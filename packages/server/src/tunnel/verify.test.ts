@@ -14,6 +14,36 @@ describe("tunnel/verify", () => {
         "https://0xabc123.server.vana.org",
       );
     });
+
+    it("strips frpc. prefix from serverAddr", () => {
+      expect(buildTunnelUrl("0xabc", "frpc.server.vana.org")).toBe(
+        "https://0xabc.server.vana.org",
+      );
+    });
+
+    it("strips protocol from serverAddr", () => {
+      expect(buildTunnelUrl("0xabc", "https://frpc.server.vana.org")).toBe(
+        "https://0xabc.server.vana.org",
+      );
+    });
+
+    it("strips port from serverAddr", () => {
+      expect(buildTunnelUrl("0xabc", "frpc.server.vana.org:7000")).toBe(
+        "https://0xabc.server.vana.org",
+      );
+    });
+
+    it("strips protocol, port, and path together", () => {
+      expect(
+        buildTunnelUrl("0xabc", "https://frpc.server.vana.org:7000/api"),
+      ).toBe("https://0xabc.server.vana.org");
+    });
+
+    it("works with non-frpc serverAddr", () => {
+      expect(buildTunnelUrl("0xabc", "custom.example.com")).toBe(
+        "https://0xabc.custom.example.com",
+      );
+    });
   });
 
   describe("verifyTunnelUrl", () => {
