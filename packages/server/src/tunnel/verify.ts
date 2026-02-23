@@ -22,8 +22,9 @@ export interface VerifyTunnelResult {
 /**
  * Build the canonical tunnel URL for a wallet address.
  */
-export function buildTunnelUrl(walletAddress: string): string {
-  return `https://${walletAddress.toLowerCase()}.server.vana.org`;
+export function buildTunnelUrl(walletAddress: string, serverAddr?: string): string {
+  const domain = (serverAddr || 'frpc.server.vana.org').replace(/^frpc\./, '');
+  return `https://${walletAddress.toLowerCase()}.${domain}`;
 }
 
 /**
