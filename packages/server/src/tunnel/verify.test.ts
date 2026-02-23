@@ -15,33 +15,21 @@ describe("tunnel/verify", () => {
       );
     });
 
-    it("strips frpc. prefix from serverAddr", () => {
+    it("uses prod domain for frpc.server.vana.org", () => {
       expect(buildTunnelUrl("0xabc", "frpc.server.vana.org")).toBe(
         "https://0xabc.server.vana.org",
       );
     });
 
-    it("strips protocol from serverAddr", () => {
-      expect(buildTunnelUrl("0xabc", "https://frpc.server.vana.org")).toBe(
-        "https://0xabc.server.vana.org",
+    it("uses dev domain for frpc.server-dev.vana.org", () => {
+      expect(buildTunnelUrl("0xabc", "frpc.server-dev.vana.org")).toBe(
+        "https://0xabc.server-dev.vana.org",
       );
     });
 
-    it("strips port from serverAddr", () => {
-      expect(buildTunnelUrl("0xabc", "frpc.server.vana.org:7000")).toBe(
-        "https://0xabc.server.vana.org",
-      );
-    });
-
-    it("strips protocol, port, and path together", () => {
-      expect(
-        buildTunnelUrl("0xabc", "https://frpc.server.vana.org:7000/api"),
-      ).toBe("https://0xabc.server.vana.org");
-    });
-
-    it("works with non-frpc serverAddr", () => {
+    it("falls back to default domain for unknown serverAddr", () => {
       expect(buildTunnelUrl("0xabc", "custom.example.com")).toBe(
-        "https://0xabc.custom.example.com",
+        "https://0xabc.server.vana.org",
       );
     });
   });
