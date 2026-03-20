@@ -53,7 +53,8 @@ RUN mkdir -p /data && chown vana:vana /data
 # Cloud-mode defaults (can be overridden at runtime)
 # SERVER_ORIGIN MUST be provided at runtime for cloud deployments
 # (e.g. -e SERVER_ORIGIN=https://ps.example.com)
-ENV PERSONAL_SERVER_ROOT_PATH=/data \
+ENV CLOUD_MODE=true \
+    PERSONAL_SERVER_ROOT_PATH=/data \
     TUNNEL_ENABLED=false \
     DEV_UI_ENABLED=false
 

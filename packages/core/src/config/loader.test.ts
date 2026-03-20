@@ -200,7 +200,7 @@ describe("loadConfig", () => {
         const configPath = join(dir, "config.json");
         await writeFile(configPath, JSON.stringify({ server: { port: 3000 } }));
 
-        await withEnv({ SERVER_PORT: "9999" }, async () => {
+        await withEnv({ CLOUD_MODE: "true", SERVER_PORT: "9999" }, async () => {
           const config = await loadConfig({ configPath });
           expect(config.server.port).toBe(9999);
         });
@@ -212,10 +212,13 @@ describe("loadConfig", () => {
         const configPath = join(dir, "config.json");
         await writeFile(configPath, JSON.stringify({}));
 
-        await withEnv({ SERVER_ORIGIN: "https://ps.example.com" }, async () => {
-          const config = await loadConfig({ configPath });
-          expect(config.server.origin).toBe("https://ps.example.com");
-        });
+        await withEnv(
+          { CLOUD_MODE: "true", SERVER_ORIGIN: "https://ps.example.com" },
+          async () => {
+            const config = await loadConfig({ configPath });
+            expect(config.server.origin).toBe("https://ps.example.com");
+          },
+        );
       });
     });
 
@@ -224,10 +227,13 @@ describe("loadConfig", () => {
         const configPath = join(dir, "config.json");
         await writeFile(configPath, JSON.stringify({}));
 
-        await withEnv({ TUNNEL_ENABLED: "false" }, async () => {
-          const config = await loadConfig({ configPath });
-          expect(config.tunnel.enabled).toBe(false);
-        });
+        await withEnv(
+          { CLOUD_MODE: "true", TUNNEL_ENABLED: "false" },
+          async () => {
+            const config = await loadConfig({ configPath });
+            expect(config.tunnel.enabled).toBe(false);
+          },
+        );
       });
     });
 
@@ -236,9 +242,24 @@ describe("loadConfig", () => {
         const configPath = join(dir, "config.json");
         await writeFile(configPath, JSON.stringify({}));
 
-        await withEnv({ DEV_UI_ENABLED: "false" }, async () => {
+        await withEnv(
+          { CLOUD_MODE: "true", DEV_UI_ENABLED: "false" },
+          async () => {
+            const config = await loadConfig({ configPath });
+            expect(config.devUi.enabled).toBe(false);
+          },
+        );
+      });
+    });
+
+    it("ignores env vars when CLOUD_MODE is not set", async () => {
+      await withTempDir(async (dir) => {
+        const configPath = join(dir, "config.json");
+        await writeFile(configPath, JSON.stringify({ server: { port: 3000 } }));
+
+        await withEnv({ SERVER_PORT: "9999" }, async () => {
           const config = await loadConfig({ configPath });
-          expect(config.devUi.enabled).toBe(false);
+          expect(config.server.port).toBe(3000);
         });
       });
     });
@@ -257,6 +278,7 @@ describe("loadConfig", () => {
 
         await withEnv(
           {
+            CLOUD_MODE: "true",
             SERVER_PORT: "4000",
             SERVER_ORIGIN: "https://cloud.example.com",
             TUNNEL_ENABLED: "false",

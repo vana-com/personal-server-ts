@@ -9,13 +9,17 @@ import { resolveRootPath } from "./paths.js";
 /**
  * Apply environment-variable overrides to the raw config object.
  *
- * Supported env vars (all optional):
+ * Gated behind CLOUD_MODE=true so desktop users are never affected.
+ *
+ * Supported env vars (all optional, only read when CLOUD_MODE=true):
  *   SERVER_PORT          — server.port (integer)
  *   SERVER_ORIGIN        — server.origin (URL)
  *   TUNNEL_ENABLED       — tunnel.enabled (boolean: "true"/"false")
  *   DEV_UI_ENABLED       — devUi.enabled (boolean: "true"/"false")
  */
 function applyEnvOverrides(obj: Record<string, unknown>): void {
+  if (process.env.CLOUD_MODE !== "true") return;
+
   const { SERVER_PORT, SERVER_ORIGIN, TUNNEL_ENABLED, DEV_UI_ENABLED } =
     process.env;
 
