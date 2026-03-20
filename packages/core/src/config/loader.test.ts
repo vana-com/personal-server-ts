@@ -177,6 +177,125 @@ describe("loadConfig", () => {
     });
   });
 
+  describe("env var overrides", () => {
+    function withEnv(
+      vars: Record<string, string>,
+      fn: () => Promise<void>,
+    ): Promise<void> {
+      const originals: Record<string, string | undefined> = {};
+      for (const key of Object.keys(vars)) {
+        originals[key] = process.env[key];
+        process.env[key] = vars[key];
+      }
+      return fn().finally(() => {
+        for (const [key, val] of Object.entries(originals)) {
+          if (val === undefined) delete process.env[key];
+          else process.env[key] = val;
+        }
+      });
+    }
+
+    it("SERVER_PORT overrides config file value", async () => {
+      await withTempDir(async (dir) => {
+        const configPath = join(dir, "config.json");
+        await writeFile(configPath, JSON.stringify({ server: { port: 3000 } }));
+
+        await withEnv({ CLOUD_MODE: "true", SERVER_PORT: "9999" }, async () => {
+          const config = await loadConfig({ configPath });
+          expect(config.server.port).toBe(9999);
+        });
+      });
+    });
+
+    it("SERVER_ORIGIN overrides default", async () => {
+      await withTempDir(async (dir) => {
+        const configPath = join(dir, "config.json");
+        await writeFile(configPath, JSON.stringify({}));
+
+        await withEnv(
+          { CLOUD_MODE: "true", SERVER_ORIGIN: "https://ps.example.com" },
+          async () => {
+            const config = await loadConfig({ configPath });
+            expect(config.server.origin).toBe("https://ps.example.com");
+          },
+        );
+      });
+    });
+
+    it("TUNNEL_ENABLED overrides default", async () => {
+      await withTempDir(async (dir) => {
+        const configPath = join(dir, "config.json");
+        await writeFile(configPath, JSON.stringify({}));
+
+        await withEnv(
+          { CLOUD_MODE: "true", TUNNEL_ENABLED: "false" },
+          async () => {
+            const config = await loadConfig({ configPath });
+            expect(config.tunnel.enabled).toBe(false);
+          },
+        );
+      });
+    });
+
+    it("DEV_UI_ENABLED overrides default", async () => {
+      await withTempDir(async (dir) => {
+        const configPath = join(dir, "config.json");
+        await writeFile(configPath, JSON.stringify({}));
+
+        await withEnv(
+          { CLOUD_MODE: "true", DEV_UI_ENABLED: "false" },
+          async () => {
+            const config = await loadConfig({ configPath });
+            expect(config.devUi.enabled).toBe(false);
+          },
+        );
+      });
+    });
+
+    it("ignores env vars when CLOUD_MODE is not set", async () => {
+      await withTempDir(async (dir) => {
+        const configPath = join(dir, "config.json");
+        await writeFile(configPath, JSON.stringify({ server: { port: 3000 } }));
+
+        await withEnv({ SERVER_PORT: "9999" }, async () => {
+          const config = await loadConfig({ configPath });
+          expect(config.server.port).toBe(3000);
+        });
+      });
+    });
+
+    it("env vars override config file values", async () => {
+      await withTempDir(async (dir) => {
+        const configPath = join(dir, "config.json");
+        await writeFile(
+          configPath,
+          JSON.stringify({
+            server: { port: 3000 },
+            tunnel: { enabled: true },
+            devUi: { enabled: true },
+          }),
+        );
+
+        await withEnv(
+          {
+            CLOUD_MODE: "true",
+            SERVER_PORT: "4000",
+            SERVER_ORIGIN: "https://cloud.example.com",
+            TUNNEL_ENABLED: "false",
+            DEV_UI_ENABLED: "false",
+          },
+          async () => {
+            const config = await loadConfig({ configPath });
+            expect(config.server.port).toBe(4000);
+            expect(config.server.origin).toBe("https://cloud.example.com");
+            expect(config.tunnel.enabled).toBe(false);
+            expect(config.devUi.enabled).toBe(false);
+          },
+        );
+      });
+    });
+  });
+
   it("prefers configPath over rootPath when both are provided", async () => {
     await withTempDir(async (dir) => {
       const rootPath = join(dir, "root-a");
