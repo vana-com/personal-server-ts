@@ -15,8 +15,11 @@ COPY packages/cli/package.json packages/cli/
 RUN npm ci
 
 # Copy source and build
-COPY tsconfig.json tsconfig.base.json ./
+COPY tsconfig.base.json ./
 COPY packages/ packages/
+
+# Create a Docker-specific tsconfig that excludes scripts/ (not needed in container)
+RUN echo '{"references":[{"path":"packages/core"},{"path":"packages/server"}],"files":[]}' > tsconfig.json
 
 RUN npm run build
 
@@ -61,4 +64,8 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 
 USER vana
 
+# If /data is mounted as a volume with wrong ownership, the GCE startup script
+# handles this (runs as root before docker run). For local dev, run with:
+#   docker run --user root -e ... vana/personal-server
+# or pre-chown the host directory.
 CMD ["node", "packages/server/dist/index.js"]

@@ -12,5 +12,5 @@ scripts
 .vscode
 .cursor
 .claude
-*.tsbuildinfo
+**/*.tsbuildinfo
 packages/*/dist
