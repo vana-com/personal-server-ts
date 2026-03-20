@@ -1,0 +1,16 @@
+node_modules
+.git
+.env
+.env.*
+!.env.example
+*.md
+docs
+tests
+scripts
+.husky
+.github
+.vscode
+.cursor
+.claude
+**/*.tsbuildinfo
+packages/*/dist
