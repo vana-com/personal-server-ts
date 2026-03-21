@@ -20,6 +20,7 @@ export interface GrantsRouteDeps {
   serverOwner?: `0x${string}`;
   serverOrigin: string | (() => string);
   devToken?: string;
+  accessToken?: string;
   serverSigner?: ServerSigner;
 }
 
@@ -95,6 +96,7 @@ export function grantsRoutes(deps: GrantsRouteDeps): Hono {
   const web3Auth = createWeb3AuthMiddleware({
     serverOrigin: deps.serverOrigin,
     devToken: deps.devToken,
+    accessToken: deps.accessToken,
     serverOwner: deps.serverOwner,
   });
   const ownerCheck = createOwnerCheckMiddleware(deps.serverOwner);

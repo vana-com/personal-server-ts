@@ -14,6 +14,7 @@ export interface SyncRouteDeps {
   serverOrigin: string | (() => string);
   serverOwner?: `0x${string}`;
   devToken?: string;
+  accessToken?: string;
   syncManager: SyncManager | null; // null when sync disabled
 }
 
@@ -23,6 +24,7 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
   const web3Auth = createWeb3AuthMiddleware({
     serverOrigin: deps.serverOrigin,
     devToken: deps.devToken,
+    accessToken: deps.accessToken,
     serverOwner: deps.serverOwner,
   });
   const ownerCheck = createOwnerCheckMiddleware(deps.serverOwner);

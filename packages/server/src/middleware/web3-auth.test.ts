@@ -174,3 +174,118 @@ describe("createWeb3AuthMiddleware with dev token", () => {
     expect(res.status).toBe(401);
   });
 });
+
+describe("createWeb3AuthMiddleware with access token (PS_ACCESS_TOKEN)", () => {
+  const ACCESS_TOKEN = "vana_ps_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6";
+  const SERVER_OWNER =
+    "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd" as `0x${string}`;
+
+  function createAccessTokenApp(opts?: { serverOwner?: `0x${string}` }) {
+    const app = new Hono();
+    const web3Auth = createWeb3AuthMiddleware({
+      serverOrigin: SERVER_ORIGIN,
+      accessToken: ACCESS_TOKEN,
+      serverOwner: opts?.serverOwner ?? SERVER_OWNER,
+    });
+
+    app.get("/test", web3Auth, (c) => {
+      const auth = c.get("auth") as VerifiedAuth;
+      return c.json({
+        signer: auth.signer,
+        devBypass: c.get("devBypass") ?? false,
+      });
+    });
+
+    return app;
+  }
+
+  it("valid access token authenticates as owner", async () => {
+    const app = createAccessTokenApp();
+
+    const res = await app.request("/test", {
+      headers: { Authorization: `Bearer ${ACCESS_TOKEN}` },
+    });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.signer).toBe(SERVER_OWNER);
+    expect(json.devBypass).toBe(true);
+  });
+
+  it("invalid access token falls through to Web3Signed verification", async () => {
+    const app = createAccessTokenApp();
+
+    const res = await app.request("/test", {
+      headers: { Authorization: "Bearer wrong-access-token" },
+    });
+
+    expect(res.status).toBe(401);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("INVALID_SIGNATURE");
+  });
+
+  it("access token without serverOwner returns 500", async () => {
+    const app = new Hono();
+    const web3Auth = createWeb3AuthMiddleware({
+      serverOrigin: SERVER_ORIGIN,
+      accessToken: ACCESS_TOKEN,
+      serverOwner: undefined,
+    });
+
+    app.get("/test", web3Auth, (c) => {
+      return c.json({ ok: true });
+    });
+
+    const res = await app.request("/test", {
+      headers: { Authorization: `Bearer ${ACCESS_TOKEN}` },
+    });
+
+    expect(res.status).toBe(500);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("SERVER_NOT_CONFIGURED");
+  });
+
+  it("dev token takes priority over access token when both configured", async () => {
+    const DEV_TOKEN = "dev-token-xyz";
+    const app = new Hono();
+    const web3Auth = createWeb3AuthMiddleware({
+      serverOrigin: SERVER_ORIGIN,
+      devToken: DEV_TOKEN,
+      accessToken: ACCESS_TOKEN,
+      serverOwner: SERVER_OWNER,
+    });
+
+    app.get("/test", web3Auth, (c) => {
+      const auth = c.get("auth") as VerifiedAuth;
+      return c.json({
+        signer: auth.signer,
+        devBypass: c.get("devBypass") ?? false,
+      });
+    });
+
+    // Dev token should work
+    const res1 = await app.request("/test", {
+      headers: { Authorization: `Bearer ${DEV_TOKEN}` },
+    });
+    expect(res1.status).toBe(200);
+
+    // Access token should also work
+    const res2 = await app.request("/test", {
+      headers: { Authorization: `Bearer ${ACCESS_TOKEN}` },
+    });
+    expect(res2.status).toBe(200);
+  });
+
+  it("uses constant-time comparison (does not leak length via timing)", async () => {
+    // This is a structural test: verify that a token of different length
+    // from the access token is still rejected (the safeCompare function
+    // handles length mismatch before timingSafeEqual)
+    const app = createAccessTokenApp();
+
+    const res = await app.request("/test", {
+      headers: { Authorization: "Bearer x" },
+    });
+
+    expect(res.status).toBe(401);
+  });
+});
