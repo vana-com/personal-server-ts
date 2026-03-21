@@ -11,6 +11,7 @@ import {
   GRANT_TYPES,
 } from "@opendatalabs/personal-server-ts-core/grants";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
+import type { TokenStore } from "../token-store.js";
 import { createWeb3AuthMiddleware } from "../middleware/web3-auth.js";
 import { createOwnerCheckMiddleware } from "../middleware/owner-check.js";
 
@@ -21,6 +22,7 @@ export interface GrantsRouteDeps {
   serverOrigin: string | (() => string);
   devToken?: string;
   accessToken?: string;
+  tokenStore?: TokenStore;
   serverSigner?: ServerSigner;
 }
 
@@ -97,6 +99,7 @@ export function grantsRoutes(deps: GrantsRouteDeps): Hono {
     serverOrigin: deps.serverOrigin,
     devToken: deps.devToken,
     accessToken: deps.accessToken,
+    tokenStore: deps.tokenStore,
     serverOwner: deps.serverOwner,
   });
   const ownerCheck = createOwnerCheckMiddleware(deps.serverOwner);

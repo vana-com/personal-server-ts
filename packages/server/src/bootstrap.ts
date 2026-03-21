@@ -45,6 +45,7 @@ import { createVanaStorageAdapter } from "@opendatalabs/personal-server-ts-core/
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
 import { generateDevToken } from "./dev-token.js";
+import { createTokenStore, type TokenStore } from "./token-store.js";
 import { TunnelManager, ensureFrpcBinary } from "./tunnel/index.js";
 
 export interface ServerContext {
@@ -236,6 +237,10 @@ export async function createServer(
   // Generate ephemeral dev token when devUi is enabled
   const devToken = config.devUi.enabled ? generateDevToken() : undefined;
 
+  // Token store for /login/v2 flow (self-hosted CLI auth)
+  const tokensPath = join(storageRoot, "tokens.json");
+  const tokenStore: TokenStore = createTokenStore(tokensPath, logger);
+
   // Mutable origin — starts with config value, updated when tunnel connects
   let effectiveOrigin = config.server.origin;
 
@@ -256,6 +261,7 @@ export async function createServer(
     accessLogReader,
     devToken,
     accessToken,
+    tokenStore,
     configPath,
     syncManager,
     serverSigner,

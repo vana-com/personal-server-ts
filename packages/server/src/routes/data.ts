@@ -12,6 +12,7 @@ import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage
 import type { GatewayClient } from "@opendatalabs/personal-server-ts-core/gateway";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
+import type { TokenStore } from "../token-store.js";
 import type { Logger } from "pino";
 import {
   createBodyLimit,
@@ -34,6 +35,7 @@ export interface DataRouteDeps {
   syncManager?: SyncManager | null;
   devToken?: string;
   accessToken?: string;
+  tokenStore?: TokenStore;
 }
 
 export function dataRoutes(deps: DataRouteDeps): Hono {
@@ -44,6 +46,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     serverOrigin: deps.serverOrigin,
     devToken: deps.devToken,
     accessToken: deps.accessToken,
+    tokenStore: deps.tokenStore,
     serverOwner: deps.serverOwner,
   });
   const builderCheck = createBuilderCheckMiddleware(deps.gateway);

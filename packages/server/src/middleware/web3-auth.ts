@@ -2,11 +2,13 @@ import { timingSafeEqual } from "node:crypto";
 import type { MiddlewareHandler } from "hono";
 import { verifyWeb3Signed } from "@opendatalabs/personal-server-ts-core/auth";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
+import type { TokenStore } from "../token-store.js";
 
 export interface Web3AuthMiddlewareDeps {
   serverOrigin: string | (() => string);
   devToken?: string;
   accessToken?: string;
+  tokenStore?: TokenStore;
   serverOwner?: `0x${string}`;
 }
 
@@ -72,6 +74,33 @@ export function createWeb3AuthMiddleware(
     if (deps.accessToken && authHeader?.startsWith("Bearer ")) {
       const token = authHeader.slice(7);
       if (safeCompare(token, deps.accessToken)) {
+        if (!deps.serverOwner) {
+          return c.json(
+            {
+              error: {
+                code: 500,
+                errorCode: "SERVER_NOT_CONFIGURED",
+                message:
+                  "Server owner address not configured. Set VANA_MASTER_KEY_SIGNATURE environment variable.",
+              },
+            },
+            500,
+          );
+        }
+        c.set("auth", {
+          signer: deps.serverOwner,
+          payload: {},
+        });
+        c.set("devBypass", true);
+        await next();
+        return;
+      }
+    }
+
+    // Token store: tokens generated via /login/v2 flow
+    if (deps.tokenStore && authHeader?.startsWith("Bearer ")) {
+      const token = authHeader.slice(7);
+      if (deps.tokenStore.isValid(token)) {
         if (!deps.serverOwner) {
           return c.json(
             {

@@ -13,8 +13,10 @@ import { accessLogsRoutes } from "./routes/access-logs.js";
 import { syncRoutes } from "./routes/sync.js";
 import { uiConfigRoutes } from "./routes/ui-config.js";
 import { uiRoute } from "./routes/ui.js";
+import { loginV2Routes } from "./routes/login-v2.js";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
+import type { TokenStore } from "./token-store.js";
 import type { Logger } from "pino";
 
 export interface IdentityInfo {
@@ -40,6 +42,7 @@ export interface AppDeps {
   configPath?: string;
   syncManager?: SyncManager | null;
   serverSigner?: ServerSigner;
+  tokenStore?: TokenStore;
   getTunnelStatus?: HealthDeps["getTunnelStatus"];
 }
 
@@ -84,6 +87,7 @@ export function createApp(deps: AppDeps): Hono {
       accessLogWriter: deps.accessLogWriter,
       devToken: deps.devToken,
       accessToken: deps.accessToken,
+      tokenStore: deps.tokenStore,
       syncManager: deps.syncManager ?? null,
     }),
   );
@@ -98,6 +102,7 @@ export function createApp(deps: AppDeps): Hono {
       serverOrigin: deps.serverOrigin,
       devToken: deps.devToken,
       accessToken: deps.accessToken,
+      tokenStore: deps.tokenStore,
       serverSigner: deps.serverSigner,
     }),
   );
@@ -112,6 +117,7 @@ export function createApp(deps: AppDeps): Hono {
       serverOwner: deps.serverOwner,
       devToken: deps.devToken,
       accessToken: deps.accessToken,
+      tokenStore: deps.tokenStore,
     }),
   );
 
@@ -124,9 +130,23 @@ export function createApp(deps: AppDeps): Hono {
       serverOwner: deps.serverOwner,
       devToken: deps.devToken,
       accessToken: deps.accessToken,
+      tokenStore: deps.tokenStore,
       syncManager: deps.syncManager ?? null,
     }),
   );
+
+  // Mount login flow v2 routes (self-hosted CLI auth, no auth required)
+  if (deps.tokenStore) {
+    app.route(
+      "/login/v2",
+      loginV2Routes({
+        logger: deps.logger,
+        serverOrigin: deps.serverOrigin,
+        serverOwner: deps.serverOwner,
+        tokenStore: deps.tokenStore,
+      }),
+    );
+  }
 
   // Mount dev UI routes when dev token is available
   if (deps.devToken) {
