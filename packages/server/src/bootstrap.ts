@@ -237,7 +237,7 @@ export async function createServer(
   // Generate ephemeral dev token when devUi is enabled
   const devToken = config.devUi.enabled ? generateDevToken() : undefined;
 
-  // Token store for /login/v2 flow (self-hosted CLI auth)
+  // Token store for /auth/device flow (self-hosted CLI auth)
   const tokensPath = join(storageRoot, "tokens.json");
   const tokenStore: TokenStore = createTokenStore(tokensPath, logger);
 

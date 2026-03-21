@@ -13,7 +13,7 @@ import { accessLogsRoutes } from "./routes/access-logs.js";
 import { syncRoutes } from "./routes/sync.js";
 import { uiConfigRoutes } from "./routes/ui-config.js";
 import { uiRoute } from "./routes/ui.js";
-import { loginV2Routes } from "./routes/login-v2.js";
+import { authDeviceRoutes } from "./routes/auth-device.js";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { TokenStore } from "./token-store.js";
@@ -138,8 +138,8 @@ export function createApp(deps: AppDeps): Hono {
   // Mount login flow v2 routes (self-hosted CLI auth, no auth required)
   if (deps.tokenStore) {
     app.route(
-      "/login/v2",
-      loginV2Routes({
+      "/auth/device",
+      authDeviceRoutes({
         logger: deps.logger,
         serverOrigin: deps.serverOrigin,
         serverOwner: deps.serverOwner,

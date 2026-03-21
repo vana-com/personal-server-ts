@@ -97,7 +97,7 @@ export function createWeb3AuthMiddleware(
       }
     }
 
-    // Token store: tokens generated via /login/v2 flow
+    // Token store: tokens generated via /auth/device flow
     if (deps.tokenStore && authHeader?.startsWith("Bearer ")) {
       const token = authHeader.slice(7);
       if (await deps.tokenStore.isValid(token)) {

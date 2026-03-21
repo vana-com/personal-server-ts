@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { loginV2Routes, sessions } from "./login-v2.js";
+import { authDeviceRoutes, sessions } from "./auth-device.js";
 import type { TokenStore } from "../token-store.js";
 import pino from "pino";
 
@@ -22,7 +22,7 @@ function createMockTokenStore(): TokenStore {
 }
 
 function createApp(tokenStore?: TokenStore) {
-  return loginV2Routes({
+  return authDeviceRoutes({
     logger: pino({ level: "silent" }),
     serverOrigin: SERVER_ORIGIN,
     serverOwner: SERVER_OWNER,
@@ -30,7 +30,7 @@ function createApp(tokenStore?: TokenStore) {
   });
 }
 
-describe("POST /login/v2", () => {
+describe("POST /auth/device", () => {
   beforeEach(() => {
     sessions.clear();
   });
@@ -44,7 +44,7 @@ describe("POST /login/v2", () => {
     expect(body.login).toMatch(
       /^http:\/\/localhost:8080\/login\/v2\/approve\?session=.+$/,
     );
-    expect(body.poll.endpoint).toBe("/login/v2/poll");
+    expect(body.poll.endpoint).toBe("/auth/device/poll");
     expect(body.poll.token).toBeDefined();
     expect(body.poll.token.length).toBe(64); // 32 bytes hex
   });
@@ -56,7 +56,7 @@ describe("POST /login/v2", () => {
   });
 });
 
-describe("GET /login/v2/poll", () => {
+describe("GET /auth/device/poll", () => {
   beforeEach(() => {
     sessions.clear();
   });
@@ -135,7 +135,7 @@ describe("GET /login/v2/poll", () => {
   });
 });
 
-describe("GET /login/v2/approve", () => {
+describe("GET /auth/device/approve", () => {
   beforeEach(() => {
     sessions.clear();
   });
@@ -191,7 +191,7 @@ describe("GET /login/v2/approve", () => {
   });
 });
 
-describe("POST /login/v2/approve", () => {
+describe("POST /auth/device/approve", () => {
   beforeEach(() => {
     sessions.clear();
   });

@@ -1,10 +1,10 @@
 /**
  * Login Flow v2 — Nextcloud-style device login for self-hosted CLI authentication.
  *
- * POST /login/v2         — Initiate a login session
- * GET  /login/v2/poll    — Poll for completion (token= query param)
- * GET  /login/v2/approve — HTML approval page (session= query param)
- * POST /login/v2/approve — Approve the session (session= query param)
+ * POST /auth/device         — Initiate a login session
+ * GET  /auth/device/poll    — Poll for completion (token= query param)
+ * GET  /auth/device/approve — HTML approval page (session= query param)
+ * POST /auth/device/approve — Approve the session (session= query param)
  */
 
 import { randomBytes } from "node:crypto";
@@ -67,7 +67,7 @@ function isLocalhostRequest(remoteAddr: string | undefined): boolean {
   );
 }
 
-export function loginV2Routes(deps: LoginV2Deps): Hono {
+export function authDeviceRoutes(deps: LoginV2Deps): Hono {
   const app = new Hono();
 
   // POST /  — Initiate login flow (no auth required)
@@ -90,9 +90,9 @@ export function loginV2Routes(deps: LoginV2Deps): Hono {
     deps.logger.info({ sessionId }, "Login flow initiated");
 
     return c.json({
-      login: `${origin}/login/v2/approve?session=${sessionId}`,
+      login: `${origin}/auth/device/approve?session=${sessionId}`,
       poll: {
-        endpoint: "/login/v2/poll",
+        endpoint: "/auth/device/poll",
         token: pollToken,
       },
     });
@@ -342,7 +342,7 @@ function approvePage(origin: string, owner: string, sessionId: string): string {
       btn.disabled = true;
       btn.textContent = 'Authorizing...';
       try {
-        const res = await fetch('/login/v2/approve?session=${escapeHtml(sessionId)}', {
+        const res = await fetch('/auth/device/approve?session=${escapeHtml(sessionId)}', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
         });
