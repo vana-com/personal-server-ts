@@ -16,8 +16,12 @@ export interface Web3AuthMiddlewareDeps {
  */
 function safeCompare(a: string, b: string): boolean {
   if (a.length === 0 || b.length === 0) return false;
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(Buffer.from(a), Buffer.from(b));
+  // Compare buffer byte lengths, not JS string lengths — they differ for
+  // non-ASCII characters (e.g. "é" is 1 char but 2 bytes in UTF-8).
+  const bufA = Buffer.from(a, "utf-8");
+  const bufB = Buffer.from(b, "utf-8");
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
 }
 
 /**
@@ -89,7 +93,10 @@ export function createWeb3AuthMiddleware(
           signer: deps.serverOwner,
           payload: {},
         });
-        c.set("devBypass", true);
+        // NOT devBypass — Bearer token gives owner-level auth, but does NOT
+        // bypass builder-check or grant-check. Owner identity is sufficient
+        // for owner operations; builder/grant checks still apply for data reads.
+        c.set("devBypass", false);
         await next();
         return;
       }
