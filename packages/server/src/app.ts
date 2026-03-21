@@ -36,6 +36,7 @@ export interface AppDeps {
   accessLogWriter: AccessLogWriter;
   accessLogReader: AccessLogReader;
   devToken?: string;
+  accessToken?: string;
   configPath?: string;
   syncManager?: SyncManager | null;
   serverSigner?: ServerSigner;
@@ -82,6 +83,7 @@ export function createApp(deps: AppDeps): Hono {
       gateway: deps.gateway,
       accessLogWriter: deps.accessLogWriter,
       devToken: deps.devToken,
+      accessToken: deps.accessToken,
       syncManager: deps.syncManager ?? null,
     }),
   );
@@ -95,6 +97,7 @@ export function createApp(deps: AppDeps): Hono {
       serverOwner: deps.serverOwner,
       serverOrigin: deps.serverOrigin,
       devToken: deps.devToken,
+      accessToken: deps.accessToken,
       serverSigner: deps.serverSigner,
     }),
   );
@@ -108,6 +111,7 @@ export function createApp(deps: AppDeps): Hono {
       serverOrigin: deps.serverOrigin,
       serverOwner: deps.serverOwner,
       devToken: deps.devToken,
+      accessToken: deps.accessToken,
     }),
   );
 
@@ -119,6 +123,7 @@ export function createApp(deps: AppDeps): Hono {
       serverOrigin: deps.serverOrigin,
       serverOwner: deps.serverOwner,
       devToken: deps.devToken,
+      accessToken: deps.accessToken,
       syncManager: deps.syncManager ?? null,
     }),
   );
