@@ -222,11 +222,13 @@ export function loginV2Routes(deps: LoginV2Deps): Hono {
       return c.json({ status: "already_approved" });
     }
 
-    // v1: localhost auto-approve — user is physically at the server
-    const remoteAddr =
-      c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ||
-      c.req.header("x-real-ip") ||
-      undefined;
+    // v1: localhost auto-approve — user is physically at the server.
+    // SECURITY: Use the direct TCP peer address, NOT X-Forwarded-For
+    // or X-Real-IP headers which are trivially spoofable by remote attackers.
+    // Access Node.js socket via Hono's env bindings.
+    const remoteAddr: string | undefined =
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c.env as any)?.incoming?.socket?.remoteAddress;
 
     if (!isLocalhostRequest(remoteAddr as string | undefined)) {
       deps.logger.warn(
@@ -259,6 +261,29 @@ export function loginV2Routes(deps: LoginV2Deps): Hono {
     deps.logger.info({ sessionId }, "Login flow approved — token generated");
 
     return c.json({ status: "approved" });
+  });
+
+  // ── Token revocation ──────────────────────────────────────────────
+  // Called by `vana logout` to invalidate the token server-side.
+
+  app.delete("/login/v2/token", async (c) => {
+    const authHeader = c.req.header("authorization");
+    if (!authHeader?.startsWith("Bearer ")) {
+      return c.json(
+        { error: { code: 401, message: "Missing Bearer token" } },
+        401,
+      );
+    }
+
+    const token = authHeader.slice(7);
+    const removed = await deps.tokenStore.removeToken(token);
+
+    if (removed) {
+      deps.logger.info("Token revoked via /login/v2/token");
+      return c.json({ status: "revoked" });
+    }
+
+    return c.json({ status: "revoked" }); // idempotent — no error if token doesn't exist
   });
 
   return app;
