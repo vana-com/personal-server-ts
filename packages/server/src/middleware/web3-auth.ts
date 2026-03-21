@@ -100,7 +100,7 @@ export function createWeb3AuthMiddleware(
     // Token store: tokens generated via /login/v2 flow
     if (deps.tokenStore && authHeader?.startsWith("Bearer ")) {
       const token = authHeader.slice(7);
-      if (deps.tokenStore.isValid(token)) {
+      if (await deps.tokenStore.isValid(token)) {
         if (!deps.serverOwner) {
           return c.json(
             {

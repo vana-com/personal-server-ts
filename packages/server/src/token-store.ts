@@ -13,7 +13,7 @@ export interface TokenStore {
   /** All currently valid tokens. */
   getTokens(): string[];
   /** Check if a token is valid. */
-  isValid(token: string): boolean;
+  isValid(token: string): Promise<boolean>;
   /** Add a new token and persist to disk. */
   addToken(token: string): Promise<void>;
   /** Remove a token and persist to disk. */
@@ -69,7 +69,8 @@ export function createTokenStore(filePath: string, logger: Logger): TokenStore {
       return Array.from(tokens);
     },
 
-    isValid(token: string): boolean {
+    async isValid(token: string): Promise<boolean> {
+      await ready;
       return tokens.has(token);
     },
 

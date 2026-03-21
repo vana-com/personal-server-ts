@@ -266,7 +266,7 @@ export function loginV2Routes(deps: LoginV2Deps): Hono {
   // ── Token revocation ──────────────────────────────────────────────
   // Called by `vana logout` to invalidate the token server-side.
 
-  app.delete("/login/v2/token", async (c) => {
+  app.delete("/token", async (c) => {
     const authHeader = c.req.header("authorization");
     if (!authHeader?.startsWith("Bearer ")) {
       return c.json(
@@ -276,13 +276,9 @@ export function loginV2Routes(deps: LoginV2Deps): Hono {
     }
 
     const token = authHeader.slice(7);
-    const removed = await deps.tokenStore.removeToken(token);
+    await deps.tokenStore.removeToken(token);
 
-    if (removed) {
-      deps.logger.info("Token revoked via /login/v2/token");
-      return c.json({ status: "revoked" });
-    }
-
+    deps.logger.info("Token revoked via DELETE /token");
     return c.json({ status: "revoked" }); // idempotent — no error if token doesn't exist
   });
 
