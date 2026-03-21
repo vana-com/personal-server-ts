@@ -1,11 +1,25 @@
+import { timingSafeEqual } from "node:crypto";
 import type { MiddlewareHandler } from "hono";
 import { verifyWeb3Signed } from "@opendatalabs/personal-server-ts-core/auth";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
+import type { TokenStore } from "../token-store.js";
 
 export interface Web3AuthMiddlewareDeps {
   serverOrigin: string | (() => string);
   devToken?: string;
+  accessToken?: string;
+  tokenStore?: TokenStore;
   serverOwner?: `0x${string}`;
+}
+
+/**
+ * Constant-time comparison of two strings.
+ * Returns false if either string is empty or they differ in length.
+ */
+function safeCompare(a: string, b: string): boolean {
+  if (a.length === 0 || b.length === 0) return false;
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(Buffer.from(a), Buffer.from(b));
 }
 
 /**
@@ -15,6 +29,11 @@ export interface Web3AuthMiddlewareDeps {
  * When a devToken is configured and the request carries a matching
  * Bearer token, auth context is populated with the server owner
  * and c.set('devBypass', true) is set to skip downstream checks.
+ *
+ * When an accessToken (PS_ACCESS_TOKEN) is configured and the request
+ * carries a matching Bearer token, auth context is populated with the
+ * server owner — treating the request as owner-authenticated.
+ * This is used by the CLI for cloud PS access.
  */
 export function createWeb3AuthMiddleware(
   depsOrOrigin: Web3AuthMiddlewareDeps | string,
@@ -25,10 +44,63 @@ export function createWeb3AuthMiddleware(
       : depsOrOrigin;
 
   return async (c, next) => {
+    const authHeader = c.req.header("authorization");
+
     // Dev token bypass: if configured and header matches, skip Web3Signed verification
-    if (deps.devToken) {
-      const authHeader = c.req.header("authorization");
-      if (authHeader === `Bearer ${deps.devToken}`) {
+    if (deps.devToken && authHeader === `Bearer ${deps.devToken}`) {
+      if (!deps.serverOwner) {
+        return c.json(
+          {
+            error: {
+              code: 500,
+              errorCode: "SERVER_NOT_CONFIGURED",
+              message:
+                "Server owner address not configured. Set VANA_MASTER_KEY_SIGNATURE environment variable.",
+            },
+          },
+          500,
+        );
+      }
+      c.set("auth", {
+        signer: deps.serverOwner,
+        payload: {},
+      });
+      c.set("devBypass", true);
+      await next();
+      return;
+    }
+
+    // PS access token: Bearer token from CLI/automation, validated with constant-time comparison
+    if (deps.accessToken && authHeader?.startsWith("Bearer ")) {
+      const token = authHeader.slice(7);
+      if (safeCompare(token, deps.accessToken)) {
+        if (!deps.serverOwner) {
+          return c.json(
+            {
+              error: {
+                code: 500,
+                errorCode: "SERVER_NOT_CONFIGURED",
+                message:
+                  "Server owner address not configured. Set VANA_MASTER_KEY_SIGNATURE environment variable.",
+              },
+            },
+            500,
+          );
+        }
+        c.set("auth", {
+          signer: deps.serverOwner,
+          payload: {},
+        });
+        c.set("devBypass", true);
+        await next();
+        return;
+      }
+    }
+
+    // Token store: tokens generated via /auth/device flow
+    if (deps.tokenStore && authHeader?.startsWith("Bearer ")) {
+      const token = authHeader.slice(7);
+      if (await deps.tokenStore.isValid(token)) {
         if (!deps.serverOwner) {
           return c.json(
             {
@@ -54,7 +126,7 @@ export function createWeb3AuthMiddleware(
 
     try {
       const auth = await verifyWeb3Signed({
-        headerValue: c.req.header("authorization"),
+        headerValue: authHeader,
         expectedOrigin:
           typeof deps.serverOrigin === "function"
             ? deps.serverOrigin()

@@ -45,6 +45,7 @@ import { createVanaStorageAdapter } from "@opendatalabs/personal-server-ts-core/
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
 import { generateDevToken } from "./dev-token.js";
+import { createTokenStore, type TokenStore } from "./token-store.js";
 import { TunnelManager, ensureFrpcBinary } from "./tunnel/index.js";
 
 export interface ServerContext {
@@ -135,6 +136,32 @@ export async function createServer(
     );
   }
 
+  // Resolve PS_ACCESS_TOKEN for Bearer token auth (CLI / automation)
+  let accessToken: string | undefined = process.env.PS_ACCESS_TOKEN;
+  if (!accessToken && process.env.CLOUD_MODE === "true") {
+    try {
+      const metadataRes = await fetch(
+        "http://metadata.google.internal/computeMetadata/v1/instance/attributes/ps-access-token",
+        {
+          headers: { "Metadata-Flavor": "Google" },
+          signal: AbortSignal.timeout(2000),
+        },
+      );
+      if (metadataRes.ok) {
+        const token = (await metadataRes.text()).trim();
+        if (token.length > 0) {
+          accessToken = token;
+          logger.info("PS access token loaded from instance metadata");
+        }
+      }
+    } catch {
+      logger.debug("Could not read PS access token from instance metadata");
+    }
+  }
+  if (accessToken) {
+    logger.info("PS_ACCESS_TOKEN configured — Bearer token auth enabled");
+  }
+
   // Download frpc binary eagerly (auth-independent) so it's ready when the user signs in
   let frpcBinaryPath = "";
   if (config.tunnel.enabled) {
@@ -210,6 +237,10 @@ export async function createServer(
   // Generate ephemeral dev token when devUi is enabled
   const devToken = config.devUi.enabled ? generateDevToken() : undefined;
 
+  // Token store for /auth/device flow (self-hosted CLI auth)
+  const tokensPath = join(storageRoot, "tokens.json");
+  const tokenStore: TokenStore = createTokenStore(tokensPath, logger);
+
   // Mutable origin — starts with config value, updated when tunnel connects
   let effectiveOrigin = config.server.origin;
 
@@ -229,6 +260,8 @@ export async function createServer(
     accessLogWriter,
     accessLogReader,
     devToken,
+    accessToken,
+    tokenStore,
     configPath,
     syncManager,
     serverSigner,
