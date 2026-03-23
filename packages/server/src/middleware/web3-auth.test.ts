@@ -199,7 +199,7 @@ describe("createWeb3AuthMiddleware with access token (PS_ACCESS_TOKEN)", () => {
     return app;
   }
 
-  it("valid access token authenticates as owner", async () => {
+  it("valid access token authenticates as owner without enabling dev bypass", async () => {
     const app = createAccessTokenApp();
 
     const res = await app.request("/test", {
@@ -209,7 +209,7 @@ describe("createWeb3AuthMiddleware with access token (PS_ACCESS_TOKEN)", () => {
     expect(res.status).toBe(200);
     const json = await res.json();
     expect(json.signer).toBe(SERVER_OWNER);
-    expect(json.devBypass).toBe(true);
+    expect(json.devBypass).toBe(false);
   });
 
   it("invalid access token falls through to Web3Signed verification", async () => {
@@ -287,5 +287,43 @@ describe("createWeb3AuthMiddleware with access token (PS_ACCESS_TOKEN)", () => {
     });
 
     expect(res.status).toBe(401);
+  });
+});
+
+describe("createWeb3AuthMiddleware with token store", () => {
+  const TOKEN = "vana_ps_cli_token";
+  const SERVER_OWNER =
+    "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd" as `0x${string}`;
+
+  it("valid stored token authenticates as owner without dev bypass", async () => {
+    const app = new Hono();
+    const web3Auth = createWeb3AuthMiddleware({
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: SERVER_OWNER,
+      tokenStore: {
+        getTokens: async () => [TOKEN],
+        isValid: async (token: string) => token === TOKEN,
+        addToken: async () => {},
+        removeToken: async () => {},
+      },
+    });
+
+    app.get("/test", web3Auth, (c) => {
+      const auth = c.get("auth") as VerifiedAuth;
+      return c.json({
+        signer: auth.signer,
+        devBypass: c.get("devBypass") ?? false,
+      });
+    });
+
+    const res = await app.request("/test", {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      signer: SERVER_OWNER,
+      devBypass: false,
+    });
   });
 });

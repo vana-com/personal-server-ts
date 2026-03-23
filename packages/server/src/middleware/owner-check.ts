@@ -12,7 +12,7 @@ export function createOwnerCheckMiddleware(
   serverOwner: `0x${string}` | undefined,
 ): MiddlewareHandler {
   return async (c, next) => {
-    if (c.get("devBypass")) {
+    if (c.get("isPolicyBypass") ?? c.get("devBypass")) {
       await next();
       return;
     }

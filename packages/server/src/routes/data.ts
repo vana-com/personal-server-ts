@@ -49,12 +49,16 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     tokenStore: deps.tokenStore,
     serverOwner: deps.serverOwner,
   });
-  const builderCheck = createBuilderCheckMiddleware(deps.gateway);
+  const builderCheck = createBuilderCheckMiddleware(
+    deps.gateway,
+    deps.serverOwner,
+  );
   const grantCheck = createGrantCheckMiddleware({
     gateway: deps.gateway,
     serverOwner: deps.serverOwner,
   });
   const accessLog = createAccessLogMiddleware(deps.accessLogWriter);
+  const ownerCheck = createOwnerCheckMiddleware(deps.serverOwner);
 
   // GET /v1/data/:scope/versions — list versions for a scope (requires auth + builder, no grant)
   app.get("/:scope/versions", web3Auth, builderCheck, async (c) => {
@@ -181,7 +185,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
 
   app.use("/:scope", createBodyLimit(DATA_INGEST_MAX_SIZE));
 
-  app.post("/:scope", async (c) => {
+  app.post("/:scope", web3Auth, ownerCheck, async (c) => {
     // 1. Parse & validate scope
     const scopeParam = c.req.param("scope");
     const scopeResult = ScopeSchema.safeParse(scopeParam);
@@ -283,9 +287,6 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     // 9. Return 201
     return c.json({ scope, collectedAt, status }, 201);
   });
-
-  // Owner-check middleware (web3-auth + owner-check)
-  const ownerCheck = createOwnerCheckMiddleware(deps.serverOwner);
 
   // DELETE /v1/data/:scope — delete all versions for a scope (owner auth required)
   app.delete("/:scope", web3Auth, ownerCheck, async (c) => {

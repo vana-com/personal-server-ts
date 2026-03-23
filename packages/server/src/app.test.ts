@@ -295,9 +295,18 @@ describe("createApp", () => {
       syncManager: mockSyncManager,
     });
 
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "POST",
+      uri: "/v1/data/test.scope",
+    });
     const res = await app.request("/v1/data/test.scope", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        authorization: auth,
+      },
       body: JSON.stringify({ data: "value" }),
     });
     expect(res.status).toBe(201);
@@ -340,9 +349,18 @@ describe("createApp", () => {
 
   it("without syncManager — POST /v1/data/:scope returns stored status", async () => {
     const app = makeApp(); // makeApp doesn't pass syncManager
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "POST",
+      uri: "/v1/data/test.scope",
+    });
     const res = await app.request("/v1/data/test.scope", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        authorization: auth,
+      },
       body: JSON.stringify({ data: "value" }),
     });
     expect(res.status).toBe(201);

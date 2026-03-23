@@ -46,7 +46,7 @@ export function createGrantCheckMiddleware(params: {
   const { gateway } = params;
 
   return async (c, next) => {
-    if (c.get("devBypass")) {
+    if (c.get("isPolicyBypass") ?? c.get("devBypass")) {
       await next();
       return;
     }

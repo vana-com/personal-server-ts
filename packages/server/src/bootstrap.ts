@@ -136,7 +136,8 @@ export async function createServer(
     );
   }
 
-  // Resolve PS_ACCESS_TOKEN for Bearer token auth (CLI / automation)
+  // Resolve PS_ACCESS_TOKEN for cloud control-plane / bootstrap auth.
+  // This is not the per-login CLI session token returned to users.
   let accessToken: string | undefined = process.env.PS_ACCESS_TOKEN;
   if (!accessToken && process.env.CLOUD_MODE === "true") {
     try {
@@ -159,7 +160,9 @@ export async function createServer(
     }
   }
   if (accessToken) {
-    logger.info("PS_ACCESS_TOKEN configured — Bearer token auth enabled");
+    logger.info(
+      "PS_ACCESS_TOKEN configured — control-plane bearer auth enabled",
+    );
   }
 
   // Download frpc binary eagerly (auth-independent) so it's ready when the user signs in

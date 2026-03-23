@@ -4,6 +4,12 @@ import { verifyWeb3Signed } from "@opendatalabs/personal-server-ts-core/auth";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { TokenStore } from "../token-store.js";
 
+export type AuthMechanism =
+  | "web3-signed"
+  | "dev-token"
+  | "access-token"
+  | "cli-session-token";
+
 export interface Web3AuthMiddlewareDeps {
   serverOrigin: string | (() => string);
   devToken?: string;
@@ -30,10 +36,10 @@ function safeCompare(a: string, b: string): boolean {
  * Bearer token, auth context is populated with the server owner
  * and c.set('devBypass', true) is set to skip downstream checks.
  *
- * When an accessToken (PS_ACCESS_TOKEN) is configured and the request
- * carries a matching Bearer token, auth context is populated with the
- * server owner — treating the request as owner-authenticated.
- * This is used by the CLI for cloud PS access.
+ * When an accessToken (PS_ACCESS_TOKEN) or tokenStore-issued CLI token is
+ * configured and the request carries a matching Bearer token, auth context
+ * is populated with the server owner. These are owner-authenticated requests,
+ * not dev-bypass requests.
  */
 export function createWeb3AuthMiddleware(
   depsOrOrigin: Web3AuthMiddlewareDeps | string,
@@ -65,6 +71,8 @@ export function createWeb3AuthMiddleware(
         signer: deps.serverOwner,
         payload: {},
       });
+      c.set("authMechanism", "dev-token" satisfies AuthMechanism);
+      c.set("isPolicyBypass", true);
       c.set("devBypass", true);
       await next();
       return;
@@ -91,7 +99,9 @@ export function createWeb3AuthMiddleware(
           signer: deps.serverOwner,
           payload: {},
         });
-        c.set("devBypass", true);
+        c.set("authMechanism", "access-token" satisfies AuthMechanism);
+        c.set("isPolicyBypass", false);
+        c.set("devBypass", false);
         await next();
         return;
       }
@@ -118,7 +128,9 @@ export function createWeb3AuthMiddleware(
           signer: deps.serverOwner,
           payload: {},
         });
-        c.set("devBypass", true);
+        c.set("authMechanism", "cli-session-token" satisfies AuthMechanism);
+        c.set("isPolicyBypass", false);
+        c.set("devBypass", false);
         await next();
         return;
       }
@@ -136,6 +148,9 @@ export function createWeb3AuthMiddleware(
       });
 
       c.set("auth", auth);
+      c.set("authMechanism", "web3-signed" satisfies AuthMechanism);
+      c.set("isPolicyBypass", false);
+      c.set("devBypass", false);
       await next();
     } catch (err) {
       if (err instanceof ProtocolError) {

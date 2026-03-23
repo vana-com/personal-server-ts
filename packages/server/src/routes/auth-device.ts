@@ -8,15 +8,20 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import type { Logger } from "pino";
 import type { TokenStore } from "../token-store.js";
+import { createWeb3AuthMiddleware } from "../middleware/web3-auth.js";
+import { createOwnerCheckMiddleware } from "../middleware/owner-check.js";
 
 export interface LoginV2Deps {
   logger: Logger;
   serverOrigin: string | (() => string);
   serverOwner?: `0x${string}`;
   tokenStore: TokenStore;
+  devToken?: string;
+  accessToken?: string;
+  getRemoteAddress?: (c: Context) => string | undefined;
 }
 
 interface LoginSession {
@@ -24,12 +29,14 @@ interface LoginSession {
   pollToken: string;
   status: "pending" | "approved" | "expired";
   accessToken?: string;
+  accessTokenExpiresAt?: string;
   createdAt: number;
   lastPollAt: number;
 }
 
 const SESSION_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const POLL_INTERVAL_MS = 5 * 1000; // 5 seconds minimum between polls
+const CLI_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 /** In-memory session store (short-lived, no persistence needed). */
 const sessions = new Map<string, LoginSession>();
@@ -67,8 +74,22 @@ function isLocalhostRequest(remoteAddr: string | undefined): boolean {
   );
 }
 
+function getSocketRemoteAddress(c: Context): string | undefined {
+  // Access Node.js socket via Hono's env bindings when running on the real server.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (c.env as any)?.incoming?.socket?.remoteAddress;
+}
+
 export function authDeviceRoutes(deps: LoginV2Deps): Hono {
   const app = new Hono();
+  const web3Auth = createWeb3AuthMiddleware({
+    serverOrigin: deps.serverOrigin,
+    devToken: deps.devToken,
+    accessToken: deps.accessToken,
+    tokenStore: deps.tokenStore,
+    serverOwner: deps.serverOwner,
+  });
+  const ownerCheck = createOwnerCheckMiddleware(deps.serverOwner);
 
   // POST /  — Initiate login flow (no auth required)
   app.post("/", (c) => {
@@ -148,7 +169,9 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
       const response = {
         status: "authorized",
         server: origin,
+        address: deps.serverOwner ?? origin,
         access_token: session.accessToken,
+        expires_at: session.accessTokenExpiresAt,
       };
       sessions.delete(session.sessionId);
 
@@ -225,10 +248,7 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
     // v1: localhost auto-approve — user is physically at the server.
     // SECURITY: Use the direct TCP peer address, NOT X-Forwarded-For
     // or X-Real-IP headers which are trivially spoofable by remote attackers.
-    // Access Node.js socket via Hono's env bindings.
-    const remoteAddr: string | undefined =
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (c.env as any)?.incoming?.socket?.remoteAddress;
+    const remoteAddr = deps.getRemoteAddress?.(c) ?? getSocketRemoteAddress(c);
 
     if (!isLocalhostRequest(remoteAddr as string | undefined)) {
       deps.logger.warn(
@@ -250,17 +270,70 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
 
     // Generate a new access token
     const accessToken = `vana_ps_${randomBytes(32).toString("hex")}`;
+    const expiresAt = new Date(Date.now() + CLI_TOKEN_TTL_MS).toISOString();
 
     // Store the token persistently
-    await deps.tokenStore.addToken(accessToken);
+    await deps.tokenStore.addToken(accessToken, { expiresAt });
 
     // Mark session as approved
     session.status = "approved";
     session.accessToken = accessToken;
+    session.accessTokenExpiresAt = expiresAt;
 
     deps.logger.info({ sessionId }, "Login flow approved — token generated");
 
     return c.json({ status: "approved" });
+  });
+
+  // POST /token — add a CLI token to the store (owner-authenticated, used by cloud control plane)
+  app.post("/token", web3Auth, ownerCheck, async (c) => {
+    if (c.get("authMechanism") === "cli-session-token") {
+      return c.json(
+        {
+          error: {
+            code: 403,
+            message: "CLI session tokens cannot mint additional CLI tokens",
+          },
+        },
+        403,
+      );
+    }
+
+    let body: { token?: string; expires_at?: string | null };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json(
+        { error: { code: 400, message: "Request body must be valid JSON" } },
+        400,
+      );
+    }
+
+    if (!body.token || typeof body.token !== "string") {
+      return c.json({ error: { code: 400, message: "Missing token" } }, 400);
+    }
+
+    let expiresAt: string | null = null;
+    if (body.expires_at !== undefined && body.expires_at !== null) {
+      const parsed = new Date(body.expires_at);
+      if (Number.isNaN(parsed.getTime())) {
+        return c.json(
+          { error: { code: 400, message: "Invalid expires_at" } },
+          400,
+        );
+      }
+      if (parsed.getTime() <= Date.now()) {
+        return c.json(
+          { error: { code: 400, message: "expires_at must be in the future" } },
+          400,
+        );
+      }
+      expiresAt = parsed.toISOString();
+    }
+
+    await deps.tokenStore.addToken(body.token, { expiresAt });
+    deps.logger.info("CLI token added via POST /token");
+    return c.json({ status: "created" }, 201);
   });
 
   // ── Token revocation ──────────────────────────────────────────────

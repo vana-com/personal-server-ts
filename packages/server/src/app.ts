@@ -144,6 +144,8 @@ export function createApp(deps: AppDeps): Hono {
         serverOrigin: deps.serverOrigin,
         serverOwner: deps.serverOwner,
         tokenStore: deps.tokenStore,
+        devToken: deps.devToken,
+        accessToken: deps.accessToken,
       }),
     );
   }

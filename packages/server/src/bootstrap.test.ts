@@ -103,7 +103,7 @@ describe("createServer", () => {
     await ctx.cleanup();
   });
 
-  it("POST /v1/data/test.scope returns 400 NO_SCHEMA or 502 GATEWAY_ERROR (schema enforcement)", async () => {
+  it("POST /v1/data/test.scope returns 401 when owner auth is missing", async () => {
     const config = makeDefaultConfig();
     const ctx = await createServer(config, {
       serverDir: tempDir,
@@ -115,11 +115,9 @@ describe("createServer", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ hello: "world" }),
     });
-    // Schema enforcement: gateway returns no schema (400) or gateway unreachable (502)
-    expect([400, 502]).toContain(res.status);
-
+    expect(res.status).toBe(401);
     const body = await res.json();
-    expect(["NO_SCHEMA", "GATEWAY_ERROR"]).toContain(body.error);
+    expect(body.error.errorCode).toBe("MISSING_AUTH");
     await ctx.cleanup();
   });
 
@@ -191,7 +189,7 @@ describe("createServer", () => {
     await ctx.cleanup();
   });
 
-  it("POST /v1/data/:scope does not require auth (schema enforcement may reject)", async () => {
+  it("POST /v1/data/:scope requires owner auth", async () => {
     const config = makeDefaultConfig();
     const ctx = await createServer(config, {
       serverDir: tempDir,
@@ -203,9 +201,9 @@ describe("createServer", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ data: "value" }),
     });
-    // No auth required: does NOT return 401. Returns 400 (NO_SCHEMA) or 502 (gateway error).
-    expect(res.status).not.toBe(401);
-    expect([400, 502]).toContain(res.status);
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error.errorCode).toBe("MISSING_AUTH");
     await ctx.cleanup();
   });
 

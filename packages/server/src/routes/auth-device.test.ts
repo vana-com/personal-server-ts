@@ -6,11 +6,12 @@ import pino from "pino";
 const SERVER_ORIGIN = "http://localhost:8080";
 const SERVER_OWNER =
   "0x1234567890abcdef1234567890abcdef12345678" as `0x${string}`;
+const TEST_REMOTE_ADDR_HEADER = "x-test-remote-addr";
 
 function createMockTokenStore(): TokenStore {
   const tokens = new Set<string>();
   return {
-    getTokens: () => Array.from(tokens),
+    getTokens: vi.fn(async () => Array.from(tokens)),
     isValid: vi.fn(async (token: string) => tokens.has(token)),
     addToken: vi.fn(async (token: string) => {
       tokens.add(token);
@@ -21,12 +22,17 @@ function createMockTokenStore(): TokenStore {
   };
 }
 
-function createApp(tokenStore?: TokenStore) {
+function createApp(options?: {
+  tokenStore?: TokenStore;
+  accessToken?: string;
+}) {
   return authDeviceRoutes({
     logger: pino({ level: "silent" }),
     serverOrigin: SERVER_ORIGIN,
     serverOwner: SERVER_OWNER,
-    tokenStore: tokenStore ?? createMockTokenStore(),
+    tokenStore: options?.tokenStore ?? createMockTokenStore(),
+    accessToken: options?.accessToken,
+    getRemoteAddress: (c) => c.req.header(TEST_REMOTE_ADDR_HEADER),
   });
 }
 
@@ -42,7 +48,7 @@ describe("POST /auth/device", () => {
 
     const body = await res.json();
     expect(body.login).toMatch(
-      /^http:\/\/localhost:8080\/login\/v2\/approve\?session=.+$/,
+      /^http:\/\/localhost:8080\/auth\/device\/approve\?session=.+$/,
     );
     expect(body.poll.endpoint).toBe("/auth/device/poll");
     expect(body.poll.token).toBeDefined();
@@ -128,7 +134,9 @@ describe("GET /auth/device/poll", () => {
     const body = await res.json();
     expect(body.status).toBe("authorized");
     expect(body.server).toBe(SERVER_ORIGIN);
+    expect(body.address).toBe(SERVER_OWNER);
     expect(body.access_token).toBe("vana_ps_test_token_123");
+    expect(body.expires_at).toBeUndefined();
 
     // Session should be deleted after retrieval
     expect(sessions.has(sessionId)).toBe(false);
@@ -221,12 +229,11 @@ describe("POST /auth/device/approve", () => {
     const initBody = await initRes.json();
     const sessionId = new URL(initBody.login).searchParams.get("session")!;
 
-    // Simulate remote request via x-forwarded-for
     const res = await app.request(`/approve?session=${sessionId}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-forwarded-for": "203.0.113.5",
+        [TEST_REMOTE_ADDR_HEADER]: "203.0.113.5",
       },
     });
     expect(res.status).toBe(403);
@@ -234,26 +241,31 @@ describe("POST /auth/device/approve", () => {
 
   it("approves session for localhost requests", async () => {
     const tokenStore = createMockTokenStore();
-    const app = createApp(tokenStore);
+    const app = createApp({ tokenStore });
 
     const initRes = await app.request("/", { method: "POST" });
     const initBody = await initRes.json();
     const sessionId = new URL(initBody.login).searchParams.get("session")!;
 
-    // NOTE: app.request() doesn't populate c.env.incoming.socket.remoteAddress,
-    // so the localhost check fails and returns 403. Localhost approval can only
-    // be integration-tested with a real HTTP server. This test verifies that the
-    // security check works (rejects when remoteAddress is undefined).
     const res = await app.request(`/approve?session=${sessionId}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1",
       },
     });
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ status: "approved" });
+    expect(tokenStore.addToken).toHaveBeenCalledTimes(1);
+    expect(tokenStore.addToken).toHaveBeenCalledWith(
+      expect.stringMatching(/^vana_ps_/),
+      {
+        expiresAt: expect.any(String),
+      },
+    );
   });
 
-  it.skip("approves session for ::1 (IPv6 localhost) — requires real HTTP server", async () => {
+  it("approves session for ::1 (IPv6 localhost)", async () => {
     const app = createApp();
 
     const initRes = await app.request("/", { method: "POST" });
@@ -264,7 +276,7 @@ describe("POST /auth/device/approve", () => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-forwarded-for": "::1",
+        [TEST_REMOTE_ADDR_HEADER]: "::1",
       },
     });
     expect(res.status).toBe(200);
@@ -282,7 +294,7 @@ describe("POST /auth/device/approve", () => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-forwarded-for": "127.0.0.1",
+        [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1",
       },
     });
 
@@ -291,9 +303,10 @@ describe("POST /auth/device/approve", () => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-forwarded-for": "127.0.0.1",
+        [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1",
       },
     });
+    expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.status).toBe("already_approved");
   });
@@ -306,7 +319,7 @@ describe("full login flow", () => {
 
   it("complete flow: initiate -> approve -> poll -> get token", async () => {
     const tokenStore = createMockTokenStore();
-    const app = createApp(tokenStore);
+    const app = createApp({ tokenStore });
 
     // 1. Initiate login
     const initRes = await app.request("/", { method: "POST" });
@@ -332,7 +345,7 @@ describe("full login flow", () => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-forwarded-for": "127.0.0.1",
+        [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1",
       },
     });
     expect(approveRes.status).toBe(200);
@@ -345,7 +358,9 @@ describe("full login flow", () => {
     const pollBody2 = await pollRes2.json();
     expect(pollBody2.status).toBe("authorized");
     expect(pollBody2.server).toBe(SERVER_ORIGIN);
+    expect(pollBody2.address).toBe(SERVER_OWNER);
     expect(pollBody2.access_token).toMatch(/^vana_ps_/);
+    expect(pollBody2.expires_at).toEqual(expect.any(String));
 
     // 5. Poll again — session should be gone
     const pollRes3 = await app.request(`/poll?token=${pollToken}`, {
@@ -354,5 +369,65 @@ describe("full login flow", () => {
     expect(pollRes3.status).toBe(404);
     const pollBody3 = await pollRes3.json();
     expect(pollBody3.status).toBe("expired");
+  });
+});
+
+describe("POST /auth/device/token", () => {
+  it("requires owner authentication", async () => {
+    const app = createApp({ accessToken: "vana_ps_control_plane" });
+
+    const res = await app.request("/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: "vana_ps_cli_token" }),
+    });
+
+    expect(res.status).toBe(401);
+    expect((await res.json()).error.errorCode).toBe("MISSING_AUTH");
+  });
+
+  it("allows owner-authenticated bearer tokens to add CLI session tokens", async () => {
+    const controlPlaneToken = "vana_ps_control_plane";
+    const tokenStore = createMockTokenStore();
+    const app = createApp({ tokenStore, accessToken: controlPlaneToken });
+    const expiresAt = new Date(Date.now() + 60_000).toISOString();
+
+    const res = await app.request("/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${controlPlaneToken}`,
+      },
+      body: JSON.stringify({
+        token: "vana_ps_cli_token",
+        expires_at: expiresAt,
+      }),
+    });
+
+    expect(res.status).toBe(201);
+    expect(await res.json()).toEqual({ status: "created" });
+    expect(tokenStore.addToken).toHaveBeenCalledWith("vana_ps_cli_token", {
+      expiresAt,
+    });
+  });
+
+  it("rejects normal CLI session tokens for token minting", async () => {
+    const tokenStore = createMockTokenStore();
+    await tokenStore.addToken("vana_ps_cli_session");
+    const app = createApp({ tokenStore });
+
+    const res = await app.request("/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer vana_ps_cli_session",
+      },
+      body: JSON.stringify({ token: "vana_ps_new_cli_token" }),
+    });
+
+    expect(res.status).toBe(403);
+    expect((await res.json()).error.message).toContain(
+      "cannot mint additional CLI tokens",
+    );
   });
 });
