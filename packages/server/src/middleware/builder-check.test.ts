@@ -37,6 +37,29 @@ function createApp(gateway: GatewayClient) {
   return app;
 }
 
+function createOwnerSessionApp(gateway: GatewayClient, sessionToken: string) {
+  const app = new Hono();
+  const serverOwner =
+    "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd" as `0x${string}`;
+  const web3Auth = createWeb3AuthMiddleware({
+    serverOrigin: SERVER_ORIGIN,
+    tokenStore: {
+      getTokens: async () => [sessionToken],
+      isValid: async (token: string) => token === sessionToken,
+      addToken: async () => {},
+      removeToken: async () => {},
+    },
+    serverOwner,
+  });
+  const builderCheck = createBuilderCheckMiddleware(gateway, serverOwner);
+
+  app.get("/test", web3Auth, builderCheck, (c) => {
+    return c.json({ ok: true, devBypass: c.get("devBypass") ?? false });
+  });
+
+  return app;
+}
+
 async function makeAuthRequest(app: Hono) {
   const header = await buildWeb3SignedHeader({
     wallet,
@@ -88,5 +111,21 @@ describe("createBuilderCheckMiddleware", () => {
     const res = await makeAuthRequest(app);
 
     expect(res.status).toBe(500);
+  });
+
+  it("allows owner-authenticated bearer tokens without requiring builder registration", async () => {
+    const sessionToken = "vana_ps_owner_token";
+    const gateway = createMockGateway({
+      isRegisteredBuilder: vi.fn().mockResolvedValue(false),
+    });
+    const app = createOwnerSessionApp(gateway, sessionToken);
+
+    const res = await app.request("/test", {
+      headers: { Authorization: `Bearer ${sessionToken}` },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, devBypass: false });
+    expect(gateway.isRegisteredBuilder).not.toHaveBeenCalled();
   });
 });

@@ -18,10 +18,12 @@ import {
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import pino from "pino";
+import type { TokenStore } from "./token-store.js";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const ownerWallet = createTestWallet(0);
 const nonOwnerWallet = createTestWallet(1);
+const CONTROL_PLANE_TOKEN = "vana_ps_control_plane";
 
 function createMockSyncManager(): SyncManager {
   return {
@@ -76,6 +78,20 @@ function createMockAccessLogReader(): AccessLogReader {
   };
 }
 
+function createMockTokenStore(tokens: string[] = []): TokenStore {
+  const storedTokens = new Set(tokens);
+  return {
+    getTokens: vi.fn(async () => Array.from(storedTokens)),
+    isValid: vi.fn(async (token: string) => storedTokens.has(token)),
+    addToken: vi.fn(async (token: string) => {
+      storedTokens.add(token);
+    }),
+    removeToken: vi.fn(async (token: string) => {
+      storedTokens.delete(token);
+    }),
+  };
+}
+
 describe("createApp", () => {
   let tempDir: string;
   let indexManager: IndexManager;
@@ -104,6 +120,50 @@ describe("createApp", () => {
       gateway: createMockGateway(),
       accessLogWriter: createMockAccessLogWriter(),
       accessLogReader: createMockAccessLogReader(),
+    });
+  }
+
+  function makeAppWithControlPlaneToken() {
+    const logger = pino({ level: "silent" });
+    return createApp({
+      logger,
+      version: "0.0.1",
+      startedAt: new Date(),
+      indexManager,
+      hierarchyOptions: { dataDir: join(tempDir, "data") },
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+      accessLogReader: createMockAccessLogReader(),
+      accessToken: CONTROL_PLANE_TOKEN,
+    });
+  }
+
+  function makeAppWithTokenStore(
+    tokenStore: TokenStore = createMockTokenStore(),
+    options?: {
+      cloudMode?: boolean;
+      accessToken?: string;
+      localApprovalOrigin?: string | (() => string | undefined);
+    },
+  ) {
+    const logger = pino({ level: "silent" });
+    return createApp({
+      logger,
+      version: "0.0.1",
+      startedAt: new Date(),
+      indexManager,
+      hierarchyOptions: { dataDir: join(tempDir, "data") },
+      serverOrigin: SERVER_ORIGIN,
+      localApprovalOrigin: options?.localApprovalOrigin,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+      accessLogReader: createMockAccessLogReader(),
+      cloudMode: options?.cloudMode,
+      accessToken: options?.accessToken,
+      tokenStore,
     });
   }
 
@@ -229,6 +289,45 @@ describe("createApp", () => {
     expect(body.error.errorCode).toBe("MISSING_AUTH");
   });
 
+  it("control-plane token cannot read owner grants routes", async () => {
+    const app = makeAppWithControlPlaneToken();
+    const res = await app.request("/v1/grants", {
+      headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+    });
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error.errorCode).toBe("INVALID_SIGNATURE");
+  });
+
+  it("control-plane token cannot write owner data routes", async () => {
+    const app = makeAppWithControlPlaneToken();
+    const res = await app.request("/v1/data/test.scope", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        authorization: `Bearer ${CONTROL_PLANE_TOKEN}`,
+      },
+      body: JSON.stringify({ data: "value" }),
+    });
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error.errorCode).toBe("INVALID_SIGNATURE");
+  });
+
+  it("control-plane token cannot trigger sync routes", async () => {
+    const app = makeAppWithControlPlaneToken();
+    const res = await app.request("/v1/sync/trigger", {
+      method: "POST",
+      headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+    });
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error.errorCode).toBe("INVALID_SIGNATURE");
+  });
+
   it("POST /v1/grants/verify without auth → 400 (public endpoint, no auth wall)", async () => {
     const app = makeApp();
     const res = await app.request("/v1/grants/verify", {
@@ -240,6 +339,135 @@ describe("createApp", () => {
     expect(res.status).toBe(400);
     const body = await res.json();
     expect(body.error).toBe("INVALID_BODY");
+  });
+
+  it("POST /auth/device returns approval URLs on the request origin", async () => {
+    const app = makeAppWithTokenStore();
+    const res = await app.request(
+      new Request("https://ps.alice.com/auth/device", { method: "POST" }),
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.login).toMatch(
+      /^https:\/\/ps\.alice\.com\/auth\/device\/approve\?session=.+$/,
+    );
+    expect(body.poll.endpoint).toBe("/auth/device/poll");
+  });
+
+  it("POST /auth/device returns loopback approval URLs for localhost login initiation", async () => {
+    const app = makeAppWithTokenStore(createMockTokenStore(), {
+      localApprovalOrigin: "http://127.0.0.1:34127",
+    });
+
+    const res = await app.request(
+      new Request("http://localhost:8080/auth/device", { method: "POST" }),
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.login).toMatch(
+      /^http:\/\/127\.0\.0\.1:34127\/auth\/device\/approve\?session=.+$/,
+    );
+  });
+
+  it("remote owner-signed /auth/device/approve succeeds on the mounted app path", async () => {
+    const app = makeAppWithTokenStore();
+
+    const initRes = await app.request(
+      new Request("https://ps.alice.com/auth/device", { method: "POST" }),
+    );
+    const initBody = await initRes.json();
+    const sessionId = new URL(initBody.login).searchParams.get("session")!;
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: "https://ps.alice.com",
+      method: "POST",
+      uri: "/auth/device/approve",
+    });
+
+    const approveRes = await app.request(
+      new Request(
+        `https://ps.alice.com/auth/device/approve?session=${sessionId}`,
+        {
+          method: "POST",
+          headers: { authorization: auth },
+        },
+      ),
+    );
+
+    expect(approveRes.status).toBe(200);
+    expect(await approveRes.json()).toEqual({ status: "approved" });
+  });
+
+  it("public localhost /auth/device/approve requires owner auth when a loopback auth channel is configured", async () => {
+    const app = makeAppWithTokenStore(createMockTokenStore(), {
+      localApprovalOrigin: "http://127.0.0.1:34127",
+    });
+
+    const initRes = await app.request(
+      new Request("http://localhost:8080/auth/device", { method: "POST" }),
+    );
+    const initBody = await initRes.json();
+    const sessionId = new URL(initBody.login).searchParams.get("session")!;
+
+    const approveRes = await app.request(
+      new Request(
+        `http://localhost:8080/auth/device/approve?session=${sessionId}`,
+        {
+          method: "POST",
+        },
+      ),
+    );
+
+    expect(approveRes.status).toBe(403);
+    expect((await approveRes.json()).error.message).toContain(
+      "Remote approval requires owner wallet authentication",
+    );
+  });
+
+  it("cloud mode disables interactive /auth/device login flow", async () => {
+    const app = makeAppWithTokenStore(createMockTokenStore(), {
+      cloudMode: true,
+      accessToken: CONTROL_PLANE_TOKEN,
+    });
+
+    const initRes = await app.request(
+      new Request("https://0xabc.myvana.app/auth/device", { method: "POST" }),
+    );
+
+    expect(initRes.status).toBe(404);
+
+    const approveRes = await app.request(
+      new Request("https://0xabc.myvana.app/auth/device/approve?session=test", {
+        method: "POST",
+      }),
+    );
+
+    expect(approveRes.status).toBe(404);
+  });
+
+  it("cloud mode still allows control-plane token provisioning", async () => {
+    const tokenStore = createMockTokenStore();
+    const app = makeAppWithTokenStore(tokenStore, {
+      cloudMode: true,
+      accessToken: CONTROL_PLANE_TOKEN,
+    });
+
+    const res = await app.request("/auth/device/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        authorization: `Bearer ${CONTROL_PLANE_TOKEN}`,
+      },
+      body: JSON.stringify({ token: "vana_ps_cli_token" }),
+    });
+
+    expect(res.status).toBe(201);
+    expect(await res.json()).toEqual({ status: "created" });
+    expect(tokenStore.addToken).toHaveBeenCalledWith("vana_ps_cli_token", {
+      expiresAt: null,
+    });
   });
 
   // --- Phase 4: Sync manager wiring tests ---
@@ -295,9 +523,18 @@ describe("createApp", () => {
       syncManager: mockSyncManager,
     });
 
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "POST",
+      uri: "/v1/data/test.scope",
+    });
     const res = await app.request("/v1/data/test.scope", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        authorization: auth,
+      },
       body: JSON.stringify({ data: "value" }),
     });
     expect(res.status).toBe(201);
@@ -340,9 +577,18 @@ describe("createApp", () => {
 
   it("without syncManager — POST /v1/data/:scope returns stored status", async () => {
     const app = makeApp(); // makeApp doesn't pass syncManager
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "POST",
+      uri: "/v1/data/test.scope",
+    });
     const res = await app.request("/v1/data/test.scope", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        authorization: auth,
+      },
       body: JSON.stringify({ data: "value" }),
     });
     expect(res.status).toBe(201);

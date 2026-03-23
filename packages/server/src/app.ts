@@ -13,8 +13,10 @@ import { accessLogsRoutes } from "./routes/access-logs.js";
 import { syncRoutes } from "./routes/sync.js";
 import { uiConfigRoutes } from "./routes/ui-config.js";
 import { uiRoute } from "./routes/ui.js";
+import { authDeviceRoutes } from "./routes/auth-device.js";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
+import type { TokenStore } from "./token-store.js";
 import type { Logger } from "pino";
 
 export interface IdentityInfo {
@@ -30,15 +32,19 @@ export interface AppDeps {
   indexManager: IndexManager;
   hierarchyOptions: HierarchyManagerOptions;
   serverOrigin: string | (() => string);
+  localApprovalOrigin?: string | (() => string | undefined);
   serverOwner?: `0x${string}`;
   identity?: IdentityInfo;
   gateway: GatewayClient;
   accessLogWriter: AccessLogWriter;
   accessLogReader: AccessLogReader;
+  cloudMode?: boolean;
   devToken?: string;
+  accessToken?: string;
   configPath?: string;
   syncManager?: SyncManager | null;
   serverSigner?: ServerSigner;
+  tokenStore?: TokenStore;
   getTunnelStatus?: HealthDeps["getTunnelStatus"];
 }
 
@@ -82,6 +88,7 @@ export function createApp(deps: AppDeps): Hono {
       gateway: deps.gateway,
       accessLogWriter: deps.accessLogWriter,
       devToken: deps.devToken,
+      tokenStore: deps.tokenStore,
       syncManager: deps.syncManager ?? null,
     }),
   );
@@ -95,6 +102,7 @@ export function createApp(deps: AppDeps): Hono {
       serverOwner: deps.serverOwner,
       serverOrigin: deps.serverOrigin,
       devToken: deps.devToken,
+      tokenStore: deps.tokenStore,
       serverSigner: deps.serverSigner,
     }),
   );
@@ -108,6 +116,7 @@ export function createApp(deps: AppDeps): Hono {
       serverOrigin: deps.serverOrigin,
       serverOwner: deps.serverOwner,
       devToken: deps.devToken,
+      tokenStore: deps.tokenStore,
     }),
   );
 
@@ -119,9 +128,27 @@ export function createApp(deps: AppDeps): Hono {
       serverOrigin: deps.serverOrigin,
       serverOwner: deps.serverOwner,
       devToken: deps.devToken,
+      tokenStore: deps.tokenStore,
       syncManager: deps.syncManager ?? null,
     }),
   );
+
+  // Mount login flow v2 routes (self-hosted CLI auth, no auth required)
+  if (deps.tokenStore) {
+    app.route(
+      "/auth/device",
+      authDeviceRoutes({
+        logger: deps.logger,
+        serverOrigin: deps.serverOrigin,
+        localApprovalOrigin: deps.localApprovalOrigin,
+        serverOwner: deps.serverOwner,
+        tokenStore: deps.tokenStore,
+        devToken: deps.devToken,
+        accessToken: deps.accessToken,
+        allowInteractiveLogin: !deps.cloudMode,
+      }),
+    );
+  }
 
   // Mount dev UI routes when dev token is available
   if (deps.devToken) {

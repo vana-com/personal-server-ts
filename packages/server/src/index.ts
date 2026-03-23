@@ -1,4 +1,5 @@
-import { serve } from "@hono/node-server";
+import { createAdaptorServer } from "@hono/node-server";
+import type { AddressInfo } from "node:net";
 import { createRequire } from "node:module";
 import { loadConfig } from "@opendatalabs/personal-server-ts-core/config";
 import { createServer } from "./bootstrap.js";
@@ -8,6 +9,39 @@ const require = createRequire(import.meta.url);
 const pkg = require("../package.json") as { version: string };
 
 const DRAIN_TIMEOUT_MS = 5_000;
+type NodeFetchHandler = Parameters<typeof createAdaptorServer>[0]["fetch"];
+type NodeServer = ReturnType<typeof createAdaptorServer>;
+
+async function listenHttpServer(params: {
+  fetch: NodeFetchHandler;
+  port: number;
+  hostname?: string;
+  onListening?: (info: AddressInfo) => void;
+}): Promise<NodeServer> {
+  const server = createAdaptorServer({ fetch: params.fetch });
+
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error) => {
+      server.off("error", onError);
+      reject(error);
+    };
+
+    server.once("error", onError);
+    server.listen(params.port, params.hostname, () => {
+      server.off("error", onError);
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        reject(new Error("Could not resolve bound server address"));
+        return;
+      }
+
+      params.onListening?.(address);
+      resolve();
+    });
+  });
+
+  return server;
+}
 
 async function main(): Promise<void> {
   const rootPath = process.env.PERSONAL_SERVER_ROOT_PATH;
@@ -15,9 +49,10 @@ async function main(): Promise<void> {
   const context = await createServer(config, { rootPath });
   const { app, logger, devToken } = context;
 
-  const server = serve(
-    { fetch: app.fetch, port: config.server.port },
-    (info) => {
+  const server = await listenHttpServer({
+    fetch: app.fetch,
+    port: config.server.port,
+    onListening: (info) => {
       logger.info({ port: info.port, version: pkg.version }, "Server started");
 
       if (devToken) {
@@ -28,7 +63,31 @@ async function main(): Promise<void> {
         logger.info({ devToken }, "Dev token (ephemeral)");
       }
     },
-  );
+  });
+
+  let localAuthServer: NodeServer | undefined;
+  if (context.localApprovalPort) {
+    try {
+      localAuthServer = await listenHttpServer({
+        fetch: app.fetch,
+        port: context.localApprovalPort,
+        hostname: "127.0.0.1",
+        onListening: (info) => {
+          const localApprovalOrigin = `http://127.0.0.1:${info.port}`;
+          context.setLocalApprovalOrigin(localApprovalOrigin);
+          logger.info(
+            { localApprovalOrigin },
+            "Loopback auth listener started",
+          );
+        },
+      });
+    } catch (err) {
+      logger.warn(
+        { err, port: context.localApprovalPort },
+        "Loopback auth listener unavailable — public approval flow will require owner wallet auth",
+      );
+    }
+  }
 
   // Fire-and-forget: gateway check + tunnel connect (slow operations)
   // HTTP server is already listening so POST /v1/data/:scope works immediately
@@ -61,10 +120,19 @@ async function main(): Promise<void> {
   function shutdown(signal: string): void {
     logger.info({ signal }, "Shutdown signal received, draining connections");
 
-    server.close(() => {
-      logger.info("Server stopped");
-      process.exit(0);
-    });
+    let pending = localAuthServer ? 2 : 1;
+    const finish = () => {
+      pending -= 1;
+      if (pending === 0) {
+        logger.info("Server stopped");
+        process.exit(0);
+      }
+    };
+
+    server.close(finish);
+    if (localAuthServer) {
+      localAuthServer.close(finish);
+    }
 
     // Force exit after drain timeout
     setTimeout(() => {
