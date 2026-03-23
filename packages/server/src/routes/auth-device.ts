@@ -10,6 +10,14 @@
 import { randomBytes } from "node:crypto";
 import { Hono, type Context } from "hono";
 import type { Logger } from "pino";
+import {
+  verifyWeb3Signed,
+  type VerifiedAuth,
+} from "@opendatalabs/personal-server-ts-core/auth";
+import {
+  NotOwnerError,
+  ProtocolError,
+} from "@opendatalabs/personal-server-ts-core/errors";
 import type { TokenStore } from "../token-store.js";
 import { createWeb3AuthMiddleware } from "../middleware/web3-auth.js";
 import { createOwnerCheckMiddleware } from "../middleware/owner-check.js";
@@ -59,8 +67,12 @@ function purgeExpired(): void {
   }
 }
 
-function resolveOrigin(origin: string | (() => string)): string {
-  return typeof origin === "function" ? origin() : origin;
+function getRequestOrigin(c: Context): string {
+  return new URL(c.req.url).origin;
+}
+
+function getRequestPath(c: Context): string {
+  return new URL(c.req.url).pathname;
 }
 
 function isLocalhostRequest(remoteAddr: string | undefined): boolean {
@@ -80,6 +92,64 @@ function getSocketRemoteAddress(c: Context): string | undefined {
   return (c.env as any)?.incoming?.socket?.remoteAddress;
 }
 
+async function verifyRemoteOwnerApproval(
+  c: Context,
+  serverOwner: `0x${string}` | undefined,
+): Promise<VerifiedAuth | Response> {
+  if (!serverOwner) {
+    return c.json(
+      {
+        error: {
+          code: 500,
+          errorCode: "SERVER_NOT_CONFIGURED",
+          message:
+            "Server owner address not configured. Set VANA_MASTER_KEY_SIGNATURE environment variable.",
+        },
+      },
+      500,
+    );
+  }
+
+  const authHeader = c.req.header("authorization");
+  if (!authHeader) {
+    return c.json(
+      {
+        error: {
+          code: 403,
+          message:
+            "Remote approval requires owner wallet authentication. " +
+            "Connect the server owner wallet and try again.",
+        },
+      },
+      403,
+    );
+  }
+
+  try {
+    const auth = await verifyWeb3Signed({
+      headerValue: authHeader,
+      expectedOrigin: getRequestOrigin(c),
+      expectedMethod: c.req.method,
+      expectedPath: getRequestPath(c),
+    });
+
+    if (auth.signer.toLowerCase() !== serverOwner.toLowerCase()) {
+      const err = new NotOwnerError({
+        signer: auth.signer,
+        expected: serverOwner,
+      });
+      return c.json(err.toJSON(), 401);
+    }
+
+    return auth;
+  } catch (err) {
+    if (err instanceof ProtocolError) {
+      return c.json(err.toJSON(), err.code as 401 | 403);
+    }
+    throw err;
+  }
+}
+
 export function authDeviceRoutes(deps: LoginV2Deps): Hono {
   const app = new Hono();
   const web3Auth = createWeb3AuthMiddleware({
@@ -97,7 +167,7 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
 
     const sessionId = randomBytes(32).toString("hex");
     const pollToken = randomBytes(32).toString("hex");
-    const origin = resolveOrigin(deps.serverOrigin);
+    const origin = getRequestOrigin(c);
 
     const session: LoginSession = {
       sessionId,
@@ -163,7 +233,7 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
     }
 
     if (session.status === "approved" && session.accessToken) {
-      const origin = resolveOrigin(deps.serverOrigin);
+      const origin = getRequestOrigin(c);
 
       // Return token once, then delete session
       const response = {
@@ -210,7 +280,7 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
       return c.html(successPage());
     }
 
-    const origin = resolveOrigin(deps.serverOrigin);
+    const origin = getRequestOrigin(c);
     const owner = deps.serverOwner ?? "unknown";
 
     return c.html(approvePage(origin, owner, sessionId));
@@ -251,20 +321,15 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
     const remoteAddr = deps.getRemoteAddress?.(c) ?? getSocketRemoteAddress(c);
 
     if (!isLocalhostRequest(remoteAddr as string | undefined)) {
-      deps.logger.warn(
-        { remoteAddr, sessionId },
-        "Non-localhost approve attempt rejected",
-      );
-      return c.json(
-        {
-          error: {
-            code: 403,
-            message:
-              "Remote approval requires wallet authentication (not implemented in v1). " +
-              "Please approve from the same machine running the Personal Server.",
-          },
-        },
-        403,
+      const approvalAuth = await verifyRemoteOwnerApproval(c, deps.serverOwner);
+      if (approvalAuth instanceof Response) {
+        deps.logger.warn({ remoteAddr, sessionId }, "Remote approval rejected");
+        return approvalAuth;
+      }
+
+      deps.logger.info(
+        { remoteAddr, sessionId, signer: approvalAuth.signer },
+        "Remote approval authenticated with owner wallet",
       );
     }
 
@@ -395,6 +460,7 @@ function approvePage(origin: string, owner: string, sessionId: string): string {
     .btn:hover { background: #1d4ed8; }
     .btn:disabled { background: #94a3b8; cursor: not-allowed; }
     #status { text-align: center; margin-top: 1rem; font-size: 0.875rem; color: #666; }
+    .hint { margin-top: 1rem; font-size: 0.875rem; color: #666; line-height: 1.5; }
   </style>
 </head>
 <body>
@@ -408,17 +474,118 @@ function approvePage(origin: string, owner: string, sessionId: string): string {
     </dl>
     <button class="btn" id="approveBtn" onclick="approve()">Approve</button>
     <div id="status"></div>
+    <p class="hint" id="hint"></p>
   </div>
   <script>
-    async function approve() {
-      const btn = document.getElementById('approveBtn');
-      const status = document.getElementById('status');
-      btn.disabled = true;
-      btn.textContent = 'Authorizing...';
+    const SESSION_ID = ${JSON.stringify(sessionId)};
+    const OWNER_ADDRESS = ${JSON.stringify(owner)};
+    const EMPTY_BODY_SHA256 =
+      "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    function isLoopbackHost(hostname) {
+      return (
+        hostname === "localhost" ||
+        hostname === "127.0.0.1" ||
+        hostname === "::1" ||
+        hostname === "[::1]" ||
+        hostname.startsWith("127.")
+      );
+    }
+
+    function base64urlEncodeUtf8(input) {
+      const bytes = new TextEncoder().encode(input);
+      let binary = "";
+      for (const byte of bytes) binary += String.fromCharCode(byte);
+      return btoa(binary).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/, "");
+    }
+
+    function utf8ToHex(input) {
+      const bytes = new TextEncoder().encode(input);
+      return (
+        "0x" +
+        Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")
+      );
+    }
+
+    async function signPersonalMessage(message, address) {
+      const hexMessage = utf8ToHex(message);
       try {
-        const res = await fetch('/auth/device/approve?session=${escapeHtml(sessionId)}', {
+        return await window.ethereum.request({
+          method: "personal_sign",
+          params: [hexMessage, address],
+        });
+      } catch (err) {
+        return window.ethereum.request({
+          method: "personal_sign",
+          params: [address, hexMessage],
+        });
+      }
+    }
+
+    async function buildRemoteApprovalHeader() {
+      if (!window.ethereum) {
+        throw new Error("No wallet found in this browser. Open this page in a wallet-enabled browser.");
+      }
+
+      const accounts = await window.ethereum.request({
+        method: "eth_requestAccounts",
+      });
+      const signer = accounts && accounts[0];
+      if (!signer) {
+        throw new Error("No wallet account available.");
+      }
+      if (signer.toLowerCase() !== OWNER_ADDRESS.toLowerCase()) {
+        throw new Error(
+          "Connected wallet does not match the Personal Server owner."
+        );
+      }
+
+      const now = Math.floor(Date.now() / 1000);
+      const payload = {
+        aud: window.location.origin,
+        bodyHash: EMPTY_BODY_SHA256,
+        exp: now + 300,
+        iat: now,
+        method: "POST",
+        uri: window.location.pathname,
+      };
+      const orderedPayload = {};
+      for (const key of Object.keys(payload).sort()) {
+        orderedPayload[key] = payload[key];
+      }
+      const payloadBase64 = base64urlEncodeUtf8(JSON.stringify(orderedPayload));
+      const signature = await signPersonalMessage(payloadBase64, signer);
+      return "Web3Signed " + payloadBase64 + "." + signature;
+    }
+
+    const remoteApproval = !isLoopbackHost(window.location.hostname);
+    const btn = document.getElementById("approveBtn");
+    const status = document.getElementById("status");
+    const hint = document.getElementById("hint");
+
+    if (remoteApproval) {
+      btn.textContent = "Connect wallet and approve";
+      hint.textContent =
+        "Remote approvals require a signature from the Personal Server owner wallet.";
+    } else {
+      hint.textContent =
+        "This browser is on the same machine as the Personal Server, so approval stays local.";
+    }
+
+    async function approve() {
+      btn.disabled = true;
+      btn.textContent = remoteApproval ? 'Signing...' : 'Authorizing...';
+      status.textContent = "";
+      try {
+        const headers = {};
+        if (remoteApproval) {
+          headers["Authorization"] = await buildRemoteApprovalHeader();
+          btn.textContent = 'Authorizing...';
+        }
+
+        const res = await fetch('/auth/device/approve?session=' + encodeURIComponent(SESSION_ID), {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
         });
         if (res.ok) {
           document.querySelector('.card').innerHTML =

@@ -18,6 +18,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import pino from "pino";
+import type { TokenStore } from "./token-store.js";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const ownerWallet = createTestWallet(0);
@@ -77,6 +78,20 @@ function createMockAccessLogReader(): AccessLogReader {
   };
 }
 
+function createMockTokenStore(tokens: string[] = []): TokenStore {
+  const storedTokens = new Set(tokens);
+  return {
+    getTokens: vi.fn(async () => Array.from(storedTokens)),
+    isValid: vi.fn(async (token: string) => storedTokens.has(token)),
+    addToken: vi.fn(async (token: string) => {
+      storedTokens.add(token);
+    }),
+    removeToken: vi.fn(async (token: string) => {
+      storedTokens.delete(token);
+    }),
+  };
+}
+
 describe("createApp", () => {
   let tempDir: string;
   let indexManager: IndexManager;
@@ -122,6 +137,25 @@ describe("createApp", () => {
       accessLogWriter: createMockAccessLogWriter(),
       accessLogReader: createMockAccessLogReader(),
       accessToken: CONTROL_PLANE_TOKEN,
+    });
+  }
+
+  function makeAppWithTokenStore(
+    tokenStore: TokenStore = createMockTokenStore(),
+  ) {
+    const logger = pino({ level: "silent" });
+    return createApp({
+      logger,
+      version: "0.0.1",
+      startedAt: new Date(),
+      indexManager,
+      hierarchyOptions: { dataDir: join(tempDir, "data") },
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+      accessLogReader: createMockAccessLogReader(),
+      tokenStore,
     });
   }
 
@@ -297,6 +331,49 @@ describe("createApp", () => {
     expect(res.status).toBe(400);
     const body = await res.json();
     expect(body.error).toBe("INVALID_BODY");
+  });
+
+  it("POST /auth/device returns approval URLs on the request origin", async () => {
+    const app = makeAppWithTokenStore();
+    const res = await app.request(
+      new Request("https://ps.alice.com/auth/device", { method: "POST" }),
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.login).toMatch(
+      /^https:\/\/ps\.alice\.com\/auth\/device\/approve\?session=.+$/,
+    );
+    expect(body.poll.endpoint).toBe("/auth/device/poll");
+  });
+
+  it("remote owner-signed /auth/device/approve succeeds on the mounted app path", async () => {
+    const app = makeAppWithTokenStore();
+
+    const initRes = await app.request(
+      new Request("https://ps.alice.com/auth/device", { method: "POST" }),
+    );
+    const initBody = await initRes.json();
+    const sessionId = new URL(initBody.login).searchParams.get("session")!;
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: "https://ps.alice.com",
+      method: "POST",
+      uri: "/auth/device/approve",
+    });
+
+    const approveRes = await app.request(
+      new Request(
+        `https://ps.alice.com/auth/device/approve?session=${sessionId}`,
+        {
+          method: "POST",
+          headers: { authorization: auth },
+        },
+      ),
+    );
+
+    expect(approveRes.status).toBe(200);
+    expect(await approveRes.json()).toEqual({ status: "approved" });
   });
 
   // --- Phase 4: Sync manager wiring tests ---

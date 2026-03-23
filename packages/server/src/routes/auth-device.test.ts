@@ -42,6 +42,14 @@ function createApp(options?: {
   });
 }
 
+function request(
+  app: ReturnType<typeof authDeviceRoutes>,
+  path: string,
+  init?: RequestInit,
+) {
+  return app.request(new Request(`${SERVER_ORIGIN}${path}`, init));
+}
+
 describe("POST /auth/device", () => {
   beforeEach(() => {
     sessions.clear();
@@ -49,7 +57,7 @@ describe("POST /auth/device", () => {
 
   it("returns login URL and poll endpoint", async () => {
     const app = createApp();
-    const res = await app.request("/", { method: "POST" });
+    const res = await request(app, "/", { method: "POST" });
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -63,7 +71,7 @@ describe("POST /auth/device", () => {
 
   it("creates a session in the sessions map", async () => {
     const app = createApp();
-    await app.request("/", { method: "POST" });
+    await request(app, "/", { method: "POST" });
     expect(sessions.size).toBe(1);
   });
 });
@@ -75,13 +83,15 @@ describe("GET /auth/device/poll", () => {
 
   it("returns 400 if no token parameter", async () => {
     const app = createApp();
-    const res = await app.request("/poll", { method: "GET" });
+    const res = await request(app, "/poll", { method: "GET" });
     expect(res.status).toBe(400);
   });
 
   it("returns expired (404) for unknown token", async () => {
     const app = createApp();
-    const res = await app.request("/poll?token=nonexistent", { method: "GET" });
+    const res = await request(app, "/poll?token=nonexistent", {
+      method: "GET",
+    });
     expect(res.status).toBe(404);
     const body = await res.json();
     expect(body.status).toBe("expired");
@@ -91,10 +101,10 @@ describe("GET /auth/device/poll", () => {
     const app = createApp();
 
     // Initiate login
-    const initRes = await app.request("/", { method: "POST" });
+    const initRes = await request(app, "/", { method: "POST" });
     const { poll } = await initRes.json();
 
-    const res = await app.request(`/poll?token=${poll.token}`, {
+    const res = await request(app, `/poll?token=${poll.token}`, {
       method: "GET",
     });
     expect(res.status).toBe(404);
@@ -105,14 +115,14 @@ describe("GET /auth/device/poll", () => {
   it("returns 429 if polled too quickly", async () => {
     const app = createApp();
 
-    const initRes = await app.request("/", { method: "POST" });
+    const initRes = await request(app, "/", { method: "POST" });
     const { poll } = await initRes.json();
 
     // First poll
-    await app.request(`/poll?token=${poll.token}`, { method: "GET" });
+    await request(app, `/poll?token=${poll.token}`, { method: "GET" });
 
     // Second poll immediately — should be rate limited
-    const res = await app.request(`/poll?token=${poll.token}`, {
+    const res = await request(app, `/poll?token=${poll.token}`, {
       method: "GET",
     });
     expect(res.status).toBe(429);
@@ -122,7 +132,7 @@ describe("GET /auth/device/poll", () => {
     const app = createApp();
 
     // Initiate
-    const initRes = await app.request("/", { method: "POST" });
+    const initRes = await request(app, "/", { method: "POST" });
     const initBody = await initRes.json();
     const sessionId = new URL(initBody.login).searchParams.get("session")!;
     const pollToken = initBody.poll.token;
@@ -133,7 +143,7 @@ describe("GET /auth/device/poll", () => {
     session.accessToken = "vana_ps_test_token_123";
     session.lastPollAt = 0; // reset so poll succeeds
 
-    const res = await app.request(`/poll?token=${pollToken}`, {
+    const res = await request(app, `/poll?token=${pollToken}`, {
       method: "GET",
     });
     expect(res.status).toBe(200);
@@ -156,13 +166,13 @@ describe("GET /auth/device/approve", () => {
 
   it("returns 400 if no session parameter", async () => {
     const app = createApp();
-    const res = await app.request("/approve", { method: "GET" });
+    const res = await request(app, "/approve", { method: "GET" });
     expect(res.status).toBe(400);
   });
 
   it("returns 404 for unknown session", async () => {
     const app = createApp();
-    const res = await app.request("/approve?session=nonexistent", {
+    const res = await request(app, "/approve?session=nonexistent", {
       method: "GET",
     });
     expect(res.status).toBe(404);
@@ -171,11 +181,11 @@ describe("GET /auth/device/approve", () => {
   it("returns HTML approval page for valid session", async () => {
     const app = createApp();
 
-    const initRes = await app.request("/", { method: "POST" });
+    const initRes = await request(app, "/", { method: "POST" });
     const initBody = await initRes.json();
     const sessionId = new URL(initBody.login).searchParams.get("session")!;
 
-    const res = await app.request(`/approve?session=${sessionId}`, {
+    const res = await request(app, `/approve?session=${sessionId}`, {
       method: "GET",
     });
     expect(res.status).toBe(200);
@@ -189,14 +199,14 @@ describe("GET /auth/device/approve", () => {
   it("returns success page if session already approved", async () => {
     const app = createApp();
 
-    const initRes = await app.request("/", { method: "POST" });
+    const initRes = await request(app, "/", { method: "POST" });
     const initBody = await initRes.json();
     const sessionId = new URL(initBody.login).searchParams.get("session")!;
 
     // Mark as approved
     sessions.get(sessionId)!.status = "approved";
 
-    const res = await app.request(`/approve?session=${sessionId}`, {
+    const res = await request(app, `/approve?session=${sessionId}`, {
       method: "GET",
     });
     expect(res.status).toBe(200);
@@ -212,7 +222,7 @@ describe("POST /auth/device/approve", () => {
 
   it("returns 400 if no session parameter", async () => {
     const app = createApp();
-    const res = await app.request("/approve", {
+    const res = await request(app, "/approve", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
     });
@@ -221,7 +231,7 @@ describe("POST /auth/device/approve", () => {
 
   it("returns 404 for unknown session", async () => {
     const app = createApp();
-    const res = await app.request("/approve?session=nonexistent", {
+    const res = await request(app, "/approve?session=nonexistent", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
     });
@@ -231,11 +241,11 @@ describe("POST /auth/device/approve", () => {
   it("rejects non-localhost requests with 403", async () => {
     const app = createApp();
 
-    const initRes = await app.request("/", { method: "POST" });
+    const initRes = await request(app, "/", { method: "POST" });
     const initBody = await initRes.json();
     const sessionId = new URL(initBody.login).searchParams.get("session")!;
 
-    const res = await app.request(`/approve?session=${sessionId}`, {
+    const res = await request(app, `/approve?session=${sessionId}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -243,17 +253,72 @@ describe("POST /auth/device/approve", () => {
       },
     });
     expect(res.status).toBe(403);
+    expect((await res.json()).error.message).toContain(
+      "Remote approval requires owner wallet authentication",
+    );
+  });
+
+  it("approves remote requests signed by the owner wallet", async () => {
+    const tokenStore = createMockTokenStore();
+    const app = createApp({ tokenStore });
+
+    const initRes = await request(app, "/", { method: "POST" });
+    const initBody = await initRes.json();
+    const sessionId = new URL(initBody.login).searchParams.get("session")!;
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "POST",
+      uri: "/approve",
+    });
+
+    const res = await request(app, `/approve?session=${sessionId}`, {
+      method: "POST",
+      headers: {
+        Authorization: auth,
+        [TEST_REMOTE_ADDR_HEADER]: "203.0.113.5",
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ status: "approved" });
+    expect(tokenStore.addToken).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects remote approvals signed by a non-owner wallet", async () => {
+    const app = createApp();
+
+    const initRes = await request(app, "/", { method: "POST" });
+    const initBody = await initRes.json();
+    const sessionId = new URL(initBody.login).searchParams.get("session")!;
+    const auth = await buildWeb3SignedHeader({
+      wallet: createTestWallet(1),
+      aud: SERVER_ORIGIN,
+      method: "POST",
+      uri: "/approve",
+    });
+
+    const res = await request(app, `/approve?session=${sessionId}`, {
+      method: "POST",
+      headers: {
+        Authorization: auth,
+        [TEST_REMOTE_ADDR_HEADER]: "203.0.113.5",
+      },
+    });
+
+    expect(res.status).toBe(401);
+    expect((await res.json()).error.errorCode).toBe("NOT_OWNER");
   });
 
   it("approves session for localhost requests", async () => {
     const tokenStore = createMockTokenStore();
     const app = createApp({ tokenStore });
 
-    const initRes = await app.request("/", { method: "POST" });
+    const initRes = await request(app, "/", { method: "POST" });
     const initBody = await initRes.json();
     const sessionId = new URL(initBody.login).searchParams.get("session")!;
 
-    const res = await app.request(`/approve?session=${sessionId}`, {
+    const res = await request(app, `/approve?session=${sessionId}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -274,11 +339,11 @@ describe("POST /auth/device/approve", () => {
   it("approves session for ::1 (IPv6 localhost)", async () => {
     const app = createApp();
 
-    const initRes = await app.request("/", { method: "POST" });
+    const initRes = await request(app, "/", { method: "POST" });
     const initBody = await initRes.json();
     const sessionId = new URL(initBody.login).searchParams.get("session")!;
 
-    const res = await app.request(`/approve?session=${sessionId}`, {
+    const res = await request(app, `/approve?session=${sessionId}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -291,12 +356,12 @@ describe("POST /auth/device/approve", () => {
   it("returns already_approved for double approval", async () => {
     const app = createApp();
 
-    const initRes = await app.request("/", { method: "POST" });
+    const initRes = await request(app, "/", { method: "POST" });
     const initBody = await initRes.json();
     const sessionId = new URL(initBody.login).searchParams.get("session")!;
 
     // First approval
-    await app.request(`/approve?session=${sessionId}`, {
+    await request(app, `/approve?session=${sessionId}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -305,7 +370,7 @@ describe("POST /auth/device/approve", () => {
     });
 
     // Second approval
-    const res = await app.request(`/approve?session=${sessionId}`, {
+    const res = await request(app, `/approve?session=${sessionId}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -328,7 +393,7 @@ describe("full login flow", () => {
     const app = createApp({ tokenStore });
 
     // 1. Initiate login
-    const initRes = await app.request("/", { method: "POST" });
+    const initRes = await request(app, "/", { method: "POST" });
     expect(initRes.status).toBe(200);
     const initBody = await initRes.json();
 
@@ -336,7 +401,7 @@ describe("full login flow", () => {
     const pollToken = initBody.poll.token;
 
     // 2. Poll — should be pending
-    const pollRes1 = await app.request(`/poll?token=${pollToken}`, {
+    const pollRes1 = await request(app, `/poll?token=${pollToken}`, {
       method: "GET",
     });
     expect(pollRes1.status).toBe(404);
@@ -347,7 +412,7 @@ describe("full login flow", () => {
     // Reset lastPollAt so we can poll again
     sessions.get(sessionId)!.lastPollAt = 0;
 
-    const approveRes = await app.request(`/approve?session=${sessionId}`, {
+    const approveRes = await request(app, `/approve?session=${sessionId}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -357,7 +422,7 @@ describe("full login flow", () => {
     expect(approveRes.status).toBe(200);
 
     // 4. Poll — should be authorized
-    const pollRes2 = await app.request(`/poll?token=${pollToken}`, {
+    const pollRes2 = await request(app, `/poll?token=${pollToken}`, {
       method: "GET",
     });
     expect(pollRes2.status).toBe(200);
@@ -369,7 +434,7 @@ describe("full login flow", () => {
     expect(pollBody2.expires_at).toEqual(expect.any(String));
 
     // 5. Poll again — session should be gone
-    const pollRes3 = await app.request(`/poll?token=${pollToken}`, {
+    const pollRes3 = await request(app, `/poll?token=${pollToken}`, {
       method: "GET",
     });
     expect(pollRes3.status).toBe(404);
