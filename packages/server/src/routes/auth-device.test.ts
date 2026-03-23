@@ -30,11 +30,14 @@ function createApp(options?: {
   tokenStore?: TokenStore;
   accessToken?: string;
   devToken?: string;
+  serverOwner?: `0x${string}`;
 }) {
+  const serverOwner =
+    options && "serverOwner" in options ? options.serverOwner : SERVER_OWNER;
   return authDeviceRoutes({
     logger: pino({ level: "silent" }),
     serverOrigin: SERVER_ORIGIN,
-    serverOwner: SERVER_OWNER,
+    serverOwner,
     tokenStore: options?.tokenStore ?? createMockTokenStore(),
     accessToken: options?.accessToken,
     devToken: options?.devToken,
@@ -73,6 +76,15 @@ describe("POST /auth/device", () => {
     const app = createApp();
     await request(app, "/", { method: "POST" });
     expect(sessions.size).toBe(1);
+  });
+
+  it("requires a configured server owner", async () => {
+    const app = createApp({ serverOwner: undefined });
+    const res = await request(app, "/", { method: "POST" });
+
+    expect(res.status).toBe(500);
+    expect((await res.json()).error.errorCode).toBe("SERVER_NOT_CONFIGURED");
+    expect(sessions.size).toBe(0);
   });
 });
 

@@ -165,6 +165,20 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
   app.post("/", (c) => {
     purgeExpired();
 
+    if (!deps.serverOwner) {
+      return c.json(
+        {
+          error: {
+            code: 500,
+            errorCode: "SERVER_NOT_CONFIGURED",
+            message:
+              "Server owner address not configured. Set VANA_MASTER_KEY_SIGNATURE environment variable.",
+          },
+        },
+        500,
+      );
+    }
+
     const sessionId = randomBytes(32).toString("hex");
     const pollToken = randomBytes(32).toString("hex");
     const origin = getRequestOrigin(c);
@@ -233,13 +247,27 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
     }
 
     if (session.status === "approved" && session.accessToken) {
+      if (!deps.serverOwner) {
+        sessions.delete(session.sessionId);
+        return c.json(
+          {
+            error: {
+              code: 500,
+              errorCode: "SERVER_NOT_CONFIGURED",
+              message:
+                "Server owner address not configured. Set VANA_MASTER_KEY_SIGNATURE environment variable.",
+            },
+          },
+          500,
+        );
+      }
       const origin = getRequestOrigin(c);
 
       // Return token once, then delete session
       const response = {
         status: "authorized",
         server: origin,
-        address: deps.serverOwner ?? origin,
+        address: deps.serverOwner,
         access_token: session.accessToken,
         expires_at: session.accessTokenExpiresAt,
       };
@@ -334,6 +362,19 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
     }
 
     // Generate a new access token
+    if (!deps.serverOwner) {
+      return c.json(
+        {
+          error: {
+            code: 500,
+            errorCode: "SERVER_NOT_CONFIGURED",
+            message:
+              "Server owner address not configured. Set VANA_MASTER_KEY_SIGNATURE environment variable.",
+          },
+        },
+        500,
+      );
+    }
     const accessToken = `vana_ps_${randomBytes(32).toString("hex")}`;
     const expiresAt = new Date(Date.now() + CLI_TOKEN_TTL_MS).toISOString();
 
