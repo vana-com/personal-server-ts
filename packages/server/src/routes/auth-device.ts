@@ -25,6 +25,7 @@ import { createOwnerCheckMiddleware } from "../middleware/owner-check.js";
 export interface LoginV2Deps {
   logger: Logger;
   serverOrigin: string | (() => string);
+  localApprovalOrigin?: string | (() => string | undefined);
   serverOwner?: `0x${string}`;
   tokenStore: TokenStore;
   devToken?: string;
@@ -36,6 +37,7 @@ export interface LoginV2Deps {
 interface LoginSession {
   sessionId: string;
   pollToken: string;
+  requestedServerOrigin: string;
   status: "pending" | "approved" | "expired";
   accessToken?: string;
   accessTokenExpiresAt?: string;
@@ -76,6 +78,12 @@ function getRequestPath(c: Context): string {
   return new URL(c.req.url).pathname;
 }
 
+function resolveOrigin(
+  origin: string | (() => string | undefined) | undefined,
+): string | undefined {
+  return typeof origin === "function" ? origin() : origin;
+}
+
 function isLocalhostRequest(remoteAddr: string | undefined): boolean {
   if (!remoteAddr) return false;
   return (
@@ -108,6 +116,26 @@ function getSocketRemoteAddress(c: Context): string | undefined {
   // Access Node.js socket via Hono's env bindings when running on the real server.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return (c.env as any)?.incoming?.socket?.remoteAddress;
+}
+
+function usesLocalApprovalChannel(c: Context, deps: LoginV2Deps): boolean {
+  const localApprovalOrigin = resolveOrigin(deps.localApprovalOrigin);
+  if (!localApprovalOrigin) {
+    return false;
+  }
+
+  return getRequestOrigin(c) === localApprovalOrigin;
+}
+
+function getApprovalOrigin(c: Context, deps: LoginV2Deps): string {
+  const requestOrigin = getRequestOrigin(c);
+  const localApprovalOrigin = resolveOrigin(deps.localApprovalOrigin);
+
+  if (localApprovalOrigin && isLocalhostOrigin(requestOrigin)) {
+    return localApprovalOrigin;
+  }
+
+  return requestOrigin;
 }
 
 async function verifyRemoteOwnerApproval(
@@ -201,11 +229,12 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
 
       const sessionId = randomBytes(32).toString("hex");
       const pollToken = randomBytes(32).toString("hex");
-      const origin = getRequestOrigin(c);
+      const requestedServerOrigin = getRequestOrigin(c);
 
       const session: LoginSession = {
         sessionId,
         pollToken,
+        requestedServerOrigin,
         status: "pending",
         createdAt: Date.now(),
         lastPollAt: 0,
@@ -215,7 +244,7 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
       deps.logger.info({ sessionId }, "Login flow initiated");
 
       return c.json({
-        login: `${origin}/auth/device/approve?session=${sessionId}`,
+        login: `${getApprovalOrigin(c, deps)}/auth/device/approve?session=${sessionId}`,
         poll: {
           endpoint: "/auth/device/poll",
           token: pollToken,
@@ -281,12 +310,10 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
             500,
           );
         }
-        const origin = getRequestOrigin(c);
-
         // Return token once, then delete session
         const response = {
           status: "authorized",
-          server: origin,
+          server: session.requestedServerOrigin,
           address: deps.serverOwner,
           access_token: session.accessToken,
           expires_at: session.accessTokenExpiresAt,
@@ -328,10 +355,17 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
         return c.html(successPage());
       }
 
-      const origin = getRequestOrigin(c);
       const owner = deps.serverOwner ?? "unknown";
+      const localApprovalShortcutEnabled = usesLocalApprovalChannel(c, deps);
 
-      return c.html(approvePage(origin, owner, sessionId));
+      return c.html(
+        approvePage(
+          session.requestedServerOrigin,
+          owner,
+          sessionId,
+          localApprovalShortcutEnabled,
+        ),
+      );
     });
 
     // POST /approve  — Approve the session
@@ -371,9 +405,8 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
       // or X-Real-IP headers which are trivially spoofable by remote attackers.
       const remoteAddr =
         deps.getRemoteAddress?.(c) ?? getSocketRemoteAddress(c);
-      const requestOrigin = getRequestOrigin(c);
       const allowLocalShortcut =
-        isLocalhostOrigin(requestOrigin) &&
+        usesLocalApprovalChannel(c, deps) &&
         isLocalhostRequest(remoteAddr as string | undefined);
 
       if (!allowLocalShortcut) {
@@ -507,7 +540,12 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
 
 // ── HTML pages ──────────────────────────────────────────────────────
 
-function approvePage(origin: string, owner: string, sessionId: string): string {
+function approvePage(
+  origin: string,
+  owner: string,
+  sessionId: string,
+  localApprovalShortcutEnabled: boolean,
+): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -560,18 +598,9 @@ function approvePage(origin: string, owner: string, sessionId: string): string {
   <script>
     const SESSION_ID = ${JSON.stringify(sessionId)};
     const OWNER_ADDRESS = ${JSON.stringify(owner)};
+    const LOCAL_APPROVAL_SHORTCUT_ENABLED = ${JSON.stringify(localApprovalShortcutEnabled)};
     const EMPTY_BODY_SHA256 =
       "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-
-    function isLoopbackHost(hostname) {
-      return (
-        hostname === "localhost" ||
-        hostname === "127.0.0.1" ||
-        hostname === "::1" ||
-        hostname === "[::1]" ||
-        hostname.startsWith("127.")
-      );
-    }
 
     function base64urlEncodeUtf8(input) {
       const bytes = new TextEncoder().encode(input);
@@ -639,7 +668,7 @@ function approvePage(origin: string, owner: string, sessionId: string): string {
       return "Web3Signed " + payloadBase64 + "." + signature;
     }
 
-    const remoteApproval = !isLoopbackHost(window.location.hostname);
+    const remoteApproval = !LOCAL_APPROVAL_SHORTCUT_ENABLED;
     const btn = document.getElementById("approveBtn");
     const status = document.getElementById("status");
     const hint = document.getElementById("hint");

@@ -142,7 +142,11 @@ describe("createApp", () => {
 
   function makeAppWithTokenStore(
     tokenStore: TokenStore = createMockTokenStore(),
-    options?: { cloudMode?: boolean; accessToken?: string },
+    options?: {
+      cloudMode?: boolean;
+      accessToken?: string;
+      localApprovalOrigin?: string | (() => string | undefined);
+    },
   ) {
     const logger = pino({ level: "silent" });
     return createApp({
@@ -152,6 +156,7 @@ describe("createApp", () => {
       indexManager,
       hierarchyOptions: { dataDir: join(tempDir, "data") },
       serverOrigin: SERVER_ORIGIN,
+      localApprovalOrigin: options?.localApprovalOrigin,
       serverOwner: ownerWallet.address,
       gateway: createMockGateway(),
       accessLogWriter: createMockAccessLogWriter(),
@@ -350,6 +355,22 @@ describe("createApp", () => {
     expect(body.poll.endpoint).toBe("/auth/device/poll");
   });
 
+  it("POST /auth/device returns loopback approval URLs for localhost login initiation", async () => {
+    const app = makeAppWithTokenStore(createMockTokenStore(), {
+      localApprovalOrigin: "http://127.0.0.1:34127",
+    });
+
+    const res = await app.request(
+      new Request("http://localhost:8080/auth/device", { method: "POST" }),
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.login).toMatch(
+      /^http:\/\/127\.0\.0\.1:34127\/auth\/device\/approve\?session=.+$/,
+    );
+  });
+
   it("remote owner-signed /auth/device/approve succeeds on the mounted app path", async () => {
     const app = makeAppWithTokenStore();
 
@@ -377,6 +398,32 @@ describe("createApp", () => {
 
     expect(approveRes.status).toBe(200);
     expect(await approveRes.json()).toEqual({ status: "approved" });
+  });
+
+  it("public localhost /auth/device/approve requires owner auth when a loopback auth channel is configured", async () => {
+    const app = makeAppWithTokenStore(createMockTokenStore(), {
+      localApprovalOrigin: "http://127.0.0.1:34127",
+    });
+
+    const initRes = await app.request(
+      new Request("http://localhost:8080/auth/device", { method: "POST" }),
+    );
+    const initBody = await initRes.json();
+    const sessionId = new URL(initBody.login).searchParams.get("session")!;
+
+    const approveRes = await app.request(
+      new Request(
+        `http://localhost:8080/auth/device/approve?session=${sessionId}`,
+        {
+          method: "POST",
+        },
+      ),
+    );
+
+    expect(approveRes.status).toBe(403);
+    expect((await approveRes.json()).error.message).toContain(
+      "Remote approval requires owner wallet authentication",
+    );
   });
 
   it("cloud mode disables interactive /auth/device login flow", async () => {

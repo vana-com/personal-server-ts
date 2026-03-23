@@ -32,6 +32,7 @@ export interface AppDeps {
   indexManager: IndexManager;
   hierarchyOptions: HierarchyManagerOptions;
   serverOrigin: string | (() => string);
+  localApprovalOrigin?: string | (() => string | undefined);
   serverOwner?: `0x${string}`;
   identity?: IdentityInfo;
   gateway: GatewayClient;
@@ -139,6 +140,7 @@ export function createApp(deps: AppDeps): Hono {
       authDeviceRoutes({
         logger: deps.logger,
         serverOrigin: deps.serverOrigin,
+        localApprovalOrigin: deps.localApprovalOrigin,
         serverOwner: deps.serverOwner,
         tokenStore: deps.tokenStore,
         devToken: deps.devToken,

@@ -61,6 +61,9 @@ export interface ServerContext {
   syncManager: SyncManager | null;
   tunnelManager?: TunnelManager;
   tunnelUrl?: string;
+  localApprovalPort?: number;
+  getLocalApprovalOrigin: () => string | undefined;
+  setLocalApprovalOrigin: (origin?: string) => void;
   devToken?: string;
   startBackgroundServices: () => Promise<void>;
   cleanup: () => Promise<void>;
@@ -71,6 +74,30 @@ export interface CreateServerOptions {
   /** @deprecated Use rootPath instead. */
   serverDir?: string;
   dataDir?: string;
+}
+
+const DEFAULT_LOCAL_APPROVAL_PORT = 34127;
+
+function resolveLocalApprovalPort(serverPort: number): number {
+  const raw = process.env.LOCAL_AUTH_PORT;
+  if (raw !== undefined) {
+    const parsed = Number(raw);
+    if (
+      Number.isInteger(parsed) &&
+      parsed >= 1 &&
+      parsed <= 65535 &&
+      parsed !== serverPort
+    ) {
+      return parsed;
+    }
+  }
+
+  const adjacentPort = serverPort + 1;
+  if (adjacentPort <= 65535) {
+    return adjacentPort;
+  }
+
+  return DEFAULT_LOCAL_APPROVAL_PORT;
 }
 
 export async function createServer(
@@ -245,9 +272,14 @@ export async function createServer(
   // Token store for /auth/device flow (self-hosted CLI auth)
   const tokensPath = join(storageRoot, "tokens.json");
   const tokenStore: TokenStore = createTokenStore(tokensPath, logger);
+  const cloudMode = process.env.CLOUD_MODE === "true";
+  const localApprovalPort = cloudMode
+    ? undefined
+    : resolveLocalApprovalPort(config.server.port);
 
   // Mutable origin — starts with config value, updated when tunnel connects
   let effectiveOrigin = config.server.origin;
+  let effectiveLocalApprovalOrigin: string | undefined;
 
   // Mutable tunnelManager — set when tunnel starts in background
   let tunnelManager: TunnelManager | undefined;
@@ -259,12 +291,13 @@ export async function createServer(
     indexManager,
     hierarchyOptions,
     serverOrigin: () => effectiveOrigin,
+    localApprovalOrigin: () => effectiveLocalApprovalOrigin,
     serverOwner,
     identity,
     gateway: gatewayClient,
     accessLogWriter,
     accessLogReader,
-    cloudMode: process.env.CLOUD_MODE === "true",
+    cloudMode,
     devToken,
     accessToken,
     tokenStore,
@@ -297,6 +330,11 @@ export async function createServer(
     syncManager,
     tunnelManager,
     tunnelUrl: undefined,
+    localApprovalPort,
+    getLocalApprovalOrigin: () => effectiveLocalApprovalOrigin,
+    setLocalApprovalOrigin: (origin?: string) => {
+      effectiveLocalApprovalOrigin = origin;
+    },
     devToken,
     startBackgroundServices: async () => {
       // --- Gateway registration check (slow: HTTP call) ---

@@ -16,8 +16,9 @@ This document freezes the intended meaning of Personal Server auth mechanisms.
 
 - Owner-session auth is for owner operations such as ingest, delete, listing scopes, listing versions, and revoking CLI tokens.
 - Self-hosted `/auth/device` approval supports two owner paths:
-  - same-machine trusted local approval
+  - same-machine trusted local approval on a dedicated loopback-only auth listener
   - remote approval authenticated with owner `Web3Signed` wallet proof
+- The public `/auth/device/approve` route never relies on peer locality. The local shortcut only exists on the separate loopback approval channel.
 - The long-lived `PS_ACCESS_TOKEN` is the cloud control-plane credential. It is not the token returned to the CLI at login.
 - `POST /auth/device/token` is reserved for the cloud control plane. Normal CLI sessions, `Web3Signed` owner auth, and `devToken` bypass are not the launch contract for provisioning additional session tokens.
 - Cloud and self-hosted CLI logins both end up with token-store-backed owner session tokens that can be revoked independently.

@@ -31,12 +31,14 @@ function createApp(options?: {
   accessToken?: string;
   devToken?: string;
   serverOwner?: `0x${string}`;
+  localApprovalOrigin?: string;
 }) {
   const serverOwner =
     options && "serverOwner" in options ? options.serverOwner : SERVER_OWNER;
   return authDeviceRoutes({
     logger: pino({ level: "silent" }),
     serverOrigin: SERVER_ORIGIN,
+    localApprovalOrigin: options?.localApprovalOrigin,
     serverOwner,
     tokenStore: options?.tokenStore ?? createMockTokenStore(),
     accessToken: options?.accessToken,
@@ -76,6 +78,36 @@ describe("POST /auth/device", () => {
     const app = createApp();
     await request(app, "/", { method: "POST" });
     expect(sessions.size).toBe(1);
+  });
+
+  it("returns a dedicated loopback approval URL for localhost login initiation", async () => {
+    const app = createApp({
+      localApprovalOrigin: "http://127.0.0.1:34127",
+    });
+    const res = await request(app, "/", { method: "POST" });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.login).toMatch(
+      /^http:\/\/127\.0\.0\.1:34127\/auth\/device\/approve\?session=.+$/,
+    );
+    expect(body.poll.endpoint).toBe("/auth/device/poll");
+  });
+
+  it("keeps public approval URLs on the public origin", async () => {
+    const app = createApp({
+      localApprovalOrigin: "http://127.0.0.1:34127",
+    });
+
+    const res = await app.request(
+      new Request("https://ps.alice.com/", { method: "POST" }),
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.login).toMatch(
+      /^https:\/\/ps\.alice\.com\/auth\/device\/approve\?session=.+$/,
+    );
   });
 
   it("requires a configured server owner", async () => {
@@ -208,6 +240,27 @@ describe("GET /auth/device/approve", () => {
     expect(html).toContain("Approve");
   });
 
+  it("shows the requested server origin even when approval happens on the loopback channel", async () => {
+    const app = createApp({
+      localApprovalOrigin: "http://127.0.0.1:34127",
+    });
+
+    const initRes = await request(app, "/", { method: "POST" });
+    const initBody = await initRes.json();
+    const sessionId = new URL(initBody.login).searchParams.get("session")!;
+
+    const res = await app.request(
+      new Request(`http://127.0.0.1:34127/approve?session=${sessionId}`, {
+        method: "GET",
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(SERVER_ORIGIN);
+    expect(html).not.toContain("127.0.0.1:34127</dd>");
+  });
+
   it("returns success page if session already approved", async () => {
     const app = createApp();
 
@@ -324,19 +377,24 @@ describe("POST /auth/device/approve", () => {
 
   it("approves session for localhost requests", async () => {
     const tokenStore = createMockTokenStore();
-    const app = createApp({ tokenStore });
+    const app = createApp({
+      tokenStore,
+      localApprovalOrigin: "http://127.0.0.1:34127",
+    });
 
     const initRes = await request(app, "/", { method: "POST" });
     const initBody = await initRes.json();
     const sessionId = new URL(initBody.login).searchParams.get("session")!;
 
-    const res = await request(app, `/approve?session=${sessionId}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1",
-      },
-    });
+    const res = await app.request(
+      new Request(`http://127.0.0.1:34127/approve?session=${sessionId}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1",
+        },
+      }),
+    );
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ status: "approved" });
     expect(tokenStore.addToken).toHaveBeenCalledTimes(1);
@@ -345,6 +403,28 @@ describe("POST /auth/device/approve", () => {
       {
         expiresAt: expect.any(String),
       },
+    );
+  });
+
+  it("does not auto-approve on the public localhost listener", async () => {
+    const app = createApp({
+      localApprovalOrigin: "http://127.0.0.1:34127",
+    });
+
+    const initRes = await request(app, "/", { method: "POST" });
+    const initBody = await initRes.json();
+    const sessionId = new URL(initBody.login).searchParams.get("session")!;
+
+    const res = await request(app, `/approve?session=${sessionId}`, {
+      method: "POST",
+      headers: {
+        [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1",
+      },
+    });
+
+    expect(res.status).toBe(403);
+    expect((await res.json()).error.message).toContain(
+      "Remote approval requires owner wallet authentication",
     );
   });
 
@@ -402,46 +482,56 @@ describe("POST /auth/device/approve", () => {
   });
 
   it("approves session for ::1 (IPv6 localhost)", async () => {
-    const app = createApp();
+    const app = createApp({
+      localApprovalOrigin: "http://127.0.0.1:34127",
+    });
 
     const initRes = await request(app, "/", { method: "POST" });
     const initBody = await initRes.json();
     const sessionId = new URL(initBody.login).searchParams.get("session")!;
 
-    const res = await request(app, `/approve?session=${sessionId}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        [TEST_REMOTE_ADDR_HEADER]: "::1",
-      },
-    });
+    const res = await app.request(
+      new Request(`http://127.0.0.1:34127/approve?session=${sessionId}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          [TEST_REMOTE_ADDR_HEADER]: "::1",
+        },
+      }),
+    );
     expect(res.status).toBe(200);
   });
 
   it("returns already_approved for double approval", async () => {
-    const app = createApp();
+    const app = createApp({
+      localApprovalOrigin: "http://127.0.0.1:34127",
+    });
 
     const initRes = await request(app, "/", { method: "POST" });
     const initBody = await initRes.json();
     const sessionId = new URL(initBody.login).searchParams.get("session")!;
 
     // First approval
-    await request(app, `/approve?session=${sessionId}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1",
-      },
-    });
+    await app.request(
+      new Request(`http://127.0.0.1:34127/approve?session=${sessionId}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1",
+        },
+      }),
+    );
 
     // Second approval
-    const res = await request(app, `/approve?session=${sessionId}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1",
-      },
-    });
+    const res = await app.request(
+      new Request(`http://127.0.0.1:34127/approve?session=${sessionId}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1",
+        },
+      }),
+    );
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.status).toBe("already_approved");
@@ -455,7 +545,10 @@ describe("full login flow", () => {
 
   it("complete flow: initiate -> approve -> poll -> get token", async () => {
     const tokenStore = createMockTokenStore();
-    const app = createApp({ tokenStore });
+    const app = createApp({
+      tokenStore,
+      localApprovalOrigin: "http://127.0.0.1:34127",
+    });
 
     // 1. Initiate login
     const initRes = await request(app, "/", { method: "POST" });
@@ -477,13 +570,15 @@ describe("full login flow", () => {
     // Reset lastPollAt so we can poll again
     sessions.get(sessionId)!.lastPollAt = 0;
 
-    const approveRes = await request(app, `/approve?session=${sessionId}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1",
-      },
-    });
+    const approveRes = await app.request(
+      new Request(`http://127.0.0.1:34127/approve?session=${sessionId}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1",
+        },
+      }),
+    );
     expect(approveRes.status).toBe(200);
 
     // 4. Poll — should be authorized
