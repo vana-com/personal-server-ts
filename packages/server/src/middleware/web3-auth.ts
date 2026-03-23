@@ -1,6 +1,9 @@
 import { timingSafeEqual } from "node:crypto";
 import type { MiddlewareHandler } from "hono";
-import { verifyWeb3Signed } from "@opendatalabs/personal-server-ts-core/auth";
+import {
+  verifyWeb3Signed,
+  type Web3SignedPayload,
+} from "@opendatalabs/personal-server-ts-core/auth";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { TokenStore } from "../token-store.js";
 
@@ -9,6 +12,11 @@ export type AuthMechanism =
   | "dev-token"
   | "access-token"
   | "cli-session-token";
+
+export interface RequestAuth {
+  signer: `0x${string}`;
+  payload: Partial<Web3SignedPayload>;
+}
 
 export interface Web3AuthMiddlewareDeps {
   serverOrigin: string | (() => string);
@@ -26,6 +34,14 @@ function safeCompare(a: string, b: string): boolean {
   if (a.length === 0 || b.length === 0) return false;
   if (a.length !== b.length) return false;
   return timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+function createOwnerSessionAuth(serverOwner: `0x${string}`): RequestAuth {
+  return {
+    signer: serverOwner,
+    // Bearer/session tokens authenticate the owner but do not carry Web3Signed claims.
+    payload: {},
+  };
 }
 
 /**
@@ -67,10 +83,7 @@ export function createWeb3AuthMiddleware(
           500,
         );
       }
-      c.set("auth", {
-        signer: deps.serverOwner,
-        payload: {},
-      });
+      c.set("auth", createOwnerSessionAuth(deps.serverOwner));
       c.set("authMechanism", "dev-token" satisfies AuthMechanism);
       c.set("isPolicyBypass", true);
       c.set("devBypass", true);
@@ -95,10 +108,7 @@ export function createWeb3AuthMiddleware(
             500,
           );
         }
-        c.set("auth", {
-          signer: deps.serverOwner,
-          payload: {},
-        });
+        c.set("auth", createOwnerSessionAuth(deps.serverOwner));
         c.set("authMechanism", "access-token" satisfies AuthMechanism);
         c.set("isPolicyBypass", false);
         c.set("devBypass", false);
@@ -124,10 +134,7 @@ export function createWeb3AuthMiddleware(
             500,
           );
         }
-        c.set("auth", {
-          signer: deps.serverOwner,
-          payload: {},
-        });
+        c.set("auth", createOwnerSessionAuth(deps.serverOwner));
         c.set("authMechanism", "cli-session-token" satisfies AuthMechanism);
         c.set("isPolicyBypass", false);
         c.set("devBypass", false);

@@ -1,7 +1,7 @@
 import type { MiddlewareHandler } from "hono";
 import type { GatewayClient } from "@opendatalabs/personal-server-ts-core/gateway";
-import type { VerifiedAuth } from "@opendatalabs/personal-server-ts-core/auth";
 import { UnregisteredBuilderError } from "@opendatalabs/personal-server-ts-core/errors";
+import type { RequestAuth } from "./web3-auth.js";
 
 /**
  * Verifies authenticated signer is a registered builder via Gateway.
@@ -17,7 +17,7 @@ export function createBuilderCheckMiddleware(
       return;
     }
 
-    const auth = c.get("auth") as VerifiedAuth;
+    const auth = c.get("auth") as RequestAuth;
     if (
       serverOwner &&
       auth.signer.toLowerCase() === serverOwner.toLowerCase()
