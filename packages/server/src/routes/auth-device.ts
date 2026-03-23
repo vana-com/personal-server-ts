@@ -87,6 +87,23 @@ function isLocalhostRequest(remoteAddr: string | undefined): boolean {
   );
 }
 
+function isLoopbackHost(hostname: string): boolean {
+  return (
+    hostname === "localhost" ||
+    hostname === "::1" ||
+    hostname === "127.0.0.1" ||
+    hostname.startsWith("127.")
+  );
+}
+
+function isLocalhostOrigin(origin: string): boolean {
+  try {
+    return isLoopbackHost(new URL(origin).hostname);
+  } catch {
+    return false;
+  }
+}
+
 function getSocketRemoteAddress(c: Context): string | undefined {
   // Access Node.js socket via Hono's env bindings when running on the real server.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -354,8 +371,12 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
       // or X-Real-IP headers which are trivially spoofable by remote attackers.
       const remoteAddr =
         deps.getRemoteAddress?.(c) ?? getSocketRemoteAddress(c);
+      const requestOrigin = getRequestOrigin(c);
+      const allowLocalShortcut =
+        isLocalhostOrigin(requestOrigin) &&
+        isLocalhostRequest(remoteAddr as string | undefined);
 
-      if (!isLocalhostRequest(remoteAddr as string | undefined)) {
+      if (!allowLocalShortcut) {
         const approvalAuth = await verifyRemoteOwnerApproval(
           c,
           deps.serverOwner,

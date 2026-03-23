@@ -348,6 +348,59 @@ describe("POST /auth/device/approve", () => {
     );
   });
 
+  it("does not trust localhost peer addresses for public-origin approvals", async () => {
+    const app = createApp();
+
+    const initRes = await app.request(
+      new Request("https://ps.alice.com/", { method: "POST" }),
+    );
+    const initBody = await initRes.json();
+    const sessionId = new URL(initBody.login).searchParams.get("session")!;
+
+    const res = await app.request(
+      new Request(`https://ps.alice.com/approve?session=${sessionId}`, {
+        method: "POST",
+        headers: {
+          [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1",
+        },
+      }),
+    );
+
+    expect(res.status).toBe(403);
+    expect((await res.json()).error.message).toContain(
+      "Remote approval requires owner wallet authentication",
+    );
+  });
+
+  it("accepts owner-signed approval for public origins even when proxied locally", async () => {
+    const app = createApp();
+
+    const initRes = await app.request(
+      new Request("https://ps.alice.com/", { method: "POST" }),
+    );
+    const initBody = await initRes.json();
+    const sessionId = new URL(initBody.login).searchParams.get("session")!;
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: "https://ps.alice.com",
+      method: "POST",
+      uri: "/approve",
+    });
+
+    const res = await app.request(
+      new Request(`https://ps.alice.com/approve?session=${sessionId}`, {
+        method: "POST",
+        headers: {
+          Authorization: auth,
+          [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1",
+        },
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ status: "approved" });
+  });
+
   it("approves session for ::1 (IPv6 localhost)", async () => {
     const app = createApp();
 
