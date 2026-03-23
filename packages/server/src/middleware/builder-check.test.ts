@@ -37,13 +37,18 @@ function createApp(gateway: GatewayClient) {
   return app;
 }
 
-function createOwnerTokenApp(gateway: GatewayClient, accessToken: string) {
+function createOwnerSessionApp(gateway: GatewayClient, sessionToken: string) {
   const app = new Hono();
   const serverOwner =
     "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd" as `0x${string}`;
   const web3Auth = createWeb3AuthMiddleware({
     serverOrigin: SERVER_ORIGIN,
-    accessToken,
+    tokenStore: {
+      getTokens: async () => [sessionToken],
+      isValid: async (token: string) => token === sessionToken,
+      addToken: async () => {},
+      removeToken: async () => {},
+    },
     serverOwner,
   });
   const builderCheck = createBuilderCheckMiddleware(gateway, serverOwner);
@@ -109,14 +114,14 @@ describe("createBuilderCheckMiddleware", () => {
   });
 
   it("allows owner-authenticated bearer tokens without requiring builder registration", async () => {
-    const accessToken = "vana_ps_owner_token";
+    const sessionToken = "vana_ps_owner_token";
     const gateway = createMockGateway({
       isRegisteredBuilder: vi.fn().mockResolvedValue(false),
     });
-    const app = createOwnerTokenApp(gateway, accessToken);
+    const app = createOwnerSessionApp(gateway, sessionToken);
 
     const res = await app.request("/test", {
-      headers: { Authorization: `Bearer ${accessToken}` },
+      headers: { Authorization: `Bearer ${sessionToken}` },
     });
 
     expect(res.status).toBe(200);

@@ -16,6 +16,7 @@ This document freezes the intended meaning of Personal Server auth mechanisms.
 
 - Owner-session auth is for owner operations such as ingest, delete, listing scopes, listing versions, and revoking CLI tokens.
 - The long-lived `PS_ACCESS_TOKEN` is the cloud control-plane credential. It is not the token returned to the CLI at login.
+- `POST /auth/device/token` is reserved for the cloud control plane. Normal CLI sessions, `Web3Signed` owner auth, and `devToken` bypass are not the launch contract for provisioning additional session tokens.
 - Cloud and self-hosted CLI logins both end up with token-store-backed owner session tokens that can be revoked independently.
 - Builder/grant reads stay separate. `GET /v1/data/:scope` still requires the normal builder + grant path unless a future product decision explicitly opens owner reads.
 - `devToken` remains the explicit escape hatch for local testing and trusted development flows. It should not be the default semantic model for newer CLI bearer tokens.

@@ -1,5 +1,5 @@
 /**
- * Persistent token store — manages PS access tokens on disk.
+ * Persistent token store — manages Personal Server session tokens on disk.
  *
  * Tokens are stored in a JSON file (tokens.json) in the PS data directory
  * so they survive restarts. Supports multiple concurrent tokens.
@@ -85,7 +85,10 @@ export function createTokenStore(filePath: string, logger: Logger): TokenStore {
         }
       }
       purgeExpired();
-      logger.info({ count: tokens.size }, "Loaded access tokens from disk");
+      logger.info(
+        { count: tokens.size },
+        "Loaded Personal Server session tokens from disk",
+      );
     } catch (err: unknown) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
         logger.warn({ err }, "Failed to read tokens file");

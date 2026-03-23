@@ -285,14 +285,15 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
     return c.json({ status: "approved" });
   });
 
-  // POST /token — add a CLI token to the store (owner-authenticated, used by cloud control plane)
+  // POST /token — add a CLI token to the store (control-plane authenticated)
   app.post("/token", web3Auth, ownerCheck, async (c) => {
-    if (c.get("authMechanism") === "cli-session-token") {
+    if (c.get("authMechanism") !== "control-plane-token") {
       return c.json(
         {
           error: {
             code: 403,
-            message: "CLI session tokens cannot mint additional CLI tokens",
+            message:
+              "Only control-plane tokens can provision Personal Server session tokens",
           },
         },
         403,

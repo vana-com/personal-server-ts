@@ -175,7 +175,7 @@ describe("createWeb3AuthMiddleware with dev token", () => {
   });
 });
 
-describe("createWeb3AuthMiddleware with access token (PS_ACCESS_TOKEN)", () => {
+describe("createWeb3AuthMiddleware with control-plane token (PS_ACCESS_TOKEN)", () => {
   const ACCESS_TOKEN = "vana_ps_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6";
   const SERVER_OWNER =
     "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd" as `0x${string}`;
@@ -199,7 +199,7 @@ describe("createWeb3AuthMiddleware with access token (PS_ACCESS_TOKEN)", () => {
     return app;
   }
 
-  it("valid access token authenticates as owner without enabling dev bypass", async () => {
+  it("valid control-plane token authenticates as owner without enabling dev bypass", async () => {
     const app = createAccessTokenApp();
 
     const res = await app.request("/test", {
@@ -212,7 +212,7 @@ describe("createWeb3AuthMiddleware with access token (PS_ACCESS_TOKEN)", () => {
     expect(json.devBypass).toBe(false);
   });
 
-  it("invalid access token falls through to Web3Signed verification", async () => {
+  it("invalid control-plane token falls through to Web3Signed verification", async () => {
     const app = createAccessTokenApp();
 
     const res = await app.request("/test", {
@@ -224,7 +224,7 @@ describe("createWeb3AuthMiddleware with access token (PS_ACCESS_TOKEN)", () => {
     expect(json.error.errorCode).toBe("INVALID_SIGNATURE");
   });
 
-  it("access token without serverOwner returns 500", async () => {
+  it("control-plane token without serverOwner returns 500", async () => {
     const app = new Hono();
     const web3Auth = createWeb3AuthMiddleware({
       serverOrigin: SERVER_ORIGIN,

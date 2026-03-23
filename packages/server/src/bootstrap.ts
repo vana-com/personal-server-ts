@@ -152,11 +152,13 @@ export async function createServer(
         const token = (await metadataRes.text()).trim();
         if (token.length > 0) {
           accessToken = token;
-          logger.info("PS access token loaded from instance metadata");
+          logger.info("PS control-plane token loaded from instance metadata");
         }
       }
     } catch {
-      logger.debug("Could not read PS access token from instance metadata");
+      logger.debug(
+        "Could not read PS control-plane token from instance metadata",
+      );
     }
   }
   if (accessToken) {

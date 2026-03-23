@@ -10,7 +10,7 @@ import type { TokenStore } from "../token-store.js";
 export type AuthMechanism =
   | "web3-signed"
   | "dev-token"
-  | "access-token"
+  | "control-plane-token"
   | "cli-session-token";
 
 export interface RequestAuth {
@@ -52,7 +52,7 @@ function createOwnerSessionAuth(serverOwner: `0x${string}`): RequestAuth {
  * Bearer token, auth context is populated with the server owner
  * and c.set('devBypass', true) is set to skip downstream checks.
  *
- * When an accessToken (PS_ACCESS_TOKEN) or tokenStore-issued CLI token is
+ * When a control-plane token (PS_ACCESS_TOKEN) or tokenStore-issued CLI token is
  * configured and the request carries a matching Bearer token, auth context
  * is populated with the server owner. These are owner-authenticated requests,
  * not dev-bypass requests.
@@ -91,7 +91,7 @@ export function createWeb3AuthMiddleware(
       return;
     }
 
-    // PS access token: Bearer token from CLI/automation, validated with constant-time comparison
+    // Control-plane token: long-lived hosted credential used for session brokerage.
     if (deps.accessToken && authHeader?.startsWith("Bearer ")) {
       const token = authHeader.slice(7);
       if (safeCompare(token, deps.accessToken)) {
@@ -109,7 +109,7 @@ export function createWeb3AuthMiddleware(
           );
         }
         c.set("auth", createOwnerSessionAuth(deps.serverOwner));
-        c.set("authMechanism", "access-token" satisfies AuthMechanism);
+        c.set("authMechanism", "control-plane-token" satisfies AuthMechanism);
         c.set("isPolicyBypass", false);
         c.set("devBypass", false);
         await next();

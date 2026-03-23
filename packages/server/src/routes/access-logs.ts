@@ -16,7 +16,6 @@ export interface AccessLogsRouteDeps {
   serverOrigin: string | (() => string);
   serverOwner?: `0x${string}`;
   devToken?: string;
-  accessToken?: string;
   tokenStore?: TokenStore;
 }
 
@@ -26,7 +25,6 @@ export function accessLogsRoutes(deps: AccessLogsRouteDeps): Hono {
   const web3Auth = createWeb3AuthMiddleware({
     serverOrigin: deps.serverOrigin,
     devToken: deps.devToken,
-    accessToken: deps.accessToken,
     tokenStore: deps.tokenStore,
     serverOwner: deps.serverOwner,
   });

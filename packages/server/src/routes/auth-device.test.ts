@@ -2,11 +2,15 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { authDeviceRoutes, sessions } from "./auth-device.js";
 import type { TokenStore } from "../token-store.js";
 import pino from "pino";
+import {
+  buildWeb3SignedHeader,
+  createTestWallet,
+} from "@opendatalabs/personal-server-ts-core/test-utils";
 
 const SERVER_ORIGIN = "http://localhost:8080";
-const SERVER_OWNER =
-  "0x1234567890abcdef1234567890abcdef12345678" as `0x${string}`;
 const TEST_REMOTE_ADDR_HEADER = "x-test-remote-addr";
+const ownerWallet = createTestWallet(0);
+const SERVER_OWNER = ownerWallet.address;
 
 function createMockTokenStore(): TokenStore {
   const tokens = new Set<string>();
@@ -25,6 +29,7 @@ function createMockTokenStore(): TokenStore {
 function createApp(options?: {
   tokenStore?: TokenStore;
   accessToken?: string;
+  devToken?: string;
 }) {
   return authDeviceRoutes({
     logger: pino({ level: "silent" }),
@@ -32,6 +37,7 @@ function createApp(options?: {
     serverOwner: SERVER_OWNER,
     tokenStore: options?.tokenStore ?? createMockTokenStore(),
     accessToken: options?.accessToken,
+    devToken: options?.devToken,
     getRemoteAddress: (c) => c.req.header(TEST_REMOTE_ADDR_HEADER),
   });
 }
@@ -386,7 +392,7 @@ describe("POST /auth/device/token", () => {
     expect((await res.json()).error.errorCode).toBe("MISSING_AUTH");
   });
 
-  it("allows owner-authenticated bearer tokens to add CLI session tokens", async () => {
+  it("allows control-plane tokens to add CLI session tokens", async () => {
     const controlPlaneToken = "vana_ps_control_plane";
     const tokenStore = createMockTokenStore();
     const app = createApp({ tokenStore, accessToken: controlPlaneToken });
@@ -427,7 +433,54 @@ describe("POST /auth/device/token", () => {
 
     expect(res.status).toBe(403);
     expect((await res.json()).error.message).toContain(
-      "cannot mint additional CLI tokens",
+      "Only control-plane tokens can provision",
+    );
+  });
+
+  it("rejects Web3Signed owner auth for token provisioning", async () => {
+    const tokenStore = createMockTokenStore();
+    const app = createApp({ tokenStore });
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "POST",
+      uri: "/token",
+    });
+
+    const res = await app.request("/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: auth,
+      },
+      body: JSON.stringify({ token: "vana_ps_new_cli_token" }),
+    });
+
+    expect(res.status).toBe(403);
+    expect((await res.json()).error.message).toContain(
+      "Only control-plane tokens can provision",
+    );
+  });
+
+  it("rejects dev-token bypass for token provisioning", async () => {
+    const tokenStore = createMockTokenStore();
+    const app = createApp({
+      tokenStore,
+      devToken: "local-dev-token",
+    });
+
+    const res = await app.request("/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer local-dev-token",
+      },
+      body: JSON.stringify({ token: "vana_ps_new_cli_token" }),
+    });
+
+    expect(res.status).toBe(403);
+    expect((await res.json()).error.message).toContain(
+      "Only control-plane tokens can provision",
     );
   });
 });

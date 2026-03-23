@@ -26,6 +26,7 @@ import {
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import { dataRoutes } from "./data.js";
 import type { DataRouteDeps } from "./data.js";
+import type { TokenStore } from "../token-store.js";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const wallet = createTestWallet(0);
@@ -86,6 +87,20 @@ function makeGrant(
 function createMockAccessLogWriter(): AccessLogWriter {
   return {
     write: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
+function createMockTokenStore(tokens: string[] = []): TokenStore {
+  const storedTokens = new Set(tokens);
+  return {
+    getTokens: vi.fn(async () => Array.from(storedTokens)),
+    isValid: vi.fn(async (token: string) => storedTokens.has(token)),
+    addToken: vi.fn(async (token: string) => {
+      storedTokens.add(token);
+    }),
+    removeToken: vi.fn(async (token: string) => {
+      storedTokens.delete(token);
+    }),
   };
 }
 
@@ -189,8 +204,8 @@ describe("POST /v1/data/:scope", () => {
     expect(json.error.errorCode).toBe("MISSING_AUTH");
   });
 
-  it("allows owner access token to ingest data without enabling policy bypass", async () => {
-    const accessToken = "vana_ps_owner_session_token";
+  it("allows owner session tokens to ingest data without enabling policy bypass", async () => {
+    const sessionToken = "vana_ps_owner_session_token";
     const localIndexManager = createIndexManager(
       initializeDatabase(":memory:"),
     );
@@ -202,14 +217,14 @@ describe("POST /v1/data/:scope", () => {
       serverOwner: ownerWallet.address,
       gateway: createMockGateway(),
       accessLogWriter: createMockAccessLogWriter(),
-      accessToken,
+      tokenStore: createMockTokenStore([sessionToken]),
     });
 
     const res = await localApp.request("/instagram.profile", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${accessToken}`,
+        Authorization: `Bearer ${sessionToken}`,
       },
       body: JSON.stringify({ username: "test" }),
     });
@@ -660,16 +675,19 @@ describe("GET /v1/data (list scopes)", () => {
     expect(json.error.errorCode).toBe("UNREGISTERED_BUILDER");
   });
 
-  it("allows owner access token to list scopes without builder registration", async () => {
-    const accessToken = "vana_ps_owner_session_token";
+  it("allows owner session tokens to list scopes without builder registration", async () => {
+    const sessionToken = "vana_ps_owner_session_token";
     const gateway = createMockGateway({
       isRegisteredBuilder: vi.fn().mockResolvedValue(false),
     });
-    const app = createApp({ gateway, accessToken });
+    const app = createApp({
+      gateway,
+      tokenStore: createMockTokenStore([sessionToken]),
+    });
     await ingestData("instagram.profile", { username: "test" }, app);
 
     const res = await app.request("/", {
-      headers: { Authorization: `Bearer ${accessToken}` },
+      headers: { Authorization: `Bearer ${sessionToken}` },
     });
 
     expect(res.status).toBe(200);
@@ -1009,14 +1027,16 @@ describe("GET /v1/data/:scope", () => {
     expect(json.error).toBe("NOT_FOUND");
   });
 
-  it("does not let owner access tokens bypass grant checks on raw reads", async () => {
-    const accessToken = "vana_ps_owner_session_token";
-    const app = createApp({ accessToken });
+  it("does not let owner session tokens bypass grant checks on raw reads", async () => {
+    const sessionToken = "vana_ps_owner_session_token";
+    const app = createApp({
+      tokenStore: createMockTokenStore([sessionToken]),
+    });
 
     await ingestData("instagram.profile", { username: "test_user" }, app);
 
     const res = await app.request("/instagram.profile", {
-      headers: { Authorization: `Bearer ${accessToken}` },
+      headers: { Authorization: `Bearer ${sessionToken}` },
     });
 
     expect(res.status).toBe(403);

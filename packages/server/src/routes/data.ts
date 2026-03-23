@@ -34,7 +34,6 @@ export interface DataRouteDeps {
   accessLogWriter: AccessLogWriter;
   syncManager?: SyncManager | null;
   devToken?: string;
-  accessToken?: string;
   tokenStore?: TokenStore;
 }
 
@@ -45,7 +44,6 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
   const web3Auth = createWeb3AuthMiddleware({
     serverOrigin: deps.serverOrigin,
     devToken: deps.devToken,
-    accessToken: deps.accessToken,
     tokenStore: deps.tokenStore,
     serverOwner: deps.serverOwner,
   });
