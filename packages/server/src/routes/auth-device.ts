@@ -456,6 +456,11 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
     }
 
     const token = authHeader.slice(7);
+    const tokenIsValid = await deps.tokenStore.isValid(token);
+    if (!tokenIsValid) {
+      return c.json({ status: "revoked" });
+    }
+
     await deps.tokenStore.removeToken(token);
 
     deps.logger.info("Token revoked via DELETE /token");

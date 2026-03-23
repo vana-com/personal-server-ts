@@ -561,3 +561,55 @@ describe("POST /auth/device/token", () => {
     );
   });
 });
+
+describe("DELETE /auth/device/token", () => {
+  beforeEach(() => {
+    sessions.clear();
+  });
+
+  it("requires a Bearer token", async () => {
+    const app = createApp();
+
+    const res = await app.request("/token", {
+      method: "DELETE",
+    });
+
+    expect(res.status).toBe(401);
+    expect((await res.json()).error.message).toContain("Missing Bearer token");
+  });
+
+  it("revokes a valid CLI session token", async () => {
+    const tokenStore = createMockTokenStore();
+    await tokenStore.addToken("vana_ps_cli_session");
+    const app = createApp({ tokenStore });
+
+    const res = await app.request("/token", {
+      method: "DELETE",
+      headers: {
+        Authorization: "Bearer vana_ps_cli_session",
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ status: "revoked" });
+    expect(tokenStore.isValid).toHaveBeenCalledWith("vana_ps_cli_session");
+    expect(tokenStore.removeToken).toHaveBeenCalledWith("vana_ps_cli_session");
+  });
+
+  it("does not mutate the token store for unknown bearer values", async () => {
+    const tokenStore = createMockTokenStore();
+    const app = createApp({ tokenStore });
+
+    const res = await app.request("/token", {
+      method: "DELETE",
+      headers: {
+        Authorization: "Bearer vana_ps_unknown",
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ status: "revoked" });
+    expect(tokenStore.isValid).toHaveBeenCalledWith("vana_ps_unknown");
+    expect(tokenStore.removeToken).not.toHaveBeenCalled();
+  });
+});
