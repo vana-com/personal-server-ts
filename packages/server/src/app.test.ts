@@ -22,6 +22,7 @@ import pino from "pino";
 const SERVER_ORIGIN = "http://localhost:8080";
 const ownerWallet = createTestWallet(0);
 const nonOwnerWallet = createTestWallet(1);
+const CONTROL_PLANE_TOKEN = "vana_ps_control_plane";
 
 function createMockSyncManager(): SyncManager {
   return {
@@ -104,6 +105,23 @@ describe("createApp", () => {
       gateway: createMockGateway(),
       accessLogWriter: createMockAccessLogWriter(),
       accessLogReader: createMockAccessLogReader(),
+    });
+  }
+
+  function makeAppWithControlPlaneToken() {
+    const logger = pino({ level: "silent" });
+    return createApp({
+      logger,
+      version: "0.0.1",
+      startedAt: new Date(),
+      indexManager,
+      hierarchyOptions: { dataDir: join(tempDir, "data") },
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+      accessLogReader: createMockAccessLogReader(),
+      accessToken: CONTROL_PLANE_TOKEN,
     });
   }
 
@@ -227,6 +245,45 @@ describe("createApp", () => {
 
     const body = await res.json();
     expect(body.error.errorCode).toBe("MISSING_AUTH");
+  });
+
+  it("control-plane token cannot read owner grants routes", async () => {
+    const app = makeAppWithControlPlaneToken();
+    const res = await app.request("/v1/grants", {
+      headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+    });
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error.errorCode).toBe("INVALID_SIGNATURE");
+  });
+
+  it("control-plane token cannot write owner data routes", async () => {
+    const app = makeAppWithControlPlaneToken();
+    const res = await app.request("/v1/data/test.scope", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        authorization: `Bearer ${CONTROL_PLANE_TOKEN}`,
+      },
+      body: JSON.stringify({ data: "value" }),
+    });
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error.errorCode).toBe("INVALID_SIGNATURE");
+  });
+
+  it("control-plane token cannot trigger sync routes", async () => {
+    const app = makeAppWithControlPlaneToken();
+    const res = await app.request("/v1/sync/trigger", {
+      method: "POST",
+      headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+    });
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error.errorCode).toBe("INVALID_SIGNATURE");
   });
 
   it("POST /v1/grants/verify without auth → 400 (public endpoint, no auth wall)", async () => {
