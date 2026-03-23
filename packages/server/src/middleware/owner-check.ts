@@ -1,6 +1,6 @@
 import type { MiddlewareHandler } from "hono";
 import { NotOwnerError } from "@opendatalabs/personal-server-ts-core/errors";
-import type { VerifiedAuth } from "@opendatalabs/personal-server-ts-core/auth";
+import type { RequestAuth } from "./web3-auth.js";
 
 /**
  * Verifies the authenticated signer is the server owner.
@@ -12,7 +12,7 @@ export function createOwnerCheckMiddleware(
   serverOwner: `0x${string}` | undefined,
 ): MiddlewareHandler {
   return async (c, next) => {
-    if (c.get("devBypass")) {
+    if (c.get("isPolicyBypass") ?? c.get("devBypass")) {
       await next();
       return;
     }
@@ -31,7 +31,7 @@ export function createOwnerCheckMiddleware(
       );
     }
 
-    const auth = c.get("auth") as VerifiedAuth | undefined;
+    const auth = c.get("auth") as RequestAuth | undefined;
 
     if (!auth) {
       throw new Error(

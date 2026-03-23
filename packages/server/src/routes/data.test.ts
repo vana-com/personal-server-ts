@@ -26,9 +26,11 @@ import {
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import { dataRoutes } from "./data.js";
 import type { DataRouteDeps } from "./data.js";
+import type { TokenStore } from "../token-store.js";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const wallet = createTestWallet(0);
+const ownerWallet = createTestWallet(9);
 
 const BUILDER_ID = "0xbuilder1";
 
@@ -65,10 +67,10 @@ function makeGrant(
 ): GatewayGrantResponse {
   return {
     id: "grant-123",
-    grantorAddress: "0xOwnerAddress",
+    grantorAddress: ownerWallet.address,
     granteeId: BUILDER_ID,
     grant: JSON.stringify({
-      user: "0xOwnerAddress",
+      user: ownerWallet.address,
       builder: wallet.address,
       scopes: ["instagram.*"],
       expiresAt: Math.floor(Date.now() / 1000) + 3600,
@@ -86,6 +88,56 @@ function createMockAccessLogWriter(): AccessLogWriter {
   return {
     write: vi.fn().mockResolvedValue(undefined),
   };
+}
+
+function createMockTokenStore(tokens: string[] = []): TokenStore {
+  const storedTokens = new Set(tokens);
+  return {
+    getTokens: vi.fn(async () => Array.from(storedTokens)),
+    isValid: vi.fn(async (token: string) => storedTokens.has(token)),
+    addToken: vi.fn(async (token: string) => {
+      storedTokens.add(token);
+    }),
+    removeToken: vi.fn(async (token: string) => {
+      storedTokens.delete(token);
+    }),
+  };
+}
+
+async function postWithOwnerAuth(
+  app: ReturnType<typeof dataRoutes>,
+  scope: string,
+  body?: unknown,
+  options: {
+    contentType?: string;
+    rawBody?: string;
+    wallet?: typeof ownerWallet;
+  } = {},
+) {
+  const {
+    contentType = "application/json",
+    rawBody,
+    wallet: signingWallet = ownerWallet,
+  } = options;
+  const auth = await buildWeb3SignedHeader({
+    wallet: signingWallet,
+    aud: SERVER_ORIGIN,
+    method: "POST",
+    uri: `/${scope}`,
+  });
+  const init: RequestInit = {
+    method: "POST",
+    headers: {
+      "Content-Type": contentType,
+      Authorization: auth,
+    },
+  };
+  if (rawBody !== undefined) {
+    init.body = rawBody;
+  } else if (body !== undefined) {
+    init.body = JSON.stringify(body);
+  }
+  return app.request(`/${scope}`, init);
 }
 
 const logger = pino({ level: "silent" });
@@ -108,7 +160,7 @@ describe("POST /v1/data/:scope", () => {
       hierarchyOptions,
       logger,
       serverOrigin: SERVER_ORIGIN,
-      serverOwner: "0xOwnerAddress" as `0x${string}`,
+      serverOwner: ownerWallet.address,
       gateway: createMockGateway(),
       accessLogWriter: createMockAccessLogWriter(),
     });
@@ -127,14 +179,7 @@ describe("POST /v1/data/:scope", () => {
     body?: unknown,
     contentType = "application/json",
   ) {
-    const init: RequestInit = {
-      method: "POST",
-      headers: { "Content-Type": contentType },
-    };
-    if (body !== undefined) {
-      init.body = JSON.stringify(body);
-    }
-    return app.request(`/${scope}`, init);
+    return postWithOwnerAuth(app, scope, body, { contentType });
   }
 
   it("returns 201 with scope, collectedAt, status for valid request", async () => {
@@ -145,6 +190,47 @@ describe("POST /v1/data/:scope", () => {
     expect(json.scope).toBe("instagram.profile");
     expect(json.collectedAt).toBeDefined();
     expect(json.status).toBe("stored");
+  });
+
+  it("returns 401 without owner authorization", async () => {
+    const res = await app.request("/instagram.profile", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "test" }),
+    });
+
+    expect(res.status).toBe(401);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("MISSING_AUTH");
+  });
+
+  it("allows owner session tokens to ingest data without enabling policy bypass", async () => {
+    const sessionToken = "vana_ps_owner_session_token";
+    const localIndexManager = createIndexManager(
+      initializeDatabase(":memory:"),
+    );
+    const localApp = dataRoutes({
+      indexManager: localIndexManager,
+      hierarchyOptions,
+      logger,
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+      tokenStore: createMockTokenStore([sessionToken]),
+    });
+
+    const res = await localApp.request("/instagram.profile", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${sessionToken}`,
+      },
+      body: JSON.stringify({ username: "test" }),
+    });
+
+    expect(res.status).toBe(201);
+    localIndexManager.close();
   });
 
   it("response collectedAt is valid ISO 8601", async () => {
@@ -192,15 +278,13 @@ describe("POST /v1/data/:scope", () => {
       hierarchyOptions,
       logger,
       serverOrigin: SERVER_ORIGIN,
-      serverOwner: "0xOwnerAddress" as `0x${string}`,
+      serverOwner: ownerWallet.address,
       gateway: createMockGateway(),
       accessLogWriter: createMockAccessLogWriter(),
     });
 
-    const res = await localApp.request("/instagram.profile", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: "test" }),
+    const res = await postWithOwnerAuth(localApp, "instagram.profile", {
+      username: "test",
     });
     const json = await res.json();
 
@@ -225,7 +309,15 @@ describe("POST /v1/data/:scope", () => {
   it("returns 400 for non-JSON body", async () => {
     const res = await app.request("/instagram.profile", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: await buildWeb3SignedHeader({
+          wallet: ownerWallet,
+          aud: SERVER_ORIGIN,
+          method: "POST",
+          uri: "/instagram.profile",
+        }),
+      },
       body: "not json",
     });
     expect(res.status).toBe(400);
@@ -267,15 +359,13 @@ describe("POST /v1/data/:scope", () => {
       hierarchyOptions,
       logger,
       serverOrigin: SERVER_ORIGIN,
-      serverOwner: "0xOwnerAddress" as `0x${string}`,
+      serverOwner: ownerWallet.address,
       gateway,
       accessLogWriter: createMockAccessLogWriter(),
     });
 
-    const res = await localApp.request("/instagram.profile", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: "test" }),
+    const res = await postWithOwnerAuth(localApp, "instagram.profile", {
+      username: "test",
     });
     expect(res.status).toBe(400);
 
@@ -300,15 +390,13 @@ describe("POST /v1/data/:scope", () => {
       hierarchyOptions,
       logger,
       serverOrigin: SERVER_ORIGIN,
-      serverOwner: "0xOwnerAddress" as `0x${string}`,
+      serverOwner: ownerWallet.address,
       gateway,
       accessLogWriter: createMockAccessLogWriter(),
     });
 
-    const res = await localApp.request("/instagram.profile", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: "test" }),
+    const res = await postWithOwnerAuth(localApp, "instagram.profile", {
+      username: "test",
     });
     expect(res.status).toBe(502);
 
@@ -343,16 +431,14 @@ describe("POST /v1/data/:scope", () => {
       hierarchyOptions,
       logger,
       serverOrigin: SERVER_ORIGIN,
-      serverOwner: "0xOwnerAddress" as `0x${string}`,
+      serverOwner: ownerWallet.address,
       gateway: createMockGateway(),
       accessLogWriter: createMockAccessLogWriter(),
       syncManager: mockSyncManager,
     });
 
-    const res = await localApp.request("/instagram.profile", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: "test" }),
+    const res = await postWithOwnerAuth(localApp, "instagram.profile", {
+      username: "test",
     });
     expect(res.status).toBe(201);
 
@@ -371,16 +457,14 @@ describe("POST /v1/data/:scope", () => {
       hierarchyOptions,
       logger,
       serverOrigin: SERVER_ORIGIN,
-      serverOwner: "0xOwnerAddress" as `0x${string}`,
+      serverOwner: ownerWallet.address,
       gateway: createMockGateway(),
       accessLogWriter: createMockAccessLogWriter(),
       syncManager: null,
     });
 
-    const res = await localApp.request("/instagram.profile", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: "test" }),
+    const res = await postWithOwnerAuth(localApp, "instagram.profile", {
+      username: "test",
     });
     expect(res.status).toBe(201);
 
@@ -407,16 +491,14 @@ describe("POST /v1/data/:scope", () => {
       hierarchyOptions,
       logger,
       serverOrigin: SERVER_ORIGIN,
-      serverOwner: "0xOwnerAddress" as `0x${string}`,
+      serverOwner: ownerWallet.address,
       gateway: createMockGateway(),
       accessLogWriter: createMockAccessLogWriter(),
       syncManager: mockSyncManager,
     });
 
-    await localApp.request("/instagram.profile", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: "test" }),
+    await postWithOwnerAuth(localApp, "instagram.profile", {
+      username: "test",
     });
 
     expect(mockSyncManager.notifyNewData).toHaveBeenCalledOnce();
@@ -468,7 +550,7 @@ describe("GET /v1/data (list scopes)", () => {
       hierarchyOptions,
       logger,
       serverOrigin: SERVER_ORIGIN,
-      serverOwner: "0xOwnerAddress" as `0x${string}`,
+      serverOwner: ownerWallet.address,
       gateway: createMockGateway(),
       accessLogWriter: createMockAccessLogWriter(),
       ...overrides,
@@ -480,11 +562,7 @@ describe("GET /v1/data (list scopes)", () => {
     data: Record<string, unknown>,
     app: ReturnType<typeof dataRoutes>,
   ) {
-    const res = await app.request(`/${scope}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    });
+    const res = await postWithOwnerAuth(app, scope, data);
     return res.json();
   }
 
@@ -596,6 +674,27 @@ describe("GET /v1/data (list scopes)", () => {
     const json = await res.json();
     expect(json.error.errorCode).toBe("UNREGISTERED_BUILDER");
   });
+
+  it("allows owner session tokens to list scopes without builder registration", async () => {
+    const sessionToken = "vana_ps_owner_session_token";
+    const gateway = createMockGateway({
+      isRegisteredBuilder: vi.fn().mockResolvedValue(false),
+    });
+    const app = createApp({
+      gateway,
+      tokenStore: createMockTokenStore([sessionToken]),
+    });
+    await ingestData("instagram.profile", { username: "test" }, app);
+
+    const res = await app.request("/", {
+      headers: { Authorization: `Bearer ${sessionToken}` },
+    });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.scopes).toHaveLength(1);
+    expect(json.scopes[0].scope).toBe("instagram.profile");
+  });
 });
 
 describe("GET /v1/data/:scope/versions", () => {
@@ -610,7 +709,7 @@ describe("GET /v1/data/:scope/versions", () => {
       hierarchyOptions,
       logger,
       serverOrigin: SERVER_ORIGIN,
-      serverOwner: "0xOwnerAddress" as `0x${string}`,
+      serverOwner: ownerWallet.address,
       gateway: createMockGateway(),
       accessLogWriter: createMockAccessLogWriter(),
       ...overrides,
@@ -622,11 +721,7 @@ describe("GET /v1/data/:scope/versions", () => {
     data: Record<string, unknown>,
     app: ReturnType<typeof dataRoutes>,
   ) {
-    const res = await app.request(`/${scope}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    });
+    const res = await postWithOwnerAuth(app, scope, data);
     return res.json();
   }
 
@@ -771,7 +866,7 @@ describe("GET /v1/data/:scope", () => {
       hierarchyOptions,
       logger,
       serverOrigin: SERVER_ORIGIN,
-      serverOwner: "0xOwnerAddress" as `0x${string}`,
+      serverOwner: ownerWallet.address,
       gateway,
       accessLogWriter: createMockAccessLogWriter(),
       ...overrides,
@@ -783,11 +878,7 @@ describe("GET /v1/data/:scope", () => {
     data: Record<string, unknown>,
     app: ReturnType<typeof dataRoutes>,
   ) {
-    const res = await app.request(`/${scope}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    });
+    const res = await postWithOwnerAuth(app, scope, data);
     return res.json();
   }
 
@@ -936,6 +1027,23 @@ describe("GET /v1/data/:scope", () => {
     expect(json.error).toBe("NOT_FOUND");
   });
 
+  it("does not let owner session tokens bypass grant checks on raw reads", async () => {
+    const sessionToken = "vana_ps_owner_session_token";
+    const app = createApp({
+      tokenStore: createMockTokenStore([sessionToken]),
+    });
+
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+
+    const res = await app.request("/instagram.profile", {
+      headers: { Authorization: `Bearer ${sessionToken}` },
+    });
+
+    expect(res.status).toBe(403);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("GRANT_REQUIRED");
+  });
+
   it("returns correct version when at query param is provided", async () => {
     const app = createApp();
 
@@ -966,7 +1074,7 @@ describe("DELETE /v1/data/:scope", () => {
   let indexManager: IndexManager;
   let cleanup: () => void;
 
-  const ownerWallet = createTestWallet(2);
+  const deleteOwnerWallet = createTestWallet(2);
 
   function createApp(overrides: Partial<DataRouteDeps> = {}) {
     return dataRoutes({
@@ -974,7 +1082,7 @@ describe("DELETE /v1/data/:scope", () => {
       hierarchyOptions,
       logger,
       serverOrigin: SERVER_ORIGIN,
-      serverOwner: ownerWallet.address,
+      serverOwner: deleteOwnerWallet.address,
       gateway: createMockGateway(),
       accessLogWriter: createMockAccessLogWriter(),
       ...overrides,
@@ -986,7 +1094,7 @@ describe("DELETE /v1/data/:scope", () => {
     scope: string,
   ) {
     const auth = await buildWeb3SignedHeader({
-      wallet: ownerWallet,
+      wallet: deleteOwnerWallet,
       aud: SERVER_ORIGIN,
       method: "DELETE",
       uri: `/${scope}`,
@@ -1002,10 +1110,8 @@ describe("DELETE /v1/data/:scope", () => {
     data: Record<string, unknown>,
     app: ReturnType<typeof dataRoutes>,
   ) {
-    const res = await app.request(`/${scope}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+    const res = await postWithOwnerAuth(app, scope, data, {
+      wallet: deleteOwnerWallet,
     });
     return res.json();
   }
@@ -1061,7 +1167,7 @@ describe("DELETE /v1/data/:scope", () => {
     const app = createApp();
 
     const auth = await buildWeb3SignedHeader({
-      wallet: ownerWallet,
+      wallet: deleteOwnerWallet,
       aud: SERVER_ORIGIN,
       method: "DELETE",
       uri: "/bad",
@@ -1078,7 +1184,7 @@ describe("DELETE /v1/data/:scope", () => {
 
   it("after DELETE, GET same scope returns 404", async () => {
     const grant = makeGrant({
-      grantorAddress: ownerWallet.address,
+      grantorAddress: deleteOwnerWallet.address,
     });
     const gateway = createMockGateway({
       getGrant: vi.fn().mockResolvedValue(grant),
@@ -1116,11 +1222,16 @@ describe("DELETE /v1/data/:scope", () => {
     const deleteRes = await deleteWithAuth(app, "instagram.profile");
     expect(deleteRes.status).toBe(204);
 
-    const res = await app.request("/instagram.profile", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ version: 2 }),
-    });
+    const res = await postWithOwnerAuth(
+      app,
+      "instagram.profile",
+      {
+        version: 2,
+      },
+      {
+        wallet: deleteOwnerWallet,
+      },
+    );
     expect(res.status).toBe(201);
 
     const json = await res.json();

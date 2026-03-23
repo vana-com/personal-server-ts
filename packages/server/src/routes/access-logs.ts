@@ -6,6 +6,7 @@
 import { Hono } from "hono";
 import type { Logger } from "pino";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
+import type { TokenStore } from "../token-store.js";
 import { createWeb3AuthMiddleware } from "../middleware/web3-auth.js";
 import { createOwnerCheckMiddleware } from "../middleware/owner-check.js";
 
@@ -15,6 +16,7 @@ export interface AccessLogsRouteDeps {
   serverOrigin: string | (() => string);
   serverOwner?: `0x${string}`;
   devToken?: string;
+  tokenStore?: TokenStore;
 }
 
 export function accessLogsRoutes(deps: AccessLogsRouteDeps): Hono {
@@ -23,6 +25,7 @@ export function accessLogsRoutes(deps: AccessLogsRouteDeps): Hono {
   const web3Auth = createWeb3AuthMiddleware({
     serverOrigin: deps.serverOrigin,
     devToken: deps.devToken,
+    tokenStore: deps.tokenStore,
     serverOwner: deps.serverOwner,
   });
   const ownerCheck = createOwnerCheckMiddleware(deps.serverOwner);

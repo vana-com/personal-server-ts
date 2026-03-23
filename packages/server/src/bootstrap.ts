@@ -45,6 +45,7 @@ import { createVanaStorageAdapter } from "@opendatalabs/personal-server-ts-core/
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
 import { generateDevToken } from "./dev-token.js";
+import { createTokenStore, type TokenStore } from "./token-store.js";
 import { TunnelManager, ensureFrpcBinary } from "./tunnel/index.js";
 
 export interface ServerContext {
@@ -60,6 +61,9 @@ export interface ServerContext {
   syncManager: SyncManager | null;
   tunnelManager?: TunnelManager;
   tunnelUrl?: string;
+  localApprovalPort?: number;
+  getLocalApprovalOrigin: () => string | undefined;
+  setLocalApprovalOrigin: (origin?: string) => void;
   devToken?: string;
   startBackgroundServices: () => Promise<void>;
   cleanup: () => Promise<void>;
@@ -70,6 +74,30 @@ export interface CreateServerOptions {
   /** @deprecated Use rootPath instead. */
   serverDir?: string;
   dataDir?: string;
+}
+
+const DEFAULT_LOCAL_APPROVAL_PORT = 34127;
+
+function resolveLocalApprovalPort(serverPort: number): number {
+  const raw = process.env.LOCAL_AUTH_PORT;
+  if (raw !== undefined) {
+    const parsed = Number(raw);
+    if (
+      Number.isInteger(parsed) &&
+      parsed >= 1 &&
+      parsed <= 65535 &&
+      parsed !== serverPort
+    ) {
+      return parsed;
+    }
+  }
+
+  const adjacentPort = serverPort + 1;
+  if (adjacentPort <= 65535) {
+    return adjacentPort;
+  }
+
+  return DEFAULT_LOCAL_APPROVAL_PORT;
 }
 
 export async function createServer(
@@ -132,6 +160,37 @@ export async function createServer(
   } else {
     logger.warn(
       "VANA_MASTER_KEY_SIGNATURE not set — owner-restricted endpoints will return 500",
+    );
+  }
+
+  // Resolve PS_ACCESS_TOKEN for cloud control-plane / bootstrap auth.
+  // This is not the per-login CLI session token returned to users.
+  let accessToken: string | undefined = process.env.PS_ACCESS_TOKEN;
+  if (!accessToken && process.env.CLOUD_MODE === "true") {
+    try {
+      const metadataRes = await fetch(
+        "http://metadata.google.internal/computeMetadata/v1/instance/attributes/ps-access-token",
+        {
+          headers: { "Metadata-Flavor": "Google" },
+          signal: AbortSignal.timeout(2000),
+        },
+      );
+      if (metadataRes.ok) {
+        const token = (await metadataRes.text()).trim();
+        if (token.length > 0) {
+          accessToken = token;
+          logger.info("PS control-plane token loaded from instance metadata");
+        }
+      }
+    } catch {
+      logger.debug(
+        "Could not read PS control-plane token from instance metadata",
+      );
+    }
+  }
+  if (accessToken) {
+    logger.info(
+      "PS_ACCESS_TOKEN configured — control-plane bearer auth enabled",
     );
   }
 
@@ -210,8 +269,17 @@ export async function createServer(
   // Generate ephemeral dev token when devUi is enabled
   const devToken = config.devUi.enabled ? generateDevToken() : undefined;
 
+  // Token store for /auth/device flow (self-hosted CLI auth)
+  const tokensPath = join(storageRoot, "tokens.json");
+  const tokenStore: TokenStore = createTokenStore(tokensPath, logger);
+  const cloudMode = process.env.CLOUD_MODE === "true";
+  const localApprovalPort = cloudMode
+    ? undefined
+    : resolveLocalApprovalPort(config.server.port);
+
   // Mutable origin — starts with config value, updated when tunnel connects
   let effectiveOrigin = config.server.origin;
+  let effectiveLocalApprovalOrigin: string | undefined;
 
   // Mutable tunnelManager — set when tunnel starts in background
   let tunnelManager: TunnelManager | undefined;
@@ -223,12 +291,16 @@ export async function createServer(
     indexManager,
     hierarchyOptions,
     serverOrigin: () => effectiveOrigin,
+    localApprovalOrigin: () => effectiveLocalApprovalOrigin,
     serverOwner,
     identity,
     gateway: gatewayClient,
     accessLogWriter,
     accessLogReader,
+    cloudMode,
     devToken,
+    accessToken,
+    tokenStore,
     configPath,
     syncManager,
     serverSigner,
@@ -258,6 +330,11 @@ export async function createServer(
     syncManager,
     tunnelManager,
     tunnelUrl: undefined,
+    localApprovalPort,
+    getLocalApprovalOrigin: () => effectiveLocalApprovalOrigin,
+    setLocalApprovalOrigin: (origin?: string) => {
+      effectiveLocalApprovalOrigin = origin;
+    },
     devToken,
     startBackgroundServices: async () => {
       // --- Gateway registration check (slow: HTTP call) ---

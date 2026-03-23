@@ -1,6 +1,5 @@
 import type { MiddlewareHandler } from "hono";
 import type { GatewayClient } from "@opendatalabs/personal-server-ts-core/gateway";
-import type { VerifiedAuth } from "@opendatalabs/personal-server-ts-core/auth";
 import { scopeCoveredByGrant } from "@opendatalabs/personal-server-ts-core/scopes";
 import {
   GrantRequiredError,
@@ -10,6 +9,7 @@ import {
   InvalidSignatureError,
   ProtocolError,
 } from "@opendatalabs/personal-server-ts-core/errors";
+import type { RequestAuth } from "./web3-auth.js";
 
 /**
  * Parse the opaque `grant` string from the gateway response.
@@ -46,12 +46,12 @@ export function createGrantCheckMiddleware(params: {
   const { gateway } = params;
 
   return async (c, next) => {
-    if (c.get("devBypass")) {
+    if (c.get("isPolicyBypass") ?? c.get("devBypass")) {
       await next();
       return;
     }
 
-    const auth = c.get("auth") as VerifiedAuth;
+    const auth = c.get("auth") as RequestAuth;
 
     try {
       // 1. Extract grantId from auth payload
