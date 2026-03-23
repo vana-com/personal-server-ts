@@ -264,6 +264,7 @@ export async function createServer(
     gateway: gatewayClient,
     accessLogWriter,
     accessLogReader,
+    cloudMode: process.env.CLOUD_MODE === "true",
     devToken,
     accessToken,
     tokenStore,

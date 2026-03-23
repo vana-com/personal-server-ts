@@ -142,6 +142,7 @@ describe("createApp", () => {
 
   function makeAppWithTokenStore(
     tokenStore: TokenStore = createMockTokenStore(),
+    options?: { cloudMode?: boolean; accessToken?: string },
   ) {
     const logger = pino({ level: "silent" });
     return createApp({
@@ -155,6 +156,8 @@ describe("createApp", () => {
       gateway: createMockGateway(),
       accessLogWriter: createMockAccessLogWriter(),
       accessLogReader: createMockAccessLogReader(),
+      cloudMode: options?.cloudMode,
+      accessToken: options?.accessToken,
       tokenStore,
     });
   }
@@ -374,6 +377,50 @@ describe("createApp", () => {
 
     expect(approveRes.status).toBe(200);
     expect(await approveRes.json()).toEqual({ status: "approved" });
+  });
+
+  it("cloud mode disables interactive /auth/device login flow", async () => {
+    const app = makeAppWithTokenStore(createMockTokenStore(), {
+      cloudMode: true,
+      accessToken: CONTROL_PLANE_TOKEN,
+    });
+
+    const initRes = await app.request(
+      new Request("https://0xabc.myvana.app/auth/device", { method: "POST" }),
+    );
+
+    expect(initRes.status).toBe(404);
+
+    const approveRes = await app.request(
+      new Request("https://0xabc.myvana.app/auth/device/approve?session=test", {
+        method: "POST",
+      }),
+    );
+
+    expect(approveRes.status).toBe(404);
+  });
+
+  it("cloud mode still allows control-plane token provisioning", async () => {
+    const tokenStore = createMockTokenStore();
+    const app = makeAppWithTokenStore(tokenStore, {
+      cloudMode: true,
+      accessToken: CONTROL_PLANE_TOKEN,
+    });
+
+    const res = await app.request("/auth/device/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        authorization: `Bearer ${CONTROL_PLANE_TOKEN}`,
+      },
+      body: JSON.stringify({ token: "vana_ps_cli_token" }),
+    });
+
+    expect(res.status).toBe(201);
+    expect(await res.json()).toEqual({ status: "created" });
+    expect(tokenStore.addToken).toHaveBeenCalledWith("vana_ps_cli_token", {
+      expiresAt: null,
+    });
   });
 
   // --- Phase 4: Sync manager wiring tests ---

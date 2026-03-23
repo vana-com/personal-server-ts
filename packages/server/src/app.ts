@@ -37,6 +37,7 @@ export interface AppDeps {
   gateway: GatewayClient;
   accessLogWriter: AccessLogWriter;
   accessLogReader: AccessLogReader;
+  cloudMode?: boolean;
   devToken?: string;
   accessToken?: string;
   configPath?: string;
@@ -142,6 +143,7 @@ export function createApp(deps: AppDeps): Hono {
         tokenStore: deps.tokenStore,
         devToken: deps.devToken,
         accessToken: deps.accessToken,
+        allowInteractiveLogin: !deps.cloudMode,
       }),
     );
   }

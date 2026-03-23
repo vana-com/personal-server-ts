@@ -29,6 +29,7 @@ export interface LoginV2Deps {
   tokenStore: TokenStore;
   devToken?: string;
   accessToken?: string;
+  allowInteractiveLogin?: boolean;
   getRemoteAddress?: (c: Context) => string | undefined;
 }
 
@@ -152,6 +153,7 @@ async function verifyRemoteOwnerApproval(
 
 export function authDeviceRoutes(deps: LoginV2Deps): Hono {
   const app = new Hono();
+  const allowInteractiveLogin = deps.allowInteractiveLogin !== false;
   const web3Auth = createWeb3AuthMiddleware({
     serverOrigin: deps.serverOrigin,
     devToken: deps.devToken,
@@ -161,94 +163,12 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
   });
   const ownerCheck = createOwnerCheckMiddleware(deps.serverOwner);
 
-  // POST /  — Initiate login flow (no auth required)
-  app.post("/", (c) => {
-    purgeExpired();
+  if (allowInteractiveLogin) {
+    // POST /  — Initiate login flow (no auth required)
+    app.post("/", (c) => {
+      purgeExpired();
 
-    if (!deps.serverOwner) {
-      return c.json(
-        {
-          error: {
-            code: 500,
-            errorCode: "SERVER_NOT_CONFIGURED",
-            message:
-              "Server owner address not configured. Set VANA_MASTER_KEY_SIGNATURE environment variable.",
-          },
-        },
-        500,
-      );
-    }
-
-    const sessionId = randomBytes(32).toString("hex");
-    const pollToken = randomBytes(32).toString("hex");
-    const origin = getRequestOrigin(c);
-
-    const session: LoginSession = {
-      sessionId,
-      pollToken,
-      status: "pending",
-      createdAt: Date.now(),
-      lastPollAt: 0,
-    };
-    sessions.set(sessionId, session);
-
-    deps.logger.info({ sessionId }, "Login flow initiated");
-
-    return c.json({
-      login: `${origin}/auth/device/approve?session=${sessionId}`,
-      poll: {
-        endpoint: "/auth/device/poll",
-        token: pollToken,
-      },
-    });
-  });
-
-  // GET /poll  — Poll for completion
-  app.get("/poll", (c) => {
-    purgeExpired();
-
-    const token = c.req.query("token");
-    if (!token) {
-      return c.json(
-        { error: { code: 400, message: "Missing token parameter" } },
-        400,
-      );
-    }
-
-    const session = findByPollToken(token);
-
-    if (!session) {
-      return c.json({ status: "expired" }, 404);
-    }
-
-    // Check if session has expired
-    if (Date.now() - session.createdAt > SESSION_TTL_MS) {
-      sessions.delete(session.sessionId);
-      return c.json({ status: "expired" }, 404);
-    }
-
-    // Rate limit polling
-    const now = Date.now();
-    if (now - session.lastPollAt < POLL_INTERVAL_MS) {
-      return c.json(
-        {
-          error: {
-            code: 429,
-            message: `Too many requests. Poll every ${POLL_INTERVAL_MS / 1000} seconds.`,
-          },
-        },
-        429,
-      );
-    }
-    session.lastPollAt = now;
-
-    if (session.status === "pending") {
-      return c.json({ status: "pending" }, 404);
-    }
-
-    if (session.status === "approved" && session.accessToken) {
       if (!deps.serverOwner) {
-        sessions.delete(session.sessionId);
         return c.json(
           {
             error: {
@@ -261,135 +181,229 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
           500,
         );
       }
+
+      const sessionId = randomBytes(32).toString("hex");
+      const pollToken = randomBytes(32).toString("hex");
       const origin = getRequestOrigin(c);
 
-      // Return token once, then delete session
-      const response = {
-        status: "authorized",
-        server: origin,
-        address: deps.serverOwner,
-        access_token: session.accessToken,
-        expires_at: session.accessTokenExpiresAt,
+      const session: LoginSession = {
+        sessionId,
+        pollToken,
+        status: "pending",
+        createdAt: Date.now(),
+        lastPollAt: 0,
       };
-      sessions.delete(session.sessionId);
+      sessions.set(sessionId, session);
 
-      deps.logger.info(
-        { sessionId: session.sessionId },
-        "Login flow completed — token delivered",
-      );
+      deps.logger.info({ sessionId }, "Login flow initiated");
 
-      return c.json(response, 200);
-    }
+      return c.json({
+        login: `${origin}/auth/device/approve?session=${sessionId}`,
+        poll: {
+          endpoint: "/auth/device/poll",
+          token: pollToken,
+        },
+      });
+    });
 
-    // Shouldn't reach here, but just in case
-    return c.json({ status: "pending" }, 404);
-  });
+    // GET /poll  — Poll for completion
+    app.get("/poll", (c) => {
+      purgeExpired();
 
-  // GET /approve  — HTML approval page
-  app.get("/approve", (c) => {
-    purgeExpired();
-
-    const sessionId = c.req.query("session");
-    if (!sessionId) {
-      return c.html(errorPage("Missing session parameter"), 400);
-    }
-
-    const session = sessions.get(sessionId);
-    if (!session) {
-      return c.html(errorPage("Session expired or invalid"), 404);
-    }
-
-    if (Date.now() - session.createdAt > SESSION_TTL_MS) {
-      sessions.delete(sessionId);
-      return c.html(errorPage("Session expired"), 410);
-    }
-
-    if (session.status === "approved") {
-      return c.html(successPage());
-    }
-
-    const origin = getRequestOrigin(c);
-    const owner = deps.serverOwner ?? "unknown";
-
-    return c.html(approvePage(origin, owner, sessionId));
-  });
-
-  // POST /approve  — Approve the session
-  app.post("/approve", async (c) => {
-    purgeExpired();
-
-    const sessionId = c.req.query("session");
-    if (!sessionId) {
-      return c.json(
-        { error: { code: 400, message: "Missing session parameter" } },
-        400,
-      );
-    }
-
-    const session = sessions.get(sessionId);
-    if (!session) {
-      return c.json(
-        { error: { code: 404, message: "Session expired or invalid" } },
-        404,
-      );
-    }
-
-    if (Date.now() - session.createdAt > SESSION_TTL_MS) {
-      sessions.delete(sessionId);
-      return c.json({ error: { code: 410, message: "Session expired" } }, 410);
-    }
-
-    if (session.status === "approved") {
-      return c.json({ status: "already_approved" });
-    }
-
-    // v1: localhost auto-approve — user is physically at the server.
-    // SECURITY: Use the direct TCP peer address, NOT X-Forwarded-For
-    // or X-Real-IP headers which are trivially spoofable by remote attackers.
-    const remoteAddr = deps.getRemoteAddress?.(c) ?? getSocketRemoteAddress(c);
-
-    if (!isLocalhostRequest(remoteAddr as string | undefined)) {
-      const approvalAuth = await verifyRemoteOwnerApproval(c, deps.serverOwner);
-      if (approvalAuth instanceof Response) {
-        deps.logger.warn({ remoteAddr, sessionId }, "Remote approval rejected");
-        return approvalAuth;
+      const token = c.req.query("token");
+      if (!token) {
+        return c.json(
+          { error: { code: 400, message: "Missing token parameter" } },
+          400,
+        );
       }
 
-      deps.logger.info(
-        { remoteAddr, sessionId, signer: approvalAuth.signer },
-        "Remote approval authenticated with owner wallet",
-      );
-    }
+      const session = findByPollToken(token);
 
-    // Generate a new access token
-    if (!deps.serverOwner) {
-      return c.json(
-        {
-          error: {
-            code: 500,
-            errorCode: "SERVER_NOT_CONFIGURED",
-            message:
-              "Server owner address not configured. Set VANA_MASTER_KEY_SIGNATURE environment variable.",
+      if (!session) {
+        return c.json({ status: "expired" }, 404);
+      }
+
+      // Check if session has expired
+      if (Date.now() - session.createdAt > SESSION_TTL_MS) {
+        sessions.delete(session.sessionId);
+        return c.json({ status: "expired" }, 404);
+      }
+
+      // Rate limit polling
+      const now = Date.now();
+      if (now - session.lastPollAt < POLL_INTERVAL_MS) {
+        return c.json(
+          {
+            error: {
+              code: 429,
+              message: `Too many requests. Poll every ${POLL_INTERVAL_MS / 1000} seconds.`,
+            },
           },
-        },
-        500,
-      );
-    }
-    const accessToken = `vana_ps_${randomBytes(32).toString("hex")}`;
-    const expiresAt = new Date(Date.now() + CLI_TOKEN_TTL_MS).toISOString();
+          429,
+        );
+      }
+      session.lastPollAt = now;
 
-    // Store the token persistently
-    await deps.tokenStore.addToken(accessToken, { expiresAt });
+      if (session.status === "pending") {
+        return c.json({ status: "pending" }, 404);
+      }
 
-    // Mark session as approved
-    session.status = "approved";
-    session.accessToken = accessToken;
-    session.accessTokenExpiresAt = expiresAt;
+      if (session.status === "approved" && session.accessToken) {
+        if (!deps.serverOwner) {
+          sessions.delete(session.sessionId);
+          return c.json(
+            {
+              error: {
+                code: 500,
+                errorCode: "SERVER_NOT_CONFIGURED",
+                message:
+                  "Server owner address not configured. Set VANA_MASTER_KEY_SIGNATURE environment variable.",
+              },
+            },
+            500,
+          );
+        }
+        const origin = getRequestOrigin(c);
 
-    deps.logger.info({ sessionId }, "Login flow approved — token generated");
+        // Return token once, then delete session
+        const response = {
+          status: "authorized",
+          server: origin,
+          address: deps.serverOwner,
+          access_token: session.accessToken,
+          expires_at: session.accessTokenExpiresAt,
+        };
+        sessions.delete(session.sessionId);
 
-    return c.json({ status: "approved" });
-  });
+        deps.logger.info(
+          { sessionId: session.sessionId },
+          "Login flow completed — token delivered",
+        );
+
+        return c.json(response, 200);
+      }
+
+      // Shouldn't reach here, but just in case
+      return c.json({ status: "pending" }, 404);
+    });
+
+    // GET /approve  — HTML approval page
+    app.get("/approve", (c) => {
+      purgeExpired();
+
+      const sessionId = c.req.query("session");
+      if (!sessionId) {
+        return c.html(errorPage("Missing session parameter"), 400);
+      }
+
+      const session = sessions.get(sessionId);
+      if (!session) {
+        return c.html(errorPage("Session expired or invalid"), 404);
+      }
+
+      if (Date.now() - session.createdAt > SESSION_TTL_MS) {
+        sessions.delete(sessionId);
+        return c.html(errorPage("Session expired"), 410);
+      }
+
+      if (session.status === "approved") {
+        return c.html(successPage());
+      }
+
+      const origin = getRequestOrigin(c);
+      const owner = deps.serverOwner ?? "unknown";
+
+      return c.html(approvePage(origin, owner, sessionId));
+    });
+
+    // POST /approve  — Approve the session
+    app.post("/approve", async (c) => {
+      purgeExpired();
+
+      const sessionId = c.req.query("session");
+      if (!sessionId) {
+        return c.json(
+          { error: { code: 400, message: "Missing session parameter" } },
+          400,
+        );
+      }
+
+      const session = sessions.get(sessionId);
+      if (!session) {
+        return c.json(
+          { error: { code: 404, message: "Session expired or invalid" } },
+          404,
+        );
+      }
+
+      if (Date.now() - session.createdAt > SESSION_TTL_MS) {
+        sessions.delete(sessionId);
+        return c.json(
+          { error: { code: 410, message: "Session expired" } },
+          410,
+        );
+      }
+
+      if (session.status === "approved") {
+        return c.json({ status: "already_approved" });
+      }
+
+      // v1: localhost auto-approve — user is physically at the server.
+      // SECURITY: Use the direct TCP peer address, NOT X-Forwarded-For
+      // or X-Real-IP headers which are trivially spoofable by remote attackers.
+      const remoteAddr =
+        deps.getRemoteAddress?.(c) ?? getSocketRemoteAddress(c);
+
+      if (!isLocalhostRequest(remoteAddr as string | undefined)) {
+        const approvalAuth = await verifyRemoteOwnerApproval(
+          c,
+          deps.serverOwner,
+        );
+        if (approvalAuth instanceof Response) {
+          deps.logger.warn(
+            { remoteAddr, sessionId },
+            "Remote approval rejected",
+          );
+          return approvalAuth;
+        }
+
+        deps.logger.info(
+          { remoteAddr, sessionId, signer: approvalAuth.signer },
+          "Remote approval authenticated with owner wallet",
+        );
+      }
+
+      // Generate a new access token
+      if (!deps.serverOwner) {
+        return c.json(
+          {
+            error: {
+              code: 500,
+              errorCode: "SERVER_NOT_CONFIGURED",
+              message:
+                "Server owner address not configured. Set VANA_MASTER_KEY_SIGNATURE environment variable.",
+            },
+          },
+          500,
+        );
+      }
+      const accessToken = `vana_ps_${randomBytes(32).toString("hex")}`;
+      const expiresAt = new Date(Date.now() + CLI_TOKEN_TTL_MS).toISOString();
+
+      // Store the token persistently
+      await deps.tokenStore.addToken(accessToken, { expiresAt });
+
+      // Mark session as approved
+      session.status = "approved";
+      session.accessToken = accessToken;
+      session.accessTokenExpiresAt = expiresAt;
+
+      deps.logger.info({ sessionId }, "Login flow approved — token generated");
+
+      return c.json({ status: "approved" });
+    });
+  }
 
   // POST /token — add a CLI token to the store (control-plane authenticated)
   app.post("/token", web3Auth, ownerCheck, async (c) => {
