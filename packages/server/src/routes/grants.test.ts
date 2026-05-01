@@ -447,3 +447,78 @@ describe("POST /", () => {
     expect(grantPayload.nonce).toBe(42);
   });
 });
+
+describe("DELETE /:grantId", () => {
+  const VALID_GRANT_ID =
+    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+  async function deleteWithOwnerAuth(
+    app: ReturnType<typeof grantsRoutes>,
+    grantId: string,
+  ) {
+    const auth = await buildWeb3SignedHeader({
+      wallet: owner,
+      aud: SERVER_ORIGIN,
+      method: "DELETE",
+      uri: `/${grantId}`,
+      bodyHash: "",
+    });
+    return app.request(`/${grantId}`, {
+      method: "DELETE",
+      headers: { authorization: auth },
+    });
+  }
+
+  it("revokes grant via gateway and returns { status: 'revoked', grantId }", async () => {
+    const mockGateway = createMockGateway();
+    const mockSigner = createMockServerSigner();
+
+    const app = createApp({ gateway: mockGateway, serverSigner: mockSigner });
+    const res = await deleteWithOwnerAuth(app, VALID_GRANT_ID);
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.status).toBe("revoked");
+    expect(json.grantId).toBe(VALID_GRANT_ID);
+
+    expect(mockSigner.signGrantRevocation).toHaveBeenCalledWith({
+      grantorAddress: owner.address,
+      grantId: VALID_GRANT_ID,
+    });
+    expect(mockGateway.revokeGrant).toHaveBeenCalledWith({
+      grantId: VALID_GRANT_ID,
+      grantorAddress: owner.address,
+      signature: "0xrevokesig",
+    });
+  });
+
+  it("returns 502 on gateway error", async () => {
+    const mockGateway = createMockGateway();
+    vi.mocked(mockGateway.revokeGrant).mockRejectedValue(
+      new Error("gateway down"),
+    );
+
+    const app = createApp({ gateway: mockGateway });
+    const res = await deleteWithOwnerAuth(app, VALID_GRANT_ID);
+
+    expect(res.status).toBe(502);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("GATEWAY_ERROR");
+  });
+
+  it("returns 500 when serverSigner is not configured", async () => {
+    const app = grantsRoutes({
+      logger,
+      gateway: createMockGateway(),
+      serverOwner: owner.address,
+      serverOrigin: SERVER_ORIGIN,
+      // serverSigner intentionally omitted
+    });
+
+    const res = await deleteWithOwnerAuth(app, VALID_GRANT_ID);
+
+    expect(res.status).toBe(500);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("SERVER_SIGNER_NOT_CONFIGURED");
+  });
+});
