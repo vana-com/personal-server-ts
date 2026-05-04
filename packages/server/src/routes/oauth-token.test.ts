@@ -83,6 +83,38 @@ describe("POST /oauth/token", () => {
       expect(json.access_token).toMatch(/^vana_ps_/);
     });
 
+    /**
+     * Regression: RFC 6749 §2.3.1 requires the client_id and client_secret
+     * sent via HTTP Basic to be `application/x-www-form-urlencoded` encoded
+     * before base64. Conformant OAuth2 clients like `oauth4webapi` percent-
+     * encode `-`, `_`, and other URL-significant characters. The server
+     * MUST decode them before comparing.
+     */
+    it("accepts percent-encoded credentials in HTTP Basic per RFC 6749 §2.3.1", async () => {
+      // application/x-www-form-urlencoded encoding of "control-plane" → "control%2Dplane"
+      // and of the secret (which contains underscores) → uppercase %5F sequences.
+      const encodedId = encodeURIComponent("control-plane").replace(
+        /-/g,
+        "%2D",
+      );
+      const encodedSecret = encodeURIComponent(SECRET).replace(/_/g, "%5F");
+      const basic = Buffer.from(
+        `${encodedId}:${encodedSecret}`,
+        "utf-8",
+      ).toString("base64");
+      const res = await app.request("/", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Authorization: `Basic ${basic}`,
+        },
+        body: form({ grant_type: "client_credentials" }),
+      });
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json.access_token).toMatch(/^vana_ps_/);
+    });
+
     it("returns invalid_client (401) for wrong client_secret", async () => {
       const res = await app.request("/", {
         method: "POST",
