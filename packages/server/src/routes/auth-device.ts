@@ -795,3 +795,33 @@ function escapeHtml(str: string): string {
 
 // Export for testing
 export { sessions, SESSION_TTL_MS, POLL_INTERVAL_MS };
+
+/**
+ * Read-only adapter exposing the device-flow session map to the standard
+ * RFC 8628 token endpoint (`POST /oauth/token` with
+ * `grant_type=urn:ietf:params:oauth:grant-type:device_code`). The
+ * `pollToken` issued at `POST /auth/device` is the OAuth2 `device_code`.
+ */
+export function createDeviceSessionLookup() {
+  return {
+    findByDeviceCode(deviceCode: string) {
+      purgeExpired();
+      const session = findByPollToken(deviceCode);
+      if (!session) return null;
+      // Re-evaluate expiry inline to match the legacy poll endpoint.
+      if (Date.now() - session.createdAt > SESSION_TTL_MS) {
+        sessions.delete(session.sessionId);
+        return null;
+      }
+      return {
+        status: session.status,
+        accessToken: session.accessToken,
+        accessTokenExpiresAt: session.accessTokenExpiresAt,
+        sessionId: session.sessionId,
+      };
+    },
+    consume(sessionId: string) {
+      sessions.delete(sessionId);
+    },
+  };
+}
