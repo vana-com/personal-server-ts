@@ -96,6 +96,13 @@ function safeCompare(a: string, b: string): boolean {
   return timingSafeEqual(bufA, bufB);
 }
 
+/**
+ * Per RFC 6749 §2.3.1, the client identifier and password sent via HTTP
+ * Basic are first encoded with `application/x-www-form-urlencoded` (per
+ * Appendix B). Conformant clients like `oauth4webapi` will percent-encode
+ * `-`, `_`, and other URL-significant characters before base64 encoding.
+ * The server is required to apply the inverse decoding before comparing.
+ */
 function parseBasicAuth(headerValue: string | undefined): {
   clientId: string;
   clientSecret: string;
@@ -104,10 +111,14 @@ function parseBasicAuth(headerValue: string | undefined): {
   const decoded = Buffer.from(headerValue.slice(6), "base64").toString("utf-8");
   const idx = decoded.indexOf(":");
   if (idx === -1) return null;
-  return {
-    clientId: decoded.slice(0, idx),
-    clientSecret: decoded.slice(idx + 1),
-  };
+  try {
+    return {
+      clientId: decodeURIComponent(decoded.slice(0, idx)),
+      clientSecret: decodeURIComponent(decoded.slice(idx + 1)),
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function oauthTokenRoutes(deps: OauthTokenRouteDeps): Hono {
