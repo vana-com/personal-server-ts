@@ -13,7 +13,11 @@ import { accessLogsRoutes } from "./routes/access-logs.js";
 import { syncRoutes } from "./routes/sync.js";
 import { uiConfigRoutes } from "./routes/ui-config.js";
 import { uiRoute } from "./routes/ui.js";
-import { authDeviceRoutes } from "./routes/auth-device.js";
+import {
+  authDeviceRoutes,
+  createDeviceSessionLookup,
+} from "./routes/auth-device.js";
+import { oauthTokenRoutes } from "./routes/oauth-token.js";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { TokenStore } from "./token-store.js";
@@ -146,6 +150,19 @@ export function createApp(deps: AppDeps): Hono {
         devToken: deps.devToken,
         accessToken: deps.accessToken,
         allowInteractiveLogin: !deps.cloudMode,
+      }),
+    );
+
+    // RFC 6749 token endpoint. Replaces ad-hoc `/auth/device/token` semantics
+    // with a standard OAuth2 surface that supports both the cloud
+    // control-plane `client_credentials` grant and the CLI device-code grant.
+    app.route(
+      "/oauth/token",
+      oauthTokenRoutes({
+        logger: deps.logger,
+        tokenStore: deps.tokenStore,
+        controlPlaneSecret: deps.accessToken,
+        deviceSessions: createDeviceSessionLookup(),
       }),
     );
   }
