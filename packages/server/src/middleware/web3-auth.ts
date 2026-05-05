@@ -7,6 +7,13 @@ import {
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { TokenStore } from "../token-store.js";
 
+/**
+ * Stable family-level audience for tokens that target *any* Personal Server.
+ * Declared once on data-connect's Hydra client; replaces the previous
+ * per-user-PS-URL whitelist. See vana-connect docs/auth-redesign §1.9.
+ */
+const VANA_PS_AUDIENCE = "vana-personal-server";
+
 export type AuthMechanism =
   | "web3-signed"
   | "dev-token"
@@ -31,18 +38,13 @@ export interface Web3AuthMiddlewareDeps {
    *   https://account-dev.vana.org/api/oauth/introspect
    *
    * The proxy returns RFC 7662 fields plus `linked_wallets[]` for the user.
-   * PS validates the token's `aud` includes its own URL, then sets
-   * auth.signer to the user's primary linked wallet address.
+   * Authorization is then a two-step check (see implementation below):
+   * (1) `aud` includes the stable PS-family audience; (2) one of the
+   * user's linked wallets equals `serverOwner`.
    *
    * If unset, the vana-session mechanism is disabled.
    */
   vanaIntrospectionUrl?: string;
-  /**
-   * Optional public URL of this PS, used to validate the access token's
-   * `aud`. Defaults to deps.serverOrigin if it's a string. Required for
-   * the vana-session mechanism to gate audience correctly.
-   */
-  serverPublicUrl?: string;
 }
 
 // In-process cache for vana-session introspection. Keyed by sha256(token);
@@ -176,9 +178,18 @@ export function createWeb3AuthMiddleware(
     // Vana session: opaque access token issued by Hydra (via
     // account.vana.org). Verified by calling the account.vana.org-hosted
     // /api/oauth/introspect proxy, which forwards to Hydra admin and
-    // enriches the response with linked_wallets[]. PS validates the
-    // token's `aud` includes its own URL, then resolves the user's
-    // primary EVM wallet as auth.signer.
+    // enriches the response with linked_wallets[].
+    //
+    // Authorization model:
+    //   1. Hydra-side: introspect must be `active`, `aud` must include the
+    //      stable family identifier "vana-personal-server" (declared once
+    //      on data-connect's Hydra client; not per-user-PS-URL). This
+    //      narrows the token to "intended for some PS" without coupling
+    //      the IdP to per-user PS URLs.
+    //   2. Resource-server-side: the token's owner (a wallet in
+    //      `linked_wallets[]`) must equal THIS PS's configured owner. This
+    //      is the load-bearing authorization check — it's what stops a
+    //      token issued for user A from being usable on user B's PS.
     //
     // See docs/auth-redesign/01-architecture.md §1.9 (vana-connect repo).
     if (deps.vanaIntrospectionUrl && authHeader?.startsWith("Bearer ")) {
@@ -188,32 +199,29 @@ export function createWeb3AuthMiddleware(
         deps.vanaIntrospectionUrl,
       );
       if (result?.active) {
-        const expectedAudience =
-          deps.serverPublicUrl ??
-          (typeof deps.serverOrigin === "string"
-            ? deps.serverOrigin
-            : undefined);
         const audArr = Array.isArray(result.aud)
           ? result.aud
           : result.aud
             ? [result.aud]
             : [];
-        if (!expectedAudience || audArr.includes(expectedAudience)) {
-          const primary =
-            result.linked_wallets?.find(
-              (w: { is_primary: boolean }) => w.is_primary,
-            ) ?? result.linked_wallets?.[0];
-          if (primary?.address) {
-            c.set(
-              "auth",
-              createOwnerSessionAuth(primary.address as `0x${string}`),
-            );
-            c.set("authMechanism", "vana-session" satisfies AuthMechanism);
-            c.set("isPolicyBypass", false);
-            c.set("devBypass", false);
-            await next();
-            return;
-          }
+        const audienceOk = audArr.includes(VANA_PS_AUDIENCE);
+        const ownerWallet = deps.serverOwner?.toLowerCase();
+        const matchingWallet = ownerWallet
+          ? result.linked_wallets?.find(
+              (w: { address: string }) =>
+                w.address.toLowerCase() === ownerWallet,
+            )
+          : undefined;
+        if (audienceOk && matchingWallet?.address) {
+          c.set(
+            "auth",
+            createOwnerSessionAuth(matchingWallet.address as `0x${string}`),
+          );
+          c.set("authMechanism", "vana-session" satisfies AuthMechanism);
+          c.set("isPolicyBypass", false);
+          c.set("devBypass", false);
+          await next();
+          return;
         }
       }
     }
