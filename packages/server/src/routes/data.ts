@@ -36,7 +36,6 @@ export interface DataRouteDeps {
   devToken?: string;
   tokenStore?: TokenStore;
   vanaIntrospectionUrl?: string;
-  serverPublicUrl?: string;
 }
 
 export function dataRoutes(deps: DataRouteDeps): Hono {
@@ -55,7 +54,6 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     tokenStore: deps.tokenStore,
     serverOwner: deps.serverOwner,
     vanaIntrospectionUrl: deps.vanaIntrospectionUrl,
-    serverPublicUrl: deps.serverPublicUrl,
   });
   const builderCheck = createBuilderCheckMiddleware(
     deps.gateway,

@@ -48,14 +48,13 @@ export interface AppDeps {
   /**
    * URL of the account.vana.org introspection proxy (e.g.
    * https://account-dev.vana.org/api/oauth/introspect). When set, PS
-   * accepts Vana session access tokens as Bearer auth, validating audience
-   * against `serverPublicUrl` and resolving the user's primary linked
-   * wallet from the proxy's enriched response. See
-   * docs/auth-redesign/01-architecture.md §1.9 in vana-connect.
+   * accepts Vana session access tokens as Bearer auth. Authorization is
+   * gated by (1) `aud` containing the stable PS-family identifier, and
+   * (2) one of the token holder's linked wallets matching this PS's
+   * `serverOwner`. See docs/auth-redesign/01-architecture.md §1.9 in
+   * vana-connect.
    */
   vanaIntrospectionUrl?: string;
-  /** Public URL of this PS, used as the expected `aud` for Vana session tokens. */
-  serverPublicUrl?: string;
   configPath?: string;
   syncManager?: SyncManager | null;
   serverSigner?: ServerSigner;
@@ -106,7 +105,6 @@ export function createApp(deps: AppDeps): Hono {
       tokenStore: deps.tokenStore,
       syncManager: deps.syncManager ?? null,
       vanaIntrospectionUrl: deps.vanaIntrospectionUrl,
-      serverPublicUrl: deps.serverPublicUrl,
     }),
   );
 
