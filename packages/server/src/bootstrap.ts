@@ -306,12 +306,10 @@ export async function createServer(
     serverSigner,
     // Vana session integration: when VANA_INTROSPECTION_URL is set, PS
     // accepts opaque Vana access tokens issued by Hydra (via
-    // account.vana.org) as Bearer auth. Validates audience against the
-    // PS's own public URL.
+    // account.vana.org) as Bearer auth. Audience is gated by the stable
+    // family identifier "vana-personal-server"; the per-PS authorization
+    // check is wallet-based (token's linked_wallets ∋ serverOwner).
     vanaIntrospectionUrl: process.env.VANA_INTROSPECTION_URL,
-    serverPublicUrl:
-      process.env.SERVER_PUBLIC_URL ??
-      (typeof effectiveOrigin === "string" ? effectiveOrigin : undefined),
     getTunnelStatus: () => tunnelManager?.getStatus() ?? null,
   });
 
