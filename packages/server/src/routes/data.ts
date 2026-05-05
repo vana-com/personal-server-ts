@@ -35,17 +35,27 @@ export interface DataRouteDeps {
   syncManager?: SyncManager | null;
   devToken?: string;
   tokenStore?: TokenStore;
+  vanaIntrospectionUrl?: string;
+  serverPublicUrl?: string;
 }
 
 export function dataRoutes(deps: DataRouteDeps): Hono {
   const app = new Hono();
 
-  // Create middleware instances
+  // Create middleware instances. Note: the control-plane token (PS_ACCESS_TOKEN)
+  // is intentionally NOT enabled on data routes — it has grant-minting authority
+  // but not raw data-write authority. See packages/server/src/app.test.ts
+  // "control-plane token cannot write owner data routes" for the asserted
+  // security boundary. Vana session auth IS enabled here because it
+  // represents the user's session (different policy than the long-lived
+  // control-plane secret).
   const web3Auth = createWeb3AuthMiddleware({
     serverOrigin: deps.serverOrigin,
     devToken: deps.devToken,
     tokenStore: deps.tokenStore,
     serverOwner: deps.serverOwner,
+    vanaIntrospectionUrl: deps.vanaIntrospectionUrl,
+    serverPublicUrl: deps.serverPublicUrl,
   });
   const builderCheck = createBuilderCheckMiddleware(
     deps.gateway,
