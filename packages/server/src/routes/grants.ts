@@ -1,5 +1,5 @@
 /**
- * Grants routes — GET / (owner), POST / (create grant), POST /verify (public).
+ * Grants routes — GET / (owner), POST / (create grant), DELETE /:grantId (revoke), POST /verify (public).
  */
 
 import { Hono } from "hono";
@@ -216,6 +216,91 @@ export function grantsRoutes(deps: GrantsRouteDeps): Hono {
     });
 
     return c.json({ grantId: result.grantId }, 201);
+  });
+
+  // DELETE /:grantId — revoke a grant (owner-only).
+  // Signs GrantRevocation EIP-712 with serverSigner (delegated) and submits to gateway.
+  app.delete("/:grantId", web3Auth, ownerCheck, async (c) => {
+    if (!deps.serverOwner) {
+      return c.json(
+        {
+          error: {
+            code: 500,
+            errorCode: "SERVER_NOT_CONFIGURED",
+            message:
+              "Server owner address not configured. Set VANA_MASTER_KEY_SIGNATURE environment variable.",
+          },
+        },
+        500,
+      );
+    }
+    if (!deps.serverSigner) {
+      return c.json(
+        {
+          error: {
+            code: 500,
+            errorCode: "SERVER_SIGNER_NOT_CONFIGURED",
+            message:
+              "Server signer not configured. Set VANA_MASTER_KEY_SIGNATURE environment variable.",
+          },
+        },
+        500,
+      );
+    }
+
+    const grantId = c.req.param("grantId");
+    if (!grantId || typeof grantId !== "string") {
+      return c.json(
+        { error: { code: 400, message: "Missing grantId parameter" } },
+        400,
+      );
+    }
+
+    // Sign EIP-712 GrantRevocation
+    let signature: `0x${string}`;
+    try {
+      signature = await deps.serverSigner.signGrantRevocation({
+        grantorAddress: deps.serverOwner,
+        grantId: grantId as `0x${string}`,
+      });
+    } catch (err) {
+      deps.logger.error({ err, grantId }, "Grant revocation signing failed");
+      return c.json(
+        {
+          error: {
+            code: 500,
+            errorCode: "GRANT_REVOCATION_SIGN_FAILED",
+            message: "Failed to sign grant revocation",
+          },
+        },
+        500,
+      );
+    }
+
+    // Submit to Gateway
+    try {
+      await deps.gateway.revokeGrant({
+        grantId,
+        grantorAddress: deps.serverOwner,
+        signature,
+      });
+    } catch (err) {
+      deps.logger.error({ err, grantId }, "Gateway grant revocation failed");
+      const message = err instanceof Error ? err.message : String(err);
+      return c.json(
+        {
+          error: {
+            code: 502,
+            errorCode: "GATEWAY_ERROR",
+            message: `Gateway grant revocation failed: ${message}`,
+          },
+        },
+        502,
+      );
+    }
+
+    deps.logger.info({ grantId }, "Grant revoked");
+    return c.json({ status: "revoked", grantId });
   });
 
   // POST /verify — public endpoint, no auth required
