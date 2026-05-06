@@ -27,8 +27,12 @@ import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import { dataRoutes } from "./data.js";
 import type { DataRouteDeps } from "./data.js";
 import type { TokenStore } from "../token-store.js";
+import { __clearVanaIntrospectionCacheForTests } from "../middleware/web3-auth.js";
 
 const SERVER_ORIGIN = "http://localhost:8080";
+const VANA_PS_AUDIENCE = "vana-personal-server";
+const VANA_INTROSPECTION_URL =
+  "https://account-dev.vana.org/api/oauth/introspect";
 const wallet = createTestWallet(0);
 const ownerWallet = createTestWallet(9);
 
@@ -104,6 +108,32 @@ function createMockTokenStore(tokens: string[] = []): TokenStore {
   };
 }
 
+function createVanaSessionFetch({
+  aud = [VANA_PS_AUDIENCE],
+  linkedWallets = [ownerWallet.address],
+}: {
+  aud?: string[] | string;
+  linkedWallets?: string[];
+} = {}) {
+  return vi.fn().mockResolvedValue(
+    new Response(
+      JSON.stringify({
+        active: true,
+        sub: `vana_user_${"0".repeat(32)}`,
+        aud,
+        exp: Math.floor(Date.now() / 1000) + 600,
+        linked_wallets: linkedWallets.map((address, index) => ({
+          vana_wallet_id: `vana_wallet_${index}`,
+          address,
+          chain_type: "evm",
+          is_primary: index === 0,
+        })),
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+  ) as unknown as typeof fetch;
+}
+
 async function postWithOwnerAuth(
   app: ReturnType<typeof dataRoutes>,
   scope: string,
@@ -141,6 +171,14 @@ async function postWithOwnerAuth(
 }
 
 const logger = pino({ level: "silent" });
+
+beforeEach(() => {
+  __clearVanaIntrospectionCacheForTests();
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe("POST /v1/data/:scope", () => {
   let dataDir: string;
@@ -230,6 +268,101 @@ describe("POST /v1/data/:scope", () => {
     });
 
     expect(res.status).toBe(201);
+    localIndexManager.close();
+  });
+
+  it("allows Vana-session tokens for this server owner to ingest data", async () => {
+    vi.stubGlobal("fetch", createVanaSessionFetch());
+    const localIndexManager = createIndexManager(
+      initializeDatabase(":memory:"),
+    );
+    const localApp = dataRoutes({
+      indexManager: localIndexManager,
+      hierarchyOptions,
+      logger,
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+      vanaIntrospectionUrl: VANA_INTROSPECTION_URL,
+    });
+
+    const res = await localApp.request("/instagram.profile", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer vana_session_token",
+      },
+      body: JSON.stringify({ username: "test" }),
+    });
+
+    expect(res.status).toBe(201);
+    localIndexManager.close();
+  });
+
+  it("rejects Vana-session tokens with the wrong audience on owner ingest", async () => {
+    vi.stubGlobal(
+      "fetch",
+      createVanaSessionFetch({ aud: ["account.vana.org"] }),
+    );
+    const localIndexManager = createIndexManager(
+      initializeDatabase(":memory:"),
+    );
+    const localApp = dataRoutes({
+      indexManager: localIndexManager,
+      hierarchyOptions,
+      logger,
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+      vanaIntrospectionUrl: VANA_INTROSPECTION_URL,
+    });
+
+    const res = await localApp.request("/instagram.profile", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer wrong_aud_vana_session_token",
+      },
+      body: JSON.stringify({ username: "test" }),
+    });
+
+    expect(res.status).toBe(401);
+    localIndexManager.close();
+  });
+
+  it("rejects Vana-session tokens for another owner on owner ingest", async () => {
+    vi.stubGlobal(
+      "fetch",
+      createVanaSessionFetch({
+        linkedWallets: ["0x1111111111111111111111111111111111111111"],
+      }),
+    );
+    const localIndexManager = createIndexManager(
+      initializeDatabase(":memory:"),
+    );
+    const localApp = dataRoutes({
+      indexManager: localIndexManager,
+      hierarchyOptions,
+      logger,
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+      vanaIntrospectionUrl: VANA_INTROSPECTION_URL,
+    });
+
+    const res = await localApp.request("/instagram.profile", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer wrong_owner_vana_session_token",
+      },
+      body: JSON.stringify({ username: "test" }),
+    });
+
+    expect(res.status).toBe(401);
     localIndexManager.close();
   });
 
@@ -695,6 +828,27 @@ describe("GET /v1/data (list scopes)", () => {
     expect(json.scopes).toHaveLength(1);
     expect(json.scopes[0].scope).toBe("instagram.profile");
   });
+
+  it("allows Vana-session tokens for this server owner to list scopes without builder registration", async () => {
+    vi.stubGlobal("fetch", createVanaSessionFetch());
+    const gateway = createMockGateway({
+      isRegisteredBuilder: vi.fn().mockResolvedValue(false),
+    });
+    const app = createApp({
+      gateway,
+      vanaIntrospectionUrl: VANA_INTROSPECTION_URL,
+    });
+    await ingestData("instagram.profile", { username: "test" }, app);
+
+    const res = await app.request("/", {
+      headers: { Authorization: "Bearer vana_session_token" },
+    });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.scopes).toHaveLength(1);
+    expect(json.scopes[0].scope).toBe("instagram.profile");
+  });
 });
 
 describe("GET /v1/data/:scope/versions", () => {
@@ -846,6 +1000,27 @@ describe("GET /v1/data/:scope/versions", () => {
     expect(res.status).toBe(401);
     const json = await res.json();
     expect(json.error.errorCode).toBe("MISSING_AUTH");
+  });
+
+  it("allows Vana-session tokens for this server owner to list versions without builder registration", async () => {
+    vi.stubGlobal("fetch", createVanaSessionFetch());
+    const gateway = createMockGateway({
+      isRegisteredBuilder: vi.fn().mockResolvedValue(false),
+    });
+    const app = createApp({
+      gateway,
+      vanaIntrospectionUrl: VANA_INTROSPECTION_URL,
+    });
+    await ingestData("instagram.profile", { version: 1 }, app);
+
+    const res = await app.request("/instagram.profile/versions", {
+      headers: { Authorization: "Bearer vana_session_token" },
+    });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.scope).toBe("instagram.profile");
+    expect(json.versions).toHaveLength(1);
   });
 });
 
@@ -1240,5 +1415,23 @@ describe("DELETE /v1/data/:scope", () => {
 
     // Index should have 1 entry
     expect(indexManager.countByScope("instagram.profile")).toBe(1);
+  });
+
+  it("allows Vana-session tokens for this server owner to delete owner data", async () => {
+    vi.stubGlobal(
+      "fetch",
+      createVanaSessionFetch({ linkedWallets: [deleteOwnerWallet.address] }),
+    );
+    const app = createApp({ vanaIntrospectionUrl: VANA_INTROSPECTION_URL });
+    await ingestData("instagram.profile", { version: 1 }, app);
+    expect(indexManager.countByScope("instagram.profile")).toBe(1);
+
+    const res = await app.request("/instagram.profile", {
+      method: "DELETE",
+      headers: { Authorization: "Bearer vana_session_token" },
+    });
+
+    expect(res.status).toBe(204);
+    expect(indexManager.countByScope("instagram.profile")).toBe(0);
   });
 });
