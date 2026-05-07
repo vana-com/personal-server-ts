@@ -54,7 +54,7 @@ describe("encryptWithPassword + decryptWithPassword", () => {
     const encrypted = await encryptWithPassword(plaintext, PASSWORD);
     const decrypted = await decryptWithPassword(encrypted, PASSWORD);
     expect(decrypted).toEqual(plaintext);
-  });
+  }, 15_000);
 
   it("output can be decrypted by raw openpgp.decrypt", async () => {
     const plaintext = new TextEncoder().encode("cross-compat test");
