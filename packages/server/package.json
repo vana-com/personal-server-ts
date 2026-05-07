@@ -38,8 +38,8 @@
     "dev": "node --watch dist/index.js"
   },
   "dependencies": {
+    "@hono/node-server": "^1.19.13",
     "@opendatalabs/personal-server-ts-core": "*",
-    "hono": "^4.12.18",
-    "@hono/node-server": "^1.19.13"
+    "hono": "^4.12.18"
   }
 }
