@@ -5,7 +5,13 @@ import {
   NotOwnerError,
   ProtocolError,
   PsUnavailableError,
+  UnregisteredBuilderError,
 } from "@opendatalabs/personal-server-ts-core/errors";
+import { verifyWeb3Signed } from "@opendatalabs/personal-server-ts-core/auth";
+import {
+  verifyDataReadPolicy,
+  type DataReadPolicyPorts,
+} from "@opendatalabs/personal-server-ts-core/policy";
 import type {
   DataStorageEntryLookup,
   DataStorageListOptions,
@@ -55,6 +61,13 @@ export interface PsLiteRuntime extends RuntimeAvailabilityPort {
 export interface BearerTokenPsLiteAuthOptions {
   ownerToken: string;
   builderToken: string;
+}
+
+export interface Web3SignedPsLiteAuthOptions {
+  origin: string | (() => string);
+  ownerAddress: `0x${string}`;
+  dataReadPolicyPorts?: DataReadPolicyPorts;
+  now?: () => number;
 }
 
 type JsonStatus = 200 | 201 | 400 | 401 | 403 | 404 | 405 | 500 | 501 | 503;
@@ -152,6 +165,68 @@ export function createBearerTokenPsLiteAuth(
           reason: "No grantId in request",
         });
       }
+    },
+  };
+}
+
+function resolveOrigin(origin: string | (() => string)): string {
+  return typeof origin === "function" ? origin() : origin;
+}
+
+async function verifyWeb3SignedRequest(
+  request: Request,
+  options: Web3SignedPsLiteAuthOptions,
+) {
+  const url = new URL(request.url);
+  return verifyWeb3Signed({
+    headerValue: request.headers.get("authorization") ?? undefined,
+    expectedOrigin: resolveOrigin(options.origin),
+    expectedMethod: request.method,
+    expectedPath: url.pathname,
+    now: options.now?.(),
+  });
+}
+
+export function createWeb3SignedPsLiteAuth(
+  options: Web3SignedPsLiteAuthOptions,
+): PsLiteAuthAdapter {
+  return {
+    async authorizeOwner(request) {
+      const verified = await verifyWeb3SignedRequest(request, options);
+      if (
+        verified.signer.toLowerCase() !== options.ownerAddress.toLowerCase()
+      ) {
+        throw new NotOwnerError({
+          expected: options.ownerAddress,
+          actual: verified.signer,
+        });
+      }
+    },
+    async authorizeBuilderList(request) {
+      const verified = await verifyWeb3SignedRequest(request, options);
+      const builder =
+        await options.dataReadPolicyPorts?.authSessionVerifier.getBuilder(
+          verified.signer,
+        );
+      if (options.dataReadPolicyPorts && !builder) {
+        throw new UnregisteredBuilderError();
+      }
+    },
+    async authorizeBuilderRead(input) {
+      const verified = await verifyWeb3SignedRequest(input.request, options);
+      if (!options.dataReadPolicyPorts) {
+        throw new GrantRequiredError({
+          reason: "PS Lite read policy ports are not configured",
+        });
+      }
+      await verifyDataReadPolicy(
+        {
+          signer: verified.signer,
+          grantId: verified.payload.grantId ?? input.grantId,
+          requestedScope: input.scope,
+        },
+        options.dataReadPolicyPorts,
+      );
     },
   };
 }

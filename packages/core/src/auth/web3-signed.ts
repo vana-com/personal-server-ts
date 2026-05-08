@@ -36,7 +36,13 @@ function base64urlDecode(input: string): string {
   let base64 = input.replace(/-/g, "+").replace(/_/g, "/");
   const padLength = (4 - (base64.length % 4)) % 4;
   base64 += "=".repeat(padLength);
-  return Buffer.from(base64, "base64").toString("utf-8");
+
+  const binary =
+    typeof globalThis.atob === "function"
+      ? globalThis.atob(base64)
+      : Buffer.from(base64, "base64").toString("binary");
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
 }
 
 /**

@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { parseWeb3SignedHeader, verifyWeb3Signed } from "./web3-signed.js";
 import {
   MissingAuthError,
@@ -218,5 +218,33 @@ describe("verifyWeb3Signed", () => {
     });
 
     expect(result.payload.grantId).toBe(grantId);
+  });
+
+  it("verifies headers without relying on Node Buffer", async () => {
+    const wallet = createTestWallet(0);
+    const now = Math.floor(Date.now() / 1000);
+    const header = await buildWeb3SignedHeader({
+      wallet,
+      aud: AUD,
+      method: METHOD,
+      uri: URI,
+      iat: now,
+      exp: now + 300,
+    });
+
+    vi.stubGlobal("Buffer", undefined);
+    try {
+      const result = await verifyWeb3Signed({
+        headerValue: header,
+        expectedOrigin: AUD,
+        expectedMethod: METHOD,
+        expectedPath: URI,
+        now,
+      });
+
+      expect(result.signer.toLowerCase()).toBe(wallet.address.toLowerCase());
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

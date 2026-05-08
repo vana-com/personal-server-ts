@@ -3,7 +3,12 @@ import {
   createBearerTokenPsLiteAuth,
   createMemoryPsLiteStorage,
   createPsLiteRuntime,
+  createWeb3SignedPsLiteAuth,
 } from "./runtime.js";
+import {
+  buildWeb3SignedHeader,
+  createTestWallet,
+} from "@opendatalabs/personal-server-ts-core/test-utils";
 
 describe("createPsLiteRuntime", () => {
   it("reports ps-lite availability through health", async () => {
@@ -222,6 +227,93 @@ describe("createPsLiteRuntime", () => {
       ),
     );
     expect(read.status).toBe(404);
+  });
+
+  it("supports Web3Signed owner writes and builder grant reads", async () => {
+    const owner = createTestWallet(0);
+    const builder = createTestWallet(1);
+    const grantId = "grant-1";
+    const runtime = createPsLiteRuntime({
+      storage: createMemoryPsLiteStorage(),
+      auth: createWeb3SignedPsLiteAuth({
+        origin: "https://ps.local",
+        ownerAddress: owner.address,
+        dataReadPolicyPorts: {
+          authSessionVerifier: {
+            async getBuilder(address) {
+              return address.toLowerCase() === builder.address.toLowerCase()
+                ? {
+                    id: "builder-1",
+                    ownerAddress: builder.address,
+                    granteeAddress: builder.address,
+                    publicKey: "0x04",
+                    appUrl: "https://builder.local",
+                    addedAt: "2026-05-08T00:00:00.000Z",
+                  }
+                : null;
+            },
+          },
+          grantVerifier: {
+            async getGrant(id) {
+              return id === grantId
+                ? {
+                    id: grantId,
+                    grantorAddress: owner.address,
+                    granteeId: "builder-1",
+                    grant: JSON.stringify({
+                      scopes: ["instagram.*"],
+                      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+                    }),
+                    fileIds: [],
+                    status: "confirmed",
+                    addedAt: "2026-05-08T00:00:00.000Z",
+                    revokedAt: null,
+                    revocationSignature: null,
+                  }
+                : null;
+            },
+          },
+        },
+      }),
+      active: true,
+      now: () => new Date("2026-05-08T00:00:00.000Z"),
+    });
+
+    const writeAuth = await buildWeb3SignedHeader({
+      wallet: owner,
+      aud: "https://ps.local",
+      method: "POST",
+      uri: "/v1/data/instagram.profile",
+    });
+    const write = await runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile", {
+        method: "POST",
+        headers: {
+          Authorization: writeAuth,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ username: "web3_user" }),
+      }),
+    );
+    expect(write.status).toBe(201);
+
+    const readAuth = await buildWeb3SignedHeader({
+      wallet: builder,
+      aud: "https://ps.local",
+      method: "GET",
+      uri: "/v1/data/instagram.profile",
+      grantId,
+    });
+    const read = await runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile", {
+        headers: { Authorization: readAuth },
+      }),
+    );
+
+    expect(read.status).toBe(200);
+    await expect(read.json()).resolves.toMatchObject({
+      data: { username: "web3_user" },
+    });
   });
 
   it("can be activated for foreground handling", async () => {
