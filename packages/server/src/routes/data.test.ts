@@ -950,6 +950,7 @@ describe("GET /v1/data/:scope", () => {
   it("returns 401 UNREGISTERED_BUILDER for unregistered builder", async () => {
     const gateway = createMockGateway({
       isRegisteredBuilder: vi.fn().mockResolvedValue(false),
+      getBuilder: vi.fn().mockResolvedValue(null),
     });
     const app = createApp({ gateway });
 
@@ -1015,6 +1016,38 @@ describe("GET /v1/data/:scope", () => {
     expect(res.status).toBe(403);
     const json = await res.json();
     expect(json.error.errorCode).toBe("SCOPE_MISMATCH");
+  });
+
+  it("returns 403 FEE_REQUIRED when fee verification fails", async () => {
+    const app = createApp({
+      feeVerifier: {
+        verifyDataReadFee: vi
+          .fn()
+          .mockResolvedValue({ ok: false, reason: "unpaid" }),
+      },
+    });
+
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+
+    const res = await getWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(403);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("FEE_REQUIRED");
+  });
+
+  it("returns 503 PS_UNAVAILABLE when runtime availability fails", async () => {
+    const app = createApp({
+      runtimeAvailability: { isAvailable: vi.fn().mockReturnValue(false) },
+    });
+
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+
+    const res = await getWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(503);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("PS_UNAVAILABLE");
   });
 
   it("returns 404 for nonexistent scope", async () => {

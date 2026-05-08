@@ -83,6 +83,23 @@ export class ScopeMismatchError extends ProtocolError {
   }
 }
 
+export class FeeRequiredError extends ProtocolError {
+  constructor(details?: Record<string, unknown>) {
+    super(403, "FEE_REQUIRED", "Required fee has not been paid", details);
+  }
+}
+
+export class PsUnavailableError extends ProtocolError {
+  constructor(details?: Record<string, unknown>) {
+    super(
+      503,
+      "PS_UNAVAILABLE",
+      "Personal Server runtime unavailable",
+      details,
+    );
+  }
+}
+
 // 413 — Payload errors
 
 export class ContentTooLargeError extends ProtocolError {

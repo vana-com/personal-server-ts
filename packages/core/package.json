@@ -60,6 +60,14 @@
       "types": "./dist/grants/index.d.ts",
       "import": "./dist/grants/index.js"
     },
+    "./policy": {
+      "types": "./dist/policy/index.d.ts",
+      "import": "./dist/policy/index.js"
+    },
+    "./ports": {
+      "types": "./dist/ports/index.d.ts",
+      "import": "./dist/ports/index.js"
+    },
     "./gateway": {
       "types": "./dist/gateway/client.d.ts",
       "import": "./dist/gateway/client.js"

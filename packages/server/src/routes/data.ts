@@ -12,6 +12,10 @@ import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage
 import type { GatewayClient } from "@opendatalabs/personal-server-ts-core/gateway";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
+import type {
+  FeeVerifierPort,
+  RuntimeAvailabilityPort,
+} from "@opendatalabs/personal-server-ts-core/ports";
 import type { TokenStore } from "../token-store.js";
 import type { Logger } from "pino";
 import {
@@ -20,7 +24,7 @@ import {
 } from "../middleware/body-limit.js";
 import { createWeb3AuthMiddleware } from "../middleware/web3-auth.js";
 import { createBuilderCheckMiddleware } from "../middleware/builder-check.js";
-import { createGrantCheckMiddleware } from "../middleware/grant-check.js";
+import { createDataReadPolicyMiddleware } from "../middleware/data-read-policy.js";
 import { createAccessLogMiddleware } from "../middleware/access-log.js";
 import { createOwnerCheckMiddleware } from "../middleware/owner-check.js";
 
@@ -35,6 +39,8 @@ export interface DataRouteDeps {
   syncManager?: SyncManager | null;
   devToken?: string;
   tokenStore?: TokenStore;
+  feeVerifier?: FeeVerifierPort;
+  runtimeAvailability?: RuntimeAvailabilityPort;
 }
 
 export function dataRoutes(deps: DataRouteDeps): Hono {
@@ -51,9 +57,10 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     deps.gateway,
     deps.serverOwner,
   );
-  const grantCheck = createGrantCheckMiddleware({
+  const dataReadPolicy = createDataReadPolicyMiddleware({
     gateway: deps.gateway,
-    serverOwner: deps.serverOwner,
+    feeVerifier: deps.feeVerifier,
+    runtimeAvailability: deps.runtimeAvailability,
   });
   const accessLog = createAccessLogMiddleware(deps.accessLogWriter);
   const ownerCheck = createOwnerCheckMiddleware(deps.serverOwner);
@@ -124,62 +131,55 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
   });
 
   // GET /v1/data/:scope — read a data file (requires auth + grant)
-  app.get(
-    "/:scope",
-    web3Auth,
-    builderCheck,
-    grantCheck,
-    accessLog,
-    async (c) => {
-      // 1. Validate scope
-      const scopeParam = c.req.param("scope");
-      const scopeResult = ScopeSchema.safeParse(scopeParam);
-      if (!scopeResult.success) {
-        return c.json(
-          {
-            error: "INVALID_SCOPE",
-            message: scopeResult.error.issues[0].message,
-          },
-          400,
-        );
-      }
-      const scope = scopeResult.data;
-
-      // 2. Determine lookup strategy: fileId, at, or latest
-      const fileIdParam = c.req.query("fileId");
-      const atParam = c.req.query("at");
-
-      let entry;
-      if (fileIdParam) {
-        entry = deps.indexManager.findByFileId(fileIdParam);
-      } else if (atParam) {
-        entry = deps.indexManager.findClosestByScope(scope, atParam);
-      } else {
-        entry = deps.indexManager.findLatestByScope(scope);
-      }
-
-      // 3. 404 if not found
-      if (!entry) {
-        return c.json(
-          {
-            error: "NOT_FOUND",
-            message: `No data found for scope "${scope}"`,
-          },
-          404,
-        );
-      }
-
-      // 4. Read the data file from disk
-      const envelope = await readDataFile(
-        deps.hierarchyOptions,
-        scope,
-        entry.collectedAt,
+  app.get("/:scope", web3Auth, dataReadPolicy, accessLog, async (c) => {
+    // 1. Validate scope
+    const scopeParam = c.req.param("scope");
+    const scopeResult = ScopeSchema.safeParse(scopeParam);
+    if (!scopeResult.success) {
+      return c.json(
+        {
+          error: "INVALID_SCOPE",
+          message: scopeResult.error.issues[0].message,
+        },
+        400,
       );
+    }
+    const scope = scopeResult.data;
 
-      // 5. Return 200 with envelope
-      return c.json(envelope);
-    },
-  );
+    // 2. Determine lookup strategy: fileId, at, or latest
+    const fileIdParam = c.req.query("fileId");
+    const atParam = c.req.query("at");
+
+    let entry;
+    if (fileIdParam) {
+      entry = deps.indexManager.findByFileId(fileIdParam);
+    } else if (atParam) {
+      entry = deps.indexManager.findClosestByScope(scope, atParam);
+    } else {
+      entry = deps.indexManager.findLatestByScope(scope);
+    }
+
+    // 3. 404 if not found
+    if (!entry) {
+      return c.json(
+        {
+          error: "NOT_FOUND",
+          message: `No data found for scope "${scope}"`,
+        },
+        404,
+      );
+    }
+
+    // 4. Read the data file from disk
+    const envelope = await readDataFile(
+      deps.hierarchyOptions,
+      scope,
+      entry.collectedAt,
+    );
+
+    // 5. Return 200 with envelope
+    return c.json(envelope);
+  });
 
   app.use("/:scope", createBodyLimit(DATA_INGEST_MAX_SIZE));
 

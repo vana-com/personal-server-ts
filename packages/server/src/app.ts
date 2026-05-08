@@ -20,6 +20,10 @@ import {
 import { oauthTokenRoutes } from "./routes/oauth-token.js";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
+import type {
+  FeeVerifierPort,
+  RuntimeAvailabilityPort,
+} from "@opendatalabs/personal-server-ts-core/ports";
 import type { TokenStore } from "./token-store.js";
 import type { Logger } from "pino";
 
@@ -49,6 +53,8 @@ export interface AppDeps {
   syncManager?: SyncManager | null;
   serverSigner?: ServerSigner;
   tokenStore?: TokenStore;
+  feeVerifier?: FeeVerifierPort;
+  runtimeAvailability?: RuntimeAvailabilityPort;
   getTunnelStatus?: HealthDeps["getTunnelStatus"];
 }
 
@@ -94,6 +100,8 @@ export function createApp(deps: AppDeps): Hono {
       devToken: deps.devToken,
       tokenStore: deps.tokenStore,
       syncManager: deps.syncManager ?? null,
+      feeVerifier: deps.feeVerifier,
+      runtimeAvailability: deps.runtimeAvailability,
     }),
   );
 
@@ -186,7 +194,7 @@ export function createApp(deps: AppDeps): Hono {
   app.onError((err, c) => {
     if (err instanceof ProtocolError) {
       deps.logger.warn({ err }, err.message);
-      return c.json(err.toJSON(), err.code as 401 | 403 | 413);
+      return c.json(err.toJSON(), err.code as 401 | 403 | 413 | 503);
     }
 
     deps.logger.error({ err }, "Unhandled error");
