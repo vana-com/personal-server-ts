@@ -11,6 +11,16 @@ export {
   configWriteErrorContract,
   validateServerConfigContract,
 } from "./config.js";
+export {
+  approveDeviceSessionContract,
+  createMemoryDeviceSessionStore,
+  DEVICE_POLL_INTERVAL_MS,
+  DEVICE_SESSION_TTL_MS,
+  initiateDeviceSessionContract,
+  pollDeviceSessionContract,
+  provisionDeviceTokenContract,
+  revokeDeviceTokenContract,
+} from "./auth-device.js";
 export { listAccessLogsContract } from "./access-logs.js";
 export {
   createGrantContract,
@@ -24,6 +34,12 @@ export {
   normalizeIntegerParam,
   parseJsonObjectBody,
 } from "./http.js";
+export {
+  oauthTokenContract,
+  OAUTH_ACCESS_TOKEN_TTL_SECONDS,
+  OAUTH_DEVICE_CODE_GRANT,
+  parseOAuthBasicAuth,
+} from "./oauth.js";
 export {
   getSyncStatusContract,
   syncFileContract,
@@ -45,4 +61,16 @@ export type {
   ReadDataContractInput,
   ReadDataContractResult,
 } from "./data.js";
+export type {
+  DeviceContractResult,
+  DeviceSession,
+  DeviceSessionStore,
+  DeviceTokenStorePort,
+} from "./auth-device.js";
 export type { ContractResult } from "./http.js";
+export type {
+  OAuthDeviceSession,
+  OAuthDeviceSessionLookup,
+  OAuthTokenResult,
+  OAuthTokenStorePort,
+} from "./oauth.js";

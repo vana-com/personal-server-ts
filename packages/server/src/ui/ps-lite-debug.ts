@@ -1,19 +1,39 @@
 import {
   createBearerTokenPsLiteAuth,
+  createIndexedDbPsLiteAccessLogStore,
   createIndexedDbPsLitePersistence,
   createIndexedDbPsLiteStateStore,
+  createIndexedDbPsLiteTokenStore,
   createMemoryPsLiteStorage,
   createPersistentPsLiteStorage,
   createPsLiteRuntime,
   loadOrCreatePsLiteConfig,
   loadOrCreatePsLiteServerIdentity,
   psLiteRelayPublicUrl,
+  savePsLiteConfig,
   startPsLiteRelayClient,
   type PsLiteRelayClient,
   type PsLiteRelayStatus,
   type PsLiteRuntime,
 } from "@opendatalabs/personal-server-ts-lite";
-import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
+import type {
+  ServerAccount,
+  SignTypedDataParams,
+} from "@opendatalabs/personal-server-ts-core/keys";
+import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
+import {
+  createGatewayClient,
+  fileRegistrationDomain,
+  grantRegistrationDomain,
+  grantRevocationDomain,
+  FILE_REGISTRATION_TYPES,
+  GRANT_REGISTRATION_TYPES,
+  GRANT_REVOCATION_TYPES,
+  type DataPortabilityGatewayConfig,
+  type FileRegistrationMessage,
+  type GrantRegistrationMessage,
+  type GrantRevocationMessage,
+} from "@opendatalabs/vana-sdk/browser";
 
 const ORIGIN = "https://ps-lite.local";
 const OWNER_TOKEN = "ps-lite-owner-token";
@@ -49,81 +69,68 @@ interface UiResult {
   data: unknown;
 }
 
+type DebugRequest = (
+  path: string,
+  options?: UiRequestOptions,
+) => Promise<UiResult>;
+
 let runtime: PsLiteRuntime | undefined;
 let storageMode: StorageMode = "indexeddb";
 let relayClient: PsLiteRelayClient | undefined;
 let relayStatus: PsLiteRelayStatus = "closed";
 let relayPublicUrl = "";
 
-const mockGateway: GatewayClient = {
-  async isRegisteredBuilder() {
-    return true;
-  },
-  async getBuilder(address: string) {
-    return {
-      id: "debug-builder",
-      ownerAddress: address,
-      granteeAddress: address,
-      publicKey: "0x04",
-      appUrl: "https://debug-builder.local",
-      addedAt: new Date().toISOString(),
-    };
-  },
-  async getGrant(grantId: string) {
-    return {
-      id: grantId,
-      grantorAddress: "debug-owner",
-      granteeId: "debug-builder",
-      grant: JSON.stringify({
-        scopes: [`${SAMPLE_SCOPE}`],
-        expiresAt: 0,
-      }),
-      fileIds: [],
-      status: "confirmed",
-      addedAt: new Date().toISOString(),
-      revokedAt: null,
-      revocationSignature: null,
-    };
-  },
-  async listGrantsByUser() {
-    return [];
-  },
-  async getSchemaForScope(scope: string) {
-    return {
-      id: "debug-schema",
-      ownerAddress: "debug-owner",
-      name: scope,
-      definitionUrl: "https://schemas.local/debug.schema.json",
-      scope,
-      addedAt: new Date().toISOString(),
-    };
-  },
-  async getServer() {
-    return null;
-  },
-  async getFile() {
-    return null;
-  },
-  async listFilesSince() {
-    return { files: [], nextCursor: null };
-  },
-  async getSchema() {
-    return null;
-  },
-  async registerFile() {
-    return { fileId: "debug-file" };
-  },
-  async createGrant() {
-    return { grantId: SAMPLE_GRANT_ID };
-  },
-  async revokeGrant() {},
-};
-
 function randomSessionId(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(12));
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
     "",
   );
+}
+
+function createBrowserServerSigner(
+  account: Pick<ServerAccount, "signTypedData">,
+  gatewayConfig: DataPortabilityGatewayConfig,
+): ServerSigner {
+  return {
+    async signFileRegistration(
+      msg: FileRegistrationMessage,
+    ): Promise<`0x${string}`> {
+      return account.signTypedData({
+        domain: fileRegistrationDomain(gatewayConfig),
+        types:
+          FILE_REGISTRATION_TYPES as unknown as SignTypedDataParams["types"],
+        primaryType: "FileRegistration",
+        message: msg as unknown as Record<string, unknown>,
+      });
+    },
+
+    async signGrantRegistration(
+      msg: GrantRegistrationMessage,
+    ): Promise<`0x${string}`> {
+      return account.signTypedData({
+        domain: grantRegistrationDomain(gatewayConfig),
+        types:
+          GRANT_REGISTRATION_TYPES as unknown as SignTypedDataParams["types"],
+        primaryType: "GrantRegistration",
+        message: {
+          ...msg,
+          fileIds: msg.fileIds.map((id: bigint) => id),
+        } as unknown as Record<string, unknown>,
+      });
+    },
+
+    async signGrantRevocation(
+      msg: GrantRevocationMessage,
+    ): Promise<`0x${string}`> {
+      return account.signTypedData({
+        domain: grantRevocationDomain(gatewayConfig),
+        types:
+          GRANT_REVOCATION_TYPES as unknown as SignTypedDataParams["types"],
+        primaryType: "GrantRevocation",
+        message: msg as unknown as Record<string, unknown>,
+      });
+    },
+  };
 }
 
 function authHeaders(mode: AuthMode): Record<string, string> {
@@ -140,7 +147,10 @@ function inferAuth(method: string): AuthMode {
   return "builder";
 }
 
-async function makeRuntime(mode: StorageMode): Promise<PsLiteRuntime> {
+async function makeRuntime(
+  mode: StorageMode,
+  options: { gateway?: "real" | "none" } = {},
+): Promise<PsLiteRuntime> {
   const stateStore = createIndexedDbPsLiteStateStore({
     dbName: "personal-server-lite-debug",
     storeName: "state",
@@ -152,17 +162,29 @@ async function makeRuntime(mode: StorageMode): Promise<PsLiteRuntime> {
     store: stateStore,
     ownerSignature: DEBUG_OWNER_SIGNATURE,
   });
+  const tokenStore = createIndexedDbPsLiteTokenStore({
+    dbName: "personal-server-lite-debug",
+    storeName: "tokens",
+  });
+  const accessLogStore = createIndexedDbPsLiteAccessLogStore({
+    dbName: "personal-server-lite-debug",
+    storeName: "accessLogs",
+  });
   const storage =
     mode === "indexeddb"
       ? await createPersistentPsLiteStorage(
           { kind: "indexeddb" },
           createIndexedDbPsLitePersistence({
-            dbName: "personal-server-lite-debug",
+            dbName: "personal-server-lite-debug-storage",
             storeName: "state",
             key: "data-storage-v1",
           }),
         )
       : createMemoryPsLiteStorage();
+  const gatewayConfig = {
+    chainId: config.gateway.chainId,
+    contracts: config.gateway.contracts,
+  };
 
   const nextRuntime = createPsLiteRuntime({
     storage,
@@ -176,8 +198,19 @@ async function makeRuntime(mode: StorageMode): Promise<PsLiteRuntime> {
       address: identity.account.address,
       publicKey: identity.account.publicKey,
     },
-    gateway: mockGateway,
+    gateway:
+      options.gateway === "none"
+        ? undefined
+        : createGatewayClient(config.gateway.url),
     serverOwner: identity.account.address,
+    serverSigner: createBrowserServerSigner(identity.account, gatewayConfig),
+    saveConfig: async (nextConfig) => {
+      const saved = await savePsLiteConfig(stateStore, nextConfig);
+      Object.assign(config, saved);
+    },
+    tokenStore,
+    accessLogReader: accessLogStore,
+    accessLogWriter: accessLogStore,
     accessToken: CONTROL_PLANE_TOKEN,
   });
   nextRuntime.activate();
@@ -209,6 +242,14 @@ async function request(
   options: UiRequestOptions = {},
 ): Promise<UiResult> {
   const activeRuntime = await ensureRuntime();
+  return requestWithRuntime(activeRuntime, path, options);
+}
+
+async function requestWithRuntime(
+  activeRuntime: PsLiteRuntime,
+  path: string,
+  options: UiRequestOptions = {},
+): Promise<UiResult> {
   const method = (options.method ?? "GET").toUpperCase();
   const headers = {
     ...authHeaders(options.auth ?? inferAuth(method)),
@@ -266,22 +307,22 @@ async function deactivate(): Promise<UiResult> {
   return status();
 }
 
-async function storageSmoke(): Promise<UiResult> {
+async function runStorageSmoke(requestFn: DebugRequest): Promise<UiResult> {
   const payload = {
     source: "debug-ui",
     runtime: "browser-ps-lite",
     at: new Date().toISOString(),
   };
-  const write = await request(`/v1/data/${SAMPLE_SCOPE}`, {
+  const write = await requestFn(`/v1/data/${SAMPLE_SCOPE}`, {
     method: "POST",
     auth: "owner",
     body: payload,
   });
-  const list = await request("/v1/data", { auth: "builder" });
-  const versions = await request(`/v1/data/${SAMPLE_SCOPE}/versions`, {
+  const list = await requestFn("/v1/data", { auth: "builder" });
+  const versions = await requestFn(`/v1/data/${SAMPLE_SCOPE}/versions`, {
     auth: "builder",
   });
-  const read = await request(
+  const read = await requestFn(
     `/v1/data/${SAMPLE_SCOPE}?grantId=${SAMPLE_GRANT_ID}`,
     { auth: "builder" },
   );
@@ -289,6 +330,37 @@ async function storageSmoke(): Promise<UiResult> {
     status: write.ok && list.ok && versions.ok && read.ok ? 200 : 500,
     ok: write.ok && list.ok && versions.ok && read.ok,
     data: { write, list, versions, read },
+  };
+}
+
+function isMissingDebugSchema(result: UiResult): boolean {
+  const data = result.data as { write?: { status?: number; data?: unknown } };
+  const write = data.write;
+  const writeData = write?.data as
+    | { error?: { errorCode?: string } }
+    | undefined;
+  return write?.status === 400 && writeData?.error?.errorCode === "NO_SCHEMA";
+}
+
+async function storageSmoke(): Promise<UiResult> {
+  const gatewayResult = await runStorageSmoke(request);
+  if (!isMissingDebugSchema(gatewayResult)) {
+    return gatewayResult;
+  }
+
+  const localRuntime = await makeRuntime(storageMode, { gateway: "none" });
+  const localResult = await runStorageSmoke((path, options) =>
+    requestWithRuntime(localRuntime, path, options),
+  );
+  return {
+    status: localResult.ok ? 200 : 500,
+    ok: localResult.ok,
+    data: {
+      gateway: gatewayResult,
+      localStorageFallback: localResult,
+      fallbackReason:
+        "Configured gateway has no schema for the debug.local.profile smoke scope",
+    },
   };
 }
 

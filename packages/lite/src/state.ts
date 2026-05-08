@@ -9,6 +9,12 @@ import type {
   ServerAccount,
   SignTypedDataParams,
 } from "@opendatalabs/personal-server-ts-core/keys";
+import type {
+  AccessLogEntry,
+  AccessLogWriter,
+} from "@opendatalabs/personal-server-ts-core/logging/access-log";
+import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
+import type { PsLiteTokenStore } from "./runtime.js";
 
 export type PsLiteStateKey = "config-v1" | "server-identity-v1" | "relay-v1";
 
@@ -19,6 +25,16 @@ export interface PsLiteStateStore {
 }
 
 export interface IndexedDbPsLiteStateStoreOptions {
+  dbName?: string;
+  storeName?: string;
+}
+
+export interface IndexedDbPsLiteTokenStoreOptions {
+  dbName?: string;
+  storeName?: string;
+}
+
+export interface IndexedDbPsLiteAccessLogStoreOptions {
   dbName?: string;
   storeName?: string;
 }
@@ -53,8 +69,19 @@ export interface PsLiteRelayState {
 
 const DEFAULT_STATE_DB_NAME = "personal-server-lite";
 const DEFAULT_STATE_STORE = "state";
+const DEFAULT_TOKEN_STORE = "tokens";
+const DEFAULT_ACCESS_LOG_STORE = "accessLogs";
+const STATE_DB_VERSION = 2;
 const CONFIG_KEY = "config-v1";
 const SERVER_IDENTITY_KEY = "server-identity-v1";
+const ACCESS_LOG_TIMESTAMP_INDEX = "timestamp";
+
+interface PsLiteTokenRecord {
+  token: string;
+  expiresAt: string | null;
+}
+
+type PsLiteAccessLogRecord = AccessLogEntry;
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
@@ -146,20 +173,56 @@ function accountFromPrivateKey(privateKey: `0x${string}`): ServerAccount {
   };
 }
 
-function openStateDb(
-  options: Required<IndexedDbPsLiteStateStoreOptions>,
-): Promise<IDBDatabase> {
+function createPsLiteStateSchema(
+  db: IDBDatabase,
+  transaction: IDBTransaction | null,
+  stores: {
+    stateStoreName: string;
+    tokenStoreName: string;
+    accessLogStoreName: string;
+  },
+): void {
+  if (!db.objectStoreNames.contains(stores.stateStoreName)) {
+    db.createObjectStore(stores.stateStoreName);
+  }
+  if (!db.objectStoreNames.contains(stores.tokenStoreName)) {
+    db.createObjectStore(stores.tokenStoreName, { keyPath: "token" });
+  }
+  if (!db.objectStoreNames.contains(stores.accessLogStoreName)) {
+    const accessLogs = db.createObjectStore(stores.accessLogStoreName, {
+      keyPath: "logId",
+    });
+    accessLogs.createIndex(ACCESS_LOG_TIMESTAMP_INDEX, "timestamp");
+  } else {
+    const accessLogs = transaction?.objectStore(stores.accessLogStoreName);
+    if (
+      accessLogs &&
+      !accessLogs.indexNames.contains(ACCESS_LOG_TIMESTAMP_INDEX)
+    ) {
+      accessLogs.createIndex(ACCESS_LOG_TIMESTAMP_INDEX, "timestamp");
+    }
+  }
+}
+
+function openStateDb(options: {
+  dbName: string;
+  stateStoreName?: string;
+  tokenStoreName?: string;
+  accessLogStoreName?: string;
+}): Promise<IDBDatabase> {
   if (typeof indexedDB === "undefined") {
     throw new Error("IndexedDB is not available in this runtime");
   }
 
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(options.dbName, 1);
+    const request = indexedDB.open(options.dbName, STATE_DB_VERSION);
     request.onupgradeneeded = () => {
-      const db = request.result;
-      if (!db.objectStoreNames.contains(options.storeName)) {
-        db.createObjectStore(options.storeName);
-      }
+      createPsLiteStateSchema(request.result, request.transaction, {
+        stateStoreName: options.stateStoreName ?? DEFAULT_STATE_STORE,
+        tokenStoreName: options.tokenStoreName ?? DEFAULT_TOKEN_STORE,
+        accessLogStoreName:
+          options.accessLogStoreName ?? DEFAULT_ACCESS_LOG_STORE,
+      });
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
@@ -171,7 +234,10 @@ function runStateTransaction<T>(
   mode: IDBTransactionMode,
   callback: (store: IDBObjectStore) => IDBRequest<T>,
 ): Promise<T> {
-  return openStateDb(options).then(
+  return openStateDb({
+    dbName: options.dbName,
+    stateStoreName: options.storeName,
+  }).then(
     (db) =>
       new Promise<T>((resolve, reject) => {
         const transaction = db.transaction(options.storeName, mode);
@@ -185,6 +251,75 @@ function runStateTransaction<T>(
           reject(transaction.error);
         };
       }),
+  );
+}
+
+function runStoreTransaction<T>(
+  options: {
+    dbName: string;
+    storeName: string;
+    schemaStore: "token" | "accessLog";
+  },
+  mode: IDBTransactionMode,
+  callback: (store: IDBObjectStore) => IDBRequest<T>,
+): Promise<T> {
+  return openStateDb({
+    dbName: options.dbName,
+    tokenStoreName:
+      options.schemaStore === "token" ? options.storeName : undefined,
+    accessLogStoreName:
+      options.schemaStore === "accessLog" ? options.storeName : undefined,
+  }).then(
+    (db) =>
+      new Promise<T>((resolve, reject) => {
+        const transaction = db.transaction(options.storeName, mode);
+        const store = transaction.objectStore(options.storeName);
+        const request = callback(store);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+        transaction.oncomplete = () => db.close();
+        transaction.onerror = () => {
+          db.close();
+          reject(transaction.error);
+        };
+      }),
+  );
+}
+
+function normalizeTokenExpiresAt(
+  value: string | Date | null | undefined,
+): string | null {
+  if (value == null) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error("Invalid token expiry");
+  }
+  return date.toISOString();
+}
+
+function tokenIsExpired(expiresAt: string | null | undefined): boolean {
+  return expiresAt ? new Date(expiresAt).getTime() <= Date.now() : false;
+}
+
+async function purgeExpiredTokens(options: {
+  dbName: string;
+  storeName: string;
+  schemaStore: "token";
+}): Promise<void> {
+  const tokens = await runStoreTransaction<PsLiteTokenRecord[]>(
+    options,
+    "readonly",
+    (store) => store.getAll(),
+  );
+  const expired = tokens.filter((entry) => tokenIsExpired(entry.expiresAt));
+  if (expired.length === 0) return;
+
+  await Promise.all(
+    expired.map((entry) =>
+      runStoreTransaction<undefined>(options, "readwrite", (store) =>
+        store.delete(entry.token),
+      ),
+    ),
   );
 }
 
@@ -234,6 +369,96 @@ export function createIndexedDbPsLiteStateStore(
       );
     },
   };
+}
+
+export function createIndexedDbPsLiteTokenStore(
+  options: IndexedDbPsLiteTokenStoreOptions = {},
+): PsLiteTokenStore {
+  const resolved = {
+    dbName: options.dbName ?? DEFAULT_STATE_DB_NAME,
+    storeName: options.storeName ?? DEFAULT_TOKEN_STORE,
+    schemaStore: "token" as const,
+  };
+
+  return {
+    capabilities: { tokens: "indexeddb" },
+    async getTokens() {
+      await purgeExpiredTokens(resolved);
+      const tokens = await runStoreTransaction<PsLiteTokenRecord[]>(
+        resolved,
+        "readonly",
+        (store) => store.getAll(),
+      );
+      return tokens.map((entry) => entry.token);
+    },
+    async isValid(token) {
+      const entry = await runStoreTransaction<PsLiteTokenRecord | undefined>(
+        resolved,
+        "readonly",
+        (store) => store.get(token),
+      );
+      if (!entry) return false;
+      if (tokenIsExpired(entry.expiresAt)) {
+        await runStoreTransaction<undefined>(resolved, "readwrite", (store) =>
+          store.delete(token),
+        );
+        return false;
+      }
+      return true;
+    },
+    async addToken(token, options) {
+      await runStoreTransaction<IDBValidKey>(resolved, "readwrite", (store) =>
+        store.put({
+          token,
+          expiresAt: normalizeTokenExpiresAt(options?.expiresAt),
+        } satisfies PsLiteTokenRecord),
+      );
+    },
+    async removeToken(token) {
+      await runStoreTransaction<undefined>(resolved, "readwrite", (store) =>
+        store.delete(token),
+      );
+    },
+  } as PsLiteTokenStore & { capabilities: { tokens: "indexeddb" } };
+}
+
+export function createIndexedDbPsLiteAccessLogStore(
+  options: IndexedDbPsLiteAccessLogStoreOptions = {},
+): AccessLogReader & AccessLogWriter {
+  const resolved = {
+    dbName: options.dbName ?? DEFAULT_STATE_DB_NAME,
+    storeName: options.storeName ?? DEFAULT_ACCESS_LOG_STORE,
+    schemaStore: "accessLog" as const,
+  };
+
+  return {
+    capabilities: { accessLogs: "indexeddb" },
+    async write(entry) {
+      await runStoreTransaction<IDBValidKey>(resolved, "readwrite", (store) =>
+        store.put({ ...entry } satisfies PsLiteAccessLogRecord),
+      );
+    },
+    async read(options) {
+      const limit = options?.limit ?? 50;
+      const offset = options?.offset ?? 0;
+      const logs = await runStoreTransaction<PsLiteAccessLogRecord[]>(
+        resolved,
+        "readonly",
+        (store) => store.getAll(),
+      );
+      logs.sort(
+        (a, b) =>
+          new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
+      );
+      return {
+        logs: logs.slice(offset, offset + limit),
+        total: logs.length,
+        limit,
+        offset,
+      };
+    },
+  } as AccessLogReader &
+    AccessLogWriter & { capabilities: { accessLogs: "indexeddb" } };
 }
 
 export async function loadOrCreatePsLiteConfig(

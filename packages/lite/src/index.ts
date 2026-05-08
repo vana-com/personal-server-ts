@@ -19,12 +19,16 @@ export {
 } from "./storage.js";
 
 export {
+  createIndexedDbPsLiteAccessLogStore,
   createIndexedDbPsLiteStateStore,
+  createIndexedDbPsLiteTokenStore,
   createMemoryPsLiteStateStore,
   loadOrCreatePsLiteConfig,
   loadOrCreatePsLiteServerIdentity,
   savePsLiteConfig,
+  type IndexedDbPsLiteAccessLogStoreOptions,
   type IndexedDbPsLiteStateStoreOptions,
+  type IndexedDbPsLiteTokenStoreOptions,
   type PsLiteEncryptedPrivateKey,
   type PsLiteEncryptedServerIdentity,
   type PsLiteRelayState,

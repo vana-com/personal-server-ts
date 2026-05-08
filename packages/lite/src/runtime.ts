@@ -15,21 +15,29 @@ import {
   UnregisteredBuilderError,
 } from "@opendatalabs/personal-server-ts-core/errors";
 import {
+  approveDeviceSessionContract,
   createGrantContract,
+  createMemoryDeviceSessionStore,
   deleteDataScopeContract,
   getSyncStatusContract,
   ingestDataContract,
+  initiateDeviceSessionContract,
   listAccessLogsContract,
   listDataScopesContract,
   listDataVersionsContract,
   listGrantsContract,
+  oauthTokenContract,
   parseDataScopeContract,
   parseJsonObjectBody,
+  pollDeviceSessionContract,
+  provisionDeviceTokenContract,
   readDataContract,
+  revokeDeviceTokenContract,
   syncFileContract,
   triggerSyncContract,
   validateServerConfigContract,
   verifyGrantContract,
+  type DeviceSessionStore,
   type DataContractError,
 } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
@@ -101,6 +109,12 @@ export interface PsLiteRuntimeOptions {
   tokenStore?: PsLiteTokenStore;
 }
 
+export interface PsLiteRuntimeStateCapabilities {
+  tokens: "indexeddb" | "memory" | "custom";
+  accessLogs: "indexeddb" | "memory" | "custom";
+  config: "indexeddb" | "memory" | "custom";
+}
+
 export interface PsLiteTokenStore {
   getTokens(): Promise<string[]>;
   isValid(token: string): Promise<boolean>;
@@ -109,6 +123,10 @@ export interface PsLiteTokenStore {
     options?: { expiresAt?: string | Date | null },
   ): Promise<void>;
   removeToken(token: string): Promise<void>;
+}
+
+interface PsLiteRuntimeStoreCapabilities {
+  capabilities?: Partial<PsLiteRuntimeStateCapabilities>;
 }
 
 export interface PsLiteRuntime extends RuntimeAvailabilityPort {
@@ -132,23 +150,6 @@ export interface Web3SignedPsLiteAuthOptions {
 }
 
 type JsonStatus = 200 | 201 | 400 | 401 | 403 | 404 | 405 | 500 | 501 | 503;
-const DEVICE_SESSION_TTL_MS = 5 * 60 * 1000;
-const DEVICE_POLL_INTERVAL_MS = 5 * 1000;
-const CLI_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const OAUTH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
-const DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
-
-interface PsLiteDeviceSession {
-  sessionId: string;
-  pollToken: string;
-  requestedServerOrigin: string;
-  status: "pending" | "approved";
-  accessToken?: string;
-  accessTokenExpiresAt?: string;
-  createdAt: number;
-  lastPollAt: number;
-}
-
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -355,6 +356,7 @@ function toDataStoragePort(
 function createMemoryAccessLogStore(): AccessLogReader & AccessLogWriter {
   const logs: AccessLogEntry[] = [];
   return {
+    capabilities: { accessLogs: "memory" },
     async write(entry) {
       logs.push(entry);
     },
@@ -372,7 +374,7 @@ function createMemoryAccessLogStore(): AccessLogReader & AccessLogWriter {
         offset,
       };
     },
-  };
+  } as AccessLogReader & AccessLogWriter & PsLiteRuntimeStoreCapabilities;
 }
 
 function createLogId(): string {
@@ -404,6 +406,7 @@ function createMemoryTokenStore(): PsLiteTokenStore {
   }
 
   return {
+    capabilities: { tokens: "memory" },
     async getTokens() {
       return Array.from(tokens.entries())
         .filter(([, expiresAt]) => !isExpired(expiresAt))
@@ -424,7 +427,7 @@ function createMemoryTokenStore(): PsLiteTokenStore {
     async removeToken(token) {
       tokens.delete(token);
     },
-  };
+  } as PsLiteTokenStore & PsLiteRuntimeStoreCapabilities;
 }
 
 function bearerToken(request: Request): string | null {
@@ -556,7 +559,7 @@ export function createPsLiteRuntime(
   const accessLogReader = options.accessLogReader ?? accessLogStore;
   const accessLogWriter = options.accessLogWriter ?? accessLogStore;
   const tokenStore = options.tokenStore ?? createMemoryTokenStore();
-  const deviceSessions = new Map<string, PsLiteDeviceSession>();
+  const deviceSessions: DeviceSessionStore = createMemoryDeviceSessionStore();
 
   async function withProtocolErrors(
     handler: () => Promise<Response> | Response,
@@ -586,103 +589,40 @@ export function createPsLiteRuntime(
     );
   }
 
-  function purgeDeviceSessions(): void {
-    const current = now().getTime();
-    for (const [sessionId, session] of deviceSessions.entries()) {
-      if (current - session.createdAt > DEVICE_SESSION_TTL_MS) {
-        deviceSessions.delete(sessionId);
-      }
-    }
-  }
-
-  function findDeviceSessionByPollToken(
-    pollToken: string,
-  ): PsLiteDeviceSession | undefined {
-    for (const session of deviceSessions.values()) {
-      if (session.pollToken === pollToken) return session;
-    }
-    return undefined;
-  }
-
   function ownerAddress(): `0x${string}` | undefined {
     return options.serverOwner ?? options.identity?.address;
   }
 
   async function handleAuthDevice(request: Request, url: URL) {
-    purgeDeviceSessions();
-
     if (url.pathname === "/auth/device") {
       if (request.method !== "POST") {
         return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
       }
-      const owner = ownerAddress();
-      if (!owner) {
-        return errorResponse(
-          500,
-          "SERVER_NOT_CONFIGURED",
-          "Server owner address not configured",
-        );
-      }
-      const sessionId = randomHex(32);
-      const pollToken = randomHex(32);
-      deviceSessions.set(sessionId, {
-        sessionId,
-        pollToken,
-        requestedServerOrigin: url.origin,
-        status: "pending",
-        createdAt: now().getTime(),
-        lastPollAt: 0,
-      });
-      return jsonResponse({
-        login: `${url.origin}/auth/device/approve?session=${sessionId}`,
-        poll: {
-          endpoint: "/auth/device/poll",
-          token: pollToken,
-        },
-      });
+      return sendContractResult(
+        initiateDeviceSessionContract({
+          sessionStore: deviceSessions,
+          serverOwner: ownerAddress(),
+          requestOrigin: url.origin,
+          approvalOrigin: url.origin,
+          sessionId: randomHex(32),
+          pollToken: randomHex(32),
+          now: now().getTime(),
+        }),
+      );
     }
 
     if (url.pathname === "/auth/device/poll") {
       if (request.method !== "GET") {
         return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
       }
-      const token = url.searchParams.get("token");
-      if (!token) {
-        return jsonResponse(
-          { error: { code: 400, message: "Missing token parameter" } },
-          { status: 400 },
-        );
-      }
-      const session = findDeviceSessionByPollToken(token);
-      if (!session) return jsonResponse({ status: "expired" }, { status: 404 });
-      const current = now().getTime();
-      if (current - session.lastPollAt < DEVICE_POLL_INTERVAL_MS) {
-        return jsonResponse(
-          {
-            error: {
-              code: 429,
-              message: `Too many requests. Poll every ${DEVICE_POLL_INTERVAL_MS / 1000} seconds.`,
-            },
-          },
-          { status: 429 },
-        );
-      }
-      session.lastPollAt = current;
-      if (session.status === "pending") {
-        return jsonResponse({ status: "pending" }, { status: 404 });
-      }
-      if (session.status === "approved" && session.accessToken) {
-        const response = {
-          status: "authorized",
-          server: session.requestedServerOrigin,
-          address: ownerAddress(),
-          access_token: session.accessToken,
-          expires_at: session.accessTokenExpiresAt,
-        };
-        deviceSessions.delete(session.sessionId);
-        return jsonResponse(response);
-      }
-      return jsonResponse({ status: "pending" }, { status: 404 });
+      return sendContractResult(
+        pollDeviceSessionContract({
+          sessionStore: deviceSessions,
+          pollToken: url.searchParams.get("token"),
+          serverOwner: ownerAddress(),
+          now: now().getTime(),
+        }),
+      );
     }
 
     if (url.pathname === "/auth/device/approve") {
@@ -716,15 +656,16 @@ export function createPsLiteRuntime(
         return jsonResponse({ status: "already_approved" });
       }
       await auth.authorizeOwner(request);
-      const accessToken = `vana_ps_${randomHex(32)}`;
-      const expiresAt = new Date(
-        now().getTime() + CLI_TOKEN_TTL_MS,
-      ).toISOString();
-      await tokenStore.addToken(accessToken, { expiresAt });
-      session.status = "approved";
-      session.accessToken = accessToken;
-      session.accessTokenExpiresAt = expiresAt;
-      return jsonResponse({ status: "approved" });
+      return sendContractResult(
+        await approveDeviceSessionContract({
+          sessionStore: deviceSessions,
+          tokenStore,
+          sessionId,
+          serverOwner: ownerAddress(),
+          accessToken: `vana_ps_${randomHex(32)}`,
+          now: now().getTime(),
+        }),
+      );
     }
 
     if (url.pathname === "/auth/device/token") {
@@ -736,10 +677,12 @@ export function createPsLiteRuntime(
             { status: 401 },
           );
         }
-        if (await tokenStore.isValid(token)) {
-          await tokenStore.removeToken(token);
-        }
-        return jsonResponse({ status: "revoked" });
+        return sendContractResult(
+          await revokeDeviceTokenContract({
+            tokenStore,
+            bearerToken: token,
+          }),
+        );
       }
       if (request.method !== "POST") {
         return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
@@ -775,10 +718,13 @@ export function createPsLiteRuntime(
           { status: 400 },
         );
       }
-      await tokenStore.addToken(body.token, {
-        expiresAt: body.expires_at ?? null,
-      });
-      return jsonResponse({ status: "created" }, { status: 201 });
+      return sendContractResult(
+        await provisionDeviceTokenContract({
+          tokenStore,
+          body,
+          now: now().getTime(),
+        }),
+      );
     }
 
     return undefined;
@@ -800,87 +746,33 @@ export function createPsLiteRuntime(
       );
     }
     const form = await readForm(request);
-    const grantType = form.get("grant_type");
-    if (grantType === "client_credentials") {
-      if (!options.accessToken) {
-        return jsonResponse(
-          {
-            error: "unauthorized_client",
-            error_description:
-              "Server is not configured for client_credentials",
-          },
-          { status: 401 },
-        );
-      }
-      const clientId = form.get("client_id");
-      const clientSecret = form.get("client_secret");
-      if (
-        clientId !== "control-plane" ||
-        clientSecret !== options.accessToken
-      ) {
-        return jsonResponse(
-          {
-            error: "invalid_client",
-            error_description: "Invalid client credentials",
-          },
-          { status: 401 },
-        );
-      }
-      const accessToken = `vana_ps_${randomHex(32)}`;
-      const expiresAt = new Date(
-        now().getTime() + OAUTH_TOKEN_TTL_SECONDS * 1000,
-      ).toISOString();
-      await tokenStore.addToken(accessToken, { expiresAt });
-      return jsonResponse({
-        access_token: accessToken,
-        token_type: "Bearer",
-        expires_in: OAUTH_TOKEN_TTL_SECONDS,
-      });
-    }
-    if (grantType === DEVICE_CODE_GRANT) {
-      const deviceCode = form.get("device_code");
-      if (!deviceCode) {
-        return jsonResponse(
-          {
-            error: "invalid_request",
-            error_description: "Missing device_code",
-          },
-          { status: 400 },
-        );
-      }
-      const session = findDeviceSessionByPollToken(deviceCode);
-      if (!session) {
-        return jsonResponse(
-          {
-            error: "expired_token",
-            error_description: "Device code is expired or unknown",
-          },
-          { status: 400 },
-        );
-      }
-      if (session.status === "pending" || !session.accessToken) {
-        return jsonResponse(
-          {
-            error: "authorization_pending",
-            error_description: "User has not yet approved the device",
-          },
-          { status: 400 },
-        );
-      }
-      deviceSessions.delete(session.sessionId);
-      return jsonResponse({
-        access_token: session.accessToken,
-        token_type: "Bearer",
-        expires_in: OAUTH_TOKEN_TTL_SECONDS,
-      });
-    }
-    return jsonResponse(
-      {
-        error: "unsupported_grant_type",
-        error_description: `Grant type '${grantType}' is not supported`,
+    const result = await oauthTokenContract({
+      body: form,
+      authorizationHeader: request.headers.get("authorization"),
+      tokenStore,
+      controlPlaneSecret: options.accessToken,
+      randomToken: () => `vana_ps_${randomHex(32)}`,
+      now,
+      deviceSessions: {
+        findByDeviceCode(deviceCode) {
+          const session = deviceSessions.findByPollToken(deviceCode);
+          if (!session) return null;
+          return {
+            status: session.status,
+            accessToken: session.accessToken,
+            accessTokenExpiresAt: session.accessTokenExpiresAt,
+            sessionId: session.sessionId,
+          };
+        },
+        consume(sessionId) {
+          deviceSessions.delete(sessionId);
+        },
       },
-      { status: 400 },
-    );
+    });
+    return jsonResponse(result.body, {
+      status: result.status,
+      headers: result.headers,
+    });
   }
 
   return {
@@ -905,11 +797,23 @@ export function createPsLiteRuntime(
               capabilities?: PsLiteStorageCapabilities;
             }
           ).capabilities;
+          const stateCapabilities: PsLiteRuntimeStateCapabilities = {
+            tokens:
+              (tokenStore as PsLiteTokenStore & PsLiteRuntimeStoreCapabilities)
+                .capabilities?.tokens ?? "custom",
+            accessLogs:
+              (
+                accessLogReader as AccessLogReader &
+                  PsLiteRuntimeStoreCapabilities
+              ).capabilities?.accessLogs ?? "custom",
+            config: options.saveConfig ? "custom" : "memory",
+          };
           return jsonResponse({
             status: active ? "healthy" : "unavailable",
             runtime: "ps-lite",
             storage: options.storage.kind,
             capabilities: capabilities ?? null,
+            stateCapabilities,
             apiOrigin: options.config?.server?.origin ?? url.origin,
             gatewayUrl: options.config?.gateway?.url ?? null,
             identity: options.identity ?? null,

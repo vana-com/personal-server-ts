@@ -38,7 +38,7 @@ export interface IndexedDbPsLitePersistenceOptions {
   key?: string;
 }
 
-const DEFAULT_INDEXED_DB_NAME = "personal-server-lite";
+const DEFAULT_INDEXED_DB_NAME = "personal-server-lite-storage";
 const DEFAULT_INDEXED_DB_STORE = "state";
 const DEFAULT_INDEXED_DB_KEY = "data-storage-v1";
 

@@ -30,6 +30,11 @@ describe("createPsLiteRuntime", () => {
         files: "memory",
         opfsAvailable: false,
       },
+      stateCapabilities: {
+        tokens: "memory",
+        accessLogs: "memory",
+        config: "memory",
+      },
       apiOrigin: "https://ps.local",
       gatewayUrl: null,
       identity: null,
@@ -407,6 +412,27 @@ describe("createPsLiteRuntime", () => {
     const redeemBody = (await redeem.json()) as { access_token: string };
     expect(redeemBody.access_token).toMatch(/^vana_ps_/);
     expect(await tokenStore.isValid(redeemBody.access_token)).toBe(true);
+
+    const clientCredentials = await runtime.fetch(
+      new Request("https://ps.local/oauth/token", {
+        method: "POST",
+        headers: {
+          Authorization: `Basic ${btoa("control-plane:control-plane-secret")}`,
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          grant_type: "client_credentials",
+        }),
+      }),
+    );
+    expect(clientCredentials.status).toBe(200);
+    const clientCredentialsBody = (await clientCredentials.json()) as {
+      access_token: string;
+    };
+    expect(clientCredentialsBody.access_token).toMatch(/^vana_ps_/);
+    expect(await tokenStore.isValid(clientCredentialsBody.access_token)).toBe(
+      true,
+    );
 
     const provision = await runtime.fetch(
       new Request("https://ps.local/auth/device/token", {
