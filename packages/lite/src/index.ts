@@ -1,4 +1,10 @@
 export {
+  handlePsLiteBridgeRequest,
+  type PsLiteBridgeRequest,
+  type PsLiteBridgeResponse,
+} from "./bridge.js";
+
+export {
   createBearerTokenPsLiteAuth,
   createMemoryPsLiteStorage,
   createPsLiteRuntime,
