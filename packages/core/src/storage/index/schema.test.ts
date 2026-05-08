@@ -68,4 +68,40 @@ describe("initializeDatabase", () => {
 
     await rm(tempDir, { recursive: true });
   });
+
+  it("sets the index schema version without dropping existing rows", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "schema-version-"));
+    const dbPath = join(tempDir, "version-test.db");
+
+    const db1 = initializeDatabase(dbPath);
+    db1
+      .prepare(
+        "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+      )
+      .run(
+        "instagram/profile.json",
+        "instagram.profile",
+        "2026-01-21T10:00:00Z",
+        42,
+      );
+    db1.close();
+
+    const db2 = initializeDatabase(dbPath);
+    const version = db2.pragma("user_version", { simple: true });
+    const row = db2
+      .prepare("SELECT path, scope, size_bytes FROM data_files WHERE path = ?")
+      .get("instagram/profile.json") as
+      | { path: string; scope: string; size_bytes: number }
+      | undefined;
+
+    expect(version).toBe(1);
+    expect(row).toEqual({
+      path: "instagram/profile.json",
+      scope: "instagram.profile",
+      size_bytes: 42,
+    });
+    db2.close();
+
+    await rm(tempDir, { recursive: true });
+  });
 });

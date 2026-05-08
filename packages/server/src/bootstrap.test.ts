@@ -1,4 +1,11 @@
-import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
@@ -268,6 +275,32 @@ describe("createServer", () => {
 
     await expect(access(join(rootPath, "index.db"))).resolves.toBeUndefined();
     await expect(access(join(serverDir, "index.db"))).rejects.toThrow();
+
+    await ctx.cleanup();
+  });
+
+  it("runs local state migrations during startup", async () => {
+    const rootPath = join(tempDir, "migrated-root");
+    await mkdir(rootPath, { recursive: true });
+    await writeFile(
+      join(rootPath, "config.json"),
+      JSON.stringify({
+        sync: { lastProcessedTimestamp: "2026-01-21T10:00:00.000Z" },
+      }),
+      "utf-8",
+    );
+
+    const config = makeDefaultConfig();
+    const ctx = await createServer(config, { rootPath });
+
+    const state = JSON.parse(
+      await readFile(join(rootPath, "state.json"), "utf-8"),
+    );
+    const cursor = JSON.parse(
+      await readFile(join(rootPath, "sync-cursor.json"), "utf-8"),
+    );
+    expect(state.version).toBe(1);
+    expect(cursor.lastProcessedTimestamp).toBe("2026-01-21T10:00:00.000Z");
 
     await ctx.cleanup();
   });

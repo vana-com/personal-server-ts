@@ -45,6 +45,7 @@ import { createVanaStorageAdapter } from "@opendatalabs/personal-server-ts-core/
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
 import { generateDevToken } from "./dev-token.js";
+import { migrateLocalState } from "./migrations/local-state.js";
 import { createTokenStore, type TokenStore } from "./token-store.js";
 import { TunnelManager, ensureFrpcBinary } from "./tunnel/index.js";
 
@@ -114,11 +115,19 @@ export async function createServer(
   const indexPath = join(storageRoot, "index.db");
   const configPath = join(storageRoot, "config.json");
   const syncCursorPath = join(storageRoot, "sync-cursor.json");
+  const tokensPath = join(storageRoot, "tokens.json");
 
   await mkdir(storageRoot, { recursive: true });
   await mkdir(dataDir, { recursive: true });
 
   const db = initializeDatabase(indexPath);
+  await migrateLocalState({
+    storageRoot,
+    dataDir,
+    configPath,
+    syncCursorPath,
+    tokensPath,
+  });
   const indexManager = createIndexManager(db);
   const hierarchyOptions: HierarchyManagerOptions = { dataDir };
 
@@ -273,7 +282,6 @@ export async function createServer(
   const devToken = config.devUi.enabled ? generateDevToken() : undefined;
 
   // Token store for /auth/device flow (self-hosted CLI auth)
-  const tokensPath = join(storageRoot, "tokens.json");
   const tokenStore: TokenStore = createTokenStore(tokensPath, logger);
   const cloudMode = process.env.CLOUD_MODE === "true";
   const localApprovalPort = cloudMode

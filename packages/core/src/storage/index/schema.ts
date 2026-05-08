@@ -17,6 +17,20 @@ const CREATE_INDEXES_SQL = [
   "CREATE INDEX IF NOT EXISTS idx_data_files_file_id ON data_files (file_id)",
 ];
 
+export const INDEX_SCHEMA_VERSION = 1;
+
+function ensureSchemaVersion(db: Database.Database): void {
+  const currentVersion = db.pragma("user_version", { simple: true }) as number;
+  if (currentVersion > INDEX_SCHEMA_VERSION) {
+    throw new Error(
+      `Unsupported index.db schema version ${currentVersion}; runtime supports ${INDEX_SCHEMA_VERSION}`,
+    );
+  }
+  if (currentVersion < INDEX_SCHEMA_VERSION) {
+    db.pragma(`user_version = ${INDEX_SCHEMA_VERSION}`);
+  }
+}
+
 /** Open/create SQLite database, run CREATE TABLE IF NOT EXISTS, set WAL mode */
 export function initializeDatabase(dbPath: string): Database.Database {
   const db = new Database(dbPath);
@@ -27,6 +41,7 @@ export function initializeDatabase(dbPath: string): Database.Database {
   for (const sql of CREATE_INDEXES_SQL) {
     db.exec(sql);
   }
+  ensureSchemaVersion(db);
 
   return db;
 }
