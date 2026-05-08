@@ -1,12 +1,7 @@
 import { Hono } from "hono";
 import { ScopeSchema } from "@opendatalabs/personal-server-ts-core/scopes";
 import { createDataFileEnvelope } from "@opendatalabs/personal-server-ts-core/schemas/data-file";
-import {
-  generateCollectedAt,
-  writeDataFile,
-  readDataFile,
-  deleteAllForScope,
-} from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
+import { generateCollectedAt } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { GatewayClient } from "@opendatalabs/personal-server-ts-core/gateway";
@@ -14,6 +9,7 @@ import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logg
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type {
   FeeVerifierPort,
+  DataStoragePort,
   RuntimeAvailabilityPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
 import type { TokenStore } from "../token-store.js";
@@ -27,6 +23,7 @@ import { createBuilderCheckMiddleware } from "../middleware/builder-check.js";
 import { createDataReadPolicyMiddleware } from "../middleware/data-read-policy.js";
 import { createAccessLogMiddleware } from "../middleware/access-log.js";
 import { createOwnerCheckMiddleware } from "../middleware/owner-check.js";
+import { createNodeDataStorage } from "../storage/node-data-storage.js";
 
 export interface DataRouteDeps {
   indexManager: IndexManager;
@@ -40,6 +37,7 @@ export interface DataRouteDeps {
   devToken?: string;
   tokenStore?: TokenStore;
   feeVerifier?: FeeVerifierPort;
+  dataStorage?: DataStoragePort;
   runtimeAvailability?: RuntimeAvailabilityPort;
 }
 
@@ -64,6 +62,12 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
   });
   const accessLog = createAccessLogMiddleware(deps.accessLogWriter);
   const ownerCheck = createOwnerCheckMiddleware(deps.serverOwner);
+  const dataStorage =
+    deps.dataStorage ??
+    createNodeDataStorage({
+      indexManager: deps.indexManager,
+      hierarchyOptions: deps.hierarchyOptions,
+    });
 
   // GET /v1/data/:scope/versions — list versions for a scope (requires auth + builder, no grant)
   app.get("/:scope/versions", web3Auth, builderCheck, async (c) => {
@@ -90,8 +94,8 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       : 0;
 
     // 3. Query index
-    const entries = deps.indexManager.findByScope({ scope, limit, offset });
-    const total = deps.indexManager.countByScope(scope);
+    const entries = dataStorage.listVersions(scope, { limit, offset });
+    const total = dataStorage.countVersions(scope);
 
     // 4. Return response
     return c.json({
@@ -116,7 +120,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       ? parseInt(c.req.query("offset")!, 10)
       : 0;
 
-    const result = deps.indexManager.listDistinctScopes({
+    const result = dataStorage.listScopes({
       scopePrefix: scopePrefix || undefined,
       limit,
       offset,
@@ -150,14 +154,11 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     const fileIdParam = c.req.query("fileId");
     const atParam = c.req.query("at");
 
-    let entry;
-    if (fileIdParam) {
-      entry = deps.indexManager.findByFileId(fileIdParam);
-    } else if (atParam) {
-      entry = deps.indexManager.findClosestByScope(scope, atParam);
-    } else {
-      entry = deps.indexManager.findLatestByScope(scope);
-    }
+    const entry = dataStorage.findEntry({
+      scope,
+      fileId: fileIdParam,
+      at: atParam,
+    });
 
     // 3. 404 if not found
     if (!entry) {
@@ -171,11 +172,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     }
 
     // 4. Read the data file from disk
-    const envelope = await readDataFile(
-      deps.hierarchyOptions,
-      scope,
-      entry.collectedAt,
-    );
+    const envelope = await dataStorage.readEnvelope(scope, entry.collectedAt);
 
     // 5. Return 200 with envelope
     return c.json(envelope);
@@ -259,10 +256,10 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     );
 
     // 6. Write atomically
-    const writeResult = await writeDataFile(deps.hierarchyOptions, envelope);
+    const writeResult = await dataStorage.writeEnvelope(envelope);
 
     // 7. Insert into index
-    deps.indexManager.insert({
+    dataStorage.insertEntry({
       fileId: null,
       path: writeResult.relativePath,
       scope,
@@ -303,10 +300,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     const scope = scopeResult.data;
 
     // 2. Delete from index
-    const deletedCount = deps.indexManager.deleteByScope(scope);
-
-    // 3. Delete from filesystem
-    await deleteAllForScope(deps.hierarchyOptions, scope);
+    const deletedCount = await dataStorage.deleteScope(scope);
 
     deps.logger.info({ scope, deletedCount }, "Scope deleted");
 
