@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
-import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
+import {
+  createDataFileEnvelope,
+  recoverServerOwner,
+} from "@opendatalabs/vana-sdk/browser";
 import { createMemoryPsLiteStorage } from "./runtime.js";
 import {
   createMemoryPsLiteStateStore,
@@ -43,6 +46,7 @@ describe("PS Lite sync", () => {
       store: stateStore,
       ownerSignature: OWNER_SIGNATURE,
     });
+    const owner = (await recoverServerOwner(OWNER_SIGNATURE)).toLowerCase();
     const gateway = {
       getSchemaForScope: vi.fn().mockResolvedValue({
         id: SCHEMA_ID,
@@ -66,15 +70,20 @@ describe("PS Lite sync", () => {
       revokeGrant: vi.fn().mockResolvedValue(undefined),
     };
     const fetchMock = vi.fn().mockResolvedValue(
-      new Response(null, {
-        status: 200,
-      }),
+      new Response(
+        JSON.stringify({
+          key: `${owner}/instagram.profile/2026-05-08T00:00:00.000Z`,
+          url: `https://storage.vana.com/v1/blobs/${owner}/instagram.profile/2026-05-08T00:00:00.000Z`,
+          etag: "etag-browser-1",
+          size: 256,
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
     );
     vi.stubGlobal("fetch", fetchMock);
-    vi.stubEnv("R2_ACCOUNT_ID", "acct");
-    vi.stubEnv("R2_ACCESS_KEY_ID", "key");
-    vi.stubEnv("R2_SECRET_ACCESS_KEY", "secret");
-    vi.stubEnv("R2_BUCKET", "bucket");
 
     const { syncManager } = await createPsLiteSyncManager({
       config: ServerConfigSchema.parse({ sync: { enabled: true } }),
@@ -94,7 +103,7 @@ describe("PS Lite sync", () => {
       fileId: "file-browser-1",
     });
     expect(fetchMock).toHaveBeenCalledWith(
-      expect.any(String),
+      `https://storage.vana.com/v1/blobs/${owner}/instagram.profile/2026-05-08T00%3A00%3A00.000Z`,
       expect.objectContaining({ method: "PUT" }),
     );
     expect(gateway.registerFile).toHaveBeenCalledWith(

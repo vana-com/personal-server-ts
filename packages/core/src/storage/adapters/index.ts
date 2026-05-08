@@ -4,3 +4,4 @@ export {
   type SdkStorageProvider,
   type SdkStorageProviderFactory,
 } from "./sdk.js";
+export { createVanaSyncStorageAdapter } from "./vana.js";

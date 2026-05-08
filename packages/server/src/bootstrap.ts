@@ -20,10 +20,7 @@ import {
   type IndexManager,
 } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
-import {
-  createGatewayClient,
-  createVanaStorageProvider,
-} from "@opendatalabs/vana-sdk/node";
+import { createGatewayClient } from "@opendatalabs/vana-sdk/node";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { createAccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import { createAccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
@@ -41,7 +38,7 @@ import {
   createSyncManager,
   type SyncManager,
 } from "@opendatalabs/personal-server-ts-core/sync";
-import { createSdkStorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
+import { createVanaSyncStorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
 import { generateDevToken } from "./dev-token.js";
@@ -233,7 +230,11 @@ export async function createServer(
   ) {
     const masterKey = deriveMasterKey(masterKeySignature);
 
-    const storageAdapter = createSdkStorageAdapter(createVanaStorageProvider);
+    const storageAdapter = createVanaSyncStorageAdapter({
+      config,
+      serverOwner,
+      serverAccount,
+    });
 
     const cursor = createSyncCursor(syncCursorPath, {
       legacyConfigPath: configPath,
