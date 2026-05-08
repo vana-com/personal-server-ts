@@ -100,6 +100,12 @@ export class PsUnavailableError extends ProtocolError {
   }
 }
 
+export class ServerNotConfiguredError extends ProtocolError {
+  constructor(details?: Record<string, unknown>) {
+    super(500, "SERVER_NOT_CONFIGURED", "Server is not configured", details);
+  }
+}
+
 // 413 — Payload errors
 
 export class ContentTooLargeError extends ProtocolError {

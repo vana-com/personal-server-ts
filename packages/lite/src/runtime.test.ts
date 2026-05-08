@@ -316,6 +316,36 @@ describe("createPsLiteRuntime", () => {
     });
   });
 
+  it("returns SERVER_NOT_CONFIGURED when Web3Signed reads lack policy ports", async () => {
+    const owner = createTestWallet(0);
+    const builder = createTestWallet(1);
+    const runtime = createPsLiteRuntime({
+      storage: createMemoryPsLiteStorage(),
+      auth: createWeb3SignedPsLiteAuth({
+        origin: "https://ps.local",
+        ownerAddress: owner.address,
+      }),
+      active: true,
+    });
+
+    const readAuth = await buildWeb3SignedHeader({
+      wallet: builder,
+      aud: "https://ps.local",
+      method: "GET",
+      uri: "/v1/data/instagram.profile",
+      grantId: "grant-1",
+    });
+    const res = await runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile", {
+        headers: { Authorization: readAuth },
+      }),
+    );
+
+    expect(res.status).toBe(500);
+    const body = await res.json();
+    expect(body.error.errorCode).toBe("SERVER_NOT_CONFIGURED");
+  });
+
   it("can be activated for foreground handling", async () => {
     const runtime = createPsLiteRuntime({
       storage: { kind: "indexeddb" },

@@ -215,9 +215,14 @@ export function createWeb3SignedPsLiteAuth(
     async authorizeBuilderRead(input) {
       const verified = await verifyWeb3SignedRequest(input.request, options);
       if (!options.dataReadPolicyPorts) {
-        throw new GrantRequiredError({
-          reason: "PS Lite read policy ports are not configured",
-        });
+        throw new ProtocolError(
+          500,
+          "SERVER_NOT_CONFIGURED",
+          "Server is not configured",
+          {
+            reason: "PS Lite read policy ports are not configured",
+          },
+        );
       }
       await verifyDataReadPolicy(
         {

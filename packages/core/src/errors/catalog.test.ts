@@ -10,6 +10,9 @@ import {
   GrantExpiredError,
   GrantRevokedError,
   ScopeMismatchError,
+  FeeRequiredError,
+  PsUnavailableError,
+  ServerNotConfiguredError,
   ContentTooLargeError,
 } from "./catalog.js";
 
@@ -73,6 +76,13 @@ describe("ProtocolError", () => {
       { Cls: GrantExpiredError, code: 403, errorCode: "GRANT_EXPIRED" },
       { Cls: GrantRevokedError, code: 403, errorCode: "GRANT_REVOKED" },
       { Cls: ScopeMismatchError, code: 403, errorCode: "SCOPE_MISMATCH" },
+      { Cls: FeeRequiredError, code: 403, errorCode: "FEE_REQUIRED" },
+      { Cls: PsUnavailableError, code: 503, errorCode: "PS_UNAVAILABLE" },
+      {
+        Cls: ServerNotConfiguredError,
+        code: 500,
+        errorCode: "SERVER_NOT_CONFIGURED",
+      },
       { Cls: ContentTooLargeError, code: 413, errorCode: "CONTENT_TOO_LARGE" },
     ];
 
@@ -94,6 +104,9 @@ describe("ProtocolError", () => {
       GrantExpiredError,
       GrantRevokedError,
       ScopeMismatchError,
+      FeeRequiredError,
+      PsUnavailableError,
+      ServerNotConfiguredError,
       ContentTooLargeError,
     ];
 
@@ -117,6 +130,11 @@ describe("ProtocolError", () => {
     expect(new GrantExpiredError().name).toBe("GrantExpiredError");
     expect(new GrantRevokedError().name).toBe("GrantRevokedError");
     expect(new ScopeMismatchError().name).toBe("ScopeMismatchError");
+    expect(new FeeRequiredError().name).toBe("FeeRequiredError");
+    expect(new PsUnavailableError().name).toBe("PsUnavailableError");
+    expect(new ServerNotConfiguredError().name).toBe(
+      "ServerNotConfiguredError",
+    );
     expect(new ContentTooLargeError().name).toBe("ContentTooLargeError");
   });
 });
