@@ -110,6 +110,7 @@
   },
   "dependencies": {
     "@noble/hashes": "^2.2.0",
+    "@opendatalabs/vana-sdk": "github:vana-com/vana-sdk#volod/encryption-auth-primitives",
     "better-sqlite3": "^12.9.0",
     "openpgp": "^6.3.0",
     "pino": "^10.3.1",
