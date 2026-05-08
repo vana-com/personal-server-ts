@@ -33,28 +33,28 @@ All implementation tasks following this spec must use red/green TDD and must pre
 
 ## Decided / TBD / Out of Scope
 
-| Topic                                              | Status                  | Notes                                                                                          |
-| -------------------------------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------- |
-| Node baseline                                      | Decided                 | Node 22.                                                                                       |
-| Canonical PS contract source                       | Decided                 | `personal-server-ts` remains the canonical HTTP/data-plane contract during refactor.           |
-| Runtime scope                                      | Decided                 | Initial spec scope includes `ps-node` and `ps-lite`.                                           |
-| Runtime split (`ps-node`, `ps-lite`)               | Decided                 | Introduce runtime-agnostic core with runtime-specific adapters.                                |
-| SDK dependency source                              | Decided with validation | Use GitHub dependency syntax for now; keep validation open for monorepo install behavior.      |
-| SDK import path                                    | Decided                 | Node runtime imports from `@opendatalabs/vana-sdk/node`.                                       |
-| PS Lite API server                                 | Decided direction       | Follow PS Lite PoC direction and adapt to the Personal Server contract surface.                |
-| Reusable primitives alignment with `vana-sdk`      | Decided                 | Align shared primitives incrementally; avoid big-bang migration.                               |
-| Plaintext boundary                                 | Decided                 | Plaintext remains inside user/PS runtime boundary only.                                        |
-| Data read preconditions                            | Decided                 | Validate builder, grant, scope, expiry, revocation, and fee state before return.               |
-| Runtime unavailable behavior                       | Decided                 | Return typed `ps_unavailable` when target runtime is down/unreachable.                         |
-| `vana-connect` placement                           | Decided                 | Adjacent integration, not PS internal runtime module.                                          |
-| Key derivation                                     | Decided                 | Keep DPv1 `HKDF(signature, scope)` model using the master key signature as key material.       |
-| GitHub dependency syntax                           | TBD after validation    | Scratch validation showed direct GitHub alias installs the monorepo root, not the SDK package. |
-| Seed recovery / backup UX                          | Out of Scope            | Not part of this pass while DPv1 signature-derived key material remains the target model.      |
-| Exact final package/export shapes                  | TBD                     | Deferred to Task 4 package-boundary details.                                                   |
-| Final DPv2 endpoint/auth contract text             | TBD                     | Deferred to Task 5 contract and auth sections.                                                 |
-| Full storage/encryption/runtime migration sequence | TBD                     | Deferred to Task 6 runtime and migration sections.                                             |
-| `ps-worker`                                        | Out of Scope            | Future extension only.                                                                         |
-| Code changes, dependency changes, test changes     | Out of Scope            | This task only updates the planning doc.                                                       |
+| Topic                                              | Status                  | Notes                                                                                                            |
+| -------------------------------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Node baseline                                      | Decided                 | Node 22.                                                                                                         |
+| Canonical PS contract source                       | Decided                 | `personal-server-ts` remains the canonical HTTP/data-plane contract during refactor.                             |
+| Runtime scope                                      | Decided                 | Initial spec scope includes `ps-node` and `ps-lite`.                                                             |
+| Runtime split (`ps-node`, `ps-lite`)               | Decided                 | Introduce runtime-agnostic core with runtime-specific adapters.                                                  |
+| SDK dependency source                              | Decided with validation | Use local `../vana-sdk` checkout while PR 137 is active; CI/Docker clone and build that branch.                  |
+| SDK import path                                    | Decided                 | Node runtime imports from `@opendatalabs/vana-sdk/node`.                                                         |
+| PS Lite API server                                 | Decided direction       | Follow PS Lite PoC direction and adapt to the Personal Server contract surface.                                  |
+| Reusable primitives alignment with `vana-sdk`      | Decided                 | Align shared primitives incrementally; avoid big-bang migration.                                                 |
+| Plaintext boundary                                 | Decided                 | Plaintext remains inside user/PS runtime boundary only.                                                          |
+| Data read preconditions                            | Decided                 | Validate builder, grant, scope, expiry, revocation, and fee state before return.                                 |
+| Runtime unavailable behavior                       | Decided                 | Return typed `ps_unavailable` when target runtime is down/unreachable.                                           |
+| `vana-connect` placement                           | Decided                 | Adjacent integration, not PS internal runtime module.                                                            |
+| Key derivation                                     | Decided                 | Keep DPv1 `HKDF(signature, scope)` model using the master key signature as key material.                         |
+| GitHub dependency syntax                           | Deferred                | Direct GitHub alias installs the monorepo root; replace local file dependency after SDK packaging is consumable. |
+| Seed recovery / backup UX                          | Out of Scope            | Not part of this pass while DPv1 signature-derived key material remains the target model.                        |
+| Exact final package/export shapes                  | TBD                     | Deferred to Task 4 package-boundary details.                                                                     |
+| Final DPv2 endpoint/auth contract text             | TBD                     | Deferred to Task 5 contract and auth sections.                                                                   |
+| Full storage/encryption/runtime migration sequence | TBD                     | Deferred to Task 6 runtime and migration sections.                                                               |
+| `ps-worker`                                        | Out of Scope            | Future extension only.                                                                                           |
+| Code changes, dependency changes, test changes     | In Scope                | Implementation is proceeding incrementally on `feat/dp2-refactor`.                                               |
 
 ## Current Inventory
 
@@ -303,8 +303,9 @@ Compatibility requirement:
 
 - Target dependency package: `@opendatalabs/vana-sdk` from `https://github.com/vana-com/vana-sdk`.
 - Local checkout for research/co-development: `../vana-sdk`.
-- GitHub dependency must be treated as a validation item because the upstream repository is a monorepo and root package installability/consumability is not yet proven for CI consumption.
-- Candidate GitHub dependency syntax remains TBD. Scratch validation on 2026-05-08 showed `@opendatalabs/vana-sdk@git+https://github.com/vana-com/vana-sdk.git` / `github:vana-com/vana-sdk` installs the monorepo root under the alias and does not expose `@opendatalabs/vana-sdk/node` or `@opendatalabs/vana-sdk/browser`.
+- The active dependency is the sibling checkout: `file:../../../vana-sdk/packages/vana-sdk`.
+- CI and Docker clone `vana-com/vana-sdk` branch `volod/encryption-auth-primitives` into the sibling path and build `@opendatalabs/vana-sdk` before installing this repo.
+- GitHub dependency syntax remains deferred because scratch validation on 2026-05-08 showed `@opendatalabs/vana-sdk@git+https://github.com/vana-com/vana-sdk.git` / `github:vana-com/vana-sdk` installs the monorepo root under the alias and does not expose `@opendatalabs/vana-sdk/node` or `@opendatalabs/vana-sdk/browser`.
 
 ### Import path policy
 
@@ -319,8 +320,8 @@ Compatibility requirement:
 
 ### Validation checklist (future implementation checks)
 
-- Validate the exact npm GitHub dependency install command.
-- Validate `npm ci` can install from lockfile in CI with the selected GitHub dependency shape.
+- Validate the sibling local SDK checkout exists and is built while PR 137 is active.
+- Validate `npm ci` can install from lockfile with the selected local file dependency shape.
 - Validate built import smoke tests for `@opendatalabs/vana-sdk/node` and `@opendatalabs/vana-sdk/browser` where applicable.
 - Validate no root SDK import appears in source (`npm run validate:sdk-imports`).
 
@@ -381,8 +382,10 @@ Future implementation validation commands:
 npm run lint
 npm run lint:eslint
 npm run format:check
+npm run validate:sdk-imports
 npm test
 npm run build
+npm run test:e2e
 ```
 
 ## Risks
@@ -398,7 +401,7 @@ npm run build
 
 ## Open TBDs
 
-- Exact GitHub dependency syntax for the `@opendatalabs/vana-sdk` workspace package that is reliable in CI and lockfile installs.
+- Replacement path from the temporary local `../vana-sdk` file dependency to a published or otherwise consumable `@opendatalabs/vana-sdk` package after PR 137 lands.
 - Any future replacement for DPv1 signature-derived key material would require a separate security design and migration plan.
 - Exact DPv2 fee-record API and verification payload shape used by read-time checks.
 - Exact final route versioning policy: keep `/v1`, add `/v2`, or provide compatibility aliases.
