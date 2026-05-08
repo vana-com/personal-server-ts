@@ -1,4 +1,4 @@
-import * as openpgp from "openpgp";
+import { decryptWithPassword as sdkDecryptWithPassword } from "@opendatalabs/vana-sdk/node";
 
 /**
  * Decrypt an OpenPGP password-encrypted binary.
@@ -12,11 +12,5 @@ export async function decryptWithPassword(
   encrypted: Uint8Array,
   password: string,
 ): Promise<Uint8Array> {
-  const message = await openpgp.readMessage({ binaryMessage: encrypted });
-  const { data } = await openpgp.decrypt({
-    message,
-    passwords: [password],
-    format: "binary",
-  });
-  return data as Uint8Array;
+  return sdkDecryptWithPassword(encrypted, password);
 }

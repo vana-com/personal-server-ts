@@ -1,13 +1,14 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 
 const ROOTS = ["packages", "scripts", "tests"];
 const SDK_PACKAGE = "@opendatalabs/vana-sdk";
-const SDK_BRANCH_SPEC =
-  "github:vana-com/vana-sdk#volod/encryption-auth-primitives";
-const SDK_PR_HEAD = "b9b0a78418dd62852e887091be5f229b672a4032";
+const SDK_LOCAL_SPEC = "file:../../../vana-sdk/packages/vana-sdk";
 const FORBIDDEN_ROOT_IMPORT =
   /from\s+["']@opendatalabs\/vana-sdk["']|import\s*\(\s*["']@opendatalabs\/vana-sdk["']\s*\)/;
+const execFileAsync = promisify(execFile);
 
 async function* walk(dir: string): AsyncGenerator<string> {
   const entries = await readdir(dir, { withFileTypes: true });
@@ -46,29 +47,71 @@ const lockfile = JSON.parse(await readFile("package-lock.json", "utf8")) as {
     {
       name?: string;
       resolved?: string;
+      link?: boolean;
     }
   >;
 };
 
-if (corePackage.dependencies?.[SDK_PACKAGE] !== SDK_BRANCH_SPEC) {
+if (corePackage.dependencies?.[SDK_PACKAGE] !== SDK_LOCAL_SPEC) {
   violations.push(
-    `packages/core/package.json must pin ${SDK_PACKAGE} to ${SDK_BRANCH_SPEC}`,
+    `packages/core/package.json must point ${SDK_PACKAGE} at ${SDK_LOCAL_SPEC}`,
   );
 }
 
-const lockedSdk = lockfile.packages?.[`node_modules/${SDK_PACKAGE}`];
-if (!lockedSdk?.resolved?.includes(SDK_PR_HEAD)) {
+const lockedSdk =
+  lockfile.packages?.[`packages/core/node_modules/${SDK_PACKAGE}`];
+if (
+  lockedSdk?.resolved !== "../vana-sdk/packages/vana-sdk" ||
+  !lockedSdk.link
+) {
   violations.push(
-    `package-lock.json must resolve ${SDK_PACKAGE} to PR 137 head ${SDK_PR_HEAD}`,
+    `package-lock.json must link ${SDK_PACKAGE} to ../vana-sdk/packages/vana-sdk`,
   );
 }
+
+async function validateImportSmoke(
+  specifier: `${typeof SDK_PACKAGE}/${string}`,
+) {
+  try {
+    const expectedExports = [
+      "deriveMasterKey",
+      "deriveScopeKey",
+      "encryptWithPassword",
+      "decryptWithPassword",
+      "verifyWeb3Signed",
+    ];
+    const script = `
+      const mod = await import(${JSON.stringify(specifier)});
+      const missing = ${JSON.stringify(expectedExports)}.filter((name) => typeof mod[name] !== "function");
+      if (missing.length > 0) {
+        throw new Error("missing exports: " + missing.join(","));
+      }
+    `;
+    await execFileAsync(
+      process.execPath,
+      ["--input-type=module", "-e", script],
+      {
+        cwd: "packages/core",
+      },
+    );
+  } catch (err) {
+    if (err instanceof Error) {
+      violations.push(`${specifier} import smoke failed: ${err.message}`);
+    } else {
+      violations.push(`${specifier} import smoke failed`);
+    }
+  }
+}
+
+await validateImportSmoke("@opendatalabs/vana-sdk/node");
+await validateImportSmoke("@opendatalabs/vana-sdk/browser");
 
 if (violations.length > 0) {
   console.error(
     [
       "vana-sdk validation failed.",
       "Root imports from @opendatalabs/vana-sdk are forbidden; use /node or /browser.",
-      `${SDK_PACKAGE} must stay pinned to PR 137 until a consumable workspace package is available.`,
+      `${SDK_PACKAGE} must resolve from the sibling ../vana-sdk checkout while PR 137 is active.`,
       ...violations.map((violation) => `- ${violation}`),
     ].join("\n"),
   );

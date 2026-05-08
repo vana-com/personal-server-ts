@@ -29,7 +29,7 @@ All implementation tasks following this spec must use red/green TDD and must pre
 - No one-step migration of all existing primitives into `vana-sdk`. Some of it has been migrated already.
 - No definition or implementation of future `ps-worker` runtime internals in this phase.
 - No treatment of `vana-connect` as Personal Server internals; it remains an adjacent integration surface.
-- Seed recovery/backup UX is not finalized here and remains TBD if unresolved in later tasks.
+- Seed recovery/backup UX is out of scope for this pass because DPv1 signature-derived key material remains the target model.
 
 ## Decided / TBD / Out of Scope
 
@@ -47,9 +47,9 @@ All implementation tasks following this spec must use red/green TDD and must pre
 | Data read preconditions                            | Decided                 | Validate builder, grant, scope, expiry, revocation, and fee state before return.               |
 | Runtime unavailable behavior                       | Decided                 | Return typed `ps_unavailable` when target runtime is down/unreachable.                         |
 | `vana-connect` placement                           | Decided                 | Adjacent integration, not PS internal runtime module.                                          |
-| Key derivation / seed backup                       | TBD                     | Random seed + HKDF is the likely direction; seed recovery remains unresolved.                  |
+| Key derivation                                     | Decided                 | Keep DPv1 `HKDF(signature, scope)` model using the master key signature as key material.       |
 | GitHub dependency syntax                           | TBD after validation    | Scratch validation showed direct GitHub alias installs the monorepo root, not the SDK package. |
-| Seed recovery / backup UX                          | TBD                     | Kept unresolved here pending dedicated design decisions.                                       |
+| Seed recovery / backup UX                          | Out of Scope            | Not part of this pass while DPv1 signature-derived key material remains the target model.      |
 | Exact final package/export shapes                  | TBD                     | Deferred to Task 4 package-boundary details.                                                   |
 | Final DPv2 endpoint/auth contract text             | TBD                     | Deferred to Task 5 contract and auth sections.                                                 |
 | Full storage/encryption/runtime migration sequence | TBD                     | Deferred to Task 6 runtime and migration sections.                                             |
@@ -132,7 +132,7 @@ Target layering for DPv2 refactor:
 | Runtime     | Environment                  | Storage             | API Exposure                                        | Sync Mode        | Secret Handling                                        | In Scope    |
 | ----------- | ---------------------------- | ------------------- | --------------------------------------------------- | ---------------- | ------------------------------------------------------ | ----------- |
 | `ps-node`   | Node 22                      | Filesystem + SQLite | Hono HTTP                                           | Daemon sync      | Local key material now; OS keychain integration future | Yes         |
-| `ps-lite`   | Browser/WebView              | IndexedDB/OPFS      | Browser-local API server/bridge (per PoC direction) | Foreground sync  | Browser keystore / seed handling TBD                   | Yes         |
+| `ps-lite`   | Browser/WebView              | IndexedDB/OPFS      | Browser-local API server/bridge (per PoC direction) | Foreground sync  | DPv1 signature-derived key material                    | Yes         |
 | `ps-worker` | Cloudflare Worker or similar | R2/KV/D1            | HTTPS worker endpoint                               | Queue/event sync | Deployed encrypted secret handling TBD                 | No (future) |
 
 ## Package Boundaries
@@ -250,10 +250,10 @@ Storage and key handling must keep plaintext/ciphertext boundaries explicit acro
 - In `ps-lite`, the browser-local equivalent of the plaintext boundary is IndexedDB/OPFS (or equivalent browser-safe local adapters); remote/cloud storage still receives ciphertext only.
 - Grant records and grant verification flows must never expose file encryption keys to builders.
 
-DPv1 key derivation and DPv2 direction:
+DPv1 key derivation direction:
 
-- Current DPv1-style derivation `HKDF(signature, scope)` is not compatible with non-deterministic Para signatures.
-- Direction for DPv2 is random seed material plus HKDF-derived working keys; final backup/recovery/rotation design is security-sensitive and remains TBD.
+- Keep the DPv1-style derivation model: the EIP-191 master key signature is the master key material and scope keys use `HKDF(signature, scope)`.
+- This preserves the existing ciphertext/key compatibility model and avoids adding seed backup/recovery/rotation semantics in this pass.
 
 DPv2 storage/index requirements to lock during implementation:
 
@@ -295,7 +295,7 @@ Compatibility requirement:
 - Sync posture: foreground/best-effort while runtime is active.
 - Unavailable behavior: when runtime is inactive, product/builder boundary must receive typed `ps_unavailable`.
 - SDK imports: browser-safe SDK primitives must come from `@opendatalabs/vana-sdk/browser`.
-- Secrets: seed/secret persistence, backup, and recovery are security-sensitive and remain TBD.
+- Secrets: PS Lite follows the DPv1 signature-derived key material model; seed backup/recovery is not introduced in this pass.
 
 ## vana-sdk Integration
 
@@ -399,7 +399,7 @@ npm run build
 ## Open TBDs
 
 - Exact GitHub dependency syntax for the `@opendatalabs/vana-sdk` workspace package that is reliable in CI and lockfile installs.
-- Final seed backup, recovery, and rotation model for key material across runtimes.
+- Any future replacement for DPv1 signature-derived key material would require a separate security design and migration plan.
 - Exact DPv2 fee-record API and verification payload shape used by read-time checks.
 - Exact final route versioning policy: keep `/v1`, add `/v2`, or provide compatibility aliases.
 - Exact package names and public exports for `ps-core`, `ps-node`, and `ps-lite` if they become real published packages.

@@ -1,4 +1,4 @@
-import * as openpgp from "openpgp";
+import { encryptWithPassword as sdkEncryptWithPassword } from "@opendatalabs/vana-sdk/node";
 
 /**
  * Encrypt plaintext using OpenPGP password-based encryption.
@@ -12,11 +12,5 @@ export async function encryptWithPassword(
   plaintext: Uint8Array,
   password: string,
 ): Promise<Uint8Array> {
-  const message = await openpgp.createMessage({ binary: plaintext });
-  const encrypted = await openpgp.encrypt({
-    message,
-    passwords: [password],
-    format: "binary",
-  });
-  return encrypted as Uint8Array;
+  return sdkEncryptWithPassword(plaintext, password);
 }

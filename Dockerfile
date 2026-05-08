@@ -2,15 +2,21 @@
 FROM node:22-alpine AS build
 
 # build-base provides gcc/g++/make for better-sqlite3 native addon
-RUN apk add --no-cache build-base python3
+RUN apk add --no-cache build-base python3 git
 
 WORKDIR /app
 
 # Copy dependency manifests first for layer caching
 COPY package.json package-lock.json ./
 COPY packages/core/package.json packages/core/
+COPY packages/lite/package.json packages/lite/
 COPY packages/server/package.json packages/server/
 COPY packages/cli/package.json packages/cli/
+
+RUN git clone --branch volod/encryption-auth-primitives --depth 1 https://github.com/vana-com/vana-sdk.git /vana-sdk \
+  && cd /vana-sdk \
+  && npm ci \
+  && npm run build --workspace @opendatalabs/vana-sdk
 
 RUN npm ci
 

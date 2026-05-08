@@ -16,6 +16,11 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: Checkout vana-sdk PR branch
+        run: git clone --branch volod/encryption-auth-primitives --depth 1 https://github.com/vana-com/vana-sdk.git ../vana-sdk
+      - name: Build local vana-sdk
+        working-directory: ../vana-sdk
+        run: npm ci && npm run build --workspace @opendatalabs/vana-sdk
       - run: npm ci
       - run: npm run lint
       - run: npm run lint:eslint
@@ -34,6 +39,11 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
+      - name: Checkout vana-sdk PR branch
+        run: git clone --branch volod/encryption-auth-primitives --depth 1 https://github.com/vana-com/vana-sdk.git ../vana-sdk
+      - name: Build local vana-sdk
+        working-directory: ../vana-sdk
+        run: npm ci && npm run build --workspace @opendatalabs/vana-sdk
       - run: npm ci
       - run: npm run build
       - run: npm test
