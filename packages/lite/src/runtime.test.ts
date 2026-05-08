@@ -336,6 +336,101 @@ describe("createPsLiteRuntime", () => {
     });
   });
 
+  it("supports browser-local device auth and oauth token routes", async () => {
+    const tokenStore = {
+      tokens: new Set<string>(),
+      async getTokens() {
+        return Array.from(this.tokens);
+      },
+      async isValid(token: string) {
+        return this.tokens.has(token);
+      },
+      async addToken(token: string) {
+        this.tokens.add(token);
+      },
+      async removeToken(token: string) {
+        this.tokens.delete(token);
+      },
+    };
+    const runtime = createPsLiteRuntime({
+      storage: createMemoryPsLiteStorage(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      serverOwner: "0x0000000000000000000000000000000000000001",
+      accessToken: "control-plane-secret",
+      tokenStore,
+      now: () => new Date("2026-05-08T00:00:00.000Z"),
+    });
+
+    const init = await runtime.fetch(
+      new Request("https://ps.local/auth/device", { method: "POST" }),
+    );
+    expect(init.status).toBe(200);
+    const initBody = (await init.json()) as {
+      login: string;
+      poll: { token: string };
+    };
+
+    const firstPoll = await runtime.fetch(
+      new Request(
+        `https://ps.local/auth/device/poll?token=${initBody.poll.token}`,
+      ),
+    );
+    expect(firstPoll.status).toBe(404);
+    await expect(firstPoll.json()).resolves.toEqual({ status: "pending" });
+
+    const approve = await runtime.fetch(
+      new Request(initBody.login, {
+        method: "POST",
+        headers: { Authorization: "Bearer owner-token" },
+      }),
+    );
+    expect(approve.status).toBe(200);
+    await expect(approve.json()).resolves.toEqual({ status: "approved" });
+
+    const redeem = await runtime.fetch(
+      new Request("https://ps.local/oauth/token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+          device_code: initBody.poll.token,
+        }),
+      }),
+    );
+    expect(redeem.status).toBe(200);
+    const redeemBody = (await redeem.json()) as { access_token: string };
+    expect(redeemBody.access_token).toMatch(/^vana_ps_/);
+    expect(await tokenStore.isValid(redeemBody.access_token)).toBe(true);
+
+    const provision = await runtime.fetch(
+      new Request("https://ps.local/auth/device/token", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer control-plane-secret",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ token: "vana_ps_control_plane" }),
+      }),
+    );
+    expect(provision.status).toBe(201);
+    expect(await tokenStore.isValid("vana_ps_control_plane")).toBe(true);
+
+    const revoke = await runtime.fetch(
+      new Request("https://ps.local/auth/device/token", {
+        method: "DELETE",
+        headers: { Authorization: "Bearer vana_ps_control_plane" },
+      }),
+    );
+    expect(revoke.status).toBe(200);
+    expect(await tokenStore.isValid("vana_ps_control_plane")).toBe(false);
+  });
+
   it("supports Web3Signed owner writes and builder grant reads", async () => {
     const owner = createTestWallet(0);
     const builder = createTestWallet(1);

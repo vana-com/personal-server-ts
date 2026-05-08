@@ -44,6 +44,7 @@ export {
   type PsLiteRuntime,
   type PsLiteRuntimeOptions,
   type PsLiteStorageAdapter,
+  type PsLiteTokenStore,
   type Web3SignedPsLiteAuthOptions,
 } from "./runtime.js";
 

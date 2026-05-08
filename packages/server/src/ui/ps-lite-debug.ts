@@ -18,6 +18,7 @@ import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
 const ORIGIN = "https://ps-lite.local";
 const OWNER_TOKEN = "ps-lite-owner-token";
 const BUILDER_TOKEN = "ps-lite-builder-token";
+const CONTROL_PLANE_TOKEN = "ps-lite-control-plane-token";
 const SAMPLE_SCOPE = "debug.local.profile";
 const SAMPLE_GRANT_ID = "debug-grant";
 const DEFAULT_CONTROL_URL = "wss://control.34.16.49.200.sslip.io:8443";
@@ -177,6 +178,7 @@ async function makeRuntime(mode: StorageMode): Promise<PsLiteRuntime> {
     },
     gateway: mockGateway,
     serverOwner: identity.account.address,
+    accessToken: CONTROL_PLANE_TOKEN,
   });
   nextRuntime.activate();
   return nextRuntime;
@@ -336,6 +338,67 @@ async function deleteSmoke(): Promise<UiResult> {
   };
 }
 
+async function authRoutesSmoke(): Promise<UiResult> {
+  const init = await request("/auth/device", {
+    method: "POST",
+    auth: "none",
+  });
+  const initData = init.data as
+    | { login?: string; poll?: { token?: string } }
+    | undefined;
+  const pollToken = initData?.poll?.token;
+  const loginUrl = initData?.login;
+  const pending = pollToken
+    ? await request(`/auth/device/poll?token=${pollToken}`, { auth: "none" })
+    : { status: 500, ok: false, data: "missing poll token" };
+  const approve = loginUrl
+    ? await request(new URL(loginUrl).pathname + new URL(loginUrl).search, {
+        method: "POST",
+        auth: "owner",
+      })
+    : { status: 500, ok: false, data: "missing login url" };
+  const oauth = pollToken
+    ? await request("/oauth/token", {
+        method: "POST",
+        auth: "none",
+        body: new URLSearchParams({
+          grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+          device_code: pollToken,
+        }).toString(),
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+      })
+    : { status: 500, ok: false, data: "missing poll token" };
+  const provision = await request("/auth/device/token", {
+    method: "POST",
+    auth: "none",
+    body: { token: "vana_ps_debug_cli_token" },
+    headers: {
+      Authorization: `Bearer ${CONTROL_PLANE_TOKEN}`,
+    },
+  });
+  const revoke = await request("/auth/device/token", {
+    method: "DELETE",
+    auth: "none",
+    headers: {
+      Authorization: "Bearer vana_ps_debug_cli_token",
+    },
+  });
+  const ok =
+    init.ok &&
+    pending.status === 404 &&
+    approve.ok &&
+    oauth.ok &&
+    provision.status === 201 &&
+    revoke.ok;
+  return {
+    status: ok ? 200 : 500,
+    ok,
+    data: { init, pending, approve, oauth, provision, revoke },
+  };
+}
+
 async function connectRelay(options: RelayOptions = {}): Promise<UiResult> {
   relayClient?.close("replaced");
   const sessionId = options.sessionId || randomSessionId();
@@ -371,6 +434,7 @@ async function disconnectRelay(): Promise<UiResult> {
 
 const psLiteDebug = {
   activate,
+  authRoutesSmoke,
   authSmoke,
   connectRelay,
   deactivate,

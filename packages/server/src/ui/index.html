@@ -482,6 +482,9 @@
             <button class="btn secondary" id="ps-lite-auth-btn">
               Auth Smoke
             </button>
+            <button class="btn secondary" id="ps-lite-auth-routes-btn">
+              Auth Routes
+            </button>
             <button class="btn secondary" id="ps-lite-delete-btn">
               Delete Smoke
             </button>
@@ -1343,6 +1346,8 @@
             result = await client.storageSmoke();
           } else if (action === "auth-smoke") {
             result = await client.authSmoke();
+          } else if (action === "auth-routes-smoke") {
+            result = await client.authRoutesSmoke();
           } else if (action === "delete-smoke") {
             result = await client.deleteSmoke();
           } else if (action === "connect-relay") {
@@ -1403,6 +1408,9 @@
       });
       el("ps-lite-auth-btn").addEventListener("click", function () {
         psLiteRequest("auth smoke", "auth-smoke");
+      });
+      el("ps-lite-auth-routes-btn").addEventListener("click", function () {
+        psLiteRequest("auth routes", "auth-routes-smoke");
       });
       el("ps-lite-delete-btn").addEventListener("click", function () {
         psLiteRequest("delete smoke", "delete-smoke");
