@@ -1,0 +1,36 @@
+{
+  "name": "@opendatalabs/personal-server-ts-lite",
+  "version": "0.0.1",
+  "description": "Browser/WebView Personal Server Lite runtime boundary",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vana-com/personal-server-ts.git",
+    "directory": "packages/lite"
+  },
+  "homepage": "https://github.com/vana-com/personal-server-ts#readme",
+  "bugs": {
+    "url": "https://github.com/vana-com/personal-server-ts/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc --build"
+  },
+  "dependencies": {
+    "@opendatalabs/personal-server-ts-core": "*"
+  }
+}
