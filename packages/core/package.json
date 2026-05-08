@@ -84,6 +84,10 @@
       "types": "./dist/sync/index.d.ts",
       "import": "./dist/sync/index.js"
     },
+    "./sync/manager": {
+      "types": "./dist/sync/engine/sync-manager.d.ts",
+      "import": "./dist/sync/engine/sync-manager.js"
+    },
     "./storage/adapters": {
       "types": "./dist/storage/adapters/index.d.ts",
       "import": "./dist/storage/adapters/index.js"

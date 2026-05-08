@@ -59,6 +59,14 @@ export function createSyncManager(
         // Upload unsynced local files
         const uploadResults = await uploadAll(uploadDeps, {
           batchSize: uploadBatchSize,
+          onError(entry, error) {
+            pushError({
+              fileId: entry.fileId,
+              scope: entry.scope,
+              message: `Upload failed for ${entry.path}: ${error.message}`,
+              timestamp: new Date().toISOString(),
+            });
+          },
         });
         uploadDeps.logger.debug(
           { uploaded: uploadResults.length },
@@ -176,7 +184,7 @@ export function createSyncManager(
     },
 
     getStatus(): SyncStatus {
-      const pendingFiles = uploadDeps.indexManager.findUnsynced().length;
+      const pendingFiles = uploadDeps.storage.findUnsynced().length;
 
       return {
         enabled: true,

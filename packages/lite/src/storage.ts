@@ -317,12 +317,29 @@ export async function createPersistentPsLiteStorage(
     return sortEntries(state.entries.filter((entry) => entry.scope === scope));
   }
 
+  function persistLater(): void {
+    void persist();
+  }
+
   const storagePort: DataStoragePort & {
     capabilities: PsLiteStorageCapabilities;
   } = {
     kind: adapter.kind === "custom" ? "custom" : "browser-indexeddb-opfs",
     capabilities,
     ...createStorageReadMethods(() => state.entries, entriesForScope),
+
+    findByFileId(fileId) {
+      return state.entries.find((entry) => entry.fileId === fileId);
+    },
+
+    findUnsynced(options) {
+      const entries = state.entries
+        .filter((entry) => entry.fileId === null)
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      return options?.limit === undefined
+        ? entries
+        : entries.slice(0, options.limit);
+    },
 
     async readEnvelope(scope, collectedAt) {
       const path = envelopePath(scope, collectedAt);
@@ -364,8 +381,24 @@ export async function createPersistentPsLiteStorage(
           indexed,
         ],
       };
-      void persist();
+      persistLater();
       return indexed;
+    },
+
+    async updateFileId(path, fileId) {
+      let updated = false;
+      state = {
+        ...state,
+        entries: state.entries.map((entry) => {
+          if (entry.path !== path) return entry;
+          updated = true;
+          return { ...entry, fileId };
+        }),
+      };
+      if (updated) {
+        await persist();
+      }
+      return updated;
     },
 
     async deleteScope(scope) {

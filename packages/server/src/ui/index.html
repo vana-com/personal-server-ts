@@ -563,6 +563,12 @@
             <button class="btn secondary" id="ps-lite-delete-btn">
               Delete Smoke
             </button>
+            <button class="btn secondary" id="ps-lite-sync-btn">
+              Sync Smoke
+            </button>
+            <button class="btn secondary" id="ps-lite-sync-status-btn">
+              Sync Status
+            </button>
             <button class="btn secondary" id="ps-lite-health-btn">
               Health
             </button>
@@ -1427,6 +1433,10 @@
             result = await client.authRoutesSmoke();
           } else if (action === "delete-smoke") {
             result = await client.deleteSmoke();
+          } else if (action === "sync-smoke") {
+            result = await client.syncSmoke();
+          } else if (action === "sync-status") {
+            result = await client.syncStatus();
           } else if (action === "connect-relay") {
             result = await client.connectRelay({
               controlUrl: el("ps-lite-relay-control-url").value.trim(),
@@ -1494,6 +1504,12 @@
       });
       el("ps-lite-delete-btn").addEventListener("click", function () {
         psLiteRequest("delete smoke", "delete-smoke");
+      });
+      el("ps-lite-sync-btn").addEventListener("click", function () {
+        psLiteRequest("sync smoke", "sync-smoke");
+      });
+      el("ps-lite-sync-status-btn").addEventListener("click", function () {
+        psLiteRequest("sync status", "sync-status");
       });
       el("ps-lite-relay-connect-btn").addEventListener("click", function () {
         psLiteRequest("connect relay", "connect-relay");

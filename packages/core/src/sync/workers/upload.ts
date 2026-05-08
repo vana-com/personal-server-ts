@@ -1,19 +1,16 @@
-import type { IndexManager } from "../../storage/index/manager.js";
-import type { HierarchyManagerOptions } from "../../storage/hierarchy/index.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import {
   deriveScopeKey,
   encryptWithPassword,
   type GatewayClient,
-} from "@opendatalabs/vana-sdk/node";
+} from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../../signing/signer.js";
 import type { Logger } from "pino";
 import type { IndexEntry } from "../../storage/index/types.js";
-import { readDataFile } from "../../storage/hierarchy/index.js";
+import type { DataStoragePort } from "../../ports/index.js";
 
 export interface UploadWorkerDeps {
-  indexManager: IndexManager;
-  hierarchyOptions: HierarchyManagerOptions;
+  storage: DataStoragePort;
   storageAdapter: StorageAdapter;
   gateway: GatewayClient;
   signer: ServerSigner;
@@ -26,6 +23,11 @@ export interface UploadResult {
   path: string;
   fileId: string;
   url: string;
+}
+
+export interface UploadAllOptions {
+  batchSize?: number;
+  onError?: (entry: IndexEntry, error: Error) => void;
 }
 
 /**
@@ -44,8 +46,7 @@ export async function uploadOne(
   entry: IndexEntry,
 ): Promise<UploadResult> {
   const {
-    indexManager,
-    hierarchyOptions,
+    storage,
     storageAdapter,
     gateway,
     signer,
@@ -55,11 +56,7 @@ export async function uploadOne(
   } = deps;
 
   // 1. Read local data file
-  const envelope = await readDataFile(
-    hierarchyOptions,
-    entry.scope,
-    entry.collectedAt,
-  );
+  const envelope = await storage.readEnvelope(entry.scope, entry.collectedAt);
 
   // 2. Resolve schemaId from the local index when available, or fall back
   // to the Gateway for legacy entries created before schema IDs were indexed.
@@ -74,7 +71,7 @@ export async function uploadOne(
 
   // 3. Derive scope key → hex-encode as OpenPGP password
   const scopeKey = deriveScopeKey(masterKey, entry.scope);
-  const scopeKeyHex = Buffer.from(scopeKey).toString("hex");
+  const scopeKeyHex = uint8ToHex(scopeKey);
 
   // 4. Encrypt with OpenPGP password-based encryption
   const plaintext = new TextEncoder().encode(JSON.stringify(envelope));
@@ -107,7 +104,7 @@ export async function uploadOne(
   }
 
   // 8. Update local index with fileId
-  indexManager.updateFileId(entry.path, fileId);
+  await storage.updateFileId(entry.path, fileId);
 
   logger.info(
     { path: entry.path, fileId, url },
@@ -124,10 +121,10 @@ export async function uploadOne(
  */
 export async function uploadAll(
   deps: UploadWorkerDeps,
-  options?: { batchSize?: number },
+  options?: UploadAllOptions,
 ): Promise<UploadResult[]> {
   const batchSize = options?.batchSize ?? 50;
-  const entries = deps.indexManager.findUnsynced({ limit: batchSize });
+  const entries = deps.storage.findUnsynced({ limit: batchSize });
   const results: UploadResult[] = [];
 
   for (const entry of entries) {
@@ -135,12 +132,20 @@ export async function uploadAll(
       const result = await uploadOne(deps, entry);
       results.push(result);
     } catch (err) {
+      const error = err as Error;
+      options?.onError?.(entry, error);
       deps.logger.error(
-        { path: entry.path, scope: entry.scope, error: (err as Error).message },
+        { path: entry.path, scope: entry.scope, error: error.message },
         "Failed to upload entry",
       );
     }
   }
 
   return results;
+}
+
+function uint8ToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
+    "",
+  );
 }

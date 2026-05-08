@@ -2,13 +2,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 import type { UploadWorkerDeps } from "../workers/upload.js";
 import type { DownloadWorkerDeps } from "../workers/download.js";
-import type { IndexManager } from "../../storage/index/manager.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
-import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../../signing/signer.js";
 import type { SyncCursor } from "../cursor.js";
-import type { HierarchyManagerOptions } from "../../storage/hierarchy/index.js";
 import type { Logger } from "pino";
+import type { DataStoragePort } from "../../ports/index.js";
 
 // Mock workers so we control their behavior
 vi.mock("../workers/upload.js", () => ({
@@ -35,14 +34,13 @@ function makeMockLogger(): Logger {
 }
 
 function makeMockUploadDeps(): UploadWorkerDeps {
-  const mockIndexManager: Partial<IndexManager> = {
+  const mockStorage: Partial<DataStoragePort> = {
     findUnsynced: vi.fn().mockReturnValue([]),
     updateFileId: vi.fn().mockReturnValue(true),
   };
 
   return {
-    indexManager: mockIndexManager as IndexManager,
-    hierarchyOptions: { dataDir: "/tmp/data" } as HierarchyManagerOptions,
+    storage: mockStorage as DataStoragePort,
     storageAdapter: {} as StorageAdapter,
     gateway: {} as GatewayClient,
     signer: {} as ServerSigner,
@@ -59,8 +57,7 @@ function makeMockDownloadDeps(): DownloadWorkerDeps {
   };
 
   return {
-    indexManager: {} as IndexManager,
-    hierarchyOptions: { dataDir: "/tmp/data" } as HierarchyManagerOptions,
+    storage: {} as DataStoragePort,
     storageAdapter: {} as StorageAdapter,
     gateway: {} as GatewayClient,
     cursor: mockCursor,
@@ -141,7 +138,7 @@ describe("SyncManager", () => {
 
     // Mock findUnsynced to return 3 pending entries
     (
-      uploadDeps.indexManager.findUnsynced as ReturnType<typeof vi.fn>
+      uploadDeps.storage.findUnsynced as ReturnType<typeof vi.fn>
     ).mockReturnValue([
       { id: 1, path: "a.json" },
       { id: 2, path: "b.json" },

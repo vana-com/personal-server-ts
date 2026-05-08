@@ -48,6 +48,7 @@ import { generateDevToken } from "./dev-token.js";
 import { migrateLocalState } from "./migrations/local-state.js";
 import { createTokenStore, type TokenStore } from "./token-store.js";
 import { TunnelManager, ensureFrpcBinary } from "./tunnel/index.js";
+import { createNodeDataStorage } from "./storage/node-data-storage.js";
 
 export interface ServerContext {
   app: Hono;
@@ -130,6 +131,7 @@ export async function createServer(
   });
   const indexManager = createIndexManager(db);
   const hierarchyOptions: HierarchyManagerOptions = { dataDir };
+  const dataStorage = createNodeDataStorage({ indexManager, hierarchyOptions });
 
   const gatewayClient = createGatewayClient(config.gateway.url);
 
@@ -243,8 +245,7 @@ export async function createServer(
     });
 
     const uploadDeps = {
-      indexManager,
-      hierarchyOptions,
+      storage: dataStorage,
       storageAdapter,
       gateway: gatewayClient,
       signer: serverSigner,
@@ -254,8 +255,7 @@ export async function createServer(
     };
 
     const downloadDeps = {
-      indexManager,
-      hierarchyOptions,
+      storage: dataStorage,
       storageAdapter,
       gateway: gatewayClient,
       cursor,
@@ -308,6 +308,7 @@ export async function createServer(
     gateway: gatewayClient,
     accessLogWriter,
     accessLogReader,
+    dataStorage,
     cloudMode,
     devToken,
     accessToken,

@@ -1,0 +1,91 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
+import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
+import { createMemoryPsLiteStorage } from "./runtime.js";
+import {
+  createMemoryPsLiteStateStore,
+  loadOrCreatePsLiteServerIdentity,
+} from "./state.js";
+import { createPsLiteSyncManager } from "./sync.js";
+
+const OWNER_SIGNATURE =
+  "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b" as const;
+
+const SCHEMA_ID =
+  "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+describe("PS Lite sync", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("uploads unsynced browser-local data and persists the file id", async () => {
+    const storage = createMemoryPsLiteStorage();
+    const envelope = createDataFileEnvelope(
+      "instagram.profile",
+      "2026-05-08T00:00:00.000Z",
+      { username: "browser_sync" },
+      "https://schemas.example/instagram.profile.json",
+      SCHEMA_ID,
+    );
+    const write = await storage.writeEnvelope(envelope);
+    storage.insertEntry({
+      fileId: null,
+      schemaId: SCHEMA_ID,
+      path: write.relativePath,
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      sizeBytes: write.sizeBytes,
+    });
+    const stateStore = createMemoryPsLiteStateStore();
+    const identity = await loadOrCreatePsLiteServerIdentity({
+      store: stateStore,
+      ownerSignature: OWNER_SIGNATURE,
+    });
+    const gateway = {
+      getSchemaForScope: vi.fn().mockResolvedValue({
+        id: SCHEMA_ID,
+        ownerAddress: "0xowner",
+        name: "instagram.profile",
+        definitionUrl: "https://schemas.example/instagram.profile.json",
+        scope: "instagram.profile",
+        addedAt: "2026-05-08T00:00:00.000Z",
+      }),
+      registerFile: vi.fn().mockResolvedValue({ fileId: "file-browser-1" }),
+      listFilesSince: vi.fn().mockResolvedValue({ files: [], cursor: null }),
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(null, {
+        status: 200,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { syncManager } = await createPsLiteSyncManager({
+      config: ServerConfigSchema.parse({ sync: { enabled: true } }),
+      stateStore,
+      storage,
+      ownerSignature: OWNER_SIGNATURE,
+      serverAccount: identity.account,
+      gateway: gateway as never,
+    });
+
+    await syncManager.trigger();
+    await syncManager.stop();
+
+    expect(storage.findUnsynced()).toEqual([]);
+    expect(storage.findByFileId("file-browser-1")).toMatchObject({
+      scope: "instagram.profile",
+      fileId: "file-browser-1",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/v1/blobs/"),
+      expect.objectContaining({ method: "PUT" }),
+    );
+    expect(gateway.registerFile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        schemaId: SCHEMA_ID,
+      }),
+    );
+  });
+});

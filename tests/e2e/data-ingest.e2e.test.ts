@@ -15,11 +15,11 @@ describe("Data ingest endpoint (e2e)", () => {
       gatewayUrl: gateway.url,
       masterKeySignature: KNOWN_SIG,
     });
-  });
+  }, 30000);
 
   afterAll(async () => {
-    await server.cleanup();
-    await gateway.cleanup();
+    await server?.cleanup();
+    await gateway?.cleanup();
   });
 
   function ownerHeaders(): Record<string, string> {

@@ -56,6 +56,12 @@ export function createVanaStorageAdapter(
     return { Authorization: header };
   }
 
+  function binaryBody(data: Uint8Array): BodyInit {
+    const copy = new Uint8Array(data.byteLength);
+    copy.set(data);
+    return copy.buffer as ArrayBuffer;
+  }
+
   return {
     async upload(key, data) {
       const url = blobUrl(key);
@@ -63,7 +69,7 @@ export function createVanaStorageAdapter(
       const auth = await authHeaders("PUT", uri, data);
       const res = await fetch(url, {
         method: "PUT",
-        body: Buffer.from(data),
+        body: binaryBody(data),
         headers: {
           "Content-Type": "application/octet-stream",
           ...auth,

@@ -1,32 +1,13 @@
 import {
   createBearerTokenPsLiteAuth,
   createIndexedDbPsLiteRuntime,
-  createPsLiteRuntime,
   psLiteRelayPublicUrl,
-  savePsLiteConfig,
   startPsLiteRelayClient,
   type PsLiteRelayClient,
   type PsLiteRelayStatus,
   type PsLiteRuntime,
 } from "@opendatalabs/personal-server-ts-lite";
-import type {
-  ServerAccount,
-  SignTypedDataParams,
-} from "@opendatalabs/personal-server-ts-core/keys";
-import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
-import {
-  createGatewayClient,
-  fileRegistrationDomain,
-  grantRegistrationDomain,
-  grantRevocationDomain,
-  FILE_REGISTRATION_TYPES,
-  GRANT_REGISTRATION_TYPES,
-  GRANT_REVOCATION_TYPES,
-  type DataPortabilityGatewayConfig,
-  type FileRegistrationMessage,
-  type GrantRegistrationMessage,
-  type GrantRevocationMessage,
-} from "@opendatalabs/vana-sdk/browser";
+import { createGatewayClient } from "@opendatalabs/vana-sdk/browser";
 
 const ORIGIN = "https://ps-lite.local";
 const OWNER_TOKEN = "ps-lite-owner-token";
@@ -83,52 +64,6 @@ function randomSessionId(): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
     "",
   );
-}
-
-function createBrowserServerSigner(
-  account: Pick<ServerAccount, "signTypedData">,
-  gatewayConfig: DataPortabilityGatewayConfig,
-): ServerSigner {
-  return {
-    async signFileRegistration(
-      msg: FileRegistrationMessage,
-    ): Promise<`0x${string}`> {
-      return account.signTypedData({
-        domain: fileRegistrationDomain(gatewayConfig),
-        types:
-          FILE_REGISTRATION_TYPES as unknown as SignTypedDataParams["types"],
-        primaryType: "FileRegistration",
-        message: msg as unknown as Record<string, unknown>,
-      });
-    },
-
-    async signGrantRegistration(
-      msg: GrantRegistrationMessage,
-    ): Promise<`0x${string}`> {
-      return account.signTypedData({
-        domain: grantRegistrationDomain(gatewayConfig),
-        types:
-          GRANT_REGISTRATION_TYPES as unknown as SignTypedDataParams["types"],
-        primaryType: "GrantRegistration",
-        message: {
-          ...msg,
-          fileIds: msg.fileIds.map((id: bigint) => id),
-        } as unknown as Record<string, unknown>,
-      });
-    },
-
-    async signGrantRevocation(
-      msg: GrantRevocationMessage,
-    ): Promise<`0x${string}`> {
-      return account.signTypedData({
-        domain: grantRevocationDomain(gatewayConfig),
-        types:
-          GRANT_REVOCATION_TYPES as unknown as SignTypedDataParams["types"],
-        primaryType: "GrantRevocation",
-        message: msg as unknown as Record<string, unknown>,
-      });
-    },
-  };
 }
 
 function authHeaders(mode: AuthMode): Record<string, string> {
@@ -236,6 +171,7 @@ async function makeRuntime(_mode: StorageMode): Promise<PsLiteRuntime> {
     ownerSignature: DEBUG_OWNER_SIGNATURE,
     configDefaults: {
       server: { port: 443, origin: ORIGIN },
+      sync: { enabled: true, lastProcessedTimestamp: null },
     },
     auth: createBearerTokenPsLiteAuth({
       ownerToken: OWNER_TOKEN,
@@ -245,43 +181,8 @@ async function makeRuntime(_mode: StorageMode): Promise<PsLiteRuntime> {
     gateway: undefined,
     accessToken: CONTROL_PLANE_TOKEN,
   });
-  const config = browserRuntime.config;
-  const identity = browserRuntime.identity;
-  const gatewayConfig = {
-    chainId: config.gateway.chainId,
-    contracts: config.gateway.contracts,
-  };
-
-  const nextRuntime = createPsLiteRuntime({
-    storage: browserRuntime.storage,
-    auth: createBearerTokenPsLiteAuth({
-      ownerToken: OWNER_TOKEN,
-      builderToken: BUILDER_TOKEN,
-    }),
-    active: true,
-    config,
-    identity: {
-      address: identity.account.address,
-      publicKey: identity.account.publicKey,
-    },
-    gateway: createGatewayClient(config.gateway.url),
-    serverOwner: identity.account.address,
-    serverSigner: createBrowserServerSigner(identity.account, gatewayConfig),
-    saveConfig: async (nextConfig) => {
-      const saved = await savePsLiteConfig(
-        browserRuntime.stateStore,
-        nextConfig,
-      );
-      Object.assign(config, saved);
-    },
-    stateCapabilities: { config: "indexeddb" },
-    tokenStore: browserRuntime.tokenStore,
-    accessLogReader: browserRuntime.accessLogStore,
-    accessLogWriter: browserRuntime.accessLogStore,
-    accessToken: CONTROL_PLANE_TOKEN,
-  });
-  nextRuntime.activate();
-  return nextRuntime;
+  browserRuntime.runtime.activate();
+  return browserRuntime.runtime;
 }
 
 async function ensureRuntime(): Promise<PsLiteRuntime> {
@@ -488,6 +389,38 @@ async function deleteSmoke(): Promise<UiResult> {
   };
 }
 
+async function syncStatus(): Promise<UiResult> {
+  return request("/v1/sync/status", { auth: "owner" });
+}
+
+async function syncTrigger(): Promise<UiResult> {
+  return request("/v1/sync/trigger", { method: "POST", auth: "owner" });
+}
+
+async function syncSmoke(): Promise<UiResult> {
+  const write = await request(`/v1/data/${SAMPLE_SCOPE}`, {
+    method: "POST",
+    auth: "owner",
+    body: sampleInstagramProfileData("ps-lite-sync-smoke"),
+  });
+  const trigger = await syncTrigger();
+  const status = await syncStatus();
+  const syncData = status.data as
+    | { pendingFiles?: number; errors?: unknown[] }
+    | undefined;
+  const ok =
+    write.ok &&
+    trigger.status === 202 &&
+    status.ok &&
+    syncData?.pendingFiles === 0 &&
+    (syncData.errors?.length ?? 0) === 0;
+  return {
+    status: ok ? 200 : 500,
+    ok,
+    data: { write, trigger, status },
+  };
+}
+
 async function authRoutesSmoke(): Promise<UiResult> {
   const init = await request("/auth/device", {
     method: "POST",
@@ -595,6 +528,9 @@ const psLiteDebug = {
   reset,
   status,
   storageSmoke,
+  syncSmoke,
+  syncStatus,
+  syncTrigger,
 };
 
 declare global {

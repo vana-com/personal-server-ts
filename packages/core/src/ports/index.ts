@@ -71,9 +71,12 @@ export interface DataStoragePort extends RuntimeStoragePort {
   listVersions(scope: string, options: DataStorageListOptions): IndexEntry[];
   countVersions(scope: string): number;
   findEntry(lookup: DataStorageEntryLookup): IndexEntry | undefined;
+  findByFileId(fileId: string): IndexEntry | undefined;
+  findUnsynced(options?: { limit?: number }): IndexEntry[];
   readEnvelope(scope: string, collectedAt: string): Promise<DataFileEnvelope>;
   writeEnvelope(envelope: DataFileEnvelope): Promise<WriteResult>;
   insertEntry(entry: NewIndexEntry): IndexEntry;
+  updateFileId(path: string, fileId: string): boolean | Promise<boolean>;
   deleteScope(scope: string): Promise<number>;
 }
 

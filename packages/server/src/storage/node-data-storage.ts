@@ -41,6 +41,12 @@ export function createNodeDataStorage(
       }
       return deps.indexManager.findLatestByScope(lookup.scope);
     },
+    findByFileId(fileId: string) {
+      return deps.indexManager.findByFileId(fileId);
+    },
+    findUnsynced(options?: { limit?: number }) {
+      return deps.indexManager.findUnsynced(options);
+    },
     readEnvelope(scope: string, collectedAt: string) {
       return readDataFile(deps.hierarchyOptions, scope, collectedAt);
     },
@@ -49,6 +55,9 @@ export function createNodeDataStorage(
     },
     insertEntry(entry) {
       return deps.indexManager.insert(entry);
+    },
+    updateFileId(path: string, fileId: string) {
+      return deps.indexManager.updateFileId(path, fileId);
     },
     async deleteScope(scope: string) {
       const deletedCount = deps.indexManager.deleteByScope(scope);

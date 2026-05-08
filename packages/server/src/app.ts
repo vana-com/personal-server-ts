@@ -21,6 +21,7 @@ import { oauthTokenRoutes } from "./routes/oauth-token.js";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type {
+  DataStoragePort,
   FeeVerifierPort,
   RuntimeAvailabilityPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
@@ -55,6 +56,7 @@ export interface AppDeps {
   tokenStore?: TokenStore;
   feeVerifier?: FeeVerifierPort;
   runtimeAvailability?: RuntimeAvailabilityPort;
+  dataStorage?: DataStoragePort;
   getTunnelStatus?: HealthDeps["getTunnelStatus"];
 }
 
@@ -103,6 +105,7 @@ export function createApp(deps: AppDeps): Hono {
       syncManager: deps.syncManager ?? null,
       feeVerifier: deps.feeVerifier,
       runtimeAvailability: deps.runtimeAvailability,
+      dataStorage: deps.dataStorage,
     }),
   );
 

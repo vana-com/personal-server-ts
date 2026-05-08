@@ -1,7 +1,12 @@
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
+import { createServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
+import {
+  createGatewayClient,
+  recoverServerOwner,
+} from "@opendatalabs/vana-sdk/browser";
 import {
   createIndexedDbPsLitePersistence,
   createPersistentPsLiteStorage,
@@ -22,6 +27,7 @@ import {
   type PsLiteRuntime,
   type PsLiteRuntimeOptions,
 } from "./runtime.js";
+import { createPsLiteSyncManager } from "./sync.js";
 
 export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   PsLiteRuntimeOptions,
@@ -52,6 +58,7 @@ export interface IndexedDbPsLiteRuntime {
   storage: DataStoragePort;
   tokenStore: PsLiteRuntimeOptions["tokenStore"];
   accessLogStore: AccessLogReader & AccessLogWriter;
+  syncManager: PsLiteRuntimeOptions["syncManager"];
 }
 
 export async function createIndexedDbPsLiteRuntime(
@@ -87,6 +94,27 @@ export async function createIndexedDbPsLiteRuntime(
     }),
     options.dataFileStore,
   );
+  const gateway = options.gateway ?? createGatewayClient(config.gateway.url);
+  const serverOwner = await recoverServerOwner(options.ownerSignature);
+  const serverSigner =
+    options.serverSigner ??
+    createServerSigner(identity.account, {
+      chainId: config.gateway.chainId,
+      contracts: config.gateway.contracts,
+    });
+  let syncManager = options.syncManager ?? null;
+  if (!syncManager && config.sync.enabled) {
+    syncManager = (
+      await createPsLiteSyncManager({
+        config,
+        stateStore,
+        storage,
+        ownerSignature: options.ownerSignature,
+        serverAccount: identity.account,
+        gateway,
+      })
+    ).syncManager;
+  }
   const runtime = createPsLiteRuntime({
     ...options,
     storage,
@@ -95,6 +123,10 @@ export async function createIndexedDbPsLiteRuntime(
       address: identity.account.address,
       publicKey: identity.account.publicKey,
     },
+    gateway,
+    serverOwner,
+    serverSigner,
+    syncManager,
     saveConfig: async (nextConfig) => {
       const saved = await savePsLiteConfig(stateStore, nextConfig);
       Object.assign(config, saved);
@@ -113,5 +145,6 @@ export async function createIndexedDbPsLiteRuntime(
     storage,
     tokenStore,
     accessLogStore,
+    syncManager,
   };
 }

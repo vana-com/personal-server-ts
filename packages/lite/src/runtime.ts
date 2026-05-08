@@ -107,7 +107,10 @@ export interface PsLiteRuntimeOptions {
   identity?: { address: `0x${string}`; publicKey: `0x${string}` };
   gateway?: GatewayClient;
   serverOwner?: `0x${string}`;
-  serverSigner?: Pick<ServerSigner, "signGrantRegistration">;
+  serverSigner?: Pick<
+    ServerSigner,
+    "signFileRegistration" | "signGrantRegistration"
+  >;
   syncManager?: Pick<SyncManager, "trigger" | "getStatus"> | null;
   accessLogReader?: AccessLogReader;
   accessLogWriter?: AccessLogWriter;
@@ -491,6 +494,21 @@ export function createMemoryPsLiteStorage(
     } satisfies PsLiteStorageCapabilities,
     ...createStorageReadMethods(() => entries.values(), entriesForScope),
 
+    findByFileId(fileId) {
+      return Array.from(entries.values()).find(
+        (entry) => entry.fileId === fileId,
+      );
+    },
+
+    findUnsynced(options) {
+      const unsynced = Array.from(entries.values())
+        .filter((entry) => entry.fileId === null)
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      return options?.limit === undefined
+        ? unsynced
+        : unsynced.slice(0, options.limit);
+    },
+
     async readEnvelope(scope, collectedAt) {
       return readEnvelopeFromMap(envelopes, envelopeKey(scope, collectedAt));
     },
@@ -517,6 +535,13 @@ export function createMemoryPsLiteStorage(
       nextId += 1;
       entries.set(entry.path, indexed);
       return indexed;
+    },
+
+    updateFileId(path, fileId) {
+      const entry = entries.get(path);
+      if (!entry) return false;
+      entries.set(path, { ...entry, fileId });
+      return true;
     },
 
     async deleteScope(scope) {

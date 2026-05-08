@@ -1,5 +1,3 @@
-import type { IndexManager } from "../../storage/index/manager.js";
-import type { HierarchyManagerOptions } from "../../storage/hierarchy/index.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import {
   DataFileEnvelopeSchema,
@@ -7,14 +5,13 @@ import {
   deriveScopeKey,
   type FileRecord,
   type GatewayClient,
-} from "@opendatalabs/vana-sdk/node";
+} from "@opendatalabs/vana-sdk/browser";
 import type { SyncCursor } from "../cursor.js";
 import type { Logger } from "pino";
-import { writeDataFile } from "../../storage/hierarchy/index.js";
+import type { DataStoragePort } from "../../ports/index.js";
 
 export interface DownloadWorkerDeps {
-  indexManager: IndexManager;
-  hierarchyOptions: HierarchyManagerOptions;
+  storage: DataStoragePort;
   storageAdapter: StorageAdapter;
   gateway: GatewayClient;
   cursor: SyncCursor;
@@ -45,17 +42,10 @@ export async function downloadOne(
   deps: DownloadWorkerDeps,
   record: FileRecord,
 ): Promise<DownloadResult | null> {
-  const {
-    indexManager,
-    hierarchyOptions,
-    storageAdapter,
-    gateway,
-    masterKey,
-    logger,
-  } = deps;
+  const { storage, storageAdapter, gateway, masterKey, logger } = deps;
 
   // 1. Check dedup: skip if fileId already in local index
-  const existing = indexManager.findByFileId(record.fileId);
+  const existing = storage.findByFileId(record.fileId);
   if (existing) {
     logger.debug({ fileId: record.fileId }, "File already in index, skipping");
     return null;
@@ -72,7 +62,7 @@ export async function downloadOne(
 
   // 4. Derive scope key → hex-encode as OpenPGP password
   const scopeKey = deriveScopeKey(masterKey, schema.scope);
-  const scopeKeyHex = Buffer.from(scopeKey).toString("hex");
+  const scopeKeyHex = uint8ToHex(scopeKey);
 
   // 5. Decrypt with OpenPGP password-based decryption
   const plaintext = await decryptWithPassword(encrypted, scopeKeyHex);
@@ -81,14 +71,11 @@ export async function downloadOne(
   const raw = JSON.parse(new TextDecoder().decode(plaintext));
   const envelope = DataFileEnvelopeSchema.parse(raw);
 
-  // 7. Write to local filesystem via hierarchy manager
-  const { relativePath, sizeBytes } = await writeDataFile(
-    hierarchyOptions,
-    envelope,
-  );
+  // 7. Write to local storage via the runtime storage port
+  const { relativePath, sizeBytes } = await storage.writeEnvelope(envelope);
 
   // 8. Insert into local index (with fileId)
-  indexManager.insert({
+  storage.insertEntry({
     fileId: record.fileId,
     schemaId: record.schemaId,
     path: relativePath,
@@ -155,4 +142,10 @@ export async function downloadAll(
   }
 
   return results;
+}
+
+function uint8ToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
+    "",
+  );
 }

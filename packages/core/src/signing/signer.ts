@@ -15,7 +15,7 @@ import {
   type FileRegistrationMessage,
   type GrantRegistrationMessage,
   type GrantRevocationMessage,
-} from "@opendatalabs/vana-sdk/node";
+} from "@opendatalabs/vana-sdk/browser";
 
 export interface ServerSigner {
   signFileRegistration(msg: FileRegistrationMessage): Promise<`0x${string}`>;

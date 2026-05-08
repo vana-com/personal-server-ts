@@ -3,7 +3,7 @@
  * Used by the Vana Storage adapter for authenticated blob operations.
  */
 
-import { buildWeb3SignedHeader } from "@opendatalabs/vana-sdk/node";
+import { buildWeb3SignedHeader } from "@opendatalabs/vana-sdk/browser";
 import type { ServerAccount } from "../keys/server-account.js";
 import type { RequestSigner } from "../storage/adapters/vana.js";
 

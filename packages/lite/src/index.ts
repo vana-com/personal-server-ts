@@ -44,6 +44,12 @@ export {
 } from "./state.js";
 
 export {
+  createPsLiteSyncCursor,
+  createPsLiteSyncManager,
+  type PsLiteSyncOptions,
+} from "./sync.js";
+
+export {
   createBearerTokenPsLiteAuth,
   createMemoryPsLiteStorage,
   createPsLiteRuntime,

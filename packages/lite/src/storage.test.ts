@@ -162,4 +162,41 @@ describe("createPersistentPsLiteStorage", () => {
       ).capabilities,
     ).toMatchObject({ metadata: "indexeddb", files: "opfs" });
   });
+
+  it("persists sync index updates", async () => {
+    const persistence = createMemoryPsLitePersistence();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      persistence,
+    );
+    const envelope = createDataFileEnvelope(
+      "instagram.profile",
+      "2026-05-08T00:00:00.000Z",
+      { username: "unsynced_user" },
+    );
+    const write = await storage.writeEnvelope(envelope);
+    storage.insertEntry({
+      fileId: null,
+      path: write.relativePath,
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      sizeBytes: write.sizeBytes,
+    });
+
+    expect(storage.findUnsynced()).toHaveLength(1);
+    expect(
+      await storage.updateFileId(write.relativePath, "file-synced-1"),
+    ).toBe(true);
+
+    const reloaded = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      persistence,
+    );
+
+    expect(reloaded.findUnsynced()).toEqual([]);
+    expect(reloaded.findByFileId("file-synced-1")).toMatchObject({
+      scope: "instagram.profile",
+      fileId: "file-synced-1",
+    });
+  });
 });
