@@ -1,4 +1,11 @@
 import {
+  ExpiredTokenError as SdkExpiredTokenError,
+  InvalidSignatureError as SdkInvalidSignatureError,
+  MissingAuthError as SdkMissingAuthError,
+  verifyWeb3Signed as sdkVerifyWeb3Signed,
+} from "@opendatalabs/vana-sdk/browser";
+import {
+  ExpiredTokenError,
   GrantRequiredError,
   InvalidSignatureError,
   MissingAuthError,
@@ -7,7 +14,6 @@ import {
   PsUnavailableError,
   UnregisteredBuilderError,
 } from "@opendatalabs/personal-server-ts-core/errors";
-import { verifyWeb3Signed } from "@opendatalabs/personal-server-ts-core/auth";
 import {
   deleteDataScopeContract,
   ingestDataContract,
@@ -187,13 +193,36 @@ async function verifyWeb3SignedRequest(
   options: Web3SignedPsLiteAuthOptions,
 ) {
   const url = new URL(request.url);
-  return verifyWeb3Signed({
-    headerValue: request.headers.get("authorization") ?? undefined,
-    expectedOrigin: resolveOrigin(options.origin),
-    expectedMethod: request.method,
-    expectedPath: url.pathname,
-    now: options.now?.(),
-  });
+  try {
+    return await sdkVerifyWeb3Signed({
+      headerValue: request.headers.get("authorization") ?? undefined,
+      expectedOrigin: resolveOrigin(options.origin),
+      expectedMethod: request.method,
+      expectedPath: url.pathname,
+      now: options.now?.(),
+    });
+  } catch (err) {
+    if (err instanceof SdkMissingAuthError) {
+      throw new MissingAuthError(getErrorDetails(err));
+    }
+    if (err instanceof SdkInvalidSignatureError) {
+      throw new InvalidSignatureError(getErrorDetails(err));
+    }
+    if (err instanceof SdkExpiredTokenError) {
+      throw new ExpiredTokenError(getErrorDetails(err));
+    }
+    throw err;
+  }
+}
+
+function getErrorDetails(err: unknown): Record<string, unknown> | undefined {
+  if (err && typeof err === "object" && "details" in err) {
+    const details = err.details;
+    if (details && typeof details === "object" && !Array.isArray(details)) {
+      return details as Record<string, unknown>;
+    }
+  }
+  return undefined;
 }
 
 export function createWeb3SignedPsLiteAuth(

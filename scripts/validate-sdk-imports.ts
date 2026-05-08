@@ -36,11 +36,16 @@ for (const root of ROOTS) {
   }
 }
 
-const corePackage = JSON.parse(
-  await readFile("packages/core/package.json", "utf8"),
-) as {
+function readPackageJson(path: string): Promise<{
   dependencies?: Record<string, string>;
-};
+}> {
+  return readFile(path, "utf8").then((contents) => JSON.parse(contents));
+}
+
+const packagesUsingSdk = [
+  "packages/core/package.json",
+  "packages/lite/package.json",
+];
 const lockfile = JSON.parse(await readFile("package-lock.json", "utf8")) as {
   packages?: Record<
     string,
@@ -52,14 +57,16 @@ const lockfile = JSON.parse(await readFile("package-lock.json", "utf8")) as {
   >;
 };
 
-if (corePackage.dependencies?.[SDK_PACKAGE] !== SDK_LOCAL_SPEC) {
-  violations.push(
-    `packages/core/package.json must point ${SDK_PACKAGE} at ${SDK_LOCAL_SPEC}`,
-  );
+for (const packagePath of packagesUsingSdk) {
+  const packageJson = await readPackageJson(packagePath);
+  if (packageJson.dependencies?.[SDK_PACKAGE] !== SDK_LOCAL_SPEC) {
+    violations.push(
+      `${packagePath} must point ${SDK_PACKAGE} at ${SDK_LOCAL_SPEC}`,
+    );
+  }
 }
 
-const lockedSdk =
-  lockfile.packages?.[`packages/core/node_modules/${SDK_PACKAGE}`];
+const lockedSdk = lockfile.packages?.[`node_modules/${SDK_PACKAGE}`];
 if (
   lockedSdk?.resolved !== "../vana-sdk/packages/vana-sdk" ||
   !lockedSdk.link

@@ -31,6 +31,7 @@
     "build": "tsc --build"
   },
   "dependencies": {
+    "@opendatalabs/vana-sdk": "file:../../../vana-sdk/packages/vana-sdk",
     "@opendatalabs/personal-server-ts-core": "*"
   }
 }

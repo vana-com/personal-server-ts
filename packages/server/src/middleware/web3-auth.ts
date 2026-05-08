@@ -1,10 +1,18 @@
 import { timingSafeEqual } from "node:crypto";
 import type { MiddlewareHandler } from "hono";
 import {
+  ExpiredTokenError as SdkExpiredTokenError,
+  InvalidSignatureError as SdkInvalidSignatureError,
+  MissingAuthError as SdkMissingAuthError,
   verifyWeb3Signed,
   type Web3SignedPayload,
-} from "@opendatalabs/personal-server-ts-core/auth";
-import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
+} from "@opendatalabs/vana-sdk/node";
+import {
+  ExpiredTokenError,
+  InvalidSignatureError,
+  MissingAuthError,
+  ProtocolError,
+} from "@opendatalabs/personal-server-ts-core/errors";
 import type { TokenStore } from "../token-store.js";
 
 export type AuthMechanism =
@@ -42,6 +50,29 @@ function createOwnerSessionAuth(serverOwner: `0x${string}`): RequestAuth {
     // Bearer/session tokens authenticate the owner but do not carry Web3Signed claims.
     payload: {},
   };
+}
+
+function getErrorDetails(err: unknown): Record<string, unknown> | undefined {
+  if (err && typeof err === "object" && "details" in err) {
+    const details = err.details;
+    if (details && typeof details === "object" && !Array.isArray(details)) {
+      return details as Record<string, unknown>;
+    }
+  }
+  return undefined;
+}
+
+function mapSdkAuthError(err: unknown): ProtocolError | null {
+  if (err instanceof SdkMissingAuthError) {
+    return new MissingAuthError(getErrorDetails(err));
+  }
+  if (err instanceof SdkInvalidSignatureError) {
+    return new InvalidSignatureError(getErrorDetails(err));
+  }
+  if (err instanceof SdkExpiredTokenError) {
+    return new ExpiredTokenError(getErrorDetails(err));
+  }
+  return null;
 }
 
 /**
@@ -160,9 +191,9 @@ export function createWeb3AuthMiddleware(
       c.set("devBypass", false);
       await next();
     } catch (err) {
-      if (err instanceof ProtocolError) {
-        return c.json(err.toJSON(), err.code as 401 | 403);
-      }
+      const authError = mapSdkAuthError(err);
+      if (authError) return c.json(authError.toJSON(), authError.code as 401);
+      if (err instanceof ProtocolError) return c.json(err.toJSON(), 401);
       throw err;
     }
   };
