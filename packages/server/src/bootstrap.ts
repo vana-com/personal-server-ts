@@ -113,6 +113,7 @@ export async function createServer(
   const dataDir = options?.dataDir ?? join(storageRoot, "data");
   const indexPath = join(storageRoot, "index.db");
   const configPath = join(storageRoot, "config.json");
+  const syncCursorPath = join(storageRoot, "sync-cursor.json");
 
   await mkdir(storageRoot, { recursive: true });
   await mkdir(dataDir, { recursive: true });
@@ -228,7 +229,9 @@ export async function createServer(
       signer: requestSigner,
     });
 
-    const cursor = createSyncCursor(configPath);
+    const cursor = createSyncCursor(syncCursorPath, {
+      legacyConfigPath: configPath,
+    });
 
     const uploadDeps = {
       indexManager,

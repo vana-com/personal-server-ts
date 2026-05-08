@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { join } from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { createSyncCursor } from "./cursor.js";
 import { loadConfig, saveConfig } from "../config/index.js";
@@ -16,10 +16,9 @@ async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
 }
 
 describe("SyncCursor", () => {
-  it("read returns null when config has default sync", async () => {
+  it("preserves legacy config-backed reads for config.json callers", async () => {
     await withTempDir(async (dir) => {
       const configPath = join(dir, "config.json");
-      // Create a default config file
       const config = ServerConfigSchema.parse({});
       await saveConfig(config, { configPath });
 
@@ -30,7 +29,7 @@ describe("SyncCursor", () => {
     });
   });
 
-  it("write then read returns the same timestamp", async () => {
+  it("preserves legacy config-backed writes for config.json callers", async () => {
     await withTempDir(async (dir) => {
       const configPath = join(dir, "config.json");
       const config = ServerConfigSchema.parse({});
@@ -44,7 +43,7 @@ describe("SyncCursor", () => {
     });
   });
 
-  it("write preserves other config fields", async () => {
+  it("legacy config-backed write preserves other config fields", async () => {
     await withTempDir(async (dir) => {
       const configPath = join(dir, "config.json");
       const config = ServerConfigSchema.parse({
@@ -65,7 +64,7 @@ describe("SyncCursor", () => {
     });
   });
 
-  it("write creates config file if it doesn't exist", async () => {
+  it("legacy config-backed write creates config file if it doesn't exist", async () => {
     await withTempDir(async (dir) => {
       const configPath = join(dir, "nonexistent", "config.json");
 
@@ -74,6 +73,56 @@ describe("SyncCursor", () => {
 
       const result = await cursor.read();
       expect(result).toBe("2026-01-21T10:00:00Z");
+    });
+  });
+
+  it("writes new cursor state outside config.json", async () => {
+    await withTempDir(async (dir) => {
+      const configPath = join(dir, "config.json");
+      const cursorPath = join(dir, "sync-cursor.json");
+      const config = ServerConfigSchema.parse({
+        sync: {
+          enabled: true,
+          lastProcessedTimestamp: "2026-01-20T10:00:00.000Z",
+        },
+      });
+      await saveConfig(config, { configPath });
+
+      const cursor = createSyncCursor(cursorPath, {
+        legacyConfigPath: configPath,
+      });
+      await cursor.write("2026-01-21T10:00:00.000Z");
+
+      expect(await cursor.read()).toBe("2026-01-21T10:00:00.000Z");
+      const reloaded = await loadConfig({ configPath });
+      expect(reloaded.sync.lastProcessedTimestamp).toBe(
+        "2026-01-20T10:00:00.000Z",
+      );
+      const cursorState = JSON.parse(await readFile(cursorPath, "utf8"));
+      expect(cursorState).toEqual({
+        version: 1,
+        lastProcessedTimestamp: "2026-01-21T10:00:00.000Z",
+      });
+    });
+  });
+
+  it("falls back to legacy config cursor before new cursor state exists", async () => {
+    await withTempDir(async (dir) => {
+      const configPath = join(dir, "config.json");
+      const cursorPath = join(dir, "sync-cursor.json");
+      const config = ServerConfigSchema.parse({
+        sync: {
+          enabled: true,
+          lastProcessedTimestamp: "2026-01-20T10:00:00.000Z",
+        },
+      });
+      await saveConfig(config, { configPath });
+
+      const cursor = createSyncCursor(cursorPath, {
+        legacyConfigPath: configPath,
+      });
+
+      expect(await cursor.read()).toBe("2026-01-20T10:00:00.000Z");
     });
   });
 });
