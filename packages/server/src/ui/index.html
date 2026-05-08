@@ -336,6 +336,15 @@
       <div id="panel-health" class="panel active">
         <div class="card">
           <div class="card-title">Server Status</div>
+          <div class="toolbar">
+            <button class="btn secondary" id="register-node-server-btn">
+              Register Server
+            </button>
+          </div>
+          <div
+            id="node-registration-status"
+            style="margin-bottom: 8px; font-size: 12px; color: var(--text-dim)"
+          ></div>
           <div id="health-content" class="kv-grid">
             <span class="label">status</span
             ><span class="value">loading...</span>
@@ -571,6 +580,9 @@
             </button>
             <button class="btn secondary" id="ps-lite-health-btn">
               Health
+            </button>
+            <button class="btn secondary" id="ps-lite-register-btn">
+              Register Server
             </button>
             <button class="btn secondary" id="ps-lite-activate-btn">
               Activate
@@ -827,8 +839,8 @@
             ["uptime", formatUptime(d.uptime), ""],
             [
               "api url",
-              d.tunnel && d.tunnel.publicUrl ? d.tunnel.publicUrl : BASE,
-              d.tunnel && d.tunnel.publicUrl ? "ok" : "warn",
+              d.apiOrigin || BASE,
+              d.apiOrigin && d.apiOrigin !== BASE ? "ok" : "warn",
             ],
             ["owner", d.owner ?? "not configured", d.owner ? "ok" : "err"],
           ];
@@ -888,7 +900,7 @@
               style: { gridColumn: "1 / -1", marginTop: "8px" },
             });
             noteEl.textContent =
-              "Register this server with `npm run register-server`";
+              "Register this server from the parent app once the API URL is reachable.";
             noteEl.style.color = "var(--text-dim)";
             noteEl.style.fontSize = "11px";
             noteEl.style.fontStyle = "italic";
@@ -902,6 +914,23 @@
           val2.textContent = "unreachable";
           container.appendChild(lbl2);
           container.appendChild(val2);
+        }
+      }
+
+      async function registerNodeServer() {
+        var statusEl = el("node-registration-status");
+        statusEl.textContent = "Registering server...";
+        try {
+          var health = await api("/health");
+          var result = await psLiteClient().registerFromHealth(health.data);
+          statusEl.style.color = result.ok ? "var(--accent)" : "var(--error)";
+          statusEl.textContent = result.ok
+            ? "Registered server"
+            : "Registration failed";
+          await loadHealth();
+        } catch (e) {
+          statusEl.style.color = "var(--error)";
+          statusEl.textContent = e.message;
         }
       }
 
@@ -971,6 +1000,10 @@
 
       el("save-config-btn").addEventListener("click", saveConfig);
       el("reload-config-btn").addEventListener("click", loadConfig);
+      el("register-node-server-btn").addEventListener(
+        "click",
+        registerNodeServer,
+      );
 
       // --- Data ---
       async function loadScopes() {
@@ -1370,6 +1403,7 @@
         var relay = data && data.relay ? data.relay : {};
         var caps = runtime.capabilities || {};
         var identity = runtime.identity || {};
+        var registration = runtime.registration || {};
         clearChildren(summary);
         [
           ["runtime", runtime.active ? "active" : "inactive"],
@@ -1381,6 +1415,10 @@
               : "unknown",
           ],
           ["identity", identity.address || "not initialized"],
+          [
+            "registration",
+            registration.registered ? "registered" : "not registered",
+          ],
           ["relay", relay.status || "closed"],
           ["api url", relay.publicUrl || "not connected"],
         ].forEach(function (item) {
@@ -1437,6 +1475,8 @@
             result = await client.syncSmoke();
           } else if (action === "sync-status") {
             result = await client.syncStatus();
+          } else if (action === "register-lite") {
+            result = await client.registerLiteServer();
           } else if (action === "connect-relay") {
             result = await client.connectRelay({
               controlUrl: el("ps-lite-relay-control-url").value.trim(),
@@ -1510,6 +1550,9 @@
       });
       el("ps-lite-sync-status-btn").addEventListener("click", function () {
         psLiteRequest("sync status", "sync-status");
+      });
+      el("ps-lite-register-btn").addEventListener("click", function () {
+        psLiteRequest("register server", "register-lite");
       });
       el("ps-lite-relay-connect-btn").addEventListener("click", function () {
         psLiteRequest("connect relay", "connect-relay");

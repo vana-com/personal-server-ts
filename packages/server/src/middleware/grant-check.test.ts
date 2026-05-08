@@ -32,6 +32,13 @@ function createMockGateway(
     listGrantsByUser: vi.fn().mockResolvedValue([]),
     getSchemaForScope: vi.fn().mockResolvedValue(null),
     getServer: vi.fn().mockResolvedValue(null),
+    getFile: vi.fn().mockResolvedValue(null),
+    listFilesSince: vi.fn().mockResolvedValue({ files: [], cursor: null }),
+    getSchema: vi.fn().mockResolvedValue(null),
+    registerServer: vi.fn().mockResolvedValue({ alreadyRegistered: false }),
+    registerFile: vi.fn().mockResolvedValue({}),
+    createGrant: vi.fn().mockResolvedValue({}),
+    revokeGrant: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
 }

@@ -52,8 +52,18 @@ describe("PS Lite sync", () => {
         scope: "instagram.profile",
         addedAt: "2026-05-08T00:00:00.000Z",
       }),
+      registerServer: vi.fn().mockResolvedValue({ alreadyRegistered: false }),
       registerFile: vi.fn().mockResolvedValue({ fileId: "file-browser-1" }),
       listFilesSince: vi.fn().mockResolvedValue({ files: [], cursor: null }),
+      isRegisteredBuilder: vi.fn().mockResolvedValue(false),
+      getBuilder: vi.fn().mockResolvedValue(null),
+      getGrant: vi.fn().mockResolvedValue(null),
+      listGrantsByUser: vi.fn().mockResolvedValue([]),
+      getServer: vi.fn().mockResolvedValue(null),
+      getFile: vi.fn().mockResolvedValue(null),
+      getSchema: vi.fn().mockResolvedValue(null),
+      createGrant: vi.fn().mockResolvedValue({}),
+      revokeGrant: vi.fn().mockResolvedValue(undefined),
     };
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(null, {
@@ -61,10 +71,10 @@ describe("PS Lite sync", () => {
       }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    vi.stubEnv("VANA_R2_ACCOUNT_ID", "acct");
-    vi.stubEnv("VANA_R2_ACCESS_KEY_ID", "key");
-    vi.stubEnv("VANA_R2_SECRET_ACCESS_KEY", "secret");
-    vi.stubEnv("VANA_R2_BUCKET", "bucket");
+    vi.stubEnv("R2_ACCOUNT_ID", "acct");
+    vi.stubEnv("R2_ACCESS_KEY_ID", "key");
+    vi.stubEnv("R2_SECRET_ACCESS_KEY", "secret");
+    vi.stubEnv("R2_BUCKET", "bucket");
 
     const { syncManager } = await createPsLiteSyncManager({
       config: ServerConfigSchema.parse({ sync: { enabled: true } }),

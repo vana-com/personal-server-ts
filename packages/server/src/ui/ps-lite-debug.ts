@@ -7,7 +7,12 @@ import {
   type PsLiteRelayStatus,
   type PsLiteRuntime,
 } from "@opendatalabs/personal-server-ts-lite";
-import { createGatewayClient } from "@opendatalabs/vana-sdk/browser";
+import {
+  createGatewayClient,
+  serverRegistrationDomain,
+  SERVER_REGISTRATION_TYPES,
+  type DataPortabilityGatewayConfig,
+} from "@opendatalabs/vana-sdk/browser";
 
 const ORIGIN = "https://ps-lite.local";
 const OWNER_TOKEN = "ps-lite-owner-token";
@@ -19,6 +24,7 @@ const GATEWAY_SCHEMA_SCOPES = [
   "linkedin.profile",
   "spotify.profile",
 ] as const;
+const ACCOUNT_URL = "https://account.vana.org";
 const SAMPLE_GRANT_ID = "debug-grant";
 const DEFAULT_CONTROL_URL = "wss://control.34.16.49.200.sslip.io:8443";
 const DEFAULT_PUBLIC_SUFFIX = "34.16.49.200.sslip.io";
@@ -46,6 +52,21 @@ interface UiResult {
   status: number;
   ok: boolean;
   data: unknown;
+}
+
+interface RegistrationCandidate {
+  ownerAddress: `0x${string}`;
+  serverAddress: `0x${string}`;
+  publicKey: `0x${string}`;
+  serverUrl: string;
+}
+
+interface RegistrationHealth {
+  gatewayUrl?: string | null;
+  gatewayConfig?:
+    | (Partial<DataPortabilityGatewayConfig> & { url?: string })
+    | null;
+  registration?: Partial<RegistrationCandidate> | null;
 }
 
 type DebugRequest = (
@@ -261,6 +282,134 @@ async function status(): Promise<UiResult> {
       },
     },
   };
+}
+
+function assertRegistrationCandidate(
+  value: RegistrationHealth["registration"],
+): RegistrationCandidate {
+  if (
+    !value?.ownerAddress ||
+    !value.serverAddress ||
+    !value.publicKey ||
+    !value.serverUrl
+  ) {
+    throw new Error("Personal Server registration metadata is incomplete");
+  }
+  return {
+    ownerAddress: value.ownerAddress,
+    serverAddress: value.serverAddress,
+    publicKey: value.publicKey,
+    serverUrl: value.serverUrl,
+  };
+}
+
+function assertExternallyReachableUrl(serverUrl: string): void {
+  const url = new URL(serverUrl);
+  if (
+    url.hostname === "localhost" ||
+    url.hostname === "127.0.0.1" ||
+    url.hostname === "ps-lite.local"
+  ) {
+    throw new Error("Connect the public PS API URL before registration");
+  }
+}
+
+function assertGatewayConfig(
+  value: RegistrationHealth["gatewayConfig"],
+): DataPortabilityGatewayConfig & { url: string } {
+  if (
+    !value?.url ||
+    !value.chainId ||
+    !value.contracts?.dataPortabilityServer
+  ) {
+    throw new Error("Gateway registration config is incomplete");
+  }
+  return value as DataPortabilityGatewayConfig & { url: string };
+}
+
+async function signServerRegistration(
+  config: DataPortabilityGatewayConfig,
+  message: RegistrationCandidate,
+): Promise<`0x${string}`> {
+  const typedData = {
+    types: SERVER_REGISTRATION_TYPES,
+    domain: serverRegistrationDomain(config),
+    primary_type: "ServerRegistration",
+    message,
+  };
+  const res = await fetch(`${ACCOUNT_URL}/api/sign`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      masterKeySignature: DEBUG_OWNER_SIGNATURE,
+      typedData,
+      type: "eth_signTypedData_v4",
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Account signing failed (${res.status}): ${text}`);
+  }
+  const body = (await res.json()) as { signature?: `0x${string}` };
+  if (!body.signature) {
+    throw new Error("Account signing response did not include a signature");
+  }
+  return body.signature;
+}
+
+async function registerFromHealth(
+  health: RegistrationHealth,
+): Promise<UiResult> {
+  const config = assertGatewayConfig(health.gatewayConfig);
+  const candidate = assertRegistrationCandidate(health.registration);
+  assertExternallyReachableUrl(candidate.serverUrl);
+  const gateway = createGatewayClient(config.url);
+  const existing = await gateway.getServer(candidate.serverAddress);
+  if (existing?.id) {
+    return {
+      status: 200,
+      ok: true,
+      data: {
+        alreadyRegistered: true,
+        serverId: existing.id,
+        candidate,
+      },
+    };
+  }
+  const signature = await signServerRegistration(config, candidate);
+  const result = await gateway.registerServer({
+    ...candidate,
+    signature,
+  });
+  return {
+    status: 200,
+    ok: true,
+    data: {
+      ...result,
+      candidate,
+    },
+  };
+}
+
+async function registerLiteServer(): Promise<UiResult> {
+  if (!relayPublicUrl) {
+    throw new Error("Connect the PS Lite relay before registration");
+  }
+  const activeRuntime = await ensureRuntime();
+  const health = await parseResponse(
+    await activeRuntime.fetch(new Request(`${ORIGIN}/health`)),
+  );
+  if (!health.ok) return health;
+  const healthData = health.data as RegistrationHealth;
+  return registerFromHealth({
+    ...healthData,
+    registration: healthData.registration
+      ? {
+          ...healthData.registration,
+          serverUrl: relayPublicUrl || healthData.registration.serverUrl,
+        }
+      : healthData.registration,
+  });
 }
 
 async function activate(): Promise<UiResult> {
@@ -525,6 +674,8 @@ const psLiteDebug = {
   disconnectRelay,
   gatewaySchemaSmoke,
   request,
+  registerFromHealth,
+  registerLiteServer,
   reset,
   status,
   storageSmoke,

@@ -1,5 +1,8 @@
 import { Hono } from "hono";
-import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
+import type {
+  DataPortabilityGatewayConfig,
+  GatewayClient,
+} from "@opendatalabs/vana-sdk/node";
 import type { RuntimeAvailabilityPort } from "@opendatalabs/personal-server-ts-core/ports";
 import type { Logger } from "pino";
 
@@ -9,9 +12,11 @@ import type { TunnelStatusInfo } from "../tunnel/index.js";
 export interface HealthDeps {
   version: string;
   startedAt: Date;
+  serverOrigin?: string | (() => string);
   serverOwner?: `0x${string}`;
   identity?: IdentityInfo;
   gateway?: GatewayClient;
+  gatewayConfig?: DataPortabilityGatewayConfig & { url?: string };
   logger?: Logger;
   getTunnelStatus?: () => TunnelStatusInfo | null;
   runtimeAvailability?: RuntimeAvailabilityPort;
@@ -47,6 +52,22 @@ export function healthRoute(deps: HealthDeps): Hono {
       : null;
 
     const tunnel = deps.getTunnelStatus?.() ?? null;
+    const fallbackOrigin =
+      typeof deps.serverOrigin === "function"
+        ? deps.serverOrigin()
+        : deps.serverOrigin;
+    const apiOrigin = tunnel?.publicUrl ?? fallbackOrigin ?? null;
+    const registration =
+      deps.serverOwner && identity && apiOrigin
+        ? {
+            ownerAddress: deps.serverOwner,
+            serverAddress: identity.address,
+            publicKey: identity.publicKey,
+            serverUrl: apiOrigin,
+            serverId,
+            registered: Boolean(serverId),
+          }
+        : null;
     const runtimeAvailable =
       (await deps.runtimeAvailability?.isAvailable()) ?? true;
 
@@ -55,7 +76,11 @@ export function healthRoute(deps: HealthDeps): Hono {
       version: deps.version,
       uptime: Math.floor(uptimeMs / 1000),
       owner: deps.serverOwner ?? null,
+      apiOrigin,
+      gatewayUrl: deps.gatewayConfig?.url ?? null,
+      gatewayConfig: deps.gatewayConfig ?? null,
       identity,
+      registration,
       tunnel,
       runtime: {
         kind: "ps-node",

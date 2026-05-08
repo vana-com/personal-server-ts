@@ -298,6 +298,7 @@ export async function createServer(
     serverOwner,
     identity,
     gateway: gatewayClient,
+    gatewayConfig: config.gateway,
     accessLogWriter,
     accessLogReader,
     dataStorage,

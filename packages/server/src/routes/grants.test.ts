@@ -39,6 +39,7 @@ function createMockGateway(): GatewayClient {
     getFile: vi.fn().mockResolvedValue(null),
     listFilesSince: vi.fn().mockResolvedValue({ files: [], nextCursor: null }),
     getSchema: vi.fn().mockResolvedValue(null),
+    registerServer: vi.fn().mockResolvedValue({ alreadyRegistered: false }),
     registerFile: vi.fn().mockResolvedValue({ fileId: "file-1" }),
     createGrant: vi.fn().mockResolvedValue({ grantId: "grant-123" }),
     revokeGrant: vi.fn().mockResolvedValue(undefined),

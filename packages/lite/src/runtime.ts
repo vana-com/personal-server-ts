@@ -50,6 +50,7 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/ports";
 import type {
   DataFileEnvelope,
+  DataPortabilityGatewayConfig,
   GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
 import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
@@ -102,7 +103,10 @@ export interface PsLiteRuntimeOptions {
   auth?: PsLiteAuthAdapter;
   active?: boolean;
   now?: () => Date;
-  config?: { server?: { origin?: string }; gateway?: { url?: string } };
+  config?: {
+    server?: { origin?: string };
+    gateway?: Partial<DataPortabilityGatewayConfig> & { url?: string };
+  };
   saveConfig?: (config: unknown) => Promise<void>;
   identity?: { address: `0x${string}`; publicKey: `0x${string}` };
   gateway?: GatewayClient;
@@ -847,6 +851,28 @@ export function createPsLiteRuntime(
         const url = new URL(request.url);
 
         if (url.pathname === "/health") {
+          const apiOrigin = options.config?.server?.origin ?? url.origin;
+          const identity = options.identity ?? null;
+          let serverId: string | null = null;
+          if (identity && options.gateway) {
+            try {
+              const server = await options.gateway.getServer(identity.address);
+              serverId = server?.id ?? null;
+            } catch {
+              serverId = null;
+            }
+          }
+          const registration =
+            options.serverOwner && identity
+              ? {
+                  ownerAddress: options.serverOwner,
+                  serverAddress: identity.address,
+                  publicKey: identity.publicKey,
+                  serverUrl: apiOrigin,
+                  serverId,
+                  registered: Boolean(serverId),
+                }
+              : null;
           const capabilities = (
             dataStorage as DataStoragePort & {
               capabilities?: PsLiteStorageCapabilities;
@@ -875,9 +901,12 @@ export function createPsLiteRuntime(
             storage: options.storage.kind,
             capabilities: capabilities ?? null,
             stateCapabilities,
-            apiOrigin: options.config?.server?.origin ?? url.origin,
+            owner: options.serverOwner ?? null,
+            apiOrigin,
             gatewayUrl: options.config?.gateway?.url ?? null,
-            identity: options.identity ?? null,
+            gatewayConfig: options.config?.gateway ?? null,
+            identity,
+            registration,
             active,
             checkedAt: now().toISOString(),
           });

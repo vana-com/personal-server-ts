@@ -16,6 +16,9 @@ describe("healthRoute", () => {
       listGrantsByUser: vi.fn().mockResolvedValue([]),
       getSchemaForScope: vi.fn().mockResolvedValue(null),
       getServer: vi.fn().mockResolvedValue(null),
+      registerServer: vi.fn().mockResolvedValue({
+        alreadyRegistered: false,
+      }),
       registerFile: vi.fn().mockResolvedValue({}),
       createGrant: vi.fn().mockResolvedValue({}),
       revokeGrant: vi.fn().mockResolvedValue(undefined),
@@ -43,7 +46,9 @@ describe("healthRoute", () => {
     expect(typeof body.uptime).toBe("number");
     expect(body.uptime).toBeGreaterThanOrEqual(0);
     expect(body.owner).toBeNull();
+    expect(body.apiOrigin).toBeNull();
     expect(body.identity).toBeNull();
+    expect(body.registration).toBeNull();
     expect(body.runtime).toEqual({
       kind: "ps-node",
       available: true,
@@ -129,6 +134,38 @@ describe("healthRoute", () => {
     expect(body.identity.address).toBe("0xServerAddr");
     expect(body.identity.publicKey).toBe("0x04PubKey");
     expect(body.identity.serverId).toBe("0xserver1");
+  });
+
+  it("includes registration candidate when owner, identity, and api URL are available", async () => {
+    const app = healthRoute({
+      version: "0.0.1",
+      startedAt: new Date(),
+      serverOwner: "0x1234567890abcdef1234567890abcdef12345678",
+      serverOrigin: "http://localhost:8080",
+      identity: {
+        address: "0xServerAddr",
+        publicKey: "0x04PubKey",
+        serverId: "0xserver1",
+      },
+      getTunnelStatus: () => ({
+        enabled: true,
+        status: "connected",
+        publicUrl: "https://0xserveraddr.server.vana.org",
+        connectedSince: "2026-02-04T10:30:00.000Z",
+      }),
+    });
+    const res = await app.request("/health");
+    const body = await res.json();
+
+    expect(body.apiOrigin).toBe("https://0xserveraddr.server.vana.org");
+    expect(body.registration).toEqual({
+      ownerAddress: "0x1234567890abcdef1234567890abcdef12345678",
+      serverAddress: "0xServerAddr",
+      publicKey: "0x04PubKey",
+      serverUrl: "https://0xserveraddr.server.vana.org",
+      serverId: "0xserver1",
+      registered: true,
+    });
   });
 
   it("identity shows serverId null when not registered", async () => {

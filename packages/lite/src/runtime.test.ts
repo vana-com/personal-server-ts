@@ -35,9 +35,12 @@ describe("createPsLiteRuntime", () => {
         accessLogs: "memory",
         config: "memory",
       },
+      owner: null,
       apiOrigin: "https://ps.local",
       gatewayUrl: null,
+      gatewayConfig: null,
       identity: null,
+      registration: null,
       active: true,
       checkedAt: "2026-05-08T00:00:00.000Z",
     });
@@ -285,6 +288,9 @@ describe("createPsLiteRuntime", () => {
         },
         async getSchema() {
           return null;
+        },
+        async registerServer() {
+          return { alreadyRegistered: false };
         },
         async registerFile() {
           return { fileId: "file-1" };

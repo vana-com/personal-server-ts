@@ -3,7 +3,10 @@ import { cors } from "hono/cors";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
-import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
+import type {
+  DataPortabilityGatewayConfig,
+  GatewayClient,
+} from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import { healthRoute, type HealthDeps } from "./routes/health.js";
@@ -45,6 +48,7 @@ export interface AppDeps {
   serverOwner?: `0x${string}`;
   identity?: IdentityInfo;
   gateway: GatewayClient;
+  gatewayConfig?: DataPortabilityGatewayConfig & { url?: string };
   accessLogWriter: AccessLogWriter;
   accessLogReader: AccessLogReader;
   cloudMode?: boolean;
@@ -80,9 +84,11 @@ export function createApp(deps: AppDeps): Hono {
     healthRoute({
       version: deps.version,
       startedAt: deps.startedAt,
+      serverOrigin: deps.serverOrigin,
       serverOwner: deps.serverOwner,
       identity: deps.identity,
       gateway: deps.gateway,
+      gatewayConfig: deps.gatewayConfig,
       logger: deps.logger,
       getTunnelStatus: deps.getTunnelStatus,
       runtimeAvailability: deps.runtimeAvailability,
