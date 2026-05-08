@@ -19,8 +19,10 @@ jobs:
           cache: npm
           registry-url: https://registry.npmjs.org
       - run: npm ci
+      - run: npm run validate:sdk-imports
       - run: npm run build
       - run: npm test
+      - run: npm run test:e2e
       - name: Set canary version
         run: |
           BASE_VERSION=$(node -p "require('./packages/cli/package.json').version")
