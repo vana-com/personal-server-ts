@@ -129,11 +129,11 @@ Target layering for DPv2 refactor:
 
 ## Runtime Matrix
 
-| Runtime     | Environment                  | Storage             | API Exposure                                        | Sync Mode        | Secret Handling                                        | In Scope    |
-| ----------- | ---------------------------- | ------------------- | --------------------------------------------------- | ---------------- | ------------------------------------------------------ | ----------- |
-| `ps-node`   | Node 22                      | Filesystem + SQLite | Hono HTTP                                           | Daemon sync      | Local key material now; OS keychain integration future | Yes         |
-| `ps-lite`   | Browser/WebView              | IndexedDB/OPFS      | Browser-local API server/bridge (per PoC direction) | Foreground sync  | DPv1 signature-derived key material                    | Yes         |
-| `ps-worker` | Cloudflare Worker or similar | R2/KV/D1            | HTTPS worker endpoint                               | Queue/event sync | Deployed encrypted secret handling TBD                 | No (future) |
+| Runtime     | Environment                  | Storage             | API Exposure                                 | Sync Mode        | Secret Handling                                        | In Scope    |
+| ----------- | ---------------------------- | ------------------- | -------------------------------------------- | ---------------- | ------------------------------------------------------ | ----------- |
+| `ps-node`   | Node 22                      | Filesystem + SQLite | Hono HTTP                                    | Daemon sync      | Local key material now; OS keychain integration future | Yes         |
+| `ps-lite`   | Browser/WebView              | IndexedDB/OPFS      | Browser-local API server through blind relay | Foreground sync  | DPv1 signature-derived key material                    | Yes         |
+| `ps-worker` | Cloudflare Worker or similar | R2/KV/D1            | HTTPS worker endpoint                        | Queue/event sync | Deployed encrypted secret handling TBD                 | No (future) |
 
 ## Package Boundaries
 
@@ -290,7 +290,8 @@ Compatibility requirement:
 `ps-lite` is the browser/webview runtime variant and must follow or adapt the browser-local-compute-runtime PoC direction: https://github.com/Kahtaf/research/tree/main/browser-local-compute-runtime-poc
 
 - Runtime model: active only while browser/webview is active; no always-on daemon assumption.
-- API exposure: use the browser-local API server/bridge/relay pattern shown by the PoC; exact production bridge mechanism stays TBD until implementation hardening.
+- API exposure: PS Lite owns the API server in the browser. The static app connects to the blind relay control WebSocket, terminates Rustls/WASM TLS locally, parses HTTP locally, dispatches requests into `PsLiteRuntime.fetch()`, and returns HTTP responses over relay frames. The deployed static app must not require the Node Personal Server; the relay is the only network-side service.
+- Relay configurability: the default control URL and public suffix match the PoC relay for now, but `ps-lite` callers can provide replacement `controlUrl`, `publicSuffix`, and `certIssuerUrl` values when the relay is swapped.
 - Storage: use IndexedDB/OPFS (or equivalent browser-safe adapter) for local runtime state.
 - Sync posture: foreground/best-effort while runtime is active.
 - Unavailable behavior: when runtime is inactive, product/builder boundary must receive typed `ps_unavailable`.
@@ -406,4 +407,4 @@ npm run test:e2e
 - Exact DPv2 fee-record API and verification payload shape used by read-time checks.
 - Exact final route versioning policy: keep `/v1`, add `/v2`, or provide compatibility aliases.
 - Exact package names and public exports for `ps-core`, `ps-node`, and `ps-lite` if they become real published packages.
-- Exact PS Lite bridge/API server mechanism after deeper implementation-level PoC analysis.
+- Production relay replacement details after the PoC relay is swapped out.

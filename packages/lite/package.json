@@ -28,10 +28,12 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc --build"
+    "copy-tls": "mkdir -p dist/browser-tls-rustls && cp src/browser-tls-rustls/* dist/browser-tls-rustls/",
+    "build": "tsc --build && npm run copy-tls"
   },
   "dependencies": {
+    "@opendatalabs/personal-server-ts-core": "*",
     "@opendatalabs/vana-sdk": "file:../../../vana-sdk/packages/vana-sdk",
-    "@opendatalabs/personal-server-ts-core": "*"
+    "node-forge": "^1.4.0"
   }
 }

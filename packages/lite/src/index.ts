@@ -26,3 +26,29 @@ export {
   type PsLiteStorageAdapter,
   type Web3SignedPsLiteAuthOptions,
 } from "./runtime.js";
+
+export {
+  decodeDataFrame,
+  encodeDataFrame,
+  psLiteRelayControlUrl,
+  psLiteRelayPublicUrl,
+  startPsLiteRelayClient,
+  type PsLiteRelayClient,
+  type PsLiteRelayClientOptions,
+  type PsLiteRelayStatus,
+  type PsLiteRelayTlsFactory,
+  type PsLiteRelayTlsPrepareInput,
+  type PsLiteRelayTlsStep,
+  type PsLiteRelayTlsStream,
+  type PsLiteRelayTlsStreamInput,
+  type PsLiteRelayWebSocket,
+  type PsLiteRelayWebSocketFactory,
+} from "./relay.js";
+
+export {
+  createRustlsPsLiteRelayTlsFactory,
+  psLiteRelayPublicHost,
+  psLiteRelayPublicUrl as psLiteRelayTlsPublicUrl,
+  type PsLiteRelayTlsIdentity,
+  type RustlsPsLiteRelayTlsOptions,
+} from "./relay-tls.js";
