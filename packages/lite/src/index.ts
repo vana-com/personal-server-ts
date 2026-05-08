@@ -1,4 +1,10 @@
 export {
+  createIndexedDbPsLiteRuntime,
+  type IndexedDbPsLiteRuntime,
+  type IndexedDbPsLiteRuntimeOptions,
+} from "./browser-runtime.js";
+
+export {
   handlePsLiteBridgeRequest,
   type PsLiteBridgeRequest,
   type PsLiteBridgeResponse,

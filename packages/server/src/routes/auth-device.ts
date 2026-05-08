@@ -15,6 +15,17 @@ import {
   type VerifiedAuth,
 } from "@opendatalabs/vana-sdk/node";
 import {
+  approveDeviceSessionContract,
+  createMemoryDeviceSessionStore,
+  DEVICE_POLL_INTERVAL_MS,
+  DEVICE_SESSION_TTL_MS,
+  initiateDeviceSessionContract,
+  pollDeviceSessionContract,
+  provisionDeviceTokenContract,
+  revokeDeviceTokenContract,
+  type DeviceSessionStore,
+} from "@opendatalabs/personal-server-ts-core/contracts";
+import {
   NotOwnerError,
   ProtocolError,
 } from "@opendatalabs/personal-server-ts-core/errors";
@@ -37,41 +48,54 @@ export interface LoginV2Deps {
   getRemoteAddress?: (c: Context) => string | undefined;
 }
 
-interface LoginSession {
-  sessionId: string;
-  pollToken: string;
-  requestedServerOrigin: string;
-  status: "pending" | "approved" | "expired";
-  accessToken?: string;
-  accessTokenExpiresAt?: string;
-  createdAt: number;
-  lastPollAt: number;
+type InspectableDeviceSessionStore = DeviceSessionStore & {
+  clear(): void;
+  readonly size: number;
+  has(sessionId: string): boolean;
+};
+
+function createInspectableDeviceSessionStore(): InspectableDeviceSessionStore {
+  const store = createMemoryDeviceSessionStore();
+  const sessionIds = new Set<string>();
+  return {
+    create(input) {
+      const session = store.create(input);
+      sessionIds.add(session.sessionId);
+      return session;
+    },
+    get(sessionId) {
+      return store.get(sessionId);
+    },
+    findByPollToken(pollToken) {
+      return store.findByPollToken(pollToken);
+    },
+    delete(sessionId) {
+      store.delete(sessionId);
+      sessionIds.delete(sessionId);
+    },
+    purgeExpired(now) {
+      store.purgeExpired(now);
+      for (const sessionId of Array.from(sessionIds)) {
+        if (!store.get(sessionId)) sessionIds.delete(sessionId);
+      }
+    },
+    clear() {
+      for (const sessionId of Array.from(sessionIds)) {
+        store.delete(sessionId);
+      }
+      sessionIds.clear();
+    },
+    get size() {
+      return sessionIds.size;
+    },
+    has(sessionId: string) {
+      return store.get(sessionId) !== undefined;
+    },
+  };
 }
 
-const SESSION_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const POLL_INTERVAL_MS = 5 * 1000; // 5 seconds minimum between polls
-const CLI_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
-
-/** In-memory session store (short-lived, no persistence needed). */
-const sessions = new Map<string, LoginSession>();
-
-/** Look up session by poll token. */
-function findByPollToken(token: string): LoginSession | undefined {
-  for (const session of sessions.values()) {
-    if (session.pollToken === token) return session;
-  }
-  return undefined;
-}
-
-/** Purge expired sessions. */
-function purgeExpired(): void {
-  const now = Date.now();
-  for (const [id, session] of sessions) {
-    if (now - session.createdAt > SESSION_TTL_MS) {
-      sessions.delete(id);
-    }
-  }
-}
+/** In-memory session store (short-lived device authorization state). */
+const sessions = createInspectableDeviceSessionStore();
 
 function getRequestOrigin(c: Context): string {
   return new URL(c.req.url).origin;
@@ -216,130 +240,43 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
   if (allowInteractiveLogin) {
     // POST /  — Initiate login flow (no auth required)
     app.post("/", (c) => {
-      purgeExpired();
-
-      if (!deps.serverOwner) {
-        return c.json(
-          {
-            error: {
-              code: 500,
-              errorCode: "SERVER_NOT_CONFIGURED",
-              message:
-                "Server owner address not configured. Set VANA_MASTER_KEY_SIGNATURE environment variable.",
-            },
-          },
-          500,
-        );
-      }
-
       const sessionId = randomBytes(32).toString("hex");
       const pollToken = randomBytes(32).toString("hex");
-      const requestedServerOrigin = getRequestOrigin(c);
-
-      const session: LoginSession = {
+      const result = initiateDeviceSessionContract({
+        sessionStore: sessions,
+        serverOwner: deps.serverOwner,
+        requestOrigin: getRequestOrigin(c),
+        approvalOrigin: getApprovalOrigin(c, deps),
         sessionId,
         pollToken,
-        requestedServerOrigin,
-        status: "pending",
-        createdAt: Date.now(),
-        lastPollAt: 0,
-      };
-      sessions.set(sessionId, session);
+        now: Date.now(),
+      });
 
       deps.logger.info({ sessionId }, "Login flow initiated");
-
-      return c.json({
-        login: `${getApprovalOrigin(c, deps)}/auth/device/approve?session=${sessionId}`,
-        poll: {
-          endpoint: "/auth/device/poll",
-          token: pollToken,
-        },
-      });
+      return c.json(result.body, result.status as 200 | 500);
     });
 
     // GET /poll  — Poll for completion
     app.get("/poll", (c) => {
-      purgeExpired();
-
-      const token = c.req.query("token");
-      if (!token) {
-        return c.json(
-          { error: { code: 400, message: "Missing token parameter" } },
-          400,
-        );
-      }
-
-      const session = findByPollToken(token);
-
-      if (!session) {
-        return c.json({ status: "expired" }, 404);
-      }
-
-      // Check if session has expired
-      if (Date.now() - session.createdAt > SESSION_TTL_MS) {
-        sessions.delete(session.sessionId);
-        return c.json({ status: "expired" }, 404);
-      }
-
-      // Rate limit polling
-      const now = Date.now();
-      if (now - session.lastPollAt < POLL_INTERVAL_MS) {
-        return c.json(
-          {
-            error: {
-              code: 429,
-              message: `Too many requests. Poll every ${POLL_INTERVAL_MS / 1000} seconds.`,
-            },
-          },
-          429,
-        );
-      }
-      session.lastPollAt = now;
-
-      if (session.status === "pending") {
-        return c.json({ status: "pending" }, 404);
-      }
-
-      if (session.status === "approved" && session.accessToken) {
-        if (!deps.serverOwner) {
-          sessions.delete(session.sessionId);
-          return c.json(
-            {
-              error: {
-                code: 500,
-                errorCode: "SERVER_NOT_CONFIGURED",
-                message:
-                  "Server owner address not configured. Set VANA_MASTER_KEY_SIGNATURE environment variable.",
-              },
-            },
-            500,
-          );
-        }
-        // Return token once, then delete session
-        const response = {
-          status: "authorized",
-          server: session.requestedServerOrigin,
-          address: deps.serverOwner,
-          access_token: session.accessToken,
-          expires_at: session.accessTokenExpiresAt,
-        };
-        sessions.delete(session.sessionId);
-
+      const result = pollDeviceSessionContract({
+        sessionStore: sessions,
+        pollToken: c.req.query("token") ?? null,
+        serverOwner: deps.serverOwner,
+        now: Date.now(),
+      });
+      if (result.status === 200) {
+        const body = result.body as { server?: string };
         deps.logger.info(
-          { sessionId: session.sessionId },
+          { server: body.server },
           "Login flow completed — token delivered",
         );
-
-        return c.json(response, 200);
       }
-
-      // Shouldn't reach here, but just in case
-      return c.json({ status: "pending" }, 404);
+      return c.json(result.body, result.status as 200 | 400 | 404 | 429 | 500);
     });
 
     // GET /approve  — HTML approval page
     app.get("/approve", (c) => {
-      purgeExpired();
+      sessions.purgeExpired(Date.now());
 
       const sessionId = c.req.query("session");
       if (!sessionId) {
@@ -349,11 +286,6 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
       const session = sessions.get(sessionId);
       if (!session) {
         return c.html(errorPage("Session expired or invalid"), 404);
-      }
-
-      if (Date.now() - session.createdAt > SESSION_TTL_MS) {
-        sessions.delete(sessionId);
-        return c.html(errorPage("Session expired"), 410);
       }
 
       if (session.status === "approved") {
@@ -375,7 +307,7 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
 
     // POST /approve  — Approve the session
     app.post("/approve", async (c) => {
-      purgeExpired();
+      sessions.purgeExpired(Date.now());
 
       const sessionId = c.req.query("session");
       if (!sessionId) {
@@ -390,14 +322,6 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
         return c.json(
           { error: { code: 404, message: "Session expired or invalid" } },
           404,
-        );
-      }
-
-      if (Date.now() - session.createdAt > SESSION_TTL_MS) {
-        sessions.delete(sessionId);
-        return c.json(
-          { error: { code: 410, message: "Session expired" } },
-          410,
         );
       }
 
@@ -433,34 +357,18 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
         );
       }
 
-      // Generate a new access token
-      if (!deps.serverOwner) {
-        return c.json(
-          {
-            error: {
-              code: 500,
-              errorCode: "SERVER_NOT_CONFIGURED",
-              message:
-                "Server owner address not configured. Set VANA_MASTER_KEY_SIGNATURE environment variable.",
-            },
-          },
-          500,
-        );
-      }
       const accessToken = `vana_ps_${randomBytes(32).toString("hex")}`;
-      const expiresAt = new Date(Date.now() + CLI_TOKEN_TTL_MS).toISOString();
-
-      // Store the token persistently
-      await deps.tokenStore.addToken(accessToken, { expiresAt });
-
-      // Mark session as approved
-      session.status = "approved";
-      session.accessToken = accessToken;
-      session.accessTokenExpiresAt = expiresAt;
+      const result = await approveDeviceSessionContract({
+        sessionStore: sessions,
+        tokenStore: deps.tokenStore,
+        sessionId,
+        serverOwner: deps.serverOwner,
+        accessToken,
+        now: Date.now(),
+      });
 
       deps.logger.info({ sessionId }, "Login flow approved — token generated");
-
-      return c.json({ status: "approved" });
+      return c.json(result.body, result.status as 200 | 400 | 404 | 500);
     });
   }
 
@@ -479,7 +387,7 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
       );
     }
 
-    let body: { token?: string; expires_at?: string | null };
+    let body: unknown;
     try {
       body = await c.req.json();
     } catch {
@@ -489,31 +397,16 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
       );
     }
 
-    if (!body.token || typeof body.token !== "string") {
-      return c.json({ error: { code: 400, message: "Missing token" } }, 400);
+    const result = await provisionDeviceTokenContract({
+      tokenStore: deps.tokenStore,
+      body,
+      now: Date.now(),
+    });
+    if (result.status !== 201) {
+      return c.json(result.body, result.status as 400);
     }
-
-    let expiresAt: string | null = null;
-    if (body.expires_at !== undefined && body.expires_at !== null) {
-      const parsed = new Date(body.expires_at);
-      if (Number.isNaN(parsed.getTime())) {
-        return c.json(
-          { error: { code: 400, message: "Invalid expires_at" } },
-          400,
-        );
-      }
-      if (parsed.getTime() <= Date.now()) {
-        return c.json(
-          { error: { code: 400, message: "expires_at must be in the future" } },
-          400,
-        );
-      }
-      expiresAt = parsed.toISOString();
-    }
-
-    await deps.tokenStore.addToken(body.token, { expiresAt });
     deps.logger.info("CLI token added via POST /token");
-    return c.json({ status: "created" }, 201);
+    return c.json(result.body, 201);
   });
 
   // ── Token revocation ──────────────────────────────────────────────
@@ -521,23 +414,17 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
 
   app.delete("/token", async (c) => {
     const authHeader = c.req.header("authorization");
-    if (!authHeader?.startsWith("Bearer ")) {
-      return c.json(
-        { error: { code: 401, message: "Missing Bearer token" } },
-        401,
-      );
+    const result = await revokeDeviceTokenContract({
+      tokenStore: deps.tokenStore,
+      bearerToken: authHeader?.startsWith("Bearer ")
+        ? authHeader.slice(7)
+        : null,
+    });
+    if (result.status !== 200) {
+      return c.json(result.body, result.status as 401);
     }
-
-    const token = authHeader.slice(7);
-    const tokenIsValid = await deps.tokenStore.isValid(token);
-    if (!tokenIsValid) {
-      return c.json({ status: "revoked" });
-    }
-
-    await deps.tokenStore.removeToken(token);
-
     deps.logger.info("Token revoked via DELETE /token");
-    return c.json({ status: "revoked" }); // idempotent — no error if token doesn't exist
+    return c.json(result.body);
   });
 
   return app;
@@ -799,7 +686,11 @@ function escapeHtml(str: string): string {
 }
 
 // Export for testing
-export { sessions, SESSION_TTL_MS, POLL_INTERVAL_MS };
+export {
+  sessions,
+  DEVICE_SESSION_TTL_MS as SESSION_TTL_MS,
+  DEVICE_POLL_INTERVAL_MS as POLL_INTERVAL_MS,
+};
 
 /**
  * Read-only adapter exposing the device-flow session map to the standard
@@ -810,14 +701,9 @@ export { sessions, SESSION_TTL_MS, POLL_INTERVAL_MS };
 export function createDeviceSessionLookup() {
   return {
     findByDeviceCode(deviceCode: string) {
-      purgeExpired();
-      const session = findByPollToken(deviceCode);
+      sessions.purgeExpired(Date.now());
+      const session = sessions.findByPollToken(deviceCode);
       if (!session) return null;
-      // Re-evaluate expiry inline to match the legacy poll endpoint.
-      if (Date.now() - session.createdAt > SESSION_TTL_MS) {
-        sessions.delete(session.sessionId);
-        return null;
-      }
       return {
         status: session.status,
         accessToken: session.accessToken,

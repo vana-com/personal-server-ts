@@ -1,14 +1,7 @@
 import {
   createBearerTokenPsLiteAuth,
-  createIndexedDbPsLiteAccessLogStore,
-  createIndexedDbPsLitePersistence,
-  createIndexedDbPsLiteStateStore,
-  createIndexedDbPsLiteTokenStore,
-  createMemoryPsLiteStorage,
-  createPersistentPsLiteStorage,
+  createIndexedDbPsLiteRuntime,
   createPsLiteRuntime,
-  loadOrCreatePsLiteConfig,
-  loadOrCreatePsLiteServerIdentity,
   psLiteRelayPublicUrl,
   savePsLiteConfig,
   startPsLiteRelayClient,
@@ -39,14 +32,19 @@ const ORIGIN = "https://ps-lite.local";
 const OWNER_TOKEN = "ps-lite-owner-token";
 const BUILDER_TOKEN = "ps-lite-builder-token";
 const CONTROL_PLANE_TOKEN = "ps-lite-control-plane-token";
-const SAMPLE_SCOPE = "debug.local.profile";
+const SAMPLE_SCOPE = "instagram.profile";
+const GATEWAY_SCHEMA_SCOPES = [
+  "instagram.profile",
+  "linkedin.profile",
+  "spotify.profile",
+] as const;
 const SAMPLE_GRANT_ID = "debug-grant";
 const DEFAULT_CONTROL_URL = "wss://control.34.16.49.200.sslip.io:8443";
 const DEFAULT_PUBLIC_SUFFIX = "34.16.49.200.sslip.io";
 const DEBUG_OWNER_SIGNATURE =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
 
-type StorageMode = "indexeddb" | "memory";
+type StorageMode = "indexeddb";
 type AuthMode = "owner" | "builder" | "none" | "bad-builder";
 
 interface UiRequestOptions {
@@ -147,47 +145,32 @@ function inferAuth(method: string): AuthMode {
   return "builder";
 }
 
-async function makeRuntime(
-  mode: StorageMode,
-  options: { gateway?: "real" | "none" } = {},
-): Promise<PsLiteRuntime> {
-  const stateStore = createIndexedDbPsLiteStateStore({
+async function makeRuntime(_mode: StorageMode): Promise<PsLiteRuntime> {
+  const browserRuntime = await createIndexedDbPsLiteRuntime({
     dbName: "personal-server-lite-debug",
-    storeName: "state",
-  });
-  const config = await loadOrCreatePsLiteConfig(stateStore, {
-    server: { port: 443, origin: ORIGIN },
-  });
-  const identity = await loadOrCreatePsLiteServerIdentity({
-    store: stateStore,
+    storageDbName: "personal-server-lite-debug-storage",
+    storageKey: "data-storage-v1",
     ownerSignature: DEBUG_OWNER_SIGNATURE,
+    configDefaults: {
+      server: { port: 443, origin: ORIGIN },
+    },
+    auth: createBearerTokenPsLiteAuth({
+      ownerToken: OWNER_TOKEN,
+      builderToken: BUILDER_TOKEN,
+    }),
+    active: true,
+    gateway: undefined,
+    accessToken: CONTROL_PLANE_TOKEN,
   });
-  const tokenStore = createIndexedDbPsLiteTokenStore({
-    dbName: "personal-server-lite-debug",
-    storeName: "tokens",
-  });
-  const accessLogStore = createIndexedDbPsLiteAccessLogStore({
-    dbName: "personal-server-lite-debug",
-    storeName: "accessLogs",
-  });
-  const storage =
-    mode === "indexeddb"
-      ? await createPersistentPsLiteStorage(
-          { kind: "indexeddb" },
-          createIndexedDbPsLitePersistence({
-            dbName: "personal-server-lite-debug-storage",
-            storeName: "state",
-            key: "data-storage-v1",
-          }),
-        )
-      : createMemoryPsLiteStorage();
+  const config = browserRuntime.config;
+  const identity = browserRuntime.identity;
   const gatewayConfig = {
     chainId: config.gateway.chainId,
     contracts: config.gateway.contracts,
   };
 
   const nextRuntime = createPsLiteRuntime({
-    storage,
+    storage: browserRuntime.storage,
     auth: createBearerTokenPsLiteAuth({
       ownerToken: OWNER_TOKEN,
       builderToken: BUILDER_TOKEN,
@@ -198,19 +181,20 @@ async function makeRuntime(
       address: identity.account.address,
       publicKey: identity.account.publicKey,
     },
-    gateway:
-      options.gateway === "none"
-        ? undefined
-        : createGatewayClient(config.gateway.url),
+    gateway: createGatewayClient(config.gateway.url),
     serverOwner: identity.account.address,
     serverSigner: createBrowserServerSigner(identity.account, gatewayConfig),
     saveConfig: async (nextConfig) => {
-      const saved = await savePsLiteConfig(stateStore, nextConfig);
+      const saved = await savePsLiteConfig(
+        browserRuntime.stateStore,
+        nextConfig,
+      );
       Object.assign(config, saved);
     },
-    tokenStore,
-    accessLogReader: accessLogStore,
-    accessLogWriter: accessLogStore,
+    stateCapabilities: { config: "indexeddb" },
+    tokenStore: browserRuntime.tokenStore,
+    accessLogReader: browserRuntime.accessLogStore,
+    accessLogWriter: browserRuntime.accessLogStore,
     accessToken: CONTROL_PLANE_TOKEN,
   });
   nextRuntime.activate();
@@ -308,6 +292,7 @@ async function deactivate(): Promise<UiResult> {
 }
 
 async function runStorageSmoke(requestFn: DebugRequest): Promise<UiResult> {
+  const schema = await gatewaySchemaSmoke();
   const payload = {
     source: "debug-ui",
     runtime: "browser-ps-lite",
@@ -329,37 +314,51 @@ async function runStorageSmoke(requestFn: DebugRequest): Promise<UiResult> {
   return {
     status: write.ok && list.ok && versions.ok && read.ok ? 200 : 500,
     ok: write.ok && list.ok && versions.ok && read.ok,
-    data: { write, list, versions, read },
+    data: { schema, write, list, versions, read },
   };
 }
 
-function isMissingDebugSchema(result: UiResult): boolean {
-  const data = result.data as { write?: { status?: number; data?: unknown } };
-  const write = data.write;
-  const writeData = write?.data as
-    | { error?: { errorCode?: string } }
-    | undefined;
-  return write?.status === 400 && writeData?.error?.errorCode === "NO_SCHEMA";
+async function storageSmoke(): Promise<UiResult> {
+  return runStorageSmoke(request);
 }
 
-async function storageSmoke(): Promise<UiResult> {
-  const gatewayResult = await runStorageSmoke(request);
-  if (!isMissingDebugSchema(gatewayResult)) {
-    return gatewayResult;
+async function gatewaySchemaSmoke(): Promise<UiResult> {
+  const activeRuntime = await ensureRuntime();
+  const health = await parseResponse(
+    await activeRuntime.fetch(new Request(`${ORIGIN}/health`)),
+  );
+  const runtimeHealth = health.data as
+    | { gatewayUrl?: string | null }
+    | null
+    | undefined;
+  const gatewayUrl = runtimeHealth?.gatewayUrl;
+  if (!gatewayUrl) {
+    return {
+      status: 500,
+      ok: false,
+      data: { error: "PS Lite gateway URL is not configured" },
+    };
   }
 
-  const localRuntime = await makeRuntime(storageMode, { gateway: "none" });
-  const localResult = await runStorageSmoke((path, options) =>
-    requestWithRuntime(localRuntime, path, options),
-  );
+  const gateway = createGatewayClient(gatewayUrl);
+  for (const scope of GATEWAY_SCHEMA_SCOPES) {
+    const schema = await gateway.getSchemaForScope(scope);
+    if (schema) {
+      return {
+        status: 200,
+        ok: true,
+        data: { scope, gatewayUrl, schema },
+      };
+    }
+  }
+
   return {
-    status: localResult.ok ? 200 : 500,
-    ok: localResult.ok,
+    status: 404,
+    ok: false,
     data: {
-      gateway: gatewayResult,
-      localStorageFallback: localResult,
-      fallbackReason:
-        "Configured gateway has no schema for the debug.local.profile smoke scope",
+      gatewayUrl,
+      scopes: GATEWAY_SCHEMA_SCOPES,
+      error: "No configured debug schema scopes were found in the gateway",
     },
   };
 }
@@ -512,6 +511,7 @@ const psLiteDebug = {
   deactivate,
   deleteSmoke,
   disconnectRelay,
+  gatewaySchemaSmoke,
   request,
   reset,
   status,

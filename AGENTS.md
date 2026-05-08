@@ -39,6 +39,7 @@
 
 - Tests are co-located as `foo.test.ts`; test utilities live under `packages/core/src/test-utils` and route tests build mock gateways/deps directly.
 - Use red/green TDD for behavior changes and bug fixes: add one focused failing test through the public route/core API, make the minimal code change to pass, then repeat; do not batch-write imagined tests up front.
+- For Personal Server UI/API work, test through the debug UI whenever applicable, end to end as far as local/runtime prerequisites allow.
 - ESLint enforces type-only imports and errors on unused vars unless prefixed with `_`; `no-explicit-any` is only a warning in source and disabled in tests.
 - Root `.editorconfig` is 2-space, LF, final newline; Markdown allows trailing whitespace.
 - Husky runs `lint-staged` pre-commit and commitlint on commit messages; PR titles are semantic-convention checked in GitHub Actions.

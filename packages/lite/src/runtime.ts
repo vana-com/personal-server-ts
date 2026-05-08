@@ -66,6 +66,12 @@ import {
   sortEntries,
 } from "./storage-utils.js";
 import type { PsLiteStorageCapabilities } from "./storage.js";
+import {
+  createIndexedDbPsLiteAccessLogStore,
+  createIndexedDbPsLiteStateStore,
+  createIndexedDbPsLiteTokenStore,
+  savePsLiteConfig,
+} from "./state.js";
 
 export interface PsLiteStorageAdapter {
   kind: "indexeddb" | "opfs" | "custom";
@@ -107,6 +113,7 @@ export interface PsLiteRuntimeOptions {
   accessLogWriter?: AccessLogWriter;
   accessToken?: string;
   tokenStore?: PsLiteTokenStore;
+  stateCapabilities?: Partial<PsLiteRuntimeStateCapabilities>;
 }
 
 export interface PsLiteRuntimeStateCapabilities {
@@ -377,6 +384,16 @@ function createMemoryAccessLogStore(): AccessLogReader & AccessLogWriter {
   } as AccessLogReader & AccessLogWriter & PsLiteRuntimeStoreCapabilities;
 }
 
+function indexedDbAvailable(): boolean {
+  return typeof indexedDB !== "undefined";
+}
+
+function createDefaultAccessLogStore(): AccessLogReader & AccessLogWriter {
+  return indexedDbAvailable()
+    ? createIndexedDbPsLiteAccessLogStore()
+    : createMemoryAccessLogStore();
+}
+
 function createLogId(): string {
   return globalThis.crypto?.randomUUID?.() ?? `log-${Date.now()}`;
 }
@@ -428,6 +445,12 @@ function createMemoryTokenStore(): PsLiteTokenStore {
       tokens.delete(token);
     },
   } as PsLiteTokenStore & PsLiteRuntimeStoreCapabilities;
+}
+
+function createDefaultTokenStore(): PsLiteTokenStore {
+  return indexedDbAvailable()
+    ? createIndexedDbPsLiteTokenStore()
+    : createMemoryTokenStore();
 }
 
 function bearerToken(request: Request): string | null {
@@ -555,10 +578,17 @@ export function createPsLiteRuntime(
   const now = options.now ?? (() => new Date());
   const auth = options.auth ?? createMissingAuthAdapter();
   const dataStorage = toDataStoragePort(options.storage);
-  const accessLogStore = createMemoryAccessLogStore();
+  const accessLogStore = createDefaultAccessLogStore();
   const accessLogReader = options.accessLogReader ?? accessLogStore;
   const accessLogWriter = options.accessLogWriter ?? accessLogStore;
-  const tokenStore = options.tokenStore ?? createMemoryTokenStore();
+  const tokenStore = options.tokenStore ?? createDefaultTokenStore();
+  const saveConfig =
+    options.saveConfig ??
+    (indexedDbAvailable()
+      ? async (nextConfig: unknown) => {
+          await savePsLiteConfig(createIndexedDbPsLiteStateStore(), nextConfig);
+        }
+      : undefined);
   const deviceSessions: DeviceSessionStore = createMemoryDeviceSessionStore();
 
   async function withProtocolErrors(
@@ -806,7 +836,13 @@ export function createPsLiteRuntime(
                 accessLogReader as AccessLogReader &
                   PsLiteRuntimeStoreCapabilities
               ).capabilities?.accessLogs ?? "custom",
-            config: options.saveConfig ? "custom" : "memory",
+            config:
+              options.stateCapabilities?.config ??
+              (options.saveConfig
+                ? "custom"
+                : saveConfig
+                  ? "indexeddb"
+                  : "memory"),
           };
           return jsonResponse({
             status: active ? "healthy" : "unavailable",
@@ -995,9 +1031,7 @@ export function createPsLiteRuntime(
               if (!parsed.ok) return sendContractResult(parsed.result);
               const result = validateServerConfigContract(parsed.body);
               if (!result.ok) return sendContractResult(result);
-              await options.saveConfig?.(
-                (result.body as { config: unknown }).config,
-              );
+              await saveConfig?.((result.body as { config: unknown }).config);
               return sendContractResult(result);
             }
             return errorResponse(

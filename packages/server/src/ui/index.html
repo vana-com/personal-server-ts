@@ -474,10 +474,9 @@
         <div class="card">
           <div class="card-title">Browser PS Lite</div>
           <div class="toolbar">
-            <select id="ps-lite-storage-mode">
-              <option value="indexeddb">IndexedDB</option>
-              <option value="memory">Memory</option>
-            </select>
+            <button class="btn secondary" id="ps-lite-gateway-schema-btn">
+              Gateway Schema
+            </button>
             <button class="btn" id="ps-lite-smoke-btn">Storage Smoke</button>
             <button class="btn secondary" id="ps-lite-auth-btn">
               Auth Smoke
@@ -1341,7 +1340,9 @@
           } else if (action === "deactivate") {
             result = await client.deactivate();
           } else if (action === "reset") {
-            result = await client.reset(el("ps-lite-storage-mode").value);
+            result = await client.reset("indexeddb");
+          } else if (action === "gateway-schema-smoke") {
+            result = await client.gatewaySchemaSmoke();
           } else if (action === "storage-smoke") {
             result = await client.storageSmoke();
           } else if (action === "auth-smoke") {
@@ -1402,6 +1403,9 @@
       });
       el("ps-lite-reset-btn").addEventListener("click", function () {
         psLiteRequest("reset", "reset");
+      });
+      el("ps-lite-gateway-schema-btn").addEventListener("click", function () {
+        psLiteRequest("gateway schema", "gateway-schema-smoke");
       });
       el("ps-lite-smoke-btn").addEventListener("click", function () {
         psLiteRequest("storage smoke", "storage-smoke");
