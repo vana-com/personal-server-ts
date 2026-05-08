@@ -6,6 +6,29 @@ export {
   parseDataScopeContract,
   readDataContract,
 } from "./data.js";
+export {
+  configReadErrorContract,
+  configWriteErrorContract,
+  validateServerConfigContract,
+} from "./config.js";
+export { listAccessLogsContract } from "./access-logs.js";
+export {
+  createGrantContract,
+  listGrantsContract,
+  verifyGrantContract,
+} from "./grants.js";
+export {
+  contractError,
+  contractOk,
+  contractProtocolError,
+  normalizeIntegerParam,
+  parseJsonObjectBody,
+} from "./http.js";
+export {
+  getSyncStatusContract,
+  syncFileContract,
+  triggerSyncContract,
+} from "./sync.js";
 
 export type {
   DataContractError,
@@ -22,3 +45,4 @@ export type {
   ReadDataContractInput,
   ReadDataContractResult,
 } from "./data.js";
+export type { ContractResult } from "./http.js";

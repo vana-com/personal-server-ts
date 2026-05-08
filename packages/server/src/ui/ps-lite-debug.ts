@@ -13,6 +13,7 @@ import {
   type PsLiteRelayStatus,
   type PsLiteRuntime,
 } from "@opendatalabs/personal-server-ts-lite";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
 
 const ORIGIN = "https://ps-lite.local";
 const OWNER_TOKEN = "ps-lite-owner-token";
@@ -52,6 +53,70 @@ let storageMode: StorageMode = "indexeddb";
 let relayClient: PsLiteRelayClient | undefined;
 let relayStatus: PsLiteRelayStatus = "closed";
 let relayPublicUrl = "";
+
+const mockGateway: GatewayClient = {
+  async isRegisteredBuilder() {
+    return true;
+  },
+  async getBuilder(address: string) {
+    return {
+      id: "debug-builder",
+      ownerAddress: address,
+      granteeAddress: address,
+      publicKey: "0x04",
+      appUrl: "https://debug-builder.local",
+      addedAt: new Date().toISOString(),
+    };
+  },
+  async getGrant(grantId: string) {
+    return {
+      id: grantId,
+      grantorAddress: "debug-owner",
+      granteeId: "debug-builder",
+      grant: JSON.stringify({
+        scopes: [`${SAMPLE_SCOPE}`],
+        expiresAt: 0,
+      }),
+      fileIds: [],
+      status: "confirmed",
+      addedAt: new Date().toISOString(),
+      revokedAt: null,
+      revocationSignature: null,
+    };
+  },
+  async listGrantsByUser() {
+    return [];
+  },
+  async getSchemaForScope(scope: string) {
+    return {
+      id: "debug-schema",
+      ownerAddress: "debug-owner",
+      name: scope,
+      definitionUrl: "https://schemas.local/debug.schema.json",
+      scope,
+      addedAt: new Date().toISOString(),
+    };
+  },
+  async getServer() {
+    return null;
+  },
+  async getFile() {
+    return null;
+  },
+  async listFilesSince() {
+    return { files: [], nextCursor: null };
+  },
+  async getSchema() {
+    return null;
+  },
+  async registerFile() {
+    return { fileId: "debug-file" };
+  },
+  async createGrant() {
+    return { grantId: SAMPLE_GRANT_ID };
+  },
+  async revokeGrant() {},
+};
 
 function randomSessionId(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(12));
@@ -110,6 +175,8 @@ async function makeRuntime(mode: StorageMode): Promise<PsLiteRuntime> {
       address: identity.account.address,
       publicKey: identity.account.publicKey,
     },
+    gateway: mockGateway,
+    serverOwner: identity.account.address,
   });
   nextRuntime.activate();
   return nextRuntime;

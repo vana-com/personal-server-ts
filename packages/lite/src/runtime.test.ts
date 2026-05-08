@@ -237,6 +237,105 @@ describe("createPsLiteRuntime", () => {
     expect(read.status).toBe(404);
   });
 
+  it("exposes grants, sync, access logs, and config routes through ps-lite", async () => {
+    const runtime = createPsLiteRuntime({
+      storage: createMemoryPsLiteStorage(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      config: {
+        server: { origin: "https://ps.local" },
+        gateway: { url: "https://gateway.local" },
+      },
+      serverOwner: "0x0000000000000000000000000000000000000001",
+      gateway: {
+        async listGrantsByUser() {
+          return [];
+        },
+        async getBuilder() {
+          return null;
+        },
+        async createGrant() {
+          return { grantId: "grant-1" };
+        },
+        async isRegisteredBuilder() {
+          return false;
+        },
+        async getGrant() {
+          return null;
+        },
+        async getSchemaForScope() {
+          return null;
+        },
+        async getServer() {
+          return null;
+        },
+        async getFile() {
+          return null;
+        },
+        async listFilesSince() {
+          return { files: [], nextCursor: null };
+        },
+        async getSchema() {
+          return null;
+        },
+        async registerFile() {
+          return { fileId: "file-1" };
+        },
+        async revokeGrant() {},
+      },
+    });
+
+    const ownerHeaders = { Authorization: "Bearer owner-token" };
+    const grants = await runtime.fetch(
+      new Request("https://ps.local/v1/grants", { headers: ownerHeaders }),
+    );
+    const syncStatus = await runtime.fetch(
+      new Request("https://ps.local/v1/sync/status", {
+        headers: ownerHeaders,
+      }),
+    );
+    const syncTrigger = await runtime.fetch(
+      new Request("https://ps.local/v1/sync/trigger", {
+        method: "POST",
+        headers: ownerHeaders,
+      }),
+    );
+    const accessLogs = await runtime.fetch(
+      new Request("https://ps.local/v1/access-logs", {
+        headers: ownerHeaders,
+      }),
+    );
+    const config = await runtime.fetch(
+      new Request("https://ps.local/ui/api/config", {
+        headers: ownerHeaders,
+      }),
+    );
+
+    expect(grants.status).toBe(200);
+    await expect(grants.json()).resolves.toEqual({ grants: [] });
+    expect(syncStatus.status).toBe(200);
+    await expect(syncStatus.json()).resolves.toMatchObject({
+      enabled: false,
+      running: false,
+    });
+    expect(syncTrigger.status).toBe(200);
+    await expect(syncTrigger.json()).resolves.toMatchObject({
+      status: "disabled",
+    });
+    expect(accessLogs.status).toBe(200);
+    await expect(accessLogs.json()).resolves.toMatchObject({
+      logs: [],
+      total: 0,
+    });
+    expect(config.status).toBe(200);
+    await expect(config.json()).resolves.toMatchObject({
+      server: { origin: "https://ps.local" },
+    });
+  });
+
   it("supports Web3Signed owner writes and builder grant reads", async () => {
     const owner = createTestWallet(0);
     const builder = createTestWallet(1);

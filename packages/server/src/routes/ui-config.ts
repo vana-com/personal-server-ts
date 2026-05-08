@@ -1,7 +1,11 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { Hono } from "hono";
 import type { MiddlewareHandler } from "hono";
-import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
+import {
+  configReadErrorContract,
+  configWriteErrorContract,
+  validateServerConfigContract,
+} from "@opendatalabs/personal-server-ts-core/contracts";
 
 export interface UiConfigRouteDeps {
   devToken: string;
@@ -40,27 +44,11 @@ export function uiConfigRoutes(deps: UiConfigRouteDeps): Hono {
         "code" in err &&
         (err as NodeJS.ErrnoException).code === "ENOENT"
       ) {
-        return c.json(
-          {
-            error: {
-              code: 404,
-              errorCode: "NOT_FOUND",
-              message: "Config file not found",
-            },
-          },
-          404,
-        );
+        const result = configReadErrorContract("not-found");
+        return c.json(result.body, 404);
       }
-      return c.json(
-        {
-          error: {
-            code: 500,
-            errorCode: "READ_ERROR",
-            message: "Failed to read config",
-          },
-        },
-        500,
-      );
+      const result = configReadErrorContract("read");
+      return c.json(result.body, 500);
     }
   });
 
@@ -82,38 +70,19 @@ export function uiConfigRoutes(deps: UiConfigRouteDeps): Hono {
       );
     }
 
-    const result = ServerConfigSchema.safeParse(body);
-    if (!result.success) {
-      return c.json(
-        {
-          error: {
-            code: 400,
-            errorCode: "VALIDATION_ERROR",
-            message: "Invalid config",
-            issues: result.error.issues,
-          },
-        },
-        400,
-      );
-    }
+    const result = validateServerConfigContract(body);
+    if (!result.ok) return c.json(result.body, 400);
 
     try {
       await writeFile(
         deps.configPath,
-        JSON.stringify(result.data, null, 2) + "\n",
+        JSON.stringify((result.body as { config: unknown }).config, null, 2) +
+          "\n",
       );
-      return c.json({ status: "saved", config: result.data });
+      return c.json(result.body);
     } catch {
-      return c.json(
-        {
-          error: {
-            code: 500,
-            errorCode: "WRITE_ERROR",
-            message: "Failed to write config",
-          },
-        },
-        500,
-      );
+      const writeError = configWriteErrorContract();
+      return c.json(writeError.body, 500);
     }
   });
 

@@ -15,12 +15,21 @@ import {
   UnregisteredBuilderError,
 } from "@opendatalabs/personal-server-ts-core/errors";
 import {
+  createGrantContract,
   deleteDataScopeContract,
+  getSyncStatusContract,
   ingestDataContract,
+  listAccessLogsContract,
   listDataScopesContract,
   listDataVersionsContract,
+  listGrantsContract,
   parseDataScopeContract,
+  parseJsonObjectBody,
   readDataContract,
+  syncFileContract,
+  triggerSyncContract,
+  validateServerConfigContract,
+  verifyGrantContract,
   type DataContractError,
 } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
@@ -31,8 +40,18 @@ import type {
   DataStoragePort,
   RuntimeAvailabilityPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
-import { type DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
+import type {
+  DataFileEnvelope,
+  GatewayClient,
+} from "@opendatalabs/vana-sdk/browser";
 import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
+import type {
+  AccessLogEntry,
+  AccessLogWriter,
+} from "@opendatalabs/personal-server-ts-core/logging/access-log";
+import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
+import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
+import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import {
   createStorageReadMethods,
   readEnvelopeFromMap,
@@ -51,10 +70,17 @@ export interface PsLiteReadAuthInput {
   fileId?: string;
 }
 
+export interface PsLiteReadAuthResult {
+  builder?: `0x${string}`;
+  grantId?: string;
+}
+
 export interface PsLiteAuthAdapter {
   authorizeOwner(request: Request): Promise<void>;
   authorizeBuilderList(request: Request): Promise<void>;
-  authorizeBuilderRead(input: PsLiteReadAuthInput): Promise<void>;
+  authorizeBuilderRead(
+    input: PsLiteReadAuthInput,
+  ): Promise<PsLiteReadAuthResult | void>;
 }
 
 export interface PsLiteRuntimeOptions {
@@ -63,7 +89,14 @@ export interface PsLiteRuntimeOptions {
   active?: boolean;
   now?: () => Date;
   config?: { server?: { origin?: string }; gateway?: { url?: string } };
+  saveConfig?: (config: unknown) => Promise<void>;
   identity?: { address: `0x${string}`; publicKey: `0x${string}` };
+  gateway?: GatewayClient;
+  serverOwner?: `0x${string}`;
+  serverSigner?: Pick<ServerSigner, "signGrantRegistration">;
+  syncManager?: Pick<SyncManager, "trigger" | "getStatus"> | null;
+  accessLogReader?: AccessLogReader;
+  accessLogWriter?: AccessLogWriter;
 }
 
 export interface PsLiteRuntime extends RuntimeAvailabilityPort {
@@ -179,6 +212,7 @@ export function createBearerTokenPsLiteAuth(
           reason: "No grantId in request",
         });
       }
+      return { grantId: input.grantId };
     },
   };
 }
@@ -261,7 +295,7 @@ export function createWeb3SignedPsLiteAuth(
           },
         );
       }
-      await verifyDataReadPolicy(
+      const grant = await verifyDataReadPolicy(
         {
           signer: verified.signer,
           grantId: verified.payload.grantId ?? input.grantId,
@@ -270,6 +304,7 @@ export function createWeb3SignedPsLiteAuth(
         },
         options.dataReadPolicyPorts,
       );
+      return { builder: verified.signer, grantId: grant.id };
     },
   };
 }
@@ -287,6 +322,33 @@ function toDataStoragePort(
     return storage;
   }
   return createMemoryPsLiteStorage(storage);
+}
+
+function createMemoryAccessLogStore(): AccessLogReader & AccessLogWriter {
+  const logs: AccessLogEntry[] = [];
+  return {
+    async write(entry) {
+      logs.push(entry);
+    },
+    async read(options) {
+      const limit = options?.limit ?? 50;
+      const offset = options?.offset ?? 0;
+      const sorted = [...logs].sort(
+        (a, b) =>
+          new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
+      );
+      return {
+        logs: sorted.slice(offset, offset + limit),
+        total: sorted.length,
+        limit,
+        offset,
+      };
+    },
+  };
+}
+
+function createLogId(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `log-${Date.now()}`;
 }
 
 export function createMemoryPsLiteStorage(
@@ -404,6 +466,9 @@ export function createPsLiteRuntime(
   const now = options.now ?? (() => new Date());
   const auth = options.auth ?? createMissingAuthAdapter();
   const dataStorage = toDataStoragePort(options.storage);
+  const accessLogStore = createMemoryAccessLogStore();
+  const accessLogReader = options.accessLogReader ?? accessLogStore;
+  const accessLogWriter = options.accessLogWriter ?? accessLogStore;
 
   async function withProtocolErrors(
     handler: () => Promise<Response> | Response,
@@ -416,6 +481,21 @@ export function createPsLiteRuntime(
       }
       return errorResponse(500, "INTERNAL_ERROR", "Internal server error");
     }
+  }
+
+  function sendContractResult(result: {
+    status: number;
+    body: unknown;
+  }): Response {
+    return jsonResponse(result.body, { status: result.status });
+  }
+
+  function gatewayRequiredResponse(): Response {
+    return errorResponse(
+      500,
+      "SERVER_NOT_CONFIGURED",
+      "Gateway is not configured",
+    );
   }
 
   return {
@@ -479,6 +559,156 @@ export function createPsLiteRuntime(
         }
 
         if (!url.pathname.startsWith(`${dataPrefix}/`)) {
+          const grantsPrefix = "/v1/grants";
+          if (
+            url.pathname === grantsPrefix ||
+            url.pathname === `${grantsPrefix}/`
+          ) {
+            if (request.method === "GET") {
+              await auth.authorizeOwner(request);
+              if (!options.gateway) return gatewayRequiredResponse();
+              return sendContractResult(
+                await listGrantsContract({
+                  gateway: options.gateway,
+                  serverOwner: options.serverOwner ?? options.identity?.address,
+                }),
+              );
+            }
+            if (request.method === "POST") {
+              await auth.authorizeOwner(request);
+              if (!options.gateway) return gatewayRequiredResponse();
+              let body: unknown;
+              try {
+                body = await request.json();
+              } catch {
+                return errorResponse(400, "INVALID_BODY", "Invalid JSON body");
+              }
+              return sendContractResult(
+                await createGrantContract({
+                  gateway: options.gateway,
+                  serverOwner: options.serverOwner ?? options.identity?.address,
+                  serverSigner: options.serverSigner,
+                  body,
+                  now: () => now().getTime(),
+                }),
+              );
+            }
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          }
+
+          if (url.pathname === `${grantsPrefix}/verify`) {
+            if (request.method !== "POST") {
+              return errorResponse(
+                405,
+                "METHOD_NOT_ALLOWED",
+                "Method not allowed",
+              );
+            }
+            let body: unknown;
+            try {
+              body = await request.json();
+            } catch {
+              return errorResponse(400, "INVALID_BODY", "Invalid JSON body");
+            }
+            return sendContractResult(await verifyGrantContract(body));
+          }
+
+          const accessLogsPrefix = "/v1/access-logs";
+          if (
+            url.pathname === accessLogsPrefix ||
+            url.pathname === `${accessLogsPrefix}/`
+          ) {
+            if (request.method !== "GET") {
+              return errorResponse(
+                405,
+                "METHOD_NOT_ALLOWED",
+                "Method not allowed",
+              );
+            }
+            await auth.authorizeOwner(request);
+            return sendContractResult(
+              await listAccessLogsContract({
+                accessLogReader,
+                limit: url.searchParams.get("limit"),
+                offset: url.searchParams.get("offset"),
+              }),
+            );
+          }
+
+          const syncPrefix = "/v1/sync";
+          if (url.pathname === `${syncPrefix}/trigger`) {
+            if (request.method !== "POST") {
+              return errorResponse(
+                405,
+                "METHOD_NOT_ALLOWED",
+                "Method not allowed",
+              );
+            }
+            await auth.authorizeOwner(request);
+            return sendContractResult(
+              await triggerSyncContract(options.syncManager ?? null),
+            );
+          }
+          if (url.pathname === `${syncPrefix}/status`) {
+            if (request.method !== "GET") {
+              return errorResponse(
+                405,
+                "METHOD_NOT_ALLOWED",
+                "Method not allowed",
+              );
+            }
+            await auth.authorizeOwner(request);
+            return sendContractResult(
+              getSyncStatusContract(options.syncManager ?? null),
+            );
+          }
+          if (url.pathname.startsWith(`${syncPrefix}/file/`)) {
+            if (request.method !== "POST") {
+              return errorResponse(
+                405,
+                "METHOD_NOT_ALLOWED",
+                "Method not allowed",
+              );
+            }
+            await auth.authorizeOwner(request);
+            const fileId = decodeURIComponent(
+              url.pathname.slice(`${syncPrefix}/file/`.length),
+            );
+            return sendContractResult(
+              await syncFileContract({
+                fileId,
+                syncManager: options.syncManager ?? null,
+              }),
+            );
+          }
+
+          if (url.pathname === "/ui/api/config") {
+            if (request.method === "GET") {
+              await auth.authorizeOwner(request);
+              return jsonResponse(options.config ?? {});
+            }
+            if (request.method === "PUT") {
+              await auth.authorizeOwner(request);
+              const parsed = await parseJsonObjectBody(request);
+              if (!parsed.ok) return sendContractResult(parsed.result);
+              const result = validateServerConfigContract(parsed.body);
+              if (!result.ok) return sendContractResult(result);
+              await options.saveConfig?.(
+                (result.body as { config: unknown }).config,
+              );
+              return sendContractResult(result);
+            }
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          }
+
           return errorResponse(404, "NOT_FOUND", "Not found");
         }
 
@@ -523,7 +753,7 @@ export function createPsLiteRuntime(
             fileId: url.searchParams.get("fileId") ?? undefined,
             at: url.searchParams.get("at") ?? undefined,
           });
-          await auth.authorizeBuilderRead({
+          const authResult = await auth.authorizeBuilderRead({
             request,
             scope,
             grantId,
@@ -539,6 +769,19 @@ export function createPsLiteRuntime(
             at: url.searchParams.get("at") ?? undefined,
           });
           if (!result.ok) return contractErrorResponse(result);
+          await accessLogWriter.write({
+            logId: createLogId(),
+            grantId: authResult?.grantId ?? grantId ?? "unknown",
+            builder: authResult?.builder ?? "unknown",
+            action: "read",
+            scope,
+            timestamp: now().toISOString(),
+            ipAddress:
+              request.headers.get("x-forwarded-for") ??
+              request.headers.get("x-real-ip") ??
+              "unknown",
+            userAgent: request.headers.get("user-agent") ?? "unknown",
+          });
           return jsonResponse(result.envelope);
         }
 
@@ -548,15 +791,32 @@ export function createPsLiteRuntime(
           if (!parsed.ok) {
             return parsed.response;
           }
+          let schemaUrl: string | undefined;
+          let schemaId: string | undefined;
+          if (options.gateway) {
+            const schema = await options.gateway.getSchemaForScope(scope);
+            if (!schema) {
+              return errorResponse(
+                400,
+                "NO_SCHEMA",
+                `No schema registered for scope: ${scope}`,
+              );
+            }
+            schemaUrl = schema.definitionUrl;
+            schemaId = schema.id;
+          }
           const collectedAt = now().toISOString();
           const result = await ingestDataContract({
             storage: dataStorage,
             scopeParam: scope,
             body: parsed.body,
             collectedAt,
-            status: "stored",
+            status: options.syncManager ? "syncing" : "stored",
+            schemaUrl,
+            schemaId,
           });
           if (!result.ok) return contractErrorResponse(result);
+          options.syncManager?.trigger().catch(() => undefined);
           return jsonResponse(result.response, { status: 201 });
         }
 

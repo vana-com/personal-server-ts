@@ -1,78 +1,23 @@
-import { timingSafeEqual } from "node:crypto";
 import type { MiddlewareHandler } from "hono";
 import {
-  ExpiredTokenError as SdkExpiredTokenError,
-  InvalidSignatureError as SdkInvalidSignatureError,
-  MissingAuthError as SdkMissingAuthError,
-  verifyWeb3Signed,
-  type Web3SignedPayload,
-} from "@opendatalabs/vana-sdk/node";
-import {
-  ExpiredTokenError,
-  InvalidSignatureError,
-  MissingAuthError,
-  ProtocolError,
-} from "@opendatalabs/personal-server-ts-core/errors";
+  authenticateRequest,
+  mapSdkAuthError,
+  type AuthMechanism,
+  type RequestAuth,
+  type SessionTokenVerifierPort,
+} from "@opendatalabs/personal-server-ts-core/auth";
+import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { TokenStore } from "../token-store.js";
 
-export type AuthMechanism =
-  | "web3-signed"
-  | "dev-token"
-  | "control-plane-token"
-  | "cli-session-token";
-
-export interface RequestAuth {
-  signer: `0x${string}`;
-  payload: Partial<Web3SignedPayload>;
-}
+export { mapSdkAuthError };
+export type { AuthMechanism, RequestAuth };
 
 export interface Web3AuthMiddlewareDeps {
   serverOrigin: string | (() => string);
   devToken?: string;
   accessToken?: string;
-  tokenStore?: TokenStore;
+  tokenStore?: TokenStore | SessionTokenVerifierPort;
   serverOwner?: `0x${string}`;
-}
-
-/**
- * Constant-time comparison of two strings.
- * Returns false if either string is empty or they differ in length.
- */
-function safeCompare(a: string, b: string): boolean {
-  if (a.length === 0 || b.length === 0) return false;
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(Buffer.from(a), Buffer.from(b));
-}
-
-function createOwnerSessionAuth(serverOwner: `0x${string}`): RequestAuth {
-  return {
-    signer: serverOwner,
-    // Bearer/session tokens authenticate the owner but do not carry Web3Signed claims.
-    payload: {},
-  };
-}
-
-function getErrorDetails(err: unknown): Record<string, unknown> | undefined {
-  if (err && typeof err === "object" && "details" in err) {
-    const details = err.details;
-    if (details && typeof details === "object" && !Array.isArray(details)) {
-      return details as Record<string, unknown>;
-    }
-  }
-  return undefined;
-}
-
-export function mapSdkAuthError(err: unknown): ProtocolError | null {
-  if (err instanceof SdkMissingAuthError) {
-    return new MissingAuthError(getErrorDetails(err));
-  }
-  if (err instanceof SdkInvalidSignatureError) {
-    return new InvalidSignatureError(getErrorDetails(err));
-  }
-  if (err instanceof SdkExpiredTokenError) {
-    return new ExpiredTokenError(getErrorDetails(err));
-  }
-  return null;
 }
 
 /**
@@ -97,103 +42,27 @@ export function createWeb3AuthMiddleware(
       : depsOrOrigin;
 
   return async (c, next) => {
-    const authHeader = c.req.header("authorization");
-
-    // Dev token bypass: if configured and header matches, skip Web3Signed verification
-    if (deps.devToken && authHeader === `Bearer ${deps.devToken}`) {
-      if (!deps.serverOwner) {
-        return c.json(
-          {
-            error: {
-              code: 500,
-              errorCode: "SERVER_NOT_CONFIGURED",
-              message:
-                "Server owner address not configured. Set VANA_MASTER_KEY_SIGNATURE environment variable.",
-            },
-          },
-          500,
-        );
-      }
-      c.set("auth", createOwnerSessionAuth(deps.serverOwner));
-      c.set("authMechanism", "dev-token" satisfies AuthMechanism);
-      c.set("isPolicyBypass", true);
-      c.set("devBypass", true);
-      await next();
-      return;
-    }
-
-    // Control-plane token: long-lived hosted credential used for session brokerage.
-    if (deps.accessToken && authHeader?.startsWith("Bearer ")) {
-      const token = authHeader.slice(7);
-      if (safeCompare(token, deps.accessToken)) {
-        if (!deps.serverOwner) {
-          return c.json(
-            {
-              error: {
-                code: 500,
-                errorCode: "SERVER_NOT_CONFIGURED",
-                message:
-                  "Server owner address not configured. Set VANA_MASTER_KEY_SIGNATURE environment variable.",
-              },
-            },
-            500,
-          );
-        }
-        c.set("auth", createOwnerSessionAuth(deps.serverOwner));
-        c.set("authMechanism", "control-plane-token" satisfies AuthMechanism);
-        c.set("isPolicyBypass", false);
-        c.set("devBypass", false);
-        await next();
-        return;
-      }
-    }
-
-    // Token store: tokens generated via /auth/device flow
-    if (deps.tokenStore && authHeader?.startsWith("Bearer ")) {
-      const token = authHeader.slice(7);
-      if (await deps.tokenStore.isValid(token)) {
-        if (!deps.serverOwner) {
-          return c.json(
-            {
-              error: {
-                code: 500,
-                errorCode: "SERVER_NOT_CONFIGURED",
-                message:
-                  "Server owner address not configured. Set VANA_MASTER_KEY_SIGNATURE environment variable.",
-              },
-            },
-            500,
-          );
-        }
-        c.set("auth", createOwnerSessionAuth(deps.serverOwner));
-        c.set("authMechanism", "cli-session-token" satisfies AuthMechanism);
-        c.set("isPolicyBypass", false);
-        c.set("devBypass", false);
-        await next();
-        return;
-      }
-    }
-
     try {
-      const auth = await verifyWeb3Signed({
-        headerValue: authHeader,
-        expectedOrigin:
-          typeof deps.serverOrigin === "function"
-            ? deps.serverOrigin()
-            : deps.serverOrigin,
-        expectedMethod: c.req.method,
-        expectedPath: new URL(c.req.url).pathname,
+      const result = await authenticateRequest({
+        request: c.req.raw,
+        serverOrigin: deps.serverOrigin,
+        devToken: deps.devToken,
+        accessToken: deps.accessToken,
+        sessionTokenVerifier: deps.tokenStore,
+        serverOwner: deps.serverOwner,
       });
 
-      c.set("auth", auth);
-      c.set("authMechanism", "web3-signed" satisfies AuthMechanism);
-      c.set("isPolicyBypass", false);
-      c.set("devBypass", false);
+      c.set("auth", result.auth);
+      c.set("authMechanism", result.mechanism satisfies AuthMechanism);
+      c.set("isPolicyBypass", result.isPolicyBypass);
+      c.set("devBypass", result.devBypass);
       await next();
     } catch (err) {
       const authError = mapSdkAuthError(err);
       if (authError) return c.json(authError.toJSON(), authError.code as 401);
-      if (err instanceof ProtocolError) return c.json(err.toJSON(), 401);
+      if (err instanceof ProtocolError) {
+        return c.json(err.toJSON(), err.code as 401 | 500);
+      }
       throw err;
     }
   };

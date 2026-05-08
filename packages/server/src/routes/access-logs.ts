@@ -6,6 +6,7 @@
 import { Hono } from "hono";
 import type { Logger } from "pino";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
+import { listAccessLogsContract } from "@opendatalabs/personal-server-ts-core/contracts";
 import type { TokenStore } from "../token-store.js";
 import { createWeb3AuthMiddleware } from "../middleware/web3-auth.js";
 import { createOwnerCheckMiddleware } from "../middleware/owner-check.js";
@@ -32,18 +33,12 @@ export function accessLogsRoutes(deps: AccessLogsRouteDeps): Hono {
 
   // GET / — list access logs with pagination (owner auth required)
   app.get("/", web3Auth, ownerCheck, async (c) => {
-    const limitParam = c.req.query("limit");
-    const offsetParam = c.req.query("offset");
-
-    const limit = limitParam !== undefined ? parseInt(limitParam, 10) : 50;
-    const offset = offsetParam !== undefined ? parseInt(offsetParam, 10) : 0;
-
-    const result = await deps.accessLogReader.read({
-      limit: Number.isNaN(limit) ? 50 : limit,
-      offset: Number.isNaN(offset) ? 0 : offset,
+    const result = await listAccessLogsContract({
+      accessLogReader: deps.accessLogReader,
+      limit: c.req.query("limit"),
+      offset: c.req.query("offset"),
     });
-
-    return c.json(result);
+    return c.json(result.body, result.status as 200);
   });
 
   return app;
