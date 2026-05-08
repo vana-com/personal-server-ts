@@ -1,9 +1,12 @@
 import {
   createBearerTokenPsLiteAuth,
   createIndexedDbPsLitePersistence,
+  createIndexedDbPsLiteStateStore,
   createMemoryPsLiteStorage,
   createPersistentPsLiteStorage,
   createPsLiteRuntime,
+  loadOrCreatePsLiteConfig,
+  loadOrCreatePsLiteServerIdentity,
   psLiteRelayPublicUrl,
   startPsLiteRelayClient,
   type PsLiteRelayClient,
@@ -18,6 +21,8 @@ const SAMPLE_SCOPE = "debug.local.profile";
 const SAMPLE_GRANT_ID = "debug-grant";
 const DEFAULT_CONTROL_URL = "wss://control.34.16.49.200.sslip.io:8443";
 const DEFAULT_PUBLIC_SUFFIX = "34.16.49.200.sslip.io";
+const DEBUG_OWNER_SIGNATURE =
+  "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
 
 type StorageMode = "indexeddb" | "memory";
 type AuthMode = "owner" | "builder" | "none" | "bad-builder";
@@ -70,6 +75,17 @@ function inferAuth(method: string): AuthMode {
 }
 
 async function makeRuntime(mode: StorageMode): Promise<PsLiteRuntime> {
+  const stateStore = createIndexedDbPsLiteStateStore({
+    dbName: "personal-server-lite-debug",
+    storeName: "state",
+  });
+  const config = await loadOrCreatePsLiteConfig(stateStore, {
+    server: { port: 443, origin: ORIGIN },
+  });
+  const identity = await loadOrCreatePsLiteServerIdentity({
+    store: stateStore,
+    ownerSignature: DEBUG_OWNER_SIGNATURE,
+  });
   const storage =
     mode === "indexeddb"
       ? await createPersistentPsLiteStorage(
@@ -89,6 +105,11 @@ async function makeRuntime(mode: StorageMode): Promise<PsLiteRuntime> {
       builderToken: BUILDER_TOKEN,
     }),
     active: true,
+    config,
+    identity: {
+      address: identity.account.address,
+      publicKey: identity.account.publicKey,
+    },
   });
   nextRuntime.activate();
   return nextRuntime;

@@ -3,17 +3,28 @@ import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { WriteResult } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { PsLiteStorageAdapter } from "./runtime.js";
-import {
-  createStorageReadMethods,
-  readEnvelopeFromMap,
-  sortEntries,
-} from "./storage-utils.js";
+import { createStorageReadMethods, sortEntries } from "./storage-utils.js";
 
 export interface PsLitePersistedStorageState {
   version: 1;
   nextId: number;
   entries: IndexEntry[];
   envelopes: DataFileEnvelope[];
+}
+
+export type PsLiteFileStorageKind = "opfs" | "indexeddb";
+
+export interface PsLiteDataFileStore {
+  readonly kind: PsLiteFileStorageKind;
+  readEnvelope(path: string): Promise<DataFileEnvelope | null>;
+  writeEnvelope(path: string, envelope: DataFileEnvelope): Promise<number>;
+  deleteEnvelope(path: string): Promise<void>;
+}
+
+export interface PsLiteStorageCapabilities {
+  metadata: "indexeddb" | "memory" | "custom";
+  files: PsLiteFileStorageKind | "memory";
+  opfsAvailable: boolean;
 }
 
 export interface PsLitePersistenceAdapter {
@@ -40,8 +51,8 @@ function initialState(): PsLitePersistedStorageState {
   };
 }
 
-function envelopeKey(scope: string, collectedAt: string): string {
-  return `${scope}\n${collectedAt}`;
+function envelopePath(scope: string, collectedAt: string): string {
+  return `data/${scope}/${collectedAt}.json`;
 }
 
 function normalizeState(
@@ -77,6 +88,120 @@ export function createMemoryPsLitePersistence(
     },
     async write(nextState) {
       state = cloneState(nextState);
+    },
+  };
+}
+
+export function createIndexedDbFallbackDataFileStore(
+  envelopes: Map<string, DataFileEnvelope>,
+): PsLiteDataFileStore {
+  return {
+    kind: "indexeddb",
+    async readEnvelope(path) {
+      return envelopes.get(path) ?? null;
+    },
+    async writeEnvelope(path, envelope) {
+      envelopes.set(path, envelope);
+      return new TextEncoder().encode(JSON.stringify(envelope)).length;
+    },
+    async deleteEnvelope(path) {
+      envelopes.delete(path);
+    },
+  };
+}
+
+export function createMemoryPsLiteDataFileStore(
+  kind: PsLiteFileStorageKind = "opfs",
+): PsLiteDataFileStore {
+  const files = new Map<string, DataFileEnvelope>();
+  return {
+    kind,
+    async readEnvelope(path) {
+      return files.get(path) ?? null;
+    },
+    async writeEnvelope(path, envelope) {
+      files.set(path, envelope);
+      return new TextEncoder().encode(JSON.stringify(envelope)).length;
+    },
+    async deleteEnvelope(path) {
+      files.delete(path);
+    },
+  };
+}
+
+async function getOrCreateOpfsDirectory(
+  root: FileSystemDirectoryHandle,
+  parts: string[],
+): Promise<FileSystemDirectoryHandle> {
+  let dir = root;
+  for (const part of parts) {
+    dir = await dir.getDirectoryHandle(part, { create: true });
+  }
+  return dir;
+}
+
+async function getOpfsFileHandle(
+  root: FileSystemDirectoryHandle,
+  path: string,
+  options?: FileSystemGetFileOptions,
+): Promise<FileSystemFileHandle> {
+  const parts = path.split("/").filter(Boolean);
+  const fileName = parts.pop();
+  if (!fileName) {
+    throw new Error("OPFS path must include a file name");
+  }
+  const dir = await getOrCreateOpfsDirectory(root, parts);
+  return dir.getFileHandle(fileName, options);
+}
+
+export async function isOpfsAvailable(): Promise<boolean> {
+  return (
+    typeof navigator !== "undefined" &&
+    typeof navigator.storage?.getDirectory === "function"
+  );
+}
+
+export async function createOpfsPsLiteDataFileStore(): Promise<PsLiteDataFileStore> {
+  if (!(await isOpfsAvailable())) {
+    throw new Error("OPFS is not available in this runtime");
+  }
+  const root = await navigator.storage.getDirectory();
+
+  return {
+    kind: "opfs",
+    async readEnvelope(path) {
+      try {
+        const handle = await getOpfsFileHandle(root, path);
+        const file = await handle.getFile();
+        return JSON.parse(await file.text()) as DataFileEnvelope;
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "NotFoundError") {
+          return null;
+        }
+        throw err;
+      }
+    },
+    async writeEnvelope(path, envelope) {
+      const encoded = JSON.stringify(envelope);
+      const handle = await getOpfsFileHandle(root, path, { create: true });
+      const writable = await handle.createWritable();
+      await writable.write(encoded);
+      await writable.close();
+      return new TextEncoder().encode(encoded).length;
+    },
+    async deleteEnvelope(path) {
+      const parts = path.split("/").filter(Boolean);
+      const fileName = parts.pop();
+      if (!fileName) return;
+      try {
+        const dir = await getOrCreateOpfsDirectory(root, parts);
+        await dir.removeEntry(fileName);
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "NotFoundError") {
+          return;
+        }
+        throw err;
+      }
     },
   };
 }
@@ -156,19 +281,34 @@ export function createIndexedDbPsLitePersistence(
 export async function createPersistentPsLiteStorage(
   adapter: PsLiteStorageAdapter,
   persistence: PsLitePersistenceAdapter = createIndexedDbPsLitePersistence(),
+  dataFileStore?: PsLiteDataFileStore,
 ): Promise<DataStoragePort> {
   let state = normalizeState(await persistence.read());
-  const envelopes = new Map(
+  const fallbackEnvelopes = new Map(
     state.envelopes.map((envelope) => [
-      envelopeKey(envelope.scope, envelope.collectedAt),
+      envelopePath(envelope.scope, envelope.collectedAt),
       envelope,
     ]),
   );
+  const fallbackStore = createIndexedDbFallbackDataFileStore(fallbackEnvelopes);
+  const fileStore =
+    dataFileStore ??
+    (adapter.kind !== "custom" && (await isOpfsAvailable())
+      ? await createOpfsPsLiteDataFileStore()
+      : fallbackStore);
+  const capabilities: PsLiteStorageCapabilities = {
+    metadata: adapter.kind === "custom" ? "custom" : "indexeddb",
+    files: fileStore.kind,
+    opfsAvailable: await isOpfsAvailable(),
+  };
 
   async function persist(): Promise<void> {
     state = {
       ...state,
-      envelopes: Array.from(envelopes.values()),
+      envelopes:
+        fileStore.kind === "indexeddb"
+          ? Array.from(fallbackEnvelopes.values())
+          : [],
     };
     await persistence.write(state);
   }
@@ -177,25 +317,35 @@ export async function createPersistentPsLiteStorage(
     return sortEntries(state.entries.filter((entry) => entry.scope === scope));
   }
 
-  return {
+  const storagePort: DataStoragePort & {
+    capabilities: PsLiteStorageCapabilities;
+  } = {
     kind: adapter.kind === "custom" ? "custom" : "browser-indexeddb-opfs",
+    capabilities,
     ...createStorageReadMethods(() => state.entries, entriesForScope),
 
     async readEnvelope(scope, collectedAt) {
-      return readEnvelopeFromMap(envelopes, envelopeKey(scope, collectedAt));
+      const path = envelopePath(scope, collectedAt);
+      const envelope =
+        (await fileStore.readEnvelope(path)) ??
+        (await fallbackStore.readEnvelope(path));
+      if (!envelope) {
+        throw new Error("Envelope not found");
+      }
+      return envelope;
     },
 
     async writeEnvelope(envelope): Promise<WriteResult> {
-      envelopes.set(
-        envelopeKey(envelope.scope, envelope.collectedAt),
-        envelope,
-      );
+      const path = envelopePath(envelope.scope, envelope.collectedAt);
+      const sizeBytes = await fileStore.writeEnvelope(path, envelope);
+      if (fileStore.kind !== "indexeddb") {
+        await fallbackStore.deleteEnvelope(path);
+      }
       await persist();
-      const path = `${envelope.scope}/${envelope.collectedAt}.json`;
       return {
         path,
         relativePath: path,
-        sizeBytes: new TextEncoder().encode(JSON.stringify(envelope)).length,
+        sizeBytes,
       };
     },
 
@@ -220,17 +370,25 @@ export async function createPersistentPsLiteStorage(
 
     async deleteScope(scope) {
       let deleted = 0;
+      const deletedPaths: string[] = [];
       state = {
         ...state,
         entries: state.entries.filter((entry) => {
           if (entry.scope !== scope) return true;
           deleted += 1;
-          envelopes.delete(envelopeKey(entry.scope, entry.collectedAt));
+          deletedPaths.push(envelopePath(entry.scope, entry.collectedAt));
           return false;
         }),
       };
+      await Promise.all(
+        deletedPaths.flatMap((path) => [
+          fileStore.deleteEnvelope(path),
+          fallbackStore.deleteEnvelope(path),
+        ]),
+      );
       await persist();
       return deleted;
     },
   };
+  return storagePort;
 }

@@ -1284,10 +1284,19 @@
         var summary = el("ps-lite-summary");
         var runtime = data && data.runtime ? data.runtime : {};
         var relay = data && data.relay ? data.relay : {};
+        var caps = runtime.capabilities || {};
+        var identity = runtime.identity || {};
         clearChildren(summary);
         [
           ["runtime", runtime.active ? "active" : "inactive"],
           ["storage", data.storageMode || runtime.storage || "unknown"],
+          [
+            "files",
+            caps.files
+              ? caps.files + (caps.opfsAvailable ? " (opfs available)" : "")
+              : "unknown",
+          ],
+          ["identity", identity.address || "not initialized"],
           ["relay", relay.status || "closed"],
           ["api url", relay.publicUrl || "not connected"],
         ].forEach(function (item) {

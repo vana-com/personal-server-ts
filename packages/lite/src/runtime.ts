@@ -38,6 +38,7 @@ import {
   readEnvelopeFromMap,
   sortEntries,
 } from "./storage-utils.js";
+import type { PsLiteStorageCapabilities } from "./storage.js";
 
 export interface PsLiteStorageAdapter {
   kind: "indexeddb" | "opfs" | "custom";
@@ -61,6 +62,8 @@ export interface PsLiteRuntimeOptions {
   auth?: PsLiteAuthAdapter;
   active?: boolean;
   now?: () => Date;
+  config?: { server?: { origin?: string }; gateway?: { url?: string } };
+  identity?: { address: `0x${string}`; publicKey: `0x${string}` };
 }
 
 export interface PsLiteRuntime extends RuntimeAvailabilityPort {
@@ -303,8 +306,15 @@ export function createMemoryPsLiteStorage(
     );
   }
 
-  return {
+  const storagePort: DataStoragePort & {
+    capabilities: PsLiteStorageCapabilities;
+  } = {
     kind: adapter.kind === "custom" ? "custom" : "browser-indexeddb-opfs",
+    capabilities: {
+      metadata: "memory",
+      files: "memory",
+      opfsAvailable: false,
+    } satisfies PsLiteStorageCapabilities,
     ...createStorageReadMethods(() => entries.values(), entriesForScope),
 
     async readEnvelope(scope, collectedAt) {
@@ -347,6 +357,7 @@ export function createMemoryPsLiteStorage(
       return deleted;
     },
   };
+  return storagePort;
 }
 
 function parseScope(pathPart: string): string | Response {
@@ -424,10 +435,19 @@ export function createPsLiteRuntime(
         const url = new URL(request.url);
 
         if (url.pathname === "/health") {
+          const capabilities = (
+            dataStorage as DataStoragePort & {
+              capabilities?: PsLiteStorageCapabilities;
+            }
+          ).capabilities;
           return jsonResponse({
             status: active ? "healthy" : "unavailable",
             runtime: "ps-lite",
             storage: options.storage.kind,
+            capabilities: capabilities ?? null,
+            apiOrigin: options.config?.server?.origin ?? url.origin,
+            gatewayUrl: options.config?.gateway?.url ?? null,
+            identity: options.identity ?? null,
             active,
             checkedAt: now().toISOString(),
           });

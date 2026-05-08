@@ -6,12 +6,32 @@ export {
 
 export {
   createIndexedDbPsLitePersistence,
+  createMemoryPsLiteDataFileStore,
   createMemoryPsLitePersistence,
+  createOpfsPsLiteDataFileStore,
   createPersistentPsLiteStorage,
+  isOpfsAvailable,
   type IndexedDbPsLitePersistenceOptions,
+  type PsLiteDataFileStore,
+  type PsLiteFileStorageKind,
   type PsLitePersistedStorageState,
   type PsLitePersistenceAdapter,
 } from "./storage.js";
+
+export {
+  createIndexedDbPsLiteStateStore,
+  createMemoryPsLiteStateStore,
+  loadOrCreatePsLiteConfig,
+  loadOrCreatePsLiteServerIdentity,
+  savePsLiteConfig,
+  type IndexedDbPsLiteStateStoreOptions,
+  type PsLiteEncryptedPrivateKey,
+  type PsLiteEncryptedServerIdentity,
+  type PsLiteRelayState,
+  type PsLiteStateKey,
+  type PsLiteStateStore,
+  type PsLiteUnlockedServerIdentity,
+} from "./state.js";
 
 export {
   createBearerTokenPsLiteAuth,

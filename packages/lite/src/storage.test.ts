@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
+  createMemoryPsLiteDataFileStore,
   createMemoryPsLitePersistence,
   createPersistentPsLiteStorage,
 } from "./storage.js";
@@ -119,5 +120,46 @@ describe("createPersistentPsLiteStorage", () => {
       ],
       total: 1,
     });
+  });
+
+  it("stores envelope JSON in the file store and metadata in persistence", async () => {
+    const persistence = createMemoryPsLitePersistence();
+    const fileStore = createMemoryPsLiteDataFileStore("opfs");
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      persistence,
+      fileStore,
+    );
+    const envelope = createDataFileEnvelope(
+      "instagram.profile",
+      "2026-05-08T00:00:00.000Z",
+      { username: "opfs_user" },
+    );
+
+    const write = await storage.writeEnvelope(envelope);
+    storage.insertEntry({
+      fileId: "file-1",
+      path: write.relativePath,
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      sizeBytes: write.sizeBytes,
+    });
+
+    await expect(
+      fileStore.readEnvelope(
+        "data/instagram.profile/2026-05-08T00:00:00.000Z.json",
+      ),
+    ).resolves.toMatchObject({ data: { username: "opfs_user" } });
+    await expect(persistence.read()).resolves.toMatchObject({
+      envelopes: [],
+      entries: [{ path: write.relativePath }],
+    });
+    expect(
+      (
+        storage as typeof storage & {
+          capabilities?: { files: string; metadata: string };
+        }
+      ).capabilities,
+    ).toMatchObject({ metadata: "indexeddb", files: "opfs" });
   });
 });
