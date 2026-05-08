@@ -122,7 +122,7 @@ if (violations.length > 0) {
     [
       "vana-sdk validation failed.",
       "Root imports from @opendatalabs/vana-sdk are forbidden; use /node or /browser.",
-      `${SDK_PACKAGE} must resolve from the sibling ../vana-sdk checkout while PR 137 is active.`,
+      `${SDK_PACKAGE} must resolve from the sibling ../vana-sdk checkout on main.`,
       ...violations.map((violation) => `- ${violation}`),
     ].join("\n"),
   );
