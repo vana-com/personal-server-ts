@@ -139,6 +139,9 @@ export async function createServer(
   const masterKeySignature = process.env.VANA_MASTER_KEY_SIGNATURE as
     | `0x${string}`
     | undefined;
+  const ownerPrivateKey = process.env.VANA_OWNER_PRIVATE_KEY as
+    | `0x${string}`
+    | undefined;
   let serverOwner: `0x${string}` | undefined;
 
   let serverAccount: ServerAccount | undefined;
@@ -304,6 +307,7 @@ export async function createServer(
     dataStorage,
     cloudMode,
     devToken,
+    ownerPrivateKey,
     accessToken,
     tokenStore,
     configPath,

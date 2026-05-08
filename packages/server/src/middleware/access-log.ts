@@ -22,16 +22,22 @@ export function createAccessLogMiddleware(
     const auth = c.get("auth") as RequestAuth | undefined;
     const grant = c.get("grant") as GatewayGrantResponse | undefined;
 
-    if (!auth || !grant) {
+    if (!auth) {
       return;
     }
+    const grantId =
+      grant?.id ??
+      (c.get("isPolicyBypass") || c.get("devBypass")
+        ? "policy-bypass"
+        : undefined);
+    if (!grantId) return;
 
     const scope = c.req.param("scope") ?? "unknown";
 
     try {
       await writer.write({
         logId: randomUUID(),
-        grantId: grant.id,
+        grantId,
         builder: auth.signer,
         action: "read",
         scope,

@@ -56,6 +56,23 @@
         color: var(--accent);
       }
 
+      .header-spacer {
+        flex: 1;
+      }
+
+      .runtime-picker {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--text-dim);
+        font-size: 12px;
+      }
+
+      .runtime-picker select {
+        width: auto;
+        min-width: 128px;
+      }
+
       header .status-dot {
         width: 8px;
         height: 8px;
@@ -318,6 +335,14 @@
     <header>
       <div class="status-dot"></div>
       <h1>PERSONAL SERVER</h1>
+      <div class="header-spacer"></div>
+      <label class="runtime-picker">
+        <span>Runtime</span>
+        <select id="runtime-select">
+          <option value="node">Node</option>
+          <option value="browser">Browser</option>
+        </select>
+      </label>
     </header>
 
     <nav id="tabs">
@@ -327,7 +352,6 @@
       <button data-tab="grants">Grants</button>
       <button data-tab="logs">Access Logs</button>
       <button data-tab="api">API Tester</button>
-      <button data-tab="ps-lite">PS Lite</button>
       <button data-tab="connect">Connect</button>
     </nav>
 
@@ -527,10 +551,6 @@
               <option>PUT</option>
               <option>DELETE</option>
             </select>
-            <select id="api-runtime">
-              <option value="local">Local PS</option>
-              <option value="ps-lite">Browser PS Lite</option>
-            </select>
             <input
               id="api-path"
               type="text"
@@ -551,77 +571,6 @@
             style="margin-bottom: 8px; font-size: 12px; color: var(--text-dim)"
           ></div>
           <pre class="json" id="api-response">No request sent yet.</pre>
-        </div>
-      </div>
-
-      <!-- PS Lite Panel -->
-      <div id="panel-ps-lite" class="panel">
-        <div class="card">
-          <div class="card-title">Browser PS Lite</div>
-          <div class="toolbar">
-            <button class="btn secondary" id="ps-lite-gateway-schema-btn">
-              Gateway Schema
-            </button>
-            <button class="btn" id="ps-lite-smoke-btn">Storage Smoke</button>
-            <button class="btn secondary" id="ps-lite-auth-btn">
-              Auth Smoke
-            </button>
-            <button class="btn secondary" id="ps-lite-auth-routes-btn">
-              Auth Routes
-            </button>
-            <button class="btn secondary" id="ps-lite-delete-btn">
-              Delete Smoke
-            </button>
-            <button class="btn secondary" id="ps-lite-sync-btn">
-              Sync Smoke
-            </button>
-            <button class="btn secondary" id="ps-lite-sync-status-btn">
-              Sync Status
-            </button>
-            <button class="btn secondary" id="ps-lite-health-btn">
-              Health
-            </button>
-            <button class="btn secondary" id="ps-lite-register-btn">
-              Register Server
-            </button>
-            <button class="btn secondary" id="ps-lite-activate-btn">
-              Activate
-            </button>
-            <button class="btn secondary" id="ps-lite-deactivate-btn">
-              Deactivate
-            </button>
-            <button class="btn secondary" id="ps-lite-reset-btn">Reset</button>
-          </div>
-          <div class="toolbar">
-            <input
-              id="ps-lite-relay-control-url"
-              type="text"
-              value="wss://control.34.16.49.200.sslip.io:8443"
-              style="flex: 1"
-            />
-            <input
-              id="ps-lite-relay-public-suffix"
-              type="text"
-              value="34.16.49.200.sslip.io"
-              style="width: 220px"
-            />
-            <button class="btn secondary" id="ps-lite-relay-connect-btn">
-              Connect Relay
-            </button>
-            <button class="btn secondary" id="ps-lite-relay-disconnect-btn">
-              Disconnect
-            </button>
-          </div>
-          <div class="kv-grid" id="ps-lite-summary" style="margin-bottom: 12px">
-            <span class="label">runtime</span
-            ><span class="value">loading...</span>
-            <span class="label">relay</span><span class="value">closed</span>
-          </div>
-          <div
-            id="ps-lite-status"
-            style="margin-bottom: 8px; font-size: 12px; color: var(--text-dim)"
-          ></div>
-          <pre class="json" id="ps-lite-response">No request sent yet.</pre>
         </div>
       </div>
 
@@ -721,6 +670,10 @@
     <script>
       const TOKEN = "__DEV_TOKEN__";
       const BASE = window.location.origin;
+      const runtimeState = {
+        active: "node",
+        registration: { ownerPrivateKeyConfigured: false },
+      };
 
       // --- DOM helpers ---
       function el(id) {
@@ -802,7 +755,6 @@
         if (tab === "data") loadScopes();
         if (tab === "grants") loadGrants();
         if (tab === "logs") loadAccessLogs();
-        if (tab === "ps-lite") psLiteRequest("health", "health");
       });
 
       // --- Fetch helper ---
@@ -826,17 +778,102 @@
         return { status: res.status, ok: res.ok, data: json };
       }
 
+      async function runtimeApi(path, opts) {
+        return runtimeState.active === "browser"
+          ? psLiteApiRequest(path, opts)
+          : api(path, opts);
+      }
+
+      function runtimeName() {
+        return runtimeState.active === "browser" ? "Browser" : "Node";
+      }
+
+      async function loadRegistrationStatus() {
+        try {
+          var result = await api("/ui/api/registration");
+          if (result.ok && result.data) {
+            runtimeState.registration = result.data;
+          }
+        } catch (e) {
+          runtimeState.registration = { ownerPrivateKeyConfigured: false };
+        }
+        updateRegisterButton();
+      }
+
+      function selectedPanel() {
+        var active = document.querySelector("#tabs button.active");
+        return active ? active.dataset.tab : "health";
+      }
+
+      function refreshSelectedPanel() {
+        var tab = selectedPanel();
+        if (tab === "health") loadHealth();
+        if (tab === "config") loadConfig();
+        if (tab === "data") loadScopes();
+        if (tab === "grants") loadGrants();
+        if (tab === "logs") loadAccessLogs();
+      }
+
+      function updateRegisterButton() {
+        var btn = el("register-node-server-btn");
+        if (!btn) return;
+        btn.disabled = !runtimeState.registration.ownerPrivateKeyConfigured;
+        btn.title = btn.disabled
+          ? "Set VANA_OWNER_PRIVATE_KEY to register servers"
+          : "Register selected runtime";
+      }
+
+      async function selectedHealth() {
+        if (runtimeState.active === "node") return api("/health");
+
+        var result = await psLiteClient().status();
+        var data = result.data || {};
+        var runtime = data.runtime || {};
+        var relay = data.relay || {};
+        var registration = runtime.registration;
+        if (registration && relay.publicUrl) {
+          registration = Object.assign({}, registration, {
+            serverUrl: relay.publicUrl,
+          });
+        }
+        return {
+          status: result.status,
+          ok: result.ok,
+          data: Object.assign({}, runtime, {
+            apiOrigin: relay.publicUrl || runtime.apiOrigin,
+            registration: registration,
+            relay: relay,
+            runtime: {
+              kind: "ps-lite",
+              available: runtime.active !== false,
+            },
+          }),
+        };
+      }
+
+      el("runtime-select").addEventListener("change", function (e) {
+        runtimeState.active = e.target.value;
+        el("node-registration-status").textContent = "";
+        refreshSelectedPanel();
+      });
+
       // --- Health ---
       async function loadHealth() {
         var container = el("health-content");
         try {
-          var result = await api("/health");
+          await loadRegistrationStatus();
+          var result = await selectedHealth();
           var d = result.data;
           clearChildren(container);
           var items = [
+            ["runtime", runtimeName(), result.ok ? "ok" : "err"],
             ["status", d.status, d.status === "healthy" ? "ok" : "err"],
-            ["version", d.version, ""],
-            ["uptime", formatUptime(d.uptime), ""],
+            ["version", d.version || "\u2014", ""],
+            [
+              "uptime",
+              typeof d.uptime === "number" ? formatUptime(d.uptime) : "\u2014",
+              "",
+            ],
             [
               "api url",
               d.apiOrigin || BASE,
@@ -844,8 +881,28 @@
             ],
             ["owner", d.owner ?? "not configured", d.owner ? "ok" : "err"],
           ];
+          if (runtimeState.active === "browser") {
+            items.push([
+              "relay",
+              d.relay && d.relay.connected
+                ? "connected"
+                : d.relay
+                  ? d.relay.status
+                  : "disconnected",
+              d.relay && d.relay.connected ? "ok" : "warn",
+            ]);
+          } else if (d.tunnel) {
+            items.push([
+              "tunnel",
+              d.tunnel.status || "unknown",
+              d.tunnel.publicUrl ? "ok" : "warn",
+            ]);
+          }
           if (d.identity) {
-            var registered = d.identity.serverId !== null;
+            var registered =
+              d.registration && typeof d.registration.registered === "boolean"
+                ? d.registration.registered
+                : d.identity.serverId !== null;
             items.push([
               "address",
               d.identity.address,
@@ -894,13 +951,15 @@
             container.appendChild(lbl);
             container.appendChild(val);
           }
-          if (d.identity && d.identity.serverId === null) {
+          if (d.identity && !(d.registration && d.registration.registered)) {
             var noteEl = createEl("span", {
               class: "label",
               style: { gridColumn: "1 / -1", marginTop: "8px" },
             });
-            noteEl.textContent =
-              "Register this server from the parent app once the API URL is reachable.";
+            noteEl.textContent = runtimeState.registration
+              .ownerPrivateKeyConfigured
+              ? "Register this runtime once the public API URL is reachable."
+              : "Set VANA_OWNER_PRIVATE_KEY to enable server registration.";
             noteEl.style.color = "var(--text-dim)";
             noteEl.style.fontSize = "11px";
             noteEl.style.fontStyle = "italic";
@@ -919,14 +978,22 @@
 
       async function registerNodeServer() {
         var statusEl = el("node-registration-status");
-        statusEl.textContent = "Registering server...";
+        statusEl.textContent = "Registering " + runtimeName() + " server...";
         try {
-          var health = await api("/health");
-          var result = await psLiteClient().registerFromHealth(health.data);
+          var health = await selectedHealth();
+          var result = await api("/ui/api/registration/server", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              gatewayConfig: health.data.gatewayConfig,
+              registration: health.data.registration,
+            }),
+          });
           statusEl.style.color = result.ok ? "var(--accent)" : "var(--error)";
           statusEl.textContent = result.ok
-            ? "Registered server"
-            : "Registration failed";
+            ? "Registered " + runtimeName() + " server"
+            : (result.data && result.data.error && result.data.error.message) ||
+              "Registration failed";
           await loadHealth();
         } catch (e) {
           statusEl.style.color = "var(--error)";
@@ -950,11 +1017,11 @@
         var msg = el("config-msg");
         clearChildren(msg);
         try {
-          var result = await api("/ui/api/config");
+          var result = await runtimeApi("/ui/api/config", { auth: "owner" });
           if (result.ok) {
             editor.value = JSON.stringify(result.data, null, 2);
           } else {
-            showMsg(msg, "Failed to load config", "err");
+            showMsg(msg, "Failed to load " + runtimeName() + " config", "err");
           }
         } catch (e) {
           showMsg(msg, "Error loading config", "err");
@@ -975,7 +1042,7 @@
         }
 
         try {
-          var result = await api("/ui/api/config", {
+          var result = await runtimeApi("/ui/api/config", {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
@@ -1012,21 +1079,62 @@
         showLoading(container);
 
         try {
-          var result = await api("/v1/data?limit=100");
+          var result = await runtimeApi("/v1/data?limit=100");
           if (!result.ok) {
             showJson(container, result.data);
             return;
           }
           if (!result.data.scopes || result.data.scopes.length === 0) {
-            showEmpty(container, "No data scopes found.");
+            showEmpty(container, "No " + runtimeName() + " data scopes found.");
             return;
           }
+
+          var syncResult = await runtimeApi("/v1/sync/status", {
+            auth: "owner",
+          }).catch(function (e) {
+            return { ok: false, data: { error: e.message } };
+          });
+          var health = await selectedHealth().catch(function () {
+            return { data: {} };
+          });
+          var latestByScope = {};
+          var fileIds = [];
+          for (var vIdx = 0; vIdx < result.data.scopes.length; vIdx++) {
+            var scopeItem = result.data.scopes[vIdx];
+            var scopeName =
+              typeof scopeItem === "string"
+                ? scopeItem
+                : scopeItem.scope || JSON.stringify(scopeItem);
+            var versions = await runtimeApi(
+              "/v1/data/" + encodeURIComponent(scopeName) + "/versions?limit=1",
+            ).catch(function (e) {
+              return { ok: false, data: { error: e.message } };
+            });
+            var latest =
+              versions.ok &&
+              versions.data &&
+              versions.data.versions &&
+              versions.data.versions.length > 0
+                ? versions.data.versions[0]
+                : null;
+            latestByScope[scopeName] = latest;
+            if (latest && latest.fileId) fileIds.push(latest.fileId);
+          }
+          var rpcFiles = await verifyRpcFiles(
+            health.data && health.data.gatewayUrl,
+            Array.from(new Set(fileIds)),
+          ).catch(function () {
+            return {};
+          });
 
           clearChildren(container);
           var table = createEl("table");
           var thead = createEl("thead");
           var headRow = createEl("tr", null, [
             createEl("th", null, "Scope"),
+            createEl("th", null, "Local"),
+            createEl("th", null, "RPC"),
+            createEl("th", null, "Sync"),
             createEl("th", null, "Actions"),
           ]);
           thead.appendChild(headRow);
@@ -1042,6 +1150,48 @@
             var tr = createEl("tr");
             var tdScope = createEl("td");
             tdScope.textContent = s;
+            var latestVersion = latestByScope[s];
+            var tdLocal = createEl("td");
+            tdLocal.textContent =
+              latestVersion && latestVersion.fileId ? "file id" : "unsynced";
+            tdLocal.style.color =
+              latestVersion && latestVersion.fileId
+                ? "var(--accent)"
+                : "var(--warn)";
+            var tdRpc = createEl("td");
+            if (latestVersion && latestVersion.fileId) {
+              var rpc = rpcFiles[latestVersion.fileId];
+              tdRpc.textContent = rpc
+                ? rpc.registered
+                  ? "registered"
+                  : "missing"
+                : "unknown";
+              tdRpc.style.color =
+                rpc && rpc.registered
+                  ? "var(--accent)"
+                  : rpc
+                    ? "var(--error)"
+                    : "var(--text-dim)";
+            } else {
+              tdRpc.textContent = "\u2014";
+              tdRpc.style.color = "var(--text-dim)";
+            }
+            var tdSync = createEl("td");
+            var syncData = syncResult.data || {};
+            tdSync.textContent =
+              syncData.enabled === false
+                ? "disabled"
+                : syncData.running
+                  ? "running"
+                  : syncResult.ok
+                    ? "idle"
+                    : "unavailable";
+            tdSync.style.color =
+              syncData.enabled === false
+                ? "var(--text-dim)"
+                : syncResult.ok
+                  ? "var(--accent)"
+                  : "var(--warn)";
             var tdActions = createEl("td");
             var btnView = createEl("button", { class: "btn secondary" });
             btnView.textContent = "View Latest";
@@ -1069,6 +1219,9 @@
             tdActions.appendChild(btnView);
             tdActions.appendChild(btnVer);
             tr.appendChild(tdScope);
+            tr.appendChild(tdLocal);
+            tr.appendChild(tdRpc);
+            tr.appendChild(tdSync);
             tr.appendChild(tdActions);
             tbody.appendChild(tr);
           }
@@ -1080,6 +1233,18 @@
       }
 
       el("refresh-data-btn").addEventListener("click", loadScopes);
+
+      async function verifyRpcFiles(gatewayUrl, fileIds) {
+        if (!gatewayUrl || fileIds.length === 0) return {};
+        var result = await api("/ui/api/rpc/files", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ gatewayUrl: gatewayUrl, fileIds: fileIds }),
+        });
+        return result.ok && result.data && result.data.files
+          ? result.data.files
+          : {};
+      }
 
       async function submitData() {
         var msg = el("add-data-msg");
@@ -1114,11 +1279,14 @@
         }
 
         try {
-          var result = await api("/v1/data/" + encodeURIComponent(scope), {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(parsed),
-          });
+          var result = await runtimeApi(
+            "/v1/data/" + encodeURIComponent(scope),
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(parsed),
+            },
+          );
           if (result.ok) {
             var collectedAt =
               (result.data && result.data.collectedAt) || "unknown";
@@ -1155,7 +1323,11 @@
         showLoading(content);
 
         try {
-          var result = await api("/v1/data/" + encodeURIComponent(scope));
+          var path = "/v1/data/" + encodeURIComponent(scope);
+          if (runtimeState.active === "browser") {
+            path += "?grantId=debug-grant";
+          }
+          var result = await runtimeApi(path);
           showJson(content, result.data);
         } catch (e) {
           showMsg(content, "Error: " + e.message, "err");
@@ -1169,7 +1341,7 @@
         showLoading(content);
 
         try {
-          var result = await api(
+          var result = await runtimeApi(
             "/v1/data/" + encodeURIComponent(scope) + "/versions",
           );
           if (!result.data.versions || result.data.versions.length === 0) {
@@ -1212,7 +1384,7 @@
         showLoading(container);
 
         try {
-          var result = await api("/v1/grants");
+          var result = await runtimeApi("/v1/grants", { auth: "owner" });
           if (!result.ok) {
             showJson(container, result.data);
             return;
@@ -1272,13 +1444,15 @@
         showLoading(container);
 
         try {
-          var result = await api("/v1/access-logs?limit=50");
+          var result = await runtimeApi("/v1/access-logs?limit=50", {
+            auth: "owner",
+          });
           if (!result.ok) {
             showJson(container, result.data);
             return;
           }
 
-          var entries = result.data.entries || result.data;
+          var entries = result.data.logs || result.data.entries || result.data;
           if (!Array.isArray(entries) || entries.length === 0) {
             showEmpty(container, "No access logs found.");
             return;
@@ -1341,10 +1515,7 @@
         }
 
         try {
-          var result =
-            el("api-runtime").value === "ps-lite"
-              ? await psLiteApiRequest(path, opts)
-              : await api(path, opts);
+          var result = await runtimeApi(path, opts);
           var color =
             result.status < 300
               ? "var(--accent)"
@@ -1373,10 +1544,10 @@
 
       el("send-api-btn").addEventListener("click", sendApiRequest);
 
-      // --- PS Lite Debug ---
+      // --- Browser Runtime Bridge ---
       function psLiteClient() {
         if (!window.psLiteDebug) {
-          throw new Error("PS Lite browser bundle is still loading");
+          throw new Error("Browser runtime bundle is still loading");
         }
         return window.psLiteDebug;
       }
@@ -1394,180 +1565,19 @@
         return psLiteClient().request(path, {
           method: opts.method || "GET",
           body: body,
+          auth: opts.auth,
+          headers: opts.headers,
         });
       }
 
-      function renderPsLiteSummary(data) {
-        var summary = el("ps-lite-summary");
-        var runtime = data && data.runtime ? data.runtime : {};
-        var relay = data && data.relay ? data.relay : {};
-        var caps = runtime.capabilities || {};
-        var identity = runtime.identity || {};
-        var registration = runtime.registration || {};
-        clearChildren(summary);
-        [
-          ["runtime", runtime.active ? "active" : "inactive"],
-          ["storage", data.storageMode || runtime.storage || "unknown"],
-          [
-            "files",
-            caps.files
-              ? caps.files + (caps.opfsAvailable ? " (opfs available)" : "")
-              : "unknown",
-          ],
-          ["identity", identity.address || "not initialized"],
-          [
-            "registration",
-            registration.registered ? "registered" : "not registered",
-          ],
-          ["relay", relay.status || "closed"],
-          ["api url", relay.publicUrl || "not connected"],
-        ].forEach(function (item) {
-          var label = createEl("span", { class: "label" });
-          label.textContent = item[0];
-          var value = createEl("span", { class: "value" });
-          value.textContent = item[1];
-          summary.appendChild(label);
-          summary.appendChild(value);
-        });
-      }
-
-      async function refreshPsLiteSummary() {
-        try {
-          var result = await psLiteClient().status();
-          renderPsLiteSummary(result.data);
-        } catch (e) {
-          renderPsLiteSummary({
-            runtime: { active: false },
-            relay: { status: "unavailable" },
-          });
-        }
-      }
-
-      async function psLiteRequest(label, action, opts) {
-        var statusEl = el("ps-lite-status");
-        var responseEl = el("ps-lite-response");
-        opts = opts || {};
-        statusEl.textContent = "Sending " + label + "...";
-        responseEl.textContent = "";
-
-        try {
-          var client = psLiteClient();
-          var result;
-          if (action === "health") {
-            result = await client.status();
-          } else if (action === "activate") {
-            result = await client.activate();
-          } else if (action === "deactivate") {
-            result = await client.deactivate();
-          } else if (action === "reset") {
-            result = await client.reset("indexeddb");
-          } else if (action === "gateway-schema-smoke") {
-            result = await client.gatewaySchemaSmoke();
-          } else if (action === "storage-smoke") {
-            result = await client.storageSmoke();
-          } else if (action === "auth-smoke") {
-            result = await client.authSmoke();
-          } else if (action === "auth-routes-smoke") {
-            result = await client.authRoutesSmoke();
-          } else if (action === "delete-smoke") {
-            result = await client.deleteSmoke();
-          } else if (action === "sync-smoke") {
-            result = await client.syncSmoke();
-          } else if (action === "sync-status") {
-            result = await client.syncStatus();
-          } else if (action === "register-lite") {
-            result = await client.registerLiteServer();
-          } else if (action === "connect-relay") {
-            result = await client.connectRelay({
-              controlUrl: el("ps-lite-relay-control-url").value.trim(),
-              publicSuffix: el("ps-lite-relay-public-suffix").value.trim(),
-            });
-          } else if (action === "disconnect-relay") {
-            result = await client.disconnectRelay();
-          } else {
-            result = await client.request(action, opts);
-          }
-          var color =
-            result.status < 300
-              ? "var(--accent)"
-              : result.status < 500
-                ? "var(--warn)"
-                : "var(--error)";
-          clearChildren(statusEl);
-          var statusSpan = createEl("span");
-          statusSpan.textContent = result.status;
-          statusSpan.style.color = color;
-          statusEl.appendChild(statusSpan);
-          statusEl.appendChild(text(" " + label));
-          responseEl.textContent =
-            typeof result.data === "string"
-              ? result.data
-              : JSON.stringify(result.data, null, 2);
-          if (result.data && result.data.runtime && result.data.relay) {
-            renderPsLiteSummary(result.data);
-          } else {
-            await refreshPsLiteSummary();
-          }
-        } catch (e) {
-          clearChildren(statusEl);
-          var errSpan = createEl("span");
-          errSpan.textContent = "Error";
-          errSpan.style.color = "var(--error)";
-          statusEl.appendChild(errSpan);
-          responseEl.textContent = e.message;
-        }
-      }
-
-      el("ps-lite-health-btn").addEventListener("click", function () {
-        psLiteRequest("health", "health");
+      window.addEventListener("ps-lite-relay-status", function () {
+        if (runtimeState.active === "browser") refreshSelectedPanel();
       });
-      el("ps-lite-activate-btn").addEventListener("click", function () {
-        psLiteRequest("activate", "activate");
-      });
-      el("ps-lite-deactivate-btn").addEventListener("click", function () {
-        psLiteRequest("deactivate", "deactivate");
-      });
-      el("ps-lite-reset-btn").addEventListener("click", function () {
-        psLiteRequest("reset", "reset");
-      });
-      el("ps-lite-gateway-schema-btn").addEventListener("click", function () {
-        psLiteRequest("gateway schema", "gateway-schema-smoke");
-      });
-      el("ps-lite-smoke-btn").addEventListener("click", function () {
-        psLiteRequest("storage smoke", "storage-smoke");
-      });
-      el("ps-lite-auth-btn").addEventListener("click", function () {
-        psLiteRequest("auth smoke", "auth-smoke");
-      });
-      el("ps-lite-auth-routes-btn").addEventListener("click", function () {
-        psLiteRequest("auth routes", "auth-routes-smoke");
-      });
-      el("ps-lite-delete-btn").addEventListener("click", function () {
-        psLiteRequest("delete smoke", "delete-smoke");
-      });
-      el("ps-lite-sync-btn").addEventListener("click", function () {
-        psLiteRequest("sync smoke", "sync-smoke");
-      });
-      el("ps-lite-sync-status-btn").addEventListener("click", function () {
-        psLiteRequest("sync status", "sync-status");
-      });
-      el("ps-lite-register-btn").addEventListener("click", function () {
-        psLiteRequest("register server", "register-lite");
-      });
-      el("ps-lite-relay-connect-btn").addEventListener("click", function () {
-        psLiteRequest("connect relay", "connect-relay");
-      });
-      el("ps-lite-relay-disconnect-btn").addEventListener("click", function () {
-        psLiteRequest("disconnect relay", "disconnect-relay");
-      });
-      window.addEventListener("ps-lite-relay-status", refreshPsLiteSummary);
       window.addEventListener("ps-lite-relay-log", function (event) {
-        var responseEl = el("ps-lite-response");
-        responseEl.textContent =
-          (responseEl.textContent ? responseEl.textContent + "\n" : "") +
-          String(event.detail);
+        if (runtimeState.active === "browser" && selectedPanel() === "health") {
+          el("node-registration-status").textContent = String(event.detail);
+        }
       });
-      window.addEventListener("load", refreshPsLiteSummary);
 
       // --- Connect Simulator ---
       var connectState = {

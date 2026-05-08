@@ -15,6 +15,7 @@ import { grantsRoutes } from "./routes/grants.js";
 import { accessLogsRoutes } from "./routes/access-logs.js";
 import { syncRoutes } from "./routes/sync.js";
 import { uiConfigRoutes } from "./routes/ui-config.js";
+import { uiRegistrationRoutes } from "./routes/ui-registration.js";
 import { uiRoute } from "./routes/ui.js";
 import {
   authDeviceRoutes,
@@ -53,6 +54,7 @@ export interface AppDeps {
   accessLogReader: AccessLogReader;
   cloudMode?: boolean;
   devToken?: string;
+  ownerPrivateKey?: `0x${string}`;
   accessToken?: string;
   configPath?: string;
   syncManager?: SyncManager | null;
@@ -198,6 +200,13 @@ export function createApp(deps: AppDeps): Hono {
         }),
       );
     }
+    app.route(
+      "/ui/api",
+      uiRegistrationRoutes({
+        devToken: deps.devToken,
+        ownerPrivateKey: deps.ownerPrivateKey,
+      }),
+    );
   }
 
   // Global error handler
