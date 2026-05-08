@@ -34,4 +34,13 @@ describe("uiRoute", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/html");
   });
+
+  it("serves the browser PS Lite debug bundle", async () => {
+    const app = uiRoute({ devToken: DEV_TOKEN });
+
+    const res = await app.request("/ps-lite-debug.js");
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/javascript");
+  });
 });

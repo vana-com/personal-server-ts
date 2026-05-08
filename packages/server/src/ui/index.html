@@ -442,6 +442,10 @@
               <option>PUT</option>
               <option>DELETE</option>
             </select>
+            <select id="api-runtime">
+              <option value="local">Local PS</option>
+              <option value="ps-lite">Browser PS Lite</option>
+            </select>
             <input
               id="api-path"
               type="text"
@@ -468,9 +472,19 @@
       <!-- PS Lite Panel -->
       <div id="panel-ps-lite" class="panel">
         <div class="card">
-          <div class="card-title">PS Lite Local Mode</div>
+          <div class="card-title">Browser PS Lite</div>
           <div class="toolbar">
-            <button class="btn" id="ps-lite-smoke-btn">Run Local Smoke</button>
+            <select id="ps-lite-storage-mode">
+              <option value="indexeddb">IndexedDB</option>
+              <option value="memory">Memory</option>
+            </select>
+            <button class="btn" id="ps-lite-smoke-btn">Storage Smoke</button>
+            <button class="btn secondary" id="ps-lite-auth-btn">
+              Auth Smoke
+            </button>
+            <button class="btn secondary" id="ps-lite-delete-btn">
+              Delete Smoke
+            </button>
             <button class="btn secondary" id="ps-lite-health-btn">
               Health
             </button>
@@ -483,14 +497,29 @@
             <button class="btn secondary" id="ps-lite-reset-btn">Reset</button>
           </div>
           <div class="toolbar">
-            <button class="btn secondary" id="ps-lite-ingest-btn">
-              Ingest Sample
+            <input
+              id="ps-lite-relay-control-url"
+              type="text"
+              value="wss://control.34.16.49.200.sslip.io:8443"
+              style="flex: 1"
+            />
+            <input
+              id="ps-lite-relay-public-suffix"
+              type="text"
+              value="34.16.49.200.sslip.io"
+              style="width: 220px"
+            />
+            <button class="btn secondary" id="ps-lite-relay-connect-btn">
+              Connect Relay
             </button>
-            <button class="btn secondary" id="ps-lite-list-btn">List</button>
-            <button class="btn secondary" id="ps-lite-read-btn">Read</button>
-            <button class="btn secondary" id="ps-lite-bridge-btn">
-              Bridge Read
+            <button class="btn secondary" id="ps-lite-relay-disconnect-btn">
+              Disconnect
             </button>
+          </div>
+          <div class="kv-grid" id="ps-lite-summary" style="margin-bottom: 12px">
+            <span class="label">runtime</span
+            ><span class="value">loading...</span>
+            <span class="label">relay</span><span class="value">closed</span>
           </div>
           <div
             id="ps-lite-status"
@@ -677,8 +706,7 @@
         if (tab === "data") loadScopes();
         if (tab === "grants") loadGrants();
         if (tab === "logs") loadAccessLogs();
-        if (tab === "ps-lite")
-          psLiteRequest("health", "/ui/api/ps-lite/health");
+        if (tab === "ps-lite") psLiteRequest("health", "health");
       });
 
       // --- Fetch helper ---
@@ -1184,7 +1212,10 @@
         }
 
         try {
-          var result = await api(path, opts);
+          var result =
+            el("api-runtime").value === "ps-lite"
+              ? await psLiteApiRequest(path, opts)
+              : await api(path, opts);
           var color =
             result.status < 300
               ? "var(--accent)"
@@ -1214,7 +1245,62 @@
       el("send-api-btn").addEventListener("click", sendApiRequest);
 
       // --- PS Lite Debug ---
-      async function psLiteRequest(label, path, opts) {
+      function psLiteClient() {
+        if (!window.psLiteDebug) {
+          throw new Error("PS Lite browser bundle is still loading");
+        }
+        return window.psLiteDebug;
+      }
+
+      async function psLiteApiRequest(path, opts) {
+        opts = opts || {};
+        var body;
+        if (opts.body) {
+          try {
+            body = JSON.parse(opts.body);
+          } catch (e) {
+            body = opts.body;
+          }
+        }
+        return psLiteClient().request(path, {
+          method: opts.method || "GET",
+          body: body,
+        });
+      }
+
+      function renderPsLiteSummary(data) {
+        var summary = el("ps-lite-summary");
+        var runtime = data && data.runtime ? data.runtime : {};
+        var relay = data && data.relay ? data.relay : {};
+        clearChildren(summary);
+        [
+          ["runtime", runtime.active ? "active" : "inactive"],
+          ["storage", data.storageMode || runtime.storage || "unknown"],
+          ["relay", relay.status || "closed"],
+          ["public url", relay.publicUrl || "not connected"],
+        ].forEach(function (item) {
+          var label = createEl("span", { class: "label" });
+          label.textContent = item[0];
+          var value = createEl("span", { class: "value" });
+          value.textContent = item[1];
+          summary.appendChild(label);
+          summary.appendChild(value);
+        });
+      }
+
+      async function refreshPsLiteSummary() {
+        try {
+          var result = await psLiteClient().status();
+          renderPsLiteSummary(result.data);
+        } catch (e) {
+          renderPsLiteSummary({
+            runtime: { active: false },
+            relay: { status: "unavailable" },
+          });
+        }
+      }
+
+      async function psLiteRequest(label, action, opts) {
         var statusEl = el("ps-lite-status");
         var responseEl = el("ps-lite-response");
         opts = opts || {};
@@ -1222,7 +1308,32 @@
         responseEl.textContent = "";
 
         try {
-          var result = await api(path, opts);
+          var client = psLiteClient();
+          var result;
+          if (action === "health") {
+            result = await client.status();
+          } else if (action === "activate") {
+            result = await client.activate();
+          } else if (action === "deactivate") {
+            result = await client.deactivate();
+          } else if (action === "reset") {
+            result = await client.reset(el("ps-lite-storage-mode").value);
+          } else if (action === "storage-smoke") {
+            result = await client.storageSmoke();
+          } else if (action === "auth-smoke") {
+            result = await client.authSmoke();
+          } else if (action === "delete-smoke") {
+            result = await client.deleteSmoke();
+          } else if (action === "connect-relay") {
+            result = await client.connectRelay({
+              controlUrl: el("ps-lite-relay-control-url").value.trim(),
+              publicSuffix: el("ps-lite-relay-public-suffix").value.trim(),
+            });
+          } else if (action === "disconnect-relay") {
+            result = await client.disconnectRelay();
+          } else {
+            result = await client.request(action, opts);
+          }
           var color =
             result.status < 300
               ? "var(--accent)"
@@ -1239,6 +1350,11 @@
             typeof result.data === "string"
               ? result.data
               : JSON.stringify(result.data, null, 2);
+          if (result.data && result.data.runtime && result.data.relay) {
+            renderPsLiteSummary(result.data);
+          } else {
+            await refreshPsLiteSummary();
+          }
         } catch (e) {
           clearChildren(statusEl);
           var errSpan = createEl("span");
@@ -1250,47 +1366,40 @@
       }
 
       el("ps-lite-health-btn").addEventListener("click", function () {
-        psLiteRequest("health", "/ui/api/ps-lite/health");
+        psLiteRequest("health", "health");
       });
       el("ps-lite-activate-btn").addEventListener("click", function () {
-        psLiteRequest("activate", "/ui/api/ps-lite/activate", {
-          method: "POST",
-        });
+        psLiteRequest("activate", "activate");
       });
       el("ps-lite-deactivate-btn").addEventListener("click", function () {
-        psLiteRequest("deactivate", "/ui/api/ps-lite/deactivate", {
-          method: "POST",
-        });
+        psLiteRequest("deactivate", "deactivate");
       });
       el("ps-lite-reset-btn").addEventListener("click", function () {
-        psLiteRequest("reset", "/ui/api/ps-lite/reset", { method: "POST" });
+        psLiteRequest("reset", "reset");
       });
       el("ps-lite-smoke-btn").addEventListener("click", function () {
-        psLiteRequest("local smoke", "/ui/api/ps-lite/local-smoke", {
-          method: "POST",
-        });
+        psLiteRequest("storage smoke", "storage-smoke");
       });
-      el("ps-lite-ingest-btn").addEventListener("click", function () {
-        psLiteRequest("ingest sample", "/ui/api/ps-lite/ingest", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            source: "debug-ui",
-            mode: "manual",
-          }),
-        });
+      el("ps-lite-auth-btn").addEventListener("click", function () {
+        psLiteRequest("auth smoke", "auth-smoke");
       });
-      el("ps-lite-list-btn").addEventListener("click", function () {
-        psLiteRequest("list", "/ui/api/ps-lite/list");
+      el("ps-lite-delete-btn").addEventListener("click", function () {
+        psLiteRequest("delete smoke", "delete-smoke");
       });
-      el("ps-lite-read-btn").addEventListener("click", function () {
-        psLiteRequest("read", "/ui/api/ps-lite/read");
+      el("ps-lite-relay-connect-btn").addEventListener("click", function () {
+        psLiteRequest("connect relay", "connect-relay");
       });
-      el("ps-lite-bridge-btn").addEventListener("click", function () {
-        psLiteRequest("bridge read", "/ui/api/ps-lite/bridge-read", {
-          method: "POST",
-        });
+      el("ps-lite-relay-disconnect-btn").addEventListener("click", function () {
+        psLiteRequest("disconnect relay", "disconnect-relay");
       });
+      window.addEventListener("ps-lite-relay-status", refreshPsLiteSummary);
+      window.addEventListener("ps-lite-relay-log", function (event) {
+        var responseEl = el("ps-lite-response");
+        responseEl.textContent =
+          (responseEl.textContent ? responseEl.textContent + "\n" : "") +
+          String(event.detail);
+      });
+      window.addEventListener("load", refreshPsLiteSummary);
 
       // --- Connect Simulator ---
       var connectState = {
@@ -1627,5 +1736,6 @@
         return addr.slice(0, 6) + "..." + addr.slice(-4);
       }
     </script>
+    <script type="module" src="/ui/ps-lite-debug.js"></script>
   </body>
 </html>

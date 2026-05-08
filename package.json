@@ -18,7 +18,7 @@
   "scripts": {
     "start": "npm run build && node --env-file-if-exists=.env packages/server/dist/index.js",
     "dev": "tsc --build && tsx watch --env-file-if-exists=.env packages/server/src/index.ts",
-    "build": "tsc --build && npm run copy-tls -w @opendatalabs/personal-server-ts-lite && npm run copy-ui -w @opendatalabs/personal-server-ts-server",
+    "build": "tsc --build && npm run copy-tls -w @opendatalabs/personal-server-ts-lite && npm run copy-ui -w @opendatalabs/personal-server-ts-server && npm run bundle-ui -w @opendatalabs/personal-server-ts-server",
     "clean": "tsc --build --clean",
     "test": "vitest run",
     "test:watch": "vitest",
