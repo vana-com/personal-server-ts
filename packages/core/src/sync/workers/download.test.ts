@@ -279,7 +279,7 @@ describe("download worker", () => {
       expect(deps.cursor.write).not.toHaveBeenCalled();
     });
 
-    it("continues on individual file failure", async () => {
+    it("continues on individual file failure without advancing cursor", async () => {
       const deps = makeMockDeps();
       const files = [
         makeFileRecord({ fileId: "file-001" }),
@@ -311,8 +311,7 @@ describe("download worker", () => {
         expect.objectContaining({ fileId: "file-002" }),
         "Failed to download file",
       );
-      // Cursor still advances despite individual failure
-      expect(deps.cursor.write).toHaveBeenCalledWith("2026-01-21T12:00:00Z");
+      expect(deps.cursor.write).not.toHaveBeenCalled();
     });
   });
 });

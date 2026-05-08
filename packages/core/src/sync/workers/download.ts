@@ -99,7 +99,7 @@ export async function downloadOne(
 
 /**
  * Poll Gateway for new file records since lastProcessedTimestamp,
- * download each, and advance the cursor.
+ * download each, and advance the cursor only when the page fully succeeds.
  */
 export async function downloadAll(
   deps: DownloadWorkerDeps,
@@ -116,6 +116,7 @@ export async function downloadAll(
   );
 
   const results: DownloadResult[] = [];
+  let failed = false;
 
   // 3. Process each file record
   for (const file of files) {
@@ -133,12 +134,18 @@ export async function downloadAll(
         },
         "Failed to download file",
       );
+      failed = true;
     }
   }
 
-  // 4. Advance cursor if there are new records
-  if (nextCursor !== null) {
+  // 4. Advance cursor only when every record in the page was handled.
+  if (nextCursor !== null && !failed) {
     await cursor.write(nextCursor);
+  } else if (failed) {
+    logger.warn(
+      { nextCursor },
+      "Download cursor not advanced because one or more files failed",
+    );
   }
 
   return results;
