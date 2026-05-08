@@ -28,14 +28,16 @@ import {
   type DataReadPolicyPorts,
 } from "@opendatalabs/personal-server-ts-core/policy";
 import type {
-  DataStorageEntryLookup,
-  DataStorageListOptions,
   DataStoragePort,
-  DataStorageScopeListOptions,
   RuntimeAvailabilityPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
 import { type DataFileEnvelope } from "@opendatalabs/personal-server-ts-core/schemas/data-file";
 import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
+import {
+  createStorageReadMethods,
+  readEnvelopeFromMap,
+  sortEntries,
+} from "./storage-utils.js";
 
 export interface PsLiteStorageAdapter {
   kind: "indexeddb" | "opfs" | "custom";
@@ -82,12 +84,6 @@ export interface Web3SignedPsLiteAuthOptions {
 }
 
 type JsonStatus = 200 | 201 | 400 | 401 | 403 | 404 | 405 | 500 | 501 | 503;
-
-interface ScopeSummary {
-  scope: string;
-  latestCollectedAt: string;
-  versionCount: number;
-}
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   const headers = new Headers(init?.headers);
@@ -290,21 +286,6 @@ function toDataStoragePort(
   return createMemoryPsLiteStorage(storage);
 }
 
-function sortEntries(entries: IndexEntry[]): IndexEntry[] {
-  return [...entries].sort((a, b) =>
-    b.collectedAt.localeCompare(a.collectedAt),
-  );
-}
-
-function paginate<T>(
-  items: T[],
-  options: DataStorageListOptions | DataStorageScopeListOptions,
-): T[] {
-  const offset = options.offset ?? 0;
-  const limit = options.limit ?? items.length;
-  return items.slice(offset, offset + limit);
-}
-
 export function createMemoryPsLiteStorage(
   adapter: PsLiteStorageAdapter = { kind: "indexeddb" },
 ): DataStoragePort {
@@ -324,61 +305,10 @@ export function createMemoryPsLiteStorage(
 
   return {
     kind: adapter.kind === "custom" ? "custom" : "browser-indexeddb-opfs",
-
-    listScopes(options) {
-      const summaries = new Map<string, ScopeSummary>();
-      for (const entry of entries.values()) {
-        if (
-          options.scopePrefix &&
-          !entry.scope.startsWith(options.scopePrefix)
-        ) {
-          continue;
-        }
-        const existing = summaries.get(entry.scope);
-        summaries.set(entry.scope, {
-          scope: entry.scope,
-          latestCollectedAt:
-            existing &&
-            existing.latestCollectedAt.localeCompare(entry.collectedAt) > 0
-              ? existing.latestCollectedAt
-              : entry.collectedAt,
-          versionCount: (existing?.versionCount ?? 0) + 1,
-        });
-      }
-      const scopes = Array.from(summaries.values()).sort((a, b) =>
-        a.scope.localeCompare(b.scope),
-      );
-      return {
-        scopes: paginate(scopes, options),
-        total: scopes.length,
-      };
-    },
-
-    listVersions(scope, options) {
-      return paginate(entriesForScope(scope), options);
-    },
-
-    countVersions(scope) {
-      return entriesForScope(scope).length;
-    },
-
-    findEntry(lookup: DataStorageEntryLookup) {
-      const scoped = entriesForScope(lookup.scope);
-      if (lookup.fileId) {
-        return scoped.find((entry) => entry.fileId === lookup.fileId);
-      }
-      if (lookup.at) {
-        return scoped.find((entry) => entry.collectedAt === lookup.at);
-      }
-      return scoped[0];
-    },
+    ...createStorageReadMethods(() => entries.values(), entriesForScope),
 
     async readEnvelope(scope, collectedAt) {
-      const envelope = envelopes.get(envelopeKey(scope, collectedAt));
-      if (!envelope) {
-        throw new Error("Envelope not found");
-      }
-      return envelope;
+      return readEnvelopeFromMap(envelopes, envelopeKey(scope, collectedAt));
     },
 
     async writeEnvelope(envelope) {
