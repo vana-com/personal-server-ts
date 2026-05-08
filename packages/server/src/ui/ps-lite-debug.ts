@@ -145,6 +145,89 @@ function inferAuth(method: string): AuthMode {
   return "builder";
 }
 
+function sampleInstagramProfileData(reason = "debug-ui") {
+  return {
+    username: "vana_debug",
+    full_name: "Vana Debug Profile",
+    bio: "Schema-shaped sample profile for Personal Server debug UI testing.",
+    biography_with_entities: {
+      raw_text:
+        "Schema-shaped sample profile for Personal Server debug UI testing.",
+      entities: [],
+    },
+    pronouns: ["they/them"],
+    bio_links: [
+      {
+        title: "Vana",
+        url: "https://www.vana.org",
+        lynx_url: "https://www.vana.org",
+      },
+    ],
+    external_url: "https://www.vana.org",
+    external_url_linkshimmed: "https://www.vana.org",
+    fb_profile_biolink: null,
+    profile_pic_url: "https://www.vana.org/favicon.ico",
+    hd_profile_pic_url: "https://www.vana.org/favicon.ico",
+    pk: "2605080001",
+    id: "2605080001",
+    fbid: null,
+    eimu_id: null,
+    follower_count: 1234,
+    following_count: 321,
+    media_count: 42,
+    highlight_reel_count: 3,
+    pinned_channels_list_count: 0,
+    is_private: false,
+    is_verified: true,
+    is_verified_by_mv4b: false,
+    is_business: false,
+    is_professional_account: true,
+    is_supervised_user: false,
+    is_supervision_enabled: false,
+    is_joined_recently: false,
+    is_embeds_disabled: false,
+    is_regulated_c18: false,
+    hide_like_and_view_counts: false,
+    ai_agent_type: null,
+    has_clips: true,
+    has_channel: false,
+    has_guides: false,
+    has_ar_effects: false,
+    has_chaining: true,
+    country_block: false,
+    should_show_category: true,
+    should_show_public_contacts: false,
+    show_account_transparency_details: true,
+    transparency_label: null,
+    transparency_product: null,
+    business: {
+      is_business_account: false,
+      category_name: "Technology",
+      business_category_name: null,
+      overall_category_name: null,
+      category_enum: null,
+      business_contact_method: null,
+      business_email: null,
+      business_phone_number: null,
+      business_address_json: null,
+    },
+    viewer_relationship: {
+      followed_by_viewer: true,
+      follows_viewer: false,
+      requested_by_viewer: false,
+      has_requested_viewer: false,
+      blocked_by_viewer: false,
+      has_blocked_viewer: false,
+      restricted_by_viewer: false,
+      is_guardian_of_viewer: false,
+      is_supervised_by_viewer: false,
+      mutual_followed_by_count: 7,
+    },
+    collected_at: new Date().toISOString(),
+    debug_source: reason,
+  };
+}
+
 async function makeRuntime(_mode: StorageMode): Promise<PsLiteRuntime> {
   const browserRuntime = await createIndexedDbPsLiteRuntime({
     dbName: "personal-server-lite-debug",
@@ -293,11 +376,7 @@ async function deactivate(): Promise<UiResult> {
 
 async function runStorageSmoke(requestFn: DebugRequest): Promise<UiResult> {
   const schema = await gatewaySchemaSmoke();
-  const payload = {
-    source: "debug-ui",
-    runtime: "browser-ps-lite",
-    at: new Date().toISOString(),
-  };
+  const payload = sampleInstagramProfileData("ps-lite-storage-smoke");
   const write = await requestFn(`/v1/data/${SAMPLE_SCOPE}`, {
     method: "POST",
     auth: "owner",
@@ -367,7 +446,7 @@ async function authSmoke(): Promise<UiResult> {
   const unauthenticatedWrite = await request(`/v1/data/${SAMPLE_SCOPE}`, {
     method: "POST",
     auth: "none",
-    body: { shouldFail: true },
+    body: sampleInstagramProfileData("ps-lite-auth-negative"),
   });
   const badBuilderRead = await request(
     `/v1/data/${SAMPLE_SCOPE}?grantId=${SAMPLE_GRANT_ID}`,
@@ -391,7 +470,7 @@ async function deleteSmoke(): Promise<UiResult> {
   await request(`/v1/data/${SAMPLE_SCOPE}`, {
     method: "POST",
     auth: "owner",
-    body: { source: "delete-smoke" },
+    body: sampleInstagramProfileData("ps-lite-delete-smoke"),
   });
   const deleted = await request(`/v1/data/${SAMPLE_SCOPE}`, {
     method: "DELETE",
