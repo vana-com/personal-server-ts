@@ -327,6 +327,7 @@
       <button data-tab="grants">Grants</button>
       <button data-tab="logs">Access Logs</button>
       <button data-tab="api">API Tester</button>
+      <button data-tab="ps-lite">PS Lite</button>
       <button data-tab="connect">Connect</button>
     </nav>
 
@@ -461,6 +462,41 @@
             style="margin-bottom: 8px; font-size: 12px; color: var(--text-dim)"
           ></div>
           <pre class="json" id="api-response">No request sent yet.</pre>
+        </div>
+      </div>
+
+      <!-- PS Lite Panel -->
+      <div id="panel-ps-lite" class="panel">
+        <div class="card">
+          <div class="card-title">PS Lite Local Mode</div>
+          <div class="toolbar">
+            <button class="btn" id="ps-lite-smoke-btn">Run Local Smoke</button>
+            <button class="btn secondary" id="ps-lite-health-btn">
+              Health
+            </button>
+            <button class="btn secondary" id="ps-lite-activate-btn">
+              Activate
+            </button>
+            <button class="btn secondary" id="ps-lite-deactivate-btn">
+              Deactivate
+            </button>
+            <button class="btn secondary" id="ps-lite-reset-btn">Reset</button>
+          </div>
+          <div class="toolbar">
+            <button class="btn secondary" id="ps-lite-ingest-btn">
+              Ingest Sample
+            </button>
+            <button class="btn secondary" id="ps-lite-list-btn">List</button>
+            <button class="btn secondary" id="ps-lite-read-btn">Read</button>
+            <button class="btn secondary" id="ps-lite-bridge-btn">
+              Bridge Read
+            </button>
+          </div>
+          <div
+            id="ps-lite-status"
+            style="margin-bottom: 8px; font-size: 12px; color: var(--text-dim)"
+          ></div>
+          <pre class="json" id="ps-lite-response">No request sent yet.</pre>
         </div>
       </div>
 
@@ -641,6 +677,8 @@
         if (tab === "data") loadScopes();
         if (tab === "grants") loadGrants();
         if (tab === "logs") loadAccessLogs();
+        if (tab === "ps-lite")
+          psLiteRequest("health", "/ui/api/ps-lite/health");
       });
 
       // --- Fetch helper ---
@@ -1174,6 +1212,85 @@
       }
 
       el("send-api-btn").addEventListener("click", sendApiRequest);
+
+      // --- PS Lite Debug ---
+      async function psLiteRequest(label, path, opts) {
+        var statusEl = el("ps-lite-status");
+        var responseEl = el("ps-lite-response");
+        opts = opts || {};
+        statusEl.textContent = "Sending " + label + "...";
+        responseEl.textContent = "";
+
+        try {
+          var result = await api(path, opts);
+          var color =
+            result.status < 300
+              ? "var(--accent)"
+              : result.status < 500
+                ? "var(--warn)"
+                : "var(--error)";
+          clearChildren(statusEl);
+          var statusSpan = createEl("span");
+          statusSpan.textContent = result.status;
+          statusSpan.style.color = color;
+          statusEl.appendChild(statusSpan);
+          statusEl.appendChild(text(" " + label));
+          responseEl.textContent =
+            typeof result.data === "string"
+              ? result.data
+              : JSON.stringify(result.data, null, 2);
+        } catch (e) {
+          clearChildren(statusEl);
+          var errSpan = createEl("span");
+          errSpan.textContent = "Error";
+          errSpan.style.color = "var(--error)";
+          statusEl.appendChild(errSpan);
+          responseEl.textContent = e.message;
+        }
+      }
+
+      el("ps-lite-health-btn").addEventListener("click", function () {
+        psLiteRequest("health", "/ui/api/ps-lite/health");
+      });
+      el("ps-lite-activate-btn").addEventListener("click", function () {
+        psLiteRequest("activate", "/ui/api/ps-lite/activate", {
+          method: "POST",
+        });
+      });
+      el("ps-lite-deactivate-btn").addEventListener("click", function () {
+        psLiteRequest("deactivate", "/ui/api/ps-lite/deactivate", {
+          method: "POST",
+        });
+      });
+      el("ps-lite-reset-btn").addEventListener("click", function () {
+        psLiteRequest("reset", "/ui/api/ps-lite/reset", { method: "POST" });
+      });
+      el("ps-lite-smoke-btn").addEventListener("click", function () {
+        psLiteRequest("local smoke", "/ui/api/ps-lite/local-smoke", {
+          method: "POST",
+        });
+      });
+      el("ps-lite-ingest-btn").addEventListener("click", function () {
+        psLiteRequest("ingest sample", "/ui/api/ps-lite/ingest", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            source: "debug-ui",
+            mode: "manual",
+          }),
+        });
+      });
+      el("ps-lite-list-btn").addEventListener("click", function () {
+        psLiteRequest("list", "/ui/api/ps-lite/list");
+      });
+      el("ps-lite-read-btn").addEventListener("click", function () {
+        psLiteRequest("read", "/ui/api/ps-lite/read");
+      });
+      el("ps-lite-bridge-btn").addEventListener("click", function () {
+        psLiteRequest("bridge read", "/ui/api/ps-lite/bridge-read", {
+          method: "POST",
+        });
+      });
 
       // --- Connect Simulator ---
       var connectState = {

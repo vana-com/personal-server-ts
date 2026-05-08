@@ -13,6 +13,7 @@ import { accessLogsRoutes } from "./routes/access-logs.js";
 import { syncRoutes } from "./routes/sync.js";
 import { uiConfigRoutes } from "./routes/ui-config.js";
 import { uiRoute } from "./routes/ui.js";
+import { psLiteDebugRoutes } from "./routes/ps-lite-debug.js";
 import {
   authDeviceRoutes,
   createDeviceSessionLookup,
@@ -189,6 +190,11 @@ export function createApp(deps: AppDeps): Hono {
         }),
       );
     }
+
+    app.route(
+      "/ui/api/ps-lite",
+      psLiteDebugRoutes({ devToken: deps.devToken }),
+    );
   }
 
   // Global error handler
