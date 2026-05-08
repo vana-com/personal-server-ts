@@ -24,8 +24,11 @@ function isHexAddress(value: unknown): value is `0x${string}` {
   return typeof value === "string" && /^0x[0-9a-fA-F]{40}$/.test(value);
 }
 
-function isHexPrivateKey(value: string): value is `0x${string}` {
-  return /^0x[0-9a-fA-F]{64}$/.test(value);
+function normalizePrivateKey(value: string): `0x${string}` | null {
+  const normalized = value.startsWith("0x") ? value : `0x${value}`;
+  return /^0x[0-9a-fA-F]{64}$/.test(normalized)
+    ? (normalized as `0x${string}`)
+    : null;
 }
 
 function parseGatewayConfig(
@@ -118,14 +121,15 @@ export function uiRegistrationRoutes(deps: UiRegistrationRouteDeps): Hono {
       );
     }
 
-    if (!isHexPrivateKey(deps.ownerPrivateKey)) {
+    const ownerPrivateKey = normalizePrivateKey(deps.ownerPrivateKey);
+    if (!ownerPrivateKey) {
       return c.json(
         {
           error: {
             code: 500,
             errorCode: "INVALID_OWNER_PRIVATE_KEY",
             message:
-              "VANA_OWNER_PRIVATE_KEY must be a 0x-prefixed 32-byte key.",
+              "VANA_OWNER_PRIVATE_KEY must be a 32-byte hex private key.",
           },
         },
         500,
@@ -176,7 +180,7 @@ export function uiRegistrationRoutes(deps: UiRegistrationRouteDeps): Hono {
       );
     }
 
-    const account = privateKeyToAccount(deps.ownerPrivateKey);
+    const account = privateKeyToAccount(ownerPrivateKey);
     if (
       account.address.toLowerCase() !== candidate.ownerAddress.toLowerCase()
     ) {

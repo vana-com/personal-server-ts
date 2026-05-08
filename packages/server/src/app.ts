@@ -7,6 +7,7 @@ import type {
   DataPortabilityGatewayConfig,
   GatewayClient,
 } from "@opendatalabs/vana-sdk/node";
+import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import { healthRoute, type HealthDeps } from "./routes/health.js";
@@ -50,10 +51,12 @@ export interface AppDeps {
   identity?: IdentityInfo;
   gateway: GatewayClient;
   gatewayConfig?: DataPortabilityGatewayConfig & { url?: string };
+  config?: ServerConfig;
   accessLogWriter: AccessLogWriter;
   accessLogReader: AccessLogReader;
   cloudMode?: boolean;
   devToken?: string;
+  ownerSignature?: `0x${string}`;
   ownerPrivateKey?: `0x${string}`;
   accessToken?: string;
   configPath?: string;
@@ -189,7 +192,18 @@ export function createApp(deps: AppDeps): Hono {
 
   // Mount dev UI routes when dev token is available
   if (deps.devToken) {
-    app.route("/ui", uiRoute({ devToken: deps.devToken }));
+    app.route(
+      "/ui",
+      uiRoute({
+        devToken: deps.devToken,
+        psLiteBootstrap: deps.ownerSignature
+          ? {
+              ownerSignature: deps.ownerSignature,
+              config: deps.config,
+            }
+          : null,
+      }),
+    );
 
     if (deps.configPath) {
       app.route(

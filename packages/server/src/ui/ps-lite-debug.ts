@@ -22,8 +22,6 @@ const GATEWAY_SCHEMA_SCOPES = [
 const SAMPLE_GRANT_ID = "debug-grant";
 const DEFAULT_CONTROL_URL = "wss://control.34.16.49.200.sslip.io:8443";
 const DEFAULT_PUBLIC_SUFFIX = "34.16.49.200.sslip.io";
-const DEBUG_OWNER_SIGNATURE =
-  "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
 
 type StorageMode = "indexeddb";
 type AuthMode = "owner" | "builder" | "none" | "bad-builder";
@@ -48,6 +46,11 @@ interface UiResult {
   data: unknown;
 }
 
+interface PsLiteBootstrap {
+  ownerSignature: `0x${string}`;
+  config?: Record<string, unknown>;
+}
+
 type DebugRequest = (
   path: string,
   options?: UiRequestOptions,
@@ -58,6 +61,31 @@ let storageMode: StorageMode = "indexeddb";
 let relayClient: PsLiteRelayClient | undefined;
 let relayStatus: PsLiteRelayStatus = "closed";
 let relayPublicUrl = "";
+
+function getBootstrap(): PsLiteBootstrap {
+  const bootstrap = window.__PS_LITE_BOOTSTRAP__;
+  if (
+    !bootstrap ||
+    typeof bootstrap.ownerSignature !== "string" ||
+    !bootstrap.ownerSignature.startsWith("0x")
+  ) {
+    throw new Error("PS Lite owner signature is not configured");
+  }
+  return bootstrap;
+}
+
+function liteConfigDefaults(bootstrap: PsLiteBootstrap) {
+  const config = bootstrap.config ?? {};
+  const server =
+    config.server && typeof config.server === "object" ? config.server : {};
+  const sync =
+    config.sync && typeof config.sync === "object" ? config.sync : {};
+  return {
+    ...config,
+    server: { ...server, port: 443, origin: ORIGIN },
+    sync: { ...sync, enabled: true, lastProcessedTimestamp: null },
+  };
+}
 
 function randomSessionId(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(12));
@@ -78,6 +106,10 @@ function inferAuth(method: string): AuthMode {
     return "owner";
   }
   return "builder";
+}
+
+function runtimeOrigin(): string {
+  return relayPublicUrl || ORIGIN;
 }
 
 function sampleInstagramProfileData(reason = "debug-ui") {
@@ -164,15 +196,13 @@ function sampleInstagramProfileData(reason = "debug-ui") {
 }
 
 async function makeRuntime(_mode: StorageMode): Promise<PsLiteRuntime> {
+  const bootstrap = getBootstrap();
   const browserRuntime = await createIndexedDbPsLiteRuntime({
     dbName: "personal-server-lite-debug",
     storageDbName: "personal-server-lite-debug-storage",
     storageKey: "data-storage-v1",
-    ownerSignature: DEBUG_OWNER_SIGNATURE,
-    configDefaults: {
-      server: { port: 443, origin: ORIGIN },
-      sync: { enabled: true, lastProcessedTimestamp: null },
-    },
+    ownerSignature: bootstrap.ownerSignature,
+    configDefaults: liteConfigDefaults(bootstrap),
     auth: createBearerTokenPsLiteAuth({
       ownerToken: OWNER_TOKEN,
       builderToken: BUILDER_TOKEN,
@@ -233,7 +263,7 @@ async function requestWithRuntime(
   }
 
   return parseResponse(
-    await activeRuntime.fetch(new Request(`${ORIGIN}${path}`, init)),
+    await activeRuntime.fetch(new Request(`${runtimeOrigin()}${path}`, init)),
   );
 }
 
@@ -246,7 +276,7 @@ async function reset(nextStorageMode = storageMode): Promise<UiResult> {
 async function status(): Promise<UiResult> {
   const activeRuntime = await ensureRuntime();
   const health = await parseResponse(
-    await activeRuntime.fetch(new Request(`${ORIGIN}/health`)),
+    await activeRuntime.fetch(new Request(`${runtimeOrigin()}/health`)),
   );
   return {
     status: health.status,
@@ -536,6 +566,7 @@ const psLiteDebug = {
 declare global {
   interface Window {
     psLiteDebug: typeof psLiteDebug;
+    __PS_LITE_BOOTSTRAP__: PsLiteBootstrap | null;
   }
 }
 

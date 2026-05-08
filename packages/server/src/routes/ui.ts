@@ -5,6 +5,7 @@ import { Hono } from "hono";
 
 export interface UiRouteDeps {
   devToken: string;
+  psLiteBootstrap?: unknown;
 }
 
 // Read the HTML file once at module load time
@@ -24,11 +25,16 @@ function getUiAssetPath(fileName: string): string {
   return distPath;
 }
 
-function loadHtml(devToken: string): string {
+function loadHtml(devToken: string, psLiteBootstrap: unknown): string {
   if (!cachedHtml) {
     cachedHtml = readFileSync(getHtmlPath(), "utf-8");
   }
-  return cachedHtml.replace("__DEV_TOKEN__", devToken);
+  return cachedHtml
+    .replace("__DEV_TOKEN__", devToken)
+    .replace(
+      '"__PS_LITE_BOOTSTRAP_JSON__"',
+      JSON.stringify(psLiteBootstrap ?? null),
+    );
 }
 
 function contentTypeFor(fileName: string): string {
@@ -42,7 +48,7 @@ export function uiRoute(deps: UiRouteDeps): Hono {
 
   app.get("/", (c) => {
     try {
-      const html = loadHtml(deps.devToken);
+      const html = loadHtml(deps.devToken, deps.psLiteBootstrap);
       return c.html(html);
     } catch {
       return c.json(

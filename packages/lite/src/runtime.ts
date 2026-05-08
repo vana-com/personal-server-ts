@@ -851,7 +851,7 @@ export function createPsLiteRuntime(
         const url = new URL(request.url);
 
         if (url.pathname === "/health") {
-          const apiOrigin = options.config?.server?.origin ?? url.origin;
+          const apiOrigin = url.origin;
           const identity = options.identity ?? null;
           let serverId: string | null = null;
           if (identity && options.gateway) {

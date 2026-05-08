@@ -46,6 +46,21 @@ describe("createPsLiteRuntime", () => {
     });
   });
 
+  it("reports the request origin as the browser API origin", async () => {
+    const runtime = createPsLiteRuntime({
+      storage: { kind: "indexeddb" },
+      active: true,
+      config: { server: { origin: "https://configured.local" } },
+    });
+
+    const res = await runtime.fetch(new Request("https://relay.local/health"));
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      apiOrigin: "https://relay.local",
+    });
+  });
+
   it("returns PS_UNAVAILABLE while the browser runtime is inactive", async () => {
     const runtime = createPsLiteRuntime({
       storage: { kind: "opfs" },

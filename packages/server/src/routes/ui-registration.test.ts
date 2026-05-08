@@ -108,6 +108,41 @@ describe("uiRegistrationRoutes", () => {
     );
   });
 
+  it("accepts an owner private key without 0x prefix", async () => {
+    gatewayMocks.getServer.mockResolvedValue(null);
+    gatewayMocks.registerServer.mockResolvedValue({
+      alreadyRegistered: false,
+      serverId: "server-1",
+    });
+    const app = uiRegistrationRoutes({
+      devToken,
+      ownerPrivateKey: owner.privateKey.slice(2) as `0x${string}`,
+    });
+
+    const candidate = {
+      ownerAddress: owner.address,
+      serverAddress: server.address,
+      publicKey: server.address,
+      serverUrl: "https://server.example.com",
+    };
+    const res = await app.request("/registration/server", {
+      method: "POST",
+      headers: {
+        ...authHeaders(),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ gatewayConfig, registration: candidate }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(gatewayMocks.registerServer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ...candidate,
+        signature: expect.stringMatching(/^0x[0-9a-f]+$/i),
+      }),
+    );
+  });
+
   it("checks file ids against the gateway", async () => {
     gatewayMocks.getFile
       .mockResolvedValueOnce({ fileId: "file-1" })

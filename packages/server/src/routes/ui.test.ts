@@ -4,7 +4,7 @@ import { uiRoute } from "./ui.js";
 // Mock fs.readFileSync to avoid needing the actual HTML file during tests
 vi.mock("node:fs", () => ({
   readFileSync: () =>
-    '<html><script>const TOKEN = "__DEV_TOKEN__";</script></html>',
+    '<html><script>const TOKEN = "__DEV_TOKEN__"; window.__PS_LITE_BOOTSTRAP__ = "__PS_LITE_BOOTSTRAP_JSON__";</script></html>',
 }));
 
 describe("uiRoute", () => {
@@ -24,6 +24,23 @@ describe("uiRoute", () => {
     const html = await res.text();
     expect(html).toContain(`const TOKEN = "${DEV_TOKEN}";`);
     expect(html).not.toContain("__DEV_TOKEN__");
+  });
+
+  it("injects PS Lite bootstrap config", async () => {
+    const app = uiRoute({
+      devToken: DEV_TOKEN,
+      psLiteBootstrap: {
+        ownerSignature: "0xsignature",
+        config: { gateway: { url: "https://gateway.example" } },
+      },
+    });
+
+    const res = await app.request("/");
+
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('"ownerSignature":"0xsignature"');
+    expect(html).not.toContain("__PS_LITE_BOOTSTRAP_JSON__");
   });
 
   it("returns HTML content type", async () => {
