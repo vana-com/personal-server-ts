@@ -1,6 +1,6 @@
 export type { StorageAdapter } from "./interface.js";
 export {
-  createVanaStorageAdapter,
-  type VanaStorageOptions,
-  type RequestSigner,
-} from "./vana.js";
+  createSdkStorageAdapter,
+  type SdkStorageProvider,
+  type SdkStorageProviderFactory,
+} from "./sdk.js";

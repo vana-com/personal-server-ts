@@ -17,6 +17,7 @@ const SCHEMA_ID =
 describe("PS Lite sync", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
   });
 
   it("uploads unsynced browser-local data and persists the file id", async () => {
@@ -60,6 +61,10 @@ describe("PS Lite sync", () => {
       }),
     );
     vi.stubGlobal("fetch", fetchMock);
+    vi.stubEnv("VANA_R2_ACCOUNT_ID", "acct");
+    vi.stubEnv("VANA_R2_ACCESS_KEY_ID", "key");
+    vi.stubEnv("VANA_R2_SECRET_ACCESS_KEY", "secret");
+    vi.stubEnv("VANA_R2_BUCKET", "bucket");
 
     const { syncManager } = await createPsLiteSyncManager({
       config: ServerConfigSchema.parse({ sync: { enabled: true } }),
@@ -79,7 +84,7 @@ describe("PS Lite sync", () => {
       fileId: "file-browser-1",
     });
     expect(fetchMock).toHaveBeenCalledWith(
-      expect.stringContaining("/v1/blobs/"),
+      expect.any(String),
       expect.objectContaining({ method: "PUT" }),
     );
     expect(gateway.registerFile).toHaveBeenCalledWith(

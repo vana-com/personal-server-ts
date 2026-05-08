@@ -4,14 +4,12 @@ import {
   createSyncManager,
   type SyncManager,
 } from "@opendatalabs/personal-server-ts-core/sync/manager";
-import { createVanaStorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
-import {
-  createRequestSigner,
-  createServerSigner,
-} from "@opendatalabs/personal-server-ts-core/signing";
+import { createSdkStorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
+import { createServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { ServerAccount } from "@opendatalabs/personal-server-ts-core/keys";
 import {
   createGatewayClient,
+  createVanaStorageProvider,
   deriveMasterKey,
   recoverServerOwner,
   type GatewayClient,
@@ -71,14 +69,7 @@ export async function createPsLiteSyncManager(
   const masterKey = deriveMasterKey(options.ownerSignature);
   const gateway =
     options.gateway ?? createGatewayClient(options.config.gateway.url);
-  const vanaConfig = options.config.storage.config.vana ?? {
-    apiUrl: "https://storage.vana.com",
-  };
-  const storageAdapter = createVanaStorageAdapter({
-    apiUrl: vanaConfig.apiUrl,
-    ownerAddress: serverOwner,
-    signer: createRequestSigner(options.serverAccount),
-  });
+  const storageAdapter = createSdkStorageAdapter(createVanaStorageProvider);
   const signer = createServerSigner(options.serverAccount, {
     chainId: options.config.gateway.chainId,
     contracts: options.config.gateway.contracts,

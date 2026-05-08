@@ -20,7 +20,10 @@ import {
   type IndexManager,
 } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
-import { createGatewayClient } from "@opendatalabs/vana-sdk/node";
+import {
+  createGatewayClient,
+  createVanaStorageProvider,
+} from "@opendatalabs/vana-sdk/node";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { createAccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import { createAccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
@@ -31,17 +34,14 @@ import {
 } from "@opendatalabs/vana-sdk/node";
 import { loadOrCreateServerAccount } from "@opendatalabs/personal-server-ts-core/keys";
 import type { ServerAccount } from "@opendatalabs/personal-server-ts-core/keys";
-import {
-  createServerSigner,
-  createRequestSigner,
-} from "@opendatalabs/personal-server-ts-core/signing";
+import { createServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import {
   createSyncCursor,
   createSyncManager,
   type SyncManager,
 } from "@opendatalabs/personal-server-ts-core/sync";
-import { createVanaStorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
+import { createSdkStorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
 import { generateDevToken } from "./dev-token.js";
@@ -230,15 +230,7 @@ export async function createServer(
   ) {
     const masterKey = deriveMasterKey(masterKeySignature);
 
-    const vanaConfig = config.storage.config.vana ?? {
-      apiUrl: "https://storage.vana.com",
-    };
-    const requestSigner = createRequestSigner(serverAccount);
-    const storageAdapter = createVanaStorageAdapter({
-      apiUrl: vanaConfig.apiUrl,
-      ownerAddress: serverOwner,
-      signer: requestSigner,
-    });
+    const storageAdapter = createSdkStorageAdapter(createVanaStorageProvider);
 
     const cursor = createSyncCursor(syncCursorPath, {
       legacyConfigPath: configPath,

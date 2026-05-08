@@ -1,11 +1,18 @@
 /**
  * RequestSigner — produces Web3Signed Authorization headers for HTTP requests.
- * Used by the Vana Storage adapter for authenticated blob operations.
  */
 
 import { buildWeb3SignedHeader } from "@opendatalabs/vana-sdk/browser";
 import type { ServerAccount } from "../keys/server-account.js";
-import type { RequestSigner } from "../storage/adapters/vana.js";
+
+export interface RequestSigner {
+  signRequest(params: {
+    aud: string;
+    method: string;
+    uri: string;
+    body?: Uint8Array;
+  }): Promise<string>;
+}
 
 /**
  * Create a RequestSigner that produces Web3Signed Authorization headers
@@ -13,12 +20,7 @@ import type { RequestSigner } from "../storage/adapters/vana.js";
  */
 export function createRequestSigner(account: ServerAccount): RequestSigner {
   return {
-    async signRequest(params: {
-      aud: string;
-      method: string;
-      uri: string;
-      body?: Uint8Array;
-    }): Promise<string> {
+    async signRequest(params) {
       return buildWeb3SignedHeader({
         signMessage: (message: string) => account.signMessage(message),
         aud: params.aud,
