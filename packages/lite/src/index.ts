@@ -5,6 +5,15 @@ export {
 } from "./bridge.js";
 
 export {
+  createIndexedDbPsLitePersistence,
+  createMemoryPsLitePersistence,
+  createPersistentPsLiteStorage,
+  type IndexedDbPsLitePersistenceOptions,
+  type PsLitePersistedStorageState,
+  type PsLitePersistenceAdapter,
+} from "./storage.js";
+
+export {
   createBearerTokenPsLiteAuth,
   createMemoryPsLiteStorage,
   createPsLiteRuntime,
