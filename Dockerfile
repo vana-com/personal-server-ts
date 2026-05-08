@@ -1,5 +1,5 @@
 # ---------- build stage ----------
-FROM node:20-alpine AS build
+FROM node:22-alpine AS build
 
 # build-base provides gcc/g++/make for better-sqlite3 native addon
 RUN apk add --no-cache build-base python3
@@ -27,7 +27,7 @@ RUN npm run build
 RUN npm prune --omit=dev
 
 # ---------- runtime stage ----------
-FROM node:20-alpine
+FROM node:22-alpine
 
 # better-sqlite3 needs libstdc++ at runtime
 RUN apk add --no-cache libstdc++ \
