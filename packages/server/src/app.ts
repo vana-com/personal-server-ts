@@ -83,6 +83,7 @@ export function createApp(deps: AppDeps): Hono {
       gateway: deps.gateway,
       logger: deps.logger,
       getTunnelStatus: deps.getTunnelStatus,
+      runtimeAvailability: deps.runtimeAvailability,
     }),
   );
 

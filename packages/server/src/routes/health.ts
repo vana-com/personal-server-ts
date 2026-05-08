@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import type { GatewayClient } from "@opendatalabs/personal-server-ts-core/gateway";
+import type { RuntimeAvailabilityPort } from "@opendatalabs/personal-server-ts-core/ports";
 import type { Logger } from "pino";
 
 import type { IdentityInfo } from "../app.js";
@@ -13,6 +14,7 @@ export interface HealthDeps {
   gateway?: GatewayClient;
   logger?: Logger;
   getTunnelStatus?: () => TunnelStatusInfo | null;
+  runtimeAvailability?: RuntimeAvailabilityPort;
 }
 
 export function healthRoute(deps: HealthDeps): Hono {
@@ -45,14 +47,20 @@ export function healthRoute(deps: HealthDeps): Hono {
       : null;
 
     const tunnel = deps.getTunnelStatus?.() ?? null;
+    const runtimeAvailable =
+      (await deps.runtimeAvailability?.isAvailable()) ?? true;
 
     return c.json({
-      status: "healthy",
+      status: runtimeAvailable ? "healthy" : "unavailable",
       version: deps.version,
       uptime: Math.floor(uptimeMs / 1000),
       owner: deps.serverOwner ?? null,
       identity,
       tunnel,
+      runtime: {
+        kind: "ps-node",
+        available: runtimeAvailable,
+      },
     });
   });
 

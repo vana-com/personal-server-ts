@@ -1,4 +1,5 @@
 import type { GatewayClient } from "@opendatalabs/personal-server-ts-core/gateway";
+import type { RuntimeAvailabilityPort } from "@opendatalabs/personal-server-ts-core/ports";
 import { describe, it, expect, vi } from "vitest";
 import { healthRoute } from "./health.js";
 
@@ -43,6 +44,30 @@ describe("healthRoute", () => {
     expect(body.uptime).toBeGreaterThanOrEqual(0);
     expect(body.owner).toBeNull();
     expect(body.identity).toBeNull();
+    expect(body.runtime).toEqual({
+      kind: "ps-node",
+      available: true,
+    });
+  });
+
+  it("exposes runtime availability when an availability port is configured", async () => {
+    const runtimeAvailability: RuntimeAvailabilityPort = {
+      isAvailable: vi.fn().mockResolvedValue(false),
+    };
+    const app = healthRoute({
+      version: "0.0.1",
+      startedAt: new Date(),
+      runtimeAvailability,
+    });
+
+    const res = await app.request("/health");
+    const body = await res.json();
+
+    expect(body.status).toBe("unavailable");
+    expect(body.runtime).toEqual({
+      kind: "ps-node",
+      available: false,
+    });
   });
 
   it("includes owner when serverOwner is set", async () => {
