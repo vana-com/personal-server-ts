@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { createPsLiteRuntime } from "./runtime.js";
+import {
+  createBearerTokenPsLiteAuth,
+  createMemoryPsLiteStorage,
+  createPsLiteRuntime,
+} from "./runtime.js";
 
 describe("createPsLiteRuntime", () => {
   it("reports ps-lite availability through health", async () => {
@@ -34,6 +38,190 @@ describe("createPsLiteRuntime", () => {
     expect(res.status).toBe(503);
     const body = await res.json();
     expect(body.error.errorCode).toBe("PS_UNAVAILABLE");
+  });
+
+  it("does not allow unauthenticated writes while active", async () => {
+    const runtime = createPsLiteRuntime({
+      storage: createMemoryPsLiteStorage(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+    });
+
+    const res = await runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "test_user" }),
+      }),
+    );
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error.errorCode).toBe("MISSING_AUTH");
+  });
+
+  it("stores and reads data through the ps-lite data contract", async () => {
+    const runtime = createPsLiteRuntime({
+      storage: createMemoryPsLiteStorage(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      now: () => new Date("2026-05-08T00:00:00.000Z"),
+    });
+
+    const write = await runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer owner-token",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ username: "test_user" }),
+      }),
+    );
+    expect(write.status).toBe(201);
+    await expect(write.json()).resolves.toEqual({
+      scope: "instagram.profile",
+      collectedAt: "2026-05-08T00:00:00.000Z",
+      status: "stored",
+    });
+
+    const read = await runtime.fetch(
+      new Request(
+        "https://ps.local/v1/data/instagram.profile?grantId=grant-1",
+        {
+          headers: { Authorization: "Bearer builder-token" },
+        },
+      ),
+    );
+
+    expect(read.status).toBe(200);
+    await expect(read.json()).resolves.toMatchObject({
+      version: "1.0",
+      scope: "instagram.profile",
+      collectedAt: "2026-05-08T00:00:00.000Z",
+      data: { username: "test_user" },
+    });
+  });
+
+  it("requires grantId for builder reads", async () => {
+    const runtime = createPsLiteRuntime({
+      storage: createMemoryPsLiteStorage(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+    });
+
+    const res = await runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile", {
+        headers: { Authorization: "Bearer builder-token" },
+      }),
+    );
+
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error.errorCode).toBe("GRANT_REQUIRED");
+  });
+
+  it("lists scopes and versions from browser-local storage", async () => {
+    const runtime = createPsLiteRuntime({
+      storage: createMemoryPsLiteStorage(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      now: () => new Date("2026-05-08T00:00:00.000Z"),
+    });
+
+    await runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer owner-token",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ username: "test_user" }),
+      }),
+    );
+
+    const scopes = await runtime.fetch(
+      new Request("https://ps.local/v1/data", {
+        headers: { Authorization: "Bearer builder-token" },
+      }),
+    );
+    const versions = await runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile/versions", {
+        headers: { Authorization: "Bearer builder-token" },
+      }),
+    );
+
+    expect(scopes.status).toBe(200);
+    await expect(scopes.json()).resolves.toMatchObject({
+      scopes: [
+        {
+          scope: "instagram.profile",
+          latestCollectedAt: "2026-05-08T00:00:00.000Z",
+          versionCount: 1,
+        },
+      ],
+      total: 1,
+    });
+
+    expect(versions.status).toBe(200);
+    await expect(versions.json()).resolves.toMatchObject({
+      scope: "instagram.profile",
+      versions: [{ collectedAt: "2026-05-08T00:00:00.000Z" }],
+      total: 1,
+    });
+  });
+
+  it("deletes a scope with owner auth", async () => {
+    const runtime = createPsLiteRuntime({
+      storage: createMemoryPsLiteStorage(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      now: () => new Date("2026-05-08T00:00:00.000Z"),
+    });
+
+    await runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer owner-token",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ username: "test_user" }),
+      }),
+    );
+
+    const deleted = await runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile", {
+        method: "DELETE",
+        headers: { Authorization: "Bearer owner-token" },
+      }),
+    );
+    expect(deleted.status).toBe(204);
+
+    const read = await runtime.fetch(
+      new Request(
+        "https://ps.local/v1/data/instagram.profile?grantId=grant-1",
+        {
+          headers: { Authorization: "Bearer builder-token" },
+        },
+      ),
+    );
+    expect(read.status).toBe(404);
   });
 
   it("can be activated for foreground handling", async () => {
