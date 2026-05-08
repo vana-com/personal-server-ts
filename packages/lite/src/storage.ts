@@ -74,7 +74,10 @@ function normalizeState(
   return {
     version: 1,
     nextId: Math.max(state.nextId, 1),
-    entries: state.entries,
+    entries: state.entries.map((entry) => ({
+      ...entry,
+      schemaId: entry.schemaId ?? null,
+    })),
     envelopes: state.envelopes,
   };
 }
@@ -271,6 +274,7 @@ export async function createPersistentPsLiteStorage(
     insertEntry(entry) {
       const indexed: IndexEntry = {
         ...entry,
+        schemaId: entry.schemaId ?? null,
         id: state.nextId,
         createdAt: new Date().toISOString(),
       };

@@ -40,6 +40,7 @@ function makeEntry(overrides?: Partial<IndexEntry>): IndexEntry {
   return {
     id: 1,
     fileId: null,
+    schemaId: null,
     path: `${SCOPE}/${COLLECTED_AT}.json`,
     scope: SCOPE,
     collectedAt: COLLECTED_AT,
@@ -176,6 +177,18 @@ describe("upload worker", () => {
         schemaId: SCHEMA_ID,
         signature: "0xmocksignature",
       });
+    });
+
+    it("uses indexed schemaId without a schema lookup", async () => {
+      const deps = makeMockDeps();
+      const entry = makeEntry({ schemaId: SCHEMA_ID });
+
+      await uploadOne(deps, entry);
+
+      expect(deps.gateway.getSchemaForScope).not.toHaveBeenCalled();
+      expect(deps.gateway.registerFile).toHaveBeenCalledWith(
+        expect.objectContaining({ schemaId: SCHEMA_ID }),
+      );
     });
 
     it("updates index with returned fileId", async () => {

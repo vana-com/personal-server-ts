@@ -32,6 +32,7 @@ describe("IndexManager", () => {
     expect(entry.scope).toBe("instagram.profile");
     expect(entry.collectedAt).toBe("2026-01-21T10:00:00Z");
     expect(entry.sizeBytes).toBe(256);
+    expect(entry.schemaId).toBeNull();
   });
 
   it("insert with fileId null stores null", () => {
@@ -44,6 +45,20 @@ describe("IndexManager", () => {
     });
 
     expect(entry.fileId).toBeNull();
+  });
+
+  it("insert with schemaId stores schema linkage", () => {
+    const entry = manager.insert({
+      fileId: null,
+      schemaId: "0xschema",
+      path: "test/scope/2026-01-21T10-00-00Z.json",
+      scope: "test.scope",
+      collectedAt: "2026-01-21T10:00:00Z",
+      sizeBytes: 100,
+    });
+
+    expect(entry.schemaId).toBe("0xschema");
+    expect(manager.findByPath(entry.path)!.schemaId).toBe("0xschema");
   });
 
   it("insert duplicate path throws unique constraint error", () => {

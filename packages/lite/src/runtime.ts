@@ -365,6 +365,7 @@ export function createMemoryPsLiteStorage(
     insertEntry(entry) {
       const indexed: IndexEntry = {
         ...entry,
+        schemaId: entry.schemaId ?? null,
         id: nextId,
         createdAt: new Date().toISOString(),
       };

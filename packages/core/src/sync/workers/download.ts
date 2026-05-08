@@ -88,6 +88,7 @@ export async function downloadOne(
   // 8. Insert into local index (with fileId)
   indexManager.insert({
     fileId: record.fileId,
+    schemaId: record.schemaId,
     path: relativePath,
     scope: envelope.scope,
     collectedAt: envelope.collectedAt,

@@ -346,6 +346,7 @@ describe("POST /v1/data/:scope", () => {
     );
     const content = JSON.parse(await readFile(filePath, "utf-8"));
     expect(content.$schema).toBe("https://ipfs.io/ipfs/QmTestSchema");
+    expect(content.schemaId).toBe("0xschema1");
   });
 
   it("returns 400 NO_SCHEMA when no schema registered for scope", async () => {

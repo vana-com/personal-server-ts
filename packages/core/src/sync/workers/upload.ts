@@ -59,10 +59,15 @@ export async function uploadOne(
     entry.collectedAt,
   );
 
-  // 2. Look up schema for the scope
-  const schema = await gateway.getSchemaForScope(entry.scope);
-  if (!schema) {
-    throw new Error(`No schema found for scope: ${entry.scope}`);
+  // 2. Resolve schemaId from the local index when available, or fall back
+  // to the Gateway for legacy entries created before schema IDs were indexed.
+  let schemaId = entry.schemaId;
+  if (!schemaId) {
+    const schema = await gateway.getSchemaForScope(entry.scope);
+    if (!schema) {
+      throw new Error(`No schema found for scope: ${entry.scope}`);
+    }
+    schemaId = schema.id;
   }
 
   // 3. Derive scope key → hex-encode as OpenPGP password
@@ -81,14 +86,14 @@ export async function uploadOne(
   const signature = await signer.signFileRegistration({
     ownerAddress: serverOwner as `0x${string}`,
     url,
-    schemaId: schema.id as `0x${string}`,
+    schemaId: schemaId as `0x${string}`,
   });
 
   // 7. Register file on-chain via Gateway
   const registration = await gateway.registerFile({
     ownerAddress: serverOwner,
     url,
-    schemaId: schema.id,
+    schemaId,
     signature,
   });
 

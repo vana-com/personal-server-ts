@@ -2,7 +2,11 @@ import type { Builder, Schema, ServerInfo } from "../gateway/client.js";
 import type { GatewayGrantResponse } from "../grants/types.js";
 import type { DataFileEnvelope } from "../schemas/data-file.js";
 import type { WriteResult } from "../storage/hierarchy/index.js";
-import type { IndexEntry, ScopeSummary } from "../storage/index/types.js";
+import type {
+  IndexEntry,
+  NewIndexEntry,
+  ScopeSummary,
+} from "../storage/index/types.js";
 import type { FileListResult, FileRecord } from "../sync/types.js";
 
 export interface ProtocolGatewayPort {
@@ -64,7 +68,7 @@ export interface DataStoragePort extends RuntimeStoragePort {
   findEntry(lookup: DataStorageEntryLookup): IndexEntry | undefined;
   readEnvelope(scope: string, collectedAt: string): Promise<DataFileEnvelope>;
   writeEnvelope(envelope: DataFileEnvelope): Promise<WriteResult>;
-  insertEntry(entry: Omit<IndexEntry, "id" | "createdAt">): IndexEntry;
+  insertEntry(entry: NewIndexEntry): IndexEntry;
   deleteScope(scope: string): Promise<number>;
 }
 

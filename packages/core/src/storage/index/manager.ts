@@ -1,8 +1,13 @@
 import type Database from "better-sqlite3";
-import type { IndexEntry, IndexListOptions, ScopeSummary } from "./types.js";
+import type {
+  IndexEntry,
+  IndexListOptions,
+  NewIndexEntry,
+  ScopeSummary,
+} from "./types.js";
 
 export interface IndexManager {
-  insert(entry: Omit<IndexEntry, "id" | "createdAt">): IndexEntry;
+  insert(entry: NewIndexEntry): IndexEntry;
   findByPath(path: string): IndexEntry | undefined;
   findByScope(options: IndexListOptions): IndexEntry[];
   findLatestByScope(scope: string): IndexEntry | undefined;
@@ -33,6 +38,7 @@ export interface IndexManager {
 interface RawRow {
   id: number;
   file_id: string | null;
+  schema_id: string | null;
   path: string;
   scope: string;
   collected_at: string;
@@ -44,6 +50,7 @@ function rowToEntry(row: RawRow): IndexEntry {
   return {
     id: row.id,
     fileId: row.file_id,
+    schemaId: row.schema_id,
     path: row.path,
     scope: row.scope,
     collectedAt: row.collected_at,
@@ -55,13 +62,14 @@ function rowToEntry(row: RawRow): IndexEntry {
 export function createIndexManager(db: Database.Database): IndexManager {
   const insertStmt = db.prepare<{
     file_id: string | null;
+    schema_id: string | null;
     path: string;
     scope: string;
     collected_at: string;
     size_bytes: number;
   }>(
-    `INSERT INTO data_files (file_id, path, scope, collected_at, size_bytes)
-     VALUES (@file_id, @path, @scope, @collected_at, @size_bytes)`,
+    `INSERT INTO data_files (file_id, schema_id, path, scope, collected_at, size_bytes)
+     VALUES (@file_id, @schema_id, @path, @scope, @collected_at, @size_bytes)`,
   );
 
   const findByPathStmt = db.prepare<{ path: string }>(
@@ -108,6 +116,7 @@ export function createIndexManager(db: Database.Database): IndexManager {
     insert(entry) {
       const result = insertStmt.run({
         file_id: entry.fileId,
+        schema_id: entry.schemaId ?? null,
         path: entry.path,
         scope: entry.scope,
         collected_at: entry.collectedAt,

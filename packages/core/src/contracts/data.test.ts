@@ -80,6 +80,7 @@ function createMemoryStorage(): DataStoragePort {
     insertEntry(entry) {
       const indexed = {
         ...entry,
+        schemaId: entry.schemaId ?? null,
         id: nextId,
         createdAt: "2026-05-08T00:00:00.000Z",
       };
@@ -113,6 +114,7 @@ describe("data contract helpers", () => {
       collectedAt: "2026-05-08T00:00:00.000Z",
       status: "stored",
       schemaUrl: "https://schemas.example/instagram.profile.json",
+      schemaId: "schema-1",
     });
 
     expect(ingest).toEqual({
@@ -162,6 +164,7 @@ describe("data contract helpers", () => {
         versions: [
           {
             collectedAt: "2026-05-08T00:00:00.000Z",
+            schemaId: "schema-1",
           },
         ],
       },
@@ -176,6 +179,7 @@ describe("data contract helpers", () => {
       ok: true,
       envelope: {
         $schema: "https://schemas.example/instagram.profile.json",
+        schemaId: "schema-1",
         data: { username: "test_user" },
       },
     });

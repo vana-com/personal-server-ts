@@ -53,6 +53,7 @@ export interface ListDataVersionsContractResult {
     scope: string;
     versions: Array<{
       fileId: string | null;
+      schemaId: string | null;
       collectedAt: string;
     }>;
     total: number;
@@ -81,6 +82,7 @@ export interface IngestDataContractInput {
   collectedAt: string;
   status: "stored" | "syncing";
   schemaUrl?: string;
+  schemaId?: string;
 }
 
 export interface IngestDataContractResult {
@@ -180,6 +182,7 @@ export function listDataVersionsContract(
       scope: scopeResult.scope,
       versions: entries.map((entry) => ({
         fileId: entry.fileId,
+        schemaId: entry.schemaId,
         collectedAt: entry.collectedAt,
       })),
       total: input.storage.countVersions(scopeResult.scope),
@@ -244,10 +247,12 @@ export async function ingestDataContract(
     input.collectedAt,
     input.body,
     input.schemaUrl,
+    input.schemaId,
   );
   const writeResult = await input.storage.writeEnvelope(envelope);
   input.storage.insertEntry({
     fileId: null,
+    schemaId: input.schemaId ?? null,
     path: writeResult.relativePath,
     scope: scopeResult.scope,
     collectedAt: input.collectedAt,

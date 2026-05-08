@@ -139,6 +139,7 @@ describe("download worker", () => {
       const existingEntry: IndexEntry = {
         id: 1,
         fileId: FILE_ID,
+        schemaId: SCHEMA_ID,
         path: RELATIVE_PATH,
         scope: SCOPE,
         collectedAt: COLLECTED_AT,
@@ -182,6 +183,7 @@ describe("download worker", () => {
       // Verify index insert was called
       expect(deps.indexManager.insert).toHaveBeenCalledWith({
         fileId: FILE_ID,
+        schemaId: SCHEMA_ID,
         path: RELATIVE_PATH,
         scope: SCOPE,
         collectedAt: COLLECTED_AT,

@@ -159,6 +159,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
 
     // 3. Look up schema via Gateway (strict: reject if not found)
     let schemaUrl: string | undefined;
+    let schemaId: string | undefined;
     try {
       const schema = await deps.gateway.getSchemaForScope(scope);
       if (!schema) {
@@ -171,6 +172,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         );
       }
       schemaUrl = schema.definitionUrl;
+      schemaId = schema.id;
     } catch (err) {
       deps.logger.error({ err, scope }, "Gateway schema lookup failed");
       return c.json(
@@ -193,6 +195,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       collectedAt,
       status,
       schemaUrl,
+      schemaId,
     });
     if (!ingest.ok) return c.json(ingest.body, ingest.status);
 

@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import Database from "better-sqlite3";
 import { initializeDatabase } from "./schema.js";
 
 describe("initializeDatabase", () => {
@@ -32,6 +33,7 @@ describe("initializeDatabase", () => {
     const columnNames = columns.map((c) => c.name);
     expect(columnNames).toContain("id");
     expect(columnNames).toContain("file_id");
+    expect(columnNames).toContain("schema_id");
     expect(columnNames).toContain("path");
     expect(columnNames).toContain("scope");
     expect(columnNames).toContain("collected_at");
@@ -94,13 +96,60 @@ describe("initializeDatabase", () => {
       | { path: string; scope: string; size_bytes: number }
       | undefined;
 
-    expect(version).toBe(1);
+    expect(version).toBe(2);
     expect(row).toEqual({
       path: "instagram/profile.json",
       scope: "instagram.profile",
       size_bytes: 42,
     });
     db2.close();
+
+    await rm(tempDir, { recursive: true });
+  });
+
+  it("migrates an existing v1 index by adding schema_id", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "schema-migrate-"));
+    const dbPath = join(tempDir, "migrate-test.db");
+
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE data_files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id TEXT,
+        path TEXT NOT NULL UNIQUE,
+        scope TEXT NOT NULL,
+        collected_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        size_bytes INTEGER NOT NULL DEFAULT 0
+      );
+      PRAGMA user_version = 1;
+    `);
+    legacy
+      .prepare(
+        "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+      )
+      .run(
+        "instagram/profile.json",
+        "instagram.profile",
+        "2026-01-21T10:00:00Z",
+        42,
+      );
+    legacy.close();
+
+    const db = initializeDatabase(dbPath);
+    const version = db.pragma("user_version", { simple: true });
+    const row = db
+      .prepare("SELECT path, schema_id FROM data_files WHERE path = ?")
+      .get("instagram/profile.json") as
+      | { path: string; schema_id: string | null }
+      | undefined;
+
+    expect(version).toBe(2);
+    expect(row).toEqual({
+      path: "instagram/profile.json",
+      schema_id: null,
+    });
+    db.close();
 
     await rm(tempDir, { recursive: true });
   });

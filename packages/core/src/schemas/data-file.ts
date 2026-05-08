@@ -4,6 +4,7 @@ export const DataFileEnvelopeSchema = z.object({
   $schema: z.string().url().optional(),
   version: z.literal("1.0"),
   scope: z.string(),
+  schemaId: z.string().optional(),
   collectedAt: z.string().datetime(),
   data: z.record(z.string(), z.unknown()),
 });
@@ -15,9 +16,11 @@ export function createDataFileEnvelope(
   collectedAt: string,
   data: Record<string, unknown>,
   schemaUrl?: string,
+  schemaId?: string,
 ): DataFileEnvelope {
   return {
     ...(schemaUrl !== undefined && { $schema: schemaUrl }),
+    ...(schemaId !== undefined && { schemaId }),
     version: "1.0",
     scope,
     collectedAt,

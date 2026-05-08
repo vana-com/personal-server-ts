@@ -40,6 +40,14 @@ describe("DataFileEnvelopeSchema", () => {
     });
     expect(result.$schema).toBe("https://ipfs.io/ipfs/QmTest123");
   });
+
+  it("parses an envelope with optional schemaId field", () => {
+    const result = DataFileEnvelopeSchema.parse({
+      schemaId: "0xschema",
+      ...validEnvelope,
+    });
+    expect(result.schemaId).toBe("0xschema");
+  });
 });
 
 describe("createDataFileEnvelope", () => {
@@ -66,6 +74,24 @@ describe("createDataFileEnvelope", () => {
     );
     expect(envelope).toEqual({
       $schema: "https://ipfs.io/ipfs/QmTest123",
+      version: "1.0",
+      scope: "instagram.profile",
+      collectedAt: "2026-01-21T10:00:00Z",
+      data: { username: "testuser" },
+    });
+  });
+
+  it("includes schemaId when provided", () => {
+    const envelope = createDataFileEnvelope(
+      "instagram.profile",
+      "2026-01-21T10:00:00Z",
+      { username: "testuser" },
+      "https://ipfs.io/ipfs/QmTest123",
+      "0xschema",
+    );
+    expect(envelope).toEqual({
+      $schema: "https://ipfs.io/ipfs/QmTest123",
+      schemaId: "0xschema",
       version: "1.0",
       scope: "instagram.profile",
       collectedAt: "2026-01-21T10:00:00Z",
