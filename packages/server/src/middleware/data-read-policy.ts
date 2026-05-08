@@ -31,6 +31,7 @@ export function createDataReadPolicyMiddleware(
           signer: auth.signer,
           grantId: auth.payload.grantId,
           requestedScope: c.req.param("scope") ?? "",
+          fileId: c.req.query("fileId"),
         },
         {
           authSessionVerifier: deps.gateway,

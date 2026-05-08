@@ -39,6 +39,7 @@ export interface PsLiteReadAuthInput {
   request: Request;
   scope: string;
   grantId?: string;
+  fileId?: string;
 }
 
 export interface PsLiteAuthAdapter {
@@ -237,6 +238,7 @@ export function createWeb3SignedPsLiteAuth(
           signer: verified.signer,
           grantId: verified.payload.grantId ?? input.grantId,
           requestedScope: input.scope,
+          fileId: input.fileId,
         },
         options.dataReadPolicyPorts,
       );
@@ -537,7 +539,12 @@ export function createPsLiteRuntime(
             url.searchParams.get("grantId") ??
             request.headers.get("x-ps-grant-id") ??
             undefined;
-          await auth.authorizeBuilderRead({ request, scope, grantId });
+          await auth.authorizeBuilderRead({
+            request,
+            scope,
+            grantId,
+            fileId: url.searchParams.get("fileId") ?? undefined,
+          });
           const result = await readDataContract({
             storage: dataStorage,
             scopeParam: scope,

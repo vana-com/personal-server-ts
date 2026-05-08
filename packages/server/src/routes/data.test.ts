@@ -1019,6 +1019,24 @@ describe("GET /v1/data/:scope", () => {
     expect(json.error.errorCode).toBe("SCOPE_MISMATCH");
   });
 
+  it("returns 403 SCOPE_MISMATCH when fileId is not authorized by grant", async () => {
+    const grant = makeGrant({ fileIds: ["file-1"] });
+    const gateway = createMockGateway({
+      getGrant: vi.fn().mockResolvedValue(grant),
+    });
+    const app = createApp({ gateway });
+
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+
+    const res = await getWithAuth(app, "instagram.profile", {
+      query: "?fileId=file-2",
+    });
+
+    expect(res.status).toBe(403);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("SCOPE_MISMATCH");
+  });
+
   it("returns 403 FEE_REQUIRED when fee verification fails", async () => {
     const app = createApp({
       feeVerifier: {

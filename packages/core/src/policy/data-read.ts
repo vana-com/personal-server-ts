@@ -22,6 +22,7 @@ export interface DataReadPolicyInput {
   signer: `0x${string}`;
   grantId?: string;
   requestedScope: string;
+  fileId?: string;
 }
 
 export interface DataReadPolicyPorts {
@@ -94,6 +95,23 @@ export async function verifyDataReadPolicy(
       requestedScope: input.requestedScope,
       grantedScopes: grantPayload.scopes,
     });
+  }
+
+  if (grant.fileIds.length > 0) {
+    if (!input.fileId) {
+      throw new ScopeMismatchError({
+        requestedScope: input.requestedScope,
+        reason: "Grant is restricted to fileIds; request must include fileId",
+        grantedFileIds: grant.fileIds,
+      });
+    }
+    if (!grant.fileIds.includes(input.fileId)) {
+      throw new ScopeMismatchError({
+        requestedScope: input.requestedScope,
+        requestedFileId: input.fileId,
+        grantedFileIds: grant.fileIds,
+      });
+    }
   }
 
   if (builder.id !== grant.granteeId) {

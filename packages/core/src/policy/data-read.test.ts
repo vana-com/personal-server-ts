@@ -79,6 +79,69 @@ describe("verifyDataReadPolicy", () => {
     ).rejects.toMatchObject({ errorCode: "FEE_REQUIRED" });
   });
 
+  it("allows a requested fileId included in a file-restricted grant", async () => {
+    const grant = makeGrant({ fileIds: ["file-1"] });
+    const result = await verifyDataReadPolicy(
+      {
+        signer: BUILDER_ADDRESS,
+        grantId: grant.id,
+        requestedScope: "instagram.profile",
+        fileId: "file-1",
+      },
+      {
+        authSessionVerifier: { getBuilder: vi.fn().mockResolvedValue(builder) },
+        grantVerifier: { getGrant: vi.fn().mockResolvedValue(grant) },
+      },
+    );
+
+    expect(result).toBe(grant);
+  });
+
+  it("returns SCOPE_MISMATCH when a file-restricted grant lacks the requested fileId", async () => {
+    await expect(
+      verifyDataReadPolicy(
+        {
+          signer: BUILDER_ADDRESS,
+          grantId: "grant-123",
+          requestedScope: "instagram.profile",
+          fileId: "file-2",
+        },
+        {
+          authSessionVerifier: {
+            getBuilder: vi.fn().mockResolvedValue(builder),
+          },
+          grantVerifier: {
+            getGrant: vi
+              .fn()
+              .mockResolvedValue(makeGrant({ fileIds: ["file-1"] })),
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ errorCode: "SCOPE_MISMATCH" });
+  });
+
+  it("requires fileId when a grant is restricted to fileIds", async () => {
+    await expect(
+      verifyDataReadPolicy(
+        {
+          signer: BUILDER_ADDRESS,
+          grantId: "grant-123",
+          requestedScope: "instagram.profile",
+        },
+        {
+          authSessionVerifier: {
+            getBuilder: vi.fn().mockResolvedValue(builder),
+          },
+          grantVerifier: {
+            getGrant: vi
+              .fn()
+              .mockResolvedValue(makeGrant({ fileIds: ["file-1"] })),
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ errorCode: "SCOPE_MISMATCH" });
+  });
+
   it("returns PS_UNAVAILABLE when the runtime availability port is down", async () => {
     await expect(
       verifyDataReadPolicy(
