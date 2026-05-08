@@ -9,6 +9,15 @@ import {
 } from "@opendatalabs/personal-server-ts-core/errors";
 import { verifyWeb3Signed } from "@opendatalabs/personal-server-ts-core/auth";
 import {
+  deleteDataScopeContract,
+  ingestDataContract,
+  listDataScopesContract,
+  listDataVersionsContract,
+  parseDataScopeContract,
+  readDataContract,
+  type DataContractError,
+} from "@opendatalabs/personal-server-ts-core/contracts";
+import {
   verifyDataReadPolicy,
   type DataReadPolicyPorts,
 } from "@opendatalabs/personal-server-ts-core/policy";
@@ -19,12 +28,7 @@ import type {
   DataStorageScopeListOptions,
   RuntimeAvailabilityPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
-import {
-  createDataFileEnvelope,
-  type DataFileEnvelope,
-} from "@opendatalabs/personal-server-ts-core/schemas/data-file";
-import { ScopeSchema } from "@opendatalabs/personal-server-ts-core/scopes";
-import type { WriteResult } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
+import { type DataFileEnvelope } from "@opendatalabs/personal-server-ts-core/schemas/data-file";
 import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
 
 export interface PsLiteStorageAdapter {
@@ -103,6 +107,10 @@ function errorResponse(
     },
     { status },
   );
+}
+
+function contractErrorResponse(err: DataContractError): Response {
+  return errorResponse(err.status, err.body.error, err.body.message);
 }
 
 function unavailableResponse(): Response {
@@ -380,11 +388,9 @@ export function createMemoryPsLiteStorage(
 }
 
 function parseScope(pathPart: string): string | Response {
-  const scopeResult = ScopeSchema.safeParse(decodeURIComponent(pathPart));
-  if (!scopeResult.success) {
-    return errorResponse(400, "INVALID_SCOPE", "Invalid scope");
-  }
-  return scopeResult.data;
+  const scopeResult = parseDataScopeContract(decodeURIComponent(pathPart));
+  if (!scopeResult.ok) return contractErrorResponse(scopeResult);
+  return scopeResult.scope;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -481,12 +487,13 @@ export function createPsLiteRuntime(
           await auth.authorizeBuilderList(request);
           const limit = normalizeLimit(url.searchParams.get("limit"), 20);
           const offset = normalizeLimit(url.searchParams.get("offset"), 0);
-          const result = dataStorage.listScopes({
+          const result = listDataScopesContract({
+            storage: dataStorage,
             scopePrefix: url.searchParams.get("scopePrefix") ?? undefined,
             limit,
             offset,
           });
-          return jsonResponse({ ...result, limit, offset });
+          return jsonResponse(result.response);
         }
 
         if (!url.pathname.startsWith(`${dataPrefix}/`)) {
@@ -510,17 +517,14 @@ export function createPsLiteRuntime(
           await auth.authorizeBuilderList(request);
           const limit = normalizeLimit(url.searchParams.get("limit"), 20);
           const offset = normalizeLimit(url.searchParams.get("offset"), 0);
-          const versions = dataStorage.listVersions(scope, { limit, offset });
-          return jsonResponse({
-            scope,
-            versions: versions.map((entry) => ({
-              fileId: entry.fileId,
-              collectedAt: entry.collectedAt,
-            })),
-            total: dataStorage.countVersions(scope),
+          const result = listDataVersionsContract({
+            storage: dataStorage,
+            scopeParam: scope,
             limit,
             offset,
           });
+          if (!result.ok) return contractErrorResponse(result);
+          return jsonResponse(result.response);
         }
 
         if (parts.length !== 1) {
@@ -533,21 +537,14 @@ export function createPsLiteRuntime(
             request.headers.get("x-ps-grant-id") ??
             undefined;
           await auth.authorizeBuilderRead({ request, scope, grantId });
-          const entry = dataStorage.findEntry({
-            scope,
+          const result = await readDataContract({
+            storage: dataStorage,
+            scopeParam: scope,
             fileId: url.searchParams.get("fileId") ?? undefined,
             at: url.searchParams.get("at") ?? undefined,
           });
-          if (!entry) {
-            return errorResponse(
-              404,
-              "NOT_FOUND",
-              `No data found for scope "${scope}"`,
-            );
-          }
-          return jsonResponse(
-            await dataStorage.readEnvelope(scope, entry.collectedAt),
-          );
+          if (!result.ok) return contractErrorResponse(result);
+          return jsonResponse(result.envelope);
         }
 
         if (request.method === "POST") {
@@ -557,31 +554,24 @@ export function createPsLiteRuntime(
             return parsed.response;
           }
           const collectedAt = now().toISOString();
-          const envelope = createDataFileEnvelope(
-            scope,
+          const result = await ingestDataContract({
+            storage: dataStorage,
+            scopeParam: scope,
+            body: parsed.body,
             collectedAt,
-            parsed.body,
-          );
-          const writeResult: WriteResult =
-            await dataStorage.writeEnvelope(envelope);
-          dataStorage.insertEntry({
-            fileId: null,
-            path: writeResult.relativePath,
-            scope,
-            collectedAt,
-            sizeBytes: writeResult.sizeBytes,
+            status: "stored",
           });
-          return jsonResponse(
-            { scope, collectedAt, status: "stored" },
-            {
-              status: 201,
-            },
-          );
+          if (!result.ok) return contractErrorResponse(result);
+          return jsonResponse(result.response, { status: 201 });
         }
 
         if (request.method === "DELETE") {
           await auth.authorizeOwner(request);
-          await dataStorage.deleteScope(scope);
+          const result = await deleteDataScopeContract({
+            storage: dataStorage,
+            scopeParam: scope,
+          });
+          if (!result.ok) return contractErrorResponse(result);
           return new Response(null, { status: 204 });
         }
 

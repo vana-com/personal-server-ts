@@ -1,6 +1,12 @@
 import { Hono } from "hono";
-import { ScopeSchema } from "@opendatalabs/personal-server-ts-core/scopes";
-import { createDataFileEnvelope } from "@opendatalabs/personal-server-ts-core/schemas/data-file";
+import {
+  deleteDataScopeContract,
+  ingestDataContract,
+  listDataScopesContract,
+  listDataVersionsContract,
+  parseDataScopeContract,
+  readDataContract,
+} from "@opendatalabs/personal-server-ts-core/contracts";
 import { generateCollectedAt } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
@@ -71,21 +77,6 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
 
   // GET /v1/data/:scope/versions — list versions for a scope (requires auth + builder, no grant)
   app.get("/:scope/versions", web3Auth, builderCheck, async (c) => {
-    // 1. Validate scope
-    const scopeParam = c.req.param("scope");
-    const scopeResult = ScopeSchema.safeParse(scopeParam);
-    if (!scopeResult.success) {
-      return c.json(
-        {
-          error: "INVALID_SCOPE",
-          message: scopeResult.error.issues[0].message,
-        },
-        400,
-      );
-    }
-    const scope = scopeResult.data;
-
-    // 2. Parse pagination
     const limit = c.req.query("limit")
       ? parseInt(c.req.query("limit")!, 10)
       : 20;
@@ -93,21 +84,14 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       ? parseInt(c.req.query("offset")!, 10)
       : 0;
 
-    // 3. Query index
-    const entries = dataStorage.listVersions(scope, { limit, offset });
-    const total = dataStorage.countVersions(scope);
-
-    // 4. Return response
-    return c.json({
-      scope,
-      versions: entries.map((e) => ({
-        fileId: e.fileId,
-        collectedAt: e.collectedAt,
-      })),
-      total,
+    const result = listDataVersionsContract({
+      storage: dataStorage,
+      scopeParam: c.req.param("scope"),
       limit,
       offset,
     });
+    if (!result.ok) return c.json(result.body, result.status);
+    return c.json(result.response);
   });
 
   // GET /v1/data — list distinct scopes (requires auth + builder, no grant)
@@ -120,82 +104,36 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       ? parseInt(c.req.query("offset")!, 10)
       : 0;
 
-    const result = dataStorage.listScopes({
+    const result = listDataScopesContract({
+      storage: dataStorage,
       scopePrefix: scopePrefix || undefined,
       limit,
       offset,
     });
 
-    return c.json({
-      scopes: result.scopes,
-      total: result.total,
-      limit,
-      offset,
-    });
+    return c.json(result.response);
   });
 
   // GET /v1/data/:scope — read a data file (requires auth + grant)
   app.get("/:scope", web3Auth, dataReadPolicy, accessLog, async (c) => {
-    // 1. Validate scope
-    const scopeParam = c.req.param("scope");
-    const scopeResult = ScopeSchema.safeParse(scopeParam);
-    if (!scopeResult.success) {
-      return c.json(
-        {
-          error: "INVALID_SCOPE",
-          message: scopeResult.error.issues[0].message,
-        },
-        400,
-      );
-    }
-    const scope = scopeResult.data;
-
-    // 2. Determine lookup strategy: fileId, at, or latest
-    const fileIdParam = c.req.query("fileId");
-    const atParam = c.req.query("at");
-
-    const entry = dataStorage.findEntry({
-      scope,
-      fileId: fileIdParam,
-      at: atParam,
+    const result = await readDataContract({
+      storage: dataStorage,
+      scopeParam: c.req.param("scope"),
+      fileId: c.req.query("fileId"),
+      at: c.req.query("at"),
     });
-
-    // 3. 404 if not found
-    if (!entry) {
-      return c.json(
-        {
-          error: "NOT_FOUND",
-          message: `No data found for scope "${scope}"`,
-        },
-        404,
-      );
-    }
-
-    // 4. Read the data file from disk
-    const envelope = await dataStorage.readEnvelope(scope, entry.collectedAt);
-
-    // 5. Return 200 with envelope
-    return c.json(envelope);
+    if (!result.ok) return c.json(result.body, result.status);
+    return c.json(result.envelope);
   });
 
   app.use("/:scope", createBodyLimit(DATA_INGEST_MAX_SIZE));
 
   app.post("/:scope", web3Auth, ownerCheck, async (c) => {
-    // 1. Parse & validate scope
     const scopeParam = c.req.param("scope");
-    const scopeResult = ScopeSchema.safeParse(scopeParam);
-    if (!scopeResult.success) {
-      return c.json(
-        {
-          error: "INVALID_SCOPE",
-          message: scopeResult.error.issues[0].message,
-        },
-        400,
-      );
-    }
-    const scope = scopeResult.data;
+    const scopeResult = parseDataScopeContract(scopeParam);
+    if (!scopeResult.ok) return c.json(scopeResult.body, scopeResult.status);
+    const { scope } = scopeResult;
 
-    // 2. Parse JSON body
     let body: unknown;
     try {
       body = await c.req.json();
@@ -244,67 +182,44 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       );
     }
 
-    // 4. Generate collectedAt
     const collectedAt = generateCollectedAt();
-
-    // 5. Construct envelope
-    const envelope = createDataFileEnvelope(
-      scope,
+    const status: "stored" | "syncing" = deps.syncManager
+      ? "syncing"
+      : "stored";
+    const ingest = await ingestDataContract({
+      storage: dataStorage,
+      scopeParam,
+      body,
       collectedAt,
-      body as Record<string, unknown>,
+      status,
       schemaUrl,
-    );
-
-    // 6. Write atomically
-    const writeResult = await dataStorage.writeEnvelope(envelope);
-
-    // 7. Insert into index
-    dataStorage.insertEntry({
-      fileId: null,
-      path: writeResult.relativePath,
-      scope,
-      collectedAt,
-      sizeBytes: writeResult.sizeBytes,
     });
+    if (!ingest.ok) return c.json(ingest.body, ingest.status);
 
     deps.logger.info(
-      { scope, collectedAt, path: writeResult.relativePath },
+      { scope, collectedAt, path: ingest.writeResult.relativePath },
       "Data file ingested",
     );
 
-    // 8. Notify sync manager of new data (if enabled)
-    let status: "stored" | "syncing" = "stored";
     if (deps.syncManager) {
       deps.syncManager.notifyNewData();
-      status = "syncing";
     }
 
-    // 9. Return 201
-    return c.json({ scope, collectedAt, status }, 201);
+    return c.json(ingest.response, 201);
   });
 
   // DELETE /v1/data/:scope — delete all versions for a scope (owner auth required)
   app.delete("/:scope", web3Auth, ownerCheck, async (c) => {
-    // 1. Validate scope
-    const scopeParam = c.req.param("scope");
-    const scopeResult = ScopeSchema.safeParse(scopeParam);
-    if (!scopeResult.success) {
-      return c.json(
-        {
-          error: "INVALID_SCOPE",
-          message: scopeResult.error.issues[0].message,
-        },
-        400,
-      );
-    }
-    const scope = scopeResult.data;
+    const result = await deleteDataScopeContract({
+      storage: dataStorage,
+      scopeParam: c.req.param("scope"),
+    });
+    if (!result.ok) return c.json(result.body, result.status);
 
-    // 2. Delete from index
-    const deletedCount = await dataStorage.deleteScope(scope);
-
-    deps.logger.info({ scope, deletedCount }, "Scope deleted");
-
-    // 4. Return 204
+    deps.logger.info(
+      { scope: c.req.param("scope"), deletedCount: result.deletedCount },
+      "Scope deleted",
+    );
     return c.body(null, 204);
   });
 
