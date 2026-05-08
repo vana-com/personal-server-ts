@@ -1,5 +1,5 @@
-import type { GatewayGrantResponse } from "../grants/types.js";
-import { scopeCoveredByGrant } from "../scopes/index.js";
+import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
+import { scopeCoveredByGrant } from "@opendatalabs/vana-sdk/browser";
 import {
   FeeRequiredError,
   GrantExpiredError,

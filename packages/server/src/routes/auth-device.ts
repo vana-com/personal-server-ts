@@ -13,13 +13,16 @@ import type { Logger } from "pino";
 import {
   verifyWeb3Signed,
   type VerifiedAuth,
-} from "@opendatalabs/personal-server-ts-core/auth";
+} from "@opendatalabs/vana-sdk/node";
 import {
   NotOwnerError,
   ProtocolError,
 } from "@opendatalabs/personal-server-ts-core/errors";
 import type { TokenStore } from "../token-store.js";
-import { createWeb3AuthMiddleware } from "../middleware/web3-auth.js";
+import {
+  createWeb3AuthMiddleware,
+  mapSdkAuthError,
+} from "../middleware/web3-auth.js";
 import { createOwnerCheckMiddleware } from "../middleware/owner-check.js";
 
 export interface LoginV2Deps {
@@ -189,6 +192,8 @@ async function verifyRemoteOwnerApproval(
 
     return auth;
   } catch (err) {
+    const authError = mapSdkAuthError(err);
+    if (authError) return c.json(authError.toJSON(), authError.code as 401);
     if (err instanceof ProtocolError) {
       return c.json(err.toJSON(), err.code as 401 | 403);
     }

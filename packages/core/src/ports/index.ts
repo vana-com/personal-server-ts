@@ -1,13 +1,18 @@
-import type { Builder, Schema, ServerInfo } from "../gateway/client.js";
-import type { GatewayGrantResponse } from "../grants/types.js";
-import type { DataFileEnvelope } from "../schemas/data-file.js";
+import type {
+  Builder,
+  DataFileEnvelope,
+  FileListResult,
+  FileRecord,
+  GatewayGrantResponse,
+  Schema,
+  ServerInfo,
+} from "@opendatalabs/vana-sdk/browser";
 import type { WriteResult } from "../storage/hierarchy/index.js";
 import type {
   IndexEntry,
   NewIndexEntry,
   ScopeSummary,
 } from "../storage/index/types.js";
-import type { FileListResult, FileRecord } from "../sync/types.js";
 
 export interface ProtocolGatewayPort {
   getBuilder(address: string): Promise<Builder | null>;

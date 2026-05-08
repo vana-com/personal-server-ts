@@ -6,11 +6,8 @@ import {
   createTestWallet,
   buildWeb3SignedHeader,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
-import type {
-  GatewayClient,
-  Builder,
-} from "@opendatalabs/personal-server-ts-core/gateway";
-import type { GatewayGrantResponse } from "@opendatalabs/personal-server-ts-core/grants";
+import type { GatewayClient, Builder } from "@opendatalabs/vana-sdk/node";
+import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const wallet = createTestWallet(0);

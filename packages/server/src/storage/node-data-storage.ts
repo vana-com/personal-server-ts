@@ -11,7 +11,7 @@ import type {
   DataStoragePort,
   DataStorageScopeListOptions,
 } from "@opendatalabs/personal-server-ts-core/ports";
-import type { DataFileEnvelope } from "@opendatalabs/personal-server-ts-core/schemas/data-file";
+import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/node";
 
 export interface NodeDataStorageDeps {
   indexManager: IndexManager;

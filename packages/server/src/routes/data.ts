@@ -10,7 +10,7 @@ import {
 import { generateCollectedAt } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
-import type { GatewayClient } from "@opendatalabs/personal-server-ts-core/gateway";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type {

@@ -10,8 +10,10 @@ import {
 } from "node:fs/promises";
 import { dirname, relative } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { DataFileEnvelope } from "../../schemas/data-file.js";
-import { DataFileEnvelopeSchema } from "../../schemas/data-file.js";
+import {
+  DataFileEnvelopeSchema,
+  type DataFileEnvelope,
+} from "@opendatalabs/vana-sdk/browser";
 import {
   buildDataFilePath,
   buildScopeDir,

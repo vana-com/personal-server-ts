@@ -1,5 +1,5 @@
 import type { MiddlewareHandler } from "hono";
-import type { GatewayClient } from "@opendatalabs/personal-server-ts-core/gateway";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { UnregisteredBuilderError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { RequestAuth } from "./web3-auth.js";
 

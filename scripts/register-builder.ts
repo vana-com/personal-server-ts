@@ -14,7 +14,7 @@ import {
   builderRegistrationDomain,
   BUILDER_REGISTRATION_TYPES,
   type BuilderRegistrationMessage,
-} from "../packages/core/src/signing/index.js";
+} from "@opendatalabs/vana-sdk/node";
 
 async function main() {
   const ownerKey = process.env.VANA_OWNER_PRIVATE_KEY;

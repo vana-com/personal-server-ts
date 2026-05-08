@@ -5,7 +5,7 @@ import type {
   FeeVerifierPort,
   RuntimeAvailabilityPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
-import type { GatewayClient } from "@opendatalabs/personal-server-ts-core/gateway";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { RequestAuth } from "./web3-auth.js";
 

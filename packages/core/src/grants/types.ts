@@ -16,16 +16,3 @@ export interface GrantWithSignature {
   payload: GrantPayload;
   signature: `0x${string}`;
 }
-
-/** Gateway response for GET /v1/grants/{grantId} (unwrapped from envelope) */
-export interface GatewayGrantResponse {
-  id: string;
-  grantorAddress: string;
-  granteeId: string;
-  grant: string;
-  fileIds: string[];
-  status: "pending" | "confirmed";
-  addedAt: string;
-  revokedAt: string | null;
-  revocationSignature: string | null;
-}

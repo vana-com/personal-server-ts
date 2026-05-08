@@ -14,7 +14,7 @@ import {
   FILE_REGISTRATION_TYPES,
   GRANT_REGISTRATION_TYPES,
   GRANT_REVOCATION_TYPES,
-} from "./eip712.js";
+} from "@opendatalabs/vana-sdk/node";
 
 const TEST_GATEWAY_CONFIG: GatewayConfig = {
   chainId: 14800,

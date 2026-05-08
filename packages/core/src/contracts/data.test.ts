@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { DataFileEnvelope } from "../schemas/data-file.js";
+import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { DataStoragePort } from "../ports/index.js";
 import type { IndexEntry } from "../storage/index/index.js";
 import {

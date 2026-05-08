@@ -62,7 +62,7 @@ function getErrorDetails(err: unknown): Record<string, unknown> | undefined {
   return undefined;
 }
 
-function mapSdkAuthError(err: unknown): ProtocolError | null {
+export function mapSdkAuthError(err: unknown): ProtocolError | null {
   if (err instanceof SdkMissingAuthError) {
     return new MissingAuthError(getErrorDetails(err));
   }

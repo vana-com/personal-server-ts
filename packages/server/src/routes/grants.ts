@@ -5,7 +5,7 @@
 import { Hono } from "hono";
 import type { Logger } from "pino";
 import { verifyTypedData } from "viem";
-import type { GatewayClient } from "@opendatalabs/personal-server-ts-core/gateway";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import {
   GRANT_DOMAIN,
   GRANT_TYPES,

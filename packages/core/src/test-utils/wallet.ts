@@ -5,6 +5,7 @@
 
 import { privateKeyToAccount } from "viem/accounts";
 import type { PrivateKeyAccount } from "viem";
+import { buildWeb3SignedHeader as sdkBuildWeb3SignedHeader } from "@opendatalabs/vana-sdk/node";
 
 export interface TestWallet {
   address: `0x${string}`;
@@ -50,15 +51,6 @@ export function createTestWallet(seed: number = 0): TestWallet {
   };
 }
 
-/** Base64url encode a string (no padding). */
-function base64urlEncode(input: string): string {
-  return Buffer.from(input, "utf-8")
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-}
-
 /**
  * Build a valid Web3Signed Authorization header value.
  * Format: "Web3Signed {base64url(payload)}.{signature}"
@@ -75,36 +67,14 @@ export async function buildWeb3SignedHeader(params: {
   exp?: number;
   grantId?: string;
 }): Promise<string> {
-  const now = Math.floor(Date.now() / 1000);
-  const payload: Record<string, unknown> = {
+  return sdkBuildWeb3SignedHeader({
+    signMessage: (message: string) => params.wallet.signMessage(message),
     aud: params.aud,
-    // SHA256 of empty string is a well-known constant
-    bodyHash:
-      params.bodyHash ??
-      "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    exp: params.exp ?? now + 300,
-    iat: params.iat ?? now,
     method: params.method,
     uri: params.uri,
-  };
-
-  if (params.grantId !== undefined) {
-    payload["grantId"] = params.grantId;
-  }
-
-  // Sort keys for deterministic serialization
-  const sortedPayload = Object.keys(payload)
-    .sort()
-    .reduce<Record<string, unknown>>((acc, key) => {
-      acc[key] = payload[key];
-      return acc;
-    }, {});
-
-  const payloadJson = JSON.stringify(sortedPayload);
-  const payloadBase64 = base64urlEncode(payloadJson);
-
-  // Sign the base64url string via EIP-191
-  const signature = await params.wallet.signMessage(payloadBase64);
-
-  return `Web3Signed ${payloadBase64}.${signature}`;
+    bodyHash: params.bodyHash,
+    iat: params.iat,
+    exp: params.exp,
+    grantId: params.grantId,
+  });
 }

@@ -1,6 +1,6 @@
 import type { MiddlewareHandler } from "hono";
-import type { GatewayClient } from "@opendatalabs/personal-server-ts-core/gateway";
-import { scopeCoveredByGrant } from "@opendatalabs/personal-server-ts-core/scopes";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
+import { scopeCoveredByGrant } from "@opendatalabs/vana-sdk/node";
 import {
   GrantRequiredError,
   GrantRevokedError,

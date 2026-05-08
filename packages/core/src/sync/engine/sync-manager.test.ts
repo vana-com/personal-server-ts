@@ -4,7 +4,7 @@ import type { UploadWorkerDeps } from "../workers/upload.js";
 import type { DownloadWorkerDeps } from "../workers/download.js";
 import type { IndexManager } from "../../storage/index/manager.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
-import type { GatewayClient } from "../../gateway/client.js";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import type { ServerSigner } from "../../signing/signer.js";
 import type { SyncCursor } from "../cursor.js";
 import type { HierarchyManagerOptions } from "../../storage/hierarchy/index.js";

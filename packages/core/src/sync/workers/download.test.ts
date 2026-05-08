@@ -2,14 +2,17 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 import type { DownloadWorkerDeps } from "./download.js";
 import { downloadOne, downloadAll } from "./download.js";
-import type { FileRecord } from "../types.js";
+import type {
+  DataFileEnvelope,
+  FileRecord,
+  GatewayClient,
+  Schema,
+} from "@opendatalabs/vana-sdk/node";
 import type { IndexManager } from "../../storage/index/manager.js";
 import type { IndexEntry } from "../../storage/index/types.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
-import type { GatewayClient, Schema } from "../../gateway/client.js";
 import type { SyncCursor } from "../cursor.js";
 import type { HierarchyManagerOptions } from "../../storage/hierarchy/index.js";
-import type { DataFileEnvelope } from "../../schemas/data-file.js";
 import type { Logger } from "pino";
 
 // Mock the filesystem-dependent modules
@@ -17,17 +20,17 @@ vi.mock("../../storage/hierarchy/index.js", () => ({
   writeDataFile: vi.fn(),
 }));
 
-vi.mock("../../keys/derive.js", () => ({
+vi.mock("@opendatalabs/vana-sdk/node", async (importOriginal) => ({
+  ...(await importOriginal()),
   deriveScopeKey: vi.fn(),
-}));
-
-vi.mock("../../storage/encryption/index.js", () => ({
   decryptWithPassword: vi.fn(),
 }));
 
 import { writeDataFile } from "../../storage/hierarchy/index.js";
-import { deriveScopeKey } from "../../keys/derive.js";
-import { decryptWithPassword } from "../../storage/encryption/index.js";
+import {
+  decryptWithPassword,
+  deriveScopeKey,
+} from "@opendatalabs/vana-sdk/node";
 
 const SCOPE = "instagram.profile";
 const COLLECTED_AT = "2026-01-21T10:00:00Z";

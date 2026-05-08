@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { scopeToPathSegments } from "../../scopes/parse.js";
+import { scopeToPathSegments } from "@opendatalabs/vana-sdk/browser";
 
 /** "2026-01-21T10:00:00Z" → "2026-01-21T10-00-00Z" */
 export function timestampToFilename(isoTimestamp: string): string {

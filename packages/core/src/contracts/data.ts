@@ -1,9 +1,9 @@
 import { type DataStoragePort } from "../ports/index.js";
 import {
   createDataFileEnvelope,
+  ScopeSchema,
   type DataFileEnvelope,
-} from "../schemas/data-file.js";
-import { ScopeSchema } from "../scopes/index.js";
+} from "@opendatalabs/vana-sdk/browser";
 import { type WriteResult } from "../storage/hierarchy/index.js";
 
 export type DataContractErrorCode =

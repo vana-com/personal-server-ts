@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createDataFileEnvelope } from "@opendatalabs/personal-server-ts-core/schemas/data-file";
+import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
   createMemoryPsLitePersistence,
   createPersistentPsLiteStorage,

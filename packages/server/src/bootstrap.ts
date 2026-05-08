@@ -20,16 +20,16 @@ import {
   type IndexManager,
 } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
-import { createGatewayClient } from "@opendatalabs/personal-server-ts-core/gateway";
-import type { GatewayClient } from "@opendatalabs/personal-server-ts-core/gateway";
+import { createGatewayClient } from "@opendatalabs/vana-sdk/node";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { createAccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import { createAccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import {
   deriveMasterKey,
   recoverServerOwner,
-  loadOrCreateServerAccount,
-} from "@opendatalabs/personal-server-ts-core/keys";
+} from "@opendatalabs/vana-sdk/node";
+import { loadOrCreateServerAccount } from "@opendatalabs/personal-server-ts-core/keys";
 import type { ServerAccount } from "@opendatalabs/personal-server-ts-core/keys";
 import {
   createServerSigner,

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import type { Builder } from "../gateway/client.js";
-import type { GatewayGrantResponse } from "../grants/types.js";
+import type { Builder } from "@opendatalabs/vana-sdk/node";
+import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
 import { verifyDataReadPolicy } from "./data-read.js";
 
 const BUILDER_ADDRESS = "0x0000000000000000000000000000000000000001";

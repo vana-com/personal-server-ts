@@ -5,8 +5,8 @@ import type {
   AccessLogWriter,
   AccessLogEntry,
 } from "@opendatalabs/personal-server-ts-core/logging/access-log";
-import type { VerifiedAuth } from "@opendatalabs/personal-server-ts-core/auth";
-import type { GatewayGrantResponse } from "@opendatalabs/personal-server-ts-core/grants";
+import type { VerifiedAuth } from "@opendatalabs/vana-sdk/node";
+import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
 
 function createMockWriter(
   overrides: Partial<AccessLogWriter> = {},

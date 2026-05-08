@@ -1,10 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { pino } from "pino";
-import type {
-  GatewayClient,
-  Builder,
-} from "@opendatalabs/personal-server-ts-core/gateway";
-import type { GrantListItem } from "@opendatalabs/personal-server-ts-core/gateway";
+import type { GatewayClient, Builder } from "@opendatalabs/vana-sdk/node";
+import type { GrantListItem } from "@opendatalabs/vana-sdk/node";
 import {
   GRANT_DOMAIN,
   GRANT_TYPES,

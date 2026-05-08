@@ -10,7 +10,7 @@ import {
   serverRegistrationDomain,
   SERVER_REGISTRATION_TYPES,
   type ServerRegistrationMessage,
-} from "../../packages/core/src/signing/index.js";
+} from "@opendatalabs/vana-sdk/node";
 import { DEFAULTS } from "../../packages/core/src/schemas/server-config.js";
 
 const KNOWN_SIG =

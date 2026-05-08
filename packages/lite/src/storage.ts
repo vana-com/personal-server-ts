@@ -1,5 +1,5 @@
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
-import type { DataFileEnvelope } from "@opendatalabs/personal-server-ts-core/schemas/data-file";
+import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { WriteResult } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { PsLiteStorageAdapter } from "./runtime.js";

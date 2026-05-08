@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { MiddlewareHandler } from "hono";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
-import type { GatewayGrantResponse } from "@opendatalabs/personal-server-ts-core/grants";
+import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
 import type { RequestAuth } from "./web3-auth.js";
 
 /**

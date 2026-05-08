@@ -13,11 +13,8 @@ import {
   buildDataFilePath,
   buildScopeDir,
 } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
-import type {
-  GatewayClient,
-  Builder,
-} from "@opendatalabs/personal-server-ts-core/gateway";
-import type { GatewayGrantResponse } from "@opendatalabs/personal-server-ts-core/grants";
+import type { GatewayClient, Builder } from "@opendatalabs/vana-sdk/node";
+import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import {
   createTestWallet,

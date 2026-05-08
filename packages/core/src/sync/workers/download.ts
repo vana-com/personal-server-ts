@@ -1,14 +1,16 @@
 import type { IndexManager } from "../../storage/index/manager.js";
 import type { HierarchyManagerOptions } from "../../storage/hierarchy/index.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
-import type { GatewayClient } from "../../gateway/client.js";
+import {
+  DataFileEnvelopeSchema,
+  decryptWithPassword,
+  deriveScopeKey,
+  type FileRecord,
+  type GatewayClient,
+} from "@opendatalabs/vana-sdk/node";
 import type { SyncCursor } from "../cursor.js";
-import type { FileRecord } from "../types.js";
 import type { Logger } from "pino";
 import { writeDataFile } from "../../storage/hierarchy/index.js";
-import { deriveScopeKey } from "../../keys/derive.js";
-import { decryptWithPassword } from "../../storage/encryption/index.js";
-import { DataFileEnvelopeSchema } from "../../schemas/data-file.js";
 
 export interface DownloadWorkerDeps {
   indexManager: IndexManager;

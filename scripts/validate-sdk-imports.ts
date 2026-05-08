@@ -86,6 +86,10 @@ async function validateImportSmoke(
       "encryptWithPassword",
       "decryptWithPassword",
       "verifyWeb3Signed",
+      "createGatewayClient",
+      "parseScope",
+      "scopeCoveredByGrant",
+      "createDataFileEnvelope",
     ];
     const script = `
       const mod = await import(${JSON.stringify(specifier)});

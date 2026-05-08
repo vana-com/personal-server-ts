@@ -15,7 +15,7 @@ import {
   serverRegistrationDomain,
   SERVER_REGISTRATION_TYPES,
   type ServerRegistrationMessage,
-} from "../packages/core/src/signing/index.js";
+} from "@opendatalabs/vana-sdk/node";
 import { join } from "node:path";
 import { buildTunnelUrl } from "../packages/server/src/tunnel/verify.js";
 

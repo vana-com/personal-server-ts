@@ -10,7 +10,7 @@ import {
   GrantExpiredError,
   ScopeMismatchError,
 } from "../errors/catalog.js";
-import { scopeCoveredByGrant } from "../scopes/match.js";
+import { scopeCoveredByGrant } from "@opendatalabs/vana-sdk/browser";
 
 import { GRANT_DOMAIN, GRANT_TYPES } from "./eip712.js";
 import type { GrantPayload, GrantWithSignature } from "./types.js";

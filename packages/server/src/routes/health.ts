@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import type { GatewayClient } from "@opendatalabs/personal-server-ts-core/gateway";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import type { RuntimeAvailabilityPort } from "@opendatalabs/personal-server-ts-core/ports";
 import type { Logger } from "pino";
 

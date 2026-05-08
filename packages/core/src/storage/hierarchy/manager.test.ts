@@ -9,7 +9,7 @@ import {
   deleteDataFile,
   deleteAllForScope,
 } from "./manager.js";
-import { createDataFileEnvelope } from "../../schemas/data-file.js";
+import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { HierarchyManagerOptions } from "./manager.js";
 
 describe("HierarchyManager", () => {
