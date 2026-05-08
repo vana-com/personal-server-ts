@@ -66,6 +66,7 @@ function makeSchema(): Schema {
 
 function makeMockDeps(): DownloadWorkerDeps {
   const mockStorage: Partial<DataStoragePort> = {
+    findEntry: vi.fn().mockReturnValue(undefined),
     findByFileId: vi.fn().mockReturnValue(undefined),
     writeEnvelope: vi.fn().mockResolvedValue({
       path: `/tmp/data/${SCOPE}/${COLLECTED_AT}.json`,
@@ -77,6 +78,7 @@ function makeMockDeps(): DownloadWorkerDeps {
       createdAt: "2026-01-21T10:00:00Z",
       ...entry,
     })),
+    updateFileId: vi.fn().mockResolvedValue(true),
   };
 
   const mockStorageAdapter: Partial<StorageAdapter> = {
@@ -192,6 +194,33 @@ describe("download worker", () => {
         collectedAt: COLLECTED_AT,
         path: RELATIVE_PATH,
       });
+    });
+
+    it("skips and attaches fileId when the same version already exists locally", async () => {
+      const deps = makeMockDeps();
+      const existingEntry: IndexEntry = {
+        id: 1,
+        fileId: null,
+        schemaId: SCHEMA_ID,
+        path: RELATIVE_PATH,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        createdAt: "2026-01-21T10:00:00Z",
+        sizeBytes: 128,
+      };
+      (deps.storage.findEntry as ReturnType<typeof vi.fn>).mockReturnValue(
+        existingEntry,
+      );
+
+      const result = await downloadOne(deps, makeFileRecord());
+
+      expect(result).toBeNull();
+      expect(deps.storage.updateFileId).toHaveBeenCalledWith(
+        RELATIVE_PATH,
+        FILE_ID,
+      );
+      expect(deps.storage.writeEnvelope).not.toHaveBeenCalled();
+      expect(deps.storage.insertEntry).not.toHaveBeenCalled();
     });
 
     it("resolves schemaId → scope via gateway.getSchema", async () => {

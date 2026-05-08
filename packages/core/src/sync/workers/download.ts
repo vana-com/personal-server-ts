@@ -71,6 +71,28 @@ export async function downloadOne(
   const raw = JSON.parse(new TextDecoder().decode(plaintext));
   const envelope = DataFileEnvelopeSchema.parse(raw);
 
+  const existingByVersion = storage.findEntry({
+    scope: envelope.scope,
+    at: envelope.collectedAt,
+  });
+  if (
+    existingByVersion !== undefined &&
+    existingByVersion.collectedAt === envelope.collectedAt
+  ) {
+    if (existingByVersion.fileId !== record.fileId) {
+      await storage.updateFileId(existingByVersion.path, record.fileId);
+    }
+    logger.debug(
+      {
+        fileId: record.fileId,
+        scope: envelope.scope,
+        collectedAt: envelope.collectedAt,
+      },
+      "File version already exists locally, skipping",
+    );
+    return null;
+  }
+
   // 7. Write to local storage via the runtime storage port
   const { relativePath, sizeBytes } = await storage.writeEnvelope(envelope);
 
