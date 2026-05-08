@@ -741,6 +741,11 @@
             ["status", d.status, d.status === "healthy" ? "ok" : "err"],
             ["version", d.version, ""],
             ["uptime", formatUptime(d.uptime), ""],
+            [
+              "api url",
+              d.tunnel && d.tunnel.publicUrl ? d.tunnel.publicUrl : BASE,
+              d.tunnel && d.tunnel.publicUrl ? "ok" : "warn",
+            ],
             ["owner", d.owner ?? "not configured", d.owner ? "ok" : "err"],
           ];
           if (d.identity) {
@@ -766,21 +771,28 @@
               class: "value" + (items[i][2] ? " " + items[i][2] : ""),
             });
             val.textContent = items[i][1];
-            // Copy-on-click for publicKey and serverAddress
-            if (items[i][0] === "publicKey" && d.identity) {
+            // Copy-on-click for publicKey and API URLs
+            if (
+              (items[i][0] === "publicKey" && d.identity) ||
+              items[i][0] === "api url"
+            ) {
+              var fullValue =
+                items[i][0] === "publicKey" && d.identity
+                  ? d.identity.publicKey
+                  : items[i][1];
               val.style.cursor = "pointer";
-              val.title = "Click to copy full public key";
+              val.title = "Click to copy";
               val.addEventListener(
                 "click",
-                (function (fullKey) {
+                (function (copyValue, displayValue) {
                   return function () {
-                    navigator.clipboard.writeText(fullKey);
+                    navigator.clipboard.writeText(copyValue);
                     val.textContent = "copied!";
                     setTimeout(function () {
-                      val.textContent = truncAddr(fullKey);
+                      val.textContent = displayValue;
                     }, 1200);
                   };
-                })(d.identity.publicKey),
+                })(fullValue, items[i][1]),
               );
             }
             container.appendChild(lbl);
@@ -1277,7 +1289,7 @@
           ["runtime", runtime.active ? "active" : "inactive"],
           ["storage", data.storageMode || runtime.storage || "unknown"],
           ["relay", relay.status || "closed"],
-          ["public url", relay.publicUrl || "not connected"],
+          ["api url", relay.publicUrl || "not connected"],
         ].forEach(function (item) {
           var label = createEl("span", { class: "label" });
           label.textContent = item[0];
