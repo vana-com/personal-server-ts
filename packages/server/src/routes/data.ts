@@ -61,19 +61,20 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     deps.gateway,
     deps.serverOwner,
   );
-  const dataReadPolicy = createDataReadPolicyMiddleware({
-    gateway: deps.gateway,
-    feeVerifier: deps.feeVerifier,
-    runtimeAvailability: deps.runtimeAvailability,
-  });
-  const accessLog = createAccessLogMiddleware(deps.accessLogWriter);
-  const ownerCheck = createOwnerCheckMiddleware(deps.serverOwner);
   const dataStorage =
     deps.dataStorage ??
     createNodeDataStorage({
       indexManager: deps.indexManager,
       hierarchyOptions: deps.hierarchyOptions,
     });
+  const dataReadPolicy = createDataReadPolicyMiddleware({
+    gateway: deps.gateway,
+    feeVerifier: deps.feeVerifier,
+    runtimeAvailability: deps.runtimeAvailability,
+    dataStorage,
+  });
+  const accessLog = createAccessLogMiddleware(deps.accessLogWriter);
+  const ownerCheck = createOwnerCheckMiddleware(deps.serverOwner);
 
   // GET /v1/data/:scope/versions — list versions for a scope (requires auth + builder, no grant)
   app.get("/:scope/versions", web3Auth, builderCheck, async (c) => {

@@ -539,11 +539,19 @@ export function createPsLiteRuntime(
             url.searchParams.get("grantId") ??
             request.headers.get("x-ps-grant-id") ??
             undefined;
+          const selectedEntry = dataStorage.findEntry({
+            scope,
+            fileId: url.searchParams.get("fileId") ?? undefined,
+            at: url.searchParams.get("at") ?? undefined,
+          });
           await auth.authorizeBuilderRead({
             request,
             scope,
             grantId,
-            fileId: url.searchParams.get("fileId") ?? undefined,
+            fileId:
+              url.searchParams.get("fileId") ??
+              selectedEntry?.fileId ??
+              undefined,
           });
           const result = await readDataContract({
             storage: dataStorage,

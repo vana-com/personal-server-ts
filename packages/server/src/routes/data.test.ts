@@ -1037,6 +1037,25 @@ describe("GET /v1/data/:scope", () => {
     expect(json.error.errorCode).toBe("SCOPE_MISMATCH");
   });
 
+  it("authorizes default latest reads against selected entry fileId", async () => {
+    const grant = makeGrant({ fileIds: ["file-1"] });
+    const gateway = createMockGateway({
+      getGrant: vi.fn().mockResolvedValue(grant),
+    });
+    const app = createApp({ gateway });
+
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+    const entry = indexManager.findLatestByScope("instagram.profile");
+    expect(entry).toBeDefined();
+    indexManager.updateFileId(entry!.path, "file-1");
+
+    const res = await getWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.data).toEqual({ username: "test_user" });
+  });
+
   it("returns 403 FEE_REQUIRED when fee verification fails", async () => {
     const app = createApp({
       feeVerifier: {

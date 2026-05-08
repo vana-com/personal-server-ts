@@ -1,6 +1,7 @@
 import type { MiddlewareHandler } from "hono";
 import { verifyDataReadPolicy } from "@opendatalabs/personal-server-ts-core/policy";
 import type {
+  DataStoragePort,
   FeeVerifierPort,
   RuntimeAvailabilityPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
@@ -12,6 +13,7 @@ export interface DataReadPolicyMiddlewareDeps {
   gateway: GatewayClient;
   feeVerifier?: FeeVerifierPort;
   runtimeAvailability?: RuntimeAvailabilityPort;
+  dataStorage?: Pick<DataStoragePort, "findEntry">;
 }
 
 export function createDataReadPolicyMiddleware(
@@ -24,14 +26,20 @@ export function createDataReadPolicyMiddleware(
     }
 
     const auth = c.get("auth") as RequestAuth;
+    const scope = c.req.param("scope") ?? "";
+    const selectedEntry = deps.dataStorage?.findEntry({
+      scope,
+      fileId: c.req.query("fileId"),
+      at: c.req.query("at"),
+    });
 
     try {
       const grant = await verifyDataReadPolicy(
         {
           signer: auth.signer,
           grantId: auth.payload.grantId,
-          requestedScope: c.req.param("scope") ?? "",
-          fileId: c.req.query("fileId"),
+          requestedScope: scope,
+          fileId: c.req.query("fileId") ?? selectedEntry?.fileId ?? undefined,
         },
         {
           authSessionVerifier: deps.gateway,
