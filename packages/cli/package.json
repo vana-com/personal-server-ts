@@ -19,6 +19,14 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js"
+    },
+    "./lite": {
+      "types": "./dist/lite.d.ts",
+      "import": "./dist/lite.js"
     }
   },
   "publishConfig": {
@@ -32,6 +40,7 @@
   },
   "dependencies": {
     "@opendatalabs/personal-server-ts-core": "*",
+    "@opendatalabs/personal-server-ts-lite": "*",
     "@opendatalabs/personal-server-ts-server": "*"
   }
 }

@@ -20,6 +20,7 @@ export interface SyncRouteDeps {
   serverOwner?: `0x${string}`;
   gateway: GatewayClient;
   devToken?: string;
+  accessToken?: string;
   tokenStore?: TokenStore;
   syncManager: SyncManager | null; // null when sync disabled
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
@@ -33,6 +34,7 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
     serverOwner: deps.serverOwner,
     gateway: deps.gateway,
     devToken: deps.devToken,
+    accessToken: deps.accessToken,
     tokenStore: deps.tokenStore,
   });
 

@@ -32,6 +32,7 @@ export interface DataRouteDeps {
   accessLogWriter: AccessLogWriter;
   syncManager?: SyncManager | null;
   devToken?: string;
+  accessToken?: string;
   tokenStore?: TokenStore;
   feeVerifier?: FeeVerifierPort;
   dataStorage?: DataStoragePort;
@@ -53,6 +54,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     serverOwner: deps.serverOwner,
     gateway: deps.gateway,
     devToken: deps.devToken,
+    accessToken: deps.accessToken,
     tokenStore: deps.tokenStore,
     dataStorage,
     feeVerifier: deps.feeVerifier,

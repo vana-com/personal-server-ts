@@ -1,11 +1,4 @@
 import {
-  ExpiredTokenError as SdkExpiredTokenError,
-  InvalidSignatureError as SdkInvalidSignatureError,
-  MissingAuthError as SdkMissingAuthError,
-  verifyWeb3Signed as sdkVerifyWeb3Signed,
-} from "@opendatalabs/vana-sdk/browser";
-import {
-  ExpiredTokenError,
   GrantRequiredError,
   InvalidSignatureError,
   MissingAuthError,
@@ -14,6 +7,11 @@ import {
   PsUnavailableError,
   UnregisteredBuilderError,
 } from "@opendatalabs/personal-server-ts-core/errors";
+import {
+  authenticateRequest,
+  type AuthenticatedRequest,
+  type SessionTokenVerifierPort,
+} from "@opendatalabs/personal-server-ts-core/auth";
 import {
   approveDeviceSessionContract,
   createMemoryDeviceSessionStore,
@@ -130,6 +128,8 @@ export interface Web3SignedPsLiteAuthOptions {
   origin: string | (() => string);
   ownerAddress: `0x${string}`;
   dataReadPolicyPorts?: DataReadPolicyPorts;
+  accessToken?: string;
+  tokenStore?: SessionTokenVerifierPort;
   now?: () => number;
 }
 
@@ -226,49 +226,36 @@ export function createBearerTokenPsLiteAuth(
   };
 }
 
-function resolveOrigin(origin: string | (() => string)): string {
-  return typeof origin === "function" ? origin() : origin;
-}
-
-async function verifyWeb3SignedRequest(
+async function authenticatePsLiteRequest(
   request: Request,
   options: Web3SignedPsLiteAuthOptions,
-) {
-  const url = new URL(request.url);
-  try {
-    return await sdkVerifyWeb3Signed({
-      headerValue: request.headers.get("authorization") ?? undefined,
-      expectedOrigin: resolveOrigin(options.origin),
-      expectedMethod: request.method,
-      expectedPath: url.pathname,
-      bodyBytes:
-        request.method === "GET" || request.method === "HEAD"
-          ? undefined
-          : new Uint8Array(await request.clone().arrayBuffer()),
-      now: options.now?.(),
-    });
-  } catch (err) {
-    if (err instanceof SdkMissingAuthError) {
-      throw new MissingAuthError(getErrorDetails(err));
-    }
-    if (err instanceof SdkInvalidSignatureError) {
-      throw new InvalidSignatureError(getErrorDetails(err));
-    }
-    if (err instanceof SdkExpiredTokenError) {
-      throw new ExpiredTokenError(getErrorDetails(err));
-    }
-    throw err;
-  }
+): Promise<AuthenticatedRequest> {
+  return authenticateRequest({
+    request,
+    serverOrigin: options.origin,
+    serverOwner: options.ownerAddress,
+    accessToken: options.accessToken,
+    sessionTokenVerifier: options.tokenStore,
+    now: options.now,
+  });
 }
 
-function getErrorDetails(err: unknown): Record<string, unknown> | undefined {
-  if (err && typeof err === "object" && "details" in err) {
-    const details = err.details;
-    if (details && typeof details === "object" && !Array.isArray(details)) {
-      return details as Record<string, unknown>;
-    }
-  }
-  return undefined;
+function isOwnerSigner(
+  auth: AuthenticatedRequest,
+  ownerAddress: string,
+): boolean {
+  return auth.auth.signer.toLowerCase() === ownerAddress.toLowerCase();
+}
+
+function dataReadPolicyPortsRequired(): ProtocolError {
+  return new ProtocolError(
+    500,
+    "SERVER_NOT_CONFIGURED",
+    "Server is not configured",
+    {
+      reason: "PS Lite read policy ports are not configured",
+    },
+  );
 }
 
 export function createWeb3SignedPsLiteAuth(
@@ -276,53 +263,48 @@ export function createWeb3SignedPsLiteAuth(
 ): PsLiteAuthAdapter {
   return {
     async authorizeOwner(request) {
-      const verified = await verifyWeb3SignedRequest(request, options);
-      if (
-        verified.signer.toLowerCase() !== options.ownerAddress.toLowerCase()
-      ) {
+      const auth = await authenticatePsLiteRequest(request, options);
+      if (!isOwnerSigner(auth, options.ownerAddress)) {
         throw new NotOwnerError({
           expected: options.ownerAddress,
-          actual: verified.signer,
+          actual: auth.auth.signer,
         });
       }
     },
     async authorizeBuilderList(request) {
-      const verified = await verifyWeb3SignedRequest(request, options);
-      if (
-        verified.signer.toLowerCase() === options.ownerAddress.toLowerCase()
-      ) {
+      const auth = await authenticatePsLiteRequest(request, options);
+      if (auth.isPolicyBypass || isOwnerSigner(auth, options.ownerAddress)) {
         return;
       }
+      if (!options.dataReadPolicyPorts) {
+        throw dataReadPolicyPortsRequired();
+      }
       const builder =
-        await options.dataReadPolicyPorts?.authSessionVerifier.getBuilder(
-          verified.signer,
+        await options.dataReadPolicyPorts.authSessionVerifier.getBuilder(
+          auth.auth.signer,
         );
-      if (options.dataReadPolicyPorts && !builder) {
+      if (!builder) {
         throw new UnregisteredBuilderError();
       }
     },
     async authorizeBuilderRead(input) {
-      const verified = await verifyWeb3SignedRequest(input.request, options);
+      const auth = await authenticatePsLiteRequest(input.request, options);
+      if (auth.isPolicyBypass) {
+        return { builder: auth.auth.signer, grantId: "policy-bypass" };
+      }
       if (!options.dataReadPolicyPorts) {
-        throw new ProtocolError(
-          500,
-          "SERVER_NOT_CONFIGURED",
-          "Server is not configured",
-          {
-            reason: "PS Lite read policy ports are not configured",
-          },
-        );
+        throw dataReadPolicyPortsRequired();
       }
       const grant = await verifyDataReadPolicy(
         {
-          signer: verified.signer,
-          grantId: verified.payload.grantId ?? input.grantId,
+          signer: auth.auth.signer,
+          grantId: auth.auth.payload.grantId ?? input.grantId,
           requestedScope: input.scope,
           fileId: input.fileId,
         },
         options.dataReadPolicyPorts,
       );
-      return { builder: verified.signer, grantId: grant.id };
+      return { builder: auth.auth.signer, grantId: grant.id };
     },
   };
 }

@@ -23,6 +23,7 @@ export interface GrantsRouteDeps {
   serverOwner?: `0x${string}`;
   serverOrigin: string | (() => string);
   devToken?: string;
+  accessToken?: string;
   tokenStore?: TokenStore;
   serverSigner?: ServerSigner;
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
@@ -34,6 +35,7 @@ export function grantsRoutes(deps: GrantsRouteDeps): Hono {
   const auth = createServerApiAuth({
     serverOrigin: deps.serverOrigin,
     devToken: deps.devToken,
+    accessToken: deps.accessToken,
     tokenStore: deps.tokenStore,
     serverOwner: deps.serverOwner,
     gateway: deps.gateway,

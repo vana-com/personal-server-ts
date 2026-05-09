@@ -1,4 +1,15 @@
-export type { GrantPayload, GrantWithSignature } from "./types.js";
-export { GRANT_DOMAIN, GRANT_TYPES, grantToEip712Message } from "./eip712.js";
-export type { GrantVerificationResult } from "./verify.js";
-export { verifyGrantLocal } from "./verify.js";
+export {
+  GRANT_REGISTRATION_TYPES,
+  GRANT_REVOCATION_TYPES,
+  grantRegistrationDomain,
+  grantRevocationDomain,
+  isDataPortabilityGatewayConfig,
+  parseGrantRegistrationPayload,
+  verifyGrantRegistration,
+  type DataPortabilityGatewayConfig,
+  type DataPortabilityGrantPayload,
+  type GrantRegistrationMessage,
+  type GrantRevocationMessage,
+  type VerifyGrantRegistrationInput,
+  type VerifyGrantRegistrationResult,
+} from "@opendatalabs/vana-sdk/browser";

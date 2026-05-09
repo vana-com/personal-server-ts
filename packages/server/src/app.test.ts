@@ -296,18 +296,17 @@ describe("createApp", () => {
     expect(body.error.errorCode).toBe("MISSING_AUTH");
   });
 
-  it("control-plane token cannot read owner grants routes", async () => {
+  it("control-plane token can read owner grants routes", async () => {
     const app = makeAppWithControlPlaneToken();
     const res = await app.request("/v1/grants", {
       headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
     });
 
-    expect(res.status).toBe(401);
-    const body = await res.json();
-    expect(body.error.errorCode).toBe("INVALID_SIGNATURE");
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({ grants: [] });
   });
 
-  it("control-plane token cannot write owner data routes", async () => {
+  it("control-plane token can write owner data routes", async () => {
     const app = makeAppWithControlPlaneToken();
     const res = await app.request("/v1/data/test.scope", {
       method: "POST",
@@ -318,21 +317,21 @@ describe("createApp", () => {
       body: JSON.stringify({ data: "value" }),
     });
 
-    expect(res.status).toBe(401);
-    const body = await res.json();
-    expect(body.error.errorCode).toBe("INVALID_SIGNATURE");
+    expect(res.status).toBe(201);
   });
 
-  it("control-plane token cannot trigger sync routes", async () => {
+  it("control-plane token can trigger sync routes", async () => {
     const app = makeAppWithControlPlaneToken();
     const res = await app.request("/v1/sync/trigger", {
       method: "POST",
       headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
     });
 
-    expect(res.status).toBe(401);
-    const body = await res.json();
-    expect(body.error.errorCode).toBe("INVALID_SIGNATURE");
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      status: "disabled",
+      message: "Sync is not enabled",
+    });
   });
 
   it("POST /v1/grants/verify without auth → 400 (public endpoint, no auth wall)", async () => {

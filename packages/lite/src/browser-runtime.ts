@@ -23,6 +23,7 @@ import {
   type PsLiteUnlockedServerIdentity,
 } from "./state.js";
 import {
+  createWeb3SignedPsLiteAuth,
   createPsLiteRuntime,
   type PsLiteRuntime,
   type PsLiteRuntimeOptions,
@@ -115,8 +116,26 @@ export async function createIndexedDbPsLiteRuntime(
       })
     ).syncManager;
   }
+  let runtimeRef: PsLiteRuntime | null = null;
+  const auth =
+    options.auth ??
+    createWeb3SignedPsLiteAuth({
+      origin: () => config.server.origin,
+      ownerAddress: serverOwner,
+      accessToken: options.accessToken,
+      tokenStore,
+      dataReadPolicyPorts: {
+        authSessionVerifier: gateway,
+        grantVerifier: gateway,
+        runtimeAvailability: {
+          isAvailable: () =>
+            runtimeRef?.isAvailable() ?? Boolean(options.active),
+        },
+      },
+    });
   const runtime = createPsLiteRuntime({
     ...options,
+    auth,
     storage,
     config,
     identity: {
@@ -136,6 +155,7 @@ export async function createIndexedDbPsLiteRuntime(
     accessLogReader: accessLogStore,
     accessLogWriter: accessLogStore,
   });
+  runtimeRef = runtime;
 
   return {
     runtime,

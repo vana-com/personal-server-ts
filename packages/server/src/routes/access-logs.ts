@@ -21,6 +21,7 @@ export interface AccessLogsRouteDeps {
   serverOwner?: `0x${string}`;
   gateway: GatewayClient;
   devToken?: string;
+  accessToken?: string;
   tokenStore?: TokenStore;
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
 }
@@ -33,6 +34,7 @@ export function accessLogsRoutes(deps: AccessLogsRouteDeps): Hono {
     serverOwner: deps.serverOwner,
     gateway: deps.gateway,
     devToken: deps.devToken,
+    accessToken: deps.accessToken,
     tokenStore: deps.tokenStore,
   });
 

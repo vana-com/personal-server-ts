@@ -20,6 +20,10 @@
       "types": "./dist/api.d.ts",
       "import": "./dist/api.js"
     },
+    "./config": {
+      "types": "./dist/config/index.d.ts",
+      "import": "./dist/config/index.js"
+    },
     "./runtime": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"

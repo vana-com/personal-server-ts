@@ -5,7 +5,7 @@
 
 import { privateKeyToAccount } from "viem/accounts";
 import type { PrivateKeyAccount } from "viem";
-import { buildWeb3SignedHeader as sdkBuildWeb3SignedHeader } from "@opendatalabs/vana-sdk/node";
+import { buildWeb3SignedHeader as sdkBuildWeb3SignedHeader } from "@opendatalabs/vana-sdk/browser";
 
 export interface TestWallet {
   address: `0x${string}`;

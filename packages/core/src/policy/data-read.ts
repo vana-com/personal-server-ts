@@ -1,5 +1,8 @@
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
-import { scopeCoveredByGrant } from "@opendatalabs/vana-sdk/browser";
+import {
+  parseGrantRegistrationPayload,
+  scopeCoveredByGrant,
+} from "@opendatalabs/vana-sdk/browser";
 import {
   FeeRequiredError,
   GrantExpiredError,
@@ -30,24 +33,6 @@ export interface DataReadPolicyPorts {
   grantVerifier: GrantVerifierPort;
   feeVerifier?: FeeVerifierPort;
   runtimeAvailability?: RuntimeAvailabilityPort;
-}
-
-function parseGrantPayload(grantString: string): {
-  scopes: string[];
-  expiresAt: number;
-} {
-  try {
-    const parsed = JSON.parse(grantString) as {
-      scopes?: string[];
-      expiresAt?: number;
-    };
-    return {
-      scopes: Array.isArray(parsed.scopes) ? parsed.scopes : [],
-      expiresAt: typeof parsed.expiresAt === "number" ? parsed.expiresAt : 0,
-    };
-  } catch {
-    return { scopes: [], expiresAt: 0 };
-  }
 }
 
 export async function verifyDataReadPolicy(
@@ -82,7 +67,13 @@ export async function verifyDataReadPolicy(
     throw new GrantRevokedError({ grantId: grant.id });
   }
 
-  const grantPayload = parseGrantPayload(grant.grant);
+  const grantPayload = parseGrantRegistrationPayload(grant.grant);
+  if (!grantPayload) {
+    throw new ScopeMismatchError({
+      requestedScope: input.requestedScope,
+      reason: "Grant payload is invalid",
+    });
+  }
   if (grantPayload.expiresAt > 0) {
     const now = Math.floor(Date.now() / 1000);
     if (grantPayload.expiresAt < now) {
@@ -114,7 +105,7 @@ export async function verifyDataReadPolicy(
     }
   }
 
-  if (builder.id !== grant.granteeId) {
+  if (builder.id.toLowerCase() !== grant.granteeId.toLowerCase()) {
     throw new InvalidSignatureError({
       reason: "Request signer is not the grant builder",
       expected: grant.granteeId,

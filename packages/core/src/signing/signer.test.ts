@@ -14,7 +14,7 @@ import {
   FILE_REGISTRATION_TYPES,
   GRANT_REGISTRATION_TYPES,
   GRANT_REVOCATION_TYPES,
-} from "@opendatalabs/vana-sdk/node";
+} from "@opendatalabs/vana-sdk/browser";
 
 const TEST_GATEWAY_CONFIG: GatewayConfig = {
   chainId: 14800,

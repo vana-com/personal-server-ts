@@ -307,6 +307,54 @@ describe("POST /verify", () => {
     expect(json.expiresAt).toBe(0);
   });
 
+  it("embedded grant user must match grantorAddress", async () => {
+    const app = createApp();
+    const grant = JSON.stringify({
+      user: builder.address,
+      builder: builder.address,
+      scopes: ["instagram.*"],
+      expiresAt: futureExpiry,
+      nonce: 1,
+    });
+    const granteeId =
+      "0x1111111111111111111111111111111111111111111111111111111111111111";
+    const signature = await owner.signTypedData({
+      domain: grantRegistrationDomain(gatewayConfig) as unknown as Record<
+        string,
+        unknown
+      >,
+      types: GRANT_REGISTRATION_TYPES as unknown as Record<
+        string,
+        Array<{ name: string; type: string }>
+      >,
+      primaryType: "GrantRegistration",
+      message: {
+        grantorAddress: owner.address,
+        granteeId,
+        grant,
+        fileIds: [],
+      },
+    });
+
+    const res = await app.request("/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        grantorAddress: owner.address,
+        granteeId,
+        grant,
+        fileIds: [],
+        signature,
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      valid: false,
+      error: "Grant user does not match grantorAddress",
+    });
+  });
+
   it("missing required fields returns 400", async () => {
     const app = createApp();
 

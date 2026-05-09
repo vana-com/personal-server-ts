@@ -728,6 +728,64 @@ describe("createPsLiteRuntime", () => {
     expect(body.error.errorCode).toBe("SERVER_NOT_CONFIGURED");
   });
 
+  it("returns SERVER_NOT_CONFIGURED when Web3Signed list auth lacks policy ports", async () => {
+    const owner = createTestWallet(0);
+    const builder = createTestWallet(1);
+    const runtime = createTestRuntime({
+      storage: createMemoryPsLiteStorage(),
+      auth: createWeb3SignedPsLiteAuth({
+        origin: "https://ps.local",
+        ownerAddress: owner.address,
+      }),
+      active: true,
+    });
+
+    const listAuth = await buildWeb3SignedHeader({
+      wallet: builder,
+      aud: "https://ps.local",
+      method: "GET",
+      uri: "/v1/data",
+    });
+    const res = await runtime.fetch(
+      new Request("https://ps.local/v1/data", {
+        headers: { Authorization: listAuth },
+      }),
+    );
+
+    expect(res.status).toBe(500);
+    const body = await res.json();
+    expect(body.error.errorCode).toBe("SERVER_NOT_CONFIGURED");
+  });
+
+  it("accepts Lite persisted session tokens through Web3Signed owner auth", async () => {
+    const owner = createTestWallet(0);
+    const tokenStore = createMemoryPsLiteTokenStore();
+    await tokenStore.addToken("vana_ps_session");
+    const runtime = createTestRuntime({
+      storage: createMemoryPsLiteStorage(),
+      tokenStore,
+      auth: createWeb3SignedPsLiteAuth({
+        origin: "https://ps.local",
+        ownerAddress: owner.address,
+        tokenStore,
+      }),
+      active: true,
+    });
+
+    const res = await runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer vana_ps_session",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ username: "session_user" }),
+      }),
+    );
+
+    expect(res.status).toBe(201);
+  });
+
   it("can be activated for foreground handling", async () => {
     const runtime = createTestRuntime({
       active: false,
