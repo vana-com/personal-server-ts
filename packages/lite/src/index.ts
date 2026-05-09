@@ -12,8 +12,6 @@ export {
 
 export {
   createIndexedDbPsLitePersistence,
-  createMemoryPsLiteDataFileStore,
-  createMemoryPsLitePersistence,
   createOpfsPsLiteDataFileStore,
   createPersistentPsLiteStorage,
   isOpfsAvailable,
@@ -28,7 +26,6 @@ export {
   createIndexedDbPsLiteAccessLogStore,
   createIndexedDbPsLiteStateStore,
   createIndexedDbPsLiteTokenStore,
-  createMemoryPsLiteStateStore,
   loadOrCreatePsLiteConfig,
   loadOrCreatePsLiteServerIdentity,
   savePsLiteConfig,
@@ -51,7 +48,6 @@ export {
 
 export {
   createBearerTokenPsLiteAuth,
-  createMemoryPsLiteStorage,
   createPsLiteRuntime,
   createWeb3SignedPsLiteAuth,
   type BearerTokenPsLiteAuthOptions,

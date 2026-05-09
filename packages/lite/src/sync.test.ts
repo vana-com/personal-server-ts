@@ -4,11 +4,11 @@ import {
   createDataFileEnvelope,
   recoverServerOwner,
 } from "@opendatalabs/vana-sdk/browser";
-import { createMemoryPsLiteStorage } from "./runtime.js";
 import {
   createMemoryPsLiteStateStore,
-  loadOrCreatePsLiteServerIdentity,
-} from "./state.js";
+  createMemoryPsLiteStorage,
+} from "./test-support/memory.js";
+import { loadOrCreatePsLiteServerIdentity } from "./state.js";
 import { createPsLiteSyncManager } from "./sync.js";
 
 const OWNER_SIGNATURE =

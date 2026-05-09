@@ -2,11 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createIndexedDbPsLiteAccessLogStore,
   createIndexedDbPsLiteTokenStore,
-  createMemoryPsLiteStateStore,
   loadOrCreatePsLiteConfig,
   loadOrCreatePsLiteServerIdentity,
   savePsLiteConfig,
 } from "./state.js";
+import { createMemoryPsLiteStateStore } from "./test-support/memory.js";
 
 const OWNER_SIGNATURE =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b" as const;

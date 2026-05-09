@@ -87,10 +87,6 @@ interface PsLiteTokenRecord {
 
 type PsLiteAccessLogRecord = AccessLogEntry;
 
-function clone<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T;
-}
-
 function bytesToBase64(bytes: Uint8Array): string {
   let binary = "";
   for (const byte of bytes) {
@@ -325,25 +321,6 @@ async function purgeExpiredTokens(options: {
       ),
     ),
   );
-}
-
-export function createMemoryPsLiteStateStore(
-  seed?: Partial<Record<PsLiteStateKey, unknown>>,
-): PsLiteStateStore {
-  const values = new Map<PsLiteStateKey, unknown>(
-    Object.entries(seed ?? {}) as Array<[PsLiteStateKey, unknown]>,
-  );
-  return {
-    async get<T>(key: PsLiteStateKey) {
-      return values.has(key) ? clone(values.get(key) as T) : null;
-    },
-    async set<T>(key: PsLiteStateKey, value: T) {
-      values.set(key, clone(value));
-    },
-    async delete(key: PsLiteStateKey) {
-      values.delete(key);
-    },
-  };
 }
 
 export function createIndexedDbPsLiteStateStore(

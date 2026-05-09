@@ -72,26 +72,6 @@ function normalizeState(
   };
 }
 
-function cloneState(
-  state: PsLitePersistedStorageState,
-): PsLitePersistedStorageState {
-  return JSON.parse(JSON.stringify(state)) as PsLitePersistedStorageState;
-}
-
-export function createMemoryPsLitePersistence(
-  seed?: PsLitePersistedStorageState,
-): PsLitePersistenceAdapter {
-  let state = seed ? cloneState(seed) : null;
-  return {
-    async read() {
-      return state ? cloneState(state) : null;
-    },
-    async write(nextState) {
-      state = cloneState(nextState);
-    },
-  };
-}
-
 export function createIndexedDbFallbackDataFileStore(
   envelopes: Map<string, DataFileEnvelope>,
 ): PsLiteDataFileStore {
@@ -106,25 +86,6 @@ export function createIndexedDbFallbackDataFileStore(
     },
     async deleteEnvelope(path) {
       envelopes.delete(path);
-    },
-  };
-}
-
-export function createMemoryPsLiteDataFileStore(
-  kind: PsLiteFileStorageKind = "opfs",
-): PsLiteDataFileStore {
-  const files = new Map<string, DataFileEnvelope>();
-  return {
-    kind,
-    async readEnvelope(path) {
-      return files.get(path) ?? null;
-    },
-    async writeEnvelope(path, envelope) {
-      files.set(path, envelope);
-      return new TextEncoder().encode(JSON.stringify(envelope)).length;
-    },
-    async deleteEnvelope(path) {
-      files.delete(path);
     },
   };
 }

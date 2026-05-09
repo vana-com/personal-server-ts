@@ -1,11 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { createBearerTokenPsLiteAuth, createPsLiteRuntime } from "./runtime.js";
 import {
-  createBearerTokenPsLiteAuth,
   createMemoryPsLiteAccessLogStore,
   createMemoryPsLiteStorage,
   createMemoryPsLiteTokenStore,
-  createPsLiteRuntime,
-} from "./runtime.js";
+} from "./test-support/memory.js";
 import {
   decodeDataFrame,
   encodeDataFrame,

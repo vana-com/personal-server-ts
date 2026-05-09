@@ -1,12 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   createBearerTokenPsLiteAuth,
-  createMemoryPsLiteAccessLogStore,
-  createMemoryPsLiteStorage,
-  createMemoryPsLiteTokenStore,
   createPsLiteRuntime,
   createWeb3SignedPsLiteAuth,
 } from "./runtime.js";
+import {
+  createMemoryPsLiteAccessLogStore,
+  createMemoryPsLiteStorage,
+  createMemoryPsLiteTokenStore,
+} from "./test-support/memory.js";
 import {
   buildWeb3SignedHeader,
   createTestWallet,

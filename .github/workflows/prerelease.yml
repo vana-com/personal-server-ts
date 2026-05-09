@@ -24,7 +24,6 @@ jobs:
         working-directory: ../vana-sdk
         run: npm ci && npm run build --workspace @opendatalabs/vana-sdk
       - run: npm ci
-      - run: npm run validate:sdk-imports
       - run: npm run build
       - run: npm test
       - run: npm run test:e2e

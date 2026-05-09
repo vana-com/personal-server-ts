@@ -3,8 +3,8 @@ import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
   createMemoryPsLiteDataFileStore,
   createMemoryPsLitePersistence,
-  createPersistentPsLiteStorage,
-} from "./storage.js";
+} from "./test-support/memory.js";
+import { createPersistentPsLiteStorage } from "./storage.js";
 
 describe("createPersistentPsLiteStorage", () => {
   it("persists envelopes and index entries across storage reloads", async () => {

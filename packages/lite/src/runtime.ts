@@ -49,23 +49,13 @@ import type {
   RuntimeAvailabilityPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
 import type {
-  DataFileEnvelope,
   DataPortabilityGatewayConfig,
   GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
-import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
-import type {
-  AccessLogEntry,
-  AccessLogWriter,
-} from "@opendatalabs/personal-server-ts-core/logging/access-log";
+import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
-import {
-  createStorageReadMethods,
-  readEnvelopeFromMap,
-  sortEntries,
-} from "./storage-utils.js";
 import type { PsLiteStorageCapabilities } from "./storage.js";
 import {
   createIndexedDbPsLiteAccessLogStore,
@@ -369,31 +359,6 @@ function toDataStoragePort(
   );
 }
 
-export function createMemoryPsLiteAccessLogStore(): AccessLogReader &
-  AccessLogWriter {
-  const logs: AccessLogEntry[] = [];
-  return {
-    capabilities: { accessLogs: "memory" },
-    async write(entry) {
-      logs.push(entry);
-    },
-    async read(options) {
-      const limit = options?.limit ?? 50;
-      const offset = options?.offset ?? 0;
-      const sorted = [...logs].sort(
-        (a, b) =>
-          new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
-      );
-      return {
-        logs: sorted.slice(offset, offset + limit),
-        total: sorted.length,
-        limit,
-        offset,
-      };
-    },
-  } as AccessLogReader & AccessLogWriter & PsLiteRuntimeStoreCapabilities;
-}
-
 function indexedDbAvailable(): boolean {
   return typeof indexedDB !== "undefined";
 }
@@ -417,47 +382,6 @@ function randomHex(byteLength: number): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
     "",
   );
-}
-
-export function createMemoryPsLiteTokenStore(): PsLiteTokenStore {
-  const tokens = new Map<string, string | null>();
-
-  function normalizeExpiresAt(value: string | Date | null | undefined) {
-    if (value == null) return null;
-    const date = value instanceof Date ? value : new Date(value);
-    if (Number.isNaN(date.getTime())) {
-      throw new Error("Invalid token expiry");
-    }
-    return date.toISOString();
-  }
-
-  function isExpired(expiresAt: string | null | undefined): boolean {
-    return expiresAt ? new Date(expiresAt).getTime() <= Date.now() : false;
-  }
-
-  return {
-    capabilities: { tokens: "memory" },
-    async getTokens() {
-      return Array.from(tokens.entries())
-        .filter(([, expiresAt]) => !isExpired(expiresAt))
-        .map(([token]) => token);
-    },
-    async isValid(token) {
-      const expiresAt = tokens.get(token);
-      if (expiresAt === undefined) return false;
-      if (isExpired(expiresAt)) {
-        tokens.delete(token);
-        return false;
-      }
-      return true;
-    },
-    async addToken(token, options) {
-      tokens.set(token, normalizeExpiresAt(options?.expiresAt));
-    },
-    async removeToken(token) {
-      tokens.delete(token);
-    },
-  } as PsLiteTokenStore & PsLiteRuntimeStoreCapabilities;
 }
 
 function createDefaultTokenStore(): PsLiteTokenStore {
@@ -487,99 +411,6 @@ function bearerToken(request: Request): string | null {
 
 async function readForm(request: Request): Promise<URLSearchParams> {
   return new URLSearchParams(await request.text());
-}
-
-export function createMemoryPsLiteStorage(
-  adapter: PsLiteStorageAdapter = { kind: "indexeddb" },
-): DataStoragePort {
-  const entries = new Map<string, IndexEntry>();
-  const envelopes = new Map<string, DataFileEnvelope>();
-  let nextId = 1;
-
-  function envelopeKey(scope: string, collectedAt: string): string {
-    return `${scope}\n${collectedAt}`;
-  }
-
-  function entriesForScope(scope: string): IndexEntry[] {
-    return sortEntries(
-      Array.from(entries.values()).filter((entry) => entry.scope === scope),
-    );
-  }
-
-  const storagePort: DataStoragePort & {
-    capabilities: PsLiteStorageCapabilities;
-  } = {
-    kind: adapter.kind === "custom" ? "custom" : "browser-indexeddb-opfs",
-    capabilities: {
-      metadata: "memory",
-      files: "memory",
-      opfsAvailable: false,
-    } satisfies PsLiteStorageCapabilities,
-    ...createStorageReadMethods(() => entries.values(), entriesForScope),
-
-    findByFileId(fileId) {
-      return Array.from(entries.values()).find(
-        (entry) => entry.fileId === fileId,
-      );
-    },
-
-    findUnsynced(options) {
-      const unsynced = Array.from(entries.values())
-        .filter((entry) => entry.fileId === null)
-        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-      return options?.limit === undefined
-        ? unsynced
-        : unsynced.slice(0, options.limit);
-    },
-
-    async readEnvelope(scope, collectedAt) {
-      return readEnvelopeFromMap(envelopes, envelopeKey(scope, collectedAt));
-    },
-
-    async writeEnvelope(envelope) {
-      envelopes.set(
-        envelopeKey(envelope.scope, envelope.collectedAt),
-        envelope,
-      );
-      return {
-        path: `${envelope.scope}/${envelope.collectedAt}.json`,
-        relativePath: `${envelope.scope}/${envelope.collectedAt}.json`,
-        sizeBytes: new TextEncoder().encode(JSON.stringify(envelope)).length,
-      };
-    },
-
-    insertEntry(entry) {
-      const indexed: IndexEntry = {
-        ...entry,
-        schemaId: entry.schemaId ?? null,
-        id: nextId,
-        createdAt: new Date().toISOString(),
-      };
-      nextId += 1;
-      entries.set(entry.path, indexed);
-      return indexed;
-    },
-
-    updateFileId(path, fileId) {
-      const entry = entries.get(path);
-      if (!entry) return false;
-      entries.set(path, { ...entry, fileId });
-      return true;
-    },
-
-    async deleteScope(scope) {
-      let deleted = 0;
-      for (const [path, entry] of entries.entries()) {
-        if (entry.scope === scope) {
-          entries.delete(path);
-          envelopes.delete(envelopeKey(entry.scope, entry.collectedAt));
-          deleted += 1;
-        }
-      }
-      return deleted;
-    },
-  };
-  return storagePort;
 }
 
 function parseScope(pathPart: string): string | Response {
