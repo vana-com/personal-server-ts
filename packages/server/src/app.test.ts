@@ -4,11 +4,11 @@ import { tmpdir } from "node:os";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createApp } from "./app.js";
 import { MissingAuthError } from "@opendatalabs/personal-server-ts-core/errors";
+import { initializeDatabase } from "./storage/index-schema.js";
 import {
-  initializeDatabase,
   createIndexManager,
   type IndexManager,
-} from "@opendatalabs/personal-server-ts-core/storage/index";
+} from "./storage/index-manager.js";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
@@ -530,11 +530,13 @@ describe("createApp", () => {
       syncManager: mockSyncManager,
     });
 
+    const requestBody = JSON.stringify({ data: "value" });
     const auth = await buildWeb3SignedHeader({
       wallet: ownerWallet,
       aud: SERVER_ORIGIN,
       method: "POST",
       uri: "/v1/data/test.scope",
+      body: new TextEncoder().encode(requestBody),
     });
     const res = await app.request("/v1/data/test.scope", {
       method: "POST",
@@ -542,7 +544,7 @@ describe("createApp", () => {
         "Content-Type": "application/json",
         authorization: auth,
       },
-      body: JSON.stringify({ data: "value" }),
+      body: requestBody,
     });
     expect(res.status).toBe(201);
 
@@ -584,11 +586,13 @@ describe("createApp", () => {
 
   it("without syncManager — POST /v1/data/:scope returns stored status", async () => {
     const app = makeApp(); // makeApp doesn't pass syncManager
+    const requestBody = JSON.stringify({ data: "value" });
     const auth = await buildWeb3SignedHeader({
       wallet: ownerWallet,
       aud: SERVER_ORIGIN,
       method: "POST",
       uri: "/v1/data/test.scope",
+      body: new TextEncoder().encode(requestBody),
     });
     const res = await app.request("/v1/data/test.scope", {
       method: "POST",
@@ -596,7 +600,7 @@ describe("createApp", () => {
         "Content-Type": "application/json",
         authorization: auth,
       },
-      body: JSON.stringify({ data: "value" }),
+      body: requestBody,
     });
     expect(res.status).toBe(201);
 

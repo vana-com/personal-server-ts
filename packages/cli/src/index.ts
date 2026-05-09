@@ -8,7 +8,7 @@ export {
   loadConfig,
   resolveRootPath,
   type LoadConfigOptions,
-} from "@opendatalabs/personal-server-ts-core/config";
+} from "@opendatalabs/personal-server-ts-server";
 export type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 export {
   createServer,

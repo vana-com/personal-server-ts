@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { initializeDatabase } from "./schema.js";
-import { createIndexManager, type IndexManager } from "./manager.js";
+import { initializeDatabase } from "./index-schema.js";
+import { createIndexManager, type IndexManager } from "./index-manager.js";
 import type Database from "better-sqlite3";
 
 describe("IndexManager", () => {

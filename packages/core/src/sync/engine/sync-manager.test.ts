@@ -6,7 +6,7 @@ import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../../signing/signer.js";
 import type { SyncCursor } from "../cursor.js";
-import type { Logger } from "pino";
+import type { Logger } from "../../logger/index.js";
 import type { DataStoragePort } from "../../ports/index.js";
 
 // Mock workers so we control their behavior

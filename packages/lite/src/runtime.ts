@@ -16,22 +16,19 @@ import {
 } from "@opendatalabs/personal-server-ts-core/errors";
 import {
   approveDeviceSessionContract,
-  createGrantContract,
   createMemoryDeviceSessionStore,
   initiateDeviceSessionContract,
-  listGrantsContract,
-  oauthTokenContract,
-  parseJsonObjectBody,
   pollDeviceSessionContract,
   provisionDeviceTokenContract,
   revokeDeviceTokenContract,
-  validateServerConfigContract,
-  verifyGrantContract,
   type DeviceSessionStore,
 } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
   handlePersonalServerAccessLogsRequest,
+  handlePersonalServerConfigRequest,
   handlePersonalServerDataRequest,
+  handlePersonalServerGrantsRequest,
+  handlePersonalServerOauthTokenRequest,
   handlePersonalServerSyncRequest,
   type PersonalServerApiAuthPort,
   type PersonalServerReadAuthInput,
@@ -244,6 +241,10 @@ async function verifyWeb3SignedRequest(
       expectedOrigin: resolveOrigin(options.origin),
       expectedMethod: request.method,
       expectedPath: url.pathname,
+      bodyBytes:
+        request.method === "GET" || request.method === "HEAD"
+          ? undefined
+          : new Uint8Array(await request.clone().arrayBuffer()),
       now: options.now?.(),
     });
   } catch (err) {
@@ -387,10 +388,6 @@ function bearerToken(request: Request): string | null {
   return authorization.slice(7);
 }
 
-async function readForm(request: Request): Promise<URLSearchParams> {
-  return new URLSearchParams(await request.text());
-}
-
 export function createPsLiteRuntime(
   options: PsLiteRuntimeOptions,
 ): PsLiteRuntime {
@@ -427,14 +424,6 @@ export function createPsLiteRuntime(
     body: unknown;
   }): Response {
     return jsonResponse(result.body, { status: result.status });
-  }
-
-  function gatewayRequiredResponse(): Response {
-    return errorResponse(
-      500,
-      "SERVER_NOT_CONFIGURED",
-      "Gateway is not configured",
-    );
   }
 
   function ownerAddress(): `0x${string}` | undefined {
@@ -578,51 +567,6 @@ export function createPsLiteRuntime(
     return undefined;
   }
 
-  async function handleOauthToken(request: Request) {
-    if (request.method !== "POST") {
-      return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
-    }
-    const contentType = request.headers.get("content-type") ?? "";
-    if (!contentType.includes("application/x-www-form-urlencoded")) {
-      return jsonResponse(
-        {
-          error: "invalid_request",
-          error_description:
-            "Content-Type must be application/x-www-form-urlencoded",
-        },
-        { status: 400 },
-      );
-    }
-    const form = await readForm(request);
-    const result = await oauthTokenContract({
-      body: form,
-      authorizationHeader: request.headers.get("authorization"),
-      tokenStore,
-      controlPlaneSecret: options.accessToken,
-      randomToken: () => `vana_ps_${randomHex(32)}`,
-      now,
-      deviceSessions: {
-        findByDeviceCode(deviceCode) {
-          const session = deviceSessions.findByPollToken(deviceCode);
-          if (!session) return null;
-          return {
-            status: session.status,
-            accessToken: session.accessToken,
-            accessTokenExpiresAt: session.accessTokenExpiresAt,
-            sessionId: session.sessionId,
-          };
-        },
-        consume(sessionId) {
-          deviceSessions.delete(sessionId);
-        },
-      },
-    });
-    return jsonResponse(result.body, {
-      status: result.status,
-      headers: result.headers,
-    });
-  }
-
   return {
     kind: "ps-lite",
     storage: options.storage,
@@ -727,61 +671,49 @@ export function createPsLiteRuntime(
         }
 
         if (url.pathname === "/oauth/token") {
-          return handleOauthToken(request);
+          return handlePersonalServerOauthTokenRequest(request, {
+            tokenStore,
+            controlPlaneSecret: options.accessToken,
+            randomToken: () => `vana_ps_${randomHex(32)}`,
+            now,
+            deviceSessions: {
+              findByDeviceCode(deviceCode) {
+                const session = deviceSessions.findByPollToken(deviceCode);
+                if (!session) return null;
+                return {
+                  status: session.status,
+                  accessToken: session.accessToken,
+                  accessTokenExpiresAt: session.accessTokenExpiresAt,
+                  sessionId: session.sessionId,
+                };
+              },
+              consume(sessionId) {
+                deviceSessions.delete(sessionId);
+              },
+            },
+          });
         }
 
         const grantsPrefix = "/v1/grants";
         if (
           url.pathname === grantsPrefix ||
-          url.pathname === `${grantsPrefix}/`
+          url.pathname === `${grantsPrefix}/` ||
+          url.pathname === `${grantsPrefix}/verify`
         ) {
-          if (request.method === "GET") {
-            await auth.authorizeOwner(request);
-            if (!options.gateway) return gatewayRequiredResponse();
-            return sendContractResult(
-              await listGrantsContract({
-                gateway: options.gateway,
-                serverOwner: options.serverOwner ?? options.identity?.address,
-              }),
-            );
-          }
-          if (request.method === "POST") {
-            await auth.authorizeOwner(request);
-            if (!options.gateway) return gatewayRequiredResponse();
-            let body: unknown;
-            try {
-              body = await request.json();
-            } catch {
-              return errorResponse(400, "INVALID_BODY", "Invalid JSON body");
-            }
-            return sendContractResult(
-              await createGrantContract({
-                gateway: options.gateway,
-                serverOwner: options.serverOwner ?? options.identity?.address,
-                serverSigner: options.serverSigner,
-                body,
-                now: () => now().getTime(),
-              }),
-            );
-          }
-          return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
-        }
-
-        if (url.pathname === `${grantsPrefix}/verify`) {
-          if (request.method !== "POST") {
-            return errorResponse(
-              405,
-              "METHOD_NOT_ALLOWED",
-              "Method not allowed",
-            );
-          }
-          let body: unknown;
-          try {
-            body = await request.json();
-          } catch {
-            return errorResponse(400, "INVALID_BODY", "Invalid JSON body");
-          }
-          return sendContractResult(await verifyGrantContract(body));
+          return handlePersonalServerGrantsRequest(
+            request,
+            {
+              auth,
+              gateway: options.gateway,
+              gatewayConfig: options.config?.gateway as
+                | DataPortabilityGatewayConfig
+                | undefined,
+              serverOwner: options.serverOwner ?? options.identity?.address,
+              serverSigner: options.serverSigner,
+              now,
+            },
+            { basePath: grantsPrefix },
+          );
         }
 
         const accessLogsPrefix = "/v1/access-logs";
@@ -810,20 +742,15 @@ export function createPsLiteRuntime(
         }
 
         if (url.pathname === "/ui/api/config") {
-          if (request.method === "GET") {
-            await auth.authorizeOwner(request);
-            return jsonResponse(options.config ?? {});
-          }
-          if (request.method === "PUT") {
-            await auth.authorizeOwner(request);
-            const parsed = await parseJsonObjectBody(request);
-            if (!parsed.ok) return sendContractResult(parsed.result);
-            const result = validateServerConfigContract(parsed.body);
-            if (!result.ok) return sendContractResult(result);
-            await saveConfig?.((result.body as { config: unknown }).config);
-            return sendContractResult(result);
-          }
-          return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+          return handlePersonalServerConfigRequest(request, {
+            auth,
+            async readConfig() {
+              return options.config ?? {};
+            },
+            async writeConfig(config) {
+              await saveConfig(config);
+            },
+          });
         }
 
         return errorResponse(404, "NOT_FOUND", "Not found");

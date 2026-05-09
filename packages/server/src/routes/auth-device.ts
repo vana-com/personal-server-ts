@@ -204,6 +204,10 @@ async function verifyRemoteOwnerApproval(
       expectedOrigin: getRequestOrigin(c),
       expectedMethod: c.req.method,
       expectedPath: getRequestPath(c),
+      bodyBytes:
+        c.req.method === "GET" || c.req.method === "HEAD"
+          ? undefined
+          : new Uint8Array(await c.req.raw.clone().arrayBuffer()),
     });
 
     if (auth.signer.toLowerCase() !== serverOwner.toLowerCase()) {

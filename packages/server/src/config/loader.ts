@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import {
   ServerConfigSchema,
   type ServerConfig,
-} from "../schemas/server-config.js";
+} from "@opendatalabs/personal-server-ts-core/schemas";
 import { resolveRootPath } from "./paths.js";
 
 /**

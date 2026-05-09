@@ -1,9 +1,5 @@
-import {
-  deleteAllForScope,
-  readDataFile,
-  writeDataFile,
-  type HierarchyManagerOptions,
-} from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
+import { deleteAllForScope, readDataFile, writeDataFile } from "./hierarchy.js";
+import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type {
   DataStorageEntryLookup,

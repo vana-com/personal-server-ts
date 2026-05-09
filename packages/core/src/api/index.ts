@@ -21,9 +21,24 @@ import {
   syncFileContract,
   triggerSyncContract,
   getSyncStatusContract,
+  configReadErrorContract,
+  configWriteErrorContract,
+  createGrantContract,
+  listGrantsContract,
+  oauthTokenContract,
   type ContractResult,
   type DataContractError,
+  type OAuthDeviceSessionLookup,
+  type OAuthTokenStorePort,
+  type VerifyGrantContractInput,
+  validateServerConfigContract,
+  verifyGrantContract,
 } from "../contracts/index.js";
+import type {
+  DataPortabilityGatewayConfig,
+  GatewayClient,
+} from "@opendatalabs/vana-sdk/browser";
+import type { ServerSigner } from "../signing/index.js";
 
 export interface PersonalServerReadAuthInput {
   request: Request;
@@ -77,6 +92,33 @@ export interface PersonalServerSyncApiDeps {
   auth: Pick<PersonalServerApiAuthPort, "authorizeOwner">;
   syncManager: Pick<SyncManager, "trigger" | "getStatus"> | null;
   logger?: PersonalServerApiLogger;
+}
+
+export interface PersonalServerGrantsApiDeps {
+  auth: Pick<PersonalServerApiAuthPort, "authorizeOwner">;
+  gateway?: Pick<
+    GatewayClient,
+    "getBuilder" | "createGrant" | "listGrantsByUser"
+  >;
+  gatewayConfig?: DataPortabilityGatewayConfig;
+  serverOwner?: `0x${string}`;
+  serverSigner?: Pick<ServerSigner, "signGrantRegistration">;
+  now?: () => Date;
+}
+
+export interface PersonalServerConfigApiDeps {
+  auth: Pick<PersonalServerApiAuthPort, "authorizeOwner">;
+  readConfig(): Promise<unknown>;
+  writeConfig(config: unknown): Promise<void>;
+}
+
+export interface PersonalServerOauthTokenApiDeps {
+  tokenStore: OAuthTokenStorePort;
+  controlPlaneSecret?: string;
+  deviceSessions?: OAuthDeviceSessionLookup;
+  randomToken(): string;
+  now?: () => Date;
+  safeCompare?: (left: string, right: string) => boolean;
 }
 
 export interface PersonalServerApiDispatchOptions {
@@ -425,6 +467,133 @@ export async function handlePersonalServerSyncRequest(
     }
 
     return notFound();
+  });
+}
+
+export async function handlePersonalServerGrantsRequest(
+  request: Request,
+  deps: PersonalServerGrantsApiDeps,
+  options: PersonalServerApiDispatchOptions = {},
+): Promise<Response> {
+  return withApiErrors(async () => {
+    const url = new URL(request.url);
+    const pathname = stripBasePath(url.pathname, options.basePath);
+
+    if (pathname === "/" || pathname === "") {
+      await deps.auth.authorizeOwner(request);
+      if (!deps.gateway) {
+        return errorResponse(
+          500,
+          "SERVER_NOT_CONFIGURED",
+          "Gateway is not configured",
+        );
+      }
+      if (request.method === "GET") {
+        return contractResponse(
+          await listGrantsContract({
+            gateway: deps.gateway,
+            serverOwner: deps.serverOwner,
+          }),
+        );
+      }
+      if (request.method === "POST") {
+        const parsed = await parseJsonObjectBody(request);
+        if (!parsed.ok) return contractResponse(parsed.result);
+        return contractResponse(
+          await createGrantContract({
+            gateway: deps.gateway,
+            serverOwner: deps.serverOwner,
+            serverSigner: deps.serverSigner,
+            body: parsed.body,
+            now: () => deps.now?.().getTime() ?? Date.now(),
+          }),
+        );
+      }
+      return methodNotAllowed();
+    }
+
+    if (pathname === "/verify") {
+      if (request.method !== "POST") return methodNotAllowed();
+      const parsed = await parseJsonObjectBody(request);
+      if (!parsed.ok) return contractResponse(parsed.result);
+      return contractResponse(
+        await verifyGrantContract({
+          body: parsed.body,
+          gatewayConfig: deps.gatewayConfig,
+        } satisfies VerifyGrantContractInput),
+      );
+    }
+
+    return notFound();
+  });
+}
+
+export async function handlePersonalServerConfigRequest(
+  request: Request,
+  deps: PersonalServerConfigApiDeps,
+): Promise<Response> {
+  return withApiErrors(async () => {
+    await deps.auth.authorizeOwner(request);
+    if (request.method === "GET") {
+      try {
+        return jsonResponse(await deps.readConfig());
+      } catch (err) {
+        const kind =
+          err instanceof Error &&
+          "code" in err &&
+          (err as { code?: string }).code === "ENOENT"
+            ? "not-found"
+            : "read";
+        return contractResponse(configReadErrorContract(kind));
+      }
+    }
+    if (request.method === "PUT") {
+      const parsed = await parseJsonObjectBody(request);
+      if (!parsed.ok) return contractResponse(parsed.result);
+      const result = validateServerConfigContract(parsed.body);
+      if (!result.ok) return contractResponse(result);
+      try {
+        await deps.writeConfig((result.body as { config: unknown }).config);
+      } catch {
+        return contractResponse(configWriteErrorContract());
+      }
+      return contractResponse(result);
+    }
+    return methodNotAllowed();
+  });
+}
+
+export async function handlePersonalServerOauthTokenRequest(
+  request: Request,
+  deps: PersonalServerOauthTokenApiDeps,
+): Promise<Response> {
+  return withApiErrors(async () => {
+    if (request.method !== "POST") return methodNotAllowed();
+    const contentType = request.headers.get("content-type") ?? "";
+    if (!contentType.includes("application/x-www-form-urlencoded")) {
+      return jsonResponse(
+        {
+          error: "invalid_request",
+          error_description:
+            "Content-Type must be application/x-www-form-urlencoded",
+        },
+        { status: 400 },
+      );
+    }
+    const result = await oauthTokenContract({
+      body: new URLSearchParams(await request.text()),
+      authorizationHeader: request.headers.get("authorization"),
+      tokenStore: deps.tokenStore,
+      controlPlaneSecret: deps.controlPlaneSecret,
+      deviceSessions: deps.deviceSessions,
+      randomToken: deps.randomToken,
+      now: deps.now,
+      safeCompare: deps.safeCompare,
+    });
+    return jsonResponse(result.body, {
+      status: result.status,
+      headers: result.headers,
+    });
   });
 }
 

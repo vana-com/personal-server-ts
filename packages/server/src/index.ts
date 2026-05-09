@@ -1,7 +1,7 @@
 import { createAdaptorServer } from "@hono/node-server";
 import type { AddressInfo } from "node:net";
 import { createRequire } from "node:module";
-import { loadConfig } from "@opendatalabs/personal-server-ts-core/config";
+import { loadConfig } from "./config/index.js";
 import { createServer } from "./bootstrap.js";
 import { verifyTunnelUrl } from "./tunnel/index.js";
 

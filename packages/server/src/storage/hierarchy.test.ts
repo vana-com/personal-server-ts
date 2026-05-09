@@ -8,9 +8,9 @@ import {
   listVersions,
   deleteDataFile,
   deleteAllForScope,
-} from "./manager.js";
+} from "./hierarchy.js";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
-import type { HierarchyManagerOptions } from "./manager.js";
+import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 
 describe("HierarchyManager", () => {
   let dataDir: string;
@@ -138,7 +138,8 @@ describe("HierarchyManager", () => {
 
       // Scope directory should be gone
       const { stat } = await import("node:fs/promises");
-      const { buildScopeDir } = await import("./paths.js");
+      const { buildScopeDir } =
+        await import("@opendatalabs/personal-server-ts-core/storage/hierarchy");
       const scopeDir = buildScopeDir(dataDir, scope);
       await expect(stat(scopeDir)).rejects.toThrow(/ENOENT/);
     });

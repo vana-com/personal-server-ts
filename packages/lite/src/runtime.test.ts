@@ -659,11 +659,13 @@ describe("createPsLiteRuntime", () => {
       now: () => new Date("2026-05-08T00:00:00.000Z"),
     });
 
+    const writeBody = JSON.stringify({ username: "web3_user" });
     const writeAuth = await buildWeb3SignedHeader({
       wallet: owner,
       aud: "https://ps.local",
       method: "POST",
       uri: "/v1/data/instagram.profile",
+      body: new TextEncoder().encode(writeBody),
     });
     const write = await runtime.fetch(
       new Request("https://ps.local/v1/data/instagram.profile", {
@@ -672,7 +674,7 @@ describe("createPsLiteRuntime", () => {
           Authorization: writeAuth,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ username: "web3_user" }),
+        body: writeBody,
       }),
     );
     expect(write.status).toBe(201);

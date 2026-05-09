@@ -8,9 +8,9 @@
  */
 
 import { privateKeyToAccount } from "viem/accounts";
-import { loadConfig } from "../packages/core/src/config/loader.js";
-import { resolveRootPath } from "../packages/core/src/config/paths.js";
-import { loadOrCreateServerAccount } from "../packages/core/src/keys/server-account.js";
+import { loadConfig } from "../packages/server/src/config/loader.js";
+import { resolveRootPath } from "../packages/server/src/config/paths.js";
+import { loadOrCreateServerAccount } from "../packages/server/src/keys/server-account.js";
 import {
   serverRegistrationDomain,
   SERVER_REGISTRATION_TYPES,

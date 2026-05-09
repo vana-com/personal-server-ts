@@ -7,7 +7,7 @@ import {
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
 import type { SyncCursor } from "../cursor.js";
-import type { Logger } from "pino";
+import type { Logger } from "../../logger/index.js";
 import type { DataStoragePort } from "../../ports/index.js";
 
 export interface DownloadWorkerDeps {

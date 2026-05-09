@@ -1,9 +1,13 @@
 import { verifyTypedData } from "viem";
 import type {
   CreateGrantParams,
+  DataPortabilityGatewayConfig,
   GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
-import { GRANT_DOMAIN, GRANT_TYPES } from "../grants/index.js";
+import {
+  GRANT_REGISTRATION_TYPES,
+  grantRegistrationDomain,
+} from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../signing/index.js";
 import {
   contractError,
@@ -13,14 +17,10 @@ import {
 } from "./http.js";
 
 export interface VerifyGrantRequestBody {
-  grantId: string;
-  payload: {
-    user: `0x${string}`;
-    builder: `0x${string}`;
-    scopes: string[];
-    expiresAt: number;
-    nonce: number;
-  };
+  grantorAddress: `0x${string}`;
+  granteeId: `0x${string}`;
+  grant: string;
+  fileIds?: Array<string | number>;
   signature: `0x${string}`;
 }
 
@@ -42,6 +42,20 @@ export interface CreateGrantContractInput {
 export interface ListGrantsContractInput {
   gateway: Pick<GatewayClient, "listGrantsByUser">;
   serverOwner?: `0x${string}`;
+}
+
+export interface VerifyGrantContractInput {
+  body: unknown;
+  gatewayConfig?: DataPortabilityGatewayConfig;
+  nowSeconds?: number;
+}
+
+interface ParsedGrantPayload {
+  user?: `0x${string}`;
+  builder?: `0x${string}`;
+  scopes: string[];
+  expiresAt: number;
+  nonce?: number;
 }
 
 function isValidCreateBody(body: unknown): body is CreateGrantRequestBody {
@@ -69,27 +83,77 @@ function isValidVerifyBody(body: unknown): body is VerifyGrantRequestBody {
     return false;
   }
   const b = body as Record<string, unknown>;
-  if (typeof b.grantId !== "string" || b.grantId.length === 0) return false;
-  if (typeof b.signature !== "string" || !b.signature.startsWith("0x")) {
-    return false;
-  }
   if (
-    b.payload === null ||
-    typeof b.payload !== "object" ||
-    Array.isArray(b.payload)
+    typeof b.grantorAddress !== "string" ||
+    !b.grantorAddress.startsWith("0x")
   ) {
     return false;
   }
-  const p = b.payload as Record<string, unknown>;
-  if (typeof p.user !== "string" || !p.user.startsWith("0x")) return false;
-  if (typeof p.builder !== "string" || !p.builder.startsWith("0x")) {
+  if (typeof b.granteeId !== "string" || !b.granteeId.startsWith("0x")) {
     return false;
   }
-  if (!Array.isArray(p.scopes) || p.scopes.length === 0) return false;
-  if (!p.scopes.every((scope) => typeof scope === "string")) return false;
-  if (typeof p.expiresAt !== "number") return false;
-  if (typeof p.nonce !== "number") return false;
+  if (typeof b.grant !== "string" || b.grant.length === 0) return false;
+  if (
+    b.fileIds !== undefined &&
+    (!Array.isArray(b.fileIds) ||
+      !b.fileIds.every(
+        (fileId) => typeof fileId === "string" || typeof fileId === "number",
+      ))
+  ) {
+    return false;
+  }
+  if (typeof b.signature !== "string" || !b.signature.startsWith("0x")) {
+    return false;
+  }
   return true;
+}
+
+function parseGrantPayload(grant: string): ParsedGrantPayload | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(grant);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+  const value = parsed as Record<string, unknown>;
+  if (!Array.isArray(value.scopes) || value.scopes.length === 0) return null;
+  if (!value.scopes.every((scope) => typeof scope === "string")) return null;
+  if (typeof value.expiresAt !== "number") return null;
+  if (
+    value.user !== undefined &&
+    (typeof value.user !== "string" || !value.user.startsWith("0x"))
+  ) {
+    return null;
+  }
+  if (
+    value.builder !== undefined &&
+    (typeof value.builder !== "string" || !value.builder.startsWith("0x"))
+  ) {
+    return null;
+  }
+  if (value.nonce !== undefined && typeof value.nonce !== "number") {
+    return null;
+  }
+  return {
+    user: value.user as `0x${string}` | undefined,
+    builder: value.builder as `0x${string}` | undefined,
+    scopes: value.scopes as string[],
+    expiresAt: value.expiresAt,
+    nonce: value.nonce,
+  };
+}
+
+function fileIdsToBigInt(
+  fileIds: Array<string | number> | undefined,
+): bigint[] | null {
+  try {
+    return (fileIds ?? []).map((fileId) => BigInt(fileId));
+  } catch {
+    return null;
+  }
 }
 
 function serverOwnerNotConfigured(): ContractResult {
@@ -163,34 +227,57 @@ export async function createGrantContract(
   return contractOk({ grantId: result.grantId }, 201);
 }
 
-export async function verifyGrantContract(
-  body: unknown,
+export async function verifyGrantContract({
+  body,
+  gatewayConfig,
   nowSeconds = Math.floor(Date.now() / 1000),
-): Promise<ContractResult> {
+}: VerifyGrantContractInput): Promise<ContractResult> {
   if (!isValidVerifyBody(body)) {
     return contractError(
       400,
       "INVALID_BODY",
-      "Body must include grantId (string), payload (object with user, builder, scopes, expiresAt, nonce), and signature (0x string)",
+      "Body must include grantorAddress, granteeId, grant, optional fileIds, and signature",
+    );
+  }
+  if (!gatewayConfig) {
+    return contractProtocolError(
+      500,
+      "SERVER_NOT_CONFIGURED",
+      "Gateway config is not configured",
     );
   }
 
-  const { payload, signature } = body;
+  const payload = parseGrantPayload(body.grant);
+  if (!payload) {
+    return contractError(
+      400,
+      "INVALID_BODY",
+      "Grant must be JSON with scopes and expiresAt",
+    );
+  }
+
+  const fileIds = fileIdsToBigInt(body.fileIds);
+  if (!fileIds) {
+    return contractError(
+      400,
+      "INVALID_BODY",
+      "fileIds must contain integer values",
+    );
+  }
   let valid: boolean;
   try {
     valid = await verifyTypedData({
-      address: payload.user,
-      domain: GRANT_DOMAIN,
-      types: GRANT_TYPES,
-      primaryType: "Grant",
+      address: body.grantorAddress,
+      domain: grantRegistrationDomain(gatewayConfig),
+      types: GRANT_REGISTRATION_TYPES,
+      primaryType: "GrantRegistration",
       message: {
-        user: payload.user,
-        builder: payload.builder,
-        scopes: payload.scopes,
-        expiresAt: BigInt(payload.expiresAt),
-        nonce: BigInt(payload.nonce),
+        grantorAddress: body.grantorAddress,
+        granteeId: body.granteeId,
+        grant: body.grant,
+        fileIds,
       },
-      signature,
+      signature: body.signature,
     });
   } catch {
     return contractOk({
@@ -202,7 +289,7 @@ export async function verifyGrantContract(
   if (!valid) {
     return contractOk({
       valid: false,
-      error: "Grant signature does not match user",
+      error: "Grant signature does not match grantor",
     });
   }
 
@@ -212,9 +299,12 @@ export async function verifyGrantContract(
 
   return contractOk({
     valid: true,
-    user: payload.user,
+    grantorAddress: body.grantorAddress,
+    granteeId: body.granteeId,
+    user: payload.user ?? body.grantorAddress,
     builder: payload.builder,
     scopes: payload.scopes,
     expiresAt: payload.expiresAt,
+    fileIds: body.fileIds ?? [],
   });
 }

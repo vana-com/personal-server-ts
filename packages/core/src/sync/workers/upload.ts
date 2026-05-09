@@ -5,7 +5,7 @@ import {
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../../signing/signer.js";
-import type { Logger } from "pino";
+import type { Logger } from "../../logger/index.js";
 import type { IndexEntry } from "../../storage/index/types.js";
 import type { DataStoragePort } from "../../ports/index.js";
 

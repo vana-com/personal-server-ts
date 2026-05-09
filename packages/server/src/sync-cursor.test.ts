@@ -2,9 +2,9 @@ import { describe, it, expect } from "vitest";
 import { join } from "node:path";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { createSyncCursor } from "./cursor.js";
-import { loadConfig, saveConfig } from "../config/index.js";
-import { ServerConfigSchema } from "../schemas/server-config.js";
+import { createSyncCursor } from "./sync-cursor.js";
+import { loadConfig, saveConfig } from "./config/index.js";
+import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "sync-cursor-test-"));

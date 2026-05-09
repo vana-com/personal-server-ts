@@ -1,5 +1,5 @@
-export {
-  loadOrCreateServerAccount,
-  type ServerAccount,
-  type SignTypedDataParams,
+export type {
+  KeyFileData,
+  ServerAccount,
+  SignTypedDataParams,
 } from "./server-account.js";

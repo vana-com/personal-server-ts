@@ -3,10 +3,8 @@ import { mkdtemp, rm, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { pino } from "pino";
-import {
-  initializeDatabase,
-  createIndexManager,
-} from "@opendatalabs/personal-server-ts-core/storage/index";
+import { initializeDatabase } from "../storage/index-schema.js";
+import { createIndexManager } from "../storage/index-manager.js";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import {
@@ -123,11 +121,21 @@ async function postWithOwnerAuth(
     rawBody,
     wallet: signingWallet = ownerWallet,
   } = options;
+  const requestBody =
+    rawBody !== undefined
+      ? rawBody
+      : body !== undefined
+        ? JSON.stringify(body)
+        : undefined;
   const auth = await buildWeb3SignedHeader({
     wallet: signingWallet,
     aud: SERVER_ORIGIN,
     method: "POST",
     uri: `/${scope}`,
+    body:
+      requestBody !== undefined
+        ? new TextEncoder().encode(requestBody)
+        : undefined,
   });
   const init: RequestInit = {
     method: "POST",
@@ -136,11 +144,7 @@ async function postWithOwnerAuth(
       Authorization: auth,
     },
   };
-  if (rawBody !== undefined) {
-    init.body = rawBody;
-  } else if (body !== undefined) {
-    init.body = JSON.stringify(body);
-  }
+  if (requestBody !== undefined) init.body = requestBody;
   return app.request(`/${scope}`, init);
 }
 
@@ -320,6 +324,7 @@ describe("POST /v1/data/:scope", () => {
           aud: SERVER_ORIGIN,
           method: "POST",
           uri: "/instagram.profile",
+          body: new TextEncoder().encode("not json"),
         }),
       },
       body: "not json",

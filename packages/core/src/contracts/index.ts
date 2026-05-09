@@ -69,6 +69,13 @@ export type {
 } from "./auth-device.js";
 export type { ContractResult } from "./http.js";
 export type {
+  VerifyGrantContractInput,
+  VerifyGrantRequestBody,
+  CreateGrantRequestBody,
+  CreateGrantContractInput,
+  ListGrantsContractInput,
+} from "./grants.js";
+export type {
   OAuthDeviceSession,
   OAuthDeviceSessionLookup,
   OAuthTokenResult,

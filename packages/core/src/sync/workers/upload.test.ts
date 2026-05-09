@@ -10,7 +10,7 @@ import type {
   Schema,
 } from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../../signing/signer.js";
-import type { Logger } from "pino";
+import type { Logger } from "../../logger/index.js";
 import type { DataStoragePort } from "../../ports/index.js";
 
 vi.mock("@opendatalabs/vana-sdk/browser", () => ({

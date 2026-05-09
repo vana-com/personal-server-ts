@@ -83,7 +83,7 @@ function decodeBase64(input: string): string {
   if (typeof atob === "function") {
     return atob(input);
   }
-  return Buffer.from(input, "base64").toString("utf-8");
+  throw new Error("Base64 decoding is not available in this runtime");
 }
 
 export function parseOAuthBasicAuth(

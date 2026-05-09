@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { recoverTypedDataAddress } from "viem";
 
-import { loadOrCreateServerAccount } from "../keys/server-account.js";
+import { loadOrCreateServerAccount } from "../../../server/src/keys/server-account.js";
 import type { GatewayConfig } from "../schemas/server-config.js";
 import { createServerSigner } from "./signer.js";
 import {

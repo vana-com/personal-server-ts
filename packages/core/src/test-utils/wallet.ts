@@ -63,6 +63,7 @@ export async function buildWeb3SignedHeader(params: {
   method: string;
   uri: string;
   bodyHash?: string;
+  body?: Uint8Array;
   iat?: number;
   exp?: number;
   grantId?: string;
@@ -73,6 +74,7 @@ export async function buildWeb3SignedHeader(params: {
     method: params.method,
     uri: params.uri,
     bodyHash: params.bodyHash,
+    body: params.body,
     iat: params.iat,
     exp: params.exp,
     grantId: params.grantId,

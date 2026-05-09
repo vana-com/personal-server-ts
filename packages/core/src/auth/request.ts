@@ -79,6 +79,13 @@ function getBearerToken(headerValue: string | null): string | null {
   return headerValue.slice(7);
 }
 
+async function requestBodyBytes(
+  request: Request,
+): Promise<Uint8Array | undefined> {
+  if (request.method === "GET" || request.method === "HEAD") return undefined;
+  return new Uint8Array(await request.clone().arrayBuffer());
+}
+
 function getErrorDetails(err: unknown): Record<string, unknown> | undefined {
   if (err && typeof err === "object" && "details" in err) {
     const details = err.details;
@@ -149,6 +156,7 @@ export async function authenticateRequest(
       expectedOrigin: resolveOrigin(input.serverOrigin),
       expectedMethod: input.request.method,
       expectedPath: url.pathname,
+      bodyBytes: await requestBodyBytes(input.request),
       now: input.now?.(),
     });
 

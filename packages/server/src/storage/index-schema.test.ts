@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import Database from "better-sqlite3";
-import { initializeDatabase } from "./schema.js";
+import { initializeDatabase } from "./index-schema.js";
 
 describe("initializeDatabase", () => {
   it("returns a Database instance", () => {

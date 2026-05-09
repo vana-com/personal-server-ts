@@ -6,35 +6,29 @@ import { join } from "node:path";
 const require = createRequire(import.meta.url);
 const pkg = require("../package.json") as { version: string };
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
+import { DEFAULT_ROOT_PATH, resolveRootPath } from "./config/index.js";
+import { createLogger, type Logger } from "./logger/index.js";
+import { initializeDatabase } from "./storage/index-schema.js";
 import {
-  DEFAULT_ROOT_PATH,
-  resolveRootPath,
-} from "@opendatalabs/personal-server-ts-core/config";
-import {
-  createLogger,
-  type Logger,
-} from "@opendatalabs/personal-server-ts-core/logger";
-import {
-  initializeDatabase,
   createIndexManager,
   type IndexManager,
-} from "@opendatalabs/personal-server-ts-core/storage/index";
+} from "./storage/index-manager.js";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { createGatewayClient } from "@opendatalabs/vana-sdk/node";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
-import { createAccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
-import { createAccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
+import { createAccessLogWriter } from "./logging/access-log.js";
+import { createAccessLogReader } from "./logging/access-reader.js";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import {
   deriveMasterKey,
   recoverServerOwner,
 } from "@opendatalabs/vana-sdk/node";
-import { loadOrCreateServerAccount } from "@opendatalabs/personal-server-ts-core/keys";
+import { loadOrCreateServerAccount } from "./keys/server-account.js";
 import type { ServerAccount } from "@opendatalabs/personal-server-ts-core/keys";
 import { createServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
+import { createSyncCursor } from "./sync-cursor.js";
 import {
-  createSyncCursor,
   createSyncManager,
   type SyncManager,
 } from "@opendatalabs/personal-server-ts-core/sync";

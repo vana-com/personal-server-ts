@@ -127,11 +127,13 @@ export function createApp(deps: AppDeps): Hono {
     grantsRoutes({
       logger: deps.logger,
       gateway: deps.gateway,
+      gatewayConfig: deps.gatewayConfig,
       serverOwner: deps.serverOwner,
       serverOrigin: deps.serverOrigin,
       devToken: deps.devToken,
       tokenStore: deps.tokenStore,
       serverSigner: deps.serverSigner,
+      mountPath: "/v1/grants",
     }),
   );
 

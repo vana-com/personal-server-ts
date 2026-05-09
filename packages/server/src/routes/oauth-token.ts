@@ -27,12 +27,10 @@
  */
 
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { Hono, type Context } from "hono";
+import { Hono } from "hono";
 import type { Logger } from "pino";
-import {
-  oauthTokenContract,
-  type OAuthDeviceSessionLookup,
-} from "@opendatalabs/personal-server-ts-core/contracts";
+import type { OAuthDeviceSessionLookup } from "@opendatalabs/personal-server-ts-core/contracts";
+import { handlePersonalServerOauthTokenRequest } from "@opendatalabs/personal-server-ts-core/api";
 import type { TokenStore } from "../token-store.js";
 
 /**
@@ -60,36 +58,6 @@ export interface OauthTokenRouteDeps {
   deviceSessions?: DeviceSessionLookup;
 }
 
-type OauthError =
-  | "invalid_request"
-  | "invalid_client"
-  | "invalid_grant"
-  | "unauthorized_client"
-  | "unsupported_grant_type"
-  | "invalid_scope"
-  | "authorization_pending"
-  | "access_denied"
-  | "expired_token";
-
-function oauthError(
-  c: Context,
-  error: OauthError,
-  description: string,
-  status: 400 | 401 = 400,
-) {
-  return c.json(
-    {
-      error,
-      error_description: description,
-    },
-    status,
-    {
-      "Cache-Control": "no-store",
-      Pragma: "no-cache",
-    },
-  );
-}
-
 function safeCompare(a: string, b: string): boolean {
   const bufA = Buffer.from(a, "utf-8");
   const bufB = Buffer.from(b, "utf-8");
@@ -100,34 +68,15 @@ function safeCompare(a: string, b: string): boolean {
 export function oauthTokenRoutes(deps: OauthTokenRouteDeps): Hono {
   const app = new Hono();
 
-  app.post("/", async (c) => {
-    const contentType = c.req.header("content-type") ?? "";
-    if (!contentType.includes("application/x-www-form-urlencoded")) {
-      return oauthError(
-        c,
-        "invalid_request",
-        "Content-Type must be application/x-www-form-urlencoded",
-      );
-    }
-
-    const body = await c.req.parseBody();
-    const params = new URLSearchParams();
-    for (const [key, value] of Object.entries(body)) {
-      if (typeof value === "string") {
-        params.set(key, value);
-      }
-    }
-    const result = await oauthTokenContract({
-      body: params,
-      authorizationHeader: c.req.header("authorization"),
+  app.all("/", (c) =>
+    handlePersonalServerOauthTokenRequest(c.req.raw, {
       tokenStore: deps.tokenStore,
       controlPlaneSecret: deps.controlPlaneSecret,
       deviceSessions: deps.deviceSessions,
       randomToken: () => `vana_ps_${randomBytes(32).toString("hex")}`,
       safeCompare,
-    });
-    return c.json(result.body, result.status, result.headers);
-  });
+    }),
+  );
 
   return app;
 }
