@@ -363,7 +363,10 @@ describe("createServer", () => {
     });
 
     it("syncManager is null when VANA_MASTER_KEY_SIGNATURE not set even if sync.enabled", async () => {
-      const config = ServerConfigSchema.parse({ sync: { enabled: true } });
+      const config = ServerConfigSchema.parse({
+        sync: { enabled: true },
+        tunnel: { enabled: false },
+      });
       const ctx = await createServer(config, {
         serverDir: tempDir,
         dataDir: join(tempDir, "data"),
@@ -449,6 +452,7 @@ describe("createServer", () => {
         gateway: {
           ...testGatewayConfig,
         },
+        tunnel: { enabled: false },
       });
       const ctx = await createServer(config, {
         serverDir: tempDir,
