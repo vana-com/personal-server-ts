@@ -117,6 +117,7 @@ export function createApp(deps: AppDeps): Hono {
       feeVerifier: deps.feeVerifier,
       runtimeAvailability: deps.runtimeAvailability,
       dataStorage: deps.dataStorage,
+      mountPath: "/v1/data",
     }),
   );
 
@@ -142,8 +143,10 @@ export function createApp(deps: AppDeps): Hono {
       accessLogReader: deps.accessLogReader,
       serverOrigin: deps.serverOrigin,
       serverOwner: deps.serverOwner,
+      gateway: deps.gateway,
       devToken: deps.devToken,
       tokenStore: deps.tokenStore,
+      mountPath: "/v1/access-logs",
     }),
   );
 
@@ -154,9 +157,11 @@ export function createApp(deps: AppDeps): Hono {
       logger: deps.logger,
       serverOrigin: deps.serverOrigin,
       serverOwner: deps.serverOwner,
+      gateway: deps.gateway,
       devToken: deps.devToken,
       tokenStore: deps.tokenStore,
       syncManager: deps.syncManager ?? null,
+      mountPath: "/v1/sync",
     }),
   );
 

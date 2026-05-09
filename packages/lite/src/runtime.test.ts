@@ -9,6 +9,7 @@ import {
   createMemoryPsLiteStorage,
   createMemoryPsLiteTokenStore,
 } from "./test-support/memory.js";
+import { createMockPsLiteGateway } from "./test-support/gateway.js";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
@@ -20,6 +21,7 @@ function createTestRuntime(options: Partial<PsLiteRuntimeOptions> = {}) {
   const accessLogStore = createMemoryPsLiteAccessLogStore();
   const defaults: PsLiteRuntimeOptions = {
     storage: createMemoryPsLiteStorage(),
+    gateway: createMockPsLiteGateway(),
     accessLogReader: accessLogStore,
     accessLogWriter: accessLogStore,
     tokenStore: createMemoryPsLiteTokenStore(),
@@ -30,6 +32,7 @@ function createTestRuntime(options: Partial<PsLiteRuntimeOptions> = {}) {
     ...defaults,
     ...options,
     storage: options.storage ?? defaults.storage,
+    gateway: "gateway" in options ? options.gateway : defaults.gateway,
     accessLogReader: options.accessLogReader ?? defaults.accessLogReader,
     accessLogWriter: options.accessLogWriter ?? defaults.accessLogWriter,
     tokenStore: options.tokenStore ?? defaults.tokenStore,
@@ -162,6 +165,71 @@ describe("createPsLiteRuntime", () => {
     expect(body.error.errorCode).toBe("MISSING_AUTH");
   });
 
+  it("requires a gateway schema resolver for owner writes", async () => {
+    const storage = createMemoryPsLiteStorage();
+    const runtime = createTestRuntime({
+      storage,
+      gateway: undefined,
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+    });
+
+    const res = await runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer owner-token",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ username: "test_user" }),
+      }),
+    );
+
+    expect(res.status).toBe(500);
+    const body = await res.json();
+    expect(body.error.errorCode).toBe("SERVER_NOT_CONFIGURED");
+    expect(storage.listScopes({ limit: 20, offset: 0 }).total).toBe(0);
+  });
+
+  it("rejects owner writes when no schema is registered for the scope", async () => {
+    const storage = createMemoryPsLiteStorage();
+    const runtime = createTestRuntime({
+      storage,
+      gateway: {
+        ...createMockPsLiteGateway(),
+        async getSchemaForScope() {
+          return null;
+        },
+      },
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+    });
+
+    const res = await runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer owner-token",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ username: "test_user" }),
+      }),
+    );
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({
+      error: "NO_SCHEMA",
+      message: "No schema registered for scope: instagram.profile",
+    });
+    expect(storage.listScopes({ limit: 20, offset: 0 }).total).toBe(0);
+  });
+
   it("stores and reads data through the ps-lite data contract", async () => {
     const runtime = createTestRuntime({
       storage: createMemoryPsLiteStorage(),
@@ -186,7 +254,7 @@ describe("createPsLiteRuntime", () => {
     expect(write.status).toBe(201);
     await expect(write.json()).resolves.toEqual({
       scope: "instagram.profile",
-      collectedAt: "2026-05-08T00:00:00.000Z",
+      collectedAt: "2026-05-08T00:00:00Z",
       status: "stored",
     });
 
@@ -203,7 +271,7 @@ describe("createPsLiteRuntime", () => {
     await expect(read.json()).resolves.toMatchObject({
       version: "1.0",
       scope: "instagram.profile",
-      collectedAt: "2026-05-08T00:00:00.000Z",
+      collectedAt: "2026-05-08T00:00:00Z",
       data: { username: "test_user" },
     });
   });
@@ -267,7 +335,7 @@ describe("createPsLiteRuntime", () => {
       scopes: [
         {
           scope: "instagram.profile",
-          latestCollectedAt: "2026-05-08T00:00:00.000Z",
+          latestCollectedAt: "2026-05-08T00:00:00Z",
           versionCount: 1,
         },
       ],
@@ -277,7 +345,7 @@ describe("createPsLiteRuntime", () => {
     expect(versions.status).toBe(200);
     await expect(versions.json()).resolves.toMatchObject({
       scope: "instagram.profile",
-      versions: [{ collectedAt: "2026-05-08T00:00:00.000Z" }],
+      versions: [{ collectedAt: "2026-05-08T00:00:00Z" }],
       total: 1,
     });
   });

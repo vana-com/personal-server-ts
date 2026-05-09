@@ -18,28 +18,25 @@ import {
   approveDeviceSessionContract,
   createGrantContract,
   createMemoryDeviceSessionStore,
-  deleteDataScopeContract,
-  getSyncStatusContract,
-  ingestDataContract,
   initiateDeviceSessionContract,
-  listAccessLogsContract,
-  listDataScopesContract,
-  listDataVersionsContract,
   listGrantsContract,
   oauthTokenContract,
-  parseDataScopeContract,
   parseJsonObjectBody,
   pollDeviceSessionContract,
   provisionDeviceTokenContract,
-  readDataContract,
   revokeDeviceTokenContract,
-  syncFileContract,
-  triggerSyncContract,
   validateServerConfigContract,
   verifyGrantContract,
   type DeviceSessionStore,
-  type DataContractError,
 } from "@opendatalabs/personal-server-ts-core/contracts";
+import {
+  handlePersonalServerAccessLogsRequest,
+  handlePersonalServerDataRequest,
+  handlePersonalServerSyncRequest,
+  type PersonalServerApiAuthPort,
+  type PersonalServerReadAuthInput,
+  type PersonalServerReadAuthResult,
+} from "@opendatalabs/personal-server-ts-core/api";
 import {
   verifyDataReadPolicy,
   type DataReadPolicyPorts,
@@ -68,25 +65,11 @@ export interface PsLiteStorageAdapter {
   kind: "indexeddb" | "opfs" | "custom";
 }
 
-export interface PsLiteReadAuthInput {
-  request: Request;
-  scope: string;
-  grantId?: string;
-  fileId?: string;
-}
+export type PsLiteReadAuthInput = PersonalServerReadAuthInput;
 
-export interface PsLiteReadAuthResult {
-  builder?: `0x${string}`;
-  grantId?: string;
-}
+export type PsLiteReadAuthResult = PersonalServerReadAuthResult;
 
-export interface PsLiteAuthAdapter {
-  authorizeOwner(request: Request): Promise<void>;
-  authorizeBuilderList(request: Request): Promise<void>;
-  authorizeBuilderRead(
-    input: PsLiteReadAuthInput,
-  ): Promise<PsLiteReadAuthResult | void>;
-}
+export type PsLiteAuthAdapter = PersonalServerApiAuthPort;
 
 export interface PsLiteRuntimeOptions {
   storage: PsLiteStorageAdapter | DataStoragePort;
@@ -179,10 +162,6 @@ function errorResponse(
     },
     { status },
   );
-}
-
-function contractErrorResponse(err: DataContractError): Response {
-  return errorResponse(err.status, err.body.error, err.body.message);
 }
 
 function unavailableResponse(): Response {
@@ -308,6 +287,11 @@ export function createWeb3SignedPsLiteAuth(
     },
     async authorizeBuilderList(request) {
       const verified = await verifyWeb3SignedRequest(request, options);
+      if (
+        verified.signer.toLowerCase() === options.ownerAddress.toLowerCase()
+      ) {
+        return;
+      }
       const builder =
         await options.dataReadPolicyPorts?.authSessionVerifier.getBuilder(
           verified.signer,
@@ -340,12 +324,6 @@ export function createWeb3SignedPsLiteAuth(
       return { builder: verified.signer, grantId: grant.id };
     },
   };
-}
-
-function normalizeLimit(value: string | null, fallback: number): number {
-  if (value === null) return fallback;
-  const parsed = Number(value);
-  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 function toDataStoragePort(
@@ -411,43 +389,6 @@ function bearerToken(request: Request): string | null {
 
 async function readForm(request: Request): Promise<URLSearchParams> {
   return new URLSearchParams(await request.text());
-}
-
-function parseScope(pathPart: string): string | Response {
-  const scopeResult = parseDataScopeContract(decodeURIComponent(pathPart));
-  if (!scopeResult.ok) return contractErrorResponse(scopeResult);
-  return scopeResult.scope;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-async function parseJsonObject(
-  request: Request,
-): Promise<
-  | { ok: true; body: Record<string, unknown> }
-  | { ok: false; response: Response }
-> {
-  try {
-    const body = (await request.json()) as unknown;
-    if (!isRecord(body)) {
-      return {
-        ok: false,
-        response: errorResponse(
-          400,
-          "INVALID_BODY",
-          "Request body must be a JSON object",
-        ),
-      };
-    }
-    return { ok: true, body };
-  } catch {
-    return {
-      ok: false,
-      response: errorResponse(400, "INVALID_BODY", "Request body must be JSON"),
-    };
-  }
 }
 
 export function createPsLiteRuntime(
@@ -761,306 +702,131 @@ export function createPsLiteRuntime(
         }
 
         const dataPrefix = "/v1/data";
-        if (url.pathname === dataPrefix || url.pathname === `${dataPrefix}/`) {
-          if (request.method !== "GET") {
-            return errorResponse(
-              405,
-              "METHOD_NOT_ALLOWED",
-              "Method not allowed",
-            );
-          }
-          await auth.authorizeBuilderList(request);
-          const limit = normalizeLimit(url.searchParams.get("limit"), 20);
-          const offset = normalizeLimit(url.searchParams.get("offset"), 0);
-          const result = listDataScopesContract({
-            storage: dataStorage,
-            scopePrefix: url.searchParams.get("scopePrefix") ?? undefined,
-            limit,
-            offset,
-          });
-          return jsonResponse(result.response);
+        if (
+          url.pathname === dataPrefix ||
+          url.pathname.startsWith(`${dataPrefix}/`)
+        ) {
+          return handlePersonalServerDataRequest(
+            request,
+            {
+              storage: dataStorage,
+              auth,
+              schemaResolver: options.gateway,
+              accessLogWriter,
+              syncManager: options.syncManager ?? null,
+              now,
+              createLogId,
+            },
+            { basePath: dataPrefix },
+          );
         }
 
-        if (!url.pathname.startsWith(`${dataPrefix}/`)) {
-          if (url.pathname.startsWith("/auth/device")) {
-            const response = await handleAuthDevice(request, url);
-            if (response) return response;
-          }
+        if (url.pathname.startsWith("/auth/device")) {
+          const response = await handleAuthDevice(request, url);
+          if (response) return response;
+        }
 
-          if (url.pathname === "/oauth/token") {
-            return handleOauthToken(request);
-          }
+        if (url.pathname === "/oauth/token") {
+          return handleOauthToken(request);
+        }
 
-          const grantsPrefix = "/v1/grants";
-          if (
-            url.pathname === grantsPrefix ||
-            url.pathname === `${grantsPrefix}/`
-          ) {
-            if (request.method === "GET") {
-              await auth.authorizeOwner(request);
-              if (!options.gateway) return gatewayRequiredResponse();
-              return sendContractResult(
-                await listGrantsContract({
-                  gateway: options.gateway,
-                  serverOwner: options.serverOwner ?? options.identity?.address,
-                }),
-              );
-            }
-            if (request.method === "POST") {
-              await auth.authorizeOwner(request);
-              if (!options.gateway) return gatewayRequiredResponse();
-              let body: unknown;
-              try {
-                body = await request.json();
-              } catch {
-                return errorResponse(400, "INVALID_BODY", "Invalid JSON body");
-              }
-              return sendContractResult(
-                await createGrantContract({
-                  gateway: options.gateway,
-                  serverOwner: options.serverOwner ?? options.identity?.address,
-                  serverSigner: options.serverSigner,
-                  body,
-                  now: () => now().getTime(),
-                }),
-              );
-            }
-            return errorResponse(
-              405,
-              "METHOD_NOT_ALLOWED",
-              "Method not allowed",
+        const grantsPrefix = "/v1/grants";
+        if (
+          url.pathname === grantsPrefix ||
+          url.pathname === `${grantsPrefix}/`
+        ) {
+          if (request.method === "GET") {
+            await auth.authorizeOwner(request);
+            if (!options.gateway) return gatewayRequiredResponse();
+            return sendContractResult(
+              await listGrantsContract({
+                gateway: options.gateway,
+                serverOwner: options.serverOwner ?? options.identity?.address,
+              }),
             );
           }
-
-          if (url.pathname === `${grantsPrefix}/verify`) {
-            if (request.method !== "POST") {
-              return errorResponse(
-                405,
-                "METHOD_NOT_ALLOWED",
-                "Method not allowed",
-              );
-            }
+          if (request.method === "POST") {
+            await auth.authorizeOwner(request);
+            if (!options.gateway) return gatewayRequiredResponse();
             let body: unknown;
             try {
               body = await request.json();
             } catch {
               return errorResponse(400, "INVALID_BODY", "Invalid JSON body");
             }
-            return sendContractResult(await verifyGrantContract(body));
-          }
-
-          const accessLogsPrefix = "/v1/access-logs";
-          if (
-            url.pathname === accessLogsPrefix ||
-            url.pathname === `${accessLogsPrefix}/`
-          ) {
-            if (request.method !== "GET") {
-              return errorResponse(
-                405,
-                "METHOD_NOT_ALLOWED",
-                "Method not allowed",
-              );
-            }
-            await auth.authorizeOwner(request);
             return sendContractResult(
-              await listAccessLogsContract({
-                accessLogReader,
-                limit: url.searchParams.get("limit"),
-                offset: url.searchParams.get("offset"),
+              await createGrantContract({
+                gateway: options.gateway,
+                serverOwner: options.serverOwner ?? options.identity?.address,
+                serverSigner: options.serverSigner,
+                body,
+                now: () => now().getTime(),
               }),
             );
           }
+          return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+        }
 
-          const syncPrefix = "/v1/sync";
-          if (url.pathname === `${syncPrefix}/trigger`) {
-            if (request.method !== "POST") {
-              return errorResponse(
-                405,
-                "METHOD_NOT_ALLOWED",
-                "Method not allowed",
-              );
-            }
-            await auth.authorizeOwner(request);
-            return sendContractResult(
-              await triggerSyncContract(options.syncManager ?? null),
-            );
-          }
-          if (url.pathname === `${syncPrefix}/status`) {
-            if (request.method !== "GET") {
-              return errorResponse(
-                405,
-                "METHOD_NOT_ALLOWED",
-                "Method not allowed",
-              );
-            }
-            await auth.authorizeOwner(request);
-            return sendContractResult(
-              getSyncStatusContract(options.syncManager ?? null),
-            );
-          }
-          if (url.pathname.startsWith(`${syncPrefix}/file/`)) {
-            if (request.method !== "POST") {
-              return errorResponse(
-                405,
-                "METHOD_NOT_ALLOWED",
-                "Method not allowed",
-              );
-            }
-            await auth.authorizeOwner(request);
-            const fileId = decodeURIComponent(
-              url.pathname.slice(`${syncPrefix}/file/`.length),
-            );
-            return sendContractResult(
-              await syncFileContract({
-                fileId,
-                syncManager: options.syncManager ?? null,
-              }),
-            );
-          }
-
-          if (url.pathname === "/ui/api/config") {
-            if (request.method === "GET") {
-              await auth.authorizeOwner(request);
-              return jsonResponse(options.config ?? {});
-            }
-            if (request.method === "PUT") {
-              await auth.authorizeOwner(request);
-              const parsed = await parseJsonObjectBody(request);
-              if (!parsed.ok) return sendContractResult(parsed.result);
-              const result = validateServerConfigContract(parsed.body);
-              if (!result.ok) return sendContractResult(result);
-              await saveConfig?.((result.body as { config: unknown }).config);
-              return sendContractResult(result);
-            }
+        if (url.pathname === `${grantsPrefix}/verify`) {
+          if (request.method !== "POST") {
             return errorResponse(
               405,
               "METHOD_NOT_ALLOWED",
               "Method not allowed",
             );
           }
-
-          return errorResponse(404, "NOT_FOUND", "Not found");
-        }
-
-        const parts = url.pathname.slice(dataPrefix.length + 1).split("/");
-        const scope = parseScope(parts[0] ?? "");
-        if (scope instanceof Response) {
-          return scope;
-        }
-
-        if (parts.length === 2 && parts[1] === "versions") {
-          if (request.method !== "GET") {
-            return errorResponse(
-              405,
-              "METHOD_NOT_ALLOWED",
-              "Method not allowed",
-            );
+          let body: unknown;
+          try {
+            body = await request.json();
+          } catch {
+            return errorResponse(400, "INVALID_BODY", "Invalid JSON body");
           }
-          await auth.authorizeBuilderList(request);
-          const limit = normalizeLimit(url.searchParams.get("limit"), 20);
-          const offset = normalizeLimit(url.searchParams.get("offset"), 0);
-          const result = listDataVersionsContract({
-            storage: dataStorage,
-            scopeParam: scope,
-            limit,
-            offset,
-          });
-          if (!result.ok) return contractErrorResponse(result);
-          return jsonResponse(result.response);
+          return sendContractResult(await verifyGrantContract(body));
         }
 
-        if (parts.length !== 1) {
-          return errorResponse(404, "NOT_FOUND", "Not found");
-        }
-
-        if (request.method === "GET") {
-          const grantId =
-            url.searchParams.get("grantId") ??
-            request.headers.get("x-ps-grant-id") ??
-            undefined;
-          const selectedEntry = dataStorage.findEntry({
-            scope,
-            fileId: url.searchParams.get("fileId") ?? undefined,
-            at: url.searchParams.get("at") ?? undefined,
-          });
-          const authResult = await auth.authorizeBuilderRead({
+        const accessLogsPrefix = "/v1/access-logs";
+        if (
+          url.pathname === accessLogsPrefix ||
+          url.pathname === `${accessLogsPrefix}/`
+        ) {
+          return handlePersonalServerAccessLogsRequest(
             request,
-            scope,
-            grantId,
-            fileId:
-              url.searchParams.get("fileId") ??
-              selectedEntry?.fileId ??
-              undefined,
-          });
-          const result = await readDataContract({
-            storage: dataStorage,
-            scopeParam: scope,
-            fileId: url.searchParams.get("fileId") ?? undefined,
-            at: url.searchParams.get("at") ?? undefined,
-          });
-          if (!result.ok) return contractErrorResponse(result);
-          await accessLogWriter.write({
-            logId: createLogId(),
-            grantId: authResult?.grantId ?? grantId ?? "unknown",
-            builder: authResult?.builder ?? "unknown",
-            action: "read",
-            scope,
-            timestamp: now().toISOString(),
-            ipAddress:
-              request.headers.get("x-forwarded-for") ??
-              request.headers.get("x-real-ip") ??
-              "unknown",
-            userAgent: request.headers.get("user-agent") ?? "unknown",
-          });
-          return jsonResponse(result.envelope);
+            { auth, accessLogReader },
+            { basePath: accessLogsPrefix },
+          );
         }
 
-        if (request.method === "POST") {
-          await auth.authorizeOwner(request);
-          const parsed = await parseJsonObject(request);
-          if (!parsed.ok) {
-            return parsed.response;
+        const syncPrefix = "/v1/sync";
+        if (
+          url.pathname === `${syncPrefix}/trigger` ||
+          url.pathname === `${syncPrefix}/status` ||
+          url.pathname.startsWith(`${syncPrefix}/file/`)
+        ) {
+          return handlePersonalServerSyncRequest(
+            request,
+            { auth, syncManager: options.syncManager ?? null },
+            { basePath: syncPrefix },
+          );
+        }
+
+        if (url.pathname === "/ui/api/config") {
+          if (request.method === "GET") {
+            await auth.authorizeOwner(request);
+            return jsonResponse(options.config ?? {});
           }
-          let schemaUrl: string | undefined;
-          let schemaId: string | undefined;
-          if (options.gateway) {
-            const schema = await options.gateway.getSchemaForScope(scope);
-            if (!schema) {
-              return errorResponse(
-                400,
-                "NO_SCHEMA",
-                `No schema registered for scope: ${scope}`,
-              );
-            }
-            schemaUrl = schema.definitionUrl;
-            schemaId = schema.id;
+          if (request.method === "PUT") {
+            await auth.authorizeOwner(request);
+            const parsed = await parseJsonObjectBody(request);
+            if (!parsed.ok) return sendContractResult(parsed.result);
+            const result = validateServerConfigContract(parsed.body);
+            if (!result.ok) return sendContractResult(result);
+            await saveConfig?.((result.body as { config: unknown }).config);
+            return sendContractResult(result);
           }
-          const collectedAt = now().toISOString();
-          const result = await ingestDataContract({
-            storage: dataStorage,
-            scopeParam: scope,
-            body: parsed.body,
-            collectedAt,
-            status: options.syncManager ? "syncing" : "stored",
-            schemaUrl,
-            schemaId,
-          });
-          if (!result.ok) return contractErrorResponse(result);
-          options.syncManager?.trigger().catch(() => undefined);
-          return jsonResponse(result.response, { status: 201 });
+          return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
         }
 
-        if (request.method === "DELETE") {
-          await auth.authorizeOwner(request);
-          const result = await deleteDataScopeContract({
-            storage: dataStorage,
-            scopeParam: scope,
-          });
-          if (!result.ok) return contractErrorResponse(result);
-          return new Response(null, { status: 204 });
-        }
-
-        return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+        return errorResponse(404, "NOT_FOUND", "Not found");
       });
     },
   };

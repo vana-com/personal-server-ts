@@ -5,6 +5,7 @@ import {
   createMemoryPsLiteStorage,
   createMemoryPsLiteTokenStore,
 } from "./test-support/memory.js";
+import { createMockPsLiteGateway } from "./test-support/gateway.js";
 import { handlePsLiteBridgeRequest } from "./bridge.js";
 
 type PsLiteRuntimeOptions = Parameters<typeof createPsLiteRuntime>[0];
@@ -13,6 +14,7 @@ function createTestRuntime(options: Partial<PsLiteRuntimeOptions> = {}) {
   const accessLogStore = createMemoryPsLiteAccessLogStore();
   const defaults: PsLiteRuntimeOptions = {
     storage: createMemoryPsLiteStorage(),
+    gateway: createMockPsLiteGateway(),
     accessLogReader: accessLogStore,
     accessLogWriter: accessLogStore,
     tokenStore: createMemoryPsLiteTokenStore(),
@@ -23,6 +25,7 @@ function createTestRuntime(options: Partial<PsLiteRuntimeOptions> = {}) {
     ...defaults,
     ...options,
     storage: options.storage ?? defaults.storage,
+    gateway: options.gateway ?? defaults.gateway,
     accessLogReader: options.accessLogReader ?? defaults.accessLogReader,
     accessLogWriter: options.accessLogWriter ?? defaults.accessLogWriter,
     tokenStore: options.tokenStore ?? defaults.tokenStore,

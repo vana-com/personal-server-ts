@@ -6,40 +6,46 @@
 import { Hono } from "hono";
 import type { Logger } from "pino";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
-import { listAccessLogsContract } from "@opendatalabs/personal-server-ts-core/contracts";
+import {
+  handlePersonalServerAccessLogsRequest,
+  type PersonalServerApiDispatchOptions,
+} from "@opendatalabs/personal-server-ts-core/api";
 import type { TokenStore } from "../token-store.js";
-import { createWeb3AuthMiddleware } from "../middleware/web3-auth.js";
-import { createOwnerCheckMiddleware } from "../middleware/owner-check.js";
+import { createServerApiAuth } from "../api-auth.js";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 
 export interface AccessLogsRouteDeps {
   logger: Logger;
   accessLogReader: AccessLogReader;
   serverOrigin: string | (() => string);
   serverOwner?: `0x${string}`;
+  gateway: GatewayClient;
   devToken?: string;
   tokenStore?: TokenStore;
+  mountPath?: PersonalServerApiDispatchOptions["basePath"];
 }
 
 export function accessLogsRoutes(deps: AccessLogsRouteDeps): Hono {
   const app = new Hono();
 
-  const web3Auth = createWeb3AuthMiddleware({
+  const auth = createServerApiAuth({
     serverOrigin: deps.serverOrigin,
+    serverOwner: deps.serverOwner,
+    gateway: deps.gateway,
     devToken: deps.devToken,
     tokenStore: deps.tokenStore,
-    serverOwner: deps.serverOwner,
   });
-  const ownerCheck = createOwnerCheckMiddleware(deps.serverOwner);
 
-  // GET / — list access logs with pagination (owner auth required)
-  app.get("/", web3Auth, ownerCheck, async (c) => {
-    const result = await listAccessLogsContract({
-      accessLogReader: deps.accessLogReader,
-      limit: c.req.query("limit"),
-      offset: c.req.query("offset"),
-    });
-    return c.json(result.body, result.status as 200);
-  });
+  app.all("*", (c) =>
+    handlePersonalServerAccessLogsRequest(
+      c.req.raw,
+      {
+        auth,
+        accessLogReader: deps.accessLogReader,
+      },
+      { basePath: deps.mountPath },
+    ),
+  );
 
   return app;
 }
