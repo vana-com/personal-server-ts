@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   createBearerTokenPsLiteAuth,
+  createMemoryPsLiteAccessLogStore,
   createMemoryPsLiteStorage,
+  createMemoryPsLiteTokenStore,
   createPsLiteRuntime,
 } from "./runtime.js";
 import {
@@ -11,6 +13,33 @@ import {
   startPsLiteRelayClient,
   type PsLiteRelayWebSocket,
 } from "./relay.js";
+
+type PsLiteRuntimeOptions = Parameters<typeof createPsLiteRuntime>[0];
+
+function createTestRuntime(options: Partial<PsLiteRuntimeOptions> = {}) {
+  const accessLogStore = createMemoryPsLiteAccessLogStore();
+  const defaults: PsLiteRuntimeOptions = {
+    storage: createMemoryPsLiteStorage(),
+    accessLogReader: accessLogStore,
+    accessLogWriter: accessLogStore,
+    tokenStore: createMemoryPsLiteTokenStore(),
+    saveConfig: async () => {},
+    stateCapabilities: { config: "memory" },
+  };
+  return createPsLiteRuntime({
+    ...defaults,
+    ...options,
+    storage: options.storage ?? defaults.storage,
+    accessLogReader: options.accessLogReader ?? defaults.accessLogReader,
+    accessLogWriter: options.accessLogWriter ?? defaults.accessLogWriter,
+    tokenStore: options.tokenStore ?? defaults.tokenStore,
+    saveConfig: options.saveConfig ?? defaults.saveConfig,
+    stateCapabilities: {
+      ...defaults.stateCapabilities,
+      ...options.stateCapabilities,
+    },
+  });
+}
 
 class FakeRelayWebSocket implements PsLiteRelayWebSocket {
   binaryType = "arraybuffer";
@@ -73,7 +102,7 @@ async function flushRelayTasks() {
 describe("startPsLiteRelayClient", () => {
   it("adapts PoC relay streams into the browser PS Lite API runtime", async () => {
     const sockets: FakeRelayWebSocket[] = [];
-    const runtime = createPsLiteRuntime({
+    const runtime = createTestRuntime({
       storage: createMemoryPsLiteStorage(),
       auth: createBearerTokenPsLiteAuth({
         ownerToken: "owner-token",
@@ -149,7 +178,7 @@ describe("startPsLiteRelayClient", () => {
     const socket = new FakeRelayWebSocket();
     startPsLiteRelayClient({
       sessionId: "session123",
-      runtime: createPsLiteRuntime({
+      runtime: createTestRuntime({
         storage: createMemoryPsLiteStorage(),
         active: false,
       }),
@@ -178,7 +207,7 @@ describe("startPsLiteRelayClient", () => {
 
     startPsLiteRelayClient({
       sessionId: "session123",
-      runtime: createPsLiteRuntime({
+      runtime: createTestRuntime({
         storage: createMemoryPsLiteStorage(),
         active: true,
       }),

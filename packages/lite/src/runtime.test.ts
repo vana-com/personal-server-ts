@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   createBearerTokenPsLiteAuth,
+  createMemoryPsLiteAccessLogStore,
   createMemoryPsLiteStorage,
+  createMemoryPsLiteTokenStore,
   createPsLiteRuntime,
   createWeb3SignedPsLiteAuth,
 } from "./runtime.js";
@@ -10,10 +12,71 @@ import {
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 
+type PsLiteRuntimeOptions = Parameters<typeof createPsLiteRuntime>[0];
+
+function createTestRuntime(options: Partial<PsLiteRuntimeOptions> = {}) {
+  const accessLogStore = createMemoryPsLiteAccessLogStore();
+  const defaults: PsLiteRuntimeOptions = {
+    storage: createMemoryPsLiteStorage(),
+    accessLogReader: accessLogStore,
+    accessLogWriter: accessLogStore,
+    tokenStore: createMemoryPsLiteTokenStore(),
+    saveConfig: async () => {},
+    stateCapabilities: { config: "memory" },
+  };
+  return createPsLiteRuntime({
+    ...defaults,
+    ...options,
+    storage: options.storage ?? defaults.storage,
+    accessLogReader: options.accessLogReader ?? defaults.accessLogReader,
+    accessLogWriter: options.accessLogWriter ?? defaults.accessLogWriter,
+    tokenStore: options.tokenStore ?? defaults.tokenStore,
+    saveConfig: options.saveConfig ?? defaults.saveConfig,
+    stateCapabilities: {
+      ...defaults.stateCapabilities,
+      ...options.stateCapabilities,
+    },
+  });
+}
+
 describe("createPsLiteRuntime", () => {
+  it("rejects storage adapters instead of falling back to memory", () => {
+    expect(() =>
+      createPsLiteRuntime({ storage: { kind: "indexeddb" } }),
+    ).toThrow(
+      "PS Lite runtime requires a persistent DataStoragePort. Use createIndexedDbPsLiteRuntime() or createPersistentPsLiteStorage().",
+    );
+  });
+
+  it("requires explicit stores instead of memory fallbacks without IndexedDB", () => {
+    const accessLogStore = createMemoryPsLiteAccessLogStore();
+
+    expect(() =>
+      createPsLiteRuntime({ storage: createMemoryPsLiteStorage() }),
+    ).toThrow(
+      "IndexedDB is required for default PS Lite access log persistence.",
+    );
+
+    expect(() =>
+      createPsLiteRuntime({
+        storage: createMemoryPsLiteStorage(),
+        accessLogReader: accessLogStore,
+        accessLogWriter: accessLogStore,
+      }),
+    ).toThrow("IndexedDB is required for default PS Lite token storage.");
+
+    expect(() =>
+      createPsLiteRuntime({
+        storage: createMemoryPsLiteStorage(),
+        accessLogReader: accessLogStore,
+        accessLogWriter: accessLogStore,
+        tokenStore: createMemoryPsLiteTokenStore(),
+      }),
+    ).toThrow("IndexedDB is required for default PS Lite config persistence.");
+  });
+
   it("reports ps-lite availability through health", async () => {
-    const runtime = createPsLiteRuntime({
-      storage: { kind: "indexeddb" },
+    const runtime = createTestRuntime({
       active: true,
       now: () => new Date("2026-05-08T00:00:00.000Z"),
     });
@@ -24,7 +87,7 @@ describe("createPsLiteRuntime", () => {
     await expect(res.json()).resolves.toEqual({
       status: "healthy",
       runtime: "ps-lite",
-      storage: "indexeddb",
+      storage: "browser-indexeddb-opfs",
       capabilities: {
         metadata: "memory",
         files: "memory",
@@ -47,8 +110,7 @@ describe("createPsLiteRuntime", () => {
   });
 
   it("reports the request origin as the browser API origin", async () => {
-    const runtime = createPsLiteRuntime({
-      storage: { kind: "indexeddb" },
+    const runtime = createTestRuntime({
       active: true,
       config: { server: { origin: "https://configured.local" } },
     });
@@ -62,8 +124,7 @@ describe("createPsLiteRuntime", () => {
   });
 
   it("returns PS_UNAVAILABLE while the browser runtime is inactive", async () => {
-    const runtime = createPsLiteRuntime({
-      storage: { kind: "opfs" },
+    const runtime = createTestRuntime({
       active: false,
     });
 
@@ -77,7 +138,7 @@ describe("createPsLiteRuntime", () => {
   });
 
   it("does not allow unauthenticated writes while active", async () => {
-    const runtime = createPsLiteRuntime({
+    const runtime = createTestRuntime({
       storage: createMemoryPsLiteStorage(),
       auth: createBearerTokenPsLiteAuth({
         ownerToken: "owner-token",
@@ -100,7 +161,7 @@ describe("createPsLiteRuntime", () => {
   });
 
   it("stores and reads data through the ps-lite data contract", async () => {
-    const runtime = createPsLiteRuntime({
+    const runtime = createTestRuntime({
       storage: createMemoryPsLiteStorage(),
       auth: createBearerTokenPsLiteAuth({
         ownerToken: "owner-token",
@@ -146,7 +207,7 @@ describe("createPsLiteRuntime", () => {
   });
 
   it("requires grantId for builder reads", async () => {
-    const runtime = createPsLiteRuntime({
+    const runtime = createTestRuntime({
       storage: createMemoryPsLiteStorage(),
       auth: createBearerTokenPsLiteAuth({
         ownerToken: "owner-token",
@@ -167,7 +228,7 @@ describe("createPsLiteRuntime", () => {
   });
 
   it("lists scopes and versions from browser-local storage", async () => {
-    const runtime = createPsLiteRuntime({
+    const runtime = createTestRuntime({
       storage: createMemoryPsLiteStorage(),
       auth: createBearerTokenPsLiteAuth({
         ownerToken: "owner-token",
@@ -220,7 +281,7 @@ describe("createPsLiteRuntime", () => {
   });
 
   it("deletes a scope with owner auth", async () => {
-    const runtime = createPsLiteRuntime({
+    const runtime = createTestRuntime({
       storage: createMemoryPsLiteStorage(),
       auth: createBearerTokenPsLiteAuth({
         ownerToken: "owner-token",
@@ -261,7 +322,7 @@ describe("createPsLiteRuntime", () => {
   });
 
   it("exposes grants, sync, access logs, and config routes through ps-lite", async () => {
-    const runtime = createPsLiteRuntime({
+    const runtime = createTestRuntime({
       storage: createMemoryPsLiteStorage(),
       auth: createBearerTokenPsLiteAuth({
         ownerToken: "owner-token",
@@ -378,7 +439,7 @@ describe("createPsLiteRuntime", () => {
         this.tokens.delete(token);
       },
     };
-    const runtime = createPsLiteRuntime({
+    const runtime = createTestRuntime({
       storage: createMemoryPsLiteStorage(),
       auth: createBearerTokenPsLiteAuth({
         ownerToken: "owner-token",
@@ -482,7 +543,7 @@ describe("createPsLiteRuntime", () => {
     const owner = createTestWallet(0);
     const builder = createTestWallet(1);
     const grantId = "grant-1";
-    const runtime = createPsLiteRuntime({
+    const runtime = createTestRuntime({
       storage: createMemoryPsLiteStorage(),
       auth: createWeb3SignedPsLiteAuth({
         origin: "https://ps.local",
@@ -568,7 +629,7 @@ describe("createPsLiteRuntime", () => {
   it("returns SERVER_NOT_CONFIGURED when Web3Signed reads lack policy ports", async () => {
     const owner = createTestWallet(0);
     const builder = createTestWallet(1);
-    const runtime = createPsLiteRuntime({
+    const runtime = createTestRuntime({
       storage: createMemoryPsLiteStorage(),
       auth: createWeb3SignedPsLiteAuth({
         origin: "https://ps.local",
@@ -596,8 +657,7 @@ describe("createPsLiteRuntime", () => {
   });
 
   it("can be activated for foreground handling", async () => {
-    const runtime = createPsLiteRuntime({
-      storage: { kind: "indexeddb" },
+    const runtime = createTestRuntime({
       active: false,
     });
 

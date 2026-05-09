@@ -364,10 +364,13 @@ function toDataStoragePort(
   if ("listScopes" in storage) {
     return storage;
   }
-  return createMemoryPsLiteStorage(storage);
+  throw new Error(
+    "PS Lite runtime requires a persistent DataStoragePort. Use createIndexedDbPsLiteRuntime() or createPersistentPsLiteStorage().",
+  );
 }
 
-function createMemoryAccessLogStore(): AccessLogReader & AccessLogWriter {
+export function createMemoryPsLiteAccessLogStore(): AccessLogReader &
+  AccessLogWriter {
   const logs: AccessLogEntry[] = [];
   return {
     capabilities: { accessLogs: "memory" },
@@ -396,9 +399,12 @@ function indexedDbAvailable(): boolean {
 }
 
 function createDefaultAccessLogStore(): AccessLogReader & AccessLogWriter {
-  return indexedDbAvailable()
-    ? createIndexedDbPsLiteAccessLogStore()
-    : createMemoryAccessLogStore();
+  if (!indexedDbAvailable()) {
+    throw new Error(
+      "IndexedDB is required for default PS Lite access log persistence.",
+    );
+  }
+  return createIndexedDbPsLiteAccessLogStore();
 }
 
 function createLogId(): string {
@@ -413,7 +419,7 @@ function randomHex(byteLength: number): string {
   );
 }
 
-function createMemoryTokenStore(): PsLiteTokenStore {
+export function createMemoryPsLiteTokenStore(): PsLiteTokenStore {
   const tokens = new Map<string, string | null>();
 
   function normalizeExpiresAt(value: string | Date | null | undefined) {
@@ -455,9 +461,22 @@ function createMemoryTokenStore(): PsLiteTokenStore {
 }
 
 function createDefaultTokenStore(): PsLiteTokenStore {
-  return indexedDbAvailable()
-    ? createIndexedDbPsLiteTokenStore()
-    : createMemoryTokenStore();
+  if (!indexedDbAvailable()) {
+    throw new Error("IndexedDB is required for default PS Lite token storage.");
+  }
+  return createIndexedDbPsLiteTokenStore();
+}
+
+function createDefaultSaveConfig(): (config: unknown) => Promise<void> {
+  if (!indexedDbAvailable()) {
+    throw new Error(
+      "IndexedDB is required for default PS Lite config persistence.",
+    );
+  }
+  const stateStore = createIndexedDbPsLiteStateStore();
+  return async (nextConfig: unknown) => {
+    await savePsLiteConfig(stateStore, nextConfig);
+  };
 }
 
 function bearerToken(request: Request): string | null {
@@ -607,17 +626,15 @@ export function createPsLiteRuntime(
   const now = options.now ?? (() => new Date());
   const auth = options.auth ?? createMissingAuthAdapter();
   const dataStorage = toDataStoragePort(options.storage);
-  const accessLogStore = createDefaultAccessLogStore();
-  const accessLogReader = options.accessLogReader ?? accessLogStore;
-  const accessLogWriter = options.accessLogWriter ?? accessLogStore;
+  let accessLogReader = options.accessLogReader;
+  let accessLogWriter = options.accessLogWriter;
+  if (!accessLogReader || !accessLogWriter) {
+    const accessLogStore = createDefaultAccessLogStore();
+    accessLogReader ??= accessLogStore;
+    accessLogWriter ??= accessLogStore;
+  }
   const tokenStore = options.tokenStore ?? createDefaultTokenStore();
-  const saveConfig =
-    options.saveConfig ??
-    (indexedDbAvailable()
-      ? async (nextConfig: unknown) => {
-          await savePsLiteConfig(createIndexedDbPsLiteStateStore(), nextConfig);
-        }
-      : undefined);
+  const saveConfig = options.saveConfig ?? createDefaultSaveConfig();
   const deviceSessions: DeviceSessionStore = createMemoryDeviceSessionStore();
 
   async function withProtocolErrors(
@@ -889,11 +906,7 @@ export function createPsLiteRuntime(
               ).capabilities?.accessLogs ?? "custom",
             config:
               options.stateCapabilities?.config ??
-              (options.saveConfig
-                ? "custom"
-                : saveConfig
-                  ? "indexeddb"
-                  : "memory"),
+              (options.saveConfig ? "custom" : "indexeddb"),
           };
           return jsonResponse({
             status: active ? "healthy" : "unavailable",
