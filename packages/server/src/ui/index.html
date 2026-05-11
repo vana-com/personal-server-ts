@@ -509,7 +509,9 @@
           <div class="card-title">Data Scopes</div>
           <div class="toolbar">
             <button class="btn" id="refresh-data-btn">Refresh</button>
+            <button class="btn secondary" id="sync-now-btn">Sync Now</button>
           </div>
+          <div id="sync-msg" style="margin-bottom: 12px"></div>
           <div id="data-scopes"></div>
         </div>
         <div id="data-detail" class="card" style="display: none">
@@ -1234,6 +1236,30 @@
       }
 
       el("refresh-data-btn").addEventListener("click", loadScopes);
+
+      async function triggerSync() {
+        var msg = el("sync-msg");
+        showMsg(msg, "Triggering " + runtimeName() + " sync...", "ok");
+        try {
+          var result = await runtimeApi("/v1/sync/trigger", {
+            method: "POST",
+            auth: "owner",
+          });
+          if (!result.ok) {
+            var errMsg =
+              (result.data && result.data.error && result.data.error.message) ||
+              "Sync trigger failed (" + result.status + ")";
+            showMsg(msg, errMsg, "err");
+            return;
+          }
+          showMsg(msg, "Sync triggered for " + runtimeName() + ".", "ok");
+          await loadScopes();
+        } catch (e) {
+          showMsg(msg, "Error: " + e.message, "err");
+        }
+      }
+
+      el("sync-now-btn").addEventListener("click", triggerSync);
 
       async function verifyRpcFiles(gatewayUrl, fileIds) {
         if (!gatewayUrl || fileIds.length === 0) return {};
