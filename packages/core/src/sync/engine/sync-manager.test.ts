@@ -132,6 +132,48 @@ describe("SyncManager", () => {
     expect(downloadAll).toHaveBeenCalledTimes(1);
   });
 
+  it("notifyNewData() schedules a debounced sync cycle while running", async () => {
+    const uploadDeps = makeMockUploadDeps();
+    const downloadDeps = makeMockDownloadDeps();
+    const manager = createSyncManager(uploadDeps, downloadDeps, {
+      pollInterval: 60_000,
+      notifyDebounceMs: 500,
+    });
+
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    vi.clearAllMocks();
+
+    manager.notifyNewData();
+    manager.notifyNewData();
+
+    await vi.advanceTimersByTimeAsync(499);
+    expect(uploadAll).not.toHaveBeenCalled();
+    expect(downloadAll).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(uploadAll).toHaveBeenCalledTimes(1);
+    expect(downloadAll).toHaveBeenCalledTimes(1);
+
+    await manager.stop();
+  });
+
+  it("notifyNewData() does not sync while stopped", async () => {
+    const uploadDeps = makeMockUploadDeps();
+    const downloadDeps = makeMockDownloadDeps();
+    const manager = createSyncManager(uploadDeps, downloadDeps, {
+      pollInterval: 60_000,
+      notifyDebounceMs: 500,
+    });
+
+    manager.notifyNewData();
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(uploadAll).not.toHaveBeenCalled();
+    expect(downloadAll).not.toHaveBeenCalled();
+  });
+
   it("getStatus() returns correct pending count", () => {
     const uploadDeps = makeMockUploadDeps();
     const downloadDeps = makeMockDownloadDeps();

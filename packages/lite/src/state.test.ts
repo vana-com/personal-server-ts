@@ -209,7 +209,9 @@ describe("PS Lite browser state", () => {
       now: () => new Date("2026-05-08T00:00:00.000Z"),
     });
 
-    expect(first.persisted.encryptedPrivateKey.ciphertext).not.toContain("0x");
+    expect(first.persisted.encryptedPrivateKey.ciphertext).toMatch(
+      /^[A-Za-z0-9+/]+=*$/,
+    );
     const persisted = await store.get("server-identity-v1");
     expect(persisted).toMatchObject({
       address: first.account.address,
