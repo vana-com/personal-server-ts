@@ -5,6 +5,18 @@ export {
 } from "./browser-runtime.js";
 
 export {
+  startPersonalServer,
+  type StartPersonalServerLiteOptions,
+  type StartPersonalServerLiteRelayOptions,
+} from "./client.js";
+export type {
+  PersonalServerHandle,
+  PersonalServerInfo,
+  PersonalServerRegistrationRequest,
+  PersonalServerStatus,
+} from "@opendatalabs/personal-server-ts-core/client";
+
+export {
   handlePsLiteBridgeRequest,
   type PsLiteBridgeRequest,
   type PsLiteBridgeResponse,

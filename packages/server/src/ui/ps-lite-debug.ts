@@ -1,11 +1,8 @@
 import {
   createBearerTokenPsLiteAuth,
-  createIndexedDbPsLiteRuntime,
-  psLiteRelayPublicUrl,
-  startPsLiteRelayClient,
-  type PsLiteRelayClient,
+  startPersonalServer,
+  type PersonalServerHandle,
   type PsLiteRelayStatus,
-  type PsLiteRuntime,
 } from "@opendatalabs/personal-server-ts-lite";
 import { createGatewayClient } from "@opendatalabs/vana-sdk/browser";
 
@@ -56,11 +53,11 @@ type DebugRequest = (
   options?: UiRequestOptions,
 ) => Promise<UiResult>;
 
-let runtime: PsLiteRuntime | undefined;
+let personalServer: PersonalServerHandle | undefined;
 let storageMode: StorageMode = "indexeddb";
-let relayClient: PsLiteRelayClient | undefined;
 let relayStatus: PsLiteRelayStatus = "closed";
 let relayPublicUrl = "";
+let activeRelayOptions: RelayOptions | false = false;
 
 function getBootstrap(): PsLiteBootstrap {
   const bootstrap = window.__PS_LITE_BOOTSTRAP__;
@@ -106,10 +103,6 @@ function inferAuth(method: string): AuthMode {
     return "owner";
   }
   return "builder";
-}
-
-function runtimeOrigin(): string {
-  return relayPublicUrl || ORIGIN;
 }
 
 function sampleInstagramProfileData(reason = "debug-ui") {
@@ -195,9 +188,38 @@ function sampleInstagramProfileData(reason = "debug-ui") {
   };
 }
 
-async function makeRuntime(_mode: StorageMode): Promise<PsLiteRuntime> {
+async function makePersonalServer(
+  _mode: StorageMode,
+  relay: RelayOptions | false = activeRelayOptions,
+): Promise<PersonalServerHandle> {
   const bootstrap = getBootstrap();
-  const browserRuntime = await createIndexedDbPsLiteRuntime({
+  const relayConfig =
+    relay === false
+      ? false
+      : {
+          sessionId: relay.sessionId || randomSessionId(),
+          controlUrl: relay.controlUrl || DEFAULT_CONTROL_URL,
+          publicSuffix: relay.publicSuffix || DEFAULT_PUBLIC_SUFFIX,
+          certIssuerUrl: relay.certIssuerUrl || undefined,
+          onStatus(nextStatus: PsLiteRelayStatus) {
+            relayStatus = nextStatus;
+            window.dispatchEvent(new CustomEvent("ps-lite-relay-status"));
+          },
+          logger(line: string) {
+            window.dispatchEvent(
+              new CustomEvent("ps-lite-relay-log", { detail: line }),
+            );
+          },
+        };
+  relayPublicUrl =
+    relayConfig === false
+      ? ""
+      : `https://${relayConfig.sessionId}.${relayConfig.publicSuffix.replace(
+          /^\./,
+          "",
+        )}`;
+  relayStatus = relayConfig === false ? "closed" : "connecting";
+  const ps = await startPersonalServer({
     dbName: "personal-server-lite-debug",
     storageDbName: "personal-server-lite-debug-storage",
     storageKey: "data-storage-v1",
@@ -210,14 +232,15 @@ async function makeRuntime(_mode: StorageMode): Promise<PsLiteRuntime> {
     active: true,
     gateway: undefined,
     accessToken: CONTROL_PLANE_TOKEN,
+    relay: relayConfig,
   });
-  browserRuntime.runtime.activate();
-  return browserRuntime.runtime;
+  activeRelayOptions = relay;
+  return ps;
 }
 
-async function ensureRuntime(): Promise<PsLiteRuntime> {
-  runtime ??= await makeRuntime(storageMode);
-  return runtime;
+async function ensurePersonalServer(): Promise<PersonalServerHandle> {
+  personalServer ??= await makePersonalServer(storageMode);
+  return personalServer;
 }
 
 async function parseResponse(response: Response): Promise<UiResult> {
@@ -239,12 +262,12 @@ async function request(
   path: string,
   options: UiRequestOptions = {},
 ): Promise<UiResult> {
-  const activeRuntime = await ensureRuntime();
-  return requestWithRuntime(activeRuntime, path, options);
+  const activeServer = await ensurePersonalServer();
+  return requestWithServer(activeServer, path, options);
 }
 
-async function requestWithRuntime(
-  activeRuntime: PsLiteRuntime,
+async function requestWithServer(
+  activeServer: PersonalServerHandle,
   path: string,
   options: UiRequestOptions = {},
 ): Promise<UiResult> {
@@ -262,47 +285,67 @@ async function requestWithRuntime(
         : JSON.stringify(options.body);
   }
 
-  return parseResponse(
-    await activeRuntime.fetch(new Request(`${runtimeOrigin()}${path}`, init)),
-  );
+  return parseResponse(await activeServer.fetch(path, init));
 }
 
 async function reset(nextStorageMode = storageMode): Promise<UiResult> {
   storageMode = nextStorageMode;
-  runtime = await makeRuntime(storageMode);
+  await personalServer?.stop();
+  personalServer = await makePersonalServer(storageMode);
   return status();
 }
 
 async function status(): Promise<UiResult> {
-  const activeRuntime = await ensureRuntime();
-  const health = await parseResponse(
-    await activeRuntime.fetch(new Request(`${runtimeOrigin()}/health`)),
-  );
+  if (!personalServer) {
+    return stoppedStatus();
+  }
+  const activeServer = await ensurePersonalServer();
+  const info = await activeServer.info();
   return {
-    status: health.status,
-    ok: health.ok,
+    status: info.status === "error" ? 500 : 200,
+    ok: info.status !== "error",
     data: {
-      runtime: health.data,
+      runtime: info.details,
+      personalServer: info,
       storageMode,
       relay: {
         status: relayStatus,
-        publicUrl: relayPublicUrl || null,
+        publicUrl: (info.urls.public ?? relayPublicUrl) || null,
         connected: relayStatus === "connected",
       },
     },
   };
 }
 
+function stoppedStatus(): UiResult {
+  return {
+    status: 200,
+    ok: true,
+    data: {
+      runtime: null,
+      personalServer: { kind: "lite", status: "stopped" },
+      storageMode,
+      relay: {
+        status: relayStatus,
+        publicUrl: null,
+        connected: false,
+      },
+    },
+  };
+}
+
 async function activate(): Promise<UiResult> {
-  const activeRuntime = await ensureRuntime();
-  activeRuntime.activate();
+  if (!personalServer) {
+    personalServer = await makePersonalServer(storageMode);
+  }
   return status();
 }
 
 async function deactivate(): Promise<UiResult> {
-  const activeRuntime = await ensureRuntime();
-  activeRuntime.deactivate();
-  return status();
+  await personalServer?.stop();
+  personalServer = undefined;
+  relayStatus = "closed";
+  return stoppedStatus();
 }
 
 async function runStorageSmoke(requestFn: DebugRequest): Promise<UiResult> {
@@ -333,15 +376,9 @@ async function storageSmoke(): Promise<UiResult> {
 }
 
 async function gatewaySchemaSmoke(): Promise<UiResult> {
-  const activeRuntime = await ensureRuntime();
-  const health = await parseResponse(
-    await activeRuntime.fetch(new Request(`${ORIGIN}/health`)),
-  );
-  const runtimeHealth = health.data as
-    | { gatewayUrl?: string | null }
-    | null
-    | undefined;
-  const gatewayUrl = runtimeHealth?.gatewayUrl;
+  const activeServer = await ensurePersonalServer();
+  const info = await activeServer.info();
+  const gatewayUrl = info.gatewayUrl;
   if (!gatewayUrl) {
     return {
       status: 500,
@@ -513,35 +550,14 @@ async function authRoutesSmoke(): Promise<UiResult> {
 }
 
 async function connectRelay(options: RelayOptions = {}): Promise<UiResult> {
-  relayClient?.close("replaced");
-  const sessionId = options.sessionId || randomSessionId();
-  const controlUrl = options.controlUrl || DEFAULT_CONTROL_URL;
-  const publicSuffix = options.publicSuffix || DEFAULT_PUBLIC_SUFFIX;
-  relayPublicUrl = psLiteRelayPublicUrl(sessionId, publicSuffix);
-  relayStatus = "connecting";
-  relayClient = startPsLiteRelayClient({
-    sessionId,
-    runtime: await ensureRuntime(),
-    controlUrl,
-    publicSuffix,
-    certIssuerUrl: options.certIssuerUrl || undefined,
-    onStatus(nextStatus) {
-      relayStatus = nextStatus;
-      window.dispatchEvent(new CustomEvent("ps-lite-relay-status"));
-    },
-    logger(line) {
-      window.dispatchEvent(
-        new CustomEvent("ps-lite-relay-log", { detail: line }),
-      );
-    },
-  });
+  await personalServer?.stop();
+  personalServer = await makePersonalServer(storageMode, options);
   return status();
 }
 
 async function disconnectRelay(): Promise<UiResult> {
-  relayClient?.close("debug-ui");
-  relayClient = undefined;
-  relayStatus = "closed";
+  await personalServer?.stop();
+  personalServer = await makePersonalServer(storageMode, false);
   return status();
 }
 
@@ -571,12 +587,10 @@ declare global {
 }
 
 window.psLiteDebug = psLiteDebug;
-void ensureRuntime()
-  .then(() => connectRelay())
-  .catch((err: unknown) => {
-    window.dispatchEvent(
-      new CustomEvent("ps-lite-relay-log", {
-        detail: err instanceof Error ? err.message : String(err),
-      }),
-    );
-  });
+void connectRelay().catch((err: unknown) => {
+  window.dispatchEvent(
+    new CustomEvent("ps-lite-relay-log", {
+      detail: err instanceof Error ? err.message : String(err),
+    }),
+  );
+});

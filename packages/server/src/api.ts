@@ -4,6 +4,16 @@ export {
   type ServerContext,
 } from "./bootstrap.js";
 export {
+  startPersonalServer,
+  type StartPersonalServerNodeOptions,
+} from "./client.js";
+export type {
+  PersonalServerHandle,
+  PersonalServerInfo,
+  PersonalServerRegistrationRequest,
+  PersonalServerStatus,
+} from "@opendatalabs/personal-server-ts-core/client";
+export {
   DEFAULT_ROOT_PATH,
   DEFAULT_CONFIG_PATH,
   DEFAULT_DATA_DIR,

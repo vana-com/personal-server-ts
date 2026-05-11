@@ -12,6 +12,8 @@ export {
 export type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 export {
   createServer,
+  startPersonalServer,
   type CreateServerOptions,
   type ServerContext,
+  type StartPersonalServerNodeOptions,
 } from "@opendatalabs/personal-server-ts-server";

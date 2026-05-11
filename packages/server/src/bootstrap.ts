@@ -67,6 +67,8 @@ export interface CreateServerOptions {
   /** @deprecated Use rootPath instead. */
   serverDir?: string;
   dataDir?: string;
+  ownerSignature?: `0x${string}`;
+  gatewayClient?: GatewayClient;
 }
 
 const DEFAULT_LOCAL_APPROVAL_PORT = 34127;
@@ -124,12 +126,13 @@ export async function createServer(
   const hierarchyOptions: HierarchyManagerOptions = { dataDir };
   const dataStorage = createNodeDataStorage({ indexManager, hierarchyOptions });
 
-  const gatewayClient = createGatewayClient(config.gateway.url);
+  const gatewayClient =
+    options?.gatewayClient ?? createGatewayClient(config.gateway.url);
 
   // Derive server owner from VANA_MASTER_KEY_SIGNATURE env var
-  const masterKeySignature = process.env.VANA_MASTER_KEY_SIGNATURE as
-    | `0x${string}`
-    | undefined;
+  const masterKeySignature =
+    options?.ownerSignature ??
+    (process.env.VANA_MASTER_KEY_SIGNATURE as `0x${string}` | undefined);
   const ownerPrivateKey = process.env.VANA_OWNER_PRIVATE_KEY as
     | `0x${string}`
     | undefined;

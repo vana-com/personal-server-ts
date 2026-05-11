@@ -32,6 +32,10 @@
       "types": "./dist/contracts/index.d.ts",
       "import": "./dist/contracts/index.js"
     },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js"
+    },
     "./api": {
       "types": "./dist/api/index.d.ts",
       "import": "./dist/api/index.js"
@@ -105,7 +109,7 @@
     "build": "tsc --build"
   },
   "dependencies": {
-    "@opendatalabs/vana-sdk": "file:../../../vana-sdk/packages/vana-sdk",
+    "@opendatalabs/vana-sdk": "^3.0.1",
     "viem": "^2.48.11",
     "zod": "^4.4.3"
   }
