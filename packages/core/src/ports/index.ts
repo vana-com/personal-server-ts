@@ -75,7 +75,7 @@ export interface DataStoragePort extends RuntimeStoragePort {
   findUnsynced(options?: { limit?: number }): IndexEntry[];
   readEnvelope(scope: string, collectedAt: string): Promise<DataFileEnvelope>;
   writeEnvelope(envelope: DataFileEnvelope): Promise<WriteResult>;
-  insertEntry(entry: NewIndexEntry): IndexEntry;
+  insertEntry(entry: NewIndexEntry): IndexEntry | Promise<IndexEntry>;
   updateFileId(path: string, fileId: string): boolean | Promise<boolean>;
   deleteScope(scope: string): Promise<number>;
 }

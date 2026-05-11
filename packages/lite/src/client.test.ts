@@ -4,6 +4,7 @@ import {
   buildWeb3SignedHeader,
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
+import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import {
   createMemoryPsLiteAccessLogStore,
   createMemoryPsLiteStorage,
@@ -143,6 +144,103 @@ describe("startPersonalServer lite handle", () => {
       scope: "instagram.profile",
       status: "stored",
     });
+  });
+
+  it("preserves Request method and body when fetch applies init overrides", async () => {
+    const gateway = createGateway();
+    const ps = await startPersonalServer({
+      runtime: createRuntime(gateway),
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const body = new TextEncoder().encode(
+      JSON.stringify({ username: "vana_debug" }),
+    );
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: ORIGIN,
+      method: "POST",
+      uri: "/v1/data/instagram.profile",
+      body,
+    });
+
+    const res = await ps.fetch(
+      new Request("https://ignored.example/v1/data/instagram.profile", {
+        method: "POST",
+        body,
+      }),
+      {
+        headers: {
+          Authorization: auth,
+          "Content-Type": "application/json",
+        },
+      },
+    );
+
+    expect(res.status).toBe(201);
+    await expect(res.json()).resolves.toMatchObject({
+      scope: "instagram.profile",
+    });
+  });
+
+  it("uses the relay public URL for info and registration", async () => {
+    const gateway = createGateway();
+    const ps = await startPersonalServer({
+      runtime: createRuntime(gateway),
+      relay: {
+        sessionId: "session-1",
+        publicSuffix: "relay.example",
+        webSocketFactory(_url) {
+          return {
+            binaryType: "arraybuffer",
+            readyState: 1,
+            OPEN: 1,
+            CONNECTING: 0,
+            onopen: null,
+            onmessage: null,
+            onclose: null,
+            onerror: null,
+            send: vi.fn(),
+            close: vi.fn(),
+          };
+        },
+      },
+      localOrigin: ORIGIN,
+      gateway,
+    });
+
+    const info = await ps.info();
+    expect(info.urls).toMatchObject({
+      local: ORIGIN,
+      public: "https://session-1.relay.example",
+      apiOrigin: "https://session-1.relay.example",
+      registration: "https://session-1.relay.example",
+    });
+    await expect(ps.prepareRegistration()).resolves.toMatchObject({
+      candidate: { serverUrl: "https://session-1.relay.example" },
+    });
+
+    await ps.stop();
+  });
+
+  it("stops the owned sync manager when stopping an IndexedDB-backed handle", async () => {
+    const runtime = createRuntime(createGateway());
+    const syncManager = {
+      trigger: vi.fn().mockResolvedValue(undefined),
+      getStatus: vi.fn(),
+      stop: vi.fn().mockResolvedValue(undefined),
+    } as Pick<SyncManager, "trigger" | "getStatus" | "stop">;
+    const ps = await startPersonalServer({
+      runtime,
+      relay: false,
+      localOrigin: ORIGIN,
+      syncManager,
+    });
+
+    await ps.stop();
+
+    expect(syncManager.stop).not.toHaveBeenCalled();
   });
 
   it("routes generic fetch calls through the runtime", async () => {

@@ -67,10 +67,6 @@ export interface PersonalServerReadyOptions {
   publicUrl?: boolean;
 }
 
-export interface PersonalServerInfoOptions {
-  refresh?: boolean;
-}
-
 export interface PersonalServerPrepareRegistrationOptions {
   serverUrl?: string;
 }
@@ -90,7 +86,7 @@ export type PersonalServerPostDataOptions = PersonalServerOwnerAuth & {
 export interface PersonalServerHandle {
   readonly kind: PersonalServerKind;
   ready(options?: PersonalServerReadyOptions): Promise<PersonalServerInfo>;
-  info(options?: PersonalServerInfoOptions): Promise<PersonalServerInfo>;
+  info(): Promise<PersonalServerInfo>;
   prepareRegistration(
     options?: PersonalServerPrepareRegistrationOptions,
   ): Promise<PersonalServerRegistrationRequest>;
@@ -166,15 +162,18 @@ export function createPersonalServerInfoFromHealth(params: {
   publicUrl?: string | null;
 }): PersonalServerInfo {
   const health = toHealthBody(params.health);
-  const publicUrl = params.publicUrl ?? health.apiOrigin ?? null;
-  const apiOrigin = publicUrl ?? params.localUrl ?? null;
+  const publicUrl =
+    params.publicUrl === undefined
+      ? (health.apiOrigin ?? null)
+      : params.publicUrl;
+  const apiOrigin = publicUrl ?? health.apiOrigin ?? params.localUrl ?? null;
   const gatewayConfig = stripGatewayUrl(health.gatewayConfig);
   const candidate = health.registration
     ? {
         ownerAddress: health.registration.ownerAddress,
         serverAddress: health.registration.serverAddress,
         publicKey: health.registration.publicKey,
-        serverUrl: health.registration.serverUrl,
+        serverUrl: publicUrl ?? health.registration.serverUrl,
       }
     : null;
 
@@ -196,7 +195,7 @@ export function createPersonalServerInfoFromHealth(params: {
       local: params.localUrl ?? null,
       public: publicUrl,
       apiOrigin,
-      registration: health.registration?.serverUrl ?? publicUrl,
+      registration: publicUrl ?? health.registration?.serverUrl ?? null,
     },
     registration: {
       registered: Boolean(health.registration?.registered),

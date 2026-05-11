@@ -43,6 +43,9 @@ export interface StartPersonalServerNodeOptions
 export async function startPersonalServer(
   options: StartPersonalServerNodeOptions = {},
 ): Promise<PersonalServerHandle> {
+  if (options.port === 0) {
+    throw new Error("port: 0 is not supported by the public Node handle");
+  }
   let status: PersonalServerStatus = "starting";
   let stopped = false;
   let lastInfo: PersonalServerInfo | null = null;
@@ -100,9 +103,7 @@ export async function startPersonalServer(
           context.logger.warn({ err }, "Background services failed");
         });
 
-  async function info(
-    _options: { refresh?: boolean } = {},
-  ): Promise<PersonalServerInfo> {
+  async function info(): Promise<PersonalServerInfo> {
     if (stopped && lastInfo) {
       return { ...lastInfo, status: "stopped" };
     }
@@ -315,7 +316,8 @@ function toLocalRequest(
 ): Request {
   const url = `${localOrigin}${requestPath(input)}`;
   if (input instanceof Request) {
-    return new Request(url, init ?? input);
+    const base = new Request(url, input);
+    return init ? new Request(base, init) : base;
   }
   return new Request(url, init);
 }

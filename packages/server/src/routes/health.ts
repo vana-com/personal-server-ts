@@ -51,12 +51,12 @@ export function healthRoute(deps: HealthDeps): Hono {
         }
       : null;
 
-    const tunnel = deps.getTunnelStatus?.() ?? null;
+    const tunnelStatus = deps.getTunnelStatus?.() ?? null;
     const fallbackOrigin =
       typeof deps.serverOrigin === "function"
         ? deps.serverOrigin()
         : deps.serverOrigin;
-    const apiOrigin = tunnel?.publicUrl ?? fallbackOrigin ?? null;
+    const apiOrigin = tunnelStatus?.publicUrl ?? fallbackOrigin ?? null;
     const registration =
       deps.serverOwner && identity && apiOrigin
         ? {
@@ -68,6 +68,17 @@ export function healthRoute(deps: HealthDeps): Hono {
             registered: Boolean(serverId),
           }
         : null;
+    const tunnel =
+      tunnelStatus && registration && tunnelStatus.publicUrl
+        ? {
+            ...tunnelStatus,
+            routable:
+              registration.registered && tunnelStatus.routable !== false,
+            warning: registration.registered
+              ? tunnelStatus.warning
+              : "Server not registered with gateway",
+          }
+        : tunnelStatus;
     const runtimeAvailable =
       (await deps.runtimeAvailability?.isAvailable()) ?? true;
 

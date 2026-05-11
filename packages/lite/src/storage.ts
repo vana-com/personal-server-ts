@@ -263,23 +263,23 @@ export async function createPersistentPsLiteStorage(
     opfsAvailable: await isOpfsAvailable(),
   };
 
+  let persistQueue: Promise<void> = Promise.resolve();
+
   async function persist(): Promise<void> {
-    state = {
+    const snapshot = {
       ...state,
       envelopes:
         fileStore.kind === "indexeddb"
           ? Array.from(fallbackEnvelopes.values())
           : [],
     };
-    await persistence.write(state);
+    const write = persistQueue.then(() => persistence.write(snapshot));
+    persistQueue = write.catch(() => undefined);
+    await write;
   }
 
   function entriesForScope(scope: string): IndexEntry[] {
     return sortEntries(state.entries.filter((entry) => entry.scope === scope));
-  }
-
-  function persistLater(): void {
-    void persist();
   }
 
   const storagePort: DataStoragePort & {
@@ -327,7 +327,7 @@ export async function createPersistentPsLiteStorage(
       };
     },
 
-    insertEntry(entry) {
+    async insertEntry(entry) {
       const indexed: IndexEntry = {
         ...entry,
         schemaId: entry.schemaId ?? null,
@@ -342,7 +342,7 @@ export async function createPersistentPsLiteStorage(
           indexed,
         ],
       };
-      persistLater();
+      await persist();
       return indexed;
     },
 

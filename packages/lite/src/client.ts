@@ -21,6 +21,7 @@ import {
 } from "@opendatalabs/vana-sdk/browser";
 import {
   createIndexedDbPsLiteRuntime,
+  type IndexedDbPsLiteRuntime,
   type IndexedDbPsLiteRuntimeOptions,
 } from "./browser-runtime.js";
 import {
@@ -58,15 +59,24 @@ export async function startPersonalServer(
   options: StartPersonalServerLiteOptions,
 ): Promise<PersonalServerHandle> {
   const localOrigin = options.localOrigin ?? DEFAULT_LITE_ORIGIN;
-  const runtime =
-    options.runtime ??
-    (
-      await createIndexedDbPsLiteRuntime({
+  const relayOptions = options.relay || undefined;
+  const initialPublicUrl = relayOptions
+    ? psLiteRelayPublicUrl(relayOptions.sessionId, relayOptions.publicSuffix)
+    : null;
+  const runtimeOrigin = initialPublicUrl ?? localOrigin;
+  const runtimeBundle: IndexedDbPsLiteRuntime | null = options.runtime
+    ? null
+    : await createIndexedDbPsLiteRuntime({
         ...options,
         ownerSignature: requiredOwnerSignature(options.ownerSignature),
         active: options.active ?? true,
-      })
-    ).runtime;
+        runtimeOrigin,
+        configDefaults: configDefaultsWithOrigin(
+          options.configDefaults,
+          runtimeOrigin,
+        ),
+      });
+  const runtime = options.runtime ?? runtimeBundle!.runtime;
 
   if (options.active ?? true) {
     runtime.activate();
@@ -84,16 +94,13 @@ export async function startPersonalServer(
     options.onStatus?.(nextStatus);
   };
 
-  if (options.relay) {
-    const relayOptions = options.relay;
+  if (relayOptions) {
     relayStatus = "connecting";
-    publicUrl = psLiteRelayPublicUrl(
-      relayOptions.sessionId,
-      relayOptions.publicSuffix,
-    );
+    publicUrl = initialPublicUrl;
     relayClient = startPsLiteRelayClient({
       ...relayOptions,
       runtime,
+      origin: runtimeOrigin,
       onStatus(nextRelayStatus) {
         relayStatus = nextRelayStatus;
         if (nextRelayStatus === "error") setStatus("error");
@@ -198,6 +205,7 @@ export async function startPersonalServer(
     relayClient?.close("personal-server-stop");
     relayClient = undefined;
     runtime.deactivate();
+    await runtimeBundle?.syncManager?.stop?.();
     setStatus("stopped");
   }
 
@@ -220,6 +228,19 @@ function requiredOwnerSignature(
     throw new Error("ownerSignature is required to start PS Lite");
   }
   return ownerSignature;
+}
+
+function configDefaultsWithOrigin(
+  defaults: StartPersonalServerLiteOptions["configDefaults"],
+  origin: string,
+): StartPersonalServerLiteOptions["configDefaults"] {
+  return {
+    ...defaults,
+    server: {
+      ...defaults?.server,
+      origin,
+    },
+  } as StartPersonalServerLiteOptions["configDefaults"];
 }
 
 function requiredGatewayUrl(info: PersonalServerInfo): string {
@@ -248,7 +269,8 @@ function toRuntimeRequest(
 ): Request {
   const url = `${origin}${requestPath(input)}`;
   if (input instanceof Request) {
-    return new Request(url, init ?? input);
+    const base = new Request(url, input);
+    return init ? new Request(base, init) : base;
   }
   return new Request(url, init);
 }

@@ -97,6 +97,7 @@ async function main(): Promise<void> {
     if (
       tunnelUrl &&
       tunnelManager &&
+      context.isServerRegistered() &&
       tunnelManager.getStatus().status !== "error"
     ) {
       logger.info({ tunnelUrl }, "Verifying tunnel URL is reachable...");

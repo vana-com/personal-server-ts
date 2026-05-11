@@ -249,6 +249,63 @@ describe("healthRoute", () => {
     expect(body.tunnel.connectedSince).toBe("2026-02-04T10:30:00.000Z");
   });
 
+  it("reports a connected tunnel as not routable while server registration is missing", async () => {
+    const app = healthRoute({
+      version: "0.0.1",
+      startedAt: new Date(),
+      serverOwner: "0x1234567890abcdef1234567890abcdef12345678",
+      serverOrigin: "http://localhost:8080",
+      identity: {
+        address: "0xServerAddr",
+        publicKey: "0x04PubKey",
+        serverId: null,
+      },
+      getTunnelStatus: () => ({
+        enabled: true,
+        status: "connected",
+        publicUrl: "https://0xserveraddr.server.vana.org",
+        connectedSince: "2026-02-04T10:30:00.000Z",
+      }),
+    });
+    const res = await app.request("/health");
+    const body = await res.json();
+
+    expect(body.tunnel.status).toBe("connected");
+    expect(body.tunnel.routable).toBe(false);
+    expect(body.tunnel.warning).toBe("Server not registered with gateway");
+    expect(body.tunnel.error).toBeUndefined();
+    expect(body.registration.registered).toBe(false);
+  });
+
+  it("preserves tunnel routing warnings separately from registration", async () => {
+    const app = healthRoute({
+      version: "0.0.1",
+      startedAt: new Date(),
+      serverOwner: "0x1234567890abcdef1234567890abcdef12345678",
+      identity: {
+        address: "0xServerAddr",
+        publicKey: "0x04PubKey",
+        serverId: "0xserver1",
+      },
+      getTunnelStatus: () => ({
+        enabled: true,
+        status: "connected",
+        publicUrl: "https://0xserveraddr.server.vana.org",
+        connectedSince: "2026-02-04T10:30:00.000Z",
+        routable: false,
+        warning: "HTTP 404",
+      }),
+    });
+    const res = await app.request("/health");
+    const body = await res.json();
+
+    expect(body.registration.registered).toBe(true);
+    expect(body.tunnel.status).toBe("connected");
+    expect(body.tunnel.routable).toBe(false);
+    expect(body.tunnel.warning).toBe("HTTP 404");
+    expect(body.tunnel.error).toBeUndefined();
+  });
+
   it("tunnel status reflects disconnected state", async () => {
     const app = healthRoute({
       version: "0.0.1",

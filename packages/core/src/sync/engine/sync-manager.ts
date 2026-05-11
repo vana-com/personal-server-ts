@@ -219,6 +219,7 @@ export function createSyncManager(
       return {
         enabled: true,
         running: isRunning,
+        syncing: cycleInFlight !== null,
         lastSync,
         lastProcessedTimestamp,
         pendingFiles,

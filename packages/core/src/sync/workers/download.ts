@@ -97,7 +97,7 @@ export async function downloadOne(
   const { relativePath, sizeBytes } = await storage.writeEnvelope(envelope);
 
   // 8. Insert into local index (with fileId)
-  storage.insertEntry({
+  await storage.insertEntry({
     fileId: record.fileId,
     schemaId: record.schemaId,
     path: relativePath,

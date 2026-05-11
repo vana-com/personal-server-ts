@@ -20,7 +20,7 @@ describe("createPersistentPsLiteStorage", () => {
     );
 
     const write = await storage.writeEnvelope(envelope);
-    storage.insertEntry({
+    await storage.insertEntry({
       fileId: "file-1",
       path: write.relativePath,
       scope: envelope.scope,
@@ -58,7 +58,7 @@ describe("createPersistentPsLiteStorage", () => {
     );
 
     const write = await storage.writeEnvelope(envelope);
-    storage.insertEntry({
+    await storage.insertEntry({
       fileId: null,
       path: write.relativePath,
       scope: envelope.scope,
@@ -96,7 +96,7 @@ describe("createPersistentPsLiteStorage", () => {
 
     for (const [index, envelope] of envelopes.entries()) {
       const write = await storage.writeEnvelope(envelope);
-      storage.insertEntry({
+      await storage.insertEntry({
         fileId: `file-${index + 1}`,
         path: write.relativePath,
         scope: envelope.scope,
@@ -137,7 +137,7 @@ describe("createPersistentPsLiteStorage", () => {
     );
 
     const write = await storage.writeEnvelope(envelope);
-    storage.insertEntry({
+    await storage.insertEntry({
       fileId: "file-1",
       path: write.relativePath,
       scope: envelope.scope,
@@ -175,7 +175,7 @@ describe("createPersistentPsLiteStorage", () => {
       { username: "unsynced_user" },
     );
     const write = await storage.writeEnvelope(envelope);
-    storage.insertEntry({
+    await storage.insertEntry({
       fileId: null,
       path: write.relativePath,
       scope: envelope.scope,
@@ -198,5 +198,41 @@ describe("createPersistentPsLiteStorage", () => {
       scope: "instagram.profile",
       fileId: "file-synced-1",
     });
+  });
+
+  it("serializes overlapping index persistence so file id updates win", async () => {
+    const persistence = createMemoryPsLitePersistence();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      persistence,
+    );
+    const envelope = createDataFileEnvelope(
+      "instagram.profile",
+      "2026-05-08T00:00:00.000Z",
+      { username: "race_user" },
+    );
+    const write = await storage.writeEnvelope(envelope);
+
+    const inserted = storage.insertEntry({
+      fileId: null,
+      path: write.relativePath,
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      sizeBytes: write.sizeBytes,
+    });
+    const updated = storage.updateFileId(write.relativePath, "file-synced-1");
+    await inserted;
+    await updated;
+
+    const reloaded = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      persistence,
+    );
+
+    expect(reloaded.findByFileId("file-synced-1")).toMatchObject({
+      scope: "instagram.profile",
+      fileId: "file-synced-1",
+    });
+    expect(reloaded.findUnsynced()).toEqual([]);
   });
 });

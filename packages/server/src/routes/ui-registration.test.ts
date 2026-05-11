@@ -108,6 +108,45 @@ describe("uiRegistrationRoutes", () => {
     );
   });
 
+  it("rejects loopback and private network server URLs", async () => {
+    const app = uiRegistrationRoutes({
+      devToken,
+      ownerPrivateKey: owner.privateKey,
+    });
+
+    for (const serverUrl of [
+      "http://localhost:18081",
+      "http://127.0.0.1:18081",
+      "http://10.0.0.2:18081",
+      "http://192.168.1.10:18081",
+      "http://172.16.1.10:18081",
+      "https://ps-lite.local",
+    ]) {
+      const res = await app.request("/registration/server", {
+        method: "POST",
+        headers: {
+          ...authHeaders(),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          gatewayConfig,
+          registration: {
+            ownerAddress: owner.address,
+            serverAddress: server.address,
+            publicKey: server.address,
+            serverUrl,
+          },
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      await expect(res.json()).resolves.toMatchObject({
+        error: { errorCode: "PUBLIC_API_URL_REQUIRED" },
+      });
+    }
+    expect(gatewayMocks.registerServer).not.toHaveBeenCalled();
+  });
+
   it("accepts an owner private key without 0x prefix", async () => {
     gatewayMocks.getServer.mockResolvedValue(null);
     gatewayMocks.registerServer.mockResolvedValue({

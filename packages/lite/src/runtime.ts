@@ -83,7 +83,10 @@ export interface PsLiteRuntimeOptions {
     ServerSigner,
     "signFileRegistration" | "signGrantRegistration"
   >;
-  syncManager?: Pick<SyncManager, "trigger" | "getStatus"> | null;
+  syncManager?:
+    | (Pick<SyncManager, "trigger" | "getStatus"> &
+        Partial<Pick<SyncManager, "start" | "stop">>)
+    | null;
   accessLogReader?: AccessLogReader;
   accessLogWriter?: AccessLogWriter;
   accessToken?: string;
@@ -554,9 +557,11 @@ export function createPsLiteRuntime(
     storage: options.storage,
     activate() {
       active = true;
+      options.syncManager?.start?.();
     },
     deactivate() {
       active = false;
+      void options.syncManager?.stop?.();
     },
     isAvailable() {
       return active;

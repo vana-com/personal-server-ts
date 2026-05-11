@@ -193,11 +193,12 @@ describe("SyncManager", () => {
     expect(status.pendingFiles).toBe(3);
     expect(status.enabled).toBe(true);
     expect(status.running).toBe(false);
+    expect(status.syncing).toBe(false);
     expect(status.lastSync).toBeNull();
     expect(status.errors).toEqual([]);
   });
 
-  it("getStatus().running reflects lifecycle", async () => {
+  it("getStatus() separates lifecycle from active sync cycle", async () => {
     const uploadDeps = makeMockUploadDeps();
     const downloadDeps = makeMockDownloadDeps();
     const manager = createSyncManager(uploadDeps, downloadDeps, {
@@ -206,17 +207,21 @@ describe("SyncManager", () => {
 
     expect(manager.running).toBe(false);
     expect(manager.getStatus().running).toBe(false);
+    expect(manager.getStatus().syncing).toBe(false);
 
     manager.start();
     expect(manager.running).toBe(true);
     expect(manager.getStatus().running).toBe(true);
+    expect(manager.getStatus().syncing).toBe(true);
 
     // Flush the immediate cycle
     await vi.advanceTimersByTimeAsync(0);
+    expect(manager.getStatus().syncing).toBe(false);
 
     await manager.stop();
     expect(manager.running).toBe(false);
     expect(manager.getStatus().running).toBe(false);
+    expect(manager.getStatus().syncing).toBe(false);
   });
 
   it("upload errors are captured in getStatus().errors", async () => {

@@ -57,7 +57,7 @@ let personalServer: PersonalServerHandle | undefined;
 let storageMode: StorageMode = "indexeddb";
 let relayStatus: PsLiteRelayStatus = "closed";
 let relayPublicUrl = "";
-let activeRelayOptions: RelayOptions | false = false;
+let activeRelayOptions: RelayOptions | false = {};
 
 function getBootstrap(): PsLiteBootstrap {
   const bootstrap = window.__PS_LITE_BOOTSTRAP__;
@@ -587,10 +587,3 @@ declare global {
 }
 
 window.psLiteDebug = psLiteDebug;
-void connectRelay().catch((err: unknown) => {
-  window.dispatchEvent(
-    new CustomEvent("ps-lite-relay-log", {
-      detail: err instanceof Error ? err.message : String(err),
-    }),
-  );
-});

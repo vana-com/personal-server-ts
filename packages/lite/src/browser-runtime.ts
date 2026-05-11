@@ -47,6 +47,7 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   storageDbName?: string;
   storageStoreName?: string;
   storageKey?: string;
+  runtimeOrigin?: string;
   configDefaults?: Partial<ServerConfig>;
   dataFileStore?: PsLiteDataFileStore;
 }
@@ -120,7 +121,7 @@ export async function createIndexedDbPsLiteRuntime(
   const auth =
     options.auth ??
     createWeb3SignedPsLiteAuth({
-      origin: () => config.server.origin,
+      origin: () => options.runtimeOrigin ?? config.server.origin,
       ownerAddress: serverOwner,
       accessToken: options.accessToken,
       tokenStore,

@@ -676,6 +676,7 @@
       const runtimeState = {
         active: "node",
         registration: { ownerPrivateKeyConfigured: false },
+        devTokenExpired: false,
       };
 
       // --- DOM helpers ---
@@ -778,7 +779,21 @@
         } catch (e) {
           json = txt;
         }
-        return { status: res.status, ok: res.ok, data: json };
+        var result = { status: res.status, ok: res.ok, data: json };
+        if (isDevTokenAuthError(result)) {
+          runtimeState.devTokenExpired = true;
+          throw new Error("Dev UI token expired. Reload this page.");
+        }
+        return result;
+      }
+
+      function isDevTokenAuthError(result) {
+        var error = result.data && result.data.error;
+        var errorCode = error && (error.errorCode || error.code);
+        return (
+          result.status === 401 &&
+          (errorCode === "UNAUTHORIZED" || errorCode === "INVALID_SIGNATURE")
+        );
       }
 
       async function runtimeApi(path, opts) {
@@ -791,6 +806,14 @@
         return runtimeState.active === "browser" ? "Browser" : "Node";
       }
 
+      function registrationRequired(healthData) {
+        return Boolean(
+          healthData &&
+          healthData.registration &&
+          healthData.registration.registered === false,
+        );
+      }
+
       async function loadRegistrationStatus() {
         try {
           var result = await api("/ui/api/registration");
@@ -798,7 +821,9 @@
             runtimeState.registration = result.data;
           }
         } catch (e) {
-          runtimeState.registration = { ownerPrivateKeyConfigured: false };
+          if (runtimeState.devTokenExpired) {
+            runtimeState.registration = { ownerPrivateKeyConfigured: false };
+          }
         }
         updateRegisterButton();
       }
@@ -820,16 +845,44 @@
       function updateRegisterButton() {
         var btn = el("register-node-server-btn");
         if (!btn) return;
-        btn.disabled = !runtimeState.registration.ownerPrivateKeyConfigured;
-        btn.title = btn.disabled
-          ? "Set VANA_OWNER_PRIVATE_KEY to register servers"
-          : "Register selected runtime";
+        btn.disabled =
+          runtimeState.devTokenExpired ||
+          !runtimeState.registration.ownerPrivateKeyConfigured;
+        btn.title = runtimeState.devTokenExpired
+          ? "Reload this page to refresh the Dev UI token"
+          : btn.disabled
+            ? "Set VANA_OWNER_PRIVATE_KEY to register servers"
+            : "Register selected runtime";
+      }
+
+      function isPublicServerUrl(url) {
+        try {
+          var parsed = new URL(url);
+          var host = parsed.hostname.toLowerCase();
+          return (
+            (parsed.protocol === "https:" || parsed.protocol === "http:") &&
+            host !== "localhost" &&
+            host !== "127.0.0.1" &&
+            host !== "0.0.0.0" &&
+            host !== "::1" &&
+            host !== "[::1]" &&
+            host !== "ps-lite.local" &&
+            !host.startsWith("10.") &&
+            !host.startsWith("192.168.") &&
+            !/^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
+          );
+        } catch (e) {
+          return false;
+        }
       }
 
       async function selectedHealth() {
         if (runtimeState.active === "node") return api("/health");
 
         var result = await psLiteClient().status();
+        if (result.ok && result.data && !result.data.runtime) {
+          result = await psLiteClient().activate();
+        }
         var data = result.data || {};
         var runtime = data.runtime || {};
         var relay = data.relay || {};
@@ -895,10 +948,22 @@
               d.relay && d.relay.connected ? "ok" : "warn",
             ]);
           } else if (d.tunnel) {
+            var tunnelValue = d.tunnel.status || "unknown";
+            if (
+              d.tunnel.status === "connected" &&
+              d.tunnel.routable === false
+            ) {
+              tunnelValue =
+                d.registration && d.registration.registered
+                  ? "connected (not routable)"
+                  : "connected (not registered)";
+            }
             items.push([
               "tunnel",
-              d.tunnel.status || "unknown",
-              d.tunnel.publicUrl ? "ok" : "warn",
+              tunnelValue,
+              d.tunnel.status === "connected" && d.tunnel.routable !== false
+                ? "ok"
+                : "warn",
             ]);
           }
           if (d.identity) {
@@ -984,6 +1049,16 @@
         statusEl.textContent = "Registering " + runtimeName() + " server...";
         try {
           var health = await selectedHealth();
+          var serverUrl =
+            health.data &&
+            health.data.registration &&
+            health.data.registration.serverUrl;
+          if (!isPublicServerUrl(serverUrl)) {
+            statusEl.style.color = "var(--error)";
+            statusEl.textContent =
+              "Registration requires a reachable public API URL.";
+            return;
+          }
           var result = await api("/ui/api/registration/server", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1100,6 +1175,7 @@
           var health = await selectedHealth().catch(function () {
             return { data: {} };
           });
+          var needsRegistration = registrationRequired(health.data);
           var latestByScope = {};
           var fileIds = [];
           for (var vIdx = 0; vIdx < result.data.scopes.length; vIdx++) {
@@ -1181,20 +1257,37 @@
             }
             var tdSync = createEl("td");
             var syncData = syncResult.data || {};
-            tdSync.textContent =
-              syncData.enabled === false
-                ? "disabled"
-                : syncData.running
-                  ? "running"
-                  : syncResult.ok
-                    ? "idle"
-                    : "unavailable";
-            tdSync.style.color =
-              syncData.enabled === false
-                ? "var(--text-dim)"
-                : syncResult.ok
-                  ? "var(--accent)"
-                  : "var(--warn)";
+            var syncErrors = Array.isArray(syncData.errors)
+              ? syncData.errors
+              : [];
+            var hasPendingFiles =
+              typeof syncData.pendingFiles === "number" &&
+              syncData.pendingFiles > 0;
+            if (syncData.enabled === false) {
+              tdSync.textContent = "disabled";
+              tdSync.style.color = "var(--text-dim)";
+            } else if (needsRegistration && hasPendingFiles) {
+              tdSync.textContent = "register server";
+              tdSync.style.color = "var(--warn)";
+              tdSync.title =
+                "Register this runtime before syncing pending files.";
+            } else if (!syncResult.ok) {
+              tdSync.textContent = "unavailable";
+              tdSync.style.color = "var(--warn)";
+            } else if (syncData.syncing) {
+              tdSync.textContent = "syncing";
+              tdSync.style.color = "var(--warn)";
+            } else if (syncErrors.length > 0 && hasPendingFiles) {
+              tdSync.textContent = "error";
+              tdSync.style.color = "var(--error)";
+              tdSync.title = syncErrors[syncErrors.length - 1].message || "";
+            } else if (hasPendingFiles) {
+              tdSync.textContent = "pending";
+              tdSync.style.color = "var(--warn)";
+            } else {
+              tdSync.textContent = "idle";
+              tdSync.style.color = "var(--accent)";
+            }
             var tdActions = createEl("td");
             var btnView = createEl("button", { class: "btn secondary" });
             btnView.textContent = "View Latest";
@@ -1239,8 +1332,19 @@
 
       async function triggerSync() {
         var msg = el("sync-msg");
-        showMsg(msg, "Triggering " + runtimeName() + " sync...", "ok");
         try {
+          var health = await selectedHealth();
+          if (registrationRequired(health.data)) {
+            showMsg(
+              msg,
+              "Register " + runtimeName() + " server before syncing.",
+              "warn",
+            );
+            await loadHealth();
+            return;
+          }
+
+          showMsg(msg, "Triggering " + runtimeName() + " sync...", "ok");
           var result = await runtimeApi("/v1/sync/trigger", {
             method: "POST",
             auth: "owner",
@@ -1252,7 +1356,40 @@
             showMsg(msg, errMsg, "err");
             return;
           }
-          showMsg(msg, "Sync triggered for " + runtimeName() + ".", "ok");
+          if (result.data && result.data.status === "disabled") {
+            showMsg(msg, "Sync is disabled for " + runtimeName() + ".", "warn");
+            return;
+          }
+          var statusResult = await runtimeApi("/v1/sync/status", {
+            auth: "owner",
+          }).catch(function () {
+            return { ok: false, data: {} };
+          });
+          var syncStatus = statusResult.data || {};
+          var syncErrors = Array.isArray(syncStatus.errors)
+            ? syncStatus.errors
+            : [];
+          var pendingFiles =
+            typeof syncStatus.pendingFiles === "number"
+              ? syncStatus.pendingFiles
+              : 0;
+          if (syncErrors.length > 0 && pendingFiles > 0) {
+            var latestError = syncErrors[syncErrors.length - 1];
+            showMsg(
+              msg,
+              "Sync finished with errors: " +
+                (latestError.message || "unknown error"),
+              "err",
+            );
+          } else if (pendingFiles > 0) {
+            showMsg(
+              msg,
+              "Sync finished with " + pendingFiles + " pending file(s).",
+              "warn",
+            );
+          } else {
+            showMsg(msg, "Sync finished for " + runtimeName() + ".", "ok");
+          }
           await loadScopes();
         } catch (e) {
           showMsg(msg, "Error: " + e.message, "err");
@@ -1764,7 +1901,7 @@
 
         try {
           // Get owner address from /health
-          var healthResult = await api("/health");
+          var healthResult = await selectedHealth();
           if (
             !healthResult.ok ||
             !healthResult.data ||
@@ -1785,8 +1922,9 @@
           connectLog("Owner address: " + connectState.userAddress);
 
           // Create grant via POST /v1/grants
-          var grantResult = await api("/v1/grants", {
+          var grantResult = await runtimeApi("/v1/grants", {
             method: "POST",
+            auth: "owner",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               granteeAddress: connectState.granteeAddress,

@@ -76,6 +76,32 @@ describe("Personal Server client helpers", () => {
     });
   });
 
+  it("does not treat local health api origins as public URLs when publicUrl is explicitly null", () => {
+    const info = createPersonalServerInfoFromHealth({
+      kind: "node",
+      status: "ready",
+      localUrl: "http://127.0.0.1:34123",
+      publicUrl: null,
+      health: {
+        status: "healthy",
+        apiOrigin: "http://localhost:34123",
+        gatewayConfig: { ...gatewayConfig, url: "https://gateway.example" },
+        registration: {
+          ownerAddress: "0x1111111111111111111111111111111111111111",
+          serverAddress: "0x2222222222222222222222222222222222222222",
+          publicKey: "0x04public",
+          serverUrl: "http://localhost:34123",
+          serverId: null,
+          registered: false,
+        },
+      },
+    });
+
+    expect(info.urls.public).toBeNull();
+    expect(info.urls.apiOrigin).toBe("http://localhost:34123");
+    expect(info.urls.registration).toBe("http://localhost:34123");
+  });
+
   it("builds server registration typed data from a candidate", () => {
     const request = createPersonalServerRegistrationRequest({
       gatewayConfig,

@@ -5,7 +5,10 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
-import { createTestWallet } from "@opendatalabs/personal-server-ts-core/test-utils";
+import {
+  buildWeb3SignedHeader,
+  createTestWallet,
+} from "@opendatalabs/personal-server-ts-core/test-utils";
 import { startPersonalServer } from "./client.js";
 
 const ownerWallet = createTestWallet(8);
@@ -93,6 +96,12 @@ async function startTestServer(gateway = createGateway()) {
 }
 
 describe("startPersonalServer node handle", () => {
+  it("rejects port 0 because public handle URLs must be concrete", async () => {
+    await expect(startPersonalServer({ port: 0 })).rejects.toThrow(
+      "port: 0 is not supported",
+    );
+  });
+
   it("starts, reports identity, and prepares registration", async () => {
     const { ps, port } = await startTestServer();
 
@@ -145,6 +154,39 @@ describe("startPersonalServer node handle", () => {
     ).resolves.toMatchObject({
       scope: "instagram.profile",
       status: "stored",
+    });
+  });
+
+  it("preserves Request method and body when fetch applies init overrides", async () => {
+    const { ps, port } = await startTestServer();
+    const origin = `http://localhost:${port}`;
+    const body = new TextEncoder().encode(
+      JSON.stringify({ username: "vana_debug" }),
+    );
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: origin,
+      method: "POST",
+      uri: "/v1/data/instagram.profile",
+      body,
+    });
+
+    const response = await ps.fetch(
+      new Request("https://ignored.example/v1/data/instagram.profile", {
+        method: "POST",
+        body,
+      }),
+      {
+        headers: {
+          Authorization: auth,
+          "Content-Type": "application/json",
+        },
+      },
+    );
+
+    expect(response.status).toBe(201);
+    await expect(response.json()).resolves.toMatchObject({
+      scope: "instagram.profile",
     });
   });
 

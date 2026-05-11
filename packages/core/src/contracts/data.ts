@@ -250,7 +250,7 @@ export async function ingestDataContract(
     input.schemaId,
   );
   const writeResult = await input.storage.writeEnvelope(envelope);
-  input.storage.insertEntry({
+  await input.storage.insertEntry({
     fileId: null,
     schemaId: input.schemaId ?? null,
     path: writeResult.relativePath,

@@ -23,6 +23,7 @@ export function getSyncStatusContract(
     return contractOk({
       enabled: false,
       running: false,
+      syncing: false,
       lastSync: null,
       lastProcessedTimestamp: null,
       pendingFiles: 0,

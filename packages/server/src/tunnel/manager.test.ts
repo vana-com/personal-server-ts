@@ -15,6 +15,7 @@ describe("tunnel/manager", () => {
       expect(status.enabled).toBe(true);
       expect(status.publicUrl).toBeNull();
       expect(status.connectedSince).toBeNull();
+      expect(status.routable).toBeUndefined();
     });
 
     it("isRunning returns false when stopped", () => {
@@ -33,30 +34,34 @@ describe("tunnel/manager", () => {
       it("sets status to connected when reachable", () => {
         manager.setVerified(true);
         const status = manager.getStatus();
-        expect(status.status).toBe("connected");
+        expect(status.status).toBe("stopped");
+        expect(status.routable).toBe(true);
+        expect(status.warning).toBeUndefined();
         expect(status.error).toBeUndefined();
       });
 
-      it("sets status to error with message when not reachable", () => {
+      it("sets routing warning when not reachable without changing process status", () => {
         manager.setVerified(false, "connection refused");
         const status = manager.getStatus();
-        expect(status.status).toBe("error");
-        expect(status.error).toBe("connection refused");
+        expect(status.status).toBe("stopped");
+        expect(status.routable).toBe(false);
+        expect(status.warning).toBe("connection refused");
+        expect(status.error).toBeUndefined();
       });
 
       it("uses default error message when not reachable and no reason given", () => {
         manager.setVerified(false);
         const status = manager.getStatus();
-        expect(status.status).toBe("error");
-        expect(status.error).toBe("Tunnel URL not reachable");
+        expect(status.routable).toBe(false);
+        expect(status.warning).toBe("Tunnel URL not reachable");
       });
 
-      it("clears previous error when verified as reachable", () => {
+      it("clears previous routing warning when verified as reachable", () => {
         manager.setVerified(false, "some error");
         manager.setVerified(true);
         const status = manager.getStatus();
-        expect(status.status).toBe("connected");
-        expect(status.error).toBeUndefined();
+        expect(status.routable).toBe(true);
+        expect(status.warning).toBeUndefined();
       });
     });
   });

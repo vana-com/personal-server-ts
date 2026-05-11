@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createBearerTokenPsLiteAuth,
   createPsLiteRuntime,
@@ -126,6 +126,25 @@ describe("createPsLiteRuntime", () => {
     await expect(res.json()).resolves.toMatchObject({
       apiOrigin: "https://relay.local",
     });
+  });
+
+  it("starts and stops the sync manager with runtime activation", () => {
+    const syncManager = {
+      start: vi.fn(),
+      stop: vi.fn().mockResolvedValue(undefined),
+      trigger: vi.fn().mockResolvedValue(undefined),
+      getStatus: vi.fn(),
+    };
+    const runtime = createTestRuntime({
+      active: false,
+      syncManager,
+    });
+
+    runtime.activate();
+    runtime.deactivate();
+
+    expect(syncManager.start).toHaveBeenCalledTimes(1);
+    expect(syncManager.stop).toHaveBeenCalledTimes(1);
   });
 
   it("returns PS_UNAVAILABLE while the browser runtime is inactive", async () => {

@@ -162,6 +162,7 @@ describe("syncRoutes", () => {
         expect(json).toEqual({
           enabled: false,
           running: false,
+          syncing: false,
           lastSync: null,
           lastProcessedTimestamp: null,
           pendingFiles: 0,

@@ -2,6 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import { privateKeyToAccount } from "viem/accounts";
 
 const require = createRequire(import.meta.url);
 const pkg = require("../package.json") as { version: string };
@@ -54,6 +55,7 @@ export interface ServerContext {
   syncManager: SyncManager | null;
   tunnelManager?: TunnelManager;
   tunnelUrl?: string;
+  isServerRegistered: () => boolean;
   localApprovalPort?: number;
   getLocalApprovalOrigin: () => string | undefined;
   setLocalApprovalOrigin: (origin?: string) => void;
@@ -136,6 +138,13 @@ export async function createServer(
   const ownerPrivateKey = process.env.VANA_OWNER_PRIVATE_KEY as
     | `0x${string}`
     | undefined;
+  const ownerTunnelSigner = ownerPrivateKey
+    ? privateKeyToAccount(
+        ownerPrivateKey.startsWith("0x")
+          ? ownerPrivateKey
+          : (`0x${ownerPrivateKey}` as `0x${string}`),
+      )
+    : null;
   let serverOwner: `0x${string}` | undefined;
 
   let serverAccount: ServerAccount | undefined;
@@ -143,9 +152,19 @@ export async function createServer(
   let identity: IdentityInfo | undefined;
 
   if (masterKeySignature) {
-    serverOwner = await recoverServerOwner(masterKeySignature);
+    const recoveredServerOwner = await recoverServerOwner(masterKeySignature);
+    serverOwner = recoveredServerOwner;
     deriveMasterKey(masterKeySignature); // validate signature format
     logger.info({ owner: serverOwner }, "Server owner derived from master key");
+    if (
+      ownerTunnelSigner &&
+      ownerTunnelSigner.address.toLowerCase() !==
+        recoveredServerOwner.toLowerCase()
+    ) {
+      throw new Error(
+        "VANA_OWNER_PRIVATE_KEY does not match VANA_MASTER_KEY_SIGNATURE owner",
+      );
+    }
 
     // Load or create server keypair from disk
     const keyPath = join(storageRoot, "key.json");
@@ -339,6 +358,7 @@ export async function createServer(
     syncManager,
     tunnelManager,
     tunnelUrl: undefined,
+    isServerRegistered: () => Boolean(identity?.serverId),
     localApprovalPort,
     getLocalApprovalOrigin: () => effectiveLocalApprovalOrigin,
     setLocalApprovalOrigin: (origin?: string) => {
@@ -390,6 +410,12 @@ export async function createServer(
               walletAddress: serverAccount.address,
               ownerAddress: serverOwner,
               serverKeypair: serverAccount,
+              tunnelSigner: ownerTunnelSigner
+                ? {
+                    signMessage: (message) =>
+                      ownerTunnelSigner.signMessage({ message }),
+                  }
+                : undefined,
               runId,
               serverAddr: config.tunnel.serverAddr,
               serverPort: config.tunnel.serverPort,
@@ -404,10 +430,6 @@ export async function createServer(
           if (!identity?.serverId) {
             logger.warn(
               "Tunnel started but server is not registered with gateway — tunnel will not route traffic. Run: npm run register-server",
-            );
-            tunnelManager.setVerified(
-              false,
-              "Server not registered with gateway",
             );
           }
         } catch (err) {
