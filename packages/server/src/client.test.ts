@@ -157,6 +157,36 @@ describe("startPersonalServer node handle", () => {
     });
   });
 
+  it("exposes typed data and sync helpers through the public handle", async () => {
+    const { ps } = await startTestServer();
+    const auth = { signMessage: ownerWallet.signMessage };
+
+    await ps.postData("instagram.profile", { username: "vana_debug" }, auth);
+
+    await expect(ps.listData({ auth, limit: 10 })).resolves.toMatchObject({
+      scopes: [{ scope: "instagram.profile" }],
+    });
+    await expect(
+      ps.listVersions("instagram.profile", { auth, limit: 1 }),
+    ).resolves.toMatchObject({
+      scope: "instagram.profile",
+      versions: [{ fileId: null }],
+    });
+    await expect(
+      ps.readData("instagram.profile", { auth }),
+    ).resolves.toMatchObject({
+      scope: "instagram.profile",
+      data: { username: "vana_debug" },
+    });
+    await expect(ps.syncStatus({ auth })).resolves.toMatchObject({
+      enabled: false,
+      running: false,
+    });
+    await expect(ps.syncNow({ auth })).resolves.toMatchObject({
+      status: "disabled",
+    });
+  });
+
   it("preserves Request method and body when fetch applies init overrides", async () => {
     const { ps, port } = await startTestServer();
     const origin = `http://localhost:${port}`;

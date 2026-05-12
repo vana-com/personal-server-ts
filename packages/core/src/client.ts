@@ -1,13 +1,17 @@
 import {
   buildWeb3SignedHeader,
+  type DataFileEnvelope,
   type DataPortabilityGatewayConfig,
   type GatewayClient,
+  type ServerInfo,
   type RegisterServerParams,
   type RegisterServerResult,
   SERVER_REGISTRATION_TYPES,
   serverRegistrationDomain,
   type Web3SignedSignFn,
 } from "@opendatalabs/vana-sdk/browser";
+import type { ScopeSummary } from "./storage/index/types.js";
+import type { SyncStatus } from "./sync/types.js";
 
 export type PersonalServerKind = "node" | "lite";
 
@@ -83,6 +87,61 @@ export type PersonalServerPostDataOptions = PersonalServerOwnerAuth & {
   headers?: Record<string, string>;
 };
 
+export interface PersonalServerListDataOptions {
+  scopePrefix?: string;
+  limit?: number;
+  offset?: number;
+  auth?: PersonalServerOwnerAuth;
+  headers?: Record<string, string>;
+}
+
+export interface PersonalServerListDataResult {
+  scopes: ScopeSummary[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface PersonalServerListVersionsOptions {
+  limit?: number;
+  offset?: number;
+  auth?: PersonalServerOwnerAuth;
+  headers?: Record<string, string>;
+}
+
+export interface PersonalServerDataVersion {
+  fileId: string | null;
+  schemaId: string | null;
+  collectedAt: string;
+}
+
+export interface PersonalServerListVersionsResult {
+  scope: string;
+  versions: PersonalServerDataVersion[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface PersonalServerReadDataOptions {
+  grantId?: string;
+  fileId?: string;
+  at?: string;
+  auth?: PersonalServerOwnerAuth;
+  headers?: Record<string, string>;
+}
+
+export interface PersonalServerSyncTriggerResult {
+  status: "started" | "disabled";
+  message?: string;
+  fileId?: string;
+}
+
+export interface PersonalServerAuthRequestOptions {
+  auth?: PersonalServerOwnerAuth;
+  headers?: Record<string, string>;
+}
+
 export interface PersonalServerHandle {
   readonly kind: PersonalServerKind;
   ready(options?: PersonalServerReadyOptions): Promise<PersonalServerInfo>;
@@ -99,7 +158,54 @@ export interface PersonalServerHandle {
     body: unknown,
     options: PersonalServerPostDataOptions,
   ): Promise<{ scope: string; collectedAt: string; status: string }>;
+  listData(
+    options?: PersonalServerListDataOptions,
+  ): Promise<PersonalServerListDataResult>;
+  listVersions(
+    scope: string,
+    options?: PersonalServerListVersionsOptions,
+  ): Promise<PersonalServerListVersionsResult>;
+  readData(
+    scope: string,
+    options?: PersonalServerReadDataOptions,
+  ): Promise<DataFileEnvelope>;
+  syncStatus(options?: PersonalServerAuthRequestOptions): Promise<SyncStatus>;
+  syncNow(
+    options?: PersonalServerAuthRequestOptions,
+  ): Promise<PersonalServerSyncTriggerResult>;
   stop(): Promise<void>;
+}
+
+export interface PersonalServerClientErrorBody {
+  error?: {
+    code?: number;
+    errorCode?: string;
+    message?: string;
+    details?: unknown;
+  };
+  [key: string]: unknown;
+}
+
+export class PersonalServerClientError extends Error {
+  readonly status: number;
+  readonly errorCode?: string;
+  readonly details?: unknown;
+  readonly body?: unknown;
+
+  constructor(params: {
+    message: string;
+    status: number;
+    errorCode?: string;
+    details?: unknown;
+    body?: unknown;
+  }) {
+    super(params.message);
+    this.name = "PersonalServerClientError";
+    this.status = params.status;
+    this.errorCode = params.errorCode;
+    this.details = params.details;
+    this.body = params.body;
+  }
 }
 
 export interface PersonalServerHealthRegistration {
@@ -226,7 +332,7 @@ export async function createOwnerSignedPersonalServerRequest(params: {
         signMessage: params.auth.signMessage,
         aud: params.origin,
         method: params.method,
-        uri: params.path,
+        uri: new URL(params.path, params.origin).pathname,
         body: params.body,
       }),
     );
@@ -247,6 +353,7 @@ export async function submitPersonalServerRegistration(params: {
     params.request.candidate.serverAddress,
   );
   if (existing?.id) {
+    assertRegistrationMatches(existing, params.request.candidate);
     return { alreadyRegistered: true, serverId: existing.id };
   }
   return params.gateway.registerServer({
@@ -263,6 +370,99 @@ export function requestPath(input: string | URL | Request): string {
         ? input
         : new URL(input, "https://personal-server.local");
   return `${url.pathname}${url.search}`;
+}
+
+export function dataListPath(
+  options: PersonalServerListDataOptions = {},
+): string {
+  const params = new URLSearchParams();
+  if (options.scopePrefix) params.set("scopePrefix", options.scopePrefix);
+  if (options.limit !== undefined) params.set("limit", String(options.limit));
+  if (options.offset !== undefined)
+    params.set("offset", String(options.offset));
+  const query = params.toString();
+  return query ? `/v1/data?${query}` : "/v1/data";
+}
+
+export function dataVersionsPath(
+  scope: string,
+  options: PersonalServerListVersionsOptions = {},
+): string {
+  const params = new URLSearchParams();
+  if (options.limit !== undefined) params.set("limit", String(options.limit));
+  if (options.offset !== undefined)
+    params.set("offset", String(options.offset));
+  const query = params.toString();
+  return `/v1/data/${encodeURIComponent(scope)}/versions${
+    query ? `?${query}` : ""
+  }`;
+}
+
+export function dataReadPath(
+  scope: string,
+  options: PersonalServerReadDataOptions = {},
+): string {
+  const params = new URLSearchParams();
+  if (options.grantId) params.set("grantId", options.grantId);
+  if (options.fileId) params.set("fileId", options.fileId);
+  if (options.at) params.set("at", options.at);
+  const query = params.toString();
+  return `/v1/data/${encodeURIComponent(scope)}${query ? `?${query}` : ""}`;
+}
+
+export async function parsePersonalServerJsonResponse<T>(
+  response: Response,
+  action: string,
+): Promise<T> {
+  const body = await readJsonBody(response);
+  if (!response.ok) {
+    const structured = toClientErrorBody(body);
+    throw new PersonalServerClientError({
+      status: response.status,
+      errorCode: structured?.error?.errorCode,
+      details: structured?.error?.details,
+      body,
+      message:
+        structured?.error?.message ??
+        `Personal Server ${action} failed: ${response.status}`,
+    });
+  }
+  return body as T;
+}
+
+async function readJsonBody(response: Response): Promise<unknown> {
+  const text = await response.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return text;
+  }
+}
+
+function toClientErrorBody(
+  value: unknown,
+): PersonalServerClientErrorBody | null {
+  return value && typeof value === "object"
+    ? (value as PersonalServerClientErrorBody)
+    : null;
+}
+
+function assertRegistrationMatches(
+  existing: ServerInfo,
+  candidate: PersonalServerRegistrationCandidate,
+): void {
+  if (existing.serverUrl === candidate.serverUrl) return;
+  throw new PersonalServerClientError({
+    status: 409,
+    errorCode: "SERVER_URL_MISMATCH",
+    message: `Server ${existing.id} is already registered with URL "${existing.serverUrl}". Cannot change to "${candidate.serverUrl}".`,
+    details: {
+      serverId: existing.id,
+      existingUrl: existing.serverUrl,
+      candidateUrl: candidate.serverUrl,
+    },
+  });
 }
 
 function toHealthBody(value: unknown): PersonalServerHealthBody {

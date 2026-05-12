@@ -12,7 +12,7 @@ export async function triggerSyncContract(
   if (!syncManager) {
     return contractOk({ status: "disabled", message: "Sync is not enabled" });
   }
-  await syncManager.trigger();
+  void syncManager.trigger().catch(() => undefined);
   return contractOk({ status: "started", message: "Sync triggered" }, 202);
 }
 
@@ -43,6 +43,6 @@ export async function syncFileContract(
       message: "Sync is not enabled",
     });
   }
-  await input.syncManager.trigger();
+  void input.syncManager.trigger().catch(() => undefined);
   return contractOk({ fileId: input.fileId, status: "started" }, 202);
 }

@@ -1,6 +1,6 @@
 import type { UploadWorkerDeps } from "../workers/upload.js";
 import type { DownloadWorkerDeps } from "../workers/download.js";
-import type { SyncStatus, SyncError } from "../types.js";
+import type { SyncStatus, SyncError, SyncBlockedReason } from "../types.js";
 import { uploadAll } from "../workers/upload.js";
 import { downloadAll } from "../workers/download.js";
 
@@ -11,7 +11,13 @@ export interface SyncManagerOptions {
   uploadBatchSize?: number;
   /** Debounce for immediate sync after local ingest (default: 500ms) */
   notifyDebounceMs?: number;
+  /** Optional runtime gate. Returning blocked skips upload/download without an error. */
+  canSync?: () => Promise<SyncCanRunResult> | SyncCanRunResult;
 }
+
+export type SyncCanRunResult =
+  | { ok: true }
+  | { ok: false; reason: string; message: string };
 
 export interface SyncManager {
   /** Start the background sync loop */
@@ -49,6 +55,7 @@ export function createSyncManager(
   let isRunning = false;
   let lastSync: string | null = null;
   let lastProcessedTimestamp: string | null = null;
+  let blocked: SyncBlockedReason | null = null;
   let errors: SyncError[] = [];
   let cycleInFlight: Promise<void> | null = null;
   let rerunRequested = false;
@@ -63,6 +70,13 @@ export function createSyncManager(
     cycleInFlight = (async () => {
       do {
         rerunRequested = false;
+        const canRun = await (options?.canSync?.() ?? { ok: true });
+        if (!canRun.ok) {
+          blocked = { reason: canRun.reason, message: canRun.message };
+          uploadDeps.logger.warn(blocked, "Sync cycle blocked");
+          continue;
+        }
+        blocked = null;
 
         try {
           // Upload unsynced local files
@@ -220,6 +234,7 @@ export function createSyncManager(
         enabled: true,
         running: isRunning,
         syncing: cycleInFlight !== null,
+        blocked,
         lastSync,
         lastProcessedTimestamp,
         pendingFiles,

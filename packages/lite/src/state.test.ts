@@ -2,8 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createIndexedDbPsLiteAccessLogStore,
   createIndexedDbPsLiteTokenStore,
+  loadPsLiteRelayState,
   loadOrCreatePsLiteConfig,
   loadOrCreatePsLiteServerIdentity,
+  savePsLiteRelayState,
   savePsLiteConfig,
 } from "./state.js";
 import { createMemoryPsLiteStateStore } from "./test-support/memory.js";
@@ -241,6 +243,31 @@ describe("PS Lite browser state", () => {
         ownerSignature: `0x${"11".repeat(65)}`,
       }),
     ).rejects.toThrow();
+  });
+
+  it("persists PS Lite relay state", async () => {
+    const store = createMemoryPsLiteStateStore();
+
+    await expect(loadPsLiteRelayState(store)).resolves.toBeNull();
+
+    await expect(
+      savePsLiteRelayState(store, {
+        sessionId: "session-1",
+        controlUrl: "wss://relay.example",
+        publicSuffix: "relay.example",
+        publicUrl: "https://session-1.relay.example",
+        updatedAt: "2026-05-08T00:00:00.000Z",
+      }),
+    ).resolves.toMatchObject({
+      sessionId: "session-1",
+      publicUrl: "https://session-1.relay.example",
+    });
+
+    await expect(loadPsLiteRelayState(store)).resolves.toMatchObject({
+      sessionId: "session-1",
+      controlUrl: "wss://relay.example",
+      publicSuffix: "relay.example",
+    });
   });
 
   it("persists PS Lite tokens in IndexedDB and purges expired entries", async () => {

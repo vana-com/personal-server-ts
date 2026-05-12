@@ -33,6 +33,7 @@ function createMockSyncManager(): SyncManager {
     getStatus: vi.fn().mockReturnValue({
       enabled: true,
       running: true,
+      syncing: false,
       lastSync: null,
       lastProcessedTimestamp: null,
       pendingFiles: 0,

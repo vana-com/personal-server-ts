@@ -12,8 +12,22 @@ export {
 export type {
   PersonalServerHandle,
   PersonalServerInfo,
+  PersonalServerAuthRequestOptions,
+  PersonalServerListDataOptions,
+  PersonalServerListDataResult,
+  PersonalServerListVersionsOptions,
+  PersonalServerListVersionsResult,
+  PersonalServerReadDataOptions,
   PersonalServerRegistrationRequest,
   PersonalServerStatus,
+  PersonalServerSyncTriggerResult,
+} from "@opendatalabs/personal-server-ts-core/client";
+export {
+  PersonalServerClientError,
+  dataListPath,
+  dataReadPath,
+  dataVersionsPath,
+  parsePersonalServerJsonResponse,
 } from "@opendatalabs/personal-server-ts-core/client";
 
 export {
@@ -40,7 +54,9 @@ export {
   createIndexedDbPsLiteTokenStore,
   loadOrCreatePsLiteConfig,
   loadOrCreatePsLiteServerIdentity,
+  loadPsLiteRelayState,
   savePsLiteConfig,
+  savePsLiteRelayState,
   type IndexedDbPsLiteAccessLogStoreOptions,
   type IndexedDbPsLiteStateStoreOptions,
   type IndexedDbPsLiteTokenStoreOptions,

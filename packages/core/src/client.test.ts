@@ -5,6 +5,11 @@ import {
   createOwnerSignedPersonalServerRequest,
   createPersonalServerInfoFromHealth,
   createPersonalServerRegistrationRequest,
+  dataListPath,
+  dataReadPath,
+  dataVersionsPath,
+  parsePersonalServerJsonResponse,
+  PersonalServerClientError,
   submitPersonalServerRegistration,
 } from "./client.js";
 
@@ -147,6 +152,39 @@ describe("Personal Server client helpers", () => {
     });
   });
 
+  it("rejects an existing server registration with a different URL", async () => {
+    const request = createPersonalServerRegistrationRequest({
+      gatewayConfig,
+      ownerAddress: "0x1111111111111111111111111111111111111111",
+      serverAddress: "0x2222222222222222222222222222222222222222",
+      publicKey: "0x04public",
+      serverUrl: "https://new-session.relay.example",
+    });
+    const gateway = {
+      getServer: vi.fn().mockResolvedValue({
+        id: "server-1",
+        ownerAddress: request.candidate.ownerAddress,
+        serverAddress: request.candidate.serverAddress,
+        publicKey: request.candidate.publicKey,
+        serverUrl: "https://old-session.relay.example",
+        addedAt: "2026-05-08T00:00:00.000Z",
+      }),
+      registerServer: vi.fn(),
+    };
+
+    await expect(
+      submitPersonalServerRegistration({
+        gateway: gateway as Pick<GatewayClient, "getServer" | "registerServer">,
+        request,
+        signature: "0xsig",
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      errorCode: "SERVER_URL_MISMATCH",
+    });
+    expect(gateway.registerServer).not.toHaveBeenCalled();
+  });
+
   it("creates owner-authenticated Web3Signed requests", async () => {
     const wallet = createTestWallet(0);
     const request = await createOwnerSignedPersonalServerRequest({
@@ -161,5 +199,66 @@ describe("Personal Server client helpers", () => {
     expect(request.url).toBe("https://ps.example/v1/data/instagram.profile");
     expect(request.headers.get("Authorization")).toMatch(/^Web3Signed /);
     expect(request.headers.get("Content-Type")).toBe("application/json");
+  });
+
+  it("signs request paths without query strings", async () => {
+    const wallet = createTestWallet(0);
+    const request = await createOwnerSignedPersonalServerRequest({
+      origin: "https://ps.example",
+      path: "/v1/data?limit=10",
+      method: "GET",
+      auth: { signMessage: wallet.signMessage },
+    });
+
+    expect(request.url).toBe("https://ps.example/v1/data?limit=10");
+    const payload = request.headers
+      .get("Authorization")!
+      .split(" ")[1]
+      .split(".")[0];
+    const decoded = JSON.parse(atob(payload)) as { uri: string };
+    expect(decoded.uri).toBe("/v1/data");
+  });
+
+  it("builds typed data and sync helper paths", () => {
+    expect(dataListPath({ scopePrefix: "instagram", limit: 10 })).toBe(
+      "/v1/data?scopePrefix=instagram&limit=10",
+    );
+    expect(dataVersionsPath("instagram.profile", { offset: 5 })).toBe(
+      "/v1/data/instagram.profile/versions?offset=5",
+    );
+    expect(
+      dataReadPath("instagram.profile", {
+        grantId: "grant-1",
+        fileId: "file-1",
+      }),
+    ).toBe("/v1/data/instagram.profile?grantId=grant-1&fileId=file-1");
+  });
+
+  it("preserves structured API errors for consumers", async () => {
+    const body = JSON.stringify({
+      error: {
+        code: 401,
+        errorCode: "INVALID_SIGNATURE",
+        message: "Invalid signature",
+        details: { reason: "Missing Web3Signed prefix" },
+      },
+    });
+
+    await expect(
+      parsePersonalServerJsonResponse(
+        new Response(body, { status: 401 }),
+        "data write",
+      ),
+    ).rejects.toBeInstanceOf(PersonalServerClientError);
+    await expect(
+      parsePersonalServerJsonResponse(
+        new Response(body, { status: 401 }),
+        "data write",
+      ),
+    ).rejects.toMatchObject({
+      status: 401,
+      errorCode: "INVALID_SIGNATURE",
+      details: { reason: "Missing Web3Signed prefix" },
+    });
   });
 });

@@ -5,10 +5,17 @@ export interface SyncStatus {
   running: boolean;
   /** True while an upload/download cycle is actively in progress. */
   syncing: boolean;
+  /** Present when sync is enabled but intentionally blocked by runtime state. */
+  blocked?: SyncBlockedReason | null;
   lastSync: string | null; // ISO 8601
   lastProcessedTimestamp: string | null;
   pendingFiles: number;
   errors: SyncError[];
+}
+
+export interface SyncBlockedReason {
+  reason: string;
+  message: string;
 }
 
 export interface SyncError {

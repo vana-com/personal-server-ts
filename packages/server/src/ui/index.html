@@ -1726,12 +1726,67 @@
             body = opts.body;
           }
         }
+        var client = psLiteClient();
+        var url = new URL(path, "https://ps-lite.local");
+        var dataPrefix = "/v1/data";
+        if (
+          url.pathname === dataPrefix &&
+          (!opts.method || opts.method.toUpperCase() === "GET")
+        ) {
+          return client.listData({
+            scopePrefix: url.searchParams.get("scopePrefix") || undefined,
+            limit: numberParam(url.searchParams.get("limit")),
+            offset: numberParam(url.searchParams.get("offset")),
+          });
+        }
+        if (url.pathname.startsWith(dataPrefix + "/")) {
+          var dataSuffix = url.pathname.slice((dataPrefix + "/").length);
+          if (dataSuffix.endsWith("/versions")) {
+            return client.listVersions(
+              decodeURIComponent(dataSuffix.slice(0, -"/versions".length)),
+              {
+                limit: numberParam(url.searchParams.get("limit")),
+                offset: numberParam(url.searchParams.get("offset")),
+              },
+            );
+          }
+          var scope = decodeURIComponent(dataSuffix);
+          var method = (opts.method || "GET").toUpperCase();
+          if (method === "POST") {
+            return client.postData(scope, body);
+          }
+          if (method === "GET") {
+            return client.readData(scope, {
+              grantId: url.searchParams.get("grantId") || undefined,
+              fileId: url.searchParams.get("fileId") || undefined,
+              at: url.searchParams.get("at") || undefined,
+            });
+          }
+        }
+        if (
+          url.pathname === "/v1/sync/status" &&
+          (!opts.method || opts.method.toUpperCase() === "GET")
+        ) {
+          return client.syncStatus();
+        }
+        if (
+          url.pathname === "/v1/sync/trigger" &&
+          (opts.method || "GET").toUpperCase() === "POST"
+        ) {
+          return client.syncTrigger();
+        }
         return psLiteClient().request(path, {
           method: opts.method || "GET",
           body: body,
           auth: opts.auth,
           headers: opts.headers,
         });
+      }
+
+      function numberParam(value) {
+        if (value === null || value === "") return undefined;
+        var parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : undefined;
       }
 
       window.addEventListener("ps-lite-relay-status", function () {

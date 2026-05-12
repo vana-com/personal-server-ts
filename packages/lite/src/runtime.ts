@@ -218,6 +218,9 @@ export function createBearerTokenPsLiteAuth(
       assertBearerToken(request, options.builderToken);
     },
     async authorizeBuilderRead(input) {
+      if (parseBearerToken(input.request) === options.ownerToken) {
+        return { builder: "owner", grantId: "owner" };
+      }
       assertBearerToken(input.request, options.builderToken);
       if (!input.grantId) {
         throw new GrantRequiredError({
@@ -294,6 +297,9 @@ export function createWeb3SignedPsLiteAuth(
       const auth = await authenticatePsLiteRequest(input.request, options);
       if (auth.isPolicyBypass) {
         return { builder: auth.auth.signer, grantId: "policy-bypass" };
+      }
+      if (isOwnerSigner(auth, options.ownerAddress)) {
+        return { builder: auth.auth.signer, grantId: "owner" };
       }
       if (!options.dataReadPolicyPorts) {
         throw dataReadPolicyPortsRequired();

@@ -10,8 +10,22 @@ export {
 export type {
   PersonalServerHandle,
   PersonalServerInfo,
+  PersonalServerAuthRequestOptions,
+  PersonalServerListDataOptions,
+  PersonalServerListDataResult,
+  PersonalServerListVersionsOptions,
+  PersonalServerListVersionsResult,
+  PersonalServerReadDataOptions,
   PersonalServerRegistrationRequest,
   PersonalServerStatus,
+  PersonalServerSyncTriggerResult,
+} from "@opendatalabs/personal-server-ts-core/client";
+export {
+  PersonalServerClientError,
+  dataListPath,
+  dataReadPath,
+  dataVersionsPath,
+  parsePersonalServerJsonResponse,
 } from "@opendatalabs/personal-server-ts-core/client";
 export {
   DEFAULT_ROOT_PATH,

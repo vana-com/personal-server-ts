@@ -5,17 +5,31 @@ import {
   createOwnerSignedPersonalServerRequest,
   createPersonalServerInfoFromHealth,
   createPersonalServerRegistrationRequest,
+  dataListPath,
+  dataReadPath,
+  dataVersionsPath,
+  parsePersonalServerJsonResponse,
   requestPath,
   submitPersonalServerRegistration,
+  type PersonalServerAuthRequestOptions,
   type PersonalServerHandle,
   type PersonalServerInfo,
+  type PersonalServerListDataOptions,
+  type PersonalServerListDataResult,
+  type PersonalServerListVersionsOptions,
+  type PersonalServerListVersionsResult,
+  type PersonalServerOwnerAuth,
   type PersonalServerPostDataOptions,
   type PersonalServerPrepareRegistrationOptions,
+  type PersonalServerReadDataOptions,
   type PersonalServerReadyOptions,
   type PersonalServerRegistrationRequest,
   type PersonalServerStatus,
   type PersonalServerSubmitRegistrationOptions,
+  type PersonalServerSyncTriggerResult,
 } from "@opendatalabs/personal-server-ts-core/client";
+import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/node";
+import type { SyncStatus } from "@opendatalabs/personal-server-ts-core/sync";
 import type {
   GatewayClient,
   RegisterServerResult,
@@ -170,34 +184,133 @@ export async function startPersonalServer(
     body: unknown,
     postOptions: PersonalServerPostDataOptions,
   ): Promise<{ scope: string; collectedAt: string; status: string }> {
-    const current = await info();
-    const origin = current.urls.apiOrigin;
-    if (!origin) throw new Error("Personal Server API origin is required");
     const path = `/v1/data/${encodeURIComponent(scope)}`;
-    const encoded = new TextEncoder().encode(JSON.stringify(body));
-    const request = await createOwnerSignedPersonalServerRequest({
-      origin,
+    const request = await createOwnerRequest({
       path,
       method: "POST",
-      body: encoded,
-      auth:
-        "signMessage" in postOptions
-          ? { signMessage: postOptions.signMessage }
-          : { bearerToken: postOptions.bearerToken },
+      body,
+      authOptions: postOptions,
       headers: {
         "Content-Type": "application/json",
         ...postOptions.headers,
       },
     });
     const response = await callFetch(request);
-    if (!response.ok) {
-      throw new Error(`Personal Server data write failed: ${response.status}`);
+    return parsePersonalServerJsonResponse(response, "data write");
+  }
+
+  async function listData(
+    listOptions: PersonalServerListDataOptions = {},
+  ): Promise<PersonalServerListDataResult> {
+    const path = dataListPath(listOptions);
+    const request = await createOwnerRequest({
+      path,
+      method: "GET",
+      authOptions: listOptions,
+      headers: listOptions.headers,
+    });
+    return parsePersonalServerJsonResponse(
+      await callFetch(request),
+      "data list",
+    );
+  }
+
+  async function listVersions(
+    scope: string,
+    versionOptions: PersonalServerListVersionsOptions = {},
+  ): Promise<PersonalServerListVersionsResult> {
+    const path = dataVersionsPath(scope, versionOptions);
+    const request = await createOwnerRequest({
+      path,
+      method: "GET",
+      authOptions: versionOptions,
+      headers: versionOptions.headers,
+    });
+    return parsePersonalServerJsonResponse(
+      await callFetch(request),
+      "data versions list",
+    );
+  }
+
+  async function readData(
+    scope: string,
+    readOptions: PersonalServerReadDataOptions = {},
+  ): Promise<DataFileEnvelope> {
+    const path = dataReadPath(scope, readOptions);
+    const request = await createOwnerRequest({
+      path,
+      method: "GET",
+      authOptions: readOptions,
+      headers: readOptions.headers,
+    });
+    return parsePersonalServerJsonResponse(
+      await callFetch(request),
+      "data read",
+    );
+  }
+
+  async function syncStatus(
+    syncOptions: PersonalServerAuthRequestOptions = {},
+  ): Promise<SyncStatus> {
+    const request = await createOwnerRequest({
+      path: "/v1/sync/status",
+      method: "GET",
+      authOptions: syncOptions,
+      headers: syncOptions.headers,
+    });
+    return parsePersonalServerJsonResponse(
+      await callFetch(request),
+      "sync status",
+    );
+  }
+
+  async function syncNow(
+    syncOptions: PersonalServerAuthRequestOptions = {},
+  ): Promise<PersonalServerSyncTriggerResult> {
+    const request = await createOwnerRequest({
+      path: "/v1/sync/trigger",
+      method: "POST",
+      authOptions: syncOptions,
+      headers: syncOptions.headers,
+    });
+    return parsePersonalServerJsonResponse(
+      await callFetch(request),
+      "sync trigger",
+    );
+  }
+
+  async function createOwnerRequest(params: {
+    path: string;
+    method: string;
+    body?: unknown;
+    authOptions:
+      | PersonalServerAuthRequestOptions
+      | PersonalServerPostDataOptions;
+    headers?: Record<string, string>;
+  }): Promise<Request> {
+    const current = await info();
+    const origin = current.urls.apiOrigin;
+    if (!origin) throw new Error("Personal Server API origin is required");
+    const encoded =
+      params.body === undefined
+        ? undefined
+        : new TextEncoder().encode(JSON.stringify(params.body));
+    const auth = authFromOptions(params.authOptions);
+    if (auth) {
+      return createOwnerSignedPersonalServerRequest({
+        origin,
+        path: params.path,
+        method: params.method,
+        body: encoded,
+        auth,
+        headers: params.headers,
+      });
     }
-    return (await response.json()) as {
-      scope: string;
-      collectedAt: string;
-      status: string;
-    };
+    return new Request(`${origin}${params.path}`, {
+      method: params.method,
+      body: encoded,
+      headers: params.headers,
+    });
   }
 
   async function stop(): Promise<void> {
@@ -222,8 +335,22 @@ export async function startPersonalServer(
     submitRegistration,
     fetch: callFetch,
     postData,
+    listData,
+    listVersions,
+    readData,
+    syncStatus,
+    syncNow,
     stop,
   };
+}
+
+function authFromOptions(
+  options: PersonalServerAuthRequestOptions | PersonalServerPostDataOptions,
+): PersonalServerOwnerAuth | undefined {
+  if ("auth" in options && options.auth) return options.auth;
+  if ("signMessage" in options) return { signMessage: options.signMessage };
+  if ("bearerToken" in options) return { bearerToken: options.bearerToken };
+  return undefined;
 }
 
 async function listenHttpServer(params: {

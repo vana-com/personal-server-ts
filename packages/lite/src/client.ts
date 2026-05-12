@@ -2,20 +2,33 @@ import {
   createOwnerSignedPersonalServerRequest,
   createPersonalServerInfoFromHealth,
   createPersonalServerRegistrationRequest,
+  dataListPath,
+  dataReadPath,
+  dataVersionsPath,
+  parsePersonalServerJsonResponse,
   requestPath,
   submitPersonalServerRegistration,
+  type PersonalServerAuthRequestOptions,
   type PersonalServerHandle,
   type PersonalServerInfo,
+  type PersonalServerListDataOptions,
+  type PersonalServerListDataResult,
+  type PersonalServerListVersionsOptions,
+  type PersonalServerListVersionsResult,
   type PersonalServerOwnerAuth,
   type PersonalServerPostDataOptions,
   type PersonalServerPrepareRegistrationOptions,
+  type PersonalServerReadDataOptions,
   type PersonalServerReadyOptions,
   type PersonalServerRegistrationRequest,
   type PersonalServerStatus,
   type PersonalServerSubmitRegistrationOptions,
+  type PersonalServerSyncTriggerResult,
 } from "@opendatalabs/personal-server-ts-core/client";
+import type { SyncStatus } from "@opendatalabs/personal-server-ts-core/sync";
 import {
   createGatewayClient,
+  type DataFileEnvelope,
   type GatewayClient,
   type RegisterServerResult,
 } from "@opendatalabs/vana-sdk/browser";
@@ -32,13 +45,21 @@ import {
   type PsLiteRelayStatus,
 } from "./relay.js";
 import type { PsLiteRuntime } from "./runtime.js";
+import {
+  createIndexedDbPsLiteStateStore,
+  loadPsLiteRelayState,
+  savePsLiteRelayState,
+  type PsLiteRelayState,
+  type PsLiteStateStore,
+} from "./state.js";
 
 const DEFAULT_LITE_ORIGIN = "https://ps-lite.local";
 
 export interface StartPersonalServerLiteRelayOptions extends Omit<
   PsLiteRelayClientOptions,
-  "runtime" | "onStatus"
+  "runtime" | "onStatus" | "sessionId"
 > {
+  sessionId?: string;
   onStatus?: PsLiteRelayClientOptions["onStatus"];
 }
 
@@ -51,6 +72,7 @@ export interface StartPersonalServerLiteOptions extends Omit<
   runtime?: PsLiteRuntime;
   localOrigin?: string;
   relay?: false | StartPersonalServerLiteRelayOptions;
+  relayStateStore?: PsLiteStateStore;
   gateway?: GatewayClient;
   onStatus?: (status: PersonalServerStatus) => void;
 }
@@ -60,8 +82,32 @@ export async function startPersonalServer(
 ): Promise<PersonalServerHandle> {
   const localOrigin = options.localOrigin ?? DEFAULT_LITE_ORIGIN;
   const relayOptions = options.relay || undefined;
-  const initialPublicUrl = relayOptions
-    ? psLiteRelayPublicUrl(relayOptions.sessionId, relayOptions.publicSuffix)
+  const relayStateStore = relayOptions
+    ? (options.relayStateStore ??
+      (options.runtime
+        ? undefined
+        : createIndexedDbPsLiteStateStore({
+            dbName: options.dbName ?? "personal-server-lite",
+            storeName: options.stateStoreName ?? "state",
+          })))
+    : undefined;
+  const savedRelayState = relayStateStore
+    ? await loadPsLiteRelayState(relayStateStore).catch(() => null)
+    : null;
+  const resolvedRelayOptions = relayOptions
+    ? {
+        ...relayOptions,
+        sessionId:
+          relayOptions.sessionId ??
+          savedRelaySessionId(savedRelayState, relayOptions) ??
+          randomSessionId(),
+      }
+    : undefined;
+  const initialPublicUrl = resolvedRelayOptions
+    ? psLiteRelayPublicUrl(
+        resolvedRelayOptions.sessionId,
+        resolvedRelayOptions.publicSuffix,
+      )
     : null;
   const runtimeOrigin = initialPublicUrl ?? localOrigin;
   const runtimeBundle: IndexedDbPsLiteRuntime | null = options.runtime
@@ -94,17 +140,17 @@ export async function startPersonalServer(
     options.onStatus?.(nextStatus);
   };
 
-  if (relayOptions) {
+  if (resolvedRelayOptions) {
     relayStatus = "connecting";
     publicUrl = initialPublicUrl;
     relayClient = startPsLiteRelayClient({
-      ...relayOptions,
+      ...resolvedRelayOptions,
       runtime,
       origin: runtimeOrigin,
       onStatus(nextRelayStatus) {
         relayStatus = nextRelayStatus;
         if (nextRelayStatus === "error") setStatus("error");
-        relayOptions.onStatus?.(nextRelayStatus);
+        resolvedRelayOptions.onStatus?.(nextRelayStatus);
       },
     });
   }
@@ -158,6 +204,9 @@ export async function startPersonalServer(
       gateway: gatewayClient,
       request,
       signature: submitOptions.signature,
+    }).then(async (result) => {
+      await rememberRegisteredRelay(request.candidate.serverUrl);
+      return result;
     });
   }
 
@@ -177,27 +226,150 @@ export async function startPersonalServer(
     const current = await info();
     const origin = requiredApiOrigin(current);
     const path = `/v1/data/${encodeURIComponent(scope)}`;
-    const encoded = new TextEncoder().encode(JSON.stringify(body));
-    const request = await createOwnerSignedPersonalServerRequest({
+    const request = await createOwnerRequest({
       origin,
       path,
       method: "POST",
-      body: encoded,
-      auth: authFromOptions(postOptions),
+      body,
+      authOptions: postOptions,
       headers: {
         "Content-Type": "application/json",
         ...postOptions.headers,
       },
     });
-    const response = await callFetch(request);
-    if (!response.ok) {
-      throw new Error(`Personal Server data write failed: ${response.status}`);
+    return parsePersonalServerJsonResponse(
+      await callFetch(request),
+      "data write",
+    );
+  }
+
+  async function listData(
+    listOptions: PersonalServerListDataOptions = {},
+  ): Promise<PersonalServerListDataResult> {
+    const current = await info();
+    const request = await createOwnerRequest({
+      origin: requiredApiOrigin(current),
+      path: dataListPath(listOptions),
+      method: "GET",
+      authOptions: listOptions,
+      headers: listOptions.headers,
+    });
+    return parsePersonalServerJsonResponse(
+      await callFetch(request),
+      "data list",
+    );
+  }
+
+  async function listVersions(
+    scope: string,
+    versionOptions: PersonalServerListVersionsOptions = {},
+  ): Promise<PersonalServerListVersionsResult> {
+    const current = await info();
+    const request = await createOwnerRequest({
+      origin: requiredApiOrigin(current),
+      path: dataVersionsPath(scope, versionOptions),
+      method: "GET",
+      authOptions: versionOptions,
+      headers: versionOptions.headers,
+    });
+    return parsePersonalServerJsonResponse(
+      await callFetch(request),
+      "data versions list",
+    );
+  }
+
+  async function readData(
+    scope: string,
+    readOptions: PersonalServerReadDataOptions = {},
+  ): Promise<DataFileEnvelope> {
+    const current = await info();
+    const request = await createOwnerRequest({
+      origin: requiredApiOrigin(current),
+      path: dataReadPath(scope, readOptions),
+      method: "GET",
+      authOptions: readOptions,
+      headers: readOptions.headers,
+    });
+    return parsePersonalServerJsonResponse(
+      await callFetch(request),
+      "data read",
+    );
+  }
+
+  async function syncStatus(
+    syncOptions: PersonalServerAuthRequestOptions = {},
+  ): Promise<SyncStatus> {
+    const current = await info();
+    const request = await createOwnerRequest({
+      origin: requiredApiOrigin(current),
+      path: "/v1/sync/status",
+      method: "GET",
+      authOptions: syncOptions,
+      headers: syncOptions.headers,
+    });
+    return parsePersonalServerJsonResponse(
+      await callFetch(request),
+      "sync status",
+    );
+  }
+
+  async function syncNow(
+    syncOptions: PersonalServerAuthRequestOptions = {},
+  ): Promise<PersonalServerSyncTriggerResult> {
+    const current = await info();
+    const request = await createOwnerRequest({
+      origin: requiredApiOrigin(current),
+      path: "/v1/sync/trigger",
+      method: "POST",
+      authOptions: syncOptions,
+      headers: syncOptions.headers,
+    });
+    return parsePersonalServerJsonResponse(
+      await callFetch(request),
+      "sync trigger",
+    );
+  }
+
+  async function rememberRegisteredRelay(serverUrl: string): Promise<void> {
+    if (!resolvedRelayOptions || !relayStateStore) return;
+    await savePsLiteRelayState(relayStateStore, {
+      sessionId: resolvedRelayOptions.sessionId,
+      controlUrl: resolvedRelayOptions.controlUrl,
+      publicSuffix: resolvedRelayOptions.publicSuffix,
+      publicUrl: serverUrl,
+    });
+  }
+
+  async function createOwnerRequest(params: {
+    origin: string;
+    path: string;
+    method: string;
+    body?: unknown;
+    authOptions:
+      | PersonalServerAuthRequestOptions
+      | PersonalServerPostDataOptions;
+    headers?: Record<string, string>;
+  }): Promise<Request> {
+    const encoded =
+      params.body === undefined
+        ? undefined
+        : new TextEncoder().encode(JSON.stringify(params.body));
+    const auth = authFromOptions(params.authOptions);
+    if (auth) {
+      return createOwnerSignedPersonalServerRequest({
+        origin: params.origin,
+        path: params.path,
+        method: params.method,
+        body: encoded,
+        auth,
+        headers: params.headers,
+      });
     }
-    return (await response.json()) as {
-      scope: string;
-      collectedAt: string;
-      status: string;
-    };
+    return new Request(`${params.origin}${params.path}`, {
+      method: params.method,
+      body: encoded,
+      headers: params.headers,
+    });
   }
 
   async function stop(): Promise<void> {
@@ -217,8 +389,42 @@ export async function startPersonalServer(
     submitRegistration,
     fetch: callFetch,
     postData,
+    listData,
+    listVersions,
+    readData,
+    syncStatus,
+    syncNow,
     stop,
   };
+}
+
+function savedRelaySessionId(
+  state: PsLiteRelayState | null,
+  options: StartPersonalServerLiteRelayOptions,
+): string | null {
+  if (!state?.sessionId) return null;
+  if (options.controlUrl && state.controlUrl !== options.controlUrl)
+    return null;
+  if (options.publicSuffix && state.publicSuffix !== options.publicSuffix) {
+    return null;
+  }
+  return state.sessionId;
+}
+
+function randomSessionId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(12));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
+    "",
+  );
+}
+
+function authFromOptions(
+  options: PersonalServerAuthRequestOptions | PersonalServerPostDataOptions,
+): PersonalServerOwnerAuth | undefined {
+  if ("auth" in options && options.auth) return options.auth;
+  if ("signMessage" in options) return { signMessage: options.signMessage };
+  if ("bearerToken" in options) return { bearerToken: options.bearerToken };
+  return undefined;
 }
 
 function requiredOwnerSignature(
@@ -255,11 +461,6 @@ function requiredApiOrigin(info: PersonalServerInfo): string {
     throw new Error("Personal Server API origin is required");
   }
   return info.urls.apiOrigin;
-}
-
-function authFromOptions(options: PersonalServerPostDataOptions) {
-  if ("signMessage" in options) return { signMessage: options.signMessage };
-  return { bearerToken: options.bearerToken } satisfies PersonalServerOwnerAuth;
 }
 
 function toRuntimeRequest(

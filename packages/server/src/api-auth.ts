@@ -107,6 +107,12 @@ export function createServerApiAuth(
       if (result.isPolicyBypass) {
         return { builder: result.auth.signer, grantId: "policy-bypass" };
       }
+      if (
+        result.mechanism === "web3-signed" &&
+        isOwner(result.auth.signer, deps.serverOwner)
+      ) {
+        return { builder: result.auth.signer, grantId: "owner" };
+      }
 
       const selectedEntry = deps.dataStorage?.findEntry({
         scope: input.scope,

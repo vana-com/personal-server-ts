@@ -1,5 +1,6 @@
 import {
   createBearerTokenPsLiteAuth,
+  PersonalServerClientError,
   startPersonalServer,
   type PersonalServerHandle,
   type PsLiteRelayStatus,
@@ -82,13 +83,6 @@ function liteConfigDefaults(bootstrap: PsLiteBootstrap) {
     server: { ...server, port: 443, origin: ORIGIN },
     sync: { ...sync, enabled: true, lastProcessedTimestamp: null },
   };
-}
-
-function randomSessionId(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(12));
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
-    "",
-  );
 }
 
 function authHeaders(mode: AuthMode): Record<string, string> {
@@ -197,7 +191,7 @@ async function makePersonalServer(
     relay === false
       ? false
       : {
-          sessionId: relay.sessionId || randomSessionId(),
+          ...(relay.sessionId ? { sessionId: relay.sessionId } : {}),
           controlUrl: relay.controlUrl || DEFAULT_CONTROL_URL,
           publicSuffix: relay.publicSuffix || DEFAULT_PUBLIC_SUFFIX,
           certIssuerUrl: relay.certIssuerUrl || undefined,
@@ -211,13 +205,6 @@ async function makePersonalServer(
             );
           },
         };
-  relayPublicUrl =
-    relayConfig === false
-      ? ""
-      : `https://${relayConfig.sessionId}.${relayConfig.publicSuffix.replace(
-          /^\./,
-          "",
-        )}`;
   relayStatus = relayConfig === false ? "closed" : "connecting";
   const ps = await startPersonalServer({
     dbName: "personal-server-lite-debug",
@@ -234,6 +221,7 @@ async function makePersonalServer(
     accessToken: CONTROL_PLANE_TOKEN,
     relay: relayConfig,
   });
+  relayPublicUrl = (await ps.info()).urls.public ?? "";
   activeRelayOptions = relay;
   return ps;
 }
@@ -256,6 +244,41 @@ async function parseResponse(response: Response): Promise<UiResult> {
     data = null;
   }
   return { status: response.status, ok: response.ok, data };
+}
+
+function uiResult(data: unknown, status = 200): UiResult {
+  return { status, ok: status >= 200 && status < 300, data };
+}
+
+function uiError(error: unknown): UiResult {
+  if (error instanceof PersonalServerClientError) {
+    return {
+      status: error.status,
+      ok: false,
+      data: error.body ?? {
+        error: {
+          code: error.status,
+          errorCode: error.errorCode,
+          message: error.message,
+          details: error.details,
+        },
+      },
+    };
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    status: 500,
+    ok: false,
+    data: { error: { code: 500, message } },
+  };
+}
+
+async function handleUiCall(call: () => Promise<unknown>): Promise<UiResult> {
+  try {
+    return uiResult(await call());
+  } catch (error) {
+    return uiError(error);
+  }
 }
 
 async function request(
@@ -456,12 +479,65 @@ async function deleteSmoke(): Promise<UiResult> {
   };
 }
 
+async function postData(scope: string, body: unknown): Promise<UiResult> {
+  const activeServer = await ensurePersonalServer();
+  return handleUiCall(() =>
+    activeServer.postData(scope, body, { bearerToken: OWNER_TOKEN }),
+  );
+}
+
+async function listData(options?: {
+  scopePrefix?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<UiResult> {
+  const activeServer = await ensurePersonalServer();
+  return handleUiCall(() =>
+    activeServer.listData({
+      ...options,
+      auth: { bearerToken: OWNER_TOKEN },
+    }),
+  );
+}
+
+async function listVersions(
+  scope: string,
+  options?: { limit?: number; offset?: number },
+): Promise<UiResult> {
+  const activeServer = await ensurePersonalServer();
+  return handleUiCall(() =>
+    activeServer.listVersions(scope, {
+      ...options,
+      auth: { bearerToken: OWNER_TOKEN },
+    }),
+  );
+}
+
+async function readData(
+  scope: string,
+  options?: { grantId?: string; fileId?: string; at?: string },
+): Promise<UiResult> {
+  const activeServer = await ensurePersonalServer();
+  return handleUiCall(() =>
+    activeServer.readData(scope, {
+      ...options,
+      auth: { bearerToken: OWNER_TOKEN },
+    }),
+  );
+}
+
 async function syncStatus(): Promise<UiResult> {
-  return request("/v1/sync/status", { auth: "owner" });
+  const activeServer = await ensurePersonalServer();
+  return handleUiCall(() =>
+    activeServer.syncStatus({ auth: { bearerToken: OWNER_TOKEN } }),
+  );
 }
 
 async function syncTrigger(): Promise<UiResult> {
-  return request("/v1/sync/trigger", { method: "POST", auth: "owner" });
+  const activeServer = await ensurePersonalServer();
+  return handleUiCall(() =>
+    activeServer.syncNow({ auth: { bearerToken: OWNER_TOKEN } }),
+  );
 }
 
 async function syncSmoke(): Promise<UiResult> {
@@ -570,6 +646,10 @@ const psLiteDebug = {
   deleteSmoke,
   disconnectRelay,
   gatewaySchemaSmoke,
+  listData,
+  listVersions,
+  postData,
+  readData,
   request,
   reset,
   status,

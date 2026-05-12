@@ -132,6 +132,29 @@ describe("SyncManager", () => {
     expect(downloadAll).toHaveBeenCalledTimes(1);
   });
 
+  it("skips sync cycles when runtime registration blocks sync", async () => {
+    const uploadDeps = makeMockUploadDeps();
+    const downloadDeps = makeMockDownloadDeps();
+    const manager = createSyncManager(uploadDeps, downloadDeps, {
+      canSync: () => ({
+        ok: false,
+        reason: "unregistered",
+        message: "Register this Personal Server before syncing.",
+      }),
+    });
+
+    await manager.trigger();
+
+    expect(uploadAll).not.toHaveBeenCalled();
+    expect(downloadAll).not.toHaveBeenCalled();
+    expect(manager.getStatus()).toMatchObject({
+      blocked: {
+        reason: "unregistered",
+        message: "Register this Personal Server before syncing.",
+      },
+    });
+  });
+
   it("notifyNewData() schedules a debounced sync cycle while running", async () => {
     const uploadDeps = makeMockUploadDeps();
     const downloadDeps = makeMockDownloadDeps();

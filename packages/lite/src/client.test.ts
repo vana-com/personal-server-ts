@@ -7,6 +7,7 @@ import {
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import {
   createMemoryPsLiteAccessLogStore,
+  createMemoryPsLiteStateStore,
   createMemoryPsLiteStorage,
   createMemoryPsLiteTokenStore,
 } from "./test-support/memory.js";
@@ -146,6 +147,42 @@ describe("startPersonalServer lite handle", () => {
     });
   });
 
+  it("exposes typed data and sync helpers through the public handle", async () => {
+    const gateway = createGateway();
+    const ps = await startPersonalServer({
+      runtime: createRuntime(gateway),
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const auth = { signMessage: ownerWallet.signMessage };
+
+    await ps.postData("instagram.profile", { username: "vana_debug" }, auth);
+
+    await expect(ps.listData({ auth, limit: 10 })).resolves.toMatchObject({
+      scopes: [{ scope: "instagram.profile" }],
+    });
+    await expect(
+      ps.listVersions("instagram.profile", { auth, limit: 1 }),
+    ).resolves.toMatchObject({
+      scope: "instagram.profile",
+      versions: [{ fileId: null }],
+    });
+    await expect(
+      ps.readData("instagram.profile", { auth }),
+    ).resolves.toMatchObject({
+      scope: "instagram.profile",
+      data: { username: "vana_debug" },
+    });
+    await expect(ps.syncStatus({ auth })).resolves.toMatchObject({
+      enabled: false,
+      running: false,
+    });
+    await expect(ps.syncNow({ auth })).resolves.toMatchObject({
+      status: "disabled",
+    });
+  });
+
   it("preserves Request method and body when fetch applies init overrides", async () => {
     const gateway = createGateway();
     const ps = await startPersonalServer({
@@ -222,6 +259,51 @@ describe("startPersonalServer lite handle", () => {
     });
 
     await ps.stop();
+  });
+
+  it("reuses the saved relay session after registration", async () => {
+    const relayStateStore = createMemoryPsLiteStateStore();
+    const webSocketFactory = vi.fn((_url: string) => ({
+      binaryType: "arraybuffer",
+      readyState: 1,
+      OPEN: 1,
+      CONNECTING: 0,
+      onopen: null,
+      onmessage: null,
+      onclose: null,
+      onerror: null,
+      send: vi.fn(),
+      close: vi.fn(),
+    }));
+    const first = await startPersonalServer({
+      runtime: createRuntime(createGateway()),
+      relayStateStore,
+      relay: {
+        publicSuffix: "relay.example",
+        webSocketFactory,
+      },
+      localOrigin: ORIGIN,
+      gateway: createGateway(),
+    });
+    const firstInfo = await first.info();
+    await first.submitRegistration({ signature: "0xregistration" });
+    await first.stop();
+
+    const second = await startPersonalServer({
+      runtime: createRuntime(createGateway()),
+      relayStateStore,
+      relay: {
+        publicSuffix: "relay.example",
+        webSocketFactory,
+      },
+      localOrigin: ORIGIN,
+      gateway: createGateway(),
+    });
+
+    await expect(second.info()).resolves.toMatchObject({
+      urls: { public: firstInfo.urls.public },
+    });
+    await second.stop();
   });
 
   it("stops the owned sync manager when stopping an IndexedDB-backed handle", async () => {

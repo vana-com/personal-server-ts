@@ -78,6 +78,7 @@ const DEFAULT_ACCESS_LOG_STORE = "accessLogs";
 const STATE_DB_VERSION = 2;
 const CONFIG_KEY = "config-v1";
 const SERVER_IDENTITY_KEY = "server-identity-v1";
+const RELAY_KEY = "relay-v1";
 const ACCESS_LOG_TIMESTAMP_INDEX = "timestamp";
 
 interface PsLiteTokenRecord {
@@ -461,6 +462,26 @@ export async function savePsLiteConfig(
   const config = ServerConfigSchema.parse(value);
   await store.set(CONFIG_KEY, config);
   return config;
+}
+
+export async function loadPsLiteRelayState(
+  store: PsLiteStateStore,
+): Promise<PsLiteRelayState | null> {
+  const state = await store.get<PsLiteRelayState>(RELAY_KEY);
+  if (!state?.sessionId || !state.updatedAt) return null;
+  return state;
+}
+
+export async function savePsLiteRelayState(
+  store: PsLiteStateStore,
+  value: Omit<PsLiteRelayState, "updatedAt"> & { updatedAt?: string },
+): Promise<PsLiteRelayState> {
+  const state: PsLiteRelayState = {
+    ...value,
+    updatedAt: value.updatedAt ?? new Date().toISOString(),
+  };
+  await store.set(RELAY_KEY, state);
+  return state;
 }
 
 export async function loadOrCreatePsLiteServerIdentity(params: {

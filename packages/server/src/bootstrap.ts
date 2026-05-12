@@ -276,7 +276,29 @@ export async function createServer(
       logger,
     };
 
-    syncManager = createSyncManager(uploadDeps, downloadDeps);
+    syncManager = createSyncManager(uploadDeps, downloadDeps, {
+      async canSync() {
+        try {
+          const serverInfo = await gatewayClient.getServer(
+            serverAccount.address,
+          );
+          identity!.serverId = serverInfo?.id ?? null;
+          if (serverInfo?.id) return { ok: true };
+          return {
+            ok: false,
+            reason: "unregistered",
+            message: "Register this Personal Server before syncing.",
+          };
+        } catch (err) {
+          logger.warn({ err }, "Could not verify server registration for sync");
+          return {
+            ok: false,
+            reason: "registration_check_failed",
+            message: "Could not verify server registration before syncing.",
+          };
+        }
+      },
+    });
     syncManager.start();
     logger.info("Sync engine started");
   } else if (config.sync.enabled) {
