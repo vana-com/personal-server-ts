@@ -109,7 +109,7 @@
     "build": "tsc --build"
   },
   "dependencies": {
-    "@opendatalabs/vana-sdk": "^3.0.1",
+    "@opendatalabs/vana-sdk": "3.0.1-canary.b068ac6",
     "viem": "^2.48.11",
     "zod": "^4.4.3"
   }
