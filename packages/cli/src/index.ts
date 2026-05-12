@@ -11,7 +11,11 @@ export {
 } from "@opendatalabs/personal-server-ts-core/client";
 export type {
   PersonalServerAuthRequestOptions,
+  PersonalServerClientErrorBody,
+  PersonalServerDataVersion,
   PersonalServerHandle,
+  PersonalServerHealthRegistration,
+  PersonalServerIdentity,
   PersonalServerInfo,
   PersonalServerKind,
   PersonalServerListDataOptions,
@@ -28,4 +32,6 @@ export type {
   PersonalServerStatus,
   PersonalServerSubmitRegistrationOptions,
   PersonalServerSyncTriggerResult,
+  PersonalServerUrls,
 } from "@opendatalabs/personal-server-ts-core/client";
+export type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";

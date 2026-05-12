@@ -9,6 +9,10 @@ export {
 } from "./client.js";
 export type {
   PersonalServerHandle,
+  PersonalServerClientErrorBody,
+  PersonalServerDataVersion,
+  PersonalServerHealthRegistration,
+  PersonalServerIdentity,
   PersonalServerInfo,
   PersonalServerAuthRequestOptions,
   PersonalServerListDataOptions,
@@ -19,6 +23,7 @@ export type {
   PersonalServerRegistrationRequest,
   PersonalServerStatus,
   PersonalServerSyncTriggerResult,
+  PersonalServerUrls,
 } from "@opendatalabs/personal-server-ts-core/client";
 export {
   PersonalServerClientError,
