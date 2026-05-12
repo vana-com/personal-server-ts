@@ -343,6 +343,11 @@ describe("createPsLiteRuntime", () => {
         headers: { Authorization: "Bearer builder-token" },
       }),
     );
+    const ownerScopes = await runtime.fetch(
+      new Request("https://ps.local/v1/data", {
+        headers: { Authorization: "Bearer owner-token" },
+      }),
+    );
     const versions = await runtime.fetch(
       new Request("https://ps.local/v1/data/instagram.profile/versions", {
         headers: { Authorization: "Bearer builder-token" },
@@ -358,6 +363,11 @@ describe("createPsLiteRuntime", () => {
           versionCount: 1,
         },
       ],
+      total: 1,
+    });
+    expect(ownerScopes.status).toBe(200);
+    await expect(ownerScopes.json()).resolves.toMatchObject({
+      scopes: [{ scope: "instagram.profile" }],
       total: 1,
     });
 

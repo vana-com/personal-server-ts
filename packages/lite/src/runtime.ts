@@ -215,6 +215,7 @@ export function createBearerTokenPsLiteAuth(
       assertBearerToken(request, options.ownerToken, true);
     },
     async authorizeBuilderList(request) {
+      if (parseBearerToken(request) === options.ownerToken) return;
       assertBearerToken(request, options.builderToken);
     },
     async authorizeBuilderRead(input) {

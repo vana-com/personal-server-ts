@@ -55,6 +55,7 @@ type DebugRequest = (
 ) => Promise<UiResult>;
 
 let personalServer: PersonalServerHandle | undefined;
+let personalServerStart: Promise<PersonalServerHandle> | undefined;
 let storageMode: StorageMode = "indexeddb";
 let relayStatus: PsLiteRelayStatus = "closed";
 let relayPublicUrl = "";
@@ -227,8 +228,29 @@ async function makePersonalServer(
 }
 
 async function ensurePersonalServer(): Promise<PersonalServerHandle> {
-  personalServer ??= await makePersonalServer(storageMode);
-  return personalServer;
+  if (personalServer) return personalServer;
+  if (!personalServerStart) {
+    const start = makePersonalServer(storageMode)
+      .then((ps) => {
+        personalServer = ps;
+        return ps;
+      })
+      .finally(() => {
+        if (personalServerStart === start) {
+          personalServerStart = undefined;
+        }
+      });
+    personalServerStart = start;
+  }
+  return personalServerStart;
+}
+
+async function stopPersonalServer(): Promise<void> {
+  const active =
+    personalServer ?? (await personalServerStart?.catch(() => undefined));
+  personalServer = undefined;
+  personalServerStart = undefined;
+  await active?.stop();
 }
 
 async function parseResponse(response: Response): Promise<UiResult> {
@@ -313,8 +335,8 @@ async function requestWithServer(
 
 async function reset(nextStorageMode = storageMode): Promise<UiResult> {
   storageMode = nextStorageMode;
-  await personalServer?.stop();
-  personalServer = await makePersonalServer(storageMode);
+  await stopPersonalServer();
+  personalServer = await ensurePersonalServer();
   return status();
 }
 
@@ -358,15 +380,12 @@ function stoppedStatus(): UiResult {
 }
 
 async function activate(): Promise<UiResult> {
-  if (!personalServer) {
-    personalServer = await makePersonalServer(storageMode);
-  }
+  await ensurePersonalServer();
   return status();
 }
 
 async function deactivate(): Promise<UiResult> {
-  await personalServer?.stop();
-  personalServer = undefined;
+  await stopPersonalServer();
   relayStatus = "closed";
   return stoppedStatus();
 }
@@ -626,13 +645,13 @@ async function authRoutesSmoke(): Promise<UiResult> {
 }
 
 async function connectRelay(options: RelayOptions = {}): Promise<UiResult> {
-  await personalServer?.stop();
+  await stopPersonalServer();
   personalServer = await makePersonalServer(storageMode, options);
   return status();
 }
 
 async function disconnectRelay(): Promise<UiResult> {
-  await personalServer?.stop();
+  await stopPersonalServer();
   personalServer = await makePersonalServer(storageMode, false);
   return status();
 }
