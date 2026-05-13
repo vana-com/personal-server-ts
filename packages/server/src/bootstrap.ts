@@ -445,7 +445,15 @@ export async function createServer(
             },
             frpcBinaryPath,
           );
-          logger.info({ tunnelUrl: url }, "Tunnel established");
+          const tunnelStatus = tunnelManager.getStatus();
+          if (tunnelStatus.status === "connected") {
+            logger.info({ tunnelUrl: url }, "Tunnel established");
+          } else {
+            logger.warn(
+              { tunnelUrl: url, warning: tunnelStatus.warning },
+              "Tunnel URL reserved; waiting for tunnel connection",
+            );
+          }
           context.tunnelUrl = url;
           effectiveOrigin = url;
 

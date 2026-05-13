@@ -240,15 +240,12 @@ export class TunnelManager {
 
       let startupOutput = "";
       let resolved = false;
-      const failStartup = (message: string) => {
-        if (resolved) return;
-        resolved = true;
-        this.status = "error";
-        this.lastError =
-          message.replace(/\x1b\[[0-9;]*m/g, "").trim() ||
-          "Failed to start frpc";
-        proc.kill("SIGTERM");
-        reject(new Error(this.lastError));
+      const cleanMessage = (message: string): string =>
+        message.replace(/\x1b\[[0-9;]*m/g, "").trim();
+
+      const markRetrying = (message: string) => {
+        const warning = cleanMessage(message);
+        this.routeWarning = warning || "Waiting for tunnel connection";
       };
 
       const onData = (data: Buffer) => {
@@ -259,15 +256,21 @@ export class TunnelManager {
           text.includes("start error:") ||
           text.includes("connect to server error:")
         ) {
-          failStartup(startupOutput);
+          markRetrying(startupOutput);
+          if (!resolved) {
+            resolved = true;
+            resolve();
+          }
           return;
         }
 
         if (text.includes("start proxy success")) {
+          this.status = "connected";
+          this.connectedSince ??= new Date();
+          this.routable = undefined;
+          this.routeWarning = null;
           if (!resolved) {
             resolved = true;
-            this.status = "connected";
-            this.connectedSince = new Date();
             resolve();
           }
         }
@@ -296,13 +299,22 @@ export class TunnelManager {
           reject(new Error(this.lastError));
         } else if (this.status === "connected") {
           this.status = "disconnected";
+        } else if (code !== 0) {
+          this.status = "error";
+          this.lastError = `frpc exited with code ${code}: ${startupOutput}`;
+        } else {
+          this.status = "disconnected";
         }
       });
 
-      // Timeout for startup — resolve optimistically
+      // Timeout for startup — resolve optimistically. frpc is generated with
+      // loginFailExit=false, so auth/registration/network failures can recover
+      // after the server is registered or connectivity returns.
       setTimeout(() => {
         if (!resolved) {
-          failStartup(startupOutput || "Timed out waiting for proxy startup");
+          resolved = true;
+          markRetrying(startupOutput || "Waiting for proxy startup");
+          resolve();
         }
       }, 10_000);
     });
