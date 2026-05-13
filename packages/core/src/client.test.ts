@@ -152,6 +152,37 @@ describe("Personal Server client helpers", () => {
     });
   });
 
+  it("returns alreadyRegistered for an active existing server with the same URL", async () => {
+    const request = createPersonalServerRegistrationRequest({
+      gatewayConfig,
+      ownerAddress: "0x1111111111111111111111111111111111111111",
+      serverAddress: "0x2222222222222222222222222222222222222222",
+      publicKey: "0x04public",
+      serverUrl: "https://session.relay.example",
+    });
+    const gateway = {
+      getServer: vi.fn().mockResolvedValue({
+        id: "server-1",
+        ownerAddress: request.candidate.ownerAddress,
+        serverAddress: request.candidate.serverAddress,
+        publicKey: request.candidate.publicKey,
+        serverUrl: request.candidate.serverUrl,
+        addedAt: "2026-05-08T00:00:00.000Z",
+        revokedAt: null,
+      }),
+      registerServer: vi.fn(),
+    };
+
+    await expect(
+      submitPersonalServerRegistration({
+        gateway: gateway as Pick<GatewayClient, "getServer" | "registerServer">,
+        request,
+        signature: "0xsig",
+      }),
+    ).resolves.toEqual({ alreadyRegistered: true, serverId: "server-1" });
+    expect(gateway.registerServer).not.toHaveBeenCalled();
+  });
+
   it("rejects an existing server registration with a different URL", async () => {
     const request = createPersonalServerRegistrationRequest({
       gatewayConfig,
@@ -168,6 +199,7 @@ describe("Personal Server client helpers", () => {
         publicKey: request.candidate.publicKey,
         serverUrl: "https://old-session.relay.example",
         addedAt: "2026-05-08T00:00:00.000Z",
+        revokedAt: null,
       }),
       registerServer: vi.fn(),
     };
@@ -183,6 +215,43 @@ describe("Personal Server client helpers", () => {
       errorCode: "SERVER_URL_MISMATCH",
     });
     expect(gateway.registerServer).not.toHaveBeenCalled();
+  });
+
+  it("re-registers a revoked existing server with a different URL", async () => {
+    const request = createPersonalServerRegistrationRequest({
+      gatewayConfig,
+      ownerAddress: "0x1111111111111111111111111111111111111111",
+      serverAddress: "0x2222222222222222222222222222222222222222",
+      publicKey: "0x04public",
+      serverUrl: "https://new-session.relay.example",
+    });
+    const gateway = {
+      getServer: vi.fn().mockResolvedValue({
+        id: "server-1",
+        ownerAddress: request.candidate.ownerAddress,
+        serverAddress: request.candidate.serverAddress,
+        publicKey: request.candidate.publicKey,
+        serverUrl: "https://old-session.relay.example",
+        addedAt: "2026-05-08T00:00:00.000Z",
+        revokedAt: "2026-05-13T00:00:00.000Z",
+      }),
+      registerServer: vi.fn().mockResolvedValue({
+        alreadyRegistered: false,
+        serverId: "server-2",
+      }),
+    };
+
+    await expect(
+      submitPersonalServerRegistration({
+        gateway: gateway as Pick<GatewayClient, "getServer" | "registerServer">,
+        request,
+        signature: "0xsig",
+      }),
+    ).resolves.toEqual({ alreadyRegistered: false, serverId: "server-2" });
+    expect(gateway.registerServer).toHaveBeenCalledWith({
+      ...request.candidate,
+      signature: "0xsig",
+    });
   });
 
   it("creates owner-authenticated Web3Signed requests", async () => {

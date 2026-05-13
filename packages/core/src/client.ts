@@ -383,7 +383,7 @@ export async function submitPersonalServerRegistration(params: {
   const existing = await params.gateway.getServer(
     params.request.candidate.serverAddress,
   );
-  if (existing?.id) {
+  if (existing?.id && !serverInfoRevoked(existing)) {
     assertRegistrationMatches(existing, params.request.candidate);
     return { alreadyRegistered: true, serverId: existing.id };
   }
@@ -498,6 +498,12 @@ function assertRegistrationMatches(
       candidateUrl: candidate.serverUrl,
     },
   });
+}
+
+function serverInfoRevoked(existing: ServerInfo): boolean {
+  const revokedAt = (existing as ServerInfo & { revokedAt?: unknown })
+    .revokedAt;
+  return revokedAt !== undefined && revokedAt !== null;
 }
 
 function toHealthBody(value: unknown): PersonalServerHealthBody {
