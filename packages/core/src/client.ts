@@ -3,6 +3,7 @@ import {
   type DataFileEnvelope,
   type DataPortabilityGatewayConfig,
   type GatewayClient,
+  type GrantListItem,
   type ServerInfo,
   type RegisterServerParams,
   type RegisterServerResult,
@@ -142,6 +143,26 @@ export interface PersonalServerAuthRequestOptions {
   headers?: Record<string, string>;
 }
 
+export interface PersonalServerCreateGrantOptions extends PersonalServerAuthRequestOptions {
+  granteeAddress: `0x${string}`;
+  scopes: string[];
+  expiresAt?: number;
+  nonce?: number;
+}
+
+export interface PersonalServerCreateGrantResult {
+  grantId?: string;
+}
+
+export interface PersonalServerListGrantsResult {
+  grants: GrantListItem[];
+}
+
+export interface PersonalServerRevokeGrantResult {
+  status: "revoked";
+  grantId: string;
+}
+
 export interface PersonalServerHandle {
   readonly kind: PersonalServerKind;
   ready(options?: PersonalServerReadyOptions): Promise<PersonalServerInfo>;
@@ -169,6 +190,16 @@ export interface PersonalServerHandle {
     scope: string,
     options?: PersonalServerReadDataOptions,
   ): Promise<DataFileEnvelope>;
+  createGrant(
+    options: PersonalServerCreateGrantOptions,
+  ): Promise<PersonalServerCreateGrantResult>;
+  listGrants(
+    options?: PersonalServerAuthRequestOptions,
+  ): Promise<PersonalServerListGrantsResult>;
+  revokeGrant(
+    grantId: string,
+    options?: PersonalServerAuthRequestOptions,
+  ): Promise<PersonalServerRevokeGrantResult>;
   syncStatus(options?: PersonalServerAuthRequestOptions): Promise<SyncStatus>;
   syncNow(
     options?: PersonalServerAuthRequestOptions,
@@ -408,6 +439,10 @@ export function dataReadPath(
   if (options.at) params.set("at", options.at);
   const query = params.toString();
   return `/v1/data/${encodeURIComponent(scope)}${query ? `?${query}` : ""}`;
+}
+
+export function grantRevokePath(grantId: string): string {
+  return `/v1/grants/${encodeURIComponent(grantId)}`;
 }
 
 export async function parsePersonalServerJsonResponse<T>(

@@ -26,6 +26,7 @@ import {
   createGrantContract,
   listGrantsContract,
   oauthTokenContract,
+  revokeGrantContract,
   type ContractResult,
   type DataContractError,
   type OAuthDeviceSessionLookup,
@@ -98,11 +99,12 @@ export interface PersonalServerGrantsApiDeps {
   auth: Pick<PersonalServerApiAuthPort, "authorizeOwner">;
   gateway?: Pick<
     GatewayClient,
-    "getBuilder" | "createGrant" | "listGrantsByUser"
+    "getBuilder" | "createGrant" | "listGrantsByUser" | "revokeGrant"
   >;
   gatewayConfig?: DataPortabilityGatewayConfig;
   serverOwner?: `0x${string}`;
-  serverSigner?: Pick<ServerSigner, "signGrantRegistration">;
+  serverSigner?: Pick<ServerSigner, "signGrantRegistration"> &
+    Partial<Pick<ServerSigner, "signGrantRevocation">>;
   now?: () => Date;
 }
 
@@ -521,6 +523,26 @@ export async function handlePersonalServerGrantsRequest(
           body: parsed.body,
           gatewayConfig: deps.gatewayConfig,
         } satisfies VerifyGrantContractInput),
+      );
+    }
+
+    if (pathname.startsWith("/")) {
+      if (request.method !== "DELETE") return methodNotAllowed();
+      await deps.auth.authorizeOwner(request);
+      if (!deps.gateway) {
+        return errorResponse(
+          500,
+          "SERVER_NOT_CONFIGURED",
+          "Gateway is not configured",
+        );
+      }
+      return contractResponse(
+        await revokeGrantContract({
+          gateway: deps.gateway,
+          serverOwner: deps.serverOwner,
+          serverSigner: deps.serverSigner,
+          grantId: decodeURIComponent(pathname.slice(1)),
+        }),
       );
     }
 

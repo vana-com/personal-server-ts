@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { createServer as createNetServer } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
+import type { Builder, GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import {
   buildWeb3SignedHeader,
@@ -185,6 +185,59 @@ describe("startPersonalServer node handle", () => {
     await expect(ps.syncNow({ auth })).resolves.toMatchObject({
       status: "disabled",
     });
+  });
+
+  it("exposes grant helpers through the public handle", async () => {
+    const builderAddress = createTestWallet(9).address;
+    const grantId =
+      "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    const gateway = createGateway({
+      getBuilder: vi.fn().mockResolvedValue({
+        id: `0x${"bb".repeat(32)}`,
+        ownerAddress: "0xOwner",
+        granteeAddress: builderAddress,
+        publicKey: "0x04key",
+        appUrl: "https://app.example.com",
+        addedAt: "2026-01-21T10:00:00.000Z",
+      } satisfies Builder),
+      createGrant: vi.fn().mockResolvedValue({ grantId }),
+      listGrantsByUser: vi.fn().mockResolvedValue([
+        {
+          id: grantId,
+          grantorAddress: ownerWallet.address,
+          granteeId: `0x${"bb".repeat(32)}`,
+          grant: "{}",
+          fileIds: [],
+          status: "confirmed",
+          addedAt: "2026-01-21T10:00:00.000Z",
+          revokedAt: null,
+          revocationSignature: null,
+        },
+      ]),
+    });
+    const { ps } = await startTestServer(gateway);
+    const auth = { signMessage: ownerWallet.signMessage };
+
+    await expect(
+      ps.createGrant({
+        auth,
+        granteeAddress: builderAddress,
+        scopes: ["instagram.*"],
+      }),
+    ).resolves.toEqual({ grantId });
+    await expect(ps.listGrants({ auth })).resolves.toMatchObject({
+      grants: [{ id: grantId }],
+    });
+    await expect(ps.revokeGrant(grantId, { auth })).resolves.toEqual({
+      status: "revoked",
+      grantId,
+    });
+    expect(gateway.revokeGrant).toHaveBeenCalledWith(
+      expect.objectContaining({
+        grantorAddress: ownerWallet.address,
+        grantId,
+      }),
+    );
   });
 
   it("preserves Request method and body when fetch applies init overrides", async () => {

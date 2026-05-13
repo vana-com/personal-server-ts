@@ -8,14 +8,18 @@ import {
   dataListPath,
   dataReadPath,
   dataVersionsPath,
+  grantRevokePath,
   parsePersonalServerJsonResponse,
   requestPath,
   submitPersonalServerRegistration,
   type PersonalServerAuthRequestOptions,
+  type PersonalServerCreateGrantOptions,
+  type PersonalServerCreateGrantResult,
   type PersonalServerHandle,
   type PersonalServerInfo,
   type PersonalServerListDataOptions,
   type PersonalServerListDataResult,
+  type PersonalServerListGrantsResult,
   type PersonalServerListVersionsOptions,
   type PersonalServerListVersionsResult,
   type PersonalServerOwnerAuth,
@@ -23,6 +27,7 @@ import {
   type PersonalServerPrepareRegistrationOptions,
   type PersonalServerReadDataOptions,
   type PersonalServerReadyOptions,
+  type PersonalServerRevokeGrantResult,
   type PersonalServerRegistrationRequest,
   type PersonalServerStatus,
   type PersonalServerSubmitRegistrationOptions,
@@ -264,6 +269,65 @@ export async function startPersonalServer(
     );
   }
 
+  async function createGrant(
+    grantOptions: PersonalServerCreateGrantOptions,
+  ): Promise<PersonalServerCreateGrantResult> {
+    const request = await createOwnerRequest({
+      path: "/v1/grants",
+      method: "POST",
+      body: {
+        granteeAddress: grantOptions.granteeAddress,
+        scopes: grantOptions.scopes,
+        ...(grantOptions.expiresAt === undefined
+          ? {}
+          : { expiresAt: grantOptions.expiresAt }),
+        ...(grantOptions.nonce === undefined
+          ? {}
+          : { nonce: grantOptions.nonce }),
+      },
+      authOptions: grantOptions,
+      headers: {
+        "Content-Type": "application/json",
+        ...grantOptions.headers,
+      },
+    });
+    return parsePersonalServerJsonResponse(
+      await callFetch(request),
+      "grant create",
+    );
+  }
+
+  async function listGrants(
+    grantOptions: PersonalServerAuthRequestOptions = {},
+  ): Promise<PersonalServerListGrantsResult> {
+    const request = await createOwnerRequest({
+      path: "/v1/grants",
+      method: "GET",
+      authOptions: grantOptions,
+      headers: grantOptions.headers,
+    });
+    return parsePersonalServerJsonResponse(
+      await callFetch(request),
+      "grant list",
+    );
+  }
+
+  async function revokeGrant(
+    grantId: string,
+    grantOptions: PersonalServerAuthRequestOptions = {},
+  ): Promise<PersonalServerRevokeGrantResult> {
+    const request = await createOwnerRequest({
+      path: grantRevokePath(grantId),
+      method: "DELETE",
+      authOptions: grantOptions,
+      headers: grantOptions.headers,
+    });
+    return parsePersonalServerJsonResponse(
+      await callFetch(request),
+      "grant revoke",
+    );
+  }
+
   async function syncNow(
     syncOptions: PersonalServerAuthRequestOptions = {},
   ): Promise<PersonalServerSyncTriggerResult> {
@@ -338,6 +402,9 @@ export async function startPersonalServer(
     listData,
     listVersions,
     readData,
+    createGrant,
+    listGrants,
+    revokeGrant,
     syncStatus,
     syncNow,
     stop,

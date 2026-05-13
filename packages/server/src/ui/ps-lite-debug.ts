@@ -44,6 +44,13 @@ interface UiResult {
   data: unknown;
 }
 
+interface CreateGrantInput {
+  granteeAddress: `0x${string}`;
+  scopes: string[];
+  expiresAt?: number;
+  nonce?: number;
+}
+
 interface PsLiteBootstrap {
   ownerSignature: `0x${string}`;
   config?: Record<string, unknown>;
@@ -559,6 +566,30 @@ async function syncTrigger(): Promise<UiResult> {
   );
 }
 
+async function createGrant(input: CreateGrantInput): Promise<UiResult> {
+  const activeServer = await ensurePersonalServer();
+  return handleUiCall(() =>
+    activeServer.createGrant({
+      ...input,
+      auth: { bearerToken: OWNER_TOKEN },
+    }),
+  );
+}
+
+async function listGrants(): Promise<UiResult> {
+  const activeServer = await ensurePersonalServer();
+  return handleUiCall(() =>
+    activeServer.listGrants({ auth: { bearerToken: OWNER_TOKEN } }),
+  );
+}
+
+async function revokeGrant(grantId: string): Promise<UiResult> {
+  const activeServer = await ensurePersonalServer();
+  return handleUiCall(() =>
+    activeServer.revokeGrant(grantId, { auth: { bearerToken: OWNER_TOKEN } }),
+  );
+}
+
 async function syncSmoke(): Promise<UiResult> {
   const write = await request(`/v1/data/${SAMPLE_SCOPE}`, {
     method: "POST",
@@ -661,16 +692,19 @@ const psLiteDebug = {
   authRoutesSmoke,
   authSmoke,
   connectRelay,
+  createGrant,
   deactivate,
   deleteSmoke,
   disconnectRelay,
   gatewaySchemaSmoke,
   listData,
+  listGrants,
   listVersions,
   postData,
   readData,
   request,
   reset,
+  revokeGrant,
   status,
   storageSmoke,
   syncSmoke,

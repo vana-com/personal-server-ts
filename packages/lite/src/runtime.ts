@@ -82,7 +82,8 @@ export interface PsLiteRuntimeOptions {
   serverSigner?: Pick<
     ServerSigner,
     "signFileRegistration" | "signGrantRegistration"
-  >;
+  > &
+    Partial<Pick<ServerSigner, "signGrantRevocation">>;
   syncManager?:
     | (Pick<SyncManager, "trigger" | "getStatus"> &
         Partial<Pick<SyncManager, "start" | "stop">>)
@@ -692,7 +693,7 @@ export function createPsLiteRuntime(
         if (
           url.pathname === grantsPrefix ||
           url.pathname === `${grantsPrefix}/` ||
-          url.pathname === `${grantsPrefix}/verify`
+          url.pathname.startsWith(`${grantsPrefix}/`)
         ) {
           return handlePersonalServerGrantsRequest(
             request,

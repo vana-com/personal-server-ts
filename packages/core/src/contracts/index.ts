@@ -25,6 +25,7 @@ export { listAccessLogsContract } from "./access-logs.js";
 export {
   createGrantContract,
   listGrantsContract,
+  revokeGrantContract,
   verifyGrantContract,
 } from "./grants.js";
 export {
@@ -74,6 +75,7 @@ export type {
   CreateGrantRequestBody,
   CreateGrantContractInput,
   ListGrantsContractInput,
+  RevokeGrantContractInput,
 } from "./grants.js";
 export type {
   OAuthDeviceSession,

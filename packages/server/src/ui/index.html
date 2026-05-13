@@ -802,6 +802,30 @@
           : api(path, opts);
       }
 
+      async function runtimeListGrants() {
+        return runtimeState.active === "browser"
+          ? psLiteClient().listGrants()
+          : api("/v1/grants", { auth: "owner" });
+      }
+
+      async function runtimeCreateGrant(body) {
+        return runtimeState.active === "browser"
+          ? psLiteClient().createGrant(body)
+          : api("/v1/grants", {
+              method: "POST",
+              auth: "owner",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(body),
+            });
+      }
+
+      async function runtimeRevokeGrant(grantId) {
+        var path = "/v1/grants/" + encodeURIComponent(grantId);
+        return runtimeState.active === "browser"
+          ? psLiteClient().revokeGrant(grantId)
+          : api(path, { method: "DELETE", auth: "owner" });
+      }
+
       function runtimeName() {
         return runtimeState.active === "browser" ? "Browser" : "Node";
       }
@@ -1548,7 +1572,7 @@
         showLoading(container);
 
         try {
-          var result = await runtimeApi("/v1/grants", { auth: "owner" });
+          var result = await runtimeListGrants();
           if (!result.ok) {
             showJson(container, result.data);
             return;
@@ -1566,6 +1590,7 @@
             createEl("th", null, "Grantee"),
             createEl("th", null, "Status"),
             createEl("th", null, "Created"),
+            createEl("th", null, "Actions"),
           ]);
           thead.appendChild(headRow);
           table.appendChild(thead);
@@ -1587,10 +1612,32 @@
             td3.appendChild(statusSpan);
             var td4 = createEl("td");
             td4.textContent = g.createdAt || "\u2014";
+            var td5 = createEl("td");
+            if (status === "active") {
+              var revokeBtn = createEl("button", { class: "btn" }, "Revoke");
+              revokeBtn.addEventListener(
+                "click",
+                (function (grantId) {
+                  return async function () {
+                    revokeBtn.disabled = true;
+                    var revokeResult = await runtimeRevokeGrant(grantId);
+                    if (!revokeResult.ok) {
+                      showJson(container, revokeResult.data);
+                      return;
+                    }
+                    await loadGrants();
+                  };
+                })(String(g.id)),
+              );
+              td5.appendChild(revokeBtn);
+            } else {
+              td5.textContent = "\u2014";
+            }
             tr.appendChild(td1);
             tr.appendChild(td2);
             tr.appendChild(td3);
             tr.appendChild(td4);
+            tr.appendChild(td5);
             tbody.appendChild(tr);
           }
           table.appendChild(tbody);
@@ -1774,6 +1821,19 @@
           (opts.method || "GET").toUpperCase() === "POST"
         ) {
           return client.syncTrigger();
+        }
+        if (url.pathname === "/v1/grants") {
+          var grantMethod = (opts.method || "GET").toUpperCase();
+          if (grantMethod === "GET") return client.listGrants();
+          if (grantMethod === "POST") return client.createGrant(body);
+        }
+        if (url.pathname.startsWith("/v1/grants/")) {
+          var revokeMethod = (opts.method || "GET").toUpperCase();
+          if (revokeMethod === "DELETE") {
+            return client.revokeGrant(
+              decodeURIComponent(url.pathname.slice("/v1/grants/".length)),
+            );
+          }
         }
         return psLiteClient().request(path, {
           method: opts.method || "GET",
@@ -1976,15 +2036,9 @@
             "";
           connectLog("Owner address: " + connectState.userAddress);
 
-          // Create grant via POST /v1/grants
-          var grantResult = await runtimeApi("/v1/grants", {
-            method: "POST",
-            auth: "owner",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              granteeAddress: connectState.granteeAddress,
-              scopes: connectState.scopes,
-            }),
+          var grantResult = await runtimeCreateGrant({
+            granteeAddress: connectState.granteeAddress,
+            scopes: connectState.scopes,
           });
 
           if (!grantResult.ok) {

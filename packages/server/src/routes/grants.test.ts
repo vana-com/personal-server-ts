@@ -522,3 +522,43 @@ describe("POST /", () => {
     expect(grantPayload.nonce).toBe(42);
   });
 });
+
+describe("DELETE /:grantId", () => {
+  async function deleteWithOwnerAuth(
+    app: ReturnType<typeof grantsRoutes>,
+    grantId: `0x${string}`,
+  ) {
+    const auth = await buildWeb3SignedHeader({
+      wallet: owner,
+      aud: SERVER_ORIGIN,
+      method: "DELETE",
+      uri: `/${grantId}`,
+    });
+    return app.request(`/${grantId}`, {
+      method: "DELETE",
+      headers: { authorization: auth },
+    });
+  }
+
+  it("revokes grant via gateway and returns revoked status", async () => {
+    const mockGateway = createMockGateway();
+    const mockSigner = createMockServerSigner();
+    const grantId =
+      "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+    const app = createApp({ gateway: mockGateway, serverSigner: mockSigner });
+    const res = await deleteWithOwnerAuth(app, grantId);
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({ status: "revoked", grantId });
+    expect(mockSigner.signGrantRevocation).toHaveBeenCalledWith({
+      grantorAddress: owner.address,
+      grantId,
+    });
+    expect(mockGateway.revokeGrant).toHaveBeenCalledWith({
+      grantorAddress: owner.address,
+      grantId,
+      signature: "0xrevokesig",
+    });
+  });
+});

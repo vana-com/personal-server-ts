@@ -2,6 +2,7 @@ import type {
   CreateGrantParams,
   DataPortabilityGatewayConfig,
   GatewayClient,
+  RevokeGrantParams,
 } from "@opendatalabs/vana-sdk/browser";
 import {
   isDataPortabilityGatewayConfig,
@@ -37,6 +38,13 @@ export interface CreateGrantContractInput {
   serverSigner?: Pick<ServerSigner, "signGrantRegistration">;
   body: unknown;
   now?: () => number;
+}
+
+export interface RevokeGrantContractInput {
+  gateway: Pick<GatewayClient, "revokeGrant">;
+  serverOwner?: `0x${string}`;
+  serverSigner?: Partial<Pick<ServerSigner, "signGrantRevocation">>;
+  grantId: string;
 }
 
 export interface ListGrantsContractInput {
@@ -98,6 +106,10 @@ function isValidVerifyBody(body: unknown): body is VerifyGrantRequestBody {
     return false;
   }
   return true;
+}
+
+function isValidGrantId(grantId: string): grantId is `0x${string}` {
+  return grantId.startsWith("0x") && grantId.length > 2;
 }
 
 function serverOwnerNotConfigured(): ContractResult {
@@ -169,6 +181,38 @@ export async function createGrantContract(
   };
   const result = await input.gateway.createGrant(params);
   return contractOk({ grantId: result.grantId }, 201);
+}
+
+export async function revokeGrantContract(
+  input: RevokeGrantContractInput,
+): Promise<ContractResult> {
+  if (!input.serverOwner) return serverOwnerNotConfigured();
+  if (!input.serverSigner?.signGrantRevocation) {
+    return contractProtocolError(
+      500,
+      "SERVER_SIGNER_NOT_CONFIGURED",
+      "Server signer not configured. Set VANA_MASTER_KEY_SIGNATURE environment variable.",
+    );
+  }
+  if (!isValidGrantId(input.grantId)) {
+    return contractError(
+      400,
+      "INVALID_GRANT_ID",
+      "Grant id must be a non-empty 0x string",
+    );
+  }
+
+  const signature = await input.serverSigner.signGrantRevocation({
+    grantorAddress: input.serverOwner,
+    grantId: input.grantId,
+  });
+  const params: RevokeGrantParams = {
+    grantorAddress: input.serverOwner,
+    grantId: input.grantId,
+    signature,
+  };
+  await input.gateway.revokeGrant(params);
+  return contractOk({ status: "revoked", grantId: input.grantId });
 }
 
 export async function verifyGrantContract({

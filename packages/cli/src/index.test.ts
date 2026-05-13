@@ -7,6 +7,7 @@ describe("personal-server-ts facade", () => {
   it("keeps the root entrypoint runtime-neutral", () => {
     expect(shared).toHaveProperty("PersonalServerClientError");
     expect(shared).toHaveProperty("createPersonalServerRegistrationRequest");
+    expect(shared).toHaveProperty("grantRevokePath");
     expect(shared).not.toHaveProperty("startPersonalServer");
     expect(shared).not.toHaveProperty("createServer");
   });

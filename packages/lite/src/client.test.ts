@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
+import type { Builder, GatewayClient } from "@opendatalabs/vana-sdk/browser";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
@@ -76,6 +76,11 @@ function createRuntime(gateway: GatewayClient) {
       publicKey: "0x04public",
     },
     serverOwner: ownerWallet.address,
+    serverSigner: {
+      signFileRegistration: vi.fn().mockResolvedValue("0xfilesig"),
+      signGrantRegistration: vi.fn().mockResolvedValue("0xgrantsig"),
+      signGrantRevocation: vi.fn().mockResolvedValue("0xrevokesig"),
+    },
     auth: createWeb3SignedPsLiteAuth({
       origin: () => ORIGIN,
       ownerAddress: ownerWallet.address,
@@ -181,6 +186,64 @@ describe("startPersonalServer lite handle", () => {
     await expect(ps.syncNow({ auth })).resolves.toMatchObject({
       status: "disabled",
     });
+  });
+
+  it("exposes grant helpers through the public handle", async () => {
+    const builderAddress = createTestWallet(5).address;
+    const grantId =
+      "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    const gateway = createGateway({
+      getBuilder: vi.fn().mockResolvedValue({
+        id: `0x${"bb".repeat(32)}`,
+        ownerAddress: "0xOwner",
+        granteeAddress: builderAddress,
+        publicKey: "0x04key",
+        appUrl: "https://app.example.com",
+        addedAt: "2026-01-21T10:00:00.000Z",
+      } satisfies Builder),
+      createGrant: vi.fn().mockResolvedValue({ grantId }),
+      listGrantsByUser: vi.fn().mockResolvedValue([
+        {
+          id: grantId,
+          grantorAddress: ownerWallet.address,
+          granteeId: `0x${"bb".repeat(32)}`,
+          grant: "{}",
+          fileIds: [],
+          status: "confirmed",
+          addedAt: "2026-01-21T10:00:00.000Z",
+          revokedAt: null,
+          revocationSignature: null,
+        },
+      ]),
+    });
+    const ps = await startPersonalServer({
+      runtime: createRuntime(gateway),
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const auth = { signMessage: ownerWallet.signMessage };
+
+    await expect(
+      ps.createGrant({
+        auth,
+        granteeAddress: builderAddress,
+        scopes: ["instagram.*"],
+      }),
+    ).resolves.toEqual({ grantId });
+    await expect(ps.listGrants({ auth })).resolves.toMatchObject({
+      grants: [{ id: grantId }],
+    });
+    await expect(ps.revokeGrant(grantId, { auth })).resolves.toEqual({
+      status: "revoked",
+      grantId,
+    });
+    expect(gateway.revokeGrant).toHaveBeenCalledWith(
+      expect.objectContaining({
+        grantorAddress: ownerWallet.address,
+        grantId,
+      }),
+    );
   });
 
   it("preserves Request method and body when fetch applies init overrides", async () => {

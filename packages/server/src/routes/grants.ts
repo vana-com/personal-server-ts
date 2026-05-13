@@ -1,8 +1,9 @@
 /**
- * Grants routes — GET / (owner), POST / (create grant), POST /verify (public).
+ * Grants routes — GET / (owner), POST / (create grant), DELETE /:grantId
+ * (revoke grant), POST /verify (public).
  */
 
-import { Hono } from "hono";
+import { Hono, type Handler } from "hono";
 import type { Logger } from "pino";
 import type {
   DataPortabilityGatewayConfig,
@@ -41,7 +42,7 @@ export function grantsRoutes(deps: GrantsRouteDeps): Hono {
     gateway: deps.gateway,
   });
 
-  app.all("*", (c) =>
+  const handler: Handler = (c) =>
     handlePersonalServerGrantsRequest(
       c.req.raw,
       {
@@ -52,8 +53,11 @@ export function grantsRoutes(deps: GrantsRouteDeps): Hono {
         serverSigner: deps.serverSigner,
       },
       { basePath: deps.mountPath },
-    ),
-  );
+    );
+
+  app.all("/", handler);
+  app.delete("/:grantId", handler);
+  app.all("/*", handler);
 
   return app;
 }
