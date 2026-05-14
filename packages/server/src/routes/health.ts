@@ -56,14 +56,21 @@ export function healthRoute(deps: HealthDeps): Hono {
       typeof deps.serverOrigin === "function"
         ? deps.serverOrigin()
         : deps.serverOrigin;
-    const apiOrigin = tunnelStatus?.publicUrl ?? fallbackOrigin ?? null;
+    const tunnelPublicUrl = tunnelStatus?.publicUrl ?? null;
+    const tunnelReady =
+      tunnelStatus?.status === "connected" && tunnelStatus.routable !== false;
+    const apiOrigin =
+      tunnelReady && tunnelPublicUrl
+        ? tunnelPublicUrl
+        : (fallbackOrigin ?? null);
+    const registrationUrl = tunnelPublicUrl ?? apiOrigin;
     const registration =
-      deps.serverOwner && identity && apiOrigin
+      deps.serverOwner && identity && registrationUrl
         ? {
             ownerAddress: deps.serverOwner,
             serverAddress: identity.address,
             publicKey: identity.publicKey,
-            serverUrl: apiOrigin,
+            serverUrl: registrationUrl,
             serverId,
             registered: Boolean(serverId),
           }

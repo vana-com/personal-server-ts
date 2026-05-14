@@ -277,6 +277,39 @@ describe("healthRoute", () => {
     expect(body.registration.registered).toBe(false);
   });
 
+  it("keeps localhost as apiOrigin while a reserved tunnel URL is not connected", async () => {
+    const app = healthRoute({
+      version: "0.0.1",
+      startedAt: new Date(),
+      serverOwner: "0x1234567890abcdef1234567890abcdef12345678",
+      serverOrigin: "http://localhost:8080",
+      identity: {
+        address: "0xServerAddr",
+        publicKey: "0x04PubKey",
+        serverId: null,
+      },
+      getTunnelStatus: () => ({
+        enabled: true,
+        status: "starting",
+        publicUrl: "https://0xserveraddr.server.vana.org",
+        connectedSince: null,
+        routable: undefined,
+        warning: "Signer is not a registered server",
+      }),
+    });
+
+    const res = await app.request("/health");
+    const body = await res.json();
+
+    expect(body.apiOrigin).toBe("http://localhost:8080");
+    expect(body.registration.serverUrl).toBe(
+      "https://0xserveraddr.server.vana.org",
+    );
+    expect(body.registration.registered).toBe(false);
+    expect(body.tunnel.routable).toBe(false);
+    expect(body.tunnel.warning).toBe("Server not registered with gateway");
+  });
+
   it("preserves tunnel routing warnings separately from registration", async () => {
     const app = healthRoute({
       version: "0.0.1",

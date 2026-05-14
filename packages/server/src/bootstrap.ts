@@ -455,7 +455,12 @@ export async function createServer(
             );
           }
           context.tunnelUrl = url;
-          effectiveOrigin = url;
+          if (
+            tunnelStatus.status === "connected" &&
+            tunnelStatus.routable !== false
+          ) {
+            effectiveOrigin = url;
+          }
 
           if (!identity?.serverId) {
             logger.warn(
