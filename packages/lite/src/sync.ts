@@ -10,10 +10,10 @@ import type { ServerAccount } from "@opendatalabs/personal-server-ts-core/keys";
 import {
   createGatewayClient,
   deriveMasterKey,
-  recoverServerOwner,
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
 import type { PsLiteStateStore } from "./state.js";
+import { resolvePsLiteOwner } from "./owner-binding.js";
 
 const SYNC_CURSOR_KEY = "sync-cursor-v1";
 
@@ -30,6 +30,7 @@ export interface PsLiteSyncOptions {
   config: ServerConfig;
   stateStore: PsLiteStateStore;
   storage: DataStoragePort;
+  ownerAddress?: `0x${string}`;
   ownerSignature: `0x${string}`;
   serverAccount: ServerAccount;
   gateway?: GatewayClient;
@@ -64,7 +65,10 @@ export function createPsLiteSyncCursor(
 export async function createPsLiteSyncManager(
   options: PsLiteSyncOptions,
 ): Promise<{ syncManager: SyncManager; serverOwner: `0x${string}` }> {
-  const serverOwner = await recoverServerOwner(options.ownerSignature);
+  const serverOwner = await resolvePsLiteOwner({
+    ownerAddress: options.ownerAddress,
+    ownerSignature: options.ownerSignature,
+  });
   const masterKey = deriveMasterKey(options.ownerSignature);
   const gateway =
     options.gateway ?? createGatewayClient(options.config.gateway.url);

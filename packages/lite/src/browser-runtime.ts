@@ -3,10 +3,7 @@ import { createServerSigner } from "@opendatalabs/personal-server-ts-core/signin
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
-import {
-  createGatewayClient,
-  recoverServerOwner,
-} from "@opendatalabs/vana-sdk/browser";
+import { createGatewayClient } from "@opendatalabs/vana-sdk/browser";
 import {
   createIndexedDbPsLitePersistence,
   createPersistentPsLiteStorage,
@@ -29,6 +26,7 @@ import {
   type PsLiteRuntimeOptions,
 } from "./runtime.js";
 import { createPsLiteSyncManager } from "./sync.js";
+import { resolvePsLiteOwner } from "./owner-binding.js";
 
 export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   PsLiteRuntimeOptions,
@@ -41,6 +39,7 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   | "storage"
   | "tokenStore"
 > {
+  ownerAddress?: `0x${string}`;
   ownerSignature: `0x${string}`;
   dbName?: string;
   stateStoreName?: string;
@@ -97,7 +96,10 @@ export async function createIndexedDbPsLiteRuntime(
     options.dataFileStore,
   );
   const gateway = options.gateway ?? createGatewayClient(config.gateway.url);
-  const serverOwner = await recoverServerOwner(options.ownerSignature);
+  const serverOwner = await resolvePsLiteOwner({
+    ownerAddress: options.ownerAddress,
+    ownerSignature: options.ownerSignature,
+  });
   const serverSigner =
     options.serverSigner ??
     createServerSigner(identity.account, {
@@ -112,6 +114,7 @@ export async function createIndexedDbPsLiteRuntime(
         stateStore,
         storage,
         ownerSignature: options.ownerSignature,
+        ownerAddress: options.ownerAddress,
         serverAccount: identity.account,
         gateway,
       })

@@ -80,6 +80,11 @@ export {
 } from "./sync.js";
 
 export {
+  resolvePsLiteOwner,
+  type PsLiteOwnerBindingInput,
+} from "./owner-binding.js";
+
+export {
   createBearerTokenPsLiteAuth,
   createPsLiteRuntime,
   createWeb3SignedPsLiteAuth,
