@@ -15,7 +15,7 @@ import {
   type FileRegistrationMessage,
   type GrantRegistrationMessage,
   type GrantRevocationMessage,
-} from "./eip712.js";
+} from "@opendatalabs/vana-sdk/browser";
 
 export interface ServerSigner {
   signFileRegistration(msg: FileRegistrationMessage): Promise<`0x${string}`>;
@@ -48,7 +48,7 @@ export function createServerSigner(
         primaryType: "GrantRegistration",
         message: {
           ...msg,
-          fileIds: msg.fileIds.map((id) => id),
+          fileIds: msg.fileIds.map((id: bigint) => id),
         } as unknown as Record<string, unknown>,
       });
     },

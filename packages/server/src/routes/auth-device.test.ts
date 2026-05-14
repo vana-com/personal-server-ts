@@ -665,11 +665,13 @@ describe("POST /auth/device/token", () => {
   it("rejects Web3Signed owner auth for token provisioning", async () => {
     const tokenStore = createMockTokenStore();
     const app = createApp({ tokenStore });
+    const requestBody = JSON.stringify({ token: "vana_ps_new_cli_token" });
     const auth = await buildWeb3SignedHeader({
       wallet: ownerWallet,
       aud: SERVER_ORIGIN,
       method: "POST",
       uri: "/token",
+      body: new TextEncoder().encode(requestBody),
     });
 
     const res = await app.request("/token", {
@@ -678,7 +680,7 @@ describe("POST /auth/device/token", () => {
         "Content-Type": "application/json",
         Authorization: auth,
       },
-      body: JSON.stringify({ token: "vana_ps_new_cli_token" }),
+      body: requestBody,
     });
 
     expect(res.status).toBe(403);

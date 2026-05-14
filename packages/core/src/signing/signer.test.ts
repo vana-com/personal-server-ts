@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { recoverTypedDataAddress } from "viem";
 
-import { loadOrCreateServerAccount } from "../keys/server-account.js";
+import { loadOrCreateServerAccount } from "../../../server/src/keys/server-account.js";
 import type { GatewayConfig } from "../schemas/server-config.js";
 import { createServerSigner } from "./signer.js";
 import {
@@ -14,7 +14,7 @@ import {
   FILE_REGISTRATION_TYPES,
   GRANT_REGISTRATION_TYPES,
   GRANT_REVOCATION_TYPES,
-} from "./eip712.js";
+} from "@opendatalabs/vana-sdk/browser";
 
 const TEST_GATEWAY_CONFIG: GatewayConfig = {
   chainId: 14800,

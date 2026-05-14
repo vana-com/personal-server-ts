@@ -3,30 +3,25 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { UploadWorkerDeps } from "./upload.js";
 import { uploadOne, uploadAll } from "./upload.js";
 import type { IndexEntry } from "../../storage/index/types.js";
-import type { IndexManager } from "../../storage/index/manager.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
-import type { GatewayClient, Schema } from "../../gateway/client.js";
+import type {
+  DataFileEnvelope,
+  GatewayClient,
+  Schema,
+} from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../../signing/signer.js";
-import type { HierarchyManagerOptions } from "../../storage/hierarchy/index.js";
-import type { DataFileEnvelope } from "../../schemas/data-file.js";
-import type { Logger } from "pino";
+import type { Logger } from "../../logger/index.js";
+import type { DataStoragePort } from "../../ports/index.js";
 
-// Mock the filesystem-dependent modules
-vi.mock("../../storage/hierarchy/index.js", () => ({
-  readDataFile: vi.fn(),
-}));
-
-vi.mock("../../keys/derive.js", () => ({
+vi.mock("@opendatalabs/vana-sdk/browser", () => ({
   deriveScopeKey: vi.fn(),
-}));
-
-vi.mock("../../storage/encryption/index.js", () => ({
   encryptWithPassword: vi.fn(),
 }));
 
-import { readDataFile } from "../../storage/hierarchy/index.js";
-import { deriveScopeKey } from "../../keys/derive.js";
-import { encryptWithPassword } from "../../storage/encryption/index.js";
+import {
+  deriveScopeKey,
+  encryptWithPassword,
+} from "@opendatalabs/vana-sdk/browser";
 
 const SCOPE = "instagram.profile";
 const COLLECTED_AT = "2026-01-21T10:00:00Z";
@@ -40,6 +35,7 @@ function makeEntry(overrides?: Partial<IndexEntry>): IndexEntry {
   return {
     id: 1,
     fileId: null,
+    schemaId: null,
     path: `${SCOPE}/${COLLECTED_AT}.json`,
     scope: SCOPE,
     collectedAt: COLLECTED_AT,
@@ -70,9 +66,10 @@ function makeSchema(): Schema {
 }
 
 function makeMockDeps(): UploadWorkerDeps {
-  const mockIndexManager: Partial<IndexManager> = {
+  const mockStorage: Partial<DataStoragePort> = {
     findUnsynced: vi.fn().mockReturnValue([]),
     updateFileId: vi.fn().mockReturnValue(true),
+    readEnvelope: vi.fn().mockResolvedValue(makeEnvelope()),
   };
 
   const mockStorageAdapter: Partial<StorageAdapter> = {
@@ -98,8 +95,7 @@ function makeMockDeps(): UploadWorkerDeps {
   };
 
   return {
-    indexManager: mockIndexManager as IndexManager,
-    hierarchyOptions: { dataDir: "/tmp/data" } as HierarchyManagerOptions,
+    storage: mockStorage as DataStoragePort,
     storageAdapter: mockStorageAdapter as StorageAdapter,
     gateway: mockGateway as GatewayClient,
     signer: mockSigner as ServerSigner,
@@ -117,9 +113,6 @@ describe("upload worker", () => {
   beforeEach(() => {
     vi.clearAllMocks();
 
-    (readDataFile as ReturnType<typeof vi.fn>).mockResolvedValue(
-      makeEnvelope(),
-    );
     (deriveScopeKey as ReturnType<typeof vi.fn>).mockReturnValue(SCOPE_KEY);
     (encryptWithPassword as ReturnType<typeof vi.fn>).mockResolvedValue(
       ENCRYPTED_BYTES,
@@ -178,13 +171,25 @@ describe("upload worker", () => {
       });
     });
 
+    it("uses indexed schemaId without a schema lookup", async () => {
+      const deps = makeMockDeps();
+      const entry = makeEntry({ schemaId: SCHEMA_ID });
+
+      await uploadOne(deps, entry);
+
+      expect(deps.gateway.getSchemaForScope).not.toHaveBeenCalled();
+      expect(deps.gateway.registerFile).toHaveBeenCalledWith(
+        expect.objectContaining({ schemaId: SCHEMA_ID }),
+      );
+    });
+
     it("updates index with returned fileId", async () => {
       const deps = makeMockDeps();
       const entry = makeEntry();
 
       const result = await uploadOne(deps, entry);
 
-      expect(deps.indexManager.updateFileId).toHaveBeenCalledWith(
+      expect(deps.storage.updateFileId).toHaveBeenCalledWith(
         entry.path,
         FILE_ID,
       );
@@ -216,13 +221,13 @@ describe("upload worker", () => {
         makeEntry({ id: 2, path: "b/2.json", scope: "chatgpt.conversations" }),
         makeEntry({ id: 3, path: "c/3.json" }),
       ];
-      (
-        deps.indexManager.findUnsynced as ReturnType<typeof vi.fn>
-      ).mockReturnValue(entries);
+      (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue(
+        entries,
+      );
 
       const results = await uploadAll(deps);
 
-      expect(deps.indexManager.findUnsynced).toHaveBeenCalledWith({
+      expect(deps.storage.findUnsynced).toHaveBeenCalledWith({
         limit: 50,
       });
       expect(results).toHaveLength(3);
@@ -231,14 +236,15 @@ describe("upload worker", () => {
 
     it("continues on individual entry failure (logs error)", async () => {
       const deps = makeMockDeps();
+      const onError = vi.fn();
       const entries = [
         makeEntry({ id: 1, path: "a/1.json" }),
         makeEntry({ id: 2, path: "b/2.json" }),
         makeEntry({ id: 3, path: "c/3.json" }),
       ];
-      (
-        deps.indexManager.findUnsynced as ReturnType<typeof vi.fn>
-      ).mockReturnValue(entries);
+      (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue(
+        entries,
+      );
 
       // Make the second entry fail at schema lookup
       let callCount = 0;
@@ -250,9 +256,15 @@ describe("upload worker", () => {
         return Promise.resolve(makeSchema());
       });
 
-      const results = await uploadAll(deps);
+      const results = await uploadAll(deps, { onError });
 
       expect(results).toHaveLength(2);
+      expect(onError).toHaveBeenCalledWith(
+        entries[1],
+        expect.objectContaining({
+          message: `No schema found for scope: ${SCOPE}`,
+        }),
+      );
       expect(deps.logger.error).toHaveBeenCalledWith(
         expect.objectContaining({ path: "b/2.json" }),
         "Failed to upload entry",

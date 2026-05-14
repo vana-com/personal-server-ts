@@ -1,16 +1,12 @@
 import { describe, it, expect, vi } from "vitest";
 import { pino } from "pino";
-import type {
-  GatewayClient,
-  Builder,
-} from "@opendatalabs/personal-server-ts-core/gateway";
-import type { GrantListItem } from "@opendatalabs/personal-server-ts-core/gateway";
+import type { GatewayClient, Builder } from "@opendatalabs/vana-sdk/node";
+import type { GrantListItem } from "@opendatalabs/vana-sdk/node";
 import {
-  GRANT_DOMAIN,
-  GRANT_TYPES,
-  grantToEip712Message,
-} from "@opendatalabs/personal-server-ts-core/grants";
-import type { GrantPayload } from "@opendatalabs/personal-server-ts-core/grants";
+  GRANT_REGISTRATION_TYPES,
+  grantRegistrationDomain,
+  type DataPortabilityGatewayConfig,
+} from "@opendatalabs/vana-sdk/node";
 import {
   createTestWallet,
   buildWeb3SignedHeader,
@@ -19,6 +15,15 @@ import { grantsRoutes } from "./grants.js";
 
 const logger = pino({ level: "silent" });
 const SERVER_ORIGIN = "http://localhost:8080";
+const gatewayConfig = {
+  chainId: 14800,
+  contracts: {
+    dataRegistry: "0x0000000000000000000000000000000000000001",
+    dataPortabilityPermissions: "0x0000000000000000000000000000000000000002",
+    dataPortabilityServer: "0x0000000000000000000000000000000000000003",
+    dataPortabilityGrantees: "0x0000000000000000000000000000000000000004",
+  },
+} satisfies DataPortabilityGatewayConfig;
 
 // Wallet 0 = owner/user (signs grants), Wallet 1 = builder
 const owner = createTestWallet(0);
@@ -42,6 +47,7 @@ function createMockGateway(): GatewayClient {
     getFile: vi.fn().mockResolvedValue(null),
     listFilesSince: vi.fn().mockResolvedValue({ files: [], nextCursor: null }),
     getSchema: vi.fn().mockResolvedValue(null),
+    registerServer: vi.fn().mockResolvedValue({ alreadyRegistered: false }),
     registerFile: vi.fn().mockResolvedValue({ fileId: "file-1" }),
     createGrant: vi.fn().mockResolvedValue({ grantId: "grant-123" }),
     revokeGrant: vi.fn().mockResolvedValue(undefined),
@@ -64,7 +70,15 @@ function createMockServerSigner() {
 
 const futureExpiry = Math.floor(Date.now() / 1000) + 3600;
 
-function makePayload(overrides?: Partial<GrantPayload>): GrantPayload {
+interface TestGrantPayload {
+  user: `0x${string}`;
+  builder: `0x${string}`;
+  scopes: string[];
+  expiresAt: bigint;
+  nonce: bigint;
+}
+
+function makePayload(overrides?: Partial<TestGrantPayload>): TestGrantPayload {
   return {
     user: owner.address,
     builder: builder.address,
@@ -75,35 +89,44 @@ function makePayload(overrides?: Partial<GrantPayload>): GrantPayload {
   };
 }
 
-async function signGrant(payload: GrantPayload): Promise<{
-  grantId: string;
-  payload: {
-    user: string;
-    builder: string;
-    scopes: string[];
-    expiresAt: number;
-    nonce: number;
-  };
+async function signGrant(payload: TestGrantPayload): Promise<{
+  grantorAddress: `0x${string}`;
+  granteeId: `0x${string}`;
+  grant: string;
+  fileIds: number[];
   signature: `0x${string}`;
 }> {
+  const grant = JSON.stringify({
+    user: payload.user,
+    builder: payload.builder,
+    scopes: payload.scopes,
+    expiresAt: Number(payload.expiresAt),
+    nonce: Number(payload.nonce),
+  });
+  const granteeId =
+    "0x1111111111111111111111111111111111111111111111111111111111111111";
   const signature = await owner.signTypedData({
-    domain: GRANT_DOMAIN as unknown as Record<string, unknown>,
-    types: GRANT_TYPES as unknown as Record<
+    domain: grantRegistrationDomain(gatewayConfig) as unknown as Record<
+      string,
+      unknown
+    >,
+    types: GRANT_REGISTRATION_TYPES as unknown as Record<
       string,
       Array<{ name: string; type: string }>
     >,
-    primaryType: "Grant",
-    message: grantToEip712Message(payload) as Record<string, unknown>,
+    primaryType: "GrantRegistration",
+    message: {
+      grantorAddress: payload.user,
+      granteeId,
+      grant,
+      fileIds: [],
+    },
   });
   return {
-    grantId: "test-grant-1",
-    payload: {
-      user: payload.user,
-      builder: payload.builder,
-      scopes: payload.scopes,
-      expiresAt: Number(payload.expiresAt),
-      nonce: Number(payload.nonce),
-    },
+    grantorAddress: payload.user,
+    granteeId,
+    grant,
+    fileIds: [],
     signature,
   };
 }
@@ -117,6 +140,7 @@ function createApp(
   return grantsRoutes({
     logger,
     gateway: overrides?.gateway ?? createMockGateway(),
+    gatewayConfig,
     serverOwner: owner.address,
     serverOrigin: SERVER_ORIGIN,
     serverSigner: overrides?.serverSigner ?? createMockServerSigner(),
@@ -220,6 +244,7 @@ describe("POST /verify", () => {
     expect(res.status).toBe(200);
     const json = await res.json();
     expect(json.valid).toBe(true);
+    expect(json.grantorAddress).toBe(owner.address);
     expect(json.user).toBe(owner.address);
     expect(json.builder).toBe(builder.address);
     expect(json.scopes).toEqual(["instagram.*"]);
@@ -231,8 +256,9 @@ describe("POST /verify", () => {
     const payload = makePayload();
     const body = await signGrant(payload);
 
-    // Tamper with the scopes after signing
-    body.payload.scopes = ["*"];
+    const tamperedGrant = JSON.parse(body.grant) as Record<string, unknown>;
+    tamperedGrant.scopes = ["*"];
+    body.grant = JSON.stringify(tamperedGrant);
 
     const res = await app.request("/verify", {
       method: "POST",
@@ -279,6 +305,54 @@ describe("POST /verify", () => {
     const json = await res.json();
     expect(json.valid).toBe(true);
     expect(json.expiresAt).toBe(0);
+  });
+
+  it("embedded grant user must match grantorAddress", async () => {
+    const app = createApp();
+    const grant = JSON.stringify({
+      user: builder.address,
+      builder: builder.address,
+      scopes: ["instagram.*"],
+      expiresAt: futureExpiry,
+      nonce: 1,
+    });
+    const granteeId =
+      "0x1111111111111111111111111111111111111111111111111111111111111111";
+    const signature = await owner.signTypedData({
+      domain: grantRegistrationDomain(gatewayConfig) as unknown as Record<
+        string,
+        unknown
+      >,
+      types: GRANT_REGISTRATION_TYPES as unknown as Record<
+        string,
+        Array<{ name: string; type: string }>
+      >,
+      primaryType: "GrantRegistration",
+      message: {
+        grantorAddress: owner.address,
+        granteeId,
+        grant,
+        fileIds: [],
+      },
+    });
+
+    const res = await app.request("/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        grantorAddress: owner.address,
+        granteeId,
+        grant,
+        fileIds: [],
+        signature,
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      valid: false,
+      error: "Grant user does not match grantorAddress",
+    });
   });
 
   it("missing required fields returns 400", async () => {
@@ -389,6 +463,7 @@ describe("POST /", () => {
     const app = grantsRoutes({
       logger,
       gateway: createMockGateway(),
+      gatewayConfig,
       serverOwner: owner.address,
       serverOrigin: SERVER_ORIGIN,
       // serverSigner intentionally omitted
@@ -445,5 +520,45 @@ describe("POST /", () => {
     const grantPayload = JSON.parse(signerCall.grant);
     expect(grantPayload.expiresAt).toBe(1700000000);
     expect(grantPayload.nonce).toBe(42);
+  });
+});
+
+describe("DELETE /:grantId", () => {
+  async function deleteWithOwnerAuth(
+    app: ReturnType<typeof grantsRoutes>,
+    grantId: `0x${string}`,
+  ) {
+    const auth = await buildWeb3SignedHeader({
+      wallet: owner,
+      aud: SERVER_ORIGIN,
+      method: "DELETE",
+      uri: `/${grantId}`,
+    });
+    return app.request(`/${grantId}`, {
+      method: "DELETE",
+      headers: { authorization: auth },
+    });
+  }
+
+  it("revokes grant via gateway and returns revoked status", async () => {
+    const mockGateway = createMockGateway();
+    const mockSigner = createMockServerSigner();
+    const grantId =
+      "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+    const app = createApp({ gateway: mockGateway, serverSigner: mockSigner });
+    const res = await deleteWithOwnerAuth(app, grantId);
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({ status: "revoked", grantId });
+    expect(mockSigner.signGrantRevocation).toHaveBeenCalledWith({
+      grantorAddress: owner.address,
+      grantId,
+    });
+    expect(mockGateway.revokeGrant).toHaveBeenCalledWith({
+      grantorAddress: owner.address,
+      grantId,
+      signature: "0xrevokesig",
+    });
   });
 });

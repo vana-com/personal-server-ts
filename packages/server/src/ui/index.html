@@ -56,6 +56,23 @@
         color: var(--accent);
       }
 
+      .header-spacer {
+        flex: 1;
+      }
+
+      .runtime-picker {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--text-dim);
+        font-size: 12px;
+      }
+
+      .runtime-picker select {
+        width: auto;
+        min-width: 128px;
+      }
+
       header .status-dot {
         width: 8px;
         height: 8px;
@@ -318,6 +335,14 @@
     <header>
       <div class="status-dot"></div>
       <h1>PERSONAL SERVER</h1>
+      <div class="header-spacer"></div>
+      <label class="runtime-picker">
+        <span>Runtime</span>
+        <select id="runtime-select">
+          <option value="node">Node</option>
+          <option value="browser">Browser</option>
+        </select>
+      </label>
     </header>
 
     <nav id="tabs">
@@ -335,6 +360,15 @@
       <div id="panel-health" class="panel active">
         <div class="card">
           <div class="card-title">Server Status</div>
+          <div class="toolbar">
+            <button class="btn secondary" id="register-node-server-btn">
+              Register Server
+            </button>
+          </div>
+          <div
+            id="node-registration-status"
+            style="margin-bottom: 8px; font-size: 12px; color: var(--text-dim)"
+          ></div>
           <div id="health-content" class="kv-grid">
             <span class="label">status</span
             ><span class="value">loading...</span>
@@ -371,7 +405,7 @@
           <input
             id="add-data-scope"
             type="text"
-            value="test.dpv1.260130"
+            value="instagram.profile"
             style="margin-bottom: 12px"
           />
           <label
@@ -387,11 +421,87 @@
             id="add-data-json"
             spellcheck="false"
             style="min-height: 120px; margin-bottom: 12px"
-            placeholder='{
-  "test-string-key": "test-string",
-  "test-num-key": 0
-}'
-          ></textarea>
+          >
+{
+  "username": "vana_debug",
+  "full_name": "Vana Debug Profile",
+  "bio": "Schema-shaped sample profile for Personal Server debug UI testing.",
+  "biography_with_entities": {
+    "raw_text": "Schema-shaped sample profile for Personal Server debug UI testing.",
+    "entities": []
+  },
+  "pronouns": ["they/them"],
+  "bio_links": [
+    {
+      "title": "Vana",
+      "url": "https://www.vana.org",
+      "lynx_url": "https://www.vana.org"
+    }
+  ],
+  "external_url": "https://www.vana.org",
+  "external_url_linkshimmed": "https://www.vana.org",
+  "fb_profile_biolink": null,
+  "profile_pic_url": "https://www.vana.org/favicon.ico",
+  "hd_profile_pic_url": "https://www.vana.org/favicon.ico",
+  "pk": "2605080001",
+  "id": "2605080001",
+  "fbid": null,
+  "eimu_id": null,
+  "follower_count": 1234,
+  "following_count": 321,
+  "media_count": 42,
+  "highlight_reel_count": 3,
+  "pinned_channels_list_count": 0,
+  "is_private": false,
+  "is_verified": true,
+  "is_verified_by_mv4b": false,
+  "is_business": false,
+  "is_professional_account": true,
+  "is_supervised_user": false,
+  "is_supervision_enabled": false,
+  "is_joined_recently": false,
+  "is_embeds_disabled": false,
+  "is_regulated_c18": false,
+  "hide_like_and_view_counts": false,
+  "ai_agent_type": null,
+  "has_clips": true,
+  "has_channel": false,
+  "has_guides": false,
+  "has_ar_effects": false,
+  "has_chaining": true,
+  "country_block": false,
+  "should_show_category": true,
+  "should_show_public_contacts": false,
+  "show_account_transparency_details": true,
+  "transparency_label": null,
+  "transparency_product": null,
+  "business": {
+    "is_business_account": false,
+    "category_name": "Technology",
+    "business_category_name": null,
+    "overall_category_name": null,
+    "category_enum": null,
+    "business_contact_method": null,
+    "business_email": null,
+    "business_phone_number": null,
+    "business_address_json": null
+  },
+  "viewer_relationship": {
+    "followed_by_viewer": true,
+    "follows_viewer": false,
+    "requested_by_viewer": false,
+    "has_requested_viewer": false,
+    "blocked_by_viewer": false,
+    "has_blocked_viewer": false,
+    "restricted_by_viewer": false,
+    "is_guardian_of_viewer": false,
+    "is_supervised_by_viewer": false,
+    "mutual_followed_by_count": 7
+  },
+  "collected_at": "2026-05-08T00:00:00.000Z",
+  "debug_source": "debug-ui"
+}</textarea
+          >
           <button class="btn" id="submit-data-btn">Submit</button>
           <div id="add-data-msg" style="margin-top: 12px"></div>
         </div>
@@ -399,7 +509,9 @@
           <div class="card-title">Data Scopes</div>
           <div class="toolbar">
             <button class="btn" id="refresh-data-btn">Refresh</button>
+            <button class="btn secondary" id="sync-now-btn">Sync Now</button>
           </div>
+          <div id="sync-msg" style="margin-bottom: 12px"></div>
           <div id="data-scopes"></div>
         </div>
         <div id="data-detail" class="card" style="display: none">
@@ -560,6 +672,12 @@
     <script>
       const TOKEN = "__DEV_TOKEN__";
       const BASE = window.location.origin;
+      window.__PS_LITE_BOOTSTRAP__ = "__PS_LITE_BOOTSTRAP_JSON__";
+      const runtimeState = {
+        active: "node",
+        registration: { ownerPrivateKeyConfigured: false },
+        devTokenExpired: false,
+      };
 
       // --- DOM helpers ---
       function el(id) {
@@ -661,24 +779,222 @@
         } catch (e) {
           json = txt;
         }
-        return { status: res.status, ok: res.ok, data: json };
+        var result = { status: res.status, ok: res.ok, data: json };
+        if (isDevTokenAuthError(result)) {
+          runtimeState.devTokenExpired = true;
+          throw new Error("Dev UI token expired. Reload this page.");
+        }
+        return result;
       }
+
+      function isDevTokenAuthError(result) {
+        var error = result.data && result.data.error;
+        var errorCode = error && (error.errorCode || error.code);
+        return (
+          result.status === 401 &&
+          (errorCode === "UNAUTHORIZED" || errorCode === "INVALID_SIGNATURE")
+        );
+      }
+
+      async function runtimeApi(path, opts) {
+        return runtimeState.active === "browser"
+          ? psLiteApiRequest(path, opts)
+          : api(path, opts);
+      }
+
+      async function runtimeListGrants() {
+        return runtimeState.active === "browser"
+          ? psLiteClient().listGrants()
+          : api("/v1/grants", { auth: "owner" });
+      }
+
+      async function runtimeCreateGrant(body) {
+        return runtimeState.active === "browser"
+          ? psLiteClient().createGrant(body)
+          : api("/v1/grants", {
+              method: "POST",
+              auth: "owner",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(body),
+            });
+      }
+
+      async function runtimeRevokeGrant(grantId) {
+        var path = "/v1/grants/" + encodeURIComponent(grantId);
+        return runtimeState.active === "browser"
+          ? psLiteClient().revokeGrant(grantId)
+          : api(path, { method: "DELETE", auth: "owner" });
+      }
+
+      function runtimeName() {
+        return runtimeState.active === "browser" ? "Browser" : "Node";
+      }
+
+      function registrationRequired(healthData) {
+        return Boolean(
+          healthData &&
+          healthData.registration &&
+          healthData.registration.registered === false,
+        );
+      }
+
+      async function loadRegistrationStatus() {
+        try {
+          var result = await api("/ui/api/registration");
+          if (result.ok && result.data) {
+            runtimeState.registration = result.data;
+          }
+        } catch (e) {
+          if (runtimeState.devTokenExpired) {
+            runtimeState.registration = { ownerPrivateKeyConfigured: false };
+          }
+        }
+        updateRegisterButton();
+      }
+
+      function selectedPanel() {
+        var active = document.querySelector("#tabs button.active");
+        return active ? active.dataset.tab : "health";
+      }
+
+      function refreshSelectedPanel() {
+        var tab = selectedPanel();
+        if (tab === "health") loadHealth();
+        if (tab === "config") loadConfig();
+        if (tab === "data") loadScopes();
+        if (tab === "grants") loadGrants();
+        if (tab === "logs") loadAccessLogs();
+      }
+
+      function updateRegisterButton() {
+        var btn = el("register-node-server-btn");
+        if (!btn) return;
+        btn.disabled =
+          runtimeState.devTokenExpired ||
+          !runtimeState.registration.ownerPrivateKeyConfigured;
+        btn.title = runtimeState.devTokenExpired
+          ? "Reload this page to refresh the Dev UI token"
+          : btn.disabled
+            ? "Set VANA_OWNER_PRIVATE_KEY to register servers"
+            : "Register selected runtime";
+      }
+
+      function isPublicServerUrl(url) {
+        try {
+          var parsed = new URL(url);
+          var host = parsed.hostname.toLowerCase();
+          return (
+            (parsed.protocol === "https:" || parsed.protocol === "http:") &&
+            host !== "localhost" &&
+            host !== "127.0.0.1" &&
+            host !== "0.0.0.0" &&
+            host !== "::1" &&
+            host !== "[::1]" &&
+            host !== "ps-lite.local" &&
+            !host.startsWith("10.") &&
+            !host.startsWith("192.168.") &&
+            !/^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
+          );
+        } catch (e) {
+          return false;
+        }
+      }
+
+      async function selectedHealth() {
+        if (runtimeState.active === "node") return api("/health");
+
+        var result = await psLiteClient().status();
+        if (result.ok && result.data && !result.data.runtime) {
+          result = await psLiteClient().activate();
+        }
+        var data = result.data || {};
+        var runtime = data.runtime || {};
+        var relay = data.relay || {};
+        var registration = runtime.registration;
+        if (registration && relay.publicUrl) {
+          registration = Object.assign({}, registration, {
+            serverUrl: relay.publicUrl,
+          });
+        }
+        return {
+          status: result.status,
+          ok: result.ok,
+          data: Object.assign({}, runtime, {
+            apiOrigin: relay.publicUrl || runtime.apiOrigin,
+            registration: registration,
+            relay: relay,
+            runtime: {
+              kind: "ps-lite",
+              available: runtime.active !== false,
+            },
+          }),
+        };
+      }
+
+      el("runtime-select").addEventListener("change", function (e) {
+        runtimeState.active = e.target.value;
+        el("node-registration-status").textContent = "";
+        refreshSelectedPanel();
+      });
 
       // --- Health ---
       async function loadHealth() {
         var container = el("health-content");
         try {
-          var result = await api("/health");
+          await loadRegistrationStatus();
+          var result = await selectedHealth();
           var d = result.data;
           clearChildren(container);
           var items = [
+            ["runtime", runtimeName(), result.ok ? "ok" : "err"],
             ["status", d.status, d.status === "healthy" ? "ok" : "err"],
-            ["version", d.version, ""],
-            ["uptime", formatUptime(d.uptime), ""],
+            ["version", d.version || "\u2014", ""],
+            [
+              "uptime",
+              typeof d.uptime === "number" ? formatUptime(d.uptime) : "\u2014",
+              "",
+            ],
+            [
+              "api url",
+              d.apiOrigin || BASE,
+              d.apiOrigin && d.apiOrigin !== BASE ? "ok" : "warn",
+            ],
             ["owner", d.owner ?? "not configured", d.owner ? "ok" : "err"],
           ];
+          if (runtimeState.active === "browser") {
+            items.push([
+              "relay",
+              d.relay && d.relay.connected
+                ? "connected"
+                : d.relay
+                  ? d.relay.status
+                  : "disconnected",
+              d.relay && d.relay.connected ? "ok" : "warn",
+            ]);
+          } else if (d.tunnel) {
+            var tunnelValue = d.tunnel.status || "unknown";
+            if (
+              d.tunnel.status === "connected" &&
+              d.tunnel.routable === false
+            ) {
+              tunnelValue =
+                d.registration && d.registration.registered
+                  ? "connected (not routable)"
+                  : "connected (not registered)";
+            }
+            items.push([
+              "tunnel",
+              tunnelValue,
+              d.tunnel.status === "connected" && d.tunnel.routable !== false
+                ? "ok"
+                : "warn",
+            ]);
+          }
           if (d.identity) {
-            var registered = d.identity.serverId !== null;
+            var registered =
+              d.registration && typeof d.registration.registered === "boolean"
+                ? d.registration.registered
+                : d.identity.serverId !== null;
             items.push([
               "address",
               d.identity.address,
@@ -700,33 +1016,42 @@
               class: "value" + (items[i][2] ? " " + items[i][2] : ""),
             });
             val.textContent = items[i][1];
-            // Copy-on-click for publicKey and serverAddress
-            if (items[i][0] === "publicKey" && d.identity) {
+            // Copy-on-click for publicKey and API URLs
+            if (
+              (items[i][0] === "publicKey" && d.identity) ||
+              items[i][0] === "api url"
+            ) {
+              var fullValue =
+                items[i][0] === "publicKey" && d.identity
+                  ? d.identity.publicKey
+                  : items[i][1];
               val.style.cursor = "pointer";
-              val.title = "Click to copy full public key";
+              val.title = "Click to copy";
               val.addEventListener(
                 "click",
-                (function (fullKey) {
+                (function (copyValue, displayValue) {
                   return function () {
-                    navigator.clipboard.writeText(fullKey);
+                    navigator.clipboard.writeText(copyValue);
                     val.textContent = "copied!";
                     setTimeout(function () {
-                      val.textContent = truncAddr(fullKey);
+                      val.textContent = displayValue;
                     }, 1200);
                   };
-                })(d.identity.publicKey),
+                })(fullValue, items[i][1]),
               );
             }
             container.appendChild(lbl);
             container.appendChild(val);
           }
-          if (d.identity && d.identity.serverId === null) {
+          if (d.identity && !(d.registration && d.registration.registered)) {
             var noteEl = createEl("span", {
               class: "label",
               style: { gridColumn: "1 / -1", marginTop: "8px" },
             });
-            noteEl.textContent =
-              "Register this server with `npm run register-server`";
+            noteEl.textContent = runtimeState.registration
+              .ownerPrivateKeyConfigured
+              ? "Register this runtime once the public API URL is reachable."
+              : "Set VANA_OWNER_PRIVATE_KEY to enable server registration.";
             noteEl.style.color = "var(--text-dim)";
             noteEl.style.fontSize = "11px";
             noteEl.style.fontStyle = "italic";
@@ -740,6 +1065,41 @@
           val2.textContent = "unreachable";
           container.appendChild(lbl2);
           container.appendChild(val2);
+        }
+      }
+
+      async function registerNodeServer() {
+        var statusEl = el("node-registration-status");
+        statusEl.textContent = "Registering " + runtimeName() + " server...";
+        try {
+          var health = await selectedHealth();
+          var serverUrl =
+            health.data &&
+            health.data.registration &&
+            health.data.registration.serverUrl;
+          if (!isPublicServerUrl(serverUrl)) {
+            statusEl.style.color = "var(--error)";
+            statusEl.textContent =
+              "Registration requires a reachable public API URL.";
+            return;
+          }
+          var result = await api("/ui/api/registration/server", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              gatewayConfig: health.data.gatewayConfig,
+              registration: health.data.registration,
+            }),
+          });
+          statusEl.style.color = result.ok ? "var(--accent)" : "var(--error)";
+          statusEl.textContent = result.ok
+            ? "Registered " + runtimeName() + " server"
+            : (result.data && result.data.error && result.data.error.message) ||
+              "Registration failed";
+          await loadHealth();
+        } catch (e) {
+          statusEl.style.color = "var(--error)";
+          statusEl.textContent = e.message;
         }
       }
 
@@ -759,11 +1119,11 @@
         var msg = el("config-msg");
         clearChildren(msg);
         try {
-          var result = await api("/ui/api/config");
+          var result = await runtimeApi("/ui/api/config", { auth: "owner" });
           if (result.ok) {
             editor.value = JSON.stringify(result.data, null, 2);
           } else {
-            showMsg(msg, "Failed to load config", "err");
+            showMsg(msg, "Failed to load " + runtimeName() + " config", "err");
           }
         } catch (e) {
           showMsg(msg, "Error loading config", "err");
@@ -784,7 +1144,7 @@
         }
 
         try {
-          var result = await api("/ui/api/config", {
+          var result = await runtimeApi("/ui/api/config", {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
@@ -809,6 +1169,10 @@
 
       el("save-config-btn").addEventListener("click", saveConfig);
       el("reload-config-btn").addEventListener("click", loadConfig);
+      el("register-node-server-btn").addEventListener(
+        "click",
+        registerNodeServer,
+      );
 
       // --- Data ---
       async function loadScopes() {
@@ -817,21 +1181,63 @@
         showLoading(container);
 
         try {
-          var result = await api("/v1/data?limit=100");
+          var result = await runtimeApi("/v1/data?limit=100");
           if (!result.ok) {
             showJson(container, result.data);
             return;
           }
           if (!result.data.scopes || result.data.scopes.length === 0) {
-            showEmpty(container, "No data scopes found.");
+            showEmpty(container, "No " + runtimeName() + " data scopes found.");
             return;
           }
+
+          var syncResult = await runtimeApi("/v1/sync/status", {
+            auth: "owner",
+          }).catch(function (e) {
+            return { ok: false, data: { error: e.message } };
+          });
+          var health = await selectedHealth().catch(function () {
+            return { data: {} };
+          });
+          var needsRegistration = registrationRequired(health.data);
+          var latestByScope = {};
+          var fileIds = [];
+          for (var vIdx = 0; vIdx < result.data.scopes.length; vIdx++) {
+            var scopeItem = result.data.scopes[vIdx];
+            var scopeName =
+              typeof scopeItem === "string"
+                ? scopeItem
+                : scopeItem.scope || JSON.stringify(scopeItem);
+            var versions = await runtimeApi(
+              "/v1/data/" + encodeURIComponent(scopeName) + "/versions?limit=1",
+            ).catch(function (e) {
+              return { ok: false, data: { error: e.message } };
+            });
+            var latest =
+              versions.ok &&
+              versions.data &&
+              versions.data.versions &&
+              versions.data.versions.length > 0
+                ? versions.data.versions[0]
+                : null;
+            latestByScope[scopeName] = latest;
+            if (latest && latest.fileId) fileIds.push(latest.fileId);
+          }
+          var rpcFiles = await verifyRpcFiles(
+            health.data && health.data.gatewayUrl,
+            Array.from(new Set(fileIds)),
+          ).catch(function () {
+            return {};
+          });
 
           clearChildren(container);
           var table = createEl("table");
           var thead = createEl("thead");
           var headRow = createEl("tr", null, [
             createEl("th", null, "Scope"),
+            createEl("th", null, "Local"),
+            createEl("th", null, "RPC"),
+            createEl("th", null, "Sync"),
             createEl("th", null, "Actions"),
           ]);
           thead.appendChild(headRow);
@@ -847,6 +1253,65 @@
             var tr = createEl("tr");
             var tdScope = createEl("td");
             tdScope.textContent = s;
+            var latestVersion = latestByScope[s];
+            var tdLocal = createEl("td");
+            tdLocal.textContent =
+              latestVersion && latestVersion.fileId ? "file id" : "unsynced";
+            tdLocal.style.color =
+              latestVersion && latestVersion.fileId
+                ? "var(--accent)"
+                : "var(--warn)";
+            var tdRpc = createEl("td");
+            if (latestVersion && latestVersion.fileId) {
+              var rpc = rpcFiles[latestVersion.fileId];
+              tdRpc.textContent = rpc
+                ? rpc.registered
+                  ? "registered"
+                  : "missing"
+                : "unknown";
+              tdRpc.style.color =
+                rpc && rpc.registered
+                  ? "var(--accent)"
+                  : rpc
+                    ? "var(--error)"
+                    : "var(--text-dim)";
+            } else {
+              tdRpc.textContent = "\u2014";
+              tdRpc.style.color = "var(--text-dim)";
+            }
+            var tdSync = createEl("td");
+            var syncData = syncResult.data || {};
+            var syncErrors = Array.isArray(syncData.errors)
+              ? syncData.errors
+              : [];
+            var hasPendingFiles =
+              typeof syncData.pendingFiles === "number" &&
+              syncData.pendingFiles > 0;
+            if (syncData.enabled === false) {
+              tdSync.textContent = "disabled";
+              tdSync.style.color = "var(--text-dim)";
+            } else if (needsRegistration && hasPendingFiles) {
+              tdSync.textContent = "register server";
+              tdSync.style.color = "var(--warn)";
+              tdSync.title =
+                "Register this runtime before syncing pending files.";
+            } else if (!syncResult.ok) {
+              tdSync.textContent = "unavailable";
+              tdSync.style.color = "var(--warn)";
+            } else if (syncData.syncing) {
+              tdSync.textContent = "syncing";
+              tdSync.style.color = "var(--warn)";
+            } else if (syncErrors.length > 0 && hasPendingFiles) {
+              tdSync.textContent = "error";
+              tdSync.style.color = "var(--error)";
+              tdSync.title = syncErrors[syncErrors.length - 1].message || "";
+            } else if (hasPendingFiles) {
+              tdSync.textContent = "pending";
+              tdSync.style.color = "var(--warn)";
+            } else {
+              tdSync.textContent = "idle";
+              tdSync.style.color = "var(--accent)";
+            }
             var tdActions = createEl("td");
             var btnView = createEl("button", { class: "btn secondary" });
             btnView.textContent = "View Latest";
@@ -874,6 +1339,9 @@
             tdActions.appendChild(btnView);
             tdActions.appendChild(btnVer);
             tr.appendChild(tdScope);
+            tr.appendChild(tdLocal);
+            tr.appendChild(tdRpc);
+            tr.appendChild(tdSync);
             tr.appendChild(tdActions);
             tbody.appendChild(tr);
           }
@@ -885,6 +1353,86 @@
       }
 
       el("refresh-data-btn").addEventListener("click", loadScopes);
+
+      async function triggerSync() {
+        var msg = el("sync-msg");
+        try {
+          var health = await selectedHealth();
+          if (registrationRequired(health.data)) {
+            showMsg(
+              msg,
+              "Register " + runtimeName() + " server before syncing.",
+              "warn",
+            );
+            await loadHealth();
+            return;
+          }
+
+          showMsg(msg, "Triggering " + runtimeName() + " sync...", "ok");
+          var result = await runtimeApi("/v1/sync/trigger", {
+            method: "POST",
+            auth: "owner",
+          });
+          if (!result.ok) {
+            var errMsg =
+              (result.data && result.data.error && result.data.error.message) ||
+              "Sync trigger failed (" + result.status + ")";
+            showMsg(msg, errMsg, "err");
+            return;
+          }
+          if (result.data && result.data.status === "disabled") {
+            showMsg(msg, "Sync is disabled for " + runtimeName() + ".", "warn");
+            return;
+          }
+          var statusResult = await runtimeApi("/v1/sync/status", {
+            auth: "owner",
+          }).catch(function () {
+            return { ok: false, data: {} };
+          });
+          var syncStatus = statusResult.data || {};
+          var syncErrors = Array.isArray(syncStatus.errors)
+            ? syncStatus.errors
+            : [];
+          var pendingFiles =
+            typeof syncStatus.pendingFiles === "number"
+              ? syncStatus.pendingFiles
+              : 0;
+          if (syncErrors.length > 0 && pendingFiles > 0) {
+            var latestError = syncErrors[syncErrors.length - 1];
+            showMsg(
+              msg,
+              "Sync finished with errors: " +
+                (latestError.message || "unknown error"),
+              "err",
+            );
+          } else if (pendingFiles > 0) {
+            showMsg(
+              msg,
+              "Sync finished with " + pendingFiles + " pending file(s).",
+              "warn",
+            );
+          } else {
+            showMsg(msg, "Sync finished for " + runtimeName() + ".", "ok");
+          }
+          await loadScopes();
+        } catch (e) {
+          showMsg(msg, "Error: " + e.message, "err");
+        }
+      }
+
+      el("sync-now-btn").addEventListener("click", triggerSync);
+
+      async function verifyRpcFiles(gatewayUrl, fileIds) {
+        if (!gatewayUrl || fileIds.length === 0) return {};
+        var result = await api("/ui/api/rpc/files", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ gatewayUrl: gatewayUrl, fileIds: fileIds }),
+        });
+        return result.ok && result.data && result.data.files
+          ? result.data.files
+          : {};
+      }
 
       async function submitData() {
         var msg = el("add-data-msg");
@@ -919,11 +1467,14 @@
         }
 
         try {
-          var result = await api("/v1/data/" + encodeURIComponent(scope), {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(parsed),
-          });
+          var result = await runtimeApi(
+            "/v1/data/" + encodeURIComponent(scope),
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(parsed),
+            },
+          );
           if (result.ok) {
             var collectedAt =
               (result.data && result.data.collectedAt) || "unknown";
@@ -960,7 +1511,11 @@
         showLoading(content);
 
         try {
-          var result = await api("/v1/data/" + encodeURIComponent(scope));
+          var path = "/v1/data/" + encodeURIComponent(scope);
+          if (runtimeState.active === "browser") {
+            path += "?grantId=debug-grant";
+          }
+          var result = await runtimeApi(path);
           showJson(content, result.data);
         } catch (e) {
           showMsg(content, "Error: " + e.message, "err");
@@ -974,7 +1529,7 @@
         showLoading(content);
 
         try {
-          var result = await api(
+          var result = await runtimeApi(
             "/v1/data/" + encodeURIComponent(scope) + "/versions",
           );
           if (!result.data.versions || result.data.versions.length === 0) {
@@ -1017,7 +1572,7 @@
         showLoading(container);
 
         try {
-          var result = await api("/v1/grants");
+          var result = await runtimeListGrants();
           if (!result.ok) {
             showJson(container, result.data);
             return;
@@ -1035,6 +1590,7 @@
             createEl("th", null, "Grantee"),
             createEl("th", null, "Status"),
             createEl("th", null, "Created"),
+            createEl("th", null, "Actions"),
           ]);
           thead.appendChild(headRow);
           table.appendChild(thead);
@@ -1056,10 +1612,32 @@
             td3.appendChild(statusSpan);
             var td4 = createEl("td");
             td4.textContent = g.createdAt || "\u2014";
+            var td5 = createEl("td");
+            if (status === "active") {
+              var revokeBtn = createEl("button", { class: "btn" }, "Revoke");
+              revokeBtn.addEventListener(
+                "click",
+                (function (grantId) {
+                  return async function () {
+                    revokeBtn.disabled = true;
+                    var revokeResult = await runtimeRevokeGrant(grantId);
+                    if (!revokeResult.ok) {
+                      showJson(container, revokeResult.data);
+                      return;
+                    }
+                    await loadGrants();
+                  };
+                })(String(g.id)),
+              );
+              td5.appendChild(revokeBtn);
+            } else {
+              td5.textContent = "\u2014";
+            }
             tr.appendChild(td1);
             tr.appendChild(td2);
             tr.appendChild(td3);
             tr.appendChild(td4);
+            tr.appendChild(td5);
             tbody.appendChild(tr);
           }
           table.appendChild(tbody);
@@ -1077,13 +1655,15 @@
         showLoading(container);
 
         try {
-          var result = await api("/v1/access-logs?limit=50");
+          var result = await runtimeApi("/v1/access-logs?limit=50", {
+            auth: "owner",
+          });
           if (!result.ok) {
             showJson(container, result.data);
             return;
           }
 
-          var entries = result.data.entries || result.data;
+          var entries = result.data.logs || result.data.entries || result.data;
           if (!Array.isArray(entries) || entries.length === 0) {
             showEmpty(container, "No access logs found.");
             return;
@@ -1146,7 +1726,7 @@
         }
 
         try {
-          var result = await api(path, opts);
+          var result = await runtimeApi(path, opts);
           var color =
             result.status < 300
               ? "var(--accent)"
@@ -1174,6 +1754,109 @@
       }
 
       el("send-api-btn").addEventListener("click", sendApiRequest);
+
+      // --- Browser Runtime Bridge ---
+      function psLiteClient() {
+        if (!window.psLiteDebug) {
+          throw new Error("Browser runtime bundle is still loading");
+        }
+        return window.psLiteDebug;
+      }
+
+      async function psLiteApiRequest(path, opts) {
+        opts = opts || {};
+        var body;
+        if (opts.body) {
+          try {
+            body = JSON.parse(opts.body);
+          } catch (e) {
+            body = opts.body;
+          }
+        }
+        var client = psLiteClient();
+        var url = new URL(path, "https://ps-lite.local");
+        var dataPrefix = "/v1/data";
+        if (
+          url.pathname === dataPrefix &&
+          (!opts.method || opts.method.toUpperCase() === "GET")
+        ) {
+          return client.listData({
+            scopePrefix: url.searchParams.get("scopePrefix") || undefined,
+            limit: numberParam(url.searchParams.get("limit")),
+            offset: numberParam(url.searchParams.get("offset")),
+          });
+        }
+        if (url.pathname.startsWith(dataPrefix + "/")) {
+          var dataSuffix = url.pathname.slice((dataPrefix + "/").length);
+          if (dataSuffix.endsWith("/versions")) {
+            return client.listVersions(
+              decodeURIComponent(dataSuffix.slice(0, -"/versions".length)),
+              {
+                limit: numberParam(url.searchParams.get("limit")),
+                offset: numberParam(url.searchParams.get("offset")),
+              },
+            );
+          }
+          var scope = decodeURIComponent(dataSuffix);
+          var method = (opts.method || "GET").toUpperCase();
+          if (method === "POST") {
+            return client.postData(scope, body);
+          }
+          if (method === "GET") {
+            return client.readData(scope, {
+              grantId: url.searchParams.get("grantId") || undefined,
+              fileId: url.searchParams.get("fileId") || undefined,
+              at: url.searchParams.get("at") || undefined,
+            });
+          }
+        }
+        if (
+          url.pathname === "/v1/sync/status" &&
+          (!opts.method || opts.method.toUpperCase() === "GET")
+        ) {
+          return client.syncStatus();
+        }
+        if (
+          url.pathname === "/v1/sync/trigger" &&
+          (opts.method || "GET").toUpperCase() === "POST"
+        ) {
+          return client.syncTrigger();
+        }
+        if (url.pathname === "/v1/grants") {
+          var grantMethod = (opts.method || "GET").toUpperCase();
+          if (grantMethod === "GET") return client.listGrants();
+          if (grantMethod === "POST") return client.createGrant(body);
+        }
+        if (url.pathname.startsWith("/v1/grants/")) {
+          var revokeMethod = (opts.method || "GET").toUpperCase();
+          if (revokeMethod === "DELETE") {
+            return client.revokeGrant(
+              decodeURIComponent(url.pathname.slice("/v1/grants/".length)),
+            );
+          }
+        }
+        return psLiteClient().request(path, {
+          method: opts.method || "GET",
+          body: body,
+          auth: opts.auth,
+          headers: opts.headers,
+        });
+      }
+
+      function numberParam(value) {
+        if (value === null || value === "") return undefined;
+        var parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : undefined;
+      }
+
+      window.addEventListener("ps-lite-relay-status", function () {
+        if (runtimeState.active === "browser") refreshSelectedPanel();
+      });
+      window.addEventListener("ps-lite-relay-log", function (event) {
+        if (runtimeState.active === "browser" && selectedPanel() === "health") {
+          el("node-registration-status").textContent = String(event.detail);
+        }
+      });
 
       // --- Connect Simulator ---
       var connectState = {
@@ -1333,7 +2016,7 @@
 
         try {
           // Get owner address from /health
-          var healthResult = await api("/health");
+          var healthResult = await selectedHealth();
           if (
             !healthResult.ok ||
             !healthResult.data ||
@@ -1353,14 +2036,9 @@
             "";
           connectLog("Owner address: " + connectState.userAddress);
 
-          // Create grant via POST /v1/grants
-          var grantResult = await api("/v1/grants", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              granteeAddress: connectState.granteeAddress,
-              scopes: connectState.scopes,
-            }),
+          var grantResult = await runtimeCreateGrant({
+            granteeAddress: connectState.granteeAddress,
+            scopes: connectState.scopes,
           });
 
           if (!grantResult.ok) {
@@ -1510,5 +2188,6 @@
         return addr.slice(0, 6) + "..." + addr.slice(-4);
       }
     </script>
+    <script type="module" src="/ui/ps-lite-debug.js"></script>
   </body>
 </html>

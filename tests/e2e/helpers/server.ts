@@ -12,6 +12,7 @@ import { createServer } from "../../../packages/server/src/bootstrap.js";
 
 export interface TestServer {
   url: string;
+  devToken?: string;
   cleanup: () => Promise<void>;
 }
 
@@ -75,6 +76,7 @@ export async function startTestServer(options?: {
 
   return {
     url,
+    devToken: context.devToken,
     cleanup: async () => {
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));

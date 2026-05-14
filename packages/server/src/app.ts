@@ -3,7 +3,11 @@ import { cors } from "hono/cors";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
-import type { GatewayClient } from "@opendatalabs/personal-server-ts-core/gateway";
+import type {
+  DataPortabilityGatewayConfig,
+  GatewayClient,
+} from "@opendatalabs/vana-sdk/node";
+import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import { healthRoute, type HealthDeps } from "./routes/health.js";
@@ -12,6 +16,7 @@ import { grantsRoutes } from "./routes/grants.js";
 import { accessLogsRoutes } from "./routes/access-logs.js";
 import { syncRoutes } from "./routes/sync.js";
 import { uiConfigRoutes } from "./routes/ui-config.js";
+import { uiRegistrationRoutes } from "./routes/ui-registration.js";
 import { uiRoute } from "./routes/ui.js";
 import {
   authDeviceRoutes,
@@ -20,6 +25,11 @@ import {
 import { oauthTokenRoutes } from "./routes/oauth-token.js";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
+import type {
+  DataStoragePort,
+  FeeVerifierPort,
+  RuntimeAvailabilityPort,
+} from "@opendatalabs/personal-server-ts-core/ports";
 import type { TokenStore } from "./token-store.js";
 import type { Logger } from "pino";
 
@@ -40,15 +50,22 @@ export interface AppDeps {
   serverOwner?: `0x${string}`;
   identity?: IdentityInfo;
   gateway: GatewayClient;
+  gatewayConfig?: DataPortabilityGatewayConfig & { url?: string };
+  config?: ServerConfig;
   accessLogWriter: AccessLogWriter;
   accessLogReader: AccessLogReader;
   cloudMode?: boolean;
   devToken?: string;
+  ownerSignature?: `0x${string}`;
+  ownerPrivateKey?: `0x${string}`;
   accessToken?: string;
   configPath?: string;
   syncManager?: SyncManager | null;
   serverSigner?: ServerSigner;
   tokenStore?: TokenStore;
+  feeVerifier?: FeeVerifierPort;
+  runtimeAvailability?: RuntimeAvailabilityPort;
+  dataStorage?: DataStoragePort;
   getTunnelStatus?: HealthDeps["getTunnelStatus"];
 }
 
@@ -72,11 +89,14 @@ export function createApp(deps: AppDeps): Hono {
     healthRoute({
       version: deps.version,
       startedAt: deps.startedAt,
+      serverOrigin: deps.serverOrigin,
       serverOwner: deps.serverOwner,
       identity: deps.identity,
       gateway: deps.gateway,
+      gatewayConfig: deps.gatewayConfig,
       logger: deps.logger,
       getTunnelStatus: deps.getTunnelStatus,
+      runtimeAvailability: deps.runtimeAvailability,
     }),
   );
 
@@ -92,8 +112,13 @@ export function createApp(deps: AppDeps): Hono {
       gateway: deps.gateway,
       accessLogWriter: deps.accessLogWriter,
       devToken: deps.devToken,
+      accessToken: deps.accessToken,
       tokenStore: deps.tokenStore,
       syncManager: deps.syncManager ?? null,
+      feeVerifier: deps.feeVerifier,
+      runtimeAvailability: deps.runtimeAvailability,
+      dataStorage: deps.dataStorage,
+      mountPath: "/v1/data",
     }),
   );
 
@@ -103,11 +128,14 @@ export function createApp(deps: AppDeps): Hono {
     grantsRoutes({
       logger: deps.logger,
       gateway: deps.gateway,
+      gatewayConfig: deps.gatewayConfig,
       serverOwner: deps.serverOwner,
       serverOrigin: deps.serverOrigin,
       devToken: deps.devToken,
+      accessToken: deps.accessToken,
       tokenStore: deps.tokenStore,
       serverSigner: deps.serverSigner,
+      mountPath: "/v1/grants",
     }),
   );
 
@@ -119,8 +147,11 @@ export function createApp(deps: AppDeps): Hono {
       accessLogReader: deps.accessLogReader,
       serverOrigin: deps.serverOrigin,
       serverOwner: deps.serverOwner,
+      gateway: deps.gateway,
       devToken: deps.devToken,
+      accessToken: deps.accessToken,
       tokenStore: deps.tokenStore,
+      mountPath: "/v1/access-logs",
     }),
   );
 
@@ -131,9 +162,12 @@ export function createApp(deps: AppDeps): Hono {
       logger: deps.logger,
       serverOrigin: deps.serverOrigin,
       serverOwner: deps.serverOwner,
+      gateway: deps.gateway,
       devToken: deps.devToken,
+      accessToken: deps.accessToken,
       tokenStore: deps.tokenStore,
       syncManager: deps.syncManager ?? null,
+      mountPath: "/v1/sync",
     }),
   );
 
@@ -169,7 +203,18 @@ export function createApp(deps: AppDeps): Hono {
 
   // Mount dev UI routes when dev token is available
   if (deps.devToken) {
-    app.route("/ui", uiRoute({ devToken: deps.devToken }));
+    app.route(
+      "/ui",
+      uiRoute({
+        devToken: deps.devToken,
+        psLiteBootstrap: deps.ownerSignature
+          ? {
+              ownerSignature: deps.ownerSignature,
+              config: deps.config,
+            }
+          : null,
+      }),
+    );
 
     if (deps.configPath) {
       app.route(
@@ -180,13 +225,20 @@ export function createApp(deps: AppDeps): Hono {
         }),
       );
     }
+    app.route(
+      "/ui/api",
+      uiRegistrationRoutes({
+        devToken: deps.devToken,
+        ownerPrivateKey: deps.ownerPrivateKey,
+      }),
+    );
   }
 
   // Global error handler
   app.onError((err, c) => {
     if (err instanceof ProtocolError) {
       deps.logger.warn({ err }, err.message);
-      return c.json(err.toJSON(), err.code as 401 | 403 | 413);
+      return c.json(err.toJSON(), err.code as 401 | 403 | 413 | 503);
     }
 
     deps.logger.error({ err }, "Unhandled error");

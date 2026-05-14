@@ -8,13 +8,13 @@
  */
 
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { loadConfig } from "../packages/core/src/config/loader.js";
-import { resolveRootPath } from "../packages/core/src/config/paths.js";
+import { loadConfig } from "../packages/server/src/config/loader.js";
+import { resolveRootPath } from "../packages/server/src/config/paths.js";
 import {
   builderRegistrationDomain,
   BUILDER_REGISTRATION_TYPES,
   type BuilderRegistrationMessage,
-} from "../packages/core/src/signing/index.js";
+} from "@opendatalabs/vana-sdk/node";
 
 async function main() {
   const ownerKey = process.env.VANA_OWNER_PRIVATE_KEY;

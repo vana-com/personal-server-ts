@@ -25,6 +25,7 @@ export interface TokenStore {
 }
 
 interface TokensFile {
+  version?: 1;
   tokens: Array<string | { token: string; expiresAt?: string | null }>;
 }
 
@@ -100,6 +101,7 @@ export function createTokenStore(filePath: string, logger: Logger): TokenStore {
   async function saveToDisk(): Promise<void> {
     purgeExpired();
     const data: TokensFile = {
+      version: 1,
       tokens: Array.from(tokens.entries()).map(([token, expiresAt]) =>
         expiresAt ? { token, expiresAt } : token,
       ),

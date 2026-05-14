@@ -140,5 +140,40 @@ describe("tunnel/auth", () => {
 
       expect(recoveredAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
     });
+
+    it("can sign with an owner signer while routing to a server wallet", async () => {
+      const owner = createTestWallet(0);
+      const server = createTestWallet(1);
+
+      const { claim, sig } = await generateSignedClaim({
+        ownerAddress: owner.address,
+        walletAddress: server.address,
+        runId: "owner-signed-test",
+        serverKeypair: {
+          address: server.address,
+          publicKey: `0x${"04".padEnd(130, "0")}` as `0x${string}`,
+          signMessage: (msg: string) => server.signMessage(msg),
+          signTypedData: () => Promise.resolve("0x" as `0x${string}`),
+        },
+        signer: {
+          signMessage: (msg: string) => owner.signMessage(msg),
+        },
+      });
+
+      const decoded = Buffer.from(
+        claim.replace(/-/g, "+").replace(/_/g, "/"),
+        "base64",
+      ).toString("utf-8");
+      const payload = JSON.parse(decoded);
+      const recoveredAddress = await recoverMessageAddress({
+        message: claim,
+        signature: sig as `0x${string}`,
+      });
+
+      expect(payload.owner).toBe(owner.address);
+      expect(payload.wallet).toBe(server.address);
+      expect(payload.subdomain).toBe(server.address.toLowerCase());
+      expect(recoveredAddress.toLowerCase()).toBe(owner.address.toLowerCase());
+    });
   });
 });

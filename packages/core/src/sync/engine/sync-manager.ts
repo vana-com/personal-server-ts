@@ -1,6 +1,6 @@
 import type { UploadWorkerDeps } from "../workers/upload.js";
 import type { DownloadWorkerDeps } from "../workers/download.js";
-import type { SyncStatus, SyncError } from "../types.js";
+import type { SyncStatus, SyncError, SyncBlockedReason } from "../types.js";
 import { uploadAll } from "../workers/upload.js";
 import { downloadAll } from "../workers/download.js";
 
@@ -9,7 +9,15 @@ export interface SyncManagerOptions {
   pollInterval?: number;
   /** Max upload batch size per cycle (default: 50) */
   uploadBatchSize?: number;
+  /** Debounce for immediate sync after local ingest (default: 500ms) */
+  notifyDebounceMs?: number;
+  /** Optional runtime gate. Returning blocked skips upload/download without an error. */
+  canSync?: () => Promise<SyncCanRunResult> | SyncCanRunResult;
 }
+
+export type SyncCanRunResult =
+  | { ok: true }
+  | { ok: false; reason: string; message: string };
 
 export interface SyncManager {
   /** Start the background sync loop */
@@ -40,73 +48,97 @@ export function createSyncManager(
 ): SyncManager {
   const pollInterval = options?.pollInterval ?? 60_000;
   const uploadBatchSize = options?.uploadBatchSize ?? 50;
+  const notifyDebounceMs = options?.notifyDebounceMs ?? 500;
 
   let intervalId: ReturnType<typeof setInterval> | null = null;
+  let notifyTimerId: ReturnType<typeof setTimeout> | null = null;
   let isRunning = false;
   let lastSync: string | null = null;
   let lastProcessedTimestamp: string | null = null;
+  let blocked: SyncBlockedReason | null = null;
   let errors: SyncError[] = [];
   let cycleInFlight: Promise<void> | null = null;
+  let rerunRequested = false;
 
   async function runCycle(): Promise<void> {
     // Prevent concurrent cycles
     if (cycleInFlight) {
+      rerunRequested = true;
       return cycleInFlight;
     }
 
     cycleInFlight = (async () => {
-      try {
-        // Upload unsynced local files
-        const uploadResults = await uploadAll(uploadDeps, {
-          batchSize: uploadBatchSize,
-        });
-        uploadDeps.logger.debug(
-          { uploaded: uploadResults.length },
-          "Upload cycle complete",
-        );
-      } catch (err) {
-        const syncError: SyncError = {
-          fileId: null,
-          scope: null,
-          message: `Upload cycle failed: ${(err as Error).message}`,
-          timestamp: new Date().toISOString(),
-        };
-        pushError(syncError);
-        uploadDeps.logger.error(
-          { error: (err as Error).message },
-          "Upload cycle failed",
-        );
-      }
+      do {
+        rerunRequested = false;
+        const canRun = await (options?.canSync?.() ?? { ok: true });
+        if (!canRun.ok) {
+          blocked = { reason: canRun.reason, message: canRun.message };
+          uploadDeps.logger.warn(blocked, "Sync cycle blocked");
+          continue;
+        }
+        blocked = null;
 
-      try {
-        // Download new remote files
-        const downloadResults = await downloadAll(downloadDeps);
-        downloadDeps.logger.debug(
-          { downloaded: downloadResults.length },
-          "Download cycle complete",
-        );
-      } catch (err) {
-        const syncError: SyncError = {
-          fileId: null,
-          scope: null,
-          message: `Download cycle failed: ${(err as Error).message}`,
-          timestamp: new Date().toISOString(),
-        };
-        pushError(syncError);
-        downloadDeps.logger.error(
-          { error: (err as Error).message },
-          "Download cycle failed",
-        );
-      }
+        try {
+          // Upload unsynced local files
+          const uploadResults = await uploadAll(uploadDeps, {
+            batchSize: uploadBatchSize,
+            onError(entry, error) {
+              pushError({
+                fileId: entry.fileId,
+                scope: entry.scope,
+                message: `Upload failed for ${entry.path}: ${error.message}`,
+                timestamp: new Date().toISOString(),
+              });
+            },
+          });
+          uploadDeps.logger.debug(
+            { uploaded: uploadResults.length },
+            "Upload cycle complete",
+          );
+        } catch (err) {
+          const syncError: SyncError = {
+            fileId: null,
+            scope: null,
+            message: `Upload cycle failed: ${(err as Error).message}`,
+            timestamp: new Date().toISOString(),
+          };
+          pushError(syncError);
+          uploadDeps.logger.error(
+            { error: (err as Error).message },
+            "Upload cycle failed",
+          );
+        }
 
-      // Update cached cursor value
-      try {
-        lastProcessedTimestamp = await downloadDeps.cursor.read();
-      } catch {
-        // Non-critical: status will show stale value
-      }
+        try {
+          // Download new remote files
+          const downloadResults = await downloadAll(downloadDeps);
+          downloadDeps.logger.debug(
+            { downloaded: downloadResults.length },
+            "Download cycle complete",
+          );
+        } catch (err) {
+          const syncError: SyncError = {
+            fileId: null,
+            scope: null,
+            message: `Download cycle failed: ${(err as Error).message}`,
+            timestamp: new Date().toISOString(),
+          };
+          pushError(syncError);
+          downloadDeps.logger.error(
+            { error: (err as Error).message },
+            "Download cycle failed",
+          );
+        }
 
-      lastSync = new Date().toISOString();
+        // Update cached cursor value
+        try {
+          lastProcessedTimestamp = await downloadDeps.cursor.read();
+        } catch {
+          // Non-critical: status will show stale value
+        }
+
+        lastSync = new Date().toISOString();
+      } while (rerunRequested && isRunning);
     })();
 
     try {
@@ -114,6 +146,17 @@ export function createSyncManager(
     } finally {
       cycleInFlight = null;
     }
+  }
+
+  function scheduleNotifiedCycle(): void {
+    if (!isRunning || notifyTimerId !== null) return;
+    notifyTimerId = setTimeout(() => {
+      notifyTimerId = null;
+      if (!isRunning) return;
+      runCycle().catch(() => {
+        // Errors already captured in ring buffer
+      });
+    }, notifyDebounceMs);
   }
 
   function pushError(error: SyncError): void {
@@ -139,6 +182,13 @@ export function createSyncManager(
     }
   }
 
+  function clearNotifyTimer(): void {
+    if (notifyTimerId !== null) {
+      clearTimeout(notifyTimerId);
+      notifyTimerId = null;
+    }
+  }
+
   const manager: SyncManager = {
     get running() {
       return isRunning;
@@ -158,6 +208,7 @@ export function createSyncManager(
 
     async stop() {
       clearIntervalTimer();
+      clearNotifyTimer();
       isRunning = false;
 
       // Wait for any in-flight cycle to complete
@@ -167,8 +218,9 @@ export function createSyncManager(
     },
 
     async trigger() {
-      // Clear existing interval, run immediately, restart interval
+      // Clear existing timers, run immediately, restart interval
       clearIntervalTimer();
+      clearNotifyTimer();
       await runCycle();
       if (isRunning) {
         startInterval();
@@ -176,11 +228,13 @@ export function createSyncManager(
     },
 
     getStatus(): SyncStatus {
-      const pendingFiles = uploadDeps.indexManager.findUnsynced().length;
+      const pendingFiles = uploadDeps.storage.findUnsynced().length;
 
       return {
         enabled: true,
         running: isRunning,
+        syncing: cycleInFlight !== null,
+        blocked,
         lastSync,
         lastProcessedTimestamp,
         pendingFiles,
@@ -189,8 +243,8 @@ export function createSyncManager(
     },
 
     notifyNewData() {
-      // No-op signal — the next cycle picks up unsynced entries automatically.
       uploadDeps.logger.debug("New data notification received");
+      scheduleNotifiedCycle();
     },
   };
 

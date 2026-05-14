@@ -1,4 +1,4 @@
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -35,6 +35,7 @@ describe("createTokenStore", () => {
     // Verify persisted
     const raw = await readFile(tokensPath, "utf-8");
     const data = JSON.parse(raw);
+    expect(data.version).toBe(1);
     expect(data.tokens).toEqual(["vana_ps_abc123"]);
   });
 
@@ -46,7 +47,20 @@ describe("createTokenStore", () => {
 
     const raw = await readFile(tokensPath, "utf-8");
     const data = JSON.parse(raw);
+    expect(data.version).toBe(1);
     expect(data.tokens).toEqual([{ token: "vana_ps_expiring", expiresAt }]);
+  });
+
+  it("keeps loading legacy token files without a version", async () => {
+    await writeFile(
+      tokensPath,
+      JSON.stringify({ tokens: ["vana_ps_legacy"] }),
+      "utf-8",
+    );
+
+    const store = createTokenStore(tokensPath, logger);
+
+    expect(await store.isValid("vana_ps_legacy")).toBe(true);
   });
 
   it("supports multiple tokens", async () => {

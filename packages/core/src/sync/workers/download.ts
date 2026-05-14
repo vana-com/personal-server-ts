@@ -1,18 +1,17 @@
-import type { IndexManager } from "../../storage/index/manager.js";
-import type { HierarchyManagerOptions } from "../../storage/hierarchy/index.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
-import type { GatewayClient } from "../../gateway/client.js";
+import {
+  DataFileEnvelopeSchema,
+  decryptWithPassword,
+  deriveScopeKey,
+  type FileRecord,
+  type GatewayClient,
+} from "@opendatalabs/vana-sdk/browser";
 import type { SyncCursor } from "../cursor.js";
-import type { FileRecord } from "../types.js";
-import type { Logger } from "pino";
-import { writeDataFile } from "../../storage/hierarchy/index.js";
-import { deriveScopeKey } from "../../keys/derive.js";
-import { decryptWithPassword } from "../../storage/encryption/index.js";
-import { DataFileEnvelopeSchema } from "../../schemas/data-file.js";
+import type { Logger } from "../../logger/index.js";
+import type { DataStoragePort } from "../../ports/index.js";
 
 export interface DownloadWorkerDeps {
-  indexManager: IndexManager;
-  hierarchyOptions: HierarchyManagerOptions;
+  storage: DataStoragePort;
   storageAdapter: StorageAdapter;
   gateway: GatewayClient;
   cursor: SyncCursor;
@@ -43,17 +42,10 @@ export async function downloadOne(
   deps: DownloadWorkerDeps,
   record: FileRecord,
 ): Promise<DownloadResult | null> {
-  const {
-    indexManager,
-    hierarchyOptions,
-    storageAdapter,
-    gateway,
-    masterKey,
-    logger,
-  } = deps;
+  const { storage, storageAdapter, gateway, masterKey, logger } = deps;
 
   // 1. Check dedup: skip if fileId already in local index
-  const existing = indexManager.findByFileId(record.fileId);
+  const existing = storage.findByFileId(record.fileId);
   if (existing) {
     logger.debug({ fileId: record.fileId }, "File already in index, skipping");
     return null;
@@ -70,7 +62,7 @@ export async function downloadOne(
 
   // 4. Derive scope key → hex-encode as OpenPGP password
   const scopeKey = deriveScopeKey(masterKey, schema.scope);
-  const scopeKeyHex = Buffer.from(scopeKey).toString("hex");
+  const scopeKeyHex = uint8ToHex(scopeKey);
 
   // 5. Decrypt with OpenPGP password-based decryption
   const plaintext = await decryptWithPassword(encrypted, scopeKeyHex);
@@ -79,15 +71,35 @@ export async function downloadOne(
   const raw = JSON.parse(new TextDecoder().decode(plaintext));
   const envelope = DataFileEnvelopeSchema.parse(raw);
 
-  // 7. Write to local filesystem via hierarchy manager
-  const { relativePath, sizeBytes } = await writeDataFile(
-    hierarchyOptions,
-    envelope,
-  );
+  const existingByVersion = storage.findEntry({
+    scope: envelope.scope,
+    at: envelope.collectedAt,
+  });
+  if (
+    existingByVersion !== undefined &&
+    existingByVersion.collectedAt === envelope.collectedAt
+  ) {
+    if (existingByVersion.fileId !== record.fileId) {
+      await storage.updateFileId(existingByVersion.path, record.fileId);
+    }
+    logger.debug(
+      {
+        fileId: record.fileId,
+        scope: envelope.scope,
+        collectedAt: envelope.collectedAt,
+      },
+      "File version already exists locally, skipping",
+    );
+    return null;
+  }
+
+  // 7. Write to local storage via the runtime storage port
+  const { relativePath, sizeBytes } = await storage.writeEnvelope(envelope);
 
   // 8. Insert into local index (with fileId)
-  indexManager.insert({
+  await storage.insertEntry({
     fileId: record.fileId,
+    schemaId: record.schemaId,
     path: relativePath,
     scope: envelope.scope,
     collectedAt: envelope.collectedAt,
@@ -109,7 +121,7 @@ export async function downloadOne(
 
 /**
  * Poll Gateway for new file records since lastProcessedTimestamp,
- * download each, and advance the cursor.
+ * download each, and advance the cursor only when the page fully succeeds.
  */
 export async function downloadAll(
   deps: DownloadWorkerDeps,
@@ -126,6 +138,7 @@ export async function downloadAll(
   );
 
   const results: DownloadResult[] = [];
+  let failed = false;
 
   // 3. Process each file record
   for (const file of files) {
@@ -143,13 +156,25 @@ export async function downloadAll(
         },
         "Failed to download file",
       );
+      failed = true;
     }
   }
 
-  // 4. Advance cursor if there are new records
-  if (nextCursor !== null) {
+  // 4. Advance cursor only when every record in the page was handled.
+  if (nextCursor !== null && !failed) {
     await cursor.write(nextCursor);
+  } else if (failed) {
+    logger.warn(
+      { nextCursor },
+      "Download cursor not advanced because one or more files failed",
+    );
   }
 
   return results;
+}
+
+function uint8ToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
+    "",
+  );
 }

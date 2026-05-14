@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { ServerConfigSchema } from "./server-config.js";
-import { loadConfig, saveConfig } from "../config/loader.js";
+import { loadConfig, saveConfig } from "../../../server/src/config/loader.js";
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "server-config-test-"));

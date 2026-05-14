@@ -5,12 +5,12 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 import { startTestServer, type TestServer } from "./helpers/server.js";
 import { startMockGateway, type MockGateway } from "./helpers/mock-gateway.js";
-import { loadOrCreateServerAccount } from "../../packages/core/src/keys/server-account.js";
+import { loadOrCreateServerAccount } from "../../packages/server/src/keys/server-account.js";
 import {
   serverRegistrationDomain,
   SERVER_REGISTRATION_TYPES,
   type ServerRegistrationMessage,
-} from "../../packages/core/src/signing/index.js";
+} from "@opendatalabs/vana-sdk/node";
 import { DEFAULTS } from "../../packages/core/src/schemas/server-config.js";
 
 const KNOWN_SIG =

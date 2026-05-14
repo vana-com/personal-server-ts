@@ -8,14 +8,14 @@
  */
 
 import { privateKeyToAccount } from "viem/accounts";
-import { loadConfig } from "../packages/core/src/config/loader.js";
-import { resolveRootPath } from "../packages/core/src/config/paths.js";
-import { loadOrCreateServerAccount } from "../packages/core/src/keys/server-account.js";
+import { loadConfig } from "../packages/server/src/config/loader.js";
+import { resolveRootPath } from "../packages/server/src/config/paths.js";
+import { loadOrCreateServerAccount } from "../packages/server/src/keys/server-account.js";
 import {
   serverRegistrationDomain,
   SERVER_REGISTRATION_TYPES,
   type ServerRegistrationMessage,
-} from "../packages/core/src/signing/index.js";
+} from "@opendatalabs/vana-sdk/node";
 import { join } from "node:path";
 import { buildTunnelUrl } from "../packages/server/src/tunnel/verify.js";
 

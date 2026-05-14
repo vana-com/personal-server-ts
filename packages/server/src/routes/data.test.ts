@@ -3,21 +3,16 @@ import { mkdtemp, rm, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { pino } from "pino";
-import {
-  initializeDatabase,
-  createIndexManager,
-} from "@opendatalabs/personal-server-ts-core/storage/index";
+import { initializeDatabase } from "../storage/index-schema.js";
+import { createIndexManager } from "../storage/index-manager.js";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import {
   buildDataFilePath,
   buildScopeDir,
 } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
-import type {
-  GatewayClient,
-  Builder,
-} from "@opendatalabs/personal-server-ts-core/gateway";
-import type { GatewayGrantResponse } from "@opendatalabs/personal-server-ts-core/grants";
+import type { GatewayClient, Builder } from "@opendatalabs/vana-sdk/node";
+import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import {
   createTestWallet,
@@ -58,6 +53,13 @@ function createMockGateway(
       addedAt: "2026-01-21T10:00:00.000Z",
     }),
     getServer: vi.fn().mockResolvedValue(null),
+    getFile: vi.fn().mockResolvedValue(null),
+    listFilesSince: vi.fn().mockResolvedValue({ files: [], cursor: null }),
+    getSchema: vi.fn().mockResolvedValue(null),
+    registerServer: vi.fn().mockResolvedValue({ alreadyRegistered: false }),
+    registerFile: vi.fn().mockResolvedValue({}),
+    createGrant: vi.fn().mockResolvedValue({}),
+    revokeGrant: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
 }
@@ -119,11 +121,21 @@ async function postWithOwnerAuth(
     rawBody,
     wallet: signingWallet = ownerWallet,
   } = options;
+  const requestBody =
+    rawBody !== undefined
+      ? rawBody
+      : body !== undefined
+        ? JSON.stringify(body)
+        : undefined;
   const auth = await buildWeb3SignedHeader({
     wallet: signingWallet,
     aud: SERVER_ORIGIN,
     method: "POST",
     uri: `/${scope}`,
+    body:
+      requestBody !== undefined
+        ? new TextEncoder().encode(requestBody)
+        : undefined,
   });
   const init: RequestInit = {
     method: "POST",
@@ -132,11 +144,7 @@ async function postWithOwnerAuth(
       Authorization: auth,
     },
   };
-  if (rawBody !== undefined) {
-    init.body = rawBody;
-  } else if (body !== undefined) {
-    init.body = JSON.stringify(body);
-  }
+  if (requestBody !== undefined) init.body = requestBody;
   return app.request(`/${scope}`, init);
 }
 
@@ -316,6 +324,7 @@ describe("POST /v1/data/:scope", () => {
           aud: SERVER_ORIGIN,
           method: "POST",
           uri: "/instagram.profile",
+          body: new TextEncoder().encode("not json"),
         }),
       },
       body: "not json",
@@ -346,6 +355,7 @@ describe("POST /v1/data/:scope", () => {
     );
     const content = JSON.parse(await readFile(filePath, "utf-8"));
     expect(content.$schema).toBe("https://ipfs.io/ipfs/QmTestSchema");
+    expect(content.schemaId).toBe("0xschema1");
   });
 
   it("returns 400 NO_SCHEMA when no schema registered for scope", async () => {
@@ -950,6 +960,7 @@ describe("GET /v1/data/:scope", () => {
   it("returns 401 UNREGISTERED_BUILDER for unregistered builder", async () => {
     const gateway = createMockGateway({
       isRegisteredBuilder: vi.fn().mockResolvedValue(false),
+      getBuilder: vi.fn().mockResolvedValue(null),
     });
     const app = createApp({ gateway });
 
@@ -1015,6 +1026,75 @@ describe("GET /v1/data/:scope", () => {
     expect(res.status).toBe(403);
     const json = await res.json();
     expect(json.error.errorCode).toBe("SCOPE_MISMATCH");
+  });
+
+  it("returns 403 SCOPE_MISMATCH when fileId is not authorized by grant", async () => {
+    const grant = makeGrant({ fileIds: ["file-1"] });
+    const gateway = createMockGateway({
+      getGrant: vi.fn().mockResolvedValue(grant),
+    });
+    const app = createApp({ gateway });
+
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+
+    const res = await getWithAuth(app, "instagram.profile", {
+      query: "?fileId=file-2",
+    });
+
+    expect(res.status).toBe(403);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("SCOPE_MISMATCH");
+  });
+
+  it("authorizes default latest reads against selected entry fileId", async () => {
+    const grant = makeGrant({ fileIds: ["file-1"] });
+    const gateway = createMockGateway({
+      getGrant: vi.fn().mockResolvedValue(grant),
+    });
+    const app = createApp({ gateway });
+
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+    const entry = indexManager.findLatestByScope("instagram.profile");
+    expect(entry).toBeDefined();
+    indexManager.updateFileId(entry!.path, "file-1");
+
+    const res = await getWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.data).toEqual({ username: "test_user" });
+  });
+
+  it("returns 403 FEE_REQUIRED when fee verification fails", async () => {
+    const app = createApp({
+      feeVerifier: {
+        verifyDataReadFee: vi
+          .fn()
+          .mockResolvedValue({ ok: false, reason: "unpaid" }),
+      },
+    });
+
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+
+    const res = await getWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(403);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("FEE_REQUIRED");
+  });
+
+  it("returns 503 PS_UNAVAILABLE when runtime availability fails", async () => {
+    const app = createApp({
+      runtimeAvailability: { isAvailable: vi.fn().mockReturnValue(false) },
+    });
+
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+
+    const res = await getWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(503);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("PS_UNAVAILABLE");
   });
 
   it("returns 404 for nonexistent scope", async () => {

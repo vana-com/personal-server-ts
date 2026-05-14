@@ -20,6 +20,10 @@
       "types": "./dist/api.d.ts",
       "import": "./dist/api.js"
     },
+    "./config": {
+      "types": "./dist/config/index.d.ts",
+      "import": "./dist/config/index.js"
+    },
     "./runtime": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
@@ -32,14 +36,24 @@
     "dist"
   ],
   "scripts": {
-    "copy-ui": "mkdir -p dist/ui && cp src/ui/index.html dist/ui/index.html",
-    "build": "tsc --build && npm run copy-ui",
+    "copy-ui": "mkdir -p dist/ui && cp src/ui/index.html dist/ui/index.html && cp ../lite/src/browser-tls-rustls/browser_tls_rustls_bg.wasm dist/ui/browser_tls_rustls_bg.wasm",
+    "bundle-ui": "esbuild src/ui/ps-lite-debug.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=dist/ui/ps-lite-debug.js",
+    "build": "tsc --build && npm run copy-ui && npm run bundle-ui",
     "start": "node dist/index.js",
     "dev": "node --watch dist/index.js"
   },
   "dependencies": {
     "@hono/node-server": "^1.19.13",
     "@opendatalabs/personal-server-ts-core": "*",
-    "hono": "^4.12.18"
+    "@opendatalabs/personal-server-ts-lite": "*",
+    "@opendatalabs/vana-sdk": "3.0.1-canary.b068ac6",
+    "better-sqlite3": "^12.9.0",
+    "hono": "^4.12.18",
+    "pino": "^10.3.1",
+    "pino-pretty": "^13.0.0",
+    "viem": "^2.48.11"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0"
   }
 }

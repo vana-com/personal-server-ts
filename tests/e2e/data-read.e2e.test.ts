@@ -7,6 +7,8 @@ import {
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 
 const wallet = createTestWallet(0);
+const KNOWN_SIG =
+  "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
 
 describe("Data read endpoint (e2e)", () => {
   let server: TestServer;
@@ -14,7 +16,10 @@ describe("Data read endpoint (e2e)", () => {
 
   beforeAll(async () => {
     gateway = await startMockGateway();
-    server = await startTestServer({ gatewayUrl: gateway.url });
+    server = await startTestServer({
+      gatewayUrl: gateway.url,
+      masterKeySignature: KNOWN_SIG,
+    });
   });
 
   afterAll(async () => {
@@ -23,9 +28,15 @@ describe("Data read endpoint (e2e)", () => {
   });
 
   async function postData(scope: string, data: Record<string, unknown>) {
+    if (!server.devToken) {
+      throw new Error("Test server did not expose a dev token");
+    }
     const res = await fetch(`${server.url}/v1/data/${scope}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${server.devToken}`,
+      },
       body: JSON.stringify(data),
     });
     return res.json();
