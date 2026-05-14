@@ -7,10 +7,12 @@ import {
   type ServerInfo,
   type RegisterServerParams,
   type RegisterServerResult,
-  SERVER_REGISTRATION_TYPES,
-  serverRegistrationDomain,
   type Web3SignedSignFn,
 } from "@opendatalabs/vana-sdk/browser";
+import {
+  buildPersonalServerRegistrationTypedData,
+  type PersonalServerRegistrationTypedData,
+} from "@opendatalabs/vana-sdk/protocol/personal-server-registration";
 import type { ScopeSummary } from "./storage/index/types.js";
 import type { SyncStatus } from "./sync/types.js";
 
@@ -44,12 +46,7 @@ export type PersonalServerRegistrationCandidate = Omit<
 export interface PersonalServerRegistrationRequest {
   gatewayConfig: DataPortabilityGatewayConfig;
   candidate: PersonalServerRegistrationCandidate;
-  typedData: {
-    domain: ReturnType<typeof serverRegistrationDomain>;
-    types: typeof SERVER_REGISTRATION_TYPES;
-    primaryType: "ServerRegistration";
-    message: PersonalServerRegistrationCandidate;
-  };
+  typedData: PersonalServerRegistrationTypedData;
 }
 
 export interface PersonalServerInfo {
@@ -282,12 +279,13 @@ export function createPersonalServerRegistrationRequest(params: {
   return {
     gatewayConfig: params.gatewayConfig,
     candidate,
-    typedData: {
-      domain: serverRegistrationDomain(params.gatewayConfig),
-      types: SERVER_REGISTRATION_TYPES,
-      primaryType: "ServerRegistration",
-      message: candidate,
-    },
+    typedData: buildPersonalServerRegistrationTypedData({
+      ownerAddress: params.ownerAddress,
+      serverAddress: params.serverAddress,
+      serverPublicKey: params.publicKey,
+      serverUrl: params.serverUrl,
+      config: params.gatewayConfig,
+    }),
   };
 }
 
