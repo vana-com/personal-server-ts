@@ -68,6 +68,7 @@ export async function startPersonalServer(
   let status: PersonalServerStatus = "starting";
   let stopped = false;
   let lastInfo: PersonalServerInfo | null = null;
+  let lastPreparedRegistration: PersonalServerRegistrationRequest | null = null;
   const setStatus = (nextStatus: PersonalServerStatus): void => {
     status = nextStatus;
     options.onStatus?.(nextStatus);
@@ -158,21 +159,28 @@ export async function startPersonalServer(
     if (!current.gatewayConfig) {
       throw new Error("Personal Server gateway config is required");
     }
-    return createPersonalServerRegistrationRequest({
+    const request = createPersonalServerRegistrationRequest({
       gatewayConfig: current.gatewayConfig,
       ownerAddress: current.ownerAddress,
       serverAddress: current.server.address,
       publicKey: current.server.publicKey,
       serverUrl,
     });
+    lastPreparedRegistration = request;
+    return request;
   }
 
   async function submitRegistration(
     submitOptions: PersonalServerSubmitRegistrationOptions,
   ): Promise<RegisterServerResult> {
+    const request =
+      submitOptions.request ??
+      (submitOptions.serverUrl
+        ? await prepareRegistration({ serverUrl: submitOptions.serverUrl })
+        : (lastPreparedRegistration ?? (await prepareRegistration())));
     return submitPersonalServerRegistration({
       gateway: context.gatewayClient,
-      request: await prepareRegistration(),
+      request,
       signature: submitOptions.signature,
     });
   }

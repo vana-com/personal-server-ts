@@ -142,6 +142,47 @@ describe("startPersonalServer node handle", () => {
     });
   });
 
+  it("submits the exact prepared registration request when a public server URL is provided", async () => {
+    const gateway = createGateway();
+    const { ps, port } = await startTestServer(gateway);
+    const registration = await ps.prepareRegistration({
+      serverUrl: "https://node-public.example",
+    });
+
+    await expect(
+      ps.submitRegistration({
+        request: registration,
+        signature: "0xregistration",
+      }),
+    ).resolves.toEqual({ alreadyRegistered: false, serverId: "server-1" });
+    expect(registration.candidate.serverUrl).toBe(
+      "https://node-public.example",
+    );
+    expect(registration.candidate.serverUrl).not.toBe(
+      `http://localhost:${port}`,
+    );
+    expect(gateway.registerServer).toHaveBeenCalledWith({
+      ...registration.candidate,
+      signature: "0xregistration",
+    });
+  });
+
+  it("submits the most recently prepared registration request when no request is passed", async () => {
+    const gateway = createGateway();
+    const { ps } = await startTestServer(gateway);
+    const registration = await ps.prepareRegistration({
+      serverUrl: "https://node-public.example",
+    });
+
+    await expect(
+      ps.submitRegistration({ signature: "0xregistration" }),
+    ).resolves.toEqual({ alreadyRegistered: false, serverId: "server-1" });
+    expect(gateway.registerServer).toHaveBeenCalledWith({
+      ...registration.candidate,
+      signature: "0xregistration",
+    });
+  });
+
   it("posts data through the public handle", async () => {
     const { ps } = await startTestServer();
 

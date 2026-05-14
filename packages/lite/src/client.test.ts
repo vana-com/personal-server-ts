@@ -131,6 +131,55 @@ describe("startPersonalServer lite handle", () => {
     });
   });
 
+  it("submits the exact prepared registration request when a public server URL is provided", async () => {
+    const gateway = createGateway();
+    const ps = await startPersonalServer({
+      runtime: createRuntime(gateway),
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const registration = await ps.prepareRegistration({
+      serverUrl: "https://lite-public.example",
+    });
+
+    await expect(
+      ps.submitRegistration({
+        request: registration,
+        signature: "0xregistration",
+      }),
+    ).resolves.toEqual({ alreadyRegistered: false, serverId: "server-1" });
+    expect(registration.candidate.serverUrl).toBe(
+      "https://lite-public.example",
+    );
+    expect(registration.candidate.serverUrl).not.toBe(ORIGIN);
+    expect(gateway.registerServer).toHaveBeenCalledWith({
+      ...registration.candidate,
+      signature: "0xregistration",
+    });
+  });
+
+  it("submits the most recently prepared registration request when no request is passed", async () => {
+    const gateway = createGateway();
+    const ps = await startPersonalServer({
+      runtime: createRuntime(gateway),
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const registration = await ps.prepareRegistration({
+      serverUrl: "https://lite-public.example",
+    });
+
+    await expect(
+      ps.submitRegistration({ signature: "0xregistration" }),
+    ).resolves.toEqual({ alreadyRegistered: false, serverId: "server-1" });
+    expect(gateway.registerServer).toHaveBeenCalledWith({
+      ...registration.candidate,
+      signature: "0xregistration",
+    });
+  });
+
   it("posts data with owner Web3Signed auth", async () => {
     const gateway = createGateway();
     const ps = await startPersonalServer({

@@ -74,6 +74,8 @@ export interface PersonalServerPrepareRegistrationOptions {
 }
 
 export interface PersonalServerSubmitRegistrationOptions {
+  request?: PersonalServerRegistrationRequest;
+  serverUrl?: string;
   signature: `0x${string}`;
 }
 

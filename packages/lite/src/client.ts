@@ -138,6 +138,7 @@ export async function startPersonalServer(
   let relayClient: PsLiteRelayClient | undefined;
   let publicUrl: string | null = null;
   let lastInfo: PersonalServerInfo | null = null;
+  let lastPreparedRegistration: PersonalServerRegistrationRequest | null = null;
   const gateway = options.gateway;
 
   const setStatus = (nextStatus: PersonalServerStatus): void => {
@@ -190,19 +191,25 @@ export async function startPersonalServer(
     if (!current.gatewayConfig) {
       throw new Error("Personal Server gateway config is required");
     }
-    return createPersonalServerRegistrationRequest({
+    const request = createPersonalServerRegistrationRequest({
       gatewayConfig: current.gatewayConfig,
       ownerAddress: current.ownerAddress,
       serverAddress: current.server.address,
       publicKey: current.server.publicKey,
       serverUrl,
     });
+    lastPreparedRegistration = request;
+    return request;
   }
 
   async function submitRegistration(
     submitOptions: PersonalServerSubmitRegistrationOptions,
   ): Promise<RegisterServerResult> {
-    const request = await prepareRegistration();
+    const request =
+      submitOptions.request ??
+      (submitOptions.serverUrl
+        ? await prepareRegistration({ serverUrl: submitOptions.serverUrl })
+        : (lastPreparedRegistration ?? (await prepareRegistration())));
     const gatewayClient =
       gateway ?? createGatewayClient(requiredGatewayUrl(await info()));
     return submitPersonalServerRegistration({
