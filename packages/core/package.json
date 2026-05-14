@@ -110,7 +110,7 @@
   },
   "dependencies": {
     "@opendatalabs/vana-sdk": "3.2.0",
-    "viem": "^2.48.11",
+    "viem": "^2.49.0",
     "zod": "^4.4.3"
   }
 }
