@@ -16,6 +16,7 @@ function createMockSyncManager(overrides?: Partial<SyncManager>): SyncManager {
   const status: SyncStatus = {
     enabled: true,
     running: true,
+    syncing: false,
     lastSync: "2026-01-21T10:00:00.000Z",
     lastProcessedTimestamp: "2026-01-21T09:00:00.000Z",
     pendingFiles: 3,
@@ -64,6 +65,32 @@ describe("syncRoutes", () => {
         });
         expect(mockSyncManager.trigger).toHaveBeenCalled();
       });
+
+      it("returns immediately while sync continues in the background", async () => {
+        const trigger = vi.fn<() => Promise<void>>(
+          () => new Promise(() => undefined),
+        );
+        const app = syncRoutes({
+          logger,
+          serverOrigin: SERVER_ORIGIN,
+          serverOwner: owner.address,
+          syncManager: createMockSyncManager({ trigger }),
+        });
+        const auth = await buildWeb3SignedHeader({
+          wallet: owner,
+          aud: SERVER_ORIGIN,
+          method: "POST",
+          uri: "/trigger",
+        });
+
+        const res = await app.request("/trigger", {
+          method: "POST",
+          headers: { authorization: auth },
+        });
+
+        expect(res.status).toBe(202);
+        expect(trigger).toHaveBeenCalledTimes(1);
+      });
     });
 
     describe("GET /status", () => {
@@ -84,6 +111,7 @@ describe("syncRoutes", () => {
         expect(json).toEqual({
           enabled: true,
           running: true,
+          syncing: false,
           lastSync: "2026-01-21T10:00:00.000Z",
           lastProcessedTimestamp: "2026-01-21T09:00:00.000Z",
           pendingFiles: 3,
@@ -162,6 +190,7 @@ describe("syncRoutes", () => {
         expect(json).toEqual({
           enabled: false,
           running: false,
+          syncing: false,
           lastSync: null,
           lastProcessedTimestamp: null,
           pendingFiles: 0,

@@ -5,8 +5,8 @@ import type {
   AccessLogWriter,
   AccessLogEntry,
 } from "@opendatalabs/personal-server-ts-core/logging/access-log";
-import type { VerifiedAuth } from "@opendatalabs/personal-server-ts-core/auth";
-import type { GatewayGrantResponse } from "@opendatalabs/personal-server-ts-core/grants";
+import type { VerifiedAuth } from "@opendatalabs/vana-sdk/node";
+import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
 
 function createMockWriter(
   overrides: Partial<AccessLogWriter> = {},
@@ -19,9 +19,19 @@ function createMockWriter(
 
 function createApp(
   writer: AccessLogWriter,
-  options: { status?: number; setAuth?: boolean; setGrant?: boolean } = {},
+  options: {
+    status?: number;
+    setAuth?: boolean;
+    setGrant?: boolean;
+    policyBypass?: boolean;
+  } = {},
 ) {
-  const { status = 200, setAuth = true, setGrant = true } = options;
+  const {
+    status = 200,
+    setAuth = true,
+    setGrant = true,
+    policyBypass = false,
+  } = options;
   const app = new Hono();
   const accessLog = createAccessLogMiddleware(writer);
 
@@ -57,6 +67,7 @@ function createApp(
   app.use("/v1/data/:scope", async (c, next) => {
     if (setAuth) c.set("auth", auth);
     if (setGrant) c.set("grant", grant);
+    if (policyBypass) c.set("isPolicyBypass", true);
     await next();
   });
 
@@ -119,6 +130,19 @@ describe("createAccessLogMiddleware", () => {
 
     const entry = writer.write.mock.calls[0][0] as AccessLogEntry;
     expect(entry.userAgent).toBe("unknown");
+  });
+
+  it("policy-bypass reads without grants are logged for debug UI visibility", async () => {
+    const writer = createMockWriter();
+    const app = createApp(writer, { setGrant: false, policyBypass: true });
+
+    const res = await app.request("/v1/data/instagram.profile");
+
+    expect(res.status).toBe(200);
+    expect(writer.write).toHaveBeenCalledOnce();
+    const entry = writer.write.mock.calls[0][0] as AccessLogEntry;
+    expect(entry.grantId).toBe("policy-bypass");
+    expect(entry.builder).toBe("0xBuilderAddress");
   });
 
   it("writer failure does not affect response", async () => {

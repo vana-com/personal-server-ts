@@ -8,6 +8,7 @@ export interface FrpcConfigOptions {
   serverAddr: string;
   serverPort: number;
   localPort: number;
+  proxyName?: string;
   subdomain: string;
   walletAddress: string;
   ownerAddress: string;
@@ -41,7 +42,7 @@ metadatas.auth_claim = "${options.authClaim}"
 metadatas.auth_sig = "${options.authSig}"
 
 [[proxies]]
-name = "personal-server"
+name = "${options.proxyName ?? `personal-server-${options.subdomain.toLowerCase()}`}"
 type = "http"
 localIP = "127.0.0.1"
 localPort = ${options.localPort}

@@ -1,13 +1,13 @@
-import pino, { type Logger } from "pino";
 import type { LoggingConfig } from "../schemas/server-config.js";
 
-export type { Logger } from "pino";
+export interface Logger {
+  debug(payloadOrMessage?: unknown, message?: string): void;
+  info(payloadOrMessage?: unknown, message?: string): void;
+  warn(payloadOrMessage?: unknown, message?: string): void;
+  error(payloadOrMessage?: unknown, message?: string): void;
+}
 
 export function createLogger(config: LoggingConfig): Logger {
-  const usePretty = config.pretty || process.env.NODE_ENV !== "production";
-
-  return pino({
-    level: config.level,
-    ...(usePretty ? { transport: { target: "pino-pretty" } } : {}),
-  });
+  void config;
+  return console;
 }

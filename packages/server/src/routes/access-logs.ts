@@ -6,45 +6,48 @@
 import { Hono } from "hono";
 import type { Logger } from "pino";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
+import {
+  handlePersonalServerAccessLogsRequest,
+  type PersonalServerApiDispatchOptions,
+} from "@opendatalabs/personal-server-ts-core/api";
 import type { TokenStore } from "../token-store.js";
-import { createWeb3AuthMiddleware } from "../middleware/web3-auth.js";
-import { createOwnerCheckMiddleware } from "../middleware/owner-check.js";
+import { createServerApiAuth } from "../api-auth.js";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 
 export interface AccessLogsRouteDeps {
   logger: Logger;
   accessLogReader: AccessLogReader;
   serverOrigin: string | (() => string);
   serverOwner?: `0x${string}`;
+  gateway: GatewayClient;
   devToken?: string;
+  accessToken?: string;
   tokenStore?: TokenStore;
+  mountPath?: PersonalServerApiDispatchOptions["basePath"];
 }
 
 export function accessLogsRoutes(deps: AccessLogsRouteDeps): Hono {
   const app = new Hono();
 
-  const web3Auth = createWeb3AuthMiddleware({
+  const auth = createServerApiAuth({
     serverOrigin: deps.serverOrigin,
-    devToken: deps.devToken,
-    tokenStore: deps.tokenStore,
     serverOwner: deps.serverOwner,
+    gateway: deps.gateway,
+    devToken: deps.devToken,
+    accessToken: deps.accessToken,
+    tokenStore: deps.tokenStore,
   });
-  const ownerCheck = createOwnerCheckMiddleware(deps.serverOwner);
 
-  // GET / — list access logs with pagination (owner auth required)
-  app.get("/", web3Auth, ownerCheck, async (c) => {
-    const limitParam = c.req.query("limit");
-    const offsetParam = c.req.query("offset");
-
-    const limit = limitParam !== undefined ? parseInt(limitParam, 10) : 50;
-    const offset = offsetParam !== undefined ? parseInt(offsetParam, 10) : 0;
-
-    const result = await deps.accessLogReader.read({
-      limit: Number.isNaN(limit) ? 50 : limit,
-      offset: Number.isNaN(offset) ? 0 : offset,
-    });
-
-    return c.json(result);
-  });
+  app.all("*", (c) =>
+    handlePersonalServerAccessLogsRequest(
+      c.req.raw,
+      {
+        auth,
+        accessLogReader: deps.accessLogReader,
+      },
+      { basePath: deps.mountPath },
+    ),
+  );
 
   return app;
 }

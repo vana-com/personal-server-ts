@@ -13,7 +13,11 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { writeFile, mkdir, chmod, access, constants } from "node:fs/promises";
 import { join } from "node:path";
 import type { ServerAccount } from "@opendatalabs/personal-server-ts-core/keys";
-import { generateSignedClaim, CLAIM_TTL_SECONDS } from "./auth.js";
+import {
+  generateSignedClaim,
+  CLAIM_TTL_SECONDS,
+  type TunnelClaimSigner,
+} from "./auth.js";
 import { generateFrpcConfig } from "./config.js";
 import { buildTunnelUrl } from "./verify.js";
 
@@ -29,6 +33,8 @@ export interface TunnelStatusInfo {
   status: TunnelStatus;
   publicUrl: string | null;
   connectedSince: string | null;
+  routable?: boolean;
+  warning?: string;
   error?: string;
 }
 
@@ -36,6 +42,7 @@ export interface TunnelConfig {
   walletAddress: string;
   ownerAddress: string;
   serverKeypair: ServerAccount;
+  tunnelSigner?: TunnelClaimSigner;
   runId: string;
   serverAddr: string;
   serverPort: number;
@@ -55,6 +62,8 @@ export class TunnelManager {
   private publicUrl: string | null = null;
   private connectedSince: Date | null = null;
   private lastError: string | null = null;
+  private routable: boolean | undefined;
+  private routeWarning: string | null = null;
   private config: TunnelConfig | null = null;
   private binaryPath: string | null = null;
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -78,6 +87,8 @@ export class TunnelManager {
     this.binaryPath = binaryPath;
     this.status = "starting";
     this.lastError = null;
+    this.routable = undefined;
+    this.routeWarning = null;
 
     // Verify binary exists and is executable
     try {
@@ -128,6 +139,8 @@ export class TunnelManager {
         this.status = "stopped";
         this.publicUrl = null;
         this.connectedSince = null;
+        this.routable = undefined;
+        this.routeWarning = null;
         resolve();
       });
 
@@ -147,13 +160,10 @@ export class TunnelManager {
    * Update status based on external verification of the tunnel URL.
    */
   setVerified(reachable: boolean, error?: string): void {
-    if (reachable) {
-      this.status = "connected";
-      this.lastError = null;
-    } else {
-      this.status = "error";
-      this.lastError = error ?? "Tunnel URL not reachable";
-    }
+    this.routable = reachable;
+    this.routeWarning = reachable
+      ? null
+      : (error ?? "Tunnel URL not reachable");
   }
 
   /**
@@ -165,6 +175,8 @@ export class TunnelManager {
       status: this.status,
       publicUrl: this.publicUrl,
       connectedSince: this.connectedSince?.toISOString() ?? null,
+      routable: this.routable,
+      warning: this.routeWarning ?? undefined,
       error: this.lastError ?? undefined,
     };
   }
@@ -191,6 +203,7 @@ export class TunnelManager {
       walletAddress: config.walletAddress,
       runId: config.runId,
       serverKeypair: config.serverKeypair,
+      signer: config.tunnelSigner,
     });
 
     const frpcConfig = generateFrpcConfig({
@@ -227,19 +240,37 @@ export class TunnelManager {
 
       let startupOutput = "";
       let resolved = false;
+      const cleanMessage = (message: string): string =>
+        message.replace(/\x1b\[[0-9;]*m/g, "").trim();
+
+      const markRetrying = (message: string) => {
+        const warning = cleanMessage(message);
+        this.routeWarning = warning || "Waiting for tunnel connection";
+      };
 
       const onData = (data: Buffer) => {
         const text = data.toString();
         startupOutput += text;
 
         if (
-          text.includes("start proxy success") ||
-          text.includes("login to server success")
+          text.includes("start error:") ||
+          text.includes("connect to server error:")
         ) {
+          markRetrying(startupOutput);
           if (!resolved) {
             resolved = true;
-            this.status = "connected";
-            this.connectedSince = new Date();
+            resolve();
+          }
+          return;
+        }
+
+        if (text.includes("start proxy success")) {
+          this.status = "connected";
+          this.connectedSince ??= new Date();
+          this.routable = undefined;
+          this.routeWarning = null;
+          if (!resolved) {
+            resolved = true;
             resolve();
           }
         }
@@ -268,15 +299,21 @@ export class TunnelManager {
           reject(new Error(this.lastError));
         } else if (this.status === "connected") {
           this.status = "disconnected";
+        } else if (code !== 0) {
+          this.status = "error";
+          this.lastError = `frpc exited with code ${code}: ${startupOutput}`;
+        } else {
+          this.status = "disconnected";
         }
       });
 
-      // Timeout for startup — resolve optimistically
+      // Timeout for startup — resolve optimistically. frpc is generated with
+      // loginFailExit=false, so auth/registration/network failures can recover
+      // after the server is registered or connectivity returns.
       setTimeout(() => {
         if (!resolved) {
           resolved = true;
-          this.status = "connected";
-          this.connectedSince = new Date();
+          markRetrying(startupOutput || "Waiting for proxy startup");
           resolve();
         }
       }, 10_000);

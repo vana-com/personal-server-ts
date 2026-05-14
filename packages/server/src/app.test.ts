@@ -4,12 +4,12 @@ import { tmpdir } from "node:os";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createApp } from "./app.js";
 import { MissingAuthError } from "@opendatalabs/personal-server-ts-core/errors";
+import { initializeDatabase } from "./storage/index-schema.js";
 import {
-  initializeDatabase,
   createIndexManager,
   type IndexManager,
-} from "@opendatalabs/personal-server-ts-core/storage/index";
-import type { GatewayClient } from "@opendatalabs/personal-server-ts-core/gateway";
+} from "./storage/index-manager.js";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import {
@@ -33,6 +33,7 @@ function createMockSyncManager(): SyncManager {
     getStatus: vi.fn().mockReturnValue({
       enabled: true,
       running: true,
+      syncing: false,
       lastSync: null,
       lastProcessedTimestamp: null,
       pendingFiles: 0,
@@ -58,6 +59,13 @@ function createMockGateway(): GatewayClient {
       addedAt: "2026-01-21T10:00:00.000Z",
     }),
     getServer: vi.fn().mockResolvedValue(null),
+    registerServer: vi.fn().mockResolvedValue({ alreadyRegistered: false }),
+    getFile: vi.fn().mockResolvedValue(null),
+    listFilesSince: vi.fn().mockResolvedValue({ files: [], cursor: null }),
+    getSchema: vi.fn().mockResolvedValue(null),
+    registerFile: vi.fn().mockResolvedValue({}),
+    createGrant: vi.fn().mockResolvedValue({}),
+    revokeGrant: vi.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -289,18 +297,17 @@ describe("createApp", () => {
     expect(body.error.errorCode).toBe("MISSING_AUTH");
   });
 
-  it("control-plane token cannot read owner grants routes", async () => {
+  it("control-plane token can read owner grants routes", async () => {
     const app = makeAppWithControlPlaneToken();
     const res = await app.request("/v1/grants", {
       headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
     });
 
-    expect(res.status).toBe(401);
-    const body = await res.json();
-    expect(body.error.errorCode).toBe("INVALID_SIGNATURE");
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({ grants: [] });
   });
 
-  it("control-plane token cannot write owner data routes", async () => {
+  it("control-plane token can write owner data routes", async () => {
     const app = makeAppWithControlPlaneToken();
     const res = await app.request("/v1/data/test.scope", {
       method: "POST",
@@ -311,21 +318,21 @@ describe("createApp", () => {
       body: JSON.stringify({ data: "value" }),
     });
 
-    expect(res.status).toBe(401);
-    const body = await res.json();
-    expect(body.error.errorCode).toBe("INVALID_SIGNATURE");
+    expect(res.status).toBe(201);
   });
 
-  it("control-plane token cannot trigger sync routes", async () => {
+  it("control-plane token can trigger sync routes", async () => {
     const app = makeAppWithControlPlaneToken();
     const res = await app.request("/v1/sync/trigger", {
       method: "POST",
       headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
     });
 
-    expect(res.status).toBe(401);
-    const body = await res.json();
-    expect(body.error.errorCode).toBe("INVALID_SIGNATURE");
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      status: "disabled",
+      message: "Sync is not enabled",
+    });
   });
 
   it("POST /v1/grants/verify without auth → 400 (public endpoint, no auth wall)", async () => {
@@ -523,11 +530,13 @@ describe("createApp", () => {
       syncManager: mockSyncManager,
     });
 
+    const requestBody = JSON.stringify({ data: "value" });
     const auth = await buildWeb3SignedHeader({
       wallet: ownerWallet,
       aud: SERVER_ORIGIN,
       method: "POST",
       uri: "/v1/data/test.scope",
+      body: new TextEncoder().encode(requestBody),
     });
     const res = await app.request("/v1/data/test.scope", {
       method: "POST",
@@ -535,7 +544,7 @@ describe("createApp", () => {
         "Content-Type": "application/json",
         authorization: auth,
       },
-      body: JSON.stringify({ data: "value" }),
+      body: requestBody,
     });
     expect(res.status).toBe(201);
 
@@ -577,11 +586,13 @@ describe("createApp", () => {
 
   it("without syncManager — POST /v1/data/:scope returns stored status", async () => {
     const app = makeApp(); // makeApp doesn't pass syncManager
+    const requestBody = JSON.stringify({ data: "value" });
     const auth = await buildWeb3SignedHeader({
       wallet: ownerWallet,
       aud: SERVER_ORIGIN,
       method: "POST",
       uri: "/v1/data/test.scope",
+      body: new TextEncoder().encode(requestBody),
     });
     const res = await app.request("/v1/data/test.scope", {
       method: "POST",
@@ -589,7 +600,7 @@ describe("createApp", () => {
         "Content-Type": "application/json",
         authorization: auth,
       },
-      body: JSON.stringify({ data: "value" }),
+      body: requestBody,
     });
     expect(res.status).toBe(201);
 

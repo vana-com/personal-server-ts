@@ -44,6 +44,19 @@ describe("tunnel/config", () => {
       expect(config).toContain('type = "http"');
     });
 
+    it("uses a wallet-scoped default proxy name", () => {
+      const config = generateFrpcConfig(defaultOptions);
+      expect(config).toContain('name = "personal-server-0xabcdef"');
+    });
+
+    it("supports an explicit proxy name", () => {
+      const config = generateFrpcConfig({
+        ...defaultOptions,
+        proxyName: "personal-server-custom",
+      });
+      expect(config).toContain('name = "personal-server-custom"');
+    });
+
     it("sets localPort correctly", () => {
       const config = generateFrpcConfig(defaultOptions);
       expect(config).toContain("localPort = 8080");

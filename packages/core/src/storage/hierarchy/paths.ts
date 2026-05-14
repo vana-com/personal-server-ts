@@ -1,5 +1,4 @@
-import { join } from "node:path";
-import { scopeToPathSegments } from "../../scopes/parse.js";
+import { scopeToPathSegments } from "@opendatalabs/vana-sdk/browser";
 
 /** "2026-01-21T10:00:00Z" → "2026-01-21T10-00-00Z" */
 export function timestampToFilename(isoTimestamp: string): string {
@@ -26,13 +25,13 @@ export function buildDataFilePath(
 ): string {
   const segments = scopeToPathSegments(scope);
   const filename = timestampToFilename(collectedAt) + ".json";
-  return join(baseDir, ...segments, filename);
+  return joinPath(baseDir, ...segments, filename);
 }
 
 /** Directory path for a scope */
 export function buildScopeDir(baseDir: string, scope: string): string {
   const segments = scopeToPathSegments(scope);
-  return join(baseDir, ...segments);
+  return joinPath(baseDir, ...segments);
 }
 
 /** Generate current UTC timestamp without milliseconds, ending in Z */
@@ -40,4 +39,13 @@ export function generateCollectedAt(): string {
   const now = new Date();
   now.setMilliseconds(0);
   return now.toISOString().replace(".000Z", "Z");
+}
+
+function joinPath(...parts: string[]): string {
+  const [first = "", ...rest] = parts;
+  const prefix = first.startsWith("/") ? "/" : "";
+  const segments = [first, ...rest]
+    .flatMap((part) => part.split("/"))
+    .filter((part) => part.length > 0);
+  return prefix + segments.join("/");
 }

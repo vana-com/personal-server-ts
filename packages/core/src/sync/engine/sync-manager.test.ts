@@ -2,13 +2,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 import type { UploadWorkerDeps } from "../workers/upload.js";
 import type { DownloadWorkerDeps } from "../workers/download.js";
-import type { IndexManager } from "../../storage/index/manager.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
-import type { GatewayClient } from "../../gateway/client.js";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../../signing/signer.js";
 import type { SyncCursor } from "../cursor.js";
-import type { HierarchyManagerOptions } from "../../storage/hierarchy/index.js";
-import type { Logger } from "pino";
+import type { Logger } from "../../logger/index.js";
+import type { DataStoragePort } from "../../ports/index.js";
 
 // Mock workers so we control their behavior
 vi.mock("../workers/upload.js", () => ({
@@ -35,14 +34,13 @@ function makeMockLogger(): Logger {
 }
 
 function makeMockUploadDeps(): UploadWorkerDeps {
-  const mockIndexManager: Partial<IndexManager> = {
+  const mockStorage: Partial<DataStoragePort> = {
     findUnsynced: vi.fn().mockReturnValue([]),
     updateFileId: vi.fn().mockReturnValue(true),
   };
 
   return {
-    indexManager: mockIndexManager as IndexManager,
-    hierarchyOptions: { dataDir: "/tmp/data" } as HierarchyManagerOptions,
+    storage: mockStorage as DataStoragePort,
     storageAdapter: {} as StorageAdapter,
     gateway: {} as GatewayClient,
     signer: {} as ServerSigner,
@@ -59,8 +57,7 @@ function makeMockDownloadDeps(): DownloadWorkerDeps {
   };
 
   return {
-    indexManager: {} as IndexManager,
-    hierarchyOptions: { dataDir: "/tmp/data" } as HierarchyManagerOptions,
+    storage: {} as DataStoragePort,
     storageAdapter: {} as StorageAdapter,
     gateway: {} as GatewayClient,
     cursor: mockCursor,
@@ -135,13 +132,78 @@ describe("SyncManager", () => {
     expect(downloadAll).toHaveBeenCalledTimes(1);
   });
 
+  it("skips sync cycles when runtime registration blocks sync", async () => {
+    const uploadDeps = makeMockUploadDeps();
+    const downloadDeps = makeMockDownloadDeps();
+    const manager = createSyncManager(uploadDeps, downloadDeps, {
+      canSync: () => ({
+        ok: false,
+        reason: "unregistered",
+        message: "Register this Personal Server before syncing.",
+      }),
+    });
+
+    await manager.trigger();
+
+    expect(uploadAll).not.toHaveBeenCalled();
+    expect(downloadAll).not.toHaveBeenCalled();
+    expect(manager.getStatus()).toMatchObject({
+      blocked: {
+        reason: "unregistered",
+        message: "Register this Personal Server before syncing.",
+      },
+    });
+  });
+
+  it("notifyNewData() schedules a debounced sync cycle while running", async () => {
+    const uploadDeps = makeMockUploadDeps();
+    const downloadDeps = makeMockDownloadDeps();
+    const manager = createSyncManager(uploadDeps, downloadDeps, {
+      pollInterval: 60_000,
+      notifyDebounceMs: 500,
+    });
+
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    vi.clearAllMocks();
+
+    manager.notifyNewData();
+    manager.notifyNewData();
+
+    await vi.advanceTimersByTimeAsync(499);
+    expect(uploadAll).not.toHaveBeenCalled();
+    expect(downloadAll).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(uploadAll).toHaveBeenCalledTimes(1);
+    expect(downloadAll).toHaveBeenCalledTimes(1);
+
+    await manager.stop();
+  });
+
+  it("notifyNewData() does not sync while stopped", async () => {
+    const uploadDeps = makeMockUploadDeps();
+    const downloadDeps = makeMockDownloadDeps();
+    const manager = createSyncManager(uploadDeps, downloadDeps, {
+      pollInterval: 60_000,
+      notifyDebounceMs: 500,
+    });
+
+    manager.notifyNewData();
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(uploadAll).not.toHaveBeenCalled();
+    expect(downloadAll).not.toHaveBeenCalled();
+  });
+
   it("getStatus() returns correct pending count", () => {
     const uploadDeps = makeMockUploadDeps();
     const downloadDeps = makeMockDownloadDeps();
 
     // Mock findUnsynced to return 3 pending entries
     (
-      uploadDeps.indexManager.findUnsynced as ReturnType<typeof vi.fn>
+      uploadDeps.storage.findUnsynced as ReturnType<typeof vi.fn>
     ).mockReturnValue([
       { id: 1, path: "a.json" },
       { id: 2, path: "b.json" },
@@ -154,11 +216,12 @@ describe("SyncManager", () => {
     expect(status.pendingFiles).toBe(3);
     expect(status.enabled).toBe(true);
     expect(status.running).toBe(false);
+    expect(status.syncing).toBe(false);
     expect(status.lastSync).toBeNull();
     expect(status.errors).toEqual([]);
   });
 
-  it("getStatus().running reflects lifecycle", async () => {
+  it("getStatus() separates lifecycle from active sync cycle", async () => {
     const uploadDeps = makeMockUploadDeps();
     const downloadDeps = makeMockDownloadDeps();
     const manager = createSyncManager(uploadDeps, downloadDeps, {
@@ -167,17 +230,21 @@ describe("SyncManager", () => {
 
     expect(manager.running).toBe(false);
     expect(manager.getStatus().running).toBe(false);
+    expect(manager.getStatus().syncing).toBe(false);
 
     manager.start();
     expect(manager.running).toBe(true);
     expect(manager.getStatus().running).toBe(true);
+    expect(manager.getStatus().syncing).toBe(true);
 
     // Flush the immediate cycle
     await vi.advanceTimersByTimeAsync(0);
+    expect(manager.getStatus().syncing).toBe(false);
 
     await manager.stop();
     expect(manager.running).toBe(false);
     expect(manager.getStatus().running).toBe(false);
+    expect(manager.getStatus().syncing).toBe(false);
   });
 
   it("upload errors are captured in getStatus().errors", async () => {

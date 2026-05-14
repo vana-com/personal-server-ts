@@ -15,6 +15,10 @@ export interface SignedClaim {
   sig: string; // EIP-191 signature
 }
 
+export interface TunnelClaimSigner {
+  signMessage(message: string): Promise<`0x${string}`>;
+}
+
 export interface ClaimPayload {
   aud: string;
   iat: number;
@@ -30,6 +34,7 @@ export interface ClaimConfig {
   walletAddress: string;
   runId: string;
   serverKeypair: ServerAccount;
+  signer?: TunnelClaimSigner;
 }
 
 /** Encode a UTF-8 string to base64url (no padding). */
@@ -71,7 +76,8 @@ export async function generateSignedClaim(
   };
 
   const claim = base64urlEncode(JSON.stringify(payload));
-  const sig = await config.serverKeypair.signMessage(claim);
+  const signer = config.signer ?? config.serverKeypair;
+  const sig = await signer.signMessage(claim);
 
   return { claim, sig };
 }

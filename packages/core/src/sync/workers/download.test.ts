@@ -2,32 +2,28 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 import type { DownloadWorkerDeps } from "./download.js";
 import { downloadOne, downloadAll } from "./download.js";
-import type { FileRecord } from "../types.js";
-import type { IndexManager } from "../../storage/index/manager.js";
+import type {
+  DataFileEnvelope,
+  FileRecord,
+  GatewayClient,
+  Schema,
+} from "@opendatalabs/vana-sdk/browser";
 import type { IndexEntry } from "../../storage/index/types.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
-import type { GatewayClient, Schema } from "../../gateway/client.js";
 import type { SyncCursor } from "../cursor.js";
-import type { HierarchyManagerOptions } from "../../storage/hierarchy/index.js";
-import type { DataFileEnvelope } from "../../schemas/data-file.js";
-import type { Logger } from "pino";
+import type { Logger } from "../../logger/index.js";
+import type { DataStoragePort } from "../../ports/index.js";
 
-// Mock the filesystem-dependent modules
-vi.mock("../../storage/hierarchy/index.js", () => ({
-  writeDataFile: vi.fn(),
-}));
-
-vi.mock("../../keys/derive.js", () => ({
+vi.mock("@opendatalabs/vana-sdk/browser", async (importOriginal) => ({
+  ...(await importOriginal()),
   deriveScopeKey: vi.fn(),
-}));
-
-vi.mock("../../storage/encryption/index.js", () => ({
   decryptWithPassword: vi.fn(),
 }));
 
-import { writeDataFile } from "../../storage/hierarchy/index.js";
-import { deriveScopeKey } from "../../keys/derive.js";
-import { decryptWithPassword } from "../../storage/encryption/index.js";
+import {
+  decryptWithPassword,
+  deriveScopeKey,
+} from "@opendatalabs/vana-sdk/browser";
 
 const SCOPE = "instagram.profile";
 const COLLECTED_AT = "2026-01-21T10:00:00Z";
@@ -69,13 +65,20 @@ function makeSchema(): Schema {
 }
 
 function makeMockDeps(): DownloadWorkerDeps {
-  const mockIndexManager: Partial<IndexManager> = {
+  const mockStorage: Partial<DataStoragePort> = {
+    findEntry: vi.fn().mockReturnValue(undefined),
     findByFileId: vi.fn().mockReturnValue(undefined),
-    insert: vi.fn().mockImplementation((entry) => ({
+    writeEnvelope: vi.fn().mockResolvedValue({
+      path: `/tmp/data/${SCOPE}/${COLLECTED_AT}.json`,
+      relativePath: `${SCOPE}/${COLLECTED_AT}.json`,
+      sizeBytes: 128,
+    }),
+    insertEntry: vi.fn().mockImplementation((entry) => ({
       id: 1,
       createdAt: "2026-01-21T10:00:00Z",
       ...entry,
     })),
+    updateFileId: vi.fn().mockResolvedValue(true),
   };
 
   const mockStorageAdapter: Partial<StorageAdapter> = {
@@ -100,8 +103,7 @@ function makeMockDeps(): DownloadWorkerDeps {
   };
 
   return {
-    indexManager: mockIndexManager as IndexManager,
-    hierarchyOptions: { dataDir: "/tmp/data" } as HierarchyManagerOptions,
+    storage: mockStorage as DataStoragePort,
     storageAdapter: mockStorageAdapter as StorageAdapter,
     gateway: mockGateway as GatewayClient,
     cursor: mockCursor,
@@ -126,11 +128,6 @@ describe("download worker", () => {
     (decryptWithPassword as ReturnType<typeof vi.fn>).mockResolvedValue(
       plaintextBytes,
     );
-    (writeDataFile as ReturnType<typeof vi.fn>).mockResolvedValue({
-      path: `/tmp/data/${RELATIVE_PATH}`,
-      relativePath: RELATIVE_PATH,
-      sizeBytes: 128,
-    });
   });
 
   describe("downloadOne", () => {
@@ -139,15 +136,16 @@ describe("download worker", () => {
       const existingEntry: IndexEntry = {
         id: 1,
         fileId: FILE_ID,
+        schemaId: SCHEMA_ID,
         path: RELATIVE_PATH,
         scope: SCOPE,
         collectedAt: COLLECTED_AT,
         createdAt: "2026-01-21T10:00:00Z",
         sizeBytes: 128,
       };
-      (
-        deps.indexManager.findByFileId as ReturnType<typeof vi.fn>
-      ).mockReturnValue(existingEntry);
+      (deps.storage.findByFileId as ReturnType<typeof vi.fn>).mockReturnValue(
+        existingEntry,
+      );
 
       const record = makeFileRecord();
       const result = await downloadOne(deps, record);
@@ -172,7 +170,7 @@ describe("download worker", () => {
       );
 
       // Verify write was called with envelope
-      expect(writeDataFile).toHaveBeenCalledWith(deps.hierarchyOptions, {
+      expect(deps.storage.writeEnvelope).toHaveBeenCalledWith({
         version: "1.0",
         scope: SCOPE,
         collectedAt: COLLECTED_AT,
@@ -180,8 +178,9 @@ describe("download worker", () => {
       });
 
       // Verify index insert was called
-      expect(deps.indexManager.insert).toHaveBeenCalledWith({
+      expect(deps.storage.insertEntry).toHaveBeenCalledWith({
         fileId: FILE_ID,
+        schemaId: SCHEMA_ID,
         path: RELATIVE_PATH,
         scope: SCOPE,
         collectedAt: COLLECTED_AT,
@@ -195,6 +194,33 @@ describe("download worker", () => {
         collectedAt: COLLECTED_AT,
         path: RELATIVE_PATH,
       });
+    });
+
+    it("skips and attaches fileId when the same version already exists locally", async () => {
+      const deps = makeMockDeps();
+      const existingEntry: IndexEntry = {
+        id: 1,
+        fileId: null,
+        schemaId: SCHEMA_ID,
+        path: RELATIVE_PATH,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        createdAt: "2026-01-21T10:00:00Z",
+        sizeBytes: 128,
+      };
+      (deps.storage.findEntry as ReturnType<typeof vi.fn>).mockReturnValue(
+        existingEntry,
+      );
+
+      const result = await downloadOne(deps, makeFileRecord());
+
+      expect(result).toBeNull();
+      expect(deps.storage.updateFileId).toHaveBeenCalledWith(
+        RELATIVE_PATH,
+        FILE_ID,
+      );
+      expect(deps.storage.writeEnvelope).not.toHaveBeenCalled();
+      expect(deps.storage.insertEntry).not.toHaveBeenCalled();
     });
 
     it("resolves schemaId → scope via gateway.getSchema", async () => {
@@ -282,7 +308,7 @@ describe("download worker", () => {
       expect(deps.cursor.write).not.toHaveBeenCalled();
     });
 
-    it("continues on individual file failure", async () => {
+    it("continues on individual file failure without advancing cursor", async () => {
       const deps = makeMockDeps();
       const files = [
         makeFileRecord({ fileId: "file-001" }),
@@ -314,8 +340,7 @@ describe("download worker", () => {
         expect.objectContaining({ fileId: "file-002" }),
         "Failed to download file",
       );
-      // Cursor still advances despite individual failure
-      expect(deps.cursor.write).toHaveBeenCalledWith("2026-01-21T12:00:00Z");
+      expect(deps.cursor.write).not.toHaveBeenCalled();
     });
   });
 });

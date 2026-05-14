@@ -2,51 +2,45 @@ import { mkdir } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import { privateKeyToAccount } from "viem/accounts";
 
 const require = createRequire(import.meta.url);
 const pkg = require("../package.json") as { version: string };
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
+import { DEFAULT_ROOT_PATH, resolveRootPath } from "./config/index.js";
+import { createLogger, type Logger } from "./logger/index.js";
+import { initializeDatabase } from "./storage/index-schema.js";
 import {
-  DEFAULT_ROOT_PATH,
-  resolveRootPath,
-} from "@opendatalabs/personal-server-ts-core/config";
-import {
-  createLogger,
-  type Logger,
-} from "@opendatalabs/personal-server-ts-core/logger";
-import {
-  initializeDatabase,
   createIndexManager,
   type IndexManager,
-} from "@opendatalabs/personal-server-ts-core/storage/index";
+} from "./storage/index-manager.js";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
-import { createGatewayClient } from "@opendatalabs/personal-server-ts-core/gateway";
-import type { GatewayClient } from "@opendatalabs/personal-server-ts-core/gateway";
-import { createAccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
-import { createAccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
+import { createGatewayClient } from "@opendatalabs/vana-sdk/node";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
+import { createAccessLogWriter } from "./logging/access-log.js";
+import { createAccessLogReader } from "./logging/access-reader.js";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import {
   deriveMasterKey,
   recoverServerOwner,
-  loadOrCreateServerAccount,
-} from "@opendatalabs/personal-server-ts-core/keys";
+} from "@opendatalabs/vana-sdk/node";
+import { loadOrCreateServerAccount } from "./keys/server-account.js";
 import type { ServerAccount } from "@opendatalabs/personal-server-ts-core/keys";
-import {
-  createServerSigner,
-  createRequestSigner,
-} from "@opendatalabs/personal-server-ts-core/signing";
+import { createServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
+import { createSyncCursor } from "./sync-cursor.js";
 import {
-  createSyncCursor,
   createSyncManager,
   type SyncManager,
 } from "@opendatalabs/personal-server-ts-core/sync";
-import { createVanaStorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
+import { createVanaSyncStorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
 import { generateDevToken } from "./dev-token.js";
+import { migrateLocalState } from "./migrations/local-state.js";
 import { createTokenStore, type TokenStore } from "./token-store.js";
 import { TunnelManager, ensureFrpcBinary } from "./tunnel/index.js";
+import { createNodeDataStorage } from "./storage/node-data-storage.js";
 
 export interface ServerContext {
   app: Hono;
@@ -61,6 +55,7 @@ export interface ServerContext {
   syncManager: SyncManager | null;
   tunnelManager?: TunnelManager;
   tunnelUrl?: string;
+  isServerRegistered: () => boolean;
   localApprovalPort?: number;
   getLocalApprovalOrigin: () => string | undefined;
   setLocalApprovalOrigin: (origin?: string) => void;
@@ -74,6 +69,8 @@ export interface CreateServerOptions {
   /** @deprecated Use rootPath instead. */
   serverDir?: string;
   dataDir?: string;
+  ownerSignature?: `0x${string}`;
+  gatewayClient?: GatewayClient;
 }
 
 const DEFAULT_LOCAL_APPROVAL_PORT = 34127;
@@ -113,20 +110,41 @@ export async function createServer(
   const dataDir = options?.dataDir ?? join(storageRoot, "data");
   const indexPath = join(storageRoot, "index.db");
   const configPath = join(storageRoot, "config.json");
+  const syncCursorPath = join(storageRoot, "sync-cursor.json");
+  const tokensPath = join(storageRoot, "tokens.json");
 
   await mkdir(storageRoot, { recursive: true });
   await mkdir(dataDir, { recursive: true });
 
   const db = initializeDatabase(indexPath);
+  await migrateLocalState({
+    storageRoot,
+    dataDir,
+    configPath,
+    syncCursorPath,
+    tokensPath,
+  });
   const indexManager = createIndexManager(db);
   const hierarchyOptions: HierarchyManagerOptions = { dataDir };
+  const dataStorage = createNodeDataStorage({ indexManager, hierarchyOptions });
 
-  const gatewayClient = createGatewayClient(config.gateway.url);
+  const gatewayClient =
+    options?.gatewayClient ?? createGatewayClient(config.gateway.url);
 
   // Derive server owner from VANA_MASTER_KEY_SIGNATURE env var
-  const masterKeySignature = process.env.VANA_MASTER_KEY_SIGNATURE as
+  const masterKeySignature =
+    options?.ownerSignature ??
+    (process.env.VANA_MASTER_KEY_SIGNATURE as `0x${string}` | undefined);
+  const ownerPrivateKey = process.env.VANA_OWNER_PRIVATE_KEY as
     | `0x${string}`
     | undefined;
+  const ownerTunnelSigner = ownerPrivateKey
+    ? privateKeyToAccount(
+        ownerPrivateKey.startsWith("0x")
+          ? ownerPrivateKey
+          : (`0x${ownerPrivateKey}` as `0x${string}`),
+      )
+    : null;
   let serverOwner: `0x${string}` | undefined;
 
   let serverAccount: ServerAccount | undefined;
@@ -134,9 +152,19 @@ export async function createServer(
   let identity: IdentityInfo | undefined;
 
   if (masterKeySignature) {
-    serverOwner = await recoverServerOwner(masterKeySignature);
+    const recoveredServerOwner = await recoverServerOwner(masterKeySignature);
+    serverOwner = recoveredServerOwner;
     deriveMasterKey(masterKeySignature); // validate signature format
     logger.info({ owner: serverOwner }, "Server owner derived from master key");
+    if (
+      ownerTunnelSigner &&
+      ownerTunnelSigner.address.toLowerCase() !==
+        recoveredServerOwner.toLowerCase()
+    ) {
+      throw new Error(
+        "VANA_OWNER_PRIVATE_KEY does not match VANA_MASTER_KEY_SIGNATURE owner",
+      );
+    }
 
     // Load or create server keypair from disk
     const keyPath = join(storageRoot, "key.json");
@@ -218,21 +246,18 @@ export async function createServer(
   ) {
     const masterKey = deriveMasterKey(masterKeySignature);
 
-    const vanaConfig = config.storage.config.vana ?? {
-      apiUrl: "https://storage.vana.com",
-    };
-    const requestSigner = createRequestSigner(serverAccount);
-    const storageAdapter = createVanaStorageAdapter({
-      apiUrl: vanaConfig.apiUrl,
-      ownerAddress: serverOwner,
-      signer: requestSigner,
+    const storageAdapter = createVanaSyncStorageAdapter({
+      config,
+      serverOwner,
+      serverAccount,
     });
 
-    const cursor = createSyncCursor(configPath);
+    const cursor = createSyncCursor(syncCursorPath, {
+      legacyConfigPath: configPath,
+    });
 
     const uploadDeps = {
-      indexManager,
-      hierarchyOptions,
+      storage: dataStorage,
       storageAdapter,
       gateway: gatewayClient,
       signer: serverSigner,
@@ -242,8 +267,7 @@ export async function createServer(
     };
 
     const downloadDeps = {
-      indexManager,
-      hierarchyOptions,
+      storage: dataStorage,
       storageAdapter,
       gateway: gatewayClient,
       cursor,
@@ -252,7 +276,29 @@ export async function createServer(
       logger,
     };
 
-    syncManager = createSyncManager(uploadDeps, downloadDeps);
+    syncManager = createSyncManager(uploadDeps, downloadDeps, {
+      async canSync() {
+        try {
+          const serverInfo = await gatewayClient.getServer(
+            serverAccount.address,
+          );
+          identity!.serverId = serverInfo?.id ?? null;
+          if (serverInfo?.id) return { ok: true };
+          return {
+            ok: false,
+            reason: "unregistered",
+            message: "Register this Personal Server before syncing.",
+          };
+        } catch (err) {
+          logger.warn({ err }, "Could not verify server registration for sync");
+          return {
+            ok: false,
+            reason: "registration_check_failed",
+            message: "Could not verify server registration before syncing.",
+          };
+        }
+      },
+    });
     syncManager.start();
     logger.info("Sync engine started");
   } else if (config.sync.enabled) {
@@ -270,7 +316,6 @@ export async function createServer(
   const devToken = config.devUi.enabled ? generateDevToken() : undefined;
 
   // Token store for /auth/device flow (self-hosted CLI auth)
-  const tokensPath = join(storageRoot, "tokens.json");
   const tokenStore: TokenStore = createTokenStore(tokensPath, logger);
   const cloudMode = process.env.CLOUD_MODE === "true";
   const localApprovalPort = cloudMode
@@ -295,10 +340,15 @@ export async function createServer(
     serverOwner,
     identity,
     gateway: gatewayClient,
+    gatewayConfig: config.gateway,
+    config,
     accessLogWriter,
     accessLogReader,
+    dataStorage,
     cloudMode,
     devToken,
+    ownerSignature: masterKeySignature,
+    ownerPrivateKey,
     accessToken,
     tokenStore,
     configPath,
@@ -330,6 +380,7 @@ export async function createServer(
     syncManager,
     tunnelManager,
     tunnelUrl: undefined,
+    isServerRegistered: () => Boolean(identity?.serverId),
     localApprovalPort,
     getLocalApprovalOrigin: () => effectiveLocalApprovalOrigin,
     setLocalApprovalOrigin: (origin?: string) => {
@@ -381,6 +432,12 @@ export async function createServer(
               walletAddress: serverAccount.address,
               ownerAddress: serverOwner,
               serverKeypair: serverAccount,
+              tunnelSigner: ownerTunnelSigner
+                ? {
+                    signMessage: (message) =>
+                      ownerTunnelSigner.signMessage({ message }),
+                  }
+                : undefined,
               runId,
               serverAddr: config.tunnel.serverAddr,
               serverPort: config.tunnel.serverPort,
@@ -388,17 +445,26 @@ export async function createServer(
             },
             frpcBinaryPath,
           );
-          logger.info({ tunnelUrl: url }, "Tunnel established");
+          const tunnelStatus = tunnelManager.getStatus();
+          if (tunnelStatus.status === "connected") {
+            logger.info({ tunnelUrl: url }, "Tunnel established");
+          } else {
+            logger.warn(
+              { tunnelUrl: url, warning: tunnelStatus.warning },
+              "Tunnel URL reserved; waiting for tunnel connection",
+            );
+          }
           context.tunnelUrl = url;
-          effectiveOrigin = url;
+          if (
+            tunnelStatus.status === "connected" &&
+            tunnelStatus.routable !== false
+          ) {
+            effectiveOrigin = url;
+          }
 
           if (!identity?.serverId) {
             logger.warn(
               "Tunnel started but server is not registered with gateway — tunnel will not route traffic. Run: npm run register-server",
-            );
-            tunnelManager.setVerified(
-              false,
-              "Server not registered with gateway",
             );
           }
         } catch (err) {

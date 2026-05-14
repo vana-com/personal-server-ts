@@ -6,12 +6,4 @@ export {
   generateCollectedAt,
 } from "./paths.js";
 
-export {
-  writeDataFile,
-  readDataFile,
-  listVersions,
-  deleteDataFile,
-  deleteAllForScope,
-} from "./manager.js";
-
 export type { HierarchyManagerOptions, WriteResult } from "./manager.js";
