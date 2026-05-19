@@ -21,6 +21,7 @@ import {
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import { dataRoutes } from "./data.js";
 import type { DataRouteDeps } from "./data.js";
+import { createGrantFeeVerifier } from "../grant-fee-verifier.js";
 import type { TokenStore } from "../token-store.js";
 
 const SERVER_ORIGIN = "http://localhost:8080";
@@ -929,6 +930,7 @@ describe("GET /v1/data/:scope", () => {
   afterEach(async () => {
     cleanup();
     await rm(dataDir, { recursive: true, force: true });
+    vi.unstubAllGlobals();
   });
 
   it("returns 200 with DataFileEnvelope for valid auth + grant", async () => {
@@ -1074,6 +1076,52 @@ describe("GET /v1/data/:scope", () => {
       },
     });
 
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+
+    const res = await getWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(403);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("FEE_REQUIRED");
+  });
+
+  it("serves data when createGrantFeeVerifier sees the grant fee paid", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ data: { paymentStatus: "paid" } }), {
+          status: 200,
+        }),
+      ),
+    );
+    const app = createApp({
+      feeVerifier: createGrantFeeVerifier({
+        gatewayUrl: "https://dp-rpc.test",
+        logger,
+      }),
+    });
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+
+    const res = await getWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(200);
+  });
+
+  it("returns 403 FEE_REQUIRED when createGrantFeeVerifier sees the grant unpaid", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ data: { paymentStatus: "pending" } }), {
+          status: 200,
+        }),
+      ),
+    );
+    const app = createApp({
+      feeVerifier: createGrantFeeVerifier({
+        gatewayUrl: "https://dp-rpc.test",
+        logger,
+      }),
+    });
     await ingestData("instagram.profile", { username: "test_user" }, app);
 
     const res = await getWithAuth(app, "instagram.profile");
