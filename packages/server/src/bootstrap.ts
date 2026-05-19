@@ -37,6 +37,7 @@ import { createVanaSyncStorageAdapter } from "@opendatalabs/personal-server-ts-c
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
 import { createGrantFeeVerifier } from "./grant-fee-verifier.js";
+import type { FeeVerifierPort } from "@opendatalabs/personal-server-ts-core/ports";
 import { generateDevToken } from "./dev-token.js";
 import { migrateLocalState } from "./migrations/local-state.js";
 import { createTokenStore, type TokenStore } from "./token-store.js";
@@ -72,6 +73,12 @@ export interface CreateServerOptions {
   dataDir?: string;
   ownerSignature?: `0x${string}`;
   gatewayClient?: GatewayClient;
+  /**
+   * Fee verifier for payment-gated data reads. When omitted, one is built
+   * from `config.payment` — pass this to keep grant + payment checks on the
+   * same gateway as an injected `gatewayClient`.
+   */
+  feeVerifier?: FeeVerifierPort;
 }
 
 const DEFAULT_LOCAL_APPROVAL_PORT = 34127;
@@ -134,10 +141,13 @@ export async function createServer(
 
   // Payment enforcement (BUI-398): when enabled, data reads are gated on the
   // grant's payment status at DP RPC. Off by default — left unset so the data
-  // read policy falls back to `allowAllFeeVerifier`.
-  const feeVerifier = config.payment.enabled
-    ? createGrantFeeVerifier({ gatewayUrl: config.gateway.url, logger })
-    : undefined;
+  // read policy falls back to `allowAllFeeVerifier`. An injected verifier
+  // wins, mirroring how `gatewayClient` can be supplied by embedded callers.
+  const feeVerifier =
+    options?.feeVerifier ??
+    (config.payment.enabled
+      ? createGrantFeeVerifier({ gatewayUrl: config.gateway.url, logger })
+      : undefined);
   if (feeVerifier) {
     logger.info("Payment enforcement enabled — data reads gated on grant fee");
   }

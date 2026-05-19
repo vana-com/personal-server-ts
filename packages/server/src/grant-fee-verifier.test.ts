@@ -67,7 +67,7 @@ describe("createGrantFeeVerifier", () => {
     });
   });
 
-  it("queries DP RPC at the grant-by-id endpoint, trimming a trailing slash", async () => {
+  it("queries the grant-by-id endpoint with an abort signal, trimming a trailing slash", async () => {
     const fn = mockFetch(() => grantResponse("paid"));
     const verifier = createGrantFeeVerifier({ gatewayUrl: `${GATEWAY_URL}/` });
 
@@ -75,6 +75,25 @@ describe("createGrantFeeVerifier", () => {
 
     expect(fn).toHaveBeenCalledWith(
       `${GATEWAY_URL}/v1/grants/${encodeURIComponent(input.grantId)}`,
+      { signal: expect.any(AbortSignal) },
     );
+  });
+
+  it("fails closed when the DP RPC request times out", async () => {
+    mockFetch(
+      () =>
+        new Promise((_resolve, reject) => {
+          reject(new DOMException("The operation timed out.", "TimeoutError"));
+        }),
+    );
+    const verifier = createGrantFeeVerifier({
+      gatewayUrl: GATEWAY_URL,
+      timeoutMs: 10,
+    });
+
+    expect(await verifier.verifyDataReadFee(input)).toEqual({
+      ok: false,
+      reason: "Payment status unavailable",
+    });
   });
 });

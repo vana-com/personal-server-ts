@@ -23,6 +23,11 @@ export interface GrantFeeVerifierOptions {
   /** DP RPC base URL (same origin as the gateway client). */
   gatewayUrl: string;
   logger?: Logger;
+  /**
+   * Abort the DP RPC fee lookup after this many ms so a hung request fails
+   * closed instead of stalling every protected read. Default 5000.
+   */
+  timeoutMs?: number;
 }
 
 /** The grant payment field the verifier reads from a DP RPC grant record. */
@@ -34,21 +39,25 @@ export function createGrantFeeVerifier(
   options: GrantFeeVerifierOptions,
 ): FeeVerifierPort {
   const base = options.gatewayUrl.replace(/\/+$/, "");
+  const timeoutMs = options.timeoutMs ?? 5000;
 
   return {
     async verifyDataReadFee(
       input: FeeVerificationInput,
     ): Promise<FeeVerificationResult> {
       // Fail closed: any uncertainty about payment must not release data.
+      // A hung DP RPC is aborted after `timeoutMs`; the abort throws and is
+      // handled here as "unavailable".
       let res: Response;
       try {
         res = await fetch(
           `${base}/v1/grants/${encodeURIComponent(input.grantId)}`,
+          { signal: AbortSignal.timeout(timeoutMs) },
         );
       } catch (err) {
         options.logger?.warn(
           { err, grantId: input.grantId },
-          "Fee check: DP RPC unreachable",
+          "Fee check: DP RPC request failed",
         );
         return { ok: false, reason: "Payment status unavailable" };
       }
