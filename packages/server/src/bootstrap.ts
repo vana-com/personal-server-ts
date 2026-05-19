@@ -36,6 +36,7 @@ import {
 import { createVanaSyncStorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
+import { createGrantFeeVerifier } from "./grant-fee-verifier.js";
 import { generateDevToken } from "./dev-token.js";
 import { migrateLocalState } from "./migrations/local-state.js";
 import { createTokenStore, type TokenStore } from "./token-store.js";
@@ -130,6 +131,16 @@ export async function createServer(
 
   const gatewayClient =
     options?.gatewayClient ?? createGatewayClient(config.gateway.url);
+
+  // Payment enforcement (BUI-398): when enabled, data reads are gated on the
+  // grant's payment status at DP RPC. Off by default — left unset so the data
+  // read policy falls back to `allowAllFeeVerifier`.
+  const feeVerifier = config.payment.enabled
+    ? createGrantFeeVerifier({ gatewayUrl: config.gateway.url, logger })
+    : undefined;
+  if (feeVerifier) {
+    logger.info("Payment enforcement enabled — data reads gated on grant fee");
+  }
 
   // Derive server owner from VANA_MASTER_KEY_SIGNATURE env var
   const masterKeySignature =
@@ -341,6 +352,7 @@ export async function createServer(
     identity,
     gateway: gatewayClient,
     gatewayConfig: config.gateway,
+    feeVerifier,
     config,
     accessLogWriter,
     accessLogReader,
