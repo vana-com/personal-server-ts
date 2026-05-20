@@ -1,4 +1,5 @@
 import {
+  accessLogsListPath,
   createOwnerSignedPersonalServerRequest,
   createPersonalServerInfoFromHealth,
   createPersonalServerRegistrationRequest,
@@ -14,6 +15,8 @@ import {
   type PersonalServerCreateGrantResult,
   type PersonalServerHandle,
   type PersonalServerInfo,
+  type PersonalServerListAccessLogsOptions,
+  type PersonalServerListAccessLogsResult,
   type PersonalServerListDataOptions,
   type PersonalServerListDataResult,
   type PersonalServerListGrantsResult,
@@ -272,6 +275,23 @@ export async function startPersonalServer(
     );
   }
 
+  async function listAccessLogs(
+    accessLogOptions: PersonalServerListAccessLogsOptions = {},
+  ): Promise<PersonalServerListAccessLogsResult> {
+    const current = await info();
+    const request = await createOwnerRequest({
+      origin: requiredApiOrigin(current),
+      path: accessLogsListPath(accessLogOptions),
+      method: "GET",
+      authOptions: accessLogOptions,
+      headers: accessLogOptions.headers,
+    });
+    return parsePersonalServerJsonResponse(
+      await callFetch(request),
+      "access logs list",
+    );
+  }
+
   async function listVersions(
     scope: string,
     versionOptions: PersonalServerListVersionsOptions = {},
@@ -467,6 +487,7 @@ export async function startPersonalServer(
     fetch: callFetch,
     postData,
     listData,
+    listAccessLogs,
     listVersions,
     readData,
     createGrant,

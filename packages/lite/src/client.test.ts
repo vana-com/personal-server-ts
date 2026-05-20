@@ -237,6 +237,47 @@ describe("startPersonalServer lite handle", () => {
     });
   });
 
+  it("exposes listAccessLogs through the public handle with owner auth", async () => {
+    const gateway = createGateway();
+    const ps = await startPersonalServer({
+      runtime: createRuntime(gateway),
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const auth = { signMessage: ownerWallet.signMessage };
+
+    // Empty by default: no builder has read anything in this fixture.
+    await expect(ps.listAccessLogs({ auth })).resolves.toMatchObject({
+      logs: [],
+      total: 0,
+      limit: 50,
+      offset: 0,
+    });
+
+    // Honors pagination params on the wire.
+    await expect(
+      ps.listAccessLogs({ auth, limit: 5, offset: 0 }),
+    ).resolves.toMatchObject({
+      limit: 5,
+      offset: 0,
+    });
+  });
+
+  it("rejects listAccessLogs requests that lack owner auth", async () => {
+    const gateway = createGateway();
+    const ps = await startPersonalServer({
+      runtime: createRuntime(gateway),
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+
+    // No `auth` → no Web3Signed owner header → the contract rejects with
+    // the standard owner-auth missing error rather than leaking logs.
+    await expect(ps.listAccessLogs()).rejects.toThrow();
+  });
+
   it("exposes grant helpers through the public handle", async () => {
     const builderAddress = createTestWallet(5).address;
     const grantId =
