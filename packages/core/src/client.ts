@@ -13,6 +13,7 @@ import {
   buildPersonalServerRegistrationTypedData,
   type PersonalServerRegistrationTypedData,
 } from "@opendatalabs/vana-sdk/protocol/personal-server-registration";
+import type { AccessLogEntry } from "./logging/access-log.js";
 import type { ScopeSummary } from "./storage/index/types.js";
 import type { SyncStatus } from "./sync/types.js";
 
@@ -102,6 +103,20 @@ export interface PersonalServerListDataResult {
   offset: number;
 }
 
+export interface PersonalServerListAccessLogsOptions {
+  limit?: number;
+  offset?: number;
+  auth?: PersonalServerOwnerAuth;
+  headers?: Record<string, string>;
+}
+
+export interface PersonalServerListAccessLogsResult {
+  logs: AccessLogEntry[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
 export interface PersonalServerListVersionsOptions {
   limit?: number;
   offset?: number;
@@ -181,6 +196,14 @@ export interface PersonalServerHandle {
   listData(
     options?: PersonalServerListDataOptions,
   ): Promise<PersonalServerListDataResult>;
+  /**
+   * Read the owner's access-log entries, newest first. Owner-only — the
+   * request goes through the same Web3Signed owner auth as {@link listData}.
+   * Returns paginated entries describing which builders read which scopes.
+   */
+  listAccessLogs(
+    options?: PersonalServerListAccessLogsOptions,
+  ): Promise<PersonalServerListAccessLogsResult>;
   listVersions(
     scope: string,
     options?: PersonalServerListVersionsOptions,
@@ -413,6 +436,17 @@ export function dataListPath(
     params.set("offset", String(options.offset));
   const query = params.toString();
   return query ? `/v1/data?${query}` : "/v1/data";
+}
+
+export function accessLogsListPath(
+  options: PersonalServerListAccessLogsOptions = {},
+): string {
+  const params = new URLSearchParams();
+  if (options.limit !== undefined) params.set("limit", String(options.limit));
+  if (options.offset !== undefined)
+    params.set("offset", String(options.offset));
+  const query = params.toString();
+  return query ? `/v1/access-logs?${query}` : "/v1/access-logs";
 }
 
 export function dataVersionsPath(
