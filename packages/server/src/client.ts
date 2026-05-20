@@ -2,6 +2,7 @@ import { createAdaptorServer } from "@hono/node-server";
 import type { AddressInfo } from "node:net";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import {
+  accessLogsListPath,
   createOwnerSignedPersonalServerRequest,
   createPersonalServerInfoFromHealth,
   createPersonalServerRegistrationRequest,
@@ -17,6 +18,8 @@ import {
   type PersonalServerCreateGrantResult,
   type PersonalServerHandle,
   type PersonalServerInfo,
+  type PersonalServerListAccessLogsOptions,
+  type PersonalServerListAccessLogsResult,
   type PersonalServerListDataOptions,
   type PersonalServerListDataResult,
   type PersonalServerListGrantsResult,
@@ -228,6 +231,22 @@ export async function startPersonalServer(
     );
   }
 
+  async function listAccessLogs(
+    accessLogOptions: PersonalServerListAccessLogsOptions = {},
+  ): Promise<PersonalServerListAccessLogsResult> {
+    const path = accessLogsListPath(accessLogOptions);
+    const request = await createOwnerRequest({
+      path,
+      method: "GET",
+      authOptions: accessLogOptions,
+      headers: accessLogOptions.headers,
+    });
+    return parsePersonalServerJsonResponse(
+      await callFetch(request),
+      "access logs list",
+    );
+  }
+
   async function listVersions(
     scope: string,
     versionOptions: PersonalServerListVersionsOptions = {},
@@ -408,6 +427,7 @@ export async function startPersonalServer(
     fetch: callFetch,
     postData,
     listData,
+    listAccessLogs,
     listVersions,
     readData,
     createGrant,
