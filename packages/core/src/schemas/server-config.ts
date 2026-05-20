@@ -30,6 +30,11 @@ export const DEFAULTS = {
   devUi: {
     enabled: true,
   },
+  payment: {
+    // Off by default. When true, data reads are gated on the grant's
+    // payment status from DP RPC (BUI-398).
+    enabled: false,
+  },
   sync: {
     enabled: false,
     lastProcessedTimestamp: null,
@@ -109,6 +114,11 @@ export const ServerConfigSchema = z.object({
       enabled: z.boolean().default(DEFAULTS.devUi.enabled),
     })
     .default(DEFAULTS.devUi),
+  payment: z
+    .object({
+      enabled: z.boolean().default(DEFAULTS.payment.enabled),
+    })
+    .default(DEFAULTS.payment),
   sync: z
     .object({
       enabled: z.boolean().default(DEFAULTS.sync.enabled),

@@ -67,40 +67,60 @@ export async function verifyDataReadPolicy(
     throw new GrantRevokedError({ grantId: grant.id });
   }
 
-  const grantPayload = parseGrantRegistrationPayload(grant.grant);
-  if (!grantPayload) {
+  // DP RPC is migrating to a flat grant shape: fields once carried inside the
+  // signed `grant` payload (scopes, expiresAt) are returned as top-level
+  // columns, and `fileIds` is going away. Read either shape — prefer flat,
+  // fall back to parsing the legacy signed payload — until the migration
+  // lands across consumers. See vana-com/data-gateway#17.
+  const flat = grant as Omit<GatewayGrantResponse, "grant" | "fileIds"> & {
+    grant?: string;
+    fileIds?: string[];
+    scopes?: string[];
+    expiresAt?: number;
+  };
+  const legacyPayload = flat.grant
+    ? parseGrantRegistrationPayload(flat.grant)
+    : null;
+
+  const scopes = flat.scopes ?? legacyPayload?.scopes;
+  if (!scopes) {
     throw new ScopeMismatchError({
       requestedScope: input.requestedScope,
-      reason: "Grant payload is invalid",
+      reason: "Grant has no scopes",
     });
   }
-  if (grantPayload.expiresAt > 0) {
+
+  const expiresAt = flat.expiresAt ?? legacyPayload?.expiresAt;
+  if (expiresAt !== undefined && expiresAt > 0) {
     const now = Math.floor(Date.now() / 1000);
-    if (grantPayload.expiresAt < now) {
-      throw new GrantExpiredError({ expiresAt: grantPayload.expiresAt });
+    if (expiresAt < now) {
+      throw new GrantExpiredError({ expiresAt });
     }
   }
 
-  if (!scopeCoveredByGrant(input.requestedScope, grantPayload.scopes)) {
+  if (!scopeCoveredByGrant(input.requestedScope, scopes)) {
     throw new ScopeMismatchError({
       requestedScope: input.requestedScope,
-      grantedScopes: grantPayload.scopes,
+      grantedScopes: scopes,
     });
   }
 
-  if (grant.fileIds.length > 0) {
+  // fileIds restriction is legacy-only; the flat shape has no per-grant file
+  // pinning. Enforce only when the field is present.
+  const fileIds = flat.fileIds;
+  if (fileIds && fileIds.length > 0) {
     if (!input.fileId) {
       throw new ScopeMismatchError({
         requestedScope: input.requestedScope,
         reason: "Grant is restricted to fileIds; request must include fileId",
-        grantedFileIds: grant.fileIds,
+        grantedFileIds: fileIds,
       });
     }
-    if (!grant.fileIds.includes(input.fileId)) {
+    if (!fileIds.includes(input.fileId)) {
       throw new ScopeMismatchError({
         requestedScope: input.requestedScope,
         requestedFileId: input.fileId,
-        grantedFileIds: grant.fileIds,
+        grantedFileIds: fileIds,
       });
     }
   }
