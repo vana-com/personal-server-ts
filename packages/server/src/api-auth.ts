@@ -107,9 +107,26 @@ export function createServerApiAuth(
       if (result.isPolicyBypass) {
         return { builder: result.auth.signer, grantId: "policy-bypass" };
       }
+      // Owner-exempt read paths. We allow two mechanisms here:
+      //   - web3-signed: per-request signature by the owner wallet. Already
+      //     gated on a fresh cryptographic proof per request.
+      //   - control-plane-token: a static bearer set by the parent host
+      //     process at boot. Never crosses an interactive surface, so it
+      //     has the same threat model as the host process itself.
+      // Intentionally NOT exempted:
+      //   - cli-session-token: an interactive bearer issued via /auth/device.
+      //     These flow through terminals / copy-paste / shell history, so we
+      //     keep them on the grant path so that any leaked CLI session can
+      //     still only read what an explicit grant authorizes.
+      // Defense-in-depth justification: any owner-identified credential can
+      // already mint a grant via authorizeOwner, so blocking owner reads in
+      // general does not meaningfully shrink the blast radius of a stolen
+      // token. The cli-session-token exception preserves the audit-log
+      // signal for the one credential class that's most prone to leakage.
       if (
-        result.mechanism === "web3-signed" &&
-        isOwner(result.auth.signer, deps.serverOwner)
+        isOwner(result.auth.signer, deps.serverOwner) &&
+        (result.mechanism === "web3-signed" ||
+          result.mechanism === "control-plane-token")
       ) {
         return { builder: result.auth.signer, grantId: "owner" };
       }
