@@ -1155,7 +1155,12 @@ describe("GET /v1/data/:scope", () => {
     expect(json.error).toBe("NOT_FOUND");
   });
 
-  it("does not let owner session tokens bypass grant checks on raw reads", async () => {
+  it("does not let CLI session tokens bypass grant checks on raw reads", async () => {
+    // CLI session tokens are interactive bearers issued via /auth/device.
+    // They flow through terminals / copy-paste / shell history, so they
+    // stay on the grant path even when they authenticate as the owner.
+    // (Other owner-identified mechanisms — web3-signed and the parent-host
+    // control-plane token — are exempted, see api-auth.ts.)
     const sessionToken = "vana_ps_owner_session_token";
     const app = createApp({
       tokenStore: createMockTokenStore([sessionToken]),

@@ -321,6 +321,32 @@ describe("createApp", () => {
     expect(res.status).toBe(201);
   });
 
+  it("control-plane token can read owner data routes (owner-exempt read)", async () => {
+    // The parent-host control-plane token is owner-identified and never
+    // crosses an interactive surface, so it gets the same owner-exempt
+    // read treatment as web3-signed owner requests. CLI session tokens
+    // (issued via /auth/device) are intentionally NOT exempted — they
+    // travel through terminals and copy-paste, so we keep them on the
+    // grant path. See data.test.ts > "does not let CLI session tokens
+    // bypass grant checks on raw reads".
+    const app = makeAppWithControlPlaneToken();
+    // Seed a file via the same control-plane-authenticated write path.
+    const writeRes = await app.request("/v1/data/test.scope", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        authorization: `Bearer ${CONTROL_PLANE_TOKEN}`,
+      },
+      body: JSON.stringify({ data: "value" }),
+    });
+    expect(writeRes.status).toBe(201);
+
+    const readRes = await app.request("/v1/data/test.scope", {
+      headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+    });
+    expect(readRes.status).toBe(200);
+  });
+
   it("control-plane token can trigger sync routes", async () => {
     const app = makeAppWithControlPlaneToken();
     const res = await app.request("/v1/sync/trigger", {
