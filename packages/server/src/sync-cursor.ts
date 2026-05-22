@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, basename } from "node:path";
-import { loadConfig, saveConfig } from "./config/index.js";
+import { loadConfig } from "./config/index.js";
 
 export interface SyncCursor {
   /** Read the lastProcessedTimestamp from cursor state */
@@ -59,10 +59,52 @@ function createLegacyConfigCursor(configPath: string): SyncCursor {
       return config.sync.lastProcessedTimestamp;
     },
 
+    // Write only the sync cursor field through a raw read/merge/atomic-rename
+    // so we preserve every other field exactly as it lives on disk. The
+    // previous implementation round-tripped the whole config through
+    // loadConfig + saveConfig, which applies zod schema defaults (notably
+    // `storage.backend = "local"`) and silently clobbered runtime overrides
+    // like `storage.backend = "vana"` set via
+    // startPersonalServer({ configDefaults }). The result was that any
+    // consumer relying on configDefaults to set a non-default backend would
+    // silently revert to local storage after the first sync tick.
     async write(timestamp) {
-      const config = await loadConfig({ configPath });
-      config.sync.lastProcessedTimestamp = timestamp;
-      await saveConfig(config, { configPath });
+      let raw = "{}";
+      try {
+        raw = await readFile(configPath, "utf8");
+      } catch (err) {
+        if (
+          !(
+            err instanceof Error &&
+            "code" in err &&
+            (err as NodeJS.ErrnoException).code === "ENOENT"
+          )
+        ) {
+          throw err;
+        }
+      }
+      let parsed: Record<string, unknown>;
+      try {
+        const candidate = JSON.parse(raw) as unknown;
+        parsed =
+          typeof candidate === "object" && candidate !== null
+            ? (candidate as Record<string, unknown>)
+            : {};
+      } catch {
+        parsed = {};
+      }
+      const existingSync =
+        typeof parsed.sync === "object" && parsed.sync !== null
+          ? (parsed.sync as Record<string, unknown>)
+          : {};
+      const next = {
+        ...parsed,
+        sync: { ...existingSync, lastProcessedTimestamp: timestamp },
+      };
+      await mkdir(dirname(configPath), { recursive: true });
+      const tmpPath = `${configPath}.tmp`;
+      await writeFile(tmpPath, `${JSON.stringify(next, null, 2)}\n`);
+      await rename(tmpPath, configPath);
     },
   };
 }

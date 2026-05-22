@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { join } from "node:path";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { createSyncCursor } from "./sync-cursor.js";
 import { loadConfig, saveConfig } from "./config/index.js";
@@ -61,6 +61,64 @@ describe("SyncCursor", () => {
       expect(reloaded.logging.level).toBe("debug");
       expect(reloaded.sync.enabled).toBe(true);
       expect(reloaded.sync.lastProcessedTimestamp).toBe("2026-01-21T10:00:00Z");
+    });
+  });
+
+  it("legacy config-backed write does not overwrite non-default storage backend with schema defaults", async () => {
+    // Regression: createLegacyConfigCursor.write previously round-tripped the
+    // config through loadConfig + saveConfig, which fills in zod schema
+    // defaults (notably storage.backend = "local"). That silently clobbered
+    // runtime overrides such as storage.backend = "vana" injected via
+    // startPersonalServer({ configDefaults }), after the first sync tick.
+    await withTempDir(async (dir) => {
+      const configPath = join(dir, "config.json");
+      // Write a config on disk where storage.backend = "vana", as if the
+      // host process had injected it via configDefaults at boot.
+      await writeFile(
+        configPath,
+        JSON.stringify(
+          {
+            storage: { backend: "vana", config: {} },
+            sync: { enabled: true, lastProcessedTimestamp: null },
+          },
+          null,
+          2,
+        ),
+      );
+
+      const cursor = createSyncCursor(configPath);
+      await cursor.write("2026-01-21T10:00:00Z");
+
+      const raw = JSON.parse(await readFile(configPath, "utf8"));
+      expect(raw.storage.backend).toBe("vana");
+      expect(raw.sync.lastProcessedTimestamp).toBe("2026-01-21T10:00:00Z");
+    });
+  });
+
+  it("legacy config-backed write preserves unknown / forward-compat fields", async () => {
+    await withTempDir(async (dir) => {
+      const configPath = join(dir, "config.json");
+      await writeFile(
+        configPath,
+        JSON.stringify(
+          {
+            sync: { enabled: true, lastProcessedTimestamp: null },
+            // Pretend a future config field landed in the file; the cursor
+            // writer must not strip it just because the current schema
+            // doesn't know about it.
+            experimental: { newFeature: { enabled: true } },
+          },
+          null,
+          2,
+        ),
+      );
+
+      const cursor = createSyncCursor(configPath);
+      await cursor.write("2026-01-21T10:00:00Z");
+
+      const raw = JSON.parse(await readFile(configPath, "utf8"));
+      expect(raw.experimental?.newFeature?.enabled).toBe(true);
+      expect(raw.sync.lastProcessedTimestamp).toBe("2026-01-21T10:00:00Z");
     });
   });
 
