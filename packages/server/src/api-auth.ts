@@ -15,7 +15,6 @@ import {
 } from "@opendatalabs/personal-server-ts-core/errors";
 import type {
   DataStoragePort,
-  FeeVerifierPort,
   RuntimeAvailabilityPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
@@ -28,7 +27,6 @@ export interface ServerApiAuthDeps {
   accessToken?: string;
   tokenStore?: SessionTokenVerifierPort;
   dataStorage?: Pick<DataStoragePort, "findEntry">;
-  feeVerifier?: FeeVerifierPort;
   runtimeAvailability?: RuntimeAvailabilityPort;
 }
 
@@ -145,7 +143,6 @@ export function createServerApiAuth(
         {
           authSessionVerifier: deps.gateway,
           grantVerifier: deps.gateway,
-          feeVerifier: deps.feeVerifier,
           runtimeAvailability: deps.runtimeAvailability,
         },
       );

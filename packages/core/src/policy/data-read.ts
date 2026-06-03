@@ -1,7 +1,6 @@
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
 import { scopeCoveredByGrant } from "@opendatalabs/vana-sdk/browser";
 import {
-  FeeRequiredError,
   GrantExpiredError,
   GrantRequiredError,
   GrantRevokedError,
@@ -11,9 +10,7 @@ import {
   UnregisteredBuilderError,
 } from "../errors/catalog.js";
 import {
-  allowAllFeeVerifier,
   type AuthSessionVerifierPort,
-  type FeeVerifierPort,
   type GrantVerifierPort,
   type RuntimeAvailabilityPort,
 } from "../ports/index.js";
@@ -22,13 +19,18 @@ export interface DataReadPolicyInput {
   signer: `0x${string}`;
   grantId?: string;
   requestedScope: string;
+  // fileId is retained on the input shape for backwards-compat with callers
+  // that pass it; the canary policy no longer enforces fileId pinning.
   fileId?: string;
 }
 
 export interface DataReadPolicyPorts {
   authSessionVerifier: AuthSessionVerifierPort;
   grantVerifier: GrantVerifierPort;
-  feeVerifier?: FeeVerifierPort;
+  // feeVerifier is gone — payment is enforced by the X402 layer on
+  // GET /v1/data/:scope, which forwards the builder's signed payment to
+  // gateway.payForOperation. The policy no longer gates reads on
+  // grant.paymentStatus.
   runtimeAvailability?: RuntimeAvailabilityPort;
 }
 
@@ -102,19 +104,6 @@ export async function verifyDataReadPolicy(
       reason: "Request signer is not the grant builder",
       expected: grant.granteeId,
       actual: input.signer,
-    });
-  }
-
-  const feeVerifier = ports.feeVerifier ?? allowAllFeeVerifier;
-  const fee = await feeVerifier.verifyDataReadFee({
-    grantId: grant.id,
-    builderAddress: input.signer,
-    requestedScope: input.requestedScope,
-  });
-  if (!fee.ok) {
-    throw new FeeRequiredError({
-      grantId: grant.id,
-      reason: fee.reason ?? "Fee verification failed",
     });
   }
 

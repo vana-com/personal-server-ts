@@ -27,7 +27,6 @@ import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type {
   DataStoragePort,
-  FeeVerifierPort,
   RuntimeAvailabilityPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
 import type { TokenStore } from "./token-store.js";
@@ -63,9 +62,18 @@ export interface AppDeps {
   syncManager?: SyncManager | null;
   serverSigner?: ServerSigner;
   tokenStore?: TokenStore;
-  feeVerifier?: FeeVerifierPort;
   runtimeAvailability?: RuntimeAvailabilityPort;
   dataStorage?: DataStoragePort;
+  /**
+   * Gateway base URL — wired into the data route so the GET handler can
+   * forward validated X-PAYMENTs to POST /v1/escrow/pay via direct fetch.
+   */
+  gatewayUrl?: string;
+  /**
+   * When true, GET /v1/data/:scope enforces X402 payment on every read.
+   * Off-by-default to keep dev / test setups frictionless.
+   */
+  paymentEnabled?: boolean;
   getTunnelStatus?: HealthDeps["getTunnelStatus"];
 }
 
@@ -115,11 +123,18 @@ export function createApp(deps: AppDeps): Hono {
       accessToken: deps.accessToken,
       tokenStore: deps.tokenStore,
       syncManager: deps.syncManager ?? null,
-      feeVerifier: deps.feeVerifier,
       runtimeAvailability: deps.runtimeAvailability,
       dataStorage: deps.dataStorage,
-      // Powers the RECORD_DATA_ACCESS attestation on read responses.
+      // Powers the RECORD_DATA_ACCESS attestation embedded in X402 challenges.
       serverSigner: deps.serverSigner,
+      serverAddress: deps.identity?.address,
+      // Required for X402: gatewayConfig provides the EIP-712 domain for
+      // payment signature recovery; gatewayUrl is the forward target for
+      // POST /v1/escrow/pay (direct fetch — bypasses the SDK client to
+      // preserve the gateway's structured error bodies).
+      gatewayConfig: deps.gatewayConfig,
+      gatewayUrl: deps.gatewayUrl,
+      paymentEnabled: deps.paymentEnabled,
       mountPath: "/v1/data",
     }),
   );

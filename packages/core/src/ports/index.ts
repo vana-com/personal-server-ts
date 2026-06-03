@@ -91,24 +91,8 @@ export interface RuntimeAvailabilityPort {
   isAvailable(): boolean | Promise<boolean>;
 }
 
-export interface FeeVerificationInput {
-  grantId: string;
-  builderAddress: `0x${string}`;
-  requestedScope: string;
-}
-
-export type FeeVerificationResult =
-  | { ok: true }
-  | { ok: false; reason?: string };
-
-export interface FeeVerifierPort {
-  verifyDataReadFee(
-    input: FeeVerificationInput,
-  ): Promise<FeeVerificationResult>;
-}
-
-export const allowAllFeeVerifier: FeeVerifierPort = {
-  async verifyDataReadFee() {
-    return { ok: true };
-  },
-};
+// FeeVerifier was the pre-X402 hook that gated reads on grant.paymentStatus
+// via a side-channel call to the gateway. Replaced by the X402 layer on
+// GET /v1/data/:scope (see packages/core/src/payment/x402.ts), which
+// forwards the builder's signed payment to gateway.payForOperation as part
+// of the read response cycle. Reads no longer block on prior paymentStatus.
