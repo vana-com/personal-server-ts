@@ -328,9 +328,18 @@ export async function createPersistentPsLiteStorage(
     },
 
     async insertEntry(entry) {
+      const version =
+        entry.version ??
+        state.entries.reduce(
+          (max, e) =>
+            e.scope === entry.scope && e.version > max ? e.version : max,
+          0,
+        ) + 1;
       const indexed: IndexEntry = {
         ...entry,
         schemaId: entry.schemaId ?? null,
+        version,
+        dataPointId: entry.dataPointId ?? null,
         id: state.nextId,
         createdAt: new Date().toISOString(),
       };
@@ -354,6 +363,29 @@ export async function createPersistentPsLiteStorage(
           if (entry.path !== path) return entry;
           updated = true;
           return { ...entry, fileId };
+        }),
+      };
+      if (updated) {
+        await persist();
+      }
+      return updated;
+    },
+
+    findLatestVersionByScope(scope) {
+      return state.entries.reduce(
+        (max, e) => (e.scope === scope && e.version > max ? e.version : max),
+        0,
+      );
+    },
+
+    async updateDataPointId(path, dataPointId) {
+      let updated = false;
+      state = {
+        ...state,
+        entries: state.entries.map((entry) => {
+          if (entry.path !== path) return entry;
+          updated = true;
+          return { ...entry, dataPointId };
         }),
       };
       if (updated) {

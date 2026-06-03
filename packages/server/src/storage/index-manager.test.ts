@@ -549,4 +549,102 @@ describe("IndexManager", () => {
       manager.findByPath("ig/profile/2026-01-01T00-00-00Z.json"),
     ).toBeUndefined();
   });
+
+  // ─── DPv2: per-scope version + dataPointId ─────────────────────────────
+
+  it("insert without version assigns 1 for a fresh scope", () => {
+    const entry = manager.insert({
+      fileId: null,
+      path: "ig/profile/2026-01-01T00-00-00Z.json",
+      scope: "instagram.profile",
+      collectedAt: "2026-01-01T00:00:00Z",
+      sizeBytes: 100,
+    });
+
+    expect(entry.version).toBe(1);
+    expect(entry.dataPointId).toBeNull();
+  });
+
+  it("insert without version increments the per-scope counter", () => {
+    const first = manager.insert({
+      fileId: null,
+      path: "ig/profile/2026-01-01T00-00-00Z.json",
+      scope: "instagram.profile",
+      collectedAt: "2026-01-01T00:00:00Z",
+      sizeBytes: 100,
+    });
+    const second = manager.insert({
+      fileId: null,
+      path: "ig/profile/2026-01-02T00-00-00Z.json",
+      scope: "instagram.profile",
+      collectedAt: "2026-01-02T00:00:00Z",
+      sizeBytes: 120,
+    });
+    const otherScope = manager.insert({
+      fileId: null,
+      path: "tw/posts/2026-01-02T00-00-00Z.json",
+      scope: "twitter.posts",
+      collectedAt: "2026-01-02T00:00:00Z",
+      sizeBytes: 80,
+    });
+
+    expect(first.version).toBe(1);
+    expect(second.version).toBe(2);
+    expect(otherScope.version).toBe(1);
+  });
+
+  it("insert respects an explicit version", () => {
+    const entry = manager.insert({
+      fileId: null,
+      path: "ig/profile/2026-01-01T00-00-00Z.json",
+      scope: "instagram.profile",
+      collectedAt: "2026-01-01T00:00:00Z",
+      sizeBytes: 100,
+      version: 7,
+    });
+
+    expect(entry.version).toBe(7);
+  });
+
+  it("findLatestVersionByScope returns 0 for unknown scope", () => {
+    expect(manager.findLatestVersionByScope("never.seen")).toBe(0);
+  });
+
+  it("findLatestVersionByScope returns max version after inserts", () => {
+    manager.insert({
+      fileId: null,
+      path: "ig/profile/2026-01-01T00-00-00Z.json",
+      scope: "instagram.profile",
+      collectedAt: "2026-01-01T00:00:00Z",
+      sizeBytes: 100,
+    });
+    manager.insert({
+      fileId: null,
+      path: "ig/profile/2026-01-02T00-00-00Z.json",
+      scope: "instagram.profile",
+      collectedAt: "2026-01-02T00:00:00Z",
+      sizeBytes: 100,
+    });
+
+    expect(manager.findLatestVersionByScope("instagram.profile")).toBe(2);
+  });
+
+  it("updateDataPointId persists the id and returns true", () => {
+    const entry = manager.insert({
+      fileId: null,
+      path: "ig/profile/2026-01-01T00-00-00Z.json",
+      scope: "instagram.profile",
+      collectedAt: "2026-01-01T00:00:00Z",
+      sizeBytes: 100,
+    });
+    expect(entry.dataPointId).toBeNull();
+
+    const updated = manager.updateDataPointId(entry.path, "0xdatapoint");
+    expect(updated).toBe(true);
+    expect(manager.findByPath(entry.path)!.dataPointId).toBe("0xdatapoint");
+  });
+
+  it("updateDataPointId returns false for an unknown path", () => {
+    expect(manager.updateDataPointId("nonexistent.json", "0xdp")).toBe(false);
+  });
 });

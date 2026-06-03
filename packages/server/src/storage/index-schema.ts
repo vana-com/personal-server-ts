@@ -9,7 +9,9 @@ CREATE TABLE IF NOT EXISTS data_files (
   scope TEXT NOT NULL,
   collected_at TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-  size_bytes INTEGER NOT NULL DEFAULT 0
+  size_bytes INTEGER NOT NULL DEFAULT 0,
+  version INTEGER NOT NULL DEFAULT 1,
+  data_point_id TEXT
 )`;
 
 const CREATE_INDEXES_SQL = [
@@ -17,9 +19,10 @@ const CREATE_INDEXES_SQL = [
   "CREATE INDEX IF NOT EXISTS idx_data_files_collected_at ON data_files (collected_at)",
   "CREATE INDEX IF NOT EXISTS idx_data_files_file_id ON data_files (file_id)",
   "CREATE INDEX IF NOT EXISTS idx_data_files_schema_id ON data_files (schema_id)",
+  "CREATE INDEX IF NOT EXISTS idx_data_files_data_point_id ON data_files (data_point_id)",
 ];
 
-export const INDEX_SCHEMA_VERSION = 2;
+export const INDEX_SCHEMA_VERSION = 3;
 
 function hasColumn(
   db: Database.Database,
@@ -33,6 +36,19 @@ function hasColumn(
 function migrateSchema(db: Database.Database, currentVersion: number): void {
   if (currentVersion < 2 && !hasColumn(db, "data_files", "schema_id")) {
     db.exec("ALTER TABLE data_files ADD COLUMN schema_id TEXT");
+  }
+  if (currentVersion < 3) {
+    if (!hasColumn(db, "data_files", "version")) {
+      // Pre-DPv2 rows get version 1 — the same default that fresh ingests
+      // start at, so subsequent ingests of the same scope keep incrementing
+      // from there without colliding with the legacy row.
+      db.exec(
+        "ALTER TABLE data_files ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
+      );
+    }
+    if (!hasColumn(db, "data_files", "data_point_id")) {
+      db.exec("ALTER TABLE data_files ADD COLUMN data_point_id TEXT");
+    }
   }
 }
 

@@ -11,9 +11,11 @@ import {
   fileRegistrationDomain,
   grantRegistrationDomain,
   grantRevocationDomain,
+  dataRegistryDomain,
   FILE_REGISTRATION_TYPES,
   GRANT_REGISTRATION_TYPES,
   GRANT_REVOCATION_TYPES,
+  ADD_DATA_TYPES,
 } from "@opendatalabs/vana-sdk/browser";
 
 const TEST_GATEWAY_CONFIG: GatewayConfig = {
@@ -114,6 +116,32 @@ describe("ServerSigner", () => {
         domain: grantRevocationDomain(TEST_GATEWAY_CONFIG),
         types: GRANT_REVOCATION_TYPES,
         primaryType: "GrantRevocation",
+        message: msg,
+        signature,
+      });
+      expect(recovered.toLowerCase()).toBe(account.address.toLowerCase());
+    });
+  });
+
+  describe("signAddData", () => {
+    it("produces a signature recoverable to the server address", async () => {
+      const { account, signer } = setup();
+      const msg = {
+        ownerAddress:
+          "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as `0x${string}`,
+        scope: "instagram.profile",
+        dataHash: ("0x" + "11".repeat(32)) as `0x${string}`,
+        metadataHash: ("0x" + "22".repeat(32)) as `0x${string}`,
+        expectedVersion: 1n,
+      };
+
+      const signature = await signer.signAddData(msg);
+      expect(signature).toMatch(/^0x[0-9a-fA-F]+$/);
+
+      const recovered = await recoverTypedDataAddress({
+        domain: dataRegistryDomain(TEST_GATEWAY_CONFIG),
+        types: ADD_DATA_TYPES,
+        primaryType: "AddData",
         message: msg,
         signature,
       });
