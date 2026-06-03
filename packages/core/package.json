@@ -103,6 +103,10 @@
     "./test-utils": {
       "types": "./dist/test-utils/index.d.ts",
       "import": "./dist/test-utils/index.js"
+    },
+    "./payment": {
+      "types": "./dist/payment/index.d.ts",
+      "import": "./dist/payment/index.js"
     }
   },
   "scripts": {

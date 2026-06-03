@@ -54,7 +54,11 @@ function makeGrant(
 }
 
 describe("verifyDataReadPolicy", () => {
-  it("returns the grant after builder, grant, scope, expiry, revocation, and fee pass", async () => {
+  it("returns the grant after builder, grant, scope, expiry, revocation pass", async () => {
+    // Payment gating is now enforced by the X402 layer on the GET handler,
+    // not by the data-read policy. The policy returns the grant once the
+    // non-payment invariants (builder registered, scopes cover, not
+    // revoked / expired, signer matches granteeId) all hold.
     const grant = makeGrant();
     const result = await verifyDataReadPolicy(
       {
@@ -65,36 +69,10 @@ describe("verifyDataReadPolicy", () => {
       {
         authSessionVerifier: { getBuilder: vi.fn().mockResolvedValue(builder) },
         grantVerifier: { getGrant: vi.fn().mockResolvedValue(grant) },
-        feeVerifier: {
-          verifyDataReadFee: vi.fn().mockResolvedValue({ ok: true }),
-        },
       },
     );
 
     expect(result).toBe(grant);
-  });
-
-  it("returns FEE_REQUIRED when the fee verifier denies the read", async () => {
-    await expect(
-      verifyDataReadPolicy(
-        {
-          signer: BUILDER_ADDRESS,
-          grantId: "grant-123",
-          requestedScope: "instagram.profile",
-        },
-        {
-          authSessionVerifier: {
-            getBuilder: vi.fn().mockResolvedValue(builder),
-          },
-          grantVerifier: { getGrant: vi.fn().mockResolvedValue(makeGrant()) },
-          feeVerifier: {
-            verifyDataReadFee: vi
-              .fn()
-              .mockResolvedValue({ ok: false, reason: "unpaid" }),
-          },
-        },
-      ),
-    ).rejects.toMatchObject({ errorCode: "FEE_REQUIRED" });
   });
 
   it("returns GRANT_REVOKED when grant.revokedAt is set", async () => {
