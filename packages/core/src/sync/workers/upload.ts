@@ -88,12 +88,16 @@ export async function uploadOne(
   // already persisted a dataPointId on this entry).
   //
   // Commitments:
-  //   dataHash     = keccak256 of the ciphertext that gets uploaded to storage.
-  //                  Binds the on-chain version to the exact bytes we'll serve.
+  //   dataHash     = keccak256 of the plaintext envelope JSON. Commits to the
+  //                  canonical content, not the ciphertext — OpenPGP
+  //                  password-based encryption embeds random salts so
+  //                  re-encrypting the same plaintext yields different bytes;
+  //                  hashing the plaintext keeps the on-chain commitment
+  //                  reproducible across replicas serving the same version.
   //   metadataHash = keccak256 of canonical-JSON({scope, collectedAt, schemaId,
   //                  sizeBytes}). Commits to the off-chain metadata that
   //                  describes this version without leaking the payload.
-  const dataHash = keccak256(encrypted);
+  const dataHash = keccak256(plaintext);
   const metadataHash = keccak256(
     stringToHex(
       JSON.stringify({
