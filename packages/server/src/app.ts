@@ -118,6 +118,8 @@ export function createApp(deps: AppDeps): Hono {
       feeVerifier: deps.feeVerifier,
       runtimeAvailability: deps.runtimeAvailability,
       dataStorage: deps.dataStorage,
+      // Powers the RECORD_DATA_ACCESS attestation on read responses.
+      serverSigner: deps.serverSigner,
       mountPath: "/v1/data",
     }),
   );

@@ -3,6 +3,7 @@ import type {
   FeeVerificationInput,
   FeeVerificationResult,
 } from "@opendatalabs/personal-server-ts-core/ports";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import type { Logger } from "pino";
 
 /**
@@ -17,75 +18,54 @@ import type { Logger } from "pino";
  * Personal Server neither relays nor holds payments; it only enforces the
  * resulting `paymentStatus` on the grant. Contract per the DP RPC
  * `GET /v1/grants` spec (BUI-398).
+ *
+ * Backed by `gateway.getGrant(grantId)` from the canary SDK — the typed
+ * client both handles the gateway envelope unwrap and surfaces a flat
+ * `paymentStatus` field on {@link GatewayGrantResponse} so we don't need
+ * to fork the wire shape here.
  */
 
 export interface GrantFeeVerifierOptions {
-  /** DP RPC base URL (same origin as the gateway client). */
-  gatewayUrl: string;
+  gateway: Pick<GatewayClient, "getGrant">;
   logger?: Logger;
-  /**
-   * Abort the DP RPC fee lookup after this many ms so a hung request fails
-   * closed instead of stalling every protected read. Default 5000.
-   */
-  timeoutMs?: number;
-}
-
-/** The grant payment field the verifier reads from a DP RPC grant record. */
-interface GrantPaymentView {
-  paymentStatus?: "pending" | "paid";
 }
 
 export function createGrantFeeVerifier(
   options: GrantFeeVerifierOptions,
 ): FeeVerifierPort {
-  const base = options.gatewayUrl.replace(/\/+$/, "");
-  const timeoutMs = options.timeoutMs ?? 5000;
-
   return {
     async verifyDataReadFee(
       input: FeeVerificationInput,
     ): Promise<FeeVerificationResult> {
       // Fail closed: any uncertainty about payment must not release data.
-      // A hung DP RPC is aborted after `timeoutMs`; the abort throws and is
-      // handled here as "unavailable".
-      let res: Response;
+      // gateway.getGrant throws on transport/HTTP errors and returns null
+      // for 404 — both treated as "unavailable".
+      let grant: Awaited<ReturnType<GatewayClient["getGrant"]>>;
       try {
-        res = await fetch(
-          `${base}/v1/grants/${encodeURIComponent(input.grantId)}`,
-          { signal: AbortSignal.timeout(timeoutMs) },
-        );
+        grant = await options.gateway.getGrant(input.grantId);
       } catch (err) {
         options.logger?.warn(
           { err, grantId: input.grantId },
-          "Fee check: DP RPC request failed",
+          "Fee check: DP RPC getGrant failed",
         );
         return { ok: false, reason: "Payment status unavailable" };
       }
 
-      if (!res.ok) {
+      if (!grant) {
         options.logger?.warn(
-          { status: res.status, grantId: input.grantId },
-          "Fee check: DP RPC returned an error",
+          { grantId: input.grantId },
+          "Fee check: DP RPC returned no grant for id",
         );
         return { ok: false, reason: "Payment status unavailable" };
       }
 
-      let paymentStatus: GrantPaymentView["paymentStatus"];
-      try {
-        // DP RPC wraps GET responses as `{ data, proof }`.
-        const body = (await res.json()) as { data?: GrantPaymentView };
-        paymentStatus = body.data?.paymentStatus;
-      } catch {
-        return { ok: false, reason: "Payment status unavailable" };
-      }
-
-      if (paymentStatus === "paid") {
+      if (grant.paymentStatus === "paid") {
         return { ok: true };
       }
       return {
         ok: false,
         reason: `Grant registration fee not paid (status: ${
-          paymentStatus ?? "unknown"
+          grant.paymentStatus ?? "unknown"
         })`,
       };
     },

@@ -72,17 +72,27 @@ function makeGrant(
     id: "grant-123",
     grantorAddress: ownerWallet.address,
     granteeId: BUILDER_ID,
-    grant: JSON.stringify({
-      user: ownerWallet.address,
-      builder: wallet.address,
-      scopes: ["instagram.*"],
-      expiresAt: Math.floor(Date.now() / 1000) + 3600,
-    }),
-    fileIds: [],
+    scopes: ["instagram.*"],
     status: "confirmed",
     addedAt: "2026-01-21T10:00:00.000Z",
+    expiresAt: String(Math.floor(Date.now() / 1000) + 3600),
+    expired: false,
     revokedAt: null,
     revocationSignature: null,
+    paymentStatus: "paid",
+    paidAt: "2026-01-21T10:00:05.000Z",
+    paidBy: ownerWallet.address,
+    grantVersion: "1",
+    settleTxHash: null,
+    settleSubmittedAt: null,
+    revocationTxHash: null,
+    revocationSubmittedAt: null,
+    fee: {
+      asset: "0x0000000000000000000000000000000000000000",
+      registrationFee: "0",
+      dataAccessFee: "0",
+      totalDue: "0",
+    },
     ...overrides,
   };
 }
@@ -994,10 +1004,7 @@ describe("GET /v1/data/:scope", () => {
 
   it("returns 403 GRANT_EXPIRED for expired grant", async () => {
     const grant = makeGrant({
-      grant: JSON.stringify({
-        scopes: ["instagram.*"],
-        expiresAt: Math.floor(Date.now() / 1000) - 3600,
-      }),
+      expiresAt: String(Math.floor(Date.now() / 1000) - 3600),
     });
     const gateway = createMockGateway({
       getGrant: vi.fn().mockResolvedValue(grant),
@@ -1012,12 +1019,7 @@ describe("GET /v1/data/:scope", () => {
   });
 
   it("returns 403 SCOPE_MISMATCH when grant does not cover scope", async () => {
-    const grant = makeGrant({
-      grant: JSON.stringify({
-        scopes: ["twitter.*"],
-        expiresAt: Math.floor(Date.now() / 1000) + 3600,
-      }),
-    });
+    const grant = makeGrant({ scopes: ["twitter.*"] });
     const gateway = createMockGateway({
       getGrant: vi.fn().mockResolvedValue(grant),
     });
@@ -1030,35 +1032,21 @@ describe("GET /v1/data/:scope", () => {
     expect(json.error.errorCode).toBe("SCOPE_MISMATCH");
   });
 
-  it("returns 403 SCOPE_MISMATCH when fileId is not authorized by grant", async () => {
-    const grant = makeGrant({ fileIds: ["file-1"] });
+  // Canary GatewayGrantResponse has no `fileIds` — per-grant file pinning
+  // is gone. The previous "fileId not authorized" + "fileId-restricted
+  // latest reads" tests no longer have a corresponding code path to
+  // exercise. Reads now resolve by (scope, optional ?at=) without grant-
+  // level fileId allow-lists; the canary protocol relies on dataPointId +
+  // version commitments instead.
+
+  it("authorizes default latest reads when grant covers the scope", async () => {
+    const grant = makeGrant();
     const gateway = createMockGateway({
       getGrant: vi.fn().mockResolvedValue(grant),
     });
     const app = createApp({ gateway });
 
     await ingestData("instagram.profile", { username: "test_user" }, app);
-
-    const res = await getWithAuth(app, "instagram.profile", {
-      query: "?fileId=file-2",
-    });
-
-    expect(res.status).toBe(403);
-    const json = await res.json();
-    expect(json.error.errorCode).toBe("SCOPE_MISMATCH");
-  });
-
-  it("authorizes default latest reads against selected entry fileId", async () => {
-    const grant = makeGrant({ fileIds: ["file-1"] });
-    const gateway = createMockGateway({
-      getGrant: vi.fn().mockResolvedValue(grant),
-    });
-    const app = createApp({ gateway });
-
-    await ingestData("instagram.profile", { username: "test_user" }, app);
-    const entry = indexManager.findLatestByScope("instagram.profile");
-    expect(entry).toBeDefined();
-    indexManager.updateFileId(entry!.path, "file-1");
 
     const res = await getWithAuth(app, "instagram.profile");
 
@@ -1086,19 +1074,17 @@ describe("GET /v1/data/:scope", () => {
   });
 
   it("serves data when createGrantFeeVerifier sees the grant fee paid", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(
-        new Response(JSON.stringify({ data: { paymentStatus: "paid" } }), {
-          status: 200,
-        }),
-      ),
-    );
+    // The canary verifier consumes a typed GatewayClient via gateway.getGrant
+    // instead of raw fetch. The same gateway mock both authorizes the read
+    // (via getGrant) AND drives the fee check, since the verifier reads
+    // paymentStatus off the same response shape.
+    const grant = makeGrant({ paymentStatus: "paid" });
+    const feeGateway = createMockGateway({
+      getGrant: vi.fn().mockResolvedValue(grant),
+    });
     const app = createApp({
-      feeVerifier: createGrantFeeVerifier({
-        gatewayUrl: "https://dp-rpc.test",
-        logger,
-      }),
+      gateway: feeGateway,
+      feeVerifier: createGrantFeeVerifier({ gateway: feeGateway, logger }),
     });
     await ingestData("instagram.profile", { username: "test_user" }, app);
 
@@ -1108,19 +1094,17 @@ describe("GET /v1/data/:scope", () => {
   });
 
   it("returns 403 FEE_REQUIRED when createGrantFeeVerifier sees the grant unpaid", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(
-        new Response(JSON.stringify({ data: { paymentStatus: "pending" } }), {
-          status: 200,
-        }),
-      ),
-    );
+    const grant = makeGrant({
+      paymentStatus: "pending",
+      paidAt: null,
+      paidBy: null,
+    });
+    const feeGateway = createMockGateway({
+      getGrant: vi.fn().mockResolvedValue(grant),
+    });
     const app = createApp({
-      feeVerifier: createGrantFeeVerifier({
-        gatewayUrl: "https://dp-rpc.test",
-        logger,
-      }),
+      gateway: feeGateway,
+      feeVerifier: createGrantFeeVerifier({ gateway: feeGateway, logger }),
     });
     await ingestData("instagram.profile", { username: "test_user" }, app);
 

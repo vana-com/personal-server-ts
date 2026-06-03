@@ -146,7 +146,7 @@ export async function createServer(
   const feeVerifier =
     options?.feeVerifier ??
     (config.payment.enabled
-      ? createGrantFeeVerifier({ gatewayUrl: config.gateway.url, logger })
+      ? createGrantFeeVerifier({ gateway: gatewayClient, logger })
       : undefined);
   if (feeVerifier) {
     logger.info("Payment enforcement enabled — data reads gated on grant fee");
