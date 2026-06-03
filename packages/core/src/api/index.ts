@@ -79,6 +79,20 @@ export interface PersonalServerDataApiDeps {
   syncManager?: PersonalServerIngestSyncManager | null;
   runtimeAvailability?: RuntimeAvailabilityPort;
   feeVerifier?: FeeVerifierPort;
+  /**
+   * Optional. When provided alongside `serverOwner`, every successful
+   * GET /v1/data/:scope emits a server-signed RECORD_DATA_ACCESS
+   * attestation on the response envelope so the builder can attach it
+   * to their next gateway.payForOperation call.
+   */
+  serverSigner?: Pick<ServerSigner, "signRecordDataAccess">;
+  serverOwner?: `0x${string}`;
+  /**
+   * Test/override seam for the per-event recordId. Production callers
+   * leave this unset and the handler generates a fresh 32-byte hex
+   * value per read via the crypto subtle API.
+   */
+  generateRecordId?: () => `0x${string}`;
   now?: () => Date;
   createLogId?: () => string;
   logger?: PersonalServerApiLogger;
@@ -205,6 +219,19 @@ function stripBasePath(pathname: string, basePath: string | undefined): string {
     return pathname.slice(basePath.length);
   }
   return pathname;
+}
+
+// Per-event bytes32 the DPv2 contract pins to prevent replay. We use
+// 32 cryptographically random bytes so the recordId space is collision-
+// resistant under the contract's anti-replay set; the gateway re-uses
+// this value verbatim as recordId in the RECORD_DATA_ACCESS payload.
+function generateRecordId(): `0x${string}` {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return ("0x" +
+    Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join(
+      "",
+    )) as `0x${string}`;
 }
 
 function decodePathPart(value: string | undefined): string {
@@ -349,6 +376,59 @@ export async function handlePersonalServerDataRequest(
         at: url.searchParams.get("at") ?? undefined,
       });
       if (!result.ok) return contractErrorResponse(result);
+
+      // Server-signed RECORD_DATA_ACCESS attestation. Builders attach this
+      // to the gateway's accessRecord field on payForOperation so the
+      // gateway can settle the on-chain DataRegistryV2.recordDataAccess
+      // call. Emission requires both a server signer (we're signing on
+      // behalf of the owner) and an authoritative accessor address — i.e.
+      // a builder identity from authorizeBuilderRead. Owner-exempt reads
+      // (web3-signed or control-plane-token owner reads) skip emission
+      // because there's no payable op to attach a record to.
+      const entry = deps.storage.findEntry({
+        scope: scopeResult.scope,
+        fileId: url.searchParams.get("fileId") ?? undefined,
+        at: url.searchParams.get("at") ?? undefined,
+      });
+      let accessRecord:
+        | {
+            scope: string;
+            version: string;
+            accessor: `0x${string}`;
+            recordId: `0x${string}`;
+            signature: `0x${string}`;
+          }
+        | undefined;
+      const accessor = authResult?.builder;
+      const isOwnerSignal =
+        authResult?.grantId === "owner" ||
+        authResult?.grantId === "policy-bypass";
+      if (
+        deps.serverSigner &&
+        deps.serverOwner &&
+        entry &&
+        typeof accessor === "string" &&
+        accessor.startsWith("0x") &&
+        !isOwnerSignal
+      ) {
+        const recordId = deps.generateRecordId?.() ?? generateRecordId();
+        const version = BigInt(entry.version);
+        const signature = await deps.serverSigner.signRecordDataAccess({
+          ownerAddress: deps.serverOwner,
+          scope: scopeResult.scope,
+          version,
+          accessor: accessor as `0x${string}`,
+          recordId,
+        });
+        accessRecord = {
+          scope: scopeResult.scope,
+          version: version.toString(),
+          accessor: accessor as `0x${string}`,
+          recordId,
+          signature,
+        };
+      }
+
       await deps.accessLogWriter.write({
         logId: deps.createLogId?.() ?? crypto.randomUUID(),
         grantId: authResult?.grantId ?? grantId ?? "unknown",
@@ -362,7 +442,10 @@ export async function handlePersonalServerDataRequest(
           "unknown",
         userAgent: request.headers.get("user-agent") ?? "unknown",
       });
-      return jsonResponse(result.envelope);
+
+      return jsonResponse(
+        accessRecord ? { ...result.envelope, accessRecord } : result.envelope,
+      );
     }
 
     if (request.method === "POST") {

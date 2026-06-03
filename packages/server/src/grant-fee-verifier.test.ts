@@ -1,8 +1,10 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import type {
+  GatewayClient,
+  GatewayGrantResponse,
+} from "@opendatalabs/vana-sdk/node";
 import { createGrantFeeVerifier } from "./grant-fee-verifier.js";
 import type { FeeVerificationInput } from "@opendatalabs/personal-server-ts-core/ports";
-
-const GATEWAY_URL = "https://dp-rpc.example";
 
 const input: FeeVerificationInput = {
   grantId: "0xgrant",
@@ -10,46 +12,75 @@ const input: FeeVerificationInput = {
   requestedScope: "instagram.profile",
 };
 
-function mockFetch(impl: () => Response | Promise<Response>) {
-  const fn = vi.fn(impl);
-  vi.stubGlobal("fetch", fn);
-  return fn;
+function grantResponse(
+  paymentStatus: GatewayGrantResponse["paymentStatus"] | undefined,
+): GatewayGrantResponse {
+  return {
+    id: input.grantId,
+    grantorAddress: "0xowner",
+    granteeId: "0xbuilder",
+    scopes: ["instagram.*"],
+    status: "confirmed",
+    addedAt: "2026-01-01T00:00:00Z",
+    expiresAt: null,
+    expired: false,
+    revokedAt: null,
+    revocationSignature: null,
+    paymentStatus: paymentStatus as GatewayGrantResponse["paymentStatus"],
+    paidAt: paymentStatus === "paid" ? "2026-01-01T00:00:05Z" : null,
+    paidBy: paymentStatus === "paid" ? "0xpayer" : null,
+    grantVersion: "1",
+    settleTxHash: null,
+    settleSubmittedAt: null,
+    revocationTxHash: null,
+    revocationSubmittedAt: null,
+    fee: {
+      asset: "0x0000000000000000000000000000000000000000",
+      registrationFee: "0",
+      dataAccessFee: "0",
+      totalDue: "0",
+    },
+  };
 }
 
-function grantResponse(paymentStatus?: string) {
-  return new Response(
-    JSON.stringify({ data: { id: input.grantId, paymentStatus }, proof: {} }),
-    { status: 200, headers: { "Content-Type": "application/json" } },
-  );
+function makeGateway(
+  getGrant: (id: string) => Promise<GatewayGrantResponse | null>,
+): Pick<GatewayClient, "getGrant"> {
+  return { getGrant: vi.fn(getGrant) };
 }
-
-afterEach(() => vi.unstubAllGlobals());
 
 describe("createGrantFeeVerifier", () => {
   it("allows the read when the grant fee is paid", async () => {
-    mockFetch(() => grantResponse("paid"));
-    const verifier = createGrantFeeVerifier({ gatewayUrl: GATEWAY_URL });
+    const gateway = makeGateway(async () => grantResponse("paid"));
+    const verifier = createGrantFeeVerifier({ gateway });
 
     expect(await verifier.verifyDataReadFee(input)).toEqual({ ok: true });
+    expect(gateway.getGrant).toHaveBeenCalledWith(input.grantId);
   });
 
   it("blocks the read when the grant fee is pending", async () => {
-    mockFetch(() => grantResponse("pending"));
-    const verifier = createGrantFeeVerifier({ gatewayUrl: GATEWAY_URL });
+    const gateway = makeGateway(async () => grantResponse("pending"));
+    const verifier = createGrantFeeVerifier({ gateway });
 
-    expect((await verifier.verifyDataReadFee(input)).ok).toBe(false);
+    const result = await verifier.verifyDataReadFee(input);
+    expect(result.ok).toBe(false);
+    expect(result.ok ? "" : result.reason).toContain("pending");
   });
 
   it("blocks the read when paymentStatus is absent", async () => {
-    mockFetch(() => grantResponse(undefined));
-    const verifier = createGrantFeeVerifier({ gatewayUrl: GATEWAY_URL });
+    const gateway = makeGateway(async () => grantResponse(undefined));
+    const verifier = createGrantFeeVerifier({ gateway });
 
-    expect((await verifier.verifyDataReadFee(input)).ok).toBe(false);
+    const result = await verifier.verifyDataReadFee(input);
+    expect(result.ok).toBe(false);
+    expect(result.ok ? "" : result.reason).toContain("unknown");
   });
 
-  it("fails closed when DP RPC returns an error", async () => {
-    mockFetch(() => new Response("nope", { status: 500 }));
-    const verifier = createGrantFeeVerifier({ gatewayUrl: GATEWAY_URL });
+  it("fails closed when the gateway client throws", async () => {
+    const gateway = makeGateway(async () => {
+      throw new Error("ECONNREFUSED");
+    });
+    const verifier = createGrantFeeVerifier({ gateway });
 
     expect(await verifier.verifyDataReadFee(input)).toEqual({
       ok: false,
@@ -57,39 +88,9 @@ describe("createGrantFeeVerifier", () => {
     });
   });
 
-  it("fails closed when DP RPC is unreachable", async () => {
-    mockFetch(() => Promise.reject(new Error("ECONNREFUSED")));
-    const verifier = createGrantFeeVerifier({ gatewayUrl: GATEWAY_URL });
-
-    expect(await verifier.verifyDataReadFee(input)).toEqual({
-      ok: false,
-      reason: "Payment status unavailable",
-    });
-  });
-
-  it("queries the grant-by-id endpoint with an abort signal, trimming a trailing slash", async () => {
-    const fn = mockFetch(() => grantResponse("paid"));
-    const verifier = createGrantFeeVerifier({ gatewayUrl: `${GATEWAY_URL}/` });
-
-    await verifier.verifyDataReadFee(input);
-
-    expect(fn).toHaveBeenCalledWith(
-      `${GATEWAY_URL}/v1/grants/${encodeURIComponent(input.grantId)}`,
-      { signal: expect.any(AbortSignal) },
-    );
-  });
-
-  it("fails closed when the DP RPC request times out", async () => {
-    mockFetch(
-      () =>
-        new Promise((_resolve, reject) => {
-          reject(new DOMException("The operation timed out.", "TimeoutError"));
-        }),
-    );
-    const verifier = createGrantFeeVerifier({
-      gatewayUrl: GATEWAY_URL,
-      timeoutMs: 10,
-    });
+  it("fails closed when the gateway returns null (grant not found)", async () => {
+    const gateway = makeGateway(async () => null);
+    const verifier = createGrantFeeVerifier({ gateway });
 
     expect(await verifier.verifyDataReadFee(input)).toEqual({
       ok: false,

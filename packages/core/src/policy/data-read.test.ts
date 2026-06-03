@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import type { Builder } from "@opendatalabs/vana-sdk/browser";
-import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
+import type {
+  Builder,
+  GatewayGrantResponse,
+} from "@opendatalabs/vana-sdk/browser";
 import { verifyDataReadPolicy } from "./data-read.js";
 
 const BUILDER_ADDRESS = "0x0000000000000000000000000000000000000001";
@@ -15,6 +17,10 @@ const builder: Builder = {
   addedAt: "2026-01-21T10:00:00.000Z",
 };
 
+// Canary GatewayGrantResponse is fully flat: top-level scopes + expiresAt
+// (string | null), no signed JSON blob, no fileIds. paymentStatus is a
+// separate axis from on-chain `status` and is what gate-on-payment policy
+// reads through the fee verifier.
 function makeGrant(
   overrides: Partial<GatewayGrantResponse> = {},
 ): GatewayGrantResponse {
@@ -22,38 +28,29 @@ function makeGrant(
     id: "grant-123",
     grantorAddress: "0xOwner",
     granteeId: BUILDER_ID,
-    grant: JSON.stringify({
-      scopes: ["instagram.*"],
-      expiresAt: Math.floor(Date.now() / 1000) + 3600,
-    }),
-    fileIds: [],
-    status: "confirmed",
-    addedAt: "2026-01-21T10:00:00.000Z",
-    revokedAt: null,
-    revocationSignature: null,
-    ...overrides,
-  };
-}
-
-/**
- * Build a grant in the new flat DP RPC shape (vana-com/data-gateway#17):
- * `scopes` is a direct top-level array, and the legacy `grant` signed payload
- * + `fileIds` are absent.
- */
-function makeFlatGrant(
-  overrides: Record<string, unknown> = {},
-): GatewayGrantResponse {
-  return {
-    id: "grant-flat-1",
-    grantorAddress: "0xOwner",
-    granteeId: BUILDER_ID,
     scopes: ["instagram.*"],
     status: "confirmed",
     addedAt: "2026-01-21T10:00:00.000Z",
+    expiresAt: String(Math.floor(Date.now() / 1000) + 3600),
+    expired: false,
     revokedAt: null,
     revocationSignature: null,
+    paymentStatus: "paid",
+    paidAt: "2026-01-21T10:00:05.000Z",
+    paidBy: "0xOwner",
+    grantVersion: "1",
+    settleTxHash: null,
+    settleSubmittedAt: null,
+    revocationTxHash: null,
+    revocationSubmittedAt: null,
+    fee: {
+      asset: "0x0000000000000000000000000000000000000000",
+      registrationFee: "10000000000000000",
+      dataAccessFee: "1000000000000000",
+      totalDue: "11000000000000000",
+    },
     ...overrides,
-  } as unknown as GatewayGrantResponse;
+  };
 }
 
 describe("verifyDataReadPolicy", () => {
@@ -100,32 +97,93 @@ describe("verifyDataReadPolicy", () => {
     ).rejects.toMatchObject({ errorCode: "FEE_REQUIRED" });
   });
 
-  it("allows a requested fileId included in a file-restricted grant", async () => {
-    const grant = makeGrant({ fileIds: ["file-1"] });
+  it("returns GRANT_REVOKED when grant.revokedAt is set", async () => {
+    await expect(
+      verifyDataReadPolicy(
+        {
+          signer: BUILDER_ADDRESS,
+          grantId: "grant-123",
+          requestedScope: "instagram.profile",
+        },
+        {
+          authSessionVerifier: {
+            getBuilder: vi.fn().mockResolvedValue(builder),
+          },
+          grantVerifier: {
+            getGrant: vi
+              .fn()
+              .mockResolvedValue(
+                makeGrant({ revokedAt: "2026-05-01T00:00:00Z" }),
+              ),
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ errorCode: "GRANT_REVOKED" });
+  });
+
+  it("returns GRANT_EXPIRED when grant.expiresAt is in the past", async () => {
+    await expect(
+      verifyDataReadPolicy(
+        {
+          signer: BUILDER_ADDRESS,
+          grantId: "grant-123",
+          requestedScope: "instagram.profile",
+        },
+        {
+          authSessionVerifier: {
+            getBuilder: vi.fn().mockResolvedValue(builder),
+          },
+          grantVerifier: {
+            getGrant: vi.fn().mockResolvedValue(
+              makeGrant({
+                expiresAt: String(Math.floor(Date.now() / 1000) - 3600),
+              }),
+            ),
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ errorCode: "GRANT_EXPIRED" });
+  });
+
+  it("treats expiresAt='0' as perpetual (no expiry check)", async () => {
+    const grant = makeGrant({ expiresAt: "0" });
     const result = await verifyDataReadPolicy(
       {
         signer: BUILDER_ADDRESS,
         grantId: grant.id,
         requestedScope: "instagram.profile",
-        fileId: "file-1",
       },
       {
         authSessionVerifier: { getBuilder: vi.fn().mockResolvedValue(builder) },
         grantVerifier: { getGrant: vi.fn().mockResolvedValue(grant) },
       },
     );
-
     expect(result).toBe(grant);
   });
 
-  it("returns SCOPE_MISMATCH when a file-restricted grant lacks the requested fileId", async () => {
+  it("treats expiresAt=null as perpetual (no expiry check)", async () => {
+    const grant = makeGrant({ expiresAt: null });
+    const result = await verifyDataReadPolicy(
+      {
+        signer: BUILDER_ADDRESS,
+        grantId: grant.id,
+        requestedScope: "instagram.profile",
+      },
+      {
+        authSessionVerifier: { getBuilder: vi.fn().mockResolvedValue(builder) },
+        grantVerifier: { getGrant: vi.fn().mockResolvedValue(grant) },
+      },
+    );
+    expect(result).toBe(grant);
+  });
+
+  it("returns SCOPE_MISMATCH when grant scopes do not cover the read", async () => {
     await expect(
       verifyDataReadPolicy(
         {
           signer: BUILDER_ADDRESS,
           grantId: "grant-123",
           requestedScope: "instagram.profile",
-          fileId: "file-2",
         },
         {
           authSessionVerifier: {
@@ -134,14 +192,34 @@ describe("verifyDataReadPolicy", () => {
           grantVerifier: {
             getGrant: vi
               .fn()
-              .mockResolvedValue(makeGrant({ fileIds: ["file-1"] })),
+              .mockResolvedValue(makeGrant({ scopes: ["twitter.*"] })),
           },
         },
       ),
     ).rejects.toMatchObject({ errorCode: "SCOPE_MISMATCH" });
   });
 
-  it("requires fileId when a grant is restricted to fileIds", async () => {
+  it("returns SCOPE_MISMATCH when grant has empty scopes", async () => {
+    await expect(
+      verifyDataReadPolicy(
+        {
+          signer: BUILDER_ADDRESS,
+          grantId: "grant-empty",
+          requestedScope: "instagram.profile",
+        },
+        {
+          authSessionVerifier: {
+            getBuilder: vi.fn().mockResolvedValue(builder),
+          },
+          grantVerifier: {
+            getGrant: vi.fn().mockResolvedValue(makeGrant({ scopes: [] })),
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ errorCode: "SCOPE_MISMATCH" });
+  });
+
+  it("returns INVALID_SIGNATURE when signer doesn't match grant.granteeId", async () => {
     await expect(
       verifyDataReadPolicy(
         {
@@ -156,11 +234,62 @@ describe("verifyDataReadPolicy", () => {
           grantVerifier: {
             getGrant: vi
               .fn()
-              .mockResolvedValue(makeGrant({ fileIds: ["file-1"] })),
+              .mockResolvedValue(makeGrant({ granteeId: "0xsomeoneelse" })),
           },
         },
       ),
-    ).rejects.toMatchObject({ errorCode: "SCOPE_MISMATCH" });
+    ).rejects.toMatchObject({ errorCode: "INVALID_SIGNATURE" });
+  });
+
+  it("returns UNREGISTERED_BUILDER when signer is unknown", async () => {
+    await expect(
+      verifyDataReadPolicy(
+        {
+          signer: BUILDER_ADDRESS,
+          grantId: "grant-123",
+          requestedScope: "instagram.profile",
+        },
+        {
+          authSessionVerifier: { getBuilder: vi.fn().mockResolvedValue(null) },
+          grantVerifier: { getGrant: vi.fn() },
+        },
+      ),
+    ).rejects.toMatchObject({ errorCode: "UNREGISTERED_BUILDER" });
+  });
+
+  it("returns GRANT_REQUIRED when no grantId is provided", async () => {
+    await expect(
+      verifyDataReadPolicy(
+        {
+          signer: BUILDER_ADDRESS,
+          requestedScope: "instagram.profile",
+        },
+        {
+          authSessionVerifier: {
+            getBuilder: vi.fn().mockResolvedValue(builder),
+          },
+          grantVerifier: { getGrant: vi.fn() },
+        },
+      ),
+    ).rejects.toMatchObject({ errorCode: "GRANT_REQUIRED" });
+  });
+
+  it("returns GRANT_REQUIRED when the grant is not found", async () => {
+    await expect(
+      verifyDataReadPolicy(
+        {
+          signer: BUILDER_ADDRESS,
+          grantId: "grant-missing",
+          requestedScope: "instagram.profile",
+        },
+        {
+          authSessionVerifier: {
+            getBuilder: vi.fn().mockResolvedValue(builder),
+          },
+          grantVerifier: { getGrant: vi.fn().mockResolvedValue(null) },
+        },
+      ),
+    ).rejects.toMatchObject({ errorCode: "GRANT_REQUIRED" });
   });
 
   it("returns PS_UNAVAILABLE when the runtime availability port is down", async () => {
@@ -180,69 +309,5 @@ describe("verifyDataReadPolicy", () => {
         },
       ),
     ).rejects.toMatchObject({ errorCode: "PS_UNAVAILABLE" });
-  });
-
-  // The DP RPC migration to a flat grant shape — direct `scopes`, no signed
-  // `grant` payload, no `fileIds`. Confirms the policy still validates reads
-  // against the new shape once the legacy fields are gone.
-  it("validates a flat-shape grant using direct top-level scopes", async () => {
-    const grant = makeFlatGrant();
-    const result = await verifyDataReadPolicy(
-      {
-        signer: BUILDER_ADDRESS,
-        grantId: grant.id,
-        requestedScope: "instagram.profile",
-      },
-      {
-        authSessionVerifier: { getBuilder: vi.fn().mockResolvedValue(builder) },
-        grantVerifier: { getGrant: vi.fn().mockResolvedValue(grant) },
-      },
-    );
-
-    expect(result).toBe(grant);
-  });
-
-  it("returns SCOPE_MISMATCH when flat-shape scopes do not cover the read", async () => {
-    await expect(
-      verifyDataReadPolicy(
-        {
-          signer: BUILDER_ADDRESS,
-          grantId: "grant-flat-1",
-          requestedScope: "instagram.profile",
-        },
-        {
-          authSessionVerifier: {
-            getBuilder: vi.fn().mockResolvedValue(builder),
-          },
-          grantVerifier: {
-            getGrant: vi
-              .fn()
-              .mockResolvedValue(makeFlatGrant({ scopes: ["twitter.*"] })),
-          },
-        },
-      ),
-    ).rejects.toMatchObject({ errorCode: "SCOPE_MISMATCH" });
-  });
-
-  it("returns SCOPE_MISMATCH when a grant carries neither flat scopes nor a legacy payload", async () => {
-    await expect(
-      verifyDataReadPolicy(
-        {
-          signer: BUILDER_ADDRESS,
-          grantId: "grant-empty",
-          requestedScope: "instagram.profile",
-        },
-        {
-          authSessionVerifier: {
-            getBuilder: vi.fn().mockResolvedValue(builder),
-          },
-          grantVerifier: {
-            getGrant: vi
-              .fn()
-              .mockResolvedValue(makeFlatGrant({ scopes: undefined })),
-          },
-        },
-      ),
-    ).rejects.toMatchObject({ errorCode: "SCOPE_MISMATCH" });
   });
 });

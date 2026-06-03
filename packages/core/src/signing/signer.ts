@@ -14,10 +14,12 @@ import {
   GRANT_REGISTRATION_TYPES,
   GRANT_REVOCATION_TYPES,
   ADD_DATA_TYPES,
+  RECORD_DATA_ACCESS_TYPES,
   type FileRegistrationMessage,
   type GrantRegistrationMessage,
   type GrantRevocationMessage,
   type AddDataMessage,
+  type RecordDataAccessMessage,
 } from "@opendatalabs/vana-sdk/browser";
 
 export interface ServerSigner {
@@ -31,6 +33,16 @@ export interface ServerSigner {
    * server is a registered trusted server of the owner.
    */
   signAddData(msg: AddDataMessage): Promise<`0x${string}`>;
+  /**
+   * RECORD_DATA_ACCESS attestation: a server-signed delivery receipt that a
+   * specific (scope, version) was served to `accessor`. Emitted on every
+   * successful GET /v1/data/:scope; builders attach it to the AccessRecord
+   * on their next gateway.payForOperation call so the gateway can settle
+   * it on-chain via DataRegistryV2.recordDataAccess.
+   *
+   * recordId is a per-event bytes32 the contract pins to prevent replay.
+   */
+  signRecordDataAccess(msg: RecordDataAccessMessage): Promise<`0x${string}`>;
 }
 
 export function createServerSigner(
@@ -80,6 +92,17 @@ export function createServerSigner(
         domain: dataRegistryDomain(gatewayConfig),
         types: ADD_DATA_TYPES,
         primaryType: "AddData",
+        message: msg as unknown as Record<string, unknown>,
+      });
+    },
+
+    async signRecordDataAccess(
+      msg: RecordDataAccessMessage,
+    ): Promise<`0x${string}`> {
+      return account.signTypedData({
+        domain: dataRegistryDomain(gatewayConfig),
+        types: RECORD_DATA_ACCESS_TYPES,
+        primaryType: "RecordDataAccess",
         message: msg as unknown as Record<string, unknown>,
       });
     },

@@ -13,6 +13,7 @@ import type {
   DataStoragePort,
   RuntimeAvailabilityPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
+import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { TokenStore } from "../token-store.js";
 import type { Logger } from "pino";
 import {
@@ -37,6 +38,12 @@ export interface DataRouteDeps {
   feeVerifier?: FeeVerifierPort;
   dataStorage?: DataStoragePort;
   runtimeAvailability?: RuntimeAvailabilityPort;
+  /**
+   * Optional. When supplied, the GET handler emits a server-signed
+   * RECORD_DATA_ACCESS attestation on every successful read so builders
+   * can attach it to gateway.payForOperation.
+   */
+  serverSigner?: ServerSigner;
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
 }
 
@@ -73,6 +80,8 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         syncManager: deps.syncManager ?? null,
         runtimeAvailability: deps.runtimeAvailability,
         feeVerifier: deps.feeVerifier,
+        serverSigner: deps.serverSigner,
+        serverOwner: deps.serverOwner,
         logger: deps.logger,
       },
       { basePath: deps.mountPath },

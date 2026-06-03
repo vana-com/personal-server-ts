@@ -58,6 +58,15 @@ describe("PS Lite sync", () => {
       }),
       registerServer: vi.fn().mockResolvedValue({ alreadyRegistered: false }),
       registerFile: vi.fn().mockResolvedValue({ fileId: "file-browser-1" }),
+      // Canary upload worker registers the DPv2 data point before registering
+      // the off-chain file pointer. Mock returns a dataPointId so the worker
+      // proceeds to the registerFile step.
+      registerDataPoint: vi
+        .fn()
+        .mockResolvedValue({
+          dataPointId: "0xdp-browser-1",
+          expectedVersion: "1",
+        }),
       listFilesSince: vi.fn().mockResolvedValue({ files: [], cursor: null }),
       isRegisteredBuilder: vi.fn().mockResolvedValue(false),
       getBuilder: vi.fn().mockResolvedValue(null),
