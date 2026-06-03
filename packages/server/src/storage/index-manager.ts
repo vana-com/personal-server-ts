@@ -30,6 +30,13 @@ export interface IndexManager {
    * @returns true if row was updated, false if path not found
    */
   updateFileId(path: string, fileId: string): boolean;
+  /** Highest stored `version` for a scope; 0 if none. */
+  findLatestVersionByScope(scope: string): number;
+  /**
+   * Update the dataPointId for an index entry (after DPv2 registerDataPoint).
+   * @returns true if row was updated, false if path not found
+   */
+  updateDataPointId(path: string, dataPointId: string): boolean;
   /** Deletes all index entries for a scope. Returns count of deleted rows. */
   deleteByScope(scope: string): number;
   close(): void;
@@ -44,6 +51,8 @@ interface RawRow {
   collected_at: string;
   created_at: string;
   size_bytes: number;
+  version: number;
+  data_point_id: string | null;
 }
 
 function rowToEntry(row: RawRow): IndexEntry {
@@ -56,6 +65,8 @@ function rowToEntry(row: RawRow): IndexEntry {
     collectedAt: row.collected_at,
     createdAt: row.created_at,
     sizeBytes: row.size_bytes,
+    version: row.version,
+    dataPointId: row.data_point_id,
   };
 }
 
@@ -67,9 +78,15 @@ export function createIndexManager(db: Database.Database): IndexManager {
     scope: string;
     collected_at: string;
     size_bytes: number;
+    version: number;
+    data_point_id: string | null;
   }>(
-    `INSERT INTO data_files (file_id, schema_id, path, scope, collected_at, size_bytes)
-     VALUES (@file_id, @schema_id, @path, @scope, @collected_at, @size_bytes)`,
+    `INSERT INTO data_files (file_id, schema_id, path, scope, collected_at, size_bytes, version, data_point_id)
+     VALUES (@file_id, @schema_id, @path, @scope, @collected_at, @size_bytes, @version, @data_point_id)`,
+  );
+
+  const maxVersionByScopeStmt = db.prepare<{ scope: string }>(
+    "SELECT COALESCE(MAX(version), 0) AS max_version FROM data_files WHERE scope = @scope",
   );
 
   const findByPathStmt = db.prepare<{ path: string }>(
@@ -108,12 +125,26 @@ export function createIndexManager(db: Database.Database): IndexManager {
     "UPDATE data_files SET file_id = @file_id WHERE path = @path",
   );
 
+  const updateDataPointIdStmt = db.prepare<{
+    data_point_id: string;
+    path: string;
+  }>("UPDATE data_files SET data_point_id = @data_point_id WHERE path = @path");
+
   const deleteByScopeStmt = db.prepare<{ scope: string }>(
     "DELETE FROM data_files WHERE scope = @scope",
   );
 
   return {
     insert(entry) {
+      // Caller-supplied version wins; otherwise advance the per-scope
+      // counter atomically inside the same statement chain.
+      const version =
+        entry.version ??
+        (
+          maxVersionByScopeStmt.get({ scope: entry.scope }) as {
+            max_version: number;
+          }
+        ).max_version + 1;
       const result = insertStmt.run({
         file_id: entry.fileId,
         schema_id: entry.schemaId ?? null,
@@ -121,6 +152,8 @@ export function createIndexManager(db: Database.Database): IndexManager {
         scope: entry.scope,
         collected_at: entry.collectedAt,
         size_bytes: entry.sizeBytes,
+        version,
+        data_point_id: entry.dataPointId ?? null,
       });
       const row = db
         .prepare("SELECT * FROM data_files WHERE id = ?")
@@ -241,6 +274,21 @@ export function createIndexManager(db: Database.Database): IndexManager {
 
     updateFileId(path, fileId) {
       const result = updateFileIdStmt.run({ file_id: fileId, path });
+      return result.changes > 0;
+    },
+
+    findLatestVersionByScope(scope) {
+      const row = maxVersionByScopeStmt.get({ scope }) as {
+        max_version: number;
+      };
+      return row.max_version;
+    },
+
+    updateDataPointId(path, dataPointId) {
+      const result = updateDataPointIdStmt.run({
+        data_point_id: dataPointId,
+        path,
+      });
       return result.changes > 0;
     },
 

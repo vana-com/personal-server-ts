@@ -1,3 +1,4 @@
+import { keccak256, stringToHex } from "viem";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import {
   deriveScopeKey,
@@ -23,6 +24,12 @@ export interface UploadResult {
   path: string;
   fileId: string;
   url: string;
+  /**
+   * DPv2 data-point id assigned by the gateway. Present whenever this run
+   * either freshly registered the data point or found one already attached
+   * to the index entry from a prior run.
+   */
+  dataPointId: string;
 }
 
 export interface UploadAllOptions {
@@ -33,12 +40,12 @@ export interface UploadAllOptions {
 /**
  * Upload a single unsynced index entry:
  * 1. Read local data file from disk
- * 2. Look up schema for the scope → get schemaId
+ * 2. Resolve schemaId for the scope
  * 3. Derive scope key from master key → hex-encode as OpenPGP password
- * 4. Encrypt with OpenPGP password-based encryption → binary
- * 5. Upload OpenPGP binary to storage backend
- * 6. Sign file registration via EIP-712
- * 7. Register file record on-chain via Gateway (with schemaId)
+ * 4. Encrypt envelope with OpenPGP password-based encryption → ciphertext
+ * 5. Register DPv2 data point on-chain (AddData) if not already, persist dataPointId
+ * 6. Upload ciphertext to storage backend
+ * 7. Sign file registration (EIP-712) and call Gateway registerFile
  * 8. Update local index with fileId
  */
 export async function uploadOne(
@@ -77,18 +84,77 @@ export async function uploadOne(
   const plaintext = new TextEncoder().encode(JSON.stringify(envelope));
   const encrypted = await encryptWithPassword(plaintext, scopeKeyHex);
 
-  // 5. Upload to storage backend
+  // 5. DPv2 data-point registration (idempotent — skipped when the prior run
+  // already persisted a dataPointId on this entry).
+  //
+  // Commitments:
+  //   dataHash     = keccak256 of the ciphertext that gets uploaded to storage.
+  //                  Binds the on-chain version to the exact bytes we'll serve.
+  //   metadataHash = keccak256 of canonical-JSON({scope, collectedAt, schemaId,
+  //                  sizeBytes}). Commits to the off-chain metadata that
+  //                  describes this version without leaking the payload.
+  const dataHash = keccak256(encrypted);
+  const metadataHash = keccak256(
+    stringToHex(
+      JSON.stringify({
+        scope: entry.scope,
+        collectedAt: entry.collectedAt,
+        schemaId,
+        sizeBytes: encrypted.byteLength,
+      }),
+    ),
+  );
+
+  let dataPointId = entry.dataPointId;
+  if (!dataPointId) {
+    const addDataSignature = await signer.signAddData({
+      ownerAddress: serverOwner as `0x${string}`,
+      scope: entry.scope,
+      dataHash,
+      metadataHash,
+      expectedVersion: BigInt(entry.version),
+    });
+
+    const dataPointResult = await gateway.registerDataPoint({
+      ownerAddress: serverOwner,
+      scope: entry.scope,
+      dataHash,
+      metadataHash,
+      expectedVersion: String(entry.version),
+      signature: addDataSignature,
+    });
+
+    dataPointId = dataPointResult.dataPointId ?? null;
+    if (!dataPointId) {
+      throw new Error(
+        `Gateway registerDataPoint did not return a dataPointId for ${entry.path} (scope=${entry.scope}, version=${entry.version})`,
+      );
+    }
+
+    await storage.updateDataPointId(entry.path, dataPointId);
+
+    logger.info(
+      {
+        path: entry.path,
+        scope: entry.scope,
+        version: entry.version,
+        dataPointId,
+      },
+      "Registered DPv2 data point",
+    );
+  }
+
+  // 6. Upload to storage backend
   const storageKey = `${entry.scope}/${entry.collectedAt}`;
   const url = await storageAdapter.upload(storageKey, encrypted);
 
-  // 6. Sign file registration via EIP-712
+  // 7. Sign file registration via EIP-712, then register on-chain via Gateway
   const signature = await signer.signFileRegistration({
     ownerAddress: serverOwner as `0x${string}`,
     url,
     schemaId: schemaId as `0x${string}`,
   });
 
-  // 7. Register file on-chain via Gateway
   const registration = await gateway.registerFile({
     ownerAddress: serverOwner,
     url,
@@ -107,11 +173,11 @@ export async function uploadOne(
   await storage.updateFileId(entry.path, fileId);
 
   logger.info(
-    { path: entry.path, fileId, url },
+    { path: entry.path, fileId, url, dataPointId },
     "Uploaded and registered file",
   );
 
-  return { path: entry.path, fileId, url };
+  return { path: entry.path, fileId, url, dataPointId };
 }
 
 /**

@@ -77,6 +77,13 @@ export interface DataStoragePort extends RuntimeStoragePort {
   writeEnvelope(envelope: DataFileEnvelope): Promise<WriteResult>;
   insertEntry(entry: NewIndexEntry): IndexEntry | Promise<IndexEntry>;
   updateFileId(path: string, fileId: string): boolean | Promise<boolean>;
+  /** Highest stored DPv2 `version` for a scope; 0 if none. */
+  findLatestVersionByScope(scope: string): number | Promise<number>;
+  /** Stamps the DPv2 dataPointId on an entry after registerDataPoint. */
+  updateDataPointId(
+    path: string,
+    dataPointId: string,
+  ): boolean | Promise<boolean>;
   deleteScope(scope: string): Promise<number>;
 }
 

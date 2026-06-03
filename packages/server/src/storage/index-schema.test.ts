@@ -39,6 +39,8 @@ describe("initializeDatabase", () => {
     expect(columnNames).toContain("collected_at");
     expect(columnNames).toContain("created_at");
     expect(columnNames).toContain("size_bytes");
+    expect(columnNames).toContain("version");
+    expect(columnNames).toContain("data_point_id");
     db.close();
   });
 
@@ -96,7 +98,7 @@ describe("initializeDatabase", () => {
       | { path: string; scope: string; size_bytes: number }
       | undefined;
 
-    expect(version).toBe(2);
+    expect(version).toBe(3);
     expect(row).toEqual({
       path: "instagram/profile.json",
       scope: "instagram.profile",
@@ -139,15 +141,84 @@ describe("initializeDatabase", () => {
     const db = initializeDatabase(dbPath);
     const version = db.pragma("user_version", { simple: true });
     const row = db
-      .prepare("SELECT path, schema_id FROM data_files WHERE path = ?")
+      .prepare(
+        "SELECT path, schema_id, version, data_point_id FROM data_files WHERE path = ?",
+      )
       .get("instagram/profile.json") as
-      | { path: string; schema_id: string | null }
+      | {
+          path: string;
+          schema_id: string | null;
+          version: number;
+          data_point_id: string | null;
+        }
       | undefined;
 
-    expect(version).toBe(2);
+    expect(version).toBe(3);
     expect(row).toEqual({
       path: "instagram/profile.json",
       schema_id: null,
+      // v2→v3 migration backfills legacy rows with version 1 (the same
+      // starting point as a fresh ingest of a brand-new scope), and leaves
+      // data_point_id null so the sync worker will register the data point
+      // on the next pass.
+      version: 1,
+      data_point_id: null,
+    });
+    db.close();
+
+    await rm(tempDir, { recursive: true });
+  });
+
+  it("migrates an existing v2 index by adding version + data_point_id", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "schema-migrate-v2-"));
+    const dbPath = join(tempDir, "migrate-v2.db");
+
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE data_files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id TEXT,
+        schema_id TEXT,
+        path TEXT NOT NULL UNIQUE,
+        scope TEXT NOT NULL,
+        collected_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        size_bytes INTEGER NOT NULL DEFAULT 0
+      );
+      PRAGMA user_version = 2;
+    `);
+    legacy
+      .prepare(
+        "INSERT INTO data_files (path, scope, collected_at, size_bytes, schema_id) VALUES (?, ?, ?, ?, ?)",
+      )
+      .run(
+        "instagram/profile.json",
+        "instagram.profile",
+        "2026-01-21T10:00:00Z",
+        42,
+        "0xschema",
+      );
+    legacy.close();
+
+    const db = initializeDatabase(dbPath);
+    expect(db.pragma("user_version", { simple: true })).toBe(3);
+    const row = db
+      .prepare(
+        "SELECT path, schema_id, version, data_point_id FROM data_files WHERE path = ?",
+      )
+      .get("instagram/profile.json") as
+      | {
+          path: string;
+          schema_id: string | null;
+          version: number;
+          data_point_id: string | null;
+        }
+      | undefined;
+    expect(row).toEqual({
+      path: "instagram/profile.json",
+      schema_id: "0xschema",
+      version: 1,
+      data_point_id: null,
     });
     db.close();
 

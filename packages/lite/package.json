@@ -33,7 +33,7 @@
   },
   "dependencies": {
     "@opendatalabs/personal-server-ts-core": "*",
-    "@opendatalabs/vana-sdk": "3.2.0",
+    "@opendatalabs/vana-sdk": "3.2.0-canary.87b4310",
     "node-forge": "^1.4.0",
     "viem": "^2.48.11"
   }

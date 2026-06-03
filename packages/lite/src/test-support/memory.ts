@@ -152,9 +152,18 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
     },
 
     insertEntry(entry) {
+      const version =
+        entry.version ??
+        Array.from(entries.values()).reduce(
+          (max, e) =>
+            e.scope === entry.scope && e.version > max ? e.version : max,
+          0,
+        ) + 1;
       const indexed: IndexEntry = {
         ...entry,
         schemaId: entry.schemaId ?? null,
+        version,
+        dataPointId: entry.dataPointId ?? null,
         id: nextId,
         createdAt: new Date().toISOString(),
       };
@@ -167,6 +176,20 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
       const entry = entries.get(path);
       if (!entry) return false;
       entries.set(path, { ...entry, fileId });
+      return true;
+    },
+
+    findLatestVersionByScope(scope) {
+      return Array.from(entries.values()).reduce(
+        (max, e) => (e.scope === scope && e.version > max ? e.version : max),
+        0,
+      );
+    },
+
+    updateDataPointId(path, dataPointId) {
+      const entry = entries.get(path);
+      if (!entry) return false;
+      entries.set(path, { ...entry, dataPointId });
       return true;
     },
 

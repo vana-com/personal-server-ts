@@ -29,6 +29,8 @@ const OWNER = "0xAbCdEf1234567890AbCdEf1234567890AbCdEf12";
 const SCHEMA_ID =
   "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 const FILE_ID = "file-001";
+const DATA_POINT_ID =
+  "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
 const STORAGE_URL = `https://storage.vana.com/v1/blobs/${OWNER}/${SCOPE}/${COLLECTED_AT}`;
 
 function makeEntry(overrides?: Partial<IndexEntry>): IndexEntry {
@@ -41,6 +43,8 @@ function makeEntry(overrides?: Partial<IndexEntry>): IndexEntry {
     collectedAt: COLLECTED_AT,
     createdAt: "2026-01-21T10:00:00Z",
     sizeBytes: 256,
+    version: 1,
+    dataPointId: null,
     ...overrides,
   };
 }
@@ -69,6 +73,7 @@ function makeMockDeps(): UploadWorkerDeps {
   const mockStorage: Partial<DataStoragePort> = {
     findUnsynced: vi.fn().mockReturnValue([]),
     updateFileId: vi.fn().mockReturnValue(true),
+    updateDataPointId: vi.fn().mockReturnValue(true),
     readEnvelope: vi.fn().mockResolvedValue(makeEnvelope()),
   };
 
@@ -79,12 +84,18 @@ function makeMockDeps(): UploadWorkerDeps {
   const mockGateway: Partial<GatewayClient> = {
     getSchemaForScope: vi.fn().mockResolvedValue(makeSchema()),
     registerFile: vi.fn().mockResolvedValue({ fileId: FILE_ID }),
+    registerDataPoint: vi
+      .fn()
+      .mockResolvedValue({ dataPointId: DATA_POINT_ID, expectedVersion: "1" }),
   };
 
   const mockSigner: Partial<ServerSigner> = {
     signFileRegistration: vi
       .fn()
       .mockResolvedValue("0xmocksignature" as `0x${string}`),
+    signAddData: vi
+      .fn()
+      .mockResolvedValue("0xadddatasignature" as `0x${string}`),
   };
 
   const mockLogger: Partial<Logger> = {
@@ -183,7 +194,7 @@ describe("upload worker", () => {
       );
     });
 
-    it("updates index with returned fileId", async () => {
+    it("updates index with returned fileId and dataPointId", async () => {
       const deps = makeMockDeps();
       const entry = makeEntry();
 
@@ -193,11 +204,70 @@ describe("upload worker", () => {
         entry.path,
         FILE_ID,
       );
+      expect(deps.storage.updateDataPointId).toHaveBeenCalledWith(
+        entry.path,
+        DATA_POINT_ID,
+      );
       expect(result).toEqual({
         path: entry.path,
         fileId: FILE_ID,
         url: STORAGE_URL,
+        dataPointId: DATA_POINT_ID,
       });
+    });
+
+    it("registers DPv2 data point with expectedVersion + signed AddData", async () => {
+      const deps = makeMockDeps();
+      const entry = makeEntry({ version: 3 });
+
+      await uploadOne(deps, entry);
+
+      expect(deps.signer.signAddData).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ownerAddress: OWNER,
+          scope: SCOPE,
+          expectedVersion: 3n,
+        }),
+      );
+      // dataHash and metadataHash are deterministic keccak256s; assert
+      // shape (32-byte hex) rather than exact bytes so we don't pin the
+      // commitment recipe inside the test.
+      const addDataCall = (deps.signer.signAddData as ReturnType<typeof vi.fn>)
+        .mock.calls[0][0];
+      expect(addDataCall.dataHash).toMatch(/^0x[0-9a-fA-F]{64}$/);
+      expect(addDataCall.metadataHash).toMatch(/^0x[0-9a-fA-F]{64}$/);
+
+      expect(deps.gateway.registerDataPoint).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ownerAddress: OWNER,
+          scope: SCOPE,
+          expectedVersion: "3",
+          signature: "0xadddatasignature",
+        }),
+      );
+    });
+
+    it("skips data-point registration when entry already has a dataPointId", async () => {
+      const deps = makeMockDeps();
+      const entry = makeEntry({ dataPointId: DATA_POINT_ID });
+
+      const result = await uploadOne(deps, entry);
+
+      expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
+      expect(deps.signer.signAddData).not.toHaveBeenCalled();
+      expect(deps.storage.updateDataPointId).not.toHaveBeenCalled();
+      expect(result.dataPointId).toBe(DATA_POINT_ID);
+    });
+
+    it("throws if registerDataPoint returns no dataPointId", async () => {
+      const deps = makeMockDeps();
+      (
+        deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({});
+
+      await expect(uploadOne(deps, makeEntry())).rejects.toThrow(
+        /registerDataPoint did not return a dataPointId/,
+      );
     });
 
     it("throws if schema lookup returns null", async () => {
