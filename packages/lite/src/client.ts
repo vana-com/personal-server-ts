@@ -359,9 +359,9 @@ export async function startPersonalServer(
         ...(grantOptions.expiresAt === undefined
           ? {}
           : { expiresAt: grantOptions.expiresAt }),
-        ...(grantOptions.nonce === undefined
+        ...(grantOptions.grantVersion === undefined
           ? {}
-          : { nonce: grantOptions.nonce }),
+          : { grantVersion: grantOptions.grantVersion }),
       },
       authOptions: grantOptions,
       headers: {
