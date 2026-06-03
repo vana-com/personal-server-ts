@@ -56,10 +56,11 @@ export function createServerSigner(
         domain: grantRegistrationDomain(gatewayConfig),
         types: GRANT_REGISTRATION_TYPES,
         primaryType: "GrantRegistration",
-        message: {
-          ...msg,
-          fileIds: msg.fileIds.map((id: bigint) => id),
-        } as unknown as Record<string, unknown>,
+        // Canary GrantRegistrationMessage is structured:
+        //   {grantorAddress, granteeId, scopes, grantVersion, expiresAt}
+        // No JSON `grant` blob, no `fileIds`. The legacy mapping that
+        // converted bigint fileIds is gone with the field itself.
+        message: msg as unknown as Record<string, unknown>,
       });
     },
 

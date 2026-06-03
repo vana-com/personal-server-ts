@@ -76,11 +76,9 @@ describe("ServerSigner", () => {
         grantorAddress:
           "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as `0x${string}`,
         granteeId: ("0x" + "bb".repeat(32)) as `0x${string}`,
-        grant: JSON.stringify({
-          scopes: ["instagram.*"],
-          expiresAt: 9999999999,
-        }),
-        fileIds: [1n, 2n, 3n],
+        scopes: ["instagram.*"],
+        grantVersion: 1n,
+        expiresAt: 9999999999n,
       };
 
       const signature = await signer.signGrantRegistration(msg);
@@ -90,10 +88,7 @@ describe("ServerSigner", () => {
         domain: grantRegistrationDomain(TEST_GATEWAY_CONFIG),
         types: GRANT_REGISTRATION_TYPES,
         primaryType: "GrantRegistration",
-        message: {
-          ...msg,
-          fileIds: msg.fileIds.map((id) => id),
-        },
+        message: msg,
         signature,
       });
       expect(recovered.toLowerCase()).toBe(account.address.toLowerCase());
@@ -107,6 +102,10 @@ describe("ServerSigner", () => {
         grantorAddress:
           "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as `0x${string}`,
         grantId: ("0x" + "cc".repeat(32)) as `0x${string}`,
+        // Canary requires grantVersion on revocation — shares the
+        // monotonic nonce with registration so an old revocation sig
+        // can't survive a revoke -> re-register cycle.
+        grantVersion: 2n,
       };
 
       const signature = await signer.signGrantRevocation(msg);
