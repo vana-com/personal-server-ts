@@ -99,7 +99,14 @@ export interface PersonalServerGrantsApiDeps {
   auth: Pick<PersonalServerApiAuthPort, "authorizeOwner">;
   gateway?: Pick<
     GatewayClient,
-    "getBuilder" | "createGrant" | "listGrantsByUser" | "revokeGrant"
+    | "getBuilder"
+    | "createGrant"
+    | "listGrantsByUser"
+    | "revokeGrant"
+    // Canary RevokeGrantParams requires a monotonic `grantVersion` that
+    // strictly exceeds the current value. revokeGrantContract reads the
+    // live grant first to know what to bump.
+    | "getGrant"
   >;
   gatewayConfig?: DataPortabilityGatewayConfig;
   serverOwner?: `0x${string}`;
@@ -501,13 +508,14 @@ export async function handlePersonalServerGrantsRequest(
       if (request.method === "POST") {
         const parsed = await parseJsonObjectBody(request);
         if (!parsed.ok) return contractResponse(parsed.result);
+        // Canary createGrant doesn't need a clock — grantVersion defaults
+        // to "1" and callers re-registering pass a strictly higher value.
         return contractResponse(
           await createGrantContract({
             gateway: deps.gateway,
             serverOwner: deps.serverOwner,
             serverSigner: deps.serverSigner,
             body: parsed.body,
-            now: () => deps.now?.().getTime() ?? Date.now(),
           }),
         );
       }
