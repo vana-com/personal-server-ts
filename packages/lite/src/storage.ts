@@ -388,14 +388,17 @@ export async function createPersistentPsLiteStorage(
       const entry = state.entries.find((e) => e.fileId === fileId);
       if (!entry) return false;
       const blobPath = envelopePath(entry.scope, entry.collectedAt);
-      state = {
-        ...state,
-        entries: state.entries.filter((e) => e !== entry),
-      };
+      // Delete the blob FIRST (both stores tolerate a missing blob); only drop the index row once
+      // the blob is gone. If blob deletion throws for a real reason, the row is preserved so the
+      // next sync retry re-attempts instead of orphaning the local blob.
       await Promise.all([
         fileStore.deleteEnvelope(blobPath),
         fallbackStore.deleteEnvelope(blobPath),
       ]);
+      state = {
+        ...state,
+        entries: state.entries.filter((e) => e !== entry),
+      };
       await persist();
       return true;
     },

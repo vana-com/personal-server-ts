@@ -68,12 +68,16 @@ export function createNodeDataStorage(
     async deleteByFileId(fileId: string) {
       const entry = deps.indexManager.findByFileId(fileId);
       if (!entry) return false;
-      deps.indexManager.deleteByPath(entry.path);
+      // Delete the blob FIRST; only drop the index row once it's gone (deleteDataFile is
+      // ENOENT-tolerant). If blob deletion fails for a real reason, the row is preserved so the next
+      // sync retry re-attempts — rather than the row vanishing and the cursor advancing past an
+      // orphaned local blob.
       await deleteDataFile(
         deps.hierarchyOptions,
         entry.scope,
         entry.collectedAt,
       );
+      deps.indexManager.deleteByPath(entry.path);
       return true;
     },
   };

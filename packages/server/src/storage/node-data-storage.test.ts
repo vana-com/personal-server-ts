@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -8,6 +8,15 @@ import { createIndexManager } from "./index-manager.js";
 import { createNodeDataStorage } from "./node-data-storage.js";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/node";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
+import type * as Hierarchy from "./hierarchy.js";
+
+// Wrap the real hierarchy module so deleteDataFile can be forced to fail in one test.
+// By default the spy delegates to the real implementation (happy paths unaffected).
+vi.mock("./hierarchy.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof Hierarchy>();
+  return { ...actual, deleteDataFile: vi.fn(actual.deleteDataFile) };
+});
+import { deleteDataFile } from "./hierarchy.js";
 
 describe("createNodeDataStorage.deleteByFileId", () => {
   let db: Database.Database;
@@ -63,6 +72,23 @@ describe("createNodeDataStorage.deleteByFileId", () => {
 
   it("returns false (no-op) for an unknown fileId", async () => {
     expect(await storage.deleteByFileId("nope")).toBe(false);
+  });
+
+  it("preserves the index row when blob deletion fails (so a retry re-attempts)", async () => {
+    await seed("file-1", "2026-05-08T00:00:00Z");
+    // Force a real (non-ENOENT) blob-deletion failure for this call only.
+    (deleteDataFile as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error("EIO: disk failure"),
+    );
+
+    await expect(storage.deleteByFileId("file-1")).rejects.toThrow("EIO");
+
+    // Row must survive so the next sync cycle re-attempts the delete rather than
+    // advancing the cursor past an orphaned local blob.
+    expect(storage.findByFileId("file-1")).toBeDefined();
+    // A subsequent retry (real deleteDataFile) succeeds and removes the row.
+    expect(await storage.deleteByFileId("file-1")).toBe(true);
+    expect(storage.findByFileId("file-1")).toBeUndefined();
   });
 
   it("is idempotent when the blob is already gone (no throw)", async () => {
