@@ -184,7 +184,11 @@ describe("createPsLiteRuntime", () => {
     expect(body.error.errorCode).toBe("MISSING_AUTH");
   });
 
-  it("requires a gateway schema resolver for owner writes", async () => {
+  it("ingests successfully even without a gateway schema resolver", async () => {
+    // Schema is best-effort in the canary flow. When the runtime is wired
+    // without a gateway (no resolver), ingestion proceeds with schemaId
+    // unset rather than failing closed. Sync-worker registerFile (if
+    // enabled) would surface its own error there.
     const storage = createMemoryPsLiteStorage();
     const runtime = createTestRuntime({
       storage,
@@ -207,13 +211,16 @@ describe("createPsLiteRuntime", () => {
       }),
     );
 
-    expect(res.status).toBe(500);
-    const body = await res.json();
-    expect(body.error.errorCode).toBe("SERVER_NOT_CONFIGURED");
-    expect(storage.listScopes({ limit: 20, offset: 0 }).total).toBe(0);
+    expect(res.status).toBe(201);
+    expect(storage.listScopes({ limit: 20, offset: 0 }).total).toBe(1);
   });
 
-  it("rejects owner writes when no schema is registered for the scope", async () => {
+  it("accepts owner writes even when no schema is registered for the scope", async () => {
+    // Schema is optional in the canary flow — registerDataPoint (DPv2)
+    // doesn't take schemaId, and X402 reads don't consult it. The ingest
+    // path proceeds with schemaId=undefined; only the sync worker's
+    // legacy registerFile call would later need one (and surface its own
+    // error there).
     const storage = createMemoryPsLiteStorage();
     const runtime = createTestRuntime({
       storage,
@@ -241,12 +248,8 @@ describe("createPsLiteRuntime", () => {
       }),
     );
 
-    expect(res.status).toBe(400);
-    await expect(res.json()).resolves.toEqual({
-      error: "NO_SCHEMA",
-      message: "No schema registered for scope: instagram.profile",
-    });
-    expect(storage.listScopes({ limit: 20, offset: 0 }).total).toBe(0);
+    expect(res.status).toBe(201);
+    expect(storage.listScopes({ limit: 20, offset: 0 }).total).toBe(1);
   });
 
   it("stores and reads data through the ps-lite data contract", async () => {
