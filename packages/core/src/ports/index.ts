@@ -78,6 +78,12 @@ export interface DataStoragePort extends RuntimeStoragePort {
   insertEntry(entry: NewIndexEntry): IndexEntry | Promise<IndexEntry>;
   updateFileId(path: string, fileId: string): boolean | Promise<boolean>;
   deleteScope(scope: string): Promise<number>;
+  /**
+   * Delete a single version (index entry + its local blob) by its gateway fileId.
+   * Returns true if a local copy existed and was removed, false if none was present (no-op).
+   * Used by sync delete-reconciliation to drop a copy the gateway reports as deleted.
+   */
+  deleteByFileId(fileId: string): Promise<boolean>;
 }
 
 export interface RuntimeAvailabilityPort {

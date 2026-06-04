@@ -87,14 +87,19 @@ export async function listVersions(
   return jsonFiles.map((f) => filenameToTimestamp(f.replace(".json", "")));
 }
 
-/** Delete a single data file */
+/** Delete a single data file. Idempotent: a missing file is a no-op (matches deleteByFileId's
+ * no-op contract and avoids stalling the sync cursor when the blob is already gone). */
 export async function deleteDataFile(
   options: HierarchyManagerOptions,
   scope: string,
   collectedAt: string,
 ): Promise<void> {
   const filePath = buildDataFilePath(options.dataDir, scope, collectedAt);
-  await unlink(filePath);
+  try {
+    await unlink(filePath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
 }
 
 /**

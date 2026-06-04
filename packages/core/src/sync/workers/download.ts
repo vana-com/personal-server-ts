@@ -139,10 +139,12 @@ export async function downloadAll(
   // 1. Read cursor
   const lastProcessedTimestamp = await cursor.read();
 
-  // 2. Poll gateway for new file records
+  // 2. Poll gateway for new file records, including soft-deleted ones so we can reconcile deletions
+  // of files this device already holds (cross-device "deleted on desktop → gone on web too").
   const { files, cursor: nextCursor } = await gateway.listFilesSince(
     serverOwner,
     lastProcessedTimestamp,
+    { includeDeleted: true },
   );
 
   const results: DownloadResult[] = [];
@@ -151,6 +153,18 @@ export async function downloadAll(
   // 3. Process each file record
   for (const file of files) {
     try {
+      // Deletion reconciliation: a record marked deletedAt means the owner deleted it elsewhere.
+      // Drop any local copy instead of downloading. Idempotent — no local copy is a no-op.
+      if (file.deletedAt) {
+        const removed = await deps.storage.deleteByFileId(file.fileId);
+        if (removed) {
+          logger.info(
+            { fileId: file.fileId },
+            "Reconciled remote deletion: removed local copy",
+          );
+        }
+        continue;
+      }
       const result = await downloadOne(deps, file);
       if (result) {
         results.push(result);

@@ -79,6 +79,7 @@ function makeMockDeps(): DownloadWorkerDeps {
       ...entry,
     })),
     updateFileId: vi.fn().mockResolvedValue(true),
+    deleteByFileId: vi.fn().mockResolvedValue(true),
   };
 
   const mockStorageAdapter: Partial<StorageAdapter> = {
@@ -288,7 +289,41 @@ describe("download worker", () => {
       expect(deps.gateway.listFilesSince).toHaveBeenCalledWith(
         OWNER,
         timestamp,
+        {
+          includeDeleted: true,
+        },
       );
+    });
+
+    it("reconciles a remote deletion by dropping the local copy (no download)", async () => {
+      const deps = makeMockDeps();
+      const deletedRecord = makeFileRecord({
+        fileId: "file-deleted",
+        deletedAt: "2026-06-04T00:00:00Z",
+      });
+      (
+        deps.gateway.listFilesSince as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({ files: [deletedRecord], cursor: null });
+
+      await downloadAll(deps);
+
+      expect(deps.storage.deleteByFileId).toHaveBeenCalledWith("file-deleted");
+      expect(deps.storageAdapter.download).not.toHaveBeenCalled();
+    });
+
+    it("advances the cursor when a reconciled deletion is the only change", async () => {
+      const deps = makeMockDeps();
+      const nextCursor = "2026-06-04T12:00:00Z";
+      (
+        deps.gateway.listFilesSince as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        files: [makeFileRecord({ deletedAt: "2026-06-04T00:00:00Z" })],
+        cursor: nextCursor,
+      });
+
+      await downloadAll(deps);
+
+      expect(deps.cursor.write).toHaveBeenCalledWith(nextCursor);
     });
 
     it("advances cursor after processing", async () => {
