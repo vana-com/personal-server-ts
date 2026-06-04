@@ -206,6 +206,22 @@ function jsonResponse(body: unknown, init?: ResponseInit): Response {
   return new Response(JSON.stringify(body), { ...init, headers });
 }
 
+// X402 spec convention: payment responses are JSON, base64-encoded into a
+// single header value. Returns undefined on encode failure so callers can
+// just omit the header rather than fail the read. Uses btoa + TextEncoder
+// to stay portable across Node and web runtimes.
+function encodePaymentResponseHeader(body: unknown): string | undefined {
+  try {
+    const json = JSON.stringify(body ?? null);
+    const bytes = new TextEncoder().encode(json);
+    let binary = "";
+    for (const b of bytes) binary += String.fromCharCode(b);
+    return btoa(binary);
+  } catch {
+    return undefined;
+  }
+}
+
 function contractResponse(result: ContractResult): Response {
   return jsonResponse(result.body, { status: result.status });
 }
@@ -297,7 +313,7 @@ interface X402CycleInput {
 }
 
 type X402CycleResult =
-  | { kind: "ok" }
+  | { kind: "ok"; payResponse: unknown }
   | { kind: "challenge"; body: X402Challenge }
   | { kind: "gateway-error"; status: number; body: unknown };
 
@@ -447,7 +463,17 @@ async function handleX402Cycle(
   }
 
   if (gatewayRes.ok) {
-    return { kind: "ok" };
+    // Preserve the gateway's structured success body so the request
+    // handler can echo it back via the X-PAYMENT-RESPONSE header (canonical
+    // X402 convention). Empty/malformed body → propagate as null; the
+    // header still gets set so builders can tell payment succeeded.
+    let payResponseBody: unknown = null;
+    try {
+      payResponseBody = await gatewayRes.json();
+    } catch {
+      // Body unreadable but status was 2xx — treat as success with no payload.
+    }
+    return { kind: "ok", payResponse: payResponseBody };
   }
 
   // Read the gateway's structured error body if there is one.
@@ -595,6 +621,9 @@ export async function handlePersonalServerDataRequest(
         fileId: url.searchParams.get("fileId") ?? undefined,
         at: url.searchParams.get("at") ?? undefined,
       });
+      // Holds the base64-encoded gateway payForOperation response body when
+      // X402 succeeds — emitted on the final read response as X-PAYMENT-RESPONSE.
+      let paymentResponseHeader: string | undefined;
       const grantId = selectedGrantId(request, url);
       const authResult = await deps.auth.authorizeBuilderRead({
         request,
@@ -648,6 +677,12 @@ export async function handlePersonalServerDataRequest(
           return jsonResponse(x402Result.body, { status: x402Result.status });
         }
         // x402Result.kind === "ok" — payment accepted, proceed to read.
+        // The gateway's success body is forwarded back to the builder via
+        // X-PAYMENT-RESPONSE (canonical X402 convention) so callers can see
+        // breakdown / paidAt / paymentNonce without a second gateway round-trip.
+        paymentResponseHeader = encodePaymentResponseHeader(
+          x402Result.payResponse,
+        );
       }
 
       const result = await readDataContract({
@@ -672,7 +707,11 @@ export async function handlePersonalServerDataRequest(
         userAgent: request.headers.get("user-agent") ?? "unknown",
       });
 
-      return jsonResponse(result.envelope);
+      const headers: Record<string, string> = {};
+      if (paymentResponseHeader) {
+        headers["X-PAYMENT-RESPONSE"] = paymentResponseHeader;
+      }
+      return jsonResponse(result.envelope, { headers });
     }
 
     if (request.method === "POST") {
