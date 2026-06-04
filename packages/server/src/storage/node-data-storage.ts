@@ -1,4 +1,9 @@
-import { deleteAllForScope, readDataFile, writeDataFile } from "./hierarchy.js";
+import {
+  deleteAllForScope,
+  deleteDataFile,
+  readDataFile,
+  writeDataFile,
+} from "./hierarchy.js";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type {
@@ -59,6 +64,17 @@ export function createNodeDataStorage(
       const deletedCount = deps.indexManager.deleteByScope(scope);
       await deleteAllForScope(deps.hierarchyOptions, scope);
       return deletedCount;
+    },
+    async deleteByFileId(fileId: string) {
+      const entry = deps.indexManager.findByFileId(fileId);
+      if (!entry) return false;
+      deps.indexManager.deleteByPath(entry.path);
+      await deleteDataFile(
+        deps.hierarchyOptions,
+        entry.scope,
+        entry.collectedAt,
+      );
+      return true;
     },
   };
 }

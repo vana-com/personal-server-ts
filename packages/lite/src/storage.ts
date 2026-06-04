@@ -383,6 +383,22 @@ export async function createPersistentPsLiteStorage(
       await persist();
       return deleted;
     },
+
+    async deleteByFileId(fileId) {
+      const entry = state.entries.find((e) => e.fileId === fileId);
+      if (!entry) return false;
+      const blobPath = envelopePath(entry.scope, entry.collectedAt);
+      state = {
+        ...state,
+        entries: state.entries.filter((e) => e !== entry),
+      };
+      await Promise.all([
+        fileStore.deleteEnvelope(blobPath),
+        fallbackStore.deleteEnvelope(blobPath),
+      ]);
+      await persist();
+      return true;
+    },
   };
   return storagePort;
 }
