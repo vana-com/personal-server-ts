@@ -379,7 +379,13 @@ describe("POST /v1/data/:scope", () => {
     expect(content.schemaId).toBe("0xschema1");
   });
 
-  it("returns 400 NO_SCHEMA when no schema registered for scope", async () => {
+  it("ingests successfully when no schema is registered for the scope", async () => {
+    // Schema lookup is best-effort. The canary X402 read path doesn't
+    // consult schemaId, and DPv2 registerDataPoint doesn't take it.
+    // Only the legacy sync-worker registerFile call needs one, and that
+    // surfaces its own error when sync is enabled but no schema exists.
+    // The ingest endpoint itself proceeds and writes the envelope without
+    // a schemaId field.
     const db2 = initializeDatabase(":memory:");
     const indexManager2 = createIndexManager(db2);
     const gateway = createMockGateway({
@@ -398,10 +404,17 @@ describe("POST /v1/data/:scope", () => {
     const res = await postWithOwnerAuth(localApp, "instagram.profile", {
       username: "test",
     });
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(201);
 
     const json = await res.json();
-    expect(json.error).toBe("NO_SCHEMA");
+    expect(json.scope).toBe("instagram.profile");
+    expect(json.status).toBe("stored");
+
+    // The on-disk index entry should have schemaId === null since the
+    // gateway returned no schema and we proceeded gracefully.
+    const entry = indexManager2.findLatestByScope("instagram.profile");
+    expect(entry).toBeDefined();
+    expect(entry!.schemaId).toBeNull();
 
     indexManager2.close();
   });

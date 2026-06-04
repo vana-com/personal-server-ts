@@ -68,6 +68,7 @@ export interface PersonalServerApiAuthPort {
 
 export interface PersonalServerApiLogger {
   info?(payload: Record<string, unknown>, message: string): void;
+  warn?(payload: Record<string, unknown>, message: string): void;
   error?(payload: Record<string, unknown>, message: string): void;
 }
 
@@ -486,30 +487,32 @@ async function resolveSchema(
   | { ok: true; schemaUrl: string | undefined; schemaId: string | undefined }
   | { ok: false; response: Response }
 > {
+  // No resolver configured — proceed without a schema. The on-disk envelope
+  // tolerates a missing schemaId (the field is optional in DataFileEnvelope
+  // anyway), and the canary X402 read path doesn't consult it. The legacy
+  // sync-worker registerFile call DOES require schemaId, and will surface
+  // its own error there if the operator has sync enabled but no resolver.
   if (!deps.schemaResolver) {
-    return {
-      ok: false,
-      response: errorResponse(
-        500,
-        "SERVER_NOT_CONFIGURED",
-        "Gateway is not configured",
-      ),
-    };
+    deps.logger?.info?.(
+      { scope },
+      "Ingesting without a schema lookup (no schemaResolver configured)",
+    );
+    return { ok: true, schemaUrl: undefined, schemaId: undefined };
   }
 
   try {
     const schema = await deps.schemaResolver.getSchemaForScope(scope);
     if (!schema) {
-      return {
-        ok: false,
-        response: jsonResponse(
-          {
-            error: "NO_SCHEMA",
-            message: `No schema registered for scope: ${scope}`,
-          },
-          { status: 400 },
-        ),
-      };
+      // Soft fall-through: schema not on the gateway. Canary
+      // registerDataPoint doesn't need it; X402 doesn't need it. The
+      // operator's sync worker (if enabled) will fail at registerFile
+      // time with a clearer "no schemaId" error from the gateway. We
+      // intentionally don't block ingest here.
+      deps.logger?.warn?.(
+        { scope },
+        "No schema registered for scope at gateway — ingesting without schemaId",
+      );
+      return { ok: true, schemaUrl: undefined, schemaId: undefined };
     }
     return {
       ok: true,
@@ -517,6 +520,10 @@ async function resolveSchema(
       schemaId: schema.id,
     };
   } catch (err) {
+    // Network / gateway outage is different from "schema not found" —
+    // keep this a hard error so the ingest doesn't write data the
+    // operator can't trace back. Schema lookup failures are observable;
+    // a hung gateway is not the right time to silently proceed.
     deps.logger?.error?.({ err, scope }, "Gateway schema lookup failed");
     return {
       ok: false,
