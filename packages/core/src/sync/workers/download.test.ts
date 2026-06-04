@@ -154,30 +154,16 @@ describe("download worker", () => {
       expect(deps.storageAdapter.download).not.toHaveBeenCalled();
     });
 
-    it("skips (returns null) when the blob is gone, instead of throwing", async () => {
+    it("propagates a download failure (blocks the cursor) so data isn't silently skipped", async () => {
       const deps = makeMockDeps();
       (
         deps.storageAdapter.download as ReturnType<typeof vi.fn>
-      ).mockRejectedValue(new Error("vana-storage download failed: 404"));
-      deps.storageAdapter.exists = vi.fn().mockResolvedValue(false);
-
-      const result = await downloadOne(deps, makeFileRecord());
-
-      expect(result).toBeNull();
-      expect(deps.storageAdapter.exists).toHaveBeenCalledWith(STORAGE_URL);
-      expect(deps.storage.writeEnvelope).not.toHaveBeenCalled();
-    });
-
-    it("rethrows when download fails but the blob still exists (transient)", async () => {
-      const deps = makeMockDeps();
-      (
-        deps.storageAdapter.download as ReturnType<typeof vi.fn>
-      ).mockRejectedValue(new Error("network blip"));
-      deps.storageAdapter.exists = vi.fn().mockResolvedValue(true);
+      ).mockRejectedValue(new Error("storage unavailable"));
 
       await expect(downloadOne(deps, makeFileRecord())).rejects.toThrow(
-        "network blip",
+        "storage unavailable",
       );
+      expect(deps.storage.writeEnvelope).not.toHaveBeenCalled();
     });
 
     it("downloads, decrypts, writes, and indexes file", async () => {

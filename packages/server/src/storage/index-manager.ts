@@ -142,7 +142,9 @@ export function createIndexManager(db: Database.Database): IndexManager {
         params.scope = options.scope;
       }
 
-      sql += " ORDER BY collected_at DESC";
+      // id is the autoincrement PK — a stable tiebreaker so limit/offset paging can't skip or
+      // duplicate rows when versions share a collected_at (second precision).
+      sql += " ORDER BY collected_at DESC, id DESC";
 
       if (options.limit !== undefined) {
         sql += " LIMIT @limit";

@@ -52,25 +52,15 @@ export async function downloadOne(
   }
 
   // 2. Download OpenPGP encrypted binary from storage backend.
-  // Tolerate a missing blob: it may have been deleted (cross-device delete, or a deletion whose
-  // gateway de-register succeeded but blob-delete failed). Skipping (rather than throwing) keeps the
-  // download cursor advancing instead of wedging on a file whose ciphertext is permanently gone.
-  let encrypted: Uint8Array;
-  try {
-    encrypted = await storageAdapter.download(record.url);
-  } catch (err) {
-    const stillExists = await storageAdapter
-      .exists(record.url)
-      .catch(() => true);
-    if (!stillExists) {
-      logger.warn(
-        { fileId: record.fileId, url: record.url },
-        "Blob missing for registered file; skipping (cursor advances)",
-      );
-      return null;
-    }
-    throw err;
-  }
+  // A download failure (404 or transient) throws and blocks the cursor — and that is correct here:
+  // the delete cascade de-registers a file BEFORE deleting its blob, so any genuinely-deleted file
+  // has deletedAt set and is excluded from this default (excludeDeleted) listing. Thus a 404 only
+  // happens for an in-flight cross-device delete, which self-heals on the next cycle once the
+  // de-register propagates and the file drops out of the list; a transient error blocks-and-retries
+  // without losing data. We deliberately do NOT skip-on-404 here: the storage layer can't reliably
+  // distinguish "gone" from "transiently unavailable", so skipping would risk a silent data gap
+  // during an outage. (Cross-device removal of already-downloaded copies is slice 3b.)
+  const encrypted = await storageAdapter.download(record.url);
 
   // 3. Resolve schemaId → scope via Gateway getSchema
   const schema = await gateway.getSchema(record.schemaId);
