@@ -51,8 +51,26 @@ export async function downloadOne(
     return null;
   }
 
-  // 2. Download OpenPGP encrypted binary from storage backend
-  const encrypted = await storageAdapter.download(record.url);
+  // 2. Download OpenPGP encrypted binary from storage backend.
+  // Tolerate a missing blob: it may have been deleted (cross-device delete, or a deletion whose
+  // gateway de-register succeeded but blob-delete failed). Skipping (rather than throwing) keeps the
+  // download cursor advancing instead of wedging on a file whose ciphertext is permanently gone.
+  let encrypted: Uint8Array;
+  try {
+    encrypted = await storageAdapter.download(record.url);
+  } catch (err) {
+    const stillExists = await storageAdapter
+      .exists(record.url)
+      .catch(() => true);
+    if (!stillExists) {
+      logger.warn(
+        { fileId: record.fileId, url: record.url },
+        "Blob missing for registered file; skipping (cursor advances)",
+      );
+      return null;
+    }
+    throw err;
+  }
 
   // 3. Resolve schemaId → scope via Gateway getSchema
   const schema = await gateway.getSchema(record.schemaId);
