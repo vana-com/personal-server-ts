@@ -51,7 +51,15 @@ export async function downloadOne(
     return null;
   }
 
-  // 2. Download OpenPGP encrypted binary from storage backend
+  // 2. Download OpenPGP encrypted binary from storage backend.
+  // A download failure (404 or transient) throws and blocks the cursor — and that is correct here:
+  // the delete cascade de-registers a file BEFORE deleting its blob, so any genuinely-deleted file
+  // has deletedAt set and is excluded from this default (excludeDeleted) listing. Thus a 404 only
+  // happens for an in-flight cross-device delete, which self-heals on the next cycle once the
+  // de-register propagates and the file drops out of the list; a transient error blocks-and-retries
+  // without losing data. We deliberately do NOT skip-on-404 here: the storage layer can't reliably
+  // distinguish "gone" from "transiently unavailable", so skipping would risk a silent data gap
+  // during an outage. (Cross-device removal of already-downloaded copies is slice 3b.)
   const encrypted = await storageAdapter.download(record.url);
 
   // 3. Resolve schemaId → scope via Gateway getSchema

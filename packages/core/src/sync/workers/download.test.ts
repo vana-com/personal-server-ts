@@ -154,6 +154,18 @@ describe("download worker", () => {
       expect(deps.storageAdapter.download).not.toHaveBeenCalled();
     });
 
+    it("propagates a download failure (blocks the cursor) so data isn't silently skipped", async () => {
+      const deps = makeMockDeps();
+      (
+        deps.storageAdapter.download as ReturnType<typeof vi.fn>
+      ).mockRejectedValue(new Error("storage unavailable"));
+
+      await expect(downloadOne(deps, makeFileRecord())).rejects.toThrow(
+        "storage unavailable",
+      );
+      expect(deps.storage.writeEnvelope).not.toHaveBeenCalled();
+    });
+
     it("downloads, decrypts, writes, and indexes file", async () => {
       const deps = makeMockDeps();
       const record = makeFileRecord();
