@@ -9,9 +9,11 @@ import type { GatewayConfig } from "../schemas/server-config.js";
 import { createServerSigner } from "./signer.js";
 import {
   fileRegistrationDomain,
+  fileDeletionDomain,
   grantRegistrationDomain,
   grantRevocationDomain,
   FILE_REGISTRATION_TYPES,
+  FILE_DELETION_TYPES,
   GRANT_REGISTRATION_TYPES,
   GRANT_REVOCATION_TYPES,
 } from "@opendatalabs/vana-sdk/browser";
@@ -60,6 +62,29 @@ describe("ServerSigner", () => {
         domain: fileRegistrationDomain(TEST_GATEWAY_CONFIG),
         types: FILE_REGISTRATION_TYPES,
         primaryType: "FileRegistration",
+        message: msg,
+        signature,
+      });
+      expect(recovered.toLowerCase()).toBe(account.address.toLowerCase());
+    });
+  });
+
+  describe("signFileDeletion", () => {
+    it("produces a signature recoverable to the server address", async () => {
+      const { account, signer } = setup();
+      const msg = {
+        ownerAddress:
+          "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as `0x${string}`,
+        fileId: ("0x" + "dd".repeat(32)) as `0x${string}`,
+      };
+
+      const signature = await signer.signFileDeletion(msg);
+      expect(signature).toMatch(/^0x[0-9a-fA-F]+$/);
+
+      const recovered = await recoverTypedDataAddress({
+        domain: fileDeletionDomain(TEST_GATEWAY_CONFIG),
+        types: FILE_DELETION_TYPES,
+        primaryType: "FileDeletion",
         message: msg,
         signature,
       });
