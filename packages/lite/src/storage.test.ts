@@ -76,6 +76,55 @@ describe("createPersistentPsLiteStorage", () => {
     expect(reloaded.findEntry({ scope: "instagram.profile" })).toBeUndefined();
   });
 
+  it("deletes a single version by fileId (entry + blob) and no-ops on unknown id", async () => {
+    const persistence = createMemoryPsLitePersistence();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      persistence,
+    );
+    // Two versions of the same scope; only one is deleted.
+    const keep = createDataFileEnvelope(
+      "instagram.profile",
+      "2026-05-08T00:00:00.000Z",
+      { username: "keep" },
+    );
+    const drop = createDataFileEnvelope(
+      "instagram.profile",
+      "2026-05-09T00:00:00.000Z",
+      { username: "drop" },
+    );
+    for (const [index, envelope] of [keep, drop].entries()) {
+      const write = await storage.writeEnvelope(envelope);
+      await storage.insertEntry({
+        fileId: `file-${index + 1}`,
+        path: write.relativePath,
+        scope: envelope.scope,
+        collectedAt: envelope.collectedAt,
+        sizeBytes: write.sizeBytes,
+      });
+    }
+
+    expect(await storage.deleteByFileId("file-2")).toBe(true);
+    // Unknown fileId is a no-op.
+    expect(await storage.deleteByFileId("file-unknown")).toBe(false);
+
+    const reloaded = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      persistence,
+    );
+    expect(reloaded.countVersions("instagram.profile")).toBe(1);
+    expect(
+      reloaded.findEntry({ scope: "instagram.profile", fileId: "file-2" }),
+    ).toBeUndefined();
+    // The other version (and its blob) survive.
+    expect(
+      reloaded.findEntry({ scope: "instagram.profile", fileId: "file-1" }),
+    ).toBeDefined();
+    await expect(
+      reloaded.readEnvelope("instagram.profile", "2026-05-08T00:00:00.000Z"),
+    ).resolves.toBeDefined();
+  });
+
   it("summarizes persisted scopes with latest collection time and version count", async () => {
     const persistence = createMemoryPsLitePersistence();
     const storage = await createPersistentPsLiteStorage(

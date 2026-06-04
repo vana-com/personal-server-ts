@@ -181,6 +181,17 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
       }
       return deleted;
     },
+
+    async deleteByFileId(fileId) {
+      for (const [path, entry] of entries.entries()) {
+        if (entry.fileId === fileId) {
+          entries.delete(path);
+          envelopes.delete(envelopeKey(entry.scope, entry.collectedAt));
+          return true;
+        }
+      }
+      return false;
+    },
   } as DataStoragePort & { capabilities: PsLiteStorageCapabilities };
 }
 
