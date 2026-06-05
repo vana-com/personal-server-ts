@@ -143,9 +143,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-export function listDataScopesContract(
+export async function listDataScopesContract(
   input: ListDataScopesContractInput,
-): ListDataScopesContractResult {
+): Promise<ListDataScopesContractResult> {
   const limit = normalizeLimit(input.limit);
   const offset = normalizeOffset(input.offset);
   const result = input.storage.listScopes({
@@ -153,10 +153,33 @@ export function listDataScopesContract(
     limit,
     offset,
   });
+  const scopes = await Promise.all(
+    result.scopes.map(async (summary) => {
+      const entry = input.storage.findEntry({
+        scope: summary.scope,
+        at: summary.latestCollectedAt,
+      });
+      if (!entry) {
+        return summary;
+      }
+      const hasBlocks =
+        typeof input.storage.hasScopeBlocks === "function"
+          ? await input.storage.hasScopeBlocks(
+              summary.scope,
+              summary.latestCollectedAt,
+            )
+          : false;
+      return {
+        ...summary,
+        dataStatus: hasBlocks ? ("ready" as const) : ("indexing" as const),
+        sizeBytes: entry.sizeBytes,
+      };
+    }),
+  );
   return {
     ok: true,
     response: {
-      scopes: result.scopes,
+      scopes,
       total: result.total,
       limit,
       offset,
