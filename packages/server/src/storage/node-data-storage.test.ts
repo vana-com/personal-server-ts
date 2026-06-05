@@ -185,6 +185,9 @@ describe("createNodeDataStorage block sidecars", () => {
   });
 
   it("returns a typed not-found error when the manifest is missing", async () => {
+    await expect(storage.hasScopeBlocks?.(scope, collectedAt)).resolves.toBe(
+      false,
+    );
     await expect(
       storage.readScopeBlocks!(scope, collectedAt, { maxBytes: 1024 }),
     ).rejects.toMatchObject({ code: "block_manifest_not_found" });
@@ -192,6 +195,9 @@ describe("createNodeDataStorage block sidecars", () => {
 
   it("respects maxBytes approximately and does not read or parse the raw envelope", async () => {
     const built = await writeBlocks();
+    await expect(storage.hasScopeBlocks?.(scope, collectedAt)).resolves.toBe(
+      true,
+    );
     await storage.writeEnvelope(
       createDataFileEnvelope(scope, collectedAt, { raw: "source" }),
     );

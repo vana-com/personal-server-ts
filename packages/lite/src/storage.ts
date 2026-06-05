@@ -578,6 +578,17 @@ export async function createPersistentPsLiteStorage(
       };
     },
 
+    async hasScopeBlocks(scope, collectedAt) {
+      const manifestPath = blockManifestPath(scope, collectedAt);
+      const manifest =
+        (await fileStore.readBlockManifest?.(manifestPath)) ??
+        (fileStore === fallbackStore
+          ? null
+          : await fallbackStore.readBlockManifest?.(manifestPath)) ??
+        null;
+      return Boolean(manifest);
+    },
+
     async writeBlockManifest(scope, collectedAt, manifest, blocks) {
       if (!fileStore.writeBlockManifest || !fileStore.writeBlockPayload) {
         throw new Error("Block sidecar storage is not available");

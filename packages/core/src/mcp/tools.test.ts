@@ -90,6 +90,9 @@ describe("mcp/tools", () => {
     expect(JSON.parse(result.content[0].text)).toEqual({
       sources: ["chatgpt", "instagram"],
     });
+    expect(result.structuredContent).toEqual({
+      sources: ["chatgpt", "instagram"],
+    });
   });
 
   it("read_scope returns bounded blocks and a next cursor", async () => {
@@ -432,5 +435,37 @@ describe("mcp/tools", () => {
       expect(scope.dataStatus).toBe("needs_refresh");
       expect(scope.searchRecommended).toBe(false);
     }
+  });
+
+  it("list_granted_scopes marks indexed scopes as indexing when block manifests are not ready", async () => {
+    const readClient = createMinimalReadClient({
+      getScopeMetadata: vi.fn(async (scope: string) => ({
+        scope,
+        collectedAt: "2026-06-05T00:00:00Z",
+        sizeBytes: 5_000,
+        hasBlocks: false,
+      })),
+    });
+
+    const result = await getTool("list_granted_scopes").handler(
+      {},
+      {
+        connection: {
+          ...createConnection(),
+          grants: [
+            { grantId: "grant-indexing", scopes: ["instagram.profile"] },
+          ],
+        },
+        readClient: readClient as never,
+      },
+    );
+
+    const payload = JSON.parse(result.content[0].text);
+    const profile = payload.scopes.find(
+      (scope: { scope: string }) => scope.scope === "instagram.profile",
+    );
+    expect(profile.dataStatus).toBe("indexing");
+    expect(profile.searchRecommended).toBe(false);
+    expect(profile.reason).toContain("indexing");
   });
 });

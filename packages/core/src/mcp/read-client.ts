@@ -55,7 +55,7 @@ export interface McpDataReadClient {
    * to populate sizeBytes/sizeClass/searchRecommended without reading data.
    * Returns null when the scope has no local index entry.
    */
-  getScopeMetadata(scope: string): McpScopeMetadata | null;
+  getScopeMetadata(scope: string): Promise<McpScopeMetadata | null>;
 
   /**
    * Perform a grant-gated bounded block read for MCP. This is the path used by
@@ -162,15 +162,19 @@ export function createMcpDataReadClient(
       return { status: response.status, ...normalizeListScopesPayload(body) };
     },
 
-    getScopeMetadata(scope: string): McpScopeMetadata | null {
+    async getScopeMetadata(scope: string): Promise<McpScopeMetadata | null> {
       const storage = options.dataApiDeps.storage;
       const entry = storage.findEntry({ scope });
       if (!entry) return null;
+      const hasBlocks =
+        typeof storage.hasScopeBlocks === "function"
+          ? await storage.hasScopeBlocks(scope, entry.collectedAt)
+          : false;
       return {
         scope,
         collectedAt: entry.collectedAt,
         sizeBytes: entry.sizeBytes,
-        hasBlocks: Boolean(storage.readScopeBlocks),
+        hasBlocks,
       };
     },
 
