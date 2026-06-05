@@ -74,7 +74,16 @@ function uniqueScopes(connection: McpConnectionRecord): string[] {
 function uniqueSources(connection: McpConnectionRecord): string[] {
   const set = new Set<string>();
   for (const grant of connection.grants) {
-    if (grant.sourceId) set.add(grant.sourceId);
+    if (grant.sourceId) {
+      set.add(grant.sourceId);
+      continue;
+    }
+    for (const scope of grant.scopes) {
+      const [sourceId] = scope.split(".");
+      if (sourceId && sourceId !== "*") {
+        set.add(sourceId);
+      }
+    }
   }
   return Array.from(set).sort();
 }
@@ -116,7 +125,7 @@ const listGrantedSources: McpToolDefinition = {
   name: "list_granted_sources",
   title: "List granted sources",
   description:
-    "List the data sources (e.g. instagram, chatgpt) the user has granted this Claude MCP connection access to.",
+    "List the data sources (e.g. instagram, chatgpt) the user has granted this MCP connection access to.",
   inputSchema: {},
   async handler(_args, { connection }) {
     return textResult({ sources: uniqueSources(connection) });
@@ -127,7 +136,7 @@ const listGrantedScopes: McpToolDefinition = {
   name: "list_granted_scopes",
   title: "List granted scopes",
   description:
-    "List the scope identifiers the user has approved this Claude MCP connection to read.",
+    "List the scope identifiers the user has approved this MCP connection to read.",
   inputSchema: {},
   async handler(_args, { connection }) {
     return textResult({ scopes: uniqueScopes(connection) });
