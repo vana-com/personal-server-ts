@@ -20,9 +20,13 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import type { Logger } from "pino";
-import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
+import type {
+  DataPortabilityGatewayConfig,
+  GatewayClient,
+} from "@opendatalabs/vana-sdk/node";
 import {
   approveMcpOAuthAuthorization,
+  approveMcpOAuthAuthorizationWithScopes,
   approveMcpConnection,
   buildMcpProtectedResourceMetadataUrl,
   buildMcpUrl,
@@ -54,6 +58,7 @@ import type {
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { createServerApiAuth } from "../api-auth.js";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
+import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type {
@@ -74,7 +79,9 @@ export interface McpRouteDeps {
    */
   serverOrigin: string | (() => string);
   serverOwner?: `0x${string}`;
+  serverSigner?: Pick<ServerSigner, "signGrantRegistration">;
   gateway: GatewayClient;
+  gatewayConfig?: (DataPortabilityGatewayConfig & { url?: string }) | null;
   devToken?: string;
   accessToken?: string;
   tokenStore?: TokenStore;
@@ -571,15 +578,62 @@ export function mcpOAuthRoutes(deps: McpRouteDeps): Hono {
   app.post("/v1/mcp/oauth/authorizations/:id/approve", async (c) => {
     const err = await requireOwner(c);
     if (err) return err;
-    let body: { grants?: McpConnectionGrant[] } = {};
+    let body: {
+      expiresAt?: number;
+      grants?: McpConnectionGrant[];
+      nonce?: number;
+      scopes?: string[];
+    } = {};
     try {
-      body = (await c.req.json()) as { grants?: McpConnectionGrant[] };
+      body = (await c.req.json()) as typeof body;
     } catch {
       return c.json(jsonError(400, "INVALID_BODY", "Body must be JSON"), 400);
     }
+    if (Array.isArray(body.scopes) && body.scopes.length > 0) {
+      if (!deps.gatewayConfig?.url) {
+        return c.json(
+          jsonError(
+            500,
+            "SERVER_NOT_CONFIGURED",
+            "Gateway config is not configured",
+          ),
+          500,
+        );
+      }
+      try {
+        const approved = await approveMcpOAuthAuthorizationWithScopes(
+          {
+            authorizationId: c.req.param("id"),
+            scopes: body.scopes,
+            ...(body.expiresAt !== undefined
+              ? { expiresAt: body.expiresAt }
+              : {}),
+            ...(body.nonce !== undefined ? { nonce: body.nonce } : {}),
+          },
+          {
+            connectionStore,
+            authorizationStore,
+            gateway: deps.gateway,
+            gatewayConfig: deps.gatewayConfig,
+            gatewayUrl: deps.gatewayConfig.url,
+            serverOwner: deps.serverOwner,
+            serverSigner: deps.serverSigner,
+          },
+        );
+        return c.json({ redirectTo: approved.redirectTo });
+      } catch (err) {
+        if (err instanceof McpOAuthAuthorizationError) {
+          return c.json(
+            jsonError(err.status, err.code, err.message),
+            err.status as 400 | 404 | 500,
+          );
+        }
+        throw err;
+      }
+    }
     if (!Array.isArray(body.grants) || body.grants.length === 0) {
       return c.json(
-        jsonError(400, "GRANTS_REQUIRED", "Approve requires grants"),
+        jsonError(400, "GRANTS_REQUIRED", "Approve requires grants or scopes"),
         400,
       );
     }
@@ -591,7 +645,10 @@ export function mcpOAuthRoutes(deps: McpRouteDeps): Hono {
       return c.json({ redirectTo: approved.redirectTo });
     } catch (err) {
       if (err instanceof McpOAuthAuthorizationError) {
-        return c.json(jsonError(400, err.code, err.message), 400);
+        return c.json(
+          jsonError(err.status, err.code, err.message),
+          err.status as 400 | 404 | 500,
+        );
       }
       throw err;
     }
