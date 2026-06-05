@@ -468,8 +468,7 @@ const listGrantedSources: McpToolDefinition = {
   name: "list_granted_sources",
   title: "List granted sources",
   description:
-    "List the data source identifiers (e.g. instagram, chatgpt) granted to this MCP connection. " +
-    "Use list_granted_scopes for per-scope planning metadata including readiness and size.",
+    "List granted data source ids. Use list_granted_scopes for scope readiness and size.",
   inputSchema: {},
   async handler(_args, { connection }) {
     return textResult({ sources: uniqueSources(connection) });
@@ -480,10 +479,7 @@ const listGrantedScopes: McpToolDefinition = {
   name: "list_granted_scopes",
   title: "List granted scopes",
   description:
-    "List granted scopes with planning metadata. Call this first before search_personal_context or read_scope. " +
-    "Each scope entry includes dataStatus (ready/needs_refresh/unavailable), sizeClass, searchRecommended, " +
-    "and sizeBytes when known. Prefer scopes with searchRecommended:true and dataStatus:ready for search. " +
-    "Pass large or unavailable scopes explicitly with a cursor to search them safely.",
+    "List granted scopes with dataStatus, sizeClass, searchRecommended, and sizeBytes. Call first.",
   inputSchema: {},
   async handler(_args, { connection, readClient }) {
     const grantedScopes = uniqueScopes(connection);
@@ -527,9 +523,7 @@ const readScope: McpToolDefinition = {
   name: "read_scope",
   title: "Read scope",
   description:
-    "Read approved data for a single scope as bounded block pages. " +
-    "Use after search_personal_context identifies a relevant scope, or for precise full retrieval. " +
-    "Pass cursor from nextCursor to page through large scopes. Returns blocks, page metadata, and warnings.",
+    "Read one approved scope as bounded blocks. Page with nextCursor for large scopes.",
   inputSchema: {
     scope: z
       .string()
@@ -673,13 +667,7 @@ const searchPersonalContext: McpToolDefinition = {
   name: "search_personal_context",
   title: "Search personal context",
   description:
-    "Search approved personal data scopes for a literal query string. " +
-    "Call list_granted_scopes first to see which scopes are ready and searchRecommended. " +
-    "Pass specific scopes to limit search; omitting scopes auto-selects small, ready scopes. " +
-    "Large or unavailable scopes are skipped with reasons in skippedScopes. " +
-    "When nextSearchCursor is returned, call again with cursor to continue searching remaining scopes. " +
-    "The server owns the deadline — unbounded search always returns within the configured budget. " +
-    "Use read_scope for precise retrieval once search identifies a relevant scope.",
+    "Search approved scopes. Omit scopes for small ready data; pass scopes to target. Continue with nextSearchCursor.",
   inputSchema: {
     query: z.string().min(1).max(SEARCH_QUERY_MAX_CHARS),
     scopes: z
