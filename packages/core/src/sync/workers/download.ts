@@ -49,8 +49,21 @@ export async function downloadOne(
   // 1. Check dedup: skip if fileId already in local index
   const existing = storage.findByFileId(record.fileId);
   if (existing) {
-    logger.debug({ fileId: record.fileId }, "File already in index, skipping");
-    return null;
+    if (await hasLocalPayload(storage, existing.scope, existing.collectedAt)) {
+      logger.debug(
+        { fileId: record.fileId },
+        "File already in index, skipping",
+      );
+      return null;
+    }
+    logger.warn(
+      {
+        fileId: record.fileId,
+        scope: existing.scope,
+        collectedAt: existing.collectedAt,
+      },
+      "File index exists without local payload; repairing",
+    );
   }
 
   // 2. Download OpenPGP encrypted binary from storage backend.
@@ -89,18 +102,28 @@ export async function downloadOne(
     existingByVersion !== undefined &&
     existingByVersion.collectedAt === envelope.collectedAt
   ) {
-    if (existingByVersion.fileId !== record.fileId) {
-      await storage.updateFileId(existingByVersion.path, record.fileId);
+    if (await hasLocalPayload(storage, envelope.scope, envelope.collectedAt)) {
+      if (existingByVersion.fileId !== record.fileId) {
+        await storage.updateFileId(existingByVersion.path, record.fileId);
+      }
+      logger.debug(
+        {
+          fileId: record.fileId,
+          scope: envelope.scope,
+          collectedAt: envelope.collectedAt,
+        },
+        "File version already exists locally, skipping",
+      );
+      return null;
     }
-    logger.debug(
+    logger.warn(
       {
         fileId: record.fileId,
         scope: envelope.scope,
         collectedAt: envelope.collectedAt,
       },
-      "File version already exists locally, skipping",
+      "File version index exists without local payload; repairing",
     );
-    return null;
   }
 
   // 7. Write to local storage via the runtime storage port
@@ -128,6 +151,20 @@ export async function downloadOne(
     collectedAt: envelope.collectedAt,
     path: relativePath,
   };
+}
+
+async function hasLocalPayload(
+  storage: DataStoragePort,
+  scope: string,
+  collectedAt: string,
+): Promise<boolean> {
+  try {
+    await storage.readEnvelope(scope, collectedAt);
+  } catch {
+    return false;
+  }
+  if (!storage.hasScopeBlocks) return true;
+  return await storage.hasScopeBlocks(scope, collectedAt);
 }
 
 /**

@@ -73,6 +73,8 @@ function makeMockDeps(): DownloadWorkerDeps {
       relativePath: `${SCOPE}/${COLLECTED_AT}.json`,
       sizeBytes: 128,
     }),
+    readEnvelope: vi.fn().mockResolvedValue(makeEnvelope()),
+    hasScopeBlocks: vi.fn().mockResolvedValue(true),
     writeBlockManifest: vi.fn().mockResolvedValue(undefined),
     insertEntry: vi.fn().mockImplementation((entry) => ({
       id: 1,
@@ -154,6 +156,46 @@ describe("download worker", () => {
 
       expect(result).toBeNull();
       expect(deps.storageAdapter.download).not.toHaveBeenCalled();
+    });
+
+    it("repairs when fileId is indexed but local payload is missing", async () => {
+      const deps = makeMockDeps();
+      const existingEntry: IndexEntry = {
+        id: 1,
+        fileId: FILE_ID,
+        schemaId: SCHEMA_ID,
+        path: RELATIVE_PATH,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        createdAt: "2026-01-21T10:00:00Z",
+        sizeBytes: 128,
+      };
+      (deps.storage.findByFileId as ReturnType<typeof vi.fn>).mockReturnValue(
+        existingEntry,
+      );
+      (deps.storage.readEnvelope as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new Error("Envelope not found"),
+      );
+
+      const result = await downloadOne(deps, makeFileRecord());
+
+      expect(result).toEqual({
+        fileId: FILE_ID,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        path: RELATIVE_PATH,
+      });
+      expect(deps.storageAdapter.download).toHaveBeenCalledWith(STORAGE_URL);
+      expect(deps.storage.writeEnvelope).toHaveBeenCalledTimes(1);
+      expect(deps.storage.writeBlockManifest).toHaveBeenCalledTimes(1);
+      expect(deps.storage.insertEntry).toHaveBeenCalledWith({
+        fileId: FILE_ID,
+        schemaId: SCHEMA_ID,
+        path: RELATIVE_PATH,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        sizeBytes: 128,
+      });
     });
 
     it("propagates a download failure (blocks the cursor) so data isn't silently skipped", async () => {
@@ -272,6 +314,46 @@ describe("download worker", () => {
       );
       expect(deps.storage.writeEnvelope).not.toHaveBeenCalled();
       expect(deps.storage.insertEntry).not.toHaveBeenCalled();
+    });
+
+    it("repairs when the same version is indexed but local payload is missing", async () => {
+      const deps = makeMockDeps();
+      const existingEntry: IndexEntry = {
+        id: 1,
+        fileId: null,
+        schemaId: SCHEMA_ID,
+        path: RELATIVE_PATH,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        createdAt: "2026-01-21T10:00:00Z",
+        sizeBytes: 128,
+      };
+      (deps.storage.findEntry as ReturnType<typeof vi.fn>).mockReturnValue(
+        existingEntry,
+      );
+      (deps.storage.readEnvelope as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new Error("Envelope not found"),
+      );
+
+      const result = await downloadOne(deps, makeFileRecord());
+
+      expect(result).toEqual({
+        fileId: FILE_ID,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        path: RELATIVE_PATH,
+      });
+      expect(deps.storage.updateFileId).not.toHaveBeenCalled();
+      expect(deps.storage.writeEnvelope).toHaveBeenCalledTimes(1);
+      expect(deps.storage.writeBlockManifest).toHaveBeenCalledTimes(1);
+      expect(deps.storage.insertEntry).toHaveBeenCalledWith({
+        fileId: FILE_ID,
+        schemaId: SCHEMA_ID,
+        path: RELATIVE_PATH,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        sizeBytes: 128,
+      });
     });
 
     it("resolves schemaId → scope via gateway.getSchema", async () => {
