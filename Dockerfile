@@ -24,10 +24,11 @@ RUN npm ci
 COPY tsconfig.base.json ./
 COPY packages/ packages/
 
-# Create a Docker-specific tsconfig that excludes scripts/ (not needed in container)
-RUN echo '{"references":[{"path":"packages/core"},{"path":"packages/server"}],"files":[]}' > tsconfig.json
-
-RUN npm run build
+# Build only the workspaces needed by the server image. The root build also
+# compiles repo-local scripts that are intentionally absent from this image.
+RUN npm run build --workspace @opendatalabs/personal-server-ts-core \
+  && npm run build --workspace @opendatalabs/personal-server-ts-lite \
+  && npm run build --workspace @opendatalabs/personal-server-ts-server
 
 # Prune dev dependencies after build
 RUN npm prune --omit=dev
@@ -45,10 +46,10 @@ WORKDIR /app
 COPY --from=build --chown=vana:vana /app/package.json /app/package-lock.json ./
 COPY --from=build --chown=vana:vana /app/node_modules/ node_modules/
 
-# Each workspace package needs package.json, dist/, and any hoisted node_modules
+# Each workspace package needs package.json and dist/. Workspace dependencies are
+# available through the root node_modules copied above.
 COPY --from=build --chown=vana:vana /app/packages/core/package.json packages/core/package.json
 COPY --from=build --chown=vana:vana /app/packages/core/dist/ packages/core/dist/
-COPY --from=build --chown=vana:vana /app/packages/core/node_modules/ packages/core/node_modules/
 
 COPY --from=build --chown=vana:vana /app/packages/server/package.json packages/server/package.json
 COPY --from=build --chown=vana:vana /app/packages/server/dist/ packages/server/dist/
