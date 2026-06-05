@@ -85,9 +85,11 @@ function extractActivityFinishParams(
         unknown
       >;
       return {
-        resultCount: Array.isArray(body.matches)
-          ? body.matches.length
-          : undefined,
+        resultCount: Array.isArray(body.results)
+          ? body.results.length
+          : Array.isArray(body.matches)
+            ? body.matches.length
+            : undefined,
         skippedCount: Array.isArray(body.skippedScopes)
           ? body.skippedScopes.length
           : undefined,

@@ -488,7 +488,10 @@ const listGrantedScopes: McpToolDefinition = {
   async handler(_args, { connection, readClient }) {
     const grantedScopes = uniqueScopes(connection);
     const scopeEntries = grantedScopes.map((scope) => {
-      const meta = readClient.getScopeMetadata(scope);
+      const meta =
+        typeof readClient.getScopeMetadata === "function"
+          ? readClient.getScopeMetadata(scope)
+          : null;
       if (!meta) {
         return {
           scope,
@@ -914,6 +917,7 @@ const searchPersonalContext: McpToolDefinition = {
     return textResult({
       query,
       results: matches,
+      matches,
       searchedScopes,
       skippedScopes: [
         ...normalizedScopes.skippedScopes,
