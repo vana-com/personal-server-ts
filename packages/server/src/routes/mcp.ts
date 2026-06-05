@@ -40,7 +40,6 @@ import {
   hashConnectionToken,
   listMcpConnectionViews,
   loadMcpGranteeAccount,
-  McpActivityRecorder,
   McpConnectionNotFoundError,
   McpConnectionStateError,
   McpOAuthAuthorizationError,
@@ -51,6 +50,7 @@ import {
   type McpConnectionGrant,
   type McpConnectionStore,
   type McpOAuthAuthorizationStore,
+  type McpActivityRecorder,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import type {
   PersonalServerDataApiDeps,
