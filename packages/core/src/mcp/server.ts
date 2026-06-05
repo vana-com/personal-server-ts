@@ -16,16 +16,105 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import type { McpConnectionRecord } from "./types.js";
 import type { McpDataReadClient } from "./read-client.js";
 import { MCP_TOOLS, type McpToolContext } from "./tools.js";
+import type { McpActivityRecorder } from "./activity.js";
 
 export interface HandleMcpRequestOptions {
   connection: McpConnectionRecord;
   readClient: McpDataReadClient;
+  activityRecorder?: McpActivityRecorder;
   serverName?: string;
   serverVersion?: string;
 }
 
 const DEFAULT_SERVER_NAME = "vana-personal-server-mcp";
 const DEFAULT_SERVER_VERSION = "0.0.1";
+
+const QUERY_PREVIEW_CHARS = 120;
+
+function buildActivityStartParams(
+  tool: string,
+  args: Record<string, unknown>,
+): { tool: string; scopes?: string[]; queryPreview?: string } {
+  const params: { tool: string; scopes?: string[]; queryPreview?: string } = {
+    tool,
+  };
+  if (tool === "read_scope" && typeof args.scope === "string") {
+    params.scopes = [args.scope];
+  }
+  if (tool === "search_personal_context") {
+    if (typeof args.query === "string") {
+      params.queryPreview = args.query.slice(0, QUERY_PREVIEW_CHARS);
+    }
+    if (Array.isArray(args.scopes) && args.scopes.length > 0) {
+      params.scopes = (args.scopes as unknown[])
+        .filter((s): s is string => typeof s === "string")
+        .slice(0, 20);
+    }
+  }
+  return params;
+}
+
+function extractActivityFinishParams(
+  tool: string,
+  result: { content: Array<{ type: string; text: string }>; isError?: boolean },
+): {
+  resultCount?: number;
+  skippedCount?: number;
+  errorCode?: string;
+  errorMessage?: string;
+} {
+  if (result.isError || result.content.length === 0) {
+    try {
+      const body = JSON.parse(result.content[0]?.text ?? "{}") as Record<
+        string,
+        unknown
+      >;
+      return {
+        errorCode: typeof body.error === "string" ? body.error : undefined,
+        errorMessage:
+          typeof body.message === "string" ? body.message : undefined,
+      };
+    } catch {
+      return {};
+    }
+  }
+  if (tool === "search_personal_context") {
+    try {
+      const body = JSON.parse(result.content[0].text) as Record<
+        string,
+        unknown
+      >;
+      return {
+        resultCount: Array.isArray(body.results)
+          ? body.results.length
+          : Array.isArray(body.matches)
+            ? body.matches.length
+            : undefined,
+        skippedCount: Array.isArray(body.skippedScopes)
+          ? body.skippedScopes.length
+          : undefined,
+      };
+    } catch {
+      return {};
+    }
+  }
+  if (tool === "read_scope") {
+    try {
+      const body = JSON.parse(result.content[0].text) as Record<
+        string,
+        unknown
+      >;
+      return {
+        resultCount: Array.isArray(body.blocks)
+          ? body.blocks.length
+          : undefined,
+      };
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
 
 /**
  * Build a fresh `McpServer` instance bound to a single connection + read
@@ -42,6 +131,7 @@ export function createMcpServerForConnection(
   const ctx: McpToolContext = {
     connection: options.connection,
     readClient: options.readClient,
+    activityRecorder: options.activityRecorder,
   };
 
   for (const tool of MCP_TOOLS) {
@@ -52,10 +142,32 @@ export function createMcpServerForConnection(
         description: tool.description,
         inputSchema: tool.inputSchema,
       },
-      async (args) => {
+      async (args: Record<string, unknown>) => {
+        const recorder = options.activityRecorder;
+        const activityId = recorder
+          ? recorder.start(buildActivityStartParams(tool.name, args))
+          : undefined;
         try {
-          return await tool.handler(args as Record<string, unknown>, ctx);
+          const result = await tool.handler(
+            args as Record<string, unknown>,
+            ctx,
+          );
+          if (activityId && recorder) {
+            const payload = extractActivityFinishParams(tool.name, result);
+            recorder.finish(activityId, {
+              status: result.isError ? "failed" : "succeeded",
+              ...payload,
+            });
+          }
+          return result;
         } catch (err) {
+          if (activityId && recorder) {
+            recorder.finish(activityId, {
+              status: "failed",
+              errorCode: "tool_handler_error",
+              errorMessage: err instanceof Error ? err.message : String(err),
+            });
+          }
           return {
             isError: true,
             content: [

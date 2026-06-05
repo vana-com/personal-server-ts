@@ -50,6 +50,7 @@ import {
   type McpConnectionGrant,
   type McpConnectionStore,
   type McpOAuthAuthorizationStore,
+  type McpActivityRecorder,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import type {
   PersonalServerDataApiDeps,
@@ -98,6 +99,8 @@ export interface McpRouteDeps {
    * `/mcp/oauth/token`, and the owner approval endpoint.
    */
   oauthAuthorizationStore?: McpOAuthAuthorizationStore;
+  /** Activity recorder for live MCP call visibility. */
+  activityRecorder?: McpActivityRecorder;
   /**
    * Vana Web approval surface. `/mcp/oauth/authorize` redirects owners here
    * with `mcp_authorization` and `ps_origin` query params.
@@ -726,6 +729,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
     const response = await handleMcpStreamableHttpRequest(c.req.raw, {
       connection: record,
       readClient,
+      activityRecorder: deps.activityRecorder,
     });
     await store.update(record.id, {
       lastUsedAt: new Date().toISOString(),
@@ -742,6 +746,46 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
   app.all("/:connectionToken", async (c) => {
     const rawToken = c.req.param("connectionToken");
     return handleToken(c, rawToken, { oauthChallenge: false });
+  });
+
+  return app;
+}
+
+/**
+ * Owner-only activity feed route. Mount at `/v1/mcp/activity` in `app.ts`.
+ * Returns the current snapshot from the shared `McpActivityRecorder`.
+ */
+export function mcpActivityRoutes(deps: McpRouteDeps): Hono {
+  const app = new Hono();
+
+  const ownerAuth: PersonalServerApiAuthPort = createServerApiAuth({
+    serverOrigin: deps.serverOrigin,
+    serverOwner: deps.serverOwner,
+    gateway: deps.gateway,
+    devToken: deps.devToken,
+    accessToken: deps.accessToken,
+    tokenStore: deps.tokenStore,
+  });
+
+  async function requireOwner(c: Context): Promise<Response | null> {
+    try {
+      await ownerAuth.authorizeOwner(c.req.raw);
+      return null;
+    } catch (err) {
+      if (err instanceof ProtocolError) {
+        return c.json(err.toJSON(), err.code as 401 | 403);
+      }
+      throw err;
+    }
+  }
+
+  app.get("/", async (c) => {
+    const err = await requireOwner(c);
+    if (err) return err;
+    const snapshot = deps.activityRecorder
+      ? deps.activityRecorder.snapshot()
+      : { events: [], running: 0, total: 0 };
+    return c.json(snapshot);
   });
 
   return app;

@@ -69,6 +69,7 @@ import {
   toMcpOAuthAuthorizationView,
   revokeMcpConnection,
   toMcpConnectionView,
+  McpActivityRecorder,
   type McpConnectionGrant,
   type McpConnectionStore,
   type McpOAuthAuthorizationStore,
@@ -526,6 +527,9 @@ export function createPsLiteRuntime(
   const mcpOAuthAuthorizationStore =
     options.mcpOAuthAuthorizationStore ??
     createInMemoryMcpOAuthAuthorizationStore();
+  const activityRecorder = options.mcpConnectionStore
+    ? new McpActivityRecorder()
+    : undefined;
 
   async function withProtocolErrors(
     handler: () => Promise<Response> | Response,
@@ -896,6 +900,7 @@ export function createPsLiteRuntime(
               | undefined,
             serverOwner: options.serverOwner ?? options.identity?.address,
             serverSigner: options.serverSigner,
+            activityRecorder,
           });
           if (mcpResponse) return mcpResponse;
         }
@@ -932,6 +937,7 @@ async function handleMcpRoute(input: {
   gatewayConfig?: (DataPortabilityGatewayConfig & { url?: string }) | null;
   serverOwner?: `0x${string}`;
   serverSigner?: Pick<ServerSigner, "signGrantRegistration">;
+  activityRecorder?: McpActivityRecorder;
 }): Promise<Response | null> {
   const pathname = input.url.pathname;
   const ownerPrefix = "/v1/mcp/connections";
@@ -1363,11 +1369,31 @@ async function handleMcpRoute(input: {
     const response = await handleMcpStreamableHttpRequest(input.request, {
       connection: record,
       readClient,
+      activityRecorder: input.activityRecorder,
     });
     await input.store.update(record.id, {
       lastUsedAt: input.now().toISOString(),
     });
     return response;
+  }
+
+  // Owner-only activity feed endpoint.
+  if (pathname === "/v1/mcp/activity") {
+    try {
+      await input.auth.authorizeOwner(input.request);
+    } catch (err) {
+      if (err instanceof ProtocolError) {
+        return protocolErrorResponse(err);
+      }
+      throw err;
+    }
+    if (input.request.method !== "GET") {
+      return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+    }
+    const snapshot = input.activityRecorder
+      ? input.activityRecorder.snapshot()
+      : { events: [], running: 0, total: 0 };
+    return jsonResponse(snapshot);
   }
 
   // Claude-facing stable endpoint: /mcp with Bearer token.
