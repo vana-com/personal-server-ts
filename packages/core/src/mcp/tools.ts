@@ -114,10 +114,10 @@ class OperationTimeoutError extends Error {
 }
 
 /**
- * Resolve a requested scope to a covering grant id from the connection's
- * approved grants. A scope is "covered" when an approved grant's scopes
- * either contains the exact scope or contains a wildcard like `instagram.*`
- * that matches it.
+ * Resolve a concrete requested scope to a covering grant id from the
+ * connection's approved grants. A scope is "covered" when an approved grant's
+ * scopes either contains the exact scope or contains a wildcard like
+ * `instagram.*` that matches a concrete child scope like `instagram.profile`.
  *
  * Mirrors `scopeCoveredByGrant` semantics from `policy/data-read.ts` so the
  * tool surface never offers Claude a scope its grant won't actually pass
@@ -139,6 +139,23 @@ function resolveGrantForScope(
         }
       }
       if (granted === "*") {
+        return { grantId: grant.grantId, scopes: grant.scopes };
+      }
+    }
+  }
+  return null;
+}
+
+function resolveGrantForReadScope(
+  connection: McpConnectionRecord,
+  scope: string,
+): { grantId: string; scopes: string[] } | null {
+  const concreteGrant = resolveGrantForScope(connection, scope);
+  if (concreteGrant) return concreteGrant;
+
+  for (const grant of connection.grants) {
+    for (const granted of grant.scopes) {
+      if (granted.endsWith(".*") && scope === granted.slice(0, -2)) {
         return { grantId: grant.grantId, scopes: grant.scopes };
       }
     }
@@ -415,7 +432,7 @@ const readScope: McpToolDefinition = {
         true,
       );
     }
-    const grant = resolveGrantForScope(connection, scope);
+    const grant = resolveGrantForReadScope(connection, scope);
     if (!grant) {
       return textResult(
         {

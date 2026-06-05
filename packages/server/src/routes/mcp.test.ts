@@ -708,6 +708,45 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     );
   });
 
+  it("read_scope lets wildcard grants reach the data API for top-level source reads", async () => {
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store, publicOrigin: SERVER_ORIGIN },
+    );
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "grant-mcp-1", scopes: ["instagram.*"] }],
+      },
+      { store },
+    );
+    const approved = (await store.getById(created.connectionId))!;
+    const readScope = vi.fn().mockResolvedValue({
+      status: 200,
+      body: { ok: true },
+    });
+    const tool = MCP_TOOLS.find((t) => t.name === "read_scope")!;
+
+    const result = await tool.handler(
+      { scope: "instagram" },
+      {
+        connection: approved,
+        readClient: {
+          listScopes: vi.fn(),
+          readScope,
+          previewScope: vi.fn(),
+        },
+      },
+    );
+
+    expect(result.isError).not.toBe(true);
+    expect(readScope).toHaveBeenCalledWith({
+      scope: "instagram",
+      grantId: "grant-mcp-1",
+      limit: undefined,
+    });
+  });
+
   it("search_personal_context expands wildcard scopes through the real read client", async () => {
     const created = await createMcpConnection(
       { displayName: "Claude" },
