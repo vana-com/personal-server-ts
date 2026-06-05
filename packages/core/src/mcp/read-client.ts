@@ -17,7 +17,6 @@
  */
 
 import type { ServerAccount } from "../keys/server-account.js";
-import type { ScopeSummary } from "../storage/index/types.js";
 import { signMcpGranteeRequest } from "./grantee.js";
 import {
   handlePersonalServerDataRequest,
@@ -25,17 +24,6 @@ import {
 } from "../api/index.js";
 
 export interface McpDataReadClient {
-  /**
-   * List concrete scopes currently stored on the Personal Server. Used by MCP
-   * search to expand wildcard grants before reading scope envelopes.
-   */
-  listScopes(params?: {
-    scopePrefix?: string;
-    grantId?: string;
-    limit?: number;
-    offset?: number;
-  }): Promise<McpDataListResult>;
-
   /**
    * Perform `GET /v1/data/:scope?grantId=…` as the connection grantee and
    * return the parsed response body. Throws `McpDataReadError` if the read
@@ -52,14 +40,6 @@ export interface McpDataReadClient {
 export interface McpDataReadResult {
   status: number;
   body: unknown;
-}
-
-export interface McpDataListResult {
-  status: number;
-  scopes: ScopeSummary[];
-  total: number;
-  limit: number;
-  offset: number;
 }
 
 export class McpDataReadError extends Error {
@@ -105,43 +85,6 @@ export function createMcpDataReadClient(
   const basePath = options.basePath ?? "/v1/data";
 
   return {
-    async listScopes({ scopePrefix, grantId, limit, offset } = {}) {
-      const params = new URLSearchParams();
-      if (scopePrefix) params.set("scopePrefix", scopePrefix);
-      if (limit !== undefined) params.set("limit", String(limit));
-      if (offset !== undefined) params.set("offset", String(offset));
-      const query = params.toString();
-      const pathWithQuery = query ? `${basePath}?${query}` : basePath;
-
-      const authorization = await signMcpGranteeRequest({
-        account: options.granteeAccount,
-        aud: options.serverOrigin,
-        method: "GET",
-        uri: basePath,
-        grantId: grantId ?? "mcp-list",
-      });
-
-      const url = new URL(pathWithQuery, options.serverOrigin).toString();
-      const request = new Request(url, {
-        method: "GET",
-        headers: { Authorization: authorization },
-      });
-
-      const response = await handlePersonalServerDataRequest(
-        request,
-        options.dataApiDeps,
-        { basePath },
-      );
-
-      const body = await parseJsonOrText(response);
-      if (!response.ok) {
-        throw new McpDataReadError(response.status, body);
-      }
-
-      const payload = normalizeListScopesPayload(body);
-      return { status: response.status, ...payload };
-    },
-
     async readScope({ scope, grantId, limit }) {
       const safeScope = encodeURIComponent(scope);
       const query = limit !== undefined ? `?limit=${limit}` : "";
@@ -170,7 +113,13 @@ export function createMcpDataReadClient(
         { basePath },
       );
 
-      const body = await parseJsonOrText(response);
+      const text = await response.text();
+      let body: unknown;
+      try {
+        body = text ? JSON.parse(text) : null;
+      } catch {
+        body = text;
+      }
 
       if (!response.ok) {
         throw new McpDataReadError(response.status, body);
@@ -179,52 +128,4 @@ export function createMcpDataReadClient(
       return { status: response.status, body };
     },
   };
-}
-
-async function parseJsonOrText(response: Response): Promise<unknown> {
-  const text = await response.text();
-  try {
-    return text ? JSON.parse(text) : null;
-  } catch {
-    return text;
-  }
-}
-
-function normalizeListScopesPayload(
-  body: unknown,
-): Omit<McpDataListResult, "status"> {
-  if (typeof body !== "object" || body === null) {
-    return { scopes: [], total: 0, limit: 0, offset: 0 };
-  }
-  const payload = body as {
-    scopes?: unknown;
-    total?: unknown;
-    limit?: unknown;
-    offset?: unknown;
-  };
-  const scopes = Array.isArray(payload.scopes)
-    ? payload.scopes.filter(isScopeSummary)
-    : [];
-  return {
-    scopes,
-    total: typeof payload.total === "number" ? payload.total : scopes.length,
-    limit: typeof payload.limit === "number" ? payload.limit : scopes.length,
-    offset: typeof payload.offset === "number" ? payload.offset : 0,
-  };
-}
-
-function isScopeSummary(value: unknown): value is ScopeSummary {
-  if (typeof value !== "object" || value === null) {
-    return false;
-  }
-  const summary = value as {
-    scope?: unknown;
-    latestCollectedAt?: unknown;
-    versionCount?: unknown;
-  };
-  return (
-    typeof summary.scope === "string" &&
-    typeof summary.latestCollectedAt === "string" &&
-    typeof summary.versionCount === "number"
-  );
 }
