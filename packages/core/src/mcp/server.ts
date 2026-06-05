@@ -28,8 +28,56 @@ export interface HandleMcpRequestOptions {
 
 const DEFAULT_SERVER_NAME = "vana-personal-server-mcp";
 const DEFAULT_SERVER_VERSION = "0.0.1";
+const DEFAULT_MCP_TOOL_TIMEOUT_MS = 30_000;
+const MAX_MCP_TOOL_TIMEOUT_MS = 90_000;
+const MCP_TOOL_TIMEOUT_GRACE_MS = 1_000;
 
 const QUERY_PREVIEW_CHARS = 120;
+
+class McpToolTimeoutError extends Error {
+  constructor(
+    public readonly tool: string,
+    public readonly timeoutMs: number,
+  ) {
+    super(`${tool} timed out after ${timeoutMs}ms`);
+    this.name = "McpToolTimeoutError";
+  }
+}
+
+function clampToolTimeout(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return DEFAULT_MCP_TOOL_TIMEOUT_MS;
+  }
+  return Math.min(MAX_MCP_TOOL_TIMEOUT_MS, Math.max(1000, Math.trunc(value)));
+}
+
+function toolTimeoutMs(tool: string, args: Record<string, unknown>): number {
+  if (tool === "read_scope" || tool === "search_personal_context") {
+    return clampToolTimeout(args.timeoutMs) + MCP_TOOL_TIMEOUT_GRACE_MS;
+  }
+  return DEFAULT_MCP_TOOL_TIMEOUT_MS;
+}
+
+async function withToolTimeout<T>(
+  promise: Promise<T>,
+  tool: string,
+  timeoutMs: number,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new McpToolTimeoutError(tool, timeoutMs)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
 
 function buildActivityStartParams(
   tool: string,
@@ -148,9 +196,11 @@ export function createMcpServerForConnection(
           ? recorder.start(buildActivityStartParams(tool.name, args))
           : undefined;
         try {
-          const result = await tool.handler(
-            args as Record<string, unknown>,
-            ctx,
+          const timeoutMs = toolTimeoutMs(tool.name, args);
+          const result = await withToolTimeout(
+            tool.handler(args as Record<string, unknown>, ctx),
+            tool.name,
+            timeoutMs,
           );
           if (activityId && recorder) {
             const payload = extractActivityFinishParams(tool.name, result);
@@ -161,6 +211,32 @@ export function createMcpServerForConnection(
           }
           return result;
         } catch (err) {
+          if (err instanceof McpToolTimeoutError) {
+            if (activityId && recorder) {
+              recorder.finish(activityId, {
+                status: "timed_out",
+                errorCode: "tool_timeout",
+                errorMessage: err.message,
+              });
+            }
+            return {
+              isError: true,
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(
+                    {
+                      error: "tool_timeout",
+                      message: err.message,
+                      timeoutMs: err.timeoutMs,
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            };
+          }
           if (activityId && recorder) {
             recorder.finish(activityId, {
               status: "failed",

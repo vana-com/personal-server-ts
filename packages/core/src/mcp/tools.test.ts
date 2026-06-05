@@ -77,6 +77,53 @@ describe("mcp/tools", () => {
     expect(new TextEncoder().encode(body).byteLength).toBeLessThan(3000);
   });
 
+  it("MCP HTTP dispatcher returns a typed timeout for stalled tool handlers", async () => {
+    const readClient = createMinimalReadClient({
+      readScopeBlocks: vi.fn(
+        () =>
+          new Promise(() => {
+            // Deliberately never resolves: proves the dispatcher backstop.
+          }),
+      ),
+    });
+
+    const started = Date.now();
+    const response = await handleMcpStreamableHttpRequest(
+      new Request("http://localhost/mcp/test-token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: {
+            name: "read_scope",
+            arguments: {
+              scope: "instagram.profile",
+              timeoutMs: 1000,
+            },
+          },
+        }),
+      }),
+      {
+        connection: createConnection(),
+        readClient: readClient as never,
+      },
+    );
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeLessThan(2500);
+    const body = await response.json();
+    const text = body.result.content[0].text;
+    expect(JSON.parse(text)).toMatchObject({
+      error: "scope_read_timeout",
+      timeoutMs: 1000,
+    });
+  });
+
   it("list_granted_sources derives sources from granted scopes", async () => {
     const result = await getTool("list_granted_sources").handler(
       {},
@@ -151,7 +198,43 @@ describe("mcp/tools", () => {
       scope: "instagram.profile",
       grantId: "grant-1",
       nextCursor: "cursor-2",
-      page: { cursor: "cursor-1", maxBytes: 4096, returnedBlocks: 1 },
+      page: {
+        cursor: "cursor-1",
+        maxBytes: 4096,
+        timeoutMs: 30_000,
+        returnedBlocks: 1,
+      },
+    });
+  });
+
+  it("read_scope returns a typed timeout instead of hanging on a stalled read", async () => {
+    const readClient = createMinimalReadClient({
+      readScopeBlocks: vi.fn(
+        () =>
+          new Promise(() => {
+            // Deliberately never resolves: models a degraded storage sidecar.
+          }),
+      ),
+    });
+
+    const started = Date.now();
+    const result = await getTool("read_scope").handler(
+      {
+        scope: "instagram.profile",
+        timeoutMs: 1000,
+      },
+      {
+        connection: createConnection(),
+        readClient: readClient as never,
+      },
+    );
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeLessThan(1800);
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      error: "scope_read_timeout",
+      timeoutMs: 1000,
     });
   });
 
@@ -219,6 +302,221 @@ describe("mcp/tools", () => {
     expect(payload.searchedScopes).toEqual(["instagram.profile"]);
     expect(payload.nextSearchCursor).toBeDefined();
     expect(payload.limits.requestedBytesPerPage).toBe(1024);
+  });
+
+  it("search_personal_context returns a per-scope timeout when a read never resolves", async () => {
+    const readClient = createMinimalReadClient({
+      readScopeBlocks: vi.fn(
+        () =>
+          new Promise(() => {
+            // Deliberately never resolves: models a sidecar request stuck
+            // between healthy and cleanly-unavailable states.
+          }),
+      ),
+    });
+
+    const started = Date.now();
+    const result = await getTool("search_personal_context").handler(
+      {
+        query: "design",
+        scopes: ["instagram.profile"],
+        timeoutMs: 1000,
+        maxScopes: 1,
+        maxResults: 5,
+        maxBytes: 1024,
+      },
+      {
+        connection: createConnection(),
+        readClient: readClient as never,
+      },
+    );
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeLessThan(1800);
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.results).toEqual([]);
+    expect(payload.errors).toEqual([
+      expect.objectContaining({
+        scope: "instagram.profile",
+        error: "scope_search_timeout",
+      }),
+    ]);
+  });
+
+  it("search_personal_context uses an indexed search hit without reading blocks", async () => {
+    const readScopeBlocks = vi.fn();
+    const searchScopeIndex = vi.fn().mockResolvedValue({
+      status: "hit",
+      hits: [
+        {
+          id: "hit-1",
+          scope: "instagram.profile",
+          preview: "indexed kiln result",
+          blockRef: "block-1",
+          score: 1.5,
+          terms: ["kiln"],
+        },
+      ],
+    });
+    const readClient = createMinimalReadClient({
+      readScopeBlocks,
+      searchScopeIndex,
+    });
+
+    const result = await getTool("search_personal_context").handler(
+      {
+        query: "kiln",
+        scopes: ["instagram.profile"],
+        maxScopes: 1,
+      },
+      {
+        connection: createConnection(),
+        readClient,
+      },
+    );
+
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.results).toEqual([
+      expect.objectContaining({
+        scope: "instagram.profile",
+        preview: "indexed kiln result",
+        blockRef: "block-1",
+        score: 1.5,
+        terms: ["kiln"],
+      }),
+    ]);
+    expect(searchScopeIndex).toHaveBeenCalledWith({
+      scope: "instagram.profile",
+      grantId: "grant-1",
+      query: "kiln",
+      maxResults: 5,
+    });
+    expect(readScopeBlocks).not.toHaveBeenCalled();
+  });
+
+  it("search_personal_context falls back to bounded blocks when an index is missing", async () => {
+    const readScopeBlocks = vi.fn().mockResolvedValue({
+      scope: "instagram.profile",
+      collectedAt: "2026-06-05T00:00:00Z",
+      contentKind: "json",
+      blocks: [
+        {
+          id: "b1",
+          path: "$.text",
+          mediaType: "text/plain",
+          value: "fallback indexed search result",
+          sizeBytes: 20,
+        },
+      ],
+      warnings: [],
+    });
+    const readClient = createMinimalReadClient({
+      readScopeBlocks,
+      searchScopeIndex: vi.fn().mockResolvedValue({ status: "missing" }),
+    });
+
+    const result = await getTool("search_personal_context").handler(
+      {
+        query: "fallback",
+        scopes: ["instagram.profile"],
+        maxScopes: 1,
+      },
+      {
+        connection: createConnection(),
+        readClient,
+      },
+    );
+
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.results[0]).toMatchObject({
+      scope: "instagram.profile",
+      preview: expect.stringContaining("fallback indexed search result"),
+    });
+    expect(readScopeBlocks).toHaveBeenCalledTimes(1);
+  });
+
+  it("search_personal_context skips index search when continuing a block cursor", async () => {
+    const readScopeBlocks = vi.fn().mockResolvedValue({
+      scope: "instagram.profile",
+      collectedAt: "2026-06-05T00:00:00Z",
+      contentKind: "json",
+      blocks: [
+        {
+          id: "b1",
+          path: "$.text",
+          mediaType: "text/plain",
+          value: "cursor continuation result",
+          sizeBytes: 20,
+        },
+      ],
+      warnings: [],
+    });
+    const readClient = createMinimalReadClient({
+      readScopeBlocks,
+      searchScopeIndex: vi.fn().mockResolvedValue({
+        status: "hit",
+        hits: [
+          {
+            id: "stale-hit",
+            scope: "instagram.profile",
+            preview: "should not use index",
+            score: 1,
+            terms: ["cursor"],
+          },
+        ],
+      }),
+    });
+
+    const firstResult = await getTool("search_personal_context").handler(
+      {
+        query: "missing",
+        scopes: ["instagram.profile"],
+        maxScopes: 1,
+        timeoutMs: 1000,
+      },
+      {
+        connection: createConnection(),
+        readClient: createMinimalReadClient({
+          readScopeBlocks: vi.fn().mockResolvedValue({
+            scope: "instagram.profile",
+            collectedAt: "2026-06-05T00:00:00Z",
+            contentKind: "json",
+            blocks: [
+              {
+                id: "b0",
+                path: "$.text",
+                mediaType: "text/plain",
+                value: "no match",
+                sizeBytes: 20,
+              },
+            ],
+            nextCursor: "next-block",
+            warnings: [],
+          }),
+        }) as never,
+      },
+    );
+    const cursor = JSON.parse(firstResult.content[0].text).nextSearchCursor;
+
+    const result = await getTool("search_personal_context").handler(
+      {
+        query: "cursor",
+        scopes: ["instagram.profile"],
+        cursor,
+        maxScopes: 1,
+      },
+      {
+        connection: createConnection(),
+        readClient,
+      },
+    );
+
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.results[0].preview).toContain("cursor continuation result");
+    expect(readClient.searchScopeIndex).not.toHaveBeenCalled();
+    expect(readScopeBlocks).toHaveBeenCalledWith(
+      expect.objectContaining({ cursor: "next-block" }),
+    );
   });
 
   it("search_personal_context respects global deadline and returns nextSearchCursor", async () => {
@@ -467,5 +765,41 @@ describe("mcp/tools", () => {
     expect(profile.dataStatus).toBe("indexing");
     expect(profile.searchRecommended).toBe(false);
     expect(profile.reason).toContain("indexing");
+  });
+
+  it("list_granted_scopes does not hang when scope metadata stalls", async () => {
+    const readClient = createMinimalReadClient({
+      getScopeMetadata: vi.fn(
+        () =>
+          new Promise(() => {
+            // Deliberately never resolves: metadata must be best-effort.
+          }),
+      ),
+    });
+
+    const started = Date.now();
+    const result = await getTool("list_granted_scopes").handler(
+      {},
+      {
+        connection: {
+          ...createConnection(),
+          grants: [
+            { grantId: "grant-indexing", scopes: ["instagram.profile"] },
+          ],
+        },
+        readClient: readClient as never,
+      },
+    );
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeLessThan(2800);
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.scopes).toEqual([
+      expect.objectContaining({
+        scope: "instagram.profile",
+        dataStatus: "indexing",
+        searchRecommended: false,
+      }),
+    ]);
   });
 });

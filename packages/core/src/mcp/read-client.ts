@@ -21,6 +21,7 @@
 import type { ServerAccount } from "../keys/server-account.js";
 import type { ScopeSummary } from "../storage/index/types.js";
 import type { ReadScopeBlocksResponse } from "../storage/blocks/types.js";
+import type { SearchHit } from "./search/index.js";
 import { decodeDataBlockCursor } from "../storage/blocks/index.js";
 import { signMcpGranteeRequest } from "./grantee.js";
 import {
@@ -68,6 +69,26 @@ export interface McpDataReadClient {
     cursor?: string;
     maxBytes?: number;
   }): Promise<McpDataReadBlocksResult>;
+
+  /**
+   * Optional indexed search path. Implementations may return `missing` while
+   * an index is absent/stale; callers must keep the bounded block read path as
+   * fallback so full data remains accessible.
+   */
+  searchScopeIndex?(params: {
+    scope: string;
+    grantId: string;
+    query: string;
+    maxResults: number;
+  }): Promise<
+    | {
+        status: "hit";
+        hits: SearchHit[];
+      }
+    | {
+        status: "missing";
+      }
+  >;
 }
 
 export interface McpDataListResult {

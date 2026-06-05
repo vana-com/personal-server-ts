@@ -15,6 +15,7 @@ import type { McpConnectionRecord } from "./types.js";
 import type { McpDataReadClient } from "./read-client.js";
 import { McpDataReadError } from "./read-client.js";
 import type { McpActivityRecorder } from "./activity.js";
+import { MiniSearchIndex, type SearchDocument } from "./search/index.js";
 
 export interface McpToolContext {
   connection: McpConnectionRecord;
@@ -111,8 +112,11 @@ const DEFAULT_SEARCH_DISCOVERY_TIMEOUT_MS = 2_000;
 const MAX_SEARCH_TOTAL_TIMEOUT_MS = 90_000;
 const DEFAULT_READ_SCOPE_MAX_BYTES = 16_384;
 const MAX_READ_SCOPE_MAX_BYTES = 65_536;
+const DEFAULT_READ_SCOPE_TIMEOUT_MS = 30_000;
+const MAX_READ_SCOPE_TIMEOUT_MS = 90_000;
 const DEFAULT_SEARCH_MAX_BYTES = 8_192;
 const MAX_SEARCH_MAX_BYTES = 32_768;
+const DEFAULT_SCOPE_METADATA_TIMEOUT_MS = 2_000;
 const SEARCH_MAX_PAGES_PER_SCOPE = 4;
 const SEARCH_QUERY_MAX_CHARS = 256;
 const SEARCH_SCOPE_MAX_CHARS = 128;
@@ -245,6 +249,27 @@ function blockPageSearchText(
     .join("\n\n");
 }
 
+function blockPageSearchDocuments(
+  scope: string,
+  blocks: Array<{ id: string; path: string; value: unknown }>,
+): { documents: SearchDocument[]; textById: Map<string, string> } {
+  const textById = new Map<string, string>();
+  const documents = blocks.map((block, index) => {
+    const id = `${scope}:${block.id || index}`;
+    const text = `${block.path}\n${collectSearchText(block.value)}`;
+    textById.set(id, text);
+    return {
+      id,
+      scope,
+      title: block.path,
+      text,
+      preview: text.slice(0, SEARCH_PREVIEW_CHARS),
+      blockRef: block.id,
+    };
+  });
+  return { documents, textById };
+}
+
 function previewMatch(text: string, matchIndex: number): string {
   const halfWindow = Math.floor(SEARCH_PREVIEW_CHARS / 2);
   const start = Math.max(0, matchIndex - halfWindow);
@@ -252,6 +277,15 @@ function previewMatch(text: string, matchIndex: number): string {
   const prefix = start > 0 ? "..." : "";
   const suffix = end < text.length ? "..." : "";
   return `${prefix}${text.slice(start, end)}${suffix}`;
+}
+
+function miniSearchMatchIndex(text: string, terms: readonly string[]): number {
+  const normalized = text.toLowerCase();
+  for (const term of terms) {
+    const index = normalized.indexOf(term.toLowerCase());
+    if (index >= 0) return index;
+  }
+  return 0;
 }
 
 async function withTimeout<T>(
@@ -495,10 +529,26 @@ const listGrantedScopes: McpToolDefinition = {
     const grantedScopes = uniqueScopes(connection);
     const scopeEntries = await Promise.all(
       grantedScopes.map(async (scope) => {
-        const meta =
-          typeof readClient.getScopeMetadata === "function"
-            ? await readClient.getScopeMetadata(scope)
-            : null;
+        let meta = null;
+        if (typeof readClient.getScopeMetadata === "function") {
+          try {
+            meta = await withTimeout(
+              readClient.getScopeMetadata(scope),
+              DEFAULT_SCOPE_METADATA_TIMEOUT_MS,
+              `scope metadata for ${scope}`,
+            );
+          } catch {
+            return {
+              scope,
+              source: scope.split(".")[0],
+              dataStatus: "indexing" as const,
+              sizeClass: "unknown" as SizeClass,
+              searchRecommended: false,
+              reason:
+                "scope metadata is still indexing or temporarily unavailable; retry shortly",
+            };
+          }
+        }
         if (!meta) {
           return {
             scope,
@@ -543,6 +593,13 @@ const readScope: McpToolDefinition = {
       .describe("Exact scope id, e.g. 'instagram.profile'."),
     cursor: z.string().min(1).optional(),
     maxBytes: z.number().int().min(1).max(MAX_READ_SCOPE_MAX_BYTES).optional(),
+    timeoutMs: z
+      .number()
+      .int()
+      .min(1000)
+      .max(MAX_READ_SCOPE_TIMEOUT_MS)
+      .optional()
+      .describe("Wall-clock read budget in ms. Capped at 90000 by the server."),
   },
   async handler(args, { connection, readClient }) {
     const scope = typeof args.scope === "string" ? args.scope : null;
@@ -574,13 +631,23 @@ const readScope: McpToolDefinition = {
             MAX_READ_SCOPE_MAX_BYTES,
           )
         : DEFAULT_READ_SCOPE_MAX_BYTES;
+    const timeoutMs = clampInteger(
+      args.timeoutMs,
+      DEFAULT_READ_SCOPE_TIMEOUT_MS,
+      1000,
+      MAX_READ_SCOPE_TIMEOUT_MS,
+    );
     try {
-      const result = await readClient.readScopeBlocks({
-        scope,
-        grantId: grant.grantId,
-        cursor,
-        maxBytes,
-      });
+      const result = await withTimeout(
+        readClient.readScopeBlocks({
+          scope,
+          grantId: grant.grantId,
+          cursor,
+          maxBytes,
+        }),
+        timeoutMs,
+        `read blocks for ${scope}`,
+      );
       return textResult({
         scope,
         grantId: grant.grantId,
@@ -592,10 +659,21 @@ const readScope: McpToolDefinition = {
         page: {
           cursor: cursor ?? null,
           maxBytes,
+          timeoutMs,
           returnedBlocks: result.blocks.length,
         },
       });
     } catch (err) {
+      if (err instanceof OperationTimeoutError) {
+        return textResult(
+          {
+            error: "scope_read_timeout",
+            message: err.message,
+            timeoutMs: err.timeoutMs,
+          },
+          true,
+        );
+      }
       if (err instanceof McpDataReadError) {
         if (err.status === 503) {
           return textResult(
@@ -757,7 +835,6 @@ const searchPersonalContext: McpToolDefinition = {
       totalTimeoutMs,
       DEFAULT_SEARCH_DISCOVERY_TIMEOUT_MS,
     );
-    const needle = query.toLowerCase();
 
     // Decode continuation cursor if provided
     const resumeCursor =
@@ -777,6 +854,9 @@ const searchPersonalContext: McpToolDefinition = {
       preview: string;
       searchedChars: number;
       truncated: boolean;
+      blockRef?: string;
+      score?: number;
+      terms?: string[];
     }> = [];
     const searchedScopes: string[] = [];
     const truncatedScopes: string[] = [];
@@ -805,6 +885,71 @@ const searchPersonalContext: McpToolDefinition = {
       }
       const grant = resolveGrantForScope(connection, scope);
       if (!grant) continue;
+
+      if (!resumeCursor && typeof readClient.searchScopeIndex === "function") {
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) {
+          nextSearchCursor = encodeSearchCursor({ scopeIndex });
+          errors.push({ scope, error: "search_total_timeout" });
+          break;
+        }
+        const remainingScopes = resolved.scopes.length - scopeIndex;
+        const perScopeTimeoutMs = Math.min(
+          Math.max(250, Math.floor(remainingMs / Math.max(1, remainingScopes))),
+          remainingMs,
+        );
+        try {
+          const indexed = await withTimeout(
+            readClient.searchScopeIndex({
+              scope,
+              grantId: grant.grantId,
+              query,
+              maxResults: limit - matches.length,
+            }),
+            perScopeTimeoutMs,
+            `search index for ${scope}`,
+          );
+          if (indexed.status === "hit") {
+            searchedScopes.push(scope);
+            for (const hit of indexed.hits) {
+              if (matches.length >= limit) break;
+              matches.push({
+                scope,
+                grantId: grant.grantId,
+                preview: hit.preview ?? hit.title ?? "",
+                searchedChars: 0,
+                truncated: false,
+                blockRef: hit.blockRef,
+                score: hit.score,
+                terms: hit.terms,
+              });
+            }
+            if (matches.length >= limit) {
+              const nextScopeIndex = scopeIndex + 1;
+              if (nextScopeIndex < resolved.scopes.length) {
+                nextSearchCursor = encodeSearchCursor({
+                  scopeIndex: nextScopeIndex,
+                });
+              }
+              break;
+            }
+            continue;
+          }
+        } catch (err) {
+          errors.push({
+            scope,
+            error:
+              err instanceof OperationTimeoutError
+                ? "scope_index_timeout"
+                : "scope_index_failed",
+            bodyPreview: stringifyPreview(
+              err instanceof OperationTimeoutError
+                ? err.message
+                : "unexpected scope index failure",
+            ),
+          });
+        }
+      }
 
       // Use block cursor from resume only for the first scope we process
       let cursor: string | undefined =
@@ -850,13 +995,25 @@ const searchPersonalContext: McpToolDefinition = {
             `read blocks for ${scope}`,
           );
           const pageText = blockPageSearchText(result.blocks);
-          const matchIndex = pageText.toLowerCase().indexOf(needle);
-          if (matchIndex >= 0 && matches.length < limit && !scopeHasMatch) {
+          const { documents, textById } = blockPageSearchDocuments(
+            scope,
+            result.blocks,
+          );
+          const pageHits =
+            documents.length > 0
+              ? MiniSearchIndex.build(documents).search({ query, limit: 1 })
+              : [];
+          const pageHit = pageHits[0];
+          if (pageHit && matches.length < limit && !scopeHasMatch) {
+            const hitText = textById.get(pageHit.id) ?? pageText;
             matches.push({
               scope,
               grantId: grant.grantId,
               collectedAt: result.collectedAt,
-              preview: previewMatch(pageText, matchIndex),
+              preview: previewMatch(
+                hitText,
+                miniSearchMatchIndex(hitText, pageHit.terms),
+              ),
               searchedChars: pageText.length,
               truncated: Boolean(result.nextCursor),
             });
