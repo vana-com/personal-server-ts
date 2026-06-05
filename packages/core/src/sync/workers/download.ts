@@ -9,6 +9,8 @@ import {
 import type { SyncCursor } from "../cursor.js";
 import type { Logger } from "../../logger/index.js";
 import type { DataStoragePort } from "../../ports/index.js";
+import { buildDataBlocks } from "../../storage/blocks/build.js";
+import { classifySyncFailure } from "../issues.js";
 
 export interface DownloadWorkerDeps {
   storage: DataStoragePort;
@@ -103,6 +105,7 @@ export async function downloadOne(
 
   // 7. Write to local storage via the runtime storage port
   const { relativePath, sizeBytes } = await storage.writeEnvelope(envelope);
+  await writeBlockSidecars(storage, envelope, logger, record, relativePath);
 
   // 8. Insert into local index (with fileId)
   await storage.insertEntry({
@@ -135,6 +138,7 @@ export async function downloadAll(
   deps: DownloadWorkerDeps,
 ): Promise<DownloadResult[]> {
   const { gateway, cursor, serverOwner, logger } = deps;
+  const syncRunId = createSyncRunId();
 
   // 1. Read cursor
   const lastProcessedTimestamp = await cursor.read();
@@ -170,6 +174,25 @@ export async function downloadAll(
         results.push(result);
       }
     } catch (err) {
+      const classified = classifySyncFailure({
+        error: err,
+        fileId: file.fileId,
+        schemaId: file.schemaId,
+        syncRunId,
+      });
+      if (!classified.issue.retryable) {
+        logger.warn(
+          {
+            fileId: file.fileId,
+            schemaId: file.schemaId,
+            stage: classified.issue.stage,
+            errorClass: classified.issue.errorClass,
+            message: classified.issue.message,
+          },
+          "Quarantined corrupt synced file",
+        );
+        continue;
+      }
       logger.error(
         {
           fileId: file.fileId,
@@ -195,8 +218,66 @@ export async function downloadAll(
   return results;
 }
 
+function createSyncRunId(): string {
+  return typeof crypto !== "undefined" &&
+    typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `download-${Date.now().toString(36)}`;
+}
+
 function uint8ToHex(bytes: Uint8Array): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
     "",
   );
+}
+
+async function writeBlockSidecars(
+  storage: DataStoragePort,
+  envelope: {
+    scope: string;
+    collectedAt: string;
+    data: unknown;
+    version?: string;
+  },
+  logger: Logger,
+  record: FileRecord,
+  relativePath: string,
+): Promise<void> {
+  if (!storage.writeBlockManifest) return;
+
+  try {
+    const built = buildDataBlocks({
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      schemaId: record.schemaId,
+      content: envelope,
+    });
+    await storage.writeBlockManifest(
+      envelope.scope,
+      envelope.collectedAt,
+      built.manifest,
+      built.blocks,
+    );
+  } catch (error) {
+    const classified = classifySyncFailure({
+      error,
+      fileId: record.fileId,
+      syncRunId: "download",
+      stage: "block_build",
+      schemaId: record.schemaId,
+      scope: envelope.scope,
+    });
+    logger.warn(
+      {
+        fileId: record.fileId,
+        scope: envelope.scope,
+        collectedAt: envelope.collectedAt,
+        path: relativePath,
+        stage: classified.issue.stage,
+        errorClass: classified.issue.errorClass,
+        message: classified.issue.message,
+      },
+      "Bounded block sidecar write failed after raw envelope write",
+    );
+  }
 }

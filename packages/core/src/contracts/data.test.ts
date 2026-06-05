@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { DataStoragePort } from "../ports/index.js";
 import type { IndexEntry } from "../storage/index/index.js";
@@ -77,6 +77,7 @@ function createMemoryStorage(): DataStoragePort {
         sizeBytes: JSON.stringify(envelope).length,
       };
     },
+    writeBlockManifest: vi.fn().mockResolvedValue(undefined),
     insertEntry(entry) {
       const indexed = {
         ...entry,
@@ -187,6 +188,41 @@ describe("data contract helpers", () => {
     await expect(
       deleteDataScopeContract({ storage, scopeParam: "instagram.profile" }),
     ).resolves.toEqual({ ok: true, deletedCount: 1 });
+  });
+
+  it("writes bounded block sidecars when supported and continues on sidecar failure", async () => {
+    const storage = createMemoryStorage();
+    const writeBlockManifest = storage.writeBlockManifest as ReturnType<
+      typeof vi.fn
+    >;
+    writeBlockManifest.mockRejectedValueOnce(new Error("sidecar write failed"));
+
+    const ingest = await ingestDataContract({
+      storage,
+      scopeParam: "instagram.profile",
+      body: { username: "test_user" },
+      collectedAt: "2026-05-08T00:00:00.000Z",
+      status: "stored",
+      schemaUrl: "https://schemas.example/instagram.profile.json",
+      schemaId: "schema-1",
+    });
+
+    expect(ingest).toMatchObject({ ok: true });
+    expect(writeBlockManifest).toHaveBeenCalledWith(
+      "instagram.profile",
+      "2026-05-08T00:00:00.000Z",
+      expect.objectContaining({
+        scope: "instagram.profile",
+        collectedAt: "2026-05-08T00:00:00.000Z",
+      }),
+      expect.any(Array),
+    );
+    expect(
+      storage.findEntry({
+        scope: "instagram.profile",
+        at: "2026-05-08T00:00:00.000Z",
+      }),
+    ).toBeDefined();
   });
 
   it("returns compatibility-shaped validation errors", async () => {
