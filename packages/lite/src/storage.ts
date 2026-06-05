@@ -347,8 +347,8 @@ export async function createPersistentPsLiteStorage(
     async readEnvelopePreview(scope, collectedAt, { maxBytes }) {
       const path = envelopePath(scope, collectedAt);
       const preview =
-        (await fileStore.readEnvelopePreview?.(path, { maxBytes })) ??
-        (await fallbackStore.readEnvelopePreview?.(path, { maxBytes }));
+        (await readPreviewFromFileStore(fileStore, path, maxBytes)) ??
+        (await readPreviewFromFileStore(fallbackStore, path, maxBytes));
       if (!preview) {
         throw new Error("Envelope not found");
       }
@@ -446,4 +446,16 @@ export async function createPersistentPsLiteStorage(
     },
   };
   return storagePort;
+}
+
+async function readPreviewFromFileStore(
+  store: PsLiteDataFileStore,
+  path: string,
+  maxBytes: number,
+): Promise<{ text: string; truncated: boolean } | null> {
+  const preview = await store.readEnvelopePreview?.(path, { maxBytes });
+  if (preview) return preview;
+
+  const envelope = await store.readEnvelope(path);
+  return envelope ? previewEnvelopeValue(envelope, maxBytes) : null;
 }

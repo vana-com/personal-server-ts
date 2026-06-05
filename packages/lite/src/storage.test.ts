@@ -4,7 +4,10 @@ import {
   createMemoryPsLiteDataFileStore,
   createMemoryPsLitePersistence,
 } from "./test-support/memory.js";
-import { createPersistentPsLiteStorage } from "./storage.js";
+import {
+  createPersistentPsLiteStorage,
+  type PsLiteDataFileStore,
+} from "./storage.js";
 import { previewEnvelopeValue } from "./storage-utils.js";
 
 describe("createPersistentPsLiteStorage", () => {
@@ -19,6 +22,52 @@ describe("createPersistentPsLiteStorage", () => {
 
     expect(preview.truncated).toBe(true);
     expect(preview.text.length).toBeLessThanOrEqual(100_000);
+  });
+
+  it("previews custom file stores that omit readEnvelopePreview", async () => {
+    const persistence = createMemoryPsLitePersistence();
+    const files = new Map<string, ReturnType<typeof createDataFileEnvelope>>();
+    const dataFileStore: PsLiteDataFileStore = {
+      kind: "opfs",
+      async readEnvelope(path) {
+        return files.get(path) ?? null;
+      },
+      async writeEnvelope(path, envelope) {
+        files.set(path, envelope);
+        return new TextEncoder().encode(JSON.stringify(envelope)).byteLength;
+      },
+      async deleteEnvelope(path) {
+        files.delete(path);
+      },
+    };
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      persistence,
+      dataFileStore,
+    );
+    const envelope = createDataFileEnvelope(
+      "notes.profile",
+      "2026-05-08T00:00:00.000Z",
+      { text: 'line one\nline "two" uses C:\\tmp' },
+    );
+
+    const write = await storage.writeEnvelope(envelope);
+    await storage.insertEntry({
+      fileId: "file-1",
+      path: write.relativePath,
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      sizeBytes: write.sizeBytes,
+    });
+
+    await expect(
+      storage.readEnvelopePreview?.(envelope.scope, envelope.collectedAt, {
+        maxBytes: 1_000,
+      }),
+    ).resolves.toMatchObject({
+      text: expect.stringContaining('line "two" uses C:\\tmp'),
+      truncated: false,
+    });
   });
 
   it("persists envelopes and index entries across storage reloads", async () => {
