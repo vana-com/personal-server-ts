@@ -22,6 +22,7 @@ import {
   type HierarchyManagerOptions,
   type WriteResult,
 } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
+import { previewJsonEnvelopePrefix } from "@opendatalabs/personal-server-ts-core/storage/preview";
 
 /** Atomic write: mkdir -p, write temp file, rename */
 export async function writeDataFile(
@@ -77,10 +78,11 @@ export async function readDataFilePreview(
     const bytesToRead = Math.max(0, Math.min(maxBytes, stats.size));
     const buffer = Buffer.alloc(bytesToRead);
     const { bytesRead } = await handle.read(buffer, 0, bytesToRead, 0);
-    return {
-      text: buffer.subarray(0, bytesRead).toString("utf-8"),
-      truncated: stats.size > bytesRead,
-    };
+    return previewJsonEnvelopePrefix(
+      buffer.subarray(0, bytesRead).toString("utf-8"),
+      maxBytes,
+      { sourceTruncated: stats.size > bytesRead },
+    );
   } finally {
     await handle.close();
   }

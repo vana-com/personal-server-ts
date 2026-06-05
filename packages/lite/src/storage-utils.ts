@@ -4,13 +4,12 @@ import type {
   DataStoragePort,
   DataStorageScopeListOptions,
 } from "@opendatalabs/personal-server-ts-core/ports";
-import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type {
   IndexEntry,
   ScopeSummary,
 } from "@opendatalabs/personal-server-ts-core/storage/index";
-
-const PREVIEW_NODE_BUDGET = 15_000;
+import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
+export { previewEnvelopeValue } from "@opendatalabs/personal-server-ts-core/storage/preview";
 
 export function sortEntries(entries: IndexEntry[]): IndexEntry[] {
   return [...entries].sort((a, b) =>
@@ -89,71 +88,6 @@ export function readEnvelopeFromMap(
     throw new Error("Envelope not found");
   }
   return envelope;
-}
-
-export function previewEnvelopeValue(
-  envelope: DataFileEnvelope,
-  maxBytes: number,
-): { text: string; truncated: boolean } {
-  const textBudget = Math.max(0, maxBytes);
-  const chunks: string[] = [];
-  const stack: unknown[] = [envelope];
-  let chars = 0;
-  let truncated = false;
-  let nodes = 0;
-
-  while (stack.length > 0) {
-    if (chars >= textBudget || nodes >= PREVIEW_NODE_BUDGET) {
-      truncated = true;
-      break;
-    }
-
-    const current = stack.pop();
-    nodes += 1;
-    if (typeof current === "string") {
-      const remaining = textBudget - chars;
-      chunks.push(current.slice(0, remaining));
-      chars += Math.min(current.length, remaining);
-      truncated = truncated || current.length > remaining;
-      continue;
-    }
-
-    if (
-      typeof current === "number" ||
-      typeof current === "boolean" ||
-      typeof current === "bigint"
-    ) {
-      const text = String(current);
-      const remaining = textBudget - chars;
-      chunks.push(text.slice(0, remaining));
-      chars += Math.min(text.length, remaining);
-      truncated = truncated || text.length > remaining;
-      continue;
-    }
-
-    if (Array.isArray(current)) {
-      for (let index = current.length - 1; index >= 0; index -= 1) {
-        stack.push(current[index]);
-      }
-      continue;
-    }
-
-    if (typeof current === "object" && current !== null) {
-      const entries = Object.entries(current as Record<string, unknown>);
-      for (let index = entries.length - 1; index >= 0; index -= 1) {
-        const [key, value] = entries[index]!;
-        stack.push(value);
-        stack.push(key);
-      }
-    }
-  }
-
-  const encoded = new TextEncoder().encode(chunks.join("\n"));
-  const clipped = encoded.slice(0, maxBytes);
-  return {
-    text: new TextDecoder().decode(clipped),
-    truncated: truncated || encoded.length > maxBytes,
-  };
 }
 
 function summarizeScopes(

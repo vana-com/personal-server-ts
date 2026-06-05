@@ -60,6 +60,10 @@
       "types": "./dist/storage/index/index.d.ts",
       "import": "./dist/storage/index/index.js"
     },
+    "./storage/preview": {
+      "types": "./dist/storage/preview.d.ts",
+      "import": "./dist/storage/preview.js"
+    },
     "./grants": {
       "types": "./dist/grants/index.d.ts",
       "import": "./dist/grants/index.js"

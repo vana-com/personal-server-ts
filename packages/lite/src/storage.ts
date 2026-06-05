@@ -3,11 +3,11 @@ import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { WriteResult } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { PsLiteStorageAdapter } from "./runtime.js";
+import { createStorageReadMethods, sortEntries } from "./storage-utils.js";
 import {
-  createStorageReadMethods,
   previewEnvelopeValue,
-  sortEntries,
-} from "./storage-utils.js";
+  previewJsonEnvelopePrefix,
+} from "@opendatalabs/personal-server-ts-core/storage/preview";
 
 export interface PsLitePersistedStorageState {
   version: 1;
@@ -159,10 +159,13 @@ export async function createOpfsPsLiteDataFileStore(): Promise<PsLiteDataFileSto
       try {
         const handle = await getOpfsFileHandle(root, path);
         const file = await handle.getFile();
-        return {
-          text: await file.slice(0, maxBytes).text(),
-          truncated: file.size > maxBytes,
-        };
+        return previewJsonEnvelopePrefix(
+          await file.slice(0, maxBytes).text(),
+          maxBytes,
+          {
+            sourceTruncated: file.size > maxBytes,
+          },
+        );
       } catch (err) {
         if (err instanceof DOMException && err.name === "NotFoundError") {
           return null;

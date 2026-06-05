@@ -845,9 +845,10 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     expect(payload.matches).toEqual([
       expect.objectContaining({
         scope: "chatgpt.conversations",
-        searchedChars: 100_000,
       }),
     ]);
+    expect(payload.matches[0]!.searchedChars).toBeLessThanOrEqual(100_000);
+    expect(payload.matches[0]!.searchedChars).toBeGreaterThan(90_000);
     expect(payload.truncatedScopes).toEqual(["chatgpt.conversations"]);
     expect(fullRead).not.toHaveBeenCalled();
     expect(accessLogWriter.entries).toContainEqual(
@@ -858,6 +859,69 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
         scope: "chatgpt.conversations",
       }),
     );
+  });
+
+  it("search_personal_context searches decoded escaped text through server storage previews", async () => {
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store, publicOrigin: SERVER_ORIGIN },
+    );
+    const record = (await store.getById(created.connectionId))!;
+    const { gateway } = makeGatewayForGrantee({
+      granteeAddress: record.granteeAddress,
+      grantId: "grant-mcp-1",
+      scopes: ["notes.profile"],
+    });
+    const accessLogWriter = createMockAccessLogWriter();
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "grant-mcp-1", scopes: ["notes.profile"] }],
+      },
+      { store },
+    );
+
+    await ingestScope({
+      scope: "notes.profile",
+      data: {
+        text: 'line one\nline "two" uses C:\\tmp',
+      },
+      indexManager,
+      hierarchyOptions,
+      gateway,
+      accessLogWriter,
+    });
+
+    const approved = (await store.getById(created.connectionId))!;
+    const dataApiDeps = buildDataApiDeps(gateway, accessLogWriter);
+    const readClient = createMcpDataReadClient({
+      serverOrigin: SERVER_ORIGIN,
+      granteeAccount: loadMcpGranteeAccount({
+        address: approved.granteeAddress,
+        publicKey: approved.granteePublicKey,
+        encryptedPrivateKey: approved.encryptedGranteePrivateKey,
+      }),
+      dataApiDeps,
+    });
+    const tool = MCP_TOOLS.find((t) => t.name === "search_personal_context")!;
+
+    const result = await tool.handler(
+      { query: 'one\nline "two" uses C:\\tmp', scopes: ["notes.profile"] },
+      { connection: approved, readClient },
+    );
+
+    expect(result.isError).not.toBe(true);
+    const payload = JSON.parse(result.content[0].text) as {
+      matches: Array<{ scope: string; preview: string }>;
+      errors: unknown[];
+    };
+    expect(payload.errors).toEqual([]);
+    expect(payload.matches).toEqual([
+      expect.objectContaining({
+        scope: "notes.profile",
+        preview: expect.stringContaining('line "two" uses C:\\tmp'),
+      }),
+    ]);
   });
 
   it("search_personal_context hides unexpected preview storage errors", async () => {

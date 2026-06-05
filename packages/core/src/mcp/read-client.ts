@@ -26,6 +26,7 @@ import {
   type PersonalServerDataApiDeps,
 } from "../api/index.js";
 import { ProtocolError } from "../errors/catalog.js";
+import { previewEnvelopeValue } from "../storage/preview.js";
 
 export interface McpDataReadClient {
   /**
@@ -316,12 +317,7 @@ async function readStoragePreview(
   }
 
   const envelope = await storage.readEnvelope(entry.scope, entry.collectedAt);
-  const text = JSON.stringify(envelope);
-  const encoded = new TextEncoder().encode(text);
-  return {
-    text: new TextDecoder().decode(encoded.slice(0, maxBytes)),
-    truncated: encoded.byteLength > maxBytes,
-  };
+  return previewEnvelopeValue(envelope, maxBytes);
 }
 
 async function parseJsonOrText(response: Response): Promise<unknown> {
