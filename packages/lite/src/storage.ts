@@ -1,15 +1,36 @@
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
+import type {
+  DataBlockManifest,
+  DataScopeBlock,
+} from "@opendatalabs/personal-server-ts-core/storage/blocks";
+import {
+  DataBlockStorageError,
+  encodeDataBlockCursor,
+  validateDataBlockCursor,
+} from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { WriteResult } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { PsLiteStorageAdapter } from "./runtime.js";
 import { createStorageReadMethods, sortEntries } from "./storage-utils.js";
+import {
+  previewEnvelopeValue,
+  previewJsonEnvelopePrefix,
+} from "@opendatalabs/personal-server-ts-core/storage/preview";
 
 export interface PsLitePersistedStorageState {
   version: 1;
   nextId: number;
   entries: IndexEntry[];
   envelopes: DataFileEnvelope[];
+  blockManifests?: Array<{
+    path: string;
+    manifest: DataBlockManifest;
+  }>;
+  blockPayloads?: Array<{
+    path: string;
+    block: DataScopeBlock;
+  }>;
 }
 
 export type PsLiteFileStorageKind = "opfs" | "indexeddb";
@@ -17,8 +38,17 @@ export type PsLiteFileStorageKind = "opfs" | "indexeddb";
 export interface PsLiteDataFileStore {
   readonly kind: PsLiteFileStorageKind;
   readEnvelope(path: string): Promise<DataFileEnvelope | null>;
+  readEnvelopePreview?(
+    path: string,
+    options: { maxBytes: number },
+  ): Promise<{ text: string; truncated: boolean } | null>;
   writeEnvelope(path: string, envelope: DataFileEnvelope): Promise<number>;
   deleteEnvelope(path: string): Promise<void>;
+  readBlockManifest?(path: string): Promise<DataBlockManifest | null>;
+  writeBlockManifest?(path: string, manifest: DataBlockManifest): Promise<void>;
+  readBlockPayload?(path: string): Promise<DataScopeBlock | null>;
+  writeBlockPayload?(path: string, block: DataScopeBlock): Promise<void>;
+  deleteBlockTree?(pathPrefix: string): Promise<void>;
 }
 
 export interface PsLiteStorageCapabilities {
@@ -55,6 +85,22 @@ function envelopePath(scope: string, collectedAt: string): string {
   return `data/${scope}/${collectedAt}.json`;
 }
 
+function blockTreePath(scope: string, collectedAt: string): string {
+  return `blocks/${scope}/${collectedAt}`;
+}
+
+function blockManifestPath(scope: string, collectedAt: string): string {
+  return `${blockTreePath(scope, collectedAt)}/manifest.json`;
+}
+
+function blockPayloadPath(
+  scope: string,
+  collectedAt: string,
+  blockId: string,
+): string {
+  return `${blockTreePath(scope, collectedAt)}/${encodeURIComponent(blockId)}.json`;
+}
+
 function normalizeState(
   state: PsLitePersistedStorageState | null,
 ): PsLitePersistedStorageState {
@@ -69,16 +115,25 @@ function normalizeState(
       schemaId: entry.schemaId ?? null,
     })),
     envelopes: state.envelopes,
+    blockManifests: state.blockManifests ?? [],
+    blockPayloads: state.blockPayloads ?? [],
   };
 }
 
 export function createIndexedDbFallbackDataFileStore(
   envelopes: Map<string, DataFileEnvelope>,
+  blockManifests: Map<string, DataBlockManifest> = new Map(),
+  blockPayloads: Map<string, DataScopeBlock> = new Map(),
 ): PsLiteDataFileStore {
   return {
     kind: "indexeddb",
     async readEnvelope(path) {
       return envelopes.get(path) ?? null;
+    },
+    async readEnvelopePreview(path, { maxBytes }) {
+      const envelope = envelopes.get(path);
+      if (!envelope) return null;
+      return previewEnvelopeValue(envelope, maxBytes);
     },
     async writeEnvelope(path, envelope) {
       envelopes.set(path, envelope);
@@ -87,7 +142,32 @@ export function createIndexedDbFallbackDataFileStore(
     async deleteEnvelope(path) {
       envelopes.delete(path);
     },
+    async readBlockManifest(path) {
+      return blockManifests.get(path) ?? null;
+    },
+    async writeBlockManifest(path, manifest) {
+      blockManifests.set(path, manifest);
+    },
+    async readBlockPayload(path) {
+      return blockPayloads.get(path) ?? null;
+    },
+    async writeBlockPayload(path, block) {
+      blockPayloads.set(path, block);
+    },
+    async deleteBlockTree(pathPrefix) {
+      deleteMapPrefix(blockManifests, pathPrefix);
+      deleteMapPrefix(blockPayloads, pathPrefix);
+    },
   };
+}
+
+function deleteMapPrefix<T>(map: Map<string, T>, pathPrefix: string): void {
+  const prefix = pathPrefix.endsWith("/") ? pathPrefix : `${pathPrefix}/`;
+  for (const path of map.keys()) {
+    if (path === pathPrefix || path.startsWith(prefix)) {
+      map.delete(path);
+    }
+  }
 }
 
 async function getOrCreateOpfsDirectory(
@@ -142,6 +222,24 @@ export async function createOpfsPsLiteDataFileStore(): Promise<PsLiteDataFileSto
         throw err;
       }
     },
+    async readEnvelopePreview(path, { maxBytes }) {
+      try {
+        const handle = await getOpfsFileHandle(root, path);
+        const file = await handle.getFile();
+        return previewJsonEnvelopePrefix(
+          await file.slice(0, maxBytes).text(),
+          maxBytes,
+          {
+            sourceTruncated: file.size > maxBytes,
+          },
+        );
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "NotFoundError") {
+          return null;
+        }
+        throw err;
+      }
+    },
     async writeEnvelope(path, envelope) {
       const encoded = JSON.stringify(envelope);
       const handle = await getOpfsFileHandle(root, path, { create: true });
@@ -164,7 +262,67 @@ export async function createOpfsPsLiteDataFileStore(): Promise<PsLiteDataFileSto
         throw err;
       }
     },
+    async readBlockManifest(path) {
+      return readJsonOpfsFile<DataBlockManifest>(root, path);
+    },
+    async writeBlockManifest(path, manifest) {
+      await writeJsonOpfsFile(root, path, manifest);
+    },
+    async readBlockPayload(path) {
+      return readJsonOpfsFile<DataScopeBlock>(root, path);
+    },
+    async writeBlockPayload(path, block) {
+      await writeJsonOpfsFile(root, path, block);
+    },
+    async deleteBlockTree(pathPrefix) {
+      await removeOpfsDirectoryTree(root, pathPrefix);
+    },
   };
+}
+
+async function readJsonOpfsFile<T>(
+  root: FileSystemDirectoryHandle,
+  path: string,
+): Promise<T | null> {
+  try {
+    const handle = await getOpfsFileHandle(root, path);
+    const file = await handle.getFile();
+    return JSON.parse(await file.text()) as T;
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "NotFoundError") {
+      return null;
+    }
+    throw err;
+  }
+}
+
+async function writeJsonOpfsFile(
+  root: FileSystemDirectoryHandle,
+  path: string,
+  value: unknown,
+): Promise<void> {
+  const handle = await getOpfsFileHandle(root, path, { create: true });
+  const writable = await handle.createWritable();
+  await writable.write(JSON.stringify(value));
+  await writable.close();
+}
+
+async function removeOpfsDirectoryTree(
+  root: FileSystemDirectoryHandle,
+  pathPrefix: string,
+): Promise<void> {
+  const parts = pathPrefix.split("/").filter(Boolean);
+  const directoryName = parts.pop();
+  if (!directoryName) return;
+  try {
+    const parent = await getOrCreateOpfsDirectory(root, parts);
+    await parent.removeEntry(directoryName, { recursive: true });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "NotFoundError") {
+      return;
+    }
+    throw err;
+  }
 }
 
 function openIndexedDb(
@@ -251,7 +409,17 @@ export async function createPersistentPsLiteStorage(
       envelope,
     ]),
   );
-  const fallbackStore = createIndexedDbFallbackDataFileStore(fallbackEnvelopes);
+  const fallbackBlockManifests = new Map(
+    (state.blockManifests ?? []).map(({ path, manifest }) => [path, manifest]),
+  );
+  const fallbackBlockPayloads = new Map(
+    (state.blockPayloads ?? []).map(({ path, block }) => [path, block]),
+  );
+  const fallbackStore = createIndexedDbFallbackDataFileStore(
+    fallbackEnvelopes,
+    fallbackBlockManifests,
+    fallbackBlockPayloads,
+  );
   const fileStore =
     dataFileStore ??
     (adapter.kind !== "custom" && (await isOpfsAvailable())
@@ -271,6 +439,18 @@ export async function createPersistentPsLiteStorage(
       envelopes:
         fileStore.kind === "indexeddb"
           ? Array.from(fallbackEnvelopes.values())
+          : [],
+      blockManifests:
+        fileStore.kind === "indexeddb"
+          ? Array.from(fallbackBlockManifests.entries()).map(
+              ([path, manifest]) => ({ path, manifest }),
+            )
+          : [],
+      blockPayloads:
+        fileStore.kind === "indexeddb"
+          ? Array.from(fallbackBlockPayloads.entries()).map(
+              ([path, block]) => ({ path, block }),
+            )
           : [],
     };
     const write = persistQueue.then(() => persistence.write(snapshot));
@@ -327,6 +507,102 @@ export async function createPersistentPsLiteStorage(
       };
     },
 
+    async readScopeBlocks(scope, collectedAt, options) {
+      const manifestPath = blockManifestPath(scope, collectedAt);
+      const manifest =
+        (await fileStore.readBlockManifest?.(manifestPath)) ??
+        (fileStore === fallbackStore
+          ? null
+          : await fallbackStore.readBlockManifest?.(manifestPath)) ??
+        null;
+      if (!manifest) {
+        throw new DataBlockStorageError(
+          "block_manifest_not_found",
+          `Block manifest not found for ${scope} at ${collectedAt}`,
+        );
+      }
+
+      const cursorResult = options.cursor
+        ? validateDataBlockCursor(options.cursor, { scope, collectedAt })
+        : { ok: true as const, cursor: null };
+      if (!cursorResult.ok) {
+        throw new DataBlockStorageError(
+          "cursor_invalid",
+          cursorResult.error.message,
+        );
+      }
+
+      const maxBytes = Math.max(1, options.maxBytes);
+      const startIndex = cursorResult.cursor?.blockIndex ?? 0;
+      const blocks: DataScopeBlock[] = [];
+      let bytes = 0;
+
+      for (let index = startIndex; index < manifest.blocks.length; index += 1) {
+        const ref = manifest.blocks[index];
+        if (!ref) continue;
+        if (blocks.length > 0 && bytes + ref.sizeBytes > maxBytes) {
+          break;
+        }
+        const block = await readBlockPayloadFromStores(
+          fileStore,
+          fallbackStore,
+          blockPayloadPath(scope, collectedAt, ref.id),
+        );
+        if (!block) {
+          throw new DataBlockStorageError(
+            "block_payload_not_found",
+            `Block payload not found for ${scope} at ${collectedAt}: ${ref.id}`,
+          );
+        }
+        blocks.push(block);
+        bytes += ref.sizeBytes;
+      }
+
+      const nextIndex = startIndex + blocks.length;
+      return {
+        scope: manifest.scope,
+        collectedAt: manifest.collectedAt,
+        ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
+        contentKind: manifest.contentKind,
+        blocks,
+        ...(nextIndex < manifest.blocks.length
+          ? {
+              nextCursor: encodeDataBlockCursor({
+                scope,
+                collectedAt,
+                blockIndex: nextIndex,
+              }),
+            }
+          : {}),
+        warnings: manifest.warnings,
+      };
+    },
+
+    async writeBlockManifest(scope, collectedAt, manifest, blocks) {
+      if (!fileStore.writeBlockManifest || !fileStore.writeBlockPayload) {
+        throw new Error("Block sidecar storage is not available");
+      }
+      await fileStore.deleteBlockTree?.(blockTreePath(scope, collectedAt));
+      await Promise.all(
+        blocks.map((block) =>
+          fileStore.writeBlockPayload!(
+            blockPayloadPath(scope, collectedAt, block.id),
+            block,
+          ),
+        ),
+      );
+      await fileStore.writeBlockManifest(
+        blockManifestPath(scope, collectedAt),
+        manifest,
+      );
+      if (fileStore.kind !== "indexeddb") {
+        await fallbackStore.deleteBlockTree?.(
+          blockTreePath(scope, collectedAt),
+        );
+      }
+      await persist();
+    },
+
     async insertEntry(entry) {
       const indexed: IndexEntry = {
         ...entry,
@@ -365,20 +641,28 @@ export async function createPersistentPsLiteStorage(
     async deleteScope(scope) {
       let deleted = 0;
       const deletedPaths: string[] = [];
+      const deletedBlockTrees: string[] = [];
       state = {
         ...state,
         entries: state.entries.filter((entry) => {
           if (entry.scope !== scope) return true;
           deleted += 1;
           deletedPaths.push(envelopePath(entry.scope, entry.collectedAt));
+          deletedBlockTrees.push(blockTreePath(entry.scope, entry.collectedAt));
           return false;
         }),
       };
       await Promise.all(
-        deletedPaths.flatMap((path) => [
-          fileStore.deleteEnvelope(path),
-          fallbackStore.deleteEnvelope(path),
-        ]),
+        [
+          ...deletedPaths.flatMap((path) => [
+            fileStore.deleteEnvelope(path),
+            fallbackStore.deleteEnvelope(path),
+          ]),
+          ...deletedBlockTrees.flatMap((path) => [
+            fileStore.deleteBlockTree?.(path),
+            fallbackStore.deleteBlockTree?.(path),
+          ]),
+        ].filter((promise): promise is Promise<void> => promise !== undefined),
       );
       await persist();
       return deleted;
@@ -394,6 +678,12 @@ export async function createPersistentPsLiteStorage(
       await Promise.all([
         fileStore.deleteEnvelope(blobPath),
         fallbackStore.deleteEnvelope(blobPath),
+        fileStore.deleteBlockTree?.(
+          blockTreePath(entry.scope, entry.collectedAt),
+        ) ?? Promise.resolve(),
+        fallbackStore.deleteBlockTree?.(
+          blockTreePath(entry.scope, entry.collectedAt),
+        ) ?? Promise.resolve(),
       ]);
       state = {
         ...state,
@@ -403,5 +693,50 @@ export async function createPersistentPsLiteStorage(
       return true;
     },
   };
+
+  if (fileStore.readEnvelopePreview) {
+    storagePort.readEnvelopePreview = async (
+      scope,
+      collectedAt,
+      { maxBytes },
+    ) => {
+      const path = envelopePath(scope, collectedAt);
+      const primaryPreview = await readPreviewFromFileStore(
+        fileStore,
+        path,
+        maxBytes,
+      );
+      const preview =
+        primaryPreview ??
+        (fileStore === fallbackStore
+          ? null
+          : await readPreviewFromFileStore(fallbackStore, path, maxBytes));
+      if (!preview) {
+        throw new Error("Envelope not found");
+      }
+      return preview;
+    };
+  }
+
   return storagePort;
+}
+
+async function readPreviewFromFileStore(
+  store: PsLiteDataFileStore,
+  path: string,
+  maxBytes: number,
+): Promise<{ text: string; truncated: boolean } | null> {
+  return (await store.readEnvelopePreview?.(path, { maxBytes })) ?? null;
+}
+
+async function readBlockPayloadFromStores(
+  primary: PsLiteDataFileStore,
+  fallback: PsLiteDataFileStore,
+  path: string,
+): Promise<DataScopeBlock | null> {
+  return (
+    (await primary.readBlockPayload?.(path)) ??
+    (primary === fallback ? null : await fallback.readBlockPayload?.(path)) ??
+    null
+  );
 }
