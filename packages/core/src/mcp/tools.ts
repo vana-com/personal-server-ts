@@ -30,6 +30,7 @@ export interface McpToolResultContent {
 export interface McpToolResult {
   content: McpToolResultContent[];
   isError?: boolean;
+  structuredContent?: Record<string, unknown>;
   // MCP SDK types include an `[x: string]: unknown` index signature for
   // optional metadata; keep ours wide enough to satisfy it.
   [key: string]: unknown;
@@ -53,6 +54,13 @@ export interface McpToolDefinition {
 }
 
 function textResult(value: unknown, isError = false): McpToolResult {
+  const structuredContent =
+    !isError &&
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : undefined;
   return {
     content: [
       {
@@ -61,6 +69,7 @@ function textResult(value: unknown, isError = false): McpToolResult {
           typeof value === "string" ? value : JSON.stringify(value, null, 2),
       },
     ],
+    ...(structuredContent ? { structuredContent } : {}),
     ...(isError ? { isError: true } : {}),
   };
 }
@@ -323,7 +332,8 @@ function isSearchRecommended(
   if (!hasBlocks) {
     return {
       recommended: false,
-      reason: "bounded block reads unavailable for this scope",
+      reason:
+        "bounded block data is still indexing or unavailable; retry shortly",
     };
   }
   if (sizeClass === "large" || sizeClass === "huge") {
@@ -483,38 +493,40 @@ const listGrantedScopes: McpToolDefinition = {
   inputSchema: {},
   async handler(_args, { connection, readClient }) {
     const grantedScopes = uniqueScopes(connection);
-    const scopeEntries = grantedScopes.map((scope) => {
-      const meta =
-        typeof readClient.getScopeMetadata === "function"
-          ? readClient.getScopeMetadata(scope)
-          : null;
-      if (!meta) {
+    const scopeEntries = await Promise.all(
+      grantedScopes.map(async (scope) => {
+        const meta =
+          typeof readClient.getScopeMetadata === "function"
+            ? await readClient.getScopeMetadata(scope)
+            : null;
+        if (!meta) {
+          return {
+            scope,
+            dataStatus: "needs_refresh" as const,
+            sizeClass: "unknown" as SizeClass,
+            searchRecommended: false,
+            reason: "no local data found; refresh your data connection",
+          };
+        }
+        const sizeClass = classifySizeBytes(meta.sizeBytes);
+        const { recommended, reason } = isSearchRecommended(
+          sizeClass,
+          meta.hasBlocks,
+        );
         return {
           scope,
-          dataStatus: "needs_refresh" as const,
-          sizeClass: "unknown" as SizeClass,
-          searchRecommended: false,
-          reason: "no local data found; refresh your data connection",
+          source: scope.split(".")[0],
+          collectedAt: meta.collectedAt,
+          dataStatus: meta.hasBlocks
+            ? ("ready" as const)
+            : ("indexing" as const),
+          sizeBytes: meta.sizeBytes,
+          sizeClass,
+          searchRecommended: recommended,
+          ...(reason ? { reason } : {}),
         };
-      }
-      const sizeClass = classifySizeBytes(meta.sizeBytes);
-      const { recommended, reason } = isSearchRecommended(
-        sizeClass,
-        meta.hasBlocks,
-      );
-      return {
-        scope,
-        source: scope.split(".")[0],
-        collectedAt: meta.collectedAt,
-        dataStatus: meta.hasBlocks
-          ? ("ready" as const)
-          : ("needs_refresh" as const),
-        sizeBytes: meta.sizeBytes,
-        sizeClass,
-        searchRecommended: recommended,
-        ...(reason ? { reason } : {}),
-      };
-    });
+      }),
+    );
     return textResult({ scopes: scopeEntries });
   },
 };

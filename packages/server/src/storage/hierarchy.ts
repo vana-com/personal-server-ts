@@ -1,4 +1,5 @@
 import {
+  access,
   mkdir,
   open,
   readFile,
@@ -187,6 +188,22 @@ export async function readScopeBlocks(
       : {}),
     warnings: manifest.warnings,
   };
+}
+
+export async function hasScopeBlocks(
+  options: HierarchyManagerOptions,
+  scope: string,
+  collectedAt: string,
+): Promise<boolean> {
+  try {
+    await access(buildBlockManifestPath(options.dataDir, scope, collectedAt));
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return false;
+    }
+    throw err;
+  }
 }
 
 /** List version filenames for a scope, newest first. Empty array if scope dir doesn't exist. */

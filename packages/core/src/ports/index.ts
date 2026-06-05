@@ -94,6 +94,10 @@ export interface DataStoragePort extends RuntimeStoragePort {
     collectedAt: string,
     options: { cursor?: string; maxBytes: number },
   ): Promise<ReadScopeBlocksResponse>;
+  hasScopeBlocks?(
+    scope: string,
+    collectedAt: string,
+  ): boolean | Promise<boolean>;
   writeEnvelope(envelope: DataFileEnvelope): Promise<WriteResult>;
   writeBlockManifest?(
     scope: string,

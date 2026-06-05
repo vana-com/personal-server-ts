@@ -14,6 +14,56 @@ function createAccount() {
 }
 
 describe("mcp/read-client", () => {
+  it("reports metadata as block-ready only when the manifest exists", async () => {
+    const hasScopeBlocks = vi.fn().mockResolvedValue(false);
+    const client = createMcpDataReadClient({
+      serverOrigin: SERVER_ORIGIN,
+      granteeAccount: createAccount(),
+      dataApiDeps: {
+        storage: {
+          kind: "custom",
+          listScopes: () => ({ scopes: [], total: 0 }),
+          listVersions: vi.fn(),
+          countVersions: vi.fn(),
+          findEntry: () =>
+            ({
+              scope: "instagram.profile",
+              collectedAt: "2026-06-05T00:00:00Z",
+              fileId: "file-1",
+              sizeBytes: 10,
+            }) as never,
+          findByFileId: vi.fn(),
+          findUnsynced: vi.fn(),
+          readEnvelope: vi.fn(),
+          readScopeBlocks: vi.fn(),
+          hasScopeBlocks,
+          writeEnvelope: vi.fn(),
+          insertEntry: vi.fn(),
+          updateFileId: vi.fn(),
+          deleteScope: vi.fn(),
+          deleteByFileId: vi.fn(),
+        },
+        auth: {
+          authorizeOwner: vi.fn(),
+          authorizeBuilderList: vi.fn(),
+          authorizeBuilderRead: vi.fn(),
+        },
+        accessLogWriter: { write: vi.fn() },
+      },
+    });
+
+    await expect(
+      client.getScopeMetadata("instagram.profile"),
+    ).resolves.toMatchObject({
+      scope: "instagram.profile",
+      hasBlocks: false,
+    });
+    expect(hasScopeBlocks).toHaveBeenCalledWith(
+      "instagram.profile",
+      "2026-06-05T00:00:00Z",
+    );
+  });
+
   it("returns a typed unavailable error when bounded scope data is missing", async () => {
     const readEnvelope = vi.fn();
     const client = createMcpDataReadClient({
