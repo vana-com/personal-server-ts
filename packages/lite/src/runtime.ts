@@ -48,6 +48,21 @@ import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logg
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
+import {
+  approveMcpConnection,
+  createMcpConnection,
+  createMcpDataReadClient,
+  handleMcpStreamableHttpRequest,
+  hashConnectionToken,
+  listMcpConnectionViews,
+  loadMcpGranteeAccount,
+  McpConnectionNotFoundError,
+  McpConnectionStateError,
+  revokeMcpConnection,
+  toMcpConnectionView,
+  type McpConnectionGrant,
+  type McpConnectionStore,
+} from "@opendatalabs/personal-server-ts-core/mcp";
 import type { PsLiteStorageCapabilities } from "./storage.js";
 import {
   createIndexedDbPsLiteAccessLogStore,
@@ -93,6 +108,13 @@ export interface PsLiteRuntimeOptions {
   accessToken?: string;
   tokenStore?: PsLiteTokenStore;
   stateCapabilities?: Partial<PsLiteRuntimeStateCapabilities>;
+  /**
+   * Per-runtime MCP connection store. Omit to disable the MCP endpoints
+   * (`/mcp/:token` + `/v1/mcp/connections`). Pass `createInMemoryMcpConnectionStore()`
+   * to enable with non-persistent storage, or `createIndexedDbMcpConnectionStore()`
+   * for the production browser default.
+   */
+  mcpConnectionStore?: McpConnectionStore;
 }
 
 export interface PsLiteRuntimeStateCapabilities {
@@ -137,7 +159,18 @@ export interface Web3SignedPsLiteAuthOptions {
   now?: () => number;
 }
 
-type JsonStatus = 200 | 201 | 400 | 401 | 403 | 404 | 405 | 500 | 501 | 503;
+type JsonStatus =
+  | 200
+  | 201
+  | 400
+  | 401
+  | 403
+  | 404
+  | 405
+  | 409
+  | 500
+  | 501
+  | 503;
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -748,8 +781,191 @@ export function createPsLiteRuntime(
           });
         }
 
+        if (options.mcpConnectionStore) {
+          const mcpResponse = await handleMcpRoute({
+            request,
+            url,
+            store: options.mcpConnectionStore,
+            auth,
+            dataStorage,
+            schemaResolver: options.gateway,
+            accessLogWriter,
+            now,
+            runtimeAvailability: { isAvailable: () => active },
+            serverOrigin: url.origin,
+          });
+          if (mcpResponse) return mcpResponse;
+        }
+
         return errorResponse(404, "NOT_FOUND", "Not found");
       });
     },
   };
+}
+
+/**
+ * MCP route dispatcher used inside `createPsLiteRuntime.fetch`. Handles both
+ * the owner-only `/v1/mcp/connections` management endpoints and the public
+ * `/mcp/:connectionToken` Streamable HTTP endpoint that Claude dials.
+ *
+ * Returns `null` for paths that don't match — the caller continues to the
+ * 404. Errors are passed through; the caller is already inside
+ * `withProtocolErrors`.
+ */
+async function handleMcpRoute(input: {
+  request: Request;
+  url: URL;
+  store: McpConnectionStore;
+  auth: PsLiteAuthAdapter;
+  dataStorage: DataStoragePort;
+  schemaResolver?: GatewayClient;
+  accessLogWriter: AccessLogWriter;
+  now: () => Date;
+  runtimeAvailability: RuntimeAvailabilityPort;
+  serverOrigin: string;
+}): Promise<Response | null> {
+  const pathname = input.url.pathname;
+  const ownerPrefix = "/v1/mcp/connections";
+
+  // Owner management endpoints
+  if (pathname === ownerPrefix || pathname.startsWith(`${ownerPrefix}/`)) {
+    try {
+      await input.auth.authorizeOwner(input.request);
+    } catch (err) {
+      if (err instanceof ProtocolError) {
+        return protocolErrorResponse(err);
+      }
+      throw err;
+    }
+    // POST /v1/mcp/connections — create
+    if (pathname === ownerPrefix) {
+      if (input.request.method === "POST") {
+        let body: { displayName?: string } = {};
+        try {
+          body = (await input.request.json()) as { displayName?: string };
+        } catch {
+          body = {};
+        }
+        const created = await createMcpConnection(
+          { displayName: body.displayName },
+          {
+            store: input.store,
+            publicOrigin: input.serverOrigin,
+            now: input.now,
+          },
+        );
+        return jsonResponse(created, { status: 201 });
+      }
+      if (input.request.method === "GET") {
+        const records = await listMcpConnectionViews(input.store);
+        return jsonResponse({ connections: records });
+      }
+      return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+    }
+    // /v1/mcp/connections/:id[/approve]
+    const tail = pathname.slice(ownerPrefix.length + 1);
+    const [id, action] = tail.split("/");
+    if (!id) {
+      return errorResponse(404, "NOT_FOUND", "Not found");
+    }
+    if (action === "approve") {
+      if (input.request.method !== "POST") {
+        return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+      }
+      let body: { grants?: McpConnectionGrant[] } = {};
+      try {
+        body = (await input.request.json()) as {
+          grants?: McpConnectionGrant[];
+        };
+      } catch {
+        return errorResponse(400, "INVALID_BODY", "Body must be JSON");
+      }
+      if (!Array.isArray(body.grants) || body.grants.length === 0) {
+        return errorResponse(
+          400,
+          "GRANTS_REQUIRED",
+          "Approve requires at least one grant — mint grants in the consent flow first",
+        );
+      }
+      try {
+        const updated = await approveMcpConnection(
+          { connectionId: id, grants: body.grants },
+          { store: input.store, now: input.now },
+        );
+        return jsonResponse(toMcpConnectionView(updated));
+      } catch (err) {
+        if (err instanceof McpConnectionNotFoundError) {
+          return errorResponse(404, "NOT_FOUND", err.message);
+        }
+        if (err instanceof McpConnectionStateError) {
+          return errorResponse(409, "INVALID_STATE", err.message);
+        }
+        throw err;
+      }
+    }
+    if (!action) {
+      if (input.request.method === "DELETE") {
+        try {
+          const updated = await revokeMcpConnection(id, {
+            store: input.store,
+            now: input.now,
+          });
+          return jsonResponse(toMcpConnectionView(updated));
+        } catch (err) {
+          if (err instanceof McpConnectionNotFoundError) {
+            return errorResponse(404, "NOT_FOUND", err.message);
+          }
+          throw err;
+        }
+      }
+      return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+    }
+    return errorResponse(404, "NOT_FOUND", "Not found");
+  }
+
+  // Claude-facing endpoint: /mcp/:token
+  const mcpPrefix = "/mcp/";
+  if (pathname.startsWith(mcpPrefix)) {
+    const rawToken = decodeURIComponent(pathname.slice(mcpPrefix.length));
+    if (!rawToken || rawToken.includes("/")) {
+      return errorResponse(404, "NOT_FOUND", "Not found");
+    }
+    const tokenHash = await hashConnectionToken(rawToken);
+    const record = await input.store.getByTokenHash(tokenHash);
+    if (!record) {
+      return errorResponse(
+        401,
+        "INVALID_TOKEN",
+        "Unknown or revoked MCP connection",
+      );
+    }
+    const granteeAccount = loadMcpGranteeAccount({
+      address: record.granteeAddress,
+      publicKey: record.granteePublicKey,
+      encryptedPrivateKey: record.encryptedGranteePrivateKey,
+    });
+    const readClient = createMcpDataReadClient({
+      serverOrigin: input.serverOrigin,
+      granteeAccount,
+      dataApiDeps: {
+        storage: input.dataStorage,
+        auth: input.auth,
+        schemaResolver: input.schemaResolver,
+        accessLogWriter: input.accessLogWriter,
+        runtimeAvailability: input.runtimeAvailability,
+        now: input.now,
+        createLogId,
+      },
+    });
+    const response = await handleMcpStreamableHttpRequest(input.request, {
+      connection: record,
+      readClient,
+    });
+    await input.store.update(record.id, {
+      lastUsedAt: input.now().toISOString(),
+    });
+    return response;
+  }
+
+  return null;
 }

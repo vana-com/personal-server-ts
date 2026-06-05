@@ -76,6 +76,10 @@
       "types": "./dist/logging/access-log.d.ts",
       "import": "./dist/logging/access-log.js"
     },
+    "./mcp": {
+      "types": "./dist/mcp/index.d.ts",
+      "import": "./dist/mcp/index.js"
+    },
     "./keys": {
       "types": "./dist/keys/index.d.ts",
       "import": "./dist/keys/index.js"
@@ -109,6 +113,7 @@
     "build": "tsc --build"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@opendatalabs/vana-sdk": "^3.4.0",
     "viem": "^2.48.11",
     "zod": "^4.4.3"
