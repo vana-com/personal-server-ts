@@ -776,6 +776,35 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     const payload = JSON.parse(result.content[0].text);
     expect(payload.scopes).toEqual(["chatgpt.history", "instagram.*"]);
   });
+
+  it("list_granted_sources derives source ids from scope-only grants", async () => {
+    const created = await createMcpConnection(
+      {},
+      { store, publicOrigin: SERVER_ORIGIN },
+    );
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [
+          { grantId: "g1", scopes: ["instagram.profile", "instagram.posts"] },
+          { grantId: "g2", scopes: ["chatgpt.history"] },
+        ],
+      },
+      { store },
+    );
+    const approved = (await store.getById(created.connectionId))!;
+    const tool = MCP_TOOLS.find((t) => t.name === "list_granted_sources")!;
+    const result = await tool.handler(
+      {},
+      {
+        connection: approved,
+        readClient: {} as never,
+      },
+    );
+    expect(result.isError).not.toBe(true);
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.sources).toEqual(["chatgpt", "instagram"]);
+  });
 });
 
 describe("revoked connection cannot be resolved by token", () => {
