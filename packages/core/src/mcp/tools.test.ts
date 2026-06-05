@@ -35,15 +35,13 @@ function createMinimalReadClient(
   overrides: Partial<McpDataReadClient> = {},
 ): McpDataReadClient {
   return {
-    listScopes: vi
-      .fn()
-      .mockResolvedValue({
-        status: 200,
-        scopes: [],
-        total: 0,
-        limit: 0,
-        offset: 0,
-      }),
+    listScopes: vi.fn().mockResolvedValue({
+      status: 200,
+      scopes: [],
+      total: 0,
+      limit: 0,
+      offset: 0,
+    }),
     getScopeMetadata: vi.fn().mockReturnValue(null),
     readScopeBlocks: vi.fn().mockRejectedValue(new Error("not mocked")),
     ...overrides,

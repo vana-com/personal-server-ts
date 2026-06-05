@@ -11,7 +11,8 @@ function createConnection(): McpConnectionRecord {
     granteePublicKey: "0x04deadbeef",
     encryptedGranteePrivateKey: {
       kind: "plaintext",
-      privateKey: "0x2222222222222222222222222222222222222222222222222222222222222222",
+      privateKey:
+        "0x2222222222222222222222222222222222222222222222222222222222222222",
     },
     tokenHash: "token-hash",
     status: "approved",
@@ -46,10 +47,16 @@ describe("McpActivityRecorder", () => {
 
   it("records failure with errorCode", () => {
     const r = new McpActivityRecorder();
-    const id = r.start({ tool: "search_personal_context", queryPreview: "hello" });
+    const id = r.start({
+      tool: "search_personal_context",
+      queryPreview: "hello",
+    });
     r.finish(id, { status: "failed", errorCode: "scope_not_granted" });
     const { events, running } = r.snapshot();
-    expect(events[0]).toMatchObject({ status: "failed", errorCode: "scope_not_granted" });
+    expect(events[0]).toMatchObject({
+      status: "failed",
+      errorCode: "scope_not_granted",
+    });
     expect(running).toBe(0);
   });
 
@@ -118,19 +125,38 @@ describe("McpActivityRecorder", () => {
     const connection = createConnection();
     let resolveRead!: () => void;
     const slowReadClient = {
-      readScopeBlocks: vi.fn(() =>
-        new Promise<{ scope: string; blocks: never[]; warnings: never[]; collectedAt: string; contentKind: string }>(
-          (resolve) => { resolveRead = () => resolve({ scope: "instagram.profile", blocks: [], warnings: [], collectedAt: "2026-06-05T00:00:00Z", contentKind: "json" }); }
-        )
+      readScopeBlocks: vi.fn(
+        () =>
+          new Promise<{
+            scope: string;
+            blocks: never[];
+            warnings: never[];
+            collectedAt: string;
+            contentKind: string;
+          }>((resolve) => {
+            resolveRead = () =>
+              resolve({
+                scope: "instagram.profile",
+                blocks: [],
+                warnings: [],
+                collectedAt: "2026-06-05T00:00:00Z",
+                contentKind: "json",
+              });
+          }),
       ),
     };
 
     const id = r.start({ tool: "read_scope", scopes: ["instagram.profile"] });
     const tool = MCP_TOOLS.find((t) => t.name === "read_scope")!;
-    const callPromise = tool.handler({ scope: "instagram.profile" }, { connection, readClient: slowReadClient as never });
+    const callPromise = tool.handler(
+      { scope: "instagram.profile" },
+      { connection, readClient: slowReadClient as never },
+    );
 
     expect(r.snapshot().running).toBe(1);
-    expect(r.snapshot().events.find((e) => e.id === id)?.status).toBe("running");
+    expect(r.snapshot().events.find((e) => e.id === id)?.status).toBe(
+      "running",
+    );
 
     resolveRead();
     await callPromise;
@@ -140,9 +166,15 @@ describe("McpActivityRecorder", () => {
 
   it("records timed_out status", () => {
     const r = new McpActivityRecorder();
-    const id = r.start({ tool: "search_personal_context", queryPreview: "test" });
+    const id = r.start({
+      tool: "search_personal_context",
+      queryPreview: "test",
+    });
     r.finish(id, { status: "timed_out", errorCode: "scope_search_timeout" });
-    expect(r.snapshot().events[0]).toMatchObject({ status: "timed_out", errorCode: "scope_search_timeout" });
+    expect(r.snapshot().events[0]).toMatchObject({
+      status: "timed_out",
+      errorCode: "scope_search_timeout",
+    });
   });
 
   it("records aborted status", () => {

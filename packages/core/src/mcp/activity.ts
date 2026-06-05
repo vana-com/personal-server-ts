@@ -106,8 +106,7 @@ export class McpActivityRecorder {
     const event = this._events.find((e) => e.id === id);
     if (!event) return;
     const finishedAt = new Date().toISOString();
-    const durationMs =
-      Date.parse(finishedAt) - Date.parse(event.startedAt);
+    const durationMs = Date.parse(finishedAt) - Date.parse(event.startedAt);
     event.status = result.status;
     event.finishedAt = finishedAt;
     event.durationMs = durationMs;

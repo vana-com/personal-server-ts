@@ -85,7 +85,9 @@ function extractActivityFinishParams(
         unknown
       >;
       return {
-        resultCount: Array.isArray(body.matches) ? body.matches.length : undefined,
+        resultCount: Array.isArray(body.matches)
+          ? body.matches.length
+          : undefined,
         skippedCount: Array.isArray(body.skippedScopes)
           ? body.skippedScopes.length
           : undefined,
@@ -101,7 +103,9 @@ function extractActivityFinishParams(
         unknown
       >;
       return {
-        resultCount: Array.isArray(body.blocks) ? body.blocks.length : undefined,
+        resultCount: Array.isArray(body.blocks)
+          ? body.blocks.length
+          : undefined,
       };
     } catch {
       return {};
@@ -142,10 +146,16 @@ export function createMcpServerForConnection(
           ? recorder.start(buildActivityStartParams(tool.name, args))
           : undefined;
         try {
-          const result = await tool.handler(args as Record<string, unknown>, ctx);
+          const result = await tool.handler(
+            args as Record<string, unknown>,
+            ctx,
+          );
           if (activityId && recorder) {
             const payload = extractActivityFinishParams(tool.name, result);
-            recorder.finish(activityId, { status: result.isError ? "failed" : "succeeded", ...payload });
+            recorder.finish(activityId, {
+              status: result.isError ? "failed" : "succeeded",
+              ...payload,
+            });
           }
           return result;
         } catch (err) {
