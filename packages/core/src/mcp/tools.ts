@@ -14,10 +14,12 @@ import { z } from "zod";
 import type { McpConnectionRecord } from "./types.js";
 import type { McpDataReadClient } from "./read-client.js";
 import { McpDataReadError } from "./read-client.js";
+import type { McpActivityRecorder } from "./activity.js";
 
 export interface McpToolContext {
   connection: McpConnectionRecord;
   readClient: McpDataReadClient;
+  activityRecorder?: McpActivityRecorder;
 }
 
 export interface McpToolResultContent {
