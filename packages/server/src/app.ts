@@ -15,6 +15,11 @@ import { dataRoutes } from "./routes/data.js";
 import { grantsRoutes } from "./routes/grants.js";
 import { accessLogsRoutes } from "./routes/access-logs.js";
 import { syncRoutes } from "./routes/sync.js";
+import { mcpConnectionsRoutes, mcpStreamableHttpRoutes } from "./routes/mcp.js";
+import {
+  createInMemoryMcpConnectionStore,
+  type McpConnectionStore,
+} from "@opendatalabs/personal-server-ts-core/mcp";
 import { uiConfigRoutes } from "./routes/ui-config.js";
 import { uiRegistrationRoutes } from "./routes/ui-registration.js";
 import { uiRoute } from "./routes/ui.js";
@@ -67,6 +72,13 @@ export interface AppDeps {
   runtimeAvailability?: RuntimeAvailabilityPort;
   dataStorage?: DataStoragePort;
   getTunnelStatus?: HealthDeps["getTunnelStatus"];
+  /**
+   * MCP connection store shared between the `/mcp/:token` Streamable HTTP
+   * endpoint and the owner `/v1/mcp/connections` management surface. Defaults
+   * to an in-memory store so the routes are wired up out of the box; pass an
+   * IndexedDB-backed (or persistent) store for production.
+   */
+  mcpConnectionStore?: McpConnectionStore;
 }
 
 export function createApp(deps: AppDeps): Hono {
@@ -170,6 +182,32 @@ export function createApp(deps: AppDeps): Hono {
       mountPath: "/v1/sync",
     }),
   );
+
+  // MCP — Phase 1 / 260604-PLAN-vana-mcp-personal-server.md.
+  // Owner endpoints + Claude-facing Streamable HTTP endpoint share a single
+  // connection store so the management API and the data path agree on which
+  // connections exist.
+  const mcpConnectionStore =
+    deps.mcpConnectionStore ?? createInMemoryMcpConnectionStore();
+  const mcpRouteDeps = {
+    logger: deps.logger,
+    serverOrigin: deps.serverOrigin,
+    serverOwner: deps.serverOwner,
+    gateway: deps.gateway,
+    devToken: deps.devToken,
+    accessToken: deps.accessToken,
+    tokenStore: deps.tokenStore,
+    accessLogWriter: deps.accessLogWriter,
+    indexManager: deps.indexManager,
+    hierarchyOptions: deps.hierarchyOptions,
+    dataStorage: deps.dataStorage,
+    feeVerifier: deps.feeVerifier,
+    runtimeAvailability: deps.runtimeAvailability,
+    connectionStore: mcpConnectionStore,
+  };
+
+  app.route("/v1/mcp/connections", mcpConnectionsRoutes(mcpRouteDeps));
+  app.route("/mcp", mcpStreamableHttpRoutes(mcpRouteDeps));
 
   // Mount login flow v2 routes (self-hosted CLI auth, no auth required)
   if (deps.tokenStore) {
