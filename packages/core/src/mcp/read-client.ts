@@ -21,6 +21,7 @@
 import type { ServerAccount } from "../keys/server-account.js";
 import type { ScopeSummary } from "../storage/index/types.js";
 import type { ReadScopeBlocksResponse } from "../storage/blocks/types.js";
+import { decodeDataBlockCursor } from "../storage/blocks/index.js";
 import { signMcpGranteeRequest } from "./grantee.js";
 import {
   handlePersonalServerDataRequest,
@@ -156,7 +157,11 @@ export function createMcpDataReadClient(
         });
       }
 
-      const selectedEntry = storage.findEntry({ scope });
+      const pinnedCollectedAt = collectedAtFromCursor(scope, cursor);
+      const selectedEntry = storage.findEntry({
+        scope,
+        ...(pinnedCollectedAt ? { at: pinnedCollectedAt } : {}),
+      });
       if (!selectedEntry) {
         throw new McpDataReadError(404, {
           error: "NOT_FOUND",
@@ -258,6 +263,16 @@ async function parseJsonOrText(response: Response): Promise<unknown> {
   } catch {
     return text;
   }
+}
+
+function collectedAtFromCursor(
+  scope: string,
+  cursor: string | undefined,
+): string | undefined {
+  if (!cursor) return undefined;
+  const decoded = decodeDataBlockCursor(cursor);
+  if (!decoded.ok || decoded.cursor.scope !== scope) return undefined;
+  return decoded.cursor.collectedAt;
 }
 
 function dataBlockStorageErrorCode(err: Error): string | undefined {
