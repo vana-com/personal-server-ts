@@ -295,7 +295,7 @@ export async function handlePersonalServerDataRequest(
     if (pathname === "/" || pathname === "") {
       if (request.method !== "GET") return methodNotAllowed();
       await deps.auth.authorizeBuilderList(request);
-      const result = listDataScopesContract({
+      const result = await listDataScopesContract({
         storage: deps.storage,
         scopePrefix: url.searchParams.get("scopePrefix") ?? undefined,
         limit: normalizeLimit(url.searchParams.get("limit"), 20),

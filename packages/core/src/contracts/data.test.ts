@@ -13,6 +13,7 @@ import {
 function createMemoryStorage(): DataStoragePort {
   const entries: IndexEntry[] = [];
   const envelopes = new Map<string, DataFileEnvelope>();
+  const blockManifests = new Set<string>();
   let nextId = 1;
 
   function key(scope: string, collectedAt: string) {
@@ -77,7 +78,12 @@ function createMemoryStorage(): DataStoragePort {
         sizeBytes: JSON.stringify(envelope).length,
       };
     },
-    writeBlockManifest: vi.fn().mockResolvedValue(undefined),
+    hasScopeBlocks(scope, collectedAt) {
+      return blockManifests.has(key(scope, collectedAt));
+    },
+    writeBlockManifest: vi.fn(async (scope: string, collectedAt: string) => {
+      blockManifests.add(key(scope, collectedAt));
+    }),
     insertEntry(entry) {
       const indexed = {
         ...entry,
@@ -132,17 +138,19 @@ describe("data contract helpers", () => {
       }),
     });
 
-    expect(
+    await expect(
       listDataScopesContract({
         storage,
         limit: 20,
         offset: 0,
       }),
-    ).toMatchObject({
+    ).resolves.toMatchObject({
       ok: true,
       response: {
         scopes: [
           {
+            dataStatus: "ready",
+            sizeBytes: expect.any(Number),
             scope: "instagram.profile",
             latestCollectedAt: "2026-05-08T00:00:00.000Z",
             versionCount: 1,
@@ -223,6 +231,23 @@ describe("data contract helpers", () => {
         at: "2026-05-08T00:00:00.000Z",
       }),
     ).toBeDefined();
+    await expect(
+      listDataScopesContract({
+        storage,
+        limit: 20,
+        offset: 0,
+      }),
+    ).resolves.toMatchObject({
+      response: {
+        scopes: [
+          {
+            scope: "instagram.profile",
+            dataStatus: "indexing",
+            sizeBytes: expect.any(Number),
+          },
+        ],
+      },
+    });
   });
 
   it("returns compatibility-shaped validation errors", async () => {
