@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { createMcpDataReadClient, McpDataReadError } from "./read-client.js";
+import { DataBlockStorageError } from "../storage/blocks/errors.js";
 import { encodeDataBlockCursor } from "../storage/blocks/index.js";
 
 const SERVER_ORIGIN = "https://personal-server.test";
@@ -120,6 +121,93 @@ describe("mcp/read-client", () => {
       });
     }
     expect(readEnvelope).not.toHaveBeenCalled();
+  });
+
+  it("serves rebuilt blocks when a missing manifest cannot be cached", async () => {
+    const accessLogWrite = vi.fn();
+    const authorizeBuilderRead = vi
+      .fn()
+      .mockResolvedValue({ grantId: "grant-1", builder: "0x2222" });
+    const readEnvelope = vi.fn().mockResolvedValue({
+      scope: "github.profile",
+      collectedAt: "2026-06-05T00:00:00Z",
+      data: { username: "tnunamak", followers: 39 },
+    });
+    const readScopeBlocks = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new DataBlockStorageError(
+          "block_manifest_not_found",
+          "Block manifest not found",
+        ),
+      );
+    const writeBlockManifest = vi
+      .fn()
+      .mockRejectedValue(new Error("sidecar write failed"));
+
+    const client = createMcpDataReadClient({
+      serverOrigin: SERVER_ORIGIN,
+      granteeAccount: createAccount(),
+      dataApiDeps: {
+        storage: {
+          kind: "custom",
+          listScopes: () => ({ scopes: [], total: 0 }),
+          listVersions: vi.fn(),
+          countVersions: vi.fn(),
+          findEntry: () =>
+            ({
+              scope: "github.profile",
+              collectedAt: "2026-06-05T00:00:00Z",
+              fileId: "file-1",
+              sizeBytes: 64,
+            }) as never,
+          findByFileId: vi.fn(),
+          findUnsynced: vi.fn(),
+          readEnvelope,
+          readScopeBlocks,
+          writeBlockManifest,
+          writeEnvelope: vi.fn(),
+          insertEntry: vi.fn(),
+          updateFileId: vi.fn(),
+          deleteScope: vi.fn(),
+          deleteByFileId: vi.fn(),
+        },
+        auth: {
+          authorizeOwner: vi.fn(),
+          authorizeBuilderList: vi.fn(),
+          authorizeBuilderRead,
+        },
+        accessLogWriter: { write: accessLogWrite },
+      },
+    });
+
+    const result = await client.readScopeBlocks({
+      scope: "github.profile",
+      grantId: "grant-1",
+    });
+
+    expect(result).toMatchObject({
+      status: 200,
+      scope: "github.profile",
+    });
+    expect(result.blocks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "block-000002",
+          path: "$.data",
+          value: { username: "tnunamak", followers: 39 },
+        }),
+      ]),
+    );
+
+    expect(readEnvelope).toHaveBeenCalledWith(
+      "github.profile",
+      "2026-06-05T00:00:00Z",
+    );
+    expect(writeBlockManifest).toHaveBeenCalledTimes(1);
+    expect(writeBlockManifest.mock.calls[0]?.[0]).toBe("github.profile");
+    expect(readScopeBlocks).toHaveBeenCalledTimes(1);
+    expect(accessLogWrite).toHaveBeenCalledTimes(1);
   });
 
   it("authorizes and access-logs successful bounded block reads", async () => {

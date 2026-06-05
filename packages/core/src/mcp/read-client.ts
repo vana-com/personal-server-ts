@@ -20,9 +20,18 @@
 
 import type { ServerAccount } from "../keys/server-account.js";
 import type { ScopeSummary } from "../storage/index/types.js";
-import type { ReadScopeBlocksResponse } from "../storage/blocks/types.js";
+import type {
+  DataBlockManifest,
+  DataScopeBlock,
+  ReadScopeBlocksResponse,
+} from "../storage/blocks/types.js";
 import type { SearchHit } from "./search/index.js";
-import { decodeDataBlockCursor } from "../storage/blocks/index.js";
+import { buildDataBlocks } from "../storage/blocks/build.js";
+import {
+  DataBlockStorageError,
+  decodeDataBlockCursor,
+  encodeDataBlockCursor,
+} from "../storage/blocks/index.js";
 import { signMcpGranteeRequest } from "./grantee.js";
 import {
   handlePersonalServerDataRequest,
@@ -258,15 +267,58 @@ export function createMcpDataReadClient(
         throw err;
       }
 
+      const readScopeBlocks = storage.readScopeBlocks;
+      const requestedMaxBytes = maxBytes ?? 16_384;
+      const readBlocks = () =>
+        readScopeBlocks(scope, selectedEntry.collectedAt, {
+          cursor,
+          maxBytes: requestedMaxBytes,
+        });
+
       try {
-        const result = await storage.readScopeBlocks(
-          scope,
-          selectedEntry.collectedAt,
-          {
+        let result: ReadScopeBlocksResponse;
+        try {
+          result = await readBlocks();
+        } catch (err) {
+          if (
+            !(err instanceof Error) ||
+            dataBlockStorageErrorCode(err) !== "block_manifest_not_found"
+          ) {
+            throw err;
+          }
+
+          const envelope = await storage.readEnvelope(
+            scope,
+            selectedEntry.collectedAt,
+          );
+          const built = buildDataBlocks({
+            scope: envelope.scope,
+            collectedAt: envelope.collectedAt,
+            schemaId: envelope.schemaId,
+            content: envelope,
+          });
+          result = pageBuiltBlocks({
+            manifest: built.manifest,
+            blocks: built.blocks,
             cursor,
-            maxBytes: maxBytes ?? 16_384,
-          },
-        );
+            maxBytes: requestedMaxBytes,
+          });
+
+          if (storage.writeBlockManifest) {
+            try {
+              await storage.writeBlockManifest(
+                envelope.scope,
+                envelope.collectedAt,
+                built.manifest,
+                built.blocks,
+              );
+            } catch {
+              // The freshly rebuilt page is enough to satisfy this request.
+              // Cache persistence is best-effort so a flaky sidecar write cannot
+              // turn readable raw data into an MCP 503.
+            }
+          }
+        }
         await options.dataApiDeps.accessLogWriter.write({
           logId: options.dataApiDeps.createLogId?.() ?? crypto.randomUUID(),
           grantId: authResult?.grantId ?? grantId,
@@ -326,6 +378,66 @@ function collectedAtFromCursor(
   const decoded = decodeDataBlockCursor(cursor);
   if (!decoded.ok || decoded.cursor.scope !== scope) return undefined;
   return decoded.cursor.collectedAt;
+}
+
+function pageBuiltBlocks({
+  manifest,
+  blocks: builtBlocks,
+  cursor,
+  maxBytes: requestedMaxBytes,
+}: {
+  manifest: DataBlockManifest;
+  blocks: DataScopeBlock[];
+  cursor?: string;
+  maxBytes: number;
+}): ReadScopeBlocksResponse {
+  const cursorResult = cursor
+    ? decodeDataBlockCursor(cursor)
+    : { ok: true as const, cursor: null };
+  if (
+    !cursorResult.ok ||
+    (cursorResult.cursor &&
+      (cursorResult.cursor.scope !== manifest.scope ||
+        cursorResult.cursor.collectedAt !== manifest.collectedAt))
+  ) {
+    throw new DataBlockStorageError(
+      "cursor_invalid",
+      "Cursor is invalid for this scope.",
+    );
+  }
+
+  const maxBytes = Math.max(1, requestedMaxBytes);
+  const startIndex = cursorResult.cursor?.blockIndex ?? 0;
+  const blocks: DataScopeBlock[] = [];
+  let bytes = 0;
+
+  for (let index = startIndex; index < builtBlocks.length; index += 1) {
+    const block = builtBlocks[index];
+    if (!block) continue;
+    if (blocks.length > 0 && bytes + block.sizeBytes > maxBytes) break;
+    blocks.push(block);
+    bytes += block.sizeBytes;
+    if (bytes >= maxBytes) break;
+  }
+
+  const nextIndex = startIndex + blocks.length;
+  return {
+    scope: manifest.scope,
+    collectedAt: manifest.collectedAt,
+    ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
+    contentKind: manifest.contentKind,
+    blocks,
+    ...(nextIndex < builtBlocks.length
+      ? {
+          nextCursor: encodeDataBlockCursor({
+            scope: manifest.scope,
+            collectedAt: manifest.collectedAt,
+            blockIndex: nextIndex,
+          }),
+        }
+      : {}),
+    warnings: manifest.warnings,
+  };
 }
 
 function dataBlockStorageErrorCode(err: Error): string | undefined {
