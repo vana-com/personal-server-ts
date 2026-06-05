@@ -26,4 +26,12 @@ export interface ScopeSummary {
   scope: string;
   latestCollectedAt: string;
   versionCount: number;
+  /**
+   * Whether bounded block reads for the latest local version are ready.
+   * Existing data can appear in the index before the block sidecar finishes
+   * indexing; MCP reads require the sidecar.
+   */
+  dataStatus?: "ready" | "indexing";
+  /** Size in bytes of the latest local version. */
+  sizeBytes?: number;
 }
