@@ -25,14 +25,35 @@
 import type {
   McpConnectionRecord,
   McpConnectionStore,
+  McpOAuthAuthorizationRecord,
+  McpOAuthAuthorizationStore,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 
 const DEFAULT_DB_NAME = "personal-server-lite";
 const DEFAULT_STORE_NAME = "mcpConnections";
+const DEFAULT_AUTHORIZATION_STORE_NAME = "mcpOAuthAuthorizations";
 const TOKEN_HASH_INDEX = "tokenHash";
-const DB_VERSION = 1;
+const AUTHORIZATION_CODE_HASH_INDEX = "authorizationCodeHash";
+const DB_VERSION = 2;
+
+const CONNECTION_INDEXES = [
+  { name: TOKEN_HASH_INDEX, keyPath: "tokenHash", unique: true },
+] as const;
+
+const AUTHORIZATION_INDEXES = [
+  {
+    name: AUTHORIZATION_CODE_HASH_INDEX,
+    keyPath: "authorizationCodeHash",
+    unique: true,
+  },
+] as const;
 
 export interface IndexedDbMcpConnectionStoreOptions {
+  dbName?: string;
+  storeName?: string;
+}
+
+export interface IndexedDbMcpOAuthAuthorizationStoreOptions {
   dbName?: string;
   storeName?: string;
 }
@@ -42,7 +63,37 @@ interface ResolvedOptions {
   storeName: string;
 }
 
-function openDb(opts: ResolvedOptions): Promise<IDBDatabase> {
+const DEFAULT_CONNECTION_OPTIONS: ResolvedOptions = {
+  dbName: DEFAULT_DB_NAME,
+  storeName: DEFAULT_STORE_NAME,
+};
+
+const DEFAULT_AUTHORIZATION_OPTIONS: ResolvedOptions = {
+  dbName: DEFAULT_DB_NAME,
+  storeName: DEFAULT_AUTHORIZATION_STORE_NAME,
+};
+
+function ensureObjectStore(
+  db: IDBDatabase,
+  transaction: IDBTransaction | null | undefined,
+  opts: ResolvedOptions,
+  indexes: readonly { name: string; keyPath: string; unique: boolean }[],
+): void {
+  const store = db.objectStoreNames.contains(opts.storeName)
+    ? transaction?.objectStore(opts.storeName)
+    : db.createObjectStore(opts.storeName, { keyPath: "id" });
+  if (!store) return;
+  for (const index of indexes) {
+    if (!store.indexNames.contains(index.name)) {
+      store.createIndex(index.name, index.keyPath, { unique: index.unique });
+    }
+  }
+}
+
+function openDb(
+  opts: ResolvedOptions,
+  indexes: readonly { name: string; keyPath: string; unique: boolean }[],
+): Promise<IDBDatabase> {
   if (typeof indexedDB === "undefined") {
     throw new Error("IndexedDB is not available in this runtime");
   }
@@ -50,15 +101,19 @@ function openDb(opts: ResolvedOptions): Promise<IDBDatabase> {
     const request = indexedDB.open(opts.dbName, DB_VERSION);
     request.onupgradeneeded = () => {
       const db = request.result;
-      if (!db.objectStoreNames.contains(opts.storeName)) {
-        const store = db.createObjectStore(opts.storeName, { keyPath: "id" });
-        store.createIndex(TOKEN_HASH_INDEX, "tokenHash", { unique: true });
-      } else {
-        const store = request.transaction?.objectStore(opts.storeName);
-        if (store && !store.indexNames.contains(TOKEN_HASH_INDEX)) {
-          store.createIndex(TOKEN_HASH_INDEX, "tokenHash", { unique: true });
-        }
-      }
+      ensureObjectStore(db, request.transaction, opts, indexes);
+      ensureObjectStore(
+        db,
+        request.transaction,
+        DEFAULT_CONNECTION_OPTIONS,
+        CONNECTION_INDEXES,
+      );
+      ensureObjectStore(
+        db,
+        request.transaction,
+        DEFAULT_AUTHORIZATION_OPTIONS,
+        AUTHORIZATION_INDEXES,
+      );
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
@@ -68,9 +123,10 @@ function openDb(opts: ResolvedOptions): Promise<IDBDatabase> {
 function runTx<T>(
   opts: ResolvedOptions,
   mode: IDBTransactionMode,
+  indexes: readonly { name: string; keyPath: string; unique: boolean }[],
   fn: (store: IDBObjectStore) => IDBRequest<T>,
 ): Promise<T> {
-  return openDb(opts).then(
+  return openDb(opts, indexes).then(
     (db) =>
       new Promise<T>((resolve, reject) => {
         const transaction = db.transaction(opts.storeName, mode);
@@ -90,9 +146,10 @@ function runTx<T>(
 function runIndexQuery<T>(
   opts: ResolvedOptions,
   indexName: string,
+  indexes: readonly { name: string; keyPath: string; unique: boolean }[],
   fn: (index: IDBIndex) => IDBRequest<T>,
 ): Promise<T> {
-  return openDb(opts).then(
+  return openDb(opts, indexes).then(
     (db) =>
       new Promise<T>((resolve, reject) => {
         const transaction = db.transaction(opts.storeName, "readonly");
@@ -122,13 +179,17 @@ export function createIndexedDbMcpConnectionStore(
       const existing = await runTx<McpConnectionRecord | undefined>(
         resolved,
         "readonly",
+        CONNECTION_INDEXES,
         (store) => store.get(record.id),
       );
       if (existing) {
         throw new Error(`mcp connection ${record.id} already exists`);
       }
-      await runTx<IDBValidKey>(resolved, "readwrite", (store) =>
-        store.put({ ...record }),
+      await runTx<IDBValidKey>(
+        resolved,
+        "readwrite",
+        CONNECTION_INDEXES,
+        (store) => store.put({ ...record }),
       );
     },
 
@@ -136,6 +197,7 @@ export function createIndexedDbMcpConnectionStore(
       const all = await runTx<McpConnectionRecord[]>(
         resolved,
         "readonly",
+        CONNECTION_INDEXES,
         (store) => store.getAll(),
       );
       return all.map((r) => ({ ...r }));
@@ -145,6 +207,7 @@ export function createIndexedDbMcpConnectionStore(
       const record = await runTx<McpConnectionRecord | undefined>(
         resolved,
         "readonly",
+        CONNECTION_INDEXES,
         (store) => store.get(id),
       );
       return record ? { ...record } : null;
@@ -154,6 +217,7 @@ export function createIndexedDbMcpConnectionStore(
       const record = await runIndexQuery<McpConnectionRecord | undefined>(
         resolved,
         TOKEN_HASH_INDEX,
+        CONNECTION_INDEXES,
         (index) => index.get(tokenHash),
       );
       if (!record) return null;
@@ -165,14 +229,96 @@ export function createIndexedDbMcpConnectionStore(
       const existing = await runTx<McpConnectionRecord | undefined>(
         resolved,
         "readonly",
+        CONNECTION_INDEXES,
         (store) => store.get(id),
       );
       if (!existing) return null;
       const updated: McpConnectionRecord = { ...existing, ...patch };
-      await runTx<IDBValidKey>(resolved, "readwrite", (store) =>
-        store.put(updated),
+      await runTx<IDBValidKey>(
+        resolved,
+        "readwrite",
+        CONNECTION_INDEXES,
+        (store) => store.put(updated),
       );
       return { ...updated };
+    },
+  };
+}
+
+export function createIndexedDbMcpOAuthAuthorizationStore(
+  options: IndexedDbMcpOAuthAuthorizationStoreOptions = {},
+): McpOAuthAuthorizationStore {
+  const resolved: ResolvedOptions = {
+    dbName: options.dbName ?? DEFAULT_DB_NAME,
+    storeName: options.storeName ?? DEFAULT_AUTHORIZATION_STORE_NAME,
+  };
+
+  return {
+    async create(record) {
+      const existing = await runTx<McpOAuthAuthorizationRecord | undefined>(
+        resolved,
+        "readonly",
+        AUTHORIZATION_INDEXES,
+        (store) => store.get(record.id),
+      );
+      if (existing) {
+        throw new Error(`mcp oauth authorization ${record.id} already exists`);
+      }
+      await runTx<IDBValidKey>(
+        resolved,
+        "readwrite",
+        AUTHORIZATION_INDEXES,
+        (store) => store.put({ ...record }),
+      );
+    },
+
+    async getById(id) {
+      const record = await runTx<McpOAuthAuthorizationRecord | undefined>(
+        resolved,
+        "readonly",
+        AUTHORIZATION_INDEXES,
+        (store) => store.get(id),
+      );
+      return record ? { ...record } : null;
+    },
+
+    async getByCodeHash(authorizationCodeHash) {
+      const record = await runIndexQuery<
+        McpOAuthAuthorizationRecord | undefined
+      >(
+        resolved,
+        AUTHORIZATION_CODE_HASH_INDEX,
+        AUTHORIZATION_INDEXES,
+        (index) => index.get(authorizationCodeHash),
+      );
+      return record ? { ...record } : null;
+    },
+
+    async update(id, patch) {
+      const existing = await runTx<McpOAuthAuthorizationRecord | undefined>(
+        resolved,
+        "readonly",
+        AUTHORIZATION_INDEXES,
+        (store) => store.get(id),
+      );
+      if (!existing) return null;
+      const updated: McpOAuthAuthorizationRecord = { ...existing, ...patch };
+      await runTx<IDBValidKey>(
+        resolved,
+        "readwrite",
+        AUTHORIZATION_INDEXES,
+        (store) => store.put(updated),
+      );
+      return { ...updated };
+    },
+
+    async delete(id) {
+      await runTx<undefined>(
+        resolved,
+        "readwrite",
+        AUTHORIZATION_INDEXES,
+        (store) => store.delete(id),
+      );
     },
   };
 }

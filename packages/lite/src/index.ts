@@ -100,7 +100,9 @@ export {
 
 export {
   createIndexedDbMcpConnectionStore,
+  createIndexedDbMcpOAuthAuthorizationStore,
   type IndexedDbMcpConnectionStoreOptions,
+  type IndexedDbMcpOAuthAuthorizationStoreOptions,
 } from "./mcp-store.js";
 
 export {
