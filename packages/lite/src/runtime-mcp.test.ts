@@ -32,6 +32,7 @@ import {
   createInMemoryMcpConnectionStore,
   createMcpConnection,
   createMcpDataReadClient,
+  hashConnectionToken,
   loadMcpGranteeAccount,
   MCP_TOOLS,
   type McpConnectionStore,
@@ -56,7 +57,23 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 
 const SERVER_ORIGIN = "https://ps-lite.local";
+const CLAUDE_REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback";
 const owner = createTestWallet(7);
+
+async function pkceChallenge(verifier: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(verifier),
+  );
+  let binary = "";
+  for (const byte of new Uint8Array(digest)) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/u, "");
+}
 
 function makeMockGateway(opts: {
   granteeAddress: `0x${string}`;
@@ -138,6 +155,7 @@ function buildRuntime(
     granteeAddress?: `0x${string}`;
     grantId?: string;
     scopes?: string[];
+    approvalUrl?: string;
   } = {},
 ): RuntimeBundle {
   const gateway = makeMockGateway({
@@ -160,6 +178,7 @@ function buildRuntime(
     stateCapabilities: { config: "memory" },
     serverOwner: owner.address,
     mcpConnectionStore: store,
+    mcpOAuthApprovalUrl: opts.approvalUrl,
     auth: createWeb3SignedPsLiteAuth({
       origin: SERVER_ORIGIN,
       ownerAddress: owner.address,
@@ -264,6 +283,33 @@ describe("createPsLiteRuntime + MCP owner routes", () => {
 });
 
 describe("createPsLiteRuntime + /mcp/:token route", () => {
+  it("returns OAuth discovery challenge on stable /mcp without bearer token", async () => {
+    const { runtime } = buildRuntime({
+      approvalUrl: "https://app-dev.vana.org/mcp/connect/claude",
+    });
+    const res = await runtime.fetch(
+      new Request(`${SERVER_ORIGIN}/mcp`, {
+        method: "POST",
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
+      }),
+    );
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate")).toContain(
+      `${SERVER_ORIGIN}/.well-known/oauth-protected-resource/mcp`,
+    );
+    expect((await res.json()).error.errorCode).toBe("MCP_AUTH_REQUIRED");
+  });
+
+  it("does not advertise OAuth on stable /mcp when approval URL is missing", async () => {
+    const { runtime } = buildRuntime();
+    const res = await runtime.fetch(
+      new Request(`${SERVER_ORIGIN}/mcp`, { method: "POST" }),
+    );
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate")).toBeNull();
+    expect((await res.json()).error.errorCode).toBe("INVALID_TOKEN");
+  });
+
   it("rejects unknown tokens", async () => {
     const { runtime } = buildRuntime();
     const res = await runtime.fetch(
@@ -292,6 +338,114 @@ describe("createPsLiteRuntime + /mcp/:token route", () => {
       ),
     );
     expect(res.status).toBe(401);
+  });
+});
+
+describe("createPsLiteRuntime + MCP OAuth routes", () => {
+  it("returns JSON OAuth error when authorize cannot redirect", async () => {
+    const bundle = buildRuntime({
+      approvalUrl: "https://app-dev.vana.org/mcp/connect/claude",
+    });
+    const res = await bundle.runtime.fetch(
+      new Request(`${SERVER_ORIGIN}/mcp/oauth/authorize?response_type=token`),
+    );
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      error: "unsupported_response_type",
+    });
+  });
+
+  it("creates an authorization from Claude OAuth and redeems it after owner approval", async () => {
+    const bundle = buildRuntime({
+      approvalUrl: "https://app-dev.vana.org/mcp/connect/claude",
+    });
+    const register = await bundle.runtime.fetch(
+      new Request(`${SERVER_ORIGIN}/mcp/oauth/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          client_name: "Claude",
+          redirect_uris: [CLAUDE_REDIRECT_URI],
+        }),
+      }),
+    );
+    expect(register.status).toBe(201);
+    const registered = await register.json();
+    const codeVerifier = "lite-route-pkce-verifier";
+
+    const authorize = await bundle.runtime.fetch(
+      new Request(
+        `${SERVER_ORIGIN}/mcp/oauth/authorize?${new URLSearchParams({
+          response_type: "code",
+          client_id: registered.client_id,
+          redirect_uri: CLAUDE_REDIRECT_URI,
+          code_challenge: await pkceChallenge(codeVerifier),
+          code_challenge_method: "S256",
+          scope: "vana:read",
+          state: "lite-state",
+        })}`,
+      ),
+    );
+    expect(authorize.status).toBe(302);
+    const approvalLocation = authorize.headers.get("location");
+    expect(approvalLocation).toContain(
+      "https://app-dev.vana.org/mcp/connect/claude",
+    );
+    const authorizationId = new URL(approvalLocation!).searchParams.get(
+      "mcp_authorization",
+    );
+    expect(authorizationId).toMatch(/.+/);
+
+    const pending = await bundle.runtime.fetch(
+      await ownerSigned(
+        "GET",
+        `/v1/mcp/oauth/authorizations/${authorizationId}`,
+      ),
+    );
+    expect(pending.status).toBe(200);
+    expect((await pending.json()).status).toBe("pending");
+
+    const approve = await bundle.runtime.fetch(
+      await ownerSigned(
+        "POST",
+        `/v1/mcp/oauth/authorizations/${authorizationId}/approve`,
+        {
+          grants: [{ grantId: "grant-mcp-oauth", scopes: ["chatgpt.history"] }],
+        },
+      ),
+    );
+    expect(approve.status).toBe(200);
+    const redirectTo = (await approve.json()).redirectTo;
+    const redirect = new URL(redirectTo);
+    expect(`${redirect.origin}${redirect.pathname}`).toBe(CLAUDE_REDIRECT_URI);
+    expect(redirect.searchParams.get("state")).toBe("lite-state");
+    const code = redirect.searchParams.get("code");
+    expect(code).toMatch(/.+/);
+
+    const token = await bundle.runtime.fetch(
+      new Request(`${SERVER_ORIGIN}/mcp/oauth/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code: code!,
+          code_verifier: codeVerifier,
+          client_id: registered.client_id,
+          redirect_uri: CLAUDE_REDIRECT_URI,
+        }),
+      }),
+    );
+    expect(token.status).toBe(200);
+    const tokenBody = await token.json();
+    expect(tokenBody.token_type).toBe("Bearer");
+
+    const approvedConnection = await bundle.store.getByTokenHash(
+      await hashConnectionToken(tokenBody.access_token),
+    );
+    expect(approvedConnection?.status).toBe("approved");
+    expect(approvedConnection?.grants).toEqual([
+      { grantId: "grant-mcp-oauth", scopes: ["chatgpt.history"] },
+    ]);
   });
 });
 

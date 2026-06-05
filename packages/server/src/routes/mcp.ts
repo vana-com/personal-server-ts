@@ -22,9 +22,14 @@ import type { Context } from "hono";
 import type { Logger } from "pino";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import {
+  approveMcpOAuthAuthorization,
   approveMcpConnection,
+  buildMcpProtectedResourceMetadataUrl,
   buildMcpUrl,
+  buildStableMcpUrl,
+  createInMemoryMcpOAuthAuthorizationStore,
   createMcpConnection,
+  createMcpOAuthAuthorization,
   createInMemoryMcpConnectionStore,
   createMcpDataReadClient,
   handleMcpStreamableHttpRequest,
@@ -33,10 +38,14 @@ import {
   loadMcpGranteeAccount,
   McpConnectionNotFoundError,
   McpConnectionStateError,
+  McpOAuthAuthorizationError,
+  redeemMcpOAuthAuthorizationCode,
+  toMcpOAuthAuthorizationView,
   revokeMcpConnection,
   toMcpConnectionView,
   type McpConnectionGrant,
   type McpConnectionStore,
+  type McpOAuthAuthorizationStore,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import type {
   PersonalServerDataApiDeps,
@@ -77,6 +86,16 @@ export interface McpRouteDeps {
   runtimeAvailability?: RuntimeAvailabilityPort;
   /** Per-process connection store. Defaults to in-memory. */
   connectionStore?: McpConnectionStore;
+  /**
+   * OAuth authorization store shared by `/mcp/oauth/authorize`,
+   * `/mcp/oauth/token`, and the owner approval endpoint.
+   */
+  oauthAuthorizationStore?: McpOAuthAuthorizationStore;
+  /**
+   * Vana Web approval surface. `/mcp/oauth/authorize` redirects owners here
+   * with `mcp_authorization` and `ps_origin` query params.
+   */
+  oauthApprovalUrl?: string | (() => string);
 }
 
 function resolveOrigin(origin: string | (() => string)): string {
@@ -87,6 +106,91 @@ function jsonError(status: number, errorCode: string, message: string) {
   return {
     error: { code: status, errorCode, message },
   };
+}
+
+function bearerToken(request: Request): string | null {
+  const authorization = request.headers.get("authorization");
+  if (!authorization?.startsWith("Bearer ")) return null;
+  const token = authorization.slice("Bearer ".length).trim();
+  return token.length > 0 ? token : null;
+}
+
+function mcpUnauthorized(
+  origin: string,
+  message = "MCP authorization required",
+) {
+  return new Response(
+    JSON.stringify(jsonError(401, "MCP_AUTH_REQUIRED", message)),
+    {
+      status: 401,
+      headers: {
+        "content-type": "application/json",
+        "www-authenticate": `Bearer resource_metadata="${buildMcpProtectedResourceMetadataUrl(origin)}", scope="vana:read"`,
+      },
+    },
+  );
+}
+
+function authorizationServerMetadata(origin: string) {
+  return {
+    issuer: origin,
+    authorization_endpoint: `${origin}/mcp/oauth/authorize`,
+    token_endpoint: `${origin}/mcp/oauth/token`,
+    registration_endpoint: `${origin}/mcp/oauth/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code"],
+    token_endpoint_auth_methods_supported: ["none"],
+    code_challenge_methods_supported: ["S256"],
+    scopes_supported: ["vana:read"],
+  };
+}
+
+function protectedResourceMetadata(origin: string) {
+  return {
+    resource: buildStableMcpUrl(origin),
+    authorization_servers: [origin],
+    bearer_methods_supported: ["header"],
+    scopes_supported: ["vana:read"],
+    resource_name: "Vana Personal Server MCP",
+  };
+}
+
+function resolveApprovalUrl(deps: McpRouteDeps): string | null {
+  const value = deps.oauthApprovalUrl;
+  if (!value) return null;
+  return typeof value === "function" ? value() : value;
+}
+
+function redirectWithOAuthError(
+  redirectUri: string,
+  error: string,
+  description: string,
+  state: string | null,
+): Response {
+  try {
+    const url = new URL(redirectUri);
+    url.searchParams.set("error", error);
+    url.searchParams.set("error_description", description);
+    if (state) url.searchParams.set("state", state);
+    return Response.redirect(url.toString(), 302);
+  } catch {
+    return new Response(
+      JSON.stringify({
+        error,
+        error_description: description,
+        ...(state ? { state } : {}),
+      }),
+      {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      },
+    );
+  }
+}
+
+async function parseFormBody(request: Request): Promise<URLSearchParams> {
+  const text = await request.text();
+  return new URLSearchParams(text);
 }
 
 function buildDataApiDeps(deps: McpRouteDeps): PersonalServerDataApiDeps {
@@ -235,8 +339,271 @@ export function mcpConnectionsRoutes(deps: McpRouteDeps): Hono {
 }
 
 /**
+ * Top-level MCP OAuth/discovery routes.
+ *
+ * Mount at `/` so the well-known documents are served from the PS origin and
+ * Claude can discover auth for the stable `/mcp` resource.
+ */
+export function mcpOAuthRoutes(deps: McpRouteDeps): Hono {
+  const app = new Hono();
+  const connectionStore =
+    deps.connectionStore ?? createInMemoryMcpConnectionStore();
+  const authorizationStore =
+    deps.oauthAuthorizationStore ?? createInMemoryMcpOAuthAuthorizationStore();
+
+  const ownerAuth: PersonalServerApiAuthPort = createServerApiAuth({
+    serverOrigin: deps.serverOrigin,
+    serverOwner: deps.serverOwner,
+    gateway: deps.gateway,
+    devToken: deps.devToken,
+    accessToken: deps.accessToken,
+    tokenStore: deps.tokenStore,
+  });
+
+  async function requireOwner(c: Context): Promise<Response | null> {
+    try {
+      await ownerAuth.authorizeOwner(c.req.raw);
+      return null;
+    } catch (err) {
+      if (err instanceof ProtocolError) {
+        return c.json(err.toJSON(), err.code as 401 | 403);
+      }
+      throw err;
+    }
+  }
+
+  app.get("/.well-known/oauth-protected-resource/mcp", (c) =>
+    resolveApprovalUrl(deps)
+      ? c.json(protectedResourceMetadata(resolveOrigin(deps.serverOrigin)))
+      : c.json(
+          jsonError(
+            404,
+            "MCP_OAUTH_NOT_CONFIGURED",
+            "MCP OAuth is not configured",
+          ),
+          404,
+        ),
+  );
+
+  app.get("/.well-known/oauth-authorization-server", (c) =>
+    resolveApprovalUrl(deps)
+      ? c.json(authorizationServerMetadata(resolveOrigin(deps.serverOrigin)))
+      : c.json(
+          jsonError(
+            404,
+            "MCP_OAUTH_NOT_CONFIGURED",
+            "MCP OAuth is not configured",
+          ),
+          404,
+        ),
+  );
+
+  app.post("/mcp/oauth/register", async (c) => {
+    if (!resolveApprovalUrl(deps)) {
+      return c.json(
+        jsonError(
+          404,
+          "MCP_OAUTH_NOT_CONFIGURED",
+          "MCP OAuth is not configured",
+        ),
+        404,
+      );
+    }
+    let body: { client_name?: string; redirect_uris?: string[] } = {};
+    try {
+      body = (await c.req.json()) as typeof body;
+    } catch {
+      body = {};
+    }
+    return c.json(
+      {
+        client_id: `mcp-client-${crypto.randomUUID()}`,
+        client_name: body.client_name ?? "Claude",
+        redirect_uris: Array.isArray(body.redirect_uris)
+          ? body.redirect_uris
+          : [],
+        token_endpoint_auth_method: "none",
+        grant_types: ["authorization_code"],
+        response_types: ["code"],
+      },
+      201,
+    );
+  });
+
+  app.get("/mcp/oauth/authorize", async (c) => {
+    if (!resolveApprovalUrl(deps)) {
+      return c.json(
+        jsonError(
+          404,
+          "MCP_OAUTH_NOT_CONFIGURED",
+          "MCP OAuth is not configured",
+        ),
+        404,
+      );
+    }
+    const origin = resolveOrigin(deps.serverOrigin);
+    const url = new URL(c.req.url);
+    const responseType = url.searchParams.get("response_type");
+    const clientId = url.searchParams.get("client_id") ?? "";
+    const redirectUri = url.searchParams.get("redirect_uri") ?? "";
+    const codeChallenge = url.searchParams.get("code_challenge") ?? "";
+    const codeChallengeMethod =
+      url.searchParams.get("code_challenge_method") ?? "";
+    const state = url.searchParams.get("state");
+    const scope = url.searchParams.get("scope") ?? "vana:read";
+
+    if (responseType !== "code") {
+      return redirectWithOAuthError(
+        redirectUri,
+        "unsupported_response_type",
+        "Only response_type=code is supported",
+        state,
+      );
+    }
+
+    try {
+      const created = await createMcpOAuthAuthorization(
+        {
+          clientId,
+          redirectUri,
+          codeChallenge,
+          codeChallengeMethod,
+          scope,
+          ...(state ? { state } : {}),
+        },
+        {
+          connectionStore,
+          authorizationStore,
+          publicOrigin: origin,
+        },
+      );
+      const approvalUrl = resolveApprovalUrl(deps);
+      if (!approvalUrl) {
+        return c.json(
+          jsonError(
+            500,
+            "MCP_APPROVAL_URL_MISSING",
+            "MCP OAuth approval URL is not configured",
+          ),
+          500,
+        );
+      }
+      const approve = new URL(approvalUrl);
+      approve.searchParams.set("mcp_authorization", created.authorizationId);
+      approve.searchParams.set("ps_origin", origin);
+      return c.redirect(approve.toString(), 302);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return redirectWithOAuthError(
+        redirectUri,
+        err instanceof McpOAuthAuthorizationError
+          ? err.code
+          : "invalid_request",
+        message,
+        state,
+      );
+    }
+  });
+
+  app.post("/mcp/oauth/token", async (c) => {
+    if (!resolveApprovalUrl(deps)) {
+      return c.json(
+        jsonError(
+          404,
+          "MCP_OAUTH_NOT_CONFIGURED",
+          "MCP OAuth is not configured",
+        ),
+        404,
+      );
+    }
+    const body = await parseFormBody(c.req.raw);
+    if (body.get("grant_type") !== "authorization_code") {
+      return c.json(
+        {
+          error: "unsupported_grant_type",
+          error_description: "Only authorization_code is supported",
+        },
+        400,
+      );
+    }
+    try {
+      const token = await redeemMcpOAuthAuthorizationCode(
+        {
+          authorizationCode: body.get("code") ?? "",
+          codeVerifier: body.get("code_verifier") ?? "",
+          clientId: body.get("client_id") ?? "",
+          redirectUri: body.get("redirect_uri") ?? "",
+        },
+        { authorizationStore, connectionStore },
+      );
+      return c.json({
+        access_token: token.accessToken,
+        token_type: "Bearer",
+        ...(token.scope ? { scope: token.scope } : {}),
+      });
+    } catch (err) {
+      return c.json(
+        {
+          error:
+            err instanceof McpOAuthAuthorizationError
+              ? err.code
+              : "invalid_grant",
+          error_description: err instanceof Error ? err.message : String(err),
+        },
+        400,
+      );
+    }
+  });
+
+  app.get("/v1/mcp/oauth/authorizations/:id", async (c) => {
+    const err = await requireOwner(c);
+    if (err) return err;
+    const record = await authorizationStore.getById(c.req.param("id"));
+    if (!record) {
+      return c.json(
+        jsonError(404, "NOT_FOUND", "Authorization not found"),
+        404,
+      );
+    }
+    return c.json(toMcpOAuthAuthorizationView(record));
+  });
+
+  app.post("/v1/mcp/oauth/authorizations/:id/approve", async (c) => {
+    const err = await requireOwner(c);
+    if (err) return err;
+    let body: { grants?: McpConnectionGrant[] } = {};
+    try {
+      body = (await c.req.json()) as { grants?: McpConnectionGrant[] };
+    } catch {
+      return c.json(jsonError(400, "INVALID_BODY", "Body must be JSON"), 400);
+    }
+    if (!Array.isArray(body.grants) || body.grants.length === 0) {
+      return c.json(
+        jsonError(400, "GRANTS_REQUIRED", "Approve requires grants"),
+        400,
+      );
+    }
+    try {
+      const approved = await approveMcpOAuthAuthorization(
+        { authorizationId: c.req.param("id"), grants: body.grants },
+        { connectionStore, authorizationStore },
+      );
+      return c.json({ redirectTo: approved.redirectTo });
+    } catch (err) {
+      if (err instanceof McpOAuthAuthorizationError) {
+        return c.json(jsonError(400, err.code, err.message), 400);
+      }
+      throw err;
+    }
+  });
+
+  return app;
+}
+
+/**
  * Hono sub-app for the Claude-facing Streamable HTTP endpoint.
- * Mount under `/mcp` in `app.ts`; the route matches `/mcp/:connectionToken`.
+ * Mount under `/mcp` in `app.ts`; stable `/mcp` accepts OAuth bearer tokens
+ * and legacy `/mcp/:connectionToken` still accepts token-in-path calls.
  *
  * NOTE: this MUST receive the SAME `connectionStore` instance you pass to
  * `mcpConnectionsRoutes` — otherwise the management API creates connections
@@ -251,15 +618,32 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
     );
   }
 
-  app.all("/:connectionToken", async (c) => {
-    const rawToken = c.req.param("connectionToken");
+  async function handleToken(
+    c: Context,
+    rawToken: string | null,
+    options: { oauthChallenge: boolean },
+  ) {
+    if (!rawToken) {
+      if (!options.oauthChallenge) {
+        return c.json(
+          jsonError(401, "INVALID_TOKEN", "Missing MCP connection token"),
+          401,
+        );
+      }
+      return mcpUnauthorized(resolveOrigin(deps.serverOrigin));
+    }
     const tokenHash = await hashConnectionToken(rawToken);
     const record = await store.getByTokenHash(tokenHash);
     if (!record) {
-      // Unknown / pending / revoked token. Don't leak which.
-      return c.json(
-        jsonError(401, "INVALID_TOKEN", "Unknown or revoked MCP connection"),
-        401,
+      if (!options.oauthChallenge) {
+        return c.json(
+          jsonError(401, "INVALID_TOKEN", "Unknown or revoked MCP connection"),
+          401,
+        );
+      }
+      return mcpUnauthorized(
+        resolveOrigin(deps.serverOrigin),
+        "Unknown or revoked MCP connection",
       );
     }
     let dataApiDeps: PersonalServerDataApiDeps;
@@ -290,9 +674,20 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       lastUsedAt: new Date().toISOString(),
     });
     return response;
+  }
+
+  app.all("/", async (c) =>
+    handleToken(c, bearerToken(c.req.raw), {
+      oauthChallenge: Boolean(resolveApprovalUrl(deps)),
+    }),
+  );
+
+  app.all("/:connectionToken", async (c) => {
+    const rawToken = c.req.param("connectionToken");
+    return handleToken(c, rawToken, { oauthChallenge: false });
   });
 
   return app;
 }
 
-export { buildMcpUrl };
+export { buildMcpUrl, buildStableMcpUrl };

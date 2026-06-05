@@ -25,6 +25,7 @@ import { Hono } from "hono";
 import {
   approveMcpConnection,
   createInMemoryMcpConnectionStore,
+  createInMemoryMcpOAuthAuthorizationStore,
   createMcpConnection,
   createMcpDataReadClient,
   hashConnectionToken,
@@ -48,15 +49,35 @@ import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import { dataRoutes } from "./data.js";
-import { mcpConnectionsRoutes, mcpStreamableHttpRoutes } from "./mcp.js";
+import {
+  mcpConnectionsRoutes,
+  mcpOAuthRoutes,
+  mcpStreamableHttpRoutes,
+} from "./mcp.js";
 import { createServerApiAuth } from "../api-auth.js";
 import { createNodeDataStorage } from "../storage/node-data-storage.js";
 import type { PersonalServerDataApiDeps } from "@opendatalabs/personal-server-ts-core/api";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const ownerWallet = createTestWallet(9);
+const CLAUDE_REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback";
 
 const logger = pino({ level: "silent" });
+
+async function pkceChallenge(verifier: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(verifier),
+  );
+  let binary = "";
+  for (const byte of new Uint8Array(digest)) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/u, "");
+}
 
 function makeGatewayForGrantee(opts: {
   granteeAddress: `0x${string}`;
@@ -300,9 +321,44 @@ describe("MCP /mcp/:token route", () => {
         connectionStore: store,
         indexManager: createIndexManager(initializeDatabase(":memory:")),
         hierarchyOptions: { dataDir: "/tmp" },
+        oauthApprovalUrl: "https://app-dev.vana.org/mcp/connect/claude",
       }),
     );
     app = root;
+  });
+
+  it("returns OAuth discovery challenge on stable /mcp without bearer token", async () => {
+    const res = await app.request("/mcp", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate")).toContain(
+      `${SERVER_ORIGIN}/.well-known/oauth-protected-resource/mcp`,
+    );
+    expect((await res.json()).error.errorCode).toBe("MCP_AUTH_REQUIRED");
+  });
+
+  it("does not advertise OAuth on stable /mcp when approval URL is missing", async () => {
+    const root = new Hono();
+    root.route(
+      "/mcp",
+      mcpStreamableHttpRoutes({
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway,
+        accessLogWriter: createMockAccessLogWriter(),
+        connectionStore: store,
+        indexManager: createIndexManager(initializeDatabase(":memory:")),
+        hierarchyOptions: { dataDir: "/tmp" },
+      }),
+    );
+    const res = await root.request("/mcp", { method: "POST" });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate")).toBeNull();
+    expect((await res.json()).error.errorCode).toBe("INVALID_TOKEN");
   });
 
   it("returns 401 INVALID_TOKEN for unknown tokens", async () => {
@@ -330,6 +386,180 @@ describe("MCP /mcp/:token route", () => {
     );
     expect(res.status).toBe(401);
     expect((await res.json()).error.errorCode).toBe("INVALID_TOKEN");
+  });
+});
+
+describe("MCP OAuth routes", () => {
+  let app: Hono;
+  let store: McpConnectionStore;
+
+  beforeEach(() => {
+    store = createInMemoryMcpConnectionStore();
+    const authorizationStore = createInMemoryMcpOAuthAuthorizationStore();
+    const grantee = "0x0000000000000000000000000000000000000003" as const;
+    const gateway = makeGatewayForGrantee({ granteeAddress: grantee }).gateway;
+    const root = new Hono();
+    root.route(
+      "/",
+      mcpOAuthRoutes({
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway,
+        accessLogWriter: createMockAccessLogWriter(),
+        connectionStore: store,
+        oauthAuthorizationStore: authorizationStore,
+        oauthApprovalUrl: "https://app-dev.vana.org/mcp/connect/claude",
+      }),
+    );
+    app = root;
+  });
+
+  async function ownerRequest(
+    method: "GET" | "POST",
+    path: string,
+    body?: unknown,
+  ) {
+    const rawBody = body === undefined ? undefined : JSON.stringify(body);
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method,
+      uri: path,
+      body:
+        rawBody === undefined ? undefined : new TextEncoder().encode(rawBody),
+    });
+    return app.request(path, {
+      method,
+      headers: rawBody
+        ? { "Content-Type": "application/json", Authorization: auth }
+        : { Authorization: auth },
+      body: rawBody,
+    });
+  }
+
+  it("serves OAuth metadata", async () => {
+    const resource = await app.request(
+      "/.well-known/oauth-protected-resource/mcp",
+    );
+    expect(resource.status).toBe(200);
+    expect((await resource.json()).resource).toBe(`${SERVER_ORIGIN}/mcp`);
+
+    const authServer = await app.request(
+      "/.well-known/oauth-authorization-server",
+    );
+    expect(authServer.status).toBe(200);
+    expect((await authServer.json()).authorization_endpoint).toBe(
+      `${SERVER_ORIGIN}/mcp/oauth/authorize`,
+    );
+  });
+
+  it("returns 404 for OAuth metadata when approval URL is missing", async () => {
+    const root = new Hono();
+    root.route(
+      "/",
+      mcpOAuthRoutes({
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway: makeGatewayForGrantee({
+          granteeAddress: "0x0000000000000000000000000000000000000003",
+        }).gateway,
+        accessLogWriter: createMockAccessLogWriter(),
+        connectionStore: createInMemoryMcpConnectionStore(),
+        oauthAuthorizationStore: createInMemoryMcpOAuthAuthorizationStore(),
+      }),
+    );
+    const res = await root.request("/.well-known/oauth-protected-resource/mcp");
+    expect(res.status).toBe(404);
+    expect((await res.json()).error.errorCode).toBe("MCP_OAUTH_NOT_CONFIGURED");
+  });
+
+  it("returns JSON OAuth error when authorize cannot redirect", async () => {
+    const res = await app.request("/mcp/oauth/authorize?response_type=token");
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      error: "unsupported_response_type",
+    });
+  });
+
+  it("creates an authorization from Claude OAuth and redeems it after owner approval", async () => {
+    const register = await app.request("/mcp/oauth/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_name: "Claude",
+        redirect_uris: [CLAUDE_REDIRECT_URI],
+      }),
+    });
+    expect(register.status).toBe(201);
+    const registered = await register.json();
+    const codeVerifier = "server-route-pkce-verifier";
+
+    const authorize = await app.request(
+      `/mcp/oauth/authorize?${new URLSearchParams({
+        response_type: "code",
+        client_id: registered.client_id,
+        redirect_uri: CLAUDE_REDIRECT_URI,
+        code_challenge: await pkceChallenge(codeVerifier),
+        code_challenge_method: "S256",
+        scope: "vana:read",
+        state: "route-state",
+      })}`,
+    );
+    expect(authorize.status).toBe(302);
+    const approvalLocation = authorize.headers.get("location");
+    expect(approvalLocation).toContain(
+      "https://app-dev.vana.org/mcp/connect/claude",
+    );
+    const authorizationId = new URL(approvalLocation!).searchParams.get(
+      "mcp_authorization",
+    );
+    expect(authorizationId).toMatch(/.+/);
+
+    const pending = await ownerRequest(
+      "GET",
+      `/v1/mcp/oauth/authorizations/${authorizationId}`,
+    );
+    expect(pending.status).toBe(200);
+    const pendingBody = await pending.json();
+    expect(pendingBody.status).toBe("pending");
+
+    const approve = await ownerRequest(
+      "POST",
+      `/v1/mcp/oauth/authorizations/${authorizationId}/approve`,
+      { grants: [{ grantId: "grant-mcp-oauth", scopes: ["chatgpt.history"] }] },
+    );
+    expect(approve.status).toBe(200);
+    const redirectTo = (await approve.json()).redirectTo;
+    const redirect = new URL(redirectTo);
+    expect(`${redirect.origin}${redirect.pathname}`).toBe(CLAUDE_REDIRECT_URI);
+    expect(redirect.searchParams.get("state")).toBe("route-state");
+    const code = redirect.searchParams.get("code");
+    expect(code).toMatch(/.+/);
+
+    const token = await app.request("/mcp/oauth/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: code!,
+        code_verifier: codeVerifier,
+        client_id: registered.client_id,
+        redirect_uri: CLAUDE_REDIRECT_URI,
+      }),
+    });
+    expect(token.status).toBe(200);
+    const tokenBody = await token.json();
+    expect(tokenBody.token_type).toBe("Bearer");
+
+    const approvedConnection = await store.getByTokenHash(
+      await hashConnectionToken(tokenBody.access_token),
+    );
+    expect(approvedConnection?.status).toBe("approved");
+    expect(approvedConnection?.grants).toEqual([
+      { grantId: "grant-mcp-oauth", scopes: ["chatgpt.history"] },
+    ]);
   });
 });
 
