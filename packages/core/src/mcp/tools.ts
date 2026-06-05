@@ -94,10 +94,10 @@ const DEFAULT_SEARCH_LIMIT = 5;
 const MAX_SEARCH_LIMIT = 20;
 const DEFAULT_SEARCH_MAX_SCOPES = 6;
 const MAX_SEARCH_SCOPES = 10;
-const DEFAULT_SEARCH_TIMEOUT_MS = 3_500;
-const MAX_SEARCH_TIMEOUT_MS = 5_000;
-const DEFAULT_SEARCH_DISCOVERY_TIMEOUT_MS = 1_000;
-const MAX_SEARCH_TOTAL_TIMEOUT_MS = 10_000;
+const DEFAULT_SEARCH_TIMEOUT_MS = 30_000;
+const MAX_SEARCH_TIMEOUT_MS = 90_000;
+const DEFAULT_SEARCH_DISCOVERY_TIMEOUT_MS = 2_000;
+const MAX_SEARCH_TOTAL_TIMEOUT_MS = 90_000;
 const DEFAULT_READ_SCOPE_MAX_BYTES = 16_384;
 const MAX_READ_SCOPE_MAX_BYTES = 65_536;
 const DEFAULT_SEARCH_MAX_BYTES = 8_192;
@@ -109,6 +109,12 @@ const SEARCH_REQUESTED_SCOPES_LIMIT = MAX_SEARCH_SCOPES * 2;
 const SEARCH_SKIPPED_SCOPES_LIMIT = 50;
 const SEARCH_PREVIEW_CHARS = 600;
 const LIST_SCOPES_LIMIT = 200;
+
+// Size thresholds for sizeClass classification (raw envelope bytes)
+const SIZE_CLASS_TINY_BYTES = 10_000;
+const SIZE_CLASS_SMALL_BYTES = 100_000;
+const SIZE_CLASS_MEDIUM_BYTES = 1_000_000;
+const SIZE_CLASS_LARGE_BYTES = 10_000_000;
 
 class OperationTimeoutError extends Error {
   constructor(
@@ -297,6 +303,42 @@ function normalizeRequestedScopes(
   return { requestedScopes, skippedScopes };
 }
 
+type SizeClass = "tiny" | "small" | "medium" | "large" | "huge" | "unknown";
+
+function classifySizeBytes(sizeBytes: number | undefined): SizeClass {
+  if (sizeBytes === undefined) return "unknown";
+  if (sizeBytes < SIZE_CLASS_TINY_BYTES) return "tiny";
+  if (sizeBytes < SIZE_CLASS_SMALL_BYTES) return "small";
+  if (sizeBytes < SIZE_CLASS_MEDIUM_BYTES) return "medium";
+  if (sizeBytes < SIZE_CLASS_LARGE_BYTES) return "large";
+  return "huge";
+}
+
+function isSearchRecommended(
+  sizeClass: SizeClass,
+  hasBlocks: boolean,
+): { recommended: boolean; reason?: string } {
+  if (!hasBlocks) {
+    return {
+      recommended: false,
+      reason: "bounded block reads unavailable for this scope",
+    };
+  }
+  if (sizeClass === "large" || sizeClass === "huge") {
+    return {
+      recommended: false,
+      reason: `scope is ${sizeClass}; use explicit scopes with cursor to search safely`,
+    };
+  }
+  if (sizeClass === "unknown") {
+    return {
+      recommended: false,
+      reason: "scope size unknown; pass explicitly to search",
+    };
+  }
+  return { recommended: true };
+}
+
 async function resolveSearchScopes({
   connection,
   maxScopes,
@@ -414,8 +456,8 @@ async function resolveSearchScopes({
   }
 
   return {
-    scopes: Array.from(scopes).sort(),
-    skippedScopes: Array.from(new Set(skippedScopes)).sort(),
+    scopes: Array.from(scopes),
+    skippedScopes: Array.from(new Set(skippedScopes)),
     errors,
   };
 }
@@ -424,7 +466,8 @@ const listGrantedSources: McpToolDefinition = {
   name: "list_granted_sources",
   title: "List granted sources",
   description:
-    "List the data sources (e.g. instagram, chatgpt) the user has granted this MCP connection access to.",
+    "List the data source identifiers (e.g. instagram, chatgpt) granted to this MCP connection. " +
+    "Use list_granted_scopes for per-scope planning metadata including readiness and size.",
   inputSchema: {},
   async handler(_args, { connection }) {
     return textResult({ sources: uniqueSources(connection) });
@@ -435,10 +478,43 @@ const listGrantedScopes: McpToolDefinition = {
   name: "list_granted_scopes",
   title: "List granted scopes",
   description:
-    "List the scope identifiers the user has approved this MCP connection to read.",
+    "List granted scopes with planning metadata. Call this first before search_personal_context or read_scope. " +
+    "Each scope entry includes dataStatus (ready/needs_refresh/unavailable), sizeClass, searchRecommended, " +
+    "and sizeBytes when known. Prefer scopes with searchRecommended:true and dataStatus:ready for search. " +
+    "Pass large or unavailable scopes explicitly with a cursor to search them safely.",
   inputSchema: {},
-  async handler(_args, { connection }) {
-    return textResult({ scopes: uniqueScopes(connection) });
+  async handler(_args, { connection, readClient }) {
+    const grantedScopes = uniqueScopes(connection);
+    const scopeEntries = grantedScopes.map((scope) => {
+      const meta = readClient.getScopeMetadata(scope);
+      if (!meta) {
+        return {
+          scope,
+          dataStatus: "needs_refresh" as const,
+          sizeClass: "unknown" as SizeClass,
+          searchRecommended: false,
+          reason: "no local data found; refresh your data connection",
+        };
+      }
+      const sizeClass = classifySizeBytes(meta.sizeBytes);
+      const { recommended, reason } = isSearchRecommended(
+        sizeClass,
+        meta.hasBlocks,
+      );
+      return {
+        scope,
+        source: scope.split(".")[0],
+        collectedAt: meta.collectedAt,
+        dataStatus: meta.hasBlocks
+          ? ("ready" as const)
+          : ("needs_refresh" as const),
+        sizeBytes: meta.sizeBytes,
+        sizeClass,
+        searchRecommended: recommended,
+        ...(reason ? { reason } : {}),
+      };
+    });
+    return textResult({ scopes: scopeEntries });
   },
 };
 
@@ -446,7 +522,9 @@ const readScope: McpToolDefinition = {
   name: "read_scope",
   title: "Read scope",
   description:
-    "Read approved data for a single scope as bounded block pages. Returns blocks, page cursors, and warnings instead of an unlimited envelope.",
+    "Read approved data for a single scope as bounded block pages. " +
+    "Use after search_personal_context identifies a relevant scope, or for precise full retrieval. " +
+    "Pass cursor from nextCursor to page through large scopes. Returns blocks, page metadata, and warnings.",
   inputSchema: {
     scope: z
       .string()
@@ -534,20 +612,92 @@ const readScope: McpToolDefinition = {
   },
 };
 
+// Opaque cross-scope search cursor. Encodes which scope to resume from and
+// the block cursor within that scope. Base64-encoded JSON for transparency.
+interface SearchCursorPayload {
+  /** Index into the resolved scope list to start from. */
+  scopeIndex: number;
+  /** Block cursor within that scope (if partial page was in progress). */
+  blockCursor?: string;
+}
+
+function encodeSearchCursor(payload: SearchCursorPayload): string {
+  const json = JSON.stringify(payload);
+  // TextEncoder + Uint8Array → base64url without Node.js Buffer dependency
+  const bytes = new TextEncoder().encode(json);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+function decodeSearchCursor(raw: string): SearchCursorPayload | null {
+  try {
+    const base64 = raw.replace(/-/g, "+").replace(/_/g, "/");
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    const json = new TextDecoder().decode(bytes);
+    const payload = JSON.parse(json);
+    if (
+      typeof payload === "object" &&
+      payload !== null &&
+      typeof payload.scopeIndex === "number"
+    ) {
+      return {
+        scopeIndex: payload.scopeIndex,
+        blockCursor:
+          typeof payload.blockCursor === "string"
+            ? payload.blockCursor
+            : undefined,
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 const searchPersonalContext: McpToolDefinition = {
   name: "search_personal_context",
   title: "Search personal context",
   description:
-    "Search a bounded set of approved scopes for a literal query string. For large data, call list_granted_scopes first and pass specific scopes. This tool caps scope count, per-scope work, and response previews; skippedScopes means narrow the scopes and retry.",
+    "Search approved personal data scopes for a literal query string. " +
+    "Call list_granted_scopes first to see which scopes are ready and searchRecommended. " +
+    "Pass specific scopes to limit search; omitting scopes auto-selects small, ready scopes. " +
+    "Large or unavailable scopes are skipped with reasons in skippedScopes. " +
+    "When nextSearchCursor is returned, call again with cursor to continue searching remaining scopes. " +
+    "The server owns the deadline — unbounded search always returns within the configured budget. " +
+    "Use read_scope for precise retrieval once search identifies a relevant scope.",
   inputSchema: {
     query: z.string().min(1).max(SEARCH_QUERY_MAX_CHARS),
     scopes: z
       .array(z.string().min(1).max(SEARCH_SCOPE_MAX_CHARS))
       .max(SEARCH_REQUESTED_SCOPES_LIMIT)
       .optional(),
+    cursor: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "Continuation cursor from a prior search response's nextSearchCursor.",
+      ),
+    maxResults: z.number().int().min(1).max(MAX_SEARCH_LIMIT).optional(),
     limit: z.number().int().min(1).max(MAX_SEARCH_LIMIT).optional(),
     maxScopes: z.number().int().min(1).max(MAX_SEARCH_SCOPES).optional(),
-    timeoutMs: z.number().int().min(50).max(MAX_SEARCH_TIMEOUT_MS).optional(),
+    timeoutMs: z
+      .number()
+      .int()
+      .min(1000)
+      .max(MAX_SEARCH_TIMEOUT_MS)
+      .optional()
+      .describe("Wall-clock budget in ms. Capped at 90000 by the server."),
     maxBytes: z.number().int().min(1).max(MAX_SEARCH_MAX_BYTES).optional(),
   },
   async handler(args, { connection, readClient }) {
@@ -570,8 +720,9 @@ const searchPersonalContext: McpToolDefinition = {
 
     const normalizedScopes = normalizeRequestedScopes(args.scopes, connection);
     const requestedScopes = normalizedScopes.requestedScopes;
+    // maxResults takes precedence over deprecated limit for forward compat
     const limit = clampInteger(
-      args.limit,
+      args.maxResults ?? args.limit,
       DEFAULT_SEARCH_LIMIT,
       1,
       MAX_SEARCH_LIMIT,
@@ -585,7 +736,7 @@ const searchPersonalContext: McpToolDefinition = {
     const timeoutMs = clampInteger(
       args.timeoutMs,
       DEFAULT_SEARCH_TIMEOUT_MS,
-      50,
+      1000,
       MAX_SEARCH_TIMEOUT_MS,
     );
     const maxBytes = clampInteger(
@@ -594,11 +745,18 @@ const searchPersonalContext: McpToolDefinition = {
       1,
       MAX_SEARCH_MAX_BYTES,
     );
+    const totalTimeoutMs = Math.min(MAX_SEARCH_TOTAL_TIMEOUT_MS, timeoutMs);
+    const startedAt = Date.now();
+    const deadline = startedAt + totalTimeoutMs;
     const discoveryTimeoutMs = Math.min(
-      timeoutMs,
+      totalTimeoutMs,
       DEFAULT_SEARCH_DISCOVERY_TIMEOUT_MS,
     );
     const needle = query.toLowerCase();
+
+    // Decode continuation cursor if provided
+    const resumeCursor =
+      typeof args.cursor === "string" ? decodeSearchCursor(args.cursor) : null;
 
     const resolved = await resolveSearchScopes({
       connection,
@@ -618,21 +776,34 @@ const searchPersonalContext: McpToolDefinition = {
     const searchedScopes: string[] = [];
     const truncatedScopes: string[] = [];
     const errors = [...resolved.errors];
-    const totalTimeoutMs = Math.min(
-      MAX_SEARCH_TOTAL_TIMEOUT_MS,
-      timeoutMs * Math.max(1, resolved.scopes.length),
-    );
-    const deadline = Date.now() + totalTimeoutMs;
 
-    for (const scope of resolved.scopes) {
+    // When resuming, start from the scope index encoded in the cursor
+    const startScopeIndex = resumeCursor
+      ? Math.max(0, Math.min(resumeCursor.scopeIndex, resolved.scopes.length))
+      : 0;
+    const initialBlockCursor = resumeCursor?.blockCursor ?? undefined;
+
+    let nextSearchCursor: string | undefined;
+
+    for (
+      let scopeIndex = startScopeIndex;
+      scopeIndex < resolved.scopes.length;
+      scopeIndex += 1
+    ) {
+      const scope = resolved.scopes[scopeIndex];
       const remainingBeforeScope = deadline - Date.now();
       if (remainingBeforeScope <= 0) {
+        // Budget exhausted — offer cursor to continue from this scope
+        nextSearchCursor = encodeSearchCursor({ scopeIndex });
         errors.push({ scope, error: "search_total_timeout" });
         break;
       }
       const grant = resolveGrantForScope(connection, scope);
       if (!grant) continue;
-      let cursor: string | undefined;
+
+      // Use block cursor from resume only for the first scope we process
+      let cursor: string | undefined =
+        scopeIndex === startScopeIndex ? initialBlockCursor : undefined;
       let pageCount = 0;
       let scopeHasMatch = false;
       let scopeTruncated = false;
@@ -641,7 +812,13 @@ const searchPersonalContext: McpToolDefinition = {
         while (pageCount < SEARCH_MAX_PAGES_PER_SCOPE) {
           const remainingMs = deadline - Date.now();
           if (remainingMs <= 0) {
+            // Budget hit mid-scope — encode cursor pointing at this scope + block
+            nextSearchCursor = encodeSearchCursor({
+              scopeIndex,
+              blockCursor: cursor,
+            });
             errors.push({ scope, error: "search_total_timeout" });
+            scopeTruncated = Boolean(cursor);
             break;
           }
           pageCount += 1;
@@ -649,6 +826,14 @@ const searchPersonalContext: McpToolDefinition = {
             searchedScopes.push(scope);
             scopeSearched = true;
           }
+          const remainingScopes = resolved.scopes.length - scopeIndex;
+          const perScopeTimeoutMs = Math.min(
+            Math.max(
+              250,
+              Math.floor(remainingMs / Math.max(1, remainingScopes)),
+            ),
+            remainingMs,
+          );
           const result = await withTimeout(
             readClient.readScopeBlocks({
               scope,
@@ -656,7 +841,7 @@ const searchPersonalContext: McpToolDefinition = {
               cursor,
               maxBytes,
             }),
-            Math.min(timeoutMs, remainingMs),
+            perScopeTimeoutMs,
             `read blocks for ${scope}`,
           );
           const pageText = blockPageSearchText(result.blocks);
@@ -679,6 +864,11 @@ const searchPersonalContext: McpToolDefinition = {
               matches.length >= limit
             ) {
               scopeTruncated = true;
+              // More pages remain in this scope — cursor points here
+              nextSearchCursor = encodeSearchCursor({
+                scopeIndex,
+                blockCursor: cursor,
+              });
               break;
             }
             continue;
@@ -705,12 +895,23 @@ const searchPersonalContext: McpToolDefinition = {
           ),
         });
       }
-      if (matches.length >= limit) break;
+      if (matches.length >= limit) {
+        // Result limit hit — if more scopes remain, offer cursor for next scope
+        const nextScopeIndex = scopeIndex + 1;
+        if (nextScopeIndex < resolved.scopes.length) {
+          nextSearchCursor = encodeSearchCursor({
+            scopeIndex: nextScopeIndex,
+          });
+        }
+        break;
+      }
     }
+
+    const elapsedMs = Date.now() - startedAt;
 
     return textResult({
       query,
-      matches,
+      results: matches,
       searchedScopes,
       skippedScopes: [
         ...normalizedScopes.skippedScopes,
@@ -718,8 +919,10 @@ const searchPersonalContext: McpToolDefinition = {
       ],
       truncatedScopes,
       errors,
+      ...(nextSearchCursor ? { nextSearchCursor } : {}),
+      elapsedMs,
       limits: {
-        maxMatches: limit,
+        maxResults: limit,
         maxScopes,
         maxRequestedScopes: SEARCH_REQUESTED_SCOPES_LIMIT,
         timeoutMs,
