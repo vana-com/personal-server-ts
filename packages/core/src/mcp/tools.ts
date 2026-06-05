@@ -88,6 +88,41 @@ function uniqueSources(connection: McpConnectionRecord): string[] {
   return Array.from(set).sort();
 }
 
+const SEARCH_PREVIEW_CHARS = 800;
+
+function stringifyForSearch(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+
+  try {
+    return JSON.stringify(value) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function previewMatch(haystack: string, matchIndex: number): string {
+  const halfWindow = Math.floor(SEARCH_PREVIEW_CHARS / 2);
+  const start = Math.max(0, matchIndex - halfWindow);
+  const end = Math.min(haystack.length, start + SEARCH_PREVIEW_CHARS);
+  const prefix = start > 0 ? "..." : "";
+  const suffix = end < haystack.length ? "..." : "";
+  return `${prefix}${haystack.slice(start, end)}${suffix}`;
+}
+
+function getEnvelopeCollectedAt(value: unknown): string | undefined {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !("collectedAt" in value)
+  ) {
+    return undefined;
+  }
+  const collectedAt = (value as { collectedAt?: unknown }).collectedAt;
+  return typeof collectedAt === "string" ? collectedAt : undefined;
+}
+
 /**
  * Resolve a requested scope to a covering grant id from the connection's
  * approved grants. A scope is "covered" when an approved grant's scopes
@@ -119,6 +154,69 @@ function resolveGrantForScope(
     }
   }
   return null;
+}
+
+async function expandSearchScopes(
+  connection: McpConnectionRecord,
+  readClient: McpDataReadClient,
+  requestedScopes: string[],
+): Promise<{
+  scopes: string[];
+  errors: Array<{
+    scope: string;
+    grantId: string;
+    status: number;
+    bodyPreview: string;
+  }>;
+}> {
+  const scopes = new Set<string>();
+  const errors: Array<{
+    scope: string;
+    grantId: string;
+    status: number;
+    bodyPreview: string;
+  }> = [];
+
+  for (const requested of requestedScopes) {
+    const grant = resolveGrantForScope(connection, requested);
+    if (!grant) continue;
+
+    const wildcardPrefix =
+      requested === "*"
+        ? ""
+        : requested.endsWith(".*")
+          ? `${requested.slice(0, -2)}.`
+          : null;
+
+    if (wildcardPrefix === null) {
+      scopes.add(requested);
+      continue;
+    }
+
+    try {
+      const listed = await readClient.listScopes({
+        scopePrefix: wildcardPrefix,
+        grantId: grant.grantId,
+        limit: 200,
+      });
+      for (const summary of listed.scopes) {
+        if (resolveGrantForScope(connection, summary.scope)) {
+          scopes.add(summary.scope);
+        }
+      }
+    } catch (err) {
+      errors.push({
+        scope: requested,
+        grantId: grant.grantId,
+        status: err instanceof McpDataReadError ? err.status : 500,
+        bodyPreview: stringifyForSearch(
+          err instanceof McpDataReadError ? err.body : String(err),
+        ).slice(0, SEARCH_PREVIEW_CHARS),
+      });
+    }
+  }
+
+  return { scopes: Array.from(scopes).sort(), errors };
 }
 
 const listGrantedSources: McpToolDefinition = {
@@ -232,10 +330,24 @@ const searchPersonalContext: McpToolDefinition = {
     const matches: Array<{
       scope: string;
       grantId: string;
-      data: unknown;
+      collectedAt?: string;
+      preview: string;
+      resultSizeChars: number;
     }> = [];
+    const errors: Array<{
+      scope: string;
+      grantId: string;
+      status: number;
+      bodyPreview: string;
+    }> = [];
+    const expanded = await expandSearchScopes(
+      connection,
+      readClient,
+      requestedScopes,
+    );
+    errors.push(...expanded.errors);
 
-    for (const scope of requestedScopes) {
+    for (const scope of expanded.scopes) {
       if (matches.length >= limit) break;
       const grant = resolveGrantForScope(connection, scope);
       if (!grant) continue;
@@ -244,31 +356,33 @@ const searchPersonalContext: McpToolDefinition = {
           scope,
           grantId: grant.grantId,
         });
-        const haystack = JSON.stringify(result.body ?? "").toLowerCase();
-        if (haystack.includes(needle)) {
+        const haystack = stringifyForSearch(result.body ?? "");
+        const matchIndex = haystack.toLowerCase().indexOf(needle);
+        if (matchIndex >= 0) {
           matches.push({
             scope,
             grantId: grant.grantId,
-            data: result.body,
+            collectedAt: getEnvelopeCollectedAt(result.body),
+            preview: previewMatch(haystack, matchIndex),
+            resultSizeChars: haystack.length,
           });
         }
       } catch (err) {
         if (err instanceof McpDataReadError && err.status === 404) continue;
         // Surface non-404 errors as part of the result so the caller can debug,
         // but keep going across other scopes.
-        matches.push({
+        errors.push({
           scope,
           grantId: grant.grantId,
-          data: {
-            error: "data_read_failed",
-            status: err instanceof McpDataReadError ? err.status : 500,
-            body: err instanceof McpDataReadError ? err.body : String(err),
-          },
+          status: err instanceof McpDataReadError ? err.status : 500,
+          bodyPreview: stringifyForSearch(
+            err instanceof McpDataReadError ? err.body : String(err),
+          ).slice(0, SEARCH_PREVIEW_CHARS),
         });
       }
     }
 
-    return textResult({ query, matches });
+    return textResult({ query, matches, errors });
   },
 };
 
