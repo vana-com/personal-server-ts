@@ -61,6 +61,16 @@ import type { PersonalServerDataApiDeps } from "@opendatalabs/personal-server-ts
 const SERVER_ORIGIN = "http://localhost:8080";
 const ownerWallet = createTestWallet(9);
 const CLAUDE_REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback";
+const gatewayConfig = {
+  url: "https://gateway.test",
+  chainId: 14800,
+  contracts: {
+    dataRegistry: "0x0000000000000000000000000000000000000001",
+    dataPortabilityPermissions: "0x0000000000000000000000000000000000000002",
+    dataPortabilityServer: "0x0000000000000000000000000000000000000003",
+    dataPortabilityGrantees: "0x0000000000000000000000000000000000000004",
+  },
+} as const;
 
 const logger = pino({ level: "silent" });
 
@@ -127,7 +137,9 @@ function makeGatewayForGrantee(opts: {
     getSchema: vi.fn().mockResolvedValue(null),
     registerServer: vi.fn().mockResolvedValue({ alreadyRegistered: false }),
     registerFile: vi.fn().mockResolvedValue({}),
-    createGrant: vi.fn().mockResolvedValue({}),
+    createGrant: vi.fn().mockResolvedValue({
+      grantId: opts.grantId ?? "grant-mcp-1",
+    }),
     revokeGrant: vi.fn().mockResolvedValue(undefined),
   };
   return { gateway, grant };
@@ -197,6 +209,12 @@ describe("MCP owner connection routes", () => {
         serverOrigin: SERVER_ORIGIN,
         serverOwner: ownerWallet.address,
         gateway,
+        gatewayConfig,
+        serverSigner: {
+          signGrantRegistration: vi
+            .fn()
+            .mockResolvedValue("0xgrantsig" as `0x${string}`),
+        },
         accessLogWriter: createMockAccessLogWriter(),
         connectionStore: store,
       }),
@@ -317,6 +335,12 @@ describe("MCP /mcp/:token route", () => {
         serverOrigin: SERVER_ORIGIN,
         serverOwner: ownerWallet.address,
         gateway,
+        gatewayConfig,
+        serverSigner: {
+          signGrantRegistration: vi
+            .fn()
+            .mockResolvedValue("0xgrantsig" as `0x${string}`),
+        },
         accessLogWriter: createMockAccessLogWriter(),
         connectionStore: store,
         indexManager: createIndexManager(initializeDatabase(":memory:")),
@@ -406,6 +430,12 @@ describe("MCP OAuth routes", () => {
         serverOrigin: SERVER_ORIGIN,
         serverOwner: ownerWallet.address,
         gateway,
+        gatewayConfig,
+        serverSigner: {
+          signGrantRegistration: vi
+            .fn()
+            .mockResolvedValue("0xgrantsig" as `0x${string}`),
+        },
         accessLogWriter: createMockAccessLogWriter(),
         connectionStore: store,
         oauthAuthorizationStore: authorizationStore,
@@ -528,7 +558,7 @@ describe("MCP OAuth routes", () => {
     const approve = await ownerRequest(
       "POST",
       `/v1/mcp/oauth/authorizations/${authorizationId}/approve`,
-      { grants: [{ grantId: "grant-mcp-oauth", scopes: ["chatgpt.history"] }] },
+      { scopes: ["chatgpt.history"] },
     );
     expect(approve.status).toBe(200);
     const redirectTo = (await approve.json()).redirectTo;
@@ -558,7 +588,7 @@ describe("MCP OAuth routes", () => {
     );
     expect(approvedConnection?.status).toBe("approved");
     expect(approvedConnection?.grants).toEqual([
-      { grantId: "grant-mcp-oauth", scopes: ["chatgpt.history"] },
+      { grantId: "grant-mcp-1", scopes: ["chatgpt.history"] },
     ]);
   });
 });

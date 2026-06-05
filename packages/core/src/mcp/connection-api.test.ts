@@ -4,7 +4,7 @@
  * + the in-memory `McpConnectionStore`.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   createInMemoryMcpConnectionStore,
   createInMemoryMcpOAuthAuthorizationStore,
@@ -23,9 +23,19 @@ import {
   redeemMcpOAuthAuthorizationCode,
   revokeMcpConnection,
 } from "./connection-api.js";
+import { ensureMcpGranteeRegistered } from "./builder-registration.js";
 
 const PUBLIC_ORIGIN = "https://example-session.relay.test";
 const REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback";
+const GATEWAY_CONFIG = {
+  chainId: 14800,
+  contracts: {
+    dataRegistry: "0x0000000000000000000000000000000000000001",
+    dataPortabilityPermissions: "0x0000000000000000000000000000000000000002",
+    dataPortabilityServer: "0x0000000000000000000000000000000000000003",
+    dataPortabilityGrantees: "0x0000000000000000000000000000000000000004",
+  },
+} as const;
 
 async function pkceChallenge(verifier: string): Promise<string> {
   const digest = await crypto.subtle.digest(
@@ -263,5 +273,46 @@ describe("mcp/connection-api", () => {
         { authorizationStore, connectionStore },
       ),
     ).rejects.toThrow(/already been used/i);
+  });
+
+  it("self-registers the generated MCP grantee when it is missing", async () => {
+    const store = createInMemoryMcpConnectionStore();
+    const created = await createMcpConnection(
+      { displayName: "MCP client" },
+      { store, publicOrigin: PUBLIC_ORIGIN },
+    );
+    const connection = await store.getById(created.connectionId);
+    expect(connection).not.toBeNull();
+
+    const getBuilder = vi.fn().mockResolvedValue(null);
+    const fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ success: true, builderId: "0xbuilder" }), {
+        status: 201,
+      }),
+    );
+
+    await ensureMcpGranteeRegistered({
+      connection: connection!,
+      gateway: { getBuilder },
+      gatewayConfig: GATEWAY_CONFIG,
+      gatewayUrl: "https://gateway.test/",
+      appUrl: "https://mcp-client.test",
+      fetch,
+    });
+
+    expect(getBuilder).toHaveBeenCalledWith(connection!.granteeAddress);
+    expect(fetch).toHaveBeenCalledOnce();
+    const [url, init] = fetch.mock.calls[0]!;
+    expect(url).toBe("https://gateway.test/v1/builders");
+    expect((init as RequestInit).method).toBe("POST");
+    expect(
+      ((init as RequestInit).headers as Record<string, string>).authorization,
+    ).toMatch(/^Web3Signed 0x[0-9a-fA-F]{130}$/);
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual({
+      ownerAddress: connection!.granteeAddress,
+      granteeAddress: connection!.granteeAddress,
+      publicKey: connection!.granteePublicKey,
+      appUrl: "https://mcp-client.test",
+    });
   });
 });

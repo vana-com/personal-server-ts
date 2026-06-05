@@ -13,6 +13,17 @@
  */
 
 import { generateMcpGrantee } from "./grantee.js";
+import { createGrantContract } from "../contracts/index.js";
+import type {
+  DataPortabilityGatewayConfig,
+  GatewayClient,
+} from "@opendatalabs/vana-sdk/browser";
+import type { ServerSigner } from "../signing/index.js";
+import {
+  appUrlFromOAuthRedirectUri,
+  ensureMcpGranteeRegistered,
+  McpGranteeRegistrationError,
+} from "./builder-registration.js";
 import type {
   McpConnectionRecord,
   McpConnectionStore,
@@ -285,6 +296,8 @@ export class McpOAuthAuthorizationError extends Error {
   constructor(
     public code: string,
     message: string,
+    public status = 400,
+    public body?: unknown,
   ) {
     super(message);
     this.name = "McpOAuthAuthorizationError";
@@ -392,6 +405,13 @@ export interface ApproveMcpOAuthAuthorizationInput {
   grants: McpConnectionGrant[];
 }
 
+export interface ApproveMcpOAuthAuthorizationScopesInput {
+  authorizationId: string;
+  scopes: string[];
+  expiresAt?: number;
+  nonce?: number;
+}
+
 export interface ApproveMcpOAuthAuthorizationOptions {
   connectionStore: McpConnectionStore;
   authorizationStore: McpOAuthAuthorizationStore;
@@ -460,6 +480,106 @@ export async function approveMcpOAuthAuthorization(
   }
 
   return { redirectTo: redirectTo.toString(), authorizationCode };
+}
+
+export interface ApproveMcpOAuthAuthorizationScopesOptions extends ApproveMcpOAuthAuthorizationOptions {
+  gateway: Pick<GatewayClient, "getBuilder" | "createGrant">;
+  gatewayConfig: DataPortabilityGatewayConfig;
+  gatewayUrl: string;
+  serverOwner?: `0x${string}`;
+  serverSigner?: Pick<ServerSigner, "signGrantRegistration">;
+  fetch?: typeof fetch;
+}
+
+export async function approveMcpOAuthAuthorizationWithScopes(
+  input: ApproveMcpOAuthAuthorizationScopesInput,
+  options: ApproveMcpOAuthAuthorizationScopesOptions,
+): Promise<ApproveMcpOAuthAuthorizationOutput> {
+  const record = await options.authorizationStore.getById(
+    input.authorizationId,
+  );
+  if (!record) {
+    throw new McpOAuthAuthorizationError(
+      "not_found",
+      `mcp oauth authorization ${input.authorizationId} not found`,
+      404,
+    );
+  }
+  if (!Array.isArray(input.scopes) || input.scopes.length === 0) {
+    throw new McpOAuthAuthorizationError(
+      "scopes_required",
+      "Approve requires at least one scope",
+    );
+  }
+
+  const connection = await options.connectionStore.getById(record.connectionId);
+  if (!connection) {
+    throw new McpOAuthAuthorizationError(
+      "connection_not_found",
+      `mcp connection ${record.connectionId} not found`,
+      404,
+    );
+  }
+
+  try {
+    await ensureMcpGranteeRegistered({
+      connection,
+      gateway: options.gateway,
+      gatewayConfig: options.gatewayConfig,
+      gatewayUrl: options.gatewayUrl,
+      appUrl: appUrlFromOAuthRedirectUri(record.redirectUri, record.clientId),
+      fetch: options.fetch,
+    });
+  } catch (err) {
+    if (err instanceof McpGranteeRegistrationError) {
+      throw new McpOAuthAuthorizationError(
+        err.code,
+        err.message,
+        err.status ?? 502,
+        err.body,
+      );
+    }
+    throw err;
+  }
+
+  const grantResult = await createGrantContract({
+    gateway: options.gateway,
+    serverOwner: options.serverOwner,
+    serverSigner: options.serverSigner,
+    body: {
+      granteeAddress: connection.granteeAddress,
+      scopes: input.scopes,
+      ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
+      ...(input.nonce !== undefined ? { nonce: input.nonce } : {}),
+    },
+    now: () => options.now?.().getTime() ?? Date.now(),
+  });
+  if (!grantResult.ok) {
+    throw new McpOAuthAuthorizationError(
+      "grant_creation_failed",
+      extractGrantErrorMessage(grantResult.body),
+      grantResult.status,
+      grantResult.body,
+    );
+  }
+
+  const grantId = (grantResult.body as { grantId?: string }).grantId;
+  if (!grantId) {
+    throw new McpOAuthAuthorizationError(
+      "grant_creation_failed",
+      "Personal Server did not return a grant id.",
+      500,
+      grantResult.body,
+    );
+  }
+
+  return approveMcpOAuthAuthorization(
+    {
+      authorizationId: input.authorizationId,
+      grants: [{ grantId, scopes: input.scopes }],
+    },
+    options,
+  );
 }
 
 export interface RedeemMcpOAuthAuthorizationCodeInput {
@@ -568,4 +688,17 @@ async function verifyPkceS256(input: {
   const data = new TextEncoder().encode(input.codeVerifier);
   const digest = await globalThis.crypto.subtle.digest("SHA-256", data);
   return bytesToBase64Url(new Uint8Array(digest)) === input.expectedChallenge;
+}
+
+function extractGrantErrorMessage(body: unknown): string {
+  if (body && typeof body === "object") {
+    const record = body as Record<string, unknown>;
+    if (typeof record.message === "string") return record.message;
+    const nested = record.error;
+    if (nested && typeof nested === "object") {
+      const message = (nested as Record<string, unknown>).message;
+      if (typeof message === "string") return message;
+    }
+  }
+  return "Could not create MCP grant";
 }
