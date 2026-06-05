@@ -15,10 +15,16 @@ import { dataRoutes } from "./routes/data.js";
 import { grantsRoutes } from "./routes/grants.js";
 import { accessLogsRoutes } from "./routes/access-logs.js";
 import { syncRoutes } from "./routes/sync.js";
-import { mcpConnectionsRoutes, mcpStreamableHttpRoutes } from "./routes/mcp.js";
+import {
+  mcpConnectionsRoutes,
+  mcpOAuthRoutes,
+  mcpStreamableHttpRoutes,
+} from "./routes/mcp.js";
 import {
   createInMemoryMcpConnectionStore,
+  createInMemoryMcpOAuthAuthorizationStore,
   type McpConnectionStore,
+  type McpOAuthAuthorizationStore,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import { uiConfigRoutes } from "./routes/ui-config.js";
 import { uiRegistrationRoutes } from "./routes/ui-registration.js";
@@ -79,6 +85,8 @@ export interface AppDeps {
    * IndexedDB-backed (or persistent) store for production.
    */
   mcpConnectionStore?: McpConnectionStore;
+  mcpOAuthAuthorizationStore?: McpOAuthAuthorizationStore;
+  mcpOAuthApprovalUrl?: string | (() => string);
 }
 
 export function createApp(deps: AppDeps): Hono {
@@ -189,6 +197,9 @@ export function createApp(deps: AppDeps): Hono {
   // connections exist.
   const mcpConnectionStore =
     deps.mcpConnectionStore ?? createInMemoryMcpConnectionStore();
+  const mcpOAuthAuthorizationStore =
+    deps.mcpOAuthAuthorizationStore ??
+    createInMemoryMcpOAuthAuthorizationStore();
   const mcpRouteDeps = {
     logger: deps.logger,
     serverOrigin: deps.serverOrigin,
@@ -204,8 +215,11 @@ export function createApp(deps: AppDeps): Hono {
     feeVerifier: deps.feeVerifier,
     runtimeAvailability: deps.runtimeAvailability,
     connectionStore: mcpConnectionStore,
+    oauthAuthorizationStore: mcpOAuthAuthorizationStore,
+    oauthApprovalUrl: deps.mcpOAuthApprovalUrl,
   };
 
+  app.route("/", mcpOAuthRoutes(mcpRouteDeps));
   app.route("/v1/mcp/connections", mcpConnectionsRoutes(mcpRouteDeps));
   app.route("/mcp", mcpStreamableHttpRoutes(mcpRouteDeps));
 

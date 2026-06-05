@@ -8,7 +8,12 @@
  * adapter mirrors `createIndexedDbPsLiteTokenStore()`.
  */
 
-import type { McpConnectionRecord, McpConnectionStore } from "./types.js";
+import type {
+  McpConnectionRecord,
+  McpConnectionStore,
+  McpOAuthAuthorizationRecord,
+  McpOAuthAuthorizationStore,
+} from "./types.js";
 
 export function createInMemoryMcpConnectionStore(): McpConnectionStore {
   const byId = new Map<string, McpConnectionRecord>();
@@ -44,9 +49,64 @@ export function createInMemoryMcpConnectionStore(): McpConnectionStore {
     async update(id, patch) {
       const record = byId.get(id);
       if (!record) return null;
+      if (patch.tokenHash && patch.tokenHash !== record.tokenHash) {
+        byTokenHash.delete(record.tokenHash);
+        byTokenHash.set(patch.tokenHash, id);
+      }
       const updated = { ...record, ...patch };
       byId.set(id, updated);
       return { ...updated };
+    },
+  };
+}
+
+export function createInMemoryMcpOAuthAuthorizationStore(): McpOAuthAuthorizationStore {
+  const byId = new Map<string, McpOAuthAuthorizationRecord>();
+  const byCodeHash = new Map<string, string>(); // authorizationCodeHash -> id
+
+  return {
+    async create(record) {
+      if (byId.has(record.id)) {
+        throw new Error(`mcp oauth authorization ${record.id} already exists`);
+      }
+      byId.set(record.id, { ...record });
+      if (record.authorizationCodeHash) {
+        byCodeHash.set(record.authorizationCodeHash, record.id);
+      }
+    },
+
+    async getById(id) {
+      const record = byId.get(id);
+      return record ? { ...record } : null;
+    },
+
+    async getByCodeHash(authorizationCodeHash) {
+      const id = byCodeHash.get(authorizationCodeHash);
+      if (!id) return null;
+      const record = byId.get(id);
+      return record ? { ...record } : null;
+    },
+
+    async update(id, patch) {
+      const record = byId.get(id);
+      if (!record) return null;
+      if (
+        patch.authorizationCodeHash &&
+        patch.authorizationCodeHash !== record.authorizationCodeHash
+      ) {
+        byCodeHash.set(patch.authorizationCodeHash, id);
+      }
+      const updated = { ...record, ...patch };
+      byId.set(id, updated);
+      return { ...updated };
+    },
+
+    async delete(id) {
+      const record = byId.get(id);
+      if (record?.authorizationCodeHash) {
+        byCodeHash.delete(record.authorizationCodeHash);
+      }
+      byId.delete(id);
     },
   };
 }

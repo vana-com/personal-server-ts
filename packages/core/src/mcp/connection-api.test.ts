@@ -5,19 +5,42 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { createInMemoryMcpConnectionStore } from "./store.js";
+import {
+  createInMemoryMcpConnectionStore,
+  createInMemoryMcpOAuthAuthorizationStore,
+} from "./store.js";
 import {
   approveMcpConnection,
+  approveMcpOAuthAuthorization,
+  buildStableMcpUrl,
   buildMcpUrl,
   createMcpConnection,
+  createMcpOAuthAuthorization,
   hashConnectionToken,
   listMcpConnectionViews,
   McpConnectionNotFoundError,
   McpConnectionStateError,
+  redeemMcpOAuthAuthorizationCode,
   revokeMcpConnection,
 } from "./connection-api.js";
 
 const PUBLIC_ORIGIN = "https://example-session.relay.test";
+const REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback";
+
+async function pkceChallenge(verifier: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(verifier),
+  );
+  let binary = "";
+  for (const byte of new Uint8Array(digest)) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/u, "");
+}
 
 describe("mcp/connection-api", () => {
   it("creates a pending connection with grantee + raw token + mcpUrl", async () => {
@@ -159,5 +182,86 @@ describe("mcp/connection-api", () => {
     expect(buildMcpUrl("https://x.relay.test/", "abc")).toBe(
       "https://x.relay.test/mcp/abc",
     );
+  });
+
+  it("buildStableMcpUrl trims trailing slash on origin", () => {
+    expect(buildStableMcpUrl("https://x.relay.test/")).toBe(
+      "https://x.relay.test/mcp",
+    );
+  });
+
+  it("creates, approves, and redeems an OAuth authorization for stable /mcp", async () => {
+    const connectionStore = createInMemoryMcpConnectionStore();
+    const authorizationStore = createInMemoryMcpOAuthAuthorizationStore();
+    const codeVerifier = "correct-horse-battery-staple";
+    const created = await createMcpOAuthAuthorization(
+      {
+        clientId: "claude-client",
+        redirectUri: REDIRECT_URI,
+        codeChallenge: await pkceChallenge(codeVerifier),
+        codeChallengeMethod: "S256",
+        scope: "vana:read",
+        state: "state-123",
+      },
+      {
+        connectionStore,
+        authorizationStore,
+        publicOrigin: PUBLIC_ORIGIN,
+      },
+    );
+
+    const pending = await authorizationStore.getById(created.authorizationId);
+    expect(pending?.status).toBe("pending");
+    expect(JSON.stringify(pending)).not.toContain("connectionToken");
+    expect(await connectionStore.getById(created.connectionId)).toMatchObject({
+      status: "pending",
+      granteeAddress: created.granteeAddress,
+    });
+
+    const approved = await approveMcpOAuthAuthorization(
+      {
+        authorizationId: created.authorizationId,
+        grants: [{ grantId: "grant-1", scopes: ["chatgpt.history"] }],
+      },
+      { connectionStore, authorizationStore },
+    );
+    const redirect = new URL(approved.redirectTo);
+    expect(`${redirect.origin}${redirect.pathname}`).toBe(REDIRECT_URI);
+    expect(redirect.searchParams.get("state")).toBe("state-123");
+    expect(redirect.searchParams.get("code")).toBe(approved.authorizationCode);
+
+    const token = await redeemMcpOAuthAuthorizationCode(
+      {
+        authorizationCode: approved.authorizationCode,
+        codeVerifier,
+        clientId: "claude-client",
+        redirectUri: REDIRECT_URI,
+      },
+      { authorizationStore, connectionStore },
+    );
+    expect(token.scope).toBe("vana:read");
+    expect(token.accessToken).toMatch(/^[A-Za-z0-9_-]{20,}$/);
+    expect(
+      JSON.stringify(await authorizationStore.getById(created.authorizationId)),
+    ).not.toContain(token.accessToken);
+
+    const tokenHash = await hashConnectionToken(token.accessToken);
+    const connection = await connectionStore.getByTokenHash(tokenHash);
+    expect(connection?.status).toBe("approved");
+    expect(connection?.grants).toEqual([
+      { grantId: "grant-1", scopes: ["chatgpt.history"] },
+    ]);
+
+    await expect(
+      redeemMcpOAuthAuthorizationCode(
+        {
+          authorizationCode: approved.authorizationCode,
+          codeVerifier,
+          clientId: "claude-client",
+          redirectUri: REDIRECT_URI,
+        },
+        { authorizationStore, connectionStore },
+      ),
+    ).rejects.toThrow(/already been used/i);
   });
 });

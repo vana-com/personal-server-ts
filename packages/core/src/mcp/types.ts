@@ -11,8 +11,10 @@
  *    reads exactly like an external builder, and the access log records the
  *    grantee address (NOT the owner) for every MCP read.
  *
- *  - a high-entropy connection token — placed in the URL the user pastes
- *    into Claude (`/mcp/<connectionToken>`). The store keeps only the
+ *  - a high-entropy connection token — used as the OAuth access token Claude
+ *    presents as `Authorization: Bearer ...` to the stable `/mcp` endpoint.
+ *    The legacy `/mcp/<connectionToken>` URL path still resolves the same
+ *    token for backward-compatible manual smokes. The store keeps only the
  *    SHA-256 hash so a leaked store dump can't be replayed.
  *
  *  - a set of grant ids minted during DCR-style consent. The MCP tools only
@@ -83,7 +85,55 @@ export interface McpConnectionStore {
         | "revokedAt"
         | "lastUsedAt"
         | "displayName"
+        | "tokenHash"
       >
     >,
   ): Promise<McpConnectionRecord | null>;
+}
+
+export type McpOAuthAuthorizationStatus =
+  | "pending"
+  | "approved"
+  | "redeemed"
+  | "denied"
+  | "expired";
+
+export interface McpOAuthAuthorizationRecord {
+  id: string;
+  clientId: string;
+  redirectUri: string;
+  codeChallenge: string;
+  codeChallengeMethod: "S256";
+  scope?: string;
+  state?: string;
+  connectionId: string;
+  granteeAddress: `0x${string}`;
+  status: McpOAuthAuthorizationStatus;
+  createdAt: string;
+  expiresAt: string;
+  approvedAt?: string;
+  authorizationCodeHash?: string;
+  redeemedAt?: string;
+}
+
+export interface McpOAuthAuthorizationStore {
+  create(record: McpOAuthAuthorizationRecord): Promise<void>;
+  getById(id: string): Promise<McpOAuthAuthorizationRecord | null>;
+  getByCodeHash(
+    authorizationCodeHash: string,
+  ): Promise<McpOAuthAuthorizationRecord | null>;
+  update(
+    id: string,
+    patch: Partial<
+      Pick<
+        McpOAuthAuthorizationRecord,
+        | "status"
+        | "approvedAt"
+        | "authorizationCodeHash"
+        | "redeemedAt"
+        | "expiresAt"
+      >
+    >,
+  ): Promise<McpOAuthAuthorizationRecord | null>;
+  delete(id: string): Promise<void>;
 }
