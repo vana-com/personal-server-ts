@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
   createMemoryPsLiteDataFileStore,
@@ -24,14 +24,13 @@ describe("createPersistentPsLiteStorage", () => {
     expect(preview.text.length).toBeLessThanOrEqual(100_000);
   });
 
-  it("previews custom file stores that omit readEnvelopePreview", async () => {
+  it("leaves custom file stores without bounded previews on the core fallback path", async () => {
     const persistence = createMemoryPsLitePersistence();
     const files = new Map<string, ReturnType<typeof createDataFileEnvelope>>();
+    const readEnvelope = vi.fn(async (path: string) => files.get(path) ?? null);
     const dataFileStore: PsLiteDataFileStore = {
       kind: "opfs",
-      async readEnvelope(path) {
-        return files.get(path) ?? null;
-      },
+      readEnvelope,
       async writeEnvelope(path, envelope) {
         files.set(path, envelope);
         return new TextEncoder().encode(JSON.stringify(envelope)).byteLength;
@@ -48,10 +47,11 @@ describe("createPersistentPsLiteStorage", () => {
     const envelope = createDataFileEnvelope(
       "notes.profile",
       "2026-05-08T00:00:00.000Z",
-      { text: 'line one\nline "two" uses C:\\tmp' },
+      { text: "x".repeat(10_000) },
     );
 
     const write = await storage.writeEnvelope(envelope);
+    expect(write.sizeBytes).toBeGreaterThan(1_000);
     await storage.insertEntry({
       fileId: "file-1",
       path: write.relativePath,
@@ -60,14 +60,8 @@ describe("createPersistentPsLiteStorage", () => {
       sizeBytes: write.sizeBytes,
     });
 
-    await expect(
-      storage.readEnvelopePreview?.(envelope.scope, envelope.collectedAt, {
-        maxBytes: 1_000,
-      }),
-    ).resolves.toMatchObject({
-      text: expect.stringContaining('line "two" uses C:\\tmp'),
-      truncated: false,
-    });
+    expect(storage.readEnvelopePreview).toBeUndefined();
+    expect(readEnvelope).not.toHaveBeenCalled();
   });
 
   it("persists envelopes and index entries across storage reloads", async () => {

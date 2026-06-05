@@ -344,17 +344,6 @@ export async function createPersistentPsLiteStorage(
       return envelope;
     },
 
-    async readEnvelopePreview(scope, collectedAt, { maxBytes }) {
-      const path = envelopePath(scope, collectedAt);
-      const preview =
-        (await readPreviewFromFileStore(fileStore, path, maxBytes)) ??
-        (await readPreviewFromFileStore(fallbackStore, path, maxBytes));
-      if (!preview) {
-        throw new Error("Envelope not found");
-      }
-      return preview;
-    },
-
     async writeEnvelope(envelope): Promise<WriteResult> {
       const path = envelopePath(envelope.scope, envelope.collectedAt);
       const sizeBytes = await fileStore.writeEnvelope(path, envelope);
@@ -445,6 +434,31 @@ export async function createPersistentPsLiteStorage(
       return true;
     },
   };
+
+  if (fileStore.readEnvelopePreview) {
+    storagePort.readEnvelopePreview = async (
+      scope,
+      collectedAt,
+      { maxBytes },
+    ) => {
+      const path = envelopePath(scope, collectedAt);
+      const primaryPreview = await readPreviewFromFileStore(
+        fileStore,
+        path,
+        maxBytes,
+      );
+      const preview =
+        primaryPreview ??
+        (fileStore === fallbackStore
+          ? null
+          : await readPreviewFromFileStore(fallbackStore, path, maxBytes));
+      if (!preview) {
+        throw new Error("Envelope not found");
+      }
+      return preview;
+    };
+  }
+
   return storagePort;
 }
 
@@ -453,9 +467,5 @@ async function readPreviewFromFileStore(
   path: string,
   maxBytes: number,
 ): Promise<{ text: string; truncated: boolean } | null> {
-  const preview = await store.readEnvelopePreview?.(path, { maxBytes });
-  if (preview) return preview;
-
-  const envelope = await store.readEnvelope(path);
-  return envelope ? previewEnvelopeValue(envelope, maxBytes) : null;
+  return (await store.readEnvelopePreview?.(path, { maxBytes })) ?? null;
 }
