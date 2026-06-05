@@ -5,8 +5,22 @@ import {
   createMemoryPsLitePersistence,
 } from "./test-support/memory.js";
 import { createPersistentPsLiteStorage } from "./storage.js";
+import { previewEnvelopeValue } from "./storage-utils.js";
 
 describe("createPersistentPsLiteStorage", () => {
+  it("bounds in-memory previews by traversal work for container-heavy envelopes", () => {
+    const envelope = createDataFileEnvelope(
+      "chatgpt.conversations",
+      "2026-05-08T00:00:00.000Z",
+      { items: Array.from({ length: 50_000 }, () => ({})) },
+    );
+
+    const preview = previewEnvelopeValue(envelope, 100_000);
+
+    expect(preview.truncated).toBe(true);
+    expect(preview.text.length).toBeLessThanOrEqual(100_000);
+  });
+
   it("persists envelopes and index entries across storage reloads", async () => {
     const persistence = createMemoryPsLitePersistence();
     const storage = await createPersistentPsLiteStorage(

@@ -2,6 +2,7 @@ import {
   deleteAllForScope,
   deleteDataFile,
   readDataFile,
+  readDataFilePreview,
   writeDataFile,
 } from "./hierarchy.js";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -50,6 +51,14 @@ export function createNodeDataStorage(
     },
     readEnvelope(scope: string, collectedAt: string) {
       return readDataFile(deps.hierarchyOptions, scope, collectedAt);
+    },
+    readEnvelopePreview(scope: string, collectedAt: string, { maxBytes }) {
+      return readDataFilePreview(
+        deps.hierarchyOptions,
+        scope,
+        collectedAt,
+        maxBytes,
+      );
     },
     writeEnvelope(envelope: DataFileEnvelope) {
       return writeDataFile(deps.hierarchyOptions, envelope);

@@ -63,6 +63,11 @@ export interface DataStorageEntryLookup {
   at?: string;
 }
 
+export interface DataStorageEnvelopePreview {
+  text: string;
+  truncated: boolean;
+}
+
 export interface DataStoragePort extends RuntimeStoragePort {
   listScopes(options: DataStorageScopeListOptions): {
     scopes: ScopeSummary[];
@@ -74,6 +79,11 @@ export interface DataStoragePort extends RuntimeStoragePort {
   findByFileId(fileId: string): IndexEntry | undefined;
   findUnsynced(options?: { limit?: number }): IndexEntry[];
   readEnvelope(scope: string, collectedAt: string): Promise<DataFileEnvelope>;
+  readEnvelopePreview?(
+    scope: string,
+    collectedAt: string,
+    options: { maxBytes: number },
+  ): Promise<DataStorageEnvelopePreview>;
   writeEnvelope(envelope: DataFileEnvelope): Promise<WriteResult>;
   insertEntry(entry: NewIndexEntry): IndexEntry | Promise<IndexEntry>;
   updateFileId(path: string, fileId: string): boolean | Promise<boolean>;

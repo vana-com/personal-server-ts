@@ -3,7 +3,11 @@ import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { WriteResult } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { PsLiteStorageAdapter } from "./runtime.js";
-import { createStorageReadMethods, sortEntries } from "./storage-utils.js";
+import {
+  createStorageReadMethods,
+  previewEnvelopeValue,
+  sortEntries,
+} from "./storage-utils.js";
 
 export interface PsLitePersistedStorageState {
   version: 1;
@@ -17,6 +21,10 @@ export type PsLiteFileStorageKind = "opfs" | "indexeddb";
 export interface PsLiteDataFileStore {
   readonly kind: PsLiteFileStorageKind;
   readEnvelope(path: string): Promise<DataFileEnvelope | null>;
+  readEnvelopePreview?(
+    path: string,
+    options: { maxBytes: number },
+  ): Promise<{ text: string; truncated: boolean } | null>;
   writeEnvelope(path: string, envelope: DataFileEnvelope): Promise<number>;
   deleteEnvelope(path: string): Promise<void>;
 }
@@ -80,6 +88,11 @@ export function createIndexedDbFallbackDataFileStore(
     async readEnvelope(path) {
       return envelopes.get(path) ?? null;
     },
+    async readEnvelopePreview(path, { maxBytes }) {
+      const envelope = envelopes.get(path);
+      if (!envelope) return null;
+      return previewEnvelopeValue(envelope, maxBytes);
+    },
     async writeEnvelope(path, envelope) {
       envelopes.set(path, envelope);
       return new TextEncoder().encode(JSON.stringify(envelope)).length;
@@ -135,6 +148,21 @@ export async function createOpfsPsLiteDataFileStore(): Promise<PsLiteDataFileSto
         const handle = await getOpfsFileHandle(root, path);
         const file = await handle.getFile();
         return JSON.parse(await file.text()) as DataFileEnvelope;
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "NotFoundError") {
+          return null;
+        }
+        throw err;
+      }
+    },
+    async readEnvelopePreview(path, { maxBytes }) {
+      try {
+        const handle = await getOpfsFileHandle(root, path);
+        const file = await handle.getFile();
+        return {
+          text: await file.slice(0, maxBytes).text(),
+          truncated: file.size > maxBytes,
+        };
       } catch (err) {
         if (err instanceof DOMException && err.name === "NotFoundError") {
           return null;
@@ -311,6 +339,17 @@ export async function createPersistentPsLiteStorage(
         throw new Error("Envelope not found");
       }
       return envelope;
+    },
+
+    async readEnvelopePreview(scope, collectedAt, { maxBytes }) {
+      const path = envelopePath(scope, collectedAt);
+      const preview =
+        (await fileStore.readEnvelopePreview?.(path, { maxBytes })) ??
+        (await fallbackStore.readEnvelopePreview?.(path, { maxBytes }));
+      if (!preview) {
+        throw new Error("Envelope not found");
+      }
+      return preview;
     },
 
     async writeEnvelope(envelope): Promise<WriteResult> {

@@ -1,5 +1,6 @@
 import {
   mkdir,
+  open,
   readFile,
   writeFile,
   readdir,
@@ -60,6 +61,29 @@ export async function readDataFile(
   const filePath = buildDataFilePath(options.dataDir, scope, collectedAt);
   const content = await readFile(filePath, "utf-8");
   return DataFileEnvelopeSchema.parse(JSON.parse(content));
+}
+
+/** Read a bounded UTF-8 text prefix without parsing the full envelope. */
+export async function readDataFilePreview(
+  options: HierarchyManagerOptions,
+  scope: string,
+  collectedAt: string,
+  maxBytes: number,
+): Promise<{ text: string; truncated: boolean }> {
+  const filePath = buildDataFilePath(options.dataDir, scope, collectedAt);
+  const handle = await open(filePath, "r");
+  try {
+    const stats = await handle.stat();
+    const bytesToRead = Math.max(0, Math.min(maxBytes, stats.size));
+    const buffer = Buffer.alloc(bytesToRead);
+    const { bytesRead } = await handle.read(buffer, 0, bytesToRead, 0);
+    return {
+      text: buffer.subarray(0, bytesRead).toString("utf-8"),
+      truncated: stats.size > bytesRead,
+    };
+  } finally {
+    await handle.close();
+  }
 }
 
 /** List version filenames for a scope, newest first. Empty array if scope dir doesn't exist. */

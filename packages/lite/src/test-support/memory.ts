@@ -15,6 +15,7 @@ import type {
 import type { PsLiteStateKey, PsLiteStateStore } from "../state.js";
 import {
   createStorageReadMethods,
+  previewEnvelopeValue,
   readEnvelopeFromMap,
   sortEntries,
 } from "../storage-utils.js";
@@ -139,6 +140,14 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
       return readEnvelopeFromMap(envelopes, envelopeKey(scope, collectedAt));
     },
 
+    async readEnvelopePreview(scope, collectedAt, { maxBytes }) {
+      const envelope = readEnvelopeFromMap(
+        envelopes,
+        envelopeKey(scope, collectedAt),
+      );
+      return previewEnvelopeValue(envelope, maxBytes);
+    },
+
     async writeEnvelope(envelope) {
       envelopes.set(
         envelopeKey(envelope.scope, envelope.collectedAt),
@@ -217,6 +226,11 @@ export function createMemoryPsLiteDataFileStore(
     kind,
     async readEnvelope(path) {
       return files.get(path) ?? null;
+    },
+    async readEnvelopePreview(path, { maxBytes }) {
+      const envelope = files.get(path);
+      if (!envelope) return null;
+      return previewEnvelopeValue(envelope, maxBytes);
     },
     async writeEnvelope(path, envelope) {
       files.set(path, envelope);
