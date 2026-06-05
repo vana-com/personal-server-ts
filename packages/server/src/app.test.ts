@@ -17,6 +17,7 @@ import {
   buildWeb3SignedHeader,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
+import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import pino from "pino";
 import type { TokenStore } from "./token-store.js";
 
@@ -608,6 +609,144 @@ describe("createApp", () => {
 
     const body = await res.json();
     expect(body.enabled).toBe(false);
+  });
+
+  // --- Binary / unstructured data ingestion ---
+
+  it("POST /v1/data/:scope with a binary body stores it and serves it back raw", async () => {
+    const app = makeApp();
+    const pdf = new Uint8Array([
+      0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x34,
+    ]); // %PDF-1.4
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "POST",
+      uri: "/v1/data/documents.pdf",
+      body: pdf,
+    });
+    const res = await app.request("/v1/data/documents.pdf", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/pdf",
+        "X-Filename": "report.pdf",
+        "X-Vana-Metadata": "Quarterly earnings report",
+        authorization: auth,
+      },
+      body: pdf,
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.scope).toBe("documents.pdf");
+
+    // Default GET returns the envelope (binary marker + base64 inside `data`).
+    const readAuth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: "/v1/data/documents.pdf",
+    });
+    const envRes = await app.request("/v1/data/documents.pdf", {
+      headers: { authorization: readAuth },
+    });
+    expect(envRes.status).toBe(200);
+    const envelope = await envRes.json();
+    expect(envelope.data.$binary).toBe(true);
+    expect(envelope.data.metadata).toBe("Quarterly earnings report");
+
+    // `?content=raw` returns the original bytes with the original media type.
+    const rawAuth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: "/v1/data/documents.pdf",
+    });
+    const rawRes = await app.request("/v1/data/documents.pdf?content=raw", {
+      headers: { authorization: rawAuth },
+    });
+    expect(rawRes.status).toBe(200);
+    expect(rawRes.headers.get("content-type")).toBe("application/pdf");
+    expect(rawRes.headers.get("content-disposition")).toContain("report.pdf");
+    expect(rawRes.headers.get("x-vana-metadata")).toBe(
+      "Quarterly earnings report",
+    );
+    const received = new Uint8Array(await rawRes.arrayBuffer());
+    expect(Array.from(received)).toEqual(Array.from(pdf));
+  });
+
+  it("POST binary auto-registers a no-schema schema when the scope has none", async () => {
+    const logger = pino({ level: "silent" });
+    const gateway = createMockGateway();
+    // No schema exists for this scope → triggers auto-registration.
+    (gateway.getSchemaForScope as ReturnType<typeof vi.fn>).mockResolvedValue(
+      null,
+    );
+    const signer: ServerSigner = {
+      address: "0x2222222222222222222222222222222222222222",
+      signFileRegistration: vi.fn(),
+      signGrantRegistration: vi.fn(),
+      signGrantRevocation: vi.fn(),
+      signSchemaRegistration: vi.fn().mockResolvedValue("0xschemasig"),
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ data: { schemaId: "0xnoschema" } }), {
+        status: 200,
+      }),
+    );
+
+    const app = createApp({
+      logger,
+      version: "0.0.1",
+      startedAt: new Date(),
+      indexManager,
+      hierarchyOptions: { dataDir: join(tempDir, "data") },
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway,
+      gatewayConfig: {
+        url: "https://gw.example",
+        chainId: 14800,
+        contracts: {
+          dataRegistry: "0x0",
+          dataPortabilityPermissions: "0x0",
+          dataPortabilityServer: "0x0",
+          dataPortabilityGrantees: "0x0",
+          dataPortabilityEscrow: "0x0",
+          feeRegistry: "0x0",
+        },
+      },
+      serverSigner: signer,
+      accessLogWriter: createMockAccessLogWriter(),
+      accessLogReader: createMockAccessLogReader(),
+    });
+
+    const blob = new Uint8Array([1, 2, 3, 4]);
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "POST",
+      uri: "/v1/data/random.blob",
+      body: blob,
+    });
+    const res = await app.request("/v1/data/random.blob", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        authorization: auth,
+      },
+      body: blob,
+    });
+
+    expect(res.status).toBe(201);
+    expect(signer.signSchemaRegistration).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: "random.blob" }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://gw.example/v1/schemas",
+      expect.objectContaining({ method: "POST" }),
+    );
+
+    vi.restoreAllMocks();
   });
 
   it("without syncManager — POST /v1/data/:scope returns stored status", async () => {
