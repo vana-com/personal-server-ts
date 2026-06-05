@@ -50,6 +50,7 @@ import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import {
   approveMcpOAuthAuthorization,
+  approveMcpOAuthAuthorizationWithScopes,
   approveMcpConnection,
   buildMcpProtectedResourceMetadataUrl,
   buildStableMcpUrl,
@@ -889,6 +890,12 @@ export function createPsLiteRuntime(
             now,
             runtimeAvailability: { isAvailable: () => active },
             serverOrigin: url.origin,
+            gateway: options.gateway,
+            gatewayConfig: options.config?.gateway as
+              | (DataPortabilityGatewayConfig & { url?: string })
+              | undefined,
+            serverOwner: options.serverOwner ?? options.identity?.address,
+            serverSigner: options.serverSigner,
           });
           if (mcpResponse) return mcpResponse;
         }
@@ -921,6 +928,10 @@ async function handleMcpRoute(input: {
   now: () => Date;
   runtimeAvailability: RuntimeAvailabilityPort;
   serverOrigin: string;
+  gateway?: GatewayClient;
+  gatewayConfig?: (DataPortabilityGatewayConfig & { url?: string }) | null;
+  serverOwner?: `0x${string}`;
+  serverSigner?: Pick<ServerSigner, "signGrantRegistration">;
 }): Promise<Response | null> {
   const pathname = input.url.pathname;
   const ownerPrefix = "/v1/mcp/connections";
@@ -1131,16 +1142,60 @@ async function handleMcpRoute(input: {
       if (input.request.method !== "POST") {
         return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
       }
-      let body: { grants?: McpConnectionGrant[] } = {};
+      let body: {
+        expiresAt?: number;
+        grants?: McpConnectionGrant[];
+        nonce?: number;
+        scopes?: string[];
+      } = {};
       try {
-        body = (await input.request.json()) as {
-          grants?: McpConnectionGrant[];
-        };
+        body = (await input.request.json()) as typeof body;
       } catch {
         return errorResponse(400, "INVALID_BODY", "Body must be JSON");
       }
+      if (Array.isArray(body.scopes) && body.scopes.length > 0) {
+        if (!input.gateway || !input.gatewayConfig?.url) {
+          return errorResponse(
+            500,
+            "SERVER_NOT_CONFIGURED",
+            "Gateway config is not configured",
+          );
+        }
+        try {
+          const approved = await approveMcpOAuthAuthorizationWithScopes(
+            {
+              authorizationId: id,
+              scopes: body.scopes,
+              ...(body.expiresAt !== undefined
+                ? { expiresAt: body.expiresAt }
+                : {}),
+              ...(body.nonce !== undefined ? { nonce: body.nonce } : {}),
+            },
+            {
+              connectionStore: input.store,
+              authorizationStore: input.authorizationStore,
+              gateway: input.gateway,
+              gatewayConfig: input.gatewayConfig,
+              gatewayUrl: input.gatewayConfig.url,
+              serverOwner: input.serverOwner,
+              serverSigner: input.serverSigner,
+              now: input.now,
+            },
+          );
+          return jsonResponse({ redirectTo: approved.redirectTo });
+        } catch (err) {
+          if (err instanceof McpOAuthAuthorizationError) {
+            return errorResponse(err.status as never, err.code, err.message);
+          }
+          throw err;
+        }
+      }
       if (!Array.isArray(body.grants) || body.grants.length === 0) {
-        return errorResponse(400, "GRANTS_REQUIRED", "Approve requires grants");
+        return errorResponse(
+          400,
+          "GRANTS_REQUIRED",
+          "Approve requires grants or scopes",
+        );
       }
       try {
         const approved = await approveMcpOAuthAuthorization(
@@ -1154,7 +1209,7 @@ async function handleMcpRoute(input: {
         return jsonResponse({ redirectTo: approved.redirectTo });
       } catch (err) {
         if (err instanceof McpOAuthAuthorizationError) {
-          return errorResponse(400, err.code, err.message);
+          return errorResponse(err.status as never, err.code, err.message);
         }
         throw err;
       }

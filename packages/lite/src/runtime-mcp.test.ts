@@ -59,6 +59,16 @@ import type {
 const SERVER_ORIGIN = "https://ps-lite.local";
 const CLAUDE_REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback";
 const owner = createTestWallet(7);
+const gatewayConfig = {
+  url: "https://gateway.test",
+  chainId: 14800,
+  contracts: {
+    dataRegistry: "0x0000000000000000000000000000000000000001",
+    dataPortabilityPermissions: "0x0000000000000000000000000000000000000002",
+    dataPortabilityServer: "0x0000000000000000000000000000000000000003",
+    dataPortabilityGrantees: "0x0000000000000000000000000000000000000004",
+  },
+} as const;
 
 async function pkceChallenge(verifier: string): Promise<string> {
   const digest = await crypto.subtle.digest(
@@ -123,7 +133,7 @@ function makeMockGateway(opts: {
     getSchema: vi.fn().mockResolvedValue(null),
     registerServer: vi.fn().mockResolvedValue({ alreadyRegistered: false }),
     registerFile: vi.fn().mockResolvedValue({}),
-    createGrant: vi.fn().mockResolvedValue({}),
+    createGrant: vi.fn().mockResolvedValue({ grantId: opts.grantId }),
     revokeGrant: vi.fn().mockResolvedValue(undefined),
   } as unknown as GatewayClient;
 }
@@ -170,7 +180,13 @@ function buildRuntime(
   const runtime = createPsLiteRuntime({
     active: true,
     storage,
+    config: { gateway: gatewayConfig },
     gateway,
+    serverSigner: {
+      signGrantRegistration: vi
+        .fn()
+        .mockResolvedValue("0xgrantsig" as `0x${string}`),
+    },
     accessLogReader: accessLog,
     accessLogWriter: accessLog,
     tokenStore: createMemoryPsLiteTokenStore(),
@@ -409,9 +425,7 @@ describe("createPsLiteRuntime + MCP OAuth routes", () => {
       await ownerSigned(
         "POST",
         `/v1/mcp/oauth/authorizations/${authorizationId}/approve`,
-        {
-          grants: [{ grantId: "grant-mcp-oauth", scopes: ["chatgpt.history"] }],
-        },
+        { scopes: ["chatgpt.history"] },
       ),
     );
     expect(approve.status).toBe(200);
@@ -444,7 +458,7 @@ describe("createPsLiteRuntime + MCP OAuth routes", () => {
     );
     expect(approvedConnection?.status).toBe("approved");
     expect(approvedConnection?.grants).toEqual([
-      { grantId: "grant-mcp-oauth", scopes: ["chatgpt.history"] },
+      { grantId: "grant-mcp-1", scopes: ["chatgpt.history"] },
     ]);
   });
 });
