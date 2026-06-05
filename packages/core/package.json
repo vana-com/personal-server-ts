@@ -60,9 +60,17 @@
       "types": "./dist/storage/index/index.d.ts",
       "import": "./dist/storage/index/index.js"
     },
+    "./storage/blocks": {
+      "types": "./dist/storage/blocks/index.d.ts",
+      "import": "./dist/storage/blocks/index.js"
+    },
     "./storage/preview": {
       "types": "./dist/storage/preview.d.ts",
       "import": "./dist/storage/preview.js"
+    },
+    "./storage/blocks/build": {
+      "types": "./dist/storage/blocks/build.d.ts",
+      "import": "./dist/storage/blocks/build.js"
     },
     "./grants": {
       "types": "./dist/grants/index.d.ts",

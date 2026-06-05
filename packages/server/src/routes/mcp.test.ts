@@ -157,6 +157,31 @@ function createMockAccessLogWriter(): AccessLogWriter & {
   };
 }
 
+function blockReadResult(opts: {
+  scope: string;
+  value: unknown;
+  collectedAt?: string;
+  nextCursor?: string;
+}) {
+  return {
+    status: 200,
+    scope: opts.scope,
+    collectedAt: opts.collectedAt ?? "2026-06-01T12:00:00.000Z",
+    contentKind: "json" as const,
+    blocks: [
+      {
+        id: "block-1",
+        path: "$.data",
+        mediaType: "application/json",
+        value: opts.value,
+        sizeBytes: JSON.stringify(opts.value).length,
+      },
+    ],
+    ...(opts.nextCursor ? { nextCursor: opts.nextCursor } : {}),
+    warnings: [],
+  };
+}
+
 async function ingestScope(opts: {
   scope: string;
   data: Record<string, unknown>;
@@ -688,7 +713,14 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     const payload = JSON.parse(result.content[0].text);
     expect(payload.scope).toBe("instagram.profile");
     expect(payload.grantId).toBe("grant-mcp-1");
-    expect(payload.data.data).toEqual({ username: "mcp_user" });
+    expect(payload.blocks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: "$.data",
+          value: { username: "mcp_user" },
+        }),
+      ]),
+    );
 
     // Access log: the read added a new entry.
     expect(accessLogWriter.entries.length).toBeGreaterThan(ingestEntriesBefore);
@@ -708,7 +740,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     );
   });
 
-  it("read_scope lets wildcard grants reach the data API for top-level source reads", async () => {
+  it("read_scope rejects top-level source ids even when a wildcard grant exists", async () => {
     const created = await createMcpConnection(
       { displayName: "Claude" },
       { store, publicOrigin: SERVER_ORIGIN },
@@ -720,31 +752,28 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
       },
       { store },
     );
-    const approved = (await store.getById(created.connectionId))!;
-    const readScope = vi.fn().mockResolvedValue({
-      status: 200,
-      body: { ok: true },
-    });
+    const readScopeBlocks = vi
+      .fn()
+      .mockResolvedValue(blockReadResult({ scope: "instagram", value: {} }));
     const tool = MCP_TOOLS.find((t) => t.name === "read_scope")!;
 
     const result = await tool.handler(
       { scope: "instagram" },
       {
-        connection: approved,
+        connection: (await store.getById(created.connectionId))!,
         readClient: {
           listScopes: vi.fn(),
-          readScope,
-          previewScope: vi.fn(),
+          readScopeBlocks,
         },
       },
     );
 
-    expect(result.isError).not.toBe(true);
-    expect(readScope).toHaveBeenCalledWith({
-      scope: "instagram",
-      grantId: "grant-mcp-1",
-      limit: undefined,
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      error: "scope_not_granted",
+      grantedScopes: ["instagram.*"],
     });
+    expect(readScopeBlocks).not.toHaveBeenCalled();
   });
 
   it("search_personal_context expands wildcard scopes through the real read client", async () => {
@@ -822,7 +851,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     ]);
   });
 
-  it("search_personal_context searches a bounded storage preview without full envelope parsing", async () => {
+  it("search_personal_context searches bounded storage blocks without full envelope parsing", async () => {
     const created = await createMcpConnection(
       { displayName: "Claude" },
       { store, publicOrigin: SERVER_ORIGIN },
@@ -886,8 +915,8 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
         scope: "chatgpt.conversations",
       }),
     ]);
-    expect(payload.matches[0]!.searchedChars).toBeLessThanOrEqual(100_000);
-    expect(payload.matches[0]!.searchedChars).toBeGreaterThan(90_000);
+    expect(payload.matches[0]!.searchedChars).toBeLessThanOrEqual(55_000);
+    expect(payload.matches[0]!.searchedChars).toBeGreaterThan(45_000);
     expect(payload.truncatedScopes).toEqual(["chatgpt.conversations"]);
     expect(fullRead).not.toHaveBeenCalled();
     expect(accessLogWriter.entries).toContainEqual(
@@ -900,7 +929,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     );
   });
 
-  it("search_personal_context searches decoded escaped text through server storage previews", async () => {
+  it("search_personal_context searches decoded escaped text through server storage blocks", async () => {
     const created = await createMcpConnection(
       { displayName: "Claude" },
       { store, publicOrigin: SERVER_ORIGIN },
@@ -963,7 +992,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     ]);
   });
 
-  it("search_personal_context hides unexpected preview storage errors", async () => {
+  it("search_personal_context hides unexpected bounded storage errors", async () => {
     const created = await createMcpConnection(
       { displayName: "Claude" },
       { store, publicOrigin: SERVER_ORIGIN },
@@ -994,7 +1023,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
 
     const approved = (await store.getById(created.connectionId))!;
     const dataApiDeps = buildDataApiDeps(gateway, accessLogWriter);
-    dataApiDeps.storage.readEnvelopePreview = vi
+    dataApiDeps.storage.readScopeBlocks = vi
       .fn()
       .mockRejectedValue(
         new Error("ENOENT: /home/tim/personal-server/data/github.profile.json"),
@@ -1020,13 +1049,12 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
       errors: Array<{ scope: string; status?: number; bodyPreview: string }>;
     };
     expect(payload.errors).toEqual([
-      {
+      expect.objectContaining({
         scope: "github.profile",
         error: "scope_read_failed",
-        status: 500,
-        bodyPreview:
-          '{"error":"INTERNAL_ERROR","message":"Failed to read scope preview"}',
-      },
+        status: 503,
+        bodyPreview: expect.stringContaining("BOUNDED_DATA_UNAVAILABLE"),
+      }),
     ]);
     expect(result.content[0].text).not.toContain("/home/tim");
   });
@@ -1156,14 +1184,12 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
         connection: approved,
         readClient: {
           listScopes: vi.fn(),
-          readScope: vi.fn(),
-          previewScope: vi.fn().mockResolvedValue({
-            status: 200,
-            scope: "chatgpt.conversations",
-            collectedAt: "2026-06-01T12:00:00.000Z",
-            text: `${largePrefix} unique-match ${largeSuffix}`,
-            truncated: false,
-          }),
+          readScopeBlocks: vi.fn().mockResolvedValue(
+            blockReadResult({
+              scope: "chatgpt.conversations",
+              value: `${largePrefix} unique-match ${largeSuffix}`,
+            }),
+          ),
         },
       },
     );
@@ -1208,13 +1234,11 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
       { store },
     );
     const approved = (await store.getById(created.connectionId))!;
-    const previewScope = vi.fn().mockResolvedValue({
-      status: 200,
-      scope: "instagram.ads",
-      collectedAt: "2026-06-01T12:00:00.000Z",
-      text: "needle_user",
-      truncated: false,
-    });
+    const readScopeBlocks = vi
+      .fn()
+      .mockResolvedValue(
+        blockReadResult({ scope: "instagram.ads", value: "needle_user" }),
+      );
     const tool = MCP_TOOLS.find((t) => t.name === "search_personal_context")!;
 
     const result = await tool.handler(
@@ -1245,8 +1269,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
             limit: 200,
             offset: 0,
           }),
-          readScope: vi.fn(),
-          previewScope,
+          readScopeBlocks,
         },
       },
     );
@@ -1267,7 +1290,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     expect(payload.matches).toHaveLength(1);
     expect(payload.matches[0].scope).toBe("instagram.ads");
     expect(payload.matches[0].preview).toContain("needle_user");
-    expect(previewScope).toHaveBeenCalledTimes(1);
+    expect(readScopeBlocks).toHaveBeenCalledTimes(1);
   });
 
   it("search_personal_context stops wildcard discovery once the scope cap is filled", async () => {
@@ -1316,14 +1339,12 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
         connection: approved,
         readClient: {
           listScopes,
-          readScope: vi.fn(),
-          previewScope: vi.fn().mockResolvedValue({
-            status: 200,
-            scope: "instagram.profile",
-            collectedAt: "2026-06-01T12:00:00.000Z",
-            text: "needle_user",
-            truncated: false,
-          }),
+          readScopeBlocks: vi.fn().mockResolvedValue(
+            blockReadResult({
+              scope: "instagram.profile",
+              value: "needle_user",
+            }),
+          ),
         },
       },
     );
@@ -1354,14 +1375,14 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     );
     const approved = (await store.getById(created.connectionId))!;
     const listScopes = vi.fn();
-    const readScope = vi.fn();
+    const readScopeBlocks = vi.fn();
     const tool = MCP_TOOLS.find((t) => t.name === "search_personal_context")!;
 
     const result = await tool.handler(
       { query: "needle", scopes: ["instagram"] },
       {
         connection: approved,
-        readClient: { listScopes, readScope, previewScope: vi.fn() },
+        readClient: { listScopes, readScopeBlocks },
       },
     );
 
@@ -1375,7 +1396,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
       { scope: "instagram", error: "scope_not_granted" },
     ]);
     expect(listScopes).not.toHaveBeenCalled();
-    expect(readScope).not.toHaveBeenCalled();
+    expect(readScopeBlocks).not.toHaveBeenCalled();
   });
 
   it("search_personal_context rejects oversized queries without echoing them", async () => {
@@ -1400,8 +1421,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
         connection: approved,
         readClient: {
           listScopes: vi.fn(),
-          readScope: vi.fn(),
-          previewScope: vi.fn(),
+          readScopeBlocks: vi.fn(),
         },
       },
     );
@@ -1441,8 +1461,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
         connection: approved,
         readClient: {
           listScopes: vi.fn(),
-          readScope: vi.fn(),
-          previewScope: vi.fn(),
+          readScopeBlocks: vi.fn(),
         },
       },
     );
@@ -1481,7 +1500,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
       { store },
     );
     const approved = (await store.getById(created.connectionId))!;
-    const readScope = vi.fn();
+    const readScopeBlocks = vi.fn();
     const tool = MCP_TOOLS.find((t) => t.name === "search_personal_context")!;
 
     const result = await tool.handler(
@@ -1490,8 +1509,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
         connection: approved,
         readClient: {
           listScopes: vi.fn().mockReturnValue(new Promise(() => undefined)),
-          readScope,
-          previewScope: vi.fn(),
+          readScopeBlocks,
         },
       },
     );
@@ -1511,7 +1529,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
         ),
       }),
     ]);
-    expect(readScope).not.toHaveBeenCalled();
+    expect(readScopeBlocks).not.toHaveBeenCalled();
   });
 
   it("search_personal_context reports per-scope timeout without failing the whole search", async () => {
@@ -1542,19 +1560,14 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
         connection: approved,
         readClient: {
           listScopes: vi.fn(),
-          readScope: vi.fn(),
-          previewScope: vi
+          readScopeBlocks: vi
             .fn()
             .mockImplementation(({ scope }: { scope: string }) =>
               scope === "chatgpt.conversations"
                 ? new Promise(() => undefined)
-                : Promise.resolve({
-                    status: 200,
-                    scope,
-                    collectedAt: "2026-06-01T12:00:00.000Z",
-                    text: "needle_user",
-                    truncated: false,
-                  }),
+                : Promise.resolve(
+                    blockReadResult({ scope, value: "needle_user" }),
+                  ),
             ),
         },
       },
@@ -1572,12 +1585,12 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
       scope: "chatgpt.conversations",
       error: "scope_search_timeout",
       bodyPreview: expect.stringContaining(
-        "preview scope chatgpt.conversations timed out after 50ms",
+        "read blocks for chatgpt.conversations timed out after 50ms",
       ),
     });
   });
 
-  it("search_personal_context reports all truncated scopes even when match output is capped", async () => {
+  it("search_personal_context stops after match output is capped", async () => {
     const created = await createMcpConnection(
       {},
       { store, publicOrigin: SERVER_ORIGIN },
@@ -1606,20 +1619,19 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
         connection: approved,
         readClient: {
           listScopes: vi.fn(),
-          readScope: vi.fn(),
-          previewScope: vi
+          readScopeBlocks: vi
             .fn()
             .mockImplementation(({ scope }: { scope: string }) =>
-              Promise.resolve({
-                status: 200,
-                scope,
-                collectedAt: "2026-06-01T12:00:00.000Z",
-                text:
-                  scope === "github.profile"
-                    ? `needle ${largeSuffix}`
-                    : largeSuffix,
-                truncated: true,
-              }),
+              Promise.resolve(
+                blockReadResult({
+                  scope,
+                  value:
+                    scope === "github.profile"
+                      ? `needle ${largeSuffix}`
+                      : largeSuffix,
+                  nextCursor: "cursor-2",
+                }),
+              ),
             ),
         },
       },
@@ -1628,15 +1640,14 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     expect(result.isError).not.toBe(true);
     const payload = JSON.parse(result.content[0].text) as {
       matches: Array<{ scope: string }>;
+      searchedScopes: string[];
       truncatedScopes: string[];
     };
     expect(payload.matches).toEqual([
       expect.objectContaining({ scope: "github.profile" }),
     ]);
-    expect(payload.truncatedScopes).toEqual([
-      "github.profile",
-      "linkedin.profile",
-    ]);
+    expect(payload.searchedScopes).toEqual(["github.profile"]);
+    expect(payload.truncatedScopes).toEqual(["github.profile"]);
   });
 
   it("exposes stable list/read/search MCP tools", () => {

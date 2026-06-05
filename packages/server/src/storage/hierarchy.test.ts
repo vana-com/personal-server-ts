@@ -5,9 +5,11 @@ import { tmpdir } from "node:os";
 import {
   writeDataFile,
   readDataFile,
+  readScopeBlocks,
   listVersions,
   deleteDataFile,
   deleteAllForScope,
+  writeBlockManifest,
 } from "./hierarchy.js";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -125,6 +127,45 @@ describe("HierarchyManager", () => {
         /ENOENT/,
       );
     });
+
+    it("removes sidecars for that version", async () => {
+      await writeDataFile(options, makeEnvelope());
+      await writeBlockManifest(
+        options,
+        scope,
+        collectedAt,
+        {
+          version: 1,
+          scope,
+          collectedAt,
+          contentKind: "json",
+          blocks: [
+            {
+              id: "block-000001",
+              path: "$",
+              mediaType: "application/json",
+              sizeBytes: 12,
+            },
+          ],
+          warnings: [],
+        },
+        [
+          {
+            id: "block-000001",
+            path: "$",
+            mediaType: "application/json",
+            value: { ok: true },
+            sizeBytes: 12,
+          },
+        ],
+      );
+
+      await deleteDataFile(options, scope, collectedAt);
+
+      await expect(
+        readScopeBlocks(options, scope, collectedAt, { maxBytes: 1024 }),
+      ).rejects.toMatchObject({ code: "block_manifest_not_found" });
+    });
   });
 
   describe("deleteAllForScope", () => {
@@ -147,11 +188,30 @@ describe("HierarchyManager", () => {
     it("after delete, listVersions returns empty array", async () => {
       await writeDataFile(options, makeEnvelope(scope, "2026-01-21T08:00:00Z"));
       await writeDataFile(options, makeEnvelope(scope, "2026-01-21T10:00:00Z"));
+      await writeBlockManifest(
+        options,
+        scope,
+        "2026-01-21T10:00:00Z",
+        {
+          version: 1,
+          scope,
+          collectedAt: "2026-01-21T10:00:00Z",
+          contentKind: "json",
+          blocks: [],
+          warnings: [],
+        },
+        [],
+      );
 
       await deleteAllForScope(options, scope);
 
       const versions = await listVersions(options, scope);
       expect(versions).toEqual([]);
+      await expect(
+        readScopeBlocks(options, scope, "2026-01-21T10:00:00Z", {
+          maxBytes: 1024,
+        }),
+      ).rejects.toMatchObject({ code: "block_manifest_not_found" });
     });
 
     it("deleting nonexistent scope does not throw (idempotent)", async () => {

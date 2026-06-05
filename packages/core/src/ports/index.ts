@@ -9,6 +9,11 @@ import type {
 } from "@opendatalabs/vana-sdk/browser";
 import type { WriteResult } from "../storage/hierarchy/index.js";
 import type {
+  DataBlockManifest,
+  DataScopeBlock,
+  ReadScopeBlocksResponse,
+} from "../storage/blocks/index.js";
+import type {
   IndexEntry,
   NewIndexEntry,
   ScopeSummary,
@@ -84,7 +89,18 @@ export interface DataStoragePort extends RuntimeStoragePort {
     collectedAt: string,
     options: { maxBytes: number },
   ): Promise<DataStorageEnvelopePreview>;
+  readScopeBlocks?(
+    scope: string,
+    collectedAt: string,
+    options: { cursor?: string; maxBytes: number },
+  ): Promise<ReadScopeBlocksResponse>;
   writeEnvelope(envelope: DataFileEnvelope): Promise<WriteResult>;
+  writeBlockManifest?(
+    scope: string,
+    collectedAt: string,
+    manifest: DataBlockManifest,
+    blocks: DataScopeBlock[],
+  ): Promise<void>;
   insertEntry(entry: NewIndexEntry): IndexEntry | Promise<IndexEntry>;
   updateFileId(path: string, fileId: string): boolean | Promise<boolean>;
   deleteScope(scope: string): Promise<number>;

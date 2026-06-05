@@ -1,16 +1,16 @@
 /**
  * In-process MCP read client.
  *
- * The MCP route accepts a tool call from Claude, then needs to read scoped data
+ * The MCP route accepts a tool call from an MCP client, then needs to read scoped data
  * from the user's Personal Server *as the per-connection grantee*. We do NOT
- * round-trip through the public HTTP origin for this — the relay/tunnel is
- * only for inbound Claude traffic. Instead we:
+ * round-trip through the public HTTP origin for this — the relay/tunnel is only
+ * for inbound MCP traffic. Instead we:
  *
  *  1. Build a Web Request signed by the connection's grantee, with the
  *     existing grantId in the Web3Signed payload.
- *  2. Hand normal reads to `handlePersonalServerDataRequest` directly.
- *     Search previews use the same auth and access-log ports, then read only a
- *     bounded text prefix from storage.
+ *  2. Use the same auth and access-log ports as `/v1/data`, then read bounded
+ *     block sidecars from storage. MCP tools must not fall back to full envelope
+ *     reads when sidecars are unavailable.
  *
  * This guarantees parity: the MCP read goes through the same policy check
  * (`verifyDataReadPolicy`) and access-log path as an external builder read.
@@ -19,14 +19,14 @@
  */
 
 import type { ServerAccount } from "../keys/server-account.js";
-import type { IndexEntry, ScopeSummary } from "../storage/index/types.js";
+import type { ScopeSummary } from "../storage/index/types.js";
+import type { ReadScopeBlocksResponse } from "../storage/blocks/types.js";
 import { signMcpGranteeRequest } from "./grantee.js";
 import {
   handlePersonalServerDataRequest,
   type PersonalServerDataApiDeps,
 } from "../api/index.js";
 import { ProtocolError } from "../errors/catalog.js";
-import { previewEnvelopeValue } from "../storage/preview.js";
 
 export interface McpDataReadClient {
   /**
@@ -41,32 +41,16 @@ export interface McpDataReadClient {
   }): Promise<McpDataListResult>;
 
   /**
-   * Perform `GET /v1/data/:scope?grantId=…` as the connection grantee and
-   * return the parsed response body. Throws `McpDataReadError` if the read
-   * fails for any reason (no matching grant, scope not covered, runtime
-   * unavailable, …) — the caller turns this into an MCP `isError` result.
+   * Perform a grant-gated bounded block read for MCP. This is the path used by
+   * MCP tools that need pagination and must not fall back to full envelope
+   * reads when the bounded storage path is unavailable.
    */
-  readScope(params: {
+  readScopeBlocks(params: {
     scope: string;
     grantId: string;
-    limit?: number;
-  }): Promise<McpDataReadResult>;
-
-  /**
-   * Perform a grant-gated, access-logged read of a bounded text prefix for MCP
-   * search. This deliberately does not parse the full envelope, so one huge
-   * scope cannot consume the whole MCP client timeout before search can skip it.
-   */
-  previewScope(params: {
-    scope: string;
-    grantId: string;
-    maxBytes: number;
-  }): Promise<McpDataPreviewResult>;
-}
-
-export interface McpDataReadResult {
-  status: number;
-  body: unknown;
+    cursor?: string;
+    maxBytes?: number;
+  }): Promise<McpDataReadBlocksResult>;
 }
 
 export interface McpDataListResult {
@@ -77,12 +61,8 @@ export interface McpDataListResult {
   offset: number;
 }
 
-export interface McpDataPreviewResult {
+export interface McpDataReadBlocksResult extends ReadScopeBlocksResponse {
   status: number;
-  scope: string;
-  collectedAt: string;
-  text: string;
-  truncated: boolean;
 }
 
 export class McpDataReadError extends Error {
@@ -165,44 +145,25 @@ export function createMcpDataReadClient(
       return { status: response.status, ...normalizeListScopesPayload(body) };
     },
 
-    async readScope({ scope, grantId, limit }) {
-      const safeScope = encodeURIComponent(scope);
-      const query = limit !== undefined ? `?limit=${limit}` : "";
-      const pathWithQuery = `${basePath}/${safeScope}${query}`;
-      // The data-API auth verifier checks `payload.uri === url.pathname` on the
-      // incoming Request — pathname has no query string, so sign the path only.
-      const signingUri = `${basePath}/${safeScope}`;
-
-      const authorization = await signMcpGranteeRequest({
-        account: options.granteeAccount,
-        aud: options.serverOrigin,
-        method: "GET",
-        uri: signingUri,
-        grantId,
-      });
-
-      const url = new URL(pathWithQuery, options.serverOrigin).toString();
-      const request = new Request(url, {
-        method: "GET",
-        headers: { Authorization: authorization },
-      });
-
-      const response = await handlePersonalServerDataRequest(
-        request,
-        options.dataApiDeps,
-        { basePath },
-      );
-
-      const body = await parseJsonOrText(response);
-
-      if (!response.ok) {
-        throw new McpDataReadError(response.status, body);
+    async readScopeBlocks({ scope, grantId, cursor, maxBytes }) {
+      const storage = options.dataApiDeps.storage;
+      if (!storage.readScopeBlocks) {
+        throw new McpDataReadError(503, {
+          error: "BOUNDED_DATA_UNAVAILABLE",
+          message:
+            "Bounded scope data is unavailable while the storage sidecar is missing or still indexing.",
+          scope,
+        });
       }
 
-      return { status: response.status, body };
-    },
+      const selectedEntry = storage.findEntry({ scope });
+      if (!selectedEntry) {
+        throw new McpDataReadError(404, {
+          error: "NOT_FOUND",
+          message: `No data found for scope "${scope}"`,
+        });
+      }
 
-    async previewScope({ scope, grantId, maxBytes }) {
       const safeScope = encodeURIComponent(scope);
       const signingUri = `${basePath}/${safeScope}`;
       const authorization = await signMcpGranteeRequest({
@@ -217,7 +178,6 @@ export function createMcpDataReadClient(
         method: "GET",
         headers: { Authorization: authorization },
       });
-      const selectedEntry = options.dataApiDeps.storage.findEntry({ scope });
 
       let authResult:
         | Awaited<
@@ -231,7 +191,7 @@ export function createMcpDataReadClient(
           request,
           scope,
           grantId,
-          fileId: selectedEntry?.fileId ?? undefined,
+          fileId: selectedEntry.fileId ?? undefined,
         });
       } catch (err) {
         if (err instanceof ProtocolError) {
@@ -240,84 +200,55 @@ export function createMcpDataReadClient(
         throw err;
       }
 
-      if (!selectedEntry) {
-        throw new McpDataReadError(404, {
-          error: "NOT_FOUND",
-          message: `No data found for scope "${scope}"`,
-        });
-      }
-
-      let preview: { text: string; truncated: boolean };
       try {
-        preview = await readStoragePreview(
-          options.dataApiDeps.storage,
-          selectedEntry,
-          maxBytes,
+        const result = await storage.readScopeBlocks(
+          scope,
+          selectedEntry.collectedAt,
+          {
+            cursor,
+            maxBytes: maxBytes ?? 16_384,
+          },
         );
-      } catch (err) {
-        if (err instanceof McpDataReadError) {
-          throw err;
-        }
-        options.dataApiDeps.logger?.error?.(
-          { err, scope },
-          "MCP scope preview read failed",
-        );
-        throw new McpDataReadError(500, {
-          error: "INTERNAL_ERROR",
-          message: "Failed to read scope preview",
+        await options.dataApiDeps.accessLogWriter.write({
+          logId: options.dataApiDeps.createLogId?.() ?? crypto.randomUUID(),
+          grantId: authResult?.grantId ?? grantId,
+          builder: authResult?.builder ?? options.granteeAccount.address,
+          action: "read",
+          scope,
+          timestamp: (
+            options.dataApiDeps.now ?? (() => new Date())
+          )().toISOString(),
+          ipAddress:
+            request.headers.get("x-forwarded-for") ??
+            request.headers.get("x-real-ip") ??
+            "unknown",
+          userAgent: request.headers.get("user-agent") ?? "unknown",
         });
+        return { status: 200, ...result };
+      } catch (err) {
+        if (err instanceof ProtocolError) {
+          throw new McpDataReadError(err.code, err.toJSON());
+        }
+        if (err instanceof Error) {
+          const code = dataBlockStorageErrorCode(err);
+          const status = code === "cursor_invalid" ? 400 : 503;
+          throw new McpDataReadError(status, {
+            error:
+              code === "cursor_invalid"
+                ? "INVALID_CURSOR"
+                : "BOUNDED_DATA_UNAVAILABLE",
+            message:
+              code === "cursor_invalid"
+                ? "The bounded read cursor is invalid for this scope."
+                : "Bounded scope data is unavailable while the storage sidecar is missing or still indexing.",
+            scope,
+            ...(code ? { reason: code } : {}),
+          });
+        }
+        throw err;
       }
-
-      await options.dataApiDeps.accessLogWriter.write({
-        logId: options.dataApiDeps.createLogId?.() ?? crypto.randomUUID(),
-        grantId: authResult?.grantId ?? grantId,
-        builder: authResult?.builder ?? options.granteeAccount.address,
-        action: "read",
-        scope,
-        timestamp: (
-          options.dataApiDeps.now ?? (() => new Date())
-        )().toISOString(),
-        ipAddress:
-          request.headers.get("x-forwarded-for") ??
-          request.headers.get("x-real-ip") ??
-          "unknown",
-        userAgent: request.headers.get("user-agent") ?? "unknown",
-      });
-
-      return {
-        status: 200,
-        scope,
-        collectedAt: selectedEntry.collectedAt,
-        ...preview,
-      };
     },
   };
-}
-
-async function readStoragePreview(
-  storage: PersonalServerDataApiDeps["storage"],
-  entry: IndexEntry,
-  maxBytes: number,
-): Promise<{ text: string; truncated: boolean }> {
-  if (storage.readEnvelopePreview) {
-    return storage.readEnvelopePreview(entry.scope, entry.collectedAt, {
-      maxBytes,
-    });
-  }
-
-  if (entry.sizeBytes > maxBytes) {
-    throw new McpDataReadError(413, {
-      error: "PREVIEW_UNAVAILABLE",
-      message:
-        "This storage backend cannot provide bounded search previews for large scopes.",
-      scope: entry.scope,
-      maxBytes,
-      sizeBytes: entry.sizeBytes,
-    });
-  }
-
-  const envelope = await storage.readEnvelope(entry.scope, entry.collectedAt);
-  return previewEnvelopeValue(envelope, maxBytes);
 }
 
 async function parseJsonOrText(response: Response): Promise<unknown> {
@@ -327,6 +258,12 @@ async function parseJsonOrText(response: Response): Promise<unknown> {
   } catch {
     return text;
   }
+}
+
+function dataBlockStorageErrorCode(err: Error): string | undefined {
+  if (!("code" in err)) return undefined;
+  const code = (err as { code?: unknown }).code;
+  return typeof code === "string" ? code : undefined;
 }
 
 function normalizeListScopesPayload(

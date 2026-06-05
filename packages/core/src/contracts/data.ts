@@ -5,6 +5,7 @@ import {
   type DataFileEnvelope,
 } from "@opendatalabs/vana-sdk/browser";
 import { type WriteResult } from "../storage/hierarchy/index.js";
+import { buildDataBlocks } from "../storage/blocks/build.js";
 
 export type DataContractErrorCode =
   | "INVALID_SCOPE"
@@ -250,6 +251,11 @@ export async function ingestDataContract(
     input.schemaId,
   );
   const writeResult = await input.storage.writeEnvelope(envelope);
+  try {
+    await writeBlockSidecars(input.storage, envelope);
+  } catch {
+    // Best-effort bounded sidecars: raw envelope storage remains the source of truth.
+  }
   await input.storage.insertEntry({
     fileId: null,
     schemaId: input.schemaId ?? null,
@@ -282,4 +288,24 @@ export async function deleteDataScopeContract(
     ok: true,
     deletedCount: await input.storage.deleteScope(scopeResult.scope),
   };
+}
+
+async function writeBlockSidecars(
+  storage: DataStoragePort,
+  envelope: DataFileEnvelope,
+): Promise<void> {
+  if (!storage.writeBlockManifest) return;
+
+  const built = buildDataBlocks({
+    scope: envelope.scope,
+    collectedAt: envelope.collectedAt,
+    schemaId: envelope.schemaId,
+    content: envelope,
+  });
+  await storage.writeBlockManifest(
+    envelope.scope,
+    envelope.collectedAt,
+    built.manifest,
+    built.blocks,
+  );
 }
