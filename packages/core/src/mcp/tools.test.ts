@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { MCP_TOOLS } from "./tools.js";
+import { handleMcpStreamableHttpRequest } from "./server.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { McpDataReadClient } from "./read-client.js";
 
@@ -49,6 +50,33 @@ function createMinimalReadClient(
 }
 
 describe("mcp/tools", () => {
+  it("keeps the MCP tools/list response parseable and under the tunnel budget", async () => {
+    const response = await handleMcpStreamableHttpRequest(
+      new Request("http://localhost/mcp/test-token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/list",
+          params: {},
+        }),
+      }),
+      {
+        connection: createConnection(),
+        readClient: createMinimalReadClient(),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    expect(() => JSON.parse(body)).not.toThrow();
+    expect(new TextEncoder().encode(body).byteLength).toBeLessThan(3000);
+  });
+
   it("list_granted_sources derives sources from granted scopes", async () => {
     const result = await getTool("list_granted_sources").handler(
       {},
