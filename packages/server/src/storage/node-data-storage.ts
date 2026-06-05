@@ -3,6 +3,7 @@ import {
   deleteDataFile,
   readDataFile,
   readDataFilePreview,
+  hasScopeBlocks,
   readScopeBlocks,
   writeBlockManifest,
   writeDataFile,
@@ -69,6 +70,9 @@ export function createNodeDataStorage(
         collectedAt,
         options,
       );
+    },
+    hasScopeBlocks(scope: string, collectedAt: string) {
+      return hasScopeBlocks(deps.hierarchyOptions, scope, collectedAt);
     },
     writeEnvelope(envelope: DataFileEnvelope) {
       return writeDataFile(deps.hierarchyOptions, envelope);

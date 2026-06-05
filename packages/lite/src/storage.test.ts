@@ -445,6 +445,9 @@ describe("createPersistentPsLiteStorage", () => {
         maxBytes: 1_000,
       }),
     ).rejects.toThrow("Block manifest not found");
+    await expect(
+      storage.hasScopeBlocks?.("notes.profile", "2026-05-08T00:00:00.000Z"),
+    ).resolves.toBe(false);
     expect(readEnvelope).not.toHaveBeenCalled();
   });
 
@@ -462,6 +465,9 @@ describe("createPersistentPsLiteStorage", () => {
       manifest,
       blocks,
     );
+    await expect(
+      storage.hasScopeBlocks?.(manifest.scope, manifest.collectedAt),
+    ).resolves.toBe(true);
 
     await expect(
       storage.readScopeBlocks?.(manifest.scope, manifest.collectedAt, {

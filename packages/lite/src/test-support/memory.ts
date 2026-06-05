@@ -235,6 +235,10 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
       };
     },
 
+    async hasScopeBlocks(scope, collectedAt) {
+      return blockManifests.has(blockKey(scope, collectedAt));
+    },
+
     async writeBlockManifest(scope, collectedAt, manifest, blocks) {
       const key = blockKey(scope, collectedAt);
       blockManifests.delete(key);
