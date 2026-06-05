@@ -1125,7 +1125,10 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     );
     expect(result.isError).not.toBe(true);
     const payload = JSON.parse(result.content[0].text);
-    expect(payload.scopes).toEqual(["chatgpt.history", "instagram.*"]);
+    expect(payload.scopes).toEqual([
+      expect.objectContaining({ scope: "chatgpt.history" }),
+      expect.objectContaining({ scope: "instagram.*" }),
+    ]);
   });
 
   it("list_granted_sources derives source ids from scope-only grants", async () => {
@@ -1525,7 +1528,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
         scope: "instagram.*",
         error: "scope_list_timeout",
         bodyPreview: expect.stringContaining(
-          "list scopes for instagram.* timed out after 50ms",
+          "list scopes for instagram.* timed out after 1000ms",
         ),
       }),
     ]);
@@ -1585,7 +1588,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
       scope: "chatgpt.conversations",
       error: "scope_search_timeout",
       bodyPreview: expect.stringContaining(
-        "read blocks for chatgpt.conversations timed out after 50ms",
+        "read blocks for chatgpt.conversations timed out after 500ms",
       ),
     });
   });

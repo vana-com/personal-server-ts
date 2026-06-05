@@ -29,6 +29,14 @@ import {
 } from "../api/index.js";
 import { ProtocolError } from "../errors/catalog.js";
 
+export interface McpScopeMetadata {
+  scope: string;
+  collectedAt: string;
+  sizeBytes: number;
+  /** True when the bounded block read path is available for this scope. */
+  hasBlocks: boolean;
+}
+
 export interface McpDataReadClient {
   /**
    * Perform `GET /v1/data?scopePrefix=…` as the connection grantee. This is
@@ -40,6 +48,14 @@ export interface McpDataReadClient {
     limit?: number;
     offset?: number;
   }): Promise<McpDataListResult>;
+
+  /**
+   * Return lightweight planning metadata for a scope using the storage index
+   * only — no network call, no block read, no auth. Used by list_granted_scopes
+   * to populate sizeBytes/sizeClass/searchRecommended without reading data.
+   * Returns null when the scope has no local index entry.
+   */
+  getScopeMetadata(scope: string): McpScopeMetadata | null;
 
   /**
    * Perform a grant-gated bounded block read for MCP. This is the path used by
@@ -144,6 +160,18 @@ export function createMcpDataReadClient(
       }
 
       return { status: response.status, ...normalizeListScopesPayload(body) };
+    },
+
+    getScopeMetadata(scope: string): McpScopeMetadata | null {
+      const storage = options.dataApiDeps.storage;
+      const entry = storage.findEntry({ scope });
+      if (!entry) return null;
+      return {
+        scope,
+        collectedAt: entry.collectedAt,
+        sizeBytes: entry.sizeBytes,
+        hasBlocks: Boolean(storage.readScopeBlocks),
+      };
     },
 
     async readScopeBlocks({ scope, grantId, cursor, maxBytes }) {
