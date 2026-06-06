@@ -260,6 +260,46 @@ describe("download worker", () => {
         "Session key decryption failed",
       );
     });
+
+    it("downloads a binary ($binary) envelope, preserving content + scope", async () => {
+      const deps = makeMockDeps();
+      const binaryScope = "dexa.scan";
+      const binaryEnvelope = {
+        version: "1.0",
+        scope: binaryScope,
+        collectedAt: COLLECTED_AT,
+        data: {
+          $binary: true,
+          mimeType: "application/pdf",
+          filename: "dexa-scan.pdf",
+          sizeBytes: 3,
+          contentHash:
+            "0x5e2df0bad926875ab6543fd40dc8ef4ff928b9283008dab06bf28da2c044f94e",
+          encoding: "base64",
+          content: "QUJD",
+        },
+      };
+      // No-schema binary files register a schema whose scope IS the data scope.
+      (deps.gateway.getSchema as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...makeSchema(),
+        scope: binaryScope,
+      });
+      (decryptWithPassword as ReturnType<typeof vi.fn>).mockResolvedValue(
+        new TextEncoder().encode(JSON.stringify(binaryEnvelope)),
+      );
+
+      const result = await downloadOne(deps, makeFileRecord());
+
+      // Decrypt key derives from the binary scope (matches upload encryption).
+      expect(deriveScopeKey).toHaveBeenCalledWith(deps.masterKey, binaryScope);
+      // The binary `data` (incl. content) must survive envelope validation —
+      // otherwise the file indexes with no content and the View is empty.
+      expect(deps.storage.writeEnvelope).toHaveBeenCalledWith(binaryEnvelope);
+      expect(deps.storage.insertEntry).toHaveBeenCalledWith(
+        expect.objectContaining({ fileId: FILE_ID, scope: binaryScope }),
+      );
+      expect(result?.scope).toBe(binaryScope);
+    });
   });
 
   describe("downloadAll", () => {
