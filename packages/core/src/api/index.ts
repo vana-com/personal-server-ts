@@ -75,6 +75,8 @@ export interface PersonalServerApiLogger {
 export interface PersonalServerIngestSyncManager {
   trigger(): Promise<void>;
   notifyNewData?(): void;
+  /** Propagate a scope deletion to R2 + the gateway before the local delete. */
+  deleteScopeRemote?(scope: string): Promise<void>;
 }
 
 export interface PersonalServerDataApiDeps {
@@ -358,7 +360,7 @@ export async function handlePersonalServerDataRequest(
     if (pathname === "/" || pathname === "") {
       if (request.method !== "GET") return methodNotAllowed();
       await deps.auth.authorizeBuilderList(request);
-      const result = listDataScopesContract({
+      const result = await listDataScopesContract({
         storage: deps.storage,
         scopePrefix: url.searchParams.get("scopePrefix") ?? undefined,
         limit: normalizeLimit(url.searchParams.get("limit"), 20),
@@ -522,6 +524,22 @@ export async function handlePersonalServerDataRequest(
 
     if (request.method === "DELETE") {
       await deps.auth.authorizeOwner(request);
+      // Propagate the deletion to the authoritative stores (R2 blobs + gateway records) BEFORE the
+      // local delete — it reads the local index to find what to remove. Best-effort: a remote
+      // failure must not block the owner's local delete (and sync would otherwise resurrect it; the
+      // download-worker reconciliation is the backstop). Parse the scope first so an invalid scope
+      // still 400s without a wasted remote call.
+      const parsed = parseDataScopeContract(scopeParam);
+      if (parsed.ok && deps.syncManager?.deleteScopeRemote) {
+        try {
+          await deps.syncManager.deleteScopeRemote(parsed.scope);
+        } catch (err) {
+          deps.logger?.info?.(
+            { scope: scopeParam, error: (err as Error).message },
+            "Remote scope deletion failed; proceeding with local delete",
+          );
+        }
+      }
       const result = await deleteDataScopeContract({
         storage: deps.storage,
         scopeParam,

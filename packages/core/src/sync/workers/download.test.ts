@@ -73,12 +73,14 @@ function makeMockDeps(): DownloadWorkerDeps {
       relativePath: `${SCOPE}/${COLLECTED_AT}.json`,
       sizeBytes: 128,
     }),
+    writeBlockManifest: vi.fn().mockResolvedValue(undefined),
     insertEntry: vi.fn().mockImplementation((entry) => ({
       id: 1,
       createdAt: "2026-01-21T10:00:00Z",
       ...entry,
     })),
     updateFileId: vi.fn().mockResolvedValue(true),
+    deleteByFileId: vi.fn().mockResolvedValue(true),
   };
 
   const mockStorageAdapter: Partial<StorageAdapter> = {
@@ -154,6 +156,18 @@ describe("download worker", () => {
       expect(deps.storageAdapter.download).not.toHaveBeenCalled();
     });
 
+    it("propagates a download failure (blocks the cursor) so data isn't silently skipped", async () => {
+      const deps = makeMockDeps();
+      (
+        deps.storageAdapter.download as ReturnType<typeof vi.fn>
+      ).mockRejectedValue(new Error("storage unavailable"));
+
+      await expect(downloadOne(deps, makeFileRecord())).rejects.toThrow(
+        "storage unavailable",
+      );
+      expect(deps.storage.writeEnvelope).not.toHaveBeenCalled();
+    });
+
     it("downloads, decrypts, writes, and indexes file", async () => {
       const deps = makeMockDeps();
       const record = makeFileRecord();
@@ -176,6 +190,15 @@ describe("download worker", () => {
         collectedAt: COLLECTED_AT,
         data: { username: "testuser" },
       });
+      expect(deps.storage.writeBlockManifest).toHaveBeenCalledWith(
+        SCOPE,
+        COLLECTED_AT,
+        expect.objectContaining({
+          scope: SCOPE,
+          collectedAt: COLLECTED_AT,
+        }),
+        expect.any(Array),
+      );
 
       // Verify index insert was called
       expect(deps.storage.insertEntry).toHaveBeenCalledWith({
@@ -194,6 +217,34 @@ describe("download worker", () => {
         collectedAt: COLLECTED_AT,
         path: RELATIVE_PATH,
       });
+    });
+
+    it("keeps raw envelope storage and indexing when block sidecar build fails", async () => {
+      const deps = makeMockDeps();
+      const record = makeFileRecord();
+      (
+        deps.storage.writeBlockManifest as ReturnType<typeof vi.fn>
+      ).mockRejectedValueOnce(new Error("block sidecar failed"));
+
+      const result = await downloadOne(deps, record);
+
+      expect(result).toEqual({
+        fileId: FILE_ID,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        path: RELATIVE_PATH,
+      });
+      expect(deps.storage.writeEnvelope).toHaveBeenCalledTimes(1);
+      expect(deps.storage.insertEntry).toHaveBeenCalledTimes(1);
+      expect(deps.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          fileId: FILE_ID,
+          scope: SCOPE,
+          collectedAt: COLLECTED_AT,
+          stage: "block_build",
+        }),
+        "Bounded block sidecar write failed after raw envelope write",
+      );
     });
 
     it("skips and attaches fileId when the same version already exists locally", async () => {
@@ -316,7 +367,41 @@ describe("download worker", () => {
       expect(deps.gateway.listFilesSince).toHaveBeenCalledWith(
         OWNER,
         timestamp,
+        {
+          includeDeleted: true,
+        },
       );
+    });
+
+    it("reconciles a remote deletion by dropping the local copy (no download)", async () => {
+      const deps = makeMockDeps();
+      const deletedRecord = makeFileRecord({
+        fileId: "file-deleted",
+        deletedAt: "2026-06-04T00:00:00Z",
+      });
+      (
+        deps.gateway.listFilesSince as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({ files: [deletedRecord], cursor: null });
+
+      await downloadAll(deps);
+
+      expect(deps.storage.deleteByFileId).toHaveBeenCalledWith("file-deleted");
+      expect(deps.storageAdapter.download).not.toHaveBeenCalled();
+    });
+
+    it("advances the cursor when a reconciled deletion is the only change", async () => {
+      const deps = makeMockDeps();
+      const nextCursor = "2026-06-04T12:00:00Z";
+      (
+        deps.gateway.listFilesSince as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        files: [makeFileRecord({ deletedAt: "2026-06-04T00:00:00Z" })],
+        cursor: nextCursor,
+      });
+
+      await downloadAll(deps);
+
+      expect(deps.cursor.write).toHaveBeenCalledWith(nextCursor);
     });
 
     it("advances cursor after processing", async () => {
@@ -381,6 +466,48 @@ describe("download worker", () => {
         "Failed to download file",
       );
       expect(deps.cursor.write).not.toHaveBeenCalled();
+    });
+
+    it("quarantines deterministic corrupt files and still advances the cursor", async () => {
+      const deps = makeMockDeps();
+      const files = [
+        makeFileRecord({ fileId: "file-001" }),
+        makeFileRecord({ fileId: "file-002" }),
+        makeFileRecord({ fileId: "file-003" }),
+      ];
+      (
+        deps.gateway.listFilesSince as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        files,
+        cursor: "2026-01-21T12:00:00Z",
+      });
+      let decryptCount = 0;
+      (decryptWithPassword as ReturnType<typeof vi.fn>).mockImplementation(
+        async () => {
+          decryptCount += 1;
+          if (decryptCount === 2) {
+            throw new Error(
+              "Error decrypting message: Session key decryption failed.",
+            );
+          }
+          return new TextEncoder().encode(JSON.stringify(makeEnvelope()));
+        },
+      );
+
+      const results = await downloadAll(deps);
+
+      expect(results).toHaveLength(2);
+      expect(deps.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          fileId: "file-002",
+          schemaId: SCHEMA_ID,
+          stage: "decrypt",
+          errorClass: "Error",
+          message: "Encrypted payload could not be decrypted",
+        }),
+        "Quarantined corrupt synced file",
+      );
+      expect(deps.cursor.write).toHaveBeenCalledWith("2026-01-21T12:00:00Z");
     });
   });
 });
