@@ -2,7 +2,8 @@
  * End-to-end: register a binary PDF (a DEXA scan) to the Vana network.
  *
  * Flow:
- *   1. Generate a fresh owner wallet + derive its master-key signature.
+ *   1. Load the owner wallet (VANA_WEB_PRIVATE_KEY from .env.local, else
+ *      ephemeral) + derive its master-key signature. The key is never logged.
  *   2. Register a server account with the gateway, then boot a personal server
  *      (sync enabled). Registering before boot avoids a transient "unregistered"
  *      sync warning.
@@ -10,13 +11,16 @@
  *      The scope has no schema, so the server auto-registers a "no-schema" one.
  *   4. Trigger sync → the file is encrypted, uploaded to storage, and
  *      registered on-chain (registerFile). Poll until it gets a fileId.
- *   5. Boot a SECOND registered server for the same owner; its sync downloads +
+ *   5. Discover the owner's scopes from the gateway: GET /v1/files?user=… then
+ *      GET /v1/schemas/<schemaId> for each → scope. Confirm the file shows up.
+ *   6. Boot a SECOND registered server for the same owner; its sync downloads +
  *      decrypts the file, then serves the raw bytes back — verify they match.
  *
  * Run:
  *   npx tsx scripts/e2e-register-pdf.ts
  *
- * Optional env overrides:
+ * Optional env overrides (also read from .env.local):
+ *   VANA_WEB_PRIVATE_KEY            (owner private key; else a fresh one is made)
  *   GATEWAY_URL                     (default https://dev.data-gateway.vana.org)
  *   STORAGE_API_URL                 (blob storage endpoint that validates the
  *                                    server↔owner link against THIS gateway's
@@ -53,6 +57,14 @@ import {
 } from "../packages/core/src/schemas/server-config.js";
 import { createServer } from "../packages/server/src/bootstrap.js";
 import { loadOrCreateServerAccount } from "../packages/server/src/keys/server-account.js";
+
+// Load .env.local (e.g. VANA_WEB_PRIVATE_KEY) without overriding already-set env
+// vars. Secrets are read at runtime only — never logged or committed.
+try {
+  process.loadEnvFile(".env.local");
+} catch {
+  // .env.local is optional.
+}
 
 const GATEWAY_URL = (
   process.env.GATEWAY_URL ?? "https://dev.data-gateway.vana.org"
@@ -223,18 +235,64 @@ async function bootRegisteredServer(params: {
   return ctx as ReadyServer;
 }
 
+/**
+ * Discover the scopes a user has data in, from their on-chain files:
+ *   GET /v1/files?user=<addr>  → each file's schemaId   (paginated via cursor)
+ *   GET /v1/schemas/<schemaId> → schema.scope
+ * Returns a map of scope → file count.
+ */
+async function gatewayScopesForUser(
+  gateway: ServerCtx["gatewayClient"],
+  userAddress: string,
+): Promise<Map<string, number>> {
+  const files: Awaited<ReturnType<typeof gateway.listFilesSince>>["files"] = [];
+  let cursor: string | null = null;
+  for (let page = 0; page < 100; page++) {
+    const result = await gateway.listFilesSince(userAddress, cursor);
+    files.push(...result.files);
+    cursor = result.cursor;
+    if (!cursor) break;
+  }
+  console.log(`  ${files.length} file(s) on the gateway`);
+
+  const schemaIds = [
+    ...new Set(files.map((f) => f.schemaId).filter((id): id is string => !!id)),
+  ];
+  const scopeBySchema = new Map<string, string>();
+  for (const id of schemaIds) {
+    const schema = await gateway.getSchema(id);
+    if (schema) scopeBySchema.set(id, schema.scope);
+  }
+
+  const byScope = new Map<string, number>();
+  for (const f of files) {
+    const scope = !f.schemaId
+      ? "(no schema)"
+      : (scopeBySchema.get(f.schemaId) ?? `(unresolved ${f.schemaId})`);
+    byScope.set(scope, (byScope.get(scope) ?? 0) + 1);
+  }
+  return byScope;
+}
+
 async function main() {
   const rootPath = await mkdtemp(join(tmpdir(), "vana-e2e-"));
 
-  // 1. Fresh owner wallet + master-key signature.
-  const ownerPrivateKey = generatePrivateKey();
+  // 1. Owner wallet + master-key signature. Prefer the user's key from
+  // .env.local (VANA_WEB_PRIVATE_KEY); otherwise generate an ephemeral one.
+  // The private key is read at runtime only and is never logged.
+  const envKey = process.env.VANA_WEB_PRIVATE_KEY;
+  const ownerPrivateKey = envKey
+    ? ((envKey.startsWith("0x") ? envKey : `0x${envKey}`) as `0x${string}`)
+    : generatePrivateKey();
   const ownerAccount = privateKeyToAccount(ownerPrivateKey);
   const masterKeySignature = await ownerAccount.signMessage({
     message: MASTER_KEY_MESSAGE,
   });
-  log("1/5", "Generated owner wallet");
+  log("1/6", "Loaded owner wallet");
+  console.log(
+    `  owner source:  ${envKey ? "VANA_WEB_PRIVATE_KEY (.env.local)" : "ephemeral (generated)"}`,
+  );
   console.log(`  owner address: ${ownerAccount.address}`);
-  console.log(`  owner privkey: ${ownerPrivateKey}`);
   console.log(`  gateway:       ${GATEWAY_URL}`);
   console.log(`  chainId:       ${makeConfig(PORT).gateway.chainId}`);
 
@@ -243,7 +301,7 @@ async function main() {
   let ctx: ReadyServer | undefined;
   try {
     // 2. Register the server account, then boot the personal server.
-    log("2/5", "Registering + starting personal server");
+    log("2/6", "Registering + starting personal server");
     ctx = await bootRegisteredServer({
       rootPath,
       port: PORT,
@@ -253,7 +311,7 @@ async function main() {
     });
 
     // 3. Download the PDF and POST it as binary (auto-registers a schema).
-    log("3/5", `Downloading + posting PDF to scope "${SCOPE}"`);
+    log("3/6", `Downloading + posting PDF to scope "${SCOPE}"`);
     const pdfRes = await fetch(PDF_URL);
     if (!pdfRes.ok) {
       throw new Error(`failed to download PDF: ${pdfRes.status}`);
@@ -291,7 +349,7 @@ async function main() {
     const ingested = ctx.indexManager.findLatestByScope(SCOPE);
 
     // 4. Sync: encrypt → upload to storage → register on-chain. Poll for fileId.
-    log("4/5", "Syncing (upload + on-chain registerFile)");
+    log("4/6", "Syncing (upload + on-chain registerFile)");
     let fileId: string | null = null;
     for (let attempt = 1; attempt <= 12 && !fileId; attempt++) {
       await ctx.syncManager.trigger();
@@ -320,10 +378,28 @@ async function main() {
     console.log(`    schemaId: ${ingested?.schemaId ?? "(none)"}`);
     if (record) console.log(`    url:      ${record.url}`);
 
-    // 5. Download + decryption: a SECOND personal server for the same owner
+    // 5. Discover the owner's scopes from the gateway: GET /v1/files?user=… →
+    // resolve each schemaId via GET /v1/schemas/<id> → scope. Confirms the
+    // freshly registered file is discoverable on the network by user address.
+    log("5/6", "Listing owner scopes from the gateway (files → schemas)");
+    const scopes = await gatewayScopesForUser(
+      ctx.gatewayClient,
+      ownerAccount.address,
+    );
+    console.log(`  scopes (${scopes.size}):`);
+    for (const [scope, count] of [...scopes.entries()].sort()) {
+      console.log(`    ${scope} — ${count} file${count === 1 ? "" : "s"}`);
+    }
+    if (!scopes.has(SCOPE)) {
+      throw new Error(
+        `expected scope "${SCOPE}" not found in the gateway file listing`,
+      );
+    }
+
+    // 6. Download + decryption: a SECOND personal server for the same owner
     // (registered before boot) pulls the file off the network, decrypts it with
     // the owner's master key, and serves it back — full cross-server round-trip.
-    log("5/5", "Verifying download + decryption on a second server");
+    log("6/6", "Verifying download + decryption on a second server");
     rootPath2 = await mkdtemp(join(tmpdir(), "vana-e2e-2-"));
     ctx2 = await bootRegisteredServer({
       rootPath: rootPath2,
