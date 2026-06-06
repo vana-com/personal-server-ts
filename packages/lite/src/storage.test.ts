@@ -1,12 +1,74 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import type {
+  DataBlockManifest,
+  DataScopeBlock,
+} from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
+  createMemoryPsLiteStorage,
   createMemoryPsLiteDataFileStore,
   createMemoryPsLitePersistence,
 } from "./test-support/memory.js";
-import { createPersistentPsLiteStorage } from "./storage.js";
+import {
+  createPersistentPsLiteStorage,
+  type PsLiteDataFileStore,
+} from "./storage.js";
+import { previewEnvelopeValue } from "./storage-utils.js";
 
 describe("createPersistentPsLiteStorage", () => {
+  it("bounds in-memory previews by traversal work for container-heavy envelopes", () => {
+    const envelope = createDataFileEnvelope(
+      "chatgpt.conversations",
+      "2026-05-08T00:00:00.000Z",
+      { items: Array.from({ length: 50_000 }, () => ({})) },
+    );
+
+    const preview = previewEnvelopeValue(envelope, 100_000);
+
+    expect(preview.truncated).toBe(true);
+    expect(preview.text.length).toBeLessThanOrEqual(100_000);
+  });
+
+  it("leaves custom file stores without bounded previews on the core fallback path", async () => {
+    const persistence = createMemoryPsLitePersistence();
+    const files = new Map<string, ReturnType<typeof createDataFileEnvelope>>();
+    const readEnvelope = vi.fn(async (path: string) => files.get(path) ?? null);
+    const dataFileStore: PsLiteDataFileStore = {
+      kind: "opfs",
+      readEnvelope,
+      async writeEnvelope(path, envelope) {
+        files.set(path, envelope);
+        return new TextEncoder().encode(JSON.stringify(envelope)).byteLength;
+      },
+      async deleteEnvelope(path) {
+        files.delete(path);
+      },
+    };
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      persistence,
+      dataFileStore,
+    );
+    const envelope = createDataFileEnvelope(
+      "notes.profile",
+      "2026-05-08T00:00:00.000Z",
+      { text: "x".repeat(10_000) },
+    );
+
+    const write = await storage.writeEnvelope(envelope);
+    expect(write.sizeBytes).toBeGreaterThan(1_000);
+    await storage.insertEntry({
+      fileId: "file-1",
+      path: write.relativePath,
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      sizeBytes: write.sizeBytes,
+    });
+
+    expect(storage.readEnvelopePreview).toBeUndefined();
+    expect(readEnvelope).not.toHaveBeenCalled();
+  });
+
   it("persists envelopes and index entries across storage reloads", async () => {
     const persistence = createMemoryPsLitePersistence();
     const storage = await createPersistentPsLiteStorage(
@@ -74,6 +136,55 @@ describe("createPersistentPsLiteStorage", () => {
 
     expect(reloaded.countVersions("instagram.profile")).toBe(0);
     expect(reloaded.findEntry({ scope: "instagram.profile" })).toBeUndefined();
+  });
+
+  it("deletes a single version by fileId (entry + blob) and no-ops on unknown id", async () => {
+    const persistence = createMemoryPsLitePersistence();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      persistence,
+    );
+    // Two versions of the same scope; only one is deleted.
+    const keep = createDataFileEnvelope(
+      "instagram.profile",
+      "2026-05-08T00:00:00.000Z",
+      { username: "keep" },
+    );
+    const drop = createDataFileEnvelope(
+      "instagram.profile",
+      "2026-05-09T00:00:00.000Z",
+      { username: "drop" },
+    );
+    for (const [index, envelope] of [keep, drop].entries()) {
+      const write = await storage.writeEnvelope(envelope);
+      await storage.insertEntry({
+        fileId: `file-${index + 1}`,
+        path: write.relativePath,
+        scope: envelope.scope,
+        collectedAt: envelope.collectedAt,
+        sizeBytes: write.sizeBytes,
+      });
+    }
+
+    expect(await storage.deleteByFileId("file-2")).toBe(true);
+    // Unknown fileId is a no-op.
+    expect(await storage.deleteByFileId("file-unknown")).toBe(false);
+
+    const reloaded = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      persistence,
+    );
+    expect(reloaded.countVersions("instagram.profile")).toBe(1);
+    expect(
+      reloaded.findEntry({ scope: "instagram.profile", fileId: "file-2" }),
+    ).toBeUndefined();
+    // The other version (and its blob) survive.
+    expect(
+      reloaded.findEntry({ scope: "instagram.profile", fileId: "file-1" }),
+    ).toBeDefined();
+    await expect(
+      reloaded.readEnvelope("instagram.profile", "2026-05-08T00:00:00.000Z"),
+    ).resolves.toBeDefined();
   });
 
   it("summarizes persisted scopes with latest collection time and version count", async () => {
@@ -235,4 +346,166 @@ describe("createPersistentPsLiteStorage", () => {
     });
     expect(reloaded.findUnsynced()).toEqual([]);
   });
+
+  it("persists IndexedDB fallback block sidecars across storage reloads", async () => {
+    const persistence = createMemoryPsLitePersistence();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      persistence,
+    );
+    const { manifest, blocks } = blockFixture(
+      "instagram.profile",
+      "2026-05-08T00:00:00.000Z",
+      2,
+    );
+
+    await storage.writeBlockManifest?.(
+      manifest.scope,
+      manifest.collectedAt,
+      manifest,
+      blocks,
+    );
+
+    const reloaded = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      persistence,
+    );
+    await expect(
+      reloaded.readScopeBlocks?.(
+        "instagram.profile",
+        "2026-05-08T00:00:00.000Z",
+        { maxBytes: 1_000 },
+      ),
+    ).resolves.toMatchObject({
+      scope: "instagram.profile",
+      blocks: [{ value: { index: 0 } }, { value: { index: 1 } }],
+    });
+  });
+
+  it("pages block sidecar reads by cursor until all blocks are reachable", async () => {
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      createMemoryPsLitePersistence(),
+    );
+    const { manifest, blocks } = blockFixture(
+      "chatgpt.conversations",
+      "2026-05-08T00:00:00.000Z",
+      3,
+    );
+    await storage.writeBlockManifest?.(
+      manifest.scope,
+      manifest.collectedAt,
+      manifest,
+      blocks,
+    );
+
+    const seen: unknown[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await storage.readScopeBlocks!(
+        manifest.scope,
+        manifest.collectedAt,
+        { cursor, maxBytes: 1 },
+      );
+      seen.push(...page.blocks.map((block) => block.value));
+      cursor = page.nextCursor;
+    } while (cursor);
+
+    expect(seen).toEqual([{ index: 0 }, { index: 1 }, { index: 2 }]);
+  });
+
+  it("reports missing block manifests without reading raw envelopes", async () => {
+    const files = new Map<string, ReturnType<typeof createDataFileEnvelope>>();
+    const readEnvelope = vi.fn(async (path: string) => files.get(path) ?? null);
+    const dataFileStore: PsLiteDataFileStore = {
+      kind: "opfs",
+      readEnvelope,
+      async writeEnvelope(path, envelope) {
+        files.set(path, envelope);
+        return new TextEncoder().encode(JSON.stringify(envelope)).byteLength;
+      },
+      async deleteEnvelope(path) {
+        files.delete(path);
+      },
+      async readBlockManifest() {
+        return null;
+      },
+      async readBlockPayload() {
+        throw new Error("payload should not be read without a manifest");
+      },
+    };
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      dataFileStore,
+    );
+
+    await expect(
+      storage.readScopeBlocks?.("notes.profile", "2026-05-08T00:00:00.000Z", {
+        maxBytes: 1_000,
+      }),
+    ).rejects.toThrow("Block manifest not found");
+    await expect(
+      storage.hasScopeBlocks?.("notes.profile", "2026-05-08T00:00:00.000Z"),
+    ).resolves.toBe(false);
+    expect(readEnvelope).not.toHaveBeenCalled();
+  });
+
+  it("supports block sidecars in memory storage", async () => {
+    const storage = createMemoryPsLiteStorage();
+    const { manifest, blocks } = blockFixture(
+      "spotify.profile",
+      "2026-05-08T00:00:00.000Z",
+      1,
+    );
+
+    await storage.writeBlockManifest?.(
+      manifest.scope,
+      manifest.collectedAt,
+      manifest,
+      blocks,
+    );
+    await expect(
+      storage.hasScopeBlocks?.(manifest.scope, manifest.collectedAt),
+    ).resolves.toBe(true);
+
+    await expect(
+      storage.readScopeBlocks?.(manifest.scope, manifest.collectedAt, {
+        maxBytes: 1_000,
+      }),
+    ).resolves.toMatchObject({
+      contentKind: "json",
+      blocks: [{ value: { index: 0 } }],
+    });
+  });
 });
+
+function blockFixture(
+  scope: string,
+  collectedAt: string,
+  count: number,
+): { manifest: DataBlockManifest; blocks: DataScopeBlock[] } {
+  const blocks = Array.from({ length: count }, (_, index) => ({
+    id: `block-${index}`,
+    path: `$.items[${index}]`,
+    mediaType: "application/json",
+    value: { index },
+    sizeBytes: 10,
+  }));
+  return {
+    manifest: {
+      version: 1,
+      scope,
+      collectedAt,
+      contentKind: "json",
+      blocks: blocks.map(({ id, path, mediaType, sizeBytes }) => ({
+        id,
+        path,
+        mediaType,
+        sizeBytes,
+      })),
+      warnings: [],
+    },
+    blocks,
+  };
+}

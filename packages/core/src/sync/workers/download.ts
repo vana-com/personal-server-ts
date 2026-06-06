@@ -9,6 +9,8 @@ import {
 import type { SyncCursor } from "../cursor.js";
 import type { Logger } from "../../logger/index.js";
 import type { DataStoragePort } from "../../ports/index.js";
+import { buildDataBlocks } from "../../storage/blocks/build.js";
+import { classifySyncFailure } from "../issues.js";
 
 export interface DownloadWorkerDeps {
   storage: DataStoragePort;
@@ -51,7 +53,15 @@ export async function downloadOne(
     return null;
   }
 
-  // 2. Download OpenPGP encrypted binary from storage backend
+  // 2. Download OpenPGP encrypted binary from storage backend.
+  // A download failure (404 or transient) throws and blocks the cursor — and that is correct here:
+  // the delete cascade de-registers a file BEFORE deleting its blob, so any genuinely-deleted file
+  // has deletedAt set and is excluded from this default (excludeDeleted) listing. Thus a 404 only
+  // happens for an in-flight cross-device delete, which self-heals on the next cycle once the
+  // de-register propagates and the file drops out of the list; a transient error blocks-and-retries
+  // without losing data. We deliberately do NOT skip-on-404 here: the storage layer can't reliably
+  // distinguish "gone" from "transiently unavailable", so skipping would risk a silent data gap
+  // during an outage. (Cross-device removal of already-downloaded copies is slice 3b.)
   const encrypted = await storageAdapter.download(record.url);
 
   // 3. Resolve schemaId → scope via Gateway getSchema
@@ -95,6 +105,7 @@ export async function downloadOne(
 
   // 7. Write to local storage via the runtime storage port
   const { relativePath, sizeBytes } = await storage.writeEnvelope(envelope);
+  await writeBlockSidecars(storage, envelope, logger, record, relativePath);
 
   // 8. Insert into local index (with fileId)
   await storage.insertEntry({
@@ -127,14 +138,17 @@ export async function downloadAll(
   deps: DownloadWorkerDeps,
 ): Promise<DownloadResult[]> {
   const { gateway, cursor, serverOwner, logger } = deps;
+  const syncRunId = createSyncRunId();
 
   // 1. Read cursor
   const lastProcessedTimestamp = await cursor.read();
 
-  // 2. Poll gateway for new file records
+  // 2. Poll gateway for new file records, including soft-deleted ones so we can reconcile deletions
+  // of files this device already holds (cross-device "deleted on desktop → gone on web too").
   const { files, cursor: nextCursor } = await gateway.listFilesSince(
     serverOwner,
     lastProcessedTimestamp,
+    { includeDeleted: true },
   );
 
   const results: DownloadResult[] = [];
@@ -143,11 +157,42 @@ export async function downloadAll(
   // 3. Process each file record
   for (const file of files) {
     try {
+      // Deletion reconciliation: a record marked deletedAt means the owner deleted it elsewhere.
+      // Drop any local copy instead of downloading. Idempotent — no local copy is a no-op.
+      if (file.deletedAt) {
+        const removed = await deps.storage.deleteByFileId(file.fileId);
+        if (removed) {
+          logger.info(
+            { fileId: file.fileId },
+            "Reconciled remote deletion: removed local copy",
+          );
+        }
+        continue;
+      }
       const result = await downloadOne(deps, file);
       if (result) {
         results.push(result);
       }
     } catch (err) {
+      const classified = classifySyncFailure({
+        error: err,
+        fileId: file.fileId,
+        schemaId: file.schemaId,
+        syncRunId,
+      });
+      if (!classified.issue.retryable) {
+        logger.warn(
+          {
+            fileId: file.fileId,
+            schemaId: file.schemaId,
+            stage: classified.issue.stage,
+            errorClass: classified.issue.errorClass,
+            message: classified.issue.message,
+          },
+          "Quarantined corrupt synced file",
+        );
+        continue;
+      }
       logger.error(
         {
           fileId: file.fileId,
@@ -173,8 +218,66 @@ export async function downloadAll(
   return results;
 }
 
+function createSyncRunId(): string {
+  return typeof crypto !== "undefined" &&
+    typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `download-${Date.now().toString(36)}`;
+}
+
 function uint8ToHex(bytes: Uint8Array): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
     "",
   );
+}
+
+async function writeBlockSidecars(
+  storage: DataStoragePort,
+  envelope: {
+    scope: string;
+    collectedAt: string;
+    data: unknown;
+    version?: string;
+  },
+  logger: Logger,
+  record: FileRecord,
+  relativePath: string,
+): Promise<void> {
+  if (!storage.writeBlockManifest) return;
+
+  try {
+    const built = buildDataBlocks({
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      schemaId: record.schemaId,
+      content: envelope,
+    });
+    await storage.writeBlockManifest(
+      envelope.scope,
+      envelope.collectedAt,
+      built.manifest,
+      built.blocks,
+    );
+  } catch (error) {
+    const classified = classifySyncFailure({
+      error,
+      fileId: record.fileId,
+      syncRunId: "download",
+      stage: "block_build",
+      schemaId: record.schemaId,
+      scope: envelope.scope,
+    });
+    logger.warn(
+      {
+        fileId: record.fileId,
+        scope: envelope.scope,
+        collectedAt: envelope.collectedAt,
+        path: relativePath,
+        stage: classified.issue.stage,
+        errorClass: classified.issue.errorClass,
+        message: classified.issue.message,
+      },
+      "Bounded block sidecar write failed after raw envelope write",
+    );
+  }
 }

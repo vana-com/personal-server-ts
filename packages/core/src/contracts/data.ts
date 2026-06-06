@@ -6,6 +6,7 @@ import {
 } from "@opendatalabs/vana-sdk/browser";
 import { type WriteResult } from "../storage/hierarchy/index.js";
 import { buildBinaryEnvelopeData, sha256Hex } from "./binary.js";
+import { buildDataBlocks } from "../storage/blocks/build.js";
 
 export type DataContractErrorCode =
   | "INVALID_SCOPE"
@@ -157,9 +158,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-export function listDataScopesContract(
+export async function listDataScopesContract(
   input: ListDataScopesContractInput,
-): ListDataScopesContractResult {
+): Promise<ListDataScopesContractResult> {
   const limit = normalizeLimit(input.limit);
   const offset = normalizeOffset(input.offset);
   const result = input.storage.listScopes({
@@ -167,10 +168,33 @@ export function listDataScopesContract(
     limit,
     offset,
   });
+  const scopes = await Promise.all(
+    result.scopes.map(async (summary) => {
+      const entry = input.storage.findEntry({
+        scope: summary.scope,
+        at: summary.latestCollectedAt,
+      });
+      if (!entry) {
+        return summary;
+      }
+      const hasBlocks =
+        typeof input.storage.hasScopeBlocks === "function"
+          ? await input.storage.hasScopeBlocks(
+              summary.scope,
+              summary.latestCollectedAt,
+            )
+          : false;
+      return {
+        ...summary,
+        dataStatus: hasBlocks ? ("ready" as const) : ("indexing" as const),
+        sizeBytes: entry.sizeBytes,
+      };
+    }),
+  );
   return {
     ok: true,
     response: {
-      scopes: result.scopes,
+      scopes,
       total: result.total,
       limit,
       offset,
@@ -265,6 +289,11 @@ export async function ingestDataContract(
     input.schemaId,
   );
   const writeResult = await input.storage.writeEnvelope(envelope);
+  try {
+    await writeBlockSidecars(input.storage, envelope);
+  } catch {
+    // Best-effort bounded sidecars: raw envelope storage remains the source of truth.
+  }
   await input.storage.insertEntry({
     fileId: null,
     schemaId: input.schemaId ?? null,
@@ -328,6 +357,11 @@ export async function ingestBinaryDataContract(
     input.schemaId,
   );
   const writeResult = await input.storage.writeEnvelope(envelope);
+  try {
+    await writeBlockSidecars(input.storage, envelope);
+  } catch {
+    // Best-effort bounded sidecars: raw envelope storage remains the source of truth.
+  }
   await input.storage.insertEntry({
     fileId: null,
     schemaId: input.schemaId ?? null,
@@ -360,4 +394,24 @@ export async function deleteDataScopeContract(
     ok: true,
     deletedCount: await input.storage.deleteScope(scopeResult.scope),
   };
+}
+
+async function writeBlockSidecars(
+  storage: DataStoragePort,
+  envelope: DataFileEnvelope,
+): Promise<void> {
+  if (!storage.writeBlockManifest) return;
+
+  const built = buildDataBlocks({
+    scope: envelope.scope,
+    collectedAt: envelope.collectedAt,
+    schemaId: envelope.schemaId,
+    content: envelope,
+  });
+  await storage.writeBlockManifest(
+    envelope.scope,
+    envelope.collectedAt,
+    built.manifest,
+    built.blocks,
+  );
 }

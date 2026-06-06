@@ -3,6 +3,7 @@ import type { DownloadWorkerDeps } from "../workers/download.js";
 import type { SyncStatus, SyncError, SyncBlockedReason } from "../types.js";
 import { uploadAll } from "../workers/upload.js";
 import { downloadAll } from "../workers/download.js";
+import { deleteScopeRemote } from "../workers/delete.js";
 
 export interface SyncManagerOptions {
   /** Polling interval in milliseconds (default: 60_000 = 1 minute) */
@@ -34,6 +35,13 @@ export interface SyncManager {
 
   /** Signal that new data has been ingested (next cycle picks it up) */
   notifyNewData(): void;
+
+  /**
+   * Propagate a scope deletion to the authoritative stores (R2 blobs + gateway file records).
+   * Call BEFORE deleting the scope locally — it reads the local index to find what to remove.
+   * Best-effort: resolves with a summary; per-file failures are logged, not thrown.
+   */
+  deleteScopeRemote(scope: string): Promise<void>;
 
   /** Whether the sync manager is currently running */
   readonly running: boolean;
@@ -245,6 +253,11 @@ export function createSyncManager(
     notifyNewData() {
       uploadDeps.logger.debug("New data notification received");
       scheduleNotifiedCycle();
+    },
+
+    async deleteScopeRemote(scope: string) {
+      // Reuses the upload worker's remote deps (gateway, storage adapter, signer, owner).
+      await deleteScopeRemote(uploadDeps, scope);
     },
   };
 

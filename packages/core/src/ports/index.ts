@@ -9,6 +9,11 @@ import type {
 } from "@opendatalabs/vana-sdk/browser";
 import type { WriteResult } from "../storage/hierarchy/index.js";
 import type {
+  DataBlockManifest,
+  DataScopeBlock,
+  ReadScopeBlocksResponse,
+} from "../storage/blocks/index.js";
+import type {
   IndexEntry,
   NewIndexEntry,
   ScopeSummary,
@@ -78,6 +83,11 @@ export interface DataStorageEntryLookup {
   at?: string;
 }
 
+export interface DataStorageEnvelopePreview {
+  text: string;
+  truncated: boolean;
+}
+
 export interface DataStoragePort extends RuntimeStoragePort {
   listScopes(options: DataStorageScopeListOptions): {
     scopes: ScopeSummary[];
@@ -89,10 +99,36 @@ export interface DataStoragePort extends RuntimeStoragePort {
   findByFileId(fileId: string): IndexEntry | undefined;
   findUnsynced(options?: { limit?: number }): IndexEntry[];
   readEnvelope(scope: string, collectedAt: string): Promise<DataFileEnvelope>;
+  readEnvelopePreview?(
+    scope: string,
+    collectedAt: string,
+    options: { maxBytes: number },
+  ): Promise<DataStorageEnvelopePreview>;
+  readScopeBlocks?(
+    scope: string,
+    collectedAt: string,
+    options: { cursor?: string; maxBytes: number },
+  ): Promise<ReadScopeBlocksResponse>;
+  hasScopeBlocks?(
+    scope: string,
+    collectedAt: string,
+  ): boolean | Promise<boolean>;
   writeEnvelope(envelope: DataFileEnvelope): Promise<WriteResult>;
+  writeBlockManifest?(
+    scope: string,
+    collectedAt: string,
+    manifest: DataBlockManifest,
+    blocks: DataScopeBlock[],
+  ): Promise<void>;
   insertEntry(entry: NewIndexEntry): IndexEntry | Promise<IndexEntry>;
   updateFileId(path: string, fileId: string): boolean | Promise<boolean>;
   deleteScope(scope: string): Promise<number>;
+  /**
+   * Delete a single version (index entry + its local blob) by its gateway fileId.
+   * Returns true if a local copy existed and was removed, false if none was present (no-op).
+   * Used by sync delete-reconciliation to drop a copy the gateway reports as deleted.
+   */
+  deleteByFileId(fileId: string): Promise<boolean>;
 }
 
 export interface RuntimeAvailabilityPort {

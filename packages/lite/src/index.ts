@@ -99,6 +99,13 @@ export {
 } from "./runtime.js";
 
 export {
+  createIndexedDbMcpConnectionStore,
+  createIndexedDbMcpOAuthAuthorizationStore,
+  type IndexedDbMcpConnectionStoreOptions,
+  type IndexedDbMcpOAuthAuthorizationStoreOptions,
+} from "./mcp-store.js";
+
+export {
   decodeDataFrame,
   encodeDataFrame,
   psLiteRelayControlUrl,
