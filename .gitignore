@@ -4,6 +4,8 @@ dist/
 .DS_Store
 coverage/
 .env
+.env.*
+!.env.example
 *.log
 # Build artifacts that may land in src/ (should go to dist/)
 packages/*/src/**/*.js
