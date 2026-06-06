@@ -46,6 +46,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
+  type FileRecord,
   MASTER_KEY_MESSAGE,
   serverRegistrationDomain,
   SERVER_REGISTRATION_TYPES,
@@ -245,18 +246,23 @@ async function gatewayScopesForUser(
   gateway: ServerCtx["gatewayClient"],
   userAddress: string,
 ): Promise<Map<string, number>> {
-  const files: Awaited<ReturnType<typeof gateway.listFilesSince>>["files"] = [];
+  const files: FileRecord[] = [];
   let cursor: string | null = null;
   for (let page = 0; page < 100; page++) {
-    const result = await gateway.listFilesSince(userAddress, cursor);
+    const result = (await gateway.listFilesSince(userAddress, cursor)) as {
+      cursor: string | null;
+      files: FileRecord[];
+    };
     files.push(...result.files);
     cursor = result.cursor;
     if (!cursor) break;
   }
   console.log(`  ${files.length} file(s) on the gateway`);
 
-  const schemaIds = [
-    ...new Set(files.map((f) => f.schemaId).filter((id): id is string => !!id)),
+  const schemaIds: string[] = [
+    ...new Set(
+      files.map((f) => f.schemaId).filter((id): id is string => Boolean(id)),
+    ),
   ];
   const scopeBySchema = new Map<string, string>();
   for (const id of schemaIds) {
