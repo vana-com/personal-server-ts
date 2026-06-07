@@ -40,6 +40,21 @@ export interface SchemaResolverPort {
   getSchemaForScope(scope: string): Promise<Schema | null>;
 }
 
+/** Result of registering (or idempotently resolving) a schema for a scope. */
+export interface RegisteredSchema {
+  schemaId: string;
+  definitionUrl: string;
+}
+
+/**
+ * Registers a permissive "no-schema" schema for scopes that carry unstructured
+ * data (e.g. binary blobs). Idempotent on scope at the gateway: registering an
+ * already-registered scope returns its existing schemaId.
+ */
+export interface SchemaRegistrarPort {
+  registerNoSchema(scope: string): Promise<RegisteredSchema>;
+}
+
 export interface FileRegistrySyncRegistryPort {
   getFile(fileId: string): Promise<FileRecord | null>;
   listFilesSince(owner: string, cursor: string | null): Promise<FileListResult>;

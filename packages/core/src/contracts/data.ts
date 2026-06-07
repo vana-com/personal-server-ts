@@ -5,6 +5,7 @@ import {
   type DataFileEnvelope,
 } from "@opendatalabs/vana-sdk/browser";
 import { type WriteResult } from "../storage/hierarchy/index.js";
+import { buildBinaryEnvelopeData, sha256Hex } from "./binary.js";
 import { buildDataBlocks } from "../storage/blocks/build.js";
 
 export type DataContractErrorCode =
@@ -96,6 +97,20 @@ export interface IngestDataContractResult {
     status: "stored" | "syncing";
   };
   writeResult: WriteResult;
+}
+
+export interface IngestBinaryDataContractInput {
+  storage: DataStoragePort;
+  scopeParam: string;
+  bytes: Uint8Array;
+  mimeType: string;
+  filename?: string;
+  /** Free-form caller metadata (e.g. a description) stored alongside the file. */
+  metadata?: unknown;
+  collectedAt: string;
+  status: "stored" | "syncing";
+  schemaUrl?: string;
+  schemaId?: string;
 }
 
 export interface DeleteDataScopeContractInput {
@@ -286,6 +301,74 @@ export async function ingestDataContract(
     scope: scopeResult.scope,
     collectedAt: input.collectedAt,
     sizeBytes: writeResult.sizeBytes,
+  });
+
+  return {
+    ok: true,
+    scope: scopeResult.scope,
+    collectedAt: input.collectedAt,
+    response: {
+      scope: scopeResult.scope,
+      collectedAt: input.collectedAt,
+      status: input.status,
+    },
+    writeResult,
+  };
+}
+
+/**
+ * Ingest unstructured/binary data (e.g. a PDF). The bytes are hashed and
+ * base64-encoded into a binary DataFileEnvelope, then written and indexed
+ * exactly like JSON ingest — so the downstream encrypt/upload/register path is
+ * unchanged. Unlike JSON ingest, the body is raw bytes (not a JSON object) and
+ * `schemaId` may be absent (the caller decides whether to auto-register one).
+ */
+export async function ingestBinaryDataContract(
+  input: IngestBinaryDataContractInput,
+): Promise<IngestDataContractResult | DataContractError> {
+  const scopeResult = parseDataScopeContract(input.scopeParam);
+  if (!scopeResult.ok) return scopeResult;
+
+  if (input.bytes.length === 0) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: "INVALID_BODY",
+        message: "Request body must not be empty",
+      },
+    };
+  }
+
+  const contentHash = await sha256Hex(input.bytes);
+  const data = buildBinaryEnvelopeData({
+    bytes: input.bytes,
+    mimeType: input.mimeType,
+    filename: input.filename,
+    contentHash,
+    metadata: input.metadata,
+  });
+
+  const envelope = createDataFileEnvelope(
+    scopeResult.scope,
+    input.collectedAt,
+    data,
+    input.schemaUrl,
+    input.schemaId,
+  );
+  const writeResult = await input.storage.writeEnvelope(envelope);
+  try {
+    await writeBlockSidecars(input.storage, envelope);
+  } catch {
+    // Best-effort bounded sidecars: raw envelope storage remains the source of truth.
+  }
+  await input.storage.insertEntry({
+    fileId: null,
+    schemaId: input.schemaId ?? null,
+    path: writeResult.relativePath,
+    scope: scopeResult.scope,
+    collectedAt: input.collectedAt,
+    sizeBytes: input.bytes.length,
   });
 
   return {
