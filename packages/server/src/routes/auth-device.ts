@@ -7,6 +7,9 @@
  * POST /auth/device/approve — Approve the session (session= query param)
  */
 
+// Load the Hono ContextVariableMap augmentation (auth/authMechanism/etc.) so
+// c.get("authMechanism") is typed in this route's compilation.
+import "../hono-context.js";
 import { randomBytes } from "node:crypto";
 import { Hono, type Context } from "hono";
 import type { Logger } from "pino";

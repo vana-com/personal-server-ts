@@ -25,6 +25,11 @@ export const DEFAULTS = {
       dataPortabilityPermissions: "0xD54523048AdD05b4d734aFaE7C68324Ebb7373eF",
       dataPortabilityServer: "0x1483B1F634DBA75AeaE60da7f01A679aabd5ee2c",
       dataPortabilityGrantees: "0x8325C0A0948483EdA023A1A2Fd895e62C5131234",
+      // Schema registration (POST /v1/schemas) is signed against the Data
+      // Refiner Registry contract — distinct from the contracts above. The
+      // server config loader populates this from GATEWAY_DATA_REFINER_REGISTRY;
+      // empty here means schema auto-registration is unavailable.
+      dataRefinerRegistry: "0x93c3EF89369fDcf08Be159D9DeF0F18AB6Be008c",
     },
   },
   devUi: {
@@ -105,6 +110,12 @@ export const ServerConfigSchema = z.object({
             .string()
             .startsWith("0x")
             .default(DEFAULTS.gateway.contracts.dataPortabilityGrantees),
+          // Optional: only required for schema registration (POST /v1/schemas).
+          // Empty string when unset — the schema registrar errors clearly if
+          // it is asked to register while this is missing.
+          dataRefinerRegistry: z
+            .string()
+            .default(DEFAULTS.gateway.contracts.dataRefinerRegistry),
         })
         .default(DEFAULTS.gateway.contracts),
     })
@@ -154,5 +165,7 @@ export type GatewayConfig = {
     dataPortabilityPermissions: string;
     dataPortabilityServer: string;
     dataPortabilityGrantees: string;
+    /** Verifying contract for SchemaRegistration EIP-712. Empty when unset. */
+    dataRefinerRegistry?: string;
   };
 };

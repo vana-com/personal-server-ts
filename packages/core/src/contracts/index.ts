@@ -1,11 +1,25 @@
 export {
   deleteDataScopeContract,
   ingestDataContract,
+  ingestBinaryDataContract,
   listDataScopesContract,
   listDataVersionsContract,
   parseDataScopeContract,
   readDataContract,
 } from "./data.js";
+export {
+  BINARY_MARKER,
+  BINARY_ENCODING,
+  buildBinaryEnvelopeData,
+  decodeBinaryEnvelope,
+  isBinaryEnvelope,
+  sha256Hex,
+  bytesToBase64,
+  base64ToBytes,
+  parseMetadataHeader,
+  stringifyMetadataHeader,
+} from "./binary.js";
+export type { BinaryEnvelopeData, DecodedBinary } from "./binary.js";
 export {
   configReadErrorContract,
   configWriteErrorContract,
@@ -55,6 +69,7 @@ export type {
   DeleteDataScopeContractResult,
   IngestDataContractInput,
   IngestDataContractResult,
+  IngestBinaryDataContractInput,
   ListDataScopesContractInput,
   ListDataScopesContractResult,
   ListDataVersionsContractInput,
