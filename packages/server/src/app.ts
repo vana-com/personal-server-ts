@@ -138,6 +138,8 @@ export function createApp(deps: AppDeps): Hono {
       feeVerifier: deps.feeVerifier,
       runtimeAvailability: deps.runtimeAvailability,
       dataStorage: deps.dataStorage,
+      serverSigner: deps.serverSigner,
+      gatewayUrl: deps.config?.gateway.url ?? deps.gatewayConfig?.url,
       mountPath: "/v1/data",
     }),
   );
