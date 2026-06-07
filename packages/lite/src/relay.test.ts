@@ -312,4 +312,24 @@ describe("buildHttpResponse binary safety", () => {
     expect(corrupted.length).toBeGreaterThan(wire.length);
     expect(Array.from(bodyOf(corrupted))).not.toEqual(Array.from(body));
   });
+
+  it("round-trips a JSON/text body intact (the conversion supports both)", () => {
+    const json = '{"username":"relay_user","emoji_free":true}';
+    const body = new TextEncoder().encode(json);
+    const responseString = buildHttpResponse({
+      status: 200,
+      headers: { "content-type": "application/json" },
+      body: base64(body),
+    });
+
+    const wire = Uint8Array.from(responseString, (char) => char.charCodeAt(0));
+    expect(Array.from(bodyOf(wire))).toEqual(Array.from(body));
+    expect(new TextDecoder().decode(bodyOf(wire))).toBe(json);
+    // content-length must match the actual body bytes for both text and binary.
+    const headText = responseString.slice(
+      0,
+      responseString.indexOf("\r\n\r\n"),
+    );
+    expect(headText).toContain(`content-length: ${body.length}`);
+  });
 });
