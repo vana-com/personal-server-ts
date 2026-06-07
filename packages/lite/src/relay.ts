@@ -194,7 +194,14 @@ export function startPsLiteRelayClient(
         parsed.request,
         origin,
       );
-      writePlaintextResponse(stream, textToBytes(response));
+      // `response` is a binary (latin1) string: buildHttpResponse appends the
+      // body via bytesToBinary, so each char code 0x00–0xFF is one body byte.
+      // It must be turned back into bytes the same way (binaryToBytes), NOT
+      // UTF-8 re-encoded — textToBytes would expand every byte >= 0x80 into a
+      // 2-byte sequence, corrupting binary payloads (e.g. OpenPGP-encrypted
+      // files fail downstream with "not a valid OpenPGP message"). ASCII/JSON
+      // bodies survive UTF-8, which is why only encrypted binary downloads broke.
+      writePlaintextResponse(stream, binaryToBytes(response));
       closeStream(stream.streamId, "http_response_sent");
       return;
     }
@@ -364,7 +371,7 @@ async function handleRelayHttpRequest(
   return buildHttpResponse(bridgeResponse);
 }
 
-function buildHttpResponse(response: PsLiteBridgeResponse): string {
+export function buildHttpResponse(response: PsLiteBridgeResponse): string {
   const responseHeaders = {
     "cache-control": "no-store",
     connection: "close",
