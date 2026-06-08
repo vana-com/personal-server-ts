@@ -16,11 +16,13 @@ import { grantsRoutes } from "./routes/grants.js";
 import { accessLogsRoutes } from "./routes/access-logs.js";
 import { syncRoutes } from "./routes/sync.js";
 import {
+  mcpActivityRoutes,
   mcpConnectionsRoutes,
   mcpOAuthRoutes,
   mcpStreamableHttpRoutes,
 } from "./routes/mcp.js";
 import {
+  McpActivityRecorder,
   createInMemoryMcpConnectionStore,
   createInMemoryMcpOAuthAuthorizationStore,
   type McpConnectionStore,
@@ -87,6 +89,7 @@ export interface AppDeps {
   mcpConnectionStore?: McpConnectionStore;
   mcpOAuthAuthorizationStore?: McpOAuthAuthorizationStore;
   mcpOAuthApprovalUrl?: string | (() => string);
+  mcpActivityRecorder?: McpActivityRecorder;
 }
 
 export function createApp(deps: AppDeps): Hono {
@@ -202,6 +205,8 @@ export function createApp(deps: AppDeps): Hono {
   const mcpOAuthAuthorizationStore =
     deps.mcpOAuthAuthorizationStore ??
     createInMemoryMcpOAuthAuthorizationStore();
+  const mcpActivityRecorder =
+    deps.mcpActivityRecorder ?? new McpActivityRecorder();
   const mcpRouteDeps = {
     logger: deps.logger,
     serverOrigin: deps.serverOrigin,
@@ -221,10 +226,12 @@ export function createApp(deps: AppDeps): Hono {
     connectionStore: mcpConnectionStore,
     oauthAuthorizationStore: mcpOAuthAuthorizationStore,
     oauthApprovalUrl: deps.mcpOAuthApprovalUrl,
+    activityRecorder: mcpActivityRecorder,
   };
 
   app.route("/", mcpOAuthRoutes(mcpRouteDeps));
   app.route("/v1/mcp/connections", mcpConnectionsRoutes(mcpRouteDeps));
+  app.route("/v1/mcp/activity", mcpActivityRoutes(mcpRouteDeps));
   app.route("/mcp", mcpStreamableHttpRoutes(mcpRouteDeps));
 
   // Mount login flow v2 routes (self-hosted CLI auth, no auth required)

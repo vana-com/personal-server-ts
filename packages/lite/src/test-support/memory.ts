@@ -29,6 +29,10 @@ import {
   sortEntries,
 } from "../storage-utils.js";
 
+const TEXT_PAGE_MEDIA_TYPE = "text/plain; charset=utf-8";
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
 interface PsLiteRuntimeStoreCapabilities {
   capabilities?: {
     tokens?: "memory";
@@ -195,12 +199,27 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
 
       const maxBytes = Math.max(1, options.maxBytes);
       const startIndex = cursorResult.cursor?.blockIndex ?? 0;
+      const startOffset = cursorResult.cursor?.intraBlockOffset ?? 0;
       const blocks: DataScopeBlock[] = [];
       let bytes = 0;
-      for (let index = startIndex; index < manifest.blocks.length; index += 1) {
-        const ref = manifest.blocks[index];
-        if (!ref) continue;
-        if (blocks.length > 0 && bytes + ref.sizeBytes > maxBytes) {
+      let nextIndex = startIndex;
+      let nextOffset: number | undefined;
+      while (nextIndex < manifest.blocks.length) {
+        const ref = manifest.blocks[nextIndex];
+        if (!ref) {
+          nextIndex += 1;
+          continue;
+        }
+        const offset = nextIndex === startIndex ? startOffset : 0;
+        if (offset >= ref.sizeBytes) {
+          nextIndex += 1;
+          continue;
+        }
+        if (
+          blocks.length > 0 &&
+          offset === 0 &&
+          bytes + ref.sizeBytes > maxBytes
+        ) {
           break;
         }
         const block = blockPayloads.get(
@@ -212,22 +231,32 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
             `Block payload not found for ${scope} at ${collectedAt}: ${ref.id}`,
           );
         }
-        blocks.push(block);
-        bytes += ref.sizeBytes;
+        const page = pageBlock(block, offset, maxBytes - bytes);
+        blocks.push(page.block);
+        bytes += page.block.sizeBytes;
+
+        if (page.nextOffset !== undefined) {
+          nextOffset = page.nextOffset;
+          break;
+        }
+
+        nextIndex += 1;
       }
-      const nextIndex = startIndex + blocks.length;
       return {
         scope: manifest.scope,
         collectedAt: manifest.collectedAt,
         ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
         contentKind: manifest.contentKind,
         blocks,
-        ...(nextIndex < manifest.blocks.length
+        ...(nextOffset !== undefined || nextIndex < manifest.blocks.length
           ? {
               nextCursor: encodeDataBlockCursor({
                 scope,
                 collectedAt,
                 blockIndex: nextIndex,
+                ...(nextOffset === undefined
+                  ? {}
+                  : { intraBlockOffset: nextOffset }),
               }),
             }
           : {}),
@@ -374,6 +403,37 @@ function deleteMapPrefix<T>(map: Map<string, T>, pathPrefix: string): void {
       map.delete(path);
     }
   }
+}
+
+function pageBlock(
+  block: DataScopeBlock,
+  offsetBytes: number,
+  maxBytes: number,
+): { block: DataScopeBlock; nextOffset?: number } {
+  const text =
+    typeof block.value === "string" ? block.value : JSON.stringify(block.value);
+  const bytes = textEncoder.encode(text);
+  if (offsetBytes <= 0 && bytes.length <= maxBytes) {
+    return { block };
+  }
+
+  const start = Math.min(Math.max(0, offsetBytes), bytes.length);
+  const end = Math.min(bytes.length, start + Math.max(1, maxBytes));
+  const value = textDecoder.decode(bytes.slice(start, end));
+
+  return {
+    block: {
+      ...block,
+      path: `${block.path}[bytes ${start}:${end}]`,
+      mediaType: block.mediaType.startsWith("text/")
+        ? block.mediaType
+        : TEXT_PAGE_MEDIA_TYPE,
+      value,
+      sizeBytes: end - start,
+      truncated: end < bytes.length,
+    },
+    ...(end < bytes.length ? { nextOffset: end } : {}),
+  };
 }
 
 export function createMemoryPsLiteStateStore(

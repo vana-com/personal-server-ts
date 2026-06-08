@@ -405,13 +405,67 @@ describe("createPersistentPsLiteStorage", () => {
       const page = await storage.readScopeBlocks!(
         manifest.scope,
         manifest.collectedAt,
-        { cursor, maxBytes: 1 },
+        { cursor, maxBytes: 16 },
       );
       seen.push(...page.blocks.map((block) => block.value));
       cursor = page.nextCursor;
     } while (cursor);
 
     expect(seen).toEqual([{ index: 0 }, { index: 1 }, { index: 2 }]);
+  });
+
+  it("pages through a single oversized persistent block", async () => {
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      createMemoryPsLitePersistence(),
+    );
+    const scope = "chatgpt.conversations";
+    const collectedAt = "2026-05-08T00:00:00.000Z";
+    const value = "0123456789".repeat(600);
+    const sizeBytes = new TextEncoder().encode(value).byteLength;
+    await storage.writeBlockManifest?.(
+      scope,
+      collectedAt,
+      {
+        version: 1,
+        scope,
+        collectedAt,
+        contentKind: "text",
+        blocks: [
+          {
+            id: "block-000001",
+            path: "$.data",
+            mediaType: "text/plain",
+            sizeBytes,
+          },
+        ],
+        warnings: [],
+      },
+      [
+        {
+          id: "block-000001",
+          path: "$.data",
+          mediaType: "text/plain",
+          value,
+          sizeBytes,
+        },
+      ],
+    );
+
+    const firstPage = await storage.readScopeBlocks!(scope, collectedAt, {
+      maxBytes: 1024,
+    });
+    expect(firstPage.blocks[0]?.value).toBe(value.slice(0, 1024));
+    expect(firstPage.blocks[0]?.truncated).toBe(true);
+    expect(firstPage.nextCursor).toBeTruthy();
+
+    const secondPage = await storage.readScopeBlocks!(scope, collectedAt, {
+      cursor: firstPage.nextCursor,
+      maxBytes: 1024,
+    });
+    expect(secondPage.blocks[0]?.value).toBe(value.slice(1024, 2048));
+    expect(secondPage.blocks[0]?.truncated).toBe(true);
+    expect(secondPage.nextCursor).toBeTruthy();
   });
 
   it("reports missing block manifests without reading raw envelopes", async () => {
@@ -478,6 +532,57 @@ describe("createPersistentPsLiteStorage", () => {
       blocks: [{ value: { index: 0 } }],
     });
   });
+
+  it("pages through a single oversized memory block", async () => {
+    const storage = createMemoryPsLiteStorage();
+    const scope = "chatgpt.conversations";
+    const collectedAt = "2026-05-08T00:00:00.000Z";
+    const value = "abcdefghij".repeat(600);
+    const sizeBytes = new TextEncoder().encode(value).byteLength;
+    await storage.writeBlockManifest?.(
+      scope,
+      collectedAt,
+      {
+        version: 1,
+        scope,
+        collectedAt,
+        contentKind: "text",
+        blocks: [
+          {
+            id: "block-000001",
+            path: "$.data",
+            mediaType: "text/plain",
+            sizeBytes,
+          },
+        ],
+        warnings: [],
+      },
+      [
+        {
+          id: "block-000001",
+          path: "$.data",
+          mediaType: "text/plain",
+          value,
+          sizeBytes,
+        },
+      ],
+    );
+
+    const firstPage = await storage.readScopeBlocks!(scope, collectedAt, {
+      maxBytes: 1024,
+    });
+    expect(firstPage.blocks[0]?.value).toBe(value.slice(0, 1024));
+    expect(firstPage.blocks[0]?.truncated).toBe(true);
+    expect(firstPage.nextCursor).toBeTruthy();
+
+    const secondPage = await storage.readScopeBlocks!(scope, collectedAt, {
+      cursor: firstPage.nextCursor,
+      maxBytes: 1024,
+    });
+    expect(secondPage.blocks[0]?.value).toBe(value.slice(1024, 2048));
+    expect(secondPage.blocks[0]?.truncated).toBe(true);
+    expect(secondPage.nextCursor).toBeTruthy();
+  });
 });
 
 function blockFixture(
@@ -485,13 +590,16 @@ function blockFixture(
   collectedAt: string,
   count: number,
 ): { manifest: DataBlockManifest; blocks: DataScopeBlock[] } {
-  const blocks = Array.from({ length: count }, (_, index) => ({
-    id: `block-${index}`,
-    path: `$.items[${index}]`,
-    mediaType: "application/json",
-    value: { index },
-    sizeBytes: 10,
-  }));
+  const blocks = Array.from({ length: count }, (_, index) => {
+    const value = { index };
+    return {
+      id: `block-${index}`,
+      path: `$.items[${index}]`,
+      mediaType: "application/json",
+      value,
+      sizeBytes: new TextEncoder().encode(JSON.stringify(value)).byteLength,
+    };
+  });
   return {
     manifest: {
       version: 1,

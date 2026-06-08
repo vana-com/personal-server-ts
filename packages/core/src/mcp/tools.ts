@@ -103,21 +103,21 @@ function uniqueSources(connection: McpConnectionRecord): string[] {
 }
 
 const DEFAULT_SEARCH_LIMIT = 5;
-const MAX_SEARCH_LIMIT = 20;
-const DEFAULT_SEARCH_MAX_SCOPES = 6;
-const MAX_SEARCH_SCOPES = 10;
+const MAX_SEARCH_LIMIT = 50;
+const DEFAULT_SEARCH_MAX_SCOPES = 10;
+const MAX_SEARCH_SCOPES = 50;
 const DEFAULT_SEARCH_TIMEOUT_MS = 30_000;
-const MAX_SEARCH_TIMEOUT_MS = 90_000;
+const MAX_SEARCH_TIMEOUT_MS = 300_000;
 const DEFAULT_SEARCH_DISCOVERY_TIMEOUT_MS = 2_000;
-const MAX_SEARCH_TOTAL_TIMEOUT_MS = 90_000;
-const DEFAULT_READ_SCOPE_MAX_BYTES = 16_384;
-const MAX_READ_SCOPE_MAX_BYTES = 65_536;
-const DEFAULT_READ_SCOPE_TIMEOUT_MS = 30_000;
-const MAX_READ_SCOPE_TIMEOUT_MS = 90_000;
-const DEFAULT_SEARCH_MAX_BYTES = 8_192;
-const MAX_SEARCH_MAX_BYTES = 32_768;
+const MAX_SEARCH_TOTAL_TIMEOUT_MS = 300_000;
+const DEFAULT_READ_SCOPE_MAX_BYTES = 256 * 1024;
+const MAX_READ_SCOPE_MAX_BYTES = 5 * 1024 * 1024;
+const DEFAULT_READ_SCOPE_TIMEOUT_MS = 60_000;
+const MAX_READ_SCOPE_TIMEOUT_MS = 300_000;
+const DEFAULT_SEARCH_MAX_BYTES = 64 * 1024;
+const MAX_SEARCH_MAX_BYTES = 1024 * 1024;
 const DEFAULT_SCOPE_METADATA_TIMEOUT_MS = 2_000;
-const SEARCH_MAX_PAGES_PER_SCOPE = 4;
+const SEARCH_MAX_PAGES_PER_SCOPE = 16;
 const SEARCH_QUERY_MAX_CHARS = 256;
 const SEARCH_SCOPE_MAX_CHARS = 128;
 const SEARCH_REQUESTED_SCOPES_LIMIT = MAX_SEARCH_SCOPES * 2;
@@ -599,7 +599,9 @@ const readScope: McpToolDefinition = {
       .min(1000)
       .max(MAX_READ_SCOPE_TIMEOUT_MS)
       .optional()
-      .describe("Wall-clock read budget in ms. Capped at 90000 by the server."),
+      .describe(
+        "Wall-clock read budget in ms. Capped at 300000 by the server.",
+      ),
   },
   async handler(args, { connection, readClient }) {
     const scope = typeof args.scope === "string" ? args.scope : null;
@@ -648,16 +650,19 @@ const readScope: McpToolDefinition = {
         timeoutMs,
         `read blocks for ${scope}`,
       );
+      const nextCursor = result.nextCursor ?? null;
       return textResult({
         scope,
         grantId: grant.grantId,
         collectedAt: result.collectedAt,
         contentKind: result.contentKind,
         blocks: result.blocks,
-        nextCursor: result.nextCursor,
+        ...(result.nextCursor ? { nextCursor: result.nextCursor } : {}),
         warnings: result.warnings,
         page: {
           cursor: cursor ?? null,
+          nextCursor,
+          hasMore: Boolean(result.nextCursor),
           maxBytes,
           timeoutMs,
           returnedBlocks: result.blocks.length,
@@ -780,7 +785,7 @@ const searchPersonalContext: McpToolDefinition = {
       .min(1000)
       .max(MAX_SEARCH_TIMEOUT_MS)
       .optional()
-      .describe("Wall-clock budget in ms. Capped at 90000 by the server."),
+      .describe("Wall-clock budget in ms. Capped at 300000 by the server."),
     maxBytes: z.number().int().min(1).max(MAX_SEARCH_MAX_BYTES).optional(),
   },
   async handler(args, { connection, readClient }) {
