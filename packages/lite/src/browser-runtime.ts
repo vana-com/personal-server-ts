@@ -27,6 +27,7 @@ import {
 } from "./runtime.js";
 import { createPsLiteSyncManager } from "./sync.js";
 import { resolvePsLiteOwner } from "./owner-binding.js";
+import { DiagnosticsRecorder } from "./diagnostics.js";
 
 export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   PsLiteRuntimeOptions,
@@ -106,6 +107,9 @@ export async function createIndexedDbPsLiteRuntime(
       chainId: config.gateway.chainId,
       contracts: config.gateway.contracts,
     });
+  // Create (or reuse) a shared diagnostics recorder before the sync manager so
+  // both share the same recorder instance and events appear in /v1/diagnostics.
+  const diagnostics = options.diagnostics ?? new DiagnosticsRecorder();
   let syncManager = options.syncManager ?? null;
   if (!syncManager && config.sync.enabled) {
     syncManager = (
@@ -117,6 +121,7 @@ export async function createIndexedDbPsLiteRuntime(
         ownerAddress: options.ownerAddress,
         serverAccount: identity.account,
         gateway,
+        diagnostics,
       })
     ).syncManager;
   }
@@ -150,6 +155,7 @@ export async function createIndexedDbPsLiteRuntime(
     serverOwner,
     serverSigner,
     syncManager,
+    diagnostics,
     saveConfig: async (nextConfig) => {
       const saved = await savePsLiteConfig(stateStore, nextConfig);
       Object.assign(config, saved);

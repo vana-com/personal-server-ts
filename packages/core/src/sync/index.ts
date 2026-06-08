@@ -16,3 +16,7 @@ export {
   type SyncManager,
   type SyncManagerOptions,
 } from "./engine/sync-manager.js";
+export type {
+  DownloadDiagnosticsHook,
+  DownloadWorkerDeps,
+} from "./workers/download.js";
