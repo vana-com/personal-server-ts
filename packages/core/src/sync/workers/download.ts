@@ -12,6 +12,23 @@ import type { DataStoragePort } from "../../ports/index.js";
 import { buildDataBlocks } from "../../storage/blocks/build.js";
 import { classifySyncFailure } from "../issues.js";
 
+/** Minimal diagnostics hook — keeps core free of lite-specific imports. */
+export interface DownloadDiagnosticsHook {
+  onDownloadStart(fileId: string): void;
+  onDownloadEnd(fileId: string, scope: string): void;
+  onDownloadError(fileId: string, detail: string): void;
+  onDecryptStart(fileId: string, scope: string): void;
+  onDecryptEnd(fileId: string, scope: string): void;
+  onDecryptError(fileId: string, scope: string, detail: string): void;
+  onIndexStart(fileId: string, scope: string): void;
+  onIndexEnd(fileId: string, scope: string): void;
+  onIndexError(fileId: string, scope: string, detail: string): void;
+  onManifestBuildStart(fileId: string, scope: string): void;
+  onManifestBuildEnd(fileId: string, scope: string): void;
+  onManifestBuildError(fileId: string, scope: string, detail: string): void;
+  onRepair(scope: string, detail: string): void;
+}
+
 export interface DownloadWorkerDeps {
   storage: DataStoragePort;
   storageAdapter: StorageAdapter;
@@ -20,6 +37,8 @@ export interface DownloadWorkerDeps {
   masterKey: Uint8Array;
   serverOwner: string;
   logger: Logger;
+  /** Optional diagnostics hook — omit to disable instrumentation. */
+  diagnostics?: DownloadDiagnosticsHook;
 }
 
 export interface DownloadResult {
@@ -44,7 +63,8 @@ export async function downloadOne(
   deps: DownloadWorkerDeps,
   record: FileRecord,
 ): Promise<DownloadResult | null> {
-  const { storage, storageAdapter, gateway, masterKey, logger } = deps;
+  const { storage, storageAdapter, gateway, masterKey, logger, diagnostics } =
+    deps;
 
   // 1. Check dedup: skip if fileId already in local index
   const existing = storage.findByFileId(record.fileId);
@@ -62,24 +82,54 @@ export async function downloadOne(
   // without losing data. We deliberately do NOT skip-on-404 here: the storage layer can't reliably
   // distinguish "gone" from "transiently unavailable", so skipping would risk a silent data gap
   // during an outage. (Cross-device removal of already-downloaded copies is slice 3b.)
-  const encrypted = await storageAdapter.download(record.url);
+  diagnostics?.onDownloadStart(record.fileId);
+  let encrypted: Uint8Array;
+  try {
+    encrypted = await storageAdapter.download(record.url);
+  } catch (err) {
+    const detail = (err as Error).message;
+    diagnostics?.onDownloadError(record.fileId, detail);
+    throw err;
+  }
 
   // 3. Resolve schemaId → scope via Gateway getSchema
   const schema = await gateway.getSchema(record.schemaId);
   if (!schema) {
+    diagnostics?.onDownloadError(
+      record.fileId,
+      `No schema found for schemaId: ${record.schemaId}`,
+    );
     throw new Error(`No schema found for schemaId: ${record.schemaId}`);
   }
+
+  diagnostics?.onDownloadEnd(record.fileId, schema.scope);
 
   // 4. Derive scope key → hex-encode as OpenPGP password
   const scopeKey = deriveScopeKey(masterKey, schema.scope);
   const scopeKeyHex = uint8ToHex(scopeKey);
 
   // 5. Decrypt with OpenPGP password-based decryption
-  const plaintext = await decryptWithPassword(encrypted, scopeKeyHex);
+  diagnostics?.onDecryptStart(record.fileId, schema.scope);
+  let plaintext: Uint8Array;
+  try {
+    plaintext = await decryptWithPassword(encrypted, scopeKeyHex);
+  } catch (err) {
+    const detail = (err as Error).message;
+    diagnostics?.onDecryptError(record.fileId, schema.scope, detail);
+    throw err;
+  }
 
   // 6. Parse as DataFileEnvelope (validate)
-  const raw = JSON.parse(new TextDecoder().decode(plaintext));
-  const envelope = DataFileEnvelopeSchema.parse(raw);
+  let envelope: ReturnType<typeof DataFileEnvelopeSchema.parse>;
+  try {
+    const raw = JSON.parse(new TextDecoder().decode(plaintext));
+    envelope = DataFileEnvelopeSchema.parse(raw);
+  } catch (err) {
+    const detail = (err as Error).message;
+    diagnostics?.onDecryptError(record.fileId, schema.scope, detail);
+    throw err;
+  }
+  diagnostics?.onDecryptEnd(record.fileId, envelope.scope);
 
   const existingByVersion = storage.findEntry({
     scope: envelope.scope,
@@ -104,18 +154,41 @@ export async function downloadOne(
   }
 
   // 7. Write to local storage via the runtime storage port
-  const { relativePath, sizeBytes } = await storage.writeEnvelope(envelope);
-  await writeBlockSidecars(storage, envelope, logger, record, relativePath);
+  diagnostics?.onIndexStart(record.fileId, envelope.scope);
+  let relativePath: string;
+  let sizeBytes: number;
+  try {
+    ({ relativePath, sizeBytes } = await storage.writeEnvelope(envelope));
+    await writeBlockSidecars(
+      storage,
+      envelope,
+      logger,
+      record,
+      relativePath,
+      diagnostics,
+    );
+  } catch (err) {
+    const detail = (err as Error).message;
+    diagnostics?.onIndexError(record.fileId, envelope.scope, detail);
+    throw err;
+  }
 
   // 8. Insert into local index (with fileId)
-  await storage.insertEntry({
-    fileId: record.fileId,
-    schemaId: record.schemaId,
-    path: relativePath,
-    scope: envelope.scope,
-    collectedAt: envelope.collectedAt,
-    sizeBytes,
-  });
+  try {
+    await storage.insertEntry({
+      fileId: record.fileId,
+      schemaId: record.schemaId,
+      path: relativePath,
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      sizeBytes,
+    });
+  } catch (err) {
+    const detail = (err as Error).message;
+    diagnostics?.onIndexError(record.fileId, envelope.scope, detail);
+    throw err;
+  }
+  diagnostics?.onIndexEnd(record.fileId, envelope.scope);
 
   logger.info(
     { fileId: record.fileId, scope: envelope.scope, path: relativePath },
@@ -242,9 +315,11 @@ async function writeBlockSidecars(
   logger: Logger,
   record: FileRecord,
   relativePath: string,
+  diagnostics?: DownloadDiagnosticsHook,
 ): Promise<void> {
   if (!storage.writeBlockManifest) return;
 
+  diagnostics?.onManifestBuildStart(record.fileId, envelope.scope);
   try {
     const built = buildDataBlocks({
       scope: envelope.scope,
@@ -258,6 +333,7 @@ async function writeBlockSidecars(
       built.manifest,
       built.blocks,
     );
+    diagnostics?.onManifestBuildEnd(record.fileId, envelope.scope);
   } catch (error) {
     const classified = classifySyncFailure({
       error,
@@ -267,6 +343,11 @@ async function writeBlockSidecars(
       schemaId: record.schemaId,
       scope: envelope.scope,
     });
+    diagnostics?.onManifestBuildError(
+      record.fileId,
+      envelope.scope,
+      classified.issue.message,
+    );
     logger.warn(
       {
         fileId: record.fileId,
