@@ -106,7 +106,7 @@ function buildDownloadDiagnosticsHook(
     onIndexEnd(fileId, scope) {
       recorder.endOperation();
       recorder.push({ phase: "indexing", fileId, scope });
-      recorder.setScopeStatus(scope, "ready");
+      recorder.setScopeReadyAfterIndex(scope);
     },
     onIndexError(fileId, scope, detail) {
       recorder.endOperation();
@@ -117,6 +117,7 @@ function buildDownloadDiagnosticsHook(
     },
     onManifestBuildEnd(fileId, scope) {
       recorder.push({ phase: "buildingManifest", fileId, scope });
+      recorder.setScopeManifestBuilt(scope);
     },
     onManifestBuildError(fileId, scope, detail) {
       recorder.push({
