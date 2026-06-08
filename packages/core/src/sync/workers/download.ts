@@ -69,6 +69,13 @@ export async function downloadOne(
   // 1. Check dedup: skip if fileId already in local index
   const existing = storage.findByFileId(record.fileId);
   if (existing) {
+    await repairMissingBlockSidecars(
+      storage,
+      logger,
+      record,
+      existing,
+      diagnostics,
+    );
     logger.debug({ fileId: record.fileId }, "File already in index, skipping");
     return null;
   }
@@ -142,6 +149,17 @@ export async function downloadOne(
     if (existingByVersion.fileId !== record.fileId) {
       await storage.updateFileId(existingByVersion.path, record.fileId);
     }
+    await repairMissingBlockSidecars(
+      storage,
+      logger,
+      record,
+      {
+        ...existingByVersion,
+        fileId: record.fileId,
+        schemaId: existingByVersion.schemaId ?? record.schemaId,
+      },
+      diagnostics,
+    );
     logger.debug(
       {
         fileId: record.fileId,
@@ -212,6 +230,8 @@ export async function downloadAll(
 ): Promise<DownloadResult[]> {
   const { gateway, cursor, serverOwner, logger } = deps;
   const syncRunId = createSyncRunId();
+
+  await repairLocalMissingBlockSidecars(deps);
 
   // 1. Read cursor
   const lastProcessedTimestamp = await cursor.read();
@@ -291,6 +311,54 @@ export async function downloadAll(
   return results;
 }
 
+export async function repairLocalMissingBlockSidecars(
+  deps: Pick<DownloadWorkerDeps, "storage" | "logger" | "diagnostics">,
+): Promise<number> {
+  const { storage, logger, diagnostics } = deps;
+  if (!storage.writeBlockManifest || !storage.hasScopeBlocks) return 0;
+
+  let repaired = 0;
+  let offset = 0;
+  const limit = 100;
+
+  while (true) {
+    const page = storage.listScopes({ limit, offset });
+    for (const scopeSummary of page.scopes) {
+      const entry = storage.findEntry({
+        scope: scopeSummary.scope,
+        at: scopeSummary.latestCollectedAt,
+      });
+      if (!entry) continue;
+
+      const repairedScope = await repairMissingBlockSidecars(
+        storage,
+        logger,
+        {
+          fileId: entry.fileId ?? entry.path,
+          owner: "",
+          url: "",
+          schemaId: entry.schemaId ?? "",
+          createdAt: entry.createdAt,
+        },
+        entry,
+        diagnostics,
+      );
+      if (repairedScope) repaired += 1;
+    }
+
+    offset += page.scopes.length;
+    if (offset >= page.total || page.scopes.length === 0) break;
+  }
+
+  if (repaired > 0) {
+    logger.info(
+      { repaired },
+      "Repaired missing bounded block sidecars for local indexed data",
+    );
+  }
+  return repaired;
+}
+
 function createSyncRunId(): string {
   return typeof crypto !== "undefined" &&
     typeof crypto.randomUUID === "function"
@@ -360,5 +428,87 @@ async function writeBlockSidecars(
       },
       "Bounded block sidecar write failed after raw envelope write",
     );
+  }
+}
+
+async function repairMissingBlockSidecars(
+  storage: DataStoragePort,
+  logger: Logger,
+  record: FileRecord,
+  entry: {
+    scope: string;
+    collectedAt: string;
+    fileId: string | null;
+    schemaId: string | null;
+    path: string;
+  },
+  diagnostics?: DownloadDiagnosticsHook,
+): Promise<boolean> {
+  if (!storage.writeBlockManifest || !storage.hasScopeBlocks) return false;
+
+  let hasBlocks = false;
+  try {
+    hasBlocks = await storage.hasScopeBlocks(entry.scope, entry.collectedAt);
+  } catch (error) {
+    logger.warn(
+      {
+        fileId: entry.fileId ?? record.fileId,
+        scope: entry.scope,
+        collectedAt: entry.collectedAt,
+        error: (error as Error).message,
+      },
+      "Bounded block sidecar repair skipped after readiness check failed",
+    );
+    return false;
+  }
+  if (hasBlocks) return false;
+
+  diagnostics?.onRepair(
+    entry.scope,
+    "indexed entry missing block manifest; rebuilding from local envelope",
+  );
+
+  let envelope: Awaited<ReturnType<DataStoragePort["readEnvelope"]>>;
+  try {
+    envelope = await storage.readEnvelope(entry.scope, entry.collectedAt);
+  } catch (error) {
+    logger.warn(
+      {
+        fileId: entry.fileId ?? record.fileId,
+        scope: entry.scope,
+        collectedAt: entry.collectedAt,
+        error: (error as Error).message,
+      },
+      "Bounded block sidecar repair skipped because local envelope is unavailable",
+    );
+    return false;
+  }
+
+  await writeBlockSidecars(
+    storage,
+    envelope,
+    logger,
+    {
+      ...record,
+      fileId: entry.fileId ?? record.fileId,
+      schemaId: entry.schemaId ?? record.schemaId,
+    },
+    entry.path,
+    diagnostics,
+  );
+
+  try {
+    return await storage.hasScopeBlocks(entry.scope, entry.collectedAt);
+  } catch (error) {
+    logger.warn(
+      {
+        fileId: entry.fileId ?? record.fileId,
+        scope: entry.scope,
+        collectedAt: entry.collectedAt,
+        error: (error as Error).message,
+      },
+      "Bounded block sidecar repair completed but readiness could not be verified",
+    );
+    return false;
   }
 }
