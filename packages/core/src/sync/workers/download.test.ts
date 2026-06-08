@@ -156,6 +156,73 @@ describe("download worker", () => {
       expect(deps.storageAdapter.download).not.toHaveBeenCalled();
     });
 
+    it("backfills missing block sidecars when fileId is already indexed", async () => {
+      const deps = makeMockDeps();
+      const existingEntry: IndexEntry = {
+        id: 1,
+        fileId: FILE_ID,
+        schemaId: SCHEMA_ID,
+        path: RELATIVE_PATH,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        createdAt: "2026-01-21T10:00:00Z",
+        sizeBytes: 128,
+      };
+      (deps.storage.findByFileId as ReturnType<typeof vi.fn>).mockReturnValue(
+        existingEntry,
+      );
+      deps.storage.hasScopeBlocks = vi.fn().mockResolvedValue(false);
+      deps.storage.readEnvelope = vi.fn().mockResolvedValue(makeEnvelope());
+
+      const result = await downloadOne(deps, makeFileRecord());
+
+      expect(result).toBeNull();
+      expect(deps.storageAdapter.download).not.toHaveBeenCalled();
+      expect(deps.storage.hasScopeBlocks).toHaveBeenCalledWith(
+        SCOPE,
+        COLLECTED_AT,
+      );
+      expect(deps.storage.readEnvelope).toHaveBeenCalledWith(
+        SCOPE,
+        COLLECTED_AT,
+      );
+      expect(deps.storage.writeBlockManifest).toHaveBeenCalledWith(
+        SCOPE,
+        COLLECTED_AT,
+        expect.objectContaining({
+          scope: SCOPE,
+          collectedAt: COLLECTED_AT,
+        }),
+        expect.any(Array),
+      );
+    });
+
+    it("does not backfill block sidecars when an indexed file already has them", async () => {
+      const deps = makeMockDeps();
+      const existingEntry: IndexEntry = {
+        id: 1,
+        fileId: FILE_ID,
+        schemaId: SCHEMA_ID,
+        path: RELATIVE_PATH,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        createdAt: "2026-01-21T10:00:00Z",
+        sizeBytes: 128,
+      };
+      (deps.storage.findByFileId as ReturnType<typeof vi.fn>).mockReturnValue(
+        existingEntry,
+      );
+      deps.storage.hasScopeBlocks = vi.fn().mockResolvedValue(true);
+      deps.storage.readEnvelope = vi.fn().mockResolvedValue(makeEnvelope());
+
+      const result = await downloadOne(deps, makeFileRecord());
+
+      expect(result).toBeNull();
+      expect(deps.storageAdapter.download).not.toHaveBeenCalled();
+      expect(deps.storage.readEnvelope).not.toHaveBeenCalled();
+      expect(deps.storage.writeBlockManifest).not.toHaveBeenCalled();
+    });
+
     it("propagates a download failure (blocks the cursor) so data isn't silently skipped", async () => {
       const deps = makeMockDeps();
       (
@@ -274,6 +341,44 @@ describe("download worker", () => {
       expect(deps.storage.insertEntry).not.toHaveBeenCalled();
     });
 
+    it("backfills missing block sidecars when the same version is already indexed", async () => {
+      const deps = makeMockDeps();
+      const existingEntry: IndexEntry = {
+        id: 1,
+        fileId: null,
+        schemaId: SCHEMA_ID,
+        path: RELATIVE_PATH,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        createdAt: "2026-01-21T10:00:00Z",
+        sizeBytes: 128,
+      };
+      (deps.storage.findEntry as ReturnType<typeof vi.fn>).mockReturnValue(
+        existingEntry,
+      );
+      deps.storage.hasScopeBlocks = vi.fn().mockResolvedValue(false);
+      deps.storage.readEnvelope = vi.fn().mockResolvedValue(makeEnvelope());
+
+      const result = await downloadOne(deps, makeFileRecord());
+
+      expect(result).toBeNull();
+      expect(deps.storage.updateFileId).toHaveBeenCalledWith(
+        RELATIVE_PATH,
+        FILE_ID,
+      );
+      expect(deps.storage.writeEnvelope).not.toHaveBeenCalled();
+      expect(deps.storage.insertEntry).not.toHaveBeenCalled();
+      expect(deps.storage.writeBlockManifest).toHaveBeenCalledWith(
+        SCOPE,
+        COLLECTED_AT,
+        expect.objectContaining({
+          scope: SCOPE,
+          collectedAt: COLLECTED_AT,
+        }),
+        expect.any(Array),
+      );
+    });
+
     it("resolves schemaId → scope via gateway.getSchema", async () => {
       const deps = makeMockDeps();
       const record = makeFileRecord();
@@ -354,6 +459,65 @@ describe("download worker", () => {
   });
 
   describe("downloadAll", () => {
+    it("repairs local indexed scopes that are missing block sidecars even when there are no new files", async () => {
+      const deps = makeMockDeps();
+      const existingEntry: IndexEntry = {
+        id: 1,
+        fileId: FILE_ID,
+        schemaId: SCHEMA_ID,
+        path: RELATIVE_PATH,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        createdAt: "2026-01-21T10:00:00Z",
+        sizeBytes: 128,
+      };
+      deps.storage.listScopes = vi.fn().mockReturnValue({
+        scopes: [
+          {
+            scope: SCOPE,
+            latestCollectedAt: COLLECTED_AT,
+            versionCount: 1,
+            dataStatus: "indexing",
+            sizeBytes: 128,
+          },
+        ],
+        total: 1,
+      });
+      (deps.storage.findEntry as ReturnType<typeof vi.fn>).mockReturnValue(
+        existingEntry,
+      );
+      deps.storage.hasScopeBlocks = vi
+        .fn()
+        .mockResolvedValueOnce(false)
+        .mockResolvedValueOnce(true);
+      deps.storage.readEnvelope = vi.fn().mockResolvedValue(makeEnvelope());
+      (
+        deps.gateway.listFilesSince as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({ files: [], cursor: null });
+
+      const results = await downloadAll(deps);
+
+      expect(results).toEqual([]);
+      expect(deps.storageAdapter.download).not.toHaveBeenCalled();
+      expect(deps.storage.readEnvelope).toHaveBeenCalledWith(
+        SCOPE,
+        COLLECTED_AT,
+      );
+      expect(deps.storage.writeBlockManifest).toHaveBeenCalledWith(
+        SCOPE,
+        COLLECTED_AT,
+        expect.objectContaining({
+          scope: SCOPE,
+          collectedAt: COLLECTED_AT,
+        }),
+        expect.any(Array),
+      );
+      expect(deps.logger.info).toHaveBeenCalledWith(
+        { repaired: 1 },
+        "Repaired missing bounded block sidecars for local indexed data",
+      );
+    });
+
     it("polls gateway with cursor from config", async () => {
       const deps = makeMockDeps();
       const timestamp = "2026-01-20T00:00:00Z";
