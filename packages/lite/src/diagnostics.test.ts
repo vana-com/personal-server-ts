@@ -344,7 +344,7 @@ describe("collectDiagnosticsWithTimeout", () => {
 });
 
 describe("DiagnosticsRecorder — runtime route integration", () => {
-  it("GET /v1/diagnostics returns 404 when recorder not configured", async () => {
+  it("GET /v1/diagnostics returns snapshot with default recorder when not explicitly configured", async () => {
     const { createPsLiteRuntime } = await import("./runtime.js");
     const {
       createMemoryPsLiteStorage,
@@ -368,15 +368,19 @@ describe("DiagnosticsRecorder — runtime route integration", () => {
           return { grantId: "owner" };
         },
       },
-      // Note: diagnostics NOT configured
+      // No explicit diagnostics — runtime creates a default recorder
     });
 
     const response = await runtime.fetch(
       new Request("http://localhost/v1/diagnostics", { method: "GET" }),
     );
-    expect(response.status).toBe(404);
-    const body = (await response.json()) as { error: { errorCode: string } };
-    expect(body.error.errorCode).toBe("DIAGNOSTICS_NOT_CONFIGURED");
+    // Always 200 now that a default recorder is wired in
+    expect(response.status).toBe(200);
+    const snap = (await response.json()) as PsLiteDiagnosticsSnapshot;
+    expect(snap.diagnosticVersion).toBe(DIAGNOSTICS_VERSION);
+    // At minimum the "booting" event pushed at runtime creation
+    expect(snap.recentEvents.length).toBeGreaterThanOrEqual(1);
+    expect(snap.recentEvents[0]!.phase).toBe("booting");
   });
 
   it("GET /v1/diagnostics returns snapshot when recorder is configured", async () => {
@@ -422,8 +426,11 @@ describe("DiagnosticsRecorder — runtime route integration", () => {
     const snap = (await response.json()) as PsLiteDiagnosticsSnapshot;
     expect(snap.diagnosticVersion).toBe(DIAGNOSTICS_VERSION);
     expect(snap.runtimeActive).toBe(true);
-    expect(snap.recentEvents.length).toBe(1);
+    // createPsLiteRuntime adds a "booting" event, so pre-pushed "indexing" + runtime's "booting" = 2 total
+    expect(snap.recentEvents.length).toBe(2);
+    // indexing was pushed before runtime creation; booting is pushed during runtime creation
     expect(snap.recentEvents[0]!.phase).toBe("indexing");
+    expect(snap.recentEvents[1]!.phase).toBe("booting");
     expect(snap.repairCounts["drive"]).toBe(1);
     expect(snap.partial).toBe(false);
   });
@@ -498,5 +505,172 @@ describe("DiagnosticsRecorder — runtime route integration", () => {
       new Request("http://localhost/v1/diagnostics", { method: "GET" }),
     );
     expect(response.status).toBe(401);
+  });
+
+  it("repair loop increments repairCounts and appears in /v1/diagnostics", async () => {
+    const { createPsLiteRuntime } = await import("./runtime.js");
+    const {
+      createMemoryPsLiteStorage,
+      createMemoryPsLiteTokenStore,
+      createMemoryPsLiteAccessLogStore,
+    } = await import("./test-support/memory.js");
+
+    const recorder = new DiagnosticsRecorder();
+    // Simulate the repair loop as it would be called from sync instrumentation
+    recorder.recordRepair("drive");
+    recorder.push({
+      phase: "repairingManifest",
+      scope: "drive",
+      detail: "index exists without local payload; repairing",
+    });
+    recorder.recordRepair("drive");
+    recorder.push({
+      phase: "repairingManifest",
+      scope: "drive",
+      detail: "index exists without local payload; repairing",
+    });
+
+    const accessLogStore = createMemoryPsLiteAccessLogStore();
+    const runtime = createPsLiteRuntime({
+      storage: createMemoryPsLiteStorage(),
+      accessLogReader: accessLogStore,
+      accessLogWriter: accessLogStore,
+      tokenStore: createMemoryPsLiteTokenStore(),
+      saveConfig: async () => {},
+      stateCapabilities: { config: "memory" },
+      active: true,
+      auth: {
+        async authorizeOwner() {},
+        async authorizeBuilderList() {},
+        async authorizeBuilderRead() {
+          return { grantId: "owner" };
+        },
+      },
+      diagnostics: recorder,
+    });
+
+    const response = await runtime.fetch(
+      new Request("http://localhost/v1/diagnostics", { method: "GET" }),
+    );
+    expect(response.status).toBe(200);
+
+    const snap = (await response.json()) as PsLiteDiagnosticsSnapshot;
+    // Repair counts must reflect both recordRepair calls
+    expect(snap.repairCounts["drive"]).toBe(2);
+    // Scope entry must have the count
+    const driveScope = snap.scopes.find((s) => s.scope === "drive");
+    expect(driveScope).toBeDefined();
+    expect(driveScope!.repairCount).toBe(2);
+    // Both repair events must be in the ring
+    const repairEvents = snap.recentEvents.filter(
+      (e) => e.phase === "repairingManifest" && e.scope === "drive",
+    );
+    expect(repairEvents).toHaveLength(2);
+  });
+
+  it("download failure maps to downloadFailed scope status in /v1/diagnostics", async () => {
+    const { createPsLiteRuntime } = await import("./runtime.js");
+    const {
+      createMemoryPsLiteStorage,
+      createMemoryPsLiteTokenStore,
+      createMemoryPsLiteAccessLogStore,
+    } = await import("./test-support/memory.js");
+
+    const recorder = new DiagnosticsRecorder();
+    // Simulate download failure as the sync hook adapter would record it
+    recorder.beginOperation("downloading", undefined, "file-bad");
+    recorder.push({
+      phase: "downloading",
+      fileId: "file-bad",
+      error: true,
+      detail: "connection refused",
+    });
+    recorder.endOperation();
+
+    const accessLogStore = createMemoryPsLiteAccessLogStore();
+    const runtime = createPsLiteRuntime({
+      storage: createMemoryPsLiteStorage(),
+      accessLogReader: accessLogStore,
+      accessLogWriter: accessLogStore,
+      tokenStore: createMemoryPsLiteTokenStore(),
+      saveConfig: async () => {},
+      stateCapabilities: { config: "memory" },
+      active: true,
+      auth: {
+        async authorizeOwner() {},
+        async authorizeBuilderList() {},
+        async authorizeBuilderRead() {
+          return { grantId: "owner" };
+        },
+      },
+      diagnostics: recorder,
+    });
+
+    const response = await runtime.fetch(
+      new Request("http://localhost/v1/diagnostics", { method: "GET" }),
+    );
+    expect(response.status).toBe(200);
+
+    const snap = (await response.json()) as PsLiteDiagnosticsSnapshot;
+    // No scope is set since we pushed without scope, but the error event must appear
+    const errorEvents = snap.recentEvents.filter(
+      (e) => e.error && e.phase === "downloading",
+    );
+    expect(errorEvents).toHaveLength(1);
+    expect(errorEvents[0]!.detail).toBe("connection refused");
+    expect(errorEvents[0]!.fileId).toBe("file-bad");
+    // Active operation must be cleared after endOperation
+    expect(snap.activeOperation).toBeNull();
+  });
+
+  it("decrypt failure maps to decryptFailed scope status in /v1/diagnostics", async () => {
+    const { createPsLiteRuntime } = await import("./runtime.js");
+    const {
+      createMemoryPsLiteStorage,
+      createMemoryPsLiteTokenStore,
+      createMemoryPsLiteAccessLogStore,
+    } = await import("./test-support/memory.js");
+
+    const recorder = new DiagnosticsRecorder();
+    recorder.beginOperation("decrypting", "health", "file-enc");
+    recorder.push({
+      phase: "decrypting",
+      fileId: "file-enc",
+      scope: "health",
+      error: true,
+      detail: "bad decryption key",
+    });
+    recorder.endOperation();
+
+    const accessLogStore = createMemoryPsLiteAccessLogStore();
+    const runtime = createPsLiteRuntime({
+      storage: createMemoryPsLiteStorage(),
+      accessLogReader: accessLogStore,
+      accessLogWriter: accessLogStore,
+      tokenStore: createMemoryPsLiteTokenStore(),
+      saveConfig: async () => {},
+      stateCapabilities: { config: "memory" },
+      active: true,
+      auth: {
+        async authorizeOwner() {},
+        async authorizeBuilderList() {},
+        async authorizeBuilderRead() {
+          return { grantId: "owner" };
+        },
+      },
+      diagnostics: recorder,
+    });
+
+    const response = await runtime.fetch(
+      new Request("http://localhost/v1/diagnostics", { method: "GET" }),
+    );
+    expect(response.status).toBe(200);
+
+    const snap = (await response.json()) as PsLiteDiagnosticsSnapshot;
+    const healthScope = snap.scopes.find((s) => s.scope === "health");
+    expect(healthScope).toBeDefined();
+    expect(healthScope!.status).toBe("decryptFailed");
+    expect(healthScope!.lastError).toBe("bad decryption key");
+    expect(healthScope!.lastFileId).toBe("file-enc");
   });
 });

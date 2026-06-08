@@ -83,7 +83,7 @@ import {
 } from "./state.js";
 import {
   collectDiagnosticsWithTimeout,
-  type DiagnosticsRecorder,
+  DiagnosticsRecorder,
 } from "./diagnostics.js";
 
 export interface PsLiteStorageAdapter {
@@ -523,6 +523,10 @@ export function createPsLiteRuntime(
   const now = options.now ?? (() => new Date());
   const auth = options.auth ?? createMissingAuthAdapter();
   const dataStorage = toDataStoragePort(options.storage);
+  // Wire diagnostics by default so GET /v1/diagnostics is always available.
+  const diagnostics = options.diagnostics ?? new DiagnosticsRecorder();
+  options = { ...options, diagnostics };
+  diagnostics.push({ phase: "booting", detail: "runtime created" });
   let accessLogReader = options.accessLogReader;
   let accessLogWriter = options.accessLogWriter;
   if (!accessLogReader || !accessLogWriter) {

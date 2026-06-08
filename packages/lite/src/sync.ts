@@ -12,8 +12,10 @@ import {
   deriveMasterKey,
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
+import type { DownloadDiagnosticsHook } from "@opendatalabs/personal-server-ts-core/sync";
 import type { PsLiteStateStore } from "./state.js";
 import { resolvePsLiteOwner } from "./owner-binding.js";
+import type { DiagnosticsRecorder } from "./diagnostics.js";
 
 const SYNC_CURSOR_KEY = "sync-cursor-v1";
 
@@ -34,6 +36,7 @@ export interface PsLiteSyncOptions {
   ownerSignature: `0x${string}`;
   serverAccount: ServerAccount;
   gateway?: GatewayClient;
+  diagnostics?: DiagnosticsRecorder;
 }
 
 function createBrowserLogger() {
@@ -62,6 +65,75 @@ export function createPsLiteSyncCursor(
   };
 }
 
+function buildDownloadDiagnosticsHook(
+  recorder: DiagnosticsRecorder,
+): DownloadDiagnosticsHook {
+  return {
+    onDownloadStart(fileId) {
+      recorder.beginOperation("downloading", undefined, fileId);
+      recorder.push({ phase: "downloading", fileId });
+    },
+    onDownloadEnd(fileId, scope) {
+      recorder.endOperation();
+      recorder.push({ phase: "downloading", fileId, scope });
+    },
+    onDownloadError(fileId, detail) {
+      recorder.endOperation();
+      recorder.push({ phase: "downloading", fileId, error: true, detail });
+    },
+    onDecryptStart(fileId, scope) {
+      recorder.beginOperation("decrypting", scope, fileId);
+      recorder.push({ phase: "decrypting", fileId, scope });
+    },
+    onDecryptEnd(fileId, scope) {
+      recorder.endOperation();
+      recorder.push({ phase: "decrypting", fileId, scope });
+    },
+    onDecryptError(fileId, scope, detail) {
+      recorder.endOperation();
+      recorder.push({
+        phase: "decrypting",
+        fileId,
+        scope,
+        error: true,
+        detail,
+      });
+    },
+    onIndexStart(fileId, scope) {
+      recorder.beginOperation("indexing", scope, fileId);
+      recorder.push({ phase: "indexing", fileId, scope });
+    },
+    onIndexEnd(fileId, scope) {
+      recorder.endOperation();
+      recorder.push({ phase: "indexing", fileId, scope });
+      recorder.setScopeStatus(scope, "ready");
+    },
+    onIndexError(fileId, scope, detail) {
+      recorder.endOperation();
+      recorder.push({ phase: "indexing", fileId, scope, error: true, detail });
+    },
+    onManifestBuildStart(fileId, scope) {
+      recorder.push({ phase: "buildingManifest", fileId, scope });
+    },
+    onManifestBuildEnd(fileId, scope) {
+      recorder.push({ phase: "buildingManifest", fileId, scope });
+    },
+    onManifestBuildError(fileId, scope, detail) {
+      recorder.push({
+        phase: "buildingManifest",
+        fileId,
+        scope,
+        error: true,
+        detail,
+      });
+    },
+    onRepair(scope, detail) {
+      recorder.recordRepair(scope);
+      recorder.push({ phase: "repairingManifest", scope, detail });
+    },
+  };
+}
+
 export async function createPsLiteSyncManager(
   options: PsLiteSyncOptions,
 ): Promise<{ syncManager: SyncManager; serverOwner: `0x${string}` }> {
@@ -83,6 +155,9 @@ export async function createPsLiteSyncManager(
   });
   const cursor = createPsLiteSyncCursor(options.stateStore);
   const logger = createBrowserLogger();
+  const downloadDiagnostics = options.diagnostics
+    ? buildDownloadDiagnosticsHook(options.diagnostics)
+    : undefined;
   const syncManager = createSyncManager(
     {
       storage: options.storage,
@@ -101,6 +176,7 @@ export async function createPsLiteSyncManager(
       masterKey,
       serverOwner,
       logger: logger as never,
+      diagnostics: downloadDiagnostics,
     },
     {
       async canSync() {
