@@ -81,6 +81,10 @@ import {
   createIndexedDbPsLiteTokenStore,
   savePsLiteConfig,
 } from "./state.js";
+import {
+  collectDiagnosticsWithTimeout,
+  type DiagnosticsRecorder,
+} from "./diagnostics.js";
 
 export interface PsLiteStorageAdapter {
   kind: "indexeddb" | "opfs" | "custom";
@@ -128,6 +132,11 @@ export interface PsLiteRuntimeOptions {
   mcpConnectionStore?: McpConnectionStore;
   mcpOAuthAuthorizationStore?: McpOAuthAuthorizationStore;
   mcpOAuthApprovalUrl?: string | (() => string);
+  /**
+   * Optional diagnostics recorder. When provided, GET /v1/diagnostics (owner-only)
+   * returns a structured snapshot useful for debugging stuck approval pages.
+   */
+  diagnostics?: DiagnosticsRecorder;
 }
 
 export interface PsLiteRuntimeStateCapabilities {
@@ -878,6 +887,47 @@ export function createPsLiteRuntime(
               await saveConfig(config);
             },
           });
+        }
+
+        if (url.pathname === "/v1/diagnostics") {
+          if (request.method !== "GET") {
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          }
+          try {
+            await auth.authorizeOwner(request);
+          } catch (err) {
+            if (err instanceof ProtocolError) {
+              return protocolErrorResponse(err);
+            }
+            throw err;
+          }
+          if (!options.diagnostics) {
+            return jsonResponse(
+              {
+                error: {
+                  code: 404,
+                  errorCode: "DIAGNOSTICS_NOT_CONFIGURED",
+                  message:
+                    "Diagnostics recorder not configured for this runtime",
+                },
+              },
+              { status: 404 },
+            );
+          }
+          const syncStatus = options.syncManager?.getStatus() ?? null;
+          const snapshot = await collectDiagnosticsWithTimeout(
+            options.diagnostics,
+            {
+              runtimeActive: active,
+              syncStatus,
+              storage: dataStorage,
+            },
+          );
+          return jsonResponse(snapshot);
         }
 
         if (options.mcpConnectionStore) {
