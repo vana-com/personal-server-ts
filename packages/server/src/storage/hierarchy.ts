@@ -33,6 +33,10 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import { previewJsonEnvelopePrefix } from "@opendatalabs/personal-server-ts-core/storage/preview";
 
+const TEXT_PAGE_MEDIA_TYPE = "text/plain; charset=utf-8";
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
 /** Atomic write: mkdir -p, write temp file, rename */
 export async function writeDataFile(
   options: HierarchyManagerOptions,
@@ -155,17 +159,36 @@ export async function readScopeBlocks(
 
   const maxBytes = Math.max(1, readOptions.maxBytes);
   const startIndex = cursor?.ok ? cursor.cursor.blockIndex : 0;
+  const startOffset = cursor?.ok ? (cursor.cursor.intraBlockOffset ?? 0) : 0;
   const blocks: DataScopeBlock[] = [];
   let totalBytes = 0;
   let nextIndex = startIndex;
+  let nextOffset: number | undefined;
 
   while (nextIndex < manifest.blocks.length) {
     const ref = manifest.blocks[nextIndex]!;
-    if (blocks.length > 0 && totalBytes + ref.sizeBytes > maxBytes) break;
+    const offset = nextIndex === startIndex ? startOffset : 0;
+    if (offset >= ref.sizeBytes) {
+      nextIndex++;
+      continue;
+    }
+    if (
+      blocks.length > 0 &&
+      offset === 0 &&
+      totalBytes + ref.sizeBytes > maxBytes
+    )
+      break;
 
     const block = await readBlockPayload(options, scope, collectedAt, ref.id);
-    blocks.push(block);
-    totalBytes += ref.sizeBytes;
+    const page = pageBlock(block, offset, maxBytes - totalBytes);
+    blocks.push(page.block);
+    totalBytes += page.block.sizeBytes;
+
+    if (page.nextOffset !== undefined) {
+      nextOffset = page.nextOffset;
+      break;
+    }
+
     nextIndex++;
 
     if (totalBytes >= maxBytes) break;
@@ -177,12 +200,15 @@ export async function readScopeBlocks(
     ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
     contentKind: manifest.contentKind,
     blocks,
-    ...(nextIndex < manifest.blocks.length
+    ...(nextOffset !== undefined || nextIndex < manifest.blocks.length
       ? {
           nextCursor: encodeDataBlockCursor({
             scope,
             collectedAt,
             blockIndex: nextIndex,
+            ...(nextOffset === undefined
+              ? {}
+              : { intraBlockOffset: nextOffset }),
           }),
         }
       : {}),
@@ -309,6 +335,37 @@ async function readBlockPayload(
     }
     throw err;
   }
+}
+
+function pageBlock(
+  block: DataScopeBlock,
+  offsetBytes: number,
+  maxBytes: number,
+): { block: DataScopeBlock; nextOffset?: number } {
+  const text =
+    typeof block.value === "string" ? block.value : JSON.stringify(block.value);
+  const bytes = textEncoder.encode(text);
+  if (offsetBytes <= 0 && bytes.length <= maxBytes) {
+    return { block };
+  }
+
+  const start = Math.min(Math.max(0, offsetBytes), bytes.length);
+  const end = Math.min(bytes.length, start + Math.max(1, maxBytes));
+  const value = textDecoder.decode(bytes.slice(start, end));
+
+  return {
+    block: {
+      ...block,
+      path: `${block.path}[bytes ${start}:${end}]`,
+      mediaType: block.mediaType.startsWith("text/")
+        ? block.mediaType
+        : TEXT_PAGE_MEDIA_TYPE,
+      value,
+      sizeBytes: end - start,
+      truncated: end < bytes.length,
+    },
+    ...(end < bytes.length ? { nextOffset: end } : {}),
+  };
 }
 
 async function deleteBlockSidecars(

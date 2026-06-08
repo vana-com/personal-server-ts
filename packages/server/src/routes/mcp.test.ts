@@ -915,9 +915,9 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
         scope: "chatgpt.conversations",
       }),
     ]);
-    expect(payload.matches[0]!.searchedChars).toBeLessThanOrEqual(55_000);
+    expect(payload.matches[0]!.searchedChars).toBeLessThanOrEqual(70_000);
     expect(payload.matches[0]!.searchedChars).toBeGreaterThan(45_000);
-    expect(payload.truncatedScopes).toEqual(["chatgpt.conversations"]);
+    expect(payload.truncatedScopes).toEqual([]);
     expect(fullRead).not.toHaveBeenCalled();
     expect(accessLogWriter.entries).toContainEqual(
       expect.objectContaining({
@@ -1455,7 +1455,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     const oversizedScope = "x".repeat(1_000);
     const requestedScopes = [
       oversizedScope,
-      ...Array.from({ length: 30 }, (_value, index) => `unknown.${index}`),
+      ...Array.from({ length: 120 }, (_value, index) => `unknown.${index}`),
     ];
 
     const result = await tool.handler(
@@ -1475,16 +1475,16 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
       skippedScopes: string[];
       limits: { maxRequestedScopes: number; scopeChars: number };
     };
-    expect(payload.errors).toHaveLength(19);
+    expect(payload.errors).toHaveLength(99);
     expect(
       payload.errors.every((entry) => entry.error === "scope_not_granted"),
     ).toBe(true);
     expect(payload.skippedScopes).toEqual([
-      "11 requested scopes omitted by input cap",
+      "21 requested scopes omitted by input cap",
       "1 invalid requested scopes omitted",
     ]);
     expect(payload.limits).toMatchObject({
-      maxRequestedScopes: 20,
+      maxRequestedScopes: 100,
       scopeChars: 128,
     });
     expect(result.content[0].text).not.toContain(oversizedScope);

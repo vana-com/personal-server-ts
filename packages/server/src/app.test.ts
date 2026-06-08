@@ -184,6 +184,27 @@ describe("createApp", () => {
     expect(body.status).toBe("healthy");
   });
 
+  it("GET /v1/mcp/activity returns the owner activity snapshot", async () => {
+    const app = makeApp();
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: "/v1/mcp/activity",
+    });
+
+    const res = await app.request("/v1/mcp/activity", {
+      headers: { authorization: auth },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      events: [],
+      running: 0,
+      total: 0,
+    });
+  });
+
   it("ProtocolError returns correct status and JSON body", async () => {
     const app = makeApp();
 

@@ -99,6 +99,59 @@ describe("HierarchyManager", () => {
     });
   });
 
+  describe("readScopeBlocks", () => {
+    it("pages through a single oversized block with intra-block cursors", async () => {
+      const largeValue = "0123456789".repeat(600);
+      const sizeBytes = new TextEncoder().encode(largeValue).byteLength;
+      await writeBlockManifest(
+        options,
+        scope,
+        collectedAt,
+        {
+          version: 1,
+          scope,
+          collectedAt,
+          contentKind: "text",
+          blocks: [
+            {
+              id: "block-000001",
+              path: "$.data",
+              mediaType: "text/plain",
+              sizeBytes,
+            },
+          ],
+          warnings: [],
+        },
+        [
+          {
+            id: "block-000001",
+            path: "$.data",
+            mediaType: "text/plain",
+            value: largeValue,
+            sizeBytes,
+          },
+        ],
+      );
+
+      const firstPage = await readScopeBlocks(options, scope, collectedAt, {
+        maxBytes: 1024,
+      });
+      expect(firstPage.blocks).toHaveLength(1);
+      expect(firstPage.blocks[0]?.value).toBe(largeValue.slice(0, 1024));
+      expect(firstPage.blocks[0]?.truncated).toBe(true);
+      expect(firstPage.nextCursor).toBeTruthy();
+
+      const secondPage = await readScopeBlocks(options, scope, collectedAt, {
+        cursor: firstPage.nextCursor,
+        maxBytes: 1024,
+      });
+      expect(secondPage.blocks).toHaveLength(1);
+      expect(secondPage.blocks[0]?.value).toBe(largeValue.slice(1024, 2048));
+      expect(secondPage.blocks[0]?.truncated).toBe(true);
+      expect(secondPage.nextCursor).toBeTruthy();
+    });
+  });
+
   describe("listVersions", () => {
     it("returns filenames in reverse chronological order", async () => {
       const ts1 = "2026-01-21T08:00:00Z";
