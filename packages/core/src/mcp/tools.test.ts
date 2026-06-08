@@ -207,6 +207,67 @@ describe("mcp/tools", () => {
     });
   });
 
+  it("read_scope surfaces binary (vana-envelope) content without dropping the payload", async () => {
+    // Binary/no-schema scopes (e.g. an ingested PDF under dexa.scan) read back
+    // as vana-envelope blocks whose value carries the base64 $binary payload.
+    // read_scope must pass contentKind + blocks through verbatim so the binary
+    // content reaches the MCP client intact.
+    const binaryBlock = {
+      id: "blk-0",
+      path: "$",
+      mediaType: "application/pdf",
+      value: {
+        $binary: true as const,
+        mimeType: "application/pdf",
+        filename: "dexa-scan.pdf",
+        sizeBytes: 3,
+        contentHash:
+          "0x5e2df0bad926875ab6543fd40dc8ef4ff928b9283008dab06bf28da2c044f94e",
+        encoding: "base64" as const,
+        content: "QUJD", // base64 of the bytes "ABC"
+      },
+      sizeBytes: 3,
+    };
+    const readClient = createMinimalReadClient({
+      readScopeBlocks: vi.fn().mockResolvedValue({
+        scope: "dexa.scan",
+        collectedAt: "2026-06-07T01:47:11Z",
+        contentKind: "vana-envelope",
+        blocks: [binaryBlock],
+        warnings: [],
+      }),
+    });
+    const connection: McpConnectionRecord = {
+      ...createConnection(),
+      grants: [{ grantId: "grant-binary", scopes: ["dexa.*"] }],
+    };
+
+    const result = await getTool("read_scope").handler(
+      { scope: "dexa.scan", maxBytes: 1024 },
+      { connection, readClient: readClient as never },
+    );
+
+    expect(result.isError).not.toBe(true);
+    expect(readClient.readScopeBlocks).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: "dexa.scan", grantId: "grant-binary" }),
+    );
+
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload).toMatchObject({
+      scope: "dexa.scan",
+      grantId: "grant-binary",
+      contentKind: "vana-envelope",
+    });
+    // The binary payload must round-trip through the tool layer byte-for-byte:
+    // the $binary metadata and base64 content are preserved, and the base64
+    // still decodes back to the original bytes.
+    expect(payload.blocks).toHaveLength(1);
+    expect(payload.blocks[0].value).toEqual(binaryBlock.value);
+    expect(Buffer.from(payload.blocks[0].value.content, "base64")).toEqual(
+      Buffer.from("ABC"),
+    );
+  });
+
   it("read_scope returns a typed timeout instead of hanging on a stalled read", async () => {
     const readClient = createMinimalReadClient({
       readScopeBlocks: vi.fn(
