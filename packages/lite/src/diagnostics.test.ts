@@ -137,6 +137,45 @@ describe("DiagnosticsRecorder", () => {
     expect(scope!.status).toBe("indexFailed");
   });
 
+  it("does not mask manifest failures as ready after raw indexing completes", () => {
+    recorder.push({
+      phase: "buildingManifest",
+      scope: "chatgpt.conversations",
+      error: true,
+      detail: "block_manifest_not_found",
+    });
+    recorder.push({
+      phase: "indexing",
+      scope: "chatgpt.conversations",
+    });
+    recorder.setScopeReadyAfterIndex("chatgpt.conversations");
+
+    const snap = recorder.snapshot();
+    const scope = snap.scopes.find((s) => s.scope === "chatgpt.conversations");
+    expect(scope!.status).toBe("manifestMissing");
+    expect(scope!.lastError).toBe("block_manifest_not_found");
+  });
+
+  it("allows a later successful manifest build to become ready", () => {
+    recorder.push({
+      phase: "buildingManifest",
+      scope: "chatgpt.conversations",
+      error: true,
+      detail: "block_manifest_not_found",
+    });
+    recorder.push({
+      phase: "buildingManifest",
+      scope: "chatgpt.conversations",
+    });
+    recorder.setScopeManifestBuilt("chatgpt.conversations");
+    recorder.setScopeReadyAfterIndex("chatgpt.conversations");
+
+    const snap = recorder.snapshot();
+    const scope = snap.scopes.find((s) => s.scope === "chatgpt.conversations");
+    expect(scope!.status).toBe("ready");
+    expect(scope!.lastError).toBeUndefined();
+  });
+
   it("tracks repair loop counts per scope", () => {
     recorder.recordRepair("drive");
     recorder.recordRepair("drive");
@@ -381,6 +420,45 @@ describe("DiagnosticsRecorder — runtime route integration", () => {
     // At minimum the "booting" event pushed at runtime creation
     expect(snap.recentEvents.length).toBeGreaterThanOrEqual(1);
     expect(snap.recentEvents[0]!.phase).toBe("booting");
+  });
+
+  it("GET /v1/diagnostics works even when the runtime is inactive", async () => {
+    const { createPsLiteRuntime } = await import("./runtime.js");
+    const {
+      createMemoryPsLiteStorage,
+      createMemoryPsLiteTokenStore,
+      createMemoryPsLiteAccessLogStore,
+    } = await import("./test-support/memory.js");
+
+    const accessLogStore = createMemoryPsLiteAccessLogStore();
+    const runtime = createPsLiteRuntime({
+      storage: createMemoryPsLiteStorage(),
+      accessLogReader: accessLogStore,
+      accessLogWriter: accessLogStore,
+      tokenStore: createMemoryPsLiteTokenStore(),
+      saveConfig: async () => {},
+      stateCapabilities: { config: "memory" },
+      active: false,
+      auth: {
+        async authorizeOwner() {},
+        async authorizeBuilderList() {},
+        async authorizeBuilderRead() {
+          return { grantId: "owner" };
+        },
+      },
+    });
+
+    const diagnostics = await runtime.fetch(
+      new Request("http://localhost/v1/diagnostics", { method: "GET" }),
+    );
+    expect(diagnostics.status).toBe(200);
+    const snap = (await diagnostics.json()) as PsLiteDiagnosticsSnapshot;
+    expect(snap.runtimeActive).toBe(false);
+
+    const data = await runtime.fetch(
+      new Request("http://localhost/v1/data/scopes", { method: "GET" }),
+    );
+    expect(data.status).toBe(503);
   });
 
   it("GET /v1/diagnostics returns snapshot when recorder is configured", async () => {

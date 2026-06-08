@@ -199,7 +199,7 @@ export class DiagnosticsRecorder {
         ...(options.error && options.detail
           ? { lastError: options.detail }
           : {}),
-        status: phaseToScopeStatus(options.phase, options.error),
+        status: nextScopeStatus(existing.status, options.phase, options.error),
       };
       this.scopeMap.set(options.scope, next);
     }
@@ -257,6 +257,32 @@ export class DiagnosticsRecorder {
   ): void {
     const existing = this.scopeMap.get(scope) ?? { scope, status };
     this.scopeMap.set(scope, { ...existing, ...extra, scope, status });
+  }
+
+  /**
+   * Mark a scope as ready after a successful index pass, unless an earlier
+   * phase found that the bounded read sidecar is missing or corrupt.
+   */
+  setScopeReadyAfterIndex(scope: string): void {
+    const existing = this.scopeMap.get(scope);
+    if (existing && isBlockingScopeStatus(existing.status)) {
+      return;
+    }
+    this.setScopeStatus(scope, "ready");
+  }
+
+  /** Mark a successful block-manifest write and clear any stale manifest error. */
+  setScopeManifestBuilt(scope: string): void {
+    const existing = this.scopeMap.get(scope) ?? {
+      scope,
+      status: "indexing" as ScopeReadinessStatus,
+    };
+    const { lastError: _lastError, ...withoutError } = existing;
+    this.scopeMap.set(scope, {
+      ...withoutError,
+      scope,
+      status: "indexing",
+    });
   }
 
   /**
@@ -326,6 +352,26 @@ function phaseToScopeStatus(
     default:
       return "unknown";
   }
+}
+
+function nextScopeStatus(
+  existingStatus: ScopeReadinessStatus,
+  phase: DiagnosticsPhase,
+  error?: boolean,
+): ScopeReadinessStatus {
+  if (!error && isBlockingScopeStatus(existingStatus)) {
+    return existingStatus;
+  }
+  return phaseToScopeStatus(phase, error);
+}
+
+function isBlockingScopeStatus(status: ScopeReadinessStatus): boolean {
+  return (
+    status === "manifestMissing" ||
+    status === "downloadFailed" ||
+    status === "decryptFailed" ||
+    status === "indexFailed"
+  );
 }
 
 function buildSyncDiagnostics(
