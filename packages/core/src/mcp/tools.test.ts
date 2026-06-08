@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { McpActivityRecorder } from "./activity.js";
 import { MCP_TOOLS } from "./tools.js";
 import { handleMcpStreamableHttpRequest } from "./server.js";
 import type { McpConnectionRecord } from "./types.js";
@@ -75,6 +76,41 @@ describe("mcp/tools", () => {
     const body = await response.text();
     expect(() => JSON.parse(body)).not.toThrow();
     expect(new TextEncoder().encode(body).byteLength).toBeLessThan(3000);
+  });
+
+  it("records activity for MCP HTTP tool calls", async () => {
+    const activityRecorder = new McpActivityRecorder();
+    const response = await handleMcpStreamableHttpRequest(
+      new Request("http://localhost/mcp/test-token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: {
+            name: "list_granted_scopes",
+            arguments: {},
+          },
+        }),
+      }),
+      {
+        connection: createConnection(),
+        readClient: createMinimalReadClient(),
+        activityRecorder,
+      },
+    );
+
+    expect(response.status).toBe(200);
+    const snapshot = activityRecorder.snapshot();
+    expect(snapshot.total).toBe(1);
+    expect(snapshot.events[0]).toMatchObject({
+      status: "succeeded",
+      tool: "list_granted_scopes",
+    });
   });
 
   it("MCP HTTP dispatcher returns a typed timeout for stalled tool handlers", async () => {
@@ -200,8 +236,10 @@ describe("mcp/tools", () => {
       nextCursor: "cursor-2",
       page: {
         cursor: "cursor-1",
+        hasMore: true,
         maxBytes: 4096,
-        timeoutMs: 30_000,
+        nextCursor: "cursor-2",
+        timeoutMs: 60_000,
         returnedBlocks: 1,
       },
     });
