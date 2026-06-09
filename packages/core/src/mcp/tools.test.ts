@@ -46,6 +46,7 @@ function createMinimalReadClient(
     }),
     getScopeMetadata: vi.fn().mockReturnValue(null),
     readScopeBlocks: vi.fn().mockRejectedValue(new Error("not mocked")),
+    readRawScopeFile: vi.fn().mockRejectedValue(new Error("not mocked")),
     ...overrides,
   };
 }
@@ -116,6 +117,53 @@ describe("mcp/tools", () => {
     expect(typeof snapshot.events[0].durationMs).toBe("number");
     expect(snapshot.events[0].payloadBytes).toBeGreaterThan(0);
     expect(snapshot.events[0].textBytes).toBeGreaterThan(0);
+  });
+
+  it("serves raw scope files through MCP resources/read", async () => {
+    const response = await handleMcpStreamableHttpRequest(
+      new Request("http://localhost/mcp/test-token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "resources/read",
+          params: { uri: "vana://scope/manual.document/raw" },
+        }),
+      }),
+      {
+        connection: {
+          ...createConnection(),
+          grants: [{ grantId: "grant-3", scopes: ["manual.document"] }],
+        },
+        readClient: createMinimalReadClient({
+          readRawScopeFile: vi.fn().mockResolvedValue({
+            status: 200,
+            scope: "manual.document",
+            mimeType: "application/pdf",
+            sizeBytes: 4,
+            contentBase64: "JVBERg==",
+          }),
+        }),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      result: {
+        contents: Array<{ uri: string; mimeType: string; blob: string }>;
+      };
+    };
+    expect(body.result.contents).toEqual([
+      expect.objectContaining({
+        uri: "vana://scope/manual.document/raw",
+        mimeType: "application/pdf",
+        blob: "JVBERg==",
+      }),
+    ]);
   });
 
   it("MCP HTTP dispatcher returns a typed timeout for stalled tool handlers", async () => {
@@ -248,6 +296,88 @@ describe("mcp/tools", () => {
         returnedBlocks: 1,
       },
     });
+  });
+
+  it("get_scope_file returns raw binary data as an MCP resource blob", async () => {
+    const readRawScopeFile = vi.fn().mockResolvedValue({
+      status: 200,
+      scope: "manual.document",
+      collectedAt: "2026-06-05T00:00:00Z",
+      fileId: "file-1",
+      mimeType: "application/pdf",
+      filename: "scan.pdf",
+      sizeBytes: 4,
+      contentBase64: "JVBERg==",
+    });
+    const result = await getTool("get_scope_file").handler(
+      { scope: "manual.document" },
+      {
+        connection: {
+          ...createConnection(),
+          grants: [{ grantId: "grant-3", scopes: ["manual.document"] }],
+        },
+        readClient: createMinimalReadClient({ readRawScopeFile }),
+      },
+    );
+
+    expect(result.isError).not.toBe(true);
+    expect(readRawScopeFile).toHaveBeenCalledWith({
+      scope: "manual.document",
+      grantId: "grant-3",
+      at: undefined,
+      fileId: undefined,
+    });
+    expect(result.content).toContainEqual(
+      expect.objectContaining({
+        type: "resource",
+        resource: expect.objectContaining({
+          uri: "vana://scope/manual.document/raw",
+          mimeType: "application/pdf",
+          blob: "JVBERg==",
+        }),
+      }),
+    );
+    expect(result.structuredContent).toMatchObject({
+      scope: "manual.document",
+      resourceUri: "vana://scope/manual.document/raw",
+      contentIncluded: true,
+      resourceType: "blob",
+    });
+  });
+
+  it("get_scope_file links without embedding when the file exceeds maxBytes", async () => {
+    const result = await getTool("get_scope_file").handler(
+      { scope: "manual.document", maxBytes: 3 },
+      {
+        connection: {
+          ...createConnection(),
+          grants: [{ grantId: "grant-3", scopes: ["manual.document"] }],
+        },
+        readClient: createMinimalReadClient({
+          readRawScopeFile: vi.fn().mockResolvedValue({
+            status: 200,
+            scope: "manual.document",
+            mimeType: "application/pdf",
+            filename: "scan.pdf",
+            sizeBytes: 4,
+            contentBase64: "JVBERg==",
+          }),
+        }),
+      },
+    );
+
+    expect(result.isError).not.toBe(true);
+    expect(result.content).toContainEqual(
+      expect.objectContaining({
+        type: "resource_link",
+        uri: "vana://scope/manual.document/raw",
+        mimeType: "application/pdf",
+        size: 4,
+      }),
+    );
+    expect(result.content).not.toContainEqual(
+      expect.objectContaining({ type: "resource" }),
+    );
   });
 
   it("read_scope defaults to a client-safe page and does not duplicate large payloads", async () => {
@@ -843,6 +973,52 @@ describe("mcp/tools", () => {
     // Second call must not re-search scopes that were already covered
     expect(callLog).not.toContain("instagram.profile");
     expect(secondPayload.results.length).toBeGreaterThan(0);
+  });
+
+  it("search_personal_context default sweep reaches scopes beyond the old ten-scope cap", async () => {
+    const scopes = Array.from({ length: 15 }, (_, index) =>
+      index === 14 ? "manual.document" : `source${index}.profile`,
+    );
+    const readClient = createMinimalReadClient({
+      readScopeBlocks: vi.fn(async ({ scope }: { scope: string }) => ({
+        scope,
+        collectedAt: "2026-06-05T00:00:00Z",
+        contentKind: "json",
+        blocks: [
+          {
+            id: "b1",
+            path: "$.text",
+            mediaType: "text/plain",
+            value:
+              scope === "manual.document"
+                ? "This PDF mentions 78752."
+                : `No zip code in ${scope}.`,
+            sizeBytes: 32,
+          },
+        ],
+        warnings: [],
+      })),
+    });
+
+    const result = await getTool("search_personal_context").handler(
+      { query: "78752", timeoutMs: 30_000 },
+      {
+        connection: {
+          ...createConnection(),
+          grants: [{ grantId: "grant-wide", scopes }],
+        },
+        readClient,
+      },
+    );
+
+    const payload = JSON.parse(result.content[0].text) as {
+      results: Array<{ scope: string }>;
+      limits: { maxScopes: number };
+    };
+    expect(payload.results).toEqual([
+      expect.objectContaining({ scope: "manual.document" }),
+    ]);
+    expect(payload.limits.maxScopes).toBeGreaterThan(10);
   });
 
   it("list_granted_scopes returns planning metadata for each scope", async () => {
