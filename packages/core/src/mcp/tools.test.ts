@@ -250,6 +250,50 @@ describe("mcp/tools", () => {
     });
   });
 
+  it("read_scope defaults to a client-safe page and does not duplicate large payloads", async () => {
+    const readClient = createMinimalReadClient({
+      readScopeBlocks: vi.fn().mockResolvedValue({
+        scope: "instagram.profile",
+        collectedAt: "2026-06-05T00:00:00Z",
+        contentKind: "json",
+        blocks: [
+          {
+            id: "b1",
+            path: "$.large",
+            mediaType: "application/json",
+            value: { text: "x".repeat(70 * 1024) },
+            sizeBytes: 70 * 1024,
+          },
+        ],
+        nextCursor: "cursor-2",
+        warnings: [],
+      }),
+    });
+
+    const result = await getTool("read_scope").handler(
+      { scope: "instagram.profile" },
+      {
+        connection: createConnection(),
+        readClient: readClient as never,
+      },
+    );
+
+    expect(readClient.readScopeBlocks).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: "instagram.profile",
+        maxBytes: 64 * 1024,
+      }),
+    );
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      nextCursor: "cursor-2",
+      page: {
+        hasMore: true,
+        maxBytes: 64 * 1024,
+      },
+    });
+    expect(result.structuredContent).toBeUndefined();
+  });
+
   it("read_scope attaches search guidance for large scopes and omits it for small ones", async () => {
     const block = {
       id: "b1",

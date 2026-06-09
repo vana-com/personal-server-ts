@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { buildBinaryEnvelopeData } from "../../contracts/binary.js";
 import { buildDataBlocks, type DataBlockPayload } from "./build.js";
 
 describe("buildDataBlocks", () => {
@@ -178,6 +179,46 @@ describe("buildDataBlocks", () => {
     expect(binary.manifest.warnings[0]?.code).toBe("binary_metadata_only");
     expect(zip.manifest.contentKind).toBe("zip");
     expect(zip.manifest.warnings[0]?.code).toBe("zip_metadata_only");
+  });
+
+  it("represents binary Vana envelopes as metadata without indexing base64 content", () => {
+    const binaryData = buildBinaryEnvelopeData({
+      bytes: new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31]),
+      mimeType: "application/pdf",
+      filename: "roof-report.pdf",
+      contentHash: `0x${"a".repeat(64)}`,
+      metadata: { title: "Roof report" },
+    });
+    const result = buildDataBlocks({
+      scope: "manual.document",
+      collectedAt: "2026-06-09T16:28:09Z",
+      content: {
+        scope: "manual.document",
+        collectedAt: "2026-06-09T16:28:09Z",
+        schemaId: "schema-1",
+        data: binaryData,
+      },
+    });
+
+    expect(result.manifest.contentKind).toBe("binary");
+    expect(result.manifest.warnings[0]?.code).toBe("binary_metadata_only");
+    expect(result.blocks).toHaveLength(2);
+    expect(result.blocks[0]?.path).toBe("$.__envelope");
+    expect(result.blocks[1]).toMatchObject({
+      path: "$.data",
+      mediaType: "application/json",
+      value: {
+        contentKind: "binary",
+        mimeType: "application/pdf",
+        filename: "roof-report.pdf",
+        sizeBytes: 6,
+        contentHash: `0x${"a".repeat(64)}`,
+        metadata: { title: "Roof report" },
+        searchable: false,
+        rawContentAvailable: true,
+      },
+    });
+    expect(JSON.stringify(result.blocks)).not.toContain(binaryData.content);
   });
 });
 

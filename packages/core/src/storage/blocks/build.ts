@@ -1,8 +1,14 @@
 import type {
+  ContentKind,
   DataBlockManifest,
   DataBlockWarning,
   DataScopeBlock,
 } from "./types.js";
+import {
+  BINARY_ENCODING,
+  BINARY_MARKER,
+  type BinaryEnvelopeData,
+} from "../../contracts/binary.js";
 
 export type {
   ContentKind,
@@ -55,6 +61,7 @@ export function buildDataBlocks(
   const rawSizeBytes = estimateRawSize(input.content);
   const classified = classifyContent(input.content, input.mediaType);
   const blocks: DataBlockPayload[] = [];
+  let contentKind: ContentKind = classified.kind;
 
   if (classified.kind === "json" || classified.kind === "vana-envelope") {
     const json = classified.value;
@@ -63,7 +70,18 @@ export function buildDataBlocks(
       if (Object.keys(metadata).length > 0) {
         addJsonBlocks(blocks, "$.__envelope", metadata, options);
       }
-      addJsonBlocks(blocks, "$.data", json["data"], options);
+      const binaryData = parseBinaryEnvelopeData(json["data"]);
+      if (binaryData) {
+        contentKind = contentKindForBinaryEnvelope(binaryData);
+        addBinaryEnvelopeBlock(blocks, "$.data", binaryData);
+        warnings.push({
+          code: `${contentKind}_metadata_only`,
+          message: `${contentKind} content is represented as metadata only`,
+          path: "$.data",
+        });
+      } else {
+        addJsonBlocks(blocks, "$.data", json["data"], options);
+      }
     } else {
       addJsonBlocks(blocks, "$", json, options);
     }
@@ -90,7 +108,7 @@ export function buildDataBlocks(
     scope: input.scope,
     collectedAt: input.collectedAt,
     ...(input.schemaId ? { schemaId: input.schemaId } : {}),
-    contentKind: classified.kind,
+    contentKind,
     rawSizeBytes,
     blocks: blocksWithIds.map(({ id, path, mediaType, sizeBytes }) => ({
       id,
@@ -103,6 +121,43 @@ export function buildDataBlocks(
   };
 
   return { manifest, blocks: blocksWithIds };
+}
+
+function parseBinaryEnvelopeData(value: unknown): BinaryEnvelopeData | null {
+  if (!isPlainObject(value) || value[BINARY_MARKER] !== true) return null;
+  if (value.encoding !== BINARY_ENCODING) return null;
+  if (typeof value.content !== "string") return null;
+  if (typeof value.mimeType !== "string") return null;
+  if (typeof value.sizeBytes !== "number") return null;
+  if (typeof value.contentHash !== "string") return null;
+  return value as unknown as BinaryEnvelopeData;
+}
+
+function contentKindForBinaryEnvelope(data: BinaryEnvelopeData): ContentKind {
+  const mimeType = data.mimeType.toLowerCase();
+  const filename = data.filename?.toLowerCase() ?? "";
+  return mimeType.includes("zip") || filename.endsWith(".zip")
+    ? "zip"
+    : "binary";
+}
+
+function addBinaryEnvelopeBlock(
+  blocks: DataBlockPayload[],
+  path: string,
+  data: BinaryEnvelopeData,
+): void {
+  blocks.push(
+    createPayload(path, JSON_MEDIA_TYPE, {
+      contentKind: contentKindForBinaryEnvelope(data),
+      mimeType: data.mimeType,
+      ...(data.filename ? { filename: data.filename } : {}),
+      sizeBytes: data.sizeBytes,
+      contentHash: data.contentHash,
+      ...(data.metadata !== undefined ? { metadata: data.metadata } : {}),
+      searchable: false,
+      rawContentAvailable: true,
+    }),
+  );
 }
 
 function classifyContent(
