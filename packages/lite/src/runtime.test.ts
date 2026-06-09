@@ -249,6 +249,67 @@ describe("createPsLiteRuntime", () => {
     expect(storage.listScopes({ limit: 20, offset: 0 }).total).toBe(0);
   });
 
+  it("auto-registers a no-schema for binary uploads to a novel scope", async () => {
+    // Regression: PS-Lite must register a "no-schema" for binary scopes that
+    // lack one (like the Node server). Without the wired registrar the sync
+    // upload worker later fails with "No schema found for scope".
+    const signSchemaRegistration = vi.fn().mockResolvedValue("0xschemasig");
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ data: { schemaId: "0xnoschema" } }), {
+        headers: { "Content-Type": "application/json" },
+        status: 200,
+      }),
+    );
+
+    try {
+      const runtime = createTestRuntime({
+        active: true,
+        auth: createBearerTokenPsLiteAuth({
+          builderToken: "builder-token",
+          ownerToken: "owner-token",
+        }),
+        config: { gateway: { url: "https://gw.test" } },
+        gateway: {
+          ...createMockPsLiteGateway(),
+          async getSchemaForScope() {
+            return null;
+          },
+        },
+        serverSigner: {
+          address: "0x1111111111111111111111111111111111111111",
+          signFileRegistration: vi.fn(),
+          signGrantRegistration: vi.fn(),
+          signSchemaRegistration,
+        },
+        storage: createMemoryPsLiteStorage(),
+      });
+
+      const res = await runtime.fetch(
+        new Request("https://ps.local/v1/data/dexa.scan", {
+          body: new Uint8Array([1, 2, 3]),
+          headers: {
+            Authorization: "Bearer owner-token",
+            "Content-Type": "application/octet-stream",
+            "X-Filename": "scan.bin",
+          },
+          method: "POST",
+        }),
+      );
+
+      expect(res.status).toBe(201);
+      expect(signSchemaRegistration).toHaveBeenCalledTimes(1);
+      expect(signSchemaRegistration.mock.calls[0][0]).toMatchObject({
+        scope: "dexa.scan",
+      });
+      expect(fetchMock).toHaveBeenCalledWith(
+        "https://gw.test/v1/schemas",
+        expect.objectContaining({ method: "POST" }),
+      );
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
   it("stores and reads data through the ps-lite data contract", async () => {
     const runtime = createTestRuntime({
       storage: createMemoryPsLiteStorage(),
