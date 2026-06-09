@@ -9,7 +9,7 @@ import {
 import type { SyncCursor } from "../cursor.js";
 import type { Logger } from "../../logger/index.js";
 import type { DataStoragePort } from "../../ports/index.js";
-import { buildDataBlocks } from "../../storage/blocks/build.js";
+import { buildDataBlocksAsync } from "../../storage/blocks/build.js";
 import {
   classifySyncFailure,
   inferPayloadKind,
@@ -438,7 +438,7 @@ async function writeBlockSidecars(
 
   diagnostics?.onManifestBuildStart(record.fileId, envelope.scope);
   try {
-    const built = buildDataBlocks({
+    const built = await buildDataBlocksAsync({
       scope: envelope.scope,
       collectedAt: envelope.collectedAt,
       schemaId: record.schemaId,

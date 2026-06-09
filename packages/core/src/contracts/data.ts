@@ -6,7 +6,7 @@ import {
 } from "@opendatalabs/vana-sdk/browser";
 import { type WriteResult } from "../storage/hierarchy/index.js";
 import { buildBinaryEnvelopeData, sha256Hex } from "./binary.js";
-import { buildDataBlocks } from "../storage/blocks/build.js";
+import { buildDataBlocksAsync } from "../storage/blocks/build.js";
 
 export type DataContractErrorCode =
   | "INVALID_SCOPE"
@@ -402,7 +402,7 @@ async function writeBlockSidecars(
 ): Promise<void> {
   if (!storage.writeBlockManifest) return;
 
-  const built = buildDataBlocks({
+  const built = await buildDataBlocksAsync({
     scope: envelope.scope,
     collectedAt: envelope.collectedAt,
     schemaId: envelope.schemaId,

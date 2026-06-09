@@ -54,9 +54,16 @@ export interface McpToolDefinition {
   ): Promise<McpToolResult>;
 }
 
+const STRUCTURED_CONTENT_TEXT_LIMIT_BYTES = 64 * 1024;
+const resultTextEncoder = new TextEncoder();
+
 function textResult(value: unknown, isError = false): McpToolResult {
+  const text =
+    typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  const textBytes = resultTextEncoder.encode(text).byteLength;
   const structuredContent =
     !isError &&
+    textBytes <= STRUCTURED_CONTENT_TEXT_LIMIT_BYTES &&
     typeof value === "object" &&
     value !== null &&
     !Array.isArray(value)
@@ -66,8 +73,7 @@ function textResult(value: unknown, isError = false): McpToolResult {
     content: [
       {
         type: "text",
-        text:
-          typeof value === "string" ? value : JSON.stringify(value, null, 2),
+        text,
       },
     ],
     ...(structuredContent ? { structuredContent } : {}),
@@ -110,7 +116,7 @@ const DEFAULT_SEARCH_TIMEOUT_MS = 30_000;
 const MAX_SEARCH_TIMEOUT_MS = 300_000;
 const DEFAULT_SEARCH_DISCOVERY_TIMEOUT_MS = 2_000;
 const MAX_SEARCH_TOTAL_TIMEOUT_MS = 300_000;
-const DEFAULT_READ_SCOPE_MAX_BYTES = 256 * 1024;
+const DEFAULT_READ_SCOPE_MAX_BYTES = 64 * 1024;
 const MAX_READ_SCOPE_MAX_BYTES = 5 * 1024 * 1024;
 const DEFAULT_READ_SCOPE_TIMEOUT_MS = 60_000;
 const MAX_READ_SCOPE_TIMEOUT_MS = 300_000;
@@ -1135,6 +1141,8 @@ const searchPersonalContext: McpToolDefinition = {
     return textResult({
       query,
       results: matches,
+      // Backward-compatible alias for existing clients/tests. `results` is the
+      // canonical field, but removing `matches` is a separate migration.
       matches,
       searchedScopes,
       skippedScopes: [
