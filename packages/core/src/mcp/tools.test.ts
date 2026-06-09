@@ -108,9 +108,14 @@ describe("mcp/tools", () => {
     const snapshot = activityRecorder.snapshot();
     expect(snapshot.total).toBe(1);
     expect(snapshot.events[0]).toMatchObject({
+      phase: "response_ready",
       status: "succeeded",
       tool: "list_granted_scopes",
     });
+    expect(typeof snapshot.events[0].handlerDurationMs).toBe("number");
+    expect(typeof snapshot.events[0].durationMs).toBe("number");
+    expect(snapshot.events[0].payloadBytes).toBeGreaterThan(0);
+    expect(snapshot.events[0].textBytes).toBeGreaterThan(0);
   });
 
   it("MCP HTTP dispatcher returns a typed timeout for stalled tool handlers", async () => {

@@ -17,13 +17,24 @@ export type McpActivityStatus =
   | "timed_out"
   | "aborted";
 
+export type McpActivityPhase =
+  | "tool_running"
+  | "response_preparing"
+  | "response_ready";
+
 export interface McpActivityEvent {
   id: string;
   tool: string;
   status: McpActivityStatus;
+  /** Current server-side phase. This is PS-side only, not a client receipt ack. */
+  phase: McpActivityPhase;
   startedAt: string;
   finishedAt?: string;
   durationMs?: number;
+  handlerDurationMs?: number;
+  payloadBytes?: number;
+  textBytes?: number;
+  structuredContentBytes?: number;
   /** Scopes involved in the call, where applicable. */
   scopes?: string[];
   /** Clipped query preview for search calls only. */
@@ -66,6 +77,7 @@ export class McpActivityRecorder {
       id,
       tool: params.tool,
       status: "running",
+      phase: "tool_running",
       startedAt: new Date().toISOString(),
       ...(params.scopes && params.scopes.length > 0
         ? { scopes: params.scopes }
@@ -92,11 +104,38 @@ export class McpActivityRecorder {
     return id;
   }
 
+  /** Update metadata for an in-flight call. No-op if the id is not found. */
+  update(
+    id: string,
+    patch: Partial<
+      Pick<
+        McpActivityEvent,
+        | "phase"
+        | "handlerDurationMs"
+        | "payloadBytes"
+        | "textBytes"
+        | "structuredContentBytes"
+        | "resultCount"
+        | "skippedCount"
+        | "errorCode"
+        | "errorMessage"
+      >
+    >,
+  ): void {
+    const event = this._events.find((e) => e.id === id);
+    if (!event) return;
+    Object.assign(event, patch);
+  }
+
   /** Finish a running call by id. No-op if the id is not found. */
   finish(
     id: string,
     result: {
       status: Exclude<McpActivityStatus, "running">;
+      handlerDurationMs?: number;
+      payloadBytes?: number;
+      textBytes?: number;
+      structuredContentBytes?: number;
       resultCount?: number;
       skippedCount?: number;
       errorCode?: string;
@@ -108,8 +147,21 @@ export class McpActivityRecorder {
     const finishedAt = new Date().toISOString();
     const durationMs = Date.parse(finishedAt) - Date.parse(event.startedAt);
     event.status = result.status;
+    event.phase = "response_ready";
     event.finishedAt = finishedAt;
     event.durationMs = durationMs;
+    if (result.handlerDurationMs !== undefined) {
+      event.handlerDurationMs = result.handlerDurationMs;
+    }
+    if (result.payloadBytes !== undefined) {
+      event.payloadBytes = result.payloadBytes;
+    }
+    if (result.textBytes !== undefined) {
+      event.textBytes = result.textBytes;
+    }
+    if (result.structuredContentBytes !== undefined) {
+      event.structuredContentBytes = result.structuredContentBytes;
+    }
     if (result.resultCount !== undefined) {
       event.resultCount = result.resultCount;
     }

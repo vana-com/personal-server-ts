@@ -1425,9 +1425,13 @@ async function handleMcpRoute(input: {
       readClient,
       activityRecorder: input.activityRecorder,
     });
-    await input.store.update(record.id, {
-      lastUsedAt: input.now().toISOString(),
-    });
+    void input.store
+      .update(record.id, {
+        lastUsedAt: input.now().toISOString(),
+      })
+      .catch((err) => {
+        console.warn("[mcp] failed to update lastUsedAt", err);
+      });
     return response;
   }
 

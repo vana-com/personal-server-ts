@@ -731,9 +731,13 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       readClient,
       activityRecorder: deps.activityRecorder,
     });
-    await store.update(record.id, {
-      lastUsedAt: new Date().toISOString(),
-    });
+    void store
+      .update(record.id, {
+        lastUsedAt: new Date().toISOString(),
+      })
+      .catch((err) => {
+        console.warn("[mcp] failed to update lastUsedAt", err);
+      });
     return response;
   }
 
