@@ -2,7 +2,7 @@
  * MCP tool surface. Phase 1 / §4 of 260604-PLAN-vana-mcp-personal-server.md.
  *
  * Read-only, small, and only over scopes that the connection's grants cover.
- * No write tools. No grant-management tools. No raw owner/admin status tools.
+ * No write tools. No grant-approval tools. No raw owner/admin status tools.
  *
  * Every tool that returns data first picks a covering grant from the
  * connection's grant list, signs a Web3Signed request as the per-connection
@@ -130,6 +130,22 @@ function uniqueSources(connection: McpConnectionRecord): string[] {
     }
   }
   return Array.from(set).sort();
+}
+
+function normalizeScopeListInput(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const scopes: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of value) {
+    if (typeof raw !== "string") continue;
+    const scope = raw.trim();
+    if (!scope || scope.length > SEARCH_SCOPE_MAX_CHARS || seen.has(scope)) {
+      continue;
+    }
+    seen.add(scope);
+    scopes.push(scope);
+  }
+  return scopes;
 }
 
 const DEFAULT_SEARCH_LIMIT = 5;
@@ -624,6 +640,53 @@ const listGrantedScopes: McpToolDefinition = {
       }),
     );
     return textResult({ scopes: scopeEntries });
+  },
+};
+
+const requestScopeAccess: McpToolDefinition = {
+  name: "request_scope_access",
+  title: "Request scope access",
+  description:
+    "Check which requested scopes are missing from this MCP grant and tell the user to approve them in Vana.",
+  inputSchema: {
+    scopes: z
+      .array(z.string().min(1).max(SEARCH_SCOPE_MAX_CHARS))
+      .min(1)
+      .max(SEARCH_REQUESTED_SCOPES_LIMIT)
+      .describe("Exact scope ids the MCP client wants to read."),
+    reason: z
+      .string()
+      .max(500)
+      .optional()
+      .describe("Brief reason to show the user."),
+  },
+  async handler(args, { connection }) {
+    const requestedScopes = normalizeScopeListInput(args.scopes);
+    const grantedRequestedScopes = requestedScopes.filter((scope) =>
+      Boolean(resolveGrantForScope(connection, scope)),
+    );
+    const missingScopes = requestedScopes.filter(
+      (scope) => !resolveGrantForScope(connection, scope),
+    );
+    const reason = typeof args.reason === "string" ? args.reason.trim() : "";
+    const approvalRequired = missingScopes.length > 0;
+
+    return textResult({
+      approvalRequired,
+      client: {
+        id: connection.id,
+        displayName: connection.displayName,
+        status: connection.status,
+      },
+      requestedScopes,
+      grantedRequestedScopes,
+      missingScopes,
+      grantedScopes: uniqueScopes(connection),
+      reason: reason || undefined,
+      nextAction: approvalRequired
+        ? "Ask the user to open Vana's Personal Server page and add the missing scopes to this MCP client. This tool cannot grant access by itself."
+        : "No new grant is needed for the requested scopes.",
+    });
   },
 };
 
@@ -1356,6 +1419,7 @@ const getScopeFile: McpToolDefinition = {
 export const MCP_TOOLS: readonly McpToolDefinition[] = [
   listGrantedSources,
   listGrantedScopes,
+  requestScopeAccess,
   readScope,
   getScopeFile,
   searchPersonalContext,

@@ -76,7 +76,7 @@ describe("mcp/tools", () => {
     expect(response.status).toBe(200);
     const body = await response.text();
     expect(() => JSON.parse(body)).not.toThrow();
-    expect(new TextEncoder().encode(body).byteLength).toBeLessThan(3000);
+    expect(new TextEncoder().encode(body).byteLength).toBeLessThan(4000);
   });
 
   it("records activity for MCP HTTP tool calls", async () => {
@@ -228,6 +228,63 @@ describe("mcp/tools", () => {
     });
     expect(result.structuredContent).toEqual({
       sources: ["chatgpt", "instagram"],
+    });
+  });
+
+  it("request_scope_access reports missing scopes without granting access", async () => {
+    const result = await getTool("request_scope_access").handler(
+      {
+        scopes: [
+          "instagram.profile",
+          "chatgpt.conversations",
+          "chatgpt.history",
+        ],
+        reason: "Use ChatGPT history for the requested analysis.",
+      },
+      {
+        connection: createConnection(),
+        readClient: createMinimalReadClient(),
+      },
+    );
+
+    expect(result.isError).not.toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      approvalRequired: true,
+      client: {
+        id: "conn-1",
+        displayName: "Test client",
+        status: "approved",
+      },
+      requestedScopes: [
+        "instagram.profile",
+        "chatgpt.conversations",
+        "chatgpt.history",
+      ],
+      grantedRequestedScopes: ["instagram.profile", "chatgpt.history"],
+      missingScopes: ["chatgpt.conversations"],
+      nextAction: expect.stringContaining("cannot grant access by itself"),
+    });
+    expect(result.structuredContent).toMatchObject({
+      approvalRequired: true,
+      missingScopes: ["chatgpt.conversations"],
+    });
+  });
+
+  it("request_scope_access reports when requested scopes are already granted", async () => {
+    const result = await getTool("request_scope_access").handler(
+      { scopes: ["instagram.profile", "chatgpt.history"] },
+      {
+        connection: createConnection(),
+        readClient: createMinimalReadClient(),
+      },
+    );
+
+    expect(result.isError).not.toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      approvalRequired: false,
+      missingScopes: [],
+      grantedRequestedScopes: ["instagram.profile", "chatgpt.history"],
+      nextAction: "No new grant is needed for the requested scopes.",
     });
   });
 
