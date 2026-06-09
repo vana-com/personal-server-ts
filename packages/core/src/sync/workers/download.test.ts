@@ -156,6 +156,47 @@ describe("download worker", () => {
       expect(deps.storageAdapter.download).not.toHaveBeenCalled();
     });
 
+    it("records downloaded payload metadata when OpenPGP parsing fails", async () => {
+      const deps = makeMockDeps();
+      const htmlPayload = new TextEncoder().encode("<html>not pgp</html>");
+      (
+        deps.storageAdapter.download as ReturnType<typeof vi.fn>
+      ).mockResolvedValue(htmlPayload);
+      (decryptWithPassword as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new Error("Armored OpenPGP message could not be parsed"),
+      );
+      deps.diagnostics = {
+        onDownloadStart: vi.fn(),
+        onDownloadEnd: vi.fn(),
+        onDownloadError: vi.fn(),
+        onDecryptStart: vi.fn(),
+        onDecryptEnd: vi.fn(),
+        onDecryptError: vi.fn(),
+        onIndexStart: vi.fn(),
+        onIndexEnd: vi.fn(),
+        onIndexError: vi.fn(),
+        onManifestBuildStart: vi.fn(),
+        onManifestBuildEnd: vi.fn(),
+        onManifestBuildError: vi.fn(),
+        onRepair: vi.fn(),
+      };
+
+      await expect(downloadOne(deps, makeFileRecord())).rejects.toThrow(
+        "Armored OpenPGP message could not be parsed",
+      );
+
+      expect(deps.diagnostics.onDecryptError).toHaveBeenCalledWith(
+        FILE_ID,
+        SCOPE,
+        expect.stringContaining("payloadKind=html"),
+      );
+      expect(deps.diagnostics.onDecryptError).toHaveBeenCalledWith(
+        FILE_ID,
+        SCOPE,
+        expect.stringContaining(`encryptedSizeBytes=${htmlPayload.byteLength}`),
+      );
+    });
+
     it("backfills missing block sidecars when fileId is already indexed", async () => {
       const deps = makeMockDeps();
       const existingEntry: IndexEntry = {
@@ -665,7 +706,10 @@ describe("download worker", () => {
         expect.objectContaining({
           fileId: "file-002",
           schemaId: SCHEMA_ID,
+          scope: SCOPE,
           stage: "decrypt",
+          payloadKind: "unknown",
+          encryptedSizeBytes: 2,
           errorClass: "Error",
           message: "Encrypted payload could not be decrypted",
         }),
