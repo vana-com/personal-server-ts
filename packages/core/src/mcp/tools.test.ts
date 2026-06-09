@@ -298,7 +298,7 @@ describe("mcp/tools", () => {
     });
   });
 
-  it("get_scope_file returns raw binary data as an MCP resource blob", async () => {
+  it("get_scope_file defaults to a resource link without embedding raw bytes", async () => {
     const readRawScopeFile = vi.fn().mockResolvedValue({
       status: 200,
       scope: "manual.document",
@@ -327,6 +327,47 @@ describe("mcp/tools", () => {
       at: undefined,
       fileId: undefined,
     });
+    expect(result.content).toContainEqual(
+      expect.objectContaining({
+        type: "resource_link",
+        uri: "vana://scope/manual.document/raw",
+        mimeType: "application/pdf",
+        size: 4,
+      }),
+    );
+    expect(result.content).not.toContainEqual(
+      expect.objectContaining({ type: "resource" }),
+    );
+    expect(result.structuredContent).toMatchObject({
+      scope: "manual.document",
+      resourceUri: "vana://scope/manual.document/raw",
+      contentIncluded: false,
+    });
+  });
+
+  it("get_scope_file embeds raw binary data when includeContent is true", async () => {
+    const readRawScopeFile = vi.fn().mockResolvedValue({
+      status: 200,
+      scope: "manual.document",
+      collectedAt: "2026-06-05T00:00:00Z",
+      fileId: "file-1",
+      mimeType: "application/pdf",
+      filename: "scan.pdf",
+      sizeBytes: 4,
+      contentBase64: "JVBERg==",
+    });
+    const result = await getTool("get_scope_file").handler(
+      { scope: "manual.document", includeContent: true },
+      {
+        connection: {
+          ...createConnection(),
+          grants: [{ grantId: "grant-3", scopes: ["manual.document"] }],
+        },
+        readClient: createMinimalReadClient({ readRawScopeFile }),
+      },
+    );
+
+    expect(result.isError).not.toBe(true);
     expect(result.content).toContainEqual(
       expect.objectContaining({
         type: "resource",
