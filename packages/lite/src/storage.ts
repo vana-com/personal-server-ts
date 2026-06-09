@@ -306,8 +306,11 @@ async function writeJsonOpfsFile(
 ): Promise<void> {
   const handle = await getOpfsFileHandle(root, path, { create: true });
   const writable = await handle.createWritable();
-  await writable.write(JSON.stringify(value));
-  await writable.close();
+  try {
+    await writable.write(JSON.stringify(value));
+  } finally {
+    await writable.close();
+  }
 }
 
 async function removeOpfsDirectoryTree(
@@ -622,14 +625,12 @@ export async function createPersistentPsLiteStorage(
         throw new Error("Block sidecar storage is not available");
       }
       await fileStore.deleteBlockTree?.(blockTreePath(scope, collectedAt));
-      await Promise.all(
-        blocks.map((block) =>
-          fileStore.writeBlockPayload!(
-            blockPayloadPath(scope, collectedAt, block.id),
-            block,
-          ),
-        ),
-      );
+      for (const block of blocks) {
+        await fileStore.writeBlockPayload(
+          blockPayloadPath(scope, collectedAt, block.id),
+          block,
+        );
+      }
       await fileStore.writeBlockManifest(
         blockManifestPath(scope, collectedAt),
         manifest,
