@@ -47,6 +47,14 @@ import type {
 } from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../signing/index.js";
 
+export {
+  createSchemaRegistrar,
+  NO_SCHEMA_DEFINITION_URL,
+  NO_SCHEMA_DIALECT,
+  NO_SCHEMA_NAME,
+  type SchemaRegistrarDeps,
+} from "./schema-registrar.js";
+
 export interface PersonalServerReadAuthInput {
   request: Request;
   scope: string;
