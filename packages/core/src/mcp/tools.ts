@@ -1184,7 +1184,7 @@ const getScopeFile: McpToolDefinition = {
   name: "get_scope_file",
   title: "Get scope file",
   description:
-    "Fetch original bytes for an approved file/PDF scope. Use search for extracted text.",
+    "Fetch an approved file/PDF scope. Defaults to metadata plus a resource link; set includeContent=true only when the client supports inline resource blobs. Use search_personal_context for extracted text.",
   inputSchema: {
     ...rawScopeFileInputSchema,
     timeoutMs: z
@@ -1217,7 +1217,7 @@ const getScopeFile: McpToolDefinition = {
     const at = typeof args.at === "string" ? args.at : undefined;
     const fileId = typeof args.fileId === "string" ? args.fileId : undefined;
     const includeContent =
-      typeof args.includeContent === "boolean" ? args.includeContent : true;
+      typeof args.includeContent === "boolean" ? args.includeContent : false;
     const maxBytes = clampInteger(
       args.maxBytes,
       DEFAULT_READ_FILE_MAX_BYTES,
