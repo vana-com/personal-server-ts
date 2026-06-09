@@ -1,8 +1,15 @@
 import type {
+  ContentKind,
   DataBlockManifest,
   DataBlockWarning,
   DataScopeBlock,
 } from "./types.js";
+import {
+  base64ToBytes,
+  BINARY_ENCODING,
+  BINARY_MARKER,
+  type BinaryEnvelopeData,
+} from "../../contracts/binary.js";
 
 export type {
   ContentKind,
@@ -43,6 +50,19 @@ const textEncoder = new TextEncoder();
 export function buildDataBlocks(
   input: BuildDataBlocksInput,
 ): BuildDataBlocksResult {
+  return buildDataBlocksInternal(input);
+}
+
+export async function buildDataBlocksAsync(
+  input: BuildDataBlocksInput,
+): Promise<BuildDataBlocksResult> {
+  return buildDataBlocksInternal(input, await extractBinaryEnvelopeText(input));
+}
+
+function buildDataBlocksInternal(
+  input: BuildDataBlocksInput,
+  extractedBinaryText?: ExtractedBinaryText,
+): BuildDataBlocksResult {
   const maxBytes = Math.max(1, input.maxBlockBytes ?? DEFAULT_MAX_BLOCK_BYTES);
   const options = {
     targetBytes: Math.min(
@@ -55,6 +75,7 @@ export function buildDataBlocks(
   const rawSizeBytes = estimateRawSize(input.content);
   const classified = classifyContent(input.content, input.mediaType);
   const blocks: DataBlockPayload[] = [];
+  let contentKind: ContentKind = classified.kind;
 
   if (classified.kind === "json" || classified.kind === "vana-envelope") {
     const json = classified.value;
@@ -63,7 +84,26 @@ export function buildDataBlocks(
       if (Object.keys(metadata).length > 0) {
         addJsonBlocks(blocks, "$.__envelope", metadata, options);
       }
-      addJsonBlocks(blocks, "$.data", json["data"], options);
+      const binaryData = parseBinaryEnvelopeData(json["data"]);
+      if (binaryData) {
+        contentKind = contentKindForBinaryEnvelope(binaryData);
+        const extractedText = extractedBinaryText?.text?.trim();
+        addBinaryEnvelopeBlock(blocks, "$.data", binaryData, {
+          extractedTextAvailable: Boolean(extractedText),
+        });
+        if (extractedText) {
+          addTextBlocks(blocks, "$.data.text", extractedText, options);
+        } else {
+          warnings.push({
+            code: `${contentKind}_metadata_only`,
+            message: `${contentKind} content is represented as metadata only`,
+            path: "$.data",
+          });
+        }
+        warnings.push(...(extractedBinaryText?.warnings ?? []));
+      } else {
+        addJsonBlocks(blocks, "$.data", json["data"], options);
+      }
     } else {
       addJsonBlocks(blocks, "$", json, options);
     }
@@ -90,7 +130,7 @@ export function buildDataBlocks(
     scope: input.scope,
     collectedAt: input.collectedAt,
     ...(input.schemaId ? { schemaId: input.schemaId } : {}),
-    contentKind: classified.kind,
+    contentKind,
     rawSizeBytes,
     blocks: blocksWithIds.map(({ id, path, mediaType, sizeBytes }) => ({
       id,
@@ -103,6 +143,109 @@ export function buildDataBlocks(
   };
 
   return { manifest, blocks: blocksWithIds };
+}
+
+interface ExtractedBinaryText {
+  text?: string;
+  warnings: DataBlockWarning[];
+}
+
+async function extractBinaryEnvelopeText(
+  input: BuildDataBlocksInput,
+): Promise<ExtractedBinaryText | undefined> {
+  const classified = classifyContent(input.content, input.mediaType);
+  if (classified.kind !== "vana-envelope" || !isPlainObject(classified.value)) {
+    return undefined;
+  }
+
+  const binaryData = parseBinaryEnvelopeData(classified.value["data"]);
+  if (!binaryData || !isPdfBinaryEnvelope(binaryData)) return undefined;
+
+  try {
+    const { extractText } = await import("unpdf");
+    const extracted = await extractText(base64ToBytes(binaryData.content), {
+      mergePages: true,
+    });
+    const text = normalizeExtractedText(extracted.text);
+    if (text === "") {
+      return {
+        warnings: [
+          {
+            code: "pdf_text_empty",
+            message: "PDF text extraction found no readable text",
+            path: "$.data",
+          },
+        ],
+      };
+    }
+    return { text, warnings: [] };
+  } catch (error) {
+    return {
+      warnings: [
+        {
+          code: "pdf_text_extraction_failed",
+          message: `PDF text extraction failed: ${errorMessage(error)}`,
+          path: "$.data",
+        },
+      ],
+    };
+  }
+}
+
+function parseBinaryEnvelopeData(value: unknown): BinaryEnvelopeData | null {
+  if (!isPlainObject(value) || value[BINARY_MARKER] !== true) return null;
+  if (value.encoding !== BINARY_ENCODING) return null;
+  if (typeof value.content !== "string") return null;
+  if (typeof value.mimeType !== "string") return null;
+  if (typeof value.sizeBytes !== "number") return null;
+  if (typeof value.contentHash !== "string") return null;
+  return value as unknown as BinaryEnvelopeData;
+}
+
+function contentKindForBinaryEnvelope(data: BinaryEnvelopeData): ContentKind {
+  const mimeType = data.mimeType.toLowerCase();
+  const filename = data.filename?.toLowerCase() ?? "";
+  return mimeType.includes("zip") || filename.endsWith(".zip")
+    ? "zip"
+    : "binary";
+}
+
+function isPdfBinaryEnvelope(data: BinaryEnvelopeData): boolean {
+  const mimeType = data.mimeType.toLowerCase();
+  const filename = data.filename?.toLowerCase() ?? "";
+  return mimeType.includes("pdf") || filename.endsWith(".pdf");
+}
+
+function addBinaryEnvelopeBlock(
+  blocks: DataBlockPayload[],
+  path: string,
+  data: BinaryEnvelopeData,
+  options: { extractedTextAvailable?: boolean } = {},
+): void {
+  blocks.push(
+    createPayload(path, JSON_MEDIA_TYPE, {
+      contentKind: contentKindForBinaryEnvelope(data),
+      mimeType: data.mimeType,
+      ...(data.filename ? { filename: data.filename } : {}),
+      sizeBytes: data.sizeBytes,
+      contentHash: data.contentHash,
+      ...(data.metadata !== undefined ? { metadata: data.metadata } : {}),
+      searchable: options.extractedTextAvailable === true,
+      extractedTextAvailable: options.extractedTextAvailable === true,
+      rawContentAvailable: true,
+    }),
+  );
+}
+
+function normalizeExtractedText(value: string): string {
+  return value
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .trim();
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function classifyContent(
