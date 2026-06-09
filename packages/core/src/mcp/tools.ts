@@ -16,6 +16,11 @@ import type { McpDataReadClient } from "./read-client.js";
 import { McpDataReadError } from "./read-client.js";
 import type { McpActivityRecorder } from "./activity.js";
 import { MiniSearchIndex, type SearchDocument } from "./search/index.js";
+import {
+  rawScopeFileInputSchema,
+  rawScopeMetadata,
+  rawScopeResourceUri,
+} from "./resources.js";
 
 export interface McpToolContext {
   connection: McpConnectionRecord;
@@ -23,10 +28,29 @@ export interface McpToolContext {
   activityRecorder?: McpActivityRecorder;
 }
 
-export interface McpToolResultContent {
-  type: "text";
-  text: string;
-}
+export type McpToolResultContent =
+  | {
+      type: "text";
+      text: string;
+    }
+  | {
+      type: "resource_link";
+      uri: string;
+      name: string;
+      title?: string;
+      description?: string;
+      mimeType?: string;
+      size?: number;
+    }
+  | {
+      type: "resource";
+      resource: {
+        uri: string;
+        mimeType?: string;
+        blob: string;
+        _meta?: Record<string, unknown>;
+      };
+    };
 
 export interface McpToolResult {
   content: McpToolResultContent[];
@@ -110,8 +134,8 @@ function uniqueSources(connection: McpConnectionRecord): string[] {
 
 const DEFAULT_SEARCH_LIMIT = 5;
 const MAX_SEARCH_LIMIT = 50;
-const DEFAULT_SEARCH_MAX_SCOPES = 10;
-const MAX_SEARCH_SCOPES = 50;
+const MAX_SEARCH_SCOPES = 200;
+const DEFAULT_SEARCH_MAX_SCOPES = MAX_SEARCH_SCOPES;
 const DEFAULT_SEARCH_TIMEOUT_MS = 30_000;
 const MAX_SEARCH_TIMEOUT_MS = 300_000;
 const DEFAULT_SEARCH_DISCOVERY_TIMEOUT_MS = 2_000;
@@ -120,6 +144,10 @@ const DEFAULT_READ_SCOPE_MAX_BYTES = 64 * 1024;
 const MAX_READ_SCOPE_MAX_BYTES = 5 * 1024 * 1024;
 const DEFAULT_READ_SCOPE_TIMEOUT_MS = 60_000;
 const MAX_READ_SCOPE_TIMEOUT_MS = 300_000;
+const DEFAULT_READ_FILE_TIMEOUT_MS = 60_000;
+const MAX_READ_FILE_TIMEOUT_MS = 300_000;
+const DEFAULT_READ_FILE_MAX_BYTES = 10 * 1024 * 1024;
+const MAX_READ_FILE_MAX_BYTES = 25 * 1024 * 1024;
 const DEFAULT_SEARCH_MAX_BYTES = 64 * 1024;
 const MAX_SEARCH_MAX_BYTES = 1024 * 1024;
 const DEFAULT_SCOPE_METADATA_TIMEOUT_MS = 2_000;
@@ -541,7 +569,7 @@ const listGrantedScopes: McpToolDefinition = {
   name: "list_granted_scopes",
   title: "List granted scopes",
   description:
-    "List granted scopes with dataStatus, sizeClass, sizeBytes, and recommendedAccess ('read' for small scopes, 'search' for large/huge scopes, 'wait' while indexing). Call first, then follow recommendedAccess.",
+    "List granted scopes, readiness, size, and recommendedAccess. Call first.",
   inputSchema: {},
   async handler(_args, { connection, readClient }) {
     const grantedScopes = uniqueScopes(connection);
@@ -603,12 +631,9 @@ const readScope: McpToolDefinition = {
   name: "read_scope",
   title: "Read scope",
   description:
-    "Read one full approved scope as bounded blocks. Best for tiny/small/medium scopes (see sizeClass from list_granted_scopes). For large/huge scopes prefer search_personal_context — a full read returns many pages you must walk via nextCursor and is slow. The response includes a `guidance` hint when a scope is large enough that search is the better tool.",
+    "Read approved scope blocks. Best for small scopes. Use nextCursor for more pages; prefer search for large scopes.",
   inputSchema: {
-    scope: z
-      .string()
-      .min(1)
-      .describe("Exact scope id, e.g. 'instagram.profile'."),
+    scope: z.string().min(1).describe("Exact scope id."),
     cursor: z.string().min(1).optional(),
     maxBytes: z.number().int().min(1).max(MAX_READ_SCOPE_MAX_BYTES).optional(),
     timeoutMs: z
@@ -616,10 +641,7 @@ const readScope: McpToolDefinition = {
       .int()
       .min(1000)
       .max(MAX_READ_SCOPE_TIMEOUT_MS)
-      .optional()
-      .describe(
-        "Wall-clock read budget in ms. Capped at 300000 by the server.",
-      ),
+      .optional(),
   },
   async handler(args, { connection, readClient }) {
     const scope = typeof args.scope === "string" ? args.scope : null;
@@ -824,30 +846,18 @@ const searchPersonalContext: McpToolDefinition = {
   name: "search_personal_context",
   title: "Search personal context",
   description:
-    "Search approved scopes by keyword — the preferred way to pull from large/huge scopes without reading every page. Omit scopes to sweep all small ready data; name scopes (including large ones) to target them. Continue with nextSearchCursor.",
+    "Search approved scopes. Omit scopes for default sweep; name scopes for targeted search. Continue with nextSearchCursor.",
   inputSchema: {
     query: z.string().min(1).max(SEARCH_QUERY_MAX_CHARS),
     scopes: z
       .array(z.string().min(1).max(SEARCH_SCOPE_MAX_CHARS))
       .max(SEARCH_REQUESTED_SCOPES_LIMIT)
       .optional(),
-    cursor: z
-      .string()
-      .min(1)
-      .optional()
-      .describe(
-        "Continuation cursor from a prior search response's nextSearchCursor.",
-      ),
+    cursor: z.string().min(1).optional(),
     maxResults: z.number().int().min(1).max(MAX_SEARCH_LIMIT).optional(),
     limit: z.number().int().min(1).max(MAX_SEARCH_LIMIT).optional(),
     maxScopes: z.number().int().min(1).max(MAX_SEARCH_SCOPES).optional(),
-    timeoutMs: z
-      .number()
-      .int()
-      .min(1000)
-      .max(MAX_SEARCH_TIMEOUT_MS)
-      .optional()
-      .describe("Wall-clock budget in ms. Capped at 300000 by the server."),
+    timeoutMs: z.number().int().min(1000).max(MAX_SEARCH_TIMEOUT_MS).optional(),
     maxBytes: z.number().int().min(1).max(MAX_SEARCH_MAX_BYTES).optional(),
   },
   async handler(args, { connection, readClient }) {
@@ -1170,9 +1180,183 @@ const searchPersonalContext: McpToolDefinition = {
   },
 };
 
+const getScopeFile: McpToolDefinition = {
+  name: "get_scope_file",
+  title: "Get scope file",
+  description:
+    "Fetch original bytes for an approved file/PDF scope. Use search for extracted text.",
+  inputSchema: {
+    ...rawScopeFileInputSchema,
+    timeoutMs: z
+      .number()
+      .int()
+      .min(1000)
+      .max(MAX_READ_FILE_TIMEOUT_MS)
+      .optional(),
+  },
+  async handler(args, { connection, readClient }) {
+    const scope = typeof args.scope === "string" ? args.scope : null;
+    if (!scope) {
+      return textResult(
+        { error: "scope is required and must be a string" },
+        true,
+      );
+    }
+    const grant = resolveGrantForScope(connection, scope);
+    if (!grant) {
+      return textResult(
+        {
+          error: "scope_not_granted",
+          message: `Scope '${scope}' is not covered by any grant on this MCP connection.`,
+          grantedScopes: uniqueScopes(connection),
+        },
+        true,
+      );
+    }
+
+    const at = typeof args.at === "string" ? args.at : undefined;
+    const fileId = typeof args.fileId === "string" ? args.fileId : undefined;
+    const includeContent =
+      typeof args.includeContent === "boolean" ? args.includeContent : true;
+    const maxBytes = clampInteger(
+      args.maxBytes,
+      DEFAULT_READ_FILE_MAX_BYTES,
+      1,
+      MAX_READ_FILE_MAX_BYTES,
+    );
+    const timeoutMs = clampInteger(
+      args.timeoutMs,
+      DEFAULT_READ_FILE_TIMEOUT_MS,
+      1000,
+      MAX_READ_FILE_TIMEOUT_MS,
+    );
+    const resourceUri = rawScopeResourceUri({ scope, at, fileId });
+
+    try {
+      const raw = await withTimeout(
+        readClient.readRawScopeFile({
+          scope,
+          grantId: grant.grantId,
+          at,
+          fileId,
+        }),
+        timeoutMs,
+        `read raw file for ${scope}`,
+      );
+      const metadata = rawScopeMetadata(raw);
+      const base = {
+        ...metadata,
+        grantId: grant.grantId,
+        resourceUri,
+        includeContent,
+        maxBytes,
+        timeoutMs,
+      };
+      if (!includeContent || raw.sizeBytes > maxBytes) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  ...base,
+                  contentIncluded: false,
+                  reason: !includeContent
+                    ? "includeContent=false"
+                    : "file exceeds maxBytes for inline MCP tool response",
+                  nextStep:
+                    "Use resources/read with resourceUri if your MCP client supports resources, or retry with a higher maxBytes if appropriate.",
+                },
+                null,
+                2,
+              ),
+            },
+            {
+              type: "resource_link",
+              uri: resourceUri,
+              name: raw.filename ?? scope,
+              title: raw.filename ?? scope,
+              description: `Raw file for ${scope}`,
+              mimeType: raw.mimeType,
+              size: raw.sizeBytes,
+            },
+          ],
+          structuredContent: {
+            ...base,
+            contentIncluded: false,
+          },
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                ...base,
+                contentIncluded: true,
+                resourceType: "blob",
+              },
+              null,
+              2,
+            ),
+          },
+          {
+            type: "resource",
+            resource: {
+              uri: resourceUri,
+              mimeType: raw.mimeType,
+              blob: raw.contentBase64,
+              _meta: metadata,
+            },
+          },
+        ],
+        structuredContent: {
+          ...base,
+          contentIncluded: true,
+          resourceType: "blob",
+        },
+      };
+    } catch (err) {
+      if (err instanceof OperationTimeoutError) {
+        return textResult(
+          {
+            error: "scope_file_timeout",
+            message: err.message,
+            timeoutMs: err.timeoutMs,
+          },
+          true,
+        );
+      }
+      if (err instanceof McpDataReadError) {
+        return textResult(
+          {
+            error:
+              err.status === 404
+                ? "scope_file_not_found"
+                : "scope_file_read_failed",
+            status: err.status,
+            body: err.body,
+          },
+          true,
+        );
+      }
+      return textResult(
+        {
+          error: "tool_handler_error",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        true,
+      );
+    }
+  },
+};
+
 export const MCP_TOOLS: readonly McpToolDefinition[] = [
   listGrantedSources,
   listGrantedScopes,
   readScope,
+  getScopeFile,
   searchPersonalContext,
 ] as const;

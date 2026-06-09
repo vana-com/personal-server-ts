@@ -1455,7 +1455,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     const oversizedScope = "x".repeat(1_000);
     const requestedScopes = [
       oversizedScope,
-      ...Array.from({ length: 120 }, (_value, index) => `unknown.${index}`),
+      ...Array.from({ length: 420 }, (_value, index) => `unknown.${index}`),
     ];
 
     const result = await tool.handler(
@@ -1475,7 +1475,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
       skippedScopes: string[];
       limits: { maxRequestedScopes: number; scopeChars: number };
     };
-    expect(payload.errors).toHaveLength(99);
+    expect(payload.errors).toHaveLength(399);
     expect(
       payload.errors.every((entry) => entry.error === "scope_not_granted"),
     ).toBe(true);
@@ -1484,7 +1484,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
       "1 invalid requested scopes omitted",
     ]);
     expect(payload.limits).toMatchObject({
-      maxRequestedScopes: 100,
+      maxRequestedScopes: 400,
       scopeChars: 128,
     });
     expect(result.content[0].text).not.toContain(oversizedScope);
@@ -1658,6 +1658,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
       "list_granted_sources",
       "list_granted_scopes",
       "read_scope",
+      "get_scope_file",
       "search_personal_context",
     ]);
   });
