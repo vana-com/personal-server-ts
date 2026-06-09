@@ -236,32 +236,33 @@ async function bootRegisteredServer(params: {
   return ctx as ReadyServer;
 }
 
+type ResolvedFile = FileRecord & { scope: string };
+
 /**
- * Discover the scopes a user has data in, from their on-chain files:
- *   GET /v1/files?user=<addr>  → each file's schemaId   (paginated via cursor)
+ * Discover the user's on-chain files and the scopes they cover:
+ *   GET /v1/files?user=<addr>  → each file's fileId/url/schemaId (paginated)
  *   GET /v1/schemas/<schemaId> → schema.scope
- * Returns a map of scope → file count.
+ * Returns the per-file records (annotated with scope) plus scope → file count.
  */
-async function gatewayScopesForUser(
+async function gatewayFilesForUser(
   gateway: ServerCtx["gatewayClient"],
   userAddress: string,
-): Promise<Map<string, number>> {
-  const files: FileRecord[] = [];
+): Promise<{ files: ResolvedFile[]; scopes: Map<string, number> }> {
+  const raw: FileRecord[] = [];
   let cursor: string | null = null;
   for (let page = 0; page < 100; page++) {
     const result = (await gateway.listFilesSince(userAddress, cursor)) as {
       cursor: string | null;
       files: FileRecord[];
     };
-    files.push(...result.files);
+    raw.push(...result.files);
     cursor = result.cursor;
     if (!cursor) break;
   }
-  console.log(`  ${files.length} file(s) on the gateway`);
 
   const schemaIds: string[] = [
     ...new Set(
-      files.map((f) => f.schemaId).filter((id): id is string => Boolean(id)),
+      raw.map((f) => f.schemaId).filter((id): id is string => Boolean(id)),
     ),
   ];
   const scopeBySchema = new Map<string, string>();
@@ -270,14 +271,18 @@ async function gatewayScopesForUser(
     if (schema) scopeBySchema.set(id, schema.scope);
   }
 
-  const byScope = new Map<string, number>();
-  for (const f of files) {
-    const scope = !f.schemaId
+  const files: ResolvedFile[] = raw.map((f) => ({
+    ...f,
+    scope: !f.schemaId
       ? "(no schema)"
-      : (scopeBySchema.get(f.schemaId) ?? `(unresolved ${f.schemaId})`);
-    byScope.set(scope, (byScope.get(scope) ?? 0) + 1);
+      : (scopeBySchema.get(f.schemaId) ?? `(unresolved ${f.schemaId})`),
+  }));
+
+  const scopes = new Map<string, number>();
+  for (const f of files) {
+    scopes.set(f.scope, (scopes.get(f.scope) ?? 0) + 1);
   }
-  return byScope;
+  return { files, scopes };
 }
 
 async function main() {
@@ -388,13 +393,22 @@ async function main() {
     // resolve each schemaId via GET /v1/schemas/<id> → scope. Confirms the
     // freshly registered file is discoverable on the network by user address.
     log("5/6", "Listing owner scopes from the gateway (files → schemas)");
-    const scopes = await gatewayScopesForUser(
+    const { files: userFiles, scopes } = await gatewayFilesForUser(
       ctx.gatewayClient,
       ownerAccount.address,
     );
+    console.log(`  ${userFiles.length} file(s) on the gateway`);
     console.log(`  scopes (${scopes.size}):`);
     for (const [scope, count] of [...scopes.entries()].sort()) {
       console.log(`    ${scope} — ${count} file${count === 1 ? "" : "s"}`);
+    }
+    console.log("  files:");
+    for (const f of userFiles) {
+      console.log(`    - scope:     ${f.scope}`);
+      console.log(`      fileId:    ${f.fileId}`);
+      console.log(`      schemaId:  ${f.schemaId ?? "(none)"}`);
+      console.log(`      createdAt: ${f.createdAt}`);
+      console.log(`      url:       ${f.url}`);
     }
     if (!scopes.has(SCOPE)) {
       throw new Error(

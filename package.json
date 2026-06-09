@@ -31,6 +31,8 @@
     "format:check": "prettier --check .",
     "register-server": "tsx --env-file-if-exists=.env scripts/register-server.ts",
     "register-builder": "tsx --env-file-if-exists=.env scripts/register-builder.ts",
+    "e2e:read-scope": "tsx scripts/e2e-read-scope.ts",
+    "e2e:register-pdf": "tsx --env-file-if-exists=.env scripts/e2e-register-pdf.ts",
     "validate": "npm run lint && npm run lint:eslint && npm run format:check && npm test",
     "prepare": "husky"
   },

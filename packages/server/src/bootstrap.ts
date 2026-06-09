@@ -79,6 +79,12 @@ export interface CreateServerOptions {
    * same gateway as an injected `gatewayClient`.
    */
   feeVerifier?: FeeVerifierPort;
+  /**
+   * Approval surface URL for the MCP OAuth flow. When set, the
+   * `/mcp/oauth/*` endpoints are enabled (authorize redirects here with the
+   * `mcp_authorization` id). Embedders/tests that drive the OAuth flow set this.
+   */
+  mcpOAuthApprovalUrl?: string;
 }
 
 const DEFAULT_LOCAL_APPROVAL_PORT = 34127;
@@ -376,6 +382,7 @@ export async function createServer(
     configPath,
     syncManager,
     serverSigner,
+    mcpOAuthApprovalUrl: options?.mcpOAuthApprovalUrl,
     getTunnelStatus: () => tunnelManager?.getStatus() ?? null,
   });
 
