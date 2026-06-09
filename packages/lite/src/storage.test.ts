@@ -382,6 +382,75 @@ describe("createPersistentPsLiteStorage", () => {
     });
   });
 
+  it("writes persistent block sidecars sequentially before publishing the manifest", async () => {
+    const writes: string[] = [];
+    let activePayloadWrites = 0;
+    const payloads = new Map<string, DataScopeBlock>();
+    const manifests = new Map<string, DataBlockManifest>();
+    const dataFileStore: PsLiteDataFileStore = {
+      kind: "opfs",
+      async readEnvelope() {
+        return null;
+      },
+      async writeEnvelope() {
+        return 0;
+      },
+      async deleteEnvelope() {},
+      async readBlockManifest(path) {
+        return manifests.get(path) ?? null;
+      },
+      async writeBlockManifest(path, manifest) {
+        writes.push(`manifest:${path}`);
+        manifests.set(path, manifest);
+      },
+      async readBlockPayload(path) {
+        return payloads.get(path) ?? null;
+      },
+      async writeBlockPayload(path, block) {
+        activePayloadWrites += 1;
+        try {
+          expect(activePayloadWrites).toBe(1);
+          writes.push(`payload:${path}`);
+          await Promise.resolve();
+          payloads.set(path, block);
+        } finally {
+          activePayloadWrites -= 1;
+        }
+      },
+      async deleteBlockTree(pathPrefix) {
+        for (const key of [...payloads.keys()]) {
+          if (key.startsWith(pathPrefix)) payloads.delete(key);
+        }
+      },
+    };
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      dataFileStore,
+    );
+    const { manifest, blocks } = blockFixture(
+      "chatgpt.conversations",
+      "2026-05-08T00:00:00.000Z",
+      3,
+    );
+
+    await storage.writeBlockManifest?.(
+      manifest.scope,
+      manifest.collectedAt,
+      manifest,
+      blocks,
+    );
+
+    expect(writes).toHaveLength(4);
+    expect(
+      writes.slice(0, 3).every((write) => write.startsWith("payload:")),
+    ).toBe(true);
+    expect(writes[3]).toMatch(/^manifest:/);
+    await expect(
+      storage.hasScopeBlocks?.(manifest.scope, manifest.collectedAt),
+    ).resolves.toBe(true);
+  });
+
   it("pages block sidecar reads by cursor until all blocks are reachable", async () => {
     const storage = await createPersistentPsLiteStorage(
       { kind: "indexeddb" },

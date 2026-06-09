@@ -53,7 +53,7 @@ export interface McpDataReadClient {
   /**
    * Return lightweight planning metadata for a scope using the storage index
    * only — no network call, no block read, no auth. Used by list_granted_scopes
-   * to populate sizeBytes/sizeClass/searchRecommended without reading data.
+   * to populate sizeBytes/sizeClass/recommendedAccess without reading data.
    * Returns null when the scope has no local index entry.
    */
   getScopeMetadata(scope: string): Promise<McpScopeMetadata | null>;
