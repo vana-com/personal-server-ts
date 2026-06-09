@@ -740,6 +740,145 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     );
   });
 
+  it("local MCP route returns embedded raw files without hanging", async () => {
+    const created = await createMcpConnection(
+      { displayName: "Codex route repro" },
+      { store, publicOrigin: SERVER_ORIGIN },
+    );
+    const record = (await store.getById(created.connectionId))!;
+    const { gateway } = makeGatewayForGrantee({
+      granteeAddress: record.granteeAddress,
+      grantId: "grant-file-1",
+      scopes: ["manual.document"],
+    });
+    const accessLogWriter = createMockAccessLogWriter();
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "grant-file-1", scopes: ["manual.document"] }],
+      },
+      { store },
+    );
+
+    const dataApp = dataRoutes({
+      indexManager,
+      hierarchyOptions,
+      logger,
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway,
+      accessLogWriter,
+    });
+    const pdf = new Uint8Array(154_453);
+    pdf.set(new TextEncoder().encode("%PDF-1.4\n"));
+    const writeAuth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "POST",
+      uri: "/manual.document",
+      body: pdf,
+    });
+    const write = await dataApp.request("/manual.document", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/pdf",
+        "X-Filename": "scan.pdf",
+        Authorization: writeAuth,
+      },
+      body: pdf,
+    });
+    expect(write.status).toBe(201);
+
+    const root = new Hono();
+    root.route(
+      "/mcp",
+      mcpStreamableHttpRoutes({
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway,
+        gatewayConfig,
+        serverSigner: {
+          signGrantRegistration: vi
+            .fn()
+            .mockResolvedValue("0xgrantsig" as `0x${string}`),
+        },
+        accessLogWriter,
+        connectionStore: store,
+        indexManager,
+        hierarchyOptions,
+        oauthApprovalUrl: "https://app-dev.vana.org/mcp",
+      }),
+    );
+
+    async function rpc(
+      id: string,
+      method: string,
+      params: Record<string, unknown>,
+    ) {
+      const res = await root.request(
+        `/mcp/${encodeURIComponent(created.connectionToken)}`,
+        {
+          method: "POST",
+          headers: {
+            Accept: "application/json, text/event-stream",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
+        },
+      );
+      const text = await res.text();
+      return {
+        status: res.status,
+        bytes: new TextEncoder().encode(text).byteLength,
+        body: JSON.parse(text),
+      };
+    }
+
+    async function withHangTimeout<T>(
+      label: string,
+      promise: Promise<T>,
+    ): Promise<T> {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error(`${label} hung for 5000ms`)),
+              5000,
+            );
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+
+    const inline = await withHangTimeout(
+      "inline file tool response",
+      rpc("inline", "tools/call", {
+        name: "get_scope_file",
+        arguments: { scope: "manual.document", includeContent: true },
+      }),
+    );
+    expect(inline.status).toBe(200);
+    expect(inline.bytes).toBeGreaterThan(200_000);
+    expect(
+      inline.body.result.content.map((item: { type: string }) => item.type),
+    ).toEqual(["text", "resource"]);
+
+    const resource = await withHangTimeout(
+      "raw file resource read response",
+      rpc("resource", "resources/read", {
+        uri: "vana://scope/manual.document/raw",
+      }),
+    );
+    expect(resource.status).toBe(200);
+    expect(resource.bytes).toBeGreaterThan(200_000);
+    expect(resource.body.result.contents[0].blob).toMatch(/^JVBERi0xLjQK/u);
+  });
+
   it("read_scope rejects top-level source ids even when a wildcard grant exists", async () => {
     const created = await createMcpConnection(
       { displayName: "Claude" },
