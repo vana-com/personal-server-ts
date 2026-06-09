@@ -1796,6 +1796,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     expect(MCP_TOOLS.map((tool) => tool.name)).toEqual([
       "list_granted_sources",
       "list_granted_scopes",
+      "request_scope_access",
       "read_scope",
       "get_scope_file",
       "search_personal_context",
