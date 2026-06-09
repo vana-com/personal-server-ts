@@ -245,6 +245,103 @@ describe("mcp/tools", () => {
     });
   });
 
+  it("read_scope attaches search guidance for large scopes and omits it for small ones", async () => {
+    const block = {
+      id: "b1",
+      path: "$.items[0:1]",
+      mediaType: "application/json",
+      value: { id: 1 },
+      sizeBytes: 20,
+    };
+    const makeClient = (sizeBytes: number) =>
+      createMinimalReadClient({
+        getScopeMetadata: vi.fn(async (scope: string) => ({
+          scope,
+          collectedAt: "2026-06-05T00:00:00Z",
+          sizeBytes,
+          hasBlocks: true,
+        })),
+        readScopeBlocks: vi.fn().mockResolvedValue({
+          scope: "instagram.profile",
+          collectedAt: "2026-06-05T00:00:00Z",
+          contentKind: "json",
+          blocks: [block],
+          nextCursor: "cursor-2",
+          warnings: [],
+        }),
+      });
+
+    // Large scope (~5MB) → guidance steering to search, read still served.
+    const large = await getTool("read_scope").handler(
+      { scope: "instagram.profile" },
+      {
+        connection: createConnection(),
+        readClient: makeClient(5_000_000) as never,
+      },
+    );
+    const largePayload = JSON.parse(large.content[0].text);
+    expect(largePayload.blocks).toHaveLength(1);
+    expect(largePayload.guidance).toMatchObject({
+      recommendedAccess: "search",
+      sizeClass: "large",
+    });
+
+    // Small scope (5KB) → no guidance noise.
+    const small = await getTool("read_scope").handler(
+      { scope: "instagram.profile" },
+      {
+        connection: createConnection(),
+        readClient: makeClient(5_000) as never,
+      },
+    );
+    expect(JSON.parse(small.content[0].text).guidance).toBeUndefined();
+  });
+
+  it("read_scope does not wait for stalled metadata guidance", async () => {
+    const readClient = createMinimalReadClient({
+      getScopeMetadata: vi.fn(
+        () =>
+          new Promise(() => {
+            // Deliberately never resolves: guidance is advisory only.
+          }),
+      ),
+      readScopeBlocks: vi.fn().mockResolvedValue({
+        scope: "instagram.profile",
+        collectedAt: "2026-06-05T00:00:00Z",
+        contentKind: "json",
+        blocks: [
+          {
+            id: "b1",
+            path: "$.profile",
+            mediaType: "application/json",
+            value: { username: "tim" },
+            sizeBytes: 18,
+          },
+        ],
+        warnings: [],
+      }),
+    });
+
+    const started = Date.now();
+    const result = await getTool("read_scope").handler(
+      { scope: "instagram.profile", timeoutMs: 1000 },
+      {
+        connection: createConnection(),
+        readClient: readClient as never,
+      },
+    );
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeLessThan(500);
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      scope: "instagram.profile",
+      page: {
+        returnedBlocks: 1,
+      },
+    });
+  });
+
   it("read_scope returns a typed timeout instead of hanging on a stalled read", async () => {
     const readClient = createMinimalReadClient({
       readScopeBlocks: vi.fn(
@@ -743,15 +840,15 @@ describe("mcp/tools", () => {
       payload.scopes.map((s: { scope: string }) => [s.scope, s]),
     );
 
-    // instagram.profile: 5KB → tiny → searchRecommended: true
+    // instagram.profile: 5KB → tiny → read the whole scope directly
     expect(byScope["instagram.profile"].dataStatus).toBe("ready");
-    expect(byScope["instagram.profile"].searchRecommended).toBe(true);
+    expect(byScope["instagram.profile"].recommendedAccess).toBe("read");
     expect(byScope["instagram.profile"].sizeBytes).toBe(5_000);
     expect(byScope["instagram.profile"].sizeClass).toBe("tiny");
 
-    // chatgpt.history: 15MB → huge → searchRecommended: false
+    // chatgpt.history: 15MB → huge → steer to search instead of a full read
     expect(byScope["chatgpt.history"].dataStatus).toBe("ready");
-    expect(byScope["chatgpt.history"].searchRecommended).toBe(false);
+    expect(byScope["chatgpt.history"].recommendedAccess).toBe("search");
     expect(byScope["chatgpt.history"].sizeClass).toBe("huge");
     expect(byScope["chatgpt.history"].reason).toBeDefined();
   });
@@ -769,7 +866,7 @@ describe("mcp/tools", () => {
     const payload = JSON.parse(result.content[0].text);
     for (const scope of payload.scopes) {
       expect(scope.dataStatus).toBe("needs_refresh");
-      expect(scope.searchRecommended).toBe(false);
+      expect(scope.recommendedAccess).toBe("wait");
     }
   });
 
@@ -801,7 +898,7 @@ describe("mcp/tools", () => {
       (scope: { scope: string }) => scope.scope === "instagram.profile",
     );
     expect(profile.dataStatus).toBe("indexing");
-    expect(profile.searchRecommended).toBe(false);
+    expect(profile.recommendedAccess).toBe("wait");
     expect(profile.reason).toContain("indexing");
   });
 
@@ -836,7 +933,7 @@ describe("mcp/tools", () => {
       expect.objectContaining({
         scope: "instagram.profile",
         dataStatus: "indexing",
-        searchRecommended: false,
+        recommendedAccess: "wait",
       }),
     ]);
   });
