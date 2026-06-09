@@ -1,8 +1,23 @@
-import { describe, expect, it } from "vitest";
+import { extractText } from "unpdf";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { buildBinaryEnvelopeData } from "../../contracts/binary.js";
-import { buildDataBlocks, type DataBlockPayload } from "./build.js";
+import {
+  buildDataBlocks,
+  buildDataBlocksAsync,
+  type DataBlockPayload,
+} from "./build.js";
+
+vi.mock("unpdf", () => ({
+  extractText: vi.fn(),
+}));
+
+const extractTextMock = vi.mocked(extractText);
 
 describe("buildDataBlocks", () => {
+  beforeEach(() => {
+    extractTextMock.mockReset();
+  });
+
   it("classifies Vana envelopes and emits metadata plus complete data blocks", () => {
     const envelope = {
       scope: "test.scope",
@@ -218,6 +233,86 @@ describe("buildDataBlocks", () => {
         rawContentAvailable: true,
       },
     });
+    expect(JSON.stringify(result.blocks)).not.toContain(binaryData.content);
+  });
+
+  it("extracts searchable PDF text from binary Vana envelopes without indexing base64 content", async () => {
+    extractTextMock.mockResolvedValueOnce({
+      totalPages: 1,
+      text: "Roof report\r\nDEXA scan summary\n",
+    });
+    const binaryData = buildBinaryEnvelopeData({
+      bytes: new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31]),
+      mimeType: "application/pdf",
+      filename: "roof-report.pdf",
+      contentHash: `0x${"b".repeat(64)}`,
+      metadata: { title: "Roof report" },
+    });
+    const result = await buildDataBlocksAsync({
+      scope: "manual.document",
+      collectedAt: "2026-06-09T16:28:09Z",
+      content: {
+        scope: "manual.document",
+        collectedAt: "2026-06-09T16:28:09Z",
+        schemaId: "schema-1",
+        data: binaryData,
+      },
+      blockTargetBytes: 40,
+      maxBlockBytes: 120,
+    });
+
+    const metadataBlock = result.blocks.find(
+      (block) => block.path === "$.data",
+    );
+    const textBlocks = result.blocks.filter((block) =>
+      block.path.startsWith("$.data.text"),
+    );
+    expect(result.manifest.contentKind).toBe("binary");
+    expect(metadataBlock).toMatchObject({
+      mediaType: "application/json",
+      value: {
+        contentKind: "binary",
+        searchable: true,
+        extractedTextAvailable: true,
+        rawContentAvailable: true,
+      },
+    });
+    expect(rebuildString(textBlocks, "$.data.text")).toBe(
+      "Roof report\nDEXA scan summary",
+    );
+    expect(
+      result.manifest.warnings.map((warning) => warning.code),
+    ).not.toContain("binary_metadata_only");
+    expect(JSON.stringify(result.blocks)).not.toContain(binaryData.content);
+    expect(extractTextMock).toHaveBeenCalledTimes(1);
+    expect(extractTextMock.mock.calls[0]?.[0]).toBeInstanceOf(Uint8Array);
+  });
+
+  it("falls back to binary metadata when PDF text extraction fails", async () => {
+    extractTextMock.mockRejectedValueOnce(new Error("invalid pdf"));
+    const binaryData = buildBinaryEnvelopeData({
+      bytes: new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31]),
+      mimeType: "application/pdf",
+      filename: "broken.pdf",
+      contentHash: `0x${"c".repeat(64)}`,
+    });
+    const result = await buildDataBlocksAsync({
+      scope: "manual.document",
+      collectedAt: "2026-06-09T16:28:09Z",
+      content: {
+        scope: "manual.document",
+        collectedAt: "2026-06-09T16:28:09Z",
+        data: binaryData,
+      },
+    });
+
+    expect(
+      result.blocks.some((block) => block.path.startsWith("$.data.text")),
+    ).toBe(false);
+    expect(result.manifest.warnings.map((warning) => warning.code)).toEqual([
+      "binary_metadata_only",
+      "pdf_text_extraction_failed",
+    ]);
     expect(JSON.stringify(result.blocks)).not.toContain(binaryData.content);
   });
 });
