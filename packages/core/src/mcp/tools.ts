@@ -359,30 +359,42 @@ function classifySizeBytes(sizeBytes: number | undefined): SizeClass {
   return "huge";
 }
 
-function isSearchRecommended(
+type RecommendedAccess = "read" | "search" | "wait";
+
+// Directive guidance the MCP client (e.g. Claude) uses to pick read_scope vs
+// search_personal_context for a scope WITHOUT operator intervention. The signal
+// must be unambiguous: a misnamed flag here (the old `searchRecommended: false`
+// on large scopes) reads to a model as "don't search → read the whole thing",
+// which is exactly the slow path — a full read of a large scope returns many
+// pages it must walk via nextCursor and tends to stall the agent loop.
+function recommendAccessForScope(
   sizeClass: SizeClass,
   hasBlocks: boolean,
-): { recommended: boolean; reason?: string } {
+): { recommendedAccess: RecommendedAccess; reason: string } {
   if (!hasBlocks) {
     return {
-      recommended: false,
+      recommendedAccess: "wait",
       reason:
-        "bounded block data is still indexing or unavailable; retry shortly",
+        "bounded block data is still indexing or unavailable; retry shortly before reading or searching",
     };
   }
   if (sizeClass === "large" || sizeClass === "huge") {
     return {
-      recommended: false,
-      reason: `scope is ${sizeClass}; use explicit scopes with cursor to search safely`,
+      recommendedAccess: "search",
+      reason: `scope is ${sizeClass}; prefer search_personal_context and name this scope explicitly. A full read_scope returns many pages you must walk via nextCursor.`,
     };
   }
   if (sizeClass === "unknown") {
     return {
-      recommended: false,
-      reason: "scope size unknown; pass explicitly to search",
+      recommendedAccess: "search",
+      reason:
+        "scope size is unknown; prefer search_personal_context and name this scope explicitly",
     };
   }
-  return { recommended: true };
+  return {
+    recommendedAccess: "read",
+    reason: `scope is ${sizeClass}; read_scope returns it in one or few pages. search_personal_context also works for targeted lookups.`,
+  };
 }
 
 async function resolveSearchScopes({
@@ -523,7 +535,7 @@ const listGrantedScopes: McpToolDefinition = {
   name: "list_granted_scopes",
   title: "List granted scopes",
   description:
-    "List granted scopes with dataStatus, sizeClass, searchRecommended, and sizeBytes. Call first.",
+    "List granted scopes with dataStatus, sizeClass, sizeBytes, and recommendedAccess ('read' for small scopes, 'search' for large/huge scopes, 'wait' while indexing). Call first, then follow recommendedAccess.",
   inputSchema: {},
   async handler(_args, { connection, readClient }) {
     const grantedScopes = uniqueScopes(connection);
@@ -543,7 +555,7 @@ const listGrantedScopes: McpToolDefinition = {
               source: scope.split(".")[0],
               dataStatus: "indexing" as const,
               sizeClass: "unknown" as SizeClass,
-              searchRecommended: false,
+              recommendedAccess: "wait" as RecommendedAccess,
               reason:
                 "scope metadata is still indexing or temporarily unavailable; retry shortly",
             };
@@ -554,12 +566,12 @@ const listGrantedScopes: McpToolDefinition = {
             scope,
             dataStatus: "needs_refresh" as const,
             sizeClass: "unknown" as SizeClass,
-            searchRecommended: false,
+            recommendedAccess: "wait" as RecommendedAccess,
             reason: "no local data found; refresh your data connection",
           };
         }
         const sizeClass = classifySizeBytes(meta.sizeBytes);
-        const { recommended, reason } = isSearchRecommended(
+        const { recommendedAccess, reason } = recommendAccessForScope(
           sizeClass,
           meta.hasBlocks,
         );
@@ -572,8 +584,8 @@ const listGrantedScopes: McpToolDefinition = {
             : ("indexing" as const),
           sizeBytes: meta.sizeBytes,
           sizeClass,
-          searchRecommended: recommended,
-          ...(reason ? { reason } : {}),
+          recommendedAccess,
+          reason,
         };
       }),
     );
@@ -585,7 +597,7 @@ const readScope: McpToolDefinition = {
   name: "read_scope",
   title: "Read scope",
   description:
-    "Read one approved scope as bounded blocks. Page with nextCursor for large scopes.",
+    "Read one full approved scope as bounded blocks. Best for tiny/small/medium scopes (see sizeClass from list_granted_scopes). For large/huge scopes prefer search_personal_context — a full read returns many pages you must walk via nextCursor and is slow. The response includes a `guidance` hint when a scope is large enough that search is the better tool.",
   inputSchema: {
     scope: z
       .string()
@@ -639,6 +651,49 @@ const readScope: McpToolDefinition = {
       1000,
       MAX_READ_SCOPE_TIMEOUT_MS,
     );
+
+    // In-band steer: the model may call read_scope on a large scope without
+    // first consulting list_granted_scopes. Fetch lightweight planning metadata
+    // (storage-index only, no network/auth) so we can attach a `guidance` hint
+    // pointing at search_personal_context when a full read would be slow. This
+    // is best-effort and never blocks the read.
+    let guidance:
+      | {
+          sizeClass: SizeClass;
+          sizeBytes?: number;
+          recommendedAccess: RecommendedAccess;
+          reason: string;
+        }
+      | undefined;
+    if (typeof readClient.getScopeMetadata === "function") {
+      try {
+        const meta = await withTimeout(
+          readClient.getScopeMetadata(scope),
+          DEFAULT_SCOPE_METADATA_TIMEOUT_MS,
+          `scope metadata for ${scope}`,
+        );
+        if (meta) {
+          const sizeClass = classifySizeBytes(meta.sizeBytes);
+          const recommendation = recommendAccessForScope(
+            sizeClass,
+            meta.hasBlocks,
+          );
+          // Only steer when search is the better tool; a normal small read
+          // gets no extra noise.
+          if (recommendation.recommendedAccess === "search") {
+            guidance = {
+              sizeClass,
+              sizeBytes: meta.sizeBytes,
+              recommendedAccess: recommendation.recommendedAccess,
+              reason: recommendation.reason,
+            };
+          }
+        }
+      } catch {
+        // Advisory only — fall through and serve the read without guidance.
+      }
+    }
+
     try {
       const result = await withTimeout(
         readClient.readScopeBlocks({
@@ -658,6 +713,7 @@ const readScope: McpToolDefinition = {
         contentKind: result.contentKind,
         blocks: result.blocks,
         ...(result.nextCursor ? { nextCursor: result.nextCursor } : {}),
+        ...(guidance ? { guidance } : {}),
         warnings: result.warnings,
         page: {
           cursor: cursor ?? null,
@@ -762,7 +818,7 @@ const searchPersonalContext: McpToolDefinition = {
   name: "search_personal_context",
   title: "Search personal context",
   description:
-    "Search approved scopes. Omit scopes for small ready data; pass scopes to target. Continue with nextSearchCursor.",
+    "Search approved scopes by keyword — the preferred way to pull from large/huge scopes without reading every page. Omit scopes to sweep all small ready data; name scopes (including large ones) to target them. Continue with nextSearchCursor.",
   inputSchema: {
     query: z.string().min(1).max(SEARCH_QUERY_MAX_CHARS),
     scopes: z
