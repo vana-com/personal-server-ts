@@ -38,9 +38,31 @@ describe("McpActivityRecorder", () => {
   it("finishes with succeeded", () => {
     const r = new McpActivityRecorder();
     const id = r.start({ tool: "read_scope", scopes: ["instagram.profile"] });
+    r.update(id, {
+      phase: "response_preparing",
+      handlerDurationMs: 12,
+      payloadBytes: 2048,
+      textBytes: 1024,
+      structuredContentBytes: 1024,
+    });
+    expect(r.snapshot().events[0]).toMatchObject({
+      status: "running",
+      phase: "response_preparing",
+      handlerDurationMs: 12,
+      payloadBytes: 2048,
+    });
     r.finish(id, { status: "succeeded", resultCount: 3 });
     const ev = r.snapshot().events[0];
-    expect(ev).toMatchObject({ id, status: "succeeded", resultCount: 3 });
+    expect(ev).toMatchObject({
+      id,
+      status: "succeeded",
+      phase: "response_ready",
+      resultCount: 3,
+      handlerDurationMs: 12,
+      payloadBytes: 2048,
+      textBytes: 1024,
+      structuredContentBytes: 1024,
+    });
     expect(ev.finishedAt).toBeDefined();
     expect(typeof ev.durationMs).toBe("number");
   });
