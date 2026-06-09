@@ -11,12 +11,23 @@
  * DELETE=close). Claude Web's remote connector speaks this.
  */
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import {
+  McpServer,
+  ResourceTemplate,
+} from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { McpDataReadClient } from "./read-client.js";
-import { MCP_TOOLS, type McpToolContext } from "./tools.js";
+import {
+  MCP_TOOLS,
+  type McpToolContext,
+  type McpToolResultContent,
+} from "./tools.js";
 import type { McpActivityRecorder, McpActivityStatus } from "./activity.js";
+import {
+  RAW_SCOPE_RESOURCE_TEMPLATES,
+  readRawScopeResource,
+} from "./resources.js";
 
 export interface HandleMcpRequestOptions {
   connection: McpConnectionRecord;
@@ -53,7 +64,11 @@ function clampToolTimeout(value: unknown): number {
 }
 
 function toolTimeoutMs(tool: string, args: Record<string, unknown>): number {
-  if (tool === "read_scope" || tool === "search_personal_context") {
+  if (
+    tool === "read_scope" ||
+    tool === "search_personal_context" ||
+    tool === "get_scope_file"
+  ) {
     return clampToolTimeout(args.timeoutMs) + MCP_TOOL_TIMEOUT_GRACE_MS;
   }
   return DEFAULT_MCP_TOOL_TIMEOUT_MS;
@@ -87,7 +102,10 @@ function buildActivityStartParams(
   const params: { tool: string; scopes?: string[]; queryPreview?: string } = {
     tool,
   };
-  if (tool === "read_scope" && typeof args.scope === "string") {
+  if (
+    (tool === "read_scope" || tool === "get_scope_file") &&
+    typeof args.scope === "string"
+  ) {
     params.scopes = [args.scope];
   }
   if (tool === "search_personal_context") {
@@ -105,7 +123,7 @@ function buildActivityStartParams(
 
 function extractActivityFinishParams(
   tool: string,
-  result: { content: Array<{ type: string; text: string }>; isError?: boolean },
+  result: { content: McpToolResultContent[]; isError?: boolean },
 ): {
   resultCount?: number;
   skippedCount?: number;
@@ -114,10 +132,9 @@ function extractActivityFinishParams(
 } {
   if (result.isError || result.content.length === 0) {
     try {
-      const body = JSON.parse(result.content[0]?.text ?? "{}") as Record<
-        string,
-        unknown
-      >;
+      const firstText =
+        result.content[0]?.type === "text" ? result.content[0].text : "{}";
+      const body = JSON.parse(firstText) as Record<string, unknown>;
       return {
         errorCode: typeof body.error === "string" ? body.error : undefined,
         errorMessage:
@@ -129,10 +146,9 @@ function extractActivityFinishParams(
   }
   if (tool === "search_personal_context") {
     try {
-      const body = JSON.parse(result.content[0].text) as Record<
-        string,
-        unknown
-      >;
+      const firstText =
+        result.content[0]?.type === "text" ? result.content[0].text : "{}";
+      const body = JSON.parse(firstText) as Record<string, unknown>;
       return {
         resultCount: Array.isArray(body.results)
           ? body.results.length
@@ -149,10 +165,9 @@ function extractActivityFinishParams(
   }
   if (tool === "read_scope") {
     try {
-      const body = JSON.parse(result.content[0].text) as Record<
-        string,
-        unknown
-      >;
+      const firstText =
+        result.content[0]?.type === "text" ? result.content[0].text : "{}";
+      const body = JSON.parse(firstText) as Record<string, unknown>;
       return {
         resultCount: Array.isArray(body.blocks)
           ? body.blocks.length
@@ -185,12 +200,16 @@ function bytes(value: string): number {
 }
 
 function estimatePayloadMetrics(result: {
-  content?: Array<{ text?: string }>;
+  content?: McpToolResultContent[];
   structuredContent?: unknown;
 }): ActivityPayloadMetrics {
   const textBytes =
     result.content?.reduce((total, item) => {
-      return total + (typeof item.text === "string" ? bytes(item.text) : 0);
+      if (item.type === "text") return total + bytes(item.text);
+      if (item.type === "resource") {
+        return total + bytes(item.resource.blob);
+      }
+      return total + bytes(JSON.stringify(item));
     }, 0) ?? 0;
   // The SDK serializes both text content and structuredContent. Avoid a second
   // JSON stringify over very large payloads here; the pretty text body is a
@@ -344,6 +363,20 @@ export function createMcpServerForConnection(
       },
     );
   }
+
+  RAW_SCOPE_RESOURCE_TEMPLATES.forEach((template, index) => {
+    server.registerResource(
+      `raw-scope-file-${index}`,
+      new ResourceTemplate(template, { list: undefined }),
+      {
+        title: "Raw scope file",
+        description:
+          "Original binary/unstructured file bytes for an approved Vana scope.",
+        mimeType: "application/octet-stream",
+      },
+      async (uri) => readRawScopeResource(uri, ctx),
+    );
+  });
 
   function finishPendingActivities(
     override?: Pick<

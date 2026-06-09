@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createMcpDataReadClient, McpDataReadError } from "./read-client.js";
 import { encodeDataBlockCursor } from "../storage/blocks/index.js";
+import { buildBinaryEnvelopeData } from "../contracts/binary.js";
 
 const SERVER_ORIGIN = "https://personal-server.test";
 
@@ -285,6 +286,93 @@ describe("mcp/read-client", () => {
       "instagram.profile",
       oldCollectedAt,
       { cursor, maxBytes: 16_384 },
+    );
+  });
+
+  it("reads raw binary scopes through the grant-gated data API path", async () => {
+    const bytes = new Uint8Array([0x25, 0x50, 0x44, 0x46]);
+    const authorizeBuilderRead = vi
+      .fn()
+      .mockResolvedValue({ grantId: "grant-1", builder: "0x2222" });
+    const accessLogWrite = vi.fn();
+    const client = createMcpDataReadClient({
+      serverOrigin: SERVER_ORIGIN,
+      granteeAccount: createAccount(),
+      dataApiDeps: {
+        storage: {
+          kind: "custom",
+          listScopes: () => ({ scopes: [], total: 0 }),
+          listVersions: vi.fn(),
+          countVersions: vi.fn(),
+          findEntry: () =>
+            ({
+              scope: "manual.document",
+              collectedAt: "2026-06-05T00:00:00Z",
+              fileId: "file-1",
+              sizeBytes: bytes.byteLength,
+            }) as never,
+          findByFileId: vi.fn(),
+          findUnsynced: vi.fn(),
+          readEnvelope: vi.fn().mockResolvedValue({
+            $schema: "https://example.test/schema.json",
+            version: "1.0",
+            scope: "manual.document",
+            schemaId: "schema-1",
+            collectedAt: "2026-06-05T00:00:00Z",
+            data: buildBinaryEnvelopeData({
+              bytes,
+              mimeType: "application/pdf",
+              filename: "scan.pdf",
+              contentHash: `0x${"1".repeat(64)}`,
+              metadata: { source: "manual" },
+            }),
+          } as never),
+          readScopeBlocks: vi.fn(),
+          writeEnvelope: vi.fn(),
+          insertEntry: vi.fn(),
+          updateFileId: vi.fn(),
+          deleteScope: vi.fn(),
+          deleteByFileId: vi.fn(),
+        },
+        auth: {
+          authorizeOwner: vi.fn(),
+          authorizeBuilderList: vi.fn(),
+          authorizeBuilderRead,
+        },
+        accessLogWriter: { write: accessLogWrite },
+        now: () => new Date("2026-06-05T00:00:00Z"),
+        createLogId: () => "log-1",
+      },
+    });
+
+    await expect(
+      client.readRawScopeFile({
+        scope: "manual.document",
+        grantId: "grant-1",
+      }),
+    ).resolves.toMatchObject({
+      scope: "manual.document",
+      mimeType: "application/pdf",
+      filename: "scan.pdf",
+      sizeBytes: bytes.byteLength,
+      contentBase64: "JVBERg==",
+      metadata: { source: "manual" },
+    });
+    expect(authorizeBuilderRead).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: "manual.document",
+        grantId: "grant-1",
+        fileId: "file-1",
+      }),
+    );
+    expect(accessLogWrite).toHaveBeenCalledWith(
+      expect.objectContaining({
+        logId: "log-1",
+        grantId: "grant-1",
+        builder: "0x2222",
+        action: "read",
+        scope: "manual.document",
+      }),
     );
   });
 });
