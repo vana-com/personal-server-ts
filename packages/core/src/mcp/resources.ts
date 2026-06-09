@@ -135,7 +135,12 @@ export const rawScopeFileInputSchema = {
   scope: z.string().min(1).describe("Exact approved file scope."),
   at: z.string().min(1).optional(),
   fileId: z.string().min(1).optional(),
-  includeContent: z.boolean().optional().describe("Embed bytes as MCP blob."),
+  includeContent: z
+    .boolean()
+    .optional()
+    .describe(
+      "Embed bytes as an MCP resource blob. Defaults to false; resource links are safer for broad client compatibility.",
+    ),
   maxBytes: z
     .number()
     .int()
