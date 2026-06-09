@@ -10,7 +10,12 @@ import type { SyncCursor } from "../cursor.js";
 import type { Logger } from "../../logger/index.js";
 import type { DataStoragePort } from "../../ports/index.js";
 import { buildDataBlocks } from "../../storage/blocks/build.js";
-import { classifySyncFailure } from "../issues.js";
+import {
+  classifySyncFailure,
+  inferPayloadKind,
+  type SyncFailureStage,
+  type SyncPayloadKind,
+} from "../issues.js";
 
 /** Minimal diagnostics hook — keeps core free of lite-specific imports. */
 export interface DownloadDiagnosticsHook {
@@ -46,6 +51,13 @@ export interface DownloadResult {
   scope: string;
   collectedAt: string;
   path: string;
+}
+
+interface SyncFailureMetadata {
+  stage?: SyncFailureStage;
+  scope?: string;
+  payloadKind?: SyncPayloadKind;
+  encryptedSizeBytes?: number;
 }
 
 /**
@@ -121,9 +133,19 @@ export async function downloadOne(
   try {
     plaintext = await decryptWithPassword(encrypted, scopeKeyHex);
   } catch (err) {
-    const detail = (err as Error).message;
+    const payloadKind = inferPayloadKind(encrypted);
+    const encryptedSizeBytes = encrypted.byteLength;
+    const detail = [
+      (err as Error).message,
+      `payloadKind=${payloadKind}`,
+      `encryptedSizeBytes=${encryptedSizeBytes}`,
+    ].join("; ");
     diagnostics?.onDecryptError(record.fileId, schema.scope, detail);
-    throw err;
+    throw withSyncFailureMetadata(err, {
+      scope: schema.scope,
+      payloadKind,
+      encryptedSizeBytes,
+    });
   }
 
   // 6. Parse as DataFileEnvelope (validate)
@@ -267,18 +289,26 @@ export async function downloadAll(
         results.push(result);
       }
     } catch (err) {
+      const metadata = getSyncFailureMetadata(err);
       const classified = classifySyncFailure({
         error: err,
         fileId: file.fileId,
         schemaId: file.schemaId,
         syncRunId,
+        stage: metadata.stage,
+        scope: metadata.scope,
+        payloadKind: metadata.payloadKind,
+        encryptedSizeBytes: metadata.encryptedSizeBytes,
       });
       if (!classified.issue.retryable) {
         logger.warn(
           {
             fileId: file.fileId,
             schemaId: file.schemaId,
+            scope: classified.issue.scope,
             stage: classified.issue.stage,
+            payloadKind: classified.issue.payloadKind,
+            encryptedSizeBytes: classified.issue.encryptedSizeBytes,
             errorClass: classified.issue.errorClass,
             message: classified.issue.message,
           },
@@ -370,6 +400,25 @@ function uint8ToHex(bytes: Uint8Array): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
     "",
   );
+}
+
+function withSyncFailureMetadata(
+  error: unknown,
+  metadata: SyncFailureMetadata,
+): unknown {
+  if (error instanceof Error) {
+    Object.assign(error, { syncFailureMetadata: metadata });
+    return error;
+  }
+  return { error, syncFailureMetadata: metadata };
+}
+
+function getSyncFailureMetadata(error: unknown): SyncFailureMetadata {
+  if (typeof error !== "object" || error === null) return {};
+  const metadata = (error as { syncFailureMetadata?: unknown })
+    .syncFailureMetadata;
+  if (typeof metadata !== "object" || metadata === null) return {};
+  return metadata as SyncFailureMetadata;
 }
 
 async function writeBlockSidecars(
