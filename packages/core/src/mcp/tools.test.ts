@@ -297,6 +297,51 @@ describe("mcp/tools", () => {
     expect(JSON.parse(small.content[0].text).guidance).toBeUndefined();
   });
 
+  it("read_scope does not wait for stalled metadata guidance", async () => {
+    const readClient = createMinimalReadClient({
+      getScopeMetadata: vi.fn(
+        () =>
+          new Promise(() => {
+            // Deliberately never resolves: guidance is advisory only.
+          }),
+      ),
+      readScopeBlocks: vi.fn().mockResolvedValue({
+        scope: "instagram.profile",
+        collectedAt: "2026-06-05T00:00:00Z",
+        contentKind: "json",
+        blocks: [
+          {
+            id: "b1",
+            path: "$.profile",
+            mediaType: "application/json",
+            value: { username: "tim" },
+            sizeBytes: 18,
+          },
+        ],
+        warnings: [],
+      }),
+    });
+
+    const started = Date.now();
+    const result = await getTool("read_scope").handler(
+      { scope: "instagram.profile", timeoutMs: 1000 },
+      {
+        connection: createConnection(),
+        readClient: readClient as never,
+      },
+    );
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeLessThan(500);
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      scope: "instagram.profile",
+      page: {
+        returnedBlocks: 1,
+      },
+    });
+  });
+
   it("read_scope returns a typed timeout instead of hanging on a stalled read", async () => {
     const readClient = createMinimalReadClient({
       readScopeBlocks: vi.fn(

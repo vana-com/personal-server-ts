@@ -654,9 +654,9 @@ const readScope: McpToolDefinition = {
 
     // In-band steer: the model may call read_scope on a large scope without
     // first consulting list_granted_scopes. Fetch lightweight planning metadata
-    // (storage-index only, no network/auth) so we can attach a `guidance` hint
-    // pointing at search_personal_context when a full read would be slow. This
-    // is best-effort and never blocks the read.
+    // (storage-index only, no network/auth) opportunistically so we can attach a
+    // `guidance` hint when it is already available. This is advisory only: it
+    // must never delay the read or consume the read timeout budget.
     let guidance:
       | {
           sizeClass: SizeClass;
@@ -666,20 +666,20 @@ const readScope: McpToolDefinition = {
         }
       | undefined;
     if (typeof readClient.getScopeMetadata === "function") {
-      try {
-        const meta = await withTimeout(
-          readClient.getScopeMetadata(scope),
-          DEFAULT_SCOPE_METADATA_TIMEOUT_MS,
-          `scope metadata for ${scope}`,
-        );
-        if (meta) {
+      void withTimeout(
+        readClient.getScopeMetadata(scope),
+        DEFAULT_SCOPE_METADATA_TIMEOUT_MS,
+        `scope metadata for ${scope}`,
+      )
+        .then((meta) => {
+          if (!meta) return;
           const sizeClass = classifySizeBytes(meta.sizeBytes);
           const recommendation = recommendAccessForScope(
             sizeClass,
             meta.hasBlocks,
           );
-          // Only steer when search is the better tool; a normal small read
-          // gets no extra noise.
+          // Only steer when search is the better tool; a normal small read gets
+          // no extra noise.
           if (recommendation.recommendedAccess === "search") {
             guidance = {
               sizeClass,
@@ -688,10 +688,10 @@ const readScope: McpToolDefinition = {
               reason: recommendation.reason,
             };
           }
-        }
-      } catch {
-        // Advisory only — fall through and serve the read without guidance.
-      }
+        })
+        .catch(() => {
+          // Advisory only — serve the read without guidance.
+        });
     }
 
     try {
