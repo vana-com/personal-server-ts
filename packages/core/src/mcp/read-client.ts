@@ -23,6 +23,7 @@ import type { ScopeSummary } from "../storage/index/types.js";
 import type { ReadScopeBlocksResponse } from "../storage/blocks/types.js";
 import type { SearchHit } from "./search/index.js";
 import { decodeDataBlockCursor } from "../storage/blocks/index.js";
+import { bytesToBase64, parseMetadataHeader } from "../contracts/binary.js";
 import { signMcpGranteeRequest } from "./grantee.js";
 import {
   handlePersonalServerDataRequest,
@@ -71,6 +72,18 @@ export interface McpDataReadClient {
   }): Promise<McpDataReadBlocksResult>;
 
   /**
+   * Perform a grant-gated raw binary read for an approved binary scope. This
+   * reuses `/v1/data/{scope}?content=raw` so policy checks and access logs stay
+   * identical to normal builder reads.
+   */
+  readRawScopeFile(params: {
+    scope: string;
+    grantId: string;
+    at?: string;
+    fileId?: string;
+  }): Promise<McpDataReadRawFileResult>;
+
+  /**
    * Optional indexed search path. Implementations may return `missing` while
    * an index is absent/stale; callers must keep the bounded block read path as
    * fallback so full data remains accessible.
@@ -101,6 +114,18 @@ export interface McpDataListResult {
 
 export interface McpDataReadBlocksResult extends ReadScopeBlocksResponse {
   status: number;
+}
+
+export interface McpDataReadRawFileResult {
+  status: number;
+  scope: string;
+  collectedAt?: string;
+  fileId?: string;
+  mimeType: string;
+  filename?: string;
+  sizeBytes: number;
+  contentBase64: string;
+  metadata?: unknown;
 }
 
 export class McpDataReadError extends Error {
@@ -306,6 +331,80 @@ export function createMcpDataReadClient(
         throw err;
       }
     },
+
+    async readRawScopeFile({ scope, grantId, at, fileId }) {
+      const storage = options.dataApiDeps.storage;
+      const selectedEntry = storage.findEntry({
+        scope,
+        ...(fileId ? { fileId } : {}),
+        ...(at ? { at } : {}),
+      });
+      if (!selectedEntry) {
+        throw new McpDataReadError(404, {
+          error: "NOT_FOUND",
+          message: `No data found for scope "${scope}"`,
+        });
+      }
+
+      const safeScope = encodeURIComponent(scope);
+      const signingUri = `${basePath}/${safeScope}`;
+      const query = new URLSearchParams({ content: "raw" });
+      if (fileId) query.set("fileId", fileId);
+      if (at) query.set("at", at);
+      query.set("grantId", grantId);
+
+      const authorization = await signMcpGranteeRequest({
+        account: options.granteeAccount,
+        aud: options.serverOrigin,
+        method: "GET",
+        uri: signingUri,
+        grantId,
+      });
+      const url = new URL(
+        `${signingUri}?${query.toString()}`,
+        options.serverOrigin,
+      ).toString();
+      const request = new Request(url, {
+        method: "GET",
+        headers: { Authorization: authorization },
+      });
+
+      const response = await handlePersonalServerDataRequest(
+        request,
+        options.dataApiDeps,
+        { basePath },
+      );
+      if (!response.ok) {
+        throw new McpDataReadError(
+          response.status,
+          await parseJsonOrText(response),
+        );
+      }
+
+      const mimeType =
+        response.headers.get("content-type") ?? "application/octet-stream";
+      if (mimeType.includes("application/json")) {
+        throw new McpDataReadError(400, {
+          error: "NOT_BINARY_SCOPE",
+          message: `Scope "${scope}" does not expose raw binary content.`,
+        });
+      }
+
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      const contentDisposition = response.headers.get("content-disposition");
+      const metadataHeader = response.headers.get("x-vana-metadata");
+      return {
+        status: response.status,
+        scope,
+        collectedAt: selectedEntry.collectedAt,
+        fileId: selectedEntry.fileId ?? undefined,
+        mimeType,
+        filename: filenameFromContentDisposition(contentDisposition),
+        sizeBytes: bytes.byteLength,
+        contentBase64: bytesToBase64(bytes),
+        metadata: parseMetadataHeader(metadataHeader),
+      };
+    },
   };
 }
 
@@ -316,6 +415,15 @@ async function parseJsonOrText(response: Response): Promise<unknown> {
   } catch {
     return text;
   }
+}
+
+function filenameFromContentDisposition(
+  value: string | null,
+): string | undefined {
+  if (!value) return undefined;
+  const match =
+    /filename="([^"]+)"/i.exec(value) ?? /filename=([^;]+)/i.exec(value);
+  return match?.[1]?.trim();
 }
 
 function collectedAtFromCursor(
