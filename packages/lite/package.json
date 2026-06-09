@@ -35,6 +35,6 @@
     "@opendatalabs/personal-server-ts-core": "*",
     "@opendatalabs/vana-sdk": "^3.4.1",
     "node-forge": "^1.4.0",
-    "viem": "^2.48.11"
+    "viem": "^2.52.2"
   }
 }
