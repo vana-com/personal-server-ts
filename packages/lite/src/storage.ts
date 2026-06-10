@@ -3,6 +3,7 @@ import type {
   DataBlockManifest,
   DataScopeBlock,
 } from "@opendatalabs/personal-server-ts-core/storage/blocks";
+import { buildDataBlocksAsync } from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import {
   DataBlockStorageError,
   encodeDataBlockCursor,
@@ -74,6 +75,11 @@ const DEFAULT_INDEXED_DB_KEY = "data-storage-v1";
 const TEXT_PAGE_MEDIA_TYPE = "text/plain; charset=utf-8";
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
+
+function schemaIdFromEnvelope(envelope: DataFileEnvelope): string | undefined {
+  const schemaId = (envelope as { schemaId?: unknown }).schemaId;
+  return typeof schemaId === "string" ? schemaId : undefined;
+}
 
 function initialState(): PsLitePersistedStorageState {
   return {
@@ -519,17 +525,40 @@ export async function createPersistentPsLiteStorage(
 
     async readScopeBlocks(scope, collectedAt, options) {
       const manifestPath = blockManifestPath(scope, collectedAt);
-      const manifest =
+      let manifest =
         (await fileStore.readBlockManifest?.(manifestPath)) ??
         (fileStore === fallbackStore
           ? null
           : await fallbackStore.readBlockManifest?.(manifestPath)) ??
         null;
+      let inMemoryBlocks: DataScopeBlock[] | null = null;
       if (!manifest) {
-        throw new DataBlockStorageError(
-          "block_manifest_not_found",
-          `Block manifest not found for ${scope} at ${collectedAt}`,
-        );
+        const envelope = await storagePort.readEnvelope(scope, collectedAt);
+        const built = await buildDataBlocksAsync({
+          scope,
+          collectedAt,
+          schemaId: schemaIdFromEnvelope(envelope),
+          content: envelope,
+        });
+        manifest = built.manifest;
+        inMemoryBlocks = built.blocks;
+        try {
+          await storagePort.writeBlockManifest?.(
+            scope,
+            collectedAt,
+            built.manifest,
+            built.blocks,
+          );
+        } catch (error) {
+          console.warn(
+            {
+              scope,
+              collectedAt,
+              ...describeStorageError(error),
+            },
+            "Block sidecar cache write failed; serving read from local envelope",
+          );
+        }
       }
 
       const cursorResult = options.cursor
@@ -568,16 +597,28 @@ export async function createPersistentPsLiteStorage(
         ) {
           break;
         }
-        const block = await readBlockPayloadFromStores(
-          fileStore,
-          fallbackStore,
-          blockPayloadPath(scope, collectedAt, ref.id),
-        );
+        const block =
+          inMemoryBlocks?.find((candidate) => candidate.id === ref.id) ??
+          (await readBlockPayloadFromStores(
+            fileStore,
+            fallbackStore,
+            blockPayloadPath(scope, collectedAt, ref.id),
+          ));
         if (!block) {
-          throw new DataBlockStorageError(
-            "block_payload_not_found",
-            `Block payload not found for ${scope} at ${collectedAt}: ${ref.id}`,
-          );
+          const envelope = await storagePort.readEnvelope(scope, collectedAt);
+          const rebuilt = await buildDataBlocksAsync({
+            scope,
+            collectedAt,
+            schemaId: schemaIdFromEnvelope(envelope),
+            content: envelope,
+          });
+          manifest = rebuilt.manifest;
+          inMemoryBlocks = rebuilt.blocks;
+          nextIndex = startIndex;
+          nextOffset = undefined;
+          bytes = 0;
+          blocks.length = 0;
+          continue;
         }
         const page = pageBlock(block, offset, maxBytes - bytes);
         blocks.push(page.block);
@@ -622,6 +663,25 @@ export async function createPersistentPsLiteStorage(
           : await fallbackStore.readBlockManifest?.(manifestPath)) ??
         null;
       return Boolean(manifest);
+    },
+
+    async canReadScopeBlocks(scope, collectedAt) {
+      if (await storagePort.hasScopeBlocks?.(scope, collectedAt)) {
+        return true;
+      }
+      const path = envelopePath(scope, collectedAt);
+      const preview =
+        (await readPreviewFromFileStore(fileStore, path, 1)) ??
+        (fileStore === fallbackStore
+          ? null
+          : await readPreviewFromFileStore(fallbackStore, path, 1));
+      if (preview) return true;
+      const envelope =
+        (await fileStore.readEnvelope(path)) ??
+        (fileStore === fallbackStore
+          ? null
+          : await fallbackStore.readEnvelope(path));
+      return Boolean(envelope);
     },
 
     async writeBlockManifest(scope, collectedAt, manifest, blocks) {
