@@ -238,6 +238,97 @@ describe("download worker", () => {
       );
     });
 
+    it("re-downloads an indexed file when its local envelope is missing", async () => {
+      const deps = makeMockDeps();
+      const existingEntry: IndexEntry = {
+        id: 1,
+        fileId: FILE_ID,
+        schemaId: SCHEMA_ID,
+        path: RELATIVE_PATH,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        createdAt: "2026-01-21T10:00:00Z",
+        sizeBytes: 128,
+      };
+      (deps.storage.findByFileId as ReturnType<typeof vi.fn>).mockReturnValue(
+        existingEntry,
+      );
+      deps.storage.hasScopeBlocks = vi.fn().mockResolvedValue(false);
+      deps.storage.readEnvelope = vi
+        .fn()
+        .mockRejectedValue(new Error("Envelope not found"));
+
+      const result = await downloadOne(deps, makeFileRecord());
+
+      expect(result).toEqual({
+        fileId: FILE_ID,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        path: RELATIVE_PATH,
+      });
+      expect(deps.storage.deleteByFileId).toHaveBeenCalledWith(FILE_ID);
+      expect(deps.storageAdapter.download).toHaveBeenCalledWith(STORAGE_URL);
+      expect(deps.storage.writeEnvelope).toHaveBeenCalledWith(makeEnvelope());
+      expect(deps.storage.insertEntry).toHaveBeenCalledWith(
+        expect.objectContaining({
+          fileId: FILE_ID,
+          scope: SCOPE,
+          collectedAt: COLLECTED_AT,
+        }),
+      );
+      expect(deps.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          fileId: FILE_ID,
+          scope: SCOPE,
+          collectedAt: COLLECTED_AT,
+        }),
+        "Removed stale local index entry missing local envelope",
+      );
+    });
+
+    it("rewrites a matching local version when its envelope is missing", async () => {
+      const deps = makeMockDeps();
+      const existingEntry: IndexEntry = {
+        id: 1,
+        fileId: null,
+        schemaId: SCHEMA_ID,
+        path: RELATIVE_PATH,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        createdAt: "2026-01-21T10:00:00Z",
+        sizeBytes: 128,
+      };
+      (deps.storage.findEntry as ReturnType<typeof vi.fn>).mockReturnValue(
+        existingEntry,
+      );
+      deps.storage.hasScopeBlocks = vi.fn().mockResolvedValue(false);
+      deps.storage.readEnvelope = vi
+        .fn()
+        .mockRejectedValue(new Error("Envelope not found"));
+
+      const result = await downloadOne(deps, makeFileRecord());
+
+      expect(result).toEqual({
+        fileId: FILE_ID,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        path: RELATIVE_PATH,
+      });
+      expect(deps.storage.updateFileId).toHaveBeenCalledWith(
+        RELATIVE_PATH,
+        FILE_ID,
+      );
+      expect(deps.storage.deleteByFileId).toHaveBeenCalledWith(FILE_ID);
+      expect(deps.storage.writeEnvelope).toHaveBeenCalledWith(makeEnvelope());
+      expect(deps.storage.insertEntry).toHaveBeenCalledWith(
+        expect.objectContaining({
+          fileId: FILE_ID,
+          scope: SCOPE,
+          collectedAt: COLLECTED_AT,
+        }),
+      );
+    });
+
     it("does not backfill block sidecars when an indexed file already has them", async () => {
       const deps = makeMockDeps();
       const existingEntry: IndexEntry = {
@@ -557,6 +648,68 @@ describe("download worker", () => {
         { repaired: 1 },
         "Repaired missing bounded block sidecars for local indexed data",
       );
+    });
+
+    it("does a full listing when local repair removes stale index entries", async () => {
+      const deps = makeMockDeps();
+      let hasStaleEntry = true;
+      const existingEntry: IndexEntry = {
+        id: 1,
+        fileId: FILE_ID,
+        schemaId: SCHEMA_ID,
+        path: RELATIVE_PATH,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        createdAt: "2026-01-21T10:00:00Z",
+        sizeBytes: 128,
+      };
+      deps.storage.listScopes = vi.fn().mockReturnValue({
+        scopes: hasStaleEntry
+          ? [
+              {
+                scope: SCOPE,
+                latestCollectedAt: COLLECTED_AT,
+                versionCount: 1,
+                dataStatus: "indexing",
+                sizeBytes: 128,
+              },
+            ]
+          : [],
+        total: hasStaleEntry ? 1 : 0,
+      });
+      (deps.storage.findEntry as ReturnType<typeof vi.fn>).mockImplementation(
+        () => (hasStaleEntry ? existingEntry : undefined),
+      );
+      (
+        deps.storage.deleteByFileId as ReturnType<typeof vi.fn>
+      ).mockImplementation(async () => {
+        hasStaleEntry = false;
+        return true;
+      });
+      deps.storage.hasScopeBlocks = vi.fn().mockResolvedValue(false);
+      deps.storage.readEnvelope = vi
+        .fn()
+        .mockRejectedValue(new Error("Envelope not found"));
+      (deps.cursor.read as ReturnType<typeof vi.fn>).mockResolvedValue(
+        "2026-06-01T00:00:00Z",
+      );
+      (
+        deps.gateway.listFilesSince as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        files: [makeFileRecord()],
+        cursor: "2026-06-10T00:00:00Z",
+      });
+
+      const results = await downloadAll(deps);
+
+      expect(results).toHaveLength(1);
+      expect(deps.storage.deleteByFileId).toHaveBeenCalledWith(FILE_ID);
+      expect(deps.cursor.read).not.toHaveBeenCalled();
+      expect(deps.gateway.listFilesSince).toHaveBeenCalledWith(OWNER, null, {
+        includeDeleted: true,
+      });
+      expect(deps.storageAdapter.download).toHaveBeenCalledWith(STORAGE_URL);
+      expect(deps.cursor.write).toHaveBeenCalledWith("2026-06-10T00:00:00Z");
     });
 
     it("polls gateway with cursor from config", async () => {
