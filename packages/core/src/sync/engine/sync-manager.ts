@@ -67,6 +67,7 @@ export function createSyncManager(
   let errors: SyncError[] = [];
   let cycleInFlight: Promise<void> | null = null;
   let rerunRequested = false;
+  let needsFullReconcile = true;
 
   async function runCycle(): Promise<void> {
     // Prevent concurrent cycles
@@ -119,9 +120,13 @@ export function createSyncManager(
 
         try {
           // Download new remote files
-          const downloadResults = await downloadAll(downloadDeps);
+          const fullReconcile = needsFullReconcile;
+          const downloadResults = await downloadAll(downloadDeps, {
+            fullReconcile,
+          });
+          needsFullReconcile = false;
           downloadDeps.logger.debug(
-            { downloaded: downloadResults.length },
+            { downloaded: downloadResults.length, fullReconcile },
             "Download cycle complete",
           );
         } catch (err) {

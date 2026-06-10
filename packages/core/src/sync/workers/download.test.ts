@@ -731,6 +731,34 @@ describe("download worker", () => {
       );
     });
 
+    it("can reconcile missing local records even when the cursor is already advanced", async () => {
+      const deps = makeMockDeps();
+      (deps.cursor.read as ReturnType<typeof vi.fn>).mockResolvedValue(
+        "2026-06-01T00:00:00Z",
+      );
+      (
+        deps.gateway.listFilesSince as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        files: [makeFileRecord({ createdAt: "2026-01-21T10:00:00Z" })],
+        cursor: "2026-06-10T00:00:00Z",
+      });
+
+      const results = await downloadAll(deps, { fullReconcile: true });
+
+      expect(results).toHaveLength(1);
+      expect(deps.cursor.read).not.toHaveBeenCalled();
+      expect(deps.gateway.listFilesSince).toHaveBeenCalledWith(OWNER, null, {
+        includeDeleted: true,
+      });
+      expect(deps.storageAdapter.download).toHaveBeenCalledWith(STORAGE_URL);
+      expect(deps.storage.insertEntry).toHaveBeenCalledWith(
+        expect.objectContaining({
+          fileId: FILE_ID,
+          scope: SCOPE,
+        }),
+      );
+    });
+
     it("reconciles a remote deletion by dropping the local copy (no download)", async () => {
       const deps = makeMockDeps();
       const deletedRecord = makeFileRecord({

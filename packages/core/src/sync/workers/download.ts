@@ -53,6 +53,15 @@ export interface DownloadResult {
   path: string;
 }
 
+export interface DownloadAllOptions {
+  /**
+   * Ignore the stored incremental cursor and reconcile from the beginning of the
+   * owner's file registry. This repairs browser caches whose cursor advanced
+   * while local IndexedDB/OPFS lost or failed to index some older records.
+   */
+  fullReconcile?: boolean;
+}
+
 interface SyncFailureMetadata {
   stage?: SyncFailureStage;
   scope?: string;
@@ -284,6 +293,7 @@ export async function downloadOne(
  */
 export async function downloadAll(
   deps: DownloadWorkerDeps,
+  options: DownloadAllOptions = {},
 ): Promise<DownloadResult[]> {
   const { gateway, cursor, serverOwner, logger } = deps;
   const syncRunId = createSyncRunId();
@@ -292,7 +302,14 @@ export async function downloadAll(
 
   // 1. Read cursor
   const lastProcessedTimestamp =
-    repairSummary.missingEnvelopeEntries > 0 ? null : await cursor.read();
+    options.fullReconcile || repairSummary.missingEnvelopeEntries > 0
+      ? null
+      : await cursor.read();
+  if (options.fullReconcile) {
+    logger.info(
+      "Running full registry reconciliation to repair any missing local scope records",
+    );
+  }
   if (repairSummary.missingEnvelopeEntries > 0) {
     logger.warn(
       { missingEnvelopeEntries: repairSummary.missingEnvelopeEntries },
