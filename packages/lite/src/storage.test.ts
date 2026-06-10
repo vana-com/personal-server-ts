@@ -639,10 +639,7 @@ describe("createPersistentPsLiteStorage", () => {
     await storage.writeEnvelope(envelope);
 
     await expect(
-      storage.canReadScopeBlocks?.(
-        "notes.profile",
-        "2026-05-08T00:00:00.000Z",
-      ),
+      storage.canReadScopeBlocks?.("notes.profile", "2026-05-08T00:00:00.000Z"),
     ).resolves.toBe(true);
     await expect(
       storage.readScopeBlocks?.("notes.profile", "2026-05-08T00:00:00.000Z", {
