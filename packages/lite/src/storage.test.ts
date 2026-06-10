@@ -606,7 +606,7 @@ describe("createPersistentPsLiteStorage", () => {
     expect(secondPage.nextCursor).toBeTruthy();
   });
 
-  it("reports missing block manifests without reading raw envelopes", async () => {
+  it("serves missing block manifests from the raw local envelope", async () => {
     const files = new Map<string, ReturnType<typeof createDataFileEnvelope>>();
     const readEnvelope = vi.fn(async (path: string) => files.get(path) ?? null);
     const dataFileStore: PsLiteDataFileStore = {
@@ -631,16 +631,36 @@ describe("createPersistentPsLiteStorage", () => {
       createMemoryPsLitePersistence(),
       dataFileStore,
     );
+    const envelope = createDataFileEnvelope(
+      "notes.profile",
+      "2026-05-08T00:00:00.000Z",
+      { bio: "cached envelope can be read without a manifest" },
+    );
+    await storage.writeEnvelope(envelope);
 
+    await expect(
+      storage.canReadScopeBlocks?.(
+        "notes.profile",
+        "2026-05-08T00:00:00.000Z",
+      ),
+    ).resolves.toBe(true);
     await expect(
       storage.readScopeBlocks?.("notes.profile", "2026-05-08T00:00:00.000Z", {
         maxBytes: 1_000,
       }),
-    ).rejects.toThrow("Block manifest not found");
+    ).resolves.toMatchObject({
+      scope: "notes.profile",
+      contentKind: "vana-envelope",
+      blocks: expect.arrayContaining([
+        expect.objectContaining({
+          path: "$.data",
+        }),
+      ]),
+    });
     await expect(
       storage.hasScopeBlocks?.("notes.profile", "2026-05-08T00:00:00.000Z"),
-    ).resolves.toBe(false);
-    expect(readEnvelope).not.toHaveBeenCalled();
+    ).resolves.toBe(true);
+    expect(readEnvelope).toHaveBeenCalled();
   });
 
   it("supports block sidecars in memory storage", async () => {

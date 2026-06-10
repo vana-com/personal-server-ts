@@ -20,6 +20,8 @@ export {
   type ValidateDataBlockCursorResult,
 } from "./cursor.js";
 
+export { buildDataBlocksAsync } from "./build.js";
+
 export {
   DataBlockStorageError,
   type DataBlockStorageErrorCode,

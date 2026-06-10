@@ -178,12 +178,17 @@ export async function listDataScopesContract(
         return summary;
       }
       const hasBlocks =
-        typeof input.storage.hasScopeBlocks === "function"
-          ? await input.storage.hasScopeBlocks(
+        typeof input.storage.canReadScopeBlocks === "function"
+          ? await input.storage.canReadScopeBlocks(
               summary.scope,
               summary.latestCollectedAt,
             )
-          : false;
+          : typeof input.storage.hasScopeBlocks === "function"
+            ? await input.storage.hasScopeBlocks(
+                summary.scope,
+                summary.latestCollectedAt,
+              )
+            : false;
       return {
         ...summary,
         dataStatus: hasBlocks ? ("ready" as const) : ("indexing" as const),
