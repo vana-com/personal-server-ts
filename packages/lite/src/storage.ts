@@ -173,6 +173,16 @@ function deleteMapPrefix<T>(map: Map<string, T>, pathPrefix: string): void {
   }
 }
 
+function describeStorageError(error: unknown): {
+  errorClass: string;
+  message: string;
+} {
+  if (error instanceof Error) {
+    return { errorClass: error.name, message: error.message };
+  }
+  return { errorClass: typeof error, message: String(error) };
+}
+
 async function getOrCreateOpfsDirectory(
   root: FileSystemDirectoryHandle,
   parts: string[],
@@ -446,18 +456,12 @@ export async function createPersistentPsLiteStorage(
         fileStore.kind === "indexeddb"
           ? Array.from(fallbackEnvelopes.values())
           : [],
-      blockManifests:
-        fileStore.kind === "indexeddb"
-          ? Array.from(fallbackBlockManifests.entries()).map(
-              ([path, manifest]) => ({ path, manifest }),
-            )
-          : [],
-      blockPayloads:
-        fileStore.kind === "indexeddb"
-          ? Array.from(fallbackBlockPayloads.entries()).map(
-              ([path, block]) => ({ path, block }),
-            )
-          : [],
+      blockManifests: Array.from(fallbackBlockManifests.entries()).map(
+        ([path, manifest]) => ({ path, manifest }),
+      ),
+      blockPayloads: Array.from(fallbackBlockPayloads.entries()).map(
+        ([path, block]) => ({ path, block }),
+      ),
     };
     const write = persistQueue.then(() => persistence.write(snapshot));
     persistQueue = write.catch(() => undefined);
@@ -621,21 +625,45 @@ export async function createPersistentPsLiteStorage(
     },
 
     async writeBlockManifest(scope, collectedAt, manifest, blocks) {
-      if (!fileStore.writeBlockManifest || !fileStore.writeBlockPayload) {
-        throw new Error("Block sidecar storage is not available");
-      }
-      await fileStore.deleteBlockTree?.(blockTreePath(scope, collectedAt));
-      for (const block of blocks) {
-        await fileStore.writeBlockPayload(
-          blockPayloadPath(scope, collectedAt, block.id),
-          block,
+      const writeTree = async (store: PsLiteDataFileStore) => {
+        if (!store.writeBlockManifest || !store.writeBlockPayload) {
+          throw new Error("Block sidecar storage is not available");
+        }
+        await store.deleteBlockTree?.(blockTreePath(scope, collectedAt));
+        for (const block of blocks) {
+          await store.writeBlockPayload(
+            blockPayloadPath(scope, collectedAt, block.id),
+            block,
+          );
+        }
+        await store.writeBlockManifest(
+          blockManifestPath(scope, collectedAt),
+          manifest,
         );
+      };
+
+      let wrotePrimary = false;
+      try {
+        await writeTree(fileStore);
+        wrotePrimary = true;
+      } catch (error) {
+        if (fileStore === fallbackStore) {
+          throw error;
+        }
+        console.warn(
+          {
+            scope,
+            collectedAt,
+            fileStoreKind: fileStore.kind,
+            fallbackStoreKind: fallbackStore.kind,
+            ...describeStorageError(error),
+          },
+          "Primary block sidecar write failed; using IndexedDB fallback",
+        );
+        await writeTree(fallbackStore);
       }
-      await fileStore.writeBlockManifest(
-        blockManifestPath(scope, collectedAt),
-        manifest,
-      );
-      if (fileStore.kind !== "indexeddb") {
+
+      if (wrotePrimary && fileStore.kind !== "indexeddb") {
         await fallbackStore.deleteBlockTree?.(
           blockTreePath(scope, collectedAt),
         );

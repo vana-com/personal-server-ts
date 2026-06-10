@@ -60,6 +60,17 @@ interface SyncFailureMetadata {
   encryptedSizeBytes?: number;
 }
 
+type MissingBlockRepairResult =
+  | "already-ready"
+  | "repaired"
+  | "missing-envelope"
+  | "not-repaired";
+
+interface LocalMissingBlockRepairSummary {
+  repaired: number;
+  missingEnvelopeEntries: number;
+}
+
 /**
  * Download and process a single file record from the storage backend:
  * 1. Check dedup: skip if fileId already in local index
@@ -81,15 +92,29 @@ export async function downloadOne(
   // 1. Check dedup: skip if fileId already in local index
   const existing = storage.findByFileId(record.fileId);
   if (existing) {
-    await repairMissingBlockSidecars(
+    const repairResult = await repairMissingBlockSidecars(
       storage,
       logger,
       record,
       existing,
       diagnostics,
     );
-    logger.debug({ fileId: record.fileId }, "File already in index, skipping");
-    return null;
+    if (repairResult === "missing-envelope") {
+      logger.warn(
+        {
+          fileId: record.fileId,
+          scope: existing.scope,
+          collectedAt: existing.collectedAt,
+        },
+        "Local index entry was missing its envelope; re-downloading file",
+      );
+    } else {
+      logger.debug(
+        { fileId: record.fileId },
+        "File already in index, skipping",
+      );
+      return null;
+    }
   }
 
   // 2. Download OpenPGP encrypted binary from storage backend.
@@ -171,7 +196,7 @@ export async function downloadOne(
     if (existingByVersion.fileId !== record.fileId) {
       await storage.updateFileId(existingByVersion.path, record.fileId);
     }
-    await repairMissingBlockSidecars(
+    const repairResult = await repairMissingBlockSidecars(
       storage,
       logger,
       record,
@@ -182,15 +207,25 @@ export async function downloadOne(
       },
       diagnostics,
     );
-    logger.debug(
+    if (repairResult !== "missing-envelope") {
+      logger.debug(
+        {
+          fileId: record.fileId,
+          scope: envelope.scope,
+          collectedAt: envelope.collectedAt,
+        },
+        "File version already exists locally, skipping",
+      );
+      return null;
+    }
+    logger.warn(
       {
         fileId: record.fileId,
         scope: envelope.scope,
         collectedAt: envelope.collectedAt,
       },
-      "File version already exists locally, skipping",
+      "Local version entry was missing its envelope; rewriting downloaded file",
     );
-    return null;
   }
 
   // 7. Write to local storage via the runtime storage port
@@ -253,10 +288,17 @@ export async function downloadAll(
   const { gateway, cursor, serverOwner, logger } = deps;
   const syncRunId = createSyncRunId();
 
-  await repairLocalMissingBlockSidecars(deps);
+  const repairSummary = await repairLocalMissingBlockSidecars(deps);
 
   // 1. Read cursor
-  const lastProcessedTimestamp = await cursor.read();
+  const lastProcessedTimestamp =
+    repairSummary.missingEnvelopeEntries > 0 ? null : await cursor.read();
+  if (repairSummary.missingEnvelopeEntries > 0) {
+    logger.warn(
+      { missingEnvelopeEntries: repairSummary.missingEnvelopeEntries },
+      "Resetting this sync listing to repair stale local index entries",
+    );
+  }
 
   // 2. Poll gateway for new file records, including soft-deleted ones so we can reconcile deletions
   // of files this device already holds (cross-device "deleted on desktop → gone on web too").
@@ -343,16 +385,20 @@ export async function downloadAll(
 
 export async function repairLocalMissingBlockSidecars(
   deps: Pick<DownloadWorkerDeps, "storage" | "logger" | "diagnostics">,
-): Promise<number> {
+): Promise<LocalMissingBlockRepairSummary> {
   const { storage, logger, diagnostics } = deps;
-  if (!storage.writeBlockManifest || !storage.hasScopeBlocks) return 0;
+  if (!storage.writeBlockManifest || !storage.hasScopeBlocks) {
+    return { repaired: 0, missingEnvelopeEntries: 0 };
+  }
 
   let repaired = 0;
+  let missingEnvelopeEntries = 0;
   let offset = 0;
   const limit = 100;
 
   while (true) {
     const page = storage.listScopes({ limit, offset });
+    let deletedEntryInPage = false;
     for (const scopeSummary of page.scopes) {
       const entry = storage.findEntry({
         scope: scopeSummary.scope,
@@ -360,7 +406,7 @@ export async function repairLocalMissingBlockSidecars(
       });
       if (!entry) continue;
 
-      const repairedScope = await repairMissingBlockSidecars(
+      const repairResult = await repairMissingBlockSidecars(
         storage,
         logger,
         {
@@ -373,10 +419,16 @@ export async function repairLocalMissingBlockSidecars(
         entry,
         diagnostics,
       );
-      if (repairedScope) repaired += 1;
+      if (repairResult === "repaired") repaired += 1;
+      if (repairResult === "missing-envelope") {
+        missingEnvelopeEntries += 1;
+        deletedEntryInPage = true;
+      }
     }
 
-    offset += page.scopes.length;
+    if (!deletedEntryInPage) {
+      offset += page.scopes.length;
+    }
     if (offset >= page.total || page.scopes.length === 0) break;
   }
 
@@ -386,7 +438,13 @@ export async function repairLocalMissingBlockSidecars(
       "Repaired missing bounded block sidecars for local indexed data",
     );
   }
-  return repaired;
+  if (missingEnvelopeEntries > 0) {
+    logger.warn(
+      { missingEnvelopeEntries },
+      "Removed stale local index entries missing local envelopes",
+    );
+  }
+  return { repaired, missingEnvelopeEntries };
 }
 
 function createSyncRunId(): string {
@@ -492,8 +550,10 @@ async function repairMissingBlockSidecars(
     path: string;
   },
   diagnostics?: DownloadDiagnosticsHook,
-): Promise<boolean> {
-  if (!storage.writeBlockManifest || !storage.hasScopeBlocks) return false;
+): Promise<MissingBlockRepairResult> {
+  if (!storage.writeBlockManifest || !storage.hasScopeBlocks) {
+    return "not-repaired";
+  }
 
   let hasBlocks = false;
   try {
@@ -508,9 +568,9 @@ async function repairMissingBlockSidecars(
       },
       "Bounded block sidecar repair skipped after readiness check failed",
     );
-    return false;
+    return "not-repaired";
   }
-  if (hasBlocks) return false;
+  if (hasBlocks) return "already-ready";
 
   diagnostics?.onRepair(
     entry.scope,
@@ -530,7 +590,24 @@ async function repairMissingBlockSidecars(
       },
       "Bounded block sidecar repair skipped because local envelope is unavailable",
     );
-    return false;
+    if (entry.fileId) {
+      diagnostics?.onRepair(
+        entry.scope,
+        "index exists without local payload; removing stale local index entry",
+      );
+      const removed = await storage.deleteByFileId(entry.fileId);
+      logger.warn(
+        {
+          fileId: entry.fileId,
+          scope: entry.scope,
+          collectedAt: entry.collectedAt,
+          removed,
+        },
+        "Removed stale local index entry missing local envelope",
+      );
+      return removed ? "missing-envelope" : "not-repaired";
+    }
+    return "not-repaired";
   }
 
   await writeBlockSidecars(
@@ -547,7 +624,9 @@ async function repairMissingBlockSidecars(
   );
 
   try {
-    return await storage.hasScopeBlocks(entry.scope, entry.collectedAt);
+    return (await storage.hasScopeBlocks(entry.scope, entry.collectedAt))
+      ? "repaired"
+      : "not-repaired";
   } catch (error) {
     logger.warn(
       {
@@ -558,6 +637,6 @@ async function repairMissingBlockSidecars(
       },
       "Bounded block sidecar repair completed but readiness could not be verified",
     );
-    return false;
+    return "not-repaired";
   }
 }

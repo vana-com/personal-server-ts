@@ -451,6 +451,75 @@ describe("createPersistentPsLiteStorage", () => {
     ).resolves.toBe(true);
   });
 
+  it("falls back to IndexedDB block sidecars when the primary file store cannot write them", async () => {
+    const persistence = createMemoryPsLitePersistence();
+    const primaryWriteAttempts: string[] = [];
+    const dataFileStore: PsLiteDataFileStore = {
+      kind: "opfs",
+      async readEnvelope() {
+        return null;
+      },
+      async writeEnvelope() {
+        return 0;
+      },
+      async deleteEnvelope() {},
+      async readBlockManifest() {
+        return null;
+      },
+      async writeBlockManifest() {
+        primaryWriteAttempts.push("manifest");
+        throw new DOMException("locked", "NoModificationAllowedError");
+      },
+      async readBlockPayload() {
+        return null;
+      },
+      async writeBlockPayload() {
+        primaryWriteAttempts.push("payload");
+        throw new DOMException("locked", "NoModificationAllowedError");
+      },
+      async deleteBlockTree() {},
+    };
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      persistence,
+      dataFileStore,
+    );
+    const { manifest, blocks } = blockFixture(
+      "linkedin.skills",
+      "2026-03-06T20:26:21Z",
+      2,
+    );
+
+    await storage.writeBlockManifest?.(
+      manifest.scope,
+      manifest.collectedAt,
+      manifest,
+      blocks,
+    );
+
+    expect(primaryWriteAttempts).toEqual(["payload"]);
+    await expect(
+      storage.hasScopeBlocks?.(manifest.scope, manifest.collectedAt),
+    ).resolves.toBe(true);
+    await expect(
+      storage.readScopeBlocks?.(manifest.scope, manifest.collectedAt, {
+        maxBytes: 1_000,
+      }),
+    ).resolves.toMatchObject({
+      scope: "linkedin.skills",
+      blocks: [{ value: { index: 0 } }, { value: { index: 1 } }],
+    });
+
+    const reloaded = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      persistence,
+      dataFileStore,
+    );
+    await expect(
+      reloaded.hasScopeBlocks?.(manifest.scope, manifest.collectedAt),
+    ).resolves.toBe(true);
+  });
+
   it("pages block sidecar reads by cursor until all blocks are reachable", async () => {
     const storage = await createPersistentPsLiteStorage(
       { kind: "indexeddb" },
