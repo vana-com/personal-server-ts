@@ -252,10 +252,10 @@ describe("createPsLiteRuntime", () => {
     expect(storage.listScopes({ limit: 20, offset: 0 }).total).toBe(1);
   });
 
-  it("auto-registers a no-schema for binary uploads to a novel scope", async () => {
-    // Regression: PS-Lite must register a "no-schema" for binary scopes that
-    // lack one (like the Node server). Without the wired registrar the sync
-    // upload worker later fails with "No schema found for scope".
+  it("ingests binary uploads schemaless on DPv2 (no no-schema registration)", async () => {
+    // DPv2 data points are scope-addressed and carry no schemaId, so binary
+    // uploads to a novel scope must NOT register a "no schema" — the upload
+    // worker no longer needs one.
     const signSchemaRegistration = vi.fn().mockResolvedValue("0xschemasig");
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ data: { schemaId: "0xnoschema" } }), {
@@ -280,7 +280,6 @@ describe("createPsLiteRuntime", () => {
         },
         serverSigner: {
           address: "0x1111111111111111111111111111111111111111",
-          signFileRegistration: vi.fn(),
           signGrantRegistration: vi.fn(),
           signSchemaRegistration,
         },
@@ -300,13 +299,10 @@ describe("createPsLiteRuntime", () => {
       );
 
       expect(res.status).toBe(201);
-      expect(signSchemaRegistration).toHaveBeenCalledTimes(1);
-      expect(signSchemaRegistration.mock.calls[0][0]).toMatchObject({
-        scope: "dexa.scan",
-      });
-      expect(fetchMock).toHaveBeenCalledWith(
+      expect(signSchemaRegistration).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalledWith(
         "https://gw.test/v1/schemas",
-        expect.objectContaining({ method: "POST" }),
+        expect.anything(),
       );
     } finally {
       fetchMock.mockRestore();

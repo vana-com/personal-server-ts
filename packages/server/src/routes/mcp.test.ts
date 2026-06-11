@@ -94,22 +94,24 @@ function makeGatewayForGrantee(opts: {
   grantId?: string;
   scopes?: string[];
 }): { gateway: GatewayClient; grant: GatewayGrantResponse } {
-  const grant: GatewayGrantResponse = {
+  const grant = {
     id: opts.grantId ?? "grant-mcp-1",
     grantorAddress: ownerWallet.address,
     granteeId: opts.granteeAddress,
-    grant: JSON.stringify({
-      user: ownerWallet.address,
-      builder: opts.granteeAddress,
-      scopes: opts.scopes ?? ["instagram.*"],
-      expiresAt: Math.floor(Date.now() / 1000) + 3600,
-    }),
-    fileIds: [],
+    // Canary GatewayGrantResponse is flat: scopes is a top-level string[] and
+    // expiresAt is a decimal-string uint256 (null = perpetual).
+    scopes: opts.scopes ?? ["instagram.*"],
     status: "confirmed",
     addedAt: "2026-01-21T10:00:00.000Z",
+    expiresAt: null,
+    expired: false,
     revokedAt: null,
     revocationSignature: null,
-  };
+    paymentStatus: "paid",
+    paidAt: null,
+    paidBy: null,
+    grantVersion: "1",
+  } as unknown as GatewayGrantResponse;
   const builder: Builder = {
     id: opts.granteeAddress,
     ownerAddress: ownerWallet.address,
@@ -132,11 +134,13 @@ function makeGatewayForGrantee(opts: {
       addedAt: "2026-01-21T10:00:00.000Z",
     }),
     getServer: vi.fn().mockResolvedValue(null),
-    getFile: vi.fn().mockResolvedValue(null),
-    listFilesSince: vi.fn().mockResolvedValue({ files: [], cursor: null }),
+    getDataPoint: vi.fn().mockResolvedValue(null),
+    listDataPointsByOwner: vi
+      .fn()
+      .mockResolvedValue({ dataPoints: [], cursor: null }),
     getSchema: vi.fn().mockResolvedValue(null),
     registerServer: vi.fn().mockResolvedValue({ alreadyRegistered: false }),
-    registerFile: vi.fn().mockResolvedValue({}),
+    registerDataPoint: vi.fn().mockResolvedValue({ dataPointId: "0xdp" }),
     createGrant: vi.fn().mockResolvedValue({
       grantId: opts.grantId ?? "grant-mcp-1",
     }),

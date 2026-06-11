@@ -64,7 +64,6 @@ import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-c
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type {
   DataStoragePort,
-  FeeVerifierPort,
   RuntimeAvailabilityPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
 import type { TokenStore } from "../token-store.js";
@@ -90,7 +89,6 @@ export interface McpRouteDeps {
   indexManager?: IndexManager;
   hierarchyOptions?: HierarchyManagerOptions;
   dataStorage?: DataStoragePort;
-  feeVerifier?: FeeVerifierPort;
   runtimeAvailability?: RuntimeAvailabilityPort;
   /** Per-process connection store. Defaults to in-memory. */
   connectionStore?: McpConnectionStore;
@@ -226,7 +224,6 @@ function buildDataApiDeps(deps: McpRouteDeps): PersonalServerDataApiDeps {
     accessToken: deps.accessToken,
     tokenStore: deps.tokenStore,
     dataStorage,
-    feeVerifier: deps.feeVerifier,
     runtimeAvailability: deps.runtimeAvailability,
   });
 
@@ -236,7 +233,6 @@ function buildDataApiDeps(deps: McpRouteDeps): PersonalServerDataApiDeps {
     schemaResolver: deps.gateway,
     accessLogWriter: deps.accessLogWriter,
     runtimeAvailability: deps.runtimeAvailability,
-    feeVerifier: deps.feeVerifier,
     logger: deps.logger,
   };
 }
