@@ -5,6 +5,8 @@ import {
   type DataFileEnvelope,
 } from "@opendatalabs/vana-sdk/browser";
 import { type WriteResult } from "../storage/hierarchy/index.js";
+import { buildBinaryEnvelopeData, sha256Hex } from "./binary.js";
+import { buildDataBlocksAsync } from "../storage/blocks/build.js";
 
 export type DataContractErrorCode =
   | "INVALID_SCOPE"
@@ -97,6 +99,20 @@ export interface IngestDataContractResult {
   writeResult: WriteResult;
 }
 
+export interface IngestBinaryDataContractInput {
+  storage: DataStoragePort;
+  scopeParam: string;
+  bytes: Uint8Array;
+  mimeType: string;
+  filename?: string;
+  /** Free-form caller metadata (e.g. a description) stored alongside the file. */
+  metadata?: unknown;
+  collectedAt: string;
+  status: "stored" | "syncing";
+  schemaUrl?: string;
+  schemaId?: string;
+}
+
 export interface DeleteDataScopeContractInput {
   storage: DataStoragePort;
   scopeParam: string;
@@ -142,9 +158,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-export function listDataScopesContract(
+export async function listDataScopesContract(
   input: ListDataScopesContractInput,
-): ListDataScopesContractResult {
+): Promise<ListDataScopesContractResult> {
   const limit = normalizeLimit(input.limit);
   const offset = normalizeOffset(input.offset);
   const result = input.storage.listScopes({
@@ -152,10 +168,38 @@ export function listDataScopesContract(
     limit,
     offset,
   });
+  const scopes = await Promise.all(
+    result.scopes.map(async (summary) => {
+      const entry = input.storage.findEntry({
+        scope: summary.scope,
+        at: summary.latestCollectedAt,
+      });
+      if (!entry) {
+        return summary;
+      }
+      const hasBlocks =
+        typeof input.storage.canReadScopeBlocks === "function"
+          ? await input.storage.canReadScopeBlocks(
+              summary.scope,
+              summary.latestCollectedAt,
+            )
+          : typeof input.storage.hasScopeBlocks === "function"
+            ? await input.storage.hasScopeBlocks(
+                summary.scope,
+                summary.latestCollectedAt,
+              )
+            : false;
+      return {
+        ...summary,
+        dataStatus: hasBlocks ? ("ready" as const) : ("indexing" as const),
+        sizeBytes: entry.sizeBytes,
+      };
+    }),
+  );
   return {
     ok: true,
     response: {
-      scopes: result.scopes,
+      scopes,
       total: result.total,
       limit,
       offset,
@@ -250,6 +294,11 @@ export async function ingestDataContract(
     input.schemaId,
   );
   const writeResult = await input.storage.writeEnvelope(envelope);
+  try {
+    await writeBlockSidecars(input.storage, envelope);
+  } catch {
+    // Best-effort bounded sidecars: raw envelope storage remains the source of truth.
+  }
   await input.storage.insertEntry({
     fileId: null,
     schemaId: input.schemaId ?? null,
@@ -257,6 +306,74 @@ export async function ingestDataContract(
     scope: scopeResult.scope,
     collectedAt: input.collectedAt,
     sizeBytes: writeResult.sizeBytes,
+  });
+
+  return {
+    ok: true,
+    scope: scopeResult.scope,
+    collectedAt: input.collectedAt,
+    response: {
+      scope: scopeResult.scope,
+      collectedAt: input.collectedAt,
+      status: input.status,
+    },
+    writeResult,
+  };
+}
+
+/**
+ * Ingest unstructured/binary data (e.g. a PDF). The bytes are hashed and
+ * base64-encoded into a binary DataFileEnvelope, then written and indexed
+ * exactly like JSON ingest — so the downstream encrypt/upload/register path is
+ * unchanged. Unlike JSON ingest, the body is raw bytes (not a JSON object) and
+ * `schemaId` may be absent (the caller decides whether to auto-register one).
+ */
+export async function ingestBinaryDataContract(
+  input: IngestBinaryDataContractInput,
+): Promise<IngestDataContractResult | DataContractError> {
+  const scopeResult = parseDataScopeContract(input.scopeParam);
+  if (!scopeResult.ok) return scopeResult;
+
+  if (input.bytes.length === 0) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: "INVALID_BODY",
+        message: "Request body must not be empty",
+      },
+    };
+  }
+
+  const contentHash = await sha256Hex(input.bytes);
+  const data = buildBinaryEnvelopeData({
+    bytes: input.bytes,
+    mimeType: input.mimeType,
+    filename: input.filename,
+    contentHash,
+    metadata: input.metadata,
+  });
+
+  const envelope = createDataFileEnvelope(
+    scopeResult.scope,
+    input.collectedAt,
+    data,
+    input.schemaUrl,
+    input.schemaId,
+  );
+  const writeResult = await input.storage.writeEnvelope(envelope);
+  try {
+    await writeBlockSidecars(input.storage, envelope);
+  } catch {
+    // Best-effort bounded sidecars: raw envelope storage remains the source of truth.
+  }
+  await input.storage.insertEntry({
+    fileId: null,
+    schemaId: input.schemaId ?? null,
+    path: writeResult.relativePath,
+    scope: scopeResult.scope,
+    collectedAt: input.collectedAt,
+    sizeBytes: input.bytes.length,
   });
 
   return {
@@ -282,4 +399,24 @@ export async function deleteDataScopeContract(
     ok: true,
     deletedCount: await input.storage.deleteScope(scopeResult.scope),
   };
+}
+
+async function writeBlockSidecars(
+  storage: DataStoragePort,
+  envelope: DataFileEnvelope,
+): Promise<void> {
+  if (!storage.writeBlockManifest) return;
+
+  const built = await buildDataBlocksAsync({
+    scope: envelope.scope,
+    collectedAt: envelope.collectedAt,
+    schemaId: envelope.schemaId,
+    content: envelope,
+  });
+  await storage.writeBlockManifest(
+    envelope.scope,
+    envelope.collectedAt,
+    built.manifest,
+    built.blocks,
+  );
 }

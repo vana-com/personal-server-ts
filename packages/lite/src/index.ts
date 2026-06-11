@@ -99,6 +99,29 @@ export {
 } from "./runtime.js";
 
 export {
+  createIndexedDbMcpConnectionStore,
+  createIndexedDbMcpOAuthAuthorizationStore,
+  type IndexedDbMcpConnectionStoreOptions,
+  type IndexedDbMcpOAuthAuthorizationStoreOptions,
+} from "./mcp-store.js";
+
+export {
+  DiagnosticsRecorder,
+  collectDiagnosticsWithTimeout,
+  DIAGNOSTICS_VERSION,
+  type ActiveOperation,
+  type DiagnosticsEvent,
+  type DiagnosticsPhase,
+  type LastNetworkOperation,
+  type PsLiteDiagnosticsSnapshot,
+  type RecordEventOptions,
+  type ScopeDiagnostics,
+  type ScopeReadinessStatus,
+  type StorageHealthSummary,
+  type SyncDiagnostics,
+} from "./diagnostics.js";
+
+export {
   decodeDataFrame,
   encodeDataFrame,
   psLiteRelayControlUrl,

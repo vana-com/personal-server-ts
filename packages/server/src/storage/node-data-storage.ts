@@ -1,4 +1,13 @@
-import { deleteAllForScope, readDataFile, writeDataFile } from "./hierarchy.js";
+import {
+  deleteAllForScope,
+  deleteDataFile,
+  readDataFile,
+  readDataFilePreview,
+  hasScopeBlocks,
+  readScopeBlocks,
+  writeBlockManifest,
+  writeDataFile,
+} from "./hierarchy.js";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type {
@@ -49,8 +58,36 @@ export function createNodeDataStorage(
     readEnvelope(scope: string, collectedAt: string) {
       return readDataFile(deps.hierarchyOptions, scope, collectedAt);
     },
+    readEnvelopePreview(scope: string, collectedAt: string, { maxBytes }) {
+      return readDataFilePreview(
+        deps.hierarchyOptions,
+        scope,
+        collectedAt,
+        maxBytes,
+      );
+    },
+    readScopeBlocks(scope: string, collectedAt: string, options) {
+      return readScopeBlocks(
+        deps.hierarchyOptions,
+        scope,
+        collectedAt,
+        options,
+      );
+    },
+    hasScopeBlocks(scope: string, collectedAt: string) {
+      return hasScopeBlocks(deps.hierarchyOptions, scope, collectedAt);
+    },
     writeEnvelope(envelope: DataFileEnvelope) {
       return writeDataFile(deps.hierarchyOptions, envelope);
+    },
+    writeBlockManifest(scope, collectedAt, manifest, blocks) {
+      return writeBlockManifest(
+        deps.hierarchyOptions,
+        scope,
+        collectedAt,
+        manifest,
+        blocks,
+      );
     },
     insertEntry(entry) {
       return deps.indexManager.insert(entry);
@@ -68,6 +105,21 @@ export function createNodeDataStorage(
       const deletedCount = deps.indexManager.deleteByScope(scope);
       await deleteAllForScope(deps.hierarchyOptions, scope);
       return deletedCount;
+    },
+    async deleteByFileId(fileId: string) {
+      const entry = deps.indexManager.findByFileId(fileId);
+      if (!entry) return false;
+      // Delete the blob FIRST; only drop the index row once it's gone (deleteDataFile is
+      // ENOENT-tolerant). If blob deletion fails for a real reason, the row is preserved so the next
+      // sync retry re-attempts — rather than the row vanishing and the cursor advancing past an
+      // orphaned local blob.
+      await deleteDataFile(
+        deps.hierarchyOptions,
+        entry.scope,
+        entry.collectedAt,
+      );
+      deps.indexManager.deleteByPath(entry.path);
+      return true;
     },
   };
 }

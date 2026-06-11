@@ -5,12 +5,14 @@ import {
   type DataStoragePort,
   type RuntimeAvailabilityPort,
   type SchemaResolverPort,
+  type SchemaRegistrarPort,
 } from "../ports/index.js";
 import type { DataReadPolicyPorts } from "../policy/index.js";
 import type { SyncManager } from "../sync/index.js";
 import {
   deleteDataScopeContract,
   ingestDataContract,
+  ingestBinaryDataContract,
   listAccessLogsContract,
   listDataScopesContract,
   listDataVersionsContract,
@@ -33,6 +35,10 @@ import {
   type VerifyGrantContractInput,
   validateServerConfigContract,
   verifyGrantContract,
+  decodeBinaryEnvelope,
+  isBinaryEnvelope,
+  parseMetadataHeader,
+  stringifyMetadataHeader,
 } from "../contracts/index.js";
 import type {
   DataPortabilityGatewayConfig,
@@ -45,6 +51,14 @@ import {
   verifyPayment,
   type X402Challenge,
 } from "../payment/index.js";
+
+export {
+  createSchemaRegistrar,
+  NO_SCHEMA_DEFINITION_URL,
+  NO_SCHEMA_DIALECT,
+  NO_SCHEMA_NAME,
+  type SchemaRegistrarDeps,
+} from "./schema-registrar.js";
 
 export interface PersonalServerReadAuthInput {
   request: Request;
@@ -75,12 +89,16 @@ export interface PersonalServerApiLogger {
 export interface PersonalServerIngestSyncManager {
   trigger(): Promise<void>;
   notifyNewData?(): void;
+  /** Propagate a scope deletion to R2 + the gateway before the local delete. */
+  deleteScopeRemote?(scope: string): Promise<void>;
 }
 
 export interface PersonalServerDataApiDeps {
   storage: DataStoragePort;
   auth: PersonalServerApiAuthPort;
   schemaResolver?: SchemaResolverPort;
+  /** Auto-registers a "no-schema" schema for binary scopes that lack one. */
+  schemaRegistrar?: SchemaRegistrarPort;
   accessLogWriter: AccessLogWriter;
   syncManager?: PersonalServerIngestSyncManager | null;
   runtimeAvailability?: RuntimeAvailabilityPort;
@@ -564,6 +582,63 @@ async function resolveSchema(
   }
 }
 
+/** True when the request body should be treated as a JSON object (the legacy
+ * path). Missing/blank Content-Type is treated as JSON for backward compat. */
+function isJsonContentType(request: Request): boolean {
+  const ct = request.headers.get("content-type");
+  if (!ct) return true;
+  return ct.toLowerCase().includes("application/json");
+}
+
+function binaryMimeType(request: Request): string {
+  const ct = request.headers.get("content-type");
+  if (!ct) return "application/octet-stream";
+  // Strip any "; charset=..." / boundary parameters.
+  return ct.split(";")[0].trim() || "application/octet-stream";
+}
+
+/** Extract a filename from X-Filename or a Content-Disposition header. */
+function binaryFilename(request: Request): string | undefined {
+  const explicit = request.headers.get("x-filename");
+  if (explicit) return explicit;
+  const disposition = request.headers.get("content-disposition");
+  const match = disposition?.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+  return match ? decodeURIComponent(match[1]) : undefined;
+}
+
+/**
+ * Resolve a schema for a binary scope, registering a permissive "no-schema"
+ * schema when none exists. Unlike the JSON path this never hard-fails on a
+ * missing schema: if there is no registrar, ingestion proceeds with no schemaId
+ * (the entry is registered against the gateway's resolved schema later).
+ */
+async function resolveBinarySchema(
+  deps: Pick<
+    PersonalServerDataApiDeps,
+    "schemaResolver" | "schemaRegistrar" | "logger"
+  >,
+  scope: string,
+): Promise<{ schemaId?: string; schemaUrl?: string }> {
+  if (deps.schemaResolver) {
+    const schema = await deps.schemaResolver.getSchemaForScope(scope);
+    if (schema) {
+      return { schemaId: schema.id, schemaUrl: schema.definitionUrl };
+    }
+  }
+  if (deps.schemaRegistrar) {
+    const registered = await deps.schemaRegistrar.registerNoSchema(scope);
+    deps.logger?.info?.(
+      { scope, schemaId: registered.schemaId },
+      "Registered no-schema schema for binary scope",
+    );
+    return {
+      schemaId: registered.schemaId,
+      schemaUrl: registered.definitionUrl,
+    };
+  }
+  return {};
+}
+
 function notifyNewData(
   syncManager: PersonalServerDataApiDeps["syncManager"],
 ): void {
@@ -587,7 +662,7 @@ export async function handlePersonalServerDataRequest(
     if (pathname === "/" || pathname === "") {
       if (request.method !== "GET") return methodNotAllowed();
       await deps.auth.authorizeBuilderList(request);
-      const result = listDataScopesContract({
+      const result = await listDataScopesContract({
         storage: deps.storage,
         scopePrefix: url.searchParams.get("scopePrefix") ?? undefined,
         limit: normalizeLimit(url.searchParams.get("limit"), 20),
@@ -711,6 +786,31 @@ export async function handlePersonalServerDataRequest(
       if (paymentResponseHeader) {
         headers["X-PAYMENT-RESPONSE"] = paymentResponseHeader;
       }
+
+      // `?content=raw` streams the decoded bytes of a binary envelope with its
+      // original media type, so a builder can download the file directly. The
+      // X-PAYMENT-RESPONSE header (if any) rides along on the raw response too.
+      if (
+        url.searchParams.get("content") === "raw" &&
+        isBinaryEnvelope(result.envelope)
+      ) {
+        const decoded = decodeBinaryEnvelope(result.envelope);
+        headers["Content-Type"] = decoded.mimeType;
+        headers["Content-Length"] = String(decoded.bytes.length);
+        if (decoded.filename) {
+          headers["Content-Disposition"] =
+            `attachment; filename="${decoded.filename}"`;
+        }
+        if (decoded.metadata !== undefined) {
+          headers["X-Vana-Metadata"] = stringifyMetadataHeader(
+            decoded.metadata,
+          );
+        }
+        return new Response(decoded.bytes as unknown as BodyInit, {
+          status: 200,
+          headers,
+        });
+      }
       return jsonResponse(result.envelope, { headers });
     }
 
@@ -718,6 +818,44 @@ export async function handlePersonalServerDataRequest(
       await deps.auth.authorizeOwner(request);
       const scopeResult = parseDataScopeContract(scopeParam);
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
+      const collectedAtValue = collectedAt(deps.now ?? (() => new Date()));
+      const status = deps.syncManager ? "syncing" : "stored";
+
+      // Binary / unstructured data (e.g. a PDF): the body is raw bytes and the
+      // scope may not have a registered schema — auto-register a no-schema one.
+      if (!isJsonContentType(request)) {
+        const { schemaId, schemaUrl } = await resolveBinarySchema(
+          deps,
+          scopeResult.scope,
+        );
+        const bytes = new Uint8Array(await request.arrayBuffer());
+        const result = await ingestBinaryDataContract({
+          storage: deps.storage,
+          scopeParam: scopeResult.scope,
+          bytes,
+          mimeType: binaryMimeType(request),
+          filename: binaryFilename(request),
+          metadata: parseMetadataHeader(request.headers.get("x-vana-metadata")),
+          collectedAt: collectedAtValue,
+          status,
+          schemaUrl,
+          schemaId,
+        });
+        if (!result.ok) return contractErrorResponse(result);
+        deps.logger?.info?.(
+          {
+            scope: scopeResult.scope,
+            collectedAt: collectedAtValue,
+            path: result.writeResult.relativePath,
+            mimeType: binaryMimeType(request),
+            sizeBytes: bytes.length,
+          },
+          "Binary data file ingested",
+        );
+        notifyNewData(deps.syncManager);
+        return jsonResponse(result.response, { status: 201 });
+      }
+
       const parsed = await parseJsonObjectBody(
         request,
         "Request body must be valid JSON",
@@ -725,13 +863,12 @@ export async function handlePersonalServerDataRequest(
       if (!parsed.ok) return contractResponse(parsed.result);
       const schema = await resolveSchema(deps, scopeResult.scope);
       if (!schema.ok) return schema.response;
-      const collectedAtValue = collectedAt(deps.now ?? (() => new Date()));
       const result = await ingestDataContract({
         storage: deps.storage,
         scopeParam: scopeResult.scope,
         body: parsed.body,
         collectedAt: collectedAtValue,
-        status: deps.syncManager ? "syncing" : "stored",
+        status,
         schemaUrl: schema.schemaUrl,
         schemaId: schema.schemaId,
       });
@@ -750,6 +887,22 @@ export async function handlePersonalServerDataRequest(
 
     if (request.method === "DELETE") {
       await deps.auth.authorizeOwner(request);
+      // Propagate the deletion to the authoritative stores (R2 blobs + gateway records) BEFORE the
+      // local delete — it reads the local index to find what to remove. Best-effort: a remote
+      // failure must not block the owner's local delete (and sync would otherwise resurrect it; the
+      // download-worker reconciliation is the backstop). Parse the scope first so an invalid scope
+      // still 400s without a wasted remote call.
+      const parsed = parseDataScopeContract(scopeParam);
+      if (parsed.ok && deps.syncManager?.deleteScopeRemote) {
+        try {
+          await deps.syncManager.deleteScopeRemote(parsed.scope);
+        } catch (err) {
+          deps.logger?.info?.(
+            { scope: scopeParam, error: (err as Error).message },
+            "Remote scope deletion failed; proceeding with local delete",
+          );
+        }
+      }
       const result = await deleteDataScopeContract({
         storage: deps.storage,
         scopeParam,

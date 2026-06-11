@@ -15,6 +15,19 @@ import { dataRoutes } from "./routes/data.js";
 import { grantsRoutes } from "./routes/grants.js";
 import { accessLogsRoutes } from "./routes/access-logs.js";
 import { syncRoutes } from "./routes/sync.js";
+import {
+  mcpActivityRoutes,
+  mcpConnectionsRoutes,
+  mcpOAuthRoutes,
+  mcpStreamableHttpRoutes,
+} from "./routes/mcp.js";
+import {
+  McpActivityRecorder,
+  createInMemoryMcpConnectionStore,
+  createInMemoryMcpOAuthAuthorizationStore,
+  type McpConnectionStore,
+  type McpOAuthAuthorizationStore,
+} from "@opendatalabs/personal-server-ts-core/mcp";
 import { uiConfigRoutes } from "./routes/ui-config.js";
 import { uiRegistrationRoutes } from "./routes/ui-registration.js";
 import { uiRoute } from "./routes/ui.js";
@@ -75,6 +88,16 @@ export interface AppDeps {
    */
   paymentEnabled?: boolean;
   getTunnelStatus?: HealthDeps["getTunnelStatus"];
+  /**
+   * MCP connection store shared between the `/mcp/:token` Streamable HTTP
+   * endpoint and the owner `/v1/mcp/connections` management surface. Defaults
+   * to an in-memory store so the routes are wired up out of the box; pass an
+   * IndexedDB-backed (or persistent) store for production.
+   */
+  mcpConnectionStore?: McpConnectionStore;
+  mcpOAuthAuthorizationStore?: McpOAuthAuthorizationStore;
+  mcpOAuthApprovalUrl?: string | (() => string);
+  mcpActivityRecorder?: McpActivityRecorder;
 }
 
 export function createApp(deps: AppDeps): Hono {
@@ -133,7 +156,8 @@ export function createApp(deps: AppDeps): Hono {
       // POST /v1/escrow/pay (direct fetch — bypasses the SDK client to
       // preserve the gateway's structured error bodies).
       gatewayConfig: deps.gatewayConfig,
-      gatewayUrl: deps.gatewayUrl,
+      gatewayUrl:
+        deps.gatewayUrl ?? deps.config?.gateway.url ?? deps.gatewayConfig?.url,
       paymentEnabled: deps.paymentEnabled,
       mountPath: "/v1/data",
     }),
@@ -187,6 +211,44 @@ export function createApp(deps: AppDeps): Hono {
       mountPath: "/v1/sync",
     }),
   );
+
+  // MCP — Phase 1 / 260604-PLAN-vana-mcp-personal-server.md.
+  // Owner endpoints + Claude-facing Streamable HTTP endpoint share a single
+  // connection store so the management API and the data path agree on which
+  // connections exist.
+  const mcpConnectionStore =
+    deps.mcpConnectionStore ?? createInMemoryMcpConnectionStore();
+  const mcpOAuthAuthorizationStore =
+    deps.mcpOAuthAuthorizationStore ??
+    createInMemoryMcpOAuthAuthorizationStore();
+  const mcpActivityRecorder =
+    deps.mcpActivityRecorder ?? new McpActivityRecorder();
+  const mcpRouteDeps = {
+    logger: deps.logger,
+    serverOrigin: deps.serverOrigin,
+    serverOwner: deps.serverOwner,
+    serverSigner: deps.serverSigner,
+    gateway: deps.gateway,
+    gatewayConfig: deps.gatewayConfig,
+    devToken: deps.devToken,
+    accessToken: deps.accessToken,
+    tokenStore: deps.tokenStore,
+    accessLogWriter: deps.accessLogWriter,
+    indexManager: deps.indexManager,
+    hierarchyOptions: deps.hierarchyOptions,
+    dataStorage: deps.dataStorage,
+    feeVerifier: deps.feeVerifier,
+    runtimeAvailability: deps.runtimeAvailability,
+    connectionStore: mcpConnectionStore,
+    oauthAuthorizationStore: mcpOAuthAuthorizationStore,
+    oauthApprovalUrl: deps.mcpOAuthApprovalUrl,
+    activityRecorder: mcpActivityRecorder,
+  };
+
+  app.route("/", mcpOAuthRoutes(mcpRouteDeps));
+  app.route("/v1/mcp/connections", mcpConnectionsRoutes(mcpRouteDeps));
+  app.route("/v1/mcp/activity", mcpActivityRoutes(mcpRouteDeps));
+  app.route("/mcp", mcpStreamableHttpRoutes(mcpRouteDeps));
 
   // Mount login flow v2 routes (self-hosted CLI auth, no auth required)
   if (deps.tokenStore) {

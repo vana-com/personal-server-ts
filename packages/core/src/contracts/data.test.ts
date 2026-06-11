@@ -1,18 +1,25 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { DataStoragePort } from "../ports/index.js";
 import type { IndexEntry } from "../storage/index/index.js";
 import {
   deleteDataScopeContract,
   ingestDataContract,
+  ingestBinaryDataContract,
   listDataScopesContract,
   listDataVersionsContract,
   readDataContract,
 } from "./data.js";
+import {
+  decodeBinaryEnvelope,
+  isBinaryEnvelope,
+  parseMetadataHeader,
+} from "./binary.js";
 
 function createMemoryStorage(): DataStoragePort {
   const entries: IndexEntry[] = [];
   const envelopes = new Map<string, DataFileEnvelope>();
+  const blockManifests = new Set<string>();
   let nextId = 1;
 
   function key(scope: string, collectedAt: string) {
@@ -77,6 +84,12 @@ function createMemoryStorage(): DataStoragePort {
         sizeBytes: JSON.stringify(envelope).length,
       };
     },
+    hasScopeBlocks(scope, collectedAt) {
+      return blockManifests.has(key(scope, collectedAt));
+    },
+    writeBlockManifest: vi.fn(async (scope: string, collectedAt: string) => {
+      blockManifests.add(key(scope, collectedAt));
+    }),
     insertEntry(entry) {
       const indexed = {
         ...entry,
@@ -131,17 +144,19 @@ describe("data contract helpers", () => {
       }),
     });
 
-    expect(
+    await expect(
       listDataScopesContract({
         storage,
         limit: 20,
         offset: 0,
       }),
-    ).toMatchObject({
+    ).resolves.toMatchObject({
       ok: true,
       response: {
         scopes: [
           {
+            dataStatus: "ready",
+            sizeBytes: expect.any(Number),
             scope: "instagram.profile",
             latestCollectedAt: "2026-05-08T00:00:00.000Z",
             versionCount: 1,
@@ -189,6 +204,58 @@ describe("data contract helpers", () => {
     ).resolves.toEqual({ ok: true, deletedCount: 1 });
   });
 
+  it("writes bounded block sidecars when supported and continues on sidecar failure", async () => {
+    const storage = createMemoryStorage();
+    const writeBlockManifest = storage.writeBlockManifest as ReturnType<
+      typeof vi.fn
+    >;
+    writeBlockManifest.mockRejectedValueOnce(new Error("sidecar write failed"));
+
+    const ingest = await ingestDataContract({
+      storage,
+      scopeParam: "instagram.profile",
+      body: { username: "test_user" },
+      collectedAt: "2026-05-08T00:00:00.000Z",
+      status: "stored",
+      schemaUrl: "https://schemas.example/instagram.profile.json",
+      schemaId: "schema-1",
+    });
+
+    expect(ingest).toMatchObject({ ok: true });
+    expect(writeBlockManifest).toHaveBeenCalledWith(
+      "instagram.profile",
+      "2026-05-08T00:00:00.000Z",
+      expect.objectContaining({
+        scope: "instagram.profile",
+        collectedAt: "2026-05-08T00:00:00.000Z",
+      }),
+      expect.any(Array),
+    );
+    expect(
+      storage.findEntry({
+        scope: "instagram.profile",
+        at: "2026-05-08T00:00:00.000Z",
+      }),
+    ).toBeDefined();
+    await expect(
+      listDataScopesContract({
+        storage,
+        limit: 20,
+        offset: 0,
+      }),
+    ).resolves.toMatchObject({
+      response: {
+        scopes: [
+          {
+            scope: "instagram.profile",
+            dataStatus: "indexing",
+            sizeBytes: expect.any(Number),
+          },
+        ],
+      },
+    });
+  });
+
   it("returns compatibility-shaped validation errors", async () => {
     const storage = createMemoryStorage();
 
@@ -221,6 +288,142 @@ describe("data contract helpers", () => {
         error: "INVALID_BODY",
         message: "Request body must be a JSON object",
       },
+    });
+  });
+
+  it("ingests binary data and round-trips the bytes through read", async () => {
+    const storage = createMemoryStorage();
+    const bytes = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31]); // %PDF-1
+
+    const ingest = await ingestBinaryDataContract({
+      storage,
+      scopeParam: "documents.pdf",
+      bytes,
+      mimeType: "application/pdf",
+      filename: "report.pdf",
+      collectedAt: "2026-05-08T00:00:00.000Z",
+      status: "syncing",
+      schemaId: "schema-bin",
+    });
+
+    expect(ingest).toMatchObject({
+      ok: true,
+      scope: "documents.pdf",
+      response: { status: "syncing" },
+    });
+
+    const read = await readDataContract({
+      storage,
+      scopeParam: "documents.pdf",
+    });
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+
+    expect(isBinaryEnvelope(read.envelope)).toBe(true);
+    expect(read.envelope.schemaId).toBe("schema-bin");
+
+    const decoded = decodeBinaryEnvelope(read.envelope);
+    expect(decoded.mimeType).toBe("application/pdf");
+    expect(decoded.filename).toBe("report.pdf");
+    expect(Array.from(decoded.bytes)).toEqual(Array.from(bytes));
+  });
+
+  it("stores free-form metadata in the binary envelope and reads it back", async () => {
+    const storage = createMemoryStorage();
+    const metadata = { description: "Q2 invoice", tags: ["finance"] };
+
+    await ingestBinaryDataContract({
+      storage,
+      scopeParam: "documents.pdf",
+      bytes: new Uint8Array([1, 2, 3]),
+      mimeType: "application/pdf",
+      metadata,
+      collectedAt: "2026-05-08T00:00:00.000Z",
+      status: "stored",
+    });
+
+    const read = await readDataContract({
+      storage,
+      scopeParam: "documents.pdf",
+    });
+    if (!read.ok) throw new Error("expected ok");
+
+    // Lives inside `data`, so it survives the SDK envelope schema.
+    expect((read.envelope.data as Record<string, unknown>).metadata).toEqual(
+      metadata,
+    );
+    expect(decodeBinaryEnvelope(read.envelope).metadata).toEqual(metadata);
+  });
+
+  it("omits the metadata key when none is provided", async () => {
+    const storage = createMemoryStorage();
+    await ingestBinaryDataContract({
+      storage,
+      scopeParam: "documents.pdf",
+      bytes: new Uint8Array([1]),
+      mimeType: "application/pdf",
+      collectedAt: "2026-05-08T00:00:00.000Z",
+      status: "stored",
+    });
+    const read = await readDataContract({
+      storage,
+      scopeParam: "documents.pdf",
+    });
+    if (!read.ok) throw new Error("expected ok");
+    expect("metadata" in (read.envelope.data as Record<string, unknown>)).toBe(
+      false,
+    );
+  });
+
+  it("parses metadata header as JSON when possible, else as a string", () => {
+    expect(parseMetadataHeader('{"a":1}')).toEqual({ a: 1 });
+    expect(parseMetadataHeader("just a description")).toBe(
+      "just a description",
+    );
+    expect(parseMetadataHeader("")).toBeUndefined();
+    expect(parseMetadataHeader(null)).toBeUndefined();
+  });
+
+  it("rejects an empty binary body", async () => {
+    const storage = createMemoryStorage();
+    expect(
+      await ingestBinaryDataContract({
+        storage,
+        scopeParam: "documents.pdf",
+        bytes: new Uint8Array(),
+        mimeType: "application/pdf",
+        collectedAt: "2026-05-08T00:00:00.000Z",
+        status: "stored",
+      }),
+    ).toMatchObject({
+      ok: false,
+      status: 400,
+      body: { error: "INVALID_BODY" },
+    });
+  });
+
+  it("ingests binary data without a schemaId (schema-less scope)", async () => {
+    const storage = createMemoryStorage();
+    const ingest = await ingestBinaryDataContract({
+      storage,
+      scopeParam: "documents.pdf",
+      bytes: new Uint8Array([1, 2, 3]),
+      mimeType: "application/octet-stream",
+      collectedAt: "2026-05-08T00:00:00.000Z",
+      status: "stored",
+    });
+    expect(ingest).toMatchObject({ ok: true });
+
+    expect(
+      listDataVersionsContract({
+        storage,
+        scopeParam: "documents.pdf",
+        limit: 20,
+        offset: 0,
+      }),
+    ).toMatchObject({
+      ok: true,
+      response: { versions: [{ schemaId: null }] },
     });
   });
 });
