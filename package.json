@@ -32,6 +32,7 @@
     "register-server": "tsx --env-file-if-exists=.env scripts/register-server.ts",
     "register-builder": "tsx --env-file-if-exists=.env scripts/register-builder.ts",
     "e2e:x402": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/e2e-x402-flow.ts",
+    "e2e:sync": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/e2e-storage-sync.ts",
     "validate": "npm run lint && npm run lint:eslint && npm run format:check && npm test",
     "prepare": "husky"
   },

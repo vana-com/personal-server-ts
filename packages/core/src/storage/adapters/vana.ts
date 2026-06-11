@@ -18,7 +18,11 @@ export function createVanaSyncStorageAdapter(params: {
   const endpoint = (
     params.config.storage.config.vana?.apiUrl ?? DEFAULT_VANA_STORAGE_ENDPOINT
   ).replace(/\/+$/, "");
-  const owner = params.serverOwner;
+  // The SDK's vana-storage provider lowercases the owner before building the
+  // blob path (and its URL validator compares against the lowercased form),
+  // so urlForKey MUST lowercase too or the reconstructed download URL won't
+  // match the uploaded blob's key.
+  const owner = params.serverOwner.toLowerCase();
 
   return createSdkStorageAdapter(
     createVanaStorageProvider({
