@@ -8,9 +8,11 @@
  *      (sync enabled). Registering before boot avoids a transient "unregistered"
  *      sync warning.
  *   3. Download the sample DEXA PDF and POST it to /v1/data/{scope} as binary.
- *      The scope has no schema, so the server auto-registers a "no-schema" one.
- *   4. Trigger sync → the file is encrypted, uploaded to storage, and
- *      registered on-chain (registerFile). Poll until it gets a fileId.
+ *      Unstructured data is ingested schemaless — DPv2 data points are
+ *      scope-addressed and carry no schemaId.
+ *   4. Trigger sync → the file is encrypted, uploaded to storage (version-keyed),
+ *      and registered on-chain (registerDataPoint). Poll until it gets a
+ *      dataPointId.
  *   5. Discover the owner's scopes from the gateway via listDataPointsByOwner
  *      (DataPointRecords carry scope directly). Confirm the scope shows up.
  *   6. Boot a SECOND registered server for the same owner; its sync downloads +
@@ -39,7 +41,6 @@
  *   GATEWAY_DP_SERVER               (server registration verifying contract)
  *   GATEWAY_DP_PERMISSIONS          (grant registration verifying contract)
  *   GATEWAY_DP_GRANTEES             (builder registration verifying contract)
- *   GATEWAY_DATA_REFINER_REGISTRY   (schema registration verifying contract)
  */
 
 import { mkdtemp, rm } from "node:fs/promises";
@@ -98,10 +99,8 @@ function previewEnvelope(envelope: Record<string, unknown>): void {
     delete data.content;
   }
   console.log("  envelope:");
-  console.log(`    $schema:     ${envelope.$schema ?? "(none)"}`);
   console.log(`    version:     ${envelope.version}`);
   console.log(`    scope:       ${envelope.scope}`);
-  console.log(`    schemaId:    ${envelope.schemaId ?? "(none)"}`);
   console.log(`    collectedAt: ${envelope.collectedAt}`);
   console.log("    data:");
   for (const [k, v] of Object.entries(data)) {
@@ -121,7 +120,6 @@ function makeConfig(port: number): ServerConfig {
     dataPortabilityPermissions: process.env.GATEWAY_DP_PERMISSIONS,
     dataPortabilityServer: process.env.GATEWAY_DP_SERVER,
     dataPortabilityGrantees: process.env.GATEWAY_DP_GRANTEES,
-    dataRefinerRegistry: process.env.GATEWAY_DATA_REFINER_REGISTRY,
   };
   const contracts = Object.fromEntries(
     Object.entries(contractEnv).filter(([, v]) => v),
@@ -302,7 +300,7 @@ async function main() {
       label: "server",
     });
 
-    // 3. Download the PDF and POST it as binary (auto-registers a schema).
+    // 3. Download the PDF and POST it as binary (ingested schemaless).
     log("3/6", `Downloading + posting PDF to scope "${SCOPE}"`);
     const pdfRes = await fetch(PDF_URL);
     if (!pdfRes.ok) {
@@ -338,8 +336,6 @@ async function main() {
     const envelope = (await envRes.json()) as Record<string, unknown>;
     previewEnvelope(envelope);
 
-    const ingested = ctx.indexManager.findLatestByScope(SCOPE);
-
     // 4. Sync: encrypt → upload to storage → register the DPv2 data point.
     // Poll for the gateway-assigned dataPointId.
     log("4/6", "Syncing (upload + on-chain registerDataPoint)");
@@ -370,7 +366,6 @@ async function main() {
       .catch(() => null);
     console.log("  registered:");
     console.log(`    dataPointId: ${dataPointId}`);
-    console.log(`    schemaId:    ${ingested?.schemaId ?? "(none)"}`);
     if (record) console.log(`    version:     ${record.expectedVersion}`);
 
     // 5. Discover the owner's scopes from the gateway by listing data points by
@@ -450,7 +445,6 @@ async function main() {
     console.log(`   owner:    ${ownerAccount.address}`);
     console.log(`   server:   ${ctx.serverAccount.address}`);
     console.log(`   scope:    ${SCOPE}`);
-    console.log(`   schemaId:    ${ingested?.schemaId ?? "(none)"}`);
     console.log(`   dataPointId: ${dataPointId}`);
     if (record) console.log(`   version:     ${record.expectedVersion}`);
     console.log(`   download+decrypt verified: bytes match (sha256 ${rtHash})`);
