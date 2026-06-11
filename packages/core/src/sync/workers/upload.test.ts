@@ -28,10 +28,11 @@ const COLLECTED_AT = "2026-01-21T10:00:00Z";
 const OWNER = "0xAbCdEf1234567890AbCdEf1234567890AbCdEf12";
 const SCHEMA_ID =
   "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-const FILE_ID = "file-001";
+const VERSION = 1;
 const DATA_POINT_ID =
   "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
-const STORAGE_URL = `https://storage.vana.com/v1/blobs/${OWNER}/${SCOPE}/${COLLECTED_AT}`;
+// Blobs are version-keyed `{scope}/{version}`, not collectedAt-keyed.
+const STORAGE_URL = `https://storage.vana.com/v1/blobs/${OWNER}/${SCOPE}/${VERSION}`;
 
 function makeEntry(overrides?: Partial<IndexEntry>): IndexEntry {
   return {
@@ -72,7 +73,6 @@ function makeSchema(): Schema {
 function makeMockDeps(): UploadWorkerDeps {
   const mockStorage: Partial<DataStoragePort> = {
     findUnsynced: vi.fn().mockReturnValue([]),
-    updateFileId: vi.fn().mockReturnValue(true),
     updateDataPointId: vi.fn().mockReturnValue(true),
     readEnvelope: vi.fn().mockResolvedValue(makeEnvelope()),
   };
@@ -83,16 +83,12 @@ function makeMockDeps(): UploadWorkerDeps {
 
   const mockGateway: Partial<GatewayClient> = {
     getSchemaForScope: vi.fn().mockResolvedValue(makeSchema()),
-    registerFile: vi.fn().mockResolvedValue({ fileId: FILE_ID }),
     registerDataPoint: vi
       .fn()
       .mockResolvedValue({ dataPointId: DATA_POINT_ID, expectedVersion: "1" }),
   };
 
   const mockSigner: Partial<ServerSigner> = {
-    signFileRegistration: vi
-      .fn()
-      .mockResolvedValue("0xmocksignature" as `0x${string}`),
     signAddData: vi
       .fn()
       .mockResolvedValue("0xadddatasignature" as `0x${string}`),
@@ -157,29 +153,9 @@ describe("upload worker", () => {
       await uploadOne(deps, entry);
 
       expect(deps.storageAdapter.upload).toHaveBeenCalledWith(
-        `${SCOPE}/${COLLECTED_AT}`,
+        `${SCOPE}/${VERSION}`,
         ENCRYPTED_BYTES,
       );
-    });
-
-    it("calls gateway registerFile with correct schemaId and signature", async () => {
-      const deps = makeMockDeps();
-      const entry = makeEntry();
-
-      await uploadOne(deps, entry);
-
-      expect(deps.signer.signFileRegistration).toHaveBeenCalledWith({
-        ownerAddress: OWNER,
-        url: STORAGE_URL,
-        schemaId: SCHEMA_ID,
-      });
-
-      expect(deps.gateway.registerFile).toHaveBeenCalledWith({
-        ownerAddress: OWNER,
-        url: STORAGE_URL,
-        schemaId: SCHEMA_ID,
-        signature: "0xmocksignature",
-      });
     });
 
     it("uses indexed schemaId without a schema lookup", async () => {
@@ -188,29 +164,24 @@ describe("upload worker", () => {
 
       await uploadOne(deps, entry);
 
+      // schemaId is resolved only to commit it into metadataHash; with an
+      // indexed schemaId the gateway fallback lookup is skipped.
       expect(deps.gateway.getSchemaForScope).not.toHaveBeenCalled();
-      expect(deps.gateway.registerFile).toHaveBeenCalledWith(
-        expect.objectContaining({ schemaId: SCHEMA_ID }),
-      );
+      expect(deps.gateway.registerDataPoint).toHaveBeenCalledOnce();
     });
 
-    it("updates index with returned fileId and dataPointId", async () => {
+    it("stamps the gateway dataPointId on the index entry", async () => {
       const deps = makeMockDeps();
       const entry = makeEntry();
 
       const result = await uploadOne(deps, entry);
 
-      expect(deps.storage.updateFileId).toHaveBeenCalledWith(
-        entry.path,
-        FILE_ID,
-      );
       expect(deps.storage.updateDataPointId).toHaveBeenCalledWith(
         entry.path,
         DATA_POINT_ID,
       );
       expect(result).toEqual({
         path: entry.path,
-        fileId: FILE_ID,
         url: STORAGE_URL,
         dataPointId: DATA_POINT_ID,
       });

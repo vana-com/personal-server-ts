@@ -20,9 +20,12 @@ export interface IndexManager {
   }): { scopes: ScopeSummary[]; total: number };
   findClosestByScope(scope: string, at: string): IndexEntry | undefined;
   findByFileId(fileId: string): IndexEntry | undefined;
+  /** Find an index entry by its DPv2 data-point id (download dedup). */
+  findByDataPointId(dataPointId: string): IndexEntry | undefined;
   /**
-   * Find all index entries where fileId is null (not yet synced to storage backend).
-   * Returns entries ordered by created_at ASC (oldest first).
+   * Find all index entries where dataPointId is null (not yet synced /
+   * registered on-chain). Returns entries ordered by created_at ASC (oldest
+   * first).
    */
   findUnsynced(options?: { limit?: number }): IndexEntry[];
   /**
@@ -113,12 +116,16 @@ export function createIndexManager(db: Database.Database): IndexManager {
     "SELECT * FROM data_files WHERE file_id = @file_id",
   );
 
+  const findByDataPointIdStmt = db.prepare<{ data_point_id: string }>(
+    "SELECT * FROM data_files WHERE data_point_id = @data_point_id",
+  );
+
   const findUnsyncedStmt = db.prepare(
-    "SELECT * FROM data_files WHERE file_id IS NULL ORDER BY created_at ASC",
+    "SELECT * FROM data_files WHERE data_point_id IS NULL ORDER BY created_at ASC",
   );
 
   const findUnsyncedLimitStmt = db.prepare<{ limit: number }>(
-    "SELECT * FROM data_files WHERE file_id IS NULL ORDER BY created_at ASC LIMIT @limit",
+    "SELECT * FROM data_files WHERE data_point_id IS NULL ORDER BY created_at ASC LIMIT @limit",
   );
 
   const updateFileIdStmt = db.prepare<{ file_id: string; path: string }>(
@@ -256,6 +263,13 @@ export function createIndexManager(db: Database.Database): IndexManager {
 
     findByFileId(fileId) {
       const row = findByFileIdStmt.get({ file_id: fileId }) as
+        | RawRow
+        | undefined;
+      return row ? rowToEntry(row) : undefined;
+    },
+
+    findByDataPointId(dataPointId) {
+      const row = findByDataPointIdStmt.get({ data_point_id: dataPointId }) as
         | RawRow
         | undefined;
       return row ? rowToEntry(row) : undefined;

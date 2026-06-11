@@ -126,9 +126,15 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
       );
     },
 
+    findByDataPointId(dataPointId) {
+      return Array.from(entries.values()).find(
+        (entry) => entry.dataPointId === dataPointId,
+      );
+    },
+
     findUnsynced(options) {
       const unsynced = Array.from(entries.values())
-        .filter((entry) => entry.fileId === null)
+        .filter((entry) => entry.dataPointId === null)
         .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
       return options?.limit === undefined
         ? unsynced

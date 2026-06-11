@@ -3,7 +3,7 @@ import {
   DataFileEnvelopeSchema,
   decryptWithPassword,
   deriveScopeKey,
-  type FileRecord,
+  type DataPointRecord,
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
 import type { SyncCursor } from "../cursor.js";
@@ -21,47 +21,51 @@ export interface DownloadWorkerDeps {
 }
 
 export interface DownloadResult {
-  fileId: string;
+  dataPointId: string;
   scope: string;
   collectedAt: string;
   path: string;
 }
 
 /**
- * Download and process a single file record from the storage backend:
- * 1. Check dedup: skip if fileId already in local index
- * 2. Download OpenPGP encrypted binary from storage backend
- * 3. Resolve schemaId → scope via Gateway getSchema
+ * Download and process a single DPv2 data point from the storage backend:
+ * 1. Check dedup: skip if dataPointId already in local index
+ * 2. Reconstruct the blob URL from (scope, expectedVersion) — DataPointRecords
+ *    carry no URL, so we rebuild the version-keyed `{scope}/{version}` key the
+ *    upload worker wrote under and resolve it via storageAdapter.urlForKey
+ * 3. Download the OpenPGP encrypted binary from storage
  * 4. Derive scope key from master key → hex-encode as OpenPGP password
+ *    (scope comes straight off the record — no schema lookup needed)
  * 5. Decrypt with OpenPGP password-based decryption → plaintext JSON
  * 6. Parse as DataFileEnvelope (validate)
- * 7. Write to local filesystem via hierarchy manager
- * 8. Insert into local index (with fileId)
+ * 7. Write to local filesystem via the runtime storage port
+ * 8. Insert into local index (with dataPointId + version)
  */
 export async function downloadOne(
   deps: DownloadWorkerDeps,
-  record: FileRecord,
+  record: DataPointRecord,
 ): Promise<DownloadResult | null> {
-  const { storage, storageAdapter, gateway, masterKey, logger } = deps;
+  const { storage, storageAdapter, masterKey, logger } = deps;
 
-  // 1. Check dedup: skip if fileId already in local index
-  const existing = storage.findByFileId(record.fileId);
+  // 1. Check dedup: skip if dataPointId already in local index
+  const existing = storage.findByDataPointId(record.id);
   if (existing) {
-    logger.debug({ fileId: record.fileId }, "File already in index, skipping");
+    logger.debug(
+      { dataPointId: record.id },
+      "Data point already in index, skipping",
+    );
     return null;
   }
 
-  // 2. Download OpenPGP encrypted binary from storage backend
-  const encrypted = await storageAdapter.download(record.url);
+  // 2. Reconstruct the version-keyed storage URL.
+  const storageKey = `${record.scope}/${record.expectedVersion}`;
+  const url = storageAdapter.urlForKey(storageKey);
 
-  // 3. Resolve schemaId → scope via Gateway getSchema
-  const schema = await gateway.getSchema(record.schemaId);
-  if (!schema) {
-    throw new Error(`No schema found for schemaId: ${record.schemaId}`);
-  }
+  // 3. Download OpenPGP encrypted binary from storage backend
+  const encrypted = await storageAdapter.download(url);
 
   // 4. Derive scope key → hex-encode as OpenPGP password
-  const scopeKey = deriveScopeKey(masterKey, schema.scope);
+  const scopeKey = deriveScopeKey(masterKey, record.scope);
   const scopeKeyHex = uint8ToHex(scopeKey);
 
   // 5. Decrypt with OpenPGP password-based decryption
@@ -79,16 +83,16 @@ export async function downloadOne(
     existingByVersion !== undefined &&
     existingByVersion.collectedAt === envelope.collectedAt
   ) {
-    if (existingByVersion.fileId !== record.fileId) {
-      await storage.updateFileId(existingByVersion.path, record.fileId);
+    if (existingByVersion.dataPointId !== record.id) {
+      await storage.updateDataPointId(existingByVersion.path, record.id);
     }
     logger.debug(
       {
-        fileId: record.fileId,
+        dataPointId: record.id,
         scope: envelope.scope,
         collectedAt: envelope.collectedAt,
       },
-      "File version already exists locally, skipping",
+      "Data version already exists locally, skipping",
     );
     return null;
   }
@@ -96,23 +100,25 @@ export async function downloadOne(
   // 7. Write to local storage via the runtime storage port
   const { relativePath, sizeBytes } = await storage.writeEnvelope(envelope);
 
-  // 8. Insert into local index (with fileId)
+  // 8. Insert into local index (with dataPointId + version)
   await storage.insertEntry({
-    fileId: record.fileId,
-    schemaId: record.schemaId,
+    fileId: null,
+    schemaId: envelope.schemaId ?? null,
     path: relativePath,
     scope: envelope.scope,
     collectedAt: envelope.collectedAt,
     sizeBytes,
+    version: Number(record.expectedVersion),
+    dataPointId: record.id,
   });
 
   logger.info(
-    { fileId: record.fileId, scope: envelope.scope, path: relativePath },
-    "Downloaded and indexed file",
+    { dataPointId: record.id, scope: envelope.scope, path: relativePath },
+    "Downloaded and indexed data point",
   );
 
   return {
-    fileId: record.fileId,
+    dataPointId: record.id,
     scope: envelope.scope,
     collectedAt: envelope.collectedAt,
     path: relativePath,
@@ -120,41 +126,40 @@ export async function downloadOne(
 }
 
 /**
- * Poll Gateway for new file records since lastProcessedTimestamp,
- * download each, and advance the cursor only when the page fully succeeds.
+ * Poll Gateway for new data points owned by this server since the stored
+ * cursor, download each, and advance the cursor only when the page fully
+ * succeeds.
  */
 export async function downloadAll(
   deps: DownloadWorkerDeps,
 ): Promise<DownloadResult[]> {
   const { gateway, cursor, serverOwner, logger } = deps;
 
-  // 1. Read cursor
-  const lastProcessedTimestamp = await cursor.read();
+  // 1. Read cursor (opaque pagination cursor persisted across runs)
+  const lastCursor = await cursor.read();
 
-  // 2. Poll gateway for new file records
-  const { files, cursor: nextCursor } = await gateway.listFilesSince(
-    serverOwner,
-    lastProcessedTimestamp,
-  );
+  // 2. Poll gateway for new data points
+  const { dataPoints, cursor: nextCursor } =
+    await gateway.listDataPointsByOwner(serverOwner, lastCursor);
 
   const results: DownloadResult[] = [];
   let failed = false;
 
-  // 3. Process each file record
-  for (const file of files) {
+  // 3. Process each data point record
+  for (const dataPoint of dataPoints) {
     try {
-      const result = await downloadOne(deps, file);
+      const result = await downloadOne(deps, dataPoint);
       if (result) {
         results.push(result);
       }
     } catch (err) {
       logger.error(
         {
-          fileId: file.fileId,
-          schemaId: file.schemaId,
+          dataPointId: dataPoint.id,
+          scope: dataPoint.scope,
           error: (err as Error).message,
         },
-        "Failed to download file",
+        "Failed to download data point",
       );
       failed = true;
     }
@@ -166,7 +171,7 @@ export async function downloadAll(
   } else if (failed) {
     logger.warn(
       { nextCursor },
-      "Download cursor not advanced because one or more files failed",
+      "Download cursor not advanced because one or more data points failed",
     );
   }
 

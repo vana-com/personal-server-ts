@@ -56,7 +56,6 @@ import { serve, type ServerType } from "@hono/node-server";
 import {
   ADD_DATA_TYPES,
   BUILDER_REGISTRATION_TYPES,
-  FILE_REGISTRATION_TYPES,
   GENERIC_PAYMENT_TYPES,
   MASTER_KEY_MESSAGE,
   NATIVE_VANA_ASSET,
@@ -66,7 +65,6 @@ import {
   createGatewayClient,
   dataRegistryDomain,
   escrowPaymentDomain,
-  fileRegistrationDomain,
   getFee,
   serverRegistrationDomain,
   type DataPortabilityGatewayConfig,
@@ -704,56 +702,6 @@ async function main(): Promise<void> {
     ps.indexManager.updateDataPointId(ingestedEntry.path, dataPointId);
     console.log(`    dataPointId: ${dataPointId}`);
     console.log(`    version:     ${ingestedEntry.version}`);
-
-    // ─── 7.6 Register the encrypted file location on-chain ──────────
-    //
-    // Mirrors the upload worker's FileRegistration step (see
-    // packages/core/src/sync/workers/upload.ts ~L151-L178). Because we
-    // skip the real storage adapter, we hand the gateway a stub URL —
-    // a real downloader couldn't fetch it, but on-chain FileRegistration
-    // just records the URL as a string.
-    //
-    // Signing: server-delegated (server key + ownerAddress=user). In
-    // production only the server knows the storage URL it picked, so the
-    // owner can't pre-sign — the upload worker relies on the gateway +
-    // V2 contract honoring trusted-server delegation for FileRegistration.
-    // If this 401s with "signer does not match ownerAddress", we have the
-    // same gateway gap we saw on AddData (no delegated signing path),
-    // and the upload worker can't work against this deployment as-is.
-    step("Registering file URL on-chain via gateway.registerFile");
-    if (!registeredSchemaId) {
-      throw new Error(
-        "FileRegistration needs a schemaId — schema step didn't produce one",
-      );
-    }
-    const stubFileUrl =
-      `https://example-storage.test/encrypted/${ingestedEntry.scope}/` +
-      `${encodeURIComponent(ingestedEntry.collectedAt)}.pgp`;
-    const fileRegistrationMessage = {
-      ownerAddress: userAccount.address,
-      url: stubFileUrl,
-      schemaId: registeredSchemaId,
-    };
-    const fileRegistrationSignature = await ps.serverAccount.signTypedData({
-      domain: fileRegistrationDomain(GATEWAY_CONFIG),
-      types: FILE_REGISTRATION_TYPES,
-      primaryType: "FileRegistration",
-      message: fileRegistrationMessage as unknown as Record<string, unknown>,
-    });
-    const fileRegistration = await gateway.registerFile({
-      ownerAddress: userAccount.address,
-      url: stubFileUrl,
-      schemaId: registeredSchemaId,
-      signature: fileRegistrationSignature,
-    });
-    const fileId = fileRegistration.fileId as Hex | undefined;
-    if (!fileId) {
-      throw new Error("gateway.registerFile returned no fileId");
-    }
-    ps.indexManager.updateFileId(ingestedEntry.path, fileId);
-    console.log(`    fileId:     ${fileId}`);
-    console.log(`    url:        ${stubFileUrl}`);
-    console.log(`    signer:     server (${ps.serverAccount.address})`);
 
     // ─── 8. User creates a grant via the personal server (delegated) ──
     //

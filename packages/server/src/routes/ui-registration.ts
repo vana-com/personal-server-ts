@@ -272,8 +272,8 @@ export function uiRegistrationRoutes(deps: UiRegistrationRouteDeps): Hono {
     await Promise.all(
       fileIds.map(async (fileId) => {
         try {
-          const file = await gateway.getFile(fileId);
-          results[fileId] = { registered: Boolean(file) };
+          const dataPoint = await gateway.getDataPoint(fileId);
+          results[fileId] = { registered: Boolean(dataPoint) };
         } catch (err) {
           results[fileId] = {
             registered: false,

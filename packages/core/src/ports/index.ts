@@ -1,9 +1,10 @@
 import type {
   Builder,
   DataFileEnvelope,
-  FileListResult,
-  FileRecord,
+  DataPointListResult,
+  DataPointRecord,
   GatewayGrantResponse,
+  ListDataPointsOptions,
   Schema,
   ServerInfo,
 } from "@opendatalabs/vana-sdk/browser";
@@ -19,8 +20,12 @@ export interface ProtocolGatewayPort {
   getGrant(grantId: string): Promise<GatewayGrantResponse | null>;
   getSchemaForScope(scope: string): Promise<Schema | null>;
   getServer(address: string): Promise<ServerInfo | null>;
-  getFile(fileId: string): Promise<FileRecord | null>;
-  listFilesSince(owner: string, cursor: string | null): Promise<FileListResult>;
+  getDataPoint(dataPointId: string): Promise<DataPointRecord | null>;
+  listDataPointsByOwner(
+    owner: string,
+    cursor: string | null,
+    options?: ListDataPointsOptions,
+  ): Promise<DataPointListResult>;
 }
 
 export interface GrantVerifierPort {
@@ -36,8 +41,12 @@ export interface SchemaResolverPort {
 }
 
 export interface FileRegistrySyncRegistryPort {
-  getFile(fileId: string): Promise<FileRecord | null>;
-  listFilesSince(owner: string, cursor: string | null): Promise<FileListResult>;
+  getDataPoint(dataPointId: string): Promise<DataPointRecord | null>;
+  listDataPointsByOwner(
+    owner: string,
+    cursor: string | null,
+    options?: ListDataPointsOptions,
+  ): Promise<DataPointListResult>;
 }
 
 export interface PlatformCryptoPort {
@@ -72,6 +81,8 @@ export interface DataStoragePort extends RuntimeStoragePort {
   countVersions(scope: string): number;
   findEntry(lookup: DataStorageEntryLookup): IndexEntry | undefined;
   findByFileId(fileId: string): IndexEntry | undefined;
+  /** Dedup lookup for the download worker: find an entry by its DPv2 data-point id. */
+  findByDataPointId(dataPointId: string): IndexEntry | undefined;
   findUnsynced(options?: { limit?: number }): IndexEntry[];
   readEnvelope(scope: string, collectedAt: string): Promise<DataFileEnvelope>;
   writeEnvelope(envelope: DataFileEnvelope): Promise<WriteResult>;
