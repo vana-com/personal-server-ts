@@ -96,6 +96,8 @@ interface RecordContext {
   schemaId: string | null;
 }
 
+const sessionQuarantinedDataPointIds = new Set<string>();
+
 /**
  * Download and process a single DPv2 data point from the storage backend:
  * 1. Check dedup: skip if dataPointId already in local index
@@ -335,6 +337,9 @@ export async function downloadAll(
   // 3. Process each data point record
   for (const dataPoint of dataPoints) {
     try {
+      if (sessionQuarantinedDataPointIds.has(dataPoint.id)) {
+        continue;
+      }
       const result = await downloadOne(deps, dataPoint);
       if (result) {
         results.push(result);
@@ -363,6 +368,7 @@ export async function downloadAll(
           },
           "Quarantined corrupt synced data point",
         );
+        sessionQuarantinedDataPointIds.add(dataPoint.id);
         continue;
       }
       logger.error(
