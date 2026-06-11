@@ -448,11 +448,33 @@ export async function loadOrCreatePsLiteConfig(
   defaults?: Partial<ServerConfig>,
 ): Promise<ServerConfig> {
   const existing = await store.get<unknown>(CONFIG_KEY);
-  const config = ServerConfigSchema.parse(existing ?? defaults ?? {});
   if (!existing) {
+    const config = ServerConfigSchema.parse(defaults ?? {});
     await store.set(CONFIG_KEY, config);
+    return config;
   }
-  return config;
+  // A persisted config exists. The gateway block (url, chainId, contracts) is
+  // environment-derived deployment config, not instance state — when the
+  // caller's defaults move it (e.g. a contract redeploy), the stored snapshot
+  // must follow, or EIP-712 signing keeps using the stale verifyingContract.
+  // Instance state (server.origin, sync cursor, etc.) stays persisted.
+  const stored = ServerConfigSchema.parse(existing);
+  if (!defaults?.gateway) return stored;
+  const reconciled = ServerConfigSchema.parse({
+    ...stored,
+    gateway: {
+      ...stored.gateway,
+      ...defaults.gateway,
+      contracts: {
+        ...stored.gateway.contracts,
+        ...defaults.gateway.contracts,
+      },
+    },
+  });
+  if (JSON.stringify(reconciled.gateway) !== JSON.stringify(stored.gateway)) {
+    await store.set(CONFIG_KEY, reconciled);
+  }
+  return reconciled;
 }
 
 export async function savePsLiteConfig(
