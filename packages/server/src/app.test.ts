@@ -695,20 +695,22 @@ describe("createApp", () => {
     expect(Array.from(received)).toEqual(Array.from(pdf));
   });
 
-  it("POST binary auto-registers a no-schema schema when the scope has none", async () => {
+  it("POST binary ingests schemaless on DPv2 (no schema lookup/registration)", async () => {
     const logger = pino({ level: "silent" });
     const gateway = createMockGateway();
-    // No schema exists for this scope → triggers auto-registration.
+    // Even if no schema exists for the scope, DPv2 binary ingest must NOT
+    // look one up or register a "no schema" — data points are scope-addressed.
     (gateway.getSchemaForScope as ReturnType<typeof vi.fn>).mockResolvedValue(
       null,
     );
     const signer: ServerSigner = {
       address: "0x2222222222222222222222222222222222222222",
-      signFileRegistration: vi.fn(),
       signGrantRegistration: vi.fn(),
       signGrantRevocation: vi.fn(),
+      signAddData: vi.fn(),
+      signRecordDataAccess: vi.fn(),
       signSchemaRegistration: vi.fn().mockResolvedValue("0xschemasig"),
-    };
+    } as unknown as ServerSigner;
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ data: { schemaId: "0xnoschema" } }), {
         status: 200,
@@ -759,13 +761,15 @@ describe("createApp", () => {
     });
 
     expect(res.status).toBe(201);
-    expect(signer.signSchemaRegistration).toHaveBeenCalledWith(
-      expect.objectContaining({ scope: "random.blob" }),
-    );
-    expect(fetchMock).toHaveBeenCalledWith(
+    // No schema registration: no SchemaRegistration signature, no POST /v1/schemas.
+    expect(signer.signSchemaRegistration).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalledWith(
       "https://gw.example/v1/schemas",
-      expect.objectContaining({ method: "POST" }),
+      expect.anything(),
     );
+    // The stored entry carries no schemaId.
+    const entry = indexManager.findLatestByScope("random.blob");
+    expect(entry?.schemaId ?? null).toBeNull();
 
     vi.restoreAllMocks();
   });

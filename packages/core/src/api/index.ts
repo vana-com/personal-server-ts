@@ -606,39 +606,6 @@ function binaryFilename(request: Request): string | undefined {
   return match ? decodeURIComponent(match[1]) : undefined;
 }
 
-/**
- * Resolve a schema for a binary scope, registering a permissive "no-schema"
- * schema when none exists. Unlike the JSON path this never hard-fails on a
- * missing schema: if there is no registrar, ingestion proceeds with no schemaId
- * (the entry is registered against the gateway's resolved schema later).
- */
-async function resolveBinarySchema(
-  deps: Pick<
-    PersonalServerDataApiDeps,
-    "schemaResolver" | "schemaRegistrar" | "logger"
-  >,
-  scope: string,
-): Promise<{ schemaId?: string; schemaUrl?: string }> {
-  if (deps.schemaResolver) {
-    const schema = await deps.schemaResolver.getSchemaForScope(scope);
-    if (schema) {
-      return { schemaId: schema.id, schemaUrl: schema.definitionUrl };
-    }
-  }
-  if (deps.schemaRegistrar) {
-    const registered = await deps.schemaRegistrar.registerNoSchema(scope);
-    deps.logger?.info?.(
-      { scope, schemaId: registered.schemaId },
-      "Registered no-schema schema for binary scope",
-    );
-    return {
-      schemaId: registered.schemaId,
-      schemaUrl: registered.definitionUrl,
-    };
-  }
-  return {};
-}
-
 function notifyNewData(
   syncManager: PersonalServerDataApiDeps["syncManager"],
 ): void {
@@ -821,13 +788,11 @@ export async function handlePersonalServerDataRequest(
       const collectedAtValue = collectedAt(deps.now ?? (() => new Date()));
       const status = deps.syncManager ? "syncing" : "stored";
 
-      // Binary / unstructured data (e.g. a PDF): the body is raw bytes and the
-      // scope may not have a registered schema — auto-register a no-schema one.
+      // Binary / unstructured data (e.g. a PDF): the body is raw bytes. DPv2
+      // data points are scope-addressed and carry no schemaId, so unstructured
+      // data needs no schema at all — we ingest it schemaless. (Structured JSON
+      // below still resolves a schema for validation/metadata.)
       if (!isJsonContentType(request)) {
-        const { schemaId, schemaUrl } = await resolveBinarySchema(
-          deps,
-          scopeResult.scope,
-        );
         const bytes = new Uint8Array(await request.arrayBuffer());
         const result = await ingestBinaryDataContract({
           storage: deps.storage,
@@ -838,8 +803,6 @@ export async function handlePersonalServerDataRequest(
           metadata: parseMetadataHeader(request.headers.get("x-vana-metadata")),
           collectedAt: collectedAtValue,
           status,
-          schemaUrl,
-          schemaId,
         });
         if (!result.ok) return contractErrorResponse(result);
         deps.logger?.info?.(

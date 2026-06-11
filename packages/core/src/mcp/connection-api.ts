@@ -552,7 +552,6 @@ export async function approveMcpOAuthAuthorizationWithScopes(
       ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
       ...(input.nonce !== undefined ? { nonce: input.nonce } : {}),
     },
-    now: () => options.now?.().getTime() ?? Date.now(),
   });
   if (!grantResult.ok) {
     throw new McpOAuthAuthorizationError(

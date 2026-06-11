@@ -25,7 +25,6 @@ import {
 import { createNodeDataStorage } from "../storage/node-data-storage.js";
 import { createServerApiAuth } from "../api-auth.js";
 import { createSchemaRegistrar } from "../schema-registrar.js";
-import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 
 export interface DataRouteDeps {
   indexManager: IndexManager;
@@ -73,10 +72,6 @@ export interface DataRouteDeps {
    */
   serverAddress?: `0x${string}`;
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
-  /** Server signing account — enables binary schema auto-registration. */
-  serverSigner?: ServerSigner;
-  /** Gateway base URL, required (with serverSigner) for schema registration. */
-  gatewayUrl?: string;
 }
 
 export function dataRoutes(deps: DataRouteDeps): Hono {
