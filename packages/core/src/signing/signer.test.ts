@@ -8,11 +8,9 @@ import { loadOrCreateServerAccount } from "../../../server/src/keys/server-accou
 import type { GatewayConfig } from "../schemas/server-config.js";
 import { createServerSigner } from "./signer.js";
 import {
-  fileRegistrationDomain,
   grantRegistrationDomain,
   grantRevocationDomain,
   dataRegistryDomain,
-  FILE_REGISTRATION_TYPES,
   GRANT_REGISTRATION_TYPES,
   GRANT_REVOCATION_TYPES,
   ADD_DATA_TYPES,
@@ -43,30 +41,6 @@ describe("ServerSigner", () => {
 
   afterEach(async () => {
     await rm(tempDir, { recursive: true, force: true });
-  });
-
-  describe("signFileRegistration", () => {
-    it("produces a signature recoverable to the server address", async () => {
-      const { account, signer } = setup();
-      const msg = {
-        ownerAddress:
-          "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as `0x${string}`,
-        url: "https://storage.example.com/file.json",
-        schemaId: ("0x" + "ab".repeat(32)) as `0x${string}`,
-      };
-
-      const signature = await signer.signFileRegistration(msg);
-      expect(signature).toMatch(/^0x[0-9a-fA-F]+$/);
-
-      const recovered = await recoverTypedDataAddress({
-        domain: fileRegistrationDomain(TEST_GATEWAY_CONFIG),
-        types: FILE_REGISTRATION_TYPES,
-        primaryType: "FileRegistration",
-        message: msg,
-        signature,
-      });
-      expect(recovered.toLowerCase()).toBe(account.address.toLowerCase());
-    });
   });
 
   describe("signGrantRegistration", () => {
@@ -148,17 +122,19 @@ describe("ServerSigner", () => {
     });
   });
 
-  it("all three signing methods are deterministic", async () => {
+  it("signing is deterministic", async () => {
     const { signer } = setup();
-    const fileMsg = {
+    const addDataMsg = {
       ownerAddress:
         "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as `0x${string}`,
-      url: "https://example.com/file.json",
-      schemaId: ("0x" + "ab".repeat(32)) as `0x${string}`,
+      scope: "instagram.profile",
+      dataHash: ("0x" + "11".repeat(32)) as `0x${string}`,
+      metadataHash: ("0x" + "22".repeat(32)) as `0x${string}`,
+      expectedVersion: 1n,
     };
 
-    const sig1 = await signer.signFileRegistration(fileMsg);
-    const sig2 = await signer.signFileRegistration(fileMsg);
+    const sig1 = await signer.signAddData(addDataMsg);
+    const sig2 = await signer.signAddData(addDataMsg);
     expect(sig1).toBe(sig2);
   });
 });

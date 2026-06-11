@@ -22,7 +22,7 @@ export interface UploadWorkerDeps {
 
 export interface UploadResult {
   path: string;
-  fileId: string;
+  /** Storage URL the encrypted blob was written to (version-keyed). */
   url: string;
   /**
    * DPv2 data-point id assigned by the gateway. Present whenever this run
@@ -43,10 +43,10 @@ export interface UploadAllOptions {
  * 2. Resolve schemaId for the scope
  * 3. Derive scope key from master key → hex-encode as OpenPGP password
  * 4. Encrypt envelope with OpenPGP password-based encryption → ciphertext
- * 5. Register DPv2 data point on-chain (AddData) if not already, persist dataPointId
- * 6. Upload ciphertext to storage backend
- * 7. Sign file registration (EIP-712) and call Gateway registerFile
- * 8. Update local index with fileId
+ * 5. Compute dataHash / metadataHash commitments
+ * 6. Upload ciphertext to storage backend, version-keyed `{scope}/{version}`
+ * 7. Register DPv2 data point on-chain (AddData) if not already
+ * 8. Persist the gateway-assigned dataPointId (marks the entry synced)
  */
 export async function uploadOne(
   deps: UploadWorkerDeps,
@@ -109,6 +109,17 @@ export async function uploadOne(
     ),
   );
 
+  // 6. Upload ciphertext to storage backend FIRST, version-keyed so the
+  // download worker can reconstruct the URL from a DataPointRecord's
+  // (scope, expectedVersion) — DataPointRecords carry no URL. We upload
+  // before registering so the on-chain data point (the synced marker) is
+  // never stamped ahead of a blob that failed to land.
+  const storageKey = `${entry.scope}/${entry.version}`;
+  const url = await storageAdapter.upload(storageKey, encrypted);
+
+  // 7. DPv2 data-point registration (idempotent — skipped when a prior run
+  // already persisted a dataPointId on this entry). registerDataPoint stamps
+  // the synced marker that excludes this entry from findUnsynced next time.
   let dataPointId = entry.dataPointId;
   if (!dataPointId) {
     const addDataSignature = await signer.signAddData({
@@ -135,57 +146,26 @@ export async function uploadOne(
       );
     }
 
+    // 8. Stamp the dataPointId on the local index entry — marks it synced.
     await storage.updateDataPointId(entry.path, dataPointId);
-
-    logger.info(
-      {
-        path: entry.path,
-        scope: entry.scope,
-        version: entry.version,
-        dataPointId,
-      },
-      "Registered DPv2 data point",
-    );
   }
-
-  // 6. Upload to storage backend
-  const storageKey = `${entry.scope}/${entry.collectedAt}`;
-  const url = await storageAdapter.upload(storageKey, encrypted);
-
-  // 7. Sign file registration via EIP-712, then register on-chain via Gateway
-  const signature = await signer.signFileRegistration({
-    ownerAddress: serverOwner as `0x${string}`,
-    url,
-    schemaId: schemaId as `0x${string}`,
-  });
-
-  const registration = await gateway.registerFile({
-    ownerAddress: serverOwner,
-    url,
-    schemaId,
-    signature,
-  });
-
-  const fileId = registration.fileId;
-  if (!fileId) {
-    throw new Error(
-      `Gateway registerFile did not return a fileId for ${entry.path}`,
-    );
-  }
-
-  // 8. Update local index with fileId
-  await storage.updateFileId(entry.path, fileId);
 
   logger.info(
-    { path: entry.path, fileId, url, dataPointId },
-    "Uploaded and registered file",
+    {
+      path: entry.path,
+      scope: entry.scope,
+      version: entry.version,
+      url,
+      dataPointId,
+    },
+    "Uploaded and registered DPv2 data point",
   );
 
-  return { path: entry.path, fileId, url, dataPointId };
+  return { path: entry.path, url, dataPointId };
 }
 
 /**
- * Process all unsynced entries (fileId === null).
+ * Process all unsynced entries (dataPointId === null).
  * Processes sequentially to avoid overwhelming storage backend.
  * Returns array of results (skips failures, logs errors).
  */

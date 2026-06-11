@@ -10,10 +10,23 @@ export interface SdkStorageProvider {
 }
 export type SdkStorageProviderFactory = () => SdkStorageProvider;
 
+export interface SdkStorageAdapterOptions {
+  /**
+   * Reconstruct a blob URL from a storage key without uploading. The personal
+   * server owns the key layout, so the download worker can resolve a URL from
+   * a DataPointRecord's (scope, version). Supplied by the concrete backend
+   * (e.g. vana.ts knows endpoint + owner). Defaults to identity so in-memory
+   * test backends that treat the key itself as the URL keep working.
+   */
+  urlForKey?: (key: string) => string;
+}
+
 export function createSdkStorageAdapter(
   providerOrFactory: SdkStorageProvider | SdkStorageProviderFactory,
+  options?: SdkStorageAdapterOptions,
 ): StorageAdapter {
   let cachedProvider: SdkStorageProvider | undefined;
+  const urlForKey = options?.urlForKey ?? ((key: string) => key);
 
   function provider(): SdkStorageProvider {
     if (typeof providerOrFactory === "function") {
@@ -31,6 +44,8 @@ export function createSdkStorageAdapter(
       );
       return result.url;
     },
+
+    urlForKey,
 
     async download(storageUrl) {
       const blob = await provider().download(storageUrl);

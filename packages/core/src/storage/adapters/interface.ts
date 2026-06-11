@@ -13,6 +13,17 @@ export interface StorageAdapter {
   upload(key: string, data: Uint8Array): Promise<string>;
 
   /**
+   * Resolve the canonical URL for a storage key WITHOUT uploading.
+   *
+   * The personal server owns the key layout (`{scope}/{version}`), so the
+   * download worker can reconstruct a blob's URL from a DataPointRecord —
+   * which carries `scope` + `expectedVersion` but no URL — and fetch it
+   * via {@link download}. Must be the inverse of {@link upload}'s keying:
+   * `download(urlForKey(key))` returns what `upload(key, data)` stored.
+   */
+  urlForKey(key: string): string;
+
+  /**
    * Download an encrypted blob from the storage backend.
    * @param url - storage URL returned by upload()
    * @returns encrypted binary data

@@ -6,16 +6,13 @@
 import type { ServerAccount } from "../keys/server-account.js";
 import type { GatewayConfig } from "../schemas/server-config.js";
 import {
-  fileRegistrationDomain,
   grantRegistrationDomain,
   grantRevocationDomain,
   dataRegistryDomain,
-  FILE_REGISTRATION_TYPES,
   GRANT_REGISTRATION_TYPES,
   GRANT_REVOCATION_TYPES,
   ADD_DATA_TYPES,
   RECORD_DATA_ACCESS_TYPES,
-  type FileRegistrationMessage,
   type GrantRegistrationMessage,
   type GrantRevocationMessage,
   type AddDataMessage,
@@ -23,7 +20,6 @@ import {
 } from "@opendatalabs/vana-sdk/browser";
 
 export interface ServerSigner {
-  signFileRegistration(msg: FileRegistrationMessage): Promise<`0x${string}`>;
   signGrantRegistration(msg: GrantRegistrationMessage): Promise<`0x${string}`>;
   signGrantRevocation(msg: GrantRevocationMessage): Promise<`0x${string}`>;
   /**
@@ -50,17 +46,6 @@ export function createServerSigner(
   gatewayConfig: GatewayConfig,
 ): ServerSigner {
   return {
-    async signFileRegistration(
-      msg: FileRegistrationMessage,
-    ): Promise<`0x${string}`> {
-      return account.signTypedData({
-        domain: fileRegistrationDomain(gatewayConfig),
-        types: FILE_REGISTRATION_TYPES,
-        primaryType: "FileRegistration",
-        message: msg as unknown as Record<string, unknown>,
-      });
-    },
-
     async signGrantRegistration(
       msg: GrantRegistrationMessage,
     ): Promise<`0x${string}`> {

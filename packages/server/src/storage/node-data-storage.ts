@@ -40,6 +40,9 @@ export function createNodeDataStorage(
     findByFileId(fileId: string) {
       return deps.indexManager.findByFileId(fileId);
     },
+    findByDataPointId(dataPointId: string) {
+      return deps.indexManager.findByDataPointId(dataPointId);
+    },
     findUnsynced(options?: { limit?: number }) {
       return deps.indexManager.findUnsynced(options);
     },

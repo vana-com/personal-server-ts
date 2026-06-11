@@ -185,7 +185,7 @@ describe("createPersistentPsLiteStorage", () => {
 
     expect(storage.findUnsynced()).toHaveLength(1);
     expect(
-      await storage.updateFileId(write.relativePath, "file-synced-1"),
+      await storage.updateDataPointId(write.relativePath, "0xdp-synced-1"),
     ).toBe(true);
 
     const reloaded = await createPersistentPsLiteStorage(
@@ -194,13 +194,13 @@ describe("createPersistentPsLiteStorage", () => {
     );
 
     expect(reloaded.findUnsynced()).toEqual([]);
-    expect(reloaded.findByFileId("file-synced-1")).toMatchObject({
+    expect(reloaded.findByDataPointId("0xdp-synced-1")).toMatchObject({
       scope: "instagram.profile",
-      fileId: "file-synced-1",
+      dataPointId: "0xdp-synced-1",
     });
   });
 
-  it("serializes overlapping index persistence so file id updates win", async () => {
+  it("serializes overlapping index persistence so data-point id updates win", async () => {
     const persistence = createMemoryPsLitePersistence();
     const storage = await createPersistentPsLiteStorage(
       { kind: "indexeddb" },
@@ -220,7 +220,10 @@ describe("createPersistentPsLiteStorage", () => {
       collectedAt: envelope.collectedAt,
       sizeBytes: write.sizeBytes,
     });
-    const updated = storage.updateFileId(write.relativePath, "file-synced-1");
+    const updated = storage.updateDataPointId(
+      write.relativePath,
+      "0xdp-synced-1",
+    );
     await inserted;
     await updated;
 
@@ -229,9 +232,9 @@ describe("createPersistentPsLiteStorage", () => {
       persistence,
     );
 
-    expect(reloaded.findByFileId("file-synced-1")).toMatchObject({
+    expect(reloaded.findByDataPointId("0xdp-synced-1")).toMatchObject({
       scope: "instagram.profile",
-      fileId: "file-synced-1",
+      dataPointId: "0xdp-synced-1",
     });
     expect(reloaded.findUnsynced()).toEqual([]);
   });

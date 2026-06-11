@@ -19,9 +19,12 @@ export interface IndexManager {
   }): { scopes: ScopeSummary[]; total: number };
   findClosestByScope(scope: string, at: string): IndexEntry | undefined;
   findByFileId(fileId: string): IndexEntry | undefined;
+  /** Find an index entry by its DPv2 data-point id (download dedup). */
+  findByDataPointId(dataPointId: string): IndexEntry | undefined;
   /**
-   * Find all index entries where fileId is null (not yet synced to storage backend).
-   * Returns entries ordered by created_at ASC (oldest first).
+   * Find all index entries where dataPointId is null (not yet synced /
+   * registered on-chain). Returns entries ordered by created_at ASC (oldest
+   * first).
    */
   findUnsynced(options?: { limit?: number }): IndexEntry[];
   /**

@@ -293,9 +293,13 @@ export async function createPersistentPsLiteStorage(
       return state.entries.find((entry) => entry.fileId === fileId);
     },
 
+    findByDataPointId(dataPointId) {
+      return state.entries.find((entry) => entry.dataPointId === dataPointId);
+    },
+
     findUnsynced(options) {
       const entries = state.entries
-        .filter((entry) => entry.fileId === null)
+        .filter((entry) => entry.dataPointId === null)
         .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
       return options?.limit === undefined
         ? entries

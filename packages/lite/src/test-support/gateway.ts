@@ -32,11 +32,11 @@ export function createMockPsLiteGateway(): NonNullable<
     async getServer() {
       return null;
     },
-    async getFile() {
+    async getDataPoint() {
       return null;
     },
-    async listFilesSince() {
-      return { files: [], nextCursor: null };
+    async listDataPointsByOwner() {
+      return { dataPoints: [], cursor: null };
     },
     async getSchema() {
       return null;
@@ -44,8 +44,8 @@ export function createMockPsLiteGateway(): NonNullable<
     async registerServer() {
       return { alreadyRegistered: false };
     },
-    async registerFile() {
-      return { fileId: "file-1" };
+    async registerDataPoint() {
+      return { dataPointId: "data-point-1" };
     },
     async revokeGrant() {},
   };
