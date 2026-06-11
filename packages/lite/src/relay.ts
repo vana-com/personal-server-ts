@@ -8,6 +8,7 @@ import type { PsLiteRuntime } from "./runtime.js";
 
 const DATA_FRAME_TYPE = 1;
 const HEADER_BYTES = 5;
+const RESPONSE_CHUNK_BYTES = 16 * 1024;
 const DEFAULT_CONTROL_URL = "wss://control.34.16.49.200.sslip.io:8443";
 const DEFAULT_PUBLIC_SUFFIX = "34.16.49.200.sslip.io";
 const DEFAULT_ORIGIN = "https://ps-lite.local";
@@ -171,13 +172,23 @@ export function startPsLiteRelayClient(
     responseBytes: Uint8Array,
   ) => {
     if (!stream.tls) {
-      sendData(stream.streamId, responseBytes);
+      for (const chunk of chunks(responseBytes, RESPONSE_CHUNK_BYTES)) {
+        sendData(stream.streamId, chunk);
+      }
       return;
     }
 
-    const step = stream.tls.writePlaintext(responseBytes, true);
-    if (step.tls.length > 0) {
-      sendData(stream.streamId, step.tls);
+    const responseChunks = chunks(responseBytes, RESPONSE_CHUNK_BYTES);
+    for (let index = 0; index < responseChunks.length; index += 1) {
+      const step = stream.tls.writePlaintext(
+        responseChunks[index],
+        index === responseChunks.length - 1,
+      );
+      for (const chunk of chunks(step.tls, RESPONSE_CHUNK_BYTES)) {
+        if (chunk.length > 0) {
+          sendData(stream.streamId, chunk);
+        }
+      }
     }
   };
 
@@ -194,7 +205,14 @@ export function startPsLiteRelayClient(
         parsed.request,
         origin,
       );
-      writePlaintextResponse(stream, textToBytes(response));
+      // `response` is a binary (latin1) string: buildHttpResponse appends the
+      // body via bytesToBinary, so each char code 0x00–0xFF is one body byte.
+      // It must be turned back into bytes the same way (binaryToBytes), NOT
+      // UTF-8 re-encoded — textToBytes would expand every byte >= 0x80 into a
+      // 2-byte sequence, corrupting binary payloads (e.g. OpenPGP-encrypted
+      // files fail downstream with "not a valid OpenPGP message"). ASCII/JSON
+      // bodies survive UTF-8, which is why only encrypted binary downloads broke.
+      writePlaintextResponse(stream, binaryToBytes(response));
       closeStream(stream.streamId, "http_response_sent");
       return;
     }
@@ -364,7 +382,7 @@ async function handleRelayHttpRequest(
   return buildHttpResponse(bridgeResponse);
 }
 
-function buildHttpResponse(response: PsLiteBridgeResponse): string {
+export function buildHttpResponse(response: PsLiteBridgeResponse): string {
   const responseHeaders = {
     "cache-control": "no-store",
     connection: "close",
@@ -479,6 +497,15 @@ function encodeBase64(bytes: Uint8Array): string {
   return typeof globalThis.btoa === "function"
     ? globalThis.btoa(binary)
     : Buffer.from(binary, "binary").toString("base64");
+}
+
+function chunks(bytes: Uint8Array, chunkBytes: number): Uint8Array[] {
+  if (bytes.length === 0) return [bytes];
+  const result: Uint8Array[] = [];
+  for (let offset = 0; offset < bytes.length; offset += chunkBytes) {
+    result.push(bytes.slice(offset, offset + chunkBytes));
+  }
+  return result;
 }
 
 function decodeBase64(input: string): Uint8Array {

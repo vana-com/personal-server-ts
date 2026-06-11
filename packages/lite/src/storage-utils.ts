@@ -4,11 +4,12 @@ import type {
   DataStoragePort,
   DataStorageScopeListOptions,
 } from "@opendatalabs/personal-server-ts-core/ports";
-import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type {
   IndexEntry,
   ScopeSummary,
 } from "@opendatalabs/personal-server-ts-core/storage/index";
+import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
+export { previewEnvelopeValue } from "@opendatalabs/personal-server-ts-core/storage/preview";
 
 export function sortEntries(entries: IndexEntry[]): IndexEntry[] {
   return [...entries].sort((a, b) =>

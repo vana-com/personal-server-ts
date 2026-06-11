@@ -22,6 +22,7 @@ import {
   type DeviceSessionStore,
 } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
+  createSchemaRegistrar,
   handlePersonalServerAccessLogsRequest,
   handlePersonalServerConfigRequest,
   handlePersonalServerDataRequest,
@@ -48,6 +49,32 @@ import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logg
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
+import {
+  approveMcpOAuthAuthorization,
+  approveMcpOAuthAuthorizationWithScopes,
+  approveMcpConnection,
+  buildMcpProtectedResourceMetadataUrl,
+  buildStableMcpUrl,
+  createInMemoryMcpOAuthAuthorizationStore,
+  createMcpConnection,
+  createMcpOAuthAuthorization,
+  createMcpDataReadClient,
+  handleMcpStreamableHttpRequest,
+  hashConnectionToken,
+  listMcpConnectionViews,
+  loadMcpGranteeAccount,
+  McpConnectionNotFoundError,
+  McpConnectionStateError,
+  McpOAuthAuthorizationError,
+  redeemMcpOAuthAuthorizationCode,
+  toMcpOAuthAuthorizationView,
+  revokeMcpConnection,
+  toMcpConnectionView,
+  McpActivityRecorder,
+  type McpConnectionGrant,
+  type McpConnectionStore,
+  type McpOAuthAuthorizationStore,
+} from "@opendatalabs/personal-server-ts-core/mcp";
 import type { PsLiteStorageCapabilities } from "./storage.js";
 import {
   createIndexedDbPsLiteAccessLogStore,
@@ -55,6 +82,10 @@ import {
   createIndexedDbPsLiteTokenStore,
   savePsLiteConfig,
 } from "./state.js";
+import {
+  collectDiagnosticsWithTimeout,
+  DiagnosticsRecorder,
+} from "./diagnostics.js";
 
 export interface PsLiteStorageAdapter {
   kind: "indexeddb" | "opfs" | "custom";
@@ -80,7 +111,12 @@ export interface PsLiteRuntimeOptions {
   gateway?: GatewayClient;
   serverOwner?: `0x${string}`;
   serverSigner?: Pick<ServerSigner, "signGrantRegistration"> &
-    Partial<Pick<ServerSigner, "signGrantRevocation">>;
+    Partial<
+      Pick<
+        ServerSigner,
+        "signGrantRevocation" | "signSchemaRegistration" | "address"
+      >
+    >;
   syncManager?:
     | (Pick<SyncManager, "trigger" | "getStatus"> &
         Partial<Pick<SyncManager, "start" | "stop">>)
@@ -90,6 +126,20 @@ export interface PsLiteRuntimeOptions {
   accessToken?: string;
   tokenStore?: PsLiteTokenStore;
   stateCapabilities?: Partial<PsLiteRuntimeStateCapabilities>;
+  /**
+   * Per-runtime MCP connection store. Omit to disable the MCP endpoints
+   * (`/mcp/:token` + `/v1/mcp/connections`). Pass `createInMemoryMcpConnectionStore()`
+   * to enable with non-persistent storage, or `createIndexedDbMcpConnectionStore()`
+   * for the production browser default.
+   */
+  mcpConnectionStore?: McpConnectionStore;
+  mcpOAuthAuthorizationStore?: McpOAuthAuthorizationStore;
+  mcpOAuthApprovalUrl?: string | (() => string);
+  /**
+   * Optional diagnostics recorder. When provided, GET /v1/diagnostics (owner-only)
+   * returns a structured snapshot useful for debugging stuck approval pages.
+   */
+  diagnostics?: DiagnosticsRecorder;
 }
 
 export interface PsLiteRuntimeStateCapabilities {
@@ -134,7 +184,18 @@ export interface Web3SignedPsLiteAuthOptions {
   now?: () => number;
 }
 
-type JsonStatus = 200 | 201 | 400 | 401 | 403 | 404 | 405 | 500 | 501 | 503;
+type JsonStatus =
+  | 200
+  | 201
+  | 400
+  | 401
+  | 403
+  | 404
+  | 405
+  | 409
+  | 500
+  | 501
+  | 503;
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -160,6 +221,86 @@ function errorResponse(
     },
     { status },
   );
+}
+
+function mcpUnauthorized(
+  origin: string,
+  message = "MCP authorization required",
+) {
+  return jsonResponse(
+    {
+      error: {
+        code: 401,
+        errorCode: "MCP_AUTH_REQUIRED",
+        message,
+      },
+    },
+    {
+      status: 401,
+      headers: {
+        "WWW-Authenticate": `Bearer resource_metadata="${buildMcpProtectedResourceMetadataUrl(origin)}", scope="vana:read"`,
+      },
+    },
+  );
+}
+
+function authorizationServerMetadata(origin: string) {
+  return {
+    issuer: origin,
+    authorization_endpoint: `${origin}/mcp/oauth/authorize`,
+    token_endpoint: `${origin}/mcp/oauth/token`,
+    registration_endpoint: `${origin}/mcp/oauth/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code"],
+    token_endpoint_auth_methods_supported: ["none"],
+    code_challenge_methods_supported: ["S256"],
+    scopes_supported: ["vana:read"],
+  };
+}
+
+function protectedResourceMetadata(origin: string) {
+  return {
+    resource: buildStableMcpUrl(origin),
+    authorization_servers: [origin],
+    bearer_methods_supported: ["header"],
+    scopes_supported: ["vana:read"],
+    resource_name: "Vana Personal Server MCP",
+  };
+}
+
+function resolveMcpApprovalUrl(
+  value: string | (() => string) | undefined,
+): string | null {
+  if (!value) return null;
+  return typeof value === "function" ? value() : value;
+}
+
+function redirectWithOAuthError(
+  redirectUri: string,
+  error: string,
+  description: string,
+  state: string | null,
+): Response {
+  try {
+    const url = new URL(redirectUri);
+    url.searchParams.set("error", error);
+    url.searchParams.set("error_description", description);
+    if (state) url.searchParams.set("state", state);
+    return Response.redirect(url.toString(), 302);
+  } catch {
+    return jsonResponse(
+      {
+        error,
+        error_description: description,
+        ...(state ? { state } : {}),
+      },
+      { status: 400 },
+    );
+  }
+}
+
+async function parseFormBody(request: Request): Promise<URLSearchParams> {
+  return new URLSearchParams(await request.text());
 }
 
 function unavailableResponse(): Response {
@@ -385,6 +526,10 @@ export function createPsLiteRuntime(
   const now = options.now ?? (() => new Date());
   const auth = options.auth ?? createMissingAuthAdapter();
   const dataStorage = toDataStoragePort(options.storage);
+  // Wire diagnostics by default so GET /v1/diagnostics is always available.
+  const diagnostics = options.diagnostics ?? new DiagnosticsRecorder();
+  options = { ...options, diagnostics };
+  diagnostics.push({ phase: "booting", detail: "runtime created" });
   let accessLogReader = options.accessLogReader;
   let accessLogWriter = options.accessLogWriter;
   if (!accessLogReader || !accessLogWriter) {
@@ -394,7 +539,33 @@ export function createPsLiteRuntime(
   }
   const tokenStore = options.tokenStore ?? createDefaultTokenStore();
   const saveConfig = options.saveConfig ?? createDefaultSaveConfig();
+  // Auto-register a permissive "no-schema" schema for binary uploads to novel
+  // scopes, mirroring the Node server. Without this the sync upload worker
+  // fails with "No schema found for scope" for files the user uploads under a
+  // scope that has no registered schema. Requires the server signer (to sign
+  // the EIP-712 SchemaRegistration) and a gateway URL.
+  const schemaRegistrarSigner = options.serverSigner;
+  const schemaRegistrarGatewayUrl = options.config?.gateway?.url;
+  const schemaRegistrar =
+    schemaRegistrarSigner?.signSchemaRegistration &&
+    schemaRegistrarSigner.address &&
+    schemaRegistrarGatewayUrl
+      ? createSchemaRegistrar({
+          gatewayUrl: schemaRegistrarGatewayUrl,
+          signer: {
+            address: schemaRegistrarSigner.address,
+            signSchemaRegistration:
+              schemaRegistrarSigner.signSchemaRegistration,
+          },
+        })
+      : undefined;
   const deviceSessions: DeviceSessionStore = createMemoryDeviceSessionStore();
+  const mcpOAuthAuthorizationStore =
+    options.mcpOAuthAuthorizationStore ??
+    createInMemoryMcpOAuthAuthorizationStore();
+  const activityRecorder = options.mcpConnectionStore
+    ? new McpActivityRecorder()
+    : undefined;
 
   async function withProtocolErrors(
     handler: () => Promise<Response> | Response,
@@ -633,6 +804,47 @@ export function createPsLiteRuntime(
           });
         }
 
+        if (url.pathname === "/v1/diagnostics") {
+          if (request.method !== "GET") {
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          }
+          try {
+            await auth.authorizeOwner(request);
+          } catch (err) {
+            if (err instanceof ProtocolError) {
+              return protocolErrorResponse(err);
+            }
+            throw err;
+          }
+          if (!options.diagnostics) {
+            return jsonResponse(
+              {
+                error: {
+                  code: 404,
+                  errorCode: "DIAGNOSTICS_NOT_CONFIGURED",
+                  message:
+                    "Diagnostics recorder not configured for this runtime",
+                },
+              },
+              { status: 404 },
+            );
+          }
+          const syncStatus = options.syncManager?.getStatus() ?? null;
+          const snapshot = await collectDiagnosticsWithTimeout(
+            options.diagnostics,
+            {
+              runtimeActive: active,
+              syncStatus,
+              storage: dataStorage,
+            },
+          );
+          return jsonResponse(snapshot);
+        }
+
         if (!active) {
           return unavailableResponse();
         }
@@ -648,6 +860,7 @@ export function createPsLiteRuntime(
               storage: dataStorage,
               auth,
               schemaResolver: options.gateway,
+              schemaRegistrar,
               accessLogWriter,
               syncManager: options.syncManager ?? null,
               now,
@@ -745,8 +958,542 @@ export function createPsLiteRuntime(
           });
         }
 
+        if (options.mcpConnectionStore) {
+          const mcpResponse = await handleMcpRoute({
+            request,
+            url,
+            store: options.mcpConnectionStore,
+            authorizationStore: mcpOAuthAuthorizationStore,
+            approvalUrl: options.mcpOAuthApprovalUrl,
+            auth,
+            dataStorage,
+            schemaResolver: options.gateway,
+            accessLogWriter,
+            now,
+            runtimeAvailability: { isAvailable: () => active },
+            serverOrigin: url.origin,
+            gateway: options.gateway,
+            gatewayConfig: options.config?.gateway as
+              | (DataPortabilityGatewayConfig & { url?: string })
+              | undefined,
+            serverOwner: options.serverOwner ?? options.identity?.address,
+            serverSigner: options.serverSigner,
+            activityRecorder,
+          });
+          if (mcpResponse) return mcpResponse;
+        }
+
         return errorResponse(404, "NOT_FOUND", "Not found");
       });
     },
   };
+}
+
+/**
+ * MCP route dispatcher used inside `createPsLiteRuntime.fetch`. Handles both
+ * the owner-only `/v1/mcp/connections` management endpoints and the public
+ * `/mcp/:connectionToken` Streamable HTTP endpoint that Claude dials.
+ *
+ * Returns `null` for paths that don't match — the caller continues to the
+ * 404. Errors are passed through; the caller is already inside
+ * `withProtocolErrors`.
+ */
+async function handleMcpRoute(input: {
+  request: Request;
+  url: URL;
+  store: McpConnectionStore;
+  authorizationStore: McpOAuthAuthorizationStore;
+  approvalUrl?: string | (() => string);
+  auth: PsLiteAuthAdapter;
+  dataStorage: DataStoragePort;
+  schemaResolver?: GatewayClient;
+  accessLogWriter: AccessLogWriter;
+  now: () => Date;
+  runtimeAvailability: RuntimeAvailabilityPort;
+  serverOrigin: string;
+  gateway?: GatewayClient;
+  gatewayConfig?: (DataPortabilityGatewayConfig & { url?: string }) | null;
+  serverOwner?: `0x${string}`;
+  serverSigner?: Pick<ServerSigner, "signGrantRegistration">;
+  activityRecorder?: McpActivityRecorder;
+}): Promise<Response | null> {
+  const pathname = input.url.pathname;
+  const ownerPrefix = "/v1/mcp/connections";
+  const ownerAuthorizationPrefix = "/v1/mcp/oauth/authorizations";
+
+  if (pathname === "/.well-known/oauth-protected-resource/mcp") {
+    if (!resolveMcpApprovalUrl(input.approvalUrl)) {
+      return errorResponse(
+        404,
+        "MCP_OAUTH_NOT_CONFIGURED",
+        "MCP OAuth is not configured",
+      );
+    }
+    return jsonResponse(protectedResourceMetadata(input.serverOrigin));
+  }
+
+  if (pathname === "/.well-known/oauth-authorization-server") {
+    if (!resolveMcpApprovalUrl(input.approvalUrl)) {
+      return errorResponse(
+        404,
+        "MCP_OAUTH_NOT_CONFIGURED",
+        "MCP OAuth is not configured",
+      );
+    }
+    return jsonResponse(authorizationServerMetadata(input.serverOrigin));
+  }
+
+  if (pathname === "/mcp/oauth/register") {
+    if (!resolveMcpApprovalUrl(input.approvalUrl)) {
+      return errorResponse(
+        404,
+        "MCP_OAUTH_NOT_CONFIGURED",
+        "MCP OAuth is not configured",
+      );
+    }
+    if (input.request.method !== "POST") {
+      return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+    }
+    let body: { client_name?: string; redirect_uris?: string[] } = {};
+    try {
+      body = (await input.request.json()) as typeof body;
+    } catch {
+      body = {};
+    }
+    return jsonResponse(
+      {
+        client_id: `mcp-client-${crypto.randomUUID()}`,
+        client_name: body.client_name ?? "Claude",
+        redirect_uris: Array.isArray(body.redirect_uris)
+          ? body.redirect_uris
+          : [],
+        token_endpoint_auth_method: "none",
+        grant_types: ["authorization_code"],
+        response_types: ["code"],
+      },
+      { status: 201 },
+    );
+  }
+
+  if (pathname === "/mcp/oauth/authorize") {
+    if (!resolveMcpApprovalUrl(input.approvalUrl)) {
+      return errorResponse(
+        404,
+        "MCP_OAUTH_NOT_CONFIGURED",
+        "MCP OAuth is not configured",
+      );
+    }
+    if (input.request.method !== "GET") {
+      return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+    }
+    const responseType = input.url.searchParams.get("response_type");
+    const clientId = input.url.searchParams.get("client_id") ?? "";
+    const redirectUri = input.url.searchParams.get("redirect_uri") ?? "";
+    const codeChallenge = input.url.searchParams.get("code_challenge") ?? "";
+    const codeChallengeMethod =
+      input.url.searchParams.get("code_challenge_method") ?? "";
+    const state = input.url.searchParams.get("state");
+    const scope = input.url.searchParams.get("scope") ?? "vana:read";
+    if (responseType !== "code") {
+      return redirectWithOAuthError(
+        redirectUri,
+        "unsupported_response_type",
+        "Only response_type=code is supported",
+        state,
+      );
+    }
+    try {
+      const created = await createMcpOAuthAuthorization(
+        {
+          clientId,
+          redirectUri,
+          codeChallenge,
+          codeChallengeMethod,
+          scope,
+          ...(state ? { state } : {}),
+        },
+        {
+          connectionStore: input.store,
+          authorizationStore: input.authorizationStore,
+          publicOrigin: input.serverOrigin,
+          now: input.now,
+        },
+      );
+      const approvalUrl = resolveMcpApprovalUrl(input.approvalUrl);
+      if (!approvalUrl) {
+        return errorResponse(
+          500,
+          "MCP_APPROVAL_URL_MISSING",
+          "MCP OAuth approval URL is not configured",
+        );
+      }
+      const approve = new URL(approvalUrl);
+      approve.searchParams.set("mcp_authorization", created.authorizationId);
+      approve.searchParams.set("ps_origin", input.serverOrigin);
+      return Response.redirect(approve.toString(), 302);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return redirectWithOAuthError(
+        redirectUri,
+        err instanceof McpOAuthAuthorizationError
+          ? err.code
+          : "invalid_request",
+        message,
+        state,
+      );
+    }
+  }
+
+  if (pathname === "/mcp/oauth/token") {
+    if (!resolveMcpApprovalUrl(input.approvalUrl)) {
+      return errorResponse(
+        404,
+        "MCP_OAUTH_NOT_CONFIGURED",
+        "MCP OAuth is not configured",
+      );
+    }
+    if (input.request.method !== "POST") {
+      return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+    }
+    const body = await parseFormBody(input.request);
+    if (body.get("grant_type") !== "authorization_code") {
+      return jsonResponse(
+        {
+          error: "unsupported_grant_type",
+          error_description: "Only authorization_code is supported",
+        },
+        { status: 400 },
+      );
+    }
+    try {
+      const token = await redeemMcpOAuthAuthorizationCode(
+        {
+          authorizationCode: body.get("code") ?? "",
+          codeVerifier: body.get("code_verifier") ?? "",
+          clientId: body.get("client_id") ?? "",
+          redirectUri: body.get("redirect_uri") ?? "",
+        },
+        {
+          authorizationStore: input.authorizationStore,
+          connectionStore: input.store,
+          now: input.now,
+        },
+      );
+      return jsonResponse({
+        access_token: token.accessToken,
+        token_type: "Bearer",
+        ...(token.scope ? { scope: token.scope } : {}),
+      });
+    } catch (err) {
+      return jsonResponse(
+        {
+          error:
+            err instanceof McpOAuthAuthorizationError
+              ? err.code
+              : "invalid_grant",
+          error_description: err instanceof Error ? err.message : String(err),
+        },
+        { status: 400 },
+      );
+    }
+  }
+
+  if (
+    pathname === ownerAuthorizationPrefix ||
+    pathname.startsWith(`${ownerAuthorizationPrefix}/`)
+  ) {
+    try {
+      await input.auth.authorizeOwner(input.request);
+    } catch (err) {
+      if (err instanceof ProtocolError) {
+        return protocolErrorResponse(err);
+      }
+      throw err;
+    }
+    const tail = pathname.slice(ownerAuthorizationPrefix.length + 1);
+    const [id, action] = tail.split("/");
+    if (!id) {
+      return errorResponse(404, "NOT_FOUND", "Not found");
+    }
+    if (!action && input.request.method === "GET") {
+      const record = await input.authorizationStore.getById(id);
+      if (!record) {
+        return errorResponse(404, "NOT_FOUND", "Authorization not found");
+      }
+      return jsonResponse(toMcpOAuthAuthorizationView(record));
+    }
+    if (action === "approve") {
+      if (input.request.method !== "POST") {
+        return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+      }
+      let body: {
+        expiresAt?: number;
+        grants?: McpConnectionGrant[];
+        nonce?: number;
+        scopes?: string[];
+      } = {};
+      try {
+        body = (await input.request.json()) as typeof body;
+      } catch {
+        return errorResponse(400, "INVALID_BODY", "Body must be JSON");
+      }
+      if (Array.isArray(body.scopes) && body.scopes.length > 0) {
+        if (!input.gateway || !input.gatewayConfig?.url) {
+          return errorResponse(
+            500,
+            "SERVER_NOT_CONFIGURED",
+            "Gateway config is not configured",
+          );
+        }
+        try {
+          const approved = await approveMcpOAuthAuthorizationWithScopes(
+            {
+              authorizationId: id,
+              scopes: body.scopes,
+              ...(body.expiresAt !== undefined
+                ? { expiresAt: body.expiresAt }
+                : {}),
+              ...(body.nonce !== undefined ? { nonce: body.nonce } : {}),
+            },
+            {
+              connectionStore: input.store,
+              authorizationStore: input.authorizationStore,
+              gateway: input.gateway,
+              gatewayConfig: input.gatewayConfig,
+              gatewayUrl: input.gatewayConfig.url,
+              serverOwner: input.serverOwner,
+              serverSigner: input.serverSigner,
+              now: input.now,
+            },
+          );
+          return jsonResponse({ redirectTo: approved.redirectTo });
+        } catch (err) {
+          if (err instanceof McpOAuthAuthorizationError) {
+            return errorResponse(err.status as never, err.code, err.message);
+          }
+          throw err;
+        }
+      }
+      if (!Array.isArray(body.grants) || body.grants.length === 0) {
+        return errorResponse(
+          400,
+          "GRANTS_REQUIRED",
+          "Approve requires grants or scopes",
+        );
+      }
+      try {
+        const approved = await approveMcpOAuthAuthorization(
+          { authorizationId: id, grants: body.grants },
+          {
+            connectionStore: input.store,
+            authorizationStore: input.authorizationStore,
+            now: input.now,
+          },
+        );
+        return jsonResponse({ redirectTo: approved.redirectTo });
+      } catch (err) {
+        if (err instanceof McpOAuthAuthorizationError) {
+          return errorResponse(err.status as never, err.code, err.message);
+        }
+        throw err;
+      }
+    }
+    return errorResponse(404, "NOT_FOUND", "Not found");
+  }
+
+  // Owner management endpoints
+  if (pathname === ownerPrefix || pathname.startsWith(`${ownerPrefix}/`)) {
+    try {
+      await input.auth.authorizeOwner(input.request);
+    } catch (err) {
+      if (err instanceof ProtocolError) {
+        return protocolErrorResponse(err);
+      }
+      throw err;
+    }
+    // POST /v1/mcp/connections — create
+    if (pathname === ownerPrefix) {
+      if (input.request.method === "POST") {
+        let body: { displayName?: string } = {};
+        try {
+          body = (await input.request.json()) as { displayName?: string };
+        } catch {
+          body = {};
+        }
+        const created = await createMcpConnection(
+          { displayName: body.displayName },
+          {
+            store: input.store,
+            publicOrigin: input.serverOrigin,
+            now: input.now,
+          },
+        );
+        return jsonResponse(created, { status: 201 });
+      }
+      if (input.request.method === "GET") {
+        const records = await listMcpConnectionViews(input.store);
+        return jsonResponse({ connections: records });
+      }
+      return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+    }
+    // /v1/mcp/connections/:id[/approve]
+    const tail = pathname.slice(ownerPrefix.length + 1);
+    const [id, action] = tail.split("/");
+    if (!id) {
+      return errorResponse(404, "NOT_FOUND", "Not found");
+    }
+    if (action === "approve") {
+      if (input.request.method !== "POST") {
+        return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+      }
+      let body: { grants?: McpConnectionGrant[] } = {};
+      try {
+        body = (await input.request.json()) as {
+          grants?: McpConnectionGrant[];
+        };
+      } catch {
+        return errorResponse(400, "INVALID_BODY", "Body must be JSON");
+      }
+      if (!Array.isArray(body.grants) || body.grants.length === 0) {
+        return errorResponse(
+          400,
+          "GRANTS_REQUIRED",
+          "Approve requires at least one grant — mint grants in the consent flow first",
+        );
+      }
+      try {
+        const updated = await approveMcpConnection(
+          { connectionId: id, grants: body.grants },
+          { store: input.store, now: input.now },
+        );
+        return jsonResponse(toMcpConnectionView(updated));
+      } catch (err) {
+        if (err instanceof McpConnectionNotFoundError) {
+          return errorResponse(404, "NOT_FOUND", err.message);
+        }
+        if (err instanceof McpConnectionStateError) {
+          return errorResponse(409, "INVALID_STATE", err.message);
+        }
+        throw err;
+      }
+    }
+    if (!action) {
+      if (input.request.method === "DELETE") {
+        try {
+          const updated = await revokeMcpConnection(id, {
+            store: input.store,
+            now: input.now,
+          });
+          return jsonResponse(toMcpConnectionView(updated));
+        } catch (err) {
+          if (err instanceof McpConnectionNotFoundError) {
+            return errorResponse(404, "NOT_FOUND", err.message);
+          }
+          throw err;
+        }
+      }
+      return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+    }
+    return errorResponse(404, "NOT_FOUND", "Not found");
+  }
+
+  async function handleMcpToken(
+    rawToken: string | null,
+    options: { oauthChallenge: boolean },
+  ): Promise<Response> {
+    if (!rawToken) {
+      if (!options.oauthChallenge) {
+        return errorResponse(
+          401,
+          "INVALID_TOKEN",
+          "Missing MCP connection token",
+        );
+      }
+      return mcpUnauthorized(input.serverOrigin);
+    }
+    const tokenHash = await hashConnectionToken(rawToken);
+    const record = await input.store.getByTokenHash(tokenHash);
+    if (!record) {
+      if (!options.oauthChallenge) {
+        return errorResponse(
+          401,
+          "INVALID_TOKEN",
+          "Unknown or revoked MCP connection",
+        );
+      }
+      return mcpUnauthorized(
+        input.serverOrigin,
+        "Unknown or revoked MCP connection",
+      );
+    }
+    const granteeAccount = loadMcpGranteeAccount({
+      address: record.granteeAddress,
+      publicKey: record.granteePublicKey,
+      encryptedPrivateKey: record.encryptedGranteePrivateKey,
+    });
+    const readClient = createMcpDataReadClient({
+      serverOrigin: input.serverOrigin,
+      granteeAccount,
+      dataApiDeps: {
+        storage: input.dataStorage,
+        auth: input.auth,
+        schemaResolver: input.schemaResolver,
+        accessLogWriter: input.accessLogWriter,
+        runtimeAvailability: input.runtimeAvailability,
+        now: input.now,
+        createLogId,
+      },
+    });
+    const response = await handleMcpStreamableHttpRequest(input.request, {
+      connection: record,
+      readClient,
+      activityRecorder: input.activityRecorder,
+    });
+    void input.store
+      .update(record.id, {
+        lastUsedAt: input.now().toISOString(),
+      })
+      .catch((err) => {
+        console.warn("[mcp] failed to update lastUsedAt", err);
+      });
+    return response;
+  }
+
+  // Owner-only activity feed endpoint.
+  if (pathname === "/v1/mcp/activity") {
+    try {
+      await input.auth.authorizeOwner(input.request);
+    } catch (err) {
+      if (err instanceof ProtocolError) {
+        return protocolErrorResponse(err);
+      }
+      throw err;
+    }
+    if (input.request.method !== "GET") {
+      return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+    }
+    const snapshot = input.activityRecorder
+      ? input.activityRecorder.snapshot()
+      : { events: [], running: 0, total: 0 };
+    return jsonResponse(snapshot);
+  }
+
+  // Claude-facing stable endpoint: /mcp with Bearer token.
+  if (pathname === "/mcp") {
+    return handleMcpToken(bearerToken(input.request), {
+      oauthChallenge: Boolean(resolveMcpApprovalUrl(input.approvalUrl)),
+    });
+  }
+
+  // Legacy Claude-facing endpoint: /mcp/:token
+  const mcpPrefix = "/mcp/";
+  if (pathname.startsWith(mcpPrefix)) {
+    const rawToken = decodeURIComponent(pathname.slice(mcpPrefix.length));
+    if (!rawToken || rawToken.includes("/")) {
+      return errorResponse(404, "NOT_FOUND", "Not found");
+    }
+    return handleMcpToken(rawToken, { oauthChallenge: false });
+  }
+
+  return null;
 }

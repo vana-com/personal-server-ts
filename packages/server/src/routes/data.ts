@@ -24,6 +24,8 @@ import {
 } from "../middleware/body-limit.js";
 import { createNodeDataStorage } from "../storage/node-data-storage.js";
 import { createServerApiAuth } from "../api-auth.js";
+import { createSchemaRegistrar } from "../schema-registrar.js";
+import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 
 export interface DataRouteDeps {
   indexManager: IndexManager;
@@ -71,6 +73,10 @@ export interface DataRouteDeps {
    */
   serverAddress?: `0x${string}`;
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
+  /** Server signing account — enables binary schema auto-registration. */
+  serverSigner?: ServerSigner;
+  /** Gateway base URL, required (with serverSigner) for schema registration. */
+  gatewayUrl?: string;
 }
 
 export function dataRoutes(deps: DataRouteDeps): Hono {
@@ -93,6 +99,15 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     runtimeAvailability: deps.runtimeAvailability,
   });
 
+  const schemaRegistrar =
+    deps.serverSigner && deps.gatewayUrl
+      ? createSchemaRegistrar({
+          gatewayUrl: deps.gatewayUrl,
+          signer: deps.serverSigner,
+          logger: deps.logger,
+        })
+      : undefined;
+
   app.use("/:scope", createBodyLimit(DATA_INGEST_MAX_SIZE));
   app.all("*", (c) =>
     handlePersonalServerDataRequest(
@@ -101,6 +116,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         storage: dataStorage,
         auth,
         schemaResolver: deps.gateway,
+        schemaRegistrar,
         accessLogWriter: deps.accessLogWriter,
         syncManager: deps.syncManager ?? null,
         runtimeAvailability: deps.runtimeAvailability,

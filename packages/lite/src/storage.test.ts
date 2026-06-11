@@ -1,12 +1,74 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import type {
+  DataBlockManifest,
+  DataScopeBlock,
+} from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
+  createMemoryPsLiteStorage,
   createMemoryPsLiteDataFileStore,
   createMemoryPsLitePersistence,
 } from "./test-support/memory.js";
-import { createPersistentPsLiteStorage } from "./storage.js";
+import {
+  createPersistentPsLiteStorage,
+  type PsLiteDataFileStore,
+} from "./storage.js";
+import { previewEnvelopeValue } from "./storage-utils.js";
 
 describe("createPersistentPsLiteStorage", () => {
+  it("bounds in-memory previews by traversal work for container-heavy envelopes", () => {
+    const envelope = createDataFileEnvelope(
+      "chatgpt.conversations",
+      "2026-05-08T00:00:00.000Z",
+      { items: Array.from({ length: 50_000 }, () => ({})) },
+    );
+
+    const preview = previewEnvelopeValue(envelope, 100_000);
+
+    expect(preview.truncated).toBe(true);
+    expect(preview.text.length).toBeLessThanOrEqual(100_000);
+  });
+
+  it("leaves custom file stores without bounded previews on the core fallback path", async () => {
+    const persistence = createMemoryPsLitePersistence();
+    const files = new Map<string, ReturnType<typeof createDataFileEnvelope>>();
+    const readEnvelope = vi.fn(async (path: string) => files.get(path) ?? null);
+    const dataFileStore: PsLiteDataFileStore = {
+      kind: "opfs",
+      readEnvelope,
+      async writeEnvelope(path, envelope) {
+        files.set(path, envelope);
+        return new TextEncoder().encode(JSON.stringify(envelope)).byteLength;
+      },
+      async deleteEnvelope(path) {
+        files.delete(path);
+      },
+    };
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      persistence,
+      dataFileStore,
+    );
+    const envelope = createDataFileEnvelope(
+      "notes.profile",
+      "2026-05-08T00:00:00.000Z",
+      { text: "x".repeat(10_000) },
+    );
+
+    const write = await storage.writeEnvelope(envelope);
+    expect(write.sizeBytes).toBeGreaterThan(1_000);
+    await storage.insertEntry({
+      fileId: "file-1",
+      path: write.relativePath,
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      sizeBytes: write.sizeBytes,
+    });
+
+    expect(storage.readEnvelopePreview).toBeUndefined();
+    expect(readEnvelope).not.toHaveBeenCalled();
+  });
+
   it("persists envelopes and index entries across storage reloads", async () => {
     const persistence = createMemoryPsLitePersistence();
     const storage = await createPersistentPsLiteStorage(
@@ -74,6 +136,55 @@ describe("createPersistentPsLiteStorage", () => {
 
     expect(reloaded.countVersions("instagram.profile")).toBe(0);
     expect(reloaded.findEntry({ scope: "instagram.profile" })).toBeUndefined();
+  });
+
+  it("deletes a single version by fileId (entry + blob) and no-ops on unknown id", async () => {
+    const persistence = createMemoryPsLitePersistence();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      persistence,
+    );
+    // Two versions of the same scope; only one is deleted.
+    const keep = createDataFileEnvelope(
+      "instagram.profile",
+      "2026-05-08T00:00:00.000Z",
+      { username: "keep" },
+    );
+    const drop = createDataFileEnvelope(
+      "instagram.profile",
+      "2026-05-09T00:00:00.000Z",
+      { username: "drop" },
+    );
+    for (const [index, envelope] of [keep, drop].entries()) {
+      const write = await storage.writeEnvelope(envelope);
+      await storage.insertEntry({
+        fileId: `file-${index + 1}`,
+        path: write.relativePath,
+        scope: envelope.scope,
+        collectedAt: envelope.collectedAt,
+        sizeBytes: write.sizeBytes,
+      });
+    }
+
+    expect(await storage.deleteByFileId("file-2")).toBe(true);
+    // Unknown fileId is a no-op.
+    expect(await storage.deleteByFileId("file-unknown")).toBe(false);
+
+    const reloaded = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      persistence,
+    );
+    expect(reloaded.countVersions("instagram.profile")).toBe(1);
+    expect(
+      reloaded.findEntry({ scope: "instagram.profile", fileId: "file-2" }),
+    ).toBeUndefined();
+    // The other version (and its blob) survive.
+    expect(
+      reloaded.findEntry({ scope: "instagram.profile", fileId: "file-1" }),
+    ).toBeDefined();
+    await expect(
+      reloaded.readEnvelope("instagram.profile", "2026-05-08T00:00:00.000Z"),
+    ).resolves.toBeDefined();
   });
 
   it("summarizes persisted scopes with latest collection time and version count", async () => {
@@ -238,4 +349,429 @@ describe("createPersistentPsLiteStorage", () => {
     });
     expect(reloaded.findUnsynced()).toEqual([]);
   });
+
+  it("persists IndexedDB fallback block sidecars across storage reloads", async () => {
+    const persistence = createMemoryPsLitePersistence();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      persistence,
+    );
+    const { manifest, blocks } = blockFixture(
+      "instagram.profile",
+      "2026-05-08T00:00:00.000Z",
+      2,
+    );
+
+    await storage.writeBlockManifest?.(
+      manifest.scope,
+      manifest.collectedAt,
+      manifest,
+      blocks,
+    );
+
+    const reloaded = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      persistence,
+    );
+    await expect(
+      reloaded.readScopeBlocks?.(
+        "instagram.profile",
+        "2026-05-08T00:00:00.000Z",
+        { maxBytes: 1_000 },
+      ),
+    ).resolves.toMatchObject({
+      scope: "instagram.profile",
+      blocks: [{ value: { index: 0 } }, { value: { index: 1 } }],
+    });
+  });
+
+  it("writes persistent block sidecars sequentially before publishing the manifest", async () => {
+    const writes: string[] = [];
+    let activePayloadWrites = 0;
+    const payloads = new Map<string, DataScopeBlock>();
+    const manifests = new Map<string, DataBlockManifest>();
+    const dataFileStore: PsLiteDataFileStore = {
+      kind: "opfs",
+      async readEnvelope() {
+        return null;
+      },
+      async writeEnvelope() {
+        return 0;
+      },
+      async deleteEnvelope() {},
+      async readBlockManifest(path) {
+        return manifests.get(path) ?? null;
+      },
+      async writeBlockManifest(path, manifest) {
+        writes.push(`manifest:${path}`);
+        manifests.set(path, manifest);
+      },
+      async readBlockPayload(path) {
+        return payloads.get(path) ?? null;
+      },
+      async writeBlockPayload(path, block) {
+        activePayloadWrites += 1;
+        try {
+          expect(activePayloadWrites).toBe(1);
+          writes.push(`payload:${path}`);
+          await Promise.resolve();
+          payloads.set(path, block);
+        } finally {
+          activePayloadWrites -= 1;
+        }
+      },
+      async deleteBlockTree(pathPrefix) {
+        for (const key of [...payloads.keys()]) {
+          if (key.startsWith(pathPrefix)) payloads.delete(key);
+        }
+      },
+    };
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      dataFileStore,
+    );
+    const { manifest, blocks } = blockFixture(
+      "chatgpt.conversations",
+      "2026-05-08T00:00:00.000Z",
+      3,
+    );
+
+    await storage.writeBlockManifest?.(
+      manifest.scope,
+      manifest.collectedAt,
+      manifest,
+      blocks,
+    );
+
+    expect(writes).toHaveLength(4);
+    expect(
+      writes.slice(0, 3).every((write) => write.startsWith("payload:")),
+    ).toBe(true);
+    expect(writes[3]).toMatch(/^manifest:/);
+    await expect(
+      storage.hasScopeBlocks?.(manifest.scope, manifest.collectedAt),
+    ).resolves.toBe(true);
+  });
+
+  it("falls back to IndexedDB block sidecars when the primary file store cannot write them", async () => {
+    const persistence = createMemoryPsLitePersistence();
+    const primaryWriteAttempts: string[] = [];
+    const dataFileStore: PsLiteDataFileStore = {
+      kind: "opfs",
+      async readEnvelope() {
+        return null;
+      },
+      async writeEnvelope() {
+        return 0;
+      },
+      async deleteEnvelope() {},
+      async readBlockManifest() {
+        return null;
+      },
+      async writeBlockManifest() {
+        primaryWriteAttempts.push("manifest");
+        throw new DOMException("locked", "NoModificationAllowedError");
+      },
+      async readBlockPayload() {
+        return null;
+      },
+      async writeBlockPayload() {
+        primaryWriteAttempts.push("payload");
+        throw new DOMException("locked", "NoModificationAllowedError");
+      },
+      async deleteBlockTree() {},
+    };
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      persistence,
+      dataFileStore,
+    );
+    const { manifest, blocks } = blockFixture(
+      "linkedin.skills",
+      "2026-03-06T20:26:21Z",
+      2,
+    );
+
+    await storage.writeBlockManifest?.(
+      manifest.scope,
+      manifest.collectedAt,
+      manifest,
+      blocks,
+    );
+
+    expect(primaryWriteAttempts).toEqual(["payload"]);
+    await expect(
+      storage.hasScopeBlocks?.(manifest.scope, manifest.collectedAt),
+    ).resolves.toBe(true);
+    await expect(
+      storage.readScopeBlocks?.(manifest.scope, manifest.collectedAt, {
+        maxBytes: 1_000,
+      }),
+    ).resolves.toMatchObject({
+      scope: "linkedin.skills",
+      blocks: [{ value: { index: 0 } }, { value: { index: 1 } }],
+    });
+
+    const reloaded = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      persistence,
+      dataFileStore,
+    );
+    await expect(
+      reloaded.hasScopeBlocks?.(manifest.scope, manifest.collectedAt),
+    ).resolves.toBe(true);
+  });
+
+  it("pages block sidecar reads by cursor until all blocks are reachable", async () => {
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      createMemoryPsLitePersistence(),
+    );
+    const { manifest, blocks } = blockFixture(
+      "chatgpt.conversations",
+      "2026-05-08T00:00:00.000Z",
+      3,
+    );
+    await storage.writeBlockManifest?.(
+      manifest.scope,
+      manifest.collectedAt,
+      manifest,
+      blocks,
+    );
+
+    const seen: unknown[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await storage.readScopeBlocks!(
+        manifest.scope,
+        manifest.collectedAt,
+        { cursor, maxBytes: 16 },
+      );
+      seen.push(...page.blocks.map((block) => block.value));
+      cursor = page.nextCursor;
+    } while (cursor);
+
+    expect(seen).toEqual([{ index: 0 }, { index: 1 }, { index: 2 }]);
+  });
+
+  it("pages through a single oversized persistent block", async () => {
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      createMemoryPsLitePersistence(),
+    );
+    const scope = "chatgpt.conversations";
+    const collectedAt = "2026-05-08T00:00:00.000Z";
+    const value = "0123456789".repeat(600);
+    const sizeBytes = new TextEncoder().encode(value).byteLength;
+    await storage.writeBlockManifest?.(
+      scope,
+      collectedAt,
+      {
+        version: 1,
+        scope,
+        collectedAt,
+        contentKind: "text",
+        blocks: [
+          {
+            id: "block-000001",
+            path: "$.data",
+            mediaType: "text/plain",
+            sizeBytes,
+          },
+        ],
+        warnings: [],
+      },
+      [
+        {
+          id: "block-000001",
+          path: "$.data",
+          mediaType: "text/plain",
+          value,
+          sizeBytes,
+        },
+      ],
+    );
+
+    const firstPage = await storage.readScopeBlocks!(scope, collectedAt, {
+      maxBytes: 1024,
+    });
+    expect(firstPage.blocks[0]?.value).toBe(value.slice(0, 1024));
+    expect(firstPage.blocks[0]?.truncated).toBe(true);
+    expect(firstPage.nextCursor).toBeTruthy();
+
+    const secondPage = await storage.readScopeBlocks!(scope, collectedAt, {
+      cursor: firstPage.nextCursor,
+      maxBytes: 1024,
+    });
+    expect(secondPage.blocks[0]?.value).toBe(value.slice(1024, 2048));
+    expect(secondPage.blocks[0]?.truncated).toBe(true);
+    expect(secondPage.nextCursor).toBeTruthy();
+  });
+
+  it("serves missing block manifests from the raw local envelope", async () => {
+    const files = new Map<string, ReturnType<typeof createDataFileEnvelope>>();
+    const readEnvelope = vi.fn(async (path: string) => files.get(path) ?? null);
+    const dataFileStore: PsLiteDataFileStore = {
+      kind: "opfs",
+      readEnvelope,
+      async writeEnvelope(path, envelope) {
+        files.set(path, envelope);
+        return new TextEncoder().encode(JSON.stringify(envelope)).byteLength;
+      },
+      async deleteEnvelope(path) {
+        files.delete(path);
+      },
+      async readBlockManifest() {
+        return null;
+      },
+      async readBlockPayload() {
+        throw new Error("payload should not be read without a manifest");
+      },
+    };
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      dataFileStore,
+    );
+    const envelope = createDataFileEnvelope(
+      "notes.profile",
+      "2026-05-08T00:00:00.000Z",
+      { bio: "cached envelope can be read without a manifest" },
+    );
+    await storage.writeEnvelope(envelope);
+
+    await expect(
+      storage.canReadScopeBlocks?.("notes.profile", "2026-05-08T00:00:00.000Z"),
+    ).resolves.toBe(true);
+    await expect(
+      storage.readScopeBlocks?.("notes.profile", "2026-05-08T00:00:00.000Z", {
+        maxBytes: 1_000,
+      }),
+    ).resolves.toMatchObject({
+      scope: "notes.profile",
+      contentKind: "vana-envelope",
+      blocks: expect.arrayContaining([
+        expect.objectContaining({
+          path: "$.data",
+        }),
+      ]),
+    });
+    await expect(
+      storage.hasScopeBlocks?.("notes.profile", "2026-05-08T00:00:00.000Z"),
+    ).resolves.toBe(true);
+    expect(readEnvelope).toHaveBeenCalled();
+  });
+
+  it("supports block sidecars in memory storage", async () => {
+    const storage = createMemoryPsLiteStorage();
+    const { manifest, blocks } = blockFixture(
+      "spotify.profile",
+      "2026-05-08T00:00:00.000Z",
+      1,
+    );
+
+    await storage.writeBlockManifest?.(
+      manifest.scope,
+      manifest.collectedAt,
+      manifest,
+      blocks,
+    );
+    await expect(
+      storage.hasScopeBlocks?.(manifest.scope, manifest.collectedAt),
+    ).resolves.toBe(true);
+
+    await expect(
+      storage.readScopeBlocks?.(manifest.scope, manifest.collectedAt, {
+        maxBytes: 1_000,
+      }),
+    ).resolves.toMatchObject({
+      contentKind: "json",
+      blocks: [{ value: { index: 0 } }],
+    });
+  });
+
+  it("pages through a single oversized memory block", async () => {
+    const storage = createMemoryPsLiteStorage();
+    const scope = "chatgpt.conversations";
+    const collectedAt = "2026-05-08T00:00:00.000Z";
+    const value = "abcdefghij".repeat(600);
+    const sizeBytes = new TextEncoder().encode(value).byteLength;
+    await storage.writeBlockManifest?.(
+      scope,
+      collectedAt,
+      {
+        version: 1,
+        scope,
+        collectedAt,
+        contentKind: "text",
+        blocks: [
+          {
+            id: "block-000001",
+            path: "$.data",
+            mediaType: "text/plain",
+            sizeBytes,
+          },
+        ],
+        warnings: [],
+      },
+      [
+        {
+          id: "block-000001",
+          path: "$.data",
+          mediaType: "text/plain",
+          value,
+          sizeBytes,
+        },
+      ],
+    );
+
+    const firstPage = await storage.readScopeBlocks!(scope, collectedAt, {
+      maxBytes: 1024,
+    });
+    expect(firstPage.blocks[0]?.value).toBe(value.slice(0, 1024));
+    expect(firstPage.blocks[0]?.truncated).toBe(true);
+    expect(firstPage.nextCursor).toBeTruthy();
+
+    const secondPage = await storage.readScopeBlocks!(scope, collectedAt, {
+      cursor: firstPage.nextCursor,
+      maxBytes: 1024,
+    });
+    expect(secondPage.blocks[0]?.value).toBe(value.slice(1024, 2048));
+    expect(secondPage.blocks[0]?.truncated).toBe(true);
+    expect(secondPage.nextCursor).toBeTruthy();
+  });
 });
+
+function blockFixture(
+  scope: string,
+  collectedAt: string,
+  count: number,
+): { manifest: DataBlockManifest; blocks: DataScopeBlock[] } {
+  const blocks = Array.from({ length: count }, (_, index) => {
+    const value = { index };
+    return {
+      id: `block-${index}`,
+      path: `$.items[${index}]`,
+      mediaType: "application/json",
+      value,
+      sizeBytes: new TextEncoder().encode(JSON.stringify(value)).byteLength,
+    };
+  });
+  return {
+    manifest: {
+      version: 1,
+      scope,
+      collectedAt,
+      contentKind: "json",
+      blocks: blocks.map(({ id, path, mediaType, sizeBytes }) => ({
+        id,
+        path,
+        mediaType,
+        sizeBytes,
+      })),
+      warnings: [],
+    },
+    blocks,
+  };
+}

@@ -5,9 +5,11 @@ import { tmpdir } from "node:os";
 import {
   writeDataFile,
   readDataFile,
+  readScopeBlocks,
   listVersions,
   deleteDataFile,
   deleteAllForScope,
+  writeBlockManifest,
 } from "./hierarchy.js";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -97,6 +99,59 @@ describe("HierarchyManager", () => {
     });
   });
 
+  describe("readScopeBlocks", () => {
+    it("pages through a single oversized block with intra-block cursors", async () => {
+      const largeValue = "0123456789".repeat(600);
+      const sizeBytes = new TextEncoder().encode(largeValue).byteLength;
+      await writeBlockManifest(
+        options,
+        scope,
+        collectedAt,
+        {
+          version: 1,
+          scope,
+          collectedAt,
+          contentKind: "text",
+          blocks: [
+            {
+              id: "block-000001",
+              path: "$.data",
+              mediaType: "text/plain",
+              sizeBytes,
+            },
+          ],
+          warnings: [],
+        },
+        [
+          {
+            id: "block-000001",
+            path: "$.data",
+            mediaType: "text/plain",
+            value: largeValue,
+            sizeBytes,
+          },
+        ],
+      );
+
+      const firstPage = await readScopeBlocks(options, scope, collectedAt, {
+        maxBytes: 1024,
+      });
+      expect(firstPage.blocks).toHaveLength(1);
+      expect(firstPage.blocks[0]?.value).toBe(largeValue.slice(0, 1024));
+      expect(firstPage.blocks[0]?.truncated).toBe(true);
+      expect(firstPage.nextCursor).toBeTruthy();
+
+      const secondPage = await readScopeBlocks(options, scope, collectedAt, {
+        cursor: firstPage.nextCursor,
+        maxBytes: 1024,
+      });
+      expect(secondPage.blocks).toHaveLength(1);
+      expect(secondPage.blocks[0]?.value).toBe(largeValue.slice(1024, 2048));
+      expect(secondPage.blocks[0]?.truncated).toBe(true);
+      expect(secondPage.nextCursor).toBeTruthy();
+    });
+  });
+
   describe("listVersions", () => {
     it("returns filenames in reverse chronological order", async () => {
       const ts1 = "2026-01-21T08:00:00Z";
@@ -125,6 +180,45 @@ describe("HierarchyManager", () => {
         /ENOENT/,
       );
     });
+
+    it("removes sidecars for that version", async () => {
+      await writeDataFile(options, makeEnvelope());
+      await writeBlockManifest(
+        options,
+        scope,
+        collectedAt,
+        {
+          version: 1,
+          scope,
+          collectedAt,
+          contentKind: "json",
+          blocks: [
+            {
+              id: "block-000001",
+              path: "$",
+              mediaType: "application/json",
+              sizeBytes: 12,
+            },
+          ],
+          warnings: [],
+        },
+        [
+          {
+            id: "block-000001",
+            path: "$",
+            mediaType: "application/json",
+            value: { ok: true },
+            sizeBytes: 12,
+          },
+        ],
+      );
+
+      await deleteDataFile(options, scope, collectedAt);
+
+      await expect(
+        readScopeBlocks(options, scope, collectedAt, { maxBytes: 1024 }),
+      ).rejects.toMatchObject({ code: "block_manifest_not_found" });
+    });
   });
 
   describe("deleteAllForScope", () => {
@@ -147,11 +241,30 @@ describe("HierarchyManager", () => {
     it("after delete, listVersions returns empty array", async () => {
       await writeDataFile(options, makeEnvelope(scope, "2026-01-21T08:00:00Z"));
       await writeDataFile(options, makeEnvelope(scope, "2026-01-21T10:00:00Z"));
+      await writeBlockManifest(
+        options,
+        scope,
+        "2026-01-21T10:00:00Z",
+        {
+          version: 1,
+          scope,
+          collectedAt: "2026-01-21T10:00:00Z",
+          contentKind: "json",
+          blocks: [],
+          warnings: [],
+        },
+        [],
+      );
 
       await deleteAllForScope(options, scope);
 
       const versions = await listVersions(options, scope);
       expect(versions).toEqual([]);
+      await expect(
+        readScopeBlocks(options, scope, "2026-01-21T10:00:00Z", {
+          maxBytes: 1024,
+        }),
+      ).rejects.toMatchObject({ code: "block_manifest_not_found" });
     });
 
     it("deleting nonexistent scope does not throw (idempotent)", async () => {

@@ -16,8 +16,22 @@ import { resolveRootPath } from "./paths.js";
  *   SERVER_ORIGIN        — server.origin (URL)
  *   TUNNEL_ENABLED       — tunnel.enabled (boolean: "true"/"false")
  *   DEV_UI_ENABLED       — devUi.enabled (boolean: "true"/"false")
+ *
+ * Applied regardless of CLOUD_MODE (deploy-time contract address):
+ *   GATEWAY_DATA_REFINER_REGISTRY — gateway.contracts.dataRefinerRegistry
+ *                                   (verifying contract for schema registration)
  */
 function applyEnvOverrides(obj: Record<string, unknown>): void {
+  const refinerRegistry = process.env.GATEWAY_DATA_REFINER_REGISTRY;
+  if (refinerRegistry) {
+    const gateway = (obj.gateway as Record<string, unknown> | undefined) ?? {};
+    const contracts =
+      (gateway.contracts as Record<string, unknown> | undefined) ?? {};
+    contracts.dataRefinerRegistry = refinerRegistry;
+    gateway.contracts = contracts;
+    obj.gateway = gateway;
+  }
+
   if (process.env.CLOUD_MODE !== "true") return;
 
   const { SERVER_PORT, SERVER_ORIGIN, TUNNEL_ENABLED, DEV_UI_ENABLED } =

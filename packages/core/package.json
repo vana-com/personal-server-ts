@@ -60,6 +60,18 @@
       "types": "./dist/storage/index/index.d.ts",
       "import": "./dist/storage/index/index.js"
     },
+    "./storage/blocks": {
+      "types": "./dist/storage/blocks/index.d.ts",
+      "import": "./dist/storage/blocks/index.js"
+    },
+    "./storage/preview": {
+      "types": "./dist/storage/preview.d.ts",
+      "import": "./dist/storage/preview.js"
+    },
+    "./storage/blocks/build": {
+      "types": "./dist/storage/blocks/build.d.ts",
+      "import": "./dist/storage/blocks/build.js"
+    },
     "./grants": {
       "types": "./dist/grants/index.d.ts",
       "import": "./dist/grants/index.js"
@@ -75,6 +87,10 @@
     "./logging/access-log": {
       "types": "./dist/logging/access-log.d.ts",
       "import": "./dist/logging/access-log.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp/index.d.ts",
+      "import": "./dist/mcp/index.js"
     },
     "./keys": {
       "types": "./dist/keys/index.d.ts",
@@ -113,7 +129,10 @@
     "build": "tsc --build"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@opendatalabs/vana-sdk": "3.4.1-canary.a244135",
+    "minisearch": "^7.2.0",
+    "unpdf": "^1.6.2",
     "viem": "^2.48.11",
     "zod": "^4.4.3"
   }
