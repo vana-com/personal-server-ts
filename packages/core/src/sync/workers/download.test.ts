@@ -349,5 +349,33 @@ describe("download worker", () => {
       );
       expect(deps.cursor.write).not.toHaveBeenCalled();
     });
+
+    it("does not re-download data points quarantined earlier in this session", async () => {
+      const deps = makeMockDeps();
+      const dataPoint = makeDataPointRecord({
+        id: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        expectedVersion: "99",
+      });
+      (
+        deps.gateway.listDataPointsByOwner as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        dataPoints: [dataPoint],
+        cursor: null,
+      });
+      (decryptWithPassword as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new Error("Error decrypting message: Session key decryption failed."),
+      );
+
+      await downloadAll(deps);
+      await downloadAll(deps);
+
+      expect(deps.storageAdapter.download).toHaveBeenCalledTimes(1);
+      expect(decryptWithPassword).toHaveBeenCalledTimes(1);
+      expect(deps.logger.warn).toHaveBeenCalledTimes(1);
+      expect(deps.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ dataPointId: dataPoint.id }),
+        "Quarantined corrupt synced data point",
+      );
+    });
   });
 });
