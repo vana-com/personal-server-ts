@@ -24,7 +24,6 @@ import {
 } from "../middleware/body-limit.js";
 import { createNodeDataStorage } from "../storage/node-data-storage.js";
 import { createServerApiAuth } from "../api-auth.js";
-import { createSchemaRegistrar } from "../schema-registrar.js";
 
 export interface DataRouteDeps {
   indexManager: IndexManager;
@@ -94,15 +93,6 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     runtimeAvailability: deps.runtimeAvailability,
   });
 
-  const schemaRegistrar =
-    deps.serverSigner && deps.gatewayUrl
-      ? createSchemaRegistrar({
-          gatewayUrl: deps.gatewayUrl,
-          signer: deps.serverSigner,
-          logger: deps.logger,
-        })
-      : undefined;
-
   app.use("/:scope", createBodyLimit(DATA_INGEST_MAX_SIZE));
   app.all("*", (c) =>
     handlePersonalServerDataRequest(
@@ -111,7 +101,6 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         storage: dataStorage,
         auth,
         schemaResolver: deps.gateway,
-        schemaRegistrar,
         accessLogWriter: deps.accessLogWriter,
         syncManager: deps.syncManager ?? null,
         runtimeAvailability: deps.runtimeAvailability,

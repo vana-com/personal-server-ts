@@ -5,7 +5,6 @@ import {
   type DataStoragePort,
   type RuntimeAvailabilityPort,
   type SchemaResolverPort,
-  type SchemaRegistrarPort,
 } from "../ports/index.js";
 import type { DataReadPolicyPorts } from "../policy/index.js";
 import type { SyncManager } from "../sync/index.js";
@@ -52,14 +51,6 @@ import {
   type X402Challenge,
 } from "../payment/index.js";
 
-export {
-  createSchemaRegistrar,
-  NO_SCHEMA_DEFINITION_URL,
-  NO_SCHEMA_DIALECT,
-  NO_SCHEMA_NAME,
-  type SchemaRegistrarDeps,
-} from "./schema-registrar.js";
-
 export interface PersonalServerReadAuthInput {
   request: Request;
   scope: string;
@@ -97,8 +88,6 @@ export interface PersonalServerDataApiDeps {
   storage: DataStoragePort;
   auth: PersonalServerApiAuthPort;
   schemaResolver?: SchemaResolverPort;
-  /** Auto-registers a "no-schema" schema for binary scopes that lack one. */
-  schemaRegistrar?: SchemaRegistrarPort;
   accessLogWriter: AccessLogWriter;
   syncManager?: PersonalServerIngestSyncManager | null;
   runtimeAvailability?: RuntimeAvailabilityPort;
