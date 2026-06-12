@@ -412,10 +412,9 @@ async function main(): Promise<void> {
       "2",
       "registry advanced to version 2",
     );
-    const store3Entry = store3.storage.findEntry({
-      scope: SCOPE,
-      collectedAt: collectedAtY,
-    });
+    const store3Entry = store3.storage
+      .listVersions(SCOPE, {})
+      .find((e) => e.collectedAt === collectedAtY);
     assertEq(store3Entry?.version, 2, "store 3 index row rebased to version 2");
     assertEq(
       store3.storage.findUnsynced().length,

@@ -360,10 +360,35 @@ describe("upload worker", () => {
         entry.path,
         REGISTRY_ID,
       );
-      // No second registration, no rebase bookkeeping, no extra blob.
+      // No second registration, no extra blob; the local version already
+      // matches the registry's, so no version rewrite either.
       expect(deps.gateway.registerDataPoint).toHaveBeenCalledTimes(1);
       expect(deps.storage.updateEntryVersion).not.toHaveBeenCalled();
       expect(deps.storageAdapter.upload).toHaveBeenCalledTimes(1);
+    });
+
+    it("aligns the local version with the adopted registry version", async () => {
+      const deps = makeMockDeps();
+      const entry = makeEntry(); // local version 1
+      (
+        deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
+      ).mockRejectedValueOnce(STALE_409);
+      // Same content, but the registry sequence has moved on to 7 (e.g. a
+      // replica re-registered identical bytes at a higher version).
+      (deps.gateway.getDataPoint as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeRecord({ expectedVersion: "7" }),
+      );
+
+      const result = await uploadOne(deps, entry);
+
+      expect(result.dataPointId).toBe(REGISTRY_ID);
+      // Downstream consumers (x402 RecordDataAccess) sign from the local
+      // row's version — it must follow the adopted registry version.
+      expect(deps.storage.updateEntryVersion).toHaveBeenCalledWith(
+        entry.path,
+        7,
+      );
+      expect(deps.gateway.registerDataPoint).toHaveBeenCalledTimes(1);
     });
 
     it("rebases onto the registry's version + 1 when content differs", async () => {

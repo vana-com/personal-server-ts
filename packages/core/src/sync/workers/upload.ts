@@ -172,6 +172,13 @@ export async function uploadOne(
         // new version of the same bytes. The registrant already uploaded the
         // blob under the registered version key.
         dataPointId = record.id;
+        // Align the local row with the adopted registry version — downstream
+        // consumers sign from the row's version (e.g. x402 RecordDataAccess),
+        // so a stale local version would emit records the registry rejects.
+        const adoptedVersion = Number(record.expectedVersion);
+        if (adoptedVersion !== entry.version) {
+          await storage.updateEntryVersion(entry.path, adoptedVersion);
+        }
       } else {
         // Rebase: re-sign one past the registry's live version. The blob key
         // embeds the version (replicas reconstruct URLs from the registry
