@@ -37,10 +37,6 @@ export const DEFAULTS = {
       // gateway.getGrant().fee, which the gateway re-resolves per request.
       feeRegistry: "0xb4FA18443E0FA6cdC0280D20b8cCDB2377D13Bf2",
       // Schema registration (POST /v1/schemas) is signed against the Data
-      // Refiner Registry contract — distinct from the contracts above. The
-      // server config loader populates this from GATEWAY_DATA_REFINER_REGISTRY;
-      // empty here means schema auto-registration is unavailable.
-      dataRefinerRegistry: "0x93c3EF89369fDcf08Be159D9DeF0F18AB6Be008c",
     },
   },
   devUi: {
@@ -129,12 +125,6 @@ export const ServerConfigSchema = z.object({
             .string()
             .startsWith("0x")
             .default(DEFAULTS.gateway.contracts.feeRegistry),
-          // Optional: only required for schema registration (POST /v1/schemas).
-          // Empty string when unset — the schema registrar errors clearly if
-          // it is asked to register while this is missing.
-          dataRefinerRegistry: z
-            .string()
-            .default(DEFAULTS.gateway.contracts.dataRefinerRegistry),
         })
         .default(DEFAULTS.gateway.contracts),
     })
@@ -189,7 +179,5 @@ export type GatewayConfig = {
     // Required by the SDK's DataPortabilityContracts type for structural
     // compatibility; not invoked directly from the personal server.
     feeRegistry: string;
-    /** Verifying contract for SchemaRegistration EIP-712. Empty when unset. */
-    dataRefinerRegistry?: string;
   };
 };

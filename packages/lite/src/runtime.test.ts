@@ -256,7 +256,6 @@ describe("createPsLiteRuntime", () => {
     // DPv2 data points are scope-addressed and carry no schemaId, so binary
     // uploads to a novel scope must NOT register a "no schema" — the upload
     // worker no longer needs one.
-    const signSchemaRegistration = vi.fn().mockResolvedValue("0xschemasig");
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ data: { schemaId: "0xnoschema" } }), {
         headers: { "Content-Type": "application/json" },
@@ -281,7 +280,6 @@ describe("createPsLiteRuntime", () => {
         serverSigner: {
           address: "0x1111111111111111111111111111111111111111",
           signGrantRegistration: vi.fn(),
-          signSchemaRegistration,
         },
         storage: createMemoryPsLiteStorage(),
       });
@@ -299,7 +297,6 @@ describe("createPsLiteRuntime", () => {
       );
 
       expect(res.status).toBe(201);
-      expect(signSchemaRegistration).not.toHaveBeenCalled();
       expect(fetchMock).not.toHaveBeenCalledWith(
         "https://gw.test/v1/schemas",
         expect.anything(),

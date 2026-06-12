@@ -22,7 +22,6 @@ import {
   type DeviceSessionStore,
 } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
-  createSchemaRegistrar,
   handlePersonalServerAccessLogsRequest,
   handlePersonalServerConfigRequest,
   handlePersonalServerDataRequest,
@@ -111,12 +110,7 @@ export interface PsLiteRuntimeOptions {
   gateway?: GatewayClient;
   serverOwner?: `0x${string}`;
   serverSigner?: Pick<ServerSigner, "signGrantRegistration"> &
-    Partial<
-      Pick<
-        ServerSigner,
-        "signGrantRevocation" | "signSchemaRegistration" | "address"
-      >
-    >;
+    Partial<Pick<ServerSigner, "signGrantRevocation" | "address">>;
   syncManager?:
     | (Pick<SyncManager, "trigger" | "getStatus"> &
         Partial<Pick<SyncManager, "start" | "stop">>)
@@ -539,26 +533,6 @@ export function createPsLiteRuntime(
   }
   const tokenStore = options.tokenStore ?? createDefaultTokenStore();
   const saveConfig = options.saveConfig ?? createDefaultSaveConfig();
-  // Auto-register a permissive "no-schema" schema for binary uploads to novel
-  // scopes, mirroring the Node server. Without this the sync upload worker
-  // fails with "No schema found for scope" for files the user uploads under a
-  // scope that has no registered schema. Requires the server signer (to sign
-  // the EIP-712 SchemaRegistration) and a gateway URL.
-  const schemaRegistrarSigner = options.serverSigner;
-  const schemaRegistrarGatewayUrl = options.config?.gateway?.url;
-  const schemaRegistrar =
-    schemaRegistrarSigner?.signSchemaRegistration &&
-    schemaRegistrarSigner.address &&
-    schemaRegistrarGatewayUrl
-      ? createSchemaRegistrar({
-          gatewayUrl: schemaRegistrarGatewayUrl,
-          signer: {
-            address: schemaRegistrarSigner.address,
-            signSchemaRegistration:
-              schemaRegistrarSigner.signSchemaRegistration,
-          },
-        })
-      : undefined;
   const deviceSessions: DeviceSessionStore = createMemoryDeviceSessionStore();
   const mcpOAuthAuthorizationStore =
     options.mcpOAuthAuthorizationStore ??
@@ -860,7 +834,6 @@ export function createPsLiteRuntime(
               storage: dataStorage,
               auth,
               schemaResolver: options.gateway,
-              schemaRegistrar,
               accessLogWriter,
               syncManager: options.syncManager ?? null,
               now,

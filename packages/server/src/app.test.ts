@@ -709,7 +709,6 @@ describe("createApp", () => {
       signGrantRevocation: vi.fn(),
       signAddData: vi.fn(),
       signRecordDataAccess: vi.fn(),
-      signSchemaRegistration: vi.fn().mockResolvedValue("0xschemasig"),
     } as unknown as ServerSigner;
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ data: { schemaId: "0xnoschema" } }), {
@@ -761,8 +760,7 @@ describe("createApp", () => {
     });
 
     expect(res.status).toBe(201);
-    // No schema registration: no SchemaRegistration signature, no POST /v1/schemas.
-    expect(signer.signSchemaRegistration).not.toHaveBeenCalled();
+    // No schema registration: no POST /v1/schemas.
     expect(fetchMock).not.toHaveBeenCalledWith(
       "https://gw.example/v1/schemas",
       expect.anything(),
