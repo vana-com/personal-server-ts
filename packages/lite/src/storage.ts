@@ -802,6 +802,22 @@ export async function createPersistentPsLiteStorage(
       return updated;
     },
 
+    async updateEntryVersion(path, version) {
+      let updated = false;
+      state = {
+        ...state,
+        entries: state.entries.map((entry) => {
+          if (entry.path !== path) return entry;
+          updated = true;
+          return { ...entry, version };
+        }),
+      };
+      if (updated) {
+        await persist();
+      }
+      return updated;
+    },
+
     async deleteScope(scope) {
       let deleted = 0;
       const deletedPaths: string[] = [];

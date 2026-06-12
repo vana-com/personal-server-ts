@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
+import { keccak256 } from "viem";
+
 import type { UploadWorkerDeps } from "./upload.js";
-import { uploadOne, uploadAll } from "./upload.js";
+import { uploadOne, uploadAll, computeDataPointId } from "./upload.js";
 import type { IndexEntry } from "../../storage/index/types.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import type {
@@ -74,6 +76,7 @@ function makeMockDeps(): UploadWorkerDeps {
   const mockStorage: Partial<DataStoragePort> = {
     findUnsynced: vi.fn().mockReturnValue([]),
     updateDataPointId: vi.fn().mockReturnValue(true),
+    updateEntryVersion: vi.fn().mockReturnValue(true),
     readEnvelope: vi.fn().mockResolvedValue(makeEnvelope()),
   };
 
@@ -83,6 +86,7 @@ function makeMockDeps(): UploadWorkerDeps {
 
   const mockGateway: Partial<GatewayClient> = {
     getSchemaForScope: vi.fn().mockResolvedValue(makeSchema()),
+    getDataPoint: vi.fn().mockResolvedValue(null),
     registerDataPoint: vi
       .fn()
       .mockResolvedValue({ dataPointId: DATA_POINT_ID, expectedVersion: "1" }),
@@ -310,6 +314,142 @@ describe("upload worker", () => {
         expect.objectContaining({ path: "b/2.json" }),
         "Failed to upload entry",
       );
+    });
+  });
+
+  describe("uploadOne — stale-version conflicts (BUI-540)", () => {
+    const STALE_409 = new Error(
+      "Gateway error: 409 Stale expectedVersion 1: must be strictly greater than the stored value 1",
+    );
+    // The dataHash the worker computes for makeEnvelope()'s plaintext.
+    const ENVELOPE_DATA_HASH = keccak256(
+      new TextEncoder().encode(JSON.stringify(makeEnvelope())),
+    );
+    const REGISTRY_ID = computeDataPointId(OWNER, SCOPE);
+
+    function makeRecord(overrides?: {
+      dataHash?: string;
+      expectedVersion?: string;
+    }) {
+      return {
+        id: REGISTRY_ID,
+        ownerAddress: OWNER,
+        scope: SCOPE,
+        dataHash: overrides?.dataHash ?? ENVELOPE_DATA_HASH,
+        metadataHash: "0x" + "00".repeat(32),
+        expectedVersion: overrides?.expectedVersion ?? "1",
+        addedAt: "2026-06-12T00:00:00Z",
+      };
+    }
+
+    it("adopts the registered data point when its content matches", async () => {
+      const deps = makeMockDeps();
+      const entry = makeEntry();
+      (
+        deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
+      ).mockRejectedValueOnce(STALE_409);
+      (deps.gateway.getDataPoint as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeRecord(),
+      );
+
+      const result = await uploadOne(deps, entry);
+
+      expect(deps.gateway.getDataPoint).toHaveBeenCalledWith(REGISTRY_ID);
+      expect(result.dataPointId).toBe(REGISTRY_ID);
+      expect(deps.storage.updateDataPointId).toHaveBeenCalledWith(
+        entry.path,
+        REGISTRY_ID,
+      );
+      // No second registration, no rebase bookkeeping, no extra blob.
+      expect(deps.gateway.registerDataPoint).toHaveBeenCalledTimes(1);
+      expect(deps.storage.updateEntryVersion).not.toHaveBeenCalled();
+      expect(deps.storageAdapter.upload).toHaveBeenCalledTimes(1);
+    });
+
+    it("rebases onto the registry's version + 1 when content differs", async () => {
+      const deps = makeMockDeps();
+      const entry = makeEntry();
+      (deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>)
+        .mockRejectedValueOnce(STALE_409)
+        .mockResolvedValueOnce({ dataPointId: DATA_POINT_ID });
+      (deps.gateway.getDataPoint as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeRecord({ dataHash: "0x" + "ff".repeat(32), expectedVersion: "7" }),
+      );
+
+      const result = await uploadOne(deps, entry);
+
+      // Re-signed and re-registered one past the registry's live version.
+      expect(deps.signer.signAddData).toHaveBeenLastCalledWith(
+        expect.objectContaining({ expectedVersion: 8n }),
+      );
+      expect(deps.gateway.registerDataPoint).toHaveBeenLastCalledWith(
+        expect.objectContaining({ expectedVersion: "8" }),
+      );
+      // The rebased version gets its own blob and the index row follows.
+      expect(deps.storageAdapter.upload).toHaveBeenCalledWith(
+        `${SCOPE}/8`,
+        expect.any(Uint8Array),
+      );
+      expect(deps.storage.updateEntryVersion).toHaveBeenCalledWith(
+        entry.path,
+        8,
+      );
+      expect(result.dataPointId).toBe(DATA_POINT_ID);
+      expect(deps.storage.updateDataPointId).toHaveBeenCalledWith(
+        entry.path,
+        DATA_POINT_ID,
+      );
+    });
+
+    it("rethrows non-409 gateway errors without a registry lookup", async () => {
+      const deps = makeMockDeps();
+      (
+        deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
+      ).mockRejectedValue(
+        new Error("Gateway error: 500 Internal Server Error"),
+      );
+
+      await expect(uploadOne(deps, makeEntry())).rejects.toThrow(
+        "Gateway error: 500",
+      );
+      expect(deps.gateway.getDataPoint).not.toHaveBeenCalled();
+      expect(deps.storage.updateDataPointId).not.toHaveBeenCalled();
+    });
+
+    it("rethrows the conflict when the registry row is missing", async () => {
+      const deps = makeMockDeps();
+      (
+        deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
+      ).mockRejectedValue(STALE_409);
+      (deps.gateway.getDataPoint as ReturnType<typeof vi.fn>).mockResolvedValue(
+        null,
+      );
+
+      await expect(uploadOne(deps, makeEntry())).rejects.toThrow(
+        "Gateway error: 409",
+      );
+      expect(deps.storage.updateDataPointId).not.toHaveBeenCalled();
+    });
+
+    it("surfaces a raced rebase so the next cycle re-reads the registry", async () => {
+      const deps = makeMockDeps();
+      // Another replica wins the race to version 8 between our read and write.
+      (deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>)
+        .mockRejectedValueOnce(STALE_409)
+        .mockRejectedValueOnce(
+          new Error(
+            "Gateway error: 409 Stale expectedVersion 8: must be strictly greater than the stored value 8",
+          ),
+        );
+      (deps.gateway.getDataPoint as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeRecord({ dataHash: "0x" + "ff".repeat(32), expectedVersion: "7" }),
+      );
+
+      await expect(uploadOne(deps, makeEntry())).rejects.toThrow(
+        "Gateway error: 409",
+      );
+      expect(deps.storage.updateEntryVersion).not.toHaveBeenCalled();
+      expect(deps.storage.updateDataPointId).not.toHaveBeenCalled();
     });
   });
 });
