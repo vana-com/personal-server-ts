@@ -4,7 +4,6 @@ import type { AccessLogReader } from "../logging/access-reader.js";
 import {
   type DataStoragePort,
   type RuntimeAvailabilityPort,
-  type SchemaResolverPort,
 } from "../ports/index.js";
 import type { DataReadPolicyPorts } from "../policy/index.js";
 import type { SyncManager } from "../sync/index.js";
@@ -87,7 +86,6 @@ export interface PersonalServerIngestSyncManager {
 export interface PersonalServerDataApiDeps {
   storage: DataStoragePort;
   auth: PersonalServerApiAuthPort;
-  schemaResolver?: SchemaResolverPort;
   accessLogWriter: AccessLogWriter;
   syncManager?: PersonalServerIngestSyncManager | null;
   runtimeAvailability?: RuntimeAvailabilityPort;
@@ -513,64 +511,6 @@ function collectedAt(now: () => Date): string {
     .replace(/\.\d{3}Z$/, "Z");
 }
 
-async function resolveSchema(
-  deps: Pick<PersonalServerDataApiDeps, "schemaResolver" | "logger">,
-  scope: string,
-): Promise<
-  | { ok: true; schemaUrl: string | undefined; schemaId: string | undefined }
-  | { ok: false; response: Response }
-> {
-  // No resolver configured — proceed without a schema. The on-disk envelope
-  // tolerates a missing schemaId (the field is optional in DataFileEnvelope
-  // anyway), and the canary X402 read path doesn't consult it. The legacy
-  // sync-worker registerFile call DOES require schemaId, and will surface
-  // its own error there if the operator has sync enabled but no resolver.
-  if (!deps.schemaResolver) {
-    deps.logger?.info?.(
-      { scope },
-      "Ingesting without a schema lookup (no schemaResolver configured)",
-    );
-    return { ok: true, schemaUrl: undefined, schemaId: undefined };
-  }
-
-  try {
-    const schema = await deps.schemaResolver.getSchemaForScope(scope);
-    if (!schema) {
-      // Soft fall-through: schema not on the gateway. Canary
-      // registerDataPoint doesn't need it; X402 doesn't need it. The
-      // operator's sync worker (if enabled) will fail at registerFile
-      // time with a clearer "no schemaId" error from the gateway. We
-      // intentionally don't block ingest here.
-      deps.logger?.warn?.(
-        { scope },
-        "No schema registered for scope at gateway — ingesting without schemaId",
-      );
-      return { ok: true, schemaUrl: undefined, schemaId: undefined };
-    }
-    return {
-      ok: true,
-      schemaUrl: schema.definitionUrl,
-      schemaId: schema.id,
-    };
-  } catch (err) {
-    // Network / gateway outage is different from "schema not found" —
-    // keep this a hard error so the ingest doesn't write data the
-    // operator can't trace back. Schema lookup failures are observable;
-    // a hung gateway is not the right time to silently proceed.
-    deps.logger?.error?.({ err, scope }, "Gateway schema lookup failed");
-    return {
-      ok: false,
-      response: jsonResponse(
-        {
-          error: "GATEWAY_ERROR",
-          message: "Failed to look up schema for scope",
-        },
-        { status: 502 },
-      ),
-    };
-  }
-}
-
 /** True when the request body should be treated as a JSON object (the legacy
  * path). Missing/blank Content-Type is treated as JSON for backward compat. */
 function isJsonContentType(request: Request): boolean {
@@ -813,16 +753,14 @@ export async function handlePersonalServerDataRequest(
         "Request body must be valid JSON",
       );
       if (!parsed.ok) return contractResponse(parsed.result);
-      const schema = await resolveSchema(deps, scopeResult.scope);
-      if (!schema.ok) return schema.response;
+      // DPv2 is scope-addressed and the gateway records no schemas, so JSON
+      // ingest is schemaless too — no lookup, no schemaId/$schema stamped.
       const result = await ingestDataContract({
         storage: deps.storage,
         scopeParam: scopeResult.scope,
         body: parsed.body,
         collectedAt: collectedAtValue,
         status,
-        schemaUrl: schema.schemaUrl,
-        schemaId: schema.schemaId,
       });
       if (!result.ok) return contractErrorResponse(result);
       deps.logger?.info?.(

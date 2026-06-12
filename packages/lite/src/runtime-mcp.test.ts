@@ -562,7 +562,6 @@ describe("MCP read_scope tool through Lite runtime", () => {
           grantVerifier: bundle.gateway,
         },
       }),
-      schemaResolver: bundle.gateway,
       accessLogWriter: bundle.accessLog,
     };
   });
