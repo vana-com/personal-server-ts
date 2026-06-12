@@ -40,13 +40,12 @@ export interface UploadAllOptions {
 /**
  * Upload a single unsynced index entry:
  * 1. Read local data file from disk
- * 2. Resolve schemaId for the scope
- * 3. Derive scope key from master key → hex-encode as OpenPGP password
- * 4. Encrypt envelope with OpenPGP password-based encryption → ciphertext
- * 5. Compute dataHash / metadataHash commitments
- * 6. Upload ciphertext to storage backend, version-keyed `{scope}/{version}`
- * 7. Register DPv2 data point on-chain (AddData) if not already
- * 8. Persist the gateway-assigned dataPointId (marks the entry synced)
+ * 2. Derive scope key from master key → hex-encode as OpenPGP password
+ * 3. Encrypt envelope with OpenPGP password-based encryption → ciphertext
+ * 4. Compute dataHash / metadataHash commitments (scope-addressed, no schema)
+ * 5. Upload ciphertext to storage backend, version-keyed `{scope}/{version}`
+ * 6. Register DPv2 data point on-chain (AddData) if not already
+ * 7. Persist the gateway-assigned dataPointId (marks the entry synced)
  */
 export async function uploadOne(
   deps: UploadWorkerDeps,
@@ -65,51 +64,39 @@ export async function uploadOne(
   // 1. Read local data file
   const envelope = await storage.readEnvelope(entry.scope, entry.collectedAt);
 
-  // 2. Resolve schemaId from the local index when available, or fall back
-  // to the Gateway for legacy entries created before schema IDs were indexed.
-  let schemaId = entry.schemaId;
-  if (!schemaId) {
-    const schema = await gateway.getSchemaForScope(entry.scope);
-    if (!schema) {
-      throw new Error(`No schema found for scope: ${entry.scope}`);
-    }
-    schemaId = schema.id;
-  }
-
-  // 3. Derive scope key → hex-encode as OpenPGP password
+  // 2. Derive scope key → hex-encode as OpenPGP password
   const scopeKey = deriveScopeKey(masterKey, entry.scope);
   const scopeKeyHex = uint8ToHex(scopeKey);
 
-  // 4. Encrypt with OpenPGP password-based encryption
+  // 3. Encrypt with OpenPGP password-based encryption
   const plaintext = new TextEncoder().encode(JSON.stringify(envelope));
   const encrypted = await encryptWithPassword(plaintext, scopeKeyHex);
 
-  // 5. DPv2 data-point registration (idempotent — skipped when the prior run
-  // already persisted a dataPointId on this entry).
-  //
-  // Commitments:
+  // 4. Compute the on-chain commitments.
   //   dataHash     = keccak256 of the plaintext envelope JSON. Commits to the
   //                  canonical content, not the ciphertext — OpenPGP
   //                  password-based encryption embeds random salts so
   //                  re-encrypting the same plaintext yields different bytes;
   //                  hashing the plaintext keeps the on-chain commitment
   //                  reproducible across replicas serving the same version.
-  //   metadataHash = keccak256 of canonical-JSON({scope, collectedAt, schemaId,
+  //   metadataHash = keccak256 of canonical-JSON({scope, collectedAt,
   //                  sizeBytes}). Commits to the off-chain metadata that
-  //                  describes this version without leaking the payload.
+  //                  describes this version without leaking the payload. DPv2
+  //                  is scope-addressed with no schema concept — the gateway
+  //                  neither records nor registers schemas — so no schemaId is
+  //                  looked up or committed.
   const dataHash = keccak256(plaintext);
   const metadataHash = keccak256(
     stringToHex(
       JSON.stringify({
         scope: entry.scope,
         collectedAt: entry.collectedAt,
-        schemaId,
         sizeBytes: encrypted.byteLength,
       }),
     ),
   );
 
-  // 6. Upload ciphertext to storage backend FIRST, version-keyed so the
+  // 5. Upload ciphertext to storage backend FIRST, version-keyed so the
   // download worker can reconstruct the URL from a DataPointRecord's
   // (scope, expectedVersion) — DataPointRecords carry no URL. We upload
   // before registering so the on-chain data point (the synced marker) is
@@ -117,7 +104,7 @@ export async function uploadOne(
   const storageKey = `${entry.scope}/${entry.version}`;
   const url = await storageAdapter.upload(storageKey, encrypted);
 
-  // 7. DPv2 data-point registration (idempotent — skipped when a prior run
+  // 6. DPv2 data-point registration (idempotent — skipped when a prior run
   // already persisted a dataPointId on this entry). registerDataPoint stamps
   // the synced marker that excludes this entry from findUnsynced next time.
   let dataPointId = entry.dataPointId;
@@ -146,7 +133,7 @@ export async function uploadOne(
       );
     }
 
-    // 8. Stamp the dataPointId on the local index entry — marks it synced.
+    // 7. Stamp the dataPointId on the local index entry — marks it synced.
     await storage.updateDataPointId(entry.path, dataPointId);
   }
 
