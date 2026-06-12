@@ -158,14 +158,12 @@ describe("upload worker", () => {
       );
     });
 
-    it("uses indexed schemaId without a schema lookup", async () => {
+    it("never consults a schema (DPv2 is scope-addressed, no schema concept)", async () => {
       const deps = makeMockDeps();
-      const entry = makeEntry({ schemaId: SCHEMA_ID });
 
-      await uploadOne(deps, entry);
+      await uploadOne(deps, makeEntry());
 
-      // schemaId is resolved only to commit it into metadataHash; with an
-      // indexed schemaId the gateway fallback lookup is skipped.
+      // Upload neither looks up nor commits a schema — the gateway records none.
       expect(deps.gateway.getSchemaForScope).not.toHaveBeenCalled();
       expect(deps.gateway.registerDataPoint).toHaveBeenCalledOnce();
     });
@@ -240,18 +238,6 @@ describe("upload worker", () => {
         /registerDataPoint did not return a dataPointId/,
       );
     });
-
-    it("throws if schema lookup returns null", async () => {
-      const deps = makeMockDeps();
-      (
-        deps.gateway.getSchemaForScope as ReturnType<typeof vi.fn>
-      ).mockResolvedValue(null);
-      const entry = makeEntry();
-
-      await expect(uploadOne(deps, entry)).rejects.toThrow(
-        `No schema found for scope: ${SCOPE}`,
-      );
-    });
   });
 
   describe("uploadAll", () => {
@@ -287,14 +273,14 @@ describe("upload worker", () => {
         entries,
       );
 
-      // Make the second entry fail at schema lookup
+      // Make the second entry fail at the storage upload step.
       let callCount = 0;
       (
-        deps.gateway.getSchemaForScope as ReturnType<typeof vi.fn>
+        deps.storageAdapter.upload as ReturnType<typeof vi.fn>
       ).mockImplementation(() => {
         callCount++;
-        if (callCount === 2) return Promise.resolve(null);
-        return Promise.resolve(makeSchema());
+        if (callCount === 2) return Promise.reject(new Error("storage 500"));
+        return Promise.resolve(STORAGE_URL);
       });
 
       const results = await uploadAll(deps, { onError });
@@ -302,9 +288,7 @@ describe("upload worker", () => {
       expect(results).toHaveLength(2);
       expect(onError).toHaveBeenCalledWith(
         entries[1],
-        expect.objectContaining({
-          message: `No schema found for scope: ${SCOPE}`,
-        }),
+        expect.objectContaining({ message: "storage 500" }),
       );
       expect(deps.logger.error).toHaveBeenCalledWith(
         expect.objectContaining({ path: "b/2.json" }),
