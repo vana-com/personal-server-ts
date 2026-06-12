@@ -100,7 +100,6 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       {
         storage: dataStorage,
         auth,
-        schemaResolver: deps.gateway,
         accessLogWriter: deps.accessLogWriter,
         syncManager: deps.syncManager ?? null,
         runtimeAvailability: deps.runtimeAvailability,

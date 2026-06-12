@@ -83,8 +83,6 @@ export interface IngestDataContractInput {
   body: unknown;
   collectedAt: string;
   status: "stored" | "syncing";
-  schemaUrl?: string;
-  schemaId?: string;
 }
 
 export interface IngestDataContractResult {
@@ -109,8 +107,6 @@ export interface IngestBinaryDataContractInput {
   metadata?: unknown;
   collectedAt: string;
   status: "stored" | "syncing";
-  schemaUrl?: string;
-  schemaId?: string;
 }
 
 export interface DeleteDataScopeContractInput {
@@ -290,8 +286,6 @@ export async function ingestDataContract(
     scopeResult.scope,
     input.collectedAt,
     input.body,
-    input.schemaUrl,
-    input.schemaId,
   );
   const writeResult = await input.storage.writeEnvelope(envelope);
   try {
@@ -301,7 +295,7 @@ export async function ingestDataContract(
   }
   await input.storage.insertEntry({
     fileId: null,
-    schemaId: input.schemaId ?? null,
+    schemaId: null,
     path: writeResult.relativePath,
     scope: scopeResult.scope,
     collectedAt: input.collectedAt,
@@ -358,8 +352,6 @@ export async function ingestBinaryDataContract(
     scopeResult.scope,
     input.collectedAt,
     data,
-    input.schemaUrl,
-    input.schemaId,
   );
   const writeResult = await input.storage.writeEnvelope(envelope);
   try {
@@ -369,7 +361,7 @@ export async function ingestBinaryDataContract(
   }
   await input.storage.insertEntry({
     fileId: null,
-    schemaId: input.schemaId ?? null,
+    schemaId: null,
     path: writeResult.relativePath,
     scope: scopeResult.scope,
     collectedAt: input.collectedAt,
