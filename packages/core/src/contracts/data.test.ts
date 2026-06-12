@@ -126,8 +126,6 @@ describe("data contract helpers", () => {
       body: { username: "test_user" },
       collectedAt: "2026-05-08T00:00:00.000Z",
       status: "stored",
-      schemaUrl: "https://schemas.example/instagram.profile.json",
-      schemaId: "schema-1",
     });
 
     expect(ingest).toEqual({
@@ -179,7 +177,7 @@ describe("data contract helpers", () => {
         versions: [
           {
             collectedAt: "2026-05-08T00:00:00.000Z",
-            schemaId: "schema-1",
+            schemaId: null,
           },
         ],
       },
@@ -193,8 +191,6 @@ describe("data contract helpers", () => {
     ).resolves.toMatchObject({
       ok: true,
       envelope: {
-        $schema: "https://schemas.example/instagram.profile.json",
-        schemaId: "schema-1",
         data: { username: "test_user" },
       },
     });
@@ -217,8 +213,6 @@ describe("data contract helpers", () => {
       body: { username: "test_user" },
       collectedAt: "2026-05-08T00:00:00.000Z",
       status: "stored",
-      schemaUrl: "https://schemas.example/instagram.profile.json",
-      schemaId: "schema-1",
     });
 
     expect(ingest).toMatchObject({ ok: true });
@@ -303,7 +297,6 @@ describe("data contract helpers", () => {
       filename: "report.pdf",
       collectedAt: "2026-05-08T00:00:00.000Z",
       status: "syncing",
-      schemaId: "schema-bin",
     });
 
     expect(ingest).toMatchObject({
@@ -320,7 +313,7 @@ describe("data contract helpers", () => {
     if (!read.ok) return;
 
     expect(isBinaryEnvelope(read.envelope)).toBe(true);
-    expect(read.envelope.schemaId).toBe("schema-bin");
+    expect(read.envelope.schemaId).toBeUndefined();
 
     const decoded = decodeBinaryEnvelope(read.envelope);
     expect(decoded.mimeType).toBe("application/pdf");

@@ -230,7 +230,6 @@ function buildDataApiDeps(deps: McpRouteDeps): PersonalServerDataApiDeps {
   return {
     storage: dataStorage,
     auth,
-    schemaResolver: deps.gateway,
     accessLogWriter: deps.accessLogWriter,
     runtimeAvailability: deps.runtimeAvailability,
     logger: deps.logger,

@@ -41,10 +41,6 @@ export interface AuthSessionVerifierPort {
   getBuilder(address: string): Promise<Builder | null>;
 }
 
-export interface SchemaResolverPort {
-  getSchemaForScope(scope: string): Promise<Schema | null>;
-}
-
 export interface FileRegistrySyncRegistryPort {
   getDataPoint(dataPointId: string): Promise<DataPointRecord | null>;
   listDataPointsByOwner(

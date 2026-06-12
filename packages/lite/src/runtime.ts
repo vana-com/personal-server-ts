@@ -833,7 +833,6 @@ export function createPsLiteRuntime(
             {
               storage: dataStorage,
               auth,
-              schemaResolver: options.gateway,
               accessLogWriter,
               syncManager: options.syncManager ?? null,
               now,
@@ -940,7 +939,6 @@ export function createPsLiteRuntime(
             approvalUrl: options.mcpOAuthApprovalUrl,
             auth,
             dataStorage,
-            schemaResolver: options.gateway,
             accessLogWriter,
             now,
             runtimeAvailability: { isAvailable: () => active },
@@ -979,7 +977,6 @@ async function handleMcpRoute(input: {
   approvalUrl?: string | (() => string);
   auth: PsLiteAuthAdapter;
   dataStorage: DataStoragePort;
-  schemaResolver?: GatewayClient;
   accessLogWriter: AccessLogWriter;
   now: () => Date;
   runtimeAvailability: RuntimeAvailabilityPort;
@@ -1410,7 +1407,6 @@ async function handleMcpRoute(input: {
       dataApiDeps: {
         storage: input.dataStorage,
         auth: input.auth,
-        schemaResolver: input.schemaResolver,
         accessLogWriter: input.accessLogWriter,
         runtimeAvailability: input.runtimeAvailability,
         now: input.now,

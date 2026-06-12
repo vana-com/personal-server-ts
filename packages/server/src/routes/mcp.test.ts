@@ -656,7 +656,6 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
         gateway,
         dataStorage,
       }),
-      schemaResolver: gateway,
       accessLogWriter,
       logger,
     };

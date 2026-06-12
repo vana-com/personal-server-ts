@@ -364,7 +364,7 @@ describe("POST /v1/data/:scope", () => {
     expect(json.error).toBe("INVALID_BODY");
   });
 
-  it("includes $schema field in envelope when schema found", async () => {
+  it("ingests schemaless: envelope carries no $schema/schemaId", async () => {
     const res = await post("instagram.profile", { username: "test" });
     expect(res.status).toBe(201);
 
@@ -375,17 +375,13 @@ describe("POST /v1/data/:scope", () => {
       json.collectedAt,
     );
     const content = JSON.parse(await readFile(filePath, "utf-8"));
-    expect(content.$schema).toBe("https://ipfs.io/ipfs/QmTestSchema");
-    expect(content.schemaId).toBe("0xschema1");
+    expect(content.$schema).toBeUndefined();
+    expect(content.schemaId).toBeUndefined();
   });
 
   it("ingests successfully when no schema is registered for the scope", async () => {
-    // Schema lookup is best-effort. The canary X402 read path doesn't
-    // consult schemaId, and DPv2 registerDataPoint doesn't take it.
-    // Only the legacy sync-worker registerFile call needs one, and that
-    // surfaces its own error when sync is enabled but no schema exists.
-    // The ingest endpoint itself proceeds and writes the envelope without
-    // a schemaId field.
+    // DPv2 is scope-addressed: ingest never looks up a schema, so a scope
+    // with no registered schema ingests fine and the entry's schemaId is null.
     const db2 = initializeDatabase(":memory:");
     const indexManager2 = createIndexManager(db2);
     const gateway = createMockGateway({
@@ -417,45 +413,6 @@ describe("POST /v1/data/:scope", () => {
     expect(entry!.schemaId).toBeNull();
 
     indexManager2.close();
-  });
-
-  it("returns 502 GATEWAY_ERROR when gateway schema lookup fails", async () => {
-    const db2 = initializeDatabase(":memory:");
-    const indexManager2 = createIndexManager(db2);
-    const gateway = createMockGateway({
-      getSchemaForScope: vi
-        .fn()
-        .mockRejectedValue(
-          new Error("Gateway error: 500 Internal Server Error"),
-        ),
-    });
-    const localApp = dataRoutes({
-      indexManager: indexManager2,
-      hierarchyOptions,
-      logger,
-      serverOrigin: SERVER_ORIGIN,
-      serverOwner: ownerWallet.address,
-      gateway,
-      accessLogWriter: createMockAccessLogWriter(),
-    });
-
-    const res = await postWithOwnerAuth(localApp, "instagram.profile", {
-      username: "test",
-    });
-    expect(res.status).toBe(502);
-
-    const json = await res.json();
-    expect(json.error).toBe("GATEWAY_ERROR");
-
-    indexManager2.close();
-  });
-
-  it("existing POST tests pass with schema mock returning schema", async () => {
-    // Verify the default mock gateway returns a schema
-    const gateway = createMockGateway();
-    const schema = await gateway.getSchemaForScope("instagram.profile");
-    expect(schema).toBeDefined();
-    expect(schema!.definitionUrl).toBe("https://ipfs.io/ipfs/QmTestSchema");
   });
 
   it("returns status 'syncing' when syncManager is provided", async () => {
