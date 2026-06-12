@@ -19,9 +19,12 @@ export interface IndexManager {
   }): { scopes: ScopeSummary[]; total: number };
   findClosestByScope(scope: string, at: string): IndexEntry | undefined;
   findByFileId(fileId: string): IndexEntry | undefined;
+  /** Find an index entry by its DPv2 data-point id (download dedup). */
+  findByDataPointId(dataPointId: string): IndexEntry | undefined;
   /**
-   * Find all index entries where fileId is null (not yet synced to storage backend).
-   * Returns entries ordered by created_at ASC (oldest first).
+   * Find all index entries where dataPointId is null (not yet synced /
+   * registered on-chain). Returns entries ordered by created_at ASC (oldest
+   * first).
    */
   findUnsynced(options?: { limit?: number }): IndexEntry[];
   /**
@@ -29,6 +32,17 @@ export interface IndexManager {
    * @returns true if row was updated, false if path not found
    */
   updateFileId(path: string, fileId: string): boolean;
+  /**
+   * Returns the highest stored `version` for a scope, or 0 if none. Used by
+   * `insert` to derive the next expectedVersion for DPv2 AddData.
+   */
+  findLatestVersionByScope(scope: string): number;
+  /**
+   * Update the dataPointId for an index entry (after successful DPv2
+   * registerDataPoint). Sync-worker step that runs alongside fileId update.
+   * @returns true if row was updated, false if path not found
+   */
+  updateDataPointId(path: string, dataPointId: string): boolean;
   /** Deletes all index entries for a scope. Returns count of deleted rows. */
   deleteByScope(scope: string): number;
   close(): void;

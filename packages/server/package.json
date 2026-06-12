@@ -46,7 +46,7 @@
     "@hono/node-server": "^1.19.13",
     "@opendatalabs/personal-server-ts-core": "*",
     "@opendatalabs/personal-server-ts-lite": "*",
-    "@opendatalabs/vana-sdk": "^3.4.1",
+    "@opendatalabs/vana-sdk": "3.4.1-canary.a244135",
     "better-sqlite3": "^12.9.0",
     "hono": "^4.12.18",
     "pino": "^10.3.1",

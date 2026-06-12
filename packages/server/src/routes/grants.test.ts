@@ -1,11 +1,15 @@
 import { describe, it, expect, vi } from "vitest";
 import { pino } from "pino";
-import type { GatewayClient, Builder } from "@opendatalabs/vana-sdk/node";
-import type { GrantListItem } from "@opendatalabs/vana-sdk/node";
+import type {
+  Builder,
+  DataPortabilityGatewayConfig,
+  GatewayClient,
+  GatewayGrantResponse,
+  GrantListItem,
+} from "@opendatalabs/vana-sdk/node";
 import {
   GRANT_REGISTRATION_TYPES,
   grantRegistrationDomain,
-  type DataPortabilityGatewayConfig,
 } from "@opendatalabs/vana-sdk/node";
 import {
   createTestWallet,
@@ -15,6 +19,10 @@ import { grantsRoutes } from "./grants.js";
 
 const logger = pino({ level: "silent" });
 const SERVER_ORIGIN = "http://localhost:8080";
+
+// Canary DataPortabilityContracts adds dataPortabilityEscrow + feeRegistry.
+// Both are required by `DataPortabilityGatewayConfig`; the values don't
+// matter for these tests since we only exercise EIP-712 domain hashing.
 const gatewayConfig = {
   chainId: 14800,
   contracts: {
@@ -22,18 +30,54 @@ const gatewayConfig = {
     dataPortabilityPermissions: "0x0000000000000000000000000000000000000002",
     dataPortabilityServer: "0x0000000000000000000000000000000000000003",
     dataPortabilityGrantees: "0x0000000000000000000000000000000000000004",
+    dataPortabilityEscrow: "0x0000000000000000000000000000000000000005",
+    feeRegistry: "0x0000000000000000000000000000000000000006",
   },
 } satisfies DataPortabilityGatewayConfig;
 
-// Wallet 0 = owner/user (signs grants), Wallet 1 = builder
 const owner = createTestWallet(0);
 const builder = createTestWallet(1);
+
+const BUILDER_ID =
+  "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+function makeGrantResponse(
+  overrides: Partial<GatewayGrantResponse> = {},
+): GatewayGrantResponse {
+  return {
+    id: "0xgrant1",
+    grantorAddress: owner.address,
+    granteeId: BUILDER_ID,
+    scopes: ["instagram.*"],
+    status: "confirmed",
+    addedAt: "2025-01-01T00:00:00Z",
+    expiresAt: null,
+    expired: false,
+    revokedAt: null,
+    revocationSignature: null,
+    paymentStatus: "paid",
+    paidAt: "2025-01-01T00:00:05Z",
+    paidBy: owner.address,
+    grantVersion: "1",
+    settleTxHash: null,
+    settleSubmittedAt: null,
+    revocationTxHash: null,
+    revocationSubmittedAt: null,
+    fee: {
+      asset: "0x0000000000000000000000000000000000000000",
+      registrationFee: "10000000000000000",
+      dataAccessFee: "1000000000000000",
+      totalDue: "11000000000000000",
+    },
+    ...overrides,
+  };
+}
 
 function createMockGateway(): GatewayClient {
   return {
     isRegisteredBuilder: vi.fn().mockResolvedValue(true),
     getBuilder: vi.fn().mockResolvedValue({
-      id: "0xbuilder1",
+      id: BUILDER_ID,
       ownerAddress: "0xOwner",
       granteeAddress: builder.address,
       publicKey: "0x04key",
@@ -45,13 +89,31 @@ function createMockGateway(): GatewayClient {
     getSchemaForScope: vi.fn().mockResolvedValue(null),
     getServer: vi.fn().mockResolvedValue(null),
     getFile: vi.fn().mockResolvedValue(null),
-    listFilesSince: vi.fn().mockResolvedValue({ files: [], nextCursor: null }),
+    listFilesSince: vi.fn().mockResolvedValue({ files: [], cursor: null }),
     getSchema: vi.fn().mockResolvedValue(null),
     registerServer: vi.fn().mockResolvedValue({ alreadyRegistered: false }),
+    registerBuilder: vi.fn().mockResolvedValue({ alreadyRegistered: false }),
+    registerDataPoint: vi
+      .fn()
+      .mockResolvedValue({ dataPointId: "0xdp", expectedVersion: "1" }),
     registerFile: vi.fn().mockResolvedValue({ fileId: "file-1" }),
     createGrant: vi.fn().mockResolvedValue({ grantId: "grant-123" }),
     revokeGrant: vi.fn().mockResolvedValue(undefined),
-  };
+    getEscrowBalance: vi.fn().mockResolvedValue({ balances: [] }),
+    submitEscrowDeposit: vi
+      .fn()
+      .mockResolvedValue({ status: "pending", account: owner.address }),
+    payForOperation: vi.fn().mockResolvedValue({}),
+    settle: vi.fn().mockResolvedValue({
+      scanned: 0,
+      confirmed: 0,
+      submitted: 0,
+      skipped: 0,
+      failed: 0,
+      items: [],
+      reconciled: { items: [] },
+    }),
+  } as unknown as GatewayClient;
 }
 
 function createMockServerSigner() {
@@ -65,46 +127,35 @@ function createMockServerSigner() {
     signGrantRevocation: vi
       .fn()
       .mockResolvedValue("0xrevokesig" as `0x${string}`),
+    signAddData: vi.fn().mockResolvedValue("0xadddatasig" as `0x${string}`),
   };
 }
 
 const futureExpiry = Math.floor(Date.now() / 1000) + 3600;
 
-interface TestGrantPayload {
-  user: `0x${string}`;
-  builder: `0x${string}`;
-  scopes: string[];
-  expiresAt: bigint;
-  nonce: bigint;
-}
-
-function makePayload(overrides?: Partial<TestGrantPayload>): TestGrantPayload {
-  return {
-    user: owner.address,
-    builder: builder.address,
-    scopes: ["instagram.*"],
-    expiresAt: BigInt(futureExpiry),
-    nonce: 1n,
-    ...overrides,
-  };
-}
-
-async function signGrant(payload: TestGrantPayload): Promise<{
+// Canary verify body is the structured EIP-712 shape: top-level scopes,
+// grantVersion, expiresAt. No JSON `grant` blob, no fileIds.
+interface CanaryVerifyBody {
   grantorAddress: `0x${string}`;
   granteeId: `0x${string}`;
-  grant: string;
-  fileIds: number[];
+  scopes: string[];
+  grantVersion: string;
+  expiresAt: string;
   signature: `0x${string}`;
-}> {
-  const grant = JSON.stringify({
-    user: payload.user,
-    builder: payload.builder,
-    scopes: payload.scopes,
-    expiresAt: Number(payload.expiresAt),
-    nonce: Number(payload.nonce),
-  });
-  const granteeId =
-    "0x1111111111111111111111111111111111111111111111111111111111111111";
+}
+
+interface SignVerifyBodyParams {
+  scopes?: string[];
+  grantVersion?: bigint;
+  expiresAt?: bigint;
+}
+
+async function signVerifyBody(
+  params: SignVerifyBodyParams = {},
+): Promise<CanaryVerifyBody> {
+  const scopes = params.scopes ?? ["instagram.*"];
+  const grantVersion = params.grantVersion ?? 1n;
+  const expiresAt = params.expiresAt ?? BigInt(futureExpiry);
   const signature = await owner.signTypedData({
     domain: grantRegistrationDomain(gatewayConfig) as unknown as Record<
       string,
@@ -116,17 +167,19 @@ async function signGrant(payload: TestGrantPayload): Promise<{
     >,
     primaryType: "GrantRegistration",
     message: {
-      grantorAddress: payload.user,
-      granteeId,
-      grant,
-      fileIds: [],
+      grantorAddress: owner.address,
+      granteeId: BUILDER_ID,
+      scopes,
+      grantVersion,
+      expiresAt,
     },
   });
   return {
-    grantorAddress: payload.user,
-    granteeId,
-    grant,
-    fileIds: [],
+    grantorAddress: owner.address,
+    granteeId: BUILDER_ID,
+    scopes,
+    grantVersion: grantVersion.toString(),
+    expiresAt: expiresAt.toString(),
     signature,
   };
 }
@@ -164,34 +217,12 @@ describe("GET /", () => {
   it("returns grants from gateway", async () => {
     const mockGateway = createMockGateway();
     const grants: GrantListItem[] = [
-      {
-        id: "0xgrant1",
-        grantorAddress: owner.address,
-        granteeId: "0xbuilder1",
-        grant: JSON.stringify({
-          scopes: ["instagram.*"],
-          expiresAt: futureExpiry,
-        }),
-        fileIds: [],
-        status: "confirmed",
-        addedAt: "2025-01-01T00:00:00Z",
-        revokedAt: null,
-        revocationSignature: null,
-      },
-      {
+      makeGrantResponse({ id: "0xgrant1", scopes: ["instagram.*"] }),
+      makeGrantResponse({
         id: "0xgrant2",
-        grantorAddress: owner.address,
-        granteeId: "0xbuilder1",
-        grant: JSON.stringify({
-          scopes: ["twitter.*"],
-          expiresAt: futureExpiry,
-        }),
-        fileIds: [],
-        status: "confirmed",
+        scopes: ["twitter.*"],
         addedAt: "2025-01-02T00:00:00Z",
-        revokedAt: null,
-        revocationSignature: null,
-      },
+      }),
     ];
     vi.mocked(mockGateway.listGrantsByUser).mockResolvedValue(grants);
 
@@ -230,10 +261,9 @@ describe("GET /", () => {
 });
 
 describe("POST /verify", () => {
-  it("valid grant + signature returns { valid: true, user, builder, scopes, expiresAt }", async () => {
+  it("valid grant + signature returns { valid: true, scopes, grantVersion, expiresAt }", async () => {
     const app = createApp();
-    const payload = makePayload();
-    const body = await signGrant(payload);
+    const body = await signVerifyBody();
 
     const res = await app.request("/verify", {
       method: "POST",
@@ -245,20 +275,18 @@ describe("POST /verify", () => {
     const json = await res.json();
     expect(json.valid).toBe(true);
     expect(json.grantorAddress).toBe(owner.address);
-    expect(json.user).toBe(owner.address);
-    expect(json.builder).toBe(builder.address);
+    expect(json.granteeId).toBe(BUILDER_ID);
     expect(json.scopes).toEqual(["instagram.*"]);
-    expect(json.expiresAt).toBe(futureExpiry);
+    expect(json.grantVersion).toBe("1");
+    expect(json.expiresAt).toBe(String(futureExpiry));
   });
 
-  it("tampered payload (signature mismatch) returns { valid: false }", async () => {
+  it("tampered scopes returns { valid: false }", async () => {
     const app = createApp();
-    const payload = makePayload();
-    const body = await signGrant(payload);
-
-    const tamperedGrant = JSON.parse(body.grant) as Record<string, unknown>;
-    tamperedGrant.scopes = ["*"];
-    body.grant = JSON.stringify(tamperedGrant);
+    const body = await signVerifyBody();
+    // Mutate scopes after signing — the EIP-712 hash changes so recovery
+    // produces a different signer.
+    body.scopes = ["*"];
 
     const res = await app.request("/verify", {
       method: "POST",
@@ -274,9 +302,8 @@ describe("POST /verify", () => {
 
   it("expired grant returns { valid: false }", async () => {
     const app = createApp();
-    const pastExpiry = Math.floor(Date.now() / 1000) - 3600;
-    const payload = makePayload({ expiresAt: BigInt(pastExpiry) });
-    const body = await signGrant(payload);
+    const pastExpiry = BigInt(Math.floor(Date.now() / 1000) - 3600);
+    const body = await signVerifyBody({ expiresAt: pastExpiry });
 
     const res = await app.request("/verify", {
       method: "POST",
@@ -292,8 +319,7 @@ describe("POST /verify", () => {
 
   it("expiresAt: 0 (no expiry) returns { valid: true }", async () => {
     const app = createApp();
-    const payload = makePayload({ expiresAt: 0n });
-    const body = await signGrant(payload);
+    const body = await signVerifyBody({ expiresAt: 0n });
 
     const res = await app.request("/verify", {
       method: "POST",
@@ -304,55 +330,7 @@ describe("POST /verify", () => {
     expect(res.status).toBe(200);
     const json = await res.json();
     expect(json.valid).toBe(true);
-    expect(json.expiresAt).toBe(0);
-  });
-
-  it("embedded grant user must match grantorAddress", async () => {
-    const app = createApp();
-    const grant = JSON.stringify({
-      user: builder.address,
-      builder: builder.address,
-      scopes: ["instagram.*"],
-      expiresAt: futureExpiry,
-      nonce: 1,
-    });
-    const granteeId =
-      "0x1111111111111111111111111111111111111111111111111111111111111111";
-    const signature = await owner.signTypedData({
-      domain: grantRegistrationDomain(gatewayConfig) as unknown as Record<
-        string,
-        unknown
-      >,
-      types: GRANT_REGISTRATION_TYPES as unknown as Record<
-        string,
-        Array<{ name: string; type: string }>
-      >,
-      primaryType: "GrantRegistration",
-      message: {
-        grantorAddress: owner.address,
-        granteeId,
-        grant,
-        fileIds: [],
-      },
-    });
-
-    const res = await app.request("/verify", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        grantorAddress: owner.address,
-        granteeId,
-        grant,
-        fileIds: [],
-        signature,
-      }),
-    });
-
-    expect(res.status).toBe(200);
-    await expect(res.json()).resolves.toMatchObject({
-      valid: false,
-      error: "Grant user does not match grantorAddress",
-    });
+    expect(json.expiresAt).toBe("0");
   });
 
   it("missing required fields returns 400", async () => {
@@ -421,27 +399,25 @@ describe("POST /", () => {
     const json = await res.json();
     expect(json.grantId).toBe("grant-123");
 
-    // Verify gateway.getBuilder was called with the grantee address
     expect(mockGateway.getBuilder).toHaveBeenCalledWith(builder.address);
 
-    // Verify serverSigner.signGrantRegistration was called
-    expect(mockSigner.signGrantRegistration).toHaveBeenCalledWith(
-      expect.objectContaining({
-        grantorAddress: owner.address,
-        granteeId: "0xbuilder1",
-        fileIds: [],
-      }),
-    );
+    // Default grantVersion is 1n; expiresAt defaults to 0n.
+    expect(mockSigner.signGrantRegistration).toHaveBeenCalledWith({
+      grantorAddress: owner.address,
+      granteeId: BUILDER_ID,
+      scopes: ["instagram.*"],
+      grantVersion: 1n,
+      expiresAt: 0n,
+    });
 
-    // Verify gateway.createGrant was called with correct params
-    expect(mockGateway.createGrant).toHaveBeenCalledWith(
-      expect.objectContaining({
-        grantorAddress: owner.address,
-        granteeId: "0xbuilder1",
-        fileIds: [],
-        signature: "0xgrantsig",
-      }),
-    );
+    expect(mockGateway.createGrant).toHaveBeenCalledWith({
+      grantorAddress: owner.address,
+      granteeId: BUILDER_ID,
+      scopes: ["instagram.*"],
+      grantVersion: "1",
+      expiresAt: "0",
+      signature: "0xgrantsig",
+    });
   });
 
   it("returns 404 when builder is not registered", async () => {
@@ -466,7 +442,6 @@ describe("POST /", () => {
       gatewayConfig,
       serverOwner: owner.address,
       serverOrigin: SERVER_ORIGIN,
-      // serverSigner intentionally omitted
     });
 
     const res = await postWithOwnerAuth(app, {
@@ -501,7 +476,7 @@ describe("POST /", () => {
     expect(json.error).toBe("INVALID_BODY");
   });
 
-  it("passes optional expiresAt and nonce to grant payload", async () => {
+  it("forwards optional expiresAt and grantVersion to signer + gateway", async () => {
     const mockGateway = createMockGateway();
     const mockSigner = createMockServerSigner();
 
@@ -510,16 +485,23 @@ describe("POST /", () => {
       granteeAddress: builder.address,
       scopes: ["instagram.*"],
       expiresAt: 1700000000,
-      nonce: 42,
+      grantVersion: "7",
     });
 
     expect(res.status).toBe(201);
-
-    // Verify the grant payload passed to signer contains custom expiresAt/nonce
-    const signerCall = mockSigner.signGrantRegistration.mock.calls[0][0];
-    const grantPayload = JSON.parse(signerCall.grant);
-    expect(grantPayload.expiresAt).toBe(1700000000);
-    expect(grantPayload.nonce).toBe(42);
+    expect(mockSigner.signGrantRegistration).toHaveBeenCalledWith({
+      grantorAddress: owner.address,
+      granteeId: BUILDER_ID,
+      scopes: ["instagram.*"],
+      grantVersion: 7n,
+      expiresAt: 1700000000n,
+    });
+    expect(mockGateway.createGrant).toHaveBeenCalledWith(
+      expect.objectContaining({
+        grantVersion: "7",
+        expiresAt: "1700000000",
+      }),
+    );
   });
 });
 
@@ -540,25 +522,46 @@ describe("DELETE /:grantId", () => {
     });
   }
 
-  it("revokes grant via gateway and returns revoked status", async () => {
+  it("revokes grant via gateway with grantVersion + 1", async () => {
     const mockGateway = createMockGateway();
     const mockSigner = createMockServerSigner();
     const grantId =
       "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    vi.mocked(mockGateway.getGrant).mockResolvedValue(
+      makeGrantResponse({ id: grantId, grantVersion: "3" }),
+    );
 
     const app = createApp({ gateway: mockGateway, serverSigner: mockSigner });
     const res = await deleteWithOwnerAuth(app, grantId);
 
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({ status: "revoked", grantId });
+    // Revocation increments the (grantor, grantee) monotonic nonce —
+    // current grant.grantVersion is "3", revocation must use "4".
     expect(mockSigner.signGrantRevocation).toHaveBeenCalledWith({
       grantorAddress: owner.address,
       grantId,
+      grantVersion: 4n,
     });
     expect(mockGateway.revokeGrant).toHaveBeenCalledWith({
       grantorAddress: owner.address,
       grantId,
+      grantVersion: "4",
       signature: "0xrevokesig",
     });
+  });
+
+  it("returns 404 when the grant doesn't exist on the gateway", async () => {
+    const mockGateway = createMockGateway();
+    vi.mocked(mockGateway.getGrant).mockResolvedValue(null);
+    const grantId =
+      "0x9999999999999999999999999999999999999999999999999999999999999999";
+
+    const app = createApp({ gateway: mockGateway });
+    const res = await deleteWithOwnerAuth(app, grantId);
+
+    expect(res.status).toBe(404);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("GRANT_NOT_FOUND");
   });
 });

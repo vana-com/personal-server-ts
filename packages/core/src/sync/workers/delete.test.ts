@@ -15,13 +15,15 @@ const OWNER = "0xAbCdEf1234567890AbCdEf1234567890AbCdEf12";
 function makeEntry(overrides?: Partial<IndexEntry>): IndexEntry {
   return {
     id: 1,
-    fileId: "file-1",
+    fileId: null,
     schemaId: null,
     path: `${SCOPE}/2026-01-21T10:00:00Z.json`,
     scope: SCOPE,
     collectedAt: "2026-01-21T10:00:00Z",
     createdAt: "2026-01-21T10:00:00Z",
     sizeBytes: 128,
+    version: 1,
+    dataPointId: "0xdp-1",
     ...overrides,
   };
 }
@@ -35,119 +37,68 @@ function makeLogger(): Logger {
   } as unknown as Logger;
 }
 
-function makeDeps(
-  entries: IndexEntry[],
-  overrides?: {
-    getFile?: GatewayClient["getFile"];
-    deleteFile?: GatewayClient["deleteFile"];
-    storageDelete?: StorageAdapter["delete"];
-  },
-): DeleteWorkerDeps {
+function makeDeps(entries: IndexEntry[]): DeleteWorkerDeps {
   const storage: Partial<DataStoragePort> = {
     listVersions: vi.fn().mockReturnValue(entries),
   };
-  const gateway: Partial<GatewayClient> = {
-    getFile:
-      overrides?.getFile ??
-      vi.fn(async (fileId: string) => ({
-        fileId,
-        owner: OWNER,
-        url: `https://storage.vana.org/v1/blobs/${OWNER}/${SCOPE}/${fileId}`,
-        schemaId: "0xschema",
-        createdAt: "2026-01-21T10:00:00Z",
-        deletedAt: null,
-      })),
-    deleteFile: overrides?.deleteFile ?? vi.fn(async () => undefined),
-  };
+  // Remote calls must never be made on DPv2 — track them to assert absence.
+  const gateway = {
+    getDataPoint: vi.fn(),
+    registerDataPoint: vi.fn(),
+  } as unknown as GatewayClient;
   const storageAdapter: Partial<StorageAdapter> = {
-    delete: overrides?.storageDelete ?? vi.fn(async () => true),
+    delete: vi.fn(async () => true),
   };
-  const signer: Partial<ServerSigner> = {
-    signFileDeletion: vi.fn(async () => "0xsig" as `0x${string}`),
-  };
+  const signer = {} as ServerSigner;
   return {
     storage: storage as DataStoragePort,
     storageAdapter: storageAdapter as StorageAdapter,
-    gateway: gateway as GatewayClient,
-    signer: signer as ServerSigner,
+    gateway,
+    signer,
     serverOwner: OWNER,
     logger: makeLogger(),
   };
 }
 
-describe("deleteScopeRemote", () => {
-  it("de-registers each synced version: blob delete + owner-signed gateway deleteFile", async () => {
+// The DPv2 gateway has no data-point de-registration / deletion endpoint, so
+// remote scope deletion is a no-op (local data is removed elsewhere via the
+// storage port's deleteScope). These tests pin that contract: no remote calls,
+// zero counts, and a warning when synced versions would otherwise be orphaned.
+describe("deleteScopeRemote (DPv2 no-op)", () => {
+  it("makes no remote calls and reports zero de-registrations / blob deletes", async () => {
     const deps = makeDeps([
-      makeEntry({ id: 1, fileId: "file-1" }),
-      makeEntry({ id: 2, fileId: "file-2" }),
+      makeEntry({ id: 1, dataPointId: "0xdp-1" }),
+      makeEntry({ id: 2, dataPointId: "0xdp-2" }),
     ]);
 
     const result = await deleteScopeRemote(deps, SCOPE);
 
-    expect(result).toMatchObject({
+    expect(result).toEqual({
       scope: SCOPE,
-      filesDeregistered: 2,
-      blobsDeleted: 2,
+      filesDeregistered: 0,
+      blobsDeleted: 0,
       errors: [],
     });
-    expect(deps.signer.signFileDeletion).toHaveBeenCalledWith({
-      ownerAddress: OWNER,
-      fileId: "file-1",
-    });
-    expect(deps.gateway.deleteFile).toHaveBeenCalledWith({
-      fileId: "file-1",
-      ownerAddress: OWNER,
-      signature: "0xsig",
-    });
-    // blob deleted via the URL recovered from the gateway file record
-    expect(deps.storageAdapter.delete).toHaveBeenCalledWith(
-      `https://storage.vana.org/v1/blobs/${OWNER}/${SCOPE}/file-1`,
+    expect(deps.storageAdapter.delete).not.toHaveBeenCalled();
+  });
+
+  it("warns when synced versions exist (remote copies left in place)", async () => {
+    const deps = makeDeps([makeEntry({ dataPointId: "0xdp-1" })]);
+
+    await deleteScopeRemote(deps, SCOPE);
+
+    expect(deps.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: SCOPE, syncedVersions: 1 }),
+      expect.stringContaining("not supported on the DPv2 gateway"),
     );
   });
 
-  it("skips local-only versions (fileId === null) — no remote calls", async () => {
-    const deps = makeDeps([makeEntry({ id: 1, fileId: null })]);
+  it("does not warn for local-only versions (never synced)", async () => {
+    const deps = makeDeps([makeEntry({ dataPointId: null })]);
 
     const result = await deleteScopeRemote(deps, SCOPE);
 
     expect(result.filesDeregistered).toBe(0);
-    expect(result.blobsDeleted).toBe(0);
-    expect(deps.gateway.deleteFile).not.toHaveBeenCalled();
-    expect(deps.storageAdapter.delete).not.toHaveBeenCalled();
-  });
-
-  it("is best-effort: a per-file failure is collected and the rest continue", async () => {
-    const deleteFile = vi
-      .fn()
-      .mockRejectedValueOnce(new Error("gateway 500"))
-      .mockResolvedValueOnce(undefined);
-    const deps = makeDeps(
-      [
-        makeEntry({ id: 1, fileId: "file-1" }),
-        makeEntry({ id: 2, fileId: "file-2" }),
-      ],
-      { deleteFile: deleteFile as unknown as GatewayClient["deleteFile"] },
-    );
-
-    const result = await deleteScopeRemote(deps, SCOPE);
-
-    expect(result.filesDeregistered).toBe(1);
-    expect(result.errors).toEqual([
-      { fileId: "file-1", message: "gateway 500" },
-    ]);
-    expect(deleteFile).toHaveBeenCalledTimes(2);
-  });
-
-  it("does not delete a blob when the gateway has no URL for the file", async () => {
-    const deps = makeDeps([makeEntry({ id: 1, fileId: "file-1" })], {
-      getFile: vi.fn(async () => null) as unknown as GatewayClient["getFile"],
-    });
-
-    const result = await deleteScopeRemote(deps, SCOPE);
-
-    expect(deps.storageAdapter.delete).not.toHaveBeenCalled();
-    // still de-registers at the gateway (idempotent)
-    expect(result.filesDeregistered).toBe(1);
-    expect(result.blobsDeleted).toBe(0);
+    expect(deps.logger.warn).not.toHaveBeenCalled();
   });
 });

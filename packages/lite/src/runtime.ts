@@ -110,10 +110,7 @@ export interface PsLiteRuntimeOptions {
   identity?: { address: `0x${string}`; publicKey: `0x${string}` };
   gateway?: GatewayClient;
   serverOwner?: `0x${string}`;
-  serverSigner?: Pick<
-    ServerSigner,
-    "signFileRegistration" | "signGrantRegistration"
-  > &
+  serverSigner?: Pick<ServerSigner, "signGrantRegistration"> &
     Partial<
       Pick<
         ServerSigner,

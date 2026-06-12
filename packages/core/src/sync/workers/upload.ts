@@ -1,3 +1,4 @@
+import { keccak256, stringToHex } from "viem";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import {
   deriveScopeKey,
@@ -21,8 +22,14 @@ export interface UploadWorkerDeps {
 
 export interface UploadResult {
   path: string;
-  fileId: string;
+  /** Storage URL the encrypted blob was written to (version-keyed). */
   url: string;
+  /**
+   * DPv2 data-point id assigned by the gateway. Present whenever this run
+   * either freshly registered the data point or found one already attached
+   * to the index entry from a prior run.
+   */
+  dataPointId: string;
 }
 
 export interface UploadAllOptions {
@@ -33,13 +40,13 @@ export interface UploadAllOptions {
 /**
  * Upload a single unsynced index entry:
  * 1. Read local data file from disk
- * 2. Look up schema for the scope → get schemaId
+ * 2. Resolve schemaId for the scope
  * 3. Derive scope key from master key → hex-encode as OpenPGP password
- * 4. Encrypt with OpenPGP password-based encryption → binary
- * 5. Upload OpenPGP binary to storage backend
- * 6. Sign file registration via EIP-712
- * 7. Register file record on-chain via Gateway (with schemaId)
- * 8. Update local index with fileId
+ * 4. Encrypt envelope with OpenPGP password-based encryption → ciphertext
+ * 5. Compute dataHash / metadataHash commitments
+ * 6. Upload ciphertext to storage backend, version-keyed `{scope}/{version}`
+ * 7. Register DPv2 data point on-chain (AddData) if not already
+ * 8. Persist the gateway-assigned dataPointId (marks the entry synced)
  */
 export async function uploadOne(
   deps: UploadWorkerDeps,
@@ -77,45 +84,88 @@ export async function uploadOne(
   const plaintext = new TextEncoder().encode(JSON.stringify(envelope));
   const encrypted = await encryptWithPassword(plaintext, scopeKeyHex);
 
-  // 5. Upload to storage backend
-  const storageKey = `${entry.scope}/${entry.collectedAt}`;
-  const url = await storageAdapter.upload(storageKey, encrypted);
-
-  // 6. Sign file registration via EIP-712
-  const signature = await signer.signFileRegistration({
-    ownerAddress: serverOwner as `0x${string}`,
-    url,
-    schemaId: schemaId as `0x${string}`,
-  });
-
-  // 7. Register file on-chain via Gateway
-  const registration = await gateway.registerFile({
-    ownerAddress: serverOwner,
-    url,
-    schemaId,
-    signature,
-  });
-
-  const fileId = registration.fileId;
-  if (!fileId) {
-    throw new Error(
-      `Gateway registerFile did not return a fileId for ${entry.path}`,
-    );
-  }
-
-  // 8. Update local index with fileId
-  await storage.updateFileId(entry.path, fileId);
-
-  logger.info(
-    { path: entry.path, fileId, url },
-    "Uploaded and registered file",
+  // 5. DPv2 data-point registration (idempotent — skipped when the prior run
+  // already persisted a dataPointId on this entry).
+  //
+  // Commitments:
+  //   dataHash     = keccak256 of the plaintext envelope JSON. Commits to the
+  //                  canonical content, not the ciphertext — OpenPGP
+  //                  password-based encryption embeds random salts so
+  //                  re-encrypting the same plaintext yields different bytes;
+  //                  hashing the plaintext keeps the on-chain commitment
+  //                  reproducible across replicas serving the same version.
+  //   metadataHash = keccak256 of canonical-JSON({scope, collectedAt, schemaId,
+  //                  sizeBytes}). Commits to the off-chain metadata that
+  //                  describes this version without leaking the payload.
+  const dataHash = keccak256(plaintext);
+  const metadataHash = keccak256(
+    stringToHex(
+      JSON.stringify({
+        scope: entry.scope,
+        collectedAt: entry.collectedAt,
+        schemaId,
+        sizeBytes: encrypted.byteLength,
+      }),
+    ),
   );
 
-  return { path: entry.path, fileId, url };
+  // 6. Upload ciphertext to storage backend FIRST, version-keyed so the
+  // download worker can reconstruct the URL from a DataPointRecord's
+  // (scope, expectedVersion) — DataPointRecords carry no URL. We upload
+  // before registering so the on-chain data point (the synced marker) is
+  // never stamped ahead of a blob that failed to land.
+  const storageKey = `${entry.scope}/${entry.version}`;
+  const url = await storageAdapter.upload(storageKey, encrypted);
+
+  // 7. DPv2 data-point registration (idempotent — skipped when a prior run
+  // already persisted a dataPointId on this entry). registerDataPoint stamps
+  // the synced marker that excludes this entry from findUnsynced next time.
+  let dataPointId = entry.dataPointId;
+  if (!dataPointId) {
+    const addDataSignature = await signer.signAddData({
+      ownerAddress: serverOwner as `0x${string}`,
+      scope: entry.scope,
+      dataHash,
+      metadataHash,
+      expectedVersion: BigInt(entry.version),
+    });
+
+    const dataPointResult = await gateway.registerDataPoint({
+      ownerAddress: serverOwner,
+      scope: entry.scope,
+      dataHash,
+      metadataHash,
+      expectedVersion: String(entry.version),
+      signature: addDataSignature,
+    });
+
+    dataPointId = dataPointResult.dataPointId ?? null;
+    if (!dataPointId) {
+      throw new Error(
+        `Gateway registerDataPoint did not return a dataPointId for ${entry.path} (scope=${entry.scope}, version=${entry.version})`,
+      );
+    }
+
+    // 8. Stamp the dataPointId on the local index entry — marks it synced.
+    await storage.updateDataPointId(entry.path, dataPointId);
+  }
+
+  logger.info(
+    {
+      path: entry.path,
+      scope: entry.scope,
+      version: entry.version,
+      url,
+      dataPointId,
+    },
+    "Uploaded and registered DPv2 data point",
+  );
+
+  return { path: entry.path, url, dataPointId };
 }
 
 /**
- * Process all unsynced entries (fileId === null).
+ * Process all unsynced entries (dataPointId === null).
  * Processes sequentially to avoid overwhelming storage backend.
  * Returns array of results (skips failures, logs errors).
  */

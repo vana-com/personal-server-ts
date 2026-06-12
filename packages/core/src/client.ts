@@ -160,8 +160,15 @@ export interface PersonalServerAuthRequestOptions {
 export interface PersonalServerCreateGrantOptions extends PersonalServerAuthRequestOptions {
   granteeAddress: `0x${string}`;
   scopes: string[];
+  /** Unix seconds. 0 or omitted = perpetual. */
   expiresAt?: number;
-  nonce?: number;
+  /**
+   * Decimal uint256 string. Defaults to "1" for first registration.
+   * Re-registration must pass a strictly higher value than the live grant's
+   * grantVersion; otherwise the gateway returns 409. Shares the monotonic
+   * (grantor, grantee) nonce with revocation (canary 87b4310).
+   */
+  grantVersion?: string;
 }
 
 export interface PersonalServerCreateGrantResult {

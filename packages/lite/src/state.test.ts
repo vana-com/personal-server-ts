@@ -203,6 +203,62 @@ describe("PS Lite browser state", () => {
     });
   });
 
+  it("reconciles stored gateway config when defaults move and re-persists it", async () => {
+    const store = createMemoryPsLiteStateStore();
+
+    // Boot once with the old deployment config, mutating instance state.
+    await loadOrCreatePsLiteConfig(store, {
+      gateway: {
+        url: "https://gateway.old.example",
+        chainId: 14800,
+        contracts: { dataPortabilityServer: "0xOLD" },
+      },
+    });
+    const withInstanceState = await loadOrCreatePsLiteConfig(store);
+    await savePsLiteConfig(store, {
+      ...withInstanceState,
+      server: { ...withInstanceState.server, origin: "https://lite.example" },
+    });
+
+    // Boot again with new defaults (contract redeploy).
+    const reconciled = await loadOrCreatePsLiteConfig(store, {
+      gateway: {
+        url: "https://gateway.new.example",
+        chainId: 14800,
+        contracts: { dataPortabilityServer: "0xNEW" },
+      },
+    });
+
+    expect(reconciled.gateway.url).toBe("https://gateway.new.example");
+    expect(reconciled.gateway.contracts.dataPortabilityServer).toBe("0xNEW");
+    // Instance state survives the reconcile.
+    expect(reconciled.server.origin).toBe("https://lite.example");
+    // Non-overridden contracts keep their stored values.
+    expect(reconciled.gateway.contracts.dataRegistry).toBe(
+      withInstanceState.gateway.contracts.dataRegistry,
+    );
+
+    // The reconciled gateway is persisted, not recomputed each boot.
+    await expect(loadOrCreatePsLiteConfig(store)).resolves.toMatchObject({
+      gateway: { contracts: { dataPortabilityServer: "0xNEW" } },
+    });
+  });
+
+  it("leaves stored config untouched when no gateway defaults are given", async () => {
+    const store = createMemoryPsLiteStateStore();
+    await loadOrCreatePsLiteConfig(store, {
+      gateway: {
+        url: "https://gateway.old.example",
+        chainId: 14800,
+        contracts: { dataPortabilityServer: "0xOLD" },
+      },
+    });
+
+    const reloaded = await loadOrCreatePsLiteConfig(store);
+    expect(reloaded.gateway.contracts.dataPortabilityServer).toBe("0xOLD");
+    expect(reloaded.gateway.url).toBe("https://gateway.old.example");
+  });
+
   it("creates an encrypted browser server identity and unlocks it after reload", async () => {
     const store = createMemoryPsLiteStateStore();
     const first = await loadOrCreatePsLiteServerIdentity({

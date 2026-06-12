@@ -21,8 +21,18 @@ import {
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import { dataRoutes } from "./data.js";
 import type { DataRouteDeps } from "./data.js";
-import { createGrantFeeVerifier } from "../grant-fee-verifier.js";
 import type { TokenStore } from "../token-store.js";
+import {
+  encodePaymentHeader,
+  nextPaymentNonce,
+} from "@opendatalabs/personal-server-ts-core/payment";
+import {
+  GENERIC_PAYMENT_TYPES,
+  RECORD_DATA_ACCESS_TYPES,
+  escrowPaymentDomain,
+  type DataPortabilityGatewayConfig,
+} from "@opendatalabs/vana-sdk/node";
+import { privateKeyToAccount } from "viem/accounts";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const wallet = createTestWallet(0);
@@ -72,17 +82,27 @@ function makeGrant(
     id: "grant-123",
     grantorAddress: ownerWallet.address,
     granteeId: BUILDER_ID,
-    grant: JSON.stringify({
-      user: ownerWallet.address,
-      builder: wallet.address,
-      scopes: ["instagram.*"],
-      expiresAt: Math.floor(Date.now() / 1000) + 3600,
-    }),
-    fileIds: [],
+    scopes: ["instagram.*"],
     status: "confirmed",
     addedAt: "2026-01-21T10:00:00.000Z",
+    expiresAt: String(Math.floor(Date.now() / 1000) + 3600),
+    expired: false,
     revokedAt: null,
     revocationSignature: null,
+    paymentStatus: "paid",
+    paidAt: "2026-01-21T10:00:05.000Z",
+    paidBy: ownerWallet.address,
+    grantVersion: "1",
+    settleTxHash: null,
+    settleSubmittedAt: null,
+    revocationTxHash: null,
+    revocationSubmittedAt: null,
+    fee: {
+      asset: "0x0000000000000000000000000000000000000000",
+      registrationFee: "0",
+      dataAccessFee: "0",
+      totalDue: "0",
+    },
     ...overrides,
   };
 }
@@ -359,7 +379,13 @@ describe("POST /v1/data/:scope", () => {
     expect(content.schemaId).toBe("0xschema1");
   });
 
-  it("returns 400 NO_SCHEMA when no schema registered for scope", async () => {
+  it("ingests successfully when no schema is registered for the scope", async () => {
+    // Schema lookup is best-effort. The canary X402 read path doesn't
+    // consult schemaId, and DPv2 registerDataPoint doesn't take it.
+    // Only the legacy sync-worker registerFile call needs one, and that
+    // surfaces its own error when sync is enabled but no schema exists.
+    // The ingest endpoint itself proceeds and writes the envelope without
+    // a schemaId field.
     const db2 = initializeDatabase(":memory:");
     const indexManager2 = createIndexManager(db2);
     const gateway = createMockGateway({
@@ -378,10 +404,17 @@ describe("POST /v1/data/:scope", () => {
     const res = await postWithOwnerAuth(localApp, "instagram.profile", {
       username: "test",
     });
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(201);
 
     const json = await res.json();
-    expect(json.error).toBe("NO_SCHEMA");
+    expect(json.scope).toBe("instagram.profile");
+    expect(json.status).toBe("stored");
+
+    // The on-disk index entry should have schemaId === null since the
+    // gateway returned no schema and we proceeded gracefully.
+    const entry = indexManager2.findLatestByScope("instagram.profile");
+    expect(entry).toBeDefined();
+    expect(entry!.schemaId).toBeNull();
 
     indexManager2.close();
   });
@@ -994,10 +1027,7 @@ describe("GET /v1/data/:scope", () => {
 
   it("returns 403 GRANT_EXPIRED for expired grant", async () => {
     const grant = makeGrant({
-      grant: JSON.stringify({
-        scopes: ["instagram.*"],
-        expiresAt: Math.floor(Date.now() / 1000) - 3600,
-      }),
+      expiresAt: String(Math.floor(Date.now() / 1000) - 3600),
     });
     const gateway = createMockGateway({
       getGrant: vi.fn().mockResolvedValue(grant),
@@ -1012,12 +1042,7 @@ describe("GET /v1/data/:scope", () => {
   });
 
   it("returns 403 SCOPE_MISMATCH when grant does not cover scope", async () => {
-    const grant = makeGrant({
-      grant: JSON.stringify({
-        scopes: ["twitter.*"],
-        expiresAt: Math.floor(Date.now() / 1000) + 3600,
-      }),
-    });
+    const grant = makeGrant({ scopes: ["twitter.*"] });
     const gateway = createMockGateway({
       getGrant: vi.fn().mockResolvedValue(grant),
     });
@@ -1030,35 +1055,21 @@ describe("GET /v1/data/:scope", () => {
     expect(json.error.errorCode).toBe("SCOPE_MISMATCH");
   });
 
-  it("returns 403 SCOPE_MISMATCH when fileId is not authorized by grant", async () => {
-    const grant = makeGrant({ fileIds: ["file-1"] });
+  // Canary GatewayGrantResponse has no `fileIds` — per-grant file pinning
+  // is gone. The previous "fileId not authorized" + "fileId-restricted
+  // latest reads" tests no longer have a corresponding code path to
+  // exercise. Reads now resolve by (scope, optional ?at=) without grant-
+  // level fileId allow-lists; the canary protocol relies on dataPointId +
+  // version commitments instead.
+
+  it("authorizes default latest reads when grant covers the scope", async () => {
+    const grant = makeGrant();
     const gateway = createMockGateway({
       getGrant: vi.fn().mockResolvedValue(grant),
     });
     const app = createApp({ gateway });
 
     await ingestData("instagram.profile", { username: "test_user" }, app);
-
-    const res = await getWithAuth(app, "instagram.profile", {
-      query: "?fileId=file-2",
-    });
-
-    expect(res.status).toBe(403);
-    const json = await res.json();
-    expect(json.error.errorCode).toBe("SCOPE_MISMATCH");
-  });
-
-  it("authorizes default latest reads against selected entry fileId", async () => {
-    const grant = makeGrant({ fileIds: ["file-1"] });
-    const gateway = createMockGateway({
-      getGrant: vi.fn().mockResolvedValue(grant),
-    });
-    const app = createApp({ gateway });
-
-    await ingestData("instagram.profile", { username: "test_user" }, app);
-    const entry = indexManager.findLatestByScope("instagram.profile");
-    expect(entry).toBeDefined();
-    indexManager.updateFileId(entry!.path, "file-1");
 
     const res = await getWithAuth(app, "instagram.profile");
 
@@ -1067,69 +1078,9 @@ describe("GET /v1/data/:scope", () => {
     expect(json.data).toEqual({ username: "test_user" });
   });
 
-  it("returns 403 FEE_REQUIRED when fee verification fails", async () => {
-    const app = createApp({
-      feeVerifier: {
-        verifyDataReadFee: vi
-          .fn()
-          .mockResolvedValue({ ok: false, reason: "unpaid" }),
-      },
-    });
-
-    await ingestData("instagram.profile", { username: "test_user" }, app);
-
-    const res = await getWithAuth(app, "instagram.profile");
-
-    expect(res.status).toBe(403);
-    const json = await res.json();
-    expect(json.error.errorCode).toBe("FEE_REQUIRED");
-  });
-
-  it("serves data when createGrantFeeVerifier sees the grant fee paid", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(
-        new Response(JSON.stringify({ data: { paymentStatus: "paid" } }), {
-          status: 200,
-        }),
-      ),
-    );
-    const app = createApp({
-      feeVerifier: createGrantFeeVerifier({
-        gatewayUrl: "https://dp-rpc.test",
-        logger,
-      }),
-    });
-    await ingestData("instagram.profile", { username: "test_user" }, app);
-
-    const res = await getWithAuth(app, "instagram.profile");
-
-    expect(res.status).toBe(200);
-  });
-
-  it("returns 403 FEE_REQUIRED when createGrantFeeVerifier sees the grant unpaid", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(
-        new Response(JSON.stringify({ data: { paymentStatus: "pending" } }), {
-          status: 200,
-        }),
-      ),
-    );
-    const app = createApp({
-      feeVerifier: createGrantFeeVerifier({
-        gatewayUrl: "https://dp-rpc.test",
-        logger,
-      }),
-    });
-    await ingestData("instagram.profile", { username: "test_user" }, app);
-
-    const res = await getWithAuth(app, "instagram.profile");
-
-    expect(res.status).toBe(403);
-    const json = await res.json();
-    expect(json.error.errorCode).toBe("FEE_REQUIRED");
-  });
+  // The legacy fee verifier (which gated reads on paymentStatus by polling
+  // the gateway) has been replaced by the X402 dance on every builder read.
+  // Coverage for the new dispatch lives in the "X402 payment" block below.
 
   it("returns 503 PS_UNAVAILABLE when runtime availability fails", async () => {
     const app = createApp({
@@ -1373,5 +1324,358 @@ describe("DELETE /v1/data/:scope", () => {
 
     // Index should have 1 entry
     expect(indexManager.countByScope("instagram.profile")).toBe(1);
+  });
+});
+
+describe("X402 payment on GET /v1/data/:scope", () => {
+  // End-to-end exercise of the X402 dispatch wired into the GET handler:
+  // missing X-PAYMENT → 402 challenge; valid X-PAYMENT → forward to gateway
+  // via global fetch (stubbed) → on 2xx serve data, on 409/400 fresh
+  // challenge, on 402 relay verbatim.
+  let dataDir: string;
+  let hierarchyOptions: HierarchyManagerOptions;
+  let indexManager: IndexManager;
+  let cleanup: () => void;
+
+  const builderWallet = createTestWallet(0);
+  const ownerForX402 = createTestWallet(9);
+  const serverAccount = privateKeyToAccount(
+    ("0x" + "33".repeat(32)) as `0x${string}`,
+  );
+
+  const gatewayConfig: DataPortabilityGatewayConfig = {
+    chainId: 14800,
+    contracts: {
+      dataRegistry: "0x0000000000000000000000000000000000000001",
+      dataPortabilityPermissions: "0x0000000000000000000000000000000000000002",
+      dataPortabilityServer: "0x0000000000000000000000000000000000000003",
+      dataPortabilityGrantees: "0x0000000000000000000000000000000000000004",
+      dataPortabilityEscrow: "0x0000000000000000000000000000000000000005",
+      feeRegistry: "0x0000000000000000000000000000000000000006",
+    },
+  };
+
+  // grant.granteeId must match the builder mock's `id` for the data-read
+  // policy's signer-vs-granteeId cross-check.
+  const GRANT_FOR_X402 = "0x" + "11".repeat(32);
+
+  function paidGrant(): GatewayGrantResponse {
+    return {
+      id: GRANT_FOR_X402 as `0x${string}`,
+      grantorAddress: ownerForX402.address,
+      granteeId: BUILDER_ID as `0x${string}`,
+      scopes: ["instagram.*"],
+      status: "confirmed",
+      addedAt: "2026-01-21T10:00:00.000Z",
+      expiresAt: null,
+      expired: false,
+      revokedAt: null,
+      revocationSignature: null,
+      paymentStatus: "pending",
+      paidAt: null,
+      paidBy: null,
+      grantVersion: "1",
+      settleTxHash: null,
+      settleSubmittedAt: null,
+      revocationTxHash: null,
+      revocationSubmittedAt: null,
+      fee: {
+        asset: "0x0000000000000000000000000000000000000000",
+        registrationFee: "10000000000000000",
+        dataAccessFee: "1000000000000000",
+        totalDue: "11000000000000000",
+      },
+    };
+  }
+
+  function createX402App(overrides: Partial<DataRouteDeps> = {}) {
+    const grant = paidGrant();
+    const gateway = createMockGateway({
+      getGrant: vi.fn().mockResolvedValue(grant),
+    });
+    return dataRoutes({
+      indexManager,
+      hierarchyOptions,
+      logger,
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerForX402.address,
+      gateway,
+      gatewayConfig,
+      gatewayUrl: "https://gateway.test",
+      paymentEnabled: true,
+      serverAddress: serverAccount.address,
+      // Mock signer that returns a recoverable accessRecord signature so the
+      // challenge embeds one when entry.dataPointId is non-null.
+      serverSigner: {
+        async signFileRegistration() {
+          return ("0x" + "aa".repeat(65)) as `0x${string}`;
+        },
+        async signGrantRegistration() {
+          return ("0x" + "aa".repeat(65)) as `0x${string}`;
+        },
+        async signGrantRevocation() {
+          return ("0x" + "aa".repeat(65)) as `0x${string}`;
+        },
+        async signAddData() {
+          return ("0x" + "aa".repeat(65)) as `0x${string}`;
+        },
+        async signRecordDataAccess(msg) {
+          return serverAccount.signTypedData({
+            domain: {
+              name: "Vana Data Portability",
+              version: "1",
+              chainId: gatewayConfig.chainId,
+              verifyingContract: gatewayConfig.contracts
+                .dataRegistry as `0x${string}`,
+            },
+            types: RECORD_DATA_ACCESS_TYPES,
+            primaryType: "RecordDataAccess",
+            message: msg,
+          });
+        },
+      },
+      accessLogWriter: createMockAccessLogWriter(),
+      ...overrides,
+    });
+  }
+
+  async function ingest(
+    app: ReturnType<typeof dataRoutes>,
+    scope: string,
+    body: Record<string, unknown>,
+  ) {
+    const bodyStr = JSON.stringify(body);
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerForX402,
+      aud: SERVER_ORIGIN,
+      method: "POST",
+      uri: `/${scope}`,
+      bodyHash: `sha256:${await import("node:crypto").then((c) =>
+        c.createHash("sha256").update(bodyStr).digest("hex"),
+      )}`,
+    });
+    return app.request(`/${scope}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: auth },
+      body: bodyStr,
+    });
+  }
+
+  async function getNoPayment(
+    app: ReturnType<typeof dataRoutes>,
+    scope: string,
+  ) {
+    const auth = await buildWeb3SignedHeader({
+      wallet: builderWallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: `/${scope}`,
+      grantId: GRANT_FOR_X402,
+    });
+    return app.request(`/${scope}`, {
+      headers: { Authorization: auth },
+    });
+  }
+
+  async function getWithPayment(
+    app: ReturnType<typeof dataRoutes>,
+    scope: string,
+    paymentHeader: string,
+  ) {
+    const auth = await buildWeb3SignedHeader({
+      wallet: builderWallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: `/${scope}`,
+      grantId: GRANT_FOR_X402,
+    });
+    return app.request(`/${scope}`, {
+      headers: { Authorization: auth, "X-PAYMENT": paymentHeader },
+    });
+  }
+
+  async function signedXPayment(opts?: {
+    paymentNonce?: bigint;
+    amountOverride?: string;
+  }) {
+    const nonce = opts?.paymentNonce ?? nextPaymentNonce();
+    const amount = opts?.amountOverride ?? "11000000000000000";
+    const message = {
+      payerAddress: builderWallet.address,
+      opType: "grant" as const,
+      opId: GRANT_FOR_X402 as `0x${string}`,
+      asset: "0x0000000000000000000000000000000000000000" as `0x${string}`,
+      amount: BigInt(amount),
+      paymentNonce: nonce,
+    };
+    const signature = await builderWallet.signTypedData({
+      domain: escrowPaymentDomain(gatewayConfig),
+      types: GENERIC_PAYMENT_TYPES,
+      primaryType: "GenericPayment",
+      message,
+    });
+    return encodePaymentHeader({
+      x402Version: 1,
+      scheme: "vana-escrow-grant",
+      network: `vana:${gatewayConfig.chainId}`,
+      payload: {
+        message: {
+          payerAddress: message.payerAddress,
+          opType: message.opType,
+          opId: message.opId,
+          asset: message.asset,
+          amount,
+          paymentNonce: nonce.toString(),
+        },
+        signature,
+      },
+    });
+  }
+
+  beforeEach(async () => {
+    dataDir = await mkdtemp(join(tmpdir(), "x402-test-"));
+    hierarchyOptions = { dataDir };
+    const db = initializeDatabase(":memory:");
+    indexManager = createIndexManager(db);
+    cleanup = () => {
+      indexManager.close();
+    };
+  });
+
+  afterEach(async () => {
+    cleanup();
+    await rm(dataDir, { recursive: true, force: true });
+    vi.unstubAllGlobals();
+  });
+
+  it("returns 402 with a fresh challenge when X-PAYMENT is absent", async () => {
+    const app = createX402App();
+    const ingestRes = await ingest(app, "instagram.profile", {
+      username: "test",
+    });
+    expect(ingestRes.status).toBe(201);
+
+    const res = await getNoPayment(app, "instagram.profile");
+    expect(res.status).toBe(402);
+    const body = await res.json();
+    expect(body.x402Version).toBe(1);
+    expect(body.error).toBe("PAYMENT_REQUIRED");
+    expect(body.accepts).toHaveLength(1);
+    expect(body.accepts[0].scheme).toBe("vana-escrow-grant");
+    expect(body.accepts[0].amount).toBe("11000000000000000");
+    expect(body.accepts[0].message.payerAddress.toLowerCase()).toBe(
+      builderWallet.address.toLowerCase(),
+    );
+  });
+
+  it("serves data when X-PAYMENT is valid AND gateway accepts the forwarded payment", async () => {
+    const gatewayFetch = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          success: true,
+          breakdown: {
+            registrationFee: "10000000000000000",
+            dataAccessFee: "1000000000000000",
+            registrationPaid: true,
+          },
+          paidAt: "2026-01-21T10:00:05Z",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", gatewayFetch);
+
+    const app = createX402App();
+    await ingest(app, "instagram.profile", { username: "test" });
+    const paymentHeader = await signedXPayment();
+
+    const res = await getWithPayment(app, "instagram.profile", paymentHeader);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toEqual({ username: "test" });
+    expect(gatewayFetch).toHaveBeenCalledTimes(1);
+    expect(gatewayFetch.mock.calls[0][0]).toBe(
+      "https://gateway.test/v1/escrow/pay",
+    );
+  });
+
+  it("returns 402 with a fresh challenge when gateway rejects with 409 (replay/race)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            success: false,
+            error: "paymentNonce already used",
+          }),
+          { status: 409, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+
+    const app = createX402App();
+    await ingest(app, "instagram.profile", { username: "test" });
+
+    const res = await getWithPayment(
+      app,
+      "instagram.profile",
+      await signedXPayment(),
+    );
+    expect(res.status).toBe(402);
+    const body = await res.json();
+    expect(body.x402Version).toBe(1);
+    expect(body.error).toBe("PAYMENT_REQUIRED");
+  });
+
+  it("relays gateway 402 (insufficient balance) verbatim", async () => {
+    const gatewayErrorBody = {
+      success: false,
+      error: "Insufficient finalized balance for this payment",
+      asset: "0x0000000000000000000000000000000000000000",
+      amount: "11000000000000000",
+      finalizedBalance: "0",
+      alreadyAuthorized: "0",
+      available: "0",
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify(gatewayErrorBody), {
+          status: 402,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+
+    const app = createX402App();
+    await ingest(app, "instagram.profile", { username: "test" });
+
+    const res = await getWithPayment(
+      app,
+      "instagram.profile",
+      await signedXPayment(),
+    );
+    expect(res.status).toBe(402);
+    const body = await res.json();
+    // The relayed gateway body has NO x402Version field — that's the
+    // discriminator builders use to distinguish "insufficient balance"
+    // from "you need to sign a payment".
+    expect(body.x402Version).toBeUndefined();
+    expect(body.error).toContain("Insufficient");
+    expect(body.finalizedBalance).toBe("0");
+  });
+
+  it("returns 402 with a fresh challenge for a malformed X-PAYMENT", async () => {
+    const app = createX402App();
+    await ingest(app, "instagram.profile", { username: "test" });
+
+    const res = await getWithPayment(
+      app,
+      "instagram.profile",
+      "not-base64-???",
+    );
+    expect(res.status).toBe(402);
+    const body = await res.json();
+    expect(body.x402Version).toBe(1);
   });
 });

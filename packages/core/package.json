@@ -119,6 +119,10 @@
     "./test-utils": {
       "types": "./dist/test-utils/index.d.ts",
       "import": "./dist/test-utils/index.js"
+    },
+    "./payment": {
+      "types": "./dist/payment/index.d.ts",
+      "import": "./dist/payment/index.js"
     }
   },
   "scripts": {
@@ -126,7 +130,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "@opendatalabs/vana-sdk": "^3.4.1",
+    "@opendatalabs/vana-sdk": "3.4.1-canary.a244135",
     "minisearch": "^7.2.0",
     "unpdf": "^1.6.2",
     "viem": "^2.48.11",

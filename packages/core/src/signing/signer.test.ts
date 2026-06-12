@@ -8,14 +8,12 @@ import { loadOrCreateServerAccount } from "../../../server/src/keys/server-accou
 import type { GatewayConfig } from "../schemas/server-config.js";
 import { createServerSigner } from "./signer.js";
 import {
-  fileRegistrationDomain,
-  fileDeletionDomain,
   grantRegistrationDomain,
   grantRevocationDomain,
-  FILE_REGISTRATION_TYPES,
-  FILE_DELETION_TYPES,
+  dataRegistryDomain,
   GRANT_REGISTRATION_TYPES,
   GRANT_REVOCATION_TYPES,
+  ADD_DATA_TYPES,
 } from "@opendatalabs/vana-sdk/browser";
 
 const TEST_GATEWAY_CONFIG: GatewayConfig = {
@@ -45,53 +43,6 @@ describe("ServerSigner", () => {
     await rm(tempDir, { recursive: true, force: true });
   });
 
-  describe("signFileRegistration", () => {
-    it("produces a signature recoverable to the server address", async () => {
-      const { account, signer } = setup();
-      const msg = {
-        ownerAddress:
-          "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as `0x${string}`,
-        url: "https://storage.example.com/file.json",
-        schemaId: ("0x" + "ab".repeat(32)) as `0x${string}`,
-      };
-
-      const signature = await signer.signFileRegistration(msg);
-      expect(signature).toMatch(/^0x[0-9a-fA-F]+$/);
-
-      const recovered = await recoverTypedDataAddress({
-        domain: fileRegistrationDomain(TEST_GATEWAY_CONFIG),
-        types: FILE_REGISTRATION_TYPES,
-        primaryType: "FileRegistration",
-        message: msg,
-        signature,
-      });
-      expect(recovered.toLowerCase()).toBe(account.address.toLowerCase());
-    });
-  });
-
-  describe("signFileDeletion", () => {
-    it("produces a signature recoverable to the server address", async () => {
-      const { account, signer } = setup();
-      const msg = {
-        ownerAddress:
-          "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as `0x${string}`,
-        fileId: ("0x" + "dd".repeat(32)) as `0x${string}`,
-      };
-
-      const signature = await signer.signFileDeletion(msg);
-      expect(signature).toMatch(/^0x[0-9a-fA-F]+$/);
-
-      const recovered = await recoverTypedDataAddress({
-        domain: fileDeletionDomain(TEST_GATEWAY_CONFIG),
-        types: FILE_DELETION_TYPES,
-        primaryType: "FileDeletion",
-        message: msg,
-        signature,
-      });
-      expect(recovered.toLowerCase()).toBe(account.address.toLowerCase());
-    });
-  });
-
   describe("signGrantRegistration", () => {
     it("produces a signature recoverable to the server address", async () => {
       const { account, signer } = setup();
@@ -99,11 +50,9 @@ describe("ServerSigner", () => {
         grantorAddress:
           "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as `0x${string}`,
         granteeId: ("0x" + "bb".repeat(32)) as `0x${string}`,
-        grant: JSON.stringify({
-          scopes: ["instagram.*"],
-          expiresAt: 9999999999,
-        }),
-        fileIds: [1n, 2n, 3n],
+        scopes: ["instagram.*"],
+        grantVersion: 1n,
+        expiresAt: 9999999999n,
       };
 
       const signature = await signer.signGrantRegistration(msg);
@@ -113,10 +62,7 @@ describe("ServerSigner", () => {
         domain: grantRegistrationDomain(TEST_GATEWAY_CONFIG),
         types: GRANT_REGISTRATION_TYPES,
         primaryType: "GrantRegistration",
-        message: {
-          ...msg,
-          fileIds: msg.fileIds.map((id) => id),
-        },
+        message: msg,
         signature,
       });
       expect(recovered.toLowerCase()).toBe(account.address.toLowerCase());
@@ -130,6 +76,10 @@ describe("ServerSigner", () => {
         grantorAddress:
           "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as `0x${string}`,
         grantId: ("0x" + "cc".repeat(32)) as `0x${string}`,
+        // Canary requires grantVersion on revocation — shares the
+        // monotonic nonce with registration so an old revocation sig
+        // can't survive a revoke -> re-register cycle.
+        grantVersion: 2n,
       };
 
       const signature = await signer.signGrantRevocation(msg);
@@ -146,17 +96,45 @@ describe("ServerSigner", () => {
     });
   });
 
-  it("all three signing methods are deterministic", async () => {
+  describe("signAddData", () => {
+    it("produces a signature recoverable to the server address", async () => {
+      const { account, signer } = setup();
+      const msg = {
+        ownerAddress:
+          "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as `0x${string}`,
+        scope: "instagram.profile",
+        dataHash: ("0x" + "11".repeat(32)) as `0x${string}`,
+        metadataHash: ("0x" + "22".repeat(32)) as `0x${string}`,
+        expectedVersion: 1n,
+      };
+
+      const signature = await signer.signAddData(msg);
+      expect(signature).toMatch(/^0x[0-9a-fA-F]+$/);
+
+      const recovered = await recoverTypedDataAddress({
+        domain: dataRegistryDomain(TEST_GATEWAY_CONFIG),
+        types: ADD_DATA_TYPES,
+        primaryType: "AddData",
+        message: msg,
+        signature,
+      });
+      expect(recovered.toLowerCase()).toBe(account.address.toLowerCase());
+    });
+  });
+
+  it("signing is deterministic", async () => {
     const { signer } = setup();
-    const fileMsg = {
+    const addDataMsg = {
       ownerAddress:
         "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as `0x${string}`,
-      url: "https://example.com/file.json",
-      schemaId: ("0x" + "ab".repeat(32)) as `0x${string}`,
+      scope: "instagram.profile",
+      dataHash: ("0x" + "11".repeat(32)) as `0x${string}`,
+      metadataHash: ("0x" + "22".repeat(32)) as `0x${string}`,
+      expectedVersion: 1n,
     };
 
-    const sig1 = await signer.signFileRegistration(fileMsg);
-    const sig2 = await signer.signFileRegistration(fileMsg);
+    const sig1 = await signer.signAddData(addDataMsg);
+    const sig2 = await signer.signAddData(addDataMsg);
     expect(sig1).toBe(sig2);
   });
 });
