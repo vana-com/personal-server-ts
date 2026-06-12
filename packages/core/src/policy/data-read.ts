@@ -1,10 +1,6 @@
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
+import { scopeCoveredByGrant } from "@opendatalabs/vana-sdk/browser";
 import {
-  parseGrantRegistrationPayload,
-  scopeCoveredByGrant,
-} from "@opendatalabs/vana-sdk/browser";
-import {
-  FeeRequiredError,
   GrantExpiredError,
   GrantRequiredError,
   GrantRevokedError,
@@ -14,9 +10,7 @@ import {
   UnregisteredBuilderError,
 } from "../errors/catalog.js";
 import {
-  allowAllFeeVerifier,
   type AuthSessionVerifierPort,
-  type FeeVerifierPort,
   type GrantVerifierPort,
   type RuntimeAvailabilityPort,
 } from "../ports/index.js";
@@ -25,13 +19,18 @@ export interface DataReadPolicyInput {
   signer: `0x${string}`;
   grantId?: string;
   requestedScope: string;
+  // fileId is retained on the input shape for backwards-compat with callers
+  // that pass it; the canary policy no longer enforces fileId pinning.
   fileId?: string;
 }
 
 export interface DataReadPolicyPorts {
   authSessionVerifier: AuthSessionVerifierPort;
   grantVerifier: GrantVerifierPort;
-  feeVerifier?: FeeVerifierPort;
+  // feeVerifier is gone — payment is enforced by the X402 layer on
+  // GET /v1/data/:scope, which forwards the builder's signed payment to
+  // gateway.payForOperation. The policy no longer gates reads on
+  // grant.paymentStatus.
   runtimeAvailability?: RuntimeAvailabilityPort;
 }
 
@@ -67,62 +66,37 @@ export async function verifyDataReadPolicy(
     throw new GrantRevokedError({ grantId: grant.id });
   }
 
-  // DP RPC is migrating to a flat grant shape: fields once carried inside the
-  // signed `grant` payload (scopes, expiresAt) are returned as top-level
-  // columns, and `fileIds` is going away. Read either shape — prefer flat,
-  // fall back to parsing the legacy signed payload — until the migration
-  // lands across consumers. See vana-com/data-gateway#17.
-  const flat = grant as Omit<GatewayGrantResponse, "grant" | "fileIds"> & {
-    grant?: string;
-    fileIds?: string[];
-    scopes?: string[];
-    expiresAt?: number;
-  };
-  const legacyPayload = flat.grant
-    ? parseGrantRegistrationPayload(flat.grant)
-    : null;
-
-  const scopes = flat.scopes ?? legacyPayload?.scopes;
-  if (!scopes) {
+  // Canary GatewayGrantResponse is flat — scopes is a top-level string[]
+  // and expiresAt is a decimal-string uint256 (`null` = perpetual). The
+  // legacy signed `grant` JSON blob and `fileIds` pinning are gone.
+  if (!grant.scopes || grant.scopes.length === 0) {
     throw new ScopeMismatchError({
       requestedScope: input.requestedScope,
       reason: "Grant has no scopes",
     });
   }
 
-  const expiresAt = flat.expiresAt ?? legacyPayload?.expiresAt;
-  if (expiresAt !== undefined && expiresAt > 0) {
-    const now = Math.floor(Date.now() / 1000);
-    if (expiresAt < now) {
-      throw new GrantExpiredError({ expiresAt });
+  if (grant.expiresAt !== null && grant.expiresAt !== undefined) {
+    // Canary surfaces the wire-format string; "0" is the sentinel for
+    // perpetual grants and the gateway returns `expired: false` for them,
+    // but we re-check locally against the system clock so the policy
+    // doesn't trust a stale `expired` snapshot.
+    const expiresAtSec = BigInt(grant.expiresAt);
+    if (expiresAtSec > 0n) {
+      const nowSec = BigInt(Math.floor(Date.now() / 1000));
+      if (expiresAtSec < nowSec) {
+        throw new GrantExpiredError({
+          expiresAt: Number(expiresAtSec),
+        });
+      }
     }
   }
 
-  if (!scopeCoveredByGrant(input.requestedScope, scopes)) {
+  if (!scopeCoveredByGrant(input.requestedScope, grant.scopes)) {
     throw new ScopeMismatchError({
       requestedScope: input.requestedScope,
-      grantedScopes: scopes,
+      grantedScopes: grant.scopes,
     });
-  }
-
-  // fileIds restriction is legacy-only; the flat shape has no per-grant file
-  // pinning. Enforce only when the field is present.
-  const fileIds = flat.fileIds;
-  if (fileIds && fileIds.length > 0) {
-    if (!input.fileId) {
-      throw new ScopeMismatchError({
-        requestedScope: input.requestedScope,
-        reason: "Grant is restricted to fileIds; request must include fileId",
-        grantedFileIds: fileIds,
-      });
-    }
-    if (!fileIds.includes(input.fileId)) {
-      throw new ScopeMismatchError({
-        requestedScope: input.requestedScope,
-        requestedFileId: input.fileId,
-        grantedFileIds: fileIds,
-      });
-    }
   }
 
   if (builder.id.toLowerCase() !== grant.granteeId.toLowerCase()) {
@@ -130,19 +104,6 @@ export async function verifyDataReadPolicy(
       reason: "Request signer is not the grant builder",
       expected: grant.granteeId,
       actual: input.signer,
-    });
-  }
-
-  const feeVerifier = ports.feeVerifier ?? allowAllFeeVerifier;
-  const fee = await feeVerifier.verifyDataReadFee({
-    grantId: grant.id,
-    builderAddress: input.signer,
-    requestedScope: input.requestedScope,
-  });
-  if (!fee.ok) {
-    throw new FeeRequiredError({
-      grantId: grant.id,
-      reason: fee.reason ?? "Fee verification failed",
     });
   }
 

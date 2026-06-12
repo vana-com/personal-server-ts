@@ -184,7 +184,11 @@ describe("createPsLiteRuntime", () => {
     expect(body.error.errorCode).toBe("MISSING_AUTH");
   });
 
-  it("requires a gateway schema resolver for owner writes", async () => {
+  it("ingests successfully even without a gateway schema resolver", async () => {
+    // Schema is best-effort in the canary flow. When the runtime is wired
+    // without a gateway (no resolver), ingestion proceeds with schemaId
+    // unset rather than failing closed. Sync-worker registerFile (if
+    // enabled) would surface its own error there.
     const storage = createMemoryPsLiteStorage();
     const runtime = createTestRuntime({
       storage,
@@ -207,13 +211,16 @@ describe("createPsLiteRuntime", () => {
       }),
     );
 
-    expect(res.status).toBe(500);
-    const body = await res.json();
-    expect(body.error.errorCode).toBe("SERVER_NOT_CONFIGURED");
-    expect(storage.listScopes({ limit: 20, offset: 0 }).total).toBe(0);
+    expect(res.status).toBe(201);
+    expect(storage.listScopes({ limit: 20, offset: 0 }).total).toBe(1);
   });
 
-  it("rejects owner writes when no schema is registered for the scope", async () => {
+  it("accepts owner writes even when no schema is registered for the scope", async () => {
+    // Schema is optional in the canary flow — registerDataPoint (DPv2)
+    // doesn't take schemaId, and X402 reads don't consult it. The ingest
+    // path proceeds with schemaId=undefined; only the sync worker's
+    // legacy registerFile call would later need one (and surface its own
+    // error there).
     const storage = createMemoryPsLiteStorage();
     const runtime = createTestRuntime({
       storage,
@@ -241,18 +248,14 @@ describe("createPsLiteRuntime", () => {
       }),
     );
 
-    expect(res.status).toBe(400);
-    await expect(res.json()).resolves.toEqual({
-      error: "NO_SCHEMA",
-      message: "No schema registered for scope: instagram.profile",
-    });
-    expect(storage.listScopes({ limit: 20, offset: 0 }).total).toBe(0);
+    expect(res.status).toBe(201);
+    expect(storage.listScopes({ limit: 20, offset: 0 }).total).toBe(1);
   });
 
-  it("auto-registers a no-schema for binary uploads to a novel scope", async () => {
-    // Regression: PS-Lite must register a "no-schema" for binary scopes that
-    // lack one (like the Node server). Without the wired registrar the sync
-    // upload worker later fails with "No schema found for scope".
+  it("ingests binary uploads schemaless on DPv2 (no no-schema registration)", async () => {
+    // DPv2 data points are scope-addressed and carry no schemaId, so binary
+    // uploads to a novel scope must NOT register a "no schema" — the upload
+    // worker no longer needs one.
     const signSchemaRegistration = vi.fn().mockResolvedValue("0xschemasig");
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ data: { schemaId: "0xnoschema" } }), {
@@ -277,7 +280,6 @@ describe("createPsLiteRuntime", () => {
         },
         serverSigner: {
           address: "0x1111111111111111111111111111111111111111",
-          signFileRegistration: vi.fn(),
           signGrantRegistration: vi.fn(),
           signSchemaRegistration,
         },
@@ -297,13 +299,10 @@ describe("createPsLiteRuntime", () => {
       );
 
       expect(res.status).toBe(201);
-      expect(signSchemaRegistration).toHaveBeenCalledTimes(1);
-      expect(signSchemaRegistration.mock.calls[0][0]).toMatchObject({
-        scope: "dexa.scan",
-      });
-      expect(fetchMock).toHaveBeenCalledWith(
+      expect(signSchemaRegistration).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalledWith(
         "https://gw.test/v1/schemas",
-        expect.objectContaining({ method: "POST" }),
+        expect.anything(),
       );
     } finally {
       fetchMock.mockRestore();
@@ -730,15 +729,27 @@ describe("createPsLiteRuntime", () => {
                     id: grantId,
                     grantorAddress: owner.address,
                     granteeId: "builder-1",
-                    grant: JSON.stringify({
-                      scopes: ["instagram.*"],
-                      expiresAt: Math.floor(Date.now() / 1000) + 3600,
-                    }),
-                    fileIds: [],
+                    scopes: ["instagram.*"],
                     status: "confirmed",
                     addedAt: "2026-05-08T00:00:00.000Z",
+                    expiresAt: String(Math.floor(Date.now() / 1000) + 3600),
+                    expired: false,
                     revokedAt: null,
                     revocationSignature: null,
+                    paymentStatus: "paid",
+                    paidAt: "2026-05-08T00:00:05.000Z",
+                    paidBy: owner.address,
+                    grantVersion: "1",
+                    settleTxHash: null,
+                    settleSubmittedAt: null,
+                    revocationTxHash: null,
+                    revocationSubmittedAt: null,
+                    fee: {
+                      asset: "0x0000000000000000000000000000000000000000",
+                      registrationFee: "0",
+                      dataAccessFee: "0",
+                      totalDue: "0",
+                    },
                   }
                 : null;
             },

@@ -21,10 +21,21 @@ export const DEFAULTS = {
     url: "https://data-gateway-env-dev-opendatalabs.vercel.app",
     chainId: 14800,
     contracts: {
-      dataRegistry: "0x8C8788f98385F6ba1adD4234e551ABba0f82Cb7C",
-      dataPortabilityPermissions: "0xD54523048AdD05b4d734aFaE7C68324Ebb7373eF",
-      dataPortabilityServer: "0x1483B1F634DBA75AeaE60da7f01A679aabd5ee2c",
+      // DataRegistryV2 — addData, recordDataAccess
+      dataRegistry: "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+      // DataPortabilityPermissionsV2 — grant register/revoke
+      dataPortabilityPermissions: "0x4d3FA76064D88e0454cFc4CaD7e5FeC3e3124011",
+      // DataPortabilityServersV2 — server registration / trust check
+      dataPortabilityServer: "0xCae2CE0e9caa6643ed28186cF57bd40Bd9E17Eab",
+      // DataPortabilityGrantees (v1 retained)
       dataPortabilityGrantees: "0x8325C0A0948483EdA023A1A2Fd895e62C5131234",
+      // DataPortabilityEscrow — verifyingContract for the EIP-712 domain
+      // backing /v1/escrow/pay (X402 payment validation).
+      dataPortabilityEscrow: "0x07d7769081adc3a3DBe91f5E4B98E9A5a6B292e3",
+      // FeeRegistry — declared for SDK-type compatibility. The personal
+      // server doesn't call FeeRegistry directly; fees are read off
+      // gateway.getGrant().fee, which the gateway re-resolves per request.
+      feeRegistry: "0xb4FA18443E0FA6cdC0280D20b8cCDB2377D13Bf2",
       // Schema registration (POST /v1/schemas) is signed against the Data
       // Refiner Registry contract — distinct from the contracts above. The
       // server config loader populates this from GATEWAY_DATA_REFINER_REGISTRY;
@@ -110,6 +121,14 @@ export const ServerConfigSchema = z.object({
             .string()
             .startsWith("0x")
             .default(DEFAULTS.gateway.contracts.dataPortabilityGrantees),
+          dataPortabilityEscrow: z
+            .string()
+            .startsWith("0x")
+            .default(DEFAULTS.gateway.contracts.dataPortabilityEscrow),
+          feeRegistry: z
+            .string()
+            .startsWith("0x")
+            .default(DEFAULTS.gateway.contracts.feeRegistry),
           // Optional: only required for schema registration (POST /v1/schemas).
           // Empty string when unset — the schema registrar errors clearly if
           // it is asked to register while this is missing.
@@ -165,6 +184,11 @@ export type GatewayConfig = {
     dataPortabilityPermissions: string;
     dataPortabilityServer: string;
     dataPortabilityGrantees: string;
+    // verifyingContract for the EIP-712 domain backing /v1/escrow/pay.
+    dataPortabilityEscrow: string;
+    // Required by the SDK's DataPortabilityContracts type for structural
+    // compatibility; not invoked directly from the personal server.
+    feeRegistry: string;
     /** Verifying contract for SchemaRegistration EIP-712. Empty when unset. */
     dataRefinerRegistry?: string;
   };

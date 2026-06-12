@@ -8,6 +8,12 @@ import {
 } from "@opendatalabs/personal-server-ts-core/auth";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { TokenStore } from "../token-store.js";
+// Ambient module augmentation that types `c.get("authMechanism")` etc. —
+// must be in the TS module graph so the augmentation takes effect. The
+// previous reach-through (data-read-policy.ts) was deleted in the X402
+// migration; the web3-auth middleware is the most natural new anchor
+// since it's the one writing these context vars in the first place.
+import "../hono-context.js";
 
 export { mapSdkAuthError };
 export type { AuthMechanism, RequestAuth };

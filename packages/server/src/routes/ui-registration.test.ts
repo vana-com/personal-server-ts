@@ -5,7 +5,7 @@ import type * as VanaSdkNode from "@opendatalabs/vana-sdk/node";
 
 const gatewayMocks = vi.hoisted(() => ({
   createGatewayClient: vi.fn(),
-  getFile: vi.fn(),
+  getDataPoint: vi.fn(),
   getServer: vi.fn(),
   registerServer: vi.fn(),
 }));
@@ -36,7 +36,7 @@ describe("uiRegistrationRoutes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     gatewayMocks.createGatewayClient.mockReturnValue({
-      getFile: gatewayMocks.getFile,
+      getDataPoint: gatewayMocks.getDataPoint,
       getServer: gatewayMocks.getServer,
       registerServer: gatewayMocks.registerServer,
     });
@@ -183,8 +183,8 @@ describe("uiRegistrationRoutes", () => {
   });
 
   it("checks file ids against the gateway", async () => {
-    gatewayMocks.getFile
-      .mockResolvedValueOnce({ fileId: "file-1" })
+    gatewayMocks.getDataPoint
+      .mockResolvedValueOnce({ id: "file-1" })
       .mockResolvedValueOnce(null);
     const app = uiRegistrationRoutes({ devToken });
 

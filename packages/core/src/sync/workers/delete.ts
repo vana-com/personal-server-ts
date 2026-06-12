@@ -22,83 +22,50 @@ export interface DeleteScopeRemoteResult {
   errors: Array<{ fileId: string | null; message: string }>;
 }
 
-// Page size for draining all versions of a scope from the local index (no silent truncation).
-const PAGE_SIZE = 1000;
-
 /**
- * Propagate a scope deletion to the authoritative stores, run BEFORE the local index/blobs are
- * removed. For each synced version (fileId != null):
- *   1. capture the storage URL from the gateway file record (the local index doesn't persist it);
- *   2. de-register the file at the gateway with an owner-signed FileDeletion (soft-delete /
- *      availability=deleted), so sync stops re-listing it;
- *   3. hard-delete the ciphertext blob (R2) — the actual data destruction.
+ * Propagate a scope deletion to the authoritative remote stores.
  *
- * De-register BEFORE deleting the blob on purpose: the worst partial failure is then an orphaned but
- * *unlisted* blob (recoverable by GC), never a still-listed file with a missing blob — the latter
- * would make the download worker throw and wedge the sync cursor indefinitely.
+ * NOT SUPPORTED on the DPv2 (DataPoint) gateway: there is no data-point
+ * de-registration / deletion endpoint, and the DataPointRecord listing carries
+ * no soft-delete (`deletedAt`) flag. Under the legacy file model this worker
+ * de-registered each file then hard-deleted its blob; that path is gone with
+ * `gateway.getFile` / `gateway.deleteFile` / `signFileDeletion`.
  *
- * Best-effort and idempotent: all versions are paginated (no truncation), per-file failures are
- * collected not thrown so the caller can still complete the local delete, the gateway treats 409 as
- * success, and a missing blob/record is a no-op.
+ * Deleting the ciphertext blob alone would be unsafe: the data point would
+ * stay listed, so any server syncing it would 404 on download and wedge its
+ * sync cursor. So this is a no-op that logs the limitation. Local deletion
+ * (index rows + on-disk blobs) still happens via the storage port's
+ * `deleteScope`, independent of this worker — only the *remote* copy is left
+ * in place until DPv2 grows a deletion API.
  */
 export async function deleteScopeRemote(
   deps: DeleteWorkerDeps,
   scope: string,
 ): Promise<DeleteScopeRemoteResult> {
-  const { storage, storageAdapter, gateway, signer, serverOwner, logger } =
-    deps;
-  const result: DeleteScopeRemoteResult = {
+  const { storage, logger } = deps;
+
+  // Count the synced versions we *would* have de-registered, for the log only.
+  let syncedVersions = 0;
+  const PAGE_SIZE = 1000;
+  for (let offset = 0; ; offset += PAGE_SIZE) {
+    const entries = storage.listVersions(scope, { limit: PAGE_SIZE, offset });
+    syncedVersions += entries.filter((e) => e.dataPointId !== null).length;
+    if (entries.length < PAGE_SIZE) break;
+  }
+
+  if (syncedVersions > 0) {
+    logger.warn(
+      { scope, syncedVersions },
+      "Remote scope deletion is not supported on the DPv2 gateway (no " +
+        "de-registration endpoint); local data was removed but the remote " +
+        "data point(s) and ciphertext blob(s) remain",
+    );
+  }
+
+  return {
     scope,
     filesDeregistered: 0,
     blobsDeleted: 0,
     errors: [],
   };
-
-  for (let offset = 0; ; offset += PAGE_SIZE) {
-    const entries = storage.listVersions(scope, { limit: PAGE_SIZE, offset });
-    for (const entry of entries) {
-      // Local-only versions (never uploaded) have no remote state to clean up.
-      if (!entry.fileId) continue;
-      const fileId = entry.fileId;
-      try {
-        // 1. Capture the storage URL before de-registering (read-only; works regardless of state).
-        const record = await gateway.getFile(fileId);
-        // 2. De-register first → hides the file from the default list, so a subsequent blob-delete
-        //    failure can't strand a listed-but-blobless file (which would wedge the cursor).
-        const signature = await signer.signFileDeletion({
-          ownerAddress: serverOwner as `0x${string}`,
-          fileId: fileId as `0x${string}`,
-        });
-        await gateway.deleteFile({
-          fileId,
-          ownerAddress: serverOwner,
-          signature,
-        });
-        result.filesDeregistered += 1;
-        // 3. Destroy the ciphertext blob.
-        if (record?.url) {
-          const deleted = await storageAdapter.delete(record.url);
-          if (deleted) result.blobsDeleted += 1;
-        }
-      } catch (err) {
-        result.errors.push({ fileId, message: (err as Error).message });
-        logger.warn(
-          { scope, fileId, error: (err as Error).message },
-          "Remote delete failed for file (continuing)",
-        );
-      }
-    }
-    if (entries.length < PAGE_SIZE) break;
-  }
-
-  logger.info(
-    {
-      scope,
-      filesDeregistered: result.filesDeregistered,
-      blobsDeleted: result.blobsDeleted,
-      errors: result.errors.length,
-    },
-    "Remote scope deletion complete",
-  );
-  return result;
 }

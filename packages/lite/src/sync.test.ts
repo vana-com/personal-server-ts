@@ -23,7 +23,7 @@ describe("PS Lite sync", () => {
     vi.unstubAllEnvs();
   });
 
-  it("uploads unsynced browser-local data and persists the file id", async () => {
+  it("uploads unsynced browser-local data and persists the data-point id", async () => {
     const storage = createMemoryPsLiteStorage();
     const envelope = createDataFileEnvelope(
       "instagram.profile",
@@ -57,8 +57,15 @@ describe("PS Lite sync", () => {
         addedAt: "2026-05-08T00:00:00.000Z",
       }),
       registerServer: vi.fn().mockResolvedValue({ alreadyRegistered: false }),
-      registerFile: vi.fn().mockResolvedValue({ fileId: "file-browser-1" }),
-      listFilesSince: vi.fn().mockResolvedValue({ files: [], cursor: null }),
+      // DPv2 upload worker registers the data point (the synced marker) after
+      // uploading the version-keyed blob. Mock returns the dataPointId.
+      registerDataPoint: vi.fn().mockResolvedValue({
+        dataPointId: "0xdp-browser-1",
+        expectedVersion: "1",
+      }),
+      listDataPointsByOwner: vi
+        .fn()
+        .mockResolvedValue({ dataPoints: [], cursor: null }),
       isRegisteredBuilder: vi.fn().mockResolvedValue(false),
       getBuilder: vi.fn().mockResolvedValue(null),
       getGrant: vi.fn().mockResolvedValue(null),
@@ -71,7 +78,7 @@ describe("PS Lite sync", () => {
         serverUrl: "https://browser.example",
         addedAt: "2026-05-08T00:00:00.000Z",
       }),
-      getFile: vi.fn().mockResolvedValue(null),
+      getDataPoint: vi.fn().mockResolvedValue(null),
       getSchema: vi.fn().mockResolvedValue(null),
       createGrant: vi.fn().mockResolvedValue({}),
       revokeGrant: vi.fn().mockResolvedValue(undefined),
@@ -79,8 +86,9 @@ describe("PS Lite sync", () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
         JSON.stringify({
-          key: `${owner}/instagram.profile/2026-05-08T00:00:00.000Z`,
-          url: `https://storage.vana.com/v1/blobs/${owner}/instagram.profile/2026-05-08T00:00:00.000Z`,
+          // Blobs are version-keyed `{scope}/{version}` (version 1 here).
+          key: `${owner}/instagram.profile/1`,
+          url: `https://storage.vana.com/v1/blobs/${owner}/instagram.profile/1`,
           etag: "etag-browser-1",
           size: 256,
         }),
@@ -105,17 +113,18 @@ describe("PS Lite sync", () => {
     await syncManager.stop();
 
     expect(storage.findUnsynced()).toEqual([]);
-    expect(storage.findByFileId("file-browser-1")).toMatchObject({
+    expect(storage.findByDataPointId("0xdp-browser-1")).toMatchObject({
       scope: "instagram.profile",
-      fileId: "file-browser-1",
+      dataPointId: "0xdp-browser-1",
     });
     expect(fetchMock).toHaveBeenCalledWith(
-      `https://storage.vana.com/v1/blobs/${owner}/instagram.profile/2026-05-08T00%3A00%3A00.000Z`,
+      `https://storage.vana.com/v1/blobs/${owner}/instagram.profile/1`,
       expect.objectContaining({ method: "PUT" }),
     );
-    expect(gateway.registerFile).toHaveBeenCalledWith(
+    expect(gateway.registerDataPoint).toHaveBeenCalledWith(
       expect.objectContaining({
-        schemaId: SCHEMA_ID,
+        scope: "instagram.profile",
+        expectedVersion: "1",
       }),
     );
   });

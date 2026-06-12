@@ -1,9 +1,10 @@
 import type {
   Builder,
   DataFileEnvelope,
-  FileListResult,
-  FileRecord,
+  DataPointListResult,
+  DataPointRecord,
   GatewayGrantResponse,
+  ListDataPointsOptions,
   Schema,
   ServerInfo,
 } from "@opendatalabs/vana-sdk/browser";
@@ -24,8 +25,12 @@ export interface ProtocolGatewayPort {
   getGrant(grantId: string): Promise<GatewayGrantResponse | null>;
   getSchemaForScope(scope: string): Promise<Schema | null>;
   getServer(address: string): Promise<ServerInfo | null>;
-  getFile(fileId: string): Promise<FileRecord | null>;
-  listFilesSince(owner: string, cursor: string | null): Promise<FileListResult>;
+  getDataPoint(dataPointId: string): Promise<DataPointRecord | null>;
+  listDataPointsByOwner(
+    owner: string,
+    cursor: string | null,
+    options?: ListDataPointsOptions,
+  ): Promise<DataPointListResult>;
 }
 
 export interface GrantVerifierPort {
@@ -56,8 +61,12 @@ export interface SchemaRegistrarPort {
 }
 
 export interface FileRegistrySyncRegistryPort {
-  getFile(fileId: string): Promise<FileRecord | null>;
-  listFilesSince(owner: string, cursor: string | null): Promise<FileListResult>;
+  getDataPoint(dataPointId: string): Promise<DataPointRecord | null>;
+  listDataPointsByOwner(
+    owner: string,
+    cursor: string | null,
+    options?: ListDataPointsOptions,
+  ): Promise<DataPointListResult>;
 }
 
 export interface PlatformCryptoPort {
@@ -97,6 +106,8 @@ export interface DataStoragePort extends RuntimeStoragePort {
   countVersions(scope: string): number;
   findEntry(lookup: DataStorageEntryLookup): IndexEntry | undefined;
   findByFileId(fileId: string): IndexEntry | undefined;
+  /** Dedup lookup for the download worker: find an entry by its DPv2 data-point id. */
+  findByDataPointId(dataPointId: string): IndexEntry | undefined;
   findUnsynced(options?: { limit?: number }): IndexEntry[];
   readEnvelope(scope: string, collectedAt: string): Promise<DataFileEnvelope>;
   readEnvelopePreview?(
@@ -126,6 +137,13 @@ export interface DataStoragePort extends RuntimeStoragePort {
   ): Promise<void>;
   insertEntry(entry: NewIndexEntry): IndexEntry | Promise<IndexEntry>;
   updateFileId(path: string, fileId: string): boolean | Promise<boolean>;
+  /** Highest stored DPv2 `version` for a scope; 0 if none. */
+  findLatestVersionByScope(scope: string): number | Promise<number>;
+  /** Stamps the DPv2 dataPointId on an entry after registerDataPoint. */
+  updateDataPointId(
+    path: string,
+    dataPointId: string,
+  ): boolean | Promise<boolean>;
   deleteScope(scope: string): Promise<number>;
   /**
    * Delete a single version (index entry + its local blob) by its gateway fileId.
@@ -139,24 +157,8 @@ export interface RuntimeAvailabilityPort {
   isAvailable(): boolean | Promise<boolean>;
 }
 
-export interface FeeVerificationInput {
-  grantId: string;
-  builderAddress: `0x${string}`;
-  requestedScope: string;
-}
-
-export type FeeVerificationResult =
-  | { ok: true }
-  | { ok: false; reason?: string };
-
-export interface FeeVerifierPort {
-  verifyDataReadFee(
-    input: FeeVerificationInput,
-  ): Promise<FeeVerificationResult>;
-}
-
-export const allowAllFeeVerifier: FeeVerifierPort = {
-  async verifyDataReadFee() {
-    return { ok: true };
-  },
-};
+// FeeVerifier was the pre-X402 hook that gated reads on grant.paymentStatus
+// via a side-channel call to the gateway. Replaced by the X402 layer on
+// GET /v1/data/:scope (see packages/core/src/payment/x402.ts), which
+// forwards the builder's signed payment to gateway.payForOperation as part
+// of the read response cycle. Reads no longer block on prior paymentStatus.

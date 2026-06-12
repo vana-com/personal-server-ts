@@ -8,16 +8,20 @@
  *      (sync enabled). Registering before boot avoids a transient "unregistered"
  *      sync warning.
  *   3. Download the sample DEXA PDF and POST it to /v1/data/{scope} as binary.
- *      The scope has no schema, so the server auto-registers a "no-schema" one.
- *   4. Trigger sync → the file is encrypted, uploaded to storage, and
- *      registered on-chain (registerFile). Poll until it gets a fileId.
- *   5. Discover the owner's scopes from the gateway: GET /v1/files?user=… then
- *      GET /v1/schemas/<schemaId> for each → scope. Confirm the file shows up.
+ *      Unstructured data is ingested schemaless — DPv2 data points are
+ *      scope-addressed and carry no schemaId.
+ *   4. Trigger sync → the file is encrypted, uploaded to storage (version-keyed),
+ *      and registered on-chain (registerDataPoint). Poll until it gets a
+ *      dataPointId.
+ *   5. Discover the owner's scopes from the gateway via listDataPointsByOwner
+ *      (DataPointRecords carry scope directly). Confirm the scope shows up.
  *   6. Boot a SECOND registered server for the same owner; its sync downloads +
- *      decrypts the file, then serves the raw bytes back — verify they match.
+ *      decrypts the data point, then serves the raw bytes back — verify match.
  *
- * Run:
- *   npx tsx scripts/e2e-register-pdf.ts
+ * Run (needs a gateway + storage that point at each other — see e2e:sync notes;
+ * the public storage-dev is wired to a stale gateway, so run vana-storage
+ * locally against the same GATEWAY_URL and point STORAGE_API_URL at it):
+ *   GATEWAY_URL=… STORAGE_API_URL=http://localhost:8787 npm run e2e:register-pdf
  *
  * Optional env overrides (also read from .env.local):
  *   VANA_WEB_PRIVATE_KEY            (owner private key; else a fresh one is made)
@@ -37,7 +41,6 @@
  *   GATEWAY_DP_SERVER               (server registration verifying contract)
  *   GATEWAY_DP_PERMISSIONS          (grant registration verifying contract)
  *   GATEWAY_DP_GRANTEES             (builder registration verifying contract)
- *   GATEWAY_DATA_REFINER_REGISTRY   (schema registration verifying contract)
  */
 
 import { mkdtemp, rm } from "node:fs/promises";
@@ -46,7 +49,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
-  type FileRecord,
+  type DataPointRecord,
   MASTER_KEY_MESSAGE,
   serverRegistrationDomain,
   SERVER_REGISTRATION_TYPES,
@@ -96,10 +99,8 @@ function previewEnvelope(envelope: Record<string, unknown>): void {
     delete data.content;
   }
   console.log("  envelope:");
-  console.log(`    $schema:     ${envelope.$schema ?? "(none)"}`);
   console.log(`    version:     ${envelope.version}`);
   console.log(`    scope:       ${envelope.scope}`);
-  console.log(`    schemaId:    ${envelope.schemaId ?? "(none)"}`);
   console.log(`    collectedAt: ${envelope.collectedAt}`);
   console.log("    data:");
   for (const [k, v] of Object.entries(data)) {
@@ -119,7 +120,6 @@ function makeConfig(port: number): ServerConfig {
     dataPortabilityPermissions: process.env.GATEWAY_DP_PERMISSIONS,
     dataPortabilityServer: process.env.GATEWAY_DP_SERVER,
     dataPortabilityGrantees: process.env.GATEWAY_DP_GRANTEES,
-    dataRefinerRegistry: process.env.GATEWAY_DATA_REFINER_REGISTRY,
   };
   const contracts = Object.fromEntries(
     Object.entries(contractEnv).filter(([, v]) => v),
@@ -237,45 +237,29 @@ async function bootRegisteredServer(params: {
 }
 
 /**
- * Discover the scopes a user has data in, from their on-chain files:
- *   GET /v1/files?user=<addr>  → each file's schemaId   (paginated via cursor)
- *   GET /v1/schemas/<schemaId> → schema.scope
- * Returns a map of scope → file count.
+ * Discover the scopes a user has data in, from their on-chain data points:
+ *   listDataPointsByOwner(<addr>) → each record's scope   (paginated via cursor)
+ * DataPointRecords carry `scope` directly, so no schemaId→scope resolution is
+ * needed. Returns a map of scope → data-point count.
  */
 async function gatewayScopesForUser(
   gateway: ServerCtx["gatewayClient"],
   userAddress: string,
 ): Promise<Map<string, number>> {
-  const files: FileRecord[] = [];
+  const dataPoints: DataPointRecord[] = [];
   let cursor: string | null = null;
   for (let page = 0; page < 100; page++) {
-    const result = (await gateway.listFilesSince(userAddress, cursor)) as {
-      cursor: string | null;
-      files: FileRecord[];
-    };
-    files.push(...result.files);
+    const result: { dataPoints: DataPointRecord[]; cursor: string | null } =
+      await gateway.listDataPointsByOwner(userAddress, cursor);
+    dataPoints.push(...result.dataPoints);
     cursor = result.cursor;
     if (!cursor) break;
   }
-  console.log(`  ${files.length} file(s) on the gateway`);
-
-  const schemaIds: string[] = [
-    ...new Set(
-      files.map((f) => f.schemaId).filter((id): id is string => Boolean(id)),
-    ),
-  ];
-  const scopeBySchema = new Map<string, string>();
-  for (const id of schemaIds) {
-    const schema = await gateway.getSchema(id);
-    if (schema) scopeBySchema.set(id, schema.scope);
-  }
+  console.log(`  ${dataPoints.length} data point(s) on the gateway`);
 
   const byScope = new Map<string, number>();
-  for (const f of files) {
-    const scope = !f.schemaId
-      ? "(no schema)"
-      : (scopeBySchema.get(f.schemaId) ?? `(unresolved ${f.schemaId})`);
-    byScope.set(scope, (byScope.get(scope) ?? 0) + 1);
+  for (const dp of dataPoints) {
+    byScope.set(dp.scope, (byScope.get(dp.scope) ?? 0) + 1);
   }
   return byScope;
 }
@@ -316,7 +300,7 @@ async function main() {
       label: "server",
     });
 
-    // 3. Download the PDF and POST it as binary (auto-registers a schema).
+    // 3. Download the PDF and POST it as binary (ingested schemaless).
     log("3/6", `Downloading + posting PDF to scope "${SCOPE}"`);
     const pdfRes = await fetch(PDF_URL);
     if (!pdfRes.ok) {
@@ -352,42 +336,42 @@ async function main() {
     const envelope = (await envRes.json()) as Record<string, unknown>;
     previewEnvelope(envelope);
 
-    const ingested = ctx.indexManager.findLatestByScope(SCOPE);
-
-    // 4. Sync: encrypt → upload to storage → register on-chain. Poll for fileId.
-    log("4/6", "Syncing (upload + on-chain registerFile)");
-    let fileId: string | null = null;
-    for (let attempt = 1; attempt <= 12 && !fileId; attempt++) {
+    // 4. Sync: encrypt → upload to storage → register the DPv2 data point.
+    // Poll for the gateway-assigned dataPointId.
+    log("4/6", "Syncing (upload + on-chain registerDataPoint)");
+    let dataPointId: string | null = null;
+    for (let attempt = 1; attempt <= 12 && !dataPointId; attempt++) {
       await ctx.syncManager.trigger();
       const entry = ctx.indexManager.findLatestByScope(SCOPE);
-      fileId = entry?.fileId ?? null;
+      dataPointId = entry?.dataPointId ?? null;
       const status = ctx.syncManager.getStatus();
       console.log(
-        `  attempt ${attempt}: pending=${status.pendingFiles} blocked=${status.blocked ?? "-"} fileId=${fileId ?? "…"}`,
+        `  attempt ${attempt}: pending=${status.pendingFiles} blocked=${status.blocked ?? "-"} dataPointId=${dataPointId ?? "…"}`,
       );
       if (status.errors.length) {
         console.log(`    errors: ${JSON.stringify(status.errors.slice(-2))}`);
       }
-      if (!fileId) await sleep(2500);
+      if (!dataPointId) await sleep(2500);
     }
 
-    if (!fileId) {
+    if (!dataPointId) {
       throw new Error(
-        "file was not registered on-chain (no fileId after sync). " +
+        "data point was not registered on-chain (no dataPointId after sync). " +
           "Check that the server registration was accepted and storage/gateway are reachable.",
       );
     }
 
-    const record = await ctx.gatewayClient.getFile(fileId).catch(() => null);
+    const record = await ctx.gatewayClient
+      .getDataPoint(dataPointId)
+      .catch(() => null);
     console.log("  registered:");
-    console.log(`    fileId:   ${fileId}`);
-    console.log(`    schemaId: ${ingested?.schemaId ?? "(none)"}`);
-    if (record) console.log(`    url:      ${record.url}`);
+    console.log(`    dataPointId: ${dataPointId}`);
+    if (record) console.log(`    version:     ${record.expectedVersion}`);
 
-    // 5. Discover the owner's scopes from the gateway: GET /v1/files?user=… →
-    // resolve each schemaId via GET /v1/schemas/<id> → scope. Confirms the
-    // freshly registered file is discoverable on the network by user address.
-    log("5/6", "Listing owner scopes from the gateway (files → schemas)");
+    // 5. Discover the owner's scopes from the gateway by listing data points by
+    // owner. Confirms the freshly registered data point is discoverable on the
+    // network by user address.
+    log("5/6", "Listing owner scopes from the gateway (data points)");
     const scopes = await gatewayScopesForUser(
       ctx.gatewayClient,
       ownerAccount.address,
@@ -419,7 +403,7 @@ async function main() {
     let downloaded = false;
     for (let attempt = 1; attempt <= 12 && !downloaded; attempt++) {
       await ctx2.syncManager.trigger();
-      downloaded = Boolean(ctx2.indexManager.findByFileId(fileId));
+      downloaded = Boolean(ctx2.indexManager.findByDataPointId(dataPointId));
       console.log(`  download attempt ${attempt}: found=${downloaded}`);
       if (!downloaded) await sleep(2500);
     }
@@ -461,9 +445,8 @@ async function main() {
     console.log(`   owner:    ${ownerAccount.address}`);
     console.log(`   server:   ${ctx.serverAccount.address}`);
     console.log(`   scope:    ${SCOPE}`);
-    console.log(`   schemaId: ${ingested?.schemaId ?? "(none)"}`);
-    console.log(`   fileId:   ${fileId}`);
-    if (record) console.log(`   url:      ${record.url}`);
+    console.log(`   dataPointId: ${dataPointId}`);
+    if (record) console.log(`   version:     ${record.expectedVersion}`);
     console.log(`   download+decrypt verified: bytes match (sha256 ${rtHash})`);
   } finally {
     if (ctx2) await ctx2.cleanup();
