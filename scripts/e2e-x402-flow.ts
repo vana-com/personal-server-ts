@@ -1147,9 +1147,42 @@ async function main(): Promise<void> {
     logInitial("grant", grantId, "grant ");
     logInitial("server", serverId, "server");
     logInitial("data", dataPointId, "data  ");
+    // Builder registration settles on-chain like server/data registration
+    // (registerGrantee, no fee): the gateway drains it once the builder row is
+    // status='pending' + payment_status='paid' (paid-on-insert when no builder
+    // fee is configured).
+    logInitial("builder", builderId, "builder");
     if (accessRecordId) {
       logInitial("access", accessRecordId, "access");
     }
+
+    // Assert the builder registration actually settled on-chain in this drain
+    // (fresh app wallet ⇒ a new builder row ⇒ drained this pass). The gateway
+    // submits registerGrantee; we don't gate on reconcile-finalization since
+    // the reconcile phase doesn't track builder ops (see watched note below).
+    const builderSettle = settleResult.items.find(
+      (i: SettleItem) =>
+        i.opType === "builder" &&
+        i.opId.toLowerCase() === builderId.toLowerCase(),
+    );
+    if (
+      !builderSettle ||
+      (builderSettle.status !== "confirmed" &&
+        builderSettle.status !== "submitting")
+    ) {
+      throw new Error(
+        `builder registration did not settle on-chain (registerGrantee): ${
+          builderSettle
+            ? `status=${builderSettle.status}`
+            : "not in settle scan"
+        }`,
+      );
+    }
+    const builderTx =
+      "settleTxHash" in builderSettle ? builderSettle.settleTxHash : null;
+    console.log(
+      `    ✓ builder registration settled on-chain (registerGrantee) tx=${builderTx ?? "(pending)"}`,
+    );
 
     // ─── 16. Poll gateway.settle until ALL watched ops finalize ─────
     // Loop until every watched op reaches status="finalized". `reorged`
@@ -1166,6 +1199,12 @@ async function main(): Promise<void> {
       process.env["FINALIZE_TIMEOUT_MS"] ?? 600_000,
     );
     const FINALIZE_POLL_MS = Number(process.env["FINALIZE_POLL_MS"] ?? 10_000);
+    // NOTE: builder is intentionally NOT in the finalize-watched set. The
+    // gateway settle DRAIN submits the registerGrantee tx on-chain (asserted
+    // above from the drain result), but its RECONCILE phase does not track
+    // builder finalization — `reconciled.items` never carries a builder entry,
+    // so it would hang at builder=pending forever. We assert builder settled
+    // (confirmed + tx) at drain time instead.
     const watched: Array<{ label: string; opId: Hex }> = [
       { label: "grant ", opId: grantId },
       { label: "server", opId: serverId },
