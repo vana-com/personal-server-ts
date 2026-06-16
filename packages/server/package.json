@@ -43,7 +43,7 @@
     "dev": "node --watch dist/index.js"
   },
   "dependencies": {
-    "@hono/node-server": "^1.19.13",
+    "@hono/node-server": "^2.0.4",
     "@opendatalabs/personal-server-ts-core": "*",
     "@opendatalabs/personal-server-ts-lite": "*",
     "@opendatalabs/vana-sdk": "^3.4.1",
