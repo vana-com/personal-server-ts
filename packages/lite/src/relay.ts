@@ -24,6 +24,14 @@ export interface PsLiteRelayClientOptions {
   tls?: PsLiteRelayTlsFactory | false;
   logger?: (line: string) => void;
   onStatus?: (status: PsLiteRelayStatus) => void;
+  /** Heartbeat ping cadence (ms). Default 20_000. */
+  heartbeatIntervalMs?: number;
+  /** Force-reconnect if no pong within this window (ms). Default 45_000. */
+  heartbeatTimeoutMs?: number;
+  /** First reconnect backoff delay (ms); doubles up to the max. Default 1_000. */
+  reconnectInitialDelayMs?: number;
+  /** Max reconnect backoff delay (ms). Default 30_000. */
+  reconnectMaxDelayMs?: number;
 }
 
 export type PsLiteRelayStatus =
@@ -126,7 +134,6 @@ export function startPsLiteRelayClient(
 ): PsLiteRelayClient {
   const baseControlUrl = options.controlUrl ?? DEFAULT_CONTROL_URL;
   const controlUrl = psLiteRelayControlUrl(options.sessionId, baseControlUrl);
-  const socket = createSocket(options.webSocketFactory, controlUrl);
   const tls =
     options.tls === undefined
       ? createRustlsPsLiteRelayTlsFactory({
@@ -139,11 +146,22 @@ export function startPsLiteRelayClient(
   const streams = new Map<number, StreamState>();
   const pendingStreamData = new Map<number, Uint8Array[]>();
   const origin = options.origin ?? DEFAULT_ORIGIN;
+  // Resilience knobs. Defaults chosen so a backgrounded mobile tab whose socket
+  // went half-open (no `onclose` ever fires) is detected within ~1 missed
+  // heartbeat and reconnected with capped exponential backoff.
+  const heartbeatIntervalMs = options.heartbeatIntervalMs ?? 20_000;
+  const heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? 45_000;
+  const reconnectInitialDelayMs = options.reconnectInitialDelayMs ?? 1_000;
+  const reconnectMaxDelayMs = options.reconnectMaxDelayMs ?? 30_000;
   let issueToken: string | undefined;
   let closed = false;
-
-  socket.binaryType = "arraybuffer";
-  options.onStatus?.("connecting");
+  // `socket` is reassigned on every (re)connect; all the closures below read it
+  // lazily at call time, so they always act on the current socket.
+  let socket: PsLiteRelayWebSocket;
+  let reconnectAttempts = 0;
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+  let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  let lastPongAt = 0;
 
   const log = (line: string) => options.logger?.(line);
 
@@ -287,6 +305,7 @@ export function startPsLiteRelayClient(
     }
 
     if (message.type === "pong") {
+      lastPongAt = Date.now();
       return;
     }
 
@@ -330,27 +349,97 @@ export function startPsLiteRelayClient(
     processPayload(stream, frame.payload);
   };
 
-  socket.onopen = () => options.onStatus?.("connected");
-  socket.onmessage = (event) => {
-    if (typeof event.data === "string") {
-      handleControl(JSON.parse(event.data) as ControlMessage);
+  const stopHeartbeat = () => {
+    if (heartbeatTimer !== undefined) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = undefined;
+    }
+  };
+
+  const startHeartbeat = () => {
+    stopHeartbeat();
+    lastPongAt = Date.now();
+    heartbeatTimer = setInterval(() => {
+      if (socket.readyState !== socket.OPEN) {
+        return;
+      }
+      // A backgrounded/suspended tab can leave the socket half-open: it never
+      // fires `onclose`, so reconnect-on-close alone never triggers. Detect the
+      // stale socket by missing pongs and force it closed → onclose → reconnect.
+      if (Date.now() - lastPongAt > heartbeatTimeoutMs) {
+        log("relay heartbeat timeout — forcing reconnect");
+        try {
+          socket.close(4000, "heartbeat_timeout");
+        } catch {
+          // Ignore: a socket that can't be closed will be replaced on reconnect.
+        }
+        return;
+      }
+      sendText({ type: "ping" });
+    }, heartbeatIntervalMs);
+  };
+
+  const scheduleReconnect = () => {
+    if (closed || reconnectTimer !== undefined) {
       return;
     }
-    handleDataFrame(event.data);
+    const delay = Math.min(
+      reconnectMaxDelayMs,
+      reconnectInitialDelayMs * 2 ** reconnectAttempts,
+    );
+    reconnectAttempts += 1;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = undefined;
+      connect();
+    }, delay);
   };
-  socket.onclose = () => {
-    streams.forEach((stream) => stream.tls?.close?.());
-    streams.clear();
-    pendingStreamData.clear();
-    options.onStatus?.(closed ? "closed" : "disconnected");
-  };
-  socket.onerror = () => options.onStatus?.("error");
+
+  function connect(): void {
+    issueToken = undefined;
+    socket = createSocket(options.webSocketFactory, controlUrl);
+    socket.binaryType = "arraybuffer";
+    options.onStatus?.("connecting");
+
+    socket.onopen = () => {
+      reconnectAttempts = 0;
+      startHeartbeat();
+      options.onStatus?.("connected");
+    };
+    socket.onmessage = (event) => {
+      if (typeof event.data === "string") {
+        handleControl(JSON.parse(event.data) as ControlMessage);
+        return;
+      }
+      handleDataFrame(event.data);
+    };
+    socket.onclose = () => {
+      stopHeartbeat();
+      streams.forEach((stream) => stream.tls?.close?.());
+      streams.clear();
+      pendingStreamData.clear();
+      issueToken = undefined;
+      if (closed) {
+        options.onStatus?.("closed");
+        return;
+      }
+      options.onStatus?.("disconnected");
+      scheduleReconnect();
+    };
+    socket.onerror = () => options.onStatus?.("error");
+  }
+
+  connect();
 
   return {
     sessionId: options.sessionId,
     url: controlUrl,
     close(reason = "closed") {
       closed = true;
+      stopHeartbeat();
+      if (reconnectTimer !== undefined) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = undefined;
+      }
       streams.forEach((stream) => stream.tls?.close?.());
       streams.clear();
       pendingStreamData.clear();
