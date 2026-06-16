@@ -62,6 +62,21 @@ export interface PersonalServerReadAuthResult {
   grantId?: string;
 }
 
+export interface PersonalServerReadFulfillment {
+  builder: string;
+  fileId?: string;
+  grantId: string;
+  ipAddress: string;
+  logId: string;
+  scope: string;
+  servedAt: string;
+  userAgent: string;
+}
+
+export interface PersonalServerReadFulfillmentReporter {
+  report(event: PersonalServerReadFulfillment): Promise<void>;
+}
+
 export interface PersonalServerApiAuthPort {
   authorizeOwner(request: Request): Promise<void>;
   authorizeBuilderList(request: Request): Promise<void>;
@@ -89,6 +104,7 @@ export interface PersonalServerDataApiDeps {
   accessLogWriter: AccessLogWriter;
   syncManager?: PersonalServerIngestSyncManager | null;
   runtimeAvailability?: RuntimeAvailabilityPort;
+  readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
   /**
    * Required when payment is on. Powers two things on GET /v1/data/:scope:
    *   - the X402 challenge generation (fee lookup, accessRecord binding)
@@ -546,6 +562,38 @@ function notifyNewData(
   void syncManager.trigger().catch(() => undefined);
 }
 
+function shouldReportReadFulfillment(grantId: string): boolean {
+  return (
+    grantId !== "unknown" && grantId !== "owner" && grantId !== "policy-bypass"
+  );
+}
+
+async function reportReadFulfillment(
+  deps: PersonalServerDataApiDeps,
+  event: PersonalServerReadFulfillment,
+): Promise<void> {
+  if (
+    !deps.readFulfillmentReporter ||
+    !shouldReportReadFulfillment(event.grantId)
+  ) {
+    return;
+  }
+  try {
+    await deps.readFulfillmentReporter.report(event);
+  } catch (err) {
+    deps.logger?.warn?.(
+      {
+        builder: event.builder,
+        error: err instanceof Error ? err.message : String(err),
+        grantId: event.grantId,
+        logId: event.logId,
+        scope: event.scope,
+      },
+      "Read fulfillment reporter failed",
+    );
+  }
+}
+
 export async function handlePersonalServerDataRequest(
   request: Request,
   deps: PersonalServerDataApiDeps,
@@ -664,18 +712,35 @@ export async function handlePersonalServerDataRequest(
       });
       if (!result.ok) return contractErrorResponse(result);
 
+      const logId = deps.createLogId?.() ?? crypto.randomUUID();
+      const timestamp = (deps.now ?? (() => new Date()))().toISOString();
+      const ipAddress =
+        request.headers.get("x-forwarded-for") ??
+        request.headers.get("x-real-ip") ??
+        "unknown";
+      const userAgent = request.headers.get("user-agent") ?? "unknown";
+      const loggedGrantId = authResult?.grantId ?? grantId ?? "unknown";
+      const loggedBuilder = authResult?.builder ?? "unknown";
       await deps.accessLogWriter.write({
-        logId: deps.createLogId?.() ?? crypto.randomUUID(),
-        grantId: authResult?.grantId ?? grantId ?? "unknown",
-        builder: authResult?.builder ?? "unknown",
+        logId,
+        grantId: loggedGrantId,
+        builder: loggedBuilder,
         action: "read",
         scope: scopeResult.scope,
-        timestamp: (deps.now ?? (() => new Date()))().toISOString(),
-        ipAddress:
-          request.headers.get("x-forwarded-for") ??
-          request.headers.get("x-real-ip") ??
-          "unknown",
-        userAgent: request.headers.get("user-agent") ?? "unknown",
+        timestamp,
+        ipAddress,
+        userAgent,
+      });
+      await reportReadFulfillment(deps, {
+        builder: loggedBuilder,
+        fileId:
+          url.searchParams.get("fileId") ?? selectedEntry?.fileId ?? undefined,
+        grantId: loggedGrantId,
+        ipAddress,
+        logId,
+        scope: scopeResult.scope,
+        servedAt: timestamp,
+        userAgent,
       });
 
       const headers: Record<string, string> = {};

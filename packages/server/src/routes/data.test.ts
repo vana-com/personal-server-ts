@@ -939,6 +939,44 @@ describe("GET /v1/data/:scope", () => {
     expect(json.data).toEqual({ username: "test_user" });
   });
 
+  it("reports read fulfillment for successful grant-backed reads", async () => {
+    const readFulfillmentReporter = {
+      report: vi.fn().mockResolvedValue(undefined),
+    };
+    const app = createApp({ readFulfillmentReporter });
+
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+
+    const res = await getWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(200);
+    expect(readFulfillmentReporter.report).toHaveBeenCalledWith(
+      expect.objectContaining({
+        builder: wallet.address,
+        grantId: "grant-123",
+        ipAddress: "unknown",
+        logId: expect.any(String),
+        scope: "instagram.profile",
+        servedAt: expect.any(String),
+        userAgent: "unknown",
+      }),
+    );
+  });
+
+  it("does not fail successful reads when fulfillment reporting fails", async () => {
+    const readFulfillmentReporter = {
+      report: vi.fn().mockRejectedValue(new Error("receipt sink down")),
+    };
+    const app = createApp({ readFulfillmentReporter });
+
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+
+    const res = await getWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(200);
+    expect(readFulfillmentReporter.report).toHaveBeenCalledTimes(1);
+  });
+
   it("returns 401 MISSING_AUTH without authorization header", async () => {
     const app = createApp();
 

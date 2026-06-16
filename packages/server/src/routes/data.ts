@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import {
   handlePersonalServerDataRequest,
   type PersonalServerApiDispatchOptions,
+  type PersonalServerReadFulfillmentReporter,
 } from "@opendatalabs/personal-server-ts-core/api";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
@@ -51,6 +52,7 @@ export interface DataRouteDeps {
    */
   paymentEnabled?: boolean;
   accessLogWriter: AccessLogWriter;
+  readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
   syncManager?: SyncManager | null;
   devToken?: string;
   accessToken?: string;
@@ -101,6 +103,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         storage: dataStorage,
         auth,
         accessLogWriter: deps.accessLogWriter,
+        readFulfillmentReporter: deps.readFulfillmentReporter,
         syncManager: deps.syncManager ?? null,
         runtimeAvailability: deps.runtimeAvailability,
         serverSigner: deps.serverSigner,
