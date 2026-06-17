@@ -568,19 +568,17 @@ function shouldReportReadFulfillment(grantId: string): boolean {
   );
 }
 
-async function reportReadFulfillment(
+function reportReadFulfillment(
   deps: PersonalServerDataApiDeps,
   event: PersonalServerReadFulfillment,
-): Promise<void> {
+): void {
   if (
     !deps.readFulfillmentReporter ||
     !shouldReportReadFulfillment(event.grantId)
   ) {
     return;
   }
-  try {
-    await deps.readFulfillmentReporter.report(event);
-  } catch (err) {
+  void deps.readFulfillmentReporter.report(event).catch((err) => {
     deps.logger?.warn?.(
       {
         builder: event.builder,
@@ -591,7 +589,7 @@ async function reportReadFulfillment(
       },
       "Read fulfillment reporter failed",
     );
-  }
+  });
 }
 
 export async function handlePersonalServerDataRequest(
@@ -731,7 +729,7 @@ export async function handlePersonalServerDataRequest(
         ipAddress,
         userAgent,
       });
-      await reportReadFulfillment(deps, {
+      reportReadFulfillment(deps, {
         builder: loggedBuilder,
         fileId:
           url.searchParams.get("fileId") ?? selectedEntry?.fileId ?? undefined,

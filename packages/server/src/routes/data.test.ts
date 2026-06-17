@@ -963,6 +963,20 @@ describe("GET /v1/data/:scope", () => {
     );
   });
 
+  it("does not wait for fulfillment reporting before returning successful reads", async () => {
+    const readFulfillmentReporter = {
+      report: vi.fn().mockImplementation(() => new Promise(() => undefined)),
+    };
+    const app = createApp({ readFulfillmentReporter });
+
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+
+    const res = await getWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(200);
+    expect(readFulfillmentReporter.report).toHaveBeenCalledTimes(1);
+  });
+
   it("does not fail successful reads when fulfillment reporting fails", async () => {
     const readFulfillmentReporter = {
       report: vi.fn().mockRejectedValue(new Error("receipt sink down")),
