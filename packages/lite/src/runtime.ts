@@ -31,6 +31,7 @@ import {
   type PersonalServerApiAuthPort,
   type PersonalServerReadAuthInput,
   type PersonalServerReadAuthResult,
+  type PersonalServerReadFulfillmentReporter,
 } from "@opendatalabs/personal-server-ts-core/api";
 import {
   verifyDataReadPolicy,
@@ -117,6 +118,7 @@ export interface PsLiteRuntimeOptions {
     | null;
   accessLogReader?: AccessLogReader;
   accessLogWriter?: AccessLogWriter;
+  readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
   accessToken?: string;
   tokenStore?: PsLiteTokenStore;
   stateCapabilities?: Partial<PsLiteRuntimeStateCapabilities>;
@@ -834,6 +836,7 @@ export function createPsLiteRuntime(
               storage: dataStorage,
               auth,
               accessLogWriter,
+              readFulfillmentReporter: options.readFulfillmentReporter,
               syncManager: options.syncManager ?? null,
               now,
               createLogId,
@@ -940,6 +943,7 @@ export function createPsLiteRuntime(
             auth,
             dataStorage,
             accessLogWriter,
+            readFulfillmentReporter: options.readFulfillmentReporter,
             now,
             runtimeAvailability: { isAvailable: () => active },
             serverOrigin: url.origin,
@@ -978,6 +982,7 @@ async function handleMcpRoute(input: {
   auth: PsLiteAuthAdapter;
   dataStorage: DataStoragePort;
   accessLogWriter: AccessLogWriter;
+  readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
   now: () => Date;
   runtimeAvailability: RuntimeAvailabilityPort;
   serverOrigin: string;
@@ -1408,6 +1413,7 @@ async function handleMcpRoute(input: {
         storage: input.dataStorage,
         auth: input.auth,
         accessLogWriter: input.accessLogWriter,
+        readFulfillmentReporter: input.readFulfillmentReporter,
         runtimeAvailability: input.runtimeAvailability,
         now: input.now,
         createLogId,

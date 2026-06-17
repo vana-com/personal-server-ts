@@ -50,7 +50,10 @@ type NodeServer = ReturnType<typeof createAdaptorServer>;
 
 export interface StartPersonalServerNodeOptions
   extends
-    Pick<CreateServerOptions, "rootPath" | "dataDir" | "ownerSignature">,
+    Pick<
+      CreateServerOptions,
+      "rootPath" | "dataDir" | "ownerSignature" | "readFulfillmentReporter"
+    >,
     LoadConfigOptions {
   config?: ServerConfig;
   configDefaults?: Partial<ServerConfig>;
@@ -86,6 +89,7 @@ export async function startPersonalServer(
     dataDir: options.dataDir,
     ownerSignature: options.ownerSignature,
     gatewayClient: options.gatewayClient,
+    readFulfillmentReporter: options.readFulfillmentReporter,
   });
   const mainServer = await listenHttpServer({
     fetch: context.app.fetch,
