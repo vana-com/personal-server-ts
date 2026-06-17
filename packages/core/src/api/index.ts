@@ -82,7 +82,7 @@ export interface PersonalServerApiAuthPort {
   authorizeBuilderList(request: Request): Promise<void>;
   authorizeBuilderRead(
     input: PersonalServerReadAuthInput,
-  ): Promise<PersonalServerReadAuthResult>;
+  ): Promise<PersonalServerReadAuthResult | void>;
 }
 
 export interface PersonalServerApiLogger {
@@ -741,7 +741,8 @@ export async function handlePersonalServerDataRequest(
         ipAddress,
         userAgent,
       });
-      if (authResult.grantId && authResult.builder) {
+      const reportReadFulfillment = () => {
+        if (!authResult?.grantId || !authResult.builder) return;
         reportPersonalServerReadFulfillment(deps, {
           builder: authResult.builder,
           fileId:
@@ -755,7 +756,7 @@ export async function handlePersonalServerDataRequest(
           servedAt: timestamp,
           userAgent,
         });
-      }
+      };
 
       const headers: Record<string, string> = {};
       if (paymentResponseHeader) {
@@ -781,12 +782,16 @@ export async function handlePersonalServerDataRequest(
             decoded.metadata,
           );
         }
-        return new Response(decoded.bytes as unknown as BodyInit, {
+        const response = new Response(decoded.bytes as unknown as BodyInit, {
           status: 200,
           headers,
         });
+        reportReadFulfillment();
+        return response;
       }
-      return jsonResponse(result.envelope, { headers });
+      const response = jsonResponse(result.envelope, { headers });
+      reportReadFulfillment();
+      return response;
     }
 
     if (request.method === "POST") {

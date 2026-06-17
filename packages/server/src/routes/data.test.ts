@@ -1007,6 +1007,40 @@ describe("GET /v1/data/:scope", () => {
     expect(readFulfillmentReporter.report).toHaveBeenCalledTimes(1);
   });
 
+  it("does not report read fulfillment when raw binary response cannot be decoded", async () => {
+    const readFulfillmentReporter = {
+      report: vi.fn().mockResolvedValue(undefined),
+    };
+    const gateway = createMockGateway({
+      getGrant: vi.fn().mockResolvedValue(
+        makeGrant({
+          scopes: ["manual.document"],
+        }),
+      ),
+    });
+    const app = createApp({ gateway, readFulfillmentReporter });
+
+    await ingestData(
+      "manual.document",
+      {
+        $binary: true,
+        content: "%",
+        contentHash: "0x00",
+        encoding: "base64",
+        mimeType: "application/pdf",
+        sizeBytes: 1,
+      },
+      app,
+    );
+
+    const res = await getWithAuth(app, "manual.document", {
+      query: "?content=raw",
+    });
+
+    expect(res.status).toBe(500);
+    expect(readFulfillmentReporter.report).not.toHaveBeenCalled();
+  });
+
   it("returns 401 MISSING_AUTH without authorization header", async () => {
     const app = createApp();
 
