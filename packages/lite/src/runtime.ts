@@ -105,13 +105,24 @@ export interface PsLiteRuntimeOptions {
   config?: {
     server?: { origin?: string };
     gateway?: Partial<DataPortabilityGatewayConfig> & { url?: string };
+    /** X402 read enforcement. Off by default in the browser runtime. */
+    payment?: { enabled?: boolean };
   };
   saveConfig?: (config: unknown) => Promise<void>;
   identity?: { address: `0x${string}`; publicKey: `0x${string}` };
   gateway?: GatewayClient;
   serverOwner?: `0x${string}`;
+  // Only signGrantRegistration is required (grants/MCP paths). signRecordDataAccess
+  // is optional — it's needed solely for the x402 accessRecord on paid reads,
+  // which is opt-in (payment disabled by default). Keeping it optional avoids
+  // breaking non-x402 callers that supply just a grant signer.
   serverSigner?: Pick<ServerSigner, "signGrantRegistration"> &
-    Partial<Pick<ServerSigner, "signGrantRevocation" | "address">>;
+    Partial<
+      Pick<
+        ServerSigner,
+        "signGrantRevocation" | "signRecordDataAccess" | "address"
+      >
+    >;
   syncManager?:
     | (Pick<SyncManager, "trigger" | "getStatus"> &
         Partial<Pick<SyncManager, "start" | "stop">>)
@@ -535,6 +546,46 @@ export function createPsLiteRuntime(
   }
   const tokenStore = options.tokenStore ?? createDefaultTokenStore();
   const saveConfig = options.saveConfig ?? createDefaultSaveConfig();
+
+  // x402 readiness. Paid reads need a COMPLETE gateway config (url + chainId +
+  // the escrow/dataRegistry contracts that back the EIP-712 domains). A partial
+  // config (e.g. just `{ url }`) must never enter x402 — core only gates on
+  // truthiness, so a partial config would produce malformed challenges. When
+  // payment is enabled we require a complete config (fail fast); a partial
+  // config is otherwise fine for the non-x402 paths (grants/MCP/reads).
+  const paymentEnabled = options.config?.payment?.enabled ?? false;
+  const gw = options.config?.gateway;
+  const gatewayConfigComplete = Boolean(
+    gw &&
+    typeof gw.url === "string" &&
+    typeof gw.chainId === "number" &&
+    gw.contracts &&
+    typeof (gw.contracts as Record<string, unknown>).dataPortabilityEscrow ===
+      "string" &&
+    typeof (gw.contracts as Record<string, unknown>).dataRegistry === "string",
+  );
+  if (paymentEnabled && !gatewayConfigComplete) {
+    throw new Error(
+      "PS-Lite x402 payment is enabled (config.payment.enabled) but the gateway " +
+        "config is incomplete. A complete gateway config — url, chainId, and " +
+        "contracts (dataPortabilityEscrow, dataRegistry) — is required to charge " +
+        "for reads. Provide the full config or disable payment.",
+    );
+  }
+  // Pass the gateway config to the x402 path only when complete; undefined
+  // keeps core's read free instead of issuing a malformed challenge.
+  const x402GatewayConfig:
+    | (DataPortabilityGatewayConfig & { url: string })
+    | undefined = gatewayConfigComplete
+    ? (gw as unknown as DataPortabilityGatewayConfig & { url: string })
+    : undefined;
+  // The data handler's x402 path only needs signRecordDataAccess; narrow the
+  // (optional) signer so a grant-only signer doesn't masquerade as one that can
+  // sign access records.
+  const x402ServerSigner = options.serverSigner?.signRecordDataAccess
+    ? { signRecordDataAccess: options.serverSigner.signRecordDataAccess }
+    : undefined;
+
   const deviceSessions: DeviceSessionStore = createMemoryDeviceSessionStore();
   const mcpOAuthAuthorizationStore =
     options.mcpOAuthAuthorizationStore ??
@@ -840,6 +891,24 @@ export function createPsLiteRuntime(
               syncManager: options.syncManager ?? null,
               now,
               createLogId,
+              // x402 payment enforcement for builder reads. Only engages with a
+              // complete gateway config (validated at construction); a partial
+              // config leaves these undefined so reads are served free instead
+              // of yielding a malformed challenge.
+              paymentEnabled,
+              gateway: options.gateway,
+              gatewayConfig: x402GatewayConfig,
+              gatewayUrl: x402GatewayConfig?.url,
+              serverAddress: options.identity?.address,
+              // The data owner signed into the RecordDataAccess attestation.
+              // Distinct from serverAddress (the server keypair): the core only
+              // embeds the x402 accessRecord when BOTH serverSigner and
+              // serverOwner are present (see x402.ts buildChallenge). We pass
+              // the real owner — not identity.address — so the on-chain
+              // recordDataAccess attributes the read to the correct owner; if
+              // serverOwner is absent the accessRecord is safely omitted.
+              serverOwner: options.serverOwner,
+              serverSigner: x402ServerSigner,
             },
             { basePath: dataPrefix },
           );

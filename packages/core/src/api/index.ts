@@ -86,6 +86,7 @@ export interface PersonalServerApiAuthPort {
 }
 
 export interface PersonalServerApiLogger {
+  debug?(payload: Record<string, unknown>, message: string): void;
   info?(payload: Record<string, unknown>, message: string): void;
   warn?(payload: Record<string, unknown>, message: string): void;
   error?(payload: Record<string, unknown>, message: string): void;
@@ -675,6 +676,54 @@ export async function handlePersonalServerDataRequest(
       const builder = authResult?.builder;
       const resolvedGrantId =
         !isOwnerSignal && authResult?.grantId ? authResult.grantId : undefined;
+      const willCharge = Boolean(
+        deps.paymentEnabled &&
+        !isOwnerSignal &&
+        typeof builder === "string" &&
+        builder.startsWith("0x") &&
+        resolvedGrantId &&
+        deps.gateway &&
+        deps.gatewayConfig &&
+        deps.gatewayUrl,
+      );
+      // Diagnostic: makes it explicit why a read is/isn't charged. x402 has
+      // many "served free" branches (owner read, payment disabled, missing
+      // gateway deps); this surfaces the deciding inputs.
+      //
+      // Routing: when a logger is wired (the Node server always provides one),
+      // log the full detail through it at debug level so the operator's level
+      // controls + redaction apply and access metadata (scope/grantId/builder)
+      // doesn't unconditionally hit stdout. The browser PS-Lite runtime wires
+      // no logger; there we fall back to console but log ONLY the non-identifying
+      // decision booleans — never scope/grantId/builder.
+      if (deps.logger?.debug) {
+        deps.logger.debug(
+          {
+            scope: scopeResult.scope,
+            grantId: authResult?.grantId,
+            isOwnerSignal,
+            builder,
+            resolvedGrantId,
+            paymentEnabled: Boolean(deps.paymentEnabled),
+            hasGateway: Boolean(deps.gateway),
+            hasGatewayConfig: Boolean(deps.gatewayConfig),
+            hasGatewayUrl: Boolean(deps.gatewayUrl),
+            willCharge,
+          },
+          "[x402-gate] read",
+        );
+      } else {
+        console.info("[x402-gate] read", {
+          isOwnerSignal,
+          paymentEnabled: Boolean(deps.paymentEnabled),
+          hasGateway: Boolean(deps.gateway),
+          hasGatewayConfig: Boolean(deps.gatewayConfig),
+          hasGatewayUrl: Boolean(deps.gatewayUrl),
+          willCharge,
+        });
+      }
+      // Keep the full condition inline (not `if (willCharge)`) so TS narrows
+      // deps.gateway/gatewayConfig/gatewayUrl to non-undefined in the block.
       if (
         deps.paymentEnabled &&
         !isOwnerSignal &&
