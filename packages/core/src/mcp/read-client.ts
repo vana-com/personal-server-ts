@@ -313,7 +313,12 @@ export function createMcpDataReadClient(
           ipAddress,
           userAgent,
         });
-        if (authResult?.grantId && authResult.builder && !result.nextCursor) {
+        if (
+          authResult?.grantId &&
+          authResult.builder &&
+          !cursor &&
+          !result.nextCursor
+        ) {
           reportPersonalServerReadFulfillment(options.dataApiDeps, {
             builder: authResult.builder,
             fileId: selectedEntry.fileId ?? undefined,
