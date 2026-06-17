@@ -105,6 +105,8 @@ export interface PsLiteRuntimeOptions {
   config?: {
     server?: { origin?: string };
     gateway?: Partial<DataPortabilityGatewayConfig> & { url?: string };
+    /** X402 read enforcement. Off by default in the browser runtime. */
+    payment?: { enabled?: boolean };
   };
   saveConfig?: (config: unknown) => Promise<void>;
   identity?: { address: `0x${string}`; publicKey: `0x${string}` };
