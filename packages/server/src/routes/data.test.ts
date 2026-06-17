@@ -1041,6 +1041,41 @@ describe("GET /v1/data/:scope", () => {
     expect(readFulfillmentReporter.report).not.toHaveBeenCalled();
   });
 
+  it("does not report read fulfillment for raw binary responses", async () => {
+    const readFulfillmentReporter = {
+      report: vi.fn().mockResolvedValue(undefined),
+    };
+    const gateway = createMockGateway({
+      getGrant: vi.fn().mockResolvedValue(
+        makeGrant({
+          scopes: ["manual.document"],
+        }),
+      ),
+    });
+    const app = createApp({ gateway, readFulfillmentReporter });
+
+    await ingestData(
+      "manual.document",
+      {
+        $binary: true,
+        content: "JVBERg==",
+        contentHash: "0x00",
+        encoding: "base64",
+        mimeType: "application/pdf",
+        sizeBytes: 4,
+      },
+      app,
+    );
+
+    const res = await getWithAuth(app, "manual.document", {
+      query: "?content=raw",
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/pdf");
+    expect(readFulfillmentReporter.report).not.toHaveBeenCalled();
+  });
+
   it("does not report read fulfillment for raw reads of non-binary scopes", async () => {
     const readFulfillmentReporter = {
       report: vi.fn().mockResolvedValue(undefined),

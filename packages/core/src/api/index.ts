@@ -794,7 +794,6 @@ export async function handlePersonalServerDataRequest(
           status: 200,
           headers,
         });
-        reportReadFulfillment();
         return response;
       }
       const response = jsonResponse(result.envelope, { headers });
