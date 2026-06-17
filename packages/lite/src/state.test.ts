@@ -244,6 +244,38 @@ describe("PS Lite browser state", () => {
     });
   });
 
+  it("reconciles the stored payment toggle when defaults flip it", async () => {
+    const store = createMemoryPsLiteStateStore();
+    const gateway = {
+      url: "https://gateway.example",
+      chainId: 14800,
+      contracts: { dataPortabilityServer: "0xSERVER" },
+    };
+
+    // Boot with payment off.
+    await loadOrCreatePsLiteConfig(store, {
+      gateway,
+      payment: { enabled: false },
+    });
+
+    // Flip payment on via defaults (e.g. an env toggle on next boot).
+    const on = await loadOrCreatePsLiteConfig(store, {
+      gateway,
+      payment: { enabled: true },
+    });
+    expect(on.payment.enabled).toBe(true);
+    // Persisted, not recomputed each boot.
+    await expect(loadOrCreatePsLiteConfig(store)).resolves.toMatchObject({
+      payment: { enabled: true },
+    });
+
+    // Flips back off too — payment-only defaults (no gateway) still reconcile.
+    const off = await loadOrCreatePsLiteConfig(store, {
+      payment: { enabled: false },
+    });
+    expect(off.payment.enabled).toBe(false);
+  });
+
   it("leaves stored config untouched when no gateway defaults are given", async () => {
     const store = createMemoryPsLiteStateStore();
     await loadOrCreatePsLiteConfig(store, {
