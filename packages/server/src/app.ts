@@ -10,6 +10,7 @@ import type {
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
+import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
 import { healthRoute, type HealthDeps } from "./routes/health.js";
 import { dataRoutes } from "./routes/data.js";
 import { grantsRoutes } from "./routes/grants.js";
@@ -66,6 +67,7 @@ export interface AppDeps {
   config?: ServerConfig;
   accessLogWriter: AccessLogWriter;
   accessLogReader: AccessLogReader;
+  readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
   cloudMode?: boolean;
   devToken?: string;
   ownerSignature?: `0x${string}`;
@@ -142,6 +144,7 @@ export function createApp(deps: AppDeps): Hono {
       serverOwner: deps.serverOwner,
       gateway: deps.gateway,
       accessLogWriter: deps.accessLogWriter,
+      readFulfillmentReporter: deps.readFulfillmentReporter,
       devToken: deps.devToken,
       accessToken: deps.accessToken,
       tokenStore: deps.tokenStore,
@@ -234,6 +237,7 @@ export function createApp(deps: AppDeps): Hono {
     accessToken: deps.accessToken,
     tokenStore: deps.tokenStore,
     accessLogWriter: deps.accessLogWriter,
+    readFulfillmentReporter: deps.readFulfillmentReporter,
     indexManager: deps.indexManager,
     hierarchyOptions: deps.hierarchyOptions,
     dataStorage: deps.dataStorage,

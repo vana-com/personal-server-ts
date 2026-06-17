@@ -62,6 +62,21 @@ export interface PersonalServerReadAuthResult {
   grantId?: string;
 }
 
+export interface PersonalServerReadFulfillment {
+  builder: string;
+  fileId?: string;
+  grantId: string;
+  ipAddress: string;
+  logId: string;
+  scope: string;
+  servedAt: string;
+  userAgent: string;
+}
+
+export interface PersonalServerReadFulfillmentReporter {
+  report(event: PersonalServerReadFulfillment): Promise<void>;
+}
+
 export interface PersonalServerApiAuthPort {
   authorizeOwner(request: Request): Promise<void>;
   authorizeBuilderList(request: Request): Promise<void>;
@@ -89,6 +104,7 @@ export interface PersonalServerDataApiDeps {
   accessLogWriter: AccessLogWriter;
   syncManager?: PersonalServerIngestSyncManager | null;
   runtimeAvailability?: RuntimeAvailabilityPort;
+  readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
   /**
    * Required when payment is on. Powers two things on GET /v1/data/:scope:
    *   - the X402 challenge generation (fee lookup, accessRecord binding)
@@ -546,6 +562,48 @@ function notifyNewData(
   void syncManager.trigger().catch(() => undefined);
 }
 
+function shouldReportReadFulfillment(grantId: string): boolean {
+  return (
+    grantId !== "unknown" && grantId !== "owner" && grantId !== "policy-bypass"
+  );
+}
+
+function warnReadFulfillmentReporterFailed(
+  deps: PersonalServerDataApiDeps,
+  event: PersonalServerReadFulfillment,
+  err: unknown,
+): void {
+  deps.logger?.warn?.(
+    {
+      builder: event.builder,
+      error: err instanceof Error ? err.message : String(err),
+      grantId: event.grantId,
+      logId: event.logId,
+      scope: event.scope,
+    },
+    "Read fulfillment reporter failed",
+  );
+}
+
+export function reportPersonalServerReadFulfillment(
+  deps: PersonalServerDataApiDeps,
+  event: PersonalServerReadFulfillment,
+): void {
+  if (
+    !deps.readFulfillmentReporter ||
+    !shouldReportReadFulfillment(event.grantId)
+  ) {
+    return;
+  }
+  try {
+    void Promise.resolve(deps.readFulfillmentReporter.report(event)).catch(
+      (err) => warnReadFulfillmentReporterFailed(deps, event, err),
+    );
+  } catch (err) {
+    warnReadFulfillmentReporterFailed(deps, event, err);
+  }
+}
+
 export async function handlePersonalServerDataRequest(
   request: Request,
   deps: PersonalServerDataApiDeps,
@@ -664,32 +722,62 @@ export async function handlePersonalServerDataRequest(
       });
       if (!result.ok) return contractErrorResponse(result);
 
+      const logId = deps.createLogId?.() ?? crypto.randomUUID();
+      const timestamp = (deps.now ?? (() => new Date()))().toISOString();
+      const ipAddress =
+        request.headers.get("x-forwarded-for") ??
+        request.headers.get("x-real-ip") ??
+        "unknown";
+      const userAgent = request.headers.get("user-agent") ?? "unknown";
+      const loggedGrantId = authResult?.grantId ?? grantId ?? "unknown";
+      const loggedBuilder = authResult?.builder ?? "unknown";
       await deps.accessLogWriter.write({
-        logId: deps.createLogId?.() ?? crypto.randomUUID(),
-        grantId: authResult?.grantId ?? grantId ?? "unknown",
-        builder: authResult?.builder ?? "unknown",
+        logId,
+        grantId: loggedGrantId,
+        builder: loggedBuilder,
         action: "read",
         scope: scopeResult.scope,
-        timestamp: (deps.now ?? (() => new Date()))().toISOString(),
-        ipAddress:
-          request.headers.get("x-forwarded-for") ??
-          request.headers.get("x-real-ip") ??
-          "unknown",
-        userAgent: request.headers.get("user-agent") ?? "unknown",
+        timestamp,
+        ipAddress,
+        userAgent,
       });
+      const reportReadFulfillment = () => {
+        if (!authResult?.grantId || !authResult.builder) return;
+        reportPersonalServerReadFulfillment(deps, {
+          builder: authResult.builder,
+          fileId:
+            url.searchParams.get("fileId") ??
+            selectedEntry?.fileId ??
+            undefined,
+          grantId: authResult.grantId,
+          ipAddress,
+          logId,
+          scope: scopeResult.scope,
+          servedAt: timestamp,
+          userAgent,
+        });
+      };
 
       const headers: Record<string, string> = {};
       if (paymentResponseHeader) {
         headers["X-PAYMENT-RESPONSE"] = paymentResponseHeader;
       }
 
+      const wantsRawContent = url.searchParams.get("content") === "raw";
+
       // `?content=raw` streams the decoded bytes of a binary envelope with its
       // original media type, so a builder can download the file directly. The
       // X-PAYMENT-RESPONSE header (if any) rides along on the raw response too.
-      if (
-        url.searchParams.get("content") === "raw" &&
-        isBinaryEnvelope(result.envelope)
-      ) {
+      if (wantsRawContent) {
+        if (!isBinaryEnvelope(result.envelope)) {
+          return jsonResponse(
+            {
+              error: "NOT_BINARY_SCOPE",
+              message: `Scope "${scopeResult.scope}" does not expose raw binary content.`,
+            },
+            { status: 400, headers },
+          );
+        }
         const decoded = decodeBinaryEnvelope(result.envelope);
         headers["Content-Type"] = decoded.mimeType;
         headers["Content-Length"] = String(decoded.bytes.length);
@@ -702,12 +790,15 @@ export async function handlePersonalServerDataRequest(
             decoded.metadata,
           );
         }
-        return new Response(decoded.bytes as unknown as BodyInit, {
+        const response = new Response(decoded.bytes as unknown as BodyInit, {
           status: 200,
           headers,
         });
+        return response;
       }
-      return jsonResponse(result.envelope, { headers });
+      const response = jsonResponse(result.envelope, { headers });
+      reportReadFulfillment();
+      return response;
     }
 
     if (request.method === "POST") {

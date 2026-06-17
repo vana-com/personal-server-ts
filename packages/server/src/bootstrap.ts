@@ -7,6 +7,7 @@ import { privateKeyToAccount } from "viem/accounts";
 const require = createRequire(import.meta.url);
 const pkg = require("../package.json") as { version: string };
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
+import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
 import { DEFAULT_ROOT_PATH, resolveRootPath } from "./config/index.js";
 import { createLogger, type Logger } from "./logger/index.js";
 import { initializeDatabase } from "./storage/index-schema.js";
@@ -71,6 +72,7 @@ export interface CreateServerOptions {
   dataDir?: string;
   ownerSignature?: `0x${string}`;
   gatewayClient?: GatewayClient;
+  readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
 }
 
 const DEFAULT_LOCAL_APPROVAL_PORT = 34127;
@@ -355,6 +357,7 @@ export async function createServer(
     config,
     accessLogWriter,
     accessLogReader,
+    readFulfillmentReporter: options?.readFulfillmentReporter,
     dataStorage,
     cloudMode,
     devToken,

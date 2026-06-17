@@ -939,6 +939,161 @@ describe("GET /v1/data/:scope", () => {
     expect(json.data).toEqual({ username: "test_user" });
   });
 
+  it("reports read fulfillment for successful grant-backed reads", async () => {
+    const readFulfillmentReporter = {
+      report: vi.fn().mockResolvedValue(undefined),
+    };
+    const app = createApp({ readFulfillmentReporter });
+
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+
+    const res = await getWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(200);
+    expect(readFulfillmentReporter.report).toHaveBeenCalledWith(
+      expect.objectContaining({
+        builder: wallet.address,
+        grantId: "grant-123",
+        ipAddress: "unknown",
+        logId: expect.any(String),
+        scope: "instagram.profile",
+        servedAt: expect.any(String),
+        userAgent: "unknown",
+      }),
+    );
+  });
+
+  it("does not wait for fulfillment reporting before returning successful reads", async () => {
+    const readFulfillmentReporter = {
+      report: vi.fn().mockImplementation(() => new Promise(() => undefined)),
+    };
+    const app = createApp({ readFulfillmentReporter });
+
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+
+    const res = await getWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(200);
+    expect(readFulfillmentReporter.report).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fail successful reads when fulfillment reporting fails", async () => {
+    const readFulfillmentReporter = {
+      report: vi.fn().mockRejectedValue(new Error("receipt sink down")),
+    };
+    const app = createApp({ readFulfillmentReporter });
+
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+
+    const res = await getWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(200);
+    expect(readFulfillmentReporter.report).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fail successful reads when fulfillment reporting throws synchronously", async () => {
+    const readFulfillmentReporter = {
+      report: vi.fn().mockImplementation(() => {
+        throw new Error("receipt sink down");
+      }),
+    };
+    const app = createApp({ readFulfillmentReporter });
+
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+
+    const res = await getWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(200);
+    expect(readFulfillmentReporter.report).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not report read fulfillment when raw binary response cannot be decoded", async () => {
+    const readFulfillmentReporter = {
+      report: vi.fn().mockResolvedValue(undefined),
+    };
+    const gateway = createMockGateway({
+      getGrant: vi.fn().mockResolvedValue(
+        makeGrant({
+          scopes: ["manual.document"],
+        }),
+      ),
+    });
+    const app = createApp({ gateway, readFulfillmentReporter });
+
+    await ingestData(
+      "manual.document",
+      {
+        $binary: true,
+        content: "%",
+        contentHash: "0x00",
+        encoding: "base64",
+        mimeType: "application/pdf",
+        sizeBytes: 1,
+      },
+      app,
+    );
+
+    const res = await getWithAuth(app, "manual.document", {
+      query: "?content=raw",
+    });
+
+    expect(res.status).toBe(500);
+    expect(readFulfillmentReporter.report).not.toHaveBeenCalled();
+  });
+
+  it("does not report read fulfillment for raw binary responses", async () => {
+    const readFulfillmentReporter = {
+      report: vi.fn().mockResolvedValue(undefined),
+    };
+    const gateway = createMockGateway({
+      getGrant: vi.fn().mockResolvedValue(
+        makeGrant({
+          scopes: ["manual.document"],
+        }),
+      ),
+    });
+    const app = createApp({ gateway, readFulfillmentReporter });
+
+    await ingestData(
+      "manual.document",
+      {
+        $binary: true,
+        content: "JVBERg==",
+        contentHash: "0x00",
+        encoding: "base64",
+        mimeType: "application/pdf",
+        sizeBytes: 4,
+      },
+      app,
+    );
+
+    const res = await getWithAuth(app, "manual.document", {
+      query: "?content=raw",
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/pdf");
+    expect(readFulfillmentReporter.report).not.toHaveBeenCalled();
+  });
+
+  it("does not report read fulfillment for raw reads of non-binary scopes", async () => {
+    const readFulfillmentReporter = {
+      report: vi.fn().mockResolvedValue(undefined),
+    };
+    const app = createApp({ readFulfillmentReporter });
+
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+
+    const res = await getWithAuth(app, "instagram.profile", {
+      query: "?content=raw",
+    });
+
+    expect(res.status).toBe(400);
+    const json = await res.json();
+    expect(json.error).toBe("NOT_BINARY_SCOPE");
+    expect(readFulfillmentReporter.report).not.toHaveBeenCalled();
+  });
+
   it("returns 401 MISSING_AUTH without authorization header", async () => {
     const app = createApp();
 
