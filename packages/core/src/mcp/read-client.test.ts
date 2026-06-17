@@ -228,6 +228,74 @@ describe("mcp/read-client", () => {
     );
   });
 
+  it("does not report fulfillment for partial bounded block pages", async () => {
+    const accessLogWrite = vi.fn();
+    const readFulfillmentReport = vi.fn().mockResolvedValue(undefined);
+    const authorizeBuilderRead = vi
+      .fn()
+      .mockResolvedValue({ grantId: "grant-1", builder: "0x2222" });
+    const nextCursor = encodeDataBlockCursor({
+      scope: "instagram.profile",
+      collectedAt: "2026-06-05T00:00:00Z",
+      blockIndex: 1,
+    });
+    const readScopeBlocks = vi.fn().mockResolvedValue({
+      scope: "instagram.profile",
+      collectedAt: "2026-06-05T00:00:00Z",
+      contentKind: "json",
+      blocks: [],
+      nextCursor,
+      warnings: [],
+    });
+
+    const client = createMcpDataReadClient({
+      serverOrigin: SERVER_ORIGIN,
+      granteeAccount: createAccount(),
+      dataApiDeps: {
+        storage: {
+          kind: "custom",
+          listScopes: () => ({ scopes: [], total: 0 }),
+          listVersions: vi.fn(),
+          countVersions: vi.fn(),
+          findEntry: () =>
+            ({
+              scope: "instagram.profile",
+              collectedAt: "2026-06-05T00:00:00Z",
+              fileId: "file-1",
+              sizeBytes: 10,
+            }) as never,
+          findByFileId: vi.fn(),
+          findUnsynced: vi.fn(),
+          readEnvelope: vi.fn(),
+          readScopeBlocks,
+          writeEnvelope: vi.fn(),
+          insertEntry: vi.fn(),
+          updateFileId: vi.fn(),
+          deleteScope: vi.fn(),
+          deleteByFileId: vi.fn(),
+        },
+        auth: {
+          authorizeOwner: vi.fn(),
+          authorizeBuilderList: vi.fn(),
+          authorizeBuilderRead,
+        },
+        accessLogWriter: { write: accessLogWrite },
+        readFulfillmentReporter: { report: readFulfillmentReport },
+      },
+    });
+
+    await expect(
+      client.readScopeBlocks({
+        scope: "instagram.profile",
+        grantId: "grant-1",
+        maxBytes: 4096,
+      }),
+    ).resolves.toMatchObject({ nextCursor });
+
+    expect(accessLogWrite).toHaveBeenCalledTimes(1);
+    expect(readFulfillmentReport).not.toHaveBeenCalled();
+  });
+
   it("pins cursor reads to the version encoded in the cursor", async () => {
     const oldCollectedAt = "2026-06-05T00:00:00Z";
     const latestCollectedAt = "2026-06-06T00:00:00Z";

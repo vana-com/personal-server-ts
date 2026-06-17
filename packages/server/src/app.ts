@@ -237,6 +237,7 @@ export function createApp(deps: AppDeps): Hono {
     accessToken: deps.accessToken,
     tokenStore: deps.tokenStore,
     accessLogWriter: deps.accessLogWriter,
+    readFulfillmentReporter: deps.readFulfillmentReporter,
     indexManager: deps.indexManager,
     hierarchyOptions: deps.hierarchyOptions,
     dataStorage: deps.dataStorage,
