@@ -14,6 +14,11 @@ import {
   buildWeb3SignedHeader,
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
+import {
+  createDataFileEnvelope,
+  RECORD_DATA_ACCESS_TYPES,
+} from "@opendatalabs/vana-sdk/browser";
+import { privateKeyToAccount } from "viem/accounts";
 
 type PsLiteRuntimeOptions = Parameters<typeof createPsLiteRuntime>[0];
 
@@ -892,5 +897,152 @@ describe("createPsLiteRuntime", () => {
     expect(await runtime.isAvailable()).toBe(false);
     runtime.activate();
     expect(await runtime.isAvailable()).toBe(true);
+  });
+
+  it("x402: unpaid read 402 embeds the server-signed accessRecord when the entry has a dataPointId", async () => {
+    const ORIGIN = "https://ps.local";
+    const COLLECTED_AT = "2026-05-08T00:00:00.000Z";
+    const owner = createTestWallet(0);
+    const builder = createTestWallet(1);
+    const serverAccount = privateKeyToAccount(
+      ("0x" + "33".repeat(32)) as `0x${string}`,
+    );
+    const BUILDER_ID = ("0x" + "bb".repeat(32)) as `0x${string}`;
+    const GRANT_ID = ("0x" + "11".repeat(32)) as `0x${string}`;
+    const DATA_POINT_ID = ("0x" + "dd".repeat(32)) as `0x${string}`;
+    const chainId = 14800;
+    const contracts = {
+      dataRegistry: "0x0000000000000000000000000000000000000001",
+      dataPortabilityPermissions: "0x0000000000000000000000000000000000000002",
+      dataPortabilityServer: "0x0000000000000000000000000000000000000003",
+      dataPortabilityGrantees: "0x0000000000000000000000000000000000000004",
+      dataPortabilityEscrow: "0x0000000000000000000000000000000000000005",
+      feeRegistry: "0x0000000000000000000000000000000000000006",
+    };
+
+    // Paid-eligible grant whose granteeId matches the builder (data-read policy
+    // cross-check) and which carries a fee (x402 charges).
+    const grant = {
+      id: GRANT_ID,
+      grantorAddress: owner.address,
+      granteeId: BUILDER_ID,
+      scopes: ["instagram.*"],
+      status: "confirmed",
+      addedAt: COLLECTED_AT,
+      expiresAt: null,
+      expired: false,
+      revokedAt: null,
+      revocationSignature: null,
+      paymentStatus: "pending",
+      paidAt: null,
+      paidBy: null,
+      grantVersion: "1",
+      fee: {
+        asset: "0x0000000000000000000000000000000000000000",
+        registrationFee: "10000000000000000",
+        dataAccessFee: "1000000000000000",
+        totalDue: "11000000000000000",
+      },
+    };
+    const gateway = {
+      ...createMockPsLiteGateway(),
+      async getGrant() {
+        return grant;
+      },
+      async getBuilder() {
+        return {
+          id: BUILDER_ID,
+          ownerAddress: owner.address,
+          granteeAddress: builder.address,
+          publicKey: "0x04",
+          appUrl: "https://app.test",
+          addedAt: COLLECTED_AT,
+        };
+      },
+      async isRegisteredBuilder() {
+        return true;
+      },
+    } as unknown as Parameters<typeof createTestRuntime>[0]["gateway"];
+
+    // Seed a synced entry (dataPointId set) so buildChallenge binds an
+    // accessRecord to it.
+    const storage = createMemoryPsLiteStorage();
+    const envelope = createDataFileEnvelope("instagram.profile", COLLECTED_AT, {
+      username: "x",
+    });
+    const write = await storage.writeEnvelope(envelope);
+    await storage.insertEntry({
+      fileId: null,
+      schemaId: null,
+      path: write.relativePath,
+      scope: "instagram.profile",
+      collectedAt: COLLECTED_AT,
+      sizeBytes: write.sizeBytes,
+      version: 1,
+      dataPointId: DATA_POINT_ID,
+    });
+
+    const runtime = createTestRuntime({
+      storage,
+      gateway,
+      active: true,
+      serverOwner: owner.address,
+      identity: { address: serverAccount.address, publicKey: "0x04" },
+      config: {
+        server: { origin: ORIGIN },
+        gateway: { url: "https://gateway.test", chainId, contracts },
+        payment: { enabled: true },
+      },
+      serverSigner: {
+        async signGrantRegistration() {
+          return ("0x" + "aa".repeat(65)) as `0x${string}`;
+        },
+        async signRecordDataAccess(msg) {
+          return serverAccount.signTypedData({
+            domain: {
+              name: "Vana Data Portability",
+              version: "1",
+              chainId,
+              verifyingContract: contracts.dataRegistry as `0x${string}`,
+            },
+            types: RECORD_DATA_ACCESS_TYPES,
+            primaryType: "RecordDataAccess",
+            message: msg,
+          });
+        },
+      },
+      auth: createWeb3SignedPsLiteAuth({
+        origin: () => ORIGIN,
+        ownerAddress: owner.address,
+        dataReadPolicyPorts: {
+          authSessionVerifier: gateway,
+          grantVerifier: gateway,
+        },
+      }),
+    });
+
+    const authHeader = await buildWeb3SignedHeader({
+      wallet: builder,
+      aud: ORIGIN,
+      method: "GET",
+      uri: "/v1/data/instagram.profile",
+      grantId: GRANT_ID,
+    });
+    const res = await runtime.fetch(
+      new Request("https://ignored.example/v1/data/instagram.profile", {
+        headers: { Authorization: authHeader },
+      }),
+    );
+
+    expect(res.status).toBe(402);
+    const body = await res.json();
+    expect(body.error).toBe("PAYMENT_REQUIRED");
+    expect(body.accepts).toHaveLength(1);
+    const accessRecord = body.accepts[0].accessRecord;
+    expect(accessRecord).toBeDefined();
+    expect(accessRecord.dataPointId).toBe(DATA_POINT_ID);
+    expect(accessRecord.accessor.toLowerCase()).toBe(
+      builder.address.toLowerCase(),
+    );
   });
 });

@@ -856,6 +856,14 @@ export function createPsLiteRuntime(
                 | undefined,
               gatewayUrl: options.config?.gateway?.url,
               serverAddress: options.identity?.address,
+              // The data owner signed into the RecordDataAccess attestation.
+              // Distinct from serverAddress (the server keypair): the core only
+              // embeds the x402 accessRecord when BOTH serverSigner and
+              // serverOwner are present (see x402.ts buildChallenge). We pass
+              // the real owner — not identity.address — so the on-chain
+              // recordDataAccess attributes the read to the correct owner; if
+              // serverOwner is absent the accessRecord is safely omitted.
+              serverOwner: options.serverOwner,
               serverSigner: options.serverSigner,
             },
             { basePath: dataPrefix },
