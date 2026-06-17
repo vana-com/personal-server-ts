@@ -585,7 +585,7 @@ function warnReadFulfillmentReporterFailed(
   );
 }
 
-function reportReadFulfillment(
+export function reportPersonalServerReadFulfillment(
   deps: PersonalServerDataApiDeps,
   event: PersonalServerReadFulfillment,
 ): void {
@@ -742,7 +742,7 @@ export async function handlePersonalServerDataRequest(
         userAgent,
       });
       if (authResult.grantId && authResult.builder) {
-        reportReadFulfillment(deps, {
+        reportPersonalServerReadFulfillment(deps, {
           builder: authResult.builder,
           fileId:
             url.searchParams.get("fileId") ??

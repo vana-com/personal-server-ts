@@ -55,6 +55,7 @@ import {
 import type {
   PersonalServerDataApiDeps,
   PersonalServerApiAuthPort,
+  PersonalServerReadFulfillmentReporter,
 } from "@opendatalabs/personal-server-ts-core/api";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { createServerApiAuth } from "../api-auth.js";
@@ -86,6 +87,7 @@ export interface McpRouteDeps {
   accessToken?: string;
   tokenStore?: TokenStore;
   accessLogWriter: AccessLogWriter;
+  readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
   indexManager?: IndexManager;
   hierarchyOptions?: HierarchyManagerOptions;
   dataStorage?: DataStoragePort;
@@ -231,6 +233,7 @@ function buildDataApiDeps(deps: McpRouteDeps): PersonalServerDataApiDeps {
     storage: dataStorage,
     auth,
     accessLogWriter: deps.accessLogWriter,
+    readFulfillmentReporter: deps.readFulfillmentReporter,
     runtimeAvailability: deps.runtimeAvailability,
     logger: deps.logger,
   };

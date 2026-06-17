@@ -943,6 +943,7 @@ export function createPsLiteRuntime(
             auth,
             dataStorage,
             accessLogWriter,
+            readFulfillmentReporter: options.readFulfillmentReporter,
             now,
             runtimeAvailability: { isAvailable: () => active },
             serverOrigin: url.origin,
@@ -981,6 +982,7 @@ async function handleMcpRoute(input: {
   auth: PsLiteAuthAdapter;
   dataStorage: DataStoragePort;
   accessLogWriter: AccessLogWriter;
+  readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
   now: () => Date;
   runtimeAvailability: RuntimeAvailabilityPort;
   serverOrigin: string;
@@ -1411,6 +1413,7 @@ async function handleMcpRoute(input: {
         storage: input.dataStorage,
         auth: input.auth,
         accessLogWriter: input.accessLogWriter,
+        readFulfillmentReporter: input.readFulfillmentReporter,
         runtimeAvailability: input.runtimeAvailability,
         now: input.now,
         createLogId,

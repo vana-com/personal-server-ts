@@ -27,6 +27,7 @@ import { bytesToBase64, parseMetadataHeader } from "../contracts/binary.js";
 import { signMcpGranteeRequest } from "./grantee.js";
 import {
   handlePersonalServerDataRequest,
+  reportPersonalServerReadFulfillment,
   type PersonalServerDataApiDeps,
 } from "../api/index.js";
 import { ProtocolError } from "../errors/catalog.js";
@@ -292,21 +293,38 @@ export function createMcpDataReadClient(
             maxBytes: maxBytes ?? 16_384,
           },
         );
+        const logId =
+          options.dataApiDeps.createLogId?.() ?? crypto.randomUUID();
+        const timestamp = (
+          options.dataApiDeps.now ?? (() => new Date())
+        )().toISOString();
+        const ipAddress =
+          request.headers.get("x-forwarded-for") ??
+          request.headers.get("x-real-ip") ??
+          "unknown";
+        const userAgent = request.headers.get("user-agent") ?? "unknown";
         await options.dataApiDeps.accessLogWriter.write({
-          logId: options.dataApiDeps.createLogId?.() ?? crypto.randomUUID(),
+          logId,
           grantId: authResult?.grantId ?? grantId,
           builder: authResult?.builder ?? options.granteeAccount.address,
           action: "read",
           scope,
-          timestamp: (
-            options.dataApiDeps.now ?? (() => new Date())
-          )().toISOString(),
-          ipAddress:
-            request.headers.get("x-forwarded-for") ??
-            request.headers.get("x-real-ip") ??
-            "unknown",
-          userAgent: request.headers.get("user-agent") ?? "unknown",
+          timestamp,
+          ipAddress,
+          userAgent,
         });
+        if (authResult?.grantId && authResult.builder) {
+          reportPersonalServerReadFulfillment(options.dataApiDeps, {
+            builder: authResult.builder,
+            fileId: selectedEntry.fileId ?? undefined,
+            grantId: authResult.grantId,
+            ipAddress,
+            logId,
+            scope,
+            servedAt: timestamp,
+            userAgent,
+          });
+        }
         return { status: 200, ...result };
       } catch (err) {
         if (err instanceof ProtocolError) {

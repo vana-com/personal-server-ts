@@ -125,6 +125,7 @@ describe("mcp/read-client", () => {
 
   it("authorizes and access-logs successful bounded block reads", async () => {
     const accessLogWrite = vi.fn();
+    const readFulfillmentReport = vi.fn().mockResolvedValue(undefined);
     const authorizeBuilderRead = vi
       .fn()
       .mockResolvedValue({ grantId: "grant-1", builder: "0x2222" });
@@ -176,6 +177,7 @@ describe("mcp/read-client", () => {
           authorizeBuilderRead,
         },
         accessLogWriter: { write: accessLogWrite },
+        readFulfillmentReporter: { report: readFulfillmentReport },
         now: () => new Date("2026-06-05T00:00:00Z"),
         createLogId: () => "log-1",
       },
@@ -212,6 +214,16 @@ describe("mcp/read-client", () => {
         action: "read",
         scope: "instagram.profile",
         timestamp: "2026-06-05T00:00:00.000Z",
+      }),
+    );
+    expect(readFulfillmentReport).toHaveBeenCalledWith(
+      expect.objectContaining({
+        builder: "0x2222",
+        fileId: "file-1",
+        grantId: "grant-1",
+        logId: "log-1",
+        scope: "instagram.profile",
+        servedAt: "2026-06-05T00:00:00.000Z",
       }),
     );
   });
