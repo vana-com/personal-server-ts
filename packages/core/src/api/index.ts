@@ -763,13 +763,21 @@ export async function handlePersonalServerDataRequest(
         headers["X-PAYMENT-RESPONSE"] = paymentResponseHeader;
       }
 
+      const wantsRawContent = url.searchParams.get("content") === "raw";
+
       // `?content=raw` streams the decoded bytes of a binary envelope with its
       // original media type, so a builder can download the file directly. The
       // X-PAYMENT-RESPONSE header (if any) rides along on the raw response too.
-      if (
-        url.searchParams.get("content") === "raw" &&
-        isBinaryEnvelope(result.envelope)
-      ) {
+      if (wantsRawContent) {
+        if (!isBinaryEnvelope(result.envelope)) {
+          return jsonResponse(
+            {
+              error: "NOT_BINARY_SCOPE",
+              message: `Scope "${scopeResult.scope}" does not expose raw binary content.`,
+            },
+            { status: 400, headers },
+          );
+        }
         const decoded = decodeBinaryEnvelope(result.envelope);
         headers["Content-Type"] = decoded.mimeType;
         headers["Content-Length"] = String(decoded.bytes.length);

@@ -1041,6 +1041,24 @@ describe("GET /v1/data/:scope", () => {
     expect(readFulfillmentReporter.report).not.toHaveBeenCalled();
   });
 
+  it("does not report read fulfillment for raw reads of non-binary scopes", async () => {
+    const readFulfillmentReporter = {
+      report: vi.fn().mockResolvedValue(undefined),
+    };
+    const app = createApp({ readFulfillmentReporter });
+
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+
+    const res = await getWithAuth(app, "instagram.profile", {
+      query: "?content=raw",
+    });
+
+    expect(res.status).toBe(400);
+    const json = await res.json();
+    expect(json.error).toBe("NOT_BINARY_SCOPE");
+    expect(readFulfillmentReporter.report).not.toHaveBeenCalled();
+  });
+
   it("returns 401 MISSING_AUTH without authorization header", async () => {
     const app = createApp();
 
