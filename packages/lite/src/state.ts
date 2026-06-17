@@ -453,25 +453,36 @@ export async function loadOrCreatePsLiteConfig(
     await store.set(CONFIG_KEY, config);
     return config;
   }
-  // A persisted config exists. The gateway block (url, chainId, contracts) is
-  // environment-derived deployment config, not instance state — when the
-  // caller's defaults move it (e.g. a contract redeploy), the stored snapshot
-  // must follow, or EIP-712 signing keeps using the stale verifyingContract.
+  // A persisted config exists. The gateway block (url, chainId, contracts) and
+  // the payment toggle are environment/deployment config, not instance state —
+  // when the caller's defaults move them (a contract redeploy, or flipping
+  // x402 payment via env), the stored snapshot must follow, or EIP-712 signing
+  // keeps using the stale verifyingContract / payment stays at its old value.
   // Instance state (server.origin, sync cursor, etc.) stays persisted.
   const stored = ServerConfigSchema.parse(existing);
-  if (!defaults?.gateway) return stored;
+  if (!(defaults?.gateway || defaults?.payment)) return stored;
   const reconciled = ServerConfigSchema.parse({
     ...stored,
-    gateway: {
-      ...stored.gateway,
-      ...defaults.gateway,
-      contracts: {
-        ...stored.gateway.contracts,
-        ...defaults.gateway.contracts,
-      },
-    },
+    ...(defaults.gateway
+      ? {
+          gateway: {
+            ...stored.gateway,
+            ...defaults.gateway,
+            contracts: {
+              ...stored.gateway.contracts,
+              ...defaults.gateway.contracts,
+            },
+          },
+        }
+      : {}),
+    ...(defaults.payment
+      ? { payment: { ...stored.payment, ...defaults.payment } }
+      : {}),
   });
-  if (JSON.stringify(reconciled.gateway) !== JSON.stringify(stored.gateway)) {
+  if (
+    JSON.stringify(reconciled.gateway) !== JSON.stringify(stored.gateway) ||
+    JSON.stringify(reconciled.payment) !== JSON.stringify(stored.payment)
+  ) {
     await store.set(CONFIG_KEY, reconciled);
   }
   return reconciled;
