@@ -675,6 +675,36 @@ export async function handlePersonalServerDataRequest(
       const builder = authResult?.builder;
       const resolvedGrantId =
         !isOwnerSignal && authResult?.grantId ? authResult.grantId : undefined;
+      const willCharge = Boolean(
+        deps.paymentEnabled &&
+        !isOwnerSignal &&
+        typeof builder === "string" &&
+        builder.startsWith("0x") &&
+        resolvedGrantId &&
+        deps.gateway &&
+        deps.gatewayConfig &&
+        deps.gatewayUrl,
+      );
+      // Permanent diagnostic: makes it explicit why a read is/isn't charged.
+      // x402 has many "served free" branches (owner read, payment disabled,
+      // missing gateway deps); this logs the deciding inputs on every read.
+      // Uses console (not deps.logger) on purpose: the in-browser PS-Lite
+      // runtime wires no logger, and this needs to surface in the browser
+      // console for support/debugging.
+      console.info("[x402-gate] read", {
+        scope: scopeResult.scope,
+        grantId: authResult?.grantId,
+        isOwnerSignal,
+        builder,
+        resolvedGrantId,
+        paymentEnabled: Boolean(deps.paymentEnabled),
+        hasGateway: Boolean(deps.gateway),
+        hasGatewayConfig: Boolean(deps.gatewayConfig),
+        hasGatewayUrl: Boolean(deps.gatewayUrl),
+        willCharge,
+      });
+      // Keep the full condition inline (not `if (willCharge)`) so TS narrows
+      // deps.gateway/gatewayConfig/gatewayUrl to non-undefined in the block.
       if (
         deps.paymentEnabled &&
         !isOwnerSignal &&

@@ -110,7 +110,10 @@ export interface PsLiteRuntimeOptions {
   identity?: { address: `0x${string}`; publicKey: `0x${string}` };
   gateway?: GatewayClient;
   serverOwner?: `0x${string}`;
-  serverSigner?: Pick<ServerSigner, "signGrantRegistration"> &
+  serverSigner?: Pick<
+    ServerSigner,
+    "signGrantRegistration" | "signRecordDataAccess"
+  > &
     Partial<Pick<ServerSigner, "signGrantRevocation" | "address">>;
   syncManager?:
     | (Pick<SyncManager, "trigger" | "getStatus"> &
@@ -840,6 +843,18 @@ export function createPsLiteRuntime(
               syncManager: options.syncManager ?? null,
               now,
               createLogId,
+              // x402 payment enforcement for builder reads. Without these the
+              // data handler's payment gate is always false
+              // (deps.paymentEnabled/gateway undefined), so reads are served
+              // free regardless of config.payment.enabled.
+              paymentEnabled: options.config?.payment?.enabled ?? false,
+              gateway: options.gateway,
+              gatewayConfig: options.config?.gateway as
+                | DataPortabilityGatewayConfig
+                | undefined,
+              gatewayUrl: options.config?.gateway?.url,
+              serverAddress: options.identity?.address,
+              serverSigner: options.serverSigner,
             },
             { basePath: dataPrefix },
           );
