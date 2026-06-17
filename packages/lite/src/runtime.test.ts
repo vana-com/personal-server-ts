@@ -1045,4 +1045,27 @@ describe("createPsLiteRuntime", () => {
       builder.address.toLowerCase(),
     );
   });
+
+  it("x402: throws when payment is enabled but the gateway config is incomplete", () => {
+    expect(() =>
+      createTestRuntime({
+        active: true,
+        config: {
+          // url only — missing chainId + contracts. Must NOT enter x402 with a
+          // partial config (which would yield malformed challenges).
+          gateway: { url: "https://gateway.test" },
+          payment: { enabled: true },
+        },
+      }),
+    ).toThrow(/gateway config is incomplete/);
+  });
+
+  it("x402: a partial gateway config is fine when payment is disabled", () => {
+    expect(() =>
+      createTestRuntime({
+        active: true,
+        config: { gateway: { url: "https://gateway.test" } },
+      }),
+    ).not.toThrow();
+  });
 });
