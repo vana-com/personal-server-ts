@@ -82,7 +82,7 @@ export interface PersonalServerApiAuthPort {
   authorizeBuilderList(request: Request): Promise<void>;
   authorizeBuilderRead(
     input: PersonalServerReadAuthInput,
-  ): Promise<PersonalServerReadAuthResult | void>;
+  ): Promise<PersonalServerReadAuthResult>;
 }
 
 export interface PersonalServerApiLogger {
@@ -568,6 +568,23 @@ function shouldReportReadFulfillment(grantId: string): boolean {
   );
 }
 
+function warnReadFulfillmentReporterFailed(
+  deps: PersonalServerDataApiDeps,
+  event: PersonalServerReadFulfillment,
+  err: unknown,
+): void {
+  deps.logger?.warn?.(
+    {
+      builder: event.builder,
+      error: err instanceof Error ? err.message : String(err),
+      grantId: event.grantId,
+      logId: event.logId,
+      scope: event.scope,
+    },
+    "Read fulfillment reporter failed",
+  );
+}
+
 function reportReadFulfillment(
   deps: PersonalServerDataApiDeps,
   event: PersonalServerReadFulfillment,
@@ -578,18 +595,13 @@ function reportReadFulfillment(
   ) {
     return;
   }
-  void deps.readFulfillmentReporter.report(event).catch((err) => {
-    deps.logger?.warn?.(
-      {
-        builder: event.builder,
-        error: err instanceof Error ? err.message : String(err),
-        grantId: event.grantId,
-        logId: event.logId,
-        scope: event.scope,
-      },
-      "Read fulfillment reporter failed",
+  try {
+    void Promise.resolve(deps.readFulfillmentReporter.report(event)).catch(
+      (err) => warnReadFulfillmentReporterFailed(deps, event, err),
     );
-  });
+  } catch (err) {
+    warnReadFulfillmentReporterFailed(deps, event, err);
+  }
 }
 
 export async function handlePersonalServerDataRequest(
@@ -729,17 +741,21 @@ export async function handlePersonalServerDataRequest(
         ipAddress,
         userAgent,
       });
-      reportReadFulfillment(deps, {
-        builder: loggedBuilder,
-        fileId:
-          url.searchParams.get("fileId") ?? selectedEntry?.fileId ?? undefined,
-        grantId: loggedGrantId,
-        ipAddress,
-        logId,
-        scope: scopeResult.scope,
-        servedAt: timestamp,
-        userAgent,
-      });
+      if (authResult.grantId && authResult.builder) {
+        reportReadFulfillment(deps, {
+          builder: authResult.builder,
+          fileId:
+            url.searchParams.get("fileId") ??
+            selectedEntry?.fileId ??
+            undefined,
+          grantId: authResult.grantId,
+          ipAddress,
+          logId,
+          scope: scopeResult.scope,
+          servedAt: timestamp,
+          userAgent,
+        });
+      }
 
       const headers: Record<string, string> = {};
       if (paymentResponseHeader) {

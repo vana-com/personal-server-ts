@@ -991,6 +991,22 @@ describe("GET /v1/data/:scope", () => {
     expect(readFulfillmentReporter.report).toHaveBeenCalledTimes(1);
   });
 
+  it("does not fail successful reads when fulfillment reporting throws synchronously", async () => {
+    const readFulfillmentReporter = {
+      report: vi.fn().mockImplementation(() => {
+        throw new Error("receipt sink down");
+      }),
+    };
+    const app = createApp({ readFulfillmentReporter });
+
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+
+    const res = await getWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(200);
+    expect(readFulfillmentReporter.report).toHaveBeenCalledTimes(1);
+  });
+
   it("returns 401 MISSING_AUTH without authorization header", async () => {
     const app = createApp();
 
