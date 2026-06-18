@@ -1,28 +1,54 @@
 /**
- * End-to-end test of the personal server's full canary flow against a
- * live gateway + Moksha L1.
+ * End-to-end test of the PERSONAL SERVER LITE runtime's full x402 lifecycle
+ * against a live gateway + Moksha L1.
  *
- * Scenario:
- *   1. A user spins up their own personal server.
+ * This is the PS-Lite analogue of scripts/e2e-x402-flow.ts. Instead of booting
+ * the Node server (`createServer` from the server package), it boots the Lite
+ * runtime — `createPsLiteRuntime` from packages/lite/src/runtime.ts, the same
+ * code app-dev.vana.org runs in the browser — wraps its `.fetch` in
+ * @hono/node-server's `serve({ fetch, port })` to expose a real URL, and drives
+ * the identical x402 lifecycle against the live gateway:
+ *
+ *   1. A user generates a fresh server keypair and boots the Lite runtime.
  *   2. The user registers it on the gateway as a trusted server of their wallet.
  *   3. An app registers itself as a builder.
- *   4. The app pre-funds its escrow with VANA so it can pay for reads.
- *   5. The user POSTs personal data to the server (instagram.profile).
- *   6. The user grants the app permission to read that scope via the server.
+ *   4. The user POSTs personal data to the Lite runtime (instagram.profile).
+ *   5. The ingested envelope is registered on-chain as a DPv2 data point.
+ *   6. The user grants the app permission to read that scope (delegated, the
+ *      server signer signs GrantRegistration on behalf of the owner).
  *   7. The app does a GET, hits the X402 paywall. Without payment the data is
  *      withheld (the 402 body is a challenge, never the envelope).
  *   8. The app signs the payment and retries; the gateway accepts it and the
- *      server serves the envelope.
+ *      Lite runtime serves the envelope.
+ *   9. gateway.settle() drains pending ops on-chain; we poll to finalization.
+ *  10. We assert the builder settled on-chain via the GranteeRegistered event.
  *
- * This script lives outside packages/* so the SDK is resolved as a
- * downstream consumer would resolve it. Runs the personal-server in-process
- * on a random port and drives every endpoint via plain fetch.
+ * The gateway/chain-side logic (EIP-712 signing, escrow deposit, the 402 parse
+ * + X-PAYMENT encode, the settle/finalize poll loop, the GranteeRegistered
+ * assertion) is IDENTICAL to the Node script and is reused verbatim. What
+ * differs is purely how the server is booted and how its identity/signer/
+ * storage are provided — see the "LITE-SPECIFIC" comments below.
+ *
+ * Lite storage note (full data-point path): unlike the Node server, the Lite
+ * runtime has no IndexManager/dataDir; it uses an in-memory DataStoragePort
+ * (createMemoryPsLiteStorage). That port DOES expose everything we need to do
+ * the full on-chain data-point registration:
+ *   • findEntry({ scope })        → the ingested IndexEntry (version, path, …)
+ *   • readEnvelope(scope, at)     → the stored envelope object (for hashing)
+ *   • updateDataPointId(path, id) → stamps the dataPointId back onto the entry
+ * So this script does NOT fall back to the no-accessRecord path — it performs
+ * the full registerDataPoint + accessRecord + `access` settle op, matching the
+ * Node template's behaviour exactly.
+ *
+ * This script lives outside packages/* so the SDK is resolved as a downstream
+ * consumer would resolve it. Runs the Lite runtime in-process on a random port
+ * and drives every endpoint via plain fetch.
  *
  * Usage:
  *   cd ~/repo/personal-server-ts
  *   FUNDER_PRIVATE_KEY=0x... \
  *   GATEWAY_URL=https://data-gateway-... \
- *   npm run e2e:x402
+ *   npm run e2e:x402-lite
  *
  * Env (read from .env.local if present):
  *   GATEWAY_URL                             default: bundled Moksha dev gateway
@@ -33,13 +59,11 @@
  *   DEPOSIT_AMOUNT                          default: 0.1 (VANA)
  *   SCOPE                                   default: instagram.profile
  *   APP_URL                                 default: https://example-app.test
+ *   FINALIZE_TIMEOUT_MS                     default: 600000
  */
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
 import type { AddressInfo } from "node:net";
 import {
   createPublicClient,
@@ -60,7 +84,6 @@ import {
   ADD_DATA_TYPES,
   BUILDER_REGISTRATION_TYPES,
   GENERIC_PAYMENT_TYPES,
-  MASTER_KEY_MESSAGE,
   NATIVE_VANA_ASSET,
   SERVER_REGISTRATION_TYPES,
   builderRegistrationDomain,
@@ -83,10 +106,26 @@ import {
   nextPaymentNonce,
   type X402Challenge,
 } from "../packages/core/src/payment/index.js";
-import { ServerConfigSchema } from "../packages/core/src/schemas/server-config.js";
-import { createServer } from "../packages/server/src/bootstrap.js";
-import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
+import type { GatewayConfig } from "../packages/core/src/schemas/server-config.js";
+import { createServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { ServerAccount } from "../packages/core/src/keys/server-account.js";
+// ─── LITE-SPECIFIC imports ────────────────────────────────────────────────
+// Boot the same Lite runtime + auth wiring the browser uses, backed by the
+// in-memory stores (the Node-equivalent of SQLite + the data dir). Import
+// specifiers mirror scripts/e2e-read-scope-lite.ts verbatim.
+import {
+  createPsLiteRuntime,
+  createWeb3SignedPsLiteAuth,
+  type PsLiteRuntime,
+} from "../packages/lite/src/runtime.js";
+import {
+  createMemoryPsLiteStorage,
+  createMemoryPsLiteTokenStore,
+  createMemoryPsLiteAccessLogStore,
+} from "../packages/lite/src/test-support/memory.js";
+import { createInMemoryMcpConnectionStore } from "@opendatalabs/personal-server-ts-core/mcp";
+import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
+import type { DataReadPolicyPorts } from "@opendatalabs/personal-server-ts-core/policy";
 
 // ─── .env.local loader ──────────────────────────────────────────────────
 
@@ -310,23 +349,27 @@ function fmt(addr: string | null | undefined): string {
   return label ? `${addr} (${label})` : addr;
 }
 
-// ─── Personal server bootstrap ───────────────────────────────────────────
+// ─── Personal server LITE bootstrap ────────────────────────────────────────
+//
+// This is the heart of the Node-vs-Lite difference. The Node script calls
+// `createServer(...)` and lets the server derive a serverAccount from the
+// master-key signature. The Lite runtime takes its identity + signer + storage
+// as explicit options, so we build them here and hand them in.
 
 interface PersonalServerHandle {
   url: string;
-  // Exposed so the e2e can hand-craft the on-chain registrations that the
-  // disabled sync/upload worker would normally perform — AddData (data
-  // point) and FileRegistration. The server account signs FileRegistration
-  // because the URL is only known to the server in production.
-  indexManager: IndexManager;
+  // The in-memory DataStoragePort backing the Lite runtime. Exposed so the
+  // e2e can do the on-chain data-point registration the (disabled) sync/upload
+  // worker would normally perform — read the ingested entry/envelope for
+  // hashing, then patch its dataPointId. Node's equivalent was indexManager +
+  // dataDir; Lite's is this single port.
+  storage: DataStoragePort;
   serverAccount: ServerAccount;
-  dataDir: string;
   cleanup(): Promise<void>;
 }
 
-async function startPersonalServer(params: {
-  ownerSignature: Hex;
-  serverDir: string;
+async function startPersonalServerLite(params: {
+  ownerAddress: `0x${string}`;
 }): Promise<PersonalServerHandle> {
   // Reserve a port by binding ephemeral, then closing.
   const ephemeral: ServerType = serve({
@@ -341,50 +384,123 @@ async function startPersonalServer(params: {
   await new Promise<void>((resolve, reject) => {
     ephemeral.close((err) => (err ? reject(err) : resolve()));
   });
+  const origin = `http://localhost:${port}`;
 
-  const config = ServerConfigSchema.parse({
-    server: { port, origin: `http://localhost:${port}` },
-    logging: { level: "info", pretty: false },
-    // X402 enforcement on every builder read.
-    payment: { enabled: true },
-    // Local-only run — no tunnel, no sync.
-    tunnel: { enabled: false },
-    sync: { enabled: false },
-    gateway: {
-      url: GATEWAY_URL,
-      chainId: CHAIN_ID,
-      contracts: GATEWAY_CONFIG.contracts,
+  // ─── LITE-SPECIFIC: server identity + signer ─────────────────────────
+  // The Node server derives a serverAccount from the master-key signature and
+  // signs accessRecords with it. Lite has no master key, so we generate a
+  // fresh server private key and build a ServerAccount over it (viem
+  // privateKeyToAccount → {address, publicKey, signTypedData, signMessage}),
+  // then wrap it with createServerSigner so the runtime can sign
+  // GrantRegistration (delegated grants) AND RecordDataAccess (the x402
+  // accessRecord on paid reads).
+  const serverPrivateKey = generatePrivateKey();
+  const viemServerAccount = privateKeyToAccount(serverPrivateKey);
+  const serverAccount: ServerAccount = {
+    address: viemServerAccount.address,
+    publicKey: viemServerAccount.publicKey as `0x${string}`,
+    async signTypedData(p) {
+      return (await viemServerAccount.signTypedData({
+        domain: p.domain,
+        types: p.types,
+        primaryType: p.primaryType,
+        message: p.message,
+      } as Parameters<
+        typeof viemServerAccount.signTypedData
+      >[0])) as `0x${string}`;
     },
-  });
+    async signMessage(message: string) {
+      return (await viemServerAccount.signMessage({
+        message,
+      })) as `0x${string}`;
+    },
+  };
+  // createServerSigner takes the core GatewayConfig (chainId + contracts).
+  // GATEWAY_CONFIG is a DataPortabilityGatewayConfig with the identical shape
+  // for these fields, so it satisfies the GatewayConfig contract.
+  const serverSigner = createServerSigner(
+    serverAccount,
+    GATEWAY_CONFIG as GatewayConfig,
+  );
 
-  process.env.VANA_MASTER_KEY_SIGNATURE = params.ownerSignature;
+  // ─── LITE-SPECIFIC: in-memory stores + auth ───────────────────────────
+  // Memory analogues of the Node server's SQLite + data dir. The auth wiring
+  // mirrors scripts/e2e-read-scope-lite.ts: web3-signed owner auth, with the
+  // gateway client doubling as the read-policy verifier (auth session +
+  // grant). We share the access-log store between reader + writer.
+  const storage = createMemoryPsLiteStorage();
+  const accessLog = createMemoryPsLiteAccessLogStore();
+  const gateway = createGatewayClient(GATEWAY_URL);
+  // The Lite runtime + auth are typed against the BROWSER GatewayClient; the
+  // Node client is structurally compatible for the endpoints they touch
+  // (getServer/getBuilder/getGrant/registerDataPoint/payForOperation/…). One
+  // cast at the boundary keeps the call sites clean — mirrors the `as never`
+  // the browser e2e (e2e-read-scope-lite.ts) uses for the same reason.
+  const browserGateway = gateway as unknown as Parameters<
+    typeof createPsLiteRuntime
+  >[0]["gateway"];
+  // For the read-policy ports, the gateway doubles as both verifiers
+  // (authSessionVerifier.getBuilder + grantVerifier.getGrant).
+  const policyGateway =
+    gateway as unknown as DataReadPolicyPorts["grantVerifier"] &
+      DataReadPolicyPorts["authSessionVerifier"];
 
-  const dataDir = join(params.serverDir, "data");
-  const context = await createServer(config, {
-    serverDir: params.serverDir,
-    dataDir,
+  // createPsLiteRuntime computes paymentEnabled = config.payment?.enabled and
+  // THROWS if payment is enabled with an incomplete gateway config (it
+  // requires url + chainId + contracts.dataPortabilityEscrow + dataRegistry).
+  // GATEWAY_CONFIG is fully populated, so the full x402 path engages.
+  const runtime: PsLiteRuntime = createPsLiteRuntime({
+    active: true,
+    storage,
+    config: {
+      server: { origin },
+      gateway: {
+        url: GATEWAY_URL,
+        chainId: CHAIN_ID,
+        contracts: GATEWAY_CONFIG.contracts,
+      },
+      payment: { enabled: true },
+    },
+    gateway: browserGateway,
+    serverOwner: params.ownerAddress,
+    // Full ServerSigner — the runtime narrows it internally to
+    // signRecordDataAccess (x402 data path) and signGrantRegistration (grants).
+    serverSigner,
+    identity: {
+      address: serverAccount.address,
+      publicKey: serverAccount.publicKey,
+    },
+    accessLogReader: accessLog,
+    accessLogWriter: accessLog,
+    tokenStore: createMemoryPsLiteTokenStore(),
+    mcpConnectionStore: createInMemoryMcpConnectionStore(),
+    // In-memory config persistence — without this the runtime defaults to
+    // IndexedDB (browser-only) and throws under Node. Mirrors e2e-read-scope-lite.
+    saveConfig: async () => {},
+    stateCapabilities: { config: "memory" },
+    auth: createWeb3SignedPsLiteAuth({
+      origin,
+      ownerAddress: params.ownerAddress,
+      dataReadPolicyPorts: {
+        authSessionVerifier: policyGateway,
+        grantVerifier: policyGateway,
+      },
+    }),
   });
-  if (!context.serverAccount) {
-    throw new Error(
-      "Personal server didn't provision a serverAccount — master-key signature missing?",
-    );
-  }
 
   const httpServer: ServerType = serve({
-    fetch: context.app.fetch,
+    fetch: (request: Request) => runtime.fetch(request),
     port,
   });
 
   return {
-    url: `http://localhost:${port}`,
-    indexManager: context.indexManager,
-    serverAccount: context.serverAccount,
-    dataDir,
+    url: origin,
+    storage,
+    serverAccount,
     async cleanup() {
       await new Promise<void>((resolve, reject) => {
         httpServer.close((err) => (err ? reject(err) : resolve()));
       });
-      await context.cleanup();
     },
   };
 }
@@ -393,7 +509,7 @@ async function startPersonalServer(params: {
 
 async function main(): Promise<void> {
   console.log("═══════════════════════════════════════════════════════════");
-  console.log("  Personal server X402 end-to-end (Moksha)");
+  console.log("  Personal server LITE X402 end-to-end (Moksha)");
   console.log("═══════════════════════════════════════════════════════════");
   console.log(`  Gateway:        ${GATEWAY_URL}`);
   console.log(`  RPC:            ${RPC_URL}`);
@@ -432,34 +548,31 @@ async function main(): Promise<void> {
     `    builder-own: ${fmt(builderOwnerAccount.address)}  (testnet only)`,
   );
 
-  // ─── 2. User signs the master-key message, boots personal-server ───
-  step("User signs MASTER_KEY_MESSAGE and starts the personal server");
-  const ownerSignature = (await userAccount.signMessage({
-    message: MASTER_KEY_MESSAGE,
-  })) as Hex;
-  console.log(`    signature: ${ownerSignature.slice(0, 18)}…`);
-
-  const serverDir = await mkdtemp(join(tmpdir(), "e2e-ps-x402-"));
-  const ps = await startPersonalServer({ ownerSignature, serverDir });
+  // ─── 2. Boot the personal-server LITE runtime ──────────────────────
+  // No master-key signature here: the Lite runtime takes its identity + signer
+  // explicitly (we generate a fresh server keypair inside the bootstrap). The
+  // owner is just the user's address.
+  step("Booting the personal-server LITE runtime (createPsLiteRuntime)");
+  const ps = await startPersonalServerLite({
+    ownerAddress: userAccount.address,
+  });
   labelAddress(ps.serverAccount.address, "personal-server");
   console.log(`    server URL: ${ps.url}`);
   console.log(`    server acc: ${fmt(ps.serverAccount.address)}`);
-  console.log(`    dataDir:    ${serverDir}`);
 
   try {
-    // ─── 3. Read the server identity health endpoint ──────────────────
-    step("Reading personal-server /health for the derived server address");
+    // ─── 3. Read the Lite runtime /health for the server identity ─────
+    step("Reading LITE /health for the server identity");
     const healthRes = await fetch(`${ps.url}/health`);
     const health = (await healthRes.json()) as {
       identity?: {
         address: `0x${string}`;
         publicKey: `0x${string}`;
-        serverId: string | null;
       };
       owner?: `0x${string}`;
     };
     if (!health.identity) {
-      throw new Error("Personal server didn't report identity");
+      throw new Error("Lite runtime didn't report identity");
     }
     const serverAddress = health.identity.address;
     const serverPublicKey = health.identity.publicKey;
@@ -469,6 +582,11 @@ async function main(): Promise<void> {
         `serverOwner mismatch: health=${ownerFromHealth} expected=${userAccount.address}`,
       );
     }
+    assertEq(
+      serverAddress.toLowerCase(),
+      ps.serverAccount.address.toLowerCase(),
+      "health.identity.address == serverAccount.address",
+    );
     console.log(`    serverAddr: ${serverAddress}`);
 
     // ─── 4. User registers the personal server on the gateway ─────────
@@ -503,10 +621,10 @@ async function main(): Promise<void> {
 
     // ─── 5. App wallet registers itself as a builder ───────────────────
     step("App registering itself as a builder");
-    // Lower bound for the on-chain GranteeRegistered scan in step 18. The
-    // gateway relayer submits registerGrantee during a later settle drain, so
-    // the event lands after this block — scanning from here keeps the getLogs
-    // range tight while still covering the eventual tx.
+    // Lower bound for the on-chain GranteeRegistered scan in the final step.
+    // The gateway relayer submits registerGrantee during a later settle drain,
+    // so the event lands after this block — scanning from here keeps the
+    // getLogs range tight while still covering the eventual tx.
     const builderProbeFromBlock = await publicClient.getBlockNumber();
     // The gateway recovers the registration signature against ownerAddress
     // (expectedSigner = owner), so the OWNER signs — not the grantee. publicKey
@@ -616,8 +734,8 @@ async function main(): Promise<void> {
       );
     }
 
-    // ─── 7. User POSTs personal data to the personal server ─────────
-    step(`User posting data to personal server at scope=${SCOPE}`);
+    // ─── 7. User POSTs personal data to the LITE runtime ─────────────
+    step(`User posting data to LITE runtime at scope=${SCOPE}`);
     const body = { username: "vana_e2e", followers: 42 };
     const bodyStr = JSON.stringify(body);
     const bodyBytes = new TextEncoder().encode(bodyStr);
@@ -650,22 +768,25 @@ async function main(): Promise<void> {
     // ─── 7.5 Register the ingested envelope as a DPv2 data point ──────
     //
     // The personal server's upload worker would normally do this (sync
-    // worker → gateway.registerDataPoint → indexManager.updateDataPointId).
-    // We've disabled sync to keep the e2e storage-backend-free, so we
-    // perform the on-chain registration here using:
-    //   • the personal server's IndexEntry for hash inputs
-    //   • the USER wallet for AddData EIP-712 signing — unlike grants,
-    //     the gateway enforces `recovered(signature) == ownerAddress` for
-    //     AddData with no trusted-server delegation path (off-chain), so
-    //     the owner has to sign directly here
+    // worker → gateway.registerDataPoint → updateDataPointId). We've left
+    // sync disabled to keep the e2e storage-backend-free, so we perform the
+    // on-chain registration here using:
+    //   • the Lite DataStoragePort's IndexEntry for hash inputs (Node used
+    //     indexManager + the on-disk envelope; Lite uses findEntry +
+    //     readEnvelope on the in-memory port — see the "Lite storage note"
+    //     in the file header)
+    //   • the USER wallet for AddData EIP-712 signing — unlike grants, the
+    //     gateway enforces `recovered(signature) == ownerAddress` for AddData
+    //     with no trusted-server delegation path (off-chain), so the owner has
+    //     to sign directly here
     //   • a direct gateway.registerDataPoint call
-    // After it lands we patch IndexEntry.dataPointId so the next X402
+    // After it lands we patch the entry's dataPointId so the next X402
     // challenge embeds an `accessRecord` → `access` settle op gets queued
     // alongside grant/server/data.
     step("Registering ingested data on-chain via gateway.registerDataPoint");
-    const ingestedEntry = ps.indexManager.findLatestByScope(SCOPE);
+    const ingestedEntry = ps.storage.findEntry({ scope: SCOPE });
     if (!ingestedEntry) {
-      throw new Error(`personal server has no IndexEntry for scope=${SCOPE}`);
+      throw new Error(`Lite storage has no IndexEntry for scope=${SCOPE}`);
     }
     if (ingestedEntry.dataPointId) {
       throw new Error(
@@ -674,14 +795,14 @@ async function main(): Promise<void> {
     }
     // Mirror the upload worker's commitment recipe (see
     // packages/core/src/sync/workers/upload.ts ~L84-L110). We hash the
-    // in-memory canonical JSON of the envelope, NOT the pretty-printed
-    // on-disk bytes — readEnvelope deserializes, then we re-stringify
-    // compactly so the hash matches the worker's path exactly.
-    const envelopeJsonOnDisk = readFileSync(
-      join(ps.dataDir, ingestedEntry.path),
-      "utf-8",
+    // in-memory canonical JSON of the envelope. The Node script read the
+    // pretty-printed on-disk bytes then re-stringified compactly; the Lite
+    // port hands back the deserialized envelope directly, which we stringify
+    // compactly for the identical hash input.
+    const ingestedEnvelope = await ps.storage.readEnvelope(
+      ingestedEntry.scope,
+      ingestedEntry.collectedAt,
     );
-    const ingestedEnvelope = JSON.parse(envelopeJsonOnDisk);
     const ingestedPlaintext = new TextEncoder().encode(
       JSON.stringify(ingestedEnvelope),
     );
@@ -724,19 +845,19 @@ async function main(): Promise<void> {
     if (!dataPointId) {
       throw new Error("gateway.registerDataPoint returned no dataPointId");
     }
-    ps.indexManager.updateDataPointId(ingestedEntry.path, dataPointId);
+    await ps.storage.updateDataPointId(ingestedEntry.path, dataPointId);
     console.log(`    dataPointId: ${dataPointId}`);
     console.log(`    version:     ${ingestedEntry.version}`);
 
-    // ─── 8. User creates a grant via the personal server (delegated) ──
+    // ─── 8. User creates a grant via the LITE runtime (delegated) ─────
     //
-    // The personal server signs the GrantRegistration EIP-712 with its own
-    // server key on behalf of the owner; the message carries
-    // `grantorAddress: serverOwner`. Both the gateway (off-chain) and the
-    // V2 PermissionsV2 contract (on-chain) accept this via a trusted-
-    // server delegation check: the recovered signer is allowed to act
-    // for `grantorAddress` if it's a registered trusted server. This
-    // exercises the delegation path end-to-end including on-chain settle.
+    // The Lite runtime signs the GrantRegistration EIP-712 with its server
+    // signer (createServerSigner.signGrantRegistration) on behalf of the
+    // owner; the message carries `grantorAddress: serverOwner`. Both the
+    // gateway (off-chain) and the V2 PermissionsV2 contract (on-chain) accept
+    // this via a trusted-server delegation check: the recovered signer is
+    // allowed to act for `grantorAddress` if it's a registered trusted server.
+    // This exercises the delegation path end-to-end including on-chain settle.
     step(`User granting scope="${SCOPE}" to app via POST /v1/grants`);
     const grantBodyObj = {
       granteeAddress: appAccount.address,
@@ -900,10 +1021,10 @@ async function main(): Promise<void> {
       `    ✓ no payment ⇒ data withheld: 402 body is a challenge {${challengeKeys.join(", ")}}, not the envelope`,
     );
 
-    // recordId is opId for the `access` settle op we watch in step 16.
+    // recordId is opId for the `access` settle op we watch in the poll loop.
     const accessRecordId: Hex | undefined = accept.accessRecord?.recordId;
 
-    // ─── 10. App signs the GenericPayment + retries with X-PAYMENT ───
+    // ─── 11. App signs the GenericPayment + retries with X-PAYMENT ───
     step("App signing GenericPayment and retrying with X-PAYMENT");
     const paymentNonce = nextPaymentNonce();
     const paymentMessage = {
@@ -989,7 +1110,7 @@ async function main(): Promise<void> {
       console.log("      (none — personal server didn't forward gateway body)");
     }
 
-    // ─── 11. Verify post-payment state on the gateway ────────────────
+    // ─── 12. Verify post-payment state on the gateway ────────────────
     step("Verifying grant.paymentStatus flipped to 'paid'");
     const grantAfterPay = await gateway.getGrant(grantId);
     if (!grantAfterPay) throw new Error("grant disappeared after pay");
@@ -1066,7 +1187,7 @@ async function main(): Promise<void> {
       `    (debit lands in 'balance' at on-chain settle — see post-finalization check)`,
     );
 
-    // ─── 12. Replay the same X-PAYMENT → should be rejected ──────────
+    // ─── 13. Replay the same X-PAYMENT → should be rejected ──────────
     step(
       "Replaying the same X-PAYMENT — gateway should reject 409 → fresh 402",
     );
@@ -1091,7 +1212,7 @@ async function main(): Promise<void> {
       `    replay rejected (nonce already used by gateway); a fresh challenge was reissued`,
     );
 
-    // ─── 15. Drain pending ops to chain via gateway.settle ───────────
+    // ─── 14. Drain pending ops to chain via gateway.settle ───────────
     // settle() submits pending off-chain ledger entries to L1: grant
     // registration, server registration, the just-settled payment, etc.
     // The gateway batches scans; ops can be in {pending|submitting|
@@ -1101,8 +1222,8 @@ async function main(): Promise<void> {
     // depends on the server's on-chain registration tx having mined
     // first, but they may be sent in the same batch and race. The
     // gateway's own scheduler retries failed items on subsequent passes;
-    // our poll in step 16 lets that play out. We log the diagnostic so
-    // the operator can see what happened but don't bail.
+    // our poll lets that play out. We log the diagnostic so the operator
+    // can see what happened but don't bail.
     // ─── Resolve fee recipients from the FeeRegistry contract ───────
     //
     // FeeRegistry has up to 5 configurable ops, each with its own payee
@@ -1206,12 +1327,12 @@ async function main(): Promise<void> {
     // Builder settles on-chain via the gateway's drainBuilders → registerGrantee.
     // We do NOT hard-assert on this single drain batch: drainBuilders gates on
     // (status='pending' AND payment_status='paid') with FOR UPDATE SKIP LOCKED,
-    // so the builder row may be picked up by THIS settle(), a later poll in
-    // step 16, or a concurrent gateway drain that already moved it past
-    // 'pending' — in which case it's legitimately absent from items[]. We
-    // capture the drain item opportunistically (for its settle tx hash) and
-    // defer the real assertion to step 18, which checks the on-chain
-    // GranteeRegistered event directly (ground truth, batch-independent).
+    // so the builder row may be picked up by THIS settle(), a later poll, or a
+    // concurrent gateway drain that already moved it past 'pending' — in which
+    // case it's legitimately absent from items[]. We capture the drain item
+    // opportunistically (for its settle tx hash) and defer the real assertion
+    // to the final step, which checks the on-chain GranteeRegistered event
+    // directly (ground truth, batch-independent).
     //
     // NB: older vana-sdk builds typed SettleOpType as
     // "grant"|"server"|"data"|"access" (no "builder"); the gateway always
@@ -1232,11 +1353,11 @@ async function main(): Promise<void> {
       );
     } else {
       console.log(
-        `    builder: not in this drain batch (already drained, or queued for a later pass — verified on-chain in step 18)`,
+        `    builder: not in this drain batch (already drained, or queued for a later pass — verified on-chain below)`,
       );
     }
 
-    // ─── 16. Poll gateway.settle until ALL watched ops finalize ─────
+    // ─── 15. Poll gateway.settle until ALL watched ops finalize ─────
     // Loop until every watched op reaches status="finalized". `reorged`
     // is fatal (chain rewound past a settle tx; the gateway will resubmit
     // but the assertion target moved). On each poll we capture the settle
@@ -1253,7 +1374,7 @@ async function main(): Promise<void> {
     const FINALIZE_POLL_MS = Number(process.env["FINALIZE_POLL_MS"] ?? 10_000);
     // NOTE: builder is intentionally NOT in the finalize-watched set. The
     // gateway settle DRAIN submits the registerGrantee tx on-chain (asserted
-    // above from the drain result), but its RECONCILE phase does not track
+    // below from the drain result), but its RECONCILE phase does not track
     // builder finalization — `reconciled.items` never carries a builder entry,
     // so it would hang at builder=pending forever. We assert builder settled
     // (confirmed + tx) at drain time instead.
@@ -1281,8 +1402,8 @@ async function main(): Promise<void> {
     while (Date.now() - finalizeStart < FINALIZE_TIMEOUT_MS) {
       const r = await gateway.settle();
       // Each poll is also a fresh drain — grab the builder item the first time
-      // any pass surfaces it, so step 18 can report the settle-drain tx hash
-      // alongside the on-chain event.
+      // any pass surfaces it, so the final step can report the settle-drain tx
+      // hash alongside the on-chain event.
       if (!builderDrainItem) {
         builderDrainItem = r.items.find(
           (i: SettleItem) =>
@@ -1358,12 +1479,12 @@ async function main(): Promise<void> {
       );
     }
 
-    // ─── 18. Assert builder registration landed on-chain ────────────
+    // ─── 16. Assert builder registration landed on-chain ────────────
     // Ground truth for builder settlement: the DataPortabilityGrantees
     // contract emits GranteeRegistered when the gateway relayer submits
     // registerGrantee for the builder row. We assert against the event (not a
     // single settle batch) because the builder is not reconcile-tracked and
-    // its drain pass is non-deterministic (see the step-17 note). By the time
+    // its drain pass is non-deterministic (see the step-14 note). By the time
     // the watched ops above have finalized, the builder's registerGrantee —
     // submitted in the same drain wave — has been mined; a short poll covers
     // any lag.
@@ -1603,7 +1724,7 @@ async function main(): Promise<void> {
     console.log(
       "\n═══════════════════════════════════════════════════════════",
     );
-    console.log("  ✓ Personal server X402 E2E PASSED");
+    console.log("  ✓ Personal server LITE X402 E2E PASSED");
     console.log("═══════════════════════════════════════════════════════════");
     console.log(`  user:    ${userAccount.address}`);
     console.log(`  app:     ${appAccount.address}`);
@@ -1614,14 +1735,11 @@ async function main(): Promise<void> {
     await ps.cleanup().catch((err) => {
       console.error("cleanup failed:", err);
     });
-    await rm(serverDir, { recursive: true, force: true }).catch(
-      () => undefined,
-    );
   }
 }
 
 main().catch((err) => {
-  console.error("\n✗ Personal server X402 E2E failed:");
+  console.error("\n✗ Personal server LITE X402 E2E failed:");
   console.error(err);
   process.exit(1);
 });

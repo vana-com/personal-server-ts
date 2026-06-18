@@ -32,6 +32,7 @@
     "register-server": "tsx --env-file-if-exists=.env scripts/register-server.ts",
     "register-builder": "tsx --env-file-if-exists=.env scripts/register-builder.ts",
     "e2e:x402": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/e2e-x402-flow.ts",
+    "e2e:x402-lite": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/e2e-x402-lite.ts",
     "e2e:sync": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/e2e-storage-sync.ts",
     "e2e:register-pdf": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/e2e-register-pdf.ts",
     "e2e:read-scope": "tsx scripts/e2e-read-scope.ts",
@@ -54,7 +55,7 @@
   "devDependencies": {
     "@commitlint/cli": "^20.5.3",
     "@commitlint/config-conventional": "^20.5.3",
-    "@opendatalabs/vana-sdk": "3.4.1-canary.a244135",
+    "@opendatalabs/vana-sdk": "3.4.1-canary.e9d0aad",
     "@semantic-release/commit-analyzer": "^13.0.1",
     "@semantic-release/git": "^10.0.1",
     "@semantic-release/github": "^12.0.6",
