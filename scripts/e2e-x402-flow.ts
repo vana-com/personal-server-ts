@@ -9,8 +9,10 @@
  *   4. The app pre-funds its escrow with VANA so it can pay for reads.
  *   5. The user POSTs personal data to the server (instagram.profile).
  *   6. The user grants the app permission to read that scope via the server.
- *   7. The app does a GET, hits the X402 paywall, signs the payment, retries.
- *   8. The gateway accepts the payment, the server serves the envelope.
+ *   7. The app does a GET, hits the X402 paywall. Without payment the data is
+ *      withheld (the 402 body is a challenge, never the envelope).
+ *   8. The app signs the payment and retries; the gateway accepts it and the
+ *      server serves the envelope.
  *
  * This script lives outside packages/* so the SDK is resolved as a
  * downstream consumer would resolve it. Runs the personal-server in-process
@@ -46,6 +48,7 @@ import {
   formatEther,
   http,
   keccak256,
+  parseAbiItem,
   parseEther,
   stringToHex,
   type Hex,
@@ -413,10 +416,21 @@ async function main(): Promise<void> {
   const appPrivateKey = generatePrivateKey();
   const appAccount = privateKeyToAccount(appPrivateKey);
   const appPublicKey = uncompressedPublicKey(appPrivateKey);
+  // The builder OWNER is a separate identity from the grantee. registerGrantee
+  // takes (owner, granteeAddress, publicKey): the owner authorizes (and signs)
+  // the registration, the grantee is the app wallet whose key backs publicKey.
+  // The owner only signs off-chain (EIP-712) — the gateway relayer submits the
+  // tx — so it needs no on-chain balance.
+  const builderOwnerPrivateKey = generatePrivateKey();
+  const builderOwnerAccount = privateKeyToAccount(builderOwnerPrivateKey);
   labelAddress(userAccount.address, "user");
-  labelAddress(appAccount.address, "app/builder");
-  console.log(`    user:    ${fmt(userAccount.address)}  (testnet only)`);
-  console.log(`    app:     ${fmt(appAccount.address)}  (testnet only)`);
+  labelAddress(appAccount.address, "app/grantee");
+  labelAddress(builderOwnerAccount.address, "builder-owner");
+  console.log(`    user:        ${fmt(userAccount.address)}  (testnet only)`);
+  console.log(`    app/grantee: ${fmt(appAccount.address)}  (testnet only)`);
+  console.log(
+    `    builder-own: ${fmt(builderOwnerAccount.address)}  (testnet only)`,
+  );
 
   // ─── 2. User signs the master-key message, boots personal-server ───
   step("User signs MASTER_KEY_MESSAGE and starts the personal server");
@@ -489,19 +503,27 @@ async function main(): Promise<void> {
 
     // ─── 5. App wallet registers itself as a builder ───────────────────
     step("App registering itself as a builder");
-    const builderSig = await appAccount.signTypedData({
+    // Lower bound for the on-chain GranteeRegistered scan in step 18. The
+    // gateway relayer submits registerGrantee during a later settle drain, so
+    // the event lands after this block — scanning from here keeps the getLogs
+    // range tight while still covering the eventual tx.
+    const builderProbeFromBlock = await publicClient.getBlockNumber();
+    // The gateway recovers the registration signature against ownerAddress
+    // (expectedSigner = owner), so the OWNER signs — not the grantee. publicKey
+    // must still derive to granteeAddress (the app wallet).
+    const builderSig = await builderOwnerAccount.signTypedData({
       domain: builderRegistrationDomain(GATEWAY_CONFIG),
       types: BUILDER_REGISTRATION_TYPES,
       primaryType: "BuilderRegistration",
       message: {
-        ownerAddress: appAccount.address,
+        ownerAddress: builderOwnerAccount.address,
         granteeAddress: appAccount.address,
         publicKey: appPublicKey,
         appUrl: APP_URL,
       },
     });
     const builderRes = await gateway.registerBuilder({
-      ownerAddress: appAccount.address,
+      ownerAddress: builderOwnerAccount.address,
       granteeAddress: appAccount.address,
       publicKey: appPublicKey,
       appUrl: APP_URL,
@@ -512,6 +534,9 @@ async function main(): Promise<void> {
     }
     const builderId = builderRes.builderId as Hex;
     console.log(`    builderId:  ${builderId}`);
+    console.log(
+      `    owner→grantee: ${fmt(builderOwnerAccount.address)} → ${fmt(appAccount.address)}`,
+    );
 
     // (The funder deposit is deferred until AFTER grant creation so we can
     // size it from the grant's actual fee — gateway FeeRegistry values
@@ -853,6 +878,28 @@ async function main(): Promise<void> {
     } else {
       console.log(`    accessRec:  (none — entry has no dataPointId)`);
     }
+
+    // ─── Negative case: no payment ⇒ no data ──────────────────────────
+    // The app made an authorized, grant-valid read but did NOT pay the fee.
+    // The server withholds the data: the 402 body is a payment challenge, not
+    // the protected envelope. Prove the ingested secret ("vana_e2e") did not
+    // leak in the unpaid response — i.e. without paying, the app cannot get
+    // the data.
+    if (JSON.stringify(challenge).includes("vana_e2e")) {
+      throw new Error(
+        "Unpaid 402 response leaked the protected data — paywall not enforced",
+      );
+    }
+    const challengeKeys = Object.keys(
+      challenge as unknown as Record<string, unknown>,
+    );
+    if (challengeKeys.includes("data")) {
+      throw new Error("Unpaid 402 body unexpectedly carried a `data` field");
+    }
+    console.log(
+      `    ✓ no payment ⇒ data withheld: 402 body is a challenge {${challengeKeys.join(", ")}}, not the envelope`,
+    );
+
     // recordId is opId for the `access` settle op we watch in step 16.
     const accessRecordId: Hex | undefined = accept.accessRecord?.recordId;
 
@@ -1156,33 +1203,38 @@ async function main(): Promise<void> {
       logInitial("access", accessRecordId, "access");
     }
 
-    // Assert the builder registration actually settled on-chain in this drain
-    // (fresh app wallet ⇒ a new builder row ⇒ drained this pass). The gateway
-    // submits registerGrantee; we don't gate on reconcile-finalization since
-    // the reconcile phase doesn't track builder ops (see watched note below).
-    const builderSettle = settleResult.items.find(
+    // Builder settles on-chain via the gateway's drainBuilders → registerGrantee.
+    // We do NOT hard-assert on this single drain batch: drainBuilders gates on
+    // (status='pending' AND payment_status='paid') with FOR UPDATE SKIP LOCKED,
+    // so the builder row may be picked up by THIS settle(), a later poll in
+    // step 16, or a concurrent gateway drain that already moved it past
+    // 'pending' — in which case it's legitimately absent from items[]. We
+    // capture the drain item opportunistically (for its settle tx hash) and
+    // defer the real assertion to step 18, which checks the on-chain
+    // GranteeRegistered event directly (ground truth, batch-independent).
+    //
+    // NB: older vana-sdk builds typed SettleOpType as
+    // "grant"|"server"|"data"|"access" (no "builder"); the gateway always
+    // emitted builder items at runtime, so this find() works regardless — the
+    // SDK type widening just makes `i.opType === "builder"` type-check.
+    let builderDrainItem: SettleItem | undefined = settleResult.items.find(
       (i: SettleItem) =>
         i.opType === "builder" &&
         i.opId.toLowerCase() === builderId.toLowerCase(),
     );
-    if (
-      !builderSettle ||
-      (builderSettle.status !== "confirmed" &&
-        builderSettle.status !== "submitting")
-    ) {
-      throw new Error(
-        `builder registration did not settle on-chain (registerGrantee): ${
-          builderSettle
-            ? `status=${builderSettle.status}`
-            : "not in settle scan"
-        }`,
+    if (builderDrainItem) {
+      const tx =
+        "settleTxHash" in builderDrainItem
+          ? builderDrainItem.settleTxHash
+          : null;
+      console.log(
+        `    builder: drained this pass status=${builderDrainItem.status}${tx ? ` tx=${tx}` : ""}`,
+      );
+    } else {
+      console.log(
+        `    builder: not in this drain batch (already drained, or queued for a later pass — verified on-chain in step 18)`,
       );
     }
-    const builderTx =
-      "settleTxHash" in builderSettle ? builderSettle.settleTxHash : null;
-    console.log(
-      `    ✓ builder registration settled on-chain (registerGrantee) tx=${builderTx ?? "(pending)"}`,
-    );
 
     // ─── 16. Poll gateway.settle until ALL watched ops finalize ─────
     // Loop until every watched op reaches status="finalized". `reorged`
@@ -1228,6 +1280,16 @@ async function main(): Promise<void> {
     let finalized = false;
     while (Date.now() - finalizeStart < FINALIZE_TIMEOUT_MS) {
       const r = await gateway.settle();
+      // Each poll is also a fresh drain — grab the builder item the first time
+      // any pass surfaces it, so step 18 can report the settle-drain tx hash
+      // alongside the on-chain event.
+      if (!builderDrainItem) {
+        builderDrainItem = r.items.find(
+          (i: SettleItem) =>
+            i.opType === "builder" &&
+            i.opId.toLowerCase() === builderId.toLowerCase(),
+        );
+      }
       const elapsed = Math.round((Date.now() - finalizeStart) / 1000);
       let allFinalized = true;
       let line = `    [${elapsed}s]`;
@@ -1294,6 +1356,63 @@ async function main(): Promise<void> {
           ` tx=${s.settleTxHash ?? "(none)"}` +
           ` block=${s.chainBlockHeight ?? "(unknown)"}`,
       );
+    }
+
+    // ─── 18. Assert builder registration landed on-chain ────────────
+    // Ground truth for builder settlement: the DataPortabilityGrantees
+    // contract emits GranteeRegistered when the gateway relayer submits
+    // registerGrantee for the builder row. We assert against the event (not a
+    // single settle batch) because the builder is not reconcile-tracked and
+    // its drain pass is non-deterministic (see the step-17 note). By the time
+    // the watched ops above have finalized, the builder's registerGrantee —
+    // submitted in the same drain wave — has been mined; a short poll covers
+    // any lag.
+    step("Verifying builder registration landed on-chain (GranteeRegistered)");
+    const GRANTEE_REGISTERED_EVENT = parseAbiItem(
+      "event GranteeRegistered(uint256 indexed granteeId, address indexed owner, address indexed granteeAddress, string publicKey)",
+    );
+    const granteesContract = GATEWAY_CONFIG.contracts
+      .dataPortabilityGrantees as `0x${string}`;
+    let granteeId: bigint | undefined;
+    let granteeTxHash: `0x${string}` | null = null;
+    let granteeBlock: bigint | null = null;
+    for (let attempt = 1; attempt <= 5 && granteeId === undefined; attempt++) {
+      // getLogs is typed off the `event` arg, so `log.args` is fully inferred.
+      const logs = await publicClient.getLogs({
+        address: granteesContract,
+        event: GRANTEE_REGISTERED_EVENT,
+        args: { granteeAddress: appAccount.address },
+        fromBlock: builderProbeFromBlock,
+        toBlock: "latest",
+      });
+      const last = logs.at(-1);
+      if (last) {
+        granteeId = last.args.granteeId;
+        granteeTxHash = last.transactionHash;
+        granteeBlock = last.blockNumber;
+      } else {
+        await new Promise((r) => setTimeout(r, FINALIZE_POLL_MS));
+      }
+    }
+    if (granteeId === undefined) {
+      throw new Error(
+        `builder registration did not land on-chain: no GranteeRegistered ` +
+          `event for granteeAddress=${appAccount.address} on ${granteesContract} ` +
+          `(scanned from block ${builderProbeFromBlock})`,
+      );
+    }
+    const drainTx =
+      builderDrainItem && "settleTxHash" in builderDrainItem
+        ? builderDrainItem.settleTxHash
+        : null;
+    console.log(
+      `    ✓ builder registered on-chain (registerGrantee)` +
+        ` granteeId=${granteeId}` +
+        ` tx=${granteeTxHash}` +
+        ` block=${granteeBlock}`,
+    );
+    if (drainTx) {
+      console.log(`      (settle drain reported tx=${drainTx})`);
     }
 
     // ─── Verify app's escrow was debited by the paid amount ────────
