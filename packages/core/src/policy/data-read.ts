@@ -34,6 +34,18 @@ export interface DataReadPolicyPorts {
   runtimeAvailability?: RuntimeAvailabilityPort;
 }
 
+function parseExpiresAtSeconds(value: unknown): number | null {
+  if (value === null || value === undefined || value === "0") return 0;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value !== "string") return null;
+
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return numeric;
+
+  const millis = Date.parse(value);
+  return Number.isNaN(millis) ? null : Math.floor(millis / 1000);
+}
+
 export async function verifyDataReadPolicy(
   input: DataReadPolicyInput,
   ports: DataReadPolicyPorts,
@@ -77,16 +89,21 @@ export async function verifyDataReadPolicy(
   }
 
   if (grant.expiresAt !== null && grant.expiresAt !== undefined) {
-    // Canary surfaces the wire-format string; "0" is the sentinel for
-    // perpetual grants and the gateway returns `expired: false` for them,
-    // but we re-check locally against the system clock so the policy
-    // doesn't trust a stale `expired` snapshot.
-    const expiresAtSec = BigInt(grant.expiresAt);
-    if (expiresAtSec > 0n) {
-      const nowSec = BigInt(Math.floor(Date.now() / 1000));
+    // DPv2 may surface either the legacy uint256-seconds string or the
+    // current gateway ISO timestamp. Parse both so the policy stays aligned
+    // with the gateway response shape.
+    const expiresAtSec = parseExpiresAtSeconds(grant.expiresAt);
+    if (expiresAtSec === null) {
+      throw new ScopeMismatchError({
+        requestedScope: input.requestedScope,
+        reason: "Grant expiry is invalid",
+      });
+    }
+    if (expiresAtSec > 0) {
+      const nowSec = Math.floor(Date.now() / 1000);
       if (expiresAtSec < nowSec) {
         throw new GrantExpiredError({
-          expiresAt: Number(expiresAtSec),
+          expiresAt: expiresAtSec,
         });
       }
     }
