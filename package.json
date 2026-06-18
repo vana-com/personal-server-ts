@@ -54,7 +54,7 @@
   "devDependencies": {
     "@commitlint/cli": "^20.5.3",
     "@commitlint/config-conventional": "^20.5.3",
-    "@opendatalabs/vana-sdk": "3.4.1-canary.a244135",
+    "@opendatalabs/vana-sdk": "3.4.1-canary.e9d0aad",
     "@semantic-release/commit-analyzer": "^13.0.1",
     "@semantic-release/git": "^10.0.1",
     "@semantic-release/github": "^12.0.6",
