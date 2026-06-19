@@ -43,6 +43,14 @@ export interface IndexManager {
    * @returns true if row was updated, false if path not found
    */
   updateDataPointId(path: string, dataPointId: string): boolean;
+  /**
+   * Update the DPv2 `version` for an index entry. Used by the upload worker
+   * when a registration is rebased onto the registry's live version after a
+   * stale-expectedVersion conflict (the blob key embeds the version, so the
+   * local row must follow).
+   * @returns true if row was updated, false if path not found
+   */
+  updateVersion(path: string, version: number): boolean;
   /** Deletes all index entries for a scope. Returns count of deleted rows. */
   deleteByScope(scope: string): number;
   close(): void;

@@ -40,6 +40,12 @@ export interface IndexManager {
    * @returns true if row was updated, false if path not found
    */
   updateDataPointId(path: string, dataPointId: string): boolean;
+  /**
+   * Update the DPv2 `version` for an index entry (upload-worker rebase after
+   * a stale-expectedVersion conflict).
+   * @returns true if row was updated, false if path not found
+   */
+  updateVersion(path: string, version: number): boolean;
   /** Deletes all index entries for a scope. Returns count of deleted rows. */
   deleteByScope(scope: string): number;
   close(): void;
@@ -136,6 +142,10 @@ export function createIndexManager(db: Database.Database): IndexManager {
     data_point_id: string;
     path: string;
   }>("UPDATE data_files SET data_point_id = @data_point_id WHERE path = @path");
+
+  const updateVersionStmt = db.prepare<{ version: number; path: string }>(
+    "UPDATE data_files SET version = @version WHERE path = @path",
+  );
 
   const deleteByScopeStmt = db.prepare<{ scope: string }>(
     "DELETE FROM data_files WHERE scope = @scope",
@@ -305,6 +315,11 @@ export function createIndexManager(db: Database.Database): IndexManager {
         data_point_id: dataPointId,
         path,
       });
+      return result.changes > 0;
+    },
+
+    updateVersion(path, version) {
+      const result = updateVersionStmt.run({ version, path });
       return result.changes > 0;
     },
 

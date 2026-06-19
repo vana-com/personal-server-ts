@@ -330,6 +330,13 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
       return true;
     },
 
+    updateEntryVersion(path, version) {
+      const entry = entries.get(path);
+      if (!entry) return false;
+      entries.set(path, { ...entry, version });
+      return true;
+    },
+
     async deleteScope(scope) {
       let deleted = 0;
       for (const [path, entry] of entries.entries()) {

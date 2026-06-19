@@ -101,6 +101,9 @@ export function createNodeDataStorage(
     updateDataPointId(path: string, dataPointId: string) {
       return deps.indexManager.updateDataPointId(path, dataPointId);
     },
+    updateEntryVersion(path: string, version: number) {
+      return deps.indexManager.updateVersion(path, version);
+    },
     async deleteScope(scope: string) {
       const deletedCount = deps.indexManager.deleteByScope(scope);
       await deleteAllForScope(deps.hierarchyOptions, scope);

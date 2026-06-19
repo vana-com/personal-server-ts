@@ -144,6 +144,13 @@ export interface DataStoragePort extends RuntimeStoragePort {
     path: string,
     dataPointId: string,
   ): boolean | Promise<boolean>;
+  /**
+   * Rewrites the DPv2 `version` on an entry. Used when the upload worker
+   * rebases a registration onto the registry's live version after a
+   * stale-expectedVersion conflict — the blob key embeds the version, so
+   * the local row must follow the registered one.
+   */
+  updateEntryVersion(path: string, version: number): boolean | Promise<boolean>;
   deleteScope(scope: string): Promise<number>;
   /**
    * Delete a single version (index entry + its local blob) by its gateway fileId.
