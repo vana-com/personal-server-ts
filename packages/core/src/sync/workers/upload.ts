@@ -1,4 +1,4 @@
-import { keccak256, stringToHex } from "viem";
+import { encodeAbiParameters, keccak256, stringToHex } from "viem";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import {
   deriveScopeKey,
@@ -102,35 +102,86 @@ export async function uploadOne(
   // before registering so the on-chain data point (the synced marker) is
   // never stamped ahead of a blob that failed to land.
   const storageKey = `${entry.scope}/${entry.version}`;
-  const url = await storageAdapter.upload(storageKey, encrypted);
+  let url = await storageAdapter.upload(storageKey, encrypted);
 
   // 6. DPv2 data-point registration (idempotent — skipped when a prior run
   // already persisted a dataPointId on this entry). registerDataPoint stamps
   // the synced marker that excludes this entry from findUnsynced next time.
-  let dataPointId = entry.dataPointId;
-  if (!dataPointId) {
-    const addDataSignature = await signer.signAddData({
-      ownerAddress: serverOwner as `0x${string}`,
-      scope: entry.scope,
-      dataHash,
-      metadataHash,
-      expectedVersion: BigInt(entry.version),
-    });
+  let dataPointId: string;
+  if (entry.dataPointId) {
+    dataPointId = entry.dataPointId;
+  } else {
+    const registerAt = async (version: bigint): Promise<string> => {
+      const addDataSignature = await signer.signAddData({
+        ownerAddress: serverOwner as `0x${string}`,
+        scope: entry.scope,
+        dataHash,
+        metadataHash,
+        expectedVersion: version,
+      });
 
-    const dataPointResult = await gateway.registerDataPoint({
-      ownerAddress: serverOwner,
-      scope: entry.scope,
-      dataHash,
-      metadataHash,
-      expectedVersion: String(entry.version),
-      signature: addDataSignature,
-    });
+      const dataPointResult = await gateway.registerDataPoint({
+        ownerAddress: serverOwner,
+        scope: entry.scope,
+        dataHash,
+        metadataHash,
+        expectedVersion: String(version),
+        signature: addDataSignature,
+      });
 
-    dataPointId = dataPointResult.dataPointId ?? null;
-    if (!dataPointId) {
-      throw new Error(
-        `Gateway registerDataPoint did not return a dataPointId for ${entry.path} (scope=${entry.scope}, version=${entry.version})`,
+      const id = dataPointResult.dataPointId ?? null;
+      if (!id) {
+        throw new Error(
+          `Gateway registerDataPoint did not return a dataPointId for ${entry.path} (scope=${entry.scope}, version=${version})`,
+        );
+      }
+      return id;
+    };
+
+    try {
+      dataPointId = await registerAt(BigInt(entry.version));
+    } catch (err) {
+      if (!isStaleVersionConflict(err)) throw err;
+      // The registry's version for this (owner, scope) is ahead of the local
+      // index: pre-DPv2 rows were backfilled to version 1, and other replicas
+      // (PS Lite in the browser) advance the same per-scope sequence. The
+      // gateway 409s precisely so the client can re-sign against the live
+      // version — retrying the same version every cycle head-blocks the
+      // scope's whole upload queue.
+      const record = await gateway.getDataPoint(
+        computeDataPointId(serverOwner, entry.scope),
       );
+      if (!record) throw err;
+
+      if (record.dataHash.toLowerCase() === dataHash.toLowerCase()) {
+        // Identical content is already registered (this entry, or a replica's
+        // copy of it) — adopt the registered data point rather than minting a
+        // new version of the same bytes. The registrant already uploaded the
+        // blob under the registered version key.
+        dataPointId = record.id;
+        // Align the local row with the adopted registry version — downstream
+        // consumers sign from the row's version (e.g. x402 RecordDataAccess),
+        // so a stale local version would emit records the registry rejects.
+        const adoptedVersion = Number(record.expectedVersion);
+        if (adoptedVersion !== entry.version) {
+          await storage.updateEntryVersion(entry.path, adoptedVersion);
+        }
+      } else {
+        // Rebase: re-sign one past the registry's live version. The blob key
+        // embeds the version (replicas reconstruct URLs from the registry
+        // record), so the rebased version needs its own blob; the one written
+        // under the stale key above is orphaned, which storage tolerates.
+        const rebased = BigInt(record.expectedVersion) + 1n;
+        url = await storageAdapter.upload(
+          `${entry.scope}/${rebased}`,
+          encrypted,
+        );
+        // A concurrent replica can still win the race to `rebased`; the next
+        // sync cycle re-reads the registry and rebases again, so this stays
+        // convergent without looping here.
+        dataPointId = await registerAt(rebased);
+        await storage.updateEntryVersion(entry.path, Number(rebased));
+      }
     }
 
     // 7. Stamp the dataPointId on the local index entry — marks it synced.
@@ -184,5 +235,35 @@ export async function uploadAll(
 function uint8ToHex(bytes: Uint8Array): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
     "",
+  );
+}
+
+// The gateway rejects a registration whose expectedVersion is not strictly
+// greater than its stored value with a 409; the SDK client surfaces it as
+// `Gateway error: 409 <detail>`. Anything else is not a version conflict.
+function isStaleVersionConflict(err: unknown): err is Error {
+  return err instanceof Error && /Gateway error: 409\b/.test(err.message);
+}
+
+/**
+ * Deterministic DPv2 data-point id — `keccak256(abi.encode(owner, scope))`,
+ * the same primary key DataRegistryV2 and the gateway use. Lets the upload
+ * worker look up the registry's live row for a scope without a list call.
+ */
+export function computeDataPointId(
+  ownerAddress: string,
+  scope: string,
+): `0x${string}` {
+  // ABI-encoding an address is checksum-insensitive (same bytes either way),
+  // but viem rejects mixed-case strings that fail checksum validation —
+  // normalize so config-sourced owner strings can't trip it.
+  return keccak256(
+    encodeAbiParameters(
+      [
+        { name: "ownerAddress", type: "address" },
+        { name: "scope", type: "string" },
+      ],
+      [ownerAddress.toLowerCase() as `0x${string}`, scope],
+    ),
   );
 }
