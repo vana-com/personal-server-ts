@@ -33,6 +33,7 @@
     "register-builder": "tsx --env-file-if-exists=.env scripts/register-builder.ts",
     "e2e:x402": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/e2e-x402-flow.ts",
     "e2e:sync": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/e2e-storage-sync.ts",
+    "e2e:rebase": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/e2e-stale-version-rebase.ts",
     "e2e:register-pdf": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/e2e-register-pdf.ts",
     "e2e:read-scope": "tsx scripts/e2e-read-scope.ts",
     "e2e:read-scope-lite": "tsx scripts/e2e-read-scope-lite.ts",
