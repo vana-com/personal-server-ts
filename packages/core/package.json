@@ -130,7 +130,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "@opendatalabs/vana-sdk": "3.5.1-pr.159.12a6f39",
+    "@opendatalabs/vana-sdk": "3.6.0",
     "minisearch": "^7.2.0",
     "unpdf": "^1.6.2",
     "viem": "^2.48.11",
