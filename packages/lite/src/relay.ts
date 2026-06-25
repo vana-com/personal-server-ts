@@ -379,16 +379,87 @@ async function handleRelayHttpRequest(
       origin,
     },
   );
-  return buildHttpResponse(bridgeResponse);
+  // Large exports (e.g. chatgpt.conversations) are big JSON streamed over the
+  // relay's WebSocket tunnel; an uncompressed body inflates transfer time and the
+  // window for a mid-stream drop (truncated read → UND_ERR_RES_CONTENT_LENGTH_MISMATCH).
+  // gzip when the client accepts it and the payload is large enough to be worth it;
+  // the SDK/undici sends Accept-Encoding and auto-decompresses. See BUI-591.
+  const bodyBytes = decodeBase64(bridgeResponse.body);
+  const acceptsGzip = (request.headers["accept-encoding"] ?? "").includes(
+    "gzip",
+  );
+  const alreadyEncoded = Boolean(bridgeResponse.headers?.["content-encoding"]);
+  if (
+    acceptsGzip &&
+    !alreadyEncoded &&
+    bodyBytes.length >= GZIP_MIN_BYTES &&
+    typeof CompressionStream !== "undefined"
+  ) {
+    const gzipped = await gzipBytes(bodyBytes);
+    return buildHttpResponse(bridgeResponse, {
+      bodyOverride: gzipped,
+      contentEncoding: "gzip",
+    });
+  }
+  return buildHttpResponse(bridgeResponse, { bodyOverride: bodyBytes });
 }
 
-export function buildHttpResponse(response: PsLiteBridgeResponse): string {
-  const responseHeaders = {
+// Responses below this size aren't worth the gzip overhead, and small reads
+// already complete reliably over the relay.
+const GZIP_MIN_BYTES = 1024;
+
+async function gzipBytes(input: Uint8Array): Promise<Uint8Array> {
+  const cs = new CompressionStream("gzip");
+  const writer = cs.writable.getWriter();
+  // Copy into a fresh ArrayBuffer-backed view: TS types the stream's chunk as
+  // BufferSource, which excludes the generic Uint8Array<ArrayBufferLike>.
+  const chunk = new Uint8Array(input);
+  const writeDone = writer.write(chunk).then(() => writer.close());
+  const reader = cs.readable.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (value) {
+      chunks.push(value);
+      total += value.length;
+    }
+  }
+  await writeDone;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return out;
+}
+
+export function buildHttpResponse(
+  response: PsLiteBridgeResponse,
+  opts?: { bodyOverride?: Uint8Array; contentEncoding?: string },
+): string {
+  const responseHeaders: Record<string, string> = {
     "cache-control": "no-store",
     connection: "close",
     ...response.headers,
   };
-  const bodyBytes = decodeBase64(response.body);
+  // We always emit an authoritative content-length below, computed from the
+  // exact bytes we write (gzip changes the length vs. the upstream value). Drop
+  // any upstream copy first — the core raw-data path sets Content-Length and the
+  // bridge lowercases it, so without this the head would carry two conflicting
+  // content-length values and clients reject that (the same mismatch class this
+  // change fixes). Match case-insensitively in case the name wasn't normalized.
+  for (const key of Object.keys(responseHeaders)) {
+    if (key.toLowerCase() === "content-length") {
+      delete responseHeaders[key];
+    }
+  }
+  if (opts?.contentEncoding) {
+    responseHeaders["content-encoding"] = opts.contentEncoding;
+  }
+  const bodyBytes = opts?.bodyOverride ?? decodeBase64(response.body);
   const head = [
     `HTTP/1.1 ${response.status} ${httpStatusText(response.status)}`,
     ...Object.entries(responseHeaders).map(
