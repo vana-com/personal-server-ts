@@ -445,6 +445,17 @@ export function buildHttpResponse(
     connection: "close",
     ...response.headers,
   };
+  // We always emit an authoritative content-length below, computed from the
+  // exact bytes we write (gzip changes the length vs. the upstream value). Drop
+  // any upstream copy first — the core raw-data path sets Content-Length and the
+  // bridge lowercases it, so without this the head would carry two conflicting
+  // content-length values and clients reject that (the same mismatch class this
+  // change fixes). Match case-insensitively in case the name wasn't normalized.
+  for (const key of Object.keys(responseHeaders)) {
+    if (key.toLowerCase() === "content-length") {
+      delete responseHeaders[key];
+    }
+  }
   if (opts?.contentEncoding) {
     responseHeaders["content-encoding"] = opts.contentEncoding;
   }

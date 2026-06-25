@@ -458,4 +458,39 @@ describe("buildHttpResponse binary safety", () => {
     const wire = Uint8Array.from(responseString, (char) => char.charCodeAt(0));
     expect(Array.from(bodyOf(wire))).toEqual(Array.from(encoded));
   });
+
+  it("drops the upstream content-length so the gzip response carries exactly one, matching the compressed body (BUI-591)", () => {
+    const original = new TextEncoder().encode(
+      JSON.stringify({
+        conversations: Array.from({ length: 50 }, (_, i) => i),
+      }),
+    );
+    const encoded = new Uint8Array([
+      0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef,
+    ]);
+    const responseString = buildHttpResponse(
+      {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          // The core raw-data path sets Content-Length; the bridge lowercases it.
+          // This is the original (uncompressed) length — it must not survive.
+          "content-length": String(original.length),
+        },
+        body: base64(original),
+      },
+      { bodyOverride: encoded, contentEncoding: "gzip" },
+    );
+
+    const headText = responseString.slice(
+      0,
+      responseString.indexOf("\r\n\r\n"),
+    );
+    const contentLengthLines = headText
+      .split("\r\n")
+      .filter((line) => line.toLowerCase().startsWith("content-length:"));
+    expect(contentLengthLines).toEqual([`content-length: ${encoded.length}`]);
+    // The stale uncompressed length must not appear anywhere in the head.
+    expect(headText).not.toContain(`content-length: ${original.length}`);
+  });
 });
