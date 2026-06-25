@@ -428,4 +428,34 @@ describe("buildHttpResponse binary safety", () => {
     );
     expect(headText).toContain(`content-length: ${body.length}`);
   });
+
+  it("uses the pre-encoded body override and emits content-encoding + matching content-length (BUI-591 gzip path)", () => {
+    const original = new TextEncoder().encode(
+      JSON.stringify({
+        conversations: Array.from({ length: 50 }, (_, i) => i),
+      }),
+    );
+    // Stand-in for the gzipped body the relay produces (gzip magic + high bytes).
+    const encoded = new Uint8Array([
+      0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef,
+    ]);
+    const responseString = buildHttpResponse(
+      {
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: base64(original),
+      },
+      { bodyOverride: encoded, contentEncoding: "gzip" },
+    );
+
+    const headText = responseString.slice(
+      0,
+      responseString.indexOf("\r\n\r\n"),
+    );
+    expect(headText.toLowerCase()).toContain("content-encoding: gzip");
+    // content-length must reflect the encoded body, not the original.
+    expect(headText).toContain(`content-length: ${encoded.length}`);
+    const wire = Uint8Array.from(responseString, (char) => char.charCodeAt(0));
+    expect(Array.from(bodyOf(wire))).toEqual(Array.from(encoded));
+  });
 });
