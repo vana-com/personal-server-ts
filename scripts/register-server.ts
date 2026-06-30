@@ -4,7 +4,7 @@
  * Usage:
  *   VANA_OWNER_PRIVATE_KEY=0x... npm run register-server
  *   VANA_OWNER_PRIVATE_KEY=0x... npm run register-server https://my-server.com
- *   PERSONAL_SERVER_ROOT_PATH=~/data-connect/personal-server VANA_OWNER_PRIVATE_KEY=0x... npm run register-server
+ *   PERSONAL_SERVER_ROOT_PATH=~/.vana/desktop/personal-server VANA_OWNER_PRIVATE_KEY=0x... npm run register-server
  */
 
 import { privateKeyToAccount } from "viem/accounts";
