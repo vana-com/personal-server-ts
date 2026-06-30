@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { access, mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { loadConfig } from "./loader.js";
+import { DEFAULTS } from "../schemas/server-config.js";
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "config-test-"));
@@ -35,7 +36,6 @@ describe("loadConfig", () => {
         configPath,
         JSON.stringify({
           server: { port: 3000 },
-          gateway: { url: "https://custom.rpc.org" },
           logging: { level: "debug", pretty: true },
           storage: { backend: "vana" },
         }),
@@ -44,7 +44,6 @@ describe("loadConfig", () => {
       const config = await loadConfig({ configPath });
 
       expect(config.server.port).toBe(3000);
-      expect(config.gateway.url).toBe("https://custom.rpc.org");
       expect(config.logging.level).toBe("debug");
       expect(config.logging.pretty).toBe(true);
       expect(config.storage.backend).toBe("vana");
@@ -70,6 +69,99 @@ describe("loadConfig", () => {
       );
       expect(config.logging.level).toBe("info");
       expect(config.storage.backend).toBe("local");
+    });
+  });
+
+  // BUI-539: an existing install's persisted config.json carries a full gateway
+  // block (incl. contracts). When the bundled defaults move (DPv1→DPv2 contract
+  // flip) the stale persisted contracts must be overwritten, or EIP-712 signing
+  // keeps using the V1 verifyingContract and the gateway 401s on upload.
+  describe("gateway reconcile", () => {
+    it("overwrites stale persisted gateway contracts with current defaults", async () => {
+      await withTempDir(async (dir) => {
+        const configPath = join(dir, "config.json");
+        await writeFile(
+          configPath,
+          JSON.stringify({
+            gateway: {
+              url: "https://gateway.v1.example",
+              chainId: 999,
+              contracts: {
+                dataRegistry: "0xV1dataRegistry",
+                dataPortabilityPermissions: "0xV1permissions",
+                dataPortabilityServer: "0xV1server",
+                dataPortabilityGrantees: "0xV1grantees",
+              },
+            },
+          }),
+        );
+
+        const config = await loadConfig({ configPath });
+
+        // Every gateway field follows the current defaults, not the stale file.
+        expect(config.gateway.url).toBe(DEFAULTS.gateway.url);
+        expect(config.gateway.chainId).toBe(DEFAULTS.gateway.chainId);
+        expect(config.gateway.contracts).toEqual(DEFAULTS.gateway.contracts);
+      });
+    });
+
+    it("preserves unrelated user config while reconciling the gateway", async () => {
+      await withTempDir(async (dir) => {
+        const configPath = join(dir, "config.json");
+        await writeFile(
+          configPath,
+          JSON.stringify({
+            server: { port: 7777, origin: "https://my-node.example" },
+            storage: { backend: "vana" },
+            sync: {
+              enabled: true,
+              lastProcessedTimestamp: "2026-01-01T00:00:00.000Z",
+            },
+            gateway: {
+              contracts: { dataPortabilityServer: "0xStaleV1server" },
+            },
+          }),
+        );
+
+        const config = await loadConfig({ configPath });
+
+        // Gateway reconciled to defaults...
+        expect(config.gateway.contracts.dataPortabilityServer).toBe(
+          DEFAULTS.gateway.contracts.dataPortabilityServer,
+        );
+        // ...but unrelated user/instance config is untouched.
+        expect(config.server.port).toBe(7777);
+        expect(config.server.origin).toBe("https://my-node.example");
+        expect(config.storage.backend).toBe("vana");
+        expect(config.sync.enabled).toBe(true);
+        expect(config.sync.lastProcessedTimestamp).toBe(
+          "2026-01-01T00:00:00.000Z",
+        );
+      });
+    });
+
+    it("re-persists the reconciled gateway block to disk", async () => {
+      await withTempDir(async (dir) => {
+        const configPath = join(dir, "config.json");
+        await writeFile(
+          configPath,
+          JSON.stringify({
+            server: { port: 7777 },
+            gateway: {
+              contracts: { dataPortabilityServer: "0xStaleV1server" },
+            },
+          }),
+        );
+
+        await loadConfig({ configPath });
+
+        const onDisk = JSON.parse(await readFile(configPath, "utf-8"));
+        expect(onDisk.gateway.contracts.dataPortabilityServer).toBe(
+          DEFAULTS.gateway.contracts.dataPortabilityServer,
+        );
+        // Unrelated value still on disk.
+        expect(onDisk.server.port).toBe(7777);
+      });
     });
   });
 
