@@ -1,10 +1,41 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
+  DEFAULTS,
   ServerConfigSchema,
   type ServerConfig,
 } from "../schemas/server-config.js";
 import { resolveRootPath } from "./paths.js";
+
+/**
+ * Reconcile the persisted gateway block against the current defaults.
+ *
+ * The gateway block (url, chainId, contracts) is environment-derived deployment
+ * config, not user/instance state — when the bundled defaults move (e.g. a
+ * contract redeploy / the DPv1→DPv2 flip), the persisted snapshot must follow,
+ * or EIP-712 signing keeps using the stale verifyingContract and the gateway
+ * rejects uploads with "401 Invalid signature".
+ *
+ * Zod `.default()` only fills *missing* fields, so once a full gateway block has
+ * been written back to config.json it would otherwise win forever. We mutate the
+ * raw parsed object in place (defaults override, per-contract merge) before
+ * schema validation, so the write-back below re-persists the corrected block.
+ * All non-gateway config (port, origin, sync cursor, storage, …) is untouched.
+ */
+function reconcileGateway(obj: Record<string, unknown>): void {
+  const stored = (obj.gateway as Record<string, unknown> | undefined) ?? {};
+  const storedContracts =
+    (stored.contracts as Record<string, unknown> | undefined) ?? {};
+  obj.gateway = {
+    ...stored,
+    url: DEFAULTS.gateway.url,
+    chainId: DEFAULTS.gateway.chainId,
+    contracts: {
+      ...storedContracts,
+      ...DEFAULTS.gateway.contracts,
+    },
+  };
+}
 
 /**
  * Apply environment-variable overrides to the raw config object.
@@ -74,6 +105,10 @@ export async function loadConfig(
 
   // Allow env vars to override config-file values (useful for cloud / Docker deployments)
   applyEnvOverrides(parsed);
+
+  // Force the current gateway deployment config over any stale persisted block
+  // (the persisted contracts otherwise win forever — see reconcileGateway).
+  reconcileGateway(parsed);
 
   const config = ServerConfigSchema.parse(parsed);
 
