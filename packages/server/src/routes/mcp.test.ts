@@ -1692,28 +1692,42 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     const approved = (await store.getById(created.connectionId))!;
     const tool = MCP_TOOLS.find((t) => t.name === "search_personal_context")!;
 
-    const result = await tool.handler(
-      {
-        query: "needle",
-        scopes: ["chatgpt.conversations", "github.profile"],
-        timeoutMs: 50,
-      },
-      {
-        connection: approved,
-        readClient: {
-          listScopes: vi.fn(),
-          readScopeBlocks: vi
-            .fn()
-            .mockImplementation(({ scope }: { scope: string }) =>
-              scope === "chatgpt.conversations"
-                ? new Promise(() => undefined)
-                : Promise.resolve(
-                    blockReadResult({ scope, value: "needle_user" }),
-                  ),
-            ),
-        },
-      },
-    );
+    // The slow scope never resolves, so the handler's per-scope timeout must
+    // fire. Drive that timeout with fake timers instead of waiting on the real
+    // ~500ms wall clock, which raced under CI load and flaked (BUI-631).
+    const result = await (async () => {
+      vi.useFakeTimers();
+      try {
+        const resultPromise = tool.handler(
+          {
+            query: "needle",
+            scopes: ["chatgpt.conversations", "github.profile"],
+            timeoutMs: 50,
+          },
+          {
+            connection: approved,
+            readClient: {
+              listScopes: vi.fn(),
+              readScopeBlocks: vi
+                .fn()
+                .mockImplementation(({ scope }: { scope: string }) =>
+                  scope === "chatgpt.conversations"
+                    ? new Promise(() => undefined)
+                    : Promise.resolve(
+                        blockReadResult({ scope, value: "needle_user" }),
+                      ),
+                ),
+            },
+          },
+        );
+        // Advance past the total budget so the per-scope timeout deterministically
+        // fires and the fast scope resolves.
+        await vi.advanceTimersByTimeAsync(1000);
+        return await resultPromise;
+      } finally {
+        vi.useRealTimers();
+      }
+    })();
 
     expect(result.isError).not.toBe(true);
     const payload = JSON.parse(result.content[0].text) as {
