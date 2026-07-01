@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createBearerTokenPsLiteAuth, createPsLiteRuntime } from "./runtime.js";
 import {
   createMemoryPsLiteAccessLogStore,
@@ -12,6 +12,7 @@ import {
   encodeDataFrame,
   psLiteRelayControlUrl,
   startPsLiteRelayClient,
+  type PsLiteRelayClientOptions,
   type PsLiteRelayWebSocket,
 } from "./relay.js";
 
@@ -492,5 +493,83 @@ describe("buildHttpResponse binary safety", () => {
     expect(contentLengthLines).toEqual([`content-length: ${encoded.length}`]);
     // The stale uncompressed length must not appear anywhere in the head.
     expect(headText).not.toContain(`content-length: ${original.length}`);
+  });
+});
+
+describe("startPsLiteRelayClient resilience", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function startWithSockets(extra: Partial<PsLiteRelayClientOptions> = {}) {
+    const sockets: FakeRelayWebSocket[] = [];
+    const client = startPsLiteRelayClient({
+      sessionId: "s1",
+      runtime: createTestRuntime(),
+      controlUrl: "wss://relay.example",
+      tls: false,
+      reconnectInitialDelayMs: 1_000,
+      reconnectMaxDelayMs: 5_000,
+      heartbeatIntervalMs: 1_000,
+      heartbeatTimeoutMs: 2_500,
+      webSocketFactory() {
+        const socket = new FakeRelayWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+      ...extra,
+    });
+    return { sockets, client };
+  }
+
+  function pingCount(socket: FakeRelayWebSocket): number {
+    return socket.sent.filter(
+      (message): message is string =>
+        typeof message === "string" &&
+        (JSON.parse(message) as { type?: string }).type === "ping",
+    ).length;
+  }
+
+  it("reconnects with backoff after an unexpected socket close", () => {
+    vi.useFakeTimers();
+    const { sockets } = startWithSockets();
+    sockets[0].onopen?.();
+    expect(sockets).toHaveLength(1);
+
+    // Relay drops the connection (NOT an intentional client.close()).
+    sockets[0].close();
+    expect(sockets).toHaveLength(1); // reconnect is scheduled, not immediate
+
+    vi.advanceTimersByTime(1_000); // reconnectInitialDelayMs elapses
+    expect(sockets).toHaveLength(2); // reconnected
+  });
+
+  it("force-reconnects a half-open socket when pongs stop (heartbeat timeout)", () => {
+    vi.useFakeTimers();
+    const { sockets } = startWithSockets();
+    sockets[0].onopen?.();
+
+    vi.advanceTimersByTime(1_000); // first heartbeat tick → ping
+    expect(pingCount(sockets[0])).toBeGreaterThanOrEqual(1);
+
+    // No pong ever arrives → a later tick crosses heartbeatTimeoutMs and
+    // force-closes the stale socket, which schedules a reconnect.
+    vi.advanceTimersByTime(2_500);
+    vi.advanceTimersByTime(1_000); // reconnect backoff elapses
+    expect(sockets.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("does not reconnect after an intentional close()", () => {
+    vi.useFakeTimers();
+    const statuses: string[] = [];
+    const { sockets, client } = startWithSockets({
+      onStatus: (status) => statuses.push(status),
+    });
+    sockets[0].onopen?.();
+
+    client.close();
+    vi.advanceTimersByTime(10_000);
+    expect(sockets).toHaveLength(1);
+    expect(statuses).toContain("closed");
   });
 });
