@@ -1,3 +1,4 @@
+import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
 import {
   handlePsLiteBridgeRequest,
   type PsLiteBridgeRequest,
@@ -45,6 +46,19 @@ export interface PsLiteRelayClient {
   readonly sessionId: string;
   readonly url: string;
   close(reason?: string): void;
+  /**
+   * Resolves once the relay has finished delivering everything in flight: no
+   * HTTP streams open and the socket's send buffer empty. A non-OPEN socket
+   * counts as drained (its buffered bytes died with it and reconnect starts
+   * from a clean slate). Resolves after `timeoutMs` regardless, so callers can
+   * never deadlock on a wedged tunnel.
+   */
+  whenDrained(options?: {
+    /** Max time to wait before resolving anyway (ms). Default 20_000. */
+    timeoutMs?: number;
+    /** Drain-state poll cadence (ms). Default 50. */
+    pollIntervalMs?: number;
+  }): Promise<void>;
 }
 
 export interface PsLiteRelayWebSocketFactory {
@@ -56,6 +70,12 @@ export interface PsLiteRelayWebSocket {
   readonly readyState: number;
   readonly OPEN: number;
   readonly CONNECTING: number;
+  /**
+   * Bytes accepted by send() but not yet flushed to the network (standard
+   * WebSocket.bufferedAmount). Optional so lightweight fakes can omit it;
+   * treated as 0 when absent.
+   */
+  readonly bufferedAmount?: number;
   onopen: (() => void) | null;
   onmessage:
     | ((event: { data: string | ArrayBuffer | Uint8Array }) => void)
@@ -127,6 +147,32 @@ export function psLiteRelayPublicUrl(
   publicSuffix = DEFAULT_PUBLIC_SUFFIX,
 ): string {
   return `https://${sessionId}.${publicSuffix.replace(/^\./, "")}`;
+}
+
+/**
+ * Defers read-fulfillment reports until the relay has delivered the in-flight
+ * response. The core data handler reports fulfillment as soon as it BUILDS the
+ * response, but over the relay the (potentially multi-MB) body still has to be
+ * pumped through TLS over the WebSocket. Consumers act on the report
+ * immediately — the DCR approval page closes the tab hosting this PS — so an
+ * eager report kills the tunnel mid-transfer and the builder gets a truncated
+ * body (UND_ERR_RES_CONTENT_LENGTH_MISMATCH) after escrow already settled.
+ * Gating the report on relay drain makes "fulfilled" mean "delivered".
+ *
+ * `getRelayClient` is late-bound: the runtime needs the reporter at
+ * construction time, before the relay client exists. When it returns
+ * undefined (relay disabled / not started yet), reports pass straight through.
+ */
+export function createRelayDrainGatedReadFulfillmentReporter(
+  reporter: PersonalServerReadFulfillmentReporter,
+  getRelayClient: () => Pick<PsLiteRelayClient, "whenDrained"> | undefined,
+): PersonalServerReadFulfillmentReporter {
+  return {
+    async report(event) {
+      await getRelayClient()?.whenDrained();
+      return reporter.report(event);
+    },
+  };
 }
 
 export function startPsLiteRelayClient(
@@ -430,9 +476,28 @@ export function startPsLiteRelayClient(
 
   connect();
 
+  // Drained = no HTTP streams in flight and nothing queued in the socket's
+  // send buffer. Only an OPEN socket can still be flushing; a closed or
+  // reconnecting socket's buffered bytes are gone either way.
+  const isDrained = () => {
+    if (streams.size > 0) {
+      return false;
+    }
+    if (!closed && socket.readyState === socket.OPEN) {
+      return (socket.bufferedAmount ?? 0) === 0;
+    }
+    return true;
+  };
+
   return {
     sessionId: options.sessionId,
     url: controlUrl,
+    async whenDrained({ timeoutMs = 20_000, pollIntervalMs = 50 } = {}) {
+      const deadline = Date.now() + timeoutMs;
+      while (!isDrained() && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      }
+    },
     close(reason = "closed") {
       closed = true;
       stopHeartbeat();

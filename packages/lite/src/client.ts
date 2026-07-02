@@ -46,6 +46,7 @@ import {
   type IndexedDbPsLiteRuntimeOptions,
 } from "./browser-runtime.js";
 import {
+  createRelayDrainGatedReadFulfillmentReporter,
   psLiteRelayPublicUrl,
   startPsLiteRelayClient,
   type PsLiteRelayClient,
@@ -118,10 +119,22 @@ export async function startPersonalServer(
       )
     : null;
   const runtimeOrigin = initialPublicUrl ?? localOrigin;
+  // Late-bound relay handle for the drain-gated fulfillment reporter: the
+  // runtime needs the (wrapped) reporter at construction time, but the relay
+  // client only starts further down. Until it exists, reports pass through.
+  let relayClientForDrain: PsLiteRelayClient | undefined;
+  const readFulfillmentReporter =
+    options.readFulfillmentReporter && resolvedRelayOptions
+      ? createRelayDrainGatedReadFulfillmentReporter(
+          options.readFulfillmentReporter,
+          () => relayClientForDrain,
+        )
+      : options.readFulfillmentReporter;
   const runtimeBundle: IndexedDbPsLiteRuntime | null = options.runtime
     ? null
     : await createIndexedDbPsLiteRuntime({
         ...options,
+        readFulfillmentReporter,
         ownerSignature: requiredOwnerSignature(options.ownerSignature),
         active: options.active ?? true,
         runtimeOrigin,
@@ -162,6 +175,7 @@ export async function startPersonalServer(
         resolvedRelayOptions.onStatus?.(nextRelayStatus);
       },
     });
+    relayClientForDrain = relayClient;
   }
 
   async function info(): Promise<PersonalServerInfo> {
