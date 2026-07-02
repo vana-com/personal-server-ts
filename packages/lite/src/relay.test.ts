@@ -8,6 +8,7 @@ import {
 import { createMockPsLiteGateway } from "./test-support/gateway.js";
 import {
   buildHttpResponse,
+  createRelayDrainGatedReadFulfillmentReporter,
   decodeDataFrame,
   encodeDataFrame,
   psLiteRelayControlUrl,
@@ -50,6 +51,7 @@ class FakeRelayWebSocket implements PsLiteRelayWebSocket {
   readyState = 1;
   readonly OPEN = 1;
   readonly CONNECTING = 0;
+  bufferedAmount = 0;
   onopen: (() => void) | null = null;
   onmessage:
     | ((event: { data: string | ArrayBuffer | Uint8Array }) => void)
@@ -571,5 +573,102 @@ describe("startPsLiteRelayClient resilience", () => {
     vi.advanceTimersByTime(10_000);
     expect(sockets).toHaveLength(1);
     expect(statuses).toContain("closed");
+  });
+});
+
+describe("whenDrained + drain-gated read fulfillment", () => {
+  function startClient() {
+    const sockets: FakeRelayWebSocket[] = [];
+    const client = startPsLiteRelayClient({
+      sessionId: "drain1",
+      runtime: createTestRuntime(),
+      controlUrl: "wss://relay.example",
+      tls: false,
+      webSocketFactory() {
+        const socket = new FakeRelayWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+    return { client, socket: sockets[0] };
+  }
+
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  it("resolves immediately when nothing is in flight", async () => {
+    const { client } = startClient();
+    await client.whenDrained({ pollIntervalMs: 5, timeoutMs: 100 });
+    client.close();
+  });
+
+  it("waits for open streams and the socket send buffer to drain", async () => {
+    const { client, socket } = startClient();
+    socket.receive(JSON.stringify({ type: "session.ready" }));
+    socket.receive(JSON.stringify({ type: "stream.open", streamId: 7 }));
+    await flushRelayTasks();
+
+    let drained = false;
+    const wait = client.whenDrained({ pollIntervalMs: 5 }).then(() => {
+      drained = true;
+    });
+
+    await sleep(25);
+    expect(drained).toBe(false); // stream in flight
+
+    // Stream closes but the socket still holds unflushed response bytes.
+    socket.bufferedAmount = 4096;
+    socket.receive(JSON.stringify({ type: "stream.close", streamId: 7 }));
+    await sleep(25);
+    expect(drained).toBe(false); // buffer still flushing
+
+    socket.bufferedAmount = 0;
+    await wait;
+    expect(drained).toBe(true);
+    client.close();
+  });
+
+  it("resolves after timeoutMs even when never drained (no deadlock)", async () => {
+    const { client, socket } = startClient();
+    socket.receive(JSON.stringify({ type: "session.ready" }));
+    socket.receive(JSON.stringify({ type: "stream.open", streamId: 9 }));
+    await flushRelayTasks();
+    await client.whenDrained({ pollIntervalMs: 5, timeoutMs: 50 });
+    client.close();
+  });
+
+  it("drain-gated reporter defers the report until the relay is drained", async () => {
+    const events: unknown[] = [];
+    const reporter = {
+      report: async (event: never) => {
+        events.push(event);
+      },
+    };
+
+    // Without a relay client the report passes straight through.
+    const passthrough = createRelayDrainGatedReadFulfillmentReporter(
+      reporter,
+      () => undefined,
+    );
+    await passthrough.report({ grantId: "g0" } as never);
+    expect(events).toHaveLength(1);
+
+    // With a relay mid-delivery, the report lands only after drain.
+    const { client, socket } = startClient();
+    socket.receive(JSON.stringify({ type: "session.ready" }));
+    socket.receive(JSON.stringify({ type: "stream.open", streamId: 3 }));
+    await flushRelayTasks();
+
+    const gated = createRelayDrainGatedReadFulfillmentReporter(
+      reporter,
+      () => client,
+    );
+    const pending = gated.report({ grantId: "g1" } as never);
+    await sleep(25);
+    expect(events).toHaveLength(1); // still deferred: stream open
+
+    socket.receive(JSON.stringify({ type: "stream.close", streamId: 3 }));
+    await pending;
+    expect(events).toHaveLength(2); // delivered -> reported
+    client.close();
   });
 });
