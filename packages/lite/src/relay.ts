@@ -460,6 +460,11 @@ export function startPsLiteRelayClient(
   };
 
   function connect(): void {
+    // Terminal states (intentional close, or a 1012 session takeover) must
+    // never re-open a socket, even if a stale timer or event slips through.
+    if (closed) {
+      return;
+    }
     issueToken = undefined;
     socket = createSocket(options.webSocketFactory, controlUrl);
     socket.binaryType = "arraybuffer";
@@ -492,6 +497,12 @@ export function startPsLiteRelayClient(
         // Reconnecting would evict it and start a session tug-of-war, so this
         // client steps down for good and lets the host surface the handoff.
         closed = true;
+        // Cancel any reconnect already scheduled by an earlier drop so a
+        // pending timer can't fire connect() after we've stepped down.
+        if (reconnectTimer !== undefined) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = undefined;
+        }
         log("relay session replaced by another connection — not reconnecting");
         options.onStatus?.("replaced");
         return;
@@ -499,7 +510,12 @@ export function startPsLiteRelayClient(
       options.onStatus?.("disconnected");
       scheduleReconnect();
     };
-    socket.onerror = () => options.onStatus?.("error");
+    socket.onerror = () => {
+      if (closed) {
+        return;
+      }
+      options.onStatus?.("error");
+    };
   }
 
   connect();

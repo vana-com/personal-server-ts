@@ -577,6 +577,25 @@ describe("startPsLiteRelayClient resilience", () => {
     expect(statuses).not.toContain("disconnected");
   });
 
+  it("cancels an already-scheduled reconnect when a 1012 lands mid-backoff", () => {
+    vi.useFakeTimers();
+    const statuses: string[] = [];
+    const { sockets } = startWithSockets({
+      onStatus: (status) => statuses.push(status),
+    });
+    sockets[0].onopen?.();
+
+    // First an ordinary drop schedules a reconnect...
+    sockets[0].close();
+    // ...then, before the backoff elapses, a 1012 takeover arrives.
+    sockets[0].close(1012, "session replaced");
+    vi.advanceTimersByTime(60_000);
+
+    // The pending reconnect timer must have been cancelled: no new socket.
+    expect(sockets).toHaveLength(1);
+    expect(statuses).toContain("replaced");
+  });
+
   it("does not reconnect after an intentional close()", () => {
     vi.useFakeTimers();
     const statuses: string[] = [];
