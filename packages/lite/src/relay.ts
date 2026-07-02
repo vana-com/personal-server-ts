@@ -40,7 +40,16 @@ export type PsLiteRelayStatus =
   | "connected"
   | "disconnected"
   | "closed"
+  | "replaced"
   | "error";
+
+/**
+ * Close code the relay sends to the losing side when a new connection claims
+ * the same sessionId. Terminal for this client: reconnecting would evict the
+ * winner right back and the two tabs would trade the session every backoff
+ * tick (observed live as a 1012 eviction loop every ~2s with two app tabs).
+ */
+export const RELAY_CLOSE_SESSION_REPLACED = 1012;
 
 export interface PsLiteRelayClient {
   readonly sessionId: string;
@@ -65,6 +74,16 @@ export interface PsLiteRelayWebSocketFactory {
   (url: string): PsLiteRelayWebSocket;
 }
 
+/**
+ * Subset of the standard CloseEvent the relay client reads. Browser
+ * WebSockets pass a full CloseEvent here; fakes may call onclose with
+ * nothing (treated as an abnormal close).
+ */
+export interface PsLiteRelayCloseEvent {
+  code?: number;
+  reason?: string;
+}
+
 export interface PsLiteRelayWebSocket {
   binaryType: string;
   readonly readyState: number;
@@ -80,7 +99,7 @@ export interface PsLiteRelayWebSocket {
   onmessage:
     | ((event: { data: string | ArrayBuffer | Uint8Array }) => void)
     | null;
-  onclose: (() => void) | null;
+  onclose: ((event?: PsLiteRelayCloseEvent) => void) | null;
   onerror: (() => void) | null;
   send(data: string | Uint8Array): void;
   close(code?: number, reason?: string): void;
@@ -458,7 +477,7 @@ export function startPsLiteRelayClient(
       }
       handleDataFrame(event.data);
     };
-    socket.onclose = () => {
+    socket.onclose = (event) => {
       stopHeartbeat();
       streams.forEach((stream) => stream.tls?.close?.());
       streams.clear();
@@ -466,6 +485,15 @@ export function startPsLiteRelayClient(
       issueToken = undefined;
       if (closed) {
         options.onStatus?.("closed");
+        return;
+      }
+      if (event?.code === RELAY_CLOSE_SESSION_REPLACED) {
+        // Another connection (typically a second tab) now owns this session.
+        // Reconnecting would evict it and start a session tug-of-war, so this
+        // client steps down for good and lets the host surface the handoff.
+        closed = true;
+        log("relay session replaced by another connection — not reconnecting");
+        options.onStatus?.("replaced");
         return;
       }
       options.onStatus?.("disconnected");

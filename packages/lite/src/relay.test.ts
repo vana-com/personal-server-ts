@@ -56,7 +56,7 @@ class FakeRelayWebSocket implements PsLiteRelayWebSocket {
   onmessage:
     | ((event: { data: string | ArrayBuffer | Uint8Array }) => void)
     | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((event?: { code?: number; reason?: string }) => void) | null = null;
   onerror: (() => void) | null = null;
   readonly sent: Array<string | Uint8Array> = [];
 
@@ -64,9 +64,9 @@ class FakeRelayWebSocket implements PsLiteRelayWebSocket {
     this.sent.push(data);
   }
 
-  close(): void {
+  close(code?: number, reason?: string): void {
     this.readyState = 3;
-    this.onclose?.();
+    this.onclose?.({ code, reason });
   }
 
   receive(data: string | Uint8Array): void {
@@ -559,6 +559,22 @@ describe("startPsLiteRelayClient resilience", () => {
     vi.advanceTimersByTime(2_500);
     vi.advanceTimersByTime(1_000); // reconnect backoff elapses
     expect(sockets.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("stops for good when the relay replaces the session (close 1012)", () => {
+    vi.useFakeTimers();
+    const statuses: string[] = [];
+    const { sockets } = startWithSockets({
+      onStatus: (status) => statuses.push(status),
+    });
+    sockets[0].onopen?.();
+
+    // Another tab claimed the same sessionId; the relay evicts this side.
+    sockets[0].close(1012, "session replaced");
+    vi.advanceTimersByTime(60_000);
+    expect(sockets).toHaveLength(1); // no reconnect — ever
+    expect(statuses).toContain("replaced");
+    expect(statuses).not.toContain("disconnected");
   });
 
   it("does not reconnect after an intentional close()", () => {
