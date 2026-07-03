@@ -34,17 +34,65 @@ let rustlsInitPromise: Promise<unknown> | undefined;
 export function createRustlsPsLiteRelayTlsFactory(
   options: RustlsPsLiteRelayTlsOptions,
 ): PsLiteRelayTlsFactory {
-  let identityPromise: Promise<PsLiteRelayTlsIdentity> | undefined;
+  // Only a TRUSTED (ACME) identity is memoized for the factory's lifetime. A
+  // self-signed fallback must NOT be: it means issuance failed on this attempt
+  // (no issueToken yet, /issue-cert error, ACME timeout), and locking it in
+  // would strand the tab on an untrusted cert forever — even after a reconnect
+  // delivers a fresh issueToken (BUI-664). The relay factory outlives every
+  // reconnect, so a first-attempt fallback used to pin the whole session to
+  // self-signed. Leaving it unmemoized lets the next prepare/createStream retry
+  // issuance (or hit the persisted ACME cache once it succeeds).
+  let trustedIdentity: PsLiteRelayTlsIdentity | undefined;
+  let inFlight: Promise<PsLiteRelayTlsIdentity> | undefined;
+  let inFlightToken: string | undefined;
+
+  async function resolveIdentity(
+    input: PsLiteRelayTlsPrepareInput,
+  ): Promise<PsLiteRelayTlsIdentity> {
+    if (trustedIdentity) {
+      return trustedIdentity;
+    }
+    // Coalesce concurrent callers onto one attempt, but clear on settle so a
+    // failed (self-signed) attempt doesn't block the next retry. A caller that
+    // brings a fresh issueToken must NOT join an in-flight attempt made with
+    // different (or no) credentials: that attempt can settle self-signed even
+    // though this caller could mint a trusted cert, and the first strict-TLS
+    // stream after recovery would still get the untrusted identity. Such a
+    // caller starts its own attempt; the superseded one settles harmlessly.
+    const token = input.issueToken ?? "";
+    if (!inFlight || (token && token !== inFlightToken)) {
+      const attempt = createTlsIdentity(input, options).finally(() => {
+        if (inFlight === attempt) {
+          inFlight = undefined;
+          inFlightToken = undefined;
+        }
+      });
+      inFlight = attempt;
+      inFlightToken = token;
+    }
+    const identity = await inFlight;
+    if (identity.trusted) {
+      trustedIdentity = identity;
+    } else if (trustedIdentity) {
+      // A concurrent tokened attempt settled trusted while this caller was
+      // awaiting a fallback attempt — serve the trusted identity instead of
+      // handing one last stream a self-signed cert.
+      return trustedIdentity;
+    } else {
+      options.logger?.(
+        `serving self-signed cert for ${identity.hostname}; ACME issuance unavailable this attempt, will retry on the next stream/reconnect`,
+      );
+    }
+    return identity;
+  }
 
   return {
     async prepare(input: PsLiteRelayTlsPrepareInput) {
-      identityPromise ??= createTlsIdentity(input, options);
-      await identityPromise;
+      await resolveIdentity(input);
     },
     async createStream(input: PsLiteRelayTlsStreamInput) {
       await ensureRustls();
-      identityPromise ??= createTlsIdentity(input, options);
-      const identity = await identityPromise;
+      const identity = await resolveIdentity(input);
       const tls = new RustlsServer(identity.certPem, identity.keyPem);
       return createRustlsStream(tls);
     },
@@ -246,7 +294,17 @@ async function requestAcmeCertificate(input: {
       source: "acme",
       trusted: true,
     };
-    cacheTlsIdentity(identity, input.storage);
+    try {
+      cacheTlsIdentity(identity, input.storage);
+    } catch (error) {
+      // A failed cache write (e.g. QuotaExceededError — PS-Lite tabs are
+      // heavy localStorage users) must not discard a successful issuance:
+      // falling into the outer catch would serve self-signed AND mint a
+      // fresh LE cert per stream, burning the duplicate-certificate limit.
+      input.logger?.(
+        `failed to persist issued certificate (${error instanceof Error ? error.message : String(error)}); continuing with the in-memory identity`,
+      );
+    }
     return identity;
   } catch (error) {
     input.logger?.(error instanceof Error ? error.message : String(error));
