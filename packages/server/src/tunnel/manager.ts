@@ -74,17 +74,39 @@ export class TunnelManager {
   }
 
   /**
-   * Start the frpc process with the given configuration.
-   * Returns the public URL once the tunnel is established.
-   * Automatically schedules periodic claim refresh.
+   * Reserve the tunnel's public URL without starting frpc. The URL is
+   * deterministic (wallet-derived subdomain), so callers can register the
+   * server with the gateway before any tunnel traffic is attempted. Dialing
+   * the relay pre-registration is what poisoned its delegation cache and
+   * caused the ~70s "Signer is not a registered server" window (BUI-611).
    */
-  async start(config: TunnelConfig, binaryPath: string): Promise<string> {
+  reserve(config: TunnelConfig, binaryPath: string): string {
     if (this.process) {
       throw new Error("Tunnel already running");
     }
 
     this.config = config;
     this.binaryPath = binaryPath;
+    const subdomain = config.walletAddress.toLowerCase();
+    this.publicUrl = buildTunnelUrl(subdomain, config.serverAddr);
+    return this.publicUrl;
+  }
+
+  /**
+   * Start the frpc process for a previously reserved tunnel.
+   * Returns the public URL once the tunnel is established.
+   * Automatically schedules periodic claim refresh.
+   */
+  async connect(): Promise<string> {
+    if (this.process) {
+      throw new Error("Tunnel already running");
+    }
+    const config = this.config;
+    const binaryPath = this.binaryPath;
+    if (!config || !binaryPath || !this.publicUrl) {
+      throw new Error("Tunnel not reserved");
+    }
+
     this.status = "starting";
     this.lastError = null;
     this.routable = undefined;
@@ -103,15 +125,24 @@ export class TunnelManager {
       }
     }
 
-    const subdomain = config.walletAddress.toLowerCase();
-    this.publicUrl = buildTunnelUrl(subdomain, config.serverAddr);
-
-    const configPath = await this.writeFreshConfig(subdomain);
+    const configPath = await this.writeFreshConfig(
+      config.walletAddress.toLowerCase(),
+    );
     await this.spawnProcess(configPath);
 
     this.scheduleRefresh();
 
     return this.publicUrl;
+  }
+
+  /**
+   * Reserve and immediately connect. Prefer reserve() + connect() gated on
+   * server registration; this remains for callers that are already
+   * registered.
+   */
+  async start(config: TunnelConfig, binaryPath: string): Promise<string> {
+    this.reserve(config, binaryPath);
+    return this.connect();
   }
 
   /**

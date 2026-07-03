@@ -18,6 +18,8 @@ interface RegistrationCandidate {
 export interface UiRegistrationRouteDeps {
   devToken: string;
   ownerPrivateKey?: `0x${string}`;
+  /** Called when registration is confirmed (fresh or already registered). */
+  onRegistered?: (serverId: string | null) => void;
 }
 
 function isHexAddress(value: unknown): value is `0x${string}` {
@@ -206,6 +208,7 @@ export function uiRegistrationRoutes(deps: UiRegistrationRouteDeps): Hono {
     const gateway = createGatewayClient(gatewayConfig.url);
     const existing = await gateway.getServer(candidate.serverAddress);
     if (existing?.id) {
+      deps.onRegistered?.(existing.id);
       return c.json({
         alreadyRegistered: true,
         serverId: existing.id,
@@ -223,6 +226,7 @@ export function uiRegistrationRoutes(deps: UiRegistrationRouteDeps): Hono {
       ...candidate,
       signature,
     });
+    deps.onRegistered?.(result.serverId ?? null);
 
     return c.json({
       ...result,

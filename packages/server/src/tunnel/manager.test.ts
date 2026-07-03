@@ -152,5 +152,70 @@ describe("tunnel/manager", () => {
         });
       });
     });
+
+    describe("reserve + connect (registration-gated start, BUI-611)", () => {
+      async function createExecutable(): Promise<string> {
+        const binaryPath = join(tempDir, "frpc");
+        await writeFile(binaryPath, "#!/bin/sh\n");
+        await chmod(binaryPath, 0o755);
+        return binaryPath;
+      }
+
+      async function createStartConfig() {
+        const owner = createTestWallet(0);
+        const serverKeypair = loadOrCreateServerAccount(
+          join(tempDir, "key.json"),
+        );
+        return {
+          walletAddress: serverKeypair.address,
+          ownerAddress: owner.address,
+          serverKeypair,
+          runId: "run-1",
+          serverAddr: "frpc.server.vana.org",
+          serverPort: 7000,
+          localPort: 8080,
+        };
+      }
+
+      it("reserve exposes the public URL without spawning frpc", async () => {
+        const url = manager.reserve(
+          await createStartConfig(),
+          await createExecutable(),
+        );
+
+        expect(url).toMatch(/^https:\/\/0x[0-9a-f]{40}\.server\.vana\.org$/);
+        expect(spawnMock).not.toHaveBeenCalled();
+        expect(manager.getStatus()).toMatchObject({
+          status: "stopped",
+          publicUrl: url,
+        });
+        expect(manager.getPublicUrl()).toBe(url);
+      });
+
+      it("connect spawns frpc for the reserved URL", async () => {
+        const proc = new FakeChildProcess();
+        spawnMock.mockReturnValue(proc);
+
+        const reserved = manager.reserve(
+          await createStartConfig(),
+          await createExecutable(),
+        );
+        const connect = manager.connect();
+        await vi.waitFor(() => expect(spawnMock).toHaveBeenCalled());
+        proc.stdout.emit("data", Buffer.from("start proxy success\n"));
+
+        const publicUrl = await connect;
+        expect(publicUrl).toBe(reserved);
+        expect(manager.getStatus()).toMatchObject({
+          status: "connected",
+          publicUrl,
+        });
+      });
+
+      it("connect without reserve rejects", async () => {
+        await expect(manager.connect()).rejects.toThrow("Tunnel not reserved");
+        expect(spawnMock).not.toHaveBeenCalled();
+      });
+    });
   });
 });
