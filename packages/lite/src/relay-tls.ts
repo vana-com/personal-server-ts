@@ -73,6 +73,11 @@ export function createRustlsPsLiteRelayTlsFactory(
     const identity = await inFlight;
     if (identity.trusted) {
       trustedIdentity = identity;
+    } else if (trustedIdentity) {
+      // A concurrent tokened attempt settled trusted while this caller was
+      // awaiting a fallback attempt — serve the trusted identity instead of
+      // handing one last stream a self-signed cert.
+      return trustedIdentity;
     } else {
       options.logger?.(
         `serving self-signed cert for ${identity.hostname}; ACME issuance unavailable this attempt, will retry on the next stream/reconnect`,
@@ -289,7 +294,17 @@ async function requestAcmeCertificate(input: {
       source: "acme",
       trusted: true,
     };
-    cacheTlsIdentity(identity, input.storage);
+    try {
+      cacheTlsIdentity(identity, input.storage);
+    } catch (error) {
+      // A failed cache write (e.g. QuotaExceededError — PS-Lite tabs are
+      // heavy localStorage users) must not discard a successful issuance:
+      // falling into the outer catch would serve self-signed AND mint a
+      // fresh LE cert per stream, burning the duplicate-certificate limit.
+      input.logger?.(
+        `failed to persist issued certificate (${error instanceof Error ? error.message : String(error)}); continuing with the in-memory identity`,
+      );
+    }
     return identity;
   } catch (error) {
     input.logger?.(error instanceof Error ? error.message : String(error));

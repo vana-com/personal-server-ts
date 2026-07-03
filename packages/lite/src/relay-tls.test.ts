@@ -131,6 +131,22 @@ describe("createRustlsPsLiteRelayTlsFactory identity resolution", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps the issued ACME identity when the cache write throws (quota)", async () => {
+    storage.setItem = () => {
+      throw new DOMException("quota exceeded", "QuotaExceededError");
+    };
+    const factory = createFactory();
+
+    await factory.prepare?.({ sessionId: SESSION_ID, issueToken: "tok" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // Issuance succeeded, so the identity is trusted and memoized: no
+    // self-signed fallback, no re-issuance on the next stream.
+    expect(logs.join("\n")).not.toContain("self-signed");
+    await factory.prepare?.({ sessionId: SESSION_ID });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(logs.join("\n")).toContain("failed to persist issued certificate");
+  });
+
   it("persists the issued ACME identity for reuse across factories", async () => {
     const factory = createFactory();
     await factory.prepare?.({ sessionId: SESSION_ID, issueToken: "tok" });
