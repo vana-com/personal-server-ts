@@ -346,6 +346,11 @@ export async function createServer(
   // startBackgroundServices once the tunnel is reserved.
   let notifyServerRegistered: (serverId: string | null) => void = () => {};
   let registrationPollTimer: ReturnType<typeof setTimeout> | null = null;
+  // Set by cleanup(). A poll iteration that is mid-flight when cleanup runs
+  // holds no timer handle, so clearing the timer alone cannot stop it — and
+  // a reserved-but-never-connected TunnelManager would happily spawn frpc
+  // from an orphaned poll after shutdown. Every deferred path checks this.
+  let backgroundClosed = false;
   const clearRegistrationPoll = () => {
     if (registrationPollTimer) {
       clearTimeout(registrationPollTimer);
@@ -386,6 +391,7 @@ export async function createServer(
   });
 
   const cleanup = async () => {
+    backgroundClosed = true;
     clearRegistrationPoll();
     if (tunnelManager) {
       await tunnelManager.stop();
@@ -458,7 +464,7 @@ export async function createServer(
         let tunnelConnectStarted = false;
         const connectTunnel = async () => {
           const manager = tunnelManager;
-          if (!manager || tunnelConnectStarted) {
+          if (!manager || tunnelConnectStarted || backgroundClosed) {
             return;
           }
           tunnelConnectStarted = true;
@@ -480,6 +486,11 @@ export async function createServer(
             );
             tunnelManager = undefined;
             context.tunnelManager = undefined;
+            // Local-only mode must keep the local audience/URL: leaving the
+            // public URL as effectiveOrigin would reject local Web3Signed
+            // callers against an origin that will never route.
+            effectiveOrigin = config.server.origin;
+            context.tunnelUrl = undefined;
           }
         };
 
@@ -490,6 +501,9 @@ export async function createServer(
           const pollStartedAt = Date.now();
           const poll = async () => {
             registrationPollTimer = null;
+            if (backgroundClosed) {
+              return;
+            }
             try {
               const serverInfo = await gatewayClient.getServer(
                 serverAccount.address,
@@ -505,6 +519,9 @@ export async function createServer(
             } catch {
               // Gateway unreachable — keep polling.
             }
+            if (backgroundClosed) {
+              return;
+            }
             const interval =
               Date.now() - pollStartedAt < 2 * 60_000 ? 5_000 : 30_000;
             registrationPollTimer = setTimeout(() => void poll(), interval);
@@ -515,10 +532,18 @@ export async function createServer(
         };
 
         notifyServerRegistered = (serverId) => {
-          if (identity && serverId) {
-            identity.serverId = serverId;
+          if (backgroundClosed) {
+            return;
           }
-          clearRegistrationPoll();
+          if (serverId) {
+            if (identity) {
+              identity.serverId = serverId;
+            }
+            // Only a confirmed serverId stops the poll: on a null result the
+            // poll keeps running so identity/health converge once the
+            // gateway lookup sees the registration.
+            clearRegistrationPoll();
+          }
           void connectTunnel();
         };
 
