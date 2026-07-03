@@ -340,6 +340,24 @@ export async function createServer(
   // Mutable tunnelManager — set when tunnel starts in background
   let tunnelManager: TunnelManager | undefined;
 
+  // Registration can land after boot (desktop signing exchange or the
+  // /ui/api registration route); the tunnel connect is gated on it, so the
+  // route needs a way to trigger the deferred connect. Assigned inside
+  // startBackgroundServices once the tunnel is reserved.
+  let notifyServerRegistered: (serverId: string | null) => void = () => {};
+  let registrationPollTimer: ReturnType<typeof setTimeout> | null = null;
+  // Set by cleanup(). A poll iteration that is mid-flight when cleanup runs
+  // holds no timer handle, so clearing the timer alone cannot stop it — and
+  // a reserved-but-never-connected TunnelManager would happily spawn frpc
+  // from an orphaned poll after shutdown. Every deferred path checks this.
+  let backgroundClosed = false;
+  const clearRegistrationPoll = () => {
+    if (registrationPollTimer) {
+      clearTimeout(registrationPollTimer);
+      registrationPollTimer = null;
+    }
+  };
+
   const app = createApp({
     logger,
     version: pkg.version,
@@ -369,9 +387,12 @@ export async function createServer(
     syncManager,
     serverSigner,
     getTunnelStatus: () => tunnelManager?.getStatus() ?? null,
+    onServerRegistered: (serverId) => notifyServerRegistered(serverId),
   });
 
   const cleanup = async () => {
+    backgroundClosed = true;
+    clearRegistrationPoll();
     if (tunnelManager) {
       await tunnelManager.stop();
     }
@@ -440,8 +461,97 @@ export async function createServer(
 
         const runId = randomUUID();
 
+        let tunnelConnectStarted = false;
+        const connectTunnel = async () => {
+          const manager = tunnelManager;
+          if (!manager || tunnelConnectStarted || backgroundClosed) {
+            return;
+          }
+          tunnelConnectStarted = true;
+          try {
+            const url = await manager.connect();
+            const tunnelStatus = manager.getStatus();
+            if (tunnelStatus.status === "connected") {
+              logger.info({ tunnelUrl: url }, "Tunnel established");
+            } else {
+              logger.warn(
+                { tunnelUrl: url, warning: tunnelStatus.warning },
+                "Tunnel URL reserved; waiting for tunnel connection",
+              );
+            }
+          } catch (err) {
+            logger.warn(
+              { err },
+              "Tunnel failed to connect - server running in local-only mode",
+            );
+            tunnelManager = undefined;
+            context.tunnelManager = undefined;
+            // Local-only mode must keep the local audience/URL: leaving the
+            // public URL as effectiveOrigin would reject local Web3Signed
+            // callers against an origin that will never route.
+            effectiveOrigin = config.server.origin;
+            context.tunnelUrl = undefined;
+          }
+        };
+
+        // Poll fallback for registrations the route callback can't see
+        // (e.g. desktop registers with the gateway directly and the sidecar
+        // only observes it via a gateway lookup).
+        const scheduleRegistrationPoll = () => {
+          const pollStartedAt = Date.now();
+          const poll = async () => {
+            registrationPollTimer = null;
+            if (backgroundClosed) {
+              return;
+            }
+            try {
+              const serverInfo = await gatewayClient.getServer(
+                serverAccount.address,
+              );
+              if (serverInfo?.id) {
+                if (identity) {
+                  identity.serverId = serverInfo.id;
+                }
+                logger.info("Server registration detected — starting tunnel");
+                await connectTunnel();
+                return;
+              }
+            } catch {
+              // Gateway unreachable — keep polling.
+            }
+            if (backgroundClosed) {
+              return;
+            }
+            const interval =
+              Date.now() - pollStartedAt < 2 * 60_000 ? 5_000 : 30_000;
+            registrationPollTimer = setTimeout(() => void poll(), interval);
+            registrationPollTimer.unref?.();
+          };
+          registrationPollTimer = setTimeout(() => void poll(), 5_000);
+          registrationPollTimer.unref?.();
+        };
+
+        notifyServerRegistered = (serverId) => {
+          if (backgroundClosed) {
+            return;
+          }
+          if (serverId) {
+            if (identity) {
+              identity.serverId = serverId;
+            }
+            // Only a confirmed serverId stops the poll: on a null result the
+            // poll keeps running so identity/health converge once the
+            // gateway lookup sees the registration.
+            clearRegistrationPoll();
+          }
+          void connectTunnel();
+        };
+
         try {
-          const url = await tunnelManager.start(
+          // Reserve the public URL without dialing the relay: the URL is
+          // what registration needs, and dialing before the registration
+          // lands poisons the relay's delegation cache (BUI-611).
+          const url = tunnelManager.reserve(
             {
               walletAddress: serverAccount.address,
               ownerAddress: serverOwner,
@@ -459,32 +569,25 @@ export async function createServer(
             },
             frpcBinaryPath,
           );
-          const tunnelStatus = tunnelManager.getStatus();
-          if (tunnelStatus.status === "connected") {
-            logger.info({ tunnelUrl: url }, "Tunnel established");
-          } else {
-            logger.warn(
-              { tunnelUrl: url, warning: tunnelStatus.warning },
-              "Tunnel URL reserved; waiting for tunnel connection",
-            );
-          }
           context.tunnelUrl = url;
-          if (
-            tunnelStatus.status === "connected" &&
-            tunnelStatus.routable !== false
-          ) {
-            effectiveOrigin = url;
-          }
+          // The public URL is the audience clients sign against, so adopt it
+          // as the effective origin as soon as it's known (matches the
+          // unity-surfaces #583 sidecar patch).
+          effectiveOrigin = url;
 
-          if (!identity?.serverId) {
-            logger.warn(
-              "Tunnel started but server is not registered with gateway — tunnel will not route traffic. Run: npm run register-server",
+          if (identity?.serverId) {
+            await connectTunnel();
+          } else {
+            logger.info(
+              { tunnelUrl: url },
+              "Tunnel start deferred until server registration — register to enable routing",
             );
+            scheduleRegistrationPoll();
           }
         } catch (err) {
           logger.warn(
             { err },
-            "Tunnel failed to connect - server running in local-only mode",
+            "Tunnel failed to start - server running in local-only mode",
           );
           tunnelManager = undefined;
           context.tunnelManager = undefined;

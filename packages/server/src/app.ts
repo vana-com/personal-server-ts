@@ -91,6 +91,13 @@ export interface AppDeps {
   paymentEnabled?: boolean;
   getTunnelStatus?: HealthDeps["getTunnelStatus"];
   /**
+   * Invoked when the /ui/api registration route confirms the server is
+   * registered with the gateway (fresh or pre-existing), so a
+   * registration-gated tunnel can start immediately instead of waiting for
+   * the bootstrap's gateway poll (BUI-611).
+   */
+  onServerRegistered?: (serverId: string | null) => void;
+  /**
    * MCP connection store shared between the `/mcp/:token` Streamable HTTP
    * endpoint and the owner `/v1/mcp/connections` management surface. Defaults
    * to an in-memory store so the routes are wired up out of the box; pass an
@@ -312,6 +319,7 @@ export function createApp(deps: AppDeps): Hono {
       uiRegistrationRoutes({
         devToken: deps.devToken,
         ownerPrivateKey: deps.ownerPrivateKey,
+        onRegistered: deps.onServerRegistered,
       }),
     );
   }
