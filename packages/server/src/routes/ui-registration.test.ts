@@ -182,6 +182,71 @@ describe("uiRegistrationRoutes", () => {
     );
   });
 
+  it("notifies onRegistered after a fresh registration (BUI-611 tunnel gate)", async () => {
+    gatewayMocks.getServer.mockResolvedValue(null);
+    gatewayMocks.registerServer.mockResolvedValue({
+      alreadyRegistered: false,
+      serverId: "server-1",
+    });
+    const onRegistered = vi.fn();
+    const app = uiRegistrationRoutes({
+      devToken,
+      ownerPrivateKey: owner.privateKey,
+      onRegistered,
+    });
+
+    const res = await app.request("/registration/server", {
+      method: "POST",
+      headers: {
+        ...authHeaders(),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        gatewayConfig,
+        registration: {
+          ownerAddress: owner.address,
+          serverAddress: server.address,
+          publicKey: server.address,
+          serverUrl: "https://server.example.com",
+        },
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(onRegistered).toHaveBeenCalledWith("server-1");
+  });
+
+  it("notifies onRegistered when the server is already registered", async () => {
+    gatewayMocks.getServer.mockResolvedValue({ id: "server-9" });
+    const onRegistered = vi.fn();
+    const app = uiRegistrationRoutes({
+      devToken,
+      ownerPrivateKey: owner.privateKey,
+      onRegistered,
+    });
+
+    const res = await app.request("/registration/server", {
+      method: "POST",
+      headers: {
+        ...authHeaders(),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        gatewayConfig,
+        registration: {
+          ownerAddress: owner.address,
+          serverAddress: server.address,
+          publicKey: server.address,
+          serverUrl: "https://server.example.com",
+        },
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(onRegistered).toHaveBeenCalledWith("server-9");
+    expect(gatewayMocks.registerServer).not.toHaveBeenCalled();
+  });
+
   it("checks file ids against the gateway", async () => {
     gatewayMocks.getDataPoint
       .mockResolvedValueOnce({ id: "file-1" })
