@@ -27,7 +27,10 @@ export interface PsLiteRelayClientOptions {
   onStatus?: (status: PsLiteRelayStatus) => void;
   /** Heartbeat ping cadence (ms). Default 20_000. */
   heartbeatIntervalMs?: number;
-  /** Force-reconnect if no pong within this window (ms). Default 45_000. */
+  /**
+   * Force-reconnect when a ping the client actually sent goes unanswered by
+   * ANY relay frame for this long, measured by wall clock (ms). Default 45_000.
+   */
   heartbeatTimeoutMs?: number;
   /** First reconnect backoff delay (ms); doubles up to the max. Default 1_000. */
   reconnectInitialDelayMs?: number;
@@ -50,6 +53,14 @@ export type PsLiteRelayStatus =
  * tick (observed live as a 1012 eviction loop every ~2s with two app tabs).
  */
 export const RELAY_CLOSE_SESSION_REPLACED = 1012;
+
+/**
+ * A heartbeat tick arriving more than this many intervals after the previous
+ * one means the tab's timers were throttled (Chrome backgrounds clamp them to
+ * >= 1/min), not that the tunnel is dead. Such a tick probes with a fresh ping
+ * instead of closing on stale elapsed time (BUI-665).
+ */
+const HEARTBEAT_LATE_FIRE_FACTOR = 2;
 
 export interface PsLiteRelayClient {
   readonly sessionId: string;
@@ -226,7 +237,17 @@ export function startPsLiteRelayClient(
   let reconnectAttempts = 0;
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
-  let lastPongAt = 0;
+  // Liveness is evidence-based (BUI-665): ANY frame from the relay — data,
+  // control, pong — proves the tunnel is alive. The heartbeat declares it dead
+  // only when a ping it actually SENT went unanswered by any frame for the
+  // full timeout window, measured by wall clock. A late-firing throttled timer
+  // that finds recent frames must never kill a healthy socket.
+  let lastFrameReceivedAt = 0;
+  // Wall-clock send time of the oldest ping not yet answered by any frame;
+  // undefined when the tunnel has proven itself since the last ping.
+  let unansweredPingSentAt: number | undefined;
+  let lastHeartbeatCheckAt = 0;
+  let heartbeatGraceUsed = false;
 
   const log = (line: string) => options.logger?.(line);
 
@@ -370,7 +391,8 @@ export function startPsLiteRelayClient(
     }
 
     if (message.type === "pong") {
-      lastPongAt = Date.now();
+      // Liveness is recorded for every frame in socket.onmessage; the pong
+      // carries no other payload.
       return;
     }
 
@@ -421,27 +443,65 @@ export function startPsLiteRelayClient(
     }
   };
 
+  const heartbeatTick = () => {
+    if (socket.readyState !== socket.OPEN) {
+      return;
+    }
+    const now = Date.now();
+    // A tick arriving well past its cadence means the tab's timers were
+    // throttled — the elapsed time says nothing about the tunnel.
+    const firedLate =
+      now - lastHeartbeatCheckAt >
+      heartbeatIntervalMs * HEARTBEAT_LATE_FIRE_FACTOR;
+    lastHeartbeatCheckAt = now;
+
+    if (
+      unansweredPingSentAt !== undefined &&
+      lastFrameReceivedAt >= unansweredPingSentAt
+    ) {
+      // A frame arrived since the ping went out — pong, data, or control all
+      // count as proof of life.
+      unansweredPingSentAt = undefined;
+      heartbeatGraceUsed = false;
+    }
+
+    const pingUnansweredForFullWindow =
+      unansweredPingSentAt !== undefined &&
+      now - unansweredPingSentAt > heartbeatTimeoutMs;
+
+    if (pingUnansweredForFullWindow && firedLate && !heartbeatGraceUsed) {
+      // Throttling, not deadness: the ping (and its answer) may have been
+      // stalled along with the tab. Probe with a fresh ping and re-check on
+      // the next tick instead of killing a usually-healthy socket.
+      heartbeatGraceUsed = true;
+      unansweredPingSentAt = undefined;
+    } else if (pingUnansweredForFullWindow) {
+      // A backgrounded/suspended tab can leave the socket half-open: it never
+      // fires `onclose`, so reconnect-on-close alone never triggers. A ping we
+      // actually sent drew no frame at all for the full wall-clock window —
+      // the tunnel really is dead; force it closed → onclose → reconnect.
+      log("relay heartbeat timeout — forcing reconnect");
+      try {
+        socket.close(4000, "heartbeat_timeout");
+      } catch {
+        // Ignore: a socket that can't be closed will be replaced on reconnect.
+      }
+      return;
+    }
+
+    sendText({ type: "ping" });
+    if (unansweredPingSentAt === undefined) {
+      unansweredPingSentAt = now;
+    }
+  };
+
   const startHeartbeat = () => {
     stopHeartbeat();
-    lastPongAt = Date.now();
-    heartbeatTimer = setInterval(() => {
-      if (socket.readyState !== socket.OPEN) {
-        return;
-      }
-      // A backgrounded/suspended tab can leave the socket half-open: it never
-      // fires `onclose`, so reconnect-on-close alone never triggers. Detect the
-      // stale socket by missing pongs and force it closed → onclose → reconnect.
-      if (Date.now() - lastPongAt > heartbeatTimeoutMs) {
-        log("relay heartbeat timeout — forcing reconnect");
-        try {
-          socket.close(4000, "heartbeat_timeout");
-        } catch {
-          // Ignore: a socket that can't be closed will be replaced on reconnect.
-        }
-        return;
-      }
-      sendText({ type: "ping" });
-    }, heartbeatIntervalMs);
+    lastFrameReceivedAt = Date.now();
+    lastHeartbeatCheckAt = Date.now();
+    unansweredPingSentAt = undefined;
+    heartbeatGraceUsed = false;
+    heartbeatTimer = setInterval(heartbeatTick, heartbeatIntervalMs);
   };
 
   const scheduleReconnect = () => {
@@ -476,6 +536,7 @@ export function startPsLiteRelayClient(
       options.onStatus?.("connected");
     };
     socket.onmessage = (event) => {
+      lastFrameReceivedAt = Date.now();
       if (typeof event.data === "string") {
         handleControl(JSON.parse(event.data) as ControlMessage);
         return;
