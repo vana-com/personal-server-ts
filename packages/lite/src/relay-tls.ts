@@ -44,6 +44,7 @@ export function createRustlsPsLiteRelayTlsFactory(
   // issuance (or hit the persisted ACME cache once it succeeds).
   let trustedIdentity: PsLiteRelayTlsIdentity | undefined;
   let inFlight: Promise<PsLiteRelayTlsIdentity> | undefined;
+  let inFlightToken: string | undefined;
 
   async function resolveIdentity(
     input: PsLiteRelayTlsPrepareInput,
@@ -52,10 +53,23 @@ export function createRustlsPsLiteRelayTlsFactory(
       return trustedIdentity;
     }
     // Coalesce concurrent callers onto one attempt, but clear on settle so a
-    // failed (self-signed) attempt doesn't block the next retry.
-    inFlight ??= createTlsIdentity(input, options).finally(() => {
-      inFlight = undefined;
-    });
+    // failed (self-signed) attempt doesn't block the next retry. A caller that
+    // brings a fresh issueToken must NOT join an in-flight attempt made with
+    // different (or no) credentials: that attempt can settle self-signed even
+    // though this caller could mint a trusted cert, and the first strict-TLS
+    // stream after recovery would still get the untrusted identity. Such a
+    // caller starts its own attempt; the superseded one settles harmlessly.
+    const token = input.issueToken ?? "";
+    if (!inFlight || (token && token !== inFlightToken)) {
+      const attempt = createTlsIdentity(input, options).finally(() => {
+        if (inFlight === attempt) {
+          inFlight = undefined;
+          inFlightToken = undefined;
+        }
+      });
+      inFlight = attempt;
+      inFlightToken = token;
+    }
     const identity = await inFlight;
     if (identity.trusted) {
       trustedIdentity = identity;
