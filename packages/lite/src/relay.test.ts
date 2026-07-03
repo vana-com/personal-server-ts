@@ -554,11 +554,90 @@ describe("startPsLiteRelayClient resilience", () => {
     vi.advanceTimersByTime(1_000); // first heartbeat tick → ping
     expect(pingCount(sockets[0])).toBeGreaterThanOrEqual(1);
 
-    // No pong ever arrives → a later tick crosses heartbeatTimeoutMs and
-    // force-closes the stale socket, which schedules a reconnect.
-    vi.advanceTimersByTime(2_500);
+    // No frame ever arrives → the timeout window (measured from the first
+    // unanswered ping) expires on a later on-schedule tick, which force-closes
+    // the stale socket and schedules a reconnect.
+    vi.advanceTimersByTime(3_000);
     vi.advanceTimersByTime(1_000); // reconnect backoff elapses
     expect(sockets.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("closes 4000 heartbeat_timeout and reconnects when a sent ping draws no frames for the full window (BUI-665 regression guard)", () => {
+    vi.useFakeTimers();
+    const { sockets } = startWithSockets();
+    sockets[0].onopen?.();
+    const closeSpy = vi.spyOn(sockets[0], "close");
+
+    vi.advanceTimersByTime(1_000); // tick 1 → ping goes out, never answered
+    expect(pingCount(sockets[0])).toBe(1);
+
+    // On-schedule ticks at 2s/3s stay inside the 2.5s window; the 4s tick sees
+    // the ping unanswered for 3s of wall clock → genuinely dead.
+    vi.advanceTimersByTime(3_000);
+    expect(closeSpy).toHaveBeenCalledWith(4000, "heartbeat_timeout");
+
+    vi.advanceTimersByTime(1_000); // reconnect backoff elapses
+    expect(sockets).toHaveLength(2);
+  });
+
+  it("does not close a healthy socket when the throttled timer fires late but frames arrived (BUI-665)", () => {
+    vi.useFakeTimers();
+    const { sockets } = startWithSockets();
+    sockets[0].onopen?.();
+
+    vi.advanceTimersByTime(1_000); // tick 1 → ping
+    sockets[0].receive(JSON.stringify({ type: "pong" }));
+
+    // Chrome throttles background-tab timers to >= 1/min: the clock jumps 60s
+    // with no ticks, then a single late tick fires. The elapsed time is far
+    // past heartbeatTimeoutMs, but the last ping WAS answered — the old
+    // cadence-based check killed this healthy socket (727/763 disconnects).
+    vi.setSystemTime(Date.now() + 60_000);
+    vi.advanceTimersByTime(1_000);
+
+    expect(sockets).toHaveLength(1); // no reconnect churn
+    expect(sockets[0].readyState).toBe(1); // still OPEN
+  });
+
+  it("treats any relay frame as liveness — data frames without pongs keep the socket open (BUI-665)", () => {
+    vi.useFakeTimers();
+    const { sockets } = startWithSockets();
+    sockets[0].onopen?.();
+
+    vi.advanceTimersByTime(1_000); // tick 1 → ping
+    // Only relay traffic arrives — never a pong. Ticks fire off-schedule
+    // (throttled), so elapsed-since-last-pong is huge on every check.
+    sockets[0].receive(encodeDataFrame(1, new Uint8Array([1, 2, 3])));
+    vi.setSystemTime(Date.now() + 60_000);
+    sockets[0].receive(encodeDataFrame(1, new Uint8Array([4, 5, 6])));
+    vi.advanceTimersByTime(1_000); // late tick finds recent frames → alive
+
+    expect(sockets).toHaveLength(1);
+    expect(sockets[0].readyState).toBe(1);
+  });
+
+  it("gives a late tick with an expired window one grace ping, then closes if the tunnel stays silent (BUI-665)", () => {
+    vi.useFakeTimers();
+    const { sockets } = startWithSockets();
+    sockets[0].onopen?.();
+    const closeSpy = vi.spyOn(sockets[0], "close");
+
+    vi.advanceTimersByTime(1_000); // tick 1 → ping, never answered
+    const pingsAfterFirstTick = pingCount(sockets[0]);
+
+    // Late tick with the window long expired: throttling, not deadness. The
+    // client probes with a fresh ping instead of closing.
+    vi.setSystemTime(Date.now() + 60_000);
+    vi.advanceTimersByTime(1_000);
+    expect(sockets[0].readyState).toBe(1);
+    expect(pingCount(sockets[0])).toBe(pingsAfterFirstTick + 1);
+    expect(closeSpy).not.toHaveBeenCalled();
+
+    // The fresh ping also draws no frame for another full wall-clock window →
+    // the tunnel really is dead, even from a throttled tab.
+    vi.setSystemTime(Date.now() + 60_000);
+    vi.advanceTimersByTime(1_000);
+    expect(closeSpy).toHaveBeenCalledWith(4000, "heartbeat_timeout");
   });
 
   it("stops for good when the relay replaces the session (close 1012)", () => {
