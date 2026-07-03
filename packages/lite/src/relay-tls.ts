@@ -34,17 +34,46 @@ let rustlsInitPromise: Promise<unknown> | undefined;
 export function createRustlsPsLiteRelayTlsFactory(
   options: RustlsPsLiteRelayTlsOptions,
 ): PsLiteRelayTlsFactory {
-  let identityPromise: Promise<PsLiteRelayTlsIdentity> | undefined;
+  // Only a TRUSTED (ACME) identity is memoized for the factory's lifetime. A
+  // self-signed fallback must NOT be: it means issuance failed on this attempt
+  // (no issueToken yet, /issue-cert error, ACME timeout), and locking it in
+  // would strand the tab on an untrusted cert forever — even after a reconnect
+  // delivers a fresh issueToken (BUI-664). The relay factory outlives every
+  // reconnect, so a first-attempt fallback used to pin the whole session to
+  // self-signed. Leaving it unmemoized lets the next prepare/createStream retry
+  // issuance (or hit the persisted ACME cache once it succeeds).
+  let trustedIdentity: PsLiteRelayTlsIdentity | undefined;
+  let inFlight: Promise<PsLiteRelayTlsIdentity> | undefined;
+
+  async function resolveIdentity(
+    input: PsLiteRelayTlsPrepareInput,
+  ): Promise<PsLiteRelayTlsIdentity> {
+    if (trustedIdentity) {
+      return trustedIdentity;
+    }
+    // Coalesce concurrent callers onto one attempt, but clear on settle so a
+    // failed (self-signed) attempt doesn't block the next retry.
+    inFlight ??= createTlsIdentity(input, options).finally(() => {
+      inFlight = undefined;
+    });
+    const identity = await inFlight;
+    if (identity.trusted) {
+      trustedIdentity = identity;
+    } else {
+      options.logger?.(
+        `serving self-signed cert for ${identity.hostname}; ACME issuance unavailable this attempt, will retry on the next stream/reconnect`,
+      );
+    }
+    return identity;
+  }
 
   return {
     async prepare(input: PsLiteRelayTlsPrepareInput) {
-      identityPromise ??= createTlsIdentity(input, options);
-      await identityPromise;
+      await resolveIdentity(input);
     },
     async createStream(input: PsLiteRelayTlsStreamInput) {
       await ensureRustls();
-      identityPromise ??= createTlsIdentity(input, options);
-      const identity = await identityPromise;
+      const identity = await resolveIdentity(input);
       const tls = new RustlsServer(identity.certPem, identity.keyPem);
       return createRustlsStream(tls);
     },
