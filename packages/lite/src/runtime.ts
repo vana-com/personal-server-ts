@@ -192,17 +192,7 @@ export interface Web3SignedPsLiteAuthOptions {
 }
 
 type JsonStatus =
-  | 200
-  | 201
-  | 400
-  | 401
-  | 403
-  | 404
-  | 405
-  | 409
-  | 500
-  | 501
-  | 503;
+  200 | 201 | 400 | 401 | 403 | 404 | 405 | 409 | 500 | 501 | 503;
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -575,10 +565,10 @@ export function createPsLiteRuntime(
   // Pass the gateway config to the x402 path only when complete; undefined
   // keeps core's read free instead of issuing a malformed challenge.
   const x402GatewayConfig:
-    | (DataPortabilityGatewayConfig & { url: string })
-    | undefined = gatewayConfigComplete
-    ? (gw as unknown as DataPortabilityGatewayConfig & { url: string })
-    : undefined;
+    (DataPortabilityGatewayConfig & { url: string }) | undefined =
+    gatewayConfigComplete
+      ? (gw as unknown as DataPortabilityGatewayConfig & { url: string })
+      : undefined;
   // The data handler's x402 path only needs signRecordDataAccess; narrow the
   // (optional) signer so a grant-only signer doesn't masquerade as one that can
   // sign access records.
@@ -955,8 +945,7 @@ export function createPsLiteRuntime(
               auth,
               gateway: options.gateway,
               gatewayConfig: options.config?.gateway as
-                | DataPortabilityGatewayConfig
-                | undefined,
+                DataPortabilityGatewayConfig | undefined,
               serverOwner: options.serverOwner ?? options.identity?.address,
               serverSigner: options.serverSigner,
               now,
@@ -1018,8 +1007,7 @@ export function createPsLiteRuntime(
             serverOrigin: url.origin,
             gateway: options.gateway,
             gatewayConfig: options.config?.gateway as
-              | (DataPortabilityGatewayConfig & { url?: string })
-              | undefined,
+              (DataPortabilityGatewayConfig & { url?: string }) | undefined,
             serverOwner: options.serverOwner ?? options.identity?.address,
             serverSigner: options.serverSigner,
             activityRecorder,

@@ -599,8 +599,7 @@ async function syncSmoke(): Promise<UiResult> {
   const trigger = await syncTrigger();
   const status = await syncStatus();
   const syncData = status.data as
-    | { pendingFiles?: number; errors?: unknown[] }
-    | undefined;
+    { pendingFiles?: number; errors?: unknown[] } | undefined;
   const ok =
     write.ok &&
     trigger.status === 202 &&
@@ -620,8 +619,7 @@ async function authRoutesSmoke(): Promise<UiResult> {
     auth: "none",
   });
   const initData = init.data as
-    | { login?: string; poll?: { token?: string } }
-    | undefined;
+    { login?: string; poll?: { token?: string } } | undefined;
   const pollToken = initData?.poll?.token;
   const loginUrl = initData?.login;
   const pending = pollToken

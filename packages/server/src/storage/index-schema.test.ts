@@ -95,8 +95,7 @@ describe("initializeDatabase", () => {
     const row = db2
       .prepare("SELECT path, scope, size_bytes FROM data_files WHERE path = ?")
       .get("instagram/profile.json") as
-      | { path: string; scope: string; size_bytes: number }
-      | undefined;
+      { path: string; scope: string; size_bytes: number } | undefined;
 
     expect(version).toBe(3);
     expect(row).toEqual({

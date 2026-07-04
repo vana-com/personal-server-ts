@@ -44,9 +44,7 @@ function filterAuthorizedUsers(users: User[]): User[] {
 
 ```typescript
 // Incorrect - O(n) search
-const users: User[] = [
-  /* ... */
-];
+const users: User[] = [/* ... */];
 function findUserById(id: string): User | undefined {
   return users.find((u) => u.id === id); // Scans entire array
 }

@@ -73,13 +73,11 @@ function createLegacyConfigCursor(configPath: string): SyncCursor {
       try {
         raw = await readFile(configPath, "utf8");
       } catch (err) {
-        if (
-          !(
-            err instanceof Error &&
-            "code" in err &&
-            (err as NodeJS.ErrnoException).code === "ENOENT"
-          )
-        ) {
+        if (!(
+          err instanceof Error &&
+          "code" in err &&
+          (err as NodeJS.ErrnoException).code === "ENOENT"
+        )) {
           throw err;
         }
       }

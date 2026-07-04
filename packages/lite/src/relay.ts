@@ -39,12 +39,7 @@ export interface PsLiteRelayClientOptions {
 }
 
 export type PsLiteRelayStatus =
-  | "connecting"
-  | "connected"
-  | "disconnected"
-  | "closed"
-  | "replaced"
-  | "error";
+  "connecting" | "connected" | "disconnected" | "closed" | "replaced" | "error";
 
 /**
  * Close code the relay sends to the losing side when a new connection claims
@@ -108,8 +103,7 @@ export interface PsLiteRelayWebSocket {
   readonly bufferedAmount?: number;
   onopen: (() => void) | null;
   onmessage:
-    | ((event: { data: string | ArrayBuffer | Uint8Array }) => void)
-    | null;
+    ((event: { data: string | ArrayBuffer | Uint8Array }) => void) | null;
   onclose: ((event?: PsLiteRelayCloseEvent) => void) | null;
   onerror: (() => void) | null;
   send(data: string | Uint8Array): void;

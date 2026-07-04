@@ -92,11 +92,7 @@ export interface McpConnectionStore {
 }
 
 export type McpOAuthAuthorizationStatus =
-  | "pending"
-  | "approved"
-  | "redeemed"
-  | "denied"
-  | "expired";
+  "pending" | "approved" | "redeemed" | "denied" | "expired";
 
 export interface McpOAuthAuthorizationRecord {
   id: string;

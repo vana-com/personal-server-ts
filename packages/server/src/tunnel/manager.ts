@@ -22,11 +22,7 @@ import { generateFrpcConfig } from "./config.js";
 import { buildTunnelUrl } from "./verify.js";
 
 export type TunnelStatus =
-  | "stopped"
-  | "starting"
-  | "connected"
-  | "disconnected"
-  | "error";
+  "stopped" | "starting" | "connected" | "disconnected" | "error";
 
 export interface TunnelStatusInfo {
   enabled: boolean;

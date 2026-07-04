@@ -8,12 +8,7 @@ export type SyncFailureStage =
   | "unknown";
 
 export type SyncPayloadKind =
-  | "openpgp"
-  | "json"
-  | "html"
-  | "empty"
-  | "binary"
-  | "unknown";
+  "openpgp" | "json" | "html" | "empty" | "binary" | "unknown";
 
 export type SyncFailureDisposition = "deterministic" | "transient";
 

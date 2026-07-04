@@ -9,9 +9,7 @@ import { buildBinaryEnvelopeData, sha256Hex } from "./binary.js";
 import { buildDataBlocksAsync } from "../storage/blocks/build.js";
 
 export type DataContractErrorCode =
-  | "INVALID_SCOPE"
-  | "INVALID_BODY"
-  | "NOT_FOUND";
+  "INVALID_SCOPE" | "INVALID_BODY" | "NOT_FOUND";
 
 export interface DataContractErrorBody {
   error: DataContractErrorCode;

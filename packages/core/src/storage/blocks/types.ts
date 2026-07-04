@@ -1,10 +1,5 @@
 export type ContentKind =
-  | "vana-envelope"
-  | "json"
-  | "zip"
-  | "text"
-  | "binary"
-  | "unsupported";
+  "vana-envelope" | "json" | "zip" | "text" | "binary" | "unsupported";
 
 export interface DataBlockManifest {
   version: 1;

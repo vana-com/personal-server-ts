@@ -13,10 +13,7 @@ import {
 } from "../errors/catalog.js";
 
 export type AuthMechanism =
-  | "web3-signed"
-  | "dev-token"
-  | "control-plane-token"
-  | "cli-session-token";
+  "web3-signed" | "dev-token" | "control-plane-token" | "cli-session-token";
 
 export interface RequestAuth {
   signer: `0x${string}`;

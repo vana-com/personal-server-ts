@@ -17,10 +17,7 @@ import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logg
 import type { PsLiteTokenStore } from "./runtime.js";
 
 export type PsLiteStateKey =
-  | "config-v1"
-  | "server-identity-v1"
-  | "relay-v1"
-  | "sync-cursor-v1";
+  "config-v1" | "server-identity-v1" | "relay-v1" | "sync-cursor-v1";
 
 export interface PsLiteStateStore {
   get<T>(key: PsLiteStateKey): Promise<T | null>;
