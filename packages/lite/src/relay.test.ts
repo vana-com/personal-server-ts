@@ -54,8 +54,8 @@ class FakeRelayWebSocket implements PsLiteRelayWebSocket {
   bufferedAmount = 0;
   onopen: (() => void) | null = null;
   onmessage:
-    | ((event: { data: string | ArrayBuffer | Uint8Array }) => void)
-    | null = null;
+    ((event: { data: string | ArrayBuffer | Uint8Array }) => void) | null =
+    null;
   onclose: ((event?: { code?: number; reason?: string }) => void) | null = null;
   onerror: (() => void) | null = null;
   readonly sent: Array<string | Uint8Array> = [];

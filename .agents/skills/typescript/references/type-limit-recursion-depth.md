@@ -18,12 +18,7 @@ type DeepPartial<T> = {
 // No depth limit - deeply nested objects cause exponential expansion
 
 type JSONValue =
-  | string
-  | number
-  | boolean
-  | null
-  | JSONValue[]
-  | { [key: string]: JSONValue };
+  string | number | boolean | null | JSONValue[] | { [key: string]: JSONValue };
 // Infinite recursion potential
 ```
 
@@ -40,13 +35,12 @@ type DeepPartial<T, Depth extends number[] = []> = Depth["length"] extends 5
 
 type JSONValue<Depth extends number[] = []> = Depth["length"] extends 10
   ? unknown
-  :
-      | string
-      | number
-      | boolean
-      | null
-      | JSONValue<[...Depth, 1]>[]
-      | { [key: string]: JSONValue<[...Depth, 1]> };
+  : | string
+    | number
+    | boolean
+    | null
+    | JSONValue<[...Depth, 1]>[]
+    | { [key: string]: JSONValue<[...Depth, 1]> };
 ```
 
 **Alternative (use built-in utilities):**

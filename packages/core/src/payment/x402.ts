@@ -156,8 +156,7 @@ export interface X402Payment {
  * builds a fresh challenge.
  */
 export type X402VerifyResult =
-  | { ok: true; payment: X402Payment }
-  | { ok: false; reason: string };
+  { ok: true; payment: X402Payment } | { ok: false; reason: string };
 
 const CHALLENGE_TTL_SECONDS = 300; // 5 min — challenges are stateless; this
 // is purely advisory for clients.

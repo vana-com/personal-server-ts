@@ -17,8 +17,7 @@ export interface SyncManagerOptions {
 }
 
 export type SyncCanRunResult =
-  | { ok: true }
-  | { ok: false; reason: string; message: string };
+  { ok: true } | { ok: false; reason: string; message: string };
 
 export interface SyncManager {
   /** Start the background sync loop */

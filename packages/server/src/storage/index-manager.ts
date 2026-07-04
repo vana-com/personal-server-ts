@@ -268,22 +268,19 @@ export function createIndexManager(db: Database.Database): IndexManager {
 
     findClosestByScope(scope, at) {
       const row = findClosestByScopeStmt.get({ scope, at }) as
-        | RawRow
-        | undefined;
+        RawRow | undefined;
       return row ? rowToEntry(row) : undefined;
     },
 
     findByFileId(fileId) {
       const row = findByFileIdStmt.get({ file_id: fileId }) as
-        | RawRow
-        | undefined;
+        RawRow | undefined;
       return row ? rowToEntry(row) : undefined;
     },
 
     findByDataPointId(dataPointId) {
       const row = findByDataPointIdStmt.get({ data_point_id: dataPointId }) as
-        | RawRow
-        | undefined;
+        RawRow | undefined;
       return row ? rowToEntry(row) : undefined;
     },
 

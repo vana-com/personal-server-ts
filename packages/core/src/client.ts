@@ -20,11 +20,7 @@ import type { SyncStatus } from "./sync/types.js";
 export type PersonalServerKind = "node" | "lite";
 
 export type PersonalServerStatus =
-  | "starting"
-  | "ready"
-  | "unavailable"
-  | "stopped"
-  | "error";
+  "starting" | "ready" | "unavailable" | "stopped" | "error";
 
 export interface PersonalServerIdentity {
   address: `0x${string}`;
@@ -81,8 +77,7 @@ export interface PersonalServerSubmitRegistrationOptions {
 }
 
 export type PersonalServerOwnerAuth =
-  | { signMessage: Web3SignedSignFn }
-  | { bearerToken: string };
+  { signMessage: Web3SignedSignFn } | { bearerToken: string };
 
 export type PersonalServerPostDataOptions = PersonalServerOwnerAuth & {
   headers?: Record<string, string>;

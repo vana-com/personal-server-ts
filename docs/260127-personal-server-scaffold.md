@@ -381,11 +381,12 @@ Authorization: Web3Signed <base64url(json)>.<signature>
 ```
 
 **Query Parameters:**
-| Param | Type | Required | Description |
-|-------|------|----------|-------------|
-| `scopePrefix` | string | No | Filter by scope prefix (e.g., `instagram`) |
-| `limit` | number | No | Pagination limit (default: 50) |
-| `offset` | number | No | Pagination offset (default: 0) |
+
+| Param         | Type   | Required | Description                                |
+| ------------- | ------ | -------- | ------------------------------------------ |
+| `scopePrefix` | string | No       | Filter by scope prefix (e.g., `instagram`) |
+| `limit`       | number | No       | Pagination limit (default: 50)             |
+| `offset`      | number | No       | Pagination offset (default: 0)             |
 
 **Web3Signed Payload:**
 
@@ -431,10 +432,11 @@ Authorization: Web3Signed <base64url(json)>.<signature>
 ```
 
 **Query Parameters:**
-| Param | Type | Required | Description |
-|-------|------|----------|-------------|
-| `fileId` | string | No | Specific version by DataRegistry fileId |
-| `at` | ISO8601 | No | Specific version by collectedAt (closest ≤ at) |
+
+| Param    | Type    | Required | Description                                    |
+| -------- | ------- | -------- | ---------------------------------------------- |
+| `fileId` | string  | No       | Specific version by DataRegistry fileId        |
+| `at`     | ISO8601 | No       | Specific version by collectedAt (closest ≤ at) |
 
 Default: latest by `collectedAt`
 
@@ -494,10 +496,11 @@ Authorization: Web3Signed <base64url(json)>.<signature>
 ```
 
 **Query Parameters:**
-| Param | Type | Required | Description |
-|-------|------|----------|-------------|
-| `limit` | number | No | Pagination limit (default: 50) |
-| `offset` | number | No | Pagination offset (default: 0) |
+
+| Param    | Type   | Required | Description                    |
+| -------- | ------ | -------- | ------------------------------ |
+| `limit`  | number | No       | Pagination limit (default: 50) |
+| `offset` | number | No       | Pagination offset (default: 0) |
 
 **Web3Signed Payload:**
 
@@ -627,10 +630,11 @@ Authorization: Web3Signed <base64url(json)>.<signature>
 (Owner auth — signer must match `server.address`)
 
 **Query Parameters:**
-| Param | Type | Required | Description |
-|-------|------|----------|-------------|
-| `limit` | number | No | Pagination limit (default: 50) |
-| `offset` | number | No | Pagination offset (default: 0) |
+
+| Param    | Type   | Required | Description                    |
+| -------- | ------ | -------- | ------------------------------ |
+| `limit`  | number | No       | Pagination limit (default: 50) |
+| `offset` | number | No       | Pagination offset (default: 0) |
 
 **Response (200 OK):**
 

@@ -76,10 +76,7 @@ interface SyncFailureMetadata {
 }
 
 type MissingBlockRepairResult =
-  | "already-ready"
-  | "repaired"
-  | "missing-envelope"
-  | "not-repaired";
+  "already-ready" | "repaired" | "missing-envelope" | "not-repaired";
 
 interface LocalMissingBlockRepairSummary {
   repaired: number;

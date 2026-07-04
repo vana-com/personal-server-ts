@@ -147,8 +147,7 @@ export async function createServer(
     options?.ownerSignature ??
     (process.env.VANA_MASTER_KEY_SIGNATURE as `0x${string}` | undefined);
   const ownerPrivateKey = process.env.VANA_OWNER_PRIVATE_KEY as
-    | `0x${string}`
-    | undefined;
+    `0x${string}` | undefined;
   const ownerTunnelSigner = ownerPrivateKey
     ? privateKeyToAccount(
         ownerPrivateKey.startsWith("0x")

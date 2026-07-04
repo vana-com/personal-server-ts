@@ -457,8 +457,7 @@ export async function startPersonalServer(
     method: string;
     body?: unknown;
     authOptions:
-      | PersonalServerAuthRequestOptions
-      | PersonalServerPostDataOptions;
+      PersonalServerAuthRequestOptions | PersonalServerPostDataOptions;
     headers?: Record<string, string>;
   }): Promise<Request> {
     const encoded =

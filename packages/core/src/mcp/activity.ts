@@ -11,16 +11,10 @@
  */
 
 export type McpActivityStatus =
-  | "running"
-  | "succeeded"
-  | "failed"
-  | "timed_out"
-  | "aborted";
+  "running" | "succeeded" | "failed" | "timed_out" | "aborted";
 
 export type McpActivityPhase =
-  | "tool_running"
-  | "response_preparing"
-  | "response_ready";
+  "tool_running" | "response_preparing" | "response_ready";
 
 export interface McpActivityEvent {
   id: string;
