@@ -54,7 +54,7 @@
     "node": ">=22.0.0"
   },
   "devDependencies": {
-    "@commitlint/cli": "^20.5.3",
+    "@commitlint/cli": "^21.2.0",
     "@commitlint/config-conventional": "^21.2.0",
     "@opendatalabs/vana-sdk": "3.11.0",
     "@semantic-release/commit-analyzer": "^13.0.1",
