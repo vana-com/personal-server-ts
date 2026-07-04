@@ -3,7 +3,9 @@ name: Prerelease
 on:
   push:
     branches:
-      - main
+      # main mirrors dev (fast-forward), so publishing from it would always
+      # collide with the canary the dev push already published (E403
+      # cannot-publish-over). Canary comes from dev only.
       - develop
       - dev
       - "feat/*"
