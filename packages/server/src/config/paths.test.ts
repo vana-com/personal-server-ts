@@ -10,8 +10,8 @@ describe("expandHomePath", () => {
   });
 
   it('expands "~/" prefixes to the current home directory', () => {
-    expect(expandHomePath("~/data-connect/personal-server")).toBe(
-      resolve(homedir(), "data-connect/personal-server"),
+    expect(expandHomePath("~/.vana/desktop/personal-server")).toBe(
+      resolve(homedir(), ".vana/desktop/personal-server"),
     );
   });
 
