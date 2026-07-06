@@ -39,12 +39,41 @@ describe("ServerConfigSchema — sync fields", () => {
     expect(config.sync.lastProcessedTimestamp).toBe("2026-01-21T10:00:00Z");
   });
 
-  it("storage.config.vana.apiUrl defaults to https://storage.vana.com", () => {
+  it("storage.config.vana.apiUrl defaults to https://storage.vana.org", () => {
     const config = ServerConfigSchema.parse({
       storage: { config: { vana: {} } },
     });
 
-    expect(config.storage.config.vana?.apiUrl).toBe("https://storage.vana.com");
+    expect(config.storage.config.vana?.apiUrl).toBe("https://storage.vana.org");
+  });
+});
+
+describe("ServerConfigSchema — storage network", () => {
+  it.each(["mainnet", "moksha"] as const)(
+    "accepts storage.config.vana.network = %s",
+    (network) => {
+      const config = ServerConfigSchema.parse({
+        storage: { config: { vana: { network } } },
+      });
+
+      expect(config.storage.config.vana?.network).toBe(network);
+    },
+  );
+
+  it("leaves storage.config.vana.network undefined when omitted", () => {
+    const config = ServerConfigSchema.parse({
+      storage: { config: { vana: {} } },
+    });
+
+    expect(config.storage.config.vana?.network).toBeUndefined();
+  });
+
+  it("rejects an invalid storage.config.vana.network", () => {
+    expect(() =>
+      ServerConfigSchema.parse({
+        storage: { config: { vana: { network: "testnet" } } },
+      }),
+    ).toThrow();
   });
 });
 

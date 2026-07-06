@@ -13,7 +13,7 @@ export const DEFAULTS = {
     backend: "local" as const,
     config: {
       vana: {
-        apiUrl: "https://storage.vana.com",
+        apiUrl: "https://storage.vana.org",
       },
     },
   },
@@ -66,8 +66,23 @@ export const StorageBackend = z.enum([
   "dropbox",
 ]);
 
+/**
+ * On-chain protocol network that scopes vana-storage blob paths. This is
+ * independent of the product storage host (`apiUrl`) — the protocol network is
+ * never inferred from the storage hostname. Mirrors the SDK's `ProtocolNetwork`.
+ */
+export const ProtocolNetwork = z.enum(["mainnet", "moksha"]);
+export type ProtocolNetwork = z.infer<typeof ProtocolNetwork>;
+
 export const VanaStorageConfigSchema = z.object({
   apiUrl: z.url().default(DEFAULTS.storage.config.vana.apiUrl),
+  /**
+   * Optional protocol network passed through to the storage provider. When set,
+   * uploads/reads use network-scoped routes (`/v1/networks/{network}/blobs/...`).
+   * When omitted, the adapter falls back to the gateway chainId and finally to
+   * the legacy `/v1/blobs/...` routes.
+   */
+  network: ProtocolNetwork.optional(),
 });
 
 export const ServerConfigSchema = z.object({
