@@ -525,6 +525,33 @@ async function main(): Promise<void> {
   });
   const gateway = createGatewayClient(GATEWAY_URL);
 
+  // Some gateways (e.g. moksha) gate POST /v1/settle behind a shared secret;
+  // the SDK's gateway.settle() sends no Authorization, so it 401s there. When
+  // SETTLE_SECRET is set we drive settle via a direct fetch carrying
+  // `Authorization: Bearer <secret>`; otherwise fall back to the SDK client
+  // (open settle endpoints, e.g. dev). Same response shape either way.
+  const SETTLE_SECRET = process.env["SETTLE_SECRET"];
+  const drainSettle = async (): Promise<
+    Awaited<ReturnType<typeof gateway.settle>>
+  > => {
+    if (!SETTLE_SECRET) return gateway.settle();
+    const res = await fetch(`${GATEWAY_URL}/v1/settle`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${SETTLE_SECRET}`,
+      },
+      body: JSON.stringify({}),
+    });
+    if (!res.ok) {
+      throw new Error(`Gateway error: ${res.status} ${res.statusText}`);
+    }
+    return res.json() as Promise<Awaited<ReturnType<typeof gateway.settle>>>;
+  };
+  console.log(
+    `  Settle auth:    ${SETTLE_SECRET ? "Bearer SETTLE_SECRET" : "(none — SDK client)"}`,
+  );
+
   // ─── 1. Generate fresh wallets ─────────────────────────────────────
   step("Generating fresh user + app wallets");
   const userPrivateKey = generatePrivateKey();
@@ -983,11 +1010,23 @@ async function main(): Promise<void> {
       throw new Error("challenge.accepts should have exactly one option");
     }
     const accept = challenge.accepts[0];
+    // First read: the grant is unpaid, so the challenge bundles the one-time
+    // grant-registration fee WITH the per-read data-access fee. Capture the
+    // pieces so we can contrast them against the second read below.
+    const firstReadAmount = accept.amount;
+    const firstRegFee = accept.breakdown.registrationFee;
+    const firstAccessFee = accept.breakdown.dataAccessFee;
+    console.log(`    first read fee (registration + data access):`);
     console.log(
-      `    amount:     ${accept.amount} (${formatEther(BigInt(accept.amount))} VANA)`,
+      `      amount:     ${firstReadAmount} (${formatEther(BigInt(firstReadAmount))} VANA)`,
     );
     console.log(
-      `    breakdown:  reg=${accept.breakdown.registrationFee} access=${accept.breakdown.dataAccessFee} regOwed=${accept.breakdown.registrationOwed}`,
+      `      breakdown:  reg=${firstRegFee} access=${firstAccessFee} regOwed=${accept.breakdown.registrationOwed}`,
+    );
+    assertEq(
+      accept.breakdown.registrationOwed,
+      true,
+      "first read: registrationOwed",
     );
     if (accept.accessRecord) {
       console.log(
@@ -1111,9 +1150,20 @@ async function main(): Promise<void> {
     }
 
     // ─── 12. Verify post-payment state on the gateway ────────────────
+    // The envelope was already served, which means /v1/escrow/pay returned
+    // 2xx (the core handler only serves on a 2xx pay response). The grant's
+    // paymentStatus is flipped by that same call, but the read-back can lag
+    // the write by a beat on a loaded gateway — so poll rather than assert on
+    // the first read (mirrors the escrow-credit poll above).
     step("Verifying grant.paymentStatus flipped to 'paid'");
-    const grantAfterPay = await gateway.getGrant(grantId);
-    if (!grantAfterPay) throw new Error("grant disappeared after pay");
+    const grantAfterPay = await pollUntil(
+      "grant paymentStatus=paid",
+      async () => {
+        const g = await gateway.getGrant(grantId);
+        if (!g) throw new Error("grant disappeared after pay");
+        return g.paymentStatus === "paid" ? g : null;
+      },
+    );
     console.log(`    paymentStatus:   ${grantAfterPay.paymentStatus}`);
     console.log(`    paidBy:          ${fmt(grantAfterPay.paidBy ?? null)}`);
     console.log(`    paidAt:          ${grantAfterPay.paidAt}`);
@@ -1122,6 +1172,51 @@ async function main(): Promise<void> {
       grantAfterPay.paidBy?.toLowerCase(),
       appAccount.address.toLowerCase(),
       "grant.paidBy",
+    );
+
+    // ─── Second read: registration paid ⇒ data-access fee only ────────
+    // Now that the grant's registration fee is paid, a fresh unpaid read
+    // re-issues a 402 whose challenge drops the registration component:
+    // buildChallenge sets registrationOwed=false (paymentStatus==="paid"),
+    // so registrationFee shows "0" and amount === the per-read dataAccessFee.
+    step(
+      `Second read of ${SCOPE} without X-PAYMENT — registration already paid`,
+    );
+    const secondPayRes = await fetch(`${ps.url}${readUri}`, {
+      headers: { Authorization: await readAuthFn(readUri) },
+    });
+    if (secondPayRes.status !== 402) {
+      throw new Error(
+        `Expected 402 on second read, got ${secondPayRes.status}: ${await secondPayRes.text()}`,
+      );
+    }
+    const secondChallenge = (await secondPayRes.json()) as X402Challenge;
+    const secondAccept = secondChallenge.accepts[0];
+    console.log(`    second read fee (data access only):`);
+    console.log(
+      `      amount:     ${secondAccept.amount} (${formatEther(BigInt(secondAccept.amount))} VANA)`,
+    );
+    console.log(
+      `      breakdown:  reg=${secondAccept.breakdown.registrationFee} access=${secondAccept.breakdown.dataAccessFee} regOwed=${secondAccept.breakdown.registrationOwed}`,
+    );
+    console.log(
+      `    first → second: ${firstReadAmount} (reg ${firstRegFee} + access ${firstAccessFee})` +
+        ` → ${secondAccept.amount} (access ${secondAccept.breakdown.dataAccessFee})`,
+    );
+    assertEq(
+      secondAccept.breakdown.registrationOwed,
+      false,
+      "second read: registrationOwed",
+    );
+    assertEq(
+      secondAccept.breakdown.registrationFee,
+      "0",
+      "second read: registrationFee dropped to 0",
+    );
+    assertEq(
+      secondAccept.amount,
+      secondAccept.breakdown.dataAccessFee,
+      "second read: amount == dataAccessFee only",
     );
 
     // Pre-settle escrow snapshot. The gateway tracks four amounts per asset:
@@ -1284,7 +1379,7 @@ async function main(): Promise<void> {
     }
 
     step("Draining pending ops via gateway.settle()");
-    const settleResult = await gateway.settle();
+    const settleResult = await drainSettle();
     console.log(`    scanned:   ${settleResult.scanned}`);
     console.log(`    confirmed: ${settleResult.confirmed}`);
     console.log(`    submitted: ${settleResult.submitted}`);
@@ -1292,7 +1387,7 @@ async function main(): Promise<void> {
     console.log(`    failed:    ${settleResult.failed}`);
 
     function logInitial(opType: string, opId: Hex, label: string): void {
-      const item = settleResult.items.find(
+      const item = (settleResult.items ?? []).find(
         (i: SettleItem) =>
           i.opType === opType && i.opId.toLowerCase() === opId.toLowerCase(),
       );
@@ -1338,7 +1433,9 @@ async function main(): Promise<void> {
     // "grant"|"server"|"data"|"access" (no "builder"); the gateway always
     // emitted builder items at runtime, so this find() works regardless — the
     // SDK type widening just makes `i.opType === "builder"` type-check.
-    let builderDrainItem: SettleItem | undefined = settleResult.items.find(
+    let builderDrainItem: SettleItem | undefined = (
+      settleResult.items ?? []
+    ).find(
       (i: SettleItem) =>
         i.opType === "builder" &&
         i.opId.toLowerCase() === builderId.toLowerCase(),
@@ -1367,7 +1464,7 @@ async function main(): Promise<void> {
     // FINALIZE_TIMEOUT_MS env if your chain is slow. Polls every 10s by
     // default to limit gateway load while still picking up state changes
     // promptly on Moksha's ~6s block time.
-    step("Polling gateway.settle for reconcile → finalized");
+    step("Polling gateway.settle until every op's settle tx is mined on-chain");
     const FINALIZE_TIMEOUT_MS = Number(
       process.env["FINALIZE_TIMEOUT_MS"] ?? 600_000,
     );
@@ -1391,89 +1488,140 @@ async function main(): Promise<void> {
       );
     }
     interface WatchedState {
-      status: string;
-      settleTxHash: string | null;
+      // Gateway reconcile verdict: finalized | unchanged | reorged | pending.
+      // NOTE this is NOT the op's DB lifecycle status — an op only appears in
+      // reconciled.items once it's already 'confirmed', and "unchanged" means
+      // "still confirmed, block not past the chain's finalized tip yet".
+      reconcileStatus: string;
+      settleTxHash: `0x${string}` | null;
       chainBlockHeight: string | null;
+      // Ground truth: the settle tx receipt is mined AND status === "success".
+      minedOk: boolean;
       reason: string | null;
     }
     const finalStatus: Record<string, WatchedState> = {};
     const finalizeStart = Date.now();
-    let finalized = false;
+    let allSettled = false;
+    // Success condition = every watched op's settle tx is mined + successful
+    // on-chain. We do NOT block on the gateway's reconcile promoting
+    // 'confirmed' → 'finalized': that gates on the chain's `finalized` tip,
+    // which can lag minutes on Moksha (the op sits at reconcile-status
+    // "unchanged" — i.e. confirmed-but-not-yet-finalized). A mined+successful
+    // settle tx is the real "it landed on-chain" signal; `finalized` is a
+    // stricter bonus we surface when it happens.
     while (Date.now() - finalizeStart < FINALIZE_TIMEOUT_MS) {
-      const r = await gateway.settle();
+      const r = await drainSettle();
       // Each poll is also a fresh drain — grab the builder item the first time
       // any pass surfaces it, so the final step can report the settle-drain tx
       // hash alongside the on-chain event.
+      // A settle response may omit items/reconciled when a pass has nothing to
+      // report (empty/partial body); default to empty arrays so a quiet poll
+      // doesn't crash the loop.
       if (!builderDrainItem) {
-        builderDrainItem = r.items.find(
+        builderDrainItem = (r.items ?? []).find(
           (i: SettleItem) =>
             i.opType === "builder" &&
             i.opId.toLowerCase() === builderId.toLowerCase(),
         );
       }
       const elapsed = Math.round((Date.now() - finalizeStart) / 1000);
-      let allFinalized = true;
+      let allOk = true;
       let line = `    [${elapsed}s]`;
       for (const w of watched) {
-        const item = r.reconciled.items.find(
+        const item = (r.reconciled?.items ?? []).find(
           (i: SettleReconcileItem) =>
             i.opId.toLowerCase() === w.opId.toLowerCase(),
         );
         const prev = finalStatus[w.opId];
-        const cur: WatchedState = item
-          ? {
-              status: item.status,
-              settleTxHash: item.settleTxHash,
-              chainBlockHeight: item.chainBlockHeight,
-              reason: item.reason ?? null,
-            }
-          : (prev ?? {
-              status: "pending",
-              settleTxHash: null,
-              chainBlockHeight: null,
-              reason: null,
-            });
-        finalStatus[w.opId] = cur;
-
-        const txSuffix = cur.settleTxHash
-          ? ` tx=${cur.settleTxHash.slice(0, 12)}…`
-          : "";
-        line += ` ${w.label}=${cur.status}${txSuffix}`;
-        if (cur.status !== "finalized") allFinalized = false;
-        if (cur.status === "reorged") {
+        const reconcileStatus =
+          item?.status ?? prev?.reconcileStatus ?? "pending";
+        if (reconcileStatus === "reorged") {
           throw new Error(
-            `reconcile flagged ${w.label.trim()} ${w.opId} as reorged${cur.reason ? `: ${cur.reason}` : ""}`,
+            `reconcile flagged ${w.label.trim()} ${w.opId} as reorged${item?.reason ? `: ${item.reason}` : ""}`,
           );
         }
+        const settleTxHash =
+          (item?.settleTxHash as `0x${string}` | null) ??
+          prev?.settleTxHash ??
+          null;
+        let minedOk = prev?.minedOk ?? false;
+        let chainBlockHeight =
+          item?.chainBlockHeight ?? prev?.chainBlockHeight ?? null;
+        // Verify the settle tx directly on-chain (the SDK reconcile item only
+        // tells us the gateway's finality view; the receipt tells us the tx
+        // actually landed). getTransactionReceipt throws until the tx is mined.
+        if (!minedOk && settleTxHash) {
+          try {
+            const receipt = await publicClient.getTransactionReceipt({
+              hash: settleTxHash,
+            });
+            if (receipt.status === "success") {
+              minedOk = true;
+              chainBlockHeight = receipt.blockNumber.toString();
+            }
+          } catch {
+            // Receipt not available yet — tx not mined; retry next poll.
+          }
+        }
+        finalStatus[w.opId] = {
+          reconcileStatus,
+          settleTxHash,
+          chainBlockHeight,
+          minedOk,
+          reason: item?.reason ?? prev?.reason ?? null,
+        };
+
+        // Display the TRUE state: finalized (reconcile promoted) > confirmed
+        // (settle tx mined) > the raw reconcile verdict (pending/unchanged).
+        const state = minedOk
+          ? reconcileStatus === "finalized"
+            ? "finalized"
+            : "confirmed"
+          : reconcileStatus;
+        const txSuffix = settleTxHash
+          ? ` tx=${settleTxHash.slice(0, 12)}…`
+          : "";
+        line += ` ${w.label}=${state}${txSuffix}`;
+        if (!minedOk) allOk = false;
       }
       console.log(line);
-      if (allFinalized) {
-        finalized = true;
-        console.log(`    ✓ all ${watched.length} ops finalized in ${elapsed}s`);
+      if (allOk) {
+        allSettled = true;
+        const finalizedCount = watched.filter(
+          (w) => finalStatus[w.opId]?.reconcileStatus === "finalized",
+        ).length;
+        console.log(
+          `    ✓ all ${watched.length} ops settled on-chain (settle tx mined) in ${elapsed}s` +
+            ` — ${finalizedCount}/${watched.length} also past finality tip`,
+        );
         break;
       }
       await new Promise((r) => setTimeout(r, FINALIZE_POLL_MS));
     }
-    if (!finalized) {
+    if (!allSettled) {
       const summary = watched
-        .map(
-          (w) =>
-            `${w.label.trim()}=${finalStatus[w.opId]?.status ?? "pending"}`,
-        )
+        .map((w) => {
+          const s = finalStatus[w.opId];
+          return `${w.label.trim()}=${s?.minedOk ? "confirmed" : (s?.reconcileStatus ?? "pending")}`;
+        })
         .join(", ");
       throw new Error(
-        `Timed out after ${FINALIZE_TIMEOUT_MS / 1000}s waiting for finalization. Last: ${summary}`,
+        `Timed out after ${FINALIZE_TIMEOUT_MS / 1000}s waiting for on-chain settlement (settle tx mined). Last: ${summary}`,
       );
     }
 
-    // Per-op tx hash + block height summary, now that we know everything
-    // landed on-chain finalized.
+    // Per-op settle-tx + block summary. "confirmed" = settle tx mined;
+    // "finalized" = the gateway's reconcile also promoted it past the chain's
+    // finality tip (may still be catching up on slow-finality chains).
     console.log("");
-    console.log("    Finalized on-chain:");
+    console.log(
+      "    Settled on-chain (confirmed = mined; finalized = past finality tip):",
+    );
     for (const w of watched) {
       const s = finalStatus[w.opId];
       console.log(
         `      ${w.label.trim()}:` +
+          ` ${s.reconcileStatus === "finalized" ? "finalized" : "confirmed"}` +
           ` tx=${s.settleTxHash ?? "(none)"}` +
           ` block=${s.chainBlockHeight ?? "(unknown)"}`,
       );
@@ -1485,8 +1633,8 @@ async function main(): Promise<void> {
     // registerGrantee for the builder row. We assert against the event (not a
     // single settle batch) because the builder is not reconcile-tracked and
     // its drain pass is non-deterministic (see the step-14 note). By the time
-    // the watched ops above have finalized, the builder's registerGrantee —
-    // submitted in the same drain wave — has been mined; a short poll covers
+    // the watched ops above have settled on-chain, the builder's registerGrantee
+    // — submitted in the same drain wave — has been mined; a short poll covers
     // any lag.
     step("Verifying builder registration landed on-chain (GranteeRegistered)");
     const GRANTEE_REGISTERED_EVENT = parseAbiItem(
