@@ -23,14 +23,7 @@ describe("PS Lite sync", () => {
     vi.unstubAllEnvs();
   });
 
-  // SDK BLOCKER: chain-scoped storage paths (`/v1/chains/{chainId}/blobs/...`)
-  // are not yet published. The latest vana-sdk (3.12.0) still routes the real
-  // provider through the legacy network scheme (`/v1/networks/{network}/blobs/`),
-  // so this real-provider assertion fails until the chainId storage API ships.
-  // The adapter's chainId wiring is covered by the mocked unit tests in
-  // packages/core/src/storage/adapters/vana.test.ts. Un-skip once the SDK bump
-  // lands. See PR discussion.
-  it.skip("uploads unsynced browser-local data and persists the data-point id", async () => {
+  it("uploads unsynced browser-local data and persists the data-point id", async () => {
     const storage = createMemoryPsLiteStorage();
     const envelope = createDataFileEnvelope(
       "instagram.profile",
