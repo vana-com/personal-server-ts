@@ -8,7 +8,6 @@ import { createSdkStorageAdapter } from "./sdk.js";
 // so urlForKey resolves to the same host the provider uploads to when no
 // explicit apiUrl is configured.
 const DEFAULT_VANA_STORAGE_ENDPOINT = "https://storage.vana.org";
-const BLOB_PATH_PREFIX = "/v1/blobs";
 
 export function createVanaSyncStorageAdapter(params: {
   config: ServerConfig;
@@ -23,10 +22,16 @@ export function createVanaSyncStorageAdapter(params: {
   // so urlForKey MUST lowercase too or the reconstructed download URL won't
   // match the uploaded blob's key.
   const owner = params.serverOwner.toLowerCase();
+  // Storage blob paths are scoped by the protocol chain id so data for the same
+  // owner/scope/version never collides across networks. The chain id is the
+  // gateway's — it is never inferred from the storage host (apiUrl), which
+  // selects the product host independently.
+  const chainId = params.config.gateway.chainId;
 
   return createSdkStorageAdapter(
     createVanaStorageProvider({
       endpoint: params.config.storage.config.vana?.apiUrl,
+      chainId,
       ownerAddress: owner,
       signer: {
         address: params.serverAccount.address,
@@ -36,7 +41,7 @@ export function createVanaSyncStorageAdapter(params: {
     }),
     {
       // Mirror the provider's keying: PUT/GET target
-      // `${endpoint}/v1/blobs/${owner}/${encodeURIComponent-per-segment(key)}`.
+      // `${endpoint}/v1/chains/${chainId}/blobs/${owner}/${encodeURIComponent-per-segment(key)}`.
       // The download worker hands us `{scope}/{version}` and we rebuild the
       // exact URL the provider's pathFromUrl() validator accepts.
       urlForKey: (key) => {
@@ -44,7 +49,7 @@ export function createVanaSyncStorageAdapter(params: {
           .split("/")
           .map((segment) => encodeURIComponent(segment))
           .join("/");
-        return `${endpoint}${BLOB_PATH_PREFIX}/${owner}/${subpath}`;
+        return `${endpoint}/v1/chains/${chainId}/blobs/${owner}/${subpath}`;
       },
     },
   );

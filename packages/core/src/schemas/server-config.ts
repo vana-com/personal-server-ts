@@ -13,7 +13,7 @@ export const DEFAULTS = {
     backend: "local" as const,
     config: {
       vana: {
-        apiUrl: "https://storage.vana.com",
+        apiUrl: "https://storage.vana.org",
       },
     },
   },

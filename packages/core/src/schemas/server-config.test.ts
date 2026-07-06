@@ -39,12 +39,12 @@ describe("ServerConfigSchema — sync fields", () => {
     expect(config.sync.lastProcessedTimestamp).toBe("2026-01-21T10:00:00Z");
   });
 
-  it("storage.config.vana.apiUrl defaults to https://storage.vana.com", () => {
+  it("storage.config.vana.apiUrl defaults to https://storage.vana.org", () => {
     const config = ServerConfigSchema.parse({
       storage: { config: { vana: {} } },
     });
 
-    expect(config.storage.config.vana?.apiUrl).toBe("https://storage.vana.com");
+    expect(config.storage.config.vana?.apiUrl).toBe("https://storage.vana.org");
   });
 });
 

@@ -87,8 +87,10 @@ describe("PS Lite sync", () => {
       new Response(
         JSON.stringify({
           // Blobs are version-keyed `{scope}/{version}` (version 1 here).
+          // Storage paths are scoped by the gateway chainId (default 14800), so
+          // the provider uses chain-scoped `/v1/chains/{chainId}/blobs/...`.
           key: `${owner}/instagram.profile/1`,
-          url: `https://storage.vana.com/v1/blobs/${owner}/instagram.profile/1`,
+          url: `https://storage.vana.org/v1/chains/14800/blobs/${owner}/instagram.profile/1`,
           etag: "etag-browser-1",
           size: 256,
         }),
@@ -118,7 +120,7 @@ describe("PS Lite sync", () => {
       dataPointId: "0xdp-browser-1",
     });
     expect(fetchMock).toHaveBeenCalledWith(
-      `https://storage.vana.com/v1/blobs/${owner}/instagram.profile/1`,
+      `https://storage.vana.org/v1/chains/14800/blobs/${owner}/instagram.profile/1`,
       expect.objectContaining({ method: "PUT" }),
     );
     expect(gateway.registerDataPoint).toHaveBeenCalledWith(
