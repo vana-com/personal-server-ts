@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
 // Capture the config handed to the SDK provider factory so we can assert the
-// resolved network passthrough without hitting the network. Hoisted so the
+// resolved chainId passthrough without hitting the network. Hoisted so the
 // vi.mock factory (also hoisted) can reference it. The provider stub only needs
 // the SdkStorageProvider surface the adapter delegates to.
 const { createVanaStorageProvider } = vi.hoisted(() => ({
@@ -43,59 +43,34 @@ function buildAdapter(overrides: Record<string, unknown>) {
   return adapter;
 }
 
-describe("createVanaSyncStorageAdapter — network scoping", () => {
+describe("createVanaSyncStorageAdapter — chain-scoped storage", () => {
   beforeEach(() => {
     createVanaStorageProvider.mockClear();
   });
 
-  it("maps gateway chainId 14800 to moksha URLs and network", () => {
+  it("scopes blob paths by the gateway chainId (moksha, 14800)", () => {
     const adapter = buildAdapter({ gateway: { chainId: 14800 } });
 
     expect(createVanaStorageProvider).toHaveBeenCalledWith(
-      expect.objectContaining({ network: "moksha" }),
+      expect.objectContaining({ chainId: 14800 }),
     );
     expect(adapter.urlForKey("scope.name/2026-01-01T00:00:00.000Z")).toBe(
-      `https://storage.vana.org/v1/networks/moksha/blobs/${OWNER_LOWER}/scope.name/2026-01-01T00%3A00%3A00.000Z`,
+      `https://storage.vana.org/v1/chains/14800/blobs/${OWNER_LOWER}/scope.name/2026-01-01T00%3A00%3A00.000Z`,
     );
   });
 
-  it("maps gateway chainId 1480 to mainnet URLs and network", () => {
+  it("scopes blob paths by the gateway chainId (mainnet, 1480)", () => {
     const adapter = buildAdapter({ gateway: { chainId: 1480 } });
 
     expect(createVanaStorageProvider).toHaveBeenCalledWith(
-      expect.objectContaining({ network: "mainnet" }),
+      expect.objectContaining({ chainId: 1480 }),
     );
     expect(adapter.urlForKey("scope.name/v1")).toBe(
-      `https://storage.vana.org/v1/networks/mainnet/blobs/${OWNER_LOWER}/scope.name/v1`,
+      `https://storage.vana.org/v1/chains/1480/blobs/${OWNER_LOWER}/scope.name/v1`,
     );
   });
 
-  it("lets explicit config network override the chainId mapping", () => {
-    const adapter = buildAdapter({
-      gateway: { chainId: 14800 },
-      storage: { backend: "vana", config: { vana: { network: "mainnet" } } },
-    });
-
-    expect(createVanaStorageProvider).toHaveBeenCalledWith(
-      expect.objectContaining({ network: "mainnet" }),
-    );
-    expect(adapter.urlForKey("scope/v1")).toBe(
-      `https://storage.vana.org/v1/networks/mainnet/blobs/${OWNER_LOWER}/scope/v1`,
-    );
-  });
-
-  it("preserves legacy /v1/blobs URLs and omits network for unknown chainId", () => {
-    const adapter = buildAdapter({ gateway: { chainId: 999999 } });
-
-    expect(createVanaStorageProvider).toHaveBeenCalledWith(
-      expect.objectContaining({ network: undefined }),
-    );
-    expect(adapter.urlForKey("scope/v1")).toBe(
-      `https://storage.vana.org/v1/blobs/${OWNER_LOWER}/scope/v1`,
-    );
-  });
-
-  it("keeps apiUrl (product host) independent of the resolved network", () => {
+  it("keeps apiUrl (product host) independent of the resolved chainId", () => {
     const adapter = buildAdapter({
       gateway: { chainId: 14800 },
       storage: {
@@ -104,15 +79,15 @@ describe("createVanaSyncStorageAdapter — network scoping", () => {
       },
     });
 
-    // Product host stays whatever apiUrl configured; network still scopes path.
+    // Product host stays whatever apiUrl configured; chainId still scopes path.
     expect(createVanaStorageProvider).toHaveBeenCalledWith(
       expect.objectContaining({
         endpoint: "https://storage-dev.vana.org",
-        network: "moksha",
+        chainId: 14800,
       }),
     );
     expect(adapter.urlForKey("scope/v1")).toBe(
-      `https://storage-dev.vana.org/v1/networks/moksha/blobs/${OWNER_LOWER}/scope/v1`,
+      `https://storage-dev.vana.org/v1/chains/14800/blobs/${OWNER_LOWER}/scope/v1`,
     );
   });
 });

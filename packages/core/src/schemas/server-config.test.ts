@@ -48,35 +48,6 @@ describe("ServerConfigSchema — sync fields", () => {
   });
 });
 
-describe("ServerConfigSchema — storage network", () => {
-  it.each(["mainnet", "moksha"] as const)(
-    "accepts storage.config.vana.network = %s",
-    (network) => {
-      const config = ServerConfigSchema.parse({
-        storage: { config: { vana: { network } } },
-      });
-
-      expect(config.storage.config.vana?.network).toBe(network);
-    },
-  );
-
-  it("leaves storage.config.vana.network undefined when omitted", () => {
-    const config = ServerConfigSchema.parse({
-      storage: { config: { vana: {} } },
-    });
-
-    expect(config.storage.config.vana?.network).toBeUndefined();
-  });
-
-  it("rejects an invalid storage.config.vana.network", () => {
-    expect(() =>
-      ServerConfigSchema.parse({
-        storage: { config: { vana: { network: "testnet" } } },
-      }),
-    ).toThrow();
-  });
-});
-
 describe("saveConfig", () => {
   it("writes JSON file that loadConfig reads back identically", async () => {
     await withTempDir(async (dir) => {
