@@ -48,10 +48,10 @@
     "@opendatalabs/personal-server-ts-lite": "*",
     "@opendatalabs/vana-sdk": "3.13.0",
     "better-sqlite3": "^12.11.1",
-    "hono": "^4.12.27",
+    "hono": "^4.12.28",
     "pino": "^10.3.1",
     "pino-pretty": "^13.0.0",
-    "viem": "^2.54.2"
+    "viem": "^2.54.6"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0"
