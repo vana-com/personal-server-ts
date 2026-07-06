@@ -12,6 +12,7 @@ import type {
 
 const TLS_IDENTITY_CACHE_KEY = "personal-server-lite-tls-identity-v1";
 const DEFAULT_PUBLIC_SUFFIX = "34.16.49.200.sslip.io";
+const DEFAULT_ISSUE_CERT_TIMEOUT_MS = 8_000;
 
 export interface RustlsPsLiteRelayTlsOptions {
   controlUrl: string;
@@ -19,6 +20,20 @@ export interface RustlsPsLiteRelayTlsOptions {
   certIssuerUrl?: string;
   storage?: Storage;
   logger?: (line: string) => void;
+  /**
+   * Max time to wait on the relay's /issue-cert endpoint before treating this
+   * attempt as failed and serving the self-signed fallback. A hung issuer
+   * (observed live, BUI-666: the endpoint accepts the POST and never responds
+   * while relay-side ACME is wedged) would otherwise leave the identity
+   * promise pending forever — and every incoming TLS handshake awaits that
+   * promise, so the public endpoint serves zero bytes while the control
+   * session looks healthy. Default 8s: while the issuer is wedged every
+   * stream's fresh attempt pays this timeout again (failed attempts are
+   * deliberately unmemoized), so it must undercut external probe timeouts
+   * (DCR completion probes allow ~8-10s) or probes fail before the
+   * self-signed fallback ever serves.
+   */
+  issueCertTimeoutMs?: number;
 }
 
 export interface PsLiteRelayTlsIdentity {
@@ -164,6 +179,7 @@ async function createTlsIdentity(
     hostname,
     storage: options.storage,
     logger: options.logger,
+    timeoutMs: options.issueCertTimeoutMs ?? DEFAULT_ISSUE_CERT_TIMEOUT_MS,
   });
   if (issued) {
     return issued;
@@ -242,7 +258,7 @@ function createSelfSignedIdentity(
   };
 }
 
-async function requestAcmeCertificate(input: {
+interface AcmeIssueRequest {
   issuerUrl: string;
   sessionId: string;
   csrPem: string;
@@ -251,7 +267,12 @@ async function requestAcmeCertificate(input: {
   hostname: string;
   storage?: Storage;
   logger?: (line: string) => void;
-}): Promise<PsLiteRelayTlsIdentity | undefined> {
+  timeoutMs: number;
+}
+
+async function requestAcmeCertificate(
+  input: AcmeIssueRequest,
+): Promise<PsLiteRelayTlsIdentity | undefined> {
   if (!input.issueToken) {
     input.logger?.(
       "ACME issuer token unavailable; using self-signed certificate",
@@ -260,52 +281,7 @@ async function requestAcmeCertificate(input: {
   }
 
   try {
-    const response = await fetch(input.issuerUrl, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        sessionId: input.sessionId,
-        csrPem: input.csrPem,
-        issueToken: input.issueToken,
-      }),
-    });
-
-    if (!response.ok) {
-      const detail = await response.text();
-      input.logger?.(
-        `ACME issuer unavailable (${response.status}); using self-signed certificate`,
-      );
-      input.logger?.(detail.slice(0, 240));
-      return undefined;
-    }
-
-    const payload = (await response.json()) as { certPem?: string };
-    if (!payload.certPem) {
-      input.logger?.(
-        "ACME issuer returned no certificate; using self-signed certificate",
-      );
-      return undefined;
-    }
-
-    const identity: PsLiteRelayTlsIdentity = {
-      certPem: payload.certPem,
-      keyPem: input.keyPem,
-      hostname: input.hostname,
-      source: "acme",
-      trusted: true,
-    };
-    try {
-      cacheTlsIdentity(identity, input.storage);
-    } catch (error) {
-      // A failed cache write (e.g. QuotaExceededError — PS-Lite tabs are
-      // heavy localStorage users) must not discard a successful issuance:
-      // falling into the outer catch would serve self-signed AND mint a
-      // fresh LE cert per stream, burning the duplicate-certificate limit.
-      input.logger?.(
-        `failed to persist issued certificate (${error instanceof Error ? error.message : String(error)}); continuing with the in-memory identity`,
-      );
-    }
-    return identity;
+    return await withIssueCertTimeout(issueCertificate(input), input.timeoutMs);
   } catch (error) {
     input.logger?.(error instanceof Error ? error.message : String(error));
     input.logger?.(
@@ -313,6 +289,94 @@ async function requestAcmeCertificate(input: {
     );
     return undefined;
   }
+}
+
+async function issueCertificate(
+  input: AcmeIssueRequest,
+): Promise<PsLiteRelayTlsIdentity | undefined> {
+  const response = await fetch(input.issuerUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      sessionId: input.sessionId,
+      csrPem: input.csrPem,
+      issueToken: input.issueToken,
+    }),
+    // Belt: cancels the request in flight where supported. The
+    // withIssueCertTimeout race is the load-bearing guard — a fetch whose
+    // implementation ignores `signal` must still not wedge identity
+    // resolution.
+    signal: issueCertAbortSignal(input.timeoutMs),
+  });
+
+  if (!response.ok) {
+    const detail = await response.text();
+    input.logger?.(
+      `ACME issuer unavailable (${response.status}); using self-signed certificate`,
+    );
+    input.logger?.(detail.slice(0, 240));
+    return undefined;
+  }
+
+  const payload = (await response.json()) as { certPem?: string };
+  if (!payload.certPem) {
+    input.logger?.(
+      "ACME issuer returned no certificate; using self-signed certificate",
+    );
+    return undefined;
+  }
+
+  const identity: PsLiteRelayTlsIdentity = {
+    certPem: payload.certPem,
+    keyPem: input.keyPem,
+    hostname: input.hostname,
+    source: "acme",
+    trusted: true,
+  };
+  try {
+    cacheTlsIdentity(identity, input.storage);
+  } catch (error) {
+    // A failed cache write (e.g. QuotaExceededError — PS-Lite tabs are
+    // heavy localStorage users) must not discard a successful issuance:
+    // falling into the outer catch would serve self-signed AND mint a
+    // fresh LE cert per stream, burning the duplicate-certificate limit.
+    input.logger?.(
+      `failed to persist issued certificate (${error instanceof Error ? error.message : String(error)}); continuing with the in-memory identity`,
+    );
+  }
+  return identity;
+}
+
+function issueCertAbortSignal(timeoutMs: number): AbortSignal | undefined {
+  return typeof AbortSignal !== "undefined" &&
+    typeof AbortSignal.timeout === "function"
+    ? AbortSignal.timeout(timeoutMs)
+    : undefined;
+}
+
+function withIssueCertTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(
+        new Error(
+          `certificate issuer did not respond within ${timeoutMs}ms (hung /issue-cert)`,
+        ),
+      );
+    }, timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 function resolveCertIssuerUrl(options: RustlsPsLiteRelayTlsOptions) {

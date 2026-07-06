@@ -147,6 +147,43 @@ describe("createRustlsPsLiteRelayTlsFactory identity resolution", () => {
     expect(logs.join("\n")).toContain("failed to persist issued certificate");
   });
 
+  it("falls back to self-signed when the issuer hangs, then recovers (BUI-666)", async () => {
+    // Observed live: the relay's /issue-cert accepts the POST and never
+    // responds while relay-side ACME is wedged. Without a timeout the
+    // identity promise never settles and every incoming TLS handshake
+    // awaits it forever — the public endpoint serves zero bytes while the
+    // control session looks healthy.
+    fetchMock.mockImplementation(() => new Promise(() => {}));
+    const factory = createRustlsPsLiteRelayTlsFactory({
+      controlUrl: CONTROL_URL,
+      publicSuffix: "psrelay.test",
+      storage,
+      logger: (line) => logs.push(line),
+      issueCertTimeoutMs: 40,
+    });
+
+    await factory.prepare?.({ sessionId: SESSION_ID, issueToken: "tok" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(logs.join("\n")).toContain("did not respond within 40ms");
+    expect(logs.join("\n")).toContain("self-signed");
+
+    // The timed-out attempt is not memoized: once the issuer recovers, a
+    // tokened retry mints the trusted ACME identity.
+    fetchMock.mockImplementation(
+      async () =>
+        new Response(JSON.stringify({ certPem: ISSUED_CERT_PEM }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    await factory.prepare?.({ sessionId: SESSION_ID, issueToken: "tok2" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    // Trusted identity is now memoized: no further issuance.
+    await factory.prepare?.({ sessionId: SESSION_ID });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("persists the issued ACME identity for reuse across factories", async () => {
     const factory = createFactory();
     await factory.prepare?.({ sessionId: SESSION_ID, issueToken: "tok" });
