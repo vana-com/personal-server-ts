@@ -20,7 +20,7 @@
  *      the rebased blob key lines up with what replicas derive.
  *
  * Usage:
- *   GATEWAY_URL=https://dp-rpc-dev.vana.org npx tsx scripts/e2e-stale-version-rebase.ts
+ *   GATEWAY_URL=https://dp-rpc.moksha.vana.org npx tsx scripts/e2e-stale-version-rebase.ts
  *
  * Env (read from .env.local if present): GATEWAY_URL, STORAGE_API_URL,
  * CHAIN_ID, SCOPE — same defaults as e2e-storage-sync.ts.
@@ -90,7 +90,7 @@ function loadEnvFile(path: string): void {
 // ─── Configuration ───────────────────────────────────────────────────────
 
 const GATEWAY_URL = (
-  process.env["GATEWAY_URL"] ?? "https://dp-rpc-dev.vana.org"
+  process.env["GATEWAY_URL"] ?? "https://dp-rpc.moksha.vana.org"
 ).replace(/\/$/, "");
 const STORAGE_API_URL = (
   process.env["STORAGE_API_URL"] ?? "https://storage-dev.vana.org"
