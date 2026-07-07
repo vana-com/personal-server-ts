@@ -12,7 +12,7 @@ import type {
 
 const TLS_IDENTITY_CACHE_KEY = "personal-server-lite-tls-identity-v1";
 const DEFAULT_PUBLIC_SUFFIX = "34.16.49.200.sslip.io";
-const DEFAULT_ISSUE_CERT_TIMEOUT_MS = 8_000;
+const DEFAULT_ISSUE_CERT_TIMEOUT_MS = 60_000;
 
 export interface RustlsPsLiteRelayTlsOptions {
   controlUrl: string;
@@ -27,11 +27,19 @@ export interface RustlsPsLiteRelayTlsOptions {
    * while relay-side ACME is wedged) would otherwise leave the identity
    * promise pending forever — and every incoming TLS handshake awaits that
    * promise, so the public endpoint serves zero bytes while the control
-   * session looks healthy. Default 8s: while the issuer is wedged every
-   * stream's fresh attempt pays this timeout again (failed attempts are
-   * deliberately unmemoized), so it must undercut external probe timeouts
-   * (DCR completion probes allow ~8-10s) or probes fail before the
-   * self-signed fallback ever serves.
+   * session looks healthy.
+   *
+   * Default 60s. This MUST exceed a real ACME issuance, not undercut it: a
+   * genuine DNS-01 issuance takes tens of seconds (measured ~26s live on
+   * psrelay; TXT propagation can push it toward a minute). An earlier 8s
+   * default (meant to undercut the DCR completion probe) aborted every real
+   * issuance before it finished, so the cert was NEVER minted and the endpoint
+   * stayed self-signed / unreachable — turning the rare wedged-issuer hang into
+   * a guaranteed failure. The completion probe polls (every ~2s for minutes),
+   * so the right behavior is to let issuance finish: early probes fail on the
+   * self-signed fallback, then once the cert lands the endpoint is reachable
+   * and a later probe succeeds. Only a truly wedged issuer (never responds)
+   * should hit this timeout, and 60s still bounds that.
    */
   issueCertTimeoutMs?: number;
 }
