@@ -175,24 +175,28 @@ async function createTlsIdentity(
     return cached;
   }
 
-  const keys = await generateKeyPair();
-  const keyPem = forge.pki.privateKeyToPem(keys.privateKey);
-  const csrPem = createCsrPem(hostname, keys);
-  const issued = await requestAcmeCertificate({
-    issuerUrl: resolveCertIssuerUrl(options),
+  // Fetch the relay's shared wildcard cert+key for this session (POST
+  // /session-cert). This replaces per-session ACME: the relay issues one
+  // `*.<suffix>` cert and hands it to every session, so there is no per-session
+  // DNS-01 challenge, no TXT-propagation race, and no Let's Encrypt rate-limit
+  // exposure. The wildcard SAN covers our `<sessionId>.<suffix>` hostname.
+  const wildcard = await requestSessionCertificate({
+    issuerUrl: resolveSessionCertUrl(options),
     sessionId: input.sessionId,
-    csrPem,
-    keyPem,
     issueToken: input.issueToken ?? "",
     hostname,
     storage: options.storage,
     logger: options.logger,
     timeoutMs: options.issueCertTimeoutMs ?? DEFAULT_ISSUE_CERT_TIMEOUT_MS,
   });
-  if (issued) {
-    return issued;
+  if (wildcard) {
+    return wildcard;
   }
 
+  // Unmemoized self-signed fallback (BUI-664): the relay was unreachable or the
+  // wildcard was unavailable this attempt; retry issuance on the next stream.
+  const keys = await generateKeyPair();
+  const keyPem = forge.pki.privateKeyToPem(keys.privateKey);
   return createSelfSignedIdentity(hostname, keyPem, keys);
 }
 
@@ -398,6 +402,109 @@ function resolveCertIssuerUrl(options: RustlsPsLiteRelayTlsOptions) {
   url.search = "";
   url.hash = "";
   return url.toString();
+}
+
+function resolveSessionCertUrl(options: RustlsPsLiteRelayTlsOptions) {
+  const base = options.certIssuerUrl
+    ? options.certIssuerUrl.replace(/\/+$/, "").replace(/\/issue-cert$/, "")
+    : (() => {
+        const url = new URL(options.controlUrl);
+        url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+        url.pathname = "";
+        url.search = "";
+        url.hash = "";
+        return url.toString().replace(/\/+$/, "");
+      })();
+  return `${base}/session-cert`;
+}
+
+/**
+ * Fetch the relay's shared wildcard cert+key for this browser session. Unlike
+ * the per-session ACME path, the relay already holds the cert, so this is a
+ * fast lookup with no DNS challenge. Returns undefined (self-signed fallback)
+ * on any failure, mirroring requestAcmeCertificate.
+ */
+async function requestSessionCertificate(input: {
+  issuerUrl: string;
+  sessionId: string;
+  issueToken: string;
+  hostname: string;
+  storage?: Storage;
+  logger?: (line: string) => void;
+  timeoutMs: number;
+}): Promise<PsLiteRelayTlsIdentity | undefined> {
+  if (!input.issueToken) {
+    input.logger?.(
+      "session issue token unavailable; using self-signed certificate",
+    );
+    return undefined;
+  }
+
+  try {
+    return await withIssueCertTimeout(fetchSessionCert(input), input.timeoutMs);
+  } catch (error) {
+    input.logger?.(error instanceof Error ? error.message : String(error));
+    input.logger?.(
+      "session certificate request failed; using self-signed certificate",
+    );
+    return undefined;
+  }
+}
+
+async function fetchSessionCert(input: {
+  issuerUrl: string;
+  sessionId: string;
+  issueToken: string;
+  hostname: string;
+  storage?: Storage;
+  logger?: (line: string) => void;
+  timeoutMs: number;
+}): Promise<PsLiteRelayTlsIdentity | undefined> {
+  const response = await fetch(input.issuerUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      sessionId: input.sessionId,
+      issueToken: input.issueToken,
+    }),
+    signal: issueCertAbortSignal(input.timeoutMs),
+  });
+
+  if (!response.ok) {
+    const detail = await response.text();
+    input.logger?.(
+      `session-cert unavailable (${response.status}); using self-signed certificate`,
+    );
+    input.logger?.(detail.slice(0, 240));
+    return undefined;
+  }
+
+  const payload = (await response.json()) as {
+    certPem?: string;
+    keyPem?: string;
+  };
+  if (!payload.certPem || !payload.keyPem) {
+    input.logger?.(
+      "session-cert returned no certificate; using self-signed certificate",
+    );
+    return undefined;
+  }
+
+  const identity: PsLiteRelayTlsIdentity = {
+    certPem: payload.certPem,
+    keyPem: payload.keyPem,
+    hostname: input.hostname,
+    source: "acme",
+    trusted: true,
+  };
+  try {
+    cacheTlsIdentity(identity, input.storage);
+  } catch (error) {
+    input.logger?.(
+      `failed to persist session certificate (${error instanceof Error ? error.message : String(error)}); continuing with the in-memory identity`,
+    );
+  }
+  return identity;
 }
 
 function readCachedTlsIdentity(
