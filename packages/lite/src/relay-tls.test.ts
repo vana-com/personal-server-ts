@@ -22,6 +22,11 @@ const ISSUED_CERT_PEM = (() => {
   return forge.pki.certificateToPem(cert);
 })();
 
+// The relay's /session-cert returns the shared wildcard cert AND its key.
+const ISSUED_KEY_PEM = forge.pki.privateKeyToPem(
+  forge.pki.rsa.generateKeyPair(512).privateKey,
+);
+
 function createMemoryStorage(): Storage {
   const map = new Map<string, string>();
   return {
@@ -48,7 +53,7 @@ describe("createRustlsPsLiteRelayTlsFactory identity resolution", () => {
   beforeEach(() => {
     fetchMock = vi.fn(
       async () =>
-        new Response(JSON.stringify({ certPem: ISSUED_CERT_PEM }), {
+        new Response(JSON.stringify({ certPem: ISSUED_CERT_PEM, keyPem: ISSUED_KEY_PEM }), {
           status: 200,
           headers: { "content-type": "application/json" },
         }),
@@ -144,7 +149,7 @@ describe("createRustlsPsLiteRelayTlsFactory identity resolution", () => {
     expect(logs.join("\n")).not.toContain("self-signed");
     await factory.prepare?.({ sessionId: SESSION_ID });
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(logs.join("\n")).toContain("failed to persist issued certificate");
+    expect(logs.join("\n")).toContain("failed to persist session certificate");
   });
 
   it("falls back to self-signed when the issuer hangs, then recovers (BUI-666)", async () => {
@@ -171,7 +176,7 @@ describe("createRustlsPsLiteRelayTlsFactory identity resolution", () => {
     // tokened retry mints the trusted ACME identity.
     fetchMock.mockImplementation(
       async () =>
-        new Response(JSON.stringify({ certPem: ISSUED_CERT_PEM }), {
+        new Response(JSON.stringify({ certPem: ISSUED_CERT_PEM, keyPem: ISSUED_KEY_PEM }), {
           status: 200,
           headers: { "content-type": "application/json" },
         }),
