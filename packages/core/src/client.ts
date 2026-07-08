@@ -514,9 +514,31 @@ async function readJsonBody(response: Response): Promise<unknown> {
 function toClientErrorBody(
   value: unknown,
 ): PersonalServerClientErrorBody | null {
-  return value && typeof value === "object"
-    ? (value as PersonalServerClientErrorBody)
-    : null;
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+
+  // Nested protocol shape: `{ error: { errorCode, message, details, code } }`.
+  if (record.error && typeof record.error === "object") {
+    return record as PersonalServerClientErrorBody;
+  }
+
+  // Flat contract shape: `{ error: "INVALID_BODY", message }`. The data/scope
+  // contract layer (contractError) emits `error` as a bare code string with a
+  // top-level `message` — normalize it into the nested shape so the real
+  // errorCode + message reach the consumer instead of collapsing into the
+  // opaque "Personal Server <action> failed: <status>" (see BUI-683).
+  const message =
+    typeof record.message === "string" ? record.message : undefined;
+  if (typeof record.error === "string") {
+    return { ...record, error: { errorCode: record.error, message } };
+  }
+
+  // No structured `error`, but a top-level `message` is still worth surfacing.
+  if (message !== undefined) {
+    return { ...record, error: { message } };
+  }
+
+  return record as PersonalServerClientErrorBody;
 }
 
 function assertRegistrationMatches(
