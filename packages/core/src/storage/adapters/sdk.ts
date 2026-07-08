@@ -57,14 +57,50 @@ export function createSdkStorageAdapter(
     },
 
     async exists(storageUrl) {
+      // The SDK provider interface has no HEAD/metadata call, so existence is
+      // probed with a full download (follow-up: add a HEAD to the vana
+      // provider). Only a definitive not-found may report "absent" — a
+      // transient error (network, 5xx, auth blip) must throw instead, so the
+      // caller retries next cycle rather than acting on a false "missing"
+      // (e.g. the upload worker's blob heal overwriting a blob that is
+      // actually there).
       try {
         await provider().download(storageUrl);
         return true;
-      } catch {
-        return false;
+      } catch (err) {
+        if (isDefinitiveNotFound(err)) {
+          return false;
+        }
+        throw err;
       }
     },
   };
+}
+
+// Prefer a numeric status property when the error carries one; today the
+// SDK's StorageError does NOT (the HTTP status lives only in its message —
+// "vana-storage download failed: 404 Not Found"), so fall back to that
+// stable message shape (also matches R2's "R2 download failed: 404 ...").
+// Providers with other message shapes (ipfs, pinata, dropbox) match
+// neither and so surface as errors — safe, never a false "missing". When
+// vana-sdk grows a status field on StorageError, the property check takes
+// over and the regex becomes dead fallback.
+function isDefinitiveNotFound(err: unknown): boolean {
+  const status =
+    numericProperty(err, "status") ?? numericProperty(err, "statusCode");
+  if (status !== undefined) {
+    return status === 404 || status === 410;
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  return /download failed: (404|410)\b/.test(message);
+}
+
+function numericProperty(value: unknown, key: string): number | undefined {
+  if (typeof value !== "object" || value === null || !(key in value)) {
+    return undefined;
+  }
+  const property = (value as Record<string, unknown>)[key];
+  return typeof property === "number" ? property : undefined;
 }
 
 function copyBytes(data: Uint8Array): ArrayBuffer {
