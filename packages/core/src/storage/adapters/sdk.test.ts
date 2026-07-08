@@ -53,4 +53,83 @@ describe("createSdkStorageAdapter", () => {
 
     expect(factory).toHaveBeenCalledTimes(1);
   });
+
+  describe("exists", () => {
+    function adapterWithDownload(download: ReturnType<typeof vi.fn>) {
+      return createSdkStorageAdapter({
+        upload: vi.fn(),
+        download,
+        delete: vi.fn(),
+      } as unknown as SdkStorageProvider);
+    }
+
+    it("returns true when the blob downloads", async () => {
+      const adapter = adapterWithDownload(
+        vi.fn().mockResolvedValue(new Blob()),
+      );
+      await expect(adapter.exists("https://s/x")).resolves.toBe(true);
+    });
+
+    it("returns false only for a definitive not-found", async () => {
+      const adapter = adapterWithDownload(
+        vi
+          .fn()
+          .mockRejectedValue(
+            new Error("vana-storage download failed: 404 Not Found"),
+          ),
+      );
+      await expect(adapter.exists("https://s/x")).resolves.toBe(false);
+    });
+
+    it("prefers a numeric status property over message parsing", async () => {
+      // Errors that carry a real status don't need the message-shape
+      // fallback (StorageError doesn't today, but future SDK versions or
+      // other providers may).
+      const notFound = adapterWithDownload(
+        vi
+          .fn()
+          .mockRejectedValue(
+            Object.assign(new Error("gone away"), { status: 404 }),
+          ),
+      );
+      await expect(notFound.exists("https://s/x")).resolves.toBe(false);
+
+      // A numeric status wins even when the message would match: 503 is
+      // transient, so it must rethrow.
+      const transientWithMisleadingMessage = adapterWithDownload(
+        vi.fn().mockRejectedValue(
+          Object.assign(new Error("download failed: 404 (cached page)"), {
+            status: 503,
+          }),
+        ),
+      );
+      await expect(
+        transientWithMisleadingMessage.exists("https://s/x"),
+      ).rejects.toThrow("404");
+    });
+
+    it("rethrows transient failures instead of reporting absence", async () => {
+      // A 5xx or network blip must not read as "blob missing" — the upload
+      // worker's blob heal would overwrite a blob that is actually there.
+      const adapter = adapterWithDownload(
+        vi
+          .fn()
+          .mockRejectedValue(
+            new Error("vana-storage download failed: 503 Service Unavailable"),
+          ),
+      );
+      await expect(adapter.exists("https://s/x")).rejects.toThrow("503");
+
+      const networkAdapter = adapterWithDownload(
+        vi
+          .fn()
+          .mockRejectedValue(
+            new Error("vana-storage download network error: fetch failed"),
+          ),
+      );
+      await expect(networkAdapter.exists("https://s/x")).rejects.toThrow(
+        "network error",
+      );
+    });
+  });
 });

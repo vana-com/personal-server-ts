@@ -156,14 +156,32 @@ export async function uploadOne(
       if (record.dataHash.toLowerCase() === dataHash.toLowerCase()) {
         // Identical content is already registered (this entry, or a replica's
         // copy of it) — adopt the registered data point rather than minting a
-        // new version of the same bytes. The registrant already uploaded the
-        // blob under the registered version key.
+        // new version of the same bytes.
         dataPointId = record.id;
         // Align the local row with the adopted registry version — downstream
         // consumers sign from the row's version (e.g. x402 RecordDataAccess),
         // so a stale local version would emit records the registry rejects.
         const adoptedVersion = Number(record.expectedVersion);
         if (adoptedVersion !== entry.version) {
+          // Cross-replica adopt: "the registrant already uploaded the blob
+          // under the registered version key" is an assumption, not a fact —
+          // a replica that crashed between register and upload leaves a
+          // registry row whose bytes 404 for every consumer (readers
+          // reconstruct the URL from the record's (scope, expectedVersion);
+          // records carry no URL). Verify, and heal from our identical
+          // plaintext (dataHash matched, so our ciphertext decrypts to the
+          // registered content).
+          const adoptedKey = `${entry.scope}/${adoptedVersion}`;
+          const adoptedBlobExists = await storageAdapter.exists(
+            storageAdapter.urlForKey(adoptedKey),
+          );
+          if (!adoptedBlobExists) {
+            logger.warn(
+              { scope: entry.scope, version: adoptedVersion, dataPointId },
+              "Adopted registry version has no blob in storage; re-uploading from local content",
+            );
+            url = await storageAdapter.upload(adoptedKey, encrypted);
+          }
           await storage.updateEntryVersion(entry.path, adoptedVersion);
         }
       } else {
