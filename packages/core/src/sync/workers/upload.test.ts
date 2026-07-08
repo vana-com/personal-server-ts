@@ -82,6 +82,10 @@ function makeMockDeps(): UploadWorkerDeps {
 
   const mockStorageAdapter: Partial<StorageAdapter> = {
     upload: vi.fn().mockResolvedValue(STORAGE_URL),
+    urlForKey: vi.fn(
+      (key: string) => `https://storage.vana.com/v1/blobs/${OWNER}/${key}`,
+    ),
+    exists: vi.fn().mockResolvedValue(true),
   };
 
   const mockGateway: Partial<GatewayClient> = {
@@ -373,6 +377,82 @@ describe("upload worker", () => {
         7,
       );
       expect(deps.gateway.registerDataPoint).toHaveBeenCalledTimes(1);
+    });
+
+    it("heals a missing blob when adopting a cross-replica version", async () => {
+      const deps = makeMockDeps();
+      const entry = makeEntry(); // local version 1
+      (
+        deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
+      ).mockRejectedValueOnce(STALE_409);
+      // Same content registered by another replica at version 7 — but that
+      // replica never landed the blob (crashed between register and upload,
+      // or wrote to storage this reader can't reach).
+      (deps.gateway.getDataPoint as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeRecord({ expectedVersion: "7" }),
+      );
+      (
+        deps.storageAdapter.exists as ReturnType<typeof vi.fn>
+      ).mockResolvedValue(false);
+
+      const result = await uploadOne(deps, entry);
+
+      // Probed the adopted version's blob URL, found it missing, and healed
+      // it from our identical plaintext (dataHash matched).
+      expect(deps.storageAdapter.exists).toHaveBeenCalledWith(
+        `https://storage.vana.com/v1/blobs/${OWNER}/${SCOPE}/7`,
+      );
+      expect(deps.storageAdapter.upload).toHaveBeenCalledWith(
+        `${SCOPE}/7`,
+        expect.any(Uint8Array),
+      );
+      expect(result.dataPointId).toBe(REGISTRY_ID);
+      expect(deps.storage.updateEntryVersion).toHaveBeenCalledWith(
+        entry.path,
+        7,
+      );
+    });
+
+    it("does not re-upload when the adopted cross-replica blob is present", async () => {
+      const deps = makeMockDeps();
+      const entry = makeEntry(); // local version 1
+      (
+        deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
+      ).mockRejectedValueOnce(STALE_409);
+      (deps.gateway.getDataPoint as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeRecord({ expectedVersion: "7" }),
+      );
+      // exists defaults to true in makeMockDeps.
+
+      await uploadOne(deps, entry);
+
+      expect(deps.storageAdapter.exists).toHaveBeenCalledWith(
+        `https://storage.vana.com/v1/blobs/${OWNER}/${SCOPE}/7`,
+      );
+      // Only the initial step-5 upload to {scope}/1 — no heal upload.
+      expect(deps.storageAdapter.upload).toHaveBeenCalledTimes(1);
+      expect(deps.storageAdapter.upload).toHaveBeenCalledWith(
+        `${SCOPE}/${VERSION}`,
+        expect.any(Uint8Array),
+      );
+    });
+
+    it("skips the existence probe when adopting at the local version", async () => {
+      const deps = makeMockDeps();
+      const entry = makeEntry(); // local version 1, record also version 1
+      (
+        deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
+      ).mockRejectedValueOnce(STALE_409);
+      (deps.gateway.getDataPoint as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeRecord(),
+      );
+
+      await uploadOne(deps, entry);
+
+      // Our own step-5 upload just landed the bytes at {scope}/1 — probing
+      // would be redundant.
+      expect(deps.storageAdapter.exists).not.toHaveBeenCalled();
+      expect(deps.storageAdapter.upload).toHaveBeenCalledTimes(1);
     });
 
     it("rebases onto the registry's version + 1 when content differs", async () => {
