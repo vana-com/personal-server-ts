@@ -73,7 +73,12 @@ const DETERMINISTIC_STAGES = new Set<SyncFailureStage>([
   "block_build",
 ]);
 
-const TRANSIENT_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
+// Only statuses that PROVE the blob cannot appear by retrying are
+// deterministic. Everything else — 5xx, Cloudflare 52x, 401/403 auth blips
+// (downloads are Web3Signed off the local clock), 429 — is treated as
+// transient and bounded by the retry memory's attempt cap instead of being
+// permanently quarantined on first sight.
+const DETERMINISTIC_DOWNLOAD_STATUSES = new Set([404, 410]);
 
 export function classifySyncFailure(
   input: ClassifySyncFailureInput,
@@ -146,9 +151,12 @@ function classifyDisposition(
   if (stage === "download") {
     const status =
       getNumericProperty(error, "status") ??
-      getNumericProperty(error, "statusCode");
+      getNumericProperty(error, "statusCode") ??
+      getDownloadStatusFromMessage(error);
     if (status !== undefined) {
-      return TRANSIENT_STATUS_CODES.has(status) ? "transient" : "deterministic";
+      return DETERMINISTIC_DOWNLOAD_STATUSES.has(status)
+        ? "deterministic"
+        : "transient";
     }
     return "transient";
   }
@@ -197,6 +205,17 @@ function getStringProperty(value: unknown, key: string): string {
   if (typeof value !== "object" || value === null || !(key in value)) return "";
   const property = (value as Record<string, unknown>)[key];
   return typeof property === "string" ? property : "";
+}
+
+// The SDK's StorageError carries the HTTP status only in its message —
+// "vana-storage download failed: 404 Not Found" — with no numeric property.
+// Without this fallback a 404'd blob classifies transient and is retried
+// every sync cycle forever. The anchored "download failed: " prefix mirrors
+// the provider's stable message shape and avoids misreading digits in
+// network-error causes (IPs, ports), which stay transient.
+function getDownloadStatusFromMessage(error: unknown): number | undefined {
+  const match = /download failed: ([1-5]\d{2})\b/.exec(getRawMessage(error));
+  return match ? Number(match[1]) : undefined;
 }
 
 function getNumericProperty(value: unknown, key: string): number | undefined {

@@ -4,6 +4,7 @@ import type { SyncStatus, SyncError, SyncBlockedReason } from "../types.js";
 import { uploadAll } from "../workers/upload.js";
 import { downloadAll } from "../workers/download.js";
 import { deleteScopeRemote } from "../workers/delete.js";
+import { createDownloadRetryMemory } from "../retry-memory.js";
 
 export interface SyncManagerOptions {
   /** Polling interval in milliseconds (default: 60_000 = 1 minute) */
@@ -67,6 +68,10 @@ export function createSyncManager(
   let cycleInFlight: Promise<void> | null = null;
   let rerunRequested = false;
   let needsFullReconcile = true;
+  // One retry memory per manager (= per boot session): a blob that 404s is
+  // attempted once per session, not once per cycle; transient storage errors
+  // back off exponentially instead of re-firing on every cycle.
+  const downloadRetryMemory = createDownloadRetryMemory();
 
   async function runCycle(): Promise<void> {
     // Prevent concurrent cycles
@@ -122,6 +127,7 @@ export function createSyncManager(
           const fullReconcile = needsFullReconcile;
           const downloadResults = await downloadAll(downloadDeps, {
             fullReconcile,
+            retryMemory: downloadRetryMemory,
           });
           needsFullReconcile = false;
           downloadDeps.logger.debug(
