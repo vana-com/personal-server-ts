@@ -330,4 +330,40 @@ describe("Personal Server client helpers", () => {
       details: { reason: "Missing Web3Signed prefix" },
     });
   });
+
+  it("surfaces flat contract error bodies (error as a string + top-level message)", async () => {
+    // The data/scope contract layer emits `{ error: "CODE", message }` (flat),
+    // unlike the protocol layer's `{ error: { errorCode, message } }` (nested).
+    // Both must reach the consumer — otherwise a real 400 collapses into the
+    // opaque "Personal Server data write failed: 400" (see BUI-683).
+    const body = JSON.stringify({
+      error: "INVALID_BODY",
+      message: "Request body must be valid JSON",
+    });
+
+    await expect(
+      parsePersonalServerJsonResponse(
+        new Response(body, { status: 400 }),
+        "data write",
+      ),
+    ).rejects.toMatchObject({
+      status: 400,
+      errorCode: "INVALID_BODY",
+      message: "Request body must be valid JSON",
+    });
+  });
+
+  it("falls back to a top-level message when no error field is present", async () => {
+    const body = JSON.stringify({ message: "Something specific went wrong" });
+
+    await expect(
+      parsePersonalServerJsonResponse(
+        new Response(body, { status: 400 }),
+        "data write",
+      ),
+    ).rejects.toMatchObject({
+      status: 400,
+      message: "Something specific went wrong",
+    });
+  });
 });
