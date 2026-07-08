@@ -514,5 +514,47 @@ describe("download worker", () => {
       await downloadAll(deps, { retryMemory: memory }); // fresh attempt 2
       expect(download).toHaveBeenCalledTimes(4);
     });
+
+    it("full reconcile refreshes exhausted transient budgets but not 404s", async () => {
+      const deps = makeMockDeps();
+      let nowMs = 0;
+      const memory = createDownloadRetryMemory({
+        now: () => nowMs,
+        backoffBaseMs: 0,
+        maxTransientAttempts: 1,
+      });
+      (
+        deps.gateway.listDataPointsByOwner as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        dataPoints: [
+          makeDataPointRecord({ id: "0xaa", expectedVersion: "1" }),
+          makeDataPointRecord({ id: "0xbb", expectedVersion: "1" }),
+        ],
+        cursor: null,
+      });
+      const download = deps.storageAdapter.download as ReturnType<typeof vi.fn>;
+      // 0xaa fails transiently, 0xbb 404s.
+      download
+        .mockRejectedValueOnce(STORAGE_503())
+        .mockRejectedValueOnce(STORAGE_404());
+
+      await downloadAll(deps, { retryMemory: memory });
+      expect(download).toHaveBeenCalledTimes(2);
+
+      // Both exhausted/dead — a plain cycle attempts neither.
+      nowMs = 1;
+      await downloadAll(deps, { retryMemory: memory });
+      expect(download).toHaveBeenCalledTimes(2);
+
+      // An explicit reconcile exists to re-fetch: the transient record gets
+      // a fresh budget; the 404 stays dead.
+      download.mockResolvedValue(new Uint8Array([0xde, 0xad]));
+      nowMs = 2;
+      await downloadAll(deps, { fullReconcile: true, retryMemory: memory });
+      expect(download).toHaveBeenCalledTimes(3);
+      expect(download).toHaveBeenLastCalledWith(
+        expect.stringContaining(`${SCOPE}/1`),
+      );
+    });
   });
 });

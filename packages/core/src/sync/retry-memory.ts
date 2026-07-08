@@ -40,6 +40,13 @@ export interface DownloadRetryMemory {
   recordFailure(key: string, retryable: boolean): void;
   /** Clear the failure history after a successful download. */
   recordSuccess(key: string): void;
+  /**
+   * The listing restarted from the beginning (repair pass / full
+   * reconcile) — give transient failures a fresh attempt budget so the
+   * reset can actually re-fetch what it re-lists. Deterministic (404)
+   * entries stay dead: re-listing doesn't make missing bytes appear.
+   */
+  onListingReset(): void;
 }
 
 /** Retry-memory key for a data-point record: id + version. */
@@ -92,6 +99,14 @@ export function createDownloadRetryMemory(
 
     recordSuccess(key) {
       entries.delete(key);
+    },
+
+    onListingReset() {
+      for (const [key, entry] of entries) {
+        if (!entry.permanent) {
+          entries.delete(key);
+        }
+      }
     },
   };
 }

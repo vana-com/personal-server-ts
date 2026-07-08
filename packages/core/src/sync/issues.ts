@@ -73,7 +73,12 @@ const DETERMINISTIC_STAGES = new Set<SyncFailureStage>([
   "block_build",
 ]);
 
-const TRANSIENT_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
+// Only statuses that PROVE the blob cannot appear by retrying are
+// deterministic. Everything else — 5xx, Cloudflare 52x, 401/403 auth blips
+// (downloads are Web3Signed off the local clock), 429 — is treated as
+// transient and bounded by the retry memory's attempt cap instead of being
+// permanently quarantined on first sight.
+const DETERMINISTIC_DOWNLOAD_STATUSES = new Set([404, 410]);
 
 export function classifySyncFailure(
   input: ClassifySyncFailureInput,
@@ -149,7 +154,9 @@ function classifyDisposition(
       getNumericProperty(error, "statusCode") ??
       getDownloadStatusFromMessage(error);
     if (status !== undefined) {
-      return TRANSIENT_STATUS_CODES.has(status) ? "transient" : "deterministic";
+      return DETERMINISTIC_DOWNLOAD_STATUSES.has(status)
+        ? "deterministic"
+        : "transient";
     }
     return "transient";
   }

@@ -94,6 +94,27 @@ describe("download retry memory", () => {
     expect(memory.decide("0xother@1")).toBe("attempt");
   });
 
+  it("gives transient failures a fresh budget on listing reset, keeps 404s dead", () => {
+    const memory = createDownloadRetryMemory({
+      now: () => 0,
+      backoffBaseMs: 0,
+      maxTransientAttempts: 2,
+    });
+
+    memory.recordFailure("transient@1", true);
+    memory.recordFailure("transient@1", true); // exhausted
+    memory.recordFailure("dead@1", false); // 404
+    expect(memory.decide("transient@1")).toBe("give-up");
+    expect(memory.decide("dead@1")).toBe("give-up");
+
+    memory.onListingReset();
+
+    // The reset exists to re-fetch: exhausted transient entries retry again…
+    expect(memory.decide("transient@1")).toBe("attempt");
+    // …but re-listing doesn't make missing bytes appear.
+    expect(memory.decide("dead@1")).toBe("give-up");
+  });
+
   it("exposes a sane default attempt cap", () => {
     // Bounded retries: 3-5 attempts, not one per sync cycle forever.
     expect(DEFAULT_MAX_TRANSIENT_ATTEMPTS).toBeGreaterThanOrEqual(3);

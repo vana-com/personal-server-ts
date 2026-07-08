@@ -335,6 +335,15 @@ export async function downloadAll(
       "Resetting this sync listing to repair stale local index entries",
     );
   }
+  if (options.fullReconcile || repairSummary.missingEnvelopeEntries > 0) {
+    // An EXPLICIT listing restart (full reconcile, or the repair path above)
+    // exists to re-fetch — give transient failures a fresh attempt budget so
+    // it can; 404s stay dead. Note `lastCursor === null` alone is NOT a
+    // reset signal: single-page listings never advance the cursor, so null
+    // is their steady state and clearing on it would erase the backoff
+    // memory every cycle.
+    options.retryMemory?.onListingReset();
+  }
 
   // 2. Poll gateway for the owner's data points.
   const { dataPoints, cursor: nextCursor } =

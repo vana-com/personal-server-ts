@@ -86,6 +86,41 @@ describe("sync issue classification", () => {
     });
   });
 
+  it("keeps auth blips and edge errors transient — only 404/410 are deterministic", () => {
+    // Downloads are Web3Signed off the local clock, so 401/403 windows are
+    // recoverable; storage sits behind Cloudflare, so 52x edge errors are
+    // too. Neither may permanently quarantine a record on first sight —
+    // the retry memory's attempt cap bounds them instead.
+    for (const line of [
+      "vana-storage download failed: 401 Unauthorized",
+      "vana-storage download failed: 403 Forbidden",
+      "vana-storage download failed: 520 Web Server Returned an Unknown Error",
+    ]) {
+      const result = classifySyncFailure({
+        ...BASE_INPUT,
+        error: Object.assign(new Error(line), { name: "StorageError" }),
+        stage: "download",
+      });
+      expect(result.issue).toMatchObject({
+        disposition: "transient",
+        retryable: true,
+      });
+    }
+
+    const gone = classifySyncFailure({
+      ...BASE_INPUT,
+      error: Object.assign(
+        new Error("vana-storage download failed: 410 Gone"),
+        { name: "StorageError" },
+      ),
+      stage: "download",
+    });
+    expect(gone.issue).toMatchObject({
+      disposition: "deterministic",
+      retryable: false,
+    });
+  });
+
   it("keeps download network errors without a status transient", () => {
     // Network errors embed the cause description, which can contain digits
     // (IPs, ports) that must not be misread as an HTTP status.
