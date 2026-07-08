@@ -77,15 +77,30 @@ export function createSdkStorageAdapter(
   };
 }
 
-// Mirrors the stable message shape of the SDK storage providers'
-// download failures ("vana-storage download failed: 404 Not Found",
-// "R2 download failed: 404 ..."): the status is only in the message, no
-// numeric property. Providers with other message shapes (ipfs, pinata,
-// dropbox) won't match and so surface as errors — safe, never a false
-// "missing".
+// Prefer a numeric status property when the error carries one; today the
+// SDK's StorageError does NOT (the HTTP status lives only in its message —
+// "vana-storage download failed: 404 Not Found"), so fall back to that
+// stable message shape (also matches R2's "R2 download failed: 404 ...").
+// Providers with other message shapes (ipfs, pinata, dropbox) match
+// neither and so surface as errors — safe, never a false "missing". When
+// vana-sdk grows a status field on StorageError, the property check takes
+// over and the regex becomes dead fallback.
 function isDefinitiveNotFound(err: unknown): boolean {
+  const status =
+    numericProperty(err, "status") ?? numericProperty(err, "statusCode");
+  if (status !== undefined) {
+    return status === 404 || status === 410;
+  }
   const message = err instanceof Error ? err.message : String(err);
   return /download failed: (404|410)\b/.test(message);
+}
+
+function numericProperty(value: unknown, key: string): number | undefined {
+  if (typeof value !== "object" || value === null || !(key in value)) {
+    return undefined;
+  }
+  const property = (value as Record<string, unknown>)[key];
+  return typeof property === "number" ? property : undefined;
 }
 
 function copyBytes(data: Uint8Array): ArrayBuffer {
