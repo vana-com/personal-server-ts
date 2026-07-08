@@ -146,7 +146,8 @@ function classifyDisposition(
   if (stage === "download") {
     const status =
       getNumericProperty(error, "status") ??
-      getNumericProperty(error, "statusCode");
+      getNumericProperty(error, "statusCode") ??
+      getDownloadStatusFromMessage(error);
     if (status !== undefined) {
       return TRANSIENT_STATUS_CODES.has(status) ? "transient" : "deterministic";
     }
@@ -197,6 +198,17 @@ function getStringProperty(value: unknown, key: string): string {
   if (typeof value !== "object" || value === null || !(key in value)) return "";
   const property = (value as Record<string, unknown>)[key];
   return typeof property === "string" ? property : "";
+}
+
+// The SDK's StorageError carries the HTTP status only in its message —
+// "vana-storage download failed: 404 Not Found" — with no numeric property.
+// Without this fallback a 404'd blob classifies transient and is retried
+// every sync cycle forever. The anchored "download failed: " prefix mirrors
+// the provider's stable message shape and avoids misreading digits in
+// network-error causes (IPs, ports), which stay transient.
+function getDownloadStatusFromMessage(error: unknown): number | undefined {
+  const match = /download failed: ([1-5]\d{2})\b/.exec(getRawMessage(error));
+  return match ? Number(match[1]) : undefined;
 }
 
 function getNumericProperty(value: unknown, key: string): number | undefined {

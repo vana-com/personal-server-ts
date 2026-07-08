@@ -43,6 +43,72 @@ describe("sync issue classification", () => {
     });
   });
 
+  it("classifies a download 404 embedded in the error message as deterministic", () => {
+    // The SDK's vana-storage provider throws StorageError with the HTTP
+    // status only in the message ("vana-storage download failed: 404 Not
+    // Found") — no numeric status property. A 404 blob can never heal by
+    // retrying, so it must classify deterministic.
+    const error = Object.assign(
+      new Error("vana-storage download failed: 404 Not Found"),
+      { name: "StorageError" },
+    );
+
+    const result = classifySyncFailure({
+      ...BASE_INPUT,
+      error,
+      stage: "download",
+    });
+
+    expect(result.issue).toMatchObject({
+      stage: "download",
+      disposition: "deterministic",
+      retryable: false,
+      message: "Download failed with a non-retryable storage response",
+    });
+  });
+
+  it("keeps a download 503 embedded in the error message transient", () => {
+    const error = Object.assign(
+      new Error("vana-storage download failed: 503 Service Unavailable"),
+      { name: "StorageError" },
+    );
+
+    const result = classifySyncFailure({
+      ...BASE_INPUT,
+      error,
+      stage: "download",
+    });
+
+    expect(result.issue).toMatchObject({
+      stage: "download",
+      disposition: "transient",
+      retryable: true,
+    });
+  });
+
+  it("keeps download network errors without a status transient", () => {
+    // Network errors embed the cause description, which can contain digits
+    // (IPs, ports) that must not be misread as an HTTP status.
+    const error = Object.assign(
+      new Error(
+        "vana-storage download network error: connect ECONNREFUSED 127.0.0.1:8080",
+      ),
+      { name: "StorageError" },
+    );
+
+    const result = classifySyncFailure({
+      ...BASE_INPUT,
+      error,
+      stage: "download",
+    });
+
+    expect(result.issue).toMatchObject({
+      stage: "download",
+      disposition: "transient",
+      retryable: true,
+    });
+  });
+
   it("classifies OpenPGP parse failures as deterministic corrupt payloads", () => {
     const result = classifySyncFailure({
       ...BASE_INPUT,

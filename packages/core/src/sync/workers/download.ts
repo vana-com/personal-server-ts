@@ -16,6 +16,7 @@ import {
   type SyncFailureStage,
   type SyncPayloadKind,
 } from "../issues.js";
+import { downloadRetryKey, type DownloadRetryMemory } from "../retry-memory.js";
 
 /**
  * Minimal diagnostics hook — keeps core free of lite-specific imports.
@@ -66,6 +67,13 @@ export interface DownloadAllOptions {
    * advanced while local IndexedDB/OPFS lost or failed to index some records.
    */
   fullReconcile?: boolean;
+  /**
+   * Cross-cycle failure memory. Records are re-listed every cycle (the cursor
+   * only advances past fully-successful pages), so without this a failing
+   * blob is re-downloaded once per cycle — a 404 forever. The sync manager
+   * owns one instance per boot session.
+   */
+  retryMemory?: DownloadRetryMemory;
 }
 
 interface SyncFailureMetadata {
@@ -148,7 +156,10 @@ export async function downloadOne(
 
   // 3. Download OpenPGP encrypted binary from storage backend. A download
   // failure throws and blocks the cursor (correct: a transient error retries
-  // next cycle rather than risk a silent gap).
+  // next cycle rather than risk a silent gap). Stamp the stage so the
+  // classifier can tell a deterministic 404 (quarantine, never retry) from a
+  // transient storage error — without it the failure infers stage "unknown"
+  // and every 404 is retried forever.
   diagnostics?.onDownloadStart(record.id);
   let encrypted: Uint8Array;
   try {
@@ -156,7 +167,10 @@ export async function downloadOne(
   } catch (err) {
     const detail = (err as Error).message;
     diagnostics?.onDownloadError(record.id, detail);
-    throw err;
+    throw withSyncFailureMetadata(err, {
+      stage: "download",
+      scope: record.scope,
+    });
   }
   diagnostics?.onDownloadEnd(record.id, record.scope);
 
@@ -331,8 +345,28 @@ export async function downloadAll(
 
   // 3. Process each data point record
   for (const dataPoint of dataPoints) {
+    const retryKey = downloadRetryKey(dataPoint);
+    const decision = options.retryMemory?.decide(retryKey) ?? "attempt";
+    if (decision === "give-up") {
+      // Non-retryable failure (e.g. blob 404) or exhausted transient
+      // retries — skip without blocking the cursor so one dead record
+      // can't wedge the rest of the listing. A new registered version
+      // (different retry key) starts fresh.
+      logger.debug(
+        { dataPointId: dataPoint.id, scope: dataPoint.scope },
+        "Skipping data point after exhausted download retries",
+      );
+      continue;
+    }
+    if (decision === "backoff") {
+      // Waiting out the backoff window. Block the cursor so the record is
+      // still listed when the window expires.
+      failed = true;
+      continue;
+    }
     try {
       const result = await downloadOne(deps, dataPoint);
+      options.retryMemory?.recordSuccess(retryKey);
       if (result) {
         results.push(result);
       }
@@ -347,6 +381,7 @@ export async function downloadAll(
         payloadKind: metadata.payloadKind,
         encryptedSizeBytes: metadata.encryptedSizeBytes,
       });
+      options.retryMemory?.recordFailure(retryKey, classified.issue.retryable);
       if (!classified.issue.retryable) {
         logger.warn(
           {
