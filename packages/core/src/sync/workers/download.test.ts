@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 import type { DownloadWorkerDeps } from "./download.js";
 import { downloadOne, downloadAll } from "./download.js";
+import { createDownloadRetryMemory } from "../retry-memory.js";
 import type {
   DataFileEnvelope,
   DataPointRecord,
@@ -348,6 +349,212 @@ describe("download worker", () => {
         "Failed to download data point",
       );
       expect(deps.cursor.write).not.toHaveBeenCalled();
+    });
+
+    it("quarantines a message-embedded 404 download failure and advances the cursor", async () => {
+      const deps = makeMockDeps();
+      (
+        deps.gateway.listDataPointsByOwner as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        dataPoints: [makeDataPointRecord()],
+        cursor: "opaque-cursor-2",
+      });
+      // The SDK's vana-storage provider carries the HTTP status only in the
+      // message — no numeric status property.
+      (
+        deps.storageAdapter.download as ReturnType<typeof vi.fn>
+      ).mockRejectedValue(
+        Object.assign(
+          new Error("vana-storage download failed: 404 Not Found"),
+          {
+            name: "StorageError",
+          },
+        ),
+      );
+
+      const results = await downloadAll(deps);
+
+      expect(results).toEqual([]);
+      // Deterministic → quarantined, not "failed": the cursor advances so one
+      // missing blob can't wedge the whole sync listing.
+      expect(deps.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ stage: "download", scope: SCOPE }),
+        "Quarantined corrupt synced data point",
+      );
+      expect(deps.cursor.write).toHaveBeenCalledWith("opaque-cursor-2");
+    });
+  });
+
+  describe("downloadAll — cross-cycle retry memory", () => {
+    const STORAGE_404 = () =>
+      Object.assign(new Error("vana-storage download failed: 404 Not Found"), {
+        name: "StorageError",
+      });
+    const STORAGE_503 = () =>
+      Object.assign(
+        new Error("vana-storage download failed: 503 Service Unavailable"),
+        { name: "StorageError" },
+      );
+
+    it("never re-attempts a 404 blob in later cycles", async () => {
+      const deps = makeMockDeps();
+      const memory = createDownloadRetryMemory({ now: () => 0 });
+      (
+        deps.gateway.listDataPointsByOwner as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        dataPoints: [makeDataPointRecord()],
+        cursor: null,
+      });
+      (
+        deps.storageAdapter.download as ReturnType<typeof vi.fn>
+      ).mockRejectedValue(STORAGE_404());
+
+      await downloadAll(deps, { retryMemory: memory });
+      expect(deps.storageAdapter.download).toHaveBeenCalledTimes(1);
+
+      // The single-page listing has no nextCursor, so the same record is
+      // re-listed every cycle — the memory must gate the re-download.
+      await downloadAll(deps, { retryMemory: memory });
+      await downloadAll(deps, { retryMemory: memory });
+      expect(deps.storageAdapter.download).toHaveBeenCalledTimes(1);
+    });
+
+    it("backs off transient failures and blocks the cursor while waiting", async () => {
+      const deps = makeMockDeps();
+      let nowMs = 0;
+      const memory = createDownloadRetryMemory({
+        now: () => nowMs,
+        backoffBaseMs: 30_000,
+      });
+      (
+        deps.gateway.listDataPointsByOwner as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        dataPoints: [makeDataPointRecord()],
+        cursor: "opaque-cursor-2",
+      });
+      (
+        deps.storageAdapter.download as ReturnType<typeof vi.fn>
+      ).mockRejectedValue(STORAGE_503());
+
+      await downloadAll(deps, { retryMemory: memory });
+      expect(deps.storageAdapter.download).toHaveBeenCalledTimes(1);
+
+      // Within the backoff window: no re-attempt, and the cursor must stay
+      // blocked so the record is still listed when the backoff expires.
+      nowMs = 1_000;
+      await downloadAll(deps, { retryMemory: memory });
+      expect(deps.storageAdapter.download).toHaveBeenCalledTimes(1);
+      expect(deps.cursor.write).not.toHaveBeenCalled();
+
+      // Past the backoff window: retried.
+      nowMs = 30_000;
+      await downloadAll(deps, { retryMemory: memory });
+      expect(deps.storageAdapter.download).toHaveBeenCalledTimes(2);
+    });
+
+    it("gives up on transient failures after the cap and unblocks the cursor", async () => {
+      const deps = makeMockDeps();
+      let nowMs = 0;
+      const memory = createDownloadRetryMemory({
+        now: () => nowMs,
+        backoffBaseMs: 0,
+        maxTransientAttempts: 2,
+      });
+      (
+        deps.gateway.listDataPointsByOwner as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        dataPoints: [makeDataPointRecord()],
+        cursor: "opaque-cursor-2",
+      });
+      (
+        deps.storageAdapter.download as ReturnType<typeof vi.fn>
+      ).mockRejectedValue(STORAGE_503());
+
+      await downloadAll(deps, { retryMemory: memory }); // attempt 1
+      nowMs = 1;
+      await downloadAll(deps, { retryMemory: memory }); // attempt 2 (cap)
+      expect(deps.storageAdapter.download).toHaveBeenCalledTimes(2);
+      expect(deps.cursor.write).not.toHaveBeenCalled();
+
+      // Cap reached → give up: no further attempts, and the cursor advances
+      // so the exhausted record can't wedge the rest of the listing.
+      nowMs = 2;
+      await downloadAll(deps, { retryMemory: memory });
+      expect(deps.storageAdapter.download).toHaveBeenCalledTimes(2);
+      expect(deps.cursor.write).toHaveBeenCalledWith("opaque-cursor-2");
+    });
+
+    it("clears the failure history when a retry succeeds", async () => {
+      const deps = makeMockDeps();
+      let nowMs = 0;
+      const memory = createDownloadRetryMemory({
+        now: () => nowMs,
+        backoffBaseMs: 0,
+        maxTransientAttempts: 2,
+      });
+      (
+        deps.gateway.listDataPointsByOwner as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        dataPoints: [makeDataPointRecord()],
+        cursor: null,
+      });
+      const download = deps.storageAdapter.download as ReturnType<typeof vi.fn>;
+
+      download.mockRejectedValueOnce(STORAGE_503()); // cycle 1: fail (1 attempt)
+      await downloadAll(deps, { retryMemory: memory });
+      nowMs = 1;
+      await downloadAll(deps, { retryMemory: memory }); // cycle 2: succeeds
+      expect(download).toHaveBeenCalledTimes(2);
+
+      // History cleared by the success: two fresh failures fit under the cap.
+      download.mockRejectedValue(STORAGE_503());
+      nowMs = 2;
+      await downloadAll(deps, { retryMemory: memory }); // fresh attempt 1
+      nowMs = 3;
+      await downloadAll(deps, { retryMemory: memory }); // fresh attempt 2
+      expect(download).toHaveBeenCalledTimes(4);
+    });
+
+    it("full reconcile refreshes exhausted transient budgets but not 404s", async () => {
+      const deps = makeMockDeps();
+      let nowMs = 0;
+      const memory = createDownloadRetryMemory({
+        now: () => nowMs,
+        backoffBaseMs: 0,
+        maxTransientAttempts: 1,
+      });
+      (
+        deps.gateway.listDataPointsByOwner as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        dataPoints: [
+          makeDataPointRecord({ id: "0xaa", expectedVersion: "1" }),
+          makeDataPointRecord({ id: "0xbb", expectedVersion: "1" }),
+        ],
+        cursor: null,
+      });
+      const download = deps.storageAdapter.download as ReturnType<typeof vi.fn>;
+      // 0xaa fails transiently, 0xbb 404s.
+      download
+        .mockRejectedValueOnce(STORAGE_503())
+        .mockRejectedValueOnce(STORAGE_404());
+
+      await downloadAll(deps, { retryMemory: memory });
+      expect(download).toHaveBeenCalledTimes(2);
+
+      // Both exhausted/dead — a plain cycle attempts neither.
+      nowMs = 1;
+      await downloadAll(deps, { retryMemory: memory });
+      expect(download).toHaveBeenCalledTimes(2);
+
+      // An explicit reconcile exists to re-fetch: the transient record gets
+      // a fresh budget; the 404 stays dead.
+      download.mockResolvedValue(new Uint8Array([0xde, 0xad]));
+      nowMs = 2;
+      await downloadAll(deps, { fullReconcile: true, retryMemory: memory });
+      expect(download).toHaveBeenCalledTimes(3);
+      expect(download).toHaveBeenLastCalledWith(
+        expect.stringContaining(`${SCOPE}/1`),
+      );
     });
   });
 });
