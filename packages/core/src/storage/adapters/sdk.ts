@@ -57,14 +57,35 @@ export function createSdkStorageAdapter(
     },
 
     async exists(storageUrl) {
+      // The SDK provider interface has no HEAD/metadata call, so existence is
+      // probed with a full download (follow-up: add a HEAD to the vana
+      // provider). Only a definitive not-found may report "absent" — a
+      // transient error (network, 5xx, auth blip) must throw instead, so the
+      // caller retries next cycle rather than acting on a false "missing"
+      // (e.g. the upload worker's blob heal overwriting a blob that is
+      // actually there).
       try {
         await provider().download(storageUrl);
         return true;
-      } catch {
-        return false;
+      } catch (err) {
+        if (isDefinitiveNotFound(err)) {
+          return false;
+        }
+        throw err;
       }
     },
   };
+}
+
+// Mirrors the stable message shape of the SDK storage providers'
+// download failures ("vana-storage download failed: 404 Not Found",
+// "R2 download failed: 404 ..."): the status is only in the message, no
+// numeric property. Providers with other message shapes (ipfs, pinata,
+// dropbox) won't match and so surface as errors — safe, never a false
+// "missing".
+function isDefinitiveNotFound(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /download failed: (404|410)\b/.test(message);
 }
 
 function copyBytes(data: Uint8Array): ArrayBuffer {

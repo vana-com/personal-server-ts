@@ -437,6 +437,30 @@ describe("upload worker", () => {
       );
     });
 
+    it("leaves the entry unsynced when the existence probe fails transiently", async () => {
+      const deps = makeMockDeps();
+      const entry = makeEntry(); // local version 1
+      (
+        deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
+      ).mockRejectedValueOnce(STALE_409);
+      (deps.gateway.getDataPoint as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeRecord({ expectedVersion: "7" }),
+      );
+      // Transient storage error — the adapter rethrows instead of answering.
+      (
+        deps.storageAdapter.exists as ReturnType<typeof vi.fn>
+      ).mockRejectedValue(
+        new Error("vana-storage download failed: 503 Service Unavailable"),
+      );
+
+      await expect(uploadOne(deps, entry)).rejects.toThrow("503");
+
+      // A failed heal must not stamp the entry synced or move its version —
+      // the next cycle retries the whole adopt from a clean slate.
+      expect(deps.storage.updateEntryVersion).not.toHaveBeenCalled();
+      expect(deps.storage.updateDataPointId).not.toHaveBeenCalled();
+    });
+
     it("skips the existence probe when adopting at the local version", async () => {
       const deps = makeMockDeps();
       const entry = makeEntry(); // local version 1, record also version 1
