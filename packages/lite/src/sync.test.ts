@@ -130,4 +130,55 @@ describe("PS Lite sync", () => {
       }),
     );
   });
+
+  it("uses the caller-provided logger for sync lifecycle logs", async () => {
+    const stateStore = createMemoryPsLiteStateStore();
+    const storage = createMemoryPsLiteStorage();
+    const identity = await loadOrCreatePsLiteServerIdentity({
+      store: stateStore,
+      ownerSignature: OWNER_SIGNATURE,
+    });
+    const owner = (await recoverServerOwner(OWNER_SIGNATURE)).toLowerCase();
+    const gateway = {
+      getServer: vi.fn().mockResolvedValue({
+        id: "server-browser-1",
+        ownerAddress: owner,
+        serverAddress: identity.account.address,
+        publicKey: identity.account.publicKey,
+        serverUrl: "https://browser.example",
+        addedAt: "2026-05-08T00:00:00.000Z",
+      }),
+      listDataPointsByOwner: vi
+        .fn()
+        .mockResolvedValue({ dataPoints: [], cursor: null }),
+    };
+    const logger = {
+      debug: vi.fn(),
+      error: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+    };
+
+    const { syncManager } = await createPsLiteSyncManager({
+      config: ServerConfigSchema.parse({ sync: { enabled: true } }),
+      stateStore,
+      storage,
+      ownerSignature: OWNER_SIGNATURE,
+      serverAccount: identity.account,
+      gateway: gateway as never,
+      logger,
+    });
+
+    await syncManager.trigger();
+    await syncManager.stop();
+
+    expect(logger.debug).toHaveBeenCalledWith(
+      { uploaded: 0 },
+      "Upload cycle complete",
+    );
+    expect(logger.debug).toHaveBeenCalledWith(
+      { downloaded: 0, fullReconcile: false },
+      "Download cycle complete",
+    );
+  });
 });
