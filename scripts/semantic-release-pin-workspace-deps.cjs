@@ -24,7 +24,11 @@ function pinWorkspaceDeps(version) {
     const pkg = JSON.parse(fs.readFileSync(filePath, "utf8"));
     let changed = false;
 
-    for (const field of ["dependencies", "devDependencies", "peerDependencies"]) {
+    for (const field of [
+      "dependencies",
+      "devDependencies",
+      "peerDependencies",
+    ]) {
       const deps = pkg[field];
       if (!deps) continue;
       for (const name of Object.keys(deps)) {
@@ -44,7 +48,9 @@ function pinWorkspaceDeps(version) {
 module.exports = {
   prepare({ nextRelease }) {
     if (!nextRelease?.version) {
-      throw new Error("semantic-release-pin-workspace-deps: missing nextRelease.version");
+      throw new Error(
+        "semantic-release-pin-workspace-deps: missing nextRelease.version",
+      );
     }
     pinWorkspaceDeps(nextRelease.version);
   },

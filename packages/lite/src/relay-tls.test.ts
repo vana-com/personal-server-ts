@@ -53,10 +53,13 @@ describe("createRustlsPsLiteRelayTlsFactory identity resolution", () => {
   beforeEach(() => {
     fetchMock = vi.fn(
       async () =>
-        new Response(JSON.stringify({ certPem: ISSUED_CERT_PEM, keyPem: ISSUED_KEY_PEM }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
+        new Response(
+          JSON.stringify({ certPem: ISSUED_CERT_PEM, keyPem: ISSUED_KEY_PEM }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
     );
     vi.stubGlobal("fetch", fetchMock);
     storage = createMemoryStorage();
@@ -76,7 +79,7 @@ describe("createRustlsPsLiteRelayTlsFactory identity resolution", () => {
     });
   }
 
-  it("does not memoize a self-signed fallback: a later tokened attempt mints ACME (BUI-664)", async () => {
+  it("does not memoize a self-signed fallback: a later tokened attempt mints a trusted cert (BUI-664)", async () => {
     const factory = createFactory();
 
     await factory.prepare?.({ sessionId: SESSION_ID });
@@ -136,7 +139,7 @@ describe("createRustlsPsLiteRelayTlsFactory identity resolution", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps the issued ACME identity when the cache write throws (quota)", async () => {
+  it("keeps the issued trusted identity when the cache write throws (quota)", async () => {
     storage.setItem = () => {
       throw new DOMException("quota exceeded", "QuotaExceededError");
     };
@@ -153,8 +156,8 @@ describe("createRustlsPsLiteRelayTlsFactory identity resolution", () => {
   });
 
   it("falls back to self-signed when the issuer hangs, then recovers (BUI-666)", async () => {
-    // Observed live: the relay's /issue-cert accepts the POST and never
-    // responds while relay-side ACME is wedged. Without a timeout the
+    // Observed live: the relay cert endpoint accepts the POST and never
+    // responds while relay-side certificate issuance is wedged. Without a timeout the
     // identity promise never settles and every incoming TLS handshake
     // awaits it forever — the public endpoint serves zero bytes while the
     // control session looks healthy.
@@ -173,13 +176,16 @@ describe("createRustlsPsLiteRelayTlsFactory identity resolution", () => {
     expect(logs.join("\n")).toContain("self-signed");
 
     // The timed-out attempt is not memoized: once the issuer recovers, a
-    // tokened retry mints the trusted ACME identity.
+    // tokened retry mints the trusted relay identity.
     fetchMock.mockImplementation(
       async () =>
-        new Response(JSON.stringify({ certPem: ISSUED_CERT_PEM, keyPem: ISSUED_KEY_PEM }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
+        new Response(
+          JSON.stringify({ certPem: ISSUED_CERT_PEM, keyPem: ISSUED_KEY_PEM }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
     );
     await factory.prepare?.({ sessionId: SESSION_ID, issueToken: "tok2" });
     expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -189,7 +195,7 @@ describe("createRustlsPsLiteRelayTlsFactory identity resolution", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("persists the issued ACME identity for reuse across factories", async () => {
+  it("persists the issued trusted identity for reuse across factories", async () => {
     const factory = createFactory();
     await factory.prepare?.({ sessionId: SESSION_ID, issueToken: "tok" });
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -199,6 +205,6 @@ describe("createRustlsPsLiteRelayTlsFactory identity resolution", () => {
     const rebooted = createFactory();
     await rebooted.prepare?.({ sessionId: SESSION_ID });
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(logs.join("\n")).not.toContain("ACME issuer unavailable");
+    expect(logs.join("\n")).not.toContain("relay certificate unavailable");
   });
 });

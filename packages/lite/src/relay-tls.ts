@@ -21,25 +21,15 @@ export interface RustlsPsLiteRelayTlsOptions {
   storage?: Storage;
   logger?: (line: string) => void;
   /**
-   * Max time to wait on the relay's /issue-cert endpoint before treating this
+   * Max time to wait on the relay's certificate endpoint before treating this
    * attempt as failed and serving the self-signed fallback. A hung issuer
-   * (observed live, BUI-666: the endpoint accepts the POST and never responds
-   * while relay-side ACME is wedged) would otherwise leave the identity
-   * promise pending forever — and every incoming TLS handshake awaits that
-   * promise, so the public endpoint serves zero bytes while the control
-   * session looks healthy.
+   * (observed live, BUI-666: the endpoint accepts the POST and never responds)
+   * would otherwise leave the identity promise pending forever — and every
+   * incoming TLS handshake awaits that promise, so the public endpoint serves
+   * zero bytes while the control session looks healthy.
    *
-   * Default 60s. This MUST exceed a real ACME issuance, not undercut it: a
-   * genuine DNS-01 issuance takes tens of seconds (measured ~26s live on
-   * psrelay; TXT propagation can push it toward a minute). An earlier 8s
-   * default (meant to undercut the DCR completion probe) aborted every real
-   * issuance before it finished, so the cert was NEVER minted and the endpoint
-   * stayed self-signed / unreachable — turning the rare wedged-issuer hang into
-   * a guaranteed failure. The completion probe polls (every ~2s for minutes),
-   * so the right behavior is to let issuance finish: early probes fail on the
-   * self-signed fallback, then once the cert lands the endpoint is reachable
-   * and a later probe succeeds. Only a truly wedged issuer (never responds)
-   * should hit this timeout, and 60s still bounds that.
+   * Default 60s. This preserves the old per-session ACME margin and is still
+   * bounded for a truly wedged relay endpoint.
    */
   issueCertTimeoutMs?: number;
 }
@@ -57,14 +47,14 @@ let rustlsInitPromise: Promise<unknown> | undefined;
 export function createRustlsPsLiteRelayTlsFactory(
   options: RustlsPsLiteRelayTlsOptions,
 ): PsLiteRelayTlsFactory {
-  // Only a TRUSTED (ACME) identity is memoized for the factory's lifetime. A
+  // Only a trusted relay identity is memoized for the factory's lifetime. A
   // self-signed fallback must NOT be: it means issuance failed on this attempt
-  // (no issueToken yet, /issue-cert error, ACME timeout), and locking it in
+  // (no issueToken yet, certificate endpoint error/timeout), and locking it in
   // would strand the tab on an untrusted cert forever — even after a reconnect
   // delivers a fresh issueToken (BUI-664). The relay factory outlives every
   // reconnect, so a first-attempt fallback used to pin the whole session to
   // self-signed. Leaving it unmemoized lets the next prepare/createStream retry
-  // issuance (or hit the persisted ACME cache once it succeeds).
+  // issuance (or hit the persisted certificate cache once it succeeds).
   let trustedIdentity: PsLiteRelayTlsIdentity | undefined;
   let inFlight: Promise<PsLiteRelayTlsIdentity> | undefined;
   let inFlightToken: string | undefined;
@@ -103,7 +93,7 @@ export function createRustlsPsLiteRelayTlsFactory(
       return trustedIdentity;
     } else {
       options.logger?.(
-        `serving self-signed cert for ${identity.hostname}; ACME issuance unavailable this attempt, will retry on the next stream/reconnect`,
+        `serving self-signed cert for ${identity.hostname}; relay certificate unavailable this attempt, will retry on the next stream/reconnect`,
       );
     }
     return identity;
@@ -215,25 +205,6 @@ function generateKeyPair(): Promise<forge.pki.rsa.KeyPair> {
   });
 }
 
-function createCsrPem(hostname: string, keys: forge.pki.rsa.KeyPair) {
-  const csr = forge.pki.createCertificationRequest();
-  csr.publicKey = keys.publicKey;
-  csr.setSubject([{ name: "commonName", value: hostname }]);
-  csr.setAttributes([
-    {
-      name: "extensionRequest",
-      extensions: [
-        {
-          name: "subjectAltName",
-          altNames: [{ type: 2, value: hostname }],
-        },
-      ],
-    },
-  ]);
-  csr.sign(keys.privateKey, forge.md.sha256.create());
-  return forge.pki.certificationRequestToPem(csr);
-}
-
 function createSelfSignedIdentity(
   hostname: string,
   keyPem: string,
@@ -270,95 +241,6 @@ function createSelfSignedIdentity(
   };
 }
 
-interface AcmeIssueRequest {
-  issuerUrl: string;
-  sessionId: string;
-  csrPem: string;
-  keyPem: string;
-  issueToken: string;
-  hostname: string;
-  storage?: Storage;
-  logger?: (line: string) => void;
-  timeoutMs: number;
-}
-
-async function requestAcmeCertificate(
-  input: AcmeIssueRequest,
-): Promise<PsLiteRelayTlsIdentity | undefined> {
-  if (!input.issueToken) {
-    input.logger?.(
-      "ACME issuer token unavailable; using self-signed certificate",
-    );
-    return undefined;
-  }
-
-  try {
-    return await withIssueCertTimeout(issueCertificate(input), input.timeoutMs);
-  } catch (error) {
-    input.logger?.(error instanceof Error ? error.message : String(error));
-    input.logger?.(
-      "ACME certificate request failed; using self-signed certificate",
-    );
-    return undefined;
-  }
-}
-
-async function issueCertificate(
-  input: AcmeIssueRequest,
-): Promise<PsLiteRelayTlsIdentity | undefined> {
-  const response = await fetch(input.issuerUrl, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      sessionId: input.sessionId,
-      csrPem: input.csrPem,
-      issueToken: input.issueToken,
-    }),
-    // Belt: cancels the request in flight where supported. The
-    // withIssueCertTimeout race is the load-bearing guard — a fetch whose
-    // implementation ignores `signal` must still not wedge identity
-    // resolution.
-    signal: issueCertAbortSignal(input.timeoutMs),
-  });
-
-  if (!response.ok) {
-    const detail = await response.text();
-    input.logger?.(
-      `ACME issuer unavailable (${response.status}); using self-signed certificate`,
-    );
-    input.logger?.(detail.slice(0, 240));
-    return undefined;
-  }
-
-  const payload = (await response.json()) as { certPem?: string };
-  if (!payload.certPem) {
-    input.logger?.(
-      "ACME issuer returned no certificate; using self-signed certificate",
-    );
-    return undefined;
-  }
-
-  const identity: PsLiteRelayTlsIdentity = {
-    certPem: payload.certPem,
-    keyPem: input.keyPem,
-    hostname: input.hostname,
-    source: "acme",
-    trusted: true,
-  };
-  try {
-    cacheTlsIdentity(identity, input.storage);
-  } catch (error) {
-    // A failed cache write (e.g. QuotaExceededError — PS-Lite tabs are
-    // heavy localStorage users) must not discard a successful issuance:
-    // falling into the outer catch would serve self-signed AND mint a
-    // fresh LE cert per stream, burning the duplicate-certificate limit.
-    input.logger?.(
-      `failed to persist issued certificate (${error instanceof Error ? error.message : String(error)}); continuing with the in-memory identity`,
-    );
-  }
-  return identity;
-}
-
 function issueCertAbortSignal(timeoutMs: number): AbortSignal | undefined {
   return typeof AbortSignal !== "undefined" &&
     typeof AbortSignal.timeout === "function"
@@ -373,9 +255,7 @@ function withIssueCertTimeout<T>(
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => {
       reject(
-        new Error(
-          `certificate issuer did not respond within ${timeoutMs}ms (hung /issue-cert)`,
-        ),
+        new Error(`certificate issuer did not respond within ${timeoutMs}ms`),
       );
     }, timeoutMs);
     promise.then(
@@ -389,19 +269,6 @@ function withIssueCertTimeout<T>(
       },
     );
   });
-}
-
-function resolveCertIssuerUrl(options: RustlsPsLiteRelayTlsOptions) {
-  if (options.certIssuerUrl) {
-    return options.certIssuerUrl.replace(/\/+$/, "");
-  }
-
-  const url = new URL(options.controlUrl);
-  url.protocol = url.protocol === "wss:" ? "https:" : "http:";
-  url.pathname = "/issue-cert";
-  url.search = "";
-  url.hash = "";
-  return url.toString();
 }
 
 function resolveSessionCertUrl(options: RustlsPsLiteRelayTlsOptions) {
@@ -422,7 +289,7 @@ function resolveSessionCertUrl(options: RustlsPsLiteRelayTlsOptions) {
  * Fetch the relay's shared wildcard cert+key for this browser session. Unlike
  * the per-session ACME path, the relay already holds the cert, so this is a
  * fast lookup with no DNS challenge. Returns undefined (self-signed fallback)
- * on any failure, mirroring requestAcmeCertificate.
+ * on any failure.
  */
 async function requestSessionCertificate(input: {
   issuerUrl: string;
