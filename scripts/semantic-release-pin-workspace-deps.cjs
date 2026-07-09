@@ -1,10 +1,11 @@
 /**
- * semantic-release prepare plugin: rewrite monorepo workspace dependencies
- * (`*` → nextRelease.version) so published packages pin same-version
- * @opendatalabs/personal-server-ts-{core,lite,server}.
+ * semantic-release prepare plugin: atomically version every workspace and
+ * rewrite internal workspace dependencies (`*` → nextRelease.version).
  *
  * Mirrors the canary pin step in .github/workflows/prerelease.yml.
- * @semantic-release/npm only bumps each package's own `version` field.
+ * This must run before every @semantic-release/npm prepare hook. npm's version
+ * command updates the root workspace lock and will otherwise try to resolve a
+ * pinned sibling version before that sibling has been versioned or published.
  */
 const fs = require("node:fs");
 const path = require("node:path");
@@ -42,7 +43,10 @@ function pinWorkspacePackageJsonFiles(version) {
     const filePath = path.resolve(process.cwd(), rel);
     const pkg = JSON.parse(fs.readFileSync(filePath, "utf8"));
 
-    if (pinInternalDepsInPackage(pkg, version)) {
+    const changed = pkg.version !== version;
+    pkg.version = version;
+
+    if (pinInternalDepsInPackage(pkg, version) || changed) {
       fs.writeFileSync(filePath, `${JSON.stringify(pkg, null, 2)}\n`);
     }
   }
@@ -61,6 +65,10 @@ function pinPackageLock(version) {
     const workspacePath = path.dirname(rel);
     const pkg = packages[workspacePath];
     if (!pkg) continue;
+    if (pkg.version !== version) {
+      pkg.version = version;
+      changed = true;
+    }
     changed = pinInternalDepsInPackage(pkg, version) || changed;
   }
 
