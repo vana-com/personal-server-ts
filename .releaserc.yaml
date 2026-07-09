@@ -6,6 +6,10 @@ plugins:
         - breaking: true
           release: minor
   - "@semantic-release/release-notes-generator"
+  # Version every workspace and pin internal dependencies before any npm
+  # plugin runs `npm version`/packs a workspace. Doing this atomically keeps
+  # npm from resolving not-yet-published sibling versions from the registry.
+  - "./scripts/semantic-release-pin-workspace-deps.cjs"
   - - "@semantic-release/npm"
     - pkgRoot: packages/core
       npmPublish: true
@@ -18,10 +22,6 @@ plugins:
   - - "@semantic-release/npm"
     - pkgRoot: packages/cli
       npmPublish: true
-  # Pin workspace "*" deps to the release version after npm has bumped each
-  # workspace version, but before publish/git. Running this before npm's prepare
-  # makes npm try to resolve future workspace versions from the registry.
-  - "./scripts/semantic-release-pin-workspace-deps.cjs"
   - - "@semantic-release/git"
     - assets:
         - package.json
