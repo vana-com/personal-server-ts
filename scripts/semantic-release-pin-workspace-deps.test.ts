@@ -8,6 +8,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { describe, expect, it } from "vitest";
 
 const require = createRequire(import.meta.url);
 const releasePlugin = require("./semantic-release-pin-workspace-deps.cjs");
