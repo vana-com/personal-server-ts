@@ -244,7 +244,7 @@ export async function startPersonalServer(
     init?: RequestInit,
   ): Promise<Response> {
     const origin = (await info()).urls.apiOrigin ?? localOrigin;
-    return runtime.fetch(toRuntimeRequest(input, origin, init));
+    return runtime.fetch(await toRuntimeRequest(input, origin, init));
   }
 
   async function postData(
@@ -577,14 +577,29 @@ function requiredApiOrigin(info: PersonalServerInfo): string {
   return info.urls.apiOrigin;
 }
 
-function toRuntimeRequest(
+async function toRuntimeRequest(
   input: string | URL | Request,
   origin: string,
   init?: RequestInit,
-): Request {
+): Promise<Request> {
   const url = `${origin}${requestPath(input)}`;
   if (input instanceof Request) {
-    const base = new Request(url, input);
+    // Rebuild onto the runtime origin with an explicitly buffered body.
+    // `new Request(url, request)` treats the request as an init bag and reads
+    // its body via the `Request.prototype.body` getter, which Firefox does
+    // not implement (no fetch upload streaming) - the body silently drops and
+    // every POST reaches the runtime empty ("Request body must be valid
+    // JSON"). Buffering via arrayBuffer() works in every engine.
+    const buffered =
+      input.method === "GET" || input.method === "HEAD"
+        ? undefined
+        : await input.clone().arrayBuffer();
+    const base = new Request(url, {
+      method: input.method,
+      headers: input.headers,
+      body: buffered && buffered.byteLength > 0 ? buffered : undefined,
+      signal: input.signal,
+    });
     return init ? new Request(base, init) : base;
   }
   return new Request(url, init);

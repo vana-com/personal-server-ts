@@ -416,6 +416,61 @@ describe("startPersonalServer lite handle", () => {
     });
   });
 
+  it("preserves the Request body when the engine lacks the Request.prototype.body getter (Firefox)", async () => {
+    // Firefox does not implement the `Request.prototype.body` getter (no
+    // fetch upload streaming), so `new Request(url, request)` - which reads
+    // the body off the init bag via that getter - silently drops the body
+    // and every data write reaches the runtime empty (BUI-683). Simulate the
+    // Firefox engine by hiding the getter for the duration of the test.
+    const bodyDescriptor = Object.getOwnPropertyDescriptor(
+      Request.prototype,
+      "body",
+    );
+    Object.defineProperty(Request.prototype, "body", {
+      configurable: true,
+      get: () => undefined,
+    });
+    try {
+      const gateway = createGateway();
+      const ps = await startPersonalServer({
+        runtime: createRuntime(gateway),
+        relay: false,
+        localOrigin: ORIGIN,
+        gateway,
+      });
+      const body = new TextEncoder().encode(
+        JSON.stringify({ username: "vana_debug" }),
+      );
+      const auth = await buildWeb3SignedHeader({
+        wallet: ownerWallet,
+        aud: ORIGIN,
+        method: "POST",
+        uri: "/v1/data/instagram.profile",
+        body,
+      });
+
+      const res = await ps.fetch(
+        new Request("https://ignored.example/v1/data/instagram.profile", {
+          method: "POST",
+          body,
+          headers: {
+            Authorization: auth,
+            "Content-Type": "application/json",
+          },
+        }),
+      );
+
+      expect(res.status).toBe(201);
+      await expect(res.json()).resolves.toMatchObject({
+        scope: "instagram.profile",
+      });
+    } finally {
+      if (bodyDescriptor) {
+        Object.defineProperty(Request.prototype, "body", bodyDescriptor);
+      }
+    }
+  });
+
   it("uses the relay public URL for info and registration", async () => {
     const gateway = createGateway();
     const ps = await startPersonalServer({
