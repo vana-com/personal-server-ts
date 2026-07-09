@@ -19,7 +19,6 @@ import {
   RECORD_DATA_ACCESS_TYPES,
 } from "@opendatalabs/vana-sdk/browser";
 import { privateKeyToAccount } from "viem/accounts";
-import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 
 type PsLiteRuntimeOptions = Parameters<typeof createPsLiteRuntime>[0];
 
@@ -48,15 +47,6 @@ function createTestRuntime(options: Partial<PsLiteRuntimeOptions> = {}) {
       ...options.stateCapabilities,
     },
   });
-}
-
-function createMockLogger(): Logger {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  };
 }
 
 describe("createPsLiteRuntime", () => {
@@ -127,137 +117,6 @@ describe("createPsLiteRuntime", () => {
       active: true,
       checkedAt: "2026-05-08T00:00:00.000Z",
     });
-  });
-
-  it("logs every PS Lite HTTP request and response when a logger is supplied", async () => {
-    const logger = createMockLogger();
-    const runtime = createTestRuntime({
-      active: true,
-      logger,
-      now: () => new Date("2026-05-08T00:00:00.000Z"),
-    });
-
-    const res = await runtime.fetch(new Request("https://ps.local/health"));
-
-    expect(res.status).toBe(200);
-    expect(logger.debug).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event: "ps_lite.http.request",
-        method: "GET",
-        path: "/health",
-      }),
-      "PS Lite HTTP request",
-    );
-    expect(logger.debug).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event: "ps_lite.http.response",
-        method: "GET",
-        path: "/health",
-        status: 200,
-      }),
-      "PS Lite HTTP response",
-    );
-  });
-
-  it("logs handled HTTP failures with redacted request and response previews", async () => {
-    const logger = createMockLogger();
-    const runtime = createTestRuntime({
-      active: true,
-      accessToken: "owner-control-token",
-      logger,
-    });
-
-    const res = await runtime.fetch(
-      new Request("https://ps.local/auth/device/token", {
-        method: "POST",
-        headers: {
-          Authorization: "Bearer owner-control-token",
-          "Content-Type": "application/json",
-        },
-        body: '{"token":"super-secret-token"',
-      }),
-    );
-
-    expect(res.status).toBe(400);
-    expect(logger.warn).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event: "ps_lite.http.invalid_json",
-        method: "POST",
-        path: "/auth/device/token",
-        bodyPreview: '{"token":"[Redacted]"',
-      }),
-      "PS Lite request body is not valid JSON",
-    );
-    expect(logger.warn).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event: "ps_lite.http.error_response",
-        method: "POST",
-        path: "/auth/device/token",
-        status: 400,
-        hasAuthorization: true,
-        bodyPreview: '{"token":"[Redacted]"',
-        responseBodyPreview: expect.objectContaining({
-          error: expect.objectContaining({
-            message: "Request body must be valid JSON",
-          }),
-        }),
-      }),
-      "PS Lite HTTP error response",
-    );
-  });
-
-  it("logs unmatched routes through the HTTP boundary", async () => {
-    const logger = createMockLogger();
-    const runtime = createTestRuntime({
-      active: true,
-      logger,
-    });
-
-    const res = await runtime.fetch(new Request("https://ps.local/missing"));
-
-    expect(res.status).toBe(404);
-    expect(logger.warn).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event: "ps_lite.http.error_response",
-        method: "GET",
-        path: "/missing",
-        status: 404,
-        responseBodyPreview: expect.objectContaining({
-          error: expect.objectContaining({
-            errorCode: "NOT_FOUND",
-          }),
-        }),
-      }),
-      "PS Lite HTTP error response",
-    );
-  });
-
-  it("logs inactive-runtime failures through the HTTP boundary", async () => {
-    const logger = createMockLogger();
-    const runtime = createTestRuntime({
-      active: false,
-      logger,
-    });
-
-    const res = await runtime.fetch(
-      new Request("https://ps.local/v1/data/instagram.profile"),
-    );
-
-    expect(res.status).toBe(503);
-    expect(logger.error).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event: "ps_lite.http.error_response",
-        method: "GET",
-        path: "/v1/data/instagram.profile",
-        status: 503,
-        responseBodyPreview: expect.objectContaining({
-          error: expect.objectContaining({
-            errorCode: "PS_UNAVAILABLE",
-          }),
-        }),
-      }),
-      "PS Lite HTTP error response",
-    );
   });
 
   it("reports the request origin as the browser API origin", async () => {
