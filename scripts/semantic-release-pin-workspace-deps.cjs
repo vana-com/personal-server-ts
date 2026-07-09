@@ -46,7 +46,7 @@ function pinWorkspaceDeps(version) {
 }
 
 module.exports = {
-  prepare({ nextRelease }) {
+  prepare(_pluginConfig, { nextRelease }) {
     if (!nextRelease?.version) {
       throw new Error(
         "semantic-release-pin-workspace-deps: missing nextRelease.version",
