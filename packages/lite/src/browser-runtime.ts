@@ -1,4 +1,5 @@
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
+import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 import { createServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
@@ -50,6 +51,7 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   runtimeOrigin?: string;
   configDefaults?: Partial<ServerConfig>;
   dataFileStore?: PsLiteDataFileStore;
+  logger?: Logger;
 }
 
 export interface IndexedDbPsLiteRuntime {
@@ -122,6 +124,7 @@ export async function createIndexedDbPsLiteRuntime(
         serverAccount: identity.account,
         gateway,
         diagnostics,
+        logger: options.logger,
       })
     ).syncManager;
   }

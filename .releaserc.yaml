@@ -6,11 +6,6 @@ plugins:
         - breaking: true
           release: minor
   - "@semantic-release/release-notes-generator"
-  # Pin workspace "*" deps to the release version before npm publish so the
-  # facade/server/lite tarballs depend on same-version core/lite/server (canary
-  # prerelease.yml does the same rewrite). Multi @semantic-release/npm pkgRoot
-  # entries share one nextRelease.version; order is dependency order.
-  - "./scripts/semantic-release-pin-workspace-deps.cjs"
   - - "@semantic-release/npm"
     - pkgRoot: packages/core
       npmPublish: true
@@ -23,6 +18,10 @@ plugins:
   - - "@semantic-release/npm"
     - pkgRoot: packages/cli
       npmPublish: true
+  # Pin workspace "*" deps to the release version after npm has bumped each
+  # workspace version, but before publish/git. Running this before npm's prepare
+  # makes npm try to resolve future workspace versions from the registry.
+  - "./scripts/semantic-release-pin-workspace-deps.cjs"
   - - "@semantic-release/git"
     - assets:
         - package.json
