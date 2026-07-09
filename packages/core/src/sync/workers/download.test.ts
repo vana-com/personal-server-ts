@@ -351,6 +351,75 @@ describe("download worker", () => {
       expect(deps.cursor.write).not.toHaveBeenCalled();
     });
 
+    /**
+     * BUI-700: Web/Desktop may only have DPv2 data points + chain-scoped storage
+     * blobs while the legacy gateway file registry (`/v1/files` via listFilesSince)
+     * is empty. Sync-down must use listDataPointsByOwner as the primary path and
+     * still download + index those scopes.
+     */
+    it("syncs DPv2-only records when legacy listFilesSince would return empty", async () => {
+      const deps = makeMockDeps();
+      const chainId = 1480;
+      const ownerLower = OWNER.toLowerCase();
+      const chainScopedUrl = `https://storage.vana.org/v1/chains/${chainId}/blobs/${ownerLower}/${SCOPE}/${EXPECTED_VERSION}`;
+
+      // Legacy file registry is empty (and must not be the sync source).
+      const listFilesSince = vi
+        .fn()
+        .mockResolvedValue({ files: [], cursor: null });
+      (
+        deps.gateway as GatewayClient & {
+          listFilesSince?: typeof listFilesSince;
+        }
+      ).listFilesSince = listFilesSince;
+
+      (
+        deps.gateway.listDataPointsByOwner as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        dataPoints: [makeDataPointRecord()],
+        cursor: "opaque-cursor-dpv2",
+      });
+
+      (
+        deps.storageAdapter.urlForKey as ReturnType<typeof vi.fn>
+      ).mockImplementation(
+        (key: string) =>
+          `https://storage.vana.org/v1/chains/${chainId}/blobs/${ownerLower}/${key}`,
+      );
+
+      const results = await downloadAll(deps);
+
+      // Primary path is DPv2 data points — not legacy /v1/files.
+      expect(deps.gateway.listDataPointsByOwner).toHaveBeenCalledWith(
+        OWNER,
+        null,
+      );
+      expect(listFilesSince).not.toHaveBeenCalled();
+
+      // Chain-scoped blob is reconstructed and downloaded.
+      expect(deps.storageAdapter.urlForKey).toHaveBeenCalledWith(STORAGE_KEY);
+      expect(deps.storageAdapter.download).toHaveBeenCalledWith(chainScopedUrl);
+
+      // Local index receives the scope from the downloaded envelope.
+      expect(deps.storage.insertEntry).toHaveBeenCalledWith(
+        expect.objectContaining({
+          scope: SCOPE,
+          collectedAt: COLLECTED_AT,
+          dataPointId: DATA_POINT_ID,
+          version: 1,
+        }),
+      );
+      expect(results).toEqual([
+        {
+          dataPointId: DATA_POINT_ID,
+          scope: SCOPE,
+          collectedAt: COLLECTED_AT,
+          path: RELATIVE_PATH,
+        },
+      ]);
+      expect(deps.cursor.write).toHaveBeenCalledWith("opaque-cursor-dpv2");
+    });
+
     it("quarantines a message-embedded 404 download failure and advances the cursor", async () => {
       const deps = makeMockDeps();
       (
