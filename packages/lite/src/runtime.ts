@@ -49,6 +49,7 @@ import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logg
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
+import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 import {
   approveMcpOAuthAuthorization,
   approveMcpOAuthAuthorizationWithScopes,
@@ -147,6 +148,12 @@ export interface PsLiteRuntimeOptions {
    * returns a structured snapshot useful for debugging stuck approval pages.
    */
   diagnostics?: DiagnosticsRecorder;
+  /**
+   * Optional structured logger for browser/runtime diagnostics. When provided,
+   * PS Lite emits HTTP boundary logs and domain lifecycle logs through this
+   * interface so the hosting app can forward them to the browser console.
+   */
+  logger?: Logger;
 }
 
 export interface PsLiteRuntimeStateCapabilities {
@@ -306,6 +313,167 @@ function unavailableResponse(): Response {
     reason: "Browser runtime is inactive",
   });
   return protocolErrorResponse(err);
+}
+
+type PsLiteLogLevel = keyof Pick<Logger, "debug" | "info" | "warn" | "error">;
+
+const SENSITIVE_LOG_KEY =
+  /^(authorization|cookie|password|privateKey|secret|signature|token|accessToken|refreshToken|ownerSignature)$/i;
+const SENSITIVE_TEXT_VALUE =
+  /\b(Bearer\s+)[A-Za-z0-9._~+/=-]+|\b(token|access_token|refresh_token|signature|privateKey|password|secret)(["'\s:=]+)([^"',\s}]+)/gi;
+const LOG_BODY_PREVIEW_LIMIT = 2048;
+
+function callLogger(
+  logger: Logger | undefined,
+  level: PsLiteLogLevel,
+  payload: unknown,
+  message: string,
+): void {
+  try {
+    logger?.[level]?.(payload, message);
+  } catch {
+    // Diagnostics must never change runtime behavior.
+  }
+}
+
+function redactForLog(value: unknown, depth = 0): unknown {
+  if (depth > 5) return "[MaxDepth]";
+  if (typeof value === "string") return redactTextForLog(value);
+  if (Array.isArray(value)) {
+    return value.slice(0, 20).map((item) => redactForLog(item, depth + 1));
+  }
+  if (!value || typeof value !== "object") return value;
+  const output: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    output[key] = SENSITIVE_LOG_KEY.test(key)
+      ? "[Redacted]"
+      : redactForLog(child, depth + 1);
+  }
+  return output;
+}
+
+function redactTextForLog(value: string): string {
+  return value.replace(
+    SENSITIVE_TEXT_VALUE,
+    (match, bearerPrefix, key, separator) => {
+      if (bearerPrefix) return `${bearerPrefix}[Redacted]`;
+      if (key && separator) return `${key}${separator}[Redacted]`;
+      return match;
+    },
+  );
+}
+
+function errorToLogPayload(err: unknown): Record<string, unknown> {
+  if (err instanceof Error) {
+    return {
+      name: err.name,
+      message: err.message,
+      stack: err.stack,
+    };
+  }
+  return { message: String(err) };
+}
+
+function requestSummary(request: Request, url: URL): Record<string, unknown> {
+  return {
+    requestId: createLogId(),
+    method: request.method,
+    path: url.pathname,
+    queryKeys: Array.from(new Set(url.searchParams.keys())).sort(),
+    contentType: request.headers.get("content-type"),
+    contentLength: request.headers.get("content-length"),
+    hasAuthorization: request.headers.has("authorization"),
+  };
+}
+
+function responseSummary(response: Response): Record<string, unknown> {
+  return {
+    status: response.status,
+    contentType: response.headers.get("content-type"),
+    contentLength: response.headers.get("content-length"),
+  };
+}
+
+function requestCanHaveBody(request: Request): boolean {
+  return !["GET", "HEAD"].includes(request.method.toUpperCase());
+}
+
+async function readBodyPreviewForLog(
+  request: Request | null,
+): Promise<Record<string, unknown> | undefined> {
+  if (!request) return undefined;
+  try {
+    const text = await request.text();
+    const truncated = text.length > LOG_BODY_PREVIEW_LIMIT;
+    const preview = text.slice(0, LOG_BODY_PREVIEW_LIMIT);
+    return {
+      bodyBytes: text.length,
+      bodyPreview: redactTextForLog(preview),
+      bodyPreviewTruncated: truncated,
+    };
+  } catch (err) {
+    return {
+      bodyPreviewUnavailable: true,
+      bodyPreviewError: errorToLogPayload(err),
+    };
+  }
+}
+
+async function readResponsePreviewForLog(
+  response: Response,
+): Promise<Record<string, unknown> | undefined> {
+  try {
+    const text = await response.clone().text();
+    if (!text) return undefined;
+    const truncated = text.length > LOG_BODY_PREVIEW_LIMIT;
+    let preview: unknown = text.slice(0, LOG_BODY_PREVIEW_LIMIT);
+    const contentType = response.headers.get("content-type") ?? "";
+    if (contentType.includes("application/json")) {
+      try {
+        preview = redactForLog(JSON.parse(text));
+      } catch {
+        preview = redactTextForLog(String(preview));
+      }
+    } else {
+      preview = redactTextForLog(String(preview));
+    }
+    return {
+      responseBodyBytes: text.length,
+      responseBodyPreview: preview,
+      responseBodyPreviewTruncated: truncated,
+    };
+  } catch (err) {
+    return {
+      responseBodyPreviewUnavailable: true,
+      responseBodyPreviewError: errorToLogPayload(err),
+    };
+  }
+}
+
+async function parseJsonBodyForLog<T>(
+  request: Request,
+  logger: Logger | undefined,
+  context: Record<string, unknown>,
+): Promise<T> {
+  const text = await request.text();
+  try {
+    return JSON.parse(text) as T;
+  } catch (err) {
+    callLogger(
+      logger,
+      "warn",
+      {
+        event: "ps_lite.http.invalid_json",
+        ...context,
+        bodyBytes: text.length,
+        bodyPreview: redactTextForLog(text.slice(0, LOG_BODY_PREVIEW_LIMIT)),
+        bodyPreviewTruncated: text.length > LOG_BODY_PREVIEW_LIMIT,
+        parseError: errorToLogPayload(err),
+      },
+      "PS Lite request body is not valid JSON",
+    );
+    throw err;
+  }
 }
 
 function parseBearerToken(request: Request): string | null {
@@ -521,6 +689,7 @@ export function createPsLiteRuntime(
 ): PsLiteRuntime {
   let active = options.active ?? false;
   const now = options.now ?? (() => new Date());
+  const logger = options.logger;
   const auth = options.auth ?? createMissingAuthAdapter();
   const dataStorage = toDataStoragePort(options.storage);
   // Wire diagnostics by default so GET /v1/diagnostics is always available.
@@ -591,8 +760,27 @@ export function createPsLiteRuntime(
       return await handler();
     } catch (err) {
       if (err instanceof ProtocolError) {
+        callLogger(
+          logger,
+          "warn",
+          {
+            event: "ps_lite.protocol_error",
+            ...errorToLogPayload(err),
+            status: err.code,
+          },
+          "PS Lite protocol error",
+        );
         return protocolErrorResponse(err);
       }
+      callLogger(
+        logger,
+        "error",
+        {
+          event: "ps_lite.unhandled_error",
+          ...errorToLogPayload(err),
+        },
+        "PS Lite unhandled runtime error",
+      );
       return errorResponse(500, "INTERNAL_ERROR", "Internal server error");
     }
   }
@@ -608,7 +796,11 @@ export function createPsLiteRuntime(
     return options.serverOwner ?? options.identity?.address;
   }
 
-  async function handleAuthDevice(request: Request, url: URL) {
+  async function handleAuthDevice(
+    request: Request,
+    url: URL,
+    logContext: Record<string, unknown>,
+  ) {
     if (url.pathname === "/auth/device") {
       if (request.method !== "POST") {
         return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
@@ -717,10 +909,10 @@ export function createPsLiteRuntime(
       }
       let body: { token?: string; expires_at?: string | null };
       try {
-        body = (await request.json()) as {
+        body = await parseJsonBodyForLog<{
           token?: string;
           expires_at?: string | null;
-        };
+        }>(request, logger, logContext);
       } catch {
         return jsonResponse(
           { error: { code: 400, message: "Request body must be valid JSON" } },
@@ -760,8 +952,27 @@ export function createPsLiteRuntime(
       return active;
     },
     async fetch(request: Request) {
-      return withProtocolErrors(async () => {
-        const url = new URL(request.url);
+      const url = new URL(request.url);
+      const startedAt = globalThis.performance?.now?.() ?? Date.now();
+      const requestLog = requestSummary(request, url);
+      const requestBodyForErrorLog =
+        logger && requestCanHaveBody(request) ? request.clone() : null;
+      callLogger(
+        logger,
+        "debug",
+        {
+          event: "ps_lite.http.request",
+          ...requestLog,
+        },
+        "PS Lite HTTP request",
+      );
+
+      const response = await withProtocolErrors(async () => {
+        const routeLogContext = {
+          method: request.method,
+          path: url.pathname,
+          requestId: requestLog.requestId,
+        };
 
         if (url.pathname === "/health") {
           const apiOrigin = url.origin;
@@ -879,6 +1090,7 @@ export function createPsLiteRuntime(
               accessLogWriter,
               readFulfillmentReporter: options.readFulfillmentReporter,
               syncManager: options.syncManager ?? null,
+              logger,
               now,
               createLogId,
               // x402 payment enforcement for builder reads. Only engages with a
@@ -905,7 +1117,11 @@ export function createPsLiteRuntime(
         }
 
         if (url.pathname.startsWith("/auth/device")) {
-          const response = await handleAuthDevice(request, url);
+          const response = await handleAuthDevice(
+            request,
+            url,
+            routeLogContext,
+          );
           if (response) return response;
         }
 
@@ -974,7 +1190,7 @@ export function createPsLiteRuntime(
         ) {
           return handlePersonalServerSyncRequest(
             request,
-            { auth, syncManager: options.syncManager ?? null },
+            { auth, syncManager: options.syncManager ?? null, logger },
             { basePath: syncPrefix },
           );
         }
@@ -1011,12 +1227,42 @@ export function createPsLiteRuntime(
             serverOwner: options.serverOwner ?? options.identity?.address,
             serverSigner: options.serverSigner,
             activityRecorder,
+            logger,
           });
           if (mcpResponse) return mcpResponse;
         }
 
         return errorResponse(404, "NOT_FOUND", "Not found");
       });
+      const durationMs =
+        Math.round(
+          ((globalThis.performance?.now?.() ?? Date.now()) - startedAt) * 100,
+        ) / 100;
+      const responseLog = {
+        event: "ps_lite.http.response",
+        ...requestLog,
+        ...responseSummary(response),
+        durationMs,
+      };
+      if (response.status >= 400) {
+        const [requestBody, responseBody] = await Promise.all([
+          readBodyPreviewForLog(requestBodyForErrorLog),
+          readResponsePreviewForLog(response),
+        ]);
+        callLogger(
+          logger,
+          response.status >= 500 ? "error" : "warn",
+          {
+            ...responseLog,
+            event: "ps_lite.http.error_response",
+            ...(requestBody ?? {}),
+            ...(responseBody ?? {}),
+          },
+          "PS Lite HTTP error response",
+        );
+      }
+      callLogger(logger, "debug", responseLog, "PS Lite HTTP response");
+      return response;
     },
   };
 }
@@ -1048,8 +1294,13 @@ async function handleMcpRoute(input: {
   serverOwner?: `0x${string}`;
   serverSigner?: Pick<ServerSigner, "signGrantRegistration">;
   activityRecorder?: McpActivityRecorder;
+  logger?: Logger;
 }): Promise<Response | null> {
   const pathname = input.url.pathname;
+  const logContext = {
+    method: input.request.method,
+    path: input.url.pathname,
+  };
   const ownerPrefix = "/v1/mcp/connections";
   const ownerAuthorizationPrefix = "/v1/mcp/oauth/authorizations";
 
@@ -1088,7 +1339,11 @@ async function handleMcpRoute(input: {
     }
     let body: { client_name?: string; redirect_uris?: string[] } = {};
     try {
-      body = (await input.request.json()) as typeof body;
+      body = await parseJsonBodyForLog<typeof body>(
+        input.request,
+        input.logger,
+        logContext,
+      );
     } catch {
       body = {};
     }
@@ -1265,7 +1520,11 @@ async function handleMcpRoute(input: {
         scopes?: string[];
       } = {};
       try {
-        body = (await input.request.json()) as typeof body;
+        body = await parseJsonBodyForLog<typeof body>(
+          input.request,
+          input.logger,
+          logContext,
+        );
       } catch {
         return errorResponse(400, "INVALID_BODY", "Body must be JSON");
       }
@@ -1348,7 +1607,11 @@ async function handleMcpRoute(input: {
       if (input.request.method === "POST") {
         let body: { displayName?: string } = {};
         try {
-          body = (await input.request.json()) as { displayName?: string };
+          body = await parseJsonBodyForLog<{ displayName?: string }>(
+            input.request,
+            input.logger,
+            logContext,
+          );
         } catch {
           body = {};
         }
@@ -1380,9 +1643,11 @@ async function handleMcpRoute(input: {
       }
       let body: { grants?: McpConnectionGrant[] } = {};
       try {
-        body = (await input.request.json()) as {
-          grants?: McpConnectionGrant[];
-        };
+        body = await parseJsonBodyForLog<{ grants?: McpConnectionGrant[] }>(
+          input.request,
+          input.logger,
+          logContext,
+        );
       } catch {
         return errorResponse(400, "INVALID_BODY", "Body must be JSON");
       }
@@ -1486,7 +1751,16 @@ async function handleMcpRoute(input: {
         lastUsedAt: input.now().toISOString(),
       })
       .catch((err) => {
-        console.warn("[mcp] failed to update lastUsedAt", err);
+        callLogger(
+          input.logger,
+          "warn",
+          {
+            event: "ps_lite.mcp.last_used_update_failed",
+            connectionId: record.id,
+            ...errorToLogPayload(err),
+          },
+          "MCP failed to update lastUsedAt",
+        );
       });
     return response;
   }
