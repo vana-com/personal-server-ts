@@ -1,5 +1,6 @@
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
+import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 import {
   createSyncManager,
   type SyncManager,
@@ -37,14 +38,24 @@ export interface PsLiteSyncOptions {
   serverAccount: ServerAccount;
   gateway?: GatewayClient;
   diagnostics?: DiagnosticsRecorder;
+  logger?: Logger;
 }
 
-function createBrowserLogger() {
-  return {
+function createBrowserLogger(logger?: Logger): Logger {
+  const fallback: Logger = {
     info: console.info.bind(console),
     error: console.error.bind(console),
     warn: console.warn.bind(console),
     debug: console.debug.bind(console),
+  };
+  if (!logger) {
+    return fallback;
+  }
+  return {
+    debug: logger.debug?.bind(logger) ?? fallback.debug,
+    info: logger.info?.bind(logger) ?? fallback.info,
+    warn: logger.warn?.bind(logger) ?? fallback.warn,
+    error: logger.error?.bind(logger) ?? fallback.error,
   };
 }
 
@@ -155,7 +166,7 @@ export async function createPsLiteSyncManager(
     contracts: options.config.gateway.contracts,
   });
   const cursor = createPsLiteSyncCursor(options.stateStore);
-  const logger = createBrowserLogger();
+  const logger = createBrowserLogger(options.logger);
   const downloadDiagnostics = options.diagnostics
     ? buildDownloadDiagnosticsHook(options.diagnostics)
     : undefined;
@@ -192,7 +203,10 @@ export async function createPsLiteSyncManager(
             message: "Register this Personal Server before syncing.",
           };
         } catch (err) {
-          logger.warn("Could not verify server registration for sync", err);
+          logger.warn(
+            { error: err instanceof Error ? err.message : String(err) },
+            "Could not verify server registration for sync",
+          );
           return {
             ok: false,
             reason: "registration_check_failed",
