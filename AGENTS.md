@@ -46,6 +46,7 @@
 
 ## Release/deploy/git notes
 
-- `release.yml` is present but hard-disabled with `if: false`; canary prereleases publish from `main`, `develop`, and `feat/*` after build/test and rewrite package versions/pins for the publish job.
+- Stable release: `release.yml` runs semantic-release on push to `main` and publishes `packages/core` → `lite` → `server` → `cli` (see `.releaserc.yaml`). Workspace `*` deps are pinned to the release version before publish via `scripts/semantic-release-pin-workspace-deps.cjs` (same idea as canary).
+- Canary prereleases: `prerelease.yml` on `dev`/`develop`/`feat/*` rewrites package versions/pins then `npm publish --tag canary` for core/lite/server/cli.
 - Docker build intentionally replaces root `tsconfig.json` with references to only `core` and `server`; container defaults set `CLOUD_MODE=true`, `PERSONAL_SERVER_ROOT_PATH=/data`, `TUNNEL_ENABLED=false`, and `DEV_UI_ENABLED=false`.
 - Use conventional commits for commit messages
