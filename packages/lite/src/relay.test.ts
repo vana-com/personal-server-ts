@@ -688,6 +688,26 @@ describe("startPsLiteRelayClient resilience", () => {
     expect(sockets).toHaveLength(1);
     expect(statuses).toContain("closed");
   });
+
+  it("forwards the WebSocket close code to onStatus", () => {
+    vi.useFakeTimers();
+    const events: { status: string; code?: number }[] = [];
+    const { sockets } = startWithSockets({
+      onStatus: (status, detail) => events.push({ status, code: detail?.code }),
+    });
+    sockets[0].onopen?.();
+
+    // An abnormal drop carries its close code through to consumers...
+    sockets[0].close(1006, "abnormal");
+    expect(events).toContainEqual({ status: "disconnected", code: 1006 });
+
+    // ...and a takeover forwards 1012 on the terminal "replaced".
+    vi.advanceTimersByTime(60_000);
+    const reconnected = sockets.at(-1);
+    reconnected?.onopen?.();
+    reconnected?.close(1012, "session replaced");
+    expect(events).toContainEqual({ status: "replaced", code: 1012 });
+  });
 });
 
 describe("whenDrained + drain-gated read fulfillment", () => {
