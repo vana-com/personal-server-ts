@@ -169,10 +169,10 @@ export async function startPersonalServer(
       ...resolvedRelayOptions,
       runtime,
       origin: runtimeOrigin,
-      onStatus(nextRelayStatus) {
+      onStatus(nextRelayStatus, detail) {
         relayStatus = nextRelayStatus;
         if (nextRelayStatus === "error") setStatus("error");
-        resolvedRelayOptions.onStatus?.(nextRelayStatus);
+        resolvedRelayOptions.onStatus?.(nextRelayStatus, detail);
       },
     });
     relayClientForDrain = relayClient;
