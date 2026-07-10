@@ -24,7 +24,10 @@ export interface PsLiteRelayClientOptions {
   webSocketFactory?: PsLiteRelayWebSocketFactory;
   tls?: PsLiteRelayTlsFactory | false;
   logger?: (line: string) => void;
-  onStatus?: (status: PsLiteRelayStatus) => void;
+  onStatus?: (
+    status: PsLiteRelayStatus,
+    detail?: PsLiteRelayStatusDetail,
+  ) => void;
   /** Heartbeat ping cadence (ms). Default 20_000. */
   heartbeatIntervalMs?: number;
   /**
@@ -40,6 +43,18 @@ export interface PsLiteRelayClientOptions {
 
 export type PsLiteRelayStatus =
   "connecting" | "connected" | "disconnected" | "closed" | "replaced" | "error";
+
+/**
+ * Extra context for a relay status transition — the WebSocket close code/reason
+ * on `disconnected` / `closed` / `replaced`. Lets consumers distinguish an
+ * abnormal drop (1006) from a takeover (1012) or a clean close (1000) for
+ * reliability telemetry. Optional and additive: 1-arg `onStatus` handlers stay
+ * valid.
+ */
+export interface PsLiteRelayStatusDetail {
+  code?: number;
+  reason?: string;
+}
 
 /**
  * Close code the relay sends to the losing side when a new connection claims
@@ -543,8 +558,9 @@ export function startPsLiteRelayClient(
       streams.clear();
       pendingStreamData.clear();
       issueToken = undefined;
+      const detail = { code: event?.code, reason: event?.reason };
       if (closed) {
-        options.onStatus?.("closed");
+        options.onStatus?.("closed", detail);
         return;
       }
       if (event?.code === RELAY_CLOSE_SESSION_REPLACED) {
@@ -559,10 +575,10 @@ export function startPsLiteRelayClient(
           reconnectTimer = undefined;
         }
         log("relay session replaced by another connection — not reconnecting");
-        options.onStatus?.("replaced");
+        options.onStatus?.("replaced", detail);
         return;
       }
-      options.onStatus?.("disconnected");
+      options.onStatus?.("disconnected", detail);
       scheduleReconnect();
     };
     socket.onerror = () => {
