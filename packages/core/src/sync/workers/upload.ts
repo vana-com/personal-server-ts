@@ -201,6 +201,17 @@ export async function uploadOne(
         const target = Math.max(recordNext, errorNext);
         if (target <= 0) throw err;
         const rebased = BigInt(target);
+        // Known limitation (BUI-715 follow-up): when the registry regressed
+        // BELOW the local index, `target` can land on a version this scope
+        // already has an (older, now-defunct) synced row for. We realign only
+        // this entry, so the scope's other stale rows stay bound to gateway
+        // versions the reset dropped until their next sync cycle re-registers
+        // them. That is transient and fail-safe — readers resolve blobs from
+        // the gateway record (consistent with what we just re-registered), and
+        // x402 signed from a stale local version is rejected by the gateway
+        // rather than serving wrong bytes. A full scope reconcile (clear +
+        // renumber every row for the scope from the gateway's version) is
+        // tracked separately; head-block recovery is the fix that matters here.
         // The blob key embeds the version (replicas reconstruct URLs from the
         // registry record), so the rebased version needs its own blob; the one
         // written under the stale key above is orphaned, which storage
