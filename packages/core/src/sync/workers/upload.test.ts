@@ -529,11 +529,13 @@ describe("upload worker", () => {
       expect(deps.storage.updateDataPointId).not.toHaveBeenCalled();
     });
 
-    it("rethrows the conflict when the registry row is missing", async () => {
+    it("rethrows the conflict when the registry row is missing and the error carries no version hint", async () => {
       const deps = makeMockDeps();
+      // A 409 with no parseable next-valid version and no registry row leaves
+      // us nothing to rebase onto — surface it rather than guess.
       (
         deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
-      ).mockRejectedValue(STALE_409);
+      ).mockRejectedValue(new Error("Gateway error: 409 Conflict"));
       (deps.gateway.getDataPoint as ReturnType<typeof vi.fn>).mockResolvedValue(
         null,
       );
@@ -563,6 +565,90 @@ describe("upload worker", () => {
       );
       expect(deps.storage.updateEntryVersion).not.toHaveBeenCalled();
       expect(deps.storage.updateDataPointId).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("uploadOne — registry behind local (BUI-715)", () => {
+    // New-format gateway 409 when the local version overshoots the registry
+    // (e.g. after a moksha/DataRegistry reset dropped currentVersion below the
+    // local index, or duplicate re-snapshots pushed the local counter ahead).
+    const gap409 = (expected: number, effectiveMax: number) =>
+      new Error(
+        `Gateway error: 409 Gap in version sequence: expectedVersion ${expected} ` +
+          `would skip past the effective max (${effectiveMax}; gateway stored=${effectiveMax}, ` +
+          `on-chain currentVersion=${effectiveMax}). Versions must be POSTed in order — ` +
+          `next valid version is ${effectiveMax + 1}.`,
+      );
+    const REGISTRY_ID = computeDataPointId(OWNER, SCOPE);
+    const CHANGED_DATA_HASH = "0x" + "ff".repeat(32);
+
+    it("recovers a full registry wipe (no record) by rebasing to the error's next-valid version", async () => {
+      const deps = makeMockDeps();
+      // Local index is at version 4; the registry was wiped to 0 and has no
+      // row at all, so getDataPoint returns null. Pre-fix this rethrew and
+      // head-blocked the whole scope forever.
+      const entry = makeEntry({ version: 4 });
+      (deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>)
+        .mockRejectedValueOnce(gap409(4, 0))
+        .mockResolvedValueOnce({ dataPointId: DATA_POINT_ID });
+      (deps.gateway.getDataPoint as ReturnType<typeof vi.fn>).mockResolvedValue(
+        null,
+      );
+
+      const result = await uploadOne(deps, entry);
+
+      // Rebased down to the gateway's stated next-valid version (0 + 1 = 1).
+      expect(deps.signer.signAddData).toHaveBeenLastCalledWith(
+        expect.objectContaining({ expectedVersion: 1n }),
+      );
+      expect(deps.gateway.registerDataPoint).toHaveBeenLastCalledWith(
+        expect.objectContaining({ expectedVersion: "1" }),
+      );
+      expect(deps.storageAdapter.upload).toHaveBeenCalledWith(
+        `${SCOPE}/1`,
+        expect.any(Uint8Array),
+      );
+      expect(deps.storage.updateEntryVersion).toHaveBeenCalledWith(
+        entry.path,
+        1,
+      );
+      expect(result.dataPointId).toBe(DATA_POINT_ID);
+    });
+
+    it("rebases to the gateway's next-valid version when the registry is behind local (record present, content changed)", async () => {
+      const deps = makeMockDeps();
+      // Local version 4, gateway currentVersion 1, content differs from the
+      // registered v1. record-based next (1+1=2) and error-based next
+      // (effectiveMax 1 → 2) agree: rebase to 2.
+      const entry = makeEntry({ version: 4 });
+      (deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>)
+        .mockRejectedValueOnce(gap409(4, 1))
+        .mockResolvedValueOnce({ dataPointId: DATA_POINT_ID });
+      (deps.gateway.getDataPoint as ReturnType<typeof vi.fn>).mockResolvedValue(
+        {
+          id: REGISTRY_ID,
+          ownerAddress: OWNER,
+          scope: SCOPE,
+          dataHash: CHANGED_DATA_HASH,
+          metadataHash: "0x" + "00".repeat(32),
+          expectedVersion: "1",
+          addedAt: "2026-07-12T00:00:00Z",
+        },
+      );
+
+      await uploadOne(deps, entry);
+
+      expect(deps.gateway.registerDataPoint).toHaveBeenLastCalledWith(
+        expect.objectContaining({ expectedVersion: "2" }),
+      );
+      expect(deps.storageAdapter.upload).toHaveBeenCalledWith(
+        `${SCOPE}/2`,
+        expect.any(Uint8Array),
+      );
+      expect(deps.storage.updateEntryVersion).toHaveBeenCalledWith(
+        entry.path,
+        2,
+      );
     });
   });
 });
