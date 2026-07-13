@@ -151,9 +151,8 @@ export async function uploadOne(
       const record = await gateway.getDataPoint(
         computeDataPointId(serverOwner, entry.scope),
       );
-      if (!record) throw err;
 
-      if (record.dataHash.toLowerCase() === dataHash.toLowerCase()) {
+      if (record && record.dataHash.toLowerCase() === dataHash.toLowerCase()) {
         // Identical content is already registered (this entry, or a replica's
         // copy of it) — adopt the registered data point rather than minting a
         // new version of the same bytes.
@@ -185,11 +184,38 @@ export async function uploadOne(
           await storage.updateEntryVersion(entry.path, adoptedVersion);
         }
       } else {
-        // Rebase: re-sign one past the registry's live version. The blob key
-        // embeds the version (replicas reconstruct URLs from the registry
-        // record), so the rebased version needs its own blob; the one written
-        // under the stale key above is orphaned, which storage tolerates.
-        const rebased = BigInt(record.expectedVersion) + 1n;
+        // Rebase onto the gateway's live next-valid version. Two independent
+        // signals for what that is:
+        //   • the registry row — a replica racing AHEAD advances it past the
+        //     version this error was raised against;
+        //   • the 409 message itself — authoritative when the registry
+        //     regressed BEHIND the local index (a moksha/DataRegistry reset,
+        //     or duplicate re-snapshots pushing the local counter ahead), and
+        //     the only signal at all when the reset left no row for
+        //     getDataPoint to return (BUI-715).
+        // Take the max so the scope converges from either direction; when
+        // neither signal is available there is nothing to rebase onto, so
+        // surface the conflict rather than guess.
+        const recordNext = record ? Number(record.expectedVersion) + 1 : 0;
+        const errorNext = parseGatewayNextVersion((err as Error).message) ?? 0;
+        const target = Math.max(recordNext, errorNext);
+        if (target <= 0) throw err;
+        const rebased = BigInt(target);
+        // Known limitation (BUI-715 follow-up): when the registry regressed
+        // BELOW the local index, `target` can land on a version this scope
+        // already has an (older, now-defunct) synced row for. We realign only
+        // this entry, so the scope's other stale rows stay bound to gateway
+        // versions the reset dropped until their next sync cycle re-registers
+        // them. That is transient and fail-safe — readers resolve blobs from
+        // the gateway record (consistent with what we just re-registered), and
+        // x402 signed from a stale local version is rejected by the gateway
+        // rather than serving wrong bytes. A full scope reconcile (clear +
+        // renumber every row for the scope from the gateway's version) is
+        // tracked separately; head-block recovery is the fix that matters here.
+        // The blob key embeds the version (replicas reconstruct URLs from the
+        // registry record), so the rebased version needs its own blob; the one
+        // written under the stale key above is orphaned, which storage
+        // tolerates.
         url = await storageAdapter.upload(
           `${entry.scope}/${rebased}`,
           encrypted,
@@ -261,6 +287,25 @@ function uint8ToHex(bytes: Uint8Array): string {
 // `Gateway error: 409 <detail>`. Anything else is not a version conflict.
 function isStaleVersionConflict(err: unknown): err is Error {
   return err instanceof Error && /Gateway error: 409\b/.test(err.message);
+}
+
+// Extract the gateway's authoritative next-valid version from a 409 body so a
+// rebase can target it directly instead of only inferring from a registry row
+// (which is absent after a reset that dropped the scope's row entirely).
+// Handles the current "Gap in version sequence … next valid version is N"
+// phrasing (and its "effective max (M" form) as well as the older "Stale
+// expectedVersion … must be strictly greater than the stored value N" one.
+// Returns null when no version can be parsed.
+export function parseGatewayNextVersion(message: string): number | null {
+  const nextValid = message.match(/next valid version is (\d+)/i);
+  if (nextValid) return Number(nextValid[1]);
+  const effectiveMax = message.match(/effective max \((\d+)/i);
+  if (effectiveMax) return Number(effectiveMax[1]) + 1;
+  const storedValue = message.match(
+    /strictly greater than the stored value (\d+)/i,
+  );
+  if (storedValue) return Number(storedValue[1]) + 1;
+  return null;
 }
 
 /**
