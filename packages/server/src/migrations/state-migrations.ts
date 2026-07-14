@@ -122,12 +122,28 @@ export function runStateMigrations(
     if (needed) {
       try {
         const result = migration.run(ctx);
-        log.push({
-          id: migration.id,
-          ranAt: now(),
-          changed: result.changed,
-          detail: result.detail,
-        });
+        // everyBoot migrations re-observe the same condition on every boot
+        // until it clears; without dedupe a persistent condition fills the
+        // bounded log with identical entries and evicts real history. Keep
+        // one entry per observation streak: skip the push when the latest
+        // entry for this id already records the same outcome. One-shot
+        // migrations always log (a re-run after ledger loss is worth seeing).
+        const latestForId = [...log]
+          .reverse()
+          .find((entry) => entry.id === migration.id);
+        const duplicateObservation =
+          migration.everyBoot === true &&
+          latestForId !== undefined &&
+          latestForId.changed === result.changed &&
+          latestForId.detail === result.detail;
+        if (!duplicateObservation) {
+          log.push({
+            id: migration.id,
+            ranAt: now(),
+            changed: result.changed,
+            detail: result.detail,
+          });
+        }
         ctx.logger?.info(
           {
             migration: migration.id,

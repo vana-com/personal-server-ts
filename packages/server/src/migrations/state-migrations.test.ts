@@ -103,7 +103,49 @@ describe("runStateMigrations", () => {
     state = runStateMigrations(ctx, state, { migrations: [migration], now });
     expect(run).toHaveBeenCalledTimes(2);
     expect(state.applied).not.toContain("heal");
+    // Identical consecutive observations collapse into one log entry — see
+    // the dedupe tests below.
+    expect(state.log).toHaveLength(1);
+  });
+
+  it("dedupes consecutive identical everyBoot observations in the log", () => {
+    const migration: StateMigration = {
+      id: "detect",
+      description: "detect",
+      everyBoot: true,
+      check: () => true,
+      run: () => ({ changed: false, detail: "2 scopes stuck" }),
+    };
+    let state = runStateMigrations(ctx, undefined, {
+      migrations: [migration],
+      now,
+    });
+    state = runStateMigrations(ctx, state, { migrations: [migration], now });
+    state = runStateMigrations(ctx, state, { migrations: [migration], now });
+    expect(state.log).toHaveLength(1);
+    expect(state.log[0].detail).toBe("2 scopes stuck");
+  });
+
+  it("logs a new entry when an everyBoot observation changes", () => {
+    let detail = "2 scopes stuck";
+    const migration: StateMigration = {
+      id: "detect",
+      description: "detect",
+      everyBoot: true,
+      check: () => true,
+      run: () => ({ changed: false, detail }),
+    };
+    let state = runStateMigrations(ctx, undefined, {
+      migrations: [migration],
+      now,
+    });
+    detail = "1 scope stuck";
+    state = runStateMigrations(ctx, state, { migrations: [migration], now });
     expect(state.log).toHaveLength(2);
+    expect(state.log.map((entry) => entry.detail)).toEqual([
+      "2 scopes stuck",
+      "1 scope stuck",
+    ]);
   });
 
   it("does not mark a migration applied when it throws, so it retries next boot", () => {
@@ -141,12 +183,14 @@ describe("runStateMigrations", () => {
   });
 
   it("caps the run log at maxLog entries", () => {
+    // Distinct details so entries are real observations, not dedupe fodder.
+    let boot = 0;
     const migration: StateMigration = {
       id: "heal",
       description: "heal",
       everyBoot: true,
       check: () => true,
-      run: () => ({ changed: true }),
+      run: () => ({ changed: true, detail: `boot ${boot++}` }),
     };
     let state = { applied: [] as string[], log: [] };
     for (let i = 0; i < 10; i++) {
@@ -157,5 +201,10 @@ describe("runStateMigrations", () => {
       });
     }
     expect(state.log).toHaveLength(3);
+    expect(state.log.map((entry) => entry.detail)).toEqual([
+      "boot 7",
+      "boot 8",
+      "boot 9",
+    ]);
   });
 });
