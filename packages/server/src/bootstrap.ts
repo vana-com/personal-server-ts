@@ -125,6 +125,8 @@ export async function createServer(
     configPath,
     syncCursorPath,
     tokensPath,
+    db,
+    logger,
   });
   const indexManager = createIndexManager(db);
   const hierarchyOptions: HierarchyManagerOptions = { dataDir };
