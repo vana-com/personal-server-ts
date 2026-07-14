@@ -47,7 +47,16 @@ export interface StateMigration {
   everyBoot?: boolean;
   /** Cheap guard: is the repair needed right now? */
   check(ctx: StateMigrationContext): boolean;
-  /** Apply the repair. Should be a no-op when nothing needs fixing. */
+  /**
+   * Apply the repair. Should be a no-op when nothing needs fixing.
+   *
+   * MUST be idempotent even for one-shot (non-`everyBoot`) migrations. The
+   * `applied` ledger in state.json is a best-effort skip cache, not a
+   * guarantee: a lost or corrupt state.json legitimately resets it, so `run`
+   * may execute more than once across boots. Guard destructive work behind
+   * `check()` (which is always consulted before `run` when the id is not in the
+   * ledger) and make `run` safe to repeat.
+   */
   run(ctx: StateMigrationContext): StateMigrationResult;
 }
 
@@ -87,8 +96,13 @@ export function runStateMigrations(
   const now = options.now ?? (() => new Date().toISOString());
   const maxLog = options.maxLog ?? DEFAULT_MAX_LOG;
 
-  const applied = new Set(prior?.applied ?? []);
-  const log = [...(prior?.log ?? [])];
+  // Defensive: state.json is parsed untyped, so a corrupt or hand-edited file
+  // can carry non-array `applied`/`log` (e.g. `{}`). Coerce rather than let
+  // `new Set(...)` / spread throw and brick boot.
+  const applied = new Set(Array.isArray(prior?.applied) ? prior.applied : []);
+  const log: StateMigrationRunLogEntry[] = Array.isArray(prior?.log)
+    ? [...prior.log]
+    : [];
 
   for (const migration of migrations) {
     if (!migration.everyBoot && applied.has(migration.id)) continue;

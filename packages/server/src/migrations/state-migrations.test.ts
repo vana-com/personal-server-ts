@@ -3,6 +3,7 @@ import {
   runStateMigrations,
   type StateMigration,
   type StateMigrationContext,
+  type StateMigrationsState,
 } from "./state-migrations.js";
 
 // The framework operates on a StateMigrationContext; these tests exercise the
@@ -32,6 +33,23 @@ let clock = 0;
 const now = () => `2026-07-14T00:00:${String(clock++).padStart(2, "0")}Z`;
 
 describe("runStateMigrations", () => {
+  it("tolerates a malformed prior ledger (non-array applied/log) instead of bricking boot", () => {
+    // A corrupt / hand-edited state.json parses to valid JSON with wrong types.
+    const malformed = {
+      applied: {},
+      log: {},
+    } as unknown as StateMigrationsState;
+    const run = vi.fn();
+    const state = runStateMigrations(ctx, malformed, {
+      migrations: [oneShot("m1", run)],
+      now,
+    });
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(state.applied).toEqual(["m1"]);
+    expect(Array.isArray(state.log)).toBe(true);
+    expect(state.log).toHaveLength(1);
+  });
+
   it("runs a pending one-shot migration once and records it as applied", () => {
     const run = vi.fn();
     const state = runStateMigrations(ctx, undefined, {
