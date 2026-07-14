@@ -1,5 +1,12 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import type Database from "better-sqlite3";
+import {
+  runStateMigrations,
+  type StateMigration,
+  type StateMigrationLogger,
+  type StateMigrationsState,
+} from "./state-migrations.js";
 
 export const LOCAL_STATE_VERSION = 1;
 export const INDEX_STATE_VERSION = 1;
@@ -15,12 +22,24 @@ export interface LocalStateMigrationOptions {
   syncCursorPath: string;
   tokensPath: string;
   statePath?: string;
+  /**
+   * Open `index.db` handle. When supplied, the versioned state-migration
+   * registry runs against it and its result is persisted into `state.json`.
+   * Omitted in the file-only unit tests that predate the registry.
+   */
+  db?: Database.Database;
+  /** Overrides the registry (tests). Defaults to STATE_MIGRATIONS. */
+  migrations?: StateMigration[];
+  logger?: StateMigrationLogger;
+  /** Injectable clock for migration log timestamps (tests). */
+  now?: () => string;
 }
 
 export interface LocalStateMigrationResult {
   statePath: string;
   syncCursorCreated: boolean;
   tokensFileVersioned: boolean;
+  migrations?: StateMigrationsState;
 }
 
 interface LocalStateFile {
@@ -34,6 +53,7 @@ interface LocalStateFile {
     tokensFile: typeof TOKEN_STORE_VERSION;
     syncCursor: typeof SYNC_CURSOR_VERSION;
   };
+  migrations?: StateMigrationsState;
 }
 
 interface LegacyConfigShape {
@@ -141,6 +161,23 @@ async function migrateTokensFile(tokensPath: string): Promise<boolean> {
   return true;
 }
 
+async function readPriorState(
+  statePath: string,
+): Promise<LocalStateFile | undefined> {
+  try {
+    const raw = await readFile(statePath, "utf-8");
+    return JSON.parse(raw) as LocalStateFile;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+    // A corrupt/unreadable state.json must not brick boot — start fresh. The
+    // migration registry is re-derived from disk state, so nothing is lost
+    // beyond the applied-id/log bookkeeping.
+    return undefined;
+  }
+}
+
 export async function migrateLocalState(
   options: LocalStateMigrationOptions,
 ): Promise<LocalStateMigrationResult> {
@@ -150,11 +187,26 @@ export async function migrateLocalState(
   await mkdir(options.storageRoot, { recursive: true });
   await mkdir(options.dataDir, { recursive: true });
 
+  const priorState = await readPriorState(statePath);
+
   const syncCursorCreated = await migrateSyncCursor(
     options.configPath,
     options.syncCursorPath,
   );
   const tokensFileVersioned = await migrateTokensFile(options.tokensPath);
+
+  // Versioned state-migration registry (needs the open index.db handle).
+  const migrations = options.db
+    ? runStateMigrations(
+        {
+          db: options.db,
+          storageRoot: options.storageRoot,
+          logger: options.logger,
+        },
+        priorState?.migrations,
+        { migrations: options.migrations, now: options.now },
+      )
+    : priorState?.migrations;
 
   const state: LocalStateFile = {
     version: LOCAL_STATE_VERSION,
@@ -167,6 +219,7 @@ export async function migrateLocalState(
       tokensFile: TOKEN_STORE_VERSION,
       syncCursor: SYNC_CURSOR_VERSION,
     },
+    ...(migrations ? { migrations } : {}),
   };
   await writeJsonFile(statePath, state);
 
@@ -174,5 +227,6 @@ export async function migrateLocalState(
     statePath,
     syncCursorCreated,
     tokensFileVersioned,
+    ...(migrations ? { migrations } : {}),
   };
 }
