@@ -52,7 +52,11 @@ export interface StartPersonalServerNodeOptions
   extends
     Pick<
       CreateServerOptions,
-      "rootPath" | "dataDir" | "ownerSignature" | "readFulfillmentReporter"
+      | "rootPath"
+      | "dataDir"
+      | "ownerSignature"
+      | "readFulfillmentReporter"
+      | "mcpOAuthApprovalUrl"
     >,
     LoadConfigOptions {
   config?: ServerConfig;
@@ -90,6 +94,7 @@ export async function startPersonalServer(
     ownerSignature: options.ownerSignature,
     gatewayClient: options.gatewayClient,
     readFulfillmentReporter: options.readFulfillmentReporter,
+    mcpOAuthApprovalUrl: options.mcpOAuthApprovalUrl,
   });
   const mainServer = await listenHttpServer({
     fetch: context.app.fetch,

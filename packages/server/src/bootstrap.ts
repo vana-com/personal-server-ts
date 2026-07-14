@@ -73,6 +73,14 @@ export interface CreateServerOptions {
   ownerSignature?: `0x${string}`;
   gatewayClient?: GatewayClient;
   readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
+  /**
+   * MCP OAuth approval page URL (or a lazy getter for it). When set, the MCP
+   * OAuth router advertises discovery metadata and redirects authorization
+   * requests to this page for owner approval; when absent, MCP OAuth
+   * endpoints report MCP_OAUTH_NOT_CONFIGURED. Hosts that render their own
+   * approval surface (e.g. the desktop app) pass it here.
+   */
+  mcpOAuthApprovalUrl?: string | (() => string);
 }
 
 const DEFAULT_LOCAL_APPROVAL_PORT = 34127;
@@ -388,6 +396,7 @@ export async function createServer(
     syncManager,
     serverSigner,
     getTunnelStatus: () => tunnelManager?.getStatus() ?? null,
+    mcpOAuthApprovalUrl: options?.mcpOAuthApprovalUrl,
     onServerRegistered: (serverId) => notifyServerRegistered(serverId),
   });
 
