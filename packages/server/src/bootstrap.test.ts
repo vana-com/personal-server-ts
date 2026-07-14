@@ -57,6 +57,34 @@ describe("createServer", () => {
     await ctx.cleanup();
   });
 
+  it("threads mcpOAuthApprovalUrl into the MCP OAuth router (BUI-730)", async () => {
+    // Without the option MCP OAuth is unconfigured — discovery 404s.
+    const bare = await createServer(makeDefaultConfig(), {
+      serverDir: tempDir,
+      dataDir: join(tempDir, "data"),
+    });
+    const missing = await bare.app.request(
+      "/.well-known/oauth-protected-resource/mcp",
+    );
+    expect(missing.status).toBe(404);
+    await bare.cleanup();
+
+    // With the option (previously only reachable via the desktop's
+    // apply-patches.js build patch) discovery advertises the resource.
+    const ctx = await createServer(makeDefaultConfig(), {
+      serverDir: tempDir,
+      dataDir: join(tempDir, "data"),
+      mcpOAuthApprovalUrl: () => "https://example.test/mcp/approve",
+    });
+    const res = await ctx.app.request(
+      "/.well-known/oauth-protected-resource/mcp",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.resource_name).toBe("Vana Personal Server MCP");
+    await ctx.cleanup();
+  });
+
   it("logger is a valid pino instance", async () => {
     const config = makeDefaultConfig();
     const ctx = await createServer(config, {
