@@ -38,6 +38,26 @@ export interface UploadAllOptions {
 }
 
 /**
+ * Thrown when an unsynced entry's local payload file is gone, so the entry was
+ * dropped from the index rather than uploaded. `uploadAll` treats it as a
+ * silent self-heal, not a sync failure — it must not surface to the user or
+ * poison the settle-wait (there is nothing to retry).
+ */
+export class OrphanedEntryError extends Error {
+  constructor(path: string) {
+    super(`Orphaned index entry dropped (payload missing): ${path}`);
+    this.name = "OrphanedEntryError";
+  }
+}
+
+/** A filesystem "file not found" from readEnvelope, however the adapter spells it. */
+function isMissingPayloadError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const code = (err as { code?: unknown }).code;
+  return code === "ENOENT" || /ENOENT|no such file/i.test(err.message);
+}
+
+/**
  * Upload a single unsynced index entry:
  * 1. Read local data file from disk
  * 2. Derive scope key from master key → hex-encode as OpenPGP password
@@ -62,7 +82,28 @@ export async function uploadOne(
   } = deps;
 
   // 1. Read local data file
-  const envelope = await storage.readEnvelope(entry.scope, entry.collectedAt);
+  let envelope;
+  try {
+    envelope = await storage.readEnvelope(entry.scope, entry.collectedAt);
+  } catch (err) {
+    // The index row points at a payload file that no longer exists on disk
+    // (a manual `data/<scope>` deletion, or an interrupted cleanup). This
+    // entry can never upload — its source bytes are gone — so retrying it
+    // every cycle head-blocks the scope forever (ENOENT loop). Drop the
+    // orphaned row and skip it instead. Unsynced entries carry no fileId, so
+    // this is index-only; nothing on the gateway is affected.
+    if (isMissingPayloadError(err) && storage.dropUnsyncedEntry) {
+      const dropped = await storage.dropUnsyncedEntry(entry.path);
+      if (dropped) {
+        logger.warn(
+          { path: entry.path, scope: entry.scope },
+          "Dropped orphaned index entry: local payload file is missing",
+        );
+        throw new OrphanedEntryError(entry.path);
+      }
+    }
+    throw err;
+  }
 
   // 2. Derive scope key → hex-encode as OpenPGP password
   const scopeKey = deriveScopeKey(masterKey, entry.scope);
@@ -264,6 +305,13 @@ export async function uploadAll(
       const result = await uploadOne(deps, entry);
       results.push(result);
     } catch (err) {
+      // A dropped orphan is a self-heal, not a failure: the row is already
+      // gone, there is nothing to retry, and surfacing it would keep the
+      // scope showing a scary error (and fail settle-waits) for a file the
+      // user deleted on purpose. Already logged in uploadOne; swallow here.
+      if (err instanceof OrphanedEntryError) {
+        continue;
+      }
       const error = err as Error;
       options?.onError?.(entry, error);
       deps.logger.error(
