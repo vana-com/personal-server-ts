@@ -134,6 +134,91 @@ describe("upload worker", () => {
     );
   });
 
+  describe("orphaned entry (missing local payload)", () => {
+    it("drops the index row and does not head-block when the payload file is gone", async () => {
+      const deps = makeMockDeps();
+      const dropUnsyncedEntry = vi.fn().mockReturnValue(true);
+      const enoent = Object.assign(
+        new Error("ENOENT: no such file or directory, open '/x/spotify.json'"),
+        { code: "ENOENT" },
+      );
+      (deps.storage as unknown as Record<string, unknown>).dropUnsyncedEntry =
+        dropUnsyncedEntry;
+      deps.storage.readEnvelope = vi.fn().mockRejectedValue(enoent);
+      const entry = makeEntry({ path: "spotify/savedTracks/x.json" });
+
+      await expect(uploadOne(deps, entry)).rejects.toMatchObject({
+        name: "OrphanedEntryError",
+      });
+      expect(dropUnsyncedEntry).toHaveBeenCalledWith(
+        "spotify/savedTracks/x.json",
+      );
+    });
+
+    it("surfaces the original error when the orphan drop reports no row removed", async () => {
+      const deps = makeMockDeps();
+      const enoent = Object.assign(new Error("ENOENT: no such file"), {
+        code: "ENOENT",
+      });
+      (deps.storage as unknown as Record<string, unknown>).dropUnsyncedEntry =
+        vi.fn().mockReturnValue(false);
+      deps.storage.readEnvelope = vi.fn().mockRejectedValue(enoent);
+      const entry = makeEntry();
+
+      // Not an OrphanedEntryError — nothing was dropped, so the real ENOENT
+      // must surface rather than being silently swallowed.
+      await expect(uploadOne(deps, entry)).rejects.toThrow(/ENOENT/);
+    });
+
+    it("uploadAll swallows the orphan drop instead of surfacing a sync error", async () => {
+      const deps = makeMockDeps();
+      const onError = vi.fn();
+      const enoent = Object.assign(new Error("ENOENT: no such file"), {
+        code: "ENOENT",
+      });
+      (deps.storage as unknown as Record<string, unknown>).dropUnsyncedEntry =
+        vi.fn().mockReturnValue(true);
+      deps.storage.readEnvelope = vi.fn().mockRejectedValue(enoent);
+      deps.storage.findUnsynced = vi
+        .fn()
+        .mockReturnValue([makeEntry({ path: "spotify/savedTracks/x.json" })]);
+
+      const results = await uploadAll(deps, { onError });
+
+      expect(results).toEqual([]);
+      expect(onError).not.toHaveBeenCalled();
+    });
+
+    it("a non-ENOENT read failure still surfaces as a real error", async () => {
+      const deps = makeMockDeps();
+      const onError = vi.fn();
+      deps.storage.readEnvelope = vi
+        .fn()
+        .mockRejectedValue(new Error("disk exploded"));
+      deps.storage.findUnsynced = vi.fn().mockReturnValue([makeEntry()]);
+
+      await uploadAll(deps, { onError });
+
+      expect(onError).toHaveBeenCalledTimes(1);
+    });
+
+    it("does NOT drop on a non-ENOENT error whose message merely mentions a missing file", async () => {
+      const deps = makeMockDeps();
+      const dropUnsyncedEntry = vi.fn().mockReturnValue(true);
+      (deps.storage as unknown as Record<string, unknown>).dropUnsyncedEntry =
+        dropUnsyncedEntry;
+      // No `code: "ENOENT"` — a validation/adapter error that happens to say
+      // "no such file" must not be treated as a missing payload.
+      deps.storage.readEnvelope = vi
+        .fn()
+        .mockRejectedValue(new Error("gateway rejected: no such file id"));
+      const entry = makeEntry();
+
+      await expect(uploadOne(deps, entry)).rejects.toThrow(/no such file id/);
+      expect(dropUnsyncedEntry).not.toHaveBeenCalled();
+    });
+  });
+
   describe("uploadOne", () => {
     it("calls encryptWithPassword with correct scope key hex", async () => {
       const deps = makeMockDeps();

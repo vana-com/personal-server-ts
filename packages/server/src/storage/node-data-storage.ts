@@ -124,5 +124,13 @@ export function createNodeDataStorage(
       deps.indexManager.deleteByPath(entry.path);
       return true;
     },
+    dropUnsyncedEntry(path: string) {
+      // Index row only — the payload file is already gone (that is why the
+      // caller is dropping it). No blob delete. Guarded to unsynced rows: if
+      // the row raced to synced after selection, its metadata is preserved
+      // and this returns false, so the caller surfaces the real error instead
+      // of silently discarding registered data.
+      return deps.indexManager.deleteUnsyncedByPath(path);
+    },
   };
 }
