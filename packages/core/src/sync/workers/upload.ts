@@ -50,11 +50,16 @@ export class OrphanedEntryError extends Error {
   }
 }
 
-/** A filesystem "file not found" from readEnvelope, however the adapter spells it. */
+/**
+ * A filesystem "file not found" from readEnvelope. Matched strictly on the
+ * Node error code, never on message text: the only storage adapter that
+ * implements `dropUnsyncedEntry` (node-data-storage, backed by fs) always sets
+ * `code: "ENOENT"` on a missing file, and message-substring matching would let
+ * an unrelated validation/adapter error that merely mentions "no such file"
+ * trigger a destructive index-row drop.
+ */
 function isMissingPayloadError(err: unknown): boolean {
-  if (!(err instanceof Error)) return false;
-  const code = (err as { code?: unknown }).code;
-  return code === "ENOENT" || /ENOENT|no such file/i.test(err.message);
+  return err instanceof Error && (err as { code?: unknown }).code === "ENOENT";
 }
 
 /**

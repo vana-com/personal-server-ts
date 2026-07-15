@@ -201,6 +201,22 @@ describe("upload worker", () => {
 
       expect(onError).toHaveBeenCalledTimes(1);
     });
+
+    it("does NOT drop on a non-ENOENT error whose message merely mentions a missing file", async () => {
+      const deps = makeMockDeps();
+      const dropUnsyncedEntry = vi.fn().mockReturnValue(true);
+      (deps.storage as unknown as Record<string, unknown>).dropUnsyncedEntry =
+        dropUnsyncedEntry;
+      // No `code: "ENOENT"` — a validation/adapter error that happens to say
+      // "no such file" must not be treated as a missing payload.
+      deps.storage.readEnvelope = vi
+        .fn()
+        .mockRejectedValue(new Error("gateway rejected: no such file id"));
+      const entry = makeEntry();
+
+      await expect(uploadOne(deps, entry)).rejects.toThrow(/no such file id/);
+      expect(dropUnsyncedEntry).not.toHaveBeenCalled();
+    });
   });
 
   describe("uploadOne", () => {
