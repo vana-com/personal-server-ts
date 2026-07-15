@@ -13,6 +13,13 @@ export interface IndexManager {
   findLatestByScope(scope: string): IndexEntry | undefined;
   countByScope(scope: string): number;
   deleteByPath(path: string): boolean;
+  /**
+   * Delete a row by path ONLY if it is still unsynced (`data_point_id IS NULL`).
+   * Atomic guard against a TOCTOU: a row that became synced after the caller
+   * selected it must keep its metadata (the gateway/on-chain state references
+   * it). Returns true only when an unsynced row was actually removed.
+   */
+  deleteUnsyncedByPath(path: string): boolean;
   listDistinctScopes(options?: {
     scopePrefix?: string;
     limit?: number;
@@ -112,6 +119,9 @@ export function createIndexManager(db: Database.Database): IndexManager {
 
   const deleteByPathStmt = db.prepare<{ path: string }>(
     "DELETE FROM data_files WHERE path = @path",
+  );
+  const deleteUnsyncedByPathStmt = db.prepare<{ path: string }>(
+    "DELETE FROM data_files WHERE path = @path AND data_point_id IS NULL",
   );
 
   const findClosestByScopeStmt = db.prepare<{ scope: string; at: string }>(
@@ -222,6 +232,11 @@ export function createIndexManager(db: Database.Database): IndexManager {
 
     deleteByPath(path) {
       const result = deleteByPathStmt.run({ path });
+      return result.changes > 0;
+    },
+
+    deleteUnsyncedByPath(path) {
+      const result = deleteUnsyncedByPathStmt.run({ path });
       return result.changes > 0;
     },
 

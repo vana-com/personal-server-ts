@@ -139,6 +139,14 @@ export interface DataStoragePort extends RuntimeStoragePort {
    * Used by sync delete-reconciliation to drop a copy the gateway reports as deleted.
    */
   deleteByFileId(fileId: string): Promise<boolean>;
+  /**
+   * Drop a single unsynced index entry by path, WITHOUT touching any blob.
+   * Used by the upload worker to evict an orphaned row whose local payload
+   * file is already gone (e.g. a manual `data/<scope>` deletion): the row can
+   * never upload, so retrying it head-blocks the scope forever. Returns true
+   * if a row was removed. No-op-safe when the path is unknown.
+   */
+  dropUnsyncedEntry?(path: string): boolean | Promise<boolean>;
 }
 
 export interface RuntimeAvailabilityPort {

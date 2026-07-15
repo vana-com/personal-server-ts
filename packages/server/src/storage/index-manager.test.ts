@@ -572,6 +572,33 @@ describe("IndexManager", () => {
     ).toBeUndefined();
   });
 
+  it("deleteUnsyncedByPath removes an unsynced row but preserves a synced one", () => {
+    const path = "spotify/savedTracks/2026-07-14T00-00-00Z.json";
+    manager.insert({
+      fileId: null,
+      path,
+      scope: "spotify.savedTracks",
+      collectedAt: "2026-07-14T00:00:00Z",
+      sizeBytes: 100,
+    });
+
+    // Unsynced (data_point_id IS NULL) → removed.
+    expect(manager.deleteUnsyncedByPath(path)).toBe(true);
+    expect(manager.findByPath(path)).toBeUndefined();
+
+    // Re-insert and mark synced → the guard must NOT delete it.
+    manager.insert({
+      fileId: null,
+      path,
+      scope: "spotify.savedTracks",
+      collectedAt: "2026-07-14T00:00:00Z",
+      sizeBytes: 100,
+    });
+    manager.updateDataPointId(path, "0xdatapoint");
+    expect(manager.deleteUnsyncedByPath(path)).toBe(false);
+    expect(manager.findByPath(path)).toBeDefined();
+  });
+
   // ─── DPv2: per-scope version + dataPointId ─────────────────────────────
 
   it("insert without version assigns 1 for a fresh scope", () => {

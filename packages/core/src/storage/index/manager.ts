@@ -12,6 +12,12 @@ export interface IndexManager {
   findLatestByScope(scope: string): IndexEntry | undefined;
   countByScope(scope: string): number;
   deleteByPath(path: string): boolean;
+  /**
+   * Delete a row by path ONLY if it is still unsynced (`dataPointId` null).
+   * Atomic guard so a row that raced to synced after selection keeps its
+   * metadata. Returns true only when an unsynced row was actually removed.
+   */
+  deleteUnsyncedByPath(path: string): boolean;
   listDistinctScopes(options?: {
     scopePrefix?: string;
     limit?: number;
