@@ -83,6 +83,17 @@ export class ScopeMismatchError extends ProtocolError {
   }
 }
 
+export class GrantOwnerMismatchError extends ProtocolError {
+  constructor(details?: Record<string, unknown>) {
+    super(
+      403,
+      "GRANT_OWNER_MISMATCH",
+      "Grant was not issued by this server's owner",
+      details,
+    );
+  }
+}
+
 export class FeeRequiredError extends ProtocolError {
   constructor(details?: Record<string, unknown>) {
     super(403, "FEE_REQUIRED", "Required fee has not been paid", details);

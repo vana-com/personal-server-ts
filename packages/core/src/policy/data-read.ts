@@ -2,6 +2,7 @@ import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
 import { scopeCoveredByGrant } from "@opendatalabs/vana-sdk/browser";
 import {
   GrantExpiredError,
+  GrantOwnerMismatchError,
   GrantRequiredError,
   GrantRevokedError,
   InvalidSignatureError,
@@ -22,6 +23,13 @@ export interface DataReadPolicyInput {
   // fileId is retained on the input shape for backwards-compat with callers
   // that pass it; the canary policy no longer enforces fileId pinning.
   fileId?: string;
+  /**
+   * This server's owner address. When provided, the grant's grantor MUST equal
+   * it — a grant issued by a different owner is rejected. Callers should always
+   * pass this; it is optional only for backwards-compatibility with callers
+   * that predate the check.
+   */
+  serverOwner?: `0x${string}`;
 }
 
 export interface DataReadPolicyPorts {
@@ -76,6 +84,24 @@ export async function verifyDataReadPolicy(
 
   if (grant.revokedAt !== null) {
     throw new GrantRevokedError({ grantId: grant.id });
+  }
+
+  // The grant must have been issued by THIS server's owner. Otherwise any PS
+  // that holds the requested scope's data would serve it to any app holding a
+  // valid grant for that scope+grantee — regardless of whose data the grant
+  // actually covers. In the happy path the builder resolves the grantor's own
+  // PS from the grant's serverAddress, but that discovery is a convention, not
+  // an enforcement; this binds the grant to the data owner at read time.
+  if (
+    input.serverOwner &&
+    grant.grantorAddress &&
+    grant.grantorAddress.toLowerCase() !== input.serverOwner.toLowerCase()
+  ) {
+    throw new GrantOwnerMismatchError({
+      grantId: grant.id,
+      expected: input.serverOwner,
+      actual: grant.grantorAddress,
+    });
   }
 
   // Canary GatewayGrantResponse is flat — scopes is a top-level string[]

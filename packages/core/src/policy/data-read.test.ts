@@ -75,6 +75,45 @@ describe("verifyDataReadPolicy", () => {
     expect(result).toBe(grant);
   });
 
+  it("passes when serverOwner matches the grant's grantor", async () => {
+    const grant = makeGrant({ grantorAddress: "0xOwner" });
+    const result = await verifyDataReadPolicy(
+      {
+        signer: BUILDER_ADDRESS,
+        grantId: grant.id,
+        requestedScope: "instagram.profile",
+        serverOwner: "0xOwner",
+      },
+      {
+        authSessionVerifier: { getBuilder: vi.fn().mockResolvedValue(builder) },
+        grantVerifier: { getGrant: vi.fn().mockResolvedValue(grant) },
+      },
+    );
+    expect(result).toBe(grant);
+  });
+
+  it("rejects GRANT_OWNER_MISMATCH when the grantor is a different owner", async () => {
+    // A grant issued by 0xOwner must not be honored by a server owned by
+    // someone else, even if grantee + scope check out.
+    const grant = makeGrant({ grantorAddress: "0xOwner" });
+    await expect(
+      verifyDataReadPolicy(
+        {
+          signer: BUILDER_ADDRESS,
+          grantId: grant.id,
+          requestedScope: "instagram.profile",
+          serverOwner: "0xSomeoneElse",
+        },
+        {
+          authSessionVerifier: {
+            getBuilder: vi.fn().mockResolvedValue(builder),
+          },
+          grantVerifier: { getGrant: vi.fn().mockResolvedValue(grant) },
+        },
+      ),
+    ).rejects.toMatchObject({ errorCode: "GRANT_OWNER_MISMATCH" });
+  });
+
   it("returns GRANT_REVOKED when grant.revokedAt is set", async () => {
     await expect(
       verifyDataReadPolicy(

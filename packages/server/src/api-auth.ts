@@ -139,6 +139,7 @@ export function createServerApiAuth(
           grantId: result.auth.payload.grantId ?? input.grantId,
           requestedScope: input.scope,
           fileId: input.fileId ?? selectedEntry?.fileId ?? undefined,
+          serverOwner: deps.serverOwner,
         },
         {
           authSessionVerifier: deps.gateway,
