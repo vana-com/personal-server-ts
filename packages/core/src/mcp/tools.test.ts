@@ -1014,6 +1014,36 @@ describe("mcp/tools", () => {
     expect(blob?.resource?.blob).toBe("JVBERg==");
   });
 
+  it("get_scope_file preserves the size cap on paid reads (no inline dump of oversized files)", async () => {
+    const readRawScopeFile = vi.fn().mockResolvedValue({
+      status: 200,
+      scope: "manual.document",
+      mimeType: "application/pdf",
+      sizeBytes: 10_000,
+      contentBase64: "AAAA",
+    });
+    const readClient = createMinimalReadClient({ readRawScopeFile });
+    const result = await getTool("get_scope_file").handler(
+      { scope: "manual.document", payment: "PAYPROOF", maxBytes: 100 },
+      {
+        connection: {
+          ...createConnection(),
+          grants: [{ grantId: "g", scopes: ["manual.document"] }],
+        },
+        readClient: readClient as never,
+      },
+    );
+    const payload = JSON.parse(result.content[0].text);
+    // Payment settled, but the oversized file is NOT dumped inline.
+    expect(payload.error).toBe("paid_file_exceeds_max_bytes");
+    expect(payload.sizeBytes).toBe(10_000);
+    expect(
+      (result.content as Array<{ type: string }>).some(
+        (c) => c.type === "resource",
+      ),
+    ).toBe(false);
+  });
+
   it("search_personal_context falls back to bounded blocks when an index is missing", async () => {
     const readScopeBlocks = vi.fn().mockResolvedValue({
       scope: "instagram.profile",
