@@ -321,7 +321,7 @@ function selectedGrantId(request: Request, url: URL): string | undefined {
   );
 }
 
-interface X402CycleInput {
+export interface X402CycleInput {
   deps: PersonalServerDataApiDeps;
   request: Request;
   scope: string;
@@ -334,7 +334,7 @@ interface X402CycleInput {
   gatewayUrl: string;
 }
 
-type X402CycleResult =
+export type X402CycleResult =
   | { kind: "ok"; payResponse: unknown }
   | { kind: "challenge"; body: X402Challenge }
   | { kind: "gateway-error"; status: number; body: unknown };
@@ -355,7 +355,7 @@ type X402CycleResult =
  * exactly what we need to distinguish gateway 402 (insufficient balance) from
  * 409 (replay) from 400 (amount mismatch).
  */
-async function handleX402Cycle(
+export async function handleX402Cycle(
   input: X402CycleInput,
 ): Promise<X402CycleResult> {
   const { deps, gateway, gatewayConfig, gatewayUrl, builder, scope } = input;
