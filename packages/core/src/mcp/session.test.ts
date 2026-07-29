@@ -129,6 +129,37 @@ describe("createMcpSession", () => {
     );
   });
 
+  it("does not consume the proof when validation fails, so a valid retry succeeds", async () => {
+    const replayStore = createInMemoryMcpProofReplayStore();
+    let builderCalls = 0;
+    const gw = {
+      getBuilder: async () => {
+        builderCalls += 1;
+        if (builderCalls === 1) throw new Error("transient gateway failure");
+        return { id: BUILDER };
+      },
+      getGrant: async () => grant(),
+    } as unknown as AuthSessionVerifierPort & GrantVerifierPort;
+    const opts = {
+      store: createInMemoryMcpSessionStore(),
+      authSessionVerifier: gw,
+      grantVerifier: gw,
+      randomToken: () => "tok",
+      replayStore,
+    };
+    const input = {
+      builderAddress: BUILDER,
+      grantId: "grant_1",
+      proof: { id: "proof-retry", expiresAtMs: Date.now() + 60_000 },
+    };
+    // First attempt fails during validation (before the proof is consumed).
+    await expect(createMcpSession(input, opts)).rejects.toThrow(/transient/);
+    // Retrying the SAME proof now succeeds — it was never marked as consumed.
+    await expect(createMcpSession(input, opts)).resolves.toMatchObject({
+      grantId: "grant_1",
+    });
+  });
+
   it("allows a fresh proof id after a prior one was consumed", async () => {
     const gw = fakeGateway(grant());
     const replayStore = createInMemoryMcpProofReplayStore();

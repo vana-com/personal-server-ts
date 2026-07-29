@@ -148,21 +148,6 @@ export async function createMcpSession(
   input: CreateMcpSessionInput,
   options: CreateMcpSessionOptions,
 ): Promise<CreateMcpSessionResult> {
-  // Replay guard: a still-valid handshake proof must mint at most one token.
-  if (input.proof && options.replayStore) {
-    const replayed = await options.replayStore.consume(
-      input.proof.id,
-      input.proof.expiresAtMs,
-    );
-    if (replayed) {
-      throw new ProtocolError(
-        401,
-        "MCP_SESSION_PROOF_REPLAY",
-        "Handshake proof already used; sign a fresh proof",
-      );
-    }
-  }
-
   const builder = await options.authSessionVerifier.getBuilder(
     input.builderAddress,
   );
@@ -184,6 +169,25 @@ export async function createMcpSession(
       expected: grant.granteeId,
       actual: input.builderAddress,
     });
+  }
+
+  // Replay guard: a still-valid handshake proof must mint at most one token.
+  // Consume ONLY after identity validation succeeds, so a transient failure
+  // (gateway/store error) above doesn't burn the proof and block a legitimate
+  // retry. The consume is an atomic check-and-set, so concurrent duplicates
+  // still resolve to exactly one winner.
+  if (input.proof && options.replayStore) {
+    const replayed = await options.replayStore.consume(
+      input.proof.id,
+      input.proof.expiresAtMs,
+    );
+    if (replayed) {
+      throw new ProtocolError(
+        401,
+        "MCP_SESSION_PROOF_REPLAY",
+        "Handshake proof already used; sign a fresh proof",
+      );
+    }
   }
 
   const token = options.randomToken();
