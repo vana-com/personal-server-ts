@@ -1401,11 +1401,27 @@ const getScopeFile: McpToolDefinition = {
         maxBytes,
         timeoutMs,
       };
-      // A paid read settles a SINGLE-USE x402 payment for this fetch. Returning
-      // a resource link would force a second, unpaid resources/read → another
-      // 402 that cannot be satisfied. So a paid read always returns the bytes
-      // inline (ignoring includeContent/maxBytes), redeeming the payment once.
+      // A paid read settles a SINGLE-USE x402 payment for this fetch. A resource
+      // link would force a second, unpaid resources/read → another 402 that
+      // cannot be satisfied, so a paid read returns the bytes inline (regardless
+      // of includeContent) — BUT the hard size cap is still enforced to protect
+      // server/client memory and the MCP transport. An oversized paid file
+      // returns a structured error, never an inline dump; clients size maxBytes
+      // from the payment challenge's `sizeBytes` before paying.
       const paidRead = Boolean(payment);
+      if (paidRead && raw.sizeBytes > maxBytes) {
+        return textResult(
+          {
+            error: "paid_file_exceeds_max_bytes",
+            status: 413,
+            sizeBytes: raw.sizeBytes,
+            maxBytes,
+            message:
+              "Payment settled, but the file exceeds maxBytes and is not returned inline. Retry with a larger maxBytes (and a fresh payment); files above the inline ceiling cannot be delivered over MCP.",
+          },
+          true,
+        );
+      }
       if (!paidRead && (!includeContent || raw.sizeBytes > maxBytes)) {
         return {
           content: [
@@ -1496,13 +1512,29 @@ const getScopeFile: McpToolDefinition = {
           // Only a genuine PAYMENT_REQUIRED with a challenge is signable; a
           // gateway 402 (e.g. insufficient escrow) is surfaced as an error.
           if (body?.error?.errorCode === "PAYMENT_REQUIRED" && challenge) {
+            // Surface the file size so the client can set maxBytes >= sizeBytes
+            // BEFORE paying — a paid read must fit the inline size cap (the
+            // single-use payment can't fund a second resources/read).
+            let meta: { sizeBytes?: number } | null = null;
+            try {
+              meta = await readClient.getScopeMetadata(scope);
+            } catch {
+              meta = null;
+            }
+            const sizeBytes = meta?.sizeBytes;
             return textResult(
               {
                 payment_required: true,
                 status: 402,
                 challenge,
+                ...(typeof sizeBytes === "number"
+                  ? { sizeBytes, recommendedMaxBytes: sizeBytes }
+                  : {}),
                 message:
-                  "This file requires payment. Sign the x402 challenge and call get_scope_file again with the `payment` argument.",
+                  "This file requires payment. Sign the x402 challenge and call get_scope_file again with the `payment` argument" +
+                  (typeof sizeBytes === "number"
+                    ? ` and maxBytes >= ${sizeBytes}.`
+                    : "."),
               },
               true,
             );
