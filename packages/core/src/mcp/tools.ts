@@ -837,18 +837,39 @@ const readScope: McpToolDefinition = {
       }
       if (err instanceof McpDataReadError) {
         if (err.status === 402) {
-          // x402: surface the challenge so the app can sign + retry with the
-          // `payment` argument. (Only paid self-signing sessions hit this.)
           const body = err.body as {
-            error?: { details?: { challenge?: unknown } };
+            error?: {
+              errorCode?: string;
+              message?: string;
+              details?: { challenge?: unknown };
+            };
           };
+          const challenge = body?.error?.details?.challenge;
+          // Only a genuine PAYMENT_REQUIRED with a challenge is signable. A
+          // gateway failure that also surfaces as 402 (e.g. PAYMENT_GATEWAY_ERROR
+          // — insufficient escrow balance) is NOT signable; presenting it as a
+          // challenge would make the client sign an error envelope in a loop.
+          if (body?.error?.errorCode === "PAYMENT_REQUIRED" && challenge) {
+            return textResult(
+              {
+                payment_required: true,
+                status: 402,
+                challenge,
+                message:
+                  "This read requires payment. Sign the x402 challenge and call read_scope again with the `payment` argument.",
+              },
+              true,
+            );
+          }
+          // Gateway-side payment failure — surface the real error + remediation.
           return textResult(
             {
-              payment_required: true,
+              error: "payment_failed",
               status: 402,
-              challenge: body?.error?.details?.challenge ?? err.body,
+              errorCode: body?.error?.errorCode ?? "PAYMENT_ERROR",
               message:
-                "This read requires payment. Sign the x402 challenge and call read_scope again with the `payment` argument.",
+                body?.error?.message ??
+                "Payment could not be completed (e.g. insufficient escrow balance). This is not a signable challenge; resolve the gateway error and retry.",
             },
             true,
           );
@@ -1212,9 +1233,15 @@ const searchPersonalContext: McpToolDefinition = {
           truncatedScopes.push(scope);
         }
       } catch (err) {
-        if (err instanceof McpDataReadError && err.status === 402) {
+        const paymentChallenge =
+          err instanceof McpDataReadError &&
+          err.status === 402 &&
+          (err.body as { error?: { errorCode?: string } })?.error?.errorCode ===
+            "PAYMENT_REQUIRED";
+        if (paymentChallenge) {
           // Paid session hit a chargeable scope. Surface it as payment-required
           // (retrieve via read_scope with `payment`) rather than a scope error.
+          // A gateway 402 (PAYMENT_GATEWAY_ERROR) falls through to `errors`.
           if (!paymentRequiredScopes.includes(scope)) {
             paymentRequiredScopes.push(scope);
           }
