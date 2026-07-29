@@ -705,6 +705,12 @@ const readScope: McpToolDefinition = {
       .min(1000)
       .max(MAX_READ_SCOPE_TIMEOUT_MS)
       .optional(),
+    payment: z
+      .string()
+      .optional()
+      .describe(
+        "Base64 X-PAYMENT proof (x402). Provide it after a prior call returned payment_required.",
+      ),
   },
   async handler(args, { connection, readClient }) {
     const scope = typeof args.scope === "string" ? args.scope : null;
@@ -785,6 +791,8 @@ const readScope: McpToolDefinition = {
         });
     }
 
+    const payment = typeof args.payment === "string" ? args.payment : undefined;
+
     try {
       const result = await withTimeout(
         readClient.readScopeBlocks({
@@ -792,6 +800,7 @@ const readScope: McpToolDefinition = {
           grantId: grant.grantId,
           cursor,
           maxBytes,
+          payment,
         }),
         timeoutMs,
         `read blocks for ${scope}`,
@@ -827,6 +836,23 @@ const readScope: McpToolDefinition = {
         );
       }
       if (err instanceof McpDataReadError) {
+        if (err.status === 402) {
+          // x402: surface the challenge so the app can sign + retry with the
+          // `payment` argument. (Only paid self-signing sessions hit this.)
+          const body = err.body as {
+            error?: { details?: { challenge?: unknown } };
+          };
+          return textResult(
+            {
+              payment_required: true,
+              status: 402,
+              challenge: body?.error?.details?.challenge ?? err.body,
+              message:
+                "This read requires payment. Sign the x402 challenge and call read_scope again with the `payment` argument.",
+            },
+            true,
+          );
+        }
         if (err.status === 503) {
           return textResult(
             {
