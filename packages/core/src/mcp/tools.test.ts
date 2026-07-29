@@ -289,6 +289,50 @@ describe("mcp/tools", () => {
     });
   });
 
+  it("read_scope surfaces a genuine PAYMENT_REQUIRED as a signable challenge", async () => {
+    const readClient = createMinimalReadClient({
+      readScopeBlocks: vi.fn().mockRejectedValue(
+        new McpDataReadError(402, {
+          error: {
+            errorCode: "PAYMENT_REQUIRED",
+            message: "Payment required for this read",
+            details: { challenge: { accepts: [{ amount: "1" }] } },
+          },
+        }),
+      ),
+    });
+    const result = await getTool("read_scope").handler(
+      { scope: "instagram.profile" },
+      { connection: createConnection(), readClient: readClient as never },
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.payment_required).toBe(true);
+    expect(payload.challenge).toEqual({ accepts: [{ amount: "1" }] });
+  });
+
+  it("read_scope does NOT present a gateway 402 (PAYMENT_GATEWAY_ERROR) as a signable challenge", async () => {
+    const readClient = createMinimalReadClient({
+      readScopeBlocks: vi.fn().mockRejectedValue(
+        new McpDataReadError(402, {
+          error: {
+            errorCode: "PAYMENT_GATEWAY_ERROR",
+            message: "insufficient escrow balance",
+            details: { body: {} },
+          },
+        }),
+      ),
+    });
+    const result = await getTool("read_scope").handler(
+      { scope: "instagram.profile" },
+      { connection: createConnection(), readClient: readClient as never },
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.payment_required).toBeUndefined();
+    expect(payload.error).toBe("payment_failed");
+    expect(payload.errorCode).toBe("PAYMENT_GATEWAY_ERROR");
+    expect(payload.message).toContain("insufficient escrow");
+  });
+
   it("read_scope returns bounded blocks and a next cursor", async () => {
     const readClient = createMinimalReadClient({
       readScopeBlocks: vi
