@@ -8,6 +8,7 @@ import {
   InvalidSignatureError,
   PsUnavailableError,
   ScopeMismatchError,
+  ServerNotConfiguredError,
   UnregisteredBuilderError,
 } from "../errors/catalog.js";
 import {
@@ -86,24 +87,6 @@ export async function verifyDataReadPolicy(
     throw new GrantRevokedError({ grantId: grant.id });
   }
 
-  // The grant must have been issued by THIS server's owner. Otherwise any PS
-  // that holds the requested scope's data would serve it to any app holding a
-  // valid grant for that scope+grantee — regardless of whose data the grant
-  // actually covers. In the happy path the builder resolves the grantor's own
-  // PS from the grant's serverAddress, but that discovery is a convention, not
-  // an enforcement; this binds the grant to the data owner at read time.
-  if (
-    input.serverOwner &&
-    grant.grantorAddress &&
-    grant.grantorAddress.toLowerCase() !== input.serverOwner.toLowerCase()
-  ) {
-    throw new GrantOwnerMismatchError({
-      grantId: grant.id,
-      expected: input.serverOwner,
-      actual: grant.grantorAddress,
-    });
-  }
-
   // Canary GatewayGrantResponse is flat — scopes is a top-level string[]
   // and expiresAt is a decimal-string uint256 (`null` = perpetual). The
   // legacy signed `grant` JSON blob and `fileIds` pinning are gone.
@@ -147,6 +130,29 @@ export async function verifyDataReadPolicy(
       reason: "Request signer is not the grant builder",
       expected: grant.granteeId,
       actual: input.signer,
+    });
+  }
+
+  // Ownership binding — the grant MUST have been issued by THIS server's owner.
+  // Otherwise any PS holding the requested scope's data would serve it under a
+  // grant issued by a *different* owner (the happy-path binding is the app
+  // resolving the grantor's own PS via serverAddress — a convention, not an
+  // enforcement). Fail CLOSED: a missing serverOwner (server misconfig) or a
+  // grant with no grantor (gateway responses are untrusted runtime data,
+  // despite their type) must reject, never skip the check.
+  if (!input.serverOwner) {
+    throw new ServerNotConfiguredError({
+      reason: "serverOwner is required to verify grant ownership",
+    });
+  }
+  if (
+    !grant.grantorAddress ||
+    grant.grantorAddress.toLowerCase() !== input.serverOwner.toLowerCase()
+  ) {
+    throw new GrantOwnerMismatchError({
+      grantId: grant.id,
+      expected: input.serverOwner,
+      actual: grant.grantorAddress ?? null,
     });
   }
 
