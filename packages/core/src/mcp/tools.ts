@@ -1401,7 +1401,12 @@ const getScopeFile: McpToolDefinition = {
         maxBytes,
         timeoutMs,
       };
-      if (!includeContent || raw.sizeBytes > maxBytes) {
+      // A paid read settles a SINGLE-USE x402 payment for this fetch. Returning
+      // a resource link would force a second, unpaid resources/read → another
+      // 402 that cannot be satisfied. So a paid read always returns the bytes
+      // inline (ignoring includeContent/maxBytes), redeeming the payment once.
+      const paidRead = Boolean(payment);
+      if (!paidRead && (!includeContent || raw.sizeBytes > maxBytes)) {
         return {
           content: [
             {
