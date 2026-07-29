@@ -70,6 +70,12 @@ export interface McpDataReadClient {
     grantId: string;
     cursor?: string;
     maxBytes?: number;
+    /**
+     * Optional base64 `X-PAYMENT` proof (x402). Forwarded as a header on the
+     * in-process read request so a payment-enforcing auth port (self-signing
+     * MCP sessions) can settle it. The owner/OAuth path never sets this.
+     */
+    payment?: string;
   }): Promise<McpDataReadBlocksResult>;
 
   /**
@@ -225,7 +231,7 @@ export function createMcpDataReadClient(
       };
     },
 
-    async readScopeBlocks({ scope, grantId, cursor, maxBytes }) {
+    async readScopeBlocks({ scope, grantId, cursor, maxBytes, payment }) {
       const storage = options.dataApiDeps.storage;
       if (!storage.readScopeBlocks) {
         throw new McpDataReadError(503, {
@@ -260,7 +266,10 @@ export function createMcpDataReadClient(
       const url = new URL(signingUri, options.serverOrigin).toString();
       const request = new Request(url, {
         method: "GET",
-        headers: { Authorization: authorization },
+        headers: {
+          Authorization: authorization,
+          ...(payment ? { "X-PAYMENT": payment } : {}),
+        },
       });
 
       let authResult:

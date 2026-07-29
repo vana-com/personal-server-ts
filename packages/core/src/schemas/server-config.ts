@@ -18,7 +18,7 @@ export const DEFAULTS = {
     },
   },
   gateway: {
-    url: "https://data-gateway-env-dev-opendatalabs.vercel.app",
+    url: "https://dp-rpc.moksha.vana.org",
     chainId: 14800,
     contracts: {
       // DataRegistryV2 — addData, recordDataAccess
