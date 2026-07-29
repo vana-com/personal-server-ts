@@ -4,6 +4,7 @@ import { MCP_TOOLS } from "./tools.js";
 import { handleMcpStreamableHttpRequest } from "./server.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { McpDataReadClient } from "./read-client.js";
+import { McpDataReadError } from "./read-client.js";
 
 function getTool(name: string) {
   const tool = MCP_TOOLS.find((candidate) => candidate.name === name);
@@ -714,6 +715,65 @@ describe("mcp/tools", () => {
     expect(payload.searchedScopes).toEqual(["instagram.profile"]);
     expect(payload.nextSearchCursor).toBeDefined();
     expect(payload.limits.requestedBytesPerPage).toBe(1024);
+  });
+
+  it("search_personal_context surfaces chargeable scopes as payment_required, not scope errors", async () => {
+    const readClient = createMinimalReadClient({
+      readScopeBlocks: vi.fn(async ({ scope }: { scope: string }) => {
+        if (scope === "instagram.profile") {
+          // Paid self-signing session: a chargeable read 402s inside search.
+          throw new McpDataReadError(402, {
+            error: {
+              errorCode: "PAYMENT_REQUIRED",
+              message: "payment required",
+              details: { challenge: { accepts: [] } },
+            },
+          });
+        }
+        return {
+          scope,
+          collectedAt: "2026-06-05T00:00:00Z",
+          contentKind: "json",
+          blocks: [
+            {
+              id: "b1",
+              path: "$.text",
+              mediaType: "text/plain",
+              value: "hello query world",
+              sizeBytes: 20,
+            },
+          ],
+          warnings: [],
+        };
+      }),
+    });
+
+    const result = await getTool("search_personal_context").handler(
+      {
+        query: "query",
+        scopes: ["instagram.profile", "chatgpt.history"],
+        maxScopes: 2,
+        maxResults: 5,
+        maxBytes: 1024,
+      },
+      {
+        connection: createConnection(),
+        readClient: readClient as never,
+      },
+    );
+
+    const payload = JSON.parse(result.content[0].text);
+    // The 402 is surfaced as an actionable payment signal...
+    expect(payload.payment_required).toBe(true);
+    expect(payload.paymentRequiredScopes).toContain("instagram.profile");
+    // ...not buried as a generic scope error.
+    expect(
+      (payload.errors ?? []).some(
+        (e: { scope: string }) => e.scope === "instagram.profile",
+      ),
+    ).toBe(false);
+    // Non-chargeable scopes are still searched normally.
+    expect(payload.searchedScopes).toContain("chatgpt.history");
   });
 
   it("search_personal_context returns a per-scope timeout when a read never resolves", async () => {

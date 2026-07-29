@@ -935,7 +935,7 @@ const searchPersonalContext: McpToolDefinition = {
   name: "search_personal_context",
   title: "Search personal context",
   description:
-    "Search approved scopes. Omit scopes for default sweep; name scopes for targeted search. Continue with nextSearchCursor.",
+    "Search approved scopes. Omit scopes for default sweep; name scopes for targeted search. Continue with nextSearchCursor. Free discovery/preview — it does not settle payments; chargeable scopes are returned in paymentRequiredScopes, fetch those via read_scope with a `payment` proof.",
   inputSchema: {
     query: z.string().min(1).max(SEARCH_QUERY_MAX_CHARS),
     scopes: z
@@ -1026,6 +1026,11 @@ const searchPersonalContext: McpToolDefinition = {
     }> = [];
     const searchedScopes: string[] = [];
     const truncatedScopes: string[] = [];
+    // Chargeable scopes hit on a paid (self-signing) session. Search is a free
+    // discovery/preview surface and does not settle x402 payments — it surfaces
+    // these explicitly so the client retrieves them via read_scope with a
+    // `payment` proof, instead of burying the 402 as an opaque scope error.
+    const paymentRequiredScopes: string[] = [];
     const errors = [...resolved.errors];
 
     // When resuming, start from the scope index encoded in the cursor
@@ -1207,21 +1212,29 @@ const searchPersonalContext: McpToolDefinition = {
           truncatedScopes.push(scope);
         }
       } catch (err) {
-        errors.push({
-          scope,
-          error:
-            err instanceof OperationTimeoutError
-              ? "scope_search_timeout"
-              : "scope_read_failed",
-          status: err instanceof McpDataReadError ? err.status : undefined,
-          bodyPreview: stringifyPreview(
-            err instanceof McpDataReadError
-              ? err.body
-              : err instanceof OperationTimeoutError
-                ? err.message
-                : "unexpected scope read failure",
-          ),
-        });
+        if (err instanceof McpDataReadError && err.status === 402) {
+          // Paid session hit a chargeable scope. Surface it as payment-required
+          // (retrieve via read_scope with `payment`) rather than a scope error.
+          if (!paymentRequiredScopes.includes(scope)) {
+            paymentRequiredScopes.push(scope);
+          }
+        } else {
+          errors.push({
+            scope,
+            error:
+              err instanceof OperationTimeoutError
+                ? "scope_search_timeout"
+                : "scope_read_failed",
+            status: err instanceof McpDataReadError ? err.status : undefined,
+            bodyPreview: stringifyPreview(
+              err instanceof McpDataReadError
+                ? err.body
+                : err instanceof OperationTimeoutError
+                  ? err.message
+                  : "unexpected scope read failure",
+            ),
+          });
+        }
       }
       if (matches.length >= limit) {
         // Result limit hit — if more scopes remain, offer cursor for next scope
@@ -1250,6 +1263,14 @@ const searchPersonalContext: McpToolDefinition = {
       ],
       truncatedScopes,
       errors,
+      ...(paymentRequiredScopes.length > 0
+        ? {
+            payment_required: true,
+            paymentRequiredScopes,
+            paymentHint:
+              "These scopes are chargeable; search does not settle x402 payments. Retrieve each with read_scope (it returns a payment_required challenge; sign it and re-call read_scope with the `payment` argument).",
+          }
+        : {}),
       ...(nextSearchCursor ? { nextSearchCursor } : {}),
       elapsedMs,
       limits: {
