@@ -447,6 +447,9 @@ export function createWeb3SignedPsLiteAuth(
           grantId: auth.auth.payload.grantId ?? input.grantId,
           requestedScope: input.scope,
           fileId: input.fileId,
+          // Bind the read to this PS's owner — the grant must have been issued
+          // by us. Required now that the policy fails closed on a missing owner.
+          serverOwner: options.ownerAddress,
         },
         options.dataReadPolicyPorts,
       );
