@@ -17,7 +17,7 @@
  * "encrypt grantee private keys at rest" applies there).
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import type { Logger } from "pino";
@@ -37,10 +37,12 @@ import {
   createMcpOAuthAuthorization,
   createInMemoryMcpConnectionStore,
   createInMemoryMcpSessionStore,
+  createInMemoryMcpProofReplayStore,
   createMcpSession,
   createMcpSessionAuthPort,
   buildMcpSessionConnection,
   type McpSessionPaymentConfig,
+  type McpProofReplayStore,
   createMcpDataReadClient,
   handleMcpStreamableHttpRequest,
   hashConnectionToken,
@@ -118,6 +120,11 @@ export interface McpRouteDeps {
    * `/mcp/session` handshake and the `/mcp` reads.
    */
   sessionStore?: McpSessionStore;
+  /**
+   * Per-process replay guard for `/mcp/session` handshake proofs. Defaults to
+   * in-memory. Rejects reuse of a still-valid Web3Signed proof.
+   */
+  proofReplayStore?: McpProofReplayStore;
   /**
    * OAuth authorization store shared by `/mcp/oauth/authorize`,
    * `/mcp/oauth/token`, and the owner approval endpoint.
@@ -695,6 +702,8 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
   const app = new Hono();
   const store = deps.connectionStore ?? createInMemoryMcpConnectionStore();
   const sessionStore = deps.sessionStore ?? createInMemoryMcpSessionStore();
+  const proofReplayStore =
+    deps.proofReplayStore ?? createInMemoryMcpProofReplayStore();
   if (!deps.connectionStore) {
     deps.logger.warn(
       "mcpStreamableHttpRoutes: no connectionStore passed; using a fresh in-memory store. The management routes will not see these connections unless they share the same store.",
@@ -752,6 +761,19 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
     c: Context,
     session: Awaited<ReturnType<McpSessionStore["getByTokenHash"]>> & object,
   ) {
+    // Fail closed: if x402 is enabled but the gateway isn't fully configured,
+    // refuse the read rather than silently serving it for free.
+    if (deps.paymentEnabled && !deps.gatewayConfig?.url) {
+      return c.json(
+        jsonError(
+          500,
+          "SERVER_NOT_CONFIGURED",
+          "x402 payment is enabled but the gateway URL is not configured",
+        ),
+        500,
+      );
+    }
+
     const baseDeps = dataApiDepsOrError(c);
     if (baseDeps instanceof Response) return baseDeps;
 
@@ -874,14 +896,28 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
         400,
       );
     }
+    // Replay guard: bind to a digest of the exact proof header, remembered
+    // until the proof's own expiry (a replay only matters while still valid).
+    const proofHeader = c.req.raw.headers.get("authorization") ?? "";
+    const proofId = createHash("sha256").update(proofHeader).digest("hex");
+    const expSec = authResult.auth.payload.exp;
+    const expiresAtMs =
+      (typeof expSec === "number"
+        ? expSec
+        : Math.floor(Date.now() / 1000) + 300) * 1000;
     try {
       const session = await createMcpSession(
-        { builderAddress: authResult.auth.signer, grantId },
+        {
+          builderAddress: authResult.auth.signer,
+          grantId,
+          proof: { id: proofId, expiresAtMs },
+        },
         {
           store: sessionStore,
           authSessionVerifier: deps.gateway,
           grantVerifier: deps.gateway,
           randomToken: () => `vana_mcp_${randomBytes(32).toString("hex")}`,
+          replayStore: proofReplayStore,
         },
       );
       return c.json({

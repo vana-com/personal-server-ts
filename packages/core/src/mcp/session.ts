@@ -77,11 +77,47 @@ export function createInMemoryMcpSessionStore(): McpSessionStore {
   };
 }
 
+/**
+ * Records consumed handshake-proof identifiers until they expire, so a still-
+ * valid Web3Signed proof cannot be replayed to mint a second session token.
+ */
+export interface McpProofReplayStore {
+  /**
+   * Atomically record `proofId` (remembered until `expiresAtMs`) and report
+   * whether it was ALREADY present and live — i.e. a replay. Returns `true`
+   * on replay, `false` when the proof is fresh (and now recorded).
+   */
+  consume(proofId: string, expiresAtMs: number): Promise<boolean>;
+}
+
+export function createInMemoryMcpProofReplayStore(): McpProofReplayStore {
+  const seen = new Map<string, number>();
+  return {
+    async consume(proofId, expiresAtMs) {
+      const now = Date.now();
+      for (const [id, exp] of seen) {
+        if (exp <= now) seen.delete(id);
+      }
+      const existing = seen.get(proofId);
+      if (existing !== undefined && existing > now) return true;
+      seen.set(proofId, expiresAtMs);
+      return false;
+    },
+  };
+}
+
 const DEFAULT_SESSION_TTL_MS = 60 * 60 * 1000;
 
 export interface CreateMcpSessionInput {
   builderAddress: `0x${string}`;
   grantId: string;
+  /**
+   * Handshake-proof replay guard. When supplied together with a `replayStore`,
+   * a proof id already seen (and still live) is rejected instead of minting a
+   * fresh token. `expiresAtMs` bounds how long the id is remembered (the
+   * proof's own expiry).
+   */
+  proof?: { id: string; expiresAtMs: number };
 }
 
 export interface CreateMcpSessionOptions {
@@ -91,6 +127,8 @@ export interface CreateMcpSessionOptions {
   randomToken: () => string;
   ttlMs?: number;
   now?: () => number;
+  /** Optional replay guard for the handshake proof (see `input.proof`). */
+  replayStore?: McpProofReplayStore;
 }
 
 export interface CreateMcpSessionResult {
@@ -110,6 +148,21 @@ export async function createMcpSession(
   input: CreateMcpSessionInput,
   options: CreateMcpSessionOptions,
 ): Promise<CreateMcpSessionResult> {
+  // Replay guard: a still-valid handshake proof must mint at most one token.
+  if (input.proof && options.replayStore) {
+    const replayed = await options.replayStore.consume(
+      input.proof.id,
+      input.proof.expiresAtMs,
+    );
+    if (replayed) {
+      throw new ProtocolError(
+        401,
+        "MCP_SESSION_PROOF_REPLAY",
+        "Handshake proof already used; sign a fresh proof",
+      );
+    }
+  }
+
   const builder = await options.authSessionVerifier.getBuilder(
     input.builderAddress,
   );
