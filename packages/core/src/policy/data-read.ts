@@ -25,12 +25,12 @@ export interface DataReadPolicyInput {
   // that pass it; the canary policy no longer enforces fileId pinning.
   fileId?: string;
   /**
-   * This server's owner address. When provided, the grant's grantor MUST equal
-   * it — a grant issued by a different owner is rejected. Callers should always
-   * pass this; it is optional only for backwards-compatibility with callers
-   * that predate the check.
+   * This server's owner address. The grant's grantor MUST equal it — a grant
+   * issued by a different owner is rejected. Required (not optional) so that
+   * TypeScript flags any caller that fails to bind the read to the server
+   * owner; the check also fails closed at runtime for untyped/JS callers.
    */
-  serverOwner?: `0x${string}`;
+  serverOwner: `0x${string}`;
 }
 
 export interface DataReadPolicyPorts {
