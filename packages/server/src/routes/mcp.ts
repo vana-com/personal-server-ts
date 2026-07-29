@@ -812,6 +812,9 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       serverOrigin: resolveOrigin(deps.serverOrigin),
       granteeAccount: account,
       dataApiDeps: { ...baseDeps, auth },
+      // Paid session: mark reads as x402-enforced so tools skip any
+      // payment-bypassing shortcut (e.g. the searchScopeIndex preview path).
+      enforcesPayment: Boolean(payment),
     });
     return handleMcpStreamableHttpRequest(c.req.raw, {
       connection,

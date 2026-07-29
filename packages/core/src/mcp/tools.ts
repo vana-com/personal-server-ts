@@ -1078,7 +1078,14 @@ const searchPersonalContext: McpToolDefinition = {
       const grant = resolveGrantForScope(connection, scope);
       if (!grant) continue;
 
-      if (!resumeCursor && typeof readClient.searchScopeIndex === "function") {
+      // The index preview path bypasses the data API auth port (and thus
+      // x402). Skip it when reads are payment-enforced so paid content is never
+      // previewed for free — search falls back to the paid bounded block read.
+      if (
+        !resumeCursor &&
+        !readClient.enforcesPayment &&
+        typeof readClient.searchScopeIndex === "function"
+      ) {
         const remainingMs = deadline - Date.now();
         if (remainingMs <= 0) {
           nextSearchCursor = encodeSearchCursor({ scopeIndex });
@@ -1324,6 +1331,8 @@ const getScopeFile: McpToolDefinition = {
     "Fetch an approved file/PDF scope. Defaults to metadata plus a resource link; set includeContent=true only when the client supports inline resource blobs. Use search_personal_context for extracted text.",
   inputSchema: {
     ...rawScopeFileInputSchema,
+    // x402 proof (see read_scope's `payment`); provide after a payment_required.
+    payment: z.string().optional(),
     timeoutMs: z
       .number()
       .int()
@@ -1369,6 +1378,8 @@ const getScopeFile: McpToolDefinition = {
     );
     const resourceUri = rawScopeResourceUri({ scope, at, fileId });
 
+    const payment = typeof args.payment === "string" ? args.payment : undefined;
+
     try {
       const raw = await withTimeout(
         readClient.readRawScopeFile({
@@ -1376,6 +1387,7 @@ const getScopeFile: McpToolDefinition = {
           grantId: grant.grantId,
           at,
           fileId,
+          payment,
         }),
         timeoutMs,
         `read raw file for ${scope}`,
@@ -1467,6 +1479,41 @@ const getScopeFile: McpToolDefinition = {
         );
       }
       if (err instanceof McpDataReadError) {
+        if (err.status === 402) {
+          const body = err.body as {
+            error?: {
+              errorCode?: string;
+              message?: string;
+              details?: { challenge?: unknown };
+            };
+          };
+          const challenge = body?.error?.details?.challenge;
+          // Only a genuine PAYMENT_REQUIRED with a challenge is signable; a
+          // gateway 402 (e.g. insufficient escrow) is surfaced as an error.
+          if (body?.error?.errorCode === "PAYMENT_REQUIRED" && challenge) {
+            return textResult(
+              {
+                payment_required: true,
+                status: 402,
+                challenge,
+                message:
+                  "This file requires payment. Sign the x402 challenge and call get_scope_file again with the `payment` argument.",
+              },
+              true,
+            );
+          }
+          return textResult(
+            {
+              error: "payment_failed",
+              status: 402,
+              errorCode: body?.error?.errorCode ?? "PAYMENT_ERROR",
+              message:
+                body?.error?.message ??
+                "Payment could not be completed. This is not a signable challenge; resolve the gateway error and retry.",
+            },
+            true,
+          );
+        }
         return textResult(
           {
             error:

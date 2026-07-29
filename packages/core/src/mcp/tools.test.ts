@@ -910,6 +910,76 @@ describe("mcp/tools", () => {
     expect(readScopeBlocks).not.toHaveBeenCalled();
   });
 
+  it("search_personal_context skips the index preview path when payment is enforced", async () => {
+    const searchScopeIndex = vi.fn().mockResolvedValue({
+      status: "hit",
+      hits: [
+        {
+          id: "h",
+          scope: "instagram.profile",
+          preview: "free preview",
+          blockRef: "b1",
+          score: 1,
+          terms: ["kiln"],
+        },
+      ],
+    });
+    const readScopeBlocks = vi.fn().mockResolvedValue({
+      scope: "instagram.profile",
+      collectedAt: "2026-06-05T00:00:00Z",
+      contentKind: "json",
+      blocks: [
+        {
+          id: "b1",
+          path: "$.text",
+          mediaType: "text/plain",
+          value: "kiln content",
+          sizeBytes: 12,
+        },
+      ],
+      warnings: [],
+    });
+    const readClient = createMinimalReadClient({
+      enforcesPayment: true,
+      searchScopeIndex,
+      readScopeBlocks,
+    });
+
+    await getTool("search_personal_context").handler(
+      { query: "kiln", scopes: ["instagram.profile"], maxScopes: 1 },
+      { connection: createConnection(), readClient },
+    );
+
+    // Paid session: the payment-bypassing index preview must NOT be used...
+    expect(searchScopeIndex).not.toHaveBeenCalled();
+    // ...it falls back to the paid bounded block read (which enforces x402).
+    expect(readScopeBlocks).toHaveBeenCalled();
+  });
+
+  it("get_scope_file surfaces PAYMENT_REQUIRED as a signable challenge and forwards payment", async () => {
+    const readRawScopeFile = vi.fn().mockRejectedValueOnce(
+      new McpDataReadError(402, {
+        error: {
+          errorCode: "PAYMENT_REQUIRED",
+          message: "payment required",
+          details: { challenge: { accepts: [{ amount: "1" }] } },
+        },
+      }),
+    );
+    const readClient = createMinimalReadClient({ readRawScopeFile });
+    const result = await getTool("get_scope_file").handler(
+      { scope: "instagram.profile", includeContent: true, payment: "PAYPROOF" },
+      { connection: createConnection(), readClient: readClient as never },
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.payment_required).toBe(true);
+    expect(payload.challenge).toEqual({ accepts: [{ amount: "1" }] });
+    // The x402 proof is forwarded on the raw file read.
+    expect(readRawScopeFile).toHaveBeenCalledWith(
+      expect.objectContaining({ payment: "PAYPROOF" }),
+    );
+  });
+
   it("search_personal_context falls back to bounded blocks when an index is missing", async () => {
     const readScopeBlocks = vi.fn().mockResolvedValue({
       scope: "instagram.profile",
