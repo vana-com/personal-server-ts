@@ -980,6 +980,40 @@ describe("mcp/tools", () => {
     );
   });
 
+  it("get_scope_file returns paid content inline on default options (payment redeemed once)", async () => {
+    const readRawScopeFile = vi.fn().mockResolvedValue({
+      status: 200,
+      scope: "manual.document",
+      mimeType: "application/pdf",
+      sizeBytes: 4,
+      contentBase64: "JVBERg==",
+    });
+    const readClient = createMinimalReadClient({ readRawScopeFile });
+    // Default options: includeContent omitted (=> false), but a payment proof
+    // is supplied. The settled single-use payment must return the bytes inline
+    // rather than a resource link that a second (unpaid) resources/read can't
+    // redeem.
+    const result = await getTool("get_scope_file").handler(
+      { scope: "manual.document", payment: "PAYPROOF" },
+      {
+        connection: {
+          ...createConnection(),
+          grants: [{ grantId: "g", scopes: ["manual.document"] }],
+        },
+        readClient: readClient as never,
+      },
+    );
+    expect(readRawScopeFile).toHaveBeenCalledWith(
+      expect.objectContaining({ payment: "PAYPROOF" }),
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.contentIncluded).toBe(true);
+    const blob = (
+      result.content as Array<{ type: string; resource?: { blob?: string } }>
+    ).find((c) => c.type === "resource");
+    expect(blob?.resource?.blob).toBe("JVBERg==");
+  });
+
   it("search_personal_context falls back to bounded blocks when an index is missing", async () => {
     const readScopeBlocks = vi.fn().mockResolvedValue({
       scope: "instagram.profile",
