@@ -88,6 +88,12 @@ export interface McpProofReplayStore {
    * on replay, `false` when the proof is fresh (and now recorded).
    */
   consume(proofId: string, expiresAtMs: number): Promise<boolean>;
+  /**
+   * Roll back a prior `consume` for `proofId` (e.g. when session persistence
+   * failed after the reservation). Optional — stores that can't release safely
+   * omit it and callers must tolerate its absence.
+   */
+  release?(proofId: string): Promise<void>;
 }
 
 export function createInMemoryMcpProofReplayStore(): McpProofReplayStore {
@@ -102,6 +108,9 @@ export function createInMemoryMcpProofReplayStore(): McpProofReplayStore {
       if (existing !== undefined && existing > now) return true;
       seen.set(proofId, expiresAtMs);
       return false;
+    },
+    async release(proofId) {
+      seen.delete(proofId);
     },
   };
 }
@@ -171,11 +180,19 @@ export async function createMcpSession(
     });
   }
 
+  // Prepare the token first (deterministic, can't meaningfully fail) so the
+  // only fallible step after consuming the proof is persistence.
+  const token = options.randomToken();
+  const tokenHash = await hashConnectionToken(token);
+  const ttlMs = options.ttlMs ?? DEFAULT_SESSION_TTL_MS;
+  const nowMs = options.now?.() ?? Date.now();
+
   // Replay guard: a still-valid handshake proof must mint at most one token.
-  // Consume ONLY after identity validation succeeds, so a transient failure
-  // (gateway/store error) above doesn't burn the proof and block a legitimate
-  // retry. The consume is an atomic check-and-set, so concurrent duplicates
-  // still resolve to exactly one winner.
+  // Consume ONLY after identity validation, and roll the reservation back if
+  // persistence fails — so a transient failure never burns a valid proof.
+  // consume() is an atomic check-and-set, so concurrent duplicates still
+  // resolve to exactly one winner.
+  const usingReplayGuard = Boolean(input.proof && options.replayStore);
   if (input.proof && options.replayStore) {
     const replayed = await options.replayStore.consume(
       input.proof.id,
@@ -190,18 +207,23 @@ export async function createMcpSession(
     }
   }
 
-  const token = options.randomToken();
-  const tokenHash = await hashConnectionToken(token);
-  const ttlMs = options.ttlMs ?? DEFAULT_SESSION_TTL_MS;
-  const nowMs = options.now?.() ?? Date.now();
-  await options.store.create({
-    tokenHash,
-    builderAddress: input.builderAddress,
-    grantId: grant.id,
-    scopes: grant.scopes ?? [],
-    createdAt: new Date(nowMs).toISOString(),
-    expiresAtMs: nowMs + ttlMs,
-  });
+  try {
+    await options.store.create({
+      tokenHash,
+      builderAddress: input.builderAddress,
+      grantId: grant.id,
+      scopes: grant.scopes ?? [],
+      createdAt: new Date(nowMs).toISOString(),
+      expiresAtMs: nowMs + ttlMs,
+    });
+  } catch (err) {
+    // Persistence failed — release the reservation so a legitimate retry with
+    // the same still-valid proof isn't rejected as a replay.
+    if (usingReplayGuard && input.proof && options.replayStore?.release) {
+      await options.replayStore.release(input.proof.id);
+    }
+    throw err;
+  }
   return {
     accessToken: token,
     expiresInSeconds: Math.floor(ttlMs / 1000),

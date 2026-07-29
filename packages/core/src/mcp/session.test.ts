@@ -160,6 +160,42 @@ describe("createMcpSession", () => {
     });
   });
 
+  it("releases the proof when session persistence fails, so a retry succeeds", async () => {
+    const replayStore = createInMemoryMcpProofReplayStore();
+    const gw = fakeGateway(grant());
+    let createCalls = 0;
+    const store = {
+      ...createInMemoryMcpSessionStore(),
+      async create(record: unknown) {
+        createCalls += 1;
+        if (createCalls === 1) throw new Error("transient store failure");
+        // Delegate to a real store on retry.
+        return realStore.create(record as never);
+      },
+    };
+    const realStore = createInMemoryMcpSessionStore();
+    const opts = {
+      store: store as never,
+      authSessionVerifier: gw,
+      grantVerifier: gw,
+      randomToken: () => "tok",
+      replayStore,
+    };
+    const input = {
+      builderAddress: BUILDER,
+      grantId: "grant_1",
+      proof: { id: "proof-persist", expiresAtMs: Date.now() + 60_000 },
+    };
+    // First attempt: validation passes, proof consumed, but store.create fails.
+    await expect(createMcpSession(input, opts)).rejects.toThrow(
+      /store failure/,
+    );
+    // The proof was released on failure, so retrying the same proof succeeds.
+    await expect(createMcpSession(input, opts)).resolves.toMatchObject({
+      grantId: "grant_1",
+    });
+  });
+
   it("allows a fresh proof id after a prior one was consumed", async () => {
     const gw = fakeGateway(grant());
     const replayStore = createInMemoryMcpProofReplayStore();
