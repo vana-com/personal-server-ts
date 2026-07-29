@@ -1841,3 +1841,83 @@ describe("revoked connection cannot be resolved by token", () => {
     expect(await store.getByTokenHash(hash)).toBeNull();
   });
 });
+
+describe("MCP /mcp/session (self-signing handshake)", () => {
+  const appWallet = createTestWallet(21);
+  const GRANT_ID = "grant-sess-1";
+
+  function buildApp(extra: Record<string, unknown>): Hono {
+    const gateway = makeGatewayForGrantee({
+      granteeAddress: appWallet.address,
+      grantId: GRANT_ID,
+      scopes: ["instagram.profile"],
+    }).gateway;
+    const root = new Hono();
+    root.route(
+      "/mcp",
+      mcpStreamableHttpRoutes({
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway,
+        ...extra,
+      }),
+    );
+    return root;
+  }
+
+  function sessionProof(): Promise<string> {
+    return buildWeb3SignedHeader({
+      wallet: appWallet,
+      aud: SERVER_ORIGIN,
+      method: "POST",
+      uri: "/mcp/session",
+      grantId: GRANT_ID,
+    });
+  }
+
+  it("mints a session token, then rejects a replay of the same proof", async () => {
+    const app = buildApp({ gatewayConfig });
+    const proof = await sessionProof();
+
+    const first = await app.request("/mcp/session", {
+      method: "POST",
+      headers: { Authorization: proof },
+    });
+    expect(first.status).toBe(200);
+    const firstBody = (await first.json()) as { access_token?: string };
+    expect(firstBody.access_token).toBeTruthy();
+
+    // Replaying the identical still-valid proof must NOT mint a second token.
+    const replay = await app.request("/mcp/session", {
+      method: "POST",
+      headers: { Authorization: proof },
+    });
+    expect(replay.status).toBe(401);
+    expect((await replay.json()).error.errorCode).toBe(
+      "MCP_SESSION_PROOF_REPLAY",
+    );
+  });
+
+  it("fails closed on a session read when payment is enabled but the gateway is unconfigured", async () => {
+    // paymentEnabled true, but NO gatewayConfig — must refuse, not serve free.
+    const app = buildApp({ paymentEnabled: true });
+    const minted = (await (
+      await app.request("/mcp/session", {
+        method: "POST",
+        headers: { Authorization: await sessionProof() },
+      })
+    ).json()) as { access_token: string };
+
+    const read = await app.request("/mcp", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${minted.access_token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+    expect(read.status).toBe(500);
+    expect((await read.json()).error.errorCode).toBe("SERVER_NOT_CONFIGURED");
+  });
+});

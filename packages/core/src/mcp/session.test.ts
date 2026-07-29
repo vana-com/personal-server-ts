@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   buildMcpSessionConnection,
+  createInMemoryMcpProofReplayStore,
   createInMemoryMcpSessionStore,
   createMcpSession,
   createMcpSessionAuthPort,
@@ -102,6 +103,60 @@ describe("createMcpSession", () => {
         },
       ),
     ).rejects.toThrow();
+  });
+
+  it("rejects a replayed handshake proof (same proof id, still live)", async () => {
+    const gw = fakeGateway(grant());
+    const opts = {
+      store: createInMemoryMcpSessionStore(),
+      authSessionVerifier: gw,
+      grantVerifier: gw,
+      randomToken: () => "tok",
+      replayStore: createInMemoryMcpProofReplayStore(),
+    };
+    const input = {
+      builderAddress: BUILDER,
+      grantId: "grant_1",
+      proof: { id: "proof-abc", expiresAtMs: Date.now() + 60_000 },
+    };
+    // First use mints a token.
+    await expect(createMcpSession(input, opts)).resolves.toMatchObject({
+      grantId: "grant_1",
+    });
+    // Replaying the same proof id is rejected instead of minting a second token.
+    await expect(createMcpSession(input, opts)).rejects.toThrow(
+      /already used/i,
+    );
+  });
+
+  it("allows a fresh proof id after a prior one was consumed", async () => {
+    const gw = fakeGateway(grant());
+    const replayStore = createInMemoryMcpProofReplayStore();
+    const base = {
+      store: createInMemoryMcpSessionStore(),
+      authSessionVerifier: gw,
+      grantVerifier: gw,
+      randomToken: () => "tok",
+      replayStore,
+    };
+    await createMcpSession(
+      {
+        builderAddress: BUILDER,
+        grantId: "grant_1",
+        proof: { id: "proof-1", expiresAtMs: Date.now() + 60_000 },
+      },
+      base,
+    );
+    await expect(
+      createMcpSession(
+        {
+          builderAddress: BUILDER,
+          grantId: "grant_1",
+          proof: { id: "proof-2", expiresAtMs: Date.now() + 60_000 },
+        },
+        base,
+      ),
+    ).resolves.toMatchObject({ grantId: "grant_1" });
   });
 });
 
