@@ -1,0 +1,292 @@
+import { describe, it, expect } from "vitest";
+import {
+  buildMcpSessionConnection,
+  createInMemoryMcpProofReplayStore,
+  createInMemoryMcpSessionStore,
+  createMcpSession,
+  createMcpSessionAuthPort,
+} from "./session.js";
+import { hashConnectionToken } from "./connection-api.js";
+import type {
+  AuthSessionVerifierPort,
+  GrantVerifierPort,
+} from "../ports/index.js";
+
+const BUILDER = "0xabc0000000000000000000000000000000000001" as const;
+const OTHER = "0xdef0000000000000000000000000000000000002" as const;
+
+function grant(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "grant_1",
+    granteeId: BUILDER,
+    scopes: ["instagram.profile"],
+    revokedAt: null,
+    expiresAt: null,
+    ...overrides,
+  };
+}
+
+// Minimal fakes for the two ports verifyDataReadPolicy/createMcpSession use.
+function fakeGateway(
+  grantValue: unknown,
+  builderId: string | null = BUILDER,
+): AuthSessionVerifierPort & GrantVerifierPort {
+  return {
+    getBuilder: async () => (builderId ? { id: builderId } : null),
+    getGrant: async () => grantValue,
+  } as unknown as AuthSessionVerifierPort & GrantVerifierPort;
+}
+
+describe("createMcpSession", () => {
+  it("mints a token for a valid builder + grant and stores it by hash", async () => {
+    const store = createInMemoryMcpSessionStore();
+    const gw = fakeGateway(grant());
+    const result = await createMcpSession(
+      { builderAddress: BUILDER, grantId: "grant_1" },
+      {
+        store,
+        authSessionVerifier: gw,
+        grantVerifier: gw,
+        randomToken: () => "tok_test",
+      },
+    );
+    expect(result.accessToken).toBe("tok_test");
+    expect(result.grantId).toBe("grant_1");
+    expect(result.scopes).toEqual(["instagram.profile"]);
+    const rec = await store.getByTokenHash(
+      await hashConnectionToken("tok_test"),
+    );
+    expect(rec?.builderAddress).toBe(BUILDER);
+    expect(rec?.grantId).toBe("grant_1");
+  });
+
+  it("rejects an unregistered builder", async () => {
+    const gw = fakeGateway(grant(), null);
+    await expect(
+      createMcpSession(
+        { builderAddress: BUILDER, grantId: "grant_1" },
+        {
+          store: createInMemoryMcpSessionStore(),
+          authSessionVerifier: gw,
+          grantVerifier: gw,
+          randomToken: () => "t",
+        },
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("rejects a grant not owned by the builder", async () => {
+    const gw = fakeGateway(grant({ granteeId: OTHER }));
+    await expect(
+      createMcpSession(
+        { builderAddress: BUILDER, grantId: "grant_1" },
+        {
+          store: createInMemoryMcpSessionStore(),
+          authSessionVerifier: gw,
+          grantVerifier: gw,
+          randomToken: () => "t",
+        },
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("rejects a revoked grant", async () => {
+    const gw = fakeGateway(grant({ revokedAt: "2020-01-01T00:00:00Z" }));
+    await expect(
+      createMcpSession(
+        { builderAddress: BUILDER, grantId: "grant_1" },
+        {
+          store: createInMemoryMcpSessionStore(),
+          authSessionVerifier: gw,
+          grantVerifier: gw,
+          randomToken: () => "t",
+        },
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("rejects a replayed handshake proof (same proof id, still live)", async () => {
+    const gw = fakeGateway(grant());
+    const opts = {
+      store: createInMemoryMcpSessionStore(),
+      authSessionVerifier: gw,
+      grantVerifier: gw,
+      randomToken: () => "tok",
+      replayStore: createInMemoryMcpProofReplayStore(),
+    };
+    const input = {
+      builderAddress: BUILDER,
+      grantId: "grant_1",
+      proof: { id: "proof-abc", expiresAtMs: Date.now() + 60_000 },
+    };
+    // First use mints a token.
+    await expect(createMcpSession(input, opts)).resolves.toMatchObject({
+      grantId: "grant_1",
+    });
+    // Replaying the same proof id is rejected instead of minting a second token.
+    await expect(createMcpSession(input, opts)).rejects.toThrow(
+      /already used/i,
+    );
+  });
+
+  it("does not consume the proof when validation fails, so a valid retry succeeds", async () => {
+    const replayStore = createInMemoryMcpProofReplayStore();
+    let builderCalls = 0;
+    const gw = {
+      getBuilder: async () => {
+        builderCalls += 1;
+        if (builderCalls === 1) throw new Error("transient gateway failure");
+        return { id: BUILDER };
+      },
+      getGrant: async () => grant(),
+    } as unknown as AuthSessionVerifierPort & GrantVerifierPort;
+    const opts = {
+      store: createInMemoryMcpSessionStore(),
+      authSessionVerifier: gw,
+      grantVerifier: gw,
+      randomToken: () => "tok",
+      replayStore,
+    };
+    const input = {
+      builderAddress: BUILDER,
+      grantId: "grant_1",
+      proof: { id: "proof-retry", expiresAtMs: Date.now() + 60_000 },
+    };
+    // First attempt fails during validation (before the proof is consumed).
+    await expect(createMcpSession(input, opts)).rejects.toThrow(/transient/);
+    // Retrying the SAME proof now succeeds — it was never marked as consumed.
+    await expect(createMcpSession(input, opts)).resolves.toMatchObject({
+      grantId: "grant_1",
+    });
+  });
+
+  it("releases the proof when session persistence fails, so a retry succeeds", async () => {
+    const replayStore = createInMemoryMcpProofReplayStore();
+    const gw = fakeGateway(grant());
+    let createCalls = 0;
+    const store = {
+      ...createInMemoryMcpSessionStore(),
+      async create(record: unknown) {
+        createCalls += 1;
+        if (createCalls === 1) throw new Error("transient store failure");
+        // Delegate to a real store on retry.
+        return realStore.create(record as never);
+      },
+    };
+    const realStore = createInMemoryMcpSessionStore();
+    const opts = {
+      store: store as never,
+      authSessionVerifier: gw,
+      grantVerifier: gw,
+      randomToken: () => "tok",
+      replayStore,
+    };
+    const input = {
+      builderAddress: BUILDER,
+      grantId: "grant_1",
+      proof: { id: "proof-persist", expiresAtMs: Date.now() + 60_000 },
+    };
+    // First attempt: validation passes, proof consumed, but store.create fails.
+    await expect(createMcpSession(input, opts)).rejects.toThrow(
+      /store failure/,
+    );
+    // The proof was released on failure, so retrying the same proof succeeds.
+    await expect(createMcpSession(input, opts)).resolves.toMatchObject({
+      grantId: "grant_1",
+    });
+  });
+
+  it("allows a fresh proof id after a prior one was consumed", async () => {
+    const gw = fakeGateway(grant());
+    const replayStore = createInMemoryMcpProofReplayStore();
+    const base = {
+      store: createInMemoryMcpSessionStore(),
+      authSessionVerifier: gw,
+      grantVerifier: gw,
+      randomToken: () => "tok",
+      replayStore,
+    };
+    await createMcpSession(
+      {
+        builderAddress: BUILDER,
+        grantId: "grant_1",
+        proof: { id: "proof-1", expiresAtMs: Date.now() + 60_000 },
+      },
+      base,
+    );
+    await expect(
+      createMcpSession(
+        {
+          builderAddress: BUILDER,
+          grantId: "grant_1",
+          proof: { id: "proof-2", expiresAtMs: Date.now() + 60_000 },
+        },
+        base,
+      ),
+    ).resolves.toMatchObject({ grantId: "grant_1" });
+  });
+});
+
+describe("createMcpSessionAuthPort", () => {
+  it("authorizes a read for a covered scope as the builder", async () => {
+    const gw = fakeGateway(grant());
+    const port = createMcpSessionAuthPort({
+      builderAddress: BUILDER,
+      grantId: "grant_1",
+      authSessionVerifier: gw,
+      grantVerifier: gw,
+    });
+    const result = await port.authorizeBuilderRead({
+      request: new Request("http://ps.local/"),
+      scope: "instagram.profile",
+    });
+    expect(result).toMatchObject({ builder: BUILDER, grantId: "grant_1" });
+  });
+
+  it("rejects an uncovered scope (isolation guarantee)", async () => {
+    const gw = fakeGateway(grant());
+    const port = createMcpSessionAuthPort({
+      builderAddress: BUILDER,
+      grantId: "grant_1",
+      authSessionVerifier: gw,
+      grantVerifier: gw,
+    });
+    await expect(
+      port.authorizeBuilderRead({
+        request: new Request("http://ps.local/"),
+        scope: "instagram.posts",
+      }),
+    ).rejects.toThrow();
+  });
+
+  it("refuses owner operations", async () => {
+    const gw = fakeGateway(grant());
+    const port = createMcpSessionAuthPort({
+      builderAddress: BUILDER,
+      grantId: "grant_1",
+      authSessionVerifier: gw,
+      grantVerifier: gw,
+    });
+    await expect(
+      port.authorizeOwner(new Request("http://ps.local/")),
+    ).rejects.toThrow();
+  });
+});
+
+describe("buildMcpSessionConnection", () => {
+  it("builds a synthetic approved connection carrying the grant", () => {
+    const { connection, account } = buildMcpSessionConnection({
+      builderAddress: BUILDER,
+      grantId: "grant_1",
+      scopes: ["instagram.profile"],
+    });
+    expect(connection.status).toBe("approved");
+    expect(connection.granteeAddress).toBe(BUILDER);
+    expect(connection.grants).toEqual([
+      { grantId: "grant_1", scopes: ["instagram.profile"] },
+    ]);
+    // A throwaway signing key exists but is not the builder's key.
+    expect(account.address).toMatch(/^0x[0-9a-fA-F]{40}$/);
+    expect(account.address.toLowerCase()).not.toBe(BUILDER);
+  });
+});

@@ -17,6 +17,7 @@
  * "encrypt grantee private keys at rest" applies there).
  */
 
+import { createHash, randomBytes } from "node:crypto";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import type { Logger } from "pino";
@@ -35,6 +36,13 @@ import {
   createMcpConnection,
   createMcpOAuthAuthorization,
   createInMemoryMcpConnectionStore,
+  createInMemoryMcpSessionStore,
+  createInMemoryMcpProofReplayStore,
+  createMcpSession,
+  createMcpSessionAuthPort,
+  buildMcpSessionConnection,
+  type McpSessionPaymentConfig,
+  type McpProofReplayStore,
   createMcpDataReadClient,
   handleMcpStreamableHttpRequest,
   hashConnectionToken,
@@ -49,6 +57,7 @@ import {
   toMcpConnectionView,
   type McpConnectionGrant,
   type McpConnectionStore,
+  type McpSessionStore,
   type McpOAuthAuthorizationStore,
   type McpActivityRecorder,
 } from "@opendatalabs/personal-server-ts-core/mcp";
@@ -59,6 +68,7 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/api";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { createServerApiAuth } from "../api-auth.js";
+import { authenticateRequest } from "@opendatalabs/personal-server-ts-core/auth";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -80,9 +90,19 @@ export interface McpRouteDeps {
    */
   serverOrigin: string | (() => string);
   serverOwner?: `0x${string}`;
-  serverSigner?: Pick<ServerSigner, "signGrantRegistration">;
+  /** The server's own account address — required for x402 payment settlement. */
+  serverAddress?: `0x${string}`;
+  serverSigner?: Pick<
+    ServerSigner,
+    "signGrantRegistration" | "signRecordDataAccess"
+  >;
   gateway: GatewayClient;
   gatewayConfig?: (DataPortabilityGatewayConfig & { url?: string }) | null;
+  /**
+   * Enables x402 pay-per-read for self-signing (chatbot) MCP sessions only.
+   * The owner/OAuth connection path is always free regardless of this flag.
+   */
+  paymentEnabled?: boolean;
   devToken?: string;
   accessToken?: string;
   tokenStore?: TokenStore;
@@ -94,6 +114,17 @@ export interface McpRouteDeps {
   runtimeAvailability?: RuntimeAvailabilityPort;
   /** Per-process connection store. Defaults to in-memory. */
   connectionStore?: McpConnectionStore;
+  /**
+   * Per-process store for self-signing chatbot MCP sessions (Option A).
+   * Defaults to in-memory. Shared within `mcpStreamableHttpRoutes` between the
+   * `/mcp/session` handshake and the `/mcp` reads.
+   */
+  sessionStore?: McpSessionStore;
+  /**
+   * Per-process replay guard for `/mcp/session` handshake proofs. Defaults to
+   * in-memory. Rejects reuse of a still-valid Web3Signed proof.
+   */
+  proofReplayStore?: McpProofReplayStore;
   /**
    * OAuth authorization store shared by `/mcp/oauth/authorize`,
    * `/mcp/oauth/token`, and the owner approval endpoint.
@@ -670,10 +701,126 @@ export function mcpOAuthRoutes(deps: McpRouteDeps): Hono {
 export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
   const app = new Hono();
   const store = deps.connectionStore ?? createInMemoryMcpConnectionStore();
+  const sessionStore = deps.sessionStore ?? createInMemoryMcpSessionStore();
+  const proofReplayStore =
+    deps.proofReplayStore ?? createInMemoryMcpProofReplayStore();
   if (!deps.connectionStore) {
     deps.logger.warn(
       "mcpStreamableHttpRoutes: no connectionStore passed; using a fresh in-memory store. The management routes will not see these connections unless they share the same store.",
     );
+  }
+
+  function dataApiDepsOrError(
+    c: Context,
+  ): PersonalServerDataApiDeps | Response {
+    try {
+      return buildDataApiDeps(deps);
+    } catch (caught) {
+      deps.logger.error({ err: caught }, "mcp route data deps failed");
+      return c.json(
+        jsonError(500, "SERVER_NOT_CONFIGURED", String(caught)),
+        500,
+      );
+    }
+  }
+
+  // Owner's-Claude path: PS holds the per-connection grantee key and signs.
+  async function handleConnectionRead(
+    c: Context,
+    record: Awaited<ReturnType<McpConnectionStore["getByTokenHash"]>> & object,
+  ) {
+    const dataApiDeps = dataApiDepsOrError(c);
+    if (dataApiDeps instanceof Response) return dataApiDeps;
+    const granteeAccount = loadMcpGranteeAccount({
+      address: record.granteeAddress,
+      publicKey: record.granteePublicKey,
+      encryptedPrivateKey: record.encryptedGranteePrivateKey,
+    });
+    const readClient = createMcpDataReadClient({
+      serverOrigin: resolveOrigin(deps.serverOrigin),
+      granteeAccount,
+      dataApiDeps,
+    });
+    const response = await handleMcpStreamableHttpRequest(c.req.raw, {
+      connection: record,
+      readClient,
+      activityRecorder: deps.activityRecorder,
+    });
+    void store
+      .update(record.id, { lastUsedAt: new Date().toISOString() })
+      .catch((err) => {
+        console.warn("[mcp] failed to update lastUsedAt", err);
+      });
+    return response;
+  }
+
+  // Chatbot-first path (Option A): the app self-signed the handshake, so the PS
+  // holds NO key. We authorize reads as the app via a session auth port; the
+  // read client's own signature (with a throwaway key) is ignored.
+  async function handleSessionRead(
+    c: Context,
+    session: Awaited<ReturnType<McpSessionStore["getByTokenHash"]>> & object,
+  ) {
+    // Fail closed: if x402 is enabled but the gateway isn't fully configured,
+    // refuse the read rather than silently serving it for free.
+    if (deps.paymentEnabled && !deps.gatewayConfig?.url) {
+      return c.json(
+        jsonError(
+          500,
+          "SERVER_NOT_CONFIGURED",
+          "x402 payment is enabled but the gateway URL is not configured",
+        ),
+        500,
+      );
+    }
+
+    const baseDeps = dataApiDepsOrError(c);
+    if (baseDeps instanceof Response) return baseDeps;
+
+    // Paid session: wire x402 for this self-signing session only. Owner/OAuth
+    // reads never build this, so they stay free.
+    let payment: McpSessionPaymentConfig | undefined;
+    const gatewayUrl = deps.gatewayConfig?.url;
+    if (deps.paymentEnabled && deps.gatewayConfig && gatewayUrl) {
+      payment = {
+        dataApiDeps: {
+          ...baseDeps,
+          gateway: deps.gateway,
+          gatewayConfig: deps.gatewayConfig,
+          gatewayUrl,
+          serverOwner: deps.serverOwner,
+          serverSigner: deps.serverSigner,
+          serverAddress: deps.serverAddress,
+          paymentEnabled: true,
+        },
+        gateway: deps.gateway,
+        gatewayConfig: deps.gatewayConfig,
+        gatewayUrl,
+      };
+    }
+
+    const auth = createMcpSessionAuthPort({
+      builderAddress: session.builderAddress,
+      grantId: session.grantId,
+      authSessionVerifier: deps.gateway,
+      grantVerifier: deps.gateway,
+      runtimeAvailability: deps.runtimeAvailability,
+      payment,
+    });
+    const { connection, account } = buildMcpSessionConnection(session);
+    const readClient = createMcpDataReadClient({
+      serverOrigin: resolveOrigin(deps.serverOrigin),
+      granteeAccount: account,
+      dataApiDeps: { ...baseDeps, auth },
+      // Paid session: mark reads as x402-enforced so tools skip any
+      // payment-bypassing shortcut (e.g. the searchScopeIndex preview path).
+      enforcesPayment: Boolean(payment),
+    });
+    return handleMcpStreamableHttpRequest(c.req.raw, {
+      connection,
+      readClient,
+      activityRecorder: deps.activityRecorder,
+    });
   }
 
   async function handleToken(
@@ -692,52 +839,110 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
     }
     const tokenHash = await hashConnectionToken(rawToken);
     const record = await store.getByTokenHash(tokenHash);
-    if (!record) {
-      if (!options.oauthChallenge) {
-        return c.json(
-          jsonError(401, "INVALID_TOKEN", "Unknown or revoked MCP connection"),
-          401,
-        );
-      }
-      return mcpUnauthorized(
-        resolveOrigin(deps.serverOrigin),
-        "Unknown or revoked MCP connection",
-      );
-    }
-    let dataApiDeps: PersonalServerDataApiDeps;
-    try {
-      dataApiDeps = buildDataApiDeps(deps);
-    } catch (caught) {
-      deps.logger.error({ err: caught }, "mcp route data deps failed");
+    if (record) return handleConnectionRead(c, record);
+    const session = await sessionStore.getByTokenHash(tokenHash);
+    if (session) return handleSessionRead(c, session);
+    if (!options.oauthChallenge) {
       return c.json(
-        jsonError(500, "SERVER_NOT_CONFIGURED", String(caught)),
-        500,
+        jsonError(401, "INVALID_TOKEN", "Unknown or revoked MCP connection"),
+        401,
       );
     }
-    const granteeAccount = loadMcpGranteeAccount({
-      address: record.granteeAddress,
-      publicKey: record.granteePublicKey,
-      encryptedPrivateKey: record.encryptedGranteePrivateKey,
-    });
-    const readClient = createMcpDataReadClient({
-      serverOrigin: resolveOrigin(deps.serverOrigin),
-      granteeAccount,
-      dataApiDeps,
-    });
-    const response = await handleMcpStreamableHttpRequest(c.req.raw, {
-      connection: record,
-      readClient,
-      activityRecorder: deps.activityRecorder,
-    });
-    void store
-      .update(record.id, {
-        lastUsedAt: new Date().toISOString(),
-      })
-      .catch((err) => {
-        console.warn("[mcp] failed to update lastUsedAt", err);
-      });
-    return response;
+    return mcpUnauthorized(
+      resolveOrigin(deps.serverOrigin),
+      "Unknown or revoked MCP connection",
+    );
   }
+
+  // Self-signing handshake (Option A): the app proves control of its key + DCR
+  // grant with a Web3Signed proof, and gets a short-lived bearer session token.
+  // Registered BEFORE `/:connectionToken` so it isn't captured as a token.
+  app.post("/session", async (c) => {
+    let authResult;
+    try {
+      authResult = await authenticateRequest({
+        request: c.req.raw,
+        serverOrigin: deps.serverOrigin,
+        devToken: deps.devToken,
+        accessToken: deps.accessToken,
+        sessionTokenVerifier: deps.tokenStore,
+        serverOwner: deps.serverOwner,
+      });
+    } catch (err) {
+      return c.json(
+        jsonError(
+          401,
+          "MCP_SESSION_AUTH_FAILED",
+          err instanceof Error ? err.message : String(err),
+        ),
+        401,
+      );
+    }
+    if (authResult.mechanism !== "web3-signed") {
+      return c.json(
+        jsonError(
+          401,
+          "MCP_SESSION_PROOF_REQUIRED",
+          "POST /mcp/session requires a Web3Signed proof signed by the app key",
+        ),
+        401,
+      );
+    }
+    const grantId = authResult.auth.payload.grantId;
+    if (!grantId) {
+      return c.json(
+        jsonError(
+          400,
+          "GRANT_ID_REQUIRED",
+          "The Web3Signed proof must carry a grantId (the DCR grant issued to the app)",
+        ),
+        400,
+      );
+    }
+    // Replay guard: bind to a digest of the exact proof header, remembered
+    // until the proof's own expiry (a replay only matters while still valid).
+    const proofHeader = c.req.raw.headers.get("authorization") ?? "";
+    const proofId = createHash("sha256").update(proofHeader).digest("hex");
+    const expSec = authResult.auth.payload.exp;
+    const expiresAtMs =
+      (typeof expSec === "number"
+        ? expSec
+        : Math.floor(Date.now() / 1000) + 300) * 1000;
+    try {
+      const session = await createMcpSession(
+        {
+          builderAddress: authResult.auth.signer,
+          grantId,
+          proof: { id: proofId, expiresAtMs },
+        },
+        {
+          store: sessionStore,
+          authSessionVerifier: deps.gateway,
+          grantVerifier: deps.gateway,
+          randomToken: () => `vana_mcp_${randomBytes(32).toString("hex")}`,
+          replayStore: proofReplayStore,
+        },
+      );
+      return c.json({
+        access_token: session.accessToken,
+        token_type: "Bearer",
+        expires_in: session.expiresInSeconds,
+        scope: session.scopes.join(" "),
+      });
+    } catch (err) {
+      if (err instanceof ProtocolError) {
+        return c.json(err.toJSON(), err.code as 400 | 401 | 403 | 404);
+      }
+      return c.json(
+        jsonError(
+          400,
+          "MCP_SESSION_FAILED",
+          err instanceof Error ? err.message : String(err),
+        ),
+        400,
+      );
+    }
+  });
 
   app.all("/", async (c) =>
     handleToken(c, bearerToken(c.req.raw), {
