@@ -129,6 +129,10 @@ export function createServerApiAuth(
         return { builder: result.auth.signer, grantId: "owner" };
       }
 
+      // Fail closed: a builder grant read can't be authorized if we can't
+      // identify this server's owner to bind the grant to.
+      if (!deps.serverOwner) throw serverNotConfigured();
+
       const selectedEntry = deps.dataStorage?.findEntry({
         scope: input.scope,
         fileId: input.fileId,
@@ -139,6 +143,7 @@ export function createServerApiAuth(
           grantId: result.auth.payload.grantId ?? input.grantId,
           requestedScope: input.scope,
           fileId: input.fileId ?? selectedEntry?.fileId ?? undefined,
+          serverOwner: deps.serverOwner,
         },
         {
           authSessionVerifier: deps.gateway,

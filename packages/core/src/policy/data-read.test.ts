@@ -65,6 +65,7 @@ describe("verifyDataReadPolicy", () => {
         signer: BUILDER_ADDRESS,
         grantId: grant.id,
         requestedScope: "instagram.profile",
+        serverOwner: "0xOwner",
       },
       {
         authSessionVerifier: { getBuilder: vi.fn().mockResolvedValue(builder) },
@@ -75,6 +76,91 @@ describe("verifyDataReadPolicy", () => {
     expect(result).toBe(grant);
   });
 
+  it("passes when serverOwner matches the grant's grantor", async () => {
+    const grant = makeGrant({ grantorAddress: "0xOwner" });
+    const result = await verifyDataReadPolicy(
+      {
+        signer: BUILDER_ADDRESS,
+        grantId: grant.id,
+        requestedScope: "instagram.profile",
+        serverOwner: "0xOwner",
+      },
+      {
+        authSessionVerifier: { getBuilder: vi.fn().mockResolvedValue(builder) },
+        grantVerifier: { getGrant: vi.fn().mockResolvedValue(grant) },
+      },
+    );
+    expect(result).toBe(grant);
+  });
+
+  it("rejects GRANT_OWNER_MISMATCH when the grantor is a different owner", async () => {
+    // A grant issued by 0xOwner must not be honored by a server owned by
+    // someone else, even if grantee + scope check out.
+    const grant = makeGrant({ grantorAddress: "0xOwner" });
+    await expect(
+      verifyDataReadPolicy(
+        {
+          signer: BUILDER_ADDRESS,
+          grantId: grant.id,
+          requestedScope: "instagram.profile",
+          serverOwner: "0xSomeoneElse",
+        },
+        {
+          authSessionVerifier: {
+            getBuilder: vi.fn().mockResolvedValue(builder),
+          },
+          grantVerifier: { getGrant: vi.fn().mockResolvedValue(grant) },
+        },
+      ),
+    ).rejects.toMatchObject({ errorCode: "GRANT_OWNER_MISMATCH" });
+  });
+
+  it("fails closed with SERVER_NOT_CONFIGURED when serverOwner is absent", async () => {
+    // A read must never be authorized when the server can't identify its own
+    // owner — otherwise the ownership binding silently no-ops.
+    const grant = makeGrant();
+    await expect(
+      verifyDataReadPolicy(
+        {
+          signer: BUILDER_ADDRESS,
+          grantId: grant.id,
+          requestedScope: "instagram.profile",
+          // Simulate an untyped / JS caller passing no owner — the runtime
+          // guard must still fail closed (the type now requires serverOwner).
+          serverOwner: undefined as unknown as `0x${string}`,
+        },
+        {
+          authSessionVerifier: {
+            getBuilder: vi.fn().mockResolvedValue(builder),
+          },
+          grantVerifier: { getGrant: vi.fn().mockResolvedValue(grant) },
+        },
+      ),
+    ).rejects.toMatchObject({ errorCode: "SERVER_NOT_CONFIGURED" });
+  });
+
+  it("fails closed with GRANT_OWNER_MISMATCH when the grant has no grantor", async () => {
+    // Gateway responses are untrusted runtime data despite their type — a grant
+    // with a missing grantor must be rejected, not treated as a match.
+    const grant = makeGrant({ grantorAddress: "" });
+    await expect(
+      verifyDataReadPolicy(
+        {
+          signer: BUILDER_ADDRESS,
+          grantId: grant.id,
+          requestedScope: "instagram.profile",
+          serverOwner: "0xOwner",
+        },
+        {
+          authSessionVerifier: {
+            getBuilder: vi.fn().mockResolvedValue(builder),
+          },
+          grantVerifier: { getGrant: vi.fn().mockResolvedValue(grant) },
+        },
+      ),
+    ).rejects.toMatchObject({ errorCode: "GRANT_OWNER_MISMATCH" });
+  });
+
   it("returns GRANT_REVOKED when grant.revokedAt is set", async () => {
     await expect(
       verifyDataReadPolicy(
@@ -82,6 +168,7 @@ describe("verifyDataReadPolicy", () => {
           signer: BUILDER_ADDRESS,
           grantId: "grant-123",
           requestedScope: "instagram.profile",
+          serverOwner: "0xOwner",
         },
         {
           authSessionVerifier: {
@@ -106,6 +193,7 @@ describe("verifyDataReadPolicy", () => {
           signer: BUILDER_ADDRESS,
           grantId: "grant-123",
           requestedScope: "instagram.profile",
+          serverOwner: "0xOwner",
         },
         {
           authSessionVerifier: {
@@ -132,6 +220,7 @@ describe("verifyDataReadPolicy", () => {
         signer: BUILDER_ADDRESS,
         grantId: grant.id,
         requestedScope: "instagram.profile",
+        serverOwner: "0xOwner",
       },
       {
         authSessionVerifier: { getBuilder: vi.fn().mockResolvedValue(builder) },
@@ -149,6 +238,7 @@ describe("verifyDataReadPolicy", () => {
         signer: BUILDER_ADDRESS,
         grantId: grant.id,
         requestedScope: "instagram.profile",
+        serverOwner: "0xOwner",
       },
       {
         authSessionVerifier: { getBuilder: vi.fn().mockResolvedValue(builder) },
@@ -165,6 +255,7 @@ describe("verifyDataReadPolicy", () => {
         signer: BUILDER_ADDRESS,
         grantId: grant.id,
         requestedScope: "instagram.profile",
+        serverOwner: "0xOwner",
       },
       {
         authSessionVerifier: { getBuilder: vi.fn().mockResolvedValue(builder) },
@@ -181,6 +272,7 @@ describe("verifyDataReadPolicy", () => {
           signer: BUILDER_ADDRESS,
           grantId: "grant-123",
           requestedScope: "instagram.profile",
+          serverOwner: "0xOwner",
         },
         {
           authSessionVerifier: {
@@ -203,6 +295,7 @@ describe("verifyDataReadPolicy", () => {
           signer: BUILDER_ADDRESS,
           grantId: "grant-empty",
           requestedScope: "instagram.profile",
+          serverOwner: "0xOwner",
         },
         {
           authSessionVerifier: {
@@ -223,6 +316,7 @@ describe("verifyDataReadPolicy", () => {
           signer: BUILDER_ADDRESS,
           grantId: "grant-123",
           requestedScope: "instagram.profile",
+          serverOwner: "0xOwner",
         },
         {
           authSessionVerifier: {
@@ -245,6 +339,7 @@ describe("verifyDataReadPolicy", () => {
           signer: BUILDER_ADDRESS,
           grantId: "grant-123",
           requestedScope: "instagram.profile",
+          serverOwner: "0xOwner",
         },
         {
           authSessionVerifier: { getBuilder: vi.fn().mockResolvedValue(null) },
@@ -260,6 +355,7 @@ describe("verifyDataReadPolicy", () => {
         {
           signer: BUILDER_ADDRESS,
           requestedScope: "instagram.profile",
+          serverOwner: "0xOwner",
         },
         {
           authSessionVerifier: {
@@ -278,6 +374,7 @@ describe("verifyDataReadPolicy", () => {
           signer: BUILDER_ADDRESS,
           grantId: "grant-missing",
           requestedScope: "instagram.profile",
+          serverOwner: "0xOwner",
         },
         {
           authSessionVerifier: {
@@ -296,6 +393,7 @@ describe("verifyDataReadPolicy", () => {
           signer: BUILDER_ADDRESS,
           grantId: "grant-123",
           requestedScope: "instagram.profile",
+          serverOwner: "0xOwner",
         },
         {
           authSessionVerifier: {
