@@ -2,11 +2,13 @@ import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
 import { scopeCoveredByGrant } from "@opendatalabs/vana-sdk/browser";
 import {
   GrantExpiredError,
+  GrantOwnerMismatchError,
   GrantRequiredError,
   GrantRevokedError,
   InvalidSignatureError,
   PsUnavailableError,
   ScopeMismatchError,
+  ServerNotConfiguredError,
   UnregisteredBuilderError,
 } from "../errors/catalog.js";
 import {
@@ -22,6 +24,13 @@ export interface DataReadPolicyInput {
   // fileId is retained on the input shape for backwards-compat with callers
   // that pass it; the canary policy no longer enforces fileId pinning.
   fileId?: string;
+  /**
+   * This server's owner address. The grant's grantor MUST equal it — a grant
+   * issued by a different owner is rejected. Required (not optional) so that
+   * TypeScript flags any caller that fails to bind the read to the server
+   * owner; the check also fails closed at runtime for untyped/JS callers.
+   */
+  serverOwner: `0x${string}`;
 }
 
 export interface DataReadPolicyPorts {
@@ -121,6 +130,29 @@ export async function verifyDataReadPolicy(
       reason: "Request signer is not the grant builder",
       expected: grant.granteeId,
       actual: input.signer,
+    });
+  }
+
+  // Ownership binding — the grant MUST have been issued by THIS server's owner.
+  // Otherwise any PS holding the requested scope's data would serve it under a
+  // grant issued by a *different* owner (the happy-path binding is the app
+  // resolving the grantor's own PS via serverAddress — a convention, not an
+  // enforcement). Fail CLOSED: a missing serverOwner (server misconfig) or a
+  // grant with no grantor (gateway responses are untrusted runtime data,
+  // despite their type) must reject, never skip the check.
+  if (!input.serverOwner) {
+    throw new ServerNotConfiguredError({
+      reason: "serverOwner is required to verify grant ownership",
+    });
+  }
+  if (
+    !grant.grantorAddress ||
+    grant.grantorAddress.toLowerCase() !== input.serverOwner.toLowerCase()
+  ) {
+    throw new GrantOwnerMismatchError({
+      grantId: grant.id,
+      expected: input.serverOwner,
+      actual: grant.grantorAddress ?? null,
     });
   }
 
