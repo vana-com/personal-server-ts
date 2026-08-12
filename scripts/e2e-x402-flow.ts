@@ -149,8 +149,13 @@ const GATEWAY_CONFIG: DataPortabilityGatewayConfig = {
   },
 };
 
-const FUNDER_PRIVATE_KEY = (process.env["FUNDER_PRIVATE_KEY"] ??
-  "0xREDACTED_LEAKED_KEY_REMOVED_SEE_INCIDENT_2026_07_31") as Hex;
+const FUNDER_PRIVATE_KEY = process.env["FUNDER_PRIVATE_KEY"] as Hex;
+if (!FUNDER_PRIVATE_KEY) {
+  throw new Error(
+    "FUNDER_PRIVATE_KEY environment variable is required. " +
+      "This script previously contained a hardcoded fallback key, which has been removed.",
+  );
+}
 const DEPOSIT_AMOUNT = parseEther(process.env["DEPOSIT_AMOUNT"] ?? "0.1");
 const SCOPE = process.env["SCOPE"] ?? "instagram.profile";
 const APP_URL = process.env["APP_URL"] ?? "https://example-app.test";
