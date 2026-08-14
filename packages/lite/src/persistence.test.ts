@@ -12,10 +12,10 @@
  * record shape + plaintext-at-rest behavior are preserved.
  */
 
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import forge from "node-forge";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { privateKeyToAccount } from "viem/accounts";
+import { buildPersonalServerLiteOwnerBindingMessage } from "@opendatalabs/vana-sdk/protocol/personal-server-lite-owner-binding";
 import { createBearerTokenPsLiteAuth, createPsLiteRuntime } from "./runtime.js";
 import {
   assertCompletePsLitePersistenceBundle,
@@ -45,8 +45,15 @@ import {
   createInMemoryMcpOAuthAuthorizationStore,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 
-const SERVER_OWNER = "0x0000000000000000000000000000000000000001" as const;
-const OWNER_SIGNATURE = `0x${"ab".repeat(65)}` as `0x${string}`;
+const ownerAccount = privateKeyToAccount(`0x${"11".repeat(32)}`);
+const SERVER_OWNER = ownerAccount.address;
+let OWNER_SIGNATURE: `0x${string}`;
+
+beforeAll(async () => {
+  OWNER_SIGNATURE = await ownerAccount.signMessage({
+    message: buildPersonalServerLiteOwnerBindingMessage(SERVER_OWNER),
+  });
+});
 
 function ownerAuth() {
   return createBearerTokenPsLiteAuth({
@@ -121,6 +128,25 @@ function registrationRuntimeOverBundle(bundle: PsLitePersistenceBundle) {
         },
       },
     },
+  });
+}
+
+function startServerOverBundle(
+  bundle: PsLitePersistenceBundle,
+  options: Partial<Parameters<typeof startPersonalServer>[0]> = {},
+) {
+  return startPersonalServer({
+    ownerAddress: SERVER_OWNER,
+    ownerSignature: OWNER_SIGNATURE,
+    persistence: bundle,
+    gateway: createMockPsLiteGateway(),
+    auth: ownerAuth(),
+    configDefaults: {
+      server: { origin: "https://ps.local" },
+      gateway: { url: "https://gateway.local" },
+      sync: { enabled: false },
+    },
+    ...options,
   });
 }
 
@@ -589,6 +615,20 @@ describe("relay TLS identity — injected store vs browser localStorage default"
 });
 
 describe("startPersonalServer relay persistence wiring", () => {
+  it("rejects a prebuilt runtime beside a complete persistence bundle", async () => {
+    const bundle = memoryBundle();
+
+    await expect(
+      startPersonalServer({
+        runtime: registrationRuntimeOverBundle(bundle),
+        persistence: bundle,
+        relay: false,
+      }),
+    ).rejects.toThrow(
+      "runtime cannot be supplied with a complete persistence bundle",
+    );
+  });
+
   it("rejects a relay-state override beside a complete persistence bundle", async () => {
     await expect(
       startPersonalServer({
@@ -620,9 +660,7 @@ describe("startPersonalServer relay persistence wiring", () => {
       send: vi.fn(),
       close: vi.fn(),
     };
-    const server = await startPersonalServer({
-      runtime: runtimeOverBundle(bundle),
-      persistence: bundle,
+    const server = await startServerOverBundle(bundle, {
       relay: {
         sessionId: "native-session",
         webSocketFactory: () => socket,
@@ -654,11 +692,8 @@ describe("startPersonalServer relay persistence wiring", () => {
     }));
     const relay = { publicSuffix: "relay.example", webSocketFactory };
 
-    const first = await startPersonalServer({
-      runtime: registrationRuntimeOverBundle(bundle),
-      persistence: bundle,
+    const first = await startServerOverBundle(bundle, {
       relay,
-      gateway: createMockPsLiteGateway(),
     });
     const firstInfo = await first.info();
     await first.submitRegistration({ signature: "0xregistration" });
@@ -667,11 +702,8 @@ describe("startPersonalServer relay persistence wiring", () => {
     });
     await first.stop();
 
-    const restarted = await startPersonalServer({
-      runtime: registrationRuntimeOverBundle(bundle),
-      persistence: bundle,
+    const restarted = await startServerOverBundle(bundle, {
       relay,
-      gateway: createMockPsLiteGateway(),
     });
     await expect(restarted.info()).resolves.toMatchObject({
       urls: { public: firstInfo.urls.public },
@@ -709,38 +741,4 @@ describe("startPersonalServer relay persistence wiring", () => {
       vi.unstubAllGlobals();
     }
   });
-});
-
-describe("guard: runtime/composition code has no hidden browser persistence", () => {
-  // The bundle contract + the HTTP runtime are the "runtime code outside
-  // explicit browser adapters". They must never reach a browser storage global
-  // directly — every persistence access flows through an injected port.
-  const RUNTIME_FILES = [
-    "./runtime.ts",
-    "./persistence.ts",
-    "./client.ts",
-    "./relay.ts",
-  ];
-  const FORBIDDEN = [
-    /\blocalStorage\b/,
-    /\bindexedDB\b/,
-    /\bnavigator\.storage\b/,
-    /getDirectory/,
-    /\bOPFS\b/,
-  ];
-
-  for (const relative of RUNTIME_FILES) {
-    it(`${relative} contains no direct IndexedDB/OPFS/localStorage access`, () => {
-      const source = readFileSync(
-        fileURLToPath(new URL(relative, import.meta.url)),
-        "utf8",
-      );
-      for (const pattern of FORBIDDEN) {
-        expect(
-          pattern.test(source),
-          `${relative} must not reference ${pattern}`,
-        ).toBe(false);
-      }
-    });
-  }
 });

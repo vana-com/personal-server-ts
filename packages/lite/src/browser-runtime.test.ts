@@ -5,10 +5,12 @@
  * environment. Browser defaults remain exercised by the existing suite.
  */
 
-import { beforeAll, describe, expect, it } from "vitest";
+import { IDBFactory } from "fake-indexeddb";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
 import { buildPersonalServerLiteOwnerBindingMessage } from "@opendatalabs/vana-sdk/protocol/personal-server-lite-owner-binding";
 import { createIndexedDbPsLiteRuntime } from "./browser-runtime.js";
+import { startPersonalServer } from "./client.js";
 import { createBearerTokenPsLiteAuth } from "./runtime.js";
 import type { PsLitePersistenceBundle } from "./persistence.js";
 import {
@@ -25,6 +27,10 @@ import {
 
 let ownerAddress: `0x${string}`;
 let ownerSignature: `0x${string}`;
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 beforeAll(async () => {
   const account = privateKeyToAccount(`0x${"11".repeat(32)}`);
@@ -101,6 +107,41 @@ describe("createIndexedDbPsLiteRuntime persistence injection", () => {
     expect(persisted?.address).toBe(built.identity.account.address);
   });
 
+  it("uses a complete bundle without touching browser persistence globals", async () => {
+    const unavailable = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error("browser persistence must not be accessed");
+        },
+      },
+    );
+    vi.stubGlobal("indexedDB", unavailable);
+    vi.stubGlobal("localStorage", unavailable);
+    vi.stubGlobal("navigator", { storage: unavailable });
+    const bundle = memoryBundle();
+
+    const server = await startPersonalServer({
+      ownerAddress,
+      ownerSignature,
+      persistence: bundle,
+      gateway: createMockPsLiteGateway(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+      },
+      relay: false,
+    });
+
+    await expect(server.ready()).resolves.toMatchObject({ status: "ready" });
+    await server.stop();
+  });
+
   it("serves data through the injected storage across a runtime restart", async () => {
     const bundle = memoryBundle();
 
@@ -121,6 +162,54 @@ describe("createIndexedDbPsLiteRuntime persistence injection", () => {
     // durability comes from the native store, not the runtime instance.
     const rebooted = await build(bundle);
     const list = await rebooted.runtime.fetch(
+      new Request("https://ps.local/v1/data", {
+        headers: { Authorization: "Bearer owner-token" },
+      }),
+    );
+    expect(list.status).toBe(200);
+    await expect(list.json()).resolves.toMatchObject({
+      scopes: [{ scope: "instagram.profile" }],
+      total: 1,
+    });
+  });
+});
+
+describe("createIndexedDbPsLiteRuntime browser defaults", () => {
+  it("preserves data across restarts using the default IndexedDB stores", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const dbName = "ps-lite-browser-defaults";
+    const options = {
+      ownerAddress,
+      ownerSignature,
+      dbName,
+      storageDbName: `${dbName}-storage`,
+      gateway: createMockPsLiteGateway(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+      },
+    };
+
+    const first = await createIndexedDbPsLiteRuntime(options);
+    const write = await first.runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer owner-token",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ username: "browser_user" }),
+      }),
+    );
+    expect(write.status).toBe(201);
+
+    const restarted = await createIndexedDbPsLiteRuntime(options);
+    const list = await restarted.runtime.fetch(
       new Request("https://ps.local/v1/data", {
         headers: { Authorization: "Bearer owner-token" },
       }),

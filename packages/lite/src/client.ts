@@ -89,6 +89,11 @@ export interface StartPersonalServerLiteOptions extends Omit<
 export async function startPersonalServer(
   options: StartPersonalServerLiteOptions,
 ): Promise<PersonalServerHandle> {
+  if (options.persistence && options.runtime) {
+    throw new Error(
+      "runtime cannot be supplied with a complete persistence bundle",
+    );
+  }
   if (options.persistence && options.relayStateStore) {
     throw new Error(
       "relayStateStore cannot be supplied with a complete persistence bundle",
