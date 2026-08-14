@@ -29,6 +29,10 @@ import {
 import { createPsLiteSyncManager } from "./sync.js";
 import { resolvePsLiteOwner } from "./owner-binding.js";
 import { DiagnosticsRecorder } from "./diagnostics.js";
+import {
+  assertCompletePsLitePersistenceBundle,
+  type PsLitePersistenceBundle,
+} from "./persistence.js";
 
 export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   PsLiteRuntimeOptions,
@@ -52,6 +56,14 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   configDefaults?: Partial<ServerConfig>;
   dataFileStore?: PsLiteDataFileStore;
   logger?: Logger;
+  /**
+   * Inject host-owned persistence ports (Mobile native SQLite/filesystem) in
+   * place of the browser IndexedDB defaults, without giving up this factory's
+   * identity/config/sync/auth/signer composition. This is all-or-nothing:
+   * either omit it for the default Web IndexedDB/OPFS path, or provide every
+   * port for a host-owned persistence implementation.
+   */
+  persistence?: PsLitePersistenceBundle;
 }
 
 export interface IndexedDbPsLiteRuntime {
@@ -69,10 +81,17 @@ export async function createIndexedDbPsLiteRuntime(
   options: IndexedDbPsLiteRuntimeOptions,
 ): Promise<IndexedDbPsLiteRuntime> {
   const dbName = options.dbName ?? "personal-server-lite";
-  const stateStore = createIndexedDbPsLiteStateStore({
-    dbName,
-    storeName: options.stateStoreName ?? "state",
-  });
+  const injected = options.persistence;
+  if (injected !== undefined) assertCompletePsLitePersistenceBundle(injected);
+  // No bundle preserves the Web IndexedDB/OPFS path. A supplied bundle has
+  // already been validated as complete, so hosts never silently mix native and
+  // browser persistence. Config, identity, and sync remain generic over state.
+  const stateStore =
+    injected?.state ??
+    createIndexedDbPsLiteStateStore({
+      dbName,
+      storeName: options.stateStoreName ?? "state",
+    });
   const config = await loadOrCreatePsLiteConfig(
     stateStore,
     options.configDefaults,
@@ -81,23 +100,29 @@ export async function createIndexedDbPsLiteRuntime(
     store: stateStore,
     ownerSignature: options.ownerSignature,
   });
-  const tokenStore = createIndexedDbPsLiteTokenStore({
-    dbName,
-    storeName: "tokens",
-  });
-  const accessLogStore = createIndexedDbPsLiteAccessLogStore({
-    dbName,
-    storeName: "accessLogs",
-  });
-  const storage = await createPersistentPsLiteStorage(
-    { kind: "indexeddb" },
-    createIndexedDbPsLitePersistence({
-      dbName: options.storageDbName ?? `${dbName}-storage`,
-      storeName: options.storageStoreName ?? "state",
-      key: options.storageKey ?? "data-storage-v1",
-    }),
-    options.dataFileStore,
-  );
+  const tokenStore =
+    injected?.tokens ??
+    createIndexedDbPsLiteTokenStore({
+      dbName,
+      storeName: "tokens",
+    });
+  const accessLogStore =
+    injected?.accessLog ??
+    createIndexedDbPsLiteAccessLogStore({
+      dbName,
+      storeName: "accessLogs",
+    });
+  const storage =
+    injected?.storage ??
+    (await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      createIndexedDbPsLitePersistence({
+        dbName: options.storageDbName ?? `${dbName}-storage`,
+        storeName: options.storageStoreName ?? "state",
+        key: options.storageKey ?? "data-storage-v1",
+      }),
+      options.dataFileStore,
+    ));
   const gateway = options.gateway ?? createGatewayClient(config.gateway.url);
   const serverOwner = await resolvePsLiteOwner({
     ownerAddress: options.ownerAddress,
@@ -163,10 +188,15 @@ export async function createIndexedDbPsLiteRuntime(
       const saved = await savePsLiteConfig(stateStore, nextConfig);
       Object.assign(config, saved);
     },
-    stateCapabilities: { config: "indexeddb" },
+    stateCapabilities: { config: injected?.state ? "custom" : "indexeddb" },
     tokenStore,
     accessLogReader: accessLogStore,
     accessLogWriter: accessLogStore,
+    // A complete host bundle owns both MCP records too. Direct options remain
+    // available only on the default Web path for backwards compatibility.
+    mcpConnectionStore: injected?.mcpConnections ?? options.mcpConnectionStore,
+    mcpOAuthAuthorizationStore:
+      injected?.mcpOAuthAuthorizations ?? options.mcpOAuthAuthorizationStore,
   });
   runtimeRef = runtime;
 

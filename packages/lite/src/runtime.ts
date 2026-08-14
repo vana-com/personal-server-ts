@@ -77,10 +77,9 @@ import {
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import type { PsLiteStorageCapabilities } from "./storage.js";
 import {
-  createIndexedDbPsLiteAccessLogStore,
-  createIndexedDbPsLiteStateStore,
-  createIndexedDbPsLiteTokenStore,
-  savePsLiteConfig,
+  createDefaultPsLiteAccessLogStore,
+  createDefaultPsLiteSaveConfig,
+  createDefaultPsLiteTokenStore,
 } from "./state.js";
 import {
   collectDiagnosticsWithTimeout,
@@ -469,19 +468,6 @@ function toDataStoragePort(
   );
 }
 
-function indexedDbAvailable(): boolean {
-  return typeof indexedDB !== "undefined";
-}
-
-function createDefaultAccessLogStore(): AccessLogReader & AccessLogWriter {
-  if (!indexedDbAvailable()) {
-    throw new Error(
-      "IndexedDB is required for default PS Lite access log persistence.",
-    );
-  }
-  return createIndexedDbPsLiteAccessLogStore();
-}
-
 function createLogId(): string {
   return globalThis.crypto?.randomUUID?.() ?? `log-${Date.now()}`;
 }
@@ -492,25 +478,6 @@ function randomHex(byteLength: number): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
     "",
   );
-}
-
-function createDefaultTokenStore(): PsLiteTokenStore {
-  if (!indexedDbAvailable()) {
-    throw new Error("IndexedDB is required for default PS Lite token storage.");
-  }
-  return createIndexedDbPsLiteTokenStore();
-}
-
-function createDefaultSaveConfig(): (config: unknown) => Promise<void> {
-  if (!indexedDbAvailable()) {
-    throw new Error(
-      "IndexedDB is required for default PS Lite config persistence.",
-    );
-  }
-  const stateStore = createIndexedDbPsLiteStateStore();
-  return async (nextConfig: unknown) => {
-    await savePsLiteConfig(stateStore, nextConfig);
-  };
 }
 
 function bearerToken(request: Request): string | null {
@@ -533,12 +500,12 @@ export function createPsLiteRuntime(
   let accessLogReader = options.accessLogReader;
   let accessLogWriter = options.accessLogWriter;
   if (!accessLogReader || !accessLogWriter) {
-    const accessLogStore = createDefaultAccessLogStore();
+    const accessLogStore = createDefaultPsLiteAccessLogStore();
     accessLogReader ??= accessLogStore;
     accessLogWriter ??= accessLogStore;
   }
-  const tokenStore = options.tokenStore ?? createDefaultTokenStore();
-  const saveConfig = options.saveConfig ?? createDefaultSaveConfig();
+  const tokenStore = options.tokenStore ?? createDefaultPsLiteTokenStore();
+  const saveConfig = options.saveConfig ?? createDefaultPsLiteSaveConfig();
 
   // x402 readiness. Paid reads need a COMPLETE gateway config (url + chainId +
   // the escrow/dataRegistry contracts that back the EIP-712 domains). A partial

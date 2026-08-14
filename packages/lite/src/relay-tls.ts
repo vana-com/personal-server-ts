@@ -14,10 +14,36 @@ const TLS_IDENTITY_CACHE_KEY = "personal-server-lite-tls-identity-v1";
 const DEFAULT_PUBLIC_SUFFIX = "34.16.49.200.sslip.io";
 const DEFAULT_ISSUE_CERT_TIMEOUT_MS = 60_000;
 
+/**
+ * Persistence port for the relay's issued TLS identity. PS Lite runtime code
+ * resolves the cached cert through this injected store instead of reaching for
+ * `globalThis.localStorage` directly, so a non-browser host (Mobile) can back
+ * it with app-private storage. Browser callers get the localStorage-backed
+ * default via {@link createLocalStoragePsLiteRelayTlsIdentityStore}.
+ */
+export interface PsLiteRelayTlsIdentityStore {
+  read(
+    hostname: string,
+  ): Promise<PsLiteRelayTlsIdentity | null> | PsLiteRelayTlsIdentity | null;
+  write(identity: PsLiteRelayTlsIdentity): Promise<void> | void;
+}
+
 export interface RustlsPsLiteRelayTlsOptions {
   controlUrl: string;
   publicSuffix?: string;
   certIssuerUrl?: string;
+  /**
+   * Injected persistence for the issued relay TLS identity. Omit to fall back
+   * to {@link storage} (or, if that is also omitted, the browser localStorage
+   * default). Non-browser hosts pass their own store to keep runtime code free
+   * of hidden `globalThis` access.
+   */
+  identityStore?: PsLiteRelayTlsIdentityStore;
+  /**
+   * @deprecated Prefer {@link identityStore}. A raw `Storage` is wrapped by
+   * {@link createLocalStoragePsLiteRelayTlsIdentityStore}. Retained so existing
+   * browser callers keep their exact localStorage behavior.
+   */
   storage?: Storage;
   logger?: (line: string) => void;
   /**
@@ -58,6 +84,14 @@ export function createRustlsPsLiteRelayTlsFactory(
   let trustedIdentity: PsLiteRelayTlsIdentity | undefined;
   let inFlight: Promise<PsLiteRelayTlsIdentity> | undefined;
   let inFlightToken: string | undefined;
+  // Do not create the browser default here: merely composing a relay factory
+  // must remain safe in a native/SSR host that has not injected localStorage.
+  // The default adapter is resolved only when a relay actually prepares TLS.
+  const identityStore =
+    options.identityStore ??
+    (options.storage
+      ? createLocalStoragePsLiteRelayTlsIdentityStore(options.storage)
+      : undefined);
 
   async function resolveIdentity(
     input: PsLiteRelayTlsPrepareInput,
@@ -74,7 +108,11 @@ export function createRustlsPsLiteRelayTlsFactory(
     // caller starts its own attempt; the superseded one settles harmlessly.
     const token = input.issueToken ?? "";
     if (!inFlight || (token && token !== inFlightToken)) {
-      const attempt = createTlsIdentity(input, options).finally(() => {
+      const attempt = createTlsIdentity(
+        input,
+        options,
+        identityStore ?? createLocalStoragePsLiteRelayTlsIdentityStore(),
+      ).finally(() => {
         if (inFlight === attempt) {
           inFlight = undefined;
           inFlightToken = undefined;
@@ -158,9 +196,10 @@ function normalizeTlsStep(value: unknown): PsLiteRelayTlsStep {
 async function createTlsIdentity(
   input: PsLiteRelayTlsPrepareInput,
   options: RustlsPsLiteRelayTlsOptions,
+  identityStore: PsLiteRelayTlsIdentityStore,
 ): Promise<PsLiteRelayTlsIdentity> {
   const hostname = psLiteRelayPublicHost(input.sessionId, options.publicSuffix);
-  const cached = readCachedTlsIdentity(hostname, options.storage);
+  const cached = await readCachedTlsIdentity(hostname, identityStore);
   if (cached) {
     return cached;
   }
@@ -175,7 +214,7 @@ async function createTlsIdentity(
     sessionId: input.sessionId,
     issueToken: input.issueToken ?? "",
     hostname,
-    storage: options.storage,
+    identityStore,
     logger: options.logger,
     timeoutMs: options.issueCertTimeoutMs ?? DEFAULT_ISSUE_CERT_TIMEOUT_MS,
   });
@@ -296,7 +335,7 @@ async function requestSessionCertificate(input: {
   sessionId: string;
   issueToken: string;
   hostname: string;
-  storage?: Storage;
+  identityStore: PsLiteRelayTlsIdentityStore;
   logger?: (line: string) => void;
   timeoutMs: number;
 }): Promise<PsLiteRelayTlsIdentity | undefined> {
@@ -323,7 +362,7 @@ async function fetchSessionCert(input: {
   sessionId: string;
   issueToken: string;
   hostname: string;
-  storage?: Storage;
+  identityStore: PsLiteRelayTlsIdentityStore;
   logger?: (line: string) => void;
   timeoutMs: number;
 }): Promise<PsLiteRelayTlsIdentity | undefined> {
@@ -365,7 +404,7 @@ async function fetchSessionCert(input: {
     trusted: true,
   };
   try {
-    cacheTlsIdentity(identity, input.storage);
+    await cacheTlsIdentity(identity, input.identityStore);
   } catch (error) {
     input.logger?.(
       `failed to persist session certificate (${error instanceof Error ? error.message : String(error)}); continuing with the in-memory identity`,
@@ -374,18 +413,37 @@ async function fetchSessionCert(input: {
   return identity;
 }
 
-function readCachedTlsIdentity(
-  hostname: string,
-  storage = globalThis.localStorage,
-): PsLiteRelayTlsIdentity | undefined {
-  try {
-    const raw = storage.getItem(`${TLS_IDENTITY_CACHE_KEY}:${hostname}`);
-    if (!raw) {
-      return undefined;
-    }
+/**
+ * Browser default relay TLS identity store: persists the issued cert in
+ * `localStorage`, matching PS Lite's pre-injection behavior byte for byte. This
+ * is the one place the relay TLS path is allowed to touch a browser global; the
+ * resolution logic above goes through the injected {@link PsLiteRelayTlsIdentityStore}.
+ */
+export function createLocalStoragePsLiteRelayTlsIdentityStore(
+  storage: Storage = globalThis.localStorage,
+): PsLiteRelayTlsIdentityStore {
+  return {
+    read(hostname) {
+      const raw = storage.getItem(`${TLS_IDENTITY_CACHE_KEY}:${hostname}`);
+      return raw ? (JSON.parse(raw) as PsLiteRelayTlsIdentity) : null;
+    },
+    write(identity) {
+      storage.setItem(
+        `${TLS_IDENTITY_CACHE_KEY}:${identity.hostname}`,
+        JSON.stringify(identity),
+      );
+    },
+  };
+}
 
-    const identity = JSON.parse(raw) as PsLiteRelayTlsIdentity;
+async function readCachedTlsIdentity(
+  hostname: string,
+  identityStore: PsLiteRelayTlsIdentityStore,
+): Promise<PsLiteRelayTlsIdentity | undefined> {
+  try {
+    const identity = await identityStore.read(hostname);
     if (
+      !identity ||
       identity.hostname !== hostname ||
       !identity.certPem ||
       !identity.keyPem ||
@@ -409,17 +467,14 @@ function readCachedTlsIdentity(
   }
 }
 
-function cacheTlsIdentity(
+async function cacheTlsIdentity(
   identity: PsLiteRelayTlsIdentity,
-  storage = globalThis.localStorage,
-) {
+  identityStore: PsLiteRelayTlsIdentityStore,
+): Promise<void> {
   if (identity.source !== "acme") {
     return;
   }
-  storage.setItem(
-    `${TLS_IDENTITY_CACHE_KEY}:${identity.hostname}`,
-    JSON.stringify(identity),
-  );
+  await identityStore.write(identity);
 }
 
 function firstCertificateNotAfter(certPem: string) {

@@ -34,7 +34,7 @@ describe("createPersistentPsLiteStorage", () => {
     const files = new Map<string, ReturnType<typeof createDataFileEnvelope>>();
     const readEnvelope = vi.fn(async (path: string) => files.get(path) ?? null);
     const dataFileStore: PsLiteDataFileStore = {
-      kind: "opfs",
+      kind: "custom",
       readEnvelope,
       async writeEnvelope(path, envelope) {
         files.set(path, envelope);
@@ -67,6 +67,23 @@ describe("createPersistentPsLiteStorage", () => {
 
     expect(storage.readEnvelopePreview).toBeUndefined();
     expect(readEnvelope).not.toHaveBeenCalled();
+    expect(storage.capabilities).toMatchObject({
+      metadata: "custom",
+      files: "custom",
+    });
+  });
+
+  it("keeps the browser IndexedDB fallback capability unchanged", async () => {
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      createMemoryPsLitePersistence(),
+    );
+
+    expect(storage.capabilities).toEqual({
+      metadata: "indexeddb",
+      files: "indexeddb",
+      opfsAvailable: false,
+    });
   });
 
   it("persists envelopes and index entries across storage reloads", async () => {
@@ -265,13 +282,10 @@ describe("createPersistentPsLiteStorage", () => {
       envelopes: [],
       entries: [{ path: write.relativePath }],
     });
-    expect(
-      (
-        storage as typeof storage & {
-          capabilities?: { files: string; metadata: string };
-        }
-      ).capabilities,
-    ).toMatchObject({ metadata: "indexeddb", files: "opfs" });
+    expect(storage.capabilities).toMatchObject({
+      metadata: "indexeddb",
+      files: "opfs",
+    });
   });
 
   it("persists sync index updates", async () => {
