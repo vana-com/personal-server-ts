@@ -1899,6 +1899,37 @@ describe("MCP /mcp/session (self-signing handshake)", () => {
     );
   });
 
+  it("rejects a handshake for a grant issued by a grantor that is not the server owner", async () => {
+    const { gateway, grant } = makeGatewayForGrantee({
+      granteeAddress: appWallet.address,
+      grantId: GRANT_ID,
+      scopes: ["instagram.profile"],
+    });
+    const strangerWallet = createTestWallet(22);
+    (gateway.getGrant as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...grant,
+      grantorAddress: strangerWallet.address,
+    });
+    const root = new Hono();
+    root.route(
+      "/mcp",
+      mcpStreamableHttpRoutes({
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway,
+        gatewayConfig,
+      }),
+    );
+
+    const res = await root.request("/mcp/session", {
+      method: "POST",
+      headers: { Authorization: await sessionProof() },
+    });
+    expect(res.status).toBe(403);
+    expect((await res.json()).error.errorCode).toBe("GRANT_OWNER_MISMATCH");
+  });
+
   it("fails closed on a session read when payment is enabled but the gateway is unconfigured", async () => {
     // paymentEnabled true, but NO gatewayConfig — must refuse, not serve free.
     const app = buildApp({ paymentEnabled: true });

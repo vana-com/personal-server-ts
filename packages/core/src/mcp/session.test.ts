@@ -14,10 +14,12 @@ import type {
 
 const BUILDER = "0xabc0000000000000000000000000000000000001" as const;
 const OTHER = "0xdef0000000000000000000000000000000000002" as const;
+const OWNER = "0x0000000000000000000000000000000000000aaa" as const;
 
 function grant(overrides: Record<string, unknown> = {}) {
   return {
     id: "grant_1",
+    grantorAddress: OWNER,
     granteeId: BUILDER,
     scopes: ["instagram.profile"],
     revokedAt: null,
@@ -47,6 +49,7 @@ describe("createMcpSession", () => {
         store,
         authSessionVerifier: gw,
         grantVerifier: gw,
+        serverOwner: OWNER,
         randomToken: () => "tok_test",
       },
     );
@@ -69,6 +72,7 @@ describe("createMcpSession", () => {
           store: createInMemoryMcpSessionStore(),
           authSessionVerifier: gw,
           grantVerifier: gw,
+          serverOwner: OWNER,
           randomToken: () => "t",
         },
       ),
@@ -84,6 +88,7 @@ describe("createMcpSession", () => {
           store: createInMemoryMcpSessionStore(),
           authSessionVerifier: gw,
           grantVerifier: gw,
+          serverOwner: OWNER,
           randomToken: () => "t",
         },
       ),
@@ -99,6 +104,7 @@ describe("createMcpSession", () => {
           store: createInMemoryMcpSessionStore(),
           authSessionVerifier: gw,
           grantVerifier: gw,
+          serverOwner: OWNER,
           randomToken: () => "t",
         },
       ),
@@ -111,6 +117,7 @@ describe("createMcpSession", () => {
       store: createInMemoryMcpSessionStore(),
       authSessionVerifier: gw,
       grantVerifier: gw,
+      serverOwner: OWNER,
       randomToken: () => "tok",
       replayStore: createInMemoryMcpProofReplayStore(),
     };
@@ -144,6 +151,7 @@ describe("createMcpSession", () => {
       store: createInMemoryMcpSessionStore(),
       authSessionVerifier: gw,
       grantVerifier: gw,
+      serverOwner: OWNER,
       randomToken: () => "tok",
       replayStore,
     };
@@ -178,6 +186,7 @@ describe("createMcpSession", () => {
       store: store as never,
       authSessionVerifier: gw,
       grantVerifier: gw,
+      serverOwner: OWNER,
       randomToken: () => "tok",
       replayStore,
     };
@@ -203,6 +212,7 @@ describe("createMcpSession", () => {
       store: createInMemoryMcpSessionStore(),
       authSessionVerifier: gw,
       grantVerifier: gw,
+      serverOwner: OWNER,
       randomToken: () => "tok",
       replayStore,
     };
@@ -225,6 +235,38 @@ describe("createMcpSession", () => {
       ),
     ).resolves.toMatchObject({ grantId: "grant_1" });
   });
+
+  it("rejects a grant issued by a grantor that is not the server owner", async () => {
+    const gw = fakeGateway(grant({ grantorAddress: OTHER }));
+    await expect(
+      createMcpSession(
+        { builderAddress: BUILDER, grantId: "grant_1" },
+        {
+          store: createInMemoryMcpSessionStore(),
+          authSessionVerifier: gw,
+          grantVerifier: gw,
+          serverOwner: OWNER,
+          randomToken: () => "t",
+        },
+      ),
+    ).rejects.toMatchObject({ errorCode: "GRANT_OWNER_MISMATCH" });
+  });
+
+  it("fails closed on a grant with no grantor", async () => {
+    const gw = fakeGateway(grant({ grantorAddress: undefined }));
+    await expect(
+      createMcpSession(
+        { builderAddress: BUILDER, grantId: "grant_1" },
+        {
+          store: createInMemoryMcpSessionStore(),
+          authSessionVerifier: gw,
+          grantVerifier: gw,
+          serverOwner: OWNER,
+          randomToken: () => "t",
+        },
+      ),
+    ).rejects.toMatchObject({ errorCode: "GRANT_OWNER_MISMATCH" });
+  });
 });
 
 describe("createMcpSessionAuthPort", () => {
@@ -235,6 +277,7 @@ describe("createMcpSessionAuthPort", () => {
       grantId: "grant_1",
       authSessionVerifier: gw,
       grantVerifier: gw,
+      serverOwner: OWNER,
     });
     const result = await port.authorizeBuilderRead({
       request: new Request("http://ps.local/"),
@@ -250,6 +293,7 @@ describe("createMcpSessionAuthPort", () => {
       grantId: "grant_1",
       authSessionVerifier: gw,
       grantVerifier: gw,
+      serverOwner: OWNER,
     });
     await expect(
       port.authorizeBuilderRead({
@@ -259,6 +303,23 @@ describe("createMcpSessionAuthPort", () => {
     ).rejects.toThrow();
   });
 
+  it("rejects a read under a grant issued by a grantor that is not the server owner", async () => {
+    const gw = fakeGateway(grant({ grantorAddress: OTHER }));
+    const port = createMcpSessionAuthPort({
+      builderAddress: BUILDER,
+      grantId: "grant_1",
+      authSessionVerifier: gw,
+      grantVerifier: gw,
+      serverOwner: OWNER,
+    });
+    await expect(
+      port.authorizeBuilderRead({
+        request: new Request("http://ps.local/"),
+        scope: "instagram.profile",
+      }),
+    ).rejects.toMatchObject({ errorCode: "GRANT_OWNER_MISMATCH" });
+  });
+
   it("refuses owner operations", async () => {
     const gw = fakeGateway(grant());
     const port = createMcpSessionAuthPort({
@@ -266,6 +327,7 @@ describe("createMcpSessionAuthPort", () => {
       grantId: "grant_1",
       authSessionVerifier: gw,
       grantVerifier: gw,
+      serverOwner: OWNER,
     });
     await expect(
       port.authorizeOwner(new Request("http://ps.local/")),

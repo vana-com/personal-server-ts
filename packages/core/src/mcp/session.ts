@@ -30,6 +30,7 @@ import type {
   PersonalServerDataApiDeps,
 } from "../api/index.js";
 import {
+  GrantOwnerMismatchError,
   GrantRequiredError,
   GrantRevokedError,
   InvalidSignatureError,
@@ -133,6 +134,13 @@ export interface CreateMcpSessionOptions {
   store: McpSessionStore;
   authSessionVerifier: AuthSessionVerifierPort;
   grantVerifier: GrantVerifierPort;
+  /**
+   * This server's owner address. The grant's grantor MUST equal it — mirrors
+   * `verifyDataReadPolicy`'s ownership binding (see policy/data-read.ts).
+   * Required (not optional) so TypeScript flags any caller that would mint a
+   * session for a grant issued by a different owner.
+   */
+  serverOwner: `0x${string}`;
   randomToken: () => string;
   ttlMs?: number;
   now?: () => number;
@@ -177,6 +185,22 @@ export async function createMcpSession(
       reason: "Handshake signer is not the grant builder",
       expected: grant.granteeId,
       actual: input.builderAddress,
+    });
+  }
+  // Ownership binding — the grant MUST have been issued by THIS server's
+  // owner (same check as `verifyDataReadPolicy`, which stays authoritative at
+  // read time). A wrong-owner grant can never become valid for this server,
+  // so reject at handshake with a clear error instead of minting a token
+  // whose every read would 403. Fail closed on a grantor-less grant: gateway
+  // responses are untrusted runtime data, despite their type.
+  if (
+    !grant.grantorAddress ||
+    grant.grantorAddress.toLowerCase() !== options.serverOwner.toLowerCase()
+  ) {
+    throw new GrantOwnerMismatchError({
+      grantId: grant.id,
+      expected: options.serverOwner,
+      actual: grant.grantorAddress ?? null,
     });
   }
 
@@ -255,6 +279,11 @@ export function createMcpSessionAuthPort(params: {
   grantId: string;
   authSessionVerifier: AuthSessionVerifierPort;
   grantVerifier: GrantVerifierPort;
+  /**
+   * This server's owner address, required by `verifyDataReadPolicy` to bind
+   * every session read to a grant issued by THIS server's owner.
+   */
+  serverOwner: `0x${string}`;
   runtimeAvailability?: RuntimeAvailabilityPort;
   /** Present only for paid self-signing sessions; absent = free. */
   payment?: McpSessionPaymentConfig;
@@ -275,6 +304,7 @@ export function createMcpSessionAuthPort(params: {
           grantId: params.grantId,
           requestedScope: input.scope,
           fileId: input.fileId,
+          serverOwner: params.serverOwner,
         },
         {
           authSessionVerifier: params.authSessionVerifier,

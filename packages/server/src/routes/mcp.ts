@@ -761,6 +761,19 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
     c: Context,
     session: Awaited<ReturnType<McpSessionStore["getByTokenHash"]>> & object,
   ) {
+    // Fail closed: session reads can't be authorized without this server's
+    // owner to bind the grant to (verifyDataReadPolicy requires it).
+    if (!deps.serverOwner) {
+      return c.json(
+        jsonError(
+          500,
+          "SERVER_NOT_CONFIGURED",
+          "Server owner is not configured",
+        ),
+        500,
+      );
+    }
+
     // Fail closed: if x402 is enabled but the gateway isn't fully configured,
     // refuse the read rather than silently serving it for free.
     if (deps.paymentEnabled && !deps.gatewayConfig?.url) {
@@ -804,6 +817,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       grantId: session.grantId,
       authSessionVerifier: deps.gateway,
       grantVerifier: deps.gateway,
+      serverOwner: deps.serverOwner,
       runtimeAvailability: deps.runtimeAvailability,
       payment,
     });
@@ -858,6 +872,18 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
   // grant with a Web3Signed proof, and gets a short-lived bearer session token.
   // Registered BEFORE `/:connectionToken` so it isn't captured as a token.
   app.post("/session", async (c) => {
+    // Fail closed: minting a session requires this server's owner to bind the
+    // grant to (createMcpSession rejects grants issued by a different owner).
+    if (!deps.serverOwner) {
+      return c.json(
+        jsonError(
+          500,
+          "SERVER_NOT_CONFIGURED",
+          "Server owner is not configured",
+        ),
+        500,
+      );
+    }
     let authResult;
     try {
       authResult = await authenticateRequest({
@@ -919,6 +945,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
           store: sessionStore,
           authSessionVerifier: deps.gateway,
           grantVerifier: deps.gateway,
+          serverOwner: deps.serverOwner,
           randomToken: () => `vana_mcp_${randomBytes(32).toString("hex")}`,
           replayStore: proofReplayStore,
         },
