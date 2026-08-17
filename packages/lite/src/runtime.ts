@@ -486,6 +486,40 @@ function bearerToken(request: Request): string | null {
   return authorization.slice(7);
 }
 
+function resolveX402Settings(config: PsLiteRuntimeOptions["config"]): {
+  paymentEnabled: boolean;
+  gatewayConfig?: DataPortabilityGatewayConfig & { url: string };
+} {
+  // Paid reads need the complete EIP-712 gateway domain. A partial gateway is
+  // valid while payment is disabled, but must never enter the x402 path.
+  const paymentEnabled = config?.payment?.enabled ?? false;
+  const gateway = config?.gateway;
+  const gatewayConfigComplete = Boolean(
+    gateway &&
+    typeof gateway.url === "string" &&
+    typeof gateway.chainId === "number" &&
+    gateway.contracts &&
+    typeof (gateway.contracts as Record<string, unknown>)
+      .dataPortabilityEscrow === "string" &&
+    typeof (gateway.contracts as Record<string, unknown>).dataRegistry ===
+      "string",
+  );
+  if (paymentEnabled && !gatewayConfigComplete) {
+    throw new Error(
+      "PS-Lite x402 payment is enabled (config.payment.enabled) but the gateway " +
+        "config is incomplete. A complete gateway config — url, chainId, and " +
+        "contracts (dataPortabilityEscrow, dataRegistry) — is required to charge " +
+        "for reads. Provide the full config or disable payment.",
+    );
+  }
+  return {
+    paymentEnabled,
+    gatewayConfig: gatewayConfigComplete
+      ? (gateway as DataPortabilityGatewayConfig & { url: string })
+      : undefined,
+  };
+}
+
 export function createPsLiteRuntime(
   options: PsLiteRuntimeOptions,
 ): PsLiteRuntime {
@@ -507,38 +541,10 @@ export function createPsLiteRuntime(
   const tokenStore = options.tokenStore ?? createDefaultPsLiteTokenStore();
   const saveConfig = options.saveConfig ?? createDefaultPsLiteSaveConfig();
 
-  // x402 readiness. Paid reads need a COMPLETE gateway config (url + chainId +
-  // the escrow/dataRegistry contracts that back the EIP-712 domains). A partial
-  // config (e.g. just `{ url }`) must never enter x402 — core only gates on
-  // truthiness, so a partial config would produce malformed challenges. When
-  // payment is enabled we require a complete config (fail fast); a partial
-  // config is otherwise fine for the non-x402 paths (grants/MCP/reads).
-  const paymentEnabled = options.config?.payment?.enabled ?? false;
-  const gw = options.config?.gateway;
-  const gatewayConfigComplete = Boolean(
-    gw &&
-    typeof gw.url === "string" &&
-    typeof gw.chainId === "number" &&
-    gw.contracts &&
-    typeof (gw.contracts as Record<string, unknown>).dataPortabilityEscrow ===
-      "string" &&
-    typeof (gw.contracts as Record<string, unknown>).dataRegistry === "string",
-  );
-  if (paymentEnabled && !gatewayConfigComplete) {
-    throw new Error(
-      "PS-Lite x402 payment is enabled (config.payment.enabled) but the gateway " +
-        "config is incomplete. A complete gateway config — url, chainId, and " +
-        "contracts (dataPortabilityEscrow, dataRegistry) — is required to charge " +
-        "for reads. Provide the full config or disable payment.",
-    );
-  }
-  // Pass the gateway config to the x402 path only when complete; undefined
-  // keeps core's read free instead of issuing a malformed challenge.
-  const x402GatewayConfig:
-    (DataPortabilityGatewayConfig & { url: string }) | undefined =
-    gatewayConfigComplete
-      ? (gw as unknown as DataPortabilityGatewayConfig & { url: string })
-      : undefined;
+  // Validate initial x402 readiness. The same derivation runs for every read
+  // and before every config write so payment policy cannot drift from the live
+  // config after a same-runtime update.
+  resolveX402Settings(options.config);
   // The data handler's x402 path only needs signRecordDataAccess; narrow the
   // (optional) signer so a grant-only signer doesn't masquerade as one that can
   // sign access records.
@@ -841,6 +847,7 @@ export function createPsLiteRuntime(
           url.pathname === dataPrefix ||
           url.pathname.startsWith(`${dataPrefix}/`)
         ) {
+          const x402 = resolveX402Settings(options.config);
           return handlePersonalServerDataRequest(
             request,
             {
@@ -855,10 +862,10 @@ export function createPsLiteRuntime(
               // complete gateway config (validated at construction); a partial
               // config leaves these undefined so reads are served free instead
               // of yielding a malformed challenge.
-              paymentEnabled,
+              paymentEnabled: x402.paymentEnabled,
               gateway: options.gateway,
-              gatewayConfig: x402GatewayConfig,
-              gatewayUrl: x402GatewayConfig?.url,
+              gatewayConfig: x402.gatewayConfig,
+              gatewayUrl: x402.gatewayConfig?.url,
               serverAddress: options.identity?.address,
               // The data owner signed into the RecordDataAccess attestation.
               // Distinct from serverAddress (the server keypair): the core only
@@ -956,7 +963,15 @@ export function createPsLiteRuntime(
               return options.config ?? {};
             },
             async writeConfig(config) {
+              resolveX402Settings(config as PsLiteRuntimeOptions["config"]);
               await saveConfig(config);
+              if (
+                options.config &&
+                typeof config === "object" &&
+                config !== null
+              ) {
+                Object.assign(options.config, config);
+              }
             },
           });
         }

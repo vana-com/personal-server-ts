@@ -899,7 +899,7 @@ describe("createPsLiteRuntime", () => {
     expect(await runtime.isAvailable()).toBe(true);
   });
 
-  it("x402: unpaid read 402 embeds the server-signed accessRecord when the entry has a dataPointId", async () => {
+  it("x402: payment config takes effect without restarting the runtime", async () => {
     const ORIGIN = "https://ps.local";
     const COLLECTED_AT = "2026-05-08T00:00:00.000Z";
     const owner = createTestWallet(0);
@@ -991,7 +991,7 @@ describe("createPsLiteRuntime", () => {
       config: {
         server: { origin: ORIGIN },
         gateway: { url: "https://gateway.test", chainId, contracts },
-        payment: { enabled: true },
+        payment: { enabled: false },
       },
       serverSigner: {
         async signGrantRegistration() {
@@ -1021,7 +1021,45 @@ describe("createPsLiteRuntime", () => {
       }),
     });
 
-    const authHeader = await buildWeb3SignedHeader({
+    const freeAuthHeader = await buildWeb3SignedHeader({
+      wallet: builder,
+      aud: ORIGIN,
+      method: "GET",
+      uri: "/v1/data/instagram.profile",
+      grantId: GRANT_ID,
+    });
+    const freeRead = await runtime.fetch(
+      new Request("https://ignored.example/v1/data/instagram.profile", {
+        headers: { Authorization: freeAuthHeader },
+      }),
+    );
+    expect(freeRead.status).toBe(200);
+
+    const configBody = JSON.stringify({
+      server: { origin: ORIGIN },
+      gateway: { url: "https://gateway.test", chainId, contracts },
+      payment: { enabled: true },
+    });
+    const ownerAuthHeader = await buildWeb3SignedHeader({
+      wallet: owner,
+      aud: ORIGIN,
+      method: "PUT",
+      uri: "/ui/api/config",
+      body: new TextEncoder().encode(configBody),
+    });
+    const update = await runtime.fetch(
+      new Request(`${ORIGIN}/ui/api/config`, {
+        method: "PUT",
+        headers: {
+          Authorization: ownerAuthHeader,
+          "Content-Type": "application/json",
+        },
+        body: configBody,
+      }),
+    );
+    expect(update.status).toBe(200);
+
+    const paidAuthHeader = await buildWeb3SignedHeader({
       wallet: builder,
       aud: ORIGIN,
       method: "GET",
@@ -1030,7 +1068,7 @@ describe("createPsLiteRuntime", () => {
     });
     const res = await runtime.fetch(
       new Request("https://ignored.example/v1/data/instagram.profile", {
-        headers: { Authorization: authHeader },
+        headers: { Authorization: paidAuthHeader },
       }),
     );
 

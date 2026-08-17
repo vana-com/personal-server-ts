@@ -1,4 +1,5 @@
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
+import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type {
@@ -6,7 +7,11 @@ import type {
   McpOAuthAuthorizationStore,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import type { PsLiteRuntimeOptions, PsLiteTokenStore } from "./runtime.js";
-import { savePsLiteConfig, type PsLiteStateStore } from "./state.js";
+import {
+  loadOrCreatePsLiteConfig,
+  savePsLiteConfig,
+  type PsLiteStateStore,
+} from "./state.js";
 import type { PsLiteRelayTlsIdentityStore } from "./relay-tls.js";
 
 /**
@@ -55,7 +60,8 @@ export type PsLitePersistenceRuntimeOptions = Pick<
   | "saveConfig"
   | "mcpConnectionStore"
   | "mcpOAuthAuthorizationStore"
->;
+> &
+  Required<Pick<PsLiteRuntimeOptions, "config">>;
 
 /**
  * Map a {@link PsLitePersistenceBundle} onto the runtime option subset it backs,
@@ -63,7 +69,7 @@ export type PsLitePersistenceRuntimeOptions = Pick<
  *
  * ```ts
  * const runtime = createPsLiteRuntime({
- *   ...psLitePersistenceRuntimeOptions(bundle),
+ *   ...(await psLitePersistenceRuntimeOptions(bundle, configDefaults)),
  *   auth,
  *   identity,
  *   serverOwner,
@@ -74,17 +80,21 @@ export type PsLitePersistenceRuntimeOptions = Pick<
  * `saveConfig` is derived from the injected state store via the existing
  * `savePsLiteConfig` contract, so config writes land in the host's store.
  */
-export function psLitePersistenceRuntimeOptions(
+export async function psLitePersistenceRuntimeOptions(
   bundle: PsLitePersistenceBundle,
-): PsLitePersistenceRuntimeOptions {
+  configDefaults?: Partial<ServerConfig>,
+): Promise<PsLitePersistenceRuntimeOptions> {
   assertCompletePsLitePersistenceBundle(bundle);
+  const config = await loadOrCreatePsLiteConfig(bundle.state, configDefaults);
   return {
     storage: bundle.storage,
+    config,
     tokenStore: bundle.tokens,
     accessLogReader: bundle.accessLog,
     accessLogWriter: bundle.accessLog,
-    saveConfig: async (config: unknown) => {
-      await savePsLiteConfig(bundle.state, config);
+    saveConfig: async (nextConfig: unknown) => {
+      const saved = await savePsLiteConfig(bundle.state, nextConfig);
+      Object.assign(config, saved);
     },
     mcpConnectionStore: bundle.mcpConnections,
     mcpOAuthAuthorizationStore: bundle.mcpOAuthAuthorizations,

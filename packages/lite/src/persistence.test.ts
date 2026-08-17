@@ -93,22 +93,23 @@ function memoryBundle(
 
 type RuntimeOptions = Parameters<typeof createPsLiteRuntime>[0];
 
-function runtimeOverBundle(
+async function runtimeOverBundle(
   bundle: PsLitePersistenceBundle,
   options: Partial<RuntimeOptions> = {},
 ) {
+  const { config: configDefaults, ...runtimeOverrides } = options;
   return createPsLiteRuntime({
-    ...psLitePersistenceRuntimeOptions(bundle),
+    ...(await psLitePersistenceRuntimeOptions(bundle, configDefaults)),
     auth: ownerAuth(),
     gateway: createMockPsLiteGateway(),
     serverOwner: SERVER_OWNER,
     active: true,
     now: () => new Date("2026-05-08T00:00:00.000Z"),
-    ...options,
+    ...runtimeOverrides,
   });
 }
 
-function registrationRuntimeOverBundle(bundle: PsLitePersistenceBundle) {
+async function registrationRuntimeOverBundle(bundle: PsLitePersistenceBundle) {
   return runtimeOverBundle(bundle, {
     identity: {
       address: "0x2222222222222222222222222222222222222222",
@@ -167,12 +168,12 @@ async function writeOwnerScope(
 }
 
 describe("PS Lite persistence bundle — injected state + data continuity", () => {
-  it("rejects a partial bundle through the public composition helper", () => {
-    expect(() =>
+  it("rejects a partial bundle through the public composition helper", async () => {
+    await expect(
       psLitePersistenceRuntimeOptions({
         storage: createMemoryPsLiteStorage(),
       } as PsLitePersistenceBundle),
-    ).toThrow(
+    ).rejects.toThrow(
       "PS Lite persistence bundle must be complete; missing state, tokens, accessLog, mcpConnections, mcpOAuthAuthorizations, relayTlsIdentity",
     );
   });
@@ -189,7 +190,7 @@ describe("PS Lite persistence bundle — injected state + data continuity", () =
 
   it("constructs a runtime from a fully in-memory bundle (no browser storage)", async () => {
     const bundle = memoryBundle();
-    const runtime = runtimeOverBundle(bundle);
+    const runtime = await runtimeOverBundle(bundle);
     const health = await runtime.fetch(new Request("https://ps.local/health"));
     expect(health.status).toBe(200);
     await expect(health.json()).resolves.toMatchObject({
@@ -201,7 +202,7 @@ describe("PS Lite persistence bundle — injected state + data continuity", () =
   it("persists data + access logs through injected stores across a runtime restart", async () => {
     const bundle = memoryBundle();
 
-    const first = runtimeOverBundle(bundle);
+    const first = await runtimeOverBundle(bundle);
     expect((await writeOwnerScope(first, "instagram.profile")).status).toBe(
       201,
     );
@@ -217,7 +218,7 @@ describe("PS Lite persistence bundle — injected state + data continuity", () =
 
     // A brand-new runtime over the SAME bundle sees the persisted data + logs:
     // durability comes from the injected stores, not the runtime instance.
-    const rebooted = runtimeOverBundle(bundle);
+    const rebooted = await runtimeOverBundle(bundle);
 
     const scopes = await rebooted.fetch(
       new Request("https://ps.local/v1/data", {
@@ -242,7 +243,7 @@ describe("PS Lite persistence bundle — injected state + data continuity", () =
 
   it("routes config writes into the injected state store", async () => {
     const bundle = memoryBundle();
-    const runtime = runtimeOverBundle(bundle, {
+    const runtime = await runtimeOverBundle(bundle, {
       config: {
         server: { origin: "https://ps.local" },
         gateway: { url: "https://gateway.local" },
@@ -269,6 +270,32 @@ describe("PS Lite persistence bundle — injected state + data continuity", () =
       "config-v1",
     );
     expect(stored?.server.origin).toBe("https://moved.local");
+
+    const current = await runtime.fetch(
+      new Request("https://ps.local/ui/api/config", {
+        headers: { Authorization: "Bearer owner-token" },
+      }),
+    );
+    expect(current.status).toBe(200);
+    await expect(current.json()).resolves.toMatchObject({
+      server: { origin: "https://moved.local" },
+    });
+
+    const rebooted = await runtimeOverBundle(bundle, {
+      config: {
+        server: { origin: "https://ps.local" },
+        gateway: { url: "https://gateway.local" },
+      },
+    });
+    const restored = await rebooted.fetch(
+      new Request("https://ps.local/ui/api/config", {
+        headers: { Authorization: "Bearer owner-token" },
+      }),
+    );
+    expect(restored.status).toBe(200);
+    await expect(restored.json()).resolves.toMatchObject({
+      server: { origin: "https://moved.local" },
+    });
   });
 });
 
@@ -277,7 +304,7 @@ describe("PS Lite persistence bundle — injected token continuity", () => {
     const bundle = memoryBundle();
     const controlPlane = { accessToken: "control-plane-secret" };
 
-    const first = runtimeOverBundle(bundle, controlPlane);
+    const first = await runtimeOverBundle(bundle, controlPlane);
     const provision = await first.fetch(
       new Request("https://ps.local/auth/device/token", {
         method: "POST",
@@ -293,7 +320,7 @@ describe("PS Lite persistence bundle — injected token continuity", () => {
     expect(await bundle.tokens.isValid("vana_ps_injected")).toBe(true);
 
     // A fresh runtime over the same token store still sees + can revoke it.
-    const rebooted = runtimeOverBundle(bundle, controlPlane);
+    const rebooted = await runtimeOverBundle(bundle, controlPlane);
     const revoke = await rebooted.fetch(
       new Request("https://ps.local/auth/device/token", {
         method: "DELETE",
@@ -348,7 +375,7 @@ describe("PS Lite persistence bundle — injected server identity", () => {
 
   it("keeps injected config plaintext at rest", async () => {
     const bundle = memoryBundle();
-    const runtime = runtimeOverBundle(bundle, {
+    const runtime = await runtimeOverBundle(bundle, {
       config: { server: { origin: "https://ps.local" } },
     });
     await runtime.fetch(
@@ -377,7 +404,7 @@ describe("PS Lite persistence bundle — injected MCP stores", () => {
       mcpOAuthApprovalUrl: "https://app.local/mcp/approve",
     };
 
-    const first = runtimeOverBundle(bundle, mcpOptions);
+    const first = await runtimeOverBundle(bundle, mcpOptions);
 
     // Owner creates a connection — written to the injected connection store.
     const created = await first.fetch(
@@ -415,7 +442,7 @@ describe("PS Lite persistence bundle — injected MCP stores", () => {
 
     // A fresh runtime over the SAME stores still lists the connection and can
     // read the authorization back — both MCP stores are injected + durable.
-    const rebooted = runtimeOverBundle(bundle, mcpOptions);
+    const rebooted = await runtimeOverBundle(bundle, mcpOptions);
 
     const list = await rebooted.fetch(
       new Request("https://ps.local/v1/mcp/connections", {
@@ -620,7 +647,7 @@ describe("startPersonalServer relay persistence wiring", () => {
 
     await expect(
       startPersonalServer({
-        runtime: registrationRuntimeOverBundle(bundle),
+        runtime: await registrationRuntimeOverBundle(bundle),
         persistence: bundle,
         relay: false,
       }),
@@ -714,7 +741,7 @@ describe("startPersonalServer relay persistence wiring", () => {
   it("keeps a prebuilt runtime free of implicit browser relay-state persistence", async () => {
     vi.stubGlobal("indexedDB", undefined);
     const server = await startPersonalServer({
-      runtime: registrationRuntimeOverBundle(memoryBundle()),
+      runtime: await registrationRuntimeOverBundle(memoryBundle()),
       relay: {
         sessionId: "browser-session",
         webSocketFactory: () => ({
