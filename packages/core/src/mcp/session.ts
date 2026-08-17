@@ -60,6 +60,12 @@ export interface McpSessionStore {
   getByTokenHash(tokenHash: string): Promise<McpSessionRecord | null>;
 }
 
+/**
+ * KNOWN LIMITATION: in-memory only. A process restart (or a second instance)
+ * starts with an empty store, so live session tokens die with the process and
+ * the client must re-handshake. Acceptable for today's single-instance
+ * Personal Server; persist via the host's state store before multi-instance.
+ */
 export function createInMemoryMcpSessionStore(): McpSessionStore {
   const byHash = new Map<string, McpSessionRecord>();
   return {
@@ -97,6 +103,14 @@ export interface McpProofReplayStore {
   release?(proofId: string): Promise<void>;
 }
 
+/**
+ * KNOWN LIMITATION: in-memory only. A process restart (or a second instance)
+ * forgets consumed proof ids, so a still-valid handshake proof could be
+ * replayed once against the fresh process. The blast radius is bounded by the
+ * proof's own expiry, and today's Personal Server runs single-instance, so we
+ * document rather than persist. Persist via the host's state store (do not
+ * invent a new storage layer) before running multiple instances.
+ */
 export function createInMemoryMcpProofReplayStore(): McpProofReplayStore {
   const seen = new Map<string, number>();
   return {
