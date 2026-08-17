@@ -16,6 +16,7 @@ import type { McpDataReadClient } from "./read-client.js";
 import { McpDataReadError } from "./read-client.js";
 import type { McpActivityRecorder } from "./activity.js";
 import { MiniSearchIndex, type SearchDocument } from "./search/index.js";
+import { MAX_SELECTED_BLOCK_IDS } from "../storage/blocks/index.js";
 import {
   rawScopeFileInputSchema,
   rawScopeMetadata,
@@ -81,9 +82,12 @@ export interface McpToolDefinition {
 const STRUCTURED_CONTENT_TEXT_LIMIT_BYTES = 64 * 1024;
 const resultTextEncoder = new TextEncoder();
 
+/**
+ * Tool payloads are machine-read, never displayed as-is: pretty-printing them
+ * inflated the wire size 1.37x-1.63x on real scopes for no reader benefit.
+ */
 function textResult(value: unknown, isError = false): McpToolResult {
-  const text =
-    typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  const text = typeof value === "string" ? value : JSON.stringify(value);
   const textBytes = resultTextEncoder.encode(text).byteLength;
   const structuredContent =
     !isError &&
@@ -132,6 +136,28 @@ function uniqueSources(connection: McpConnectionRecord): string[] {
   return Array.from(set).sort();
 }
 
+/**
+ * Block ids a caller may name in one block-addressed read. Bounded so a model
+ * cannot turn `blockIds` into an unbounded fan-out; `maxBytes` still applies on
+ * top of it.
+ */
+function normalizeBlockIdsInput(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const blockIds: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of value) {
+    if (typeof raw !== "string") continue;
+    const blockId = raw.trim();
+    if (!blockId || blockId.length > BLOCK_ID_MAX_CHARS || seen.has(blockId)) {
+      continue;
+    }
+    seen.add(blockId);
+    blockIds.push(blockId);
+    if (blockIds.length >= MAX_SELECTED_BLOCK_IDS) break;
+  }
+  return blockIds;
+}
+
 function normalizeScopeListInput(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   const scopes: string[] = [];
@@ -148,28 +174,49 @@ function normalizeScopeListInput(value: unknown): string[] {
   return scopes;
 }
 
+/**
+ * Hard ceiling the MCP dispatcher enforces on any tool call (see
+ * `clampToolTimeout` in `server.ts`, which imports this).
+ *
+ * Tools must never advertise a larger `timeoutMs` than the dispatcher allows: a
+ * client that trusts the advertised maximum gets killed with a hard
+ * `tool_timeout` instead of the graceful "budget exhausted, here are partial
+ * results plus nextSearchCursor" path the tools implement.
+ */
+export const MAX_MCP_TOOL_TIMEOUT_MS = 90_000;
+
 const DEFAULT_SEARCH_LIMIT = 5;
 const MAX_SEARCH_LIMIT = 50;
 const MAX_SEARCH_SCOPES = 200;
 const DEFAULT_SEARCH_MAX_SCOPES = MAX_SEARCH_SCOPES;
 const DEFAULT_SEARCH_TIMEOUT_MS = 30_000;
-const MAX_SEARCH_TIMEOUT_MS = 300_000;
+const MAX_SEARCH_TIMEOUT_MS = MAX_MCP_TOOL_TIMEOUT_MS;
 const DEFAULT_SEARCH_DISCOVERY_TIMEOUT_MS = 2_000;
-const MAX_SEARCH_TOTAL_TIMEOUT_MS = 300_000;
+const MAX_SEARCH_TOTAL_TIMEOUT_MS = MAX_MCP_TOOL_TIMEOUT_MS;
 const DEFAULT_READ_SCOPE_MAX_BYTES = 64 * 1024;
 const MAX_READ_SCOPE_MAX_BYTES = 5 * 1024 * 1024;
 const DEFAULT_READ_SCOPE_TIMEOUT_MS = 60_000;
-const MAX_READ_SCOPE_TIMEOUT_MS = 300_000;
+const MAX_READ_SCOPE_TIMEOUT_MS = MAX_MCP_TOOL_TIMEOUT_MS;
 const DEFAULT_READ_FILE_TIMEOUT_MS = 60_000;
-const MAX_READ_FILE_TIMEOUT_MS = 300_000;
+const MAX_READ_FILE_TIMEOUT_MS = MAX_MCP_TOOL_TIMEOUT_MS;
 const DEFAULT_READ_FILE_MAX_BYTES = 10 * 1024 * 1024;
 const MAX_READ_FILE_MAX_BYTES = 25 * 1024 * 1024;
 const DEFAULT_SEARCH_MAX_BYTES = 64 * 1024;
 const MAX_SEARCH_MAX_BYTES = 1024 * 1024;
 const DEFAULT_SCOPE_METADATA_TIMEOUT_MS = 2_000;
-const SEARCH_MAX_PAGES_PER_SCOPE = 16;
+const DEFAULT_LIST_BLOCKS_LIMIT = 100;
+const MAX_LIST_BLOCKS_LIMIT = 500;
+const LIST_BLOCKS_TIMEOUT_MS = 15_000;
+/**
+ * Safety net, not a search budget: a scope is scanned page by page until the
+ * result limit or the time budget is hit, and this only stops a pathological
+ * scope from monopolising the run. Pages beyond it are resumable through
+ * `nextSearchCursor`, so raising it costs latency, never correctness.
+ */
+const SEARCH_MAX_PAGES_PER_SCOPE = 256;
 const SEARCH_QUERY_MAX_CHARS = 256;
 const SEARCH_SCOPE_MAX_CHARS = 128;
+const BLOCK_ID_MAX_CHARS = 128;
 const SEARCH_REQUESTED_SCOPES_LIMIT = MAX_SEARCH_SCOPES * 2;
 const SEARCH_SKIPPED_SCOPES_LIMIT = 50;
 const SEARCH_PREVIEW_CHARS = 600;
@@ -694,10 +741,18 @@ const readScope: McpToolDefinition = {
   name: "read_scope",
   title: "Read scope",
   description:
-    "Read approved scope blocks. Best for small scopes. Use nextCursor for more pages; prefer search for large scopes.",
+    "Read approved scope blocks. Pass blockIds to fetch exact blocks; otherwise page with nextCursor.",
   inputSchema: {
     scope: z.string().min(1).describe("Exact scope id."),
     cursor: z.string().min(1).optional(),
+    blockIds: z
+      .array(z.string().min(1).max(BLOCK_ID_MAX_CHARS))
+      .min(1)
+      .max(MAX_SELECTED_BLOCK_IDS)
+      .optional()
+      .describe(
+        "Block ids from a search hit's blockRef or list_scope_blocks. Ignores cursor; maxBytes still applies.",
+      ),
     maxBytes: z.number().int().min(1).max(MAX_READ_SCOPE_MAX_BYTES).optional(),
     timeoutMs: z
       .number()
@@ -727,6 +782,7 @@ const readScope: McpToolDefinition = {
     }
 
     const cursor = typeof args.cursor === "string" ? args.cursor : undefined;
+    const blockIds = normalizeBlockIdsInput(args.blockIds);
     const maxBytes =
       typeof args.maxBytes === "number"
         ? clampInteger(
@@ -792,6 +848,7 @@ const readScope: McpToolDefinition = {
           grantId: grant.grantId,
           cursor,
           maxBytes,
+          ...(blockIds.length > 0 ? { blockIds } : {}),
         }),
         timeoutMs,
         `read blocks for ${scope}`,
@@ -813,6 +870,7 @@ const readScope: McpToolDefinition = {
           maxBytes,
           timeoutMs,
           returnedBlocks: result.blocks.length,
+          ...(blockIds.length > 0 ? { requestedBlockIds: blockIds } : {}),
         },
       });
     } catch (err) {
@@ -837,6 +895,127 @@ const readScope: McpToolDefinition = {
             true,
           );
         }
+        return textResult(
+          { error: "data_read_failed", status: err.status, body: err.body },
+          true,
+        );
+      }
+      return textResult(
+        {
+          error: "tool_handler_error",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        true,
+      );
+    }
+  },
+};
+
+const listScopeBlocks: McpToolDefinition = {
+  name: "list_scope_blocks",
+  title: "List scope blocks",
+  description:
+    "Scope table of contents: block ids, paths, sizes. Feed ids to read_scope blockIds.",
+  inputSchema: {
+    scope: z.string().min(1).describe("Exact scope id."),
+    offset: z.number().int().min(0).optional(),
+    limit: z.number().int().min(1).max(MAX_LIST_BLOCKS_LIMIT).optional(),
+  },
+  async handler(args, { connection, readClient }) {
+    const scope = typeof args.scope === "string" ? args.scope : null;
+    if (!scope) {
+      return textResult(
+        { error: "scope is required and must be a string" },
+        true,
+      );
+    }
+    const grant = resolveGrantForScope(connection, scope);
+    if (!grant) {
+      return textResult(
+        {
+          error: "scope_not_granted",
+          message: `Scope '${scope}' is not covered by any grant on this MCP connection.`,
+          grantedScopes: uniqueScopes(connection),
+        },
+        true,
+      );
+    }
+    if (typeof readClient.readBlockManifest !== "function") {
+      return textResult({
+        scope,
+        blocks: [],
+        manifestAvailable: false,
+        reason: "this server build does not expose block manifests",
+        nextStep: "Use read_scope with nextCursor, or search_personal_context.",
+      });
+    }
+
+    const offset = clampInteger(args.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+    const limit = clampInteger(
+      args.limit,
+      DEFAULT_LIST_BLOCKS_LIMIT,
+      1,
+      MAX_LIST_BLOCKS_LIMIT,
+    );
+
+    try {
+      const manifest = await withTimeout(
+        readClient.readBlockManifest({ scope, grantId: grant.grantId }),
+        LIST_BLOCKS_TIMEOUT_MS,
+        `read block manifest for ${scope}`,
+      );
+      // Scopes stored before block sidecars existed, and scopes still
+      // indexing, simply have no manifest. That is not an error.
+      if (!manifest) {
+        return textResult({
+          scope,
+          grantId: grant.grantId,
+          blocks: [],
+          manifestAvailable: false,
+          reason:
+            "no block manifest for this scope yet; it may still be indexing",
+          nextStep:
+            "Use read_scope with nextCursor, or search_personal_context.",
+        });
+      }
+
+      const page = manifest.blocks.slice(offset, offset + limit);
+      const nextOffset = offset + page.length;
+      return textResult({
+        scope,
+        grantId: grant.grantId,
+        collectedAt: manifest.collectedAt,
+        contentKind: manifest.contentKind,
+        manifestAvailable: true,
+        totalBlocks: manifest.blocks.length,
+        blocks: page.map((block) => ({
+          id: block.id,
+          path: block.path,
+          sizeBytes: block.sizeBytes,
+          ...(block.itemCount === undefined
+            ? {}
+            : { itemCount: block.itemCount }),
+        })),
+        warnings: manifest.warnings,
+        page: {
+          offset,
+          limit,
+          returnedBlocks: page.length,
+          ...(nextOffset < manifest.blocks.length ? { nextOffset } : {}),
+        },
+      });
+    } catch (err) {
+      if (err instanceof OperationTimeoutError) {
+        return textResult(
+          {
+            error: "scope_blocks_timeout",
+            message: err.message,
+            timeoutMs: err.timeoutMs,
+          },
+          true,
+        );
+      }
+      if (err instanceof McpDataReadError) {
         return textResult(
           { error: "data_read_failed", status: err.status, body: err.body },
           true,
@@ -1095,7 +1274,6 @@ const searchPersonalContext: McpToolDefinition = {
       let cursor: string | undefined =
         scopeIndex === startScopeIndex ? initialBlockCursor : undefined;
       let pageCount = 0;
-      let scopeHasMatch = false;
       let scopeTruncated = false;
       let scopeSearched = false;
       try {
@@ -1139,12 +1317,18 @@ const searchPersonalContext: McpToolDefinition = {
             scope,
             result.blocks,
           );
+          // Every hit the page can still contribute, not one per page: the
+          // index is thrown away with the page, so a discarded hit is a block
+          // the caller can never reach again.
           const pageHits =
             documents.length > 0
-              ? MiniSearchIndex.build(documents).search({ query, limit: 1 })
+              ? MiniSearchIndex.build(documents).search({
+                  query,
+                  limit: limit - matches.length,
+                })
               : [];
-          const pageHit = pageHits[0];
-          if (pageHit && matches.length < limit && !scopeHasMatch) {
+          for (const pageHit of pageHits) {
+            if (matches.length >= limit) break;
             const hitText = textById.get(pageHit.id) ?? pageText;
             matches.push({
               scope,
@@ -1156,8 +1340,12 @@ const searchPersonalContext: McpToolDefinition = {
               ),
               searchedChars: pageText.length,
               truncated: Boolean(result.nextCursor),
+              // The id of the block that matched, so the caller can fetch it
+              // with read_scope({ blockIds }) instead of walking cursors.
+              ...(pageHit.blockRef ? { blockRef: pageHit.blockRef } : {}),
+              score: pageHit.score,
+              terms: pageHit.terms,
             });
-            scopeHasMatch = true;
           }
           if (result.nextCursor) {
             cursor = result.nextCursor;
@@ -1198,9 +1386,11 @@ const searchPersonalContext: McpToolDefinition = {
         });
       }
       if (matches.length >= limit) {
-        // Result limit hit — if more scopes remain, offer cursor for next scope
+        // Result limit hit — if more scopes remain, offer cursor for next scope.
+        // A cursor set inside the scope wins: it still has unread pages, and
+        // pointing past it would silently drop them.
         const nextScopeIndex = scopeIndex + 1;
-        if (nextScopeIndex < resolved.scopes.length) {
+        if (!nextSearchCursor && nextScopeIndex < resolved.scopes.length) {
           nextSearchCursor = encodeSearchCursor({
             scopeIndex: nextScopeIndex,
           });
@@ -1320,19 +1510,15 @@ const getScopeFile: McpToolDefinition = {
           content: [
             {
               type: "text",
-              text: JSON.stringify(
-                {
-                  ...base,
-                  contentIncluded: false,
-                  reason: !includeContent
-                    ? "includeContent=false"
-                    : "file exceeds maxBytes for inline MCP tool response",
-                  nextStep:
-                    "Use resources/read with resourceUri if your MCP client supports resources, or retry with a higher maxBytes if appropriate.",
-                },
-                null,
-                2,
-              ),
+              text: JSON.stringify({
+                ...base,
+                contentIncluded: false,
+                reason: !includeContent
+                  ? "includeContent=false"
+                  : "file exceeds maxBytes for inline MCP tool response",
+                nextStep:
+                  "Use resources/read with resourceUri if your MCP client supports resources, or retry with a higher maxBytes if appropriate.",
+              }),
             },
             {
               type: "resource_link",
@@ -1355,15 +1541,11 @@ const getScopeFile: McpToolDefinition = {
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              {
-                ...base,
-                contentIncluded: true,
-                resourceType: "blob",
-              },
-              null,
-              2,
-            ),
+            text: JSON.stringify({
+              ...base,
+              contentIncluded: true,
+              resourceType: "blob",
+            }),
           },
           {
             type: "resource",
@@ -1421,6 +1603,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
   listGrantedScopes,
   requestScopeAccess,
   readScope,
+  listScopeBlocks,
   getScopeFile,
   searchPersonalContext,
 ] as const;
