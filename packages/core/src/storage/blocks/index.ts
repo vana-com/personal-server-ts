@@ -23,6 +23,12 @@ export {
 export { buildDataBlocksAsync } from "./build.js";
 
 export {
+  MAX_SELECTED_BLOCK_IDS,
+  selectScopeBlocksByIds,
+  type SelectScopeBlocksResult,
+} from "./select.js";
+
+export {
   DataBlockStorageError,
   type DataBlockStorageErrorCode,
 } from "./errors.js";

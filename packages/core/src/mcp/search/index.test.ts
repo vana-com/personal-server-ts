@@ -74,6 +74,68 @@ describe("MiniSearchIndex", () => {
     });
   });
 
+  it("does not match every document on stopwords or one-letter terms", () => {
+    const index = MiniSearchIndex.build([
+      {
+        id: "notes-1",
+        scope: "notes.plain",
+        text: "The kiln is in the studio and it is hot",
+      },
+      {
+        id: "notes-2",
+        scope: "notes.plain",
+        text: "The invoice is in the drawer and it is unpaid",
+      },
+    ]);
+
+    expect(index.search({ query: "the" })).toEqual([]);
+    expect(index.search({ query: "is it in the" })).toEqual([]);
+    expect(index.search({ query: "a" })).toEqual([]);
+    expect(index.search({ query: "kiln" }).map((hit) => hit.id)).toEqual([
+      "notes-1",
+    ]);
+  });
+
+  it("does not prefix-expand short terms into a match-everything query", () => {
+    const index = MiniSearchIndex.build([
+      {
+        id: "notes-1",
+        scope: "notes.plain",
+        text: "invoices and inventory",
+      },
+      {
+        id: "notes-2",
+        scope: "notes.plain",
+        text: "insurance renewal",
+      },
+    ]);
+
+    // "in" would prefix-match both documents; "invo" is long enough to expand.
+    expect(index.search({ query: "in" })).toEqual([]);
+    expect(index.search({ query: "invo" }).map((hit) => hit.id)).toEqual([
+      "notes-1",
+    ]);
+  });
+
+  it("drops the weak tail of a multi-term query below the relevance floor", () => {
+    const index = MiniSearchIndex.build([
+      {
+        id: "strong",
+        scope: "notes.plain",
+        text: "ceramic kiln firing schedule for the kiln",
+      },
+      {
+        id: "weak",
+        scope: "notes.plain",
+        text: "firing questions about hiring and staffing and payroll and taxes",
+      },
+    ]);
+
+    expect(index.search({ query: "kiln firing" }).map((hit) => hit.id)).toEqual(
+      ["strong"],
+    );
+  });
+
   it("indexes plain text documents without JSON/schema inference", () => {
     const index = MiniSearchIndex.build([
       {

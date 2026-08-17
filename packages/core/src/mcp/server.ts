@@ -19,6 +19,7 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import type { McpConnectionRecord } from "./types.js";
 import type { McpDataReadClient } from "./read-client.js";
 import {
+  MAX_MCP_TOOL_TIMEOUT_MS,
   MCP_TOOLS,
   type McpToolContext,
   type McpToolResultContent,
@@ -40,7 +41,6 @@ export interface HandleMcpRequestOptions {
 const DEFAULT_SERVER_NAME = "vana-personal-server-mcp";
 const DEFAULT_SERVER_VERSION = "0.0.1";
 const DEFAULT_MCP_TOOL_TIMEOUT_MS = 30_000;
-const MAX_MCP_TOOL_TIMEOUT_MS = 90_000;
 const MCP_TOOL_TIMEOUT_GRACE_MS = 1_000;
 
 const QUERY_PREVIEW_CHARS = 120;
