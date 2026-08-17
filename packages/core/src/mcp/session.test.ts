@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   buildMcpSessionConnection,
   createInMemoryMcpProofReplayStore,
@@ -332,6 +332,76 @@ describe("createMcpSessionAuthPort", () => {
     await expect(
       port.authorizeOwner(new Request("http://ps.local/")),
     ).rejects.toThrow();
+  });
+
+  it("binds the x402 payment cycle to the pinned data version, not the latest", async () => {
+    const PINNED_AT = "2026-06-05T00:00:00Z";
+    const gw = fakeGateway(
+      grant({
+        paymentStatus: "pending",
+        fee: {
+          totalDue: "100",
+          asset: "0x0000000000000000000000000000000000000fee",
+        },
+      }),
+    );
+    // Two versions exist; `at` selects which one the payment binds to.
+    const findEntry = vi.fn(({ at }: { at?: string }) => ({
+      scope: "instagram.profile",
+      collectedAt: at ?? "2026-06-06T00:00:00Z",
+      fileId: at === PINNED_AT ? "file-old" : "file-latest",
+      sizeBytes: 10,
+      dataPointId: "0x00000000000000000000000000000000000000dp",
+      version: at === PINNED_AT ? 3 : 7,
+    }));
+    const signRecordDataAccess = vi.fn().mockResolvedValue("0xsig");
+    const port = createMcpSessionAuthPort({
+      builderAddress: BUILDER,
+      grantId: "grant_1",
+      authSessionVerifier: gw,
+      grantVerifier: gw,
+      serverOwner: OWNER,
+      payment: {
+        dataApiDeps: {
+          storage: { findEntry } as never,
+          auth: {} as never,
+          accessLogWriter: { write: vi.fn() },
+          serverSigner: { signRecordDataAccess },
+          serverOwner: OWNER,
+          serverAddress: "0x0000000000000000000000000000000000000ccc",
+        },
+        gateway: gw as never,
+        gatewayConfig: {
+          chainId: 14800,
+          contracts: {
+            dataRegistry: "0x0000000000000000000000000000000000000001",
+            dataPortabilityPermissions:
+              "0x0000000000000000000000000000000000000002",
+            dataPortabilityServer: "0x0000000000000000000000000000000000000003",
+            dataPortabilityGrantees:
+              "0x0000000000000000000000000000000000000004",
+          },
+        } as never,
+        gatewayUrl: "https://gateway.test",
+      },
+    });
+
+    // No X-PAYMENT header → the cycle must issue a challenge (402) whose
+    // accessRecord is signed over the PINNED version, not the latest.
+    await expect(
+      port.authorizeBuilderRead({
+        request: new Request("http://ps.local/"),
+        scope: "instagram.profile",
+        at: PINNED_AT,
+      }),
+    ).rejects.toMatchObject({ code: 402, errorCode: "PAYMENT_REQUIRED" });
+
+    expect(findEntry).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: "instagram.profile", at: PINNED_AT }),
+    );
+    expect(signRecordDataAccess).toHaveBeenCalledWith(
+      expect.objectContaining({ version: 3n }),
+    );
   });
 });
 

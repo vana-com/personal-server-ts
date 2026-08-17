@@ -304,6 +304,9 @@ export function createMcpDataReadClient(
           scope,
           grantId,
           fileId: selectedEntry.fileId ?? undefined,
+          // The exact version this read serves (cursor-pinned or latest) —
+          // a payment-enforcing auth port binds the x402 settlement to it.
+          at: selectedEntry.collectedAt,
         });
       } catch (err) {
         if (err instanceof ProtocolError) {

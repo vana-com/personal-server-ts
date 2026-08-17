@@ -55,6 +55,12 @@ export interface PersonalServerReadAuthInput {
   scope: string;
   grantId?: string;
   fileId?: string;
+  /**
+   * The `collectedAt` version the read is pinned to (cursor-pinned or
+   * `?at=`-pinned reads). Payment-enforcing auth ports use it to bind the
+   * x402 challenge/settlement to the exact version served, not the latest.
+   */
+  at?: string;
 }
 
 export interface PersonalServerReadAuthResult {
@@ -661,6 +667,7 @@ export async function handlePersonalServerDataRequest(
         grantId,
         fileId:
           url.searchParams.get("fileId") ?? selectedEntry?.fileId ?? undefined,
+        at: url.searchParams.get("at") ?? undefined,
       });
 
       // X402 payment dance for builder reads. Owner-exempt reads (the

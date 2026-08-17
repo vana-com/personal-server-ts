@@ -321,6 +321,11 @@ export function createMcpSessionAuthPort(params: {
           request: input.request,
           scope: input.scope,
           fileIdParam: input.fileId,
+          // Bind the payment to the exact data version being served (a
+          // cursor-pinned or `at=`-pinned read may serve an older version
+          // than the latest entry) — otherwise the challenge/accessRecord
+          // would settle against different bytes than were returned.
+          atParam: input.at,
           grantId: params.grantId,
           builder: params.builderAddress,
           gateway: params.payment.gateway,

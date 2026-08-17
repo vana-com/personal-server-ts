@@ -366,6 +366,9 @@ describe("mcp/read-client", () => {
   });
 
   it("pins cursor reads to the version encoded in the cursor", async () => {
+    const authorizeBuilderRead = vi
+      .fn()
+      .mockResolvedValue({ grantId: "grant-1", builder: "0x2222" });
     const oldCollectedAt = "2026-06-05T00:00:00Z";
     const latestCollectedAt = "2026-06-06T00:00:00Z";
     const cursor = encodeDataBlockCursor({
@@ -413,9 +416,7 @@ describe("mcp/read-client", () => {
         auth: {
           authorizeOwner: vi.fn(),
           authorizeBuilderList: vi.fn(),
-          authorizeBuilderRead: vi
-            .fn()
-            .mockResolvedValue({ grantId: "grant-1", builder: "0x2222" }),
+          authorizeBuilderRead,
         },
         accessLogWriter: { write: vi.fn() },
       },
@@ -435,6 +436,11 @@ describe("mcp/read-client", () => {
       "instagram.profile",
       oldCollectedAt,
       { cursor, maxBytes: 16_384 },
+    );
+    // The auth port sees the pinned version too, so a payment-enforcing port
+    // (paid self-signing session) settles against the version actually served.
+    expect(authorizeBuilderRead).toHaveBeenCalledWith(
+      expect.objectContaining({ at: oldCollectedAt }),
     );
   });
 
