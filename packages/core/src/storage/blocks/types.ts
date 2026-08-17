@@ -33,6 +33,13 @@ export interface ReadScopeBlocksRequest {
   collectedAt?: string;
   cursor?: string;
   maxBytes?: number;
+  /**
+   * Read only these blocks, in this order, instead of paging the scope from
+   * `cursor`. Ids come from a manifest listing or from a search hit's
+   * `blockRef`. When set, `cursor` is ignored and no `nextCursor` is returned;
+   * `maxBytes` still bounds the response.
+   */
+  blockIds?: string[];
 }
 
 export interface ReadScopeBlocksResponse {

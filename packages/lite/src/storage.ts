@@ -7,6 +7,7 @@ import { buildDataBlocksAsync } from "@opendatalabs/personal-server-ts-core/stor
 import {
   DataBlockStorageError,
   encodeDataBlockCursor,
+  selectScopeBlocksByIds,
   validateDataBlockCursor,
 } from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
@@ -565,6 +566,29 @@ export async function createPersistentPsLiteStorage(
         }
       }
 
+      if (options.blockIds?.length) {
+        const selection = await selectScopeBlocksByIds(
+          manifest,
+          options.blockIds,
+          { maxBytes: options.maxBytes },
+          async (blockId) =>
+            inMemoryBlocks?.find((candidate) => candidate.id === blockId) ??
+            (await readBlockPayloadFromStores(
+              fileStore,
+              fallbackStore,
+              blockPayloadPath(scope, collectedAt, blockId),
+            )),
+        );
+        return {
+          scope: manifest.scope,
+          collectedAt: manifest.collectedAt,
+          ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
+          contentKind: manifest.contentKind,
+          blocks: selection.blocks,
+          warnings: [...manifest.warnings, ...selection.warnings],
+        };
+      }
+
       const cursorResult = options.cursor
         ? validateDataBlockCursor(options.cursor, { scope, collectedAt })
         : { ok: true as const, cursor: null };
@@ -658,15 +682,19 @@ export async function createPersistentPsLiteStorage(
       };
     },
 
-    async hasScopeBlocks(scope, collectedAt) {
+    async readBlockManifest(scope, collectedAt) {
       const manifestPath = blockManifestPath(scope, collectedAt);
-      const manifest =
+      return (
         (await fileStore.readBlockManifest?.(manifestPath)) ??
         (fileStore === fallbackStore
           ? null
           : await fallbackStore.readBlockManifest?.(manifestPath)) ??
-        null;
-      return Boolean(manifest);
+        null
+      );
+    },
+
+    async hasScopeBlocks(scope, collectedAt) {
+      return Boolean(await storagePort.readBlockManifest?.(scope, collectedAt));
     },
 
     async canReadScopeBlocks(scope, collectedAt) {

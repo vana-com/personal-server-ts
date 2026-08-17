@@ -26,6 +26,7 @@ import {
 import {
   DataBlockStorageError,
   encodeDataBlockCursor,
+  selectScopeBlocksByIds,
   validateDataBlockCursor,
   type DataBlockManifest,
   type DataScopeBlock,
@@ -146,9 +147,32 @@ export async function readScopeBlocks(
   options: HierarchyManagerOptions,
   scope: string,
   collectedAt: string,
-  readOptions: { cursor?: string; maxBytes: number },
+  readOptions: {
+    cursor?: string;
+    maxBytes: number;
+    blockIds?: readonly string[];
+  },
 ): Promise<ReadScopeBlocksResponse> {
   const manifest = await readBlockManifest(options, scope, collectedAt);
+
+  if (readOptions.blockIds?.length) {
+    const selection = await selectScopeBlocksByIds(
+      manifest,
+      readOptions.blockIds,
+      { maxBytes: readOptions.maxBytes },
+      (blockId) =>
+        readBlockPayloadIfPresent(options, scope, collectedAt, blockId),
+    );
+    return {
+      scope: manifest.scope,
+      collectedAt: manifest.collectedAt,
+      ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
+      contentKind: manifest.contentKind,
+      blocks: selection.blocks,
+      warnings: [...manifest.warnings, ...selection.warnings],
+    };
+  }
+
   const cursor = readOptions.cursor
     ? validateDataBlockCursor(readOptions.cursor, { scope, collectedAt })
     : undefined;
@@ -214,6 +238,29 @@ export async function readScopeBlocks(
       : {}),
     warnings: manifest.warnings,
   };
+}
+
+/**
+ * Manifest as a table of contents. Unlike the internal reader this returns null
+ * for a scope that was stored before block sidecars existed, so callers can
+ * degrade instead of failing.
+ */
+export async function readScopeBlockManifest(
+  options: HierarchyManagerOptions,
+  scope: string,
+  collectedAt: string,
+): Promise<DataBlockManifest | null> {
+  try {
+    return await readBlockManifest(options, scope, collectedAt);
+  } catch (err) {
+    if (
+      err instanceof DataBlockStorageError &&
+      err.code === "block_manifest_not_found"
+    ) {
+      return null;
+    }
+    throw err;
+  }
 }
 
 export async function hasScopeBlocks(
@@ -332,6 +379,26 @@ async function readBlockPayload(
         "block_payload_not_found",
         `Block payload not found for ${scope} at ${collectedAt}: ${blockId}`,
       );
+    }
+    throw err;
+  }
+}
+
+/** Payload read for block-addressed selection: a missing id is a warning, not a throw. */
+async function readBlockPayloadIfPresent(
+  options: HierarchyManagerOptions,
+  scope: string,
+  collectedAt: string,
+  blockId: string,
+): Promise<DataScopeBlock | null> {
+  try {
+    return await readBlockPayload(options, scope, collectedAt, blockId);
+  } catch (err) {
+    if (
+      err instanceof DataBlockStorageError &&
+      err.code === "block_payload_not_found"
+    ) {
+      return null;
     }
     throw err;
   }
