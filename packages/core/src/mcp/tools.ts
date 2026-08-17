@@ -1401,6 +1401,13 @@ const searchPersonalContext: McpToolDefinition = {
 
     const elapsedMs = Date.now() - startedAt;
 
+    // Matches accumulate in page order, so a weak early hit would otherwise
+    // outrank a strong later one. Scores are only comparable within one page's
+    // index, but best-first is still strictly better than page order for the
+    // caller. Unscored matches (budget-exhausted fallback path) keep their
+    // relative order at the end.
+    matches.sort((a, b) => (b.score ?? -1) - (a.score ?? -1));
+
     return textResult({
       query,
       results: matches,
