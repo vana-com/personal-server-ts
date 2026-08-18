@@ -4,6 +4,7 @@ import { MAX_MCP_TOOL_TIMEOUT_MS, MCP_TOOLS } from "./tools.js";
 import { handleMcpStreamableHttpRequest } from "./server.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { McpDataReadClient } from "./read-client.js";
+import { McpDataReadError } from "./read-client.js";
 
 function getTool(name: string) {
   const tool = MCP_TOOLS.find((candidate) => candidate.name === name);
@@ -332,6 +333,50 @@ describe("mcp/tools", () => {
       grantedRequestedScopes: ["instagram.profile", "chatgpt.history"],
       nextAction: "No new grant is needed for the requested scopes.",
     });
+  });
+
+  it("read_scope surfaces a genuine PAYMENT_REQUIRED as a signable challenge", async () => {
+    const readClient = createMinimalReadClient({
+      readScopeBlocks: vi.fn().mockRejectedValue(
+        new McpDataReadError(402, {
+          error: {
+            errorCode: "PAYMENT_REQUIRED",
+            message: "Payment required for this read",
+            details: { challenge: { accepts: [{ amount: "1" }] } },
+          },
+        }),
+      ),
+    });
+    const result = await getTool("read_scope").handler(
+      { scope: "instagram.profile" },
+      { connection: createConnection(), readClient: readClient as never },
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.payment_required).toBe(true);
+    expect(payload.challenge).toEqual({ accepts: [{ amount: "1" }] });
+  });
+
+  it("read_scope does NOT present a gateway 402 (PAYMENT_GATEWAY_ERROR) as a signable challenge", async () => {
+    const readClient = createMinimalReadClient({
+      readScopeBlocks: vi.fn().mockRejectedValue(
+        new McpDataReadError(402, {
+          error: {
+            errorCode: "PAYMENT_GATEWAY_ERROR",
+            message: "insufficient escrow balance",
+            details: { body: {} },
+          },
+        }),
+      ),
+    });
+    const result = await getTool("read_scope").handler(
+      { scope: "instagram.profile" },
+      { connection: createConnection(), readClient: readClient as never },
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.payment_required).toBeUndefined();
+    expect(payload.error).toBe("payment_failed");
+    expect(payload.errorCode).toBe("PAYMENT_GATEWAY_ERROR");
+    expect(payload.message).toContain("insufficient escrow");
   });
 
   it("read_scope returns bounded blocks and a next cursor", async () => {
@@ -762,6 +807,65 @@ describe("mcp/tools", () => {
     expect(payload.limits.requestedBytesPerPage).toBe(1024);
   });
 
+  it("search_personal_context surfaces chargeable scopes as payment_required, not scope errors", async () => {
+    const readClient = createMinimalReadClient({
+      readScopeBlocks: vi.fn(async ({ scope }: { scope: string }) => {
+        if (scope === "instagram.profile") {
+          // Paid self-signing session: a chargeable read 402s inside search.
+          throw new McpDataReadError(402, {
+            error: {
+              errorCode: "PAYMENT_REQUIRED",
+              message: "payment required",
+              details: { challenge: { accepts: [] } },
+            },
+          });
+        }
+        return {
+          scope,
+          collectedAt: "2026-06-05T00:00:00Z",
+          contentKind: "json",
+          blocks: [
+            {
+              id: "b1",
+              path: "$.text",
+              mediaType: "text/plain",
+              value: "hello query world",
+              sizeBytes: 20,
+            },
+          ],
+          warnings: [],
+        };
+      }),
+    });
+
+    const result = await getTool("search_personal_context").handler(
+      {
+        query: "query",
+        scopes: ["instagram.profile", "chatgpt.history"],
+        maxScopes: 2,
+        maxResults: 5,
+        maxBytes: 1024,
+      },
+      {
+        connection: createConnection(),
+        readClient: readClient as never,
+      },
+    );
+
+    const payload = JSON.parse(result.content[0].text);
+    // The 402 is surfaced as an actionable payment signal...
+    expect(payload.payment_required).toBe(true);
+    expect(payload.paymentRequiredScopes).toContain("instagram.profile");
+    // ...not buried as a generic scope error.
+    expect(
+      (payload.errors ?? []).some(
+        (e: { scope: string }) => e.scope === "instagram.profile",
+      ),
+    ).toBe(false);
+    // Non-chargeable scopes are still searched normally.
+    expect(payload.searchedScopes).toContain("chatgpt.history");
+  });
+
   it("search_personal_context returns every matching block in a scope with a usable blockRef", async () => {
     const readClient = createMinimalReadClient({
       readScopeBlocks: vi.fn(async ({ scope }: { scope: string }) => ({
@@ -1017,6 +1121,140 @@ describe("mcp/tools", () => {
       maxResults: 5,
     });
     expect(readScopeBlocks).not.toHaveBeenCalled();
+  });
+
+  it("search_personal_context skips the index preview path when payment is enforced", async () => {
+    const searchScopeIndex = vi.fn().mockResolvedValue({
+      status: "hit",
+      hits: [
+        {
+          id: "h",
+          scope: "instagram.profile",
+          preview: "free preview",
+          blockRef: "b1",
+          score: 1,
+          terms: ["kiln"],
+        },
+      ],
+    });
+    const readScopeBlocks = vi.fn().mockResolvedValue({
+      scope: "instagram.profile",
+      collectedAt: "2026-06-05T00:00:00Z",
+      contentKind: "json",
+      blocks: [
+        {
+          id: "b1",
+          path: "$.text",
+          mediaType: "text/plain",
+          value: "kiln content",
+          sizeBytes: 12,
+        },
+      ],
+      warnings: [],
+    });
+    const readClient = createMinimalReadClient({
+      enforcesPayment: true,
+      searchScopeIndex,
+      readScopeBlocks,
+    });
+
+    await getTool("search_personal_context").handler(
+      { query: "kiln", scopes: ["instagram.profile"], maxScopes: 1 },
+      { connection: createConnection(), readClient },
+    );
+
+    // Paid session: the payment-bypassing index preview must NOT be used...
+    expect(searchScopeIndex).not.toHaveBeenCalled();
+    // ...it falls back to the paid bounded block read (which enforces x402).
+    expect(readScopeBlocks).toHaveBeenCalled();
+  });
+
+  it("get_scope_file surfaces PAYMENT_REQUIRED as a signable challenge and forwards payment", async () => {
+    const readRawScopeFile = vi.fn().mockRejectedValueOnce(
+      new McpDataReadError(402, {
+        error: {
+          errorCode: "PAYMENT_REQUIRED",
+          message: "payment required",
+          details: { challenge: { accepts: [{ amount: "1" }] } },
+        },
+      }),
+    );
+    const readClient = createMinimalReadClient({ readRawScopeFile });
+    const result = await getTool("get_scope_file").handler(
+      { scope: "instagram.profile", includeContent: true, payment: "PAYPROOF" },
+      { connection: createConnection(), readClient: readClient as never },
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.payment_required).toBe(true);
+    expect(payload.challenge).toEqual({ accepts: [{ amount: "1" }] });
+    // The x402 proof is forwarded on the raw file read.
+    expect(readRawScopeFile).toHaveBeenCalledWith(
+      expect.objectContaining({ payment: "PAYPROOF" }),
+    );
+  });
+
+  it("get_scope_file returns paid content inline on default options (payment redeemed once)", async () => {
+    const readRawScopeFile = vi.fn().mockResolvedValue({
+      status: 200,
+      scope: "manual.document",
+      mimeType: "application/pdf",
+      sizeBytes: 4,
+      contentBase64: "JVBERg==",
+    });
+    const readClient = createMinimalReadClient({ readRawScopeFile });
+    // Default options: includeContent omitted (=> false), but a payment proof
+    // is supplied. The settled single-use payment must return the bytes inline
+    // rather than a resource link that a second (unpaid) resources/read can't
+    // redeem.
+    const result = await getTool("get_scope_file").handler(
+      { scope: "manual.document", payment: "PAYPROOF" },
+      {
+        connection: {
+          ...createConnection(),
+          grants: [{ grantId: "g", scopes: ["manual.document"] }],
+        },
+        readClient: readClient as never,
+      },
+    );
+    expect(readRawScopeFile).toHaveBeenCalledWith(
+      expect.objectContaining({ payment: "PAYPROOF" }),
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.contentIncluded).toBe(true);
+    const blob = (
+      result.content as Array<{ type: string; resource?: { blob?: string } }>
+    ).find((c) => c.type === "resource");
+    expect(blob?.resource?.blob).toBe("JVBERg==");
+  });
+
+  it("get_scope_file preserves the size cap on paid reads (no inline dump of oversized files)", async () => {
+    const readRawScopeFile = vi.fn().mockResolvedValue({
+      status: 200,
+      scope: "manual.document",
+      mimeType: "application/pdf",
+      sizeBytes: 10_000,
+      contentBase64: "AAAA",
+    });
+    const readClient = createMinimalReadClient({ readRawScopeFile });
+    const result = await getTool("get_scope_file").handler(
+      { scope: "manual.document", payment: "PAYPROOF", maxBytes: 100 },
+      {
+        connection: {
+          ...createConnection(),
+          grants: [{ grantId: "g", scopes: ["manual.document"] }],
+        },
+        readClient: readClient as never,
+      },
+    );
+    const payload = JSON.parse(result.content[0].text);
+    // Payment settled, but the oversized file is NOT dumped inline.
+    expect(payload.error).toBe("paid_file_exceeds_max_bytes");
+    expect(payload.sizeBytes).toBe(10_000);
+    expect(
+      (result.content as Array<{ type: string }>).some(
+        (c) => c.type === "resource",
+      ),
+    ).toBe(false);
   });
 
   it("search_personal_context falls back to bounded blocks when an index is missing", async () => {

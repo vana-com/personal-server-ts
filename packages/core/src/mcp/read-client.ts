@@ -45,6 +45,14 @@ export interface McpScopeMetadata {
 
 export interface McpDataReadClient {
   /**
+   * True when reads through this client are x402-payment-enforced (a paid
+   * self-signing session). Payment-bypassing shortcuts — notably the optional
+   * `searchScopeIndex` preview path, which does not route through the data API
+   * auth port — MUST NOT be used when this is set.
+   */
+  enforcesPayment?: boolean;
+
+  /**
    * Perform `GET /v1/data?scopePrefix=…` as the connection grantee. This is
    * used only for discovery/expanding wildcard grants before a grant-gated
    * read; it does not return scope contents.
@@ -77,6 +85,12 @@ export interface McpDataReadClient {
     grantId: string;
     cursor?: string;
     maxBytes?: number;
+    /**
+     * Optional base64 `X-PAYMENT` proof (x402). Forwarded as a header on the
+     * in-process read request so a payment-enforcing auth port (self-signing
+     * MCP sessions) can settle it. The owner/OAuth path never sets this.
+     */
+    payment?: string;
     blockIds?: readonly string[];
   }): Promise<McpDataReadBlocksResult>;
 
@@ -101,6 +115,11 @@ export interface McpDataReadClient {
     grantId: string;
     at?: string;
     fileId?: string;
+    /**
+     * Optional base64 `X-PAYMENT` proof (x402), forwarded like
+     * `readScopeBlocks` so a paid self-signing session can settle raw reads.
+     */
+    payment?: string;
   }): Promise<McpDataReadRawFileResult>;
 
   /**
@@ -183,6 +202,11 @@ export interface CreateMcpDataReadClientOptions {
    * expects after strip-base-path. Defaults to `/v1/data`.
    */
   basePath?: string;
+  /**
+   * Marks reads through this client as x402-enforced (paid self-signing
+   * session). Surfaced as `McpDataReadClient.enforcesPayment`.
+   */
+  enforcesPayment?: boolean;
 }
 
 type BuilderReadAuthorization = Awaited<
@@ -205,6 +229,18 @@ export function createMcpDataReadClient(
     scope: string;
     grantId: string;
     fileId?: string;
+    /**
+     * The exact version this read serves (cursor-pinned or latest). A
+     * payment-enforcing auth port (self-signing MCP sessions) binds the x402
+     * settlement to it; the owner/OAuth path ignores it.
+     */
+    at?: string;
+    /**
+     * Optional base64 `X-PAYMENT` proof (x402), forwarded as a header on the
+     * in-process read request so a payment-enforcing auth port can settle it.
+     * The owner/OAuth path never sets this.
+     */
+    payment?: string;
   }): Promise<{ request: Request; authResult?: BuilderReadAuthorization }> {
     const safeScope = encodeURIComponent(params.scope);
     const signingUri = `${basePath}/${safeScope}`;
@@ -218,7 +254,10 @@ export function createMcpDataReadClient(
     const url = new URL(signingUri, options.serverOrigin).toString();
     const request = new Request(url, {
       method: "GET",
-      headers: { Authorization: authorization },
+      headers: {
+        Authorization: authorization,
+        ...(params.payment ? { "X-PAYMENT": params.payment } : {}),
+      },
     });
 
     try {
@@ -227,6 +266,7 @@ export function createMcpDataReadClient(
         scope: params.scope,
         grantId: params.grantId,
         fileId: params.fileId,
+        ...(params.at ? { at: params.at } : {}),
       });
       return { request, authResult };
     } catch (err) {
@@ -273,6 +313,7 @@ export function createMcpDataReadClient(
   }
 
   return {
+    enforcesPayment: options.enforcesPayment ?? false,
     async listScopes({ scopePrefix, limit, offset } = {}) {
       const params = new URLSearchParams();
       if (scopePrefix) params.set("scopePrefix", scopePrefix);
@@ -326,7 +367,14 @@ export function createMcpDataReadClient(
       };
     },
 
-    async readScopeBlocks({ scope, grantId, cursor, maxBytes, blockIds }) {
+    async readScopeBlocks({
+      scope,
+      grantId,
+      cursor,
+      maxBytes,
+      payment,
+      blockIds,
+    }) {
       const storage = options.dataApiDeps.storage;
       if (!storage.readScopeBlocks) {
         throw new McpDataReadError(503, {
@@ -353,6 +401,10 @@ export function createMcpDataReadClient(
         scope,
         grantId,
         fileId: selectedEntry.fileId ?? undefined,
+        // The exact version this read serves (cursor-pinned or latest) —
+        // a payment-enforcing auth port binds the x402 settlement to it.
+        at: selectedEntry.collectedAt,
+        payment,
       });
 
       try {
@@ -440,7 +492,7 @@ export function createMcpDataReadClient(
       return manifest;
     },
 
-    async readRawScopeFile({ scope, grantId, at, fileId }) {
+    async readRawScopeFile({ scope, grantId, at, fileId, payment }) {
       const storage = options.dataApiDeps.storage;
       const selectedEntry = storage.findEntry({
         scope,
@@ -474,7 +526,10 @@ export function createMcpDataReadClient(
       ).toString();
       const request = new Request(url, {
         method: "GET",
-        headers: { Authorization: authorization },
+        headers: {
+          Authorization: authorization,
+          ...(payment ? { "X-PAYMENT": payment } : {}),
+        },
       });
 
       const response = await handlePersonalServerDataRequest(

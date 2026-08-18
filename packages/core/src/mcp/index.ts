@@ -6,4 +6,5 @@ export * from "./read-client.js";
 export * from "./tools.js";
 export * from "./server.js";
 export * from "./connection-api.js";
+export * from "./session.js";
 export * from "./activity.js";
