@@ -21,7 +21,10 @@ export function createVanaSyncStorageAdapter(params: {
   // blob path (and its URL validator compares against the lowercased form),
   // so urlForKey MUST lowercase too or the reconstructed download URL won't
   // match the uploaded blob's key.
-  const owner = params.serverOwner.toLowerCase();
+  // serverOwner is already a 0x-hex address; lowercasing preserves that, but
+  // .toLowerCase() widens to string. vana-sdk 3.14.0 types the provider's
+  // ownerAddress as `0x${string}`, so re-narrow to the known-hex form.
+  const owner = params.serverOwner.toLowerCase() as `0x${string}`;
   // Storage blob paths are scoped by the protocol chain id so data for the same
   // owner/scope/version never collides across networks. The chain id is the
   // gateway's — it is never inferred from the storage host (apiUrl), which
