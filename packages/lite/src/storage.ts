@@ -35,7 +35,7 @@ export interface PsLitePersistedStorageState {
   }>;
 }
 
-export type PsLiteFileStorageKind = "opfs" | "indexeddb";
+export type PsLiteFileStorageKind = "opfs" | "indexeddb" | "custom";
 
 export interface PsLiteDataFileStore {
   readonly kind: PsLiteFileStorageKind;
@@ -57,6 +57,11 @@ export interface PsLiteStorageCapabilities {
   metadata: "indexeddb" | "memory" | "custom";
   files: PsLiteFileStorageKind | "memory";
   opfsAvailable: boolean;
+}
+
+/** Persistent Lite storage with its public backend capability report. */
+export interface PsLiteStoragePort extends DataStoragePort {
+  readonly capabilities: PsLiteStorageCapabilities;
 }
 
 export interface PsLitePersistenceAdapter {
@@ -424,7 +429,7 @@ export async function createPersistentPsLiteStorage(
   adapter: PsLiteStorageAdapter,
   persistence: PsLitePersistenceAdapter = createIndexedDbPsLitePersistence(),
   dataFileStore?: PsLiteDataFileStore,
-): Promise<DataStoragePort> {
+): Promise<PsLiteStoragePort> {
   let state = normalizeState(await persistence.read());
   const fallbackEnvelopes = new Map(
     state.envelopes.map((envelope) => [
@@ -479,9 +484,7 @@ export async function createPersistentPsLiteStorage(
     return sortEntries(state.entries.filter((entry) => entry.scope === scope));
   }
 
-  const storagePort: DataStoragePort & {
-    capabilities: PsLiteStorageCapabilities;
-  } = {
+  const storagePort: PsLiteStoragePort = {
     kind: adapter.kind === "custom" ? "custom" : "browser-indexeddb-opfs",
     capabilities,
     ...createStorageReadMethods(() => state.entries, entriesForScope),

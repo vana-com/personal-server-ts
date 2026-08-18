@@ -18,6 +18,7 @@ import {
   createDataFileEnvelope,
   RECORD_DATA_ACCESS_TYPES,
 } from "@opendatalabs/vana-sdk/browser";
+import { recoverTypedDataAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
 type PsLiteRuntimeOptions = Parameters<typeof createPsLiteRuntime>[0];
@@ -47,6 +48,147 @@ function createTestRuntime(options: Partial<PsLiteRuntimeOptions> = {}) {
       ...options.stateCapabilities,
     },
   });
+}
+
+/**
+ * x402 fixture: a paid-eligible grant, a synced entry carrying a dataPointId,
+ * and a server signer bound — like the real `createServerSigner` — to the
+ * STARTUP chainId/contracts. `payment.enabled` starts off so tests can flip it
+ * through a live config write.
+ */
+async function setupX402Fixture() {
+  const ORIGIN = "https://ps.local";
+  const COLLECTED_AT = "2026-05-08T00:00:00.000Z";
+  const owner = createTestWallet(0);
+  const builder = createTestWallet(1);
+  const serverAccount = privateKeyToAccount(
+    ("0x" + "33".repeat(32)) as `0x${string}`,
+  );
+  const BUILDER_ID = ("0x" + "bb".repeat(32)) as `0x${string}`;
+  const GRANT_ID = ("0x" + "11".repeat(32)) as `0x${string}`;
+  const DATA_POINT_ID = ("0x" + "dd".repeat(32)) as `0x${string}`;
+  const chainId = 14800;
+  const contracts = {
+    dataRegistry: "0x0000000000000000000000000000000000000001",
+    dataPortabilityPermissions: "0x0000000000000000000000000000000000000002",
+    dataPortabilityServer: "0x0000000000000000000000000000000000000003",
+    dataPortabilityGrantees: "0x0000000000000000000000000000000000000004",
+    dataPortabilityEscrow: "0x0000000000000000000000000000000000000005",
+    feeRegistry: "0x0000000000000000000000000000000000000006",
+  };
+
+  // Paid-eligible grant whose granteeId matches the builder (data-read policy
+  // cross-check) and which carries a fee (x402 charges).
+  const grant = {
+    id: GRANT_ID,
+    grantorAddress: owner.address,
+    granteeId: BUILDER_ID,
+    scopes: ["instagram.*"],
+    status: "confirmed",
+    addedAt: COLLECTED_AT,
+    expiresAt: null,
+    expired: false,
+    revokedAt: null,
+    revocationSignature: null,
+    paymentStatus: "pending",
+    paidAt: null,
+    paidBy: null,
+    grantVersion: "1",
+    fee: {
+      asset: "0x0000000000000000000000000000000000000000",
+      registrationFee: "10000000000000000",
+      dataAccessFee: "1000000000000000",
+      totalDue: "11000000000000000",
+    },
+  };
+  const gateway = {
+    ...createMockPsLiteGateway(),
+    async getGrant() {
+      return grant;
+    },
+    async getBuilder() {
+      return {
+        id: BUILDER_ID,
+        ownerAddress: owner.address,
+        granteeAddress: builder.address,
+        publicKey: "0x04",
+        appUrl: "https://app.test",
+        addedAt: COLLECTED_AT,
+      };
+    },
+    async isRegisteredBuilder() {
+      return true;
+    },
+  } as unknown as Parameters<typeof createTestRuntime>[0]["gateway"];
+
+  // Seed a synced entry (dataPointId set) so buildChallenge binds an
+  // accessRecord to it.
+  const storage = createMemoryPsLiteStorage();
+  const envelope = createDataFileEnvelope("instagram.profile", COLLECTED_AT, {
+    username: "x",
+  });
+  const write = await storage.writeEnvelope(envelope);
+  await storage.insertEntry({
+    fileId: null,
+    schemaId: null,
+    path: write.relativePath,
+    scope: "instagram.profile",
+    collectedAt: COLLECTED_AT,
+    sizeBytes: write.sizeBytes,
+    version: 1,
+    dataPointId: DATA_POINT_ID,
+  });
+
+  const runtime = createTestRuntime({
+    storage,
+    gateway,
+    active: true,
+    serverOwner: owner.address,
+    identity: { address: serverAccount.address, publicKey: "0x04" },
+    config: {
+      server: { origin: ORIGIN },
+      gateway: { url: "https://gateway.test", chainId, contracts },
+      payment: { enabled: false },
+    },
+    serverSigner: {
+      async signGrantRegistration() {
+        return ("0x" + "aa".repeat(65)) as `0x${string}`;
+      },
+      async signRecordDataAccess(msg) {
+        return serverAccount.signTypedData({
+          domain: {
+            name: "Vana Data Portability",
+            version: "1",
+            chainId,
+            verifyingContract: contracts.dataRegistry as `0x${string}`,
+          },
+          types: RECORD_DATA_ACCESS_TYPES,
+          primaryType: "RecordDataAccess",
+          message: msg,
+        });
+      },
+    },
+    auth: createWeb3SignedPsLiteAuth({
+      origin: () => ORIGIN,
+      ownerAddress: owner.address,
+      dataReadPolicyPorts: {
+        authSessionVerifier: gateway,
+        grantVerifier: gateway,
+      },
+    }),
+  });
+
+  return {
+    runtime,
+    owner,
+    builder,
+    serverAccount,
+    ORIGIN,
+    GRANT_ID,
+    DATA_POINT_ID,
+    chainId,
+    contracts,
+  };
 }
 
 describe("createPsLiteRuntime", () => {
@@ -899,129 +1041,57 @@ describe("createPsLiteRuntime", () => {
     expect(await runtime.isAvailable()).toBe(true);
   });
 
-  it("x402: unpaid read 402 embeds the server-signed accessRecord when the entry has a dataPointId", async () => {
-    const ORIGIN = "https://ps.local";
-    const COLLECTED_AT = "2026-05-08T00:00:00.000Z";
-    const owner = createTestWallet(0);
-    const builder = createTestWallet(1);
-    const serverAccount = privateKeyToAccount(
-      ("0x" + "33".repeat(32)) as `0x${string}`,
-    );
-    const BUILDER_ID = ("0x" + "bb".repeat(32)) as `0x${string}`;
-    const GRANT_ID = ("0x" + "11".repeat(32)) as `0x${string}`;
-    const DATA_POINT_ID = ("0x" + "dd".repeat(32)) as `0x${string}`;
-    const chainId = 14800;
-    const contracts = {
-      dataRegistry: "0x0000000000000000000000000000000000000001",
-      dataPortabilityPermissions: "0x0000000000000000000000000000000000000002",
-      dataPortabilityServer: "0x0000000000000000000000000000000000000003",
-      dataPortabilityGrantees: "0x0000000000000000000000000000000000000004",
-      dataPortabilityEscrow: "0x0000000000000000000000000000000000000005",
-      feeRegistry: "0x0000000000000000000000000000000000000006",
-    };
+  it("x402: payment config takes effect without restarting the runtime", async () => {
+    const {
+      runtime,
+      owner,
+      builder,
+      ORIGIN,
+      GRANT_ID,
+      DATA_POINT_ID,
+      chainId,
+      contracts,
+    } = await setupX402Fixture();
 
-    // Paid-eligible grant whose granteeId matches the builder (data-read policy
-    // cross-check) and which carries a fee (x402 charges).
-    const grant = {
-      id: GRANT_ID,
-      grantorAddress: owner.address,
-      granteeId: BUILDER_ID,
-      scopes: ["instagram.*"],
-      status: "confirmed",
-      addedAt: COLLECTED_AT,
-      expiresAt: null,
-      expired: false,
-      revokedAt: null,
-      revocationSignature: null,
-      paymentStatus: "pending",
-      paidAt: null,
-      paidBy: null,
-      grantVersion: "1",
-      fee: {
-        asset: "0x0000000000000000000000000000000000000000",
-        registrationFee: "10000000000000000",
-        dataAccessFee: "1000000000000000",
-        totalDue: "11000000000000000",
-      },
-    };
-    const gateway = {
-      ...createMockPsLiteGateway(),
-      async getGrant() {
-        return grant;
-      },
-      async getBuilder() {
-        return {
-          id: BUILDER_ID,
-          ownerAddress: owner.address,
-          granteeAddress: builder.address,
-          publicKey: "0x04",
-          appUrl: "https://app.test",
-          addedAt: COLLECTED_AT,
-        };
-      },
-      async isRegisteredBuilder() {
-        return true;
-      },
-    } as unknown as Parameters<typeof createTestRuntime>[0]["gateway"];
-
-    // Seed a synced entry (dataPointId set) so buildChallenge binds an
-    // accessRecord to it.
-    const storage = createMemoryPsLiteStorage();
-    const envelope = createDataFileEnvelope("instagram.profile", COLLECTED_AT, {
-      username: "x",
+    const freeAuthHeader = await buildWeb3SignedHeader({
+      wallet: builder,
+      aud: ORIGIN,
+      method: "GET",
+      uri: "/v1/data/instagram.profile",
+      grantId: GRANT_ID,
     });
-    const write = await storage.writeEnvelope(envelope);
-    await storage.insertEntry({
-      fileId: null,
-      schemaId: null,
-      path: write.relativePath,
-      scope: "instagram.profile",
-      collectedAt: COLLECTED_AT,
-      sizeBytes: write.sizeBytes,
-      version: 1,
-      dataPointId: DATA_POINT_ID,
-    });
-
-    const runtime = createTestRuntime({
-      storage,
-      gateway,
-      active: true,
-      serverOwner: owner.address,
-      identity: { address: serverAccount.address, publicKey: "0x04" },
-      config: {
-        server: { origin: ORIGIN },
-        gateway: { url: "https://gateway.test", chainId, contracts },
-        payment: { enabled: true },
-      },
-      serverSigner: {
-        async signGrantRegistration() {
-          return ("0x" + "aa".repeat(65)) as `0x${string}`;
-        },
-        async signRecordDataAccess(msg) {
-          return serverAccount.signTypedData({
-            domain: {
-              name: "Vana Data Portability",
-              version: "1",
-              chainId,
-              verifyingContract: contracts.dataRegistry as `0x${string}`,
-            },
-            types: RECORD_DATA_ACCESS_TYPES,
-            primaryType: "RecordDataAccess",
-            message: msg,
-          });
-        },
-      },
-      auth: createWeb3SignedPsLiteAuth({
-        origin: () => ORIGIN,
-        ownerAddress: owner.address,
-        dataReadPolicyPorts: {
-          authSessionVerifier: gateway,
-          grantVerifier: gateway,
-        },
+    const freeRead = await runtime.fetch(
+      new Request("https://ignored.example/v1/data/instagram.profile", {
+        headers: { Authorization: freeAuthHeader },
       }),
-    });
+    );
+    expect(freeRead.status).toBe(200);
 
-    const authHeader = await buildWeb3SignedHeader({
+    const configBody = JSON.stringify({
+      server: { origin: ORIGIN },
+      gateway: { url: "https://gateway.test", chainId, contracts },
+      payment: { enabled: true },
+    });
+    const ownerAuthHeader = await buildWeb3SignedHeader({
+      wallet: owner,
+      aud: ORIGIN,
+      method: "PUT",
+      uri: "/ui/api/config",
+      body: new TextEncoder().encode(configBody),
+    });
+    const update = await runtime.fetch(
+      new Request(`${ORIGIN}/ui/api/config`, {
+        method: "PUT",
+        headers: {
+          Authorization: ownerAuthHeader,
+          "Content-Type": "application/json",
+        },
+        body: configBody,
+      }),
+    );
+    expect(update.status).toBe(200);
+
+    const paidAuthHeader = await buildWeb3SignedHeader({
       wallet: builder,
       aud: ORIGIN,
       method: "GET",
@@ -1030,7 +1100,7 @@ describe("createPsLiteRuntime", () => {
     });
     const res = await runtime.fetch(
       new Request("https://ignored.example/v1/data/instagram.profile", {
-        headers: { Authorization: authHeader },
+        headers: { Authorization: paidAuthHeader },
       }),
     );
 
@@ -1044,6 +1114,121 @@ describe("createPsLiteRuntime", () => {
     expect(accessRecord.accessor.toLowerCase()).toBe(
       builder.address.toLowerCase(),
     );
+  });
+
+  it("x402: a live gateway change never moves the challenge domain off the signer's domain", async () => {
+    const {
+      runtime,
+      owner,
+      builder,
+      serverAccount,
+      ORIGIN,
+      GRANT_ID,
+      chainId,
+      contracts,
+    } = await setupX402Fixture();
+
+    // A config save that moves the gateway block: the UI PUTs a full config,
+    // so an edit elsewhere (or an omitted gateway block, which the schema fills
+    // with defaults) can silently redirect the EIP-712 domain. The gateway
+    // client and the signer cannot be rebuilt inside a running runtime.
+    const movedContracts = {
+      ...contracts,
+      dataRegistry: "0x00000000000000000000000000000000000000a1",
+      dataPortabilityEscrow: "0x00000000000000000000000000000000000000a5",
+    };
+    const configBody = JSON.stringify({
+      server: { origin: ORIGIN },
+      gateway: {
+        url: "https://moved-gateway.test",
+        chainId: 1337,
+        contracts: movedContracts,
+      },
+      payment: { enabled: true },
+    });
+    const ownerAuthHeader = await buildWeb3SignedHeader({
+      wallet: owner,
+      aud: ORIGIN,
+      method: "PUT",
+      uri: "/ui/api/config",
+      body: new TextEncoder().encode(configBody),
+    });
+    const update = await runtime.fetch(
+      new Request(`${ORIGIN}/ui/api/config`, {
+        method: "PUT",
+        headers: {
+          Authorization: ownerAuthHeader,
+          "Content-Type": "application/json",
+        },
+        body: configBody,
+      }),
+    );
+    expect(update.status).toBe(200);
+
+    const paidAuthHeader = await buildWeb3SignedHeader({
+      wallet: builder,
+      aud: ORIGIN,
+      method: "GET",
+      uri: "/v1/data/instagram.profile",
+      grantId: GRANT_ID,
+    });
+    const res = await runtime.fetch(
+      new Request("https://ignored.example/v1/data/instagram.profile", {
+        headers: { Authorization: paidAuthHeader },
+      }),
+    );
+
+    expect(res.status).toBe(402);
+    const body = await res.json();
+    const challenge = body.accepts[0];
+    // The challenge still names the domain the runtime's signer and gateway
+    // client are bound to — not the freshly persisted one.
+    expect(challenge.domain.chainId).toBe(chainId);
+    expect(challenge.domain.verifyingContract.toLowerCase()).toBe(
+      contracts.dataPortabilityEscrow,
+    );
+    // ...and the accessRecord signature recovers under that same chain, so the
+    // gateway can actually verify what it is handed.
+    const accessRecord = challenge.accessRecord;
+    await expect(
+      recoverTypedDataAddress({
+        domain: {
+          name: "Vana Data Portability",
+          version: "1",
+          chainId: challenge.domain.chainId,
+          verifyingContract: contracts.dataRegistry as `0x${string}`,
+        },
+        types: RECORD_DATA_ACCESS_TYPES,
+        primaryType: "RecordDataAccess",
+        message: {
+          ownerAddress: owner.address,
+          scope: "instagram.profile",
+          version: BigInt(accessRecord.version),
+          accessor: accessRecord.accessor,
+          recordId: accessRecord.recordId,
+        },
+        signature: accessRecord.signature,
+      }),
+    ).resolves.toBe(serverAccount.address);
+
+    // The write itself still persisted: the new gateway is reported back and
+    // takes effect on the next restart, when both dependencies are rebuilt.
+    const currentConfig = await runtime.fetch(
+      new Request(`${ORIGIN}/ui/api/config`, {
+        headers: {
+          Authorization: await buildWeb3SignedHeader({
+            wallet: owner,
+            aud: ORIGIN,
+            method: "GET",
+            uri: "/ui/api/config",
+          }),
+        },
+      }),
+    );
+    expect(currentConfig.status).toBe(200);
+    await expect(currentConfig.json()).resolves.toMatchObject({
+      gateway: { url: "https://moved-gateway.test", chainId: 1337 },
+    });
   });
 
   it("x402: throws when payment is enabled but the gateway config is incomplete", () => {

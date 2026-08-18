@@ -5,6 +5,7 @@ import {
   type PsLiteBridgeResponse,
 } from "./bridge.js";
 import { createRustlsPsLiteRelayTlsFactory } from "./relay-tls.js";
+import type { PsLiteRelayTlsIdentityStore } from "./relay-tls.js";
 import type { PsLiteRuntime } from "./runtime.js";
 
 const DATA_FRAME_TYPE = 1;
@@ -23,6 +24,8 @@ export interface PsLiteRelayClientOptions {
   origin?: string;
   webSocketFactory?: PsLiteRelayWebSocketFactory;
   tls?: PsLiteRelayTlsFactory | false;
+  /** Host-owned cache for the issued relay certificate identity. */
+  tlsIdentityStore?: PsLiteRelayTlsIdentityStore;
   logger?: (line: string) => void;
   onStatus?: (
     status: PsLiteRelayStatus,
@@ -225,6 +228,7 @@ export function startPsLiteRelayClient(
           controlUrl: baseControlUrl,
           publicSuffix: options.publicSuffix,
           certIssuerUrl: options.certIssuerUrl,
+          identityStore: options.tlsIdentityStore,
           logger: options.logger,
         })
       : options.tls;

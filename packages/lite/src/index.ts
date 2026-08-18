@@ -51,6 +51,8 @@ export {
   type PsLiteFileStorageKind,
   type PsLitePersistedStorageState,
   type PsLitePersistenceAdapter,
+  type PsLiteStorageCapabilities,
+  type PsLiteStoragePort,
 } from "./storage.js";
 
 export {
@@ -142,9 +144,18 @@ export {
 } from "./relay.js";
 
 export {
+  createLocalStoragePsLiteRelayTlsIdentityStore,
   createRustlsPsLiteRelayTlsFactory,
   psLiteRelayPublicHost,
   psLiteRelayPublicUrl as psLiteRelayTlsPublicUrl,
   type PsLiteRelayTlsIdentity,
+  type PsLiteRelayTlsIdentityStore,
   type RustlsPsLiteRelayTlsOptions,
 } from "./relay-tls.js";
+
+export {
+  assertCompletePsLitePersistenceBundle,
+  psLitePersistenceRuntimeOptions,
+  type PsLitePersistenceBundle,
+  type PsLitePersistenceRuntimeOptions,
+} from "./persistence.js";

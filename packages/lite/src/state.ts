@@ -446,6 +446,48 @@ export function createIndexedDbPsLiteAccessLogStore(
     AccessLogWriter & { capabilities: { accessLogs: "indexeddb" } };
 }
 
+function indexedDbAvailable(): boolean {
+  return typeof indexedDB !== "undefined";
+}
+
+/**
+ * Browser default access-log store for `createPsLiteRuntime`. Lives in this
+ * adapter module (not the runtime) so runtime code stays free of direct
+ * IndexedDB access; a non-browser host injects its own store instead.
+ */
+export function createDefaultPsLiteAccessLogStore(): AccessLogReader &
+  AccessLogWriter {
+  if (!indexedDbAvailable()) {
+    throw new Error(
+      "IndexedDB is required for default PS Lite access log persistence.",
+    );
+  }
+  return createIndexedDbPsLiteAccessLogStore();
+}
+
+/** Browser default token store for `createPsLiteRuntime`. */
+export function createDefaultPsLiteTokenStore(): PsLiteTokenStore {
+  if (!indexedDbAvailable()) {
+    throw new Error("IndexedDB is required for default PS Lite token storage.");
+  }
+  return createIndexedDbPsLiteTokenStore();
+}
+
+/** Browser default `saveConfig` for `createPsLiteRuntime`. */
+export function createDefaultPsLiteSaveConfig(): (
+  config: unknown,
+) => Promise<void> {
+  if (!indexedDbAvailable()) {
+    throw new Error(
+      "IndexedDB is required for default PS Lite config persistence.",
+    );
+  }
+  const stateStore = createIndexedDbPsLiteStateStore();
+  return async (nextConfig: unknown) => {
+    await savePsLiteConfig(stateStore, nextConfig);
+  };
+}
+
 export async function loadOrCreatePsLiteConfig(
   store: PsLiteStateStore,
   defaults?: Partial<ServerConfig>,
