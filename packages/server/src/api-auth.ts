@@ -65,12 +65,12 @@ async function assertRegisteredBuilder(
   gateway: GatewayClient,
   signer: `0x${string}`,
 ): Promise<void> {
-  if ("isRegisteredBuilder" in gateway) {
-    if (await gateway.isRegisteredBuilder(signer)) return;
-    throw new UnregisteredBuilderError();
-  }
-  const builder = await gateway.getBuilder(signer);
-  if (!builder) throw new UnregisteredBuilderError();
+  // vana-sdk 3.14.0's GatewayClient always exposes isRegisteredBuilder, so the
+  // legacy getBuilder feature-detect fallback is now unreachable (its else
+  // branch narrows the client to `never`). Query registration directly, matching
+  // middleware/builder-check.ts.
+  if (await gateway.isRegisteredBuilder(signer)) return;
+  throw new UnregisteredBuilderError();
 }
 
 export function createServerApiAuth(

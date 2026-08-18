@@ -553,9 +553,8 @@ export function createPsLiteRuntime(
     typeof gw.url === "string" &&
     typeof gw.chainId === "number" &&
     gw.contracts &&
-    typeof (gw.contracts as Record<string, unknown>).dataPortabilityEscrow ===
-      "string" &&
-    typeof (gw.contracts as Record<string, unknown>).dataRegistry === "string",
+    typeof gw.contracts.dataPortabilityEscrow === "string" &&
+    typeof gw.contracts.dataRegistry === "string",
   );
   if (paymentEnabled && !gatewayConfigComplete) {
     throw new Error(
