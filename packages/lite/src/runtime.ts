@@ -77,10 +77,9 @@ import {
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import type { PsLiteStorageCapabilities } from "./storage.js";
 import {
-  createIndexedDbPsLiteAccessLogStore,
-  createIndexedDbPsLiteStateStore,
-  createIndexedDbPsLiteTokenStore,
-  savePsLiteConfig,
+  createDefaultPsLiteAccessLogStore,
+  createDefaultPsLiteSaveConfig,
+  createDefaultPsLiteTokenStore,
 } from "./state.js";
 import {
   collectDiagnosticsWithTimeout,
@@ -469,19 +468,6 @@ function toDataStoragePort(
   );
 }
 
-function indexedDbAvailable(): boolean {
-  return typeof indexedDB !== "undefined";
-}
-
-function createDefaultAccessLogStore(): AccessLogReader & AccessLogWriter {
-  if (!indexedDbAvailable()) {
-    throw new Error(
-      "IndexedDB is required for default PS Lite access log persistence.",
-    );
-  }
-  return createIndexedDbPsLiteAccessLogStore();
-}
-
 function createLogId(): string {
   return globalThis.crypto?.randomUUID?.() ?? `log-${Date.now()}`;
 }
@@ -494,29 +480,63 @@ function randomHex(byteLength: number): string {
   );
 }
 
-function createDefaultTokenStore(): PsLiteTokenStore {
-  if (!indexedDbAvailable()) {
-    throw new Error("IndexedDB is required for default PS Lite token storage.");
-  }
-  return createIndexedDbPsLiteTokenStore();
-}
-
-function createDefaultSaveConfig(): (config: unknown) => Promise<void> {
-  if (!indexedDbAvailable()) {
-    throw new Error(
-      "IndexedDB is required for default PS Lite config persistence.",
-    );
-  }
-  const stateStore = createIndexedDbPsLiteStateStore();
-  return async (nextConfig: unknown) => {
-    await savePsLiteConfig(stateStore, nextConfig);
-  };
-}
-
 function bearerToken(request: Request): string | null {
   const authorization = request.headers.get("authorization");
   if (!authorization?.startsWith("Bearer ")) return null;
   return authorization.slice(7);
+}
+
+type PsLiteGatewayConfig = NonNullable<
+  NonNullable<PsLiteRuntimeOptions["config"]>["gateway"]
+>;
+
+/**
+ * Detached copy of the gateway block the caller built the gateway client and
+ * the server signer from, so a later live config write cannot mutate it.
+ */
+function snapshotGatewayConfig(
+  config: PsLiteRuntimeOptions["config"],
+): PsLiteGatewayConfig | undefined {
+  const gateway = config?.gateway;
+  if (!gateway) return undefined;
+  return {
+    ...gateway,
+    ...(gateway.contracts ? { contracts: { ...gateway.contracts } } : {}),
+  };
+}
+
+function resolveX402Settings(
+  config: PsLiteRuntimeOptions["config"],
+  gateway: PsLiteGatewayConfig | undefined = config?.gateway,
+): {
+  paymentEnabled: boolean;
+  gatewayConfig?: DataPortabilityGatewayConfig & { url: string };
+} {
+  // Paid reads need the complete EIP-712 gateway domain. A partial gateway is
+  // valid while payment is disabled, but must never enter the x402 path.
+  const paymentEnabled = config?.payment?.enabled ?? false;
+  const gatewayConfigComplete = Boolean(
+    gateway &&
+    typeof gateway.url === "string" &&
+    typeof gateway.chainId === "number" &&
+    gateway.contracts &&
+    typeof gateway.contracts.dataPortabilityEscrow === "string" &&
+    typeof gateway.contracts.dataRegistry === "string",
+  );
+  if (paymentEnabled && !gatewayConfigComplete) {
+    throw new Error(
+      "PS-Lite x402 payment is enabled (config.payment.enabled) but the gateway " +
+        "config is incomplete. A complete gateway config — url, chainId, and " +
+        "contracts (dataPortabilityEscrow, dataRegistry) — is required to charge " +
+        "for reads. Provide the full config or disable payment.",
+    );
+  }
+  return {
+    paymentEnabled,
+    gatewayConfig: gatewayConfigComplete
+      ? (gateway as DataPortabilityGatewayConfig & { url: string })
+      : undefined,
+  };
 }
 
 export function createPsLiteRuntime(
@@ -533,44 +553,27 @@ export function createPsLiteRuntime(
   let accessLogReader = options.accessLogReader;
   let accessLogWriter = options.accessLogWriter;
   if (!accessLogReader || !accessLogWriter) {
-    const accessLogStore = createDefaultAccessLogStore();
+    const accessLogStore = createDefaultPsLiteAccessLogStore();
     accessLogReader ??= accessLogStore;
     accessLogWriter ??= accessLogStore;
   }
-  const tokenStore = options.tokenStore ?? createDefaultTokenStore();
-  const saveConfig = options.saveConfig ?? createDefaultSaveConfig();
+  const tokenStore = options.tokenStore ?? createDefaultPsLiteTokenStore();
+  const saveConfig = options.saveConfig ?? createDefaultPsLiteSaveConfig();
 
-  // x402 readiness. Paid reads need a COMPLETE gateway config (url + chainId +
-  // the escrow/dataRegistry contracts that back the EIP-712 domains). A partial
-  // config (e.g. just `{ url }`) must never enter x402 — core only gates on
-  // truthiness, so a partial config would produce malformed challenges. When
-  // payment is enabled we require a complete config (fail fast); a partial
-  // config is otherwise fine for the non-x402 paths (grants/MCP/reads).
-  const paymentEnabled = options.config?.payment?.enabled ?? false;
-  const gw = options.config?.gateway;
-  const gatewayConfigComplete = Boolean(
-    gw &&
-    typeof gw.url === "string" &&
-    typeof gw.chainId === "number" &&
-    gw.contracts &&
-    typeof gw.contracts.dataPortabilityEscrow === "string" &&
-    typeof gw.contracts.dataRegistry === "string",
-  );
-  if (paymentEnabled && !gatewayConfigComplete) {
-    throw new Error(
-      "PS-Lite x402 payment is enabled (config.payment.enabled) but the gateway " +
-        "config is incomplete. A complete gateway config — url, chainId, and " +
-        "contracts (dataPortabilityEscrow, dataRegistry) — is required to charge " +
-        "for reads. Provide the full config or disable payment.",
-    );
-  }
-  // Pass the gateway config to the x402 path only when complete; undefined
-  // keeps core's read free instead of issuing a malformed challenge.
-  const x402GatewayConfig:
-    (DataPortabilityGatewayConfig & { url: string }) | undefined =
-    gatewayConfigComplete
-      ? (gw as unknown as DataPortabilityGatewayConfig & { url: string })
-      : undefined;
+  // The gateway client (options.gateway) and the server signer are built ONCE
+  // by the caller, from the startup gateway block: the gateway URL and the
+  // EIP-712 domain (chainId + contracts) are baked into them. A live config
+  // write persists a new gateway block but cannot rebuild those dependencies,
+  // so every gateway-derived request setting stays pinned to this snapshot —
+  // otherwise a config save (the UI PUTs a schema-defaulted config, so an
+  // omitted gateway block silently becomes the schema default) would issue
+  // x402 challenges, and query a gateway, for a domain the accessRecord
+  // signature was never made against. Gateway changes take effect on restart.
+  const boundGatewayConfig = snapshotGatewayConfig(options.config);
+  // Validate initial x402 readiness. The same derivation runs for every read
+  // and before every config write so payment policy cannot drift from the live
+  // config after a same-runtime update.
+  resolveX402Settings(options.config, boundGatewayConfig);
   // The data handler's x402 path only needs signRecordDataAccess; narrow the
   // (optional) signer so a grant-only signer doesn't masquerade as one that can
   // sign access records.
@@ -873,6 +876,7 @@ export function createPsLiteRuntime(
           url.pathname === dataPrefix ||
           url.pathname.startsWith(`${dataPrefix}/`)
         ) {
+          const x402 = resolveX402Settings(options.config, boundGatewayConfig);
           return handlePersonalServerDataRequest(
             request,
             {
@@ -887,10 +891,10 @@ export function createPsLiteRuntime(
               // complete gateway config (validated at construction); a partial
               // config leaves these undefined so reads are served free instead
               // of yielding a malformed challenge.
-              paymentEnabled,
+              paymentEnabled: x402.paymentEnabled,
               gateway: options.gateway,
-              gatewayConfig: x402GatewayConfig,
-              gatewayUrl: x402GatewayConfig?.url,
+              gatewayConfig: x402.gatewayConfig,
+              gatewayUrl: x402.gatewayConfig?.url,
               serverAddress: options.identity?.address,
               // The data owner signed into the RecordDataAccess attestation.
               // Distinct from serverAddress (the server keypair): the core only
@@ -988,7 +992,25 @@ export function createPsLiteRuntime(
               return options.config ?? {};
             },
             async writeConfig(config) {
+              // Validate the policy that will actually run: the incoming
+              // payment toggle against the pinned gateway, so a persisted
+              // config can never leave live reads without a usable domain.
+              resolveX402Settings(
+                config as PsLiteRuntimeOptions["config"],
+                boundGatewayConfig,
+              );
               await saveConfig(config);
+              // Reflect the persisted config in memory so reads (and
+              // GET /ui/api/config) stop serving the pre-write snapshot. The
+              // gateway block is reported as persisted but stays pinned for
+              // behavior until the next restart rebuilds gateway + signer.
+              if (
+                options.config &&
+                typeof config === "object" &&
+                config !== null
+              ) {
+                Object.assign(options.config, config);
+              }
             },
           });
         }
@@ -1008,7 +1030,9 @@ export function createPsLiteRuntime(
             runtimeAvailability: { isAvailable: () => active },
             serverOrigin: url.origin,
             gateway: options.gateway,
-            gatewayConfig: options.config?.gateway as
+            // Pinned like the x402 path: grant registration is signed with the
+            // startup EIP-712 domain, so the MCP route must see the same one.
+            gatewayConfig: boundGatewayConfig as
               (DataPortabilityGatewayConfig & { url?: string }) | undefined,
             serverOwner: options.serverOwner ?? options.identity?.address,
             serverSigner: options.serverSigner,

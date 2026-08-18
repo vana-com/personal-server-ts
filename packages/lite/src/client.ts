@@ -89,10 +89,21 @@ export interface StartPersonalServerLiteOptions extends Omit<
 export async function startPersonalServer(
   options: StartPersonalServerLiteOptions,
 ): Promise<PersonalServerHandle> {
+  if (options.persistence && options.runtime) {
+    throw new Error(
+      "runtime cannot be supplied with a complete persistence bundle",
+    );
+  }
+  if (options.persistence && options.relayStateStore) {
+    throw new Error(
+      "relayStateStore cannot be supplied with a complete persistence bundle",
+    );
+  }
   const localOrigin = options.localOrigin ?? DEFAULT_LITE_ORIGIN;
   const relayOptions = options.relay || undefined;
   const relayStateStore = relayOptions
     ? (options.relayStateStore ??
+      options.persistence?.state ??
       (options.runtime
         ? undefined
         : createIndexedDbPsLiteStateStore({
@@ -169,6 +180,9 @@ export async function startPersonalServer(
       ...resolvedRelayOptions,
       runtime,
       origin: runtimeOrigin,
+      tlsIdentityStore:
+        options.persistence?.relayTlsIdentity ??
+        resolvedRelayOptions.tlsIdentityStore,
       onStatus(nextRelayStatus, detail) {
         relayStatus = nextRelayStatus;
         if (nextRelayStatus === "error") setStatus("error");
