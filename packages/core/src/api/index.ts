@@ -393,11 +393,15 @@ async function handleX402Cycle(
       }
     : undefined;
 
+  // `grant` is narrowed to non-null above, but that narrowing is not carried
+  // into this closure (vana-sdk 3.14.0 made getGrant return `... | null`), so
+  // capture the guaranteed-present value via a typed alias for the closure.
+  const liveGrant: NonNullable<typeof grant> = grant;
   async function buildFreshChallenge(): Promise<X402Challenge> {
     return buildChallenge({
       builder,
       grantId: opIdLower,
-      grant,
+      grant: liveGrant,
       network: deps.network ?? `vana:${gatewayConfig.chainId}`,
       gatewayConfig,
       serverSigner: deps.serverSigner,

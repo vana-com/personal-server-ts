@@ -110,10 +110,16 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 
 async function importAesKey(masterKey: Uint8Array): Promise<CryptoKey> {
   const identityKey = deriveScopeKey(masterKey, "ps-lite.server-identity");
-  return crypto.subtle.importKey("raw", identityKey, "AES-GCM", false, [
-    "encrypt",
-    "decrypt",
-  ]);
+  // deriveScopeKey returns a bare Uint8Array (ArrayBufferLike-backed under
+  // vana-sdk 3.14.0's types), which no longer satisfies importKey's
+  // BufferSource. Copy into a fresh ArrayBuffer-backed view.
+  return crypto.subtle.importKey(
+    "raw",
+    toArrayBuffer(identityKey),
+    "AES-GCM",
+    false,
+    ["encrypt", "decrypt"],
+  );
 }
 
 async function encryptPrivateKey(
