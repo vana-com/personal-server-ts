@@ -499,10 +499,8 @@ function resolveX402Settings(config: PsLiteRuntimeOptions["config"]): {
     typeof gateway.url === "string" &&
     typeof gateway.chainId === "number" &&
     gateway.contracts &&
-    typeof (gateway.contracts as Record<string, unknown>)
-      .dataPortabilityEscrow === "string" &&
-    typeof (gateway.contracts as Record<string, unknown>).dataRegistry ===
-      "string",
+    typeof gateway.contracts.dataPortabilityEscrow === "string" &&
+    typeof gateway.contracts.dataRegistry === "string",
   );
   if (paymentEnabled && !gatewayConfigComplete) {
     throw new Error(
