@@ -486,14 +486,35 @@ function bearerToken(request: Request): string | null {
   return authorization.slice(7);
 }
 
-function resolveX402Settings(config: PsLiteRuntimeOptions["config"]): {
+type PsLiteGatewayConfig = NonNullable<
+  NonNullable<PsLiteRuntimeOptions["config"]>["gateway"]
+>;
+
+/**
+ * Detached copy of the gateway block the caller built the gateway client and
+ * the server signer from, so a later live config write cannot mutate it.
+ */
+function snapshotGatewayConfig(
+  config: PsLiteRuntimeOptions["config"],
+): PsLiteGatewayConfig | undefined {
+  const gateway = config?.gateway;
+  if (!gateway) return undefined;
+  return {
+    ...gateway,
+    ...(gateway.contracts ? { contracts: { ...gateway.contracts } } : {}),
+  };
+}
+
+function resolveX402Settings(
+  config: PsLiteRuntimeOptions["config"],
+  gateway: PsLiteGatewayConfig | undefined = config?.gateway,
+): {
   paymentEnabled: boolean;
   gatewayConfig?: DataPortabilityGatewayConfig & { url: string };
 } {
   // Paid reads need the complete EIP-712 gateway domain. A partial gateway is
   // valid while payment is disabled, but must never enter the x402 path.
   const paymentEnabled = config?.payment?.enabled ?? false;
-  const gateway = config?.gateway;
   const gatewayConfigComplete = Boolean(
     gateway &&
     typeof gateway.url === "string" &&
@@ -539,10 +560,20 @@ export function createPsLiteRuntime(
   const tokenStore = options.tokenStore ?? createDefaultPsLiteTokenStore();
   const saveConfig = options.saveConfig ?? createDefaultPsLiteSaveConfig();
 
+  // The gateway client (options.gateway) and the server signer are built ONCE
+  // by the caller, from the startup gateway block: the gateway URL and the
+  // EIP-712 domain (chainId + contracts) are baked into them. A live config
+  // write persists a new gateway block but cannot rebuild those dependencies,
+  // so every gateway-derived request setting stays pinned to this snapshot —
+  // otherwise a config save (the UI PUTs a schema-defaulted config, so an
+  // omitted gateway block silently becomes the schema default) would issue
+  // x402 challenges, and query a gateway, for a domain the accessRecord
+  // signature was never made against. Gateway changes take effect on restart.
+  const boundGatewayConfig = snapshotGatewayConfig(options.config);
   // Validate initial x402 readiness. The same derivation runs for every read
   // and before every config write so payment policy cannot drift from the live
   // config after a same-runtime update.
-  resolveX402Settings(options.config);
+  resolveX402Settings(options.config, boundGatewayConfig);
   // The data handler's x402 path only needs signRecordDataAccess; narrow the
   // (optional) signer so a grant-only signer doesn't masquerade as one that can
   // sign access records.
@@ -845,7 +876,7 @@ export function createPsLiteRuntime(
           url.pathname === dataPrefix ||
           url.pathname.startsWith(`${dataPrefix}/`)
         ) {
-          const x402 = resolveX402Settings(options.config);
+          const x402 = resolveX402Settings(options.config, boundGatewayConfig);
           return handlePersonalServerDataRequest(
             request,
             {
@@ -961,8 +992,18 @@ export function createPsLiteRuntime(
               return options.config ?? {};
             },
             async writeConfig(config) {
-              resolveX402Settings(config as PsLiteRuntimeOptions["config"]);
+              // Validate the policy that will actually run: the incoming
+              // payment toggle against the pinned gateway, so a persisted
+              // config can never leave live reads without a usable domain.
+              resolveX402Settings(
+                config as PsLiteRuntimeOptions["config"],
+                boundGatewayConfig,
+              );
               await saveConfig(config);
+              // Reflect the persisted config in memory so reads (and
+              // GET /ui/api/config) stop serving the pre-write snapshot. The
+              // gateway block is reported as persisted but stays pinned for
+              // behavior until the next restart rebuilds gateway + signer.
               if (
                 options.config &&
                 typeof config === "object" &&
@@ -989,7 +1030,9 @@ export function createPsLiteRuntime(
             runtimeAvailability: { isAvailable: () => active },
             serverOrigin: url.origin,
             gateway: options.gateway,
-            gatewayConfig: options.config?.gateway as
+            // Pinned like the x402 path: grant registration is signed with the
+            // startup EIP-712 domain, so the MCP route must see the same one.
+            gatewayConfig: boundGatewayConfig as
               (DataPortabilityGatewayConfig & { url?: string }) | undefined,
             serverOwner: options.serverOwner ?? options.identity?.address,
             serverSigner: options.serverSigner,
