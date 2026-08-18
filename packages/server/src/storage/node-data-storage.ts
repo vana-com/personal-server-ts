@@ -4,6 +4,7 @@ import {
   readDataFile,
   readDataFilePreview,
   hasScopeBlocks,
+  readScopeBlockManifest,
   readScopeBlocks,
   writeBlockManifest,
   writeDataFile,
@@ -76,6 +77,9 @@ export function createNodeDataStorage(
     },
     hasScopeBlocks(scope: string, collectedAt: string) {
       return hasScopeBlocks(deps.hierarchyOptions, scope, collectedAt);
+    },
+    readBlockManifest(scope: string, collectedAt: string) {
+      return readScopeBlockManifest(deps.hierarchyOptions, scope, collectedAt);
     },
     writeEnvelope(envelope: DataFileEnvelope) {
       return writeDataFile(deps.hierarchyOptions, envelope);

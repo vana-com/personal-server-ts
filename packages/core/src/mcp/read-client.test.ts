@@ -123,6 +123,154 @@ describe("mcp/read-client", () => {
     expect(readEnvelope).not.toHaveBeenCalled();
   });
 
+  it("passes blockIds to storage and does not report a block-addressed read as fulfillment", async () => {
+    const accessLogWrite = vi.fn();
+    const readFulfillmentReport = vi.fn().mockResolvedValue(undefined);
+    const readScopeBlocks = vi.fn().mockResolvedValue({
+      scope: "instagram.profile",
+      collectedAt: "2026-06-05T00:00:00Z",
+      contentKind: "json",
+      blocks: [
+        {
+          id: "block-42",
+          path: "$.items[41]",
+          mediaType: "application/json",
+          value: { username: "tim" },
+          sizeBytes: 18,
+        },
+      ],
+      warnings: [],
+    });
+
+    const client = createMcpDataReadClient({
+      serverOrigin: SERVER_ORIGIN,
+      granteeAccount: createAccount(),
+      dataApiDeps: {
+        storage: {
+          kind: "custom",
+          listScopes: () => ({ scopes: [], total: 0 }),
+          listVersions: vi.fn(),
+          countVersions: vi.fn(),
+          findEntry: () =>
+            ({
+              scope: "instagram.profile",
+              collectedAt: "2026-06-05T00:00:00Z",
+              fileId: "file-1",
+              sizeBytes: 10,
+            }) as never,
+          findByFileId: vi.fn(),
+          findUnsynced: vi.fn(),
+          readEnvelope: vi.fn(),
+          readScopeBlocks,
+          writeEnvelope: vi.fn(),
+          insertEntry: vi.fn(),
+          updateFileId: vi.fn(),
+          deleteScope: vi.fn(),
+          deleteByFileId: vi.fn(),
+        },
+        auth: {
+          authorizeOwner: vi.fn(),
+          authorizeBuilderList: vi.fn(),
+          authorizeBuilderRead: vi
+            .fn()
+            .mockResolvedValue({ grantId: "grant-1", builder: "0x2222" }),
+        },
+        accessLogWriter: { write: accessLogWrite },
+        readFulfillmentReporter: { report: readFulfillmentReport },
+      },
+    });
+
+    await client.readScopeBlocks({
+      scope: "instagram.profile",
+      grantId: "grant-1",
+      maxBytes: 4096,
+      blockIds: ["block-42"],
+    });
+
+    expect(readScopeBlocks).toHaveBeenCalledWith(
+      "instagram.profile",
+      "2026-06-05T00:00:00Z",
+      { cursor: undefined, maxBytes: 4096, blockIds: ["block-42"] },
+    );
+    expect(accessLogWrite).toHaveBeenCalledTimes(1);
+    expect(readFulfillmentReport).not.toHaveBeenCalled();
+  });
+
+  it("grant-gates and access-logs block manifest reads", async () => {
+    const accessLogWrite = vi.fn();
+    const authorizeBuilderRead = vi
+      .fn()
+      .mockResolvedValue({ grantId: "grant-1", builder: "0x2222" });
+    const manifest = {
+      version: 1 as const,
+      scope: "instagram.profile",
+      collectedAt: "2026-06-05T00:00:00Z",
+      contentKind: "json" as const,
+      blocks: [
+        {
+          id: "block-1",
+          path: "$.items[0]",
+          mediaType: "application/json",
+          sizeBytes: 18,
+        },
+      ],
+      warnings: [],
+    };
+
+    const client = createMcpDataReadClient({
+      serverOrigin: SERVER_ORIGIN,
+      granteeAccount: createAccount(),
+      dataApiDeps: {
+        storage: {
+          kind: "custom",
+          listScopes: () => ({ scopes: [], total: 0 }),
+          listVersions: vi.fn(),
+          countVersions: vi.fn(),
+          findEntry: () =>
+            ({
+              scope: "instagram.profile",
+              collectedAt: "2026-06-05T00:00:00Z",
+              fileId: "file-1",
+              sizeBytes: 10,
+            }) as never,
+          findByFileId: vi.fn(),
+          findUnsynced: vi.fn(),
+          readEnvelope: vi.fn(),
+          readScopeBlocks: vi.fn(),
+          readBlockManifest: vi.fn().mockResolvedValue(manifest),
+          writeEnvelope: vi.fn(),
+          insertEntry: vi.fn(),
+          updateFileId: vi.fn(),
+          deleteScope: vi.fn(),
+          deleteByFileId: vi.fn(),
+        },
+        auth: {
+          authorizeOwner: vi.fn(),
+          authorizeBuilderList: vi.fn(),
+          authorizeBuilderRead,
+        },
+        accessLogWriter: { write: accessLogWrite },
+      },
+    });
+
+    await expect(
+      client.readBlockManifest?.({
+        scope: "instagram.profile",
+        grantId: "grant-1",
+      }),
+    ).resolves.toMatchObject({ blocks: [{ id: "block-1" }] });
+
+    expect(authorizeBuilderRead).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: "instagram.profile",
+        grantId: "grant-1",
+      }),
+    );
+    expect(accessLogWrite).toHaveBeenCalledWith(
+      expect.objectContaining({ action: "read", scope: "instagram.profile" }),
+    );
+  });
+
   it("authorizes and access-logs successful bounded block reads", async () => {
     const accessLogWrite = vi.fn();
     const readFulfillmentReport = vi.fn().mockResolvedValue(undefined);

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import {
   writeDataFile,
   readDataFile,
+  readScopeBlockManifest,
   readScopeBlocks,
   listVersions,
   deleteDataFile,
@@ -149,6 +150,127 @@ describe("HierarchyManager", () => {
       expect(secondPage.blocks[0]?.value).toBe(largeValue.slice(1024, 2048));
       expect(secondPage.blocks[0]?.truncated).toBe(true);
       expect(secondPage.nextCursor).toBeTruthy();
+    });
+  });
+
+  describe("block-addressed reads", () => {
+    async function writeThreeBlocks() {
+      const blocks = ["alpha", "beta", "gamma"].map((word, index) => ({
+        id: `block-00000${index + 1}`,
+        path: `$.items[${index}]`,
+        mediaType: "text/plain",
+        value: word.repeat(100),
+        sizeBytes: new TextEncoder().encode(word.repeat(100)).byteLength,
+      }));
+      await writeBlockManifest(
+        options,
+        scope,
+        collectedAt,
+        {
+          version: 1,
+          scope,
+          collectedAt,
+          contentKind: "json",
+          blocks: blocks.map(({ value: _value, ...ref }) => ref),
+          warnings: [],
+        },
+        blocks,
+      );
+      return blocks;
+    }
+
+    it("returns exactly the requested blocks, in the requested order", async () => {
+      const blocks = await writeThreeBlocks();
+
+      const page = await readScopeBlocks(options, scope, collectedAt, {
+        maxBytes: 64 * 1024,
+        blockIds: ["block-000003", "block-000001"],
+      });
+
+      expect(page.blocks.map((block) => block.id)).toEqual([
+        "block-000003",
+        "block-000001",
+      ]);
+      expect(page.blocks[0]?.value).toBe(blocks[2].value);
+      expect(page.nextCursor).toBeUndefined();
+    });
+
+    it("honours maxBytes and reports the ids it could not return", async () => {
+      await writeThreeBlocks();
+
+      const page = await readScopeBlocks(options, scope, collectedAt, {
+        maxBytes: 600,
+        blockIds: ["block-000001", "block-000002", "block-000003"],
+      });
+
+      expect(page.blocks.map((block) => block.id)).toEqual(["block-000001"]);
+      expect(page.warnings).toContainEqual(
+        expect.objectContaining({ code: "block_selection_truncated" }),
+      );
+    });
+
+    it("warns instead of throwing for ids that are not in the scope", async () => {
+      await writeThreeBlocks();
+
+      const page = await readScopeBlocks(options, scope, collectedAt, {
+        maxBytes: 64 * 1024,
+        blockIds: ["block-000001", "block-does-not-exist"],
+      });
+
+      expect(page.blocks.map((block) => block.id)).toEqual(["block-000001"]);
+      expect(page.warnings).toContainEqual(
+        expect.objectContaining({ code: "block_not_found" }),
+      );
+    });
+  });
+
+  describe("readScopeBlockManifest", () => {
+    it("returns the manifest as a table of contents", async () => {
+      await writeBlockManifest(
+        options,
+        scope,
+        collectedAt,
+        {
+          version: 1,
+          scope,
+          collectedAt,
+          contentKind: "json",
+          blocks: [
+            {
+              id: "block-000001",
+              path: "$.items[0]",
+              mediaType: "application/json",
+              sizeBytes: 12,
+              itemCount: 1,
+            },
+          ],
+          warnings: [],
+        },
+        [
+          {
+            id: "block-000001",
+            path: "$.items[0]",
+            mediaType: "application/json",
+            value: { ok: true },
+            sizeBytes: 12,
+          },
+        ],
+      );
+
+      const manifest = await readScopeBlockManifest(
+        options,
+        scope,
+        collectedAt,
+      );
+      expect(manifest?.blocks).toEqual([
+        expect.objectContaining({ id: "block-000001", itemCount: 1 }),
+      ]);
+    });
+
+    it("returns null when the scope has no manifest", async () => {
+      await expect(
+        readScopeBlockManifest(options, scope, collectedAt),
+      ).resolves.toBeNull();
     });
   });
 

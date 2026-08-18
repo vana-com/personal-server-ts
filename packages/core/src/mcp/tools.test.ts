@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { McpActivityRecorder } from "./activity.js";
-import { MCP_TOOLS } from "./tools.js";
+import { MAX_MCP_TOOL_TIMEOUT_MS, MCP_TOOLS } from "./tools.js";
 import { handleMcpStreamableHttpRequest } from "./server.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { McpDataReadClient } from "./read-client.js";
@@ -77,7 +77,53 @@ describe("mcp/tools", () => {
     expect(response.status).toBe(200);
     const body = await response.text();
     expect(() => JSON.parse(body)).not.toThrow();
-    expect(new TextEncoder().encode(body).byteLength).toBeLessThan(4000);
+    // Budget raised from 4000 when list_scope_blocks was added; the point is
+    // that tools/list stays small enough to cross the relay in one go, not the
+    // exact number.
+    expect(new TextEncoder().encode(body).byteLength).toBeLessThan(5000);
+  });
+
+  it("advertises no timeoutMs larger than the dispatcher will allow", async () => {
+    const response = await handleMcpStreamableHttpRequest(
+      new Request("http://localhost/mcp/test-token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/list",
+          params: {},
+        }),
+      }),
+      {
+        connection: createConnection(),
+        readClient: createMinimalReadClient(),
+      },
+    );
+
+    const body = (await response.json()) as {
+      result: {
+        tools: Array<{
+          name: string;
+          inputSchema: {
+            properties?: { timeoutMs?: { maximum?: number } };
+          };
+        }>;
+      };
+    };
+    const advertised = body.result.tools
+      .map((tool) => tool.inputSchema.properties?.timeoutMs?.maximum)
+      .filter((maximum): maximum is number => typeof maximum === "number");
+
+    // A client that trusts a larger advertised maximum gets a hard
+    // tool_timeout instead of the graceful partial-results path.
+    expect(advertised.length).toBeGreaterThan(0);
+    for (const maximum of advertised) {
+      expect(maximum).toBeLessThanOrEqual(MAX_MCP_TOOL_TIMEOUT_MS);
+    }
   });
 
   it("records activity for MCP HTTP tool calls", async () => {
@@ -818,6 +864,173 @@ describe("mcp/tools", () => {
     ).toBe(false);
     // Non-chargeable scopes are still searched normally.
     expect(payload.searchedScopes).toContain("chatgpt.history");
+  });
+
+  it("search_personal_context returns every matching block in a scope with a usable blockRef", async () => {
+    const readClient = createMinimalReadClient({
+      readScopeBlocks: vi.fn(async ({ scope }: { scope: string }) => ({
+        scope,
+        collectedAt: "2026-06-05T00:00:00Z",
+        contentKind: "json",
+        blocks: [
+          {
+            id: "block-000001",
+            path: "$.items[0]",
+            mediaType: "text/plain",
+            value: "a note about the studio",
+            sizeBytes: 24,
+          },
+          {
+            id: "block-000042",
+            path: "$.items[41]",
+            mediaType: "text/plain",
+            value: "loading the kiln for a bisque firing",
+            sizeBytes: 36,
+          },
+          {
+            id: "block-000077",
+            path: "$.items[76]",
+            mediaType: "text/plain",
+            value: "kiln repair quote from the supplier",
+            sizeBytes: 35,
+          },
+        ],
+        warnings: [],
+      })),
+    });
+
+    const result = await getTool("search_personal_context").handler(
+      {
+        query: "kiln",
+        scopes: ["instagram.profile"],
+        maxScopes: 1,
+        maxResults: 5,
+      },
+      { connection: createConnection(), readClient },
+    );
+
+    const payload = JSON.parse(result.content[0].text);
+    // One scope, two matching blocks: the old one-hit-per-scope guard returned
+    // whichever block came first regardless of the query.
+    expect(payload.results).toHaveLength(2);
+    expect(
+      payload.results
+        .map((match: { blockRef: string }) => match.blockRef)
+        .sort(),
+    ).toEqual(["block-000042", "block-000077"]);
+    expect(payload.results[0].preview).toContain("kiln");
+  });
+
+  it("read_scope fetches the blocks a search hit pointed at", async () => {
+    const readScopeBlocks = vi.fn().mockResolvedValue({
+      scope: "instagram.profile",
+      collectedAt: "2026-06-05T00:00:00Z",
+      contentKind: "json",
+      blocks: [
+        {
+          id: "block-000042",
+          path: "$.items[41]",
+          mediaType: "text/plain",
+          value: "loading the kiln for a bisque firing",
+          sizeBytes: 36,
+        },
+      ],
+      warnings: [],
+    });
+    const readClient = createMinimalReadClient({ readScopeBlocks });
+
+    const result = await getTool("read_scope").handler(
+      {
+        scope: "instagram.profile",
+        blockIds: ["block-000042", "block-000042", ""],
+        maxBytes: 4096,
+      },
+      { connection: createConnection(), readClient: readClient as never },
+    );
+
+    expect(readScopeBlocks).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: "instagram.profile",
+        blockIds: ["block-000042"],
+        maxBytes: 4096,
+      }),
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.blocks).toHaveLength(1);
+    expect(payload.page.requestedBlockIds).toEqual(["block-000042"]);
+    expect(payload.page.hasMore).toBe(false);
+  });
+
+  it("list_scope_blocks returns a paged table of contents", async () => {
+    const readBlockManifest = vi.fn().mockResolvedValue({
+      version: 1,
+      scope: "instagram.profile",
+      collectedAt: "2026-06-05T00:00:00Z",
+      contentKind: "json",
+      blocks: [
+        {
+          id: "block-000001",
+          path: "$.items[0]",
+          mediaType: "application/json",
+          sizeBytes: 120,
+          itemCount: 1,
+        },
+        {
+          id: "block-000002",
+          path: "$.items[1]",
+          mediaType: "application/json",
+          sizeBytes: 130,
+        },
+      ],
+      warnings: [],
+    });
+
+    const result = await getTool("list_scope_blocks").handler(
+      { scope: "instagram.profile", limit: 1 },
+      {
+        connection: createConnection(),
+        readClient: createMinimalReadClient({ readBlockManifest }),
+      },
+    );
+
+    expect(readBlockManifest).toHaveBeenCalledWith({
+      scope: "instagram.profile",
+      grantId: "grant-1",
+    });
+    expect(result.isError).not.toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      scope: "instagram.profile",
+      manifestAvailable: true,
+      totalBlocks: 2,
+      blocks: [
+        {
+          id: "block-000001",
+          path: "$.items[0]",
+          sizeBytes: 120,
+          itemCount: 1,
+        },
+      ],
+      page: { offset: 0, limit: 1, returnedBlocks: 1, nextOffset: 1 },
+    });
+  });
+
+  it("list_scope_blocks degrades instead of failing when a scope has no manifest", async () => {
+    const result = await getTool("list_scope_blocks").handler(
+      { scope: "instagram.profile" },
+      {
+        connection: createConnection(),
+        readClient: createMinimalReadClient({
+          readBlockManifest: vi.fn().mockResolvedValue(null),
+        }),
+      },
+    );
+
+    expect(result.isError).not.toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      scope: "instagram.profile",
+      manifestAvailable: false,
+      blocks: [],
+    });
   });
 
   it("search_personal_context returns a per-scope timeout when a read never resolves", async () => {

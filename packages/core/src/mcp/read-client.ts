@@ -20,7 +20,10 @@
 
 import type { ServerAccount } from "../keys/server-account.js";
 import type { ScopeSummary } from "../storage/index/types.js";
-import type { ReadScopeBlocksResponse } from "../storage/blocks/types.js";
+import type {
+  DataBlockManifest,
+  ReadScopeBlocksResponse,
+} from "../storage/blocks/types.js";
 import type { SearchHit } from "./search/index.js";
 import { decodeDataBlockCursor } from "../storage/blocks/index.js";
 import { bytesToBase64, parseMetadataHeader } from "../contracts/binary.js";
@@ -72,6 +75,10 @@ export interface McpDataReadClient {
    * Perform a grant-gated bounded block read for MCP. This is the path used by
    * MCP tools that need pagination and must not fall back to full envelope
    * reads when the bounded storage path is unavailable.
+   *
+   * `blockIds` switches the read to block-addressed mode: only those blocks are
+   * returned, `cursor` is ignored, and no `nextCursor` is produced. `maxBytes`
+   * still bounds the response.
    */
   readScopeBlocks(params: {
     scope: string;
@@ -84,7 +91,19 @@ export interface McpDataReadClient {
      * MCP sessions) can settle it. The owner/OAuth path never sets this.
      */
     payment?: string;
+    blockIds?: readonly string[];
   }): Promise<McpDataReadBlocksResult>;
+
+  /**
+   * Read a scope's block manifest (ids, paths, sizes) as a table of contents.
+   * Grant-gated like `readScopeBlocks`, but returns no block values. Resolves
+   * null when the scope has no manifest — older scopes and scopes that are
+   * still indexing must degrade, not fail.
+   */
+  readBlockManifest?(params: {
+    scope: string;
+    grantId: string;
+  }): Promise<DataBlockManifest | null>;
 
   /**
    * Perform a grant-gated raw binary read for an approved binary scope. This
@@ -190,10 +209,108 @@ export interface CreateMcpDataReadClientOptions {
   enforcesPayment?: boolean;
 }
 
+type BuilderReadAuthorization = Awaited<
+  ReturnType<
+    CreateMcpDataReadClientOptions["dataApiDeps"]["auth"]["authorizeBuilderRead"]
+  >
+>;
+
 export function createMcpDataReadClient(
   options: CreateMcpDataReadClientOptions,
 ): McpDataReadClient {
   const basePath = options.basePath ?? "/v1/data";
+
+  /**
+   * Sign a grantee request for `scope` and run the same policy check
+   * `/v1/data/:scope` runs. Shared by every grant-gated read below so none of
+   * them can drift away from the external read path's authorization.
+   */
+  async function authorizeScopeRead(params: {
+    scope: string;
+    grantId: string;
+    fileId?: string;
+    /**
+     * The exact version this read serves (cursor-pinned or latest). A
+     * payment-enforcing auth port (self-signing MCP sessions) binds the x402
+     * settlement to it; the owner/OAuth path ignores it.
+     */
+    at?: string;
+    /**
+     * Optional base64 `X-PAYMENT` proof (x402), forwarded as a header on the
+     * in-process read request so a payment-enforcing auth port can settle it.
+     * The owner/OAuth path never sets this.
+     */
+    payment?: string;
+  }): Promise<{ request: Request; authResult?: BuilderReadAuthorization }> {
+    const safeScope = encodeURIComponent(params.scope);
+    const signingUri = `${basePath}/${safeScope}`;
+    const authorization = await signMcpGranteeRequest({
+      account: options.granteeAccount,
+      aud: options.serverOrigin,
+      method: "GET",
+      uri: signingUri,
+      grantId: params.grantId,
+    });
+    const url = new URL(signingUri, options.serverOrigin).toString();
+    const request = new Request(url, {
+      method: "GET",
+      headers: {
+        Authorization: authorization,
+        ...(params.payment ? { "X-PAYMENT": params.payment } : {}),
+      },
+    });
+
+    try {
+      const authResult = await options.dataApiDeps.auth.authorizeBuilderRead({
+        request,
+        scope: params.scope,
+        grantId: params.grantId,
+        fileId: params.fileId,
+        ...(params.at ? { at: params.at } : {}),
+      });
+      return { request, authResult };
+    } catch (err) {
+      if (err instanceof ProtocolError) {
+        throw new McpDataReadError(err.code, err.toJSON());
+      }
+      throw err;
+    }
+  }
+
+  async function writeReadAccessLog(
+    request: Request,
+    params: {
+      scope: string;
+      grantId: string;
+      authResult?: BuilderReadAuthorization;
+    },
+  ): Promise<{
+    logId: string;
+    timestamp: string;
+    ipAddress: string;
+    userAgent: string;
+  }> {
+    const logId = options.dataApiDeps.createLogId?.() ?? crypto.randomUUID();
+    const timestamp = (
+      options.dataApiDeps.now ?? (() => new Date())
+    )().toISOString();
+    const ipAddress =
+      request.headers.get("x-forwarded-for") ??
+      request.headers.get("x-real-ip") ??
+      "unknown";
+    const userAgent = request.headers.get("user-agent") ?? "unknown";
+    await options.dataApiDeps.accessLogWriter.write({
+      logId,
+      grantId: params.authResult?.grantId ?? params.grantId,
+      builder: params.authResult?.builder ?? options.granteeAccount.address,
+      action: "read",
+      scope: params.scope,
+      timestamp,
+      ipAddress,
+      userAgent,
+    });
+    return { logId, timestamp, ipAddress, userAgent };
+  }
 
   return {
     enforcesPayment: options.enforcesPayment ?? false,
@@ -250,7 +367,14 @@ export function createMcpDataReadClient(
       };
     },
 
-    async readScopeBlocks({ scope, grantId, cursor, maxBytes, payment }) {
+    async readScopeBlocks({
+      scope,
+      grantId,
+      cursor,
+      maxBytes,
+      payment,
+      blockIds,
+    }) {
       const storage = options.dataApiDeps.storage;
       if (!storage.readScopeBlocks) {
         throw new McpDataReadError(503, {
@@ -273,47 +397,15 @@ export function createMcpDataReadClient(
         });
       }
 
-      const safeScope = encodeURIComponent(scope);
-      const signingUri = `${basePath}/${safeScope}`;
-      const authorization = await signMcpGranteeRequest({
-        account: options.granteeAccount,
-        aud: options.serverOrigin,
-        method: "GET",
-        uri: signingUri,
+      const { request, authResult } = await authorizeScopeRead({
+        scope,
         grantId,
+        fileId: selectedEntry.fileId ?? undefined,
+        // The exact version this read serves (cursor-pinned or latest) —
+        // a payment-enforcing auth port binds the x402 settlement to it.
+        at: selectedEntry.collectedAt,
+        payment,
       });
-      const url = new URL(signingUri, options.serverOrigin).toString();
-      const request = new Request(url, {
-        method: "GET",
-        headers: {
-          Authorization: authorization,
-          ...(payment ? { "X-PAYMENT": payment } : {}),
-        },
-      });
-
-      let authResult:
-        | Awaited<
-            ReturnType<
-              CreateMcpDataReadClientOptions["dataApiDeps"]["auth"]["authorizeBuilderRead"]
-            >
-          >
-        | undefined;
-      try {
-        authResult = await options.dataApiDeps.auth.authorizeBuilderRead({
-          request,
-          scope,
-          grantId,
-          fileId: selectedEntry.fileId ?? undefined,
-          // The exact version this read serves (cursor-pinned or latest) —
-          // a payment-enforcing auth port binds the x402 settlement to it.
-          at: selectedEntry.collectedAt,
-        });
-      } catch (err) {
-        if (err instanceof ProtocolError) {
-          throw new McpDataReadError(err.code, err.toJSON());
-        }
-        throw err;
-      }
 
       try {
         const result = await storage.readScopeBlocks(
@@ -322,32 +414,19 @@ export function createMcpDataReadClient(
           {
             cursor,
             maxBytes: maxBytes ?? 16_384,
+            ...(blockIds?.length ? { blockIds } : {}),
           },
         );
-        const logId =
-          options.dataApiDeps.createLogId?.() ?? crypto.randomUUID();
-        const timestamp = (
-          options.dataApiDeps.now ?? (() => new Date())
-        )().toISOString();
-        const ipAddress =
-          request.headers.get("x-forwarded-for") ??
-          request.headers.get("x-real-ip") ??
-          "unknown";
-        const userAgent = request.headers.get("user-agent") ?? "unknown";
-        await options.dataApiDeps.accessLogWriter.write({
-          logId,
-          grantId: authResult?.grantId ?? grantId,
-          builder: authResult?.builder ?? options.granteeAccount.address,
-          action: "read",
-          scope,
-          timestamp,
-          ipAddress,
-          userAgent,
-        });
+        const { logId, timestamp, ipAddress, userAgent } =
+          await writeReadAccessLog(request, { scope, grantId, authResult });
+        // A block-addressed read serves a hand-picked subset, so it never
+        // completes the scope the way an uncursored full read does; reporting
+        // fulfillment for it would settle the read on partial data.
         if (
           authResult?.grantId &&
           authResult.builder &&
           !cursor &&
+          !blockIds?.length &&
           !result.nextCursor
         ) {
           reportPersonalServerReadFulfillment(options.dataApiDeps, {
@@ -384,6 +463,33 @@ export function createMcpDataReadClient(
         }
         throw err;
       }
+    },
+
+    async readBlockManifest({ scope, grantId }) {
+      const storage = options.dataApiDeps.storage;
+      if (!storage.readBlockManifest) return null;
+
+      const selectedEntry = storage.findEntry({ scope });
+      if (!selectedEntry) {
+        throw new McpDataReadError(404, {
+          error: "NOT_FOUND",
+          message: `No data found for scope "${scope}"`,
+        });
+      }
+
+      const { request, authResult } = await authorizeScopeRead({
+        scope,
+        grantId,
+        fileId: selectedEntry.fileId ?? undefined,
+      });
+      const manifest = await storage.readBlockManifest(
+        scope,
+        selectedEntry.collectedAt,
+      );
+      // Logged like any other grant-gated read, but never reported as a read
+      // fulfillment: a table of contents carries no block values.
+      await writeReadAccessLog(request, { scope, grantId, authResult });
+      return manifest;
     },
 
     async readRawScopeFile({ scope, grantId, at, fileId, payment }) {

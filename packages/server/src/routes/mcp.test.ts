@@ -1815,6 +1815,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
       "list_granted_scopes",
       "request_scope_access",
       "read_scope",
+      "list_scope_blocks",
       "get_scope_file",
       "search_personal_context",
     ]);

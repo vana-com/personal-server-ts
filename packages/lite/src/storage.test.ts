@@ -555,6 +555,54 @@ describe("createPersistentPsLiteStorage", () => {
     expect(seen).toEqual([{ index: 0 }, { index: 1 }, { index: 2 }]);
   });
 
+  it("reads only the named blocks and exposes the manifest as a table of contents", async () => {
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      createMemoryPsLitePersistence(),
+    );
+    const { manifest, blocks } = blockFixture(
+      "chatgpt.conversations",
+      "2026-05-08T00:00:00.000Z",
+      3,
+    );
+    await storage.writeBlockManifest?.(
+      manifest.scope,
+      manifest.collectedAt,
+      manifest,
+      blocks,
+    );
+
+    const page = await storage.readScopeBlocks!(
+      manifest.scope,
+      manifest.collectedAt,
+      { maxBytes: 16 * 1024, blockIds: ["block-2", "block-0"] },
+    );
+
+    expect(page.blocks.map((block) => block.value)).toEqual([
+      { index: 2 },
+      { index: 0 },
+    ]);
+    expect(page.nextCursor).toBeUndefined();
+
+    await expect(
+      storage.readBlockManifest?.(manifest.scope, manifest.collectedAt),
+    ).resolves.toMatchObject({ blocks: manifest.blocks });
+  });
+
+  it("returns no manifest for a scope that was never indexed", async () => {
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      createMemoryPsLitePersistence(),
+    );
+
+    await expect(
+      storage.readBlockManifest?.(
+        "chatgpt.conversations",
+        "2026-05-08T00:00:00.000Z",
+      ),
+    ).resolves.toBeNull();
+  });
+
   it("pages through a single oversized persistent block", async () => {
     const storage = await createPersistentPsLiteStorage(
       { kind: "indexeddb" },

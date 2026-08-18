@@ -99,8 +99,25 @@ export interface DataStoragePort extends RuntimeStoragePort {
   readScopeBlocks?(
     scope: string,
     collectedAt: string,
-    options: { cursor?: string; maxBytes: number },
+    options: {
+      cursor?: string;
+      maxBytes: number;
+      /**
+       * Block-addressed read: return only these blocks, in this order. When
+       * set, `cursor` is ignored and no `nextCursor` is produced; `maxBytes`
+       * still applies and any ids it cuts off are reported as warnings.
+       */
+      blockIds?: readonly string[];
+    },
   ): Promise<ReadScopeBlocksResponse>;
+  /**
+   * Read a scope's block manifest (table of contents) without reading any block
+   * values. Returns null when the scope has no manifest yet.
+   */
+  readBlockManifest?(
+    scope: string,
+    collectedAt: string,
+  ): Promise<DataBlockManifest | null>;
   hasScopeBlocks?(
     scope: string,
     collectedAt: string,

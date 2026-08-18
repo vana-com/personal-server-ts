@@ -6,6 +6,7 @@ import type {
 import {
   DataBlockStorageError,
   encodeDataBlockCursor,
+  selectScopeBlocksByIds,
   validateDataBlockCursor,
 } from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
@@ -193,6 +194,25 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
           `Block manifest not found for ${scope} at ${collectedAt}`,
         );
       }
+      if (options.blockIds?.length) {
+        const selection = await selectScopeBlocksByIds(
+          manifest,
+          options.blockIds,
+          { maxBytes: options.maxBytes },
+          async (blockId) =>
+            blockPayloads.get(`${blockKey(scope, collectedAt)}\n${blockId}`) ??
+            null,
+        );
+        return {
+          scope: manifest.scope,
+          collectedAt: manifest.collectedAt,
+          ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
+          contentKind: manifest.contentKind,
+          blocks: selection.blocks,
+          warnings: [...manifest.warnings, ...selection.warnings],
+        };
+      }
+
       const cursorResult = options.cursor
         ? validateDataBlockCursor(options.cursor, { scope, collectedAt })
         : { ok: true as const, cursor: null };
@@ -272,6 +292,10 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
 
     async hasScopeBlocks(scope, collectedAt) {
       return blockManifests.has(blockKey(scope, collectedAt));
+    },
+
+    async readBlockManifest(scope, collectedAt) {
+      return blockManifests.get(blockKey(scope, collectedAt)) ?? null;
     },
 
     async writeBlockManifest(scope, collectedAt, manifest, blocks) {
