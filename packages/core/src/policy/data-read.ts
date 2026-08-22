@@ -43,7 +43,14 @@ export interface DataReadPolicyPorts {
   runtimeAvailability?: RuntimeAvailabilityPort;
 }
 
-function parseExpiresAtSeconds(value: unknown): number | null {
+/**
+ * Parse a grant's `expiresAt` into unix seconds. Accepts the legacy
+ * uint256-seconds string, a numeric value, or the current gateway ISO
+ * timestamp. Returns 0 for "perpetual" encodings (null/undefined/"0") and
+ * null for unparseable input. Shared by the read and write policies so both
+ * stay aligned with the gateway response shape.
+ */
+export function parseGrantExpiresAtSeconds(value: unknown): number | null {
   if (value === null || value === undefined || value === "0") return 0;
   if (typeof value === "number") return Number.isFinite(value) ? value : null;
   if (typeof value !== "string") return null;
@@ -101,7 +108,7 @@ export async function verifyDataReadPolicy(
     // DPv2 may surface either the legacy uint256-seconds string or the
     // current gateway ISO timestamp. Parse both so the policy stays aligned
     // with the gateway response shape.
-    const expiresAtSec = parseExpiresAtSeconds(grant.expiresAt);
+    const expiresAtSec = parseGrantExpiresAtSeconds(grant.expiresAt);
     if (expiresAtSec === null) {
       throw new ScopeMismatchError({
         requestedScope: input.requestedScope,

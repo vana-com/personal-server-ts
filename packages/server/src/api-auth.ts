@@ -6,8 +6,18 @@ import {
 import type {
   PersonalServerApiAuthPort,
   PersonalServerReadAuthInput,
+  PersonalServerWriteAuthInput,
+  PersonalServerWriteAuthResult,
 } from "@opendatalabs/personal-server-ts-core/api";
-import { verifyDataReadPolicy } from "@opendatalabs/personal-server-ts-core/policy";
+import {
+  verifyDataReadPolicy,
+  verifyDataWritePolicy,
+} from "@opendatalabs/personal-server-ts-core/policy";
+import {
+  hashWriteSessionToken,
+  verifyWriterAttribution,
+  type WriteSessionStore,
+} from "@opendatalabs/personal-server-ts-core/write";
 import {
   NotOwnerError,
   ProtocolError,
@@ -28,6 +38,14 @@ export interface ServerApiAuthDeps {
   tokenStore?: SessionTokenVerifierPort;
   dataStorage?: Pick<DataStoragePort, "findEntry">;
   runtimeAvailability?: RuntimeAvailabilityPort;
+  /**
+   * Write API sessions. When present, POST /v1/data/:scope accepts a bearer
+   * write-session token (minted by POST /v1/write/session) and authorizes the
+   * write as the session's builder via verifyDataWritePolicy + the
+   * X-Vana-Write-Signature attribution proof. Absent = owner-only ingest,
+   * exactly as before.
+   */
+  writeSessionStore?: WriteSessionStore;
 }
 
 function serverNotConfigured(): ProtocolError {
@@ -73,21 +91,80 @@ async function assertRegisteredBuilder(
   throw new UnregisteredBuilderError();
 }
 
+function bearerToken(request: Request): string | null {
+  const header = request.headers.get("authorization");
+  if (!header?.startsWith("Bearer ")) return null;
+  return header.slice(7);
+}
+
 export function createServerApiAuth(
   deps: ServerApiAuthDeps,
 ): PersonalServerApiAuthPort {
-  return {
-    async authorizeOwner(request) {
-      const result = await authenticate(request, deps);
-      if (result.isPolicyBypass) return;
-      if (!deps.serverOwner) throw serverNotConfigured();
-      if (!isOwner(result.auth.signer, deps.serverOwner)) {
-        throw new NotOwnerError({
-          signer: result.auth.signer,
-          expected: deps.serverOwner,
+  async function authorizeOwner(request: Request): Promise<void> {
+    const result = await authenticate(request, deps);
+    if (result.isPolicyBypass) return;
+    if (!deps.serverOwner) throw serverNotConfigured();
+    if (!isOwner(result.auth.signer, deps.serverOwner)) {
+      throw new NotOwnerError({
+        signer: result.auth.signer,
+        expected: deps.serverOwner,
+      });
+    }
+  }
+
+  /**
+   * Delegated ingest. A bearer token that resolves to a live write session
+   * authorizes as the session builder: the write policy re-runs against the
+   * LIVE grant (revocation / expiry / scope coverage stay authoritative per
+   * write), and the builder's X-Vana-Write-Signature payload proof is
+   * verified and returned for the handler to store with the record. Any
+   * other credential (owner Web3Signed, dev token, control-plane token,
+   * unknown bearer) falls through to the owner path unchanged.
+   */
+  async function authorizeWrite(
+    input: PersonalServerWriteAuthInput,
+  ): Promise<PersonalServerWriteAuthResult | void> {
+    const token = bearerToken(input.request);
+    if (token && deps.writeSessionStore) {
+      const session = await deps.writeSessionStore.getByTokenHash(
+        await hashWriteSessionToken(token),
+      );
+      if (session) {
+        if (!deps.serverOwner) throw serverNotConfigured();
+        const grant = await verifyDataWritePolicy(
+          {
+            signer: session.builderAddress,
+            grantId: session.grantId,
+            requestedScope: input.scope,
+            serverOwner: deps.serverOwner,
+          },
+          {
+            authSessionVerifier: deps.gateway,
+            grantVerifier: deps.gateway,
+            runtimeAvailability: deps.runtimeAvailability,
+            // Fee seam intentionally not wired: builder writes are free in
+            // the demo slice (write fee mechanics undecided).
+          },
+        );
+        const attribution = await verifyWriterAttribution({
+          request: input.request,
+          builderAddress: session.builderAddress,
+          grantId: grant.id,
+          serverOrigin: deps.serverOrigin,
         });
+        return {
+          builder: session.builderAddress,
+          grantId: grant.id,
+          attribution,
+        };
       }
-    },
+    }
+    await authorizeOwner(input.request);
+  }
+
+  return {
+    authorizeOwner,
+    authorizeWrite,
 
     async authorizeBuilderList(request) {
       const result = await authenticate(request, deps);

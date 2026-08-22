@@ -43,6 +43,7 @@ import type {
   GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../signing/index.js";
+import type { WriterAttribution } from "../write/attribution.js";
 import {
   buildChallenge,
   parsePaymentHeader,
@@ -68,6 +69,24 @@ export interface PersonalServerReadAuthResult {
   grantId?: string;
 }
 
+export interface PersonalServerWriteAuthInput {
+  request: Request;
+  /** Raw scope path param (validated by parseDataScopeContract after auth,
+   * same precedence as the owner write path). */
+  scope: string;
+}
+
+/**
+ * Result of authorizing a DELEGATED (write-session) write. A void return
+ * means the request was authorized as the owner instead — the ingest then
+ * proceeds exactly as today, with no attribution stamped.
+ */
+export interface PersonalServerWriteAuthResult {
+  builder: `0x${string}`;
+  grantId: string;
+  attribution: WriterAttribution;
+}
+
 export interface PersonalServerReadFulfillment {
   builder: string;
   fileId?: string;
@@ -89,6 +108,18 @@ export interface PersonalServerApiAuthPort {
   authorizeBuilderRead(
     input: PersonalServerReadAuthInput,
   ): Promise<PersonalServerReadAuthResult | void>;
+  /**
+   * Authorize a data ingest (POST /v1/data/:scope). Optional — auth ports
+   * that don't support delegated writes omit it and the handler falls back
+   * to authorizeOwner, preserving today's owner-only behavior. Ports that DO
+   * support write sessions handle BOTH paths here: a recognized session
+   * token authorizes as the builder (write policy + attribution proof) and
+   * returns the attribution to store; anything else falls through to the
+   * owner path and returns void.
+   */
+  authorizeWrite?(
+    input: PersonalServerWriteAuthInput,
+  ): Promise<PersonalServerWriteAuthResult | void>;
 }
 
 export interface PersonalServerApiLogger {
@@ -862,11 +893,41 @@ export async function handlePersonalServerDataRequest(
     }
 
     if (request.method === "POST") {
-      await deps.auth.authorizeOwner(request);
+      // Delegated writes: an auth port that supports write sessions handles
+      // both paths in authorizeWrite (builder session token -> write policy +
+      // attribution; anything else -> owner path). Ports without it keep
+      // today's owner-only gate.
+      let writeAuth: PersonalServerWriteAuthResult | undefined;
+      if (deps.auth.authorizeWrite) {
+        writeAuth =
+          (await deps.auth.authorizeWrite({ request, scope: scopeParam })) ??
+          undefined;
+      } else {
+        await deps.auth.authorizeOwner(request);
+      }
       const scopeResult = parseDataScopeContract(scopeParam);
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
       const collectedAtValue = collectedAt(deps.now ?? (() => new Date()));
       const status = deps.syncManager ? "syncing" : "stored";
+
+      // Builder writes land in the same access log as builder reads, so the
+      // owner sees who wrote what under which grant.
+      const logBuilderWrite = async (): Promise<void> => {
+        if (!writeAuth) return;
+        await deps.accessLogWriter.write({
+          logId: deps.createLogId?.() ?? crypto.randomUUID(),
+          grantId: writeAuth.grantId,
+          builder: writeAuth.builder,
+          action: "write",
+          scope: scopeResult.scope,
+          timestamp: (deps.now ?? (() => new Date()))().toISOString(),
+          ipAddress:
+            request.headers.get("x-forwarded-for") ??
+            request.headers.get("x-real-ip") ??
+            "unknown",
+          userAgent: request.headers.get("user-agent") ?? "unknown",
+        });
+      };
 
       // Binary / unstructured data (e.g. a PDF): the body is raw bytes. DPv2
       // data points are scope-addressed and carry no schemaId, so unstructured
@@ -883,6 +944,7 @@ export async function handlePersonalServerDataRequest(
           metadata: parseMetadataHeader(request.headers.get("x-vana-metadata")),
           collectedAt: collectedAtValue,
           status,
+          attribution: writeAuth?.attribution,
         });
         if (!result.ok) return contractErrorResponse(result);
         deps.logger?.info?.(
@@ -892,9 +954,11 @@ export async function handlePersonalServerDataRequest(
             path: result.writeResult.relativePath,
             mimeType: binaryMimeType(request),
             sizeBytes: bytes.length,
+            ...(writeAuth ? { builder: writeAuth.builder } : {}),
           },
           "Binary data file ingested",
         );
+        await logBuilderWrite();
         notifyNewData(deps.syncManager);
         return jsonResponse(result.response, { status: 201 });
       }
@@ -912,6 +976,7 @@ export async function handlePersonalServerDataRequest(
         body: parsed.body,
         collectedAt: collectedAtValue,
         status,
+        attribution: writeAuth?.attribution,
       });
       if (!result.ok) return contractErrorResponse(result);
       deps.logger?.info?.(
@@ -919,9 +984,11 @@ export async function handlePersonalServerDataRequest(
           scope: scopeResult.scope,
           collectedAt: collectedAtValue,
           path: result.writeResult.relativePath,
+          ...(writeAuth ? { builder: writeAuth.builder } : {}),
         },
         "Data file ingested",
       );
+      await logBuilderWrite();
       notifyNewData(deps.syncManager);
       return jsonResponse(result.response, { status: 201 });
     }

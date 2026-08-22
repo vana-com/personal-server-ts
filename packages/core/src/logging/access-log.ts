@@ -2,7 +2,7 @@ export interface AccessLogEntry {
   logId: string;
   grantId: string;
   builder: string;
-  action: "read";
+  action: "read" | "write";
   scope: string;
   timestamp: string;
   ipAddress: string;

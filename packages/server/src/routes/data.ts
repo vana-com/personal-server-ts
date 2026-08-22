@@ -18,6 +18,7 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/ports";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { TokenStore } from "../token-store.js";
+import type { WriteSessionStore } from "@opendatalabs/personal-server-ts-core/write";
 import type { Logger } from "pino";
 import {
   createBodyLimit,
@@ -60,6 +61,12 @@ export interface DataRouteDeps {
   dataStorage?: DataStoragePort;
   runtimeAvailability?: RuntimeAvailabilityPort;
   /**
+   * Write API sessions (POST /v1/write/session). When present, the ingest
+   * endpoint accepts write-session bearer tokens for delegated builder
+   * writes; absent = owner-only ingest, unchanged.
+   */
+  writeSessionStore?: WriteSessionStore;
+  /**
    * Powers the RECORD_DATA_ACCESS attestation embedded in 402 challenges.
    * When supplied alongside serverOwner + paymentEnabled, every challenge
    * carries a server-signed accessRecord. Required for the on-chain
@@ -93,6 +100,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     tokenStore: deps.tokenStore,
     dataStorage,
     runtimeAvailability: deps.runtimeAvailability,
+    writeSessionStore: deps.writeSessionStore,
   });
 
   app.use("/:scope", createBodyLimit(DATA_INGEST_MAX_SIZE));
