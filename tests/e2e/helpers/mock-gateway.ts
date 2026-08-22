@@ -5,6 +5,8 @@ import type { ServerType } from "@hono/node-server";
 
 export interface MockGateway {
   url: string;
+  /** Register (or replace) a grant served by GET /v1/grants/:grantId. */
+  setGrant: (grantId: string, grant: Record<string, unknown>) => void;
   cleanup: () => Promise<void>;
 }
 
@@ -62,8 +64,13 @@ export async function startMockGateway(
     );
   });
 
+  // Grants registered via mockGateway.setGrant are served; unknown ids 404
+  // (the SDK client maps 404 to null).
+  const grants = new Map<string, Record<string, unknown>>();
   app.get("/v1/grants/:grantId", (c) => {
-    return c.json({ error: "not found" }, 404);
+    const grant = grants.get(c.req.param("grantId"));
+    if (!grant) return c.json({ error: "not found" }, 404);
+    return c.json(wrapEnvelope(grant));
   });
 
   app.get("/v1/grants", (c) => {
@@ -154,6 +161,9 @@ export async function startMockGateway(
 
   return {
     url,
+    setGrant: (grantId, grant) => {
+      grants.set(grantId, grant);
+    },
     cleanup: async () => {
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
