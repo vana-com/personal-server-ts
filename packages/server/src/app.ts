@@ -13,6 +13,11 @@ import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logg
 import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
 import { healthRoute, type HealthDeps } from "./routes/health.js";
 import { dataRoutes } from "./routes/data.js";
+import { writeSessionRoutes } from "./routes/write-session.js";
+import {
+  createInMemoryWriteSessionStore,
+  type WriteSessionStore,
+} from "@opendatalabs/personal-server-ts-core/write";
 import { grantsRoutes } from "./routes/grants.js";
 import { accessLogsRoutes } from "./routes/access-logs.js";
 import { syncRoutes } from "./routes/sync.js";
@@ -107,10 +112,20 @@ export interface AppDeps {
   mcpOAuthAuthorizationStore?: McpOAuthAuthorizationStore;
   mcpOAuthApprovalUrl?: string | (() => string);
   mcpActivityRecorder?: McpActivityRecorder;
+  /**
+   * Write API session store shared between POST /v1/write/session (which
+   * mints tokens) and the ingest endpoint (which redeems them). Defaults to
+   * an in-memory store, mirroring the MCP connection store default.
+   */
+  writeSessionStore?: WriteSessionStore;
 }
 
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
+
+  // One store for mint (POST /v1/write/session) and redeem (data ingest).
+  const writeSessionStore =
+    deps.writeSessionStore ?? createInMemoryWriteSessionStore();
 
   // CORS — allow all origins for browser-based clients
   app.use(
@@ -169,7 +184,23 @@ export function createApp(deps: AppDeps): Hono {
       gatewayUrl:
         deps.gatewayUrl ?? deps.config?.gateway.url ?? deps.gatewayConfig?.url,
       paymentEnabled: deps.paymentEnabled,
+      writeSessionStore,
       mountPath: "/v1/data",
+    }),
+  );
+
+  // Mount the Write API session handshake (delegated builder writes).
+  app.route(
+    "/v1/write",
+    writeSessionRoutes({
+      logger: deps.logger,
+      serverOrigin: deps.serverOrigin,
+      serverOwner: deps.serverOwner,
+      gateway: deps.gateway,
+      devToken: deps.devToken,
+      accessToken: deps.accessToken,
+      tokenStore: deps.tokenStore,
+      sessionStore: writeSessionStore,
     }),
   );
 
