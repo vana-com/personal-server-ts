@@ -7,6 +7,11 @@ import {
 import { type WriteResult } from "../storage/hierarchy/index.js";
 import { buildBinaryEnvelopeData, sha256Hex } from "./binary.js";
 import { buildDataBlocksAsync } from "../storage/blocks/build.js";
+import {
+  hasReservedWriterKey,
+  stampWriterAttribution,
+  type WriterAttribution,
+} from "../write/attribution.js";
 
 export type DataContractErrorCode =
   "INVALID_SCOPE" | "INVALID_BODY" | "NOT_FOUND";
@@ -81,6 +86,13 @@ export interface IngestDataContractInput {
   body: unknown;
   collectedAt: string;
   status: "stored" | "syncing";
+  /**
+   * Builder attribution for delegated (write-session) writes. When present,
+   * it is stamped into the envelope `data` under the reserved `$writtenBy`
+   * key so it travels through the unchanged encrypt/upload/register path.
+   * Owner writes pass nothing and the envelope is byte-identical to today.
+   */
+  attribution?: WriterAttribution;
 }
 
 export interface IngestDataContractResult {
@@ -105,6 +117,8 @@ export interface IngestBinaryDataContractInput {
   metadata?: unknown;
   collectedAt: string;
   status: "stored" | "syncing";
+  /** Builder attribution for delegated writes (see IngestDataContractInput). */
+  attribution?: WriterAttribution;
 }
 
 export interface DeleteDataScopeContractInput {
@@ -280,10 +294,25 @@ export async function ingestDataContract(
     };
   }
 
+  // The attribution key is server-stamped, never caller-supplied — a payload
+  // that already carries it could forge (or shadow) its own attribution.
+  if (input.attribution && hasReservedWriterKey(input.body)) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: "INVALID_BODY",
+        message: "Request body must not contain the reserved $writtenBy key",
+      },
+    };
+  }
+
   const envelope = createDataFileEnvelope(
     scopeResult.scope,
     input.collectedAt,
-    input.body,
+    input.attribution
+      ? stampWriterAttribution(input.body, input.attribution)
+      : input.body,
   );
   const writeResult = await input.storage.writeEnvelope(envelope);
   try {
@@ -349,7 +378,7 @@ export async function ingestBinaryDataContract(
   const envelope = createDataFileEnvelope(
     scopeResult.scope,
     input.collectedAt,
-    data,
+    input.attribution ? stampWriterAttribution(data, input.attribution) : data,
   );
   const writeResult = await input.storage.writeEnvelope(envelope);
   try {

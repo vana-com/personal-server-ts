@@ -123,6 +123,10 @@
     "./payment": {
       "types": "./dist/payment/index.d.ts",
       "import": "./dist/payment/index.js"
+    },
+    "./write": {
+      "types": "./dist/write/index.d.ts",
+      "import": "./dist/write/index.js"
     }
   },
   "scripts": {
