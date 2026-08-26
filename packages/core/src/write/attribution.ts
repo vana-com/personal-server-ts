@@ -20,19 +20,25 @@
  * therefore cannot be lifted onto another scope's record or relabelled with a
  * different grant and still verify.
  *
- * A third party holding the record can verify authorship from the envelope
- * ALONE (verifyStoredWriterAttribution): recover the signer over the stored
- * proof's base64url payload (EIP-191), check the signed claims against the
- * envelope's scope and stored grantId, and re-derive the signed bytes from
- * the stored data. For that to hold, the stored form must re-serialize to
- * exactly the bytes the builder signed, so:
- *   - binary records keep the raw bytes verbatim (base64 in `$binary`);
- *   - JSON records must be sent in compact form, i.e. what JSON.stringify
- *     emits (no insignificant whitespace, keys in the order given). Ingest
- *     stores the parsed object, and JSON.parse/JSON.stringify round-trips
- *     compact JSON byte-for-byte; a body that does not round-trip is rejected
- *     at write time (WRITE_BODY_NOT_CANONICAL) instead of storing an
- *     attribution nobody can check.
+ * What the builder signs is the STORED representation, not the wire body:
+ * the compact JSON of the envelope `data` record the PS will write (minus
+ * `$writtenBy`). A third party holding the envelope can therefore verify
+ * authorship from the envelope ALONE (verifyStoredWriterAttribution): recover
+ * the signer over the stored proof's base64url payload (EIP-191), check the
+ * signed claims against the envelope's scope and stored grantId, and hash
+ * JSON.stringify(data minus $writtenBy) against the signed bodyHash.
+ *   - JSON writes: the body IS the stored record, so the builder signs the
+ *     body bytes, which must be compact JSON (what JSON.stringify emits: no
+ *     insignificant whitespace, keys in the order given). JSON.parse /
+ *     JSON.stringify round-trips that byte-for-byte; a body that does not
+ *     round-trip is rejected at write time (WRITE_BODY_NOT_CANONICAL) instead
+ *     of being stored with an attribution nobody can check.
+ *   - Binary writes: the stored record is the `$binary` envelope data (media
+ *     type, filename, caller metadata, size, content hash, base64 content),
+ *     so the builder signs its compact JSON (binaryWriteSignedBytes). That
+ *     binds the caller-controlled representation headers (Content-Type,
+ *     X-Filename / Content-Disposition, X-Vana-Metadata) to the signature and
+ *     makes a JSON-vs-binary switch of the same bytes fail verification.
  */
 
 import {
@@ -44,9 +50,13 @@ import {
 import { recoverMessageAddress } from "viem";
 import { ProtocolError } from "../errors/catalog.js";
 import {
-  decodeBinaryEnvelope,
-  isBinaryEnvelope,
+  binaryFilename,
+  binaryMimeType,
+  buildBinaryEnvelopeData,
   isJsonContentType,
+  normalizeBinaryMimeType,
+  parseMetadataHeader,
+  sha256Hex,
 } from "../contracts/binary.js";
 
 /** Header carrying the builder's signed-payload proof on a session write. */
@@ -90,11 +100,60 @@ function resolveOrigin(origin: string | (() => string)): string {
   return typeof origin === "function" ? origin() : origin;
 }
 
+export interface BinaryWriteSignedBytesInput {
+  /** The raw body bytes the write will send. */
+  bytes: Uint8Array;
+  /** The Content-Type header the write will send (parameters are ignored). */
+  contentType: string;
+  /** The X-Filename header value the write will send, if any. */
+  filename?: string;
+  /** The exact X-Vana-Metadata header value the write will send, if any. */
+  metadataHeader?: string;
+}
+
+/**
+ * The bytes a builder signs (as the Web3Signed body) for a BINARY session
+ * write: the compact JSON of the `$binary` record the PS stores for these
+ * headers and bytes. Mirrors ingest exactly (same media-type normalization,
+ * metadata parsing and envelope builder), so the signature covers the stored
+ * representation and verifyStoredWriterAttribution can re-derive it.
+ */
+export async function binaryWriteSignedBytes(
+  input: BinaryWriteSignedBytesInput,
+): Promise<Uint8Array> {
+  const data = buildBinaryEnvelopeData({
+    bytes: input.bytes,
+    mimeType: normalizeBinaryMimeType(input.contentType),
+    filename: input.filename,
+    contentHash: await sha256Hex(input.bytes),
+    metadata: parseMetadataHeader(input.metadataHeader ?? null),
+  });
+  return new TextEncoder().encode(JSON.stringify(data));
+}
+
+/**
+ * The bytes the proof must commit to for this request: the body itself for
+ * a JSON write, the stored `$binary` representation for anything else.
+ */
+async function signedBytesFor(
+  request: Request,
+  bodyBytes: Uint8Array,
+): Promise<Uint8Array> {
+  if (isJsonContentType(request)) return bodyBytes;
+  return binaryWriteSignedBytes({
+    bytes: bodyBytes,
+    contentType: binaryMimeType(request),
+    filename: binaryFilename(request),
+    metadataHeader: request.headers.get("x-vana-metadata") ?? undefined,
+  });
+}
+
 /**
  * Verify the `X-Vana-Write-Signature` proof on a session write and produce
  * the attribution record to store with the data. Throws ProtocolError(401)
  * when the proof is missing, malformed, expired, fails EIP-191 recovery /
- * bodyHash binding, recovers to a different key than the session builder, or
+ * bodyHash binding (the hash covers the stored representation, see
+ * signedBytesFor), recovers to a different key than the session builder, or
  * does not carry the session's grantId as a signed claim.
  */
 export async function verifyWriterAttribution(
@@ -120,7 +179,7 @@ export async function verifyWriterAttribution(
       expectedOrigin: resolveOrigin(input.serverOrigin),
       expectedMethod: input.request.method,
       expectedPath: url.pathname,
-      bodyBytes,
+      bodyBytes: await signedBytesFor(input.request, bodyBytes),
     });
   } catch (err) {
     throw new ProtocolError(
@@ -272,14 +331,14 @@ function signedScopeOf(uri: string): string | null {
 
 /**
  * Verify builder attribution from a stored envelope alone (no request, no
- * server state, no expiry check: the proof is evidence of who wrote the bytes
- * at the time, not a live credential). Checks, in order: the envelope carries
- * an attribution; the stored data re-hashes to the signed bodyHash (decoded
- * `$binary` content, or the compact JSON of the data minus `$writtenBy`);
- * the proof parses and recovers to the attributed builder; and the signed
- * claims bind the proof to THIS record: a POST whose path names the
- * envelope's scope, the stored grantId, and (when given) the server origin.
- * Throws WriterAttributionVerificationError with the failing reason.
+ * server state, no expiry check: the proof is evidence of who wrote the
+ * record at the time, not a live credential). Checks, in order: the envelope
+ * carries an attribution; the stored representation (compact JSON of the
+ * data minus `$writtenBy`, for JSON and `$binary` records alike) re-hashes
+ * to the signed bodyHash; the proof parses and recovers to the attributed
+ * builder; and the signed claims bind the proof to THIS record: a POST whose
+ * path names the envelope's scope, the stored grantId, and (when given) the
+ * server origin. Throws WriterAttributionVerificationError with the reason.
  */
 export async function verifyStoredWriterAttribution(
   envelope: { scope: string; data: Record<string, unknown> },
@@ -295,14 +354,13 @@ export async function verifyStoredWriterAttribution(
   }
   const { [WRITER_ATTRIBUTION_KEY]: _attribution, ...payloadData } = data;
 
-  const signedBytes = isBinaryEnvelope({ data: payloadData })
-    ? decodeBinaryEnvelope({ data: payloadData }).bytes
-    : new TextEncoder().encode(JSON.stringify(payloadData));
-  const bodyHash = computeBodyHash(signedBytes);
+  const bodyHash = computeBodyHash(
+    new TextEncoder().encode(JSON.stringify(payloadData)),
+  );
   if (bodyHash !== attribution.bodyHash) {
     throw new WriterAttributionVerificationError(
       "BODY_HASH_MISMATCH",
-      "Stored data does not hash to the attribution bodyHash",
+      "Stored record does not hash to the attribution bodyHash",
     );
   }
 

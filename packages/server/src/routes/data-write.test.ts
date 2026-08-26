@@ -23,6 +23,7 @@ import {
 import {
   WRITE_SIGNATURE_HEADER,
   WRITER_ATTRIBUTION_KEY,
+  binaryWriteSignedBytes,
   createInMemoryWriteSessionStore,
   hashWriteSessionToken,
   verifyStoredWriterAttribution,
@@ -136,6 +137,38 @@ async function sessionWrite(
   });
 }
 
+async function sessionBinaryWrite(
+  app: ReturnType<typeof dataRoutes>,
+  scope: string,
+  bytes: Uint8Array,
+  representation: {
+    contentType: string;
+    filename?: string;
+    metadataHeader?: string;
+  },
+  options: { signedBytes?: Uint8Array } = {},
+) {
+  const headers: Record<string, string> = {
+    "Content-Type": representation.contentType,
+    Authorization: `Bearer ${SESSION_TOKEN}`,
+  };
+  if (representation.filename) headers["X-Filename"] = representation.filename;
+  if (representation.metadataHeader !== undefined) {
+    headers["X-Vana-Metadata"] = representation.metadataHeader;
+  }
+  headers[WRITE_SIGNATURE_HEADER] = await buildWeb3SignedHeader({
+    wallet: builderWallet,
+    aud: SERVER_ORIGIN,
+    method: "POST",
+    uri: `/${scope}`,
+    body:
+      options.signedBytes ??
+      (await binaryWriteSignedBytes({ bytes, ...representation })),
+    grantId: WRITE_GRANT_ID,
+  });
+  return app.request(`/${scope}`, { method: "POST", headers, body: bytes });
+}
+
 describe("POST /v1/data/:scope with a write session", () => {
   let dataDir: string;
   let hierarchyOptions: HierarchyManagerOptions;
@@ -226,6 +259,53 @@ describe("POST /v1/data/:scope with a write session", () => {
         scope: SCOPE,
       }),
     );
+  });
+
+  it("accepts a binary session write signed over its stored representation", async () => {
+    const bytes = new TextEncoder().encode("%PDF-1.7 fake report");
+    const res = await sessionBinaryWrite(app, SCOPE, bytes, {
+      contentType: "application/pdf",
+      filename: "report.pdf",
+      metadataHeader: "DEXA scan",
+    });
+    expect(res.status).toBe(201);
+
+    const read = await ownerRead(SCOPE);
+    expect(read.status).toBe(200);
+    const envelope = await read.json();
+    expect(envelope.data.$binary).toBe(true);
+    expect(envelope.data.mimeType).toBe("application/pdf");
+    expect(envelope.data.filename).toBe("report.pdf");
+    expect(envelope.data.metadata).toBe("DEXA scan");
+    expect(envelope.data[WRITER_ATTRIBUTION_KEY].builder).toBe(
+      builderWallet.address,
+    );
+    // The signature covers media type, filename and metadata as stored.
+    const verified = await verifyStoredWriterAttribution(envelope, {
+      expectedOrigin: SERVER_ORIGIN,
+    });
+    expect(verified.grantId).toBe(WRITE_GRANT_ID);
+  });
+
+  it("rejects a binary session write whose headers differ from the signed representation", async () => {
+    const bytes = new TextEncoder().encode("%PDF-1.7 fake report");
+    const signedBytes = await binaryWriteSignedBytes({
+      bytes,
+      contentType: "application/pdf",
+      filename: "report.pdf",
+    });
+    const res = await sessionBinaryWrite(
+      app,
+      SCOPE,
+      bytes,
+      { contentType: "application/pdf", filename: "renamed.pdf" },
+      { signedBytes },
+    );
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error.errorCode).toBe("WRITE_ATTRIBUTION_INVALID");
+    const read = await ownerRead(SCOPE);
+    expect(read.status).toBe(404);
   });
 
   it("rejects a non-compact JSON body whose attribution could not be verified after read-back", async () => {

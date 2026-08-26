@@ -22,6 +22,26 @@ export function isJsonContentType(request: Request): boolean {
   return ct.toLowerCase().includes("application/json");
 }
 
+/** The media type stored for a binary body: Content-Type minus parameters. */
+export function normalizeBinaryMimeType(contentType: string | null): string {
+  if (!contentType) return "application/octet-stream";
+  // Strip any "; charset=..." / boundary parameters.
+  return contentType.split(";")[0].trim() || "application/octet-stream";
+}
+
+export function binaryMimeType(request: Request): string {
+  return normalizeBinaryMimeType(request.headers.get("content-type"));
+}
+
+/** Extract a filename from X-Filename or a Content-Disposition header. */
+export function binaryFilename(request: Request): string | undefined {
+  const explicit = request.headers.get("x-filename");
+  if (explicit) return explicit;
+  const disposition = request.headers.get("content-disposition");
+  const match = disposition?.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+  return match ? decodeURIComponent(match[1]) : undefined;
+}
+
 export interface BinaryEnvelopeData extends Record<string, unknown> {
   $binary: true;
   mimeType: string;

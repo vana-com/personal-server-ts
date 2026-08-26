@@ -6,6 +6,7 @@ import {
 import {
   WRITE_SIGNATURE_HEADER,
   WRITER_ATTRIBUTION_KEY,
+  binaryWriteSignedBytes,
   hasReservedWriterKey,
   stampWriterAttribution,
   verifyStoredWriterAttribution,
@@ -28,23 +29,44 @@ const SCOPE = "notes.entries";
 async function buildWriteRequest(params: {
   body?: string | Uint8Array;
   contentType?: string;
+  filename?: string;
+  metadataHeader?: string;
   signer?: typeof builderWallet;
   header?: string | null;
+  /** JSON writes: sign these bytes instead of the body. */
   signedBody?: string;
+  /** Sign exactly these bytes instead of the request's own representation. */
+  signedBytes?: Uint8Array;
   /** grantId claim in the proof; null omits it. Defaults to GRANT_ID. */
   grantId?: string | null;
 }): Promise<Request> {
   const body = params.body ?? JSON.stringify({ note: "hello" });
+  const contentType = params.contentType ?? "application/json";
   const bodyBytes =
-    params.signedBody !== undefined
+    typeof body === "string" ? new TextEncoder().encode(body) : body;
+  const isJson = contentType.toLowerCase().includes("application/json");
+  // What a well-behaved builder signs: the body for JSON, the stored
+  // representation for binary.
+  const toSign =
+    params.signedBytes ??
+    (params.signedBody !== undefined
       ? new TextEncoder().encode(params.signedBody)
-      : typeof body === "string"
-        ? new TextEncoder().encode(body)
-        : body;
+      : isJson
+        ? bodyBytes
+        : await binaryWriteSignedBytes({
+            bytes: bodyBytes,
+            contentType,
+            filename: params.filename,
+            metadataHeader: params.metadataHeader,
+          }));
   const headers: Record<string, string> = {
-    "Content-Type": params.contentType ?? "application/json",
+    "Content-Type": contentType,
     Authorization: "Bearer vana_write_sessiontoken",
   };
+  if (params.filename) headers["X-Filename"] = params.filename;
+  if (params.metadataHeader !== undefined) {
+    headers["X-Vana-Metadata"] = params.metadataHeader;
+  }
   if (params.header !== null) {
     headers[WRITE_SIGNATURE_HEADER] =
       params.header ??
@@ -53,12 +75,12 @@ async function buildWriteRequest(params: {
         aud: SERVER_ORIGIN,
         method: "POST",
         uri: `/v1/data/${SCOPE}`,
-        body: bodyBytes,
+        body: toSign,
         grantId:
           params.grantId === null ? undefined : (params.grantId ?? GRANT_ID),
       }));
   }
-  return new Request(`${SERVER_ORIGIN}/v1/data/notes.entries`, {
+  return new Request(`${SERVER_ORIGIN}/v1/data/${SCOPE}`, {
     method: "POST",
     headers,
     body,
@@ -196,6 +218,110 @@ describe("verifyWriterAttribution", () => {
     ).resolves.toMatchObject({ builder: builderWallet.address });
   });
 
+  it("binds a binary write to its stored representation, not just its bytes", async () => {
+    const bytes = new TextEncoder().encode("%PDF-1.7 fake");
+    const verifyWith = (request: Request) =>
+      verifyWriterAttribution({
+        request,
+        builderAddress: builderWallet.address,
+        grantId: GRANT_ID,
+        serverOrigin: SERVER_ORIGIN,
+      });
+    const signedFor = (
+      representation: Parameters<typeof binaryWriteSignedBytes>[0],
+    ) => binaryWriteSignedBytes({ bytes, ...representation });
+
+    // Baseline: the representation the request carries is what was signed.
+    await expect(
+      verifyWith(
+        await buildWriteRequest({
+          body: bytes,
+          contentType: "application/pdf",
+          filename: "scan.pdf",
+          metadataHeader: '{"kind":"dexa"}',
+        }),
+      ),
+    ).resolves.toMatchObject({ builder: builderWallet.address });
+
+    // Content-Type parameters are not part of the stored media type.
+    await expect(
+      verifyWith(
+        await buildWriteRequest({
+          body: bytes,
+          contentType: "application/pdf; charset=binary",
+          signedBytes: await signedFor({ contentType: "application/pdf" }),
+        }),
+      ),
+    ).resolves.toMatchObject({ builder: builderWallet.address });
+
+    // Each caller-controlled representation header is covered by the proof.
+    const tampered = [
+      buildWriteRequest({
+        body: bytes,
+        contentType: "image/png",
+        signedBytes: await signedFor({ contentType: "application/pdf" }),
+      }),
+      buildWriteRequest({
+        body: bytes,
+        contentType: "application/pdf",
+        filename: "other.pdf",
+        signedBytes: await signedFor({
+          contentType: "application/pdf",
+          filename: "scan.pdf",
+        }),
+      }),
+      buildWriteRequest({
+        body: bytes,
+        contentType: "application/pdf",
+        metadataHeader: '{"kind":"tampered"}',
+        signedBytes: await signedFor({
+          contentType: "application/pdf",
+          metadataHeader: '{"kind":"dexa"}',
+        }),
+      }),
+    ];
+    for (const request of tampered) {
+      await expect(verifyWith(await request)).rejects.toMatchObject({
+        errorCode: "WRITE_ATTRIBUTION_INVALID",
+      });
+    }
+  });
+
+  it("rejects the same signed bytes re-sent under the other representation", async () => {
+    const json = JSON.stringify({ note: "hello" });
+    const jsonBytes = new TextEncoder().encode(json);
+    const verifyWith = (request: Request) =>
+      verifyWriterAttribution({
+        request,
+        builderAddress: builderWallet.address,
+        grantId: GRANT_ID,
+        serverOrigin: SERVER_ORIGIN,
+      });
+    // Signed as a JSON write, sent as binary.
+    await expect(
+      verifyWith(
+        await buildWriteRequest({
+          body: json,
+          contentType: "application/octet-stream",
+          signedBytes: jsonBytes,
+        }),
+      ),
+    ).rejects.toMatchObject({ errorCode: "WRITE_ATTRIBUTION_INVALID" });
+    // Signed as a binary write, sent as JSON.
+    await expect(
+      verifyWith(
+        await buildWriteRequest({
+          body: json,
+          contentType: "application/json",
+          signedBytes: await binaryWriteSignedBytes({
+            bytes: jsonBytes,
+            contentType: "application/octet-stream",
+          }),
+        }),
+      ),
+    ).rejects.toMatchObject({ errorCode: "WRITE_ATTRIBUTION_INVALID" });
+  });
+
   it("does not apply the JSON canonical rule to binary bodies", async () => {
     const bytes = new TextEncoder().encode('  { "pretty": true }  ');
     const request = await buildWriteRequest({
@@ -250,11 +376,13 @@ describe("verifyStoredWriterAttribution", () => {
     expect(verified.payload.grantId).toBe(GRANT_ID);
   });
 
-  it("verifies a stored binary record from the decoded bytes", async () => {
+  async function storedBinaryRecord() {
     const bytes = new TextEncoder().encode("%PDF-1.7 fake");
     const request = await buildWriteRequest({
       body: bytes,
       contentType: "application/pdf",
+      filename: "scan.pdf",
+      metadataHeader: '{"kind":"dexa"}',
     });
     const attribution = await verifyWriterAttribution({
       request,
@@ -262,21 +390,42 @@ describe("verifyStoredWriterAttribution", () => {
       grantId: GRANT_ID,
       serverOrigin: SERVER_ORIGIN,
     });
+    // What ingestBinaryDataContract stores for these headers and bytes.
     const data = stampWriterAttribution(
       buildBinaryEnvelopeData({
         bytes,
         mimeType: "application/pdf",
+        filename: "scan.pdf",
         contentHash: await sha256Hex(bytes),
+        metadata: { kind: "dexa" },
       }),
       attribution,
     );
+    return JSON.parse(JSON.stringify(data)) as Record<string, unknown>;
+  }
+
+  it("verifies a stored binary record from its stored representation", async () => {
+    const data = await storedBinaryRecord();
     const verified = await verifyStoredWriterAttribution({
       scope: SCOPE,
-      data: JSON.parse(JSON.stringify(data)),
+      data,
     });
     expect(verified.builder.toLowerCase()).toBe(
       builderWallet.address.toLowerCase(),
     );
+  });
+
+  it("rejects a stored binary record whose representation metadata was altered", async () => {
+    for (const patch of [
+      { mimeType: "image/png" },
+      { filename: "other.pdf" },
+      { metadata: { kind: "tampered" } },
+    ]) {
+      const data = { ...(await storedBinaryRecord()), ...patch };
+      await expect(
+        verifyStoredWriterAttribution({ scope: SCOPE, data }),
+      ).rejects.toMatchObject({ reason: "BODY_HASH_MISMATCH" });
+    }
   });
 
   it("rejects a record whose data was altered after the write", async () => {

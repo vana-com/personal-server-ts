@@ -13,11 +13,13 @@ export {
 export {
   WRITE_SIGNATURE_HEADER,
   WRITER_ATTRIBUTION_KEY,
+  binaryWriteSignedBytes,
   hasReservedWriterKey,
   stampWriterAttribution,
   verifyStoredWriterAttribution,
   verifyWriterAttribution,
   WriterAttributionVerificationError,
+  type BinaryWriteSignedBytesInput,
   type StoredWriterAttributionVerification,
   type VerifyStoredWriterAttributionOptions,
   type VerifyWriterAttributionInput,

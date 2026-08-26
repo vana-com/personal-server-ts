@@ -44,7 +44,11 @@ import type {
 } from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../signing/index.js";
 import type { WriterAttribution } from "../write/attribution.js";
-import { isJsonContentType } from "../contracts/binary.js";
+import {
+  binaryFilename,
+  binaryMimeType,
+  isJsonContentType,
+} from "../contracts/binary.js";
 import {
   buildChallenge,
   parsePaymentHeader,
@@ -568,22 +572,6 @@ function collectedAt(now: () => Date): string {
   return now()
     .toISOString()
     .replace(/\.\d{3}Z$/, "Z");
-}
-
-function binaryMimeType(request: Request): string {
-  const ct = request.headers.get("content-type");
-  if (!ct) return "application/octet-stream";
-  // Strip any "; charset=..." / boundary parameters.
-  return ct.split(";")[0].trim() || "application/octet-stream";
-}
-
-/** Extract a filename from X-Filename or a Content-Disposition header. */
-function binaryFilename(request: Request): string | undefined {
-  const explicit = request.headers.get("x-filename");
-  if (explicit) return explicit;
-  const disposition = request.headers.get("content-disposition");
-  const match = disposition?.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
-  return match ? decodeURIComponent(match[1]) : undefined;
 }
 
 function notifyNewData(
