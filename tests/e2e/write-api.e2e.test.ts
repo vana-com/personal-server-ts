@@ -140,6 +140,7 @@ describe("Write API (e2e)", () => {
       method: "POST",
       uri: `/v1/data/${SCOPE}`,
       body: new TextEncoder().encode(rawBody),
+      grantId: WRITE_GRANT_ID,
     });
     const res = await fetch(`${server.url}/v1/data/${SCOPE}`, {
       method: "POST",
@@ -205,7 +206,9 @@ describe("Write API (e2e)", () => {
     // A third party holding only the record can verify who wrote it: the
     // stored data re-hashes to the signed bodyHash, the proof recovers to
     // the builder.
-    const verified = await verifyStoredWriterAttribution(envelope.data);
+    const verified = await verifyStoredWriterAttribution(envelope, {
+      expectedOrigin: server.url,
+    });
     expect(verified.builder.toLowerCase()).toBe(
       builderWallet.address.toLowerCase(),
     );
@@ -220,6 +223,7 @@ describe("Write API (e2e)", () => {
       method: "POST",
       uri: "/v1/data/other.scope",
       body: new TextEncoder().encode(rawBody),
+      grantId: WRITE_GRANT_ID,
     });
     const res = await fetch(`${server.url}/v1/data/other.scope`, {
       method: "POST",

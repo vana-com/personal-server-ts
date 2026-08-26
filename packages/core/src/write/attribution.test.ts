@@ -23,12 +23,16 @@ const builderWallet = createTestWallet(3);
 const otherWallet = createTestWallet(4);
 const GRANT_ID = "0xgrant_w1";
 
+const SCOPE = "notes.entries";
+
 async function buildWriteRequest(params: {
   body?: string | Uint8Array;
   contentType?: string;
   signer?: typeof builderWallet;
   header?: string | null;
   signedBody?: string;
+  /** grantId claim in the proof; null omits it. Defaults to GRANT_ID. */
+  grantId?: string | null;
 }): Promise<Request> {
   const body = params.body ?? JSON.stringify({ note: "hello" });
   const bodyBytes =
@@ -48,8 +52,10 @@ async function buildWriteRequest(params: {
         wallet: params.signer ?? builderWallet,
         aud: SERVER_ORIGIN,
         method: "POST",
-        uri: "/v1/data/notes.entries",
+        uri: `/v1/data/${SCOPE}`,
         body: bodyBytes,
+        grantId:
+          params.grantId === null ? undefined : (params.grantId ?? GRANT_ID),
       }));
   }
   return new Request(`${SERVER_ORIGIN}/v1/data/notes.entries`, {
@@ -142,6 +148,22 @@ describe("verifyWriterAttribution", () => {
     ).rejects.toMatchObject({ errorCode: "WRITE_ATTRIBUTION_INVALID" });
   });
 
+  it("rejects a proof that does not carry the session's grantId as a signed claim", async () => {
+    for (const grantId of [null, "0xother_grant"]) {
+      const request = await buildWriteRequest({ grantId });
+      await expect(
+        verifyWriterAttribution({
+          request,
+          builderAddress: builderWallet.address,
+          grantId: GRANT_ID,
+          serverOrigin: SERVER_ORIGIN,
+        }),
+      ).rejects.toMatchObject({
+        errorCode: "WRITE_ATTRIBUTION_GRANT_MISMATCH",
+      });
+    }
+  });
+
   it("rejects a JSON body that would not re-serialize to the signed bytes", async () => {
     // Pretty-printed JSON is validly signed, but the stored (parsed) record
     // could never reproduce these bytes, so the bodyHash would be dead on
@@ -212,7 +234,10 @@ describe("verifyStoredWriterAttribution", () => {
       nested: { z: 1, a: [1, 2, { b: null }] },
       unicode: "caf\u00e9 \u2603",
     });
-    const verified = await verifyStoredWriterAttribution(data);
+    const verified = await verifyStoredWriterAttribution(
+      { scope: SCOPE, data },
+      { expectedOrigin: SERVER_ORIGIN },
+    );
     expect(verified.builder.toLowerCase()).toBe(
       builderWallet.address.toLowerCase(),
     );
@@ -221,7 +246,8 @@ describe("verifyStoredWriterAttribution", () => {
       (data[WRITER_ATTRIBUTION_KEY] as WriterAttribution).bodyHash,
     );
     expect(verified.payload.method).toBe("POST");
-    expect(verified.payload.uri).toBe("/v1/data/notes.entries");
+    expect(verified.payload.uri).toBe(`/v1/data/${SCOPE}`);
+    expect(verified.payload.grantId).toBe(GRANT_ID);
   });
 
   it("verifies a stored binary record from the decoded bytes", async () => {
@@ -244,9 +270,10 @@ describe("verifyStoredWriterAttribution", () => {
       }),
       attribution,
     );
-    const verified = await verifyStoredWriterAttribution(
-      JSON.parse(JSON.stringify(data)),
-    );
+    const verified = await verifyStoredWriterAttribution({
+      scope: SCOPE,
+      data: JSON.parse(JSON.stringify(data)),
+    });
     expect(verified.builder.toLowerCase()).toBe(
       builderWallet.address.toLowerCase(),
     );
@@ -255,9 +282,9 @@ describe("verifyStoredWriterAttribution", () => {
   it("rejects a record whose data was altered after the write", async () => {
     const data = await storedJsonRecord({ note: "hello" });
     data.note = "tampered";
-    await expect(verifyStoredWriterAttribution(data)).rejects.toMatchObject({
-      reason: "BODY_HASH_MISMATCH",
-    });
+    await expect(
+      verifyStoredWriterAttribution({ scope: SCOPE, data }),
+    ).rejects.toMatchObject({ reason: "BODY_HASH_MISMATCH" });
   });
 
   it("rejects a record whose attributed builder does not match the proof signer", async () => {
@@ -267,24 +294,55 @@ describe("verifyStoredWriterAttribution", () => {
       ...attribution,
       builder: otherWallet.address,
     };
-    await expect(verifyStoredWriterAttribution(data)).rejects.toMatchObject({
-      reason: "SIGNER_MISMATCH",
-    });
+    await expect(
+      verifyStoredWriterAttribution({ scope: SCOPE, data }),
+    ).rejects.toMatchObject({ reason: "SIGNER_MISMATCH" });
   });
 
   it("rejects a record with a malformed stored proof", async () => {
     const data = await storedJsonRecord({ note: "hello" });
     const attribution = data[WRITER_ATTRIBUTION_KEY] as WriterAttribution;
     data[WRITER_ATTRIBUTION_KEY] = { ...attribution, signature: "not.valid" };
-    await expect(verifyStoredWriterAttribution(data)).rejects.toMatchObject({
-      reason: "PROOF_INVALID",
-    });
+    await expect(
+      verifyStoredWriterAttribution({ scope: SCOPE, data }),
+    ).rejects.toMatchObject({ reason: "PROOF_INVALID" });
   });
 
   it("rejects a record without attribution", async () => {
     await expect(
-      verifyStoredWriterAttribution({ note: "owner write" }),
+      verifyStoredWriterAttribution({
+        scope: SCOPE,
+        data: { note: "owner write" },
+      }),
     ).rejects.toMatchObject({ reason: "ATTRIBUTION_MISSING" });
+  });
+
+  it("rejects an attribution copied onto another scope's record", async () => {
+    // Same bytes, same $writtenBy, different scope: the signed uri names the
+    // original scope, so the transplanted record must not verify.
+    const data = await storedJsonRecord({ note: "hello" });
+    await expect(
+      verifyStoredWriterAttribution({ scope: "other.scope", data }),
+    ).rejects.toMatchObject({ reason: "SCOPE_MISMATCH" });
+  });
+
+  it("rejects a stored grantId that is not the grant the builder signed", async () => {
+    const data = await storedJsonRecord({ note: "hello" });
+    const attribution = data[WRITER_ATTRIBUTION_KEY] as WriterAttribution;
+    data[WRITER_ATTRIBUTION_KEY] = { ...attribution, grantId: "0xrelabelled" };
+    await expect(
+      verifyStoredWriterAttribution({ scope: SCOPE, data }),
+    ).rejects.toMatchObject({ reason: "GRANT_MISMATCH" });
+  });
+
+  it("rejects a proof addressed to a different server when the origin is known", async () => {
+    const data = await storedJsonRecord({ note: "hello" });
+    await expect(
+      verifyStoredWriterAttribution(
+        { scope: SCOPE, data },
+        { expectedOrigin: "https://other-ps.example" },
+      ),
+    ).rejects.toMatchObject({ reason: "AUDIENCE_MISMATCH" });
   });
 });
 

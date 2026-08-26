@@ -19,6 +19,7 @@ export {
   verifyWriterAttribution,
   WriterAttributionVerificationError,
   type StoredWriterAttributionVerification,
+  type VerifyStoredWriterAttributionOptions,
   type VerifyWriterAttributionInput,
   type WriterAttribution,
 } from "./attribution.js";

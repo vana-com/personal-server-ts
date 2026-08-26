@@ -13,11 +13,19 @@
  * so attribution travels through the unchanged encrypt / upload / register
  * path and back out on read. The on-chain shape is untouched.
  *
- * A third party holding the record can verify authorship from the record
+ * The proof binds the write to its context, not just its bytes: the signed
+ * claims carry the request path (whose last segment is the scope), the
+ * method, the audience (this server's origin) and the session's grantId,
+ * which the PS requires to match the session at ingest. A stored `$writtenBy`
+ * therefore cannot be lifted onto another scope's record or relabelled with a
+ * different grant and still verify.
+ *
+ * A third party holding the record can verify authorship from the envelope
  * ALONE (verifyStoredWriterAttribution): recover the signer over the stored
- * proof's base64url payload (EIP-191) and re-derive the signed bytes from the
- * stored data. For that to hold, the stored form must re-serialize to exactly
- * the bytes the builder signed, so:
+ * proof's base64url payload (EIP-191), check the signed claims against the
+ * envelope's scope and stored grantId, and re-derive the signed bytes from
+ * the stored data. For that to hold, the stored form must re-serialize to
+ * exactly the bytes the builder signed, so:
  *   - binary records keep the raw bytes verbatim (base64 in `$binary`);
  *   - JSON records must be sent in compact form, i.e. what JSON.stringify
  *     emits (no insignificant whitespace, keys in the order given). Ingest
@@ -86,7 +94,8 @@ function resolveOrigin(origin: string | (() => string)): string {
  * Verify the `X-Vana-Write-Signature` proof on a session write and produce
  * the attribution record to store with the data. Throws ProtocolError(401)
  * when the proof is missing, malformed, expired, fails EIP-191 recovery /
- * bodyHash binding, or recovers to a different key than the session builder.
+ * bodyHash binding, recovers to a different key than the session builder, or
+ * does not carry the session's grantId as a signed claim.
  */
 export async function verifyWriterAttribution(
   input: VerifyWriterAttributionInput,
@@ -127,6 +136,17 @@ export async function verifyWriterAttribution(
       "WRITE_ATTRIBUTION_SIGNER_MISMATCH",
       "Payload proof is not signed by the session builder",
       { expected: input.builderAddress, actual: verified.signer },
+    );
+  }
+
+  // The grant is a signed claim, so the stored attribution's grantId is
+  // covered by the builder's signature rather than being a bare label.
+  if (verified.payload.grantId !== input.grantId) {
+    throw new ProtocolError(
+      401,
+      "WRITE_ATTRIBUTION_GRANT_MISMATCH",
+      "Payload proof must carry the write session's grantId as a signed claim",
+      { expected: input.grantId, actual: verified.payload.grantId ?? null },
     );
   }
 
@@ -195,7 +215,10 @@ export class WriterAttributionVerificationError extends Error {
       | "ATTRIBUTION_MISSING"
       | "BODY_HASH_MISMATCH"
       | "PROOF_INVALID"
-      | "SIGNER_MISMATCH",
+      | "SIGNER_MISMATCH"
+      | "SCOPE_MISMATCH"
+      | "GRANT_MISMATCH"
+      | "AUDIENCE_MISMATCH",
     message: string,
   ) {
     super(message);
@@ -226,19 +249,43 @@ function isWriterAttribution(value: unknown): value is WriterAttribution {
   );
 }
 
+export interface VerifyStoredWriterAttributionOptions {
+  /**
+   * When known, the origin of the Personal Server the record was written to;
+   * the proof's signed audience must match it. Omit for records whose server
+   * is not known to the verifier.
+   */
+  expectedOrigin?: string;
+}
+
+/** Last path segment of the signed request uri, i.e. the scope written to. */
+function signedScopeOf(uri: string): string | null {
+  const path = uri.split("?")[0] ?? "";
+  const segment = path.slice(path.lastIndexOf("/") + 1);
+  if (!segment) return null;
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Verify builder attribution from a stored record alone (no request, no
+ * Verify builder attribution from a stored envelope alone (no request, no
  * server state, no expiry check: the proof is evidence of who wrote the bytes
- * at the time, not a live credential). The bytes the builder signed are
- * re-derived from the record: the decoded content of a `$binary` record, or
- * the compact JSON serialization of the data with `$writtenBy` removed.
- * Throws WriterAttributionVerificationError when the record carries no
- * attribution, the data no longer hashes to the signed bodyHash, the proof is
- * malformed, or the proof's signer is not the stored builder.
+ * at the time, not a live credential). Checks, in order: the envelope carries
+ * an attribution; the stored data re-hashes to the signed bodyHash (decoded
+ * `$binary` content, or the compact JSON of the data minus `$writtenBy`);
+ * the proof parses and recovers to the attributed builder; and the signed
+ * claims bind the proof to THIS record: a POST whose path names the
+ * envelope's scope, the stored grantId, and (when given) the server origin.
+ * Throws WriterAttributionVerificationError with the failing reason.
  */
 export async function verifyStoredWriterAttribution(
-  data: Record<string, unknown>,
+  envelope: { scope: string; data: Record<string, unknown> },
+  options: VerifyStoredWriterAttributionOptions = {},
 ): Promise<StoredWriterAttributionVerification> {
+  const data = envelope.data;
   const attribution = data[WRITER_ATTRIBUTION_KEY];
   if (!isWriterAttribution(attribution)) {
     throw new WriterAttributionVerificationError(
@@ -285,6 +332,31 @@ export async function verifyStoredWriterAttribution(
     throw new WriterAttributionVerificationError(
       "SIGNER_MISMATCH",
       "Stored proof is not signed by the attributed builder",
+    );
+  }
+  // Context binding: the signed claims must describe a write of THIS record.
+  if (
+    proof.payload.method !== "POST" ||
+    signedScopeOf(proof.payload.uri) !== envelope.scope
+  ) {
+    throw new WriterAttributionVerificationError(
+      "SCOPE_MISMATCH",
+      `Stored proof is not a write to scope ${envelope.scope}`,
+    );
+  }
+  if (proof.payload.grantId !== attribution.grantId) {
+    throw new WriterAttributionVerificationError(
+      "GRANT_MISMATCH",
+      "Stored grantId is not the grant the builder signed",
+    );
+  }
+  if (
+    options.expectedOrigin !== undefined &&
+    proof.payload.aud !== options.expectedOrigin
+  ) {
+    throw new WriterAttributionVerificationError(
+      "AUDIENCE_MISMATCH",
+      "Stored proof was not addressed to this server",
     );
   }
   return {

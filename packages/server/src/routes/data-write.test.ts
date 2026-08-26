@@ -126,6 +126,7 @@ async function sessionWrite(
       method: "POST",
       uri: `/${scope}`,
       body: new TextEncoder().encode(rawBody),
+      grantId: WRITE_GRANT_ID,
     });
   }
   return app.request(`/${scope}`, {
@@ -208,7 +209,9 @@ describe("POST /v1/data/:scope with a write session", () => {
     // The attribution is verifiable from the read-back record alone: the
     // stored data re-hashes to the signed bodyHash and the proof recovers to
     // the builder.
-    const verified = await verifyStoredWriterAttribution(envelope.data);
+    const verified = await verifyStoredWriterAttribution(envelope, {
+      expectedOrigin: SERVER_ORIGIN,
+    });
     expect(verified.builder.toLowerCase()).toBe(
       builderWallet.address.toLowerCase(),
     );

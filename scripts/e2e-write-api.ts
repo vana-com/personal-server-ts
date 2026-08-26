@@ -181,6 +181,8 @@ async function main() {
       method: "POST",
       uri: `/v1/data/${SCOPE}`,
       body: new TextEncoder().encode(rawBody),
+      // Signed claim: binds the attribution to the write-grant.
+      grantId: WRITE_GRANT_ID,
     });
     const writeRes = await app.request(`${ORIGIN}/v1/data/${SCOPE}`, {
       method: "POST",
