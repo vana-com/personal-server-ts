@@ -37,6 +37,7 @@ import {
   isBinaryEnvelope,
   parseMetadataHeader,
   stringifyMetadataHeader,
+  IngestPersistedError,
 } from "../contracts/index.js";
 import type {
   DataPortabilityGatewayConfig,
@@ -1009,7 +1010,24 @@ export async function handlePersonalServerDataRequest(
         notifyNewData(deps.syncManager);
         return jsonResponse(result.response, { status: 201 });
       } catch (err) {
-        if (!committed) await writeAuth?.releaseProof?.();
+        // An envelope that reached storage before indexing failed is
+        // persisted (a re-index surfaces it): keep the proof consumed so a
+        // retry cannot store it twice; the builder needs a fresh proof.
+        if (err instanceof IngestPersistedError) {
+          deps.logger?.error?.(
+            {
+              scope: scopeParam,
+              path: err.relativePath,
+              error:
+                err.cause instanceof Error
+                  ? err.cause.message
+                  : String(err.cause),
+            },
+            "Envelope written but indexing failed; record persisted unindexed",
+          );
+        } else if (!committed) {
+          await writeAuth?.releaseProof?.();
+        }
         throw err;
       }
     }

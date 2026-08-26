@@ -80,6 +80,37 @@ export interface ReadDataContractResult {
   envelope: DataFileEnvelope;
 }
 
+/**
+ * Thrown by the ingest contracts when the envelope was already written to
+ * storage but a later step (indexing) failed. The record is on disk and a
+ * re-index can surface it, so callers must treat the write as persisted:
+ * never retry it under the same proof, never release a replay reservation.
+ */
+export class IngestPersistedError extends Error {
+  constructor(
+    public readonly relativePath: string,
+    public readonly cause: unknown,
+  ) {
+    super(
+      `Envelope written to ${relativePath} but indexing failed: ${
+        cause instanceof Error ? cause.message : String(cause)
+      }`,
+    );
+    this.name = "IngestPersistedError";
+  }
+}
+
+async function indexWrittenEnvelope(
+  storage: IngestDataContractInput["storage"],
+  entry: Parameters<IngestDataContractInput["storage"]["insertEntry"]>[0],
+): Promise<void> {
+  try {
+    await storage.insertEntry(entry);
+  } catch (err) {
+    throw new IngestPersistedError(entry.path, err);
+  }
+}
+
 export interface IngestDataContractInput {
   storage: DataStoragePort;
   scopeParam: string;
@@ -320,7 +351,7 @@ export async function ingestDataContract(
   } catch {
     // Best-effort bounded sidecars: raw envelope storage remains the source of truth.
   }
-  await input.storage.insertEntry({
+  await indexWrittenEnvelope(input.storage, {
     fileId: null,
     schemaId: null,
     path: writeResult.relativePath,
@@ -386,7 +417,7 @@ export async function ingestBinaryDataContract(
   } catch {
     // Best-effort bounded sidecars: raw envelope storage remains the source of truth.
   }
-  await input.storage.insertEntry({
+  await indexWrittenEnvelope(input.storage, {
     fileId: null,
     schemaId: null,
     path: writeResult.relativePath,

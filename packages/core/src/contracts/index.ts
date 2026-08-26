@@ -1,5 +1,6 @@
 export {
   deleteDataScopeContract,
+  IngestPersistedError,
   ingestDataContract,
   ingestBinaryDataContract,
   listDataScopesContract,

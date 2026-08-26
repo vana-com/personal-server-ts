@@ -436,6 +436,65 @@ describe("POST /v1/data/:scope with a write session", () => {
     flakyIndex.close();
   });
 
+  it("keeps the proof consumed when the envelope persisted but indexing failed", async () => {
+    // Partial storage failure: the envelope reaches disk, the index insert
+    // throws. The record is persisted (a re-index surfaces it), so the same
+    // proof must NOT be accepted again.
+    const partialIndex = createIndexManager(initializeDatabase(":memory:"));
+    const realStorage = createNodeDataStorage({
+      indexManager: partialIndex,
+      hierarchyOptions,
+    });
+    let indexFailures = 1;
+    const partialApp = dataRoutes({
+      indexManager: partialIndex,
+      hierarchyOptions,
+      logger,
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway,
+      accessLogWriter,
+      writeSessionStore,
+      dataStorage: {
+        ...realStorage,
+        async insertEntry(entry) {
+          if (indexFailures-- > 0) throw new Error("index locked");
+          return realStorage.insertEntry(entry);
+        },
+      },
+    });
+    const rawBody = JSON.stringify({ note: "partial" });
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${SESSION_TOKEN}`,
+      [WRITE_SIGNATURE_HEADER]: await buildWeb3SignedHeader({
+        wallet: builderWallet,
+        aud: SERVER_ORIGIN,
+        method: "POST",
+        uri: `/${SCOPE}`,
+        body: new TextEncoder().encode(rawBody),
+        grantId: WRITE_GRANT_ID,
+      }),
+    };
+    const send = () =>
+      partialApp.request(`/${SCOPE}`, {
+        method: "POST",
+        headers,
+        body: rawBody,
+      });
+
+    const failing = await send();
+    expect(failing.status).toBe(500);
+    const retry = await send();
+    expect(retry.status).toBe(401);
+    expect((await retry.json()).error.errorCode).toBe(
+      "WRITE_ATTRIBUTION_REPLAY",
+    );
+    // Only the orphaned (unindexed) envelope exists: nothing was indexed.
+    expect(partialIndex.findLatestByScope(SCOPE)).toBeUndefined();
+    partialIndex.close();
+  });
+
   it("rejects a session write without the attribution proof", async () => {
     const res = await sessionWrite(
       app,
