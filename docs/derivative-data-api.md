@@ -278,9 +278,11 @@ Response:
   version and 404s when that version does not exist or failed on chain.
 - `sources[].version` is the source's current version, `deletedAt` its
   tombstone time or null.
-- `derivatives` lists every data point of the same owner that cites this id in
-  any of its versions; `version` is the latest citing version, `deletedAt` the
-  derivative's current tombstone time or null.
+- `derivatives` lists the same owner's data points whose effective lineage
+  cites this id: their current version, or for a deleted derivative its last
+  lineage statement (`deletedAt` set). A newer version registered without
+  lineage, or with a lineage that dropped this source, ends the
+  relationship; `version` is the citing version.
 - `proof` is the standard gateway attestation (`GatewayAttestation` EIP-712,
   `userSignature` = the data point's AddData signature) over:
   - `requestHash = keccak256(abi.encode(string "GET /v1/data/:dataPointId/lineage", bytes32 dataPointId, uint256 version, bytes32 grantId))`
