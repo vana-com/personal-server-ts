@@ -12,6 +12,7 @@ import type {
   DataPointFeedPort,
   DataPointFeedRecord,
   DataStoragePort,
+  PendingBlobDeletionStore,
 } from "../../ports/index.js";
 import { computeDataPointId } from "../data-point-id.js";
 import {
@@ -55,6 +56,12 @@ export interface UploadWorkerDeps {
    * live again (a re-add after a tombstone must not keep answering 410).
    */
   scopeDeletions?: ScopeDeletionTracker;
+  /**
+   * Guarded cleanup queue for ciphertext this worker uploaded and then had to
+   * abandon because a tombstone landed between the deletion guard and the
+   * registration. Used only when deleting that exact blob fails.
+   */
+  pendingBlobDeletions?: PendingBlobDeletionStore;
 }
 
 export interface UploadResult {
@@ -104,15 +111,44 @@ export class DeletedScopeEntryError extends Error {
  * Drop an unsynced entry the gateway tombstone covers and signal it as a
  * self-heal. Returns without effect when the entry was ingested with
  * knowledge of the tombstone (`afterTombstoneVersion`): a legitimate re-add.
+ *
+ * When the entry's ciphertext already went up (`uploaded`: the tombstone
+ * landed between the deletion guard and the registration), that exact blob
+ * is deleted too, so abandoning the entry never leaves owner-decryptable
+ * deleted data in storage. If the delete fails the scope is queued for the
+ * guarded scope-wide cleanup the sync cycle retries.
  */
 async function dropIfCoveredByDeletion(
-  deps: Pick<UploadWorkerDeps, "storage" | "logger">,
+  deps: Pick<
+    UploadWorkerDeps,
+    "storage" | "storageAdapter" | "pendingBlobDeletions" | "logger"
+  >,
   entry: IndexEntry,
   tombstone: Pick<DataPointFeedRecord, "expectedVersion">,
   deletedAt: string,
+  uploaded?: { url: string },
 ): Promise<void> {
   const version = tombstoneVersion(tombstone);
   if (!isEntryCoveredByTombstone(entry, { version })) return;
+  if (uploaded) {
+    try {
+      await deps.storageAdapter.delete(uploaded.url);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (deps.pendingBlobDeletions) {
+        await deps.pendingBlobDeletions.add(entry.scope);
+      }
+      deps.logger.warn(
+        {
+          scope: entry.scope,
+          url: uploaded.url,
+          error: message,
+          queuedForCleanup: Boolean(deps.pendingBlobDeletions),
+        },
+        "Could not delete the ciphertext uploaded for an entry the tombstone covers",
+      );
+    }
+  }
   await deps.storage.deleteVersion(entry.scope, entry.collectedAt);
   deps.logger.warn(
     {
@@ -349,7 +385,9 @@ export async function uploadOne(
       // genuine re-add rebases past the tombstone below.
       const conflictDeletedAt = record ? deletionTimestamp(record) : null;
       if (record && conflictDeletedAt !== null) {
-        await dropIfCoveredByDeletion(deps, entry, record, conflictDeletedAt);
+        await dropIfCoveredByDeletion(deps, entry, record, conflictDeletedAt, {
+          url,
+        });
       }
 
       if (record && record.dataHash.toLowerCase() === dataHash.toLowerCase()) {

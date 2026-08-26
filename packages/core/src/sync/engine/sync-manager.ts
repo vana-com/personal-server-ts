@@ -91,6 +91,13 @@ export function createSyncManager(
   const dataPointFeed = downloadDeps.dataPointFeed ?? uploadDeps.dataPointFeed;
   const scopeDeletions =
     uploadDeps.scopeDeletions ?? downloadDeps.scopeDeletions;
+  // The upload worker queues guarded cleanup for ciphertext it had to
+  // abandon mid-race; it shares the manager's marker store.
+  const workerUploadDeps: UploadWorkerDeps = {
+    ...uploadDeps,
+    pendingBlobDeletions:
+      uploadDeps.pendingBlobDeletions ?? options?.pendingBlobDeletions,
+  };
 
   // Sync cycles and durable deletes mutate the same local index and the same
   // registry rows. Run them one at a time (FIFO): a delete cannot start while
@@ -141,7 +148,7 @@ export function createSyncManager(
 
         try {
           // Upload unsynced local files
-          const uploadResults = await uploadAll(uploadDeps, {
+          const uploadResults = await uploadAll(workerUploadDeps, {
             batchSize: uploadBatchSize,
             onError(entry, error) {
               pushError({

@@ -391,6 +391,11 @@ describe("SyncManager", () => {
       );
       expect(pending.remove).toHaveBeenCalledWith("chatgpt.conversations");
       expect(uploadAll).toHaveBeenCalledTimes(1);
+      // The upload worker shares the marker store for its own guarded cleanup.
+      expect(uploadAll).toHaveBeenCalledWith(
+        expect.objectContaining({ pendingBlobDeletions: pending }),
+        expect.anything(),
+      );
     });
 
     it("hands the retry the deletion-aware feed so a re-added scope is not wiped", async () => {

@@ -925,6 +925,7 @@ describe("upload worker", () => {
         maxStalenessMs: 0,
       };
       deps.scopeDeletions = scopeDeletions;
+      deps.storageAdapter.delete = vi.fn(async () => true);
       const entry = makeEntry({ createdAt: "2026-01-21T10:00:00Z" });
 
       await expect(uploadOne(deps, entry)).rejects.toMatchObject({
@@ -933,12 +934,70 @@ describe("upload worker", () => {
 
       expect(deps.gateway.registerDataPoint).toHaveBeenCalledTimes(1);
       expect(deps.storageAdapter.upload).toHaveBeenCalledTimes(1);
+      // The ciphertext already uploaded for the abandoned entry is removed
+      // from storage: dropping the row alone would leave deleted data behind.
+      const uploadedUrl = (
+        deps.storageAdapter.upload as ReturnType<typeof vi.fn>
+      ).mock.results[0].value;
+      expect(deps.storageAdapter.delete).toHaveBeenCalledWith(
+        await uploadedUrl,
+      );
       expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
         SCOPE,
         COLLECTED_AT,
       );
       expect(deps.storage.updateDataPointId).not.toHaveBeenCalled();
       expect(scopeDeletions.markLive).not.toHaveBeenCalled();
+    });
+
+    it("queues guarded cleanup when the abandoned upload's blob cannot be deleted", async () => {
+      const deps = withFeed(makeMockDeps(), {
+        deletedAt: null,
+        expectedVersion: "1",
+      });
+      const feed = deps.dataPointFeed!.getDataPoint as ReturnType<typeof vi.fn>;
+      const live = await feed({ ownerAddress: OWNER, scope: SCOPE });
+      feed.mockReset();
+      feed.mockResolvedValueOnce(live).mockResolvedValueOnce({
+        id: DATA_POINT_ID,
+        ownerAddress: OWNER,
+        scope: SCOPE,
+        dataHash: "0x" + "33".repeat(32),
+        metadataHash: "0x" + "44".repeat(32),
+        expectedVersion: "2",
+        addedAt: DELETED_AT,
+        deletedAt: DELETED_AT,
+      });
+      (
+        deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
+      ).mockRejectedValueOnce(
+        new Error(
+          "Gateway error: 409 Stale expectedVersion 1: must be strictly greater than the stored value 2",
+        ),
+      );
+      deps.storageAdapter.delete = vi.fn(async () => {
+        throw new Error("storage 503");
+      });
+      const pendingBlobDeletions = {
+        list: vi.fn(async () => []),
+        add: vi.fn(async () => undefined),
+        remove: vi.fn(async () => undefined),
+      };
+      deps.pendingBlobDeletions = pendingBlobDeletions;
+
+      await expect(uploadOne(deps, makeEntry())).rejects.toMatchObject({
+        name: "DeletedScopeEntryError",
+      });
+
+      expect(pendingBlobDeletions.add).toHaveBeenCalledWith(SCOPE);
+      expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
+        SCOPE,
+        COLLECTED_AT,
+      );
+      expect(deps.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ scope: SCOPE, queuedForCleanup: true }),
+        expect.stringContaining("Could not delete the ciphertext"),
+      );
     });
 
     it("marks the scope live in the read-side memory once it is registered", async () => {
