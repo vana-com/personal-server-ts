@@ -165,7 +165,7 @@ describe("data contract helpers", () => {
     });
 
     expect(
-      listDataVersionsContract({
+      await listDataVersionsContract({
         storage,
         scopeParam: "instagram.profile",
         limit: 20,
@@ -408,7 +408,7 @@ describe("data contract helpers", () => {
     expect(ingest).toMatchObject({ ok: true });
 
     expect(
-      listDataVersionsContract({
+      await listDataVersionsContract({
         storage,
         scopeParam: "documents.pdf",
         limit: 20,

@@ -296,6 +296,82 @@ describe("deleteScope vs a concurrent remote re-add", () => {
     );
   });
 
+  it("tombstones the row that a registration raced in after a not-registered answer", async () => {
+    // tombstone() found no row; by the time the registry is re-read another
+    // replica has registered the scope. Deleting locally now would let sync
+    // restore it, so the tombstone is attempted again against the new row.
+    let lookups = 0;
+    const dataPointFeed = feedAnswering(async () =>
+      ++lookups === 1
+        ? { deletedAt: null, expectedVersion: "1" }
+        : { deletedAt: "2026-08-25T10:00:00.000Z", expectedVersion: "2" },
+    );
+    const deps = makeDeps({ dataPointFeed });
+    (deps.deleteData!.tombstone as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({
+        status: "not-registered",
+        dataPointId: DATA_POINT_ID,
+      })
+      .mockResolvedValueOnce({
+        status: "tombstoned",
+        dataPointId: DATA_POINT_ID,
+        version: "2",
+        deletedAt: "2026-08-25T10:00:00.000Z",
+      });
+
+    const result = await deleteScope(deps, SCOPE);
+
+    expect(deps.deleteData!.tombstone).toHaveBeenCalledTimes(2);
+    expect(result.durable).toBe(true);
+    expect(result.steps.gateway).toMatchObject({ status: "ok", version: "2" });
+    expect(result.steps.storage).toEqual({ status: "ok", blobsDeleted: 3 });
+    expect(result.steps.local).toEqual({ status: "ok", deletedCount: 2 });
+  });
+
+  it("refuses and keeps the local copy when the scope keeps being registered concurrently", async () => {
+    const dataPointFeed = feedAnswering(async () => ({
+      deletedAt: null,
+      expectedVersion: "1",
+    }));
+    const deps = makeDeps({ dataPointFeed });
+    (deps.deleteData!.tombstone as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: "not-registered",
+      dataPointId: DATA_POINT_ID,
+    });
+
+    const result = await deleteScope(deps, SCOPE);
+
+    expect(result.durable).toBe(false);
+    expect(result.steps.gateway).toMatchObject({ status: "failed" });
+    expect(result.steps.gateway.error).toContain("registered concurrently");
+    expect(result.steps.local).toEqual({
+      status: "skipped",
+      reason: "gateway-failed",
+    });
+    expect(deps.storage.deleteScope).not.toHaveBeenCalled();
+    expect(deps.deleteData!.deleteBlobs).not.toHaveBeenCalled();
+  });
+
+  it("refuses a not-registered delete when the registry cannot be re-read", async () => {
+    const dataPointFeed = feedAnswering(async () => {
+      throw new Error("gateway down");
+    });
+    const deps = makeDeps({ dataPointFeed });
+    (deps.deleteData!.tombstone as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: "not-registered",
+      dataPointId: DATA_POINT_ID,
+    });
+
+    const result = await deleteScope(deps, SCOPE);
+
+    expect(result.durable).toBe(false);
+    expect(result.steps.gateway).toEqual({
+      status: "failed",
+      error: "gateway down",
+    });
+    expect(deps.storage.deleteScope).not.toHaveBeenCalled();
+  });
+
   it("deletes the blobs when the registry still shows the tombstone", async () => {
     const dataPointFeed = feedAnswering(async () => ({
       deletedAt: "2026-08-25T10:00:00.000Z",

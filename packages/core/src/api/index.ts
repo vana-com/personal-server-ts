@@ -681,6 +681,19 @@ export async function assertScopeNotDeleted(
   if (deletion) throw new DataDeletedError(deletion);
 }
 
+/**
+ * Discovery filter for the scope and version listings: an entry a read would
+ * refuse with 410 is not listed either. Undefined (no filtering) when no
+ * deletion tracker is wired.
+ */
+function discoveryVisibility(
+  deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
+): ((scope: string, entry: ReadDeletionEntry) => Promise<boolean>) | undefined {
+  if (!deps.scopeDeletions) return undefined;
+  return async (scope, entry) =>
+    (await resolveReadDeletion(deps, scope, entry)) === null;
+}
+
 /** The index fields the deletion gate needs from the entry a read would serve. */
 export type ReadDeletionEntry = Pick<
   IndexEntry,
@@ -847,6 +860,7 @@ export async function handlePersonalServerDataRequest(
         scopePrefix: url.searchParams.get("scopePrefix") ?? undefined,
         limit: normalizeLimit(url.searchParams.get("limit"), 20),
         offset: normalizeLimit(url.searchParams.get("offset"), 0),
+        isVisible: discoveryVisibility(deps),
       });
       return jsonResponse(result.response);
     }
@@ -855,13 +869,19 @@ export async function handlePersonalServerDataRequest(
     if (parts.length === 2 && parts[1] === "versions") {
       if (request.method !== "GET") return methodNotAllowed();
       await deps.auth.authorizeBuilderList(request);
-      const result = listDataVersionsContract({
+      const result = await listDataVersionsContract({
         storage: deps.storage,
         scopeParam: decodePathPart(parts[0]),
         limit: normalizeLimit(url.searchParams.get("limit"), 20),
         offset: normalizeLimit(url.searchParams.get("offset"), 0),
+        isVisible: discoveryVisibility(deps),
       });
       if (!result.ok) return contractErrorResponse(result);
+      if (result.response.total === 0) {
+        // Nothing visible: answer 410 rather than an empty list when that is
+        // because the scope is tombstoned, exactly as a read would.
+        await assertScopeNotDeleted(deps, result.scope, undefined);
+      }
       return jsonResponse(result.response);
     }
 

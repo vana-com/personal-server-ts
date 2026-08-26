@@ -128,8 +128,31 @@ export async function deleteScope(
     // 1. Gateway tombstone: the durable fact. Nothing else happens if it
     // fails, so the owner gets a clear "nothing was deleted" instead of a
     // local delete that sync silently undoes.
+    let registry: RegistryState;
     try {
-      const outcome = await deleteData.tombstone(scope);
+      let outcome = await deleteData.tombstone(scope);
+      registry = await registryState(deps, scope);
+      if (outcome.status === "not-registered") {
+        // "Nothing to tombstone" is only durable if the registry still has
+        // no row. A registration racing our lookup would otherwise survive
+        // the local delete and sync would restore the scope: re-read, and
+        // tombstone the row that appeared. If it keeps appearing, or the
+        // registry cannot be asked, refuse rather than delete on a guess.
+        if (registry.status === "live") {
+          outcome = await deleteData.tombstone(scope);
+          registry = await registryState(deps, scope);
+        }
+        if (
+          outcome.status === "not-registered" &&
+          registry.status !== "deleted-or-absent"
+        ) {
+          throw registry.status === "unknown"
+            ? registry.error
+            : new Error(
+                "Scope was registered concurrently while it was being deleted; retry the delete",
+              );
+        }
+      }
       if (outcome.status === "not-registered") {
         result.steps.gateway = { status: "skipped", reason: "not-registered" };
       } else {
@@ -168,9 +191,8 @@ export async function deleteScope(
     }
 
     // 2. Storage blobs. Best-effort once the tombstone exists: a failure is
-    // reported and remembered for a later cycle, never hidden. Guarded by a
-    // registry re-read so a concurrent re-add keeps its ciphertext.
-    const registry = await registryState(deps, scope);
+    // reported and remembered for a later cycle, never hidden. Guarded by the
+    // registry re-read above so a concurrent re-add keeps its ciphertext.
     if (registry.status === "live") {
       result.steps.storage = { status: "skipped", reason: "re-added" };
       await pendingBlobDeletions?.remove(scope);

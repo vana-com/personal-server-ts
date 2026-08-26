@@ -677,6 +677,12 @@ describe("createPsLiteRuntime", () => {
       },
     });
 
+    // Discovery is gated the same way: the scope is not listed.
+    const listed = await runtime.fetch(
+      new Request("https://ps.local/v1/data", { headers: builderHeaders }),
+    );
+    expect(await listed.json()).toMatchObject({ scopes: [], total: 0 });
+
     // A re-add ingested on top of the known tombstone is served.
     await runtime.fetch(
       new Request("https://ps.local/v1/data/instagram.profile", {

@@ -1667,7 +1667,10 @@ describe("DELETE /v1/data/:scope", () => {
       });
       await ingestData("instagram.profile", { username: "stale" }, createApp());
       // What the download worker records when it lists the tombstone.
-      tracker.markDeleted("instagram.profile", "2099-01-01T00:00:00.000Z");
+      tracker.markDeleted("instagram.profile", {
+        deletedAt: "2099-01-01T00:00:00.000Z",
+        version: "4",
+      });
 
       const res = await getAsBuilder(app);
 
@@ -1675,7 +1678,7 @@ describe("DELETE /v1/data/:scope", () => {
       expect(feed.getDataPoint).not.toHaveBeenCalled();
     });
 
-    it("serves a local re-add that is newer than the tombstone", async () => {
+    it("serves a local re-add ingested on top of the tombstone", async () => {
       const feed = tombstoneFeed("2020-01-01T00:00:00.000Z");
       const app = createApp({
         gateway: createMockGateway({
@@ -1686,13 +1689,143 @@ describe("DELETE /v1/data/:scope", () => {
           serverOwner: deleteOwnerWallet.address,
         }),
       });
+      // Ingest learns of tombstone 4 and stamps the row as a re-add on top
+      // of it; the read then serves it although the scope is tombstoned.
       await ingestData("instagram.profile", { username: "re-added" }, app);
+      expect(
+        indexManager.findClosestByScope(
+          "instagram.profile",
+          "2099-01-01T00:00:00.000Z",
+        ),
+      ).toMatchObject({ afterTombstoneVersion: 4, dataPointId: null });
 
       const res = await getAsBuilder(app);
 
       expect(res.status).toBe(200);
       expect(await res.json()).toMatchObject({
         data: { username: "re-added" },
+      });
+    });
+
+    it("refuses a local copy ingested before the tombstone was known, whatever the clocks say", async () => {
+      // Ingested while the feed showed nothing (deletion not yet visible),
+      // then a tombstone with a deletedAt far in the past: a clock-ahead
+      // replica must still not serve the pre-deletion copy.
+      const feed = tombstoneFeed("2000-01-01T00:00:00.000Z");
+      feed.getDataPoint.mockResolvedValueOnce(null);
+      const app = createApp({
+        gateway: createMockGateway({
+          getGrant: vi.fn().mockResolvedValue(grant()),
+        }),
+        scopeDeletions: createScopeDeletionTracker({
+          feed,
+          serverOwner: deleteOwnerWallet.address,
+          maxStalenessMs: 0,
+        }),
+      });
+      await ingestData("instagram.profile", { username: "stale" }, app);
+
+      const res = await getAsBuilder(app);
+
+      expect(res.status).toBe(410);
+    });
+
+    it("hides a tombstoned scope from the versions and scope listings, and 410s the versions of a fully covered scope", async () => {
+      const feed = tombstoneFeed(null);
+      const tracker = createScopeDeletionTracker({
+        feed,
+        serverOwner: deleteOwnerWallet.address,
+      });
+      const app = createApp({
+        gateway: createMockGateway({
+          getGrant: vi.fn().mockResolvedValue(grant()),
+        }),
+        scopeDeletions: tracker,
+      });
+      await ingestData("instagram.profile", { username: "stale" }, createApp());
+      await ingestData("instagram.media", { count: 1 }, createApp());
+      tracker.markDeleted("instagram.profile", {
+        deletedAt: "2099-01-01T00:00:00.000Z",
+        version: "4",
+      });
+
+      const listHeader = await buildWeb3SignedHeader({
+        wallet,
+        aud: SERVER_ORIGIN,
+        method: "GET",
+        uri: "/",
+      });
+      const list = await app.request("/", {
+        headers: { Authorization: listHeader },
+      });
+      expect(list.status).toBe(200);
+      expect(await list.json()).toMatchObject({
+        scopes: [{ scope: "instagram.media" }],
+        total: 1,
+      });
+
+      const versionsHeader = await buildWeb3SignedHeader({
+        wallet,
+        aud: SERVER_ORIGIN,
+        method: "GET",
+        uri: "/instagram.profile/versions",
+      });
+      const versions = await app.request("/instagram.profile/versions", {
+        headers: { Authorization: versionsHeader },
+      });
+      expect(versions.status).toBe(410);
+      expect((await versions.json()).error.errorCode).toBe("DATA_DELETED");
+    });
+
+    it("lists only the re-add versions of a tombstoned scope", async () => {
+      const feed = tombstoneFeed("2020-01-01T00:00:00.000Z");
+      const tracker = createScopeDeletionTracker({
+        feed,
+        serverOwner: deleteOwnerWallet.address,
+      });
+      const app = createApp({
+        gateway: createMockGateway({
+          getGrant: vi.fn().mockResolvedValue(grant()),
+        }),
+        scopeDeletions: tracker,
+      });
+      // One stale copy (no marker), then a re-add stamped through ingest.
+      await ingestData("instagram.profile", { username: "stale" }, createApp());
+      // collectedAt has second granularity; keep the two versions apart.
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      const reAdd = (await ingestData(
+        "instagram.profile",
+        { username: "re-added" },
+        app,
+      )) as { collectedAt: string };
+
+      const versionsHeader = await buildWeb3SignedHeader({
+        wallet,
+        aud: SERVER_ORIGIN,
+        method: "GET",
+        uri: "/instagram.profile/versions",
+      });
+      const versions = await app.request("/instagram.profile/versions", {
+        headers: { Authorization: versionsHeader },
+      });
+      expect(versions.status).toBe(200);
+      expect(await versions.json()).toMatchObject({
+        versions: [{ collectedAt: reAdd.collectedAt }],
+        total: 1,
+      });
+
+      const listHeader = await buildWeb3SignedHeader({
+        wallet,
+        aud: SERVER_ORIGIN,
+        method: "GET",
+        uri: "/",
+      });
+      const list = await app.request("/", {
+        headers: { Authorization: listHeader },
+      });
+      expect(await list.json()).toMatchObject({
+        scopes: [{ scope: "instagram.profile" }],
+        total: 1,
       });
     });
 
@@ -2044,7 +2177,10 @@ describe("X402 payment on GET /v1/data/:scope", () => {
       username: "gone",
     });
     expect(ingestRes.status).toBe(201);
-    tracker.markDeleted("instagram.profile", "2099-01-01T00:00:00.000Z");
+    tracker.markDeleted("instagram.profile", {
+      deletedAt: "2099-01-01T00:00:00.000Z",
+      version: "4",
+    });
     const gatewayFetch = vi.fn();
     vi.stubGlobal("fetch", gatewayFetch);
 
