@@ -325,9 +325,11 @@ export async function ingestDataContract(
     };
   }
 
-  // The attribution key is server-stamped, never caller-supplied — a payload
-  // that already carries it could forge (or shadow) its own attribution.
-  if (input.attribution && hasReservedWriterKey(input.body)) {
+  // The attribution key is server-stamped, never caller-supplied: a payload
+  // that carries it could forge (or shadow) an attribution. That holds for
+  // every JSON ingest, owner writes included, so consumers can trust that a
+  // stored $writtenBy was always produced by the server.
+  if (hasReservedWriterKey(input.body)) {
     return {
       ok: false,
       status: 400,

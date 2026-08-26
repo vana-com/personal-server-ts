@@ -584,6 +584,31 @@ describe("POST /v1/data/:scope with a write session", () => {
     expect(envelope.data[WRITER_ATTRIBUTION_KEY]).toBeUndefined();
   });
 
+  it("owner writes cannot supply the reserved $writtenBy key either", async () => {
+    // The key is server-stamped for every JSON ingest; an owner-authenticated
+    // payload carrying it would look like a delegated write to consumers.
+    const rawBody = JSON.stringify({
+      note: "owner write",
+      [WRITER_ATTRIBUTION_KEY]: { builder: builderWallet.address },
+    });
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "POST",
+      uri: `/${SCOPE}`,
+      body: new TextEncoder().encode(rawBody),
+    });
+    const res = await app.request(`/${SCOPE}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: auth },
+      body: rawBody,
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("INVALID_BODY");
+    const read = await ownerRead(SCOPE);
+    expect(read.status).toBe(404);
+  });
+
   it("a write-grant never satisfies a builder READ of the same scope", async () => {
     // Land a record first (via the session write).
     const write = await sessionWrite(app, SCOPE, { note: "secret" });
