@@ -1,4 +1,6 @@
 import {
+  DataDeletedError,
+  DeleteTombstoneFailedError,
   GrantRequiredError,
   InvalidCascadeError,
   LineageCascadeUnavailableError,
@@ -10,13 +12,17 @@ import {
 import type { AccessLogWriter } from "../logging/access-log.js";
 import type { AccessLogReader } from "../logging/access-reader.js";
 import {
+  type DataPointFeedPort,
   type DataStoragePort,
   type RuntimeAvailabilityPort,
 } from "../ports/index.js";
 import type { DataReadPolicyPorts } from "../policy/index.js";
 import type { SyncManager } from "../sync/index.js";
 import {
-  deleteDataScopeContract,
+  deleteScope as deleteScopeLocally,
+  type DeleteScopeResult,
+} from "../sync/workers/delete.js";
+import {
   ingestDataContract,
   ingestBinaryDataContract,
   listAccessLogsContract,
@@ -159,8 +165,12 @@ export interface PersonalServerApiLogger {
 export interface PersonalServerIngestSyncManager {
   trigger(): Promise<void>;
   notifyNewData?(): void;
-  /** Propagate a scope deletion to R2 + the gateway before the local delete. */
-  deleteScopeRemote?(scope: string): Promise<void>;
+  /**
+   * Durable scope deletion (gateway tombstone -> storage blobs -> local).
+   * When absent the DELETE route deletes the local copy only and reports
+   * `durable: false`.
+   */
+  deleteScope?(scope: string): Promise<DeleteScopeResult>;
 }
 
 export interface PersonalServerDataApiDeps {
@@ -170,6 +180,13 @@ export interface PersonalServerDataApiDeps {
   syncManager?: PersonalServerIngestSyncManager | null;
   runtimeAvailability?: RuntimeAvailabilityPort;
   readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
+  /**
+   * Deletion-aware registry lookup. When a read finds no local copy, the
+   * handler asks the gateway whether the owner deleted the scope and answers
+   * 410 DATA_DELETED instead of 404, so SDK readers can tell "deleted" from
+   * "never had it". Needs `serverOwner` to derive the data-point id.
+   */
+  dataPointFeed?: DataPointFeedPort;
   /**
    * Required when payment is on. Powers two things on GET /v1/data/:scope:
    *   - the X402 challenge generation (fee lookup, accessRecord binding)
@@ -603,6 +620,63 @@ function collectedAt(now: () => Date): string {
     .replace(/\.\d{3}Z$/, "Z");
 }
 
+/**
+ * A read that misses locally may be a scope the owner durably deleted (the
+ * local copy is gone by design). Ask the registry and answer 410 so clients
+ * never mistake a deletion for missing data. Feed errors are swallowed: the
+ * 404 stands when the gateway cannot be reached.
+ */
+async function throwIfScopeDeleted(
+  deps: Pick<
+    PersonalServerDataApiDeps,
+    "dataPointFeed" | "serverOwner" | "logger"
+  >,
+  scope: string,
+): Promise<void> {
+  if (!deps.dataPointFeed || !deps.serverOwner) return;
+  let record: Awaited<ReturnType<DataPointFeedPort["getDataPoint"]>>;
+  try {
+    record = await deps.dataPointFeed.getDataPoint({
+      ownerAddress: deps.serverOwner,
+      scope,
+    });
+  } catch (err) {
+    deps.logger?.warn?.(
+      { scope, error: err instanceof Error ? err.message : String(err) },
+      "Could not check gateway deletion state for a missing scope",
+    );
+    return;
+  }
+  if (record?.deletedAt) {
+    throw new DataDeletedError({
+      scope,
+      dataPointId: record.id,
+      deletedAt: record.deletedAt,
+    });
+  }
+}
+
+// The delete worker wants a full Logger; the API logger is all-optional.
+function apiLoggerAsLogger(logger: PersonalServerApiLogger | undefined) {
+  const noop = () => undefined;
+  return {
+    debug: (payload: unknown, message?: string) =>
+      (logger?.debug ?? noop)(
+        payload as Record<string, unknown>,
+        message ?? "",
+      ),
+    info: (payload: unknown, message?: string) =>
+      (logger?.info ?? noop)(payload as Record<string, unknown>, message ?? ""),
+    warn: (payload: unknown, message?: string) =>
+      (logger?.warn ?? noop)(payload as Record<string, unknown>, message ?? ""),
+    error: (payload: unknown, message?: string) =>
+      (logger?.error ?? noop)(
+        payload as Record<string, unknown>,
+        message ?? "",
+      ),
+  };
+}
+
 function notifyNewData(
   syncManager: PersonalServerDataApiDeps["syncManager"],
 ): void {
@@ -704,45 +778,6 @@ function resolveLineageGrantView(
     });
   }
   return { grantId };
-}
-
-/**
- * Delete one scope the way DELETE /v1/data/:scope always has: propagate to
- * the authoritative stores first, best-effort (on DPv2 the remote step is a
- * logged no-op until the tombstone-based delete lands), then drop the local
- * copy.
- */
-async function deleteOneScope(
-  deps: PersonalServerDataApiDeps,
-  scope: string,
-): Promise<number> {
-  if (deps.syncManager?.deleteScopeRemote) {
-    try {
-      await deps.syncManager.deleteScopeRemote(scope);
-    } catch (err) {
-      deps.logger?.info?.(
-        { scope, error: (err as Error).message },
-        "Remote scope deletion failed; proceeding with local delete",
-      );
-    }
-  }
-  const result = await deleteDataScopeContract({
-    storage: deps.storage,
-    scopeParam: scope,
-  });
-  if (!result.ok) {
-    // The scope was validated by the caller; a contract error here is a bug.
-    throw new ProtocolError(
-      result.status,
-      result.body.error,
-      result.body.message,
-    );
-  }
-  deps.logger?.info?.(
-    { scope, deletedCount: result.deletedCount },
-    "Scope deleted",
-  );
-  return result.deletedCount;
 }
 
 export async function handlePersonalServerDataRequest(
@@ -998,7 +1033,12 @@ export async function handlePersonalServerDataRequest(
         fileId: url.searchParams.get("fileId") ?? undefined,
         at: url.searchParams.get("at") ?? undefined,
       });
-      if (!result.ok) return contractErrorResponse(result);
+      if (!result.ok) {
+        if (result.status === 404) {
+          await throwIfScopeDeleted(deps, scopeResult.scope);
+        }
+        return contractErrorResponse(result);
+      }
 
       const logId = deps.createLogId?.() ?? crypto.randomUUID();
       const timestamp = (deps.now ?? (() => new Date()))().toISOString();
@@ -1268,14 +1308,58 @@ export async function handlePersonalServerDataRequest(
         // them back.
         throw new LineageCascadeUnavailableError({ scope: parsed.scope });
       }
-      // Single node (the default): propagate the deletion to the
-      // authoritative stores (R2 blobs + gateway records) BEFORE the local
-      // delete, which reads the local index to find what to remove.
-      // Best-effort: a remote failure must not block the owner's local delete
-      // (sync would otherwise resurrect it; the download-worker
-      // reconciliation is the backstop).
-      await deleteOneScope(deps, parsed.scope);
-      return new Response(null, { status: 204 });
+
+      // Durable order: gateway tombstone -> storage blobs -> local copy. The
+      // sync manager owns the remote ports; without one (sync disabled or
+      // no owner key material) only the local copy goes and the result says
+      // so (`durable: false`) rather than pretending.
+      const result = deps.syncManager?.deleteScope
+        ? await deps.syncManager.deleteScope(parsed.scope)
+        : await deleteScopeLocally(
+            {
+              storage: deps.storage,
+              serverOwner: deps.serverOwner,
+              deleteData: null,
+              logger: apiLoggerAsLogger(deps.logger),
+            },
+            parsed.scope,
+          );
+
+      if (result.steps.gateway.status === "failed") {
+        // Nothing was deleted: the local copy is kept on purpose so sync
+        // cannot resurrect a half-deleted scope. Surface it as an upstream
+        // failure with the per-step result attached.
+        throw new DeleteTombstoneFailedError({
+          scope: parsed.scope,
+          result,
+        });
+      }
+
+      await deps.accessLogWriter.write({
+        logId: deps.createLogId?.() ?? crypto.randomUUID(),
+        grantId: "owner",
+        builder: deps.serverOwner ?? "owner",
+        action: "delete",
+        scope: parsed.scope,
+        timestamp: (deps.now ?? (() => new Date()))().toISOString(),
+        ipAddress:
+          request.headers.get("x-forwarded-for") ??
+          request.headers.get("x-real-ip") ??
+          "unknown",
+        userAgent: request.headers.get("user-agent") ?? "unknown",
+      });
+      deps.logger?.info?.(
+        {
+          scope: parsed.scope,
+          durable: result.durable,
+          gateway: result.steps.gateway.status,
+          storage: result.steps.storage.status,
+          local: result.steps.local.status,
+          deletedCount: result.steps.local.deletedCount,
+        },
+        "Scope deleted",
+      );
+      return jsonResponse(result, { status: 200 });
     }
 
     return methodNotAllowed();

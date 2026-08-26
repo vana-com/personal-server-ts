@@ -8,8 +8,13 @@ import {
 import type { ServerSigner } from "../../signing/signer.js";
 import type { Logger } from "../../logger/index.js";
 import type { IndexEntry } from "../../storage/index/types.js";
-import type { DataStoragePort } from "../../ports/index.js";
+import type {
+  DataPointFeedPort,
+  DataPointFeedRecord,
+  DataStoragePort,
+} from "../../ports/index.js";
 import { computeDataPointId } from "../data-point-id.js";
+import { isTombstoneRecord } from "../tombstone.js";
 import { readStoredLineage } from "../../lineage/lineage.js";
 import type { LineageGatewayPort } from "../../lineage/gateway.js";
 
@@ -31,6 +36,14 @@ export interface UploadWorkerDeps {
    * a root record whose lineage exists only inside the ciphertext.
    */
   lineageGateway?: Pick<LineageGatewayPort, "registerDataPoint">;
+  /**
+   * Deletion-aware registry lookup. When present, an unsynced entry for a
+   * scope the gateway has tombstoned is dropped instead of uploaded (unless
+   * it was ingested AFTER the deletion, which is a legitimate re-add and is
+   * registered strictly after the tombstone version). Without it the worker
+   * behaves as before and cannot see deletions.
+   */
+  dataPointFeed?: DataPointFeedPort;
 }
 
 export interface UploadResult {
@@ -61,6 +74,35 @@ export class OrphanedEntryError extends Error {
     super(`Orphaned index entry dropped (payload missing): ${path}`);
     this.name = "OrphanedEntryError";
   }
+}
+
+/**
+ * Thrown when an unsynced entry belongs to a scope the gateway has tombstoned
+ * and the entry predates that deletion: uploading it would resurrect data the
+ * owner deleted, so the local copy is dropped instead. Like
+ * `OrphanedEntryError`, `uploadAll` treats it as a silent self-heal.
+ */
+export class DeletedScopeEntryError extends Error {
+  constructor(path: string, deletedAt: string) {
+    super(`Dropped local entry for a scope deleted at ${deletedAt}: ${path}`);
+    this.name = "DeletedScopeEntryError";
+  }
+}
+
+/**
+ * True when `entry` was ingested at or before the gateway deletion, i.e. it
+ * is part of what the owner deleted rather than a fresh re-add. Unparseable
+ * timestamps count as stale: resurrecting deleted data is the failure this
+ * guards against.
+ */
+export function isEntryCoveredByDeletion(
+  entry: Pick<IndexEntry, "createdAt">,
+  deletedAt: string,
+): boolean {
+  const created = Date.parse(entry.createdAt);
+  const deleted = Date.parse(deletedAt);
+  if (Number.isNaN(created) || Number.isNaN(deleted)) return true;
+  return created <= deleted;
 }
 
 /**
@@ -123,6 +165,37 @@ export async function uploadOne(
     throw err;
   }
 
+  // 1b. Deletion guard. If the gateway holds a tombstone for this scope, an
+  // unsynced entry from before the deletion must never be uploaded: the
+  // owner deleted it (possibly on another replica) and registering it again
+  // would resurrect the scope. An entry ingested after the deletion is a
+  // real re-add and goes up at a version strictly after the tombstone.
+  let registerVersion = BigInt(entry.version);
+  if (!entry.dataPointId && deps.dataPointFeed) {
+    const remote = await deps.dataPointFeed.getDataPoint({
+      ownerAddress: serverOwner,
+      scope: entry.scope,
+    });
+    const deletedAt = deletionTimestamp(remote);
+    if (remote && deletedAt !== null) {
+      if (isEntryCoveredByDeletion(entry, deletedAt)) {
+        await storage.deleteVersion(entry.scope, entry.collectedAt);
+        logger.warn(
+          {
+            path: entry.path,
+            scope: entry.scope,
+            deletedAt,
+            createdAt: entry.createdAt,
+          },
+          "Dropped unsynced local entry: the gateway reports its scope as deleted",
+        );
+        throw new DeletedScopeEntryError(entry.path, deletedAt);
+      }
+      const afterTombstone = BigInt(remote.expectedVersion) + 1n;
+      if (afterTombstone > registerVersion) registerVersion = afterTombstone;
+    }
+  }
+
   // 2. Derive scope key → hex-encode as OpenPGP password
   const scopeKey = deriveScopeKey(masterKey, entry.scope);
   const scopeKeyHex = uint8ToHex(scopeKey);
@@ -160,7 +233,7 @@ export async function uploadOne(
   // (scope, expectedVersion) — DataPointRecords carry no URL. We upload
   // before registering so the on-chain data point (the synced marker) is
   // never stamped ahead of a blob that failed to land.
-  const storageKey = `${entry.scope}/${entry.version}`;
+  const storageKey = `${entry.scope}/${registerVersion}`;
   let url = await storageAdapter.upload(storageKey, encrypted);
 
   // 6. DPv2 data-point registration (idempotent — skipped when a prior run
@@ -234,7 +307,12 @@ export async function uploadOne(
     };
 
     try {
-      dataPointId = await registerAt(BigInt(entry.version));
+      dataPointId = await registerAt(registerVersion);
+      if (registerVersion !== BigInt(entry.version)) {
+        // Re-add after a deletion: the row must follow the registered
+        // version (the blob key embeds it).
+        await storage.updateEntryVersion(entry.path, Number(registerVersion));
+      }
     } catch (err) {
       if (!isStaleVersionConflict(err)) throw err;
       // The registry's version for this (owner, scope) is ahead of the local
@@ -243,9 +321,16 @@ export async function uploadOne(
       // gateway 409s precisely so the client can re-sign against the live
       // version — retrying the same version every cycle head-blocks the
       // scope's whole upload queue.
-      const record = await gateway.getDataPoint(
-        computeDataPointId(serverOwner, entry.scope),
-      );
+      // Prefer the deletion-aware feed: the SDK client throws on a 410 for
+      // a tombstoned point, which would wedge this entry forever.
+      const record = deps.dataPointFeed
+        ? await deps.dataPointFeed.getDataPoint({
+            ownerAddress: serverOwner,
+            scope: entry.scope,
+          })
+        : await gateway.getDataPoint(
+            computeDataPointId(serverOwner, entry.scope),
+          );
 
       if (record && record.dataHash.toLowerCase() === dataHash.toLowerCase()) {
         // Identical content is already registered (this entry, or a replica's
@@ -363,7 +448,10 @@ export async function uploadAll(
       // gone, there is nothing to retry, and surfacing it would keep the
       // scope showing a scary error (and fail settle-waits) for a file the
       // user deleted on purpose. Already logged in uploadOne; swallow here.
-      if (err instanceof OrphanedEntryError) {
+      if (
+        err instanceof OrphanedEntryError ||
+        err instanceof DeletedScopeEntryError
+      ) {
         continue;
       }
       const error = err as Error;
@@ -408,4 +496,13 @@ export function parseGatewayNextVersion(message: string): number | null {
   );
   if (storedValue) return Number(storedValue[1]) + 1;
   return null;
+}
+
+// A tombstone is visible either as `deletedAt` (a feed that models deletion)
+// or, from a gateway that lists tombstones as plain rows, as the tombstone
+// commitments themselves; `addedAt` is then the deletion time.
+function deletionTimestamp(record: DataPointFeedRecord | null): string | null {
+  if (!record) return null;
+  if (record.deletedAt) return record.deletedAt;
+  return isTombstoneRecord(record) ? record.addedAt : null;
 }

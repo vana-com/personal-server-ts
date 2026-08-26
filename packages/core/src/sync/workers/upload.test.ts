@@ -14,6 +14,7 @@ import type {
 import type { ServerSigner } from "../../signing/signer.js";
 import type { Logger } from "../../logger/index.js";
 import type { DataStoragePort } from "../../ports/index.js";
+import { TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH } from "../tombstone.js";
 
 vi.mock("@opendatalabs/vana-sdk/browser", () => ({
   deriveScopeKey: vi.fn(),
@@ -737,6 +738,141 @@ describe("upload worker", () => {
         entry.path,
         2,
       );
+    });
+  });
+
+  describe("deletion guard (durable delete)", () => {
+    const DELETED_AT = "2026-02-01T00:00:00.000Z";
+
+    function withFeed(
+      deps: UploadWorkerDeps,
+      remote: {
+        deletedAt: string | null;
+        expectedVersion: string;
+        dataHash?: string;
+      } | null,
+    ) {
+      deps.dataPointFeed = {
+        getDataPoint: vi.fn(async () =>
+          remote
+            ? {
+                id: DATA_POINT_ID,
+                ownerAddress: OWNER,
+                scope: SCOPE,
+                dataHash: remote.dataHash ?? "0x" + "33".repeat(32),
+                metadataHash: "0x" + "44".repeat(32),
+                expectedVersion: remote.expectedVersion,
+                addedAt: "2026-01-01T00:00:00.000Z",
+                deletedAt: remote.deletedAt,
+              }
+            : null,
+        ),
+        listDataPointsByOwner: vi.fn(),
+      };
+      deps.storage.deleteVersion = vi.fn(async () => true);
+      return deps;
+    }
+
+    it("drops an unsynced entry whose scope the gateway has tombstoned instead of uploading it", async () => {
+      const deps = withFeed(makeMockDeps(), {
+        deletedAt: DELETED_AT,
+        expectedVersion: "4",
+      });
+      const entry = makeEntry({ createdAt: "2026-01-21T10:00:00Z" });
+      (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue([
+        entry,
+      ]);
+      const onError = vi.fn();
+
+      const results = await uploadAll(deps, { onError });
+
+      expect(results).toEqual([]);
+      expect(onError).not.toHaveBeenCalled();
+      expect(deps.storageAdapter.upload).not.toHaveBeenCalled();
+      expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
+      expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
+        SCOPE,
+        COLLECTED_AT,
+      );
+    });
+
+    it("registers a re-ingest newer than the deletion strictly after the tombstone version", async () => {
+      const deps = withFeed(makeMockDeps(), {
+        deletedAt: DELETED_AT,
+        expectedVersion: "4",
+      });
+      const entry = makeEntry({ createdAt: "2026-03-01T00:00:00.000Z" });
+
+      const result = await uploadOne(deps, entry);
+
+      expect(deps.storage.deleteVersion).not.toHaveBeenCalled();
+      expect(deps.storageAdapter.upload).toHaveBeenCalledWith(
+        `${SCOPE}/5`,
+        ENCRYPTED_BYTES,
+      );
+      expect(deps.signer.signAddData).toHaveBeenCalledWith(
+        expect.objectContaining({ expectedVersion: 5n }),
+      );
+      expect(deps.gateway.registerDataPoint).toHaveBeenCalledWith(
+        expect.objectContaining({ expectedVersion: "5" }),
+      );
+      expect(deps.storage.updateEntryVersion).toHaveBeenCalledWith(
+        entry.path,
+        5,
+      );
+      expect(result.dataPointId).toBe(DATA_POINT_ID);
+    });
+
+    it("recognises a tombstone row by its hash pair even without deletedAt", async () => {
+      const deps = withFeed(makeMockDeps(), {
+        deletedAt: null,
+        expectedVersion: "4",
+        dataHash: TOMBSTONE_DATA_HASH,
+      });
+      (
+        deps.dataPointFeed!.getDataPoint as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        id: DATA_POINT_ID,
+        ownerAddress: OWNER,
+        scope: SCOPE,
+        dataHash: TOMBSTONE_DATA_HASH,
+        metadataHash: TOMBSTONE_METADATA_HASH,
+        expectedVersion: "4",
+        addedAt: DELETED_AT,
+        deletedAt: null,
+      });
+      const entry = makeEntry({ createdAt: "2026-01-21T10:00:00Z" });
+
+      await expect(uploadOne(deps, entry)).rejects.toMatchObject({
+        name: "DeletedScopeEntryError",
+      });
+      expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
+    });
+
+    it("uploads normally when the gateway has a live row or no row", async () => {
+      const live = withFeed(makeMockDeps(), {
+        deletedAt: null,
+        expectedVersion: "1",
+      });
+      await uploadOne(live, makeEntry());
+      expect(live.gateway.registerDataPoint).toHaveBeenCalledWith(
+        expect.objectContaining({ expectedVersion: "1" }),
+      );
+
+      const none = withFeed(makeMockDeps(), null);
+      await uploadOne(none, makeEntry());
+      expect(none.gateway.registerDataPoint).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not consult the feed for entries that are already synced", async () => {
+      const deps = withFeed(makeMockDeps(), {
+        deletedAt: DELETED_AT,
+        expectedVersion: "4",
+      });
+
+      await uploadOne(deps, makeEntry({ dataPointId: DATA_POINT_ID }));
+
+      expect(deps.dataPointFeed!.getDataPoint).not.toHaveBeenCalled();
     });
   });
 });

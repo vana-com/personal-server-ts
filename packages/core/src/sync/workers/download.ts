@@ -8,7 +8,13 @@ import {
 } from "@opendatalabs/vana-sdk/browser";
 import type { SyncCursor } from "../cursor.js";
 import type { Logger } from "../../logger/index.js";
-import type { DataStoragePort } from "../../ports/index.js";
+import type {
+  DataPointFeedPort,
+  DataPointFeedRecord,
+  DataStoragePort,
+} from "../../ports/index.js";
+import { feedFromGatewayClient } from "../data-point-feed.js";
+import { isTombstoneRecord } from "../tombstone.js";
 import { buildDataBlocksAsync } from "../../storage/blocks/build.js";
 import {
   classifySyncFailure,
@@ -51,6 +57,22 @@ export interface DownloadWorkerDeps {
   logger: Logger;
   /** Optional diagnostics hook — omit to disable instrumentation. */
   diagnostics?: DownloadDiagnosticsHook;
+  /**
+   * Deletion-aware registry listing (`includeDeleted=true`). When present,
+   * tombstoned points reach this replica and their local copies are removed
+   * instead of re-pulled. Falls back to the SDK client listing, which only
+   * sees deletions the gateway volunteers without being asked.
+   */
+  dataPointFeed?: DataPointFeedPort;
+}
+
+export interface DeletionReconcileResult {
+  scope: string;
+  deletedAt: string;
+  /** Local versions removed because the tombstone covers them. */
+  removed: number;
+  /** Local unsynced versions ingested after the deletion and kept. */
+  kept: number;
 }
 
 export interface DownloadResult {
@@ -345,15 +367,41 @@ export async function downloadAll(
     options.retryMemory?.onListingReset();
   }
 
-  // 2. Poll gateway for the owner's data points.
-  const { dataPoints, cursor: nextCursor } =
-    await gateway.listDataPointsByOwner(serverOwner, lastCursor);
+  // 2. Poll gateway for the owner's data points, tombstones included: a
+  // deletion made on another replica must reach this one or its local copy
+  // would be re-uploaded and resurrect the point.
+  const feed = deps.dataPointFeed ?? feedFromGatewayClient(gateway);
+  const { dataPoints, cursor: nextCursor } = await feed.listDataPointsByOwner(
+    serverOwner,
+    lastCursor,
+    { includeDeleted: true },
+  );
 
   const results: DownloadResult[] = [];
   let failed = false;
 
   // 3. Process each data point record
   for (const dataPoint of dataPoints) {
+    const deletedAt = deletionTimestamp(dataPoint);
+    if (deletedAt !== null) {
+      // Tombstone: never download; drop what the deletion covers locally.
+      // A failure here blocks the cursor so the tombstone is re-listed and
+      // the reconcile retried next cycle.
+      try {
+        await reconcileDeletedDataPoint(deps, dataPoint, deletedAt);
+      } catch (err) {
+        logger.error(
+          {
+            dataPointId: dataPoint.id,
+            scope: dataPoint.scope,
+            error: (err as Error).message,
+          },
+          "Failed to reconcile deleted data point locally",
+        );
+        failed = true;
+      }
+      continue;
+    }
     const retryKey = downloadRetryKey(dataPoint);
     const decision = options.retryMemory?.decide(retryKey) ?? "attempt";
     if (decision === "give-up") {
@@ -429,6 +477,72 @@ export async function downloadAll(
   }
 
   return results;
+}
+
+/**
+ * Apply a gateway tombstone to the local index: remove every local version
+ * the deletion covers (synced rows, and unsynced rows ingested at or before
+ * `deletedAt`), keep unsynced rows ingested after it (a legitimate re-add
+ * that the upload worker registers after the tombstone version).
+ */
+export async function reconcileDeletedDataPoint(
+  deps: Pick<DownloadWorkerDeps, "storage" | "logger">,
+  record: Pick<DataPointFeedRecord, "id" | "scope">,
+  deletedAt: string,
+): Promise<DeletionReconcileResult> {
+  const { storage, logger } = deps;
+  const PAGE_SIZE = 500;
+  const stale: Array<{ scope: string; collectedAt: string }> = [];
+  let kept = 0;
+  for (let offset = 0; ; offset += PAGE_SIZE) {
+    const entries = storage.listVersions(record.scope, {
+      limit: PAGE_SIZE,
+      offset,
+    });
+    for (const entry of entries) {
+      if (entry.dataPointId !== null || coveredByDeletion(entry, deletedAt)) {
+        stale.push({ scope: entry.scope, collectedAt: entry.collectedAt });
+      } else {
+        kept += 1;
+      }
+    }
+    if (entries.length < PAGE_SIZE) break;
+  }
+
+  let removed = 0;
+  for (const version of stale) {
+    if (await storage.deleteVersion(version.scope, version.collectedAt)) {
+      removed += 1;
+    }
+  }
+
+  if (removed > 0 || kept > 0) {
+    logger.info(
+      { dataPointId: record.id, scope: record.scope, deletedAt, removed, kept },
+      "Reconciled gateway deletion against local index",
+    );
+  }
+  return { scope: record.scope, deletedAt, removed, kept };
+}
+
+// Mirrors the upload worker's rule: unparseable timestamps count as covered,
+// because resurrecting deleted data is the failure this guards against.
+function coveredByDeletion(
+  entry: { createdAt: string },
+  deletedAt: string,
+): boolean {
+  const created = Date.parse(entry.createdAt);
+  const deleted = Date.parse(deletedAt);
+  if (Number.isNaN(created) || Number.isNaN(deleted)) return true;
+  return created <= deleted;
+}
+
+// A tombstone is visible either as `deletedAt` (a feed that models deletion)
+// or, from a gateway that lists tombstones as plain rows, as the tombstone
+// commitments themselves; `addedAt` is then the deletion time.
+function deletionTimestamp(record: DataPointFeedRecord): string | null {
+  if (record.deletedAt) return record.deletedAt;
+  return isTombstoneRecord(record) ? record.addedAt : null;
 }
 
 export async function repairLocalMissingBlockSidecars(

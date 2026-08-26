@@ -1,71 +1,221 @@
-import type { StorageAdapter } from "../../storage/adapters/interface.js";
-import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
-import type { ServerSigner } from "../../signing/signer.js";
 import type { Logger } from "../../logger/index.js";
-import type { DataStoragePort } from "../../ports/index.js";
+import type {
+  DataStoragePort,
+  DeleteDataPort,
+  PendingBlobDeletionStore,
+} from "../../ports/index.js";
+import { computeDataPointId } from "../data-point-id.js";
 
-export interface DeleteWorkerDeps {
+export interface DeleteScopeDeps {
   storage: DataStoragePort;
-  storageAdapter: StorageAdapter;
-  gateway: GatewayClient;
-  signer: ServerSigner;
-  serverOwner: string;
+  /** Data owner; absent only on an unconfigured host (no key material). */
+  serverOwner?: string;
+  /**
+   * Remote deletion (gateway tombstone + storage blobs). Absent when the host
+   * runs without sync (no owner key material): deletion is then local-only
+   * and reported as such, never silently "durable".
+   */
+  deleteData?: DeleteDataPort | null;
+  /** Retry marker for blob deletion that failed after the tombstone landed. */
+  pendingBlobDeletions?: PendingBlobDeletionStore;
   logger: Logger;
 }
 
-export interface DeleteScopeRemoteResult {
+export type DeleteStepStatus = "ok" | "skipped" | "failed";
+
+export interface DeleteScopeStep {
+  status: DeleteStepStatus;
+  /** Why the step was skipped (e.g. "not-registered", "sync-disabled"). */
+  reason?: string;
+  /** Error message when status is "failed". */
+  error?: string;
+}
+
+export interface DeleteScopeResult {
   scope: string;
-  /** Synced versions de-registered at the gateway. */
-  filesDeregistered: number;
-  /** Ciphertext blobs hard-deleted from storage. */
-  blobsDeleted: number;
-  errors: Array<{ fileId: string | null; message: string }>;
+  /** DPv2 identity: keccak256(abi.encode(owner, scope)); null without an owner. */
+  dataPointId: string | null;
+  /**
+   * True once the gateway holds the tombstone (or never held the point at
+   * all): sync can no longer resurrect the scope on any replica. False when
+   * only the local copy was removed.
+   */
+  durable: boolean;
+  steps: {
+    gateway: DeleteScopeStep & {
+      /** Tombstone version at the gateway (previous current + 1). */
+      version?: string;
+      deletedAt?: string | null;
+    };
+    storage: DeleteScopeStep & { blobsDeleted?: number | null };
+    local: DeleteScopeStep & { deletedCount?: number };
+  };
+  /**
+   * True when the tombstone landed but blob deletion did not: a retry marker
+   * was recorded and a later sync cycle finishes it.
+   */
+  pendingBlobDeletion: boolean;
 }
 
 /**
- * Propagate a scope deletion to the authoritative remote stores.
+ * Durable scope deletion, in the only order that cannot resurrect data:
  *
- * NOT SUPPORTED on the DPv2 (DataPoint) gateway: there is no data-point
- * de-registration / deletion endpoint, and the DataPointRecord listing carries
- * no soft-delete (`deletedAt`) flag. Under the legacy file model this worker
- * de-registered each file then hard-deleted its blob; that path is gone with
- * `gateway.getFile` / `gateway.deleteFile` / `signFileDeletion`.
+ *   1. gateway tombstone  (owner-signed AddData at current + 1; the fact)
+ *   2. storage blobs      (every version's ciphertext)
+ *   3. local copy         (index rows + files + sidecars)
  *
- * Deleting the ciphertext blob alone would be unsafe: the data point would
- * stay listed, so any server syncing it would 404 on download and wedge its
- * sync cursor. So this is a no-op that logs the limitation. Local deletion
- * (index rows + on-disk blobs) still happens via the storage port's
- * `deleteScope`, independent of this worker — only the *remote* copy is left
- * in place until DPv2 grows a deletion API.
+ * The local delete never runs before the gateway has acknowledged: until the
+ * registry says "deleted", the next sync cycle would re-pull the point from
+ * the still-live row. A storage failure after step 1 is reported AND leaves
+ * a retry marker; it does not block step 3 because the tombstone already
+ * makes the deletion stick.
  */
-export async function deleteScopeRemote(
-  deps: DeleteWorkerDeps,
+export async function deleteScope(
+  deps: DeleteScopeDeps,
   scope: string,
-): Promise<DeleteScopeRemoteResult> {
-  const { storage, logger } = deps;
-
-  // Count the synced versions we *would* have de-registered, for the log only.
-  let syncedVersions = 0;
-  const PAGE_SIZE = 1000;
-  for (let offset = 0; ; offset += PAGE_SIZE) {
-    const entries = storage.listVersions(scope, { limit: PAGE_SIZE, offset });
-    syncedVersions += entries.filter((e) => e.dataPointId !== null).length;
-    if (entries.length < PAGE_SIZE) break;
-  }
-
-  if (syncedVersions > 0) {
-    logger.warn(
-      { scope, syncedVersions },
-      "Remote scope deletion is not supported on the DPv2 gateway (no " +
-        "de-registration endpoint); local data was removed but the remote " +
-        "data point(s) and ciphertext blob(s) remain",
-    );
-  }
-
-  return {
+): Promise<DeleteScopeResult> {
+  const { storage, deleteData, pendingBlobDeletions, logger } = deps;
+  const dataPointId = deps.serverOwner
+    ? computeDataPointId(deps.serverOwner, scope)
+    : null;
+  const result: DeleteScopeResult = {
     scope,
-    filesDeregistered: 0,
-    blobsDeleted: 0,
-    errors: [],
+    dataPointId,
+    durable: false,
+    steps: {
+      gateway: { status: "skipped", reason: "sync-disabled" },
+      storage: { status: "skipped", reason: "sync-disabled" },
+      local: { status: "skipped" },
+    },
+    pendingBlobDeletion: false,
   };
+
+  if (deleteData) {
+    // 1. Gateway tombstone: the durable fact. Nothing else happens if it
+    // fails, so the owner gets a clear "nothing was deleted" instead of a
+    // local delete that sync silently undoes.
+    try {
+      const outcome = await deleteData.tombstone(scope);
+      if (outcome.status === "not-registered") {
+        result.steps.gateway = { status: "skipped", reason: "not-registered" };
+      } else {
+        result.steps.gateway = {
+          status: "ok",
+          ...(outcome.status === "already-deleted" && {
+            reason: "already-deleted",
+          }),
+          version: outcome.version,
+          deletedAt: outcome.deletedAt,
+        };
+      }
+      result.durable = true;
+    } catch (err) {
+      const message = errorMessage(err);
+      result.steps.gateway = { status: "failed", error: message };
+      result.steps.storage = { status: "skipped", reason: "gateway-failed" };
+      result.steps.local = { status: "skipped", reason: "gateway-failed" };
+      logger.error(
+        { scope, dataPointId, error: message },
+        "Gateway tombstone failed; scope NOT deleted (local copy kept so sync cannot resurrect a half-deleted scope)",
+      );
+      return result;
+    }
+
+    // 2. Storage blobs. Best-effort once the tombstone exists: a failure is
+    // reported and remembered for a later cycle, never hidden.
+    try {
+      const outcome = await deleteData.deleteBlobs(scope);
+      result.steps.storage = {
+        status: "ok",
+        blobsDeleted: outcome.blobsDeleted,
+      };
+      await pendingBlobDeletions?.remove(scope);
+    } catch (err) {
+      const message = errorMessage(err);
+      result.steps.storage = { status: "failed", error: message };
+      if (pendingBlobDeletions) {
+        try {
+          await pendingBlobDeletions.add(scope);
+          result.pendingBlobDeletion = true;
+        } catch (markerErr) {
+          logger.error(
+            { scope, error: errorMessage(markerErr) },
+            "Could not record pending blob deletion marker",
+          );
+        }
+      }
+      logger.warn(
+        {
+          scope,
+          error: message,
+          pendingBlobDeletion: result.pendingBlobDeletion,
+        },
+        "Storage blob deletion failed after gateway tombstone; will retry",
+      );
+    }
+  }
+
+  // 3. Local copy. Safe now: the registry row is a tombstone (or the point
+  // was never registered / sync is off), so nothing can re-pull it.
+  try {
+    const deletedCount = await storage.deleteScope(scope);
+    result.steps.local = { status: "ok", deletedCount };
+  } catch (err) {
+    const message = errorMessage(err);
+    result.steps.local = { status: "failed", error: message };
+    logger.error({ scope, error: message }, "Local scope deletion failed");
+  }
+
+  logger.info(
+    {
+      scope,
+      dataPointId,
+      durable: result.durable,
+      gateway: result.steps.gateway.status,
+      storage: result.steps.storage.status,
+      local: result.steps.local.status,
+    },
+    "Scope deletion finished",
+  );
+  return result;
+}
+
+export interface RetryPendingBlobDeletionsResult {
+  completed: string[];
+  failed: Array<{ scope: string; error: string }>;
+}
+
+/**
+ * Finish blob deletions whose tombstone landed but whose storage DELETE did
+ * not. Runs at the start of every sync cycle; each scope is retried until
+ * storage acknowledges (2xx or 404), then the marker is cleared.
+ */
+export async function retryPendingBlobDeletions(
+  deps: Pick<DeleteScopeDeps, "deleteData" | "pendingBlobDeletions" | "logger">,
+): Promise<RetryPendingBlobDeletionsResult> {
+  const { deleteData, pendingBlobDeletions, logger } = deps;
+  const result: RetryPendingBlobDeletionsResult = { completed: [], failed: [] };
+  if (!deleteData || !pendingBlobDeletions) return result;
+
+  const scopes = await pendingBlobDeletions.list();
+  for (const scope of scopes) {
+    try {
+      await deleteData.deleteBlobs(scope);
+      await pendingBlobDeletions.remove(scope);
+      result.completed.push(scope);
+      logger.info({ scope }, "Completed pending blob deletion");
+    } catch (err) {
+      const message = errorMessage(err);
+      result.failed.push({ scope, error: message });
+      logger.warn(
+        { scope, error: message },
+        "Pending blob deletion failed again",
+      );
+    }
+  }
+  return result;
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }

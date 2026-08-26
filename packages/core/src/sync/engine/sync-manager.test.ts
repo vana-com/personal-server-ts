@@ -313,4 +313,84 @@ describe("SyncManager", () => {
 
     await manager.stop();
   });
+
+  describe("durable delete", () => {
+    function makeDeleteData() {
+      return {
+        tombstone: vi.fn(async () => ({
+          status: "tombstoned" as const,
+          dataPointId: "0xdp",
+          version: "2",
+          deletedAt: "2026-08-25T10:00:00.000Z",
+        })),
+        deleteBlobs: vi.fn(async () => ({ blobsDeleted: 1 })),
+      };
+    }
+
+    function makePending(initial: string[] = []) {
+      const scopes = [...initial];
+      return {
+        list: vi.fn(async () => [...scopes]),
+        add: vi.fn(async (scope: string) => {
+          if (!scopes.includes(scope)) scopes.push(scope);
+        }),
+        remove: vi.fn(async (scope: string) => {
+          const i = scopes.indexOf(scope);
+          if (i >= 0) scopes.splice(i, 1);
+        }),
+      };
+    }
+
+    it("deleteScope() runs tombstone -> blobs -> local through the wired ports", async () => {
+      const uploadDeps = makeMockUploadDeps();
+      uploadDeps.storage.deleteScope = vi.fn(async () => 2);
+      const deleteData = makeDeleteData();
+      const manager = createSyncManager(uploadDeps, makeMockDownloadDeps(), {
+        deleteData,
+        pendingBlobDeletions: makePending(),
+      });
+
+      const result = await manager.deleteScope("instagram.profile");
+
+      expect(deleteData.tombstone).toHaveBeenCalledWith("instagram.profile");
+      expect(deleteData.deleteBlobs).toHaveBeenCalledWith("instagram.profile");
+      expect(uploadDeps.storage.deleteScope).toHaveBeenCalledWith(
+        "instagram.profile",
+      );
+      expect(result.durable).toBe(true);
+      expect(result.steps.local).toEqual({ status: "ok", deletedCount: 2 });
+    });
+
+    it("deleteScope() is local-only when no delete port is wired", async () => {
+      const uploadDeps = makeMockUploadDeps();
+      uploadDeps.storage.deleteScope = vi.fn(async () => 1);
+      const manager = createSyncManager(uploadDeps, makeMockDownloadDeps());
+
+      const result = await manager.deleteScope("instagram.profile");
+
+      expect(result.durable).toBe(false);
+      expect(result.steps.gateway).toEqual({
+        status: "skipped",
+        reason: "sync-disabled",
+      });
+    });
+
+    it("retries pending blob deletions at the start of every cycle", async () => {
+      const deleteData = makeDeleteData();
+      const pending = makePending(["chatgpt.conversations"]);
+      const manager = createSyncManager(
+        makeMockUploadDeps(),
+        makeMockDownloadDeps(),
+        { deleteData, pendingBlobDeletions: pending },
+      );
+
+      await manager.trigger();
+
+      expect(deleteData.deleteBlobs).toHaveBeenCalledWith(
+        "chatgpt.conversations",
+      );
+      expect(pending.remove).toHaveBeenCalledWith("chatgpt.conversations");
+      expect(uploadAll).toHaveBeenCalledTimes(1);
+    });
+  });
 });
