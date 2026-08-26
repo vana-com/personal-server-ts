@@ -601,6 +601,17 @@ describe("verifyStoredWriterAttribution with lineage", () => {
     );
   });
 
+  it("rejects a $lineage mirror that does not restate the signed lineage field", async () => {
+    const data = await storedDerivativeRecord();
+    data[LINEAGE_KEY] = {
+      sources: [`0x${"cd".repeat(32)}`],
+      writtenAt: "2026-08-31T09:12:44.000Z",
+    };
+    await expect(
+      verifyStoredWriterAttribution({ scope: SCOPE, data }),
+    ).rejects.toMatchObject({ reason: "LINEAGE_MISMATCH" });
+  });
+
   it("still rejects a record whose signed lineage field was altered", async () => {
     const data = await storedDerivativeRecord();
     data.lineage = [`0x${"cd".repeat(32)}`];

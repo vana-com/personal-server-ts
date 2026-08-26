@@ -61,7 +61,12 @@ import {
   parseMetadataHeader,
   sha256Hex,
 } from "../contracts/binary.js";
-import { LINEAGE_KEY } from "../lineage/lineage.js";
+import {
+  LINEAGE_KEY,
+  extractLineageField,
+  readStoredLineage,
+} from "../lineage/lineage.js";
+import { isBinaryEnvelope } from "../contracts/binary.js";
 
 /** Header carrying the builder's signed-payload proof on a session write. */
 export const WRITE_SIGNATURE_HEADER = "x-vana-write-signature";
@@ -319,7 +324,8 @@ export class WriterAttributionVerificationError extends Error {
       | "SIGNER_MISMATCH"
       | "SCOPE_MISMATCH"
       | "GRANT_MISMATCH"
-      | "AUDIENCE_MISMATCH",
+      | "AUDIENCE_MISMATCH"
+      | "LINEAGE_MISMATCH",
     message: string,
   ) {
     super(message);
@@ -401,10 +407,9 @@ export async function verifyStoredWriterAttribution(
   // record re-hashes to the same signed bodyHash as a root record.
   const {
     [WRITER_ATTRIBUTION_KEY]: _attribution,
-    [LINEAGE_KEY]: _lineage,
+    [LINEAGE_KEY]: storedLineage,
     ...payloadData
   } = data;
-
   const bodyHash = computeBodyHash(
     new TextEncoder().encode(JSON.stringify(payloadData)),
   );
@@ -467,6 +472,34 @@ export async function verifyStoredWriterAttribution(
       "AUDIENCE_MISMATCH",
       "Stored proof was not addressed to this server",
     );
+  }
+  // The stripped mirror is not unauthenticated for that: it must restate
+  // the builder-signed `lineage` field (body top level, or the binary
+  // record's metadata object), so a `$lineage` edited after the write is
+  // caught even though it is outside the hashed bytes.
+  if (storedLineage !== undefined) {
+    const signedField = extractLineageField(
+      isBinaryEnvelope({ data: payloadData })
+        ? payloadData.metadata
+        : payloadData,
+    );
+    const mirror = readStoredLineage(data);
+    const signed = Array.isArray(signedField)
+      ? signedField.map((id) =>
+          typeof id === "string" ? id.toLowerCase() : id,
+        )
+      : null;
+    if (
+      !mirror ||
+      !signed ||
+      signed.length !== mirror.sources.length ||
+      signed.some((id, i) => id !== mirror.sources[i])
+    ) {
+      throw new WriterAttributionVerificationError(
+        "LINEAGE_MISMATCH",
+        "Stored $lineage does not restate the builder-signed lineage field",
+      );
+    }
   }
   return {
     builder: attribution.builder,

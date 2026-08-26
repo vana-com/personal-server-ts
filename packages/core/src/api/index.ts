@@ -699,7 +699,11 @@ export const LINEAGE_CASCADE_NODE_LIMIT = 1000;
  * Delete one scope the way DELETE /v1/data/:scope always has: propagate to
  * the authoritative stores (R2 blobs + gateway records) first, best-effort,
  * then drop the local copy. Shared by the single-node delete and the lineage
- * cascade so both compose with the durable-delete work the same way.
+ * cascade so both compose with the durable-delete work the same way: the
+ * tombstone-based delete (volod/ps-durable-delete) replaces this one
+ * function. Until it lands, the remote step covers the versions this
+ * replica has indexed; a derivative registered only by another replica is
+ * removed here locally (a no-op) and at the gateway once that work lands.
  */
 async function deleteOneScope(
   deps: PersonalServerDataApiDeps,
