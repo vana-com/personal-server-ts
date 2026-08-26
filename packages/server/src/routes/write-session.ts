@@ -46,6 +46,20 @@ function jsonError(status: number, errorCode: string, message: string) {
   };
 }
 
+/**
+ * Only ProtocolErrors are client-facing. Anything else (gateway, store,
+ * runtime failures) is logged with its cause and answered generically so
+ * internal details never reach the caller. Same mapping as the core data
+ * handler.
+ */
+function internalError(logger: Logger, err: unknown, stage: string) {
+  logger.error(
+    { err, stage },
+    "Write session handshake failed with an unexpected error",
+  );
+  return jsonError(500, "INTERNAL_ERROR", "Internal server error");
+}
+
 export function writeSessionRoutes(deps: WriteSessionRouteDeps): Hono {
   const app = new Hono();
   const proofReplayStore =
@@ -75,12 +89,11 @@ export function writeSessionRoutes(deps: WriteSessionRouteDeps): Hono {
         serverOwner: deps.serverOwner,
       });
     } catch (err) {
+      if (!(err instanceof ProtocolError)) {
+        return c.json(internalError(deps.logger, err, "authenticate"), 500);
+      }
       return c.json(
-        jsonError(
-          401,
-          "WRITE_SESSION_AUTH_FAILED",
-          err instanceof Error ? err.message : String(err),
-        ),
+        jsonError(401, "WRITE_SESSION_AUTH_FAILED", err.message),
         401,
       );
     }
@@ -150,14 +163,7 @@ export function writeSessionRoutes(deps: WriteSessionRouteDeps): Hono {
       if (err instanceof ProtocolError) {
         return c.json(err.toJSON(), err.code as 400 | 401 | 403 | 404);
       }
-      return c.json(
-        jsonError(
-          400,
-          "WRITE_SESSION_FAILED",
-          err instanceof Error ? err.message : String(err),
-        ),
-        400,
-      );
+      return c.json(internalError(deps.logger, err, "create-session"), 500);
     }
   });
 

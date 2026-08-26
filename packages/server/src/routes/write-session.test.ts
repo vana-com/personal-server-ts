@@ -207,6 +207,71 @@ describe("POST /v1/write/session", () => {
     expect(body.error.errorCode).toBe("WRITE_SESSION_PROOF_REPLAY");
   });
 
+  it("answers unexpected gateway, store and verifier failures with a generic 500", async () => {
+    // Internal error messages must not reach the caller; only ProtocolErrors
+    // are client-facing. The cause is logged instead.
+    const cases: Array<{
+      name: string;
+      deps: Partial<Parameters<typeof writeSessionRoutes>[0]>;
+      authorization: () => Promise<string>;
+    }> = [
+      {
+        name: "gateway.getGrant throws",
+        deps: {
+          gateway: createMockGateway({
+            getGrant: vi.fn().mockRejectedValue(new Error("gateway exploded")),
+          }),
+        },
+        authorization: handshakeHeader,
+      },
+      {
+        name: "sessionStore.create throws",
+        deps: {
+          gateway: createMockGateway({
+            getGrant: vi.fn().mockResolvedValue(makeWriteGrant()),
+          }),
+          sessionStore: {
+            ...createInMemoryWriteSessionStore(),
+            create: vi.fn().mockRejectedValue(new Error("store exploded")),
+          },
+        },
+        authorization: handshakeHeader,
+      },
+      {
+        name: "tokenStore.isValid throws during authentication",
+        deps: {
+          tokenStore: {
+            getTokens: vi.fn().mockResolvedValue([]),
+            isValid: vi.fn().mockRejectedValue(new Error("verifier exploded")),
+            addToken: vi.fn(),
+            removeToken: vi.fn(),
+          },
+        },
+        authorization: async () => "Bearer vana_ps_some_session_token",
+      },
+    ];
+    for (const testCase of cases) {
+      const errorLog = vi.fn();
+      const app = writeSessionRoutes({
+        logger: { ...logger, error: errorLog } as unknown as typeof logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway: createMockGateway(),
+        sessionStore: createInMemoryWriteSessionStore(),
+        ...testCase.deps,
+      });
+      const res = await app.request("/session", {
+        method: "POST",
+        headers: { Authorization: await testCase.authorization() },
+      });
+      expect(res.status, testCase.name).toBe(500);
+      const body = await res.json();
+      expect(body.error.errorCode, testCase.name).toBe("INTERNAL_ERROR");
+      expect(JSON.stringify(body), testCase.name).not.toMatch(/exploded/);
+      expect(errorLog, testCase.name).toHaveBeenCalledTimes(1);
+    }
+  });
+
   it("returns 500 when the server owner is not configured", async () => {
     const app = writeSessionRoutes({
       logger,
