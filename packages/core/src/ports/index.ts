@@ -234,7 +234,13 @@ export type TombstoneOutcome =
   | {
       status: "already-deleted";
       dataPointId: string;
-      version: string;
+      /**
+       * The winning tombstone's registry version as the gateway reports it
+       * (possibly higher than the version this replica attempted), or null
+       * when the gateway did not say. Null means the covered key range is
+       * unknown, so callers defer enumeration rather than guess.
+       */
+      version: string | null;
       deletedAt: string | null;
     }
   | {
@@ -271,14 +277,22 @@ export interface DeleteDataPort {
 }
 
 /**
- * One blob still to delete after a tombstone landed: the exact
- * (scope, version) key. `version: null` is the degenerate case where the
- * gateway did not report the tombstone's version, so the key set could not
- * be enumerated yet; the retry expands it into exact keys once it can.
+ * Blob deletion work still to do after a tombstone landed, in one of three
+ * shapes:
+ *   - an exact key: `{ scope, version }`;
+ *   - a contiguous version range `{ scope, version: null, range }` (both
+ *     bounds inclusive, decimal strings): the registry versions a tombstone
+ *     covers, kept as bounds so a large tombstone version never has to be
+ *     materialised key by key; passes take keys from the head and advance
+ *     `from`;
+ *   - an unexpanded marker `{ scope, version: null }` (no range): the gateway
+ *     did not report the tombstone's version, so the covered range is not
+ *     known yet; the retry expands it once the registry answers.
  */
 export interface PendingBlobDeletion {
   scope: string;
   version: string | null;
+  range?: { from: string; to: string };
 }
 
 /**

@@ -73,8 +73,8 @@ export interface DeleteScopeResult {
   durable: boolean;
   steps: {
     gateway: DeleteScopeStep & {
-      /** Tombstone version at the gateway (previous current + 1). */
-      version?: string;
+      /** Tombstone version at the gateway; null when it did not report one. */
+      version?: string | null;
       deletedAt?: string | null;
     };
     /**
@@ -97,44 +97,96 @@ export interface DeleteScopeResult {
   pendingBlobDeletion: boolean;
 }
 
+export interface BlobDeletionPlan {
+  /**
+   * Exact keys of covered local entries that lie outside the registry range:
+   * an upload that landed under a key the registry never saw (crashed before
+   * registering, or rebased later) is still deleted data. Bounded by the
+   * local index size.
+   */
+  keys: string[];
+  /**
+   * Every registry version up to and including the tombstone's, as inclusive
+   * bounds. Versions are a dense, strictly increasing integer sequence per
+   * scope and an absent key answers 404, so the range is exact and complete
+   * across replicas without listing storage. Kept as bounds, never
+   * materialised: a large tombstone version costs nothing until its keys are
+   * actually sent, a batch at a time. Null without a tombstone version.
+   */
+  range: { from: string; to: string } | null;
+}
+
 /**
- * The exact storage keys a tombstone covers for `scope`, as version strings:
- *   - every registry version up to and including the tombstone's (versions
- *     are a dense, strictly increasing integer sequence per scope, and an
- *     absent key answers 404, so the range is exact and complete across
- *     replicas without listing storage);
- *   - plus the version of every local entry the tombstone covers, whatever
- *     its number: an upload that landed under a key the registry never saw
- *     (crashed before registering, or rebased later) is still deleted data.
- * A re-add registered after the tombstone lives under a higher version key,
- * so it is never in this set and survives by construction. With no tombstone
- * version (never registered, or the gateway did not report one) only the
- * local entries' keys can be enumerated.
+ * The storage keys a tombstone covers for `scope`. A re-add registered after
+ * the tombstone lives under a higher version key, so it is never in this set
+ * and survives by construction. With no tombstone version (never registered,
+ * or the gateway did not report one) only the local entries' keys can be
+ * enumerated.
  */
 export function planBlobDeletions(
   storage: Pick<DataStoragePort, "listVersions">,
   scope: string,
   tombstoneVersionValue: string | null,
-): string[] {
-  const keys = new Set<string>();
+): BlobDeletionPlan {
   const tombstone = { version: tombstoneVersionValue };
+  const last =
+    tombstoneVersionValue === null ? null : BigInt(tombstoneVersionValue);
+  const keys = new Set<string>();
   const PAGE_SIZE = 500;
   for (let offset = 0; ; offset += PAGE_SIZE) {
     const entries = storage.listVersions(scope, { limit: PAGE_SIZE, offset });
     for (const entry of entries) {
-      if (isEntryCoveredByTombstone(entry, tombstone)) {
-        keys.add(String(entry.version));
-      }
+      if (!isEntryCoveredByTombstone(entry, tombstone)) continue;
+      const version = BigInt(entry.version);
+      if (last !== null && version >= 1n && version <= last) continue;
+      keys.add(version.toString());
     }
     if (entries.length < PAGE_SIZE) break;
   }
-  if (tombstoneVersionValue !== null) {
-    const last = BigInt(tombstoneVersionValue);
-    for (let version = 1n; version <= last; version += 1n) {
-      keys.add(version.toString());
-    }
+  return {
+    keys: [...keys].sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1)),
+    range:
+      last === null || last < 1n ? null : { from: "1", to: last.toString() },
+  };
+}
+
+/** Take up to `count` versions from the head of a range; `rest` is what remains. */
+function takeFromRange(
+  range: { from: string; to: string },
+  count: number,
+): { versions: string[]; rest: { from: string; to: string } | null } {
+  const from = BigInt(range.from);
+  const to = BigInt(range.to);
+  const versions: string[] = [];
+  let cursor = from;
+  while (cursor <= to && versions.length < count) {
+    versions.push(cursor.toString());
+    cursor += 1n;
   }
-  return [...keys].sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1));
+  return {
+    versions,
+    rest: cursor <= to ? { from: cursor.toString(), to: range.to } : null,
+  };
+}
+
+function rangeSize(range: { from: string; to: string }): bigint {
+  return BigInt(range.to) - BigInt(range.from) + 1n;
+}
+
+/**
+ * Count of blob keys a marker list still stands for, clamped for reporting.
+ * An unexpanded marker (range not known yet) counts as one.
+ */
+function countPendingKeys(markers: PendingBlobDeletion[]): number {
+  let total = 0n;
+  for (const marker of markers) {
+    if (marker.version !== null) total += 1n;
+    else if (marker.range) total += rangeSize(marker.range);
+    else total += 1n;
+  }
+  return total > BigInt(Number.MAX_SAFE_INTEGER)
+    ? Number.MAX_SAFE_INTEGER
+    : Number(total);
 }
 
 /**
@@ -215,9 +267,10 @@ export async function deleteScope(
         result.steps.gateway = { status: "skipped", reason: "not-registered" };
       } else {
         tombstoneKnown = true;
-        tombstoneVersionValue = tombstoneVersion({
-          expectedVersion: outcome.version,
-        });
+        tombstoneVersionValue =
+          outcome.version === null
+            ? null
+            : tombstoneVersion({ expectedVersion: outcome.version });
         result.steps.gateway = {
           status: "ok",
           ...(outcome.status === "already-deleted" && {
@@ -256,16 +309,28 @@ export async function deleteScope(
     // queued. A tombstone whose version the gateway did not report cannot be
     // expanded into registry keys yet; a version-less marker asks the retry
     // to expand it once the registry answers.
-    const keys = planBlobDeletions(storage, scope, tombstoneVersionValue);
-    const expansionMarker: PendingBlobDeletion[] =
-      tombstoneKnown && tombstoneVersionValue === null
-        ? [{ scope, version: null }]
-        : [];
+    const plan = planBlobDeletions(storage, scope, tombstoneVersionValue);
+    const batch = plan.keys.slice(0, BLOB_DELETE_BATCH_SIZE);
+    const leftovers: PendingBlobDeletion[] = plan.keys
+      .slice(BLOB_DELETE_BATCH_SIZE)
+      .map((version) => ({ scope, version }));
+    if (plan.range) {
+      const taken = takeFromRange(
+        plan.range,
+        BLOB_DELETE_BATCH_SIZE - batch.length,
+      );
+      batch.push(...taken.versions);
+      if (taken.rest)
+        leftovers.push({ scope, version: null, range: taken.rest });
+    }
+    if (tombstoneKnown && tombstoneVersionValue === null) {
+      leftovers.push({ scope, version: null });
+    }
     const storageStep = await deleteBlobKeys(
       { deleteData, pendingBlobDeletions, logger },
       scope,
-      keys,
-      expansionMarker,
+      batch,
+      leftovers,
     );
     result.steps.storage = storageStep.step;
     result.pendingBlobDeletion = storageStep.pending > 0;
@@ -304,12 +369,10 @@ export async function deleteScope(
 async function deleteBlobKeys(
   deps: Pick<DeleteScopeDeps, "deleteData" | "pendingBlobDeletions" | "logger">,
   scope: string,
-  keys: string[],
-  extraMarkers: PendingBlobDeletion[],
+  batch: string[],
+  leftovers: PendingBlobDeletion[],
 ): Promise<{ step: DeleteScopeResult["steps"]["storage"]; pending: number }> {
   const { deleteData, pendingBlobDeletions, logger } = deps;
-  const batch = keys.slice(0, BLOB_DELETE_BATCH_SIZE);
-  const deferred = keys.slice(BLOB_DELETE_BATCH_SIZE);
   let outcome: Awaited<ReturnType<DeleteDataPort["deleteBlobVersions"]>>;
   try {
     outcome =
@@ -330,10 +393,10 @@ async function deleteBlobKeys(
   );
   const remaining: PendingBlobDeletion[] = [
     ...outcome.failed.map(({ version }) => ({ scope, version })),
-    ...deferred.map((version) => ({ scope, version })),
-    ...extraMarkers,
+    ...leftovers,
   ];
-  let recorded = remaining.length;
+  const remainingKeys = countPendingKeys(remaining);
+  let recorded = remainingKeys;
   if (pendingBlobDeletions) {
     try {
       if (completed.length > 0) await pendingBlobDeletions.remove(completed);
@@ -341,21 +404,21 @@ async function deleteBlobKeys(
     } catch (markerErr) {
       recorded = 0;
       logger.error(
-        { scope, error: errorMessage(markerErr), keys: remaining.length },
+        { scope, error: errorMessage(markerErr), keys: remainingKeys },
         "Could not record pending blob deletion markers",
       );
     }
   } else if (remaining.length > 0) {
     recorded = 0;
     logger.error(
-      { scope, keys: remaining.length },
+      { scope, keys: remainingKeys },
       "Blob deletions left unfinished with no marker store to retry them",
     );
   }
   const counts = {
     blobsDeleted: outcome.deleted.length,
     blobsMissing: outcome.missing.length,
-    blobsPending: remaining.length,
+    blobsPending: remainingKeys,
   };
   if (outcome.failed.length > 0) {
     const first = outcome.failed[0];
@@ -390,22 +453,23 @@ async function deleteBlobKeys(
 export interface RetryPendingBlobDeletionsResult {
   /** Exact keys finished this pass (deleted, or already absent). */
   completed: PendingBlobDeletion[];
-  /** Version-less markers dropped because the scope is live again. */
+  /** Unexpanded markers dropped because the scope is live again. */
   superseded: string[];
   failed: Array<{ scope: string; version: string | null; error: string }>;
-  /** Keys still queued after this pass. */
+  /** Markers still queued after this pass (a range counts once). */
   remaining: number;
 }
 
 /**
  * Finish blob deletions whose tombstone landed but whose storage deletes did
- * not: one batch of exact keys per sync cycle, each key retried until storage
- * acknowledges (2xx or 404), then cleared. Version-less markers (the gateway
- * did not report a tombstone version at delete time) are expanded into exact
- * keys from the registry first; if the registry shows the scope live again
- * the old tombstone's version is unknowable, so the marker is dropped and the
- * pre-tombstone ciphertext stays (owner-decryptable only) until the next
- * delete of that scope.
+ * not: one batch of exact keys per sync cycle, taken from exact-key markers
+ * first and then from the head of range markers (which advance in place),
+ * each key retried until storage acknowledges (2xx or 404). Unexpanded
+ * markers (the gateway did not report a tombstone version at delete time)
+ * are expanded from the registry first; if the registry shows the scope live
+ * again the old tombstone's version is unknowable, so the marker is dropped
+ * and the pre-tombstone ciphertext stays (owner-decryptable only) until the
+ * next delete of that scope.
  */
 export async function retryPendingBlobDeletions(
   deps: Pick<
@@ -416,7 +480,7 @@ export async function retryPendingBlobDeletions(
     | "serverOwner"
     | "logger"
   > & {
-    /** Local index, for expanding version-less markers into exact keys. */
+    /** Local index, for expanding unexpanded markers into exact keys. */
     storage?: Pick<DataStoragePort, "listVersions">;
   },
 ): Promise<RetryPendingBlobDeletionsResult> {
@@ -429,11 +493,13 @@ export async function retryPendingBlobDeletions(
   };
   if (!deleteData || !pendingBlobDeletions) return result;
 
-  let keys = await pendingBlobDeletions.list();
-  if (keys.length === 0) return result;
+  let markers = await pendingBlobDeletions.list();
+  if (markers.length === 0) return result;
 
-  // Expand version-less markers into exact keys.
-  for (const marker of keys.filter((key) => key.version === null)) {
+  // Expand markers whose tombstone version was unknown at delete time.
+  for (const marker of markers.filter(
+    (key) => key.version === null && !key.range,
+  )) {
     const registry = await registryState(deps, marker.scope);
     if (registry.status === "unknown") {
       result.failed.push({
@@ -456,47 +522,92 @@ export async function retryPendingBlobDeletions(
       );
       continue;
     }
-    const expanded = planBlobDeletions(
+    const plan = planBlobDeletions(
       deps.storage ?? { listVersions: () => [] },
       marker.scope,
       registry.status === "deleted" ? registry.version : null,
-    ).map((version): PendingBlobDeletion => ({ scope: marker.scope, version }));
+    );
+    const expanded: PendingBlobDeletion[] = plan.keys.map((version) => ({
+      scope: marker.scope,
+      version,
+    }));
+    if (plan.range) {
+      expanded.push({ scope: marker.scope, version: null, range: plan.range });
+    }
     await pendingBlobDeletions.remove([marker]);
     await pendingBlobDeletions.add(expanded);
   }
-  keys = (await pendingBlobDeletions.list()).filter(
-    (key) => key.version !== null,
-  );
+  markers = await pendingBlobDeletions.list();
 
-  // One rate-limited batch across scopes, in stored order.
-  const batch = keys.slice(0, BLOB_DELETE_BATCH_SIZE);
+  // One rate-limited batch in stored order: exact keys, then range heads.
+  let budget = BLOB_DELETE_BATCH_SIZE;
   const byScope = new Map<string, string[]>();
-  for (const key of batch) {
-    const versions = byScope.get(key.scope) ?? [];
-    versions.push(key.version as string);
-    byScope.set(key.scope, versions);
+  const exactOrigin = new Set<string>();
+  const advancedRanges: Array<{
+    old: PendingBlobDeletion;
+    next: PendingBlobDeletion | null;
+  }> = [];
+  const enqueue = (scope: string, version: string) => {
+    const versions = byScope.get(scope) ?? [];
+    versions.push(version);
+    byScope.set(scope, versions);
+  };
+  for (const marker of markers) {
+    if (budget === 0) break;
+    if (marker.version !== null) {
+      enqueue(marker.scope, marker.version);
+      exactOrigin.add(`${marker.scope}\u0000${marker.version}`);
+      budget -= 1;
+    }
   }
+  for (const marker of markers) {
+    if (budget === 0) break;
+    if (marker.version === null && marker.range) {
+      const taken = takeFromRange(marker.range, budget);
+      for (const version of taken.versions) enqueue(marker.scope, version);
+      budget -= taken.versions.length;
+      advancedRanges.push({
+        old: marker,
+        next: taken.rest
+          ? { scope: marker.scope, version: null, range: taken.rest }
+          : null,
+      });
+    }
+  }
+
   for (const [scope, versions] of byScope) {
     let outcome: Awaited<ReturnType<DeleteDataPort["deleteBlobVersions"]>>;
     try {
       outcome = await deleteData.deleteBlobVersions(scope, versions);
     } catch (err) {
       const message = errorMessage(err);
-      for (const version of versions) {
-        result.failed.push({ scope, version, error: message });
-      }
-      logger.warn(
-        { scope, error: message },
-        "Pending blob deletion failed again",
-      );
-      continue;
+      outcome = {
+        deleted: [],
+        missing: [],
+        failed: versions.map((version) => ({ version, error: message })),
+      };
     }
-    const completed = [...outcome.deleted, ...outcome.missing].map(
-      (version): PendingBlobDeletion => ({ scope, version }),
+    const completed = [...outcome.deleted, ...outcome.missing]
+      .filter((version) => exactOrigin.has(`${scope}\u0000${version}`))
+      .map((version): PendingBlobDeletion => ({ scope, version }));
+    if (completed.length > 0) await pendingBlobDeletions.remove(completed);
+    result.completed.push(
+      ...[...outcome.deleted, ...outcome.missing].map(
+        (version): PendingBlobDeletion => ({ scope, version }),
+      ),
     );
-    if (completed.length > 0) {
-      await pendingBlobDeletions.remove(completed);
-      result.completed.push(...completed);
+    // A failed key that came from a range becomes an exact marker; a failed
+    // exact marker simply stays.
+    const failedFromRange = outcome.failed
+      .filter(({ version }) => !exactOrigin.has(`${scope}\u0000${version}`))
+      .map(({ version }): PendingBlobDeletion => ({ scope, version }));
+    if (failedFromRange.length > 0) {
+      await pendingBlobDeletions.add(failedFromRange);
+    }
+    for (const failure of outcome.failed) {
+      result.failed.push({ scope, ...failure });
+    }
+    if (outcome.deleted.length + outcome.missing.length > 0) {
       logger.info(
         {
           scope,
@@ -505,9 +616,6 @@ export async function retryPendingBlobDeletions(
         },
         "Completed pending blob deletions",
       );
-    }
-    for (const failure of outcome.failed) {
-      result.failed.push({ scope, ...failure });
     }
     if (outcome.failed.length > 0) {
       logger.warn(
@@ -519,6 +627,12 @@ export async function retryPendingBlobDeletions(
         "Pending blob deletion failed again",
       );
     }
+  }
+  // Advance the ranges only now: a crash mid-pass re-sends already-deleted
+  // keys (404, harmless) rather than skipping keys that were never sent.
+  for (const { old, next } of advancedRanges) {
+    await pendingBlobDeletions.remove([old]);
+    if (next) await pendingBlobDeletions.add([next]);
   }
   result.remaining = (await pendingBlobDeletions.list()).length;
   return result;

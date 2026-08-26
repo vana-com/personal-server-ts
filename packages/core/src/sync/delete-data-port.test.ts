@@ -188,15 +188,14 @@ describe("createGatewayDeleteDataPort.tombstone", () => {
     expect(outcome).toMatchObject({ status: "tombstoned", version: "8" });
   });
 
-  it("treats a 410 from the gateway as already-deleted", async () => {
+  it("takes the winning tombstone's version from a 410 body, not the version it attempted", async () => {
     const fetchImpl = vi.fn(async () =>
       jsonResponse(410, {
-        error: "Gone",
-        deletedAt: "2026-08-24T00:00:00.000Z",
+        data: { expectedVersion: "9", deletedAt: "2026-08-25T10:00:00.000Z" },
       }),
     );
     const { port } = makePort(
-      liveRecord(),
+      liveRecord({ expectedVersion: "4" }),
       fetchImpl as unknown as typeof fetch,
     );
 
@@ -204,9 +203,58 @@ describe("createGatewayDeleteDataPort.tombstone", () => {
 
     expect(outcome).toEqual({
       status: "already-deleted",
-      dataPointId: DATA_POINT_ID,
-      version: "4",
-      deletedAt: "2026-08-24T00:00:00.000Z",
+      dataPointId: computeDataPointId(OWNER, SCOPE),
+      version: "9",
+      deletedAt: "2026-08-25T10:00:00.000Z",
+    });
+  });
+
+  it("re-reads the feed for the winning tombstone when the 410 body carries no version", async () => {
+    const fetchImpl = vi.fn(
+      async () => new Response(null, { status: 410, statusText: "Gone" }),
+    );
+    const { port, dataPointFeed } = makePort(
+      liveRecord({ expectedVersion: "4" }),
+      fetchImpl as unknown as typeof fetch,
+    );
+    const getDataPoint = dataPointFeed.getDataPoint as ReturnType<typeof vi.fn>;
+    getDataPoint
+      .mockReset()
+      .mockResolvedValueOnce(liveRecord({ expectedVersion: "4" }))
+      .mockResolvedValueOnce({
+        ...liveRecord({ expectedVersion: "7" }),
+        deletedAt: "2026-08-25T10:00:00.000Z",
+      });
+
+    const outcome = await port.tombstone(SCOPE);
+
+    expect(getDataPoint).toHaveBeenCalledTimes(2);
+    expect(outcome).toMatchObject({
+      status: "already-deleted",
+      version: "7",
+      deletedAt: "2026-08-25T10:00:00.000Z",
+    });
+  });
+
+  it("reports an unknown version when neither the 410 body nor the feed say", async () => {
+    const fetchImpl = vi.fn(
+      async () => new Response(null, { status: 410, statusText: "Gone" }),
+    );
+    const { port, dataPointFeed } = makePort(
+      liveRecord({ expectedVersion: "4" }),
+      fetchImpl as unknown as typeof fetch,
+    );
+    (dataPointFeed.getDataPoint as ReturnType<typeof vi.fn>)
+      .mockReset()
+      .mockResolvedValueOnce(liveRecord({ expectedVersion: "4" }))
+      .mockRejectedValueOnce(new Error("gateway down"));
+
+    const outcome = await port.tombstone(SCOPE);
+
+    expect(outcome).toMatchObject({
+      status: "already-deleted",
+      version: null,
+      deletedAt: null,
     });
   });
 

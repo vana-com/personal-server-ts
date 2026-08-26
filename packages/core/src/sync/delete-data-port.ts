@@ -158,13 +158,31 @@ export function createGatewayDeleteDataPort(
         return { status: "not-registered", dataPointId };
       }
       if (res.status === 410) {
-        // Raced with a concurrent deletion: the point is already gone.
+        // Raced with a concurrent deletion: the point is already gone. The
+        // winning tombstone may sit above the version we attempted (another
+        // replica advanced the scope first), and its version bounds the
+        // ciphertext to delete, so take the gateway's word: the echoed row,
+        // else a re-read of the deletion-aware feed, else unknown.
         const body = await res.json().catch(() => null);
+        const echoed = unwrap(body);
+        let winning = normalizeVersionString(
+          stringField(echoed, "expectedVersion"),
+        );
+        let deletedAt = stringField(echoed, "deletedAt");
+        if (winning === null) {
+          const reread = await options.dataPointFeed
+            .getDataPoint({ ownerAddress: options.serverOwner, scope })
+            .catch(() => null);
+          if (reread && reread.deletedAt !== null) {
+            winning = normalizeVersionString(reread.expectedVersion);
+            deletedAt = deletedAt ?? reread.deletedAt;
+          }
+        }
         return {
           status: "already-deleted",
           dataPointId,
-          version: String(version),
-          deletedAt: stringField(unwrap(body), "deletedAt"),
+          version: winning,
+          deletedAt,
         };
       }
       if (!res.ok) {
@@ -250,6 +268,14 @@ function detailFromBody(body: unknown, fallback: string): string {
 
 // Versions are unbounded integers on the wire (decimal strings); parse them
 // as bigint so a value past Number.MAX_SAFE_INTEGER cannot round.
+// A registry version is a positive decimal integer; anything else (including
+// the "0" a body-less 410 can synthesise) is "unknown".
+function normalizeVersionString(value: string | null): string | null {
+  if (value === null || !/^\d+$/.test(value)) return null;
+  const parsed = BigInt(value);
+  return parsed > 0n ? parsed.toString() : null;
+}
+
 function integerField(record: unknown, key: string): bigint | null {
   if (typeof record !== "object" || record === null) return null;
   const value = (record as Record<string, unknown>)[key];

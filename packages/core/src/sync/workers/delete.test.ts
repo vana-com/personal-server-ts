@@ -152,7 +152,7 @@ function versionsSent(deleteData: DeleteDataPort): string[][] {
 }
 
 describe("planBlobDeletions", () => {
-  it("covers every registry version up to the tombstone plus covered local keys above it", () => {
+  it("covers the registry range as bounds plus covered local keys outside it", () => {
     const storage = {
       listVersions: vi.fn(() => [
         entry({ version: 2 }),
@@ -168,13 +168,10 @@ describe("planBlobDeletions", () => {
       ]),
     };
 
-    expect(planBlobDeletions(storage, SCOPE, "4")).toEqual([
-      "1",
-      "2",
-      "3",
-      "4",
-      "9",
-    ]);
+    expect(planBlobDeletions(storage, SCOPE, "4")).toEqual({
+      keys: ["9"],
+      range: { from: "1", to: "4" },
+    });
   });
 
   it("enumerates only the covered local keys when no tombstone version is known", () => {
@@ -184,7 +181,18 @@ describe("planBlobDeletions", () => {
         entry({ id: 2, version: 5, dataPointId: null }),
       ]),
     };
-    expect(planBlobDeletions(storage, SCOPE, null)).toEqual(["3", "5"]);
+    expect(planBlobDeletions(storage, SCOPE, null)).toEqual({
+      keys: ["3", "5"],
+      range: null,
+    });
+  });
+
+  it("never materialises the registry range, however large the tombstone version", () => {
+    const huge = "18446744073709551617";
+    const started = Date.now();
+    const plan = planBlobDeletions({ listVersions: () => [] }, SCOPE, huge);
+    expect(plan).toEqual({ keys: [], range: { from: "1", to: huge } });
+    expect(Date.now() - started).toBeLessThan(1000);
   });
 
   it("walks every page of local versions", () => {
@@ -198,11 +206,12 @@ describe("planBlobDeletions", () => {
       .mockReturnValueOnce([
         entry({ id: 501, version: 501, dataPointId: null }),
       ]);
-    const keys = planBlobDeletions({ listVersions }, SCOPE, "2");
+    const plan = planBlobDeletions({ listVersions }, SCOPE, "2");
     expect(listVersions).toHaveBeenCalledTimes(2);
-    expect(keys).toHaveLength(501);
-    expect(keys[0]).toBe("1");
-    expect(keys[500]).toBe("501");
+    // Versions 1 and 2 are inside the range; the other 499 are exact keys.
+    expect(plan.keys).toHaveLength(499);
+    expect(plan.keys[0]).toBe("3");
+    expect(plan.keys[498]).toBe("501");
   });
 });
 
@@ -330,7 +339,7 @@ describe("deleteScope orchestration", () => {
     expect(await deps.pendingBlobDeletions!.list()).toHaveLength(4);
   });
 
-  it("sends one rate-limited batch and defers the rest as exact keys", async () => {
+  it("sends one rate-limited batch and defers the rest of the range as bounds", async () => {
     const deps = makeDeps();
     (deps.deleteData!.tombstone as ReturnType<typeof vi.fn>).mockResolvedValue({
       status: "tombstoned",
@@ -352,16 +361,41 @@ describe("deleteScope orchestration", () => {
       blobsPending: 40 - BLOB_DELETE_BATCH_SIZE,
     });
     expect(result.pendingBlobDeletion).toBe(true);
-    const pending = await deps.pendingBlobDeletions!.list();
-    expect(pending).toHaveLength(40 - BLOB_DELETE_BATCH_SIZE);
-    expect(pending[0]).toEqual({
-      scope: SCOPE,
-      version: String(BLOB_DELETE_BATCH_SIZE + 1),
+    expect(await deps.pendingBlobDeletions!.list()).toEqual([
+      {
+        scope: SCOPE,
+        version: null,
+        range: { from: String(BLOB_DELETE_BATCH_SIZE + 1), to: "40" },
+      },
+    ]);
+  });
+
+  it("handles a tombstone version past Number.MAX_SAFE_INTEGER without materialising keys", async () => {
+    const huge = "18446744073709551617";
+    const deps = makeDeps();
+    (deps.deleteData!.tombstone as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: "tombstoned",
+      dataPointId: DATA_POINT_ID,
+      version: huge,
+      deletedAt: DELETED_AT,
     });
-    expect(pending[pending.length - 1]).toEqual({
-      scope: SCOPE,
-      version: "40",
+
+    const result = await deleteScope(deps, SCOPE);
+
+    expect(versionsSent(deps.deleteData!)[0]).toHaveLength(
+      BLOB_DELETE_BATCH_SIZE,
+    );
+    expect(result.steps.storage).toMatchObject({
+      status: "deferred",
+      blobsPending: Number.MAX_SAFE_INTEGER,
     });
+    expect(await deps.pendingBlobDeletions!.list()).toEqual([
+      {
+        scope: SCOPE,
+        version: null,
+        range: { from: String(BLOB_DELETE_BATCH_SIZE + 1), to: huge },
+      },
+    ]);
   });
 
   it("clears stale retry markers for keys storage now acknowledges", async () => {
@@ -624,6 +658,71 @@ describe("retryPendingBlobDeletions", () => {
     expect(second.remaining).toBe(0);
   });
 
+  it("drains a range marker from its head, advancing the bounds in place", async () => {
+    const pending = makePending();
+    await pending.add([
+      { scope: SCOPE, version: "99" },
+      { scope: SCOPE, version: null, range: { from: "1", to: "20" } },
+    ]);
+    const deleteData = makeDeleteData();
+
+    const first = await retryPendingBlobDeletions({
+      deleteData,
+      pendingBlobDeletions: pending,
+      logger: makeLogger(),
+    });
+
+    // Exact keys go first, then the range head fills the rest of the batch.
+    expect(versionsSent(deleteData)[0]).toEqual([
+      "99",
+      ...Array.from({ length: BLOB_DELETE_BATCH_SIZE - 1 }, (_, i) =>
+        String(i + 1),
+      ),
+    ]);
+    expect(first.remaining).toBe(1);
+    expect(await pending.list()).toEqual([
+      {
+        scope: SCOPE,
+        version: null,
+        range: { from: String(BLOB_DELETE_BATCH_SIZE), to: "20" },
+      },
+    ]);
+
+    const second = await retryPendingBlobDeletions({
+      deleteData,
+      pendingBlobDeletions: pending,
+      logger: makeLogger(),
+    });
+    expect(second.remaining).toBe(0);
+    expect(await pending.list()).toEqual([]);
+  });
+
+  it("turns a failed key from a range into an exact marker and still advances the range", async () => {
+    const pending = makePending();
+    await pending.add([
+      { scope: SCOPE, version: null, range: { from: "1", to: "3" } },
+    ]);
+    const deleteData = makeDeleteData();
+    (
+      deleteData.deleteBlobVersions as ReturnType<typeof vi.fn>
+    ).mockImplementation(async () => ({
+      deleted: ["1", "3"],
+      missing: [],
+      failed: [{ version: "2", error: "429 Too Many Requests" }],
+    }));
+
+    const result = await retryPendingBlobDeletions({
+      deleteData,
+      pendingBlobDeletions: pending,
+      logger: makeLogger(),
+    });
+
+    expect(result.failed).toEqual([
+      { scope: SCOPE, version: "2", error: "429 Too Many Requests" },
+    ]);
+    expect(await pending.list()).toEqual([{ scope: SCOPE, version: "2" }]);
+  });
+
   it("expands a version-less marker into exact keys from the registry before deleting", async () => {
     const pending = makePending();
     await pending.add([{ scope: SCOPE, version: null }]);
@@ -645,7 +744,8 @@ describe("retryPendingBlobDeletions", () => {
       logger: makeLogger(),
     });
 
-    expect(versionsSent(deleteData)).toEqual([["1", "2", "3", "6"]]);
+    // Exact local key first, then the registry range head.
+    expect(versionsSent(deleteData)).toEqual([["6", "1", "2", "3"]]);
     expect(result.completed).toHaveLength(4);
     expect(await pending.list()).toEqual([]);
   });

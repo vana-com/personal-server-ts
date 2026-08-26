@@ -17,7 +17,25 @@ export interface PendingBlobDeletionKv {
 }
 
 function markerId(key: PendingBlobDeletion): string {
-  return `${key.scope}\u0000${key.version ?? ""}`;
+  const range = key.range ? `${key.range.from}-${key.range.to}` : "";
+  return `${key.scope}\u0000${key.version ?? ""}\u0000${range}`;
+}
+
+function normalizeRange(
+  value: unknown,
+): { from: string; to: string } | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const { from, to } = value as { from?: unknown; to?: unknown };
+  if (
+    typeof from !== "string" ||
+    typeof to !== "string" ||
+    !/^\d+$/.test(from) ||
+    !/^\d+$/.test(to) ||
+    BigInt(from) > BigInt(to)
+  ) {
+    return undefined;
+  }
+  return { from, to };
 }
 
 /**
@@ -39,9 +57,14 @@ export function normalizePendingBlobDeletions(
       typeof (item as { scope?: unknown }).scope === "string"
     ) {
       const version = (item as { version?: unknown }).version;
+      const range =
+        typeof version === "string"
+          ? undefined
+          : normalizeRange((item as { range?: unknown }).range);
       keys.push({
         scope: (item as { scope: string }).scope,
         version: typeof version === "string" ? version : null,
+        ...(range ? { range } : {}),
       });
     }
   }
@@ -83,7 +106,11 @@ export function createPendingBlobDeletionStore(
           const id = markerId(key);
           if (known.has(id)) continue;
           known.add(id);
-          next.push({ scope: key.scope, version: key.version });
+          next.push({
+            scope: key.scope,
+            version: key.version,
+            ...(key.range ? { range: { ...key.range } } : {}),
+          });
         }
         if (next.length === existing.length) return;
         await kv.write(next);

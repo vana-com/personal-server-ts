@@ -68,6 +68,30 @@ describe("pending blob deletion store", () => {
     expect(normalizePendingBlobDeletions({ scopes: [] })).toEqual([]);
   });
 
+  it("keeps well-formed range markers and drops malformed ranges", () => {
+    expect(
+      normalizePendingBlobDeletions([
+        { scope: "a.b", version: null, range: { from: "16", to: "40" } },
+        { scope: "a.b", version: null, range: { from: "9", to: "2" } },
+        { scope: "a.b", version: null, range: { from: "x", to: "2" } },
+      ]),
+    ).toEqual([
+      { scope: "a.b", version: null, range: { from: "16", to: "40" } },
+      { scope: "a.b", version: null },
+      { scope: "a.b", version: null },
+    ]);
+  });
+
+  it("treats ranges with different bounds as different markers", async () => {
+    const store = createMemoryPendingBlobDeletionStore();
+    const r1 = { scope: "a.b", version: null, range: { from: "1", to: "9" } };
+    const r2 = { scope: "a.b", version: null, range: { from: "5", to: "9" } };
+    await store.add([r1, r1, r2]);
+    expect(await store.list()).toEqual([r1, r2]);
+    await store.remove([r1]);
+    expect(await store.list()).toEqual([r2]);
+  });
+
   it("serialises concurrent mutations so no marker is lost", async () => {
     // A kv whose write completes only when released, so two operations that
     // start together would both read the same snapshot without the lock.
