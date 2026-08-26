@@ -243,6 +243,93 @@ describe("deleteScope orchestration", () => {
   });
 });
 
+describe("deleteScope vs a concurrent remote re-add", () => {
+  function feedAnswering(
+    answer: (scope: string) => Promise<{
+      deletedAt: string | null;
+      expectedVersion: string;
+    } | null>,
+  ) {
+    const getDataPoint = vi.fn(
+      async ({ scope }: { ownerAddress: string; scope: string }) => {
+        const row = await answer(scope);
+        return row
+          ? {
+              id: computeDataPointId(OWNER, scope),
+              ownerAddress: OWNER,
+              scope,
+              dataHash: "0x" + "11".repeat(32),
+              metadataHash: "0x" + "22".repeat(32),
+              expectedVersion: row.expectedVersion,
+              addedAt: "2026-08-25T11:00:00.000Z",
+              deletedAt: row.deletedAt,
+            }
+          : null;
+      },
+    );
+    return { getDataPoint, listDataPointsByOwner: vi.fn() };
+  }
+
+  it("leaves the storage blobs alone when another replica re-added the scope after the tombstone", async () => {
+    // Replica B registered version 5 between A's tombstone (4) and A's
+    // scope-wide blob delete: the prefix now holds B's live ciphertext.
+    const dataPointFeed = feedAnswering(async () => ({
+      deletedAt: null,
+      expectedVersion: "5",
+    }));
+    const deps = makeDeps({ dataPointFeed });
+
+    const result = await deleteScope(deps, SCOPE);
+
+    expect(deps.calls).toEqual(["gateway", "local"]);
+    expect(deps.deleteData!.deleteBlobs).not.toHaveBeenCalled();
+    expect(result.durable).toBe(true);
+    expect(result.steps.storage).toEqual({
+      status: "skipped",
+      reason: "re-added",
+    });
+    expect(result.pendingBlobDeletion).toBe(false);
+    expect(deps.pendingBlobDeletions!.add).not.toHaveBeenCalled();
+    expect(deps.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: SCOPE, version: "5" }),
+      expect.stringContaining("re-added"),
+    );
+  });
+
+  it("deletes the blobs when the registry still shows the tombstone", async () => {
+    const dataPointFeed = feedAnswering(async () => ({
+      deletedAt: "2026-08-25T10:00:00.000Z",
+      expectedVersion: "4",
+    }));
+    const deps = makeDeps({ dataPointFeed });
+
+    const result = await deleteScope(deps, SCOPE);
+
+    expect(deps.calls).toEqual(["gateway", "storage", "local"]);
+    expect(dataPointFeed.getDataPoint).toHaveBeenCalledTimes(1);
+    expect(result.steps.storage).toEqual({ status: "ok", blobsDeleted: 3 });
+  });
+
+  it("defers the blob delete to the retry when the re-add check cannot reach the gateway", async () => {
+    const dataPointFeed = feedAnswering(async () => {
+      throw new Error("gateway down");
+    });
+    const deps = makeDeps({ dataPointFeed });
+
+    const result = await deleteScope(deps, SCOPE);
+
+    expect(deps.deleteData!.deleteBlobs).not.toHaveBeenCalled();
+    expect(result.steps.storage).toEqual({
+      status: "failed",
+      error: "gateway down",
+    });
+    expect(result.pendingBlobDeletion).toBe(true);
+    expect(await deps.pendingBlobDeletions!.list()).toEqual([SCOPE]);
+    // The local copy the tombstone covers still goes.
+    expect(result.steps.local).toEqual({ status: "ok", deletedCount: 2 });
+  });
+});
+
 describe("retryPendingBlobDeletions", () => {
   it("retries each pending scope and clears the marker on success", async () => {
     const pending = makePending();

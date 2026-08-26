@@ -1,6 +1,7 @@
 import type { Logger } from "../../logger/index.js";
 import type {
   DataPointFeedPort,
+  DataPointFeedRecord,
   DataStoragePort,
   DeleteDataPort,
   PendingBlobDeletionStore,
@@ -29,9 +30,9 @@ export interface DeleteScopeDeps {
    */
   scopeDeletions?: ScopeDeletionTracker;
   /**
-   * Deletion-aware registry lookup used by the pending-blob retry to notice a
-   * scope that was re-added after its tombstone (see
-   * `retryPendingBlobDeletions`).
+   * Deletion-aware registry lookup, re-read right before any scope-wide blob
+   * delete (initial and retry) to notice a scope re-added after its
+   * tombstone.
    */
   dataPointFeed?: DataPointFeedPort;
   logger: Logger;
@@ -92,6 +93,14 @@ export interface DeleteScopeResult {
  * same scope on this replica (see engine/sync-manager.ts). Uploads racing on
  * another replica are handled by the upload worker's deletion guard and the
  * download worker's reconcile.
+ *
+ * Step 2 is scope-wide (every version's ciphertext under one storage prefix),
+ * so a re-add another replica lands between step 1 and step 2 would lose its
+ * blob to it. The registry is therefore re-read immediately before the blob
+ * delete: a live row means a re-add won the race and the blobs are left alone
+ * (the pre-tombstone ciphertext stays, owner-decryptable only, until the next
+ * delete). The residual window is one storage round-trip; closing it fully
+ * needs a version-bounded delete on the storage side.
  */
 export async function deleteScope(
   deps: DeleteScopeDeps,
@@ -156,36 +165,56 @@ export async function deleteScope(
     }
 
     // 2. Storage blobs. Best-effort once the tombstone exists: a failure is
-    // reported and remembered for a later cycle, never hidden.
-    try {
-      const outcome = await deleteData.deleteBlobs(scope);
-      result.steps.storage = {
-        status: "ok",
-        blobsDeleted: outcome.blobsDeleted,
-      };
+    // reported and remembered for a later cycle, never hidden. Guarded by a
+    // registry re-read so a concurrent re-add keeps its ciphertext.
+    const registry = await registryState(deps, scope);
+    if (registry.status === "live") {
+      result.steps.storage = { status: "skipped", reason: "re-added" };
       await pendingBlobDeletions?.remove(scope);
-    } catch (err) {
-      const message = errorMessage(err);
-      result.steps.storage = { status: "failed", error: message };
-      if (pendingBlobDeletions) {
-        try {
-          await pendingBlobDeletions.add(scope);
-          result.pendingBlobDeletion = true;
-        } catch (markerErr) {
-          logger.error(
-            { scope, error: errorMessage(markerErr) },
-            "Could not record pending blob deletion marker",
-          );
-        }
-      }
       logger.warn(
         {
           scope,
-          error: message,
-          pendingBlobDeletion: result.pendingBlobDeletion,
+          dataPointId: registry.record.id,
+          version: registry.record.expectedVersion,
         },
-        "Storage blob deletion failed after gateway tombstone; will retry",
+        "Scope was re-added after its tombstone; leaving storage blobs so the live version's ciphertext survives",
       );
+    } else {
+      try {
+        if (registry.status === "unknown") {
+          // Cannot tell whether a re-add landed: do not delete on a guess.
+          // The retry marker re-checks on a later cycle.
+          throw registry.error;
+        }
+        const outcome = await deleteData.deleteBlobs(scope);
+        result.steps.storage = {
+          status: "ok",
+          blobsDeleted: outcome.blobsDeleted,
+        };
+        await pendingBlobDeletions?.remove(scope);
+      } catch (err) {
+        const message = errorMessage(err);
+        result.steps.storage = { status: "failed", error: message };
+        if (pendingBlobDeletions) {
+          try {
+            await pendingBlobDeletions.add(scope);
+            result.pendingBlobDeletion = true;
+          } catch (markerErr) {
+            logger.error(
+              { scope, error: errorMessage(markerErr) },
+              "Could not record pending blob deletion marker",
+            );
+          }
+        }
+        logger.warn(
+          {
+            scope,
+            error: message,
+            pendingBlobDeletion: result.pendingBlobDeletion,
+          },
+          "Storage blob deletion failed after gateway tombstone; will retry",
+        );
+      }
     }
   }
 
@@ -255,20 +284,23 @@ export async function retryPendingBlobDeletions(
   const scopes = await pendingBlobDeletions.list();
   for (const scope of scopes) {
     try {
-      if (dataPointFeed && serverOwner) {
-        const record = await dataPointFeed.getDataPoint({
-          ownerAddress: serverOwner,
-          scope,
-        });
-        if (record !== null && deletionTimestamp(record) === null) {
-          await pendingBlobDeletions.remove(scope);
-          result.superseded.push(scope);
-          logger.warn(
-            { scope, dataPointId: record.id, version: record.expectedVersion },
-            "Scope was re-added after its tombstone; dropping the pending blob deletion so the live version's ciphertext survives",
-          );
-          continue;
-        }
+      const registry = await registryState(
+        { dataPointFeed, serverOwner },
+        scope,
+      );
+      if (registry.status === "unknown") throw registry.error;
+      if (registry.status === "live") {
+        await pendingBlobDeletions.remove(scope);
+        result.superseded.push(scope);
+        logger.warn(
+          {
+            scope,
+            dataPointId: registry.record.id,
+            version: registry.record.expectedVersion,
+          },
+          "Scope was re-added after its tombstone; dropping the pending blob deletion so the live version's ciphertext survives",
+        );
+        continue;
       }
       await deleteData.deleteBlobs(scope);
       await pendingBlobDeletions.remove(scope);
@@ -284,6 +316,42 @@ export async function retryPendingBlobDeletions(
     }
   }
   return result;
+}
+
+type RegistryState =
+  | { status: "live"; record: DataPointFeedRecord }
+  | { status: "deleted-or-absent" }
+  | { status: "unknown"; error: Error };
+
+/**
+ * What the registry currently says about `scope`, read right before a
+ * scope-wide blob delete. "live" means a re-add landed after the tombstone
+ * and the storage prefix now holds ciphertext that must survive. Without a
+ * feed or owner wired there is nothing to ask, so the delete proceeds.
+ */
+async function registryState(
+  deps: Pick<DeleteScopeDeps, "dataPointFeed" | "serverOwner">,
+  scope: string,
+): Promise<RegistryState> {
+  if (!deps.dataPointFeed || !deps.serverOwner) {
+    return { status: "deleted-or-absent" };
+  }
+  let record: DataPointFeedRecord | null;
+  try {
+    record = await deps.dataPointFeed.getDataPoint({
+      ownerAddress: deps.serverOwner,
+      scope,
+    });
+  } catch (err) {
+    return {
+      status: "unknown",
+      error: err instanceof Error ? err : new Error(String(err)),
+    };
+  }
+  if (record !== null && deletionTimestamp(record) === null) {
+    return { status: "live", record };
+  }
+  return { status: "deleted-or-absent" };
 }
 
 function errorMessage(err: unknown): string {
