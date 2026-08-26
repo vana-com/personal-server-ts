@@ -45,6 +45,7 @@ import {
 import { oauthTokenRoutes } from "./routes/oauth-token.js";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
+import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
 import type {
   DataStoragePort,
   RuntimeAvailabilityPort,
@@ -95,6 +96,8 @@ export interface AppDeps {
    * Off-by-default to keep dev / test setups frictionless.
    */
   paymentEnabled?: boolean;
+  /** Derivative data: gateway lineage access for the data routes. */
+  lineageGateway?: LineageGatewayPort;
   getTunnelStatus?: HealthDeps["getTunnelStatus"];
   /**
    * Invoked when the /ui/api registration route confirms the server is
@@ -184,6 +187,7 @@ export function createApp(deps: AppDeps): Hono {
       gatewayUrl:
         deps.gatewayUrl ?? deps.config?.gateway.url ?? deps.gatewayConfig?.url,
       paymentEnabled: deps.paymentEnabled,
+      lineageGateway: deps.lineageGateway,
       writeSessionStore,
       writeProofReplayStore: deps.writeProofReplayStore,
       mountPath: "/v1/data",

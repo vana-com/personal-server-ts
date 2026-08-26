@@ -14,6 +14,7 @@ import {
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
 import type { DownloadDiagnosticsHook } from "@opendatalabs/personal-server-ts-core/sync";
+import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
 import type { PsLiteStateStore } from "./state.js";
 import { resolvePsLiteOwner } from "./owner-binding.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
@@ -39,6 +40,8 @@ export interface PsLiteSyncOptions {
   gateway?: GatewayClient;
   diagnostics?: DiagnosticsRecorder;
   logger?: Logger;
+  /** Registers derivatives (envelopes carrying `$lineage`) with their lineage. */
+  lineageGateway?: Pick<LineageGatewayPort, "registerDataPoint">;
 }
 
 function createBrowserLogger(logger?: Logger): Logger {
@@ -179,6 +182,7 @@ export async function createPsLiteSyncManager(
       masterKey,
       serverOwner,
       logger: logger as never,
+      lineageGateway: options.lineageGateway,
     },
     {
       storage: options.storage,

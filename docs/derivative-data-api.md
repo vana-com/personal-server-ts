@@ -101,16 +101,20 @@ signed and the server-stamped `$lineage` is the validated mirror of it.
 Validation, in order:
 
 1. `lineage` must be an array of distinct 0x-prefixed 32-byte hex strings, at
-   most 256 entries. Otherwise 400 `LINEAGE_INVALID`.
-2. The derived scope must not be named under a source's wildcard prefix (see
-   "Naming rule"). Otherwise 400 `LINEAGE_SCOPE_UNDER_SOURCE_PREFIX`.
-3. Every source id must resolve to a data point of this owner: the Personal
+   most 256 entries, none of them the record's own id. Otherwise 400
+   `LINEAGE_INVALID`. A `null` or absent `lineage` is a root record.
+2. Every source id must resolve to a data point of this owner: the Personal
    Server first checks its local index (`keccak256(owner, scope)` over its own
-   scopes), then asks the gateway with `includeDeleted=true`. A tombstoned
-   source is a valid lineage target (it is reported as deleted when the
-   lineage is walked). An id that resolves to nothing, or to another owner's
-   data point, fails with 422 `LINEAGE_SOURCE_UNKNOWN` and
-   `details.unknown` lists the offending ids.
+   scopes, so a source that has not synced yet is still valid), then asks the
+   gateway with `includeDeleted=true`. A tombstoned source is a valid lineage
+   target (it is reported as deleted when the lineage is walked). An id that
+   resolves to nothing, or to another owner's data point, fails with 422
+   `LINEAGE_SOURCE_UNKNOWN` and `details.unknown` lists the offending ids.
+3. The derived scope must not be named under a source's wildcard prefix (see
+   "Naming rule"). Otherwise 400 `LINEAGE_SCOPE_UNDER_SOURCE_PREFIX`.
+
+Scopes follow the existing grammar (two or three dot-separated segments, e.g.
+`spine.health.summary`).
 
 A rejected session write hands the builder's proof back (the replay guard is
 not consumed), so the same signed request can be retried after fixing the
@@ -155,7 +159,7 @@ Error bodies for lineage codes use the protocol error envelope:
 Grant scopes use the existing pattern grammar: an exact scope, `prefix.*`
 (every scope starting with `prefix.`), or `*`. A grant on `chatgpt.*` reads
 every scope under `chatgpt.`. If a derivative of `chatgpt.conversations` were
-named `chatgpt.health-summary`, a grant on the source namespace would read the
+named `chatgpt.summary`, a grant on the source namespace would read the
 derivative and a grant on `chatgpt.*` taken for the derivative would read the
 sources. That is the only way the current grammar can leak across a lineage
 edge, so it is ruled out at write time:
@@ -234,7 +238,7 @@ Response:
     "derivatives": [
       {
         "dataPointId": "0x41c0...7e",
-        "scope": "coach.weekly-plan",
+        "scope": "coach.weekly",
         "version": "1",
         "deletedAt": "2026-08-30T18:00:00.000Z"
       }
@@ -297,6 +301,10 @@ redacted view, and returns the gateway response body unchanged (`data` +
 
 Lineage is served from the gateway, so a derivative becomes walkable once its
 registration has synced (the ingest response reports `status: "syncing"`).
+The Personal Server's upload worker registers a derivative at the gateway
+with the `lineage` from its `$lineage` (see "Gateway write" below); the
+gateway requires the sources to be registered first, so a derivative whose
+source has not synced yet is retried on the next sync cycle.
 
 ## Delete
 
@@ -313,7 +321,7 @@ DELETE /v1/data/chatgpt.conversations?cascade=lineage
   "scope": "chatgpt.conversations",
   "cascade": "lineage",
   "deleted": [
-    { "dataPointId": "0x41c0...7e", "scope": "coach.weekly-plan" },
+    { "dataPointId": "0x41c0...7e", "scope": "coach.weekly" },
     { "dataPointId": "0xd3f1...aa", "scope": "spine.health.summary" },
     { "dataPointId": "0x5b1a...9c", "scope": "chatgpt.conversations" }
   ]

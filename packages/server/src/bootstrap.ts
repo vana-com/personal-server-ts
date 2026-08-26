@@ -27,8 +27,15 @@ import {
 } from "@opendatalabs/vana-sdk/node";
 import { loadOrCreateServerAccount } from "./keys/server-account.js";
 import type { ServerAccount } from "@opendatalabs/personal-server-ts-core/keys";
-import { createServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
+import {
+  createRequestSigner,
+  createServerSigner,
+} from "@opendatalabs/personal-server-ts-core/signing";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
+import {
+  createGatewayLineageClient,
+  type LineageGatewayPort,
+} from "@opendatalabs/personal-server-ts-core/lineage";
 import { createSyncCursor } from "./sync-cursor.js";
 import {
   createSyncManager,
@@ -254,6 +261,16 @@ export async function createServer(
     }
   }
 
+  // Derivative data: the gateway lineage client signs lineage reads with the
+  // server key (the gateway treats a registered server as the owner's) and
+  // registers derivatives with their lineage. Needs the server account.
+  const lineageGateway: LineageGatewayPort | undefined = serverAccount
+    ? createGatewayLineageClient({
+        gatewayUrl: config.gateway.url,
+        requestSigner: createRequestSigner(serverAccount),
+      })
+    : undefined;
+
   // --- Sync engine setup ---
   let syncManager: SyncManager | null = null;
 
@@ -284,6 +301,7 @@ export async function createServer(
       masterKey,
       serverOwner,
       logger,
+      lineageGateway,
     };
 
     const downloadDeps = {
@@ -381,6 +399,7 @@ export async function createServer(
     gatewayConfig: config.gateway,
     paymentEnabled: config.payment.enabled,
     gatewayUrl: config.gateway.url,
+    lineageGateway,
     config,
     accessLogWriter,
     accessLogReader,

@@ -1,6 +1,10 @@
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
-import { createServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
+import {
+  createRequestSigner,
+  createServerSigner,
+} from "@opendatalabs/personal-server-ts-core/signing";
+import { createGatewayLineageClient } from "@opendatalabs/personal-server-ts-core/lineage";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
@@ -137,6 +141,12 @@ export async function createIndexedDbPsLiteRuntime(
   // Create (or reuse) a shared diagnostics recorder before the sync manager so
   // both share the same recorder instance and events appear in /v1/diagnostics.
   const diagnostics = options.diagnostics ?? new DiagnosticsRecorder();
+  // Derivative data: lineage reads are signed with the server key and
+  // derivatives are registered with their lineage (see core/lineage).
+  const lineageGateway = createGatewayLineageClient({
+    gatewayUrl: config.gateway.url,
+    requestSigner: createRequestSigner(identity.account),
+  });
   let syncManager = options.syncManager ?? null;
   if (!syncManager && config.sync.enabled) {
     syncManager = (
@@ -150,6 +160,7 @@ export async function createIndexedDbPsLiteRuntime(
         gateway,
         diagnostics,
         logger: options.logger,
+        lineageGateway,
       })
     ).syncManager;
   }
@@ -184,6 +195,7 @@ export async function createIndexedDbPsLiteRuntime(
     serverSigner,
     syncManager,
     diagnostics,
+    lineageGateway,
     saveConfig: async (nextConfig) => {
       const saved = await savePsLiteConfig(stateStore, nextConfig);
       Object.assign(config, saved);

@@ -33,6 +33,7 @@ import {
   type PersonalServerReadAuthResult,
   type PersonalServerReadFulfillmentReporter,
 } from "@opendatalabs/personal-server-ts-core/api";
+import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
 import {
   verifyDataReadPolicy,
   type DataReadPolicyPorts,
@@ -129,6 +130,11 @@ export interface PsLiteRuntimeOptions {
   accessLogReader?: AccessLogReader;
   accessLogWriter?: AccessLogWriter;
   readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
+  /**
+   * Derivative data: gateway lineage access for the data routes (source
+   * lookups on write, signed lineage read, cascade delete walk).
+   */
+  lineageGateway?: LineageGatewayPort;
   accessToken?: string;
   tokenStore?: PsLiteTokenStore;
   stateCapabilities?: Partial<PsLiteRuntimeStateCapabilities>;
@@ -905,6 +911,7 @@ export function createPsLiteRuntime(
               // serverOwner is absent the accessRecord is safely omitted.
               serverOwner: options.serverOwner,
               serverSigner: x402ServerSigner,
+              lineageGateway: options.lineageGateway,
             },
             { basePath: dataPrefix },
           );
