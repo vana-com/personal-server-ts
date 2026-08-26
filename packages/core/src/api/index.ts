@@ -19,9 +19,10 @@ import type { DataReadPolicyPorts } from "../policy/index.js";
 import type { SyncManager } from "../sync/index.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
 import {
-  isEntryCoveredByDeletion,
+  isEntryCoveredByTombstone,
   type ScopeDeletionTracker,
 } from "../sync/scope-deletions.js";
+import type { IndexEntry } from "../storage/index/types.js";
 import {
   deleteScope as deleteScopeLocally,
   type DeleteScopeResult,
@@ -632,8 +633,8 @@ function collectedAt(now: () => Date): string {
  * on a local miss).
  *
  * - A local copy is refused when the gateway holds a tombstone that covers
- *   it (entry ingested at or before `deletedAt`). A newer local entry is a
- *   legitimate re-add and is served.
+ *   it (see `isEntryCoveredByTombstone`: registry versions and the ingest
+ *   marker, never clocks). A local re-add on top of the tombstone is served.
  * - A local miss asks the tracker to consult the gateway (bounded by its
  *   per-scope verdict cache and failure back-off): the local index cannot
  *   tell "deleted long ago" from "never had it".
@@ -643,7 +644,7 @@ function collectedAt(now: () => Date): string {
 export async function resolveReadDeletion(
   deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
   scope: string,
-  entry: { createdAt: string } | null | undefined,
+  entry: ReadDeletionEntry | null | undefined,
 ): Promise<{
   scope: string;
   dataPointId: string | null;
@@ -654,7 +655,7 @@ export async function resolveReadDeletion(
     consultGateway: entry ? "if-stale" : "always",
   });
   if (!verdict.deleted) return null;
-  if (entry && !isEntryCoveredByDeletion(entry, verdict.deletedAt)) {
+  if (entry && !isEntryCoveredByTombstone(entry, verdict)) {
     return null;
   }
   return {
@@ -674,10 +675,35 @@ export async function resolveReadDeletion(
 export async function assertScopeNotDeleted(
   deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
   scope: string,
-  entry: { createdAt: string } | null | undefined,
+  entry: ReadDeletionEntry | null | undefined,
 ): Promise<void> {
   const deletion = await resolveReadDeletion(deps, scope, entry);
   if (deletion) throw new DataDeletedError(deletion);
+}
+
+/** The index fields the deletion gate needs from the entry a read would serve. */
+export type ReadDeletionEntry = Pick<
+  IndexEntry,
+  "version" | "dataPointId" | "afterTombstoneVersion"
+>;
+
+/**
+ * The causal marker a fresh ingest carries: the tombstone version this
+ * replica currently knows for the scope, if any, so the new entry is a
+ * deliberate re-add that survives that deletion (and only that one). Uses
+ * the same verdict path as reads, so it costs a gateway lookup only when the
+ * tracker's view is stale. An unknown or unsafe version leaves the marker
+ * null: the entry is then covered, never resurrected on a guess.
+ */
+async function ingestTombstoneMarker(
+  deps: Pick<PersonalServerDataApiDeps, "scopeDeletions">,
+  scope: string,
+): Promise<number | null> {
+  if (!deps.scopeDeletions) return null;
+  const verdict = await deps.scopeDeletions.resolve(scope);
+  if (!verdict.deleted || verdict.version === null) return null;
+  const version = Number(verdict.version);
+  return Number.isSafeInteger(version) ? version : null;
 }
 
 // The delete worker wants a full Logger; the API logger is all-optional.
@@ -1178,6 +1204,10 @@ export async function handlePersonalServerDataRequest(
           return failWrite(contractErrorResponse(scopeResult));
         const collectedAtValue = collectedAt(deps.now ?? (() => new Date()));
         const status = deps.syncManager ? "syncing" : "stored";
+        const afterTombstoneVersion = await ingestTombstoneMarker(
+          deps,
+          scopeResult.scope,
+        );
 
         // Builder writes land in the same access log as builder reads, so the
         // owner sees who wrote what under which grant.
@@ -1241,6 +1271,7 @@ export async function handlePersonalServerDataRequest(
             status,
             attribution: writeAuth?.attribution,
             lineage,
+            afterTombstoneVersion,
           });
           if (!result.ok) return failWrite(contractErrorResponse(result));
           committed = true;
@@ -1282,6 +1313,7 @@ export async function handlePersonalServerDataRequest(
           status,
           attribution: writeAuth?.attribution,
           lineage,
+          afterTombstoneVersion,
         });
         if (!result.ok) return failWrite(contractErrorResponse(result));
         committed = true;

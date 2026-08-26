@@ -447,7 +447,7 @@ describe("deleteScope read-side memory", () => {
 
     expect(scopeDeletions.markDeleted).toHaveBeenCalledWith(
       SCOPE,
-      "2026-08-25T10:00:00.000Z",
+      { deletedAt: "2026-08-25T10:00:00.000Z", version: "4" },
       "local-delete",
     );
   });
@@ -469,7 +469,7 @@ describe("deleteScope read-side memory", () => {
 
     expect(scopeDeletions.markDeleted).toHaveBeenCalledWith(
       SCOPE,
-      "2026-08-26T12:00:00.000Z",
+      { deletedAt: "2026-08-26T12:00:00.000Z", version: "4" },
       "local-delete",
     );
   });

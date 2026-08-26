@@ -97,7 +97,7 @@ describe("initializeDatabase", () => {
       .get("instagram/profile.json") as
       { path: string; scope: string; size_bytes: number } | undefined;
 
-    expect(version).toBe(3);
+    expect(version).toBe(4);
     expect(row).toEqual({
       path: "instagram/profile.json",
       scope: "instagram.profile",
@@ -152,7 +152,7 @@ describe("initializeDatabase", () => {
         }
       | undefined;
 
-    expect(version).toBe(3);
+    expect(version).toBe(4);
     expect(row).toEqual({
       path: "instagram/profile.json",
       schema_id: null,
@@ -200,7 +200,7 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(3);
+    expect(db.pragma("user_version", { simple: true })).toBe(4);
     const row = db
       .prepare(
         "SELECT path, schema_id, version, data_point_id FROM data_files WHERE path = ?",
@@ -221,6 +221,65 @@ describe("initializeDatabase", () => {
     });
     db.close();
 
+    await rm(tempDir, { recursive: true });
+  });
+
+  it("migrates an existing v3 index by adding after_tombstone_version, null for every row", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "schema-v4-"));
+    const dbPath = join(tempDir, "index.db");
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE data_files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id TEXT,
+        schema_id TEXT,
+        path TEXT NOT NULL UNIQUE,
+        scope TEXT NOT NULL,
+        collected_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        size_bytes INTEGER NOT NULL DEFAULT 0,
+        version INTEGER NOT NULL DEFAULT 1,
+        data_point_id TEXT
+      );
+      PRAGMA user_version = 3;
+    `);
+    legacy
+      .prepare(
+        "INSERT INTO data_files (path, scope, collected_at, size_bytes, version, data_point_id) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        "instagram/profile.json",
+        "instagram.profile",
+        "2026-01-21T10:00:00Z",
+        42,
+        7,
+        "0xdp",
+      );
+    legacy.close();
+
+    const db = initializeDatabase(dbPath);
+    expect(db.pragma("user_version", { simple: true })).toBe(4);
+    const row = db
+      .prepare(
+        "SELECT path, version, data_point_id, after_tombstone_version FROM data_files WHERE path = ?",
+      )
+      .get("instagram/profile.json") as
+      | {
+          path: string;
+          version: number;
+          data_point_id: string | null;
+          after_tombstone_version: number | null;
+        }
+      | undefined;
+    // Nothing ingested before the column existed can claim to post-date a
+    // tombstone.
+    expect(row).toEqual({
+      path: "instagram/profile.json",
+      version: 7,
+      data_point_id: "0xdp",
+      after_tombstone_version: null,
+    });
+    db.close();
     await rm(tempDir, { recursive: true });
   });
 });

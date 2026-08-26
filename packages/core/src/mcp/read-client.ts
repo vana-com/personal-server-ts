@@ -34,6 +34,7 @@ import {
   reportPersonalServerReadFulfillment,
   resolveReadDeletion,
   type PersonalServerDataApiDeps,
+  type ReadDeletionEntry,
 } from "../api/index.js";
 import { ProtocolError } from "../errors/catalog.js";
 
@@ -228,7 +229,7 @@ export function createMcpDataReadClient(
    */
   async function assertScopeReadable(
     scope: string,
-    entry: { createdAt: string },
+    entry: ReadDeletionEntry,
   ): Promise<void> {
     try {
       await assertScopeNotDeleted(options.dataApiDeps, scope, entry);

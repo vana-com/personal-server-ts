@@ -416,7 +416,10 @@ describe("createMcpSessionAuthPort", () => {
       }),
     );
     const scopeDeletions = createScopeDeletionTracker({ serverOwner: OWNER });
-    scopeDeletions.markDeleted("instagram.profile", "2099-01-01T00:00:00Z");
+    scopeDeletions.markDeleted("instagram.profile", {
+      deletedAt: "2099-01-01T00:00:00Z",
+      version: "9",
+    });
     const signRecordDataAccess = vi.fn().mockResolvedValue("0xsig");
     const port = createMcpSessionAuthPort({
       builderAddress: BUILDER,

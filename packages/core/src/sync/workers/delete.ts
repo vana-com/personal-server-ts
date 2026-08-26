@@ -147,7 +147,10 @@ export async function deleteScope(
         // than any local entry the deletion covers, so nothing slips through.
         scopeDeletions?.markDeleted(
           scope,
-          outcome.deletedAt ?? now().toISOString(),
+          {
+            deletedAt: outcome.deletedAt ?? now().toISOString(),
+            version: outcome.version,
+          },
           "local-delete",
         );
       }

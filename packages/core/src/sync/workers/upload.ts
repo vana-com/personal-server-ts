@@ -8,18 +8,23 @@ import {
 import type { ServerSigner } from "../../signing/signer.js";
 import type { Logger } from "../../logger/index.js";
 import type { IndexEntry } from "../../storage/index/types.js";
-import type { DataPointFeedPort, DataStoragePort } from "../../ports/index.js";
+import type {
+  DataPointFeedPort,
+  DataPointFeedRecord,
+  DataStoragePort,
+} from "../../ports/index.js";
 import { computeDataPointId } from "../data-point-id.js";
 import {
   deletionTimestamp,
-  isEntryCoveredByDeletion,
+  isEntryCoveredByTombstone,
+  tombstoneVersion,
   type ScopeDeletionTracker,
 } from "../scope-deletions.js";
 import { readStoredLineage } from "../../lineage/lineage.js";
 import type { LineageGatewayPort } from "../../lineage/gateway.js";
 
 export { computeDataPointId } from "../data-point-id.js";
-export { isEntryCoveredByDeletion } from "../scope-deletions.js";
+export { isEntryCoveredByTombstone } from "../scope-deletions.js";
 
 export interface UploadWorkerDeps {
   storage: DataStoragePort;
@@ -96,23 +101,27 @@ export class DeletedScopeEntryError extends Error {
 }
 
 /**
- * Drop an unsynced entry the gateway deletion covers (ingested at or before
- * `deletedAt`) and signal it as a self-heal. Returns without effect when the
- * entry post-dates the deletion: that is a legitimate re-add.
+ * Drop an unsynced entry the gateway tombstone covers and signal it as a
+ * self-heal. Returns without effect when the entry was ingested with
+ * knowledge of the tombstone (`afterTombstoneVersion`): a legitimate re-add.
  */
 async function dropIfCoveredByDeletion(
   deps: Pick<UploadWorkerDeps, "storage" | "logger">,
   entry: IndexEntry,
+  tombstone: Pick<DataPointFeedRecord, "expectedVersion">,
   deletedAt: string,
 ): Promise<void> {
-  if (!isEntryCoveredByDeletion(entry, deletedAt)) return;
+  const version = tombstoneVersion(tombstone);
+  if (!isEntryCoveredByTombstone(entry, { version })) return;
   await deps.storage.deleteVersion(entry.scope, entry.collectedAt);
   deps.logger.warn(
     {
       path: entry.path,
       scope: entry.scope,
       deletedAt,
-      createdAt: entry.createdAt,
+      tombstoneVersion: version,
+      entryVersion: entry.version,
+      afterTombstoneVersion: entry.afterTombstoneVersion ?? null,
     },
     "Dropped unsynced local entry: the gateway reports its scope as deleted",
   );
@@ -192,7 +201,7 @@ export async function uploadOne(
     });
     const deletedAt = deletionTimestamp(remote);
     if (remote && deletedAt !== null) {
-      await dropIfCoveredByDeletion(deps, entry, deletedAt);
+      await dropIfCoveredByDeletion(deps, entry, remote, deletedAt);
       const afterTombstone = BigInt(remote.expectedVersion) + 1n;
       if (afterTombstone > registerVersion) registerVersion = afterTombstone;
     }
@@ -339,8 +348,8 @@ export async function uploadOne(
       // the same rule again before rebasing: a covered entry is dropped, a
       // genuine re-add rebases past the tombstone below.
       const conflictDeletedAt = record ? deletionTimestamp(record) : null;
-      if (conflictDeletedAt !== null) {
-        await dropIfCoveredByDeletion(deps, entry, conflictDeletedAt);
+      if (record && conflictDeletedAt !== null) {
+        await dropIfCoveredByDeletion(deps, entry, record, conflictDeletedAt);
       }
 
       if (record && record.dataHash.toLowerCase() === dataHash.toLowerCase()) {

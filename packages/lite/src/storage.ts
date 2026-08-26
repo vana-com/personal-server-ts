@@ -779,6 +779,7 @@ export async function createPersistentPsLiteStorage(
         schemaId: entry.schemaId ?? null,
         version,
         dataPointId: entry.dataPointId ?? null,
+        afterTombstoneVersion: entry.afterTombstoneVersion ?? null,
         id: state.nextId,
         createdAt: new Date().toISOString(),
       };

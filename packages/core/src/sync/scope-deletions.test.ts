@@ -4,13 +4,15 @@ import type { DataPointFeedRecord } from "../ports/index.js";
 import {
   createScopeDeletionTracker,
   deletionTimestamp,
-  isEntryCoveredByDeletion,
+  isEntryCoveredByTombstone,
+  tombstoneVersion,
 } from "./scope-deletions.js";
 import { TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH } from "./tombstone.js";
 
 const OWNER = "0xAbCdEf1234567890AbCdEf1234567890AbCdEf12";
 const SCOPE = "instagram.profile";
 const DELETED_AT = "2026-08-25T10:00:00.000Z";
+const TOMB = { deletedAt: DELETED_AT, version: "3" };
 
 function record(
   overrides: Partial<DataPointFeedRecord> = {},
@@ -63,19 +65,20 @@ function makeTracker(options: {
 describe("scope deletion tracker", () => {
   it("answers a known tombstone synchronously, without a gateway lookup", async () => {
     const { tracker, getDataPoint } = makeTracker({ remote: record() });
-    tracker.markDeleted(SCOPE, DELETED_AT);
+    tracker.markDeleted(SCOPE, TOMB);
 
-    expect(tracker.knownDeletion(SCOPE)).toEqual({ deletedAt: DELETED_AT });
+    expect(tracker.knownDeletion(SCOPE)).toEqual(TOMB);
     await expect(tracker.resolve(SCOPE)).resolves.toEqual({
       deleted: true,
       deletedAt: DELETED_AT,
+      version: "3",
       source: "feed",
       verified: true,
     });
     expect(getDataPoint).not.toHaveBeenCalled();
 
     // The delete worker names itself as the source of its own tombstone.
-    tracker.markDeleted("other.scope", DELETED_AT, "local-delete");
+    tracker.markDeleted("other.scope", TOMB, "local-delete");
     await expect(tracker.resolve("other.scope")).resolves.toMatchObject({
       deleted: true,
       source: "local-delete",
@@ -124,6 +127,7 @@ describe("scope deletion tracker", () => {
     ).resolves.toEqual({
       deleted: true,
       deletedAt: DELETED_AT,
+      version: "3",
       source: "gateway",
       verified: true,
     });
@@ -176,7 +180,7 @@ describe("scope deletion tracker", () => {
     expect(getDataPoint).toHaveBeenCalledTimes(2);
 
     // A known tombstone is still refused while offline.
-    tracker.markDeleted(SCOPE, DELETED_AT);
+    tracker.markDeleted(SCOPE, TOMB);
     await expect(tracker.resolve(SCOPE)).resolves.toMatchObject({
       deleted: true,
     });
@@ -189,7 +193,7 @@ describe("scope deletion tracker", () => {
       remote: record({ expectedVersion: "5" }),
       maxStalenessMs: 1_000,
     });
-    tracker.markDeleted(SCOPE, DELETED_AT, "local-delete");
+    tracker.markDeleted(SCOPE, TOMB, "local-delete");
 
     await expect(tracker.resolve(SCOPE)).resolves.toMatchObject({
       deleted: true,
@@ -213,12 +217,13 @@ describe("scope deletion tracker", () => {
       maxStalenessMs: 1_000,
       gatewayRetryMs: 500,
     });
-    tracker.markDeleted(SCOPE, DELETED_AT);
+    tracker.markDeleted(SCOPE, TOMB);
     advance(1_001);
 
     await expect(tracker.resolve(SCOPE)).resolves.toEqual({
       deleted: true,
       deletedAt: DELETED_AT,
+      version: "3",
       source: "feed",
       verified: false,
     });
@@ -236,7 +241,7 @@ describe("scope deletion tracker", () => {
       remote: record(),
       maxStalenessMs: 1_000,
     });
-    tracker.markDeleted(SCOPE, DELETED_AT);
+    tracker.markDeleted(SCOPE, TOMB);
     advance(900);
     // The pass listed no live row for SCOPE (else markLive would have run).
     tracker.noteFeedSynced();
@@ -267,7 +272,7 @@ describe("scope deletion tracker", () => {
 
   it("forgets a tombstone once the scope is live again (re-add)", async () => {
     const { tracker, getDataPoint } = makeTracker({ remote: record() });
-    tracker.markDeleted(SCOPE, DELETED_AT);
+    tracker.markDeleted(SCOPE, TOMB);
     tracker.markLive(SCOPE);
 
     expect(tracker.knownDeletion(SCOPE)).toBeNull();
@@ -311,28 +316,61 @@ describe("scope deletion tracker", () => {
 });
 
 describe("deletion helpers", () => {
-  it("isEntryCoveredByDeletion treats entries at or before deletedAt (and unparseable stamps) as covered", () => {
+  it("isEntryCoveredByTombstone decides by registry version and ingest marker, never by clocks", () => {
+    const tombstone = { version: "4" };
+    // Synced rows: covered at or below the tombstone version.
     expect(
-      isEntryCoveredByDeletion({ createdAt: DELETED_AT }, DELETED_AT),
+      isEntryCoveredByTombstone({ version: 4, dataPointId: "0xdp" }, tombstone),
     ).toBe(true);
     expect(
-      isEntryCoveredByDeletion(
-        { createdAt: "2026-08-25T09:59:59.999Z" },
-        DELETED_AT,
+      isEntryCoveredByTombstone({ version: 5, dataPointId: "0xdp" }, tombstone),
+    ).toBe(false);
+    // Unsynced rows: covered unless ingested on top of this tombstone (or a
+    // later one), whatever their local version or wall-clock stamp says.
+    expect(
+      isEntryCoveredByTombstone({ version: 9, dataPointId: null }, tombstone),
+    ).toBe(true);
+    expect(
+      isEntryCoveredByTombstone(
+        { version: 9, dataPointId: null, afterTombstoneVersion: null },
+        tombstone,
       ),
     ).toBe(true);
     expect(
-      isEntryCoveredByDeletion(
-        { createdAt: "2026-08-25T10:00:00.001Z" },
-        DELETED_AT,
+      isEntryCoveredByTombstone(
+        { version: 1, dataPointId: null, afterTombstoneVersion: 3 },
+        tombstone,
+      ),
+    ).toBe(true);
+    expect(
+      isEntryCoveredByTombstone(
+        { version: 1, dataPointId: null, afterTombstoneVersion: 4 },
+        tombstone,
       ),
     ).toBe(false);
-    expect(isEntryCoveredByDeletion({ createdAt: "garbage" }, DELETED_AT)).toBe(
-      true,
-    );
     expect(
-      isEntryCoveredByDeletion({ createdAt: DELETED_AT }, "not a date"),
+      isEntryCoveredByTombstone(
+        { version: 1, dataPointId: null, afterTombstoneVersion: 7 },
+        tombstone,
+      ),
+    ).toBe(false);
+    // Unknown tombstone version covers everything.
+    expect(
+      isEntryCoveredByTombstone(
+        { version: 1, dataPointId: null, afterTombstoneVersion: 9 },
+        { version: null },
+      ),
     ).toBe(true);
+  });
+
+  it("tombstoneVersion normalises the registry version and rejects the synthesised 0", () => {
+    expect(tombstoneVersion(null)).toBeNull();
+    expect(tombstoneVersion({ expectedVersion: "0" })).toBeNull();
+    expect(tombstoneVersion({ expectedVersion: "007" })).toBe("7");
+    expect(tombstoneVersion({ expectedVersion: "x" })).toBeNull();
+    expect(tombstoneVersion({ expectedVersion: "18446744073709551617" })).toBe(
+      "18446744073709551617",
+    );
   });
 
   it("deletionTimestamp prefers deletedAt, falls back to the tombstone hash pair, else null", () => {

@@ -658,8 +658,11 @@ describe("createPsLiteRuntime", () => {
     const builderHeaders = { Authorization: "Bearer builder-token" };
 
     // The sync feed (or a delete on another replica) reports a tombstone
-    // newer than the local copy: the copy is refused, not served.
-    tracker.markDeleted("instagram.profile", "2099-01-01T00:00:00.000Z");
+    // the local copy predates: the copy is refused, not served.
+    tracker.markDeleted("instagram.profile", {
+      deletedAt: "2099-01-01T00:00:00.000Z",
+      version: "4",
+    });
     const refused = await runtime.fetch(
       new Request(readUrl, { headers: builderHeaders }),
     );
@@ -674,13 +677,24 @@ describe("createPsLiteRuntime", () => {
       },
     });
 
-    // A tombstone older than the local copy is a re-add: served.
-    tracker.markLive("instagram.profile");
-    tracker.markDeleted("instagram.profile", "2000-01-01T00:00:00.000Z");
+    // A re-add ingested on top of the known tombstone is served.
+    await runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer owner-token",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ username: "re-added" }),
+      }),
+    );
     const served = await runtime.fetch(
       new Request(readUrl, { headers: builderHeaders }),
     );
     expect(served.status).toBe(200);
+    expect(await served.json()).toMatchObject({
+      data: { username: "re-added" },
+    });
   });
 
   it("exposes grants, sync, access logs, and config routes through ps-lite", async () => {

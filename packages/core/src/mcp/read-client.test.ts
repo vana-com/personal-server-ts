@@ -689,7 +689,10 @@ describe("mcp/read-client deletion gate", () => {
       serverOwner: "0x2222222222222222222222222222222222222222",
     });
     // What the sync feed (or this replica's own delete) recorded.
-    tracker.markDeleted(SCOPE, "2099-01-01T00:00:00.000Z");
+    tracker.markDeleted(SCOPE, {
+      deletedAt: "2099-01-01T00:00:00.000Z",
+      version: "4",
+    });
     const authorizeBuilderRead = vi.fn();
     const readScopeBlocks = vi.fn();
     const readBlockManifest = vi.fn();
@@ -710,6 +713,8 @@ describe("mcp/read-client deletion gate", () => {
               createdAt: "2026-06-05T00:00:00Z",
               fileId: "file-1",
               sizeBytes: 10,
+              version: 1,
+              dataPointId: null,
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),

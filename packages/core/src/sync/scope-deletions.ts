@@ -1,4 +1,5 @@
 import type { DataPointFeedPort, DataPointFeedRecord } from "../ports/index.js";
+import type { IndexEntry } from "../storage/index/types.js";
 import { isTombstoneRecord } from "./tombstone.js";
 
 /**
@@ -12,6 +13,11 @@ export type ScopeDeletionVerdict =
   | {
       deleted: true;
       deletedAt: string;
+      /**
+       * The tombstone's registry version, or null when the gateway did not
+       * say (a 410 without a body). Null covers every local entry.
+       */
+      version: string | null;
       source: Exclude<ScopeDeletionSource, "assumed-live">;
       /**
        * False when the tombstone is older than `maxStalenessMs`, the
@@ -75,7 +81,7 @@ export interface ScopeDeletionTracker {
    */
   markDeleted(
     scope: string,
-    deletedAt: string,
+    tombstone: ScopeTombstone,
     source?: Exclude<ScopeDeletionSource, "assumed-live">,
   ): void;
   /** Record that the registry holds a live (non-tombstoned) row for `scope`. */
@@ -88,7 +94,7 @@ export interface ScopeDeletionTracker {
    */
   noteFeedSynced(at?: Date): void;
   /** Synchronous view: a known tombstone, or null when none is known. */
-  knownDeletion(scope: string): { deletedAt: string } | null;
+  knownDeletion(scope: string): ScopeTombstone | null;
   /** Milliseconds since the last complete feed pass, or null if none yet. */
   feedAgeMs(): number | null;
   /** Async verdict, consulting the gateway only as described above. */
@@ -97,6 +103,12 @@ export interface ScopeDeletionTracker {
     options?: ScopeDeletionResolveOptions,
   ): Promise<ScopeDeletionVerdict>;
   readonly maxStalenessMs: number;
+}
+
+export interface ScopeTombstone {
+  deletedAt: string;
+  /** Registry version of the tombstone; null when unknown (covers everything). */
+  version: string | null;
 }
 
 export interface ScopeDeletionTrackerOptions {
@@ -125,8 +137,7 @@ export const DEFAULT_SCOPE_DELETION_MAX_STALENESS_MS = 120_000;
 export const DEFAULT_SCOPE_DELETION_GATEWAY_RETRY_MS = 15_000;
 const DEFAULT_MAX_LIVE_ENTRIES = 10_000;
 
-interface KnownTombstone {
-  deletedAt: string;
+interface KnownTombstone extends ScopeTombstone {
   source: Exclude<ScopeDeletionSource, "assumed-live">;
   /** When the registry last confirmed the tombstone (ms). */
   verifiedAtMs: number;
@@ -168,10 +179,15 @@ export function createScopeDeletionTracker(
 
   function rememberDeleted(
     scope: string,
-    deletedAt: string,
+    tombstone: ScopeTombstone,
     source: KnownTombstone["source"],
   ): void {
-    deleted.set(scope, { deletedAt, source, verifiedAtMs: nowMs() });
+    deleted.set(scope, {
+      deletedAt: tombstone.deletedAt,
+      version: normalizeVersion(tombstone.version),
+      source,
+      verifiedAtMs: nowMs(),
+    });
     live.delete(scope);
   }
 
@@ -185,8 +201,15 @@ export function createScopeDeletionTracker(
   ): ScopeDeletionVerdict {
     const deletedAt = deletionTimestamp(record);
     if (deletedAt !== null) {
-      rememberDeleted(scope, deletedAt, "gateway");
-      return { deleted: true, deletedAt, source: "gateway", verified: true };
+      const version = tombstoneVersion(record);
+      rememberDeleted(scope, { deletedAt, version }, "gateway");
+      return {
+        deleted: true,
+        deletedAt,
+        version,
+        source: "gateway",
+        verified: true,
+      };
     }
     rememberLive(scope, nowMs());
     return { deleted: false, source: "gateway", verified: true };
@@ -239,8 +262,8 @@ export function createScopeDeletionTracker(
   return {
     maxStalenessMs,
 
-    markDeleted(scope, deletedAt, source = "feed") {
-      rememberDeleted(scope, deletedAt, source);
+    markDeleted(scope, tombstone, source = "feed") {
+      rememberDeleted(scope, tombstone, source);
     },
 
     markLive(scope) {
@@ -261,7 +284,9 @@ export function createScopeDeletionTracker(
 
     knownDeletion(scope) {
       const known = deleted.get(scope);
-      return known === undefined ? null : { deletedAt: known.deletedAt };
+      return known === undefined
+        ? null
+        : { deletedAt: known.deletedAt, version: known.version };
     },
 
     feedAgeMs() {
@@ -275,6 +300,7 @@ export function createScopeDeletionTracker(
           return {
             deleted: true,
             deletedAt: known.deletedAt,
+            version: known.version,
             source: known.source,
             verified: true,
           };
@@ -287,6 +313,7 @@ export function createScopeDeletionTracker(
         return {
           deleted: true,
           deletedAt: known.deletedAt,
+          version: known.version,
           source: known.source,
           verified: false,
         };
@@ -327,17 +354,49 @@ export function deletionTimestamp(
 }
 
 /**
- * True when a local index entry was ingested at or before the gateway
- * deletion, i.e. it is part of what the owner deleted rather than a fresh
- * re-add. Unparseable timestamps count as covered: resurrecting deleted data
- * is the failure this guards against.
+ * The tombstone's registry version as the gateway reported it, normalised to
+ * a positive decimal string, or null when it did not say (the 410 fallback
+ * synthesises "0").
  */
-export function isEntryCoveredByDeletion(
-  entry: { createdAt: string },
-  deletedAt: string,
+export function tombstoneVersion(
+  record: Pick<DataPointFeedRecord, "expectedVersion"> | null,
+): string | null {
+  return normalizeVersion(record?.expectedVersion ?? null);
+}
+
+function normalizeVersion(value: string | null | undefined): string | null {
+  if (typeof value !== "string" || !/^\d+$/.test(value)) return null;
+  return BigInt(value) > 0n ? BigInt(value).toString() : null;
+}
+
+/**
+ * True when a local index entry is part of what a gateway tombstone deleted,
+ * decided causally rather than by comparing clocks across machines:
+ *   - a synced entry is covered when its registry version is at or below
+ *     the tombstone's (the tombstone superseded it);
+ *   - an unsynced entry is covered unless it was ingested with knowledge of
+ *     this tombstone or a later one (`afterTombstoneVersion` >= tombstone
+ *     version), which makes it a deliberate re-add;
+ *   - a tombstone of unknown version covers everything.
+ * Data ingested concurrently with a deletion elsewhere (before this replica
+ * learned of it) is therefore covered too: refusing to resurrect is the
+ * failure this guards against, and the window is one sync poll interval.
+ */
+export function isEntryCoveredByTombstone(
+  entry: Pick<IndexEntry, "version" | "dataPointId" | "afterTombstoneVersion">,
+  tombstone: Pick<ScopeTombstone, "version">,
 ): boolean {
-  const created = Date.parse(entry.createdAt);
-  const deleted = Date.parse(deletedAt);
-  if (Number.isNaN(created) || Number.isNaN(deleted)) return true;
-  return created <= deleted;
+  const version = normalizeVersion(tombstone.version);
+  if (version === null) return true;
+  const tombstoned = BigInt(version);
+  if (entry.dataPointId !== null) return BigInt(entry.version) <= tombstoned;
+  const marker = entry.afterTombstoneVersion;
+  if (
+    marker === null ||
+    marker === undefined ||
+    !Number.isSafeInteger(marker)
+  ) {
+    return true;
+  }
+  return BigInt(marker) < tombstoned;
 }

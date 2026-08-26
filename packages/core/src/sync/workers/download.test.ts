@@ -616,19 +616,23 @@ describe("download worker", () => {
 
     it("removes the local synced copy and stale unsynced versions, keeps a re-ingest newer than the deletion", async () => {
       const synced = syncedEntry();
+      // Ingested without knowledge of the tombstone; its clock-ahead
+      // createdAt and higher local version do not save it.
       const staleUnsynced = syncedEntry({
         id: 2,
         collectedAt: "2026-01-25T00:00:00Z",
-        createdAt: "2026-01-25T00:00:00Z",
+        createdAt: "2099-01-25T00:00:00Z",
         version: 2,
         dataPointId: null,
       });
+      // Ingested on top of the tombstone (version 1): a deliberate re-add.
       const reIngest = syncedEntry({
         id: 3,
         collectedAt: "2026-03-01T00:00:00Z",
         createdAt: "2026-03-01T00:00:00Z",
         version: 3,
         dataPointId: null,
+        afterTombstoneVersion: 1,
       });
       const deps = withLocalVersions(makeMockDeps(), [
         synced,
@@ -691,10 +695,10 @@ describe("download worker", () => {
 
       await downloadAll(deps);
 
-      expect(scopeDeletions.markDeleted).toHaveBeenCalledWith(
-        SCOPE,
-        DELETED_AT,
-      );
+      expect(scopeDeletions.markDeleted).toHaveBeenCalledWith(SCOPE, {
+        deletedAt: DELETED_AT,
+        version: "1",
+      });
       expect(scopeDeletions.markLive).toHaveBeenCalledWith("other.scope");
       // More pages remain: the memory is not complete yet.
       expect(scopeDeletions.noteFeedSynced).not.toHaveBeenCalled();

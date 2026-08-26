@@ -16,7 +16,8 @@ import type {
 import { feedFromGatewayClient } from "../data-point-feed.js";
 import {
   deletionTimestamp,
-  isEntryCoveredByDeletion,
+  isEntryCoveredByTombstone,
+  tombstoneVersion,
   type ScopeDeletionTracker,
 } from "../scope-deletions.js";
 import { buildDataBlocksAsync } from "../../storage/blocks/build.js";
@@ -395,7 +396,10 @@ export async function downloadAll(
     for (const dataPoint of dataPoints) {
       const deletedAt = deletionTimestamp(dataPoint);
       if (deletedAt !== null) {
-        deps.scopeDeletions.markDeleted(dataPoint.scope, deletedAt);
+        deps.scopeDeletions.markDeleted(dataPoint.scope, {
+          deletedAt,
+          version: tombstoneVersion(dataPoint),
+        });
       } else {
         deps.scopeDeletions.markLive(dataPoint.scope);
       }
@@ -507,15 +511,17 @@ export async function downloadAll(
 
 /**
  * Apply a gateway tombstone to the local index: remove every local version
- * the deletion covers (synced rows, and unsynced rows ingested at or before
- * `deletedAt`), keep unsynced rows ingested after it (a legitimate re-add
- * that the upload worker registers after the tombstone version).
+ * the tombstone covers (synced rows at or below its version, and unsynced
+ * rows ingested without knowledge of it), keep unsynced rows ingested on top
+ * of it (a legitimate re-add that the upload worker registers after the
+ * tombstone version). See `isEntryCoveredByTombstone`.
  */
 export async function reconcileDeletedDataPoint(
   deps: Pick<DownloadWorkerDeps, "storage" | "logger">,
-  record: Pick<DataPointFeedRecord, "id" | "scope">,
+  record: Pick<DataPointFeedRecord, "id" | "scope" | "expectedVersion">,
   deletedAt: string,
 ): Promise<DeletionReconcileResult> {
+  const tombstone = { version: tombstoneVersion(record) };
   const { storage, logger } = deps;
   const PAGE_SIZE = 500;
   const stale: Array<{ scope: string; collectedAt: string }> = [];
@@ -526,10 +532,7 @@ export async function reconcileDeletedDataPoint(
       offset,
     });
     for (const entry of entries) {
-      if (
-        entry.dataPointId !== null ||
-        isEntryCoveredByDeletion(entry, deletedAt)
-      ) {
+      if (isEntryCoveredByTombstone(entry, tombstone)) {
         stale.push({ scope: entry.scope, collectedAt: entry.collectedAt });
       } else {
         kept += 1;

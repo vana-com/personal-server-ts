@@ -276,6 +276,7 @@ describe("PS Lite read-side deletion memory", () => {
 
     expect(scopeDeletions.knownDeletion("instagram.profile")).toEqual({
       deletedAt: "2026-05-09T00:00:00.000Z",
+      version: "2",
     });
     expect(scopeDeletions.feedAgeMs()).not.toBeNull();
     await expect(

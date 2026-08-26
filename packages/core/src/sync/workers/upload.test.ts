@@ -801,7 +801,8 @@ describe("upload worker", () => {
         deletedAt: DELETED_AT,
         expectedVersion: "4",
       });
-      const entry = makeEntry({ createdAt: "2026-03-01T00:00:00.000Z" });
+      // Ingested with knowledge of tombstone 4: a deliberate re-add.
+      const entry = makeEntry({ afterTombstoneVersion: 4 });
 
       const result = await uploadOne(deps, entry);
 
@@ -821,6 +822,42 @@ describe("upload worker", () => {
         5,
       );
       expect(result.dataPointId).toBe(DATA_POINT_ID);
+    });
+
+    it("drops a pre-deletion entry even when this replica's clock is ahead of the gateway", async () => {
+      const deps = withFeed(makeMockDeps(), {
+        deletedAt: DELETED_AT,
+        expectedVersion: "4",
+      });
+      // Wall clocks are not consulted: a future createdAt and a local version
+      // past the tombstone do not make this a re-add; only the marker does.
+      const entry = makeEntry({
+        createdAt: "2099-01-01T00:00:00.000Z",
+        version: 9,
+        afterTombstoneVersion: null,
+      });
+
+      await expect(uploadOne(deps, entry)).rejects.toMatchObject({
+        name: "DeletedScopeEntryError",
+      });
+      expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
+        SCOPE,
+        COLLECTED_AT,
+      );
+      expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
+    });
+
+    it("drops a re-add that was made on top of an older tombstone than the current one", async () => {
+      const deps = withFeed(makeMockDeps(), {
+        deletedAt: DELETED_AT,
+        expectedVersion: "6",
+      });
+      const entry = makeEntry({ afterTombstoneVersion: 4 });
+
+      await expect(uploadOne(deps, entry)).rejects.toMatchObject({
+        name: "DeletedScopeEntryError",
+      });
+      expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
     });
 
     it("recognises a tombstone row by its hash pair even without deletedAt", async () => {

@@ -325,6 +325,7 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
         schemaId: entry.schemaId ?? null,
         version,
         dataPointId: entry.dataPointId ?? null,
+        afterTombstoneVersion: entry.afterTombstoneVersion ?? null,
         id: nextId,
         createdAt: new Date().toISOString(),
       };

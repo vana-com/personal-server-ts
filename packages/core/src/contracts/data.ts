@@ -136,6 +136,8 @@ export interface IngestDataContractInput {
    * unchanged.
    */
   lineage?: StoredLineage;
+  /** See `IndexEntry.afterTombstoneVersion`. */
+  afterTombstoneVersion?: number | null;
 }
 
 export interface IngestDataContractResult {
@@ -166,6 +168,8 @@ export interface IngestBinaryDataContractInput {
   attribution?: WriterAttribution;
   /** Validated lineage for a derivative write (see IngestDataContractInput). */
   lineage?: StoredLineage;
+  /** See `IndexEntry.afterTombstoneVersion`. */
+  afterTombstoneVersion?: number | null;
 }
 
 export interface DeleteDataScopeContractInput {
@@ -386,6 +390,7 @@ export async function ingestDataContract(
     scope: scopeResult.scope,
     collectedAt: input.collectedAt,
     sizeBytes: writeResult.sizeBytes,
+    afterTombstoneVersion: input.afterTombstoneVersion ?? null,
   });
 
   return {
@@ -497,6 +502,7 @@ export async function ingestBinaryDataContract(
     scope: scopeResult.scope,
     collectedAt: input.collectedAt,
     sizeBytes: input.bytes.length,
+    afterTombstoneVersion: input.afterTombstoneVersion ?? null,
   });
 
   return {

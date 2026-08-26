@@ -1611,8 +1611,8 @@ describe("DELETE /v1/data/:scope", () => {
     }
 
     it("refuses a stale local copy when the gateway holds a tombstone that covers it", async () => {
-      // The local envelope exists (this replica has not synced since the
-      // deletion); the registry says deleted after it was ingested.
+      // The local envelope exists and was ingested before this replica knew
+      // of any tombstone (no re-add marker); the registry now says deleted.
       const feed = tombstoneFeed("2099-01-01T00:00:00.000Z");
       const app = createApp({
         gateway: createMockGateway({
@@ -1623,7 +1623,7 @@ describe("DELETE /v1/data/:scope", () => {
           serverOwner: deleteOwnerWallet.address,
         }),
       });
-      await ingestData("instagram.profile", { username: "stale" }, app);
+      await ingestData("instagram.profile", { username: "stale" }, createApp());
       expect(
         indexManager.findClosestByScope(
           "instagram.profile",
@@ -1665,7 +1665,7 @@ describe("DELETE /v1/data/:scope", () => {
         }),
         scopeDeletions: tracker,
       });
-      await ingestData("instagram.profile", { username: "stale" }, app);
+      await ingestData("instagram.profile", { username: "stale" }, createApp());
       // What the download worker records when it lists the tombstone.
       tracker.markDeleted("instagram.profile", "2099-01-01T00:00:00.000Z");
 
@@ -1708,7 +1708,7 @@ describe("DELETE /v1/data/:scope", () => {
         }),
         scopeDeletions: tracker,
       });
-      await ingestData("instagram.profile", { username: "fresh" }, app);
+      await ingestData("instagram.profile", { username: "fresh" }, createApp());
       // A complete feed pass just happened and listed no tombstone for it.
       tracker.noteFeedSynced();
 
@@ -1731,7 +1731,11 @@ describe("DELETE /v1/data/:scope", () => {
           serverOwner: deleteOwnerWallet.address,
         }),
       });
-      await ingestData("instagram.profile", { username: "offline" }, app);
+      await ingestData(
+        "instagram.profile",
+        { username: "offline" },
+        createApp(),
+      );
 
       const res = await getAsBuilder(app);
 

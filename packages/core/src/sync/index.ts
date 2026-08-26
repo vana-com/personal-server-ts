@@ -47,7 +47,8 @@ export { computeDataPointId } from "./data-point-id.js";
 export {
   createScopeDeletionTracker,
   deletionTimestamp,
-  isEntryCoveredByDeletion,
+  isEntryCoveredByTombstone,
+  tombstoneVersion,
   DEFAULT_SCOPE_DELETION_GATEWAY_RETRY_MS,
   DEFAULT_SCOPE_DELETION_MAX_STALENESS_MS,
   type ScopeDeletionResolveOptions,
@@ -55,6 +56,7 @@ export {
   type ScopeDeletionTracker,
   type ScopeDeletionTrackerOptions,
   type ScopeDeletionVerdict,
+  type ScopeTombstone,
 } from "./scope-deletions.js";
 export {
   TOMBSTONE_DATA_HASH,
