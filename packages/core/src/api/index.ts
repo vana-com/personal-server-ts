@@ -162,6 +162,20 @@ export interface PersonalServerIngestSyncManager {
   notifyNewData?(): void;
   /** Propagate a scope deletion to R2 + the gateway before the local delete. */
   deleteScopeRemote?(scope: string): Promise<void>;
+  /**
+   * Durable scope deletion (gateway tombstone -> storage blobs -> local),
+   * the port the tombstone-based delete work provides. The lineage cascade
+   * requires it: a cascade that only removed local copies would report
+   * derivatives deleted while the gateway graph and ciphertext remain.
+   * Absent = DELETE ?cascade=lineage answers 501.
+   */
+  deleteScope?(scope: string): Promise<DurableDeleteResult>;
+}
+
+/** The part of the durable delete result the cascade acts on. */
+export interface DurableDeleteResult {
+  /** True once the gateway holds the tombstone; false = local copy only. */
+  durable: boolean;
 }
 
 export interface PersonalServerDataApiDeps {
@@ -697,13 +711,9 @@ export const LINEAGE_CASCADE_NODE_LIMIT = 1000;
 
 /**
  * Delete one scope the way DELETE /v1/data/:scope always has: propagate to
- * the authoritative stores (R2 blobs + gateway records) first, best-effort,
- * then drop the local copy. Shared by the single-node delete and the lineage
- * cascade so both compose with the durable-delete work the same way: the
- * tombstone-based delete (volod/ps-durable-delete) replaces this one
- * function. Until it lands, the remote step covers the versions this
- * replica has indexed; a derivative registered only by another replica is
- * removed here locally (a no-op) and at the gateway once that work lands.
+ * the authoritative stores first, best-effort (on DPv2 the remote step is a
+ * logged no-op until the tombstone-based delete lands), then drop the local
+ * copy. The lineage cascade does NOT use this: it needs the durable port.
  */
 async function deleteOneScope(
   deps: PersonalServerDataApiDeps,
@@ -742,10 +752,13 @@ async function deleteOneScope(
  * DELETE ?cascade=lineage: walk the gateway lineage graph from the scope's
  * data point (owner view, signed as this server), collect every derivative
  * that cites it transitively, and delete them deepest-first, then the scope
- * itself. The whole walk completes before anything is deleted, so a gateway
- * failure, an oversize graph or a foreign-owner node aborts with nothing
- * removed. Derivatives already tombstoned at the gateway are skipped.
- * Deleting a derivative never touches its sources.
+ * itself, through the durable (tombstone) delete port. The whole walk
+ * completes before anything is deleted, so a gateway failure, an oversize
+ * graph or a foreign-owner node aborts with nothing removed. Derivatives
+ * already tombstoned at the gateway are skipped. Deleting a derivative
+ * never touches its sources. Without the durable port (or the gateway
+ * lineage client) the cascade answers 501 rather than reporting nodes
+ * deleted whose gateway records and ciphertext are still in place.
  */
 async function cascadeDeleteLineage(
   deps: PersonalServerDataApiDeps,
@@ -756,7 +769,14 @@ async function cascadeDeleteLineage(
       reason: "serverOwner is required to resolve the data point id",
     });
   }
-  if (!deps.lineageGateway) throw new LineageCascadeUnavailableError();
+  const durableDelete = deps.syncManager?.deleteScope;
+  if (!deps.lineageGateway || !durableDelete) {
+    throw new LineageCascadeUnavailableError({
+      reason: deps.lineageGateway
+        ? "durable (tombstone) delete is not available on this server"
+        : "gateway lineage client is not configured",
+    });
+  }
   const owner = deps.serverOwner;
   const lineageGateway = deps.lineageGateway;
   const visited = new Set<string>();
@@ -814,7 +834,17 @@ async function cascadeDeleteLineage(
 
   const deleted: Array<{ dataPointId: string; scope: string }> = [];
   for (const node of order) {
-    await deleteOneScope(deps, node.scope);
+    const result = await durableDelete.call(deps.syncManager, node.scope);
+    if (!result.durable) {
+      // The tombstone did not land: stop here and say exactly how far the
+      // cascade got, rather than listing nodes sync could still bring back.
+      throw new ProtocolError(
+        502,
+        "LINEAGE_CASCADE_INCOMPLETE",
+        `Deletion of ${node.scope} did not reach the gateway; cascade stopped`,
+        { failed: node, deleted },
+      );
+    }
     deleted.push(node);
   }
   return deleted;

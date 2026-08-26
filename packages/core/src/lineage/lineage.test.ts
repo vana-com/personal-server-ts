@@ -3,6 +3,7 @@ import type { DataStoragePort } from "../ports/index.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
 import {
   LINEAGE_KEY,
+  LOCAL_SCOPE_SCAN_PAGE,
   MAX_LINEAGE_SOURCES,
   assertDerivedScopeNaming,
   derivedScopeViolatesNaming,
@@ -214,6 +215,53 @@ describe("resolveLineageSources", () => {
     });
   });
 
+  it("pages through the whole local index so a source past the first page resolves locally", async () => {
+    const total = LOCAL_SCOPE_SCAN_PAGE * 2 + 5;
+    const listScopes = vi.fn(
+      ({ limit, offset }: { limit: number; offset: number }) => ({
+        scopes: Array.from(
+          { length: Math.max(0, Math.min(limit, total - offset)) },
+          (_, i) => {
+            const n = offset + i;
+            return {
+              scope: n === total - 1 ? SOURCE_SCOPE : `filler.scope${n}`,
+              latestCollectedAt: "2026-01-01T00:00:00Z",
+              versionCount: 1,
+            };
+          },
+        ),
+        total,
+      }),
+    );
+    const gateway: LineageSourceLookup = { getDataPoint: vi.fn() };
+    const resolved = await resolveLineageSources({
+      scope: DERIVED_SCOPE,
+      sources: [SOURCE_ID],
+      serverOwner: OWNER,
+      storage: { listScopes },
+      gateway,
+    });
+    expect(resolved[0].scope).toBe(SOURCE_SCOPE);
+    expect(listScopes).toHaveBeenCalledTimes(3);
+    expect(gateway.getDataPoint).not.toHaveBeenCalled();
+  });
+
+  it("stops scanning once every source is found", async () => {
+    const listScopes = vi.fn().mockReturnValue({
+      scopes: [
+        { scope: SOURCE_SCOPE, latestCollectedAt: "x", versionCount: 1 },
+      ],
+      total: 50_000,
+    });
+    await resolveLineageSources({
+      scope: DERIVED_SCOPE,
+      sources: [SOURCE_ID],
+      serverOwner: OWNER,
+      storage: { listScopes },
+    });
+    expect(listScopes).toHaveBeenCalledTimes(1);
+  });
+
   it("fails with 502 when the gateway lookup throws (retryable, not 'unknown')", async () => {
     const gateway: LineageSourceLookup = {
       getDataPoint: vi.fn().mockRejectedValue(new Error("Gateway error: 503")),
@@ -259,6 +307,18 @@ describe("prepareLineage", () => {
       sources: [SOURCE_ID, OTHER_SOURCE_ID],
       writtenAt: "2026-08-31T09:12:44.000Z",
     });
+  });
+
+  it("returns undefined for an empty list: a root record, nothing to stamp", async () => {
+    await expect(
+      prepareLineage({
+        scope: DERIVED_SCOPE,
+        field: [],
+        serverOwner: OWNER,
+        storage: storageWithScopes(),
+        now,
+      }),
+    ).resolves.toBeUndefined();
   });
 
   it("applies the naming rule against the resolved source scopes", async () => {

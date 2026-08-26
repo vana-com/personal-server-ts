@@ -193,7 +193,7 @@ export class LineageCascadeUnavailableError extends ProtocolError {
     super(
       501,
       "LINEAGE_CASCADE_UNAVAILABLE",
-      "Cascade deletion needs the gateway lineage graph, which this server cannot reach (gateway URL or server signing key missing)",
+      "Cascade deletion needs the gateway lineage graph and a durable (tombstone) delete, which this server does not have",
       details,
     );
   }

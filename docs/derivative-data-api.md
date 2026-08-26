@@ -105,7 +105,8 @@ Validation, in order:
 
 1. `lineage` must be an array of distinct 0x-prefixed 32-byte hex strings, at
    most 256 entries, none of them the record's own id. Otherwise 400
-   `LINEAGE_INVALID`. A `null` or absent `lineage` is a root record.
+   `LINEAGE_INVALID`. An empty, `null` or absent `lineage` is a root record:
+   nothing is stamped and nothing is registered for it.
 2. Every source id must resolve to a data point of this owner: the Personal
    Server first checks its local index (`keccak256(owner, scope)` over its own
    scopes, so a source that has not synced yet is still valid), then asks the
@@ -348,13 +349,22 @@ point, deepest derivatives first, and refuses the whole operation with 409
 already deleted are skipped. Deleting a derivative never touches its
 sources, with or without cascade.
 
-| Status | errorCode                     | When                                                           |
-| ------ | ----------------------------- | -------------------------------------------------------------- |
-| 200    |                               | cascade completed; `deleted` lists the nodes in deletion order |
-| 400    | `INVALID_CASCADE`             | `cascade` is set to anything but `lineage`                     |
-| 409    | `LINEAGE_CROSS_OWNER`         | a node in the walk has a different owner                       |
-| 501    | `LINEAGE_CASCADE_UNAVAILABLE` | this server cannot reach the gateway lineage graph             |
-| 502    | `LINEAGE_GATEWAY_ERROR`       | the walk failed at the gateway; nothing was deleted            |
+Each node is deleted through the durable (tombstone) delete: gateway
+tombstone, then ciphertext, then the local copy. A server without that
+capability answers 501 for the cascade rather than reporting derivatives
+deleted while their gateway records and blobs remain; the single-node delete
+keeps today's behaviour on such a server. If a node's tombstone does not
+land, the cascade stops with 502 `LINEAGE_CASCADE_INCOMPLETE` whose `details`
+list the failed node and what was deleted before it.
+
+| Status | errorCode                     | When                                                              |
+| ------ | ----------------------------- | ----------------------------------------------------------------- |
+| 200    |                               | cascade completed; `deleted` lists the nodes in deletion order    |
+| 400    | `INVALID_CASCADE`             | `cascade` is set to anything but `lineage`                        |
+| 409    | `LINEAGE_CROSS_OWNER`         | a node in the walk has a different owner                          |
+| 501    | `LINEAGE_CASCADE_UNAVAILABLE` | this server has no gateway lineage client or no durable delete    |
+| 502    | `LINEAGE_GATEWAY_ERROR`       | the walk failed at the gateway; nothing was deleted               |
+| 502    | `LINEAGE_CASCADE_INCOMPLETE`  | a node's tombstone did not land; `details.deleted` lists what did |
 
 ## Gateway write (for clients that register directly)
 
@@ -407,8 +417,12 @@ deleted allowed) and answers 400 `LINEAGE_INVALID` /
 The 201 response echoes `lineage` (`[]` when the request made no lineage
 statement).
 
-`lineage` absent or empty is "no lineage statement": a fresh version is a
+`lineage` absent (or `null`) is "no lineage statement": a fresh version is a
 root, and a same-version refresh of a still-pending version keeps whatever
-lineage the slot holds. A refresh that carries an attested `lineage`
-replaces it together with the payload. Once the version is in flight or
-settled the refresh is refused as today, so registered lineage is immutable.
+lineage the slot holds. An array, the empty array included, is a statement
+and needs `lineageSignature`: a refresh that carries one replaces the slot's
+lineage together with the payload (`[]` clears it: an attested root). The
+201 echoes `lineage` as sent (lowercased) or `null` when no statement was
+made. A tombstone version never carries lineage; a tombstone that refreshes
+a pending data slot clears it. Once the version is in flight or settled the
+refresh is refused as today, so registered lineage is immutable.

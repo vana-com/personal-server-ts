@@ -1,7 +1,7 @@
 export {
   LINEAGE_FIELD,
   LINEAGE_KEY,
-  LOCAL_SCOPE_SCAN_LIMIT,
+  LOCAL_SCOPE_SCAN_PAGE,
   MAX_LINEAGE_SOURCES,
   assertDerivedScopeNaming,
   derivedScopeViolatesNaming,

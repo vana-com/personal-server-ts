@@ -446,6 +446,17 @@ describe("derivative data routes", () => {
       expect(verified.grantId).toBe(WRITE_GRANT_ID);
     });
 
+    it("treats an empty lineage as a root record: nothing stamped", async () => {
+      const res = await ownerWrite("notes.entries", {
+        note: "root",
+        lineage: [],
+      });
+      expect(res.status).toBe(201);
+      expect((await res.json()).lineage).toBeUndefined();
+      const envelope = await (await ownerRead("notes.entries")).json();
+      expect(envelope.data.$lineage).toBeUndefined();
+    });
+
     it("leaves a root write untouched (no lineage field, no $lineage)", async () => {
       const res = await ownerWrite("notes.entries", { note: "root" });
       expect(res.status).toBe(201);
@@ -632,6 +643,7 @@ describe("derivative data routes", () => {
     }
 
     let deleteScopeRemote: ReturnType<typeof vi.fn>;
+    let deleteScope: ReturnType<typeof vi.fn>;
 
     beforeEach(async () => {
       const nodes = graph();
@@ -644,6 +656,12 @@ describe("derivative data routes", () => {
           : { ok: false, status: 404, body: {} };
       });
       deleteScopeRemote = vi.fn().mockResolvedValue(undefined);
+      // The durable (tombstone) delete port the cascade requires; it also
+      // removes the local copy, as the real implementation does.
+      deleteScope = vi.fn(async (scope: string) => {
+        await deps.indexManager.deleteScope?.(scope);
+        return { durable: true };
+      });
       app = dataRoutes({
         ...deps,
         syncManager: {
@@ -653,8 +671,9 @@ describe("derivative data routes", () => {
           getStatus: vi.fn(),
           notifyNewData: vi.fn(),
           deleteScopeRemote,
+          deleteScope,
           running: false,
-        },
+        } as unknown as NonNullable<DataRouteDeps["syncManager"]>,
       });
       await seedSource(SOURCE_SCOPE);
       await seedSource(DERIVED_SCOPE);
@@ -680,14 +699,22 @@ describe("derivative data routes", () => {
           { dataPointId: SOURCE_ID, scope: SOURCE_SCOPE },
         ],
       });
-      expect(deleteScopeRemote.mock.calls.map((c) => c[0])).toEqual([
+      expect(deleteScope.mock.calls.map((c) => c[0])).toEqual([
         DERIVED2_SCOPE,
         DERIVED_SCOPE,
         SOURCE_SCOPE,
       ]);
-      for (const scope of [SOURCE_SCOPE, DERIVED_SCOPE, DERIVED2_SCOPE]) {
-        expect((await ownerRead(scope)).status).toBe(404);
-      }
+      expect(deleteScopeRemote).not.toHaveBeenCalled();
+    });
+
+    it("stops with 502 when a node's deletion did not reach the gateway", async () => {
+      deleteScope.mockResolvedValueOnce({ durable: false });
+      const res = await ownerDelete(SOURCE_SCOPE, "?cascade=lineage");
+      expect(res.status).toBe(502);
+      const body = await res.json();
+      expect(body.error.errorCode).toBe("LINEAGE_CASCADE_INCOMPLETE");
+      expect(body.error.details.failed.scope).toBe(DERIVED2_SCOPE);
+      expect(deleteScope).toHaveBeenCalledTimes(1);
     });
 
     it("deleting a derivative never touches its sources", async () => {
@@ -696,8 +723,8 @@ describe("derivative data routes", () => {
       expect((await res.json()).deleted).toEqual([
         { dataPointId: DERIVED2_ID, scope: DERIVED2_SCOPE },
       ]);
-      expect((await ownerRead(DERIVED_SCOPE)).status).toBe(200);
-      expect((await ownerRead(SOURCE_SCOPE)).status).toBe(200);
+      expect(deleteScope).toHaveBeenCalledTimes(1);
+      expect(deleteScope).toHaveBeenCalledWith(DERIVED2_SCOPE);
     });
 
     it("cascades a local-only scope the gateway does not know as a single node", async () => {
@@ -724,7 +751,7 @@ describe("derivative data routes", () => {
       const res = await ownerDelete(SOURCE_SCOPE, "?cascade=lineage");
       expect(res.status).toBe(409);
       expect((await res.json()).error.errorCode).toBe("LINEAGE_CROSS_OWNER");
-      expect(deleteScopeRemote).not.toHaveBeenCalled();
+      expect(deleteScope).not.toHaveBeenCalled();
       expect((await ownerRead(SOURCE_SCOPE)).status).toBe(200);
     });
 
@@ -738,21 +765,26 @@ describe("derivative data routes", () => {
       );
       const res = await ownerDelete(SOURCE_SCOPE, "?cascade=lineage");
       expect(res.status).toBe(502);
-      expect(deleteScopeRemote).not.toHaveBeenCalled();
+      expect(deleteScope).not.toHaveBeenCalled();
     });
 
-    it("answers 501 without a lineage gateway and 400 for an unknown cascade mode", async () => {
-      const localApp = dataRoutes({ ...deps, lineageGateway: undefined });
-      const res = await localApp.request(`/${SOURCE_SCOPE}?cascade=lineage`, {
-        method: "DELETE",
-        headers: {
-          Authorization: await ownerHeader("DELETE", `/${SOURCE_SCOPE}`),
-        },
-      });
-      expect(res.status).toBe(501);
-      expect((await res.json()).error.errorCode).toBe(
-        "LINEAGE_CASCADE_UNAVAILABLE",
-      );
+    it("answers 501 without a lineage gateway or a durable delete, and 400 for an unknown cascade mode", async () => {
+      for (const variant of [
+        { ...deps, lineageGateway: undefined, syncManager: deps.syncManager },
+        { ...deps, syncManager: null },
+      ]) {
+        const localApp = dataRoutes(variant);
+        const res = await localApp.request(`/${SOURCE_SCOPE}?cascade=lineage`, {
+          method: "DELETE",
+          headers: {
+            Authorization: await ownerHeader("DELETE", `/${SOURCE_SCOPE}`),
+          },
+        });
+        expect(res.status).toBe(501);
+        expect((await res.json()).error.errorCode).toBe(
+          "LINEAGE_CASCADE_UNAVAILABLE",
+        );
+      }
       const bad = await ownerDelete(SOURCE_SCOPE, "?cascade=all");
       expect(bad.status).toBe(400);
       expect((await bad.json()).error.errorCode).toBe("INVALID_CASCADE");

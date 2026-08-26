@@ -36,11 +36,8 @@ export const LINEAGE_FIELD = "lineage" as const;
 /** Upper bound on sources per record; keeps validation and hashing bounded. */
 export const MAX_LINEAGE_SOURCES = 256;
 
-/**
- * How many local scopes the source resolver hashes before it stops treating
- * the local index as authoritative and defers the remainder to the gateway.
- */
-export const LOCAL_SCOPE_SCAN_LIMIT = 5000;
+/** Page size of the local index scan the source resolver runs. */
+export const LOCAL_SCOPE_SCAN_PAGE = 1000;
 
 const BYTES32_HEX = /^0x[0-9a-fA-F]{64}$/;
 
@@ -237,7 +234,11 @@ export async function resolveLineageSources(
     );
   }
 
-  const local = localScopesById(input.storage, input.serverOwner);
+  const local = localScopesById(
+    input.storage,
+    input.serverOwner,
+    new Set(input.sources),
+  );
   const resolved: ResolvedLineageSource[] = [];
   const unknown: string[] = [];
   for (const dataPointId of input.sources) {
@@ -285,21 +286,33 @@ export async function resolveLineageSources(
 }
 
 /**
- * `dataPointId -> scope` for the server's own scopes. Bounded by
- * LOCAL_SCOPE_SCAN_LIMIT; scopes beyond it are simply resolved through the
- * gateway like any non-local source.
+ * `dataPointId -> scope` for the server's own scopes that appear in
+ * `wanted`. Pages through the whole local index (an unsynced scope is a
+ * valid source wherever it sorts), stopping early once every wanted id has
+ * been found.
  */
 function localScopesById(
   storage: Pick<DataStoragePort, "listScopes">,
   serverOwner: `0x${string}`,
+  wanted: ReadonlySet<string>,
 ): Map<string, string> {
   const byId = new Map<string, string>();
-  const { scopes } = storage.listScopes({
-    limit: LOCAL_SCOPE_SCAN_LIMIT,
-    offset: 0,
-  });
-  for (const summary of scopes) {
-    byId.set(computeDataPointId(serverOwner, summary.scope), summary.scope);
+  for (let offset = 0; ; offset += LOCAL_SCOPE_SCAN_PAGE) {
+    const { scopes, total } = storage.listScopes({
+      limit: LOCAL_SCOPE_SCAN_PAGE,
+      offset,
+    });
+    for (const summary of scopes) {
+      const id = computeDataPointId(serverOwner, summary.scope);
+      if (wanted.has(id)) byId.set(id, summary.scope);
+    }
+    if (
+      byId.size === wanted.size ||
+      scopes.length === 0 ||
+      offset + scopes.length >= total
+    ) {
+      break;
+    }
   }
   return byId;
 }
@@ -316,13 +329,16 @@ export interface PrepareLineageInput {
 
 /**
  * Validate a write's lineage end to end (shape, sources, naming rule) and
- * produce the `$lineage` record to stamp. Throws ProtocolErrors; callers on
+ * produce the `$lineage` record to stamp, or undefined for an empty list:
+ * an empty `lineage` is a root record and nothing is stamped or registered
+ * for it, exactly like an absent field. Throws ProtocolErrors; callers on
  * the write path let them propagate before anything is stored.
  */
 export async function prepareLineage(
   input: PrepareLineageInput,
-): Promise<StoredLineage> {
+): Promise<StoredLineage | undefined> {
   const sources = parseLineageSources(input.field);
+  if (sources.length === 0) return undefined;
   if (!input.serverOwner) {
     throw new ServerNotConfiguredError({
       reason: "serverOwner is required to validate lineage sources",
