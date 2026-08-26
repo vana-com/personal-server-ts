@@ -85,7 +85,7 @@ describe("createGatewayLineageClient", () => {
     await expect(client.getDataPoint(ID)).rejects.toThrow(/Gateway error: 503/);
   });
 
-  it("getLineage signs the request as the server over the path plus canonical query", async () => {
+  it("getLineage signs the request as the server: version in the path, grant view as the grantId claim", async () => {
     const wallet = createTestWallet(5);
     const fetchMock = vi
       .fn()
@@ -102,17 +102,15 @@ describe("createGatewayLineageClient", () => {
     });
     expect(result).toEqual({ ok: true, data: view, proof: { ok: 1 } });
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe(
-      `https://gateway.example.com/v1/data/${ID}/lineage?version=2&grantId=0xgrant`,
-    );
+    expect(url).toBe(`https://gateway.example.com/v1/data/${ID}/lineage/2`);
     const header = (init.headers as Record<string, string>).Authorization;
     const { payload } = parseWeb3SignedHeader(header);
     expect(payload.aud).toBe("https://gateway.example.com");
     expect(payload.method).toBe("GET");
-    // The canonical query is inside the signed uri.
-    expect(payload.uri).toBe(
-      `/v1/data/${ID}/lineage?version=2&grantId=0xgrant`,
-    );
+    // The version is a path segment inside the signed uri and the grant view
+    // is the signed grantId claim.
+    expect(payload.uri).toBe(`/v1/data/${ID}/lineage/2`);
+    expect(payload.grantId).toBe("0xgrant");
   });
 
   it("getLineage reports gateway errors with their body instead of throwing", async () => {

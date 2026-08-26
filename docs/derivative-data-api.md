@@ -200,32 +200,35 @@ derived scopes only.
 ### Gateway
 
 ```http
-GET /v1/data/:dataPointId/lineage[?version=N][&grantId=0x...]
+GET /v1/data/:dataPointId/lineage[/:version]
 Authorization: Web3Signed <base64url(payload)>.<sig>
 ```
 
 Authentication is the request-signing scheme the Personal Server already
 uses (EIP-191 over a base64url JSON payload with `aud`, `method`, `uri`,
-`bodyHash`, `iat`, `exp`): `aud` is the gateway origin, `method` is `GET`,
-`bodyHash` is the hash of an empty body (`sha256:e3b0c442...`), `iat <= exp`
-with at most one hour between them. `uri` is the path plus the canonical
-query: `/v1/data/<id lowercase>/lineage`, then `?version=N` and/or
-`grantId=<lowercase>` in that order, exactly as requested, so a captured
-signature cannot be replayed for another version or grant view. A `grantId`
-claim in the payload, when present, must equal the requested `grantId`. The
-signer decides the view:
+`bodyHash`, `iat`, `exp`, optional `grantId`): `aud` is the gateway origin,
+`method` is `GET`, `bodyHash` is the hash of an empty body
+(`sha256:e3b0c442...`), `iat <= exp` with at most one hour between them, and
+`uri` is the request path without a query string, exactly as in Personal
+Server reads. The endpoint takes no query parameters: the view selectors are
+signed. The version is a path segment (`/v1/data/<id>/lineage/3`; omit it for
+the current version) and the grant view is the scheme's own `grantId` claim
+in the signed payload, so a captured signature cannot be replayed for another
+version or grant view. The signer decides the view:
 
 - the data point's owner, or one of the owner's registered servers: full
-  view. With `?grantId=` the response is instead the view that grant sees
-  (the grant must be issued by this owner), attested as such; this is how a
-  Personal Server serves a builder.
+  view. With a `grantId` claim the response is instead the view that grant
+  sees (the grant must be issued by this owner), attested as such; this is
+  how a Personal Server serves a builder.
 - a registered builder holding a live grant from the owner (not revoked or
   expired, registration paid and confirmed on chain) that covers the data
-  point's scope: the view for that grant. Nodes whose scope the grant
-  does not cover are returned as `{ "dataPointId": "0x...", "redacted": true }`,
+  point's scope: the view for that grant. Nodes whose scope the grant does
+  not cover are returned as `{ "dataPointId": "0x...", "redacted": true }`,
   so a consent UI can show the shape of the graph without learning the
   scopes.
-- anyone else: 403.
+- anyone else, and any signer asking about an id the gateway does not hold:
+  404, indistinguishable, so a wallet cannot enumerate which data point ids
+  exist. A grantee whose grant does not cover the root gets the same 404.
 
 Response:
 
@@ -268,10 +271,11 @@ Response:
 - `ownerAddress` is the data point owner; every node in the view belongs to
   the same owner.
 - `version` is the derived record's version whose lineage is shown. Without
-  `?version=` it is the current version; when the current version is a
-  tombstone it is the last version that carried lineage (so a deleted
-  derivative still exposes what it came from). `?version=N` selects a specific
-  version and 404s when that version does not exist.
+  a path version it is the current version; when the current version is a
+  tombstone it is the last version that carried a lineage statement (so a
+  deleted derivative still exposes what it came from, and an attested root
+  is not overridden by an older version). `/lineage/N` selects a specific
+  version and 404s when that version does not exist or failed on chain.
 - `sources[].version` is the source's current version, `deletedAt` its
   tombstone time or null.
 - `derivatives` lists every data point of the same owner that cites this id in
@@ -280,7 +284,10 @@ Response:
 - `proof` is the standard gateway attestation (`GatewayAttestation` EIP-712,
   `userSignature` = the data point's AddData signature) over:
   - `requestHash = keccak256(abi.encode(string "GET /v1/data/:dataPointId/lineage", bytes32 dataPointId, uint256 version, bytes32 grantId))`
-    with `version` 0 and `grantId` bytes32 zero when not given;
+    with `version` 0 when no path version was given and `grantId` bytes32
+    zero for the full view; `userSignature` in the proof is the AddData
+    signature of the version shown, and `status` / `chainBlockHeight` are
+    that version's;
   - `responseHash = keccak256(abi.encode(bytes32 dataPointId, address ownerAddress, string scope, uint256 version, uint256 deletedAt, bytes32 sourcesHash, bytes32 derivativesHash))`
     where `deletedAt` is unix seconds (0 when null), each list hash is
     `keccak256(abi.encode(bytes32[] nodeHashes))` in response order, a
@@ -291,12 +298,12 @@ Response:
     The gateway signs the view it served, so a redacted view verifies on its
     own and un-redacting or dropping a node breaks the proof.
 
-| Status | When                                                                                                        |
-| ------ | ----------------------------------------------------------------------------------------------------------- |
-| 400    | malformed id, `version` or `grantId`                                                                        |
-| 401    | missing or invalid request signature                                                                        |
-| 403    | signer is neither owner, registered server nor a covering grantee; or `grantId` was not issued by the owner |
-| 404    | unknown data point or version                                                                               |
+| Status | When                                                                                                                        |
+| ------ | --------------------------------------------------------------------------------------------------------------------------- |
+| 400    | malformed id or version, or a query string (the endpoint takes none)                                                        |
+| 401    | missing or invalid request signature                                                                                        |
+| 403    | owner or registered server asked for a `grantId` that is not a live grant of the owner, or one that does not cover the root |
+| 404    | unknown data point, unknown or failed version, or a signer with no live covering grant (indistinguishable from unknown)     |
 
 ### Personal Server
 
@@ -308,9 +315,10 @@ Same authentication as `GET /v1/data/:scope`: the owner, or a builder with
 `Authorization: Web3Signed ...` whose grant (from the payload's `grantId`
 claim, `?grantId=` or `X-PS-Grant-Id`) covers `:scope`. The server resolves
 `dataPointId = keccak256(owner, scope)`, calls the gateway endpoint signed
-with its server key, passes the builder's `grantId` so the gateway attests the
-redacted view, and returns the gateway response body unchanged (`data` +
-`proof`). Owners get the full view.
+with its server key (the `?version=N` given here becomes the gateway path
+version), passes the builder's `grantId` as the signed claim so the gateway
+attests the redacted view, and returns the gateway response body unchanged
+(`data` + `proof`). Owners get the full view.
 
 | Status    | errorCode               | When                                           |
 | --------- | ----------------------- | ---------------------------------------------- |
@@ -329,8 +337,16 @@ source has not synced yet is retried on the next sync cycle.
 ## Delete
 
 `DELETE /v1/data/:scope` keeps its single-node behaviour (204, the scope's
-local copy, blobs and gateway record). Add `?cascade=lineage` to also delete
-every derivative that lists the scope as a source, transitively:
+local copy, blobs and gateway record). Deleting a derivative never touches
+its sources.
+
+`?cascade=lineage` is specified here and NOT implemented in this slice: the
+Personal Server answers 501 `LINEAGE_CASCADE_UNAVAILABLE` for it today. The
+cascade must tombstone every derivative at the gateway, and DPv2 deletion
+(gateway tombstone, then ciphertext, then the local copy) is separate work
+that no current runtime has; a cascade that only removed local copies would
+report derivatives deleted while their gateway records and ciphertext remain
+and sync could bring them back. Once durable deletion lands the cascade is:
 
 ```http
 DELETE /v1/data/chatgpt.conversations?cascade=lineage
@@ -349,29 +365,18 @@ DELETE /v1/data/chatgpt.conversations?cascade=lineage
 ```
 
 Owner only. The server walks the gateway lineage graph from the scope's data
-point, deepest derivatives first, and refuses the whole operation with 409
-`LINEAGE_CROSS_OWNER` if any node in the walk belongs to another owner
-(cannot happen for lineage written through this API, checked anyway). Nodes
-already deleted are skipped. Deleting a derivative never touches its
-sources, with or without cascade.
-
-Each node is deleted through the durable (tombstone) delete: gateway
-tombstone, then ciphertext, then the local copy. That delete is separate
-work (the tombstone-based deletion branch); no current Personal Server
-runtime has it yet, so today every cascade answers 501
-`LINEAGE_CASCADE_UNAVAILABLE` rather than reporting derivatives deleted
-while their gateway records and blobs remain. The walk, ordering and error
-contract below are implemented and tested against the port that work
-provides; the single-node delete keeps today's behaviour. If a node's tombstone does not
-land, the cascade stops with 502 `LINEAGE_CASCADE_INCOMPLETE` whose `details`
-list the failed node and what was deleted before it.
+point (owner view, signed as the server), deepest derivatives first, and
+deletes each node durably, then the scope itself. The whole walk completes
+before anything is deleted; a gateway failure, an oversize graph or a
+foreign-owner node aborts with nothing removed. Nodes already deleted at the
+gateway are skipped.
 
 | Status | errorCode                     | When                                                              |
 | ------ | ----------------------------- | ----------------------------------------------------------------- |
 | 200    |                               | cascade completed; `deleted` lists the nodes in deletion order    |
 | 400    | `INVALID_CASCADE`             | `cascade` is set to anything but `lineage`                        |
-| 409    | `LINEAGE_CROSS_OWNER`         | a node in the walk has a different owner                          |
-| 501    | `LINEAGE_CASCADE_UNAVAILABLE` | this server has no gateway lineage client or no durable delete    |
+| 409    | `LINEAGE_CROSS_OWNER`         | a node in the walk has a different owner; nothing deleted         |
+| 501    | `LINEAGE_CASCADE_UNAVAILABLE` | this server has no durable delete (every current runtime)         |
 | 502    | `LINEAGE_GATEWAY_ERROR`       | the walk failed at the gateway; nothing was deleted               |
 | 502    | `LINEAGE_CASCADE_INCOMPLETE`  | a node's tombstone did not land; `details.deleted` lists what did |
 

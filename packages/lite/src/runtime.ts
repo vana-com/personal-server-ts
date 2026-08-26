@@ -34,7 +34,6 @@ import {
   type PersonalServerReadFulfillmentReporter,
 } from "@opendatalabs/personal-server-ts-core/api";
 import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
-import type { DurableDeletePort } from "@opendatalabs/personal-server-ts-core/api";
 import {
   verifyDataReadPolicy,
   type DataReadPolicyPorts,
@@ -136,8 +135,6 @@ export interface PsLiteRuntimeOptions {
    * lookups on write, signed lineage read, cascade delete walk).
    */
   lineageGateway?: LineageGatewayPort;
-  /** Durable delete for the lineage cascade; unset = 501 (see core/api). */
-  durableDelete?: DurableDeletePort;
   accessToken?: string;
   tokenStore?: PsLiteTokenStore;
   stateCapabilities?: Partial<PsLiteRuntimeStateCapabilities>;
@@ -915,7 +912,6 @@ export function createPsLiteRuntime(
               serverOwner: options.serverOwner,
               serverSigner: x402ServerSigner,
               lineageGateway: options.lineageGateway,
-              durableDelete: options.durableDelete,
             },
             { basePath: dataPrefix },
           );

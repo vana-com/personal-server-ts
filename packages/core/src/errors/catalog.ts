@@ -193,29 +193,7 @@ export class LineageCascadeUnavailableError extends ProtocolError {
     super(
       501,
       "LINEAGE_CASCADE_UNAVAILABLE",
-      "Cascade deletion needs the gateway lineage graph and a durable (tombstone) delete, which this server does not have",
-      details,
-    );
-  }
-}
-
-export class LineageCrossOwnerError extends ProtocolError {
-  constructor(details: { dataPointId: string; ownerAddress: string }) {
-    super(
-      409,
-      "LINEAGE_CROSS_OWNER",
-      "A node in the lineage walk belongs to a different owner; nothing was deleted",
-      details,
-    );
-  }
-}
-
-export class LineageCascadeTooLargeError extends ProtocolError {
-  constructor(details: { limit: number }) {
-    super(
-      422,
-      "LINEAGE_CASCADE_TOO_LARGE",
-      `The lineage walk exceeds ${details.limit} nodes; nothing was deleted`,
+      "DELETE ?cascade=lineage is specified but not implemented yet: it needs the durable (tombstone) deletion of every derivative at the gateway, which this server cannot perform. Delete scopes one at a time.",
       details,
     );
   }

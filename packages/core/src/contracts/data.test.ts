@@ -490,6 +490,28 @@ describe("lineage on ingest", () => {
     });
   });
 
+  it("rejects binary metadata carrying a reserved server key", async () => {
+    for (const metadata of [
+      { $lineage: lineage },
+      { $writtenBy: { builder: "0x1" } },
+    ]) {
+      const result = await ingestBinaryDataContract({
+        storage: createMemoryStorage(),
+        scopeParam: "spine.health.report",
+        bytes: new TextEncoder().encode("%PDF"),
+        mimeType: "application/pdf",
+        metadata,
+        collectedAt: "2026-08-31T09:12:44Z",
+        status: "stored",
+      });
+      expect(result).toMatchObject({
+        ok: false,
+        status: 400,
+        body: { error: "INVALID_BODY" },
+      });
+    }
+  });
+
   it("leaves a root record byte-identical (no lineage key)", async () => {
     const storage = createMemoryStorage();
     await ingestDataContract({

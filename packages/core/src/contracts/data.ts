@@ -450,6 +450,26 @@ export async function ingestBinaryDataContract(
     };
   }
 
+  // The caller's metadata object is stored verbatim inside the record, so
+  // the reserved server-stamped keys are refused there too (same rule as a
+  // JSON body): a reader must never find a caller-planted $lineage or
+  // $writtenBy anywhere in what the server wrote.
+  if (
+    isRecord(input.metadata) &&
+    (hasReservedWriterKey(input.metadata) ||
+      hasReservedLineageKey(input.metadata))
+  ) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: "INVALID_BODY",
+        message:
+          "X-Vana-Metadata must not contain the reserved $lineage or $writtenBy keys",
+      },
+    };
+  }
+
   const contentHash = await sha256Hex(input.bytes);
   const data = buildBinaryEnvelopeData({
     bytes: input.bytes,

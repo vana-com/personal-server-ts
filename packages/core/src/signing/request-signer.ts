@@ -11,6 +11,8 @@ export interface RequestSigner {
     method: string;
     uri: string;
     body?: Uint8Array;
+    /** Signed `grantId` claim (the grant view a lineage read asks for). */
+    grantId?: string;
   }): Promise<string>;
 }
 
@@ -27,6 +29,7 @@ export function createRequestSigner(account: ServerAccount): RequestSigner {
         method: params.method,
         uri: params.uri,
         body: params.body,
+        grantId: params.grantId,
       });
     },
   };

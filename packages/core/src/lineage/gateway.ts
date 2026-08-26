@@ -164,21 +164,18 @@ export function createGatewayLineageClient(
       if (!options.requestSigner) {
         throw new LineageUnavailableError({ reason: "no request signer" });
       }
-      const path = `/v1/data/${input.dataPointId.toLowerCase()}/lineage`;
-      // Canonical query, in this order and lowercased, is part of the signed
-      // uri so a captured signature cannot be replayed for another version
-      // or grant view (the gateway rebuilds and compares it).
-      const params = new URLSearchParams();
-      if (input.version !== undefined) params.set("version", input.version);
-      if (input.grantId !== undefined) {
-        params.set("grantId", input.grantId.toLowerCase());
-      }
-      const query = params.toString();
-      const uri = `${path}${query ? `?${query}` : ""}`;
+      // The view selectors are signed, never free query parameters: the
+      // version is a path segment (inside the signed uri) and the grant view
+      // is the scheme's own `grantId` claim, so a captured signature cannot
+      // be replayed for another version or grant view.
+      const uri =
+        `/v1/data/${input.dataPointId.toLowerCase()}/lineage` +
+        (input.version !== undefined ? `/${input.version}` : "");
       const authorization = await options.requestSigner.signRequest({
         aud: origin,
         method: "GET",
         uri,
+        grantId: input.grantId?.toLowerCase(),
       });
       const res = await doFetch(`${base}${uri}`, {
         headers: { Authorization: authorization },

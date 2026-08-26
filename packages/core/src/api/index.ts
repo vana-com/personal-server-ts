@@ -1,8 +1,6 @@
 import {
   InvalidCascadeError,
-  LineageCascadeTooLargeError,
   LineageCascadeUnavailableError,
-  LineageCrossOwnerError,
   LineageGatewayError,
   LineageUnavailableError,
   ProtocolError,
@@ -164,27 +162,6 @@ export interface PersonalServerIngestSyncManager {
   deleteScopeRemote?(scope: string): Promise<void>;
 }
 
-/**
- * Durable scope deletion (gateway tombstone -> storage blobs -> local copy).
- * NOT implemented by today's SyncManager: DPv2 has no delete API on the
- * deployed gateway, and the tombstone-based deletion is a separate piece of
- * work (branch volod/ps-durable-delete) that provides exactly this port.
- * The lineage cascade requires it, because a cascade that only removed
- * local copies would report derivatives deleted while the gateway graph and
- * the ciphertext remain and sync could bring them back. Until that work is
- * wired, no runtime supplies this port and DELETE ?cascade=lineage answers
- * 501 LINEAGE_CASCADE_UNAVAILABLE by design (see docs/derivative-data-api.md).
- */
-export interface DurableDeletePort {
-  deleteScope(scope: string): Promise<DurableDeleteResult>;
-}
-
-/** The part of the durable delete result the cascade acts on. */
-export interface DurableDeleteResult {
-  /** True once the gateway holds the tombstone; false = local copy only. */
-  durable: boolean;
-}
-
 export interface PersonalServerDataApiDeps {
   storage: DataStoragePort;
   auth: PersonalServerApiAuthPort;
@@ -256,18 +233,11 @@ export interface PersonalServerDataApiDeps {
   logger?: PersonalServerApiLogger;
   /**
    * Gateway access for derivative data (docs/derivative-data-api.md): source
-   * lookups for lineage validation on write, the signed lineage read behind
-   * GET /v1/data/:scope/lineage and the walk behind DELETE ?cascade=lineage.
-   * Absent = writes with lineage can only cite local scopes, and the lineage
-   * read / cascade answer 503 / 501.
+   * lookups for lineage validation on write and the signed lineage read
+   * behind GET /v1/data/:scope/lineage. Absent = writes with lineage can
+   * only cite local scopes and the lineage read answers 503.
    */
   lineageGateway?: LineageGatewayPort;
-  /**
-   * Durable (tombstone) delete used by DELETE ?cascade=lineage. Absent in
-   * every current runtime (see DurableDeletePort): the cascade is a
-   * documented 501 stub until the tombstone-based delete lands.
-   */
-  durableDelete?: DurableDeletePort;
 }
 
 export interface PersonalServerAccessLogsApiDeps {
@@ -719,14 +689,11 @@ function isOwnerReadSignal(
   );
 }
 
-/** Upper bound on nodes a cascade delete walks before refusing. */
-export const LINEAGE_CASCADE_NODE_LIMIT = 1000;
-
 /**
  * Delete one scope the way DELETE /v1/data/:scope always has: propagate to
  * the authoritative stores first, best-effort (on DPv2 the remote step is a
  * logged no-op until the tombstone-based delete lands), then drop the local
- * copy. The lineage cascade does NOT use this: it needs the durable port.
+ * copy.
  */
 async function deleteOneScope(
   deps: PersonalServerDataApiDeps,
@@ -759,108 +726,6 @@ async function deleteOneScope(
     "Scope deleted",
   );
   return result.deletedCount;
-}
-
-/**
- * DELETE ?cascade=lineage: walk the gateway lineage graph from the scope's
- * data point (owner view, signed as this server), collect every derivative
- * that cites it transitively, and delete them deepest-first, then the scope
- * itself, through the durable (tombstone) delete port. The whole walk
- * completes before anything is deleted, so a gateway failure, an oversize
- * graph or a foreign-owner node aborts with nothing removed. Derivatives
- * already tombstoned at the gateway are skipped. Deleting a derivative
- * never touches its sources. Without the durable port (or the gateway
- * lineage client) the cascade answers 501 rather than reporting nodes
- * deleted whose gateway records and ciphertext are still in place.
- */
-async function cascadeDeleteLineage(
-  deps: PersonalServerDataApiDeps,
-  scope: string,
-): Promise<Array<{ dataPointId: string; scope: string }>> {
-  if (!deps.serverOwner) {
-    throw new ServerNotConfiguredError({
-      reason: "serverOwner is required to resolve the data point id",
-    });
-  }
-  const durableDelete = deps.durableDelete;
-  if (!deps.lineageGateway || !durableDelete) {
-    throw new LineageCascadeUnavailableError({
-      reason: deps.lineageGateway
-        ? "durable (tombstone) delete is not available on this server"
-        : "gateway lineage client is not configured",
-    });
-  }
-  const owner = deps.serverOwner;
-  const lineageGateway = deps.lineageGateway;
-  const visited = new Set<string>();
-  const order: Array<{ dataPointId: string; scope: string }> = [];
-
-  const walk = async (
-    dataPointId: string,
-    scopeHint: string | null,
-    isRoot: boolean,
-  ): Promise<void> => {
-    if (visited.has(dataPointId)) return;
-    visited.add(dataPointId);
-    if (visited.size > LINEAGE_CASCADE_NODE_LIMIT) {
-      throw new LineageCascadeTooLargeError({
-        limit: LINEAGE_CASCADE_NODE_LIMIT,
-      });
-    }
-    const result = await lineageGateway.getLineage({ dataPointId });
-    if (!result.ok) {
-      // Not registered at the gateway: nothing can cite it there, so the
-      // node is a leaf. Only the root can legitimately be unregistered (a
-      // local-only scope); derivatives were just reported by the gateway.
-      if (result.status === 404 && isRoot) {
-        order.push({ dataPointId, scope: scopeHint ?? scope });
-        return;
-      }
-      throw new LineageGatewayError({
-        status: result.status,
-        body: result.body,
-      });
-    }
-    if (result.data.ownerAddress.toLowerCase() !== owner.toLowerCase()) {
-      throw new LineageCrossOwnerError({
-        dataPointId,
-        ownerAddress: result.data.ownerAddress,
-      });
-    }
-    for (const node of result.data.derivatives) {
-      if ("redacted" in node) {
-        // The owner view is never redacted; a redaction means the gateway did
-        // not treat this server as the owner's, so refuse to guess.
-        throw new LineageGatewayError({
-          status: 200,
-          body: { error: "redacted node in owner lineage view", node },
-        });
-      }
-      await walk(node.dataPointId, node.scope, false);
-    }
-    if (isRoot || result.data.deletedAt === null) {
-      order.push({ dataPointId, scope: result.data.scope });
-    }
-  };
-
-  await walk(computeDataPointId(owner, scope), scope, true);
-
-  const deleted: Array<{ dataPointId: string; scope: string }> = [];
-  for (const node of order) {
-    const result = await durableDelete.deleteScope(node.scope);
-    if (!result.durable) {
-      // The tombstone did not land: stop here and say exactly how far the
-      // cascade got, rather than listing nodes sync could still bring back.
-      throw new ProtocolError(
-        502,
-        "LINEAGE_CASCADE_INCOMPLETE",
-        `Deletion of ${node.scope} did not reach the gateway; cascade stopped`,
-        { failed: node, deleted },
-      );
-    }
-    deleted.push(node);
-  }
-  return deleted;
 }
 
 export async function handlePersonalServerDataRequest(
@@ -1349,8 +1214,14 @@ export async function handlePersonalServerDataRequest(
       const parsed = parseDataScopeContract(scopeParam);
       if (!parsed.ok) return contractErrorResponse(parsed);
       if (cascade === "lineage") {
-        const deleted = await cascadeDeleteLineage(deps, parsed.scope);
-        return jsonResponse({ scope: parsed.scope, cascade, deleted });
+        // Specified (docs/derivative-data-api.md, "Delete") but not
+        // implemented here: the cascade must tombstone every derivative at
+        // the gateway, and DPv2 deletion is separate work (the tombstone
+        // based delete branch). Until that lands the only honest answer is
+        // 501; a local-only cascade would report derivatives deleted while
+        // their gateway records and ciphertext remain and sync could bring
+        // them back.
+        throw new LineageCascadeUnavailableError({ scope: parsed.scope });
       }
       // Single node (the default): propagate the deletion to the
       // authoritative stores (R2 blobs + gateway records) BEFORE the local

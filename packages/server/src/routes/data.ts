@@ -23,7 +23,6 @@ import type {
   WriteSessionStore,
 } from "@opendatalabs/personal-server-ts-core/write";
 import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
-import type { DurableDeletePort } from "@opendatalabs/personal-server-ts-core/api";
 import type { Logger } from "pino";
 import {
   createBodyLimit,
@@ -92,12 +91,6 @@ export interface DataRouteDeps {
    * can only cite local scopes; lineage read / cascade answer 503 / 501.
    */
   lineageGateway?: LineageGatewayPort;
-  /**
-   * Durable (tombstone) delete for DELETE ?cascade=lineage. Not provided by
-   * the current bootstrap (the tombstone-based delete is separate work), so
-   * the cascade answers 501 in production until it is wired here.
-   */
-  durableDelete?: DurableDeletePort;
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
 }
 
@@ -142,7 +135,6 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         gatewayUrl: deps.gatewayUrl,
         paymentEnabled: deps.paymentEnabled,
         lineageGateway: deps.lineageGateway,
-        durableDelete: deps.durableDelete,
         // Network identifier for the 402 challenge body. We use the chain
         // id as the convention since the gateway is chain-scoped; clients
         // dispatch on the (scheme, chainId) pair, not the human name.

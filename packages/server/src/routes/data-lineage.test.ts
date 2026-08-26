@@ -35,8 +35,6 @@ import {
   type LineageGatewayPort,
   type LineageView,
 } from "@opendatalabs/personal-server-ts-core/lineage";
-import { createSyncManager } from "@opendatalabs/personal-server-ts-core/sync/manager";
-import { createNodeDataStorage } from "../storage/node-data-storage.js";
 import { dataRoutes, type DataRouteDeps } from "./data.js";
 
 const SERVER_ORIGIN = "http://localhost:8080";
@@ -459,6 +457,28 @@ describe("derivative data routes", () => {
       expect(envelope.data.$lineage).toBeUndefined();
     });
 
+    it("rejects binary metadata that carries the reserved $lineage key", async () => {
+      const bytes = new TextEncoder().encode("%PDF-1.7 report");
+      const res = await app.request("/spine.health.report", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/pdf",
+          "X-Vana-Metadata": JSON.stringify({
+            $lineage: { sources: [SOURCE_ID], writtenAt: "now" },
+          }),
+          Authorization: await ownerHeader(
+            "POST",
+            "/spine.health.report",
+            "%PDF-1.7 report",
+          ),
+        },
+        body: bytes,
+      });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toBe("INVALID_BODY");
+      expect((await ownerRead("spine.health.report")).status).toBe(404);
+    });
+
     it("leaves a root write untouched (no lineage field, no $lineage)", async () => {
       const res = await ownerWrite("notes.entries", { note: "root" });
       expect(res.status).toBe(201);
@@ -586,104 +606,6 @@ describe("derivative data routes", () => {
   });
 
   describe("DELETE /v1/data/:scope?cascade=lineage", () => {
-    const DERIVED2_SCOPE = "coach.weekly";
-    const DERIVED2_ID = computeDataPointId(ownerWallet.address, DERIVED2_SCOPE);
-    const DELETED_SCOPE = "old.summary";
-    const DELETED_ID = computeDataPointId(ownerWallet.address, DELETED_SCOPE);
-
-    function graph(): Record<string, LineageView> {
-      // source -> derived -> derived2 ; source -> deleted (already tombstoned)
-      return {
-        [SOURCE_ID]: lineageView({
-          dataPointId: SOURCE_ID,
-          scope: SOURCE_SCOPE,
-          sources: [],
-          derivatives: [
-            {
-              dataPointId: DERIVED_ID,
-              scope: DERIVED_SCOPE,
-              version: "1",
-              deletedAt: null,
-            },
-            {
-              dataPointId: DELETED_ID,
-              scope: DELETED_SCOPE,
-              version: "1",
-              deletedAt: "2026-08-01T00:00:00.000Z",
-            },
-          ],
-        }),
-        [DERIVED_ID]: lineageView({
-          derivatives: [
-            {
-              dataPointId: DERIVED2_ID,
-              scope: DERIVED2_SCOPE,
-              version: "1",
-              deletedAt: null,
-            },
-          ],
-        }),
-        [DERIVED2_ID]: lineageView({
-          dataPointId: DERIVED2_ID,
-          scope: DERIVED2_SCOPE,
-          sources: [
-            {
-              dataPointId: DERIVED_ID,
-              scope: DERIVED_SCOPE,
-              version: "1",
-              deletedAt: null,
-            },
-          ],
-        }),
-        [DELETED_ID]: lineageView({
-          dataPointId: DELETED_ID,
-          scope: DELETED_SCOPE,
-          deletedAt: "2026-08-01T00:00:00.000Z",
-          derivatives: [],
-        }),
-      };
-    }
-
-    let deleteScopeRemote: ReturnType<typeof vi.fn>;
-    let deleteScope: ReturnType<typeof vi.fn>;
-
-    beforeEach(async () => {
-      const nodes = graph();
-      (
-        lineageGateway.getLineage as ReturnType<typeof vi.fn>
-      ).mockImplementation(async ({ dataPointId }: { dataPointId: string }) => {
-        const data = nodes[dataPointId];
-        return data
-          ? { ok: true, data, proof: {} }
-          : { ok: false, status: 404, body: {} };
-      });
-      deleteScopeRemote = vi.fn().mockResolvedValue(undefined);
-      // The durable (tombstone) delete port the cascade requires. No current
-      // runtime provides it (the tombstone-based delete is separate work), so
-      // these tests exercise the port contract; the 501 test below covers
-      // what a real SyncManager-only deployment answers.
-      deleteScope = vi.fn(async (scope: string) => {
-        await deps.indexManager.deleteScope?.(scope);
-        return { durable: true };
-      });
-      app = dataRoutes({
-        ...deps,
-        syncManager: {
-          start: vi.fn(),
-          stop: vi.fn(),
-          trigger: vi.fn(),
-          getStatus: vi.fn(),
-          notifyNewData: vi.fn(),
-          deleteScopeRemote,
-          running: false,
-        },
-        durableDelete: { deleteScope },
-      });
-      await seedSource(SOURCE_SCOPE);
-      await seedSource(DERIVED_SCOPE);
-      await seedSource(DERIVED2_SCOPE);
-    });
-
     async function ownerDelete(scope: string, query = "") {
       return app.request(`/${scope}${query}`, {
         method: "DELETE",
@@ -691,132 +613,25 @@ describe("derivative data routes", () => {
       });
     }
 
-    it("deletes derivatives deepest-first, then the scope, skipping already-deleted nodes", async () => {
+    it("is a specified 501 stub until durable (tombstone) deletion exists", async () => {
+      await seedSource(SOURCE_SCOPE);
       const res = await ownerDelete(SOURCE_SCOPE, "?cascade=lineage");
-      expect(res.status).toBe(200);
-      expect(await res.json()).toEqual({
-        scope: SOURCE_SCOPE,
-        cascade: "lineage",
-        deleted: [
-          { dataPointId: DERIVED2_ID, scope: DERIVED2_SCOPE },
-          { dataPointId: DERIVED_ID, scope: DERIVED_SCOPE },
-          { dataPointId: SOURCE_ID, scope: SOURCE_SCOPE },
-        ],
-      });
-      expect(deleteScope.mock.calls.map((c) => c[0])).toEqual([
-        DERIVED2_SCOPE,
-        DERIVED_SCOPE,
-        SOURCE_SCOPE,
-      ]);
-      expect(deleteScopeRemote).not.toHaveBeenCalled();
-    });
-
-    it("stops with 502 when a node's deletion did not reach the gateway", async () => {
-      deleteScope.mockResolvedValueOnce({ durable: false });
-      const res = await ownerDelete(SOURCE_SCOPE, "?cascade=lineage");
-      expect(res.status).toBe(502);
+      expect(res.status).toBe(501);
       const body = await res.json();
-      expect(body.error.errorCode).toBe("LINEAGE_CASCADE_INCOMPLETE");
-      expect(body.error.details.failed.scope).toBe(DERIVED2_SCOPE);
-      expect(deleteScope).toHaveBeenCalledTimes(1);
-    });
-
-    it("deleting a derivative never touches its sources", async () => {
-      const res = await ownerDelete(DERIVED2_SCOPE, "?cascade=lineage");
-      expect(res.status).toBe(200);
-      expect((await res.json()).deleted).toEqual([
-        { dataPointId: DERIVED2_ID, scope: DERIVED2_SCOPE },
-      ]);
-      expect(deleteScope).toHaveBeenCalledTimes(1);
-      expect(deleteScope).toHaveBeenCalledWith(DERIVED2_SCOPE);
-    });
-
-    it("cascades a local-only scope the gateway does not know as a single node", async () => {
-      await seedSource("local.only");
-      const res = await ownerDelete("local.only", "?cascade=lineage");
-      expect(res.status).toBe(200);
-      expect((await res.json()).deleted).toHaveLength(1);
-    });
-
-    it("refuses the whole cascade on a foreign-owner node with nothing deleted", async () => {
-      const nodes = graph();
-      nodes[DERIVED_ID] = lineageView({
-        ownerAddress: "0x1111111111111111111111111111111111111111",
-      });
-      (
-        lineageGateway.getLineage as ReturnType<typeof vi.fn>
-      ).mockImplementation(
-        async ({ dataPointId }: { dataPointId: string }) => ({
-          ok: true,
-          data: nodes[dataPointId],
-          proof: {},
-        }),
-      );
-      const res = await ownerDelete(SOURCE_SCOPE, "?cascade=lineage");
-      expect(res.status).toBe(409);
-      expect((await res.json()).error.errorCode).toBe("LINEAGE_CROSS_OWNER");
-      expect(deleteScope).not.toHaveBeenCalled();
+      expect(body.error.errorCode).toBe("LINEAGE_CASCADE_UNAVAILABLE");
+      // Nothing was walked or deleted.
+      expect(lineageGateway.getLineage).not.toHaveBeenCalled();
       expect((await ownerRead(SOURCE_SCOPE)).status).toBe(200);
     });
 
-    it("aborts with 502 and nothing deleted when the gateway walk fails", async () => {
-      (lineageGateway.getLineage as ReturnType<typeof vi.fn>).mockResolvedValue(
-        {
-          ok: false,
-          status: 500,
-          body: {},
-        },
-      );
-      const res = await ownerDelete(SOURCE_SCOPE, "?cascade=lineage");
-      expect(res.status).toBe(502);
-      expect(deleteScope).not.toHaveBeenCalled();
-    });
-
-    it("answers 501 without a lineage gateway or a durable delete, and 400 for an unknown cascade mode", async () => {
-      const realSyncManager = createSyncManager(
-        {
-          storage: createNodeDataStorage({
-            indexManager: deps.indexManager,
-            hierarchyOptions: deps.hierarchyOptions,
-          }),
-          storageAdapter: {} as never,
-          gateway: deps.gateway,
-          signer: {} as never,
-          masterKey: new Uint8Array(65),
-          serverOwner: ownerWallet.address,
-          logger: logger as never,
-        },
-        {} as never,
-      );
-      for (const variant of [
-        { ...deps, lineageGateway: undefined, durableDelete: { deleteScope } },
-        // What every current runtime wires: the real sync manager and no
-        // durable delete port.
-        { ...deps, syncManager: realSyncManager },
-      ]) {
-        const localApp = dataRoutes(variant);
-        const res = await localApp.request(`/${SOURCE_SCOPE}?cascade=lineage`, {
-          method: "DELETE",
-          headers: {
-            Authorization: await ownerHeader("DELETE", `/${SOURCE_SCOPE}`),
-          },
-        });
-        expect(res.status).toBe(501);
-        expect((await res.json()).error.errorCode).toBe(
-          "LINEAGE_CASCADE_UNAVAILABLE",
-        );
-      }
+    it("rejects an unknown cascade mode with 400 and keeps the default single-node delete at 204", async () => {
+      await seedSource(SOURCE_SCOPE);
       const bad = await ownerDelete(SOURCE_SCOPE, "?cascade=all");
       expect(bad.status).toBe(400);
       expect((await bad.json()).error.errorCode).toBe("INVALID_CASCADE");
-    });
-
-    it("keeps the default single-node delete at 204 without walking lineage", async () => {
       const res = await ownerDelete(SOURCE_SCOPE);
       expect(res.status).toBe(204);
-      expect(lineageGateway.getLineage).not.toHaveBeenCalled();
-      expect(deleteScopeRemote).toHaveBeenCalledWith(SOURCE_SCOPE);
-      expect((await ownerRead(DERIVED_SCOPE)).status).toBe(200);
+      expect((await ownerRead(SOURCE_SCOPE)).status).toBe(404);
     });
 
     it("is owner-only", async () => {
