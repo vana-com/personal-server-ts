@@ -119,13 +119,22 @@ export function createGatewayDeleteDataPort(
         // once against it.
         const body = await res.json().catch(() => null);
         const conflict = unwrap(body);
+        // Gateway 409 body: `nextExpectedVersion` is the version to sign
+        // next; `currentExpectedVersion` is the version the gateway holds,
+        // so it needs +1. Prefer the explicit next, fall back to current+1,
+        // then to the legacy message phrasing.
+        const nextExplicit =
+          integerField(conflict, "nextExpectedVersion") ??
+          integerField(body, "nextExpectedVersion");
         const currentExpected =
           integerField(conflict, "currentExpectedVersion") ??
           integerField(body, "currentExpectedVersion");
         const next =
-          currentExpected !== null
-            ? currentExpected + 1
-            : parseGatewayNextVersion(detailFromBody(body, res.statusText));
+          nextExplicit !== null
+            ? nextExplicit
+            : currentExpected !== null
+              ? currentExpected + 1
+              : parseGatewayNextVersion(detailFromBody(body, res.statusText));
         if (next === null) {
           throw new Error(
             `Gateway error: 409 ${detailFromBody(body, res.statusText)}`,

@@ -157,13 +157,14 @@ describe("createGatewayDeleteDataPort.tombstone", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it("re-signs once against currentExpectedVersion+1 on a 409", async () => {
+  it("re-signs once against nextExpectedVersion on a 409", async () => {
     const fetchImpl = vi
       .fn()
       .mockResolvedValueOnce(
         jsonResponse(409, {
           error: "Stale expectedVersion",
           currentExpectedVersion: "7",
+          nextExpectedVersion: "8",
         }),
       )
       .mockResolvedValueOnce(
