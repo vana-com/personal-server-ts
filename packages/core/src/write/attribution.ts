@@ -26,7 +26,8 @@
  * authorship from the envelope ALONE (verifyStoredWriterAttribution): recover
  * the signer over the stored proof's base64url payload (EIP-191), check the
  * signed claims against the envelope's scope and stored grantId, and hash
- * JSON.stringify(data minus $writtenBy) against the signed bodyHash.
+ * JSON.stringify(data minus the server-stamped keys `$writtenBy` and
+ * `$lineage`) against the signed bodyHash.
  *   - JSON writes: the body IS the stored record, so the builder signs the
  *     body bytes, which must be compact JSON (what JSON.stringify emits: no
  *     insignificant whitespace, keys in the order given). JSON.parse /
@@ -60,6 +61,7 @@ import {
   parseMetadataHeader,
   sha256Hex,
 } from "../contracts/binary.js";
+import { LINEAGE_KEY } from "../lineage/lineage.js";
 
 /** Header carrying the builder's signed-payload proof on a session write. */
 export const WRITE_SIGNATURE_HEADER = "x-vana-write-signature";
@@ -374,7 +376,8 @@ function signedScopeOf(uri: string): string | null {
  * server state, no expiry check: the proof is evidence of who wrote the
  * record at the time, not a live credential). Checks, in order: the envelope
  * carries an attribution; the stored representation (compact JSON of the
- * data minus `$writtenBy`, for JSON and `$binary` records alike) re-hashes
+ * data minus the server-stamped `$writtenBy` and `$lineage` keys, for JSON
+ * and `$binary` records alike) re-hashes
  * to the signed bodyHash; the proof parses and recovers to the attributed
  * builder; and the signed claims bind the proof to THIS record: a POST whose
  * path names the envelope's scope, the stored grantId, and (when given) the
@@ -392,7 +395,15 @@ export async function verifyStoredWriterAttribution(
       `Record carries no ${WRITER_ATTRIBUTION_KEY} attribution`,
     );
   }
-  const { [WRITER_ATTRIBUTION_KEY]: _attribution, ...payloadData } = data;
+  // Every server-stamped reserved key is stripped, not just the attribution:
+  // `$lineage` is the server's validated mirror of the caller's `lineage`
+  // field (the field itself stays inside the signed bytes), so a derivative
+  // record re-hashes to the same signed bodyHash as a root record.
+  const {
+    [WRITER_ATTRIBUTION_KEY]: _attribution,
+    [LINEAGE_KEY]: _lineage,
+    ...payloadData
+  } = data;
 
   const bodyHash = computeBodyHash(
     new TextEncoder().encode(JSON.stringify(payloadData)),

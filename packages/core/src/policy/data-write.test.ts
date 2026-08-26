@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { scopeCoveredByGrant } from "@opendatalabs/vana-sdk/browser";
 import type {
   Builder,
   GatewayGrantResponse,
@@ -324,5 +325,34 @@ describe("verifyDataWritePolicy", () => {
       grant,
       scope: "notes.entries",
     });
+  });
+});
+
+describe("derivative write grants never leak across a lineage edge", () => {
+  const SOURCE_SCOPE = "chatgpt.conversations";
+  const DERIVED_SCOPE = "spine.health.summary";
+
+  it("a write grant on the derived scope writes the derivative only", () => {
+    const scopes = [`write:${DERIVED_SCOPE}`];
+    expect(scopeCoveredByWriteGrant(DERIVED_SCOPE, scopes)).toBe(true);
+    expect(scopeCoveredByWriteGrant(SOURCE_SCOPE, scopes)).toBe(false);
+  });
+
+  it("a write grant on the source namespace does not write the derivative", () => {
+    expect(scopeCoveredByWriteGrant(DERIVED_SCOPE, ["write:chatgpt.*"])).toBe(
+      false,
+    );
+    expect(
+      scopeCoveredByWriteGrant(DERIVED_SCOPE, [`write:${SOURCE_SCOPE}`]),
+    ).toBe(false);
+  });
+
+  it("a write grant on the derived scope confers no READ on the sources", () => {
+    expect(scopeCoveredByGrant(SOURCE_SCOPE, [`write:${DERIVED_SCOPE}`])).toBe(
+      false,
+    );
+    expect(scopeCoveredByGrant(DERIVED_SCOPE, [`write:${DERIVED_SCOPE}`])).toBe(
+      false,
+    );
   });
 });

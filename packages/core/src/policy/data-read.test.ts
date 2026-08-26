@@ -406,3 +406,79 @@ describe("verifyDataReadPolicy", () => {
     ).rejects.toMatchObject({ errorCode: "PS_UNAVAILABLE" });
   });
 });
+
+describe("derivative grants never leak across a lineage edge", () => {
+  // A derivative of chatgpt.conversations lives in its own namespace (the
+  // naming rule enforced at write time). The read policy matches the
+  // requested scope against the grant entries verbatim, so a grant on either
+  // side of the lineage edge confers nothing on the other.
+  const SOURCE_SCOPE = "chatgpt.conversations";
+  const DERIVED_SCOPE = "spine.health.summary";
+
+  function ports(grant: GatewayGrantResponse) {
+    return {
+      authSessionVerifier: { getBuilder: vi.fn().mockResolvedValue(builder) },
+      grantVerifier: { getGrant: vi.fn().mockResolvedValue(grant) },
+    };
+  }
+
+  it("a grant on the derived scope reads the derivative only", async () => {
+    const grant = makeGrant({ scopes: [DERIVED_SCOPE] });
+    await expect(
+      verifyDataReadPolicy(
+        {
+          signer: BUILDER_ADDRESS,
+          grantId: grant.id,
+          requestedScope: DERIVED_SCOPE,
+          serverOwner: "0xOwner",
+        },
+        ports(grant),
+      ),
+    ).resolves.toBe(grant);
+    await expect(
+      verifyDataReadPolicy(
+        {
+          signer: BUILDER_ADDRESS,
+          grantId: grant.id,
+          requestedScope: SOURCE_SCOPE,
+          serverOwner: "0xOwner",
+        },
+        ports(grant),
+      ),
+    ).rejects.toMatchObject({ errorCode: "SCOPE_MISMATCH" });
+  });
+
+  it("a grant on the source (exact or wildcard) does not read the derivative", async () => {
+    for (const scopes of [[SOURCE_SCOPE], ["chatgpt.*"]]) {
+      const grant = makeGrant({ scopes });
+      await expect(
+        verifyDataReadPolicy(
+          {
+            signer: BUILDER_ADDRESS,
+            grantId: grant.id,
+            requestedScope: DERIVED_SCOPE,
+            serverOwner: "0xOwner",
+          },
+          ports(grant),
+        ),
+      ).rejects.toMatchObject({ errorCode: "SCOPE_MISMATCH" });
+    }
+  });
+
+  it("documents why the naming rule exists: a derivative named under the source namespace would leak", async () => {
+    // Not reachable through the write path (400 LINEAGE_SCOPE_UNDER_SOURCE_PREFIX),
+    // pinned here so a grammar change that widens this is caught.
+    const grant = makeGrant({ scopes: ["chatgpt.*"] });
+    await expect(
+      verifyDataReadPolicy(
+        {
+          signer: BUILDER_ADDRESS,
+          grantId: grant.id,
+          requestedScope: "chatgpt.health-summary",
+          serverOwner: "0xOwner",
+        },
+        ports(grant),
+      ),
+    ).resolves.toBe(grant);
+  });
+});

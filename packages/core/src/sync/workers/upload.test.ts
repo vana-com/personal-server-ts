@@ -737,3 +737,66 @@ describe("upload worker", () => {
     });
   });
 });
+
+describe("uploadOne — derivative registration (lineage)", () => {
+  const SOURCE_ID =
+    "0xabababababababababababababababababababababababababababababababab";
+
+  function derivativeEnvelope(): DataFileEnvelope {
+    return {
+      version: "1.0",
+      scope: SCOPE,
+      collectedAt: COLLECTED_AT,
+      data: {
+        summary: "x",
+        lineage: [SOURCE_ID],
+        $lineage: { sources: [SOURCE_ID], writtenAt: COLLECTED_AT },
+      },
+    };
+  }
+
+  it("registers an envelope carrying $lineage through the lineage gateway with its sources", async () => {
+    const deps = makeMockDeps();
+    (deps.storage.readEnvelope as ReturnType<typeof vi.fn>).mockResolvedValue(
+      derivativeEnvelope(),
+    );
+    const registerDataPoint = vi
+      .fn()
+      .mockResolvedValue({ dataPointId: DATA_POINT_ID, expectedVersion: "1" });
+    deps.lineageGateway = { registerDataPoint };
+
+    const result = await uploadOne(deps, makeEntry());
+
+    expect(result.dataPointId).toBe(DATA_POINT_ID);
+    expect(registerDataPoint).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ownerAddress: OWNER,
+        scope: SCOPE,
+        expectedVersion: "1",
+        signature: "0xadddatasignature",
+        lineage: [SOURCE_ID],
+      }),
+    );
+    expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
+  });
+
+  it("fails (and leaves the entry unsynced) instead of registering a derivative as a root when no lineage gateway is wired", async () => {
+    const deps = makeMockDeps();
+    (deps.storage.readEnvelope as ReturnType<typeof vi.fn>).mockResolvedValue(
+      derivativeEnvelope(),
+    );
+    await expect(uploadOne(deps, makeEntry())).rejects.toThrow(
+      /lineage registration needs a gateway URL/,
+    );
+    expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
+    expect(deps.storage.updateDataPointId).not.toHaveBeenCalled();
+  });
+
+  it("keeps using the SDK client for root records", async () => {
+    const deps = makeMockDeps();
+    deps.lineageGateway = { registerDataPoint: vi.fn() };
+    await uploadOne(deps, makeEntry());
+    expect(deps.gateway.registerDataPoint).toHaveBeenCalled();
+    expect(deps.lineageGateway.registerDataPoint).not.toHaveBeenCalled();
+  });
+});

@@ -1,4 +1,13 @@
-import { ProtocolError } from "../errors/catalog.js";
+import {
+  InvalidCascadeError,
+  LineageCascadeTooLargeError,
+  LineageCascadeUnavailableError,
+  LineageCrossOwnerError,
+  LineageGatewayError,
+  LineageUnavailableError,
+  ProtocolError,
+  ServerNotConfiguredError,
+} from "../errors/catalog.js";
 import type { AccessLogWriter } from "../logging/access-log.js";
 import type { AccessLogReader } from "../logging/access-reader.js";
 import {
@@ -45,6 +54,13 @@ import type {
 } from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../signing/index.js";
 import type { WriterAttribution } from "../write/attribution.js";
+import {
+  extractLineageField,
+  prepareLineage,
+  type StoredLineage,
+} from "../lineage/lineage.js";
+import type { LineageGatewayPort } from "../lineage/gateway.js";
+import { computeDataPointId } from "../sync/data-point-id.js";
 import {
   binaryFilename,
   binaryMimeType,
@@ -217,6 +233,14 @@ export interface PersonalServerDataApiDeps {
   now?: () => Date;
   createLogId?: () => string;
   logger?: PersonalServerApiLogger;
+  /**
+   * Gateway access for derivative data (docs/derivative-data-api.md): source
+   * lookups for lineage validation on write, the signed lineage read behind
+   * GET /v1/data/:scope/lineage and the walk behind DELETE ?cascade=lineage.
+   * Absent = writes with lineage can only cite local scopes, and the lineage
+   * read / cascade answer 503 / 501.
+   */
+  lineageGateway?: LineageGatewayPort;
 }
 
 export interface PersonalServerAccessLogsApiDeps {
@@ -634,6 +658,164 @@ export function reportPersonalServerReadFulfillment(
   }
 }
 
+/**
+ * Validate a write's caller-supplied `lineage` (JSON body top level, or the
+ * binary metadata object) into the `$lineage` record to stamp. `undefined`
+ * (or null) means a root record. Throws ProtocolErrors; the write handler
+ * lets them propagate before anything is stored.
+ */
+async function prepareWriteLineage(
+  deps: PersonalServerDataApiDeps,
+  scope: string,
+  field: unknown,
+): Promise<StoredLineage | undefined> {
+  if (field === undefined || field === null) return undefined;
+  return prepareLineage({
+    scope,
+    field,
+    serverOwner: deps.serverOwner,
+    storage: deps.storage,
+    gateway: deps.lineageGateway,
+    now: deps.now ?? (() => new Date()),
+  });
+}
+
+/** Owner-exempt read signals from the auth port (see api-auth). */
+function isOwnerReadSignal(
+  authResult: PersonalServerReadAuthResult | void,
+): boolean {
+  return (
+    authResult === undefined ||
+    authResult.grantId === undefined ||
+    authResult.grantId === "owner" ||
+    authResult.grantId === "policy-bypass"
+  );
+}
+
+/** Upper bound on nodes a cascade delete walks before refusing. */
+export const LINEAGE_CASCADE_NODE_LIMIT = 1000;
+
+/**
+ * Delete one scope the way DELETE /v1/data/:scope always has: propagate to
+ * the authoritative stores (R2 blobs + gateway records) first, best-effort,
+ * then drop the local copy. Shared by the single-node delete and the lineage
+ * cascade so both compose with the durable-delete work the same way.
+ */
+async function deleteOneScope(
+  deps: PersonalServerDataApiDeps,
+  scope: string,
+): Promise<number> {
+  if (deps.syncManager?.deleteScopeRemote) {
+    try {
+      await deps.syncManager.deleteScopeRemote(scope);
+    } catch (err) {
+      deps.logger?.info?.(
+        { scope, error: (err as Error).message },
+        "Remote scope deletion failed; proceeding with local delete",
+      );
+    }
+  }
+  const result = await deleteDataScopeContract({
+    storage: deps.storage,
+    scopeParam: scope,
+  });
+  if (!result.ok) {
+    // The scope was validated by the caller; a contract error here is a bug.
+    throw new ProtocolError(
+      result.status,
+      result.body.error,
+      result.body.message,
+    );
+  }
+  deps.logger?.info?.(
+    { scope, deletedCount: result.deletedCount },
+    "Scope deleted",
+  );
+  return result.deletedCount;
+}
+
+/**
+ * DELETE ?cascade=lineage: walk the gateway lineage graph from the scope's
+ * data point (owner view, signed as this server), collect every derivative
+ * that cites it transitively, and delete them deepest-first, then the scope
+ * itself. The whole walk completes before anything is deleted, so a gateway
+ * failure, an oversize graph or a foreign-owner node aborts with nothing
+ * removed. Derivatives already tombstoned at the gateway are skipped.
+ * Deleting a derivative never touches its sources.
+ */
+async function cascadeDeleteLineage(
+  deps: PersonalServerDataApiDeps,
+  scope: string,
+): Promise<Array<{ dataPointId: string; scope: string }>> {
+  if (!deps.serverOwner) {
+    throw new ServerNotConfiguredError({
+      reason: "serverOwner is required to resolve the data point id",
+    });
+  }
+  if (!deps.lineageGateway) throw new LineageCascadeUnavailableError();
+  const owner = deps.serverOwner;
+  const lineageGateway = deps.lineageGateway;
+  const visited = new Set<string>();
+  const order: Array<{ dataPointId: string; scope: string }> = [];
+
+  const walk = async (
+    dataPointId: string,
+    scopeHint: string | null,
+    isRoot: boolean,
+  ): Promise<void> => {
+    if (visited.has(dataPointId)) return;
+    visited.add(dataPointId);
+    if (visited.size > LINEAGE_CASCADE_NODE_LIMIT) {
+      throw new LineageCascadeTooLargeError({
+        limit: LINEAGE_CASCADE_NODE_LIMIT,
+      });
+    }
+    const result = await lineageGateway.getLineage({ dataPointId });
+    if (!result.ok) {
+      // Not registered at the gateway: nothing can cite it there, so the
+      // node is a leaf. Only the root can legitimately be unregistered (a
+      // local-only scope); derivatives were just reported by the gateway.
+      if (result.status === 404 && isRoot) {
+        order.push({ dataPointId, scope: scopeHint ?? scope });
+        return;
+      }
+      throw new LineageGatewayError({
+        status: result.status,
+        body: result.body,
+      });
+    }
+    if (result.data.ownerAddress.toLowerCase() !== owner.toLowerCase()) {
+      throw new LineageCrossOwnerError({
+        dataPointId,
+        ownerAddress: result.data.ownerAddress,
+      });
+    }
+    for (const node of result.data.derivatives) {
+      if ("redacted" in node) {
+        // The owner view is never redacted; a redaction means the gateway did
+        // not treat this server as the owner's, so refuse to guess.
+        throw new LineageGatewayError({
+          status: 200,
+          body: { error: "redacted node in owner lineage view", node },
+        });
+      }
+      await walk(node.dataPointId, node.scope, false);
+    }
+    if (isRoot || result.data.deletedAt === null) {
+      order.push({ dataPointId, scope: result.data.scope });
+    }
+  };
+
+  await walk(computeDataPointId(owner, scope), scope, true);
+
+  const deleted: Array<{ dataPointId: string; scope: string }> = [];
+  for (const node of order) {
+    await deleteOneScope(deps, node.scope);
+    deleted.push(node);
+  }
+  return deleted;
+}
+
 export async function handlePersonalServerDataRequest(
   request: Request,
   deps: PersonalServerDataApiDeps,
@@ -667,6 +849,66 @@ export async function handlePersonalServerDataRequest(
       });
       if (!result.ok) return contractErrorResponse(result);
       return jsonResponse(result.response);
+    }
+
+    if (parts.length === 2 && parts[1] === "lineage") {
+      if (request.method !== "GET") return methodNotAllowed();
+      const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
+      if (!scopeResult.ok) return contractErrorResponse(scopeResult);
+      const version = url.searchParams.get("version") ?? undefined;
+      if (version !== undefined && !/^[1-9]\d*$/.test(version)) {
+        return errorResponse(
+          400,
+          "INVALID_VERSION",
+          "version must be a positive decimal integer",
+        );
+      }
+      // Same gate as a read of the scope: the owner, or a builder whose grant
+      // covers it. The gateway then attests the view that grant sees, so a
+      // builder only learns the scopes of nodes its grant covers.
+      const authResult = await deps.auth.authorizeBuilderRead({
+        request,
+        scope: scopeResult.scope,
+        grantId: selectedGrantId(request, url),
+      });
+      if (!deps.serverOwner) {
+        throw new ServerNotConfiguredError({
+          reason: "serverOwner is required to resolve the data point id",
+        });
+      }
+      if (!deps.lineageGateway) throw new LineageUnavailableError();
+      const grantId = isOwnerReadSignal(authResult)
+        ? undefined
+        : authResult?.grantId;
+      const result = await deps.lineageGateway.getLineage({
+        dataPointId: computeDataPointId(deps.serverOwner, scopeResult.scope),
+        version,
+        grantId,
+      });
+      if (!result.ok) {
+        if (result.status === 404) {
+          return errorResponse(
+            404,
+            "NOT_FOUND",
+            version
+              ? `Scope "${scopeResult.scope}" has no registered version ${version}`
+              : `Scope "${scopeResult.scope}" is not registered at the gateway`,
+          );
+        }
+        if (result.status === 403) {
+          throw new ProtocolError(
+            403,
+            "LINEAGE_FORBIDDEN",
+            "The gateway refused the lineage view for this grant",
+            { gateway: result.body },
+          );
+        }
+        throw new LineageGatewayError({
+          status: result.status,
+          body: result.body,
+        });
+      }
+      return jsonResponse({ data: result.data, proof: result.proof });
     }
 
     if (parts.length !== 1) return notFound();
@@ -949,18 +1191,27 @@ export async function handlePersonalServerDataRequest(
         // below still resolves a schema for validation/metadata.)
         if (!isJsonContentType(request)) {
           const bytes = new Uint8Array(await request.arrayBuffer());
+          const metadata = parseMetadataHeader(
+            request.headers.get("x-vana-metadata"),
+          );
+          // A binary derivative names its sources inside the metadata
+          // object; the validated mirror lands at the top of the record.
+          const lineage = await prepareWriteLineage(
+            deps,
+            scopeResult.scope,
+            extractLineageField(metadata),
+          );
           const result = await ingestBinaryDataContract({
             storage: deps.storage,
             scopeParam: scopeResult.scope,
             bytes,
             mimeType: binaryMimeType(request),
             filename: binaryFilename(request),
-            metadata: parseMetadataHeader(
-              request.headers.get("x-vana-metadata"),
-            ),
+            metadata,
             collectedAt: collectedAtValue,
             status,
             attribution: writeAuth?.attribution,
+            lineage,
           });
           if (!result.ok) return failWrite(contractErrorResponse(result));
           committed = true;
@@ -985,6 +1236,13 @@ export async function handlePersonalServerDataRequest(
           "Request body must be valid JSON",
         );
         if (!parsed.ok) return failWrite(contractResponse(parsed.result));
+        // Derivative writes: validate the caller's `lineage` before anything
+        // is stored (a failure here throws, releasing the builder's proof).
+        const lineage = await prepareWriteLineage(
+          deps,
+          scopeResult.scope,
+          extractLineageField(parsed.body),
+        );
         // DPv2 is scope-addressed and the gateway records no schemas, so JSON
         // ingest is schemaless too — no lookup, no schemaId/$schema stamped.
         const result = await ingestDataContract({
@@ -994,6 +1252,7 @@ export async function handlePersonalServerDataRequest(
           collectedAt: collectedAtValue,
           status,
           attribution: writeAuth?.attribution,
+          lineage,
         });
         if (!result.ok) return failWrite(contractErrorResponse(result));
         committed = true;
@@ -1034,31 +1293,25 @@ export async function handlePersonalServerDataRequest(
 
     if (request.method === "DELETE") {
       await deps.auth.authorizeOwner(request);
-      // Propagate the deletion to the authoritative stores (R2 blobs + gateway records) BEFORE the
-      // local delete — it reads the local index to find what to remove. Best-effort: a remote
-      // failure must not block the owner's local delete (and sync would otherwise resurrect it; the
-      // download-worker reconciliation is the backstop). Parse the scope first so an invalid scope
-      // still 400s without a wasted remote call.
-      const parsed = parseDataScopeContract(scopeParam);
-      if (parsed.ok && deps.syncManager?.deleteScopeRemote) {
-        try {
-          await deps.syncManager.deleteScopeRemote(parsed.scope);
-        } catch (err) {
-          deps.logger?.info?.(
-            { scope: scopeParam, error: (err as Error).message },
-            "Remote scope deletion failed; proceeding with local delete",
-          );
-        }
+      const cascade = url.searchParams.get("cascade");
+      if (cascade !== null && cascade !== "lineage") {
+        throw new InvalidCascadeError({ cascade });
       }
-      const result = await deleteDataScopeContract({
-        storage: deps.storage,
-        scopeParam,
-      });
-      if (!result.ok) return contractErrorResponse(result);
-      deps.logger?.info?.(
-        { scope: scopeParam, deletedCount: result.deletedCount },
-        "Scope deleted",
-      );
+      // Parse the scope first so an invalid scope still 400s without a
+      // wasted remote call.
+      const parsed = parseDataScopeContract(scopeParam);
+      if (!parsed.ok) return contractErrorResponse(parsed);
+      if (cascade === "lineage") {
+        const deleted = await cascadeDeleteLineage(deps, parsed.scope);
+        return jsonResponse({ scope: parsed.scope, cascade, deleted });
+      }
+      // Single node (the default): propagate the deletion to the
+      // authoritative stores (R2 blobs + gateway records) BEFORE the local
+      // delete, which reads the local index to find what to remove.
+      // Best-effort: a remote failure must not block the owner's local delete
+      // (sync would otherwise resurrect it; the download-worker
+      // reconciliation is the backstop).
+      await deleteOneScope(deps, parsed.scope);
       return new Response(null, { status: 204 });
     }
 

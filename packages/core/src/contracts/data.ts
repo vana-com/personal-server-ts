@@ -12,6 +12,11 @@ import {
   stampWriterAttribution,
   type WriterAttribution,
 } from "../write/attribution.js";
+import {
+  hasReservedLineageKey,
+  stampLineage,
+  type StoredLineage,
+} from "../lineage/lineage.js";
 
 export type DataContractErrorCode =
   "INVALID_SCOPE" | "INVALID_BODY" | "NOT_FOUND";
@@ -124,6 +129,13 @@ export interface IngestDataContractInput {
    * Owner writes pass nothing and the envelope is byte-identical to today.
    */
   attribution?: WriterAttribution;
+  /**
+   * Validated lineage for a derivative write (see lineage/lineage.ts). When
+   * present it is stamped into the envelope `data` under the reserved
+   * `$lineage` key, next to `$writtenBy`; absent = root record, envelope
+   * unchanged.
+   */
+  lineage?: StoredLineage;
 }
 
 export interface IngestDataContractResult {
@@ -134,6 +146,8 @@ export interface IngestDataContractResult {
     scope: string;
     collectedAt: string;
     status: "stored" | "syncing";
+    /** Echoed for a derivative write: the accepted, normalized sources. */
+    lineage?: { sources: `0x${string}`[] };
   };
   writeResult: WriteResult;
 }
@@ -150,6 +164,8 @@ export interface IngestBinaryDataContractInput {
   status: "stored" | "syncing";
   /** Builder attribution for delegated writes (see IngestDataContractInput). */
   attribution?: WriterAttribution;
+  /** Validated lineage for a derivative write (see IngestDataContractInput). */
+  lineage?: StoredLineage;
 }
 
 export interface DeleteDataScopeContractInput {
@@ -339,13 +355,23 @@ export async function ingestDataContract(
       },
     };
   }
+  // Same rule for the lineage mirror: `$lineage` is what the server
+  // validated, so a caller must not be able to plant or shadow it.
+  if (hasReservedLineageKey(input.body)) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: "INVALID_BODY",
+        message: "Request body must not contain the reserved $lineage key",
+      },
+    };
+  }
 
   const envelope = createDataFileEnvelope(
     scopeResult.scope,
     input.collectedAt,
-    input.attribution
-      ? stampWriterAttribution(input.body, input.attribution)
-      : input.body,
+    stampServerKeys(input.body, input),
   );
   const writeResult = await input.storage.writeEnvelope(envelope);
   try {
@@ -366,12 +392,37 @@ export async function ingestDataContract(
     ok: true,
     scope: scopeResult.scope,
     collectedAt: input.collectedAt,
-    response: {
-      scope: scopeResult.scope,
-      collectedAt: input.collectedAt,
-      status: input.status,
-    },
+    response: ingestResponse(scopeResult.scope, input),
     writeResult,
+  };
+}
+
+/**
+ * Stamp the server-owned reserved keys (`$writtenBy`, `$lineage`) into the
+ * record about to be stored. Both are absent from owner root writes, so such
+ * an envelope stays byte-identical to today's.
+ */
+function stampServerKeys(
+  data: Record<string, unknown>,
+  input: Pick<IngestDataContractInput, "attribution" | "lineage">,
+): Record<string, unknown> {
+  let stamped = data;
+  if (input.lineage) stamped = stampLineage(stamped, input.lineage);
+  if (input.attribution) {
+    stamped = stampWriterAttribution(stamped, input.attribution);
+  }
+  return stamped;
+}
+
+function ingestResponse(
+  scope: string,
+  input: Pick<IngestDataContractInput, "collectedAt" | "status" | "lineage">,
+): IngestDataContractResult["response"] {
+  return {
+    scope,
+    collectedAt: input.collectedAt,
+    status: input.status,
+    ...(input.lineage ? { lineage: { sources: input.lineage.sources } } : {}),
   };
 }
 
@@ -411,7 +462,7 @@ export async function ingestBinaryDataContract(
   const envelope = createDataFileEnvelope(
     scopeResult.scope,
     input.collectedAt,
-    input.attribution ? stampWriterAttribution(data, input.attribution) : data,
+    stampServerKeys(data, input),
   );
   const writeResult = await input.storage.writeEnvelope(envelope);
   try {
@@ -432,11 +483,7 @@ export async function ingestBinaryDataContract(
     ok: true,
     scope: scopeResult.scope,
     collectedAt: input.collectedAt,
-    response: {
-      scope: scopeResult.scope,
-      collectedAt: input.collectedAt,
-      status: input.status,
-    },
+    response: ingestResponse(scopeResult.scope, input),
     writeResult,
   };
 }

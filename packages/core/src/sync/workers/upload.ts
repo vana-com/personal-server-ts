@@ -1,4 +1,4 @@
-import { encodeAbiParameters, keccak256, stringToHex } from "viem";
+import { keccak256, stringToHex } from "viem";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import {
   deriveScopeKey,
@@ -9,6 +9,11 @@ import type { ServerSigner } from "../../signing/signer.js";
 import type { Logger } from "../../logger/index.js";
 import type { IndexEntry } from "../../storage/index/types.js";
 import type { DataStoragePort } from "../../ports/index.js";
+import { computeDataPointId } from "../data-point-id.js";
+import { readStoredLineage } from "../../lineage/lineage.js";
+import type { LineageGatewayPort } from "../../lineage/gateway.js";
+
+export { computeDataPointId } from "../data-point-id.js";
 
 export interface UploadWorkerDeps {
   storage: DataStoragePort;
@@ -18,6 +23,14 @@ export interface UploadWorkerDeps {
   masterKey: Uint8Array;
   serverOwner: string;
   logger: Logger;
+  /**
+   * Registers derivative records (envelopes stamped with `$lineage`) with
+   * their lineage. The SDK client's registerDataPoint sends only the AddData
+   * fields, so a derivative needs this direct client; without it a derivative
+   * upload fails (and retries next cycle) rather than silently registering as
+   * a root record whose lineage exists only inside the ciphertext.
+   */
+  lineageGateway?: Pick<LineageGatewayPort, "registerDataPoint">;
 }
 
 export interface UploadResult {
@@ -166,14 +179,36 @@ export async function uploadOne(
         expectedVersion: version,
       });
 
-      const dataPointResult = await gateway.registerDataPoint({
+      const registration = {
         ownerAddress: serverOwner,
         scope: entry.scope,
         dataHash,
         metadataHash,
         expectedVersion: String(version),
         signature: addDataSignature,
-      });
+      };
+      // A derivative carries its validated `$lineage` inside the envelope;
+      // the gateway stores the same sources as attested metadata for this
+      // (dataPointId, version) so lineage can be walked without the
+      // plaintext. The AddData signature is unchanged: metadataHash already
+      // commits to the data, `$lineage` included.
+      const lineage = readStoredLineage(
+        envelope.data as Record<string, unknown> | undefined,
+      );
+      let dataPointResult;
+      if (lineage) {
+        if (!deps.lineageGateway) {
+          throw new Error(
+            `Cannot register derivative ${entry.path} (scope=${entry.scope}): lineage registration needs a gateway URL (lineageGateway is not configured)`,
+          );
+        }
+        dataPointResult = await deps.lineageGateway.registerDataPoint({
+          ...registration,
+          lineage: lineage.sources,
+        });
+      } else {
+        dataPointResult = await gateway.registerDataPoint(registration);
+      }
 
       const id = dataPointResult.dataPointId ?? null;
       if (!id) {
@@ -359,27 +394,4 @@ export function parseGatewayNextVersion(message: string): number | null {
   );
   if (storedValue) return Number(storedValue[1]) + 1;
   return null;
-}
-
-/**
- * Deterministic DPv2 data-point id — `keccak256(abi.encode(owner, scope))`,
- * the same primary key DataRegistryV2 and the gateway use. Lets the upload
- * worker look up the registry's live row for a scope without a list call.
- */
-export function computeDataPointId(
-  ownerAddress: string,
-  scope: string,
-): `0x${string}` {
-  // ABI-encoding an address is checksum-insensitive (same bytes either way),
-  // but viem rejects mixed-case strings that fail checksum validation —
-  // normalize so config-sourced owner strings can't trip it.
-  return keccak256(
-    encodeAbiParameters(
-      [
-        { name: "ownerAddress", type: "address" },
-        { name: "scope", type: "string" },
-      ],
-      [ownerAddress.toLowerCase() as `0x${string}`, scope],
-    ),
-  );
 }

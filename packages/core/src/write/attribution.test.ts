@@ -14,6 +14,7 @@ import {
   type WriterAttribution,
 } from "./attribution.js";
 import { buildBinaryEnvelopeData, sha256Hex } from "../contracts/binary.js";
+import { LINEAGE_KEY, stampLineage } from "../lineage/lineage.js";
 import { createInMemoryWriteProofReplayStore } from "./session.js";
 import {
   buildWeb3SignedHeader,
@@ -558,5 +559,53 @@ describe("stampWriterAttribution", () => {
   it("hasReservedWriterKey detects caller-supplied attribution", () => {
     expect(hasReservedWriterKey({ note: "x" })).toBe(false);
     expect(hasReservedWriterKey({ [WRITER_ATTRIBUTION_KEY]: {} })).toBe(true);
+  });
+});
+
+describe("verifyStoredWriterAttribution with lineage", () => {
+  const SOURCE_ID = `0x${"ab".repeat(32)}` as const;
+
+  async function storedDerivativeRecord() {
+    // The builder's own `lineage` field is inside the signed body; the
+    // server stamps the validated `$lineage` mirror next to `$writtenBy`.
+    const body = { summary: "sleep improved", lineage: [SOURCE_ID] };
+    const request = await buildWriteRequest({ body: JSON.stringify(body) });
+    const attribution = await verifyWriterAttribution({
+      request,
+      builderAddress: builderWallet.address,
+      grantId: GRANT_ID,
+      serverOrigin: SERVER_ORIGIN,
+    });
+    const stamped = stampWriterAttribution(
+      stampLineage(body, {
+        sources: [SOURCE_ID],
+        writtenAt: "2026-08-31T09:12:44.000Z",
+      }),
+      attribution,
+    );
+    return JSON.parse(JSON.stringify(stamped)) as Record<string, unknown>;
+  }
+
+  it("verifies a derivative record: $lineage is stripped like $writtenBy", async () => {
+    const data = await storedDerivativeRecord();
+    expect(data[LINEAGE_KEY]).toEqual({
+      sources: [SOURCE_ID],
+      writtenAt: "2026-08-31T09:12:44.000Z",
+    });
+    const verified = await verifyStoredWriterAttribution(
+      { scope: SCOPE, data },
+      { expectedOrigin: SERVER_ORIGIN },
+    );
+    expect(verified.builder.toLowerCase()).toBe(
+      builderWallet.address.toLowerCase(),
+    );
+  });
+
+  it("still rejects a record whose signed lineage field was altered", async () => {
+    const data = await storedDerivativeRecord();
+    data.lineage = [`0x${"cd".repeat(32)}`];
+    await expect(
+      verifyStoredWriterAttribution({ scope: SCOPE, data }),
+    ).rejects.toMatchObject({ reason: "BODY_HASH_MISMATCH" });
   });
 });
