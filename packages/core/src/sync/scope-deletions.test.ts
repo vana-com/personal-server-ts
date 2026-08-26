@@ -182,6 +182,73 @@ describe("scope deletion tracker", () => {
     });
   });
 
+  it("re-validates a tombstone once it is older than maxStalenessMs, so a remote re-add is picked up", async () => {
+    // Delete on this replica, then a re-add on another replica while sync
+    // is off: the registry row is live again at a later version.
+    const { tracker, getDataPoint, advance } = makeTracker({
+      remote: record({ expectedVersion: "5" }),
+      maxStalenessMs: 1_000,
+    });
+    tracker.markDeleted(SCOPE, DELETED_AT, "local-delete");
+
+    await expect(tracker.resolve(SCOPE)).resolves.toMatchObject({
+      deleted: true,
+      verified: true,
+    });
+    expect(getDataPoint).not.toHaveBeenCalled();
+
+    advance(1_001);
+    await expect(tracker.resolve(SCOPE)).resolves.toEqual({
+      deleted: false,
+      source: "gateway",
+      verified: true,
+    });
+    expect(getDataPoint).toHaveBeenCalledTimes(1);
+    expect(tracker.knownDeletion(SCOPE)).toBeNull();
+  });
+
+  it("keeps refusing a stale tombstone when the re-check cannot reach the gateway", async () => {
+    const { tracker, getDataPoint, advance } = makeTracker({
+      remote: new Error("ECONNREFUSED"),
+      maxStalenessMs: 1_000,
+      gatewayRetryMs: 500,
+    });
+    tracker.markDeleted(SCOPE, DELETED_AT);
+    advance(1_001);
+
+    await expect(tracker.resolve(SCOPE)).resolves.toEqual({
+      deleted: true,
+      deletedAt: DELETED_AT,
+      source: "feed",
+      verified: false,
+    });
+    expect(getDataPoint).toHaveBeenCalledTimes(1);
+    // Inside the back-off the stale tombstone is still served, no lookup.
+    await expect(tracker.resolve(SCOPE)).resolves.toMatchObject({
+      deleted: true,
+      verified: false,
+    });
+    expect(getDataPoint).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a complete feed pass as re-validation of every remembered tombstone", async () => {
+    const { tracker, getDataPoint, advance } = makeTracker({
+      remote: record(),
+      maxStalenessMs: 1_000,
+    });
+    tracker.markDeleted(SCOPE, DELETED_AT);
+    advance(900);
+    // The pass listed no live row for SCOPE (else markLive would have run).
+    tracker.noteFeedSynced();
+    advance(900);
+
+    await expect(tracker.resolve(SCOPE)).resolves.toMatchObject({
+      deleted: true,
+      verified: true,
+    });
+    expect(getDataPoint).not.toHaveBeenCalled();
+  });
+
   it("is assumed-live without a feed or owner to ask", async () => {
     const noOwner = makeTracker({ remote: record(), owner: undefined });
     await expect(noOwner.tracker.resolve(SCOPE)).resolves.toEqual({

@@ -2,8 +2,8 @@ import type { DataPointFeedPort, DataPointFeedRecord } from "../ports/index.js";
 import { isTombstoneRecord } from "./tombstone.js";
 
 /**
- * Where a deletion verdict came from. `assumed-live` is the only unverified
- * source: it means the tracker had no fact and could not reach the gateway.
+ * Where a deletion verdict came from. `assumed-live` is the only source that
+ * is never verified: the tracker had no fact and could not reach the gateway.
  */
 export type ScopeDeletionSource =
   "feed" | "gateway" | "local-delete" | "assumed-live";
@@ -13,7 +13,12 @@ export type ScopeDeletionVerdict =
       deleted: true;
       deletedAt: string;
       source: Exclude<ScopeDeletionSource, "assumed-live">;
-      verified: true;
+      /**
+       * False when the tombstone is older than `maxStalenessMs`, the
+       * re-check could not reach the gateway, and the last known state is
+       * being served (fail-safe: refuse rather than resurrect).
+       */
+      verified: boolean;
     }
   | {
       deleted: false;
@@ -45,19 +50,23 @@ export interface ScopeDeletionResolveOptions {
  *   - the delete worker (a landed tombstone means the scope is deleted),
  *   - direct gateway lookups made by `resolve` itself.
  *
- * Consistency window, stated explicitly:
+ * Every remembered verdict, live or deleted, ages out after `maxStalenessMs`
+ * and is then re-established from the feed or a gateway lookup. Consistency
+ * window, stated explicitly:
  *   - a tombstone landed by THIS replica is visible to its reads immediately;
  *   - a tombstone landed by ANOTHER replica is visible here once the download
  *     feed lists it (one sync poll interval while sync is healthy), or after
  *     at most `maxStalenessMs` plus one gateway lookup when the feed is not
  *     fresh (sync off, blocked, or a multi-page backlog);
+ *   - a re-add on another replica after a tombstone becomes visible here on
+ *     the same schedule: the feed lists the live row, or the tombstone ages
+ *     out and the next read re-checks the gateway;
  *   - while the gateway is unreachable the tracker serves its last known
  *     state (`verified: false`) rather than failing every read; it re-checks
  *     after `gatewayRetryMs`. A partitioned replica therefore keeps serving
- *     its local copy until connectivity returns, and never longer than
- *     `maxStalenessMs` after it does.
- * A deleted verdict is sticky until the registry shows the scope live again
- * (a re-add), which the feed, the upload worker or a direct lookup reports.
+ *     its local copy (or keeps refusing a tombstoned scope) until
+ *     connectivity returns, and never longer than `maxStalenessMs` after it
+ *     does.
  */
 export interface ScopeDeletionTracker {
   /**
@@ -73,7 +82,9 @@ export interface ScopeDeletionTracker {
   markLive(scope: string): void;
   /**
    * Record that a deletion-aware feed listing completed with no further
-   * pages: every tombstone up to `at` has been fed through `markDeleted`.
+   * pages: every tombstone up to `at` has been fed through `markDeleted`,
+   * and every re-add through `markLive`, so all remembered tombstones are
+   * re-validated as of `at`.
    */
   noteFeedSynced(at?: Date): void;
   /** Synchronous view: a known tombstone, or null when none is known. */
@@ -94,9 +105,10 @@ export interface ScopeDeletionTrackerOptions {
   /** Data owner used for on-demand lookups. Optional for the same reason. */
   serverOwner?: string;
   /**
-   * How old a complete feed pass or a per-scope gateway verdict may be before
-   * `resolve` asks the gateway again. Default 120_000 (two default sync poll
-   * intervals, so one missed cycle does not turn every read into a lookup).
+   * How old a complete feed pass or a per-scope verdict (live or deleted)
+   * may be before `resolve` asks the gateway again. Default 120_000 (two
+   * default sync poll intervals, so one missed cycle does not turn every
+   * read into a lookup).
    */
   maxStalenessMs?: number;
   /** Back-off after a failed gateway lookup before trying again. Default 15_000. */
@@ -113,6 +125,13 @@ export const DEFAULT_SCOPE_DELETION_MAX_STALENESS_MS = 120_000;
 export const DEFAULT_SCOPE_DELETION_GATEWAY_RETRY_MS = 15_000;
 const DEFAULT_MAX_LIVE_ENTRIES = 10_000;
 
+interface KnownTombstone {
+  deletedAt: string;
+  source: Exclude<ScopeDeletionSource, "assumed-live">;
+  /** When the registry last confirmed the tombstone (ms). */
+  verifiedAtMs: number;
+}
+
 export function createScopeDeletionTracker(
   options: ScopeDeletionTrackerOptions = {},
 ): ScopeDeletionTracker {
@@ -124,17 +143,16 @@ export function createScopeDeletionTracker(
   const now = options.now ?? (() => new Date());
   const nowMs = () => now().getTime();
 
-  // scope -> tombstone. Sticky until the registry shows the scope live.
-  const deleted = new Map<
-    string,
-    { deletedAt: string; source: Exclude<ScopeDeletionSource, "assumed-live"> }
-  >();
+  // scope -> tombstone. Kept until the registry shows the scope live, but
+  // re-validated once older than maxStalenessMs (a re-add elsewhere must not
+  // leave this replica answering 410 forever).
+  const deleted = new Map<string, KnownTombstone>();
   // scope -> when a gateway lookup last confirmed the scope live (ms).
   const live = new Map<string, number>();
   let lastFeedSyncMs: number | null = null;
   let lastGatewayFailureMs: number | null = null;
   // Coalesce concurrent lookups of the same scope into one request.
-  const inflight = new Map<string, Promise<ScopeDeletionVerdict>>();
+  const inflight = new Map<string, Promise<ScopeDeletionVerdict | null>>();
 
   function rememberLive(scope: string, at: number): void {
     deleted.delete(scope);
@@ -148,6 +166,15 @@ export function createScopeDeletionTracker(
     }
   }
 
+  function rememberDeleted(
+    scope: string,
+    deletedAt: string,
+    source: KnownTombstone["source"],
+  ): void {
+    deleted.set(scope, { deletedAt, source, verifiedAtMs: nowMs() });
+    live.delete(scope);
+  }
+
   function isFresh(at: number | null): boolean {
     return at !== null && nowMs() - at <= maxStalenessMs;
   }
@@ -158,25 +185,27 @@ export function createScopeDeletionTracker(
   ): ScopeDeletionVerdict {
     const deletedAt = deletionTimestamp(record);
     if (deletedAt !== null) {
-      deleted.set(scope, { deletedAt, source: "gateway" });
-      live.delete(scope);
+      rememberDeleted(scope, deletedAt, "gateway");
       return { deleted: true, deletedAt, source: "gateway", verified: true };
     }
     rememberLive(scope, nowMs());
     return { deleted: false, source: "gateway", verified: true };
   }
 
-  async function lookup(scope: string): Promise<ScopeDeletionVerdict> {
+  /**
+   * Ask the registry. Null when it cannot be asked right now (no feed or
+   * owner wired, inside the failure back-off, or the request failed): the
+   * caller falls back to its last known state.
+   */
+  async function lookup(scope: string): Promise<ScopeDeletionVerdict | null> {
     const feed = options.feed;
     const owner = options.serverOwner;
-    if (!feed || !owner) {
-      return { deleted: false, source: "assumed-live", verified: false };
-    }
+    if (!feed || !owner) return null;
     if (
       lastGatewayFailureMs !== null &&
       nowMs() - lastGatewayFailureMs < gatewayRetryMs
     ) {
-      return { deleted: false, source: "assumed-live", verified: false };
+      return null;
     }
     const pending = inflight.get(scope);
     if (pending) return pending;
@@ -198,11 +227,7 @@ export function createScopeDeletionTracker(
           },
           "Could not check gateway deletion state; serving last known state",
         );
-        return {
-          deleted: false,
-          source: "assumed-live",
-          verified: false,
-        } satisfies ScopeDeletionVerdict;
+        return null;
       } finally {
         inflight.delete(scope);
       }
@@ -215,8 +240,7 @@ export function createScopeDeletionTracker(
     maxStalenessMs,
 
     markDeleted(scope, deletedAt, source = "feed") {
-      deleted.set(scope, { deletedAt, source });
-      live.delete(scope);
+      rememberDeleted(scope, deletedAt, source);
     },
 
     markLive(scope) {
@@ -225,6 +249,14 @@ export function createScopeDeletionTracker(
 
     noteFeedSynced(at) {
       lastFeedSyncMs = (at ?? now()).getTime();
+      // A complete pass would have listed any re-add as a live row (and
+      // marked it live above), so every tombstone still here is confirmed.
+      for (const tombstone of deleted.values()) {
+        tombstone.verifiedAtMs = Math.max(
+          tombstone.verifiedAtMs,
+          lastFeedSyncMs,
+        );
+      }
     },
 
     knownDeletion(scope) {
@@ -239,11 +271,24 @@ export function createScopeDeletionTracker(
     async resolve(scope, resolveOptions) {
       const known = deleted.get(scope);
       if (known !== undefined) {
+        if (isFresh(known.verifiedAtMs)) {
+          return {
+            deleted: true,
+            deletedAt: known.deletedAt,
+            source: known.source,
+            verified: true,
+          };
+        }
+        // Stale tombstone: the scope may have been re-added elsewhere. Ask;
+        // if the registry cannot be reached, keep refusing (never resurrect
+        // on a guess) and say the verdict is unverified.
+        const rechecked = await lookup(scope);
+        if (rechecked !== null) return rechecked;
         return {
           deleted: true,
           deletedAt: known.deletedAt,
           source: known.source,
-          verified: true,
+          verified: false,
         };
       }
       if (isFresh(live.get(scope) ?? null)) {
@@ -253,7 +298,13 @@ export function createScopeDeletionTracker(
       if (consult === "if-stale" && isFresh(lastFeedSyncMs)) {
         return { deleted: false, source: "feed", verified: true };
       }
-      return lookup(scope);
+      return (
+        (await lookup(scope)) ?? {
+          deleted: false,
+          source: "assumed-live",
+          verified: false,
+        }
+      );
     },
   };
 }
