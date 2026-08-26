@@ -85,7 +85,7 @@ describe("createGatewayLineageClient", () => {
     await expect(client.getDataPoint(ID)).rejects.toThrow(/Gateway error: 503/);
   });
 
-  it("getLineage signs the request as the server over the path only and forwards version/grantId", async () => {
+  it("getLineage signs the request as the server over the path plus canonical query", async () => {
     const wallet = createTestWallet(5);
     const fetchMock = vi
       .fn()
@@ -109,7 +109,10 @@ describe("createGatewayLineageClient", () => {
     const { payload } = parseWeb3SignedHeader(header);
     expect(payload.aud).toBe("https://gateway.example.com");
     expect(payload.method).toBe("GET");
-    expect(payload.uri).toBe(`/v1/data/${ID}/lineage`);
+    // The canonical query is inside the signed uri.
+    expect(payload.uri).toBe(
+      `/v1/data/${ID}/lineage?version=2&grantId=0xgrant`,
+    );
   });
 
   it("getLineage reports gateway errors with their body instead of throwing", async () => {

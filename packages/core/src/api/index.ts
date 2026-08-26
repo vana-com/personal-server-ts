@@ -162,14 +162,21 @@ export interface PersonalServerIngestSyncManager {
   notifyNewData?(): void;
   /** Propagate a scope deletion to R2 + the gateway before the local delete. */
   deleteScopeRemote?(scope: string): Promise<void>;
-  /**
-   * Durable scope deletion (gateway tombstone -> storage blobs -> local),
-   * the port the tombstone-based delete work provides. The lineage cascade
-   * requires it: a cascade that only removed local copies would report
-   * derivatives deleted while the gateway graph and ciphertext remain.
-   * Absent = DELETE ?cascade=lineage answers 501.
-   */
-  deleteScope?(scope: string): Promise<DurableDeleteResult>;
+}
+
+/**
+ * Durable scope deletion (gateway tombstone -> storage blobs -> local copy).
+ * NOT implemented by today's SyncManager: DPv2 has no delete API on the
+ * deployed gateway, and the tombstone-based deletion is a separate piece of
+ * work (branch volod/ps-durable-delete) that provides exactly this port.
+ * The lineage cascade requires it, because a cascade that only removed
+ * local copies would report derivatives deleted while the gateway graph and
+ * the ciphertext remain and sync could bring them back. Until that work is
+ * wired, no runtime supplies this port and DELETE ?cascade=lineage answers
+ * 501 LINEAGE_CASCADE_UNAVAILABLE by design (see docs/derivative-data-api.md).
+ */
+export interface DurableDeletePort {
+  deleteScope(scope: string): Promise<DurableDeleteResult>;
 }
 
 /** The part of the durable delete result the cascade acts on. */
@@ -255,6 +262,12 @@ export interface PersonalServerDataApiDeps {
    * read / cascade answer 503 / 501.
    */
   lineageGateway?: LineageGatewayPort;
+  /**
+   * Durable (tombstone) delete used by DELETE ?cascade=lineage. Absent in
+   * every current runtime (see DurableDeletePort): the cascade is a
+   * documented 501 stub until the tombstone-based delete lands.
+   */
+  durableDelete?: DurableDeletePort;
 }
 
 export interface PersonalServerAccessLogsApiDeps {
@@ -769,7 +782,7 @@ async function cascadeDeleteLineage(
       reason: "serverOwner is required to resolve the data point id",
     });
   }
-  const durableDelete = deps.syncManager?.deleteScope;
+  const durableDelete = deps.durableDelete;
   if (!deps.lineageGateway || !durableDelete) {
     throw new LineageCascadeUnavailableError({
       reason: deps.lineageGateway
@@ -834,7 +847,7 @@ async function cascadeDeleteLineage(
 
   const deleted: Array<{ dataPointId: string; scope: string }> = [];
   for (const node of order) {
-    const result = await durableDelete.call(deps.syncManager, node.scope);
+    const result = await durableDelete.deleteScope(node.scope);
     if (!result.durable) {
       // The tombstone did not land: stop here and say exactly how far the
       // cascade got, rather than listing nodes sync could still bring back.

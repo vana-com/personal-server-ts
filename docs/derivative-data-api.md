@@ -207,15 +207,21 @@ Authorization: Web3Signed <base64url(payload)>.<sig>
 Authentication is the request-signing scheme the Personal Server already
 uses (EIP-191 over a base64url JSON payload with `aud`, `method`, `uri`,
 `bodyHash`, `iat`, `exp`): `aud` is the gateway origin, `method` is `GET`,
-`uri` is the request path without the query string, `bodyHash` is the hash of
-an empty body. The signer decides the view:
+`bodyHash` is the hash of an empty body (`sha256:e3b0c442...`), `iat <= exp`
+with at most one hour between them. `uri` is the path plus the canonical
+query: `/v1/data/<id lowercase>/lineage`, then `?version=N` and/or
+`grantId=<lowercase>` in that order, exactly as requested, so a captured
+signature cannot be replayed for another version or grant view. A `grantId`
+claim in the payload, when present, must equal the requested `grantId`. The
+signer decides the view:
 
 - the data point's owner, or one of the owner's registered servers: full
   view. With `?grantId=` the response is instead the view that grant sees
   (the grant must be issued by this owner), attested as such; this is how a
   Personal Server serves a builder.
-- a registered builder holding a live grant from the owner that covers the
-  data point's scope: the view for that grant. Nodes whose scope the grant
+- a registered builder holding a live grant from the owner (not revoked or
+  expired, registration paid and confirmed on chain) that covers the data
+  point's scope: the view for that grant. Nodes whose scope the grant
   does not cover are returned as `{ "dataPointId": "0x...", "redacted": true }`,
   so a consent UI can show the shape of the graph without learning the
   scopes.
@@ -350,10 +356,13 @@ already deleted are skipped. Deleting a derivative never touches its
 sources, with or without cascade.
 
 Each node is deleted through the durable (tombstone) delete: gateway
-tombstone, then ciphertext, then the local copy. A server without that
-capability answers 501 for the cascade rather than reporting derivatives
-deleted while their gateway records and blobs remain; the single-node delete
-keeps today's behaviour on such a server. If a node's tombstone does not
+tombstone, then ciphertext, then the local copy. That delete is separate
+work (the tombstone-based deletion branch); no current Personal Server
+runtime has it yet, so today every cascade answers 501
+`LINEAGE_CASCADE_UNAVAILABLE` rather than reporting derivatives deleted
+while their gateway records and blobs remain. The walk, ordering and error
+contract below are implemented and tested against the port that work
+provides; the single-node delete keeps today's behaviour. If a node's tombstone does not
 land, the cascade stops with 502 `LINEAGE_CASCADE_INCOMPLETE` whose `details`
 list the failed node and what was deleted before it.
 

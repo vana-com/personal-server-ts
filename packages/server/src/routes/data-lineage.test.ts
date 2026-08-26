@@ -35,6 +35,8 @@ import {
   type LineageGatewayPort,
   type LineageView,
 } from "@opendatalabs/personal-server-ts-core/lineage";
+import { createSyncManager } from "@opendatalabs/personal-server-ts-core/sync/manager";
+import { createNodeDataStorage } from "../storage/node-data-storage.js";
 import { dataRoutes, type DataRouteDeps } from "./data.js";
 
 const SERVER_ORIGIN = "http://localhost:8080";
@@ -656,8 +658,10 @@ describe("derivative data routes", () => {
           : { ok: false, status: 404, body: {} };
       });
       deleteScopeRemote = vi.fn().mockResolvedValue(undefined);
-      // The durable (tombstone) delete port the cascade requires; it also
-      // removes the local copy, as the real implementation does.
+      // The durable (tombstone) delete port the cascade requires. No current
+      // runtime provides it (the tombstone-based delete is separate work), so
+      // these tests exercise the port contract; the 501 test below covers
+      // what a real SyncManager-only deployment answers.
       deleteScope = vi.fn(async (scope: string) => {
         await deps.indexManager.deleteScope?.(scope);
         return { durable: true };
@@ -671,9 +675,9 @@ describe("derivative data routes", () => {
           getStatus: vi.fn(),
           notifyNewData: vi.fn(),
           deleteScopeRemote,
-          deleteScope,
           running: false,
-        } as unknown as NonNullable<DataRouteDeps["syncManager"]>,
+        },
+        durableDelete: { deleteScope },
       });
       await seedSource(SOURCE_SCOPE);
       await seedSource(DERIVED_SCOPE);
@@ -769,9 +773,26 @@ describe("derivative data routes", () => {
     });
 
     it("answers 501 without a lineage gateway or a durable delete, and 400 for an unknown cascade mode", async () => {
+      const realSyncManager = createSyncManager(
+        {
+          storage: createNodeDataStorage({
+            indexManager: deps.indexManager,
+            hierarchyOptions: deps.hierarchyOptions,
+          }),
+          storageAdapter: {} as never,
+          gateway: deps.gateway,
+          signer: {} as never,
+          masterKey: new Uint8Array(65),
+          serverOwner: ownerWallet.address,
+          logger: logger as never,
+        },
+        {} as never,
+      );
       for (const variant of [
-        { ...deps, lineageGateway: undefined, syncManager: deps.syncManager },
-        { ...deps, syncManager: null },
+        { ...deps, lineageGateway: undefined, durableDelete: { deleteScope } },
+        // What every current runtime wires: the real sync manager and no
+        // durable delete port.
+        { ...deps, syncManager: realSyncManager },
       ]) {
         const localApp = dataRoutes(variant);
         const res = await localApp.request(`/${SOURCE_SCOPE}?cascade=lineage`, {

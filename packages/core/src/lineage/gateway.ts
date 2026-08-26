@@ -164,20 +164,23 @@ export function createGatewayLineageClient(
       if (!options.requestSigner) {
         throw new LineageUnavailableError({ reason: "no request signer" });
       }
-      const path = `/v1/data/${encodeURIComponent(input.dataPointId)}/lineage`;
+      const path = `/v1/data/${input.dataPointId.toLowerCase()}/lineage`;
+      // Canonical query, in this order and lowercased, is part of the signed
+      // uri so a captured signature cannot be replayed for another version
+      // or grant view (the gateway rebuilds and compares it).
       const params = new URLSearchParams();
       if (input.version !== undefined) params.set("version", input.version);
-      if (input.grantId !== undefined) params.set("grantId", input.grantId);
+      if (input.grantId !== undefined) {
+        params.set("grantId", input.grantId.toLowerCase());
+      }
       const query = params.toString();
-      // The signed uri is the path only (the gateway verifies against the
-      // request path without its query string), matching how Personal Server
-      // reads are signed.
+      const uri = `${path}${query ? `?${query}` : ""}`;
       const authorization = await options.requestSigner.signRequest({
         aud: origin,
         method: "GET",
-        uri: path,
+        uri,
       });
-      const res = await doFetch(`${base}${path}${query ? `?${query}` : ""}`, {
+      const res = await doFetch(`${base}${uri}`, {
         headers: { Authorization: authorization },
       });
       const body = await readJson(res);
