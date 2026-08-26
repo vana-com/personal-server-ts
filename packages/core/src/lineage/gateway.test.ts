@@ -166,6 +166,7 @@ describe("createGatewayLineageClient", () => {
       expectedVersion: "1",
       signature: "0xsig",
       lineage: [SOURCE_ID],
+      lineageSignature: "0xlineagesig",
     });
     expect(result).toEqual({ dataPointId: ID, expectedVersion: "1" });
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
@@ -180,6 +181,7 @@ describe("createGatewayLineageClient", () => {
       metadataHash: "0xmeta",
       expectedVersion: "1",
       lineage: [SOURCE_ID],
+      lineageSignature: "0xlineagesig",
     });
   });
 
@@ -202,6 +204,7 @@ describe("createGatewayLineageClient", () => {
         expectedVersion: "1",
         signature: "0xsig",
         lineage: [],
+        lineageSignature: "0xlineagesig",
       }),
     ).rejects.toThrow(/^Gateway error: 409 Gap in version sequence/);
   });

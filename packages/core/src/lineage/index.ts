@@ -31,4 +31,8 @@ export {
   type RegisterDataPointWithLineageParams,
   type RegisterDataPointWithLineageResult,
 } from "./gateway.js";
+export {
+  LINEAGE_ATTESTATION_TYPES,
+  type LineageAttestationMessage,
+} from "./attestation.js";
 export { computeDataPointId } from "../sync/data-point-id.js";

@@ -188,23 +188,34 @@ export async function uploadOne(
         signature: addDataSignature,
       };
       // A derivative carries its validated `$lineage` inside the envelope;
-      // the gateway stores the same sources as attested metadata for this
-      // (dataPointId, version) so lineage can be walked without the
-      // plaintext. The AddData signature is unchanged: metadataHash already
-      // commits to the data, `$lineage` included.
+      // the gateway stores the same sources next to this (dataPointId,
+      // version) so lineage can be walked without the plaintext. The
+      // AddData signature is unchanged (dataHash already commits to the
+      // plaintext, `$lineage` included); the plaintext list the gateway
+      // keeps is covered by a separate LineageAttestation signature bound
+      // to this version and dataHash, so a replayed registration cannot
+      // swap it (see lineage/attestation.ts).
       const lineage = readStoredLineage(
         envelope.data as Record<string, unknown> | undefined,
       );
       let dataPointResult;
-      if (lineage) {
+      if (lineage && lineage.sources.length > 0) {
         if (!deps.lineageGateway) {
           throw new Error(
             `Cannot register derivative ${entry.path} (scope=${entry.scope}): lineage registration needs a gateway URL (lineageGateway is not configured)`,
           );
         }
+        const lineageSignature = await signer.signLineageAttestation({
+          ownerAddress: serverOwner as `0x${string}`,
+          scope: entry.scope,
+          expectedVersion: version,
+          dataHash,
+          sources: lineage.sources,
+        });
         dataPointResult = await deps.lineageGateway.registerDataPoint({
           ...registration,
           lineage: lineage.sources,
+          lineageSignature,
         });
       } else {
         dataPointResult = await gateway.registerDataPoint(registration);

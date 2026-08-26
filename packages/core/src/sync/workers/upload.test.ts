@@ -100,6 +100,9 @@ function makeMockDeps(): UploadWorkerDeps {
     signAddData: vi
       .fn()
       .mockResolvedValue("0xadddatasignature" as `0x${string}`),
+    signLineageAttestation: vi
+      .fn()
+      .mockResolvedValue("0xlineagesignature" as `0x${string}`),
   };
 
   const mockLogger: Partial<Logger> = {
@@ -775,8 +778,17 @@ describe("uploadOne — derivative registration (lineage)", () => {
         expectedVersion: "1",
         signature: "0xadddatasignature",
         lineage: [SOURCE_ID],
+        lineageSignature: "0xlineagesignature",
       }),
     );
+    // The attestation binds the lineage to this exact registration.
+    expect(deps.signer.signLineageAttestation).toHaveBeenCalledWith({
+      ownerAddress: OWNER,
+      scope: SCOPE,
+      expectedVersion: 1n,
+      dataHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+      sources: [SOURCE_ID],
+    });
     expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
   });
 

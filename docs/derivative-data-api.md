@@ -86,9 +86,12 @@ and mirrors it into the stored envelope `data` under the reserved key
 (or metadata object) that brings its own `$lineage` is rejected with 400, the
 same rule as `$writtenBy`.
 
-Because `$lineage` lives inside `data`, `metadataHash` (unchanged definition:
-the commitment the Personal Server computes over the envelope) now commits to
-the lineage as well. The on-chain AddData struct is untouched.
+Because `$lineage` lives inside `data`, `dataHash` (unchanged definition:
+keccak256 of the plaintext envelope JSON) now commits to the lineage as well;
+`metadataHash` keeps its definition (`{scope, collectedAt, sizeBytes}`). The
+on-chain AddData struct is untouched. The plaintext copy of the lineage that
+the gateway stores is covered by a separate server-signed attestation (see
+"Gateway write").
 
 Builder attribution and the reserved keys: the builder signs the compact JSON
 body (JSON writes) or the stored `$binary` record (binary writes). Both
@@ -255,6 +258,8 @@ Response:
 }
 ```
 
+- `ownerAddress` is the data point owner; every node in the view belongs to
+  the same owner.
 - `version` is the derived record's version whose lineage is shown. Without
   `?version=` it is the current version; when the current version is a
   tombstone it is the last version that carried lineage (so a deleted
@@ -265,11 +270,19 @@ Response:
 - `derivatives` lists every data point of the same owner that cites this id in
   any of its versions; `version` is the latest citing version, `deletedAt` the
   derivative's current tombstone time or null.
-- `proof` is the standard gateway attestation over
-  `requestHash = keccak256(abi.encode("GET /v1/data/:dataPointId/lineage", dataPointId, version, grantId))`
-  (`version` 0 and `grantId` bytes32 zero when not given) and a `responseHash`
-  over the node list exactly as returned, redactions included. The gateway
-  signs the view it served, so a redacted view verifies on its own.
+- `proof` is the standard gateway attestation (`GatewayAttestation` EIP-712,
+  `userSignature` = the data point's AddData signature) over:
+  - `requestHash = keccak256(abi.encode(string "GET /v1/data/:dataPointId/lineage", bytes32 dataPointId, uint256 version, bytes32 grantId))`
+    with `version` 0 and `grantId` bytes32 zero when not given;
+  - `responseHash = keccak256(abi.encode(bytes32 dataPointId, address ownerAddress, string scope, uint256 version, uint256 deletedAt, bytes32 sourcesHash, bytes32 derivativesHash))`
+    where `deletedAt` is unix seconds (0 when null), each list hash is
+    `keccak256(abi.encode(bytes32[] nodeHashes))` in response order, a
+    visible node hashes as
+    `keccak256(abi.encode(bytes32 dataPointId, string scope, uint256 version, uint256 deletedAt))`
+    and a redacted node as
+    `keccak256(abi.encode(bytes32 dataPointId, string "redacted"))`.
+    The gateway signs the view it served, so a redacted view verifies on its
+    own and un-redacting or dropping a node breaks the proof.
 
 | Status | When                                                                                                        |
 | ------ | ----------------------------------------------------------------------------------------------------------- |
@@ -346,7 +359,7 @@ sources, with or without cascade.
 ## Gateway write (for clients that register directly)
 
 `POST /v1/data` accepts an optional `lineage: string[]` next to the existing
-AddData fields:
+AddData fields, together with `lineageSignature`:
 
 ```json
 {
@@ -355,21 +368,47 @@ AddData fields:
   "dataHash": "0x...",
   "metadataHash": "0x...",
   "expectedVersion": "3",
-  "lineage": ["0x5b1a...9c", "0x9e77...02"]
+  "lineage": ["0x5b1a...9c", "0x9e77...02"],
+  "lineageSignature": "0x..."
 }
 ```
 
-The signed EIP-712 AddData struct is unchanged: the gateway stores lineage as
-gateway-attested metadata for `(dataPointId, expectedVersion)`, and the
-on-chain commitment to it is `metadataHash`, which the Personal Server
-computed over data that includes `$lineage`. The gateway validates the same
-things the Personal Server does (shape, naming rule, every source is an
-existing data point of `ownerAddress`, deleted allowed) and answers 400
-`LINEAGE_INVALID` / `LINEAGE_SCOPE_UNDER_SOURCE_PREFIX` or 422
-`LINEAGE_SOURCE_UNKNOWN` (`unknown: [...]`). A tombstone version cannot carry
-lineage. The 201 response echoes `lineage`.
+The signed EIP-712 AddData struct is unchanged. The on-chain commitment to
+the lineage is `dataHash` (the Personal Server hashes the plaintext envelope,
+`$lineage` included), which the gateway cannot open. The plaintext list the
+gateway stores for `(dataPointId, expectedVersion)` therefore carries its own
+proof of authorship, `lineageSignature`: an EIP-712 signature under the same
+DataRegistry domain as AddData over
 
-A same-version refresh of a still-pending version replaces its lineage
-together with its payload (absent lineage on the refresh makes it a root);
-once the version is in flight or settled the refresh is refused as today, so
-registered lineage is immutable.
+```
+LineageAttestation {
+  address   ownerAddress;
+  string    scope;
+  uint256   expectedVersion;
+  bytes32   dataHash;
+  bytes32[] sources;   // lowercase ids, registered order
+}
+```
+
+signed by the owner or one of the owner's registered servers (the same rule
+as AddData). Why a second signature: the AddData signature is public (every
+gateway attestation carries it as `userSignature`), and a still-pending
+version accepts a same-version refresh, so without the attestation anyone
+could replay a registration with a different lineage. The Personal Server's
+upload worker produces this signature with the server key.
+
+The gateway validates the same things the Personal Server does (shape,
+naming rule, every source is an existing data point of `ownerAddress`,
+deleted allowed) and answers 400 `LINEAGE_INVALID` /
+`LINEAGE_SCOPE_UNDER_SOURCE_PREFIX`, 401 `LINEAGE_SIGNATURE_REQUIRED` /
+`LINEAGE_SIGNATURE_INVALID`, or 422 `LINEAGE_SOURCE_UNKNOWN`
+(`unknown: [...]`); error bodies are the gateway's usual
+`{ success: false, error, code }`. A tombstone version cannot carry lineage.
+The 201 response echoes `lineage` (`[]` when the request made no lineage
+statement).
+
+`lineage` absent or empty is "no lineage statement": a fresh version is a
+root, and a same-version refresh of a still-pending version keeps whatever
+lineage the slot holds. A refresh that carries an attested `lineage`
+replaces it together with the payload. Once the version is in flight or
+settled the refresh is refused as today, so registered lineage is immutable.
