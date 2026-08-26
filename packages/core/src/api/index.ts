@@ -44,6 +44,7 @@ import type {
 } from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../signing/index.js";
 import type { WriterAttribution } from "../write/attribution.js";
+import { isJsonContentType } from "../contracts/binary.js";
 import {
   buildChallenge,
   parsePaymentHeader,
@@ -569,14 +570,6 @@ function collectedAt(now: () => Date): string {
     .replace(/\.\d{3}Z$/, "Z");
 }
 
-/** True when the request body should be treated as a JSON object (the legacy
- * path). Missing/blank Content-Type is treated as JSON for backward compat. */
-function isJsonContentType(request: Request): boolean {
-  const ct = request.headers.get("content-type");
-  if (!ct) return true;
-  return ct.toLowerCase().includes("application/json");
-}
-
 function binaryMimeType(request: Request): string {
   const ct = request.headers.get("content-type");
   if (!ct) return "application/octet-stream";
@@ -912,21 +905,37 @@ export async function handlePersonalServerDataRequest(
 
       // Builder writes land in the same access log as builder reads, so the
       // owner sees who wrote what under which grant.
+      // Best-effort: it runs AFTER the record is committed, so a log failure
+      // must not turn a successful write into a 500 (the builder would retry
+      // and store a duplicate). The ingest log line above still names the
+      // builder; the failure itself is logged for the owner.
       const logBuilderWrite = async (): Promise<void> => {
         if (!writeAuth) return;
-        await deps.accessLogWriter.write({
-          logId: deps.createLogId?.() ?? crypto.randomUUID(),
-          grantId: writeAuth.grantId,
-          builder: writeAuth.builder,
-          action: "write",
-          scope: scopeResult.scope,
-          timestamp: (deps.now ?? (() => new Date()))().toISOString(),
-          ipAddress:
-            request.headers.get("x-forwarded-for") ??
-            request.headers.get("x-real-ip") ??
-            "unknown",
-          userAgent: request.headers.get("user-agent") ?? "unknown",
-        });
+        try {
+          await deps.accessLogWriter.write({
+            logId: deps.createLogId?.() ?? crypto.randomUUID(),
+            grantId: writeAuth.grantId,
+            builder: writeAuth.builder,
+            action: "write",
+            scope: scopeResult.scope,
+            timestamp: (deps.now ?? (() => new Date()))().toISOString(),
+            ipAddress:
+              request.headers.get("x-forwarded-for") ??
+              request.headers.get("x-real-ip") ??
+              "unknown",
+            userAgent: request.headers.get("user-agent") ?? "unknown",
+          });
+        } catch (err) {
+          deps.logger?.warn?.(
+            {
+              scope: scopeResult.scope,
+              builder: writeAuth.builder,
+              grantId: writeAuth.grantId,
+              error: err instanceof Error ? err.message : String(err),
+            },
+            "Builder write access-log entry failed; record already stored",
+          );
+        }
       };
 
       // Binary / unstructured data (e.g. a PDF): the body is raw bytes. DPv2

@@ -8,9 +8,11 @@ import {
   WRITER_ATTRIBUTION_KEY,
   hasReservedWriterKey,
   stampWriterAttribution,
+  verifyStoredWriterAttribution,
   verifyWriterAttribution,
   type WriterAttribution,
 } from "./attribution.js";
+import { buildBinaryEnvelopeData, sha256Hex } from "../contracts/binary.js";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
@@ -22,15 +24,21 @@ const otherWallet = createTestWallet(4);
 const GRANT_ID = "0xgrant_w1";
 
 async function buildWriteRequest(params: {
-  body?: string;
+  body?: string | Uint8Array;
+  contentType?: string;
   signer?: typeof builderWallet;
   header?: string | null;
   signedBody?: string;
 }): Promise<Request> {
   const body = params.body ?? JSON.stringify({ note: "hello" });
-  const bodyBytes = new TextEncoder().encode(params.signedBody ?? body);
+  const bodyBytes =
+    params.signedBody !== undefined
+      ? new TextEncoder().encode(params.signedBody)
+      : typeof body === "string"
+        ? new TextEncoder().encode(body)
+        : body;
   const headers: Record<string, string> = {
-    "Content-Type": "application/json",
+    "Content-Type": params.contentType ?? "application/json",
     Authorization: "Bearer vana_write_sessiontoken",
   };
   if (params.header !== null) {
@@ -132,6 +140,151 @@ describe("verifyWriterAttribution", () => {
         serverOrigin: SERVER_ORIGIN,
       }),
     ).rejects.toMatchObject({ errorCode: "WRITE_ATTRIBUTION_INVALID" });
+  });
+
+  it("rejects a JSON body that would not re-serialize to the signed bytes", async () => {
+    // Pretty-printed JSON is validly signed, but the stored (parsed) record
+    // could never reproduce these bytes, so the bodyHash would be dead on
+    // read-back. Rejected up front instead.
+    const request = await buildWriteRequest({
+      body: JSON.stringify({ note: "hello", n: 1 }, null, 2),
+    });
+    await expect(
+      verifyWriterAttribution({
+        request,
+        builderAddress: builderWallet.address,
+        grantId: GRANT_ID,
+        serverOrigin: SERVER_ORIGIN,
+      }),
+    ).rejects.toMatchObject({
+      code: 400,
+      errorCode: "WRITE_BODY_NOT_CANONICAL",
+    });
+  });
+
+  it("leaves unparseable JSON to the ingest path (no canonical check)", async () => {
+    const request = await buildWriteRequest({ body: "{not json" });
+    await expect(
+      verifyWriterAttribution({
+        request,
+        builderAddress: builderWallet.address,
+        grantId: GRANT_ID,
+        serverOrigin: SERVER_ORIGIN,
+      }),
+    ).resolves.toMatchObject({ builder: builderWallet.address });
+  });
+
+  it("does not apply the JSON canonical rule to binary bodies", async () => {
+    const bytes = new TextEncoder().encode('  { "pretty": true }  ');
+    const request = await buildWriteRequest({
+      body: bytes,
+      contentType: "application/pdf",
+    });
+    const attribution = await verifyWriterAttribution({
+      request,
+      builderAddress: builderWallet.address,
+      grantId: GRANT_ID,
+      serverOrigin: SERVER_ORIGIN,
+    });
+    expect(attribution.bodyHash).toMatch(/^sha256:/);
+  });
+});
+
+describe("verifyStoredWriterAttribution", () => {
+  async function storedJsonRecord(body: Record<string, unknown>) {
+    const request = await buildWriteRequest({ body: JSON.stringify(body) });
+    const attribution = await verifyWriterAttribution({
+      request,
+      builderAddress: builderWallet.address,
+      grantId: GRANT_ID,
+      serverOrigin: SERVER_ORIGIN,
+    });
+    // What ingest stores: the parsed body with $writtenBy stamped, after a
+    // JSON round-trip (the envelope is serialized to disk and parsed back).
+    return JSON.parse(
+      JSON.stringify(stampWriterAttribution(body, attribution)),
+    ) as Record<string, unknown>;
+  }
+
+  it("verifies a stored JSON record from the record alone", async () => {
+    const data = await storedJsonRecord({
+      note: "hello",
+      nested: { z: 1, a: [1, 2, { b: null }] },
+      unicode: "caf\u00e9 \u2603",
+    });
+    const verified = await verifyStoredWriterAttribution(data);
+    expect(verified.builder.toLowerCase()).toBe(
+      builderWallet.address.toLowerCase(),
+    );
+    expect(verified.grantId).toBe(GRANT_ID);
+    expect(verified.bodyHash).toBe(
+      (data[WRITER_ATTRIBUTION_KEY] as WriterAttribution).bodyHash,
+    );
+    expect(verified.payload.method).toBe("POST");
+    expect(verified.payload.uri).toBe("/v1/data/notes.entries");
+  });
+
+  it("verifies a stored binary record from the decoded bytes", async () => {
+    const bytes = new TextEncoder().encode("%PDF-1.7 fake");
+    const request = await buildWriteRequest({
+      body: bytes,
+      contentType: "application/pdf",
+    });
+    const attribution = await verifyWriterAttribution({
+      request,
+      builderAddress: builderWallet.address,
+      grantId: GRANT_ID,
+      serverOrigin: SERVER_ORIGIN,
+    });
+    const data = stampWriterAttribution(
+      buildBinaryEnvelopeData({
+        bytes,
+        mimeType: "application/pdf",
+        contentHash: await sha256Hex(bytes),
+      }),
+      attribution,
+    );
+    const verified = await verifyStoredWriterAttribution(
+      JSON.parse(JSON.stringify(data)),
+    );
+    expect(verified.builder.toLowerCase()).toBe(
+      builderWallet.address.toLowerCase(),
+    );
+  });
+
+  it("rejects a record whose data was altered after the write", async () => {
+    const data = await storedJsonRecord({ note: "hello" });
+    data.note = "tampered";
+    await expect(verifyStoredWriterAttribution(data)).rejects.toMatchObject({
+      reason: "BODY_HASH_MISMATCH",
+    });
+  });
+
+  it("rejects a record whose attributed builder does not match the proof signer", async () => {
+    const data = await storedJsonRecord({ note: "hello" });
+    const attribution = data[WRITER_ATTRIBUTION_KEY] as WriterAttribution;
+    data[WRITER_ATTRIBUTION_KEY] = {
+      ...attribution,
+      builder: otherWallet.address,
+    };
+    await expect(verifyStoredWriterAttribution(data)).rejects.toMatchObject({
+      reason: "SIGNER_MISMATCH",
+    });
+  });
+
+  it("rejects a record with a malformed stored proof", async () => {
+    const data = await storedJsonRecord({ note: "hello" });
+    const attribution = data[WRITER_ATTRIBUTION_KEY] as WriterAttribution;
+    data[WRITER_ATTRIBUTION_KEY] = { ...attribution, signature: "not.valid" };
+    await expect(verifyStoredWriterAttribution(data)).rejects.toMatchObject({
+      reason: "PROOF_INVALID",
+    });
+  });
+
+  it("rejects a record without attribution", async () => {
+    await expect(
+      verifyStoredWriterAttribution({ note: "owner write" }),
+    ).rejects.toMatchObject({ reason: "ATTRIBUTION_MISSING" });
   });
 });
 

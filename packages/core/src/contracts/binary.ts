@@ -10,6 +10,18 @@ import { type DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 export const BINARY_MARKER = "$binary" as const;
 export const BINARY_ENCODING = "base64" as const;
 
+/**
+ * True when a request body should be treated as a JSON object (the legacy
+ * path); anything else is ingested as binary. Missing/blank Content-Type is
+ * treated as JSON for backward compat. Shared by ingest and the Write API
+ * attribution check so both classify a body the same way.
+ */
+export function isJsonContentType(request: Request): boolean {
+  const ct = request.headers.get("content-type");
+  if (!ct) return true;
+  return ct.toLowerCase().includes("application/json");
+}
+
 export interface BinaryEnvelopeData extends Record<string, unknown> {
   $binary: true;
   mimeType: string;

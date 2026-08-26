@@ -15,7 +15,10 @@ export {
   WRITER_ATTRIBUTION_KEY,
   hasReservedWriterKey,
   stampWriterAttribution,
+  verifyStoredWriterAttribution,
   verifyWriterAttribution,
+  WriterAttributionVerificationError,
+  type StoredWriterAttributionVerification,
   type VerifyWriterAttributionInput,
   type WriterAttribution,
 } from "./attribution.js";

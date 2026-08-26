@@ -13,16 +13,33 @@
  * so attribution travels through the unchanged encrypt / upload / register
  * path and back out on read. The on-chain shape is untouched.
  *
- * A third party holding the record can verify authorship: decode the stored
- * compact proof, recover the signer over its base64url payload (EIP-191), and
- * check the payload's bodyHash against the original request body bytes.
+ * A third party holding the record can verify authorship from the record
+ * ALONE (verifyStoredWriterAttribution): recover the signer over the stored
+ * proof's base64url payload (EIP-191) and re-derive the signed bytes from the
+ * stored data. For that to hold, the stored form must re-serialize to exactly
+ * the bytes the builder signed, so:
+ *   - binary records keep the raw bytes verbatim (base64 in `$binary`);
+ *   - JSON records must be sent in compact form, i.e. what JSON.stringify
+ *     emits (no insignificant whitespace, keys in the order given). Ingest
+ *     stores the parsed object, and JSON.parse/JSON.stringify round-trips
+ *     compact JSON byte-for-byte; a body that does not round-trip is rejected
+ *     at write time (WRITE_BODY_NOT_CANONICAL) instead of storing an
+ *     attribution nobody can check.
  */
 
 import {
+  computeBodyHash,
   parseWeb3SignedHeader,
   verifyWeb3Signed,
+  type Web3SignedPayload,
 } from "@opendatalabs/vana-sdk/browser";
+import { recoverMessageAddress } from "viem";
 import { ProtocolError } from "../errors/catalog.js";
+import {
+  decodeBinaryEnvelope,
+  isBinaryEnvelope,
+  isJsonContentType,
+} from "../contracts/binary.js";
 
 /** Header carrying the builder's signed-payload proof on a session write. */
 export const WRITE_SIGNATURE_HEADER = "x-vana-write-signature";
@@ -113,6 +130,10 @@ export async function verifyWriterAttribution(
     );
   }
 
+  if (isJsonContentType(input.request)) {
+    assertCanonicalJsonBody(bodyBytes);
+  }
+
   // Store the compact `{payload}.{signature}` form (scheme prefix stripped)
   // so verifiers don't need to know the header framing.
   const { payloadBase64, signature } = parseWeb3SignedHeader(headerValue);
@@ -140,4 +161,136 @@ export function stampWriterAttribution(
 
 export function hasReservedWriterKey(data: Record<string, unknown>): boolean {
   return Object.prototype.hasOwnProperty.call(data, WRITER_ATTRIBUTION_KEY);
+}
+
+/**
+ * A JSON session write must be the compact serialization of its own parsed
+ * value, so the record stored after JSON.parse re-serializes to the signed
+ * bytes. Bodies that do not parse are left to the ingest path, which reports
+ * the parse error itself.
+ */
+function assertCanonicalJsonBody(bodyBytes: Uint8Array): void {
+  const text = new TextDecoder().decode(bodyBytes);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return;
+  }
+  if (JSON.stringify(parsed) !== text) {
+    throw new ProtocolError(
+      400,
+      "WRITE_BODY_NOT_CANONICAL",
+      "Session writes must send compact JSON (the JSON.stringify form) so the stored record re-serializes to the signed bytes and the attribution bodyHash stays verifiable",
+    );
+  }
+}
+
+/** Proof scheme prefix the compact stored signature was stripped of. */
+const WEB3_SIGNED_SCHEME = "Web3Signed";
+
+export class WriterAttributionVerificationError extends Error {
+  constructor(
+    public readonly reason:
+      | "ATTRIBUTION_MISSING"
+      | "BODY_HASH_MISMATCH"
+      | "PROOF_INVALID"
+      | "SIGNER_MISMATCH",
+    message: string,
+  ) {
+    super(message);
+    this.name = "WriterAttributionVerificationError";
+  }
+}
+
+export interface StoredWriterAttributionVerification {
+  /** Signer recovered from the stored proof (equals the stored builder). */
+  builder: `0x${string}`;
+  grantId: string;
+  /** Hash re-derived from the stored data; equals the proof's bodyHash. */
+  bodyHash: string;
+  /** The signed claims (aud / method / uri / bodyHash / iat / exp). */
+  payload: Web3SignedPayload;
+}
+
+function isWriterAttribution(value: unknown): value is WriterAttribution {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.builder === "string" &&
+    v.builder.startsWith("0x") &&
+    typeof v.grantId === "string" &&
+    typeof v.signature === "string" &&
+    typeof v.bodyHash === "string" &&
+    typeof v.writtenAt === "string"
+  );
+}
+
+/**
+ * Verify builder attribution from a stored record alone (no request, no
+ * server state, no expiry check: the proof is evidence of who wrote the bytes
+ * at the time, not a live credential). The bytes the builder signed are
+ * re-derived from the record: the decoded content of a `$binary` record, or
+ * the compact JSON serialization of the data with `$writtenBy` removed.
+ * Throws WriterAttributionVerificationError when the record carries no
+ * attribution, the data no longer hashes to the signed bodyHash, the proof is
+ * malformed, or the proof's signer is not the stored builder.
+ */
+export async function verifyStoredWriterAttribution(
+  data: Record<string, unknown>,
+): Promise<StoredWriterAttributionVerification> {
+  const attribution = data[WRITER_ATTRIBUTION_KEY];
+  if (!isWriterAttribution(attribution)) {
+    throw new WriterAttributionVerificationError(
+      "ATTRIBUTION_MISSING",
+      `Record carries no ${WRITER_ATTRIBUTION_KEY} attribution`,
+    );
+  }
+  const { [WRITER_ATTRIBUTION_KEY]: _attribution, ...payloadData } = data;
+
+  const signedBytes = isBinaryEnvelope({ data: payloadData })
+    ? decodeBinaryEnvelope({ data: payloadData }).bytes
+    : new TextEncoder().encode(JSON.stringify(payloadData));
+  const bodyHash = computeBodyHash(signedBytes);
+  if (bodyHash !== attribution.bodyHash) {
+    throw new WriterAttributionVerificationError(
+      "BODY_HASH_MISMATCH",
+      "Stored data does not hash to the attribution bodyHash",
+    );
+  }
+
+  let proof: ReturnType<typeof parseWeb3SignedHeader>;
+  let signer: `0x${string}`;
+  try {
+    proof = parseWeb3SignedHeader(
+      `${WEB3_SIGNED_SCHEME} ${attribution.signature}`,
+    );
+    signer = await recoverMessageAddress({
+      message: proof.payloadBase64,
+      signature: proof.signature,
+    });
+  } catch (err) {
+    throw new WriterAttributionVerificationError(
+      "PROOF_INVALID",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+  if (proof.payload.bodyHash !== bodyHash) {
+    throw new WriterAttributionVerificationError(
+      "BODY_HASH_MISMATCH",
+      "Stored proof does not commit to the attribution bodyHash",
+    );
+  }
+  if (signer.toLowerCase() !== attribution.builder.toLowerCase()) {
+    throw new WriterAttributionVerificationError(
+      "SIGNER_MISMATCH",
+      "Stored proof is not signed by the attributed builder",
+    );
+  }
+  return {
+    builder: attribution.builder,
+    grantId: attribution.grantId,
+    bodyHash,
+    payload: proof.payload,
+  };
 }

@@ -25,6 +25,7 @@ import {
   WRITER_ATTRIBUTION_KEY,
   createInMemoryWriteSessionStore,
   hashWriteSessionToken,
+  verifyStoredWriterAttribution,
   type WriteSessionStore,
 } from "@opendatalabs/personal-server-ts-core/write";
 import { dataRoutes } from "./data.js";
@@ -109,9 +110,11 @@ async function sessionWrite(
     signatureWallet?: typeof builderWallet;
     omitSignature?: boolean;
     token?: string;
+    /** Exact bytes to send (and sign) instead of JSON.stringify(body). */
+    rawBody?: string;
   } = {},
 ) {
-  const rawBody = JSON.stringify(body);
+  const rawBody = options.rawBody ?? JSON.stringify(body);
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Authorization: `Bearer ${options.token ?? SESSION_TOKEN}`,
@@ -202,6 +205,14 @@ describe("POST /v1/data/:scope with a write session", () => {
     expect(attribution.grantId).toBe(WRITE_GRANT_ID);
     expect(attribution.signature).toContain(".");
     expect(attribution.bodyHash).toMatch(/^sha256:/);
+    // The attribution is verifiable from the read-back record alone: the
+    // stored data re-hashes to the signed bodyHash and the proof recovers to
+    // the builder.
+    const verified = await verifyStoredWriterAttribution(envelope.data);
+    expect(verified.builder.toLowerCase()).toBe(
+      builderWallet.address.toLowerCase(),
+    );
+    expect(verified.grantId).toBe(WRITE_GRANT_ID);
 
     // The write landed in the access log under the grant.
     expect(accessLogWriter.write).toHaveBeenCalledWith(
@@ -211,6 +222,35 @@ describe("POST /v1/data/:scope with a write session", () => {
         grantId: WRITE_GRANT_ID,
         scope: SCOPE,
       }),
+    );
+  });
+
+  it("rejects a non-compact JSON body whose attribution could not be verified after read-back", async () => {
+    const res = await sessionWrite(app, SCOPE, null, {
+      rawBody: JSON.stringify({ note: "pretty" }, null, 2),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error.errorCode).toBe("WRITE_BODY_NOT_CANONICAL");
+    // Nothing was stored.
+    const read = await ownerRead(SCOPE);
+    expect(read.status).toBe(404);
+  });
+
+  it("an access-log failure after the record is committed does not fail the write", async () => {
+    (accessLogWriter.write as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error("access log unavailable"),
+    );
+    const res = await sessionWrite(app, SCOPE, { note: "still stored" });
+    // The record is committed before logging; a 500 here would make the
+    // builder retry and store a duplicate.
+    expect(res.status).toBe(201);
+    const read = await ownerRead(SCOPE);
+    expect(read.status).toBe(200);
+    const envelope = await read.json();
+    expect(envelope.data.note).toBe("still stored");
+    expect(envelope.data[WRITER_ATTRIBUTION_KEY].builder).toBe(
+      builderWallet.address,
     );
   });
 
