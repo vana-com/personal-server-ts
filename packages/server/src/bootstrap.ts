@@ -38,10 +38,17 @@ import {
 } from "@opendatalabs/personal-server-ts-core/lineage";
 import { createSyncCursor } from "./sync-cursor.js";
 import {
+  createGatewayDataPointFeed,
+  createGatewayDeleteDataPort,
   createSyncManager,
   type SyncManager,
 } from "@opendatalabs/personal-server-ts-core/sync";
-import { createVanaSyncStorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
+import type { DataPointFeedPort } from "@opendatalabs/personal-server-ts-core/ports";
+import {
+  createVanaSyncStorageAdapter,
+  resolveVanaStorageEndpoint,
+} from "@opendatalabs/personal-server-ts-core/storage/adapters";
+import { createFilePendingBlobDeletionStore } from "./pending-blob-deletions.js";
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
 import { generateDevToken } from "./dev-token.js";
@@ -79,6 +86,12 @@ export interface CreateServerOptions {
   dataDir?: string;
   ownerSignature?: `0x${string}`;
   gatewayClient?: GatewayClient;
+  /**
+   * Deletion-aware gateway feed (`includeDeleted=true` listings + tombstone
+   * lookups). Defaults to a REST feed on `config.gateway.url`; inject with a
+   * mock gateway in tests.
+   */
+  dataPointFeed?: DataPointFeedPort;
   readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
   /**
    * MCP OAuth approval page URL (or a lazy getter for it). When set, the MCP
@@ -128,6 +141,10 @@ export async function createServer(
   const indexPath = join(storageRoot, "index.db");
   const configPath = join(storageRoot, "config.json");
   const syncCursorPath = join(storageRoot, "sync-cursor.json");
+  const pendingBlobDeletionsPath = join(
+    storageRoot,
+    "pending-blob-deletions.json",
+  );
   const tokensPath = join(storageRoot, "tokens.json");
 
   await mkdir(storageRoot, { recursive: true });
@@ -273,6 +290,11 @@ export async function createServer(
 
   // --- Sync engine setup ---
   let syncManager: SyncManager | null = null;
+  // Deletion-aware registry view. Independent of sync: the data route uses
+  // it to answer 410 for scopes the owner deleted even when sync is off.
+  const dataPointFeed =
+    options?.dataPointFeed ??
+    createGatewayDataPointFeed({ gatewayUrl: config.gateway.url });
 
   if (
     config.sync.enabled &&
@@ -302,6 +324,7 @@ export async function createServer(
       serverOwner,
       logger,
       lineageGateway,
+      dataPointFeed,
     };
 
     const downloadDeps = {
@@ -312,9 +335,30 @@ export async function createServer(
       masterKey,
       serverOwner,
       logger,
+      dataPointFeed,
     };
 
+    // Durable deletion: gateway tombstone signed with the same server
+    // account + AddData signer uploads use, storage DELETE authorised with
+    // the same Web3Signed signer the storage provider uploads with.
+    const deleteData = createGatewayDeleteDataPort({
+      gatewayUrl: config.gateway.url,
+      dataPointFeed,
+      serverOwner,
+      signer: serverSigner,
+      storage: {
+        endpoint: resolveVanaStorageEndpoint(config),
+        chainId: config.gateway.chainId,
+        signMessage: (message) => serverAccount.signMessage(message),
+      },
+    });
+    const pendingBlobDeletions = createFilePendingBlobDeletionStore(
+      pendingBlobDeletionsPath,
+    );
+
     syncManager = createSyncManager(uploadDeps, downloadDeps, {
+      deleteData,
+      pendingBlobDeletions,
       async canSync() {
         try {
           const serverInfo = await gatewayClient.getServer(
@@ -405,6 +449,7 @@ export async function createServer(
     accessLogReader,
     readFulfillmentReporter: options?.readFulfillmentReporter,
     dataStorage,
+    dataPointFeed,
     cloudMode,
     devToken,
     ownerSignature: masterKeySignature,

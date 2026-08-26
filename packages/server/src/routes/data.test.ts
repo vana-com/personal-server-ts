@@ -1329,7 +1329,7 @@ describe("DELETE /v1/data/:scope", () => {
     await rm(dataDir, { recursive: true, force: true });
   });
 
-  it("returns 204 and removes files + index for existing scope", async () => {
+  it("returns 200 with a per-step result and removes files + index for existing scope", async () => {
     const app = createApp();
 
     // Ingest 2 versions
@@ -1340,9 +1340,21 @@ describe("DELETE /v1/data/:scope", () => {
     // Verify data exists
     expect(indexManager.countByScope("instagram.profile")).toBe(2);
 
-    // DELETE with owner auth
+    // DELETE with owner auth. No sync manager here, so the route deletes the
+    // local copy only and says so (durable: false) instead of pretending.
     const res = await deleteWithAuth(app, "instagram.profile");
-    expect(res.status).toBe(204);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      scope: "instagram.profile",
+      dataPointId: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+      durable: false,
+      steps: {
+        gateway: { status: "skipped", reason: "sync-disabled" },
+        storage: { status: "skipped", reason: "sync-disabled" },
+        local: { status: "ok", deletedCount: 2 },
+      },
+      pendingBlobDeletion: false,
+    });
 
     // Index should be empty
     expect(indexManager.countByScope("instagram.profile")).toBe(0);
@@ -1352,11 +1364,119 @@ describe("DELETE /v1/data/:scope", () => {
     await expect(readdir(scopeDir)).rejects.toThrow();
   });
 
-  it("returns 204 for nonexistent scope (idempotent)", async () => {
+  it("returns 200 for nonexistent scope (idempotent)", async () => {
     const app = createApp();
 
     const res = await deleteWithAuth(app, "instagram.profile");
-    expect(res.status).toBe(204);
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.steps.local).toEqual({ status: "ok", deletedCount: 0 });
+  });
+
+  it("runs the durable delete through the sync manager and writes a delete access-log entry", async () => {
+    const accessLogWriter = createMockAccessLogWriter();
+    const deleteScope = vi.fn(async (scope: string) => ({
+      scope,
+      dataPointId: "0xdp",
+      durable: true,
+      steps: {
+        gateway: {
+          status: "ok" as const,
+          version: "3",
+          deletedAt: "2026-08-25T10:00:00.000Z",
+        },
+        storage: { status: "ok" as const, blobsDeleted: 2 },
+        local: { status: "ok" as const, deletedCount: 2 },
+      },
+      pendingBlobDeletion: false,
+    }));
+    const app = createApp({
+      accessLogWriter,
+      syncManager: { deleteScope } as unknown as SyncManager,
+    });
+
+    const res = await deleteWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(200);
+    expect(deleteScope).toHaveBeenCalledWith("instagram.profile");
+    expect(await res.json()).toMatchObject({
+      durable: true,
+      steps: { gateway: { status: "ok", version: "3" } },
+    });
+    expect(accessLogWriter.write).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "delete",
+        scope: "instagram.profile",
+        grantId: "owner",
+        builder: deleteOwnerWallet.address,
+      }),
+    );
+  });
+
+  it("reports a storage failure after a gateway success instead of hiding it", async () => {
+    const app = createApp({
+      syncManager: {
+        deleteScope: vi.fn(async (scope: string) => ({
+          scope,
+          dataPointId: "0xdp",
+          durable: true,
+          steps: {
+            gateway: { status: "ok" as const, version: "3", deletedAt: null },
+            storage: {
+              status: "failed" as const,
+              error: "vana-storage delete failed: 502",
+            },
+            local: { status: "ok" as const, deletedCount: 1 },
+          },
+          pendingBlobDeletion: true,
+        })),
+      } as unknown as SyncManager,
+    });
+
+    const res = await deleteWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      durable: true,
+      pendingBlobDeletion: true,
+      steps: {
+        storage: {
+          status: "failed",
+          error: "vana-storage delete failed: 502",
+        },
+      },
+    });
+  });
+
+  it("returns 502 DELETE_TOMBSTONE_FAILED and keeps local data when the gateway tombstone fails", async () => {
+    const accessLogWriter = createMockAccessLogWriter();
+    const app = createApp({
+      accessLogWriter,
+      syncManager: {
+        deleteScope: vi.fn(async (scope: string) => ({
+          scope,
+          dataPointId: "0xdp",
+          durable: false,
+          steps: {
+            gateway: {
+              status: "failed" as const,
+              error: "Gateway error: 503 Service Unavailable",
+            },
+            storage: { status: "skipped" as const, reason: "gateway-failed" },
+            local: { status: "skipped" as const, reason: "gateway-failed" },
+          },
+          pendingBlobDeletion: false,
+        })),
+      } as unknown as SyncManager,
+    });
+
+    const res = await deleteWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(502);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("DELETE_TOMBSTONE_FAILED");
+    expect(json.error.details.result.steps.gateway.status).toBe("failed");
+    expect(accessLogWriter.write).not.toHaveBeenCalled();
   });
 
   it("returns 400 for invalid scope", async () => {
@@ -1392,7 +1512,7 @@ describe("DELETE /v1/data/:scope", () => {
 
     // DELETE with owner auth
     const deleteRes = await deleteWithAuth(app, "instagram.profile");
-    expect(deleteRes.status).toBe(204);
+    expect(deleteRes.status).toBe(200);
 
     // GET should be 404
     const uri = "/instagram.profile";
@@ -1409,6 +1529,50 @@ describe("DELETE /v1/data/:scope", () => {
     expect(getRes.status).toBe(404);
   });
 
+  it("answers 410 DATA_DELETED (not 404) for a scope the gateway reports as deleted", async () => {
+    const grant = makeGrant({ grantorAddress: deleteOwnerWallet.address });
+    const gateway = createMockGateway({
+      getGrant: vi.fn().mockResolvedValue(grant),
+    });
+    const getDataPoint = vi.fn(async () => ({
+      id: "0xdp",
+      ownerAddress: deleteOwnerWallet.address,
+      scope: "instagram.profile",
+      dataHash: "0x" + "11".repeat(32),
+      metadataHash: "0x" + "22".repeat(32),
+      expectedVersion: "4",
+      addedAt: "2026-08-25T10:00:00.000Z",
+      deletedAt: "2026-08-25T10:00:00.000Z",
+    }));
+    const app = createApp({
+      gateway,
+      dataPointFeed: { getDataPoint, listDataPointsByOwner: vi.fn() },
+    });
+
+    const header = await buildWeb3SignedHeader({
+      wallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: "/instagram.profile",
+      grantId: "grant-123",
+    });
+    const getRes = await app.request("/instagram.profile", {
+      headers: { Authorization: header },
+    });
+
+    expect(getRes.status).toBe(410);
+    const json = await getRes.json();
+    expect(json.error.errorCode).toBe("DATA_DELETED");
+    expect(json.error.details).toMatchObject({
+      scope: "instagram.profile",
+      deletedAt: "2026-08-25T10:00:00.000Z",
+    });
+    expect(getDataPoint).toHaveBeenCalledWith({
+      ownerAddress: deleteOwnerWallet.address,
+      scope: "instagram.profile",
+    });
+  });
+
   it("after DELETE, can re-create with POST", async () => {
     const app = createApp();
 
@@ -1416,7 +1580,7 @@ describe("DELETE /v1/data/:scope", () => {
     await ingestData("instagram.profile", { version: 1 }, app);
 
     const deleteRes = await deleteWithAuth(app, "instagram.profile");
-    expect(deleteRes.status).toBe(204);
+    expect(deleteRes.status).toBe(200);
 
     const res = await postWithOwnerAuth(
       app,

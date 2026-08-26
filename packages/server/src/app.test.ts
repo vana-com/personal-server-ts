@@ -278,7 +278,7 @@ describe("createApp", () => {
     expect(body.error.errorCode).toBe("NOT_OWNER");
   });
 
-  it("DELETE /v1/data/:scope with owner auth → 204", async () => {
+  it("DELETE /v1/data/:scope with owner auth -> 200 with per-step result", async () => {
     const app = makeApp();
     const auth = await buildWeb3SignedHeader({
       wallet: ownerWallet,
@@ -290,7 +290,11 @@ describe("createApp", () => {
       method: "DELETE",
       headers: { authorization: auth },
     });
-    expect(res.status).toBe(204);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      scope: "test.scope",
+      steps: { local: { status: "ok" } },
+    });
   });
 
   it("GET /v1/grants without auth → 401", async () => {

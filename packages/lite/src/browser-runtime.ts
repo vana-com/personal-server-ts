@@ -148,21 +148,23 @@ export async function createIndexedDbPsLiteRuntime(
     requestSigner: createRequestSigner(identity.account),
   });
   let syncManager = options.syncManager ?? null;
+  let dataPointFeed = options.dataPointFeed;
   if (!syncManager && config.sync.enabled) {
-    syncManager = (
-      await createPsLiteSyncManager({
-        config,
-        stateStore,
-        storage,
-        ownerSignature: options.ownerSignature,
-        ownerAddress: options.ownerAddress,
-        serverAccount: identity.account,
-        gateway,
-        diagnostics,
-        logger: options.logger,
-        lineageGateway,
-      })
-    ).syncManager;
+    const sync = await createPsLiteSyncManager({
+      config,
+      stateStore,
+      storage,
+      ownerSignature: options.ownerSignature,
+      ownerAddress: options.ownerAddress,
+      serverAccount: identity.account,
+      gateway,
+      dataPointFeed,
+      diagnostics,
+      logger: options.logger,
+      lineageGateway,
+    });
+    syncManager = sync.syncManager;
+    dataPointFeed = sync.dataPointFeed;
   }
   let runtimeRef: PsLiteRuntime | null = null;
   const auth =
@@ -194,6 +196,7 @@ export async function createIndexedDbPsLiteRuntime(
     serverOwner,
     serverSigner,
     syncManager,
+    dataPointFeed,
     diagnostics,
     lineageGateway,
     saveConfig: async (nextConfig) => {

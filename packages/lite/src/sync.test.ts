@@ -109,6 +109,12 @@ describe("PS Lite sync", () => {
       ownerSignature: OWNER_SIGNATURE,
       serverAccount: identity.account,
       gateway: gateway as never,
+      // The deletion-aware feed is a separate REST client; stub it so the
+      // single-shot fetch mock above only sees the storage upload.
+      dataPointFeed: {
+        getDataPoint: async () => null,
+        listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      },
     });
 
     await syncManager.trigger();
@@ -166,6 +172,12 @@ describe("PS Lite sync", () => {
       ownerSignature: OWNER_SIGNATURE,
       serverAccount: identity.account,
       gateway: gateway as never,
+      // The deletion-aware feed is a separate REST client; stub it so the
+      // single-shot fetch mock above only sees the storage upload.
+      dataPointFeed: {
+        getDataPoint: async () => null,
+        listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      },
       logger,
     });
 

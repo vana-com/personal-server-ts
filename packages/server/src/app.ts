@@ -47,6 +47,7 @@ import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
 import type {
+  DataPointFeedPort,
   DataStoragePort,
   RuntimeAvailabilityPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
@@ -82,6 +83,8 @@ export interface AppDeps {
   accessToken?: string;
   configPath?: string;
   syncManager?: SyncManager | null;
+  /** Deletion-aware gateway lookup; reads of a deleted scope answer 410. */
+  dataPointFeed?: DataPointFeedPort;
   serverSigner?: ServerSigner;
   tokenStore?: TokenStore;
   runtimeAvailability?: RuntimeAvailabilityPort;
@@ -174,6 +177,7 @@ export function createApp(deps: AppDeps): Hono {
       accessToken: deps.accessToken,
       tokenStore: deps.tokenStore,
       syncManager: deps.syncManager ?? null,
+      dataPointFeed: deps.dataPointFeed,
       runtimeAvailability: deps.runtimeAvailability,
       dataStorage: deps.dataStorage,
       // Powers the RECORD_DATA_ACCESS attestation embedded in X402 challenges.

@@ -611,7 +611,11 @@ describe("createPsLiteRuntime", () => {
         headers: { Authorization: "Bearer owner-token" },
       }),
     );
-    expect(deleted.status).toBe(204);
+    expect(deleted.status).toBe(200);
+    expect(await deleted.json()).toMatchObject({
+      durable: false,
+      steps: { local: { status: "ok", deletedCount: 1 } },
+    });
 
     const read = await runtime.fetch(
       new Request(

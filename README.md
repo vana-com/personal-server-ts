@@ -102,7 +102,7 @@ All authenticated endpoints use `Authorization: Web3Signed <base64url(json)>.<si
 | `/v1/data`                  | GET    | Builder         | List scopes            |
 | `/v1/data/{scope}`          | GET    | Builder + Grant | Read data              |
 | `/v1/data/{scope}/versions` | GET    | Builder         | List versions          |
-| `/v1/data/{scope}`          | DELETE | Owner           | Delete data            |
+| `/v1/data/{scope}`          | DELETE | Owner           | Delete data (durable)  |
 | `/v1/grants`                | GET    | Owner           | List grants            |
 | `/v1/grants/verify`         | POST   | None            | Verify grant signature |
 | `/v1/access-logs`           | GET    | Owner           | Access history         |
