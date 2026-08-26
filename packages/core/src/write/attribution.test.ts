@@ -612,6 +612,39 @@ describe("verifyStoredWriterAttribution with lineage", () => {
     ).rejects.toMatchObject({ reason: "LINEAGE_MISMATCH" });
   });
 
+  it("rejects a derivative record whose $lineage mirror was removed", async () => {
+    const data = await storedDerivativeRecord();
+    delete data[LINEAGE_KEY];
+    await expect(
+      verifyStoredWriterAttribution({ scope: SCOPE, data }),
+    ).rejects.toMatchObject({ reason: "LINEAGE_MISMATCH" });
+  });
+
+  it("rejects a $lineage mirror planted on a root record", async () => {
+    const body = { note: "root" };
+    const request = await buildWriteRequest({ body: JSON.stringify(body) });
+    const attribution = await verifyWriterAttribution({
+      request,
+      builderAddress: builderWallet.address,
+      grantId: GRANT_ID,
+      serverOrigin: SERVER_ORIGIN,
+    });
+    const data = JSON.parse(
+      JSON.stringify(
+        stampWriterAttribution(
+          stampLineage(body, {
+            sources: [SOURCE_ID],
+            writtenAt: "2026-08-31T09:12:44.000Z",
+          }),
+          attribution,
+        ),
+      ),
+    ) as Record<string, unknown>;
+    await expect(
+      verifyStoredWriterAttribution({ scope: SCOPE, data }),
+    ).rejects.toMatchObject({ reason: "LINEAGE_MISMATCH" });
+  });
+
   it("still rejects a record whose signed lineage field was altered", async () => {
     const data = await storedDerivativeRecord();
     data.lineage = [`0x${"cd".repeat(32)}`];

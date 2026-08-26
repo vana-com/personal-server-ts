@@ -475,31 +475,30 @@ export async function verifyStoredWriterAttribution(
   }
   // The stripped mirror is not unauthenticated for that: it must restate
   // the builder-signed `lineage` field (body top level, or the binary
-  // record's metadata object), so a `$lineage` edited after the write is
-  // caught even though it is outside the hashed bytes.
-  if (storedLineage !== undefined) {
-    const signedField = extractLineageField(
-      isBinaryEnvelope({ data: payloadData })
-        ? payloadData.metadata
-        : payloadData,
+  // record's metadata object) in both directions, so a `$lineage` edited
+  // after the write, or one removed to hide a derivative's sources, is
+  // caught even though it is outside the hashed bytes. An empty or absent
+  // signed field is a root record and has no mirror.
+  const signedField = extractLineageField(
+    isBinaryEnvelope({ data: payloadData })
+      ? payloadData.metadata
+      : payloadData,
+  );
+  const signed = Array.isArray(signedField)
+    ? signedField.map((id) => (typeof id === "string" ? id.toLowerCase() : id))
+    : [];
+  const mirror = storedLineage === undefined ? null : readStoredLineage(data);
+  const consistent =
+    signed.length === 0
+      ? storedLineage === undefined
+      : mirror !== null &&
+        signed.length === mirror.sources.length &&
+        signed.every((id, i) => id === mirror.sources[i]);
+  if (!consistent) {
+    throw new WriterAttributionVerificationError(
+      "LINEAGE_MISMATCH",
+      "Stored $lineage does not restate the builder-signed lineage field",
     );
-    const mirror = readStoredLineage(data);
-    const signed = Array.isArray(signedField)
-      ? signedField.map((id) =>
-          typeof id === "string" ? id.toLowerCase() : id,
-        )
-      : null;
-    if (
-      !mirror ||
-      !signed ||
-      signed.length !== mirror.sources.length ||
-      signed.some((id, i) => id !== mirror.sources[i])
-    ) {
-      throw new WriterAttributionVerificationError(
-        "LINEAGE_MISMATCH",
-        "Stored $lineage does not restate the builder-signed lineage field",
-      );
-    }
   }
   return {
     builder: attribution.builder,
