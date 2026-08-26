@@ -98,6 +98,11 @@ export function createSyncManager(
     pendingBlobDeletions:
       uploadDeps.pendingBlobDeletions ?? options?.pendingBlobDeletions,
   };
+  const workerDownloadDeps: DownloadWorkerDeps = {
+    ...downloadDeps,
+    pendingBlobDeletions:
+      downloadDeps.pendingBlobDeletions ?? options?.pendingBlobDeletions,
+  };
 
   // Sync cycles and durable deletes mutate the same local index and the same
   // registry rows. Run them one at a time (FIFO): a delete cannot start while
@@ -137,6 +142,7 @@ export function createSyncManager(
             pendingBlobDeletions: options?.pendingBlobDeletions,
             dataPointFeed,
             serverOwner: uploadDeps.serverOwner,
+            storage: uploadDeps.storage,
             logger: uploadDeps.logger,
           });
         } catch (err) {
@@ -180,7 +186,7 @@ export function createSyncManager(
         try {
           // Download new remote files
           const fullReconcile = needsFullReconcile;
-          const downloadResults = await downloadAll(downloadDeps, {
+          const downloadResults = await downloadAll(workerDownloadDeps, {
             fullReconcile,
             retryMemory: downloadRetryMemory,
           });

@@ -116,7 +116,7 @@ export class DeletedScopeEntryError extends Error {
  * landed between the deletion guard and the registration), that exact blob
  * is deleted too, so abandoning the entry never leaves owner-decryptable
  * deleted data in storage. If the delete fails the scope is queued for the
- * guarded scope-wide cleanup the sync cycle retries.
+ * exact-key cleanup the sync cycle retries.
  */
 async function dropIfCoveredByDeletion(
   deps: Pick<
@@ -136,7 +136,9 @@ async function dropIfCoveredByDeletion(
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (deps.pendingBlobDeletions) {
-        await deps.pendingBlobDeletions.add(entry.scope);
+        await deps.pendingBlobDeletions.add([
+          { scope: entry.scope, version: String(entry.version) },
+        ]);
       }
       deps.logger.warn(
         {

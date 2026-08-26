@@ -12,6 +12,8 @@ import type {
   DataPointFeedPort,
   DataPointFeedRecord,
   DataStoragePort,
+  PendingBlobDeletion,
+  PendingBlobDeletionStore,
 } from "../../ports/index.js";
 import { feedFromGatewayClient } from "../data-point-feed.js";
 import {
@@ -75,6 +77,13 @@ export interface DownloadWorkerDeps {
    * reads can refuse tombstoned scopes without their own gateway lookups.
    */
   scopeDeletions?: ScopeDeletionTracker;
+  /**
+   * Exact-key cleanup queue. An unsynced local entry a tombstone covers may
+   * have had its ciphertext uploaded under a version key the registry never
+   * recorded (crashed before registering); reconciling drops the entry and
+   * queues that exact key so the sync cycle's rate-limited pass removes it.
+   */
+  pendingBlobDeletions?: PendingBlobDeletionStore;
 }
 
 export interface DeletionReconcileResult {
@@ -517,11 +526,18 @@ export async function downloadAll(
  * tombstone version). See `isEntryCoveredByTombstone`.
  */
 export async function reconcileDeletedDataPoint(
-  deps: Pick<DownloadWorkerDeps, "storage" | "logger">,
+  deps: Pick<DownloadWorkerDeps, "storage" | "logger" | "pendingBlobDeletions">,
   record: Pick<DataPointFeedRecord, "id" | "scope" | "expectedVersion">,
   deletedAt: string,
 ): Promise<DeletionReconcileResult> {
   const tombstone = { version: tombstoneVersion(record) };
+  const tombstoned =
+    tombstone.version === null ? null : BigInt(tombstone.version);
+  // Unsynced covered entries above the tombstone version: the deleting
+  // replica's exact-key pass only enumerates registry versions, so any
+  // ciphertext this replica uploaded under a higher, never-registered key is
+  // ours to clean up.
+  const orphanKeys: PendingBlobDeletion[] = [];
   const { storage, logger } = deps;
   const PAGE_SIZE = 500;
   const stale: Array<{ scope: string; collectedAt: string }> = [];
@@ -534,6 +550,15 @@ export async function reconcileDeletedDataPoint(
     for (const entry of entries) {
       if (isEntryCoveredByTombstone(entry, tombstone)) {
         stale.push({ scope: entry.scope, collectedAt: entry.collectedAt });
+        if (
+          entry.dataPointId === null &&
+          (tombstoned === null || BigInt(entry.version) > tombstoned)
+        ) {
+          orphanKeys.push({
+            scope: entry.scope,
+            version: String(entry.version),
+          });
+        }
       } else {
         kept += 1;
       }
@@ -546,6 +571,9 @@ export async function reconcileDeletedDataPoint(
     if (await storage.deleteVersion(version.scope, version.collectedAt)) {
       removed += 1;
     }
+  }
+  if (orphanKeys.length > 0 && deps.pendingBlobDeletions) {
+    await deps.pendingBlobDeletions.add(orphanKeys);
   }
 
   if (removed > 0 || kept > 0) {

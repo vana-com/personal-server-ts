@@ -7,7 +7,11 @@ import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../../signing/signer.js";
 import type { SyncCursor } from "../cursor.js";
 import type { Logger } from "../../logger/index.js";
-import type { DataStoragePort } from "../../ports/index.js";
+import type {
+  DataStoragePort,
+  PendingBlobDeletion,
+} from "../../ports/index.js";
+import { createMemoryPendingBlobDeletionStore } from "../pending-blob-deletions.js";
 
 // Mock workers so we control their behavior
 vi.mock("../workers/upload.js", () => ({
@@ -323,20 +327,31 @@ describe("SyncManager", () => {
           version: "2",
           deletedAt: "2026-08-25T10:00:00.000Z",
         })),
-        deleteBlobs: vi.fn(async () => ({ blobsDeleted: 1 })),
+        deleteBlobVersions: vi.fn(
+          async (_scope: string, versions: string[]) => ({
+            deleted: versions,
+            missing: [],
+            failed: [],
+          }),
+        ),
       };
     }
 
-    function makePending(initial: string[] = []) {
-      const scopes = [...initial];
+    function makePending(initial: PendingBlobDeletion[] = []) {
+      const store = createMemoryPendingBlobDeletionStore();
+      const ready = store.add(initial);
       return {
-        list: vi.fn(async () => [...scopes]),
-        add: vi.fn(async (scope: string) => {
-          if (!scopes.includes(scope)) scopes.push(scope);
+        list: vi.fn(async () => {
+          await ready;
+          return store.list();
         }),
-        remove: vi.fn(async (scope: string) => {
-          const i = scopes.indexOf(scope);
-          if (i >= 0) scopes.splice(i, 1);
+        add: vi.fn(async (keys: PendingBlobDeletion[]) => {
+          await ready;
+          return store.add(keys);
+        }),
+        remove: vi.fn(async (keys: PendingBlobDeletion[]) => {
+          await ready;
+          return store.remove(keys);
         }),
       };
     }
@@ -344,6 +359,7 @@ describe("SyncManager", () => {
     it("deleteScope() runs tombstone -> blobs -> local through the wired ports", async () => {
       const uploadDeps = makeMockUploadDeps();
       uploadDeps.storage.deleteScope = vi.fn(async () => 2);
+      uploadDeps.storage.listVersions = vi.fn(() => []);
       const deleteData = makeDeleteData();
       const manager = createSyncManager(uploadDeps, makeMockDownloadDeps(), {
         deleteData,
@@ -353,7 +369,10 @@ describe("SyncManager", () => {
       const result = await manager.deleteScope("instagram.profile");
 
       expect(deleteData.tombstone).toHaveBeenCalledWith("instagram.profile");
-      expect(deleteData.deleteBlobs).toHaveBeenCalledWith("instagram.profile");
+      expect(deleteData.deleteBlobVersions).toHaveBeenCalledWith(
+        "instagram.profile",
+        ["1", "2"],
+      );
       expect(uploadDeps.storage.deleteScope).toHaveBeenCalledWith(
         "instagram.profile",
       );
@@ -364,6 +383,7 @@ describe("SyncManager", () => {
     it("deleteScope() is local-only when no delete port is wired", async () => {
       const uploadDeps = makeMockUploadDeps();
       uploadDeps.storage.deleteScope = vi.fn(async () => 1);
+      uploadDeps.storage.listVersions = vi.fn(() => []);
       const manager = createSyncManager(uploadDeps, makeMockDownloadDeps());
 
       const result = await manager.deleteScope("instagram.profile");
@@ -377,7 +397,9 @@ describe("SyncManager", () => {
 
     it("retries pending blob deletions at the start of every cycle", async () => {
       const deleteData = makeDeleteData();
-      const pending = makePending(["chatgpt.conversations"]);
+      const pending = makePending([
+        { scope: "chatgpt.conversations", version: "3" },
+      ]);
       const manager = createSyncManager(
         makeMockUploadDeps(),
         makeMockDownloadDeps(),
@@ -386,10 +408,13 @@ describe("SyncManager", () => {
 
       await manager.trigger();
 
-      expect(deleteData.deleteBlobs).toHaveBeenCalledWith(
+      expect(deleteData.deleteBlobVersions).toHaveBeenCalledWith(
         "chatgpt.conversations",
+        ["3"],
       );
-      expect(pending.remove).toHaveBeenCalledWith("chatgpt.conversations");
+      expect(pending.remove).toHaveBeenCalledWith([
+        { scope: "chatgpt.conversations", version: "3" },
+      ]);
       expect(uploadAll).toHaveBeenCalledTimes(1);
       // The upload worker shares the marker store for its own guarded cleanup.
       expect(uploadAll).toHaveBeenCalledWith(
@@ -398,9 +423,11 @@ describe("SyncManager", () => {
       );
     });
 
-    it("hands the retry the deletion-aware feed so a re-added scope is not wiped", async () => {
+    it("hands the retry the deletion-aware feed so an unexpanded marker of a re-added scope is dropped", async () => {
       const deleteData = makeDeleteData();
-      const pending = makePending(["chatgpt.conversations"]);
+      const pending = makePending([
+        { scope: "chatgpt.conversations", version: null },
+      ]);
       const getDataPoint = vi.fn(async () => ({
         id: "0xdp",
         ownerAddress: "0xAbCdEf1234567890AbCdEf1234567890AbCdEf12",
@@ -427,13 +454,16 @@ describe("SyncManager", () => {
         ownerAddress: "0xAbCdEf1234567890AbCdEf1234567890AbCdEf12",
         scope: "chatgpt.conversations",
       });
-      expect(deleteData.deleteBlobs).not.toHaveBeenCalled();
-      expect(pending.remove).toHaveBeenCalledWith("chatgpt.conversations");
+      expect(deleteData.deleteBlobVersions).not.toHaveBeenCalled();
+      expect(pending.remove).toHaveBeenCalledWith([
+        { scope: "chatgpt.conversations", version: null },
+      ]);
     });
 
     it("does not start a delete while a sync cycle is mid-upload", async () => {
       const uploadDeps = makeMockUploadDeps();
       uploadDeps.storage.deleteScope = vi.fn(async () => 1);
+      uploadDeps.storage.listVersions = vi.fn(() => []);
       const deleteData = makeDeleteData();
       let releaseUpload!: () => void;
       const uploadStarted = new Promise<void>((started) => {
@@ -468,6 +498,7 @@ describe("SyncManager", () => {
     it("does not start a sync cycle while a delete is in flight", async () => {
       const uploadDeps = makeMockUploadDeps();
       uploadDeps.storage.deleteScope = vi.fn(async () => 1);
+      uploadDeps.storage.listVersions = vi.fn(() => []);
       let releaseTombstone!: () => void;
       const deleteData = makeDeleteData();
       const tombstoneStarted = new Promise<void>((started) => {
@@ -513,6 +544,7 @@ describe("SyncManager", () => {
       uploadDeps.storage.deleteScope = vi.fn(async () => {
         throw new Error("index locked");
       });
+      uploadDeps.storage.listVersions = vi.fn(() => []);
       const deleteData = makeDeleteData();
       const manager = createSyncManager(uploadDeps, makeMockDownloadDeps(), {
         deleteData,

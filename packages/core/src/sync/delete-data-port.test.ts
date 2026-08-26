@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
-import { verifyMessage } from "viem";
 
 import { createGatewayDeleteDataPort } from "./delete-data-port.js";
 import { computeDataPointId } from "./data-point-id.js";
@@ -226,72 +225,123 @@ describe("createGatewayDeleteDataPort.tombstone", () => {
   });
 });
 
-describe("createGatewayDeleteDataPort.deleteBlobs", () => {
-  it("sends a Web3Signed DELETE to the chain-scoped owner/scope blob prefix", async () => {
-    const fetchImpl = vi.fn(async () => jsonResponse(200, { deleted: 3 }));
+describe("createGatewayDeleteDataPort.deleteBlobVersions", () => {
+  it("sends one Web3Signed DELETE per exact version key, never the scope prefix", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse(200, { deleted: true }));
     const { port } = makePort(
       liveRecord(),
       fetchImpl as unknown as typeof fetch,
     );
 
-    const outcome = await port.deleteBlobs("chatgpt.conversations");
+    const outcome = await port.deleteBlobVersions("chatgpt.conversations", [
+      "1",
+      "2",
+    ]);
 
-    expect(outcome).toEqual({ blobsDeleted: 3 });
-    const [url, init] = fetchImpl.mock.calls[0] as unknown as [
-      string,
-      RequestInit,
-    ];
-    const expectedPath = `/v1/chains/${CHAIN_ID}/blobs/${OWNER.toLowerCase()}/chatgpt.conversations`;
-    expect(url).toBe(`${STORAGE}${expectedPath}`);
-    expect(init.method).toBe("DELETE");
-    expect(init.body).toBeUndefined();
+    expect(outcome).toEqual({ deleted: ["1", "2"], missing: [], failed: [] });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    const calls = fetchImpl.mock.calls as unknown as [string, RequestInit][];
+    const prefix = `/v1/chains/${CHAIN_ID}/blobs/${OWNER.toLowerCase()}/chatgpt.conversations`;
+    expect(calls.map(([url]) => url)).toEqual([
+      `${STORAGE}${prefix}/1`,
+      `${STORAGE}${prefix}/2`,
+    ]);
+    for (const [, init] of calls) {
+      expect(init.method).toBe("DELETE");
+      expect(init.body).toBeUndefined();
+    }
 
     // The header is the SDK's Web3Signed shape, signed by the server
-    // account over (aud = storage origin, method DELETE, uri = path,
-    // empty-body hash).
-    const header = (init.headers as Record<string, string>).authorization;
+    // account over (aud = storage origin, method DELETE, uri = the exact
+    // blob path, empty-body hash).
+    const header = (calls[0][1].headers as Record<string, string>)
+      .authorization;
     expect(header.startsWith("Web3Signed ")).toBe(true);
-    const [payloadB64, signature] = header
-      .slice("Web3Signed ".length)
-      .split(".");
+    const [payloadB64] = header.slice("Web3Signed ".length).split(".");
     const payload = JSON.parse(
       Buffer.from(payloadB64, "base64url").toString("utf8"),
     );
     expect(payload).toMatchObject({
       aud: STORAGE,
       method: "DELETE",
-      uri: expectedPath,
+      uri: `${prefix}/1`,
       bodyHash:
         "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     });
     expect(payload.exp - payload.iat).toBe(300);
-    expect(
-      await verifyMessage({
-        address: serverAccount.address,
-        message: payloadB64,
-        signature: signature as `0x${string}`,
-      }),
-    ).toBe(true);
   });
 
-  it("treats 404 as nothing-to-delete and fails loudly on other statuses", async () => {
-    const notFound = vi.fn(async () => new Response(null, { status: 404 }));
-    const { port: p1 } = makePort(
+  it("URI-encodes the scope and version segments the way the storage provider does", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse(200, { deleted: true }));
+    const { port } = makePort(
       liveRecord(),
-      notFound as unknown as typeof fetch,
+      fetchImpl as unknown as typeof fetch,
     );
-    expect(await p1.deleteBlobs(SCOPE)).toEqual({ blobsDeleted: 0 });
 
-    const boom = vi.fn(
-      async () =>
-        new Response(null, { status: 502, statusText: "Bad Gateway" }),
-    );
-    const { port: p2 } = makePort(
+    await port.deleteBlobVersions("weird scope/with slash", ["3"]);
+
+    const [url] = fetchImpl.mock.calls[0] as unknown as [string];
+    expect(url.endsWith("/weird%20scope%2Fwith%20slash/3")).toBe(true);
+  });
+
+  it("treats 404 as already gone, reports other statuses per key and keeps going", async () => {
+    const statuses: Record<string, number> = { "1": 404, "2": 502, "3": 200 };
+    const fetchImpl = vi.fn(async (url: string) => {
+      const version = url.slice(url.lastIndexOf("/") + 1);
+      const status = statuses[version];
+      return status === 200
+        ? jsonResponse(200, { deleted: true })
+        : new Response(null, {
+            status,
+            statusText: status === 404 ? "Not Found" : "Bad Gateway",
+          });
+    });
+    const { port } = makePort(
       liveRecord(),
-      boom as unknown as typeof fetch,
+      fetchImpl as unknown as typeof fetch,
     );
-    await expect(p2.deleteBlobs(SCOPE)).rejects.toThrow(
-      "vana-storage delete failed: 502 Bad Gateway",
+
+    const outcome = await port.deleteBlobVersions(SCOPE, ["1", "2", "3"]);
+
+    expect(outcome).toEqual({
+      deleted: ["3"],
+      missing: ["1"],
+      failed: [
+        { version: "2", error: "vana-storage delete failed: 502 Bad Gateway" },
+      ],
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it("reports a network error per key instead of throwing", async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error("ECONNRESET");
+    });
+    const { port } = makePort(
+      liveRecord(),
+      fetchImpl as unknown as typeof fetch,
     );
+
+    const outcome = await port.deleteBlobVersions(SCOPE, ["1"]);
+
+    expect(outcome).toEqual({
+      deleted: [],
+      missing: [],
+      failed: [{ version: "1", error: "ECONNRESET" }],
+    });
+  });
+
+  it("sends nothing for an empty key list", async () => {
+    const fetchImpl = vi.fn();
+    const { port } = makePort(
+      liveRecord(),
+      fetchImpl as unknown as typeof fetch,
+    );
+    expect(await port.deleteBlobVersions(SCOPE, [])).toEqual({
+      deleted: [],
+      missing: [],
+      failed: [],
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });

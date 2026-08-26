@@ -989,7 +989,9 @@ describe("upload worker", () => {
         name: "DeletedScopeEntryError",
       });
 
-      expect(pendingBlobDeletions.add).toHaveBeenCalledWith(SCOPE);
+      expect(pendingBlobDeletions.add).toHaveBeenCalledWith([
+        { scope: SCOPE, version: "1" },
+      ]);
       expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
         SCOPE,
         COLLECTED_AT,

@@ -243,32 +243,55 @@ export type TombstoneOutcome =
       dataPointId: string;
     };
 
-export interface DeleteBlobsOutcome {
-  /** Blob count reported by storage, or null when the backend does not say. */
-  blobsDeleted: number | null;
+export interface DeleteBlobVersionsOutcome {
+  /** Versions whose blob existed and was deleted. */
+  deleted: string[];
+  /** Versions with no blob in storage (404): nothing to do, counts as done. */
+  missing: string[];
+  /** Versions whose delete failed (rate limit, 5xx, network); retry later. */
+  failed: Array<{ version: string; error: string }>;
 }
 
 /**
  * Remote side of durable deletion. `tombstone` is the durable fact (an
  * owner-signed AddData with the tombstone commitments, recorded by the
- * gateway); `deleteBlobs` removes every version's ciphertext from storage.
- * Callers MUST run tombstone first: a blob delete without a tombstone leaves
- * a live registry row every replica would 404 on and then wedge.
+ * gateway); `deleteBlobVersions` removes the ciphertext of exactly the given
+ * versions, one exact-key delete per version, never a scope-wide prefix: a
+ * re-add registered after the tombstone lives under a higher version key and
+ * is untouched by construction. Callers MUST run tombstone first: a blob
+ * delete without a tombstone leaves a live registry row every replica would
+ * 404 on and then wedge.
  */
 export interface DeleteDataPort {
   tombstone(scope: string): Promise<TombstoneOutcome>;
-  deleteBlobs(scope: string): Promise<DeleteBlobsOutcome>;
+  deleteBlobVersions(
+    scope: string,
+    versions: string[],
+  ): Promise<DeleteBlobVersionsOutcome>;
 }
 
 /**
- * Durable retry marker for blob deletion that failed AFTER the gateway
- * tombstone landed. The tombstone already makes the deletion stick; this
- * only exists so a later sync cycle finishes removing the ciphertext.
+ * One blob still to delete after a tombstone landed: the exact
+ * (scope, version) key. `version: null` is the degenerate case where the
+ * gateway did not report the tombstone's version, so the key set could not
+ * be enumerated yet; the retry expands it into exact keys once it can.
+ */
+export interface PendingBlobDeletion {
+  scope: string;
+  version: string | null;
+}
+
+/**
+ * Durable retry marker for blob deletions that could not complete AFTER the
+ * gateway tombstone landed (storage failure, rate limit, or a batch larger
+ * than one pass may send). The tombstone already makes the deletion stick;
+ * this only exists so later sync cycles finish removing the ciphertext, key
+ * by key.
  */
 export interface PendingBlobDeletionStore {
-  list(): Promise<string[]>;
-  add(scope: string): Promise<void>;
-  remove(scope: string): Promise<void>;
+  list(): Promise<PendingBlobDeletion[]>;
+  add(keys: PendingBlobDeletion[]): Promise<void>;
+  remove(keys: PendingBlobDeletion[]): Promise<void>;
 }
 
 // FeeVerifier was the pre-X402 hook that gated reads on grant.paymentStatus

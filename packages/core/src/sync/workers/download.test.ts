@@ -664,6 +664,40 @@ describe("download worker", () => {
       expect(deps.cursor.write).toHaveBeenCalledWith("next");
     });
 
+    it("queues the exact key of a dropped unsynced entry above the tombstone version for cleanup", async () => {
+      // This replica may have uploaded version 9 before registering it (or
+      // crashed in between); the deleting replica only enumerates registry
+      // versions up to the tombstone, so this key is ours to clean up.
+      const deps = withLocalVersions(makeMockDeps(), [
+        syncedEntry({ id: 1, version: 1 }),
+        syncedEntry({ id: 2, version: 9, dataPointId: null }),
+      ]);
+      const pendingBlobDeletions = {
+        list: vi.fn(async () => []),
+        add: vi.fn(async () => undefined),
+        remove: vi.fn(async () => undefined),
+      };
+      deps.pendingBlobDeletions = pendingBlobDeletions;
+      (
+        deps.gateway.listDataPointsByOwner as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        dataPoints: [
+          {
+            ...makeDataPointRecord({ expectedVersion: "2" }),
+            deletedAt: DELETED_AT,
+          },
+        ],
+        cursor: null,
+      });
+
+      await downloadAll(deps);
+
+      expect(deps.storage.deleteVersion).toHaveBeenCalledTimes(2);
+      expect(pendingBlobDeletions.add).toHaveBeenCalledWith([
+        { scope: SCOPE, version: "9" },
+      ]);
+    });
+
     it("feeds the read-side deletion memory from every listed row and marks a complete pass", async () => {
       const deps = withLocalVersions(makeMockDeps(), []);
       // The live row is already indexed, so no download is attempted for it.

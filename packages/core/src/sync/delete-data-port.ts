@@ -1,7 +1,7 @@
 import { buildWeb3SignedHeader } from "@opendatalabs/vana-sdk/browser";
 import type {
   DataPointFeedPort,
-  DeleteBlobsOutcome,
+  DeleteBlobVersionsOutcome,
   DeleteDataPort,
   TombstoneOutcome,
 } from "../ports/index.js";
@@ -50,9 +50,12 @@ export interface GatewayDeleteDataPortOptions {
  *   { ownerAddress, scope, dataHash: TOMBSTONE_DATA_HASH,
  *     metadataHash: TOMBSTONE_METADATA_HASH, expectedVersion: current + 1 }
  *
- * Storage (every version's ciphertext):
- *   DELETE {storage}/v1/chains/{chainId}/blobs/{owner}/{scope}
+ * Storage (one exact blob per version, never the scope prefix):
+ *   DELETE {storage}/v1/chains/{chainId}/blobs/{owner}/{scope}/{version}
  *   authorization: Web3Signed (aud = storage endpoint, uri = that path)
+ * The path is the one the SDK's vana-storage provider uploads to: lowercased
+ * owner, every key segment URI-encoded; vana-storage resolves a three-segment
+ * path as a single-object delete and answers 404 when the object is absent.
  */
 export function createGatewayDeleteDataPort(
   options: GatewayDeleteDataPortOptions,
@@ -61,7 +64,7 @@ export function createGatewayDeleteDataPort(
   const storageBase = options.storage.endpoint.replace(/\/+$/, "");
   const fetchImpl = options.fetch ?? globalThis.fetch;
   // The storage provider lowercases the owner in blob paths; match it or the
-  // DELETE prefix would not cover the blobs PUT wrote.
+  // exact DELETE keys would not be the ones PUT wrote.
   const owner = options.serverOwner.toLowerCase() as `0x${string}`;
 
   async function sendTombstone(
@@ -179,28 +182,50 @@ export function createGatewayDeleteDataPort(
       };
     },
 
-    async deleteBlobs(scope: string): Promise<DeleteBlobsOutcome> {
-      const path = `/v1/chains/${options.storage.chainId}/blobs/${owner}/${encodeURIComponent(scope)}`;
-      const authorization = await buildWeb3SignedHeader({
-        signMessage: (message: string) => options.storage.signMessage(message),
-        aud: storageBase,
-        method: "DELETE",
-        uri: path,
-      });
-      const res = await fetchImpl(`${storageBase}${path}`, {
-        method: "DELETE",
-        headers: { authorization },
-      });
-      // Idempotent: nothing stored under the prefix is a completed delete.
-      if (res.status === 404) return { blobsDeleted: 0 };
-      if (!res.ok) {
-        throw new Error(
-          `vana-storage delete failed: ${res.status} ${res.statusText}`,
-        );
+    async deleteBlobVersions(
+      scope: string,
+      versions: string[],
+    ): Promise<DeleteBlobVersionsOutcome> {
+      const outcome: DeleteBlobVersionsOutcome = {
+        deleted: [],
+        missing: [],
+        failed: [],
+      };
+      // Sequential on purpose: vana-storage rate-limits DELETE per owner
+      // and the caller already bounds the batch size per pass.
+      for (const version of versions) {
+        const path = `/v1/chains/${options.storage.chainId}/blobs/${owner}/${encodeURIComponent(scope)}/${encodeURIComponent(version)}`;
+        try {
+          const authorization = await buildWeb3SignedHeader({
+            signMessage: (message: string) =>
+              options.storage.signMessage(message),
+            aud: storageBase,
+            method: "DELETE",
+            uri: path,
+          });
+          const res = await fetchImpl(`${storageBase}${path}`, {
+            method: "DELETE",
+            headers: { authorization },
+          });
+          if (res.status === 404) {
+            // Idempotent: an absent object is a completed delete.
+            outcome.missing.push(version);
+          } else if (res.ok) {
+            outcome.deleted.push(version);
+          } else {
+            outcome.failed.push({
+              version,
+              error: `vana-storage delete failed: ${res.status} ${res.statusText}`,
+            });
+          }
+        } catch (err) {
+          outcome.failed.push({
+            version,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
       }
-      const body = await res.json().catch(() => null);
-      const row = unwrap(body);
-      return { blobsDeleted: numberField(row, "deleted") };
+      return outcome;
     },
   };
 }
@@ -250,12 +275,4 @@ function stringField(
 ): string | null {
   const value = record?.[key];
   return typeof value === "string" ? value : null;
-}
-
-function numberField(
-  record: Record<string, unknown> | null,
-  key: string,
-): number | null {
-  const value = record?.[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }

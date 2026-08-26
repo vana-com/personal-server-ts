@@ -202,20 +202,31 @@ describe("PS Lite pending blob deletion store", () => {
   it("does not lose markers when a delete and a retry mutate the state key concurrently", async () => {
     const stateStore = createMemoryPsLiteStateStore();
     const store = createPsLitePendingBlobDeletionStore(stateStore);
-    await store.add("retrying.scope");
+    const retrying = { scope: "retrying.scope", version: "3" };
+    const first = { scope: "first.scope", version: "1" };
+    const second = { scope: "second.scope", version: "1" };
+    await store.add([retrying]);
 
     await Promise.all([
-      store.remove("retrying.scope"),
-      store.add("first.scope"),
-      store.add("second.scope"),
-      store.add("first.scope"),
+      store.remove([retrying]),
+      store.add([first]),
+      store.add([second]),
+      store.add([first]),
     ]);
 
-    expect(await store.list()).toEqual(["first.scope", "second.scope"]);
+    expect(await store.list()).toEqual([first, second]);
     // Survives a fresh store over the same state.
     expect(
       await createPsLitePendingBlobDeletionStore(stateStore).list(),
-    ).toEqual(["first.scope", "second.scope"]);
+    ).toEqual([first, second]);
+
+    // The pre-key state shape (whole scopes) reads as version-less markers.
+    await stateStore.set("pending-blob-deletions-v1", {
+      scopes: ["legacy.scope"],
+    });
+    expect(
+      await createPsLitePendingBlobDeletionStore(stateStore).list(),
+    ).toEqual([{ scope: "legacy.scope", version: null }]);
   });
 });
 

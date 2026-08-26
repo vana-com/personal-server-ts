@@ -21,7 +21,9 @@ export type {
   DownloadWorkerDeps,
 } from "./workers/download.js";
 export {
+  BLOB_DELETE_BATCH_SIZE,
   deleteScope,
+  planBlobDeletions,
   retryPendingBlobDeletions,
   type DeleteScopeDeps,
   type DeleteScopeResult,
@@ -41,6 +43,7 @@ export {
 export {
   createMemoryPendingBlobDeletionStore,
   createPendingBlobDeletionStore,
+  normalizePendingBlobDeletions,
   type PendingBlobDeletionKv,
 } from "./pending-blob-deletions.js";
 export { computeDataPointId } from "./data-point-id.js";

@@ -10,10 +10,12 @@ import {
   createGatewayDeleteDataPort,
   createPendingBlobDeletionStore,
   createScopeDeletionTracker,
+  normalizePendingBlobDeletions,
   type ScopeDeletionTracker,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type {
   DataPointFeedPort,
+  PendingBlobDeletion,
   PendingBlobDeletionStore,
 } from "@opendatalabs/personal-server-ts-core/ports";
 import {
@@ -37,7 +39,9 @@ const SYNC_CURSOR_KEY = "sync-cursor-v1";
 const PENDING_BLOB_DELETIONS_KEY = "pending-blob-deletions-v1";
 
 interface PsLitePendingBlobDeletionsState {
-  scopes: string[];
+  /** Exact (scope, version) keys; `scopes` is the pre-key format. */
+  keys?: PendingBlobDeletion[];
+  scopes?: string[];
 }
 
 interface PsLiteSyncCursorState {
@@ -116,12 +120,13 @@ export function createPsLitePendingBlobDeletionStore(
       const state = await stateStore.get<PsLitePendingBlobDeletionsState>(
         PENDING_BLOB_DELETIONS_KEY,
       );
-      return state?.scopes ?? null;
+      if (!state) return null;
+      return normalizePendingBlobDeletions(state.keys ?? state.scopes);
     },
-    async write(scopes) {
+    async write(keys) {
       await stateStore.set<PsLitePendingBlobDeletionsState>(
         PENDING_BLOB_DELETIONS_KEY,
-        { scopes },
+        { keys },
       );
     },
   });
