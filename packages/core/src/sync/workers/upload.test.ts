@@ -849,6 +849,79 @@ describe("upload worker", () => {
       expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
     });
 
+    it("drops the entry when a 409 reveals a tombstone that landed after the guard ran", async () => {
+      // Step 1b saw a live row; another replica deleted the scope before
+      // this worker registered. The 409 path must apply the same rule
+      // instead of rebasing past the tombstone (which would resurrect it).
+      const deps = withFeed(makeMockDeps(), {
+        deletedAt: null,
+        expectedVersion: "1",
+      });
+      const tombstoned = {
+        id: DATA_POINT_ID,
+        ownerAddress: OWNER,
+        scope: SCOPE,
+        dataHash: "0x" + "33".repeat(32),
+        metadataHash: "0x" + "44".repeat(32),
+        expectedVersion: "2",
+        addedAt: DELETED_AT,
+        deletedAt: DELETED_AT,
+      };
+      const feed = deps.dataPointFeed!.getDataPoint as ReturnType<typeof vi.fn>;
+      const live = await feed({ ownerAddress: OWNER, scope: SCOPE });
+      feed.mockReset();
+      feed.mockResolvedValueOnce(live).mockResolvedValueOnce(tombstoned);
+      (
+        deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
+      ).mockRejectedValueOnce(
+        new Error(
+          "Gateway error: 409 Stale expectedVersion 1: must be strictly greater than the stored value 2",
+        ),
+      );
+      const scopeDeletions = {
+        markDeleted: vi.fn(),
+        markLive: vi.fn(),
+        noteFeedSynced: vi.fn(),
+        knownDeletion: vi.fn(() => null),
+        feedAgeMs: vi.fn(() => null),
+        resolve: vi.fn(),
+        maxStalenessMs: 0,
+      };
+      deps.scopeDeletions = scopeDeletions;
+      const entry = makeEntry({ createdAt: "2026-01-21T10:00:00Z" });
+
+      await expect(uploadOne(deps, entry)).rejects.toMatchObject({
+        name: "DeletedScopeEntryError",
+      });
+
+      expect(deps.gateway.registerDataPoint).toHaveBeenCalledTimes(1);
+      expect(deps.storageAdapter.upload).toHaveBeenCalledTimes(1);
+      expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
+        SCOPE,
+        COLLECTED_AT,
+      );
+      expect(deps.storage.updateDataPointId).not.toHaveBeenCalled();
+      expect(scopeDeletions.markLive).not.toHaveBeenCalled();
+    });
+
+    it("marks the scope live in the read-side memory once it is registered", async () => {
+      const deps = withFeed(makeMockDeps(), null);
+      const scopeDeletions = {
+        markDeleted: vi.fn(),
+        markLive: vi.fn(),
+        noteFeedSynced: vi.fn(),
+        knownDeletion: vi.fn(() => null),
+        feedAgeMs: vi.fn(() => null),
+        resolve: vi.fn(),
+        maxStalenessMs: 0,
+      };
+      deps.scopeDeletions = scopeDeletions;
+
+      await uploadOne(deps, makeEntry());
+
+      expect(scopeDeletions.markLive).toHaveBeenCalledWith(SCOPE);
+    });
+
     it("uploads normally when the gateway has a live row or no row", async () => {
       const live = withFeed(makeMockDeps(), {
         deletedAt: null,

@@ -129,18 +129,23 @@ export function createGatewayDeleteDataPort(
         const currentExpected =
           integerField(conflict, "currentExpectedVersion") ??
           integerField(body, "currentExpectedVersion");
+        const legacyNext = parseGatewayNextVersion(
+          detailFromBody(body, res.statusText),
+        );
         const next =
           nextExplicit !== null
             ? nextExplicit
             : currentExpected !== null
-              ? currentExpected + 1
-              : parseGatewayNextVersion(detailFromBody(body, res.statusText));
+              ? currentExpected + 1n
+              : legacyNext !== null
+                ? BigInt(legacyNext)
+                : null;
         if (next === null) {
           throw new Error(
             `Gateway error: 409 ${detailFromBody(body, res.statusText)}`,
           );
         }
-        version = BigInt(next);
+        version = next;
         res = await sendTombstone(scope, dataPointId, version);
       }
       if (res.status === 404) {
@@ -218,11 +223,15 @@ function detailFromBody(body: unknown, fallback: string): string {
   return fallback;
 }
 
-function integerField(record: unknown, key: string): number | null {
+// Versions are unbounded integers on the wire (decimal strings); parse them
+// as bigint so a value past Number.MAX_SAFE_INTEGER cannot round.
+function integerField(record: unknown, key: string): bigint | null {
   if (typeof record !== "object" || record === null) return null;
   const value = (record as Record<string, unknown>)[key];
-  if (typeof value === "number" && Number.isInteger(value)) return value;
-  if (typeof value === "string" && /^\d+$/.test(value)) return Number(value);
+  if (typeof value === "number" && Number.isSafeInteger(value)) {
+    return BigInt(value);
+  }
+  if (typeof value === "string" && /^\d+$/.test(value)) return BigInt(value);
   return null;
 }
 

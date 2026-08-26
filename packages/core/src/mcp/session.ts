@@ -23,7 +23,7 @@ import type {
   GrantVerifierPort,
   RuntimeAvailabilityPort,
 } from "../ports/index.js";
-import { handleX402Cycle } from "../api/index.js";
+import { assertScopeNotDeleted, handleX402Cycle } from "../api/index.js";
 import type {
   PersonalServerApiAuthPort,
   PersonalServerReadAuthInput,
@@ -330,6 +330,19 @@ export function createMcpSessionAuthPort(params: {
       // Paid session: enforce x402 per read (reuses the exact HTTP cycle). The
       // read client forwards the app's `X-PAYMENT` proof on `input.request`.
       if (params.payment) {
+        // Settlement happens here, ahead of the HTTP handler's own deletion
+        // gate, so the gate must run here too: never challenge or settle a
+        // read of a scope the owner deleted.
+        const deps = params.payment.dataApiDeps;
+        await assertScopeNotDeleted(
+          deps,
+          input.scope,
+          deps.storage.findEntry({
+            scope: input.scope,
+            fileId: input.fileId,
+            at: input.at,
+          }),
+        );
         const cycle = await handleX402Cycle({
           deps: params.payment.dataApiDeps,
           request: input.request,

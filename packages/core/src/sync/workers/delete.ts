@@ -1,10 +1,15 @@
 import type { Logger } from "../../logger/index.js";
 import type {
+  DataPointFeedPort,
   DataStoragePort,
   DeleteDataPort,
   PendingBlobDeletionStore,
 } from "../../ports/index.js";
 import { computeDataPointId } from "../data-point-id.js";
+import {
+  deletionTimestamp,
+  type ScopeDeletionTracker,
+} from "../scope-deletions.js";
 
 export interface DeleteScopeDeps {
   storage: DataStoragePort;
@@ -18,7 +23,19 @@ export interface DeleteScopeDeps {
   deleteData?: DeleteDataPort | null;
   /** Retry marker for blob deletion that failed after the tombstone landed. */
   pendingBlobDeletions?: PendingBlobDeletionStore;
+  /**
+   * Read-side deletion memory. A landed tombstone is recorded here so this
+   * replica's reads answer 410 immediately, before any sync cycle.
+   */
+  scopeDeletions?: ScopeDeletionTracker;
+  /**
+   * Deletion-aware registry lookup used by the pending-blob retry to notice a
+   * scope that was re-added after its tombstone (see
+   * `retryPendingBlobDeletions`).
+   */
+  dataPointFeed?: DataPointFeedPort;
   logger: Logger;
+  now?: () => Date;
 }
 
 export type DeleteStepStatus = "ok" | "skipped" | "failed";
@@ -69,12 +86,20 @@ export interface DeleteScopeResult {
  * the still-live row. A storage failure after step 1 is reported AND leaves
  * a retry marker; it does not block step 3 because the tombstone already
  * makes the deletion stick.
+ *
+ * Not serialised here: the sync manager runs this under the same lock as its
+ * upload/download cycles so a delete cannot interleave with an upload of the
+ * same scope on this replica (see engine/sync-manager.ts). Uploads racing on
+ * another replica are handled by the upload worker's deletion guard and the
+ * download worker's reconcile.
  */
 export async function deleteScope(
   deps: DeleteScopeDeps,
   scope: string,
 ): Promise<DeleteScopeResult> {
-  const { storage, deleteData, pendingBlobDeletions, logger } = deps;
+  const { storage, deleteData, pendingBlobDeletions, scopeDeletions, logger } =
+    deps;
+  const now = deps.now ?? (() => new Date());
   const dataPointId = deps.serverOwner
     ? computeDataPointId(deps.serverOwner, scope)
     : null;
@@ -107,6 +132,15 @@ export async function deleteScope(
           version: outcome.version,
           deletedAt: outcome.deletedAt,
         };
+        // Reads on this replica must refuse the scope from this point on,
+        // without waiting for the feed to echo the tombstone back. A missing
+        // `deletedAt` (gateway did not echo one) is taken as "now": later
+        // than any local entry the deletion covers, so nothing slips through.
+        scopeDeletions?.markDeleted(
+          scope,
+          outcome.deletedAt ?? now().toISOString(),
+          "local-delete",
+        );
       }
       result.durable = true;
     } catch (err) {
@@ -182,6 +216,8 @@ export async function deleteScope(
 
 export interface RetryPendingBlobDeletionsResult {
   completed: string[];
+  /** Markers dropped because the scope was re-added after its tombstone. */
+  superseded: string[];
   failed: Array<{ scope: string; error: string }>;
 }
 
@@ -189,17 +225,51 @@ export interface RetryPendingBlobDeletionsResult {
  * Finish blob deletions whose tombstone landed but whose storage DELETE did
  * not. Runs at the start of every sync cycle; each scope is retried until
  * storage acknowledges (2xx or 404), then the marker is cleared.
+ *
+ * A marker can outlive its tombstone: if the owner re-added the scope on any
+ * replica in the meantime, the registry row is live again and the storage
+ * prefix now holds the re-add's ciphertext. Deleting the prefix would leave a
+ * live row whose bytes 404 for every reader, so when the feed shows the scope
+ * live the marker is dropped instead and the pre-tombstone ciphertext stays
+ * (owner-decryptable only; the next delete of the scope removes it).
  */
 export async function retryPendingBlobDeletions(
-  deps: Pick<DeleteScopeDeps, "deleteData" | "pendingBlobDeletions" | "logger">,
+  deps: Pick<
+    DeleteScopeDeps,
+    | "deleteData"
+    | "pendingBlobDeletions"
+    | "dataPointFeed"
+    | "serverOwner"
+    | "logger"
+  >,
 ): Promise<RetryPendingBlobDeletionsResult> {
-  const { deleteData, pendingBlobDeletions, logger } = deps;
-  const result: RetryPendingBlobDeletionsResult = { completed: [], failed: [] };
+  const { deleteData, pendingBlobDeletions, dataPointFeed, serverOwner } = deps;
+  const { logger } = deps;
+  const result: RetryPendingBlobDeletionsResult = {
+    completed: [],
+    superseded: [],
+    failed: [],
+  };
   if (!deleteData || !pendingBlobDeletions) return result;
 
   const scopes = await pendingBlobDeletions.list();
   for (const scope of scopes) {
     try {
+      if (dataPointFeed && serverOwner) {
+        const record = await dataPointFeed.getDataPoint({
+          ownerAddress: serverOwner,
+          scope,
+        });
+        if (record !== null && deletionTimestamp(record) === null) {
+          await pendingBlobDeletions.remove(scope);
+          result.superseded.push(scope);
+          logger.warn(
+            { scope, dataPointId: record.id, version: record.expectedVersion },
+            "Scope was re-added after its tombstone; dropping the pending blob deletion so the live version's ciphertext survives",
+          );
+          continue;
+        }
+      }
       await deleteData.deleteBlobs(scope);
       await pendingBlobDeletions.remove(scope);
       result.completed.push(scope);

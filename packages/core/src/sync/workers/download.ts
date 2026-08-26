@@ -14,7 +14,11 @@ import type {
   DataStoragePort,
 } from "../../ports/index.js";
 import { feedFromGatewayClient } from "../data-point-feed.js";
-import { isTombstoneRecord } from "../tombstone.js";
+import {
+  deletionTimestamp,
+  isEntryCoveredByDeletion,
+  type ScopeDeletionTracker,
+} from "../scope-deletions.js";
 import { buildDataBlocksAsync } from "../../storage/blocks/build.js";
 import {
   classifySyncFailure,
@@ -64,6 +68,12 @@ export interface DownloadWorkerDeps {
    * sees deletions the gateway volunteers without being asked.
    */
   dataPointFeed?: DataPointFeedPort;
+  /**
+   * Read-side deletion memory. Every listed row is recorded here (deleted or
+   * live) and a listing with no further pages marks the memory complete, so
+   * reads can refuse tombstoned scopes without their own gateway lookups.
+   */
+  scopeDeletions?: ScopeDeletionTracker;
 }
 
 export interface DeletionReconcileResult {
@@ -377,6 +387,22 @@ export async function downloadAll(
     { includeDeleted: true },
   );
 
+  // Feed the read-side deletion memory before any per-record work so a
+  // tombstone is refused by reads even if its local reconcile below fails.
+  // Only a listing with no further pages proves the memory complete: a
+  // multi-page backlog leaves it "stale" and reads fall back to lookups.
+  if (deps.scopeDeletions) {
+    for (const dataPoint of dataPoints) {
+      const deletedAt = deletionTimestamp(dataPoint);
+      if (deletedAt !== null) {
+        deps.scopeDeletions.markDeleted(dataPoint.scope, deletedAt);
+      } else {
+        deps.scopeDeletions.markLive(dataPoint.scope);
+      }
+    }
+    if (nextCursor === null) deps.scopeDeletions.noteFeedSynced();
+  }
+
   const results: DownloadResult[] = [];
   let failed = false;
 
@@ -500,7 +526,10 @@ export async function reconcileDeletedDataPoint(
       offset,
     });
     for (const entry of entries) {
-      if (entry.dataPointId !== null || coveredByDeletion(entry, deletedAt)) {
+      if (
+        entry.dataPointId !== null ||
+        isEntryCoveredByDeletion(entry, deletedAt)
+      ) {
         stale.push({ scope: entry.scope, collectedAt: entry.collectedAt });
       } else {
         kept += 1;
@@ -523,26 +552,6 @@ export async function reconcileDeletedDataPoint(
     );
   }
   return { scope: record.scope, deletedAt, removed, kept };
-}
-
-// Mirrors the upload worker's rule: unparseable timestamps count as covered,
-// because resurrecting deleted data is the failure this guards against.
-function coveredByDeletion(
-  entry: { createdAt: string },
-  deletedAt: string,
-): boolean {
-  const created = Date.parse(entry.createdAt);
-  const deleted = Date.parse(deletedAt);
-  if (Number.isNaN(created) || Number.isNaN(deleted)) return true;
-  return created <= deleted;
-}
-
-// A tombstone is visible either as `deletedAt` (a feed that models deletion)
-// or, from a gateway that lists tombstones as plain rows, as the tombstone
-// commitments themselves; `addedAt` is then the deletion time.
-function deletionTimestamp(record: DataPointFeedRecord): string | null {
-  if (record.deletedAt) return record.deletedAt;
-  return isTombstoneRecord(record) ? record.addedAt : null;
 }
 
 export async function repairLocalMissingBlockSidecars(

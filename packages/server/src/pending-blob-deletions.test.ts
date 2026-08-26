@@ -39,4 +39,25 @@ describe("createFilePendingBlobDeletionStore", () => {
       "chatgpt.conversations",
     ]);
   });
+
+  it("does not lose markers when a delete and a retry mutate the file concurrently", async () => {
+    const path = join(dir, "pending-blob-deletions.json");
+    const store = createFilePendingBlobDeletionStore(path);
+    await store.add("retrying.scope");
+
+    // A retry clearing its marker while two deletes record theirs: every
+    // operation is a read-modify-write of the same file.
+    await Promise.all([
+      store.remove("retrying.scope"),
+      store.add("first.scope"),
+      store.add("second.scope"),
+      store.add("first.scope"),
+    ]);
+
+    expect(await store.list()).toEqual(["first.scope", "second.scope"]);
+    expect(JSON.parse(await readFile(path, "utf8"))).toEqual({
+      version: 1,
+      scopes: ["first.scope", "second.scope"],
+    });
+  });
 });

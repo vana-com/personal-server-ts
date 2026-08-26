@@ -7,7 +7,10 @@ import {
 import { createGatewayLineageClient } from "@opendatalabs/personal-server-ts-core/lineage";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
-import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
+import type {
+  DataPointFeedPort,
+  DataStoragePort,
+} from "@opendatalabs/personal-server-ts-core/ports";
 import { createGatewayClient } from "@opendatalabs/vana-sdk/browser";
 import {
   createIndexedDbPsLitePersistence,
@@ -60,6 +63,11 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   configDefaults?: Partial<ServerConfig>;
   dataFileStore?: PsLiteDataFileStore;
   logger?: Logger;
+  /**
+   * Deletion-aware gateway feed for the sync workers. Defaults to a REST
+   * feed on the configured gateway URL; inject with a mock `gateway` in tests.
+   */
+  dataPointFeed?: DataPointFeedPort;
   /**
    * Inject host-owned persistence ports (Mobile native SQLite/filesystem) in
    * place of the browser IndexedDB defaults, without giving up this factory's
@@ -148,7 +156,7 @@ export async function createIndexedDbPsLiteRuntime(
     requestSigner: createRequestSigner(identity.account),
   });
   let syncManager = options.syncManager ?? null;
-  let dataPointFeed = options.dataPointFeed;
+  let scopeDeletions = options.scopeDeletions;
   if (!syncManager && config.sync.enabled) {
     const sync = await createPsLiteSyncManager({
       config,
@@ -158,13 +166,14 @@ export async function createIndexedDbPsLiteRuntime(
       ownerAddress: options.ownerAddress,
       serverAccount: identity.account,
       gateway,
-      dataPointFeed,
+      dataPointFeed: options.dataPointFeed,
+      scopeDeletions,
       diagnostics,
       logger: options.logger,
       lineageGateway,
     });
     syncManager = sync.syncManager;
-    dataPointFeed = sync.dataPointFeed;
+    scopeDeletions = sync.scopeDeletions;
   }
   let runtimeRef: PsLiteRuntime | null = null;
   const auth =
@@ -196,7 +205,7 @@ export async function createIndexedDbPsLiteRuntime(
     serverOwner,
     serverSigner,
     syncManager,
-    dataPointFeed,
+    scopeDeletions,
     diagnostics,
     lineageGateway,
     saveConfig: async (nextConfig) => {

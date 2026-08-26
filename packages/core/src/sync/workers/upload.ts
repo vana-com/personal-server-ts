@@ -8,17 +8,18 @@ import {
 import type { ServerSigner } from "../../signing/signer.js";
 import type { Logger } from "../../logger/index.js";
 import type { IndexEntry } from "../../storage/index/types.js";
-import type {
-  DataPointFeedPort,
-  DataPointFeedRecord,
-  DataStoragePort,
-} from "../../ports/index.js";
+import type { DataPointFeedPort, DataStoragePort } from "../../ports/index.js";
 import { computeDataPointId } from "../data-point-id.js";
-import { isTombstoneRecord } from "../tombstone.js";
+import {
+  deletionTimestamp,
+  isEntryCoveredByDeletion,
+  type ScopeDeletionTracker,
+} from "../scope-deletions.js";
 import { readStoredLineage } from "../../lineage/lineage.js";
 import type { LineageGatewayPort } from "../../lineage/gateway.js";
 
 export { computeDataPointId } from "../data-point-id.js";
+export { isEntryCoveredByDeletion } from "../scope-deletions.js";
 
 export interface UploadWorkerDeps {
   storage: DataStoragePort;
@@ -44,6 +45,11 @@ export interface UploadWorkerDeps {
    * behaves as before and cannot see deletions.
    */
   dataPointFeed?: DataPointFeedPort;
+  /**
+   * Read-side deletion memory. A successful registration marks the scope
+   * live again (a re-add after a tombstone must not keep answering 410).
+   */
+  scopeDeletions?: ScopeDeletionTracker;
 }
 
 export interface UploadResult {
@@ -90,19 +96,27 @@ export class DeletedScopeEntryError extends Error {
 }
 
 /**
- * True when `entry` was ingested at or before the gateway deletion, i.e. it
- * is part of what the owner deleted rather than a fresh re-add. Unparseable
- * timestamps count as stale: resurrecting deleted data is the failure this
- * guards against.
+ * Drop an unsynced entry the gateway deletion covers (ingested at or before
+ * `deletedAt`) and signal it as a self-heal. Returns without effect when the
+ * entry post-dates the deletion: that is a legitimate re-add.
  */
-export function isEntryCoveredByDeletion(
-  entry: Pick<IndexEntry, "createdAt">,
+async function dropIfCoveredByDeletion(
+  deps: Pick<UploadWorkerDeps, "storage" | "logger">,
+  entry: IndexEntry,
   deletedAt: string,
-): boolean {
-  const created = Date.parse(entry.createdAt);
-  const deleted = Date.parse(deletedAt);
-  if (Number.isNaN(created) || Number.isNaN(deleted)) return true;
-  return created <= deleted;
+): Promise<void> {
+  if (!isEntryCoveredByDeletion(entry, deletedAt)) return;
+  await deps.storage.deleteVersion(entry.scope, entry.collectedAt);
+  deps.logger.warn(
+    {
+      path: entry.path,
+      scope: entry.scope,
+      deletedAt,
+      createdAt: entry.createdAt,
+    },
+    "Dropped unsynced local entry: the gateway reports its scope as deleted",
+  );
+  throw new DeletedScopeEntryError(entry.path, deletedAt);
 }
 
 /**
@@ -178,19 +192,7 @@ export async function uploadOne(
     });
     const deletedAt = deletionTimestamp(remote);
     if (remote && deletedAt !== null) {
-      if (isEntryCoveredByDeletion(entry, deletedAt)) {
-        await storage.deleteVersion(entry.scope, entry.collectedAt);
-        logger.warn(
-          {
-            path: entry.path,
-            scope: entry.scope,
-            deletedAt,
-            createdAt: entry.createdAt,
-          },
-          "Dropped unsynced local entry: the gateway reports its scope as deleted",
-        );
-        throw new DeletedScopeEntryError(entry.path, deletedAt);
-      }
+      await dropIfCoveredByDeletion(deps, entry, deletedAt);
       const afterTombstone = BigInt(remote.expectedVersion) + 1n;
       if (afterTombstone > registerVersion) registerVersion = afterTombstone;
     }
@@ -332,6 +334,15 @@ export async function uploadOne(
             computeDataPointId(serverOwner, entry.scope),
           );
 
+      // The 409 may be a tombstone that landed after the deletion guard in
+      // step 1b ran (a delete on another replica racing this upload). Apply
+      // the same rule again before rebasing: a covered entry is dropped, a
+      // genuine re-add rebases past the tombstone below.
+      const conflictDeletedAt = record ? deletionTimestamp(record) : null;
+      if (conflictDeletedAt !== null) {
+        await dropIfCoveredByDeletion(deps, entry, conflictDeletedAt);
+      }
+
       if (record && record.dataHash.toLowerCase() === dataHash.toLowerCase()) {
         // Identical content is already registered (this entry, or a replica's
         // copy of it) — adopt the registered data point rather than minting a
@@ -410,6 +421,9 @@ export async function uploadOne(
 
     // 7. Stamp the dataPointId on the local index entry — marks it synced.
     await storage.updateDataPointId(entry.path, dataPointId);
+    // The registry now holds a live row for the scope (fresh registration or
+    // an adopted one): reads must stop treating it as deleted.
+    deps.scopeDeletions?.markLive(entry.scope);
   }
 
   logger.info(
@@ -496,13 +510,4 @@ export function parseGatewayNextVersion(message: string): number | null {
   );
   if (storedValue) return Number(storedValue[1]) + 1;
   return null;
-}
-
-// A tombstone is visible either as `deletedAt` (a feed that models deletion)
-// or, from a gateway that lists tombstones as plain rows, as the tombstone
-// commitments themselves; `addedAt` is then the deletion time.
-function deletionTimestamp(record: DataPointFeedRecord | null): string | null {
-  if (!record) return null;
-  if (record.deletedAt) return record.deletedAt;
-  return isTombstoneRecord(record) ? record.addedAt : null;
 }

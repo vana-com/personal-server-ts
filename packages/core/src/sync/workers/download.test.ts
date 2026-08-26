@@ -660,6 +660,50 @@ describe("download worker", () => {
       expect(deps.cursor.write).toHaveBeenCalledWith("next");
     });
 
+    it("feeds the read-side deletion memory from every listed row and marks a complete pass", async () => {
+      const deps = withLocalVersions(makeMockDeps(), []);
+      // The live row is already indexed, so no download is attempted for it.
+      deps.storage.findByDataPointId = vi
+        .fn()
+        .mockImplementation((id: string) =>
+          id === "0xother" ? syncedEntry({ dataPointId: id }) : undefined,
+        );
+      const scopeDeletions = {
+        markDeleted: vi.fn(),
+        markLive: vi.fn(),
+        noteFeedSynced: vi.fn(),
+        knownDeletion: vi.fn(() => null),
+        feedAgeMs: vi.fn(() => null),
+        resolve: vi.fn(),
+        maxStalenessMs: 0,
+      };
+      deps.scopeDeletions = scopeDeletions;
+      const listing = deps.gateway.listDataPointsByOwner as ReturnType<
+        typeof vi.fn
+      >;
+      listing.mockResolvedValueOnce({
+        dataPoints: [
+          { ...makeDataPointRecord(), deletedAt: DELETED_AT },
+          makeDataPointRecord({ id: "0xother", scope: "other.scope" }),
+        ],
+        cursor: "more-pages",
+      });
+
+      await downloadAll(deps);
+
+      expect(scopeDeletions.markDeleted).toHaveBeenCalledWith(
+        SCOPE,
+        DELETED_AT,
+      );
+      expect(scopeDeletions.markLive).toHaveBeenCalledWith("other.scope");
+      // More pages remain: the memory is not complete yet.
+      expect(scopeDeletions.noteFeedSynced).not.toHaveBeenCalled();
+
+      listing.mockResolvedValueOnce({ dataPoints: [], cursor: null });
+      await downloadAll(deps);
+      expect(scopeDeletions.noteFeedSynced).toHaveBeenCalledTimes(1);
+    });
+
     it("uses the dedicated feed with includeDeleted=true when one is wired", async () => {
       const deps = withLocalVersions(makeMockDeps(), [syncedEntry()]);
       deps.dataPointFeed = {

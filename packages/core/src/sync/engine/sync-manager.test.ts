@@ -392,5 +392,132 @@ describe("SyncManager", () => {
       expect(pending.remove).toHaveBeenCalledWith("chatgpt.conversations");
       expect(uploadAll).toHaveBeenCalledTimes(1);
     });
+
+    it("hands the retry the deletion-aware feed so a re-added scope is not wiped", async () => {
+      const deleteData = makeDeleteData();
+      const pending = makePending(["chatgpt.conversations"]);
+      const getDataPoint = vi.fn(async () => ({
+        id: "0xdp",
+        ownerAddress: "0xAbCdEf1234567890AbCdEf1234567890AbCdEf12",
+        scope: "chatgpt.conversations",
+        dataHash: "0x" + "11".repeat(32),
+        metadataHash: "0x" + "22".repeat(32),
+        expectedVersion: "3",
+        addedAt: "2026-08-25T11:00:00.000Z",
+        deletedAt: null,
+      }));
+      const downloadDeps = makeMockDownloadDeps();
+      downloadDeps.dataPointFeed = {
+        getDataPoint,
+        listDataPointsByOwner: vi.fn(),
+      };
+      const manager = createSyncManager(makeMockUploadDeps(), downloadDeps, {
+        deleteData,
+        pendingBlobDeletions: pending,
+      });
+
+      await manager.trigger();
+
+      expect(getDataPoint).toHaveBeenCalledWith({
+        ownerAddress: "0xAbCdEf1234567890AbCdEf1234567890AbCdEf12",
+        scope: "chatgpt.conversations",
+      });
+      expect(deleteData.deleteBlobs).not.toHaveBeenCalled();
+      expect(pending.remove).toHaveBeenCalledWith("chatgpt.conversations");
+    });
+
+    it("does not start a delete while a sync cycle is mid-upload", async () => {
+      const uploadDeps = makeMockUploadDeps();
+      uploadDeps.storage.deleteScope = vi.fn(async () => 1);
+      const deleteData = makeDeleteData();
+      let releaseUpload!: () => void;
+      const uploadStarted = new Promise<void>((started) => {
+        (uploadAll as ReturnType<typeof vi.fn>).mockImplementationOnce(() => {
+          started();
+          return new Promise<never[]>((resolve) => {
+            releaseUpload = () => resolve([]);
+          });
+        });
+      });
+      const manager = createSyncManager(uploadDeps, makeMockDownloadDeps(), {
+        deleteData,
+      });
+
+      const cycle = manager.trigger();
+      await uploadStarted;
+      expect(uploadAll).toHaveBeenCalledTimes(1);
+
+      const deletion = manager.deleteScope("instagram.profile");
+      // Let any eagerly-scheduled work run: the delete must still be queued.
+      for (let i = 0; i < 5; i += 1) await Promise.resolve();
+      expect(deleteData.tombstone).not.toHaveBeenCalled();
+
+      releaseUpload();
+      await cycle;
+      const result = await deletion;
+
+      expect(deleteData.tombstone).toHaveBeenCalledWith("instagram.profile");
+      expect(result.durable).toBe(true);
+    });
+
+    it("does not start a sync cycle while a delete is in flight", async () => {
+      const uploadDeps = makeMockUploadDeps();
+      uploadDeps.storage.deleteScope = vi.fn(async () => 1);
+      let releaseTombstone!: () => void;
+      const deleteData = makeDeleteData();
+      const tombstoneStarted = new Promise<void>((started) => {
+        deleteData.tombstone.mockImplementationOnce(() => {
+          started();
+          return new Promise((resolve) => {
+            releaseTombstone = () =>
+              resolve({
+                status: "tombstoned" as const,
+                dataPointId: "0xdp",
+                version: "2",
+                deletedAt: "2026-08-25T10:00:00.000Z",
+              });
+          });
+        });
+      });
+      const manager = createSyncManager(uploadDeps, makeMockDownloadDeps(), {
+        deleteData,
+      });
+
+      const deletion = manager.deleteScope("instagram.profile");
+      await tombstoneStarted;
+      const cycle = manager.trigger();
+      for (let i = 0; i < 5; i += 1) await Promise.resolve();
+      expect(uploadAll).not.toHaveBeenCalled();
+
+      releaseTombstone();
+      await deletion;
+      await cycle;
+
+      expect(uploadAll).toHaveBeenCalledTimes(1);
+      // The local delete finished before the cycle's upload began.
+      const deleteOrder = (
+        uploadDeps.storage.deleteScope as ReturnType<typeof vi.fn>
+      ).mock.invocationCallOrder[0];
+      const uploadOrder = (uploadAll as ReturnType<typeof vi.fn>).mock
+        .invocationCallOrder[0];
+      expect(deleteOrder).toBeLessThan(uploadOrder);
+    });
+
+    it("a failed delete does not block the next cycle", async () => {
+      const uploadDeps = makeMockUploadDeps();
+      uploadDeps.storage.deleteScope = vi.fn(async () => {
+        throw new Error("index locked");
+      });
+      const deleteData = makeDeleteData();
+      const manager = createSyncManager(uploadDeps, makeMockDownloadDeps(), {
+        deleteData,
+      });
+
+      const result = await manager.deleteScope("instagram.profile");
+      expect(result.steps.local.status).toBe("failed");
+
+      await manager.trigger();
+      expect(uploadAll).toHaveBeenCalledTimes(1);
+    });
   });
 });

@@ -9,6 +9,8 @@ import {
   createGatewayDataPointFeed,
   createGatewayDeleteDataPort,
   createPendingBlobDeletionStore,
+  createScopeDeletionTracker,
+  type ScopeDeletionTracker,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type {
   DataPointFeedPort,
@@ -60,6 +62,11 @@ export interface PsLiteSyncOptions {
    * gateway URL; inject alongside a mock `gateway` in tests.
    */
   dataPointFeed?: DataPointFeedPort;
+  /**
+   * Read-side tombstone memory shared with the runtime's data API. Built
+   * here by default so the sync workers and the reads see the same state.
+   */
+  scopeDeletions?: ScopeDeletionTracker;
   diagnostics?: DiagnosticsRecorder;
   logger?: Logger;
   /** Registers derivatives (envelopes carrying `$lineage`) with their lineage. */
@@ -196,6 +203,7 @@ export async function createPsLiteSyncManager(
   syncManager: SyncManager;
   serverOwner: `0x${string}`;
   dataPointFeed: DataPointFeedPort;
+  scopeDeletions: ScopeDeletionTracker;
 }> {
   const serverOwner = await resolvePsLiteOwner({
     ownerAddress: options.ownerAddress,
@@ -218,6 +226,9 @@ export async function createPsLiteSyncManager(
   const dataPointFeed =
     options.dataPointFeed ??
     createGatewayDataPointFeed({ gatewayUrl: options.config.gateway.url });
+  const scopeDeletions =
+    options.scopeDeletions ??
+    createScopeDeletionTracker({ feed: dataPointFeed, serverOwner, logger });
   // Durable deletion: same AddData signer as uploads, same Web3Signed
   // account as the storage provider.
   const deleteData = createGatewayDeleteDataPort({
@@ -248,6 +259,7 @@ export async function createPsLiteSyncManager(
       logger: logger as never,
       lineageGateway: options.lineageGateway,
       dataPointFeed,
+      scopeDeletions,
     },
     {
       storage: options.storage,
@@ -259,6 +271,7 @@ export async function createPsLiteSyncManager(
       logger: logger as never,
       diagnostics: downloadDiagnostics,
       dataPointFeed,
+      scopeDeletions,
     },
     {
       deleteData,
@@ -289,5 +302,5 @@ export async function createPsLiteSyncManager(
     },
   );
   syncManager.start();
-  return { syncManager, serverOwner, dataPointFeed };
+  return { syncManager, serverOwner, dataPointFeed, scopeDeletions };
 }

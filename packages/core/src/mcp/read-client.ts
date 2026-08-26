@@ -29,8 +29,10 @@ import { decodeDataBlockCursor } from "../storage/blocks/index.js";
 import { bytesToBase64, parseMetadataHeader } from "../contracts/binary.js";
 import { signMcpGranteeRequest } from "./grantee.js";
 import {
+  assertScopeNotDeleted,
   handlePersonalServerDataRequest,
   reportPersonalServerReadFulfillment,
+  resolveReadDeletion,
   type PersonalServerDataApiDeps,
 } from "../api/index.js";
 import { ProtocolError } from "../errors/catalog.js";
@@ -221,6 +223,24 @@ export function createMcpDataReadClient(
   const basePath = options.basePath ?? "/v1/data";
 
   /**
+   * Same deletion gate as GET /v1/data/:scope, surfaced as the MCP error
+   * shape. Runs before `authorizeScopeRead`, which may settle payment.
+   */
+  async function assertScopeReadable(
+    scope: string,
+    entry: { createdAt: string },
+  ): Promise<void> {
+    try {
+      await assertScopeNotDeleted(options.dataApiDeps, scope, entry);
+    } catch (err) {
+      if (err instanceof ProtocolError) {
+        throw new McpDataReadError(err.code, err.toJSON());
+      }
+      throw err;
+    }
+  }
+
+  /**
    * Sign a grantee request for `scope` and run the same policy check
    * `/v1/data/:scope` runs. Shared by every grant-gated read below so none of
    * them can drift away from the external read path's authorization.
@@ -355,6 +375,11 @@ export function createMcpDataReadClient(
       const storage = options.dataApiDeps.storage;
       const entry = storage.findEntry({ scope });
       if (!entry) return null;
+      // A tombstoned scope is absent for discovery purposes, exactly like a
+      // scope with no local copy; the same gate the HTTP read applies.
+      if (await resolveReadDeletion(options.dataApiDeps, scope, entry)) {
+        return null;
+      }
       const hasBlocks =
         typeof storage.hasScopeBlocks === "function"
           ? await storage.hasScopeBlocks(scope, entry.collectedAt)
@@ -396,6 +421,9 @@ export function createMcpDataReadClient(
           message: `No data found for scope "${scope}"`,
         });
       }
+      // Before authorizeScopeRead: a payment-enforcing auth port settles
+      // x402 there, and deleted data must never be charged for.
+      await assertScopeReadable(scope, selectedEntry);
 
       const { request, authResult } = await authorizeScopeRead({
         scope,
@@ -476,6 +504,7 @@ export function createMcpDataReadClient(
           message: `No data found for scope "${scope}"`,
         });
       }
+      await assertScopeReadable(scope, selectedEntry);
 
       const { request, authResult } = await authorizeScopeRead({
         scope,

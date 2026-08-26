@@ -261,6 +261,7 @@ describe("retryPendingBlobDeletions", () => {
 
     expect(result).toEqual({
       completed: ["a.b"],
+      superseded: [],
       failed: [{ scope: "c.d", error: "still down" }],
     });
     expect(await pending.list()).toEqual(["c.d"]);
@@ -268,6 +269,139 @@ describe("retryPendingBlobDeletions", () => {
 
   it("is a no-op without a delete port or marker store", async () => {
     const result = await retryPendingBlobDeletions({ logger: makeLogger() });
-    expect(result).toEqual({ completed: [], failed: [] });
+    expect(result).toEqual({ completed: [], superseded: [], failed: [] });
+  });
+
+  it("drops the marker without deleting when the scope was re-added after its tombstone", async () => {
+    const pending = makePending();
+    await pending.add(SCOPE);
+    await pending.add("still.deleted");
+    const deleteData = makeDeleteData();
+    const getDataPoint = vi.fn(
+      async ({ scope }: { ownerAddress: string; scope: string }) => ({
+        id: computeDataPointId(OWNER, scope),
+        ownerAddress: OWNER,
+        scope,
+        dataHash: "0x" + "11".repeat(32),
+        metadataHash: "0x" + "22".repeat(32),
+        expectedVersion: "6",
+        addedAt: "2026-08-25T11:00:00.000Z",
+        // The re-added scope is live again; the other is still tombstoned.
+        deletedAt: scope === SCOPE ? null : "2026-08-25T10:00:00.000Z",
+      }),
+    );
+    const logger = makeLogger();
+
+    const result = await retryPendingBlobDeletions({
+      deleteData,
+      pendingBlobDeletions: pending,
+      dataPointFeed: { getDataPoint, listDataPointsByOwner: vi.fn() },
+      serverOwner: OWNER,
+      logger,
+    });
+
+    expect(result).toEqual({
+      completed: ["still.deleted"],
+      superseded: [SCOPE],
+      failed: [],
+    });
+    // The live version's ciphertext under the prefix must survive.
+    expect(deleteData.deleteBlobs).toHaveBeenCalledTimes(1);
+    expect(deleteData.deleteBlobs).toHaveBeenCalledWith("still.deleted");
+    expect(await pending.list()).toEqual([]);
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: SCOPE, version: "6" }),
+      expect.stringContaining("re-added"),
+    );
+  });
+
+  it("still retries when the feed cannot say (lookup error is a failed retry, marker kept)", async () => {
+    const pending = makePending();
+    await pending.add(SCOPE);
+    const deleteData = makeDeleteData();
+
+    const result = await retryPendingBlobDeletions({
+      deleteData,
+      pendingBlobDeletions: pending,
+      dataPointFeed: {
+        getDataPoint: vi.fn(async () => {
+          throw new Error("gateway down");
+        }),
+        listDataPointsByOwner: vi.fn(),
+      },
+      serverOwner: OWNER,
+      logger: makeLogger(),
+    });
+
+    expect(result.failed).toEqual([{ scope: SCOPE, error: "gateway down" }]);
+    expect(deleteData.deleteBlobs).not.toHaveBeenCalled();
+    expect(await pending.list()).toEqual([SCOPE]);
+  });
+});
+
+describe("deleteScope read-side memory", () => {
+  function makeTracker() {
+    return {
+      markDeleted: vi.fn(),
+      markLive: vi.fn(),
+      noteFeedSynced: vi.fn(),
+      knownDeletion: vi.fn(() => null),
+      feedAgeMs: vi.fn(() => null),
+      resolve: vi.fn(),
+      maxStalenessMs: 0,
+    };
+  }
+
+  it("records the tombstone so this replica's reads refuse the scope at once", async () => {
+    const scopeDeletions = makeTracker();
+    const deps = makeDeps({ scopeDeletions });
+
+    await deleteScope(deps, SCOPE);
+
+    expect(scopeDeletions.markDeleted).toHaveBeenCalledWith(
+      SCOPE,
+      "2026-08-25T10:00:00.000Z",
+      "local-delete",
+    );
+  });
+
+  it("falls back to the current time when the gateway echoes no deletedAt", async () => {
+    const scopeDeletions = makeTracker();
+    const deps = makeDeps({
+      scopeDeletions,
+      now: () => new Date("2026-08-26T12:00:00.000Z"),
+    });
+    (deps.deleteData!.tombstone as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: "tombstoned",
+      dataPointId: DATA_POINT_ID,
+      version: "4",
+      deletedAt: null,
+    });
+
+    await deleteScope(deps, SCOPE);
+
+    expect(scopeDeletions.markDeleted).toHaveBeenCalledWith(
+      SCOPE,
+      "2026-08-26T12:00:00.000Z",
+      "local-delete",
+    );
+  });
+
+  it("records nothing when the tombstone fails or the point was never registered", async () => {
+    const failed = makeTracker();
+    const failing = makeDeps({ scopeDeletions: failed });
+    (
+      failing.deleteData!.tombstone as ReturnType<typeof vi.fn>
+    ).mockRejectedValue(new Error("Gateway error: 503"));
+    await deleteScope(failing, SCOPE);
+    expect(failed.markDeleted).not.toHaveBeenCalled();
+
+    const unregistered = makeTracker();
+    const never = makeDeps({ scopeDeletions: unregistered });
+    (never.deleteData!.tombstone as ReturnType<typeof vi.fn>).mockResolvedValue(
+      { status: "not-registered", dataPointId: DATA_POINT_ID },
+    );
+    await deleteScope(never, SCOPE);
+    expect(unregistered.markDeleted).not.toHaveBeenCalled();
   });
 });

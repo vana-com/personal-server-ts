@@ -18,7 +18,10 @@ import {
   createTestWallet,
   buildWeb3SignedHeader,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
-import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
+import {
+  createScopeDeletionTracker,
+  type SyncManager,
+} from "@opendatalabs/personal-server-ts-core/sync";
 import { dataRoutes } from "./data.js";
 import type { DataRouteDeps } from "./data.js";
 import type { TokenStore } from "../token-store.js";
@@ -1546,7 +1549,10 @@ describe("DELETE /v1/data/:scope", () => {
     }));
     const app = createApp({
       gateway,
-      dataPointFeed: { getDataPoint, listDataPointsByOwner: vi.fn() },
+      scopeDeletions: createScopeDeletionTracker({
+        feed: { getDataPoint, listDataPointsByOwner: vi.fn() },
+        serverOwner: deleteOwnerWallet.address,
+      }),
     });
 
     const header = await buildWeb3SignedHeader({
@@ -1571,6 +1577,205 @@ describe("DELETE /v1/data/:scope", () => {
       ownerAddress: deleteOwnerWallet.address,
       scope: "instagram.profile",
     });
+  });
+
+  describe("reads of a scope another replica deleted", () => {
+    const grant = () =>
+      makeGrant({ grantorAddress: deleteOwnerWallet.address });
+
+    function tombstoneFeed(deletedAt: string | null) {
+      const getDataPoint = vi.fn(async () => ({
+        id: "0xdp",
+        ownerAddress: deleteOwnerWallet.address,
+        scope: "instagram.profile",
+        dataHash: "0x" + "11".repeat(32),
+        metadataHash: "0x" + "22".repeat(32),
+        expectedVersion: "4",
+        addedAt: "2026-08-25T10:00:00.000Z",
+        deletedAt,
+      }));
+      return { getDataPoint, listDataPointsByOwner: vi.fn() };
+    }
+
+    async function getAsBuilder(app: ReturnType<typeof dataRoutes>) {
+      const header = await buildWeb3SignedHeader({
+        wallet,
+        aud: SERVER_ORIGIN,
+        method: "GET",
+        uri: "/instagram.profile",
+        grantId: "grant-123",
+      });
+      return app.request("/instagram.profile", {
+        headers: { Authorization: header },
+      });
+    }
+
+    it("refuses a stale local copy when the gateway holds a tombstone that covers it", async () => {
+      // The local envelope exists (this replica has not synced since the
+      // deletion); the registry says deleted after it was ingested.
+      const feed = tombstoneFeed("2099-01-01T00:00:00.000Z");
+      const app = createApp({
+        gateway: createMockGateway({
+          getGrant: vi.fn().mockResolvedValue(grant()),
+        }),
+        scopeDeletions: createScopeDeletionTracker({
+          feed,
+          serverOwner: deleteOwnerWallet.address,
+        }),
+      });
+      await ingestData("instagram.profile", { username: "stale" }, app);
+      expect(
+        indexManager.findClosestByScope(
+          "instagram.profile",
+          "2099-01-01T00:00:00.000Z",
+        ),
+      ).toBeDefined();
+
+      const first = await getAsBuilder(app);
+      expect(first.status).toBe(410);
+      const json = await first.json();
+      expect(json.error.errorCode).toBe("DATA_DELETED");
+      expect(json.error.details).toMatchObject({
+        scope: "instagram.profile",
+        deletedAt: "2099-01-01T00:00:00.000Z",
+      });
+      // The read does not touch the local copy; sync reconciles it.
+      expect(
+        indexManager.findClosestByScope(
+          "instagram.profile",
+          "2099-01-01T00:00:00.000Z",
+        ),
+      ).toBeDefined();
+
+      // The verdict is remembered: a second read costs no gateway lookup.
+      const second = await getAsBuilder(app);
+      expect(second.status).toBe(410);
+      expect(feed.getDataPoint).toHaveBeenCalledTimes(1);
+    });
+
+    it("refuses a stale local copy the sync feed reported deleted, with no gateway lookup at all", async () => {
+      const feed = tombstoneFeed(null);
+      const tracker = createScopeDeletionTracker({
+        feed,
+        serverOwner: deleteOwnerWallet.address,
+      });
+      const app = createApp({
+        gateway: createMockGateway({
+          getGrant: vi.fn().mockResolvedValue(grant()),
+        }),
+        scopeDeletions: tracker,
+      });
+      await ingestData("instagram.profile", { username: "stale" }, app);
+      // What the download worker records when it lists the tombstone.
+      tracker.markDeleted("instagram.profile", "2099-01-01T00:00:00.000Z");
+
+      const res = await getAsBuilder(app);
+
+      expect(res.status).toBe(410);
+      expect(feed.getDataPoint).not.toHaveBeenCalled();
+    });
+
+    it("serves a local re-add that is newer than the tombstone", async () => {
+      const feed = tombstoneFeed("2020-01-01T00:00:00.000Z");
+      const app = createApp({
+        gateway: createMockGateway({
+          getGrant: vi.fn().mockResolvedValue(grant()),
+        }),
+        scopeDeletions: createScopeDeletionTracker({
+          feed,
+          serverOwner: deleteOwnerWallet.address,
+        }),
+      });
+      await ingestData("instagram.profile", { username: "re-added" }, app);
+
+      const res = await getAsBuilder(app);
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        data: { username: "re-added" },
+      });
+    });
+
+    it("trusts the local index without a lookup while the sync feed is fresh", async () => {
+      const feed = tombstoneFeed("2099-01-01T00:00:00.000Z");
+      const tracker = createScopeDeletionTracker({
+        feed,
+        serverOwner: deleteOwnerWallet.address,
+      });
+      const app = createApp({
+        gateway: createMockGateway({
+          getGrant: vi.fn().mockResolvedValue(grant()),
+        }),
+        scopeDeletions: tracker,
+      });
+      await ingestData("instagram.profile", { username: "fresh" }, app);
+      // A complete feed pass just happened and listed no tombstone for it.
+      tracker.noteFeedSynced();
+
+      const res = await getAsBuilder(app);
+
+      expect(res.status).toBe(200);
+      expect(feed.getDataPoint).not.toHaveBeenCalled();
+    });
+
+    it("serves the local copy from last known state when the gateway is unreachable", async () => {
+      const getDataPoint = vi.fn(async () => {
+        throw new Error("ECONNREFUSED");
+      });
+      const app = createApp({
+        gateway: createMockGateway({
+          getGrant: vi.fn().mockResolvedValue(grant()),
+        }),
+        scopeDeletions: createScopeDeletionTracker({
+          feed: { getDataPoint, listDataPointsByOwner: vi.fn() },
+          serverOwner: deleteOwnerWallet.address,
+        }),
+      });
+      await ingestData("instagram.profile", { username: "offline" }, app);
+
+      const res = await getAsBuilder(app);
+
+      expect(res.status).toBe(200);
+      expect(getDataPoint).toHaveBeenCalledTimes(1);
+    });
+
+    it("answers 404, not 410, for a scope the gateway has never seen", async () => {
+      const getDataPoint = vi.fn(async () => null);
+      const app = createApp({
+        gateway: createMockGateway({
+          getGrant: vi.fn().mockResolvedValue(grant()),
+        }),
+        scopeDeletions: createScopeDeletionTracker({
+          feed: { getDataPoint, listDataPointsByOwner: vi.fn() },
+          serverOwner: deleteOwnerWallet.address,
+        }),
+      });
+
+      const res = await getAsBuilder(app);
+
+      expect(res.status).toBe(404);
+      expect(getDataPoint).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("returns 401 without owner authorization and deletes nothing", async () => {
+    const syncManager = {
+      trigger: vi.fn(),
+      deleteScope: vi.fn(),
+    } as unknown as SyncManager;
+    const app = createApp({ syncManager });
+    await ingestData("instagram.profile", { username: "keep" }, app);
+
+    const res = await app.request("/instagram.profile", { method: "DELETE" });
+
+    expect(res.status).toBe(401);
+    expect(syncManager.deleteScope).not.toHaveBeenCalled();
+    expect(
+      indexManager.findClosestByScope(
+        "instagram.profile",
+        "2099-01-01T00:00:00.000Z",
+      ),
+    ).toBeDefined();
   });
 
   it("after DELETE, can re-create with POST", async () => {
@@ -1822,6 +2027,33 @@ describe("X402 payment on GET /v1/data/:scope", () => {
     cleanup();
     await rm(dataDir, { recursive: true, force: true });
     vi.unstubAllGlobals();
+  });
+
+  it("answers 410 for a deleted scope before issuing any payment challenge", async () => {
+    // Deletion is checked ahead of the x402 cycle so a builder is never
+    // charged (or even challenged) for data the owner deleted.
+    const tracker = createScopeDeletionTracker({
+      serverOwner: ownerForX402.address,
+    });
+    const app = createX402App({ scopeDeletions: tracker });
+    const ingestRes = await ingest(app, "instagram.profile", {
+      username: "gone",
+    });
+    expect(ingestRes.status).toBe(201);
+    tracker.markDeleted("instagram.profile", "2099-01-01T00:00:00.000Z");
+    const gatewayFetch = vi.fn();
+    vi.stubGlobal("fetch", gatewayFetch);
+
+    const noPayment = await getNoPayment(app, "instagram.profile");
+    expect(noPayment.status).toBe(410);
+
+    const paid = await getWithPayment(
+      app,
+      "instagram.profile",
+      await signedXPayment(),
+    );
+    expect(paid.status).toBe(410);
+    expect(gatewayFetch).not.toHaveBeenCalled();
   });
 
   it("returns 402 with a fresh challenge when X-PAYMENT is absent", async () => {

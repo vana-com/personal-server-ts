@@ -1,0 +1,290 @@
+import { describe, expect, it, vi } from "vitest";
+
+import type { DataPointFeedRecord } from "../ports/index.js";
+import {
+  createScopeDeletionTracker,
+  deletionTimestamp,
+  isEntryCoveredByDeletion,
+} from "./scope-deletions.js";
+import { TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH } from "./tombstone.js";
+
+const OWNER = "0xAbCdEf1234567890AbCdEf1234567890AbCdEf12";
+const SCOPE = "instagram.profile";
+const DELETED_AT = "2026-08-25T10:00:00.000Z";
+
+function record(
+  overrides: Partial<DataPointFeedRecord> = {},
+): DataPointFeedRecord {
+  return {
+    id: "0xdp",
+    ownerAddress: OWNER,
+    scope: SCOPE,
+    dataHash: "0x" + "11".repeat(32),
+    metadataHash: "0x" + "22".repeat(32),
+    expectedVersion: "3",
+    addedAt: "2026-08-01T00:00:00.000Z",
+    deletedAt: null,
+    ...overrides,
+  };
+}
+
+function makeTracker(options: {
+  remote?: DataPointFeedRecord | null | Error;
+  maxStalenessMs?: number;
+  gatewayRetryMs?: number;
+  maxLiveEntries?: number;
+  owner?: string | undefined;
+}) {
+  let nowMs = Date.parse("2026-08-26T12:00:00.000Z");
+  const getDataPoint = vi.fn(async () => {
+    if (options.remote instanceof Error) throw options.remote;
+    return options.remote ?? null;
+  });
+  const logger = { warn: vi.fn() };
+  const tracker = createScopeDeletionTracker({
+    feed: { getDataPoint, listDataPointsByOwner: vi.fn() },
+    serverOwner: "owner" in options ? options.owner : OWNER,
+    maxStalenessMs: options.maxStalenessMs,
+    gatewayRetryMs: options.gatewayRetryMs,
+    maxLiveEntries: options.maxLiveEntries,
+    now: () => new Date(nowMs),
+    logger,
+  });
+  return {
+    tracker,
+    getDataPoint,
+    logger,
+    advance(ms: number) {
+      nowMs += ms;
+    },
+  };
+}
+
+describe("scope deletion tracker", () => {
+  it("answers a known tombstone synchronously, without a gateway lookup", async () => {
+    const { tracker, getDataPoint } = makeTracker({ remote: record() });
+    tracker.markDeleted(SCOPE, DELETED_AT);
+
+    expect(tracker.knownDeletion(SCOPE)).toEqual({ deletedAt: DELETED_AT });
+    await expect(tracker.resolve(SCOPE)).resolves.toEqual({
+      deleted: true,
+      deletedAt: DELETED_AT,
+      source: "feed",
+      verified: true,
+    });
+    expect(getDataPoint).not.toHaveBeenCalled();
+
+    // The delete worker names itself as the source of its own tombstone.
+    tracker.markDeleted("other.scope", DELETED_AT, "local-delete");
+    await expect(tracker.resolve("other.scope")).resolves.toMatchObject({
+      deleted: true,
+      source: "local-delete",
+    });
+  });
+
+  it("trusts a fresh feed pass for local hits and asks the gateway once it is stale", async () => {
+    const { tracker, getDataPoint, advance } = makeTracker({
+      remote: record(),
+      maxStalenessMs: 1_000,
+    });
+    tracker.noteFeedSynced();
+
+    await expect(tracker.resolve(SCOPE)).resolves.toMatchObject({
+      deleted: false,
+      source: "feed",
+      verified: true,
+    });
+    expect(getDataPoint).not.toHaveBeenCalled();
+    expect(tracker.feedAgeMs()).toBe(0);
+
+    advance(1_001);
+    await expect(tracker.resolve(SCOPE)).resolves.toMatchObject({
+      deleted: false,
+      source: "gateway",
+      verified: true,
+    });
+    expect(getDataPoint).toHaveBeenCalledTimes(1);
+
+    // The per-scope live verdict is cached for maxStalenessMs.
+    await tracker.resolve(SCOPE);
+    expect(getDataPoint).toHaveBeenCalledTimes(1);
+    advance(1_001);
+    await tracker.resolve(SCOPE);
+    expect(getDataPoint).toHaveBeenCalledTimes(2);
+  });
+
+  it("consults the gateway for a local miss even when the feed is fresh", async () => {
+    const { tracker, getDataPoint } = makeTracker({
+      remote: record({ deletedAt: DELETED_AT }),
+    });
+    tracker.noteFeedSynced();
+
+    await expect(
+      tracker.resolve(SCOPE, { consultGateway: "always" }),
+    ).resolves.toEqual({
+      deleted: true,
+      deletedAt: DELETED_AT,
+      source: "gateway",
+      verified: true,
+    });
+    expect(getDataPoint).toHaveBeenCalledWith({
+      ownerAddress: OWNER,
+      scope: SCOPE,
+    });
+    // A gateway verdict is remembered: the next read needs no lookup.
+    await tracker.resolve(SCOPE, { consultGateway: "always" });
+    expect(getDataPoint).toHaveBeenCalledTimes(1);
+  });
+
+  it("recognises a tombstone row by its hash pair when the gateway omits deletedAt", async () => {
+    const { tracker } = makeTracker({
+      remote: record({
+        dataHash: TOMBSTONE_DATA_HASH,
+        metadataHash: TOMBSTONE_METADATA_HASH,
+        addedAt: DELETED_AT,
+      }),
+    });
+
+    await expect(tracker.resolve(SCOPE)).resolves.toMatchObject({
+      deleted: true,
+      deletedAt: DELETED_AT,
+    });
+  });
+
+  it("serves last known state and backs off when the gateway is unreachable", async () => {
+    const { tracker, getDataPoint, logger, advance } = makeTracker({
+      remote: new Error("ECONNREFUSED"),
+      gatewayRetryMs: 5_000,
+    });
+
+    await expect(tracker.resolve(SCOPE)).resolves.toEqual({
+      deleted: false,
+      source: "assumed-live",
+      verified: false,
+    });
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: SCOPE, error: "ECONNREFUSED" }),
+      expect.any(String),
+    );
+
+    // Inside the retry window every read is answered without a lookup.
+    await tracker.resolve("other.scope");
+    expect(getDataPoint).toHaveBeenCalledTimes(1);
+
+    advance(5_000);
+    await tracker.resolve("other.scope");
+    expect(getDataPoint).toHaveBeenCalledTimes(2);
+
+    // A known tombstone is still refused while offline.
+    tracker.markDeleted(SCOPE, DELETED_AT);
+    await expect(tracker.resolve(SCOPE)).resolves.toMatchObject({
+      deleted: true,
+    });
+  });
+
+  it("is assumed-live without a feed or owner to ask", async () => {
+    const noOwner = makeTracker({ remote: record(), owner: undefined });
+    await expect(noOwner.tracker.resolve(SCOPE)).resolves.toEqual({
+      deleted: false,
+      source: "assumed-live",
+      verified: false,
+    });
+    expect(noOwner.getDataPoint).not.toHaveBeenCalled();
+
+    const bare = createScopeDeletionTracker();
+    await expect(bare.resolve(SCOPE)).resolves.toMatchObject({
+      deleted: false,
+      verified: false,
+    });
+  });
+
+  it("forgets a tombstone once the scope is live again (re-add)", async () => {
+    const { tracker, getDataPoint } = makeTracker({ remote: record() });
+    tracker.markDeleted(SCOPE, DELETED_AT);
+    tracker.markLive(SCOPE);
+
+    expect(tracker.knownDeletion(SCOPE)).toBeNull();
+    await expect(tracker.resolve(SCOPE)).resolves.toMatchObject({
+      deleted: false,
+      verified: true,
+    });
+    expect(getDataPoint).not.toHaveBeenCalled();
+  });
+
+  it("coalesces concurrent lookups of one scope into a single request", async () => {
+    const { tracker, getDataPoint } = makeTracker({ remote: record() });
+
+    const verdicts = await Promise.all([
+      tracker.resolve(SCOPE),
+      tracker.resolve(SCOPE),
+      tracker.resolve(SCOPE),
+    ]);
+
+    expect(getDataPoint).toHaveBeenCalledTimes(1);
+    expect(verdicts.every((verdict) => verdict.deleted === false)).toBe(true);
+  });
+
+  it("bounds the number of remembered live verdicts", async () => {
+    const { tracker, getDataPoint } = makeTracker({
+      remote: record(),
+      maxLiveEntries: 2,
+    });
+
+    await tracker.resolve("a.one");
+    await tracker.resolve("a.two");
+    await tracker.resolve("a.three");
+    expect(getDataPoint).toHaveBeenCalledTimes(3);
+
+    // The oldest verdict was evicted; the newest two are still cached.
+    await tracker.resolve("a.one");
+    expect(getDataPoint).toHaveBeenCalledTimes(4);
+    await tracker.resolve("a.three");
+    expect(getDataPoint).toHaveBeenCalledTimes(4);
+  });
+});
+
+describe("deletion helpers", () => {
+  it("isEntryCoveredByDeletion treats entries at or before deletedAt (and unparseable stamps) as covered", () => {
+    expect(
+      isEntryCoveredByDeletion({ createdAt: DELETED_AT }, DELETED_AT),
+    ).toBe(true);
+    expect(
+      isEntryCoveredByDeletion(
+        { createdAt: "2026-08-25T09:59:59.999Z" },
+        DELETED_AT,
+      ),
+    ).toBe(true);
+    expect(
+      isEntryCoveredByDeletion(
+        { createdAt: "2026-08-25T10:00:00.001Z" },
+        DELETED_AT,
+      ),
+    ).toBe(false);
+    expect(isEntryCoveredByDeletion({ createdAt: "garbage" }, DELETED_AT)).toBe(
+      true,
+    );
+    expect(
+      isEntryCoveredByDeletion({ createdAt: DELETED_AT }, "not a date"),
+    ).toBe(true);
+  });
+
+  it("deletionTimestamp prefers deletedAt, falls back to the tombstone hash pair, else null", () => {
+    expect(deletionTimestamp(null)).toBeNull();
+    expect(deletionTimestamp(record())).toBeNull();
+    expect(deletionTimestamp(record({ deletedAt: DELETED_AT }))).toBe(
+      DELETED_AT,
+    );
+    expect(
+      deletionTimestamp(
+        record({
+          dataHash: TOMBSTONE_DATA_HASH,
+          metadataHash: TOMBSTONE_METADATA_HASH,
+          addedAt: DELETED_AT,
+        }),
+      ),
+    ).toBe(DELETED_AT);
+    // A plain SDK record without the deletedAt field at all.
+    const { deletedAt: _ignored, ...sdkRecord } = record();
+    expect(deletionTimestamp(sdkRecord)).toBeNull();
+  });
+});

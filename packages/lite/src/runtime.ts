@@ -39,10 +39,10 @@ import {
   type DataReadPolicyPorts,
 } from "@opendatalabs/personal-server-ts-core/policy";
 import type {
-  DataPointFeedPort,
   DataStoragePort,
   RuntimeAvailabilityPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
+import type { ScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
 import type {
   DataPortabilityGatewayConfig,
   GatewayClient,
@@ -129,10 +129,11 @@ export interface PsLiteRuntimeOptions {
         Partial<Pick<SyncManager, "start" | "stop" | "deleteScope">>)
     | null;
   /**
-   * Deletion-aware gateway lookup; lets reads of a deleted scope answer 410
-   * instead of 404. Built by the browser runtime alongside the sync manager.
+   * Read-side tombstone memory; reads of a scope the gateway reports deleted
+   * answer 410 (stale local copy or not). Built by the browser runtime
+   * alongside the sync manager, which keeps it current.
    */
-  dataPointFeed?: DataPointFeedPort;
+  scopeDeletions?: ScopeDeletionTracker;
   accessLogReader?: AccessLogReader;
   accessLogWriter?: AccessLogWriter;
   readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
@@ -897,7 +898,7 @@ export function createPsLiteRuntime(
               accessLogWriter,
               readFulfillmentReporter: options.readFulfillmentReporter,
               syncManager: options.syncManager ?? null,
-              dataPointFeed: options.dataPointFeed,
+              scopeDeletions: options.scopeDeletions,
               now,
               createLogId,
               // x402 payment enforcement for builder reads. Only engages with a

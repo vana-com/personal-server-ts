@@ -12,12 +12,16 @@ import {
 import type { AccessLogWriter } from "../logging/access-log.js";
 import type { AccessLogReader } from "../logging/access-reader.js";
 import {
-  type DataPointFeedPort,
   type DataStoragePort,
   type RuntimeAvailabilityPort,
 } from "../ports/index.js";
 import type { DataReadPolicyPorts } from "../policy/index.js";
 import type { SyncManager } from "../sync/index.js";
+import { computeDataPointId } from "../sync/data-point-id.js";
+import {
+  isEntryCoveredByDeletion,
+  type ScopeDeletionTracker,
+} from "../sync/scope-deletions.js";
 import {
   deleteScope as deleteScopeLocally,
   type DeleteScopeResult,
@@ -181,12 +185,14 @@ export interface PersonalServerDataApiDeps {
   runtimeAvailability?: RuntimeAvailabilityPort;
   readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
   /**
-   * Deletion-aware registry lookup. When a read finds no local copy, the
-   * handler asks the gateway whether the owner deleted the scope and answers
-   * 410 DATA_DELETED instead of 404, so SDK readers can tell "deleted" from
-   * "never had it". Needs `serverOwner` to derive the data-point id.
+   * Read-side memory of gateway tombstones (see sync/scope-deletions.ts for
+   * the consistency window). Every read consults it before serving or
+   * charging: a scope the gateway reports deleted answers 410 DATA_DELETED
+   * whether or not a stale local copy still exists, and a local miss on a
+   * deleted scope answers 410 instead of 404 so SDK readers can tell
+   * "deleted" from "never had it". Without it reads are local-only.
    */
-  dataPointFeed?: DataPointFeedPort;
+  scopeDeletions?: ScopeDeletionTracker;
   /**
    * Required when payment is on. Powers two things on GET /v1/data/:scope:
    *   - the X402 challenge generation (fee lookup, accessRecord binding)
@@ -621,39 +627,57 @@ function collectedAt(now: () => Date): string {
 }
 
 /**
- * A read that misses locally may be a scope the owner durably deleted (the
- * local copy is gone by design). Ask the registry and answer 410 so clients
- * never mistake a deletion for missing data. Feed errors are swallowed: the
- * 404 stands when the gateway cannot be reached.
+ * The deletion that applies to a read of `scope`, or null when the read may
+ * be served. `entry` is the local version the read would serve (undefined
+ * on a local miss).
+ *
+ * - A local copy is refused when the gateway holds a tombstone that covers
+ *   it (entry ingested at or before `deletedAt`). A newer local entry is a
+ *   legitimate re-add and is served.
+ * - A local miss asks the tracker to consult the gateway (bounded by its
+ *   per-scope verdict cache and failure back-off): the local index cannot
+ *   tell "deleted long ago" from "never had it".
+ * Gateway unreachability never fails the read: the tracker answers from its
+ * last known state, which is the documented offline behaviour.
  */
-async function throwIfScopeDeleted(
-  deps: Pick<
-    PersonalServerDataApiDeps,
-    "dataPointFeed" | "serverOwner" | "logger"
-  >,
+export async function resolveReadDeletion(
+  deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
   scope: string,
+  entry: { createdAt: string } | null | undefined,
+): Promise<{
+  scope: string;
+  dataPointId: string | null;
+  deletedAt: string;
+} | null> {
+  if (!deps.scopeDeletions) return null;
+  const verdict = await deps.scopeDeletions.resolve(scope, {
+    consultGateway: entry ? "if-stale" : "always",
+  });
+  if (!verdict.deleted) return null;
+  if (entry && !isEntryCoveredByDeletion(entry, verdict.deletedAt)) {
+    return null;
+  }
+  return {
+    scope,
+    dataPointId: deps.serverOwner
+      ? computeDataPointId(deps.serverOwner, scope)
+      : null,
+    deletedAt: verdict.deletedAt,
+  };
+}
+
+/**
+ * Throw 410 DATA_DELETED when `resolveReadDeletion` says the read must not be
+ * served. Call it before any payment step: a builder must never be charged
+ * for a scope the owner deleted.
+ */
+export async function assertScopeNotDeleted(
+  deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
+  scope: string,
+  entry: { createdAt: string } | null | undefined,
 ): Promise<void> {
-  if (!deps.dataPointFeed || !deps.serverOwner) return;
-  let record: Awaited<ReturnType<DataPointFeedPort["getDataPoint"]>>;
-  try {
-    record = await deps.dataPointFeed.getDataPoint({
-      ownerAddress: deps.serverOwner,
-      scope,
-    });
-  } catch (err) {
-    deps.logger?.warn?.(
-      { scope, error: err instanceof Error ? err.message : String(err) },
-      "Could not check gateway deletion state for a missing scope",
-    );
-    return;
-  }
-  if (record?.deletedAt) {
-    throw new DataDeletedError({
-      scope,
-      dataPointId: record.id,
-      deletedAt: record.deletedAt,
-    });
-  }
+  const deletion = await resolveReadDeletion(deps, scope, entry);
+  if (deletion) throw new DataDeletedError(deletion);
 }
 
 // The delete worker wants a full Logger; the API logger is all-optional.
@@ -927,6 +951,11 @@ export async function handlePersonalServerDataRequest(
         at: url.searchParams.get("at") ?? undefined,
       });
 
+      // Deletion gate, after auth (so unauthenticated callers learn nothing)
+      // and before payment (so nobody is charged for deleted data). Covers
+      // both a stale local copy of a tombstoned scope and a local miss.
+      await assertScopeNotDeleted(deps, scopeResult.scope, selectedEntry);
+
       // X402 payment dance for builder reads. Owner-exempt reads (the
       // grantId sentinels "owner" / "policy-bypass") skip payment entirely
       // since there's no payable op to attach the payment to.
@@ -1035,7 +1064,10 @@ export async function handlePersonalServerDataRequest(
       });
       if (!result.ok) {
         if (result.status === 404) {
-          await throwIfScopeDeleted(deps, scopeResult.scope);
+          // The entry selected above can vanish before the read (a sync
+          // reconcile applying a tombstone concurrently); answer 410, not
+          // 404, when that is why.
+          await assertScopeNotDeleted(deps, scopeResult.scope, undefined);
         }
         return contractErrorResponse(result);
       }

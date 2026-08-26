@@ -40,6 +40,7 @@ import { createSyncCursor } from "./sync-cursor.js";
 import {
   createGatewayDataPointFeed,
   createGatewayDeleteDataPort,
+  createScopeDeletionTracker,
   createSyncManager,
   type SyncManager,
 } from "@opendatalabs/personal-server-ts-core/sync";
@@ -295,6 +296,13 @@ export async function createServer(
   const dataPointFeed =
     options?.dataPointFeed ??
     createGatewayDataPointFeed({ gatewayUrl: config.gateway.url });
+  // Read-side memory of tombstones, shared by the sync workers (which feed
+  // it) and the data route (which consults it on every read).
+  const scopeDeletions = createScopeDeletionTracker({
+    feed: dataPointFeed,
+    serverOwner,
+    logger,
+  });
 
   if (
     config.sync.enabled &&
@@ -325,6 +333,7 @@ export async function createServer(
       logger,
       lineageGateway,
       dataPointFeed,
+      scopeDeletions,
     };
 
     const downloadDeps = {
@@ -336,6 +345,7 @@ export async function createServer(
       serverOwner,
       logger,
       dataPointFeed,
+      scopeDeletions,
     };
 
     // Durable deletion: gateway tombstone signed with the same server
@@ -449,7 +459,7 @@ export async function createServer(
     accessLogReader,
     readFulfillmentReporter: options?.readFulfillmentReporter,
     dataStorage,
-    dataPointFeed,
+    scopeDeletions,
     cloudMode,
     devToken,
     ownerSignature: masterKeySignature,

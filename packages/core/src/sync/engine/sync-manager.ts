@@ -88,6 +88,21 @@ export function createSyncManager(
   // attempted once per session, not once per cycle; transient storage errors
   // back off exponentially instead of re-firing on every cycle.
   const downloadRetryMemory = createDownloadRetryMemory();
+  const dataPointFeed = downloadDeps.dataPointFeed ?? uploadDeps.dataPointFeed;
+  const scopeDeletions =
+    uploadDeps.scopeDeletions ?? downloadDeps.scopeDeletions;
+
+  // Sync cycles and durable deletes mutate the same local index and the same
+  // registry rows. Run them one at a time (FIFO): a delete cannot start while
+  // an upload of the same scope is between "blob uploaded" and "row marked
+  // synced", and a cycle cannot start until a delete has finished all three
+  // steps. A rejected operation never blocks the ones queued behind it.
+  let mutationQueue: Promise<unknown> = Promise.resolve();
+  function exclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const run = mutationQueue.then(operation, operation);
+    mutationQueue = run.catch(() => undefined);
+    return run;
+  }
 
   async function runCycle(): Promise<void> {
     // Prevent concurrent cycles
@@ -96,7 +111,7 @@ export function createSyncManager(
       return cycleInFlight;
     }
 
-    cycleInFlight = (async () => {
+    cycleInFlight = exclusive(async () => {
       do {
         rerunRequested = false;
         const canRun = await (options?.canSync?.() ?? { ok: true });
@@ -113,6 +128,8 @@ export function createSyncManager(
           await retryPendingBlobDeletions({
             deleteData: options?.deleteData,
             pendingBlobDeletions: options?.pendingBlobDeletions,
+            dataPointFeed,
+            serverOwner: uploadDeps.serverOwner,
             logger: uploadDeps.logger,
           });
         } catch (err) {
@@ -188,7 +205,7 @@ export function createSyncManager(
 
         lastSync = new Date().toISOString();
       } while (rerunRequested && isRunning);
-    })();
+    });
 
     try {
       await cycleInFlight;
@@ -296,16 +313,20 @@ export function createSyncManager(
       scheduleNotifiedCycle();
     },
 
-    async deleteScope(scope: string) {
-      return deleteScope(
-        {
-          storage: uploadDeps.storage,
-          serverOwner: uploadDeps.serverOwner,
-          deleteData: options?.deleteData,
-          pendingBlobDeletions: options?.pendingBlobDeletions,
-          logger: uploadDeps.logger,
-        },
-        scope,
+    deleteScope(scope: string) {
+      return exclusive(() =>
+        deleteScope(
+          {
+            storage: uploadDeps.storage,
+            serverOwner: uploadDeps.serverOwner,
+            deleteData: options?.deleteData,
+            pendingBlobDeletions: options?.pendingBlobDeletions,
+            scopeDeletions,
+            dataPointFeed,
+            logger: uploadDeps.logger,
+          },
+          scope,
+        ),
       );
     },
   };

@@ -10,6 +10,7 @@ import {
   createMemoryPsLiteTokenStore,
 } from "./test-support/memory.js";
 import { createMockPsLiteGateway } from "./test-support/gateway.js";
+import { createScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
@@ -626,6 +627,60 @@ describe("createPsLiteRuntime", () => {
       ),
     );
     expect(read.status).toBe(404);
+  });
+
+  it("refuses a stale local copy of a scope the gateway reports deleted (same gate as the node server)", async () => {
+    const tracker = createScopeDeletionTracker({
+      serverOwner: "0x0000000000000000000000000000000000000001",
+    });
+    const runtime = createTestRuntime({
+      storage: createMemoryPsLiteStorage(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      serverOwner: "0x0000000000000000000000000000000000000001",
+      scopeDeletions: tracker,
+    });
+    await runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer owner-token",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ username: "stale" }),
+      }),
+    );
+    const readUrl =
+      "https://ps.local/v1/data/instagram.profile?grantId=grant-1";
+    const builderHeaders = { Authorization: "Bearer builder-token" };
+
+    // The sync feed (or a delete on another replica) reports a tombstone
+    // newer than the local copy: the copy is refused, not served.
+    tracker.markDeleted("instagram.profile", "2099-01-01T00:00:00.000Z");
+    const refused = await runtime.fetch(
+      new Request(readUrl, { headers: builderHeaders }),
+    );
+    expect(refused.status).toBe(410);
+    expect(await refused.json()).toMatchObject({
+      error: {
+        errorCode: "DATA_DELETED",
+        details: {
+          scope: "instagram.profile",
+          deletedAt: "2099-01-01T00:00:00.000Z",
+        },
+      },
+    });
+
+    // A tombstone older than the local copy is a re-add: served.
+    tracker.markLive("instagram.profile");
+    tracker.markDeleted("instagram.profile", "2000-01-01T00:00:00.000Z");
+    const served = await runtime.fetch(
+      new Request(readUrl, { headers: builderHeaders }),
+    );
+    expect(served.status).toBe(200);
   });
 
   it("exposes grants, sync, access logs, and config routes through ps-lite", async () => {

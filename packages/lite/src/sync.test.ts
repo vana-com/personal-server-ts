@@ -9,7 +9,10 @@ import {
   createMemoryPsLiteStorage,
 } from "./test-support/memory.js";
 import { loadOrCreatePsLiteServerIdentity } from "./state.js";
-import { createPsLiteSyncManager } from "./sync.js";
+import {
+  createPsLitePendingBlobDeletionStore,
+  createPsLiteSyncManager,
+} from "./sync.js";
 
 const OWNER_SIGNATURE =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b" as const;
@@ -192,5 +195,94 @@ describe("PS Lite sync", () => {
       { downloaded: 0, fullReconcile: false },
       "Download cycle complete",
     );
+  });
+});
+
+describe("PS Lite pending blob deletion store", () => {
+  it("does not lose markers when a delete and a retry mutate the state key concurrently", async () => {
+    const stateStore = createMemoryPsLiteStateStore();
+    const store = createPsLitePendingBlobDeletionStore(stateStore);
+    await store.add("retrying.scope");
+
+    await Promise.all([
+      store.remove("retrying.scope"),
+      store.add("first.scope"),
+      store.add("second.scope"),
+      store.add("first.scope"),
+    ]);
+
+    expect(await store.list()).toEqual(["first.scope", "second.scope"]);
+    // Survives a fresh store over the same state.
+    expect(
+      await createPsLitePendingBlobDeletionStore(stateStore).list(),
+    ).toEqual(["first.scope", "second.scope"]);
+  });
+});
+
+describe("PS Lite read-side deletion memory", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("is fed by the sync feed so a tombstone listed on the next cycle is refused by reads", async () => {
+    const stateStore = createMemoryPsLiteStateStore();
+    const storage = createMemoryPsLiteStorage();
+    const identity = await loadOrCreatePsLiteServerIdentity({
+      store: stateStore,
+      ownerSignature: OWNER_SIGNATURE,
+    });
+    const owner = (await recoverServerOwner(OWNER_SIGNATURE)).toLowerCase();
+    const gateway = {
+      getServer: vi.fn().mockResolvedValue({
+        id: "server-browser-1",
+        ownerAddress: owner,
+        serverAddress: identity.account.address,
+        publicKey: identity.account.publicKey,
+        serverUrl: "https://browser.example",
+        addedAt: "2026-05-08T00:00:00.000Z",
+      }),
+      listDataPointsByOwner: vi.fn(),
+    };
+
+    const { syncManager, scopeDeletions } = await createPsLiteSyncManager({
+      config: ServerConfigSchema.parse({ sync: { enabled: true } }),
+      stateStore,
+      storage,
+      ownerSignature: OWNER_SIGNATURE,
+      serverAccount: identity.account,
+      gateway: gateway as never,
+      dataPointFeed: {
+        getDataPoint: async () => null,
+        listDataPointsByOwner: async () => ({
+          dataPoints: [
+            {
+              id: "0xdp-deleted",
+              ownerAddress: owner,
+              scope: "instagram.profile",
+              dataHash: "0x" + "11".repeat(32),
+              metadataHash: "0x" + "22".repeat(32),
+              expectedVersion: "2",
+              addedAt: "2026-05-09T00:00:00.000Z",
+              deletedAt: "2026-05-09T00:00:00.000Z",
+            },
+          ],
+          cursor: null,
+        }),
+      },
+    });
+
+    await syncManager.trigger();
+    await syncManager.stop();
+
+    expect(scopeDeletions.knownDeletion("instagram.profile")).toEqual({
+      deletedAt: "2026-05-09T00:00:00.000Z",
+    });
+    expect(scopeDeletions.feedAgeMs()).not.toBeNull();
+    await expect(
+      scopeDeletions.resolve("instagram.profile"),
+    ).resolves.toMatchObject({
+      deleted: true,
+      deletedAt: "2026-05-09T00:00:00.000Z",
+    });
   });
 });
