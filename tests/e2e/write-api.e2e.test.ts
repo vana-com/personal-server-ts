@@ -85,6 +85,29 @@ describe("Write API (e2e)", () => {
 
   let sessionToken: string;
 
+  it("answers CORS preflight for both Write API routes without credentials", async () => {
+    // A browser builder app preflights both routes; the real HTTP server must
+    // answer 204 before auth and allowlist the delegated-write headers.
+    for (const path of ["/v1/write/session", `/v1/data/${SCOPE}`]) {
+      const res = await fetch(`${server.url}${path}`, {
+        method: "OPTIONS",
+        headers: {
+          Origin: "https://builder.example",
+          "Access-Control-Request-Method": "POST",
+          "Access-Control-Request-Headers":
+            "authorization, content-type, x-vana-write-signature",
+        },
+      });
+      expect(res.status, path).toBe(204);
+      expect(res.headers.get("access-control-allow-origin"), path).toBe("*");
+      const allowed = (
+        res.headers.get("access-control-allow-headers") ?? ""
+      ).toLowerCase();
+      expect(allowed, path).toContain("authorization");
+      expect(allowed, path).toContain("x-vana-write-signature");
+    }
+  });
+
   it("opens a write-session with a Web3Signed handshake + write-grant", async () => {
     const auth = await buildWeb3SignedHeader({
       wallet: builderWallet,

@@ -1,5 +1,4 @@
 import { Hono } from "hono";
-import { cors } from "hono/cors";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -12,6 +11,7 @@ import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logg
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
 import { healthRoute, type HealthDeps } from "./routes/health.js";
+import { corsMiddleware } from "./middleware/cors.js";
 import { dataRoutes } from "./routes/data.js";
 import { writeSessionRoutes } from "./routes/write-session.js";
 import {
@@ -127,16 +127,10 @@ export function createApp(deps: AppDeps): Hono {
   const writeSessionStore =
     deps.writeSessionStore ?? createInMemoryWriteSessionStore();
 
-  // CORS — allow all origins for browser-based clients
-  app.use(
-    "*",
-    cors({
-      origin: "*",
-      allowHeaders: ["Content-Type", "Authorization"],
-      allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-      maxAge: 86400,
-    }),
-  );
+  // CORS — allow all origins for browser-based clients. Registered first so
+  // OPTIONS preflights are answered before any route or auth code runs
+  // (route sub-apps only register their real methods).
+  app.use("*", corsMiddleware());
 
   // Mount health route
   app.route(

@@ -20,6 +20,7 @@ import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import pino from "pino";
 import type { TokenStore } from "./token-store.js";
+import { WRITE_SIGNATURE_HEADER } from "@opendatalabs/personal-server-ts-core/write";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const ownerWallet = createTestWallet(0);
@@ -794,5 +795,85 @@ describe("createApp", () => {
 
     const body = await res.json();
     expect(body.status).toBe("stored");
+  });
+
+  describe("CORS preflight (Write API)", () => {
+    // Builder apps call both Write API routes cross-origin from the browser.
+    // The preflight is answered by the app-level CORS middleware BEFORE any
+    // route or auth code, so it must succeed with no credentials and must
+    // allowlist every non-safelisted header the routes read. Browsers match
+    // header names case-insensitively, so assertions lowercase both sides.
+    const PREFLIGHT_ORIGIN = "https://builder.example";
+
+    function lowerList(value: string | null): string[] {
+      return (value ?? "").split(",").map((h) => h.trim().toLowerCase());
+    }
+
+    it("OPTIONS /v1/write/session answers 204 without credentials", async () => {
+      const app = makeApp();
+      const res = await app.request("/v1/write/session", {
+        method: "OPTIONS",
+        headers: {
+          Origin: PREFLIGHT_ORIGIN,
+          "Access-Control-Request-Method": "POST",
+          "Access-Control-Request-Headers": "authorization",
+        },
+      });
+      expect(res.status).toBe(204);
+      expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+      expect(res.headers.get("Access-Control-Allow-Methods")).toContain("POST");
+      expect(
+        lowerList(res.headers.get("Access-Control-Allow-Headers")),
+      ).toContain("authorization");
+    });
+
+    it("OPTIONS /v1/data/:scope allowlists the delegated-write headers", async () => {
+      const app = makeApp();
+      const res = await app.request("/v1/data/notes.entries", {
+        method: "OPTIONS",
+        headers: {
+          Origin: PREFLIGHT_ORIGIN,
+          "Access-Control-Request-Method": "POST",
+          "Access-Control-Request-Headers":
+            "Authorization, Content-Type, X-Vana-Write-Signature, X-Vana-Metadata",
+        },
+      });
+      expect(res.status).toBe(204);
+      expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+      expect(res.headers.get("Access-Control-Allow-Methods")).toContain("POST");
+      const allowed = lowerList(
+        res.headers.get("Access-Control-Allow-Headers"),
+      );
+      for (const required of [
+        "authorization",
+        "content-type",
+        WRITE_SIGNATURE_HEADER,
+        "x-vana-metadata",
+      ]) {
+        expect(allowed).toContain(required);
+      }
+    });
+
+    it("preflight bypass does not extend to the real request", async () => {
+      const app = makeApp();
+      const res = await app.request("/v1/write/session", {
+        method: "POST",
+        headers: { Origin: PREFLIGHT_ORIGIN },
+      });
+      expect(res.status).toBe(401);
+      // Error responses still carry CORS so the browser can surface them.
+      expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    });
+
+    it("exposes the response headers a browser client reads back", async () => {
+      const app = makeApp();
+      const res = await app.request("/health", {
+        headers: { Origin: PREFLIGHT_ORIGIN },
+      });
+      expect(res.status).toBe(200);
+      expect(
+        lowerList(res.headers.get("Access-Control-Expose-Headers")),
+      ).toContain("x-vana-metadata");
+    });
   });
 });
