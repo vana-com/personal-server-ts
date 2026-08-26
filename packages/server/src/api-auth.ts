@@ -14,8 +14,10 @@ import {
   verifyDataWritePolicy,
 } from "@opendatalabs/personal-server-ts-core/policy";
 import {
+  createInMemoryWriteProofReplayStore,
   hashWriteSessionToken,
   verifyWriterAttribution,
+  type WriteProofReplayStore,
   type WriteSessionStore,
 } from "@opendatalabs/personal-server-ts-core/write";
 import {
@@ -46,6 +48,12 @@ export interface ServerApiAuthDeps {
    * exactly as before.
    */
   writeSessionStore?: WriteSessionStore;
+  /**
+   * Replay guard for per-write proofs (X-Vana-Write-Signature). Defaults to
+   * an in-memory store so replay protection is always on when write sessions
+   * are enabled; hosts may supply a shared store.
+   */
+  writeProofReplayStore?: WriteProofReplayStore;
 }
 
 function serverNotConfigured(): ProtocolError {
@@ -100,6 +108,9 @@ function bearerToken(request: Request): string | null {
 export function createServerApiAuth(
   deps: ServerApiAuthDeps,
 ): PersonalServerApiAuthPort {
+  const writeProofReplayStore =
+    deps.writeProofReplayStore ?? createInMemoryWriteProofReplayStore();
+
   async function authorizeOwner(request: Request): Promise<void> {
     const result = await authenticate(request, deps);
     if (result.isPolicyBypass) return;
@@ -146,16 +157,20 @@ export function createServerApiAuth(
             // the demo slice (write fee mechanics undecided).
           },
         );
-        const attribution = await verifyWriterAttribution({
+        // releaseProof is a rollback hook for the handler, never part of the
+        // stored attribution record.
+        const { releaseProof, ...attribution } = await verifyWriterAttribution({
           request: input.request,
           builderAddress: session.builderAddress,
           grantId: grant.id,
           serverOrigin: deps.serverOrigin,
+          replayStore: writeProofReplayStore,
         });
         return {
           builder: session.builderAddress,
           grantId: grant.id,
           attribution,
+          releaseProof,
         };
       }
     }

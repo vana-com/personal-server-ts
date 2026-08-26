@@ -90,6 +90,12 @@ export interface PersonalServerWriteAuthResult {
   builder: `0x${string}`;
   grantId: string;
   attribution: WriterAttribution;
+  /**
+   * Rolls back the per-write proof reservation (replay guard). The handler
+   * calls it when the write fails BEFORE the record is committed, so the
+   * builder can retry with the same still-valid proof.
+   */
+  releaseProof?: () => Promise<void>;
 }
 
 export interface PersonalServerReadFulfillment {
@@ -886,108 +892,126 @@ export async function handlePersonalServerDataRequest(
       } else {
         await deps.auth.authorizeOwner(request);
       }
-      const scopeResult = parseDataScopeContract(scopeParam);
-      if (!scopeResult.ok) return contractErrorResponse(scopeResult);
-      const collectedAtValue = collectedAt(deps.now ?? (() => new Date()));
-      const status = deps.syncManager ? "syncing" : "stored";
+      // A write that fails before commit hands the proof back (replay guard)
+      // so the builder's retry with the same still-valid proof is accepted;
+      // after commit the proof stays consumed (a retry would be a duplicate).
+      let committed = false;
+      const failWrite = async <T>(response: T): Promise<T> => {
+        await writeAuth?.releaseProof?.();
+        return response;
+      };
+      try {
+        const scopeResult = parseDataScopeContract(scopeParam);
+        if (!scopeResult.ok)
+          return failWrite(contractErrorResponse(scopeResult));
+        const collectedAtValue = collectedAt(deps.now ?? (() => new Date()));
+        const status = deps.syncManager ? "syncing" : "stored";
 
-      // Builder writes land in the same access log as builder reads, so the
-      // owner sees who wrote what under which grant.
-      // Best-effort: it runs AFTER the record is committed, so a log failure
-      // must not turn a successful write into a 500 (the builder would retry
-      // and store a duplicate). The ingest log line above still names the
-      // builder; the failure itself is logged for the owner.
-      const logBuilderWrite = async (): Promise<void> => {
-        if (!writeAuth) return;
-        try {
-          await deps.accessLogWriter.write({
-            logId: deps.createLogId?.() ?? crypto.randomUUID(),
-            grantId: writeAuth.grantId,
-            builder: writeAuth.builder,
-            action: "write",
-            scope: scopeResult.scope,
-            timestamp: (deps.now ?? (() => new Date()))().toISOString(),
-            ipAddress:
-              request.headers.get("x-forwarded-for") ??
-              request.headers.get("x-real-ip") ??
-              "unknown",
-            userAgent: request.headers.get("user-agent") ?? "unknown",
+        // Builder writes land in the same access log as builder reads, so the
+        // owner sees who wrote what under which grant.
+        // Best-effort: it runs AFTER the record is committed, so a log failure
+        // must not turn a successful write into a 500 (the builder would retry
+        // and store a duplicate). The ingest log line above still names the
+        // builder; the failure itself is logged for the owner.
+        const logBuilderWrite = async (): Promise<void> => {
+          if (!writeAuth) return;
+          try {
+            await deps.accessLogWriter.write({
+              logId: deps.createLogId?.() ?? crypto.randomUUID(),
+              grantId: writeAuth.grantId,
+              builder: writeAuth.builder,
+              action: "write",
+              scope: scopeResult.scope,
+              timestamp: (deps.now ?? (() => new Date()))().toISOString(),
+              ipAddress:
+                request.headers.get("x-forwarded-for") ??
+                request.headers.get("x-real-ip") ??
+                "unknown",
+              userAgent: request.headers.get("user-agent") ?? "unknown",
+            });
+          } catch (err) {
+            deps.logger?.warn?.(
+              {
+                scope: scopeResult.scope,
+                builder: writeAuth.builder,
+                grantId: writeAuth.grantId,
+                error: err instanceof Error ? err.message : String(err),
+              },
+              "Builder write access-log entry failed; record already stored",
+            );
+          }
+        };
+
+        // Binary / unstructured data (e.g. a PDF): the body is raw bytes. DPv2
+        // data points are scope-addressed and carry no schemaId, so unstructured
+        // data needs no schema at all — we ingest it schemaless. (Structured JSON
+        // below still resolves a schema for validation/metadata.)
+        if (!isJsonContentType(request)) {
+          const bytes = new Uint8Array(await request.arrayBuffer());
+          const result = await ingestBinaryDataContract({
+            storage: deps.storage,
+            scopeParam: scopeResult.scope,
+            bytes,
+            mimeType: binaryMimeType(request),
+            filename: binaryFilename(request),
+            metadata: parseMetadataHeader(
+              request.headers.get("x-vana-metadata"),
+            ),
+            collectedAt: collectedAtValue,
+            status,
+            attribution: writeAuth?.attribution,
           });
-        } catch (err) {
-          deps.logger?.warn?.(
+          if (!result.ok) return failWrite(contractErrorResponse(result));
+          committed = true;
+          deps.logger?.info?.(
             {
               scope: scopeResult.scope,
-              builder: writeAuth.builder,
-              grantId: writeAuth.grantId,
-              error: err instanceof Error ? err.message : String(err),
+              collectedAt: collectedAtValue,
+              path: result.writeResult.relativePath,
+              mimeType: binaryMimeType(request),
+              sizeBytes: bytes.length,
+              ...(writeAuth ? { builder: writeAuth.builder } : {}),
             },
-            "Builder write access-log entry failed; record already stored",
+            "Binary data file ingested",
           );
+          await logBuilderWrite();
+          notifyNewData(deps.syncManager);
+          return jsonResponse(result.response, { status: 201 });
         }
-      };
 
-      // Binary / unstructured data (e.g. a PDF): the body is raw bytes. DPv2
-      // data points are scope-addressed and carry no schemaId, so unstructured
-      // data needs no schema at all — we ingest it schemaless. (Structured JSON
-      // below still resolves a schema for validation/metadata.)
-      if (!isJsonContentType(request)) {
-        const bytes = new Uint8Array(await request.arrayBuffer());
-        const result = await ingestBinaryDataContract({
+        const parsed = await parseJsonObjectBody(
+          request,
+          "Request body must be valid JSON",
+        );
+        if (!parsed.ok) return failWrite(contractResponse(parsed.result));
+        // DPv2 is scope-addressed and the gateway records no schemas, so JSON
+        // ingest is schemaless too — no lookup, no schemaId/$schema stamped.
+        const result = await ingestDataContract({
           storage: deps.storage,
           scopeParam: scopeResult.scope,
-          bytes,
-          mimeType: binaryMimeType(request),
-          filename: binaryFilename(request),
-          metadata: parseMetadataHeader(request.headers.get("x-vana-metadata")),
+          body: parsed.body,
           collectedAt: collectedAtValue,
           status,
           attribution: writeAuth?.attribution,
         });
-        if (!result.ok) return contractErrorResponse(result);
+        if (!result.ok) return failWrite(contractErrorResponse(result));
+        committed = true;
         deps.logger?.info?.(
           {
             scope: scopeResult.scope,
             collectedAt: collectedAtValue,
             path: result.writeResult.relativePath,
-            mimeType: binaryMimeType(request),
-            sizeBytes: bytes.length,
             ...(writeAuth ? { builder: writeAuth.builder } : {}),
           },
-          "Binary data file ingested",
+          "Data file ingested",
         );
         await logBuilderWrite();
         notifyNewData(deps.syncManager);
         return jsonResponse(result.response, { status: 201 });
+      } catch (err) {
+        if (!committed) await writeAuth?.releaseProof?.();
+        throw err;
       }
-
-      const parsed = await parseJsonObjectBody(
-        request,
-        "Request body must be valid JSON",
-      );
-      if (!parsed.ok) return contractResponse(parsed.result);
-      // DPv2 is scope-addressed and the gateway records no schemas, so JSON
-      // ingest is schemaless too — no lookup, no schemaId/$schema stamped.
-      const result = await ingestDataContract({
-        storage: deps.storage,
-        scopeParam: scopeResult.scope,
-        body: parsed.body,
-        collectedAt: collectedAtValue,
-        status,
-        attribution: writeAuth?.attribution,
-      });
-      if (!result.ok) return contractErrorResponse(result);
-      deps.logger?.info?.(
-        {
-          scope: scopeResult.scope,
-          collectedAt: collectedAtValue,
-          path: result.writeResult.relativePath,
-          ...(writeAuth ? { builder: writeAuth.builder } : {}),
-        },
-        "Data file ingested",
-      );
-      await logBuilderWrite();
-      notifyNewData(deps.syncManager);
-      return jsonResponse(result.response, { status: 201 });
     }
 
     if (request.method === "DELETE") {

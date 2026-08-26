@@ -21,6 +21,7 @@ export {
   WriterAttributionVerificationError,
   type BinaryWriteSignedBytesInput,
   type StoredWriterAttributionVerification,
+  type VerifiedWriterAttribution,
   type VerifyStoredWriterAttributionOptions,
   type VerifyWriterAttributionInput,
   type WriterAttribution,

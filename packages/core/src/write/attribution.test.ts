@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   parseWeb3SignedHeader,
   verifyWeb3Signed,
@@ -14,6 +14,7 @@ import {
   type WriterAttribution,
 } from "./attribution.js";
 import { buildBinaryEnvelopeData, sha256Hex } from "../contracts/binary.js";
+import { createInMemoryWriteProofReplayStore } from "./session.js";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
@@ -320,6 +321,50 @@ describe("verifyWriterAttribution", () => {
         }),
       ),
     ).rejects.toMatchObject({ errorCode: "WRITE_ATTRIBUTION_INVALID" });
+  });
+
+  it("consumes the proof so an identical write is rejected as a replay", async () => {
+    const replayStore = createInMemoryWriteProofReplayStore();
+    const request = await buildWriteRequest({});
+    const verify = () =>
+      verifyWriterAttribution({
+        request: request.clone(),
+        builderAddress: builderWallet.address,
+        grantId: GRANT_ID,
+        serverOrigin: SERVER_ORIGIN,
+        replayStore,
+      });
+    const first = await verify();
+    expect(first.builder).toBe(builderWallet.address);
+    expect(typeof first.releaseProof).toBe("function");
+    await expect(verify()).rejects.toMatchObject({
+      code: 401,
+      errorCode: "WRITE_ATTRIBUTION_REPLAY",
+    });
+    // A write that failed before commit hands the proof back: the same
+    // proof is accepted again.
+    await first.releaseProof?.();
+    await expect(verify()).resolves.toMatchObject({
+      builder: builderWallet.address,
+    });
+  });
+
+  it("does not consume the proof of a request that fails verification", async () => {
+    const replayStore = createInMemoryWriteProofReplayStore();
+    const consume = vi.spyOn(replayStore, "consume");
+    const request = await buildWriteRequest({ signer: otherWallet });
+    await expect(
+      verifyWriterAttribution({
+        request,
+        builderAddress: builderWallet.address,
+        grantId: GRANT_ID,
+        serverOrigin: SERVER_ORIGIN,
+        replayStore,
+      }),
+    ).rejects.toMatchObject({
+      errorCode: "WRITE_ATTRIBUTION_SIGNER_MISMATCH",
+    });
+    expect(consume).not.toHaveBeenCalled();
   });
 
   it("does not apply the JSON canonical rule to binary bodies", async () => {

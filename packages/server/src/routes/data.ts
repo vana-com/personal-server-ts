@@ -18,7 +18,10 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/ports";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { TokenStore } from "../token-store.js";
-import type { WriteSessionStore } from "@opendatalabs/personal-server-ts-core/write";
+import type {
+  WriteProofReplayStore,
+  WriteSessionStore,
+} from "@opendatalabs/personal-server-ts-core/write";
 import type { Logger } from "pino";
 import {
   createBodyLimit,
@@ -66,6 +69,8 @@ export interface DataRouteDeps {
    * writes; absent = owner-only ingest, unchanged.
    */
   writeSessionStore?: WriteSessionStore;
+  /** Replay guard for per-write proofs; defaults to in-memory (api-auth). */
+  writeProofReplayStore?: WriteProofReplayStore;
   /**
    * Powers the RECORD_DATA_ACCESS attestation embedded in 402 challenges.
    * When supplied alongside serverOwner + paymentEnabled, every challenge
@@ -101,6 +106,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     dataStorage,
     runtimeAvailability: deps.runtimeAvailability,
     writeSessionStore: deps.writeSessionStore,
+    writeProofReplayStore: deps.writeProofReplayStore,
   });
 
   app.use("/:scope", createBodyLimit(DATA_INGEST_MAX_SIZE));

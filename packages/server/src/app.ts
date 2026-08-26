@@ -16,6 +16,7 @@ import { dataRoutes } from "./routes/data.js";
 import { writeSessionRoutes } from "./routes/write-session.js";
 import {
   createInMemoryWriteSessionStore,
+  type WriteProofReplayStore,
   type WriteSessionStore,
 } from "@opendatalabs/personal-server-ts-core/write";
 import { grantsRoutes } from "./routes/grants.js";
@@ -118,6 +119,11 @@ export interface AppDeps {
    * an in-memory store, mirroring the MCP connection store default.
    */
   writeSessionStore?: WriteSessionStore;
+  /**
+   * Replay guard for per-write proofs on delegated ingest. Defaults to an
+   * in-memory store (api-auth); hosts may supply a shared one.
+   */
+  writeProofReplayStore?: WriteProofReplayStore;
 }
 
 export function createApp(deps: AppDeps): Hono {
@@ -179,6 +185,7 @@ export function createApp(deps: AppDeps): Hono {
         deps.gatewayUrl ?? deps.config?.gateway.url ?? deps.gatewayConfig?.url,
       paymentEnabled: deps.paymentEnabled,
       writeSessionStore,
+      writeProofReplayStore: deps.writeProofReplayStore,
       mountPath: "/v1/data",
     }),
   );

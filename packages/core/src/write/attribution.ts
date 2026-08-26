@@ -49,6 +49,8 @@ import {
 } from "@opendatalabs/vana-sdk/browser";
 import { recoverMessageAddress } from "viem";
 import { ProtocolError } from "../errors/catalog.js";
+import { hashConnectionToken as sha256HexOf } from "../mcp/connection-api.js";
+import type { WriteProofReplayStore } from "./session.js";
 import {
   binaryFilename,
   binaryMimeType,
@@ -94,6 +96,24 @@ export interface VerifyWriterAttributionInput {
   grantId: string;
   serverOrigin: string | (() => string);
   now?: () => Date;
+  /**
+   * Replay guard for the per-write proof. When supplied, a proof is consumed
+   * on successful verification (keyed by a digest of the exact header,
+   * remembered until the proof's own expiry) and a second write carrying the
+   * same proof is rejected: holding the session bearer plus one captured
+   * signed request must not allow re-storing it until the proof expires.
+   */
+  replayStore?: WriteProofReplayStore;
+}
+
+/** verifyWriterAttribution's result: the record to store plus a rollback. */
+export interface VerifiedWriterAttribution extends WriterAttribution {
+  /**
+   * Present when a replay store consumed the proof. Callers whose write then
+   * FAILS before the record is committed should call it so the builder can
+   * retry with the same still-valid proof (a retry after success is a replay).
+   */
+  releaseProof?: () => Promise<void>;
 }
 
 function resolveOrigin(origin: string | (() => string)): string {
@@ -158,7 +178,7 @@ async function signedBytesFor(
  */
 export async function verifyWriterAttribution(
   input: VerifyWriterAttributionInput,
-): Promise<WriterAttribution> {
+): Promise<VerifiedWriterAttribution> {
   const headerValue =
     input.request.headers.get(WRITE_SIGNATURE_HEADER) ?? undefined;
   if (!headerValue) {
@@ -213,6 +233,25 @@ export async function verifyWriterAttribution(
     assertCanonicalJsonBody(bodyBytes);
   }
 
+  // Replay guard, last: only a proof that passed every check is consumed,
+  // so a rejected request never burns a proof.
+  let releaseProof: (() => Promise<void>) | undefined;
+  if (input.replayStore) {
+    const store = input.replayStore;
+    const proofId = await sha256HexOf(headerValue);
+    const replayed = await store.consume(proofId, verified.payload.exp * 1000);
+    if (replayed) {
+      throw new ProtocolError(
+        401,
+        "WRITE_ATTRIBUTION_REPLAY",
+        "Payload proof already used; sign a fresh proof for each write",
+      );
+    }
+    releaseProof = async () => {
+      await store.release?.(proofId);
+    };
+  }
+
   // Store the compact `{payload}.{signature}` form (scheme prefix stripped)
   // so verifiers don't need to know the header framing.
   const { payloadBase64, signature } = parseWeb3SignedHeader(headerValue);
@@ -223,6 +262,7 @@ export async function verifyWriterAttribution(
     signature: `${payloadBase64}.${signature}`,
     bodyHash: verified.payload.bodyHash,
     writtenAt: (input.now?.() ?? new Date()).toISOString(),
+    ...(releaseProof ? { releaseProof } : {}),
   };
 }
 

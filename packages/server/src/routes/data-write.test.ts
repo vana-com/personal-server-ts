@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { pino } from "pino";
 import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
+import { createNodeDataStorage } from "../storage/node-data-storage.js";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { GatewayClient, Builder } from "@opendatalabs/vana-sdk/node";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
@@ -335,6 +336,104 @@ describe("POST /v1/data/:scope with a write session", () => {
     expect(envelope.data[WRITER_ATTRIBUTION_KEY].builder).toBe(
       builderWallet.address,
     );
+  });
+
+  it("rejects a replayed write: the same signed request is stored once", async () => {
+    // Capture one valid signed request (bearer + proof + body) and send it
+    // twice, as an attacker holding the session token would.
+    const rawBody = JSON.stringify({ note: "once" });
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${SESSION_TOKEN}`,
+      [WRITE_SIGNATURE_HEADER]: await buildWeb3SignedHeader({
+        wallet: builderWallet,
+        aud: SERVER_ORIGIN,
+        method: "POST",
+        uri: `/${SCOPE}`,
+        body: new TextEncoder().encode(rawBody),
+        grantId: WRITE_GRANT_ID,
+      }),
+    };
+    const send = () =>
+      app.request(`/${SCOPE}`, { method: "POST", headers, body: rawBody });
+
+    const first = await send();
+    expect(first.status).toBe(201);
+    const replay = await send();
+    expect(replay.status).toBe(401);
+    const body = await replay.json();
+    expect(body.error.errorCode).toBe("WRITE_ATTRIBUTION_REPLAY");
+    // Exactly one record, the first write's.
+    const read = await ownerRead(SCOPE);
+    expect(read.status).toBe(200);
+    expect((await read.json()).data.note).toBe("once");
+    const writeEntries = (
+      accessLogWriter.write as ReturnType<typeof vi.fn>
+    ).mock.calls.filter(([entry]) => entry.action === "write");
+    expect(writeEntries).toHaveLength(1);
+  });
+
+  it("a write that fails before commit does not burn its proof", async () => {
+    // Storage that fails the first commit, then works: the same signed
+    // request must be accepted on retry rather than rejected as a replay.
+    const flakyIndex = createIndexManager(initializeDatabase(":memory:"));
+    const realStorage = createNodeDataStorage({
+      indexManager: flakyIndex,
+      hierarchyOptions,
+    });
+    let failures = 1;
+    const flakyApp = dataRoutes({
+      indexManager: flakyIndex,
+      hierarchyOptions,
+      logger,
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway,
+      accessLogWriter,
+      writeSessionStore,
+      dataStorage: {
+        ...realStorage,
+        async writeEnvelope(envelope) {
+          if (failures-- > 0) throw new Error("disk full");
+          return realStorage.writeEnvelope(envelope);
+        },
+      },
+    });
+    const rawBody = JSON.stringify({ note: "retry" });
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${SESSION_TOKEN}`,
+      [WRITE_SIGNATURE_HEADER]: await buildWeb3SignedHeader({
+        wallet: builderWallet,
+        aud: SERVER_ORIGIN,
+        method: "POST",
+        uri: `/${SCOPE}`,
+        body: new TextEncoder().encode(rawBody),
+        grantId: WRITE_GRANT_ID,
+      }),
+    };
+    const send = () =>
+      flakyApp.request(`/${SCOPE}`, {
+        method: "POST",
+        headers,
+        body: rawBody,
+      });
+
+    const failing = await send();
+    expect(failing.status).toBe(500);
+    const retry = await send();
+    expect(retry.status).toBe(201);
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: `/${SCOPE}`,
+    });
+    const read = await flakyApp.request(`/${SCOPE}`, {
+      headers: { Authorization: auth },
+    });
+    expect((await read.json()).data.note).toBe("retry");
+    flakyIndex.close();
   });
 
   it("rejects a session write without the attribution proof", async () => {
