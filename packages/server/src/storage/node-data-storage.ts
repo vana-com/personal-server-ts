@@ -128,6 +128,15 @@ export function createNodeDataStorage(
       deps.indexManager.deleteByPath(entry.path);
       return true;
     },
+    async deleteVersion(scope: string, collectedAt: string) {
+      const entry = deps.indexManager.findClosestByScope(scope, collectedAt);
+      if (!entry || entry.collectedAt !== collectedAt) return false;
+      // Same ordering as deleteByFileId: blob first (ENOENT-tolerant), then
+      // the index row, so a real blob failure keeps the row for a retry.
+      await deleteDataFile(deps.hierarchyOptions, scope, collectedAt);
+      deps.indexManager.deleteByPath(entry.path);
+      return true;
+    },
     dropUnsyncedEntry(path: string) {
       // Index row only — the payload file is already gone (that is why the
       // caller is dropping it). No blob delete. Guarded to unsynced rows: if

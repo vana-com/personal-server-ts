@@ -209,3 +209,24 @@ export class InvalidCascadeError extends ProtocolError {
     );
   }
 }
+
+// 502 - Upstream (gateway) errors
+
+export class DeleteTombstoneFailedError extends ProtocolError {
+  constructor(details?: Record<string, unknown>) {
+    super(
+      502,
+      "DELETE_TOMBSTONE_FAILED",
+      "Gateway did not acknowledge the deletion tombstone; nothing was deleted",
+      details,
+    );
+  }
+}
+
+// 410 - Deleted resources
+
+export class DataDeletedError extends ProtocolError {
+  constructor(details?: Record<string, unknown>) {
+    super(410, "DATA_DELETED", "Data point has been deleted", details);
+  }
+}

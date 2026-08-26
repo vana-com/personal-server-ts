@@ -9,14 +9,19 @@ import { createSdkStorageAdapter } from "./sdk.js";
 // explicit apiUrl is configured.
 const DEFAULT_VANA_STORAGE_ENDPOINT = "https://storage.vana.org";
 
+/** Storage base URL the sync adapter targets (config override or SDK default). */
+export function resolveVanaStorageEndpoint(config: ServerConfig): string {
+  return (
+    config.storage.config.vana?.apiUrl ?? DEFAULT_VANA_STORAGE_ENDPOINT
+  ).replace(/\/+$/, "");
+}
+
 export function createVanaSyncStorageAdapter(params: {
   config: ServerConfig;
   serverOwner: `0x${string}`;
   serverAccount: ServerAccount;
 }): StorageAdapter {
-  const endpoint = (
-    params.config.storage.config.vana?.apiUrl ?? DEFAULT_VANA_STORAGE_ENDPOINT
-  ).replace(/\/+$/, "");
+  const endpoint = resolveVanaStorageEndpoint(params.config);
   // The SDK's vana-storage provider lowercases the owner before building the
   // blob path (and its URL validator compares against the lowercased form),
   // so urlForKey MUST lowercase too or the reconstructed download URL won't

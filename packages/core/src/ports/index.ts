@@ -157,6 +157,14 @@ export interface DataStoragePort extends RuntimeStoragePort {
    */
   deleteByFileId(fileId: string): Promise<boolean>;
   /**
+   * Delete a single version (index entry + its local blob + block sidecars)
+   * by its DPv2 identity (scope, collectedAt). Returns true if a local copy
+   * existed and was removed, false if none was present (no-op). Used by sync
+   * deletion reconciliation to drop the exact versions a gateway tombstone
+   * covers while leaving a newer local re-ingest in place.
+   */
+  deleteVersion(scope: string, collectedAt: string): Promise<boolean>;
+  /**
    * Drop a single unsynced index entry by path, WITHOUT touching any blob.
    * Used by the upload worker to evict an orphaned row whose local payload
    * file is already gone (e.g. a manual `data/<scope>` deletion): the row can
@@ -168,6 +176,99 @@ export interface DataStoragePort extends RuntimeStoragePort {
 
 export interface RuntimeAvailabilityPort {
   isAvailable(): boolean | Promise<boolean>;
+}
+
+/**
+ * A gateway data-point row as seen by sync, including the deletion marker the
+ * plain SDK `DataPointRecord` does not model. `deletedAt` is null while the
+ * point is live and an ISO timestamp once the owner has tombstoned it.
+ */
+export interface DataPointFeedRecord extends DataPointRecord {
+  deletedAt: string | null;
+}
+
+export interface DataPointFeedListOptions extends ListDataPointsOptions {
+  /**
+   * Ask the gateway to include tombstoned rows (with `deletedAt` set). Sync
+   * always passes true: deletions must reach every replica or the local copy
+   * would be re-uploaded and resurrect the point.
+   */
+  includeDeleted?: boolean;
+}
+
+export interface DataPointFeedListResult {
+  dataPoints: DataPointFeedRecord[];
+  cursor: string | null;
+}
+
+/**
+ * Deletion-aware view of the gateway data-point registry. Mirrors the SDK
+ * `GatewayClient` listing/lookup shape but surfaces `deletedAt`, which the
+ * SDK client (3.14) neither requests (`includeDeleted`) nor types.
+ */
+export interface DataPointFeedPort {
+  listDataPointsByOwner(
+    owner: string,
+    cursor: string | null,
+    options?: DataPointFeedListOptions,
+  ): Promise<DataPointFeedListResult>;
+  /**
+   * Current registry row for (owner, scope), deleted or not. Null when the
+   * point was never registered. A tombstoned point comes back with
+   * `deletedAt` set (never as a thrown 410).
+   */
+  getDataPoint(input: {
+    ownerAddress: string;
+    scope: string;
+  }): Promise<DataPointFeedRecord | null>;
+}
+
+export type TombstoneOutcome =
+  | {
+      status: "tombstoned";
+      dataPointId: string;
+      /** The tombstone's own version (previous current + 1). */
+      version: string;
+      deletedAt: string | null;
+    }
+  | {
+      status: "already-deleted";
+      dataPointId: string;
+      version: string;
+      deletedAt: string | null;
+    }
+  | {
+      /** The gateway has no row for (owner, scope): nothing to tombstone. */
+      status: "not-registered";
+      dataPointId: string;
+    };
+
+export interface DeleteBlobsOutcome {
+  /** Blob count reported by storage, or null when the backend does not say. */
+  blobsDeleted: number | null;
+}
+
+/**
+ * Remote side of durable deletion. `tombstone` is the durable fact (an
+ * owner-signed AddData with the tombstone commitments, recorded by the
+ * gateway); `deleteBlobs` removes every version's ciphertext from storage.
+ * Callers MUST run tombstone first: a blob delete without a tombstone leaves
+ * a live registry row every replica would 404 on and then wedge.
+ */
+export interface DeleteDataPort {
+  tombstone(scope: string): Promise<TombstoneOutcome>;
+  deleteBlobs(scope: string): Promise<DeleteBlobsOutcome>;
+}
+
+/**
+ * Durable retry marker for blob deletion that failed AFTER the gateway
+ * tombstone landed. The tombstone already makes the deletion stick; this
+ * only exists so a later sync cycle finishes removing the ciphertext.
+ */
+export interface PendingBlobDeletionStore {
+  list(): Promise<string[]>;
+  add(scope: string): Promise<void>;
+  remove(scope: string): Promise<void>;
 }
 
 // FeeVerifier was the pre-X402 hook that gated reads on grant.paymentStatus
