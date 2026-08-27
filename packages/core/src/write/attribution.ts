@@ -63,6 +63,7 @@ import {
 } from "../contracts/binary.js";
 import {
   LINEAGE_KEY,
+  StoredLineageMalformedError,
   extractLineageField,
   readStoredLineage,
 } from "../lineage/lineage.js";
@@ -497,7 +498,18 @@ export async function verifyStoredWriterAttribution(
     signedAbsent || !signedWellFormed
       ? null
       : (signedField as string[]).map((id) => id.toLowerCase());
-  const mirror = storedLineage === undefined ? null : readStoredLineage(data);
+  let mirror: ReturnType<typeof readStoredLineage>;
+  try {
+    mirror = storedLineage === undefined ? null : readStoredLineage(data);
+  } catch (error) {
+    if (error instanceof StoredLineageMalformedError) {
+      throw new WriterAttributionVerificationError(
+        "LINEAGE_MISMATCH",
+        `stored $lineage mirror is malformed: ${error.message}`,
+      );
+    }
+    throw error;
+  }
   const consistent =
     !signedAbsent && !signedWellFormed
       ? false

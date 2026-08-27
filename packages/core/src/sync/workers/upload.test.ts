@@ -792,6 +792,20 @@ describe("uploadOne — derivative registration (lineage)", () => {
     expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
   });
 
+  it("fails closed on a malformed stored $lineage instead of registering the record as a root", async () => {
+    const deps = makeMockDeps();
+    const env = derivativeEnvelope() as { data: Record<string, unknown> };
+    (deps.storage.readEnvelope as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...env,
+      data: { ...env.data, $lineage: "invalid" },
+    });
+    await expect(uploadOne(deps, makeEntry())).rejects.toThrow(
+      /Stored \$lineage is malformed/,
+    );
+    expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
+    expect(deps.storage.updateDataPointId).not.toHaveBeenCalled();
+  });
+
   it("fails (and leaves the entry unsynced) instead of registering a derivative as a root when no lineage gateway is wired", async () => {
     const deps = makeMockDeps();
     (deps.storage.readEnvelope as ReturnType<typeof vi.fn>).mockResolvedValue(

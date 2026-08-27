@@ -4,6 +4,8 @@ import { createRequestSigner } from "../signing/request-signer.js";
 import { createTestWallet } from "../test-utils/index.js";
 import { createGatewayLineageClient, type LineageView } from "./gateway.js";
 
+import { computeDataPointId } from "../sync/data-point-id.js";
+
 const GATEWAY_URL = "https://gateway.example.com/";
 const ID = `0x${"ab".repeat(32)}`;
 const SOURCE_ID = `0x${"cd".repeat(32)}`;
@@ -53,11 +55,13 @@ const view: LineageView = {
 
 describe("createGatewayLineageClient", () => {
   it("getDataPoint asks for deleted points too and maps the record", async () => {
+    const owner = "0x000000000000000000000000000000000000dEaD";
+    const realId = computeDataPointId(owner, "chatgpt.conversations");
     const fetchMock = vi.fn().mockResolvedValue(
       jsonResponse(200, {
         data: {
-          id: ID,
-          ownerAddress: "0xowner",
+          id: realId,
+          ownerAddress: owner,
           scope: "chatgpt.conversations",
           expectedVersion: "3",
           deletedAt: "2026-08-01T00:00:00.000Z",
@@ -69,13 +73,13 @@ describe("createGatewayLineageClient", () => {
       gatewayUrl: GATEWAY_URL,
       fetch: fetchMock,
     });
-    const record = await client.getDataPoint(ID);
+    const record = await client.getDataPoint(realId);
     expect(fetchMock).toHaveBeenCalledWith(
-      `https://gateway.example.com/v1/data/${ID}?includeDeleted=true`,
+      `https://gateway.example.com/v1/data/${realId}?includeDeleted=true`,
     );
     expect(record).toEqual({
-      dataPointId: ID,
-      ownerAddress: "0xowner",
+      dataPointId: realId,
+      ownerAddress: owner,
       scope: "chatgpt.conversations",
       version: "3",
       deletedAt: "2026-08-01T00:00:00.000Z",
@@ -270,6 +274,25 @@ describe("createGatewayLineageClient", () => {
       dataPointId: ID,
     });
     expect(clean.ok).toBe(true);
+  });
+
+  it("getDataPoint refuses a record whose owner and scope do not derive the id it claims", async () => {
+    const client = createGatewayLineageClient({
+      gatewayUrl: GATEWAY_URL,
+      fetch: vi.fn().mockResolvedValue(
+        jsonResponse(200, {
+          data: {
+            id: ID,
+            ownerAddress: "0x000000000000000000000000000000000000dEaD",
+            scope: "some.other.scope",
+            expectedVersion: "3",
+            deletedAt: null,
+          },
+          proof: {},
+        }),
+      ),
+    });
+    await expect(client.getDataPoint(ID)).rejects.toThrow(/does not derive/);
   });
 
   it("getLineage is unavailable without a request signer", async () => {

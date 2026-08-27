@@ -96,18 +96,38 @@ export function stampLineage(
  * hand-crafted envelopes: anything that is not the exact stamped shape is
  * treated as no lineage rather than thrown on.
  */
+export class StoredLineageMalformedError extends Error {
+  constructor(detail: string) {
+    super(`Stored $lineage is malformed: ${detail}`);
+    this.name = "StoredLineageMalformedError";
+  }
+}
+
+/**
+ * Absent `$lineage` (or a data object that is not a record) is `null`: no
+ * statement. A PRESENT but malformed `$lineage` throws: a corrupted or
+ * hand-crafted derivative must fail closed, never fall through the root
+ * path and get registered as if it made no lineage statement.
+ */
 export function readStoredLineage(
   data: Record<string, unknown> | undefined,
 ): StoredLineage | null {
-  const value = data?.[LINEAGE_KEY];
-  if (!isRecord(value)) return null;
+  if (!isRecord(data) || !(LINEAGE_KEY in data)) return null;
+  const value = data[LINEAGE_KEY];
+  if (!isRecord(value)) {
+    throw new StoredLineageMalformedError("not an object");
+  }
   const sources = value.sources;
   if (
     !Array.isArray(sources) ||
-    !sources.every((id) => typeof id === "string" && BYTES32_HEX.test(id)) ||
-    typeof value.writtenAt !== "string"
+    !sources.every((id) => typeof id === "string" && BYTES32_HEX.test(id))
   ) {
-    return null;
+    throw new StoredLineageMalformedError(
+      "sources is not a list of bytes32 ids",
+    );
+  }
+  if (typeof value.writtenAt !== "string") {
+    throw new StoredLineageMalformedError("writtenAt is not a string");
   }
   return {
     sources: sources.map((id) => id.toLowerCase() as `0x${string}`),

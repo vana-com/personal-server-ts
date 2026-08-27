@@ -98,6 +98,8 @@ export interface GatewayLineageClientOptions {
   fetch?: typeof fetch;
 }
 
+import { computeDataPointId } from "../sync/data-point-id.js";
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -205,6 +207,26 @@ export function createGatewayLineageClient(
       if (data.id.toLowerCase() !== dataPointId.toLowerCase()) {
         throw new Error(
           `Gateway error: data point response is for ${data.id}, requested ${dataPointId}`,
+        );
+      }
+      // The id is keccak256(owner, scope): the record's own owner and scope
+      // must derive the id it claims, or a malformed response could pair the
+      // requested id with an arbitrary same-owner scope and slip past local
+      // naming validation.
+      let derived: string;
+      try {
+        derived = computeDataPointId(
+          data.ownerAddress as `0x${string}`,
+          data.scope,
+        );
+      } catch {
+        throw new Error(
+          `Gateway error: data point ${data.id} has an owner or scope that cannot derive an id`,
+        );
+      }
+      if (derived.toLowerCase() !== data.id.toLowerCase()) {
+        throw new Error(
+          `Gateway error: data point ${data.id} does not derive from its owner and scope`,
         );
       }
       return {

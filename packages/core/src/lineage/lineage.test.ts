@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import type { DataStoragePort } from "../ports/index.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
 import {
-  LINEAGE_KEY,
   LOCAL_SCOPE_SCAN_PAGE,
   MAX_LINEAGE_SOURCES,
   assertDerivedScopeNaming,
@@ -12,6 +11,7 @@ import {
   parseLineageSources,
   prepareLineage,
   readStoredLineage,
+  StoredLineageMalformedError,
   resolveLineageSources,
   stampLineage,
   type LineageSourceLookup,
@@ -375,13 +375,20 @@ describe("stored lineage helpers", () => {
     expect(stamped.note).toBe("x");
   });
 
-  it("readStoredLineage tolerates malformed or absent lineage", () => {
+  it("readStoredLineage: absent is null, present-but-malformed throws (fail closed)", () => {
     expect(readStoredLineage(undefined)).toBeNull();
-    expect(readStoredLineage({ note: "x" })).toBeNull();
-    expect(readStoredLineage({ [LINEAGE_KEY]: "nope" })).toBeNull();
-    expect(
-      readStoredLineage({ [LINEAGE_KEY]: { sources: ["bad"], writtenAt: "" } }),
-    ).toBeNull();
+    expect(readStoredLineage({ note: "root" })).toBeNull();
+    for (const bad of [
+      "invalid",
+      7,
+      { sources: "x", writtenAt: "2026-08-31T09:12:44.000Z" },
+      { sources: ["0xnothex"], writtenAt: "2026-08-31T09:12:44.000Z" },
+      { sources: [`0x${"ab".repeat(32)}`] },
+    ]) {
+      expect(() => readStoredLineage({ $lineage: bad })).toThrow(
+        StoredLineageMalformedError,
+      );
+    }
   });
 
   it("extractLineageField reads the caller field from objects only", () => {
