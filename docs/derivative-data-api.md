@@ -441,8 +441,9 @@ LineageAttestation {
 }
 ```
 
-signed by the owner or one of the owner's registered servers (the same rule
-as AddData). Why a second signature: the AddData signature is public (every
+signed by the owner or one of the owner's active servers: registered,
+confirmed or finalized, paid and unrevoked, the same bar a server has to
+clear to read lineage. Why a second signature: the AddData signature is public (every
 gateway attestation carries it as `userSignature`), and a still-pending
 version accepts a same-version refresh, so without the attestation anyone
 could replay a registration with a different lineage. The Personal Server's
@@ -460,8 +461,10 @@ statement).
 
 `lineage` absent (or `null`) is "no lineage statement": a fresh version is a
 root, and a same-version refresh of a still-pending version keeps whatever
-lineage the slot holds while its payload hashes are unchanged (a re-sign or
-a replay); a refresh that commits to different hashes clears it. An array, the empty array included, is a statement
+lineage the slot holds while its `dataHash` is unchanged (a re-sign, a
+replay, or a metadata-only refresh: the attestation binds `dataHash`, not
+`metadataHash`); a refresh that commits to a different `dataHash` clears
+it. An array, the empty array included, is a statement
 and needs `lineageSignature`: a refresh that carries one replaces the slot's
 lineage together with the payload (`[]` clears it: an attested root). The
 201 echoes `lineage` as sent (lowercased) or `null` when no statement was
