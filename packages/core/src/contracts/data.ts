@@ -7,6 +7,11 @@ import {
 import { type WriteResult } from "../storage/hierarchy/index.js";
 import { buildBinaryEnvelopeData, sha256Hex } from "./binary.js";
 import { buildDataBlocksAsync } from "../storage/blocks/build.js";
+import {
+  hasReservedWriterKey,
+  stampWriterAttribution,
+  type WriterAttribution,
+} from "../write/attribution.js";
 
 export type DataContractErrorCode =
   "INVALID_SCOPE" | "INVALID_BODY" | "NOT_FOUND";
@@ -75,12 +80,50 @@ export interface ReadDataContractResult {
   envelope: DataFileEnvelope;
 }
 
+/**
+ * Thrown by the ingest contracts when the envelope was already written to
+ * storage but a later step (indexing) failed. The record is on disk and a
+ * re-index can surface it, so callers must treat the write as persisted:
+ * never retry it under the same proof, never release a replay reservation.
+ */
+export class IngestPersistedError extends Error {
+  constructor(
+    public readonly relativePath: string,
+    public readonly cause: unknown,
+  ) {
+    super(
+      `Envelope written to ${relativePath} but indexing failed: ${
+        cause instanceof Error ? cause.message : String(cause)
+      }`,
+    );
+    this.name = "IngestPersistedError";
+  }
+}
+
+async function indexWrittenEnvelope(
+  storage: IngestDataContractInput["storage"],
+  entry: Parameters<IngestDataContractInput["storage"]["insertEntry"]>[0],
+): Promise<void> {
+  try {
+    await storage.insertEntry(entry);
+  } catch (err) {
+    throw new IngestPersistedError(entry.path, err);
+  }
+}
+
 export interface IngestDataContractInput {
   storage: DataStoragePort;
   scopeParam: string;
   body: unknown;
   collectedAt: string;
   status: "stored" | "syncing";
+  /**
+   * Builder attribution for delegated (write-session) writes. When present,
+   * it is stamped into the envelope `data` under the reserved `$writtenBy`
+   * key so it travels through the unchanged encrypt/upload/register path.
+   * Owner writes pass nothing and the envelope is byte-identical to today.
+   */
+  attribution?: WriterAttribution;
 }
 
 export interface IngestDataContractResult {
@@ -105,6 +148,8 @@ export interface IngestBinaryDataContractInput {
   metadata?: unknown;
   collectedAt: string;
   status: "stored" | "syncing";
+  /** Builder attribution for delegated writes (see IngestDataContractInput). */
+  attribution?: WriterAttribution;
 }
 
 export interface DeleteDataScopeContractInput {
@@ -280,10 +325,27 @@ export async function ingestDataContract(
     };
   }
 
+  // The attribution key is server-stamped, never caller-supplied: a payload
+  // that carries it could forge (or shadow) an attribution. That holds for
+  // every JSON ingest, owner writes included, so consumers can trust that a
+  // stored $writtenBy was always produced by the server.
+  if (hasReservedWriterKey(input.body)) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: "INVALID_BODY",
+        message: "Request body must not contain the reserved $writtenBy key",
+      },
+    };
+  }
+
   const envelope = createDataFileEnvelope(
     scopeResult.scope,
     input.collectedAt,
-    input.body,
+    input.attribution
+      ? stampWriterAttribution(input.body, input.attribution)
+      : input.body,
   );
   const writeResult = await input.storage.writeEnvelope(envelope);
   try {
@@ -291,7 +353,7 @@ export async function ingestDataContract(
   } catch {
     // Best-effort bounded sidecars: raw envelope storage remains the source of truth.
   }
-  await input.storage.insertEntry({
+  await indexWrittenEnvelope(input.storage, {
     fileId: null,
     schemaId: null,
     path: writeResult.relativePath,
@@ -349,7 +411,7 @@ export async function ingestBinaryDataContract(
   const envelope = createDataFileEnvelope(
     scopeResult.scope,
     input.collectedAt,
-    data,
+    input.attribution ? stampWriterAttribution(data, input.attribution) : data,
   );
   const writeResult = await input.storage.writeEnvelope(envelope);
   try {
@@ -357,7 +419,7 @@ export async function ingestBinaryDataContract(
   } catch {
     // Best-effort bounded sidecars: raw envelope storage remains the source of truth.
   }
-  await input.storage.insertEntry({
+  await indexWrittenEnvelope(input.storage, {
     fileId: null,
     schemaId: null,
     path: writeResult.relativePath,

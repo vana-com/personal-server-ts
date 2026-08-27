@@ -10,6 +10,38 @@ import { type DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 export const BINARY_MARKER = "$binary" as const;
 export const BINARY_ENCODING = "base64" as const;
 
+/**
+ * True when a request body should be treated as a JSON object (the legacy
+ * path); anything else is ingested as binary. Missing/blank Content-Type is
+ * treated as JSON for backward compat. Shared by ingest and the Write API
+ * attribution check so both classify a body the same way.
+ */
+export function isJsonContentType(request: Request): boolean {
+  const ct = request.headers.get("content-type");
+  if (!ct) return true;
+  return ct.toLowerCase().includes("application/json");
+}
+
+/** The media type stored for a binary body: Content-Type minus parameters. */
+export function normalizeBinaryMimeType(contentType: string | null): string {
+  if (!contentType) return "application/octet-stream";
+  // Strip any "; charset=..." / boundary parameters.
+  return contentType.split(";")[0].trim() || "application/octet-stream";
+}
+
+export function binaryMimeType(request: Request): string {
+  return normalizeBinaryMimeType(request.headers.get("content-type"));
+}
+
+/** Extract a filename from X-Filename or a Content-Disposition header. */
+export function binaryFilename(request: Request): string | undefined {
+  const explicit = request.headers.get("x-filename");
+  if (explicit) return explicit;
+  const disposition = request.headers.get("content-disposition");
+  const match = disposition?.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+  return match ? decodeURIComponent(match[1]) : undefined;
+}
+
 export interface BinaryEnvelopeData extends Record<string, unknown> {
   $binary: true;
   mimeType: string;

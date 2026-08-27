@@ -1,5 +1,4 @@
 import { Hono } from "hono";
-import { cors } from "hono/cors";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -12,7 +11,14 @@ import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logg
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
 import { healthRoute, type HealthDeps } from "./routes/health.js";
+import { corsMiddleware } from "./middleware/cors.js";
 import { dataRoutes } from "./routes/data.js";
+import { writeSessionRoutes } from "./routes/write-session.js";
+import {
+  createInMemoryWriteSessionStore,
+  type WriteProofReplayStore,
+  type WriteSessionStore,
+} from "@opendatalabs/personal-server-ts-core/write";
 import { grantsRoutes } from "./routes/grants.js";
 import { accessLogsRoutes } from "./routes/access-logs.js";
 import { syncRoutes } from "./routes/sync.js";
@@ -107,21 +113,30 @@ export interface AppDeps {
   mcpOAuthAuthorizationStore?: McpOAuthAuthorizationStore;
   mcpOAuthApprovalUrl?: string | (() => string);
   mcpActivityRecorder?: McpActivityRecorder;
+  /**
+   * Write API session store shared between POST /v1/write/session (which
+   * mints tokens) and the ingest endpoint (which redeems them). Defaults to
+   * an in-memory store, mirroring the MCP connection store default.
+   */
+  writeSessionStore?: WriteSessionStore;
+  /**
+   * Replay guard for per-write proofs on delegated ingest. Defaults to an
+   * in-memory store (api-auth); hosts may supply a shared one.
+   */
+  writeProofReplayStore?: WriteProofReplayStore;
 }
 
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
 
-  // CORS — allow all origins for browser-based clients
-  app.use(
-    "*",
-    cors({
-      origin: "*",
-      allowHeaders: ["Content-Type", "Authorization"],
-      allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-      maxAge: 86400,
-    }),
-  );
+  // One store for mint (POST /v1/write/session) and redeem (data ingest).
+  const writeSessionStore =
+    deps.writeSessionStore ?? createInMemoryWriteSessionStore();
+
+  // CORS — allow all origins for browser-based clients. Registered first so
+  // OPTIONS preflights are answered before any route or auth code runs
+  // (route sub-apps only register their real methods).
+  app.use("*", corsMiddleware());
 
   // Mount health route
   app.route(
@@ -169,7 +184,24 @@ export function createApp(deps: AppDeps): Hono {
       gatewayUrl:
         deps.gatewayUrl ?? deps.config?.gateway.url ?? deps.gatewayConfig?.url,
       paymentEnabled: deps.paymentEnabled,
+      writeSessionStore,
+      writeProofReplayStore: deps.writeProofReplayStore,
       mountPath: "/v1/data",
+    }),
+  );
+
+  // Mount the Write API session handshake (delegated builder writes).
+  app.route(
+    "/v1/write",
+    writeSessionRoutes({
+      logger: deps.logger,
+      serverOrigin: deps.serverOrigin,
+      serverOwner: deps.serverOwner,
+      gateway: deps.gateway,
+      devToken: deps.devToken,
+      accessToken: deps.accessToken,
+      tokenStore: deps.tokenStore,
+      sessionStore: writeSessionStore,
     }),
   );
 
