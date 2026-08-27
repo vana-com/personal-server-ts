@@ -161,6 +161,56 @@ describe("createGatewayLineageClient", () => {
     expect(result.ok).toBe(false);
   });
 
+  it("getDataPoint refuses a record for a different data point than requested", async () => {
+    const client = createGatewayLineageClient({
+      gatewayUrl: GATEWAY_URL,
+      fetch: vi.fn().mockResolvedValue(
+        jsonResponse(200, {
+          data: {
+            id: SOURCE_ID,
+            ownerAddress: "0xowner",
+            scope: "chatgpt.conversations",
+            expectedVersion: "3",
+            deletedAt: null,
+          },
+          proof: {},
+        }),
+      ),
+    });
+    await expect(client.getDataPoint(ID)).rejects.toThrow(/requested/);
+  });
+
+  it("getLineage refuses an attested view for another data point or version", async () => {
+    const otherPoint = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse(200, { data: { ...view, dataPointId: SOURCE_ID }, proof }),
+      );
+    const client = createGatewayLineageClient({
+      gatewayUrl: GATEWAY_URL,
+      requestSigner: requestSignerFor(createTestWallet(5)),
+      fetch: otherPoint,
+    });
+    const byId = await client.getLineage({ dataPointId: ID });
+    expect(byId.ok).toBe(false);
+
+    const otherVersion = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse(200, { data: { ...view, version: "7" }, proof }),
+      );
+    const client2 = createGatewayLineageClient({
+      gatewayUrl: GATEWAY_URL,
+      requestSigner: requestSignerFor(createTestWallet(5)),
+      fetch: otherVersion,
+    });
+    const byVersion = await client2.getLineage({
+      dataPointId: ID,
+      version: "3",
+    });
+    expect(byVersion.ok).toBe(false);
+  });
+
   it("getLineage is unavailable without a request signer", async () => {
     const client = createGatewayLineageClient({
       gatewayUrl: GATEWAY_URL,

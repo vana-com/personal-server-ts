@@ -181,6 +181,13 @@ export function createGatewayLineageClient(
       ) {
         throw new Error("Gateway error: malformed data point response");
       }
+      // Bind the record to what was asked for: a stale or misrouted 200 must
+      // not validate a different source than the one the caller named.
+      if (data.id.toLowerCase() !== dataPointId.toLowerCase()) {
+        throw new Error(
+          `Gateway error: data point response is for ${data.id}, requested ${dataPointId}`,
+        );
+      }
       return {
         dataPointId: data.id,
         ownerAddress: data.ownerAddress,
@@ -222,6 +229,24 @@ export function createGatewayLineageClient(
           ok: false,
           status: res.status,
           body: { error: "malformed lineage response", received: body },
+        };
+      }
+      // The attested view must be the one that was requested. A response for
+      // another data point, or for a version other than the signed path
+      // segment, is a gateway error, never served to an authorized caller.
+      const requestedId = input.dataPointId.toLowerCase();
+      const viewMismatch =
+        data.dataPointId.toLowerCase() !== requestedId ||
+        (input.version !== undefined && data.version !== input.version);
+      if (viewMismatch) {
+        return {
+          ok: false,
+          status: res.status,
+          body: {
+            error: "lineage response does not match the requested view",
+            requested: { dataPointId: requestedId, version: input.version },
+            received: { dataPointId: data.dataPointId, version: data.version },
+          },
         };
       }
       return { ok: true, data, proof };
