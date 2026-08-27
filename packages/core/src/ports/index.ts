@@ -157,6 +157,14 @@ export interface DataStoragePort extends RuntimeStoragePort {
    */
   deleteByFileId(fileId: string): Promise<boolean>;
   /**
+   * Delete a single version (index entry + its local blob + block sidecars)
+   * by its DPv2 identity (scope, collectedAt). Returns true if a local copy
+   * existed and was removed, false if none was present (no-op). Used by sync
+   * deletion reconciliation to drop the exact versions a gateway tombstone
+   * covers while leaving a newer local re-ingest in place.
+   */
+  deleteVersion(scope: string, collectedAt: string): Promise<boolean>;
+  /**
    * Drop a single unsynced index entry by path, WITHOUT touching any blob.
    * Used by the upload worker to evict an orphaned row whose local payload
    * file is already gone (e.g. a manual `data/<scope>` deletion): the row can
@@ -168,6 +176,136 @@ export interface DataStoragePort extends RuntimeStoragePort {
 
 export interface RuntimeAvailabilityPort {
   isAvailable(): boolean | Promise<boolean>;
+}
+
+/**
+ * A gateway data-point row as seen by sync, including the deletion marker the
+ * plain SDK `DataPointRecord` does not model. `deletedAt` is null while the
+ * point is live and an ISO timestamp once the owner has tombstoned it.
+ */
+export interface DataPointFeedRecord extends DataPointRecord {
+  deletedAt: string | null;
+}
+
+export interface DataPointFeedListOptions extends ListDataPointsOptions {
+  /**
+   * Ask the gateway to include tombstoned rows (with `deletedAt` set). Sync
+   * always passes true: deletions must reach every replica or the local copy
+   * would be re-uploaded and resurrect the point.
+   */
+  includeDeleted?: boolean;
+}
+
+export interface DataPointFeedListResult {
+  dataPoints: DataPointFeedRecord[];
+  cursor: string | null;
+}
+
+/**
+ * Deletion-aware view of the gateway data-point registry. Mirrors the SDK
+ * `GatewayClient` listing/lookup shape but surfaces `deletedAt`, which the
+ * SDK client (3.14) neither requests (`includeDeleted`) nor types.
+ */
+export interface DataPointFeedPort {
+  listDataPointsByOwner(
+    owner: string,
+    cursor: string | null,
+    options?: DataPointFeedListOptions,
+  ): Promise<DataPointFeedListResult>;
+  /**
+   * Current registry row for (owner, scope), deleted or not. Null when the
+   * point was never registered. A tombstoned point comes back with
+   * `deletedAt` set (never as a thrown 410).
+   */
+  getDataPoint(input: {
+    ownerAddress: string;
+    scope: string;
+  }): Promise<DataPointFeedRecord | null>;
+}
+
+export type TombstoneOutcome =
+  | {
+      status: "tombstoned";
+      dataPointId: string;
+      /** The tombstone's own version (previous current + 1). */
+      version: string;
+      deletedAt: string | null;
+    }
+  | {
+      status: "already-deleted";
+      dataPointId: string;
+      /**
+       * The winning tombstone's registry version as the gateway reports it
+       * (possibly higher than the version this replica attempted), or null
+       * when the gateway did not say. Null means the covered key range is
+       * unknown, so callers defer enumeration rather than guess.
+       */
+      version: string | null;
+      deletedAt: string | null;
+    }
+  | {
+      /** The gateway has no row for (owner, scope): nothing to tombstone. */
+      status: "not-registered";
+      dataPointId: string;
+    };
+
+export interface DeleteBlobVersionsOutcome {
+  /** Versions whose blob existed and was deleted. */
+  deleted: string[];
+  /** Versions with no blob in storage (404): nothing to do, counts as done. */
+  missing: string[];
+  /** Versions whose delete failed (rate limit, 5xx, network); retry later. */
+  failed: Array<{ version: string; error: string }>;
+}
+
+/**
+ * Remote side of durable deletion. `tombstone` is the durable fact (an
+ * owner-signed AddData with the tombstone commitments, recorded by the
+ * gateway); `deleteBlobVersions` removes the ciphertext of exactly the given
+ * versions, one exact-key delete per version, never a scope-wide prefix: a
+ * re-add registered after the tombstone lives under a higher version key and
+ * is untouched by construction. Callers MUST run tombstone first: a blob
+ * delete without a tombstone leaves a live registry row every replica would
+ * 404 on and then wedge.
+ */
+export interface DeleteDataPort {
+  tombstone(scope: string): Promise<TombstoneOutcome>;
+  deleteBlobVersions(
+    scope: string,
+    versions: string[],
+  ): Promise<DeleteBlobVersionsOutcome>;
+}
+
+/**
+ * Blob deletion work still to do after a tombstone landed, in one of three
+ * shapes:
+ *   - an exact key: `{ scope, version }`;
+ *   - a contiguous version range `{ scope, version: null, range }` (both
+ *     bounds inclusive, decimal strings): the registry versions a tombstone
+ *     covers, kept as bounds so a large tombstone version never has to be
+ *     materialised key by key; passes take keys from the head and advance
+ *     `from`;
+ *   - an unexpanded marker `{ scope, version: null }` (no range): the gateway
+ *     did not report the tombstone's version, so the covered range is not
+ *     known yet; the retry expands it once the registry answers.
+ */
+export interface PendingBlobDeletion {
+  scope: string;
+  version: string | null;
+  range?: { from: string; to: string };
+}
+
+/**
+ * Durable retry marker for blob deletions that could not complete AFTER the
+ * gateway tombstone landed (storage failure, rate limit, or a batch larger
+ * than one pass may send). The tombstone already makes the deletion stick;
+ * this only exists so later sync cycles finish removing the ciphertext, key
+ * by key.
+ */
+export interface PendingBlobDeletionStore {
+  list(): Promise<PendingBlobDeletion[]>;
+  add(keys: PendingBlobDeletion[]): Promise<void>;
+  remove(keys: PendingBlobDeletion[]): Promise<void>;
 }
 
 // FeeVerifier was the pre-X402 hook that gated reads on grant.paymentStatus

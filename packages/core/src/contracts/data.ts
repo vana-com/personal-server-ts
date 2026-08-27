@@ -1,4 +1,5 @@
 import { type DataStoragePort } from "../ports/index.js";
+import type { IndexEntry, ScopeSummary } from "../storage/index/types.js";
 import {
   createDataFileEnvelope,
   ScopeSchema,
@@ -32,11 +33,24 @@ export interface DataContractError {
   body: DataContractErrorBody;
 }
 
+/**
+ * Discovery-time visibility of a local index entry. False hides the entry
+ * (and, for scope listings, the scope whose latest entry it is) the same way
+ * a read of it would answer 410: a copy a gateway tombstone covers must not
+ * be discoverable either. When present, pagination and totals are computed
+ * over the visible set.
+ */
+export type DataVisibilityFilter = (
+  scope: string,
+  entry: IndexEntry,
+) => Promise<boolean> | boolean;
+
 export interface ListDataScopesContractInput {
   storage: DataStoragePort;
   scopePrefix?: string;
   limit?: number;
   offset?: number;
+  isVisible?: DataVisibilityFilter;
 }
 
 export interface ListDataScopesContractResult {
@@ -54,6 +68,7 @@ export interface ListDataVersionsContractInput {
   scopeParam: string;
   limit?: number;
   offset?: number;
+  isVisible?: DataVisibilityFilter;
 }
 
 export interface ListDataVersionsContractResult {
@@ -136,6 +151,8 @@ export interface IngestDataContractInput {
    * unchanged.
    */
   lineage?: StoredLineage;
+  /** See `IndexEntry.afterTombstoneVersion`. */
+  afterTombstoneVersion?: number | null;
 }
 
 export interface IngestDataContractResult {
@@ -166,6 +183,8 @@ export interface IngestBinaryDataContractInput {
   attribution?: WriterAttribution;
   /** Validated lineage for a derivative write (see IngestDataContractInput). */
   lineage?: StoredLineage;
+  /** See `IndexEntry.afterTombstoneVersion`. */
+  afterTombstoneVersion?: number | null;
 }
 
 export interface DeleteDataScopeContractInput {
@@ -213,18 +232,49 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+const VISIBILITY_PAGE_SIZE = 200;
+
 export async function listDataScopesContract(
   input: ListDataScopesContractInput,
 ): Promise<ListDataScopesContractResult> {
   const limit = normalizeLimit(input.limit);
   const offset = normalizeOffset(input.offset);
-  const result = input.storage.listScopes({
-    scopePrefix: input.scopePrefix,
-    limit,
-    offset,
-  });
+  let page: ScopeSummary[];
+  let total: number;
+  if (input.isVisible) {
+    // Filtered listing: walk every scope so the page and the total both
+    // describe the visible set (the index cannot filter by tombstone).
+    const visible: ScopeSummary[] = [];
+    for (let scan = 0; ; scan += VISIBILITY_PAGE_SIZE) {
+      const batch = input.storage.listScopes({
+        scopePrefix: input.scopePrefix,
+        limit: VISIBILITY_PAGE_SIZE,
+        offset: scan,
+      });
+      for (const summary of batch.scopes) {
+        const latest = input.storage.findEntry({
+          scope: summary.scope,
+          at: summary.latestCollectedAt,
+        });
+        if (!latest || (await input.isVisible(summary.scope, latest))) {
+          visible.push(summary);
+        }
+      }
+      if (batch.scopes.length < VISIBILITY_PAGE_SIZE) break;
+    }
+    total = visible.length;
+    page = visible.slice(offset, offset + limit);
+  } else {
+    const result = input.storage.listScopes({
+      scopePrefix: input.scopePrefix,
+      limit,
+      offset,
+    });
+    page = result.scopes;
+    total = result.total;
+  }
   const scopes = await Promise.all(
-    result.scopes.map(async (summary) => {
+    page.map(async (summary) => {
       const entry = input.storage.findEntry({
         scope: summary.scope,
         at: summary.latestCollectedAt,
@@ -233,17 +283,12 @@ export async function listDataScopesContract(
         return summary;
       }
       const hasBlocks =
-        typeof input.storage.canReadScopeBlocks === "function"
-          ? await input.storage.canReadScopeBlocks(
+        typeof input.storage.hasScopeBlocks === "function"
+          ? await input.storage.hasScopeBlocks(
               summary.scope,
               summary.latestCollectedAt,
             )
-          : typeof input.storage.hasScopeBlocks === "function"
-            ? await input.storage.hasScopeBlocks(
-                summary.scope,
-                summary.latestCollectedAt,
-              )
-            : false;
+          : false;
       return {
         ...summary,
         dataStatus: hasBlocks ? ("ready" as const) : ("indexing" as const),
@@ -255,36 +300,54 @@ export async function listDataScopesContract(
     ok: true,
     response: {
       scopes,
-      total: result.total,
+      total,
       limit,
       offset,
     },
   };
 }
 
-export function listDataVersionsContract(
+export async function listDataVersionsContract(
   input: ListDataVersionsContractInput,
-): ListDataVersionsContractResult | DataContractError {
+): Promise<ListDataVersionsContractResult | DataContractError> {
   const scopeResult = parseDataScopeContract(input.scopeParam);
   if (!scopeResult.ok) return scopeResult;
 
   const limit = normalizeLimit(input.limit);
   const offset = normalizeOffset(input.offset);
-  const entries = input.storage.listVersions(scopeResult.scope, {
-    limit,
-    offset,
-  });
+  let page: IndexEntry[];
+  let total: number;
+  if (input.isVisible) {
+    const visible: IndexEntry[] = [];
+    for (let scan = 0; ; scan += VISIBILITY_PAGE_SIZE) {
+      const batch = input.storage.listVersions(scopeResult.scope, {
+        limit: VISIBILITY_PAGE_SIZE,
+        offset: scan,
+      });
+      for (const entry of batch) {
+        if (await input.isVisible(scopeResult.scope, entry)) {
+          visible.push(entry);
+        }
+      }
+      if (batch.length < VISIBILITY_PAGE_SIZE) break;
+    }
+    total = visible.length;
+    page = visible.slice(offset, offset + limit);
+  } else {
+    page = input.storage.listVersions(scopeResult.scope, { limit, offset });
+    total = input.storage.countVersions(scopeResult.scope);
+  }
   return {
     ok: true,
     scope: scopeResult.scope,
     response: {
       scope: scopeResult.scope,
-      versions: entries.map((entry) => ({
+      versions: page.map((entry) => ({
         fileId: entry.fileId,
         schemaId: entry.schemaId,
         collectedAt: entry.collectedAt,
       })),
-      total: input.storage.countVersions(scopeResult.scope),
+      total,
       limit,
       offset,
     },
@@ -386,6 +449,7 @@ export async function ingestDataContract(
     scope: scopeResult.scope,
     collectedAt: input.collectedAt,
     sizeBytes: writeResult.sizeBytes,
+    afterTombstoneVersion: input.afterTombstoneVersion ?? null,
   });
 
   return {
@@ -497,6 +561,7 @@ export async function ingestBinaryDataContract(
     scope: scopeResult.scope,
     collectedAt: input.collectedAt,
     sizeBytes: input.bytes.length,
+    afterTombstoneVersion: input.afterTombstoneVersion ?? null,
   });
 
   return {

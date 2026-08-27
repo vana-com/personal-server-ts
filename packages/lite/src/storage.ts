@@ -779,6 +779,7 @@ export async function createPersistentPsLiteStorage(
         schemaId: entry.schemaId ?? null,
         version,
         dataPointId: entry.dataPointId ?? null,
+        afterTombstoneVersion: entry.afterTombstoneVersion ?? null,
         id: state.nextId,
         createdAt: new Date().toISOString(),
       };
@@ -879,31 +880,43 @@ export async function createPersistentPsLiteStorage(
       return deleted;
     },
 
+    async deleteVersion(scope, collectedAt) {
+      const entry = state.entries.find(
+        (e) => e.scope === scope && e.collectedAt === collectedAt,
+      );
+      if (!entry) return false;
+      return removeEntry(entry);
+    },
+
     async deleteByFileId(fileId) {
       const entry = state.entries.find((e) => e.fileId === fileId);
       if (!entry) return false;
-      const blobPath = envelopePath(entry.scope, entry.collectedAt);
-      // Delete the blob FIRST (both stores tolerate a missing blob); only drop the index row once
-      // the blob is gone. If blob deletion throws for a real reason, the row is preserved so the
-      // next sync retry re-attempts instead of orphaning the local blob.
-      await Promise.all([
-        fileStore.deleteEnvelope(blobPath),
-        fallbackStore.deleteEnvelope(blobPath),
-        fileStore.deleteBlockTree?.(
-          blockTreePath(entry.scope, entry.collectedAt),
-        ) ?? Promise.resolve(),
-        fallbackStore.deleteBlockTree?.(
-          blockTreePath(entry.scope, entry.collectedAt),
-        ) ?? Promise.resolve(),
-      ]);
-      state = {
-        ...state,
-        entries: state.entries.filter((e) => e !== entry),
-      };
-      await persist();
-      return true;
+      return removeEntry(entry);
     },
   };
+
+  async function removeEntry(entry: IndexEntry): Promise<boolean> {
+    const blobPath = envelopePath(entry.scope, entry.collectedAt);
+    // Delete the blob FIRST (both stores tolerate a missing blob); only drop the index row once
+    // the blob is gone. If blob deletion throws for a real reason, the row is preserved so the
+    // next sync retry re-attempts instead of orphaning the local blob.
+    await Promise.all([
+      fileStore.deleteEnvelope(blobPath),
+      fallbackStore.deleteEnvelope(blobPath),
+      fileStore.deleteBlockTree?.(
+        blockTreePath(entry.scope, entry.collectedAt),
+      ) ?? Promise.resolve(),
+      fallbackStore.deleteBlockTree?.(
+        blockTreePath(entry.scope, entry.collectedAt),
+      ) ?? Promise.resolve(),
+    ]);
+    state = {
+      ...state,
+      entries: state.entries.filter((e) => e !== entry),
+    };
+    await persist();
+    return true;
+  }
 
   if (fileStore.readEnvelopePreview) {
     storagePort.readEnvelopePreview = async (

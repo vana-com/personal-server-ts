@@ -14,6 +14,13 @@ export interface IndexEntry {
   // DPv2 data-point id assigned by the gateway after registerDataPoint
   // succeeds. Null until the sync worker has registered this entry on-chain.
   dataPointId: string | null;
+  // Causal deletion marker for unsynced entries. The gateway tombstone
+  // version this replica knew about when the entry was ingested: the entry
+  // is a deliberate re-add on top of that deletion and survives it. Null (or
+  // absent, for rows from before this column) means the entry was ingested
+  // without knowledge of any tombstone, so any tombstone covers it. Never a
+  // wall-clock comparison: clocks differ across replicas, versions do not.
+  afterTombstoneVersion?: number | null;
 }
 
 export type NewIndexEntry = Omit<

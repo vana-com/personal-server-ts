@@ -11,7 +11,8 @@ CREATE TABLE IF NOT EXISTS data_files (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
   size_bytes INTEGER NOT NULL DEFAULT 0,
   version INTEGER NOT NULL DEFAULT 1,
-  data_point_id TEXT
+  data_point_id TEXT,
+  after_tombstone_version INTEGER
 )`;
 
 const CREATE_INDEXES_SQL = [
@@ -22,7 +23,7 @@ const CREATE_INDEXES_SQL = [
   "CREATE INDEX IF NOT EXISTS idx_data_files_data_point_id ON data_files (data_point_id)",
 ];
 
-export const INDEX_SCHEMA_VERSION = 3;
+export const INDEX_SCHEMA_VERSION = 4;
 
 function hasColumn(
   db: Database.Database,
@@ -49,6 +50,16 @@ function migrateSchema(db: Database.Database, currentVersion: number): void {
     if (!hasColumn(db, "data_files", "data_point_id")) {
       db.exec("ALTER TABLE data_files ADD COLUMN data_point_id TEXT");
     }
+  }
+  if (
+    currentVersion < 4 &&
+    !hasColumn(db, "data_files", "after_tombstone_version")
+  ) {
+    // Null for every existing row: nothing ingested before this column
+    // existed can claim to post-date a tombstone.
+    db.exec(
+      "ALTER TABLE data_files ADD COLUMN after_tombstone_version INTEGER",
+    );
   }
 }
 

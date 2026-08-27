@@ -8,7 +8,20 @@ import {
 } from "@opendatalabs/vana-sdk/browser";
 import type { SyncCursor } from "../cursor.js";
 import type { Logger } from "../../logger/index.js";
-import type { DataStoragePort } from "../../ports/index.js";
+import type {
+  DataPointFeedPort,
+  DataPointFeedRecord,
+  DataStoragePort,
+  PendingBlobDeletion,
+  PendingBlobDeletionStore,
+} from "../../ports/index.js";
+import { feedFromGatewayClient } from "../data-point-feed.js";
+import {
+  deletionTimestamp,
+  isEntryCoveredByTombstone,
+  tombstoneVersion,
+  type ScopeDeletionTracker,
+} from "../scope-deletions.js";
 import { buildDataBlocksAsync } from "../../storage/blocks/build.js";
 import {
   classifySyncFailure,
@@ -51,6 +64,35 @@ export interface DownloadWorkerDeps {
   logger: Logger;
   /** Optional diagnostics hook — omit to disable instrumentation. */
   diagnostics?: DownloadDiagnosticsHook;
+  /**
+   * Deletion-aware registry listing (`includeDeleted=true`). When present,
+   * tombstoned points reach this replica and their local copies are removed
+   * instead of re-pulled. Falls back to the SDK client listing, which only
+   * sees deletions the gateway volunteers without being asked.
+   */
+  dataPointFeed?: DataPointFeedPort;
+  /**
+   * Read-side deletion memory. Every listed row is recorded here (deleted or
+   * live) and a listing with no further pages marks the memory complete, so
+   * reads can refuse tombstoned scopes without their own gateway lookups.
+   */
+  scopeDeletions?: ScopeDeletionTracker;
+  /**
+   * Exact-key cleanup queue. An unsynced local entry a tombstone covers may
+   * have had its ciphertext uploaded under a version key the registry never
+   * recorded (crashed before registering); reconciling drops the entry and
+   * queues that exact key so the sync cycle's rate-limited pass removes it.
+   */
+  pendingBlobDeletions?: PendingBlobDeletionStore;
+}
+
+export interface DeletionReconcileResult {
+  scope: string;
+  deletedAt: string;
+  /** Local versions removed because the tombstone covers them. */
+  removed: number;
+  /** Local unsynced versions ingested after the deletion and kept. */
+  kept: number;
 }
 
 export interface DownloadResult {
@@ -345,15 +387,66 @@ export async function downloadAll(
     options.retryMemory?.onListingReset();
   }
 
-  // 2. Poll gateway for the owner's data points.
-  const { dataPoints, cursor: nextCursor } =
-    await gateway.listDataPointsByOwner(serverOwner, lastCursor);
+  // 2. Poll gateway for the owner's data points, tombstones included: a
+  // deletion made on another replica must reach this one or its local copy
+  // would be re-uploaded and resurrect the point.
+  const feed = deps.dataPointFeed ?? feedFromGatewayClient(gateway);
+  const { dataPoints, cursor: nextCursor } = await feed.listDataPointsByOwner(
+    serverOwner,
+    lastCursor,
+    { includeDeleted: true },
+  );
+
+  // Feed the read-side deletion memory before any per-record work so a
+  // tombstone is refused by reads even if its local reconcile below fails.
+  // Only a listing with no further pages proves the memory complete: a
+  // multi-page backlog leaves it "stale" and reads fall back to lookups. A
+  // listing from no cursor covered the whole registry (`full`), which is
+  // what re-validates remembered tombstones; an incremental pass does not.
+  if (deps.scopeDeletions) {
+    for (const dataPoint of dataPoints) {
+      const deletedAt = deletionTimestamp(dataPoint);
+      if (deletedAt !== null) {
+        deps.scopeDeletions.markDeleted(dataPoint.scope, {
+          deletedAt,
+          version: tombstoneVersion(dataPoint),
+        });
+      } else {
+        deps.scopeDeletions.markLive(dataPoint.scope);
+      }
+    }
+    if (nextCursor === null) {
+      deps.scopeDeletions.noteFeedSynced(undefined, {
+        full: lastCursor === null,
+      });
+    }
+  }
 
   const results: DownloadResult[] = [];
   let failed = false;
 
   // 3. Process each data point record
   for (const dataPoint of dataPoints) {
+    const deletedAt = deletionTimestamp(dataPoint);
+    if (deletedAt !== null) {
+      // Tombstone: never download; drop what the deletion covers locally.
+      // A failure here blocks the cursor so the tombstone is re-listed and
+      // the reconcile retried next cycle.
+      try {
+        await reconcileDeletedDataPoint(deps, dataPoint, deletedAt);
+      } catch (err) {
+        logger.error(
+          {
+            dataPointId: dataPoint.id,
+            scope: dataPoint.scope,
+            error: (err as Error).message,
+          },
+          "Failed to reconcile deleted data point locally",
+        );
+        failed = true;
+      }
+      continue;
+    }
     const retryKey = downloadRetryKey(dataPoint);
     const decision = options.retryMemory?.decide(retryKey) ?? "attempt";
     if (decision === "give-up") {
@@ -429,6 +522,73 @@ export async function downloadAll(
   }
 
   return results;
+}
+
+/**
+ * Apply a gateway tombstone to the local index: remove every local version
+ * the tombstone covers (synced rows at or below its version, and unsynced
+ * rows ingested without knowledge of it), keep unsynced rows ingested on top
+ * of it (a legitimate re-add that the upload worker registers after the
+ * tombstone version). See `isEntryCoveredByTombstone`.
+ */
+export async function reconcileDeletedDataPoint(
+  deps: Pick<DownloadWorkerDeps, "storage" | "logger" | "pendingBlobDeletions">,
+  record: Pick<DataPointFeedRecord, "id" | "scope" | "expectedVersion">,
+  deletedAt: string,
+): Promise<DeletionReconcileResult> {
+  const tombstone = { version: tombstoneVersion(record) };
+  const tombstoned =
+    tombstone.version === null ? null : BigInt(tombstone.version);
+  // Unsynced covered entries above the tombstone version: the deleting
+  // replica's exact-key pass only enumerates registry versions, so any
+  // ciphertext this replica uploaded under a higher, never-registered key is
+  // ours to clean up.
+  const orphanKeys: PendingBlobDeletion[] = [];
+  const { storage, logger } = deps;
+  const PAGE_SIZE = 500;
+  const stale: Array<{ scope: string; collectedAt: string }> = [];
+  let kept = 0;
+  for (let offset = 0; ; offset += PAGE_SIZE) {
+    const entries = storage.listVersions(record.scope, {
+      limit: PAGE_SIZE,
+      offset,
+    });
+    for (const entry of entries) {
+      if (isEntryCoveredByTombstone(entry, tombstone)) {
+        stale.push({ scope: entry.scope, collectedAt: entry.collectedAt });
+        if (
+          entry.dataPointId === null &&
+          (tombstoned === null || BigInt(entry.version) > tombstoned)
+        ) {
+          orphanKeys.push({
+            scope: entry.scope,
+            version: String(entry.version),
+          });
+        }
+      } else {
+        kept += 1;
+      }
+    }
+    if (entries.length < PAGE_SIZE) break;
+  }
+
+  let removed = 0;
+  for (const version of stale) {
+    if (await storage.deleteVersion(version.scope, version.collectedAt)) {
+      removed += 1;
+    }
+  }
+  if (orphanKeys.length > 0 && deps.pendingBlobDeletions) {
+    await deps.pendingBlobDeletions.add(orphanKeys);
+  }
+
+  if (removed > 0 || kept > 0) {
+    logger.info(
+      { dataPointId: record.id, scope: record.scope, deletedAt, removed, kept },
+      "Reconciled gateway deletion against local index",
+    );
+  }
+  return { scope: record.scope, deletedAt, removed, kept };
 }
 
 export async function repairLocalMissingBlockSidecars(

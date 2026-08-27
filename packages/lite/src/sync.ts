@@ -5,7 +5,23 @@ import {
   createSyncManager,
   type SyncManager,
 } from "@opendatalabs/personal-server-ts-core/sync/manager";
-import { createVanaSyncStorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
+import {
+  createGatewayDataPointFeed,
+  createGatewayDeleteDataPort,
+  createPendingBlobDeletionStore,
+  createScopeDeletionTracker,
+  normalizePendingBlobDeletions,
+  type ScopeDeletionTracker,
+} from "@opendatalabs/personal-server-ts-core/sync";
+import type {
+  DataPointFeedPort,
+  PendingBlobDeletion,
+  PendingBlobDeletionStore,
+} from "@opendatalabs/personal-server-ts-core/ports";
+import {
+  createVanaSyncStorageAdapter,
+  resolveVanaStorageEndpoint,
+} from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import { createServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { ServerAccount } from "@opendatalabs/personal-server-ts-core/keys";
 import {
@@ -20,6 +36,13 @@ import { resolvePsLiteOwner } from "./owner-binding.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
 
 const SYNC_CURSOR_KEY = "sync-cursor-v1";
+const PENDING_BLOB_DELETIONS_KEY = "pending-blob-deletions-v1";
+
+interface PsLitePendingBlobDeletionsState {
+  /** Exact (scope, version) keys; `scopes` is the pre-key format. */
+  keys?: PendingBlobDeletion[];
+  scopes?: string[];
+}
 
 interface PsLiteSyncCursorState {
   lastProcessedTimestamp: string | null;
@@ -38,6 +61,16 @@ export interface PsLiteSyncOptions {
   ownerSignature: `0x${string}`;
   serverAccount: ServerAccount;
   gateway?: GatewayClient;
+  /**
+   * Deletion-aware gateway feed. Defaults to a REST feed on the configured
+   * gateway URL; inject alongside a mock `gateway` in tests.
+   */
+  dataPointFeed?: DataPointFeedPort;
+  /**
+   * Read-side tombstone memory shared with the runtime's data API. Built
+   * here by default so the sync workers and the reads see the same state.
+   */
+  scopeDeletions?: ScopeDeletionTracker;
   diagnostics?: DiagnosticsRecorder;
   logger?: Logger;
   /** Registers derivatives (envelopes carrying `$lineage`) with their lineage. */
@@ -77,6 +110,26 @@ export function createPsLiteSyncCursor(
       });
     },
   };
+}
+
+export function createPsLitePendingBlobDeletionStore(
+  stateStore: PsLiteStateStore,
+): PendingBlobDeletionStore {
+  return createPendingBlobDeletionStore({
+    async read() {
+      const state = await stateStore.get<PsLitePendingBlobDeletionsState>(
+        PENDING_BLOB_DELETIONS_KEY,
+      );
+      if (!state) return null;
+      return normalizePendingBlobDeletions(state.keys ?? state.scopes);
+    },
+    async write(keys) {
+      await stateStore.set<PsLitePendingBlobDeletionsState>(
+        PENDING_BLOB_DELETIONS_KEY,
+        { keys },
+      );
+    },
+  });
 }
 
 function buildDownloadDiagnosticsHook(
@@ -151,7 +204,12 @@ function buildDownloadDiagnosticsHook(
 
 export async function createPsLiteSyncManager(
   options: PsLiteSyncOptions,
-): Promise<{ syncManager: SyncManager; serverOwner: `0x${string}` }> {
+): Promise<{
+  syncManager: SyncManager;
+  serverOwner: `0x${string}`;
+  dataPointFeed: DataPointFeedPort;
+  scopeDeletions: ScopeDeletionTracker;
+}> {
   const serverOwner = await resolvePsLiteOwner({
     ownerAddress: options.ownerAddress,
     ownerSignature: options.ownerSignature,
@@ -170,6 +228,28 @@ export async function createPsLiteSyncManager(
   });
   const cursor = createPsLiteSyncCursor(options.stateStore);
   const logger = createBrowserLogger(options.logger);
+  const dataPointFeed =
+    options.dataPointFeed ??
+    createGatewayDataPointFeed({ gatewayUrl: options.config.gateway.url });
+  const scopeDeletions =
+    options.scopeDeletions ??
+    createScopeDeletionTracker({ feed: dataPointFeed, serverOwner, logger });
+  // Durable deletion: same AddData signer as uploads, same Web3Signed
+  // account as the storage provider.
+  const deleteData = createGatewayDeleteDataPort({
+    gatewayUrl: options.config.gateway.url,
+    dataPointFeed,
+    serverOwner,
+    signer,
+    storage: {
+      endpoint: resolveVanaStorageEndpoint(options.config),
+      chainId: options.config.gateway.chainId,
+      signMessage: (message) => options.serverAccount.signMessage(message),
+    },
+  });
+  const pendingBlobDeletions = createPsLitePendingBlobDeletionStore(
+    options.stateStore,
+  );
   const downloadDiagnostics = options.diagnostics
     ? buildDownloadDiagnosticsHook(options.diagnostics)
     : undefined;
@@ -183,6 +263,8 @@ export async function createPsLiteSyncManager(
       serverOwner,
       logger: logger as never,
       lineageGateway: options.lineageGateway,
+      dataPointFeed,
+      scopeDeletions,
     },
     {
       storage: options.storage,
@@ -193,8 +275,12 @@ export async function createPsLiteSyncManager(
       serverOwner,
       logger: logger as never,
       diagnostics: downloadDiagnostics,
+      dataPointFeed,
+      scopeDeletions,
     },
     {
+      deleteData,
+      pendingBlobDeletions,
       async canSync() {
         try {
           const serverInfo = await gateway.getServer(
@@ -221,5 +307,5 @@ export async function createPsLiteSyncManager(
     },
   );
   syncManager.start();
-  return { syncManager, serverOwner };
+  return { syncManager, serverOwner, dataPointFeed, scopeDeletions };
 }

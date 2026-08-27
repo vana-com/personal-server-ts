@@ -69,6 +69,7 @@ interface RawRow {
   size_bytes: number;
   version: number;
   data_point_id: string | null;
+  after_tombstone_version: number | null;
 }
 
 function rowToEntry(row: RawRow): IndexEntry {
@@ -83,6 +84,7 @@ function rowToEntry(row: RawRow): IndexEntry {
     sizeBytes: row.size_bytes,
     version: row.version,
     dataPointId: row.data_point_id,
+    afterTombstoneVersion: row.after_tombstone_version ?? null,
   };
 }
 
@@ -96,9 +98,10 @@ export function createIndexManager(db: Database.Database): IndexManager {
     size_bytes: number;
     version: number;
     data_point_id: string | null;
+    after_tombstone_version: number | null;
   }>(
-    `INSERT INTO data_files (file_id, schema_id, path, scope, collected_at, size_bytes, version, data_point_id)
-     VALUES (@file_id, @schema_id, @path, @scope, @collected_at, @size_bytes, @version, @data_point_id)`,
+    `INSERT INTO data_files (file_id, schema_id, path, scope, collected_at, size_bytes, version, data_point_id, after_tombstone_version)
+     VALUES (@file_id, @schema_id, @path, @scope, @collected_at, @size_bytes, @version, @data_point_id, @after_tombstone_version)`,
   );
 
   const maxVersionByScopeStmt = db.prepare<{ scope: string }>(
@@ -181,6 +184,7 @@ export function createIndexManager(db: Database.Database): IndexManager {
         size_bytes: entry.sizeBytes,
         version,
         data_point_id: entry.dataPointId ?? null,
+        after_tombstone_version: entry.afterTombstoneVersion ?? null,
       });
       const row = db
         .prepare("SELECT * FROM data_files WHERE id = ?")

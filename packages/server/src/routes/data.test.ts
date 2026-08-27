@@ -18,7 +18,10 @@ import {
   createTestWallet,
   buildWeb3SignedHeader,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
-import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
+import {
+  createScopeDeletionTracker,
+  type SyncManager,
+} from "@opendatalabs/personal-server-ts-core/sync";
 import { dataRoutes } from "./data.js";
 import type { DataRouteDeps } from "./data.js";
 import type { TokenStore } from "../token-store.js";
@@ -1329,7 +1332,7 @@ describe("DELETE /v1/data/:scope", () => {
     await rm(dataDir, { recursive: true, force: true });
   });
 
-  it("returns 204 and removes files + index for existing scope", async () => {
+  it("returns 200 with a per-step result and removes files + index for existing scope", async () => {
     const app = createApp();
 
     // Ingest 2 versions
@@ -1340,9 +1343,21 @@ describe("DELETE /v1/data/:scope", () => {
     // Verify data exists
     expect(indexManager.countByScope("instagram.profile")).toBe(2);
 
-    // DELETE with owner auth
+    // DELETE with owner auth. No sync manager here, so the route deletes the
+    // local copy only and says so (durable: false) instead of pretending.
     const res = await deleteWithAuth(app, "instagram.profile");
-    expect(res.status).toBe(204);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      scope: "instagram.profile",
+      dataPointId: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+      durable: false,
+      steps: {
+        gateway: { status: "skipped", reason: "sync-disabled" },
+        storage: { status: "skipped", reason: "sync-disabled" },
+        local: { status: "ok", deletedCount: 2 },
+      },
+      pendingBlobDeletion: false,
+    });
 
     // Index should be empty
     expect(indexManager.countByScope("instagram.profile")).toBe(0);
@@ -1352,11 +1367,141 @@ describe("DELETE /v1/data/:scope", () => {
     await expect(readdir(scopeDir)).rejects.toThrow();
   });
 
-  it("returns 204 for nonexistent scope (idempotent)", async () => {
+  it("returns 200 for nonexistent scope (idempotent)", async () => {
     const app = createApp();
 
     const res = await deleteWithAuth(app, "instagram.profile");
-    expect(res.status).toBe(204);
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.steps.local).toEqual({ status: "ok", deletedCount: 0 });
+  });
+
+  it("runs the durable delete through the sync manager and writes a delete access-log entry", async () => {
+    const accessLogWriter = createMockAccessLogWriter();
+    const deleteScope = vi.fn(async (scope: string) => ({
+      scope,
+      dataPointId: "0xdp",
+      durable: true,
+      steps: {
+        gateway: {
+          status: "ok" as const,
+          version: "3",
+          deletedAt: "2026-08-25T10:00:00.000Z",
+        },
+        storage: { status: "ok" as const, blobsDeleted: 2 },
+        local: { status: "ok" as const, deletedCount: 2 },
+      },
+      pendingBlobDeletion: false,
+    }));
+    const app = createApp({
+      accessLogWriter,
+      syncManager: { deleteScope } as unknown as SyncManager,
+    });
+
+    const res = await deleteWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(200);
+    expect(deleteScope).toHaveBeenCalledWith("instagram.profile");
+    expect(await res.json()).toMatchObject({
+      durable: true,
+      steps: { gateway: { status: "ok", version: "3" } },
+    });
+    expect(accessLogWriter.write).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "delete",
+        scope: "instagram.profile",
+        grantId: "owner",
+        builder: deleteOwnerWallet.address,
+      }),
+    );
+  });
+
+  it("still reports the deletion when the access-log write fails (the data is already gone)", async () => {
+    const accessLogWriter = createMockAccessLogWriter();
+    (accessLogWriter.write as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("audit db locked"),
+    );
+    const app = createApp({ accessLogWriter });
+    await ingestData("instagram.profile", { username: "gone" }, app);
+
+    const res = await deleteWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      steps: { local: { status: "ok", deletedCount: 1 } },
+    });
+    expect(
+      indexManager.findClosestByScope(
+        "instagram.profile",
+        "2099-01-01T00:00:00.000Z",
+      ),
+    ).toBeUndefined();
+  });
+
+  it("reports a storage failure after a gateway success instead of hiding it", async () => {
+    const app = createApp({
+      syncManager: {
+        deleteScope: vi.fn(async (scope: string) => ({
+          scope,
+          dataPointId: "0xdp",
+          durable: true,
+          steps: {
+            gateway: { status: "ok" as const, version: "3", deletedAt: null },
+            storage: {
+              status: "failed" as const,
+              error: "vana-storage delete failed: 502",
+            },
+            local: { status: "ok" as const, deletedCount: 1 },
+          },
+          pendingBlobDeletion: true,
+        })),
+      } as unknown as SyncManager,
+    });
+
+    const res = await deleteWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      durable: true,
+      pendingBlobDeletion: true,
+      steps: {
+        storage: {
+          status: "failed",
+          error: "vana-storage delete failed: 502",
+        },
+      },
+    });
+  });
+
+  it("returns 502 DELETE_TOMBSTONE_FAILED and keeps local data when the gateway tombstone fails", async () => {
+    const accessLogWriter = createMockAccessLogWriter();
+    const app = createApp({
+      accessLogWriter,
+      syncManager: {
+        deleteScope: vi.fn(async (scope: string) => ({
+          scope,
+          dataPointId: "0xdp",
+          durable: false,
+          steps: {
+            gateway: {
+              status: "failed" as const,
+              error: "Gateway error: 503 Service Unavailable",
+            },
+            storage: { status: "skipped" as const, reason: "gateway-failed" },
+            local: { status: "skipped" as const, reason: "gateway-failed" },
+          },
+          pendingBlobDeletion: false,
+        })),
+      } as unknown as SyncManager,
+    });
+
+    const res = await deleteWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(502);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("DELETE_TOMBSTONE_FAILED");
+    expect(json.error.details.result.steps.gateway.status).toBe("failed");
+    expect(accessLogWriter.write).not.toHaveBeenCalled();
   });
 
   it("returns 400 for invalid scope", async () => {
@@ -1392,7 +1537,7 @@ describe("DELETE /v1/data/:scope", () => {
 
     // DELETE with owner auth
     const deleteRes = await deleteWithAuth(app, "instagram.profile");
-    expect(deleteRes.status).toBe(204);
+    expect(deleteRes.status).toBe(200);
 
     // GET should be 404
     const uri = "/instagram.profile";
@@ -1409,6 +1554,389 @@ describe("DELETE /v1/data/:scope", () => {
     expect(getRes.status).toBe(404);
   });
 
+  it("answers 410 DATA_DELETED (not 404) for a scope the gateway reports as deleted", async () => {
+    const grant = makeGrant({ grantorAddress: deleteOwnerWallet.address });
+    const gateway = createMockGateway({
+      getGrant: vi.fn().mockResolvedValue(grant),
+    });
+    const getDataPoint = vi.fn(async () => ({
+      id: "0xdp",
+      ownerAddress: deleteOwnerWallet.address,
+      scope: "instagram.profile",
+      dataHash: "0x" + "11".repeat(32),
+      metadataHash: "0x" + "22".repeat(32),
+      expectedVersion: "4",
+      addedAt: "2026-08-25T10:00:00.000Z",
+      deletedAt: "2026-08-25T10:00:00.000Z",
+    }));
+    const app = createApp({
+      gateway,
+      scopeDeletions: createScopeDeletionTracker({
+        feed: { getDataPoint, listDataPointsByOwner: vi.fn() },
+        serverOwner: deleteOwnerWallet.address,
+      }),
+    });
+
+    const header = await buildWeb3SignedHeader({
+      wallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: "/instagram.profile",
+      grantId: "grant-123",
+    });
+    const getRes = await app.request("/instagram.profile", {
+      headers: { Authorization: header },
+    });
+
+    expect(getRes.status).toBe(410);
+    const json = await getRes.json();
+    expect(json.error.errorCode).toBe("DATA_DELETED");
+    expect(json.error.details).toMatchObject({
+      scope: "instagram.profile",
+      deletedAt: "2026-08-25T10:00:00.000Z",
+    });
+    expect(getDataPoint).toHaveBeenCalledWith({
+      ownerAddress: deleteOwnerWallet.address,
+      scope: "instagram.profile",
+    });
+  });
+
+  describe("reads of a scope another replica deleted", () => {
+    const grant = () =>
+      makeGrant({ grantorAddress: deleteOwnerWallet.address });
+
+    function tombstoneFeed(deletedAt: string | null) {
+      const getDataPoint = vi.fn(async () => ({
+        id: "0xdp",
+        ownerAddress: deleteOwnerWallet.address,
+        scope: "instagram.profile",
+        dataHash: "0x" + "11".repeat(32),
+        metadataHash: "0x" + "22".repeat(32),
+        expectedVersion: "4",
+        addedAt: "2026-08-25T10:00:00.000Z",
+        deletedAt,
+      }));
+      return { getDataPoint, listDataPointsByOwner: vi.fn() };
+    }
+
+    async function getAsBuilder(app: ReturnType<typeof dataRoutes>) {
+      const header = await buildWeb3SignedHeader({
+        wallet,
+        aud: SERVER_ORIGIN,
+        method: "GET",
+        uri: "/instagram.profile",
+        grantId: "grant-123",
+      });
+      return app.request("/instagram.profile", {
+        headers: { Authorization: header },
+      });
+    }
+
+    it("refuses a stale local copy when the gateway holds a tombstone that covers it", async () => {
+      // The local envelope exists and was ingested before this replica knew
+      // of any tombstone (no re-add marker); the registry now says deleted.
+      const feed = tombstoneFeed("2099-01-01T00:00:00.000Z");
+      const app = createApp({
+        gateway: createMockGateway({
+          getGrant: vi.fn().mockResolvedValue(grant()),
+        }),
+        scopeDeletions: createScopeDeletionTracker({
+          feed,
+          serverOwner: deleteOwnerWallet.address,
+        }),
+      });
+      await ingestData("instagram.profile", { username: "stale" }, createApp());
+      expect(
+        indexManager.findClosestByScope(
+          "instagram.profile",
+          "2099-01-01T00:00:00.000Z",
+        ),
+      ).toBeDefined();
+
+      const first = await getAsBuilder(app);
+      expect(first.status).toBe(410);
+      const json = await first.json();
+      expect(json.error.errorCode).toBe("DATA_DELETED");
+      expect(json.error.details).toMatchObject({
+        scope: "instagram.profile",
+        deletedAt: "2099-01-01T00:00:00.000Z",
+      });
+      // The read does not touch the local copy; sync reconciles it.
+      expect(
+        indexManager.findClosestByScope(
+          "instagram.profile",
+          "2099-01-01T00:00:00.000Z",
+        ),
+      ).toBeDefined();
+
+      // The verdict is remembered: a second read costs no gateway lookup.
+      const second = await getAsBuilder(app);
+      expect(second.status).toBe(410);
+      expect(feed.getDataPoint).toHaveBeenCalledTimes(1);
+    });
+
+    it("refuses a stale local copy the sync feed reported deleted, with no gateway lookup at all", async () => {
+      const feed = tombstoneFeed(null);
+      const tracker = createScopeDeletionTracker({
+        feed,
+        serverOwner: deleteOwnerWallet.address,
+      });
+      const app = createApp({
+        gateway: createMockGateway({
+          getGrant: vi.fn().mockResolvedValue(grant()),
+        }),
+        scopeDeletions: tracker,
+      });
+      await ingestData("instagram.profile", { username: "stale" }, createApp());
+      // What the download worker records when it lists the tombstone.
+      tracker.markDeleted("instagram.profile", {
+        deletedAt: "2099-01-01T00:00:00.000Z",
+        version: "4",
+      });
+
+      const res = await getAsBuilder(app);
+
+      expect(res.status).toBe(410);
+      expect(feed.getDataPoint).not.toHaveBeenCalled();
+    });
+
+    it("serves a local re-add ingested on top of the tombstone", async () => {
+      const feed = tombstoneFeed("2020-01-01T00:00:00.000Z");
+      const app = createApp({
+        gateway: createMockGateway({
+          getGrant: vi.fn().mockResolvedValue(grant()),
+        }),
+        scopeDeletions: createScopeDeletionTracker({
+          feed,
+          serverOwner: deleteOwnerWallet.address,
+        }),
+      });
+      // Ingest learns of tombstone 4 and stamps the row as a re-add on top
+      // of it; the read then serves it although the scope is tombstoned.
+      await ingestData("instagram.profile", { username: "re-added" }, app);
+      expect(
+        indexManager.findClosestByScope(
+          "instagram.profile",
+          "2099-01-01T00:00:00.000Z",
+        ),
+      ).toMatchObject({ afterTombstoneVersion: 4, dataPointId: null });
+
+      const res = await getAsBuilder(app);
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        data: { username: "re-added" },
+      });
+    });
+
+    it("refuses a local copy ingested before the tombstone was known, whatever the clocks say", async () => {
+      // Ingested while the feed showed nothing (deletion not yet visible),
+      // then a tombstone with a deletedAt far in the past: a clock-ahead
+      // replica must still not serve the pre-deletion copy.
+      const feed = tombstoneFeed("2000-01-01T00:00:00.000Z");
+      feed.getDataPoint.mockResolvedValueOnce(null);
+      const app = createApp({
+        gateway: createMockGateway({
+          getGrant: vi.fn().mockResolvedValue(grant()),
+        }),
+        scopeDeletions: createScopeDeletionTracker({
+          feed,
+          serverOwner: deleteOwnerWallet.address,
+          maxStalenessMs: 0,
+        }),
+      });
+      await ingestData("instagram.profile", { username: "stale" }, app);
+
+      const res = await getAsBuilder(app);
+
+      expect(res.status).toBe(410);
+    });
+
+    it("hides a tombstoned scope from the versions and scope listings, and 410s the versions of a fully covered scope", async () => {
+      const feed = tombstoneFeed(null);
+      const tracker = createScopeDeletionTracker({
+        feed,
+        serverOwner: deleteOwnerWallet.address,
+      });
+      const app = createApp({
+        gateway: createMockGateway({
+          getGrant: vi.fn().mockResolvedValue(grant()),
+        }),
+        scopeDeletions: tracker,
+      });
+      await ingestData("instagram.profile", { username: "stale" }, createApp());
+      await ingestData("instagram.media", { count: 1 }, createApp());
+      tracker.markDeleted("instagram.profile", {
+        deletedAt: "2099-01-01T00:00:00.000Z",
+        version: "4",
+      });
+
+      const listHeader = await buildWeb3SignedHeader({
+        wallet,
+        aud: SERVER_ORIGIN,
+        method: "GET",
+        uri: "/",
+      });
+      const list = await app.request("/", {
+        headers: { Authorization: listHeader },
+      });
+      expect(list.status).toBe(200);
+      expect(await list.json()).toMatchObject({
+        scopes: [{ scope: "instagram.media" }],
+        total: 1,
+      });
+
+      const versionsHeader = await buildWeb3SignedHeader({
+        wallet,
+        aud: SERVER_ORIGIN,
+        method: "GET",
+        uri: "/instagram.profile/versions",
+      });
+      const versions = await app.request("/instagram.profile/versions", {
+        headers: { Authorization: versionsHeader },
+      });
+      expect(versions.status).toBe(410);
+      expect((await versions.json()).error.errorCode).toBe("DATA_DELETED");
+    });
+
+    it("lists only the re-add versions of a tombstoned scope", async () => {
+      const feed = tombstoneFeed("2020-01-01T00:00:00.000Z");
+      const tracker = createScopeDeletionTracker({
+        feed,
+        serverOwner: deleteOwnerWallet.address,
+      });
+      const app = createApp({
+        gateway: createMockGateway({
+          getGrant: vi.fn().mockResolvedValue(grant()),
+        }),
+        scopeDeletions: tracker,
+      });
+      // One stale copy (no marker), then a re-add stamped through ingest.
+      await ingestData("instagram.profile", { username: "stale" }, createApp());
+      // collectedAt has second granularity; keep the two versions apart.
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      const reAdd = (await ingestData(
+        "instagram.profile",
+        { username: "re-added" },
+        app,
+      )) as { collectedAt: string };
+
+      const versionsHeader = await buildWeb3SignedHeader({
+        wallet,
+        aud: SERVER_ORIGIN,
+        method: "GET",
+        uri: "/instagram.profile/versions",
+      });
+      const versions = await app.request("/instagram.profile/versions", {
+        headers: { Authorization: versionsHeader },
+      });
+      expect(versions.status).toBe(200);
+      expect(await versions.json()).toMatchObject({
+        versions: [{ collectedAt: reAdd.collectedAt }],
+        total: 1,
+      });
+
+      const listHeader = await buildWeb3SignedHeader({
+        wallet,
+        aud: SERVER_ORIGIN,
+        method: "GET",
+        uri: "/",
+      });
+      const list = await app.request("/", {
+        headers: { Authorization: listHeader },
+      });
+      expect(await list.json()).toMatchObject({
+        scopes: [{ scope: "instagram.profile" }],
+        total: 1,
+      });
+    });
+
+    it("trusts the local index without a lookup while the sync feed is fresh", async () => {
+      const feed = tombstoneFeed("2099-01-01T00:00:00.000Z");
+      const tracker = createScopeDeletionTracker({
+        feed,
+        serverOwner: deleteOwnerWallet.address,
+      });
+      const app = createApp({
+        gateway: createMockGateway({
+          getGrant: vi.fn().mockResolvedValue(grant()),
+        }),
+        scopeDeletions: tracker,
+      });
+      await ingestData("instagram.profile", { username: "fresh" }, createApp());
+      // A complete feed pass just happened and listed no tombstone for it.
+      tracker.noteFeedSynced();
+
+      const res = await getAsBuilder(app);
+
+      expect(res.status).toBe(200);
+      expect(feed.getDataPoint).not.toHaveBeenCalled();
+    });
+
+    it("serves the local copy from last known state when the gateway is unreachable", async () => {
+      const getDataPoint = vi.fn(async () => {
+        throw new Error("ECONNREFUSED");
+      });
+      const app = createApp({
+        gateway: createMockGateway({
+          getGrant: vi.fn().mockResolvedValue(grant()),
+        }),
+        scopeDeletions: createScopeDeletionTracker({
+          feed: { getDataPoint, listDataPointsByOwner: vi.fn() },
+          serverOwner: deleteOwnerWallet.address,
+        }),
+      });
+      await ingestData(
+        "instagram.profile",
+        { username: "offline" },
+        createApp(),
+      );
+
+      const res = await getAsBuilder(app);
+
+      expect(res.status).toBe(200);
+      expect(getDataPoint).toHaveBeenCalledTimes(1);
+    });
+
+    it("answers 404, not 410, for a scope the gateway has never seen", async () => {
+      const getDataPoint = vi.fn(async () => null);
+      const app = createApp({
+        gateway: createMockGateway({
+          getGrant: vi.fn().mockResolvedValue(grant()),
+        }),
+        scopeDeletions: createScopeDeletionTracker({
+          feed: { getDataPoint, listDataPointsByOwner: vi.fn() },
+          serverOwner: deleteOwnerWallet.address,
+        }),
+      });
+
+      const res = await getAsBuilder(app);
+
+      expect(res.status).toBe(404);
+      expect(getDataPoint).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("returns 401 without owner authorization and deletes nothing", async () => {
+    const syncManager = {
+      trigger: vi.fn(),
+      deleteScope: vi.fn(),
+    } as unknown as SyncManager;
+    const app = createApp({ syncManager });
+    await ingestData("instagram.profile", { username: "keep" }, app);
+
+    const res = await app.request("/instagram.profile", { method: "DELETE" });
+
+    expect(res.status).toBe(401);
+    expect(syncManager.deleteScope).not.toHaveBeenCalled();
+    expect(
+      indexManager.findClosestByScope(
+        "instagram.profile",
+        "2099-01-01T00:00:00.000Z",
+      ),
+    ).toBeDefined();
+  });
+
   it("after DELETE, can re-create with POST", async () => {
     const app = createApp();
 
@@ -1416,7 +1944,7 @@ describe("DELETE /v1/data/:scope", () => {
     await ingestData("instagram.profile", { version: 1 }, app);
 
     const deleteRes = await deleteWithAuth(app, "instagram.profile");
-    expect(deleteRes.status).toBe(204);
+    expect(deleteRes.status).toBe(200);
 
     const res = await postWithOwnerAuth(
       app,
@@ -1658,6 +2186,36 @@ describe("X402 payment on GET /v1/data/:scope", () => {
     cleanup();
     await rm(dataDir, { recursive: true, force: true });
     vi.unstubAllGlobals();
+  });
+
+  it("answers 410 for a deleted scope before issuing any payment challenge", async () => {
+    // Deletion is checked ahead of the x402 cycle so a builder is never
+    // charged (or even challenged) for data the owner deleted.
+    const tracker = createScopeDeletionTracker({
+      serverOwner: ownerForX402.address,
+    });
+    const app = createX402App({ scopeDeletions: tracker });
+    const ingestRes = await ingest(app, "instagram.profile", {
+      username: "gone",
+    });
+    expect(ingestRes.status).toBe(201);
+    tracker.markDeleted("instagram.profile", {
+      deletedAt: "2099-01-01T00:00:00.000Z",
+      version: "4",
+    });
+    const gatewayFetch = vi.fn();
+    vi.stubGlobal("fetch", gatewayFetch);
+
+    const noPayment = await getNoPayment(app, "instagram.profile");
+    expect(noPayment.status).toBe(410);
+
+    const paid = await getWithPayment(
+      app,
+      "instagram.profile",
+      await signedXPayment(),
+    );
+    expect(paid.status).toBe(410);
+    expect(gatewayFetch).not.toHaveBeenCalled();
   });
 
   it("returns 402 with a fresh challenge when X-PAYMENT is absent", async () => {

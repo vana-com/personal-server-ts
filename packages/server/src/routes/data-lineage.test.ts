@@ -688,7 +688,7 @@ describe("derivative data routes", () => {
       });
     }
 
-    it("is a specified 501 stub until durable (tombstone) deletion exists", async () => {
+    it("is a specified 501 stub until the lineage walk is implemented", async () => {
       await seedSource(SOURCE_SCOPE);
       const res = await ownerDelete(SOURCE_SCOPE, "?cascade=lineage");
       expect(res.status).toBe(501);
@@ -699,13 +699,18 @@ describe("derivative data routes", () => {
       expect((await ownerRead(SOURCE_SCOPE)).status).toBe(200);
     });
 
-    it("rejects an unknown cascade mode with 400 and keeps the default single-node delete at 204", async () => {
+    it("rejects an unknown cascade mode with 400 and keeps the default single-node durable delete", async () => {
       await seedSource(SOURCE_SCOPE);
       const bad = await ownerDelete(SOURCE_SCOPE, "?cascade=all");
       expect(bad.status).toBe(400);
       expect((await bad.json()).error.errorCode).toBe("INVALID_CASCADE");
       const res = await ownerDelete(SOURCE_SCOPE);
-      expect(res.status).toBe(204);
+      // The single-node delete answers with its per-step result.
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        scope: SOURCE_SCOPE,
+        steps: { local: { status: "ok" } },
+      });
       expect((await ownerRead(SOURCE_SCOPE)).status).toBe(404);
     });
 

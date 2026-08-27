@@ -43,7 +43,10 @@ import {
   createDeviceSessionLookup,
 } from "./routes/auth-device.js";
 import { oauthTokenRoutes } from "./routes/oauth-token.js";
-import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
+import type {
+  ScopeDeletionTracker,
+  SyncManager,
+} from "@opendatalabs/personal-server-ts-core/sync";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
 import type {
@@ -82,6 +85,8 @@ export interface AppDeps {
   accessToken?: string;
   configPath?: string;
   syncManager?: SyncManager | null;
+  /** Read-side tombstone memory; reads of a deleted scope answer 410. */
+  scopeDeletions?: ScopeDeletionTracker;
   serverSigner?: ServerSigner;
   tokenStore?: TokenStore;
   runtimeAvailability?: RuntimeAvailabilityPort;
@@ -174,6 +179,7 @@ export function createApp(deps: AppDeps): Hono {
       accessToken: deps.accessToken,
       tokenStore: deps.tokenStore,
       syncManager: deps.syncManager ?? null,
+      scopeDeletions: deps.scopeDeletions,
       runtimeAvailability: deps.runtimeAvailability,
       dataStorage: deps.dataStorage,
       // Powers the RECORD_DATA_ACCESS attestation embedded in X402 challenges.

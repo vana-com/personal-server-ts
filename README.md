@@ -102,13 +102,17 @@ All authenticated endpoints use `Authorization: Web3Signed <base64url(json)>.<si
 | `/v1/data`                  | GET    | Builder         | List scopes            |
 | `/v1/data/{scope}`          | GET    | Builder + Grant | Read data              |
 | `/v1/data/{scope}/versions` | GET    | Builder         | List versions          |
-| `/v1/data/{scope}`          | DELETE | Owner           | Delete data            |
+| `/v1/data/{scope}`          | DELETE | Owner           | Delete data (durable)  |
 | `/v1/grants`                | GET    | Owner           | List grants            |
 | `/v1/grants/verify`         | POST   | None            | Verify grant signature |
 | `/v1/access-logs`           | GET    | Owner           | Access history         |
 | `/v1/sync/trigger`          | POST   | Owner           | Force sync             |
 | `/v1/sync/status`           | GET    | Owner           | Sync status            |
 | `/v1/sync/file/{fileId}`    | POST   | Owner           | Sync specific file     |
+
+### Durable deletion
+
+`DELETE /v1/data/{scope}` registers an owner-signed tombstone at the gateway, removes the ciphertext from storage one exact version key at a time (every registry version up to the tombstone plus any covered local key; never a scope-wide delete, so a re-add registered above the tombstone version keeps its blob by construction), then removes the local copy, in that order; the response reports each step. Blob deletes run in batches under the storage rate limit and any key not finished in a pass is queued as an exact retry marker that later sync cycles drain. Reads of a deleted scope answer `410 DATA_DELETED`, never a tombstone as data, and the scope and version listings hide copies a tombstone covers. Every replica keeps an in-memory view of gateway tombstones fed by its sync cycle and consulted before serving or charging for a read, so the consistency window for a deletion made on another replica is one sync poll interval while sync is healthy (60s by default), and at most `maxStalenessMs` (120s) plus one gateway lookup otherwise; a scope re-added on another replica after its deletion becomes readable here on the same schedule, because remembered tombstones age out and are re-checked too. Whether a local copy is covered by a tombstone is decided by registry versions and an ingest-time marker (the tombstone version the replica knew when the row was written), never by comparing clocks across machines; data ingested before a replica learns of a deletion made elsewhere is treated as deleted. A replica that cannot reach the gateway serves its last known state rather than failing reads. Ciphertext that left the server before the deletion stays decryptable by the owner; the scope key is derived, not stored, so there is nothing to destroy.
 
 ## Docs
 

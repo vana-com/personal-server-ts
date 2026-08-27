@@ -3,8 +3,16 @@ import type { DownloadWorkerDeps } from "../workers/download.js";
 import type { SyncStatus, SyncError, SyncBlockedReason } from "../types.js";
 import { uploadAll } from "../workers/upload.js";
 import { downloadAll } from "../workers/download.js";
-import { deleteScopeRemote } from "../workers/delete.js";
+import {
+  deleteScope,
+  retryPendingBlobDeletions,
+  type DeleteScopeResult,
+} from "../workers/delete.js";
 import { createDownloadRetryMemory } from "../retry-memory.js";
+import type {
+  DeleteDataPort,
+  PendingBlobDeletionStore,
+} from "../../ports/index.js";
 
 export interface SyncManagerOptions {
   /** Polling interval in milliseconds (default: 60_000 = 1 minute) */
@@ -15,6 +23,13 @@ export interface SyncManagerOptions {
   notifyDebounceMs?: number;
   /** Optional runtime gate. Returning blocked skips upload/download without an error. */
   canSync?: () => Promise<SyncCanRunResult> | SyncCanRunResult;
+  /**
+   * Remote deletion (gateway tombstone + storage blobs). Without it
+   * `deleteScope` is local-only and reports `durable: false`.
+   */
+  deleteData?: DeleteDataPort | null;
+  /** Durable retry marker for blob deletions that failed after the tombstone. */
+  pendingBlobDeletions?: PendingBlobDeletionStore;
 }
 
 export type SyncCanRunResult =
@@ -37,11 +52,12 @@ export interface SyncManager {
   notifyNewData(): void;
 
   /**
-   * Propagate a scope deletion to the authoritative stores (R2 blobs + gateway file records).
-   * Call BEFORE deleting the scope locally — it reads the local index to find what to remove.
-   * Best-effort: resolves with a summary; per-file failures are logged, not thrown.
+   * Durable scope deletion: gateway tombstone, then storage blobs, then the
+   * local copy (see workers/delete.ts for why that order is the only safe
+   * one). Resolves with a per-step result; a gateway failure leaves the
+   * local copy in place and is reported as `steps.gateway.status = "failed"`.
    */
-  deleteScopeRemote(scope: string): Promise<void>;
+  deleteScope(scope: string): Promise<DeleteScopeResult>;
 
   /** Whether the sync manager is currently running */
   readonly running: boolean;
@@ -72,6 +88,33 @@ export function createSyncManager(
   // attempted once per session, not once per cycle; transient storage errors
   // back off exponentially instead of re-firing on every cycle.
   const downloadRetryMemory = createDownloadRetryMemory();
+  const dataPointFeed = downloadDeps.dataPointFeed ?? uploadDeps.dataPointFeed;
+  const scopeDeletions =
+    uploadDeps.scopeDeletions ?? downloadDeps.scopeDeletions;
+  // The upload worker queues guarded cleanup for ciphertext it had to
+  // abandon mid-race; it shares the manager's marker store.
+  const workerUploadDeps: UploadWorkerDeps = {
+    ...uploadDeps,
+    pendingBlobDeletions:
+      uploadDeps.pendingBlobDeletions ?? options?.pendingBlobDeletions,
+  };
+  const workerDownloadDeps: DownloadWorkerDeps = {
+    ...downloadDeps,
+    pendingBlobDeletions:
+      downloadDeps.pendingBlobDeletions ?? options?.pendingBlobDeletions,
+  };
+
+  // Sync cycles and durable deletes mutate the same local index and the same
+  // registry rows. Run them one at a time (FIFO): a delete cannot start while
+  // an upload of the same scope is between "blob uploaded" and "row marked
+  // synced", and a cycle cannot start until a delete has finished all three
+  // steps. A rejected operation never blocks the ones queued behind it.
+  let mutationQueue: Promise<unknown> = Promise.resolve();
+  function exclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const run = mutationQueue.then(operation, operation);
+    mutationQueue = run.catch(() => undefined);
+    return run;
+  }
 
   async function runCycle(): Promise<void> {
     // Prevent concurrent cycles
@@ -80,7 +123,7 @@ export function createSyncManager(
       return cycleInFlight;
     }
 
-    cycleInFlight = (async () => {
+    cycleInFlight = exclusive(async () => {
       do {
         rerunRequested = false;
         const canRun = await (options?.canSync?.() ?? { ok: true });
@@ -91,9 +134,27 @@ export function createSyncManager(
         }
         blocked = null;
 
+        // Finish blob deletions whose tombstone landed but whose storage
+        // DELETE did not. Cheap when nothing is pending; never blocks sync.
+        try {
+          await retryPendingBlobDeletions({
+            deleteData: options?.deleteData,
+            pendingBlobDeletions: options?.pendingBlobDeletions,
+            dataPointFeed,
+            serverOwner: uploadDeps.serverOwner,
+            storage: uploadDeps.storage,
+            logger: uploadDeps.logger,
+          });
+        } catch (err) {
+          uploadDeps.logger.warn(
+            { error: (err as Error).message },
+            "Pending blob deletion retry failed",
+          );
+        }
+
         try {
           // Upload unsynced local files
-          const uploadResults = await uploadAll(uploadDeps, {
+          const uploadResults = await uploadAll(workerUploadDeps, {
             batchSize: uploadBatchSize,
             onError(entry, error) {
               pushError({
@@ -125,7 +186,7 @@ export function createSyncManager(
         try {
           // Download new remote files
           const fullReconcile = needsFullReconcile;
-          const downloadResults = await downloadAll(downloadDeps, {
+          const downloadResults = await downloadAll(workerDownloadDeps, {
             fullReconcile,
             retryMemory: downloadRetryMemory,
           });
@@ -157,7 +218,7 @@ export function createSyncManager(
 
         lastSync = new Date().toISOString();
       } while (rerunRequested && isRunning);
-    })();
+    });
 
     try {
       await cycleInFlight;
@@ -265,9 +326,21 @@ export function createSyncManager(
       scheduleNotifiedCycle();
     },
 
-    async deleteScopeRemote(scope: string) {
-      // Reuses the upload worker's remote deps (gateway, storage adapter, signer, owner).
-      await deleteScopeRemote(uploadDeps, scope);
+    deleteScope(scope: string) {
+      return exclusive(() =>
+        deleteScope(
+          {
+            storage: uploadDeps.storage,
+            serverOwner: uploadDeps.serverOwner,
+            deleteData: options?.deleteData,
+            pendingBlobDeletions: options?.pendingBlobDeletions,
+            scopeDeletions,
+            dataPointFeed,
+            logger: uploadDeps.logger,
+          },
+          scope,
+        ),
+      );
     },
   };
 

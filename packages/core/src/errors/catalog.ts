@@ -193,7 +193,7 @@ export class LineageCascadeUnavailableError extends ProtocolError {
     super(
       501,
       "LINEAGE_CASCADE_UNAVAILABLE",
-      "DELETE ?cascade=lineage is specified but not implemented yet: it needs the durable (tombstone) deletion of every derivative at the gateway, which this server cannot perform. Delete scopes one at a time.",
+      "DELETE ?cascade=lineage is specified but not implemented yet: the lineage walk that finds every derivative is missing. Delete scopes one at a time; each single-scope delete is durable.",
       details,
     );
   }
@@ -207,5 +207,26 @@ export class InvalidCascadeError extends ProtocolError {
       'Unsupported cascade mode; the only supported value is "lineage"',
       details,
     );
+  }
+}
+
+// 502 - Upstream (gateway) errors
+
+export class DeleteTombstoneFailedError extends ProtocolError {
+  constructor(details?: Record<string, unknown>) {
+    super(
+      502,
+      "DELETE_TOMBSTONE_FAILED",
+      "Gateway did not acknowledge the deletion tombstone; nothing was deleted",
+      details,
+    );
+  }
+}
+
+// 410 - Deleted resources
+
+export class DataDeletedError extends ProtocolError {
+  constructor(details?: Record<string, unknown>) {
+    super(410, "DATA_DELETED", "Data point has been deleted", details);
   }
 }

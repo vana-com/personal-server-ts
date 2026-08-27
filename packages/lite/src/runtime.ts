@@ -42,6 +42,7 @@ import type {
   DataStoragePort,
   RuntimeAvailabilityPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
+import type { ScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
 import type {
   DataPortabilityGatewayConfig,
   GatewayClient,
@@ -125,8 +126,14 @@ export interface PsLiteRuntimeOptions {
     >;
   syncManager?:
     | (Pick<SyncManager, "trigger" | "getStatus"> &
-        Partial<Pick<SyncManager, "start" | "stop">>)
+        Partial<Pick<SyncManager, "start" | "stop" | "deleteScope">>)
     | null;
+  /**
+   * Read-side tombstone memory; reads of a scope the gateway reports deleted
+   * answer 410 (stale local copy or not). Built by the browser runtime
+   * alongside the sync manager, which keeps it current.
+   */
+  scopeDeletions?: ScopeDeletionTracker;
   accessLogReader?: AccessLogReader;
   accessLogWriter?: AccessLogWriter;
   readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
@@ -891,6 +898,7 @@ export function createPsLiteRuntime(
               accessLogWriter,
               readFulfillmentReporter: options.readFulfillmentReporter,
               syncManager: options.syncManager ?? null,
+              scopeDeletions: options.scopeDeletions,
               now,
               createLogId,
               // x402 payment enforcement for builder reads. Only engages with a

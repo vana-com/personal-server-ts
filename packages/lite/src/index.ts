@@ -76,6 +76,7 @@ export {
 } from "./state.js";
 
 export {
+  createPsLitePendingBlobDeletionStore,
   createPsLiteSyncCursor,
   createPsLiteSyncManager,
   type PsLiteSyncOptions,

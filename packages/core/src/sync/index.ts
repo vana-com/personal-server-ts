@@ -20,3 +20,49 @@ export type {
   DownloadDiagnosticsHook,
   DownloadWorkerDeps,
 } from "./workers/download.js";
+export {
+  BLOB_DELETE_BATCH_SIZE,
+  deleteScope,
+  planBlobDeletions,
+  retryPendingBlobDeletions,
+  type DeleteScopeDeps,
+  type DeleteScopeResult,
+  type DeleteScopeStep,
+  type DeleteStepStatus,
+  type RetryPendingBlobDeletionsResult,
+} from "./workers/delete.js";
+export {
+  createGatewayDataPointFeed,
+  feedFromGatewayClient,
+  type GatewayDataPointFeedOptions,
+} from "./data-point-feed.js";
+export {
+  createGatewayDeleteDataPort,
+  type GatewayDeleteDataPortOptions,
+} from "./delete-data-port.js";
+export {
+  createMemoryPendingBlobDeletionStore,
+  createPendingBlobDeletionStore,
+  normalizePendingBlobDeletions,
+  type PendingBlobDeletionKv,
+} from "./pending-blob-deletions.js";
+export { computeDataPointId } from "./data-point-id.js";
+export {
+  createScopeDeletionTracker,
+  deletionTimestamp,
+  isEntryCoveredByTombstone,
+  tombstoneVersion,
+  DEFAULT_SCOPE_DELETION_GATEWAY_RETRY_MS,
+  DEFAULT_SCOPE_DELETION_MAX_STALENESS_MS,
+  type ScopeDeletionResolveOptions,
+  type ScopeDeletionSource,
+  type ScopeDeletionTracker,
+  type ScopeDeletionTrackerOptions,
+  type ScopeDeletionVerdict,
+  type ScopeTombstone,
+} from "./scope-deletions.js";
+export {
+  TOMBSTONE_DATA_HASH,
+  TOMBSTONE_METADATA_HASH,
+  isTombstoneRecord,
+} from "./tombstone.js";

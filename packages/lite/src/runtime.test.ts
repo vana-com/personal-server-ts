@@ -10,6 +10,7 @@ import {
   createMemoryPsLiteTokenStore,
 } from "./test-support/memory.js";
 import { createMockPsLiteGateway } from "./test-support/gateway.js";
+import { createScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
@@ -611,7 +612,11 @@ describe("createPsLiteRuntime", () => {
         headers: { Authorization: "Bearer owner-token" },
       }),
     );
-    expect(deleted.status).toBe(204);
+    expect(deleted.status).toBe(200);
+    expect(await deleted.json()).toMatchObject({
+      durable: false,
+      steps: { local: { status: "ok", deletedCount: 1 } },
+    });
 
     const read = await runtime.fetch(
       new Request(
@@ -622,6 +627,80 @@ describe("createPsLiteRuntime", () => {
       ),
     );
     expect(read.status).toBe(404);
+  });
+
+  it("refuses a stale local copy of a scope the gateway reports deleted (same gate as the node server)", async () => {
+    const tracker = createScopeDeletionTracker({
+      serverOwner: "0x0000000000000000000000000000000000000001",
+    });
+    const runtime = createTestRuntime({
+      storage: createMemoryPsLiteStorage(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      serverOwner: "0x0000000000000000000000000000000000000001",
+      scopeDeletions: tracker,
+    });
+    await runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer owner-token",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ username: "stale" }),
+      }),
+    );
+    const readUrl =
+      "https://ps.local/v1/data/instagram.profile?grantId=grant-1";
+    const builderHeaders = { Authorization: "Bearer builder-token" };
+
+    // The sync feed (or a delete on another replica) reports a tombstone
+    // the local copy predates: the copy is refused, not served.
+    tracker.markDeleted("instagram.profile", {
+      deletedAt: "2099-01-01T00:00:00.000Z",
+      version: "4",
+    });
+    const refused = await runtime.fetch(
+      new Request(readUrl, { headers: builderHeaders }),
+    );
+    expect(refused.status).toBe(410);
+    expect(await refused.json()).toMatchObject({
+      error: {
+        errorCode: "DATA_DELETED",
+        details: {
+          scope: "instagram.profile",
+          deletedAt: "2099-01-01T00:00:00.000Z",
+        },
+      },
+    });
+
+    // Discovery is gated the same way: the scope is not listed.
+    const listed = await runtime.fetch(
+      new Request("https://ps.local/v1/data", { headers: builderHeaders }),
+    );
+    expect(await listed.json()).toMatchObject({ scopes: [], total: 0 });
+
+    // A re-add ingested on top of the known tombstone is served.
+    await runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer owner-token",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ username: "re-added" }),
+      }),
+    );
+    const served = await runtime.fetch(
+      new Request(readUrl, { headers: builderHeaders }),
+    );
+    expect(served.status).toBe(200);
+    expect(await served.json()).toMatchObject({
+      data: { username: "re-added" },
+    });
   });
 
   it("exposes grants, sync, access logs, and config routes through ps-lite", async () => {

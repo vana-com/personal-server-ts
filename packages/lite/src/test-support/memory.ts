@@ -325,6 +325,7 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
         schemaId: entry.schemaId ?? null,
         version,
         dataPointId: entry.dataPointId ?? null,
+        afterTombstoneVersion: entry.afterTombstoneVersion ?? null,
         id: nextId,
         createdAt: new Date().toISOString(),
       };
@@ -378,6 +379,24 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
         }
       }
       return deleted;
+    },
+
+    async deleteVersion(scope, collectedAt) {
+      for (const [path, entry] of entries.entries()) {
+        if (entry.scope === scope && entry.collectedAt === collectedAt) {
+          entries.delete(path);
+          envelopes.delete(envelopeKey(entry.scope, entry.collectedAt));
+          const key = blockKey(entry.scope, entry.collectedAt);
+          blockManifests.delete(key);
+          for (const payloadKey of blockPayloads.keys()) {
+            if (payloadKey.startsWith(`${key}\n`)) {
+              blockPayloads.delete(payloadKey);
+            }
+          }
+          return true;
+        }
+      }
+      return false;
     },
 
     async deleteByFileId(fileId) {

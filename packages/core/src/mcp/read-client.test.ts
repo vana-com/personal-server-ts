@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createMcpDataReadClient, McpDataReadError } from "./read-client.js";
 import { encodeDataBlockCursor } from "../storage/blocks/index.js";
 import { buildBinaryEnvelopeData } from "../contracts/binary.js";
+import { createScopeDeletionTracker } from "../sync/scope-deletions.js";
 
 const SERVER_ORIGIN = "https://personal-server.test";
 
@@ -677,5 +678,96 @@ describe("mcp/read-client", () => {
         scope: "manual.document",
       }),
     );
+  });
+});
+
+describe("mcp/read-client deletion gate", () => {
+  const SCOPE = "instagram.profile";
+
+  function deletedScopeClient() {
+    const tracker = createScopeDeletionTracker({
+      serverOwner: "0x2222222222222222222222222222222222222222",
+    });
+    // What the sync feed (or this replica's own delete) recorded.
+    tracker.markDeleted(SCOPE, {
+      deletedAt: "2099-01-01T00:00:00.000Z",
+      version: "4",
+    });
+    const authorizeBuilderRead = vi.fn();
+    const readScopeBlocks = vi.fn();
+    const readBlockManifest = vi.fn();
+    const client = createMcpDataReadClient({
+      serverOrigin: SERVER_ORIGIN,
+      granteeAccount: createAccount(),
+      dataApiDeps: {
+        storage: {
+          kind: "custom",
+          listScopes: () => ({ scopes: [], total: 0 }),
+          listVersions: vi.fn(),
+          countVersions: vi.fn(),
+          // A stale local copy from before the deletion.
+          findEntry: () =>
+            ({
+              scope: SCOPE,
+              collectedAt: "2026-06-05T00:00:00Z",
+              createdAt: "2026-06-05T00:00:00Z",
+              fileId: "file-1",
+              sizeBytes: 10,
+              version: 1,
+              dataPointId: null,
+            }) as never,
+          findByFileId: vi.fn(),
+          findUnsynced: vi.fn(),
+          readEnvelope: vi.fn(),
+          readScopeBlocks,
+          readBlockManifest,
+          hasScopeBlocks: vi.fn().mockResolvedValue(true),
+          writeEnvelope: vi.fn(),
+          insertEntry: vi.fn(),
+          updateFileId: vi.fn(),
+          deleteScope: vi.fn(),
+          deleteByFileId: vi.fn(),
+        },
+        auth: {
+          authorizeOwner: vi.fn(),
+          authorizeBuilderList: vi.fn(),
+          authorizeBuilderRead,
+        },
+        accessLogWriter: { write: vi.fn() },
+        serverOwner: "0x2222222222222222222222222222222222222222",
+        scopeDeletions: tracker,
+      },
+    });
+    return { client, authorizeBuilderRead, readScopeBlocks, readBlockManifest };
+  }
+
+  it("reports a deleted scope as absent for discovery", async () => {
+    const { client } = deletedScopeClient();
+    await expect(client.getScopeMetadata(SCOPE)).resolves.toBeNull();
+  });
+
+  it("refuses bounded reads of a deleted scope before auth or payment run", async () => {
+    const { client, authorizeBuilderRead, readScopeBlocks } =
+      deletedScopeClient();
+
+    await expect(
+      client.readScopeBlocks({ scope: SCOPE, grantId: "grant-1" }),
+    ).rejects.toMatchObject({
+      status: 410,
+      body: { error: { errorCode: "DATA_DELETED" } },
+    });
+    expect(authorizeBuilderRead).not.toHaveBeenCalled();
+    expect(readScopeBlocks).not.toHaveBeenCalled();
+  });
+
+  it("refuses the block manifest of a deleted scope", async () => {
+    const { client, authorizeBuilderRead, readBlockManifest } =
+      deletedScopeClient();
+
+    await expect(
+      client.readBlockManifest({ scope: SCOPE, grantId: "grant-1" }),
+    ).rejects.toMatchObject({ status: 410 });
+    expect(authorizeBuilderRead).not.toHaveBeenCalled();
+    expect(readBlockManifest).not.toHaveBeenCalled();
   });
 });

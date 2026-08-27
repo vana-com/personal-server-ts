@@ -13,6 +13,7 @@ import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import type { SyncCursor } from "../cursor.js";
 import type { Logger } from "../../logger/index.js";
 import type { DataStoragePort } from "../../ports/index.js";
+import { TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH } from "../tombstone.js";
 
 vi.mock("@opendatalabs/vana-sdk/browser", async (importOriginal) => ({
   ...(await importOriginal()),
@@ -554,6 +555,275 @@ describe("download worker", () => {
       expect(download).toHaveBeenCalledTimes(3);
       expect(download).toHaveBeenLastCalledWith(
         expect.stringContaining(`${SCOPE}/1`),
+      );
+    });
+  });
+
+  describe("deletion reconciliation (durable delete)", () => {
+    const DELETED_AT = "2026-02-01T00:00:00.000Z";
+
+    function syncedEntry(overrides?: Partial<IndexEntry>): IndexEntry {
+      return {
+        id: 1,
+        fileId: null,
+        schemaId: null,
+        path: RELATIVE_PATH,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        createdAt: "2026-01-21T10:00:00Z",
+        sizeBytes: 128,
+        version: 1,
+        dataPointId: DATA_POINT_ID,
+        ...overrides,
+      };
+    }
+
+    function withLocalVersions(
+      deps: DownloadWorkerDeps,
+      entries: IndexEntry[],
+    ) {
+      deps.storage.listVersions = vi.fn().mockReturnValue(entries);
+      deps.storage.deleteVersion = vi.fn(async () => true);
+      return deps;
+    }
+
+    // Resurrection reproduction. Before this change the worker ignored the
+    // gateway's deletion marker: the point was still listed, the local index
+    // no longer had it (the owner deleted the scope), so the worker
+    // downloaded and re-indexed it -- the deleted scope came back on the next
+    // cycle. Now a tombstoned row is never downloaded.
+    it("does not resurrect a scope the gateway reports as deleted (includeDeleted feed)", async () => {
+      const deps = withLocalVersions(makeMockDeps(), []);
+      (
+        deps.gateway.listDataPointsByOwner as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        dataPoints: [
+          {
+            ...makeDataPointRecord({ expectedVersion: "2" }),
+            deletedAt: DELETED_AT,
+          },
+        ],
+        cursor: null,
+      });
+
+      const results = await downloadAll(deps);
+
+      expect(results).toEqual([]);
+      expect(deps.storageAdapter.download).not.toHaveBeenCalled();
+      expect(deps.storage.writeEnvelope).not.toHaveBeenCalled();
+      expect(deps.storage.insertEntry).not.toHaveBeenCalled();
+    });
+
+    it("removes the local synced copy and stale unsynced versions, keeps a re-ingest newer than the deletion", async () => {
+      const synced = syncedEntry();
+      // Ingested without knowledge of the tombstone; its clock-ahead
+      // createdAt and higher local version do not save it.
+      const staleUnsynced = syncedEntry({
+        id: 2,
+        collectedAt: "2026-01-25T00:00:00Z",
+        createdAt: "2099-01-25T00:00:00Z",
+        version: 2,
+        dataPointId: null,
+      });
+      // Ingested on top of the tombstone (version 1): a deliberate re-add.
+      const reIngest = syncedEntry({
+        id: 3,
+        collectedAt: "2026-03-01T00:00:00Z",
+        createdAt: "2026-03-01T00:00:00Z",
+        version: 3,
+        dataPointId: null,
+        afterTombstoneVersion: 1,
+      });
+      const deps = withLocalVersions(makeMockDeps(), [
+        synced,
+        staleUnsynced,
+        reIngest,
+      ]);
+      (
+        deps.gateway.listDataPointsByOwner as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        dataPoints: [{ ...makeDataPointRecord(), deletedAt: DELETED_AT }],
+        cursor: "next",
+      });
+
+      await downloadAll(deps);
+
+      expect(deps.storage.deleteVersion).toHaveBeenCalledTimes(2);
+      expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
+        SCOPE,
+        synced.collectedAt,
+      );
+      expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
+        SCOPE,
+        staleUnsynced.collectedAt,
+      );
+      expect(deps.storage.deleteVersion).not.toHaveBeenCalledWith(
+        SCOPE,
+        reIngest.collectedAt,
+      );
+      expect(deps.cursor.write).toHaveBeenCalledWith("next");
+    });
+
+    it("queues the exact key of a dropped unsynced entry above the tombstone version for cleanup", async () => {
+      // This replica may have uploaded version 9 before registering it (or
+      // crashed in between); the deleting replica only enumerates registry
+      // versions up to the tombstone, so this key is ours to clean up.
+      const deps = withLocalVersions(makeMockDeps(), [
+        syncedEntry({ id: 1, version: 1 }),
+        syncedEntry({ id: 2, version: 9, dataPointId: null }),
+      ]);
+      const pendingBlobDeletions = {
+        list: vi.fn(async () => []),
+        add: vi.fn(async () => undefined),
+        remove: vi.fn(async () => undefined),
+      };
+      deps.pendingBlobDeletions = pendingBlobDeletions;
+      (
+        deps.gateway.listDataPointsByOwner as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        dataPoints: [
+          {
+            ...makeDataPointRecord({ expectedVersion: "2" }),
+            deletedAt: DELETED_AT,
+          },
+        ],
+        cursor: null,
+      });
+
+      await downloadAll(deps);
+
+      expect(deps.storage.deleteVersion).toHaveBeenCalledTimes(2);
+      expect(pendingBlobDeletions.add).toHaveBeenCalledWith([
+        { scope: SCOPE, version: "9" },
+      ]);
+    });
+
+    it("feeds the read-side deletion memory from every listed row and marks a complete pass", async () => {
+      const deps = withLocalVersions(makeMockDeps(), []);
+      // The live row is already indexed, so no download is attempted for it.
+      deps.storage.findByDataPointId = vi
+        .fn()
+        .mockImplementation((id: string) =>
+          id === "0xother" ? syncedEntry({ dataPointId: id }) : undefined,
+        );
+      const scopeDeletions = {
+        markDeleted: vi.fn(),
+        markLive: vi.fn(),
+        noteFeedSynced: vi.fn(),
+        knownDeletion: vi.fn(() => null),
+        feedAgeMs: vi.fn(() => null),
+        resolve: vi.fn(),
+        maxStalenessMs: 0,
+      };
+      deps.scopeDeletions = scopeDeletions;
+      const listing = deps.gateway.listDataPointsByOwner as ReturnType<
+        typeof vi.fn
+      >;
+      listing.mockResolvedValueOnce({
+        dataPoints: [
+          { ...makeDataPointRecord(), deletedAt: DELETED_AT },
+          makeDataPointRecord({ id: "0xother", scope: "other.scope" }),
+        ],
+        cursor: "more-pages",
+      });
+
+      await downloadAll(deps);
+
+      expect(scopeDeletions.markDeleted).toHaveBeenCalledWith(SCOPE, {
+        deletedAt: DELETED_AT,
+        version: "1",
+      });
+      expect(scopeDeletions.markLive).toHaveBeenCalledWith("other.scope");
+      // More pages remain: the memory is not complete yet.
+      expect(scopeDeletions.noteFeedSynced).not.toHaveBeenCalled();
+
+      listing.mockResolvedValueOnce({ dataPoints: [], cursor: null });
+      await downloadAll(deps);
+      expect(scopeDeletions.noteFeedSynced).toHaveBeenCalledTimes(1);
+      // This listing started from no cursor: it covered the whole registry.
+      expect(scopeDeletions.noteFeedSynced).toHaveBeenCalledWith(undefined, {
+        full: true,
+      });
+
+      // An incremental pass (from a stored cursor) is not a full listing.
+      (deps.cursor.read as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+        "cursor-7",
+      );
+      listing.mockResolvedValueOnce({ dataPoints: [], cursor: null });
+      await downloadAll(deps);
+      expect(scopeDeletions.noteFeedSynced).toHaveBeenLastCalledWith(
+        undefined,
+        { full: false },
+      );
+    });
+
+    it("uses the dedicated feed with includeDeleted=true when one is wired", async () => {
+      const deps = withLocalVersions(makeMockDeps(), [syncedEntry()]);
+      deps.dataPointFeed = {
+        listDataPointsByOwner: vi.fn(async () => ({
+          dataPoints: [{ ...makeDataPointRecord(), deletedAt: DELETED_AT }],
+          cursor: null,
+        })),
+        getDataPoint: vi.fn(),
+      };
+
+      await downloadAll(deps);
+
+      expect(deps.dataPointFeed.listDataPointsByOwner).toHaveBeenCalledWith(
+        OWNER,
+        null,
+        { includeDeleted: true },
+      );
+      expect(deps.gateway.listDataPointsByOwner).not.toHaveBeenCalled();
+      expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
+        SCOPE,
+        COLLECTED_AT,
+      );
+    });
+
+    it("recognises a tombstone row by its hash pair even without deletedAt", async () => {
+      const deps = withLocalVersions(makeMockDeps(), [syncedEntry()]);
+      (
+        deps.gateway.listDataPointsByOwner as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        dataPoints: [
+          makeDataPointRecord({
+            dataHash: TOMBSTONE_DATA_HASH,
+            metadataHash: TOMBSTONE_METADATA_HASH,
+            addedAt: DELETED_AT,
+            expectedVersion: "2",
+          }),
+        ],
+        cursor: null,
+      });
+
+      await downloadAll(deps);
+
+      expect(deps.storageAdapter.download).not.toHaveBeenCalled();
+      expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
+        SCOPE,
+        COLLECTED_AT,
+      );
+    });
+
+    it("holds the cursor when the local reconcile fails so the tombstone is retried", async () => {
+      const deps = withLocalVersions(makeMockDeps(), [syncedEntry()]);
+      (
+        deps.storage.deleteVersion as ReturnType<typeof vi.fn>
+      ).mockRejectedValue(new Error("disk error"));
+      (
+        deps.gateway.listDataPointsByOwner as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        dataPoints: [{ ...makeDataPointRecord(), deletedAt: DELETED_AT }],
+        cursor: "next",
+      });
+
+      await downloadAll(deps);
+
+      expect(deps.cursor.write).not.toHaveBeenCalled();
+      expect(deps.logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ scope: SCOPE, error: "disk error" }),
+        "Failed to reconcile deleted data point locally",
       );
     });
   });

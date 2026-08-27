@@ -363,13 +363,16 @@ source has not synced yet is retried on the next sync cycle.
 
 ## Delete
 
-`DELETE /v1/data/:scope` keeps its single-node behaviour (204, the scope's
-local copy, blobs and gateway record). Deleting a derivative never touches
-its sources.
+`DELETE /v1/data/:scope` keeps its single-node behaviour: a durable delete
+(gateway tombstone, then the ciphertext of every covered version, then the
+local copy) answering 200 with a per-step result. Deleting a derivative never
+touches its sources.
 
 `?cascade=lineage` is specified here and NOT implemented in this slice: the
 Personal Server answers 501 `LINEAGE_CASCADE_UNAVAILABLE` for it today. The
-cascade must tombstone every derivative at the gateway, and DPv2 deletion
+single-scope durable delete exists; what is missing is the lineage walk that
+finds every derivative. The cascade must tombstone every derivative at the
+gateway, and DPv2 deletion
 (gateway tombstone, then ciphertext, then the local copy) is separate work
 that no current runtime has; a cascade that only removed local copies would
 report derivatives deleted while their gateway records and ciphertext remain

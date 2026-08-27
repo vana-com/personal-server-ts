@@ -11,7 +11,10 @@ import type {
   GatewayClient,
 } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
-import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
+import type {
+  ScopeDeletionTracker,
+  SyncManager,
+} from "@opendatalabs/personal-server-ts-core/sync";
 import type {
   DataStoragePort,
   RuntimeAvailabilityPort,
@@ -59,6 +62,8 @@ export interface DataRouteDeps {
   accessLogWriter: AccessLogWriter;
   readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
   syncManager?: SyncManager | null;
+  /** Read-side tombstone memory; reads of a deleted scope answer 410. */
+  scopeDeletions?: ScopeDeletionTracker;
   devToken?: string;
   accessToken?: string;
   tokenStore?: TokenStore;
@@ -126,6 +131,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         accessLogWriter: deps.accessLogWriter,
         readFulfillmentReporter: deps.readFulfillmentReporter,
         syncManager: deps.syncManager ?? null,
+        scopeDeletions: deps.scopeDeletions,
         runtimeAvailability: deps.runtimeAvailability,
         serverSigner: deps.serverSigner,
         serverOwner: deps.serverOwner,

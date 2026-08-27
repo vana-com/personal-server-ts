@@ -7,6 +7,7 @@ import {
   createMcpSessionAuthPort,
 } from "./session.js";
 import { hashConnectionToken } from "./connection-api.js";
+import { createScopeDeletionTracker } from "../sync/scope-deletions.js";
 import type {
   AuthSessionVerifierPort,
   GrantVerifierPort,
@@ -402,6 +403,66 @@ describe("createMcpSessionAuthPort", () => {
     expect(signRecordDataAccess).toHaveBeenCalledWith(
       expect.objectContaining({ version: 3n }),
     );
+  });
+
+  it("refuses a deleted scope with 410 before any payment challenge or settlement", async () => {
+    const gw = fakeGateway(
+      grant({
+        paymentStatus: "pending",
+        fee: {
+          totalDue: "100",
+          asset: "0x0000000000000000000000000000000000000fee",
+        },
+      }),
+    );
+    const scopeDeletions = createScopeDeletionTracker({ serverOwner: OWNER });
+    scopeDeletions.markDeleted("instagram.profile", {
+      deletedAt: "2099-01-01T00:00:00Z",
+      version: "9",
+    });
+    const signRecordDataAccess = vi.fn().mockResolvedValue("0xsig");
+    const port = createMcpSessionAuthPort({
+      builderAddress: BUILDER,
+      grantId: "grant_1",
+      authSessionVerifier: gw,
+      grantVerifier: gw,
+      serverOwner: OWNER,
+      payment: {
+        dataApiDeps: {
+          storage: {
+            findEntry: () => ({
+              scope: "instagram.profile",
+              collectedAt: "2026-06-06T00:00:00Z",
+              createdAt: "2026-06-06T00:00:00Z",
+              fileId: "file-latest",
+              sizeBytes: 10,
+              dataPointId: "0x00000000000000000000000000000000000000dp",
+              version: 7,
+            }),
+          } as never,
+          auth: {} as never,
+          accessLogWriter: { write: vi.fn() },
+          serverSigner: { signRecordDataAccess },
+          serverOwner: OWNER,
+          serverAddress: "0x0000000000000000000000000000000000000ccc",
+          scopeDeletions,
+        },
+        gateway: gw as never,
+        gatewayConfig: {} as never,
+        gatewayUrl: "https://gateway.test",
+      },
+    });
+
+    await expect(
+      port.authorizeBuilderRead({
+        request: new Request("http://ps.local/", {
+          headers: { "X-PAYMENT": "would-be-settled" },
+        }),
+        scope: "instagram.profile",
+      }),
+    ).rejects.toMatchObject({ code: 410, errorCode: "DATA_DELETED" });
+
+    expect(signRecordDataAccess).not.toHaveBeenCalled();
   });
 });
 
