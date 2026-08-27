@@ -804,11 +804,22 @@ export async function handlePersonalServerDataRequest(
       const grantId = isOwnerReadSignal(authResult)
         ? undefined
         : authResult?.grantId;
-      const result = await deps.lineageGateway.getLineage({
-        dataPointId: computeDataPointId(deps.serverOwner, scopeResult.scope),
-        version,
-        grantId,
-      });
+      let result: Awaited<ReturnType<LineageGatewayPort["getLineage"]>>;
+      try {
+        result = await deps.lineageGateway.getLineage({
+          dataPointId: computeDataPointId(deps.serverOwner, scopeResult.scope),
+          version,
+          grantId,
+        });
+      } catch (err) {
+        // Transport failures (DNS, refused, timeout) are gateway errors to
+        // the caller, not internal ones: same 502 as a gateway error body.
+        if (err instanceof ProtocolError) throw err;
+        throw new LineageGatewayError({
+          status: 0,
+          body: { error: err instanceof Error ? err.message : String(err) },
+        });
+      }
       if (!result.ok) {
         if (result.status === 404) {
           return errorResponse(

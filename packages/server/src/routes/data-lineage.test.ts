@@ -587,6 +587,21 @@ describe("derivative data routes", () => {
       expect((await res.json()).error.errorCode).toBe("LINEAGE_GATEWAY_ERROR");
     });
 
+    it("maps a gateway transport failure to 502 LINEAGE_GATEWAY_ERROR", async () => {
+      (lineageGateway.getLineage as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new TypeError("fetch failed"),
+      );
+      const res = await app.request(`/${DERIVED_SCOPE}/lineage`, {
+        headers: {
+          Authorization: await ownerHeader("GET", `/${DERIVED_SCOPE}/lineage`),
+        },
+      });
+      expect(res.status).toBe(502);
+      const body = await res.json();
+      expect(body.error.errorCode).toBe("LINEAGE_GATEWAY_ERROR");
+      expect(body.error.details.body.error).toBe("fetch failed");
+    });
+
     it("answers 503 when the server has no lineage gateway", async () => {
       const localApp = dataRoutes({ ...deps, lineageGateway: undefined });
       const res = await localApp.request(`/${DERIVED_SCOPE}/lineage`, {
