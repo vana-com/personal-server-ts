@@ -281,7 +281,9 @@ Response:
   `/lineage/N` selects a specific version and 404s when that version does
   not exist or failed on chain.
 - `sources[].version` is the source's current version, `deletedAt` its
-  tombstone time or null.
+  tombstone time or null. A source whose registration no longer exists (its
+  only version failed on chain and was rolled back after the derivative cited
+  it) keeps its scope and is served with `version: "0"`.
 - `derivatives` lists the same owner's data points whose effective lineage
   cites this id: their current version, or for a deleted derivative the
   version its tombstone replaced (`deletedAt` set). A newer version
