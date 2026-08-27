@@ -29,6 +29,12 @@ export interface LineageView {
   derivatives: LineageNode[];
   /** Present (true) only when the gateway capped `derivatives`. */
   derivativesTruncated?: true;
+  /**
+   * The grant this view was attested for. Absent on the owner's full view;
+   * set (lowercase) on a redacted grant view. The client refuses a view
+   * whose grantId does not match the one it asked for.
+   */
+  grantId?: string;
 }
 
 export type LineageGatewayResult =
@@ -236,17 +242,31 @@ export function createGatewayLineageClient(
       // another data point, or for a version other than the signed path
       // segment, is a gateway error, never served to an authorized caller.
       const requestedId = input.dataPointId.toLowerCase();
+      // The grant view is part of the identity of the response: a builder
+      // asking under its grant must get a view attested for that grant, and
+      // a full owner view (no grantId) must never be handed to a builder.
+      const requestedGrant = input.grantId?.toLowerCase();
+      const servedGrant = data.grantId?.toLowerCase();
       const viewMismatch =
         data.dataPointId.toLowerCase() !== requestedId ||
-        (input.version !== undefined && data.version !== input.version);
+        (input.version !== undefined && data.version !== input.version) ||
+        requestedGrant !== servedGrant;
       if (viewMismatch) {
         return {
           ok: false,
           status: res.status,
           body: {
             error: "lineage response does not match the requested view",
-            requested: { dataPointId: requestedId, version: input.version },
-            received: { dataPointId: data.dataPointId, version: data.version },
+            requested: {
+              dataPointId: requestedId,
+              version: input.version,
+              grantId: requestedGrant,
+            },
+            received: {
+              dataPointId: data.dataPointId,
+              version: data.version,
+              grantId: servedGrant,
+            },
           },
         };
       }

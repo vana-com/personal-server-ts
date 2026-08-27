@@ -96,9 +96,11 @@ describe("createGatewayLineageClient", () => {
 
   it("getLineage signs the request as the server: version in the path, grant view as the grantId claim", async () => {
     const wallet = createTestWallet(5);
+    // The served view is attested for the grant that was requested.
+    const grantView = { ...view, grantId: "0xgrant" };
     const fetchMock = vi
       .fn()
-      .mockResolvedValue(jsonResponse(200, { data: view, proof }));
+      .mockResolvedValue(jsonResponse(200, { data: grantView, proof }));
     const client = createGatewayLineageClient({
       gatewayUrl: GATEWAY_URL,
       requestSigner: requestSignerFor(wallet),
@@ -109,7 +111,7 @@ describe("createGatewayLineageClient", () => {
       version: "2",
       grantId: "0xgrant",
     });
-    expect(result).toEqual({ ok: true, data: view, proof });
+    expect(result).toEqual({ ok: true, data: grantView, proof });
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe(`https://gateway.example.com/v1/data/${ID}/lineage/2`);
     const header = (init.headers as Record<string, string>).Authorization;
@@ -209,6 +211,40 @@ describe("createGatewayLineageClient", () => {
       version: "3",
     });
     expect(byVersion.ok).toBe(false);
+  });
+
+  it("getLineage refuses a view attested for another grant, or a full view when a grant was requested", async () => {
+    const grant = `0x${"11".repeat(32)}`;
+    const mk = (body: unknown) =>
+      createGatewayLineageClient({
+        gatewayUrl: GATEWAY_URL,
+        requestSigner: requestSignerFor(createTestWallet(5)),
+        fetch: vi.fn().mockResolvedValue(jsonResponse(200, body)),
+      });
+    // Full owner view (no grantId) served to a builder that asked under a grant.
+    const fullToBuilder = await mk({ data: { ...view }, proof }).getLineage({
+      dataPointId: ID,
+      grantId: grant,
+    });
+    expect(fullToBuilder.ok).toBe(false);
+    // View attested for a different grant.
+    const otherGrant = await mk({
+      data: { ...view, grantId: `0x${"22".repeat(32)}` },
+      proof,
+    }).getLineage({ dataPointId: ID, grantId: grant });
+    expect(otherGrant.ok).toBe(false);
+    // Matching grant, case-insensitive, is accepted.
+    const same = await mk({
+      data: { ...view, grantId: grant.toUpperCase().replace("0X", "0x") },
+      proof,
+    }).getLineage({ dataPointId: ID, grantId: grant });
+    expect(same.ok).toBe(true);
+    // A grant view handed to the owner (who asked for the full view) is refused too.
+    const grantToOwner = await mk({
+      data: { ...view, grantId: grant },
+      proof,
+    }).getLineage({ dataPointId: ID });
+    expect(grantToOwner.ok).toBe(false);
   });
 
   it("getLineage is unavailable without a request signer", async () => {
