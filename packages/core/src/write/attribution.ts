@@ -26,7 +26,8 @@
  * authorship from the envelope ALONE (verifyStoredWriterAttribution): recover
  * the signer over the stored proof's base64url payload (EIP-191), check the
  * signed claims against the envelope's scope and stored grantId, and hash
- * JSON.stringify(data minus $writtenBy) against the signed bodyHash.
+ * JSON.stringify(data minus the server-stamped keys `$writtenBy` and
+ * `$lineage`) against the signed bodyHash.
  *   - JSON writes: the body IS the stored record, so the builder signs the
  *     body bytes, which must be compact JSON (what JSON.stringify emits: no
  *     insignificant whitespace, keys in the order given). JSON.parse /
@@ -60,6 +61,13 @@ import {
   parseMetadataHeader,
   sha256Hex,
 } from "../contracts/binary.js";
+import {
+  LINEAGE_KEY,
+  StoredLineageMalformedError,
+  extractLineageField,
+  readStoredLineage,
+} from "../lineage/lineage.js";
+import { isBinaryEnvelope } from "../contracts/binary.js";
 
 /** Header carrying the builder's signed-payload proof on a session write. */
 export const WRITE_SIGNATURE_HEADER = "x-vana-write-signature";
@@ -317,7 +325,8 @@ export class WriterAttributionVerificationError extends Error {
       | "SIGNER_MISMATCH"
       | "SCOPE_MISMATCH"
       | "GRANT_MISMATCH"
-      | "AUDIENCE_MISMATCH",
+      | "AUDIENCE_MISMATCH"
+      | "LINEAGE_MISMATCH",
     message: string,
   ) {
     super(message);
@@ -374,7 +383,8 @@ function signedScopeOf(uri: string): string | null {
  * server state, no expiry check: the proof is evidence of who wrote the
  * record at the time, not a live credential). Checks, in order: the envelope
  * carries an attribution; the stored representation (compact JSON of the
- * data minus `$writtenBy`, for JSON and `$binary` records alike) re-hashes
+ * data minus the server-stamped `$writtenBy` and `$lineage` keys, for JSON
+ * and `$binary` records alike) re-hashes
  * to the signed bodyHash; the proof parses and recovers to the attributed
  * builder; and the signed claims bind the proof to THIS record: a POST whose
  * path names the envelope's scope, the stored grantId, and (when given) the
@@ -392,8 +402,15 @@ export async function verifyStoredWriterAttribution(
       `Record carries no ${WRITER_ATTRIBUTION_KEY} attribution`,
     );
   }
-  const { [WRITER_ATTRIBUTION_KEY]: _attribution, ...payloadData } = data;
-
+  // Every server-stamped reserved key is stripped, not just the attribution:
+  // `$lineage` is the server's validated mirror of the caller's `lineage`
+  // field (the field itself stays inside the signed bytes), so a derivative
+  // record re-hashes to the same signed bodyHash as a root record.
+  const {
+    [WRITER_ATTRIBUTION_KEY]: _attribution,
+    [LINEAGE_KEY]: storedLineage,
+    ...payloadData
+  } = data;
   const bodyHash = computeBodyHash(
     new TextEncoder().encode(JSON.stringify(payloadData)),
   );
@@ -455,6 +472,56 @@ export async function verifyStoredWriterAttribution(
     throw new WriterAttributionVerificationError(
       "AUDIENCE_MISMATCH",
       "Stored proof was not addressed to this server",
+    );
+  }
+  // The stripped mirror is not unauthenticated for that: it must restate
+  // the builder-signed `lineage` field (body top level, or the binary
+  // record's metadata object) in both directions, so a `$lineage` edited
+  // after the write, or one removed to hide a derivative's sources, is
+  // caught even though it is outside the hashed bytes. A signed list
+  // (empty included: an explicit root statement) must have its mirror; an
+  // absent signed field must have none.
+  const signedField = extractLineageField(
+    isBinaryEnvelope({ data: payloadData })
+      ? payloadData.metadata
+      : payloadData,
+  );
+  // Absent or null means "no statement". Anything else that is not a list
+  // of strings is a malformed signed field: an independently constructed
+  // record must not pass verification just because its lineage claim is
+  // unreadable, so it is a mismatch, never "absent".
+  const signedAbsent = signedField === undefined || signedField === null;
+  const signedWellFormed =
+    Array.isArray(signedField) &&
+    signedField.every((id) => typeof id === "string");
+  const signed =
+    signedAbsent || !signedWellFormed
+      ? null
+      : (signedField as string[]).map((id) => id.toLowerCase());
+  let mirror: ReturnType<typeof readStoredLineage>;
+  try {
+    mirror = storedLineage === undefined ? null : readStoredLineage(data);
+  } catch (error) {
+    if (error instanceof StoredLineageMalformedError) {
+      throw new WriterAttributionVerificationError(
+        "LINEAGE_MISMATCH",
+        `stored $lineage mirror is malformed: ${error.message}`,
+      );
+    }
+    throw error;
+  }
+  const consistent =
+    !signedAbsent && !signedWellFormed
+      ? false
+      : signed === null
+        ? storedLineage === undefined
+        : mirror !== null &&
+          signed.length === mirror.sources.length &&
+          signed.every((id, i) => id === mirror.sources[i]);
+  if (!consistent) {
+    throw new WriterAttributionVerificationError(
+      "LINEAGE_MISMATCH",
+      "Stored $lineage does not restate the builder-signed lineage field",
     );
   }
   return {

@@ -80,6 +80,10 @@
       "types": "./dist/policy/index.d.ts",
       "import": "./dist/policy/index.js"
     },
+    "./lineage": {
+      "types": "./dist/lineage/index.d.ts",
+      "import": "./dist/lineage/index.js"
+    },
     "./ports": {
       "types": "./dist/ports/index.d.ts",
       "import": "./dist/ports/index.js"

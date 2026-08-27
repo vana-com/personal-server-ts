@@ -124,3 +124,88 @@ export class ContentTooLargeError extends ProtocolError {
     super(413, "CONTENT_TOO_LARGE", "Content too large", details);
   }
 }
+
+// Derivative data / lineage (see docs/derivative-data-api.md)
+
+export class LineageInvalidError extends ProtocolError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super(400, "LINEAGE_INVALID", message, details);
+  }
+}
+
+export class LineageScopeUnderSourcePrefixError extends ProtocolError {
+  constructor(details: { scope: string; sourceScope: string }) {
+    super(
+      400,
+      "LINEAGE_SCOPE_UNDER_SOURCE_PREFIX",
+      `Derived scope "${details.scope}" shares its first segment with source scope "${details.sourceScope}"; a wildcard grant on that namespace would read both. Name derivatives under their own namespace.`,
+      details,
+    );
+  }
+}
+
+export class LineageSourceUnknownError extends ProtocolError {
+  constructor(details: { unknown: string[] }) {
+    super(
+      422,
+      "LINEAGE_SOURCE_UNKNOWN",
+      "One or more lineage sources are not data points of this owner",
+      details,
+    );
+  }
+}
+
+export class LineageSourceLookupFailedError extends ProtocolError {
+  constructor(details?: Record<string, unknown>) {
+    super(
+      502,
+      "LINEAGE_SOURCE_LOOKUP_FAILED",
+      "Could not resolve a lineage source at the gateway",
+      details,
+    );
+  }
+}
+
+export class LineageUnavailableError extends ProtocolError {
+  constructor(details?: Record<string, unknown>) {
+    super(
+      503,
+      "LINEAGE_UNAVAILABLE",
+      "This server is not configured to reach the gateway lineage graph (gateway URL or server signing key missing)",
+      details,
+    );
+  }
+}
+
+export class LineageGatewayError extends ProtocolError {
+  constructor(details: { status: number; body: unknown }) {
+    super(
+      502,
+      "LINEAGE_GATEWAY_ERROR",
+      `Gateway lineage request failed with status ${details.status}`,
+      details,
+    );
+  }
+}
+
+export class LineageCascadeUnavailableError extends ProtocolError {
+  constructor(details?: Record<string, unknown>) {
+    super(
+      501,
+      "LINEAGE_CASCADE_UNAVAILABLE",
+      "DELETE ?cascade=lineage is specified but not implemented yet: it needs the durable (tombstone) deletion of every derivative at the gateway, which this server cannot perform. Delete scopes one at a time.",
+      details,
+    );
+  }
+}
+
+export class InvalidCascadeError extends ProtocolError {
+  constructor(details: { cascade: string }) {
+    super(
+      400,
+      "INVALID_CASCADE",
+      'Unsupported cascade mode; the only supported value is "lineage"',
+      details,
+    );
+  }
+}

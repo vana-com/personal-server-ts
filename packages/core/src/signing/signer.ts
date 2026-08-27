@@ -18,6 +18,10 @@ import {
   type AddDataMessage,
   type RecordDataAccessMessage,
 } from "@opendatalabs/vana-sdk/browser";
+import {
+  LINEAGE_ATTESTATION_TYPES,
+  type LineageAttestationMessage,
+} from "../lineage/attestation.js";
 
 export interface ServerSigner {
   /** Address that signs (the server account). */
@@ -41,6 +45,15 @@ export interface ServerSigner {
    * recordId is a per-event bytes32 the contract pins to prevent replay.
    */
   signRecordDataAccess(msg: RecordDataAccessMessage): Promise<`0x${string}`>;
+  /**
+   * LineageAttestation (derivative data): binds a derivative's source list
+   * to the exact (owner, scope, version, dataHash) it is registered with,
+   * under the DataRegistry domain. The gateway requires it on POST /v1/data
+   * with `lineage`; see lineage/attestation.ts for why.
+   */
+  signLineageAttestation(
+    msg: LineageAttestationMessage,
+  ): Promise<`0x${string}`>;
 }
 
 export function createServerSigner(
@@ -82,6 +95,17 @@ export function createServerSigner(
         types: ADD_DATA_TYPES,
         primaryType: "AddData",
         message: msg as unknown as Record<string, unknown>,
+      });
+    },
+
+    async signLineageAttestation(
+      msg: LineageAttestationMessage,
+    ): Promise<`0x${string}`> {
+      return account.signTypedData({
+        domain: dataRegistryDomain(gatewayConfig),
+        types: LINEAGE_ATTESTATION_TYPES,
+        primaryType: "LineageAttestation",
+        message: { ...msg, sources: [...msg.sources] },
       });
     },
 

@@ -1,4 +1,12 @@
-import { ProtocolError } from "../errors/catalog.js";
+import {
+  GrantRequiredError,
+  InvalidCascadeError,
+  LineageCascadeUnavailableError,
+  LineageGatewayError,
+  LineageUnavailableError,
+  ProtocolError,
+  ServerNotConfiguredError,
+} from "../errors/catalog.js";
 import type { AccessLogWriter } from "../logging/access-log.js";
 import type { AccessLogReader } from "../logging/access-reader.js";
 import {
@@ -45,6 +53,13 @@ import type {
 } from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../signing/index.js";
 import type { WriterAttribution } from "../write/attribution.js";
+import {
+  extractLineageField,
+  prepareLineage,
+  type StoredLineage,
+} from "../lineage/lineage.js";
+import type { LineageGatewayPort } from "../lineage/gateway.js";
+import { computeDataPointId } from "../sync/data-point-id.js";
 import {
   binaryFilename,
   binaryMimeType,
@@ -217,6 +232,13 @@ export interface PersonalServerDataApiDeps {
   now?: () => Date;
   createLogId?: () => string;
   logger?: PersonalServerApiLogger;
+  /**
+   * Gateway access for derivative data (docs/derivative-data-api.md): source
+   * lookups for lineage validation on write and the signed lineage read
+   * behind GET /v1/data/:scope/lineage. Absent = writes with lineage can
+   * only cite local scopes and the lineage read answers 503.
+   */
+  lineageGateway?: LineageGatewayPort;
 }
 
 export interface PersonalServerAccessLogsApiDeps {
@@ -634,6 +656,95 @@ export function reportPersonalServerReadFulfillment(
   }
 }
 
+/**
+ * Validate a write's caller-supplied `lineage` (JSON body top level, or the
+ * binary metadata object) into the `$lineage` record to stamp. `undefined`
+ * (or null) means a root record. Throws ProtocolErrors; the write handler
+ * lets them propagate before anything is stored.
+ */
+async function prepareWriteLineage(
+  deps: PersonalServerDataApiDeps,
+  scope: string,
+  field: unknown,
+): Promise<StoredLineage | undefined> {
+  if (field === undefined || field === null) return undefined;
+  return prepareLineage({
+    scope,
+    field,
+    serverOwner: deps.serverOwner,
+    storage: deps.storage,
+    gateway: deps.lineageGateway,
+    now: deps.now ?? (() => new Date()),
+  });
+}
+
+/**
+ * The lineage view a read auth result entitles the caller to. The auth port
+ * answers an owner read with no result or with the "owner" / "policy-bypass"
+ * sentinels (see api-auth): those get the full view. A builder read carries
+ * the grant the read policy resolved, and that grant names the view. A
+ * builder result with no resolved grant (or an "unknown" one) proves
+ * nothing and is refused: a missing grantId must never widen to the full
+ * view.
+ */
+function resolveLineageGrantView(
+  authResult: PersonalServerReadAuthResult | void,
+): { grantId: string | undefined } {
+  if (
+    authResult === undefined ||
+    authResult.grantId === "owner" ||
+    authResult.grantId === "policy-bypass"
+  ) {
+    return { grantId: undefined };
+  }
+  const grantId = authResult.grantId;
+  if (typeof grantId !== "string" || grantId === "" || grantId === "unknown") {
+    throw new GrantRequiredError({
+      reason: "a lineage read by a builder needs a resolved grant",
+    });
+  }
+  return { grantId };
+}
+
+/**
+ * Delete one scope the way DELETE /v1/data/:scope always has: propagate to
+ * the authoritative stores first, best-effort (on DPv2 the remote step is a
+ * logged no-op until the tombstone-based delete lands), then drop the local
+ * copy.
+ */
+async function deleteOneScope(
+  deps: PersonalServerDataApiDeps,
+  scope: string,
+): Promise<number> {
+  if (deps.syncManager?.deleteScopeRemote) {
+    try {
+      await deps.syncManager.deleteScopeRemote(scope);
+    } catch (err) {
+      deps.logger?.info?.(
+        { scope, error: (err as Error).message },
+        "Remote scope deletion failed; proceeding with local delete",
+      );
+    }
+  }
+  const result = await deleteDataScopeContract({
+    storage: deps.storage,
+    scopeParam: scope,
+  });
+  if (!result.ok) {
+    // The scope was validated by the caller; a contract error here is a bug.
+    throw new ProtocolError(
+      result.status,
+      result.body.error,
+      result.body.message,
+    );
+  }
+  deps.logger?.info?.(
+    { scope, deletedCount: result.deletedCount },
+    "Scope deleted",
+  );
+  return result.deletedCount;
+}
+
 export async function handlePersonalServerDataRequest(
   request: Request,
   deps: PersonalServerDataApiDeps,
@@ -667,6 +778,94 @@ export async function handlePersonalServerDataRequest(
       });
       if (!result.ok) return contractErrorResponse(result);
       return jsonResponse(result.response);
+    }
+
+    if ((parts.length === 2 || parts.length === 3) && parts[1] === "lineage") {
+      if (request.method !== "GET") return methodNotAllowed();
+      const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
+      if (!scopeResult.ok) return contractErrorResponse(scopeResult);
+      // The version is a PATH segment (/v1/data/:scope/lineage/:version), so
+      // it is inside the signed request uri: a builder's signature for one
+      // version cannot be replayed to read another. The grant view is the
+      // signed grantId claim the read auth already honours. Query
+      // parameters would be unsigned inputs to the view and are refused.
+      if (url.searchParams.has("version")) {
+        return errorResponse(
+          400,
+          "INVALID_VERSION",
+          "version is a path segment (/v1/data/:scope/lineage/:version), not a query parameter",
+        );
+      }
+      if (url.search.length > 0) {
+        return errorResponse(
+          400,
+          "INVALID_QUERY",
+          "lineage reads take no query parameters; the version is a path segment and the grant view is the signed grantId claim",
+        );
+      }
+      const version = parts.length === 3 ? decodePathPart(parts[2]) : undefined;
+      if (version !== undefined && !/^[1-9]\d*$/.test(version)) {
+        return errorResponse(
+          400,
+          "INVALID_VERSION",
+          "version must be a positive decimal integer",
+        );
+      }
+      // Same gate as a read of the scope: the owner, or a builder whose grant
+      // covers it. The gateway then attests the view that grant sees, so a
+      // builder only learns the scopes of nodes its grant covers.
+      const authResult = await deps.auth.authorizeBuilderRead({
+        request,
+        scope: scopeResult.scope,
+        grantId: selectedGrantId(request, url),
+      });
+      if (!deps.serverOwner) {
+        throw new ServerNotConfiguredError({
+          reason: "serverOwner is required to resolve the data point id",
+        });
+      }
+      if (!deps.lineageGateway) throw new LineageUnavailableError();
+      const { grantId } = resolveLineageGrantView(authResult);
+      let result: Awaited<ReturnType<LineageGatewayPort["getLineage"]>>;
+      try {
+        result = await deps.lineageGateway.getLineage({
+          dataPointId: computeDataPointId(deps.serverOwner, scopeResult.scope),
+          version,
+          grantId,
+        });
+      } catch (err) {
+        // Transport failures (DNS, refused, timeout) are gateway errors to
+        // the caller, not internal ones: same 502 as a gateway error body.
+        if (err instanceof ProtocolError) throw err;
+        throw new LineageGatewayError({
+          status: 0,
+          body: { error: err instanceof Error ? err.message : String(err) },
+        });
+      }
+      if (!result.ok) {
+        if (result.status === 404) {
+          return errorResponse(
+            404,
+            "NOT_FOUND",
+            version
+              ? `Scope "${scopeResult.scope}" has no registered version ${version}`
+              : `Scope "${scopeResult.scope}" is not registered at the gateway`,
+          );
+        }
+        if (result.status === 403) {
+          throw new ProtocolError(
+            403,
+            "LINEAGE_FORBIDDEN",
+            "The gateway refused the lineage view for this grant",
+            { gateway: result.body },
+          );
+        }
+        throw new LineageGatewayError({
+          status: result.status,
+          body: result.body,
+        });
+      }
+      return jsonResponse({ data: result.data, proof: result.proof });
     }
 
     if (parts.length !== 1) return notFound();
@@ -949,18 +1148,27 @@ export async function handlePersonalServerDataRequest(
         // below still resolves a schema for validation/metadata.)
         if (!isJsonContentType(request)) {
           const bytes = new Uint8Array(await request.arrayBuffer());
+          const metadata = parseMetadataHeader(
+            request.headers.get("x-vana-metadata"),
+          );
+          // A binary derivative names its sources inside the metadata
+          // object; the validated mirror lands at the top of the record.
+          const lineage = await prepareWriteLineage(
+            deps,
+            scopeResult.scope,
+            extractLineageField(metadata),
+          );
           const result = await ingestBinaryDataContract({
             storage: deps.storage,
             scopeParam: scopeResult.scope,
             bytes,
             mimeType: binaryMimeType(request),
             filename: binaryFilename(request),
-            metadata: parseMetadataHeader(
-              request.headers.get("x-vana-metadata"),
-            ),
+            metadata,
             collectedAt: collectedAtValue,
             status,
             attribution: writeAuth?.attribution,
+            lineage,
           });
           if (!result.ok) return failWrite(contractErrorResponse(result));
           committed = true;
@@ -985,6 +1193,13 @@ export async function handlePersonalServerDataRequest(
           "Request body must be valid JSON",
         );
         if (!parsed.ok) return failWrite(contractResponse(parsed.result));
+        // Derivative writes: validate the caller's `lineage` before anything
+        // is stored (a failure here throws, releasing the builder's proof).
+        const lineage = await prepareWriteLineage(
+          deps,
+          scopeResult.scope,
+          extractLineageField(parsed.body),
+        );
         // DPv2 is scope-addressed and the gateway records no schemas, so JSON
         // ingest is schemaless too — no lookup, no schemaId/$schema stamped.
         const result = await ingestDataContract({
@@ -994,6 +1209,7 @@ export async function handlePersonalServerDataRequest(
           collectedAt: collectedAtValue,
           status,
           attribution: writeAuth?.attribution,
+          lineage,
         });
         if (!result.ok) return failWrite(contractErrorResponse(result));
         committed = true;
@@ -1034,31 +1250,31 @@ export async function handlePersonalServerDataRequest(
 
     if (request.method === "DELETE") {
       await deps.auth.authorizeOwner(request);
-      // Propagate the deletion to the authoritative stores (R2 blobs + gateway records) BEFORE the
-      // local delete — it reads the local index to find what to remove. Best-effort: a remote
-      // failure must not block the owner's local delete (and sync would otherwise resurrect it; the
-      // download-worker reconciliation is the backstop). Parse the scope first so an invalid scope
-      // still 400s without a wasted remote call.
-      const parsed = parseDataScopeContract(scopeParam);
-      if (parsed.ok && deps.syncManager?.deleteScopeRemote) {
-        try {
-          await deps.syncManager.deleteScopeRemote(parsed.scope);
-        } catch (err) {
-          deps.logger?.info?.(
-            { scope: scopeParam, error: (err as Error).message },
-            "Remote scope deletion failed; proceeding with local delete",
-          );
-        }
+      const cascade = url.searchParams.get("cascade");
+      if (cascade !== null && cascade !== "lineage") {
+        throw new InvalidCascadeError({ cascade });
       }
-      const result = await deleteDataScopeContract({
-        storage: deps.storage,
-        scopeParam,
-      });
-      if (!result.ok) return contractErrorResponse(result);
-      deps.logger?.info?.(
-        { scope: scopeParam, deletedCount: result.deletedCount },
-        "Scope deleted",
-      );
+      // Parse the scope first so an invalid scope still 400s without a
+      // wasted remote call.
+      const parsed = parseDataScopeContract(scopeParam);
+      if (!parsed.ok) return contractErrorResponse(parsed);
+      if (cascade === "lineage") {
+        // Specified (docs/derivative-data-api.md, "Delete") but not
+        // implemented here: the cascade must tombstone every derivative at
+        // the gateway, and DPv2 deletion is separate work (the tombstone
+        // based delete branch). Until that lands the only honest answer is
+        // 501; a local-only cascade would report derivatives deleted while
+        // their gateway records and ciphertext remain and sync could bring
+        // them back.
+        throw new LineageCascadeUnavailableError({ scope: parsed.scope });
+      }
+      // Single node (the default): propagate the deletion to the
+      // authoritative stores (R2 blobs + gateway records) BEFORE the local
+      // delete, which reads the local index to find what to remove.
+      // Best-effort: a remote failure must not block the owner's local delete
+      // (sync would otherwise resurrect it; the download-worker
+      // reconciliation is the backstop).
+      await deleteOneScope(deps, parsed.scope);
       return new Response(null, { status: 204 });
     }
 

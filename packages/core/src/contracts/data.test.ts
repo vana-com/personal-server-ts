@@ -420,3 +420,111 @@ describe("data contract helpers", () => {
     });
   });
 });
+
+describe("lineage on ingest", () => {
+  const SOURCE_ID = `0x${"ab".repeat(32)}` as const;
+  const lineage = {
+    sources: [SOURCE_ID],
+    writtenAt: "2026-08-31T09:12:44.000Z",
+  };
+
+  it("stamps $lineage into a JSON record and echoes the sources", async () => {
+    const storage = createMemoryStorage();
+    const result = await ingestDataContract({
+      storage,
+      scopeParam: "spine.health.summary",
+      body: { summary: "x", lineage: [SOURCE_ID] },
+      collectedAt: "2026-08-31T09:12:44Z",
+      status: "stored",
+      lineage,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.response.lineage).toEqual({ sources: [SOURCE_ID] });
+    const read = await readDataContract({
+      storage,
+      scopeParam: "spine.health.summary",
+    });
+    expect(read.ok && read.envelope.data).toEqual({
+      summary: "x",
+      lineage: [SOURCE_ID],
+      $lineage: lineage,
+    });
+  });
+
+  it("stamps $lineage at the top of a binary record, next to $binary", async () => {
+    const storage = createMemoryStorage();
+    const result = await ingestBinaryDataContract({
+      storage,
+      scopeParam: "spine.health.report",
+      bytes: new TextEncoder().encode("%PDF"),
+      mimeType: "application/pdf",
+      metadata: { lineage: [SOURCE_ID] },
+      collectedAt: "2026-08-31T09:12:44Z",
+      status: "stored",
+      lineage,
+    });
+    expect(result.ok).toBe(true);
+    const read = await readDataContract({
+      storage,
+      scopeParam: "spine.health.report",
+    });
+    expect(read.ok && read.envelope.data.$lineage).toEqual(lineage);
+    expect(read.ok && read.envelope.data.metadata).toEqual({
+      lineage: [SOURCE_ID],
+    });
+  });
+
+  it("rejects a body that carries the reserved $lineage key", async () => {
+    const result = await ingestDataContract({
+      storage: createMemoryStorage(),
+      scopeParam: "spine.health.summary",
+      body: { summary: "x", $lineage: lineage },
+      collectedAt: "2026-08-31T09:12:44Z",
+      status: "stored",
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      status: 400,
+      body: { error: "INVALID_BODY" },
+    });
+  });
+
+  it("rejects binary metadata carrying a reserved server key", async () => {
+    for (const metadata of [
+      { $lineage: lineage },
+      { $writtenBy: { builder: "0x1" } },
+    ]) {
+      const result = await ingestBinaryDataContract({
+        storage: createMemoryStorage(),
+        scopeParam: "spine.health.report",
+        bytes: new TextEncoder().encode("%PDF"),
+        mimeType: "application/pdf",
+        metadata,
+        collectedAt: "2026-08-31T09:12:44Z",
+        status: "stored",
+      });
+      expect(result).toMatchObject({
+        ok: false,
+        status: 400,
+        body: { error: "INVALID_BODY" },
+      });
+    }
+  });
+
+  it("leaves a root record byte-identical (no lineage key)", async () => {
+    const storage = createMemoryStorage();
+    await ingestDataContract({
+      storage,
+      scopeParam: "notes.entries",
+      body: { note: "x" },
+      collectedAt: "2026-08-31T09:12:44Z",
+      status: "stored",
+    });
+    const read = await readDataContract({
+      storage,
+      scopeParam: "notes.entries",
+    });
+    expect(read.ok && read.envelope.data).toEqual({ note: "x" });
+  });
+});

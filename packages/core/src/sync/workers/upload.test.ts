@@ -100,6 +100,9 @@ function makeMockDeps(): UploadWorkerDeps {
     signAddData: vi
       .fn()
       .mockResolvedValue("0xadddatasignature" as `0x${string}`),
+    signLineageAttestation: vi
+      .fn()
+      .mockResolvedValue("0xlineagesignature" as `0x${string}`),
   };
 
   const mockLogger: Partial<Logger> = {
@@ -735,5 +738,118 @@ describe("upload worker", () => {
         2,
       );
     });
+  });
+});
+
+describe("uploadOne — derivative registration (lineage)", () => {
+  const SOURCE_ID =
+    "0xabababababababababababababababababababababababababababababababab";
+
+  function derivativeEnvelope(): DataFileEnvelope {
+    return {
+      version: "1.0",
+      scope: SCOPE,
+      collectedAt: COLLECTED_AT,
+      data: {
+        summary: "x",
+        lineage: [SOURCE_ID],
+        $lineage: { sources: [SOURCE_ID], writtenAt: COLLECTED_AT },
+      },
+    };
+  }
+
+  it("registers an envelope carrying $lineage through the lineage gateway with its sources", async () => {
+    const deps = makeMockDeps();
+    (deps.storage.readEnvelope as ReturnType<typeof vi.fn>).mockResolvedValue(
+      derivativeEnvelope(),
+    );
+    const registerDataPoint = vi
+      .fn()
+      .mockResolvedValue({ dataPointId: DATA_POINT_ID, expectedVersion: "1" });
+    deps.lineageGateway = { registerDataPoint };
+
+    const result = await uploadOne(deps, makeEntry());
+
+    expect(result.dataPointId).toBe(DATA_POINT_ID);
+    expect(registerDataPoint).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ownerAddress: OWNER,
+        scope: SCOPE,
+        expectedVersion: "1",
+        signature: "0xadddatasignature",
+        lineage: [SOURCE_ID],
+        lineageSignature: "0xlineagesignature",
+      }),
+    );
+    // The attestation binds the lineage to this exact registration.
+    expect(deps.signer.signLineageAttestation).toHaveBeenCalledWith({
+      ownerAddress: OWNER,
+      scope: SCOPE,
+      expectedVersion: 1n,
+      dataHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+      sources: [SOURCE_ID],
+    });
+    expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
+  });
+
+  it("fails closed on a malformed stored $lineage instead of registering the record as a root", async () => {
+    const deps = makeMockDeps();
+    const env = derivativeEnvelope() as { data: Record<string, unknown> };
+    (deps.storage.readEnvelope as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...env,
+      data: { ...env.data, $lineage: "invalid" },
+    });
+    await expect(uploadOne(deps, makeEntry())).rejects.toThrow(
+      /Stored \$lineage is malformed/,
+    );
+    expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
+    expect(deps.storage.updateDataPointId).not.toHaveBeenCalled();
+  });
+
+  it("fails (and leaves the entry unsynced) instead of registering a derivative as a root when no lineage gateway is wired", async () => {
+    const deps = makeMockDeps();
+    (deps.storage.readEnvelope as ReturnType<typeof vi.fn>).mockResolvedValue(
+      derivativeEnvelope(),
+    );
+    await expect(uploadOne(deps, makeEntry())).rejects.toThrow(
+      /lineage registration needs a gateway URL/,
+    );
+    expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
+    expect(deps.storage.updateDataPointId).not.toHaveBeenCalled();
+  });
+
+  it("registers an explicit empty $lineage as an attested root statement", async () => {
+    const deps = makeMockDeps();
+    (deps.storage.readEnvelope as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...derivativeEnvelope(),
+      data: {
+        note: "x",
+        lineage: [],
+        $lineage: { sources: [], writtenAt: COLLECTED_AT },
+      },
+    });
+    const registerDataPoint = vi
+      .fn()
+      .mockResolvedValue({ dataPointId: DATA_POINT_ID, expectedVersion: "1" });
+    deps.lineageGateway = { registerDataPoint };
+    await uploadOne(deps, makeEntry());
+    expect(registerDataPoint).toHaveBeenCalledWith(
+      expect.objectContaining({
+        lineage: [],
+        lineageSignature: "0xlineagesignature",
+      }),
+    );
+    expect(deps.signer.signLineageAttestation).toHaveBeenCalledWith(
+      expect.objectContaining({ sources: [] }),
+    );
+    expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
+  });
+
+  it("keeps using the SDK client for root records", async () => {
+    const deps = makeMockDeps();
+    deps.lineageGateway = { registerDataPoint: vi.fn() };
+    await uploadOne(deps, makeEntry());
+    expect(deps.gateway.registerDataPoint).toHaveBeenCalled();
+    expect(deps.lineageGateway.registerDataPoint).not.toHaveBeenCalled();
   });
 });

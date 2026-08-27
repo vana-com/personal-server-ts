@@ -15,6 +15,7 @@ import {
   GRANT_REVOCATION_TYPES,
   ADD_DATA_TYPES,
 } from "@opendatalabs/vana-sdk/browser";
+import { LINEAGE_ATTESTATION_TYPES } from "../lineage/attestation.js";
 
 const TEST_GATEWAY_CONFIG: GatewayConfig = {
   chainId: 14800,
@@ -119,6 +120,43 @@ describe("ServerSigner", () => {
         signature,
       });
       expect(recovered.toLowerCase()).toBe(account.address.toLowerCase());
+    });
+  });
+
+  describe("signLineageAttestation", () => {
+    it("produces a signature recoverable to the server address under the DataRegistry domain", async () => {
+      const { account, signer } = setup();
+      const msg = {
+        ownerAddress:
+          "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as `0x${string}`,
+        scope: "spine.health.summary",
+        expectedVersion: 2n,
+        dataHash: ("0x" + "11".repeat(32)) as `0x${string}`,
+        sources: [
+          ("0x" + "ab".repeat(32)) as `0x${string}`,
+          ("0x" + "cd".repeat(32)) as `0x${string}`,
+        ],
+      };
+
+      const signature = await signer.signLineageAttestation(msg);
+      const recovered = await recoverTypedDataAddress({
+        domain: dataRegistryDomain(TEST_GATEWAY_CONFIG),
+        types: LINEAGE_ATTESTATION_TYPES,
+        primaryType: "LineageAttestation",
+        message: { ...msg, sources: [...msg.sources] },
+        signature,
+      });
+      expect(recovered.toLowerCase()).toBe(account.address.toLowerCase());
+
+      // A different source list does not recover to the signer.
+      const tampered = await recoverTypedDataAddress({
+        domain: dataRegistryDomain(TEST_GATEWAY_CONFIG),
+        types: LINEAGE_ATTESTATION_TYPES,
+        primaryType: "LineageAttestation",
+        message: { ...msg, sources: [msg.sources[0]] },
+        signature,
+      });
+      expect(tampered.toLowerCase()).not.toBe(account.address.toLowerCase());
     });
   });
 
