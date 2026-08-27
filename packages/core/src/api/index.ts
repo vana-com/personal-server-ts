@@ -1,4 +1,5 @@
 import {
+  GrantRequiredError,
   InvalidCascadeError,
   LineageCascadeUnavailableError,
   LineageGatewayError,
@@ -677,16 +678,32 @@ async function prepareWriteLineage(
   });
 }
 
-/** Owner-exempt read signals from the auth port (see api-auth). */
-function isOwnerReadSignal(
+/**
+ * The lineage view a read auth result entitles the caller to. The auth port
+ * answers an owner read with no result or with the "owner" / "policy-bypass"
+ * sentinels (see api-auth): those get the full view. A builder read carries
+ * the grant the read policy resolved, and that grant names the view. A
+ * builder result with no resolved grant (or an "unknown" one) proves
+ * nothing and is refused: a missing grantId must never widen to the full
+ * view.
+ */
+function resolveLineageGrantView(
   authResult: PersonalServerReadAuthResult | void,
-): boolean {
-  return (
+): { grantId: string | undefined } {
+  if (
     authResult === undefined ||
-    authResult.grantId === undefined ||
     authResult.grantId === "owner" ||
     authResult.grantId === "policy-bypass"
-  );
+  ) {
+    return { grantId: undefined };
+  }
+  const grantId = authResult.grantId;
+  if (typeof grantId !== "string" || grantId === "" || grantId === "unknown") {
+    throw new GrantRequiredError({
+      reason: "a lineage read by a builder needs a resolved grant",
+    });
+  }
+  return { grantId };
 }
 
 /**
@@ -808,9 +825,7 @@ export async function handlePersonalServerDataRequest(
         });
       }
       if (!deps.lineageGateway) throw new LineageUnavailableError();
-      const grantId = isOwnerReadSignal(authResult)
-        ? undefined
-        : authResult?.grantId;
+      const { grantId } = resolveLineageGrantView(authResult);
       let result: Awaited<ReturnType<LineageGatewayPort["getLineage"]>>;
       try {
         result = await deps.lineageGateway.getLineage({
