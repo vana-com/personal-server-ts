@@ -70,7 +70,6 @@ import {
   type StoredLineage,
 } from "../lineage/lineage.js";
 import type { LineageGatewayPort } from "../lineage/gateway.js";
-import { computeDataPointId } from "../sync/data-point-id.js";
 import {
   binaryFilename,
   binaryMimeType,
@@ -1384,12 +1383,11 @@ export async function handlePersonalServerDataRequest(
       if (!parsed.ok) return contractErrorResponse(parsed);
       if (cascade === "lineage") {
         // Specified (docs/derivative-data-api.md, "Delete") but not
-        // implemented here: the cascade must tombstone every derivative at
-        // the gateway, and DPv2 deletion is separate work (the tombstone
-        // based delete branch). Until that lands the only honest answer is
-        // 501; a local-only cascade would report derivatives deleted while
-        // their gateway records and ciphertext remain and sync could bring
-        // them back.
+        // implemented here. The durable per-scope delete below is what a
+        // cascade node needs; the missing part is the lineage walk itself
+        // (owner view of the gateway graph, deepest derivatives first,
+        // truncation and cross-owner handling, all-or-nothing before the
+        // first tombstone). Until that lands the only honest answer is 501.
         throw new LineageCascadeUnavailableError({ scope: parsed.scope });
       }
 

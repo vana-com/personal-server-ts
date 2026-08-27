@@ -193,7 +193,7 @@ export class LineageCascadeUnavailableError extends ProtocolError {
     super(
       501,
       "LINEAGE_CASCADE_UNAVAILABLE",
-      "DELETE ?cascade=lineage is specified but not implemented yet: it needs the durable (tombstone) deletion of every derivative at the gateway, which this server cannot perform. Delete scopes one at a time.",
+      "DELETE ?cascade=lineage is specified but not implemented yet: the lineage walk that finds every derivative is missing. Delete scopes one at a time; each single-scope delete is durable.",
       details,
     );
   }
