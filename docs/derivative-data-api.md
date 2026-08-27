@@ -292,6 +292,10 @@ Response:
   always the current reverse lineage, whichever version of the root is
   shown: `/lineage/N` answers what version N came from and what is built on
   the data point now, not who cited it at that time.
+  At most 1000 derivatives are listed (lowest ids first); when more exist
+  the view carries `derivativesTruncated: true`, bound into the response hash
+  (appended as a `bool` only when set). Pagination is not part of this
+  slice.
 - `proof` is the standard gateway attestation (`GatewayAttestation` EIP-712,
   `userSignature` = the data point's AddData signature) over:
   - `requestHash = keccak256(abi.encode(string "GET /v1/data/:dataPointId/lineage", bytes32 dataPointId, uint256 version, bytes32 grantId))`
@@ -447,7 +451,8 @@ statement).
 
 `lineage` absent (or `null`) is "no lineage statement": a fresh version is a
 root, and a same-version refresh of a still-pending version keeps whatever
-lineage the slot holds. An array, the empty array included, is a statement
+lineage the slot holds while its payload hashes are unchanged (a re-sign or
+a replay); a refresh that commits to different hashes clears it. An array, the empty array included, is a statement
 and needs `lineageSignature`: a refresh that carries one replaces the slot's
 lineage together with the payload (`[]` clears it: an attested root). The
 201 echoes `lineage` as sent (lowercased) or `null` when no statement was

@@ -27,6 +27,8 @@ export interface LineageView {
   deletedAt: string | null;
   sources: LineageNode[];
   derivatives: LineageNode[];
+  /** Present (true) only when the gateway capped `derivatives`. */
+  derivativesTruncated?: true;
 }
 
 export type LineageGatewayResult =
@@ -133,7 +135,11 @@ function parseLineageView(value: unknown): LineageView | null {
     !Array.isArray(value.sources) ||
     !value.sources.every(isLineageNode) ||
     !Array.isArray(value.derivatives) ||
-    !value.derivatives.every(isLineageNode)
+    !value.derivatives.every(isLineageNode) ||
+    !(
+      value.derivativesTruncated === undefined ||
+      value.derivativesTruncated === true
+    )
   ) {
     return null;
   }
