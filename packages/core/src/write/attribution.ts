@@ -485,16 +485,27 @@ export async function verifyStoredWriterAttribution(
       ? payloadData.metadata
       : payloadData,
   );
-  const signed = Array.isArray(signedField)
-    ? signedField.map((id) => (typeof id === "string" ? id.toLowerCase() : id))
-    : null;
+  // Absent or null means "no statement". Anything else that is not a list
+  // of strings is a malformed signed field: an independently constructed
+  // record must not pass verification just because its lineage claim is
+  // unreadable, so it is a mismatch, never "absent".
+  const signedAbsent = signedField === undefined || signedField === null;
+  const signedWellFormed =
+    Array.isArray(signedField) &&
+    signedField.every((id) => typeof id === "string");
+  const signed =
+    signedAbsent || !signedWellFormed
+      ? null
+      : (signedField as string[]).map((id) => id.toLowerCase());
   const mirror = storedLineage === undefined ? null : readStoredLineage(data);
   const consistent =
-    signed === null
-      ? storedLineage === undefined
-      : mirror !== null &&
-        signed.length === mirror.sources.length &&
-        signed.every((id, i) => id === mirror.sources[i]);
+    !signedAbsent && !signedWellFormed
+      ? false
+      : signed === null
+        ? storedLineage === undefined
+        : mirror !== null &&
+          signed.length === mirror.sources.length &&
+          signed.every((id, i) => id === mirror.sources[i]);
   if (!consistent) {
     throw new WriterAttributionVerificationError(
       "LINEAGE_MISMATCH",

@@ -620,6 +620,79 @@ describe("verifyStoredWriterAttribution with lineage", () => {
     ).rejects.toMatchObject({ reason: "LINEAGE_MISMATCH" });
   });
 
+  it("rejects a signed lineage field that is not a list, even with no mirror (JSON)", async () => {
+    for (const bad of ["invalid", 7, { a: 1 }, ["0xok", 5]]) {
+      const body = { note: "root", lineage: bad };
+      const request = await buildWriteRequest({ body: JSON.stringify(body) });
+      const attribution = await verifyWriterAttribution({
+        request,
+        builderAddress: builderWallet.address,
+        grantId: GRANT_ID,
+        serverOrigin: SERVER_ORIGIN,
+      });
+      const data = JSON.parse(
+        JSON.stringify(stampWriterAttribution(body, attribution)),
+      ) as Record<string, unknown>;
+      await expect(
+        verifyStoredWriterAttribution({ scope: SCOPE, data }),
+      ).rejects.toMatchObject({ reason: "LINEAGE_MISMATCH" });
+    }
+  });
+
+  it("treats a signed lineage of null as no statement (JSON)", async () => {
+    const body = { note: "root", lineage: null };
+    const request = await buildWriteRequest({ body: JSON.stringify(body) });
+    const attribution = await verifyWriterAttribution({
+      request,
+      builderAddress: builderWallet.address,
+      grantId: GRANT_ID,
+      serverOrigin: SERVER_ORIGIN,
+    });
+    const data = JSON.parse(
+      JSON.stringify(stampWriterAttribution(body, attribution)),
+    ) as Record<string, unknown>;
+    const verified = await verifyStoredWriterAttribution({
+      scope: SCOPE,
+      data,
+    });
+    expect(verified.builder.toLowerCase()).toBe(
+      builderWallet.address.toLowerCase(),
+    );
+  });
+
+  it("rejects a signed lineage field that is not a list, even with no mirror (binary)", async () => {
+    const bytes = new TextEncoder().encode("%PDF-1.7 fake");
+    const request = await buildWriteRequest({
+      body: bytes,
+      contentType: "application/pdf",
+      filename: "scan.pdf",
+      metadataHeader: '{"kind":"dexa","lineage":"invalid"}',
+    });
+    const attribution = await verifyWriterAttribution({
+      request,
+      builderAddress: builderWallet.address,
+      grantId: GRANT_ID,
+      serverOrigin: SERVER_ORIGIN,
+    });
+    const data = JSON.parse(
+      JSON.stringify(
+        stampWriterAttribution(
+          buildBinaryEnvelopeData({
+            bytes,
+            mimeType: "application/pdf",
+            filename: "scan.pdf",
+            contentHash: await sha256Hex(bytes),
+            metadata: { kind: "dexa", lineage: "invalid" },
+          }),
+          attribution,
+        ),
+      ),
+    ) as Record<string, unknown>;
+    await expect(
+      verifyStoredWriterAttribution({ scope: SCOPE, data }),
+    ).rejects.toMatchObject({ reason: "LINEAGE_MISMATCH" });
+  });
+
   it("rejects a $lineage mirror planted on a root record", async () => {
     const body = { note: "root" };
     const request = await buildWriteRequest({ body: JSON.stringify(body) });
