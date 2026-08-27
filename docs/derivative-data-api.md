@@ -288,7 +288,10 @@ Response:
   cites this id: their current version, or for a deleted derivative the
   version its tombstone replaced (`deletedAt` set). A newer version
   registered without lineage, or with a lineage that dropped this source,
-  ends the relationship; `version` is the citing version.
+  ends the relationship; `version` is the citing version. `derivatives` is
+  always the current reverse lineage, whichever version of the root is
+  shown: `/lineage/N` answers what version N came from and what is built on
+  the data point now, not who cited it at that time.
 - `proof` is the standard gateway attestation (`GatewayAttestation` EIP-712,
   `userSignature` = the data point's AddData signature) over:
   - `requestHash = keccak256(abi.encode(string "GET /v1/data/:dataPointId/lineage", bytes32 dataPointId, uint256 version, bytes32 grantId))`
