@@ -477,8 +477,9 @@ export async function verifyStoredWriterAttribution(
   // the builder-signed `lineage` field (body top level, or the binary
   // record's metadata object) in both directions, so a `$lineage` edited
   // after the write, or one removed to hide a derivative's sources, is
-  // caught even though it is outside the hashed bytes. An empty or absent
-  // signed field is a root record and has no mirror.
+  // caught even though it is outside the hashed bytes. A signed list
+  // (empty included: an explicit root statement) must have its mirror; an
+  // absent signed field must have none.
   const signedField = extractLineageField(
     isBinaryEnvelope({ data: payloadData })
       ? payloadData.metadata
@@ -486,10 +487,10 @@ export async function verifyStoredWriterAttribution(
   );
   const signed = Array.isArray(signedField)
     ? signedField.map((id) => (typeof id === "string" ? id.toLowerCase() : id))
-    : [];
+    : null;
   const mirror = storedLineage === undefined ? null : readStoredLineage(data);
   const consistent =
-    signed.length === 0
+    signed === null
       ? storedLineage === undefined
       : mirror !== null &&
         signed.length === mirror.sources.length &&

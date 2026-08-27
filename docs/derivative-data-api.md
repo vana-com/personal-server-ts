@@ -105,8 +105,11 @@ Validation, in order:
 
 1. `lineage` must be an array of distinct 0x-prefixed 32-byte hex strings, at
    most 256 entries, none of them the record's own id. Otherwise 400
-   `LINEAGE_INVALID`. An empty, `null` or absent `lineage` is a root record:
-   nothing is stamped and nothing is registered for it.
+   `LINEAGE_INVALID`. A `null` or absent `lineage` makes no lineage
+   statement (a root record, nothing stamped). An empty array is an explicit
+   root statement: `$lineage` is stamped with `sources: []` and the record is
+   registered at the gateway as an attested root, which matters for a
+   same-version refresh (see "Gateway write").
 2. Every source id must resolve to a data point of this owner: the Personal
    Server first checks its local index (`keccak256(owner, scope)` over its own
    scopes, so a source that has not synced yet is still valid), then asks the
@@ -311,17 +314,19 @@ Response:
 ### Personal Server
 
 ```http
-GET /v1/data/:scope/lineage[?version=N]
+GET /v1/data/:scope/lineage[/:version]
 ```
 
 Same authentication as `GET /v1/data/:scope`: the owner, or a builder with
 `Authorization: Web3Signed ...` whose grant (from the payload's `grantId`
-claim, `?grantId=` or `X-PS-Grant-Id`) covers `:scope`. The server resolves
-`dataPointId = keccak256(owner, scope)`, calls the gateway endpoint signed
-with its server key (the `?version=N` given here becomes the gateway path
-version), passes the builder's `grantId` as the signed claim so the gateway
-attests the redacted view, and returns the gateway response body unchanged
-(`data` + `proof`). Owners get the full view.
+claim, `?grantId=` or `X-PS-Grant-Id`) covers `:scope`. The signed `uri` is
+the request path without a query string, as for every Personal Server read;
+the version is a path segment so it is inside the signed uri (a signature for
+`/lineage/2` is refused on `/lineage/3`), and `?version=` is rejected with 400. The server resolves `dataPointId = keccak256(owner, scope)`, calls the
+gateway endpoint signed with its server key (same path version), passes the
+builder's `grantId` as the signed claim so the gateway attests the redacted
+view, and returns the gateway response body unchanged (`data` + `proof`).
+Owners get the full view.
 
 | Status    | errorCode               | When                                           |
 | --------- | ----------------------- | ---------------------------------------------- |

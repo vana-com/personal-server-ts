@@ -763,11 +763,23 @@ export async function handlePersonalServerDataRequest(
       return jsonResponse(result.response);
     }
 
-    if (parts.length === 2 && parts[1] === "lineage") {
+    if ((parts.length === 2 || parts.length === 3) && parts[1] === "lineage") {
       if (request.method !== "GET") return methodNotAllowed();
       const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
-      const version = url.searchParams.get("version") ?? undefined;
+      // The version is a PATH segment (/v1/data/:scope/lineage/:version), so
+      // it is inside the signed request uri: a builder's signature for one
+      // version cannot be replayed to read another. The grant view is the
+      // signed grantId claim the read auth already honours. Query
+      // parameters would be unsigned inputs to the view and are refused.
+      if (url.searchParams.has("version")) {
+        return errorResponse(
+          400,
+          "INVALID_VERSION",
+          "version is a path segment (/v1/data/:scope/lineage/:version), not a query parameter",
+        );
+      }
+      const version = parts.length === 3 ? decodePathPart(parts[2]) : undefined;
       if (version !== undefined && !/^[1-9]\d*$/.test(version)) {
         return errorResponse(
           400,

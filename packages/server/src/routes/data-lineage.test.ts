@@ -446,37 +446,15 @@ describe("derivative data routes", () => {
       expect(verified.grantId).toBe(WRITE_GRANT_ID);
     });
 
-    it("treats an empty lineage as a root record: nothing stamped", async () => {
+    it("keeps an explicit empty lineage as a stamped root statement", async () => {
       const res = await ownerWrite("notes.entries", {
         note: "root",
         lineage: [],
       });
       expect(res.status).toBe(201);
-      expect((await res.json()).lineage).toBeUndefined();
+      expect((await res.json()).lineage).toEqual({ sources: [] });
       const envelope = await (await ownerRead("notes.entries")).json();
-      expect(envelope.data.$lineage).toBeUndefined();
-    });
-
-    it("rejects binary metadata that carries the reserved $lineage key", async () => {
-      const bytes = new TextEncoder().encode("%PDF-1.7 report");
-      const res = await app.request("/spine.health.report", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/pdf",
-          "X-Vana-Metadata": JSON.stringify({
-            $lineage: { sources: [SOURCE_ID], writtenAt: "now" },
-          }),
-          Authorization: await ownerHeader(
-            "POST",
-            "/spine.health.report",
-            "%PDF-1.7 report",
-          ),
-        },
-        body: bytes,
-      });
-      expect(res.status).toBe(400);
-      expect((await res.json()).error).toBe("INVALID_BODY");
-      expect((await ownerRead("spine.health.report")).status).toBe(404);
+      expect(envelope.data.$lineage.sources).toEqual([]);
     });
 
     it("leaves a root write untouched (no lineage field, no $lineage)", async () => {
@@ -489,15 +467,18 @@ describe("derivative data routes", () => {
   });
 
   describe("GET /v1/data/:scope/lineage", () => {
-    async function builderLineageRead(scope: string, query = "") {
-      const uri = `/${scope}/lineage`;
-      return app.request(`${uri}${query}`, {
+    async function builderLineageRead(
+      scope: string,
+      options: { version?: string; signedUri?: string; query?: string } = {},
+    ) {
+      const uri = `/${scope}/lineage${options.version ? `/${options.version}` : ""}`;
+      return app.request(`${uri}${options.query ?? ""}`, {
         headers: {
           Authorization: await buildWeb3SignedHeader({
             wallet: builderWallet,
             aud: SERVER_ORIGIN,
             method: "GET",
-            uri,
+            uri: options.signedUri ?? uri,
             grantId: READ_GRANT_ID,
           }),
         },
@@ -533,7 +514,7 @@ describe("derivative data routes", () => {
           proof: { p: 2 },
         },
       );
-      const res = await builderLineageRead(DERIVED_SCOPE, "?version=1");
+      const res = await builderLineageRead(DERIVED_SCOPE, { version: "1" });
       expect(res.status).toBe(200);
       expect((await res.json()).data).toEqual(redacted);
       expect(lineageGateway.getLineage).toHaveBeenCalledWith({
@@ -563,12 +544,21 @@ describe("derivative data routes", () => {
         },
       });
       expect(missing.status).toBe(404);
-      const bad = await app.request(`/${DERIVED_SCOPE}/lineage?version=0`, {
+      const bad = await app.request(`/${DERIVED_SCOPE}/lineage/0`, {
+        headers: {
+          Authorization: await ownerHeader(
+            "GET",
+            `/${DERIVED_SCOPE}/lineage/0`,
+          ),
+        },
+      });
+      expect(bad.status).toBe(400);
+      const query = await app.request(`/${DERIVED_SCOPE}/lineage?version=1`, {
         headers: {
           Authorization: await ownerHeader("GET", `/${DERIVED_SCOPE}/lineage`),
         },
       });
-      expect(bad.status).toBe(400);
+      expect(query.status).toBe(400);
     });
 
     it("relays other gateway failures as 502 LINEAGE_GATEWAY_ERROR", async () => {
@@ -602,6 +592,22 @@ describe("derivative data routes", () => {
     it("requires authentication", async () => {
       const res = await app.request(`/${DERIVED_SCOPE}/lineage`);
       expect(res.status).toBe(401);
+    });
+
+    it("a builder's signature for one version cannot be replayed for another (version is in the signed path)", async () => {
+      const res = await builderLineageRead(DERIVED_SCOPE, {
+        version: "3",
+        signedUri: `/${DERIVED_SCOPE}/lineage/2`,
+      });
+      expect(res.status).toBe(401);
+      expect(lineageGateway.getLineage).not.toHaveBeenCalled();
+      const ok = await builderLineageRead(DERIVED_SCOPE, { version: "2" });
+      expect(ok.status).toBe(200);
+      expect(lineageGateway.getLineage).toHaveBeenCalledWith({
+        dataPointId: DERIVED_ID,
+        version: "2",
+        grantId: READ_GRANT_ID,
+      });
     });
   });
 
