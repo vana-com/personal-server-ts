@@ -219,12 +219,12 @@ the current version) and the grant view is the scheme's own `grantId` claim
 in the signed payload, so a captured signature cannot be replayed for another
 version or grant view. The signer decides the view:
 
-- the data point's owner, or one of the owner's registered servers: full
-  view. With a `grantId` claim the response is instead the view that grant
+- the data point's owner, or one of the owner's confirmed, unrevoked
+  registered servers: full view. With a `grantId` claim the response is instead the view that grant
   sees (the grant must be issued by this owner), attested as such; this is
   how a Personal Server serves a builder.
-- a registered builder holding a live grant from the owner (not revoked or
-  expired, registration paid and confirmed on chain) that covers the data
+- a confirmed, paid builder holding a live grant from the owner (not revoked
+  or expired, registration paid and confirmed on chain) that covers the data
   point's scope: the view for that grant. Nodes whose scope the grant does
   not cover are returned as `{ "dataPointId": "0x...", "redacted": true }`,
   so a consent UI can show the shape of the graph without learning the
