@@ -332,18 +332,19 @@ Same authentication as `GET /v1/data/:scope`: the owner, or a builder with
 claim, `?grantId=` or `X-PS-Grant-Id`) covers `:scope`. The signed `uri` is
 the request path without a query string, as for every Personal Server read;
 the version is a path segment so it is inside the signed uri (a signature for
-`/lineage/2` is refused on `/lineage/3`), and `?version=` is rejected with 400. The server resolves `dataPointId = keccak256(owner, scope)`, calls the
+`/lineage/2` is refused on `/lineage/3`), and any query string is rejected with 400 (`?version=` as `INVALID_VERSION`, anything else as `INVALID_QUERY`). The server resolves `dataPointId = keccak256(owner, scope)`, calls the
 gateway endpoint signed with its server key (same path version), passes the
 builder's `grantId` as the signed claim so the gateway attests the redacted
 view, and returns the gateway response body unchanged (`data` + `proof`).
 Owners get the full view.
 
-| Status    | errorCode               | When                                           |
-| --------- | ----------------------- | ---------------------------------------------- |
-| 401 / 403 | (existing read errors)  | not the owner and no covering grant            |
-| 404       | `NOT_FOUND`             | the scope is not registered at the gateway yet |
-| 502       | `LINEAGE_GATEWAY_ERROR` | the gateway returned an error                  |
-| 503       | `LINEAGE_UNAVAILABLE`   | this server has no gateway URL or signing key  |
+| Status    | errorCode               | When                                                                            |
+| --------- | ----------------------- | ------------------------------------------------------------------------------- |
+| 400       | `INVALID_QUERY`         | any query string; version is a path segment, the grant view is the signed claim |
+| 401 / 403 | (existing read errors)  | not the owner and no covering grant                                             |
+| 404       | `NOT_FOUND`             | the scope is not registered at the gateway yet                                  |
+| 502       | `LINEAGE_GATEWAY_ERROR` | the gateway returned an error                                                   |
+| 503       | `LINEAGE_UNAVAILABLE`   | this server has no gateway URL or signing key                                   |
 
 Lineage is served from the gateway, so a derivative becomes walkable once its
 registration has synced (the ingest response reports `status: "syncing"`).

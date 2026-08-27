@@ -779,6 +779,13 @@ export async function handlePersonalServerDataRequest(
           "version is a path segment (/v1/data/:scope/lineage/:version), not a query parameter",
         );
       }
+      if (url.search.length > 0) {
+        return errorResponse(
+          400,
+          "INVALID_QUERY",
+          "lineage reads take no query parameters; the version is a path segment and the grant view is the signed grantId claim",
+        );
+      }
       const version = parts.length === 3 ? decodePathPart(parts[2]) : undefined;
       if (version !== undefined && !/^[1-9]\d*$/.test(version)) {
         return errorResponse(

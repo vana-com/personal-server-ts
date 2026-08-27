@@ -494,6 +494,30 @@ describe("derivative data routes", () => {
       });
     }
 
+    it("rejects ?version= with 400 INVALID_VERSION (version is a path segment)", async () => {
+      const res = await builderLineageRead(DERIVED_SCOPE, {
+        query: "?version=2",
+      });
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { error: { errorCode: string } };
+      expect(body.error.errorCode).toBe("INVALID_VERSION");
+      expect(lineageGateway.getLineage).not.toHaveBeenCalled();
+    });
+
+    it("rejects any other query string with 400 INVALID_QUERY (unsigned view inputs)", async () => {
+      for (const query of [
+        "?grantId=0x1234",
+        "?foo=bar",
+        "?includeDeleted=true",
+      ]) {
+        const res = await builderLineageRead(DERIVED_SCOPE, { query });
+        expect(res.status).toBe(400);
+        const body = (await res.json()) as { error: { errorCode: string } };
+        expect(body.error.errorCode).toBe("INVALID_QUERY");
+      }
+      expect(lineageGateway.getLineage).not.toHaveBeenCalled();
+    });
+
     it("returns the owner's full view straight from the gateway, attested", async () => {
       const res = await app.request(`/${DERIVED_SCOPE}/lineage`, {
         headers: {
