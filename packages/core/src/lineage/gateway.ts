@@ -144,6 +144,26 @@ function isGatewayProof(value: unknown): value is GatewayProof {
   );
 }
 
+/**
+ * A data point id is keccak256(owner, scope). Any gateway response that
+ * labels an owner and scope with an id must derive that id from them; an
+ * owner that is not an address, or a pair that hashes elsewhere, fails.
+ */
+function derivesDataPointId(
+  id: string,
+  ownerAddress: string,
+  scope: string,
+): boolean {
+  try {
+    return (
+      computeDataPointId(ownerAddress as `0x${string}`, scope).toLowerCase() ===
+      id.toLowerCase()
+    );
+  } catch {
+    return false;
+  }
+}
+
 function parseLineageView(value: unknown): LineageView | null {
   if (
     !isRecord(value) ||
@@ -213,18 +233,7 @@ export function createGatewayLineageClient(
       // must derive the id it claims, or a malformed response could pair the
       // requested id with an arbitrary same-owner scope and slip past local
       // naming validation.
-      let derived: string;
-      try {
-        derived = computeDataPointId(
-          data.ownerAddress as `0x${string}`,
-          data.scope,
-        );
-      } catch {
-        throw new Error(
-          `Gateway error: data point ${data.id} has an owner or scope that cannot derive an id`,
-        );
-      }
-      if (derived.toLowerCase() !== data.id.toLowerCase()) {
+      if (!derivesDataPointId(data.id, data.ownerAddress, data.scope)) {
         throw new Error(
           `Gateway error: data point ${data.id} does not derive from its owner and scope`,
         );
@@ -300,6 +309,26 @@ export function createGatewayLineageClient(
               dataPointId: data.dataPointId,
               version: data.version,
               grantId: servedGrant,
+            },
+          },
+        };
+      }
+      // The view's own owner and scope must derive the id it is labeled
+      // with, exactly as getDataPoint demands of a record. Otherwise a
+      // malformed response could carry the requested id while exposing the
+      // lineage of another owner or scope under that label.
+      if (
+        !derivesDataPointId(data.dataPointId, data.ownerAddress, data.scope)
+      ) {
+        return {
+          ok: false,
+          status: res.status,
+          body: {
+            error: "lineage view does not derive from its owner and scope",
+            received: {
+              dataPointId: data.dataPointId,
+              ownerAddress: data.ownerAddress,
+              scope: data.scope,
             },
           },
         };

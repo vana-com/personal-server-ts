@@ -7,7 +7,8 @@ import { createGatewayLineageClient, type LineageView } from "./gateway.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
 
 const GATEWAY_URL = "https://gateway.example.com/";
-const ID = `0x${"ab".repeat(32)}`;
+const OWNER = "0x000000000000000000000000000000000000dEaD";
+const ID = computeDataPointId(OWNER, "spine.health.summary");
 const SOURCE_ID = `0x${"cd".repeat(32)}`;
 
 function jsonResponse(status: number, body: unknown): Response {
@@ -37,7 +38,7 @@ const proof = {
 
 const view: LineageView = {
   dataPointId: ID,
-  ownerAddress: "0xowner",
+  ownerAddress: OWNER,
   scope: "spine.health.summary",
   version: "2",
   deletedAt: null,
@@ -293,6 +294,41 @@ describe("createGatewayLineageClient", () => {
       ),
     });
     await expect(client.getDataPoint(ID)).rejects.toThrow(/does not derive/);
+  });
+
+  it("getLineage refuses a view whose owner and scope do not derive the id it carries", async () => {
+    const wrongScope = { ...view, scope: "chatgpt.conversations" };
+    const client = createGatewayLineageClient({
+      gatewayUrl: GATEWAY_URL,
+      requestSigner: requestSignerFor(createTestWallet(5)),
+      fetch: vi
+        .fn()
+        .mockResolvedValue(jsonResponse(200, { data: wrongScope, proof })),
+    });
+    const byScope = await client.getLineage({ dataPointId: ID });
+    expect(byScope.ok).toBe(false);
+    expect(JSON.stringify(byScope)).toMatch(/does not derive/);
+
+    const notAnAddress = { ...view, ownerAddress: "0xowner" };
+    const client2 = createGatewayLineageClient({
+      gatewayUrl: GATEWAY_URL,
+      requestSigner: requestSignerFor(createTestWallet(5)),
+      fetch: vi
+        .fn()
+        .mockResolvedValue(jsonResponse(200, { data: notAnAddress, proof })),
+    });
+    const byOwner = await client2.getLineage({ dataPointId: ID });
+    expect(byOwner.ok).toBe(false);
+
+    // Same id, right owner and scope: served.
+    const client3 = createGatewayLineageClient({
+      gatewayUrl: GATEWAY_URL,
+      requestSigner: requestSignerFor(createTestWallet(5)),
+      fetch: vi
+        .fn()
+        .mockResolvedValue(jsonResponse(200, { data: view, proof })),
+    });
+    expect((await client3.getLineage({ dataPointId: ID })).ok).toBe(true);
   });
 
   it("getLineage is unavailable without a request signer", async () => {
