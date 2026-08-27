@@ -23,6 +23,7 @@ export {
 export {
   createGatewayLineageClient,
   type GatewayLineageClientOptions,
+  type GatewayProof,
   type GetLineageInput,
   type LineageGatewayPort,
   type LineageGatewayResult,

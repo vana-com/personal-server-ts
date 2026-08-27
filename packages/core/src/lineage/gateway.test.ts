@@ -24,6 +24,15 @@ function requestSignerFor(wallet: ReturnType<typeof createTestWallet>) {
   });
 }
 
+const proof = {
+  userSignature: "0xuser",
+  gatewaySignature: "0xgw",
+  timestamp: 1756630000,
+  status: "confirmed",
+  estimatedConfirmation: null,
+  chainBlockHeight: 42,
+};
+
 const view: LineageView = {
   dataPointId: ID,
   ownerAddress: "0xowner",
@@ -89,7 +98,7 @@ describe("createGatewayLineageClient", () => {
     const wallet = createTestWallet(5);
     const fetchMock = vi
       .fn()
-      .mockResolvedValue(jsonResponse(200, { data: view, proof: { ok: 1 } }));
+      .mockResolvedValue(jsonResponse(200, { data: view, proof }));
     const client = createGatewayLineageClient({
       gatewayUrl: GATEWAY_URL,
       requestSigner: requestSignerFor(wallet),
@@ -100,7 +109,7 @@ describe("createGatewayLineageClient", () => {
       version: "2",
       grantId: "0xgrant",
     });
-    expect(result).toEqual({ ok: true, data: view, proof: { ok: 1 } });
+    expect(result).toEqual({ ok: true, data: view, proof });
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe(`https://gateway.example.com/v1/data/${ID}/lineage/2`);
     const header = (init.headers as Record<string, string>).Authorization;
@@ -124,6 +133,22 @@ describe("createGatewayLineageClient", () => {
       status: 404,
       body: { error: "nope" },
     });
+  });
+
+  it("getLineage rejects a 200 without a structurally valid proof", async () => {
+    for (const bad of [
+      { data: view },
+      { data: view, proof: null },
+      { data: view, proof: { gatewaySignature: "0x" } },
+    ]) {
+      const client = createGatewayLineageClient({
+        gatewayUrl: GATEWAY_URL,
+        requestSigner: requestSignerFor(createTestWallet(5)),
+        fetch: vi.fn().mockResolvedValue(jsonResponse(200, bad)),
+      });
+      const result = await client.getLineage({ dataPointId: ID });
+      expect(result.ok).toBe(false);
+    }
   });
 
   it("getLineage rejects a malformed 200 body", async () => {

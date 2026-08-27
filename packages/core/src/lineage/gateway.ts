@@ -30,7 +30,7 @@ export interface LineageView {
 }
 
 export type LineageGatewayResult =
-  | { ok: true; data: LineageView; proof: unknown }
+  | { ok: true; data: LineageView; proof: GatewayProof }
   | { ok: false; status: number; body: unknown };
 
 export interface GetLineageInput {
@@ -95,6 +95,30 @@ function isLineageNode(value: unknown): value is LineageNode {
     typeof value.scope === "string" &&
     typeof value.version === "string" &&
     (value.deletedAt === null || typeof value.deletedAt === "string")
+  );
+}
+
+/** The gateway attestation shape (ProofData); a 200 without it is not a view. */
+export interface GatewayProof {
+  userSignature: string;
+  gatewaySignature: string;
+  timestamp: number;
+  status: string;
+  estimatedConfirmation: string | null;
+  chainBlockHeight: number | null;
+}
+
+function isGatewayProof(value: unknown): value is GatewayProof {
+  return (
+    isRecord(value) &&
+    typeof value.userSignature === "string" &&
+    typeof value.gatewaySignature === "string" &&
+    typeof value.timestamp === "number" &&
+    typeof value.status === "string" &&
+    (value.estimatedConfirmation === null ||
+      typeof value.estimatedConfirmation === "string") &&
+    (value.chainBlockHeight === null ||
+      typeof value.chainBlockHeight === "number")
   );
 }
 
@@ -182,19 +206,19 @@ export function createGatewayLineageClient(
       });
       const body = await readJson(res);
       if (!res.ok) return { ok: false, status: res.status, body };
+      // The API promises an attested view: a 200 whose data or proof does
+      // not have the documented shape is reported as a gateway error, never
+      // passed on as a view.
       const data = parseLineageView(isRecord(body) ? body.data : undefined);
-      if (!data) {
+      const proof = isRecord(body) ? body.proof : undefined;
+      if (!data || !isGatewayProof(proof)) {
         return {
           ok: false,
           status: res.status,
           body: { error: "malformed lineage response", received: body },
         };
       }
-      return {
-        ok: true,
-        data,
-        proof: isRecord(body) ? (body.proof ?? null) : null,
-      };
+      return { ok: true, data, proof };
     },
 
     async registerDataPoint(params) {

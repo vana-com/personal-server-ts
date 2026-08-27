@@ -147,6 +147,15 @@ function lineageView(overrides: Partial<LineageView> = {}): LineageView {
   };
 }
 
+const PROOF = {
+  userSignature: "0xuser",
+  gatewaySignature: "0xgw",
+  timestamp: 1756630000,
+  status: "confirmed",
+  estimatedConfirmation: null,
+  chainBlockHeight: 42,
+};
+
 function createMockLineageGateway(
   overrides: Partial<LineageGatewayPort> = {},
 ): LineageGatewayPort {
@@ -154,7 +163,7 @@ function createMockLineageGateway(
     getDataPoint: vi.fn().mockResolvedValue(null),
     getLineage: vi
       .fn()
-      .mockResolvedValue({ ok: true, data: lineageView(), proof: { p: 1 } }),
+      .mockResolvedValue({ ok: true, data: lineageView(), proof: PROOF }),
     registerDataPoint: vi.fn(),
     ...overrides,
   };
@@ -511,7 +520,7 @@ describe("derivative data routes", () => {
         {
           ok: true,
           data: redacted,
-          proof: { p: 2 },
+          proof: PROOF,
         },
       );
       const res = await builderLineageRead(DERIVED_SCOPE, { version: "1" });
