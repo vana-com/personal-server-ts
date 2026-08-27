@@ -503,7 +503,7 @@ describe("derivative data routes", () => {
       expect(res.status).toBe(200);
       expect(await res.json()).toEqual({
         data: lineageView(),
-        proof: { p: 1 },
+        proof: PROOF,
       });
       expect(lineageGateway.getLineage).toHaveBeenCalledWith({
         dataPointId: DERIVED_ID,
