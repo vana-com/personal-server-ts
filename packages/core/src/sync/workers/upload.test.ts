@@ -804,6 +804,33 @@ describe("uploadOne — derivative registration (lineage)", () => {
     expect(deps.storage.updateDataPointId).not.toHaveBeenCalled();
   });
 
+  it("registers an explicit empty $lineage as an attested root statement", async () => {
+    const deps = makeMockDeps();
+    (deps.storage.readEnvelope as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...derivativeEnvelope(),
+      data: {
+        note: "x",
+        lineage: [],
+        $lineage: { sources: [], writtenAt: COLLECTED_AT },
+      },
+    });
+    const registerDataPoint = vi
+      .fn()
+      .mockResolvedValue({ dataPointId: DATA_POINT_ID, expectedVersion: "1" });
+    deps.lineageGateway = { registerDataPoint };
+    await uploadOne(deps, makeEntry());
+    expect(registerDataPoint).toHaveBeenCalledWith(
+      expect.objectContaining({
+        lineage: [],
+        lineageSignature: "0xlineagesignature",
+      }),
+    );
+    expect(deps.signer.signLineageAttestation).toHaveBeenCalledWith(
+      expect.objectContaining({ sources: [] }),
+    );
+    expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
+  });
+
   it("keeps using the SDK client for root records", async () => {
     const deps = makeMockDeps();
     deps.lineageGateway = { registerDataPoint: vi.fn() };

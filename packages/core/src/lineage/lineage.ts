@@ -329,16 +329,16 @@ export interface PrepareLineageInput {
 
 /**
  * Validate a write's lineage end to end (shape, sources, naming rule) and
- * produce the `$lineage` record to stamp, or undefined for an empty list:
- * an empty `lineage` is a root record and nothing is stamped or registered
- * for it, exactly like an absent field. Throws ProtocolErrors; callers on
- * the write path let them propagate before anything is stored.
+ * produce the `$lineage` record to stamp. An empty list is an EXPLICIT root
+ * statement: it is stamped (`sources: []`) and registered as an attested
+ * root, distinct from an absent field, which makes no lineage statement.
+ * Throws ProtocolErrors; callers on the write path let them propagate
+ * before anything is stored.
  */
 export async function prepareLineage(
   input: PrepareLineageInput,
-): Promise<StoredLineage | undefined> {
+): Promise<StoredLineage> {
   const sources = parseLineageSources(input.field);
-  if (sources.length === 0) return undefined;
   if (!input.serverOwner) {
     throw new ServerNotConfiguredError({
       reason: "serverOwner is required to validate lineage sources",

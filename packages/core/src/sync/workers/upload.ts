@@ -198,8 +198,11 @@ export async function uploadOne(
       const lineage = readStoredLineage(
         envelope.data as Record<string, unknown> | undefined,
       );
+      // An empty `$lineage` is an explicit root statement and is registered
+      // as such (attested empty list); only an ABSENT `$lineage` makes no
+      // statement and goes through the plain client.
       let dataPointResult;
-      if (lineage && lineage.sources.length > 0) {
+      if (lineage) {
         if (!deps.lineageGateway) {
           throw new Error(
             `Cannot register derivative ${entry.path} (scope=${entry.scope}): lineage registration needs a gateway URL (lineageGateway is not configured)`,

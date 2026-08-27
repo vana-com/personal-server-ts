@@ -309,7 +309,7 @@ describe("prepareLineage", () => {
     });
   });
 
-  it("returns undefined for an empty list: a root record, nothing to stamp", async () => {
+  it("keeps an explicit empty list as a root statement (stamped, distinct from absent)", async () => {
     await expect(
       prepareLineage({
         scope: DERIVED_SCOPE,
@@ -318,7 +318,7 @@ describe("prepareLineage", () => {
         storage: storageWithScopes(),
         now,
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ sources: [], writtenAt: "2026-08-31T09:12:44.000Z" });
   });
 
   it("applies the naming rule against the resolved source scopes", async () => {
