@@ -536,9 +536,30 @@ describe("derivative data routes", () => {
       });
     });
 
+    it("a builder's redacted view carries no identifier besides the view's own data point", async () => {
+      const redacted = lineageView({
+        sources: [{ redacted: true }, { redacted: true }],
+        derivatives: [{ redacted: true }],
+      });
+      (lineageGateway.getLineage as ReturnType<typeof vi.fn>).mockResolvedValue(
+        { ok: true, data: redacted, proof: PROOF },
+      );
+      const res = await builderLineageRead(DERIVED_SCOPE);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { data: Record<string, unknown> };
+      const text = JSON.stringify({ ...body.data, dataPointId: undefined });
+      // Nothing that looks like a data point id may survive redaction: a
+      // grantee knows the owner, and ids are keccak256(owner, scope).
+      expect(text.match(/0x[0-9a-fA-F]{64}/g) ?? []).toEqual([]);
+      expect(body.data.sources).toEqual([
+        { redacted: true },
+        { redacted: true },
+      ]);
+    });
+
     it("asks the gateway for the builder's grant view under its read grant", async () => {
       const redacted = lineageView({
-        sources: [{ dataPointId: SOURCE_ID, redacted: true }],
+        sources: [{ redacted: true }],
       });
       (lineageGateway.getLineage as ReturnType<typeof vi.fn>).mockResolvedValue(
         {

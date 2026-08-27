@@ -16,7 +16,13 @@ export type LineageNode =
       version: string;
       deletedAt: string | null;
     }
-  | { dataPointId: string; redacted: true };
+  /**
+   * A node the caller's grant does not cover. It carries NO identifier:
+   * dataPointId is keccak256(owner, scope) and a grantee knows the owner,
+   * so an id would let it dictionary-test scope names. Only position and
+   * count survive, which is all a consent UI needs to show the shape.
+   */
+  | { redacted: true };
 
 /** `data` of a gateway lineage response (see docs/derivative-data-api.md). */
 export interface LineageView {
@@ -97,8 +103,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isLineageNode(value: unknown): value is LineageNode {
-  if (!isRecord(value) || typeof value.dataPointId !== "string") return false;
-  if (value.redacted === true) return true;
+  if (!isRecord(value)) return false;
+  if (value.redacted === true) {
+    // A redacted node must be exactly { redacted: true }. A gateway that
+    // attaches an id, scope or version to a redacted node is leaking, and the
+    // view is refused rather than passed on with the leak intact.
+    return Object.keys(value).length === 1;
+  }
+  if (typeof value.dataPointId !== "string") return false;
   return (
     typeof value.scope === "string" &&
     typeof value.version === "string" &&

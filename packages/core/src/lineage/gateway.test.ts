@@ -46,7 +46,7 @@ const view: LineageView = {
       version: "7",
       deletedAt: null,
     },
-    { dataPointId: `0x${"ef".repeat(32)}`, redacted: true },
+    { redacted: true },
   ],
   derivatives: [],
 };
@@ -245,6 +245,31 @@ describe("createGatewayLineageClient", () => {
       proof,
     }).getLineage({ dataPointId: ID });
     expect(grantToOwner.ok).toBe(false);
+  });
+
+  it("refuses a view whose redacted node carries any identifier", async () => {
+    const mk = (nodes: unknown[]) =>
+      createGatewayLineageClient({
+        gatewayUrl: GATEWAY_URL,
+        requestSigner: requestSignerFor(createTestWallet(5)),
+        fetch: vi
+          .fn()
+          .mockResolvedValue(
+            jsonResponse(200, { data: { ...view, sources: nodes }, proof }),
+          ),
+      });
+    for (const leaky of [
+      { dataPointId: SOURCE_ID, redacted: true },
+      { redacted: true, scope: "oura.sleep" },
+      { redacted: true, version: "2" },
+    ]) {
+      const result = await mk([leaky]).getLineage({ dataPointId: ID });
+      expect(result.ok).toBe(false);
+    }
+    const clean = await mk([{ redacted: true }]).getLineage({
+      dataPointId: ID,
+    });
+    expect(clean.ok).toBe(true);
   });
 
   it("getLineage is unavailable without a request signer", async () => {

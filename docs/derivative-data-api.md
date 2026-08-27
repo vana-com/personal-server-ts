@@ -226,9 +226,11 @@ version or grant view. The signer decides the view:
 - a confirmed, paid builder holding a live grant from the owner (not revoked
   or expired, registration paid and confirmed on chain) that covers the data
   point's scope: the view for that grant. Nodes whose scope the grant does
-  not cover are returned as `{ "dataPointId": "0x...", "redacted": true }`,
-  so a consent UI can show the shape of the graph without learning the
-  scopes.
+  not cover are returned as `{ "redacted": true }` and nothing else: no id,
+  scope or version. A data point id is `keccak256(owner, scope)` and the
+  grantee knows the owner, so an id would let it dictionary-test scope
+  names. Order and count are kept, which is all a consent UI needs to
+  show the shape of the graph.
 - anyone else, and any signer asking about an id the gateway does not hold:
   404, indistinguishable, so a wallet cannot enumerate which data point ids
   exist. A grantee whose grant does not cover the root gets the same 404.
@@ -249,7 +251,7 @@ Response:
         "version": "12",
         "deletedAt": null
       },
-      { "dataPointId": "0x9e77...02", "redacted": true }
+      { "redacted": true }
     ],
     "derivatives": [
       {
@@ -314,7 +316,9 @@ Response:
     visible node hashes as
     `keccak256(abi.encode(bytes32 dataPointId, string scope, uint256 version, uint256 deletedAt))`
     and a redacted node as
-    `keccak256(abi.encode(bytes32 dataPointId, string "redacted"))`.
+    `keccak256(abi.encode(string "redacted", uint256 position))` where
+    position is its index in the list, so the proof binds count and order
+    without carrying an identifier.
     The gateway signs the view it served, so a redacted view verifies on its
     own and un-redacting or dropping a node breaks the proof.
 
