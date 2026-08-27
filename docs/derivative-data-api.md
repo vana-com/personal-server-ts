@@ -275,9 +275,9 @@ Response:
   the same owner.
 - `version` is the derived record's version whose lineage is shown. Without
   a path version it is the current version; when the current version is a
-  tombstone it is the version the tombstone replaced (so a deleted
-  derivative still exposes what it came from, and never anything older: a
-  version registered without lineage is a root and stays one).
+  tombstone it is the last data (non-tombstone) version below it (so a
+  deleted derivative still exposes what it came from, and never anything
+  older: a version registered without lineage is a root and stays one).
   `/lineage/N` selects a specific version and 404s when that version does
   not exist or failed on chain.
 - `sources[].version` is the source's current version, `deletedAt` its
@@ -296,9 +296,10 @@ Response:
   `userSignature` = the data point's AddData signature) over:
   - `requestHash = keccak256(abi.encode(string "GET /v1/data/:dataPointId/lineage", bytes32 dataPointId, uint256 version, bytes32 grantId))`
     with `version` 0 when no path version was given and `grantId` bytes32
-    zero for the full view; `userSignature` in the proof is the AddData
-    signature of the version shown, and `status` / `chainBlockHeight` are
-    that version's;
+    zero for the full view; `userSignature`, `status` and `chainBlockHeight`
+    in the proof are those of the requested version for `/lineage/N`,
+    otherwise the head's (for a tombstoned head, the tombstone registration,
+    whose lineage is shown from the data version it replaced);
   - `responseHash = keccak256(abi.encode(bytes32 dataPointId, address ownerAddress, string scope, uint256 version, uint256 deletedAt, bytes32 sourcesHash, bytes32 derivativesHash))`
     where `deletedAt` is unix seconds (0 when null), each list hash is
     `keccak256(abi.encode(bytes32[] nodeHashes))` in response order, a
