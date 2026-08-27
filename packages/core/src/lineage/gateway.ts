@@ -136,6 +136,7 @@ function parseLineageView(value: unknown): LineageView | null {
     !value.sources.every(isLineageNode) ||
     !Array.isArray(value.derivatives) ||
     !value.derivatives.every(isLineageNode) ||
+    !(value.grantId === undefined || typeof value.grantId === "string") ||
     !(
       value.derivativesTruncated === undefined ||
       value.derivativesTruncated === true

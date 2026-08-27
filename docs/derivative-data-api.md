@@ -299,8 +299,12 @@ Response:
 - `proof` is the standard gateway attestation (`GatewayAttestation` EIP-712,
   `userSignature` = the data point's AddData signature) over:
   - `requestHash = keccak256(abi.encode(string "GET /v1/data/:dataPointId/lineage", bytes32 dataPointId, uint256 version, bytes32 grantId))`
-    with `version` 0 when no path version was given and `grantId` bytes32
-    zero for the full view; `userSignature`, `status` and `chainBlockHeight`
+    with `version` 0 when no path version was given and `grantId` the grant
+    CLAIMED by the request (bytes32 zero when no claim was sent), so the
+    client can always recompute it; a grant view also carries `data.grantId`,
+    the grant that decided the redactions (claimed, or selected for a builder
+    that made no claim), appended to the response hash as `bytes32` only when
+    set, before the `derivativesTruncated` bool; `userSignature`, `status` and `chainBlockHeight`
     in the proof are those of the requested version for `/lineage/N`,
     otherwise the head's (for a tombstoned head, the tombstone registration,
     whose lineage is shown from the data version it replaced);
