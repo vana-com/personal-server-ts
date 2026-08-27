@@ -740,6 +740,21 @@ describe("download worker", () => {
       listing.mockResolvedValueOnce({ dataPoints: [], cursor: null });
       await downloadAll(deps);
       expect(scopeDeletions.noteFeedSynced).toHaveBeenCalledTimes(1);
+      // This listing started from no cursor: it covered the whole registry.
+      expect(scopeDeletions.noteFeedSynced).toHaveBeenCalledWith(undefined, {
+        full: true,
+      });
+
+      // An incremental pass (from a stored cursor) is not a full listing.
+      (deps.cursor.read as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+        "cursor-7",
+      );
+      listing.mockResolvedValueOnce({ dataPoints: [], cursor: null });
+      await downloadAll(deps);
+      expect(scopeDeletions.noteFeedSynced).toHaveBeenLastCalledWith(
+        undefined,
+        { full: false },
+      );
     });
 
     it("uses the dedicated feed with includeDeleted=true when one is wired", async () => {

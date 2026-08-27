@@ -243,8 +243,9 @@ describe("scope deletion tracker", () => {
     });
     tracker.markDeleted(SCOPE, TOMB);
     advance(900);
-    // The pass listed no live row for SCOPE (else markLive would have run).
-    tracker.noteFeedSynced();
+    // A full listing showed no live row for SCOPE (else markLive would have
+    // run), so the tombstone is confirmed as of the pass.
+    tracker.noteFeedSynced(undefined, { full: true });
     advance(900);
 
     await expect(tracker.resolve(SCOPE)).resolves.toMatchObject({
@@ -252,6 +253,29 @@ describe("scope deletion tracker", () => {
       verified: true,
     });
     expect(getDataPoint).not.toHaveBeenCalled();
+  });
+
+  it("does not let incremental feed passes keep a tombstone fresh: a remote re-add is still re-checked", async () => {
+    // Delete here, re-add elsewhere; the incremental (`since` cursor) passes
+    // in between list nothing about this scope, so they must not count as
+    // re-validation or the tombstone would never expire.
+    const { tracker, getDataPoint, advance } = makeTracker({
+      remote: record({ expectedVersion: "5" }),
+      maxStalenessMs: 1_000,
+    });
+    tracker.markDeleted(SCOPE, TOMB, "local-delete");
+    advance(600);
+    tracker.noteFeedSynced();
+    advance(600);
+    tracker.noteFeedSynced();
+
+    await expect(tracker.resolve(SCOPE)).resolves.toEqual({
+      deleted: false,
+      source: "gateway",
+      verified: true,
+    });
+    expect(getDataPoint).toHaveBeenCalledTimes(1);
+    expect(tracker.knownDeletion(SCOPE)).toBeNull();
   });
 
   it("is assumed-live without a feed or owner to ask", async () => {

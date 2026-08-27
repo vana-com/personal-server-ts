@@ -1417,19 +1417,32 @@ export async function handlePersonalServerDataRequest(
         });
       }
 
-      await deps.accessLogWriter.write({
-        logId: deps.createLogId?.() ?? crypto.randomUUID(),
-        grantId: "owner",
-        builder: deps.serverOwner ?? "owner",
-        action: "delete",
-        scope: parsed.scope,
-        timestamp: (deps.now ?? (() => new Date()))().toISOString(),
-        ipAddress:
-          request.headers.get("x-forwarded-for") ??
-          request.headers.get("x-real-ip") ??
-          "unknown",
-        userAgent: request.headers.get("user-agent") ?? "unknown",
-      });
+      // Audit entry, best-effort: the deletion above is irreversible and
+      // already done, so a failed log write must not turn it into an error
+      // response that invites a misleading retry. The failure is logged.
+      try {
+        await deps.accessLogWriter.write({
+          logId: deps.createLogId?.() ?? crypto.randomUUID(),
+          grantId: "owner",
+          builder: deps.serverOwner ?? "owner",
+          action: "delete",
+          scope: parsed.scope,
+          timestamp: (deps.now ?? (() => new Date()))().toISOString(),
+          ipAddress:
+            request.headers.get("x-forwarded-for") ??
+            request.headers.get("x-real-ip") ??
+            "unknown",
+          userAgent: request.headers.get("user-agent") ?? "unknown",
+        });
+      } catch (err) {
+        deps.logger?.warn?.(
+          {
+            scope: parsed.scope,
+            error: err instanceof Error ? err.message : String(err),
+          },
+          "Delete access-log entry failed; scope already deleted",
+        );
+      }
       deps.logger?.info?.(
         {
           scope: parsed.scope,

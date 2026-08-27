@@ -88,11 +88,15 @@ export interface ScopeDeletionTracker {
   markLive(scope: string): void;
   /**
    * Record that a deletion-aware feed listing completed with no further
-   * pages: every tombstone up to `at` has been fed through `markDeleted`,
-   * and every re-add through `markLive`, so all remembered tombstones are
-   * re-validated as of `at`.
+   * pages: every tombstone up to `at` has been fed through `markDeleted`.
+   * `full` means the listing started from no cursor and therefore covered
+   * the whole registry, so a scope re-added since its tombstone would have
+   * been listed live (and marked live); only then are the remembered
+   * tombstones re-validated as of `at`. An incremental pass (`since` the
+   * cursor) proves nothing about tombstones it did not list, so those keep
+   * ageing and are re-checked at the gateway after `maxStalenessMs`.
    */
-  noteFeedSynced(at?: Date): void;
+  noteFeedSynced(at?: Date, options?: { full?: boolean }): void;
   /** Synchronous view: a known tombstone, or null when none is known. */
   knownDeletion(scope: string): ScopeTombstone | null;
   /** Milliseconds since the last complete feed pass, or null if none yet. */
@@ -270,10 +274,12 @@ export function createScopeDeletionTracker(
       rememberLive(scope, nowMs());
     },
 
-    noteFeedSynced(at) {
+    noteFeedSynced(at, options) {
       lastFeedSyncMs = (at ?? now()).getTime();
-      // A complete pass would have listed any re-add as a live row (and
-      // marked it live above), so every tombstone still here is confirmed.
+      if (!options?.full) return;
+      // A full listing would have shown any re-add as a live row (and marked
+      // it live above), so every tombstone still here is confirmed. Tombstones
+      // an incremental pass happened to list were refreshed by markDeleted.
       for (const tombstone of deleted.values()) {
         tombstone.verifiedAtMs = Math.max(
           tombstone.verifiedAtMs,

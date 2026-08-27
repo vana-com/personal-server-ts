@@ -1416,6 +1416,28 @@ describe("DELETE /v1/data/:scope", () => {
     );
   });
 
+  it("still reports the deletion when the access-log write fails (the data is already gone)", async () => {
+    const accessLogWriter = createMockAccessLogWriter();
+    (accessLogWriter.write as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("audit db locked"),
+    );
+    const app = createApp({ accessLogWriter });
+    await ingestData("instagram.profile", { username: "gone" }, app);
+
+    const res = await deleteWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      steps: { local: { status: "ok", deletedCount: 1 } },
+    });
+    expect(
+      indexManager.findClosestByScope(
+        "instagram.profile",
+        "2099-01-01T00:00:00.000Z",
+      ),
+    ).toBeUndefined();
+  });
+
   it("reports a storage failure after a gateway success instead of hiding it", async () => {
     const app = createApp({
       syncManager: {

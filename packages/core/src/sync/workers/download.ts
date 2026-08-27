@@ -400,7 +400,9 @@ export async function downloadAll(
   // Feed the read-side deletion memory before any per-record work so a
   // tombstone is refused by reads even if its local reconcile below fails.
   // Only a listing with no further pages proves the memory complete: a
-  // multi-page backlog leaves it "stale" and reads fall back to lookups.
+  // multi-page backlog leaves it "stale" and reads fall back to lookups. A
+  // listing from no cursor covered the whole registry (`full`), which is
+  // what re-validates remembered tombstones; an incremental pass does not.
   if (deps.scopeDeletions) {
     for (const dataPoint of dataPoints) {
       const deletedAt = deletionTimestamp(dataPoint);
@@ -413,7 +415,11 @@ export async function downloadAll(
         deps.scopeDeletions.markLive(dataPoint.scope);
       }
     }
-    if (nextCursor === null) deps.scopeDeletions.noteFeedSynced();
+    if (nextCursor === null) {
+      deps.scopeDeletions.noteFeedSynced(undefined, {
+        full: lastCursor === null,
+      });
+    }
   }
 
   const results: DownloadResult[] = [];
