@@ -217,6 +217,9 @@ export async function runQueryLoop(
     if (parsed.kind === "answer") {
       finalAnswer = parsed.answer;
       finalCitations = parsed.citations;
+      // An explicit value beats prose extraction, and beats a value left over
+      // from an earlier run in the same request: this is the model's final say.
+      if (parsed.value !== undefined) resultValue = parsed.value;
       break;
     }
 

@@ -33,6 +33,7 @@
 
 import { readFileSync } from "node:fs";
 import {
+  boundRunDocument,
   encodeResultFrame,
   runQueryScript,
   type QueryToolContext,
@@ -60,6 +61,12 @@ export interface RunnerInput {
   enforcementNotes: string[];
   maxSteps?: number;
   /**
+   * Ceiling on the encoded result frame. The host sets this below the
+   * sandbox's `maxOutputBytes` so the frame always survives: a frame cut by
+   * the output cap is untrustworthy and costs the run all of its coverage.
+   */
+  frameBudgetBytes?: number;
+  /**
    * Host-authority results precomputed before the run, because `search`,
    * `classify` and `introspect` need authority that must never be inside the
    * sandbox. Absent capabilities throw `CAPABILITY_UNAVAILABLE`, which is an
@@ -71,19 +78,28 @@ export interface RunnerInput {
 declare const __VANA_INPUT__: RunnerInput;
 
 /** Parse one scope file into records. Counting is the ledger's job, not ours. */
-function loadScope(path: string): unknown[] {
+interface LoadedScope {
+  items: unknown[];
+  /** Source bytes on disk, so `bytesScanned` reflects what was actually read. */
+  bytes: number;
+}
+
+function loadScope(path: string): LoadedScope {
   const text = readFileSync(path, "utf8");
   const parsed: unknown = JSON.parse(text);
-  return Array.isArray(parsed) ? parsed : [parsed];
+  return {
+    items: Array.isArray(parsed) ? parsed : [parsed],
+    bytes: Buffer.byteLength(text, "utf8"),
+  };
 }
 
 function buildDeps(input: RunnerInput): QueryToolDeps {
   const byScope = new Map(input.scopes.map((s) => [s.scope, s]));
   // Cache per scope: a script that reads the same scope twice should not pay
   // twice, and more importantly should not be counted twice.
-  const cache = new Map<string, unknown[]>();
+  const cache = new Map<string, LoadedScope>();
 
-  const records = (scope: string): unknown[] => {
+  const load = (scope: string): LoadedScope => {
     const hit = cache.get(scope);
     if (hit) return hit;
     const entry = byScope.get(scope);
@@ -92,6 +108,8 @@ function buildDeps(input: RunnerInput): QueryToolDeps {
     cache.set(scope, loaded);
     return loaded;
   };
+
+  const records = (scope: string): unknown[] => load(scope).items;
 
   return {
     async listScopes(): Promise<ScopeInfo[]> {
@@ -107,7 +125,11 @@ function buildDeps(input: RunnerInput): QueryToolDeps {
     },
 
     async streamScope(scope, onItem) {
-      for (const item of records(scope)) await onItem(item);
+      const { items, bytes } = load(scope);
+      for (const item of items) await onItem(item);
+      // Records are counted by the runtime as they pass through; bytes are the
+      // one quantity only the source knows, so report them here.
+      return bytes;
     },
 
     async readBlocks(scope, opts): Promise<ScriptBlock[]> {
@@ -120,7 +142,16 @@ function buildDeps(input: RunnerInput): QueryToolDeps {
         const size = JSON.stringify(json).length;
         if (bytes + size > limit && out.length > 0) break;
         bytes += size;
-        out.push({ id: `${scope}#${i}`, scope, sizeBytes: size, json });
+        // One block is one record here. Without `itemCount` the runtime's
+        // `recordsRead` sums to zero, which is how a live run reported
+        // `recordsScanned: 0` after reading 8.5MB.
+        out.push({
+          id: `${scope}#${i}`,
+          scope,
+          sizeBytes: size,
+          itemCount: 1,
+          json,
+        });
       }
       return out;
     },
@@ -170,7 +201,9 @@ async function main(): Promise<void> {
     ...(outcome.result ? { result: outcome.result } : {}),
     ...(outcome.error ? { error: outcome.error } : {}),
   };
-  process.stdout.write(encodeResultFrame(doc));
+  process.stdout.write(
+    encodeResultFrame(boundRunDocument(doc, input.frameBudgetBytes)),
+  );
 }
 
 void main().catch((err: unknown) => {

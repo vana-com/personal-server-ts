@@ -152,11 +152,19 @@ export interface ScriptResult {
  */
 export interface QueryToolDeps {
   listScopes(): Promise<ScopeInfo[]>;
-  /** Streams a scope's records. Returning a count the runtime does not trust. */
+  /**
+   * Streams a scope's records.
+   *
+   * May return the number of bytes it read, which the runtime folds into
+   * `bytesScanned`. Records are counted by the runtime as they pass through,
+   * never from anything a deps implementation claims; bytes are the one
+   * quantity only the source can know, so this is the channel for them.
+   * Returning nothing simply leaves `bytesScanned` unchanged.
+   */
   streamScope(
     scope: string,
     onItem: (item: unknown) => void | Promise<void>,
-  ): Promise<void>;
+  ): Promise<void | number>;
   readBlocks(scope: string, opts: ReadOptions): Promise<ScriptBlock[]>;
   search(query: string, opts: SearchOptions): Promise<ScriptHit[]>;
   /**

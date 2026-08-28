@@ -114,10 +114,11 @@ export function createVanaApi(
       spend();
       requireGranted(scope);
       const out: unknown[] = [];
-      await deps.streamScope(scope, (item) => {
+      const bytes = await deps.streamScope(scope, (item) => {
         out.push(item);
       });
       coverage.recordsRead(out.length);
+      if (typeof bytes === "number") coverage.bytesRead(bytes);
       coverage.completeScope(scope);
       return out;
     },
@@ -139,11 +140,12 @@ export function createVanaApi(
       spend();
       requireGranted(scope);
       let n = 0;
-      await deps.streamScope(scope, async (item) => {
+      const bytes = await deps.streamScope(scope, async (item) => {
         await onItem(item, n);
         n++;
       });
       coverage.recordsRead(n);
+      if (typeof bytes === "number") coverage.bytesRead(bytes);
       coverage.completeScope(scope);
       return n;
     },

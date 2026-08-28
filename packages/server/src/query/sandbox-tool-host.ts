@@ -279,6 +279,10 @@ export function createSandboxToolHost(options: SandboxToolHostOptions) {
         })),
         budget,
         ...(callerId === undefined ? {} : { callerId }),
+        // Half the output cap, so the frame always fits with room to spare.
+        // A frame cut by `maxOutputBytes` is untrustworthy and costs the run
+        // every counter it carried, so the notes inside it yield first.
+        frameBudgetBytes: Math.floor(limits.maxOutputBytes / 2),
         enforcementNotes: [] as string[],
         ...(maxSteps === undefined ? {} : { maxSteps }),
         ...(searchResults === undefined ? {} : { searchResults }),

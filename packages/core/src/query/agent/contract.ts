@@ -34,6 +34,15 @@ export interface ParsedAnswer {
   answer: string;
   citations: QueryCitation[];
   confidence?: QueryConfidence;
+  /**
+   * The bare number, when the question has a single numeric answer.
+   *
+   * Without it, grading falls back to pulling the first number out of the
+   * prose, which read "30" out of a sentence about a 30-day window while the
+   * model had computed the average correctly. An explicit value is the
+   * difference between a gradeable answer and a guess about one.
+   */
+  value?: number;
 }
 
 export type ContractViolation =
@@ -43,7 +52,9 @@ export type ContractViolation =
   | "answer-not-json"
   | "answer-not-object"
   | "answer-missing-answer-field"
-  | "answer-bad-citations";
+  | "answer-bad-citations"
+  | "answer-bad-confidence"
+  | "answer-bad-value";
 
 export interface ParseFailure {
   kind: "violation";
@@ -121,10 +132,36 @@ function readCitations(value: unknown): QueryCitation[] | null {
   return out;
 }
 
-function readConfidence(value: unknown): QueryConfidence | undefined {
-  return value === "high" || value === "medium" || value === "low"
-    ? value
-    : undefined;
+/**
+ * `high`/`medium`/`low`, or a 0–1 number bucketed into them.
+ *
+ * Gemini answered `"confidence": 1.0` and it was silently dropped. Silently
+ * discarding a field the model deliberately set is the wrong failure: either
+ * understand it or refuse it. Anything that is neither a known word nor a
+ * number in range returns `null`, which the caller turns into a contract
+ * violation the repair retry can fix.
+ */
+function readConfidence(value: unknown): QueryConfidence | undefined | null {
+  if (value === undefined || value === null) return undefined;
+  if (value === "high" || value === "medium" || value === "low") return value;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    if (value < 0 || value > 1) return null;
+    return value >= 0.75 ? "high" : value >= 0.4 ? "medium" : "low";
+  }
+  return null;
+}
+
+/** A single numeric answer, when the model states one. */
+function readValue(value: unknown): number | undefined | null {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  // A numeric string is a near miss worth accepting; anything else is a
+  // violation rather than a silent drop.
+  if (typeof value === "string" && value.trim() !== "") {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
 }
 
 /**
@@ -207,8 +244,29 @@ export function parseTurn(text: string): ParsedTurn {
     };
   }
   const out: ParsedAnswer = { kind: "answer", answer: rec.answer, citations };
+
   const confidence = readConfidence(rec.confidence);
+  if (confidence === null) {
+    return {
+      kind: "violation",
+      violation: "answer-bad-confidence",
+      detail:
+        '`confidence` must be "high", "medium" or "low" (a number from 0 to 1 is also accepted)',
+    };
+  }
   if (confidence) out.confidence = confidence;
+
+  const value = readValue(rec.value);
+  if (value === null) {
+    return {
+      kind: "violation",
+      violation: "answer-bad-value",
+      detail:
+        "`value` must be a bare number — no units, no thousands separators, no formatting",
+    };
+  }
+  if (value !== undefined) out.value = value;
+
   return out;
 }
 

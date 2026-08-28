@@ -44,8 +44,11 @@ export {
   type RunScriptOptions,
 } from "./interpreter/index.js";
 export {
+  DEFAULT_FRAME_BUDGET_BYTES,
+  NOTES_TRIMMED,
   RESULT_FRAME_BEGIN,
   RESULT_FRAME_END,
+  boundRunDocument,
   decodeResultFrame,
   encodeResultFrame,
   stripResultFrames,

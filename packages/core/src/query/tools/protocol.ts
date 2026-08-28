@@ -73,6 +73,73 @@ export function encodeResultFrame(doc: RunDocument): string {
   return `\n${RESULT_FRAME_BEGIN}${toBase64(JSON.stringify(doc))}${RESULT_FRAME_END}\n`;
 }
 
+/** Default ceiling on an encoded frame when the host supplies no budget. */
+export const DEFAULT_FRAME_BUDGET_BYTES = 64_000;
+
+/** Marker left in `notes` when output was dropped to keep the frame intact. */
+export const NOTES_TRIMMED = "__vana_notes_trimmed__";
+
+/**
+ * Shrink a run document until its encoded frame fits `budgetBytes`.
+ *
+ * Notes are unbounded by construction — `console.log` and `vana.note` both
+ * append, and a model that debugs by printing produces thousands. They travel
+ * *inside* the frame, so an unbounded note list makes an unbounded frame, and a
+ * frame past the sandbox's `maxOutputBytes` is killed mid-write. The host then
+ * sees a truncated frame and correctly refuses to trust any of it, so a chatty
+ * script destroyed all coverage for the run.
+ *
+ * Coverage is never trimmed: it is small, fixed-size and the whole reason the
+ * frame exists. Notes are the only unbounded part, so they yield first, then
+ * the result payload. What is dropped is stated in the notes rather than
+ * silently vanishing — the model must not believe it saw output it did not.
+ */
+export function boundRunDocument(
+  doc: RunDocument,
+  budgetBytes: number = DEFAULT_FRAME_BUDGET_BYTES,
+): RunDocument {
+  const fits = (d: RunDocument): boolean =>
+    encodeResultFrame(d).length <= budgetBytes;
+  if (fits(doc)) return doc;
+
+  // Halve the note list from the middle until it fits: the first notes explain
+  // what the script set out to do and the last carry its conclusion, so keep
+  // both ends and lose the middle.
+  let notes = doc.notes;
+  while (notes.length > 2) {
+    const keep = Math.floor(notes.length / 2);
+    const head = notes.slice(0, Math.ceil(keep / 2));
+    const tail = notes.slice(notes.length - Math.floor(keep / 2));
+    const dropped = notes.length - head.length - tail.length;
+    notes = [
+      ...head,
+      `${NOTES_TRIMMED} ${dropped} note(s) dropped to keep coverage intact`,
+      ...tail,
+    ];
+    if (fits({ ...doc, notes })) return { ...doc, notes };
+    notes = [...head, ...tail];
+  }
+
+  const withoutNotes: RunDocument = {
+    ...doc,
+    notes: [`${NOTES_TRIMMED} all notes dropped to keep coverage intact`],
+  };
+  if (fits(withoutNotes)) return withoutNotes;
+
+  // Still over: the result payload itself is oversized. Keep coverage and an
+  // honest error rather than losing the frame.
+  const stripped: RunDocument = {
+    ...withoutNotes,
+    error: doc.error ?? {
+      code: "RESULT_TOO_LARGE",
+      message:
+        "the script's result exceeded the output budget and was dropped; coverage is still authoritative",
+    },
+  };
+  delete stripped.result;
+  return stripped;
+}
+
 export type DecodeOutcome =
   | { ok: true; doc: RunDocument }
   | { ok: false; reason: "absent" | "truncated" | "malformed" };

@@ -57,7 +57,10 @@ beforeAll(() => {
 
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-function host(searchResults?: Record<string, never[]>) {
+function host(
+  searchResults?: Record<string, never[]>,
+  maxOutputBytes = 1_000_000,
+) {
   return createSandboxToolHost({
     sandbox: createNodeSandbox({ dataRoot }),
     scopes: [{ scope: "oura.sleep", path: sleepPath, itemCount: 3 }],
@@ -68,7 +71,7 @@ function host(searchResults?: Record<string, never[]>) {
       cpuMs: 30_000,
       memoryMb: 512,
       wallClockMs: 60_000,
-      maxOutputBytes: 1_000_000,
+      maxOutputBytes,
     },
     runnerBundlePath: RUNNER,
     ...(searchResults ? { searchResults } : {}),
@@ -150,4 +153,55 @@ describe.skipIf(!supported)("nested execution", () => {
     // though the script terminated cleanly.
     expect(r.coverage.complete).toBe(false);
   }, 120_000);
+
+  it("a chatty script still yields trustworthy coverage", async () => {
+    // Regression for the live-run failure: a script that debugs by printing
+    // used to inflate the frame past `maxOutputBytes`, and a truncated frame
+    // costs the run every counter it had. Notes yield; coverage does not.
+    // 200KB cap, so 5000 notes genuinely overflow the frame and the trimming
+    // path is the thing under test rather than incidentally unused.
+    const r = await host(undefined, 200_000).execute(`
+      const rows = await vana.readAll("oura.sleep");
+      for (let i = 0; i < 5000; i = i + 1) {
+        console.log("debugging row " + i + " padpadpadpadpadpadpadpadpadpadpadpadpad");
+      }
+      vana.result({ answer: "done", value: rows.length });
+    `);
+
+    expect(r.error?.code).not.toBe("COVERAGE_FRAME_MISSING");
+    expect(r.coverage.recordsScanned).toBe(3);
+    expect(r.coverage.scopesScanned).toEqual(["oura.sleep"]);
+    expect(r.coverage.complete).toBe(true);
+    expect(r.result?.value).toBe(3);
+    // And it says the notes were trimmed rather than pretending it printed less.
+    expect(r.notes.join("\n")).toContain("__vana_notes_trimmed__");
+  }, 120_000);
+
+  it("counts both records and bytes on every read path", async () => {
+    // `vana.read` counted bytes but no records, while `readAll`/`stream`
+    // counted records but no bytes. A live run reported `recordsScanned: 0`
+    // after reading 8.5MB, which is exactly the dishonest-looking number the
+    // coverage invariant exists to prevent.
+    const all = await host().execute(`
+      const rows = await vana.readAll("oura.sleep");
+      vana.result({ answer: "x", value: rows.length });
+    `);
+    expect(all.coverage.recordsScanned).toBe(3);
+    expect(all.coverage.bytesScanned).toBeGreaterThan(0);
+
+    const streamed = await host().execute(`
+      let n = 0;
+      await vana.stream("oura.sleep", function () { n = n + 1; });
+      vana.result({ answer: "x", value: n });
+    `);
+    expect(streamed.coverage.recordsScanned).toBe(3);
+    expect(streamed.coverage.bytesScanned).toBeGreaterThan(0);
+
+    const blocks = await host().execute(`
+      const b = await vana.read("oura.sleep");
+      vana.result({ answer: "x", value: b.length });
+    `);
+    expect(blocks.coverage.recordsScanned).toBe(3);
+    expect(blocks.coverage.bytesScanned).toBeGreaterThan(0);
+  }, 180_000);
 });
