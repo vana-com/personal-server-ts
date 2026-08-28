@@ -15,10 +15,12 @@ import { corsMiddleware } from "./middleware/cors.js";
 import { dataRoutes } from "./routes/data.js";
 import { writeSessionRoutes } from "./routes/write-session.js";
 import {
+  createInMemoryWriteProofReplayStore,
   createInMemoryWriteSessionStore,
   type WriteProofReplayStore,
   type WriteSessionStore,
 } from "@opendatalabs/personal-server-ts-core/write";
+import { derivativesRoutes } from "./routes/derivatives.js";
 import { grantsRoutes } from "./routes/grants.js";
 import { accessLogsRoutes } from "./routes/access-logs.js";
 import { syncRoutes } from "./routes/sync.js";
@@ -49,6 +51,10 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
+import type {
+  QuestionStore,
+  RecomputeScheduler,
+} from "@opendatalabs/personal-server-ts-core/derivatives";
 import type {
   DataStoragePort,
   RuntimeAvailabilityPort,
@@ -103,6 +109,14 @@ export interface AppDeps {
   paymentEnabled?: boolean;
   /** Derivative data: gateway lineage access for the data routes. */
   lineageGateway?: LineageGatewayPort;
+  /**
+   * Derivative compute layer (docs/derivative-data-api.md, "Compute").
+   * Absent = /v1/derivatives answers 503 and writes trigger no recompute.
+   */
+  derivativeCompute?: {
+    store: QuestionStore;
+    scheduler: RecomputeScheduler;
+  } | null;
   getTunnelStatus?: HealthDeps["getTunnelStatus"];
   /**
    * Invoked when the /ui/api registration route confirms the server is
@@ -137,9 +151,13 @@ export interface AppDeps {
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
 
-  // One store for mint (POST /v1/write/session) and redeem (data ingest).
+  // One store for mint (POST /v1/write/session) and redeem (data ingest and
+  // derivative question registration), and one replay guard for the proofs
+  // both redeeming routes verify.
   const writeSessionStore =
     deps.writeSessionStore ?? createInMemoryWriteSessionStore();
+  const writeProofReplayStore =
+    deps.writeProofReplayStore ?? createInMemoryWriteProofReplayStore();
 
   // CORS — allow all origins for browser-based clients. Registered first so
   // OPTIONS preflights are answered before any route or auth code runs
@@ -195,8 +213,34 @@ export function createApp(deps: AppDeps): Hono {
       paymentEnabled: deps.paymentEnabled,
       lineageGateway: deps.lineageGateway,
       writeSessionStore,
-      writeProofReplayStore: deps.writeProofReplayStore,
+      writeProofReplayStore,
+      // Recompute on refresh: a new local version of a scope marks every
+      // question that reads it stale.
+      onDataWritten: deps.derivativeCompute
+        ? (event) =>
+            deps.derivativeCompute?.scheduler.markSourceChanged(event.scope)
+        : undefined,
       mountPath: "/v1/data",
+    }),
+  );
+
+  // Derivative compute: question registration + readiness for builders.
+  app.route(
+    "/v1/derivatives",
+    derivativesRoutes({
+      logger: deps.logger,
+      serverOrigin: deps.serverOrigin,
+      serverOwner: deps.serverOwner,
+      gateway: deps.gateway,
+      devToken: deps.devToken,
+      accessToken: deps.accessToken,
+      tokenStore: deps.tokenStore,
+      dataStorage: deps.dataStorage,
+      runtimeAvailability: deps.runtimeAvailability,
+      writeSessionStore,
+      writeProofReplayStore,
+      compute: deps.derivativeCompute ?? null,
+      mountPath: "/v1/derivatives",
     }),
   );
 
