@@ -66,6 +66,15 @@ export const DEFAULTS = {
     // (E2EE v2): the relay only sees ciphertext. Set false only for local
     // development against a provider without ACI attestation.
     e2ee: true,
+    // Extra top-level body fields merged into every chat-completions request.
+    // The default is the Vana / Phala routing hint. Point `baseUrl` at a
+    // different provider (Gemini's OpenAI-compatible layer, say) and this
+    // should be `{}` — the hint means nothing there. Override per deployment,
+    // or with INFERENCE_REQUEST_FIELDS on the Node server.
+    requestFields: { provider: { aci_verified: true, zdr: true } } as Record<
+      string,
+      unknown
+    >,
     // Newest-first items kept per source scope when a prompt is assembled.
     maxSourceItems: 50,
     // Quiet period after a source scope changes before a recompute starts.
@@ -197,6 +206,9 @@ export const ServerConfigSchema = z.object({
       baseUrl: z.url().default(DEFAULTS.inference.baseUrl),
       model: z.string().min(1).default(DEFAULTS.inference.model),
       e2ee: z.boolean().default(DEFAULTS.inference.e2ee),
+      requestFields: z
+        .record(z.string(), z.unknown())
+        .default(DEFAULTS.inference.requestFields),
       maxSourceItems: z
         .number()
         .int()
