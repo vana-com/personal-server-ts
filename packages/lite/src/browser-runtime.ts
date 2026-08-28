@@ -163,11 +163,15 @@ export async function createIndexedDbPsLiteRuntime(
   // Create (or reuse) a shared diagnostics recorder before the sync manager so
   // both share the same recorder instance and events appear in /v1/diagnostics.
   const diagnostics = options.diagnostics ?? new DiagnosticsRecorder();
+  // The one browser request signer: the identity key that registered this
+  // server with the gateway signs the lineage reads and the inference relay
+  // calls with the same Web3Signed scheme.
+  const requestSigner = createRequestSigner(identity.account);
   // Derivative data: lineage reads are signed with the server key and
   // derivatives are registered with their lineage (see core/lineage).
   const lineageGateway = createGatewayLineageClient({
     gatewayUrl: config.gateway.url,
-    requestSigner: createRequestSigner(identity.account),
+    requestSigner,
   });
   let syncManager = options.syncManager ?? null;
   let scopeDeletions = options.scopeDeletions;
@@ -198,6 +202,8 @@ export async function createIndexedDbPsLiteRuntime(
         isAvailable: () => runtimeRef?.isAvailable() ?? Boolean(options.active),
       },
       provider: options.inferenceProvider,
+      // The relay forwards only requests signed as the owner's server.
+      requestSigner,
       logger: options.logger,
     });
   } else if (derivatives === null && options.derivatives === undefined) {

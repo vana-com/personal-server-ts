@@ -1,4 +1,11 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
+import {
+  parseWeb3SignedHeader,
+  verifyWeb3Signed,
+} from "@opendatalabs/vana-sdk/browser";
+import { createRequestSigner } from "../signing/request-signer.js";
+import { createTestWallet } from "../test-utils/index.js";
 import {
   createFakeInferenceProvider,
   createOpenAiCompatibleInferenceProvider,
@@ -275,5 +282,145 @@ describe("createOpenAiCompatibleInferenceProvider with an encryption seam", () =
     await expect(
       provider.chat({ model: "m", messages: [{ role: "user", content: "q" }] }),
     ).rejects.toThrow("no assistant content");
+  });
+});
+
+describe("createOpenAiCompatibleInferenceProvider relay authentication", () => {
+  const signerFor = (wallet: ReturnType<typeof createTestWallet>) =>
+    createRequestSigner({
+      address: wallet.address,
+      publicKey: "0x04" as `0x${string}`,
+      signTypedData: vi.fn(),
+      signMessage: (message: string) => wallet.signMessage(message),
+    });
+
+  const sha256Of = (body: string) =>
+    `sha256:${createHash("sha256").update(body, "utf8").digest("hex")}`;
+
+  it("signs the relay call as the server over the exact bytes it sends", async () => {
+    const wallet = createTestWallet(7);
+    const fetchMock = fetchReplying(completion);
+    const provider = createOpenAiCompatibleInferenceProvider({
+      baseUrl: "https://dp-rpc.example/v1/inference",
+      requestSigner: signerFor(wallet),
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    await provider.chat({
+      model: "z-ai/glm-5.2",
+      messages: [{ role: "user", content: "hello" }],
+    });
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [
+      string,
+      RequestInit,
+    ];
+    expect(url).toBe("https://dp-rpc.example/v1/inference/chat/completions");
+    const header = (init.headers as Headers).get("authorization") ?? "";
+    expect(header.startsWith("Web3Signed ")).toBe(true);
+    const { payload } = parseWeb3SignedHeader(header);
+    expect(payload.aud).toBe("https://dp-rpc.example");
+    expect(payload.method).toBe("POST");
+    expect(payload.uri).toBe("/v1/inference/chat/completions");
+    // The signature is over the bytes on the wire, not over a re-serialization.
+    expect(payload.bodyHash).toBe(sha256Of(init.body as string));
+    // And the gateway's own check passes: signer, claims and body agree.
+    const verified = await verifyWeb3Signed({
+      headerValue: header,
+      expectedOrigin: "https://dp-rpc.example",
+      expectedMethod: "POST",
+      expectedPath: "/v1/inference/chat/completions",
+      bodyBytes: new TextEncoder().encode(init.body as string),
+    });
+    expect(verified.signer.toLowerCase()).toBe(wallet.address.toLowerCase());
+  });
+
+  it("hashes the encrypted body: E2EE runs before the signature", async () => {
+    const wallet = createTestWallet(8);
+    const fetchMock = fetchReplying({
+      choices: [{ message: { content: "ENC(reply)" } }],
+    });
+    const encryption: InferenceRequestEncryption = {
+      async encryptRequest({ messages, headers }) {
+        headers.set("X-E2EE-Version", "2");
+        return {
+          messages: messages.map((m) => ({
+            ...m,
+            content: `ENC(${m.content})`,
+          })),
+          async decryptResponse({ content }) {
+            return content.replace(/^ENC\((.*)\)$/, "$1");
+          },
+        };
+      },
+    };
+    const provider = createOpenAiCompatibleInferenceProvider({
+      baseUrl: "https://dp-rpc.example/v1/inference",
+      requestSigner: signerFor(wallet),
+      encryption,
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    const result = await provider.chat({
+      model: "m",
+      messages: [{ role: "user", content: "hello" }],
+    });
+    expect(result.content).toBe("reply");
+    const [, init] = fetchMock.mock.calls[0] as unknown as [
+      string,
+      RequestInit,
+    ];
+    const sent = init.body as string;
+    expect(JSON.parse(sent).messages).toEqual([
+      { role: "user", content: "ENC(hello)" },
+    ]);
+    const header = (init.headers as Headers).get("authorization") ?? "";
+    expect(parseWeb3SignedHeader(header).payload.bodyHash).toBe(sha256Of(sent));
+    await expect(
+      verifyWeb3Signed({
+        headerValue: header,
+        expectedOrigin: "https://dp-rpc.example",
+        expectedMethod: "POST",
+        expectedPath: "/v1/inference/chat/completions",
+        bodyBytes: new TextEncoder().encode(sent),
+      }),
+    ).resolves.toMatchObject({ signer: wallet.address });
+  });
+
+  it("sends the bearer key and no signature on the direct path", async () => {
+    const fetchMock = fetchReplying(completion);
+    const provider = createOpenAiCompatibleInferenceProvider({
+      apiKey: "sk-local",
+      requestSigner: signerFor(createTestWallet(9)),
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    await provider.chat({ model: "m", messages: [] });
+    const [, init] = fetchMock.mock.calls[0] as unknown as [
+      string,
+      RequestInit,
+    ];
+    expect((init.headers as Headers).get("authorization")).toBe(
+      "Bearer sk-local",
+    );
+  });
+
+  it("fails the request permanently when the signer cannot sign", async () => {
+    const fetchMock = fetchReplying(completion);
+    const provider = createOpenAiCompatibleInferenceProvider({
+      baseUrl: "https://dp-rpc.example/v1/inference",
+      requestSigner: {
+        signRequest: () => Promise.reject(new Error("wallet locked")),
+      },
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    await expect(
+      provider.chat({ model: "m", messages: [] }),
+    ).rejects.toMatchObject({
+      name: "InferenceRequestError",
+      status: null,
+      errorType: "relay_signing_failed",
+      // No retry: a signer that cannot sign will not sign on a second try.
+      retryable: false,
+      message: "inference request could not be signed (Error)",
+    });
+    // Nothing left the server unsigned.
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

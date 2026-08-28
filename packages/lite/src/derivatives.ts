@@ -25,6 +25,7 @@ import {
   type RecomputeScheduler,
 } from "@opendatalabs/personal-server-ts-core/derivatives";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
+import type { RequestSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { PsLiteStateStore } from "./state.js";
 
 const QUESTIONS_KEY = "derivative-questions-v1";
@@ -76,6 +77,12 @@ export interface PsLiteDerivativeComputeOptions {
   runtimeAvailability?: RuntimeAvailabilityPort;
   /** Defaults to the OpenAI-compatible client on `config.inference`. */
   provider?: InferenceProvider;
+  /**
+   * Signs the relay calls (chat completion and attested-key fetch) as this
+   * personal server: the same signer the gateway registration and the
+   * lineage reads use in the browser. Without it the relay answers 401.
+   */
+  requestSigner?: RequestSigner;
   logger?: Logger;
   now?: () => Date;
 }
@@ -102,12 +109,16 @@ export function createPsLiteDerivativeCompute(
     createOpenAiCompatibleInferenceProvider({
       baseUrl: options.config.inference.baseUrl,
       model: options.config.inference.model,
+      // PS-Lite holds no provider key: it always talks to the Vana relay,
+      // which forwards only requests signed as the owner's server.
+      requestSigner: options.requestSigner,
       // E2EE v2 to the Phala gateway (WebCrypto only, so it runs in the
       // browser): the relay sees ciphertext. `inference.e2ee: false` turns
       // it off for local development against a provider without ACI.
       encryption: options.config.inference.e2ee
         ? createPhalaE2eeEncryption({
             baseUrl: options.config.inference.baseUrl,
+            requestSigner: options.requestSigner,
             logger,
           })
         : undefined,

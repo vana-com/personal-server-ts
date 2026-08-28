@@ -18,6 +18,7 @@
  * plaintext. Error messages carry no prompt or answer text.
  */
 
+import type { RequestSigner } from "../../signing/request-signer.js";
 import {
   InferenceRequestError,
   type EncryptedInferenceRequest,
@@ -52,6 +53,12 @@ export const DEFAULT_E2EE_KEY_TTL_MS = 5 * 60_000;
 export interface PhalaE2eeEncryptionOptions {
   /** Chat completions base; the attestation report is fetched through it. */
   baseUrl: string;
+  /**
+   * Signs the attested-key fetch as this personal server, exactly as the
+   * chat completion is signed (see ../inference.ts). Only the fetch from
+   * `baseUrl` is signed; the direct-provider fallback is not.
+   */
+  requestSigner?: RequestSigner;
   fetch?: typeof fetch;
   /** Milliseconds since epoch (default Date.now). */
   clock?: () => number;
@@ -104,6 +111,7 @@ export function createPhalaE2eeEncryption(
   const fetchKey = async (): Promise<GatewayE2eeKey> => {
     const key = await fetchGatewayE2eeKey({
       baseUrl: options.baseUrl,
+      requestSigner: options.requestSigner,
       fetch: options.fetch,
       clock,
       expectedKeyId: options.expectedKeyId,

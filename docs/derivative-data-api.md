@@ -704,7 +704,23 @@ Environment overrides (Node server only): `INFERENCE_BASE_URL`,
 `INFERENCE_MODEL`, `INFERENCE_E2EE` (`false` turns encryption off), and
 `INFERENCE_API_KEY` for local development against a provider directly (sent
 as `Authorization: Bearer`; in production the relay holds the key and the
-Personal Server sends none).
+Personal Server sends no key).
+
+The Personal Server authenticates to the Vana inference relay
+(`POST /v1/inference/chat/completions` on the data gateway) as itself: every
+relay call carries `Authorization: Web3Signed ...`, the same scheme and the
+same request signer the lineage read uses, over `aud` (the relay origin),
+the method, the path, and `bodyHash`, the SHA-256 of the exact body bytes
+sent. The Node server signs with the server key, PS-Lite with the browser
+identity key that registered it; the relay checks that the signer is the
+owner or one of the owner's active registered servers and forwards nothing
+otherwise (401 without a valid signature, 403 without a live registration).
+The attested-key fetch through the relay is signed the same way (GET, no
+body, the nonce inside the signed path); the direct Phala fallback is
+unsigned. `INFERENCE_API_KEY` is the local-development alternative and wins:
+a bearer key means the base URL is a provider, not the relay, so no
+signature is produced. Nothing else about the request changes, and a signer
+that cannot sign fails the compute without sending anything.
 
 PS-Lite never calls a provider directly: with `inference.baseUrl` left at
 the direct-provider default the compute layer stays off and

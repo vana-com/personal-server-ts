@@ -298,10 +298,15 @@ export async function createServer(
   // Derivative data: the gateway lineage client signs lineage reads with the
   // server key (the gateway treats a registered server as the owner's) and
   // registers derivatives with their lineage. Needs the server account.
-  const lineageGateway: LineageGatewayPort | undefined = serverAccount
+  // The one server-key request signer: lineage reads, and the inference
+  // relay calls below, authenticate to the gateway with the same scheme.
+  const requestSigner = serverAccount
+    ? createRequestSigner(serverAccount)
+    : undefined;
+  const lineageGateway: LineageGatewayPort | undefined = requestSigner
     ? createGatewayLineageClient({
         gatewayUrl: config.gateway.url,
-        requestSigner: createRequestSigner(serverAccount),
+        requestSigner,
       })
     : undefined;
 
@@ -332,15 +337,26 @@ export async function createServer(
     process.env.INFERENCE_E2EE !== undefined
       ? process.env.INFERENCE_E2EE !== "false"
       : config.inference.e2ee;
+  // Local development only: production relays hold the provider key. A key
+  // means the base URL is a provider, not the relay, so nothing is signed.
+  const inferenceApiKey = process.env.INFERENCE_API_KEY;
+  // The Vana inference relay only forwards requests signed by the owner or
+  // by one of the owner's active registered servers; this is the same
+  // server-key signer the lineage reads use.
+  const inferenceSigner = inferenceApiKey ? undefined : requestSigner;
   const inferenceProvider =
     options?.inferenceProvider ??
     createOpenAiCompatibleInferenceProvider({
       baseUrl: inferenceBaseUrl,
       model: process.env.INFERENCE_MODEL ?? config.inference.model,
-      // Local development only: production relays hold the provider key.
-      apiKey: process.env.INFERENCE_API_KEY,
+      apiKey: inferenceApiKey,
+      requestSigner: inferenceSigner,
       encryption: inferenceE2ee
-        ? createPhalaE2eeEncryption({ baseUrl: inferenceBaseUrl, logger })
+        ? createPhalaE2eeEncryption({
+            baseUrl: inferenceBaseUrl,
+            requestSigner: inferenceSigner,
+            logger,
+          })
         : undefined,
     });
   if (!inferenceE2ee) {
