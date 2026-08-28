@@ -4,6 +4,12 @@
  * route through unchanged), verify the ACI binding chain structurally, and
  * select the X25519 E2EE key from the quote-bound keyset.
  *
+ * The fetch through the relay carries the same `Authorization: Web3Signed`
+ * header the chat completion does (GET, no body) when a `requestSigner` is
+ * configured, since the relay gates its passthrough routes on the caller
+ * being the owner or an active registered server. The direct Phala fallback
+ * is a different origin with no such gate and stays unsigned.
+ *
  * What is verified here (ACI spec sections 3.1, 3.2, 4, 9.1):
  *   - api_version aci/1, tee_type tdx, service advertises E2EE version 2
  *   - sha256(JCS(workload_keyset)) equals workload_keyset_digest
@@ -21,6 +27,7 @@
  * TODO(e2ee-quote-verification): wire a DCAP quote verifier in the server.
  */
 
+import type { RequestSigner } from "../../signing/request-signer.js";
 import { canonicalJsonBytes } from "./jcs.js";
 import {
   E2EE_ALGO_X25519,
@@ -95,7 +102,8 @@ export type E2eeAttestationErrorCode =
   | "keyset_expired"
   | "e2ee_unsupported"
   | "no_e2ee_key"
-  | "evidence_rejected";
+  | "evidence_rejected"
+  | "request_signing_failed";
 
 /** Carries no request data; safe to log and to surface as a compute error. */
 export class E2eeAttestationError extends Error {
@@ -111,6 +119,11 @@ export class E2eeAttestationError extends Error {
 export interface FetchGatewayE2eeKeyOptions {
   /** Chat completions base, e.g. `https://relay.example/v1`. */
   baseUrl: string;
+  /**
+   * Signs the report fetch from `baseUrl` as this personal server (the relay
+   * gates the passthrough route). Never used for the fallback origin.
+   */
+  requestSigner?: RequestSigner;
   fetch?: typeof fetch;
   /** Milliseconds since epoch (default Date.now). */
   clock?: () => number;
@@ -293,16 +306,46 @@ function attestationUrl(baseUrl: string, nonce: string): string {
   return `${baseUrl.replace(/\/+$/, "")}/aci/attestation?nonce=${nonce}`;
 }
 
+/**
+ * Sign the report fetch as this server. A signer that cannot sign is a
+ * permanent failure: the request is never sent unsigned.
+ */
+async function authorizationFor(
+  signer: RequestSigner,
+  url: URL,
+): Promise<string> {
+  try {
+    return await signer.signRequest({
+      aud: url.origin,
+      method: "GET",
+      // The nonce lives in the query string, so the query is part of the
+      // signed uri: a captured header cannot be replayed for another nonce.
+      uri: `${url.pathname}${url.search}`,
+    });
+  } catch (err) {
+    const name = err instanceof Error ? err.name : "Error";
+    throw new E2eeAttestationError(
+      "request_signing_failed",
+      `attestation request could not be signed (${name})`,
+    );
+  }
+}
+
 async function fetchReport(
   doFetch: typeof fetch,
   url: string,
   timeoutMs: number,
+  requestSigner?: RequestSigner,
 ): Promise<{ status: number; body: unknown }> {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (requestSigner) {
+    headers.Authorization = await authorizationFor(requestSigner, new URL(url));
+  }
   let response: Response;
   try {
     response = await doFetch(url, {
       method: "GET",
-      headers: { Accept: "application/json" },
+      headers,
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (err) {
@@ -347,6 +390,7 @@ export async function fetchGatewayE2eeKey(
     doFetch,
     attestationUrl(source, nonce),
     timeoutMs,
+    options.requestSigner,
   );
   if (
     (fetched.status === 404 || fetched.status === 405) &&
@@ -354,6 +398,8 @@ export async function fetchGatewayE2eeKey(
     fallback.replace(/\/+$/, "") !== source.replace(/\/+$/, "")
   ) {
     source = fallback;
+    // The fallback is the provider's own origin: it takes no server
+    // signature, so the report is fetched from it unsigned.
     fetched = await fetchReport(
       doFetch,
       attestationUrl(source, nonce),

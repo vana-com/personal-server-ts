@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  parseWeb3SignedHeader,
+  verifyWeb3Signed,
+} from "@opendatalabs/vana-sdk/browser";
+import {
   LIVE_ACI_ATTESTATION_CLOCK_S,
   LIVE_ACI_ATTESTATION_NONCE,
   LIVE_ACI_ATTESTATION_REPORT,
@@ -17,6 +21,8 @@ import {
   type AciAttestationReport,
 } from "./attestation.js";
 import { bytesToHex, hexToBytes } from "./suite.js";
+import { createRequestSigner } from "../../signing/request-signer.js";
+import { createTestWallet } from "../../test-utils/index.js";
 
 const liveReport = () =>
   JSON.parse(
@@ -184,6 +190,68 @@ describe("fetchGatewayE2eeKey", () => {
         fallbackBaseUrl: null,
       }),
     ).rejects.toMatchObject({ code: "fetch_failed" });
+  });
+
+  it("signs the fetch through the relay and leaves the fallback unsigned", async () => {
+    const wallet = createTestWallet(11);
+    const seen: Array<{ url: string; authorization: string | null }> = [];
+    const doFetch = (async (
+      input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      const url = String(input);
+      const headers = new Headers(init?.headers);
+      seen.push({ url, authorization: headers.get("authorization") });
+      if (url.startsWith("https://relay.test/")) {
+        return new Response("not found", { status: 404 });
+      }
+      return new Response(JSON.stringify(liveReport()), { status: 200 });
+    }) as unknown as typeof fetch;
+    await fetchGatewayE2eeKey({
+      baseUrl: "https://relay.test/v1/inference",
+      requestSigner: createRequestSigner({
+        address: wallet.address,
+        publicKey: "0x04" as `0x${string}`,
+        signTypedData: vi.fn(),
+        signMessage: (message: string) => wallet.signMessage(message),
+      }),
+      fetch: doFetch,
+      clock: liveClock,
+      random: liveNonceBytes,
+    });
+    const uri = `/v1/inference/aci/attestation?nonce=${LIVE_ACI_ATTESTATION_NONCE}`;
+    const header = seen[0].authorization ?? "";
+    const { payload } = parseWeb3SignedHeader(header);
+    expect(payload.aud).toBe("https://relay.test");
+    expect(payload.method).toBe("GET");
+    // The nonce is inside the signed uri, and a GET has no body to hash.
+    expect(payload.uri).toBe(uri);
+    const verified = await verifyWeb3Signed({
+      headerValue: header,
+      expectedOrigin: "https://relay.test",
+      expectedMethod: "GET",
+      expectedPath: uri,
+    });
+    expect(verified.signer.toLowerCase()).toBe(wallet.address.toLowerCase());
+    // The direct Phala fallback is a different origin with no such gate.
+    expect(seen[1].url.startsWith(PHALA_GATEWAY_BASE_URL)).toBe(true);
+    expect(seen[1].authorization).toBeNull();
+  });
+
+  it("fails closed, and permanently, when the report fetch cannot be signed", async () => {
+    const doFetch = fetchReplying(200, liveReport());
+    await expect(
+      fetchGatewayE2eeKey({
+        baseUrl: "https://relay.test/v1",
+        requestSigner: {
+          signRequest: () => Promise.reject(new Error("wallet locked")),
+        },
+        fetch: doFetch,
+        clock: liveClock,
+        random: liveNonceBytes,
+      }),
+    ).rejects.toMatchObject({ code: "request_signing_failed" });
+    expect(doFetch).not.toHaveBeenCalled();
   });
 
   it("fails closed on transport errors, non-JSON and rejected evidence", async () => {

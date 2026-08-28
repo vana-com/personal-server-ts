@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { verifyWeb3Signed } from "@opendatalabs/vana-sdk/browser";
+import { createRequestSigner } from "../../signing/request-signer.js";
+import { createTestWallet } from "../../test-utils/index.js";
 import { createFakeE2eeGateway } from "../../test-utils/e2ee-gateway.js";
 import {
   InferenceRequestError,
@@ -285,5 +288,76 @@ describe("createPhalaE2eeEncryption", () => {
         headers: new Headers(),
       }),
     ).rejects.toMatchObject({ errorType: "e2ee_invalid_payload_model" });
+  });
+});
+
+describe("createPhalaE2eeEncryption behind the Vana relay", () => {
+  it("signs both the attested-key fetch and the encrypted completion as the server", async () => {
+    const wallet = createTestWallet(12);
+    const requestSigner = createRequestSigner({
+      address: wallet.address,
+      publicKey: "0x04" as `0x${string}`,
+      signTypedData: vi.fn(),
+      signMessage: (message: string) => wallet.signMessage(message),
+    });
+    const gateway = await createFakeE2eeGateway();
+    const sent: Array<{
+      url: string;
+      authorization: string | undefined;
+      body: string | null;
+    }> = [];
+    const recordingFetch = (async (
+      input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      sent.push({
+        url: String(input),
+        authorization:
+          new Headers(init?.headers).get("authorization") ?? undefined,
+        body: typeof init?.body === "string" ? init.body : null,
+      });
+      return gateway.fetch(input, init);
+    }) as unknown as typeof fetch;
+    const provider = createOpenAiCompatibleInferenceProvider({
+      baseUrl: BASE,
+      requestSigner,
+      fetch: recordingFetch,
+      encryption: createPhalaE2eeEncryption({
+        baseUrl: BASE,
+        requestSigner,
+        fetch: recordingFetch,
+      }),
+    });
+    const result = await provider.chat({
+      model: "demo-model",
+      messages: [{ role: "user", content: SECRET }],
+    });
+    expect(JSON.parse(result.content)).toMatchObject({ answer: "fake answer" });
+
+    const attestation = sent.find((call) => call.url.includes("/aci/"))!;
+    const completion = sent.find((call) =>
+      call.url.endsWith("/chat/completions"),
+    )!;
+    const attestationUrl = new URL(attestation.url);
+    // Both calls carry a header the relay verifies as this server.
+    await expect(
+      verifyWeb3Signed({
+        headerValue: attestation.authorization,
+        expectedOrigin: "https://relay.test",
+        expectedMethod: "GET",
+        expectedPath: `${attestationUrl.pathname}${attestationUrl.search}`,
+      }),
+    ).resolves.toMatchObject({ signer: wallet.address });
+    // The signed bodyHash covers the ciphertext, never the prompt.
+    expect(completion.body).not.toContain(SECRET);
+    await expect(
+      verifyWeb3Signed({
+        headerValue: completion.authorization,
+        expectedOrigin: "https://relay.test",
+        expectedMethod: "POST",
+        expectedPath: "/v1/chat/completions",
+        bodyBytes: new TextEncoder().encode(completion.body!),
+      }),
+    ).resolves.toMatchObject({ signer: wallet.address });
   });
 });

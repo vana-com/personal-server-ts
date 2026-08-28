@@ -7,6 +7,16 @@
  * optional API key header exists for local development against a provider
  * directly.
  *
+ * RELAY AUTH: the Vana inference relay
+ * (`POST /v1/inference/chat/completions` on the data gateway) only forwards
+ * a request that is signed by the owner or by one of the owner's ACTIVE
+ * registered servers, with the same Web3Signed scheme the lineage read uses
+ * (`RequestSigner`, see ../signing/request-signer.ts). Pass `requestSigner`
+ * and every relay call carries `Authorization: Web3Signed ...` over the
+ * exact bytes that go on the wire. `apiKey` is the local-development
+ * alternative (direct provider, `Authorization: Bearer`) and wins when both
+ * are set: a bearer key means "not the relay".
+ *
  * E2EE SEAM: the Phala confidential-inference E2EE v2 protocol encrypts each
  * `messages[i].content` to the gateway's attested public key and adds the
  * headers X-E2EE-Version, X-Client-Pub-Key, X-Model-Pub-Key, X-E2EE-Nonce
@@ -15,6 +25,8 @@
  * by `createPhalaE2eeEncryption` in ./e2ee. This module only knows the
  * shape: encrypt the outgoing messages, decrypt the one response field.
  */
+
+import type { RequestSigner } from "../signing/request-signer.js";
 
 export type InferenceRole = "system" | "user" | "assistant";
 
@@ -103,6 +115,12 @@ export interface OpenAiCompatibleInferenceOptions {
   baseUrl?: string;
   /** Local development only; production relays hold the key. */
   apiKey?: string;
+  /**
+   * Signs every request to the Vana inference relay as this personal server
+   * (the same signer the lineage client uses). Ignored when `apiKey` is set,
+   * which means the base URL is a provider, not the relay.
+   */
+  requestSigner?: RequestSigner;
   model?: string;
   timeoutMs?: number;
   fetch?: typeof fetch;
@@ -201,6 +219,27 @@ async function readErrorType(response: Response): Promise<string | null> {
   return null;
 }
 
+/**
+ * Sign one relay request. A signer that cannot sign (locked key, wallet
+ * gone) is a permanent failure: the request is never sent unsigned, and the
+ * compute layer must not retry it into a storm.
+ */
+async function signOrThrow(
+  signer: RequestSigner,
+  params: { aud: string; method: string; uri: string; body?: Uint8Array },
+): Promise<string> {
+  try {
+    return await signer.signRequest(params);
+  } catch (err) {
+    const name = err instanceof Error ? err.name : "Error";
+    throw new InferenceRequestError(
+      `inference request could not be signed (${name})`,
+      null,
+      { errorType: "relay_signing_failed", retryable: false },
+    );
+  }
+}
+
 export function createOpenAiCompatibleInferenceProvider(
   options: OpenAiCompatibleInferenceOptions = {},
 ): InferenceProvider {
@@ -215,6 +254,10 @@ export function createOpenAiCompatibleInferenceProvider(
     options.requestFields ?? DEFAULT_INFERENCE_REQUEST_FIELDS;
 
   const encryption = options.encryption;
+  // A bearer key means the base URL is a provider, not the relay: the relay
+  // never takes one, so the key wins and no signature is produced.
+  const requestSigner = options.apiKey ? undefined : options.requestSigner;
+  const chatUrl = new URL(`${base}/chat/completions`);
 
   /** One send; `rejected` reports a non-2xx so the caller may retry once. */
   async function send(
@@ -244,12 +287,26 @@ export function createOpenAiCompatibleInferenceProvider(
       messages,
       max_tokens: input.maxTokens ?? DEFAULT_INFERENCE_MAX_TOKENS,
     };
+    // Serialized ONCE, after encryption: the bytes that are hashed into the
+    // signature are the bytes that go on the wire (ciphertext included).
+    const payload = JSON.stringify(body);
+    if (requestSigner) {
+      headers.set(
+        "Authorization",
+        await signOrThrow(requestSigner, {
+          aud: chatUrl.origin,
+          method: "POST",
+          uri: `${chatUrl.pathname}${chatUrl.search}`,
+          body: new TextEncoder().encode(payload),
+        }),
+      );
+    }
     let response: Response;
     try {
-      response = await doFetch(`${base}/chat/completions`, {
+      response = await doFetch(chatUrl.toString(), {
         method: "POST",
         headers,
-        body: JSON.stringify(body),
+        body: payload,
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (err) {
