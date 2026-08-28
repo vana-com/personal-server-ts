@@ -131,6 +131,20 @@ export interface PersonalServerWriteAuthResult {
   releaseProof?: () => Promise<void>;
 }
 
+/**
+ * Result of recognizing a delegated caller WITHOUT a scope to authorize
+ * against (see `authorizeWriteSession`). Identity only: no grant policy has
+ * been evaluated, so this must never gate access to data — it exists so a
+ * route can tell "a builder is calling" from "nobody is authenticated" and
+ * answer 404 / 400 instead of a misleading 401.
+ */
+export interface PersonalServerWriteSessionResult {
+  builder: `0x${string}`;
+  grantId: string;
+  /** Rolls back the per-call proof reservation; see the write result. */
+  releaseProof?: () => Promise<void>;
+}
+
 export interface PersonalServerReadFulfillment {
   builder: string;
   fileId?: string;
@@ -164,6 +178,18 @@ export interface PersonalServerApiAuthPort {
   authorizeWrite?(
     input: PersonalServerWriteAuthInput,
   ): Promise<PersonalServerWriteAuthResult | void>;
+  /**
+   * Recognize a live write session (bearer + `X-Vana-Write-Signature` proof)
+   * WITHOUT authorizing a scope. Optional, and identity only: routes use it
+   * where there is no scope to authorize against yet — an unknown question
+   * id, or a builder list call missing its `?derivedScope=` — so the answer
+   * is 404 / 400 rather than the owner gate's 401, which would send every
+   * client with a re-handshake-on-401 policy through a pointless handshake.
+   * Returns void when the request carries no write-session credential.
+   */
+  authorizeWriteSession?(
+    request: Request,
+  ): Promise<PersonalServerWriteSessionResult | void>;
 }
 
 export interface PersonalServerApiLogger {

@@ -15,7 +15,10 @@ import {
 } from "./attribution.js";
 import { buildBinaryEnvelopeData, sha256Hex } from "../contracts/binary.js";
 import { LINEAGE_KEY, stampLineage } from "../lineage/lineage.js";
-import { createInMemoryWriteProofReplayStore } from "./session.js";
+import {
+  createInMemoryWriteProofReplayStore,
+  type WriteProofReplayStore,
+} from "./session.js";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
@@ -381,6 +384,184 @@ describe("verifyWriterAttribution", () => {
       serverOrigin: SERVER_ORIGIN,
     });
     expect(attribution.bodyHash).toMatch(/^sha256:/);
+  });
+});
+
+describe("verifyWriterAttribution request uri binding", () => {
+  const LIST = "/v1/derivatives/questions";
+
+  /**
+   * A read call on the question API: no body, and the proof signs whatever
+   * uri the caller decided to sign.
+   */
+  async function readRequest(params: {
+    signedUri: string;
+    requestUri: string;
+    method?: string;
+    contentType?: string;
+    nonce?: unknown;
+    iat?: number;
+  }): Promise<Request> {
+    const method = params.method ?? "GET";
+    const headers: Record<string, string> = {
+      Authorization: "Bearer vana_write_sessiontoken",
+      [WRITE_SIGNATURE_HEADER]: await buildWeb3SignedHeader({
+        wallet: builderWallet,
+        aud: SERVER_ORIGIN,
+        method,
+        uri: params.signedUri,
+        grantId: GRANT_ID,
+        ...(params.nonce === undefined ? {} : { nonce: params.nonce }),
+        ...(params.iat === undefined ? {} : { iat: params.iat }),
+      }),
+    };
+    if (params.contentType) headers["Content-Type"] = params.contentType;
+    return new Request(`${SERVER_ORIGIN}${params.requestUri}`, {
+      method,
+      headers,
+    });
+  }
+
+  function verify(request: Request, replayStore?: WriteProofReplayStore) {
+    return verifyWriterAttribution({
+      request,
+      builderAddress: builderWallet.address,
+      grantId: GRANT_ID,
+      serverOrigin: SERVER_ORIGIN,
+      ...(replayStore ? { replayStore } : {}),
+    });
+  }
+
+  it("refuses a proof signed for one derived scope on a request for another", async () => {
+    // The list route authorizes the caller against ?derivedScope=, so the
+    // proof that authorized a list on coach.weekly must not authorize the
+    // same call on spine.summary.
+    const header = await buildWeb3SignedHeader({
+      wallet: builderWallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: `${LIST}?derivedScope=coach.weekly`,
+      grantId: GRANT_ID,
+    });
+    const send = (query: string) =>
+      verify(
+        new Request(`${SERVER_ORIGIN}${LIST}?derivedScope=${query}`, {
+          headers: {
+            Authorization: "Bearer vana_write_sessiontoken",
+            [WRITE_SIGNATURE_HEADER]: header,
+          },
+        }),
+      );
+    await expect(send("coach.weekly")).resolves.toMatchObject({
+      builder: builderWallet.address,
+    });
+    await expect(send("spine.summary")).rejects.toMatchObject({
+      code: 401,
+      errorCode: "WRITE_ATTRIBUTION_INVALID",
+    });
+  });
+
+  it("refuses a proof that signed only the bare path of a query request", async () => {
+    const request = await readRequest({
+      signedUri: LIST,
+      requestUri: `${LIST}?derivedScope=coach.weekly`,
+    });
+    await expect(verify(request)).rejects.toMatchObject({
+      errorCode: "WRITE_ATTRIBUTION_INVALID",
+    });
+  });
+
+  it("accepts the matching query whatever order the client signed it in", async () => {
+    const matching = await readRequest({
+      signedUri: `${LIST}?derivedScope=coach.weekly`,
+      requestUri: `${LIST}?derivedScope=coach.weekly`,
+    });
+    await expect(verify(matching)).resolves.toMatchObject({
+      builder: builderWallet.address,
+    });
+
+    const reordered = await readRequest({
+      signedUri: `${LIST}?derivedScope=coach.weekly&at=2026-08-27`,
+      requestUri: `${LIST}?at=2026-08-27&derivedScope=coach.weekly`,
+    });
+    await expect(verify(reordered)).resolves.toMatchObject({
+      builder: builderWallet.address,
+    });
+  });
+
+  it("leaves a request with no query string signing the bare path", async () => {
+    const request = await readRequest({
+      signedUri: `${LIST}/q-1`,
+      requestUri: `${LIST}/q-1`,
+    });
+    await expect(verify(request)).resolves.toMatchObject({
+      builder: builderWallet.address,
+    });
+  });
+
+  it("verifies a bodyless method whatever Content-Type it carries", async () => {
+    // isJsonContentType treats a missing header as JSON; a bodyless method
+    // must not be pushed down either the binary-representation path or the
+    // canonical-JSON check because of a stray header.
+    const request = await readRequest({
+      signedUri: `${LIST}/q-1`,
+      requestUri: `${LIST}/q-1`,
+      method: "DELETE",
+      contentType: "application/octet-stream",
+    });
+    await expect(verify(request)).resolves.toMatchObject({
+      builder: builderWallet.address,
+    });
+  });
+
+  it("lets a nonce make two identical polls distinct, and refuses a re-used one", async () => {
+    const replayStore = createInMemoryWriteProofReplayStore();
+    const iat = Math.floor(Date.now() / 1000);
+    const poll = (nonce: string, at = iat) =>
+      readRequest({
+        signedUri: `${LIST}/q-1`,
+        requestUri: `${LIST}/q-1`,
+        nonce,
+        iat: at,
+      });
+
+    // Same second, same request: byte-identical without a nonce.
+    const noNonce = await readRequest({
+      signedUri: `${LIST}/q-1`,
+      requestUri: `${LIST}/q-1`,
+      iat,
+    });
+    await expect(verify(noNonce.clone(), replayStore)).resolves.toBeTruthy();
+    await expect(verify(noNonce, replayStore)).rejects.toMatchObject({
+      errorCode: "WRITE_ATTRIBUTION_REPLAY",
+    });
+
+    // With a fresh nonce each poll goes through.
+    await expect(verify(await poll("n-1"), replayStore)).resolves.toBeTruthy();
+    await expect(verify(await poll("n-2"), replayStore)).resolves.toBeTruthy();
+
+    // The nonce itself is single use: re-using it is a replay even though
+    // the rest of the payload changed.
+    await expect(
+      verify(await poll("n-1", iat + 1), replayStore),
+    ).rejects.toMatchObject({
+      code: 401,
+      errorCode: "WRITE_ATTRIBUTION_REPLAY",
+    });
+  });
+
+  it("refuses a nonce claim that is not a bounded string", async () => {
+    for (const nonce of [42, "", "x".repeat(129)]) {
+      const request = await readRequest({
+        signedUri: `${LIST}/q-1`,
+        requestUri: `${LIST}/q-1`,
+        nonce,
+      });
+      await expect(verify(request)).rejects.toMatchObject({
+        code: 401,
+        errorCode: "WRITE_ATTRIBUTION_INVALID",
+      });
+    }
   });
 });
 
