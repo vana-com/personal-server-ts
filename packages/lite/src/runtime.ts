@@ -33,6 +33,11 @@ import {
   type PersonalServerReadAuthResult,
   type PersonalServerReadFulfillmentReporter,
 } from "@opendatalabs/personal-server-ts-core/api";
+import {
+  handlePersonalServerDerivativesRequest,
+  type QuestionStore,
+  type RecomputeScheduler,
+} from "@opendatalabs/personal-server-ts-core/derivatives";
 import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
 import {
   verifyDataReadPolicy,
@@ -142,6 +147,11 @@ export interface PsLiteRuntimeOptions {
    * lookups on write, signed lineage read, cascade delete walk).
    */
   lineageGateway?: LineageGatewayPort;
+  /**
+   * Derivative compute layer (store + scheduler). Omit to leave
+   * /v1/derivatives answering 503; see createPsLiteDerivativeCompute.
+   */
+  derivatives?: { store: QuestionStore; scheduler: RecomputeScheduler } | null;
   accessToken?: string;
   tokenStore?: PsLiteTokenStore;
   stateCapabilities?: Partial<PsLiteRuntimeStateCapabilities>;
@@ -769,10 +779,12 @@ export function createPsLiteRuntime(
     activate() {
       active = true;
       options.syncManager?.start?.();
+      options.derivatives?.scheduler.start();
     },
     deactivate() {
       active = false;
       void options.syncManager?.stop?.();
+      options.derivatives?.scheduler.stop();
     },
     isAvailable() {
       return active;
@@ -920,8 +932,26 @@ export function createPsLiteRuntime(
               serverOwner: options.serverOwner,
               serverSigner: x402ServerSigner,
               lineageGateway: options.lineageGateway,
+              // Recompute on refresh: a new local version marks every
+              // question that reads the scope stale.
+              onDataWritten: options.derivatives
+                ? (event) =>
+                    options.derivatives?.scheduler.markSourceChanged(
+                      event.scope,
+                      { lineageSources: event.lineageSources },
+                    )
+                : undefined,
             },
             { basePath: dataPrefix },
+          );
+        }
+
+        const derivativesPrefix = "/v1/derivatives";
+        if (url.pathname.startsWith(`${derivativesPrefix}/`)) {
+          return handlePersonalServerDerivativesRequest(
+            request,
+            { auth, compute: options.derivatives ?? null, now },
+            { basePath: derivativesPrefix },
           );
         }
 

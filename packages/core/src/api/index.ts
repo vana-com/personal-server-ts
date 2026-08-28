@@ -115,6 +115,13 @@ export interface PersonalServerWriteAuthInput {
 export interface PersonalServerWriteAuthResult {
   builder: `0x${string}`;
   grantId: string;
+  /**
+   * The live grant's scope entries (read entries bare, write entries
+   * `write:`-prefixed). Consumers that need more than the write permission
+   * (the derivative compute layer checks read coverage of source scopes)
+   * fail closed when this is absent.
+   */
+  grantScopes?: string[];
   attribution: WriterAttribution;
   /**
    * Rolls back the per-write proof reservation (replay guard). The handler
@@ -262,6 +269,18 @@ export interface PersonalServerDataApiDeps {
    * only cite local scopes and the lineage read answers 503.
    */
   lineageGateway?: LineageGatewayPort;
+  /**
+   * Called after a write is committed (owner or builder, JSON or binary).
+   * The derivative compute layer uses it to mark questions that read the
+   * scope stale (recompute on refresh). Best-effort: a throwing hook is
+   * swallowed, the write already succeeded.
+   */
+  onDataWritten?: (event: {
+    scope: string;
+    collectedAt: string;
+    /** The stamped `$lineage.sources` of the written record, if any. */
+    lineageSources?: string[];
+  }) => void;
 }
 
 export interface PersonalServerAccessLogsApiDeps {
@@ -737,6 +756,24 @@ function apiLoggerAsLogger(logger: PersonalServerApiLogger | undefined) {
         message ?? "",
       ),
   };
+}
+
+function notifyDataWritten(
+  deps: Pick<PersonalServerDataApiDeps, "onDataWritten" | "logger">,
+  event: { scope: string; collectedAt: string; lineageSources?: string[] },
+): void {
+  if (!deps.onDataWritten) return;
+  try {
+    deps.onDataWritten(event);
+  } catch (err) {
+    deps.logger?.warn?.(
+      {
+        scope: event.scope,
+        error: err instanceof Error ? err.message : String(err),
+      },
+      "onDataWritten hook failed; record already stored",
+    );
+  }
 }
 
 function notifyNewData(
@@ -1307,6 +1344,11 @@ export async function handlePersonalServerDataRequest(
           );
           await logBuilderWrite();
           notifyNewData(deps.syncManager);
+          notifyDataWritten(deps, {
+            scope: scopeResult.scope,
+            collectedAt: collectedAtValue,
+            lineageSources: lineage?.sources,
+          });
           return jsonResponse(result.response, { status: 201 });
         }
 
@@ -1347,6 +1389,11 @@ export async function handlePersonalServerDataRequest(
         );
         await logBuilderWrite();
         notifyNewData(deps.syncManager);
+        notifyDataWritten(deps, {
+          scope: scopeResult.scope,
+          collectedAt: collectedAtValue,
+          lineageSources: lineage?.sources,
+        });
         return jsonResponse(result.response, { status: 201 });
       } catch (err) {
         // An envelope that reached storage before indexing failed is

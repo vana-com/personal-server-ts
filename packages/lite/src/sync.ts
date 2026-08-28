@@ -29,7 +29,10 @@ import {
   deriveMasterKey,
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
-import type { DownloadDiagnosticsHook } from "@opendatalabs/personal-server-ts-core/sync";
+import type {
+  DownloadDiagnosticsHook,
+  DownloadWorkerDeps,
+} from "@opendatalabs/personal-server-ts-core/sync";
 import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
 import type { PsLiteStateStore } from "./state.js";
 import { resolvePsLiteOwner } from "./owner-binding.js";
@@ -75,6 +78,8 @@ export interface PsLiteSyncOptions {
   logger?: Logger;
   /** Registers derivatives (envelopes carrying `$lineage`) with their lineage. */
   lineageGateway?: Pick<LineageGatewayPort, "registerDataPoint">;
+  /** Post-index download hook (derivative recompute on refresh). */
+  onDataPointIndexed?: DownloadWorkerDeps["onDataPointIndexed"];
 }
 
 function createBrowserLogger(logger?: Logger): Logger {
@@ -277,6 +282,7 @@ export async function createPsLiteSyncManager(
       diagnostics: downloadDiagnostics,
       dataPointFeed,
       scopeDeletions,
+      onDataPointIndexed: options.onDataPointIndexed,
     },
     {
       deleteData,

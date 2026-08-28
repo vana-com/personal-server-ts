@@ -96,6 +96,12 @@ export interface DataRouteDeps {
    * can only cite local scopes; lineage read / cascade answer 503 / 501.
    */
   lineageGateway?: LineageGatewayPort;
+  /** Post-commit write hook (derivative recompute on refresh). */
+  onDataWritten?: (event: {
+    scope: string;
+    collectedAt: string;
+    lineageSources?: string[];
+  }) => void;
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
 }
 
@@ -141,6 +147,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         gatewayUrl: deps.gatewayUrl,
         paymentEnabled: deps.paymentEnabled,
         lineageGateway: deps.lineageGateway,
+        onDataWritten: deps.onDataWritten,
         // Network identifier for the 402 challenge body. We use the chain
         // id as the convention since the gateway is chain-scoped; clients
         // dispatch on the (scheme, chainId) pair, not the human name.

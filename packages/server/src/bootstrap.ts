@@ -57,6 +57,14 @@ import { migrateLocalState } from "./migrations/local-state.js";
 import { createTokenStore, type TokenStore } from "./token-store.js";
 import { TunnelManager, ensureFrpcBinary } from "./tunnel/index.js";
 import { createNodeDataStorage } from "./storage/node-data-storage.js";
+import { createSqliteQuestionStore } from "./storage/question-store.js";
+import {
+  computeQuestion,
+  createOpenAiCompatibleInferenceProvider,
+  createRecomputeScheduler,
+  type InferenceProvider,
+  type RecomputeScheduler,
+} from "@opendatalabs/personal-server-ts-core/derivatives";
 
 export interface ServerContext {
   app: Hono;
@@ -82,6 +90,13 @@ export interface ServerContext {
 
 export interface CreateServerOptions {
   rootPath?: string;
+  /**
+   * Inference provider for the derivative compute layer. Defaults to the
+   * OpenAI-compatible client on `config.inference` (env overrides:
+   * INFERENCE_BASE_URL, INFERENCE_MODEL, INFERENCE_API_KEY). Tests inject
+   * a fake.
+   */
+  inferenceProvider?: InferenceProvider;
   /** @deprecated Use rootPath instead. */
   serverDir?: string;
   dataDir?: string;
@@ -304,6 +319,51 @@ export async function createServer(
     logger,
   });
 
+  // --- Derivative compute (question -> derivative) ---
+  // The scheduler exists before the sync manager so downloads can mark
+  // questions stale; it reaches the sync manager lazily to upload results.
+  const questionStore = createSqliteQuestionStore(db);
+  const inferenceProvider =
+    options?.inferenceProvider ??
+    createOpenAiCompatibleInferenceProvider({
+      baseUrl: process.env.INFERENCE_BASE_URL ?? config.inference.baseUrl,
+      model: process.env.INFERENCE_MODEL ?? config.inference.model,
+      // Local development only: production relays hold the provider key.
+      apiKey: process.env.INFERENCE_API_KEY,
+    });
+  const derivativeScheduler: RecomputeScheduler = createRecomputeScheduler({
+    store: questionStore,
+    debounceMs: config.inference.recomputeDebounceMs,
+    serverOwner,
+    logger,
+    compute: (questionId) =>
+      computeQuestion(questionId, {
+        // A -> B -> C: a question reading this derived scope recomputes.
+        onDerivedWritten: (event) =>
+          derivativeScheduler.markSourceChanged(event.scope, {
+            lineageSources: event.lineageSources,
+          }),
+        storage: dataStorage,
+        store: questionStore,
+        provider: inferenceProvider,
+        serverOwner,
+        maxSourceItems: config.inference.maxSourceItems,
+        syncManager: {
+          notifyNewData: () => syncManager?.notifyNewData(),
+        },
+        scopeDeletions,
+        writePolicyPorts: {
+          authSessionVerifier: gatewayClient,
+          grantVerifier: gatewayClient,
+        },
+        logger,
+      }),
+  });
+  const derivativeCompute = {
+    store: questionStore,
+    scheduler: derivativeScheduler,
+  };
+
   if (
     config.sync.enabled &&
     masterKeySignature &&
@@ -346,6 +406,13 @@ export async function createServer(
       logger,
       dataPointFeed,
       scopeDeletions,
+      onDataPointIndexed: (event: {
+        scope: string;
+        lineageSources?: string[];
+      }) =>
+        derivativeScheduler.markSourceChanged(event.scope, {
+          lineageSources: event.lineageSources,
+        }),
     };
 
     // Durable deletion: gateway tombstone signed with the same server
@@ -454,6 +521,7 @@ export async function createServer(
     paymentEnabled: config.payment.enabled,
     gatewayUrl: config.gateway.url,
     lineageGateway,
+    derivativeCompute,
     config,
     accessLogWriter,
     accessLogReader,
@@ -477,6 +545,7 @@ export async function createServer(
   const cleanup = async () => {
     backgroundClosed = true;
     clearRegistrationPoll();
+    derivativeScheduler.stop();
     if (tunnelManager) {
       await tunnelManager.stop();
     }

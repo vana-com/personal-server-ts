@@ -169,6 +169,7 @@ export function createServerApiAuth(
         return {
           builder: session.builderAddress,
           grantId: grant.id,
+          grantScopes: grant.scopes ?? [],
           attribution,
           releaseProof,
         };
