@@ -280,21 +280,56 @@ Minimum tool set: `listScopes()`, `readScope(scope, opts)`,
 `searchScopes(query, scopes)` (reuse `packages/core/src/mcp/search`, do not
 duplicate it — PR #231's mistake), `recordCitation(...)`, `reportCoverage(...)`.
 
+**BUILT 2026-08-28, and it is stronger than "registered tools".** The tool set
+shipped is the prompt-contract §3 `vana.*` API, and the confinement is a real
+acorn-parsed tree-walking evaluator, not a registry over native execution — see
+the corrected §1 of `260828-query-layer-prompt.md` for why native execution in
+the subprocess was unsound. Verified by phase 4b's own suite plus 22
+independent orchestrator escape attempts committed at
+`packages/core/src/query/tools/orchestrator-escape.test.ts` (Reflect, a Proxy
+get trap, an error-stack constructor walk, the Symbol registry, async and
+generator function constructors, and a sloppy-mode `this` alias to
+`globalThis`) — all refused.
+
+Boundary: `scopes`, `readAll`, `read`, `stream`, `note` and `result` run
+in-process inside the confined evaluator; `search`, `classify` and `introspect`
+are bridged to host authority and are called O(1)–O(few) times, so the round
+trip is irrelevant.
+
+**A new dependency:** `acorn` (MIT, browser-safe) is now a real dependency of
+`packages/core`. It was initially a phantom — imported but undeclared,
+resolving only via root hoisting, which would have broken a published install.
+
 ---
 
 ### Phase 5 — Agent loop
 
 `packages/core/src/query/agent/`
 
-**Default:** `@earendil-works/pi-agent-core` + `@earendil-works/pi-ai` (MIT,
-in-process, ~2MB, arbitrary `baseUrl` + model as a first-class feature; already
-the LLM layer under DeepSeek's harness). Point it at the existing
-`inference.baseUrl`/`model` config — do not introduce a second inference path,
-and keep the `aci_verified`/`zdr` provider flags and receipt passthrough
-(`x-receipt-id`, `x-aci-identity`).
+**DECIDED 2026-08-28 (phase 5): our own loop, against the existing
+`InferenceProvider`. Not pi, and not `@ai-sdk/openai-compatible` either.**
 
-**Fallback:** our own loop, ~200–500 lines against `@ai-sdk/openai-compatible`,
-if pi's abstractions fight the grant model.
+The plan's own rule settled it — _do not introduce a second inference path_.
+`packages/core/src/derivatives/inference.ts` already carries E2EE field
+encryption, Web3Signed relay auth, `bodyHash`-over-post-encryption-bytes
+signing, receipt passthrough and an `onRejected` retry seam. **`pi-ai` is a
+second inference path.** Routing through it means either bypassing all of that
+or reimplementing it inside pi's provider abstraction — more work than the loop
+itself, and a duplicate of a security-critical file. Separately, most of
+pi-agent-core's value (tool registry, sessions, compaction, the `ExecutionEnv`
+shell) is built around wire tool-calling, which E2EE rules out. The result adds
+**zero new dependencies**.
+
+**pi's browser-safety question has evidence** (plan §6 open item, _not_ closed):
+`pi-agent-core` bundles clean for `platform:"browser"` — 540KB, zero `node:`
+refs — and `pi-ai`'s `node:fs/promises` / `node:os` hits are genuine dynamic
+imports on the OAuth file-credential path. §4.4's claim checks out. pi remains
+viable if the harness choice is ever reopened; it was rejected on the
+inference-path argument, not on portability.
+
+Original text, kept for the record: the default was
+`@earendil-works/pi-agent-core` + `@earendil-works/pi-ai`, with our own
+~200–500 line loop on `@ai-sdk/openai-compatible` as the fallback.
 
 **E2EE vs tool-calling — decided.** Since the design snapshot, `3a21eb3` landed
 Phala E2EE v2 (`inference.e2ee`, **default true**; `INFERENCE_E2EE=false`

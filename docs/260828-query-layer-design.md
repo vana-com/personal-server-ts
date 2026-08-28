@@ -793,6 +793,16 @@ It has no confirmed CPU/memory limits, so pair it with `isolated-vm` or
 `quickjs-emscripten` for resource-capped execution of the generated code
 itself.
 
+**Superseded for the Node path, 2026-08-28 (phases 4a and 4b).** Neither second
+JS engine is needed. Phase 4a confirmed from source that `sandbox-runtime`
+enforces access control only — it never spawns the process, so it could not
+impose limits even in principle — and covered the gap with `RLIMIT_CPU`,
+`RLIMIT_NPROC` and an out-of-process RSS watchdog (macOS rejects `RLIMIT_AS`
+outright and silently ignores `RLIMIT_DATA`). Phase 4b then replaced native
+execution of generated code with a tree-walking interpreter carrying its own
+step budget. Between them the caps are covered without embedding another
+engine. `quickjs-emscripten` remains the right answer for PS-Lite.
+
 Ruled out: **vm2** (unsafe for untrusted code per its own README),
 **Pyodide-in-Deno** (mcp-run-python's own maintainers state it "was not
 designed as a sandbox" and Python can escape to arbitrary JS), and
