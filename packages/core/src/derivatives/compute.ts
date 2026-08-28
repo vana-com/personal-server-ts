@@ -98,12 +98,15 @@ export type ComputeOutcome =
 
 const DEFAULT_RETRY_DELAYS_MS: readonly number[] = [1_000, 4_000];
 
-/** Transient: no response, rate limited or a provider-side failure. */
+/**
+ * Transient: no response, rate limited or a provider-side failure. An
+ * explicit `retryable` hint (E2EE key verification or decryption failures
+ * are permanent) wins over the status rule.
+ */
 function isRetryableInferenceError(err: unknown): boolean {
-  return (
-    err instanceof InferenceRequestError &&
-    (err.status === null || err.status === 429 || err.status >= 500)
-  );
+  if (!(err instanceof InferenceRequestError)) return false;
+  if (err.retryable !== undefined) return err.retryable;
+  return err.status === null || err.status === 429 || err.status >= 500;
 }
 
 /**

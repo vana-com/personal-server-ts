@@ -61,6 +61,7 @@ import { createSqliteQuestionStore } from "./storage/question-store.js";
 import {
   computeQuestion,
   createOpenAiCompatibleInferenceProvider,
+  createPhalaE2eeEncryption,
   createRecomputeScheduler,
   type InferenceProvider,
   type RecomputeScheduler,
@@ -323,14 +324,31 @@ export async function createServer(
   // The scheduler exists before the sync manager so downloads can mark
   // questions stale; it reaches the sync manager lazily to upload results.
   const questionStore = createSqliteQuestionStore(db);
+  const inferenceBaseUrl =
+    process.env.INFERENCE_BASE_URL ?? config.inference.baseUrl;
+  // E2EE to the Phala gateway is on unless config or INFERENCE_E2EE=false
+  // turns it off (local development against a provider without ACI).
+  const inferenceE2ee =
+    process.env.INFERENCE_E2EE !== undefined
+      ? process.env.INFERENCE_E2EE !== "false"
+      : config.inference.e2ee;
   const inferenceProvider =
     options?.inferenceProvider ??
     createOpenAiCompatibleInferenceProvider({
-      baseUrl: process.env.INFERENCE_BASE_URL ?? config.inference.baseUrl,
+      baseUrl: inferenceBaseUrl,
       model: process.env.INFERENCE_MODEL ?? config.inference.model,
       // Local development only: production relays hold the provider key.
       apiKey: process.env.INFERENCE_API_KEY,
+      encryption: inferenceE2ee
+        ? createPhalaE2eeEncryption({ baseUrl: inferenceBaseUrl, logger })
+        : undefined,
     });
+  if (!inferenceE2ee) {
+    logger.warn(
+      { baseUrl: inferenceBaseUrl },
+      "Inference E2EE is disabled: prompts and answers travel as plaintext over TLS",
+    );
+  }
   const derivativeScheduler: RecomputeScheduler = createRecomputeScheduler({
     store: questionStore,
     debounceMs: config.inference.recomputeDebounceMs,

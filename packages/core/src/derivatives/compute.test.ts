@@ -6,8 +6,11 @@ import { ingestDataContract } from "../contracts/data.js";
 import { computeQuestion, type QuestionComputeDeps } from "./compute.js";
 import {
   createFakeInferenceProvider,
+  createOpenAiCompatibleInferenceProvider,
   InferenceRequestError,
 } from "./inference.js";
+import { createPhalaE2eeEncryption } from "./e2ee/phala.js";
+import { createFakeE2eeGateway } from "../test-utils/e2ee-gateway.js";
 import { createRecomputeScheduler } from "./scheduler.js";
 import type { DataWritePolicyPorts } from "../policy/data-write.js";
 import type { ScopeDeletionTracker } from "../sync/scope-deletions.js";
@@ -555,5 +558,87 @@ describe("computeQuestion", () => {
       status: "skipped",
       reason: "unknown-question",
     });
+  });
+});
+
+describe("computeQuestion with E2EE to a fake Phala gateway", () => {
+  it("sends the prompt as ciphertext through the relay and stores the decrypted answer", async () => {
+    const gateway = await createFakeE2eeGateway({
+      respond: ({ messages }) => {
+        // The enclave sees the plaintext prompt with the owner's data in it.
+        expect(messages.map((m) => m.content).join("\n")).toContain(
+          "REM 91 minutes",
+        );
+        return JSON.stringify({
+          answer: "You slept well: REM was 91 minutes.",
+          evidence: "oura.sleep 2026-08-19",
+        });
+      },
+    });
+    const provider = createOpenAiCompatibleInferenceProvider({
+      baseUrl: "https://relay.test/v1",
+      fetch: gateway.fetch,
+      encryption: createPhalaE2eeEncryption({
+        baseUrl: "https://relay.test/v1",
+        fetch: gateway.fetch,
+      }),
+    });
+    const d = deps({ provider });
+    await seed(d.storage, "oura.sleep", {
+      nights: [{ date: "2026-08-19", note: "REM 91 minutes" }],
+    });
+    await seed(d.storage, "chatgpt.conversations", {
+      items: [{ title: "hello" }],
+    });
+
+    const outcome = await computeQuestion("q-1", d);
+    expect(outcome.status).toBe("ready");
+
+    // What the relay saw: ciphertext only, never the data or the question.
+    expect(gateway.requests).toHaveLength(1);
+    const wire = JSON.stringify(gateway.requests[0]!.body);
+    expect(wire).not.toContain("REM 91");
+    expect(wire).not.toContain("How did I sleep");
+    expect(wire).not.toContain("hello");
+    for (const message of gateway.requests[0]!.body.messages as Array<{
+      content: string;
+    }>) {
+      expect(message.content).toMatch(/^[0-9a-f]+$/);
+    }
+    expect(gateway.requests[0]!.headers["x-e2ee-version"]).toBe("2");
+
+    // What was stored: the decrypted answer, with the receipt id.
+    const entry = d.storage.findEntry({ scope: "coach.weekly" });
+    const envelope = await d.storage.readEnvelope(
+      "coach.weekly",
+      entry!.collectedAt,
+    );
+    expect(envelope.data).toMatchObject({
+      answer: "You slept well: REM was 91 minutes.",
+      evidence: "oura.sleep 2026-08-19",
+      inference: { receiptId: "rcpt-1" },
+    });
+  });
+
+  it("fails the question (no retry storm) when the gateway key cannot be verified", async () => {
+    const gateway = await createFakeE2eeGateway({ supportedE2eeVersions: [] });
+    const provider = createOpenAiCompatibleInferenceProvider({
+      baseUrl: "https://relay.test/v1",
+      fetch: gateway.fetch,
+      encryption: createPhalaE2eeEncryption({
+        baseUrl: "https://relay.test/v1",
+        fetch: gateway.fetch,
+      }),
+    });
+    const d = deps({ provider });
+    await seed(d.storage, "oura.sleep", { nights: [] });
+    await seed(d.storage, "chatgpt.conversations", { items: [] });
+    const outcome = await computeQuestion("q-1", d);
+    expect(outcome.status).toBe("failed");
+    expect(outcome.status === "failed" && outcome.error).toContain(
+      "e2ee key fetch failed (e2ee_unsupported)",
+    );
+    expect(gateway.requests).toHaveLength(0);
+    expect(gateway.attestationRequests).toHaveLength(1);
   });
 });

@@ -15,6 +15,7 @@ import {
   computeQuestion,
   createInMemoryQuestionStore,
   createOpenAiCompatibleInferenceProvider,
+  createPhalaE2eeEncryption,
   createRecomputeScheduler,
   DEFAULT_INFERENCE_BASE_URL,
   type ComputeSyncNotifier,
@@ -88,12 +89,6 @@ export interface PsLiteDerivativeCompute {
 export function createPsLiteDerivativeCompute(
   options: PsLiteDerivativeComputeOptions,
 ): PsLiteDerivativeCompute {
-  const provider =
-    options.provider ??
-    createOpenAiCompatibleInferenceProvider({
-      baseUrl: options.config.inference.baseUrl,
-      model: options.config.inference.model,
-    });
   const logger = options.logger
     ? {
         info: (payload: Record<string, unknown>, message: string) =>
@@ -102,6 +97,21 @@ export function createPsLiteDerivativeCompute(
           options.logger?.warn(payload, message),
       }
     : undefined;
+  const provider =
+    options.provider ??
+    createOpenAiCompatibleInferenceProvider({
+      baseUrl: options.config.inference.baseUrl,
+      model: options.config.inference.model,
+      // E2EE v2 to the Phala gateway (WebCrypto only, so it runs in the
+      // browser): the relay sees ciphertext. `inference.e2ee: false` turns
+      // it off for local development against a provider without ACI.
+      encryption: options.config.inference.e2ee
+        ? createPhalaE2eeEncryption({
+            baseUrl: options.config.inference.baseUrl,
+            logger,
+          })
+        : undefined,
+    });
   const scheduler: RecomputeScheduler = createRecomputeScheduler({
     store: options.store,
     debounceMs: options.config.inference.recomputeDebounceMs,
