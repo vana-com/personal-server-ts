@@ -1,0 +1,426 @@
+/**
+ * The 18 questions of design §3, as graded cases.
+ *
+ * Expected values are computed by `reference/compute.ts` against the serialized
+ * corpus, not asserted as literals here — a literal would go stale the moment
+ * the generator changed, and would test nothing about whether the corpus
+ * actually contains what the case claims.
+ */
+
+import type { FixtureSource } from "./fixtures/sink.js";
+import { SCOPES } from "./fixtures/generate.js";
+import {
+  Q5_RESTAURANT,
+  Q5_SPEAKER_ALIAS,
+  Q8_CONFLICT_MARKER,
+} from "./fixtures/planted.js";
+import {
+  absenceReference,
+  anomalyReference,
+  branchTrap,
+  conditionalReference,
+  identityReference,
+  localDateDrift,
+  needleReference,
+  recurringReference,
+  sleepTrap,
+  tripReference,
+} from "./reference/compute.js";
+import type { QueryEvalCase } from "./types.js";
+
+/** Q1 asks about "the last month"; 31 calendar days is the window the eval grades. */
+export const Q1_WINDOW_DAYS = 31;
+
+export async function buildCases(
+  source: FixtureSource,
+): Promise<QueryEvalCase[]> {
+  const sleepWindow = await sleepTrap(source, Q1_WINDOW_DAYS);
+  const sleepAll = await sleepTrap(source, null);
+  const branches = await branchTrap(source);
+  const needle = await needleReference(source);
+  const identity = await identityReference(source);
+  const recurring = await recurringReference(source);
+  const absence = await absenceReference(source);
+  const anomaly = await anomalyReference(source);
+  const trip = await tripReference(source);
+  const conditional = await conditionalReference(source);
+  const drift = await localDateDrift(source);
+
+  return [
+    {
+      id: "Q1",
+      question: "How much did I sleep on average over the last month?",
+      class: "aggregation",
+      scopes: [SCOPES.ouraSleep],
+      expect: {
+        kind: "numeric",
+        value: Number(sleepWindow.correctHours.toFixed(4)),
+        tolerance: 0.05,
+        denominator: sleepWindow.nights,
+      },
+      mustCite: true,
+      mustReportCoverage: true,
+      referenceFacts: {
+        naiveHoursIncludingNaps: Number(sleepWindow.naiveHours.toFixed(4)),
+        errorPctIfNapsIncluded: Number(sleepWindow.errorPct.toFixed(2)),
+        hoursIfOnlyNapsExcluded: Number(
+          sleepWindow.excludingNapsOnlyHours.toFixed(4),
+        ),
+        errorPctIfOnlyNapsExcluded: Number(
+          sleepWindow.excludingNapsOnlyErrorPct.toFixed(2),
+        ),
+        hoursIfNullDurationTreatedAsZero: Number(
+          sleepWindow.nullAsZeroHours.toFixed(4),
+        ),
+        nightsWithData: sleepWindow.nights,
+        rowsExcludedAsRestOrDeleted: sleepWindow.excludedRows,
+        nullDurationRows: sleepWindow.nullDurationRows,
+        windowDays: sleepWindow.windowDays,
+        sleepDayDriftRows: drift.mismatched,
+        // The whole-corpus figures are the stable regression numbers; the
+        // 31-day window is what the question asks for and is noisier.
+        fullCorpusCorrectHours: Number(sleepAll.correctHours.toFixed(4)),
+        fullCorpusNaiveHours: Number(sleepAll.naiveHours.toFixed(4)),
+        fullCorpusErrorPct: Number(sleepAll.errorPct.toFixed(2)),
+      },
+      notes:
+        "Three distinct silent failures: including naps (design §18.2); filtering `type !== 'late_nap'`, " +
+        "which looks careful but sweeps in `rest` and `deleted` periods; and coercing a null " +
+        "`total_sleep_duration` to zero. Also: `day` is authoritative — re-deriving the date from " +
+        `\`bedtime_start\` misdates ${drift.mismatched} rows across the timezone change.`,
+    },
+    {
+      id: "Q2",
+      question: "What was my main focus this week?",
+      class: "synthesis",
+      scopes: [SCOPES.slack, SCOPES.email, SCOPES.calendar, SCOPES.chatgpt],
+      expect: {
+        kind: "judged",
+        rubric:
+          "Covers all four granted scopes rather than the loudest one; states the weighting it used (message volume, calendar hours, or similar); cites specific artifacts. Fails if Slack volume alone drives the answer.",
+      },
+      mustCite: true,
+      mustReportCoverage: true,
+      requiresJudge: true,
+    },
+    {
+      id: "Q3",
+      question: "What is my financial risk appetite?",
+      class: "inference",
+      scopes: [SCOPES.bank, SCOPES.chatgpt],
+      expect: {
+        kind: "judged",
+        rubric:
+          "Decomposes into computable sub-quantities (spend volatility, discretionary share, cadence) and computes each rather than asserting a trait; states calibrated uncertainty and names what data is missing (no brokerage or income data in this corpus).",
+      },
+      mustCite: true,
+      mustReportCoverage: true,
+      requiresJudge: true,
+      notes:
+        "Multi-turn by construction. Design §17.1's DABStep decomposition risk lands here.",
+    },
+    {
+      id: "Q4",
+      question: "Did my sleep affect my productivity last quarter?",
+      class: "relational",
+      scopes: [SCOPES.ouraSleep, SCOPES.calendar, SCOPES.slack],
+      expect: {
+        kind: "judged",
+        rubric:
+          "States an explicit productivity proxy and join key, reports a real statistic with n and spread, and does not state correlation as causation.",
+      },
+      mustCite: true,
+      mustReportCoverage: true,
+      requiresJudge: true,
+    },
+    {
+      id: "Q5",
+      question: "What was the name of that Thai restaurant Sarah recommended?",
+      class: "exhaustive",
+      scopes: [SCOPES.slack, SCOPES.email, SCOPES.chatgpt],
+      expect: {
+        kind: "set",
+        contains: [Q5_RESTAURANT],
+        // The decoys: the other Sarah's recommendation, and a colleague's.
+        excludes: ["Golden Orchid Kitchen", "Silver Elephant Noodle House"],
+      },
+      mustCite: true,
+      mustReportCoverage: true,
+      referenceFacts: {
+        occurrencesInCorpus: needle.occurrences,
+        speakerAlias: needle.speakerAlias,
+        date: needle.date,
+        daysBeforeCorpusEnd: needle.daysBeforeEnd,
+      },
+      notes: `Single occurrence, spoken by "${Q5_SPEAKER_ALIAS}" not "Sarah Johnson", ${needle.daysBeforeEnd} days before the corpus ends. Recency truncation misses it; matching "Sarah" without resolution hits the wrong person.`,
+    },
+    {
+      id: "Q6",
+      question:
+        "How many distinct people did I talk to last month, and who were the top 10?",
+      class: "relational",
+      scopes: [SCOPES.slack, SCOPES.email, SCOPES.calendar],
+      expect: {
+        kind: "numeric",
+        value: identity.distinctPeople,
+        tolerance: 0,
+        denominator: identity.rowsScanned,
+      },
+      mustCite: true,
+      mustReportCoverage: true,
+      referenceFacts: {
+        distinctRawAliases: identity.distinctAliases,
+        rowsScanned: identity.rowsScanned,
+      },
+      notes:
+        "Counting raw handles gives distinctRawAliases; the answer is distinctPeople after alias resolution.",
+    },
+    {
+      id: "Q7",
+      question:
+        "What are my recurring monthly expenses, and which ones have crept up?",
+      class: "aggregation",
+      scopes: [SCOPES.bank],
+      expect: {
+        kind: "set",
+        contains: [...recurring.recurringMerchants],
+      },
+      mustCite: true,
+      mustReportCoverage: true,
+      referenceFacts: {
+        creptMerchants: recurring.crept.map((c) => c.merchant).join(", "),
+        transactions: recurring.transactions,
+      },
+      notes: "Cadence must be detected over the full history, not a window.",
+    },
+    {
+      id: "Q8",
+      question:
+        "Have I ever agreed to anything that conflicts with this contract?",
+      class: "exhaustive",
+      scopes: [SCOPES.documents, SCOPES.email],
+      expect: { kind: "absence", mustReportCoverage: true },
+      mustCite: false,
+      mustReportCoverage: true,
+      expectedCoverage: {
+        recordsScanned: absence.readable,
+        unreadable: absence.unreadable,
+      },
+      referenceFacts: {
+        documents: absence.documents,
+        readable: absence.readable,
+        unreadable: absence.unreadable,
+        conflictMarkerOccurrences: absence.conflictMarkerOccurrences,
+        nearMissDocuments: absence.nearMisses,
+      },
+      notes: `No conflicting agreement exists ("${Q8_CONFLICT_MARKER}" occurs ${absence.conflictMarkerOccurrences} times). A bare "no" fails: ${absence.unreadable} documents have no text layer and must be reported.`,
+    },
+    {
+      id: "Q9",
+      question: "When did I first start thinking about leaving my job?",
+      class: "synthesis",
+      scopes: [SCOPES.chatgpt, SCOPES.notes, SCOPES.slack],
+      expect: {
+        kind: "judged",
+        rubric:
+          "Orders candidate matches by time rather than relevance score, returns the earliest, and states that it is the earliest *found* rather than the earliest that exists whenever coverage.method is prefiltered.",
+      },
+      mustCite: true,
+      mustReportCoverage: true,
+      requiresJudge: true,
+      referenceFacts: {
+        conversations: branches.conversations,
+        correctMessages: branches.correctMessages,
+        messagesIfMappingFlattened: branches.naiveMessages,
+        phantomPct: Number(branches.phantomPct.toFixed(2)),
+      },
+      notes:
+        "Only meaningful because the corpus now spans 1100 days; the previous generator compressed " +
+        "conversations into ~11 days, which made this vacuous. Depends on correct message " +
+        "reconstruction twice over: flattening `mapping` invents phantom messages, and a null " +
+        "`create_time` coerced to 0 dates a message to 1970 and becomes a false 'first'.",
+    },
+    {
+      id: "Q10",
+      question: "What changed in how I think about X over the last two years?",
+      class: "synthesis",
+      scopes: [SCOPES.chatgpt, SCOPES.notes],
+      expect: {
+        kind: "judged",
+        rubric:
+          "Samples from both ends of the period with stated per-period coverage and contrasts them; a summary weighted to recent material fails.",
+      },
+      mustCite: true,
+      mustReportCoverage: true,
+      requiresJudge: true,
+      notes: "Same date-spread dependency as Q9.",
+    },
+    {
+      id: "Q11",
+      question: "Was my resting heart rate unusual last week?",
+      class: "aggregation",
+      scopes: [SCOPES.ouraSleep, SCOPES.ouraHeartRate],
+      expect: {
+        kind: "numeric",
+        value: Number(anomaly.lastWeekBpm.toFixed(4)),
+        tolerance: 0.5,
+      },
+      mustCite: true,
+      mustReportCoverage: true,
+      referenceFacts: {
+        baselineBpm: Number(anomaly.baselineBpm.toFixed(4)),
+        deltaBpm: Number(anomaly.deltaBpm.toFixed(4)),
+        baselineStdDev: Number(anomaly.baselineStdDev.toFixed(4)),
+        zScore: Number(anomaly.zScore.toFixed(4)),
+        heartRateBaselineFilteredToRestAndSleep: Number(
+          anomaly.filteredHeartRateBaselineBpm.toFixed(4),
+        ),
+        heartRateBaselineUnfiltered: Number(
+          anomaly.unfilteredHeartRateBaselineBpm.toFixed(4),
+        ),
+      },
+      notes:
+        "A real excursion is planted in the final week; the baseline needs the full history, not the " +
+        "window under test. Second trap: `heartrate.source` must be filtered to rest/sleep — an " +
+        "unfiltered baseline is inflated by workout samples and swamps the anomaly.",
+    },
+    {
+      id: "Q12",
+      question:
+        "Which of my data has app X seen, and what could it infer from it?",
+      class: "introspection",
+      scopes: [],
+      expect: {
+        kind: "judged",
+        rubric:
+          "Answered from grant records and access logs only, never from content; refused when the caller is the app being asked about.",
+      },
+      mustCite: true,
+      mustReportCoverage: true,
+      requiresJudge: true,
+      notes:
+        "Not gradeable against the fixture corpus: it reads the server's own grant/access ledger, which the fixture does not model. Needs `vana.introspect()` (prompt doc §3) and a grant-ledger fixture. Reported as a gap.",
+    },
+    {
+      id: "Q13",
+      question: "Plan my week around my energy levels.",
+      class: "synthesis",
+      scopes: [SCOPES.ouraSleep, SCOPES.ouraReadiness, SCOPES.calendar],
+      expect: {
+        kind: "judged",
+        rubric:
+          "Separates measured history from projection explicitly, and notes calendar freshness. Output is a plan, so only the separation is graded.",
+      },
+      mustCite: true,
+      mustReportCoverage: true,
+      requiresJudge: true,
+      notes:
+        "The corpus has no future calendar data, so the forward half is unexercised. Partial by construction.",
+    },
+    {
+      id: "Q14",
+      question: "How much did I spend on my Japan trip?",
+      class: "aggregation",
+      scopes: [SCOPES.bank, SCOPES.calendar],
+      expect: {
+        kind: "numeric",
+        value: Number(trip.totalUsd.toFixed(2)),
+        tolerance: 1,
+      },
+      mustCite: true,
+      mustReportCoverage: true,
+      referenceFacts: {
+        resolvedStart: trip.startDay,
+        resolvedEnd: trip.endDay,
+        inWindowOnlyUsd: Number(trip.inWindowOnlyUsd.toFixed(2)),
+        preTripFlightUsd: Number(trip.flightUsd.toFixed(2)),
+        jpyTransactions: trip.jpyTransactions,
+      },
+      notes:
+        "The flight is charged 61 days before departure. A date-window filter alone returns inWindowOnlyUsd and is wrong.",
+    },
+    {
+      id: "Q15",
+      question: "What do I keep saying I'll do but never do?",
+      class: "exhaustive",
+      scopes: [SCOPES.notes, SCOPES.chatgpt, SCOPES.calendar],
+      expect: {
+        kind: "judged",
+        rubric:
+          "Extracts intent statements, then runs a completeness-guaranteed follow-through check per intent; must report coverage.stoppedBecause when the budget is exhausted rather than silently truncating.",
+      },
+      mustCite: true,
+      mustReportCoverage: true,
+      requiresJudge: true,
+      notes:
+        "Unbounded by construction; the graded property is honest budget exhaustion.",
+    },
+    {
+      id: "Q16",
+      question: "Am I a morning person?",
+      class: "inference",
+      scopes: [SCOPES.ouraSleep, SCOPES.slack, SCOPES.chatgpt],
+      expect: {
+        kind: "judged",
+        rubric:
+          "Reports the behavioural aggregate (activity timing from the diurnal distribution) and any stated self-description separately, and surfaces disagreement rather than picking one.",
+      },
+      mustCite: true,
+      mustReportCoverage: true,
+      requiresJudge: true,
+      notes:
+        "The corpus has a genuine diurnal signal now: Slack is work-hours weighted, ChatGPT and notes are evening weighted.",
+    },
+    {
+      id: "Q17",
+      question:
+        "Summarize everything I know about Sarah Johnson before my meeting with them.",
+      class: "relational",
+      scopes: [SCOPES.slack, SCOPES.email, SCOPES.calendar],
+      expect: {
+        kind: "set",
+        contains: ["sarahj", "sarah@work.com"],
+        excludes: ["snguyen"],
+      },
+      mustCite: true,
+      mustReportCoverage: true,
+      referenceFacts: {
+        aliasesToResolve: "Sarah Johnson, sarahj, sarah@work.com, Sarah 🌸",
+        confusableWith: "Sarah Nguyen (snguyen, sarah.nguyen@partner.io)",
+      },
+      notes:
+        "Graded on alias resolution: the gather must include Sarah Johnson's handles and exclude the other Sarah's.",
+    },
+    {
+      id: "Q18",
+      question:
+        "How many calories do I typically eat on days I run more than 10km?",
+      class: "relational",
+      scopes: [SCOPES.ouraActivity, SCOPES.ouraWorkout],
+      expect: {
+        kind: "numeric",
+        value: Number(conditional.meanCaloriesOnRunDays.toFixed(2)),
+        tolerance: 5,
+        denominator: conditional.matchedDays,
+      },
+      mustCite: true,
+      mustReportCoverage: true,
+      referenceFacts: {
+        matchedDays: conditional.matchedDays,
+        unmatchedDays: conditional.unmatchedDays,
+        meanCaloriesOtherDays: Number(
+          conditional.meanCaloriesOtherDays.toFixed(2),
+        ),
+        workoutRowsBeforeDedup: conditional.workoutRows,
+        dedupedSessions: conditional.dedupedSessions,
+        runDaysIfDistanceReadAsKm: conditional.runDaysIfDistanceReadAsKm,
+      },
+      notes:
+        "Two verified traps: `workout.distance` is in metres, so the filter is `> 10000` — reading it " +
+        `as km qualifies ${conditional.runDaysIfDistanceReadAsKm} days instead of ${conditional.matchedDays + conditional.unmatchedDays}; ` +
+        "and `workout.source` is both `manual` and `autodetected`, so sessions must be deduped before " +
+        "the join. Caveat: the corpus has no nutrition log, so `total_calories` stands in for intake — " +
+        "a proxy the design does not specify, and one to revisit when a nutrition source exists.",
+    },
+  ];
+}
