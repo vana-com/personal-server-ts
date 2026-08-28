@@ -223,6 +223,16 @@ export function createOpenAiCompatibleInferenceProvider(
       }
       let messages = input.messages;
       if (options.encryption) {
+        if (input.tools && input.tools.length > 0) {
+          // The E2EE protocol covers message CONTENT only; tool_calls and
+          // tool definitions would travel outside the envelope, and replies
+          // whose payload is tool_calls bypass decryption entirely. Refuse
+          // loudly instead of leaking or feeding ciphertext to the loop.
+          throw new InferenceRequestError(
+            "tool calling is not supported with E2EE inference encryption",
+            null,
+          );
+        }
         ({ messages } = await options.encryption.encryptRequest({
           messages,
           headers,
@@ -279,7 +289,11 @@ export function createOpenAiCompatibleInferenceProvider(
         );
       }
       let content = readContent(parsed);
-      const toolCalls = readToolCalls(parsed);
+      // tool_calls only count when this request actually offered tools; a
+      // hallucinated tool_calls array on a plain completion must not defeat
+      // the empty-reply guard below.
+      const toolCalls =
+        input.tools && input.tools.length > 0 ? readToolCalls(parsed) : null;
       if ((content === null || content.trim() === "") && !toolCalls) {
         // An empty reply must never become a "ready" derivative. A reply
         // that requests tools may legitimately carry no content.
@@ -289,7 +303,7 @@ export function createOpenAiCompatibleInferenceProvider(
         );
       }
       content ??= "";
-      if (options.encryption && content !== "") {
+      if (options.encryption && content.trim() !== "") {
         content = await options.encryption.decryptResponse({
           content,
           headers: response.headers,

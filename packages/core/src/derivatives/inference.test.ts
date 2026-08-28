@@ -252,11 +252,74 @@ describe("tool calling (agentic mode wire shape)", () => {
     const result = await provider.chat({
       model: "m",
       messages: [{ role: "user", content: "q" }],
+      tools: [
+        {
+          name: "read_data",
+          description: "read",
+          parameters: { type: "object" },
+        },
+      ],
     });
     expect(result.content).toBe("");
     expect(result.toolCalls).toEqual([
       { id: "t9", name: "read_data", arguments: '{"ref":"a#0#0"}' },
     ]);
+  });
+
+  it("ignores hallucinated tool_calls when the request offered no tools", async () => {
+    const fetchMock = fetchReplying({
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "t9",
+                type: "function",
+                function: { name: "read_data", arguments: "{}" },
+              },
+            ],
+          },
+        },
+      ],
+    });
+    const provider = createOpenAiCompatibleInferenceProvider({
+      baseUrl: "https://relay.example/v1",
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    // No tools in the request: the hallucinated tool_calls must not defeat
+    // the empty-reply guard.
+    await expect(
+      provider.chat({ model: "m", messages: [{ role: "user", content: "q" }] }),
+    ).rejects.toThrow("no assistant content");
+  });
+
+  it("refuses tool calling when E2EE encryption is configured", async () => {
+    const fetchMock = fetchReplying(completion);
+    const encryption: InferenceRequestEncryption = {
+      encryptRequest: async ({ messages }) => ({ messages }),
+      decryptResponse: async ({ content }) => content,
+    };
+    const provider = createOpenAiCompatibleInferenceProvider({
+      baseUrl: "https://relay.example/v1",
+      fetch: fetchMock as unknown as typeof fetch,
+      encryption,
+    });
+    await expect(
+      provider.chat({
+        model: "m",
+        messages: [{ role: "user", content: "q" }],
+        tools: [
+          {
+            name: "search_data",
+            description: "s",
+            parameters: { type: "object" },
+          },
+        ],
+      }),
+    ).rejects.toThrow("not supported with E2EE");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("still rejects an empty reply that requests no tools", async () => {

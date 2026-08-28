@@ -407,11 +407,13 @@ export async function computeQuestion(
 
     const sources: PromptSource[] = [];
     const rawSources: Array<{ scope: string; data: unknown }> = [];
+    const binaryScopes: string[] = [];
     const sourceLineage = new Map<string, readonly string[]>();
     for (const scope of registration.sourceScopes) {
       const loaded = await loadSource(deps, scope);
       sources.push(loaded.source);
       if (loaded.raw !== null) rawSources.push({ scope, data: loaded.raw });
+      else binaryScopes.push(scope);
       sourceLineage.set(scope, loaded.lineageSources);
     }
     await assertNoLineageCycle(deps, registration, serverOwner, sourceLineage);
@@ -425,21 +427,33 @@ export async function computeQuestion(
     if (registration.mode === "agentic") {
       const corpus = buildSearchCorpus(rawSources);
       if (corpus.passageCount === 0) {
-        throw new ComputeFailure("sources contain no searchable text");
+        throw new ComputeFailure(
+          binaryScopes.length === registration.sourceScopes.length
+            ? "every source scope is binary; agentic mode needs text sources"
+            : "sources contain no searchable text",
+        );
       }
-      const loop = await withRetries(
-        deps,
-        () =>
-          runAgenticLoop({
-            provider: deps.provider,
-            model,
-            question: registration.question,
-            corpus,
-            maxToolCalls: deps.maxToolCalls,
-            maxTokens: deps.maxTokens,
-          }),
-        isRetryableInferenceError,
-      );
+      const notes: string[] = [];
+      if (binaryScopes.length > 0) {
+        notes.push(
+          `the following source scopes hold binary records whose content is not searchable: ${binaryScopes.join(", ")}`,
+        );
+      }
+      if (corpus.truncated) {
+        notes.push("the sources were too large to index completely");
+      }
+      const loop = await runAgenticLoop({
+        provider: deps.provider,
+        model,
+        question: registration.question,
+        corpus,
+        maxToolCalls: deps.maxToolCalls,
+        maxTokens: deps.maxTokens,
+        // Transient provider failures retry ONE call, never the whole loop.
+        retry: (attempt) =>
+          withRetries(deps, attempt, isRetryableInferenceError),
+        ...(notes.length > 0 ? { contextNote: notes.join("; ") } : {}),
+      });
       if (loop.content.trim() === "") {
         throw new ComputeFailure("agentic loop ended without an answer");
       }

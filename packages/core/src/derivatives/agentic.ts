@@ -6,13 +6,14 @@
  * Everything here executes inside the Personal Server. The model sees the
  * question, the snippets `search_data` returns and the passages it chooses
  * to `read_data` — never the corpus, never the index. The index lives for
- * one compute and is discarded; nothing is stored, synced or granted.
+ * one compute and is discarded — nothing is stored, synced or granted.
  *
  * See docs/derivative-data-api.md, "Agentic mode".
  */
 
 import MiniSearch from "minisearch";
 import type {
+  InferenceChatInput,
   InferenceChatResult,
   InferenceMessage,
   InferenceProvider,
@@ -29,6 +30,8 @@ const SEARCH_TOP_K = 8;
 const READ_CHARS = 6_000;
 /** Bound on any single tool result fed back to the model. */
 const TOOL_RESULT_CHARS = 8_000;
+/** Bound on the total text a corpus indexes; items past it are dropped. */
+const MAX_CORPUS_CHARS = 20_000_000;
 
 /** Envelope keys and common metadata keys that are not searchable content. */
 const RESERVED_KEYS = new Set(["$lineage", "$writtenBy", "$binary"]);
@@ -44,17 +47,21 @@ const METADATA_KEYS = new Set([
   "asset_id",
   "type",
 ]);
-const ISO_LIKE = /^\d{4}-\d{2}-\d{2}[T ]/;
+/**
+ * A string that is ONLY a timestamp ("2026-05-01T09:00:00Z"). A date-prefixed
+ * sentence ("2026-05-01 met the cardiologist") is real content and stays.
+ */
+const PURE_TIMESTAMP = /^\d{4}-\d{2}-\d{2}([T ][0-9:.,+\-Z]*)?$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-/** String leaves of one item, skipping metadata keys and bare timestamps. */
+/** String leaves of one item, skipping metadata keys and pure timestamps. */
 function harvestText(value: unknown, depth = 0): string {
   if (depth > 12) return "";
   if (typeof value === "string") {
-    return ISO_LIKE.test(value) ? "" : value;
+    return PURE_TIMESTAMP.test(value.trim()) ? "" : value;
   }
   if (Array.isArray(value)) {
     return value
@@ -76,7 +83,7 @@ export interface CorpusPassage {
   /** Stable within one compute: `<scope>#<item>#<window>`. */
   ref: string;
   scope: string;
-  /** Index of the source item this window belongs to. */
+  /** Key of the source item this window belongs to. */
   itemKey: string;
   text: string;
 }
@@ -90,6 +97,17 @@ export interface SearchCorpus {
   /** Full text of the ITEM a passage belongs to, bounded to READ_CHARS. */
   read(ref: string): string | null;
   readonly passageCount: number;
+  /** True when MAX_CORPUS_CHARS cut indexing short. */
+  readonly truncated: boolean;
+}
+
+/** `<scope>#<item>` and the window number out of a passage ref. */
+function splitRef(ref: string): { itemKey: string; window: number } {
+  const parts = ref.split("#");
+  return {
+    itemKey: parts.slice(0, 2).join("#"),
+    window: Number(parts[2] ?? 0) || 0,
+  };
 }
 
 /**
@@ -97,17 +115,26 @@ export interface SearchCorpus {
  * top-level array items (a bare array, or every top-level array value of a
  * record — same shape `trimSourceData` understands); a source with no
  * arrays contributes one item. Items are harvested to text and split into
- * bounded windows.
+ * bounded windows. Text is held ONCE (the item map); the index stores refs
+ * only and passage text is reconstructed by offset.
  */
 export function buildSearchCorpus(
   sources: ReadonlyArray<{ scope: string; data: unknown }>,
 ): SearchCorpus {
   const passages: CorpusPassage[] = [];
   const itemText = new Map<string, string>();
+  let indexedChars = 0;
+  let truncated = false;
 
   const addItem = (scope: string, key: string, item: unknown): void => {
+    if (truncated) return;
     const text = harvestText(item).trim();
     if (text === "") return;
+    if (indexedChars + text.length > MAX_CORPUS_CHARS) {
+      truncated = true;
+      return;
+    }
+    indexedChars += text.length;
     const itemKey = `${scope}#${key}`;
     itemText.set(itemKey, text);
     for (let offset = 0; offset < text.length; offset += PASSAGE_CHARS) {
@@ -141,32 +168,51 @@ export function buildSearchCorpus(
     }
   }
 
+  // Text lives once in itemText: the index stores only refs, and the passage
+  // objects are released after addAll.
   const index = new MiniSearch<CorpusPassage>({
     idField: "ref",
     fields: ["text"],
-    storeFields: ["ref", "scope", "itemKey", "text"],
+    storeFields: ["ref", "scope"],
     searchOptions: { prefix: (term: string) => term.length >= 4 },
   });
   index.addAll(passages);
+  passages.length = 0;
+
+  const passageText = (ref: string): string => {
+    const { itemKey, window } = splitRef(ref);
+    const text = itemText.get(itemKey) ?? "";
+    return text.slice(window * PASSAGE_CHARS, (window + 1) * PASSAGE_CHARS);
+  };
 
   return {
-    passageCount: passages.length,
+    passageCount: index.documentCount,
+    truncated,
     search(query) {
       return index
         .search(query)
         .slice(0, SEARCH_TOP_K)
         .map((hit) => {
-          const stored = hit as unknown as CorpusPassage;
+          const ref = String(hit.id);
+          const text = passageText(ref);
+          // Center the snippet on the first matched term so the model sees
+          // WHY this passage hit, not whatever the window starts with.
+          const lower = text.toLowerCase();
+          let at = -1;
+          for (const term of hit.terms) {
+            const found = lower.indexOf(term.toLowerCase());
+            if (found >= 0 && (at === -1 || found < at)) at = found;
+          }
+          const start = at > 60 ? at - 60 : 0;
           return {
-            ref: stored.ref,
-            scope: stored.scope,
-            snippet: stored.text.slice(0, SNIPPET_CHARS),
+            ref,
+            scope: (hit as unknown as { scope: string }).scope,
+            snippet: text.slice(start, start + SNIPPET_CHARS),
           };
         });
     },
     read(ref) {
-      // A ref names a window; reading returns its whole ITEM for context.
-      const itemKey = ref.split("#").slice(0, 2).join("#");
+      const { itemKey } = splitRef(ref);
       const text = itemText.get(itemKey);
       return text ? text.slice(0, READ_CHARS) : null;
     },
@@ -178,6 +224,7 @@ const AGENTIC_SYSTEM_PROMPT = [
   "search_data is keyword search: it matches literal words only. Vary phrasings, try synonyms, and if the data may be in another language, translate the key terms and search again.",
   "Use read_data when a search hit looks relevant but its snippet does not show the answer.",
   "Do not use outside knowledge and do not guess; if the data does not support an answer, say so in the answer.",
+  `You may use at most ${DEFAULT_MAX_TOOL_CALLS} tool calls total. Stop early once you have the answer.`,
   "When you are done, respond with a single JSON object and nothing else, with exactly these fields:",
   '  "answer": string, the answer to the question, written for the person the data belongs to;',
   '  "evidence": string, a short summary of which parts of the data support the answer.',
@@ -215,6 +262,13 @@ export interface AgenticLoopInput {
   corpus: SearchCorpus;
   maxToolCalls?: number;
   maxTokens?: number;
+  /**
+   * Wraps every provider call (retry-with-backoff lives here, so a transient
+   * failure retries ONE call, never the whole loop with its tool budget).
+   */
+  retry?: <T>(attempt: () => Promise<T>) => Promise<T>;
+  /** Extra context appended to the question (e.g. withheld binary sources). */
+  contextNote?: string;
 }
 
 export interface AgenticLoopResult {
@@ -255,23 +309,33 @@ function executeToolCall(
 
 /**
  * The loop. Bounded three ways: `maxToolCalls` tool executions (further
- * requested calls are answered with a refusal and the model is told to
- * answer), at most budget + 2 provider turns overall, and every tool
- * result cut to a fixed size. Throws what the provider throws; the caller
- * (computeQuestion) owns retries and failure accounting.
+ * requested calls are answered with a refusal), at most budget + 2
+ * tool-bearing provider turns plus one final forced answer turn, and every
+ * tool result cut to a fixed size. A loop that ends while the model is
+ * still requesting tools gets ONE tools-free turn to answer; interim
+ * narration is never the answer. Throws what the provider throws; the
+ * caller (computeQuestion) owns failure accounting.
  */
 export async function runAgenticLoop(
   input: AgenticLoopInput,
 ): Promise<AgenticLoopResult> {
   const budget = Math.max(1, input.maxToolCalls ?? DEFAULT_MAX_TOOL_CALLS);
+  const chat = (args: InferenceChatInput): Promise<InferenceChatResult> =>
+    input.retry
+      ? input.retry(() => input.provider.chat(args))
+      : input.provider.chat(args);
+  const question =
+    `## Question\n${input.question}` +
+    (input.contextNote ? `\n\nNote: ${input.contextNote}` : "");
   const messages: InferenceMessage[] = [
     { role: "system", content: AGENTIC_SYSTEM_PROMPT },
-    { role: "user", content: `## Question\n${input.question}` },
+    { role: "user", content: question },
   ];
   let executed = 0;
   let last: InferenceChatResult | null = null;
+  let answered = false;
   for (let turn = 0; turn < budget + 2; turn += 1) {
-    const reply = await input.provider.chat({
+    const reply = await chat({
       model: input.model,
       messages,
       maxTokens: input.maxTokens,
@@ -279,7 +343,10 @@ export async function runAgenticLoop(
     });
     last = reply;
     const calls = reply.toolCalls ?? [];
-    if (calls.length === 0) break;
+    if (calls.length === 0) {
+      answered = true;
+      break;
+    }
     messages.push({
       role: "assistant",
       content: reply.content,
@@ -297,6 +364,21 @@ export async function runAgenticLoop(
         toolCallId: call.id,
       });
     }
+  }
+  if (!answered) {
+    // Turn cap hit with tools still being requested: one forced answer turn
+    // with no tools on offer. Its reply is the answer or the compute fails;
+    // the interim narration in `last` is never used.
+    messages.push({
+      role: "user",
+      content:
+        "The tool budget is exhausted. Reply now with only the final JSON object.",
+    });
+    last = await chat({
+      model: input.model,
+      messages,
+      maxTokens: input.maxTokens,
+    });
   }
   return {
     content: last?.content ?? "",

@@ -74,14 +74,18 @@ export function createSqliteQuestionStore(
 ): QuestionStore {
   db.exec(CREATE_TABLE_SQL);
   db.exec(CREATE_INDEX_SQL);
-  // Tables created before the mode column existed gain it in place; the
-  // ALTER fails harmlessly once the column is there.
-  try {
+  // Tables created before the mode column existed gain it in place. Guarded
+  // by PRAGMA (the index-schema migration pattern) so a real ALTER failure
+  // (locked db, disk full) surfaces here, not as a confusing insert error.
+  const hasModeColumn = (
+    db.prepare("PRAGMA table_info(derivative_questions)").all() as Array<{
+      name: string;
+    }>
+  ).some((column) => column.name === "mode");
+  if (!hasModeColumn) {
     db.exec(
       "ALTER TABLE derivative_questions ADD COLUMN mode TEXT NOT NULL DEFAULT 'completion'",
     );
-  } catch {
-    /* column already exists */
   }
 
   const listAll = db.prepare(

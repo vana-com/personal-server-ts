@@ -681,8 +681,9 @@ told to answer from what it has. The final reply is parsed exactly like
 completion mode (`answer` / `evidence` JSON). The record and its lineage
 are unchanged except for `mode: "agentic"` and a `toolCalls` count. A
 provider that cannot do tool calling fails the question like any other
-malformed reply; registrations then fall back to `"completion"` mode by
-the caller's choice, not automatically.
+malformed reply; the caller's remedy is to delete the registration and
+re-register it in `"completion"` mode (mode is fixed at registration; no
+automatic fallback).
 
 Grant semantics are identical to completion mode: every source scope must
 be covered by a bare read entry of the builder's grant, checked at
