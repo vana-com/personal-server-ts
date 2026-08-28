@@ -440,6 +440,36 @@ can have **multiple sleep periods** (naps), so `sleep` rows must be grouped by
 average is wrong, silently. T2 is where "sleep" is defined as main-period
 `total_sleep_duration`, not time in bed, not naps included.
 
+**Corrections, verified 2026-08-28 against the Oura API v2 OpenAPI spec (1.37)
+during phase 6a.** The paragraph above understates the trap and gets one detail
+wrong:
+
+- **`type` has five values, not two.** Besides `long_sleep` and `late_nap`
+  there are `deleted` (user-deleted) and `rest` (falsely detected, rejected by
+  the user), which must be excluded from *every* calculation — nap questions
+  included. This is a nastier trap than naps, because filtering
+  `type === "long_sleep"` dodges it by luck while `type !== "late_nap"` walks
+  straight into it.
+- **`daily_sleep` carries no duration field at all** — only `score` and
+  `contributors`. "Not 1:1 with `daily_sleep`" above implies you could get a
+  duration there. You cannot.
+- **`total_sleep_duration` is nullable**, and is not `time_in_bed`.
+- **The sleep day changes at 18:00** (stated in the `late_nap` enum
+  description). Bucket by the `day` field; never re-derive it from
+  `bedtime_start`. `bedtime_*` are localized strings with UTC offsets, so
+  `new Date(x).toISOString().slice(0,10)` shifts the date.
+- **`heartrate.source` ∈ `awake|workout|rest|sleep|live|session`.** An
+  unfiltered resting-HR baseline (Q11) is contaminated by workout samples.
+- **`workout.distance` is in meters** (Q18's "10km" is `> 10000`), and
+  `workout.source` includes both `manual` and `autodetected`, so one session
+  can appear twice.
+- **`sleep_algorithm_version`** v1/v2 makes multi-year baselines
+  non-comparable.
+- The collection list above is a subset; the API also serves `daily_stress`,
+  `daily_resilience`, `daily_cardiovascular_age`, `vO2_max`, `sleep_time`,
+  `session`, `tag`, `enhanced_tag`, `rest_mode_period`, `ring_configuration`
+  and `personal_info`.
+
 Embedding any of this would be pure waste — and worse, it would make Q1
 unanswerable, since top-k retrieval cannot average.
 
@@ -463,6 +493,28 @@ non-null); `skipped` alone is unreliable, real parsers use
 rows have overlapping timestamps and need dedup. Each of these is a T2/parser
 decision, made once by us, not by the user and not by a model at query time.
 
+**Corrections, verified 2026-08-28 during phase 6a:**
+
+- **There are two different exports with the same filename, and picking the
+  wrong one is a silent decade-to-year error.** The *account data* package's
+  streaming history covers **the past year only**, with `endTime` / `msPlayed`
+  / `trackName`. The *extended streaming history* package is lifetime, with
+  `ts` / `ms_played` / `master_metadata_*`. An agent handed the account-data
+  file answers a ten-year question with twelve months and nothing indicates a
+  problem. This belongs at the top of the Spotify profile, not in a gotcha
+  list.
+- **Rows are audio, video *and* podcast** — three field clusters, not the two
+  described above.
+- The field list above omits `ip_addr`, `user_agent`, `username`,
+  `offline_timestamp` and `spotify_episode_uri`. The first three are PII that
+  no listening answer needs and must not be carried into a result.
+- **`reason_end`'s vocabulary and the 2.6% duplicate rate could not be traced
+  to a primary source** and are *not* verified. The shipped profile therefore
+  instructs the agent to enumerate the distinct `reason_end` values actually
+  present and to *measure* the duplicate rate, then state both — which is more
+  accurate than either constant and consistent with the host-authored-coverage
+  rule in the prompt contract §1.
+
 ### 12.3 ChatGPT — the only source that pays for T3
 
 `conversations.json`: an array of conversations, each with a `mapping` dict of
@@ -477,6 +529,17 @@ timestamp double-counts abandoned branches. The only correct reconstruction is
 to walk `current_node` back through `parent` to the root and reverse. Any
 question that counts, dates, or quotes messages is wrong without this — and no
 generic JSON→table inference will discover it.
+
+**Additional traps, verified 2026-08-28 during phase 6a against a maintained
+export parser:**
+
+- **`create_time` is nullable on messages.** Coerced to epoch, a null becomes
+  the "earliest" record — which silently destroys Q9 ("when did I first…"),
+  the one question whose whole answer is a minimum date.
+- **`content.parts` is nullable and holds `str | dict`.** `parts.join("")`
+  corrupts char counts and can throw.
+- **Hidden, system and tool messages** mean even a correct `current_node` walk
+  over-counts unless the answer states which roles it included.
 
 T1 here is thin but real: one row per message (id, conversation, role,
 create_time, char count) so that Q9/Q16-style questions can order and count
@@ -1038,12 +1101,42 @@ default, network denied unless enabled, with genuine per-path read/write/deny
 maps and domain-level network allowlisting. `codex-rs/sandboxing/` and
 `codex-rs/linux-sandbox/` are Apache-2.0 and worth studying directly.
 
-But Codex fails requirement 1 in a specific and checkable way: its
-`model-provider-info` source now accepts `wire_api` of `"responses"` **only**,
-rejecting `"chat"` with a hard error. Most "OpenAI-compatible" relays speak
-Chat Completions. **Whether `inference.phala.com/v1` implements the Responses
-API is unverified and worth checking before Codex is dismissed** — it is the
-only candidate that solves the hard half.
+But Codex fails requirement 1. Its `wire_api` accepts `"responses"` **only**,
+rejecting `"chat"` with a hard deserialization error — verified at source in
+`codex-rs/model-provider-info/src/lib.rs` (its own crate now; the older
+`codex-rs/core/src/model_provider_info.rs` path 404s). `WireApi` has a single
+variant, `Responses` is the default when unset, and a repo-wide search for
+`chat/completions` returns zero hits. Removed in PR #10157, first stable in
+`rust-v0.95.0`; confirmed against `codex-rs 0.150.1` (2026-08-27).
+
+**Resolved 2026-08-28 (plan phase 3), and the earlier reasoning here was
+wrong.** This section assumed Codex was blocked because our relay probably
+speaks only Chat Completions. It does not. The question has *two hops* with
+opposite answers:
+
+- **Phala upstream speaks Responses.** `Dstack-TEE/private-ai-gateway`
+  registers `.route("/v1/responses", post(responses))`, and the documented
+  example uses `z-ai/glm-5.2`. It is a create-only opaque passthrough — the
+  gateway does no chat↔Responses translation, so support is per-upstream and
+  per-model, not a gateway guarantee.
+- **Our own gateway does not expose it.** The Personal Server does not talk to
+  Phala directly; it talks to `data-gateway`, which exposes exactly three
+  inference routes (`POST /v1/inference/chat/completions` and two attestation
+  reads). No Responses route exists on `main` or `dev`, and none is in flight.
+
+So Codex is blocked for two independent reasons, neither of which is the one
+originally written here: **(a)** the deployed relay has no Responses route, and
+**(b)** E2EE cannot travel on Responses at all — Phala returns a hard
+`400 e2ee_unsupported_endpoint`, because `spec/e2ee-v2.md` §5 defines
+encryptable field paths only for the `messages[]`/`choices[]` shape and
+mandates rejection for any endpoint it does not cover. Adopting Responses means
+`inference.e2ee = false`, i.e. plaintext prompts and answers over TLS.
+
+The verdict stands; the reason is different. Note also that
+"Responses supported → Codex viable" is a **false implication** wherever it
+appears in this document: it needs both the E2EE clause and the PS-Lite clause
+(§19.3 — Codex is a subprocess wrapper, so it cannot run in a browser runtime
+at all, and would replace the sandbox on Node only).
 
 The others: **dsh** has a real cross-platform filesystem sandbox
 (bubblewrap/Landlock, Seatbelt, Windows ACL-restricted token) but it is
@@ -1124,9 +1217,11 @@ usable here.
    much we materialize.
 3. **Decide §16.5** — who authors the code. Assume PS-side unless something
    argues otherwise.
-4. **Check whether our relay speaks the OpenAI Responses API** (§19.4). If it
-   does, Codex CLI becomes viable and we get the only real sandbox for free;
-   if not, §19.6 stands as written.
+4. ~~Check whether our relay speaks the OpenAI Responses API~~ — **done
+   2026-08-28, see §19.4.** Phala speaks it; our `data-gateway` does not expose
+   it; and E2EE cannot travel on it regardless. §19.6 stands as written. The
+   remaining decision — whether giving up E2EE is ever worth Codex's sandbox —
+   is open and belongs to a human, not to an implementation agent.
 5. Prototype: `pi-agent-core` against the relay, plus both sandbox layers from
    §19.7, graded against the question set.
 6. Write T2 prose (schemas, implicit rules, metric definitions) for Oura,
@@ -1134,9 +1229,23 @@ usable here.
    produce: it is what stands between 6.48h and 5.81h.
 7. Only then, and only where the grading says so, materialize anything.
 
-Facts flagged UNVERIFIED and not relied on above: daytime heart-rate cadence,
-spo2 nesting, the midnight-crossing day-bucket rule, Oura Ring CSV headers, the
-Spotify account-data package shape, the current ChatGPT export file list, the
-Anthropic Commercial ToS reading (summarized, not counsel-reviewed), and
-dsh's 201,918-star count (real per the API, but accrued in 15 days on a repo
-with Issues disabled — not a usable maturity signal).
+Facts flagged UNVERIFIED, **updated 2026-08-28 after phase 6a**:
+
+*Resolved:*
+- **spo2 nesting** — confirmed: `daily_spo2.spo2_percentage` is a nested
+  object, `{average}` required, and the object itself is nullable.
+- **Spotify account-data package shape** — resolved as a *correction*, not a
+  confirmation. See §12.2.
+- **Midnight-crossing day-bucket rule** — partially resolved: the Oura sleep
+  day changes at 18:00, which is enough for the actionable rule (bucket by
+  `day`). The general edge-case arithmetic remains unspecified.
+
+*Still unverified, and marked as gaps in the shipped profiles rather than
+stated as fact:* daytime heart-rate cadence (`PublicHeartRateRow` has no
+interval field, so the profile tells the agent to measure gaps rather than
+assume 5-minute samples), Oura Ring CSV headers, the current ChatGPT export
+file list (OpenAI's help centre 403s to automated fetches), Spotify's
+`reason_end` vocabulary and duplicate rate (§12.2), the Anthropic Commercial
+ToS reading (summarized, not counsel-reviewed), and dsh's 201,918-star count
+(real per the API, but accrued in 15 days on a repo with Issues disabled — not
+a usable maturity signal).

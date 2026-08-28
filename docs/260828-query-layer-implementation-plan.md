@@ -122,19 +122,49 @@ Record the result in the design doc; it is currently the largest open risk
 
 ### Phase 3 — Relay capability check (gate, small)
 
-Determines the harness (design §19.4).
+Determines the harness (design §19.4). **DONE 2026-08-28 — answered from
+source, without calling the relay.**
 
-Check whether `inference.baseUrl` (default `https://inference.phala.com/v1`)
-implements the **OpenAI Responses API** or only Chat Completions.
+As originally written this phase asked the wrong question. It said "check
+whether `inference.baseUrl` (default `https://inference.phala.com/v1`)
+implements the Responses API" — but in a real deployment `inference.baseUrl` is
+`<gateway>/v1/inference`, and **the two hops have opposite answers**:
 
-- **Responses API supported** → Codex CLI becomes viable, and with it the only
-  bundled cross-platform OS sandbox (`codex-rs/sandboxing/`, Landlock+bwrap /
-  Seatbelt / Windows restricted tokens, per-path scoping *and* network
-  allowlisting). Re-open the harness decision.
-- **Chat Completions only** (expected) → proceed with phase 4 as written.
+| Hop | Responses API? |
+| --- | --- |
+| **Our `data-gateway`** (what the PS actually calls) | **No.** Exactly three inference routes: `POST /v1/inference/chat/completions` plus two attestation reads. No Responses route on `main` or `dev`, none in flight. |
+| **Phala upstream** (what the gateway forwards to) | **Yes.** `.route("/v1/responses", post(responses))`, create-only opaque passthrough; the docs' example uses `z-ai/glm-5.2`. Support is per-upstream and per-model, not a gateway guarantee. |
 
-Also confirm tool-calling support on the relay; PR #231 already proved the wire
-format works against it.
+**And it does not matter, because E2EE cannot travel on Responses at all.**
+Phala returns a hard `400 e2ee_unsupported_endpoint`: `spec/e2ee-v2.md` §5
+defines encryptable field paths only for the `messages[]`/`choices[]` shape and
+mandates rejection for any endpoint it does not cover. Our own implementation
+matches that surface exactly — `phala.ts` encrypts `messages.{i}.content`,
+`inference.ts::readContent` reads `choices.{i}.message.content`, and `aad.ts`
+binds the field path into the AAD, so a Responses body gives the scheme nothing
+to name.
+
+So **"Responses supported → Codex viable" is a false implication.** Reaching
+Codex would require building and deploying a new signed gateway route, *and*
+setting `inference.e2ee = false`, *and* accepting that Codex is a subprocess
+wrapper that cannot run in `packages/lite` at all (two harnesses), *and* still
+building phase 4b, since Codex sandboxes the process but does not make
+out-of-grant scopes unnameable.
+
+**Phase 4 stands as written.** Revisit only if Phala ships an E2EE v3 that
+defines Responses field paths. The residual decision — whether giving up E2EE
+is ever worth Codex's sandbox — is a human call, not an agent's.
+
+Tool-calling on the relay is confirmed supported on chat completions
+(`tools` / `tool_choice`), recorded as a capability only: phase 5's
+code-as-content decision means we do not use it while E2EE is on.
+
+A probe script exists to confirm the gateway result live. It is deliberately
+**unsigned**: the gateway is Vercel with an explicit rewrite allowlist and no
+catch-all, so an absent route is answered 404 by the platform before any
+handler runs, while a present route reaches the handler and rejects an unsigned
+request with our own JSON error shape. That difference is the whole signal, it
+triggers no inference, and it costs nothing.
 
 ---
 
@@ -268,6 +298,36 @@ the **post-encryption** bytes, via `createRequestSigner`
 for lineage reads. `INFERENCE_API_KEY`, when set, wins and skips signing. A
 signing failure is permanent (`relay_signing_failed`, no retry). New error codes
 to handle: `relay_signing_failed`, `e2ee_attestation_*`.
+
+**Gateway constraints the loop must respect** (found 2026-08-28 in
+`data-gateway` during phase 3; none of these appeared in this plan before, and
+each one bites a code loop harder than it bit one-shot derivative compute):
+
+1. **`INFERENCE_MAX_BODY_BYTES` = 2 MiB on our gateway** (Phala's own cap is
+   32 MiB). A code-as-content loop feeds script output back as the next
+   message's content, so a large scan result 413s at the relay. The loop needs
+   its **own output budget on what it feeds back**, separate from the sandbox's
+   `maxOutputBytes` — truncate and say so rather than failing the turn.
+2. **`INFERENCE_MODEL_ALLOWLIST` defaults to exactly `z-ai/glm-5.2`.** This
+   plan treats the model as PS-side config; it is not. Any model change is a
+   gateway env change plus a redeploy.
+3. **The gateway has no rate limiting** (`docs/INFERENCE_RELAY.md` says
+   "TODO"). An agent loop makes far more relay calls than one-shot compute did.
+   The only guards today are the registration bar, the model allowlist, the
+   body cap and Phala's quota — so the loop's own `budget.toolCalls` is
+   currently the *only* thing bounding call volume. Treat it as load-bearing.
+
+Also note the gateway's auth shape: `uri` is the path and **query strings are
+refused outright**, and authorization requires a live personal-server
+registration in the gateway's `servers` table (server address or owner
+address). The query layer inherits that bar unchanged.
+
+**Config default vs deployed topology.** `packages/core/src/schemas/server-config.ts`
+defaults `inference.baseUrl` to `https://inference.phala.com/v1` — the
+direct-provider local-dev mode — while the deployed path is
+`<gateway>/v1/inference`. That mismatch is what made this plan's phase 3 ask
+the wrong question in the first place. Do not infer the deployed topology from
+the default.
 
 **If the query layer ever registers or lists questions as a builder** (not
 owner), note `d91124d`: the write-attribution proof's signed `uri` now covers
@@ -542,9 +602,15 @@ numbers were found.
   Add env overrides only for the Node server, matching `INFERENCE_*` precedent.
 - **Error codes** go in `packages/core/src/errors/catalog.ts` next to the
   existing `DERIVATIVE_*` codes.
-- **T2 profiles are shipped assets.** They are `.md` files that must reach
-  `dist`; add a build copy step and a `files` entry the way `packages/lite` does
-  for `browser-tls-rustls` (`npm run copy-tls`).
+- **T2 profiles are shipped assets.** ~~They are `.md` files that must reach
+  `dist`; add a build copy step and a `files` entry.~~ **Superseded 2026-08-28
+  (phase 6a).** Reading `.md` at runtime conflicts with this section's own
+  first bullet — `packages/core` must stay browser-safe, so a file read would
+  need a port, and a port for static text that never changes is machinery for
+  nothing. The `.md` files remain the authored source of truth; a generated
+  `profiles.generated.ts` inlines them as string constants, and a test re-reads
+  the `.md` and fails on drift. No build copy step, no `files` change, and the
+  loader has zero Node imports.
 - **Reuse, don't duplicate.** `packages/core/src/mcp/search` already holds the
   MiniSearch index; extend it rather than building a second one (PR #231's
   mistake). Same for `createRequestSigner` and the `storage/blocks` cursor.
@@ -559,7 +625,7 @@ decision. Do not let an implementation agent silently pick an answer.
 | Open item | Blocks | Resolved by |
 | --- | --- | --- |
 | Determinism of regenerated aggregation code | how much we materialize; whether skill caching is mandatory | Phase 2 |
-| Does the relay speak the OpenAI Responses API? | whether Codex CLI's sandbox becomes available | Phase 3 (small) |
+| ~~Does the relay speak the OpenAI Responses API?~~ | ~~whether Codex CLI's sandbox becomes available~~ | **RESOLVED 2026-08-28, phase 3.** Our gateway does not expose it; Phala does; E2EE cannot travel on it either way. Codex stays out and phase 4 stands. The *decision* to trade E2EE for a sandbox remains a human call if anyone wants to reopen it. |
 | QuickJS throughput on tens of MB of JSON | whether Lite can use the paranoid path at all | throwaway benchmark, §4.2 |
 | Can the WebView host guarantee `connect-src 'none'`? | blob-worker vs QuickJS on Lite | §4.1 |
 | Realistic Lite corpus size under OPFS | Lite's materialization set | Phase 1, Lite profile |
