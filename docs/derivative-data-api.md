@@ -482,8 +482,10 @@ The compute layer lets a builder register a QUESTION over the owner's source
 scopes and have the Personal Server answer it locally. The answer is written
 as an ordinary derivative record (everything above applies unchanged) into a
 derived scope the builder may write; the builder then reads it through its
-normal read grant. The raw source data never leaves the Personal Server
-except through the inference call.
+normal read grant, which needs a BARE read entry for the derived scope on
+top of the `write:` entry (see "The grant a builder needs" below). The raw
+source data never leaves the Personal Server except through the inference
+call.
 
 Consent for a builder question is read on every source scope plus write on
 the derived scope, from the same grant. The answer is whatever the model
@@ -496,8 +498,36 @@ scope that the builder's grant does not cover with a bare read entry
 same check runs against the live grant before every compute, so a grant
 that is later narrowed fails the question closed without an inference call.
 Owner registrations are not subject to it. What the builder does not need
-is a separate read grant on the sources: one grant carrying
-`["oura.sleep", "chatgpt.conversations", "write:coach.weekly"]` is enough.
+is a SEPARATE grant for the sources: one grant carries the whole flow.
+
+### The grant a builder needs
+
+The read policy matches a requested scope against the grant's entries
+verbatim, and a requested scope never carries the `write:` prefix, so a
+`write:` entry can never satisfy a read. Three kinds of entry are therefore
+needed, in one grant:
+
+| Entry                      | What it is for                                   |
+| -------------------------- | ------------------------------------------------ |
+| bare read on each source   | registering the question and every recompute     |
+| bare read on derived scope | reading the answer back with `GET /v1/data/...`  |
+| `write:<derivedScope>`     | registering, and the question API's builder auth |
+
+```json
+{
+  "scopes": [
+    "oura.sleep",
+    "chatgpt.conversations",
+    "coach.weekly",
+    "write:coach.weekly"
+  ]
+}
+```
+
+Leaving out the bare `coach.weekly` entry is the common mistake: the
+question registers and computes, and then the read of the answer fails with
+`SCOPE_MISMATCH` because `write:coach.weekly` grants no read. Patterns work
+in both positions (`coach.*` and `write:coach.*`).
 
 What runs where:
 
@@ -514,21 +544,66 @@ What runs where:
 All under `/v1/derivatives`. Authentication for a builder is the Write API's
 (no new credential): the write-session bearer token from
 `POST /v1/write/session` plus the `X-Vana-Write-Signature` proof over the
-request (method, path, body), authorized for `write:<derivedScope>` exactly
-like a write to that scope. The proof is single use, so every builder call
-signs a fresh one, and a JSON body must be the compact serialization of its
-own value (`JSON.stringify` output; pretty-printed bodies are refused with
-400 `WRITE_BODY_NOT_CANONICAL`, as on the write path). Registration bodies
-are capped at 16 KB (413). The owner uses any owner credential. PS-Lite has
-no write sessions, so there only the owner can register.
+request, authorized for `write:<derivedScope>` exactly like a write to that
+scope. A JSON body must be the compact serialization of its own value
+(`JSON.stringify` output; pretty-printed bodies are refused with 400
+`WRITE_BODY_NOT_CANONICAL`, as on the write path). Registration bodies are
+capped at 16 KB (413). The owner uses any owner credential. PS-Lite has no
+write sessions, so there only the owner can register.
 
-| Method | Path                       | Who                                                       | Result                              |
-| ------ | -------------------------- | --------------------------------------------------------- | ----------------------------------- |
-| POST   | `/questions`               | builder (`write:<derivedScope>`) or owner                 | 201 registration, `status: pending` |
-| GET    | `/questions`               | owner; builder with `?derivedScope=` (own questions only) | `{ questions: [...] }`              |
-| GET    | `/questions/:id`           | owner or the registering builder                          | registration with status            |
-| POST   | `/questions/:id/recompute` | owner or the registering builder                          | 202, recompute scheduled now        |
-| DELETE | `/questions/:id`           | owner or the registering builder                          | `{ questionId, deleted: true }`     |
+Two rules about the proof matter on these routes.
+
+**The signed `uri` covers the query string.** The list route authorizes the
+caller against `?derivedScope=`, so the proof must commit to it: sign
+`pathname + search`, not the bare path. A proof that signed only the path is
+refused on a request that carries a query (401
+`WRITE_ATTRIBUTION_INVALID`), and a proof signed for one derived scope does
+not authorize a list of another. Parameter ORDER does not matter (the server
+compares a canonical form, parameters sorted by name and then value), but
+the parameters themselves must match. Requests with no query string sign the
+bare path exactly as before.
+
+**Polling needs a `nonce` claim.** A proof payload is otherwise fully
+determined by `{aud, method, uri, bodyHash, grantId, iat, exp}`, so two
+identical `GET /questions/:id` polls signed in the same second are
+byte-identical and the second is refused as a replay (401
+`WRITE_ATTRIBUTION_REPLAY`). Add an optional `nonce` claim to the signed
+payload (any unique string of 1 to 128 characters; a uuid is the intended
+shape) and each call is distinct. The nonce itself is then single use:
+re-using one is a replay even if the rest of the payload changed. Without a
+nonce the whole proof is the replay key, so the fallback for a client that
+cannot add claims is to vary one it already sends: give each call its own
+`exp` (unbounded going forward), or an `iat` a second apart (a future `iat`
+is rejected beyond 60s of skew, so count backwards). Signed payload with a nonce:
+
+```json
+{
+  "aud": "https://ps.example.com",
+  "bodyHash": "sha256:e3b0...b855",
+  "exp": 1787654621,
+  "grantId": "0x...",
+  "iat": 1787654321,
+  "method": "GET",
+  "nonce": "8a1f0c2e-...",
+  "uri": "/v1/derivatives/questions/5f0c..."
+}
+```
+
+(Claims are serialized with sorted keys, base64url-encoded and signed
+EIP-191, exactly as without the nonce.)
+
+| Method | Path                       | Who                                                       | Result                               |
+| ------ | -------------------------- | --------------------------------------------------------- | ------------------------------------ |
+| POST   | `/questions`               | builder (`write:<derivedScope>`) or owner                 | 201 registration view                |
+| GET    | `/questions`               | owner; builder with `?derivedScope=` (own questions only) | `{ questions: [...] }`               |
+| GET    | `/questions/:id`           | owner or the registering builder                          | registration view                    |
+| POST   | `/questions/:id/recompute` | owner or the registering builder                          | 202 registration view, recompute now |
+| DELETE | `/questions/:id`           | owner or the registering builder                          | `{ questionId, deleted: true }`      |
+
+Every route but DELETE answers with the same registration view, so a client
+needs one schema. The 202 from `recompute` carries the status the scheduled
+run starts from: `pending` for a question that never computed, `stale`
+otherwise.
 
 Registration body:
 
@@ -552,7 +627,7 @@ Sources do not have to exist yet: a missing source fails the compute
 ("source scope X has no local data") and the question recomputes once the
 scope arrives.
 
-Registration view (POST, GET and list):
+Registration view (POST, GET, list and recompute):
 
 ```json
 {
@@ -573,16 +648,28 @@ Registration view (POST, GET and list):
 ```
 
 A builder that did not register a question (even one holding a write grant
-on the same scope) gets 404 for it; an unknown id is answered after owner
-auth, so a builder probing ids gets 401. Registrations are local to the
-Personal Server that holds them (they never sync); that replica computes.
+on the same scope) gets 404 for it, and so does an unknown id: any caller
+that presents a live write session (or owner credentials) gets 404 rather
+than 401, which would send a client with a re-handshake-on-401 policy
+through a pointless handshake and then report the wrong problem. A caller
+with no credentials still gets 401. A builder that calls `GET /questions`
+with no `?derivedScope=` gets 400 `DERIVATIVE_DERIVED_SCOPE_REQUIRED` for
+the same reason: the unfiltered list is the owner's. Registrations are local
+to the Personal Server that holds them (they never sync); that replica
+computes.
 
-| Status | errorCode                           | When                              |
-| ------ | ----------------------------------- | --------------------------------- |
-| 400    | `DERIVATIVE_QUESTION_INVALID`       | body shape, scope grammar, limits |
-| 400    | `LINEAGE_SCOPE_UNDER_SOURCE_PREFIX` | naming rule                       |
-| \1     | 403                                 | `DERIVATIVE_SOURCE_NOT_GRANTED`   | a source scope is not read-granted to the builder (`details.scopes`) | \n  | 404 | `DERIVATIVE_QUESTION_NOT_FOUND`  | unknown id, or not this builder's question |
-| \1     | 413                                 | `CONTENT_TOO_LARGE`               | registration body over 16 KB                                         | \n  | 503 | `DERIVATIVE_COMPUTE_UNAVAILABLE` | the server has no compute layer wired      |
+| Status | errorCode                           | When                                                                 |
+| ------ | ----------------------------------- | -------------------------------------------------------------------- |
+| 400    | `DERIVATIVE_QUESTION_INVALID`       | body shape, scope grammar, limits                                    |
+| 400    | `LINEAGE_SCOPE_UNDER_SOURCE_PREFIX` | naming rule                                                          |
+| 400    | `DERIVATIVE_DERIVED_SCOPE_REQUIRED` | builder list call with no `?derivedScope=`                           |
+| 401    | `WRITE_ATTRIBUTION_INVALID`         | the proof does not cover this exact request (uri, query included)    |
+| 401    | `WRITE_ATTRIBUTION_REPLAY`          | the proof, or its nonce, was already used                            |
+| 403    | `DERIVATIVE_SOURCE_NOT_GRANTED`     | a source scope is not read-granted to the builder (`details.scopes`) |
+| 404    | `DERIVATIVE_QUESTION_NOT_FOUND`     | unknown id, or not this builder's question                           |
+| 409    | `DERIVATIVE_CYCLE`                  | the registration would make the derived scope its own source         |
+| 413    | `CONTENT_TOO_LARGE`                 | registration body over 16 KB                                         |
+| 503    | `DERIVATIVE_COMPUTE_UNAVAILABLE`    | the server has no compute layer wired                                |
 
 ### Status machine
 

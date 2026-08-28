@@ -178,9 +178,39 @@ export function createServerApiAuth(
     await authorizeOwner(input.request);
   }
 
+  /**
+   * Identity-only recognition of a write-session caller: the bearer must
+   * resolve to a live session and the request must carry that builder's
+   * valid proof, but NO grant policy runs (there is no scope to run it
+   * against). Callers use it only to choose between error shapes, never to
+   * release data, so a revoked or narrowed grant getting a 404 instead of a
+   * 401 discloses nothing. Returns undefined for any other credential.
+   */
+  async function authorizeWriteSession(request: Request) {
+    const token = bearerToken(request);
+    if (!token || !deps.writeSessionStore) return;
+    const session = await deps.writeSessionStore.getByTokenHash(
+      await hashWriteSessionToken(token),
+    );
+    if (!session) return;
+    const { releaseProof } = await verifyWriterAttribution({
+      request,
+      builderAddress: session.builderAddress,
+      grantId: session.grantId,
+      serverOrigin: deps.serverOrigin,
+      replayStore: writeProofReplayStore,
+    });
+    return {
+      builder: session.builderAddress,
+      grantId: session.grantId,
+      releaseProof,
+    };
+  }
+
   return {
     authorizeOwner,
     authorizeWrite,
+    authorizeWriteSession,
 
     async authorizeBuilderList(request) {
       const result = await authenticate(request, deps);

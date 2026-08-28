@@ -62,6 +62,16 @@ function createAuth(
       if (token(request) !== OWNER_TOKEN) throw new NotOwnerError();
       return undefined;
     },
+    async authorizeWriteSession(request) {
+      // Identity only, as the real port does: the bearer resolves to a live
+      // write session, no scope is authorized.
+      if (token(request) !== BUILDER_TOKEN) return undefined;
+      return {
+        builder,
+        grantId: "grant-1",
+        releaseProof: vi.fn(async () => undefined),
+      };
+    },
   };
 }
 
@@ -279,11 +289,33 @@ describe("handlePersonalServerDerivativesRequest", () => {
     expect(mine).toHaveLength(1);
     expect(mine[0].registeredBy.builder).toBe(BUILDER);
 
-    // No scope: the owner-only list.
+    // No scope: the owner-only list. A builder gets the missing-parameter
+    // answer, not a 401 that would send it re-handshaking for nothing.
     const noScope = await call(deps, "GET", "/questions", {
       token: BUILDER_TOKEN,
     });
-    expect(noScope.status).toBe(401);
+    expect(noScope.status).toBe(400);
+    expect((await noScope.json()).error.errorCode).toBe(
+      "DERIVATIVE_DERIVED_SCOPE_REQUIRED",
+    );
+
+    // An anonymous caller still gets the owner gate's 401.
+    const anonymous = await call(deps, "GET", "/questions");
+    expect(anonymous.status).toBe(401);
+
+    // An auth port with no write sessions (PS-Lite) is unchanged.
+    const ownerOnly = createDeps();
+    ownerOnly.deps.auth = {
+      ...ownerOnly.deps.auth,
+      authorizeWriteSession: undefined,
+    };
+    expect(
+      (
+        await call(ownerOnly.deps, "GET", "/questions", {
+          token: BUILDER_TOKEN,
+        })
+      ).status,
+    ).toBe(401);
   });
 
   it("reports status to the owner and the registering builder, 404 to anyone else", async () => {
@@ -321,10 +353,29 @@ describe("handlePersonalServerDerivativesRequest", () => {
     );
     expect(other.status).toBe(404);
 
+    // An unknown id is 404 for a builder holding a live write session: it
+    // already gets 404 for another builder's question, so nothing new leaks,
+    // and a 401 here would burn a handshake and report the wrong problem.
     const unknownAsBuilder = await call(deps, "GET", "/questions/nope", {
       token: BUILDER_TOKEN,
     });
-    expect(unknownAsBuilder.status).toBe(401);
+    expect(unknownAsBuilder.status).toBe(404);
+    expect((await unknownAsBuilder.json()).error.errorCode).toBe(
+      "DERIVATIVE_QUESTION_NOT_FOUND",
+    );
+    // Unauthenticated callers still get the owner gate.
+    expect((await call(deps, "GET", "/questions/nope")).status).toBe(401);
+    expect(
+      (await call(deps, "DELETE", "/questions/nope", { token: BUILDER_TOKEN }))
+        .status,
+    ).toBe(404);
+    expect(
+      (
+        await call(deps, "POST", "/questions/nope/recompute", {
+          token: BUILDER_TOKEN,
+        })
+      ).status,
+    ).toBe(404);
     const unknownAsOwner = await call(deps, "GET", "/questions/nope", {
       token: OWNER_TOKEN,
     });
@@ -359,13 +410,41 @@ describe("handlePersonalServerDerivativesRequest", () => {
       token: OWNER_TOKEN,
     });
     expect(owner.status).toBe(202);
+    // The full registration view, like every other route: one schema.
     expect(await owner.json()).toEqual({
       questionId: "q-1",
-      status: "pending",
       derivedScope: "coach.weekly",
+      sourceScopes: ["oura.sleep"],
+      question: "How did I sleep?",
+      model: null,
+      registeredBy: { kind: "builder", builder: BUILDER, grantId: "grant-1" },
+      status: "pending",
+      error: null,
+      createdAt: "2026-08-27T10:00:00.000Z",
+      updatedAt: "2026-08-27T10:00:00.000Z",
+      lastComputedAt: null,
+      derivedVersion: null,
+      derivedCollectedAt: null,
     });
     expect(scheduler.requestRecompute).toHaveBeenCalledWith("q-1", {
       immediate: true,
+    });
+
+    // A question that already computed reports the status the scheduled run
+    // starts from, with the rest of the view intact.
+    await deps.compute!.store.update("q-1", {
+      status: "ready",
+      derivedVersion: 2,
+      lastComputedAt: "2026-08-27T11:00:00.000Z",
+    });
+    const again = await call(deps, "POST", "/questions/q-1/recompute", {
+      token: OWNER_TOKEN,
+    });
+    expect(await again.json()).toMatchObject({
+      questionId: "q-1",
+      status: "stale",
+      derivedVersion: 2,
+      lastComputedAt: "2026-08-27T11:00:00.000Z",
     });
 
     const missing = await call(deps, "POST", "/questions/nope/recompute", {

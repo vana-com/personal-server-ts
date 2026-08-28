@@ -186,6 +186,7 @@ describe("/v1/derivatives/questions (composed app)", () => {
     method: string,
     path: string,
     body?: unknown,
+    options: { signedUri?: string; nonce?: string } = {},
   ): Promise<Response> {
     const rawBody = body === undefined ? "" : JSON.stringify(body);
     const headers: Record<string, string> = {
@@ -196,9 +197,12 @@ describe("/v1/derivatives/questions (composed app)", () => {
       wallet: builderWallet,
       aud: SERVER_ORIGIN,
       method,
-      uri: path,
+      // The proof covers path AND query; a caller may sign a different uri
+      // to exercise the binding.
+      uri: options.signedUri ?? path,
       body: new TextEncoder().encode(rawBody),
       grantId: WRITE_GRANT_ID,
+      ...(options.nonce === undefined ? {} : { nonce: options.nonce }),
     });
     return app.request(path, {
       method,
@@ -448,6 +452,81 @@ describe("/v1/derivatives/questions (composed app)", () => {
       headers: owner,
     });
     expect((await list.json()).questions).toEqual([]);
+  });
+
+  it("binds the question list to the derived scope the proof signed", async () => {
+    const registered = await builderRequest(
+      "POST",
+      "/v1/derivatives/questions",
+      question,
+    );
+    expect(registered.status).toBe(201);
+
+    const listPath = "/v1/derivatives/questions?derivedScope=coach.weekly";
+    const mine = await builderRequest("GET", listPath);
+    expect(mine.status).toBe(200);
+    expect((await mine.json()).questions).toHaveLength(1);
+
+    // The scope decides the authorization, so a proof that only signed the
+    // path does not authorize any scope.
+    const barePath = await builderRequest("GET", listPath, undefined, {
+      signedUri: "/v1/derivatives/questions",
+    });
+    expect(barePath.status).toBe(401);
+    expect((await barePath.json()).error.errorCode).toBe(
+      "WRITE_ATTRIBUTION_INVALID",
+    );
+
+    // And a proof signed for one scope does not carry over to another.
+    const otherScope = await builderRequest(
+      "GET",
+      "/v1/derivatives/questions?derivedScope=coach.daily",
+      undefined,
+      { signedUri: listPath },
+    );
+    expect(otherScope.status).toBe(401);
+  });
+
+  it("tells a builder the derived scope is required instead of 401", async () => {
+    const res = await builderRequest("GET", "/v1/derivatives/questions");
+    expect(res.status).toBe(400);
+    expect((await res.json()).error.errorCode).toBe(
+      "DERIVATIVE_DERIVED_SCOPE_REQUIRED",
+    );
+  });
+
+  it("answers 404, not 401, for an unknown question id", async () => {
+    const res = await builderRequest(
+      "GET",
+      "/v1/derivatives/questions/does-not-exist",
+    );
+    expect(res.status).toBe(404);
+    expect((await res.json()).error.errorCode).toBe(
+      "DERIVATIVE_QUESTION_NOT_FOUND",
+    );
+  });
+
+  it("lets a builder poll with a nonce and refuses a re-used one", async () => {
+    const registered = await builderRequest(
+      "POST",
+      "/v1/derivatives/questions",
+      question,
+    );
+    const id = (await registered.json()).questionId as string;
+    const path = `/v1/derivatives/questions/${id}`;
+    const poll = (nonce: string) =>
+      builderRequest("GET", path, undefined, { nonce });
+
+    // Two polls in the same second: identical payloads but for the nonce.
+    expect((await poll("poll-1")).status).toBe(200);
+    expect((await poll("poll-2")).status).toBe(200);
+
+    const replayed = await poll("poll-1");
+    expect(replayed.status).toBe(401);
+    expect((await replayed.json()).error.errorCode).toBe(
+      "WRITE_ATTRIBUTION_REPLAY",
+    );
+    await scheduler.whenIdle();
   });
 
   it("answers 503 when no compute layer is wired and 401 without credentials", async () => {

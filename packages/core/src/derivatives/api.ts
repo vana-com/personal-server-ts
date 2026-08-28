@@ -10,11 +10,18 @@
  * Builder authentication is the Write API's: a write-session bearer token
  * plus the X-Vana-Write-Signature proof over the request, authorized for
  * `write:<derivedScope>` (api-auth authorizeWrite). No new credential.
+ *
+ * The proof signs the request URI INCLUDING its query string (see
+ * canonicalSignedUri in write/attribution.ts), because on the list route the
+ * query decides the authorization: `?derivedScope=X` is the scope the caller
+ * is authorized against, and a proof that did not commit to it could be
+ * captured on one scope and replayed on another.
  */
 
 import {
   ContentTooLargeError,
   DerivativeComputeUnavailableError,
+  DerivativeDerivedScopeRequiredError,
   DerivativeQuestionNotFoundError,
   DerivativeSourceNotGrantedError,
   ProtocolError,
@@ -24,6 +31,7 @@ import type {
   PersonalServerApiAuthPort,
   PersonalServerApiDispatchOptions,
   PersonalServerWriteAuthResult,
+  PersonalServerWriteSessionResult,
 } from "../api/index.js";
 import {
   createQuestionRegistration,
@@ -42,7 +50,10 @@ import {
 export const MAX_QUESTION_BODY_BYTES = 16 * 1024;
 
 export interface PersonalServerDerivativesApiDeps {
-  auth: Pick<PersonalServerApiAuthPort, "authorizeOwner" | "authorizeWrite">;
+  auth: Pick<
+    PersonalServerApiAuthPort,
+    "authorizeOwner" | "authorizeWrite" | "authorizeWriteSession"
+  >;
   /** Absent = the compute layer is not wired; every route answers 503. */
   compute?: {
     store: QuestionStore;
@@ -104,10 +115,29 @@ function sameBuilder(a: string, b: string): boolean {
 }
 
 /**
+ * Is this a builder call at all? Identity only (no scope is authorized), for
+ * the two answers that have no scope to authorize against: an unknown
+ * question id and a list call with no `?derivedScope=`. Nothing is disclosed
+ * either way, and the caller's proof is handed straight back — the request
+ * ends in an error, so it must not burn the proof.
+ */
+async function recognizeWriteSession(
+  deps: PersonalServerDerivativesApiDeps,
+  request: Request,
+): Promise<PersonalServerWriteSessionResult | undefined> {
+  if (!deps.auth.authorizeWriteSession) return undefined;
+  const session = (await deps.auth.authorizeWriteSession(request)) ?? undefined;
+  await session?.releaseProof?.();
+  return session;
+}
+
+/**
  * The registration a caller may act on, or a 404 for everyone who may not:
  * the owner sees every registration; a builder sees the ones it registered.
- * An id the store does not hold is answered after owner auth, so a builder
- * learns nothing from probing ids.
+ * An id the store does not hold is 404 for any authenticated caller (a
+ * builder holding a live write session, or the owner) and 401 for everyone
+ * else, so a builder learns nothing from probing ids that it could not learn
+ * from probing another builder's ids, which already answers 404.
  */
 async function loadForCaller(
   deps: PersonalServerDerivativesApiDeps,
@@ -120,7 +150,12 @@ async function loadForCaller(
 }> {
   const registration = await store.get(questionId);
   if (!registration) {
-    await deps.auth.authorizeOwner(request);
+    // No registration means no derived scope to authorize a builder against,
+    // so fall back to identity: a live write session is enough to be told
+    // 404. Without it the owner gate decides (and answers 401).
+    if (!(await recognizeWriteSession(deps, request))) {
+      await deps.auth.authorizeOwner(request);
+    }
     throw new DerivativeQuestionNotFoundError({ questionId });
   }
   const writer = await authorizeOwnerOrWriter(
@@ -172,6 +207,13 @@ export async function handlePersonalServerDerivativesRequest(
           return jsonResponse({
             questions: registrations.map(questionRegistrationView),
           });
+        }
+        // The unfiltered list is the owner's. A builder that reached it
+        // simply forgot the parameter, so say that instead of 401: the
+        // 401 would send a re-handshake-on-401 client through a handshake
+        // and then report an authentication problem it does not have.
+        if (await recognizeWriteSession(deps, request)) {
+          throw new DerivativeDerivedScopeRequiredError();
         }
         await deps.auth.authorizeOwner(request);
         const registrations = await store.list();
@@ -282,12 +324,15 @@ export async function handlePersonalServerDerivativesRequest(
         questionId,
       );
       scheduler.requestRecompute(questionId, { immediate: true });
+      // The same registration view every other route returns, so a client
+      // needs one schema. The status is the one the scheduled run starts
+      // from: a question that never computed stays `pending`, anything else
+      // is `stale` until the run lands.
       return jsonResponse(
-        {
-          questionId,
+        questionRegistrationView({
+          ...registration,
           status: registration.status === "pending" ? "pending" : "stale",
-          derivedScope: registration.derivedScope,
-        },
+        }),
         { status: 202 },
       );
     }

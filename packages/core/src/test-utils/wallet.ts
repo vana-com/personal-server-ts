@@ -67,7 +67,16 @@ export async function buildWeb3SignedHeader(params: {
   iat?: number;
   exp?: number;
   grantId?: string;
+  /**
+   * Optional `nonce` claim. The SDK's builder has no parameter for it yet,
+   * so a proof that carries one is assembled here (same wire rules: JSON
+   * with sorted keys, base64url, EIP-191 over the encoded payload).
+   */
+  nonce?: unknown;
 }): Promise<string> {
+  if (params.nonce !== undefined) {
+    return buildWeb3SignedHeaderWithClaims(params, { nonce: params.nonce });
+  }
   return sdkBuildWeb3SignedHeader({
     signMessage: (message: string) => params.wallet.signMessage(message),
     aud: params.aud,
@@ -79,4 +88,68 @@ export async function buildWeb3SignedHeader(params: {
     exp: params.exp,
     grantId: params.grantId,
   });
+}
+
+/** Base64url without padding, matching the SDK's encoder. */
+function base64UrlEncode(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCodePoint(byte);
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+/**
+ * Sign a Web3Signed payload with extra claims the SDK builder cannot emit.
+ * Same serialization as the SDK: sorted keys, compact JSON, base64url,
+ * EIP-191 over the encoded string.
+ */
+async function buildWeb3SignedHeaderWithClaims(
+  params: {
+    wallet: TestWallet;
+    aud: string;
+    method: string;
+    uri: string;
+    bodyHash?: string;
+    body?: Uint8Array;
+    iat?: number;
+    exp?: number;
+    grantId?: string;
+  },
+  extra: Record<string, unknown>,
+): Promise<string> {
+  const base = await sdkBuildWeb3SignedHeader({
+    signMessage: (message: string) => params.wallet.signMessage(message),
+    aud: params.aud,
+    method: params.method,
+    uri: params.uri,
+    bodyHash: params.bodyHash,
+    body: params.body,
+    iat: params.iat,
+    exp: params.exp,
+    grantId: params.grantId,
+  });
+  const payloadBase64 = base.slice("Web3Signed ".length).split(".")[0] ?? "";
+  const padded = payloadBase64
+    .replace(/-/g, "+")
+    .replace(/_/g, "/")
+    .padEnd(payloadBase64.length + ((4 - (payloadBase64.length % 4)) % 4), "=");
+  const decoded = new TextDecoder().decode(
+    Uint8Array.from(atob(padded), (char) => char.charCodeAt(0)),
+  );
+  const claims = { ...JSON.parse(decoded), ...extra } as Record<
+    string,
+    unknown
+  >;
+  const sorted = Object.keys(claims)
+    .sort()
+    .reduce<Record<string, unknown>>((acc, key) => {
+      acc[key] = claims[key];
+      return acc;
+    }, {});
+  const encoded = base64UrlEncode(
+    new TextEncoder().encode(JSON.stringify(sorted)),
+  );
+  return `Web3Signed ${encoded}.${await params.wallet.signMessage(encoded)}`;
 }

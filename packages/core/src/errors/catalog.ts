@@ -245,6 +245,17 @@ export class DerivativeQuestionNotFoundError extends ProtocolError {
   }
 }
 
+export class DerivativeDerivedScopeRequiredError extends ProtocolError {
+  constructor(details?: Record<string, unknown>) {
+    super(
+      400,
+      "DERIVATIVE_DERIVED_SCOPE_REQUIRED",
+      "Listing questions as a builder needs a derived scope: add ?derivedScope=<scope>. The unfiltered list is the owner's",
+      details,
+    );
+  }
+}
+
 export class DerivativeCycleError extends ProtocolError {
   constructor(details: { derivedScope: string; path: string[] }) {
     super(

@@ -14,11 +14,15 @@
  * path and back out on read. The on-chain shape is untouched.
  *
  * The proof binds the write to its context, not just its bytes: the signed
- * claims carry the request path (whose last segment is the scope), the
- * method, the audience (this server's origin) and the session's grantId,
- * which the PS requires to match the session at ingest. A stored `$writtenBy`
- * therefore cannot be lifted onto another scope's record or relabelled with a
- * different grant and still verify.
+ * claims carry the request uri (path AND query, see canonicalSignedUri; the
+ * path's last segment is the scope on the ingest route), the method, the
+ * audience (this server's origin) and the session's grantId, which the PS
+ * requires to match the session at ingest. A stored `$writtenBy` therefore
+ * cannot be lifted onto another scope's record or relabelled with a
+ * different grant and still verify. A proof may also carry an optional
+ * `nonce` claim, which is what makes it unique: without one, two identical
+ * requests signed in the same second are byte-identical and the replay guard
+ * refuses the second.
  *
  * What the builder signs is the STORED representation, not the wire body:
  * the compact JSON of the envelope `data` record the PS will write (minus
@@ -71,6 +75,104 @@ import { isBinaryEnvelope } from "../contracts/binary.js";
 
 /** Header carrying the builder's signed-payload proof on a session write. */
 export const WRITE_SIGNATURE_HEADER = "x-vana-write-signature";
+
+/**
+ * Upper bound on the optional `nonce` claim (a uuid or a short random
+ * string is the intended shape). Bounded so a proof cannot smuggle bulk
+ * data into the replay store's keys.
+ */
+export const MAX_PROOF_NONCE_LENGTH = 128;
+
+/** HTTP methods that never carry a body on this API. */
+function isBodylessMethod(method: string): boolean {
+  const upper = method.toUpperCase();
+  return upper === "GET" || upper === "HEAD" || upper === "DELETE";
+}
+
+/**
+ * Canonical query string: parameters sorted by name and then value. The
+ * signed uri must commit to the query because a query parameter can decide
+ * authorization (`GET /v1/derivatives/questions?derivedScope=X` authorizes
+ * the caller against that scope), and a proof that does not cover it can be
+ * replayed against a different scope. Sorting makes the rule insensitive to
+ * the order a client happens to serialize its parameters in.
+ */
+function canonicalQuery(search: string): string {
+  const entries = [...new URLSearchParams(search).entries()].sort((a, b) =>
+    a[0] === b[0]
+      ? a[1] < b[1]
+        ? -1
+        : a[1] > b[1]
+          ? 1
+          : 0
+      : a[0] < b[0]
+        ? -1
+        : 1,
+  );
+  const canonical = new URLSearchParams();
+  for (const [name, value] of entries) canonical.append(name, value);
+  return canonical.toString();
+}
+
+/**
+ * The uri a proof must commit to for a request: the path, plus the canonical
+ * query when the request carries one. A request with no query string signs
+ * the bare path exactly as before.
+ */
+export function canonicalSignedUri(pathname: string, search: string): string {
+  const query = canonicalQuery(search);
+  return query ? `${pathname}?${query}` : pathname;
+}
+
+/** The same canonical form applied to a signed `uri` claim. */
+export function canonicalizeSignedUri(uri: string): string {
+  const mark = uri.indexOf("?");
+  if (mark === -1) return uri;
+  return canonicalSignedUri(uri.slice(0, mark), uri.slice(mark + 1));
+}
+
+function base64UrlDecode(value: string): string {
+  const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = base64.padEnd(
+    base64.length + ((4 - (base64.length % 4)) % 4),
+    "=",
+  );
+  const binary = atob(padded);
+  return new TextDecoder().decode(
+    Uint8Array.from(binary, (char) => char.charCodeAt(0)),
+  );
+}
+
+/**
+ * The proof's optional `nonce` claim. Read from the raw signed payload, not
+ * from the verified claims: the SDK's parser keeps only the claims it knows,
+ * and the nonce is covered by the signature all the same (the signature is
+ * over the base64url payload string).
+ */
+function signedNonce(payloadBase64: string): string | undefined {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(base64UrlDecode(payloadBase64));
+  } catch {
+    // A payload that does not decode is rejected by verifyWeb3Signed.
+    return undefined;
+  }
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const nonce = (raw as Record<string, unknown>).nonce;
+  if (nonce === undefined || nonce === null) return undefined;
+  if (
+    typeof nonce !== "string" ||
+    nonce.length === 0 ||
+    nonce.length > MAX_PROOF_NONCE_LENGTH
+  ) {
+    throw new ProtocolError(
+      401,
+      "WRITE_ATTRIBUTION_INVALID",
+      `Payload proof nonce must be a string of 1 to ${MAX_PROOF_NONCE_LENGTH} characters`,
+    );
+  }
+  return nonce;
+}
 
 /**
  * Reserved key inside the envelope's `data` record for builder attribution.
@@ -167,6 +269,9 @@ async function signedBytesFor(
   request: Request,
   bodyBytes: Uint8Array,
 ): Promise<Uint8Array> {
+  // A bodyless method has no stored representation to sign: the proof
+  // commits to the empty body, whatever Content-Type the caller sent.
+  if (isBodylessMethod(request.method)) return bodyBytes;
   if (isJsonContentType(request)) return bodyBytes;
   return binaryWriteSignedBytes({
     bytes: bodyBytes,
@@ -200,13 +305,28 @@ export async function verifyWriterAttribution(
   const url = new URL(input.request.url);
   const bodyBytes = new Uint8Array(await input.request.clone().arrayBuffer());
 
+  // The proof must commit to the whole request uri, query included. Any
+  // signed uri whose canonical form equals the request's canonical form is
+  // accepted, so parameter order is the client's business; anything else is
+  // handed to verifyWeb3Signed as a URI mismatch against the canonical form.
+  const expectedUri = canonicalSignedUri(url.pathname, url.search);
+  let expectedPath = expectedUri;
+  try {
+    const claimedUri = parseWeb3SignedHeader(headerValue).payload.uri;
+    if (canonicalizeSignedUri(claimedUri) === expectedUri) {
+      expectedPath = claimedUri;
+    }
+  } catch {
+    // Unparseable header: verifyWeb3Signed reports it with its own error.
+  }
+
   let verified;
   try {
     verified = await verifyWeb3Signed({
       headerValue,
       expectedOrigin: resolveOrigin(input.serverOrigin),
       expectedMethod: input.request.method,
-      expectedPath: url.pathname,
+      expectedPath,
       bodyBytes: await signedBytesFor(input.request, bodyBytes),
     });
   } catch (err) {
@@ -237,32 +357,55 @@ export async function verifyWriterAttribution(
     );
   }
 
-  if (isJsonContentType(input.request)) {
+  // The compact `{payload}.{signature}` form (scheme prefix stripped) is what
+  // gets stored, so verifiers don't need to know the header framing; the raw
+  // payload is also where the optional `nonce` claim is read from.
+  const { payloadBase64, signature } = parseWeb3SignedHeader(headerValue);
+  const nonce = signedNonce(payloadBase64);
+
+  // Bodyless methods (the derivative read / delete routes) never carry a
+  // body: skip the canonical-JSON rule explicitly instead of running it over
+  // empty bytes, where isJsonContentType's missing-header default would send
+  // it into a swallowed JSON.parse throw.
+  if (
+    !isBodylessMethod(input.request.method) &&
+    bodyBytes.byteLength > 0 &&
+    isJsonContentType(input.request)
+  ) {
     assertCanonicalJsonBody(bodyBytes);
   }
 
   // Replay guard, last: only a proof that passed every check is consumed,
   // so a rejected request never burns a proof.
+  //
+  // Without a `nonce` claim the key is the proof itself, so two identical
+  // requests signed in the same second (a naive poll of GET /questions/:id)
+  // produce byte-identical proofs and the second is refused. A proof that
+  // carries a nonce is keyed by (builder, nonce) instead: the builder makes
+  // each call distinct, and re-using a nonce is a replay even if the rest of
+  // the payload changed.
   let releaseProof: (() => Promise<void>) | undefined;
   if (input.replayStore) {
     const store = input.replayStore;
-    const proofId = await sha256HexOf(headerValue);
+    const proofId = await sha256HexOf(
+      nonce === undefined
+        ? headerValue
+        : `nonce:${input.builderAddress.toLowerCase()}:${nonce}`,
+    );
     const replayed = await store.consume(proofId, verified.payload.exp * 1000);
     if (replayed) {
       throw new ProtocolError(
         401,
         "WRITE_ATTRIBUTION_REPLAY",
-        "Payload proof already used; sign a fresh proof for each write",
+        nonce === undefined
+          ? "Payload proof already used; sign a fresh proof for each call (or add a unique nonce claim so repeated reads stay distinct)"
+          : "Payload proof nonce already used; each nonce is single use",
       );
     }
     releaseProof = async () => {
       await store.release?.(proofId);
     };
   }
-
-  // Store the compact `{payload}.{signature}` form (scheme prefix stripped)
-  // so verifiers don't need to know the header framing.
-  const { payloadBase64, signature } = parseWeb3SignedHeader(headerValue);
 
   return {
     builder: input.builderAddress,
