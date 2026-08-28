@@ -11,7 +11,7 @@
  *   npm run eval -- --keep out/corpus   # keep the corpus for inspection
  */
 
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -24,11 +24,16 @@ import {
   formatReport,
   generateInto,
   runEval,
+  type CorpusManifest,
   type FixtureProfileName,
 } from "@opendatalabs/personal-server-ts-core/query/evals";
 
 import { FsFixtureSink } from "./query-eval-fs-sink.js";
 import { createAgentAnswerer } from "../packages/core/src/query/agent/index.js";
+import {
+  createOpenAiCompatibleInferenceProvider,
+  type InferenceProvider,
+} from "../packages/core/src/derivatives/inference.js";
 import { createFakeInferenceProvider } from "../packages/core/src/derivatives/inference.js";
 import { createNodeSandbox } from "../packages/server/src/query/node-sandbox.js";
 import { createSandboxToolHost } from "../packages/server/src/query/sandbox-tool-host.js";
@@ -48,32 +53,44 @@ function arg(name: string, fallback?: string): string | undefined {
  * model's words are canned. Pointing this at a live relay is a separate,
  * deliberate act (see `packages/core/src/query/agent/SMOKE.md`).
  */
-async function buildAgentAnswerer(corpusDir: string) {
-  const files = await readdir(corpusDir);
-  const scopes = files
-    .filter((f) => f.endsWith(".json"))
-    .map((f) => ({
-      scope: f.replace(/\.json$/, ""),
+async function buildAgentAnswerer(
+  corpusDir: string,
+  manifest: CorpusManifest,
+  liveProvider?: InferenceProvider,
+) {
+  // Scope ids come from the MANIFEST, not from filenames. Deriving them from
+  // filenames yields `oura_sleep`, which matches no profile — the profiles
+  // declare `oura.*` / `spotify.*` / `chatgpt.*`. That silently disabled the
+  // entire T2 layer, the highest-leverage artifact in the design (§18.2), and
+  // only a live run surfaced it: the model reported every scope as
+  // unprofiled and inferred the schema rules itself.
+  const scopes = manifest.scopes.flatMap((s) =>
+    s.files.map((f) => ({
+      scope: s.scope,
       path: join(corpusDir, f),
-    }));
+      itemCount: s.records,
+    })),
+  );
 
   // Scripted per question. Q1 is scripted for real — it drives the whole
   // nested path and lands on the §18.2 nap trap, so a pass here means the
   // interpreter, the sandbox and host-authored coverage all did their jobs.
   // The rest answer honestly that no script was written, which the harness
   // correctly grades as a failure rather than letting it look like a pass.
-  const provider = createFakeInferenceProvider({
-    respond: (input, n) => {
-      const question =
-        input.messages.find((m) => m.role === "user")?.content ?? "";
-      const isSleepAverage =
-        /sleep/i.test(question) && /average|how much/i.test(question);
+  const provider =
+    liveProvider ??
+    createFakeInferenceProvider({
+      respond: (input, n) => {
+        const question =
+          input.messages.find((m) => m.role === "user")?.content ?? "";
+        const isSleepAverage =
+          /sleep/i.test(question) && /average|how much/i.test(question);
 
-      if (isSleepAverage && n === 0) {
-        return {
-          content:
-            "```vana:run\n" +
-            `const rows = await vana.readAll("oura_sleep");
+        if (isSleepAverage && n === 0) {
+          return {
+            content:
+              "```vana:run\n" +
+              `const rows = await vana.readAll("oura_sleep");
 // Oura profile, the load-bearing rules:
 //  - a day can hold several sleep periods, so rows are not 1:1 with days;
 //  - \`type\` has five values, and only main sleep counts here;
@@ -98,21 +115,21 @@ vana.result({
   value: hours,
   citations: [{ scope: "oura_sleep" }],
 });` +
+              "\n```",
+          };
+        }
+
+        return {
+          content:
+            "```vana:answer\n" +
+            JSON.stringify({
+              answer: "no scripted answer for this case",
+              citations: [],
+            }) +
             "\n```",
         };
-      }
-
-      return {
-        content:
-          "```vana:answer\n" +
-          JSON.stringify({
-            answer: "no scripted answer for this case",
-            citations: [],
-          }) +
-          "\n```",
-      };
-    },
-  });
+      },
+    });
 
   const scratchDir = await mkdtemp(join(tmpdir(), "query-eval-scratch-"));
   const tools = createSandboxToolHost({
@@ -129,7 +146,49 @@ vana.result({
     },
   });
 
-  return createAgentAnswerer({ provider, tools, name: "agent-loop" });
+  return createAgentAnswerer({
+    provider,
+    tools,
+    name: liveProvider ? "agent-live" : "agent-loop",
+  });
+}
+
+/**
+ * A real provider, from the same env the server uses. Requires
+ * INFERENCE_API_KEY; anything else is a deliberate operator choice.
+ *
+ * Note INFERENCE_REQUEST_FIELDS: the default body carries the Vana/Phala
+ * routing hint `provider:{aci_verified,zdr}`, and a provider that validates
+ * its body rejects it outright (Gemini answers 400 "Unknown name provider").
+ * Set INFERENCE_REQUEST_FIELDS=none for any non-Vana endpoint.
+ */
+function buildLiveProvider(): InferenceProvider {
+  const apiKey = process.env.INFERENCE_API_KEY;
+  if (!apiKey) {
+    throw new Error(
+      "--answerer live needs INFERENCE_API_KEY (and usually INFERENCE_BASE_URL,\n" +
+        "INFERENCE_MODEL, INFERENCE_E2EE=false, INFERENCE_REQUEST_FIELDS=none).",
+    );
+  }
+  const raw = process.env.INFERENCE_REQUEST_FIELDS;
+  const requestFields =
+    raw === undefined
+      ? undefined
+      : raw === "none" || raw.trim() === ""
+        ? {}
+        : (JSON.parse(raw) as Record<string, unknown>);
+  const baseUrl = process.env.INFERENCE_BASE_URL;
+  const model = process.env.INFERENCE_MODEL;
+  process.stderr.write(
+    `live provider: ${baseUrl ?? "(default)"} model=${model ?? "(default)"} ` +
+      `requestFields=${requestFields ? JSON.stringify(requestFields) : "(default)"}\n\n`,
+  );
+  return createOpenAiCompatibleInferenceProvider({
+    baseUrl,
+    model,
+    apiKey,
+    requestFields,
+  });
 }
 
 async function main(): Promise<void> {
@@ -161,14 +220,43 @@ async function main(): Promise<void> {
     which === "null"
       ? createNullAnswerer()
       : which === "agent"
-        ? await buildAgentAnswerer(dir)
-        : createReferenceAnswerer(source);
+        ? await buildAgentAnswerer(dir, manifest)
+        : which === "live"
+          ? await buildAgentAnswerer(dir, manifest, buildLiveProvider())
+          : createReferenceAnswerer(source);
+
+  const onlyArg = arg("only");
+  const only = onlyArg
+    ? onlyArg.split(",").map((id) => id.trim().toUpperCase())
+    : undefined;
+
+  // --show-answers: a failing numeric case is usually either a real
+  // miscalculation or the grader pulling the wrong number out of prose.
+  // Telling those apart requires seeing the answer.
+  const show = process.argv.includes("--show-answers");
+  const graded = show
+    ? {
+        name: answerer.name,
+        async answer(request: Parameters<typeof answerer.answer>[0]) {
+          const out = await answerer.answer(request);
+          process.stderr.write(
+            `\n--- ANSWER (${request.question.slice(0, 60)}...) ---\n` +
+              `value: ${JSON.stringify(out.value)}\n` +
+              `answer: ${out.answer}\n` +
+              `coverage: ${JSON.stringify(out.coverage)}\n` +
+              `citations: ${JSON.stringify(out.citations)}\n---\n\n`,
+          );
+          return out;
+        },
+      }
+    : answerer;
 
   const report = await runEval({
     cases: await buildCases(source),
-    answerer,
+    answerer: graded,
     seed,
     profile,
+    only,
   });
 
   process.stdout.write(formatReport(report) + "\n");
