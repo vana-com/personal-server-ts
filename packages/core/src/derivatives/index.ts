@@ -46,6 +46,7 @@ export {
   InferenceRequestError,
   createFakeInferenceProvider,
   createOpenAiCompatibleInferenceProvider,
+  type EncryptedInferenceRequest,
   type FakeInferenceProvider,
   type FakeInferenceProviderOptions,
   type InferenceChatInput,
@@ -76,3 +77,19 @@ export {
   handlePersonalServerDerivativesRequest,
   type PersonalServerDerivativesApiDeps,
 } from "./api.js";
+export {
+  DEFAULT_E2EE_KEY_TTL_MS,
+  E2EE_ALGO_X25519,
+  E2eeAttestationError,
+  E2eeCipherError,
+  PHALA_GATEWAY_BASE_URL,
+  createPhalaE2eeEncryption,
+  fetchGatewayE2eeKey,
+  verifyAciReportBinding,
+  type AciAttestationReport,
+  type E2eeAttestationErrorCode,
+  type FetchGatewayE2eeKeyOptions,
+  type GatewayE2eeKey,
+  type PhalaE2eeEncryption,
+  type PhalaE2eeEncryptionOptions,
+} from "./e2ee/index.js";

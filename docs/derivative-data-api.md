@@ -696,13 +696,15 @@ The provider is an OpenAI-compatible chat completions client over `fetch`
 | ------------------------------- | -------------------------------- | -------------------------------------------------------------------- |
 | `inference.baseUrl`             | `https://inference.phala.com/v1` | chat completions base; set to the Vana inference relay in production |
 | `inference.model`               | `z-ai/glm-5.2`                   | default model                                                        |
+| `inference.e2ee`                | `true`                           | end to end encryption of prompt and answer to the Phala gateway      |
 | `inference.maxSourceItems`      | `50`                             | newest items kept per source scope                                   |
 | `inference.recomputeDebounceMs` | `5000`                           | quiet period after a source change                                   |
 
 Environment overrides (Node server only): `INFERENCE_BASE_URL`,
-`INFERENCE_MODEL`, and `INFERENCE_API_KEY` for local development against a
-provider directly (sent as `Authorization: Bearer`; in production the relay
-holds the key and the Personal Server sends none).
+`INFERENCE_MODEL`, `INFERENCE_E2EE` (`false` turns encryption off), and
+`INFERENCE_API_KEY` for local development against a provider directly (sent
+as `Authorization: Bearer`; in production the relay holds the key and the
+Personal Server sends none).
 
 PS-Lite never calls a provider directly: with `inference.baseUrl` left at
 the direct-provider default the compute layer stays off and
@@ -716,13 +718,68 @@ Every request carries `provider: { aci_verified: true, zdr: true }` and
 the question with the status only; an empty assistant reply is a failure
 too, never a `ready` record.
 
-### E2EE seam
+### End to end encryption to Phala
 
-End-to-end encryption of the prompt to the model (Phala E2EE v2: encrypt
-each `messages[i].content`, headers `X-E2EE-Version`, `X-Client-Pub-Key`,
-`X-Model-Pub-Key`, `X-E2EE-Nonce`, `X-E2EE-Timestamp`, encrypted reply) is
-NOT implemented. The hook is `InferenceRequestEncryption` in
-`packages/core/src/derivatives/inference.ts`, taken by
-`createOpenAiCompatibleInferenceProvider({ encryption })`: `encryptRequest`
-sees the outgoing messages and request headers, `decryptResponse` the
-assistant content and response headers. Nothing else changes when it lands.
+With `inference.e2ee: true` (the default) the prompt and the answer are
+encrypted between the Personal Server and the Phala confidential-inference
+gateway with the E2EE v2 protocol
+(https://github.com/Dstack-TEE/private-ai-gateway/blob/main/spec/e2ee-v2.md),
+suite `x25519-aes-256-gcm-hkdf-sha256`. The Vana inference relay in between
+forwards ciphertext; it cannot read the owner's data, the question, or the
+answer. Set `inference.e2ee: false` (or `INFERENCE_E2EE=false` on the Node
+server) only for local development against a provider without ACI
+attestation: the compute layer then sends plaintext over TLS and logs a
+warning at startup.
+
+Per request:
+
+1. The gateway's attested E2EE key is fetched with
+   `GET {inference.baseUrl}/aci/attestation?nonce=<64 hex>` (through the
+   relay, which must pass the route through unchanged; when the relay
+   answers 404 the report is fetched from `https://inference.phala.com/v1`
+   directly). The report is verified structurally before the key is used:
+   `sha256(JCS(workload_keyset))` must equal `workload_keyset_digest`, the
+   ACI statement built from that digest and our nonce must hash to
+   `report_data` (freshness and keyset binding), the TDX quote's report-data
+   slot must carry it, the keyset must not be expired, and the service must
+   advertise E2EE version 2. The X25519 entry (`dstack-kms-e2ee-x25519-v1`
+   on the Phala gateway) is selected by `algo`. No verified key, no request.
+   The key is cached for five minutes and re-fetched after
+   `e2ee_model_key_mismatch` or a changed `X-ACI-Keyset-Digest`.
+2. A fresh client X25519 key pair, a 32-byte nonce and the Unix-seconds
+   timestamp are generated; the request carries `X-E2EE-Version: 2`,
+   `X-Client-Pub-Key`, `X-Model-Pub-Key`, `X-E2EE-Nonce`, and
+   `X-E2EE-Timestamp`.
+3. Every `messages[i].content` is replaced by the hex encoding of
+   `ephemeral_pub || aes_gcm_nonce || ciphertext || tag`, each field under a
+   fresh ephemeral key, keyed by HKDF-SHA256 over the X25519 shared secret,
+   with the RFC 8785 canonical JSON of `{purpose, algo, model, field, nonce,
+ts}` as associated data, so a ciphertext cannot be moved to another
+   field, request or model.
+4. The gateway decrypts inside the enclave, runs the model, and encrypts
+   `choices[0].message.content` to the client key under the response AAD
+   (which also binds the clear response `id`). The Personal Server decrypts
+   and stores the answer; a reply that is not valid ciphertext for this
+   request (a plaintext reply, a swapped id, a tampered field) fails the
+   compute and is never stored.
+
+What the relay still sees: the model name, the number of messages and the
+size of each ciphertext (roughly the prompt size), the request timing, the
+`provider` routing hint, `max_tokens`, the E2EE headers (public keys, nonce,
+timestamp), and the response headers (`x-receipt-id`, `x-aci-identity`,
+`X-ACI-Keyset-Digest`, token usage). Failure messages stored on a question
+carry the E2EE error code only, never a prompt or an answer.
+
+Caveat: the E2EE key belongs to the Phala gateway enclave (an aggregator),
+not to the model backend behind it; encryption between the gateway and the
+upstream is the gateway's own channel binding, attested in its report. The
+structural checks above establish that the key is the one the hardware quote
+bound; verification of the TDX quote itself against the Intel root is a
+`verifyEvidence` hook on `createPhalaE2eeEncryption` that the Node server
+does not wire yet (a DCAP verifier such as `@phala/aci-verifier` can be
+plugged in there).
+
+Manual smoke test against a real gateway: `npm run e2ee:smoke` sends one
+encrypted request to `INFERENCE_BASE_URL` (default
+`https://inference.phala.com/v1`, model `INFERENCE_MODEL`, optional
+`INFERENCE_API_KEY`) and prints only the receipt id and the answer length.

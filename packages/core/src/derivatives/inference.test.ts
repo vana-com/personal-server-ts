@@ -3,6 +3,7 @@ import {
   createFakeInferenceProvider,
   createOpenAiCompatibleInferenceProvider,
   type InferenceRequestEncryption,
+  type InferenceRequestError,
 } from "./inference.js";
 
 function fetchReplying(
@@ -120,18 +121,21 @@ describe("createOpenAiCompatibleInferenceProvider", () => {
       { headers: { "x-e2ee-version": "2" } },
     );
     const encryption: InferenceRequestEncryption = {
-      async encryptRequest({ messages, headers }) {
+      async encryptRequest({ model, messages, headers }) {
+        expect(model).toBe("m");
         headers.set("X-E2EE-Version", "2");
         return {
           messages: messages.map((m) => ({
             ...m,
             content: `ENC(${m.content})`,
           })),
+          async decryptResponse({ content, field, id, headers }) {
+            expect(headers.get("x-e2ee-version")).toBe("2");
+            expect(field).toBe("choices.0.message.content");
+            expect(id).toBe("");
+            return content.replace(/^ENC\((.*)\)$/, "$1");
+          },
         };
-      },
-      async decryptResponse({ content, headers }) {
-        expect(headers.get("x-e2ee-version")).toBe("2");
-        return content.replace(/^ENC\((.*)\)$/, "$1");
       },
     };
     const provider = createOpenAiCompatibleInferenceProvider({
@@ -163,5 +167,113 @@ describe("createFakeInferenceProvider", () => {
       evidence: "fake evidence",
     });
     expect(provider.calls).toHaveLength(1);
+  });
+});
+
+describe("createOpenAiCompatibleInferenceProvider with an encryption seam", () => {
+  const encrypting = (
+    calls: string[],
+    retryOn: string | null = null,
+  ): InferenceRequestEncryption => ({
+    async encryptRequest({ messages, headers }) {
+      calls.push("encrypt");
+      headers.set("X-E2EE-Version", "2");
+      return {
+        messages: messages.map((m) => ({ ...m, content: `ENC(${m.content})` })),
+        async decryptResponse({ content, field, id }) {
+          calls.push(`decrypt ${field} ${id}`);
+          return content.replace(/^ENC\((.*)\)$/, "$1");
+        },
+      };
+    },
+    async onRejected({ errorType }) {
+      calls.push(`rejected ${errorType}`);
+      return retryOn !== null && errorType === retryOn;
+    },
+  });
+
+  it("passes the choice's index member and the response id to the decryptor", async () => {
+    const calls: string[] = [];
+    const provider = createOpenAiCompatibleInferenceProvider({
+      fetch: fetchReplying({
+        id: "chatcmpl-9",
+        choices: [
+          { index: 3, message: { role: "assistant", content: "ENC(ok)" } },
+        ],
+      }) as unknown as typeof fetch,
+      encryption: encrypting(calls),
+    });
+    await expect(
+      provider.chat({ model: "m", messages: [{ role: "user", content: "q" }] }),
+    ).resolves.toMatchObject({ content: "ok" });
+    expect(calls).toEqual([
+      "encrypt",
+      "decrypt choices.3.message.content chatcmpl-9",
+    ]);
+  });
+
+  it("re-sends once when the seam asks for it, and reports the error type otherwise", async () => {
+    const calls: string[] = [];
+    const responses = [
+      () =>
+        new Response(
+          JSON.stringify({ error: { type: "e2ee_model_key_mismatch" } }),
+          {
+            status: 400,
+          },
+        ),
+      () =>
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { role: "assistant", content: "ENC(ok)" } }],
+          }),
+          { status: 200 },
+        ),
+    ];
+    const fetchMock = vi.fn(async () => responses.shift()!());
+    const provider = createOpenAiCompatibleInferenceProvider({
+      fetch: fetchMock as unknown as typeof fetch,
+      encryption: encrypting(calls, "e2ee_model_key_mismatch"),
+    });
+    await expect(
+      provider.chat({ model: "m", messages: [{ role: "user", content: "q" }] }),
+    ).resolves.toMatchObject({ content: "ok" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(calls).toEqual([
+      "encrypt",
+      "rejected e2ee_model_key_mismatch",
+      "encrypt",
+      "decrypt choices.0.message.content ",
+    ]);
+
+    const noRetry = createOpenAiCompatibleInferenceProvider({
+      fetch: fetchReplying(
+        { error: { type: "e2ee_replay_detected", message: "secret detail" } },
+        { status: 400 },
+      ) as unknown as typeof fetch,
+      encryption: encrypting([]),
+    });
+    const failure = await noRetry
+      .chat({ model: "m", messages: [{ role: "user", content: "q" }] })
+      .catch((err: unknown) => err as InferenceRequestError);
+    expect(failure).toMatchObject({
+      name: "InferenceRequestError",
+      status: 400,
+      errorType: "e2ee_replay_detected",
+      message:
+        "inference request failed with status 400 (e2ee_replay_detected)",
+    });
+  });
+
+  it("treats an empty decrypted reply as no content", async () => {
+    const provider = createOpenAiCompatibleInferenceProvider({
+      fetch: fetchReplying({
+        choices: [{ message: { role: "assistant", content: "ENC(   )" } }],
+      }) as unknown as typeof fetch,
+      encryption: encrypting([]),
+    });
+    await expect(
+      provider.chat({ model: "m", messages: [{ role: "user", content: "q" }] }),
+    ).rejects.toThrow("no assistant content");
   });
 });

@@ -62,6 +62,10 @@ export const DEFAULTS = {
     // provider key) or straight at a provider for local development.
     baseUrl: "https://inference.phala.com/v1",
     model: "z-ai/glm-5.2",
+    // End to end encryption of prompt and answer to the Phala gateway
+    // (E2EE v2): the relay only sees ciphertext. Set false only for local
+    // development against a provider without ACI attestation.
+    e2ee: true,
     // Newest-first items kept per source scope when a prompt is assembled.
     maxSourceItems: 50,
     // Quiet period after a source scope changes before a recompute starts.
@@ -176,6 +180,7 @@ export const ServerConfigSchema = z.object({
     .object({
       baseUrl: z.url().default(DEFAULTS.inference.baseUrl),
       model: z.string().min(1).default(DEFAULTS.inference.model),
+      e2ee: z.boolean().default(DEFAULTS.inference.e2ee),
       maxSourceItems: z
         .number()
         .int()
