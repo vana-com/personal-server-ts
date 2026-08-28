@@ -92,6 +92,10 @@
       "types": "./dist/ports/index.d.ts",
       "import": "./dist/ports/index.js"
     },
+    "./query": {
+      "types": "./dist/query/ports.d.ts",
+      "import": "./dist/query/ports.js"
+    },
     "./logging/access-log": {
       "types": "./dist/logging/access-log.d.ts",
       "import": "./dist/logging/access-log.js"

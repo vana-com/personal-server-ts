@@ -288,3 +288,73 @@ export class DerivativeComputeUnavailableError extends ProtocolError {
     );
   }
 }
+
+// Query layer (see docs/260828-query-layer-design.md §16, and the
+// implementation plan's phase 4)
+
+export class QueryDisabledError extends ProtocolError {
+  constructor(details?: Record<string, unknown>) {
+    super(
+      503,
+      "QUERY_DISABLED",
+      "This server has no query layer configured",
+      details,
+    );
+  }
+}
+
+export class QuerySandboxUnavailableError extends ProtocolError {
+  constructor(details: { reason: string }) {
+    super(
+      503,
+      "QUERY_SANDBOX_UNAVAILABLE",
+      "No OS sandbox is available on this runtime; model-authored code will not be run unconfined",
+      details,
+    );
+  }
+}
+
+export class QueryScopeNotGrantedError extends ProtocolError {
+  constructor(details: { scopes: string[] }) {
+    super(
+      403,
+      "QUERY_SCOPE_NOT_GRANTED",
+      "The caller's grant does not cover every scope this question needs",
+      details,
+    );
+  }
+}
+
+/**
+ * A grant-derived path failed containment (escaped the data root, resolved
+ * through a symlink out of it, was relative). Design §3 risk 1 — this is a
+ * server bug, not a caller error, so it is a 500 and the request is refused
+ * rather than narrowed.
+ */
+export class QueryReadPathRejectedError extends ProtocolError {
+  constructor(details: { path: string; reason: string }) {
+    super(
+      500,
+      "QUERY_READ_PATH_REJECTED",
+      "A grant-derived read path failed containment checks and the request was refused",
+      details,
+    );
+  }
+}
+
+export class QueryScriptInvalidError extends ProtocolError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super(422, "QUERY_SCRIPT_INVALID", message, details);
+  }
+}
+
+export class QueryBudgetExceededError extends ProtocolError {
+  constructor(details: { budget: string; limit: number }) {
+    super(
+      429,
+      "QUERY_BUDGET_EXCEEDED",
+      "The question exhausted its budget before any answer could be produced",
+      details,
+    );
+  }
+}
