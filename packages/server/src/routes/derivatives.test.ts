@@ -49,12 +49,14 @@ const builderWallet = createTestWallet(0);
 const ownerWallet = createTestWallet(9);
 const logger = pino({ level: "silent" });
 
-function createMockGateway(): GatewayClient {
+function createMockGateway(
+  scopes: string[] = ["write:coach.*", "oura.sleep"],
+): GatewayClient {
   const grant: GatewayGrantResponse = {
     id: WRITE_GRANT_ID,
     grantorAddress: ownerWallet.address,
     granteeId: BUILDER_ID,
-    scopes: ["write:coach.*"],
+    scopes,
     status: "confirmed",
     addedAt: "2026-01-21T10:00:00.000Z",
     expiresAt: null,
@@ -378,6 +380,22 @@ describe("/v1/derivatives/questions (composed app)", () => {
     expect(outside.status).toBe(403);
     expect((await outside.json()).error.errorCode).toBe("SCOPE_MISMATCH");
 
+    // Sources must be read-granted: the write grant alone confers nothing
+    // on bank.transactions, so the question is refused and never scheduled.
+    const ungranted = await builderRequest(
+      "POST",
+      "/v1/derivatives/questions",
+      { ...question, sourceScopes: ["oura.sleep", "bank.transactions"] },
+    );
+    expect(ungranted.status).toBe(403);
+    const ungrantedBody = await ungranted.json();
+    expect(ungrantedBody.error.errorCode).toBe("DERIVATIVE_SOURCE_NOT_GRANTED");
+    expect(ungrantedBody.error.details).toEqual({
+      scopes: ["bank.transactions"],
+    });
+    await scheduler.whenIdle();
+    expect(provider.calls).toHaveLength(0);
+
     const list = await app.request("/v1/derivatives/questions", {
       headers: owner,
     });
@@ -410,6 +428,26 @@ describe("/v1/derivatives/questions (composed app)", () => {
       "WRITE_ATTRIBUTION_REPLAY",
     );
     await scheduler.whenIdle();
+  });
+
+  it("a write-only grant cannot register a question over any source", async () => {
+    app = createApp({
+      ...baseDeps,
+      gateway: createMockGateway(["write:coach.*"]),
+    });
+    const res = await builderRequest(
+      "POST",
+      "/v1/derivatives/questions",
+      question,
+    );
+    expect(res.status).toBe(403);
+    expect((await res.json()).error.errorCode).toBe(
+      "DERIVATIVE_SOURCE_NOT_GRANTED",
+    );
+    const list = await app.request("/v1/derivatives/questions", {
+      headers: owner,
+    });
+    expect((await list.json()).questions).toEqual([]);
   });
 
   it("answers 503 when no compute layer is wired and 401 without credentials", async () => {

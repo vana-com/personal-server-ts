@@ -30,6 +30,7 @@ import {
   type SyncPayloadKind,
 } from "../issues.js";
 import { downloadRetryKey, type DownloadRetryMemory } from "../retry-memory.js";
+import { readStoredLineage } from "../../lineage/lineage.js";
 
 /**
  * Minimal diagnostics hook — keeps core free of lite-specific imports.
@@ -95,6 +96,8 @@ export interface DownloadWorkerDeps {
     dataPointId: string;
     version: number;
     collectedAt: string;
+    /** The record's stamped `$lineage.sources`, when it is a derivative. */
+    lineageSources?: string[];
   }) => void;
 }
 
@@ -354,11 +357,21 @@ export async function downloadOne(
 
   if (deps.onDataPointIndexed) {
     try {
+      let lineageSources: string[] | undefined;
+      try {
+        lineageSources = readStoredLineage(
+          envelope.data as Record<string, unknown> | undefined,
+        )?.sources;
+      } catch {
+        // A malformed $lineage is the upload worker's problem; the hook
+        // still learns about the new version.
+      }
       deps.onDataPointIndexed({
         scope: envelope.scope,
         dataPointId: record.id,
         version: Number(record.expectedVersion),
         collectedAt: envelope.collectedAt,
+        lineageSources,
       });
     } catch (err) {
       logger.warn(

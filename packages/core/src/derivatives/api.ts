@@ -4,7 +4,7 @@
  *   POST   /questions                 register (builder write auth or owner)
  *   GET    /questions                 list (owner; builder with ?derivedScope=)
  *   GET    /questions/:id             status (owner or the registering builder)
- *   POST   /questions/:id/recompute   owner only
+ *   POST   /questions/:id/recompute   owner or the registering builder
  *   DELETE /questions/:id             owner or the registering builder
  *
  * Builder authentication is the Write API's: a write-session bearer token
@@ -13,8 +13,10 @@
  */
 
 import {
+  ContentTooLargeError,
   DerivativeComputeUnavailableError,
   DerivativeQuestionNotFoundError,
+  DerivativeSourceNotGrantedError,
   ProtocolError,
 } from "../errors/catalog.js";
 import { parseJsonObjectBody } from "../contracts/http.js";
@@ -23,7 +25,11 @@ import type {
   PersonalServerApiDispatchOptions,
   PersonalServerWriteAuthResult,
 } from "../api/index.js";
-import { createQuestionRegistration } from "./registration.js";
+import {
+  createQuestionRegistration,
+  parseQuestionInput,
+  uncoveredSourceScopes,
+} from "./registration.js";
 import type { RecomputeScheduler } from "./scheduler.js";
 import {
   questionRegistrationView,
@@ -31,6 +37,9 @@ import {
   type QuestionRegistration,
   type QuestionStore,
 } from "./types.js";
+
+/** Registration bodies are small; anything larger is refused up front. */
+export const MAX_QUESTION_BODY_BYTES = 16 * 1024;
 
 export interface PersonalServerDerivativesApiDeps {
   auth: Pick<PersonalServerApiAuthPort, "authorizeOwner" | "authorizeWrite">;
@@ -174,6 +183,14 @@ export async function handlePersonalServerDerivativesRequest(
         // The derived scope decides which write grant must cover the call,
         // so the body is read (from a clone: the proof check reads it too)
         // before authorization. Nothing is stored until auth passed.
+        const declared = Number(request.headers.get("content-length") ?? "0");
+        if (declared > MAX_QUESTION_BODY_BYTES) {
+          throw new ContentTooLargeError({ max: MAX_QUESTION_BODY_BYTES });
+        }
+        const bodyBytes = new Uint8Array(await request.clone().arrayBuffer());
+        if (bodyBytes.byteLength > MAX_QUESTION_BODY_BYTES) {
+          throw new ContentTooLargeError({ max: MAX_QUESTION_BODY_BYTES });
+        }
         const parsed = await parseJsonObjectBody(
           request.clone(),
           "Request body must be valid JSON",
@@ -199,6 +216,19 @@ export async function handlePersonalServerDerivativesRequest(
           : { kind: "owner" };
         let registration: QuestionRegistration;
         try {
+          if (writer) {
+            // Consent: the answer exposes the sources to the builder, so
+            // every source must be read-granted to it. Fail closed when
+            // the auth port did not hand over the grant's scopes.
+            const input = parseQuestionInput(parsed.body);
+            const uncovered = uncoveredSourceScopes(
+              input.sourceScopes,
+              writer.grantScopes,
+            );
+            if (uncovered.length > 0) {
+              throw new DerivativeSourceNotGrantedError({ scopes: uncovered });
+            }
+          }
           registration = await createQuestionRegistration({
             body: parsed.body,
             registeredBy,
@@ -243,10 +273,14 @@ export async function handlePersonalServerDerivativesRequest(
       if (request.method !== "POST") {
         return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
       }
-      await deps.auth.authorizeOwner(request);
-      const registration = await store.get(questionId);
-      if (!registration)
-        throw new DerivativeQuestionNotFoundError({ questionId });
+      // Owner, or the registering builder (its retry after a transient
+      // failure); same gate as GET / DELETE.
+      const { registration } = await loadForCaller(
+        deps,
+        request,
+        store,
+        questionId,
+      );
       scheduler.requestRecompute(questionId, { immediate: true });
       return jsonResponse(
         {

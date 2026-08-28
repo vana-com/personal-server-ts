@@ -96,15 +96,22 @@ describe("createOpenAiCompatibleInferenceProvider", () => {
     });
   });
 
-  it("fails on a reply without assistant content", async () => {
-    const provider = createOpenAiCompatibleInferenceProvider({
-      fetch: fetchReplying({ choices: [] }) as unknown as typeof fetch,
-    });
-    await expect(
-      provider.chat({ model: "m", messages: [] }),
-    ).rejects.toMatchObject({
-      message: "inference response carried no assistant content",
-    });
+  it("fails on a reply without assistant content, empty content included", async () => {
+    for (const body of [
+      { choices: [] },
+      { choices: [{ message: { content: "" } }] },
+      { choices: [{ message: { content: "   \n" } }] },
+    ]) {
+      const provider = createOpenAiCompatibleInferenceProvider({
+        fetch: fetchReplying(body) as unknown as typeof fetch,
+      });
+      await expect(
+        provider.chat({ model: "m", messages: [] }),
+      ).rejects.toMatchObject({
+        name: "InferenceRequestError",
+        message: "inference response carried no assistant content",
+      });
+    }
   });
 
   it("runs the E2EE seam around the request when one is supplied", async () => {

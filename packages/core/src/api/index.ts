@@ -115,6 +115,13 @@ export interface PersonalServerWriteAuthInput {
 export interface PersonalServerWriteAuthResult {
   builder: `0x${string}`;
   grantId: string;
+  /**
+   * The live grant's scope entries (read entries bare, write entries
+   * `write:`-prefixed). Consumers that need more than the write permission
+   * (the derivative compute layer checks read coverage of source scopes)
+   * fail closed when this is absent.
+   */
+  grantScopes?: string[];
   attribution: WriterAttribution;
   /**
    * Rolls back the per-write proof reservation (replay guard). The handler
@@ -268,7 +275,12 @@ export interface PersonalServerDataApiDeps {
    * scope stale (recompute on refresh). Best-effort: a throwing hook is
    * swallowed, the write already succeeded.
    */
-  onDataWritten?: (event: { scope: string; collectedAt: string }) => void;
+  onDataWritten?: (event: {
+    scope: string;
+    collectedAt: string;
+    /** The stamped `$lineage.sources` of the written record, if any. */
+    lineageSources?: string[];
+  }) => void;
 }
 
 export interface PersonalServerAccessLogsApiDeps {
@@ -748,7 +760,7 @@ function apiLoggerAsLogger(logger: PersonalServerApiLogger | undefined) {
 
 function notifyDataWritten(
   deps: Pick<PersonalServerDataApiDeps, "onDataWritten" | "logger">,
-  event: { scope: string; collectedAt: string },
+  event: { scope: string; collectedAt: string; lineageSources?: string[] },
 ): void {
   if (!deps.onDataWritten) return;
   try {
@@ -1335,6 +1347,7 @@ export async function handlePersonalServerDataRequest(
           notifyDataWritten(deps, {
             scope: scopeResult.scope,
             collectedAt: collectedAtValue,
+            lineageSources: lineage?.sources,
           });
           return jsonResponse(result.response, { status: 201 });
         }
@@ -1379,6 +1392,7 @@ export async function handlePersonalServerDataRequest(
         notifyDataWritten(deps, {
           scope: scopeResult.scope,
           collectedAt: collectedAtValue,
+          lineageSources: lineage?.sources,
         });
         return jsonResponse(result.response, { status: 201 });
       } catch (err) {

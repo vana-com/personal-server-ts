@@ -14,12 +14,14 @@ export {
   sortQuestions,
 } from "./store.js";
 export {
+  MAX_ECHOED_SCOPE_CHARS,
   MAX_MODEL_CHARS,
   MAX_QUESTION_CHARS,
   MAX_QUESTION_SOURCE_SCOPES,
   createQuestionRegistration,
   findDerivationCycle,
   parseQuestionInput,
+  uncoveredSourceScopes,
   type CreateQuestionRegistrationInput,
   type ParsedQuestionInput,
 } from "./registration.js";
@@ -70,6 +72,7 @@ export {
   type SchedulerTimers,
 } from "./scheduler.js";
 export {
+  MAX_QUESTION_BODY_BYTES,
   handlePersonalServerDerivativesRequest,
   type PersonalServerDerivativesApiDeps,
 } from "./api.js";

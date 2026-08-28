@@ -97,7 +97,11 @@ export interface DataRouteDeps {
    */
   lineageGateway?: LineageGatewayPort;
   /** Post-commit write hook (derivative recompute on refresh). */
-  onDataWritten?: (event: { scope: string; collectedAt: string }) => void;
+  onDataWritten?: (event: {
+    scope: string;
+    collectedAt: string;
+    lineageSources?: string[];
+  }) => void;
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
 }
 

@@ -334,9 +334,15 @@ export async function createServer(
   const derivativeScheduler: RecomputeScheduler = createRecomputeScheduler({
     store: questionStore,
     debounceMs: config.inference.recomputeDebounceMs,
+    serverOwner,
     logger,
     compute: (questionId) =>
       computeQuestion(questionId, {
+        // A -> B -> C: a question reading this derived scope recomputes.
+        onDerivedWritten: (event) =>
+          derivativeScheduler.markSourceChanged(event.scope, {
+            lineageSources: event.lineageSources,
+          }),
         storage: dataStorage,
         store: questionStore,
         provider: inferenceProvider,
@@ -400,8 +406,13 @@ export async function createServer(
       logger,
       dataPointFeed,
       scopeDeletions,
-      onDataPointIndexed: (event: { scope: string }) =>
-        derivativeScheduler.markSourceChanged(event.scope),
+      onDataPointIndexed: (event: {
+        scope: string;
+        lineageSources?: string[];
+      }) =>
+        derivativeScheduler.markSourceChanged(event.scope, {
+          lineageSources: event.lineageSources,
+        }),
     };
 
     // Durable deletion: gateway tombstone signed with the same server

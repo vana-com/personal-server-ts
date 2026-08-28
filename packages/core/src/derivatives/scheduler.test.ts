@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createRecomputeScheduler, type SchedulerTimers } from "./scheduler.js";
 import { createInMemoryQuestionStore } from "./store.js";
+import { computeDataPointId } from "../sync/data-point-id.js";
 import type { QuestionRegistration } from "./types.js";
 
 function registration(
@@ -141,6 +142,74 @@ describe("createRecomputeScheduler", () => {
     expect(compute).toHaveBeenCalledTimes(2);
     release();
     await scheduler.whenIdle();
+  });
+
+  it("skips a question whose own output the new version descends from", async () => {
+    const OWNER = "0x1111111111111111111111111111111111111111" as const;
+    const store = createInMemoryQuestionStore({
+      initial: [
+        registration({
+          questionId: "q-1",
+          derivedScope: "coach.weekly",
+          sourceScopes: ["spine.summary"],
+        }),
+        registration({
+          questionId: "q-2",
+          derivedScope: "other.view",
+          sourceScopes: ["spine.summary"],
+        }),
+      ],
+    });
+    const timers = manualTimers();
+    const compute = vi.fn(async () => undefined);
+    const scheduler = createRecomputeScheduler({
+      store,
+      compute,
+      debounceMs: 0,
+      serverOwner: OWNER,
+      timers: timers.api,
+    });
+    // spine.summary (synced from another replica) was computed FROM
+    // coach.weekly: q-1 must not chase its own tail; q-2 still runs.
+    scheduler.markSourceChanged("spine.summary", {
+      lineageSources: [computeDataPointId(OWNER, "coach.weekly").toUpperCase()],
+    });
+    await scheduler.whenIdle();
+    expect((await store.get("q-1"))!.status).toBe("ready");
+    expect((await store.get("q-2"))!.status).toBe("stale");
+    timers.fireAll();
+    await scheduler.whenIdle();
+    expect(compute.mock.calls.map((call) => call[0])).toEqual(["q-2"]);
+  });
+
+  it("start() after stop() reschedules pending and stale questions", async () => {
+    const store = createInMemoryQuestionStore({
+      initial: [
+        registration({ questionId: "q-ready", status: "ready" }),
+        registration({ questionId: "q-pending", status: "pending" }),
+        registration({ questionId: "q-stale", status: "stale" }),
+        registration({ questionId: "q-failed", status: "failed" }),
+      ],
+    });
+    const timers = manualTimers();
+    const compute = vi.fn(async () => undefined);
+    const scheduler = createRecomputeScheduler({
+      store,
+      compute,
+      debounceMs: 0,
+      timers: timers.api,
+    });
+    scheduler.stop();
+    scheduler.start();
+    scheduler.start();
+    await scheduler.whenIdle();
+    expect(timers.pending()).toHaveLength(2);
+    timers.fireAll();
+    await scheduler.whenIdle();
+    expect(compute.mock.calls.map((call) => call[0]).sort()).toEqual([
+      "q-pending",
+      "q-stale",
+    ]);
   });
 
   it("stop cancels pending timers", async () => {

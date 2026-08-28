@@ -10,6 +10,8 @@ import {
 } from "../errors/catalog.js";
 import { parseDataScopeContract } from "../contracts/data.js";
 import { assertDerivedScopeNaming } from "../lineage/lineage.js";
+import { isWriteScopeEntry } from "../policy/data-write.js";
+import { scopeCoveredByGrant } from "@opendatalabs/vana-sdk/browser";
 import type {
   QuestionRegisteredBy,
   QuestionRegistration,
@@ -19,6 +21,8 @@ import type {
 export const MAX_QUESTION_SOURCE_SCOPES = 16;
 export const MAX_QUESTION_CHARS = 8_000;
 export const MAX_MODEL_CHARS = 128;
+/** Unvalidated scope strings echoed in 400 details are cut to this. */
+export const MAX_ECHOED_SCOPE_CHARS = 128;
 
 /** Model ids as providers spell them (`z-ai/glm-5.2`, `gpt-4o-mini`, ...). */
 const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/;
@@ -47,7 +51,7 @@ function parseScope(value: unknown, field: string): string {
   if (!parsed.ok) {
     throw new DerivativeQuestionInvalidError(
       `${field} is not a valid scope: ${parsed.body.message}`,
-      { field, scope: value },
+      { field, scope: value.slice(0, MAX_ECHOED_SCOPE_CHARS) },
     );
   }
   return parsed.scope;
@@ -210,4 +214,23 @@ export async function createQuestionRegistration(
   };
   await input.store.insert(registration);
   return registration;
+}
+
+/**
+ * Consent check for a builder question: the sources feed a prompt whose
+ * answer the builder reads, so every source scope must be covered by a READ
+ * entry of the builder's grant (bare entries; `write:` entries confer
+ * nothing). Returns the uncovered scopes; empty = all covered. The system
+ * prompt is not a security boundary, this is.
+ */
+export function uncoveredSourceScopes(
+  sourceScopes: readonly string[],
+  grantScopes: readonly string[] | undefined,
+): string[] {
+  const readEntries = (grantScopes ?? []).filter(
+    (entry) => !isWriteScopeEntry(entry),
+  );
+  return sourceScopes.filter(
+    (scope) => !scopeCoveredByGrant(scope, readEntries),
+  );
 }

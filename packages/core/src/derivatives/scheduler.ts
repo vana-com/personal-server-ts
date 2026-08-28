@@ -5,6 +5,7 @@
  * deterministically.
  */
 
+import { computeDataPointId } from "../sync/data-point-id.js";
 import type { QuestionStore } from "./types.js";
 
 export interface SchedulerTimers {
@@ -18,6 +19,13 @@ export interface RecomputeSchedulerOptions {
   compute(questionId: string): Promise<unknown>;
   /** Quiet period after a source change (default 5s). */
   debounceMs?: number;
+  /**
+   * Lets `markSourceChanged` recognise a new version that was computed FROM
+   * a question's own derived scope (its `$lineage` names the derived data
+   * point id) and skip that question: a cross-replica cycle then settles
+   * instead of ping-ponging through sync. Without it every change counts.
+   */
+  serverOwner?: `0x${string}`;
   timers?: SchedulerTimers;
   now?: () => Date;
   logger?: {
@@ -31,13 +39,24 @@ export interface RecomputeScheduler {
    * that lists it as a source is marked `stale` (if it had a result) and
    * scheduled. Fire and forget; failures are logged.
    */
-  markSourceChanged(scope: string): void;
+  markSourceChanged(
+    scope: string,
+    options?: {
+      /** `$lineage.sources` of the new version, when it is a derivative. */
+      lineageSources?: readonly string[];
+    },
+  ): void;
   /** Schedule one question; `immediate` skips the debounce (owner recompute). */
   requestRecompute(questionId: string, options?: { immediate?: boolean }): void;
   /** Resolves once no compute or store lookup is pending or timed. */
   whenIdle(): Promise<void>;
   /** Cancel pending timers. In-flight computes finish on their own. */
   stop(): void;
+  /**
+   * Resume after `stop()`: questions left `pending` or `stale` are
+   * scheduled again (immediately). Idempotent while running.
+   */
+  start(): void;
 }
 
 interface QuestionState {
@@ -140,12 +159,27 @@ export function createRecomputeScheduler(
   }
 
   return {
-    markSourceChanged(scope) {
+    markSourceChanged(scope, opts) {
       if (stopped) return;
+      const lineage = new Set(
+        (opts?.lineageSources ?? []).map((id) => id.toLowerCase()),
+      );
       void track(
         (async () => {
           const affected = await options.store.list({ sourceScope: scope });
           for (const registration of affected) {
+            if (
+              options.serverOwner &&
+              lineage.has(
+                computeDataPointId(
+                  options.serverOwner,
+                  registration.derivedScope,
+                ),
+              )
+            ) {
+              // The new version descends from this question's own output.
+              continue;
+            }
             await markStale(registration.questionId);
             schedule(registration.questionId, debounceMs);
           }
@@ -195,6 +229,27 @@ export function createRecomputeScheduler(
         if (state.timer !== null) timers.clearTimeout(state.timer);
         state.timer = null;
       }
+    },
+    start() {
+      if (!stopped) return;
+      stopped = false;
+      void track(
+        (async () => {
+          for (const registration of await options.store.list()) {
+            if (
+              registration.status === "pending" ||
+              registration.status === "stale"
+            ) {
+              schedule(registration.questionId, 0);
+            }
+          }
+        })().catch((err) =>
+          warn(
+            { error: err instanceof Error ? err.name : String(err) },
+            "Could not reschedule derivative questions",
+          ),
+        ),
+      );
     },
   };
 }

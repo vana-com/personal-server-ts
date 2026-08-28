@@ -256,6 +256,17 @@ export class DerivativeCycleError extends ProtocolError {
   }
 }
 
+export class DerivativeSourceNotGrantedError extends ProtocolError {
+  constructor(details: { scopes: string[] }) {
+    super(
+      403,
+      "DERIVATIVE_SOURCE_NOT_GRANTED",
+      "The builder's grant does not cover reading every source scope of this question",
+      details,
+    );
+  }
+}
+
 export class DerivativeComputeUnavailableError extends ProtocolError {
   constructor(details?: Record<string, unknown>) {
     super(

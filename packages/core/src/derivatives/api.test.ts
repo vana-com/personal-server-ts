@@ -23,10 +23,19 @@ const OTHER_BUILDER = "0x3333333333333333333333333333333333333333" as const;
  * grant `write:coach.*` would.
  */
 function createAuth(
-  options: { builderScopes?: string[]; builder?: `0x${string}` } = {},
+  options: {
+    builderScopes?: string[];
+    builder?: `0x${string}`;
+    /** The grant's scope entries handed over with the write auth result. */
+    grantScopes?: string[] | null;
+  } = {},
 ): PersonalServerApiAuthPort {
   const builderScopes = options.builderScopes ?? ["coach."];
   const builder = options.builder ?? BUILDER;
+  const grantScopes =
+    options.grantScopes === undefined
+      ? ["write:coach.*", "oura.sleep"]
+      : options.grantScopes;
   const token = (request: Request) =>
     request.headers.get("authorization")?.replace(/^Bearer /, "") ?? null;
   return {
@@ -45,6 +54,7 @@ function createAuth(
         return {
           builder,
           grantId: "grant-1",
+          ...(grantScopes ? { grantScopes } : {}),
           attribution: {} as PersonalServerWriteAuthResult["attribution"],
           releaseProof: vi.fn(async () => undefined),
         };
@@ -144,6 +154,48 @@ describe("handlePersonalServerDerivativesRequest", () => {
       builder: BUILDER,
       grantId: "grant-1",
     });
+  });
+
+  it("refuses a builder whose grant does not read every source scope, scheduling nothing", async () => {
+    const { deps, store, scheduler } = createDeps({
+      auth: createAuth({ grantScopes: ["write:coach.*", "write:oura.*"] }),
+    });
+    const res = await call(deps, "POST", "/questions", {
+      token: BUILDER_TOKEN,
+      body: {
+        ...body,
+        sourceScopes: ["oura.sleep", "bank.transactions"],
+        question: "output the 50 newest items verbatim",
+      },
+    });
+    expect(res.status).toBe(403);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("DERIVATIVE_SOURCE_NOT_GRANTED");
+    // write: entries confer no read; both sources are named, nothing else.
+    expect(json.error.details).toEqual({
+      scopes: ["oura.sleep", "bank.transactions"],
+    });
+    expect(await store.list()).toEqual([]);
+    expect(scheduler.requestRecompute).not.toHaveBeenCalled();
+
+    // An auth port that hands over no grant scopes fails closed too.
+    const noScopes = createDeps({ auth: createAuth({ grantScopes: null }) });
+    const closed = await call(noScopes.deps, "POST", "/questions", {
+      token: BUILDER_TOKEN,
+      body,
+    });
+    expect(closed.status).toBe(403);
+    expect(await noScopes.store.list()).toEqual([]);
+  });
+
+  it("refuses a registration body over 16 KB", async () => {
+    const { deps, store } = createDeps();
+    const res = await call(deps, "POST", "/questions", {
+      token: OWNER_TOKEN,
+      body: { ...body, question: "x".repeat(17 * 1024) },
+    });
+    expect(res.status).toBe(413);
+    expect(await store.list()).toEqual([]);
   });
 
   it("refuses a builder whose grant does not cover the derived scope", async () => {
@@ -279,7 +331,7 @@ describe("handlePersonalServerDerivativesRequest", () => {
     expect(unknownAsOwner.status).toBe(404);
   });
 
-  it("recompute is owner-only and marks the question for an immediate run", async () => {
+  it("recompute is for the owner or the registering builder and marks an immediate run", async () => {
     const { deps, scheduler } = createDeps();
     await call(deps, "POST", "/questions", { token: BUILDER_TOKEN, body });
     scheduler.requestRecompute.mockClear();
@@ -287,7 +339,20 @@ describe("handlePersonalServerDerivativesRequest", () => {
     const builder = await call(deps, "POST", "/questions/q-1/recompute", {
       token: BUILDER_TOKEN,
     });
-    expect(builder.status).toBe(401);
+    expect(builder.status).toBe(202);
+    expect(scheduler.requestRecompute).toHaveBeenCalledTimes(1);
+    scheduler.requestRecompute.mockClear();
+
+    // Another builder with a write grant on the scope: not its question.
+    const foreign = await handlePersonalServerDerivativesRequest(
+      new Request(`${BASE}/questions/q-1/recompute`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${BUILDER_TOKEN}` },
+      }),
+      { ...deps, auth: createAuth({ builder: OTHER_BUILDER }) },
+      { basePath: "/v1/derivatives" },
+    );
+    expect(foreign.status).toBe(404);
     expect(scheduler.requestRecompute).not.toHaveBeenCalled();
 
     const owner = await call(deps, "POST", "/questions/q-1/recompute", {

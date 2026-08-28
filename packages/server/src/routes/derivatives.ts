@@ -9,6 +9,7 @@ import type { Logger } from "pino";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import {
   handlePersonalServerDerivativesRequest,
+  MAX_QUESTION_BODY_BYTES,
   type PersonalServerDerivativesApiDeps,
 } from "@opendatalabs/personal-server-ts-core/derivatives";
 import type { PersonalServerApiDispatchOptions } from "@opendatalabs/personal-server-ts-core/api";
@@ -21,7 +22,7 @@ import type {
   WriteSessionStore,
 } from "@opendatalabs/personal-server-ts-core/write";
 import type { TokenStore } from "../token-store.js";
-import { createBodyLimit, DEFAULT_MAX_SIZE } from "../middleware/body-limit.js";
+import { createBodyLimit } from "../middleware/body-limit.js";
 import { createServerApiAuth } from "../api-auth.js";
 
 export interface DerivativesRouteDeps {
@@ -58,7 +59,7 @@ export function derivativesRoutes(deps: DerivativesRouteDeps): Hono {
     writeProofReplayStore: deps.writeProofReplayStore,
   });
 
-  app.use("*", createBodyLimit(DEFAULT_MAX_SIZE));
+  app.use("*", createBodyLimit(MAX_QUESTION_BODY_BYTES));
   app.all("*", (c) =>
     handlePersonalServerDerivativesRequest(
       c.req.raw,

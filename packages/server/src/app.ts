@@ -218,7 +218,9 @@ export function createApp(deps: AppDeps): Hono {
       // question that reads it stale.
       onDataWritten: deps.derivativeCompute
         ? (event) =>
-            deps.derivativeCompute?.scheduler.markSourceChanged(event.scope)
+            deps.derivativeCompute?.scheduler.markSourceChanged(event.scope, {
+              lineageSources: event.lineageSources,
+            })
         : undefined,
       mountPath: "/v1/data",
     }),

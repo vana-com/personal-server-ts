@@ -204,7 +204,8 @@ export function createOpenAiCompatibleInferenceProvider(
         );
       }
       let content = readContent(parsed);
-      if (content === null) {
+      if (content === null || content.trim() === "") {
+        // An empty reply must never become a "ready" derivative.
         throw new InferenceRequestError(
           "inference response carried no assistant content",
           response.status,

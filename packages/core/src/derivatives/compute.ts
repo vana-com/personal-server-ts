@@ -4,14 +4,27 @@
  * source data points).
  */
 
-import { ProtocolError } from "../errors/catalog.js";
+import {
+  DerivativeCycleError,
+  DerivativeSourceNotGrantedError,
+  ProtocolError,
+} from "../errors/catalog.js";
+import { resolveReadDeletion } from "../api/index.js";
+import {
+  LOCAL_SCOPE_SCAN_PAGE,
+  readStoredLineage,
+} from "../lineage/lineage.js";
+import { uncoveredSourceScopes } from "./registration.js";
 import { ingestDataContract } from "../contracts/data.js";
 import { isBinaryEnvelope } from "../contracts/binary.js";
 import { assertDerivedScopeNaming } from "../lineage/lineage.js";
 import type { StoredLineage } from "../lineage/lineage.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
 import type { ScopeDeletionTracker } from "../sync/scope-deletions.js";
-import type { DataStoragePort } from "../ports/index.js";
+import type {
+  DataStoragePort,
+  RuntimeAvailabilityPort,
+} from "../ports/index.js";
 import {
   verifyDataWritePolicy,
   type DataWritePolicyPorts,
@@ -55,6 +68,25 @@ export interface QuestionComputeDeps {
    * failed, no inference call). Owner registrations skip the check.
    */
   writePolicyPorts?: DataWritePolicyPorts;
+  /**
+   * Called after the derivative is written and the question marked ready,
+   * so a question that reads THIS derived scope recomputes in turn
+   * (A -> B -> C chains). The compute path never goes through the HTTP
+   * ingest hook.
+   */
+  onDerivedWritten?: (event: {
+    scope: string;
+    collectedAt: string;
+    lineageSources: string[];
+  }) => void;
+  /** When unavailable the compute is skipped and the status left as is. */
+  runtimeAvailability?: RuntimeAvailabilityPort;
+  /**
+   * Backoff between retries of a transient inference or gateway failure
+   * (default 1s, 4s: three attempts). Tests pass zeros.
+   */
+  retryDelaysMs?: readonly number[];
+  sleep?: (ms: number) => Promise<void>;
   now?: () => Date;
   logger?: ComputeLogger;
 }
@@ -62,7 +94,39 @@ export interface QuestionComputeDeps {
 export type ComputeOutcome =
   | { status: "ready"; registration: QuestionRegistration }
   | { status: "failed"; registration: QuestionRegistration; error: string }
-  | { status: "skipped"; reason: "unknown-question" };
+  | { status: "skipped"; reason: "unknown-question" | "runtime-unavailable" };
+
+const DEFAULT_RETRY_DELAYS_MS: readonly number[] = [1_000, 4_000];
+
+/** Transient: no response, rate limited or a provider-side failure. */
+function isRetryableInferenceError(err: unknown): boolean {
+  return (
+    err instanceof InferenceRequestError &&
+    (err.status === null || err.status === 429 || err.status >= 500)
+  );
+}
+
+/**
+ * Run `attempt` up to `delays.length + 1` times while `retryable(err)`;
+ * anything else (a ProtocolError, a permanent status) surfaces at once.
+ */
+async function withRetries<T>(
+  deps: Pick<QuestionComputeDeps, "retryDelaysMs" | "sleep">,
+  attempt: () => Promise<T>,
+  retryable: (err: unknown) => boolean,
+): Promise<T> {
+  const delays = deps.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
+  const sleep =
+    deps.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+  for (let index = 0; ; index += 1) {
+    try {
+      return await attempt();
+    } catch (err) {
+      if (index >= delays.length || !retryable(err)) throw err;
+      await sleep(delays[index]!);
+    }
+  }
+}
 
 /** The record written into the derived scope. */
 export interface DerivativeAnswerRecord {
@@ -128,11 +192,94 @@ async function tombstoneMarker(
   return Number.isSafeInteger(version) ? version : null;
 }
 
+/**
+ * `dataPointId -> scope` for every scope in the local index, used to walk
+ * stored lineage locally. Paged like the lineage resolver.
+ */
+function localScopesById(
+  storage: Pick<DataStoragePort, "listScopes">,
+  serverOwner: `0x${string}`,
+): Map<string, string> {
+  const byId = new Map<string, string>();
+  for (let offset = 0; ; offset += LOCAL_SCOPE_SCAN_PAGE) {
+    const { scopes, total } = storage.listScopes({
+      limit: LOCAL_SCOPE_SCAN_PAGE,
+      offset,
+    });
+    for (const summary of scopes) {
+      byId.set(computeDataPointId(serverOwner, summary.scope), summary.scope);
+    }
+    if (scopes.length === 0 || offset + scopes.length >= total) break;
+  }
+  return byId;
+}
+
+/**
+ * Cycle guard on ACTUAL lineage, for cycles the per-store registration
+ * check cannot see (two replicas each holding one half: B <- A here, A <- B
+ * there, ping-ponging through sync). Walks `$lineage` from every source's
+ * latest local version through the local index; reaching the derived data
+ * point id means this question would consume its own output. Bounded by
+ * the visited set.
+ */
+async function assertNoLineageCycle(
+  deps: QuestionComputeDeps,
+  registration: QuestionRegistration,
+  serverOwner: `0x${string}`,
+  sourceLineage: ReadonlyMap<string, readonly string[]>,
+): Promise<void> {
+  const derivedId = computeDataPointId(serverOwner, registration.derivedScope);
+  let byId: Map<string, string> | null = null;
+  const visited = new Set<string>();
+  const stack: Array<{ id: string; path: string[] }> = [];
+  for (const [scope, sources] of sourceLineage) {
+    for (const id of sources) stack.push({ id, path: [scope] });
+  }
+  while (stack.length > 0) {
+    const { id, path } = stack.pop()!;
+    if (id === derivedId) {
+      throw new DerivativeCycleError({
+        derivedScope: registration.derivedScope,
+        path: [registration.derivedScope, ...path, registration.derivedScope],
+      });
+    }
+    if (visited.has(id)) continue;
+    visited.add(id);
+    byId ??= localScopesById(deps.storage, serverOwner);
+    const scope = byId.get(id);
+    if (!scope) continue;
+    const entry = deps.storage.findEntry({ scope });
+    if (!entry) continue;
+    let sources: readonly string[] = [];
+    try {
+      const envelope = await deps.storage.readEnvelope(
+        scope,
+        entry.collectedAt,
+      );
+      sources = readStoredLineage(envelope.data)?.sources ?? [];
+    } catch {
+      // Unreadable or malformed lineage: nothing further to walk here.
+    }
+    for (const next of sources)
+      stack.push({ id: next, path: [...path, scope] });
+  }
+}
+
 async function loadSource(
   deps: QuestionComputeDeps,
   scope: string,
-): Promise<PromptSource> {
+): Promise<{ source: PromptSource; lineageSources: string[] }> {
   const entry = deps.storage.findEntry({ scope });
+  // The same deletion gate a read applies: a tombstoned scope is refused
+  // (410 on the read path) whether or not a stale local copy remains.
+  const deletion = await resolveReadDeletion(
+    { scopeDeletions: deps.scopeDeletions, serverOwner: deps.serverOwner },
+    scope,
+    entry,
+  );
+  if (deletion) {
+    throw new ComputeFailure(`source scope ${scope} is deleted`);
+  }
   if (!entry) {
     throw new ComputeFailure(`source scope ${scope} has no local data`);
   }
@@ -141,6 +288,12 @@ async function loadSource(
     envelope = await deps.storage.readEnvelope(scope, entry.collectedAt);
   } catch {
     throw new ComputeFailure(`source scope ${scope} could not be read`);
+  }
+  let lineageSources: string[] = [];
+  try {
+    lineageSources = readStoredLineage(envelope.data)?.sources ?? [];
+  } catch {
+    // Malformed stored lineage: treated as a root for the cycle walk.
   }
   const raw = isBinaryEnvelope(envelope)
     ? {
@@ -153,34 +306,61 @@ async function loadSource(
     maxChars: deps.maxSourceChars,
   });
   return {
-    scope,
-    collectedAt: entry.collectedAt,
-    version: entry.version,
-    data: trimmed.data,
-    kept: trimmed.kept,
-    total: trimmed.total,
-    truncated: trimmed.truncated,
+    source: {
+      scope,
+      collectedAt: entry.collectedAt,
+      version: entry.version,
+      data: trimmed.data,
+      kept: trimmed.kept,
+      total: trimmed.total,
+      truncated: trimmed.truncated,
+    },
+    lineageSources,
   };
 }
 
+/**
+ * A builder question re-checks its grant before every compute: the write
+ * permission on the derived scope (revocation, expiry, coverage) AND read
+ * coverage of every source scope, since the answer exposes the sources to
+ * the builder. Gateway transport failures are retried; policy failures
+ * (ProtocolErrors) fail closed at once.
+ */
 async function assertGrantStillValid(
   deps: QuestionComputeDeps,
   registration: QuestionRegistration,
 ): Promise<void> {
-  if (registration.registeredBy.kind !== "builder" || !deps.writePolicyPorts)
-    return;
+  if (registration.registeredBy.kind !== "builder") return;
+  if (!deps.writePolicyPorts) {
+    throw new ComputeFailure("builder grant verification is not configured");
+  }
   if (!deps.serverOwner) {
     throw new ComputeFailure("server owner is not configured");
   }
-  await verifyDataWritePolicy(
-    {
-      signer: registration.registeredBy.builder,
-      grantId: registration.registeredBy.grantId,
-      requestedScope: registration.derivedScope,
-      serverOwner: deps.serverOwner,
-    },
-    deps.writePolicyPorts,
+  const { builder, grantId } = registration.registeredBy;
+  const ports = deps.writePolicyPorts;
+  const serverOwner = deps.serverOwner;
+  const grant = await withRetries(
+    deps,
+    () =>
+      verifyDataWritePolicy(
+        {
+          signer: builder,
+          grantId,
+          requestedScope: registration.derivedScope,
+          serverOwner,
+        },
+        ports,
+      ),
+    (err) => !(err instanceof ProtocolError),
   );
+  const uncovered = uncoveredSourceScopes(
+    registration.sourceScopes,
+    grant.scopes ?? [],
+  );
+  if (uncovered.length > 0) {
+    throw new DerivativeSourceNotGrantedError({ scopes: uncovered });
+  }
 }
 
 /**
@@ -193,6 +373,9 @@ export async function computeQuestion(
   deps: QuestionComputeDeps,
 ): Promise<ComputeOutcome> {
   const now = deps.now ?? (() => new Date());
+  if ((await deps.runtimeAvailability?.isAvailable()) === false) {
+    return { status: "skipped", reason: "runtime-unavailable" };
+  }
   const registration = await deps.store.get(questionId);
   if (!registration) return { status: "skipped", reason: "unknown-question" };
 
@@ -210,19 +393,23 @@ export async function computeQuestion(
     );
 
     const sources: PromptSource[] = [];
+    const sourceLineage = new Map<string, readonly string[]>();
     for (const scope of registration.sourceScopes) {
-      sources.push(await loadSource(deps, scope));
+      const loaded = await loadSource(deps, scope);
+      sources.push(loaded.source);
+      sourceLineage.set(scope, loaded.lineageSources);
     }
+    await assertNoLineageCycle(deps, registration, serverOwner, sourceLineage);
     const messages = buildQuestionMessages({
       question: registration.question,
       sources,
     });
     const model = registration.model ?? deps.provider.defaultModel;
-    const reply = await deps.provider.chat({
-      model,
-      messages,
-      maxTokens: deps.maxTokens,
-    });
+    const reply = await withRetries(
+      deps,
+      () => deps.provider.chat({ model, messages, maxTokens: deps.maxTokens }),
+      isRetryableInferenceError,
+    );
     const parsed = parseAnswer(reply.content);
 
     const computedAt = now().toISOString();
@@ -297,6 +484,22 @@ export async function computeQuestion(
       deps.syncManager.notifyNewData();
     } else if (deps.syncManager?.trigger) {
       void deps.syncManager.trigger().catch(() => undefined);
+    }
+    try {
+      deps.onDerivedWritten?.({
+        scope: registration.derivedScope,
+        collectedAt,
+        lineageSources: lineageIds,
+      });
+    } catch (err) {
+      deps.logger?.warn?.(
+        {
+          questionId,
+          derivedScope: registration.derivedScope,
+          error: err instanceof Error ? err.name : String(err),
+        },
+        "onDerivedWritten hook failed; derivative already written",
+      );
     }
     deps.logger?.info?.(
       {
