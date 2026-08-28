@@ -53,7 +53,7 @@ export {
 } from "./transcript.js";
 
 export type {
-  PreparedScript,
+  ExecutedRun,
   QueryScriptResult,
   QueryToolHost,
 } from "./tool-host.js";

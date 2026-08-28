@@ -128,8 +128,23 @@ export function renderRunResult(input: {
   termination: string;
   truncatedByHost: boolean;
   maxBytes?: number;
+  /**
+   * A confinement denial, budget exhaustion or script error, surfaced to the
+   * model verbatim. The confined interpreter supports a deliberate subset of
+   * JS and fails closed on the rest, so a model that writes a `class` or a
+   * generator gets `CONFINEMENT_VIOLATION` — and it can only correct that if
+   * it is told which construct was refused. Without this the model burns its
+   * one repair attempt on a mystery.
+   */
+  error?: { code: string; message: string };
 }): { content: string; truncation?: TruncationNote } {
   const sections: string[] = [];
+
+  if (input.error) {
+    sections.push(
+      `Your script did not complete — ${input.error.code}: ${input.error.message}`,
+    );
+  }
 
   if (input.notes.length > 0) {
     sections.push("Notes:\n" + input.notes.map((n) => `- ${n}`).join("\n"));

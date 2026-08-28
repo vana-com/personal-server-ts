@@ -90,3 +90,18 @@ export interface QueryAnswer {
 
 /** Model-declared confidence from a `vana:answer` block. Never coverage. */
 export type QueryConfidence = "high" | "medium" | "low";
+
+/**
+ * Coverage for a run that produced none.
+ *
+ * Fails closed: nothing scanned, nothing complete. Used when no confined run
+ * ever reported — a contract violation burned both attempts, or the coverage
+ * frame never arrived. The alternative, defaulting to an empty-but-complete
+ * shape, would let "we learned nothing" render as a confident total.
+ */
+export const EMPTY_COVERAGE: QueryCoverage = Object.freeze({
+  scopesScanned: [],
+  recordsScanned: 0,
+  scopesSkipped: [],
+  complete: false,
+});

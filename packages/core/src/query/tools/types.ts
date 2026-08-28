@@ -125,6 +125,16 @@ export interface QueryToolContext {
    * server to audit what the server told it.
    */
   callerId?: string;
+  /**
+   * Who the question is *about*, when it names a party. Set by the host after
+   * parsing the question; `vana.introspect()` is refused when this equals
+   * `callerId`.
+   *
+   * Deliberately host-supplied rather than derived inside the API: the script
+   * must not be able to influence who the subject is, or the refusal is
+   * decorative.
+   */
+  introspectSubject?: string;
 }
 
 /** The payload a script hands to `vana.result`, terminating the run. */

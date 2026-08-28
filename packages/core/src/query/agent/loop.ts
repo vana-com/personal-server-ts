@@ -23,7 +23,6 @@ import type {
   InferenceMessage,
   InferenceProvider,
 } from "../../derivatives/inference.js";
-import type { Sandbox } from "../ports.js";
 import { buildSystemPrompt } from "./prompt.js";
 import { parseTurn, repairMessage, type ParseFailure } from "./contract.js";
 import type { QueryToolHost } from "./tool-host.js";
@@ -32,17 +31,21 @@ import {
   fitTranscript,
   renderRunResult,
 } from "./transcript.js";
-import type {
-  QueryAnswer,
-  QueryCitation,
-  QueryCoverage,
-  QueryRequest,
-  QueryStoppedBecause,
+import {
+  EMPTY_COVERAGE,
+  type QueryAnswer,
+  type QueryCitation,
+  type QueryCoverage,
+  type QueryRequest,
+  type QueryStoppedBecause,
 } from "./types.js";
 
 export interface QueryLoopOptions {
   provider: InferenceProvider;
-  sandbox: Sandbox;
+  /**
+   * Owns BOTH sandbox layers. The loop deliberately has no `Sandbox` of its
+   * own: model code must reach the confined interpreter, never Node.
+   */
   tools: QueryToolHost;
   model?: string;
   /** Hard ceiling on model turns. Also the only bound on relay call volume. */
@@ -136,7 +139,6 @@ export async function runQueryLoop(
 ): Promise<QueryAnswer> {
   const {
     provider,
-    sandbox,
     tools,
     model = provider.defaultModel,
     maxTurns = DEFAULT_MAX_TURNS,
@@ -218,22 +220,21 @@ export async function runQueryLoop(
       break;
     }
 
-    // A run block: prepare it (4b puts `vana` in scope), execute, feed back.
-    const prepared = await tools.prepare(parsed.script);
+    // A run block. `execute` runs it as DATA inside the confined interpreter,
+    // which itself runs inside the OS sandbox. The loop never holds a sandbox
+    // and never sees a runnable script, so it cannot execute model code bare.
     lastScript = parsed.script;
-    const result = await sandbox.run(prepared.script, prepared.spec);
+    const result = await tools.execute(parsed.script);
     violations.push(...result.violations);
 
     const mapped = TERMINATION_TO_STOPPED[result.termination];
     if (mapped) stoppedBecause = mapped;
 
-    // `takeResult` drains, so call it exactly once per run and keep the value.
-    const scriptResult = tools.takeResult();
-    if (scriptResult?.value !== undefined) resultValue = scriptResult.value;
-    if (scriptResult?.answer) {
+    if (result.result?.value !== undefined) resultValue = result.result.value;
+    if (result.result?.answer) {
       // `vana.result(...)` terminates the script and the run.
-      finalAnswer = scriptResult.answer;
-      finalCitations = scriptResult.citations ?? [];
+      finalAnswer = result.result.answer;
+      finalCitations = result.result.citations ?? [];
       break;
     }
 
@@ -242,10 +243,14 @@ export async function runQueryLoop(
     const rendered = renderRunResult({
       stdout: result.stdout,
       stderr: result.stderr,
-      notes: tools.takeNotes(),
+      notes: result.notes,
       termination: result.termination,
       truncatedByHost: result.truncated,
       maxBytes: outputTailBytes,
+      // A confinement denial is actionable feedback: the interpreter supports
+      // a deliberate subset of JS, and the model can only correct a rejected
+      // `class` or generator if it is told which construct was refused.
+      ...(result.error ? { error: result.error } : {}),
     });
     messages.push({ role: "user", content: rendered.content });
   }
@@ -257,7 +262,8 @@ export async function runQueryLoop(
   }
 
   // Coverage is the tool layer's, not the model's, not this loop's.
-  const hostCoverage = tools.coverage();
+  // Accumulated across every run in this request, not just the last one.
+  const hostCoverage = tools.coverage() ?? EMPTY_COVERAGE;
   const coverage: QueryCoverage = {
     ...hostCoverage,
     complete: hostCoverage.complete && stoppedBecause === undefined,

@@ -1,7 +1,7 @@
 {
   "name": "@opendatalabs/personal-server-ts-server",
   "version": "0.0.1",
-  "description": "Hono HTTP server for the Vana Personal Server — routes, middleware, composition root",
+  "description": "Hono HTTP server for the Vana Personal Server \u2014 routes, middleware, composition root",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -38,9 +38,10 @@
   "scripts": {
     "copy-ui": "mkdir -p dist/ui && cp src/ui/index.html dist/ui/index.html && cp ../lite/src/browser-tls-rustls/browser_tls_rustls_bg.wasm dist/ui/browser_tls_rustls_bg.wasm",
     "bundle-ui": "esbuild src/ui/ps-lite-debug.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=dist/ui/ps-lite-debug.js",
-    "build": "tsc --build && npm run copy-ui && npm run bundle-ui",
+    "build": "tsc --build && npm run copy-ui && npm run bundle-ui && npm run bundle-query-runner",
     "start": "node dist/index.js",
-    "dev": "node --watch dist/index.js"
+    "dev": "node --watch dist/index.js",
+    "bundle-query-runner": "esbuild src/query/runner-entry.ts --bundle --format=esm --platform=node --target=node22 --outfile=dist/query/runner.js"
   },
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "0.0.74",

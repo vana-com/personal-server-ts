@@ -43,3 +43,12 @@ export {
   runConfinedScript,
   type RunScriptOptions,
 } from "./interpreter/index.js";
+export {
+  RESULT_FRAME_BEGIN,
+  RESULT_FRAME_END,
+  decodeResultFrame,
+  encodeResultFrame,
+  stripResultFrames,
+  type DecodeOutcome,
+  type RunDocument,
+} from "./protocol.js";

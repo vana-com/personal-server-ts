@@ -52,51 +52,26 @@ export interface QueryEvalCase {
 
 /**
  * Mirrors the `QueryRequest` / `QueryAnswer` pair from implementation plan
- * phase 5. Phase 5 owns the real definitions; these live here so the harness is
- * runnable before the agent loop exists. When phase 5 lands, hoist one
- * definition to `packages/core/src/query/types.ts` and have both import it.
+ * phase 5.
+ *
+ * HOISTED 2026-08-28 (4a/4b/5 integration). Phase 5's `agent/types.ts` now
+ * holds the single canonical definition and these are aliases, so the harness
+ * cannot drift from what the loop actually returns — a mismatch becomes a
+ * compile error rather than a grading bug. In particular `stoppedBecause` was
+ * `"budget" | "error"` here while the loop produces nine values, so the
+ * harness silently lost the reason a run stopped.
  */
-export interface EvalQueryRequest {
-  question: string;
-  grantedScopes: string[];
-  budget?: { toolCalls?: number; wallClockMs?: number; usd?: number };
-}
+export type {
+  QueryRequest as EvalQueryRequest,
+  QueryCoverage as EvalCoverage,
+  QueryAnswer as EvalQueryAnswer,
+} from "../agent/types.js";
 
-export interface EvalCoverage {
-  scopesScanned: string[];
-  recordsScanned: number;
-  scopesSkipped: { scope: string; reason: string }[];
-  complete: boolean;
-  /** Records present but unreadable — what makes an absence answer honest. */
-  unreadable?: number;
-  /** "prefiltered" marks a semantically-narrowed pass (prompt doc §5, Q9/Q15). */
-  method?: "full" | "prefiltered";
-  stoppedBecause?: "budget" | "error";
-}
-
-export interface EvalQueryAnswer {
-  answer: string;
-  citations: { scope: string; recordId?: string; blockRef?: string }[];
-  coverage: EvalCoverage;
-  script?: string;
-  determinism: "replayed" | "generated";
-  cost: {
-    toolCalls: number;
-    inputTokens: number;
-    outputTokens: number;
-    usd?: number;
-  };
-  /**
-   * Extension: the numeric result, when the answer has one. Grading falls back
-   * to extracting a number from `answer` text, but an answerer that knows its
-   * own figure should say so rather than make the grader guess.
-   */
-  value?: number;
-}
+import type { QueryRequest, QueryAnswer } from "../agent/types.js";
 
 export interface EvalAnswerer {
   readonly name: string;
-  answer(request: EvalQueryRequest): Promise<EvalQueryAnswer>;
+  answer(request: QueryRequest): Promise<QueryAnswer>;
 }
 
 /* ------------------------------------------------------------------ */

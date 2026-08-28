@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import { createFakeInferenceProvider } from "../../derivatives/inference.js";
 import { runEval } from "../evals/runner.js";
 import type { QueryEvalCase } from "../evals/types.js";
-import type { Sandbox } from "../ports.js";
 import { createAgentAnswerer } from "./answerer.js";
 import type { QueryToolHost } from "./tool-host.js";
 
@@ -25,18 +24,20 @@ function stubTools(coverage: {
     async listScopes() {
       return [{ scope: "oura.sleep", itemCount: coverage.recordsScanned }];
     },
-    async prepare(code) {
+    async execute() {
       return {
-        script: code,
-        spec: {
-          readPaths: [],
-          writePath: "/scratch",
-          denyNetwork: true,
-          cpuMs: 100,
-          memoryMb: 32,
-          wallClockMs: 500,
-          maxOutputBytes: 1000,
+        coverage: {
+          scopesScanned: ["oura.sleep"],
+          recordsScanned: coverage.recordsScanned,
+          scopesSkipped: [],
+          complete: coverage.complete,
         },
+        notes: [],
+        termination: "completed",
+        stdout: "",
+        stderr: "",
+        violations: [],
+        truncated: false,
       };
     },
     coverage: () => ({
@@ -48,19 +49,8 @@ function stubTools(coverage: {
         ? {}
         : { unreadable: coverage.unreadable }),
     }),
-    takeResult: () => undefined,
-    takeNotes: () => [],
   };
 }
-
-const noSandbox: Sandbox = {
-  async run() {
-    throw new Error("not expected in these cases");
-  },
-  async capabilities() {
-    return { available: false, reason: "stub" };
-  },
-};
 
 describe("createAgentAnswerer", () => {
   it("satisfies EvalAnswerer and grades a numeric case", async () => {
@@ -76,7 +66,6 @@ describe("createAgentAnswerer", () => {
 
     const answerer = createAgentAnswerer({
       provider,
-      sandbox: noSandbox,
       tools: stubTools({ recordsScanned: 1030, complete: true }),
       name: "agent-loop-test",
     });
@@ -119,7 +108,6 @@ describe("createAgentAnswerer", () => {
 
     const answerer = createAgentAnswerer({
       provider,
-      sandbox: noSandbox,
       tools: stubTools({
         recordsScanned: 318,
         complete: false,
@@ -138,20 +126,23 @@ describe("createAgentAnswerer", () => {
     expect(result.answer).toContain("22 record(s) could not be read");
   });
 
-  it("narrows the loop's wider stoppedBecause onto the harness union", async () => {
+  it("preserves the loop's precise stoppedBecause for the grader", async () => {
     const provider = createFakeInferenceProvider({
       respond: () => ({ content: "prose with no block" }),
     });
     const answerer = createAgentAnswerer({
       provider,
-      sandbox: noSandbox,
       tools: stubTools({ recordsScanned: 0, complete: false }),
     });
     const result = await answerer.answer({
       question: "q",
       grantedScopes: ["oura.sleep"],
     });
-    // Loop says "contractViolation"; the harness only knows budget | error.
-    expect(result.coverage.stoppedBecause).toBe("error");
+    // Before the 4a/4b/5 integration this adapter narrowed the loop's nine
+    // stop reasons onto the harness's `"budget" | "error"`, so a grader could
+    // not tell "ran out of budget" from "the sandbox denied it" from "the
+    // model never produced a valid script". The harness types are now aliases
+    // of the loop's own, so the precise reason survives.
+    expect(result.coverage.stoppedBecause).toBe("contractViolation");
   });
 });

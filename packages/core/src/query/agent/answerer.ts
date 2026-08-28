@@ -1,22 +1,23 @@
 /**
  * Adapts the agent loop to the phase 1 eval harness's `EvalAnswerer`.
  *
- * This is what lets `npm run eval` grade the real loop against the same 18
- * cases the reference answerer is graded on — the comparison plan §7 asks for
- * (beat the tool loop, not just the truncation heuristic).
+ * This is what lets `npm run eval --answerer agent` grade the real loop
+ * against the same 18 cases the reference answerer is graded on — the
+ * comparison plan §7 asks for (beat the tool loop, not just the truncation
+ * heuristic).
  *
- * The shapes are near-identical by construction: `evals/types.ts` says phase 5
- * owns the real definitions and that one should be hoisted when it lands. This
- * adapter is the seam until that hoist happens, and it is where any drift
- * between the two becomes a compile error rather than a silent mismatch.
+ * Since the 4a/4b/5 integration the harness's request/answer types are
+ * *aliases* of the loop's own, hoisted into `agent/types.ts`, so this adapter
+ * no longer translates anything. It previously narrowed `stoppedBecause` from
+ * the loop's nine values down to the harness's `"budget" | "error"`, which
+ * silently discarded the reason a run stopped — exactly the information a
+ * grader needs to distinguish "ran out of budget" from "the sandbox denied
+ * it". That narrowing is gone.
  */
 
-import type {
-  EvalAnswerer,
-  EvalQueryAnswer,
-  EvalQueryRequest,
-} from "../evals/types.js";
+import type { EvalAnswerer } from "../evals/types.js";
 import { runQueryLoop, type QueryLoopOptions } from "./loop.js";
+import type { QueryAnswer, QueryRequest } from "./types.js";
 
 export interface AgentAnswererOptions extends QueryLoopOptions {
   /** Reported in the eval output so a run's provenance is legible. */
@@ -28,8 +29,8 @@ export function createAgentAnswerer(
 ): EvalAnswerer {
   return {
     name: options.name ?? "agent-loop",
-    async answer(request: EvalQueryRequest): Promise<EvalQueryAnswer> {
-      const result = await runQueryLoop(
+    async answer(request: QueryRequest): Promise<QueryAnswer> {
+      return runQueryLoop(
         {
           question: request.question,
           grantedScopes: request.grantedScopes,
@@ -37,40 +38,6 @@ export function createAgentAnswerer(
         },
         options,
       );
-
-      // `stoppedBecause` is wider on the loop than the harness's union, which
-      // only knows "budget" | "error". Narrow rather than cast: an unmapped
-      // reason becomes "error", which is the honest reading for a grader.
-      const stopped = result.coverage.stoppedBecause;
-      const evalStopped: "budget" | "error" | undefined =
-        stopped === undefined
-          ? undefined
-          : stopped === "budget"
-            ? "budget"
-            : "error";
-
-      const answer: EvalQueryAnswer = {
-        answer: result.answer,
-        citations: result.citations,
-        coverage: {
-          scopesScanned: result.coverage.scopesScanned,
-          recordsScanned: result.coverage.recordsScanned,
-          scopesSkipped: result.coverage.scopesSkipped,
-          complete: result.coverage.complete,
-          ...(result.coverage.unreadable === undefined
-            ? {}
-            : { unreadable: result.coverage.unreadable }),
-          ...(result.coverage.method === undefined
-            ? {}
-            : { method: result.coverage.method }),
-          ...(evalStopped === undefined ? {} : { stoppedBecause: evalStopped }),
-        },
-        determinism: result.determinism,
-        cost: result.cost,
-      };
-      if (result.script !== undefined) answer.script = result.script;
-      if (result.value !== undefined) answer.value = result.value;
-      return answer;
     },
   };
 }

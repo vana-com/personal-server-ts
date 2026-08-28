@@ -151,6 +151,10 @@
     "./query/tools": {
       "types": "./dist/query/tools/index.d.ts",
       "import": "./dist/query/tools/index.js"
+    },
+    "./mcp/search": {
+      "types": "./dist/mcp/search/index.d.ts",
+      "import": "./dist/mcp/search/index.js"
     }
   },
   "scripts": {

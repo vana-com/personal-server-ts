@@ -193,6 +193,23 @@ export function createVanaApi(
           "introspect is not registered for this request",
         );
       }
+      // Prompt §3: refused when the caller is the subject of the question.
+      // Q12 ("which of my data has app X seen, and what could it infer")
+      // is the one question whose answer must never be served to the party
+      // it is about — a builder may not use the server to audit what the
+      // server told it. The host decides this, because only the host knows
+      // both who is asking and who the question names; `introspectSubject`
+      // is set by the loop, which has parsed the question.
+      if (
+        ctx.callerId !== undefined &&
+        ctx.introspectSubject !== undefined &&
+        ctx.callerId === ctx.introspectSubject
+      ) {
+        throw new QueryToolError(
+          "INTROSPECT_REFUSED",
+          `introspect is refused: the caller (${ctx.callerId}) is the subject of this question`,
+        );
+      }
       return deps.introspect(ctx.callerId);
     },
 

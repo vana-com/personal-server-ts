@@ -4,10 +4,8 @@ import {
   createFakeInferenceProvider,
   type InferenceChatResult,
 } from "../../derivatives/inference.js";
-import type { Sandbox, SandboxResult } from "../ports.js";
 import { runQueryLoop } from "./loop.js";
-import type { QueryToolHost, QueryScriptResult } from "./tool-host.js";
-import type { QueryCoverage } from "./types.js";
+import type { ExecutedRun, QueryToolHost } from "./tool-host.js";
 
 const fence = "```";
 
@@ -25,87 +23,61 @@ function reply(content: string): InferenceChatResult {
   };
 }
 
-function sandboxResult(over: Partial<SandboxResult> = {}): SandboxResult {
+/**
+ * A tool host that runs nothing. Since the 4a/4b/5 integration the loop has no
+ * `Sandbox` of its own — the host owns both layers and returns an already
+ * host-authored outcome — so these fakes stand in for a confined run rather
+ * than for a sandbox.
+ */
+function executed(over: Partial<ExecutedRun> = {}): ExecutedRun {
   return {
+    coverage: {
+      scopesScanned: ["oura.sleep"],
+      recordsScanned: 1030,
+      scopesSkipped: [],
+      complete: true,
+    },
+    notes: [],
+    termination: "completed",
     stdout: "",
     stderr: "",
-    exitCode: 0,
-    timedOut: false,
-    truncated: false,
-    durationMs: 1,
-    termination: "completed",
-    enforcement: {
-      filesystemRead: true,
-      filesystemWrite: true,
-      network: true,
-      cpu: true,
-      memory: true,
-      processCount: true,
-      wallClock: true,
-      notes: [],
-    },
     violations: [],
+    truncated: false,
     ...over,
   };
 }
 
-function fakeSandbox(results: SandboxResult[]): Sandbox & { runs: string[] } {
-  const runs: string[] = [];
+function fakeTools(
+  runs: ExecutedRun[] = [executed()],
+  over: Partial<QueryToolHost> = {},
+): QueryToolHost & { executed: string[] } {
+  const seen: string[] = [];
   let i = 0;
+  let last: ExecutedRun | undefined;
   return {
-    runs,
-    async run(script) {
-      runs.push(script);
-      return results[Math.min(i++, results.length - 1)] ?? sandboxResult();
-    },
-    async capabilities() {
-      return {
-        available: true,
-        enforcement: {
-          filesystemRead: true,
-          filesystemWrite: true,
-          network: true,
-          cpu: true,
-          memory: true,
-          processCount: true,
-          wallClock: true,
-          notes: [],
-        },
-      };
-    },
-  };
-}
-
-function fakeTools(over: Partial<QueryToolHost> = {}): QueryToolHost {
-  const coverage: QueryCoverage = {
-    scopesScanned: ["oura.sleep"],
-    recordsScanned: 1030,
-    scopesSkipped: [],
-    complete: true,
-  };
-  return {
+    executed: seen,
     async listScopes() {
       return [{ scope: "oura.sleep", itemCount: 1030 }];
     },
-    async prepare(modelCode) {
-      return {
-        script: `/*vana bridge*/\n${modelCode}`,
-        spec: {
-          readPaths: ["/data/oura.json"],
-          writePath: "/scratch",
-          denyNetwork: true,
-          cpuMs: 1000,
-          memoryMb: 64,
-          wallClockMs: 2000,
-          maxOutputBytes: 1000,
-        },
-      };
+    async execute(modelCode: string) {
+      seen.push(modelCode);
+      last = runs[Math.min(i++, runs.length - 1)] ?? executed();
+      return last;
     },
-    coverage: () => coverage,
-    takeResult: () => undefined,
-    takeNotes: () => [],
+    // Stands in for the real host's accumulator. A request where no script
+    // ran has read nothing, and must say so rather than inherit a default.
+    coverage() {
+      return (
+        last?.coverage ?? {
+          scopesScanned: [],
+          recordsScanned: 0,
+          scopesSkipped: [],
+          complete: false,
+        }
+      );
+    },
     ...over,
-  };
+  } as QueryToolHost & { executed: string[] };
 }
 
 describe("runQueryLoop — happy path", () => {
@@ -121,11 +93,11 @@ describe("runQueryLoop — happy path", () => {
               }),
         ),
     });
-    const sandbox = fakeSandbox([sandboxResult({ stdout: "avg=6.52" })]);
+    const tools = fakeTools([executed({ stdout: "avg=6.52" })]);
 
     const out = await runQueryLoop(
       { question: "How much did I sleep?", grantedScopes: ["oura.sleep"] },
-      { provider, sandbox, tools: fakeTools() },
+      { provider, tools },
     );
 
     expect(out.answer).toContain("6.52 hours");
@@ -141,12 +113,17 @@ describe("runQueryLoop — happy path", () => {
       respond: (_i, n) =>
         reply(n === 0 ? runBlock("evil()") : answerBlock({ answer: "done" })),
     });
-    const sandbox = fakeSandbox([sandboxResult()]);
+    const tools = fakeTools();
     await runQueryLoop(
       { question: "q", grantedScopes: ["oura.sleep"] },
-      { provider, sandbox, tools: fakeTools() },
+      { provider, tools },
     );
-    expect(sandbox.runs[0]).toContain("/*vana bridge*/");
+    // The loop hands RAW model code to the host and holds no sandbox of its
+    // own. Since the 4a/4b/5 integration the host runs it as data inside the
+    // confined interpreter, so "running it bare" is unreachable from here
+    // rather than merely avoided by convention.
+    expect(tools.executed[0]).toBe("evil()");
+    expect("sandbox" in ({} as Record<string, unknown>)).toBe(false);
   });
 
   it("feeds script output back as the next message's content", async () => {
@@ -158,8 +135,7 @@ describe("runQueryLoop — happy path", () => {
       { question: "q", grantedScopes: ["oura.sleep"] },
       {
         provider,
-        sandbox: fakeSandbox([sandboxResult({ stdout: "SENTINEL_OUT" })]),
-        tools: fakeTools(),
+        tools: fakeTools([executed({ stdout: "SENTINEL_OUT" })]),
       },
     );
     const second = provider.calls[1];
@@ -176,19 +152,11 @@ describe("runQueryLoop — happy path", () => {
       citations: [{ scope: "oura.sleep" }],
       value: 6.52,
     };
-    let taken = false;
     const out = await runQueryLoop(
       { question: "q", grantedScopes: ["oura.sleep"] },
       {
         provider,
-        sandbox: fakeSandbox([sandboxResult()]),
-        tools: fakeTools({
-          takeResult: () => {
-            if (taken) return undefined;
-            taken = true;
-            return result;
-          },
-        }),
+        tools: fakeTools([executed({ result })]),
       },
     );
     expect(out.answer).toContain("from script");
@@ -209,7 +177,17 @@ describe("runQueryLoop — the response contract", () => {
     });
     const out = await runQueryLoop(
       { question: "q", grantedScopes: ["oura.sleep"] },
-      { provider, sandbox: fakeSandbox([]), tools: fakeTools() },
+      {
+        provider,
+        tools: fakeTools([executed()], {
+          coverage: () => ({
+            scopesScanned: ["oura.sleep"],
+            recordsScanned: 1030,
+            scopesSkipped: [],
+            complete: true,
+          }),
+        }),
+      },
     );
     expect(out.answer).toContain("6.52h");
     expect(out.coverage.complete).toBe(true);
@@ -226,7 +204,7 @@ describe("runQueryLoop — the response contract", () => {
     });
     const out = await runQueryLoop(
       { question: "q", grantedScopes: ["oura.sleep"] },
-      { provider, sandbox: fakeSandbox([]), tools: fakeTools() },
+      { provider, tools: fakeTools() },
     );
     expect(out.answer).toContain("could not produce a valid script");
     expect(out.coverage.complete).toBe(false);
@@ -237,6 +215,23 @@ describe("runQueryLoop — the response contract", () => {
 });
 
 describe("runQueryLoop — honesty invariants", () => {
+  it("an answer with no script run is never reported as complete", async () => {
+    // A model that answers straight from its own prose has read nothing. The
+    // host accumulator has no runs to report, so coverage is empty and
+    // incomplete — and the answer text has to say so. Without this, a
+    // hallucinated answer inherits a confident-looking default.
+    const provider = createFakeInferenceProvider({
+      respond: () => reply(answerBlock({ answer: "About six and a half." })),
+    });
+    const out = await runQueryLoop(
+      { question: "how much did I sleep?", grantedScopes: ["oura.sleep"] },
+      { provider, tools: fakeTools() },
+    );
+    expect(out.coverage.complete).toBe(false);
+    expect(out.coverage.recordsScanned).toBe(0);
+    expect(out.answer).toContain("incomplete");
+  });
+
   it("surfaces incompleteness in the ANSWER TEXT, not only metadata", async () => {
     // plan phase 5: coverage.complete === false must be visible to a reader of
     // the answer. Metadata alone lets a caller render a confident wrong answer.
@@ -248,8 +243,7 @@ describe("runQueryLoop — honesty invariants", () => {
       { question: "have I ever?", grantedScopes: ["docs"] },
       {
         provider,
-        sandbox: fakeSandbox([]),
-        tools: fakeTools({
+        tools: fakeTools([executed()], {
           coverage: () => ({
             scopesScanned: ["docs"],
             recordsScanned: 318,
@@ -274,9 +268,9 @@ describe("runQueryLoop — honesty invariants", () => {
       { question: "q", grantedScopes: ["oura.sleep"] },
       {
         provider,
-        sandbox: fakeSandbox([sandboxResult({ termination: "cpu" })]),
-        // Tools claim completeness; the loop must still refuse it.
-        tools: fakeTools(),
+        // The host reports complete; the loop must still refuse it because
+        // the run was cut short.
+        tools: fakeTools([executed({ termination: "cpu" })]),
         maxTurns: 1,
       },
     );
@@ -299,8 +293,7 @@ describe("runQueryLoop — honesty invariants", () => {
       { question: "q", grantedScopes: ["oura.sleep"] },
       {
         provider,
-        sandbox: fakeSandbox([]),
-        tools: fakeTools({
+        tools: fakeTools([executed()], {
           coverage: () => ({
             scopesScanned: ["oura.sleep"],
             recordsScanned: 12,
@@ -324,7 +317,7 @@ describe("runQueryLoop — honesty invariants", () => {
         grantedScopes: ["oura.sleep"],
         budget: { toolCalls: 3 },
       },
-      { provider, sandbox: fakeSandbox([sandboxResult()]), tools: fakeTools() },
+      { provider, tools: fakeTools() },
     );
     expect(out.coverage.stoppedBecause).toBe("budget");
     expect(out.coverage.complete).toBe(false);
@@ -343,10 +336,9 @@ describe("runQueryLoop — honesty invariants", () => {
       { question: "q", grantedScopes: ["oura.sleep"] },
       {
         provider,
-        sandbox: fakeSandbox([
-          sandboxResult({ violations: ["denied read /etc/passwd"] }),
+        tools: fakeTools([
+          executed({ violations: ["denied read /etc/passwd"] }),
         ]),
-        tools: fakeTools(),
       },
     );
     expect(out.coverage.violations).toContain("denied read /etc/passwd");
@@ -360,8 +352,7 @@ describe("runQueryLoop — honesty invariants", () => {
       { question: "q", grantedScopes: ["mystery.source"] },
       {
         provider,
-        sandbox: fakeSandbox([]),
-        tools: fakeTools({
+        tools: fakeTools([executed()], {
           async listScopes() {
             return [{ scope: "mystery.source" }];
           },
