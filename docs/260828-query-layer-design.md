@@ -697,6 +697,54 @@ number twice on real data.** For a server that answers financial and health
 questions, that is the gap that matters most, and it is cheap for us to measure
 ourselves.
 
+> **MEASURED 2026-08-28 (phase 2).** Gemini 3.7 Flash, N=10 per case, the
+> seeded `small` corpus, through the full nested path. **Temperature was not
+> pinned** — our provider sends only `model`, `messages` and `max_tokens` — so
+> this measures the provider's default sampler as much as the architecture.
+> That is the single largest caveat on every number below.
+>
+> | Case               | identical value     | spread (sd)       | distinct scripts | coverage records |
+> | ------------------ | ------------------- | ----------------- | ---------------- | ---------------- |
+> | Q1 sleep avg       | 6/9                 | 6.01–7.23 (0.307) | **9/9**          | 9 distinct       |
+> | Q11 HR anomaly     | **9/9**             | 69.43 (0.000)     | **9/9**          | 18.7k–62.5k      |
+> | Q14 Japan spend    | 4/4 — **all wrong** | 550824 (0.000)    | 5/5              | 5 distinct       |
+> | Q7 recurring (set) | n/a                 | —                 | 10/10            | 4 distinct       |
+> | Q18 conditional    | no value returned   | —                 | 10/10            | 10 distinct      |
+>
+> **Script variance is total: 43 runs, 43 distinct scripts**, raw _and_ after
+> normalizing whitespace and comments. The model never regenerated the same
+> script once, even when the answer was bit-identical. The "stable sequences,
+> varying arguments" finding above understates it for code.
+>
+> **Value determinism is a property of the question, not of the system.** Q11
+> is perfect; Q1 put 3 of 9 runs outside tolerance with sd 0.307 on a ~6.6
+> quantity. There is no single determinism number to quote.
+>
+> **Q14 is the result that matters most, and it is not a determinism result.**
+> All four completing runs returned exactly `550824` against an expected
+> `7727.24` — perfectly reproducible and 71× wrong. The scripts summed raw JPY
+> and never applied FX, which §3's Q14 explicitly requires. (The 71.3 ratio is
+> a _blend_ across mixed-currency rows, not an exchange rate: solving
+> `U + J = 550824` against `U + J/149.5 = 7727.24` gives J ≈ 546,754 JPY and
+> U ≈ $4,070.) `bank.transactions` has **no T2 profile**.
+>
+> So **determinism and correctness are independent axes**, and a measurement of
+> the first alone would have graded Q14 a success. This is the strongest
+> evidence yet for §18.2's thesis: the fix for Q14 is a currency profile, not a
+> cache. It also sets a hard precondition on phase 6b — caching a script that
+> was never eval-verified freezes an error forever, deterministically.
+>
+> **Coverage is unstable, and that bears on Q8 more than the values do.** Q11
+> scanned between 18,704 and 62,532 records for the same question — a 3.3×
+> swing — across 9 distinct scope sets. A completeness claim is only as good as
+> the scan behind it. Separately, `complete` was false in **43/43** runs, so the
+> flag currently carries no information and its derivation may be too strict.
+>
+> Limits: one model, one corpus, one day, N=10, unpinned temperature, and a
+> thinking model whose reasoning tokens are hidden — variance may originate in
+> reasoning the script never shows. **Re-running with a pinned temperature is
+> the obvious next measurement** and would likely lower the numbers.
+
 **Caching the code, not the data, is the underrated option.** Agent Workflow
 Memory reports +24.6% and +51.1% relative success from reusing cached workflows
 over regenerating them, and Agent Skills productizes the same idea. Replaying literal
