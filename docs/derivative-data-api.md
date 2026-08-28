@@ -483,8 +483,21 @@ scopes and have the Personal Server answer it locally. The answer is written
 as an ordinary derivative record (everything above applies unchanged) into a
 derived scope the builder may write; the builder then reads it through its
 normal read grant. The raw source data never leaves the Personal Server
-except through the inference call, and the builder needs no read grant on
-the sources.
+except through the inference call.
+
+Consent for a builder question is read on every source scope plus write on
+the derived scope, from the same grant. The answer is whatever the model
+returns from the sources, and a question can ask for the sources verbatim,
+so a builder that may read the derived scope can read anything the prompt
+saw. The system prompt is not a security boundary; the grant is. A source
+scope that the builder's grant does not cover with a bare read entry
+(`write:` entries do not count) refuses the registration with 403
+`DERIVATIVE_SOURCE_NOT_GRANTED` listing the uncovered scope names, and the
+same check runs against the live grant before every compute, so a grant
+that is later narrowed fails the question closed without an inference call.
+Owner registrations are not subject to it. What the builder does not need
+is a separate read grant on the sources: one grant carrying
+`["oura.sleep", "chatgpt.conversations", "write:coach.weekly"]` is enough.
 
 What runs where:
 
@@ -503,15 +516,18 @@ All under `/v1/derivatives`. Authentication for a builder is the Write API's
 `POST /v1/write/session` plus the `X-Vana-Write-Signature` proof over the
 request (method, path, body), authorized for `write:<derivedScope>` exactly
 like a write to that scope. The proof is single use, so every builder call
-signs a fresh one. The owner uses any owner credential. PS-Lite has no write
-sessions, so there only the owner can register.
+signs a fresh one, and a JSON body must be the compact serialization of its
+own value (`JSON.stringify` output; pretty-printed bodies are refused with
+400 `WRITE_BODY_NOT_CANONICAL`, as on the write path). Registration bodies
+are capped at 16 KB (413). The owner uses any owner credential. PS-Lite has
+no write sessions, so there only the owner can register.
 
 | Method | Path                       | Who                                                       | Result                              |
 | ------ | -------------------------- | --------------------------------------------------------- | ----------------------------------- |
 | POST   | `/questions`               | builder (`write:<derivedScope>`) or owner                 | 201 registration, `status: pending` |
 | GET    | `/questions`               | owner; builder with `?derivedScope=` (own questions only) | `{ questions: [...] }`              |
 | GET    | `/questions/:id`           | owner or the registering builder                          | registration with status            |
-| POST   | `/questions/:id/recompute` | owner                                                     | 202, recompute scheduled now        |
+| POST   | `/questions/:id/recompute` | owner or the registering builder                          | 202, recompute scheduled now        |
 | DELETE | `/questions/:id`           | owner or the registering builder                          | `{ questionId, deleted: true }`     |
 
 Registration body:
@@ -561,14 +577,12 @@ on the same scope) gets 404 for it; an unknown id is answered after owner
 auth, so a builder probing ids gets 401. Registrations are local to the
 Personal Server that holds them (they never sync); that replica computes.
 
-| Status    | errorCode                           | When                                                                               |
-| --------- | ----------------------------------- | ---------------------------------------------------------------------------------- |
-| 400       | `DERIVATIVE_QUESTION_INVALID`       | body shape, scope grammar, limits                                                  |
-| 400       | `LINEAGE_SCOPE_UNDER_SOURCE_PREFIX` | naming rule                                                                        |
-| 401 / 403 | write-session errors                | no session, proof invalid or replayed, grant does not cover `write:<derivedScope>` |
-| 404       | `DERIVATIVE_QUESTION_NOT_FOUND`     | unknown id, or not this builder's question                                         |
-| 409       | `DERIVATIVE_CYCLE`                  | the registration would create a recompute cycle                                    |
-| 503       | `DERIVATIVE_COMPUTE_UNAVAILABLE`    | the server has no compute layer wired                                              |
+| Status | errorCode                           | When                              |
+| ------ | ----------------------------------- | --------------------------------- |
+| 400    | `DERIVATIVE_QUESTION_INVALID`       | body shape, scope grammar, limits |
+| 400    | `LINEAGE_SCOPE_UNDER_SOURCE_PREFIX` | naming rule                       |
+| \1     | 403                                 | `DERIVATIVE_SOURCE_NOT_GRANTED`   | a source scope is not read-granted to the builder (`details.scopes`) | \n  | 404 | `DERIVATIVE_QUESTION_NOT_FOUND`  | unknown id, or not this builder's question |
+| \1     | 413                                 | `CONTENT_TOO_LARGE`               | registration body over 16 KB                                         | \n  | 503 | `DERIVATIVE_COMPUTE_UNAVAILABLE` | the server has no compute layer wired      |
 
 ### Status machine
 
@@ -583,14 +597,39 @@ stale --compute err-> failed
 `pending` is "never computed"; it stays `pending` while scheduled. A source
 change during a running compute makes the scheduler run once more when it
 finishes (one compute in flight per question, changes coalesce). Recompute
-after a change waits `inference.recomputeDebounceMs` (default 5000); the
-owner's `POST /recompute` runs immediately. `failed` carries a short
-`error` (a status code, a scope name, an error class); the prompt and the
-data are never stored in it.
+after a change waits `inference.recomputeDebounceMs` (default 5000);
+`POST /recompute` (owner, or the registering builder retrying after a
+failure) runs immediately. `failed` carries a short `error` (a status code,
+a scope name, an error class); the prompt and the data are never stored in
+it.
+
+Retry policy inside one compute: a transient inference failure (no
+response, 429, 5xx) and a transient gateway failure during the grant check
+are retried up to three attempts with backoff (1s, 4s); protocol failures
+(a revoked grant, an uncovered source, a 4xx from the provider) fail closed
+at once. A question left `failed` is recomputed on the next source change
+or `POST /recompute`.
 
 Before a compute of a builder-registered question the server re-runs the
-write policy against the live grant: a revoked, expired or narrowed grant
-fails the question (`GRANT_REVOKED: ...`) without an inference call.
+write policy against the live grant and the read coverage of every source:
+a revoked, expired or narrowed grant fails the question
+(`GRANT_REVOKED: ...`, `DERIVATIVE_SOURCE_NOT_GRANTED: ...`) without an
+inference call. A builder question on a server with no grant verifier
+wired fails closed the same way.
+
+Two more guards run before the provider is called. A source scope the
+gateway reports deleted is refused exactly like a read would refuse it
+(410 on the read path): "source scope X is deleted", stale local copy or
+not. And the stored `$lineage` of every source is walked through the local
+index; if it reaches the question's own derived data point id the compute
+fails with `DERIVATIVE_CYCLE`. That covers cycles the per-store check at
+registration cannot see (two replicas each holding one half, syncing each
+other's output); the scheduler also ignores a synced version whose lineage
+descends from the question's own derived scope.
+
+Chains: the compute path writes through the owner ingest contract, not
+HTTP, so it notifies the scheduler itself; a question that reads a derived
+scope recomputes when that scope is recomputed (A -> B -> C).
 
 ### Trim rule and prompt
 
@@ -639,6 +678,11 @@ in registration order and `writtenAt` = the compute time. The record body:
 `sources[].version` is the local index version of each source at compute
 time (lineage itself is version-less, see "Identifiers"). `inference` is
 present when the provider returned `x-receipt-id` / `x-aci-identity`. The
+record carries the lineage twice on purpose, the same way an HTTP
+derivative does: `lineage` is the caller-side field (here the compute
+job's claim, for a builder write the signed claim) and `$lineage` is the
+server-validated stamp that the upload worker registers; readers should
+trust `$lineage`. The
 record then syncs, uploads and registers with its lineage like any other
 derivative; the builder reads it with a read grant on `derivedScope`, which
 confers nothing on the sources.
@@ -660,10 +704,17 @@ Environment overrides (Node server only): `INFERENCE_BASE_URL`,
 provider directly (sent as `Authorization: Bearer`; in production the relay
 holds the key and the Personal Server sends none).
 
+PS-Lite never calls a provider directly: with `inference.baseUrl` left at
+the direct-provider default the compute layer stays off and
+`/v1/derivatives` answers 503 `DERIVATIVE_COMPUTE_UNAVAILABLE`; set it to
+the relay. Deactivating the runtime stops the scheduler; activating it
+reschedules `pending` and `stale` questions.
+
 Every request carries `provider: { aci_verified: true, zdr: true }` and
 `max_tokens` (2048); the response headers `x-receipt-id` and
 `x-aci-identity` are passed through into the record. A non-2xx reply fails
-the question with the status only.
+the question with the status only; an empty assistant reply is a failure
+too, never a `ready` record.
 
 ### E2EE seam
 
