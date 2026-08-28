@@ -348,6 +348,7 @@ export async function createServer(
         provider: inferenceProvider,
         serverOwner,
         maxSourceItems: config.inference.maxSourceItems,
+        maxToolCalls: config.inference.maxToolCalls,
         syncManager: {
           notifyNewData: () => syncManager?.notifyNewData(),
         },

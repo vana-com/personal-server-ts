@@ -16,17 +16,37 @@
  * incoming content + headers, and nothing else in this module has to change.
  */
 
-export type InferenceRole = "system" | "user" | "assistant";
+export type InferenceRole = "system" | "user" | "assistant" | "tool";
+
+/** One requested tool invocation from an assistant reply (OpenAI shape). */
+export interface InferenceToolCall {
+  id: string;
+  name: string;
+  /** The raw JSON argument string as the provider sent it. */
+  arguments: string;
+}
 
 export interface InferenceMessage {
   role: InferenceRole;
   content: string;
+  /** Assistant messages that request tools carry the calls verbatim. */
+  toolCalls?: InferenceToolCall[];
+  /** `role: "tool"` result messages answer one call by its id. */
+  toolCallId?: string;
+}
+
+/** A tool offered to the model; `parameters` is a JSON Schema object. */
+export interface InferenceToolDef {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
 }
 
 export interface InferenceChatInput {
   model: string;
   messages: InferenceMessage[];
   maxTokens?: number;
+  tools?: InferenceToolDef[];
 }
 
 export interface InferenceUsage {
@@ -37,6 +57,8 @@ export interface InferenceUsage {
 
 export interface InferenceChatResult {
   content: string;
+  /** Present when the model requested tool calls; content may be empty. */
+  toolCalls?: InferenceToolCall[];
   usage?: InferenceUsage;
   /** `x-receipt-id` response header when the relay / provider sets one. */
   receiptId?: string;
@@ -138,6 +160,47 @@ function readContent(body: unknown): string | null {
   return null;
 }
 
+/** The reply's `message.tool_calls`, or null when there are none. */
+function readToolCalls(body: unknown): InferenceToolCall[] | null {
+  if (!isRecord(body) || !Array.isArray(body.choices)) return null;
+  const first: unknown = body.choices[0];
+  if (!isRecord(first) || !isRecord(first.message)) return null;
+  const calls = first.message.tool_calls;
+  if (!Array.isArray(calls) || calls.length === 0) return null;
+  const out: InferenceToolCall[] = [];
+  for (const call of calls) {
+    if (!isRecord(call) || !isRecord(call.function)) continue;
+    const { name } = call.function;
+    if (typeof call.id !== "string" || typeof name !== "string") continue;
+    out.push({
+      id: call.id,
+      name,
+      arguments:
+        typeof call.function.arguments === "string"
+          ? call.function.arguments
+          : "{}",
+    });
+  }
+  return out.length > 0 ? out : null;
+}
+
+/** Serialize our message shape onto the OpenAI wire shape. */
+function toWireMessage(message: InferenceMessage): Record<string, unknown> {
+  const wire: Record<string, unknown> = {
+    role: message.role,
+    content: message.content,
+  };
+  if (message.toolCalls && message.toolCalls.length > 0) {
+    wire.tool_calls = message.toolCalls.map((call) => ({
+      id: call.id,
+      type: "function",
+      function: { name: call.name, arguments: call.arguments },
+    }));
+  }
+  if (message.toolCallId) wire.tool_call_id = message.toolCallId;
+  return wire;
+}
+
 export function createOpenAiCompatibleInferenceProvider(
   options: OpenAiCompatibleInferenceOptions = {},
 ): InferenceProvider {
@@ -168,8 +231,20 @@ export function createOpenAiCompatibleInferenceProvider(
       const body = {
         ...requestFields,
         model: input.model || defaultModel,
-        messages,
+        messages: messages.map(toWireMessage),
         max_tokens: input.maxTokens ?? DEFAULT_INFERENCE_MAX_TOKENS,
+        ...(input.tools && input.tools.length > 0
+          ? {
+              tools: input.tools.map((tool) => ({
+                type: "function",
+                function: {
+                  name: tool.name,
+                  description: tool.description,
+                  parameters: tool.parameters,
+                },
+              })),
+            }
+          : {}),
       };
       let response: Response;
       try {
@@ -204,14 +279,17 @@ export function createOpenAiCompatibleInferenceProvider(
         );
       }
       let content = readContent(parsed);
-      if (content === null || content.trim() === "") {
-        // An empty reply must never become a "ready" derivative.
+      const toolCalls = readToolCalls(parsed);
+      if ((content === null || content.trim() === "") && !toolCalls) {
+        // An empty reply must never become a "ready" derivative. A reply
+        // that requests tools may legitimately carry no content.
         throw new InferenceRequestError(
           "inference response carried no assistant content",
           response.status,
         );
       }
-      if (options.encryption) {
+      content ??= "";
+      if (options.encryption && content !== "") {
         content = await options.encryption.decryptResponse({
           content,
           headers: response.headers,
@@ -221,6 +299,7 @@ export function createOpenAiCompatibleInferenceProvider(
       const aciIdentity = response.headers.get("x-aci-identity") ?? undefined;
       return {
         content,
+        ...(toolCalls ? { toolCalls } : {}),
         usage: readUsage(isRecord(parsed) ? parsed.usage : undefined),
         ...(receiptId ? { receiptId } : {}),
         ...(aciIdentity ? { aciIdentity } : {}),

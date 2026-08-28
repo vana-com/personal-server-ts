@@ -38,7 +38,16 @@ export async function createPsLiteQuestionStore(
   stateStore: PsLiteStateStore,
 ): Promise<QuestionStore> {
   const saved = await stateStore.get<PsLiteQuestionsState>(QUESTIONS_KEY);
-  const initial = saved?.version === 1 ? saved.questions : [];
+  // Rows persisted before the mode field existed default to completion.
+  const initial = (saved?.version === 1 ? saved.questions : []).map(
+    (question) => ({
+      ...question,
+      mode:
+        question.mode === "agentic"
+          ? ("agentic" as const)
+          : ("completion" as const),
+    }),
+  );
   return createInMemoryQuestionStore({
     initial,
     onChange: (questions) =>
@@ -121,6 +130,7 @@ export function createPsLiteDerivativeCompute(
         provider,
         serverOwner: options.serverOwner,
         maxSourceItems: options.config.inference.maxSourceItems,
+        maxToolCalls: options.config.inference.maxToolCalls,
         syncManager: options.syncManager?.() ?? null,
         scopeDeletions: options.scopeDeletions?.(),
         writePolicyPorts: options.writePolicyPorts,

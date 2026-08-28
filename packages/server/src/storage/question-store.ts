@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS derivative_questions (
   source_scopes TEXT NOT NULL,
   question TEXT NOT NULL,
   model TEXT,
+  mode TEXT NOT NULL DEFAULT 'completion',
   registered_by TEXT NOT NULL,
   status TEXT NOT NULL,
   error TEXT,
@@ -38,6 +39,7 @@ interface Row {
   source_scopes: string;
   question: string;
   model: string | null;
+  mode: QuestionRegistration["mode"];
   registered_by: string;
   status: QuestionRegistration["status"];
   error: string | null;
@@ -55,6 +57,7 @@ function toRegistration(row: Row): QuestionRegistration {
     sourceScopes: JSON.parse(row.source_scopes) as string[],
     question: row.question,
     model: row.model,
+    mode: row.mode === "agentic" ? "agentic" : "completion",
     registeredBy: JSON.parse(row.registered_by) as QuestionRegisteredBy,
     status: row.status,
     error: row.error,
@@ -71,6 +74,15 @@ export function createSqliteQuestionStore(
 ): QuestionStore {
   db.exec(CREATE_TABLE_SQL);
   db.exec(CREATE_INDEX_SQL);
+  // Tables created before the mode column existed gain it in place; the
+  // ALTER fails harmlessly once the column is there.
+  try {
+    db.exec(
+      "ALTER TABLE derivative_questions ADD COLUMN mode TEXT NOT NULL DEFAULT 'completion'",
+    );
+  } catch {
+    /* column already exists */
+  }
 
   const listAll = db.prepare(
     "SELECT * FROM derivative_questions ORDER BY created_at ASC, question_id ASC",
@@ -80,11 +92,11 @@ export function createSqliteQuestionStore(
   );
   const insertOne = db.prepare(`
     INSERT INTO derivative_questions (
-      question_id, derived_scope, source_scopes, question, model,
+      question_id, derived_scope, source_scopes, question, model, mode,
       registered_by, status, error, created_at, updated_at,
       last_computed_at, derived_version, derived_collected_at
     ) VALUES (
-      @question_id, @derived_scope, @source_scopes, @question, @model,
+      @question_id, @derived_scope, @source_scopes, @question, @model, @mode,
       @registered_by, @status, @error, @created_at, @updated_at,
       @last_computed_at, @derived_version, @derived_collected_at
     )`);
@@ -118,6 +130,7 @@ export function createSqliteQuestionStore(
         source_scopes: JSON.stringify(registration.sourceScopes),
         question: registration.question,
         model: registration.model,
+        mode: registration.mode,
         registered_by: JSON.stringify(registration.registeredBy),
         status: registration.status,
         error: registration.error,

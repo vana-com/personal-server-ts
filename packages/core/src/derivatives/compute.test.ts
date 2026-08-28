@@ -26,6 +26,7 @@ function registration(
     sourceScopes: ["oura.sleep", "chatgpt.conversations"],
     question: "How did I sleep?",
     model: null,
+    mode: "completion",
     registeredBy: { kind: "owner" },
     status: "pending",
     error: null,
@@ -555,5 +556,136 @@ describe("computeQuestion", () => {
       status: "skipped",
       reason: "unknown-question",
     });
+  });
+});
+
+describe("computeQuestion in agentic mode", () => {
+  it("runs the tool loop and writes the answer with mode and toolCalls", async () => {
+    const provider = createFakeInferenceProvider({
+      respond: (input, index) => {
+        if (index === 0) {
+          expect(input.tools?.length).toBe(2);
+          return {
+            content: "",
+            toolCalls: [
+              {
+                id: "t1",
+                name: "search_data",
+                arguments: JSON.stringify({ query: "greenhouse" }),
+              },
+            ],
+          };
+        }
+        const toolMessage = input.messages.find((m) => m.role === "tool");
+        expect(toolMessage?.content).toContain("greenhouse");
+        return {
+          content: JSON.stringify({
+            answer: "a greenhouse",
+            evidence: "the plans conversation",
+          }),
+          receiptId: "agentic-receipt",
+        };
+      },
+    });
+    const d = deps({
+      provider,
+      store: createInMemoryQuestionStore({
+        initial: [
+          registration({
+            mode: "agentic",
+            sourceScopes: ["chatgpt.conversations"],
+            question: "What am I planning to build?",
+          }),
+        ],
+      }),
+    });
+    await seed(d.storage, "chatgpt.conversations", {
+      conversations: [
+        {
+          title: "Greenhouse plans",
+          messages: [{ role: "user", content: "Planning a greenhouse." }],
+        },
+      ],
+    });
+
+    const outcome = await computeQuestion("q-1", d);
+    expect(outcome.status).toBe("ready");
+    const entry = d.storage.findEntry({ scope: "coach.weekly" });
+    const envelope = await d.storage.readEnvelope(
+      "coach.weekly",
+      entry!.collectedAt,
+    );
+    expect(envelope.data).toMatchObject({
+      answer: "a greenhouse",
+      mode: "agentic",
+      toolCalls: 1,
+      lineage: [computeDataPointId(OWNER, "chatgpt.conversations")],
+      inference: { receiptId: "agentic-receipt" },
+    });
+  });
+
+  it("fails the question when the sources hold no searchable text", async () => {
+    const d = deps({
+      store: createInMemoryQuestionStore({
+        initial: [
+          registration({
+            mode: "agentic",
+            sourceScopes: ["oura.sleep"],
+          }),
+        ],
+      }),
+    });
+    await seed(d.storage, "oura.sleep", { nights: [] });
+    const outcome = await computeQuestion("q-1", d);
+    expect(outcome.status).toBe("failed");
+    if (outcome.status === "failed") {
+      expect(outcome.error).toContain("no searchable text");
+    }
+    expect(fakeCalls(d).length).toBe(0);
+  });
+
+  it("fails when the loop ends without an answer", async () => {
+    const provider = createFakeInferenceProvider({
+      respond: () => ({
+        content: "",
+        toolCalls: [
+          {
+            id: "t",
+            name: "search_data",
+            arguments: JSON.stringify({ query: "x" }),
+          },
+        ],
+      }),
+    });
+    const d = deps({
+      provider,
+      maxToolCalls: 1,
+      store: createInMemoryQuestionStore({
+        initial: [
+          registration({
+            mode: "agentic",
+            sourceScopes: ["chatgpt.conversations"],
+          }),
+        ],
+      }),
+    });
+    await seed(d.storage, "chatgpt.conversations", {
+      conversations: [{ messages: [{ role: "user", content: "hello there" }] }],
+    });
+    const outcome = await computeQuestion("q-1", d);
+    expect(outcome.status).toBe("failed");
+    if (outcome.status === "failed") {
+      expect(outcome.error).toContain("without an answer");
+    }
+    expect(d.storage.findEntry({ scope: "coach.weekly" })).toBeUndefined();
+  });
+
+  it("default completion mode never sends tools", async () => {
+    const d = deps();
+    await seed(d.storage, "oura.sleep", { nights: [{ score: 80 }] });
+    await seed(d.storage, "chatgpt.conversations", { items: [{ title: "x" }] });
+    await computeQuestion("q-1", d);
+    expect(fakeCalls(d).length).toBe(1);
+    expect(fakeCalls(d)[0]!.tools).toBeUndefined();
   });
 });

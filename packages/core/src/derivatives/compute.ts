@@ -30,6 +30,7 @@ import {
   type DataWritePolicyPorts,
 } from "../policy/data-write.js";
 import { InferenceRequestError, type InferenceProvider } from "./inference.js";
+import { buildSearchCorpus, runAgenticLoop } from "./agentic.js";
 import {
   buildQuestionMessages,
   parseAnswer,
@@ -58,6 +59,8 @@ export interface QuestionComputeDeps {
   maxSourceItems?: number;
   maxSourceChars?: number;
   maxTokens?: number;
+  /** Agentic mode's tool-execution budget per compute (default 6). */
+  maxToolCalls?: number;
   /** Uploads the derivative after it is written locally. */
   syncManager?: ComputeSyncNotifier | null;
   /** Re-add marker, same as an HTTP ingest (see api/index.ts). */
@@ -135,6 +138,9 @@ export interface DerivativeAnswerRecord {
   answer: string;
   evidence: string | null;
   model: string;
+  mode: "completion" | "agentic";
+  /** Agentic mode only: tool executions the answer took. */
+  toolCalls?: number;
   computedAt: string;
   sources: Array<{ scope: string; version: number; collectedAt: string }>;
   /** Caller-side lineage field, mirrored by the server into `$lineage`. */
@@ -268,7 +274,12 @@ async function assertNoLineageCycle(
 async function loadSource(
   deps: QuestionComputeDeps,
   scope: string,
-): Promise<{ source: PromptSource; lineageSources: string[] }> {
+): Promise<{
+  source: PromptSource;
+  lineageSources: string[];
+  /** Untrimmed non-binary data for the agentic index; null for binary. */
+  raw: unknown | null;
+}> {
   const entry = deps.storage.findEntry({ scope });
   // The same deletion gate a read applies: a tombstoned scope is refused
   // (410 on the read path) whether or not a stale local copy remains.
@@ -295,7 +306,8 @@ async function loadSource(
   } catch {
     // Malformed stored lineage: treated as a root for the cycle walk.
   }
-  const raw = isBinaryEnvelope(envelope)
+  const binary = isBinaryEnvelope(envelope);
+  const raw = binary
     ? {
         binary: true,
         note: "binary record; its content is not included in the prompt",
@@ -316,6 +328,7 @@ async function loadSource(
       truncated: trimmed.truncated,
     },
     lineageSources,
+    raw: binary ? null : envelope.data,
   };
 }
 
@@ -393,23 +406,57 @@ export async function computeQuestion(
     );
 
     const sources: PromptSource[] = [];
+    const rawSources: Array<{ scope: string; data: unknown }> = [];
     const sourceLineage = new Map<string, readonly string[]>();
     for (const scope of registration.sourceScopes) {
       const loaded = await loadSource(deps, scope);
       sources.push(loaded.source);
+      if (loaded.raw !== null) rawSources.push({ scope, data: loaded.raw });
       sourceLineage.set(scope, loaded.lineageSources);
     }
     await assertNoLineageCycle(deps, registration, serverOwner, sourceLineage);
-    const messages = buildQuestionMessages({
-      question: registration.question,
-      sources,
-    });
     const model = registration.model ?? deps.provider.defaultModel;
-    const reply = await withRetries(
-      deps,
-      () => deps.provider.chat({ model, messages, maxTokens: deps.maxTokens }),
-      isRetryableInferenceError,
-    );
+    let reply: {
+      content: string;
+      receiptId?: string;
+      aciIdentity?: string;
+    };
+    let agenticToolCalls: number | null = null;
+    if (registration.mode === "agentic") {
+      const corpus = buildSearchCorpus(rawSources);
+      if (corpus.passageCount === 0) {
+        throw new ComputeFailure("sources contain no searchable text");
+      }
+      const loop = await withRetries(
+        deps,
+        () =>
+          runAgenticLoop({
+            provider: deps.provider,
+            model,
+            question: registration.question,
+            corpus,
+            maxToolCalls: deps.maxToolCalls,
+            maxTokens: deps.maxTokens,
+          }),
+        isRetryableInferenceError,
+      );
+      if (loop.content.trim() === "") {
+        throw new ComputeFailure("agentic loop ended without an answer");
+      }
+      agenticToolCalls = loop.toolCalls;
+      reply = loop;
+    } else {
+      const messages = buildQuestionMessages({
+        question: registration.question,
+        sources,
+      });
+      reply = await withRetries(
+        deps,
+        () =>
+          deps.provider.chat({ model, messages, maxTokens: deps.maxTokens }),
+        isRetryableInferenceError,
+      );
+    }
     const parsed = parseAnswer(reply.content);
 
     const computedAt = now().toISOString();
@@ -422,6 +469,8 @@ export async function computeQuestion(
       answer: parsed.answer,
       evidence: parsed.evidence,
       model,
+      mode: registration.mode,
+      ...(agenticToolCalls !== null ? { toolCalls: agenticToolCalls } : {}),
       computedAt,
       sources: sources.map((source) => ({
         scope: source.scope,

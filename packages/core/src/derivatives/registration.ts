@@ -13,6 +13,7 @@ import { assertDerivedScopeNaming } from "../lineage/lineage.js";
 import { isWriteScopeEntry } from "../policy/data-write.js";
 import { scopeCoveredByGrant } from "@opendatalabs/vana-sdk/browser";
 import type {
+  QuestionMode,
   QuestionRegisteredBy,
   QuestionRegistration,
   QuestionStore,
@@ -32,6 +33,7 @@ export interface ParsedQuestionInput {
   sourceScopes: string[];
   question: string;
   model: string | null;
+  mode: QuestionMode;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -124,8 +126,18 @@ export function parseQuestionInput(body: unknown): ParsedQuestionInput {
     }
     model = body.model;
   }
+  let mode: QuestionMode = "completion";
+  if (body.mode !== undefined && body.mode !== null) {
+    if (body.mode !== "completion" && body.mode !== "agentic") {
+      throw new DerivativeQuestionInvalidError(
+        'mode must be "completion" or "agentic"',
+        { field: "mode" },
+      );
+    }
+    mode = body.mode;
+  }
   assertDerivedScopeNaming(derivedScope, sourceScopes);
-  return { derivedScope, sourceScopes, question: body.question, model };
+  return { derivedScope, sourceScopes, question: body.question, model, mode };
 }
 
 /**
@@ -203,6 +215,7 @@ export async function createQuestionRegistration(
     sourceScopes: parsed.sourceScopes,
     question: parsed.question,
     model: parsed.model,
+    mode: parsed.mode,
     registeredBy: input.registeredBy,
     status: "pending",
     error: null,

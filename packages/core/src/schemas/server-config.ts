@@ -64,6 +64,8 @@ export const DEFAULTS = {
     model: "z-ai/glm-5.2",
     // Newest-first items kept per source scope when a prompt is assembled.
     maxSourceItems: 50,
+    // Agentic mode: tool executions allowed per compute.
+    maxToolCalls: 6,
     // Quiet period after a source scope changes before a recompute starts.
     recomputeDebounceMs: 5_000,
   },
@@ -182,6 +184,12 @@ export const ServerConfigSchema = z.object({
         .min(1)
         .max(10_000)
         .default(DEFAULTS.inference.maxSourceItems),
+      maxToolCalls: z
+        .number()
+        .int()
+        .min(1)
+        .max(64)
+        .default(DEFAULTS.inference.maxToolCalls),
       recomputeDebounceMs: z
         .number()
         .int()

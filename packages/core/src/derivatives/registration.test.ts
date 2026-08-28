@@ -19,6 +19,7 @@ describe("parseQuestionInput", () => {
       sourceScopes: ["chatgpt.conversations", "oura.sleep"],
       question: valid.question,
       model: null,
+      mode: "completion",
     });
     expect(parseQuestionInput({ ...valid, model: "z-ai/glm-5.2" }).model).toBe(
       "z-ai/glm-5.2",

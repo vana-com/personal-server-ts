@@ -501,7 +501,7 @@ is a separate read grant on the sources: one grant carrying
 
 What runs where:
 
-1. the builder registers `{ derivedScope, sourceScopes, question, model? }`;
+1. the builder registers `{ derivedScope, sourceScopes, question, model?, mode? }`;
 2. the Personal Server reads the sources from LOCAL storage, trims them,
    assembles a prompt, calls the inference provider and writes the answer
    into `derivedScope` with lineage = the source data point ids;
@@ -651,6 +651,44 @@ and a user message with the question followed by one section per source
 JSON). The reply is parsed as JSON (a fenced block or surrounding prose is
 tolerated); when no object parses the whole text is the answer.
 
+### Agentic mode
+
+A registration may set `"mode": "agentic"` (default `"completion"`, the
+behavior above). Newest-first trimming answers questions about recent data
+only; agentic mode answers questions about ANY part of the sources by
+letting the model search them instead of receiving a trimmed dump.
+
+The compute job builds an in-memory keyword (BM25) index over the FULL
+source data — every item, not the newest `maxSourceItems` — split into
+bounded passages, and runs a bounded tool loop against the same stateless
+chat-completions endpoint, using the OpenAI tool-calling shape (`tools` in
+the request, `tool_calls` in the reply, `role: "tool"` result messages):
+
+- `search_data({ query })` — top passages matching the query, with a
+  passage `ref`, its scope and a snippet;
+- `read_data({ ref })` — the full text of one passage's source item,
+  bounded.
+
+Both tools execute inside the Personal Server against local data; the
+model only ever sees the question, the snippets search returned and the
+items it explicitly read. The index is built per compute and discarded —
+nothing new is stored, synced or granted.
+
+The loop is bounded by `inference.maxToolCalls` (default 6) tool
+executions plus two final model turns; when the budget is exhausted every
+further requested call is answered with a refusal message and the model is
+told to answer from what it has. The final reply is parsed exactly like
+completion mode (`answer` / `evidence` JSON). The record and its lineage
+are unchanged except for `mode: "agentic"` and a `toolCalls` count. A
+provider that cannot do tool calling fails the question like any other
+malformed reply; registrations then fall back to `"completion"` mode by
+the caller's choice, not automatically.
+
+Grant semantics are identical to completion mode: every source scope must
+be covered by a bare read entry of the builder's grant, checked at
+registration and re-checked before every compute. The search index never
+leaves the Personal Server and is never written as data.
+
 ### The derived record
 
 Written through the owner ingest path (no `$writtenBy`), with
@@ -696,7 +734,8 @@ The provider is an OpenAI-compatible chat completions client over `fetch`
 | ------------------------------- | -------------------------------- | -------------------------------------------------------------------- |
 | `inference.baseUrl`             | `https://inference.phala.com/v1` | chat completions base; set to the Vana inference relay in production |
 | `inference.model`               | `z-ai/glm-5.2`                   | default model                                                        |
-| `inference.maxSourceItems`      | `50`                             | newest items kept per source scope                                   |
+| `inference.maxSourceItems`      | `50`                             | newest items kept per source scope (completion mode)                 |
+| `inference.maxToolCalls`        | `6`                              | tool-execution budget per compute (agentic mode)                     |
 | `inference.recomputeDebounceMs` | `5000`                           | quiet period after a source change                                   |
 
 Environment overrides (Node server only): `INFERENCE_BASE_URL`,

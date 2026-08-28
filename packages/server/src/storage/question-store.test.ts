@@ -12,6 +12,7 @@ function registration(
     sourceScopes: ["oura.sleep", "chatgpt.conversations"],
     question: "How did I sleep?",
     model: null,
+    mode: "completion",
     registeredBy: {
       kind: "builder",
       builder: "0x2222222222222222222222222222222222222222",
