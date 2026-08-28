@@ -262,6 +262,13 @@ export interface PersonalServerDataApiDeps {
    * only cite local scopes and the lineage read answers 503.
    */
   lineageGateway?: LineageGatewayPort;
+  /**
+   * Called after a write is committed (owner or builder, JSON or binary).
+   * The derivative compute layer uses it to mark questions that read the
+   * scope stale (recompute on refresh). Best-effort: a throwing hook is
+   * swallowed, the write already succeeded.
+   */
+  onDataWritten?: (event: { scope: string; collectedAt: string }) => void;
 }
 
 export interface PersonalServerAccessLogsApiDeps {
@@ -737,6 +744,24 @@ function apiLoggerAsLogger(logger: PersonalServerApiLogger | undefined) {
         message ?? "",
       ),
   };
+}
+
+function notifyDataWritten(
+  deps: Pick<PersonalServerDataApiDeps, "onDataWritten" | "logger">,
+  event: { scope: string; collectedAt: string },
+): void {
+  if (!deps.onDataWritten) return;
+  try {
+    deps.onDataWritten(event);
+  } catch (err) {
+    deps.logger?.warn?.(
+      {
+        scope: event.scope,
+        error: err instanceof Error ? err.message : String(err),
+      },
+      "onDataWritten hook failed; record already stored",
+    );
+  }
 }
 
 function notifyNewData(
@@ -1307,6 +1332,10 @@ export async function handlePersonalServerDataRequest(
           );
           await logBuilderWrite();
           notifyNewData(deps.syncManager);
+          notifyDataWritten(deps, {
+            scope: scopeResult.scope,
+            collectedAt: collectedAtValue,
+          });
           return jsonResponse(result.response, { status: 201 });
         }
 
@@ -1347,6 +1376,10 @@ export async function handlePersonalServerDataRequest(
         );
         await logBuilderWrite();
         notifyNewData(deps.syncManager);
+        notifyDataWritten(deps, {
+          scope: scopeResult.scope,
+          collectedAt: collectedAtValue,
+        });
         return jsonResponse(result.response, { status: 201 });
       } catch (err) {
         // An envelope that reached storage before indexing failed is

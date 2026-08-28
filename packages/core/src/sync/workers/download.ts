@@ -84,6 +84,18 @@ export interface DownloadWorkerDeps {
    * queues that exact key so the sync cycle's rate-limited pass removes it.
    */
   pendingBlobDeletions?: PendingBlobDeletionStore;
+  /**
+   * Called after a downloaded data point is written and indexed locally
+   * (a new local version of `scope`). The derivative compute layer marks
+   * questions that read the scope stale. Best-effort: a throwing hook is
+   * logged and never fails the download.
+   */
+  onDataPointIndexed?: (event: {
+    scope: string;
+    dataPointId: string;
+    version: number;
+    collectedAt: string;
+  }) => void;
 }
 
 export interface DeletionReconcileResult {
@@ -339,6 +351,22 @@ export async function downloadOne(
     { dataPointId: record.id, scope: envelope.scope, path: relativePath },
     "Downloaded and indexed data point",
   );
+
+  if (deps.onDataPointIndexed) {
+    try {
+      deps.onDataPointIndexed({
+        scope: envelope.scope,
+        dataPointId: record.id,
+        version: Number(record.expectedVersion),
+        collectedAt: envelope.collectedAt,
+      });
+    } catch (err) {
+      logger.warn(
+        { scope: envelope.scope, error: (err as Error).message },
+        "onDataPointIndexed hook failed; data point already indexed",
+      );
+    }
+  }
 
   return {
     dataPointId: record.id,

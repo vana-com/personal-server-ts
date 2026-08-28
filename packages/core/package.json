@@ -84,6 +84,10 @@
       "types": "./dist/lineage/index.d.ts",
       "import": "./dist/lineage/index.js"
     },
+    "./derivatives": {
+      "types": "./dist/derivatives/index.d.ts",
+      "import": "./dist/derivatives/index.js"
+    },
     "./ports": {
       "types": "./dist/ports/index.d.ts",
       "import": "./dist/ports/index.js"
