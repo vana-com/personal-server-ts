@@ -56,14 +56,9 @@
 import { createOpenAiCompatibleInferenceProvider } from "@opendatalabs/personal-server-ts-core/derivatives";
 import {
   runQueryLoop,
+  type ExecutedRun,
   type QueryToolHost,
-  type PreparedScript,
-  type QueryScriptResult,
 } from "@opendatalabs/personal-server-ts-core/query/agent";
-import type {
-  Sandbox,
-  SandboxResult,
-} from "@opendatalabs/personal-server-ts-core/query";
 
 import { parseRequestFields } from "../packages/server/src/bootstrap.js";
 
@@ -90,44 +85,16 @@ const QUESTION =
 const rawTurns: string[] = [];
 
 /**
- * Stub sandbox: does not execute the script. It reports the stub rows so the
+ * Stub tool host. It does NOT run the script — the confinement layers are the
+ * integration path's job, not this script's. It echoes the stub rows so the
  * loop can carry on, which is all we need to see whether the model then emits
- * a well-formed `vana:answer`. Enforcement is reported as all-false because
- * none of it is real here — the loop must never be told otherwise.
+ * a well-formed `vana:answer`.
+ *
+ * Coverage is still host-authored: the model never sets it. Enforcement is
+ * reported as none, because none of it is real here and the loop must never be
+ * told otherwise.
  */
-const stubSandbox: Sandbox = {
-  async run(script: string): Promise<SandboxResult> {
-    rawTurns.push(`--- SCRIPT ---\n${script}`);
-    return {
-      stdout: JSON.stringify({ rows: SLEEP_ROWS }, null, 2),
-      stderr: "",
-      exitCode: 0,
-      timedOut: false,
-      truncated: false,
-      durationMs: 1,
-      termination: "completed",
-      enforcement: {
-        filesystemRead: false,
-        filesystemWrite: false,
-        network: false,
-        cpu: false,
-        memory: false,
-        processCount: false,
-        wallClock: false,
-        notes: ["STUB SANDBOX — nothing was enforced and no script was run"],
-      },
-      violations: [],
-    };
-  },
-  async capabilities() {
-    return { available: false, reason: "stub sandbox for the smoke test" };
-  },
-};
-
-/** Stub tool host. Coverage is still host-authored — the model never sets it. */
 function stubToolHost(): QueryToolHost {
-  let result: QueryScriptResult | undefined;
-  const notes: string[] = [];
   return {
     async listScopes() {
       return [
@@ -138,18 +105,23 @@ function stubToolHost(): QueryToolHost {
         },
       ];
     },
-    async prepare(modelCode: string): Promise<PreparedScript> {
+    async execute(modelCode: string): Promise<ExecutedRun> {
+      rawTurns.push(`--- SCRIPT ---\n${modelCode}`);
       return {
-        script: modelCode,
-        spec: {
-          readPaths: [],
-          writePath: "/tmp/query-smoke",
-          denyNetwork: true,
-          cpuMs: 5_000,
-          memoryMb: 128,
-          wallClockMs: 10_000,
-          maxOutputBytes: 100_000,
+        coverage: {
+          scopesScanned: ["oura.sleep"],
+          recordsScanned: SLEEP_ROWS.length,
+          scopesSkipped: [],
+          // Never `true`: nothing was executed and nothing was enforced.
+          complete: false,
+          stoppedBecause: "error",
         },
+        notes: ["STUB HOST - no script was executed and nothing was enforced"],
+        termination: "completed",
+        stdout: JSON.stringify({ rows: SLEEP_ROWS }, null, 2),
+        stderr: "",
+        violations: [],
+        truncated: false,
       };
     },
     coverage() {
@@ -157,16 +129,9 @@ function stubToolHost(): QueryToolHost {
         scopesScanned: ["oura.sleep"],
         recordsScanned: SLEEP_ROWS.length,
         scopesSkipped: [],
-        complete: true,
+        complete: false,
+        stoppedBecause: "error",
       };
-    },
-    takeResult() {
-      const r = result;
-      result = undefined;
-      return r;
-    },
-    takeNotes() {
-      return notes.splice(0, notes.length);
     },
   };
 }
@@ -260,7 +225,7 @@ async function main(): Promise<void> {
         grantedScopes: ["oura.sleep"],
         budget: { toolCalls: 4 },
       },
-      { provider: capturing, sandbox: stubSandbox, tools: stubToolHost() },
+      { provider: capturing, tools: stubToolHost() },
     );
   } catch (err) {
     console.error("\n=== TRANSPORT / PROVIDER FAILURE ===");

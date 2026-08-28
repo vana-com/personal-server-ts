@@ -4,3 +4,7 @@ coverage
 *.d.ts
 *.tsbuildinfo
 package-lock.json
+
+# Throwaway measurement scripts, preserved verbatim as the provenance of
+# design 18 numbers. Not production code; do not reformat or lint.
+docs/query-layer-fixtures/
