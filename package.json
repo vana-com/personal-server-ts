@@ -40,9 +40,10 @@
     "e2e:write-api": "tsx scripts/e2e-write-api.ts",
     "e2e:read-scope-lite": "tsx scripts/e2e-read-scope-lite.ts",
     "e2ee:smoke": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/e2ee-smoke.ts",
-    "validate": "npm run lint && npm run lint:eslint && npm run format:check && npm test",
+    "validate": "npm run lint && npm run lint:query-tests && npm run lint:eslint && npm run format:check && npm test",
     "prepare": "husky",
-    "eval": "tsx scripts/query-eval.ts"
+    "eval": "tsx scripts/query-eval.ts",
+    "lint:query-tests": "tsc -p tsconfig.typecheck-tests.json"
   },
   "lint-staged": {
     "*.{ts,js}": [

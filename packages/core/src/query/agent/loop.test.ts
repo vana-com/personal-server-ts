@@ -5,7 +5,11 @@ import {
   type InferenceChatResult,
 } from "../../derivatives/inference.js";
 import { runQueryLoop } from "./loop.js";
-import type { ExecutedRun, QueryToolHost } from "./tool-host.js";
+import type {
+  ExecutedRun,
+  QueryScriptResult,
+  QueryToolHost,
+} from "./tool-host.js";
 
 const fence = "```";
 
