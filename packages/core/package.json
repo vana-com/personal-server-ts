@@ -143,6 +143,14 @@
     "./query/evals": {
       "types": "./dist/query/evals/index.d.ts",
       "import": "./dist/query/evals/index.js"
+    },
+    "./query/agent": {
+      "types": "./dist/query/agent/index.d.ts",
+      "import": "./dist/query/agent/index.js"
+    },
+    "./query/tools": {
+      "types": "./dist/query/tools/index.d.ts",
+      "import": "./dist/query/tools/index.js"
     }
   },
   "scripts": {
@@ -151,6 +159,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@opendatalabs/vana-sdk": "3.14.0",
+    "acorn": "^8.16.0",
     "minisearch": "^7.2.0",
     "unpdf": "^1.6.2",
     "viem": "^2.54.2",
