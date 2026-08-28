@@ -25,16 +25,16 @@ version ledger; `derivatives/compute.ts` stuffs the newest `maxSourceItems`
 
 ## 2. What we have tried
 
-| Approach | Works for | Fails at |
-| --- | --- | --- |
-| **Raw data + coding agent** (Claude/Codex/Gemini CLI turned loose on the files) | Almost anything, given time. Can write its own aggregation on the fly. | Latency (minutes), cost, nondeterminism — two runs give two answers. Not a thing you put behind a request/response API. |
-| **RAG over embeddings** | "What did I say about X", topical recall, fuzzy semantic lookup. | Anything requiring completeness or arithmetic. Top-k retrieval structurally cannot answer "average over the last month" — it returns 8 chunks out of 30 nights and averages those. Silently wrong, not visibly wrong. |
-| **Raw data straight to an LLM** | Small scopes, recent windows. | Context window. Also degrades before it overflows: recall of a single fact inside a 500k-token dump is unreliable, and the truncation heuristic ("newest 50 items") decides the answer more than the model does. |
+| Approach                                                                        | Works for                                                              | Fails at                                                                                                                                                                                                              |
+| ------------------------------------------------------------------------------- | ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Raw data + coding agent** (Claude/Codex/Gemini CLI turned loose on the files) | Almost anything, given time. Can write its own aggregation on the fly. | Latency (minutes), cost, nondeterminism — two runs give two answers. Not a thing you put behind a request/response API.                                                                                               |
+| **RAG over embeddings**                                                         | "What did I say about X", topical recall, fuzzy semantic lookup.       | Anything requiring completeness or arithmetic. Top-k retrieval structurally cannot answer "average over the last month" — it returns 8 chunks out of 30 nights and averages those. Silently wrong, not visibly wrong. |
+| **Raw data straight to an LLM**                                                 | Small scopes, recent windows.                                          | Context window. Also degrades before it overflows: recall of a single fact inside a 500k-token dump is unreliable, and the truncation heuristic ("newest 50 items") decides the answer more than the model does.      |
 
 The shared failure: **each approach has one retrieval strategy and applies it
 to every question**, while the questions differ in what "correct" even means.
-An average needs *every* row. A theme needs *representative* rows. A trait
-inference needs *enough* rows. A needle lookup needs *the one* row.
+An average needs _every_ row. A theme needs _representative_ rows. A trait
+inference needs _enough_ rows. A needle lookup needs _the one_ row.
 
 ## 3. The question corpus
 
@@ -48,7 +48,7 @@ column is the one that matters — it is the requirement, not the design.
 
 - **Data:** Oura / Apple Health / Whoop sleep records. Dense numeric timeseries, one row per night, well-typed.
 - **Class:** Exact aggregation over a bounded window.
-- **Hard because:** trivially easy *if* the data is parsed into rows and *if* the window is complete. Neither is guaranteed: the export may have gaps, may span timezone changes, may double-count naps versus main sleep, and may have two devices reporting the same night.
+- **Hard because:** trivially easy _if_ the data is parsed into rows and _if_ the window is complete. Neither is guaranteed: the export may have gaps, may span timezone changes, may double-count naps versus main sleep, and may have two devices reporting the same night.
 - **Accurate answer requires:** a complete row set for the window, a stated denominator ("28 of 31 nights had data"), an explicit definition (total sleep time vs time in bed), and deduplication across overlapping sources. The number must be reproducible — same question, same data, same answer, byte for byte.
 
 ### Q2. "What was my main focus this week?"
@@ -63,20 +63,20 @@ column is the one that matters — it is the requirement, not the design.
 - **Data:** bank statements, brokerage trades, Polymarket/betting activity, crypto wallets, ChatGPT conversations where the user talks about money, purchase history.
 - **Class:** Latent trait inference. No record in the corpus states the answer.
 - **Hard because:** it requires composing several intermediate quantities the user never asked for — volatility of holdings, position sizing relative to income, drawdown behavior (did they sell at the bottom?), frequency of speculative bets, stated vs revealed preference. Each is itself a Q1-style aggregation. Then those get synthesized into a judgement.
-- **Accurate answer requires:** the ability to *decompose* the question into computable sub-questions, compute each exactly, and reason only over the results. It also requires calibrated uncertainty: "moderate-to-high, based on 14 months of brokerage data; no data on retirement accounts or income, so this may be unrepresentative."
+- **Accurate answer requires:** the ability to _decompose_ the question into computable sub-questions, compute each exactly, and reason only over the results. It also requires calibrated uncertainty: "moderate-to-high, based on 14 months of brokerage data; no data on retirement accounts or income, so this may be unrepresentative."
 
 ### Q4. "Did my sleep affect my productivity last quarter?"
 
 - **Data:** sleep timeseries × git commits / calendar / Linear tickets / typing activity.
 - **Class:** Cross-source correlation on a shared time axis.
 - **Hard because:** joining a nightly record to a "productivity" proxy requires (a) picking the proxy, (b) aligning to the same day boundary and timezone, (c) enough n to say anything, and (d) resisting the urge to state a correlation as a cause.
-- **Accurate answer requires:** an explicit join key, an explicit proxy definition surfaced to the user, a real statistic with n and spread, and a refusal to over-claim. Nothing about this is retrievable — it must be *computed*.
+- **Accurate answer requires:** an explicit join key, an explicit proxy definition surfaced to the user, a real statistic with n and spread, and a refusal to over-claim. Nothing about this is retrievable — it must be _computed_.
 
 ### Q5. "What was the name of that Thai restaurant Sarah recommended?"
 
 - **Data:** iMessage/WhatsApp/Slack DMs, email, possibly a ChatGPT thread where the user asked about it later.
 - **Class:** Needle in a haystack. Single fact, exact recall.
-- **Hard because:** the fact appears once, possibly years ago, in one message, possibly misspelled, possibly as a link with no name in the text. Semantic search may retrieve the right *conversation* and still miss the message. Recency-truncation guarantees a miss.
+- **Hard because:** the fact appears once, possibly years ago, in one message, possibly misspelled, possibly as a link with no name in the text. Semantic search may retrieve the right _conversation_ and still miss the message. Recency-truncation guarantees a miss.
 - **Accurate answer requires:** unbounded-time exhaustive search over the granted text, entity resolution ("Sarah" → one of four Sarahs), and an honest "not found" rather than a plausible hallucinated restaurant. This is the question where a wrong answer is indistinguishable from a right one to the user.
 
 ### Q6. "How many distinct people did I talk to last month, and who were the top 10?"
@@ -97,56 +97,56 @@ column is the one that matters — it is the requirement, not the design.
 
 - **Data:** email, signed PDFs, Slack, DocuSign confirmations, calendar.
 - **Class:** Absence/exhaustiveness question ("have I ever…", "is there any…").
-- **Hard because:** a confident "no" is only valid if the search was *complete*. Any sampling, truncation, or top-k retrieval makes "no" unjustifiable. Also spans binary documents (PDF, scans) that may not be text-extracted at all.
+- **Hard because:** a confident "no" is only valid if the search was _complete_. Any sampling, truncation, or top-k retrieval makes "no" unjustifiable. Also spans binary documents (PDF, scans) that may not be text-extracted at all.
 - **Accurate answer requires:** either an exhaustive pass over the granted corpus, or an answer that explicitly scopes its own confidence ("no match across 12k emails and 340 PDFs; 22 scanned documents could not be read"). The system must know what it did **not** look at.
 
 ### Q9. "When did I first start thinking about leaving my job?"
 
 - **Data:** ChatGPT/Claude conversations, journal entries, Slack DMs, search history, calendar (recruiter calls).
 - **Class:** Temporal first-occurrence over a fuzzy concept.
-- **Hard because:** the concept has no keyword. Early instances are oblique ("is 4 years a long time to be somewhere?"). The answer is a date, but finding it requires semantic judgement over the full timeline, and the *earliest* match matters — exactly the one that ranking-by-relevance buries.
+- **Hard because:** the concept has no keyword. Early instances are oblique ("is 4 years a long time to be somewhere?"). The answer is a date, but finding it requires semantic judgement over the full timeline, and the _earliest_ match matters — exactly the one that ranking-by-relevance buries.
 - **Accurate answer requires:** semantic matching combined with ordering by time rather than score, and evidence for the specific earliest artifact.
 
 ### Q10. "What changed in how I think about X over the last two years?"
 
 - **Data:** long-form conversations, notes, published writing, saved articles.
 - **Class:** Diachronic comparison — same topic, two time slices, contrast.
-- **Hard because:** requires representative sampling from *both* ends of the period and a comparison, not a summary. Naive retrieval returns the most relevant chunks regardless of date, which are usually all recent.
+- **Hard because:** requires representative sampling from _both_ ends of the period and a comparison, not a summary. Naive retrieval returns the most relevant chunks regardless of date, which are usually all recent.
 - **Accurate answer requires:** time-stratified retrieval (guaranteed coverage per period), then contrast. Also needs to distinguish "my view changed" from "the topic changed".
 
 ### Q11. "Was my resting heart rate unusual last week?"
 
 - **Data:** wearable timeseries.
 - **Class:** Anomaly detection against a personal baseline.
-- **Hard because:** "unusual" is relative to *this user's* distribution, which requires the full history, not the window in question. Seasonality (training blocks, illness, alcohol) matters.
+- **Hard because:** "unusual" is relative to _this user's_ distribution, which requires the full history, not the window in question. Seasonality (training blocks, illness, alcohol) matters.
 - **Accurate answer requires:** a baseline computed over a long history, a stated threshold, and the arithmetic to be exact. Cheap to compute, impossible to retrieve.
 
 ### Q12. "Which of my data has app X seen, and what could it infer from it?"
 
 - **Data:** the server's own grant records, access logs (`packages/core/src/mcp/activity.ts`), lineage graph.
 - **Class:** Introspection over metadata, not content.
-- **Hard because:** it is a question about the server itself, and the second half ("what could it infer") is a reasoning question over the *shape* of the released data. Also the one question where the answer must never be served to the app itself.
+- **Hard because:** it is a question about the server itself, and the second half ("what could it infer") is a reasoning question over the _shape_ of the released data. Also the one question where the answer must never be served to the app itself.
 - **Accurate answer requires:** exact enumeration from the grant/access ledger, plus lineage traversal (a derivative released to an app implies exposure of what it was computed from, in aggregate).
 
 ### Q13. "Plan my week around my energy levels."
 
 - **Data:** calendar (future), sleep/HRV history (past), task list, historical patterns of when the user did good work.
 - **Class:** Forward-looking synthesis mixing historical aggregation with future-state data.
-- **Hard because:** it joins a *predicted* quantity derived from history against records that do not exist yet, and the output is a plan, not a fact. Freshness matters — a calendar read from an hour-old snapshot is wrong.
+- **Hard because:** it joins a _predicted_ quantity derived from history against records that do not exist yet, and the output is a plan, not a fact. Freshness matters — a calendar read from an hour-old snapshot is wrong.
 - **Accurate answer requires:** a real aggregation over history, live-enough future data, and clear separation in the answer between what is measured and what is projected.
 
 ### Q14. "How much did I spend on my Japan trip?"
 
 - **Data:** transactions, photos metadata (geo), calendar, flight/hotel confirmations, currency rates.
 - **Class:** Aggregation over an implicitly-defined set.
-- **Hard because:** the *set membership* is the hard part, not the sum. "The Japan trip" is a date range the user never stated, inferred from flights or photo geodata; then transactions must be attributed to it (including a pre-paid hotel charged two months earlier, and the flight itself). Multi-currency.
+- **Hard because:** the _set membership_ is the hard part, not the sum. "The Japan trip" is a date range the user never stated, inferred from flights or photo geodata; then transactions must be attributed to it (including a pre-paid hotel charged two months earlier, and the flight itself). Multi-currency.
 - **Accurate answer requires:** a two-stage answer — resolve the entity ("Japan trip = Mar 3–17"), state that resolution to the user, then aggregate exactly over the resolved set with FX applied at transaction date.
 
 ### Q15. "What do I keep saying I'll do but never do?"
 
 - **Data:** task lists, notes, chat messages, calendar.
 - **Class:** Cross-referencing intent against outcome; requires negative evidence.
-- **Hard because:** it needs to find stated intentions (scattered, phrased a hundred ways) *and then prove absence* of follow-through — an exhaustiveness problem (Q8) run once per candidate intention.
+- **Hard because:** it needs to find stated intentions (scattered, phrased a hundred ways) _and then prove absence_ of follow-through — an exhaustiveness problem (Q8) run once per candidate intention.
 - **Accurate answer requires:** high-recall extraction of intent statements, then a completeness-guaranteed check for each. Expensive by construction; the interesting question is how to bound it.
 
 ### Q16. "Am I a morning person?"
@@ -178,15 +178,15 @@ column is the one that matters — it is the requirement, not the design.
 
 Grouping Q1–Q18 by what "correct" means:
 
-| Class | Examples | Correctness criterion |
-| --- | --- | --- |
-| **Exact aggregation** | Q1, Q7, Q11, Q14, Q18 | Every qualifying row included; arithmetic exact; denominator stated. Sampling is a bug. |
-| **Exhaustive / absence** | Q5, Q8, Q15 | Full-corpus coverage, or an explicit statement of what was not searched. A confident wrong "no" is the worst failure in the system. |
-| **Representative synthesis** | Q2, Q10, Q17 | Coverage-balanced sampling; no single loud source dominating; citations. |
-| **Latent inference** | Q3, Q16 | Decomposition into computable sub-facts, then bounded reasoning over the results, with calibrated confidence. |
-| **Relational / join** | Q4, Q6, Q18 | Correct join keys and entity resolution before any aggregation happens. |
-| **Entity resolution** | Q5, Q6, Q14, Q17 | The set must be resolved and *stated* before it is used. |
-| **Introspection** | Q12 | Answered from server metadata, never from content; must not be answerable by the party it is about. |
+| Class                        | Examples              | Correctness criterion                                                                                                               |
+| ---------------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| **Exact aggregation**        | Q1, Q7, Q11, Q14, Q18 | Every qualifying row included; arithmetic exact; denominator stated. Sampling is a bug.                                             |
+| **Exhaustive / absence**     | Q5, Q8, Q15           | Full-corpus coverage, or an explicit statement of what was not searched. A confident wrong "no" is the worst failure in the system. |
+| **Representative synthesis** | Q2, Q10, Q17          | Coverage-balanced sampling; no single loud source dominating; citations.                                                            |
+| **Latent inference**         | Q3, Q16               | Decomposition into computable sub-facts, then bounded reasoning over the results, with calibrated confidence.                       |
+| **Relational / join**        | Q4, Q6, Q18           | Correct join keys and entity resolution before any aggregation happens.                                                             |
+| **Entity resolution**        | Q5, Q6, Q14, Q17      | The set must be resolved and _stated_ before it is used.                                                                            |
+| **Introspection**            | Q12                   | Answered from server metadata, never from content; must not be answerable by the party it is about.                                 |
 
 The load-bearing observation: **these classes need different retrieval
 guarantees, and the class is a property of the question, not of the data.**
@@ -195,23 +195,23 @@ baseline, one week for the test) and Q4 (needs a join).
 
 ### 4.2 Data-shape taxonomy
 
-| Shape | Examples | What it affords |
-| --- | --- | --- |
-| Dense numeric timeseries | sleep, HR, steps, weight | Exact aggregation, baselines, joins on a time axis. Cheap if parsed once. |
-| Transactional / semi-structured events | bank, purchases, commits, calendar | Grouping, cadence detection, but needs normalization (merchant strings, currency, timezone). |
-| Long-form conversational text | ChatGPT/Claude exports, Slack, email | Semantic recall, theme extraction. No arithmetic. Huge. Mostly worthless per token. |
-| Documents / binary | PDFs, scans, images | Often not text at all. Silent coverage gaps (Q8). |
-| Relational / graph | contacts, org charts, attendee lists | Identity resolution, entity-centric gather. |
-| Server metadata | grants, access logs, lineage, index versions | Introspection; also the substrate for "what did I not look at". |
+| Shape                                  | Examples                                     | What it affords                                                                              |
+| -------------------------------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Dense numeric timeseries               | sleep, HR, steps, weight                     | Exact aggregation, baselines, joins on a time axis. Cheap if parsed once.                    |
+| Transactional / semi-structured events | bank, purchases, commits, calendar           | Grouping, cadence detection, but needs normalization (merchant strings, currency, timezone). |
+| Long-form conversational text          | ChatGPT/Claude exports, Slack, email         | Semantic recall, theme extraction. No arithmetic. Huge. Mostly worthless per token.          |
+| Documents / binary                     | PDFs, scans, images                          | Often not text at all. Silent coverage gaps (Q8).                                            |
+| Relational / graph                     | contacts, org charts, attendee lists         | Identity resolution, entity-centric gather.                                                  |
+| Server metadata                        | grants, access logs, lineage, index versions | Introspection; also the substrate for "what did I not look at".                              |
 
-The same *scope* can hold several shapes (a ChatGPT export is text, but it is
+The same _scope_ can hold several shapes (a ChatGPT export is text, but it is
 also an event stream with timestamps that supports Q9 and Q16).
 
 ### 4.3 Cross-cutting requirements the corpus forces
 
 1. **The system must know what it did not read.** Half the questions can only be answered honestly with a coverage statement. Any layer that cannot report its own coverage cannot answer Q1, Q8 or Q15 correctly.
 2. **Determinism where determinism is possible.** Q1, Q7, Q14, Q18 must return the same number twice. An LLM in the arithmetic path forfeits this.
-3. **Grant boundaries are part of correctness, not a wrapper.** A consumer holding a grant on `oura.sleep` asking Q4 must not get an answer computed from `github.commits`. Any index that spans scopes must be able to answer *within* a subset without leaking. Derivatives already carry this rule (a grant on a derived scope confers nothing on its sources, and vice versa) — the query layer inherits it.
+3. **Grant boundaries are part of correctness, not a wrapper.** A consumer holding a grant on `oura.sleep` asking Q4 must not get an answer computed from `github.commits`. Any index that spans scopes must be able to answer _within_ a subset without leaking. Derivatives already carry this rule (a grant on a derived scope confers nothing on its sources, and vice versa) — the query layer inherits it.
 4. **Entity resolution is a prerequisite, not a feature.** Q5, Q6, Q14, Q17 are unanswerable without it, and it is shared infrastructure across all of them.
 5. **Freshness varies by question.** Q13 needs live calendar; Q3 is fine on week-old data; Q11 needs a long-history baseline that changes slowly. One staleness policy will be wrong for most questions.
 6. **Cost must be bounded before execution, not discovered during it.** Q15 is unbounded by construction. The system needs to know the cost class of a question before running it, and to be able to say "this is a 40-second question".
@@ -220,7 +220,7 @@ also an event stream with timestamps that supports Q9 and Q16).
 
 ## 5. Open questions carried into Part II
 
-- Which classes must be exact and which may be approximate — and does the *consumer* get to choose, or the server?
+- Which classes must be exact and which may be approximate — and does the _consumer_ get to choose, or the server?
 - Do we pre-compute per shape (parse timeseries into rows at ingest) or on first question? What is the trigger, and who pays?
 - Is the answer unit a derivative record (durable, lineage-carrying, cacheable, re-servable) or a transient response? The `derivatives` module already makes the first one possible.
 - How does a consumer express a question class, or do we classify server-side?
@@ -248,7 +248,7 @@ spot. Agent-memory systems (Mem0, Zep/Graphiti, Letta, Cognee, Memobase) are
 benchmarked exclusively on QA-over-narrative-text; exact aggregation over
 structured records is unbenchmarked territory industry-wide.
 
-The two systems that *do* answer Q1-class questions reject RAG entirely:
+The two systems that _do_ answer Q1-class questions reject RAG entirely:
 karlicoss's **HPI** (exports → typed objects → pandas) and Simon Willison's
 **Dogsheep/Datasette** (exports → SQLite → SQL). Neither has an NL interface or
 a permission model. Airweave is our closest architectural sibling (connectors →
@@ -264,7 +264,7 @@ compute exactly over it; use embeddings only for descriptive text.** Top-k
 retrieval has no "return ALL matching rows" guarantee, so no amount of RAG
 tuning fixes Q1/Q7/Q18. This is the load-bearing decision in the design.
 
-The honest caveat: this argument is about *retrieval*. An agent that writes and
+The honest caveat: this argument is about _retrieval_. An agent that writes and
 runs code over raw files is a third option with a different failure profile,
 evaluated on its own terms in §15.
 
@@ -309,14 +309,14 @@ reindexing, provenance and grant isolation for free, and makes every index a
 first-class, inspectable, deletable piece of user data rather than hidden
 server state.
 
-| # | Transformation | Produces | Serves | Cost |
-| --- | --- | --- | --- | --- |
-| T1 | **Parse → typed rows.** Per-connector parsers into relational tables (Dogsheep's proven shape). DuckDB `read_json_auto` assists inference for unknown exports, but the schema is **frozen and versioned**, never re-inferred per batch. | `derived.<source>.tables` | Q1, Q4, Q7, Q11, Q14, Q18 | Cheap, deterministic, no LLM |
-| T2 | **Semantic layer.** Per-connector metric/dimension definitions + disambiguation notes, authored by us, shipped with the connector. | static, versioned | every T1 question | One-time authoring |
-| T3 | **Chunk + hybrid index.** Block-level chunks (the `storage/blocks` manifest already does this) into FTS5 + vectors, RRF-fused. Anthropic's contextual-retrieval prefix (an LLM-written blurb per chunk) cuts retrieval failure 49% / 67% with reranking — worth it only where recall is critical. | `derived.<source>.index` | Q2, Q5, Q9, Q10, Q17 | Embedding pass: tens of minutes to hours, one-time, background |
-| T4 | **Entity/alias table.** Deterministic canonicalization → probabilistic match → LLM judge on the ambiguous residual only. | `derived.identity` | Q5, Q6, Q14, Q17 | Moderate, mostly non-LLM |
-| T5 | **Bi-temporal fact extraction.** Only over conversational/journal text, only for questions that need it. | `derived.facts` | Q9, Q10, Q16 | Expensive per chunk — make it lazy and narrow |
-| T6 | **Enrichment columns.** LLM-derived columns materialized back onto T1 rows (merchant normalization, trip clustering, expense category) — Datasette's enrichment pattern. Schema inference can never produce these. | columns on T1 | Q7, Q14 | Bounded, batched, one pass per new row |
+| #   | Transformation                                                                                                                                                                                                                                                                                    | Produces                  | Serves                    | Cost                                                           |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- | ------------------------- | -------------------------------------------------------------- |
+| T1  | **Parse → typed rows.** Per-connector parsers into relational tables (Dogsheep's proven shape). DuckDB `read_json_auto` assists inference for unknown exports, but the schema is **frozen and versioned**, never re-inferred per batch.                                                           | `derived.<source>.tables` | Q1, Q4, Q7, Q11, Q14, Q18 | Cheap, deterministic, no LLM                                   |
+| T2  | **Semantic layer.** Per-connector metric/dimension definitions + disambiguation notes, authored by us, shipped with the connector.                                                                                                                                                                | static, versioned         | every T1 question         | One-time authoring                                             |
+| T3  | **Chunk + hybrid index.** Block-level chunks (the `storage/blocks` manifest already does this) into FTS5 + vectors, RRF-fused. Anthropic's contextual-retrieval prefix (an LLM-written blurb per chunk) cuts retrieval failure 49% / 67% with reranking — worth it only where recall is critical. | `derived.<source>.index`  | Q2, Q5, Q9, Q10, Q17      | Embedding pass: tens of minutes to hours, one-time, background |
+| T4  | **Entity/alias table.** Deterministic canonicalization → probabilistic match → LLM judge on the ambiguous residual only.                                                                                                                                                                          | `derived.identity`        | Q5, Q6, Q14, Q17          | Moderate, mostly non-LLM                                       |
+| T5  | **Bi-temporal fact extraction.** Only over conversational/journal text, only for questions that need it.                                                                                                                                                                                          | `derived.facts`           | Q9, Q10, Q16              | Expensive per chunk — make it lazy and narrow                  |
+| T6  | **Enrichment columns.** LLM-derived columns materialized back onto T1 rows (merchant normalization, trip clustering, expense category) — Datasette's enrichment pattern. Schema inference can never produce these.                                                                                | columns on T1             | Q7, Q14                   | Bounded, batched, one pass per new row                         |
 
 Not doing: GraphRAG community summarization (6.3), a general KG, per-user
 hand-authored models.
@@ -329,7 +329,7 @@ primitive and hoping. Evidence: Copilot's 40→13 tool cut bought +2–5pp accur
 and −400ms, and their winning selector was a cheap embedding pre-filter (94.5%
 coverage) over raw LLM judgment (87.5%); using a frontier model for trivial
 classification costs 10–15x more for worse results. Our tool count is small, so
-this is about *routing quality*, not tool-count collapse.
+this is about _routing quality_, not tool-count collapse.
 
 Per class:
 
@@ -407,16 +407,16 @@ Schemas and volumes below are verified against official docs and real export
 samples except where marked. The point of this section is that **the
 transformation matrix is sparse** — no source gets all six.
 
-| | Oura | Spotify | ChatGPT |
-| --- | --- | --- | --- |
-| Bytes that are prose | ~0% | ~5% | ~100% |
-| Rows | ~10^5 | 227,024 (real 10yr sample) | ~10^4 messages |
-| T1 parse → rows | ✅ core | ✅ core | metadata only |
-| T2 semantic layer | ✅ | ✅ | thin |
-| T3 chunk + embed | ❌ never | ❌ (FTS on track/artist only) | ✅ core |
-| T4 entity/alias | ❌ | artist/track ids, deterministic | ✅ (people named in text) |
-| T5 bi-temporal facts | ❌ | ❌ | on demand only |
-| T6 enrichment | ❌ | genre/mood, optional | ❌ |
+|                      | Oura     | Spotify                         | ChatGPT                   |
+| -------------------- | -------- | ------------------------------- | ------------------------- |
+| Bytes that are prose | ~0%      | ~5%                             | ~100%                     |
+| Rows                 | ~10^5    | 227,024 (real 10yr sample)      | ~10^4 messages            |
+| T1 parse → rows      | ✅ core  | ✅ core                         | metadata only             |
+| T2 semantic layer    | ✅       | ✅                              | thin                      |
+| T3 chunk + embed     | ❌ never | ❌ (FTS on track/artist only)   | ✅ core                   |
+| T4 entity/alias      | ❌       | artist/track ids, deterministic | ✅ (people named in text) |
+| T5 bi-temporal facts | ❌       | ❌                              | on demand only            |
+| T6 enrichment        | ❌       | genre/mood, optional            | ❌                        |
 
 ### 12.1 Oura — pure T1/T2
 
@@ -446,7 +446,7 @@ wrong:
 
 - **`type` has five values, not two.** Besides `long_sleep` and `late_nap`
   there are `deleted` (user-deleted) and `rest` (falsely detected, rejected by
-  the user), which must be excluded from *every* calculation — nap questions
+  the user), which must be excluded from _every_ calculation — nap questions
   included. This is a nastier trap than naps, because filtering
   `type === "long_sleep"` dodges it by luck while `type !== "late_nap"` walks
   straight into it.
@@ -457,7 +457,10 @@ wrong:
 - **The sleep day changes at 18:00** (stated in the `late_nap` enum
   description). Bucket by the `day` field; never re-derive it from
   `bedtime_start`. `bedtime_*` are localized strings with UTC offsets, so
-  `new Date(x).toISOString().slice(0,10)` shifts the date.
+  `new Date(x).toISOString().slice(0,10)` shifts the date. **This is not a
+  timezone edge case:** `day` is the morning the sleep _ends_ while
+  `bedtime_start` is the evening before, so re-deriving the date is wrong for
+  **~82% of rows** (1043 of 1276 measured in phase 1) regardless of offset.
 - **`heartrate.source` ∈ `awake|workout|rest|sleep|live|session`.** An
   unfiltered resting-HR baseline (Q11) is contaminated by workout samples.
 - **`workout.distance` is in meters** (Q18's "10km" is `> 10000`), and
@@ -496,22 +499,22 @@ decision, made once by us, not by the user and not by a model at query time.
 **Corrections, verified 2026-08-28 during phase 6a:**
 
 - **There are two different exports with the same filename, and picking the
-  wrong one is a silent decade-to-year error.** The *account data* package's
+  wrong one is a silent decade-to-year error.** The _account data_ package's
   streaming history covers **the past year only**, with `endTime` / `msPlayed`
-  / `trackName`. The *extended streaming history* package is lifetime, with
+  / `trackName`. The _extended streaming history_ package is lifetime, with
   `ts` / `ms_played` / `master_metadata_*`. An agent handed the account-data
   file answers a ten-year question with twelve months and nothing indicates a
   problem. This belongs at the top of the Spotify profile, not in a gotcha
   list.
-- **Rows are audio, video *and* podcast** — three field clusters, not the two
+- **Rows are audio, video _and_ podcast** — three field clusters, not the two
   described above.
 - The field list above omits `ip_addr`, `user_agent`, `username`,
   `offline_timestamp` and `spotify_episode_uri`. The first three are PII that
   no listening answer needs and must not be carried into a result.
 - **`reason_end`'s vocabulary and the 2.6% duplicate rate could not be traced
-  to a primary source** and are *not* verified. The shipped profile therefore
+  to a primary source** and are _not_ verified. The shipped profile therefore
   instructs the agent to enumerate the distinct `reason_end` values actually
-  present and to *measure* the duplicate rate, then state both — which is more
+  present and to _measure_ the duplicate rate, then state both — which is more
   accurate than either constant and consistent with the host-authored-coverage
   rule in the prompt contract §1.
 
@@ -625,7 +628,7 @@ evidence changes the design rather than killing it.
 ### 15.1 Long context alone is not a design point
 
 A 200MB personal corpus is ~40–50M tokens against a ~1M frontier context cap.
-A *single* scope — the ChatGPT export or the Spotify history — exceeds every
+A _single_ scope — the ChatGPT export or the Spotify history — exceeds every
 provider's maximum window on its own. Reading the whole corpus once is ~50
 max-size calls: order $100 per question uncached and minutes of serial latency,
 before any reasoning happens.
@@ -634,7 +637,7 @@ Worse, aggregation is the first capability to break as context grows. RULER
 shows aggregation degrading faster than any other task category; NoLiMa shows
 even single-fact retrieval falling >50% relative by 32K once literal keyword
 overlap is removed; ClaimDB (aggregation over ~110M tokens with forced tool
-use) has the best of 30 models at 82.7% *with* 93–99% SQL execution success —
+use) has the best of 30 models at 82.7% _with_ 93–99% SQL execution success —
 the failures are reasoning over correctly-retrieved data. CAG, the explicit
 "skip RAG" paper, was validated to 85K tokens on an 8B model and its authors
 call it impractical beyond that.
@@ -648,7 +651,7 @@ This is the serious alternative, and it splits cleanly.
 
 **Text retrieval — it wins.** A 2026 Amazon/AWS paper puts agentic `rga`/
 `pdfgrep` search at ~91–95% of vector RAG's faithfulness and answer
-correctness, 88% of context recall, and *beating* RAG on FinanceBench — the
+correctness, 88% of context recall, and _beating_ RAG on FinanceBench — the
 financial-table PDFs closest to our bank statements — 32.7% vs 24.2%. No vector
 store, no reindex on write.
 
@@ -704,12 +707,12 @@ generated code is exactly reproducible, which answer-similarity caching
 
 Demand-driven, not ingest-driven. Each tier is a derivative with lineage.
 
-| Tier | Artifact | Amortized over | New/unknown source | Deterministic |
-| --- | --- | --- | --- | --- |
-| 0 | none — agent + code execution over raw files | nothing | ✅ day one | ❌ |
-| 1 | the answer, as a derivative | one question | ✅ | ✅ on replay |
-| 2 | **the generated script, as a derivative** | a question *shape* | ✅ | ✅ on replay |
-| 3 | materialized T1/T2 rows | a whole source | ❌ needs a connector | ✅ |
+| Tier | Artifact                                     | Amortized over     | New/unknown source   | Deterministic |
+| ---- | -------------------------------------------- | ------------------ | -------------------- | ------------- |
+| 0    | none — agent + code execution over raw files | nothing            | ✅ day one           | ❌            |
+| 1    | the answer, as a derivative                  | one question       | ✅                   | ✅ on replay  |
+| 2    | **the generated script, as a derivative**    | a question _shape_ | ✅                   | ✅ on replay  |
+| 3    | materialized T1/T2 rows                      | a whole source     | ❌ needs a connector | ✅            |
 
 Tier 0 works on day one for any source we have never seen, which is what the
 connector-coverage risk (§11.3) needed. Tier 2 is the promotion path: when a
@@ -758,8 +761,8 @@ execution environment; the model sees only what is explicitly returned, with
 PII tokenized (`[EMAIL_1]`) before it reaches the model and detokenized at the
 client boundary.
 
-For Anthropic's hosted case, that means data does not enter the *context
-window*. **For us, running the sandbox locally, it is strictly stronger: the
+For Anthropic's hosted case, that means data does not enter the _context
+window_. **For us, running the sandbox locally, it is strictly stronger: the
 data never leaves the machine at all.** A question like "did my music change
 when I was sleeping badly" scans 227,024 Spotify rows and three years of Oura
 records, and the only thing that reaches a model is a small result table.
@@ -859,10 +862,10 @@ rules, not syntax. Choosing the wrong path for Q8 is worse still — semantic
 search instead of an exhaustive scan produces a confident "no" that is
 indistinguishable from a correct one.
 
-### 17.2 Analytical *and* semantic — yes, and better than either alone
+### 17.2 Analytical _and_ semantic — yes, and better than either alone
 
 Code execution is the only option surveyed that does both in one pass. A script
-can `GROUP BY` in DuckDB, `rg` for a phrase, *and* call an LLM as a function
+can `GROUP BY` in DuckDB, `rg` for a phrase, _and_ call an LLM as a function
 inside a loop — map-reduce over 3,000 conversations, then aggregate the
 classifications exactly.
 
@@ -874,7 +877,7 @@ real. It is also the expensive shape — thousands of model calls per question �
 which is exactly where precomputation earns its place.
 
 It also settles the completeness problem from §4.3 more convincingly than any
-index does. A script that scans every row *knows* it scanned every row, and can
+index does. A script that scans every row _knows_ it scanned every row, and can
 return the count. Completeness stops being a statistical property of a
 retriever and becomes an ordinary post-condition of a loop.
 
@@ -882,17 +885,17 @@ retriever and becomes an ordinary post-condition of a loop.
 
 Separate four things that get called "the index":
 
-| | Still needed? | Why |
-| --- | --- | --- |
-| **Implicit rules / semantic layer (T2)** | **Yes — the most important artifact** | The agent cannot rederive naps, sibling branches or skip semantics reliably. But this is *documentation the agent reads*, not a materialized structure. Cube's +17–23pp came from ~4KB of markdown. |
-| **Parsers (T1)** | Yes, but **as code, not tables** | A verified parse script (Tier 2) captures the rules and replays exactly. Materializing rows is a separate, later decision. |
-| **Materialized rows / vectors (T3)** | **Mostly no, at our scale** | DuckDB cold-scans 18GB of JSON in ~7s; our 355MB is sub-second. There is no performance argument for precomputing what a scan can do per query. |
-| **Derivatives as durable records** | **Yes — for protocol reasons, not speed** | A builder holding a grant on a derived scope needs that scope to *exist* as a record with lineage. Auditability, user inspection and deletion, and payment all attach to a record, not to a cache. |
+|                                          | Still needed?                             | Why                                                                                                                                                                                                 |
+| ---------------------------------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Implicit rules / semantic layer (T2)** | **Yes — the most important artifact**     | The agent cannot rederive naps, sibling branches or skip semantics reliably. But this is _documentation the agent reads_, not a materialized structure. Cube's +17–23pp came from ~4KB of markdown. |
+| **Parsers (T1)**                         | Yes, but **as code, not tables**          | A verified parse script (Tier 2) captures the rules and replays exactly. Materializing rows is a separate, later decision.                                                                          |
+| **Materialized rows / vectors (T3)**     | **Mostly no, at our scale**               | DuckDB cold-scans 18GB of JSON in ~7s; our 355MB is sub-second. There is no performance argument for precomputing what a scan can do per query.                                                     |
+| **Derivatives as durable records**       | **Yes — for protocol reasons, not speed** | A builder holding a grant on a derived scope needs that scope to _exist_ as a record with lineage. Auditability, user inspection and deletion, and payment all attach to a record, not to a cache.  |
 
 That yields one decision rule replacing the T1–T6 catalogue's implied "build
 them all":
 
-> **Precompute only what is expensive per query *and* reused across queries —
+> **Precompute only what is expensive per query _and_ reused across queries —
 > or what must exist as a durable record for grant, lineage or payment
 > reasons.**
 
@@ -929,15 +932,15 @@ do not pay a decryption cost.
 
 ### 18.1 What the questions actually cost
 
-| Question | Operation | Time |
-| --- | --- | --- |
-| Q1 average sleep | parse + aggregate Oura sleep | **2 ms** |
-| Q7 recurring expenses | normalize + group 9k transactions | **6 ms** |
-| Q6 distinct people | 110k rows across Slack + email + calendar, aliased | **65 ms** |
-| Q5 / Q8 exhaustive scan | literal scan of **all 95MB of prose** | **71 ms** |
-| Q4 sleep × music join | 228k streams joined to sleep by date | **238 ms** |
-| ChatGPT correct reconstruction | `current_node` walk over 10.4k conversations | **229 ms** |
-| Q3 / Q15 whole-corpus semantic map | 10,400 LLM calls, 5.5M input tokens | **~$5.47 (haiku-class) / ~$16.40 (sonnet-class)** |
+| Question                           | Operation                                          | Time                                              |
+| ---------------------------------- | -------------------------------------------------- | ------------------------------------------------- |
+| Q1 average sleep                   | parse + aggregate Oura sleep                       | **2 ms**                                          |
+| Q7 recurring expenses              | normalize + group 9k transactions                  | **6 ms**                                          |
+| Q6 distinct people                 | 110k rows across Slack + email + calendar, aliased | **65 ms**                                         |
+| Q5 / Q8 exhaustive scan            | literal scan of **all 95MB of prose**              | **71 ms**                                         |
+| Q4 sleep × music join              | 228k streams joined to sleep by date               | **238 ms**                                        |
+| ChatGPT correct reconstruction     | `current_node` walk over 10.4k conversations       | **229 ms**                                        |
+| Q3 / Q15 whole-corpus semantic map | 10,400 LLM calls, 5.5M input tokens                | **~$5.47 (haiku-class) / ~$16.40 (sonnet-class)** |
 
 Materializing does not change the picture: building a SQLite table of all 228k
 Spotify rows takes 0.4s and turns a 175ms scan into a 2ms query. Real, but not
@@ -958,6 +961,31 @@ Both implicit rules from §12 were measured, and both change answers materially:
   Naive `mapping.values()` flatten: **137,736** — **+15.0% phantom messages**
   that the user never sent or received. Every count, date and "first mention"
   built on that is wrong.
+
+**Recomputed 2026-08-28 on the seeded generator (phase 1), seed `20260828`.**
+The numbers above came from one unseeded draw and are not reproducible. The
+reproducible figures:
+
+| Trap                        | Correct     | Naive       | Error      |
+| --------------------------- | ----------- | ----------- | ---------- |
+| Sleep, full corpus (n=1030) | **6.52h**   | **5.93h**   | **-9.0%**  |
+| Sleep, 31-day window (n=28) | 6.58h       | 5.73h       | -12.8%     |
+| ChatGPT messages            | **120,003** | **138,047** | **+15.0%** |
+
+**The ChatGPT trap reproduces exactly at +15.0%** — it follows structurally from
+the sibling-branch rate, so it is a property of the data shape rather than of
+the draw. **The sleep trap's magnitude is seed and window noise**: it swings
+±4pp with how many naps land in the sampled window. Cite the full-corpus figure
+(**6.52h vs 5.93h, -9.0%**) as the stable number; the -11.5% above was one
+30-day draw. The regression test asserts the full-corpus ratio for exactly this
+reason.
+
+The direction and the mechanism are unchanged, and that is what this section
+argues. Phase 1 also made four further traps measurable that this section never
+had: keeping `rest`/`deleted` rows (6.52h → 5.99h), treating a null
+`total_sleep_duration` as zero (6.52h → 6.44h), an unfiltered resting-HR
+baseline (55.5 → 70.5 bpm), and undeduped workouts read as kilometres (193 →
+301 run days).
 
 Neither is a performance question. This is the entire case for T2, and it is
 why "let the agent figure it out" fails quietly rather than loudly.
@@ -1014,8 +1042,8 @@ Honest limits of the simulation:
 
 - **Warm page cache.** Cold reads add disk time; at NVMe speeds that is a
   fraction of a second for 222MB, but it was not measured.
-- **Synthetic prose is low-entropy.** Scan times are realistic; *semantic
-  quality* on this corpus proves nothing. Only the graded question set (§19.1)
+- **Synthetic prose is low-entropy.** Scan times are realistic; _semantic
+  quality_ on this corpus proves nothing. Only the graded question set (§19.1)
   can test that.
 - **Scale.** At ~10x (2GB+) the scan numbers move from milliseconds to seconds
   and the calculus changes — that is when T1 materialization starts earning its
@@ -1053,17 +1081,17 @@ one from each column.
 
 ### 19.2 The field
 
-| | Licence | Runtime | Arbitrary OpenAI endpoint | In-process library | OS sandbox |
-| --- | --- | --- | --- | --- | --- |
-| **pi** (earendil-works) | MIT | TS/Bun | ✅ first-class `baseUrl` | ✅ **only true one** | ❌ none, by design |
-| **Codex CLI** | Apache-2.0 | Rust | ⚠️ Responses API only | ❌ subprocess SDK | ✅ **only real one** |
-| **Qwen Code** | Apache-2.0 | TS | ✅ `modelProviders.openai[]` | ❌ subprocess SDK | ⚠️ opt-in, weak |
-| **dsh** (DeepSeek) | repo MIT / npm BSD-3 | TS | ✅ (wraps pi-ai) | ❌ Cordis framework | ⚠️ filesystem only |
-| **OpenCode** | MIT | TS | ✅ | ✅ official SDK | ❌ "No Sandbox" |
-| **Goose** | Apache-2.0 | Rust | ✅ verified in source | ❌ ACP client | ❌ none |
-| **Gemini CLI** | Apache-2.0 | TS | ❌ **Google-locked** | ❌ SDK unpublished | ⚠️ opt-in, egress open |
-| **Crush** | FSL-1.1-MIT ⚠️ | Go | ✅ | ❌ | ❌ `Setsid` only |
-| **Claude Agent SDK** | proprietary ❌ | TS | ❌ Claude only | ✅ | via separate pkg |
+|                         | Licence              | Runtime | Arbitrary OpenAI endpoint    | In-process library   | OS sandbox             |
+| ----------------------- | -------------------- | ------- | ---------------------------- | -------------------- | ---------------------- |
+| **pi** (earendil-works) | MIT                  | TS/Bun  | ✅ first-class `baseUrl`     | ✅ **only true one** | ❌ none, by design     |
+| **Codex CLI**           | Apache-2.0           | Rust    | ⚠️ Responses API only        | ❌ subprocess SDK    | ✅ **only real one**   |
+| **Qwen Code**           | Apache-2.0           | TS      | ✅ `modelProviders.openai[]` | ❌ subprocess SDK    | ⚠️ opt-in, weak        |
+| **dsh** (DeepSeek)      | repo MIT / npm BSD-3 | TS      | ✅ (wraps pi-ai)             | ❌ Cordis framework  | ⚠️ filesystem only     |
+| **OpenCode**            | MIT                  | TS      | ✅                           | ✅ official SDK      | ❌ "No Sandbox"        |
+| **Goose**               | Apache-2.0           | Rust    | ✅ verified in source        | ❌ ACP client        | ❌ none                |
+| **Gemini CLI**          | Apache-2.0           | TS      | ❌ **Google-locked**         | ❌ SDK unpublished   | ⚠️ opt-in, egress open |
+| **Crush**               | FSL-1.1-MIT ⚠️       | Go      | ✅                           | ❌                   | ❌ `Setsid` only       |
+| **Claude Agent SDK**    | proprietary ❌       | TS      | ❌ Claude only               | ✅                   | via separate pkg       |
 
 Eliminated outright: **Gemini CLI** — `AuthType` has exactly six values, all
 Google auth paths; `baseUrl` redirects Google SDK calls without changing the
@@ -1111,7 +1139,7 @@ variant, `Responses` is the default when unset, and a repo-wide search for
 
 **Resolved 2026-08-28 (plan phase 3), and the earlier reasoning here was
 wrong.** This section assumed Codex was blocked because our relay probably
-speaks only Chat Completions. It does not. The question has *two hops* with
+speaks only Chat Completions. It does not. The question has _two hops_ with
 opposite answers:
 
 - **Phala upstream speaks Responses.** `Dstack-TEE/private-ai-gateway`
@@ -1143,7 +1171,7 @@ The others: **dsh** has a real cross-platform filesystem sandbox
 filesystem-only by explicit design — "network and process visibility are
 outside this vocabulary" — and its CPU/memory rlimits apply only to its Python
 code-runtime tool. **Gemini CLI and Qwen Code** can reach real OS enforcement,
-but opt-in, off by default, with macOS's default profile *allowing* network
+but opt-in, off by default, with macOS's default profile _allowing_ network
 egress and non-Mac platforms requiring externally installed Docker/Podman.
 **OpenCode, Goose and Crush** ship nothing; OpenCode's SECURITY.md says so
 under a heading titled "No Sandbox" and tells you to use Docker or a VM.
@@ -1175,7 +1203,7 @@ Take the loop from one column and the sandbox from the other:
 
 1. **Loop — `@earendil-works/pi-agent-core`.** MIT, in-process, provider-agnostic,
    ~2MB, already the LLM layer under DeepSeek's harness. This replaces the
-   "write our own ~300 lines" plan from the previous draft: pi *is* that loop,
+   "write our own ~300 lines" plan from the previous draft: pi _is_ that loop,
    maintained. Writing our own stays the fallback if pi's abstractions fight our
    grant model.
 2. **Sandbox — ours, built from a studied reference.** `sandbox-runtime`
@@ -1197,15 +1225,15 @@ Take the loop from one column and the sandbox from the other:
 
 §16.3 described only OS enforcement. Both are needed:
 
-- **Capability confinement** — what the generated code can *call*. A language
+- **Capability confinement** — what the generated code can _call_. A language
   boundary; a shell escape defeats it.
-- **OS enforcement** — what the process can *read and reach*. Per-path read
+- **OS enforcement** — what the process can _read and reach_. Per-path read
   allowlist, zero egress, CPU/memory caps. Alone, it still lets in-grant code
   do out-of-scope things.
 
 Corrections to earlier drafts: `isolated-vm` is in maintenance mode with no CPU
 limit and only a soft memory limit, and Node's `--permission` is explicitly
-documented as *not a security boundary* against malicious code. Neither is
+documented as _not a security boundary_ against malicious code. Neither is
 usable here.
 
 ## 20. Next
@@ -1231,17 +1259,18 @@ usable here.
 
 Facts flagged UNVERIFIED, **updated 2026-08-28 after phase 6a**:
 
-*Resolved:*
+_Resolved:_
+
 - **spo2 nesting** — confirmed: `daily_spo2.spo2_percentage` is a nested
   object, `{average}` required, and the object itself is nullable.
-- **Spotify account-data package shape** — resolved as a *correction*, not a
+- **Spotify account-data package shape** — resolved as a _correction_, not a
   confirmation. See §12.2.
 - **Midnight-crossing day-bucket rule** — partially resolved: the Oura sleep
   day changes at 18:00, which is enough for the actionable rule (bucket by
   `day`). The general edge-case arithmetic remains unspecified.
 
-*Still unverified, and marked as gaps in the shipped profiles rather than
-stated as fact:* daytime heart-rate cadence (`PublicHeartRateRow` has no
+_Still unverified, and marked as gaps in the shipped profiles rather than
+stated as fact:_ daytime heart-rate cadence (`PublicHeartRateRow` has no
 interval field, so the profile tells the agent to measure gaps rather than
 assume 5-minute samples), Oura Ring CSV headers, the current ChatGPT export
 file list (OpenAI's help centre 403s to automated fetches), Spotify's

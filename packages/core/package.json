@@ -1,7 +1,7 @@
 {
   "name": "@opendatalabs/personal-server-ts-core",
   "version": "0.0.1",
-  "description": "Protocol logic for the Vana Personal Server — auth, grants, scopes, storage, keys",
+  "description": "Protocol logic for the Vana Personal Server \u2014 auth, grants, scopes, storage, keys",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -139,6 +139,10 @@
     "./write": {
       "types": "./dist/write/index.d.ts",
       "import": "./dist/write/index.js"
+    },
+    "./query/evals": {
+      "types": "./dist/query/evals/index.d.ts",
+      "import": "./dist/query/evals/index.js"
     }
   },
   "scripts": {

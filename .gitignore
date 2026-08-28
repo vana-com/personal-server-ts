@@ -15,4 +15,5 @@ packages/*/src/**/*.d.ts.map
 .sisyphus/
 
 # Downloaded frpc binaries (managed at runtime)
-packages/server/bin/
+packages/server/bin
+.claude/worktrees/
