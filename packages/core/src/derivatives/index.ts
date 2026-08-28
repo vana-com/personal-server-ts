@@ -1,5 +1,6 @@
 export {
   questionRegistrationView,
+  type QuestionMode,
   type QuestionRegisteredBy,
   type QuestionRegistration,
   type QuestionRegistrationPatch,
@@ -8,6 +9,15 @@ export {
   type QuestionStore,
   type QuestionStoreListFilter,
 } from "./types.js";
+export {
+  DEFAULT_MAX_TOOL_CALLS,
+  buildSearchCorpus,
+  runAgenticLoop,
+  type AgenticLoopInput,
+  type AgenticLoopResult,
+  type CorpusPassage,
+  type SearchCorpus,
+} from "./agentic.js";
 export {
   createInMemoryQuestionStore,
   matchesQuestionFilter,
@@ -54,6 +64,8 @@ export {
   type InferenceProvider,
   type InferenceRequestEncryption,
   type InferenceRole,
+  type InferenceToolCall,
+  type InferenceToolDef,
   type InferenceUsage,
   type OpenAiCompatibleInferenceOptions,
 } from "./inference.js";

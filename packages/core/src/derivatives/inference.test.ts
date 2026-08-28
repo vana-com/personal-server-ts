@@ -165,3 +165,190 @@ describe("createFakeInferenceProvider", () => {
     expect(provider.calls).toHaveLength(1);
   });
 });
+
+describe("tool calling (agentic mode wire shape)", () => {
+  it("serializes tools and tool messages onto the OpenAI shape", async () => {
+    const fetchMock = fetchReplying(completion);
+    const provider = createOpenAiCompatibleInferenceProvider({
+      baseUrl: "https://relay.example/v1",
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    await provider.chat({
+      model: "m",
+      messages: [
+        { role: "user", content: "q" },
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [
+            { id: "t1", name: "search_data", arguments: '{"query":"x"}' },
+          ],
+        },
+        { role: "tool", content: "result", toolCallId: "t1" },
+      ],
+      tools: [
+        {
+          name: "search_data",
+          description: "search",
+          parameters: { type: "object", properties: {} },
+        },
+      ],
+    });
+    const [, init] = fetchMock.mock.calls[0] as unknown as [
+      string,
+      RequestInit,
+    ];
+    const body = JSON.parse(init.body as string);
+    expect(body.tools).toEqual([
+      {
+        type: "function",
+        function: {
+          name: "search_data",
+          description: "search",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+    ]);
+    expect(body.messages[1]).toEqual({
+      role: "assistant",
+      content: "",
+      tool_calls: [
+        {
+          id: "t1",
+          type: "function",
+          function: { name: "search_data", arguments: '{"query":"x"}' },
+        },
+      ],
+    });
+    expect(body.messages[2]).toEqual({
+      role: "tool",
+      content: "result",
+      tool_call_id: "t1",
+    });
+  });
+
+  it("parses tool_calls from the reply and tolerates empty content", async () => {
+    const fetchMock = fetchReplying({
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "t9",
+                type: "function",
+                function: { name: "read_data", arguments: '{"ref":"a#0#0"}' },
+              },
+            ],
+          },
+        },
+      ],
+    });
+    const provider = createOpenAiCompatibleInferenceProvider({
+      baseUrl: "https://relay.example/v1",
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    const result = await provider.chat({
+      model: "m",
+      messages: [{ role: "user", content: "q" }],
+      tools: [
+        {
+          name: "read_data",
+          description: "read",
+          parameters: { type: "object" },
+        },
+      ],
+    });
+    expect(result.content).toBe("");
+    expect(result.toolCalls).toEqual([
+      { id: "t9", name: "read_data", arguments: '{"ref":"a#0#0"}' },
+    ]);
+  });
+
+  it("ignores hallucinated tool_calls when the request offered no tools", async () => {
+    const fetchMock = fetchReplying({
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "t9",
+                type: "function",
+                function: { name: "read_data", arguments: "{}" },
+              },
+            ],
+          },
+        },
+      ],
+    });
+    const provider = createOpenAiCompatibleInferenceProvider({
+      baseUrl: "https://relay.example/v1",
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    // No tools in the request: the hallucinated tool_calls must not defeat
+    // the empty-reply guard.
+    await expect(
+      provider.chat({ model: "m", messages: [{ role: "user", content: "q" }] }),
+    ).rejects.toThrow("no assistant content");
+  });
+
+  it("refuses tool calling when E2EE encryption is configured", async () => {
+    const fetchMock = fetchReplying(completion);
+    const encryption: InferenceRequestEncryption = {
+      encryptRequest: async ({ messages }) => ({ messages }),
+      decryptResponse: async ({ content }) => content,
+    };
+    const provider = createOpenAiCompatibleInferenceProvider({
+      baseUrl: "https://relay.example/v1",
+      fetch: fetchMock as unknown as typeof fetch,
+      encryption,
+    });
+    await expect(
+      provider.chat({
+        model: "m",
+        messages: [{ role: "user", content: "q" }],
+        tools: [
+          {
+            name: "search_data",
+            description: "s",
+            parameters: { type: "object" },
+          },
+        ],
+      }),
+    ).rejects.toThrow("not supported with E2EE");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("still rejects an empty reply that requests no tools", async () => {
+    const fetchMock = fetchReplying({
+      choices: [{ message: { role: "assistant", content: "" } }],
+    });
+    const provider = createOpenAiCompatibleInferenceProvider({
+      baseUrl: "https://relay.example/v1",
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    await expect(
+      provider.chat({ model: "m", messages: [{ role: "user", content: "q" }] }),
+    ).rejects.toThrow("no assistant content");
+  });
+
+  it("omits the tools field entirely when none are passed", async () => {
+    const fetchMock = fetchReplying(completion);
+    const provider = createOpenAiCompatibleInferenceProvider({
+      baseUrl: "https://relay.example/v1",
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    await provider.chat({
+      model: "m",
+      messages: [{ role: "user", content: "q" }],
+    });
+    const [, init] = fetchMock.mock.calls[0] as unknown as [
+      string,
+      RequestInit,
+    ];
+    expect(JSON.parse(init.body as string)).not.toHaveProperty("tools");
+  });
+});

@@ -8,6 +8,14 @@
 
 export type QuestionStatus = "pending" | "ready" | "failed" | "stale";
 
+/**
+ * How the answer is computed: `completion` = one chat completion over the
+ * newest-first trimmed sources; `agentic` = a bounded tool loop (search +
+ * read over the full sources). See docs/derivative-data-api.md, "Agentic
+ * mode".
+ */
+export type QuestionMode = "completion" | "agentic";
+
 /** Who registered the question; a builder is bound to the write grant. */
 export type QuestionRegisteredBy =
   | { kind: "owner" }
@@ -21,6 +29,7 @@ export interface QuestionRegistration {
   question: string;
   /** Model override; null = the provider's default. */
   model: string | null;
+  mode: QuestionMode;
   registeredBy: QuestionRegisteredBy;
   status: QuestionStatus;
   /** Short failure reason (never the prompt or the data). Null unless failed. */
@@ -75,6 +84,7 @@ export interface QuestionRegistrationView {
   sourceScopes: string[];
   question: string;
   model: string | null;
+  mode: QuestionMode;
   registeredBy: QuestionRegisteredBy;
   status: QuestionStatus;
   error: string | null;
@@ -94,6 +104,7 @@ export function questionRegistrationView(
     sourceScopes: [...registration.sourceScopes],
     question: registration.question,
     model: registration.model,
+    mode: registration.mode,
     registeredBy: registration.registeredBy,
     status: registration.status,
     error: registration.error,
