@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS derivative_questions (
   source_scopes TEXT NOT NULL,
   question TEXT NOT NULL,
   model TEXT,
+  mode TEXT NOT NULL DEFAULT 'completion',
   registered_by TEXT NOT NULL,
   status TEXT NOT NULL,
   error TEXT,
@@ -38,6 +39,7 @@ interface Row {
   source_scopes: string;
   question: string;
   model: string | null;
+  mode: string | null;
   registered_by: string;
   status: QuestionRegistration["status"];
   error: string | null;
@@ -55,6 +57,9 @@ function toRegistration(row: Row): QuestionRegistration {
     sourceScopes: JSON.parse(row.source_scopes) as string[],
     question: row.question,
     model: row.model,
+    // Narrowed rather than cast: a row written by a newer build, or by hand,
+    // must not smuggle an unknown mode into the compute path.
+    mode: row.mode === "code" ? "code" : "completion",
     registeredBy: JSON.parse(row.registered_by) as QuestionRegisteredBy,
     status: row.status,
     error: row.error,
@@ -66,11 +71,32 @@ function toRegistration(row: Row): QuestionRegistration {
   };
 }
 
+/**
+ * Adds the `mode` column to a table created before it existed.
+ *
+ * `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so a server
+ * upgraded in place would otherwise keep the old shape and fail every insert.
+ * Guarded by `PRAGMA table_info` rather than a caught `ALTER` so that a real
+ * failure (locked database, disk full) surfaces here instead of resurfacing
+ * later as a confusing insert error. Existing rows take the column default,
+ * `completion`, which is the behaviour they were registered under.
+ */
+function migrateModeColumn(db: Database.Database): void {
+  const columns = db
+    .prepare("PRAGMA table_info(derivative_questions)")
+    .all() as Array<{ name: string }>;
+  if (columns.some((column) => column.name === "mode")) return;
+  db.exec(
+    "ALTER TABLE derivative_questions ADD COLUMN mode TEXT NOT NULL DEFAULT 'completion'",
+  );
+}
+
 export function createSqliteQuestionStore(
   db: Database.Database,
 ): QuestionStore {
   db.exec(CREATE_TABLE_SQL);
   db.exec(CREATE_INDEX_SQL);
+  migrateModeColumn(db);
 
   const listAll = db.prepare(
     "SELECT * FROM derivative_questions ORDER BY created_at ASC, question_id ASC",
@@ -80,11 +106,11 @@ export function createSqliteQuestionStore(
   );
   const insertOne = db.prepare(`
     INSERT INTO derivative_questions (
-      question_id, derived_scope, source_scopes, question, model,
+      question_id, derived_scope, source_scopes, question, model, mode,
       registered_by, status, error, created_at, updated_at,
       last_computed_at, derived_version, derived_collected_at
     ) VALUES (
-      @question_id, @derived_scope, @source_scopes, @question, @model,
+      @question_id, @derived_scope, @source_scopes, @question, @model, @mode,
       @registered_by, @status, @error, @created_at, @updated_at,
       @last_computed_at, @derived_version, @derived_collected_at
     )`);
@@ -118,6 +144,7 @@ export function createSqliteQuestionStore(
         source_scopes: JSON.stringify(registration.sourceScopes),
         question: registration.question,
         model: registration.model,
+        mode: registration.mode,
         registered_by: JSON.stringify(registration.registeredBy),
         status: registration.status,
         error: registration.error,

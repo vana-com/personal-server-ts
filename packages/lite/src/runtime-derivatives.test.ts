@@ -131,6 +131,55 @@ describe("PS-Lite derivative compute", () => {
     expect(persisted?.questions.map((q) => q.questionId)).toEqual([questionId]);
     const reloaded = await createPsLiteQuestionStore(stateStore);
     expect((await reloaded.get(questionId))?.status).toBe("ready");
+    expect((await reloaded.get(questionId))?.mode).toBe("completion");
+  });
+
+  it("rehydrates mode, defaulting rows written before the field existed", async () => {
+    const stateStore = createMemoryPsLiteStateStore();
+
+    // Seed the state store the way an older build left it: no `mode` key at
+    // all on one row, an explicit `code` on another. There is no schema
+    // migration on Lite — rehydration is the migration.
+    const base = {
+      derivedScope: "coach.weekly",
+      sourceScopes: ["oura.sleep"],
+      question: "How did I sleep?",
+      model: null,
+      registeredBy: { kind: "owner" as const },
+      status: "ready" as const,
+      error: null,
+      createdAt: "2026-08-01T00:00:00.000Z",
+      updatedAt: "2026-08-01T00:00:00.000Z",
+      lastComputedAt: null,
+      derivedVersion: null,
+      derivedCollectedAt: null,
+    };
+    await stateStore.set("derivative-questions-v1", {
+      version: 1,
+      questions: [
+        { ...base, questionId: "legacy" },
+        { ...base, questionId: "coded", mode: "code" },
+        { ...base, questionId: "bogus", mode: "agentic" },
+      ],
+    });
+
+    const store = await createPsLiteQuestionStore(stateStore);
+    // Missing mode takes the behaviour it was registered under.
+    expect((await store.get("legacy"))?.mode).toBe("completion");
+    // An explicit mode survives the round trip.
+    expect((await store.get("coded"))?.mode).toBe("code");
+    // A mode this build does not know must not reach the compute path.
+    expect((await store.get("bogus"))?.mode).toBe("completion");
+
+    // And the normalized value is what gets written back.
+    await store.update("legacy", { status: "stale" });
+    const persisted = await stateStore.get<{
+      version: 1;
+      questions: QuestionRegistration[];
+    }>("derivative-questions-v1");
+    expect(
+      persisted?.questions.find((q) => q.questionId === "legacy")?.mode,
+    ).toBe("completion");
   });
 
   it("deactivate() stops the scheduler and activate() restarts it", async () => {

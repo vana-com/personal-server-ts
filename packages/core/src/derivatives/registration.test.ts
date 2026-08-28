@@ -19,10 +19,30 @@ describe("parseQuestionInput", () => {
       sourceScopes: ["chatgpt.conversations", "oura.sleep"],
       question: valid.question,
       model: null,
+      mode: "completion",
     });
     expect(parseQuestionInput({ ...valid, model: "z-ai/glm-5.2" }).model).toBe(
       "z-ai/glm-5.2",
     );
+  });
+
+  it("defaults mode to completion, accepts code, and refuses anything else", () => {
+    // An existing client that has never heard of `mode` keeps working.
+    expect(parseQuestionInput(valid).mode).toBe("completion");
+    expect(parseQuestionInput({ ...valid, mode: undefined }).mode).toBe(
+      "completion",
+    );
+    expect(parseQuestionInput({ ...valid, mode: null }).mode).toBe(
+      "completion",
+    );
+    expect(parseQuestionInput({ ...valid, mode: "code" }).mode).toBe("code");
+
+    // "agentic" was PR #231's second mode; it is deliberately not ours.
+    for (const bad of ["agentic", "", "CODE", 1, true, {}]) {
+      expect(() => parseQuestionInput({ ...valid, mode: bad })).toThrow(
+        /mode must be one of/,
+      );
+    }
   });
 
   it.each([

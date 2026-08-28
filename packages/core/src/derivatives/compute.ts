@@ -387,6 +387,16 @@ export async function computeQuestion(
       throw new ComputeFailure("server owner is not configured");
     }
     const serverOwner = deps.serverOwner;
+    // SEAM (phase 7a): `mode: "code"` routes to the query layer — a bounded
+    // code-writing agent over the full granted scopes. That path is not built
+    // yet. Fail loudly rather than falling through to the completion path:
+    // silently answering a `code` question with newest-first truncation is
+    // exactly the silent wrongness the query layer exists to remove.
+    if (registration.mode === "code") {
+      throw new ComputeFailure(
+        'mode "code" requires the query layer, which is not implemented yet',
+      );
+    }
     await assertGrantStillValid(deps, registration);
     // Defense in depth: the rule was checked at registration; a registration
     // row edited by hand must still not produce a leaking derivative.

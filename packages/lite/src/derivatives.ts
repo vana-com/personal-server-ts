@@ -40,7 +40,19 @@ export async function createPsLiteQuestionStore(
   stateStore: PsLiteStateStore,
 ): Promise<QuestionStore> {
   const saved = await stateStore.get<PsLiteQuestionsState>(QUESTIONS_KEY);
-  const initial = saved?.version === 1 ? saved.questions : [];
+  // The state store holds plain JSON, so rows written before `mode` existed
+  // come back without it. There is no schema migration here the way there is
+  // in sqlite — rehydration is the migration, and a row that arrives without
+  // a recognised mode takes `completion`, the behaviour it was registered
+  // under. Without this the field is `undefined` and every later read of it
+  // is silently wrong.
+  const initial = (saved?.version === 1 ? saved.questions : []).map(
+    (question) => ({
+      ...question,
+      mode:
+        question.mode === "code" ? ("code" as const) : ("completion" as const),
+    }),
+  );
   return createInMemoryQuestionStore({
     initial,
     onChange: (questions) =>
