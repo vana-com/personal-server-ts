@@ -55,7 +55,21 @@ closed over by the API factory and never bound into the script's realm, and
 end), not settable. `console.log` routes to a host callback rather than stdout.
 
 47x is the honest price of the confinement, and 612ms against a 60s wall clock
-is affordable. This is design §19.6 item 3 — the `codemode` pattern — which was
+is affordable. Re-measured once the interpreter was nested inside the OS
+sandbox: **390–505ms end to end**, including spawn and sandbox init, so the
+nesting cost nothing.
+
+**The frame has a budget, and coverage is the last thing sacrificed.** Script
+notes travel inside the frame, so an unbounded `console.log` loop pushed it
+past `maxOutputBytes`, the run was killed mid-write, and the host correctly
+distrusted a truncated frame — losing _all_ coverage. Failing closed there is
+right and stays. But a model that debugs by printing would hit it constantly,
+so the document is bounded before it is written: notes are trimmed from the
+middle first (both ends kept — the first say what the script set out to do,
+the last carry its conclusion) leaving a `__vana_notes_trimmed__` marker in
+band, then the result payload is dropped with `RESULT_TOO_LARGE` if still over.
+**Coverage itself is never trimmed**, and trimming cannot turn an incomplete
+run into one that looks complete. This is design §19.6 item 3 — the `codemode` pattern — which was
 described in the design but had not been built.
 
 ## 2. Response contract
@@ -78,9 +92,27 @@ Final form — the body is JSON:
 
 ````
 ```vana:answer
-{"answer": "...", "citations": [{"scope": "oura.sleep"}], "confidence": "high"}
+{"answer": "...", "citations": [{"scope": "oura.sleep"}], "confidence": "high", "value": 6.52}
 ```
 ````
+
+**`value` added 2026-08-28, and it is load-bearing for grading.** A question
+with a single numeric answer must carry the bare number — `6.52`, not
+`"6.52 hours"`, `"6.5"` or `"6,520"`. Without it the harness falls back to
+pulling the first number out of the answer's prose, which in a live run graded
+a correct 6.16h computation as **`got 30`**, because the prose opened with a
+sentence containing "30". The fallback remains for models that omit the field,
+but an explicit `value` always wins.
+
+`confidence` accepts `high`/`medium`/`low`, and coerces a finite 0–1 number
+into those buckets (≥0.75 high, ≥0.4 medium, else low) — Gemini returns `1.0`,
+which was previously dropped in silence. Anything else is a contract violation
+the repair path can fix. **Silently discarding a field the model set is never
+the right behaviour.**
+
+Contract violations: `no-block`, `unknown-tag`, `empty-block`,
+`answer-not-json`, `answer-not-object`, `answer-missing-answer-field`,
+`answer-bad-citations`, `answer-bad-confidence`, `answer-bad-value`.
 
 Parse failure is not fatal: the host replies with a repair message naming the
 violation and re-prompts once. A second failure ends the run with
@@ -100,6 +132,9 @@ vana.scopes(): Promise<ScopeInfo[]>
 vana.readAll(scope, opts?): Promise<unknown[]>       // host counts every record
 vana.read(scope, opts?): Promise<Block[]>            // bounded/cursored
 vana.stream(scope, onItem): Promise<number>          // for large scopes
+  // readAll/read/stream all feed BOTH recordsScanned and bytesScanned. They
+  // did not always: `read` reported bytes but no records, `readAll`/`stream`
+  // the reverse, so a live run scanned 8.5MB and reported recordsScanned: 0.
 vana.search(query, opts?): Promise<Hit[]>            // lexical, returns blockRef
 
 vana.classify(items, instruction, opts?): Promise<T[]>
