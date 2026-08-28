@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createFakeInferenceProvider,
   type QuestionRegistration,
@@ -9,6 +9,7 @@ import { createBearerTokenPsLiteAuth, createPsLiteRuntime } from "./runtime.js";
 import {
   createPsLiteDerivativeCompute,
   createPsLiteQuestionStore,
+  psLiteInferenceConfigured,
 } from "./derivatives.js";
 import {
   createMemoryPsLiteAccessLogStore,
@@ -29,12 +30,16 @@ async function setup() {
   const stateStore = createMemoryPsLiteStateStore();
   const provider = createFakeInferenceProvider();
   const store = await createPsLiteQuestionStore(stateStore);
+  let runtimeRef: ReturnType<typeof createPsLiteRuntime> | null = null;
   const derivatives = createPsLiteDerivativeCompute({
     config,
     storage,
     store,
     serverOwner: OWNER,
     provider,
+    runtimeAvailability: {
+      isAvailable: () => runtimeRef?.isAvailable() ?? true,
+    },
   });
   const accessLogStore = createMemoryPsLiteAccessLogStore();
   const runtime = createPsLiteRuntime({
@@ -53,6 +58,7 @@ async function setup() {
     derivatives,
     active: true,
   });
+  runtimeRef = runtime;
   return { runtime, derivatives, provider, stateStore, storage };
 }
 
@@ -125,6 +131,59 @@ describe("PS-Lite derivative compute", () => {
     expect(persisted?.questions.map((q) => q.questionId)).toEqual([questionId]);
     const reloaded = await createPsLiteQuestionStore(stateStore);
     expect((await reloaded.get(questionId))?.status).toBe("ready");
+  });
+
+  it("deactivate() stops the scheduler and activate() restarts it", async () => {
+    const { runtime, derivatives } = await setup();
+    const stop = vi.spyOn(derivatives.scheduler, "stop");
+    const start = vi.spyOn(derivatives.scheduler, "start");
+    runtime.deactivate();
+    expect(stop).toHaveBeenCalledTimes(1);
+    runtime.activate();
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips computes while inactive and picks pending questions up on activate()", async () => {
+    const { runtime, derivatives, provider } = await setup();
+    await ingest(runtime, "oura.sleep", { nights: [{ score: 1 }] });
+    const registered = await runtime.fetch(
+      new Request("https://ps.local/v1/derivatives/questions", {
+        method: "POST",
+        headers: { ...ownerHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          derivedScope: "coach.weekly",
+          sourceScopes: ["oura.sleep"],
+          question: "q",
+        }),
+      }),
+    );
+    const { questionId } = await registered.json();
+    runtime.deactivate();
+    await derivatives.scheduler.whenIdle();
+    expect(provider.calls).toHaveLength(0);
+    expect((await derivatives.store.get(questionId))!.status).toBe("pending");
+    runtime.activate();
+    await derivatives.scheduler.whenIdle();
+    expect(provider.calls).toHaveLength(1);
+    expect((await derivatives.store.get(questionId))!.status).toBe("ready");
+  });
+
+  it("does not consider the direct-provider default a configured relay", () => {
+    expect(psLiteInferenceConfigured(ServerConfigSchema.parse({}))).toBe(false);
+    expect(
+      psLiteInferenceConfigured(
+        ServerConfigSchema.parse({
+          inference: { baseUrl: "https://inference.phala.com/v1/" },
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      psLiteInferenceConfigured(
+        ServerConfigSchema.parse({
+          inference: { baseUrl: "https://inference-relay.vana.org/v1" },
+        }),
+      ),
+    ).toBe(true);
   });
 
   it("a builder token cannot register (PS-Lite has no write sessions) and the route is 503 without compute", async () => {

@@ -5,7 +5,10 @@
  */
 
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
-import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
+import type {
+  DataStoragePort,
+  RuntimeAvailabilityPort,
+} from "@opendatalabs/personal-server-ts-core/ports";
 import type { ScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
 import type { DataWritePolicyPorts } from "@opendatalabs/personal-server-ts-core/policy";
 import {
@@ -13,6 +16,7 @@ import {
   createInMemoryQuestionStore,
   createOpenAiCompatibleInferenceProvider,
   createRecomputeScheduler,
+  DEFAULT_INFERENCE_BASE_URL,
   type ComputeSyncNotifier,
   type InferenceProvider,
   type QuestionRegistration,
@@ -45,6 +49,18 @@ export async function createPsLiteQuestionStore(
   });
 }
 
+/**
+ * The browser build must not call a provider directly with no key: the
+ * default base URL is a direct provider, so the compute layer only comes up
+ * when `inference.baseUrl` names a relay (or a provider is injected).
+ */
+export function psLiteInferenceConfigured(config: ServerConfig): boolean {
+  return (
+    config.inference.baseUrl.replace(/\/+$/, "") !==
+    DEFAULT_INFERENCE_BASE_URL.replace(/\/+$/, "")
+  );
+}
+
 export interface PsLiteDerivativeComputeOptions {
   config: ServerConfig;
   storage: DataStoragePort;
@@ -55,6 +71,8 @@ export interface PsLiteDerivativeComputeOptions {
   /** Same: the tracker is built together with the sync manager. */
   scopeDeletions?: () => ScopeDeletionTracker | undefined;
   writePolicyPorts?: DataWritePolicyPorts;
+  /** Computes are skipped (status untouched) while the runtime is inactive. */
+  runtimeAvailability?: RuntimeAvailabilityPort;
   /** Defaults to the OpenAI-compatible client on `config.inference`. */
   provider?: InferenceProvider;
   logger?: Logger;
@@ -84,13 +102,20 @@ export function createPsLiteDerivativeCompute(
           options.logger?.warn(payload, message),
       }
     : undefined;
-  const scheduler = createRecomputeScheduler({
+  const scheduler: RecomputeScheduler = createRecomputeScheduler({
     store: options.store,
     debounceMs: options.config.inference.recomputeDebounceMs,
+    serverOwner: options.serverOwner,
     now: options.now,
     logger,
     compute: (questionId) =>
       computeQuestion(questionId, {
+        // A -> B -> C: a question reading this derived scope recomputes.
+        onDerivedWritten: (event) =>
+          scheduler.markSourceChanged(event.scope, {
+            lineageSources: event.lineageSources,
+          }),
+        runtimeAvailability: options.runtimeAvailability,
         storage: options.storage,
         store: options.store,
         provider,

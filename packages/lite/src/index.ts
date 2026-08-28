@@ -90,6 +90,7 @@ export {
 export {
   createPsLiteDerivativeCompute,
   createPsLiteQuestionStore,
+  psLiteInferenceConfigured,
   type PsLiteDerivativeCompute,
   type PsLiteDerivativeComputeOptions,
 } from "./derivatives.js";

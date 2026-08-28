@@ -38,6 +38,7 @@ import { createPsLiteSyncManager } from "./sync.js";
 import {
   createPsLiteDerivativeCompute,
   createPsLiteQuestionStore,
+  psLiteInferenceConfigured,
 } from "./derivatives.js";
 import { resolvePsLiteOwner } from "./owner-binding.js";
 import { DiagnosticsRecorder } from "./diagnostics.js";
@@ -170,11 +171,19 @@ export async function createIndexedDbPsLiteRuntime(
   });
   let syncManager = options.syncManager ?? null;
   let scopeDeletions = options.scopeDeletions;
+  let runtimeRef: PsLiteRuntime | null = null;
   // Derivative compute: built before sync so downloads can mark questions
   // stale; it reaches the sync manager lazily to upload its results.
-  const derivatives =
-    options.derivatives ??
-    createPsLiteDerivativeCompute({
+  // Without a relay URL (or an injected provider) the layer stays off and
+  // /v1/derivatives answers 503: the browser never calls a provider
+  // directly with no key.
+  let derivatives = options.derivatives ?? null;
+  if (
+    derivatives === null &&
+    options.derivatives === undefined &&
+    (options.inferenceProvider || psLiteInferenceConfigured(config))
+  ) {
+    derivatives = createPsLiteDerivativeCompute({
       config,
       storage,
       store: await createPsLiteQuestionStore(stateStore),
@@ -185,9 +194,18 @@ export async function createIndexedDbPsLiteRuntime(
         authSessionVerifier: gateway,
         grantVerifier: gateway,
       },
+      runtimeAvailability: {
+        isAvailable: () => runtimeRef?.isAvailable() ?? Boolean(options.active),
+      },
       provider: options.inferenceProvider,
       logger: options.logger,
     });
+  } else if (derivatives === null && options.derivatives === undefined) {
+    options.logger?.warn(
+      { baseUrl: config.inference.baseUrl },
+      "Derivative compute disabled: inference.baseUrl is the direct-provider default; point it at the Vana inference relay",
+    );
+  }
   if (!syncManager && config.sync.enabled) {
     const sync = await createPsLiteSyncManager({
       config,
@@ -203,12 +221,13 @@ export async function createIndexedDbPsLiteRuntime(
       logger: options.logger,
       lineageGateway,
       onDataPointIndexed: (event) =>
-        derivatives.scheduler.markSourceChanged(event.scope),
+        derivatives?.scheduler.markSourceChanged(event.scope, {
+          lineageSources: event.lineageSources,
+        }),
     });
     syncManager = sync.syncManager;
     scopeDeletions = sync.scopeDeletions;
   }
-  let runtimeRef: PsLiteRuntime | null = null;
   const auth =
     options.auth ??
     createWeb3SignedPsLiteAuth({

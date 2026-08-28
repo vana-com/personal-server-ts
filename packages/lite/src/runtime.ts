@@ -35,7 +35,8 @@ import {
 } from "@opendatalabs/personal-server-ts-core/api";
 import {
   handlePersonalServerDerivativesRequest,
-  type PersonalServerDerivativesApiDeps,
+  type QuestionStore,
+  type RecomputeScheduler,
 } from "@opendatalabs/personal-server-ts-core/derivatives";
 import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
 import {
@@ -150,7 +151,7 @@ export interface PsLiteRuntimeOptions {
    * Derivative compute layer (store + scheduler). Omit to leave
    * /v1/derivatives answering 503; see createPsLiteDerivativeCompute.
    */
-  derivatives?: PersonalServerDerivativesApiDeps["compute"];
+  derivatives?: { store: QuestionStore; scheduler: RecomputeScheduler } | null;
   accessToken?: string;
   tokenStore?: PsLiteTokenStore;
   stateCapabilities?: Partial<PsLiteRuntimeStateCapabilities>;
@@ -778,10 +779,12 @@ export function createPsLiteRuntime(
     activate() {
       active = true;
       options.syncManager?.start?.();
+      options.derivatives?.scheduler.start();
     },
     deactivate() {
       active = false;
       void options.syncManager?.stop?.();
+      options.derivatives?.scheduler.stop();
     },
     isAvailable() {
       return active;
@@ -935,6 +938,7 @@ export function createPsLiteRuntime(
                 ? (event) =>
                     options.derivatives?.scheduler.markSourceChanged(
                       event.scope,
+                      { lineageSources: event.lineageSources },
                     )
                 : undefined,
             },
