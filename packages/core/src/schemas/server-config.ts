@@ -56,6 +56,17 @@ export const DEFAULTS = {
     serverAddr: "frpc.server.vana.org",
     serverPort: 7000,
   },
+  inference: {
+    // OpenAI-compatible chat completions endpoint the derivative compute
+    // layer calls. Point it at the Vana inference relay (which holds the
+    // provider key) or straight at a provider for local development.
+    baseUrl: "https://inference.phala.com/v1",
+    model: "z-ai/glm-5.2",
+    // Newest-first items kept per source scope when a prompt is assembled.
+    maxSourceItems: 50,
+    // Quiet period after a source scope changes before a recompute starts.
+    recomputeDebounceMs: 5_000,
+  },
 };
 
 export const StorageBackend = z.enum([
@@ -161,6 +172,24 @@ export const ServerConfigSchema = z.object({
         .default(DEFAULTS.tunnel.serverPort),
     })
     .default(DEFAULTS.tunnel),
+  inference: z
+    .object({
+      baseUrl: z.url().default(DEFAULTS.inference.baseUrl),
+      model: z.string().min(1).default(DEFAULTS.inference.model),
+      maxSourceItems: z
+        .number()
+        .int()
+        .min(1)
+        .max(10_000)
+        .default(DEFAULTS.inference.maxSourceItems),
+      recomputeDebounceMs: z
+        .number()
+        .int()
+        .min(0)
+        .max(3_600_000)
+        .default(DEFAULTS.inference.recomputeDebounceMs),
+    })
+    .default(DEFAULTS.inference),
 });
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;

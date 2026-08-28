@@ -230,3 +230,39 @@ export class DataDeletedError extends ProtocolError {
     super(410, "DATA_DELETED", "Data point has been deleted", details);
   }
 }
+
+// Derivative compute (see docs/derivative-data-api.md, "Compute")
+
+export class DerivativeQuestionInvalidError extends ProtocolError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super(400, "DERIVATIVE_QUESTION_INVALID", message, details);
+  }
+}
+
+export class DerivativeQuestionNotFoundError extends ProtocolError {
+  constructor(details?: Record<string, unknown>) {
+    super(404, "DERIVATIVE_QUESTION_NOT_FOUND", "Question not found", details);
+  }
+}
+
+export class DerivativeCycleError extends ProtocolError {
+  constructor(details: { derivedScope: string; path: string[] }) {
+    super(
+      409,
+      "DERIVATIVE_CYCLE",
+      `Registering this question would make "${details.derivedScope}" a transitive source of itself; recompute would never settle`,
+      details,
+    );
+  }
+}
+
+export class DerivativeComputeUnavailableError extends ProtocolError {
+  constructor(details?: Record<string, unknown>) {
+    super(
+      503,
+      "DERIVATIVE_COMPUTE_UNAVAILABLE",
+      "This server has no derivative compute configured",
+      details,
+    );
+  }
+}
