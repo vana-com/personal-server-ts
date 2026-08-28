@@ -21,7 +21,8 @@ export type PsLiteStateKey =
   | "server-identity-v1"
   | "relay-v1"
   | "sync-cursor-v1"
-  | "pending-blob-deletions-v1";
+  | "pending-blob-deletions-v1"
+  | "derivative-questions-v1";
 
 export interface PsLiteStateStore {
   get<T>(key: PsLiteStateKey): Promise<T | null>;

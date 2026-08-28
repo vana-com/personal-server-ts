@@ -88,6 +88,13 @@ export {
 } from "./owner-binding.js";
 
 export {
+  createPsLiteDerivativeCompute,
+  createPsLiteQuestionStore,
+  type PsLiteDerivativeCompute,
+  type PsLiteDerivativeComputeOptions,
+} from "./derivatives.js";
+
+export {
   createBearerTokenPsLiteAuth,
   createPsLiteRuntime,
   createWeb3SignedPsLiteAuth,

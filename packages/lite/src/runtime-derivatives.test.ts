@@ -1,0 +1,169 @@
+import { describe, expect, it } from "vitest";
+import {
+  createFakeInferenceProvider,
+  type QuestionRegistration,
+} from "@opendatalabs/personal-server-ts-core/derivatives";
+import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
+import { computeDataPointId } from "@opendatalabs/personal-server-ts-core/sync";
+import { createBearerTokenPsLiteAuth, createPsLiteRuntime } from "./runtime.js";
+import {
+  createPsLiteDerivativeCompute,
+  createPsLiteQuestionStore,
+} from "./derivatives.js";
+import {
+  createMemoryPsLiteAccessLogStore,
+  createMemoryPsLiteStateStore,
+  createMemoryPsLiteStorage,
+  createMemoryPsLiteTokenStore,
+} from "./test-support/memory.js";
+import { createMockPsLiteGateway } from "./test-support/gateway.js";
+
+const OWNER = "0x1111111111111111111111111111111111111111" as const;
+const ownerHeaders = { Authorization: "Bearer owner-token" };
+
+async function setup() {
+  const config = ServerConfigSchema.parse({
+    inference: { recomputeDebounceMs: 0 },
+  });
+  const storage = createMemoryPsLiteStorage();
+  const stateStore = createMemoryPsLiteStateStore();
+  const provider = createFakeInferenceProvider();
+  const store = await createPsLiteQuestionStore(stateStore);
+  const derivatives = createPsLiteDerivativeCompute({
+    config,
+    storage,
+    store,
+    serverOwner: OWNER,
+    provider,
+  });
+  const accessLogStore = createMemoryPsLiteAccessLogStore();
+  const runtime = createPsLiteRuntime({
+    storage,
+    gateway: createMockPsLiteGateway(),
+    accessLogReader: accessLogStore,
+    accessLogWriter: accessLogStore,
+    tokenStore: createMemoryPsLiteTokenStore(),
+    saveConfig: async () => {},
+    stateCapabilities: { config: "memory" },
+    auth: createBearerTokenPsLiteAuth({
+      ownerToken: "owner-token",
+      builderToken: "builder-token",
+    }),
+    serverOwner: OWNER,
+    derivatives,
+    active: true,
+  });
+  return { runtime, derivatives, provider, stateStore, storage };
+}
+
+async function ingest(
+  runtime: Awaited<ReturnType<typeof setup>>["runtime"],
+  scope: string,
+  body: unknown,
+) {
+  return runtime.fetch(
+    new Request(`https://ps.local/v1/data/${scope}`, {
+      method: "POST",
+      headers: { ...ownerHeaders, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+describe("PS-Lite derivative compute", () => {
+  it("owner registers a question, the runtime computes it locally and persists the registration", async () => {
+    const { runtime, derivatives, provider, stateStore } = await setup();
+    expect(
+      (await ingest(runtime, "oura.sleep", { nights: [{ score: 77 }] })).status,
+    ).toBe(201);
+    await derivatives.scheduler.whenIdle();
+
+    const registered = await runtime.fetch(
+      new Request("https://ps.local/v1/derivatives/questions", {
+        method: "POST",
+        headers: { ...ownerHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          derivedScope: "coach.weekly",
+          sourceScopes: ["oura.sleep"],
+          question: "How did I sleep?",
+        }),
+      }),
+    );
+    expect(registered.status).toBe(201);
+    const { questionId } = await registered.json();
+    await derivatives.scheduler.whenIdle();
+
+    const status = await runtime.fetch(
+      new Request(`https://ps.local/v1/derivatives/questions/${questionId}`, {
+        headers: ownerHeaders,
+      }),
+    );
+    expect(await status.json()).toMatchObject({
+      status: "ready",
+      derivedVersion: 1,
+    });
+    expect(provider.calls).toHaveLength(1);
+    expect(provider.calls[0]!.messages[1]!.content).toContain('"score":77');
+
+    const read = await runtime.fetch(
+      new Request("https://ps.local/v1/data/coach.weekly", {
+        headers: ownerHeaders,
+      }),
+    );
+    expect(read.status).toBe(200);
+    const envelope = await read.json();
+    expect(envelope.data.$lineage.sources).toEqual([
+      computeDataPointId(OWNER, "oura.sleep"),
+    ]);
+    expect(envelope.data.answer).toBe("fake answer");
+
+    // The registration lives in the state store (survives a reload).
+    const persisted = await stateStore.get<{
+      version: 1;
+      questions: QuestionRegistration[];
+    }>("derivative-questions-v1");
+    expect(persisted?.questions.map((q) => q.questionId)).toEqual([questionId]);
+    const reloaded = await createPsLiteQuestionStore(stateStore);
+    expect((await reloaded.get(questionId))?.status).toBe("ready");
+  });
+
+  it("a builder token cannot register (PS-Lite has no write sessions) and the route is 503 without compute", async () => {
+    const { runtime } = await setup();
+    const res = await runtime.fetch(
+      new Request("https://ps.local/v1/derivatives/questions", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer builder-token",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          derivedScope: "coach.weekly",
+          sourceScopes: ["oura.sleep"],
+          question: "q",
+        }),
+      }),
+    );
+    expect(res.status).toBe(401);
+
+    const accessLogStore = createMemoryPsLiteAccessLogStore();
+    const bare = createPsLiteRuntime({
+      storage: createMemoryPsLiteStorage(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      accessLogReader: accessLogStore,
+      accessLogWriter: accessLogStore,
+      tokenStore: createMemoryPsLiteTokenStore(),
+      saveConfig: async () => {},
+      stateCapabilities: { config: "memory" },
+      active: true,
+    });
+    const unavailable = await bare.fetch(
+      new Request("https://ps.local/v1/derivatives/questions", {
+        headers: ownerHeaders,
+      }),
+    );
+    expect(unavailable.status).toBe(503);
+  });
+});
