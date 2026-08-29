@@ -17,6 +17,8 @@ const coverage: CoverageCounters = {
   complete: true,
   method: "full",
   enforcementNotes: [],
+  unreadable: 0,
+  perScope: {},
 };
 
 function doc(over: Partial<RunDocument> = {}): RunDocument {

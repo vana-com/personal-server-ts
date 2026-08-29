@@ -26,6 +26,8 @@ const coverage: CoverageCounters = {
   complete: true,
   method: "full",
   enforcementNotes: ["RSS watchdog samples every 50ms"],
+  unreadable: 0,
+  perScope: {},
 };
 
 const doc = (notes: string[], result?: RunDocument["result"]): RunDocument => ({

@@ -19,6 +19,8 @@ const honest = (records: number, complete: boolean): RunDocument => ({
     complete,
     method: "full",
     enforcementNotes: [],
+    unreadable: 0,
+    perScope: {},
   },
   notes: [],
   toolCalls: 0,
