@@ -582,12 +582,12 @@ summary: Daily USD/JPY rates, one row per day. The field is \`jpy_per_usd\` — 
 
 One JSON array, \`fx_rates.json\`. One row per day of the corpus window:
 
-| Field         | Type   | Notes                                        |
-| ------------- | ------ | -------------------------------------------- |
-| \`date\`        | string | \`YYYY-MM-DD\`. The join key.                  |
-| \`base\`        | string | Always \`USD\`.                                |
-| \`quote\`       | string | Always \`JPY\`.                                |
-| \`jpy_per_usd\` | number | How many JPY one USD buys. Four decimals.    |
+| Field         | Type   | Notes                                     |
+| ------------- | ------ | ----------------------------------------- |
+| \`date\`        | string | \`YYYY-MM-DD\`. The join key.               |
+| \`base\`        | string | Always \`USD\`.                             |
+| \`quote\`       | string | Always \`JPY\`.                             |
+| \`jpy_per_usd\` | number | How many JPY one USD buys. Four decimals. |
 
 There is a row for **every** day in the window, so a transaction date always
 has a rate and you never need to interpolate or carry a rate forward.
@@ -653,14 +653,14 @@ summary: Commit rows with \`authored_at\` as a local timestamp carrying its own 
 
 One JSON array, \`git_commits.json\`. Each row:
 
-| Field         | Type   | Notes                                              |
-| ------------- | ------ | -------------------------------------------------- |
-| \`sha\`         | string | Stable identifier. Cite it.                        |
-| \`authored_at\` | string | ISO 8601 **with a UTC offset**, e.g. \`-08:00\`.     |
-| \`repo\`        | string | One of a small set of repository names.            |
-| \`message\`     | string | One line.                                          |
-| \`additions\`   | number | Lines added.                                       |
-| \`deletions\`   | number | Lines removed.                                     |
+| Field         | Type   | Notes                                          |
+| ------------- | ------ | ---------------------------------------------- |
+| \`sha\`         | string | Stable identifier. Cite it.                    |
+| \`authored_at\` | string | ISO 8601 **with a UTC offset**, e.g. \`-08:00\`. |
+| \`repo\`        | string | One of a small set of repository names.        |
+| \`message\`     | string | One line.                                      |
+| \`additions\`   | number | Lines added.                                   |
+| \`deletions\`   | number | Lines removed.                                 |
 
 ## The rule that matters: read the hour locally, not in UTC
 
@@ -684,7 +684,7 @@ daily scope silently misattributes them.
 
 ## Commits are behaviour, and behaviour can contradict what was said
 
-This scope is the *measured* half of a stated-versus-measured question. If the
+This scope is the _measured_ half of a stated-versus-measured question. If the
 text scopes contain someone describing their habits and the commit distribution
 disagrees, **report both and name the conflict** — do not pick whichever source
 you happened to read. An answer that says "you describe yourself as a night owl,
@@ -809,7 +809,7 @@ log have no row at all**:
 ## The rule that matters: intake is not expenditure
 
 A question about **how much someone eats** is answered from \`total_kcal\` here.
-It is *not* answered from \`total_calories\` on an activity or Oura-style daily
+It is _not_ answered from \`total_calories\` on an activity or Oura-style daily
 scope — that field is energy **burned**, and the two differ by hundreds of
 kilocalories in the same person on the same day.
 
@@ -837,7 +837,8 @@ logging is materially worse than weekday logging**, by design. So:
 
 \`\`\`js
 const logged = days.filter((d) => byDay.has(d));
-const mean = logged.reduce((s, d) => s + byDay.get(d).total_kcal, 0) / logged.length;
+const mean =
+  logged.reduce((s, d) => s + byDay.get(d).total_kcal, 0) / logged.length;
 // report: mean, logged.length, and days.length - logged.length as unknown
 \`\`\`
 

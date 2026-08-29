@@ -9,9 +9,15 @@
 import { runConfinedScript } from "../packages/core/dist/query/tools/interpreter/index.js";
 
 const cases = [
-  ["arrow + map/filter/reduce", "const a=[1,2,3]; return a.map(x=>x*2).filter(x=>x>2).reduce((s,x)=>s+x,0)"],
+  [
+    "arrow + map/filter/reduce",
+    "const a=[1,2,3]; return a.map(x=>x*2).filter(x=>x>2).reduce((s,x)=>s+x,0)",
+  ],
   ["for..of", "let s=0; for (const x of [1,2,3]) s+=x; return s"],
-  ["for..in", "let k=[]; for (const p in {a:1,b:2}) k.push(p); return k.join()"],
+  [
+    "for..in",
+    "let k=[]; for (const p in {a:1,b:2}) k.push(p); return k.join()",
+  ],
   ["classic for", "let s=0; for(let i=0;i<3;i++)s+=i; return s"],
   ["while", "let i=0,s=0; while(i<3){s+=i;i++} return s"],
   ["destructuring obj", "const {a,b}={a:1,b:2}; return a+b"],
@@ -28,7 +34,10 @@ const cases = [
   ["rest params", "function f(...xs){return xs.length} return f(1,2,3)"],
   ["async/await", "const x = await Promise.resolve(1); return x"],
   ["Object.entries", "return Object.entries({a:1}).length"],
-  ["Object.keys/values", "return Object.keys({a:1}).length + Object.values({a:1}).length"],
+  [
+    "Object.keys/values",
+    "return Object.keys({a:1}).length + Object.values({a:1}).length",
+  ],
   ["Object.assign", "return JSON.stringify(Object.assign({},{a:1}))"],
   ["Array.from", "return Array.from([1,2]).length"],
   ["Array.isArray", "return Array.isArray([])"],
@@ -36,7 +45,10 @@ const cases = [
   ["Math", "return Math.round(Math.max(1,2.6))"],
   ["Number.toFixed", "return (1.234).toFixed(2)"],
   ["parseFloat/parseInt", "return parseFloat('1.5')+parseInt('2')"],
-  ["String methods", "return 'a,b'.split(',').length + 'x'.toUpperCase().length"],
+  [
+    "String methods",
+    "return 'a,b'.split(',').length + 'x'.toUpperCase().length",
+  ],
   ["localeCompare", "return 'a'.localeCompare('b')"],
   ["JSON round trip", "return JSON.parse(JSON.stringify({a:1})).a"],
   ["Map", "const m=new Map(); m.set('a',1); return m.get('a')"],
@@ -52,12 +64,21 @@ const cases = [
   ["do..while", "let i=0; do{i++}while(i<3); return i"],
   ["getter in object literal", "const o={get x(){return 1}}; return o.x"],
   ["computed key", "const k='a'; return ({[k]:1}).a"],
-  ["Array.flat/flatMap", "return [[1],[2]].flat().length + [1].flatMap(x=>[x]).length"],
-  ["Array.includes/find", "return ([1,2].includes(2) ? 1:0) + ([1,2].find(x=>x>1)||0)"],
+  [
+    "Array.flat/flatMap",
+    "return [[1],[2]].flat().length + [1].flatMap(x=>[x]).length",
+  ],
+  [
+    "Array.includes/find",
+    "return ([1,2].includes(2) ? 1:0) + ([1,2].find(x=>x>1)||0)",
+  ],
   ["Object.fromEntries", "return Object.fromEntries([['a',1]]).a"],
   ["Array destructure in params", "return [[1,2]].map(([a,b])=>a+b)[0]"],
   ["chained optional call", "const o={f(){return 1}}; return o.f?.()"],
-  ["Promise.all", "const r = await Promise.all([1,2].map(async x=>x)); return r.length"],
+  [
+    "Promise.all",
+    "const r = await Promise.all([1,2].map(async x=>x)); return r.length",
+  ],
   ["Intl absent?", "return typeof Intl"],
   ["toLocaleDateString", "return typeof (new Date(0)).toLocaleDateString"],
 ];

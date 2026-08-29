@@ -33,11 +33,23 @@ for (const [k, v] of [...byc.entries()].sort()) {
 }
 
 const ids = (f) => rows.filter(f).map((r) => r.id);
-console.log("\nbudget kills:", ids((r) => r.stoppedBecause === "budget"));
+console.log(
+  "\nbudget kills:",
+  ids((r) => r.stoppedBecause === "budget"),
+);
 console.log(
   "null content:",
   ids((r) => r.reasons.some((x) => x.includes("no assistant content"))),
 );
-console.log("stopped=error:", ids((r) => r.stoppedBecause === "error"));
-console.log("coverage complete:", ids((r) => r.complete));
-console.log("passes:", ids((r) => r.outcome === "pass"));
+console.log(
+  "stopped=error:",
+  ids((r) => r.stoppedBecause === "error"),
+);
+console.log(
+  "coverage complete:",
+  ids((r) => r.complete),
+);
+console.log(
+  "passes:",
+  ids((r) => r.outcome === "pass"),
+);
