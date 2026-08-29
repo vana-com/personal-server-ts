@@ -263,17 +263,24 @@ describe("renderProfiles", () => {
     expect(rendered.text).toContain("no source profile");
   });
 
-  // The shipped set no longer fits the default budget: ten profiles total
-  // ~44k characters of body against a 40k budget that was set when there were
-  // three. Degradation is therefore live, and `renderProfiles` includes
-  // profiles in alphabetical id order — so *which* profile is degraded is
-  // arbitrary with respect to how much it matters. Today that is `spotify`,
-  // whose body carries the measured account-data and skip-semantics traps.
+  // The shipped set fits the default budget in full, with headroom, and this
+  // test is what keeps that true.
   //
-  // This test pins the behaviour rather than asserting the budget is
-  // sufficient, so the tradeoff stays visible instead of silently shifting to
-  // a different profile the next time one is added or edited.
-  it("degrades only the last profiles alphabetically once the budget is spent", () => {
+  // It inverts what it asserted at a 40,000-char budget, where ten profiles
+  // came to 38,653 and `spotify` degraded — the profile carrying the measured
+  // account-data trap and the skip-semantics rule. Inclusion is alphabetical
+  // by id, so *which* profile degrades is arbitrary with respect to how much
+  // it is worth, and trading a measured trap for ~2k tokens inverts design
+  // §18.2's whole claim about this prose being the highest-leverage artifact
+  // we ship.
+  //
+  // So the budget was raised to 72,000 and the assertion turned around: the
+  // shipped set must render with NOTHING summarized. Adding a profile past the
+  // headroom now fails the build and forces a deliberate choice — raise the
+  // budget again, or make inclusion value-aware — rather than silently
+  // degrading whichever profile sorts last. The degradation mechanism itself
+  // is still exercised above, against an explicit small budget.
+  it("renders the whole shipped set with nothing degraded", () => {
     const rendered = renderProfiles(
       listProfiles().flatMap((p) =>
         p.scopes.map((s) => s.replace(".*", ".any")),
@@ -282,16 +289,10 @@ describe("renderProfiles", () => {
     expect(rendered.text.length).toBeLessThanOrEqual(
       DEFAULT_PROFILE_BUDGET_CHARS,
     );
-    // Everything before the cutoff renders in full...
-    expect(rendered.full).toContain("bank");
-    expect(rendered.full).toContain("oura");
-    expect(rendered.full).toContain("chatgpt");
-    // ...and the remainder is reported, never dropped in silence.
-    expect(rendered.summarized).toEqual(["spotify"]);
-    for (const id of rendered.summarized) {
-      expect(rendered.text).toContain(`(\`${id}\``);
+    expect(rendered.summarized).toEqual([]);
+    for (const profile of listProfiles()) {
+      expect(rendered.full).toContain(profile.id);
     }
-    expect(rendered.text).toContain("Full profile omitted for length");
   });
 
   it("renders every profile in full for a realistic single-source grant", () => {

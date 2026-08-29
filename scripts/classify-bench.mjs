@@ -31,7 +31,8 @@ const HARNESS = [
     label: "null-content crash (loop threw out of the answerer)",
   },
   {
-    test: (r) => r.reasons?.some((x) => /coverage\.unreadable is unset/.test(x)),
+    test: (r) =>
+      r.reasons?.some((x) => /coverage\.unreadable is unset/.test(x)),
     label: "coverage.unreadable never populated host-side",
   },
   {
@@ -54,25 +55,46 @@ for (const id of ids) {
   if (fails.length === 0) continue;
 
   if (FIXTURE_LIMITED.has(id)) {
-    buckets.fixture.push({ id, n: fails.length, of: rs.length, why: "case notes: corpus models no grant ledger" });
+    buckets.fixture.push({
+      id,
+      n: fails.length,
+      of: rs.length,
+      why: "case notes: corpus models no grant ledger",
+    });
     continue;
   }
   const hit = HARNESS.find((h) => fails.some((f) => h.test(f)));
   if (hit) {
-    buckets.harness.push({ id, n: fails.length, of: rs.length, why: hit.label });
+    buckets.harness.push({
+      id,
+      n: fails.length,
+      of: rs.length,
+      why: hit.label,
+    });
     continue;
   }
   // Everything left had what it needed and got it wrong: it produced an answer
   // and the answer did not satisfy the anchors.
   const reason = fails[0].reasons?.[0] ?? "wrong answer";
   if (fails.some((f) => f.value != null || (f.answerHead ?? "").length > 40)) {
-    buckets.model.push({ id, n: fails.length, of: rs.length, why: String(reason).slice(0, 120) });
+    buckets.model.push({
+      id,
+      n: fails.length,
+      of: rs.length,
+      why: String(reason).slice(0, 120),
+    });
   } else {
-    buckets.unclassified.push({ id, n: fails.length, of: rs.length, why: String(reason).slice(0, 120) });
+    buckets.unclassified.push({
+      id,
+      n: fails.length,
+      of: rs.length,
+      why: String(reason).slice(0, 120),
+    });
   }
 }
 
 for (const [name, list] of Object.entries(buckets)) {
   console.log(`\n=== ${name.toUpperCase()} (${list.length}) ===`);
-  for (const b of list) console.log(`  ${b.id}  ${b.n}/${b.of} failed  — ${b.why}`);
+  for (const b of list)
+    console.log(`  ${b.id}  ${b.n}/${b.of} failed  — ${b.why}`);
 }
