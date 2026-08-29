@@ -63,6 +63,13 @@ export * as prose from "./fixtures/prose.js";
 
 export { createReferenceAnswerer } from "./answerers/reference-answerer.js";
 export { createNullAnswerer } from "./answerers/null-answerer.js";
+export type { StuffedAnswererOptions } from "./answerers/stuffed-answerer.js";
+export {
+  DEFAULT_CORPUS_BUDGET_CHARS,
+  STUFFED_SYSTEM_PROMPT_TEMPLATE,
+  createStuffedAnswerer,
+  recordTimeMs,
+} from "./answerers/stuffed-answerer.js";
 
 export type { DefensibleReading, ResolutionOutcome } from "./readings.js";
 export {

@@ -57,6 +57,8 @@ import {
   buildCases,
   buildJudge,
   createReferenceAnswerer,
+  createStuffedAnswerer,
+  DEFAULT_CORPUS_BUDGET_CHARS,
   generateInto,
   runEval,
   type FixtureProfileName,
@@ -218,10 +220,49 @@ async function main(): Promise<void> {
   // `buildAgentAnswerer` now builds the host per request as well — it has to,
   // since the grant is per request — so this is belt and braces rather than
   // the only thing standing between the table and that bug.
+  /*
+   * Which arm is under test. `agent` is the code-writing loop this project
+   * builds; `stuffed` is the naive control implementation plan §7 asks for —
+   * the corpus truncated newest-first into one prompt, asked once, no tools.
+   * Both are graded by the same `runEval` below, which is the whole point: a
+   * parallel grading path would make the two scoreboards incomparable.
+   */
+  const arm = (arg("answerer", "agent") ?? "agent").toLowerCase();
+  if (!["agent", "stuffed"].includes(arm)) {
+    throw new Error(`unknown --answerer "${arm}" (agent | stuffed)`);
+  }
+  const corpusBudgetChars = Number(
+    arg("corpus-budget", String(DEFAULT_CORPUS_BUDGET_CHARS)),
+  );
+  /*
+   * Built ONCE, unlike the agent host. The agent's tool host accumulates
+   * coverage across the turns of a request and must be rebuilt per question
+   * or Q18 inherits everything Q1..Q17 touched. The stuffed answerer holds no
+   * such state — its coverage is derived from what a single call actually put
+   * in the prompt — so the only thing a fresh instance would buy is re-parsing
+   * 20MB of corpus JSON 54 times.
+   */
+  const stuffed =
+    arm === "stuffed" && provider
+      ? createStuffedAnswerer({
+          source,
+          manifest,
+          provider,
+          ...(process.env.INFERENCE_MODEL
+            ? { model: process.env.INFERENCE_MODEL }
+            : {}),
+          corpusBudgetChars,
+        })
+      : undefined;
+  if (arm === "stuffed" && !stuffed) {
+    throw new Error("--answerer stuffed requires --live");
+  }
+
   const freshAnswerer = async () =>
-    live
+    stuffed ??
+    (live
       ? await buildAgentAnswerer(dir, manifest, provider)
-      : createReferenceAnswerer(source);
+      : createReferenceAnswerer(source));
   const answerer = await freshAnswerer();
   // The shared judge from `evals/judge.ts`, not a local copy. This script's
   // fork was where the judge began, and it drifted: it never carried
@@ -357,6 +398,11 @@ async function main(): Promise<void> {
     seed,
     live,
     repeat,
+    // Which arm wrote this dump. Two arms now write the same row shape, and a
+    // file that does not say which one it is cannot be compared to anything.
+    answerer: answerer.name,
+    arm,
+    ...(arm === "stuffed" ? { corpusBudgetChars } : {}),
     judged: judge !== undefined,
     model: process.env.INFERENCE_MODEL ?? null,
     // Stated in the dump rather than only in the source, so a reader can tell
