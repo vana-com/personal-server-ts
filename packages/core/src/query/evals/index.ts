@@ -54,3 +54,13 @@ export * as prose from "./fixtures/prose.js";
 
 export { createReferenceAnswerer } from "./answerers/reference-answerer.js";
 export { createNullAnswerer } from "./answerers/null-answerer.js";
+
+export type { DefensibleReading, ResolutionOutcome } from "./readings.js";
+export {
+  AMBIGUOUS_READINGS,
+  Q1_READINGS,
+  Q14_READINGS,
+  Q18_READINGS,
+  classifyResolution,
+  gradeAgainstReadings,
+} from "./readings.js";
