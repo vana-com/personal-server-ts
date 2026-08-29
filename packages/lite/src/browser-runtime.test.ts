@@ -221,3 +221,47 @@ describe("createIndexedDbPsLiteRuntime browser defaults", () => {
     });
   });
 });
+
+describe("createIndexedDbPsLiteRuntime write sessions", () => {
+  it("mounts the write-session handshake by default and skips it for a caller-owned auth adapter", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const base = {
+      ownerAddress,
+      ownerSignature,
+      gateway: createMockPsLiteGateway(),
+      active: true,
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+      },
+    };
+    const handshake = (runtime: {
+      fetch: (req: Request) => Promise<Response>;
+    }) =>
+      runtime.fetch(
+        new Request("https://ps.local/v1/write/session", { method: "POST" }),
+      );
+
+    // Default wiring: the route exists, and refuses an unauthenticated
+    // handshake rather than 404ing as if delegated writes were unsupported.
+    const withDefaults = await createIndexedDbPsLiteRuntime({
+      ...base,
+      dbName: "ps-lite-write-default",
+      storageDbName: "ps-lite-write-default-storage",
+    });
+    expect((await handshake(withDefaults.runtime)).status).toBe(401);
+
+    // A caller that brings its own auth adapter owns the wiring: we must not
+    // mint tokens that adapter has never heard of.
+    const withOwnAuth = await createIndexedDbPsLiteRuntime({
+      ...base,
+      dbName: "ps-lite-write-own-auth",
+      storageDbName: "ps-lite-write-own-auth-storage",
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+    });
+    expect((await handshake(withOwnAuth.runtime)).status).toBe(404);
+  });
+});

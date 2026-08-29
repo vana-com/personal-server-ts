@@ -106,8 +106,23 @@ export {
   type PsLiteRuntimeOptions,
   type PsLiteStorageAdapter,
   type PsLiteTokenStore,
+  type PsLiteWriteSessionAuthOptions,
   type Web3SignedPsLiteAuthOptions,
 } from "./runtime.js";
+
+// Delegated builder writes: hosts that build their own auth adapter (or want
+// one store shared across several runtimes) wire these themselves.
+export {
+  createInMemoryWriteProofReplayStore,
+  createInMemoryWriteSessionStore,
+  hashWriteSessionToken,
+  verifyStoredWriterAttribution,
+  WRITE_SIGNATURE_HEADER,
+  WRITER_ATTRIBUTION_KEY,
+  type WriteProofReplayStore,
+  type WriteSessionRecord,
+  type WriteSessionStore,
+} from "@opendatalabs/personal-server-ts-core/write";
 
 export {
   createIndexedDbMcpConnectionStore,

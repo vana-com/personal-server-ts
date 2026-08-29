@@ -7,16 +7,11 @@ import type {
   PersonalServerApiAuthPort,
   PersonalServerReadAuthInput,
   PersonalServerWriteAuthInput,
-  PersonalServerWriteAuthResult,
 } from "@opendatalabs/personal-server-ts-core/api";
-import {
-  verifyDataReadPolicy,
-  verifyDataWritePolicy,
-} from "@opendatalabs/personal-server-ts-core/policy";
+import { verifyDataReadPolicy } from "@opendatalabs/personal-server-ts-core/policy";
 import {
   createInMemoryWriteProofReplayStore,
-  hashWriteSessionToken,
-  verifyWriterAttribution,
+  createWriteSessionAuthorization,
   type WriteProofReplayStore,
   type WriteSessionStore,
 } from "@opendatalabs/personal-server-ts-core/write";
@@ -99,17 +94,27 @@ async function assertRegisteredBuilder(
   throw new UnregisteredBuilderError();
 }
 
-function bearerToken(request: Request): string | null {
-  const header = request.headers.get("authorization");
-  if (!header?.startsWith("Bearer ")) return null;
-  return header.slice(7);
-}
-
 export function createServerApiAuth(
   deps: ServerApiAuthDeps,
 ): PersonalServerApiAuthPort {
   const writeProofReplayStore =
     deps.writeProofReplayStore ?? createInMemoryWriteProofReplayStore();
+  // The write-session half of this port is protocol, not runtime: the browser
+  // build's adapters call the same factory, so a delegated write is checked
+  // identically wherever the Personal Server runs.
+  const writeSessions = createWriteSessionAuthorization({
+    serverOrigin: deps.serverOrigin,
+    serverOwner: deps.serverOwner,
+    sessionStore: deps.writeSessionStore,
+    replayStore: writeProofReplayStore,
+    policyPorts: {
+      authSessionVerifier: deps.gateway,
+      grantVerifier: deps.gateway,
+      runtimeAvailability: deps.runtimeAvailability,
+      // Fee seam intentionally not wired: builder writes are free in the
+      // demo slice (write fee mechanics undecided).
+    },
+  });
 
   async function authorizeOwner(request: Request): Promise<void> {
     const result = await authenticate(request, deps);
@@ -132,49 +137,9 @@ export function createServerApiAuth(
    * other credential (owner Web3Signed, dev token, control-plane token,
    * unknown bearer) falls through to the owner path unchanged.
    */
-  async function authorizeWrite(
-    input: PersonalServerWriteAuthInput,
-  ): Promise<PersonalServerWriteAuthResult | void> {
-    const token = bearerToken(input.request);
-    if (token && deps.writeSessionStore) {
-      const session = await deps.writeSessionStore.getByTokenHash(
-        await hashWriteSessionToken(token),
-      );
-      if (session) {
-        if (!deps.serverOwner) throw serverNotConfigured();
-        const grant = await verifyDataWritePolicy(
-          {
-            signer: session.builderAddress,
-            grantId: session.grantId,
-            requestedScope: input.scope,
-            serverOwner: deps.serverOwner,
-          },
-          {
-            authSessionVerifier: deps.gateway,
-            grantVerifier: deps.gateway,
-            runtimeAvailability: deps.runtimeAvailability,
-            // Fee seam intentionally not wired: builder writes are free in
-            // the demo slice (write fee mechanics undecided).
-          },
-        );
-        // releaseProof is a rollback hook for the handler, never part of the
-        // stored attribution record.
-        const { releaseProof, ...attribution } = await verifyWriterAttribution({
-          request: input.request,
-          builderAddress: session.builderAddress,
-          grantId: grant.id,
-          serverOrigin: deps.serverOrigin,
-          replayStore: writeProofReplayStore,
-        });
-        return {
-          builder: session.builderAddress,
-          grantId: grant.id,
-          grantScopes: grant.scopes ?? [],
-          attribution,
-          releaseProof,
-        };
-      }
-    }
+  async function authorizeWrite(input: PersonalServerWriteAuthInput) {
+    const delegated = await writeSessions.authorizeSessionWrite(input);
+    if (delegated) return delegated;
     await authorizeOwner(input.request);
   }
 
@@ -187,24 +152,7 @@ export function createServerApiAuth(
    * 401 discloses nothing. Returns undefined for any other credential.
    */
   async function authorizeWriteSession(request: Request) {
-    const token = bearerToken(request);
-    if (!token || !deps.writeSessionStore) return;
-    const session = await deps.writeSessionStore.getByTokenHash(
-      await hashWriteSessionToken(token),
-    );
-    if (!session) return;
-    const { releaseProof } = await verifyWriterAttribution({
-      request,
-      builderAddress: session.builderAddress,
-      grantId: session.grantId,
-      serverOrigin: deps.serverOrigin,
-      replayStore: writeProofReplayStore,
-    });
-    return {
-      builder: session.builderAddress,
-      grantId: session.grantId,
-      releaseProof,
-    };
+    return writeSessions.recognizeWriteSession(request);
   }
 
   return {
