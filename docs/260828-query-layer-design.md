@@ -740,10 +740,44 @@ ourselves.
 > the scan behind it. Separately, `complete` was false in **43/43** runs, so the
 > flag currently carries no information and its derivation may be too strict.
 >
-> Limits: one model, one corpus, one day, N=10, unpinned temperature, and a
-> thinking model whose reasoning tokens are hidden — variance may originate in
-> reasoning the script never shows. **Re-running with a pinned temperature is
-> the obvious next measurement** and would likely lower the numbers.
+> Limits: one model, one corpus, one day, N=10, and a thinking model whose
+> reasoning tokens are hidden — variance may originate in reasoning the script
+> never shows.
+>
+> **RE-RUN WITH TEMPERATURE PINNED, same day. The variance is not the
+> sampler.** 60 runs at `temperature: 0`, plus an independent replication
+> batch:
+>
+> | Axis                | unpinned       | temperature 0  | replication |
+> | ------------------- | -------------- | -------------- | ----------- |
+> | distinct scripts    | 43/43          | **42/42**      | **18/18**   |
+> | Q1 within-tolerance | 6/9            | 5/9            | 6/9         |
+> | Q11 identical       | 9/9            | 7/7            | 9/9         |
+> | Q14                 | 550824 (wrong) | 550824 (wrong) | —           |
+> | `complete` true     | 0/43           | 0/42           | 0/18        |
+>
+> **Script variance did not move: 60 temperature-0 runs, 60 distinct scripts**,
+> raw and normalized. So regeneration is inherently unstable and no sampler
+> setting undoes it — the stronger of the two possible outcomes, and it means
+> the phase 6b caching argument rests on something no configuration can fix.
+> The offline control was 1/10 distinct with sd 0, so the harness measures the
+> model rather than itself. Coverage did not stabilise either: Q11 scanned
+> 14,428–33,832 records across 9 distinct scope sets for one question.
+>
+> **Q1's instability is set resolution, not arithmetic.** The eval reads "last
+> month" as a trailing 31 days; the model variously chose trailing-30 (6.16),
+> calendar-December (6.68) and trailing-31 (6.62) — three defensible readings
+> of an ambiguous question. Q11 is stable precisely because "last week" is not
+> ambiguous. That sharpens what a cached script would be freezing: not a
+> computation but an _interpretation_, which argues the cached artifact must
+> record its resolution alongside its code. Prompt rule 5 already requires the
+> model to state that resolution; caching should persist it.
+>
+> `seed` is **rejected** by this endpoint (`400 Unknown name "seed"`), so
+> sampler pinning is limited to `temperature` and `top_p`. An earlier probe of
+> mine reported it accepted; that probe read Gemini's array-shaped error body
+> (`[{error:…}]`) with an object-shaped check and scored a hard 400 as success.
+> `scripts/probe-params.ts` now handles both shapes.
 
 **Caching the code, not the data, is the underrated option.** Agent Workflow
 Memory reports +24.6% and +51.1% relative success from reusing cached workflows
