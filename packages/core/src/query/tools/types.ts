@@ -89,6 +89,17 @@ export interface CoverageCounters {
   bytesScanned: number;
   scopesSkipped: { scope: string; reason: string }[];
   complete: boolean;
+  /**
+   * Records that were present but could not be read — a scanned PDF with no
+   * text layer, an undecodable attachment.
+   *
+   * Host-authored like every other counter: the runtime recognises the
+   * record's own unreadable marker as it streams past. This is what lets an
+   * absence answer be honest — "no match across 318 readable documents; 22
+   * could not be read" is a true negative, while a bare "no" over the same
+   * data is not (design §4.3 point 1).
+   */
+  unreadable: number;
   method: CoverageMethod;
   stoppedBecause?: StoppedBecause;
   /**

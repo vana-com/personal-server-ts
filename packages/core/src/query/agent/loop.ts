@@ -50,6 +50,20 @@ export interface QueryLoopOptions {
   model?: string;
   /** Hard ceiling on model turns. Also the only bound on relay call volume. */
   maxTurns?: number;
+  /**
+   * Completion budget per turn.
+   *
+   * Deliberately above the provider default (2048). A *thinking* model spends
+   * reasoning tokens out of this same budget, so a small ceiling can be
+   * consumed entirely by reasoning and return a 200 with null content — which
+   * killed 3 of 18 questions in the dogfood benchmark before this existed.
+   */
+  maxTokens?: number;
+  /**
+   * How many times to re-ask when a turn comes back with no content at all.
+   * Each retry raises the completion budget; see {@link EMPTY_REPLY_RETRIES}.
+   */
+  emptyReplyRetries?: number;
   /** Per-turn cap on script output fed back to the model. */
   outputTailBytes?: number;
   profileBudgetChars?: number;
@@ -57,7 +71,48 @@ export interface QueryLoopOptions {
   now?: () => number;
 }
 
-export const DEFAULT_MAX_TURNS = 12;
+/**
+ * Hard ceiling on model turns per question.
+ *
+ * Raised from 12 on benchmark evidence, not on feel. Across the 18-question
+ * dogfood run the two questions that passed used 6 and 8 turns, while five
+ * (28%) died at exactly 12 — several still making progress, having spent turns
+ * on repair retries and scope exploration that never called a tool. 20 leaves
+ * roughly 2.5x the observed successful working set.
+ *
+ * This is the only bound on relay call volume — the gateway has no rate
+ * limiting — so it stays a hard ceiling, and the wrap-up turn below is
+ * deliberately outside it by exactly one.
+ */
+export const DEFAULT_MAX_TURNS = 20;
+
+/**
+ * Per-turn completion budget.
+ *
+ * The provider default is 2048, which is not enough headroom for a reasoning
+ * model: measured on `gemini-3.7-flash`, reasoning alone exhausted it and the
+ * reply carried no content.
+ */
+export const DEFAULT_MAX_TOKENS = 8192;
+
+/** Re-asks allowed when a turn returns no content. */
+export const EMPTY_REPLY_RETRIES = 2;
+
+/**
+ * Did this turn come back with nothing usable?
+ *
+ * Matched on the provider's message because that is the only signal it gives:
+ * the throw carries a 200 status and no `errorType`, so status and type cannot
+ * distinguish "the model returned nothing" from any other failure. String
+ * matching is fragile, and a shared error code on `InferenceRequestError`
+ * would be better — but `inference.ts` carries E2EE, relay signing and
+ * bodyHash ordering, and is deliberately not edited from here.
+ */
+function isEmptyReply(err: unknown): boolean {
+  return (
+    err instanceof Error && err.message.includes("carried no assistant content")
+  );
+}
 
 /** Sandbox terminations that map onto a coverage `stoppedBecause`. */
 const TERMINATION_TO_STOPPED: Record<string, QueryStoppedBecause | undefined> =
@@ -127,6 +182,75 @@ function honestAnswerText(answer: string, coverage: QueryCoverage): string {
 }
 
 /**
+ * One model turn, re-asked when the reply carries no content.
+ *
+ * The completion budget doubles on each attempt. A reasoning model that spent
+ * its whole allowance thinking needs more room, not another identical try, so
+ * a flat retry would mostly reproduce the failure.
+ */
+async function chatWithEmptyReplyRetry(input: {
+  provider: InferenceProvider;
+  model: string;
+  messages: InferenceMessage[];
+  maxTokens: number;
+  retries: number;
+  onRetry: () => void;
+}): Promise<Awaited<ReturnType<InferenceProvider["chat"]>>> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= input.retries; attempt++) {
+    try {
+      return await input.provider.chat({
+        model: input.model,
+        messages: input.messages,
+        maxTokens: input.maxTokens * 2 ** attempt,
+      });
+    } catch (err) {
+      if (!isEmptyReply(err)) throw err;
+      lastError = err;
+      if (attempt < input.retries) input.onRetry();
+    }
+  }
+  throw lastError;
+}
+
+/**
+ * Ask the model to conclude with whatever it already has.
+ *
+ * Strictly one attempt: it runs after the turn budget is spent, so it must not
+ * become a way to keep going. A failure here is not an error — the caller
+ * falls back to the plain budget-exhausted message.
+ */
+async function wrapUpTurn(input: {
+  provider: InferenceProvider;
+  model: string;
+  messages: InferenceMessage[];
+  maxTokens: number;
+  reason: QueryStoppedBecause;
+}): Promise<Awaited<ReturnType<InferenceProvider["chat"]>> | undefined> {
+  const fitted = fitTranscript([
+    ...input.messages,
+    {
+      role: "user",
+      content:
+        `You have run out of ${input.reason === "budget" ? "turns" : input.reason} for this question. ` +
+        "Do not write any more scripts. Reply now with a ```vana:answer``` block " +
+        "stating what you established, what you could not check, and why the " +
+        "answer is partial. If you have a number you actually computed, include " +
+        "it as `value`; if you never computed one, omit it rather than guessing.",
+    },
+  ]);
+  try {
+    return await input.provider.chat({
+      model: input.model,
+      messages: [...fitted.messages],
+      maxTokens: input.maxTokens,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Run one question to an answer.
  *
  * Never throws for an ordinary bad outcome — a budget exhaustion, a sandbox
@@ -142,11 +266,17 @@ export async function runQueryLoop(
     tools,
     model = provider.defaultModel,
     maxTurns = DEFAULT_MAX_TURNS,
+    maxTokens = DEFAULT_MAX_TOKENS,
+    emptyReplyRetries = EMPTY_REPLY_RETRIES,
     outputTailBytes = DEFAULT_OUTPUT_TAIL_BYTES,
     now = Date.now,
   } = options;
 
   const startedAt = now();
+  // `budget.toolCalls` bounds MODEL TURNS, not script executions. The two were
+  // conflated: a question that spent two turns on repair retries had two fewer
+  // left for real work, and `cost.toolCalls` reported turns that never called
+  // a tool. Both are now counted separately and both are reported.
   const turnBudget = Math.max(1, request.budget?.toolCalls ?? maxTurns);
   const wallClockMs = request.budget?.wallClockMs;
 
@@ -163,10 +293,12 @@ export async function runQueryLoop(
   ];
 
   let turns = 0;
+  let scriptRuns = 0;
   let inputTokens = 0;
   let outputTokens = 0;
   let lastScript: string | undefined;
   let repairsUsed = 0;
+  let emptyReplies = 0;
   let stoppedBecause: QueryStoppedBecause | undefined;
   const receiptIds: string[] = [];
   const violations: string[] = [];
@@ -187,10 +319,36 @@ export async function runQueryLoop(
     // Snapshot: `messages` keeps growing, and a provider that retains what it
     // was handed must not observe turns that had not happened when it was
     // called. (`fitTranscript` returns the same array when nothing is dropped.)
-    const reply = await provider.chat({
-      model,
-      messages: [...fitted.messages],
-    });
+    //
+    // An empty reply is retried rather than thrown, and each retry RAISES the
+    // completion budget. Re-asking an identical request that ran out of
+    // reasoning room would just fail again, so escalation is the point: the
+    // question is not "was it a fluke" but "was the ceiling too low".
+    let reply;
+    try {
+      reply = await chatWithEmptyReplyRetry({
+        provider,
+        model,
+        messages: [...fitted.messages],
+        maxTokens,
+        retries: emptyReplyRetries,
+        onRetry: () => {
+          emptyReplies += 1;
+        },
+      });
+    } catch (err) {
+      if (!isEmptyReply(err)) throw err;
+      // Out of retries. End with honest coverage instead of throwing out of
+      // the answerer: a question that produced nothing is a result, not a
+      // crash, and the caller still needs the coverage counters.
+      emptyReplies += 1;
+      stoppedBecause = "error";
+      finalAnswer =
+        `The model returned no content ${emptyReplies} time(s) in a row, ` +
+        `even after raising the completion budget to ${maxTokens * 2 ** emptyReplyRetries} tokens. ` +
+        `No answer was produced for this question.`;
+      break;
+    }
     inputTokens += reply.usage?.promptTokens ?? 0;
     outputTokens += reply.usage?.completionTokens ?? 0;
     if (reply.receiptId) receiptIds.push(reply.receiptId);
@@ -227,6 +385,7 @@ export async function runQueryLoop(
     // which itself runs inside the OS sandbox. The loop never holds a sandbox
     // and never sees a runnable script, so it cannot execute model code bare.
     lastScript = parsed.script;
+    scriptRuns += 1;
     const result = await tools.execute(parsed.script);
     violations.push(...result.violations);
 
@@ -260,7 +419,34 @@ export async function runQueryLoop(
 
   if (finalAnswer === undefined) {
     stoppedBecause ??= "budget";
-    finalAnswer =
+    // One wrap-up turn, outside the budget by exactly one and never retried.
+    //
+    // Hitting the ceiling used to discard everything the run had learned and
+    // return a bare "I ran out of budget", which is the least useful honest
+    // answer available: the model has usually read most of what it needed and
+    // simply not been asked to conclude. Asking it to state what it has
+    // converts a dead run into a partial answer, and coverage still reports
+    // `stoppedBecause`, so nothing here can make a partial run look complete.
+    const wrapUp = await wrapUpTurn({
+      provider,
+      model,
+      messages,
+      maxTokens,
+      reason: stoppedBecause,
+    });
+    if (wrapUp) {
+      turns += 1;
+      inputTokens += wrapUp.usage?.promptTokens ?? 0;
+      outputTokens += wrapUp.usage?.completionTokens ?? 0;
+      if (wrapUp.receiptId) receiptIds.push(wrapUp.receiptId);
+      const parsed = parseTurn(wrapUp.content);
+      if (parsed.kind === "answer") {
+        finalAnswer = parsed.answer;
+        finalCitations = parsed.citations;
+        if (parsed.value !== undefined) resultValue = parsed.value;
+      }
+    }
+    finalAnswer ??=
       "I ran out of the budget for this question before reaching an answer.";
   }
 
@@ -285,7 +471,12 @@ export async function runQueryLoop(
     citations: finalCitations,
     coverage,
     determinism: "generated",
-    cost: { toolCalls: turns, inputTokens, outputTokens },
+    cost: {
+      toolCalls: scriptRuns,
+      modelTurns: turns,
+      inputTokens,
+      outputTokens,
+    },
   };
   if (lastScript !== undefined) answer.script = lastScript;
   if (receiptIds.length > 0) answer.receiptIds = receiptIds;

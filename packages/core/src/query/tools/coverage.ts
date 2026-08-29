@@ -24,6 +24,7 @@ export class CoverageLedger {
   readonly #skipped = new Map<string, string>();
   #records = 0;
   #bytes = 0;
+  #unreadable = 0;
   #method: CoverageMethod = "full";
   #stopped: StoppedBecause | undefined;
   #enforcementNotes: string[] = [];
@@ -49,6 +50,17 @@ export class CoverageLedger {
 
   bytesRead(n: number): void {
     this.#bytes += n;
+  }
+
+  /**
+   * A record was present but carried no readable content.
+   *
+   * Counted by the runtime as the record streams past, never reported by the
+   * script — a model that says "22 were unreadable" is asserting coverage,
+   * which prompt §1 forbids.
+   */
+  unreadableRead(n: number): void {
+    this.#unreadable += n;
   }
 
   skip(scope: string, reason: string): void {
@@ -84,6 +96,7 @@ export class CoverageLedger {
       scopesScanned: scanned,
       recordsScanned: this.#records,
       bytesScanned: this.#bytes,
+      unreadable: this.#unreadable,
       scopesSkipped: [...this.#skipped].map(([scope, reason]) => ({
         scope,
         reason,

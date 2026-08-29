@@ -14,7 +14,7 @@
 import { renderProfiles } from "../profiles/index.js";
 
 /** Bump on any edit to `SYSTEM_PROMPT_TEMPLATE`. */
-export const SYSTEM_PROMPT_VERSION = "vana-query-prompt/1";
+export const SYSTEM_PROMPT_VERSION = "vana-query-prompt/2";
 
 /**
  * Verbatim from the prompt doc §4. Edit the doc and this together, or the
@@ -36,6 +36,27 @@ an average, a count, a sum, a percentage. Put the bare number there: \`6.52\`,
 not \`"6.52 hours"\`, \`"6.5"\` or \`"6,520"\`. It is the same figure your prose
 states, in machine-readable form, and it is what the number is read from.
 Omit it only when the answer genuinely is not one number.
+
+**The API.** \`vana\` is the only way to reach data. Return shapes matter:
+
+- \`await vana.scopes()\` -> \`[{scope, itemCount?, contentKind?, profile?}]\`
+- \`await vana.readAll(scope)\` -> **the records themselves**, an array of
+  the source's own row objects. Not wrapped in anything. Use this by default.
+- \`await vana.stream(scope, (item, i) => {...})\` -> count of records
+  seen. Same row objects, one at a time; for scopes too large to hold at once.
+- \`await vana.read(scope, {cursor?, maxBytes?, blockIds?})\` -> \`[{id,
+  scope, text?, json?, sizeBytes?, itemCount?}]\` — **blocks, not records.**
+  The payload is \`.json\` (parsed) or \`.text\` (raw). A bounded read, so it
+  can never support a "have I ever" answer.
+- \`await vana.search(query, {scopes?})\` -> \`[{id, scope, score, preview?}]\`.
+  Ranked, so it is a prefilter and never proof of absence.
+- \`await vana.classify(items, instruction)\` -> one result per item.
+- \`vana.note(msg)\` records a line for the operator; \`vana.result({answer,
+  citations, value})\` ends the script immediately.
+
+You are writing a **subset of JavaScript**: no \`class\`, no generators, no
+\`Intl\`, no \`require\`/\`import\`, no network. A refusal tells you exactly what
+was rejected and what to use instead.
 
 **Rules that matter more than being helpful:**
 

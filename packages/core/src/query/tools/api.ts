@@ -63,6 +63,30 @@ export interface CreatedApi {
  * never bound into the script's realm, so the script cannot read, write or
  * forge any of it (prompt §1).
  */
+/**
+ * Does this record announce that its own content could not be extracted?
+ *
+ * Exports carry this as data rather than as an error: a scanned PDF appears
+ * as an ordinary row whose text field is null and whose sibling field says
+ * why. Recognising it here, as the record streams past, is what keeps the
+ * count host-authored — the script never reports it and could not be believed
+ * if it did (prompt §1).
+ *
+ * Deliberately narrow. It requires an explicit non-empty reason, so an
+ * ordinary record that merely lacks a text field is NOT counted as unreadable;
+ * inflating this number would corrupt exactly the absence answers it exists to
+ * make honest.
+ */
+const UNREADABLE_REASON_KEYS = ["extraction_error", "extractionError"] as const;
+
+export function isUnreadableRecord(item: unknown): boolean {
+  if (typeof item !== "object" || item === null) return false;
+  const row = item as Record<string, unknown>;
+  return UNREADABLE_REASON_KEYS.some(
+    (k) => typeof row[k] === "string" && (row[k] as string).trim() !== "",
+  );
+}
+
 export function createVanaApi(
   ctx: QueryToolContext,
   deps: QueryToolDeps,
@@ -114,10 +138,13 @@ export function createVanaApi(
       spend();
       requireGranted(scope);
       const out: unknown[] = [];
+      let unreadable = 0;
       const bytes = await deps.streamScope(scope, (item) => {
+        if (isUnreadableRecord(item)) unreadable++;
         out.push(item);
       });
       coverage.recordsRead(out.length);
+      coverage.unreadableRead(unreadable);
       if (typeof bytes === "number") coverage.bytesRead(bytes);
       coverage.completeScope(scope);
       return out;
@@ -131,6 +158,9 @@ export function createVanaApi(
         blocks.reduce((n, b) => n + (b.sizeBytes ?? b.text?.length ?? 0), 0),
       );
       coverage.recordsRead(blocks.reduce((n, b) => n + (b.itemCount ?? 0), 0));
+      coverage.unreadableRead(
+        blocks.filter((b) => isUnreadableRecord(b.json)).length,
+      );
       // A bounded read is by definition not a full pass.
       coverage.partialScope(scope);
       return blocks;
@@ -140,11 +170,14 @@ export function createVanaApi(
       spend();
       requireGranted(scope);
       let n = 0;
+      let unreadable = 0;
       const bytes = await deps.streamScope(scope, async (item) => {
+        if (isUnreadableRecord(item)) unreadable++;
         await onItem(item, n);
         n++;
       });
       coverage.recordsRead(n);
+      coverage.unreadableRead(unreadable);
       if (typeof bytes === "number") coverage.bytesRead(bytes);
       coverage.completeScope(scope);
       return n;

@@ -13,6 +13,7 @@
  */
 import type { Node } from "acorn";
 import {
+  DELIBERATELY_ABSENT,
   ConfinementError,
   FORBIDDEN_IDENTIFIERS,
   readMember,
@@ -45,13 +46,13 @@ class Scope {
 
   get(name: string): unknown {
     const found = this.lookup(name);
-    if (!found) throw new ReferenceError(`${name} is not defined`);
+    if (!found) throw new ReferenceError(undefinedMessage(name));
     return found.scope.vars.get(name);
   }
 
   set(name: string, value: unknown): void {
     const found = this.lookup(name);
-    if (!found) throw new ReferenceError(`${name} is not defined`);
+    if (!found) throw new ReferenceError(undefinedMessage(name));
     found.scope.vars.set(name, value);
   }
 
@@ -92,6 +93,20 @@ const DENIED_NODES: Record<string, string> = {
   LabeledStatement: "labels are not supported",
   DebuggerStatement: "debugger is not allowed",
 };
+
+/**
+ * Why an identifier is missing.
+ *
+ * For a global we deliberately withhold, say so and name the substitute: the
+ * model gets one repair attempt, and it should not be spent working out that
+ * `Intl` is absent by design rather than by accident.
+ */
+function undefinedMessage(name: string): string {
+  const guidance = DELIBERATELY_ABSENT.get(name);
+  return guidance
+    ? `${name} is not defined. ${guidance}`
+    : `${name} is not defined`;
+}
 
 export async function evaluateProgram(
   ast: Node,

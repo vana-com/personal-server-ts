@@ -44,6 +44,16 @@ export type QueryStoppedBecause =
 export interface QueryCoverage {
   scopesScanned: string[];
   recordsScanned: number;
+  /**
+   * Bytes read across every scope this request touched.
+   *
+   * Host-authored, from the loader rather than from anything a script claims.
+   * Optional only because a run that read nothing has no figure to report —
+   * it is populated on every real read path, and was previously travelling on
+   * the runtime object while undeclared here, so no typed consumer could see
+   * it.
+   */
+  bytesScanned?: number;
   scopesSkipped: { scope: string; reason: string }[];
   /** False ⇒ the answer text must say so. Host-authored. */
   complete: boolean;
@@ -68,7 +78,15 @@ export interface QueryCoverage {
 }
 
 export interface QueryCost {
+  /** Scripts actually executed. Not the same as model turns — see below. */
   toolCalls: number;
+  /**
+   * Model turns consumed, including repair retries and the wrap-up turn.
+   *
+   * This is what `budget.toolCalls` actually bounds and what drives relay
+   * volume; `toolCalls` counts only turns that ran a script.
+   */
+  modelTurns?: number;
   inputTokens: number;
   outputTokens: number;
   usd?: number;

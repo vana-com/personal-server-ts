@@ -108,7 +108,11 @@ describe("runQueryLoop — happy path", () => {
     expect(out.coverage.complete).toBe(true);
     expect(out.coverage.recordsScanned).toBe(1030);
     expect(out.script).toContain("vana.readAll");
-    expect(out.cost.toolCalls).toBe(2);
+    // One script ran across two model turns. These were one number before and
+    // the conflation hid work: a turn spent on a repair retry looked like a
+    // tool call.
+    expect(out.cost.toolCalls).toBe(1);
+    expect(out.cost.modelTurns).toBe(2);
     expect(out.receiptIds).toEqual(["r-1", "r-1"]);
   });
 
@@ -213,8 +217,12 @@ describe("runQueryLoop — the response contract", () => {
     expect(out.answer).toContain("could not produce a valid script");
     expect(out.coverage.complete).toBe(false);
     expect(out.coverage.stoppedBecause).toBe("contractViolation");
-    // Exactly two model turns: the first attempt and the one repair.
-    expect(out.cost.toolCalls).toBe(2);
+    // Exactly two model turns: the first attempt and the one repair — and
+    // zero tool calls, because neither turn produced a runnable script. The
+    // old single counter reported "2 tool calls" for a run that never called
+    // a tool.
+    expect(out.cost.modelTurns).toBe(2);
+    expect(out.cost.toolCalls).toBe(0);
   });
 });
 

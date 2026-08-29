@@ -57,6 +57,43 @@ export const FORBIDDEN_IDENTIFIERS = new Set([
   "importScripts",
 ]);
 
+/**
+ * Globals a model plausibly reaches for that are deliberately absent, with the
+ * reason and the alternative.
+ *
+ * A bare "X is not defined" costs a whole repair turn to diagnose. Naming the
+ * substitute makes the denial actionable on the spot.
+ *
+ * **`Intl` is excluded on measured grounds, not caution.** The same script
+ * formatting the same values produced `1,234.5` and `1969-12-31` on one host
+ * and `1.234,5` and `1.1.1970` on another, purely from the ambient locale and
+ * timezone — the date itself moved by a day. Scripts here bucket records by
+ * date and join sources on it, so a host-dependent formatter would inject
+ * exactly the nondeterminism the determinism measurement exists to bound, and
+ * would do it invisibly. Formatting is presentation anyway: the answer's
+ * `value` is a bare number, so nothing about correctness needs a locale.
+ */
+export const DELIBERATELY_ABSENT = new Map<string, string>([
+  [
+    "Intl",
+    "`Intl` is not available: its output depends on the host's locale and " +
+      "timezone, which would make the same script return different numbers " +
+      "and different dates on different machines. Format manually instead — " +
+      "`toFixed(2)` for money, and build date strings from `getUTCFullYear()`, " +
+      "`getUTCMonth()` and `getUTCDate()`, or slice an ISO string.",
+  ],
+  [
+    "setTimeout",
+    "There are no timers: a script has a wall-clock budget, not a scheduler. " +
+      "Do the work directly.",
+  ],
+  [
+    "structuredClone",
+    "`structuredClone` is not available. Use `JSON.parse(JSON.stringify(x))` " +
+      "for plain data.",
+  ],
+]);
+
 export class ConfinementError extends Error {
   constructor(message: string) {
     super(message);

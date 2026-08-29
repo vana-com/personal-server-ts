@@ -126,6 +126,7 @@ function failedCoverage(
     scopesScanned: [],
     recordsScanned: 0,
     bytesScanned: 0,
+    unreadable: 0,
     scopesSkipped: [],
     complete: false,
     method: "full",
@@ -171,6 +172,7 @@ export function createSandboxToolHost(options: SandboxToolHostOptions) {
       ].sort(),
       recordsScanned: prev.recordsScanned + next.recordsScanned,
       bytesScanned: prev.bytesScanned + next.bytesScanned,
+      unreadable: prev.unreadable + next.unreadable,
       scopesSkipped: [...skipped.values()],
       complete: prev.complete && next.complete,
       // A prefiltered pass anywhere taints the request: the answer must say
@@ -229,6 +231,7 @@ export function createSandboxToolHost(options: SandboxToolHostOptions) {
           scopesScanned: [],
           recordsScanned: 0,
           bytesScanned: 0,
+          unreadable: 0,
           scopesSkipped: [],
           complete: false,
           method: "full",
