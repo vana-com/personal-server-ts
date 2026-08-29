@@ -564,6 +564,152 @@ timezone you bucketed by.
 _Field names, the single-string \`from\`/\`to\`, the full-ISO \`date\` and the absence
 of any threading field were read from the fixture generator._
 `,
+  fx: `---
+id: fx
+title: Exchange rates
+profileVersion: 1
+schemaVersion: vana-fixture-corpus/1
+scopes:
+  - fx.*
+summary: Daily USD/JPY rates, one row per day. The field is \`jpy_per_usd\` — how many JPY one USD buys — so you divide a JPY amount by it. Multiplying instead is off by a factor of ~22,000 and looks like a plausible number.
+---
+
+> **Describes the seeded fixture corpus, not a market data feed.** A real rate
+> source carries many currency pairs, bid/ask spreads and intraday ticks. This
+> has one pair and one rate per day.
+
+## Shape
+
+One JSON array, \`fx_rates.json\`. One row per day of the corpus window:
+
+| Field         | Type   | Notes                                        |
+| ------------- | ------ | -------------------------------------------- |
+| \`date\`        | string | \`YYYY-MM-DD\`. The join key.                  |
+| \`base\`        | string | Always \`USD\`.                                |
+| \`quote\`       | string | Always \`JPY\`.                                |
+| \`jpy_per_usd\` | number | How many JPY one USD buys. Four decimals.    |
+
+There is a row for **every** day in the window, so a transaction date always
+has a rate and you never need to interpolate or carry a rate forward.
+
+## The rule that matters: divide, do not multiply
+
+\`jpy_per_usd\` is quoted **JPY per one USD**. To convert a JPY amount to USD:
+
+\`\`\`js
+const usd = Math.abs(jpyAmount) / rate.jpy_per_usd;
+\`\`\`
+
+Multiplying instead produces a number roughly **22,000 times too large** on a
+rate near 150. That error does not look absurd on a single row — a ¥3,000 lunch
+becomes $448,500, which is obviously wrong, but a whole-trip total of
+"$82,000,000" reads as a formatting problem rather than an inverted rate, and a
+model that spots it often "fixes" it by dividing by 1,000 rather than by
+re-deriving the conversion.
+
+The field is named \`jpy_per_usd\` rather than \`rate\` precisely so the direction
+is stated in the data. Read the name before using the number.
+
+## Join on the transaction's own date
+
+Rates in this corpus **drift day to day** on the \`dogfood\` profile, by up to a
+few percent over a season. Converting a multi-week trip at one flat rate is
+therefore wrong even when the direction is right.
+
+\`\`\`js
+const byDate = new Map(fx.map((r) => [r.date, r.jpy_per_usd]));
+const usd = Math.abs(txn.amount) / byDate.get(txn.date);
+\`\`\`
+
+Design's requirement for spend questions is FX applied **at transaction date**,
+not at today's rate and not at an average. State the basis you used in the
+answer — "converted at each transaction's own date" — because a reader cannot
+otherwise tell which of the three you did.
+
+## Known gaps
+
+- **One currency pair only.** A transaction in any currency other than USD or
+  JPY has no rate here. Say so rather than guessing one.
+- **No intraday rates.** Everything is a daily close; a same-day pair of
+  transactions converts at one rate.
+- **No fees or card spreads.** A real card charge differs from the mid-market
+  rate by a percent or two. Do not present a converted figure as the exact
+  amount billed.
+`,
+  git: `---
+id: git
+title: Git commits
+profileVersion: 1
+schemaVersion: vana-fixture-corpus/1
+scopes:
+  - git.*
+summary: Commit rows with \`authored_at\` as a local timestamp carrying its own UTC offset. Reading the hour through \`toISOString()\` shifts every commit by the offset and can move it to the previous day, which inverts any question about what time of day someone works.
+---
+
+> **Describes the seeded fixture corpus, not a git export.** There are no
+> branches, merges, parents or diffs here — one flat list of commits.
+
+## Shape
+
+One JSON array, \`git_commits.json\`. Each row:
+
+| Field         | Type   | Notes                                              |
+| ------------- | ------ | -------------------------------------------------- |
+| \`sha\`         | string | Stable identifier. Cite it.                        |
+| \`authored_at\` | string | ISO 8601 **with a UTC offset**, e.g. \`-08:00\`.     |
+| \`repo\`        | string | One of a small set of repository names.            |
+| \`message\`     | string | One line.                                          |
+| \`additions\`   | number | Lines added.                                       |
+| \`deletions\`   | number | Lines removed.                                     |
+
+## The rule that matters: read the hour locally, not in UTC
+
+\`authored_at\` carries the offset the commit was made at. The **local wall-clock
+hour is the meaningful one** — "when does this person work" is a question about
+their day, not about UTC.
+
+\`\`\`js
+// WRONG: shifts by the offset, and can land on the previous date
+new Date(row.authored_at).getUTCHours();
+
+// RIGHT: the hour as written, before the offset
+Number(row.authored_at.slice(11, 13));
+\`\`\`
+
+Under a \`-08:00\` offset a 06:00 commit becomes 14:00 UTC; under \`+09:00\` a
+07:00 commit becomes 22:00 **the previous day**. So the mistake does not merely
+blur the answer — it can produce the exact opposite one, turning an early riser
+into a night owl, and it moves commits across date boundaries so any join to a
+daily scope silently misattributes them.
+
+## Commits are behaviour, and behaviour can contradict what was said
+
+This scope is the *measured* half of a stated-versus-measured question. If the
+text scopes contain someone describing their habits and the commit distribution
+disagrees, **report both and name the conflict** — do not pick whichever source
+you happened to read. An answer that says "you describe yourself as a night owl,
+but 62% of your commits land before 09:00" is the correct shape; one that
+reports only the percentage has dropped half the question.
+
+Note the distribution is **skewed, not degenerate**: there is a real early
+cluster plus commits spread across the working day. Report a share or a median
+hour rather than implying every commit is early.
+
+## Weekends are sparse by construction
+
+Most weekend days have no commits at all. A per-day average across a window
+that includes weekends is therefore not a working-day average. Say which you
+computed.
+
+## Known gaps
+
+- **No author field.** Every commit is the user's; there is no co-author or
+  team attribution, so "who did I work with" is unanswerable here.
+- **No branch, parent or merge structure.** Commits are a flat list, so no
+  question about branching, reverts or history rewriting can be answered.
+- **\`additions\`/\`deletions\` are unweighted line counts** with no file paths or
+  languages behind them. They are a rough size signal, not a measure of effort.
+`,
   notes: `---
 id: notes
 title: Notes
@@ -633,6 +779,82 @@ exists. Say which, and mark the coverage as prefiltered.
 
 _Field names, the single \`created\` timestamp with no modification field, and the
 filler body generation were read from the fixture generator._
+`,
+  nutrition: `---
+id: nutrition
+title: Nutrition log
+profileVersion: 1
+schemaVersion: vana-fixture-corpus/1
+scopes:
+  - nutrition.*
+summary: Self-logged food intake, \`total_kcal\` per logged day. Logging is partial and lapses on weekends, so the denominator is logged days, not calendar days. This is intake — it is not the \`total_calories\` an activity tracker reports, which is expenditure.
+---
+
+> **Describes the seeded fixture corpus, not a food-tracking export.** A real
+> export carries per-item macros, brands and portion sizes. This has meals and
+> calories.
+
+## Shape
+
+One JSON array, \`nutrition_log.json\`. **One row per logged day — days with no
+log have no row at all**:
+
+| Field        | Type    | Notes                                            |
+| ------------ | ------- | ------------------------------------------------ |
+| \`day\`        | string  | \`YYYY-MM-DD\`. The join key.                      |
+| \`entries\`    | array   | \`{meal, kcal, protein_g}\` per meal, 2–4 of them. |
+| \`total_kcal\` | number  | Sum of the day's entries. Use this.              |
+| \`complete\`   | boolean | False when fewer than 3 meals were logged.       |
+
+## The rule that matters: intake is not expenditure
+
+A question about **how much someone eats** is answered from \`total_kcal\` here.
+It is *not* answered from \`total_calories\` on an activity or Oura-style daily
+scope — that field is energy **burned**, and the two differ by hundreds of
+kilocalories in the same person on the same day.
+
+The failure is silent because both are "calories", both are plausible
+four-digit numbers, and an activity scope is usually the denser, easier source
+to reach for. A measured example from this corpus: the intake answer is
+**≈2,055 kcal** while the expenditure proxy is **≈2,403** — a ~350 kcal gap
+that reads as a believable answer to the wrong question.
+
+If you use expenditure because intake is unavailable, say which one you used.
+
+## The denominator is logged days, not days
+
+Roughly **six days in ten are logged**, and the gaps are not random — **weekend
+logging is materially worse than weekday logging**, by design. So:
+
+- Filtering a date window and dividing by the number of days in the window
+  understates intake, because unlogged days count as zero.
+- Averaging only logged days is right, but it is a **weekday-biased** average.
+  Say so when the window spans weekends.
+- Always report \`n\` — how many days actually had a log — alongside the mean.
+  A conditional question ("on days I ran more than 10km") makes this sharper:
+  many qualifying days have no log at all, and those days are not zero-calorie
+  days, they are unknown days.
+
+\`\`\`js
+const logged = days.filter((d) => byDay.has(d));
+const mean = logged.reduce((s, d) => s + byDay.get(d).total_kcal, 0) / logged.length;
+// report: mean, logged.length, and days.length - logged.length as unknown
+\`\`\`
+
+## \`complete: false\` days are partial, not light
+
+A day flagged \`complete: false\` had fewer than three meals logged — the user
+recorded breakfast and gave up. Its \`total_kcal\` is a **floor**, not a light
+day. Including them drags a mean downward; excluding them is defensible;
+silently treating them as ordinary days is not. State which you did.
+
+## Known gaps
+
+- **No timestamps within a day.** Meal ordering comes from the \`meal\` label
+  only; there is no way to ask when someone ate.
+- **No macro completeness.** \`protein_g\` is present, carbohydrate and fat are
+  not, so macro-split questions are unanswerable.
+- **No hydration, no supplements, no weight.**
 `,
   oura: `---
 id: oura

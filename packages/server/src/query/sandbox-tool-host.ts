@@ -127,6 +127,7 @@ function failedCoverage(
     recordsScanned: 0,
     bytesScanned: 0,
     unreadable: 0,
+    perScope: {},
     scopesSkipped: [],
     complete: false,
     method: "full",
@@ -156,6 +157,49 @@ export function createSandboxToolHost(options: SandboxToolHostOptions) {
    * every direction: scopes union, counters sum, and `complete` survives only
    * if every run was itself complete.
    */
+  /**
+   * Merge per-scope, then re-derive the totals.
+   *
+   * Summing bare totals across runs reintroduces at the request level exactly
+   * the double-count the single-run ledger fixes: a script that reads a scope
+   * in turn 1 and re-reads it in turn 3 covered those records once, not twice.
+   * A later run's tally for a scope therefore *replaces* an earlier one when
+   * it is larger, and scopes seen in only one run carry through untouched.
+   */
+  const mergeScopeTotals = (
+    prev: CoverageCounters,
+    next: CoverageCounters,
+  ): Pick<
+    CoverageCounters,
+    "recordsScanned" | "bytesScanned" | "unreadable" | "perScope"
+  > => {
+    const perScope: CoverageCounters["perScope"] = { ...prev.perScope };
+    for (const [scope, tally] of Object.entries(next.perScope ?? {})) {
+      const before = perScope[scope];
+      perScope[scope] = before
+        ? {
+            records: Math.max(before.records, tally.records),
+            bytes: Math.max(before.bytes, tally.bytes),
+            unreadable: Math.max(before.unreadable, tally.unreadable),
+          }
+        : tally;
+    }
+    let records = 0;
+    let bytes = 0;
+    let unreadable = 0;
+    for (const t of Object.values(perScope)) {
+      records += t.records;
+      bytes += t.bytes;
+      unreadable += t.unreadable;
+    }
+    return {
+      recordsScanned: records,
+      bytesScanned: bytes,
+      unreadable,
+      perScope,
+    };
+  };
+
   let accumulated: CoverageCounters | undefined;
 
   const merge = (next: CoverageCounters): CoverageCounters => {
@@ -170,9 +214,7 @@ export function createSandboxToolHost(options: SandboxToolHostOptions) {
       scopesScanned: [
         ...new Set([...prev.scopesScanned, ...next.scopesScanned]),
       ].sort(),
-      recordsScanned: prev.recordsScanned + next.recordsScanned,
-      bytesScanned: prev.bytesScanned + next.bytesScanned,
-      unreadable: prev.unreadable + next.unreadable,
+      ...mergeScopeTotals(prev, next),
       scopesSkipped: [...skipped.values()],
       complete: prev.complete && next.complete,
       // A prefiltered pass anywhere taints the request: the answer must say
@@ -232,6 +274,7 @@ export function createSandboxToolHost(options: SandboxToolHostOptions) {
           recordsScanned: 0,
           bytesScanned: 0,
           unreadable: 0,
+          perScope: {},
           scopesSkipped: [],
           complete: false,
           method: "full",

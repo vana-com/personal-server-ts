@@ -26,8 +26,31 @@ export type {
  * Character budget for the rendered `{{PROFILES}}` block. Profiles beyond it
  * degrade to their summary rather than being dropped, and the degradation is
  * reported so it can reach `coverage`.
+ *
+ * Sized so the **entire shipped set renders in full**, with headroom. It was
+ * 40,000 when three profiles existed; at ten the set came to 38,653 and
+ * `spotify` silently degraded — the profile carrying the measured
+ * account-data trap (a one-year export and a lifetime export share a
+ * filename) and the skip-semantics rule. Inclusion is alphabetical by id, so
+ * *which* profile degrades is arbitrary with respect to how much it is worth.
+ *
+ * Trading a measured trap for ~2k tokens inverts design §18.2, whose whole
+ * claim is that this prose is the highest-leverage artifact we ship. A test
+ * pins the shipped set below this number, so adding a profile past the
+ * headroom fails the build and forces a deliberate choice — raise the budget,
+ * or make inclusion value-aware — rather than degrading something load-bearing
+ * in silence.
+ *
+ * Raised 56k → 72k when `fx`, `nutrition` and `git` brought the set to 13,
+ * rendering 53,856 chars (~13.5k tokens). That is the **worst case only**: the
+ * budget binds on an all-scope grant, which is what the eval harness does. A
+ * real request holds a grant on a handful of scopes and renders a fraction of
+ * it. Paying ~13k tokens on a total-grant request is the right side of the
+ * trade when the alternative is dropping a rule that prevents a silently wrong
+ * answer — the `fx` profile alone is what stands between a converted total and
+ * one 22,000× off.
  */
-export const DEFAULT_PROFILE_BUDGET_CHARS = 40_000;
+export const DEFAULT_PROFILE_BUDGET_CHARS = 72_000;
 
 function parseProfile(id: string, source: string): SourceProfile {
   const label = `profile "${id}"`;

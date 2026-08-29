@@ -131,7 +131,11 @@ export function createVanaApi(
       const all = await deps.listScopes();
       // Defence in depth: even if a deps implementation over-returns, the
       // script only ever sees granted scopes.
-      return all.filter((s) => granted.has(s.scope));
+      const visible = all.filter((s) => granted.has(s.scope));
+      // Record sizes as a ceiling on partial-read totals. Advisory only: it
+      // can trim an over-count, never raise one.
+      for (const s of visible) coverage.declareSize(s.scope, s.itemCount);
+      return visible;
     },
 
     async readAll(scope) {
@@ -143,9 +147,11 @@ export function createVanaApi(
         if (isUnreadableRecord(item)) unreadable++;
         out.push(item);
       });
-      coverage.recordsRead(out.length);
-      coverage.unreadableRead(unreadable);
-      if (typeof bytes === "number") coverage.bytesRead(bytes);
+      coverage.fullPass(scope, {
+        records: out.length,
+        bytes: typeof bytes === "number" ? bytes : 0,
+        unreadable,
+      });
       coverage.completeScope(scope);
       return out;
     },
@@ -154,13 +160,14 @@ export function createVanaApi(
       spend();
       requireGranted(scope);
       const blocks = await deps.readBlocks(scope, opts);
-      coverage.bytesRead(
-        blocks.reduce((n, b) => n + (b.sizeBytes ?? b.text?.length ?? 0), 0),
-      );
-      coverage.recordsRead(blocks.reduce((n, b) => n + (b.itemCount ?? 0), 0));
-      coverage.unreadableRead(
-        blocks.filter((b) => isUnreadableRecord(b.json)).length,
-      );
+      coverage.partialPass(scope, {
+        records: blocks.reduce((n, b) => n + (b.itemCount ?? 0), 0),
+        bytes: blocks.reduce(
+          (n, b) => n + (b.sizeBytes ?? b.text?.length ?? 0),
+          0,
+        ),
+        unreadable: blocks.filter((b) => isUnreadableRecord(b.json)).length,
+      });
       // A bounded read is by definition not a full pass.
       coverage.partialScope(scope);
       return blocks;
@@ -176,9 +183,11 @@ export function createVanaApi(
         await onItem(item, n);
         n++;
       });
-      coverage.recordsRead(n);
-      coverage.unreadableRead(unreadable);
-      if (typeof bytes === "number") coverage.bytesRead(bytes);
+      coverage.fullPass(scope, {
+        records: n,
+        bytes: typeof bytes === "number" ? bytes : 0,
+        unreadable,
+      });
       coverage.completeScope(scope);
       return n;
     },

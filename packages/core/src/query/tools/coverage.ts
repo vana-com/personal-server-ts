@@ -4,6 +4,61 @@ import type {
   StoppedBecause,
 } from "./types.js";
 
+/** Records, bytes and unreadable records attributed to one scope. */
+export interface Tally {
+  records: number;
+  bytes: number;
+  unreadable: number;
+}
+
+interface ScopeTally {
+  /** Largest complete pass seen. A full pass covers the whole scope. */
+  full: Tally | undefined;
+  /** Sum of bounded reads. */
+  partial: Tally;
+  /** Scope size when the host knows it independently; a ceiling only. */
+  knownSize: number | undefined;
+}
+
+const emptyTally = (): Tally => ({ records: 0, bytes: 0, unreadable: 0 });
+
+const addTally = (a: Tally, b: Tally): Tally => ({
+  records: a.records + b.records,
+  bytes: a.bytes + b.bytes,
+  unreadable: a.unreadable + b.unreadable,
+});
+
+const maxTally = (a: Tally, b: Tally): Tally => ({
+  records: Math.max(a.records, b.records),
+  bytes: Math.max(a.bytes, b.bytes),
+  unreadable: Math.max(a.unreadable, b.unreadable),
+});
+
+/**
+ * What one scope contributes, given everything read from it.
+ *
+ * A complete pass **subsumes** any bounded read of the same scope: you cannot
+ * cover more than all of it, so the full-pass tally wins outright rather than
+ * being added to. Without a full pass, bounded reads sum — two disjoint
+ * windows really do cover more than one — but the total is capped at the
+ * scope's known size so overlapping windows cannot over-claim.
+ *
+ * The rule is deliberately asymmetric: it may *under*-report coverage (two
+ * disjoint windows over a scope of unknown size are counted honestly, but a
+ * re-read of one window is not distinguished from a new one), and it may never
+ * *over*-report it. Under-reporting weakens an absence answer; over-reporting
+ * falsifies one.
+ */
+export function effectiveFor(t: ScopeTally): Tally {
+  if (t.full) return t.full;
+  if (t.knownSize === undefined) return t.partial;
+  return {
+    records: Math.min(t.partial.records, t.knownSize),
+    bytes: t.partial.bytes,
+    unreadable: Math.min(t.partial.unreadable, t.knownSize),
+  };
+}
+
 /**
  * Host-authored coverage counters (prompt contract §1).
  *
@@ -22,15 +77,35 @@ export class CoverageLedger {
   readonly #fullyScanned = new Set<string>();
   readonly #partiallyScanned = new Set<string>();
   readonly #skipped = new Map<string, string>();
-  #records = 0;
-  #bytes = 0;
-  #unreadable = 0;
+  readonly #perScope = new Map<string, ScopeTally>();
   #method: CoverageMethod = "full";
   #stopped: StoppedBecause | undefined;
   #enforcementNotes: string[] = [];
 
   constructor(grantedScopes: readonly string[]) {
     this.#granted = new Set(grantedScopes);
+  }
+
+  #tally(scope: string): ScopeTally {
+    let t = this.#perScope.get(scope);
+    if (!t) {
+      t = { partial: emptyTally(), full: undefined, knownSize: undefined };
+      this.#perScope.set(scope, t);
+    }
+    return t;
+  }
+
+  /**
+   * The size of a scope, when the host knows it independently of any read.
+   *
+   * Used only as a ceiling: it can cap an over-count from overlapping partial
+   * reads, and it never raises a count. A wrong `itemCount` therefore cannot
+   * inflate a denominator, only fail to trim one.
+   */
+  declareSize(scope: string, itemCount: number | undefined): void {
+    if (typeof itemCount === "number" && Number.isFinite(itemCount)) {
+      this.#tally(scope).knownSize = itemCount;
+    }
   }
 
   /** A scope was streamed end to end. */
@@ -44,23 +119,31 @@ export class CoverageLedger {
     if (!this.#fullyScanned.has(scope)) this.#partiallyScanned.add(scope);
   }
 
-  recordsRead(n: number): void {
-    this.#records += n;
-  }
-
-  bytesRead(n: number): void {
-    this.#bytes += n;
+  /**
+   * A complete pass over a scope: every record was streamed.
+   *
+   * Recorded as a *maximum*, not a sum. A script that reads a scope twice —
+   * once to count, once to filter, which is ordinary code — covered the same
+   * records both times. Summing produced the live Q8 failure where a
+   * 340-document scope reported 680 scanned and 44 unreadable against 22
+   * planted, and an inflated denominator makes an absence claim look better
+   * founded than it is (design §4.3 point 1).
+   */
+  fullPass(scope: string, tally: Tally): void {
+    const t = this.#tally(scope);
+    t.full = t.full ? maxTally(t.full, tally) : tally;
   }
 
   /**
-   * A record was present but carried no readable content.
+   * A bounded read covering part of a scope.
    *
-   * Counted by the runtime as the record streams past, never reported by the
-   * script — a model that says "22 were unreadable" is asserting coverage,
-   * which prompt §1 forbids.
+   * Summed, because two windows at different cursors genuinely cover more
+   * than one — but capped at the scope's true size in {@link effectiveFor},
+   * so overlapping windows cannot push the count past what exists.
    */
-  unreadableRead(n: number): void {
-    this.#unreadable += n;
+  partialPass(scope: string, tally: Tally): void {
+    const t = this.#tally(scope);
+    t.partial = addTally(t.partial, tally);
   }
 
   skip(scope: string, reason: string): void {
@@ -87,6 +170,15 @@ export class CoverageLedger {
 
   snapshot(): CoverageCounters {
     const scanned = [...this.#fullyScanned, ...this.#partiallyScanned].sort();
+    // Totals are derived per scope and then summed, never accumulated as
+    // reads happen: that is what stops a re-read from counting twice.
+    const perScope: Record<string, Tally> = {};
+    let totals = emptyTally();
+    for (const [scope, tally] of this.#perScope) {
+      const effective = effectiveFor(tally);
+      perScope[scope] = effective;
+      totals = addTally(totals, effective);
+    }
     const everyGrantedScopeAccountedFor =
       this.#granted.size > 0 &&
       [...this.#granted].every(
@@ -94,9 +186,10 @@ export class CoverageLedger {
       );
     return {
       scopesScanned: scanned,
-      recordsScanned: this.#records,
-      bytesScanned: this.#bytes,
-      unreadable: this.#unreadable,
+      recordsScanned: totals.records,
+      bytesScanned: totals.bytes,
+      unreadable: totals.unreadable,
+      perScope,
       scopesSkipped: [...this.#skipped].map(([scope, reason]) => ({
         scope,
         reason,

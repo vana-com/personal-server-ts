@@ -79,7 +79,11 @@ describe("unreadable records are counted by the host", () => {
     // The ledger is closed over by the API factory and never bound into the
     // script's realm, so incrementing it is the only way the number moves.
     const ledger = new CoverageLedger(["documents.files"]);
-    ledger.unreadableRead(2);
+    ledger.fullPass("documents.files", {
+      records: 10,
+      bytes: 0,
+      unreadable: 2,
+    });
     expect(ledger.snapshot().unreadable).toBe(2);
     const { api } = createVanaApi(ctx, deps());
     expect(Object.keys(api)).not.toContain("coverage");

@@ -100,6 +100,18 @@ export interface CoverageCounters {
    * data is not (design §4.3 point 1).
    */
   unreadable: number;
+  /**
+   * Per-scope attribution of the totals above.
+   *
+   * Carried rather than derived so the cross-run merge can apply the same
+   * subsumption rule the single-run ledger does: a scope re-read in a later
+   * turn covers the same records, and summing bare totals across runs would
+   * reintroduce the double-count at the request level.
+   */
+  perScope: Record<
+    string,
+    { records: number; bytes: number; unreadable: number }
+  >;
   method: CoverageMethod;
   stoppedBecause?: StoppedBecause;
   /**

@@ -217,6 +217,7 @@ void main().catch((err: unknown) => {
       recordsScanned: 0,
       bytesScanned: 0,
       unreadable: 0,
+      perScope: {},
       scopesSkipped: [],
       complete: false,
       method: "full",
