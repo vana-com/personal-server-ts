@@ -1799,6 +1799,182 @@ grader was changed; the only edit under test is the rule-1 extension, applied
 identically to both arms, and it reverts with
 `git checkout becc984 -- docs/260828-query-layer-prompt.md packages/core/src/query/agent/prompt.ts packages/core/src/query/evals/answerers/stuffed-answerer.ts`.
 
+### 19.14 `vana.classify` was never wired up — and wiring it changed nothing
+
+§19.8 recorded that `vana.classify` was called in 0 of 54 runs and read that as
+a cost model that did not describe the system. Two further N=3 sweeps put the
+count at **0 of 162**, and §19.12's after-sweep added 0 of 54 more. The obvious
+hypothesis was prompt suppression: rule 8 said "`vana.classify` is expensive"
+and offered nothing on the other side of the scale. That hypothesis is wrong,
+and what is true instead is worse.
+
+**The tool has no implementation, and never had one.**
+
+`createVanaApi` throws `CAPABILITY_UNAVAILABLE` when `deps.classify` is absent
+(`tools/api.ts`). `deps` is built in exactly one non-test place —
+`runner-entry.ts`'s `buildDeps` — and that function returns four members:
+`listScopes`, `streamScope`, `readBlocks`, `search`. No `classify`, and no
+`introspect` either. The only two `classify` implementations in the repository
+are test stubs. Driven through the eval harness's own wiring, before any change:
+
+| Call                  | Outcome                                                      |
+| --------------------- | ------------------------------------------------------------ |
+| `vana.readAll(scope)` | 2,200 records                                                |
+| `vana.classify(...)`  | `CAPABILITY_UNAVAILABLE` — "classify is not registered"      |
+| `vana.search("quit")` | `SCRIPT_ERROR` — "was not resolved by the host for this run" |
+
+There is no second path where it might have been registered: nothing outside
+`scripts/query-eval-harness.ts` and the tests constructs a tool host at all, so
+the eval path _is_ the only path. **Budget was not the cause** — the harness
+passed no `classifyUsd`, and an undefined ceiling means no ceiling rather than
+a ceiling of zero.
+
+**And the model never tried.** Across the six retained agent sweeps — 279 rows,
+880 retained scripts, none elided by the retention cap — the string
+`vana.classify` appears **zero times**. The tool was simultaneously unreachable
+and unreached, and each failure hid the other: had a script attempted it once,
+the denial would have surfaced as a run error long before anyone read a counter.
+
+**Why it was not a one-line fix.** Judgement needs a model call; a model call
+needs network and a credential; and the OS sandbox denies both by construction
+— `allowedDomains: []` with `strictAllowlist: true`, and the child spawned with
+`stdio: ["ignore", "pipe", "pipe"]`. There is no egress and no channel back to
+the host mid-run. `search` has the same problem and answers it by
+precomputation, which `classify` cannot use: only the running script knows which
+items it wants judged.
+
+**What that already implies for §18.3.** §18.3 predicted semantic questions
+dominate spend through per-item `classify`, and §19.8 reported that prediction
+falsified. It was never tested. The cost model was not wrong about the system;
+it described a capability the system did not have. The same holds for the
+contract doc: `260828-query-layer-prompt.md` §5 routes **Q2, Q9, Q10 and Q15**
+through `classify`, and Q9's row carries the warning that names this corpus's
+actual Q9 failure exactly — "prefilter can miss the earliest oblique mention".
+Four questions had a prescribed solution no run could execute.
+
+**The change**, in two parts, both question-agnostic and inside one revert
+boundary.
+
+_Wiring._ `classify` becomes a deferred round trip — the shape of
+`searchResults`, resolved between runs rather than before them. The runner looks
+up `(instruction, items)` in a host-supplied `classifyResults` map; a miss ends
+the run with `CLASSIFY_DEFERRED` and carries the batch outward in the result
+frame's new `classifyRequest` field. The host judges it, caches it under the
+runner's key, and replays the same script. Replay is sound because a script only
+reads: it re-derives the same batch, finds it answered, and runs on to the next.
+Bounded at eight rounds per `execute`, cached for the life of a request, capped
+by `classifyUsd`, and an oversized batch is refused with
+`CLASSIFY_BATCH_TOO_LARGE` rather than bursting a frame — a frame cut mid-write
+costs the run all of its coverage. Verified working end to end against a stub
+judge before the sweep: two batches deferred and answered in one `execute`,
+coverage intact at 2,200 records and `complete: true`, the second turn of the
+same request paying nothing, and an unregistered host still giving the honest
+`CAPABILITY_UNAVAILABLE`.
+
+_Guidance._ Rule 8 was a cost warning with nothing opposing it. It now leads
+with the failure mode the tool exists to prevent — `filter`, `includes` and
+`search` all match wording, so they miss any record carrying the property
+without carrying its vocabulary — and keeps the cost sentence as a batching
+instruction rather than a deterrent. It names no question, scope, metric or
+planted value.
+
+`gemini-3.7-flash`, `temperature: 0`, `dogfood` @ seed 20260828, N=3, all 18
+questions, judged, same `runEval` grader. **Agent arm only:** `classify` is a
+tool call and the stuffed baseline has no tool loop, so a baseline re-run would
+have measured nothing here and was deliberately not spent.
+
+| Arm       | Before                 | After                  | Δ rows |
+| --------- | ---------------------- | ---------------------- | ------ |
+| **Agent** | 19/54, strict 16, 7 Qs | 17/54, strict 14, 8 Qs | **−2** |
+
+**Run-to-run variance is ~±3 rows, so −2 is not an effect. The change did
+nothing measurable, and it is more interesting that it did not.**
+
+**`classify` was called 0 times out of 54 — exactly as before.** Not once did a
+script write `vana.classify`, in 219 scripts across the sweep. Relay calls: 0.
+Items judged: 0. Cost: $0.00. The tool is now genuinely reachable and remains
+entirely unused, so **§18.3's cost model is still untested**: making the
+capability real was necessary to test it and was not sufficient.
+
+Every moved row, attributed:
+
+| Q       | Before | After | Reading                                          |
+| ------- | ------ | ----- | ------------------------------------------------ |
+| **Q2**  | 3/3    | 1/3   | −2, the largest single move; see below           |
+| **Q13** | 2/3    | 1/3   | −1, within noise                                 |
+| **Q8**  | 3/3    | 2/3   | −1, provider defect, not the change              |
+| **Q6**  | 2/3    | 3/3   | +1, within noise                                 |
+| **Q9**  | 0/3    | 1/3   | +1, within noise — and it did not use `classify` |
+
+Six rows moved in absolute terms across five questions, netting −2. No question
+moved by 3 or more, so none of these is separable from variance individually.
+Q8's lost row produced no script at all: three consecutive replies discarded by
+the provider with `MALFORMED_FUNCTION_CALL`, the known Gemini defect §19.12's
+diagnostic channel exists to record. Rows that produced no script at all were 2
+before and 3 after.
+
+**Q9 is the question this was built for, and it is the clearest negative
+result.** It moved 0/3 → 1/3, one row, inside the noise band — and the passing
+run **did not call `classify`**. It scanned `notes`, `slack` and
+`chatgpt.conversations` in full across five turns, worked out the shape of the
+corpus's filler sentences, and found the planted oblique mention by elimination.
+The two failing runs did what every previous sweep did: cited a later explicit
+mention. So the one row that moved is not evidence for the tool; if anything it
+is weak evidence for the rewritten rule 8's first half — the warning that a
+keyword filter misses meaning — arrived at by a route the rule did not name.
+
+**The other recall-shaped questions did not move at all.** Q5 0/3 → 0/3, Q15
+0/3 → 0/3, Q3 0/3 → 0/3, Q10 0/3 → 0/3, each failing on the same recorded
+reason as before: Q5 still admits the excluded restaurant, Q15 still names only
+one of three abandoned intentions, Q3 still declines to decompose into
+computable sub-quantities, Q10 still omits per-period coverage. **The semantic
+recall class is untouched.**
+
+**And it was not free.** Input tokens rose from 2.638M to 3.411M, **+29%**, for
+a tool that was never called. Turn count barely moved (215 → 219 scripts), so
+this is not more tool use; the median row rose 35.4k → 42.1k input tokens
+(+19%) and the tail got heavier — Q6 run 0 took 15 turns against a prior worst
+of 9, and Q17 run 0 cost 462k input tokens against a prior worst of 249k. The
+longer rules block accounts for perhaps 2% of the median rise, so the rest is
+behavioural: told that keyword filters miss things, the model scanned and
+iterated more, and bought nothing with it. Output tokens fell slightly (170k →
+156k) and wall time was flat (19.2 → 19.7 min). **A ~29% spend increase for a
+−2 row change is the honest trade recorded here.**
+
+**Verdict. The diagnosis is the result; the fix is not.** The finding worth
+keeping is that a tool documented in the prompt, specified in the API contract
+and prescribed as the solution to four separate questions had no implementation
+for the entire life of the corpus, and that no counter caught it because nothing
+ever called it. Making it real was correct on its own terms — a documented
+capability that throws is a defect regardless of whether anything scores better
+— but it moved no rows, and the guidance change that came with it cost 29% more
+input tokens for nothing. On these numbers the wiring is worth keeping and the
+rule-8 rewrite is not obviously worth its price; a cleaner experiment would
+separate them, which this one deliberately did not.
+
+**What this leaves for a human to decide, and does not decide.** §18.3's cost
+model is now testable for the first time and still untested, because the model
+does not reach for the tool even when told when to. Two readings are open:
+either judgement is genuinely unnecessary for these questions, or the agent
+cannot recognize the situations that call for it from a rule alone. Only the
+second would be an argument for standing machinery. **Plan §6's "embeddings are
+out of v1" therefore stands undisturbed here, and this section is not an
+argument to revisit it** — the design's existing answer to semantic recall was
+tested and produced no gain, but it was also never exercised, so nothing here
+shows that lexical-plus-judgement is insufficient. What it does show is that
+the next experiment on this class should make the agent's _use_ of judgement
+the variable, not its availability.
+
+Caveats. The ±3 band is inherited from prior identical-grader sweeps and was not
+re-measured. Q2, Q13, Q9, Q3, Q10 and Q15 are model-graded. Wiring and prompt
+guidance moved together, so their effects cannot be separated from this sweep.
+`classify`'s cost path is exercised only by a stub judge, never by the relay, so
+the price of real judgement remains unmeasured. `SYSTEM_PROMPT_VERSION` was left
+at `vana-query-prompt/4` despite the template changing, matching §19.12's
+precedent; a comment in `stuffed-answerer.ts` pins that string and that file was
+out of scope. No tolerance, ground truth, expected answer, rubric, fixture or
+grader was changed, and nothing here resolves an open item in plan §6.
+
 ## 20. Next
 
 1. Turn §3 into a graded question set with expected answers and coverage
