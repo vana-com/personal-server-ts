@@ -306,6 +306,20 @@ export async function runQueryLoop(
   let finalAnswer: string | undefined;
   let finalCitations: QueryCitation[] = [];
   let resultValue: number | undefined;
+  let resultResolution: string | undefined;
+  /**
+   * Why the LAST script run ended, when it ended abnormally.
+   *
+   * Kept separate from `stoppedBecause` because they answer different
+   * questions. `stoppedBecause` is "why did the run stop"; this is "did a
+   * script along the way misbehave". Conflating them made a run that errored
+   * on turn 3 and answered on turn 5 report `error` forever — it fired on
+   * 24/54 benchmark runs *including passing ones*, so it read as "something
+   * went wrong at some point" rather than a termination reason.
+   */
+  let lastRunTermination: QueryStoppedBecause | undefined;
+  /** True once the model has actually committed to an answer. */
+  let endedCleanly = false;
 
   while (turns < turnBudget) {
     if (wallClockMs !== undefined && now() - startedAt > wallClockMs) {
@@ -378,6 +392,12 @@ export async function runQueryLoop(
       // An explicit value beats prose extraction, and beats a value left over
       // from an earlier run in the same request: this is the model's final say.
       if (parsed.value !== undefined) resultValue = parsed.value;
+      if (parsed.resolution !== undefined) resultResolution = parsed.resolution;
+      // The run ended because the model answered. An abnormal termination from
+      // an earlier script is not the reason this run stopped; it stays in
+      // `violations` so the diagnosis survives.
+      stoppedBecause = undefined;
+      endedCleanly = true;
       break;
     }
 
@@ -390,13 +410,21 @@ export async function runQueryLoop(
     violations.push(...result.violations);
 
     const mapped = TERMINATION_TO_STOPPED[result.termination];
-    if (mapped) stoppedBecause = mapped;
+    if (mapped) {
+      lastRunTermination = mapped;
+      violations.push(`script run ${scriptRuns} ended: ${result.termination}`);
+    }
 
     if (result.result?.value !== undefined) resultValue = result.result.value;
+    if (result.result?.resolution !== undefined) {
+      resultResolution = result.result.resolution;
+    }
     if (result.result?.answer) {
       // `vana.result(...)` terminates the script and the run.
       finalAnswer = result.result.answer;
       finalCitations = result.result.citations ?? [];
+      stoppedBecause = undefined;
+      endedCleanly = true;
       break;
     }
 
@@ -418,7 +446,8 @@ export async function runQueryLoop(
   }
 
   if (finalAnswer === undefined) {
-    stoppedBecause ??= "budget";
+    stoppedBecause ??=
+      lastRunTermination ?? tools.coverage()?.stoppedBecause ?? "budget";
     // One wrap-up turn, outside the budget by exactly one and never retried.
     //
     // Hitting the ceiling used to discard everything the run had learned and
@@ -444,6 +473,9 @@ export async function runQueryLoop(
         finalAnswer = parsed.answer;
         finalCitations = parsed.citations;
         if (parsed.value !== undefined) resultValue = parsed.value;
+        if (parsed.resolution !== undefined) {
+          resultResolution = parsed.resolution;
+        }
       }
     }
     finalAnswer ??=
@@ -457,7 +489,15 @@ export async function runQueryLoop(
     ...hostCoverage,
     complete: hostCoverage.complete && stoppedBecause === undefined,
   };
-  if (stoppedBecause) coverage.stoppedBecause = stoppedBecause;
+  if (stoppedBecause) {
+    coverage.stoppedBecause = stoppedBecause;
+  } else if (endedCleanly) {
+    // The host merge carries the first abnormal termination it saw across the
+    // whole request and never lets a later success supersede it, so a run that
+    // recovered still reported `error`. Only the control-flow field is
+    // cleared; every counter stays exactly as the host authored it.
+    delete coverage.stoppedBecause;
+  }
   if (system.unprofiledScopes.length > 0) {
     coverage.unprofiledScopes = system.unprofiledScopes;
   }
@@ -481,5 +521,6 @@ export async function runQueryLoop(
   if (lastScript !== undefined) answer.script = lastScript;
   if (receiptIds.length > 0) answer.receiptIds = receiptIds;
   if (typeof resultValue === "number") answer.value = resultValue;
+  if (resultResolution !== undefined) answer.resolution = resultResolution;
   return answer;
 }

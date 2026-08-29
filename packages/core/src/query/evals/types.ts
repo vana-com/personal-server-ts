@@ -93,6 +93,14 @@ export interface EvalCaseResult {
     usd?: number;
   };
   actual?: number;
+  /**
+   * The set the answer says it aggregated over, verbatim.
+   *
+   * Recorded whether or not the number was right, because the two come apart:
+   * the measured failure mode is a correct computation over the wrong set, and
+   * without this the two are the same failing row.
+   */
+  resolution?: string;
 }
 
 export interface EvalClassRollup {

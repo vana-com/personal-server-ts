@@ -41,7 +41,15 @@ export interface RunOptions {
   only?: string[];
 }
 
-/** Pulls the first number out of an answer's prose, for answerers that do not set `value`. */
+/**
+ * Pulls the first number out of an answer's prose.
+ *
+ * Retained for answerers that cannot set `value` (the reference answerer), but
+ * **no longer used to grade a model answer** — see `gradeNumeric`. It scraped
+ * `29` out of "December 29" on a run that had computed 69.43 correctly, which
+ * is worse than returning nothing: it manufactures a precise-looking wrong
+ * number and files a correct run as a numeric failure.
+ */
 export function extractNumber(text: string): number | undefined {
   const match = text.replace(/,/g, "").match(/-?\d+(\.\d+)?/);
   return match ? Number(match[0]) : undefined;
@@ -53,9 +61,17 @@ function gradeNumeric(
   reasons: string[],
 ): { ok: boolean; actual?: number } {
   const { value, tolerance, denominator } = testCase.expect;
-  const actual = answer.value ?? extractNumber(answer.answer);
+  // Only an explicitly-declared `value` is graded. Scraping prose produced a
+  // date ("December 29" -> 29) on a run whose text carried the right figure,
+  // so a missing `value` is now reported as ungradeable rather than graded
+  // against whatever number happened to appear first. The prompt requires the
+  // field; failing to supply it is a contract problem, not a wrong answer.
+  const actual = answer.value;
   if (actual === undefined) {
-    reasons.push("no numeric value in answer");
+    reasons.push(
+      "ungradeable: the answer set no `value`, and grading numeric cases by " +
+        "scraping prose reads dates and window sizes as results",
+    );
     return { ok: false };
   }
   const delta = Math.abs(actual - value);
@@ -239,6 +255,9 @@ async function runCase(
     durationMs: Date.now() - started,
     cost: answer.cost,
     actual,
+    ...(answer.resolution !== undefined
+      ? { resolution: answer.resolution }
+      : {}),
   };
 }
 

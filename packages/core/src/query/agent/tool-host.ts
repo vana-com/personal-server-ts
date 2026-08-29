@@ -31,6 +31,8 @@ import type { QueryScopeInfo } from "./prompt.js";
 /** What a script passed to `vana.result(...)`, if it called it. */
 export interface QueryScriptResult {
   answer?: string;
+  /** Set resolution, when a script terminates the run via `vana.result`. */
+  resolution?: string;
   citations?: QueryCitation[];
   value?: number;
   [key: string]: unknown;

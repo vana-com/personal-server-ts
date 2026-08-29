@@ -60,6 +60,10 @@ describe("createAgentAnswerer", () => {
           answer:
             "6.52 hours over 1030 nights, main sleep only, naps excluded.",
           citations: [{ scope: "oura.sleep" }],
+          // Required by the prompt, and now the only thing numeric grading
+          // reads: scraping the prose picked dates out of sentences.
+          value: 6.52,
+          resolution: "trailing 1030 nights, main sleep only, naps excluded",
         })}\n${fence}`,
       }),
     });
@@ -92,6 +96,50 @@ describe("createAgentAnswerer", () => {
     expect(report.answerer).toBe("agent-loop-test");
     expect(report.totals.pass).toBe(1);
     expect(report.totals.fail).toBe(0);
+    expect(report.results[0]?.resolution).toContain("main sleep only");
+  });
+
+  it("reports a numeric answer with no `value` as ungradeable, not wrong", async () => {
+    // A live run computed 69.43 correctly in its prose, left `value` unset,
+    // and the old prose-scraping fallback graded it against `29` — pulled out
+    // of "December 29". A manufactured number is worse than none: it files a
+    // correct run as a numeric failure and hides the real defect.
+    const provider = createFakeInferenceProvider({
+      respond: () => ({
+        content: `${fence}vana:answer\n${JSON.stringify({
+          answer: "Your resting heart rate averaged 69.43 bpm on December 29.",
+          citations: [{ scope: "oura.sleep" }],
+        })}\n${fence}`,
+      }),
+    });
+
+    const report = await runEval({
+      cases: [
+        {
+          id: "Q11",
+          question: "Was my resting heart rate unusual last week?",
+          class: "aggregation",
+          scopes: ["oura.sleep"],
+          expect: { kind: "numeric", value: 69.43, tolerance: 0.05 },
+          mustCite: true,
+          mustReportCoverage: true,
+        },
+      ],
+      answerer: createAgentAnswerer({
+        provider,
+        tools: stubTools({ recordsScanned: 1030, complete: true }),
+        name: "agent-no-value",
+      }),
+      seed: 1,
+      profile: "small",
+    });
+
+    expect(report.totals.pass).toBe(0);
+    const reasons = report.results[0]?.reasons.join(" ") ?? "";
+    expect(reasons).toContain("ungradeable");
+    // Emphatically not graded against the scraped date.
+    expect(reasons).not.toContain("got 29");
+    expect(report.results[0]?.actual).toBeUndefined();
   });
 
   it("fails a case honestly when the host's coverage is incomplete", async () => {

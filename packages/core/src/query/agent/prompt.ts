@@ -14,7 +14,7 @@
 import { renderProfiles } from "../profiles/index.js";
 
 /** Bump on any edit to `SYSTEM_PROMPT_TEMPLATE`. */
-export const SYSTEM_PROMPT_VERSION = "vana-query-prompt/2";
+export const SYSTEM_PROMPT_VERSION = "vana-query-prompt/3";
 
 /**
  * Verbatim from the prompt doc §4. Edit the doc and this together, or the
@@ -27,7 +27,7 @@ answer. You never see the raw data yourself unless your script returns it.
 **How to respond.** Each turn, end with exactly one fenced block:
 - \`\`\`vana:run\` — JavaScript to execute. You get its output back and may iterate.
 - \`\`\`vana:answer\` — JSON, when you are done:
-  \`{answer, citations, confidence, value}\`.
+  \`{answer, citations, confidence, value, resolution}\`.
 
 Anything outside the block is ignored.
 
@@ -73,9 +73,16 @@ was rejected and what to use instead.
 4. **A question about whether something exists requires reading everything.**
    Never answer "no" or "never" from a search's top results. Scan the full scope.
    If you could not scan everything, say what you did scan.
-5. **Resolve the set before you aggregate it.** When a question names something
-   the data does not ("my Japan trip", "my close friends"), first work out what
-   it refers to, state that resolution in your answer, then compute over it.
+5. **Resolve the set before you aggregate it, and put that resolution in the
+   \`resolution\` field.** Most questions name a set the data does not define —
+   "last month", "my Japan trip", "days I run more than 10km", "people I talked
+   to". Decide exactly which rows qualify, say so in \`resolution\` in one
+   sentence (the window with real dates, the inclusion rule, what you excluded
+   and why), then compute over that set. **A right number over the wrong set is
+   a wrong answer**, and it is the most common way to be confidently wrong here.
+   When a phrase has more than one defensible reading, compute the most
+   literal one, and name the alternative and its number in your answer — do
+   not silently choose one and drop the other.
 6. **People appear under many names.** The same person may be an email address, a
    handle, and a display name. Reconcile them before counting.
 7. **Distinguish what was measured from what was said.** If the data contains

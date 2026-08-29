@@ -18,7 +18,7 @@
 import type { QueryCitation, QueryConfidence } from "./types.js";
 
 /** Bump whenever the block grammar or the answer payload shape changes. */
-export const RESPONSE_CONTRACT_VERSION = "vana-query/1";
+export const RESPONSE_CONTRACT_VERSION = "vana-query/2";
 
 export const RUN_TAG = "vana:run";
 export const ANSWER_TAG = "vana:answer";
@@ -43,6 +43,23 @@ export interface ParsedAnswer {
    * difference between a gradeable answer and a guess about one.
    */
   value?: number;
+  /**
+   * How the model resolved the set it aggregated over.
+   *
+   * Measured cause of most remaining failures: the arithmetic is right and the
+   * *set* is wrong. Q1 averaged the last full calendar month where the eval
+   * means a trailing 31 days; Q14 resolved the trip window correctly and then
+   * omitted the pre-trip flight; Q18 computed two defensible denominators and
+   * headlined the wrong one. In each case the number was a faithful
+   * computation over the wrong rows.
+   *
+   * Prompt rule 5 already required the model to state its resolution in prose.
+   * Prose is not gradeable and it is not comparable across runs, so the
+   * resolution is now a field of its own. Free text on purpose: the space of
+   * "what set did you pick" is not enumerable, and forcing it into a schema
+   * would push the model into inventing keys.
+   */
+  resolution?: string;
 }
 
 export type ContractViolation =
@@ -54,7 +71,8 @@ export type ContractViolation =
   | "answer-missing-answer-field"
   | "answer-bad-citations"
   | "answer-bad-confidence"
-  | "answer-bad-value";
+  | "answer-bad-value"
+  | "answer-bad-resolution";
 
 export interface ParseFailure {
   kind: "violation";
@@ -164,6 +182,14 @@ function readValue(value: unknown): number | undefined | null {
   return null;
 }
 
+/** How the model resolved an ambiguous set. Free text; must be non-empty. */
+function readResolution(value: unknown): string | undefined | null {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed === "" ? null : trimmed;
+}
+
 /**
  * Parse one model turn. Never throws: a malformed turn is a `violation`, which
  * the loop turns into a single repair re-prompt (prompt doc §2).
@@ -267,6 +293,17 @@ export function parseTurn(text: string): ParsedTurn {
   }
   if (value !== undefined) out.value = value;
 
+  const resolution = readResolution(rec.resolution);
+  if (resolution === null) {
+    return {
+      kind: "violation",
+      violation: "answer-bad-resolution",
+      detail:
+        "`resolution` must be a non-empty string saying which set you aggregated over",
+    };
+  }
+  if (resolution !== undefined) out.resolution = resolution;
+
   return out;
 }
 
@@ -288,7 +325,8 @@ export function repairMessage(failure: ParseFailure): string {
     "or, when you are done:",
     "",
     "```" + ANSWER_TAG,
-    '{"answer": "...", "citations": [{"scope": "..."}], "confidence": "high"}',
+    '{"answer": "...", "citations": [{"scope": "..."}], "confidence": "high",',
+    ' "value": 1.23, "resolution": "which set you aggregated over"}',
     "```",
     "",
     "Anything outside the block is ignored. Do not explain this message.",

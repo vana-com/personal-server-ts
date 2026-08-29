@@ -102,6 +102,14 @@ export interface QueryAnswer {
   cost: QueryCost;
   /** The numeric result when the answer has one. */
   value?: number;
+  /**
+   * How the model resolved the set it aggregated over, when the question named
+   * one the data does not define. Graded separately from the number: a run
+   * that resolves the set differently but *states* the resolution is a
+   * different outcome from one that silently picked wrong, and until this
+   * field existed both rendered as the same failing row.
+   */
+  resolution?: string;
   /** Relay receipt ids seen across the run (`x-receipt-id`). */
   receiptIds?: string[];
 }
