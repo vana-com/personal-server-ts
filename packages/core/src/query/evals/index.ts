@@ -49,6 +49,8 @@ export { CORPUS_DAYS, CORPUS_START_MS } from "./fixtures/time.js";
 
 export * as planted from "./fixtures/planted.js";
 export * as reference from "./reference/compute.js";
+export * as semantic from "./reference/semantic.js";
+export * as prose from "./fixtures/prose.js";
 
 export { createReferenceAnswerer } from "./answerers/reference-answerer.js";
 export { createNullAnswerer } from "./answerers/null-answerer.js";

@@ -532,13 +532,36 @@ export async function tripReference(
   const start = dayIso(Q14_TRIP_START_DAY);
   const end = dayIso(Q14_TRIP_END_DAY);
 
+  /*
+   * Rates come from the corpus, exactly as a script would read them.
+   *
+   * `fx_rates.json` is emitted for every profile so Q14 stops requiring a
+   * model to guess a constant only the grader knows. On `small`/`full`/`lite`
+   * the series is flat at `Q14_JPY_PER_USD`, so this computes the identical
+   * total it always did; on `dogfood` it drifts by date, which is what design
+   * §3 Q14 means by "FX applied at transaction date". The fallback keeps the
+   * function working against a corpus generated before the scope existed.
+   */
+  const files = await source.list();
+  const rateByDate = new Map<string, number>();
+  if (files.includes("fx_rates.json")) {
+    for (const r of await readJson<{ date: string; jpy_per_usd: number }[]>(
+      source,
+      "fx_rates.json",
+    )) {
+      rateByDate.set(r.date, r.jpy_per_usd);
+    }
+  }
+  const rateOn = (date: string): number =>
+    rateByDate.get(date) ?? Q14_JPY_PER_USD;
+
   let inWindow = 0;
   let jpyCount = 0;
   for (const row of rows) {
     if (row.date < start || row.date > end) continue;
     const usd =
       row.currency === "JPY"
-        ? Math.abs(row.amount) / Q14_JPY_PER_USD
+        ? Math.abs(row.amount) / rateOn(row.date)
         : Math.abs(row.amount);
     if (row.currency === "JPY") jpyCount++;
     inWindow += usd;

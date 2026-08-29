@@ -34,6 +34,21 @@ import {
   spreadTimestamps,
 } from "./time.js";
 import { PEOPLE, paragraph, sentence, FILLER_WORDS } from "./text.js";
+import {
+  FOCUS_LOUD_TOPIC,
+  FOCUS_REAL_TOPIC,
+  FOCUS_WEEK_DAYS,
+  INTENTIONS,
+  MORNING_CLAIMS,
+  MORNING_COMMIT_PEAK_HOUR,
+  MORNING_COMMIT_SHARE,
+  SARAH_JOHNSON_FACTS,
+  SARAH_NGUYEN_FACTS,
+  TOPIC_ARCS,
+  arcLineForDay,
+  proseParagraph,
+  proseSentence,
+} from "./prose.js";
 import type { FixtureProfile } from "./profiles.js";
 import { DEFAULT_SEED, PROFILES, type FixtureProfileName } from "./profiles.js";
 import {
@@ -53,11 +68,16 @@ import {
   type OuraSleepType,
   Q11_ANOMALY_BPM_OFFSET,
   Q11_ANOMALY_DAYS,
+  Q18_DISTANCE_THRESHOLD_M,
   Q14_FLIGHT_AMOUNT_USD,
   Q14_FLIGHT_CHARGE_LEAD_DAYS,
   Q14_FLIGHT_MERCHANT,
   Q14_TRIP_END_DAY,
   Q14_TRIP_START_DAY,
+  Q14_JPY_PER_USD,
+  FX_BASE_CURRENCY,
+  FX_DRIFT_AMPLITUDE,
+  FX_DRIFT_PERIOD_DAYS,
   Q5_CHANNEL,
   Q5_DAY_INDEX,
   Q5_DECOYS,
@@ -71,6 +91,9 @@ import {
 
 /** Scope names, as a consumer's grant would express them. */
 export const SCOPES = {
+  fx: "fx.rates",
+  nutrition: "nutrition.log",
+  commits: "git.commits",
   ouraSleep: "oura.sleep",
   ouraDailySleep: "oura.daily_sleep",
   ouraWorkout: "oura.workout",
@@ -93,6 +116,56 @@ export interface CorpusManifest {
   seed: number;
   profile: FixtureProfileName;
   scopes: { scope: string; files: string[]; records: number }[];
+}
+
+/* ------------------------------------------------------------------ */
+/* Semantic injection (dogfood only)                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * How often a text record carries an arc line rather than background prose.
+ *
+ * Deliberately low. An arc that shows up in a quarter of all notes is not a
+ * topic a model has to *find*, it is a topic it trips over — which would make
+ * Q9 and Q10 easy for the wrong reason. At 4% the arcs are a few dozen records
+ * inside thousands, which is the needle-ish density the questions assume.
+ */
+const ARC_LINE_CHANCE = 0.04;
+/** Stated intentions and morning claims are rarer still — a handful each. */
+const INTENTION_CHANCE = 0.012;
+const MORNING_CLAIM_CHANCE = 0.006;
+const PERSON_FACT_CHANCE = 0.014;
+
+/**
+ * The semantic content for one record on one day, or undefined for background.
+ *
+ * Centralised so every text source draws from the same pool in the same way —
+ * the arcs have to appear in notes *and* chat *and* slack for Q9's "order by
+ * time across sources" to mean anything, and a per-source copy of this logic
+ * would drift.
+ */
+function semanticLine(rng: Rng, dayIndex: number): string | undefined {
+  if (rng.chance(ARC_LINE_CHANCE)) {
+    const arc = rng.pick(TOPIC_ARCS);
+    const line = arcLineForDay(rng, arc, dayIndex);
+    if (line) return line;
+  }
+  if (rng.chance(INTENTION_CHANCE)) {
+    return rng.pick(rng.pick(INTENTIONS).stated);
+  }
+  if (rng.chance(MORNING_CLAIM_CHANCE)) {
+    return rng.pick(MORNING_CLAIMS);
+  }
+  if (rng.chance(PERSON_FACT_CHANCE)) {
+    const facts = rng.chance(0.75) ? SARAH_JOHNSON_FACTS : SARAH_NGUYEN_FACTS;
+    return rng.pick(facts).text;
+  }
+  return undefined;
+}
+
+/** Is this day inside the final week — the window Q2 asks about? */
+function inFocusWeek(dayIndex: number): boolean {
+  return dayIndex >= CORPUS_DAYS - FOCUS_WEEK_DAYS;
 }
 
 /** Sleep: main period 4.5–8.5h, naps 0.4–1.4h. */
@@ -164,10 +237,13 @@ export async function generateCorpus(
     ["oura_daily_sleep.json"],
     await writeDailySleep(sink, rng("oura.dailysleep"), profile),
   );
+  // Collected while workouts are written so the nutrition log can raise intake
+  // on heavy training days. Empty for profiles that emit no nutrition log.
+  const highMileageDays = new Set<string>();
   record(
     SCOPES.ouraWorkout,
     ["oura_workout.json"],
-    await writeWorkouts(sink, rng("oura.workout"), profile),
+    await writeWorkouts(sink, rng("oura.workout"), profile, highMileageDays),
   );
   record(
     SCOPES.ouraHeartRate,
@@ -229,6 +305,26 @@ export async function generateCorpus(
     await writeDocuments(sink, rng("documents"), profile),
   );
 
+  // Emitted for EVERY profile: without a rate the script can read, Q14 asks a
+  // model to guess a constant that exists only in the grader. A new scope adds
+  // no draw to any existing stream, so no committed number moves.
+  record(SCOPES.fx, ["fx_rates.json"], await writeFxRates(sink, profile));
+
+  // New scopes rather than changes to existing ones, so no committed trap
+  // number moves. Only the dogfood profile emits them.
+  if (profile.extraSources) {
+    record(
+      SCOPES.nutrition,
+      ["nutrition_log.json"],
+      await writeNutrition(sink, rng("nutrition"), profile, highMileageDays),
+    );
+    record(
+      SCOPES.commits,
+      ["git_commits.json"],
+      await writeCommits(sink, rng("commits"), profile),
+    );
+  }
+
   return { seed, profile: profile.name, scopes };
 }
 
@@ -264,6 +360,29 @@ function offsetForDay(dayIndex: number): string {
   return dayIndex >= Q14_TRIP_START_DAY && dayIndex <= Q14_TRIP_END_DAY
     ? TRIP_UTC_OFFSET
     : HOME_UTC_OFFSET;
+}
+
+/**
+ * A UTC instant that `localIso` will render at the given **local** wall-clock
+ * hour.
+ *
+ * `localIso` shifts a UTC instant by the offset before formatting, so naming a
+ * local hour means pre-compensating for it. Getting this backwards is not a
+ * cosmetic bug: Q16 asks whether the user is a morning person, and an
+ * uncompensated 06:00 renders as 22:00 the previous evening under `-08:00` —
+ * which would make the corpus assert the exact opposite of what it intends and
+ * grade a correct answer wrong.
+ */
+function atLocalHour(
+  dayIndex: number,
+  hour: number,
+  minute: number,
+  offset: string,
+): number {
+  const sign = offset.startsWith("-") ? -1 : 1;
+  const [h, m] = offset.slice(1).split(":").map(Number);
+  const offsetMs = sign * ((h! * 60 + m!) * 60_000);
+  return dayStartMs(dayIndex) + (hour * 60 + minute) * 60_000 - offsetMs;
 }
 
 function* sleepRecords(
@@ -433,6 +552,16 @@ async function writeWorkouts(
   sink: FixtureSink,
   rng: Rng,
   profile: FixtureProfile,
+  /**
+   * Days whose (deduped) run cleared the Q18 threshold, collected as they are
+   * written. The nutrition log reads this so intake can rise on heavy training
+   * days — without it Q18's answer is indistinguishable from noise, since the
+   * two means land within 20 kcal of each other.
+   *
+   * An out-param rather than a changed return type: it adds no rng draw and no
+   * emitted field, so `small`/`full`/`lite` stay byte-identical.
+   */
+  highMileageDays?: Set<string>,
 ): Promise<number> {
   function* rows(): Generator<Record<string, unknown>> {
     for (let d = 0; d < profile.sleepDays; d++) {
@@ -448,6 +577,11 @@ async function writeWorkouts(
         start_datetime: localIso(startMs, offsetForDay(d)),
         end_datetime: localIso(startMs + durationS * 1000, offsetForDay(d)),
       };
+      // The autodetected row is the one the dedup rule keeps, so it is the one
+      // that decides whether the day qualifies.
+      if (highMileageDays && distanceM > Q18_DISTANCE_THRESHOLD_M) {
+        highMileageDays.add(base.day);
+      }
       yield { id: `w${d}_auto`, ...base, source: "autodetected" };
       if (rng.chance(OURA_WORKOUT_DUPLICATE_CHANCE)) {
         // Same session, logged by hand as well. Distance differs slightly.
@@ -659,7 +793,18 @@ type ChatContent = {
 };
 
 /** One message's content, exercising the nullable/dict shapes real exports carry. */
-function chatContent(rng: Rng, sentences: number): ChatContent {
+function chatContent(
+  rng: Rng,
+  sentences: number,
+  /** Dogfood only: a semantic line to lead with, if one was drawn for this day. */
+  lead?: string,
+  semantic = false,
+): ChatContent {
+  const text = (): string =>
+    semantic
+      ? [lead, proseParagraph(rng, sentences)].filter(Boolean).join(" ")
+      : paragraph(rng, sentences);
+
   if (rng.chance(CHATGPT_NULL_PARTS_CHANCE)) {
     return { content_type: "text", parts: null };
   }
@@ -673,11 +818,11 @@ function chatContent(rng: Rng, sentences: number): ChatContent {
           content_type: "image_asset_pointer",
           asset_pointer: `file-service://${rng.int(1e9)}`,
         },
-        paragraph(rng, sentences),
+        text(),
       ],
     };
   }
-  return { content_type: "text", parts: [paragraph(rng, sentences)] };
+  return { content_type: "text", parts: [text()] };
 }
 
 /** Design §12.3: edits/regenerations are sibling children, not overwrites. */
@@ -708,10 +853,17 @@ async function writeConversations(
       // Messages inside a conversation are minutes apart, not conversations apart.
       let cursor = startMs;
 
+      const convDay = Math.floor((startMs - dayStartMs(0)) / DAY_MS);
       for (let t = 0; t < turns; t++) {
         cursor += rng.between(120_000, 480_000);
         const id = `n${c}_${t}`;
         const role = t % 2 ? "assistant" : "user";
+        // Only the user's own turns carry the arcs — an assistant reply is not
+        // evidence of what the user thinks, and Q9/Q16 turn on the user's words.
+        const lead =
+          profile.semanticProse && role === "user"
+            ? semanticLine(rng, convDay)
+            : undefined;
         mapping[id] = {
           id,
           message: {
@@ -722,7 +874,12 @@ async function writeConversations(
             create_time: rng.chance(CHATGPT_NULL_CREATE_TIME_CHANCE)
               ? null
               : cursor / 1000,
-            content: chatContent(rng, role === "user" ? 1 : 3),
+            content: chatContent(
+              rng,
+              role === "user" ? 1 : 3,
+              lead,
+              profile.semanticProse,
+            ),
             metadata: {},
           },
           parent: last,
@@ -740,7 +897,11 @@ async function writeConversations(
               id: sib,
               author: { role },
               create_time: (cursor + 1000) / 1000,
-              content: chatContent(rng, 2),
+              // Abandoned branches deliberately carry no arc line. If they did,
+              // a naive `mapping.values()` flatten could surface an "earliest
+              // mention" the user never actually sent, and Q9's ground truth
+              // would depend on which reconstruction the reader used.
+              content: chatContent(rng, 2, undefined, profile.semanticProse),
               metadata: {},
             },
             parent: last,
@@ -811,11 +972,48 @@ async function writeSlack(
   function* messages(): Generator<Record<string, unknown>> {
     for (let i = 0; i < timestamps.length; i++) {
       const override = planted.get(i);
+      if (override) {
+        yield {
+          ts: (timestamps[i]! / 1000).toFixed(6),
+          user: override.user,
+          channel: override.channel,
+          text: override.text,
+        };
+        continue;
+      }
+      if (!profile.semanticProse) {
+        yield {
+          ts: (timestamps[i]! / 1000).toFixed(6),
+          user: rng.pick(aliases),
+          channel: rng.pick(SLACK_CHANNELS),
+          text: sentence(rng),
+        };
+        continue;
+      }
+
+      const ts = timestamps[i]!;
+      const dayIndex = Math.floor((ts - dayStartMs(0)) / DAY_MS);
+      // Q2's trap: in the final week Slack is dominated by a high-volume,
+      // low-substance thread that is *not* what the week was about. A
+      // volume-weighted answer picks this; the defensible answer does not.
+      const focus = inFocusWeek(dayIndex);
+      const loud = focus && rng.chance(0.72);
+      // A little real-topic chatter survives in Slack, so the trap is "22
+      // messages about the office move against 3 about the cutover" rather
+      // than a total absence. A zero would make the ratio infinite and let a
+      // case pass by noticing the real topic is missing from Slack entirely,
+      // which is not the discrimination Q2 is asking for.
+      const realChatter = focus && !loud && rng.chance(0.35);
+      const text = loud
+        ? rng.pick(FOCUS_LOUD_TOPIC.lines)
+        : realChatter
+          ? rng.pick(FOCUS_REAL_TOPIC.lines)
+          : (semanticLine(rng, dayIndex) ?? proseSentence(rng));
       yield {
-        ts: (timestamps[i]! / 1000).toFixed(6),
-        user: override ? override.user : rng.pick(aliases),
-        channel: override ? override.channel : rng.pick(SLACK_CHANNELS),
-        text: override ? override.text : sentence(rng),
+        ts: (ts / 1000).toFixed(6),
+        user: rng.pick(aliases),
+        channel: loud ? "#office-move" : rng.pick(SLACK_CHANNELS),
+        text,
       };
     }
   }
@@ -839,15 +1037,70 @@ async function writeEmail(
       deadDayChance: 0.02,
     }),
   ];
+  /** Open threads a later message can reply into. Dogfood only. */
+  const threads: { id: string; subject: string }[] = [];
+
   function* rows(): Generator<Record<string, unknown>> {
     for (let i = 0; i < timestamps.length; i++) {
+      const ts = timestamps[i]!;
+      if (!profile.semanticProse) {
+        yield {
+          id: `m${i}`,
+          date: iso(ts),
+          from: rng.pick(aliases),
+          to: rng.pick(aliases),
+          subject: sentence(rng).slice(0, 60),
+          body: paragraph(rng, 3 + rng.int(6)),
+        };
+        continue;
+      }
+
+      const dayIndex = Math.floor((ts - dayStartMs(0)) / DAY_MS);
+      const carried = semanticLine(rng, dayIndex);
+      const body = [carried, proseParagraph(rng, 3 + rng.int(5))]
+        .filter(Boolean)
+        .join(" ");
+
+      /*
+       * Threading and multiple recipients.
+       *
+       * Without these, email is a pile of unrelated one-to-one messages:
+       * no `thread_id`, no `In-Reply-To`, subjects that never repeat, and a
+       * single `to`. Any conversation-shaped question is then unanswerable,
+       * and so is anything about group mail or Cc. Roughly a third of
+       * messages continue an existing thread, which is the shape a real
+       * mailbox has.
+       */
+      const reply = threads.length > 0 && rng.chance(0.34);
+      const thread = reply
+        ? rng.pick(threads)
+        : (() => {
+            const t = {
+              id: `t${i}`,
+              subject: (carried ?? proseSentence(rng)).slice(0, 60),
+            };
+            // Bounded so late messages do not reply into the whole history.
+            threads.push(t);
+            if (threads.length > 40) threads.shift();
+            return t;
+          })();
+
+      const to = [rng.pick(aliases)];
+      if (rng.chance(0.22)) to.push(rng.pick(aliases));
+      const cc = rng.chance(0.18) ? [rng.pick(aliases)] : [];
+
       yield {
         id: `m${i}`,
-        date: iso(timestamps[i]!),
+        date: iso(ts),
         from: rng.pick(aliases),
-        to: rng.pick(aliases),
-        subject: sentence(rng).slice(0, 60),
-        body: paragraph(rng, 3 + rng.int(6)),
+        // Arrays, not strings: group mail and Cc are ordinary, and a
+        // recipient-counting question cannot be asked of a single string.
+        to,
+        cc,
+        thread_id: thread.id,
+        in_reply_to: reply ? `${thread.id}-prev` : null,
+        subject: reply ? `Re: ${thread.subject}` : thread.subject,
+        body,
       };
     }
   }
@@ -936,15 +1189,52 @@ async function writeCalendar(
       const dayIndex = Math.floor((ts - dayStartMs(0)) / DAY_MS);
       const inTrip =
         dayIndex >= Q14_TRIP_START_DAY && dayIndex <= Q14_TRIP_END_DAY;
-      yield {
-        start: iso(ts),
-        end: iso(ts + 3_600_000),
+      let title: string;
+      if (inTrip) {
         // The trip is nameable from the calendar, which is how Q14's date range
         // is resolvable at all.
-        title: inTrip
-          ? "Japan trip — out of office"
-          : sentence(rng).slice(0, 40),
-        attendees: [rng.pick(aliases), rng.pick(aliases)],
+        title = "Japan trip — out of office";
+      } else if (!profile.semanticProse) {
+        title = sentence(rng).slice(0, 40);
+      } else if (inFocusWeek(dayIndex) && rng.chance(0.6)) {
+        // Q2's defensible evidence: the focus week's calendar hours go to the
+        // real topic even though Slack volume says otherwise.
+        title = `${FOCUS_REAL_TOPIC.label} — working session`;
+      } else if (rng.chance(0.03)) {
+        // Q15's follow-through: only the kept intentions get calendar evidence.
+        const kept = INTENTIONS.filter((i) => i.followedThrough);
+        title = `${rng.pick(kept).anchor} — booked`;
+      } else {
+        title = proseSentence(rng).slice(0, 50);
+      }
+      /*
+       * Duration and group size vary only on dogfood.
+       *
+       * Every event being exactly one hour with exactly two attendees makes
+       * "most of your calendar hours" degenerate — hours and event counts
+       * become the same number — and group-size questions unanswerable. The
+       * focus week's working sessions are deliberately long, which is what
+       * gives Q2 a defensible hours-based answer against Slack volume.
+       */
+      const durationMin = !profile.semanticProse
+        ? 60
+        : inFocusWeek(dayIndex) && title.includes(FOCUS_REAL_TOPIC.label)
+          ? rng.pick([90, 120, 180])
+          : rng.pick([15, 30, 30, 45, 60, 60, 90]);
+      const attendeeCount = !profile.semanticProse
+        ? 2
+        : rng.chance(0.18)
+          ? rng.between(3, 7)
+          : rng.between(1, 2);
+      const attendees: string[] = [];
+      for (let a = 0; a < attendeeCount; a++) attendees.push(rng.pick(aliases));
+
+      yield {
+        start: iso(ts),
+        end: iso(ts + durationMin * 60_000),
+        duration_minutes: durationMin,
+        title,
+        attendees,
         status: rng.pick(["accepted", "declined", "tentative"]),
       };
     }
@@ -988,15 +1278,205 @@ async function writeNotes(
   ];
   function* rows(): Generator<Record<string, unknown>> {
     for (let i = 0; i < timestamps.length; i++) {
+      const ts = timestamps[i]!;
+      if (!profile.semanticProse) {
+        yield {
+          id: `note${i}`,
+          created: iso(ts),
+          title: sentence(rng).slice(0, 40),
+          body: paragraph(rng, 6 + rng.int(14)),
+        };
+        continue;
+      }
+
+      const dayIndex = Math.floor((ts - dayStartMs(0)) / DAY_MS);
+      const carried = semanticLine(rng, dayIndex);
+      // The focus week's real topic lives in notes and calendar, not in the
+      // Slack volume — that asymmetry is the whole of Q2.
+      const focus =
+        inFocusWeek(dayIndex) && rng.chance(0.55)
+          ? rng.pick(FOCUS_REAL_TOPIC.lines)
+          : undefined;
+      const lead = focus ?? carried;
+      const body = [
+        lead,
+        proseParagraph(rng, 4 + rng.int(8)),
+        // A second arc line sometimes lands later in the same note, so the
+        // topic is not always the first thing on the page.
+        rng.chance(0.15) ? semanticLine(rng, dayIndex) : undefined,
+      ]
+        .filter(Boolean)
+        .join(" ");
+
       yield {
         id: `note${i}`,
-        created: iso(timestamps[i]!),
-        title: sentence(rng).slice(0, 40),
-        body: paragraph(rng, 6 + rng.int(14)),
+        created: iso(ts),
+        title: (lead ?? proseSentence(rng)).slice(0, 60),
+        body,
       };
     }
   }
   return writeJsonArray(sink, "notes.json", rows());
+}
+
+/* ------------------------------------------------------------------ */
+/* FX rates — what makes Q14 answerable rather than clairvoyant         */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The JPY/USD rate for a given day.
+ *
+ * Flat outside the dogfood profile so the committed Q14 total does not move;
+ * a slow sinusoidal drift inside it, which is what "FX at transaction date"
+ * means. Deterministic in both cases — no rng draw, so this cannot perturb
+ * any stream.
+ */
+export function jpyPerUsdOnDay(dayIndex: number, drift: boolean): number {
+  if (!drift) return Q14_JPY_PER_USD;
+  const phase = (2 * Math.PI * dayIndex) / FX_DRIFT_PERIOD_DAYS;
+  const rate = Q14_JPY_PER_USD * (1 + FX_DRIFT_AMPLITUDE * Math.sin(phase));
+  // Four decimals: enough precision that a per-date sum is exactly
+  // reproducible, and the shape a real rate feed publishes.
+  return Number(rate.toFixed(4));
+}
+
+/**
+ * A rate table the script can actually read.
+ *
+ * One row per day of the corpus window, so a script can join on transaction
+ * date rather than guessing a constant.
+ */
+async function writeFxRates(
+  sink: FixtureSink,
+  profile: FixtureProfile,
+): Promise<number> {
+  function* rows(): Generator<Record<string, unknown>> {
+    for (let d = 0; d < CORPUS_DAYS; d++) {
+      yield {
+        date: dayIso(d),
+        base: FX_BASE_CURRENCY,
+        quote: "JPY",
+        // "How many JPY one USD buys" — named explicitly, because inverting a
+        // rate is the classic silent error and the field name is the only
+        // thing standing between a correct answer and one 22,000x wrong.
+        jpy_per_usd: jpyPerUsdOnDay(d, profile.driftingFxRates),
+      };
+    }
+  }
+  return writeJsonArray(sink, "fx_rates.json", rows());
+}
+
+/* ------------------------------------------------------------------ */
+/* Nutrition — the intake source Q18 actually asks about                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Q18 asks how many calories the user *eats* on high-mileage days. The corpus
+ * had no intake source, so the case stood on `oura_activity.total_calories` —
+ * an expenditure figure — as a proxy. That is a different question with a
+ * similar-sounding name, and on a run day the two move in opposite directions.
+ *
+ * Logging is partial on purpose (design §3 Q18: "a sparse left side"), and the
+ * gaps are not random: they cluster on weekends, the way real logging lapses.
+ * The honest answer has to state its `n`, because `n` is not the number of days
+ * in the window.
+ */
+async function writeNutrition(
+  sink: FixtureSink,
+  rng: Rng,
+  profile: FixtureProfile,
+  highMileageDays: ReadonlySet<string>,
+): Promise<number> {
+  function* rows(): Generator<Record<string, unknown>> {
+    for (let d = 0; d < profile.sleepDays; d++) {
+      const dow = new Date(dayStartMs(d)).getUTCDay();
+      const weekend = dow === 0 || dow === 6;
+      // Weekend logging is materially worse than weekday logging.
+      const logged = rng.chance(
+        weekend ? profile.nutritionCoverage * 0.55 : profile.nutritionCoverage,
+      );
+      if (!logged) continue;
+
+      const day = dayIso(d);
+      // Intake rises on heavy training days. Without this the run-day and
+      // other-day means land within 20 kcal of each other and Q18's answer is
+      // indistinguishable from noise — the case would grade a model on a
+      // difference that is not there. 14% is a realistic post-long-run bump,
+      // large enough to be detectable and small enough that a careless
+      // aggregate still gets it wrong.
+      const bump = highMileageDays.has(day) ? 1.14 : 1;
+      const meals = rng.between(2, 4);
+      let total = 0;
+      const entries: Record<string, unknown>[] = [];
+      for (let m = 0; m < meals; m++) {
+        const kcal = Math.round(rng.range(280, 900) * bump);
+        total += kcal;
+        entries.push({
+          meal: ["breakfast", "lunch", "dinner", "snack"][m] ?? "snack",
+          kcal,
+          protein_g: Math.round(kcal * rng.range(0.04, 0.09)),
+        });
+      }
+      yield {
+        day,
+        entries,
+        total_kcal: total,
+        // Partial days happen: the user logged breakfast and gave up. Flagged
+        // so a careful answer can exclude them rather than averaging them in.
+        complete: meals >= 3,
+      };
+    }
+  }
+  return writeJsonArray(sink, "nutrition_log.json", rows());
+}
+
+/* ------------------------------------------------------------------ */
+/* Commits — the measured half of Q16                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Q16 ("am I a morning person?") is graded on noticing that stated and measured
+ * evidence disagree. `prose.ts` supplies the stated half — the user says, more
+ * than once, that they are not a morning person. This is the rebuttal: a commit
+ * stream clustered hard in the early morning.
+ *
+ * The disagreement is the point. A system that reads only text says no; one that
+ * only aggregates says yes; the design asks for both, reported as a conflict.
+ */
+async function writeCommits(
+  sink: FixtureSink,
+  rng: Rng,
+  profile: FixtureProfile,
+): Promise<number> {
+  const perDay = Math.max(1, Math.round(profile.commits / profile.sleepDays));
+  function* rows(): Generator<Record<string, unknown>> {
+    let n = 0;
+    for (let d = 0; d < profile.sleepDays && n < profile.commits; d++) {
+      const dow = new Date(dayStartMs(d)).getUTCDay();
+      if (dow === 0 || dow === 6 ? rng.chance(0.75) : false) continue;
+      const count = rng.between(0, perDay * 2);
+      for (let i = 0; i < count && n < profile.commits; i++, n++) {
+        // Most commits land in the early-morning cluster; the rest are spread
+        // across the working day so the distribution is skewed, not degenerate.
+        const hour = rng.chance(MORNING_COMMIT_SHARE)
+          ? MORNING_COMMIT_PEAK_HOUR + rng.int(2)
+          : 11 + rng.int(10);
+        const offset = offsetForDay(d);
+        const ts = atLocalHour(d, hour, rng.int(60), offset);
+        yield {
+          sha: `${(n + 0x1000000).toString(16)}${rng.int(1e6).toString(16)}`,
+          authored_at: localIso(ts, offset),
+          repo: rng.pick(["personal-server", "data-gateway", "notes"]),
+          message: inFocusWeek(d)
+            ? `${FOCUS_REAL_TOPIC.anchor}: ${proseSentence(rng).toLowerCase()}`
+            : proseSentence(rng).toLowerCase(),
+          additions: rng.int(400),
+          deletions: rng.int(200),
+        };
+      }
+    }
+  }
+  return writeJsonArray(sink, "git_commits.json", rows());
 }
 
 /* ------------------------------------------------------------------ */

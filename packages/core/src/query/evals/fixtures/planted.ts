@@ -273,3 +273,34 @@ export const Q14_FLIGHT_MERCHANT = "DELTA AIR 006";
 export const Q14_FLIGHT_AMOUNT_USD = 1418.6;
 /** Fixed rate so the expected total is exact rather than rate-source dependent. */
 export const Q14_JPY_PER_USD = 149.5;
+
+/**
+ * The rate has to be *in the corpus*, not only in the grader.
+ *
+ * Until this existed the corpus contained no exchange rate anywhere — no field,
+ * no table, no source — and the sandbox has zero network egress by design. So
+ * `Q14_JPY_PER_USD` was known only to the reference path, and against a ±1
+ * tolerance on ~7,727 only that exact constant passed: 149.0 or 150.0 missed by
+ * ~$12, 155.0 by ~$130. A model could apply the FX rule correctly, state its
+ * assumption honestly, and still fail. That made Q14 a test of clairvoyance
+ * rather than of reasoning, and it was producing a false negative in a measured
+ * result.
+ *
+ * `fx.rates` is a new scope, so emitting it adds no draw to any existing
+ * stream and no committed trap number moves.
+ *
+ * Two shapes, deliberately:
+ *
+ *  - **Flat** on `small`/`full`/`lite`: every date carries `Q14_JPY_PER_USD`,
+ *    so Q14 becomes answerable while its committed total (7727.24) is
+ *    unchanged to the last decimal.
+ *  - **Per-date** on `dogfood`: rates drift the way real ones do, which is what
+ *    design §3 Q14 actually asks for ("FX applied at transaction date"). A
+ *    single flat rate is easier to grade; a drifting one is the honest version,
+ *    and it is only safe to introduce where no number is yet committed.
+ */
+export const FX_BASE_CURRENCY = "USD";
+/** Peak-to-trough drift of the dogfood rate, as a fraction of the base rate. */
+export const FX_DRIFT_AMPLITUDE = 0.06;
+/** Days per full drift cycle — slow enough to look like an FX series. */
+export const FX_DRIFT_PERIOD_DAYS = 220;

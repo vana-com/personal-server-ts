@@ -26,6 +26,14 @@ import {
   sleepTrap,
   tripReference,
 } from "./reference/compute.js";
+import {
+  arcReference,
+  focusWeekReference,
+  intentionReference,
+  morningPersonReference,
+  nutritionReference,
+  personBriefReference,
+} from "./reference/semantic.js";
 import type { QueryEvalCase } from "./types.js";
 
 /** Q1 asks about "the last month"; 31 calendar days is the window the eval grades. */
@@ -46,7 +54,44 @@ export async function buildCases(
   const conditional = await conditionalReference(source);
   const drift = await localDateDrift(source);
 
-  return [
+  /*
+   * Semantic ground truth. Every one of these returns zeroes on a corpus
+   * generated without `semanticProse`, so the enrichment below is conditional:
+   * on `small`/`full`/`lite` the seven semantic cases keep exactly the rubrics
+   * they had, and on `dogfood` they gain checkable anchors.
+   *
+   * That asymmetry is deliberate. A rubric with no ground truth behind it can
+   * only be graded on whether the answer *sounds* right, which is the failure
+   * this whole eval exists to avoid.
+   */
+  const arcs = await arcReference(source);
+  const focus = await focusWeekReference(source);
+  const intentions = await intentionReference(source);
+  const morning = await morningPersonReference(source);
+  const person = await personBriefReference(source);
+  const nutrition = await nutritionReference(source);
+  const hasSemantics = arcs.some((a) => a.mentions > 0);
+  const hasNutrition = nutrition.daysLogged > 0;
+
+  const jobArc = arcs.find((a) => a.arcId === "job-departure");
+  const investingArc = arcs.find((a) => a.arcId === "investing-views");
+  const abandoned = intentions.filter(
+    (i) => !i.followedThrough && i.statedMentions > 0,
+  );
+  const kept = intentions.filter(
+    (i) => i.followedThrough && i.evidenceEvents > 0,
+  );
+
+  /** Merges reference facts into a case only when the corpus actually has them. */
+  const withFacts = (
+    base: QueryEvalCase,
+    facts: Record<string, number | string> | undefined,
+  ): QueryEvalCase =>
+    facts
+      ? { ...base, referenceFacts: { ...base.referenceFacts, ...facts } }
+      : base;
+
+  const cases: QueryEvalCase[] = [
     {
       id: "Q1",
       question: "How much did I sleep on average over the last month?",
@@ -423,4 +468,252 @@ export async function buildCases(
         "a proxy the design does not specify, and one to revisit when a nutrition source exists.",
     },
   ];
+
+  if (!hasSemantics && !hasNutrition) return cases;
+
+  /*
+   * Enrichment for the `dogfood` profile.
+   *
+   * These cases were structurally present and semantically vacuous: the rubrics
+   * described what a good answer looks like, but nothing in the corpus made one
+   * answer better than another. The facts below are what a grader compares
+   * against.
+   */
+  const byId = new Map(cases.map((c) => [c.id, c]));
+  const patch = (id: string, fn: (c: QueryEvalCase) => QueryEvalCase): void => {
+    const existing = byId.get(id);
+    if (existing) byId.set(id, fn(existing));
+  };
+
+  if (hasSemantics) {
+    patch("Q2", (c) =>
+      withFacts(
+        {
+          ...c,
+          expect: {
+            kind: "judged",
+            rubric:
+              `Identifies "${focus.realTopic}" as the week's focus and does NOT answer "${focus.loudTopic}". ` +
+              "States the weighting used, and justifies it with calendar hours, notes or commits rather than " +
+              "message volume — Slack volume points at the wrong answer by design.",
+          },
+          notes:
+            `Trap armed: in the final week Slack carries ${focus.loudSlackMessages} messages about ` +
+            `"${focus.loudAnchor}" against ${focus.realSlackMessages} about "${focus.realAnchor}" ` +
+            `(${focus.loudToRealSlackRatio.toFixed(1)}x), while calendar (${focus.realCalendarEvents}), ` +
+            `notes (${focus.realNotes}) and commits (${focus.realCommits}) all point the other way. ` +
+            "A volume-weighted answer is wrong; this is design §3 Q2's stated failure mode, made measurable.",
+        },
+        {
+          realTopic: focus.realTopic,
+          realAnchor: focus.realAnchor,
+          loudTopic: focus.loudTopic,
+          loudAnchor: focus.loudAnchor,
+          loudSlackMessages: focus.loudSlackMessages,
+          realSlackMessages: focus.realSlackMessages,
+          realCalendarEvents: focus.realCalendarEvents,
+          realCommits: focus.realCommits,
+          windowFrom: focus.from,
+          windowTo: focus.to,
+        },
+      ),
+    );
+
+    if (investingArc?.firstMentionDate) {
+      patch("Q3", (c) =>
+        withFacts(c, {
+          statedPositionEarly: investingArc.earlyPosition,
+          statedPositionLate: investingArc.latePosition,
+          statedMentionsFirstHalf: investingArc.mentionsFirstHalf,
+          statedMentionsSecondHalf: investingArc.mentionsSecondHalf,
+          note: "Stated risk appetite reverses across the window, so an answer that averages the two halves is wrong in a way the corpus can prove.",
+        }),
+      );
+    }
+
+    if (jobArc?.firstMentionDate) {
+      patch("Q9", (c) =>
+        withFacts(
+          {
+            ...c,
+            expect: {
+              kind: "judged",
+              rubric:
+                `Returns ${jobArc.firstMentionDate} (or the surrounding days) as the earliest indication, found in ` +
+                `${jobArc.firstMentionSource}, and recognises the oblique framing — the first mention is a question ` +
+                "about tenure, not a statement about leaving. Orders by time rather than relevance, and says the date " +
+                "is the earliest *found* whenever coverage.method is prefiltered.",
+            },
+            notes:
+              `The arc runs ${jobArc.mentions} mentions across four stages; the earliest carries no keyword a search ` +
+              `for "quit" or "resign" would catch, which is design §3 Q9's stated difficulty. An answer citing the ` +
+              "explicit later stage has found a real mention and still got the question wrong.",
+          },
+          {
+            firstMentionDate: jobArc.firstMentionDate ?? "unknown",
+            firstMentionSource: jobArc.firstMentionSource ?? "unknown",
+            firstMentionStage: jobArc.firstMentionStage ?? "unknown",
+            totalMentions: jobArc.mentions,
+            earlyFraming: jobArc.earlyPosition,
+          },
+        ),
+      );
+    }
+
+    if (investingArc?.firstMentionDate) {
+      patch("Q10", (c) =>
+        withFacts(
+          {
+            ...c,
+            question: `What changed in how I think about ${investingArc.subject} over the last two years?`,
+            expect: {
+              kind: "judged",
+              rubric:
+                `Contrasts the early position (${investingArc.earlyPosition}) against the late one ` +
+                `(${investingArc.latePosition}) and samples both halves with stated per-period coverage. ` +
+                "A summary weighted to recent material, or one that reports only the late position, fails.",
+            },
+            notes:
+              `${investingArc.mentionsFirstHalf} mentions in the first half against ` +
+              `${investingArc.mentionsSecondHalf} in the second, so both ends are genuinely sampleable. ` +
+              "The view reverses rather than drifts, which is what makes the contrast checkable.",
+          },
+          {
+            subject: investingArc.subject,
+            earlyPosition: investingArc.earlyPosition,
+            latePosition: investingArc.latePosition,
+            mentionsFirstHalf: investingArc.mentionsFirstHalf,
+            mentionsSecondHalf: investingArc.mentionsSecondHalf,
+          },
+        ),
+      );
+    }
+
+    if (abandoned.length > 0) {
+      patch("Q15", (c) =>
+        withFacts(
+          {
+            ...c,
+            expect: {
+              kind: "judged",
+              rubric:
+                `Names the abandoned intentions (${abandoned.map((i) => i.anchor).join(", ")}) and does not ` +
+                `list the ones that were followed through (${kept.map((i) => i.anchor).join(", ")}). ` +
+                "Reports coverage.stoppedBecause when the budget is exhausted rather than silently truncating.",
+            },
+            notes:
+              `${abandoned.length} intentions stated repeatedly with zero follow-through evidence, against ` +
+              `${kept.length} with calendar evidence. Listing a kept intention as abandoned is the more damaging ` +
+              "error — the user would believe something about themselves that is not true.",
+          },
+          {
+            abandoned: abandoned.map((i) => i.anchor).join(", "),
+            kept: kept.map((i) => i.anchor).join(", "),
+            abandonedCount: abandoned.length,
+            keptCount: kept.length,
+          },
+        ),
+      );
+    }
+
+    if (morning.conflict) {
+      patch("Q16", (c) =>
+        withFacts(
+          {
+            ...c,
+            scopes: [...c.scopes, SCOPES.commits],
+            expect: {
+              kind: "judged",
+              rubric:
+                "Reports BOTH sides and names the disagreement: the user states repeatedly that they are not a " +
+                `morning person, while ${(morning.shareBefore9 * 100).toFixed(0)}% of commits land before 09:00 ` +
+                `local (median hour ${morning.medianCommitHour}). Picking one side without acknowledging the other fails, ` +
+                "however well argued.",
+            },
+            notes:
+              `${morning.statedClaims} stated claims against ${morning.commits} commits. The measured side must be ` +
+              "read in LOCAL time — the corpus is at -08:00, so taking the UTC hour reports this user as a night " +
+              "owl and inverts the answer.",
+          },
+          {
+            statedClaims: morning.statedClaims,
+            commits: morning.commits,
+            commitsBefore9Local: morning.commitsBefore9,
+            shareBefore9Local: Number(morning.shareBefore9.toFixed(3)),
+            medianCommitHourLocal: morning.medianCommitHour,
+            conflict: "stated and measured disagree",
+          },
+        ),
+      );
+    }
+
+    if (person.factAnchors.length > 0) {
+      patch("Q17", (c) =>
+        withFacts(
+          {
+            ...c,
+            expect: {
+              kind: "set",
+              contains: [...person.aliases.slice(0, 3), ...person.factAnchors],
+              excludes: [
+                "snguyen",
+                "sarah.nguyen@partner.io",
+                ...person.confusableFactAnchors,
+              ],
+            },
+            notes:
+              `Now graded on substance as well as alias resolution: ${person.factAnchors.length} distinct facts ` +
+              `about Sarah Johnson (${person.factMentions} mentions), and the other Sarah has her own ` +
+              `(${person.confusableFactAnchors.join(", ")}). A briefing containing those is visibly about the ` +
+              "wrong person rather than merely thin.",
+          },
+          {
+            factAnchors: person.factAnchors.join(", "),
+            factMentions: person.factMentions,
+            confusableFactAnchors: person.confusableFactAnchors.join(", "),
+          },
+        ),
+      );
+    }
+  }
+
+  if (hasNutrition) {
+    patch("Q18", (c) =>
+      withFacts(
+        {
+          ...c,
+          scopes: [SCOPES.nutrition, SCOPES.ouraWorkout],
+          expect: {
+            kind: "numeric",
+            value: Number(nutrition.meanKcalOnRunDays.toFixed(2)),
+            tolerance: 5,
+            denominator: nutrition.matchedDays,
+          },
+          notes:
+            "Now answered against a real intake source. `oura_activity.total_calories` is energy " +
+            `*expenditure* and returns ${nutrition.meanActivityCaloriesOnRunDays.toFixed(0)} kcal against an ` +
+            `actual intake of ${nutrition.meanKcalOnRunDays.toFixed(0)} — a different question with a similar name. ` +
+            `Logging is partial by design: ${nutrition.runDaysWithoutLog} qualifying run days have no nutrition ` +
+            `record at all, so the honest answer states n=${nutrition.matchedDays}, not the number of run days. ` +
+            "The metre/kilometre and manual/autodetected traps still apply to the join.",
+        },
+        {
+          meanKcalOnRunDays: Number(nutrition.meanKcalOnRunDays.toFixed(2)),
+          meanKcalOtherDays: Number(nutrition.meanKcalOtherDays.toFixed(2)),
+          meanKcalCompleteDaysOnly: Number(
+            nutrition.meanKcalOnRunDaysCompleteOnly.toFixed(2),
+          ),
+          expenditureProxyValue: Number(
+            nutrition.meanActivityCaloriesOnRunDays.toFixed(2),
+          ),
+          matchedDays: nutrition.matchedDays,
+          runDaysWithoutLog: nutrition.runDaysWithoutLog,
+          daysLogged: nutrition.daysLogged,
+          daysComplete: nutrition.daysComplete,
+        },
+      ),
+    );
+  }
+
+  return cases.map((c) => byId.get(c.id) ?? c);
 }

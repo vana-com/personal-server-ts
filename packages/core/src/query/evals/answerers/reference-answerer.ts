@@ -20,6 +20,10 @@ import {
   sleepTrap,
   tripReference,
 } from "../reference/compute.js";
+import {
+  nutritionReference,
+  personBriefReference,
+} from "../reference/semantic.js";
 import { Q1_WINDOW_DAYS } from "../cases.js";
 import type {
   EvalAnswerer,
@@ -167,14 +171,22 @@ export function createReferenceAnswerer(source: FixtureSource): EvalAnswerer {
     }
 
     if (q.includes("summarize everything i know about")) {
+      // On a corpus with planted person facts the brief has to carry them, or
+      // it is an alias list rather than a briefing. Degrades to the alias-only
+      // answer when the corpus has no facts to report.
+      const person = await personBriefReference(source);
+      const facts = person.factAnchors.length
+        ? ` Known facts: ${person.factAnchors.join(", ")}.`
+        : "";
       return {
         ...base,
         answer:
           "Sarah Johnson appears as sarahj, sarah@work.com and Sarah 🌸 across Slack, email and " +
-          "calendar. Distinct from Sarah Nguyen, whose records are excluded.",
+          "calendar. Distinct from Sarah Nguyen, whose records are excluded." +
+          facts,
         coverage: {
           scopesScanned: request.grantedScopes,
-          recordsScanned: 0,
+          recordsScanned: person.factMentions,
           scopesSkipped: [],
           complete: true,
         },
@@ -182,6 +194,37 @@ export function createReferenceAnswerer(source: FixtureSource): EvalAnswerer {
     }
 
     if (q.includes("calories")) {
+      /*
+       * Prefer the real intake source when the corpus has one.
+       *
+       * `oura_activity.total_calories` is energy *expenditure*; answering an
+       * intake question from it is a different question with a similar name,
+       * and on this corpus the two differ by ~350 kcal. The fallback keeps
+       * older profiles answerable on the proxy they were built against.
+       */
+      const nutrition = await nutritionReference(source);
+      if (nutrition.daysLogged > 0) {
+        return {
+          ...base,
+          value: Number(nutrition.meanKcalOnRunDays.toFixed(2)),
+          answer:
+            `${nutrition.meanKcalOnRunDays.toFixed(0)} kcal on average across ` +
+            `${nutrition.matchedDays} days with a run over 10km (distance > 10000 metres) and a ` +
+            `nutrition record. ${nutrition.runDaysWithoutLog} qualifying run days had no log at ` +
+            `all and are excluded, so n=${nutrition.matchedDays}. Restricting to days logged in ` +
+            `full gives ${nutrition.meanKcalOnRunDaysCompleteOnly.toFixed(0)} kcal. Other logged ` +
+            `days average ${nutrition.meanKcalOtherDays.toFixed(0)} kcal. Note the activity ` +
+            `scope's ${nutrition.meanActivityCaloriesOnRunDays.toFixed(0)} kcal is expenditure, ` +
+            `not intake.`,
+          coverage: {
+            scopesScanned: request.grantedScopes,
+            recordsScanned: nutrition.matchedDays + nutrition.runDaysWithoutLog,
+            scopesSkipped: [],
+            complete: true,
+          },
+        };
+      }
+
       const conditional = await conditionalReference(source);
       return {
         ...base,

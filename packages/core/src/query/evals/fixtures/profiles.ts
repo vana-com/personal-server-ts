@@ -12,7 +12,7 @@
  * entirely in memory because the browser runtime has no filesystem.
  */
 
-export type FixtureProfileName = "small" | "full" | "lite";
+export type FixtureProfileName = "small" | "full" | "lite" | "dogfood";
 
 export interface FixtureProfile {
   name: FixtureProfileName;
@@ -30,6 +30,44 @@ export interface FixtureProfile {
   notes: number;
   /** Q8's document scope is fixed across profiles — the counts are the assertion. */
   documents: number;
+
+  /**
+   * Emit reasoning-grade prose: topic arcs, the stated/measured conflict,
+   * intentions, person facts, and a weighted focus week (`prose.ts`).
+   *
+   * **Off for `small`/`full`/`lite`, and that is load-bearing.** Those profiles
+   * carry the committed trap numbers — the Oura nap error, the ChatGPT phantom
+   * rate, Q14's total, Q18's conditional mean — and every one of them is an
+   * expectation somewhere. Emitting extra rows into a shared source would draw
+   * from that source's stream and shift the numbers downstream, so the flag
+   * gates every additional draw. With it off the generator's output is byte
+   * identical to before this existed.
+   */
+  semanticProse: boolean;
+  /**
+   * Emit a nutrition log (`nutrition.log`) and a commit stream (`git.commits`).
+   *
+   * Q18 asks about calories on high-mileage days and the corpus had no intake
+   * source at all, so `total_calories` — an expenditure figure — was standing in
+   * for intake. Q16 asks whether the user is a morning person and there was no
+   * behavioural signal to weigh a stated claim against. Both are new scopes
+   * rather than changes to existing ones, so no committed number moves.
+   */
+  extraSources: boolean;
+  /** Days of nutrition coverage, as a fraction of `sleepDays`. Partial by design. */
+  nutritionCoverage: number;
+  commits: number;
+  /**
+   * Emit a per-date JPY/USD series rather than one flat rate.
+   *
+   * `fx.rates` is emitted for every profile — without a readable rate in the
+   * corpus, Q14 is a test of clairvoyance, since the sandbox has no network and
+   * the constant lived only in the grader. But only `dogfood` lets the rate
+   * *drift*: design §3 Q14 asks for "FX applied at transaction date", and a
+   * moving rate is the honest version of that. The older profiles keep a flat
+   * series so their committed Q14 total stays exact to the last decimal.
+   */
+  driftingFxRates: boolean;
 }
 
 const DOCUMENTS = 340;
@@ -49,6 +87,11 @@ export const PROFILES: Record<FixtureProfileName, FixtureProfile> = {
     browserVisits: 120_000,
     notes: 12_000,
     documents: DOCUMENTS,
+    semanticProse: false,
+    extraSources: false,
+    nutritionCoverage: 0,
+    commits: 0,
+    driftingFxRates: false,
   },
   small: {
     name: "small",
@@ -64,6 +107,11 @@ export const PROFILES: Record<FixtureProfileName, FixtureProfile> = {
     browserVisits: 3_000,
     notes: 400,
     documents: DOCUMENTS,
+    semanticProse: false,
+    extraSources: false,
+    nutritionCoverage: 0,
+    commits: 0,
+    driftingFxRates: false,
   },
   lite: {
     name: "lite",
@@ -79,6 +127,41 @@ export const PROFILES: Record<FixtureProfileName, FixtureProfile> = {
     browserVisits: 800,
     notes: 120,
     documents: DOCUMENTS,
+    semanticProse: false,
+    extraSources: false,
+    nutritionCoverage: 0,
+    commits: 0,
+    driftingFxRates: false,
+  },
+
+  /**
+   * The semantic-exercise profile. Denser prose than `small`, nowhere near
+   * `full`'s scale — this exists to test whether a model can *reason* over the
+   * corpus, not whether it can scan a large one.
+   *
+   * Volumes are chosen so the arcs are findable but sparse: an arc line lands in
+   * a few percent of notes and messages, which is roughly how often a person
+   * actually writes about the thing that is bothering them.
+   */
+  dogfood: {
+    name: "dogfood",
+    sleepDays: 1100,
+    heartRateSamples: 8_000,
+    spotifyFiles: 2,
+    spotifyRowsPerFile: 4_000,
+    conversations: 1_400,
+    slackMessages: 9_000,
+    emails: 2_600,
+    bankTransactions: 1_800,
+    calendarEvents: 1_200,
+    browserVisits: 6_000,
+    notes: 2_200,
+    documents: DOCUMENTS,
+    semanticProse: true,
+    extraSources: true,
+    nutritionCoverage: 0.72,
+    commits: 4_200,
+    driftingFxRates: true,
   },
 };
 
