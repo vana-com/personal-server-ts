@@ -1,15 +1,21 @@
 /**
- * Regrade collected runs under both rules, side by side.
+ * Report collected runs under both rules, side by side.
  *
  * Strict: the number must equal the one reading the eval encodes.
  * Resolution-aware: a defensible declared reading plus a number consistent
  * with *that* reading is a pass (design §19.9, and the rule the user chose).
  *
- * Reads the raw dumps written by `query-benchmark.ts` and
- * `query-set-resolution.ts`. Runs collected before the `resolution` field
- * existed have their declared reading inferred from the answer prose; those
- * are counted separately and labelled, because inferring a declaration is not
- * the same as being given one.
+ * **The runner now applies both rules itself** and records both verdicts on
+ * every result, so a dump written by it is read, not regraded — this script
+ * reports what the grader decided rather than deciding it a second time. Two
+ * graders drifting apart is exactly the failure this exercise exists to avoid,
+ * and a regrade is only reached for a dump that predates the dual-rule runner.
+ *
+ * Reads the raw dumps written by `query-benchmark.ts`,
+ * `query-set-resolution.ts` and `query-eval.ts`. Runs collected before the
+ * `resolution` field existed cannot be graded by the new rule at all; they are
+ * counted separately and labelled, because inferring a declaration from prose
+ * is not the same as being given one.
  *
  *   npx tsx scripts/query-regrade.ts <dump.json> [more.json ...]
  */
@@ -37,6 +43,17 @@ interface Run {
   ms?: number;
   inTok?: number;
   inputTokens?: number;
+
+  /* --- written by the dual-rule runner; absent in older dumps --- */
+  gradedBy?: "strict" | "resolution-aware";
+  strictPass?: boolean;
+  /**
+   * As serialised. `reading.signals` are `RegExp`s and come back as `{}`, so
+   * only `label`/`id`/`value` survive — which is all this report reads.
+   */
+  resolutionOutcome?: ResolutionOutcome | null;
+  readingId?: string;
+  readingLabel?: string;
 }
 
 interface Graded extends Run {
@@ -45,6 +62,8 @@ interface Graded extends Run {
   resolutionPass: boolean;
   /** True when the declaration came from prose, not a `resolution` field. */
   inferred: boolean;
+  /** True when the verdicts were read off the dump, not recomputed here. */
+  fromRunner: boolean;
   source: string;
 }
 
@@ -54,7 +73,10 @@ function extractRuns(doc: unknown, source: string): Run[] {
   if (doc && typeof doc === "object") {
     const d = doc as Record<string, unknown>;
     if (Array.isArray(d.rows)) out.push(...(d.rows as Run[]));
-    if (d.results && typeof d.results === "object") {
+    // An `EvalReport`: `results` is a flat array, each row already carrying
+    // both verdicts. The older sweeps keyed the same field by question id.
+    if (Array.isArray(d.results)) out.push(...(d.results as Run[]));
+    else if (d.results && typeof d.results === "object") {
       for (const [id, runs] of Object.entries(
         d.results as Record<string, Run[]>,
       )) {
@@ -68,6 +90,32 @@ function extractRuns(doc: unknown, source: string): Run[] {
 function gradeOne(run: Run, source: string): Graded {
   const readings = AMBIGUOUS_READINGS[run.id] as
     readonly DefensibleReading[] | undefined;
+
+  /*
+   * The runner already graded this row under both rules. Take its word for it.
+   *
+   * Re-deriving would silently diverge the moment the two implementations do —
+   * and the runner's verdict is the one that also weighed citations, coverage
+   * and the declared reading's denominator, none of which a dump row carries.
+   */
+  if (
+    typeof run.strictPass === "boolean" &&
+    run.resolutionOutcome !== undefined
+  ) {
+    return {
+      ...run,
+      strictPass: run.strictPass,
+      resolutionOutcome: run.resolutionOutcome,
+      resolutionPass:
+        run.gradedBy === "resolution-aware"
+          ? run.outcome === "pass"
+          : run.strictPass,
+      inferred: false,
+      fromRunner: true,
+      source,
+    };
+  }
+
   const strictPass = run.outcome === "pass";
 
   if (!readings) {
@@ -78,6 +126,7 @@ function gradeOne(run: Run, source: string): Graded {
       resolutionOutcome: null,
       resolutionPass: strictPass,
       inferred: false,
+      fromRunner: false,
       source,
     };
   }
@@ -102,6 +151,7 @@ function gradeOne(run: Run, source: string): Graded {
       resolutionOutcome: null,
       resolutionPass: strictPass,
       inferred: true,
+      fromRunner: false,
       source,
     };
   }
@@ -121,6 +171,7 @@ function gradeOne(run: Run, source: string): Graded {
     resolutionOutcome: outcome,
     resolutionPass: outcome.kind === "pass" && !nonNumericFailure,
     inferred,
+    fromRunner: false,
     source,
   };
 }
@@ -136,10 +187,21 @@ async function main(): Promise<void> {
   }
 
   const graded: Graded[] = [];
+  let skipped = 0;
   for (const f of files) {
     const doc: unknown = JSON.parse(await readFile(f, "utf8"));
     const name = f.split("/").pop() ?? f;
-    for (const run of extractRuns(doc, name)) graded.push(gradeOne(run, name));
+    for (const run of extractRuns(doc, name)) {
+      // A skipped case — a judged one with no judge — was graded by neither
+      // rule. Counting it as a failure in both columns would understate both
+      // scoreboards by the same amount and make the comparison look worse than
+      // it is; it is excluded and reported.
+      if (run.outcome === "skipped") {
+        skipped++;
+        continue;
+      }
+      graded.push(gradeOne(run, name));
+    }
   }
 
   const ids = [...new Set(graded.map((g) => g.id))].sort(
@@ -169,8 +231,21 @@ async function main(): Promise<void> {
       `  ${id.padEnd(4)} ${String(rows.length).padStart(3)}   ${String(s).padStart(3)}/${rows.length}   ${String(r).padStart(4)}/${rows.length}   ${delta >= 0 ? "+" : ""}${delta}     ${note}`,
     );
   }
+  const totalDelta = resTotal - strictTotal;
   console.log(
-    `\n  TOTAL ${n}   ${strictTotal}/${n} (${pct(strictTotal, n)})   ${resTotal}/${n} (${pct(resTotal, n)})   +${resTotal - strictTotal}`,
+    `\n  TOTAL ${n}   ${strictTotal}/${n} (${pct(strictTotal, n)})   ${resTotal}/${n} (${pct(resTotal, n)})   ${totalDelta >= 0 ? "+" : ""}${totalDelta}`,
+  );
+
+  /*
+   * Where each verdict came from. Rows written by the dual-rule runner are
+   * reported as graded; only older dumps are regraded here, and the split is
+   * printed so a reader knows which they are looking at.
+   */
+  const fromRunner = graded.filter((g) => g.fromRunner).length;
+  console.log(
+    `\n  ${fromRunner} row(s) read from the runner's own dual-rule output, ` +
+      `${graded.length - fromRunner} regraded here` +
+      (skipped ? `; ${skipped} skipped row(s) excluded` : ""),
   );
 
   // The anti-cheat evidence: how runs fail under the generous rule.

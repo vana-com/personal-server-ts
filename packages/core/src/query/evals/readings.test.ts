@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
 
+import { DEFAULT_SEED } from "./fixtures/profiles.js";
 import {
   AMBIGUOUS_READINGS,
   Q1_READINGS,
   Q14_READINGS,
   Q18_READINGS,
+  READINGS_CORPUS,
   classifyResolution,
   gradeAgainstReadings,
+  readingsFor,
 } from "./readings.js";
 
 /**
@@ -150,6 +153,27 @@ describe("resolution-aware grading", () => {
       const evalReadings = readings.filter((r) => r.isEvalReading);
       expect(evalReadings, id).toHaveLength(1);
     }
+  });
+
+  it("gives each Q1 reading its own denominator", () => {
+    // Why the denominator cannot be asserted against the eval's n (§19.11):
+    // the readings disagree about it as much as they disagree about the mean,
+    // so a run that states its own n truthfully contradicts the eval's.
+    const ns = Q1_READINGS.map((r) => r.denominator);
+    expect(ns).toEqual([27, 30, 28, 27, 25]);
+    expect(new Set(ns).size).toBeGreaterThan(1);
+  });
+
+  it("offers readings only for the corpus they were enumerated over", () => {
+    // A reading is a window *and* the number that window yields, and the
+    // number is a fact about one corpus. Elsewhere the labels would still
+    // match and every value would be wrong.
+    expect(READINGS_CORPUS).toEqual({ profile: "dogfood", seed: DEFAULT_SEED });
+    expect(readingsFor("Q1", "dogfood", DEFAULT_SEED)).toBe(Q1_READINGS);
+    expect(readingsFor("Q1", "small", DEFAULT_SEED)).toBeUndefined();
+    expect(readingsFor("Q1", "dogfood", DEFAULT_SEED + 1)).toBeUndefined();
+    // Not ambiguous, on any corpus.
+    expect(readingsFor("Q6", "dogfood", DEFAULT_SEED)).toBeUndefined();
   });
 
   it("classifies by the primary reading, not a parenthetical alternative", () => {

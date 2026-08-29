@@ -71,6 +71,36 @@ export function effectiveFor(t: ScopeTally): Tally {
  *
  * `complete` is deliberately *derived*, never settable: true only when every
  * granted scope was streamed end to end and nothing stopped the run early.
+ *
+ * ## Why the derivation is unchanged despite 132 false runs
+ *
+ * It was reported as too strict to fire on a multi-scope grant, and therefore
+ * as noise. Measured instead of assumed, that is wrong, and the flag stays as
+ * it is. Every script from the 54-run `dogfood` N=3 benchmark was replayed
+ * through this ledger offline, with no model calls:
+ *
+ * | conjunct                        | runs it made `complete` false |
+ * | ------------------------------- | ----------------------------- |
+ * | some granted scope never read   | 40 / 51                       |
+ * | the run stopped (`error`)       | 30 / 51                       |
+ * | a bounded read (`partialScope`) | 0 / 51                        |
+ * | a scope skipped                 | 0 / 51                        |
+ * | `method === "prefiltered"`      | 0 / 51                        |
+ *
+ * **`complete` was true on 10 of those 51 runs**, including on two- and
+ * three-scope grants — so the derivation is satisfiable, and loosening it
+ * would destroy the signal it currently carries. The 40 are honest: Q8's run
+ * never read `email.messages` before answering an absence question over it,
+ * and Q11's never read `oura.heartrate` before answering about heart rate.
+ * Those are exactly the reads whose absence should falsify a coverage claim.
+ *
+ * The flag reads as always-false at the request level for two reasons outside
+ * this file, both recorded in the phase report: the eval harness grants the
+ * tool host all 18 corpus scopes rather than the case's two or three, so
+ * `everyGrantedScopeAccountedFor` is unsatisfiable there; and the request-level
+ * merge ANDs each run's flag, so one exploratory turn that reads nothing
+ * poisons a request that later reads everything. Neither is a defect in this
+ * derivation.
  */
 export class CoverageLedger {
   readonly #granted: Set<string>;

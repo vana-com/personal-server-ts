@@ -23,7 +23,14 @@
  * 3. **A question with one honest reading gets none of this.** Ambiguity is
  *    declared per question and deliberately sparingly; over-declaring it is
  *    the way this rule would quietly become meaningless.
+ * 4. **A reading's value belongs to one corpus.** These figures were computed
+ *    over `dogfood` at `DEFAULT_SEED`; on any other corpus they describe
+ *    nothing. `readingsFor` returns them only for that pair, so a run on
+ *    another profile grades strictly rather than against numbers that do not
+ *    apply to it.
  */
+
+import { DEFAULT_SEED } from "./fixtures/profiles.js";
 
 /** One defensible way to read an ambiguous question. */
 export interface DefensibleReading {
@@ -272,8 +279,18 @@ export const Q18_READINGS: readonly DefensibleReading[] = [
  *   "yourself", but the corpus models no owner identity — all six are
  *   counterparties — so nominating one as self is an unforced inference about
  *   the data, not a reading of the question. Grades strictly.
- * - **Q11** ("last week"). Every observed run resolved the same window; there
- *   is no spread to accommodate.
+ *   `scripts/enum-readings.ts` also settles the *window* axis, which is the
+ *   same phrase Q1 turns on: the count is 6 for every trailing window from a
+ *   week up (5 only at four days), so no reading of "last month" moves it. The
+ *   `denominator` — rows scanned — does move (256 / 260 / 274 over trailing
+ *   28 / 30 / 31), and that is recorded rather than acted on, because crediting
+ *   it would mean declaring Q6 ambiguous on grounds §19.10 already refused.
+ * - **Q11** ("last week"). The corpus ends on **Sunday 2026-01-04**, so the two
+ *   readings that would otherwise diverge — the trailing seven days, and the
+ *   Monday-to-Sunday week that just ended — are the *same seven days*, and
+ *   yield the same 69.4286bpm. There is nothing for a reading to disambiguate.
+ *   (The week before that averages 54.4286bpm, but "last week" asked on a
+ *   Sunday does not mean the week before the one that just ended.)
  * - **Q8** (document count). One honest answer.
  */
 export const AMBIGUOUS_READINGS: Readonly<
@@ -283,3 +300,34 @@ export const AMBIGUOUS_READINGS: Readonly<
   Q14: Q14_READINGS,
   Q18: Q18_READINGS,
 };
+
+/**
+ * The corpus these values were enumerated over.
+ *
+ * A reading is a window plus the number that window yields, and the number is
+ * a fact about one corpus. Applied to a different profile or seed the labels
+ * would still match and every value would be wrong, which is the worst of both
+ * rules: a generous grade against arithmetic that describes another dataset.
+ */
+export const READINGS_CORPUS = {
+  profile: "dogfood",
+  seed: DEFAULT_SEED,
+} as const;
+
+/**
+ * The readings for a question, or `undefined` if it has none *here*.
+ *
+ * `undefined` covers two different situations on purpose, because the caller
+ * treats them the same way — grade strictly: the question has one honest
+ * reading, or this run is not on the corpus the readings describe.
+ */
+export function readingsFor(
+  id: string,
+  profile: string,
+  seed: number,
+): readonly DefensibleReading[] | undefined {
+  if (profile !== READINGS_CORPUS.profile || seed !== READINGS_CORPUS.seed) {
+    return undefined;
+  }
+  return AMBIGUOUS_READINGS[id];
+}

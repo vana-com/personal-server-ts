@@ -24,6 +24,15 @@ export type {
 export type { EvalJudge, JudgeVerdict, RunOptions } from "./runner.js";
 export { runEval, formatReport, extractNumber } from "./runner.js";
 
+export type { BuildJudgeOptions, JudgePrompt } from "./judge.js";
+export {
+  JUDGE_REASON_MAX_CHARS,
+  JUDGE_SYSTEM_PROMPT,
+  buildJudge,
+  buildJudgePrompt,
+  parseJudgeReply,
+} from "./judge.js";
+
 export { buildCases, Q1_WINDOW_DAYS } from "./cases.js";
 
 export type {

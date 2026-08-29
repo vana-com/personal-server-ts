@@ -12,6 +12,14 @@
  *   npx tsx scripts/query-benchmark.ts --profile dogfood --only Q1,Q14
  *   npx tsx scripts/query-benchmark.ts --profile dogfood --live --repeat 3
  *
+ * Every row is written to disk the moment it completes — appended to
+ * `<out>.jsonl` and folded into `<out>` — so a sweep killed at 50 minutes
+ * yields a partial dataset rather than nothing, which is what happened to the
+ * first `gemini-3.1-pro-preview` N=3 run. Re-running the same command resumes:
+ * rows already in the JSONL are skipped, not re-asked. `--fresh` ignores what
+ * is there and starts over, which is what you want if the corpus or the model
+ * changed under the same `--out` path.
+ *
  * `--repeat N` is the default posture for any live claim. At temperature 0 the
  * model still produced 60 distinct scripts in 60 runs (design §15.3), so one
  * live run is a SAMPLE, not a verification. A single-run pass on Q18 was
@@ -25,7 +33,14 @@
  * blur together.
  */
 
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -73,6 +88,15 @@ interface Row {
   method?: string;
   value?: number;
   expected?: number;
+  /**
+   * The set the model declared before computing, when it declared one.
+   *
+   * Carried so `query-regrade.ts` can grade a resolution it was *given*
+   * rather than one inferred from prose. Design §19.10: inferring a
+   * declaration misclassified 2 of 9 runs, which is why the 54-run benchmark
+   * that predates the field cannot be regraded at all.
+   */
+  resolution?: string;
   reasons: string[];
   answerHead: string;
   scriptChars?: number;
@@ -196,8 +220,84 @@ async function main(): Promise<void> {
     : undefined;
 
   const cases = await buildCases(source);
-  const rows: Row[] = [];
   const answers = new Map<string, QueryAnswer>();
+
+  const repeat = Math.max(1, Number(arg("repeat", "1")));
+
+  /*
+   * Where the run persists itself, decided BEFORE the first question runs.
+   *
+   * A ~50-minute `gemini-3.1-pro-preview` N=3 sweep was killed at the wire and
+   * produced nothing at all, because the only write happened after the last
+   * row. Two files now, written as each row lands:
+   *
+   *  - `<out>.jsonl`, one row per line, appended and never rewritten. It is
+   *    the durable record: an append cannot corrupt what is already on disk,
+   *    so a kill mid-write costs at most the row in flight.
+   *  - `<out>`, the same envelope this script always wrote, rewritten via a
+   *    temp file and a rename after every row. `query-regrade.ts` reads
+   *    `{ rows: [...] }` and now finds it whether or not the sweep finished;
+   *    the rename is atomic, so a reader never sees half an envelope.
+   *
+   * Rewriting the whole envelope per row is O(n²) in bytes. At 54 rows of a
+   * few KB it is noise against a 50-minute live sweep, and it buys a partial
+   * dump that needs no reassembly.
+   */
+  const outPath =
+    arg("out") ?? join(tmpdir(), `query-bench-${profile}-${Date.now()}.json`);
+  const jsonlPath = outPath.replace(/\.json$/, "") + ".jsonl";
+  const tmpPath = `${outPath}.tmp`;
+
+  /*
+   * Resume from whatever the killed sweep managed to write.
+   *
+   * Keyed on `id#run`, because a repeat is only meaningful as a whole: a row
+   * that completed is not re-asked, and a row that was in flight when the
+   * process died was never appended, so it is re-asked. `--fresh` opts out
+   * for the case where the corpus or the model changed under the same path —
+   * resuming across either would silently mix two experiments into one table.
+   */
+  const rows: Row[] = [];
+  const done = new Set<string>();
+  const key = (id: string, run: number) => `${id}#${run}`;
+  if (!flag("fresh")) {
+    let existing = "";
+    try {
+      existing = await readFile(jsonlPath, "utf8");
+    } catch {
+      existing = "";
+    }
+    let torn = existing !== "" && !existing.endsWith("\n");
+    for (const line of existing.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const row = JSON.parse(line) as Row;
+        if (done.has(key(row.id, row.run))) continue;
+        done.add(key(row.id, row.run));
+        rows.push(row);
+      } catch {
+        // A torn final line is the expected shape of a kill. Drop it and
+        // re-ask that row rather than carrying a half-parsed one forward.
+        torn = true;
+      }
+    }
+    if (torn) {
+      // Rewrite from what parsed, because appending onto a half-written line
+      // would glue the next row to it and lose that one too — the kill would
+      // then cost two rows instead of one.
+      await writeFile(
+        jsonlPath,
+        rows.map((r) => JSON.stringify(r)).join("\n") +
+          (rows.length ? "\n" : ""),
+      );
+      process.stderr.write(`repaired a torn tail in ${jsonlPath}\n`);
+    }
+    if (rows.length > 0) {
+      process.stderr.write(
+        `resuming: ${rows.length} row(s) already in ${jsonlPath}\n`,
+      );
+    }
+  }
 
   // Wrap the answerer so per-question telemetry is captured even when grading
   // throws it away. runEval reports pass/fail; the benchmark needs the rest.
@@ -211,41 +311,75 @@ async function main(): Promise<void> {
     },
   };
 
-  const repeat = Math.max(1, Number(arg("repeat", "1")));
   const started = Date.now();
 
-  // One `runEval` per repeat, not one repeat inside `runEval`: each pass must
-  // see a fresh answerer AND a fresh grading pass, so a repeat cannot inherit
-  // state from the one before it. The per-question `freshAnswerer()` above
-  // already guards coverage accumulation within a pass.
-  const reports = [];
+  /*
+   * Totals are derived from `rows`, not summed out of the per-pass reports.
+   *
+   * A resumed sweep has rows it never graded in this process, so a report-based
+   * total would silently under-count everything the resume recovered. Rows are
+   * the only thing both halves of a resumed run have in common.
+   */
+  const envelope = () => ({
+    profile,
+    seed,
+    live,
+    repeat,
+    judged: judge !== undefined,
+    model: process.env.INFERENCE_MODEL ?? null,
+    wallClockMs: Date.now() - started,
+    totals: {
+      pass: rows.filter((r) => r.outcome === "pass").length,
+      fail: rows.filter((r) => r.outcome === "fail").length,
+      skipped: rows.filter((r) => r.outcome === "skipped").length,
+      inputTokens: rows.reduce((n, r) => n + r.inTok, 0),
+      outputTokens: rows.reduce((n, r) => n + r.outTok, 0),
+    },
+    rows,
+  });
+
+  const persist = async (row: Row): Promise<void> => {
+    await appendFile(jsonlPath, JSON.stringify(row) + "\n");
+    await writeFile(tmpPath, JSON.stringify(envelope(), null, 2));
+    await rename(tmpPath, outPath);
+  };
+
+  // One `runEval` per QUESTION per repeat, not one call spanning a whole pass.
+  // Each question still sees a fresh answerer and a fresh grading pass — the
+  // invariant that stops a repeat inheriting state — and the row lands on disk
+  // before the next question starts, which is what makes a killed sweep yield
+  // a partial dataset rather than nothing.
+  const selected = only ? cases.filter((c) => only.includes(c.id)) : cases;
   for (let run = 0; run < repeat; run++) {
     if (repeat > 1) {
       process.stderr.write(`\n--- repeat ${run + 1}/${repeat} ---\n`);
     }
-    const report = await runEval({
-      cases,
-      answerer: capturing,
-      seed,
-      profile,
-      only,
-      judge,
-    });
-    reports.push(report);
-
-    for (const result of report.results) {
-      const testCase = cases.find((c) => c.id === result.id);
-      const answer = testCase ? answers.get(testCase.question) : undefined;
+    for (const testCase of selected) {
+      if (done.has(key(testCase.id, run))) {
+        process.stderr.write(`  ${testCase.id} run ${run}: already recorded\n`);
+        continue;
+      }
+      const report = await runEval({
+        cases,
+        answerer: capturing,
+        seed,
+        profile,
+        only: [testCase.id],
+        judge,
+      });
+      const result = report.results[0];
+      if (!result) continue;
+      const answer = answers.get(testCase.question);
       // `bytesScanned` and `unreadable` are declared on `QueryCoverage` as of
       // the per-scope attribution fix, so this no longer needs a cast.
       const cov = answer?.coverage;
-      rows.push({
+      const row: Row = {
         id: result.id,
         run,
         klass: result.class,
-        kind: testCase?.expect.kind ?? "?",
+        kind: testCase.expect.kind,
         outcome: result.outcome,
-        modelGraded: testCase?.expect.kind === "judged" && judge !== undefined,
+        modelGraded: testCase.expect.kind === "judged" && judge !== undefined,
         ms: result.durationMs,
         inTok: result.cost.inputTokens,
         outTok: result.cost.outputTokens,
@@ -258,43 +392,31 @@ async function main(): Promise<void> {
         method: cov?.method,
         value: answer?.value,
         expected:
-          testCase?.expect.kind === "numeric"
+          testCase.expect.kind === "numeric"
             ? testCase.expect.value
             : undefined,
+        resolution: result.resolution,
         reasons: result.reasons,
         answerHead: (answer?.answer ?? "").replace(/\s+/g, " ").slice(0, 400),
         scriptChars: answer?.script?.length,
         script: answer?.script,
         unreadable: cov?.unreadable,
         unprofiled: cov?.unprofiledScopes?.length ?? 0,
-      });
+      };
+      rows.push(row);
+      done.add(key(result.id, run));
+      answers.clear();
+      await persist(row);
     }
-    answers.clear();
   }
   const wall = Date.now() - started;
 
-  const totals = {
-    pass: reports.reduce((n, r) => n + r.totals.pass, 0),
-    fail: reports.reduce((n, r) => n + r.totals.fail, 0),
-    skipped: reports.reduce((n, r) => n + r.totals.skipped, 0),
-    inputTokens: reports.reduce((n, r) => n + r.totals.inputTokens, 0),
-    outputTokens: reports.reduce((n, r) => n + r.totals.outputTokens, 0),
-  };
-
-  const out = {
-    profile,
-    seed,
-    live,
-    repeat,
-    judged: judge !== undefined,
-    model: process.env.INFERENCE_MODEL ?? null,
-    wallClockMs: wall,
-    totals,
-    rows,
-  };
-  const path =
-    arg("out") ?? join(tmpdir(), `query-bench-${profile}-${Date.now()}.json`);
-  await writeFile(path, JSON.stringify(out, null, 2));
+  // A final write even when every row was resumed and nothing ran, so `--out`
+  // always exists and always carries the whole table.
+  await writeFile(tmpPath, JSON.stringify(envelope(), null, 2));
+  await rename(tmpPath, outPath);
+  const totals = envelope().totals;
+  const path = outPath;
 
   const median = (xs: number[]): number => {
     if (xs.length === 0) return 0;
@@ -310,7 +432,10 @@ async function main(): Promise<void> {
   const agg = ids.map((id) => {
     const rs = rows.filter((r) => r.id === id);
     const passes = rs.filter((r) => r.outcome === "pass").length;
-    const skips = rs.filter((r) => r.outcome === "skip").length;
+    // `"skipped"`, not `"skip"` — the runner's own spelling. Matching the
+    // wrong string counted a judged case with no judge as a graded zero, so a
+    // question nobody scored reported as 0/3 rather than as unscored.
+    const skips = rs.filter((r) => r.outcome === "skipped").length;
     const graded = rs.length - skips;
     const modes = [
       ...new Set(
@@ -370,7 +495,8 @@ async function main(): Promise<void> {
       `run-totals: pass ${totals.pass}  fail ${totals.fail}  skip ${totals.skipped}\n` +
       `tokens: ${totals.inputTokens} in / ${totals.outputTokens} out   wall ${(wall / 1000).toFixed(1)}s\n` +
       `coverage.complete ever true: ${agg.some((a) => a.anyComplete) ? "YES" : "NO"}\n` +
-      `raw: ${path}\n`,
+      `raw: ${path}\n` +
+      `rows: ${jsonlPath} (appended per row; re-run the same command to resume)\n`,
   );
 
   await rm(dir, { recursive: true, force: true });

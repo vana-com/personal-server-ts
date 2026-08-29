@@ -445,19 +445,38 @@ export async function absenceReference(
 /* ------------------------------------------------------------------ */
 
 export interface AnomalyReference {
-  baselineBpm: number;
+  /**
+   * Resting heart rate over the last week: `oura_heartrate` rows whose
+   * `source` is `rest` or `sleep`. **This is the graded value**, and it is
+   * reachable only through that filter — see the two contaminated figures
+   * below, both of which are an order of magnitude outside the tolerance.
+   */
   lastWeekBpm: number;
+  /** The same filtered series over the rest of the history. */
+  baselineBpm: number;
   deltaBpm: number;
   baselineStdDev: number;
   /** Standard deviations from baseline — "unusual" needs a stated threshold. */
   zScore: number;
+  /** Samples behind each figure. Thin by construction; the answer must say so. */
+  lastWeekSamples: number;
+  baselineSamples: number;
   /**
-   * The same baseline computed from `heartrate` without filtering on `source`.
-   * Workout samples sit ~45bpm higher, so an unfiltered baseline is inflated
+   * The same two figures computed without filtering on `source`. Workout and
+   * session samples sit ~45bpm higher, so an unfiltered reading is inflated
    * far past the anomaly it is supposed to detect.
    */
-  unfilteredHeartRateBaselineBpm: number;
-  filteredHeartRateBaselineBpm: number;
+  unfilteredLastWeekBpm: number;
+  unfilteredBaselineBpm: number;
+  /**
+   * The other route to a number that looks like an answer:
+   * `oura_sleep.average_heart_rate`, which is the mean heart rate *during
+   * sleep* and not a resting series at all. It used to be what this case
+   * graded, which is why the case passed without ever reading `oura.heartrate`
+   * (implementation plan §6).
+   */
+  sleepRowLastWeekBpm: number;
+  sleepRowBaselineBpm: number;
 }
 
 interface HeartRateRow {
@@ -469,44 +488,65 @@ interface HeartRateRow {
 /** `source` values that represent a genuine resting measurement. */
 const RESTING_HR_SOURCES = new Set(["rest", "sleep"]);
 
+const mean = (xs: readonly number[]): number =>
+  xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0;
+
+/**
+ * Q11's resting-heart-rate figures, from the `heartrate` collection.
+ *
+ * The window is cut on the sample's **own timestamp date**, because that is
+ * the only date a `heartrate` row carries — there is no `day` field here, so
+ * the sleep-day convention that governs `oura_sleep` does not apply and cannot
+ * be borrowed. The generator emits each night's samples starting two hours
+ * before midnight, so a night's block is timestamped on the evening before it,
+ * exactly as a real export does.
+ */
 export async function anomalyReference(
   source: FixtureSource,
   windowDays = 7,
 ): Promise<AnomalyReference> {
-  const rows = await readJson<SleepRow[]>(source, "oura_sleep.json");
-  const main = rows.filter((r) => r.type === "long_sleep");
   const cutoff = dayIso(CORPUS_DAYS - windowDays);
 
-  const baseline = main
-    .filter((r) => r.day < cutoff)
-    .map((r) => r.average_heart_rate);
-  const recent = main
-    .filter((r) => r.day >= cutoff)
-    .map((r) => r.average_heart_rate);
+  const hr = await readJson<HeartRateRow[]>(source, "oura_heartrate.json");
+  const recent = hr.filter((r) => r.timestamp.slice(0, 10) >= cutoff);
+  const older = hr.filter((r) => r.timestamp.slice(0, 10) < cutoff);
+  const resting = (rows: HeartRateRow[]): number[] =>
+    rows.filter((r) => RESTING_HR_SOURCES.has(r.source)).map((r) => r.bpm);
 
-  const mean = (xs: number[]): number =>
-    xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0;
-  const baselineBpm = mean(baseline);
-  const lastWeekBpm = mean(recent);
-  const variance = baseline.length
-    ? baseline.reduce((a, b) => a + (b - baselineBpm) ** 2, 0) / baseline.length
+  const recentResting = resting(recent);
+  const baselineResting = resting(older);
+  const lastWeekBpm = mean(recentResting);
+  const baselineBpm = mean(baselineResting);
+  const variance = baselineResting.length
+    ? baselineResting.reduce((a, b) => a + (b - baselineBpm) ** 2, 0) /
+      baselineResting.length
     : 0;
   const sd = Math.sqrt(variance);
 
-  const hr = await readJson<HeartRateRow[]>(source, "oura_heartrate.json");
-  const unfiltered = mean(hr.map((r) => r.bpm));
-  const filtered = mean(
-    hr.filter((r) => RESTING_HR_SOURCES.has(r.source)).map((r) => r.bpm),
+  // The route this case used to grade, kept as a measured figure rather than
+  // dropped: it is the near-miss a model lands on when it answers a resting-HR
+  // question from the sleep collection, and the notes quote it.
+  const sleep = await readJson<SleepRow[]>(source, "oura_sleep.json");
+  const main = sleep.filter((r) => r.type === "long_sleep");
+  const sleepRowLastWeekBpm = mean(
+    main.filter((r) => r.day >= cutoff).map((r) => r.average_heart_rate),
+  );
+  const sleepRowBaselineBpm = mean(
+    main.filter((r) => r.day < cutoff).map((r) => r.average_heart_rate),
   );
 
   return {
-    baselineBpm,
     lastWeekBpm,
+    baselineBpm,
     deltaBpm: lastWeekBpm - baselineBpm,
     baselineStdDev: sd,
     zScore: sd === 0 ? 0 : (lastWeekBpm - baselineBpm) / sd,
-    unfilteredHeartRateBaselineBpm: unfiltered,
-    filteredHeartRateBaselineBpm: filtered,
+    lastWeekSamples: recentResting.length,
+    baselineSamples: baselineResting.length,
+    unfilteredLastWeekBpm: mean(recent.map((r) => r.bpm)),
+    unfilteredBaselineBpm: mean(older.map((r) => r.bpm)),
+    sleepRowLastWeekBpm,
+    sleepRowBaselineBpm,
   };
 }
 

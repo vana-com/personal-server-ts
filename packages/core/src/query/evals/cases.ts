@@ -205,11 +205,40 @@ export async function buildCases(
         "How many distinct people did I talk to last month, and who were the top 10?",
       class: "relational",
       scopes: [SCOPES.slack, SCOPES.email, SCOPES.calendar],
+      /*
+       * No `denominator`, deliberately, and this is the one case where its
+       * absence is the finding.
+       *
+       * It used to require `identity.rowsScanned` verbatim in the prose, and
+       * that failed every arm — including the run that returned the right
+       * number. Three reasons, measured on `dogfood`:
+       *
+       *  1. It is not a denominator. Q6 answers with a *count of people*;
+       *     nothing is divided, so there is no n behind a ratio to state.
+       *     `expect.denominator` exists for design §4.3's "6.5h over 28 of 31
+       *     nights" — Q1's nights, Q18's matched days. `rowsScanned` is a
+       *     coverage figure, and coverage is already asserted by
+       *     `mustReportCoverage`.
+       *  2. The answer is window-invariant and the figure is not.
+       *     `distinctPeople` is 6 over a 28-, 30-, 31- and 60-day window;
+       *     `rowsScanned` is 256, 260, 274 and 566, and 297 over calendar
+       *     December. So the assertion smuggles design §19.9's window
+       *     ambiguity back into the one question `readings.ts` deliberately
+       *     refuses to call ambiguous.
+       *  3. It is convention-dependent even at a fixed window: the same 31
+       *     days are 274 rows counting a calendar event once, and more
+       *     counting its 31 attendee references or an email's from and to
+       *     separately. Every one of those is an honest count.
+       *
+       * It only ever held because the reference answerer prints the literal
+       * string the case handed it. The 6-vs-5 disagreement over whether the
+       * owner is one of the six is a separate, live failure and is left
+       * failing.
+       */
       expect: {
         kind: "numeric",
         value: identity.distinctPeople,
         tolerance: 0,
-        denominator: identity.rowsScanned,
       },
       mustCite: true,
       mustReportCoverage: true,
@@ -317,17 +346,27 @@ export async function buildCases(
         deltaBpm: Number(anomaly.deltaBpm.toFixed(4)),
         baselineStdDev: Number(anomaly.baselineStdDev.toFixed(4)),
         zScore: Number(anomaly.zScore.toFixed(4)),
-        heartRateBaselineFilteredToRestAndSleep: Number(
-          anomaly.filteredHeartRateBaselineBpm.toFixed(4),
+        restingSamplesLastWeek: anomaly.lastWeekSamples,
+        restingSamplesBaseline: anomaly.baselineSamples,
+        lastWeekIfSourceIgnored: Number(
+          anomaly.unfilteredLastWeekBpm.toFixed(4),
         ),
-        heartRateBaselineUnfiltered: Number(
-          anomaly.unfilteredHeartRateBaselineBpm.toFixed(4),
+        baselineIfSourceIgnored: Number(
+          anomaly.unfilteredBaselineBpm.toFixed(4),
         ),
+        lastWeekFromSleepRows: Number(anomaly.sleepRowLastWeekBpm.toFixed(4)),
+        baselineFromSleepRows: Number(anomaly.sleepRowBaselineBpm.toFixed(4)),
       },
       notes:
         "A real excursion is planted in the final week; the baseline needs the full history, not the " +
-        "window under test. Second trap: `heartrate.source` must be filtered to rest/sleep — an " +
-        "unfiltered baseline is inflated by workout samples and swamps the anomaly.",
+        "window under test. The graded figure is the resting series itself — `oura_heartrate` rows " +
+        "with `source` in rest/sleep — so the contamination filter is load-bearing rather than " +
+        "decorative: ignoring `source` returns " +
+        `${anomaly.unfilteredLastWeekBpm.toFixed(1)} against ${anomaly.lastWeekBpm.toFixed(1)}, ` +
+        "because workout and session samples sit ~45bpm higher. Answering from " +
+        `\`oura_sleep.average_heart_rate\` instead returns ${anomaly.sleepRowLastWeekBpm.toFixed(1)} — ` +
+        "mean heart rate *during sleep*, which is not a resting series; that route is what this case " +
+        "used to grade, and it is why the case passed without ever reading `oura.heartrate`.",
     },
     {
       id: "Q12",

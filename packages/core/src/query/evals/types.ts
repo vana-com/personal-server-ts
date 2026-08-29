@@ -68,6 +68,7 @@ export type {
 } from "../agent/types.js";
 
 import type { QueryRequest, QueryAnswer } from "../agent/types.js";
+import type { ResolutionOutcome } from "./readings.js";
 
 export interface EvalAnswerer {
   readonly name: string;
@@ -101,6 +102,39 @@ export interface EvalCaseResult {
    * without this the two are the same failing row.
    */
   resolution?: string;
+
+  /* --- the two grading rules, recorded side by side --- */
+
+  /**
+   * Which rule produced `outcome`.
+   *
+   * Resolution-aware for a question with enumerated readings on the corpus
+   * they were enumerated over; strict everywhere else. Both verdicts are
+   * always recorded — `outcome` picks one, it does not discard the other.
+   */
+  gradedBy?: "strict" | "resolution-aware";
+  /**
+   * Verdict under the strict rule: the number must match the single reading
+   * the eval encodes. Kept computable so the old scoreboard stays comparable
+   * across the change. Unset for a skipped case, which neither rule graded.
+   */
+  strictPass?: boolean;
+  /**
+   * Verdict under the resolution-aware rule, in full — including *how* it
+   * failed, which is the part worth reading. `null` when the rule does not
+   * apply: one honest reading, or a corpus the readings were not computed for.
+   */
+  resolutionOutcome?: ResolutionOutcome | null;
+  /**
+   * The reading the declaration classified to, flattened.
+   *
+   * `resolutionOutcome` carries the whole `DefensibleReading`, whose `signals`
+   * are `RegExp`s that JSON-serialise to `{}`. Dumps are read back by
+   * `scripts/query-regrade.ts`, so the two fields it actually needs are
+   * duplicated here in a form that survives the round trip.
+   */
+  readingId?: string;
+  readingLabel?: string;
 }
 
 export interface EvalClassRollup {
@@ -108,6 +142,8 @@ export interface EvalClassRollup {
   pass: number;
   fail: number;
   skipped: number;
+  /** The same class under the strict rule, so the two scoreboards line up. */
+  strictPass: number;
 }
 
 export interface EvalReport {
@@ -116,10 +152,24 @@ export interface EvalReport {
   profile: string;
   results: EvalCaseResult[];
   rollups: EvalClassRollup[];
+  /**
+   * Whether the resolution-aware rule was in force, and on which questions.
+   *
+   * Empty when the run is not on the corpus the readings were enumerated over
+   * — in which case every case graded strictly, and the report says so rather
+   * than leaving the reader to assume the generous rule applied.
+   */
+  resolutionAware: string[];
   totals: {
     pass: number;
     fail: number;
     skipped: number;
+    /**
+     * Passes under the strict rule alone. `pass` is the headline; this is the
+     * scoreboard the corpus reported before the rule existed, kept computable
+     * so a change in the headline can be attributed.
+     */
+    strictPass: number;
     wallClockMs: number;
     inputTokens: number;
     outputTokens: number;
