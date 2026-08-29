@@ -10,6 +10,14 @@
  *
  *   npx tsx scripts/query-benchmark.ts --profile dogfood --live --judge
  *   npx tsx scripts/query-benchmark.ts --profile dogfood --only Q1,Q14
+ *   npx tsx scripts/query-benchmark.ts --profile dogfood --live --repeat 3
+ *
+ * `--repeat N` is the default posture for any live claim. At temperature 0 the
+ * model still produced 60 distinct scripts in 60 runs (design §15.3), so one
+ * live run is a SAMPLE, not a verification. A single-run pass on Q18 was
+ * reported as fixed and then measured at 1-in-4 on re-run; a question that is
+ * neither 0/N nor N/N is the most informative row in the table, and a single
+ * run cannot show it.
  *
  * Judged cases are graded by a model against the ground-truth anchors the
  * corpus plants, and every such row is labelled `model-graded` in the output.
@@ -47,6 +55,8 @@ const flag = (name: string) => process.argv.includes(`--${name}`);
 /** One row of the benchmark table. */
 interface Row {
   id: string;
+  /** 0-based repeat index; rows with the same id differ only by this. */
+  run: number;
   klass: string;
   kind: string;
   outcome: string;
@@ -67,6 +77,7 @@ interface Row {
   answerHead: string;
   scriptChars?: number;
   script?: string;
+  unreadable?: number;
   unprofiled: number;
 }
 
@@ -200,100 +211,165 @@ async function main(): Promise<void> {
     },
   };
 
+  const repeat = Math.max(1, Number(arg("repeat", "1")));
   const started = Date.now();
-  const report = await runEval({
-    cases,
-    answerer: capturing,
-    seed,
-    profile,
-    only,
-    judge,
-  });
+
+  // One `runEval` per repeat, not one repeat inside `runEval`: each pass must
+  // see a fresh answerer AND a fresh grading pass, so a repeat cannot inherit
+  // state from the one before it. The per-question `freshAnswerer()` above
+  // already guards coverage accumulation within a pass.
+  const reports = [];
+  for (let run = 0; run < repeat; run++) {
+    if (repeat > 1) {
+      process.stderr.write(`\n--- repeat ${run + 1}/${repeat} ---\n`);
+    }
+    const report = await runEval({
+      cases,
+      answerer: capturing,
+      seed,
+      profile,
+      only,
+      judge,
+    });
+    reports.push(report);
+
+    for (const result of report.results) {
+      const testCase = cases.find((c) => c.id === result.id);
+      const answer = testCase ? answers.get(testCase.question) : undefined;
+      // `bytesScanned` and `unreadable` are declared on `QueryCoverage` as of
+      // the per-scope attribution fix, so this no longer needs a cast.
+      const cov = answer?.coverage;
+      rows.push({
+        id: result.id,
+        run,
+        klass: result.class,
+        kind: testCase?.expect.kind ?? "?",
+        outcome: result.outcome,
+        modelGraded: testCase?.expect.kind === "judged" && judge !== undefined,
+        ms: result.durationMs,
+        inTok: result.cost.inputTokens,
+        outTok: result.cost.outputTokens,
+        toolCalls: result.cost.toolCalls,
+        records: cov?.recordsScanned ?? 0,
+        bytes: cov?.bytesScanned ?? 0,
+        scopes: cov?.scopesScanned.length ?? 0,
+        complete: cov?.complete ?? false,
+        stoppedBecause: cov?.stoppedBecause,
+        method: cov?.method,
+        value: answer?.value,
+        expected:
+          testCase?.expect.kind === "numeric"
+            ? testCase.expect.value
+            : undefined,
+        reasons: result.reasons,
+        answerHead: (answer?.answer ?? "").replace(/\s+/g, " ").slice(0, 400),
+        scriptChars: answer?.script?.length,
+        script: answer?.script,
+        unreadable: cov?.unreadable,
+        unprofiled: cov?.unprofiledScopes?.length ?? 0,
+      });
+    }
+    answers.clear();
+  }
   const wall = Date.now() - started;
 
-  for (const result of report.results) {
-    const testCase = cases.find((c) => c.id === result.id);
-    const answer = testCase ? answers.get(testCase.question) : undefined;
-    // `bytesScanned` is produced by the tool layer and travels on the runtime
-    // object, but `QueryCoverage` does not declare it — so no typed consumer
-    // can read it without this cast. Reported as a defect, not papered over.
-    const cov = answer?.coverage as
-      | (NonNullable<typeof answer>["coverage"] & { bytesScanned?: number })
-      | undefined;
-    rows.push({
-      id: result.id,
-      klass: result.class,
-      kind: testCase?.expect.kind ?? "?",
-      outcome: result.outcome,
-      modelGraded: testCase?.expect.kind === "judged" && judge !== undefined,
-      ms: result.durationMs,
-      inTok: result.cost.inputTokens,
-      outTok: result.cost.outputTokens,
-      toolCalls: result.cost.toolCalls,
-      records: cov?.recordsScanned ?? 0,
-      bytes: cov?.bytesScanned ?? 0,
-      scopes: cov?.scopesScanned.length ?? 0,
-      complete: cov?.complete ?? false,
-      stoppedBecause: cov?.stoppedBecause,
-      method: cov?.method,
-      value: answer?.value,
-      expected:
-        testCase?.expect.kind === "numeric" ? testCase.expect.value : undefined,
-      reasons: result.reasons,
-      answerHead: (answer?.answer ?? "").replace(/\s+/g, " ").slice(0, 400),
-      scriptChars: answer?.script?.length,
-      script: answer?.script,
-      unprofiled: cov?.unprofiledScopes?.length ?? 0,
-    });
-  }
+  const totals = {
+    pass: reports.reduce((n, r) => n + r.totals.pass, 0),
+    fail: reports.reduce((n, r) => n + r.totals.fail, 0),
+    skipped: reports.reduce((n, r) => n + r.totals.skipped, 0),
+    inputTokens: reports.reduce((n, r) => n + r.totals.inputTokens, 0),
+    outputTokens: reports.reduce((n, r) => n + r.totals.outputTokens, 0),
+  };
 
   const out = {
     profile,
     seed,
     live,
+    repeat,
     judged: judge !== undefined,
     model: process.env.INFERENCE_MODEL ?? null,
     wallClockMs: wall,
-    totals: report.totals,
+    totals,
     rows,
   };
   const path =
     arg("out") ?? join(tmpdir(), `query-bench-${profile}-${Date.now()}.json`);
   await writeFile(path, JSON.stringify(out, null, 2));
 
-  // Table
-  const h = [
-    "id",
-    "class",
-    "kind",
-    "outcome",
-    "ms",
-    "in",
-    "out",
-    "calls",
-    "records",
-    "bytes",
-    "scopes",
-    "cmpl",
-    "stopped",
-  ];
+  const median = (xs: number[]): number => {
+    if (xs.length === 0) return 0;
+    const v = [...xs].sort((a, b) => a - b);
+    const mid = v.length >> 1;
+    return v.length % 2 ? v[mid] : Math.round((v[mid - 1] + v[mid]) / 2);
+  };
+
+  // Aggregate by question. The headline number is pass-count-out-of-N, never a
+  // single verdict: a row that is neither 0/N nor N/N is the one a single-run
+  // benchmark would have misreported, so it gets called out explicitly.
+  const ids = [...new Set(rows.map((r) => r.id))];
+  const agg = ids.map((id) => {
+    const rs = rows.filter((r) => r.id === id);
+    const passes = rs.filter((r) => r.outcome === "pass").length;
+    const skips = rs.filter((r) => r.outcome === "skip").length;
+    const graded = rs.length - skips;
+    const modes = [
+      ...new Set(
+        rs
+          .filter((r) => r.outcome === "fail")
+          .map((r) => r.stoppedBecause ?? r.reasons[0] ?? "wrong-answer")
+          .map((m) => m.slice(0, 40)),
+      ),
+    ];
+    const values = [
+      ...new Set(rs.map((r) => r.value).filter((v) => v != null)),
+    ];
+    return {
+      id,
+      klass: rs[0].klass,
+      kind: rs[0].kind,
+      modelGraded: rs[0].modelGraded,
+      passes,
+      graded,
+      skips,
+      flaky: passes > 0 && passes < graded,
+      ms: median(rs.map((r) => r.ms)),
+      inTok: median(rs.map((r) => r.inTok)),
+      outTok: median(rs.map((r) => r.outTok)),
+      calls: median(rs.map((r) => r.toolCalls)),
+      records: median(rs.map((r) => r.records)),
+      bytes: median(rs.map((r) => r.bytes)),
+      anyComplete: rs.some((r) => r.complete),
+      modes,
+      values,
+    };
+  });
+
   process.stdout.write(
-    `\n${h[0].padEnd(4)} ${h[1].padEnd(13)} ${h[2].padEnd(8)} ${h[3].padEnd(7)} ${h[4].padStart(7)} ${h[5].padStart(7)} ${h[6].padStart(6)} ${h[7].padStart(5)} ${h[8].padStart(8)} ${h[9].padStart(9)} ${h[10].padStart(6)} ${h[11].padStart(4)} ${h[12]}\n`,
+    `\n${"id".padEnd(4)} ${"class".padEnd(13)} ${"kind".padEnd(8)} ${"pass".padEnd(6)} ` +
+      `${"ms".padStart(7)} ${"in".padStart(8)} ${"out".padStart(6)} ${"calls".padStart(5)} ` +
+      `${"records".padStart(8)} ${"cmpl".padStart(4)}  failure mode\n`,
   );
-  for (const r of rows) {
+  for (const a of agg) {
+    const score =
+      a.graded === 0 ? `-/${a.skips}skip` : `${a.passes}/${a.graded}`;
     process.stdout.write(
-      `${r.id.padEnd(4)} ${r.klass.padEnd(13)} ${r.kind.padEnd(8)} ${r.outcome.padEnd(7)} ` +
-        `${String(r.ms).padStart(7)} ${String(r.inTok).padStart(7)} ${String(r.outTok).padStart(6)} ` +
-        `${String(r.toolCalls).padStart(5)} ${String(r.records).padStart(8)} ${String(r.bytes).padStart(9)} ` +
-        `${String(r.scopes).padStart(6)} ${(r.complete ? "yes" : "no").padStart(4)} ${r.stoppedBecause ?? ""}` +
-        `${r.modelGraded ? "  [model-graded]" : ""}\n`,
+      `${a.id.padEnd(4)} ${a.klass.padEnd(13)} ${a.kind.padEnd(8)} ${score.padEnd(6)} ` +
+        `${String(a.ms).padStart(7)} ${String(a.inTok).padStart(8)} ${String(a.outTok).padStart(6)} ` +
+        `${String(a.calls).padStart(5)} ${String(a.records).padStart(8)} ` +
+        `${(a.anyComplete ? "yes" : "no").padStart(4)}  ${a.modes.join("; ")}` +
+        `${a.flaky ? "   << FLAKY" : ""}${a.modelGraded ? "  [model-graded]" : ""}\n`,
     );
   }
 
-  const t = report.totals;
+  const flaky = agg.filter((a) => a.flaky);
+  const solid = agg.filter((a) => a.graded > 0 && a.passes === a.graded);
   process.stdout.write(
-    `\ntotals: pass ${t.pass}  fail ${t.fail}  skip ${t.skipped}\n` +
-      `tokens: ${t.inputTokens} in / ${t.outputTokens} out   wall ${(wall / 1000).toFixed(1)}s\n` +
+    `\nrepeats: ${repeat}   questions: ${ids.length}\n` +
+      `always-pass: ${solid.length} (${solid.map((a) => a.id).join(", ") || "none"})\n` +
+      `FLAKY:       ${flaky.length} (${flaky.map((a) => `${a.id} ${a.passes}/${a.graded}`).join(", ") || "none"})\n` +
+      `run-totals: pass ${totals.pass}  fail ${totals.fail}  skip ${totals.skipped}\n` +
+      `tokens: ${totals.inputTokens} in / ${totals.outputTokens} out   wall ${(wall / 1000).toFixed(1)}s\n` +
+      `coverage.complete ever true: ${agg.some((a) => a.anyComplete) ? "YES" : "NO"}\n` +
       `raw: ${path}\n`,
   );
 
