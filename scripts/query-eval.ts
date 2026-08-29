@@ -40,7 +40,6 @@ import {
   runEval,
   type EvalReport,
   type FixtureProfileName,
-  type QueryEvalCase,
 } from "@opendatalabs/personal-server-ts-core/query/evals";
 
 import { FsFixtureSink } from "./query-eval-fs-sink.js";
@@ -53,43 +52,19 @@ function arg(name: string, fallback?: string): string | undefined {
 const flag = (name: string): boolean => process.argv.includes(`--${name}`);
 
 /**
- * Mark every row a model decided, and say so again in a footer.
+ * Name the judge, and say plainly what its verdicts are worth.
  *
- * This is line surgery over `formatReport`'s output rather than a field on the
- * result, which is not where it belongs: the durable fix is `modelGraded` on
- * `EvalCaseResult` and a `[model-graded]` suffix inside `formatReport` itself,
- * both of which live in `runner.ts` / `types.ts`. Until that lands, the label
- * is applied here, because the alternative — a table where a model's opinion
- * and a computed comparison render identically — is the specific confusion this
- * whole harness is built to prevent. `formatReport` emits one line per result
- * as `  MARK  id ...`, so the id column is an exact anchor.
+ * The per-row `[model-graded]` label is no longer applied here: it is a field
+ * on `EvalCaseResult`, set in `runner.ts` where the verdict is actually made
+ * and rendered by `formatReport`. This used to be line surgery over that
+ * output, which could only infer which rows a model decided from the case
+ * list. What remains is the part the report genuinely cannot know — which
+ * model was asked — plus the standing caveat, which belongs next to the
+ * scoreboard rather than buried in a row.
  */
-function labelModelGraded(
-  text: string,
-  report: EvalReport,
-  cases: QueryEvalCase[],
-  judgeModel: string,
-): string {
-  const judgedIds = new Set(
-    cases.filter((c) => c.expect.kind === "judged").map((c) => c.id),
-  );
-  const graded = report.results
-    .filter((r) => judgedIds.has(r.id) && r.outcome !== "skipped")
-    .map((r) => r.id);
-  const gradedSet = new Set(graded);
-
-  const labelled = text
-    .split("\n")
-    .map((line) => {
-      const match = line.match(/^ {2}(?:PASS|FAIL|SKIP) {2}(\S+)/);
-      return match && gradedSet.has(match[1])
-        ? `${line}  [model-graded]`
-        : line;
-    })
-    .join("\n");
-
+function judgeFooter(report: EvalReport, judgeModel: string): string {
+  const graded = report.results.filter((r) => r.modelGraded).map((r) => r.id);
   return (
-    labelled +
     `\n\n  model-graded: ${graded.length} row(s) decided by ${judgeModel}` +
     `${graded.length > 0 ? ` — ${graded.join(", ")}` : ""}\n` +
     "  A model's verdict is not a measurement. Rows above without this label\n" +
@@ -187,14 +162,11 @@ async function main(): Promise<void> {
 
   const rendered = formatReport(report);
   process.stdout.write(
-    (judge
-      ? labelModelGraded(
-          rendered,
-          report,
-          cases,
-          judgeModel ?? liveProvider!.defaultModel,
-        )
-      : rendered) + "\n",
+    rendered +
+      (judge
+        ? judgeFooter(report, judgeModel ?? liveProvider!.defaultModel)
+        : "") +
+      "\n",
   );
 
   if (!keep) await rm(dir, { recursive: true, force: true });

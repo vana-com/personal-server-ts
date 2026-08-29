@@ -7,6 +7,14 @@
  * grader or the fixture, not in the agent under test. It is also the control
  * arm for phase 2's determinism measurement, which needs a known-zero-variance
  * baseline to measure against.
+ *
+ * The three ambiguous cases (Q1, Q14, Q18) declare a `resolution`, because the
+ * dual-rule runner grades them against the set the answer NAMES and an
+ * undeclared set is a failure however right the number is. Each string states
+ * the set the reference function beside it actually computes — read off the
+ * computation, not off `readings.ts`. If one ever stops describing what the
+ * reference does, the honest fix is to correct the string, never to pick the
+ * label that makes the case pass.
  */
 
 import type { FixtureSource } from "../fixtures/sink.js";
@@ -49,6 +57,12 @@ export function createReferenceAnswerer(source: FixtureSource): EvalAnswerer {
       return {
         ...base,
         value: Number(trap.correctHours.toFixed(4)),
+        // `sleepTrap(source, 31)` cuts at `lastDay - 30 days` and keeps
+        // `day >= cutoff`, so the set really is the trailing 31 days ending on
+        // the last day with data, inclusive.
+        resolution:
+          "the trailing 31 days ending on the last day with sleep data, that " +
+          "last day included; main sleep periods only",
         answer:
           `${trap.correctHours.toFixed(2)} hours per night on average, over ${trap.nights} of ` +
           `${trap.windowDays} nights with data. Main sleep periods only — naps excluded, ` +
@@ -156,6 +170,13 @@ export function createReferenceAnswerer(source: FixtureSource): EvalAnswerer {
       return {
         ...base,
         value: Number(trip.totalUsd.toFixed(2)),
+        // `tripReference` returns `inWindow + flight`, where `inWindow` sums
+        // EVERY currency inside the calendar window (JPY at that date's rate)
+        // and `flight` is the Delta charge that falls outside it.
+        resolution:
+          "every transaction dated inside the Japan trip window, all " +
+          "currencies converted at each transaction's own rate, plus the " +
+          "Delta flight booked before departure",
         answer:
           `The Japan trip resolves to ${trip.startDay}–${trip.endDay} from the calendar. ` +
           `$${trip.totalUsd.toFixed(2)} total: $${trip.inWindowOnlyUsd.toFixed(2)} spent in-country ` +
@@ -207,6 +228,13 @@ export function createReferenceAnswerer(source: FixtureSource): EvalAnswerer {
         return {
           ...base,
           value: Number(nutrition.meanKcalOnRunDays.toFixed(2)),
+          // `meanKcalOnRunDays` averages every qualifying run day that has a
+          // log, whatever its `complete` flag says — the stricter
+          // complete-logs-only figure is computed too, but it is not what
+          // `value` carries.
+          resolution:
+            "all logged run days: every day with a deduped run over 10km " +
+            "that also has a nutrition log",
           answer:
             `${nutrition.meanKcalOnRunDays.toFixed(0)} kcal on average across ` +
             `${nutrition.matchedDays} days with a run over 10km (distance > 10000 metres) and a ` +

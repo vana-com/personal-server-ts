@@ -322,6 +322,8 @@ async function runCase(
 
   let sharedOk = true;
   let numeric: NumericGrades | undefined;
+  /** Set only where a model actually returned the verdict. */
+  let modelGraded = false;
 
   switch (testCase.expect.kind) {
     case "numeric": {
@@ -359,6 +361,10 @@ async function runCase(
         testCase,
         answer,
       );
+      // Marked here, where the verdict is actually made. Reconstructing it
+      // downstream from `expect.kind === "judged"` cannot tell a row a model
+      // decided from one that skipped for want of a judge.
+      modelGraded = true;
       sharedOk = verdict.pass;
       if (!verdict.pass) shared.push(verdict.reason);
       break;
@@ -426,6 +432,7 @@ async function runCase(
     ...(answer.resolution !== undefined
       ? { resolution: answer.resolution }
       : {}),
+    ...(modelGraded ? { modelGraded: true } : {}),
     gradedBy,
     strictPass,
     resolutionOutcome: resolutionAware?.outcome ?? null,
@@ -498,8 +505,10 @@ export function formatReport(report: EvalReport): string {
         ? ""
         : `  strict:${result.strictPass ? "PASS" : "FAIL"}`;
     const reading = result.readingLabel ? `  «${result.readingLabel}»` : "";
+    // A model's opinion and a computed comparison must never render alike.
+    const judged = result.modelGraded ? "  [model-graded]" : "";
     lines.push(
-      `  ${mark[result.outcome]}  ${result.id.padEnd(4)} ${result.class.padEnd(14)} ${String(result.durationMs).padStart(6)}ms${strict}${reading}`,
+      `  ${mark[result.outcome]}  ${result.id.padEnd(4)} ${result.class.padEnd(14)} ${String(result.durationMs).padStart(6)}ms${strict}${reading}${judged}`,
     );
     for (const reason of result.reasons) lines.push(`          ${reason}`);
   }

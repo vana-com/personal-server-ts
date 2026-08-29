@@ -14,10 +14,14 @@ import { CoverageLedger } from "./coverage.js";
  * scope. The derivation is therefore kept, and these are the cases that stop
  * it being loosened later on the strength of the same wrong inference.
  *
- * The two reasons the flag nevertheless reads as always-false at the request
- * level are outside this file — the eval harness over-grants, and the
- * request-level merge ANDs each run's flag — and are recorded on the ledger's
- * own doc comment.
+ * The two reasons the flag nevertheless read as always-false at the request
+ * level are outside this file — the eval harness over-granted, and the
+ * request-level merge ANDed each run's flag — and both are now fixed, in
+ * `scripts/query-eval-harness.ts` and `server/query/sandbox-tool-host.ts`
+ * respectively. The per-run derivation asserted here is what makes the merge's
+ * disjunction sound, so these cases are load-bearing for that fix too:
+ * `coverage-merge.test.ts` relies on one `complete: true` run meaning the
+ * whole grant was streamed.
  */
 const tally = (records: number) => ({
   records,

@@ -70,6 +70,8 @@ export {
   Q1_READINGS,
   Q14_READINGS,
   Q18_READINGS,
+  READINGS_CORPUS,
   classifyResolution,
   gradeAgainstReadings,
+  readingsFor,
 } from "./readings.js";

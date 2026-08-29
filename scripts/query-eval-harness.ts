@@ -11,7 +11,11 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { CorpusManifest } from "@opendatalabs/personal-server-ts-core/query/evals";
+import type {
+  CorpusManifest,
+  EvalAnswerer,
+  EvalQueryRequest,
+} from "@opendatalabs/personal-server-ts-core/query/evals";
 import { createAgentAnswerer } from "../packages/core/src/query/agent/index.js";
 import {
   createFakeInferenceProvider,
@@ -35,20 +39,37 @@ export async function buildAgentAnswerer(
   corpusDir: string,
   manifest: CorpusManifest,
   liveProvider?: InferenceProvider,
-) {
+): Promise<EvalAnswerer> {
   // Scope ids come from the MANIFEST, not from filenames. Deriving them from
   // filenames yields `oura_sleep`, which matches no profile — the profiles
   // declare `oura.*` / `spotify.*` / `chatgpt.*`. That silently disabled the
   // entire T2 layer, the highest-leverage artifact in the design (§18.2), and
   // only a live run surfaced it: the model reported every scope as
   // unprofiled and inferred the schema rules itself.
-  const scopes = manifest.scopes.flatMap((s) =>
+  const corpusScopes = manifest.scopes.flatMap((s) =>
     s.files.map((f) => ({
       scope: s.scope,
       path: join(corpusDir, f),
       itemCount: s.records,
     })),
   );
+
+  /**
+   * The scopes ONE request may read, from that request's own grant.
+   *
+   * Handing the host every manifest scope made `grantedScopes` all 18 on every
+   * question however few the case declared, and quietly weakened four separate
+   * things at once: the model was given the whole corpus to answer a
+   * two-scope question; `coverage.complete`'s `everyGrantedScopeAccountedFor`
+   * conjunct became unsatisfiable by construction, because no question needs
+   * all 18; and `mustReportCoverage`, `gradeAbsence` and the scope-binding
+   * assertions all graded against a grant nobody had asked for. A grant is a
+   * per-request fact, so the list is built per request.
+   */
+  const scopesFor = (grantedScopes: readonly string[]) => {
+    const granted = new Set(grantedScopes);
+    return corpusScopes.filter((s) => granted.has(s.scope));
+  };
 
   // Scripted per question. Q1 is scripted for real — it drives the whole
   // nested path and lands on the §18.2 nap trap, so a pass here means the
@@ -110,25 +131,31 @@ vana.result({
     });
 
   const scratchDir = await mkdtemp(join(tmpdir(), "query-eval-scratch-"));
-  const tools = createSandboxToolHost({
-    sandbox: createNodeSandbox({ dataRoot: corpusDir }),
-    scopes,
-    dataRoot: corpusDir,
-    scratchDir,
-    budget: { toolCalls: 50, outputBytes: 1_000_000 },
-    limits: {
-      cpuMs: 30_000,
-      memoryMb: 512,
-      wallClockMs: 60_000,
-      maxOutputBytes: 1_000_000,
-    },
-  });
+  const name = liveProvider ? "agent-live" : "agent-loop";
 
-  return createAgentAnswerer({
-    provider,
-    tools,
-    name: liveProvider ? "agent-live" : "agent-loop",
-  });
+  return {
+    name,
+    async answer(request: EvalQueryRequest) {
+      // A fresh host per request, because the grant is per request — and
+      // because the host also accumulates coverage across the turns of one
+      // request. Reusing it across questions would carry one question's
+      // counters into the next.
+      const tools = createSandboxToolHost({
+        sandbox: createNodeSandbox({ dataRoot: corpusDir }),
+        scopes: scopesFor(request.grantedScopes),
+        dataRoot: corpusDir,
+        scratchDir,
+        budget: { toolCalls: 50, outputBytes: 1_000_000 },
+        limits: {
+          cpuMs: 30_000,
+          memoryMb: 512,
+          wallClockMs: 60_000,
+          maxOutputBytes: 1_000_000,
+        },
+      });
+      return createAgentAnswerer({ provider, tools, name }).answer(request);
+    },
+  };
 }
 
 /**

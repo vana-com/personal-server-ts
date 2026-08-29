@@ -48,15 +48,13 @@ import {
   DEFAULT_SEED,
   PROFILES,
   buildCases,
+  buildJudge,
   createReferenceAnswerer,
   generateInto,
   runEval,
-  type EvalJudge,
   type FixtureProfileName,
-  type QueryEvalCase,
 } from "@opendatalabs/personal-server-ts-core/query/evals";
 import type { QueryAnswer } from "../packages/core/src/query/agent/index.js";
-import type { InferenceProvider } from "../packages/core/src/derivatives/inference.js";
 
 import { FsFixtureSink } from "./query-eval-fs-sink.js";
 import { buildAgentAnswerer, buildLiveProvider } from "./query-eval-harness.js";
@@ -105,79 +103,6 @@ interface Row {
   unprofiled: number;
 }
 
-/**
- * A model judge, scoped as tightly as the rubric allows.
- *
- * It is handed the rubric, the planted ground truth, and the answer — and told
- * to fail anything it cannot verify against those anchors. The failure mode to
- * design against is a judge that rewards fluent prose, so the prompt makes the
- * anchors the only evidence that counts.
- */
-function buildJudge(provider: InferenceProvider, model?: string): EvalJudge {
-  return {
-    async judge(rubric: string, testCase: QueryEvalCase, answer) {
-      const facts = testCase.referenceFacts
-        ? JSON.stringify(testCase.referenceFacts, null, 2)
-        : "(none recorded)";
-      const reply = await provider.chat({
-        model: model ?? provider.defaultModel,
-        maxTokens: 1024,
-        messages: [
-          {
-            role: "system",
-            content:
-              "You grade one answer against one rubric. Reply with a single " +
-              'JSON object: {"pass": boolean, "reason": "<= 200 chars"}. ' +
-              "Nothing else.\n\n" +
-              "Grade ONLY against the rubric and the ground-truth facts. " +
-              "Fluent, confident, well-structured prose is not evidence. If a " +
-              "claim in the rubric cannot be checked against the facts given, " +
-              "fail it and say which claim. An answer that omits a required " +
-              "element fails even if everything it does say is true.",
-          },
-          {
-            role: "user",
-            content:
-              `QUESTION: ${testCase.question}\n\n` +
-              `RUBRIC (all of it must hold):\n${rubric}\n\n` +
-              `GROUND TRUTH (computed from the corpus, authoritative):\n${facts}\n\n` +
-              `COVERAGE REPORTED BY HOST: complete=${answer.coverage.complete}, ` +
-              `method=${answer.coverage.method ?? "n/a"}, ` +
-              `records=${answer.coverage.recordsScanned}\n\n` +
-              `ANSWER UNDER TEST:\n${answer.answer}`,
-          },
-        ],
-      });
-      const text = reply.content ?? "";
-      const match = text.match(/\{[\s\S]*\}/);
-      if (!match) {
-        return {
-          pass: false,
-          reason: `judge returned no JSON: ${text.slice(0, 120)}`,
-        };
-      }
-      try {
-        const parsed = JSON.parse(match[0]) as {
-          pass?: unknown;
-          reason?: unknown;
-        };
-        return {
-          pass: parsed.pass === true,
-          reason:
-            typeof parsed.reason === "string"
-              ? parsed.reason
-              : "(no reason given)",
-        };
-      } catch {
-        return {
-          pass: false,
-          reason: `judge JSON unparseable: ${match[0].slice(0, 120)}`,
-        };
-      }
-    },
-  };
-}
-
 async function main(): Promise<void> {
   const profile = (arg("profile", "dogfood") ??
     "dogfood") as FixtureProfileName;
@@ -204,11 +129,22 @@ async function main(): Promise<void> {
   // benchmark: reusing one answerer makes `recordsScanned` monotonically
   // increasing, so Q18 inherits everything Q1..Q17 touched. The first run of
   // this script did exactly that and reported 723,794 records for Q18.
+  //
+  // `buildAgentAnswerer` now builds the host per request as well — it has to,
+  // since the grant is per request — so this is belt and braces rather than
+  // the only thing standing between the table and that bug.
   const freshAnswerer = async () =>
     live
       ? await buildAgentAnswerer(dir, manifest, provider)
       : createReferenceAnswerer(source);
   const answerer = await freshAnswerer();
+  // The shared judge from `evals/judge.ts`, not a local copy. This script's
+  // fork was where the judge began, and it drifted: it never carried
+  // `testCase.notes` — the written-down trap — into the prompt, it threw on a
+  // relay hiccup instead of recording `judge-error:` and losing the whole
+  // sweep with it, and it coerced a non-boolean `pass` rather than failing the
+  // contract. One judge, or the benchmark and the eval grade differently from
+  // the same corpus on the same day.
   const judge =
     flag("judge") && provider
       ? buildJudge(provider, process.env.INFERENCE_MODEL)

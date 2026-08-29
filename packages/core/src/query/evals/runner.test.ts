@@ -90,6 +90,47 @@ describe("runEval", () => {
       .filter((r) => r.outcome === "skipped")
       .map((r) => r.id);
     expect(skipped.sort()).toEqual(judged.sort());
+    // A skip is not a model verdict. Nothing was decided, so nothing carries
+    // the label — this is the distinction a downstream reconstruction from
+    // `expect.kind === "judged"` cannot draw.
+    expect(report.results.filter((r) => r.modelGraded)).toEqual([]);
+  }, 60_000);
+
+  it("marks — and renders — only the rows a model actually decided", async () => {
+    // A stub judge, so this costs nothing and hits no relay. What is under
+    // test is the plumbing, not the verdict: `modelGraded` must be set where
+    // the verdict is made and must reach the report, so a model's opinion and
+    // a computed comparison never render identically.
+    const report = await runEval({
+      answerer: createReferenceAnswerer(source),
+      cases,
+      seed: DEFAULT_SEED,
+      profile: "small",
+      judge: {
+        judge: async () => ({ pass: true, reason: "stub" }),
+      },
+    });
+
+    const judged = cases
+      .filter((c) => c.expect.kind === "judged")
+      .map((c) => c.id)
+      .sort();
+    expect(
+      report.results
+        .filter((r) => r.modelGraded)
+        .map((r) => r.id)
+        .sort(),
+    ).toEqual(judged);
+
+    const text = formatReport(report);
+    for (const line of text.split("\n")) {
+      const match = line.match(/^ {2}(?:PASS|FAIL|SKIP) {2}(\S+)/);
+      if (!match) continue;
+      expect(
+        line.includes("[model-graded]"),
+        `${match[1]} label mismatch: ${line}`,
+      ).toBe(judged.includes(match[1]));
+    }
   }, 60_000);
 
   it("fails every gradeable case against the null answerer", async () => {

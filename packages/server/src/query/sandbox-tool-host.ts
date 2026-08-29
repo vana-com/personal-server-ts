@@ -154,8 +154,8 @@ export function createSandboxToolHost(options: SandboxToolHostOptions) {
    *
    * A question can take several turns, and coverage is a claim about the whole
    * request rather than about its last script. Merging is conservative in
-   * every direction: scopes union, counters sum, and `complete` survives only
-   * if every run was itself complete.
+   * every direction: scopes union, counters sum, and `complete` is carried
+   * from the runs that earned it rather than from the last one to speak.
    */
   /**
    * Merge per-scope, then re-derive the totals.
@@ -210,19 +210,43 @@ export function createSandboxToolHost(options: SandboxToolHostOptions) {
     const prev = accumulated;
     const skipped = new Map(prev.scopesSkipped.map((s) => [s.scope, s]));
     for (const s of next.scopesSkipped) skipped.set(s.scope, s);
+    // A prefiltered pass anywhere taints the request: the answer must say
+    // "earliest found", not "earliest" (prompt §5 gap 2).
+    const method =
+      prev.method === "prefiltered" || next.method === "prefiltered"
+        ? "prefiltered"
+        : "full";
     accumulated = {
       scopesScanned: [
         ...new Set([...prev.scopesScanned, ...next.scopesScanned]),
       ].sort(),
       ...mergeScopeTotals(prev, next),
       scopesSkipped: [...skipped.values()],
-      complete: prev.complete && next.complete,
-      // A prefiltered pass anywhere taints the request: the answer must say
-      // "earliest found", not "earliest" (prompt §5 gap 2).
-      method:
-        prev.method === "prefiltered" || next.method === "prefiltered"
-          ? "prefiltered"
-          : "full",
+      /*
+       * Coverage only ACCUMULATES, so `complete` is a disjunction.
+       *
+       * ANDing it made the ordinary probe-then-compute shape permanently
+       * false: a first turn that calls `vana.scopes()` and reads nothing is
+       * `complete: false` by construction, and it poisoned a request whose
+       * second turn went on to stream every granted scope end to end. A later
+       * turn cannot un-read what an earlier one read, so refusing to credit
+       * the reading turn is not conservatism, it is a wrong answer.
+       *
+       * The disjunction is sound because a run's own `complete` already means
+       * "every scope in THIS grant was streamed end to end, nothing skipped,
+       * nothing partial, nothing stopped it" (`CoverageLedger.snapshot`), and
+       * every run in a request is ledgered against the same grant. So one
+       * `true` is a witness that the whole grant was covered.
+       *
+       * The prefilter taint is re-applied here, against the MERGED method,
+       * because it is the one conjunct the ledger enforces per run that a
+       * disjunction would otherwise drop. The `stoppedBecause` taint is not
+       * re-applied: `agent/loop.ts` already ANDs `stoppedBecause === undefined`
+       * into the request-level flag, and it — unlike this merge — knows whether
+       * the request ended cleanly or actually stopped.
+       */
+      complete: (prev.complete || next.complete) && method === "full",
+      method,
       ...((prev.stoppedBecause ?? next.stoppedBecause)
         ? { stoppedBecause: prev.stoppedBecause ?? next.stoppedBecause }
         : {}),

@@ -102,6 +102,14 @@ export interface EvalCaseResult {
    * without this the two are the same failing row.
    */
   resolution?: string;
+  /**
+   * True when a model, not a computed comparison, decided this row.
+   *
+   * Set where the verdict is made rather than reconstructed downstream, so a
+   * report cannot render a judge's opinion and an arithmetic check
+   * identically. A judge's verdict is not a measurement.
+   */
+  modelGraded?: boolean;
 
   /* --- the two grading rules, recorded side by side --- */
 

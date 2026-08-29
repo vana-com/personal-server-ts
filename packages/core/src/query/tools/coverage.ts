@@ -94,13 +94,19 @@ export function effectiveFor(t: ScopeTally): Tally {
  * and Q11's never read `oura.heartrate` before answering about heart rate.
  * Those are exactly the reads whose absence should falsify a coverage claim.
  *
- * The flag reads as always-false at the request level for two reasons outside
- * this file, both recorded in the phase report: the eval harness grants the
- * tool host all 18 corpus scopes rather than the case's two or three, so
- * `everyGrantedScopeAccountedFor` is unsatisfiable there; and the request-level
- * merge ANDs each run's flag, so one exploratory turn that reads nothing
- * poisons a request that later reads everything. Neither is a defect in this
- * derivation.
+ * The flag nevertheless read as always-false at the *request* level for two
+ * reasons outside this file, neither of them a defect in this derivation, and
+ * both since fixed:
+ *
+ *  - the eval harness granted the tool host all 18 corpus scopes rather than
+ *    the case's two or three, which made `everyGrantedScopeAccountedFor`
+ *    unsatisfiable there — no question needs all 18. The harness now narrows
+ *    the host to the request's own grant (`scripts/query-eval-harness.ts`);
+ *  - the request-level merge ANDed each run's flag, so one exploratory turn
+ *    that read nothing poisoned a request that later read everything. It now
+ *    ORs them, which is sound precisely *because* the conjuncts above are
+ *    evaluated per run against the same grant: one true run is a witness that
+ *    the whole grant was covered (`server/query/sandbox-tool-host.ts`).
  */
 export class CoverageLedger {
   readonly #granted: Set<string>;
