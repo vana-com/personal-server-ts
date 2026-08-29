@@ -347,7 +347,9 @@ describe("computeQuestion", () => {
         respond: () => {
           attempts += 1;
           if (attempts < 3) {
-            throw new InferenceRequestError("rate limited", 429);
+            throw new InferenceRequestError("rate limited", 429, {
+              code: "httpError",
+            });
           }
           return { content: '{"answer":"third time","evidence":"e"}' };
         },
@@ -363,7 +365,9 @@ describe("computeQuestion", () => {
       provider: createFakeInferenceProvider({
         respond: () => {
           permanent += 1;
-          throw new InferenceRequestError("bad request", 400);
+          throw new InferenceRequestError("bad request", 400, {
+            code: "httpError",
+          });
         },
       }),
     });
@@ -380,7 +384,9 @@ describe("computeQuestion", () => {
       provider: createFakeInferenceProvider({
         respond: () => {
           transport += 1;
-          throw new InferenceRequestError("no response", null);
+          throw new InferenceRequestError("no response", null, {
+            code: "transport",
+          });
         },
       }),
     });

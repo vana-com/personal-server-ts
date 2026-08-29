@@ -229,15 +229,29 @@ function gradeNumeric(
 /* ------------------------------------------------------------------ */
 
 /**
- * Language that marks a mention as ruled out rather than asserted.
+ * Language that marks a mention as *ruled out* rather than asserted.
  *
  * Concept-first, like `readings.ts`'s signals: these name the *act* of holding
- * two things apart — attributing something elsewhere, or declaring that more
- * than one entity answers to the query term — not any phrasing observed in a
- * transcript.
+ * two things apart — attributing something elsewhere, setting it aside, saying
+ * it is not the thing asked about — not any phrasing observed in a transcript.
+ *
+ * **Announcing an ambiguity is deliberately NOT in this set**, and that
+ * distinction is the whole rule. "There are two different people named Sarah",
+ * "another Sarah", "two distinct individuals" report that more than one entity
+ * answers to the query term. Reporting that is not resolving it: an answer can
+ * say "there are two" and then assert both as co-equal answers, which is the
+ * opposite of ruling one out. These forms were in this set and produced a false
+ * positive on the sweep's Q5 run 0 — an answer that named the decoy as one of
+ * two answers was exonerated with the reason "appears only where the answer
+ * rules it out", which was not true of it. Ruling out is directional and is
+ * performed *on* a term; a headcount is neither.
+ *
+ * `distinct` is admitted only in its directional form `distinct from`, for the
+ * same reason: "two distinct people" is a count, "distinct from Sarah Nguyen"
+ * is an exclusion.
  */
-const EXCLUSION_MARKER =
-  /\b(disambiguat\w*|distinct\w*|distinguish\w*|differentiat\w*|not to be confused|different (?:person|people|individual\w*)|two (?:different|distinct|separate)|another (?:person|individual)|exclud\w*|excepting|separate from|apart from|other than|rather than|as opposed to|unlike|not the same|unrelated to|does not refer|do not refer)\b/i;
+const RULES_OUT =
+  /\b(disambiguat\w*|distinguish\w*|differentiat\w*|not to be confused|distinct from|exclud\w*|excepting|separate from|apart from|other than|rather than|as opposed to|unlike|not the same|unrelated to|does not refer|do not refer)\b/i;
 
 /**
  * A markdown list marker: `1.`, `2)`, `-`, `*`, `+`, `•`.
@@ -245,8 +259,8 @@ const EXCLUSION_MARKER =
  * The ordinal is capped at two digits so a year ending a sentence is not one.
  * "…in a direct message on March 30, 2023. 2. **Sarah Nguyen**…" splits into
  * three blocks under an unbounded `\d+`, the middle one being the bare string
- * `2023.`, which is not a list item — and that broke the run of items the
- * ambiguity lead-in governs, one block before the item holding the decoy.
+ * `2023.`, which is not a list item — and that ends the run of items a lead-in
+ * governs one block early, silently.
  */
 const LIST_MARKER = /^\s*(?:\d{1,2}[.)]|[-*+•])\s/;
 const BLOCK_BOUNDARY = /\n+|\s+(?=(?:\d{1,2}[.)]|[-*+•])\s)/g;
@@ -274,15 +288,26 @@ function split(text: string, boundary: RegExp, from = 0): Span[] {
  * The regions of an answer in which naming an excluded term is disambiguation
  * rather than assertion.
  *
- * Two shapes, both observed and both honest:
+ * Two shapes, and both require {@link RULES_OUT} language — an announcement
+ * that the query term is ambiguous buys nothing on its own:
  *
  * 1. **A clause that rules the term out.** "Distinct from Sarah Nguyen
  *    (`sarah.nguyen@partner.io`, `snguyen`), who is an external partner
  *    contact." The exclusion is local to the sentence.
- * 2. **A lead-in that governs a list.** "There are two different people named
- *    Sarah in your records, and both recommended Thai restaurants:" followed
- *    by one list item per person. The disambiguation is stated once and the
- *    enumeration under it *is* the resolution, so each item inherits it.
+ * 2. **A lead-in that rules terms out and governs a list.** "Excluded from this
+ *    summary:" followed by one item per excluded entity. The exclusion is
+ *    stated once and each item inherits it.
+ *
+ * Shape 2 used to accept an *ambiguity* lead-in — "There are two different
+ * people named Sarah…:" over a list giving one answer per person — on the
+ * reasoning that "the enumeration under it *is* the resolution". It is not.
+ * Such a list asserts every item, including the decoy, as an answer; naming the
+ * ambiguity above it does not rule any of them out. That reading exonerated the
+ * sweep's Q5 run 0 while an answer with the same content failed for saying "two
+ * people" instead of "two different people", which is a grader artifact, not a
+ * difference in the answers. Requiring `RULES_OUT` in the lead-in removes it
+ * without removing the shape: a lead-in that genuinely sets its items aside
+ * still governs them.
  *
  * The inherited scope is deliberately bounded at the first thing that is not a
  * list item. Q17's answers open with "…distinguishing her from Sarah Nguyen:"
@@ -297,12 +322,12 @@ function exclusionContexts(text: string): Span[] {
     const body = text.slice(block.start, block.end);
 
     for (const sentence of split(body, SENTENCE_BOUNDARY, block.start)) {
-      if (EXCLUSION_MARKER.test(text.slice(sentence.start, sentence.end))) {
+      if (RULES_OUT.test(text.slice(sentence.start, sentence.end))) {
         out.push(sentence);
       }
     }
 
-    if (!EXCLUSION_MARKER.test(body) || !/:\s*$/.test(body)) continue;
+    if (!RULES_OUT.test(body) || !/:\s*$/.test(body)) continue;
     for (const next of blocks.slice(i + 1)) {
       const following = text.slice(next.start, next.end);
       if (following.trim() === "") continue;
@@ -317,16 +342,22 @@ function exclusionContexts(text: string): Span[] {
  * Grade a `set` case: required mentions present, excluded ones not asserted.
  *
  * **Containment alone cannot tell naming an entity from including its data**,
- * and it punished the runs that resolved the corpus's planted ambiguity
- * correctly. Q5 found the Thai restaurant on every anchor, noticed there are
- * two Sarahs, and presented one recommendation per person — failed for naming
- * the decoy. Q17 resolved the alias sets and was failed for the sentence
- * saying *whom it had excluded*. Implementation plan §6 left this open; the
- * user has now decided it: **surfacing the ambiguity explicitly is acceptable,
- * silently mixing the two people's data is not.**
+ * and it punished Q17, which resolved the alias sets and was failed for the
+ * sentence saying *whom it had excluded*. Implementation plan §6 left this
+ * open; the user has now decided it: **surfacing the ambiguity explicitly is
+ * acceptable, silently mixing the two people's data is not.**
  *
  * So an excluded term is a violation when it is asserted, and not when every
  * occurrence sits inside an {@link exclusionContexts} region.
+ *
+ * "Surfacing the ambiguity" means saying which entity the answer is *not*
+ * about. It does not mean declining to choose. Q5's sweep answers report both
+ * Sarahs' restaurants as co-equal answers to "what was the name of that Thai
+ * restaurant"; the decoy is asserted, never set aside, so it is a violation —
+ * see {@link RULES_OUT}. Whether presenting both is the better *product*
+ * behaviour is plan §6's remaining open item and a human's call; what is fixed
+ * here is only that the grader must not answer it by accident, differently for
+ * two answers that say the same thing.
  *
  * The gate that keeps this from being a rubber stamp: **exoneration is
  * available only to an answer that already carries every required mention.**
@@ -386,6 +417,72 @@ function gradeSet(
   return ok;
 }
 
+/**
+ * Language naming records the scan could not read.
+ *
+ * Concept-first, like {@link RULES_OUT}: the *fact* that text was not obtained
+ * from a record, however the model words it. Two forms, because English offers
+ * two and the model uses both:
+ *
+ * 1. **A word that already means it** — `unreadable`, `corrupt`, `no text
+ *    layer`. Self-contained.
+ * 2. **A reading verb under a negation** — "could not be read", "unable to
+ *    parse", "were not searched". Written as a negation followed by a verb
+ *    within a short span rather than as fixed phrases, because the two are not
+ *    adjacent in practice: the reference answerer says "could not be
+ *    **text-**extracted", which every adjacency spelling of this misses.
+ * 3. **The same thing with the words the other way round** — "extraction
+ *    failed". Kept to `fail` and kept tight, because the general reverse order
+ *    is not safe: "were read with no errors" is a negation near a reading verb
+ *    and means the opposite.
+ */
+const UNREADABLE_CUE =
+  /\b(?:unreadable|not readable|unparse\w*|undecodable|unextractable|corrupt\w*|(?:no|without a?n?) text layer)\b|\b(?:not|n't|never|no|fail\w*|unable|omitted)\b[^.]{0,20}?\b(?:read|readable|pars\w*|extract\w*|open\w*|decod\w*|search\w*|index\w*)\b|\b(?:extract\w*|pars\w*|read|decod\w*|ocr|index\w*)\b[^.]{0,10}?\bfail\w*/i;
+
+/**
+ * How far apart the count and the cue may sit and still be one assertion.
+ *
+ * Same sentence is the primary bound; this bounds the sentence, so a long
+ * sentence that mentions the number for one reason and unreadable records for
+ * another does not read as a claim about both. "22 documents in the archive
+ * could not be read" is ~30 characters end to end, so there is real headroom.
+ */
+const UNREADABLE_PROXIMITY_CHARS = 60;
+
+/**
+ * Does the answer *assert* `count` about the records it could not read?
+ *
+ * This was `answer.includes(String(count))`, which a date, an id or a record
+ * count satisfies — the integrity rule (prompt doc §1) is that an incomplete
+ * scan says so *in the prose*, and a bare digit says nothing. Q8 passed 3/3
+ * under it while only one run's retained text visibly stated the figure.
+ *
+ * The rule: the count and an {@link UNREADABLE_CUE} must occur in the same
+ * sentence, within {@link UNREADABLE_PROXIMITY_CHARS} of each other, in either
+ * order — so "22 documents could not be read", "22 unreadable", "22 files
+ * failed extraction" and "of these, 22 had no text layer" all count, and
+ * "…on December 22" does not. Word-bounded so `1,022` is not a match.
+ */
+function statesUnreadableCount(text: string, count: number): boolean {
+  const number = new RegExp(`\\b${count}\\b`, "g");
+  for (const sentence of split(text, SENTENCE_BOUNDARY)) {
+    const body = text.slice(sentence.start, sentence.end);
+    number.lastIndex = 0;
+    for (let m = number.exec(body); m; m = number.exec(body)) {
+      // Widen from the digits by the proximity bound on both sides, then ask
+      // whether a cue falls inside that window. Clamped to the sentence so the
+      // window can never reach across into a neighbouring claim.
+      const from = Math.max(0, m.index - UNREADABLE_PROXIMITY_CHARS);
+      const to = Math.min(
+        body.length,
+        m.index + m[0].length + UNREADABLE_PROXIMITY_CHARS,
+      );
+      if (UNREADABLE_CUE.test(body.slice(from, to))) return true;
+    }
+  }
+  return false;
+}
+
 function gradeAbsence(
   testCase: QueryEvalCase,
   answer: EvalQueryAnswer,
@@ -412,7 +509,7 @@ function gradeAbsence(
     }
     // The integrity rule (prompt doc §1): an incomplete scan must say so in the
     // answer text, not only in metadata.
-    if (!answer.answer.includes(String(expected.unreadable))) {
+    if (!statesUnreadableCount(answer.answer, expected.unreadable)) {
       reasons.push(
         `answer text does not mention the ${expected.unreadable} unreadable records`,
       );

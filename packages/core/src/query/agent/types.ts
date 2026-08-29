@@ -39,6 +39,16 @@ export type QueryStoppedBecause =
   | "policyDenied"
   | "sandboxUnavailable"
   | "contractViolation"
+  /**
+   * The provider kept returning a reply with no content because it discarded a
+   * tool call it could not parse.
+   *
+   * Its own reason rather than `error` because it is a specific, recognisable
+   * provider behaviour with a specific non-response — do not raise the token
+   * budget, it is not a truncation — and because a run that stopped this way
+   * has to be distinguishable from one that crashed. See `agent/loop.ts`.
+   */
+  | "malformedToolCall"
   | "error";
 
 export interface QueryCoverage {

@@ -91,12 +91,14 @@ function keyFetchError(err: unknown): InferenceRequestError {
       {
         errorType: `e2ee_attestation_${err.code}`,
         retryable: err.code === "fetch_failed",
+        code: "e2ee",
       },
     );
   }
   const name = err instanceof Error ? err.name : "Error";
   return new InferenceRequestError(`e2ee key fetch failed (${name})`, null, {
     retryable: false,
+    code: "e2ee",
   });
 }
 
@@ -172,7 +174,11 @@ export function createPhalaE2eeEncryption(
         throw new InferenceRequestError(
           "e2ee requires a non-empty request model",
           null,
-          { errorType: "e2ee_invalid_payload_model", retryable: false },
+          {
+            errorType: "e2ee_invalid_payload_model",
+            retryable: false,
+            code: "e2ee",
+          },
         );
       }
       const gatewayKey = await getKey();
@@ -204,7 +210,7 @@ export function createPhalaE2eeEncryption(
           throw new InferenceRequestError(
             `e2ee request encryption failed (${name})`,
             null,
-            { retryable: false },
+            { retryable: false, code: "e2ee" },
           );
         }
         encrypted.push({ ...message, content });
@@ -235,7 +241,11 @@ export function createPhalaE2eeEncryption(
             throw new InferenceRequestError(
               `e2ee response decryption failed for ${field} (${detail})`,
               null,
-              { errorType: "e2ee_decryption_failed", retryable: false },
+              {
+                errorType: "e2ee_decryption_failed",
+                retryable: false,
+                code: "e2ee",
+              },
             );
           }
         },

@@ -460,6 +460,60 @@ describe("absence grading", () => {
       `does not mention the ${unreadable} unreadable records`,
     );
   }, 30_000);
+
+  it("REJECTS an incidental digit standing in for the unreadable count", async () => {
+    /*
+     * The negative control on the strengthened prose rule. This was
+     * `answer.includes("22")`, which a date, an id or any record count
+     * satisfies — so an answer that never says anything went unread could pass
+     * the integrity check on a calendar reference. Both digits here are real
+     * facts about the scan and neither is a claim about unreadable records.
+     */
+    const { recordsScanned, unreadable } = q8Coverage();
+    const result = await run(
+      "Q8",
+      scripted({
+        answer:
+          `No conflicting agreement was found. The most recent amendment is ` +
+          `dated December ${unreadable}, and ${recordsScanned} documents were ` +
+          `scanned in ${unreadable} seconds.`,
+        coverage: { recordsScanned, unreadable, complete: true },
+      }),
+    );
+    expect(result.outcome).toBe("fail");
+    expect(result.reasons.join(" ")).toContain(
+      `does not mention the ${unreadable} unreadable records`,
+    );
+  }, 30_000);
+
+  it("accepts the count stated about the unreadable records, however worded", async () => {
+    /*
+     * The positive control: the rule must not become a phrasing test. Five
+     * wordings the model actually reaches for, none of them the one the
+     * passing case above uses.
+     */
+    const { recordsScanned, unreadable } = q8Coverage();
+    const wordings = [
+      `${unreadable} documents could not be read`,
+      `${unreadable} unreadable files were skipped`,
+      `${unreadable} files failed extraction`,
+      // The words the other way round, which every negation-first spelling of
+      // the rule misses.
+      `extraction failed for ${unreadable} documents`,
+      `${unreadable} of them have no text layer`,
+    ];
+    for (const wording of wordings) {
+      const result = await run(
+        "Q8",
+        scripted({
+          answer: `No conflicting agreement was found; ${wording}.`,
+          coverage: { recordsScanned, unreadable, complete: true },
+        }),
+      );
+      expect(result.reasons, wording).toEqual([]);
+      expect(result.outcome, wording).toBe("pass");
+    }
+  }, 60_000);
 });
 
 /* ------------------------------------------------------------------ */
@@ -474,7 +528,9 @@ describe("absence grading", () => {
  * The answers are built from each case's own `contains` / `excludes` rather
  * than transcribed from the sweep, so what is under test is the *rule* — an
  * excluded term ruled out, versus the same term asserted — and not one run's
- * wording.
+ * wording. The one exception is the Q5 pair below, which is transcribed on
+ * purpose: what it pins is that two real answers saying the same thing graded
+ * differently, and that only reproduces in their own words.
  */
 describe("set grading", () => {
   const q17 = (): { contains: string[]; excludes: string[] } => {
@@ -483,50 +539,74 @@ describe("set grading", () => {
     return { contains: c.expect.contains, excludes: c.expect.excludes ?? [] };
   };
 
-  it("passes an answer that resolves the ambiguity and enumerates both people", async () => {
-    // Q5's shape on all three sweep runs: the needle found, the second Sarah
-    // noticed, one recommendation reported per person. The decoy is named
-    // under a lead-in that declares the ambiguity and governs the list.
-    const q5 = dogfood.find((c) => c.id === "Q5")!;
-    if (q5.expect.kind !== "set") throw new Error("Q5 should be a set case");
-    const [wanted] = q5.expect.contains;
-    const [decoy] = q5.expect.excludes!;
-    const result = await run(
-      "Q5",
-      scripted({
-        answer:
-          "There are two different people named Sarah in your records, and both " +
-          "recommended Thai restaurants:\n\n" +
-          `1. **Sarah Johnson** (\`sarahj\`) recommended **${wanted}**.\n` +
-          `2. **Sarah Nguyen** (\`snguyen\`) recommended **${decoy}**.\n`,
-      }),
+  it("REJECTS an ambiguity lead-in over a list that asserts the decoy as an answer", async () => {
+    /*
+     * The defect this replaces: these two answers are the sweep's Q5 run 0 and
+     * run 1, verbatim as retained, and they say the same thing — both report
+     * two Sarahs, both give Baan Saothong for one and the decoy for the other,
+     * neither rules either out. Run 0 passed and run 1 failed, on nothing but
+     * "two different people" matching the exclusion regex where "two people"
+     * did not; the lead-in branch then exonerated every list item after it,
+     * and the audit line claimed the decoy "appears only where the answer
+     * rules it out", which was false of that answer.
+     *
+     * Asserted together so the pin is the *agreement*, not either verdict:
+     * identical content must grade identically however it is worded.
+     *
+     * Whether presenting both Sarahs should pass at all is plan §6's open
+     * item and a human's call. This only fixes the grader answering it by
+     * coin flip.
+     */
+    const answers = [
+      "There are recommendations from two different people named Sarah in " +
+        "your Slack messages: 1. **Sarah Johnson** (`sarahj` in `#dm-sarahj`): " +
+        'Recommended **Baan Saothong** ("on the corner by the station", ' +
+        "specifically suggesting the boat noodles). 2. **Sarah Nguyen** " +
+        "(`snguyen` in `#dm-snguyen`): Recommended **Golden Orchid Kitchen** " +
+        '("near the office", described as the reliable option).',
+      "There are two people named Sarah in your records who recommended Thai " +
+        "restaurants: 1. **Sarah Johnson** (`sarahj`): Recommended **Baan " +
+        'Saothong** ("on the corner by the station. get the boat noodles.") ' +
+        "via Slack DM on March 30, 2023. 2. **Sarah Nguyen** (`snguyen` / " +
+        "`sarah.nguyen@partner.io`): Recommended **Golden Orchid Kitchen** " +
+        '("near the office, Golden Orchid Kitchen is the reliable one.") via ' +
+        "Slack DM.",
+    ];
+
+    const results = await Promise.all(
+      answers.map((answer) => run("Q5", scripted({ answer }))),
     );
-    expect(result.outcome).toBe("pass");
-    expect(result.reasons.join(" ")).toContain("[disambiguated]");
+
+    expect(results.map((r) => r.outcome)).toEqual(["fail", "fail"]);
+    for (const result of results) {
+      const reasons = result.reasons.join(" ");
+      expect(reasons).toContain("contains excluded mention: Golden Orchid");
+      expect(reasons).not.toContain("[disambiguated]");
+    }
   }, 30_000);
 
-  it("does not mistake a year ending a sentence for the next list marker", async () => {
+  it("still lets a lead-in that rules its items out govern the list", async () => {
     /*
-     * The sweep's Q5 run 0, whitespace and all — the citation dates put "2023."
-     * between the two items. An unbounded ordinal splits that into a block of
-     * its own, which is not a list item, which ends the run of items the
-     * ambiguity lead-in governs exactly one block before the item holding the
-     * decoy. The rule then failed the run it was written to pass.
+     * The control on the tightening: the lead-in shape is narrowed, not
+     * deleted. A lead-in whose items ARE the exclusions still covers them, and
+     * a year ending a sentence between two items still must not be read as the
+     * next ordinal — an unbounded `\d+` splits "…March 30, 2023." into a block
+     * that is not a list item, ending the governed run one block before the
+     * item holding the decoy.
      */
     const q5 = dogfood.find((c) => c.id === "Q5")!;
     if (q5.expect.kind !== "set") throw new Error("Q5 should be a set case");
     const [wanted] = q5.expect.contains;
-    const [decoy] = q5.expect.excludes!;
+    const [decoy, other] = q5.expect.excludes!;
     const result = await run(
       "Q5",
       scripted({
         answer:
-          "There are two different people named Sarah in your records, and both " +
-          "recommended Thai restaurants on Slack: " +
-          `1. **Sarah Johnson** (\`sarahj\`) recommended **${wanted}** in a ` +
-          "direct message on March 30, 2023. " +
-          `2. **Sarah Nguyen** (\`snguyen\`) recommended **${decoy}** in a ` +
-          "direct message on October 2, 2024.",
+          `Sarah recommended **${wanted}**, in a direct message on March 30, ` +
+          "2023. Excluded from that answer, as recommendations by other " +
+          "people rather than by Sarah: " +
+          `1. **${decoy}**, recommended by Sarah Nguyen on March 30, 2023. ` +
+          `2. **${other}**, recommended by a colleague.`,
       }),
     );
     expect(result.outcome).toBe("pass");

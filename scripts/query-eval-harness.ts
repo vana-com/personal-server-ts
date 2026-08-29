@@ -93,6 +93,46 @@ export function retainScripts(all: readonly string[]): {
 }
 
 /**
+ * Per-row ceiling on retained answer text, in characters.
+ *
+ * The dump kept a 400-character `answerHead` and nothing else, which blocked
+ * three separate checks on the last sweep at once: whether Q17's answer *body*
+ * mixes the two Sarahs' data, whether Q8's runs state the 22 unreadable
+ * documents in prose rather than only in metadata, and any counterfactual
+ * regrade of an old row under a changed rule. A grader that reads the whole
+ * answer cannot be audited from a dump that keeps a tenth of it.
+ *
+ * 20k is well clear of anything the sweeps produce — answers run from a few
+ * hundred to a few thousand characters — so this is a runaway guard rather
+ * than a policy, unlike {@link SCRIPTS_CHAR_BUDGET}, which does bite. Every
+ * row records `answerChars` regardless, so a reader can see whether it ever
+ * started to.
+ */
+export const ANSWER_CHAR_BUDGET = 20_000;
+
+/**
+ * Fit an answer into the budget, from the front.
+ *
+ * Prose is truncated rather than dropped, the opposite of
+ * {@link retainScripts}: half a program is not auditable, but the first 20k
+ * characters of an answer are, and the front is where an answer states its
+ * result. The caller records `chars` — the true length — beside the text, so a
+ * truncated row is visibly truncated instead of silently short.
+ */
+export function retainAnswer(text: string): {
+  kept: string;
+  chars: number;
+  elided: number;
+} {
+  const elided = Math.max(0, text.length - ANSWER_CHAR_BUDGET);
+  return {
+    kept: elided === 0 ? text : text.slice(0, ANSWER_CHAR_BUDGET),
+    chars: text.length,
+    elided,
+  };
+}
+
+/**
  * Wire the agent loop over the generated corpus.
  *
  * Uses a scripted provider, not a live relay. The point is that
@@ -387,6 +427,13 @@ function describeReply(
  * a recurrence prints exactly the discriminator that is missing today.
  *
  * `QUERY_INFERENCE_DIAG=<path>` appends the same records as JSONL.
+ *
+ * READING THE RETRIES: `maxTokens` used to double on every re-ask, so it
+ * doubled as an attempt index. It no longer does for a dropped tool call —
+ * `agent/loop.ts` re-asks those at the same budget on purpose — so group
+ * consecutive records by `promptTokens` instead. The transcript does not
+ * change between a re-ask and the failure it re-asks, so a run of equal
+ * `promptTokens` is one turn's attempts.
  */
 function diagnosticFetch(diagPath: string | undefined): typeof fetch {
   return async (input, init) => {

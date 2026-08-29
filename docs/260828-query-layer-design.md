@@ -1499,6 +1499,29 @@ precisely §3's stated Q14 difficulty: the trip is defined by two disjoint rules
 a date window and a semantically-related charge outside it, and the harder half
 is knowing you need both.
 
+**Confirmed 2026-08-29, by a route that briefly looked like a refutation.**
+The scope restoration was expected to dissolve the under-composition: §19.8's
+`fx.rates` run had reached `7728.3`, the whole window in every currency, so
+granting it again should have left only the flight to find. It did not. Across
+N=3 with `fx.rates` granted, all three runs returned **5208.88** against
+`9146.9` — an error of exactly **3938.02**, which is the in-window USD spend.
+`5208.88` is `3790.28` (the JPY charges, converted at each date's rate) plus
+`1418.60` (the pre-booked flight): the model took the currency-conversion rule
+and the outside-the-window rule and dropped the plain in-window dollar charges
+between them. **Under-composition survives the scope restoration**, and §19.10's
+diagnosis stands as written.
+
+Two details worth keeping. The resolution grader classified two of the three as
+`inWindowPlusFlight` on their prose, but each declaration in fact names a
+JPY-only set plus the flight — the number is still exactly the set declared, and
+the label match is the grader's coarseness, not the model overclaiming. And the
+stuffed-context baseline arm reproduces the same composition on all three runs,
+returning `5208.88` twice and `5108.88` once, its declared transaction count
+wandering 38 / 48 / 54 while the total does not move. **Composition and
+computation fail separately**: the baseline gets the same set wrong and, on one
+run, additionally gets the arithmetic wrong — so this is not an artifact of the
+code-writing path, and fixing the sum would not fix the set.
+
 ### 19.11 A stronger model resolves better and scores worse
 
 `gemini-3.1-pro-preview`, same protocol, `temperature: 0`, `dogfood`, N=3. This

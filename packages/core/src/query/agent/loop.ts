@@ -19,9 +19,10 @@
  * model writes; everything trustworthy lives in the host's counters.
  */
 
-import type {
-  InferenceMessage,
-  InferenceProvider,
+import {
+  InferenceRequestError,
+  type InferenceMessage,
+  type InferenceProvider,
 } from "../../derivatives/inference.js";
 import { buildSystemPrompt } from "./prompt.js";
 import { parseTurn, repairMessage, type ParseFailure } from "./contract.js";
@@ -60,8 +61,12 @@ export interface QueryLoopOptions {
    */
   maxTokens?: number;
   /**
-   * How many times to re-ask when a turn comes back with no content at all.
-   * Each retry raises the completion budget; see {@link EMPTY_REPLY_RETRIES}.
+   * How many times to re-ask when a turn comes back with no content and the
+   * provider gives no reason. Each retry raises the completion budget; see
+   * {@link EMPTY_REPLY_RETRIES}.
+   *
+   * Does NOT govern a discarded tool call, which is a different failure with a
+   * different answer — {@link MALFORMED_TOOL_CALL_RETRIES}.
    */
   emptyReplyRetries?: number;
   /** Per-turn cap on script output fed back to the model. */
@@ -95,23 +100,66 @@ export const DEFAULT_MAX_TURNS = 20;
  */
 export const DEFAULT_MAX_TOKENS = 8192;
 
-/** Re-asks allowed when a turn returns no content. */
+/** Re-asks allowed when a turn returns no content and no reason. */
 export const EMPTY_REPLY_RETRIES = 2;
 
 /**
- * Did this turn come back with nothing usable?
+ * Re-asks allowed when the provider dropped a tool call it could not parse.
  *
- * Matched on the provider's message because that is the only signal it gives:
- * the throw carries a 200 status and no `errorType`, so status and type cannot
- * distinguish "the model returned nothing" from any other failure. String
- * matching is fragile, and a shared error code on `InferenceRequestError`
- * would be better — but `inference.ts` carries E2EE, relay signing and
- * bodyHash ordering, and is deliberately not edited from here.
+ * The same count as {@link EMPTY_REPLY_RETRIES}, and at the SAME completion
+ * budget every time. Only the escalation is removed, because only the
+ * escalation is wrong — this is deliberately not a change to how many chances
+ * a turn gets.
+ *
+ * On the N=3 dogfood sweep **all 20** contentless replies were a 200 with
+ * `finish_reason: "function_call_filter: MALFORMED_FUNCTION_CALL"` and no
+ * `content`. The model was never short of room: it tried to emit a tool call,
+ * which this loop does not use (see the module comment) and which the
+ * OpenAI-compat surface drops. Two measurements, one sweep each:
+ *
+ * | retry, at         | turns hit | recovered on the 1st re-ask |
+ * | ----------------- | --------- | --------------------------- |
+ * | doubled (8192→16k) | 14        | 9 (64%)                     |
+ * | flat (8192→8192)   | 10        | 6 (60%)                     |
+ *
+ * **The budget is not the mechanism** — a flat re-ask recovers as often as a
+ * doubled one, so the doubling only bought a larger prompt replay. What the
+ * extra attempt buys is real, though: of the 5 turns that failed twice under
+ * the old ladder, 4 recovered on the third attempt. A first cut of this fix
+ * set the count to 1 and turned 1 stopped run into 4 — a cost with nothing
+ * behind it, since the retry count was never the defect.
  */
-function isEmptyReply(err: unknown): boolean {
-  return (
-    err instanceof Error && err.message.includes("carried no assistant content")
-  );
+export const MALFORMED_TOOL_CALL_RETRIES = EMPTY_REPLY_RETRIES;
+
+/** Why a turn came back with nothing usable, when it did. */
+type EmptyReplyCause = "emptyContent" | "malformedToolCall";
+
+/**
+ * Did this turn come back with nothing usable, and why?
+ *
+ * Read off `InferenceRequestError.code`, which `inference.ts` now sets from the
+ * response body. This was a match on the error *message*, because a 200 with no
+ * content carries no status or `errorType` a caller can branch on — and the
+ * comment here asked for exactly this. The two causes need opposite responses
+ * (see {@link MALFORMED_TOOL_CALL_RETRIES}), which a single string match could
+ * not express.
+ *
+ * The message fallback stays for a provider adapter that is not
+ * `InferenceRequestError` — the empty reply is still a real outcome there, and
+ * losing it would turn a handled stop into a thrown crash. It classifies as
+ * `emptyContent`, the conservative reading: budget escalation wastes tokens,
+ * whereas not escalating a genuine truncation loses the run.
+ */
+function emptyReplyCause(err: unknown): EmptyReplyCause | undefined {
+  if (err instanceof InferenceRequestError) {
+    return err.code === "emptyContent" || err.code === "malformedToolCall"
+      ? err.code
+      : undefined;
+  }
+  return err instanceof Error &&
+    err.message.includes("carried no assistant content")
+    ? "emptyContent"
+    : undefined;
 }
 
 /** Sandbox terminations that map onto a coverage `stoppedBecause`. */
@@ -146,6 +194,9 @@ function honestAnswerText(answer: string, coverage: QueryCoverage): string {
         sandboxUnavailable: "no sandbox was available to run the script",
         contractViolation:
           "the model could not produce a valid script in the allowed attempts",
+        malformedToolCall:
+          "the model's replies kept arriving empty because the provider " +
+          "discarded a tool call it could not parse",
         error: "the run ended with an error",
       }[coverage.stoppedBecause] ?? coverage.stoppedBecause,
     );
@@ -184,9 +235,21 @@ function honestAnswerText(answer: string, coverage: QueryCoverage): string {
 /**
  * One model turn, re-asked when the reply carries no content.
  *
- * The completion budget doubles on each attempt. A reasoning model that spent
- * its whole allowance thinking needs more room, not another identical try, so
- * a flat retry would mostly reproduce the failure.
+ * Two ladders, because there are two causes and only one of them is a ceiling:
+ *
+ * - `emptyContent` — cause unstated, and a reasoning model that spent its whole
+ *   allowance thinking is the likeliest one. The completion budget **doubles**
+ *   on each attempt: another identical try would mostly reproduce the failure,
+ *   so escalation is the point.
+ * - `malformedToolCall` — the provider says it dropped an unparseable tool
+ *   call. The budget is **left alone** and there is one retry only. Escalating
+ *   here treats a provider-side parse failure as if it were a truncation; it
+ *   burns a full prompt replay per doubling and, measured, never works.
+ *
+ * The two counters are independent, so a run that sees one of each still gets
+ * the response each deserves. The last error is rethrown either way and the
+ * caller re-reads its cause: the *reason* the run stopped has to reach
+ * `coverage.stoppedBecause`, and a swallowed one is undiagnosable.
  */
 async function chatWithEmptyReplyRetry(input: {
   provider: InferenceProvider;
@@ -194,20 +257,33 @@ async function chatWithEmptyReplyRetry(input: {
   messages: InferenceMessage[];
   maxTokens: number;
   retries: number;
-  onRetry: () => void;
+  malformedRetries: number;
+  onRetry: (cause: EmptyReplyCause) => void;
 }): Promise<Awaited<ReturnType<InferenceProvider["chat"]>>> {
   let lastError: unknown;
-  for (let attempt = 0; attempt <= input.retries; attempt++) {
+  let doublings = 0;
+  let malformedRetries = 0;
+  for (;;) {
     try {
       return await input.provider.chat({
         model: input.model,
         messages: input.messages,
-        maxTokens: input.maxTokens * 2 ** attempt,
+        maxTokens: input.maxTokens * 2 ** doublings,
       });
     } catch (err) {
-      if (!isEmptyReply(err)) throw err;
+      const cause = emptyReplyCause(err);
+      if (cause === undefined) throw err;
       lastError = err;
-      if (attempt < input.retries) input.onRetry();
+      if (cause === "emptyContent") {
+        if (doublings >= input.retries) break;
+        doublings += 1;
+      } else {
+        if (malformedRetries >= input.malformedRetries) break;
+        // `doublings` deliberately untouched: the re-ask goes out at the same
+        // budget it failed at, because the budget is not what failed.
+        malformedRetries += 1;
+      }
+      input.onRetry(cause);
     }
   }
   throw lastError;
@@ -299,6 +375,16 @@ export async function runQueryLoop(
   let lastScript: string | undefined;
   let repairsUsed = 0;
   let emptyReplies = 0;
+  /**
+   * How many of those empty replies were a discarded tool call.
+   *
+   * Counted apart from `emptyReplies` because the two have different fixes and
+   * the sweep that produced this distinction could only be read because the
+   * harness recorded reply SHAPES to a side file. This puts the same split in
+   * the loop's own accounting, where a caller with no diagnostic file can see
+   * it in the answer text.
+   */
+  let malformedToolCalls = 0;
   let stoppedBecause: QueryStoppedBecause | undefined;
   const receiptIds: string[] = [];
   const violations: string[] = [];
@@ -334,10 +420,8 @@ export async function runQueryLoop(
     // was handed must not observe turns that had not happened when it was
     // called. (`fitTranscript` returns the same array when nothing is dropped.)
     //
-    // An empty reply is retried rather than thrown, and each retry RAISES the
-    // completion budget. Re-asking an identical request that ran out of
-    // reasoning room would just fail again, so escalation is the point: the
-    // question is not "was it a fluke" but "was the ceiling too low".
+    // An empty reply is retried rather than thrown, and HOW it is retried
+    // depends on why it was empty — see `chatWithEmptyReplyRetry`.
     let reply;
     try {
       reply = await chatWithEmptyReplyRetry({
@@ -346,21 +430,39 @@ export async function runQueryLoop(
         messages: [...fitted.messages],
         maxTokens,
         retries: emptyReplyRetries,
-        onRetry: () => {
+        malformedRetries: MALFORMED_TOOL_CALL_RETRIES,
+        onRetry: (cause) => {
           emptyReplies += 1;
+          if (cause === "malformedToolCall") malformedToolCalls += 1;
         },
       });
     } catch (err) {
-      if (!isEmptyReply(err)) throw err;
+      const cause = emptyReplyCause(err);
+      if (cause === undefined) throw err;
       // Out of retries. End with honest coverage instead of throwing out of
       // the answerer: a question that produced nothing is a result, not a
       // crash, and the caller still needs the coverage counters.
       emptyReplies += 1;
-      stoppedBecause = "error";
-      finalAnswer =
-        `The model returned no content ${emptyReplies} time(s) in a row, ` +
-        `even after raising the completion budget to ${maxTokens * 2 ** emptyReplyRetries} tokens. ` +
-        `No answer was produced for this question.`;
+      if (cause === "malformedToolCall") {
+        malformedToolCalls += 1;
+        // A distinct `stoppedBecause` rather than the catch-all `error`,
+        // because this one names a specific, actionable provider behaviour and
+        // the last sweep could not be diagnosed from the dump precisely
+        // because four situations shared one reason.
+        stoppedBecause = "malformedToolCall";
+        finalAnswer =
+          `The provider returned ${emptyReplies} repl(ies) with no content, ` +
+          `${malformedToolCalls} of them reporting that it discarded a tool call it ` +
+          `could not parse. The completion budget was deliberately left at ` +
+          `${maxTokens} tokens: this is not a truncation and a larger budget ` +
+          `does not fix it. No answer was produced for this question.`;
+      } else {
+        stoppedBecause = "error";
+        finalAnswer =
+          `The model returned no content ${emptyReplies} time(s) in a row, ` +
+          `even after raising the completion budget to ${maxTokens * 2 ** emptyReplyRetries} tokens. ` +
+          `No answer was produced for this question.`;
+      }
       break;
     }
     inputTokens += reply.usage?.promptTokens ?? 0;

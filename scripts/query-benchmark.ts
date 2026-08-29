@@ -74,8 +74,10 @@ import {
 
 import { FsFixtureSink } from "./query-eval-fs-sink.js";
 import {
+  ANSWER_CHAR_BUDGET,
   buildAgentAnswerer,
   buildLiveProvider,
+  retainAnswer,
   retainScripts,
   SCRIPTS_CHAR_BUDGET,
   type RecordingEvalAnswerer,
@@ -148,7 +150,24 @@ interface Row {
   readingLabel?: string;
 
   reasons: string[];
+  /**
+   * The first 400 characters, whitespace collapsed.
+   *
+   * Kept beside `answerText` rather than replaced by it: every existing reader
+   * of these dumps — `query-regrade.ts`, the 54-row sweep files, the analyses
+   * quoting from them — reads this field, and a one-line skim of a table wants
+   * one line. It is a view of `answerText`, not a second source of truth.
+   */
   answerHead: string;
+  /**
+   * The answer text as the grader saw it, capped at
+   * {@link ANSWER_CHAR_BUDGET}. Absent only when the run produced no answer.
+   */
+  answerText?: string;
+  /** True length before the cap. Always the truth, cap or no cap. */
+  answerChars?: number;
+  /** How many characters the cap dropped. Absent when nothing was dropped. */
+  answerElided?: number;
 
   /* --- what the run actually executed --- */
 
@@ -409,6 +428,7 @@ async function main(): Promise<void> {
     // a row that kept everything from one the cap trimmed without knowing
     // which version of this script wrote the file.
     scriptsCharBudget: SCRIPTS_CHAR_BUDGET,
+    answerCharBudget: ANSWER_CHAR_BUDGET,
     wallClockMs: Date.now() - started,
     totals: {
       pass: rows.filter((r) => r.outcome === "pass").length,
@@ -523,6 +543,13 @@ async function main(): Promise<void> {
         readingLabel: result.readingLabel,
         reasons: result.reasons,
         answerHead: (answer?.answer ?? "").replace(/\s+/g, " ").slice(0, 400),
+        ...(answer === undefined
+          ? {}
+          : (({ kept, chars, elided }) => ({
+              answerText: kept,
+              answerChars: chars,
+              ...(elided > 0 ? { answerElided: elided } : {}),
+            }))(retainAnswer(answer.answer))),
         scriptChars: answer?.script?.length,
         script: answer?.script,
         scripts: kept,

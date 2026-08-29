@@ -51,6 +51,9 @@ export {
   type FakeInferenceProviderOptions,
   type InferenceChatInput,
   type InferenceChatResult,
+  // Required to construct an `InferenceRequestError`, so a consumer that
+  // implements `InferenceProvider` cannot throw one without it.
+  type InferenceErrorCode,
   type InferenceMessage,
   type InferenceProvider,
   type InferenceRequestEncryption,
