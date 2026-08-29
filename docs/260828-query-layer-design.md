@@ -1683,6 +1683,122 @@ folded into these numbers. Nothing here reopens plan §6, and no tolerance,
 ground truth, rubric, fixture or grader was changed — the only edit under test
 is the rule-3 replacement, applied identically to both arms.
 
+### 19.13 A value-provenance contract: tried, and abandoned
+
+Q11 looked like the clean case for an answer-selection defect. It reports
+69.43 against an expected 66.25, and the reading going in was that the script
+computes the right series and then the answer headlines a number from a
+different table. If that were right it would be the most corrosive failure mode
+available — a figure the reader cannot trace to the computation that produced
+it, invisible to the grader whenever the untraceable number happens to be
+correct.
+
+Rule 1 was therefore extended. "Compute, never estimate" governs how a number
+is _produced_ and said nothing about how it reaches the answer, which is the
+unguarded half. The addition requires every reported figure to be one the final
+script produced, printed and then carried into the answer verbatim rather than
+restated from memory or from an earlier turn; requires a number computed by an
+earlier run to be recomputed before it is reported; and requires the answer to
+name, beside the headline figure, the computation behind it. **The text was
+written and saved before any rubric, dump or transcript was opened** (file
+mtimes carry the order), and it is question-agnostic: it names no question,
+scope, metric or table. Both arms share the rules block, so both got it, the
+stuffed arm in the same no-script-API translation as the rest of its rules.
+
+`gemini-3.7-flash`, `temperature: 0`, `dogfood` @ seed 20260828, N=3, all 18
+questions, judged. All four cells were graded by the same `runEval` grader —
+between `a67f352` and this run only prompt text changed — so unlike §19.12 no
+regrade was needed to make before and after comparable.
+
+| Arm                    | Before                 | After                  | Δ rows |
+| ---------------------- | ---------------------- | ---------------------- | ------ |
+| **Agent** (code loop)  | 19/54, strict 16, 7 Qs | 19/54, strict 17, 8 Qs | **0**  |
+| **Baseline** (stuffed) | 6/54, strict 5, 3 Qs   | 7/54, strict 4, 3 Qs   | **+1** |
+
+The noise band is ~±3 rows. **Neither arm moved.** In the agent arm four
+questions each moved by exactly one row — Q6 +1 and Q17 +1 against Q2 −1 and
+Q13 −1 — which is the signature of variance, not of an effect. The baseline's
+single row is Q1 going 2/3 to 3/3. **Q11, the question the change was aimed
+at, was 0/3 before and 0/3 after.**
+
+**The contract was complied with, and the compliance is measurable.** A number
+copied out of a computation keeps that computation's precision; a number a
+writer restates gets rounded. Counting `value` fields carrying more than four
+decimal places:
+
+| Arm      | Full-precision `value` | `value` present | Median answer chars | Input tokens  |
+| -------- | ---------------------- | --------------- | ------------------- | ------------- |
+| Agent    | 0/14 → **11/15**       | 18/54 → 20/54   | 1779 → 1820         | 2.64M → 4.79M |
+| Baseline | 0/10 → **2/10**        | 13/54 → 13/54   | 335 → 297           | 40.0M → 38.3M |
+
+Before the change the agent arm reported `6.68`, `61.79`, `2054.7`, `69.43`;
+after it reported `6.681697530864197`, `61.78977272727273`,
+`2054.703703703704`, `69.42857142857143`. The instruction landed almost
+perfectly and changed the score by nothing. The same split as §19.12 appears
+again — the agent arm complies, the baseline arm largely cannot — but here
+compliance bought nothing, so the split is not worth much.
+
+**The premise was wrong, and re-executing the scripts is what showed it.** The
+dump stores each run's script source but not its output, so "is the reported
+number the one the final computation produced" is not decidable from the dump.
+Replaying every final script that reported a numeric `value` against the same
+corpus and the same per-question grant — a fresh sandbox host per script, since
+coverage accumulates across `execute()` calls — and collecting every number the
+script emitted gives:
+
+| Arm   | `value` found in the final script's own output |
+| ----- | ---------------------------------------------- |
+| Agent | 13/18 → 16/20 (38 of 38 replays ran)           |
+
+Values were already traceable roughly three times in four, and the change moved
+untraceable rows from 5 to 4, which at that denominator is nothing. More
+decisively, **Q11's 69.43 is traceable in every run that reported it.** The
+final script computes it, at full precision, from the seven nightly
+`average_heart_rate` values `[61,77,60,63,76,75,74]` in the sleep records. The
+graded-correct 66.25 is the mean of `oura.heartrate` filtered to rest/sleep
+over the same window, n=8. So the number is not imported from somewhere else;
+it is the honest output of the script the model wrote. **Q11 is a
+wrong-series defect inside the script, not an answer-selection defect at the
+reporting step**, and a rule about carrying numbers out of a computation cannot
+touch it.
+
+Two rows are worth keeping from the replay. One after-run printed both figures
+in its own notes — `Last 7 days avg: 69.43 bpm` beside
+`oura.heartrate rest/sleep ... recent (last 7d, n=8) mean: 66.25` — and
+headlined the wrong one; that single row is a genuine answer-selection defect,
+one of six. And one before-run computed 66.25, the correct answer, and then set
+no `value` at all, so it was graded ungradeable. The right number was produced
+and lost at the contract boundary, which is a `value`-emission problem and not
+a provenance one.
+
+**The change also costs.** Agent input tokens went 2.64M to 4.79M, +82%, on
+only +4% more scripts (215 to 224). Telling the model to print its figures
+makes it print more, and printed output re-enters the context on every
+subsequent turn. That is a real price for a zero-row result.
+
+**Verdict: tried and abandoned.** The rule is question-agnostic, was written
+before the data was read, was complied with almost perfectly, and produced no
+movement in either arm at N=3 — 0 rows and +1 row against a ±3 band — while
+raising the agent arm's input cost by 82%. It is not retained. The finding that
+justifies the cost of the run is the diagnosis it forced: Q11 does not fail on
+provenance, and the answer-selection defect it was thought to exemplify occurs
+in about one run in six rather than as a systematic fault. The work worth doing
+on Q11 is on series selection — which of two defensible heart-rate sources the
+question means — and that belongs to the resolution machinery of §19.9/§19.10,
+not to the response contract.
+
+Caveats. The ±3 band is inherited from prior identical-grader sweeps and was
+not re-measured here. The traceability denominators are small (18 and 20 rows),
+so the 13/18 → 16/20 movement is not resolvable either way. The replay
+re-executes the final script only, in a fresh host, so a run whose answer
+depended on an earlier turn's output is judged on the last script alone. Q2,
+Q13 and Q17 are model-graded. The contract was written once and not revised
+after seeing results, so no second experiment is folded into these numbers, and
+nothing here reopens plan §6. No tolerance, ground truth, rubric, fixture or
+grader was changed; the only edit under test is the rule-1 extension, applied
+identically to both arms, and it reverts with
+`git checkout becc984 -- docs/260828-query-layer-prompt.md packages/core/src/query/agent/prompt.ts packages/core/src/query/evals/answerers/stuffed-answerer.ts`.
+
 ## 20. Next
 
 1. Turn §3 into a graded question set with expected answers and coverage
