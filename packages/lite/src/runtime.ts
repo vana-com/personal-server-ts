@@ -42,7 +42,16 @@ import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/l
 import {
   verifyDataReadPolicy,
   type DataReadPolicyPorts,
+  type DataWritePolicyPorts,
 } from "@opendatalabs/personal-server-ts-core/policy";
+import {
+  createInMemoryWriteProofReplayStore,
+  createWriteSessionAuthorization,
+  handleWriteSessionRequest,
+  type WriteProofReplayStore,
+  type WriteSessionAuthorization,
+  type WriteSessionStore,
+} from "@opendatalabs/personal-server-ts-core/write";
 import type {
   DataStoragePort,
   RuntimeAvailabilityPort,
@@ -153,6 +162,31 @@ export interface PsLiteRuntimeOptions {
    */
   derivatives?: { store: QuestionStore; scheduler: RecomputeScheduler } | null;
   accessToken?: string;
+  /**
+   * Write API sessions. When present, POST /v1/write/session is mounted and
+   * mints the bearer tokens the auth adapter redeems on POST /v1/data/:scope
+   * and the derivative question routes. The SAME store must be wired into the
+   * adapter (`writeSessions.store`); `createIndexedDbPsLiteRuntime` does both.
+   * Absent = owner-only ingest and no handshake endpoint.
+   *
+   * KNOWN LIMITATION, same as the Node build: sessions and the proof replay
+   * guard are in-memory, so a reload drops live tokens and the builder
+   * re-handshakes. Because both live in the same memory, a reload can never
+   * leave a replayable proof for a session that survived it.
+   */
+  writeSessionStore?: WriteSessionStore;
+  /**
+   * Replay guard shared by the handshake proof and the per-write proofs.
+   * Defaults to a fresh in-memory store.
+   */
+  writeProofReplayStore?: WriteProofReplayStore;
+  /**
+   * The audience every builder proof must name. It MUST be the origin the
+   * auth adapter verifies write proofs against, or a builder would have to
+   * sign the handshake for one audience and its writes for another. Defaults
+   * to the request's own origin.
+   */
+  serverOrigin?: string | (() => string);
   tokenStore?: PsLiteTokenStore;
   stateCapabilities?: Partial<PsLiteRuntimeStateCapabilities>;
   /**
@@ -199,9 +233,45 @@ export interface PsLiteRuntime extends RuntimeAvailabilityPort {
   fetch(request: Request): Promise<Response>;
 }
 
+/**
+ * Delegated-write (Write API) wiring for a PS-Lite auth adapter.
+ *
+ * A builder holding `write:<scope>` opens a session at POST /v1/write/session
+ * and then writes through the ordinary ingest endpoint. The adapter and the
+ * handshake route MUST share one `store` (the route mints what the adapter
+ * redeems) and one `replayStore` (the handshake proof and the per-write proofs
+ * are guarded by the same memory). `createIndexedDbPsLiteRuntime` wires both
+ * for you; supply them yourself only when you build the adapter by hand.
+ */
+export interface PsLiteWriteSessionAuthOptions {
+  /** Live write sessions, shared with the handshake route. */
+  store: WriteSessionStore;
+  /**
+   * Replay guard for the per-write `X-Vana-Write-Signature` proofs. Defaults
+   * to a fresh in-memory store, so replay protection is always on; pass the
+   * runtime's store to share one guard with the handshake route.
+   */
+  replayStore?: WriteProofReplayStore;
+  /**
+   * Live builder/grant verification, re-run on EVERY delegated write, so a
+   * revoked or narrowed grant stops writes at the next one.
+   */
+  policyPorts: DataWritePolicyPorts;
+}
+
 export interface BearerTokenPsLiteAuthOptions {
   ownerToken: string;
   builderToken: string;
+  /**
+   * Optional delegated-write support. The static builder token never gains
+   * write access through it: a delegated write still needs a real session
+   * token plus the builder's signed payload proof, verified exactly as the
+   * Node server verifies it.
+   */
+  writeSessions?: PsLiteWriteSessionAuthOptions & {
+    serverOrigin: string | (() => string);
+    serverOwner: `0x${string}`;
+  };
 }
 
 export interface Web3SignedPsLiteAuthOptions {
@@ -211,6 +281,11 @@ export interface Web3SignedPsLiteAuthOptions {
   accessToken?: string;
   tokenStore?: SessionTokenVerifierPort;
   now?: () => number;
+  /**
+   * Optional delegated-write support. Absent = owner-only ingest, exactly as
+   * before write sessions existed.
+   */
+  writeSessions?: PsLiteWriteSessionAuthOptions;
 }
 
 type JsonStatus =
@@ -365,13 +440,52 @@ function createMissingAuthAdapter(): PsLiteAuthAdapter {
   };
 }
 
+/**
+ * The two write-session methods of the auth port, built on the SHARED core
+ * authorizer (`createWriteSessionAuthorization`) — the same code the Node
+ * server's adapter runs. `authorizeWrite` falls back to the adapter's owner
+ * gate for any request that carries no live session, so owner ingest behaves
+ * exactly as it did before write sessions existed.
+ */
+function writeSessionAuthMethods(
+  writeSessions: PsLiteWriteSessionAuthOptions & {
+    serverOrigin: string | (() => string);
+    serverOwner: `0x${string}`;
+  },
+  authorizeOwner: (request: Request) => Promise<void>,
+): Pick<PsLiteAuthAdapter, "authorizeWrite" | "authorizeWriteSession"> {
+  const authorization: WriteSessionAuthorization =
+    createWriteSessionAuthorization({
+      serverOrigin: writeSessions.serverOrigin,
+      serverOwner: writeSessions.serverOwner,
+      sessionStore: writeSessions.store,
+      replayStore:
+        writeSessions.replayStore ?? createInMemoryWriteProofReplayStore(),
+      policyPorts: writeSessions.policyPorts,
+    });
+  return {
+    async authorizeWrite(input) {
+      const delegated = await authorization.authorizeSessionWrite(input);
+      if (delegated) return delegated;
+      await authorizeOwner(input.request);
+    },
+    async authorizeWriteSession(request) {
+      return authorization.recognizeWriteSession(request);
+    },
+  };
+}
+
 export function createBearerTokenPsLiteAuth(
   options: BearerTokenPsLiteAuthOptions,
 ): PsLiteAuthAdapter {
+  const authorizeOwner = async (request: Request) => {
+    assertBearerToken(request, options.ownerToken, true);
+  };
   return {
-    async authorizeOwner(request) {
-      assertBearerToken(request, options.ownerToken, true);
-    },
+    authorizeOwner,
+    ...(options.writeSessions
+      ? writeSessionAuthMethods(options.writeSessions, authorizeOwner)
+      : {}),
     async authorizeBuilderList(request) {
       if (parseBearerToken(request) === options.ownerToken) return;
       assertBearerToken(request, options.builderToken);
@@ -426,16 +540,27 @@ function dataReadPolicyPortsRequired(): ProtocolError {
 export function createWeb3SignedPsLiteAuth(
   options: Web3SignedPsLiteAuthOptions,
 ): PsLiteAuthAdapter {
+  const authorizeOwner = async (request: Request) => {
+    const auth = await authenticatePsLiteRequest(request, options);
+    if (!isOwnerSigner(auth, options.ownerAddress)) {
+      throw new NotOwnerError({
+        expected: options.ownerAddress,
+        actual: auth.auth.signer,
+      });
+    }
+  };
   return {
-    async authorizeOwner(request) {
-      const auth = await authenticatePsLiteRequest(request, options);
-      if (!isOwnerSigner(auth, options.ownerAddress)) {
-        throw new NotOwnerError({
-          expected: options.ownerAddress,
-          actual: auth.auth.signer,
-        });
-      }
-    },
+    authorizeOwner,
+    ...(options.writeSessions
+      ? writeSessionAuthMethods(
+          {
+            ...options.writeSessions,
+            serverOrigin: options.origin,
+            serverOwner: options.ownerAddress,
+          },
+          authorizeOwner,
+        )
+      : {}),
     async authorizeBuilderList(request) {
       const auth = await authenticatePsLiteRequest(request, options);
       if (auth.isPolicyBypass || isOwnerSigner(auth, options.ownerAddress)) {
@@ -603,6 +728,12 @@ export function createPsLiteRuntime(
   const x402ServerSigner = options.serverSigner?.signRecordDataAccess
     ? { signRecordDataAccess: options.serverSigner.signRecordDataAccess }
     : undefined;
+
+  // One replay guard for the handshake proof and (when the caller shares it
+  // with the auth adapter) the per-write proofs, matching createApp's single
+  // writeProofReplayStore in the Node build.
+  const writeProofReplayStore =
+    options.writeProofReplayStore ?? createInMemoryWriteProofReplayStore();
 
   const deviceSessions: DeviceSessionStore = createMemoryDeviceSessionStore();
   const mcpOAuthAuthorizationStore =
@@ -944,6 +1075,43 @@ export function createPsLiteRuntime(
             },
             { basePath: dataPrefix },
           );
+        }
+
+        // Write API handshake. Mounted only when a session store is wired,
+        // so a runtime without delegated writes has no endpoint to probe.
+        if (url.pathname === "/v1/write/session") {
+          if (!options.writeSessionStore) {
+            return errorResponse(404, "NOT_FOUND", "Not found");
+          }
+          if (request.method !== "POST") {
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          }
+          if (!options.gateway) {
+            return errorResponse(
+              500,
+              "SERVER_NOT_CONFIGURED",
+              "Gateway client is not configured",
+            );
+          }
+          return handleWriteSessionRequest(request, {
+            serverOrigin: options.serverOrigin ?? url.origin,
+            // The real data owner only — never the identity.address fallback
+            // the other routes accept. The grant's grantor must equal what
+            // the auth adapter binds delegated writes to, and a session
+            // minted against the SERVER key would authorize nothing. Absent
+            // = the handshake answers 500 rather than guessing.
+            serverOwner: options.serverOwner,
+            sessionStore: options.writeSessionStore,
+            replayStore: writeProofReplayStore,
+            authSessionVerifier: options.gateway,
+            grantVerifier: options.gateway,
+            accessToken: options.accessToken,
+            tokenStore,
+          });
         }
 
         const derivativesPrefix = "/v1/derivatives";

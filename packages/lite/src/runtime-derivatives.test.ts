@@ -186,7 +186,7 @@ describe("PS-Lite derivative compute", () => {
     ).toBe(true);
   });
 
-  it("a builder token cannot register (PS-Lite has no write sessions) and the route is 503 without compute", async () => {
+  it("a static builder token cannot register (it is not a write session) and the route is 503 without compute", async () => {
     const { runtime } = await setup();
     const res = await runtime.fetch(
       new Request("https://ps.local/v1/derivatives/questions", {

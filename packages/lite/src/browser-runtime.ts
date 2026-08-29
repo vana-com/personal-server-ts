@@ -14,6 +14,10 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/ports";
 import { createGatewayClient } from "@opendatalabs/vana-sdk/browser";
 import {
+  createInMemoryWriteProofReplayStore,
+  createInMemoryWriteSessionStore,
+} from "@opendatalabs/personal-server-ts-core/write";
+import {
   createIndexedDbPsLitePersistence,
   createPersistentPsLiteStorage,
   type PsLiteDataFileStore,
@@ -234,25 +238,57 @@ export async function createIndexedDbPsLiteRuntime(
     syncManager = sync.syncManager;
     scopeDeletions = sync.scopeDeletions;
   }
+  const runtimeAvailability = {
+    isAvailable: () => runtimeRef?.isAvailable() ?? Boolean(options.active),
+  };
+  // Delegated builder writes. One session store is wired into the handshake
+  // route AND the auth adapter (the route mints what the adapter redeems),
+  // and one replay guard covers the handshake proof and every per-write
+  // proof — the same single-store discipline as createApp in the Node build.
+  // A caller that brings its OWN auth adapter owns this wiring, so we do not
+  // mount a handshake for a store that adapter has never heard of.
+  const writeProofReplayStore =
+    options.writeProofReplayStore ?? createInMemoryWriteProofReplayStore();
+  const writeSessionStore =
+    options.writeSessionStore ??
+    (options.auth ? undefined : createInMemoryWriteSessionStore());
+  // One audience for the whole delegated-write flow: the handshake proof and
+  // every per-write proof are verified against the same origin.
+  const serverOrigin =
+    options.serverOrigin ??
+    (() => options.runtimeOrigin ?? config.server.origin);
   const auth =
     options.auth ??
     createWeb3SignedPsLiteAuth({
-      origin: () => options.runtimeOrigin ?? config.server.origin,
+      origin: serverOrigin,
       ownerAddress: serverOwner,
       accessToken: options.accessToken,
       tokenStore,
       dataReadPolicyPorts: {
         authSessionVerifier: gateway,
         grantVerifier: gateway,
-        runtimeAvailability: {
-          isAvailable: () =>
-            runtimeRef?.isAvailable() ?? Boolean(options.active),
-        },
+        runtimeAvailability,
       },
+      ...(writeSessionStore
+        ? {
+            writeSessions: {
+              store: writeSessionStore,
+              replayStore: writeProofReplayStore,
+              policyPorts: {
+                authSessionVerifier: gateway,
+                grantVerifier: gateway,
+                runtimeAvailability,
+              },
+            },
+          }
+        : {}),
     });
   const runtime = createPsLiteRuntime({
     ...options,
     auth,
+    serverOrigin,
+    writeSessionStore,
+    writeProofReplayStore,
     storage,
     config,
     identity: {

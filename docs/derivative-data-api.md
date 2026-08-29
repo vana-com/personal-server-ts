@@ -548,8 +548,13 @@ request, authorized for `write:<derivedScope>` exactly like a write to that
 scope. A JSON body must be the compact serialization of its own value
 (`JSON.stringify` output; pretty-printed bodies are refused with 400
 `WRITE_BODY_NOT_CANONICAL`, as on the write path). Registration bodies are
-capped at 16 KB (413). The owner uses any owner credential. PS-Lite has no
-write sessions, so there only the owner can register.
+capped at 16 KB (413). The owner uses any owner credential. PS-Lite serves the
+same routes with the same credential: it mounts `POST /v1/write/session` and
+runs the identical authorization code, so a builder registers questions
+against a browser-hosted Personal Server exactly as it does against the Node
+build. Its sessions and proof-replay memory are in-process (as the Node
+build's are), so a reload of the hosting tab ends live sessions and the
+builder re-handshakes.
 
 Two rules about the proof matter on these routes.
 

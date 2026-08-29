@@ -11,6 +11,19 @@ export {
   type WriteSessionStore,
 } from "./session.js";
 export {
+  createWriteSessionAuthorization,
+  writeServerNotConfigured,
+  writeSessionBearerToken,
+  type WriteSessionAuthorization,
+  type WriteSessionAuthorizationDeps,
+} from "./authorize.js";
+export {
+  handleWriteSessionRequest,
+  type HandleWriteSessionRequestDeps,
+  type WriteSessionResponseBody,
+  type WriteSessionRouteLogger,
+} from "./route.js";
+export {
   WRITE_SIGNATURE_HEADER,
   WRITER_ATTRIBUTION_KEY,
   binaryWriteSignedBytes,
