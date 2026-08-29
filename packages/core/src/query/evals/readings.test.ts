@@ -189,6 +189,80 @@ describe("resolution-aware grading", () => {
     if (out.kind === "pass") expect(out.reading.id).toBe("allLogged");
   });
 
+  it("reads an adjective inside a trailing window as the same window", () => {
+    // Verbatim from the N=3 sweep, Q1 run 0. Runs 1 and 2 declared the same
+    // window ("Trailing 30-day window…") and the same 6.62, and classified;
+    // this one said "calendar days" and was thrown out as `unrecognised`. The
+    // word between the number and "days" is not a different reading.
+    const out = gradeAgainstReadings(
+      Q1_READINGS,
+      "Window resolved to the last 30 calendar days ending on the latest " +
+        "recorded date (2025-12-06 to 2026-01-04), filtering to main sleep " +
+        "(type === 'long_sleep') and excluding null durations and naps.",
+      6.62,
+    );
+    expect(out.kind).toBe("pass");
+    if (out.kind === "pass") expect(out.reading.id).toBe("trailing30");
+  });
+
+  it("classifies by the primary reading when the alternative is a clause", () => {
+    // Verbatim from the N=3 sweep, Q18 run 1. The declaration is `allLogged`
+    // and the value is `allLogged`'s; `completeLogged`'s only signal matched
+    // inside the trailing clause that names it as a subset, which the
+    // parenthetical rule could not see because there were no brackets.
+    const out = gradeAgainstReadings(
+      Q18_READINGS,
+      "Matched days between `oura.workout` where running distance exceeded " +
+        "10,000 meters (193 unique dates) and `nutrition.log` daily " +
+        "`total_kcal` entries, computing intake across all 108 logged days " +
+        "and reporting the 74 complete logged days as a refined subset.",
+      2054.7,
+    );
+    expect(out.kind).toBe("pass");
+    if (out.kind === "pass") expect(out.reading.id).toBe("allLogged");
+  });
+
+  it("REJECTS the same clause structure with the other reading's number", () => {
+    // The anti-cheat, on the phrasing the rule above was widened to accept.
+    // Widening what classifies must not widen what passes: the declaration is
+    // still `allLogged`, so `completeLogged`'s figure is still inconsistent.
+    const out = gradeAgainstReadings(
+      Q18_READINGS,
+      "Computing intake across all 108 logged days and reporting the 74 " +
+        "complete logged days as a refined subset.",
+      2387.66,
+    );
+    expect(out.kind).toBe("inconsistent");
+    if (out.kind === "inconsistent") {
+      expect(out.reading.id).toBe("allLogged");
+      expect(out.expected).toBe(2054.7);
+    }
+  });
+
+  it("REJECTS a trailing window declared with a calendar month's number", () => {
+    /*
+     * Likewise for the loosened `TRAILING`: "last 30 calendar days" now
+     * classifies, and classifying is exactly what makes December's 6.6817 a
+     * failure here rather than a number nobody had to attribute.
+     *
+     * The figure has to be a *calendar* one to test anything. Q1's three
+     * trailing readings are 6.5769 / 6.5775 / 6.6190 against a ±0.05
+     * tolerance, so they do not separate from one another at all — the rule
+     * discriminates the trailing cluster from the calendar months, and no
+     * finer than that.
+     */
+    const out = gradeAgainstReadings(
+      Q1_READINGS,
+      "The last 30 calendar days ending on the latest recorded date.",
+      6.6817,
+    );
+    expect(out.kind).toBe("inconsistent");
+    if (out.kind === "inconsistent") {
+      expect(out.reading.id).toBe("trailing30");
+      expect(out.expected).toBe(6.619);
+    }
+  });
+
   it("still honours a primary reading that IS the complete-logs one", () => {
     const out = gradeAgainstReadings(
       Q18_READINGS,

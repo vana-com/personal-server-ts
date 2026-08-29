@@ -80,22 +80,71 @@ export type ResolutionOutcome =
  * Returns `undefined` when nothing matches — which is a real failure, not a
  * fallback to the eval's reading.
  */
+/**
+ * Constructions that mark a clause as an *aside* rather than the declaration.
+ *
+ * Concept-first, like the signals themselves: these name the relation one
+ * reading bears to another — a subset, a wider set, an alternative, a
+ * comparison — rather than any phrasing lifted from a transcript. The prompt
+ * asks the model to name the alternative it did not use; it obliges in
+ * whatever words it likes, but the alternative is always introduced *as* an
+ * alternative, and that is what this matches.
+ */
+const ASIDE =
+  /\b(alternativ\w*|subset|superset|refin\w*|narrower|wider|broader|stricter|looser|for comparison|by comparison|set aside|also report\w*|separately report\w*|additionally|secondar\w*|cross-check\w*)\b/;
+
+/** Clause boundaries, for locating an aside inside a longer declaration. */
+const CLAUSE_BOUNDARY = /[;:,]|\s+and\s+|\s+while\s+|\s+whereas\s+/g;
+
+/**
+ * Drop the clauses that introduce an alternative reading, keep the rest.
+ *
+ * Parentheses were the first form this took, and are still the commonest, but
+ * the model also sets an alternative aside in a plain coordinate clause:
+ * "…computing intake across all 108 logged days **and reporting the 74
+ * complete logged days as a refined subset**." Matching the whole string
+ * classifies that run by the reading it explicitly declined, which is the same
+ * defect the parenthetical rule was written to fix.
+ *
+ * Deliberately conservative: clauses are split only to *locate* an aside, and
+ * when none is found the original text is returned byte-for-byte. A
+ * declaration that names one reading and nothing else is therefore matched
+ * exactly as it was before this existed — including the multi-word signals
+ * (`FLIGHT_IN`) that span a clause boundary and would not survive a rejoin.
+ */
+function stripAsides(text: string): string {
+  const clauses: { start: number; end: number }[] = [];
+  let start = 0;
+  CLAUSE_BOUNDARY.lastIndex = 0;
+  for (let m = CLAUSE_BOUNDARY.exec(text); m; m = CLAUSE_BOUNDARY.exec(text)) {
+    clauses.push({ start, end: m.index });
+    start = m.index + m[0].length;
+  }
+  clauses.push({ start, end: text.length });
+
+  const kept = clauses.filter((c) => !ASIDE.test(text.slice(c.start, c.end)));
+  // Nothing set aside, or *everything* was: in both cases the declaration is
+  // the whole string. An aside is only an aside next to a primary clause.
+  if (kept.length === clauses.length || kept.length === 0) return text;
+  return kept.map((c) => text.slice(c.start, c.end)).join(" ");
+}
+
 export function classifyResolution(
   resolution: string,
   readings: readonly DefensibleReading[],
 ): DefensibleReading | undefined {
   /*
-   * Parenthetical asides are dropped before matching.
+   * Asides are dropped before matching.
    *
    * The prompt now asks the model, when a phrase has several defensible
    * readings, to "name the alternative and its number". It complies — and it
    * puts the alternative in parentheses: "…over the 108 logged days (with 74
-   * complete days…)". Matching the whole string then classifies the run by the
-   * reading it explicitly set aside, and penalises exactly the helpful
-   * behaviour the prompt asked for. The primary declaration is the one outside
-   * the brackets.
+   * complete days…)", or in a trailing clause. Matching the whole string then
+   * classifies the run by the reading it explicitly set aside, and penalises
+   * exactly the helpful behaviour the prompt asked for. The primary
+   * declaration is what is left once the alternatives are removed.
    */
-  const text = resolution.toLowerCase().replace(/\([^)]*\)/g, " ");
+  const text = stripAsides(resolution.toLowerCase().replace(/\([^)]*\)/g, " "));
   return readings.find(
     (r) =>
       (r.signals.all ?? []).every((re) => re.test(text)) &&
@@ -137,7 +186,17 @@ export function gradeAgainstReadings(
 
 const CALENDAR_MONTH =
   /calendar month|full month|full calendar|december|november/;
-const TRAILING = /trailing|rolling|last \d+ days|past \d+ days|preceding/;
+/**
+ * A window measured backwards from the end of the data.
+ *
+ * The `\d+ … days` arm carries an optional adjective, because the qualifier a
+ * run reaches for is not fixed: "the last 30 **calendar** days" is the same
+ * window as "the last 30 days", and the earlier pattern's hard adjacency
+ * classified it as `unrecognised` — a run whose window and value were
+ * byte-identical to two others that classified fine.
+ */
+const TRAILING =
+  /trailing|rolling|preceding|\b(?:last|past|previous|final)\s+\d+[\s-]*(?:[a-z]+\s+)?days?\b/;
 
 /**
  * Q1 — "How much did I sleep on average over the last month?"
@@ -292,6 +351,48 @@ export const Q18_READINGS: readonly DefensibleReading[] = [
  *   (The week before that averages 54.4286bpm, but "last week" asked on a
  *   Sunday does not mean the week before the one that just ended.)
  * - **Q8** (document count). One honest answer.
+ *
+ * And one question that is **genuinely ambiguous and still absent**, which is a
+ * different case from the three above and is recorded here rather than acted
+ * on:
+ *
+ * - **Q7** ("what are my recurring monthly expenses, and which ones have crept
+ *   up?"). Two readings, both defensible, and `scripts/enum-readings.ts`
+ *   separates them cleanly over 1,800 transactions across 37 months:
+ *
+ *   | merchant             |   n | distinct amounts | max/min | gaps of 26–35d |
+ *   | -------------------- | --- | ---------------- | ------- | -------------- |
+ *   | RENT ACH             |  37 |                1 |    1.00 |           100% |
+ *   | ICLOUD STORAGE       |  37 |                1 |    1.00 |           100% |
+ *   | NETFLIX.COM          |  37 |                2 |    1.48 |           100% |
+ *   | SPOTIFY P0A2         |  37 |                2 |    1.20 |           100% |
+ *   | TRADER JOES #221     | 279 |              276 |   44.90 |             0% |
+ *   | AMZN Mktp US\*2H9    | 273 |              270 |   71.16 |             0% |
+ *   | UBER \*TRIP          | 272 |              270 |   47.61 |             1% |
+ *   | SHELL OIL 4471       | 259 |              256 |   56.49 |             0% |
+ *   | WHOLEFDS #104        | 258 |              258 |   51.11 |             0% |
+ *   | SQ \*BLUE BOTTLE 982 | 256 |              255 |   73.10 |             0% |
+ *
+ *   The eval encodes the second reading via `reference/compute.ts`'s
+ *   `list.length >= months * 0.8`, which is a **count** threshold rather than a
+ *   cadence test: 273 clears 29.6 easily. It is defensible as "the things I
+ *   spend on every month" — all ten do appear in every month. The competing
+ *   reading is the one the question's own second clause presupposes: **only a
+ *   fixed price can creep up.** The four subscriptions hold one or two amounts
+ *   across three years and are charged at a monthly interval 100% of the time;
+ *   the six retail merchants are charged roughly seven times a month at a
+ *   different amount almost every time, so they have no price to creep and no
+ *   monthly cadence to speak of. All three sweep runs declared that reading up
+ *   front and got all four merchants and both price transitions right.
+ *
+ *   **It is not declared here because the machinery is numeric-only.** A
+ *   `DefensibleReading` is a number plus a tolerance, and `gradeAgainstReadings`
+ *   compares `|value - reading.value|`; `readingsFor` is consulted only from
+ *   the `numeric` branch of the runner. Q7 is a `set` case, so listing it would
+ *   be inert at best and, worse, would report Q7 as graded generously when
+ *   nothing about its grading had changed. **Q7 therefore stays failing**, and
+ *   that is the finding: the corpus asks a question with two readings and
+ *   scores only one of them.
  */
 export const AMBIGUOUS_READINGS: Readonly<
   Record<string, readonly DefensibleReading[]>

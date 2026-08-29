@@ -405,7 +405,29 @@ export async function buildCases(
       id: "Q14",
       question: "How much did I spend on my Japan trip?",
       class: "aggregation",
-      scopes: [SCOPES.bank, SCOPES.calendar],
+      /*
+       * `fx.rates` is part of the grant because the expected value cannot be
+       * reached without it.
+       *
+       * 54 of the in-window charges are in JPY. `tripReference` converts each
+       * one at *its own date's* rate from `fx_rates.json`, so the expectation
+       * is 9146.90 = 7728.30 in-window (both currencies) + 1418.60 flight.
+       * Without the rates the best a script can honestly do is 5356.62
+       * (in-window USD plus the flight, yen dropped) or a two-currency answer
+       * — and `readings.ts` deliberately does not enumerate a yen-only reading,
+       * because dropping in-window dollars is an incomplete set rather than a
+       * different reading of the question. Even guessing a flat rate misses:
+       * `Q14_JPY_PER_USD` applied uniformly gives 9041.06, outside ±1.
+       *
+       * This was measured with the scope available — design §19.8's table
+       * records `7728.3` for "profile + `fx.rates` scope" — but the case never
+       * declared it, and the over-granting harness was quietly supplying it.
+       * Once each question was narrowed to its own grant the scope vanished
+       * and all three runs said so in as many words ("the corpus contains no
+       * FX rates"). Restoring it is restoring the question to answerable, not
+       * relaxing it.
+       */
+      scopes: [SCOPES.bank, SCOPES.calendar, SCOPES.fx],
       expect: {
         kind: "numeric",
         value: Number(trip.totalUsd.toFixed(2)),
@@ -420,8 +442,27 @@ export async function buildCases(
         preTripFlightUsd: Number(trip.flightUsd.toFixed(2)),
         jpyTransactions: trip.jpyTransactions,
       },
+      /*
+       * Design §19.10 diagnosed Q14 as under-composition — the model "anchors
+       * on one inclusion rule at a time rather than unioning them". The N=3
+       * sweep taken under each question's own grant does not support that.
+       *
+       * All three runs declared `inWindowPlusFlight` and composed *both* rules:
+       * the 2025-02-19..2025-03-05 window resolved off the calendar blocks, and
+       * the 2024-12-20 Delta charge outside it. Run 2 went further and reported
+       * $3,938.02 of in-window USD — `inWindowOnlyUsd` minus the yen — so it
+       * had the whole set, in both currencies, and named it.
+       *
+       * They failed because they had no rates and so refused to merge the
+       * currencies, which left `value` unset and the run ungradeable. That is a
+       * missing scope, not a reasoning failure. §19.10's evidence was two runs
+       * that *did* under-compose; whether that survives with `fx.rates` back in
+       * the grant is now an open measurement rather than a settled diagnosis.
+       */
       notes:
-        "The flight is charged 61 days before departure. A date-window filter alone returns inWindowOnlyUsd and is wrong.",
+        "The flight is charged 61 days before departure. A date-window filter alone returns inWindowOnlyUsd and is wrong. " +
+        "The yen half needs `fx.rates` at each transaction's own date: without it the honest answer is per-currency, which " +
+        "the numeric contract cannot express, and the run grades as ungradeable rather than wrong.",
     },
     {
       id: "Q15",

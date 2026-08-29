@@ -31,6 +31,13 @@
  * corpus plants, and every such row is labelled `model-graded` in the output.
  * A judge's opinion is not a measurement and the report must never let the two
  * blur together.
+ *
+ * Every row carries BOTH grading verdicts (`gradedBy`, `strictPass`,
+ * `resolutionOutcome`) and EVERY script the run executed, not just the last.
+ * Both are the same lesson learned twice: a dump that drops what the grader
+ * decided, or what the run actually did, forces the next analysis to
+ * reconstruct it — and a reconstruction reads exactly like a measurement in
+ * the write-up while being nothing of the kind.
  */
 
 import {
@@ -55,9 +62,22 @@ import {
   type FixtureProfileName,
 } from "@opendatalabs/personal-server-ts-core/query/evals";
 import type { QueryAnswer } from "../packages/core/src/query/agent/index.js";
+// Deep import: `evals/index.ts` is the barrel, and the serialised dump shape
+// is a contract between this writer and `query-regrade.ts` alone rather than
+// part of the eval harness's public surface.
+import {
+  serializeResolutionOutcome,
+  type SerializedResolutionOutcome,
+} from "../packages/core/src/query/evals/types.js";
 
 import { FsFixtureSink } from "./query-eval-fs-sink.js";
-import { buildAgentAnswerer, buildLiveProvider } from "./query-eval-harness.js";
+import {
+  buildAgentAnswerer,
+  buildLiveProvider,
+  retainScripts,
+  SCRIPTS_CHAR_BUDGET,
+  type RecordingEvalAnswerer,
+} from "./query-eval-harness.js";
 
 function arg(name: string, fallback?: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
@@ -95,12 +115,77 @@ interface Row {
    * that predates the field cannot be regraded at all.
    */
   resolution?: string;
+
+  /* --- the grader's own verdicts, carried through rather than re-derived --- */
+
+  /**
+   * Which rule produced `outcome`, and what the other rule said.
+   *
+   * `runEval` records both verdicts on every result precisely so the strict
+   * scoreboard stays computable beside the headline. This projection carried
+   * none of them, so it did not: the first analysis of the N=3 sweep
+   * re-derived `gradedBy` and `strictPass` and re-implemented
+   * `classifyResolution`'s regexes against each row's `resolution` string to
+   * work out which reading matched. The headline finding was therefore
+   * inferred rather than measured, which is exactly the distinction the
+   * dual-rule change exists to preserve.
+   */
+  gradedBy?: "strict" | "resolution-aware";
+  strictPass?: boolean;
+  /**
+   * The full outcome, serialised so the `RegExp` signals survive.
+   *
+   * A raw `JSON.stringify` renders them as `{}` — not merely lossy, it asserts
+   * the reading has no signals. `serializeResolutionOutcome` writes them as
+   * `RegExp.source` strings, so a reader can see *why* a resolution classified
+   * as it did instead of reconstructing the rule from `readings.ts`.
+   */
+  resolutionOutcome?: SerializedResolutionOutcome | null;
+  /** The same reading flattened, for a reader that wants only the label. */
+  readingId?: string;
+  readingLabel?: string;
+
   reasons: string[];
   answerHead: string;
+
+  /* --- what the run actually executed --- */
+
+  /**
+   * The FINAL script, and its length. Unchanged and deliberately so: the
+   * §15.3 script-variance figures (43/43, 60/60, 54/54, and 52/52 in this
+   * sweep) were all counted off this field, so they mean *distinct final
+   * scripts* — not distinct first scripts, and not distinct whole programs.
+   * Keeping it makes the new dumps comparable with the old ones.
+   */
   scriptChars?: number;
   script?: string;
+  /**
+   * Every script the run executed, in order — a distinctness count over these
+   * means *distinct full programs*, which is a different claim.
+   *
+   * Rows reach `toolCalls: 16` and retained one script, so a multi-turn run
+   * could not be audited at all: Q11 run 0's answer cites a sleep-heart-rate
+   * baseline its retained script never computes, and the dump cannot say
+   * whether an earlier turn computed it. Capped, see {@link SCRIPTS_CHAR_BUDGET}.
+   */
+  scripts?: string[];
+  /** How many scripts the run ran. Always the truth, cap or no cap. */
+  scriptCount?: number;
+  /** How many of them the cap dropped. Absent when nothing was dropped. */
+  scriptsElided?: number;
+  /** Total chars across every executed script, before the cap. */
+  scriptsChars?: number;
+
   unreadable?: number;
   unprofiled: number;
+}
+
+function isRecording(a: unknown): a is RecordingEvalAnswerer {
+  return (
+    typeof a === "object" &&
+    a !== null &&
+    typeof (a as RecordingEvalAnswerer).scriptsForLastRequest === "function"
+  );
 }
 
 async function main(): Promise<void> {
@@ -175,9 +260,11 @@ async function main(): Promise<void> {
    *    `{ rows: [...] }` and now finds it whether or not the sweep finished;
    *    the rename is atomic, so a reader never sees half an envelope.
    *
-   * Rewriting the whole envelope per row is O(n²) in bytes. At 54 rows of a
-   * few KB it is noise against a 50-minute live sweep, and it buys a partial
-   * dump that needs no reassembly.
+   * Rewriting the whole envelope per row is O(n²) in bytes. Retaining every
+   * script rather than the last raised a row from ~2.5KB to ~7KB — the 54-row
+   * N=3 sweep ran 202 scripts, so its dump goes from ~144KB to ~400KB and the
+   * rewrites from ~4MB to ~11MB across a 50-minute run. Still noise, and it
+   * still buys a partial dump that needs no reassembly.
    */
   const outPath =
     arg("out") ?? join(tmpdir(), `query-bench-${profile}-${Date.now()}.json`);
@@ -237,12 +324,21 @@ async function main(): Promise<void> {
 
   // Wrap the answerer so per-question telemetry is captured even when grading
   // throws it away. runEval reports pass/fail; the benchmark needs the rest.
+  // Scripts are recorded by the harness's tool host, not read off the answer:
+  // `QueryAnswer.script` is only ever the LAST one. Keyed by question so a row
+  // picks up the scripts of its own run and nothing else.
+  const scriptsByQuestion = new Map<string, string[]>();
   const capturing = {
     name: answerer.name,
     async answer(request: Parameters<typeof answerer.answer>[0]) {
       const per = await freshAnswerer();
       const out = await per.answer(request);
       answers.set(request.question, out as QueryAnswer);
+      // The reference answerer has no tool host and so no recorder; only the
+      // agent answerer implements this.
+      if (isRecording(per)) {
+        scriptsByQuestion.set(request.question, per.scriptsForLastRequest());
+      }
       return out;
     },
   };
@@ -263,11 +359,27 @@ async function main(): Promise<void> {
     repeat,
     judged: judge !== undefined,
     model: process.env.INFERENCE_MODEL ?? null,
+    // Stated in the dump rather than only in the source, so a reader can tell
+    // a row that kept everything from one the cap trimmed without knowing
+    // which version of this script wrote the file.
+    scriptsCharBudget: SCRIPTS_CHAR_BUDGET,
     wallClockMs: Date.now() - started,
     totals: {
       pass: rows.filter((r) => r.outcome === "pass").length,
       fail: rows.filter((r) => r.outcome === "fail").length,
       skipped: rows.filter((r) => r.outcome === "skipped").length,
+      /*
+       * The old scoreboard, kept computable beside the headline.
+       *
+       * `pass` is the resolution-aware headline wherever that rule applied.
+       * This is what the same rows score under the strict rule alone, so a
+       * move in the headline can be attributed rather than assumed — the
+       * reason the runner records both verdicts in the first place. Rows from
+       * a dump written before the dual-rule runner have no `strictPass` and
+       * are not counted; `gradedRows` says how many were.
+       */
+      strictPass: rows.filter((r) => r.strictPass === true).length,
+      gradedRows: rows.filter((r) => typeof r.strictPass === "boolean").length,
       inputTokens: rows.reduce((n, r) => n + r.inTok, 0),
       outputTokens: rows.reduce((n, r) => n + r.outTok, 0),
     },
@@ -309,13 +421,31 @@ async function main(): Promise<void> {
       // `bytesScanned` and `unreadable` are declared on `QueryCoverage` as of
       // the per-scope attribution fix, so this no longer needs a cast.
       const cov = answer?.coverage;
+      /*
+       * Scripts from the harness's recorder, falling back to the single one
+       * the answer carries. The fallback is for the reference answerer, which
+       * runs no tool host at all; when it fires, one script is genuinely all
+       * there was, not all that was kept.
+       */
+      const recorded = scriptsByQuestion.get(testCase.question);
+      const allScripts =
+        recorded && recorded.length > 0
+          ? recorded
+          : answer?.script !== undefined
+            ? [answer.script]
+            : [];
+      const { kept, elided } = retainScripts(allScripts);
       const row: Row = {
         id: result.id,
         run,
         klass: result.class,
         kind: testCase.expect.kind,
         outcome: result.outcome,
-        modelGraded: testCase.expect.kind === "judged" && judge !== undefined,
+        // Read off the verdict, not reconstructed from `expect.kind`. The
+        // runner marks this where the judge's call is actually made, and it is
+        // the only thing that can tell a row a model decided from one that
+        // skipped for want of a judge.
+        modelGraded: result.modelGraded === true,
         ms: result.durationMs,
         inTok: result.cost.inputTokens,
         outTok: result.cost.outputTokens,
@@ -332,16 +462,34 @@ async function main(): Promise<void> {
             ? testCase.expect.value
             : undefined,
         resolution: result.resolution,
+        gradedBy: result.gradedBy,
+        strictPass: result.strictPass,
+        // `null` is load-bearing and must survive: it is the runner saying
+        // "the resolution rule did not apply here", which is what tells
+        // `query-regrade.ts` the row was already graded under both rules.
+        // Collapsing it to absent would send every unambiguous row back
+        // through the regrade path, i.e. re-derive what the runner decided.
+        resolutionOutcome:
+          result.resolutionOutcome == null
+            ? result.resolutionOutcome
+            : serializeResolutionOutcome(result.resolutionOutcome),
+        readingId: result.readingId,
+        readingLabel: result.readingLabel,
         reasons: result.reasons,
         answerHead: (answer?.answer ?? "").replace(/\s+/g, " ").slice(0, 400),
         scriptChars: answer?.script?.length,
         script: answer?.script,
+        scripts: kept,
+        scriptCount: allScripts.length,
+        ...(elided > 0 ? { scriptsElided: elided } : {}),
+        scriptsChars: allScripts.reduce((n, s) => n + s.length, 0),
         unreadable: cov?.unreadable,
         unprofiled: cov?.unprofiledScopes?.length ?? 0,
       };
       rows.push(row);
       done.add(key(result.id, run));
       answers.clear();
+      scriptsByQuestion.clear();
       await persist(row);
     }
   }
@@ -429,6 +577,7 @@ async function main(): Promise<void> {
       `always-pass: ${solid.length} (${solid.map((a) => a.id).join(", ") || "none"})\n` +
       `FLAKY:       ${flaky.length} (${flaky.map((a) => `${a.id} ${a.passes}/${a.graded}`).join(", ") || "none"})\n` +
       `run-totals: pass ${totals.pass}  fail ${totals.fail}  skip ${totals.skipped}\n` +
+      `strict scoreboard: pass ${totals.strictPass} of ${totals.gradedRows} graded row(s)\n` +
       `tokens: ${totals.inputTokens} in / ${totals.outputTokens} out   wall ${(wall / 1000).toFixed(1)}s\n` +
       `coverage.complete ever true: ${agg.some((a) => a.anyComplete) ? "YES" : "NO"}\n` +
       `raw: ${path}\n` +

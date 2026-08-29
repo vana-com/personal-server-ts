@@ -68,7 +68,7 @@ export type {
 } from "../agent/types.js";
 
 import type { QueryRequest, QueryAnswer } from "../agent/types.js";
-import type { ResolutionOutcome } from "./readings.js";
+import type { DefensibleReading, ResolutionOutcome } from "./readings.js";
 
 export interface EvalAnswerer {
   readonly name: string;
@@ -183,4 +183,81 @@ export interface EvalReport {
     outputTokens: number;
     usd: number;
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* Results, as they survive a JSON round trip                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A `DefensibleReading` as it appears in a dump on disk.
+ *
+ * Identical to the live shape except for `signals`. Those are `RegExp`s, and
+ * `JSON.stringify` renders a `RegExp` as `{}` — which does not merely lose
+ * them, it asserts the reading has no signals at all. The regexes ARE the
+ * classification rule, so a reader asking "why did this resolution classify as
+ * `trailing30`" needs them: the first analysis of the N=3 sweep re-implemented
+ * `classifyResolution`'s regexes by hand against each row's `resolution`
+ * string for exactly that reason. Written as `RegExp.source` strings, which
+ * `new RegExp(...)` reverses.
+ */
+export interface SerializedReading extends Omit<DefensibleReading, "signals"> {
+  signals: { all?: string[]; none?: string[] };
+}
+
+/**
+ * A `ResolutionOutcome` as it appears in a dump on disk.
+ *
+ * `value` is `number | null` rather than `number`, because the outcome's own
+ * "no number was returned at all" case carries `Number.NaN`, and JSON has no
+ * NaN — it becomes `null` whether or not anyone meant it to. Saying so in the
+ * type is the deliberate handling; a reader must not read it as a returned 0.
+ */
+export type SerializedResolutionOutcome =
+  | { kind: "pass"; reading: SerializedReading }
+  | { kind: "undeclared" }
+  | { kind: "unrecognised"; resolution: string }
+  | {
+      kind: "inconsistent";
+      reading: SerializedReading;
+      value: number | null;
+      expected: number;
+    };
+
+/** Flatten one reading's `RegExp` signals to their sources. */
+function serializeReading(reading: DefensibleReading): SerializedReading {
+  const { signals, ...rest } = reading;
+  return {
+    ...rest,
+    signals: {
+      ...(signals.all ? { all: signals.all.map((re) => re.source) } : {}),
+      ...(signals.none ? { none: signals.none.map((re) => re.source) } : {}),
+    },
+  };
+}
+
+/**
+ * Render a resolution outcome so a dump carries it losslessly.
+ *
+ * Every writer of a dump that `scripts/query-regrade.ts` reads goes through
+ * here, so the writer and the reader share one definition of the on-disk
+ * shape. Two of those drifting apart is the failure the dual-rule work exists
+ * to avoid.
+ */
+export function serializeResolutionOutcome(
+  outcome: ResolutionOutcome,
+): SerializedResolutionOutcome {
+  switch (outcome.kind) {
+    case "pass":
+      return { kind: "pass", reading: serializeReading(outcome.reading) };
+    case "inconsistent":
+      return {
+        kind: "inconsistent",
+        reading: serializeReading(outcome.reading),
+        value: Number.isNaN(outcome.value) ? null : outcome.value,
+        expected: outcome.expected,
+      };
+    default:
+      return outcome;
+  }
 }

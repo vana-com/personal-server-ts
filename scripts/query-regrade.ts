@@ -25,8 +25,13 @@ import {
   AMBIGUOUS_READINGS,
   gradeAgainstReadings,
   type DefensibleReading,
-  type ResolutionOutcome,
 } from "@opendatalabs/personal-server-ts-core/query/evals";
+// Deep import: the on-disk dump shape is a contract between `query-benchmark.ts`
+// and this reader, not part of the eval harness's public surface.
+import {
+  serializeResolutionOutcome,
+  type SerializedResolutionOutcome,
+} from "../packages/core/src/query/evals/types.js";
 
 interface Run {
   id: string;
@@ -48,17 +53,21 @@ interface Run {
   gradedBy?: "strict" | "resolution-aware";
   strictPass?: boolean;
   /**
-   * As serialised. `reading.signals` are `RegExp`s and come back as `{}`, so
-   * only `label`/`id`/`value` survive — which is all this report reads.
+   * As serialised by `serializeResolutionOutcome`: `reading.signals` are
+   * `RegExp`s in memory and are written out as their `source` strings, so the
+   * classification rule survives the round trip alongside the
+   * `label`/`id`/`value` this report reads. A dump written before that — the
+   * 54-row N=3 sweep included — simply has no `resolutionOutcome` at all, and
+   * takes the regrade path below.
    */
-  resolutionOutcome?: ResolutionOutcome | null;
+  resolutionOutcome?: SerializedResolutionOutcome | null;
   readingId?: string;
   readingLabel?: string;
 }
 
 interface Graded extends Run {
   strictPass: boolean;
-  resolutionOutcome: ResolutionOutcome | null;
+  resolutionOutcome: SerializedResolutionOutcome | null;
   resolutionPass: boolean;
   /** True when the declaration came from prose, not a `resolution` field. */
   inferred: boolean;
@@ -156,7 +165,11 @@ function gradeOne(run: Run, source: string): Graded {
     };
   }
   const inferred = false;
-  const outcome = gradeAgainstReadings(readings, declared, run.value);
+  // Serialised even though it never goes to disk from here, so `Graded` holds
+  // one shape whether the verdict was read or recomputed.
+  const outcome = serializeResolutionOutcome(
+    gradeAgainstReadings(readings, declared, run.value),
+  );
 
   // A run that fails the strict check for reasons *other* than the number —
   // a missing denominator, no citations — still fails. The resolution rule
@@ -306,7 +319,9 @@ async function main(): Promise<void> {
         o.kind === "pass"
           ? o.reading.label
           : o.kind === "inconsistent"
-            ? `${o.reading.label} (but returned ${o.value}, reading yields ${o.expected})`
+            ? // `null` is the serialised form of "the run returned no number
+              // at all" — JSON has no NaN — and must not read as a returned 0.
+              `${o.reading.label} (but returned ${o.value === null ? "no value" : o.value}, reading yields ${o.expected})`
             : o.kind;
       console.log(
         `  ${id} run${g.run ?? "?"} ${g.inferred ? "[inferred]" : "[declared]"} ${g.strictPass ? "S" : "·"}${g.resolutionPass ? "R" : "·"}  ${chosen}  <${g.source}>`,

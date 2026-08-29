@@ -224,6 +224,119 @@ function gradeNumeric(
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* Set grading: naming an entity vs including its data                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Language that marks a mention as ruled out rather than asserted.
+ *
+ * Concept-first, like `readings.ts`'s signals: these name the *act* of holding
+ * two things apart — attributing something elsewhere, or declaring that more
+ * than one entity answers to the query term — not any phrasing observed in a
+ * transcript.
+ */
+const EXCLUSION_MARKER =
+  /\b(disambiguat\w*|distinct\w*|distinguish\w*|differentiat\w*|not to be confused|different (?:person|people|individual\w*)|two (?:different|distinct|separate)|another (?:person|individual)|exclud\w*|excepting|separate from|apart from|other than|rather than|as opposed to|unlike|not the same|unrelated to|does not refer|do not refer)\b/i;
+
+/**
+ * A markdown list marker: `1.`, `2)`, `-`, `*`, `+`, `•`.
+ *
+ * The ordinal is capped at two digits so a year ending a sentence is not one.
+ * "…in a direct message on March 30, 2023. 2. **Sarah Nguyen**…" splits into
+ * three blocks under an unbounded `\d+`, the middle one being the bare string
+ * `2023.`, which is not a list item — and that broke the run of items the
+ * ambiguity lead-in governs, one block before the item holding the decoy.
+ */
+const LIST_MARKER = /^\s*(?:\d{1,2}[.)]|[-*+•])\s/;
+const BLOCK_BOUNDARY = /\n+|\s+(?=(?:\d{1,2}[.)]|[-*+•])\s)/g;
+const SENTENCE_BOUNDARY = /(?<=[.!?])\s+/g;
+
+interface Span {
+  start: number;
+  end: number;
+}
+
+/** Split `text` on `boundary`, carrying absolute offsets. */
+function split(text: string, boundary: RegExp, from = 0): Span[] {
+  const out: Span[] = [];
+  let start = 0;
+  boundary.lastIndex = 0;
+  for (let m = boundary.exec(text); m; m = boundary.exec(text)) {
+    out.push({ start: from + start, end: from + m.index });
+    start = m.index + m[0].length;
+  }
+  out.push({ start: from + start, end: from + text.length });
+  return out;
+}
+
+/**
+ * The regions of an answer in which naming an excluded term is disambiguation
+ * rather than assertion.
+ *
+ * Two shapes, both observed and both honest:
+ *
+ * 1. **A clause that rules the term out.** "Distinct from Sarah Nguyen
+ *    (`sarah.nguyen@partner.io`, `snguyen`), who is an external partner
+ *    contact." The exclusion is local to the sentence.
+ * 2. **A lead-in that governs a list.** "There are two different people named
+ *    Sarah in your records, and both recommended Thai restaurants:" followed
+ *    by one list item per person. The disambiguation is stated once and the
+ *    enumeration under it *is* the resolution, so each item inherits it.
+ *
+ * The inherited scope is deliberately bounded at the first thing that is not a
+ * list item. Q17's answers open with "…distinguishing her from Sarah Nguyen:"
+ * and then a `###` heading, which would otherwise hand a single marker in the
+ * first sentence a licence over the whole document.
+ */
+function exclusionContexts(text: string): Span[] {
+  const out: Span[] = [];
+  const blocks = split(text, BLOCK_BOUNDARY);
+
+  for (const [i, block] of blocks.entries()) {
+    const body = text.slice(block.start, block.end);
+
+    for (const sentence of split(body, SENTENCE_BOUNDARY, block.start)) {
+      if (EXCLUSION_MARKER.test(text.slice(sentence.start, sentence.end))) {
+        out.push(sentence);
+      }
+    }
+
+    if (!EXCLUSION_MARKER.test(body) || !/:\s*$/.test(body)) continue;
+    for (const next of blocks.slice(i + 1)) {
+      const following = text.slice(next.start, next.end);
+      if (following.trim() === "") continue;
+      if (!LIST_MARKER.test(following)) break;
+      out.push(next);
+    }
+  }
+  return out;
+}
+
+/**
+ * Grade a `set` case: required mentions present, excluded ones not asserted.
+ *
+ * **Containment alone cannot tell naming an entity from including its data**,
+ * and it punished the runs that resolved the corpus's planted ambiguity
+ * correctly. Q5 found the Thai restaurant on every anchor, noticed there are
+ * two Sarahs, and presented one recommendation per person — failed for naming
+ * the decoy. Q17 resolved the alias sets and was failed for the sentence
+ * saying *whom it had excluded*. Implementation plan §6 left this open; the
+ * user has now decided it: **surfacing the ambiguity explicitly is acceptable,
+ * silently mixing the two people's data is not.**
+ *
+ * So an excluded term is a violation when it is asserted, and not when every
+ * occurrence sits inside an {@link exclusionContexts} region.
+ *
+ * The gate that keeps this from being a rubber stamp: **exoneration is
+ * available only to an answer that already carries every required mention.**
+ * An answer that mixes the two people is one that is missing the subject's
+ * facts and carrying the decoy's, and it gets no generosity at all — its
+ * excluded mentions are counted exactly as before. That is what still fails
+ * the sweep's Q17 run 1, which missed five required anchors *and* carried both
+ * of the other Sarah's handles, while passing runs 0 and 2, which missed
+ * nothing and named her only to set her aside.
+ */
 function gradeSet(
   testCase: QueryEvalCase & { expect: { kind: "set" } },
   answer: EvalQueryAnswer,
@@ -231,16 +344,43 @@ function gradeSet(
 ): boolean {
   const haystack = answer.answer.toLowerCase();
   let ok = true;
-  for (const needle of testCase.expect.contains) {
-    if (!haystack.includes(needle.toLowerCase())) {
-      reasons.push(`missing required mention: ${needle}`);
-      ok = false;
-    }
+
+  const missing = testCase.expect.contains.filter(
+    (needle) => !haystack.includes(needle.toLowerCase()),
+  );
+  for (const needle of missing) {
+    reasons.push(`missing required mention: ${needle}`);
+    ok = false;
   }
-  for (const banned of testCase.expect.excludes ?? []) {
-    if (haystack.includes(banned.toLowerCase())) {
-      reasons.push(`contains excluded mention: ${banned}`);
+
+  const banned = testCase.expect.excludes ?? [];
+  if (banned.length === 0) return ok;
+
+  const contexts =
+    missing.length === 0 ? exclusionContexts(answer.answer) : /* gated */ [];
+
+  for (const term of banned) {
+    const needle = term.toLowerCase();
+    let asserted = false;
+    let seen = false;
+    for (
+      let at = haystack.indexOf(needle);
+      at >= 0;
+      at = haystack.indexOf(needle, at + 1)
+    ) {
+      seen = true;
+      if (!contexts.some((s) => at >= s.start && at < s.end)) asserted = true;
+    }
+    if (asserted) {
+      reasons.push(`contains excluded mention: ${term}`);
       ok = false;
+    } else if (seen) {
+      // Recorded on a passing row, the way the strict reasons are: a reader
+      // auditing this rule needs to see every place it was generous, not only
+      // the places it refused.
+      reasons.push(
+        `[disambiguated] excluded mention "${term}" appears only where the answer rules it out`,
+      );
     }
   }
   return ok;
@@ -279,10 +419,36 @@ function gradeAbsence(
       ok = false;
     }
   }
-  if (answer.coverage.complete && (expected?.unreadable ?? 0) > 0) {
-    reasons.push("claims complete coverage while unreadable records exist");
-    ok = false;
-  }
+  /*
+   * `coverage.complete` is deliberately NOT read here, and the two senses of
+   * the word are why.
+   *
+   * There used to be a `complete && unreadable > 0` branch reading "claims
+   * complete coverage while unreadable records exist". It was dead while the
+   * flag was unsatisfiable; per-question grants made it fire, and it took Q8
+   * from 3/3 to 0/3 by failing the two runs that did the task properly —
+   * scanned 318 readable and 22 unreadable records, said the 22 in prose, set
+   * `coverage.unreadable = 22`.
+   *
+   * The senses it conflated:
+   *
+   * - **ledger `complete`** (`tools/coverage.ts`) — every granted scope was
+   *   streamed end to end, nothing skipped, nothing read within bounds, no
+   *   prefilter, no early stop. It says nothing whatever about legibility.
+   * - **absence-rule `complete`** — nothing in the corpus was unreadable.
+   *
+   * An unreadable record was *reached*, not skipped: the runtime recognised
+   * its marker as it streamed past, which is how it got counted at all. A run
+   * can honestly be complete in the first sense while the second is false, and
+   * on Q8 every correct run is exactly that.
+   *
+   * Nothing is lost by dropping it. The integrity property — an incomplete
+   * scan must say so in the answer text, not only in metadata — is carried
+   * whole by the two checks above: the count must match the corpus, and it
+   * must appear in the prose. A run that streams everything and hides the 22
+   * still fails, on the text check; a run that claims 0 unreadable still
+   * fails, on the metadata check. What no longer fails is telling the truth.
+   */
   return ok;
 }
 

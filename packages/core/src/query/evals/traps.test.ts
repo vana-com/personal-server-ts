@@ -10,20 +10,31 @@
 
 import { beforeAll, describe, expect, it } from "vitest";
 import { MemoryFixtureSink, type FixtureSource } from "./fixtures/sink.js";
-import { generateCorpus } from "./fixtures/generate.js";
+import {
+  generateCorpus,
+  SCOPES,
+  type CorpusManifest,
+} from "./fixtures/generate.js";
 import {
   anomalyReference,
   branchTrap,
   localDateDrift,
   sleepTrap,
+  tripReference,
 } from "./reference/compute.js";
+import { Q14_JPY_PER_USD } from "./fixtures/planted.js";
+import { buildCases } from "./cases.js";
 import { DEFAULT_SEED } from "./fixtures/profiles.js";
 
 let source: FixtureSource;
+let manifest: CorpusManifest;
 
 beforeAll(async () => {
   const sink = new MemoryFixtureSink();
-  await generateCorpus(sink, { profile: "small", seed: DEFAULT_SEED });
+  manifest = await generateCorpus(sink, {
+    profile: "small",
+    seed: DEFAULT_SEED,
+  });
   source = sink;
 }, 60_000);
 
@@ -155,4 +166,91 @@ describe("trap 2 — ChatGPT sibling branches", () => {
     expect(perConversation).toBeGreaterThan(10.5);
     expect(perConversation).toBeLessThan(12.5);
   });
+});
+
+/*
+ * Q14's tolerance, duplicated here for the same reason Q11's is: this file
+ * asserts a property of the *fixture and the grant*, and the number is the one
+ * thing that has to agree with `cases.ts`.
+ */
+const Q14_TOLERANCE_USD = 1;
+
+/** In-window spend, the two currencies kept apart. */
+async function inWindowByCurrency(
+  src: FixtureSource,
+  startDay: string,
+  endDay: string,
+): Promise<{ usd: number; jpy: number }> {
+  const rows = JSON.parse(await src.read("bank_transactions.json")) as {
+    date: string;
+    currency: string;
+    amount: number;
+  }[];
+  let usd = 0;
+  let jpy = 0;
+  for (const row of rows) {
+    if (row.date < startDay || row.date > endDay) continue;
+    if (row.currency === "JPY") jpy += Math.abs(row.amount);
+    else usd += Math.abs(row.amount);
+  }
+  return { usd, jpy };
+}
+
+describe("trap 5 — Q14's grant must contain the FX rates its answer needs", () => {
+  /*
+   * The arming assertion, and a regression test for how it came unarmed.
+   *
+   * Q14's expectation is a single USD figure over a two-currency set. It was
+   * measured with `fx.rates` in play (design §19.8's table records `7728.3`
+   * for "profile + `fx.rates` scope"), but the case declared only `bank` and
+   * `calendar` — the over-granting harness was quietly supplying the scope.
+   * The moment each question was narrowed to its own grant the rates vanished,
+   * and all three live runs said so outright, answered per-currency, and left
+   * `value` unset. A declared grant that cannot reach the declared ground
+   * truth is not a hard question, it is a broken one.
+   */
+  it("declares fx.rates, and the corpus exposes it", async () => {
+    const cases = await buildCases(source);
+    const q14 = cases.find((c) => c.id === "Q14");
+    expect(q14?.scopes).toContain(SCOPES.fx);
+    // Declaring a scope the manifest does not serve fails closed at the tool
+    // host instead, which reads as the model refusing to look.
+    expect(manifest.scopes.map((s) => s.scope)).toContain(SCOPES.fx);
+  });
+
+  it("puts the answer out of reach of bank and calendar alone", async () => {
+    const trip = await tripReference(source);
+    const { usd, jpy } = await inWindowByCurrency(
+      source,
+      trip.startDay,
+      trip.endDay,
+    );
+    // Without rates the best single number a script can honestly produce is
+    // the dollar side plus the flight. It has to miss, or the scope is
+    // decorative and the case grades nothing about currency.
+    expect(Math.abs(trip.totalUsd - (usd + trip.flightUsd))).toBeGreaterThan(
+      Q14_TOLERANCE_USD,
+    );
+    // Not marginally: converted, the yen half is the larger half of the trip.
+    expect(jpy / Q14_JPY_PER_USD).toBeGreaterThan(usd);
+  });
+
+  it("puts it out of reach of a guessed flat rate once the series drifts", async () => {
+    // `dogfood` is the only profile whose rate moves, and it is the corpus
+    // §19.8's numbers and `readings.ts`'s enumerated values come from. A model
+    // that happens to know a plausible JPY/USD constant still has to read the
+    // file: applying `Q14_JPY_PER_USD` uniformly lands ~106 USD off.
+    const sink = new MemoryFixtureSink();
+    await generateCorpus(sink, { profile: "dogfood", seed: DEFAULT_SEED });
+    const trip = await tripReference(sink);
+    const { usd, jpy } = await inWindowByCurrency(
+      sink,
+      trip.startDay,
+      trip.endDay,
+    );
+    const flatRate = usd + jpy / Q14_JPY_PER_USD + trip.flightUsd;
+    expect(Math.abs(trip.totalUsd - flatRate)).toBeGreaterThan(
+      Q14_TOLERANCE_USD,
+    );
+  }, 60_000);
 });

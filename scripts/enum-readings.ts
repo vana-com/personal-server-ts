@@ -123,6 +123,66 @@ async function main(): Promise<void> {
   console.log(`  inWindow + flight  ${(inWindow + flight).toFixed(2)}`);
   console.log(`  (flight alone      ${flight.toFixed(2)})`);
 
+  /* --- Q7 "what are my recurring monthly expenses, and which ones have crept up" --- */
+  /*
+   * Q7 is a `set` case, so no number arbitrates it — but the *set* has two
+   * readings, and this is where they are enumerated rather than argued about.
+   *
+   * The eval's rule (`reference/compute.ts`) is cadence alone: a merchant
+   * charged in at least 80% of the months is recurring, whatever the amount.
+   * The competing reading is the one "which ones have **crept up**" implies —
+   * a recurring *price*, i.e. a subscription, which has a per-charge amount
+   * that can transition. A grocery run has no price to creep.
+   *
+   * Both columns are printed for every merchant that clears the cadence bar,
+   * so the split is visible in the data instead of asserted: `amounts` is the
+   * count of distinct charge amounts, and `spread` the max/min ratio. A
+   * subscription holds a handful of amounts across three years; frequent
+   * retail holds one per visit.
+   */
+  const bankDates = bank.map((r) => r.date).sort();
+  const bankMonths = new Set(bank.map((r) => r.date.slice(0, 7))).size;
+  const byMerchant = new Map<string, BankRow[]>();
+  for (const r of bank) {
+    byMerchant.set(r.merchant, [...(byMerchant.get(r.merchant) ?? []), r]);
+  }
+  console.log(
+    `\nQ7 "recurring monthly expenses" — ${bank.length} rows, ` +
+      `${bankDates[0]} → ${bankDates[bankDates.length - 1]}, ${bankMonths} months`,
+  );
+  console.log(
+    `  merchant                 n   months  amounts  spread   monthlyGaps  cadenceRule  fixedPrice`,
+  );
+  for (const [merchant, list] of [...byMerchant].sort()) {
+    // The eval's bar, restated from `recurringReference`: ~one charge a month
+    // across most of the window. `months * 0.8` with months = ceil(days/30).
+    const days =
+      (Date.parse(bankDates[bankDates.length - 1]) - Date.parse(bankDates[0])) /
+        DAY +
+      1;
+    const months = Math.ceil(days / 30);
+    if (list.length < months * 0.8) continue;
+
+    const sorted = [...list].sort((a, b) => a.date.localeCompare(b.date));
+    const amounts = sorted.map((r) => Math.abs(r.amount));
+    const distinct = new Set(amounts.map((a) => a.toFixed(2))).size;
+    const spread = Math.max(...amounts) / Math.min(...amounts);
+    const gaps = sorted
+      .slice(1)
+      .map((r, i) => (Date.parse(r.date) - Date.parse(sorted[i].date)) / DAY);
+    const monthly = gaps.filter((g) => g >= 26 && g <= 35).length / gaps.length;
+    // "Fixed price on a monthly cadence": the reading "crept up" presupposes.
+    // Deliberately generous on the price side — a subscription that changes
+    // price twice still has 3 distinct amounts over 37 charges.
+    const fixedPrice = monthly >= 0.8 && distinct <= 5;
+    console.log(
+      `  ${merchant.padEnd(24)} ${String(list.length).padStart(3)}  ` +
+        `${String(months).padStart(6)}  ${String(distinct).padStart(7)}  ` +
+        `${spread.toFixed(2).padStart(6)}  ${(monthly * 100).toFixed(0).padStart(10)}%  ` +
+        `${"yes".padStart(11)}  ${(fixedPrice ? "yes" : "no").padStart(10)}`,
+    );
+  }
+
   const nutFile = files.find((f) => f.startsWith("nutrition"));
   const workouts = await read<WorkoutRow[]>("oura_workout.json");
   const runDays = new Set(

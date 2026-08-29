@@ -30,6 +30,19 @@ export INFERENCE_MODEL="${INFERENCE_MODEL:-gemini-3.7-flash}"
 export INFERENCE_E2EE=false
 export INFERENCE_REQUEST_FIELDS='{"temperature":0}'
 
+# One JSONL line per relay reply that was rejected or carried no usable
+# content, recording its SHAPE and never its text.
+#
+# The null-content crash design §19.8 recorded as eliminated (17% -> 0/54) came
+# back at 2/54 in the last sweep, and it could not be diagnosed from the dump:
+# `inference.ts` collapses four different situations into one message and
+# `loop.ts` retries all four the same way. Note this endpoint in particular —
+# Google's OpenAI-compat surface reports errors as a JSON **array**, which
+# `isRecord` excludes, so an array body reads as "no content" rather than as
+# the error it is. Costs nothing on a healthy sweep: it writes only on a
+# failure.
+export QUERY_INFERENCE_DIAG="$SP/dogfood-n3-reply-shapes.jsonl"
+
 # The key lives in the main checkout's .env; referenced, never copied into a
 # worktree, and never echoed.
 ENV_FILE=.env
