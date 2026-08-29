@@ -149,8 +149,46 @@ script_ differs run to run even when the answer matches.
 - High variance → script caching (phase 6) becomes mandatory for every
   numeric class, and we materialize more aggressively in phase 7.
 
-Record the result in the design doc; it is currently the largest open risk
-(design §15.3).
+**MEASURED 2026-08-28 — full tables in design §15.3.** Harness:
+`scripts/query-determinism.ts`, `--repeat N` (default 10), offline by default,
+`--live` to spend. "Identical" is reported two ways — exact match on `value`
+and match within tolerance — because they come apart: a model that rounds
+inconsistently scores badly on the first and perfectly on the second, and only
+the second is correctness.
+
+**Headline: script variance is total, and it is not the sampler.** 43/43
+distinct scripts unpinned; **60/60 distinct at `temperature: 0`**, raw and after
+normalizing whitespace and comments. The offline control was 1/10 distinct with
+sd 0, so the harness measures the model rather than itself. Value determinism
+turned out to be a property of the _question_: Q11 identical 9/9, Q1 outside
+tolerance 3 of 9. Coverage never stabilised — Q11 scanned 14k–34k records for
+one question — and `complete` was false in **every one of 121 runs**, so that
+flag currently carries no information.
+
+**The "high variance → caching mandatory" branch is met, on grounds no sampler
+configuration can undo.** Two things qualify it, and neither is optional:
+
+1. **Q14 returned the same wrong number every run** — 550824 against 7727.24,
+   because no profile told it to apply FX. Caching a script that was never
+   eval-verified freezes an error forever, deterministically. Phase 6b's clause
+   "ran successfully _and_ passed its eval case" is the only thing standing
+   between script caching and a permanent silent error; it is load-bearing, not
+   incidental.
+2. **Q1's instability is set resolution, not arithmetic.** "Last month" was
+   read as trailing-30, calendar-December and trailing-31 across runs — three
+   defensible readings. So a cached script freezes an _interpretation_. The
+   cached artifact must therefore persist the resolution it chose, not just its
+   code; prompt rule 5 already makes the model state that resolution.
+
+Follow-ups from this measurement, both since done: the **bank/currency profile**
+(and six more — ten profiles now), and the **`fx.rates` corpus scope**, added
+after the profile work showed Q14 was unpassable for a reason that was not the
+model's fault — the corpus held no exchange rate anywhere and the sandbox has
+zero network egress, so only the grader knew the rate and only the exact
+constant `149.5` passed. A **`dogfood` fixture profile** (18.8MB, 19 files, 18
+scopes) now carries real topical prose in place of the 40-word filler, giving
+knowable ground truth to the seven questions design §18.5 admitted were
+unmeasurable in substance.
 
 ---
 
