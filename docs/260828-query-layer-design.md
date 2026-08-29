@@ -1328,6 +1328,125 @@ limit and only a soft memory limit, and Node's `--permission` is explicitly
 documented as _not a security boundary_ against malicious code. Neither is
 usable here.
 
+## 19.8 Measured: the question corpus, end to end
+
+The first end-to-end grading of §3's eighteen questions, run 2026-08-28 through
+the full nested path (loop → confined interpreter → OS sandbox → host-authored
+coverage) against a real model — Gemini 3.7 Flash at `temperature: 0`, over the
+`dogfood` fixture corpus, **N=3 per question**, 54 live runs, 7.17M input /
+171.6k output tokens, 1141s.
+
+N=3 is the standard, not a luxury. A prior single-run pass recorded Q1 and Q11
+as clean passes; both are 2/3. It also recorded a fix as working off one lucky
+draw that was really 1-in-4. **With 60/60 distinct scripts at temperature 0, a
+single live run is a sample, not a verification.**
+
+| Class                | Result                                      |
+| -------------------- | ------------------------------------------- |
+| Exact aggregation    | Q1 2/3, Q11 2/3, Q18 2/3, Q7 0/3, Q14 0/3   |
+| Exhaustive / absence | **Q8 3/3**, Q5 0/3, Q15 0/3                 |
+| Latent inference     | **Q16 3/3**, Q3 0/3                         |
+| Relational / join    | Q6, Q4, Q17 0/3                             |
+| Synthesis            | Q2, Q9, Q10, Q13 0/3                        |
+| Introspection        | Q12 0/3 — the corpus models no grant ledger |
+
+**Five questions pass at least once, up from two.** Every harness-caused failure
+is gone: null-content crashes 17% → **0/54**, budget kills 28% → **0/54**.
+Nothing regressed.
+
+**The one-line finding: the arithmetic is reliable; the set resolution is not.**
+Q1 (which window is "last month"), Q6 (who counts as a person), Q14 (which
+transactions belong to the trip), Q18 (which days count as logged) all compute
+correctly over the wrong set. §3 predicted exactly this for Q14 and Q6; it
+generalizes further than the document assumed, and it is the single most
+valuable thing to attack next.
+
+**T2 profiles work, measurably, and Q14 is the cleanest evidence in the build:**
+
+| Q14 state                  | Answer                                                                                                            |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| No bank profile            | `550824` — raw JPY summed, **71× wrong**, identically on 4/4 runs                                                 |
+| Bank profile               | `3790.28` — FX applied, but JPY-only                                                                              |
+| Profile + `fx.rates` scope | **`7728.3`** — exactly `inWindowOnlyUsd`; window resolved, all currencies summed, only the pre-trip flight missed |
+
+That final residual is precisely §3's stated Q14 difficulty ("a pre-paid hotel
+charged two months earlier, and the flight itself"). The profile converted a
+silent arithmetic error into a correct-but-incomplete set — the shift §18.2
+predicts, observed.
+
+**Two flaky rows are grading artifacts, not model failures.** Q11's failing run
+computed 69.43 correctly _in its answer text_ but left `value` unset, so the
+harness's `extractNumber` fallback scraped `29` out of "December 29". Q18's
+failing run computed both candidate denominators and headlined the wrong one —
+a defensible alternative reading, not an error.
+
+**§18.3's cost model does not describe the system.** It predicts semantic
+questions dominate spend through per-item `vana.classify`. Measured:
+**`classify` was called in 0 of 54 runs.** Class medians sit within 2.5× of each
+other and spend tracks _turn count_, not semantic difficulty. Scanning remains
+free as §18.1 says (13.7MB in single-digit seconds). Phase 7's materialization
+calculus rests on §18.3's premise and should be re-derived from this.
+
+**`coverage.complete` has never been true — 132 consecutive runs.** Its
+derivation (every granted scope streamed end to end) appears too strict to fire
+on a multi-scope grant. A flag that is always false is not a safety property.
+
+### 19.9 The set-resolution finding: the questions are ambiguous, not the model
+
+§19.8 concluded that "the arithmetic is reliable; the set resolution is not."
+An experiment run to attack that inverted the diagnosis, and the correction
+matters more than the original claim.
+
+The model was made to declare its chosen set in a `resolution` field before
+computing. It complied **12/12** where it had declared nothing before. And in
+**every failing run the number is exactly consistent with the set it declared**
+— not approximately, exactly.
+
+Q1 ("how much did I sleep last month") is the clean case. Every defensible
+reading, computed off the corpus:
+
+| Reading              | Average     | n   |
+| -------------------- | ----------- | --- |
+| trailing 28 days     | 6.5769h     | 25  |
+| trailing 30 days     | 6.6190h     | 27  |
+| **trailing 31 days** | **6.5775h** | 28  |
+| calendar Dec 2025    | 6.6817h     | 27  |
+| calendar Nov 2025    | 6.8354h     | 30  |
+
+The eval expects trailing-31. The model declared "calendar December 2025" and
+returned 6.68 — **correct for the set it named.** Five readings span **0.26h
+against a ±0.05 tolerance**, so the eval cannot distinguish a wrong answer from
+a different defensible reading, whatever the model does.
+
+The regression is the sharpest evidence: **Q1 went 3/3 → 0/3 when the model was
+made to deliberate.** Before, it fell into the eval's reading by luck; asked to
+choose deliberately, it chose a different defensible one. Q14 declared "3790.28
+JPY plus the 1418.60 pre-booked flight" and returned their exact sum. Q18's two
+passing runs declared "108 logged days"; the failing one declared "74 complete
+logged days" and returned the number that follows.
+
+**So this is a definition problem, not a reasoning problem**, and it is a
+finding about _the eval_, not about the agent. §3 chose these phrasings
+deliberately because real users talk like this — which means the ambiguity is a
+property of the problem the Personal Server actually has, not an artifact to be
+tuned away.
+
+Three ways forward, and none of them is "prompt harder":
+
+1. **Grade the resolution, then the number given that resolution.** A
+   defensible resolution plus a consistent number is a pass. The field now
+   exists to do it.
+2. **Return the resolution to the caller** as part of the answer contract, so
+   an app can re-ask with the window pinned. This is arguably the correct
+   product behaviour, and §8's two-stage answering already leans that way.
+3. **Disambiguate the corpus questions** — but that narrows what the corpus
+   tests, and the ambiguity is the realistic part.
+
+What must _not_ happen is tuning the prompt until Q1 lands on trailing-31. That
+optimises for an arbitrary choice and hides the finding. The experiment
+deliberately dropped a drafted prompt line defining "last month", on the
+grounds that it would have been teaching to the test.
+
 ## 20. Next
 
 1. Turn §3 into a graded question set with expected answers and coverage
