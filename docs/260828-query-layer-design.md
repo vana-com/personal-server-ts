@@ -1499,6 +1499,63 @@ precisely §3's stated Q14 difficulty: the trip is defined by two disjoint rules
 a date window and a semantically-related charge outside it, and the harder half
 is knowing you need both.
 
+### 19.11 A stronger model resolves better and scores worse
+
+`gemini-3.1-pro-preview`, same protocol, `temperature: 0`, `dogfood`, N=3. This
+was run to separate "this model is weak" from "the architecture is weak". It
+settles it, in the direction that matters.
+
+**Pro resolves sets more consistently than Flash and passes no more often.**
+On Q1 it returned **6.62 on all three runs**, declaring:
+
+> "Resolved 'last month' as the 30 days ending on the most recent date in the
+> dataset (2025-12-05 to 2026-01-04). Filtered to `type === 'long_sleep'`…
+> excluded 2 rows with null `total_sleep_duration`."
+
+That is trailing-30 — **6.6190h, n=27** in §19.9's table — computed exactly, with
+the profile's nap and null rules both applied. **Its value is inside the ±0.05
+tolerance** (off by 0.0425). It fails only the denominator assertion, which
+requires the text to contain 28; Pro stated 27, the honest denominator for the
+set it chose. **A correct number over a defensible set, failed for stating its
+own denominator truthfully.**
+
+Three defensible readings now across two model tiers: Flash-old fell into
+trailing-31 by luck (3/3), Flash-new declared calendar-December, Pro declares
+trailing-30. Q18 is sharper still — Pro consistently chose the _stricter_
+denominator ("only days with a **complete** nutrition log"), which is arguably
+the better methodology, and scored 0/3 where Flash's looser choice scored 2/3.
+**The more sophisticated set choice diverges further from the eval's arbitrary
+pick.**
+
+**Genuine-reasoning failures survive the tier change.** Q17 still conflates the
+two Sarahs (0/3) while burning **354k–442k input tokens and 17–20 tool calls** —
+~1.7× Flash's tokens and 2× its calls for the same wrong answer. Q2 still
+follows the loud source into the wrong topic, exactly as §3 predicted. These are
+architectural or prompt-level, not capability-limited.
+
+**Script variance is a property of the architecture, not of one model.** Pro:
+**6/6 distinct**, raw and normalized. Flash: 54/54. Two tiers, same 100%
+regeneration variance at temperature 0. §15.3's conclusion is now much better
+supported than one model could support.
+
+**The cost shape is counter-intuitive.** Pro is ~4.4× _cheaper_ per run on
+questions it resolves in few turns (Q1: 15k input tokens and 1 tool call against
+Flash's 66.6k and 3), because spend tracks turn count and it needs fewer. It is
+dramatically more expensive on hard ones, where it thinks longer and superlinear
+turn growth follows. **On this evidence a stronger model buys no additional
+passes at any price.**
+
+Caveats: the sweep did not complete all 18 — a full N=3 run was killed at ~50
+minutes before writing output, and the Q8/Q16 controls are unrun. Q2 and Q17
+compare Pro-on-new-prompt against Flash-on-old-prompt and are confounded, though
+both are 0/3 either way. Per-token pricing was not verified; tokens are the
+reported unit.
+
+**The conclusion this forces: model capability is not the binding constraint —
+the grading contract is.** Until a resolution is graded separately from the
+number it produces, a better model cannot appear as a better score, and the
+corpus will keep reporting sophistication as failure.
+
 ## 20. Next
 
 1. Turn §3 into a graded question set with expected answers and coverage
