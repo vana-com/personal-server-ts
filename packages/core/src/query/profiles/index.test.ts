@@ -113,7 +113,18 @@ describe("parseFrontmatter", () => {
 describe("listProfiles", () => {
   it("parses every shipped profile", () => {
     const ids = listProfiles().map((p) => p.id);
-    expect(ids).toEqual(["chatgpt", "oura", "spotify"]);
+    expect(ids).toEqual([
+      "bank",
+      "browser",
+      "calendar",
+      "chatgpt",
+      "documents",
+      "email",
+      "notes",
+      "oura",
+      "slack",
+      "spotify",
+    ]);
   });
 
   it("gives every profile complete metadata", () => {
@@ -164,13 +175,55 @@ describe("selectProfiles", () => {
     expect(unprofiledScopes).toEqual([]);
   });
 
+  it("matches every fixture-corpus scope to its profile", () => {
+    // The scope ids the seeded corpus actually emits. A mismatch here is what
+    // made the whole T2 layer inert once already: the eval derived scope ids
+    // from filenames (`oura_sleep`), which match no profile's `oura.*`.
+    const expected: Record<string, string> = {
+      "bank.transactions": "bank",
+      "browser.history": "browser",
+      "calendar.events": "calendar",
+      "chatgpt.conversations": "chatgpt",
+      "documents.files": "documents",
+      "email.messages": "email",
+      "notes.entries": "notes",
+      "oura.sleep": "oura",
+      "oura.daily_sleep": "oura",
+      "oura.heartrate": "oura",
+      "oura.workout": "oura",
+      "oura.activity": "oura",
+      "oura.readiness": "oura",
+      "slack.messages": "slack",
+      "spotify.streaming": "spotify",
+    };
+    for (const [scope, id] of Object.entries(expected)) {
+      expect(getProfileForScope(scope)?.id, scope).toBe(id);
+    }
+  });
+
+  it("leaves no fixture-corpus scope unprofiled", () => {
+    const { unprofiledScopes } = selectProfiles([
+      "bank.transactions",
+      "browser.history",
+      "calendar.events",
+      "chatgpt.conversations",
+      "documents.files",
+      "email.messages",
+      "notes.entries",
+      "oura.sleep",
+      "slack.messages",
+      "spotify.streaming",
+    ]);
+    expect(unprofiledScopes).toEqual([]);
+  });
+
   it("reports scopes with no profile", () => {
     const { profiles, unprofiledScopes } = selectProfiles([
       "oura.sleep",
-      "bank.transactions",
+      "strava.activities",
     ]);
     expect(profiles.map((p) => p.id)).toEqual(["oura"]);
-    expect(unprofiledScopes).toEqual(["bank.transactions"]);
+    expect(unprofiledScopes).toEqual(["strava.activities"]);
   });
 });
 
@@ -201,20 +254,53 @@ describe("renderProfiles", () => {
   });
 
   it("names unprofiled scopes in the rendered block", () => {
-    const rendered = renderProfiles(["oura.sleep", "bank.transactions"]);
-    expect(rendered.unprofiledScopes).toEqual(["bank.transactions"]);
-    expect(rendered.text).toContain("bank.transactions");
+    const rendered = renderProfiles(["oura.sleep", "strava.activities"]);
+    expect(rendered.unprofiledScopes).toEqual(["strava.activities"]);
+    expect(rendered.text).toContain("strava.activities");
     expect(rendered.text).toContain("no source profile");
   });
 
-  it("fits all shipped profiles inside the default budget", () => {
+  // The shipped set no longer fits the default budget: ten profiles total
+  // ~44k characters of body against a 40k budget that was set when there were
+  // three. Degradation is therefore live, and `renderProfiles` includes
+  // profiles in alphabetical id order — so *which* profile is degraded is
+  // arbitrary with respect to how much it matters. Today that is `spotify`,
+  // whose body carries the measured account-data and skip-semantics traps.
+  //
+  // This test pins the behaviour rather than asserting the budget is
+  // sufficient, so the tradeoff stays visible instead of silently shifting to
+  // a different profile the next time one is added or edited.
+  it("degrades only the last profiles alphabetically once the budget is spent", () => {
     const rendered = renderProfiles(
       listProfiles().flatMap((p) =>
         p.scopes.map((s) => s.replace(".*", ".any")),
       ),
     );
+    expect(rendered.text.length).toBeLessThanOrEqual(
+      DEFAULT_PROFILE_BUDGET_CHARS,
+    );
+    // Everything before the cutoff renders in full...
+    expect(rendered.full).toContain("bank");
+    expect(rendered.full).toContain("oura");
+    expect(rendered.full).toContain("chatgpt");
+    // ...and the remainder is reported, never dropped in silence.
+    expect(rendered.summarized).toEqual(["spotify"]);
+    for (const id of rendered.summarized) {
+      expect(rendered.text).toContain(`(\`${id}\``);
+    }
+    expect(rendered.text).toContain("Full profile omitted for length");
+  });
+
+  it("renders every profile in full for a realistic single-source grant", () => {
+    // The budget only binds on an all-scope grant. A normal request touches a
+    // handful of scopes and is never degraded.
+    const rendered = renderProfiles([
+      "bank.transactions",
+      "calendar.events",
+      "oura.sleep",
+    ]);
     expect(rendered.summarized).toEqual([]);
-    expect(rendered.text.length).toBeLessThan(DEFAULT_PROFILE_BUDGET_CHARS);
+    expect(rendered.full).toEqual(["bank", "calendar", "oura"]);
   });
 });
 
