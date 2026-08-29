@@ -17,7 +17,7 @@ describe("system prompt", () => {
     for (const rule of [
       "Compute, never estimate",
       "Read the profile first",
-      "State your definitions and denominators",
+      "Disclose your method in the answer",
       "requires reading everything",
       "Resolve the set before you aggregate it",
       "People appear under many names",

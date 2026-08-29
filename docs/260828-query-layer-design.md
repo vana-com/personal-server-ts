@@ -1579,6 +1579,110 @@ the grading contract is.** Until a resolution is graded separately from the
 number it produces, a better model cannot appear as a better score, and the
 corpus will keep reporting sophistication as failure.
 
+### 19.12 A methodological-disclosure contract, measured on both arms
+
+The largest single failure bucket in the corpus was **one missing sentence**.
+Q2 failed on "did not state the weighting used", Q10 on "did not report
+per-period coverage", Q13 on "fails to note calendar freshness" — and Q10's own
+failure reason quoted the model's correct computed figures, which it then did
+not state. All three failed **identically in the stuffed baseline**, Q13 while
+seeing 100% of its grant. So this was neither a retrieval failure nor an
+architecture failure, and the mechanism to attack it already had a precedent:
+§19.9/§19.10 showed the model complies with a contract _field_ 12/12 where it
+had previously declared nothing.
+
+Prompt doc §4's rule 3 was therefore replaced. "State your definitions and
+denominators" — two lines, aspirational — became a standing obligation to end
+every answer with a `Method:` paragraph giving what was measured and how, what
+was included and excluded and on what basis, the denominator (per group and per
+period where the answer compares them), the recency of the records used, and
+what would have changed the answer. **The replacement text was written before
+any failing rubric was read**, from §3's "accurate answer requires" column,
+and it is question-agnostic: it names no question, no scope and no metric.
+Both arms share the rules block, so both got the change.
+
+**One correction to the premise, found while attributing rows.** Q15 was
+counted in the missing-sentence bucket and does not belong there. Its recorded
+failures are substantive in both arms — it names a kept intention (the dentist)
+as abandoned and omits two real ones — not a disclosure omission. The bucket
+was three questions, not four.
+
+`gemini-3.7-flash`, `temperature: 0`, `dogfood` @ seed 20260828, N=3, all 18
+questions, judged, same `runEval` grader on every cell.
+
+| Arm                    | Before                 | After                      | Δ rows |
+| ---------------------- | ---------------------- | -------------------------- | ------ |
+| **Agent** (code loop)  | 14/54, strict 11, 6 Qs | **19/54, strict 16, 7 Qs** | **+5** |
+| **Baseline** (stuffed) | 9/54, strict 6, 4 Qs   | 6/54, strict 5, 3 Qs       | −3     |
+
+Run-to-run variance between identical-grader sweeps is **~±3 rows**, so the
+agent's +5 is an effect and **the baseline's −3 is not distinguishable from
+noise** and is not read as one here.
+
+The baseline's "before" was graded under the pre-`a67f352` grader and had to be
+made comparable first. `a67f352` changed only two prose rules — set-grading
+exoneration and the absence integrity check — and both were checked against the
+retained dump: the three set-kind questions (Q5, Q7, Q17) were already 0/9, and
+the change only _removes_ exonerations, so they cannot move; Q8's three passes
+were re-tested against the new `statesUnreadableCount` rule and all three state
+the count beside an unreadable cue inside the retained text. Numeric and judged
+grading are untouched by that commit. **The regraded baseline "before" is 9/54,
+unchanged**, and directly comparable to the agent's 14/54.
+
+**The agent's +5 is entirely the two questions the change was aimed at.**
+
+| Q       | Before | After | Recorded failure before            |
+| ------- | ------ | ----- | ---------------------------------- |
+| **Q2**  | 0/3    | 3/3   | "did not state the weighting"      |
+| **Q13** | 0/3    | 2/3   | "fails to note calendar freshness" |
+| Q18     | 2/3    | 3/3   | — (within noise)                   |
+| Q17     | 1/3    | 0/3   | — (within noise)                   |
+
+Q18 and Q17 move one row each in opposite directions and cancel. Q2 and Q13 are
+the two whose failure reason _was_ the sentence the new rule requires, and both
+moved the moment it was required. Q13's one remaining failure still cites
+freshness. **Q10 did not move at all** — 0/3 before and after, on the same
+per-period-coverage clause — so the "give the denominator for each group and
+period" clause did not land, and Q15 did not move, as its failure was never
+disclosure. Q2 and Q13 are model-graded, and a judge is not a measurement: what
+raises confidence is that the reason string is identical across all three before
+runs and absent from all three after runs, not the count alone.
+
+**The baseline could not comply with the contract, and that is the finding.**
+
+| Arm      | `Method:` present | Median answer chars | Input tokens  |
+| -------- | ----------------- | ------------------- | ------------- |
+| Agent    | 1/54 → **52/54**  | 836 → **1771**      | 2.48M → 2.64M |
+| Baseline | 0/54 → **10/54**  | 347 → **334**       | 36.0M → 40.0M |
+
+The agent arm complied almost universally and roughly doubled its answer
+length. The baseline arm's answers did not get longer at all. Asked the same
+thing by the same words, it kept returning ~330-character answers — Q2's was
+184 characters against a ~881k-token prompt — and its Q2 and Q13 failures come
+back verbatim, still "did not state the weighting used" and still "fails to
+note calendar freshness". Its three lost rows are all disclosure-adjacent
+integrity checks (a denominator not stated, `coverage.complete` false and not
+said so), which is suggestive and is _not_ claimed as an effect at −3.
+
+**So the contract was a binding constraint, and it was not the only one.** The
+question this run was built to answer was whether the baseline would gain as
+much as the agent, which would have shown the architecture was doing nothing.
+It gained nothing: **the gap between the arms widened from 5 rows to 13.** The
+honest reading is that a disclosure obligation is only worth what the
+architecture can afford to spend on satisfying it — an arm that has consumed
+its context window on raw records has no room left to explain itself, and
+telling it to explain itself more does not create that room. Compliance
+capacity, not instruction quality, is what separated the two arms here.
+
+Caveats. The ±3 band is inherited from prior identical-grader sweeps and was
+not re-measured for this pair, so the baseline's −3 could be a small real
+regression that this design cannot resolve; distinguishing them needs repeats
+the corpus did not get. Q2/Q13/Q10/Q15 are model-graded. The contract was
+written once and not revised after seeing results, so no second experiment is
+folded into these numbers. Nothing here reopens plan §6, and no tolerance,
+ground truth, rubric, fixture or grader was changed — the only edit under test
+is the rule-3 replacement, applied identically to both arms.
+
 ## 20. Next
 
 1. Turn §3 into a graded question set with expected answers and coverage

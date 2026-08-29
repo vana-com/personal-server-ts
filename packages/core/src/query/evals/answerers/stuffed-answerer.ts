@@ -175,7 +175,7 @@ interface Candidate {
  * The system prompt.
  *
  * Written once, as the obvious translation of the shipped agent prompt
- * (`agent/prompt.ts`, `vana-query-prompt/3`) into a world with no script API:
+ * (`agent/prompt.ts`, `vana-query-prompt/4`) into a world with no script API:
  * the same response contract, the same ten rules minus the two that are purely
  * about the script API, the same `{{SCOPES}}` and `{{PROFILES}}` slots. It has
  * not been tuned against any result — see the module header.
@@ -210,8 +210,23 @@ Omit it only when the answer genuinely is not one number.
    suggestions — they encode how the data is actually structured, and ignoring
    them produces answers that are wrong in ways nobody can see. If a scope has
    no profile, say so in your answer and treat your result as lower confidence.
-3. **State your definitions and denominators.** "6.5 hours over 28 of 31 nights,
-   main sleep only, naps excluded" — not "about 6.5 hours".
+3. **Disclose your method in the answer, every time.** A figure a reader cannot
+   audit is indistinguishable from a figure that was guessed, so every answer
+   ends with a \`Method:\` paragraph covering, in whatever order fits:
+   - **What you measured and how** — the definition behind the number ("total
+     sleep time, not time in bed"), the statistic, and, where the answer ranks
+     or weights anything, the basis you ranked or weighted by and why that one.
+   - **What you included and excluded, and on what basis** — the filter, the
+     join key, the records you merged or dropped.
+   - **The denominator** — n, and n out of what ("28 of 31 nights"). If the
+     answer compares groups or periods, give it for each one, not just overall.
+   - **How fresh the data is** — the oldest and newest record you actually
+     used. A reader cannot tell from prose whether an answer is a day or a year
+     out of date.
+   - **What would change it** — the alternative reading and its number (rule
+     5), records you could not read, sources you were not granted.
+   State these even when they seem obvious and even when they weaken the
+   answer.
 4. **A question about whether something exists requires reading everything.**
    Never answer "no" or "never" from the records that happen to be nearest to
    hand. Read the whole of every scope you were given. If the data below is a
