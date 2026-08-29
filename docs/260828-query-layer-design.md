@@ -1447,6 +1447,58 @@ optimises for an arbitrary choice and hides the finding. The experiment
 deliberately dropped a drafted prompt line defining "last month", on the
 grounds that it would have been teaching to the test.
 
+### 19.10 Under the generous rule: what survives, and Q14's real failure
+
+The §19.9 grading rule was implemented and the corpus regraded. Defensible
+readings are enumerated **from the corpus before any model output is read**; a
+run passes only if it declared a resolution, named an enumerated reading, and
+returned _that reading's_ value. The rule can fail a run, and does: of 18
+ambiguous runs, 7 failed because the number did not match the declared set, and
+**two of those were strict passes the new rule demotes.** It moves results both
+ways.
+
+| Question  | Strict         | Resolution-aware |
+| --------- | -------------- | ---------------- |
+| Q1        | 0/6            | **6/6**          |
+| Q6        | 0/3            | 0/3              |
+| Q14       | 0/6            | 1/6              |
+| Q18       | 3/6            | 4/6              |
+| **Total** | **3/21 (14%)** | **11/21 (52%)**  |
+
+Fresh runs made _after_ the rule existed reproduced the shift (1/9 → 4/9), so it
+is not an artifact of regrading retrospectively. The older 54-run benchmark
+**cannot** be regraded — it predates the field, and inferring declarations from
+prose misclassified 2 of 9 runs, so the tooling refuses to guess. Ambiguity was
+declared for three questions only; Q6 was refused, because the corpus models no
+owner identity, so "excluding myself" is an unforced inference about the data
+rather than a reading of the question.
+
+**Q14's failure is not what it first appeared, and the distinction decides how
+much the `resolution` field is worth.** It was reported as the model declaring
+one set and computing another — which would make the field a fluent artifact
+rather than a safety mechanism. The raw runs say otherwise:
+
+| Run | Declared                                                           | Returned  | Consistent?                     |
+| --- | ------------------------------------------------------------------ | --------- | ------------------------------- |
+| 1   | JPY charges `$3,790.28` **plus** the pre-booked flight `$1,418.60` | `5208.88` | **exactly** (3790.28 + 1418.60) |
+| 2   | trip window, JPY converted at each date's rate                     | `7728.3`  | yes — `inWindowOnlyUsd`         |
+
+Expected is `9146.9` = `7728.3` (all in-window spend, every currency) + `1418.6`
+(the pre-trip flight). **Run 1 got the flight but took only the JPY half of the
+window; run 2 got the whole window but no flight. Each applied one of the two
+inclusion rules and never both.**
+
+So the failure is **set composition, not misrepresentation**: the model states
+its set honestly and computes it exactly, but under-composes, anchoring on one
+inclusion rule at a time rather than unioning them. §19.9's central claim
+survives, and the field earned its place — this diagnosis was only available
+_because_ the model declared its set.
+
+That is narrower and more tractable than "unreliable on sets", and it is
+precisely §3's stated Q14 difficulty: the trip is defined by two disjoint rules,
+a date window and a semantically-related charge outside it, and the harder half
+is knowing you need both.
+
 ## 20. Next
 
 1. Turn §3 into a graded question set with expected answers and coverage
