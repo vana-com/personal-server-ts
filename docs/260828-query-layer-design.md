@@ -2765,6 +2765,262 @@ items 3, 4 or 5** — the throughput number the plan asked for exists now, the C
 answer is "no host provides it today", and the corpus number is bounded above
 rather than known. The choice between the three paths remains a human's.
 
+### 19.18 PS-Lite runs the benchmark: QuickJS wired, measured in a browser
+
+§19.17 measured three engines and closed no item, because the choice belonged
+to a human. **The human chose QuickJS**, on the condition that it works on web,
+Android and iOS. This section records what was built against that decision,
+what the same five-question benchmark says about it, and — importantly — which
+parts of the cross-platform condition are now measured and which are still
+unverified.
+
+Machine: Apple M4, macOS 25.5, headless Chrome 152 and Safari 26.5.2.
+Model: `gemini-3.7-flash`, `temperature: 0`, Gemini direct, E2EE off — the same
+configuration the Node arm ran under, so the two arms differ in runtime and in
+nothing else the model sees.
+
+#### What was built
+
+`packages/lite/src/query/` — the browser half of a split whose other half
+already existed. Everything runtime-independent still comes from
+`packages/core`: the agent loop, the prompt, the `vana` API, the
+`CoverageLedger` and the result-frame protocol. Four files were added.
+
+- **`quickjs-sandbox.ts`** implements the `Sandbox` port on QuickJS-WASM.
+- **`lite-tool-host.ts`** is the `QueryToolHost` the loop consumes.
+- **`lite-query-service.ts`** is the browser `runQuery`.
+- **`mcp-ask-port.ts`** injects the port, so `ask_personal_data` on PS-Lite
+  stops answering `query_unavailable`.
+
+**Nothing on the Node path was altered.** Not the sandbox, not
+`query-service.ts`, not `sandbox-tool-host.ts`, not the eval harness, not a
+grader. The Node arm's numbers stay the numbers it was measured on, which is
+the only reason the comparison below means anything. The price is one
+duplicated function — the cross-run coverage merge — kept behaviourally
+identical and covered by tests asserting the same properties.
+
+#### The one design decision §19.17 did not anticipate
+
+§19.17 framed the choice as "which engine runs the model's code". It did not
+say **where the confined interpreter goes** if QuickJS wins, and the obvious
+answer is wrong.
+
+Keeping the Node arrangement — the acorn interpreter running _inside_ QuickJS,
+for three layers instead of two — costs 20.9x (interpreter) times 9.3x
+(QuickJS) ≈ **195x native**. At the `dogfood` operating point that is roughly
+8 seconds per script against 42 ms native. §19.17's own numbers rule it out,
+and they only ever described QuickJS running model code _natively_.
+
+So the arrangement inverts. On Node the interpreter exists because the sandboxed
+process is Node, and Node hands model code `require`, `process` and
+`globalThis` whether the API offers them or not; the interpreter denies those
+names by enumeration (`interpreter/realm.ts:38-56`). **A QuickJS VM has none of
+them to deny.** What the interpreter provides by enumeration, the VM boundary
+provides by construction — so the model's code runs natively on QuickJS, and
+the `vana` API and its ledger stay on the _host_ side of the boundary.
+
+That is a strictly better place for the ledger than Node has it. The Node runner
+has to encode coverage into a base64 frame because it lives in a subprocess
+whose stdout the model's code shares; here the ledger is simply never in the
+same heap as the code it is counting. The frame is still emitted, because
+`decodeResultFrame` fails closed and the rest of the stack reads that contract.
+
+The bridge that makes this work is a settle pump: the VM's `vana` prelude
+returns promises and enqueues calls; the host drains microtasks, settles each
+call against the real async API, hands the values back, and repeats. The
+asyncify variant would remove the pump, and was tried — it returned no result
+at all and then aborted the WASM module on dispose. The sync variant is also the
+one §19.17's throughput numbers describe.
+
+#### Three mechanics, one of which §19.17 did not have
+
+Both of §19.17's are re-asserted by tests against the shipped version:
+`setMaxStackSize` at 8 MB still makes every `evalCode` fail (`MAX_STACK_BYTES`
+is 1 MB), and a memory limit below the corpus still raises rather than
+returning null.
+
+A **third** was found here and is the same shape as the `ok: true, result: null`
+trap: a host function that _returns_ `vm.newError(...)` does **not** throw
+inside the VM — it returns the error object as an ordinary value. The first
+spike of the grant-denial path read a path outside its grant and printed `LEAK`
+for exactly this reason. Every denial now uses the `{ error }` result form, and
+a test pins it.
+
+§19.17's instruction — "any QuickJS host must verify the result frame, not the
+absence of an error" — is implemented as `verifyOutcome`: a run that neither
+completed, nor errored, nor read anything, and has no budget stop to explain
+itself, is reported as a memory termination rather than as an empty success.
+**It fired in the live benchmark**, on the fifth script of Q2 run 3, and
+correctly refused to call that script a success.
+
+#### The measurement §19.17 predicted and this one hit
+
+§19.17 noted `@jitl/quickjs-wasmfile-release-sync` ships
+`emscripten-module.wasm` as a separate 503,134-byte file, "a real fetch that a
+strict policy would have to allow or pre-empt". In a real browser it is worse
+than a policy question: the variant aborts with `both async and sync fetching
+of the wasm failed` unless the embedding page serves that file at the URL
+Emscripten computes from `import.meta.url`. **Every one of the first five
+benchmark runs failed this way** — honestly, as `sandboxUnavailable` with
+`complete: false` and the reason in `violations`, but they failed.
+
+The fix is `@jitl/quickjs-singlefile-browser-release-sync`, which inlines the
+module as base64. No second fetch, nothing for a `connect-src` policy to allow,
+and nothing for a WebView's local origin — which on iOS **cannot emit a
+response header at all** (§19.17, `origin_host.dart:19-29`) — to have to serve.
+It costs bundle size and buys a deployment that cannot half-work. Measured load:
+7 ms in Chrome, 42 ms in Safari.
+
+Lazy-loaded: adding the whole query layer to `packages/lite`'s public surface
+grew the existing `ps-lite-debug` browser bundle by **3,436 bytes**, because
+the variant is behind a dynamic import.
+
+#### The benchmark: same five questions, N=3, same model
+
+The corpus is the owner's real data — 12 scopes, 4.93 MB of envelopes —
+**hand-staged** into the browser rather than synced: the page fetches the
+envelopes once and writes them through PS-Lite's own OPFS file store, then the
+reader reads them back out of that store on every request. So OPFS read cost is
+inside the numbers; the gateway and grant stack are not exercised, and that is
+the labelled difference from a production path.
+
+| Q   | arm  | correct | input tok | output tok | turns | wall  | sandbox | complete  | recordsScanned  |
+| --- | ---- | ------- | --------- | ---------- | ----- | ----- | ------- | --------- | --------------- |
+| Q1  | node | 3/3     | 99,839    | 12,056     | 6.3   | 24.8s | —       | `[t,t,t]` | `[359,359,359]` |
+| Q1  | lite | 3/3     | 68,154    | 10,098     | 4.7   | 13.6s | 238 ms  | `[t,t,t]` | `[359,359,359]` |
+| Q2  | node | 3/3     | 286,889   | 9,540      | 7.3   | 25.5s | —       | `[f,t,f]` | `[512,515,515]` |
+| Q2  | lite | 2/3     | 68,091    | 12,624     | 4.0   | 17.9s | 197 ms  | `[f,f,t]` | `[512,0,515]`   |
+| Q3  | node | 3/3     | 69,334    | 2,141      | 2.7   | 8.6s  | —       | `[t,t,t]` | `[2,2,2]`       |
+| Q3  | lite | 3/3     | 21,834    | 2,134      | 3.0   | 12.3s | 13 ms   | `[t,t,t]` | `[2,2,2]`       |
+| Q4  | node | 3/3     | 22,271    | 3,284      | 3.3   | 15.4s | —       | `[t,t,t]` | `[1,1,1]`       |
+| Q4  | lite | 3/3     | 18,662    | 3,055      | 3.0   | 6.3s  | 4 ms    | `[t,t,t]` | `[1,1,1]`       |
+| Q5  | node | 3/3     | 33,182    | 3,148      | 3.0   | 12.9s | —       | `[t,t,t]` | `[157,157,157]` |
+| Q5  | lite | 3/3     | 42,883    | 3,985      | 4.0   | 11.8s | 18 ms   | `[t,t,t]` | `[157,157,157]` |
+
+| arm  | correct | input tokens | output tokens | per correct | total wall | hard failures |
+| ---- | ------- | ------------ | ------------- | ----------- | ---------- | ------------- |
+| node | 15/15   | 511,515      | 30,169        | 34,101      | 262 s      | 0             |
+| lite | 14/15   | 219,624      | 31,896        | 15,687      | 186 s      | 0             |
+
+**`recordsScanned` is identical on every question and every run except one.**
+359, 512/515, 2, 1, 157 — the same numbers the Node arm produced, from the same
+ledger over the same envelopes through a different unwrap implementation. So the
+denominators the answers are computed against did not move.
+
+Q3 is the one worth naming: the 1,332 contribution days sit nested inside a
+single record, and **Lite reaches past the top-level unwrap exactly as Node
+did** — `recordsScanned: 2`, and all three answers report 1,332 days, 3
+contributions and 0.23% active. `unprofiledScopes` populated identically on
+Q2–Q5 and was empty on Q1, matching Node on all five.
+
+#### The engine choice is 0.8% of wall clock
+
+41 scripts ran across the 15 rows, for **1,412 ms of total QuickJS time — 34 ms
+per script, 0.8% of the 186 s the benchmark took**. §19.17 predicted this at the
+`dogfood` operating point ("at that size the engine choice is a few percent of
+wall clock") and the real corpus is smaller than `dogfood`. The 12x gap against
+native V8 is real and is not what anyone will notice here; model latency is.
+
+That Lite is _faster_ than Node in wall clock is not a QuickJS result. Lite
+spent 219,624 input tokens against Node's 511,515 for the same questions, on
+fewer turns — a model-nondeterminism difference in how many probe turns each run
+took, not a runtime property. The honest reading of the token column is that the
+two arms are the same order and the difference is noise at N=3, not that the
+browser is twice as efficient.
+
+#### The one wrong answer, and why coverage still did its job
+
+Q2 run 2 answered on **turn 1 having run zero scripts**, and confabulated a rich
+thematic overlap across nine categories — software engineering, cooking, travel,
+fitness — over a notes corpus that is 150 numbered jokes and 3 test notes. Every
+number in it is invented.
+
+**Coverage did not endorse a word of it**: `recordsScanned: 0`,
+`scopesScanned: []`, `complete: false`. The contract worked exactly as designed —
+the answer is wrong, and the coverage says the answer read nothing.
+
+This is not a Lite defect. `runQueryLoop` accepts a `vana:answer` on any turn
+with no requirement that a script ever ran (`agent/loop.ts:491-503`), and that
+is shared `packages/core` code running identically on both arms. Node's Q2 was
+3/3 here but its `complete` column reads `[false, true, false]`, so the same
+question was partial on Node twice out of three. **Q2 is the flaky question on
+both runtimes**, and one confabulation in three is inside what N=3 can
+distinguish from the Node arm's zero. It is left open rather than fixed: a guard
+requiring at least one script before an answer would be a change to the shared
+loop, which would have made this comparison meaningless.
+
+#### Cross-platform: what is measured, and what is not
+
+The user's condition was web, Android and iOS. Honest status:
+
+| surface                     | status                | evidence                                                                                                                       |
+| --------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Desktop Chrome (Blink/V8)   | **measured, working** | Full N=3 benchmark plus capability probe. Module 7 ms, zero egress globals, 359-record workload in 126 ms, OPFS write+read ok. |
+| Desktop Safari (WebKit/JSC) | **measured, working** | Capability probe: module 42 ms, zero egress globals, same workload in 112 ms, same mechanics, OPFS write+read ok, quota 82 GB. |
+| iOS WKWebView               | **UNVERIFIED**        | Same engine family as the Safari row, which is real evidence — but not the same JIT policy, memory regime or OPFS behaviour.   |
+| Android WebView             | **UNVERIFIED**        | No evidence of any kind was obtainable here. No emulator, no adb, no Flutter toolchain on this machine.                        |
+
+The Safari row is the strongest available proxy for iOS: WKWebView runs the same
+WebKit and the same JavaScriptCore. It is **not** a substitute, for three
+reasons that are specific rather than generic. First, `apps/mobile-shell`
+contains **no reference to `WebAssembly` anywhere** — in Dart or in
+`ps_bundle` — except a `'wasm': 'application/wasm'` MIME mapping in
+`asset_resolver.dart:97`; WASM has never run there. Second, §19.17 recorded the
+mobile host capping the vault at **128 MiB** and defaulting to IndexedDB
+because "WKWebView can advertise OPFS while failing its first real write" — and
+the probe written here tests exactly that with a real write, so it would
+_detect_ the failure on a device rather than assume it. Third, the single-file
+variant removes the failure mode most likely to bite a WebView (a second fetch
+against a local origin that on iOS cannot set headers), which strengthens the
+case without settling it.
+
+**What would settle it**, precisely: build `.bench/probe.ts` into
+`apps/mobile-shell/assets/ps/`, load it in the Flutter shell on one real iOS
+device and one real Android device, and read the four fields it already emits —
+`moduleLoad`, `egressGlobalsPresent`, `mechanics`, `opfs.writable`. That is a
+single page load per device and it answers the whole condition. It needs
+hardware this machine does not have.
+
+#### Containment: what Lite has, and what it does not
+
+Stated plainly, because the honest framing is one layer instead of two.
+
+The VM was _asked_, at runtime, which of 19 egress and escape globals it has —
+`fetch`, `XMLHttpRequest`, `WebSocket`, `Worker`, `importScripts`,
+`WebAssembly`, `RTCPeerConnection`, `navigator`, `process`, `require`,
+`indexedDB`, `localStorage` and others. **The answer is none, on both engines
+measured.** Not denied: absent, because QuickJS never created them. The check
+runs on every sandbox construction and refuses to execute model code if it ever
+comes back non-empty — a test injects a `fetch` into the VM and asserts the
+sandbox declines rather than running.
+
+`readPaths` is enforced in **both** directions: the run is refused if
+`readPaths` names something the materialized grant does not hold, _and_ if the
+grant holds something `readPaths` does not name. The second direction is the one
+that matters (design §3 risk 1), and the Node path does not check it.
+
+What is lost against Node is real and should not be described any other way:
+**Node keeps an OS sandbox underneath, and Lite has nothing underneath.** On
+Node a defect in the language layer is still bounded by Seatbelt or bubblewrap;
+here a defect in QuickJS is bounded only by the WASM sandbox and the browser's
+own process model. The enforcement notes say so verbatim on every answer — "one
+containment layer, not two" — and `SandboxEnforcement` reports `cpu: false` and
+`memory: false`, because the interrupt handler bounds wall clock rather than CPU
+and `setMemoryLimit` bounds the VM heap rather than the page's memory.
+
+#### What this does not resolve
+
+Plan §6 item 3 (throughput) is answered for this corpus: 34 ms per script, 0.8%
+of wall clock. **Items 4 and 5 stay open.** The single-file variant removes
+QuickJS's _need_ for `connect-src` relief, but it does not give any host a CSP
+and Lite still has no mechanism to require or verify one; the blob-worker
+question that item 4 exists for is untouched. Item 5's corpus number is still
+bounded above rather than known — 4.93 MB was measured here against a 128 MiB
+cap nothing has approached. And the storage findings of §19.17 stand unfixed:
+Lite still never calls `navigator.storage.persist()`, the probe recorded
+`persisted: false` on both engines, and the IndexedDB fallback is still a Map
+whose snapshot is rewritten whole on every write.
+
 ## 20. Next
 
 1. Turn §3 into a graded question set with expected answers and coverage

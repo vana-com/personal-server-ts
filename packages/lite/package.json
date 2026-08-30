@@ -32,9 +32,11 @@
     "build": "tsc --build && npm run copy-tls"
   },
   "dependencies": {
+    "@jitl/quickjs-singlefile-browser-release-sync": "0.32.0",
     "@opendatalabs/personal-server-ts-core": "*",
     "@opendatalabs/vana-sdk": "3.14.0",
     "node-forge": "^1.4.0",
+    "quickjs-emscripten-core": "0.32.0",
     "viem": "^2.54.2"
   }
 }
