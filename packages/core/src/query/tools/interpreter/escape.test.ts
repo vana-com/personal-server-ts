@@ -102,6 +102,186 @@ describe("confined realm: the constructor bridge is severed", () => {
   });
 });
 
+describe("confined realm: reflection cannot walk around the key guard", () => {
+  /**
+   * The key guard in `readMember` only sees the *string* a script writes. The
+   * reflection API returns the same objects without ever being asked for a
+   * guarded name: `getOwnPropertyDescriptor(proto, "constructor").value` hands
+   * back `Function` under the key `value`, and `getPrototypeOf` hands back a
+   * prototype without anyone typing `prototype`. Measured before the fix:
+   * these reached the real host `process`, `fs.readFileSync` and
+   * `process.stdout.write`, which is a forged-coverage primitive.
+   *
+   * These cases are about the *route*, so each asserts denial rather than a
+   * particular value — a route that returns `undefined` would still be a
+   * silent partial escape.
+   */
+  it("blocks getPrototypeOf", async () => {
+    await expectDenied(`return Object.getPrototypeOf({});`);
+  });
+
+  it("blocks the descriptor bridge to Function", async () => {
+    await expectDenied(
+      `const proto = Object.getPrototypeOf(Math.max);
+       const d = Object.getOwnPropertyDescriptor(proto, "constructor");
+       return d.value("return process")();`,
+    );
+  });
+
+  it("blocks the Object.values(descriptor) variant of the same bridge", async () => {
+    await expectDenied(
+      `const proto = Object.getPrototypeOf(Math.max);
+       const d = Object.getOwnPropertyDescriptor(proto, "constructor");
+       return Object.values(d)[0]("return process")();`,
+    );
+  });
+
+  it("blocks the Object.entries(descriptor) variant", async () => {
+    await expectDenied(
+      `const proto = Object.getPrototypeOf(Math.max);
+       const d = Object.getOwnPropertyDescriptor(proto, "constructor");
+       return Object.entries(d)[0][1]("return process")();`,
+    );
+  });
+
+  it("blocks getOwnPropertyDescriptors", async () => {
+    await expectDenied(
+      `return Object.getOwnPropertyDescriptors(Object.getPrototypeOf(Math.max));`,
+    );
+  });
+
+  it("blocks getOwnPropertyNames", async () => {
+    await expectDenied(`return Object.getOwnPropertyNames(Object);`);
+  });
+
+  it("blocks setPrototypeOf", async () => {
+    await expectDenied(
+      `const o = {}; Object.setPrototypeOf(o, { pwned: 7 }); return o.pwned;`,
+    );
+  });
+
+  it("blocks Object.create", async () => {
+    await expectDenied(`return Object.create({ inherited: 5 }).inherited;`);
+  });
+
+  it("blocks defineProperty", async () => {
+    await expectDenied(
+      `Object.defineProperty({}, "x", { value: 1 }); return 1;`,
+    );
+  });
+
+  it("does not let a script mutate the host's Array.prototype", async () => {
+    // The second variant needs no `Function` at all: the runner's own ledger
+    // and its `JSON.stringify` path run on the same `Array.prototype` the
+    // script would be redefining. The probe below writes a novel key rather
+    // than `map` only so that a *failing* run leaves the test process
+    // diagnosable — redefining `map` succeeded before the fix and took the
+    // test runner's own serializer down with it.
+    await expectDenied(
+      `const ap = Object.getPrototypeOf([]);
+       Object.defineProperty(ap, "__pwned__", { value: 42, configurable: true });
+       return 1;`,
+    );
+    expect(
+      (Array.prototype as unknown as Record<string, unknown>).__pwned__,
+    ).toBeUndefined();
+    expect([1, 2].map((x) => x)).toEqual([1, 2]);
+  });
+
+  it("blocks reflection reached through every other bound intrinsic", async () => {
+    // The escape is a property of handing out live host objects, not of
+    // `Object` specifically. Whatever else the realm binds must not become a
+    // second doorway to the same prototypes.
+    const roots = [
+      `Array.from([1])`,
+      `"x"`,
+      `(5)`,
+      `Promise.resolve(1)`,
+      `new Map()`,
+      `new Set()`,
+      `new Date()`,
+      `/x/`,
+      `new Error("e")`,
+      `JSON`,
+      `Math`,
+    ];
+    for (const root of roots) {
+      await expectDenied(`return Object.getPrototypeOf(${root});`);
+    }
+  });
+
+  it("does not let one script poison the realm for the next", async () => {
+    // The shims are process-wide singletons, so a mutable one would carry a
+    // redefinition across runs — the same shape of bug as prototype pollution,
+    // one level up.
+    await expect(
+      run(`Array.isArray = function(){ return true }; return 1;`),
+    ).rejects.toThrow(TypeError);
+    const r = await runConfinedScript(
+      `return Array.isArray("not an array");`,
+      noVana,
+    );
+    expect(r).toBe(false);
+  });
+
+  it("keeps the intrinsics themselves out of reach as values", async () => {
+    // Even naming a host constructor as a value is a foothold: it is the thing
+    // every descriptor route was trying to obtain.
+    await expectDenied(`return Object.getPrototypeOf(Object);`);
+  });
+});
+
+describe("confined realm: the Object statics real scripts use still work", () => {
+  // §19.16 and the real-data benchmark show model-authored code reaching for
+  // these constantly. Removing them would be a regression, not a hardening.
+  it("supports keys, values, entries, assign and fromEntries", async () => {
+    const r = await runConfinedScript(
+      `const o = { a: 1, b: 2 };
+       const merged = Object.assign({}, o, { c: 3 });
+       const round = Object.fromEntries(
+         Object.entries(merged).map(([k, v]) => [k, v * 2]),
+       );
+       return [
+         Object.keys(o).join(","),
+         Object.values(o).join(","),
+         Object.keys(merged).length,
+         JSON.stringify(round),
+       ].join("|");`,
+      noVana,
+    );
+    expect(r).toBe(`a,b|1,2|3|{"a":2,"b":4,"c":6}`);
+  });
+
+  it("groups records the way a real script does", async () => {
+    const r = await runConfinedScript(
+      `const rows = [
+         { day: "mon", mins: 30 },
+         { day: "tue", mins: 45 },
+         { day: "mon", mins: 15 },
+       ];
+       const byDay = {};
+       for (const row of rows) {
+         byDay[row.day] = (byDay[row.day] || 0) + row.mins;
+       }
+       return Object.entries(byDay)
+         .sort((a, b) => b[1] - a[1])
+         .map(([day, mins]) => day + "=" + mins)
+         .join(",");`,
+      noVana,
+    );
+    expect(r).toBe("mon=45,tue=45");
+  });
+
+  it("supports Object.freeze and Object.is", async () => {
+    const r = await runConfinedScript(
+      `const o = Object.freeze({ a: 1 });
+       return Object.is(o.a, 1) && Object.keys(o).length === 1;`,
+      noVana,
+    );
+    expect(r).toBe(true);
+  });
+});
+
 describe("confined realm: unsupported syntax fails closed", () => {
   it("rejects class declarations", async () => {
     await expectDenied(`class Foo {}`);

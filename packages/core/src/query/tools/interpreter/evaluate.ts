@@ -13,6 +13,8 @@
  */
 import type { Node } from "acorn";
 import {
+  assertNotHostBridge,
+  CONSTRUCTIBLE,
   DELIBERATELY_ABSENT,
   ConfinementError,
   FORBIDDEN_IDENTIFIERS,
@@ -386,23 +388,19 @@ export async function evaluateProgram(
         if (typeof fn !== "function") {
           throw new TypeError(`${describe(node.callee)} is not a function`);
         }
+        // Holding a host intrinsic must not be enough to use one. Even if some
+        // future route leaks `Function`, calling it is refused here.
+        assertNotHostBridge(fn, describe(node.callee));
         return (fn as (...a: unknown[]) => unknown)(...args);
       }
 
       case "NewExpression": {
         const ctor = await evalNode(node.callee, scope);
         const args = await evalArgs(node.arguments, scope);
-        const allowed = [
-          Map,
-          Set,
-          Date,
-          RegExp,
-          Error,
-          TypeError,
-          RangeError,
-          Array,
-        ];
-        if (!allowed.includes(ctor as never)) {
+        // The allowlist is over the realm's own shims, not over host
+        // constructors — those are no longer nameable, and constructing one
+        // would hand the script an object whose graph reaches the host realm.
+        if (!CONSTRUCTIBLE.has(ctor)) {
           throw new ConfinementError(
             `new ${describe(node.callee)} is not allowed in the confined realm`,
           );
