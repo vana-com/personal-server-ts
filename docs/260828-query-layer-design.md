@@ -2396,6 +2396,375 @@ embedding was built. The §19.15 patch was applied for the Stage 4 run only and
 reverted, verified by `git diff d3c89d3` on the seven files returning 0 bytes.
 Reproduce with `./scripts/run-scale-bench.sh <outdir> dogfood-xl agent|stuffed`.
 
+### 19.17 PS-Lite's execution path: three measurements, no decision
+
+Plan §6 carries three open Lite items — QuickJS throughput, whether the WebView
+host can guarantee `connect-src 'none'`, and what corpus Lite realistically
+holds. §4.2 says of the first that how much slower Lite runs is "unmeasured and
+unmeasurable from the literature" and instructs a throwaway benchmark before
+committing. This section is that benchmark plus two audits. **It closes no open
+item.** Two of the three results point away from what §4.1 assumed, which is
+precisely why the choice belongs to a human.
+
+Machine: Apple M4, 17.2 GB, macOS 25.5, Node v22.23.0.
+`quickjs-emscripten@0.32.0` (MIT) was installed as a **root dev dependency for
+the benchmark only** — neither `packages/lite` nor `packages/core` gained a
+dependency, no Lite `Sandbox` was written, and `packages/lite/src` still imports
+nothing from `query/`. Reproduce with
+`npx tsx scripts/lite-sandbox-bench.ts --corpus <dir> --repeat 3 --probe-mem`,
+where `<dir>` is a profile materialised by `generateInto` at `DEFAULT_SEED` —
+the same generator `query-benchmark.ts` uses, so the corpora are the ones §19.16
+measured.
+
+#### The workload is a measured run, not a microbenchmark
+
+§19.15 recorded that in the recall class **15 of 15 runs scanned with `readAll`
+and 15 of 15 did their own in-script lexical matching**, "each run pulling 3,600
+to 13,000 records into the sandbox to do it", and that Q9's single passing run
+"scanned 12,600 records across `notes`, `slack` and `chatgpt.conversations` in
+seven scripts". Those three scopes are Q9's whole grant, and they hold exactly
+12,600 records on `dogfood` and 112,400 on `dogfood-xl` — the same 112,400
+§19.16 reports for the Q9 run at scale. So the benchmark replays Q9's grant
+rather than approximating it: `readAll` all three scopes, walk the ChatGPT
+threads along `current_node`, match a 15-phrase list with `indexOf` on
+lowercased text, sort the hits by time, return the earliest. Every arm returns
+the identical answer at every size — the record count, the hit count and the
+earliest hit all agree — so the arms are comparable.
+
+| corpus       | records | grant JSON |
+| ------------ | ------- | ---------- |
+| `lite`       | 1,040   | 1.05 MB    |
+| `dogfood`    | 12,600  | 9.80 MB    |
+| `dogfood-xl` | 112,400 | 73.52 MB   |
+
+The grant is a fraction of the corpus in each case (`dogfood-xl` is 252.2 MB
+total), which matches §19.16's point that "12.5x corpus" and "6.8x working set"
+are both true and neither alone describes what the agent experienced.
+
+#### Measurement 1 — throughput (plan §6 item 3)
+
+Four arms, N=3, medians, one child process per run so no arm inherits another's
+resident memory. `native` is plain V8 and stands in for the blob-worker path,
+which runs model code on the engine at full speed. `confined` is
+`runConfinedScript` — the acorn-AST interpreter that `runQueryScript` actually
+calls today (`packages/core/src/query/tools/runtime.ts:51`), i.e. the language
+layer of the shipped Node paranoid path. `quickjs-json` crosses the data as JSON
+text parsed inside the VM; `quickjs-ffi` builds it handle by handle, the FFI
+marshaling §4.2 calls "precisely its worst case".
+
+| arm            | `lite` 1,040 rec | `dogfood` 12,600 rec | `dogfood-xl` 112,400 rec |
+| -------------- | ---------------- | -------------------- | ------------------------ |
+| `native` (V8)  | 3 ms             | 42 ms                | 336 ms                   |
+| `confined`     | 126 ms (37x)     | 879 ms (20.9x)       | 7,505 ms (22.4x)         |
+| `quickjs-json` | 81 ms (23.8x)    | 393 ms (9.3x)        | 4,028 ms (12.0x)         |
+| `quickjs-ffi`  | 55 ms (16.3x)    | 434 ms (10.3x)       | 4,307 ms (12.8x)         |
+
+**QuickJS does 20 MB in 0.4 s and 252 MB in 4.0 s. It is not ruled out, and the
+number that settles the item is the wrong way round from the way §4.2 posed
+it:** QuickJS-WASM is **1.6x to 2.3x faster than the confined interpreter we
+already ship and already accept on Node**. The paranoid path is not a thing Lite
+might be too slow for; on this workload Lite's version of it would be quicker
+than the Node one.
+
+The two data-crossing strategies are within noise of each other (9.3x vs 10.3x,
+12.0x vs 12.8x). **§4.2's fear that FFI marshaling of large payloads is
+QuickJS's worst case is not what the measurement shows** — marshaling 112,400
+records handle by handle costs 7% more than handing the VM a string, not an
+order of magnitude.
+
+`native` is 12x faster than QuickJS at scale, and that gap is the real price of
+the choice, not the QuickJS number in isolation. §19.16 recorded Q9 taking 11
+scripts at 252 MB. If each were a full grant pass — an upper bound, since they
+are not all full passes — one question's sandbox time would be about 3.7 s
+native, 44 s on QuickJS and 83 s on the confined interpreter, against the ~31 s
+per row (model latency included) that §19.16 measured end to end. **At
+`dogfood-xl` the engine choice would move total wall clock by more than the
+model does. At `dogfood` the same arithmetic gives 0.5 s / 4.3 s / 9.7 s, which
+is noise against model latency.** Corpus size decides whether this matters,
+which is why item 5 below is not the small one.
+
+#### Memory, and a silent failure worth knowing about
+
+Host RSS does not separate the arms: it is dominated by the harness's own
+`JSON.parse` of the grant before any arm runs (151 MB at `dogfood`, 542 MB at
+`dogfood-xl`, within 3 MB across all four arms). QuickJS's own heap could not be
+sampled either — the host is blocked while the VM runs, and by the time
+`computeMemoryUsage()` is reachable the script has returned and its arrays are
+collected (measured: 0.27 MB used, 346 live objects, immediately after a run
+that had just held 12,600 records).
+
+So the working set was measured the other way round: the smallest
+`setMemoryLimit` under which the run still produces the **correct full-grant
+answer**.
+
+| corpus       | `quickjs-json` | `quickjs-ffi` |
+| ------------ | -------------- | ------------- |
+| `lite`       | ≤16 MB         | ≤16 MB        |
+| `dogfood`    | 32 MB          | 16 MB         |
+| `dogfood-xl` | 192 MB         | 32 MB         |
+
+The FFI path needs 6x less heap at scale because the JSON path holds the source
+text and the parsed structure simultaneously — `conversations.json` alone is
+52 MB of text on `dogfood-xl`. Nothing here approaches WASM's 4 GB ceiling.
+
+**One failure mode is worth recording because it would have been reported as a
+success.** At a 16 MB limit on `dogfood-xl` the FFI arm returned
+`ok: true, result: null` — the allocation failure inside the marshaling host
+function raised no error, settled no promise, and left the host with no signal
+that anything had gone wrong. The probe only caught it because it checks the
+returned record and hit counts against the unbounded run. A Lite sandbox that
+treated "no exception" as success would hand the model an empty result over a
+truncated corpus, which is the silent-wrongness failure the whole coverage
+contract exists to prevent. Any QuickJS host must verify the result frame, not
+the absence of an error.
+
+Two `quickjs-emscripten@0.32.0` mechanics, measured rather than read:
+`setMaxStackSize` at or above **8 MB makes every `evalCode` fail** — including
+`1+1` — with `SyntaxError: stack overflow`, because the requested limit exceeds
+the WASM stack region; 0–4 MB work. And disposing a runtime that still owns a
+handle aborts the WASM module with
+`Assertion failed: list_empty(&rt->gc_obj_list)`, which takes the process with
+it; resolving the script's promise through host-side globals rather than
+`resolvePromise` avoids it. Neither is documented where you would look.
+
+#### Measurement 2 — `connect-src 'none'` is not available on any host today (plan §6 item 4)
+
+This is the item that decides blob-worker versus QuickJS, because zero egress is
+the containment for prompt injection (plan §3 risk 2) and the blob-worker path
+has no other. The answer from the code is **no**, and it is closer to "no" than
+to "unknown".
+
+**`packages/lite` ships no HTML and no CSP.** It is a library:
+`packages/lite/package.json:14-21` exports a single `.` entry, `:27-29` publishes
+only `dist`, and `:31-33` builds with `tsc` alone, so it has no document to
+carry a policy. Repo-wide, `Content-Security-Policy` / `connect-src` /
+`script-src` appear **only in prose in
+`docs/260828-query-layer-implementation-plan.md`** (lines 615, 622, 635, 636,
+702, 750) — nowhere in any package. `packages/lite/src` creates no Worker and no
+blob URL. **The CSP is entirely the host's to supply, and Lite has no mechanism
+to require or verify one.**
+
+The three candidate hosts:
+
+| host                                | hosts Lite?                     | CSP on the Lite document                          |
+| ----------------------------------- | ------------------------------- | ------------------------------------------------- |
+| Tauri desktop WebView               | **no** — ships the Node sidecar | `connect-src 'self' https://* http://localhost:*` |
+| `apps/web` (Next.js)                | yes, in the page's own document | **none**                                          |
+| `apps/mobile-shell` Flutter WebView | yes — the real "WebView host"   | **none**, and on iOS **not settable**             |
+
+- The Tauri app is **not** the Lite host, which §4.1's framing implicitly
+  assumed. `unity-surfaces/apps/desktop/src-tauri/tauri.conf.json:81-82` bundles
+  the compiled Node sidecar as a resource, and
+  `apps/desktop/src/pages/query-chat/use-query-chat.ts:18-19` says so outright.
+  Its CSP (`tauri.conf.json:30`) permits all of `https://*` anyway — the exact
+  opposite of `'none'`.
+- `apps/web` boots Lite in the product document (`"use client"`,
+  `apps/web/src/features/personal-server/web-ps-lite-runtime.ts:1,28`) with no
+  CSP at all: `next.config.ts` has no `headers()`, and there is no
+  `vercel.json` or `middleware.ts`. Even if one were added, `connect-src 'none'`
+  is incompatible with an app that fetches its own API from the same document
+  (`web-ps-lite-runtime.ts:44-45`), so `'none'` there needs a separate
+  controller document that does not exist.
+- The Flutter shell is the real WebView host —
+  `apps/mobile-shell/assets/ps/index.html` loads the published Lite bundle and
+  carries no `<meta http-equiv>` — and **on iOS the serving layer cannot emit a
+  response header at all**: `lib/shell/origin_host.dart:19-29` records that
+  `flutter_inappwebview`'s iOS handler replies with a plain `URLResponse`, not
+  an `HTTPURLResponse`, so status and headers are "not settable"; the
+  `InAppLocalhostServer` actually in use
+  (`third_party/.../in_app_localhost_server.dart:108-119`) sets only
+  `contentType`. Android could set headers and sets only `Cache-Control`
+  (`origin_host.dart:163`).
+
+**Not determinable from these repos:** whether a blob-URL worker inherits the
+creator's CSP in the engines that matter. §4.1 calls this "verified behaviour"
+(plan lines 612, 618-622) but **no test or code in either repo exercises it** —
+repo-wide, `new Worker(` and `createObjectURL` for this purpose appear only in
+that prose. Whether a `<meta http-equiv>`-delivered CSP (the only channel iOS
+leaves open) governs blob-worker inheritance identically to a header is also not
+determinable here, and it is the kind of claim a wrong "yes" turns into an
+exfiltration path. It needs its own measurement on the actual WebViews.
+
+Also relevant to §4.1's "fetch the bytes before locking CSP down" note: the
+installed variant is **not** single-file. `@jitl/quickjs-wasmfile-release-sync`
+ships `emscripten-module.wasm` as a separate **503,134-byte** file, so its load
+is a real fetch that a strict policy would have to allow or pre-empt.
+
+#### Measurement 3 — what Lite realistically holds (plan §6 item 5)
+
+This one bounds the other two: if a realistic Lite corpus is 20 MB rather than
+252 MB, a 12x-slower engine is a rounding error against model latency. **The
+item is partly mis-framed, and the shipping host answers it more sharply than
+the item expects.**
+
+**On the mobile host, the storage is not OPFS.** `apps/mobile-shell` sets
+`storageMode: options.storageMode ?? "indexeddb"` on the product path, with the
+reason inline (`ps_bundle/src/harness.js:2441-2444`): "WKWebView can advertise
+OPFS while failing its first real write. The product path therefore uses
+PS-Lite's IndexedDB file-store adapter." That is a live hazard in Lite's own
+code, not a hypothetical: `isOpfsAvailable()`
+(`packages/lite/src/storage.ts:223-228`) only tests
+`typeof navigator.storage?.getDirectory === "function"` and never probes a
+write, while the OPFS store writes through `createWritable()`
+(`storage.ts:271,330`). The harness comment at `harness.js:331-344` spells out
+the consequence: "PS-Lite selects OPFS and then fails on every envelope write."
+**Whether `createWritable` works on the target WebViews is not recorded in
+either repo**; the `"indexeddb"` default is circumstantial evidence that it does
+not.
+
+**The real host enforces ceilings, and they are the best available answer to
+this item.** On `apps/mobile-shell`:
+`ps_vault_snapshot_store.dart:14` caps the native vault snapshot at
+`128 * 1024 * 1024` — **128 MiB**, enforced on both read and write with "PS
+snapshot exceeds the native persistence limit"; `native_ps_store.dart:11` caps a
+single KV record at **1 MiB**, enforced in SQL as a `CHECK` constraint; and
+`ps_host.dart:352-360` caps a file chunk at **128 KiB** decoded. Nothing
+comparable exists on `apps/web`, which requests no persistence and sets no
+quota. **So the one shipping host that bounds Lite bounds it at 128 MiB, which
+puts `dogfood-xl` (252.2 MB) out of reach there and makes `dogfood` (20.2 MB)
+the realistic operating point** — with the caveat that no recorded run has ever
+approached that cap, and what happens to a user who exceeds it is a `StateError`
+swallowed into a log line (`ps_service.dart:740-742`).
+
+**Lite never asks the browser how much room it has, or for permission to keep
+it.** `navigator.storage.persist()`, `.persisted()` and `.estimate()` are called
+**nowhere** in `packages/lite` or `packages/core`. A grep trap worth naming:
+`packages/lite/src/storage.ts:464` defines a local `async function persist()`
+that snapshots runtime state — it is not the browser persistence API. So plan
+§4.3's requirement ("IndexedDB is evictable; OPFS needs
+`navigator.storage.persist()` … check persistence and report it in `coverage`",
+plan lines 662-664) **is not implemented**, and Lite cannot currently report
+whether its own storage is evictable. The only `persist()` call in either repo
+is the mobile harness's, opt-in and **off by default**, with a recorded reason
+(`harness.js:476-486`): the first device run that made the call "also saw every
+subsequent OPFS read fail with WebKit's generic `UnknownError`, which wedged
+sync permanently."
+
+**A scaling property that matters more than quota.** On the IndexedDB fallback
+path, `storage.ts:462-481` serialises the entire index — and every envelope —
+into **one IndexedDB record**, rewritten on every write
+(`storage.ts:526,766,794,809,832,848,879,917`). Write cost is therefore linear
+in total corpus size on the very path the mobile product defaults to. No test or
+comment measures this.
+
+**The `lite` fixture is 3.2 MB and is not a claim about capacity.** Generated
+fresh at `DEFAULT_SEED`: 18 files, 16 scopes, 3.2 MB, of which Q9's grant is
+1.05 MB / 1,040 records. `profiles.ts:11-12` calls it "the PS-Lite profile (plan
+§4.2): smaller again, and generated entirely in memory because the browser
+runtime has no filesystem", states no byte size, and ties the counts to no
+storage ceiling; it is used only as a fast unit-test fixture
+(`generate.test.ts:30,40,107`, `dogfood.test.ts:55`,
+`query-eval-harness.test.ts:58`). **No Lite eval profile in the phase-1 sense
+exists** — which is exactly what plan §6 names as this item's resolver ("Phase
+1, Lite profile"). The largest payload any test writes through a Lite storage
+port is **10 KB**, and no test runs against real OPFS or real IndexedDB.
+
+**The bounded-read machinery exists but is not the path the model takes.**
+`storage/blocks` builds at a 48 KB target and a 256 KB hard cap
+(`packages/core/src/storage/blocks/build.ts:43-44`), and a bounded read returns
+at most 50 block ids (`select.ts:18`) under a caller-supplied `maxBytes`. That
+is `vana.read`. But §19.15 measured 15 of 15 recall runs using `readAll` /
+`stream`, which pass a whole scope and are bounded by nothing — which is why
+Measurement 1's numbers are whole-grant numbers. Worse, the bound is on the
+response, not the work: with no manifest sidecar, `storage.ts:543-552` reads the
+whole envelope and rebuilds every block before paging. **Plan §4.3's "do not
+parse a 53MB scope in one go" is advice to an implementation that does not yet
+constrain the model's choice**, and the 53 MB figure itself appears exactly once
+in the repo, derived from no constant, fixture or measurement.
+
+**Not determinable from these repos:** what quota any real device grants (
+`navigator.storage.estimate()` is called only in the mobile measurement harness,
+and **no recorded output of it exists anywhere**); whether persistence would be
+granted; whether eviction has ever occurred; whether OPFS `createWritable` works
+on the target WebViews; and any OPFS throughput number at all — plan lines
+703-705 said none were found and none have been added since. The largest OPFS
+I/O any code exercises is the harness's ~960 KB torture default, with no timing
+recorded.
+
+#### The trade-off, as it stands for a human
+
+There are three shapes, not two, because the confined interpreter is already
+browser-safe and already denies egress by name — `fetch`, `XMLHttpRequest`,
+`Worker`, `importScripts`, `WebAssembly`, `eval`, `Function` and `globalThis`
+are all in `FORBIDDEN_IDENTIFIERS`
+(`packages/core/src/query/tools/interpreter/realm.ts:38-56`), and the
+`constructor` / `__proto__` bridge is closed at every member access.
+
+| path                            | speed vs V8 | egress containment rests on                                                              | needs CSP? |
+| ------------------------------- | ----------- | ---------------------------------------------------------------------------------------- | ---------- |
+| Blob worker, model code native  | 1x          | CSP alone. Model code holds the worker global.                                           | **yes**    |
+| Blob/plain worker + interpreter | 21–22x      | Enumeration in a hand-written AST walker. Already shipped, already hostile-suite tested. | no         |
+| QuickJS-WASM                    | 9–13x       | Structure: a separate heap with no host bindings except those injected.                  | no         |
+
+**Measurement 3 moves the operating point, and that changes how much
+Measurement 1's gap matters.** If the shipping mobile host caps the vault at
+128 MiB, `dogfood-xl` is not a Lite corpus and the relevant column is `dogfood`:
+per script, 42 ms native against 393 ms on QuickJS. Over §19.16's 11-script Q9
+that is roughly 0.5 s versus 4.3 s per question, against ~31 s per row of
+measured end-to-end time. **At that size the engine choice is a few percent of
+wall clock; at `dogfood-xl` it would be most of it.** Anyone weighing this
+should decide which corpus Lite is being built for before deciding which engine
+it needs, and note that the 128 MiB figure is a cap nothing has been measured
+against, not an observed corpus.
+
+What each buys and costs:
+
+- **Blob worker** is the only path that keeps Lite within an order of magnitude
+  of PS full, and it is 12x faster than QuickJS at scale. It is also the only
+  path whose safety depends on something **no host in either repo currently
+  provides**, one of which (iOS) cannot provide it through the documented API.
+  Choosing it means committing to build the strict controller document first and
+  to verify blob-worker CSP inheritance on each WebView — and accepting that if
+  the guarantee ever lapses, model code authored from a malicious email has an
+  open network.
+- **QuickJS** costs 12x against native and needs 192 MB of heap at
+  `dogfood-xl`, 32 MB at `dogfood`. It buys containment that does not depend on
+  the host at all, and it is the only option that restores §19.7's two layers on
+  a runtime where §4's table marks the OS layer "❌ impossible". It is also,
+  measured here, faster than the interpreter the Node path already runs.
+- **The confined interpreter alone** needs no new dependency and no CSP, and it
+  is the same code already under test. It is the slowest of the three and, on
+  Lite, it would be the **only** layer — on Node it is explicitly backed by the
+  OS sandbox because §19.7 says neither layer suffices alone. A defect in a
+  hand-written AST walker is an escape with nothing behind it.
+
+A fourth thing is true regardless of which is chosen: **Lite's storage layer is
+not ready for any of them.** It cannot say whether its own data is evictable, it
+picks OPFS on a feature-detect that the mobile host already routes around, and
+its IndexedDB fallback rewrites the whole corpus on every write. Those are
+independent of the sandbox decision and none of them is a query-layer change.
+
+**What would still need to be true.** For the blob worker: a controller document
+that can be given `connect-src 'none'` on every host that ships Lite (today:
+none), plus a measured demonstration of blob-worker CSP inheritance on that
+host's engine, plus explicit deletion of `RTCPeerConnection`, which
+`connect-src` does not cover (§4.1). For QuickJS: a host that verifies the
+result frame rather than the absence of an error, given the `ok: true,
+result: null` failure above; a stack limit under 4 MB; and acceptance of a
+pre-1.0 dependency in the browser bundle. For either: Lite still has no
+`Sandbox` implementation and `packages/lite/src` still imports no `query/*`, so
+whichever is chosen is greenfield.
+
+#### Caveats
+
+One machine, one OS, one architecture (M4 / macOS / arm64) and one engine
+version; a browser's WASM and a WebView's WASM are not this Node build's WASM,
+and the `native` arm is Node's V8, not a WebView's. **No measurement here was
+taken in a browser at all** — this is a throughput and memory characterisation
+of the engines, not of the runtime they would ship in, and OPFS read cost is not
+in any number above. The workload is one question's grant replayed; Q9 is
+representative of the recall class by §19.15's counts, and is not representative
+of the aggregation class, which touches far fewer records. Timings are medians
+of three, and the arms differ by factors large enough that the spread (under 12%
+within any arm) does not change the ordering. `--probe-mem` walks a coarse
+ladder, so the memory figures are upper bounds within one ladder step, not
+minima. No fixture, grader, expectation or query-layer module was modified; the
+four profiles were generated fresh and byte-checked against §19.16's sizes
+(`dogfood` 20.2 MB, `dogfood-xl` 252.2 MB). **Nothing here resolves plan §6
+items 3, 4 or 5** — the throughput number the plan asked for exists now, the CSP
+answer is "no host provides it today", and the corpus number is bounded above
+rather than known. The choice between the three paths remains a human's.
+
 ## 20. Next
 
 1. Turn §3 into a graded question set with expected answers and coverage
