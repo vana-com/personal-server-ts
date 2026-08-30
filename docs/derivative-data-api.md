@@ -701,7 +701,8 @@ after a change waits `inference.recomputeDebounceMs` (default 5000);
 `POST /recompute` (owner, or the registering builder retrying after a
 failure) runs immediately. A question registered with
 `recompute: "snapshot"` never takes the source-change edge: it computes at
-registration and on `POST /recompute` only. `failed` carries a short `error` (a status code,
+registration and on `POST /recompute` only. On boot the server reschedules
+every question a previous run left `pending` or `stale`. `failed` carries a short `error` (a status code,
 a scope name, an error class); the prompt and the data are never stored in
 it.
 

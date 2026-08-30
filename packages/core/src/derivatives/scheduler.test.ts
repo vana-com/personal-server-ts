@@ -219,6 +219,39 @@ describe("createRecomputeScheduler", () => {
     expect(compute.mock.calls.map((call) => call[0])).toEqual(["q-2"]);
   });
 
+  it("the first start() reschedules questions a previous process left pending or stale", async () => {
+    const store = createInMemoryQuestionStore({
+      initial: [
+        registration({ questionId: "q-ready", status: "ready" }),
+        registration({ questionId: "q-pending", status: "pending" }),
+        registration({ questionId: "q-stale", status: "stale" }),
+      ],
+    });
+    const timers = manualTimers();
+    const compute = vi.fn(async () => undefined);
+    const scheduler = createRecomputeScheduler({
+      store,
+      compute,
+      debounceMs: 0,
+      timers: timers.api,
+    });
+    // Boot: no stop() ever happened, the store simply came back populated.
+    scheduler.start();
+    await scheduler.whenIdle();
+    expect(timers.pending()).toHaveLength(2);
+    timers.fireAll();
+    await scheduler.whenIdle();
+    expect(compute.mock.calls.map((call) => call[0]).sort()).toEqual([
+      "q-pending",
+      "q-stale",
+    ]);
+    // While running, another start() must not replay anything.
+    scheduler.start();
+    await scheduler.whenIdle();
+    expect(timers.pending()).toHaveLength(0);
+    expect(compute).toHaveBeenCalledTimes(2);
+  });
+
   it("start() after stop() reschedules pending and stale questions", async () => {
     const store = createInMemoryQuestionStore({
       initial: [

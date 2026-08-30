@@ -53,8 +53,10 @@ export interface RecomputeScheduler {
   /** Cancel pending timers. In-flight computes finish on their own. */
   stop(): void;
   /**
-   * Resume after `stop()`: questions left `pending` or `stale` are
-   * scheduled again (immediately). Idempotent while running.
+   * Schedule every question left `pending` or `stale` (immediately). The
+   * first call is the boot reschedule: a restarted process only holds what
+   * the store holds, and those questions have no other way back onto a
+   * timer. Later calls resume after `stop()`; idempotent while running.
    */
   start(): void;
 }
@@ -80,6 +82,9 @@ export function createRecomputeScheduler(
   const states = new Map<string, QuestionState>();
   const pending = new Set<Promise<unknown>>();
   let stopped = false;
+  // Distinguishes the first start() (which must reschedule) from a
+  // redundant one while already running (which must not).
+  let started = false;
 
   function track<T>(promise: Promise<T>): Promise<T> {
     pending.add(promise);
@@ -236,7 +241,8 @@ export function createRecomputeScheduler(
       }
     },
     start() {
-      if (!stopped) return;
+      if (started && !stopped) return;
+      started = true;
       stopped = false;
       void track(
         (async () => {
