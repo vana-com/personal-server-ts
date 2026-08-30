@@ -9,5 +9,19 @@
     "sourceMap": true
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["src/**/*.test.ts"]
+  // The eval harness is test scaffolding, not part of the published surface:
+  // it is excluded from the build and has no `exports` entry. It is still
+  // typechecked by `tsconfig.typecheck-tests.json` and still run by vitest;
+  // `scripts/` reach it by relative path into `src/`.
+  "exclude": ["src/**/*.test.ts", "src/query/evals/**"],
+  // `files` is not filtered by `exclude`. These three are the only eval files
+  // product code reaches: `query/agent/answerer.ts` type-imports
+  // `EvalAnswerer` from `evals/types.ts`, which pulls `readings.ts`, which
+  // pulls `fixtures/profiles.ts`. Dropping them would dangle the published
+  // `./query/agent` types.
+  "files": [
+    "src/query/evals/types.ts",
+    "src/query/evals/readings.ts",
+    "src/query/evals/fixtures/profiles.ts"
+  ]
 }

@@ -6,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   generateInto,
   type CorpusManifest,
-} from "@opendatalabs/personal-server-ts-core/query/evals";
+} from "../packages/core/src/query/evals/index.js";
 import { createFakeInferenceProvider } from "../packages/core/src/derivatives/inference.js";
 
 import { FsFixtureSink } from "./query-eval-fs-sink.js";

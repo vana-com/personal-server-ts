@@ -140,10 +140,6 @@
       "types": "./dist/write/index.d.ts",
       "import": "./dist/write/index.js"
     },
-    "./query/evals": {
-      "types": "./dist/query/evals/index.d.ts",
-      "import": "./dist/query/evals/index.js"
-    },
     "./query/agent": {
       "types": "./dist/query/agent/index.d.ts",
       "import": "./dist/query/agent/index.js"

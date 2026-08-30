@@ -15,7 +15,7 @@ import type {
   CorpusManifest,
   EvalAnswerer,
   EvalQueryRequest,
-} from "@opendatalabs/personal-server-ts-core/query/evals";
+} from "../packages/core/src/query/evals/index.js";
 import {
   createAgentAnswerer,
   type QueryToolHost,

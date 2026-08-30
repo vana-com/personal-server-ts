@@ -15,7 +15,7 @@ import {
   DEFAULT_SEED,
   generateInto,
   reference,
-} from "@opendatalabs/personal-server-ts-core/query/evals";
+} from "../packages/core/src/query/evals/index.js";
 
 import { FsFixtureSink } from "./query-eval-fs-sink.js";
 

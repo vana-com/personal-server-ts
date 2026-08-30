@@ -14,7 +14,7 @@ import type {
   FixtureFile,
   FixtureSink,
   FixtureSource,
-} from "@opendatalabs/personal-server-ts-core/query/evals";
+} from "../packages/core/src/query/evals/index.js";
 
 export class FsFixtureSink implements FixtureSink, FixtureSource {
   constructor(private readonly dir: string) {}

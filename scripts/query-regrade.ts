@@ -25,7 +25,7 @@ import {
   AMBIGUOUS_READINGS,
   gradeAgainstReadings,
   type DefensibleReading,
-} from "@opendatalabs/personal-server-ts-core/query/evals";
+} from "../packages/core/src/query/evals/index.js";
 // Deep import: the on-disk dump shape is a contract between `query-benchmark.ts`
 // and this reader, not part of the eval harness's public surface.
 import {

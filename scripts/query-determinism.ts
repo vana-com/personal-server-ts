@@ -25,7 +25,7 @@ import {
   generateInto,
   type FixtureProfileName,
   type QueryEvalCase,
-} from "@opendatalabs/personal-server-ts-core/query/evals";
+} from "../packages/core/src/query/evals/index.js";
 
 import { FsFixtureSink } from "./query-eval-fs-sink.js";
 import { buildAgentAnswerer, buildLiveProvider } from "./query-eval-harness.js";

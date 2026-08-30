@@ -62,7 +62,7 @@ import {
   generateInto,
   runEval,
   type FixtureProfileName,
-} from "@opendatalabs/personal-server-ts-core/query/evals";
+} from "../packages/core/src/query/evals/index.js";
 import type { QueryAnswer } from "../packages/core/src/query/agent/index.js";
 // Deep import: `evals/index.ts` is the barrel, and the serialised dump shape
 // is a contract between this writer and `query-regrade.ts` alone rather than
