@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import { createFakeInferenceProvider } from "../../derivatives/inference.js";
-import { runEval } from "../evals/runner.js";
-import type { QueryEvalCase } from "../evals/types.js";
-import { createAgentAnswerer } from "./answerer.js";
-import type { QueryToolHost } from "./tool-host.js";
+import { runEval } from "./runner.js";
+import type { QueryEvalCase } from "./types.js";
+import { createAgentAnswerer } from "./agent-answerer.js";
+import type { QueryToolHost } from "../agent/tool-host.js";
 
 const fence = "```";
 

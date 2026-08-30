@@ -15,9 +15,9 @@
  * it". That narrowing is gone.
  */
 
-import type { EvalAnswerer } from "../evals/types.js";
-import { runQueryLoop, type QueryLoopOptions } from "./loop.js";
-import type { QueryAnswer, QueryRequest } from "./types.js";
+import type { EvalAnswerer } from "./types.js";
+import { runQueryLoop, type QueryLoopOptions } from "../agent/loop.js";
+import type { QueryAnswer, QueryRequest } from "../agent/types.js";
 
 export interface AgentAnswererOptions extends QueryLoopOptions {
   /** Reported in the eval output so a run's provenance is legible. */

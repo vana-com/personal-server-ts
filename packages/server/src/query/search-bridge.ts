@@ -1,3 +1,30 @@
+/*
+ * UNREACHABLE as committed — nothing calls this module.
+ *
+ * `resolveSearches` has no caller and no test. `searchResults` is the only
+ * route from its output into a run, and neither query service ever populates
+ * it: `query-service.ts` builds the tool host without the field, and PS-Lite
+ * throws for `search` outright. So `runner-entry.ts`'s `search` always falls
+ * through to its honest denial, and this file is dead at runtime.
+ *
+ * It is kept deliberately, as the apply-base for
+ * `docs/query-layer-experiments/19.15-search-deferred-roundtrip.patch`, which
+ * patches this exact file as one of seven. Design §19.15 records that patch as
+ * verified by execution: reverting with `git checkout d3c89d3 -- <seven
+ * paths>` leaves `git diff d3c89d3` at 0 bytes, and re-applying restores all
+ * seven files to matching SHA-256 digests. Deleting this file — or rewriting
+ * that hunk into a new-file diff so the patch could carry the file itself —
+ * would stop the patch applying against `d3c89d3` and falsify that measured
+ * claim. The dead code is the cheaper price, so it is labelled, not removed.
+ *
+ * The same reasoning keeps `./mcp/search` in `packages/core/package.json`:
+ * this file's type-only import is its only consumer, and it exists so this
+ * file can be patched back to life.
+ *
+ * This banner sits above the module doc rather than inside it so the patch's
+ * first hunk keeps the contiguous context it matches on.
+ */
+
 /**
  * Host-side lexical search for the query layer.
  *

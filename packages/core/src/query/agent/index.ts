@@ -61,5 +61,9 @@ export type {
 export { DEFAULT_MAX_TURNS, runQueryLoop } from "./loop.js";
 export type { QueryLoopOptions } from "./loop.js";
 
-export { createAgentAnswerer } from "./answerer.js";
-export type { AgentAnswererOptions } from "./answerer.js";
+// `createAgentAnswerer` is deliberately NOT re-exported here. It adapts this
+// loop to the eval harness's `EvalAnswerer`, so it has no product consumer —
+// only the harness and its own test — and its type-only import of
+// `evals/types.ts` was the single reason the published `./query/agent` types
+// dragged the whole `evals/` chain into `dist`. It now lives beside the thing
+// it serves, at `query/evals/agent-answerer.ts`, which the build excludes.

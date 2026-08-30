@@ -16,10 +16,8 @@ import type {
   EvalAnswerer,
   EvalQueryRequest,
 } from "../packages/core/src/query/evals/index.js";
-import {
-  createAgentAnswerer,
-  type QueryToolHost,
-} from "../packages/core/src/query/agent/index.js";
+import { createAgentAnswerer } from "../packages/core/src/query/evals/agent-answerer.js";
+import { type QueryToolHost } from "../packages/core/src/query/agent/index.js";
 import {
   createFakeInferenceProvider,
   createOpenAiCompatibleInferenceProvider,

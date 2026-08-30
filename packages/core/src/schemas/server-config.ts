@@ -80,22 +80,6 @@ export const DEFAULTS = {
     // Quiet period after a source scope changes before a recompute starts.
     recomputeDebounceMs: 5_000,
   },
-  query: {
-    // The code-writing query layer (docs/260828-query-layer-design.md).
-    // Off until the graded question set says it beats the current path.
-    enabled: false,
-    // Budgets the host enforces on a generated script. Exhausting one is a
-    // first-class outcome (a partial answer with coverage.complete=false),
-    // not an error.
-    maxToolCalls: 50,
-    wallClockMs: 60_000,
-    cpuMs: 30_000,
-    memoryMb: 512,
-    maxOutputBytes: 1_000_000,
-    // Replay a verified script instead of regenerating it. Phase 2 decides
-    // whether this is an optimization or mandatory for numeric answers.
-    skillCache: true,
-  },
 };
 
 export const StorageBackend = z.enum([
@@ -223,42 +207,6 @@ export const ServerConfigSchema = z.object({
         .default(DEFAULTS.inference.recomputeDebounceMs),
     })
     .default(DEFAULTS.inference),
-  query: z
-    .object({
-      enabled: z.boolean().default(DEFAULTS.query.enabled),
-      maxToolCalls: z
-        .number()
-        .int()
-        .min(1)
-        .max(1_000)
-        .default(DEFAULTS.query.maxToolCalls),
-      wallClockMs: z
-        .number()
-        .int()
-        .min(1_000)
-        .max(600_000)
-        .default(DEFAULTS.query.wallClockMs),
-      cpuMs: z
-        .number()
-        .int()
-        .min(1_000)
-        .max(600_000)
-        .default(DEFAULTS.query.cpuMs),
-      memoryMb: z
-        .number()
-        .int()
-        .min(64)
-        .max(8_192)
-        .default(DEFAULTS.query.memoryMb),
-      maxOutputBytes: z
-        .number()
-        .int()
-        .min(1_024)
-        .max(100_000_000)
-        .default(DEFAULTS.query.maxOutputBytes),
-      skillCache: z.boolean().default(DEFAULTS.query.skillCache),
-    })
-    .default(DEFAULTS.query),
 });
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;

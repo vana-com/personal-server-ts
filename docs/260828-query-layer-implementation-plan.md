@@ -715,11 +715,31 @@ numbers were found.
 - **Conventional commits** (commitlint, `@commitlint/config-conventional`).
   PR titles are validated by CI — a `[Don't merge]`-style prefix fails the check
   (this is why PR #231 shows a red title check).
-- **Config** goes in `packages/core/src/schemas/server-config.ts` under a new
+- ~~**Config** goes in `packages/core/src/schemas/server-config.ts` under a new
   `query` block with defaults, alongside the existing `inference` block. Suggested
   keys: `query.enabled`, `query.maxToolCalls`, `query.wallClockMs`,
   `query.cpuMs`, `query.memoryMb`, `query.maxOutputBytes`, `query.skillCache`.
-  Add env overrides only for the Node server, matching `INFERENCE_*` precedent.
+  Add env overrides only for the Node server, matching `INFERENCE_*` precedent.~~
+  **Superseded — the block was written, never read, and is now deleted.** It
+  shipped as ~52 lines of schema whose only reader was its own 42-line unit
+  test: `app.ts` mounted `/v1/query` unconditionally, the sole runtime gate
+  being `inferenceProvider === undefined → 503`; the five budgets were
+  superseded by the hardcoded `QUERY_SANDBOX_BUDGET` / `QUERY_SANDBOX_LIMITS`
+  in `query-service.ts` (and `LITE_QUERY_*` on the Lite side); and
+  `skillCache` had no implementation anywhere. A documented `enabled: false`
+  that an operator would read as "the feature is off" while the route serves
+  is worse than no switch at all, so the block went rather than the reading.
+  Wiring it was the considered alternative and was rejected on two grounds.
+  `enabled` could only ever gate the Node route — PS-Lite runs in a browser
+  and cannot read `ServerConfig` at all — so the switch would have been half a
+  switch, which is the same class of lie. And `skillCache` has no feature
+  behind it to wire: building script replay is exactly the caching decision
+  §6 reserves for a human ("caching must be gated on an eval-verified result
+  or it freezes errors permanently"). Wiring the rest and leaving `skillCache`
+  dead would have left the worst state of the three — some fields real, some
+  decorative, with nothing marking which. A real kill switch remains available
+  later; it should be added when something reads it, and it should cover both
+  runtimes.
 - **Error codes** go in `packages/core/src/errors/catalog.ts` next to the
   existing `DERIVATIVE_*` codes.
 - **T2 profiles are shipped assets.** ~~They are `.md` files that must reach
