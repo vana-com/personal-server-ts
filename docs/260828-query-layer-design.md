@@ -2070,7 +2070,7 @@ ignore search; it reimplements it.
 
 In the recall class the split is total: **15 of 15 after-runs scanned, 15 of 15
 did their own in-script lexical matching, and 1 of 15 called the tool**, each
-run pulling 3,600 to 13,000 records into the sandbox to do it. On a 222MB
+run pulling 3,600 to 13,000 records into the sandbox to do it. On this 20.2MB
 corpus that is a rational choice rather than a mistake — `readAll` is one call,
 the filter that follows is exact rather than ranked, it needs no round trip,
 and it produces the full-pass coverage that rule 4 demands for existence
@@ -2114,8 +2114,8 @@ Before this section the claim was an artifact: it was measured against an agent
 whose semantic tools all threw. Now both the measurement and the tools are
 real, and the claim is still unmeasured, because the agent does not use the
 tools even when they work. What the corpus actually demonstrates is narrower
-and firmer: **on 222MB, scanning beats retrieving, and the two recall rows that
-have ever passed both passed by scanning.** Whether better retrieval would help
+and firmer: **on 20.2MB, scanning beats retrieving, and the two recall rows
+that have ever passed both passed by scanning.** Whether better retrieval would help
 is a question this corpus cannot answer, because the agent has a cheaper
 strategy available that ranking never gets to compete with.
 
