@@ -55,6 +55,7 @@ import {
   toMcpOAuthAuthorizationView,
   revokeMcpConnection,
   toMcpConnectionView,
+  type McpAskPersonalDataPort,
   type McpConnectionGrant,
   type McpConnectionStore,
   type McpSessionStore,
@@ -108,6 +109,12 @@ export interface McpRouteDeps {
   tokenStore?: TokenStore;
   accessLogWriter: AccessLogWriter;
   readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
+  /**
+   * The query layer's engine, backing `ask_personal_data` (implementation
+   * plan phase 8). Absent, that one tool reports itself unavailable and every
+   * other tool behaves exactly as before.
+   */
+  askPersonalData?: McpAskPersonalDataPort;
   indexManager?: IndexManager;
   hierarchyOptions?: HierarchyManagerOptions;
   dataStorage?: DataStoragePort;
@@ -745,6 +752,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       connection: record,
       readClient,
       activityRecorder: deps.activityRecorder,
+      askPersonalData: deps.askPersonalData,
     });
     void store
       .update(record.id, { lastUsedAt: new Date().toISOString() })
@@ -834,6 +842,11 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       connection,
       readClient,
       activityRecorder: deps.activityRecorder,
+      // Passed on the paid session path too. The tool declines rather than
+      // sweeping when `readClient.enforcesPayment` is set — one tool call
+      // cannot carry one signed x402 proof per scope — so the caller gets a
+      // named list of chargeable scopes instead of an unmetered read.
+      askPersonalData: deps.askPersonalData,
     });
   }
 

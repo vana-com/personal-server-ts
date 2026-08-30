@@ -126,6 +126,30 @@ export interface McpDataReadClient {
   }): Promise<McpDataReadRawFileResult>;
 
   /**
+   * Read a scope's complete `DataFileEnvelope` as `GET /v1/data/{scope}`
+   * returns it — grant-gated, access-logged and payment-gated exactly like
+   * every other read here, because it goes through the same request handler.
+   *
+   * Exists for the query layer (implementation plan phase 8), which needs the
+   * WHOLE scope and cannot use the bounded block path: a `DataScopeBlock` may
+   * be `truncated`, so a corpus reassembled from pages could be silently
+   * short and `coverage.recordsScanned` would report a total over a partial
+   * read. That is the one bug the coverage contract exists to prevent, so the
+   * query layer reads the envelope or does not read the scope at all.
+   *
+   * Deliberately NOT offered to the paging tools: `read_scope` stays bounded.
+   * Optional so existing implementations and stubs need no change; a caller
+   * that needs it must feature-detect and degrade.
+   */
+  readScopeEnvelope?(params: {
+    scope: string;
+    grantId: string;
+    at?: string;
+    fileId?: string;
+    payment?: string;
+  }): Promise<McpDataReadEnvelopeResult>;
+
+  /**
    * Optional indexed search path. Implementations may return `missing` while
    * an index is absent/stale; callers must keep the bounded block read path as
    * fallback so full data remains accessible.
@@ -156,6 +180,16 @@ export interface McpDataListResult {
 
 export interface McpDataReadBlocksResult extends ReadScopeBlocksResponse {
   status: number;
+}
+
+export interface McpDataReadEnvelopeResult {
+  status: number;
+  scope: string;
+  collectedAt: string;
+  fileId?: string;
+  version?: string;
+  /** The parsed `DataFileEnvelope`, exactly as the data route serves it. */
+  envelope: unknown;
 }
 
 export interface McpDataReadRawFileResult {
@@ -596,6 +630,69 @@ export function createMcpDataReadClient(
         sizeBytes: bytes.byteLength,
         contentBase64: bytesToBase64(bytes),
         metadata: parseMetadataHeader(metadataHeader),
+      };
+    },
+
+    async readScopeEnvelope({ scope, grantId, at, fileId, payment }) {
+      const storage = options.dataApiDeps.storage;
+      const selectedEntry = storage.findEntry({
+        scope,
+        ...(fileId ? { fileId } : {}),
+        ...(at ? { at } : {}),
+      });
+      if (!selectedEntry) {
+        throw new McpDataReadError(404, {
+          error: "NOT_FOUND",
+          message: `No data found for scope "${scope}"`,
+        });
+      }
+
+      const safeScope = encodeURIComponent(scope);
+      const signingUri = `${basePath}/${safeScope}`;
+      const query = new URLSearchParams();
+      if (fileId) query.set("fileId", fileId);
+      if (at) query.set("at", at);
+      query.set("grantId", grantId);
+
+      const authorization = await signMcpGranteeRequest({
+        account: options.granteeAccount,
+        aud: options.serverOrigin,
+        method: "GET",
+        uri: signingUri,
+        grantId,
+      });
+      const url = new URL(
+        `${signingUri}?${query.toString()}`,
+        options.serverOrigin,
+      ).toString();
+      const request = new Request(url, {
+        method: "GET",
+        headers: {
+          Authorization: authorization,
+          ...(payment ? { "X-PAYMENT": payment } : {}),
+        },
+      });
+
+      // The same handler `/v1/data/:scope` runs, so the grant check, the
+      // access-log row and the x402 cycle all happen here and nowhere else.
+      const response = await handlePersonalServerDataRequest(
+        request,
+        options.dataApiDeps,
+        { basePath },
+      );
+      if (!response.ok) {
+        throw new McpDataReadError(
+          response.status,
+          await parseJsonOrText(response),
+        );
+      }
+      return {
+        status: response.status,
+        scope,
+        collectedAt: selectedEntry.collectedAt,
+        fileId: selectedEntry.fileId ?? undefined,
+        version: String(selectedEntry.version),
+        envelope: await response.json(),
       };
     },
   };

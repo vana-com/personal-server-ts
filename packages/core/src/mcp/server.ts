@@ -21,6 +21,7 @@ import type { McpDataReadClient } from "./read-client.js";
 import {
   MAX_MCP_TOOL_TIMEOUT_MS,
   MCP_TOOLS,
+  type McpAskPersonalDataPort,
   type McpToolContext,
   type McpToolResultContent,
 } from "./tools.js";
@@ -34,6 +35,13 @@ export interface HandleMcpRequestOptions {
   connection: McpConnectionRecord;
   readClient: McpDataReadClient;
   activityRecorder?: McpActivityRecorder;
+  /**
+   * The query layer's engine (implementation plan phase 8), supplied by the
+   * host runtime because it needs an OS sandbox core cannot have. Absent,
+   * `ask_personal_data` reports itself unavailable and every other tool is
+   * unaffected.
+   */
+  askPersonalData?: McpAskPersonalDataPort;
   serverName?: string;
   serverVersion?: string;
 }
@@ -71,6 +79,14 @@ function toolTimeoutMs(tool: string, args: Record<string, unknown>): number {
   ) {
     return clampToolTimeout(args.timeoutMs) + MCP_TOOL_TIMEOUT_GRACE_MS;
   }
+  // `ask_personal_data` runs a multi-turn agent loop over a full sweep, which
+  // the 30s default would cut off mid-answer. It takes no `timeoutMs` of its
+  // own — the caller bounds it with `budget.wallClockMs`, which the loop
+  // honours and which produces an honest partial answer rather than a killed
+  // request — so this is the transport's own ceiling, at the tool maximum.
+  if (tool === "ask_personal_data") {
+    return MAX_MCP_TOOL_TIMEOUT_MS + MCP_TOOL_TIMEOUT_GRACE_MS;
+  }
   return DEFAULT_MCP_TOOL_TIMEOUT_MS;
 }
 
@@ -107,6 +123,16 @@ function buildActivityStartParams(
     typeof args.scope === "string"
   ) {
     params.scopes = [args.scope];
+  }
+  if (tool === "ask_personal_data") {
+    if (typeof args.question === "string") {
+      params.queryPreview = args.question.slice(0, QUERY_PREVIEW_CHARS);
+    }
+    if (Array.isArray(args.scopes) && args.scopes.length > 0) {
+      params.scopes = (args.scopes as unknown[])
+        .filter((s): s is string => typeof s === "string")
+        .slice(0, 20);
+    }
   }
   if (tool === "search_personal_context") {
     if (typeof args.query === "string") {
@@ -281,6 +307,7 @@ export function createMcpServerForConnection(
     connection: options.connection,
     readClient: options.readClient,
     activityRecorder: options.activityRecorder,
+    askPersonalData: options.askPersonalData,
   };
 
   for (const tool of MCP_TOOLS) {

@@ -600,6 +600,10 @@ export async function createServer(
     accessLogWriter,
     accessLogReader,
     readFulfillmentReporter: options?.readFulfillmentReporter,
+    // The same provider the derivative compute layer uses, handed to the
+    // query layer's agent loop (/v1/query, ask_personal_data). One inference
+    // path, so E2EE and relay signing are inherited rather than re-derived.
+    inferenceProvider,
     dataStorage,
     scopeDeletions,
     cloudMode,
