@@ -168,6 +168,11 @@ export function createRecomputeScheduler(
         (async () => {
           const affected = await options.store.list({ sourceScope: scope });
           for (const registration of affected) {
+            if (registration.recompute === "snapshot") {
+              // A snapshot question computes at registration and on an
+              // explicit recompute only; source changes never touch it.
+              continue;
+            }
             if (
               options.serverOwner &&
               lineage.has(

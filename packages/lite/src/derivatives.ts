@@ -30,9 +30,13 @@ import type { PsLiteStateStore } from "./state.js";
 
 const QUESTIONS_KEY = "derivative-questions-v1";
 
+/** What older builds persisted: `recompute` did not exist yet. */
+type PersistedQuestionRegistration = Omit<QuestionRegistration, "recompute"> &
+  Partial<Pick<QuestionRegistration, "recompute">>;
+
 interface PsLiteQuestionsState {
   version: 1;
-  questions: QuestionRegistration[];
+  questions: PersistedQuestionRegistration[];
 }
 
 /** A question store persisted as one JSON value in the PS-Lite state store. */
@@ -40,7 +44,14 @@ export async function createPsLiteQuestionStore(
   stateStore: PsLiteStateStore,
 ): Promise<QuestionStore> {
   const saved = await stateStore.get<PsLiteQuestionsState>(QUESTIONS_KEY);
-  const initial = saved?.version === 1 ? saved.questions : [];
+  // Registrations saved before the recompute policy existed keep the old
+  // follow-every-change behavior.
+  const initial = (saved?.version === 1 ? saved.questions : []).map(
+    (question) => ({
+      ...question,
+      recompute: question.recompute ?? "on-change",
+    }),
+  );
   return createInMemoryQuestionStore({
     initial,
     onChange: (questions) =>

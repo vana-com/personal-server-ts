@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS derivative_questions (
   source_scopes TEXT NOT NULL,
   question TEXT NOT NULL,
   model TEXT,
+  recompute TEXT NOT NULL DEFAULT 'on-change',
   registered_by TEXT NOT NULL,
   status TEXT NOT NULL,
   error TEXT,
@@ -32,12 +33,18 @@ CREATE TABLE IF NOT EXISTS derivative_questions (
 const CREATE_INDEX_SQL =
   "CREATE INDEX IF NOT EXISTS idx_derivative_questions_derived_scope ON derivative_questions (derived_scope)";
 
+// Databases created before the recompute policy existed migrate in place;
+// their registrations keep the old follow-every-change behavior.
+const ADD_RECOMPUTE_COLUMN_SQL =
+  "ALTER TABLE derivative_questions ADD COLUMN recompute TEXT NOT NULL DEFAULT 'on-change'";
+
 interface Row {
   question_id: string;
   derived_scope: string;
   source_scopes: string;
   question: string;
   model: string | null;
+  recompute: QuestionRegistration["recompute"];
   registered_by: string;
   status: QuestionRegistration["status"];
   error: string | null;
@@ -55,6 +62,7 @@ function toRegistration(row: Row): QuestionRegistration {
     sourceScopes: JSON.parse(row.source_scopes) as string[],
     question: row.question,
     model: row.model,
+    recompute: row.recompute,
     registeredBy: JSON.parse(row.registered_by) as QuestionRegisteredBy,
     status: row.status,
     error: row.error,
@@ -71,6 +79,12 @@ export function createSqliteQuestionStore(
 ): QuestionStore {
   db.exec(CREATE_TABLE_SQL);
   db.exec(CREATE_INDEX_SQL);
+  const columns = db
+    .prepare("PRAGMA table_info(derivative_questions)")
+    .all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === "recompute")) {
+    db.exec(ADD_RECOMPUTE_COLUMN_SQL);
+  }
 
   const listAll = db.prepare(
     "SELECT * FROM derivative_questions ORDER BY created_at ASC, question_id ASC",
@@ -80,12 +94,12 @@ export function createSqliteQuestionStore(
   );
   const insertOne = db.prepare(`
     INSERT INTO derivative_questions (
-      question_id, derived_scope, source_scopes, question, model,
+      question_id, derived_scope, source_scopes, question, model, recompute,
       registered_by, status, error, created_at, updated_at,
       last_computed_at, derived_version, derived_collected_at
     ) VALUES (
       @question_id, @derived_scope, @source_scopes, @question, @model,
-      @registered_by, @status, @error, @created_at, @updated_at,
+      @recompute, @registered_by, @status, @error, @created_at, @updated_at,
       @last_computed_at, @derived_version, @derived_collected_at
     )`);
   const updateOne = db.prepare(`
@@ -118,6 +132,7 @@ export function createSqliteQuestionStore(
         source_scopes: JSON.stringify(registration.sourceScopes),
         question: registration.question,
         model: registration.model,
+        recompute: registration.recompute,
         registered_by: JSON.stringify(registration.registeredBy),
         status: registration.status,
         error: registration.error,

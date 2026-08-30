@@ -13,6 +13,7 @@ function registration(
     sourceScopes: ["oura.sleep"],
     question: "q",
     model: null,
+    recompute: "on-change",
     registeredBy: { kind: "owner" },
     status: "ready",
     error: null,
@@ -99,6 +100,42 @@ describe("createRecomputeScheduler", () => {
     expect(compute.mock.calls.map((call) => call[0]).sort()).toEqual([
       "q-1",
       "q-3",
+    ]);
+  });
+
+  it("markSourceChanged skips snapshot questions; an explicit recompute still runs them", async () => {
+    const store = createInMemoryQuestionStore({
+      initial: [
+        registration({ questionId: "q-snap", recompute: "snapshot" }),
+        registration({ questionId: "q-live", recompute: "on-change" }),
+      ],
+    });
+    const timers = manualTimers();
+    const compute = vi.fn(async () => undefined);
+    const scheduler = createRecomputeScheduler({
+      store,
+      compute,
+      debounceMs: 0,
+      timers: timers.api,
+    });
+
+    scheduler.markSourceChanged("oura.sleep");
+    await scheduler.whenIdle();
+    expect((await store.get("q-snap"))!.status).toBe("ready");
+    expect((await store.get("q-live"))!.status).toBe("stale");
+    timers.fireAll();
+    await scheduler.whenIdle();
+    expect(compute.mock.calls.map((call) => call[0])).toEqual(["q-live"]);
+
+    // POST /questions/:id/recompute goes through requestRecompute, which
+    // ignores the policy: the owner (or builder) asked for this run.
+    scheduler.requestRecompute("q-snap", { immediate: true });
+    await scheduler.whenIdle();
+    timers.fireAll();
+    await scheduler.whenIdle();
+    expect(compute.mock.calls.map((call) => call[0])).toEqual([
+      "q-live",
+      "q-snap",
     ]);
   });
 

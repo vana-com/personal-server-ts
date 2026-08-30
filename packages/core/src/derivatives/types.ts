@@ -8,6 +8,13 @@
 
 export type QuestionStatus = "pending" | "ready" | "failed" | "stale";
 
+/**
+ * When the answer recomputes: "on-change" follows every source change (the
+ * original behavior and the default); "snapshot" computes at registration
+ * and afterwards only on an explicit POST /questions/:id/recompute.
+ */
+export type QuestionRecompute = "snapshot" | "on-change";
+
 /** Who registered the question; a builder is bound to the write grant. */
 export type QuestionRegisteredBy =
   | { kind: "owner" }
@@ -21,6 +28,7 @@ export interface QuestionRegistration {
   question: string;
   /** Model override; null = the provider's default. */
   model: string | null;
+  recompute: QuestionRecompute;
   registeredBy: QuestionRegisteredBy;
   status: QuestionStatus;
   /** Short failure reason (never the prompt or the data). Null unless failed. */
@@ -75,6 +83,7 @@ export interface QuestionRegistrationView {
   sourceScopes: string[];
   question: string;
   model: string | null;
+  recompute: QuestionRecompute;
   registeredBy: QuestionRegisteredBy;
   status: QuestionStatus;
   error: string | null;
@@ -94,6 +103,7 @@ export function questionRegistrationView(
     sourceScopes: [...registration.sourceScopes],
     question: registration.question,
     model: registration.model,
+    recompute: registration.recompute,
     registeredBy: registration.registeredBy,
     status: registration.status,
     error: registration.error,

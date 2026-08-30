@@ -133,6 +133,31 @@ describe("PS-Lite derivative compute", () => {
     expect((await reloaded.get(questionId))?.status).toBe("ready");
   });
 
+  it("defaults recompute to on-change for registrations saved before the field existed", async () => {
+    const stateStore = createMemoryPsLiteStateStore();
+    const legacy = {
+      questionId: "q-legacy",
+      derivedScope: "coach.weekly",
+      sourceScopes: ["oura.sleep"],
+      question: "q",
+      model: null,
+      registeredBy: { kind: "owner" },
+      status: "ready",
+      error: null,
+      createdAt: "2026-08-27T00:00:00.000Z",
+      updatedAt: "2026-08-27T00:00:00.000Z",
+      lastComputedAt: "2026-08-27T00:00:00.000Z",
+      derivedVersion: 1,
+      derivedCollectedAt: "2026-08-27T00:00:00Z",
+    };
+    await stateStore.set("derivative-questions-v1", {
+      version: 1,
+      questions: [legacy],
+    });
+    const store = await createPsLiteQuestionStore(stateStore);
+    expect((await store.get("q-legacy"))!.recompute).toBe("on-change");
+  });
+
   it("deactivate() stops the scheduler and activate() restarts it", async () => {
     const { runtime, derivatives } = await setup();
     const stop = vi.spyOn(derivatives.scheduler, "stop");
