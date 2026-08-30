@@ -1975,6 +1975,183 @@ precedent; a comment in `stuffed-answerer.ts` pins that string and that file was
 out of scope. No tolerance, ground truth, expected answer, rubric, fixture or
 grader was changed, and nothing here resolves an open item in plan §6.
 
+### 19.15 `vana.search` was unusable too — and wiring it changed nothing, because the model writes its own search
+
+§19.14 recorded, in passing, that `vana.search` was as unusable in the eval
+harness as `classify`. The difference is that `search` has a real host-side
+implementation — `search-bridge.ts`, MiniSearch-backed, grant-filtered,
+deliberately host-authority — and that the model **does** reach for it. Across
+the three retained agent sweeps before this one, `vana.search` appears in the
+scripts of 4, 5 and 2 rows respectively, concentrated on exactly the questions
+this section is about: Q3 four times, Q15 three, Q16 twice, Q5 once, Q4 once.
+Every one of those calls threw.
+
+**The cause was structural, not missing code.** `runner-entry.ts` served
+`search` from a `searchResults` map the host precomputed _before_ the run, and
+the host cannot predict what a running script will search for. The eval harness
+supplied no map at all, so every call hit the honest denial. So the four
+questions the contract doc routes through `prefilter → classify → min(date)`
+had both halves unavailable, and the conclusion recorded against Q3, Q5, Q9,
+Q10 and Q15 — that semantic recall is the architecture's one genuine weakness —
+was measured against an agent holding no semantic tools.
+
+**The change is wiring only.** `search` becomes a deferred round trip, reusing
+§19.14's reverted `classify` pattern verbatim in shape: the runner looks up
+`(query, scopes, limit)` in a host-supplied map keyed by an FNV-1a hash, a miss
+ends the run with `SEARCH_DEFERRED` and carries the query outward in the result
+frame's new `searchRequest` field, and the host resolves it against the index
+and replays the same script. Replay is sound because a script only reads.
+Bounded at eight rounds per `execute`, cached for the life of the request, and
+capped at 25 hits. The index is built by handing documents to the repo's
+existing `MiniSearchIndex` — the same thing `mcp/tools.ts` does per block page,
+at the scale of a request instead of a page — so plan §5's "PR #231's mistake"
+is not repeated: nothing is persisted, no second index implementation exists,
+and no embedding or derivative is created.
+
+Two properties were verified by execution before the sweep, against a
+purpose-built harness: a search that the host cannot resolve still **denies**
+rather than returning `[]` — an empty array reads as "there is nothing there",
+which is the Q8 false negative, and only the index itself may say "no hits" —
+and coverage accounting stays correct, with `vana.search` recording
+`prefiltered()` and never contributing to `recordsScanned`. A grant-crossing
+search returns nothing from the ungranted scope. Multi-round replay resolves
+three distinct queries in one `execute`.
+
+**No prompt text was changed.** Rule 4 and the API block already documented
+`vana.search`, so nothing had to be said to make the tool known, and §19.14's
+stated regret — that wiring and guidance moved together and could not be
+attributed — is answered here by moving only the wiring. The single variable is
+whether the tool works.
+
+`gemini-3.7-flash`, `temperature: 0`, `dogfood` @ seed 20260828, N=3, all 18
+questions, judged, same `runEval` grader. **Agent arm only:** the stuffed
+baseline has no tool loop, so a baseline sweep would have measured nothing here
+and was deliberately not spent.
+
+| Arm       | Before                 | After                  | Δ rows |
+| --------- | ---------------------- | ---------------------- | ------ |
+| **Agent** | 19/54, strict 16, 7 Qs | 20/54, strict 16, 8 Qs | **+1** |
+
+**Run-to-run variance is ~±3 rows, so +1 is not an effect.** Three rows moved
+in absolute terms across three questions — Q6 2/3→3/3, Q9 0/3→1/3, Q8 3/3→2/3 —
+netting +1. No question moved by 3 or more, so none is separable from variance
+individually, and none of the three moved rows called `search`.
+
+**The recall class did not move.**
+
+| Q       | Before | After | Called `search` | Recorded failure, after                                 |
+| ------- | ------ | ----- | --------------- | ------------------------------------------------------- |
+| **Q3**  | 0/3    | 0/3   | 1 of 3          | still does not decompose into computable sub-quantities |
+| **Q5**  | 0/3    | 0/3   | 0 of 3          | still admits the excluded restaurant                    |
+| **Q9**  | 0/3    | 1/3   | 0 of 3          | two runs still cite a later explicit mention            |
+| **Q10** | 0/3    | 0/3   | 0 of 3          | still omits per-period coverage                         |
+| **Q15** | 0/3    | 0/3   | 0 of 3          | still names only one of three intentions                |
+
+**`search` was called in 1 row of 54 — down from 4 of 54 when it did not
+work.** Both counts are too small to read as a trend, and the honest statement
+is that making the tool usable did not make it used. The one call, on Q3 run 0,
+resolved: the run carries `method: "prefiltered"`, which `api.ts` sets only
+after `deps.search` returns, so the deferred round trip is confirmed working
+end to end in the live eval path. No `SEARCH_DEFERRED`, `SEARCH_ROUNDS_EXHAUSTED`
+or `CAPABILITY_UNAVAILABLE` appears anywhere in the sweep. The query was
+`"risk appetite risk tolerance investing portfolio stocks crypto asset
+allocation financial goals retirement"` over `chatgpt.conversations`, it
+returned hits, and Q3 failed for the same reason as before — a decomposition
+failure that no retrieval improvement can touch.
+
+**What the other 53 rows did instead is the finding.** The model does not
+ignore search; it reimplements it.
+
+| Behaviour, after sweep                                                         | Rows  |
+| ------------------------------------------------------------------------------ | ----- |
+| called `vana.search`                                                           | 1/54  |
+| full scan via `vana.readAll` / `vana.stream`                                   | 50/54 |
+| lexical matching **inside the script** (`includes`, `indexOf`, `match`, regex) | 34/54 |
+
+In the recall class the split is total: **15 of 15 after-runs scanned, 15 of 15
+did their own in-script lexical matching, and 1 of 15 called the tool**, each
+run pulling 3,600 to 13,000 records into the sandbox to do it. On a 222MB
+corpus that is a rational choice rather than a mistake — `readAll` is one call,
+the filter that follows is exact rather than ranked, it needs no round trip,
+and it produces the full-pass coverage that rule 4 demands for existence
+questions, which a ranked prefilter explicitly cannot. **The tool loses to the
+in-script substitute on this corpus on the merits.** That is a different and
+more useful conclusion than "the tool does not help", and it does not survive a
+corpus that no longer fits: the substitute's cost is linear in records and the
+tool's is not, so the crossover is a property of corpus size, not of the model.
+
+**Q9's single pass did not use search.** Run 1 scanned 12,600 records across
+`notes`, `slack` and `chatgpt.conversations` in seven scripts and found the
+planted oblique mention by exhaustion; the two failing runs cited a later
+explicit mention, as every previous sweep did. This is the **second** time the
+only passing run on a recall question has arrived by full scan rather than by
+retrieval — §19.14 recorded the first, on the same question — and it is the
+sharpest available evidence that on a corpus this size exhaustion is simply a
+better strategy than ranking.
+
+**Cost.** Input tokens rose 2.638M → 3.716M, **+41%**, and almost none of it is
+attributable to this change: no prompt text moved, and 53 of 54 rows never
+touched the new path. The rise is one runaway row — Q6 run 0, 19 scripts and
+946k input tokens against a prior worst of 249k, which called `search` zero
+times. Excluding the largest row from each sweep the rise is +16%; the median
+row moved 35.4k → 37.3k, **+5.4%**. Scripts fell 215 → 203, output tokens fell
+170k → 162k, and wall time was 18.7 min, in line with the 19.2–19.7 min of
+prior sweeps despite replay being available. Read as variance, not as a price
+paid for the tool.
+
+**Verdict. The wiring is correct and the result is negative.** A documented
+capability with a real implementation was unreachable for the entire life of
+the corpus and is now reachable, verified by execution; it moved the score by
++1 row against a ±3 band, moved the recall class by nothing, and was called
+once in 54 runs. On these numbers the wiring is worth keeping because a
+documented capability that throws is a defect regardless of score, and the
+retrieval story is worth nothing yet.
+
+**What this does to "semantic recall is the architecture's weakness."** The
+claim does not survive, and it does not die either — it changes from
+unsupported-because-untested to unsupported in a new and more specific way.
+Before this section the claim was an artifact: it was measured against an agent
+whose semantic tools all threw. Now both the measurement and the tools are
+real, and the claim is still unmeasured, because the agent does not use the
+tools even when they work. What the corpus actually demonstrates is narrower
+and firmer: **on 222MB, scanning beats retrieving, and the two recall rows that
+have ever passed both passed by scanning.** Whether better retrieval would help
+is a question this corpus cannot answer, because the agent has a cheaper
+strategy available that ranking never gets to compete with.
+
+**What this leaves for a human to decide, and does not decide.** One diagnostic
+is worth recording as evidence, not as an argument. Replaying the queries the
+model itself issued against the now-working index shows retrieval quality
+varies enormously by question: `"Thai"` returns the three relevant restaurant
+messages at the top; the Q15 query `"keep saying I will"` returns 4 hits
+covering **2 distinct subjects**, 3 of them the same note, so it reinforces
+exactly the one-intention answer Q15 already fails on; `"meaning to"` and
+`"productivity"` return 0 hits each. That is a vocabulary-coverage failure, and
+it is the failure mode embeddings exist to address — which is a fact about
+lexical search, **not a recommendation**. Plan §6's "embeddings are out of v1"
+is recorded as decided and nothing here reopens it; no index was built and none
+is proposed. The prior question is cheaper anyway: a retrieval tool that is
+never called cannot be improved into relevance, so the next experiment on this
+class should make the agent's _use_ of retrieval the variable — or change the
+corpus size until scanning stops being free — rather than its quality.
+
+Caveats. The ±3 band is inherited from prior identical-grader sweeps and was not
+re-measured. Q3, Q9, Q10 and Q15 are model-graded. Search usage is counted from
+retained script text, so a call in a script elided by the retention cap would be
+missed; no scripts were elided in this sweep. The tool-versus-scan comparison is
+confounded with corpus size by construction and cannot be separated without a
+larger corpus, which this run did not have. `vana.classify` remains
+unimplemented and untouched, so the `prefilter → classify` path the contract doc
+prescribes is still only half-available. `SYSTEM_PROMPT_VERSION` is unchanged
+and correctly so, since no prompt text moved. No tolerance, ground truth,
+expected answer, rubric, fixture or grader was changed, `stuffed-answerer.ts`
+was not touched, and nothing here resolves an open item in plan §6. The wiring
+reverts with
+`git checkout d3c89d3 -- packages/core/src/query/tools/errors.ts packages/core/src/query/tools/index.ts packages/core/src/query/tools/protocol.ts packages/server/src/query/runner-entry.ts packages/server/src/query/sandbox-tool-host.ts packages/server/src/query/search-bridge.ts scripts/query-eval-harness.ts`,
+verified by execution: after the revert `git diff d3c89d3` on those paths is 0
+bytes, and re-applying restores all seven files to matching SHA-256 digests.
+This section sits outside that boundary.
+
 ## 20. Next
 
 1. Turn §3 into a graded question set with expected answers and coverage
