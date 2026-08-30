@@ -2152,6 +2152,250 @@ verified by execution: after the revert `git diff d3c89d3` on those paths is 0
 bytes, and re-applying restores all seven files to matching SHA-256 digests.
 This section sits outside that boundary.
 
+### 19.16 Scale: the same corpus semantics at 252MB
+
+Every number in §19 was measured at 20.2MB. §18's "scanning is free" was a
+simulation, and §19.15's finding — that the model reimplements search in
+JavaScript rather than calling the tool — was explicitly flagged as a property
+of corpus size, because the in-script substitute's cost is linear in records and
+the tool's is not. This section measures both at 12.5x the corpus.
+
+**The corpus.** A new profile, `dogfood-xl`: `full`'s record counts with
+`dogfood`'s flags (`semanticProse`, `extraSources`, `nutritionCoverage 0.72`,
+drifting FX). `full` itself was unusable for this because it sets
+`semanticProse: false`, which makes Q2, Q9, Q10, Q13, Q15, Q16, Q17 and Q18's
+nutrition join structurally vacuous. The four existing profiles were not
+touched; a new key draws from its own per-stream `Rng`, so no committed trap
+number moves.
+
+|                | `dogfood` | `dogfood-xl` | ratio |
+| -------------- | --------- | ------------ | ----- |
+| bytes          | 20.2 MB   | **252.2 MB** | 12.5x |
+| records        | 54,371    | **730,722**  | 13.4x |
+| files / scopes | 20 / 18   | 24 / 18      |       |
+| generation     | 151 ms    | 1,379 ms     | 9.1x  |
+
+**The corpus grew 12.5x; the part any question can see grew 6.8x.** Summed over
+the scopes some question is granted, 14.24MB -> 96.40MB. `spotify.streaming`
+(4.87 -> 138.78MB) and `browser.history` (0.84 -> 16.76MB) grew most and are in
+no grant. Eight scopes are day-indexed and do not scale at all, because
+`sleepDays` is 1100 in every profile by the rule recorded in `profiles.ts`.
+Per-question grant growth is therefore uneven, from 1.00x (Q1, Q18) through
+8.5-8.9x (Q2, Q4, Q5, Q6, Q9, Q17) to 12.0x (Q11). **This is a density test, not
+a longer-window test**, and the questions are not all scaled equally.
+
+#### The ground truth recomputes, and one expectation correctly refuses to
+
+The reference answerer passes the **identical 9/18** on both corpora — Q1, Q5,
+Q6, Q7, Q8, Q11, Q14, Q17, Q18 — so no expectation is a hardcoded constant that
+broke. Reference compute stays in milliseconds at 252MB: Q5 44 -> 316 ms, Q8
+21 -> 205 ms, Q17 109 -> 705 ms, Q14 6 -> 13 ms. **§18.1's scan-is-free premise
+is now measured rather than simulated.**
+
+One expectation does not scale, and the code already knew: `readingsFor` returns
+the enumerated readings only when `profile === "dogfood" && seed ===
+DEFAULT_SEED`, because a reading is a window plus the number that window yields
+and those numbers are facts about the 20MB corpus. On `dogfood-xl` every
+question grades strictly. Nothing was regenerated. **The consequence is that the
+comparable 20MB figure is the strict scoreboard, 16/54, not the headline 19/54**,
+whose extra three rows were won by resolution-aware grading on Q1/Q14/Q18.
+
+#### The planted anchors survive, except the one that cannot
+
+Arc lines are emitted per-record at `ARC_LINE_CHANCE`, so they scale with
+volume: Q9's oblique first-mention lines go 14 -> 109, 16 -> 111 and 9 -> 81,
+Q2's `#office-move` rows 39 -> 354, Q16's stated morning claims 159 -> 1,232,
+Q17's two Sarahs 454/448 -> 4,737/4,809 as distinct users. Q16's measured
+rebuttal is preserved exactly — the commit stream still peaks at hour 7 with a
+61.8% early-morning share on both corpora. Q8's fixed counts hold (340
+documents, 22 unreadable, 0 occurrences of the conflict marker).
+
+**Q5's needle is the exception, by construction.** It must occur exactly once,
+so it went from 1-in-54,371 records to 1-in-730,722 — a 13.4x dilution, the only
+anchor that gets relatively harder. Q5 was 0/3 at 20MB and 0/3 here, so this
+cannot be read as a caused regression, but **Q5 at scale is not the same test as
+Q5 at 20MB** and should not be compared as though it were.
+
+#### The agent arm: sub-linear in every cost dimension
+
+`gemini-3.7-flash`, `temperature: 0`, `dogfood-xl` @ seed 20260828, N=3, all 18
+questions, judged, same `runEval` grader.
+
+|                                 | 20.2MB       | 252.2MB      | ratio       |
+| ------------------------------- | ------------ | ------------ | ----------- |
+| records scanned, 54 rows        | 364,341      | 2,853,197    | 7.8x        |
+| bytes streamed into the sandbox | 0.20 GB      | 1.36 GB      | 6.8x        |
+| median row bytes streamed       | 2.0 MB       | 15.0 MB      | 7.5x        |
+| max row bytes streamed          | 10.1 MB      | 75.1 MB      | 7.4x        |
+| **input tokens**                | **2.638M**   | **4.421M**   | **1.68x**   |
+| output tokens                   | 169.5k       | 203.2k       | 1.20x       |
+| **wall clock**                  | **19.2 min** | **28.3 min** | **1.47x**   |
+| scripts / tool calls            | 215          | 347          | 1.61x       |
+| median row input tokens         | 35,415       | 57,130       | 1.61x       |
+| **strict score**                | **16/54**    | **12/54**    | **-4 rows** |
+| questions with >=1 strict pass  | 6            | 7            | +1          |
+
+**A 6.8x working set costs 1.68x the tokens and 1.47x the wall clock.** The
+mechanism is the one the architecture exists for: reduction happens inside the
+sandbox and only summaries cross into context. Records scanned rose 7.8x while
+input tokens rose 1.68x, and the residual tracks turn count (scripts +61%,
+median row +61%) rather than record count — §19.8's "spend tracks turn count"
+holding along a corpus-size axis it was never measured on.
+
+**The -4 rows are at the edge of the ~±3 band and do not look like a scale
+effect.** No question moved by 3 or more, so none is separable individually. And
+the losses do not correlate with how much each question's data grew: Q18 lost
+two rows while its grant is byte-identical on both corpora (1,007 records), Q13
+lost two at 2.34x growth, Q2 lost two at 8.48x — while Q6 gained one at 8.59x
+and Q11, the largest growth in the corpus at 12.0x, was 0/3 on both. If scale
+were degrading answers the losses should concentrate on the high-growth
+questions, and they do not.
+
+**Failure kinds did not change.** The 42 failures are the same kinds as the 38
+at 20MB, dominated by the same recorded reasons — set resolution, missing
+per-period coverage, the Q9 oblique mention, the Q15 intentions. Harness-level
+losses: two rows ended in `malformedToolCall` against one at 20MB, and one row
+(Q9 run 1) ended in `stoppedBecause: "error"` after streaming 73.5MB across 20
+tool calls. **No timeouts, no out-of-memory, no truncated scans, and zero budget
+kills** (three budget-related reasons at 20MB, none here). The sandbox streamed
+75.1MB into a single row without failing.
+
+#### Coverage integrity held exactly, which is the safety result
+
+Every `complete: true` row was checked row by row against the generated
+per-scope record counts. **False completeness: 0 of 35 at 252MB, and 0 of 45 at
+20MB.** Nothing scanned a fraction and reported success. The derivation in
+`tools/coverage.ts` is why: `complete` is host-authored and requires
+`#partiallyScanned.size === 0`, so a bounded read falsifies it and the model
+cannot buy a completeness claim by sampling.
+
+`complete` fired on 35/54 rows rather than 45/54, which is the honest direction —
+more rows ran out of turns before covering the grant, and said so.
+
+**Silent confidence stayed at 0/54 on the agent arm at both sizes.**
+
+#### The baseline goes blind, as predicted, and that is the whole comparison
+
+`--answerer stuffed`, same protocol. Its cost is context-bounded and did not
+blow up: **40.03M -> 42.61M input tokens, +6.4% against a 12.5x corpus**,
+confirming rather than assuming.
+
+|                            | 20.2MB                 | 252.2MB                |
+| -------------------------- | ---------------------- | ---------------------- |
+| strict score               | 5/54                   | 5/54                   |
+| questions with >=1 pass    | 3                      | 2                      |
+| input tokens               | 40.03M                 | 42.61M                 |
+| **fraction of grant seen** | **60.0%**              | **9.2%**               |
+| `coverage.complete` true   | 23/54                  | 12/54                  |
+| silently confident rows    | 19 (61% of incomplete) | 12 (29% of incomplete) |
+
+**The one number this section exists for:**
+
+| arm                                 | 20.2MB    | 252.2MB   |
+| ----------------------------------- | --------- | --------- |
+| **agent, fraction of grant seen**   | **95.1%** | **93.6%** |
+| **stuffed, fraction of grant seen** | **60.0%** | **9.2%**  |
+
+The agent's coverage is flat across a 12.5x corpus. The baseline's is inversely
+proportional to it, which is what context-bounded means. At scale the stuffed
+arm sees 3-4% of the grant on every prose-heavy question (Q2, Q5, Q9, Q10, Q15,
+Q16) and 0% on Q11.
+
+**The silent-confidence rate fell rather than rose, and the mechanism is
+instructive.** 19 rows -> 12, and 61% -> 29% as a share of incomplete rows. It
+did not get more honest by getting better: it got more honest because
+`stuffed-answerer.ts` tells the model in the prompt how many records were
+dropped, and at 252MB that warning fires on 42 of 54 rows instead of 31, so more
+answers hedge. The absolute safety gap is still the finding — **0/54 silently
+confident on the agent arm at both sizes, against 12-19 rows on the baseline** —
+but the direction at scale is the opposite of what was expected, and is recorded
+that way. (The "52% at 20MB" this run was set up to compare against does not
+appear anywhere in this document; the only 52% here is §19.10's
+resolution-aware pass rate, which is a different quantity. The measured
+baseline figures are the ones above.)
+
+#### The §19.15 crossover, on the demand side and then the supply side
+
+**The model's strategy did change, and in exactly the predicted direction.**
+`vana.search` calls rose from 4/54 to **16/54**, and became systematic instead
+of sporadic: at scale they concentrate entirely on the recall class and appear
+on nearly every run of it (Q3 3/3, Q9 3/3, Q10 3/3, Q16 3/3, Q15 2/3, Q5 1/3,
+Q17 1/3). The shape is visible in the scripts — on Q9 run 0 the model's _first_
+script is ten queries in a loop over `vana.search`, and only after it fails does
+script 1 fall back to `vana.stream` with an in-script `includes` chain. Full
+scanning did not decrease (49/54 rows at both sizes): retrieval was added on top
+of scanning, not substituted for it.
+
+Every one of those 16 calls threw, because the §19.15 wiring is reverted at this
+commit. So the crossover was then measured directly: the patch was re-applied
+and the recall class re-run at N=3 on the same corpus.
+
+| recall class @ 252MB                        | search unwired | search wired      |
+| ------------------------------------------- | -------------- | ----------------- |
+| rows passing                                | 0/15           | 1/15              |
+| rows calling `vana.search`                  | 12/15          | 10/15             |
+| calls that resolved (`method: prefiltered`) | 0              | 10                |
+| input tokens                                | 1.657M         | **0.986M (-40%)** |
+| scripts                                     | 139            | **91 (-35%)**     |
+| records scanned                             | 831,400        | 810,011 (-2.6%)   |
+| `coverage.complete` true                    | 6              | **0**             |
+
+**Wiring search at scale buys a 40% token reduction and 35% fewer turns, no
+accuracy, and costs the completeness flag outright.** The score moved 0/15 ->
+1/15, well inside the band. Records scanned barely fell, so the model still
+scans — search made it reach the same scan in fewer iterations rather than
+replacing it. This is a real cost effect where at 20MB there was none: §19.15
+measured +41% attributable to one runaway row and a +5.4% median, i.e. nothing.
+
+**The completeness cost is structural, not incidental.** `complete` requires
+`method === "full"`, and any resolved `vana.search` sets `prefiltered`, so a run
+that uses retrieval can never report complete coverage. Q10 went 3/3 complete to
+0/3, Q3 2/3 to 0/3, Q15 1/3 to 0/3. For existence and exhaustiveness questions —
+which is most of this class — that is a direct loss of the property rule 4
+demands, traded for tokens.
+
+**And the only recall run that passed still passed by scanning.** Q9 run 0
+called no search, ran `method: full` over 112,400 records in 11 scripts, and
+passed; both runs that did call search failed, one of them after scanning only
+12,000 records because it trusted the ranked result. **This is the third
+consecutive sweep in which the sole passing run on a recall question arrived by
+exhaustion rather than retrieval** — §19.14 was the first, §19.15 the second.
+Corpus size did not change that, which was the one thing it was most expected
+to change.
+
+#### Verdict
+
+**The architecture survives scale.** At 12.5x the corpus and 13.4x the records
+it answers the same questions, at 1.68x the token cost and 1.47x the wall clock,
+with no new failure mode, no memory or timeout wall, coverage accounting that is
+exactly correct on every row that claims it, and a strict score 4 rows down
+against a ~±3 band with the losses uncorrelated with which questions actually
+grew. The naive baseline over the same corpus costs 10x more tokens to see 9.2%
+of the grant instead of 93.6%.
+
+What scale did **not** fix is what §19.8 through §19.15 already identified: set
+resolution, decomposition on Q3, per-period disclosure on Q10, the Q15
+intentions. Those are unchanged in kind and in count. Scale was never going to
+fix them, and it did not.
+
+Caveats. The ±3 band is inherited from prior identical-grader sweeps and **was
+not re-measured at this corpus size** — doing so honestly needs repeat sweeps
+this run did not spend, so the -4 is reported as "at the edge of the band" and
+not as an effect in either direction. Grading is strict on `dogfood-xl` and
+resolution-aware on `dogfood`, so only the strict-vs-strict comparison above is
+sound. Q2, Q3, Q4, Q9, Q10, Q12, Q13, Q15 and Q16 are model-graded, and a judge
+is not a measurement. Growth is uneven across questions (1.00x to 12.0x) and the
+two largest scopes are in no grant, so "12.5x corpus" and "6.8x working set" are
+both true and neither alone describes what the agent experienced. Search usage
+is counted from retained script text. The Stage 4 comparison is 15 rows, which
+is small, and its token and turn reductions are the only differences there large
+enough to read. No tolerance, ground truth, expected answer, rubric, fixture or
+grader was changed; `stuffed-answerer.ts` and the four existing profiles were
+not touched; nothing here resolves an open item in plan §6 and no index or
+embedding was built. The §19.15 patch was applied for the Stage 4 run only and
+reverted, verified by `git diff d3c89d3` on the seven files returning 0 bytes.
+Reproduce with `./scripts/run-scale-bench.sh <outdir> dogfood-xl agent|stuffed`.
+
 ## 20. Next
 
 1. Turn §3 into a graded question set with expected answers and coverage

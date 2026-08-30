@@ -12,7 +12,8 @@
  * entirely in memory because the browser runtime has no filesystem.
  */
 
-export type FixtureProfileName = "small" | "full" | "lite" | "dogfood";
+export type FixtureProfileName =
+  "small" | "full" | "lite" | "dogfood" | "dogfood-xl";
 
 export interface FixtureProfile {
   name: FixtureProfileName;
@@ -161,6 +162,52 @@ export const PROFILES: Record<FixtureProfileName, FixtureProfile> = {
     extraSources: true,
     nutritionCoverage: 0.72,
     commits: 4_200,
+    driftingFxRates: true,
+  },
+
+  /**
+   * `dogfood` semantics at `full` volume — the scale profile (design §19.16).
+   *
+   * Every measurement in §19 was taken at 20.2MB, and §19.15's central finding
+   * (the model reimplements search in-script rather than calling the tool) was
+   * explicitly flagged as a property of corpus size: the in-script
+   * substitute's cost is linear in records and the tool's is not. Testing that
+   * crossover needs a corpus that is large *and* still semantically graded.
+   * `full` is large but sets `semanticProse: false` / `extraSources: false`,
+   * so Q2, Q9, Q10, Q13, Q15, Q16, Q17 and Q18's nutrition join are
+   * structurally vacuous on it. This profile is the missing cell: `full`'s
+   * record counts with `dogfood`'s flags.
+   *
+   * **It adds a profile rather than changing one.** `small`/`full`/`lite`
+   * carry the committed trap numbers and `dogfood` carries every §19 result;
+   * a new key draws from its own `Rng` and shifts nothing downstream.
+   *
+   * `documents` stays at `DOCUMENTS` and `sleepDays` at 1100 for the reasons
+   * given above — Q8's counts are the assertion, and the multi-year axis is
+   * what Q9/Q10/Q11 are about. This profile is denser, not longer or wider.
+   *
+   * `commits` is scaled by the notes ratio (12000/2200 ≈ 5.45) rather than
+   * copied from `dogfood`, so the commit stream stays proportionate to the
+   * prose it sits beside instead of becoming a rounding error against it.
+   */
+  "dogfood-xl": {
+    name: "dogfood-xl",
+    sleepDays: 1100,
+    heartRateSamples: 110_000,
+    spotifyFiles: 6,
+    spotifyRowsPerFile: 38_000,
+    conversations: 10_400,
+    slackMessages: 90_000,
+    emails: 14_000,
+    bankTransactions: 9_000,
+    calendarEvents: 6_000,
+    browserVisits: 120_000,
+    notes: 12_000,
+    documents: DOCUMENTS,
+    semanticProse: true,
+    extraSources: true,
+    nutritionCoverage: 0.72,
+    commits: 23_000,
     driftingFxRates: true,
   },
 };
