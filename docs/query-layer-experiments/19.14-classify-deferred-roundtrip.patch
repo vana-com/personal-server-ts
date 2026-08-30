@@ -1,0 +1,657 @@
+diff --git a/docs/260828-query-layer-prompt.md b/docs/260828-query-layer-prompt.md
+index e9a0df0..c7262a8 100644
+--- a/docs/260828-query-layer-prompt.md
++++ b/docs/260828-query-layer-prompt.md
+@@ -230,10 +230,23 @@ Anything outside the block is ignored.
+ 7. **Distinguish what was measured from what was said.** If the data contains
+    both a stated claim and behaviour that contradicts it, report both and the
+    conflict.
+-8. **`vana.classify` is expensive.** It calls a model once per item. Filter
+-   first, and prefer classifying thousands of items once over classifying
+-   hundreds repeatedly. If a question needs judgement over an entire large
+-   scope, say so in your answer so the result can be saved and reused.
++8. **A keyword filter finds only what says it in words.** `filter`,
++   `includes` and `vana.search` all match wording, so they miss any record
++   that carries the property you are looking for without carrying its
++   vocabulary — a paraphrase, an implication, an aside, a question asked
++   sideways. When a question asks about a **theme, a stance, an intention or a
++   change over time** rather than a literal string, a keyword filter is a
++   source of silent false negatives, and `await vana.classify(items,
++instruction)` is the tool that can actually decide. Reach for it whenever
++   being wrong would mean having missed something rather than having
++   miscounted something.
++   `vana.classify` **is expensive** — a model call per batch — so use it
++   deliberately rather than sparingly: narrow to the records that could
++   plausibly matter, by scope, by date range, or by a **deliberately
++   generous** keyword net, and then classify that set in one call rather than
++   many. Prefer classifying thousands of items once over classifying hundreds
++   repeatedly. If a question needs judgement over an entire large scope, say
++   so in your answer so the result can be saved and reused.
+ 9. **Cite.** Every claim traces to a scope, and where possible a record.
+ 10. **Say what you do not know.** Missing days, unreadable files, scopes you
+     lack access to, budget you ran out of — surface them. An honest partial
+diff --git a/packages/core/src/query/agent/prompt.ts b/packages/core/src/query/agent/prompt.ts
+index 3244185..ef29b2a 100644
+--- a/packages/core/src/query/agent/prompt.ts
++++ b/packages/core/src/query/agent/prompt.ts
+@@ -50,7 +50,10 @@ Omit it only when the answer genuinely is not one number.
+   can never support a "have I ever" answer.
+ - \`await vana.search(query, {scopes?})\` -> \`[{id, scope, score, preview?}]\`.
+   Ranked, so it is a prefilter and never proof of absence.
+-- \`await vana.classify(items, instruction)\` -> one result per item.
++- \`await vana.classify(items, instruction)\` -> one result per item, in the
++  same order, judged by a model. Pass the records (or the fields of them that
++  matter) and say in \`instruction\` exactly what to return per item. This is
++  the only way to select on meaning rather than on wording; see rule 8.
+ - \`vana.note(msg)\` records a line for the operator; \`vana.result({answer,
+   citations, value})\` ends the script immediately.
+ 
+@@ -103,10 +106,23 @@ was rejected and what to use instead.
+ 7. **Distinguish what was measured from what was said.** If the data contains
+    both a stated claim and behaviour that contradicts it, report both and the
+    conflict.
+-8. **\`vana.classify\` is expensive.** It calls a model once per item. Filter
+-   first, and prefer classifying thousands of items once over classifying
+-   hundreds repeatedly. If a question needs judgement over an entire large
+-   scope, say so in your answer so the result can be saved and reused.
++8. **A keyword filter finds only what says it in words.** \`filter\`,
++   \`includes\` and \`vana.search\` all match wording, so they miss any record
++   that carries the property you are looking for without carrying its
++   vocabulary — a paraphrase, an implication, an aside, a question asked
++   sideways. When a question asks about a **theme, a stance, an intention or a
++   change over time** rather than a literal string, a keyword filter is a
++   source of silent false negatives, and \`await vana.classify(items,
++   instruction)\` is the tool that can actually decide. Reach for it whenever
++   being wrong would mean having missed something rather than having
++   miscounted something.
++   \`vana.classify\` **is expensive** — a model call per batch — so use it
++   deliberately rather than sparingly: narrow to the records that could
++   plausibly matter, by scope, by date range, or by a **deliberately
++   generous** keyword net, and then classify that set in one call rather than
++   many. Prefer classifying thousands of items once over classifying hundreds
++   repeatedly. If a question needs judgement over an entire large scope, say
++   so in your answer so the result can be saved and reused.
+ 9. **Cite.** Every claim traces to a scope, and where possible a record.
+ 10. **Say what you do not know.** Missing days, unreadable files, scopes you
+     lack access to, budget you ran out of — surface them. An honest partial
+diff --git a/packages/core/src/query/tools/errors.ts b/packages/core/src/query/tools/errors.ts
+index 2983148..51d14cc 100644
+--- a/packages/core/src/query/tools/errors.ts
++++ b/packages/core/src/query/tools/errors.ts
+@@ -11,6 +11,17 @@ export type QueryToolErrorCode =
+   | "INTROSPECT_REFUSED"
+   /** A capability the host did not register for this request. */
+   | "CAPABILITY_UNAVAILABLE"
++  /**
++   * A `vana.classify` call the confined run cannot serve in place.
++   *
++   * Judgement needs a model call, and a model call needs network and a
++   * credential — both of which the OS sandbox denies by construction (zero
++   * egress, `stdin` ignored, no channel back to the host mid-run). So the run
++   * ends here and hands the batch outward in `RunDocument.classifyRequest`;
++   * the host answers it and re-runs the same script with the answer in hand.
++   * Not a failure, and never surfaced to the model as one.
++   */
++  | "CLASSIFY_DEFERRED"
+   /** The script used syntax or a binding the confined realm does not allow. */
+   | "CONFINEMENT_VIOLATION"
+   /** `vana.result` called more than once, or after the run ended. */
+diff --git a/packages/core/src/query/tools/index.ts b/packages/core/src/query/tools/index.ts
+index 959e21b..08abecd 100644
+--- a/packages/core/src/query/tools/index.ts
++++ b/packages/core/src/query/tools/index.ts
+@@ -53,5 +53,6 @@ export {
+   encodeResultFrame,
+   stripResultFrames,
+   type DecodeOutcome,
++  type DeferredClassify,
+   type RunDocument,
+ } from "./protocol.js";
+diff --git a/packages/core/src/query/tools/protocol.ts b/packages/core/src/query/tools/protocol.ts
+index 3abbc2d..4e897f3 100644
+--- a/packages/core/src/query/tools/protocol.ts
++++ b/packages/core/src/query/tools/protocol.ts
+@@ -37,6 +37,24 @@ import type { CoverageCounters, ScriptResult } from "./types.js";
+ export const RESULT_FRAME_BEGIN = "__VANA_RESULT_V1_BEGIN__";
+ export const RESULT_FRAME_END = "__VANA_RESULT_V1_END__";
+ 
++/**
++ * One `vana.classify` batch the confined run could not serve, handed outward.
++ *
++ * The sandbox has zero network egress and no channel back to the host while a
++ * script is running, so judgement cannot happen inside it. Rather than deny
++ * the capability — which is what made it unreachable — the run stops at the
++ * first unserved batch and reports it here. The host performs the judgement
++ * and replays the same script with the answer supplied, which is safe because
++ * a script reads and never writes: replaying it re-derives the same batch and
++ * finds it already answered.
++ */
++export interface DeferredClassify {
++  /** Stable identity of `(instruction, items)`, so the replay finds its answer. */
++  key: string;
++  instruction: string;
++  items: unknown[];
++}
++
+ /** What one confined run reports back to the host. */
+ export interface RunDocument {
+   v: 1;
+@@ -46,6 +64,8 @@ export interface RunDocument {
+   toolCalls: number;
+   classifyUsd: number;
+   error?: { code: string; message: string };
++  /** Present only alongside a `CLASSIFY_DEFERRED` error. */
++  classifyRequest?: DeferredClassify;
+ }
+ 
+ /** UTF-8 safe base64, using only globals present in Node 18+ and browsers. */
+@@ -126,6 +146,26 @@ export function boundRunDocument(
+   };
+   if (fits(withoutNotes)) return withoutNotes;
+ 
++  // A deferred classify batch is the other unbounded field: it carries the
++  // items themselves. Dropping it turns "the host will judge this" into an
++  // honest, actionable denial — narrow the batch — rather than a frame the
++  // sandbox cuts mid-write, which would cost the run all of its coverage.
++  if (withoutNotes.classifyRequest) {
++    const n = withoutNotes.classifyRequest.items.length;
++    const withoutRequest: RunDocument = {
++      ...withoutNotes,
++      error: {
++        code: "CLASSIFY_BATCH_TOO_LARGE",
++        message:
++          `a classify batch of ${n} item(s) exceeded the output budget and was not sent; ` +
++          `narrow the items (fewer, or shorter fields per item) and classify again`,
++      },
++    };
++    delete withoutRequest.classifyRequest;
++    if (fits(withoutRequest)) return withoutRequest;
++    return withoutRequest;
++  }
++
+   // Still over: the result payload itself is oversized. Keep coverage and an
+   // honest error rather than losing the frame.
+   const stripped: RunDocument = {
+diff --git a/packages/server/src/query/runner-entry.ts b/packages/server/src/query/runner-entry.ts
+index 2d3f32e..3eab1cc 100644
+--- a/packages/server/src/query/runner-entry.ts
++++ b/packages/server/src/query/runner-entry.ts
+@@ -37,6 +37,8 @@ import {
+   encodeResultFrame,
+   runQueryScript,
+   type QueryToolContext,
++  QueryToolError,
++  type DeferredClassify,
+   type QueryToolDeps,
+   type RunDocument,
+   type ScopeInfo,
+@@ -73,6 +75,18 @@ export interface RunnerInput {
+    * honest denial rather than a silent empty result.
+    */
+   searchResults?: Record<string, ScriptHit[]>;
++  /**
++   * Judgements the host has already made for this script, keyed by
++   * {@link classifyKey}.
++   *
++   * `classify` is the one capability that cannot be served in place: it needs
++   * a model call, and the sandbox has zero network egress and no channel back
++   * to the host mid-run. So the host answers batches between runs and replays
++   * the same script with the answers here. A script only reads, so a replay
++   * re-derives the same batches in the same order and finds each one already
++   * answered — up to the first new one, which defers in its turn.
++   */
++  classifyResults?: Record<string, unknown[]>;
+ }
+ 
+ declare const __VANA_INPUT__: RunnerInput;
+@@ -93,6 +107,26 @@ function loadScope(path: string): LoadedScope {
+   };
+ }
+ 
++/**
++ * Stable identity for one classify batch, so a replay recognises its answer.
++ *
++ * FNV-1a over the serialized call. It has to be computed here rather than by
++ * the host, because only the sandbox sees the items: the host receives this
++ * key alongside them and stores its judgement under it verbatim.
++ */
++function classifyKey(instruction: string, items: unknown[]): string {
++  const text = JSON.stringify([instruction, items]);
++  let h = 0x811c9dc5;
++  for (let i = 0; i < text.length; i += 1) {
++    h ^= text.charCodeAt(i);
++    h = Math.imul(h, 0x01000193) >>> 0;
++  }
++  return `c${h.toString(16)}-${items.length}-${text.length}`;
++}
++
++/** Set by `classify` when it cannot serve a batch; read by `main`. */
++let deferredClassify: DeferredClassify | undefined;
++
+ function buildDeps(input: RunnerInput): QueryToolDeps {
+   const byScope = new Map(input.scopes.map((s) => [s.scope, s]));
+   // Cache per scope: a script that reads the same scope twice should not pay
+@@ -171,6 +205,23 @@ function buildDeps(input: RunnerInput): QueryToolDeps {
+           `re-issue the question so the host can prepare it, or scan the scope directly`,
+       );
+     },
++
++    /**
++     * Judgement is host authority for the same reason search is, and one more:
++     * it needs a model call, so it needs network and a credential, and the
++     * sandbox has neither. An answer the host already made is returned for
++     * free; anything else stops the run and travels outward as a request.
++     */
++    async classify(items, instruction) {
++      const key = classifyKey(instruction, items);
++      const pre = __VANA_INPUT__.classifyResults?.[key];
++      if (pre) return { values: pre, usd: 0, inputTokens: 0, outputTokens: 0 };
++      deferredClassify = { key, instruction, items };
++      throw new QueryToolError(
++        "CLASSIFY_DEFERRED",
++        `classify of ${items.length} item(s) deferred to the host`,
++      );
++    },
+   };
+ }
+ 
+@@ -200,6 +251,9 @@ async function main(): Promise<void> {
+     classifyUsd: outcome.classifyUsd,
+     ...(outcome.result ? { result: outcome.result } : {}),
+     ...(outcome.error ? { error: outcome.error } : {}),
++    ...(outcome.error?.code === "CLASSIFY_DEFERRED" && deferredClassify
++      ? { classifyRequest: deferredClassify }
++      : {}),
+   };
+   process.stdout.write(
+     encodeResultFrame(boundRunDocument(doc, input.frameBudgetBytes)),
+diff --git a/packages/server/src/query/sandbox-tool-host.ts b/packages/server/src/query/sandbox-tool-host.ts
+index 3bf8004..2425ae1 100644
+--- a/packages/server/src/query/sandbox-tool-host.ts
++++ b/packages/server/src/query/sandbox-tool-host.ts
+@@ -61,6 +61,17 @@ export interface SandboxToolHostOptions {
+   };
+   /** Host-resolved lexical search results, keyed by query. */
+   searchResults?: Record<string, ScriptHit[]>;
++  /**
++   * Judgement over a batch of items — host authority, because it needs a model
++   * call and the sandbox has zero network egress.
++   *
++   * Absent, `vana.classify` stays an honest `CAPABILITY_UNAVAILABLE`. Present,
++   * the host answers deferred batches between runs and replays the script.
++   */
++  classify?: (
++    items: unknown[],
++    instruction: string,
++  ) => Promise<{ values: unknown[]; usd: number }>;
+   maxSteps?: number;
+   /** Override the bundled runner path; tests supply a stub. */
+   runnerBundlePath?: string;
+@@ -146,9 +157,31 @@ export function createSandboxToolHost(options: SandboxToolHostOptions) {
+     limits,
+     callerId,
+     searchResults,
++    classify,
+     maxSteps,
+   } = options;
+ 
++  /**
++   * Judgements already paid for, keyed by the runner's `classifyKey`.
++   *
++   * Request-scoped rather than run-scoped, because the loop may run the same
++   * or a similar script over several turns: a batch judged in turn 1 must not
++   * be paid for again in turn 3. This is the design's own §17.3 rule — pay
++   * once, reuse — at the smallest scale it applies at.
++   */
++  const classifyResults: Record<string, unknown[]> = {};
++  let classifySpentUsd = 0;
++
++  /**
++   * How many times one `execute` may stop for judgement and be replayed.
++   *
++   * Each round costs a full re-run of the script, so this bounds wall time as
++   * well as spend. A script that needs more rounds than this is asking for a
++   * classify per item rather than a classify per batch, and the honest answer
++   * is to say so rather than to grind.
++   */
++  const MAX_CLASSIFY_ROUNDS = 8;
++
+   /**
+    * Coverage accumulated over every run in this request.
+    *
+@@ -356,14 +389,72 @@ export function createSandboxToolHost(options: SandboxToolHostOptions) {
+         enforcementNotes: [] as string[],
+         ...(maxSteps === undefined ? {} : { maxSteps }),
+         ...(searchResults === undefined ? {} : { searchResults }),
++        ...(Object.keys(classifyResults).length === 0
++          ? {}
++          : { classifyResults }),
+       };
+       return `globalThis.__VANA_INPUT__ = ${JSON.stringify(input)};\n${loadBundle()}`;
+     },
+ 
+     async execute(modelCode: string): Promise<ExecuteOutcome> {
+-      const program = this.buildRunnerProgram(modelCode);
+-      const run = await sandbox.run(program, spec);
+-      const decoded = decodeResultFrame(run.stdout);
++      /**
++       * Run, and keep running while the script stops for judgement.
++       *
++       * The loop exists because `classify` is the one capability the sandbox
++       * cannot serve in place: it needs a model call, and the sandbox has zero
++       * egress and no mid-run channel back here. So the script defers a batch,
++       * this host judges it, and the script is replayed with the answer in
++       * hand. Replaying is sound because a script only reads — it re-derives
++       * the same batch, finds it answered, and carries on to the next one.
++       *
++       * Coverage is deliberately merged only for the run that finishes.
++       * Merging every attempt would count the same records once per round.
++       */
++      let run = await sandbox.run(this.buildRunnerProgram(modelCode), spec);
++      let decoded = decodeResultFrame(run.stdout);
++      let classifyDenial: { code: string; message: string } | undefined;
++
++      for (let round = 0; round < MAX_CLASSIFY_ROUNDS; round += 1) {
++        if (!decoded.ok) break;
++        const req = decoded.doc.classifyRequest;
++        if (!req || decoded.doc.error?.code !== "CLASSIFY_DEFERRED") break;
++        if (!classify) {
++          classifyDenial = {
++            code: "CAPABILITY_UNAVAILABLE",
++            message: "classify is not registered for this request",
++          };
++          break;
++        }
++        const ceiling = budget.classifyUsd;
++        if (ceiling !== undefined && classifySpentUsd >= ceiling) {
++          classifyDenial = {
++            code: "BUDGET_EXHAUSTED",
++            message: `classify cost ceiling of $${ceiling} reached`,
++          };
++          break;
++        }
++        const judged = await classify(req.items, req.instruction);
++        classifySpentUsd += judged.usd;
++        classifyResults[req.key] = judged.values;
++        run = await sandbox.run(this.buildRunnerProgram(modelCode), spec);
++        decoded = decodeResultFrame(run.stdout);
++      }
++
++      // Still deferring after the last round, and never denied for a reason
++      // worth naming: say so rather than handing the model a bare error code
++      // it cannot act on.
++      if (
++        !classifyDenial &&
++        decoded.ok &&
++        decoded.doc.error?.code === "CLASSIFY_DEFERRED"
++      ) {
++        classifyDenial = {
++          code: "CLASSIFY_ROUNDS_EXHAUSTED",
++          message:
++            `this script asked for judgement more than ${MAX_CLASSIFY_ROUNDS} times; ` +
++            `classify once over a batch of items rather than once per item`,
++        };
++      }
+ 
+       const base = {
+         termination: run.termination,
+@@ -409,9 +500,17 @@ export function createSandboxToolHost(options: SandboxToolHostOptions) {
+         }),
+         notes: doc.notes,
+         toolCalls: doc.toolCalls,
+-        classifyUsd: doc.classifyUsd,
++        // Host-side, because the runner sees a pre-answered batch as free.
++        // Cumulative over the request for the same reason coverage is.
++        classifyUsd: classifySpentUsd,
+         ...(doc.result ? { result: doc.result } : {}),
+-        ...(doc.error ? { error: doc.error } : {}),
++        // A denial the host decided outranks `CLASSIFY_DEFERRED`, which is an
++        // internal signal and tells the model nothing it can act on.
++        ...(classifyDenial
++          ? { error: classifyDenial }
++          : doc.error
++            ? { error: doc.error }
++            : {}),
+       };
+     },
+   };
+diff --git a/scripts/query-benchmark.ts b/scripts/query-benchmark.ts
+index b8a28c8..6eb4326 100644
+--- a/scripts/query-benchmark.ts
++++ b/scripts/query-benchmark.ts
+@@ -80,6 +80,7 @@ import {
+   retainAnswer,
+   retainScripts,
+   SCRIPTS_CHAR_BUDGET,
++  type ClassifyStats,
+   type RecordingEvalAnswerer,
+ } from "./query-eval-harness.js";
+ 
+@@ -199,6 +200,14 @@ interface Row {
+ 
+   unreadable?: number;
+   unprofiled: number;
++  /**
++   * What `vana.classify` cost this row, present only when it was called.
++   *
++   * Absent on every row of every sweep before this field existed, which is
++   * the fact it was added to record: the tool had no implementation, so no
++   * script could reach it and none tried.
++   */
++  classify?: ClassifyStats;
+ }
+ 
+ function isRecording(a: unknown): a is RecordingEvalAnswerer {
+@@ -388,6 +397,11 @@ async function main(): Promise<void> {
+   // `QueryAnswer.script` is only ever the LAST one. Keyed by question so a row
+   // picks up the scripts of its own run and nothing else.
+   const scriptsByQuestion = new Map<string, string[]>();
++  // Host-side judgement spend, captured the same way and for the same reason:
++  // `vana.classify` costs relay calls the answer's own token counters never
++  // see, because they are made by the host between runs rather than by the
++  // loop. Design §18.3 predicts this is where a semantic question's cost is.
++  const classifyByQuestion = new Map<string, ClassifyStats>();
+   const capturing = {
+     name: answerer.name,
+     async answer(request: Parameters<typeof answerer.answer>[0]) {
+@@ -398,6 +412,8 @@ async function main(): Promise<void> {
+       // agent answerer implements this.
+       if (isRecording(per)) {
+         scriptsByQuestion.set(request.question, per.scriptsForLastRequest());
++        const cs = per.classifyStatsForLastRequest?.();
++        if (cs) classifyByQuestion.set(request.question, cs);
+       }
+       return out;
+     },
+@@ -558,11 +574,16 @@ async function main(): Promise<void> {
+         scriptsChars: allScripts.reduce((n, s) => n + s.length, 0),
+         unreadable: cov?.unreadable,
+         unprofiled: cov?.unprofiledScopes?.length ?? 0,
++        ...(() => {
++          const cs = classifyByQuestion.get(testCase.question);
++          return cs && cs.calls > 0 ? { classify: cs } : {};
++        })(),
+       };
+       rows.push(row);
+       done.add(key(result.id, run));
+       answers.clear();
+       scriptsByQuestion.clear();
++      classifyByQuestion.clear();
+       await persist(row);
+     }
+   }
+diff --git a/scripts/query-eval-harness.ts b/scripts/query-eval-harness.ts
+index df6bf5e..f942070 100644
+--- a/scripts/query-eval-harness.ts
++++ b/scripts/query-eval-harness.ts
+@@ -48,6 +48,17 @@ import { createSandboxToolHost } from "../packages/server/src/query/sandbox-tool
+ export interface RecordingEvalAnswerer extends EvalAnswerer {
+   /** Every script the most recent `answer()` executed, in order. */
+   scriptsForLastRequest(): string[];
++  /** What `vana.classify` cost the most recent `answer()`, if anything. */
++  classifyStatsForLastRequest?(): ClassifyStats;
++}
++
++/** Host-side judgement spend for one request. Zero when the tool went unused. */
++export interface ClassifyStats {
++  calls: number;
++  items: number;
++  inputTokens: number;
++  outputTokens: number;
++  usd: number;
+ }
+ 
+ /**
+@@ -132,6 +143,114 @@ export function retainAnswer(text: string): {
+   };
+ }
+ 
++const ZERO_CLASSIFY: ClassifyStats = {
++  calls: 0,
++  items: 0,
++  inputTokens: 0,
++  outputTokens: 0,
++  usd: 0,
++};
++
++/**
++ * Ceiling on judgement spend for ONE question.
++ *
++ * Design §18.3 predicted a corpus-scale semantic question at $5–16 a pass. A
++ * per-question ceiling an order of magnitude under that is deliberate: this
++ * measures whether the tool is reachable and useful, and a run that wants
++ * more than this has decided to classify the whole corpus, which §18.4 says
++ * belongs in a derivative rather than in a single question's budget.
++ */
++const CLASSIFY_USD_CEILING = 0.5;
++
++/**
++ * Items per relay call.
++ *
++ * Batched because the cost model is per call as much as per token: one call
++ * over sixty items is what makes judgement affordable at all, and it is what
++ * prompt rule 8 means by "classify thousands of items once".
++ */
++const CLASSIFY_BATCH = 60;
++
++/**
++ * Price used to convert tokens into the ceiling's currency.
++ *
++ * An operating estimate for a flash-class model, not a quoted rate: it exists
++ * so `classifyUsd` bounds something, and the measurement of record is the
++ * token count beside it, which is observed rather than assumed.
++ */
++const USD_PER_INPUT_MTOK = 0.3;
++const USD_PER_OUTPUT_MTOK = 2.5;
++
++/**
++ * Judgement over a batch of items, as host authority.
++ *
++ * One call per {@link CLASSIFY_BATCH} items, each returning a JSON array of
++ * the same length. A batch whose reply cannot be parsed, or comes back the
++ * wrong length, yields `null` for every item in it rather than a guess — a
++ * fabricated judgement is worse here than an absent one, because the script
++ * will go on to count it.
++ */
++function makeClassify(
++  provider: InferenceProvider,
++  stats: ClassifyStats,
++): (
++  items: unknown[],
++  instruction: string,
++) => Promise<{ values: unknown[]; usd: number }> {
++  return async (items, instruction) => {
++    const values: unknown[] = [];
++    let usd = 0;
++    for (let i = 0; i < items.length; i += CLASSIFY_BATCH) {
++      const batch = items.slice(i, i + CLASSIFY_BATCH);
++      const numbered = batch
++        .map((it, n) => `${n}. ${JSON.stringify(it)}`)
++        .join("\n");
++      const reply = await provider.chat({
++        model: provider.defaultModel,
++        messages: [
++          {
++            role: "system",
++            content:
++              "You judge items one at a time against an instruction. " +
++              "Reply with ONLY a JSON array, one element per numbered item, in order, " +
++              "no prose and no code fence. Use null for an item you cannot judge.",
++          },
++          {
++            role: "user",
++            content: `Instruction: ${instruction}\n\nItems (${batch.length}):\n${numbered}\n\nJSON array of ${batch.length} results:`,
++          },
++        ],
++      });
++      const inTok = reply.usage?.promptTokens ?? 0;
++      const outTok = reply.usage?.completionTokens ?? 0;
++      stats.calls += 1;
++      stats.items += batch.length;
++      stats.inputTokens += inTok;
++      stats.outputTokens += outTok;
++      usd +=
++        (inTok / 1e6) * USD_PER_INPUT_MTOK +
++        (outTok / 1e6) * USD_PER_OUTPUT_MTOK;
++
++      let parsed: unknown;
++      try {
++        const text = reply.content.trim().replace(/^```(?:json)?|```$/g, "");
++        parsed = JSON.parse(
++          text.slice(text.indexOf("["), text.lastIndexOf("]") + 1),
++        );
++      } catch {
++        parsed = undefined;
++      }
++      if (Array.isArray(parsed) && parsed.length === batch.length) {
++        values.push(...parsed);
++      } else {
++        values.push(...batch.map(() => null));
++      }
++    }
++    stats.usd += usd;
++    return { values, usd };
++  };
++}
++
+ /**
+  * Wire the agent loop over the generated corpus.
+  *
+@@ -244,21 +363,36 @@ vana.result({
+   // outlived the host would accumulate across questions in exactly the way
+   // the fresh-host rule below exists to prevent.
+   let executed: string[] = [];
++  let classifyStats: ClassifyStats = ZERO_CLASSIFY;
+ 
+   return {
+     name,
+     scriptsForLastRequest: () => [...executed],
++    classifyStatsForLastRequest: () => ({ ...classifyStats }),
+     async answer(request: EvalQueryRequest) {
+       // A fresh host per request, because the grant is per request — and
+       // because the host also accumulates coverage across the turns of one
+       // request. Reusing it across questions would carry one question's
+       // counters into the next.
++      const stats: ClassifyStats = { ...ZERO_CLASSIFY };
++      classifyStats = stats;
+       const host = createSandboxToolHost({
+         sandbox: createNodeSandbox({ dataRoot: corpusDir }),
+         scopes: scopesFor(request.grantedScopes),
+         dataRoot: corpusDir,
+         scratchDir,
+-        budget: { toolCalls: 50, outputBytes: 1_000_000 },
++        budget: {
++          toolCalls: 50,
++          outputBytes: 1_000_000,
++          classifyUsd: CLASSIFY_USD_CEILING,
++        },
++        // Judgement is host authority: the sandbox has zero egress, so the
++        // relay call happens out here. Only registered when a live provider
++        // exists — with the canned provider there is nothing to call, and an
++        // honest `CAPABILITY_UNAVAILABLE` beats a fabricated judgement.
++        ...(liveProvider
++          ? { classify: makeClassify(liveProvider, stats) }
++          : {}),
+         limits: {
+           cpuMs: 30_000,
+           memoryMb: 512,

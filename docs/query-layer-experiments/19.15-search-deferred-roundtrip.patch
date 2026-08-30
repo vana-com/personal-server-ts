@@ -1,0 +1,626 @@
+diff --git a/packages/core/src/query/tools/errors.ts b/packages/core/src/query/tools/errors.ts
+index 2983148..f58108b 100644
+--- a/packages/core/src/query/tools/errors.ts
++++ b/packages/core/src/query/tools/errors.ts
+@@ -11,6 +11,19 @@ export type QueryToolErrorCode =
+   | "INTROSPECT_REFUSED"
+   /** A capability the host did not register for this request. */
+   | "CAPABILITY_UNAVAILABLE"
++  /**
++   * A `vana.search` call the confined run cannot serve in place.
++   *
++   * Lexical search reads an index that spans scopes, so it is host authority
++   * by construction and must never live inside the sandbox — and the sandbox
++   * has zero egress and no channel back to the host mid-run. The host cannot
++   * predict what a running script will search for, so rather than deny the
++   * capability (which is what made it unusable), the run ends here and hands
++   * the query outward in `RunDocument.searchRequest`. The host resolves it
++   * against the index and re-runs the same script with the hits in hand.
++   * Not a failure, and never surfaced to the model as one.
++   */
++  | "SEARCH_DEFERRED"
+   /** The script used syntax or a binding the confined realm does not allow. */
+   | "CONFINEMENT_VIOLATION"
+   /** `vana.result` called more than once, or after the run ended. */
+diff --git a/packages/core/src/query/tools/index.ts b/packages/core/src/query/tools/index.ts
+index 959e21b..2a5f688 100644
+--- a/packages/core/src/query/tools/index.ts
++++ b/packages/core/src/query/tools/index.ts
+@@ -53,5 +53,6 @@ export {
+   encodeResultFrame,
+   stripResultFrames,
+   type DecodeOutcome,
++  type DeferredSearch,
+   type RunDocument,
+ } from "./protocol.js";
+diff --git a/packages/core/src/query/tools/protocol.ts b/packages/core/src/query/tools/protocol.ts
+index 3abbc2d..f686d8a 100644
+--- a/packages/core/src/query/tools/protocol.ts
++++ b/packages/core/src/query/tools/protocol.ts
+@@ -37,6 +37,26 @@ import type { CoverageCounters, ScriptResult } from "./types.js";
+ export const RESULT_FRAME_BEGIN = "__VANA_RESULT_V1_BEGIN__";
+ export const RESULT_FRAME_END = "__VANA_RESULT_V1_END__";
+ 
++/**
++ * One `vana.search` query the confined run could not serve, handed outward.
++ *
++ * Lexical search spans scopes, so it is host authority and cannot move inside
++ * the sandbox; and the sandbox has zero network egress and no channel back to
++ * the host while a script is running. The host also cannot predict what a
++ * running script will search for, which is what made the precomputed-map
++ * design unusable in practice. So the run stops at the first unresolved query
++ * and reports it here. The host resolves it against the index and replays the
++ * same script with the hits supplied, which is safe because a script reads and
++ * never writes: replaying it re-derives the same query and finds it answered.
++ */
++export interface DeferredSearch {
++  /** Stable identity of `(query, scopes, limit)`, so the replay finds its hits. */
++  key: string;
++  query: string;
++  scopes: string[];
++  limit?: number;
++}
++
+ /** What one confined run reports back to the host. */
+ export interface RunDocument {
+   v: 1;
+@@ -46,6 +66,8 @@ export interface RunDocument {
+   toolCalls: number;
+   classifyUsd: number;
+   error?: { code: string; message: string };
++  /** Present only alongside a `SEARCH_DEFERRED` error. */
++  searchRequest?: DeferredSearch;
+ }
+ 
+ /** UTF-8 safe base64, using only globals present in Node 18+ and browsers. */
+@@ -126,6 +148,26 @@ export function boundRunDocument(
+   };
+   if (fits(withoutNotes)) return withoutNotes;
+ 
++  // A deferred search carries a model-authored query string, which is the one
++  // field here the host does not bound. Dropping it turns "the host will
++  // resolve this" into an honest, actionable denial — shorten the query —
++  // rather than a frame the sandbox cuts mid-write, which would cost the run
++  // all of its coverage.
++  if (withoutNotes.searchRequest) {
++    const n = withoutNotes.searchRequest.query.length;
++    const withoutRequest: RunDocument = {
++      ...withoutNotes,
++      error: {
++        code: "SEARCH_QUERY_TOO_LARGE",
++        message:
++          `a search query of ${n} character(s) exceeded the output budget and was not sent; ` +
++          `use a shorter query with fewer terms`,
++      },
++    };
++    delete withoutRequest.searchRequest;
++    return withoutRequest;
++  }
++
+   // Still over: the result payload itself is oversized. Keep coverage and an
+   // honest error rather than losing the frame.
+   const stripped: RunDocument = {
+diff --git a/packages/server/src/query/runner-entry.ts b/packages/server/src/query/runner-entry.ts
+index 2d3f32e..70c7ece 100644
+--- a/packages/server/src/query/runner-entry.ts
++++ b/packages/server/src/query/runner-entry.ts
+@@ -36,6 +36,8 @@ import {
+   boundRunDocument,
+   encodeResultFrame,
+   runQueryScript,
++  QueryToolError,
++  type DeferredSearch,
+   type QueryToolContext,
+   type QueryToolDeps,
+   type RunDocument,
+@@ -67,16 +69,51 @@ export interface RunnerInput {
+    */
+   frameBudgetBytes?: number;
+   /**
+-   * Host-authority results precomputed before the run, because `search`,
+-   * `classify` and `introspect` need authority that must never be inside the
+-   * sandbox. Absent capabilities throw `CAPABILITY_UNAVAILABLE`, which is an
+-   * honest denial rather than a silent empty result.
++   * Hits the host has already resolved for this script, keyed by
++   * {@link searchKey}.
++   *
++   * `search` is host authority: it reads an index that spans scopes, so it
++   * must never live inside the sandbox. It used to be served from a map the
++   * host precomputed *before* the run, which cannot work — the host does not
++   * know what a running script will search for, so every unanticipated query
++   * was denied. Now the host answers queries between runs and replays the same
++   * script with the answers here. A script only reads, so a replay re-derives
++   * the same queries in the same order and finds each one already answered —
++   * up to the first new one, which defers in its turn.
++   *
++   * An entry present but empty is a real "the index returned nothing". A key
++   * that is absent is "not resolved", which defers rather than reading as an
++   * empty result — that distinction is the Q8 false negative.
+    */
+   searchResults?: Record<string, ScriptHit[]>;
+ }
+ 
+ declare const __VANA_INPUT__: RunnerInput;
+ 
++/**
++ * Stable identity for one search call, so a replay recognises its answer.
++ *
++ * FNV-1a over the serialized call. Scopes are sorted because the same grant
++ * asked for in a different order is the same query, and a key that missed on
++ * ordering would defer forever and burn every round.
++ */
++function searchKey(
++  query: string,
++  scopes: readonly string[],
++  limit?: number,
++): string {
++  const text = JSON.stringify([query, [...scopes].sort(), limit ?? null]);
++  let h = 0x811c9dc5;
++  for (let i = 0; i < text.length; i += 1) {
++    h ^= text.charCodeAt(i);
++    h = Math.imul(h, 0x01000193) >>> 0;
++  }
++  return `s${h.toString(16)}-${text.length}`;
++}
++
++/** Set by `search` when it cannot serve a query; read by `main`. */
++let deferredSearch: DeferredSearch | undefined;
++
+ /** Parse one scope file into records. Counting is the ledger's job, not ours. */
+ interface LoadedScope {
+   items: unknown[];
+@@ -158,17 +195,28 @@ function buildDeps(input: RunnerInput): QueryToolDeps {
+ 
+     /**
+      * Lexical search is a host-authority operation — it reads an index that
+-     * spans scopes and must never be inside the sandbox. The host resolves
+-     * the queries it can predict before the run; anything else is an honest
+-     * denial rather than an empty array, because an empty array reads as
+-     * "there is nothing there" and that is the Q8 false negative.
++     * spans scopes and must never be inside the sandbox.
++     *
++     * A query the host has already resolved is returned for free; anything
++     * else stops the run and travels outward as a request. What is never
++     * returned is a fabricated empty array: an empty array reads as "there is
++     * nothing there", and that is the Q8 false negative. An unresolvable
++     * search denies; only the index itself may say "no hits".
+      */
+-    async search(query): Promise<ScriptHit[]> {
+-      const pre = __VANA_INPUT__.searchResults?.[query];
+-      if (pre) return pre;
+-      throw new Error(
+-        `search("${query}") was not resolved by the host for this run; ` +
+-          `re-issue the question so the host can prepare it, or scan the scope directly`,
++    async search(query, opts): Promise<ScriptHit[]> {
++      const scopes = opts.scopes ?? [];
++      const key = searchKey(query, scopes, opts.limit);
++      const pre = __VANA_INPUT__.searchResults?.[key];
++      if (pre !== undefined) return pre;
++      deferredSearch = {
++        key,
++        query,
++        scopes: [...scopes],
++        ...(opts.limit === undefined ? {} : { limit: opts.limit }),
++      };
++      throw new QueryToolError(
++        "SEARCH_DEFERRED",
++        `search(${JSON.stringify(query)}) deferred to the host`,
+       );
+     },
+   };
+@@ -200,6 +248,9 @@ async function main(): Promise<void> {
+     classifyUsd: outcome.classifyUsd,
+     ...(outcome.result ? { result: outcome.result } : {}),
+     ...(outcome.error ? { error: outcome.error } : {}),
++    ...(outcome.error?.code === "SEARCH_DEFERRED" && deferredSearch
++      ? { searchRequest: deferredSearch }
++      : {}),
+   };
+   process.stdout.write(
+     encodeResultFrame(boundRunDocument(doc, input.frameBudgetBytes)),
+diff --git a/packages/server/src/query/sandbox-tool-host.ts b/packages/server/src/query/sandbox-tool-host.ts
+index 3bf8004..9cac355 100644
+--- a/packages/server/src/query/sandbox-tool-host.ts
++++ b/packages/server/src/query/sandbox-tool-host.ts
+@@ -59,8 +59,21 @@ export interface SandboxToolHostOptions {
+     wallClockMs: number;
+     maxOutputBytes: number;
+   };
+-  /** Host-resolved lexical search results, keyed by query. */
++  /** Host-resolved lexical search results, keyed by the runner's `searchKey`. */
+   searchResults?: Record<string, ScriptHit[]>;
++  /**
++   * Resolve one lexical search — host authority, because the index spans
++   * scopes and must never be inside the sandbox.
++   *
++   * Absent, `vana.search` stays an honest denial: a script that searches gets
++   * told the capability is not registered, never an empty array. Present, the
++   * host answers deferred queries between runs and replays the script.
++   */
++  resolveSearch?: (
++    query: string,
++    scopes: readonly string[],
++    limit?: number,
++  ) => ScriptHit[] | Promise<ScriptHit[]>;
+   maxSteps?: number;
+   /** Override the bundled runner path; tests supply a stub. */
+   runnerBundlePath?: string;
+@@ -146,9 +159,32 @@ export function createSandboxToolHost(options: SandboxToolHostOptions) {
+     limits,
+     callerId,
+     searchResults,
++    resolveSearch,
+     maxSteps,
+   } = options;
+ 
++  /**
++   * Hits already resolved, keyed by the runner's `searchKey`.
++   *
++   * Request-scoped rather than run-scoped, because the loop may run the same
++   * or a similar script over several turns: a query resolved in turn 1 must
++   * not be resolved again in turn 3, and — more to the point — must not cost
++   * a whole extra replay of the script each time it recurs. This is the
++   * design's own §17.3 rule (pay once, reuse) at the smallest scale it
++   * applies at. Seeded with anything the caller precomputed.
++   */
++  const resolvedSearches: Record<string, ScriptHit[]> = { ...searchResults };
++
++  /**
++   * How many times one `execute` may stop for search and be replayed.
++   *
++   * Each round costs a full re-run of the script, so this bounds wall time as
++   * well as work. A script needing more rounds than this is issuing a search
++   * per record rather than a search per question, and the honest answer is to
++   * say so rather than to grind.
++   */
++  const MAX_SEARCH_ROUNDS = 8;
++
+   /**
+    * Coverage accumulated over every run in this request.
+    *
+@@ -355,15 +391,70 @@ export function createSandboxToolHost(options: SandboxToolHostOptions) {
+         frameBudgetBytes: Math.floor(limits.maxOutputBytes / 2),
+         enforcementNotes: [] as string[],
+         ...(maxSteps === undefined ? {} : { maxSteps }),
+-        ...(searchResults === undefined ? {} : { searchResults }),
++        ...(Object.keys(resolvedSearches).length === 0
++          ? {}
++          : { searchResults: resolvedSearches }),
+       };
+       return `globalThis.__VANA_INPUT__ = ${JSON.stringify(input)};\n${loadBundle()}`;
+     },
+ 
+     async execute(modelCode: string): Promise<ExecuteOutcome> {
+-      const program = this.buildRunnerProgram(modelCode);
+-      const run = await sandbox.run(program, spec);
+-      const decoded = decodeResultFrame(run.stdout);
++      /**
++       * Run, and keep running while the script stops for a search.
++       *
++       * The loop exists because `search` is host authority the sandbox cannot
++       * serve in place: the index spans scopes, and the sandbox has no mid-run
++       * channel back here. The old design precomputed a map of queries before
++       * the run, which cannot work — the host does not know what a running
++       * script will search for. So the script defers a query, this host
++       * resolves it, and the script is replayed with the hits in hand.
++       * Replaying is sound because a script only reads: it re-derives the same
++       * query, finds it answered, and carries on to the next one.
++       *
++       * Coverage is deliberately merged only for the run that finishes.
++       * Merging every attempt would count the same records once per round.
++       */
++      let run = await sandbox.run(this.buildRunnerProgram(modelCode), spec);
++      let decoded = decodeResultFrame(run.stdout);
++      let searchDenial: { code: string; message: string } | undefined;
++
++      for (let round = 0; round < MAX_SEARCH_ROUNDS; round += 1) {
++        if (!decoded.ok) break;
++        const req = decoded.doc.searchRequest;
++        if (!req || decoded.doc.error?.code !== "SEARCH_DEFERRED") break;
++        if (!resolveSearch) {
++          // The honest denial, preserved. Never an empty array: `[]` reads as
++          // "there is nothing there", which is the Q8 false negative.
++          searchDenial = {
++            code: "CAPABILITY_UNAVAILABLE",
++            message:
++              "search is not registered for this request; scan the scope directly",
++          };
++          break;
++        }
++        resolvedSearches[req.key] = await resolveSearch(
++          req.query,
++          req.scopes,
++          req.limit,
++        );
++        run = await sandbox.run(this.buildRunnerProgram(modelCode), spec);
++        decoded = decodeResultFrame(run.stdout);
++      }
++
++      // Still deferring after the last round: say so rather than handing the
++      // model a bare internal signal it cannot act on.
++      if (
++        !searchDenial &&
++        decoded.ok &&
++        decoded.doc.error?.code === "SEARCH_DEFERRED"
++      ) {
++        searchDenial = {
++          code: "SEARCH_ROUNDS_EXHAUSTED",
++          message:
++            `this script issued more than ${MAX_SEARCH_ROUNDS} distinct searches; ` +
++            `search once per question rather than once per candidate, or scan the scope directly`,
++        };
++      }
+ 
+       const base = {
+         termination: run.termination,
+@@ -411,7 +502,13 @@ export function createSandboxToolHost(options: SandboxToolHostOptions) {
+         toolCalls: doc.toolCalls,
+         classifyUsd: doc.classifyUsd,
+         ...(doc.result ? { result: doc.result } : {}),
+-        ...(doc.error ? { error: doc.error } : {}),
++        // A denial the host decided outranks `SEARCH_DEFERRED`, which is an
++        // internal signal and tells the model nothing it can act on.
++        ...(searchDenial
++          ? { error: searchDenial }
++          : doc.error
++            ? { error: doc.error }
++            : {}),
+       };
+     },
+   };
+diff --git a/packages/server/src/query/search-bridge.ts b/packages/server/src/query/search-bridge.ts
+index 4ae16a5..9b31aea 100644
+--- a/packages/server/src/query/search-bridge.ts
++++ b/packages/server/src/query/search-bridge.ts
+@@ -13,9 +13,12 @@
+  * ungranted scope is not merely unreadable — the script never learns it exists.
+  */
+ 
+-import type {
+-  SearchIndex,
+-  SearchHit,
++import { readFileSync } from "node:fs";
++import {
++  MiniSearchIndex,
++  type SearchIndex,
++  type SearchHit,
++  type SearchDocument,
+ } from "@opendatalabs/personal-server-ts-core/mcp/search";
+ import type { ScriptHit } from "@opendatalabs/personal-server-ts-core/query/tools";
+ 
+@@ -25,6 +28,15 @@ export interface SearchBridgeOptions {
+   defaultLimit?: number;
+ }
+ 
++/**
++ * Ceiling on hits returned to one script call.
++ *
++ * Hits re-enter the model's context on the next turn, so an unbounded result
++ * set is an unbounded prompt. Ranked search past a few dozen hits is also not
++ * telling the script anything a scan would not tell it better.
++ */
++export const MAX_SEARCH_HITS = 25;
++
+ function toScriptHit(hit: SearchHit): ScriptHit {
+   const out: ScriptHit = {
+     id: hit.id,
+@@ -38,30 +50,148 @@ function toScriptHit(hit: SearchHit): ScriptHit {
+ }
+ 
+ /**
+- * Resolve the queries a run may issue, on the host, before the sandbox starts.
++ * Resolve one query, on the host, against the index.
++ *
++ * This is the whole host-authority operation. The confined runtime cannot call
++ * back out mid-run — phase 4b measured a per-call IPC round trip at ~11s for a
++ * 227k-row scan and rejected it — so a run that issues an unresolved query
++ * ends, the host answers here, and the script is replayed with the hits in
++ * hand (see `SEARCH_DEFERRED`).
+  *
+- * The confined runtime cannot call back out mid-run without a per-call IPC
+- * round trip, which phase 4b measured at ~11s for a 227k-row scan and rejected.
+- * Search is O(1)–O(few) per question, so the host resolves it up front and
+- * passes the results in.
++ * `scopes` narrows within the grant and can never widen past it: the index is
++ * asked for the intersection, and the hits are filtered again on the way out.
++ */
++export function resolveSearch(
++  query: string,
++  options: SearchBridgeOptions & { scopes?: readonly string[] },
++): ScriptHit[] {
++  const granted = new Set(options.grantedScopes);
++  // The script may narrow to a subset of its grant. Anything it names outside
++  // the grant is dropped rather than honoured — `vana.search` already rejects
++  // an ungranted scope upstream, so this is defence in depth.
++  const asked = options.scopes?.filter((s) => granted.has(s));
++  const scopes = asked && asked.length > 0 ? asked : [...options.grantedScopes];
++  const limit = Math.min(
++    options.defaultLimit ?? MAX_SEARCH_HITS,
++    MAX_SEARCH_HITS,
++  );
++  const hits = options.index.search({ query, scopes, limit });
++  const allowed = new Set(scopes);
++  return hits
++    .filter((h) => allowed.has(h.scope) && granted.has(h.scope))
++    .slice(0, limit)
++    .map(toScriptHit);
++}
++
++/**
++ * Resolve several queries at once. Retained for callers that know their
++ * queries up front; `resolveSearch` is the one that does the work.
+  */
+ export function resolveSearches(
+   queries: readonly string[],
+   options: SearchBridgeOptions,
+ ): Record<string, ScriptHit[]> {
+-  const granted = new Set(options.grantedScopes);
+   const out: Record<string, ScriptHit[]> = {};
+-  for (const query of queries) {
+-    const hits = options.index.search({
+-      query,
+-      scopes: options.grantedScopes,
+-      ...(options.defaultLimit === undefined
+-        ? {}
+-        : { limit: options.defaultLimit }),
+-    });
+-    // Defence in depth: the index is asked for granted scopes only, and the
+-    // result is filtered again on the way out.
+-    out[query] = hits.filter((h) => granted.has(h.scope)).map(toScriptHit);
+-  }
++  for (const query of queries) out[query] = resolveSearch(query, options);
+   return out;
+ }
++
++/** One granted scope and the JSON file backing it. */
++export interface IndexableScope {
++  scope: string;
++  path: string;
++}
++
++/**
++ * Longest text a single record contributes to the index.
++ *
++ * A record is one document, so a pathological row would otherwise dominate
++ * every score it appears in.
++ */
++const MAX_RECORD_TEXT_CHARS = 20_000;
++const PREVIEW_CHARS = 240;
++
++/**
++ * Flatten one record to the text worth matching on.
++ *
++ * Keys are included as well as values: a field name is often the only place a
++ * concept is named, and a search that cannot see field names cannot find a
++ * record by what the record is about.
++ */
++function recordText(value: unknown, depth = 0): string {
++  if (value === null || value === undefined) return "";
++  if (typeof value === "string") return value;
++  if (typeof value === "number" || typeof value === "boolean") {
++    return String(value);
++  }
++  if (depth > 6) return "";
++  if (Array.isArray(value)) {
++    return value.map((v) => recordText(v, depth + 1)).join(" ");
++  }
++  if (typeof value === "object") {
++    return Object.entries(value as Record<string, unknown>)
++      .map(([k, v]) => `${k} ${recordText(v, depth + 1)}`)
++      .join(" ");
++  }
++  return "";
++}
++
++/**
++ * Build the host's search index over the granted scope files.
++ *
++ * **Not a second index.** Plan §5 names building a parallel index as "PR
++ * #231's mistake", so this constructs documents and hands them to the repo's
++ * existing `MiniSearchIndex` — the same thing `mcp/tools.ts` does per block
++ * page, at the scale of a request rather than a page. Nothing is persisted:
++ * the index lives as long as the process that built it, and no embedding, no
++ * vector store and no derivative is created. Plan §6's "embeddings are out of
++ * v1" is untouched by this.
++ *
++ * One record is one document, so a hit identifies a record the script can go
++ * and read. That is deliberately *not* the same thing as a scanned record —
++ * `vana.search` records a `prefiltered()` pass, never a full one, so hits
++ * never enter `coverage.recordsScanned`.
++ */
++export function buildScopeIndex(
++  scopes: readonly IndexableScope[],
++): SearchIndex {
++  const documents: SearchDocument[] = [];
++  /**
++   * Ordinal per scope, continuing across that scope's files.
++   *
++   * A scope can be backed by several files — `spotify.streaming` is three —
++   * and numbering each file from zero collides on `scope#0`, which MiniSearch
++   * rejects outright with `duplicate ID`. That throw happens on the first
++   * search of the run rather than at startup, so it would have surfaced as
++   * every search failing rather than as a build error.
++   */
++  const nextOrdinal = new Map<string, number>();
++  for (const { scope, path } of scopes) {
++    let parsed: unknown;
++    try {
++      parsed = JSON.parse(readFileSync(path, "utf8"));
++    } catch {
++      // An unreadable scope is simply not searchable. It is still readable by
++      // a direct scan, which reports its own `unreadable` count — inventing
++      // an index entry here would be worse than omitting one.
++      continue;
++    }
++    const items = Array.isArray(parsed) ? parsed : [parsed];
++    let n = nextOrdinal.get(scope) ?? 0;
++    for (const item of items) {
++      const text = recordText(item).slice(0, MAX_RECORD_TEXT_CHARS);
++      const id = `${scope}#${n}`;
++      n += 1;
++      if (text.trim().length === 0) continue;
++      documents.push({
++        id,
++        scope,
++        text,
++        preview: text.slice(0, PREVIEW_CHARS),
++        blockRef: id,
++      });
++    }
++    nextOrdinal.set(scope, n);
++  }
++  return MiniSearchIndex.build(documents);
++}
+diff --git a/scripts/query-eval-harness.ts b/scripts/query-eval-harness.ts
+index df6bf5e..9e49606 100644
+--- a/scripts/query-eval-harness.ts
++++ b/scripts/query-eval-harness.ts
+@@ -27,6 +27,10 @@ import {
+ } from "../packages/core/src/derivatives/inference.js";
+ import { createNodeSandbox } from "../packages/server/src/query/node-sandbox.js";
+ import { createSandboxToolHost } from "../packages/server/src/query/sandbox-tool-host.js";
++import {
++  buildScopeIndex,
++  resolveSearch,
++} from "../packages/server/src/query/search-bridge.js";
+ 
+ /**
+  * An `EvalAnswerer` that also reports the scripts the last request ran.
+@@ -178,6 +182,20 @@ export async function buildAgentAnswerer(
+     return corpusScopes.filter((s) => granted.has(s.scope));
+   };
+ 
++  /**
++   * The host's search index, built once for the corpus and shared.
++   *
++   * Built lazily so a run that never searches never pays for it, and once
++   * rather than per request because the index is a property of the corpus,
++   * not of a grant — `resolveSearch` is what confines hits to the grant, and
++   * it filters twice. Nothing is persisted: this lives as long as the process.
++   */
++  let corpusIndex: ReturnType<typeof buildScopeIndex> | undefined;
++  const indexOnce = () =>
++    (corpusIndex ??= buildScopeIndex(
++      corpusScopes.map((s) => ({ scope: s.scope, path: s.path })),
++    ));
++
+   // Scripted per question. Q1 is scripted for real — it drives the whole
+   // nested path and lands on the §18.2 nap trap, so a pass here means the
+   // interpreter, the sandbox and host-authored coverage all did their jobs.
+@@ -265,6 +283,16 @@ vana.result({
+           wallClockMs: 60_000,
+           maxOutputBytes: 1_000_000,
+         },
++        // Host authority, resolved between runs. Scoped to THIS request's
++        // grant, so a hit in a scope the question was not granted is not
++        // merely unreadable — the script never learns it exists.
++        resolveSearch: (query, scopes, limit) =>
++          resolveSearch(query, {
++            index: indexOnce(),
++            grantedScopes: request.grantedScopes,
++            scopes,
++            ...(limit === undefined ? {} : { defaultLimit: limit }),
++          }),
+       });
+       const ran: string[] = [];
+       executed = ran;
