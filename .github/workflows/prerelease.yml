@@ -16,6 +16,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The canary version is derived from the newest v-tag, and the
+          # default shallow clone fetches none, so `git describe` silently
+          # falls back and every canary publishes as 0.0.1.
+          fetch-tags: true
+          fetch-depth: 0
       - uses: actions/setup-node@v6
         with:
           node-version: 22
