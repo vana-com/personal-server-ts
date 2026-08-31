@@ -14,6 +14,7 @@ import { isWriteScopeEntry } from "../policy/data-write.js";
 import { scopeCoveredByGrant } from "@opendatalabs/vana-sdk/browser";
 import type {
   QuestionMode,
+  QuestionRecompute,
   QuestionRegisteredBy,
   QuestionRegistration,
   QuestionStore,
@@ -34,6 +35,7 @@ export interface ParsedQuestionInput {
   question: string;
   model: string | null;
   mode: QuestionMode;
+  recompute: QuestionRecompute;
 }
 
 /** Accepted `mode` values, in the order they are echoed in a 400. */
@@ -144,8 +146,27 @@ export function parseQuestionInput(body: unknown): ParsedQuestionInput {
     }
     mode = body.mode as QuestionMode;
   }
+  // Absent (or null, like model) keeps the original follow-every-change
+  // behavior, so existing builder clients register exactly as before.
+  let recompute: QuestionRecompute = "on-change";
+  if (body.recompute !== undefined && body.recompute !== null) {
+    if (body.recompute !== "snapshot" && body.recompute !== "on-change") {
+      throw new DerivativeQuestionInvalidError(
+        'recompute must be "snapshot" or "on-change"',
+        { field: "recompute" },
+      );
+    }
+    recompute = body.recompute;
+  }
   assertDerivedScopeNaming(derivedScope, sourceScopes);
-  return { derivedScope, sourceScopes, question: body.question, model, mode };
+  return {
+    derivedScope,
+    sourceScopes,
+    question: body.question,
+    model,
+    mode,
+    recompute,
+  };
 }
 
 /**
@@ -224,6 +245,7 @@ export async function createQuestionRegistration(
     question: parsed.question,
     model: parsed.model,
     mode: parsed.mode,
+    recompute: parsed.recompute,
     registeredBy: input.registeredBy,
     status: "pending",
     error: null,

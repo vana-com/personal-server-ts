@@ -654,6 +654,11 @@ export async function createServer(
     },
     devToken,
     startBackgroundServices: async () => {
+      // Replay questions a previous run left pending or stale: nothing
+      // else reschedules them after a restart (registration and source
+      // changes only cover new activity).
+      derivativeScheduler.start();
+
       // --- Gateway registration check (slow: HTTP call) ---
       if (serverAccount && identity) {
         try {

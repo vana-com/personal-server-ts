@@ -13,6 +13,7 @@ function registration(
     question: "How did I sleep?",
     model: null,
     mode: "completion",
+    recompute: "on-change",
     registeredBy: {
       kind: "builder",
       builder: "0x2222222222222222222222222222222222222222",
@@ -92,6 +93,57 @@ describe("createSqliteQuestionStore", () => {
     const store = createSqliteQuestionStore(initializeDatabase(":memory:"));
     await store.insert(registration());
     await expect(store.insert(registration())).rejects.toThrow();
+  });
+
+  it("round-trips the recompute policy", async () => {
+    const store = createSqliteQuestionStore(initializeDatabase(":memory:"));
+    await store.insert(registration({ recompute: "snapshot" }));
+    expect((await store.get("q-1"))!.recompute).toBe("snapshot");
+  });
+
+  it("migrates a table created before the recompute column existed", async () => {
+    const db = initializeDatabase(":memory:");
+    // The pre-recompute schema, verbatim, with one row already in it.
+    db.exec(`
+      CREATE TABLE derivative_questions (
+        question_id TEXT PRIMARY KEY,
+        derived_scope TEXT NOT NULL,
+        source_scopes TEXT NOT NULL,
+        question TEXT NOT NULL,
+        model TEXT,
+        registered_by TEXT NOT NULL,
+        status TEXT NOT NULL,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_computed_at TEXT,
+        derived_version INTEGER,
+        derived_collected_at TEXT
+      )`);
+    db.prepare(
+      `INSERT INTO derivative_questions (
+        question_id, derived_scope, source_scopes, question, registered_by,
+        status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "q-old",
+      "coach.weekly",
+      JSON.stringify(["oura.sleep"]),
+      "q",
+      JSON.stringify({ kind: "owner" }),
+      "ready",
+      "2026-08-27T00:00:00.000Z",
+      "2026-08-27T00:00:00.000Z",
+    );
+
+    const store = createSqliteQuestionStore(db);
+    expect((await store.get("q-old"))!.recompute).toBe("on-change");
+    // New rows land in the migrated table with their own policy.
+    await store.insert(
+      registration({ questionId: "q-new", recompute: "snapshot" }),
+    );
+    expect((await store.get("q-new"))!.recompute).toBe("snapshot");
+    db.close();
   });
 });
 

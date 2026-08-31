@@ -11,6 +11,8 @@ import { tmpdir } from "node:os";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createServer } from "./bootstrap.js";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
+import { initializeDatabase } from "./storage/index-schema.js";
+import { createSqliteQuestionStore } from "./storage/question-store.js";
 
 function makeDefaultConfig() {
   return ServerConfigSchema.parse({ tunnel: { enabled: false } });
@@ -330,6 +332,47 @@ describe("createServer", () => {
     expect(state.version).toBe(1);
     expect(cursor.lastProcessedTimestamp).toBe("2026-01-21T10:00:00.000Z");
 
+    await ctx.cleanup();
+  });
+
+  it("reschedules derivative questions left pending by a previous run", async () => {
+    const rootPath = join(tempDir, "recompute-root");
+    await mkdir(rootPath, { recursive: true });
+    const seedDb = initializeDatabase(join(rootPath, "index.db"));
+    await createSqliteQuestionStore(seedDb).insert({
+      questionId: "q-boot",
+      derivedScope: "coach.weekly",
+      sourceScopes: ["oura.sleep"],
+      question: "q",
+      model: null,
+      mode: "completion",
+      recompute: "on-change",
+      registeredBy: { kind: "owner" },
+      status: "pending",
+      error: null,
+      createdAt: "2026-08-27T00:00:00.000Z",
+      updatedAt: "2026-08-27T00:00:00.000Z",
+      lastComputedAt: null,
+      derivedVersion: null,
+      derivedCollectedAt: null,
+    });
+    seedDb.close();
+
+    const ctx = await createServer(makeDefaultConfig(), { rootPath });
+    await ctx.startBackgroundServices();
+
+    // The source scope holds no data, so the compute fails fast; what
+    // matters here is that boot rescheduled the question at all (before
+    // the fix it stayed pending forever).
+    const readBack = createSqliteQuestionStore(
+      initializeDatabase(join(rootPath, "index.db")),
+    );
+    let status = "pending";
+    for (let i = 0; i < 100 && status === "pending"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      status = (await readBack.get("q-boot"))!.status;
+    }
+    expect(status).toBe("failed");
     await ctx.cleanup();
   });
 

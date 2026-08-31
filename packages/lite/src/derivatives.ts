@@ -30,9 +30,16 @@ import type { PsLiteStateStore } from "./state.js";
 
 const QUESTIONS_KEY = "derivative-questions-v1";
 
+/** What older builds persisted: neither `mode` nor `recompute` existed yet. */
+type PersistedQuestionRegistration = Omit<
+  QuestionRegistration,
+  "mode" | "recompute"
+> &
+  Partial<Pick<QuestionRegistration, "mode" | "recompute">>;
+
 interface PsLiteQuestionsState {
   version: 1;
-  questions: QuestionRegistration[];
+  questions: PersistedQuestionRegistration[];
 }
 
 /** A question store persisted as one JSON value in the PS-Lite state store. */
@@ -40,17 +47,19 @@ export async function createPsLiteQuestionStore(
   stateStore: PsLiteStateStore,
 ): Promise<QuestionStore> {
   const saved = await stateStore.get<PsLiteQuestionsState>(QUESTIONS_KEY);
-  // The state store holds plain JSON, so rows written before `mode` existed
-  // come back without it. There is no schema migration here the way there is
-  // in sqlite — rehydration is the migration, and a row that arrives without
-  // a recognised mode takes `completion`, the behaviour it was registered
-  // under. Without this the field is `undefined` and every later read of it
-  // is silently wrong.
+  // The state store holds plain JSON, so rows written before `mode` or
+  // `recompute` existed come back without them. There is no schema migration
+  // here the way there is in sqlite — rehydration is the migration, and a row
+  // that arrives without a recognised mode takes `completion`, the behaviour
+  // it was registered under; one without a recompute policy keeps the old
+  // follow-every-change behavior. Without this the fields are `undefined` and
+  // every later read of them is silently wrong.
   const initial = (saved?.version === 1 ? saved.questions : []).map(
     (question) => ({
       ...question,
       mode:
         question.mode === "code" ? ("code" as const) : ("completion" as const),
+      recompute: question.recompute ?? ("on-change" as const),
     }),
   );
   return createInMemoryQuestionStore({

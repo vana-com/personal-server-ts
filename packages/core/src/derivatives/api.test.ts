@@ -144,12 +144,33 @@ describe("handlePersonalServerDerivativesRequest", () => {
       derivedScope: "coach.weekly",
       sourceScopes: ["oura.sleep"],
       status: "pending",
+      recompute: "on-change",
       registeredBy: { kind: "owner" },
     });
     expect(await store.get("q-1")).not.toBeNull();
     expect(scheduler.requestRecompute).toHaveBeenCalledWith("q-1", {
       immediate: true,
     });
+  });
+
+  it("stores an explicit recompute policy and rejects an unknown one", async () => {
+    const { deps, store } = createDeps();
+    const res = await call(deps, "POST", "/questions", {
+      token: OWNER_TOKEN,
+      body: { ...body, recompute: "snapshot" },
+    });
+    expect(res.status).toBe(201);
+    expect((await res.json()).recompute).toBe("snapshot");
+    expect((await store.get("q-1"))!.recompute).toBe("snapshot");
+
+    const invalid = await call(deps, "POST", "/questions", {
+      token: OWNER_TOKEN,
+      body: { ...body, derivedScope: "spine.summary", recompute: "weekly" },
+    });
+    expect(invalid.status).toBe(400);
+    expect((await invalid.json()).error.errorCode).toBe(
+      "DERIVATIVE_QUESTION_INVALID",
+    );
   });
 
   it("registers a question for a builder through the write auth path", async () => {
@@ -418,6 +439,7 @@ describe("handlePersonalServerDerivativesRequest", () => {
       question: "How did I sleep?",
       model: null,
       mode: "completion",
+      recompute: "on-change",
       registeredBy: { kind: "builder", builder: BUILDER, grantId: "grant-1" },
       status: "pending",
       error: null,
