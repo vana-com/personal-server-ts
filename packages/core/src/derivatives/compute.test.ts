@@ -29,6 +29,7 @@ function registration(
     sourceScopes: ["oura.sleep", "chatgpt.conversations"],
     question: "How did I sleep?",
     model: null,
+    recompute: "on-change",
     registeredBy: { kind: "owner" },
     status: "pending",
     error: null,

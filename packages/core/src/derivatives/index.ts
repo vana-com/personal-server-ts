@@ -1,5 +1,6 @@
 export {
   questionRegistrationView,
+  type QuestionRecompute,
   type QuestionRegisteredBy,
   type QuestionRegistration,
   type QuestionRegistrationPatch,

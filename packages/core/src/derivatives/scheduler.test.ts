@@ -13,6 +13,7 @@ function registration(
     sourceScopes: ["oura.sleep"],
     question: "q",
     model: null,
+    recompute: "on-change",
     registeredBy: { kind: "owner" },
     status: "ready",
     error: null,
@@ -102,6 +103,42 @@ describe("createRecomputeScheduler", () => {
     ]);
   });
 
+  it("markSourceChanged skips snapshot questions; an explicit recompute still runs them", async () => {
+    const store = createInMemoryQuestionStore({
+      initial: [
+        registration({ questionId: "q-snap", recompute: "snapshot" }),
+        registration({ questionId: "q-live", recompute: "on-change" }),
+      ],
+    });
+    const timers = manualTimers();
+    const compute = vi.fn(async () => undefined);
+    const scheduler = createRecomputeScheduler({
+      store,
+      compute,
+      debounceMs: 0,
+      timers: timers.api,
+    });
+
+    scheduler.markSourceChanged("oura.sleep");
+    await scheduler.whenIdle();
+    expect((await store.get("q-snap"))!.status).toBe("ready");
+    expect((await store.get("q-live"))!.status).toBe("stale");
+    timers.fireAll();
+    await scheduler.whenIdle();
+    expect(compute.mock.calls.map((call) => call[0])).toEqual(["q-live"]);
+
+    // POST /questions/:id/recompute goes through requestRecompute, which
+    // ignores the policy: the owner (or builder) asked for this run.
+    scheduler.requestRecompute("q-snap", { immediate: true });
+    await scheduler.whenIdle();
+    timers.fireAll();
+    await scheduler.whenIdle();
+    expect(compute.mock.calls.map((call) => call[0])).toEqual([
+      "q-live",
+      "q-snap",
+    ]);
+  });
+
   it("runs one compute per question at a time and reruns once after a change during the run", async () => {
     const store = createInMemoryQuestionStore({ initial: [registration()] });
     const timers = manualTimers();
@@ -180,6 +217,39 @@ describe("createRecomputeScheduler", () => {
     timers.fireAll();
     await scheduler.whenIdle();
     expect(compute.mock.calls.map((call) => call[0])).toEqual(["q-2"]);
+  });
+
+  it("the first start() reschedules questions a previous process left pending or stale", async () => {
+    const store = createInMemoryQuestionStore({
+      initial: [
+        registration({ questionId: "q-ready", status: "ready" }),
+        registration({ questionId: "q-pending", status: "pending" }),
+        registration({ questionId: "q-stale", status: "stale" }),
+      ],
+    });
+    const timers = manualTimers();
+    const compute = vi.fn(async () => undefined);
+    const scheduler = createRecomputeScheduler({
+      store,
+      compute,
+      debounceMs: 0,
+      timers: timers.api,
+    });
+    // Boot: no stop() ever happened, the store simply came back populated.
+    scheduler.start();
+    await scheduler.whenIdle();
+    expect(timers.pending()).toHaveLength(2);
+    timers.fireAll();
+    await scheduler.whenIdle();
+    expect(compute.mock.calls.map((call) => call[0]).sort()).toEqual([
+      "q-pending",
+      "q-stale",
+    ]);
+    // While running, another start() must not replay anything.
+    scheduler.start();
+    await scheduler.whenIdle();
+    expect(timers.pending()).toHaveLength(0);
+    expect(compute).toHaveBeenCalledTimes(2);
   });
 
   it("start() after stop() reschedules pending and stale questions", async () => {

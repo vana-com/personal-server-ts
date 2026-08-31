@@ -531,12 +531,14 @@ in both positions (`coach.*` and `write:coach.*`).
 
 What runs where:
 
-1. the builder registers `{ derivedScope, sourceScopes, question, model? }`;
+1. the builder registers
+   `{ derivedScope, sourceScopes, question, model?, recompute? }`;
 2. the Personal Server reads the sources from LOCAL storage, trims them,
    assembles a prompt, calls the inference provider and writes the answer
    into `derivedScope` with lineage = the source data point ids;
 3. every time a source scope gets a new local version (ingest or sync) the
-   question is marked `stale` and recomputed after a quiet period;
+   question is marked `stale` and recomputed after a quiet period, unless
+   it was registered with `recompute: "snapshot"`;
 4. the builder polls the question for `ready`, then reads `derivedScope`.
 
 ### Endpoints
@@ -617,11 +619,16 @@ Registration body:
   "derivedScope": "coach.weekly",
   "sourceScopes": ["chatgpt.conversations", "oura.sleep"],
   "question": "How did my sleep relate to my mood this week?",
-  "model": "z-ai/glm-5.2"
+  "model": "z-ai/glm-5.2",
+  "recompute": "snapshot"
 }
 ```
 
-`model` is optional (the server default applies). Validation, in order:
+`model` is optional (the server default applies). `recompute` is optional
+too: `"on-change"` (the default) recomputes on every source change, while
+`"snapshot"` computes once at registration and afterwards only on an
+explicit `POST /questions/:id/recompute`; any other value is 400
+`DERIVATIVE_QUESTION_INVALID`. Validation, in order:
 scopes follow the scope grammar; 1 to 16 distinct source scopes, none equal
 to the derived scope; `question` is 1 to 8000 characters; the naming rule
 (the derived scope must not share its first segment with any source,
@@ -641,6 +648,7 @@ Registration view (POST, GET, list and recompute):
   "sourceScopes": ["chatgpt.conversations", "oura.sleep"],
   "question": "...",
   "model": null,
+  "recompute": "on-change",
   "registeredBy": { "kind": "builder", "builder": "0x...", "grantId": "0x..." },
   "status": "ready",
   "error": null,
@@ -691,7 +699,10 @@ change during a running compute makes the scheduler run once more when it
 finishes (one compute in flight per question, changes coalesce). Recompute
 after a change waits `inference.recomputeDebounceMs` (default 5000);
 `POST /recompute` (owner, or the registering builder retrying after a
-failure) runs immediately. `failed` carries a short `error` (a status code,
+failure) runs immediately. A question registered with
+`recompute: "snapshot"` never takes the source-change edge: it computes at
+registration and on `POST /recompute` only. On boot the server reschedules
+every question a previous run left `pending` or `stale`. `failed` carries a short `error` (a status code,
 a scope name, an error class); the prompt and the data are never stored in
 it.
 

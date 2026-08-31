@@ -22,12 +22,21 @@ import { createMockPsLiteGateway } from "./test-support/gateway.js";
 const OWNER = "0x1111111111111111111111111111111111111111" as const;
 const ownerHeaders = { Authorization: "Bearer owner-token" };
 
-async function setup() {
+async function setup(
+  options: { active?: boolean; seedQuestions?: QuestionRegistration[] } = {},
+) {
   const config = ServerConfigSchema.parse({
     inference: { recomputeDebounceMs: 0 },
   });
   const storage = createMemoryPsLiteStorage();
   const stateStore = createMemoryPsLiteStateStore();
+  if (options.seedQuestions) {
+    // What a previous session persisted, present before the store loads.
+    await stateStore.set("derivative-questions-v1", {
+      version: 1,
+      questions: options.seedQuestions,
+    });
+  }
   const provider = createFakeInferenceProvider();
   const store = await createPsLiteQuestionStore(stateStore);
   let runtimeRef: ReturnType<typeof createPsLiteRuntime> | null = null;
@@ -56,7 +65,7 @@ async function setup() {
     }),
     serverOwner: OWNER,
     derivatives,
-    active: true,
+    active: options.active ?? true,
   });
   runtimeRef = runtime;
   return { runtime, derivatives, provider, stateStore, storage };
@@ -131,6 +140,61 @@ describe("PS-Lite derivative compute", () => {
     expect(persisted?.questions.map((q) => q.questionId)).toEqual([questionId]);
     const reloaded = await createPsLiteQuestionStore(stateStore);
     expect((await reloaded.get(questionId))?.status).toBe("ready");
+  });
+
+  it("defaults recompute to on-change for registrations saved before the field existed", async () => {
+    const stateStore = createMemoryPsLiteStateStore();
+    const legacy = {
+      questionId: "q-legacy",
+      derivedScope: "coach.weekly",
+      sourceScopes: ["oura.sleep"],
+      question: "q",
+      model: null,
+      registeredBy: { kind: "owner" },
+      status: "ready",
+      error: null,
+      createdAt: "2026-08-27T00:00:00.000Z",
+      updatedAt: "2026-08-27T00:00:00.000Z",
+      lastComputedAt: "2026-08-27T00:00:00.000Z",
+      derivedVersion: 1,
+      derivedCollectedAt: "2026-08-27T00:00:00Z",
+    };
+    await stateStore.set("derivative-questions-v1", {
+      version: 1,
+      questions: [legacy],
+    });
+    const store = await createPsLiteQuestionStore(stateStore);
+    expect((await store.get("q-legacy"))!.recompute).toBe("on-change");
+  });
+
+  it("activate() on a fresh runtime reschedules questions a previous session left pending", async () => {
+    const { runtime, derivatives } = await setup({
+      active: false,
+      seedQuestions: [
+        {
+          questionId: "q-boot",
+          derivedScope: "coach.weekly",
+          sourceScopes: ["oura.sleep"],
+          question: "q",
+          model: null,
+          recompute: "on-change",
+          registeredBy: { kind: "owner" },
+          status: "pending",
+          error: null,
+          createdAt: "2026-08-27T00:00:00.000Z",
+          updatedAt: "2026-08-27T00:00:00.000Z",
+          lastComputedAt: null,
+          derivedVersion: null,
+          derivedCollectedAt: null,
+        },
+      ],
+    });
+    runtime.activate();
+    await derivatives.scheduler.whenIdle();
+    // The source scope holds no data, so the compute fails; what matters
+    // is that activation rescheduled the question at all (before the fix
+    // the first start() was a no-op and it stayed pending forever).
+    expect((await derivatives.store.get("q-boot"))!.status).toBe("failed");
   });
 
   it("deactivate() stops the scheduler and activate() restarts it", async () => {

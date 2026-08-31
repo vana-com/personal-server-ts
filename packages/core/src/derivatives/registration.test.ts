@@ -19,9 +19,22 @@ describe("parseQuestionInput", () => {
       sourceScopes: ["chatgpt.conversations", "oura.sleep"],
       question: valid.question,
       model: null,
+      recompute: "on-change",
     });
     expect(parseQuestionInput({ ...valid, model: "z-ai/glm-5.2" }).model).toBe(
       "z-ai/glm-5.2",
+    );
+  });
+
+  it("accepts both recompute policies and defaults a null to on-change", () => {
+    expect(
+      parseQuestionInput({ ...valid, recompute: "snapshot" }).recompute,
+    ).toBe("snapshot");
+    expect(
+      parseQuestionInput({ ...valid, recompute: "on-change" }).recompute,
+    ).toBe("on-change");
+    expect(parseQuestionInput({ ...valid, recompute: null }).recompute).toBe(
+      "on-change",
     );
   });
 
@@ -52,6 +65,8 @@ describe("parseQuestionInput", () => {
     ["question too long", { ...valid, question: "x".repeat(8_001) }],
     ["model with spaces", { ...valid, model: "gpt 4" }],
     ["model not a string", { ...valid, model: 1 }],
+    ["unknown recompute policy", { ...valid, recompute: "weekly" }],
+    ["recompute not a string", { ...valid, recompute: true }],
   ])("rejects %s with DERIVATIVE_QUESTION_INVALID", (_label, body) => {
     expect(() => parseQuestionInput(body)).toThrow(
       expect.objectContaining({ errorCode: "DERIVATIVE_QUESTION_INVALID" }),
