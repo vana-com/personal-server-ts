@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { connect } from "node:net";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type {
   SandboxResult,
@@ -140,16 +140,32 @@ beforeAll(() => {
   // directory does not exist on this machine is not evidence of anything, so
   // each one is created if absent — otherwise the assertion below would pass
   // vacuously on a clean checkout and only ever fail on a developer's laptop.
+  //
+  // Created one level at a time, deepest recorded last, rather than with
+  // `recursive: true`. `recursive` would create intermediate directories this
+  // suite could not then name in order to remove them — `/private/tmp/claude`
+  // does not exist on Linux, and a run with enough privilege would leave a
+  // stray `/private` behind on the host forever. Nothing a containment test
+  // does should litter the machine it is protecting.
   asrtDirsCreated = [];
   for (const d of ASRT_DEFAULT_WRITE_DIRS) {
     if (existsSync(d)) continue;
-    try {
-      mkdirSync(d, { recursive: true });
-      asrtDirsCreated.push(d);
-    } catch {
-      // Unwritable by the test user (a locked-down /tmp, say). The write case
-      // still asserts the host file is absent; it just cannot also prove the
-      // directory was there. Nothing else depends on it.
+    const missing: string[] = [];
+    for (let p = d; !existsSync(p) && p !== dirname(p); p = dirname(p)) {
+      missing.unshift(p);
+    }
+    for (const p of missing) {
+      try {
+        mkdirSync(p);
+        asrtDirsCreated.push(p);
+      } catch {
+        // Unwritable by the test user (a locked-down /tmp, or `/` as non-root,
+        // which is how `/private/...` fails on Linux). The write case still
+        // asserts the host file is absent; it just cannot also prove the
+        // directory was there. Stop climbing — the deeper levels cannot be
+        // created either.
+        break;
+      }
     }
   }
   asrtWriteTargets = ASRT_DEFAULT_WRITE_DIRS.map((d) =>
@@ -172,9 +188,10 @@ afterAll(() => {
   ]) {
     if (f && existsSync(f)) rmSync(f, { force: true });
   }
-  // Only the ones this suite created, and only while still empty, so a
-  // directory the machine was already using is never removed.
-  for (const d of asrtDirsCreated ?? []) {
+  // Only the ones this suite created, deepest first, and only while still
+  // empty — so a directory the machine was already using is never removed and
+  // an intermediate one we made is not left behind.
+  for (const d of [...(asrtDirsCreated ?? [])].reverse()) {
     try {
       rmdirSync(d);
     } catch {
