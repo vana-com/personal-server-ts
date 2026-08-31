@@ -1335,7 +1335,14 @@ unverified. It is now measured, on ubuntu-24.04 under bubblewrap 0.9.0 with
 `@anthropic-ai/sandbox-runtime` 0.0.74, on both architectures — x86_64 for the
 failure CI hit, arm64 (native, no emulation) for the behavioural results,
 because an emulated x86_64 kernel rejects `prctl(PR_SET_SECCOMP)` outright and
-cannot run the seccomp stage at all.
+cannot run the seccomp stage at all. The two architectures then agreed exactly:
+the arm64 container predicted 4 failed / 2090 passed / 1 skipped, and x86_64 CI
+returned 4 failed / 2090 passed / 1 skipped, from 24 failed / 2070 passed
+before. Reproducing this needs no `--privileged` container — `--security-opt`
+`seccomp=unconfined`, `apparmor=unconfined` and `systempaths=unconfined` are
+enough, and are worth preferring, since `--privileged` grants every capability
+and a writable `/proc/sys` and so hides exactly the kind of gap being looked
+for.
 
 **Nothing ran at all, and the reason was a path.** Every sandboxed run on
 Linux died before the script started, control cases included, with
@@ -1396,7 +1403,12 @@ Measured, per case:
 
 None of the four is fixable from our side: the tmpfs strategy, the mandatory
 `/proc` mount and the absence of a `bind()` filter are all ASRT's, and its
-config exposes no knob for any of them. Rewriting the assertions to accept the
+config exposes no knob for any of them. The bind case is the sharpest of the
+four, because the config _looks_ like it covers it — we already pass
+`network.allowLocalBinding: false`. Verified against the shipped 0.0.74 code:
+`allowLocalBinding` is referenced only in `macos-sandbox-utils.js`. The Linux
+path never reads it, so the option is silently macOS-only and the setting is
+inert on Linux. Rewriting the assertions to accept the
 Linux shape is the other option, and it is deliberately **not** taken here —
 the four tests encode the macOS mechanism, and a human should decide whether
 the contract is the mechanism or the outcome before anyone edits them. Until
