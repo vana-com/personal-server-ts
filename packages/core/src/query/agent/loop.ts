@@ -25,7 +25,12 @@ import {
   type InferenceProvider,
 } from "../../derivatives/inference.js";
 import { buildSystemPrompt } from "./prompt.js";
-import { parseTurn, repairMessage, type ParseFailure } from "./contract.js";
+import {
+  parseTurn,
+  repairMessage,
+  RUN_TAG,
+  type ParseFailure,
+} from "./contract.js";
 import type { QueryToolHost } from "./tool-host.js";
 import {
   DEFAULT_OUTPUT_TAIL_BYTES,
@@ -194,6 +199,9 @@ function honestAnswerText(answer: string, coverage: QueryCoverage): string {
         sandboxUnavailable: "no sandbox was available to run the script",
         contractViolation:
           "the model could not produce a valid script in the allowed attempts",
+        ungroundedAnswer:
+          "the model kept answering without running a script that read any " +
+          "of your data",
         malformedToolCall:
           "the model's replies kept arriving empty because the provider " +
           "discarded a tool call it could not parse",
@@ -231,6 +239,29 @@ function honestAnswerText(answer: string, coverage: QueryCoverage): string {
 
   return `${answer}\n\n${detail.trim()}${scanned}`;
 }
+
+/**
+ * Sent back when the model commits to an answer that no read stands behind.
+ *
+ * Names the host's counter rather than scolding in the abstract: the model
+ * cannot see `recordsScanned`, so it can only correct course if it is told what
+ * the host observed. Kept short for the same reason as `repairMessage` — it is
+ * appended to a transcript already close to the relay's body cap.
+ */
+const UNGROUNDED_ANSWER_MESSAGE = [
+  "That answer is not backed by anything: the host counted 0 records read for " +
+    "this question, so no script of yours has read the data yet.",
+  "",
+  "Do not answer from prior knowledge or from the scope list alone. Reply " +
+    "again with a run block that reads what you need:",
+  "",
+  "```" + RUN_TAG,
+  "// JavaScript that actually reads the data",
+  "```",
+  "",
+  "then answer from what it returns. If the data cannot answer the question, " +
+    "read it first and say so from what you found.",
+].join("\n");
 
 /**
  * One model turn, re-asked when the reply carries no content.
@@ -374,6 +405,24 @@ export async function runQueryLoop(
   let outputTokens = 0;
   let lastScript: string | undefined;
   let repairsUsed = 0;
+  /**
+   * Answers rejected for having no read behind them. Pushed back once, then
+   * the question fails — the same shape, and the same reasoning, as
+   * `repairsUsed`.
+   */
+  let ungroundedAnswers = 0;
+  /**
+   * Did a script fail or get refused, rather than quietly reading nothing?
+   *
+   * An answer normally has to rest on records the host counted. A refusal is
+   * the exception, and a deliberate one: `tools/api.ts`'s `requireGranted`
+   * THROWS on an ungranted scope precisely so a script cannot read the denial
+   * as "there is nothing there", and the honest answer to "how much did I
+   * spend" over an ungranted scope is that denial — which by construction
+   * scanned zero records. Only a run that completed cleanly and read nothing
+   * leaves the model with nothing whatsoever to answer from.
+   */
+  let sawRunFailure = false;
   let emptyReplies = 0;
   /**
    * How many of those empty replies were a discarded tool call.
@@ -489,6 +538,37 @@ export async function runQueryLoop(
     }
 
     if (parsed.kind === "answer") {
+      // An answer has to be BACKED. The host's record counter is the only
+      // trustworthy witness that anything was read — only a confined run can
+      // move it — so it covers both "no script ran at all" and "a script ran
+      // and read nothing". This is the PS-Lite benchmark's single miss: the
+      // model answered over `recordsScanned: 0`, and the loop took it, so a
+      // confabulation arrived wearing the shape of a finding.
+      //
+      // `sawRunFailure` is the one exemption, and not a loophole: a refused
+      // or failed run is itself the host-authored finding an absence answer
+      // rests on. See its declaration.
+      //
+      // Deliberately not merged into `coverage.complete`: an incomplete
+      // answer is still an answer, whereas this one has nothing behind it.
+      if (!sawRunFailure && (tools.coverage()?.recordsScanned ?? 0) === 0) {
+        // Pushed back once, then the question fails outright — the same shape
+        // as the contract repair above, and for the same reason: a model that
+        // answers ungrounded twice is not going to become grounded on a third
+        // ask, and spending the rest of the turn budget on it only burns
+        // relay calls.
+        if (ungroundedAnswers >= 1) {
+          stoppedBecause = "ungroundedAnswer";
+          finalAnswer =
+            "I could not answer this question from your data. The model " +
+            "committed to an answer without any script having read a single " +
+            "record, twice, so there was nothing behind it.";
+          break;
+        }
+        ungroundedAnswers += 1;
+        messages.push({ role: "user", content: UNGROUNDED_ANSWER_MESSAGE });
+        continue;
+      }
       finalAnswer = parsed.answer;
       finalCitations = parsed.citations;
       // An explicit value beats prose extraction, and beats a value left over
@@ -516,6 +596,10 @@ export async function runQueryLoop(
       lastRunTermination = mapped;
       violations.push(`script run ${scriptRuns} ended: ${result.termination}`);
     }
+    // `error` maps to no `stoppedBecause`, so `mapped` misses exactly the
+    // refusal case this has to catch — a thrown `SCOPE_NOT_GRANTED` is a
+    // script error, not a termination reason.
+    if (mapped || result.error) sawRunFailure = true;
 
     if (result.result?.value !== undefined) resultValue = result.result.value;
     if (result.result?.resolution !== undefined) {

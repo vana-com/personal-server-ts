@@ -49,6 +49,16 @@ export type QueryStoppedBecause =
    * has to be distinguishable from one that crashed. See `agent/loop.ts`.
    */
   | "malformedToolCall"
+  /**
+   * The model committed to an answer that no read stands behind — it answered
+   * over `recordsScanned: 0`.
+   *
+   * Its own reason rather than `contractViolation` because the reply was
+   * perfectly well formed; what was missing was the data. A run that stopped
+   * this way produced prose, not a finding, and a caller has to be able to
+   * tell the two apart. See `agent/loop.ts`.
+   */
+  | "ungroundedAnswer"
   | "error";
 
 export interface QueryCoverage {
