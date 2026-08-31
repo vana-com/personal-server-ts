@@ -345,7 +345,6 @@ describe("createServer", () => {
       sourceScopes: ["oura.sleep"],
       question: "q",
       model: null,
-      mode: "completion",
       recompute: "on-change",
       registeredBy: { kind: "owner" },
       status: "pending",

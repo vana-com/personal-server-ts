@@ -30,12 +30,14 @@ import type { PsLiteStateStore } from "./state.js";
 
 const QUESTIONS_KEY = "derivative-questions-v1";
 
-/** What older builds persisted: neither `mode` nor `recompute` existed yet. */
-type PersistedQuestionRegistration = Omit<
-  QuestionRegistration,
-  "mode" | "recompute"
-> &
-  Partial<Pick<QuestionRegistration, "mode" | "recompute">>;
+/**
+ * What older builds persisted. `recompute` did not exist yet; a build in
+ * between also wrote a `mode`, a field registration no longer has. Both shapes
+ * must still load, so `recompute` is optional and any other key a past build
+ * left behind is simply carried along untouched.
+ */
+type PersistedQuestionRegistration = Omit<QuestionRegistration, "recompute"> &
+  Partial<Pick<QuestionRegistration, "recompute">>;
 
 interface PsLiteQuestionsState {
   version: 1;
@@ -47,18 +49,18 @@ export async function createPsLiteQuestionStore(
   stateStore: PsLiteStateStore,
 ): Promise<QuestionStore> {
   const saved = await stateStore.get<PsLiteQuestionsState>(QUESTIONS_KEY);
-  // The state store holds plain JSON, so rows written before `mode` or
-  // `recompute` existed come back without them. There is no schema migration
-  // here the way there is in sqlite — rehydration is the migration, and a row
-  // that arrives without a recognised mode takes `completion`, the behaviour
-  // it was registered under; one without a recompute policy keeps the old
-  // follow-every-change behavior. Without this the fields are `undefined` and
-  // every later read of them is silently wrong.
+  // The state store holds plain JSON, so rows written before `recompute`
+  // existed come back without it. There is no schema migration here the way
+  // there is in sqlite — rehydration is the migration, and a row without a
+  // recompute policy keeps the old follow-every-change behavior. Without this
+  // the field is `undefined` and every later read of it is silently wrong.
+  // A row written by the build that had a `mode` keeps that key: it is dead
+  // weight, nothing reads it, and dropping it would rewrite stored records
+  // for no gain. `questionRegistrationView` picks fields explicitly, so it
+  // never reaches a response.
   const initial = (saved?.version === 1 ? saved.questions : []).map(
     (question) => ({
       ...question,
-      mode:
-        question.mode === "code" ? ("code" as const) : ("completion" as const),
       recompute: question.recompute ?? ("on-change" as const),
     }),
   );

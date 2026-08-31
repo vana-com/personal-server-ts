@@ -438,7 +438,6 @@ describe("handlePersonalServerDerivativesRequest", () => {
       sourceScopes: ["oura.sleep"],
       question: "How did I sleep?",
       model: null,
-      mode: "completion",
       recompute: "on-change",
       registeredBy: { kind: "builder", builder: BUILDER, grantId: "grant-1" },
       status: "pending",
