@@ -71,6 +71,14 @@ export {
   type QuestionComputeDeps,
 } from "./compute.js";
 export {
+  QueryRecordMappingError,
+  buildQueryAnswerRecord,
+  queryAnswerRecordKeys,
+  type BuildQueryAnswerRecordInput,
+  type QueryAnswerRecordBuild,
+  type QueryRecordSource,
+} from "./query-record.js";
+export {
   createRecomputeScheduler,
   type RecomputeScheduler,
   type RecomputeSchedulerOptions,
