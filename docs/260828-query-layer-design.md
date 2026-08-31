@@ -1372,48 +1372,75 @@ claiming it.
 | `RLIMIT_NPROC` | Spelled `ulimit -u`, which is bash. Ubuntu's `/bin/sh` is **dash**, whose `ulimit` has no `-u` at all and spells this limit `-p`. The process cap was therefore absent on every Linux run; a 400-process fork bomb under `maxProcesses: 24` printed "Illegal option -u" and ran until the _memory_ watchdog stopped it.                | `-u` with a `-p` fallback. Verified to set `Max processes` on dash, on Linux bash and on macOS `/bin/sh`.                                                                        |
 | `RLIMIT_CPU`   | `ulimit -t N` sets soft _and_ hard to N. Linux then raises SIGXCPU and escalates to SIGKILL in the same instant, so the budget fired on time (within 21ms of `cpuMs`) but surfaced as a bare exit 137 indistinguishable from any other kill, and was classified `error`. macOS delivered SIGXCPU cleanly, which is why it went unseen. | Hard limit one second above the soft one, so SIGXCPU lands first (exit 152) with the hard limit as the backstop.                                                                 |
 
-**Four hostile-script assertions still fail on Linux, and they are left
-failing.** All four are the same mechanism, and in none of them does anything
-escape. Linux confines by _namespace_ — a read-denied directory becomes an
-empty private tmpfs — where macOS confines by _permission check_. So the
-operation succeeds against nothing rather than returning an error, and an
-assertion written against the macOS shape reads that success as a breach.
-Measured, per case:
+**Four hostile-script assertions encoded the macOS mechanism, and are now
+rewritten to assert the outcome.** All four were the same thing, and in none
+of them did anything escape. Linux confines by _namespace_ — a read-denied
+directory becomes an empty private tmpfs — where macOS confines by
+_permission check_. So the operation succeeds against nothing rather than
+returning an error, and an assertion written against the macOS shape read that
+success as a breach. Measured, per case, and what each now asserts:
 
-- **Home directory readable.** `readdir` succeeds and returns
-  `[".npm", "work"]` against a host home of
-  `[".bash_logout", ".bashrc", ".cache", ".npm", ".profile", "work"]`. Both
-  entries are sandbox scaffolding. A canary planted in the real `~/.npm` reads
-  back `ENOENT` inside the sandbox. No host home content is reachable.
-- **Writes outside the scratch dir.** The write succeeds and reads back inside
-  the run; the host file never appears (`existsSync` is false on the host for
-  both the granted-root target and a `~/.npm` target). The write lands in the
-  tmpfs and is discarded. Every read-denied directory is writable this way,
-  because a tmpfs is writable by nature and ASRT's `denyWrite` cannot make one
-  read-only.
-- **`/proc` readable.** `bwrap` mounts a fresh procfs the sandbox cannot work
-  without. It holds two PIDs — `apply-seccomp` as PID 1 of the nested PID
-  namespace, and the script — and `/proc/self/environ` is the run's own
-  environment, which `minimalEnv` has already scrubbed of host variables (the
-  canary test passes). No host process or host environment is visible.
-- **Listening socket binds.** The bind succeeds on `127.0.0.1` and on
-  `0.0.0.0` inside a network namespace unshared from the host, which nothing
-  outside can reach. Egress stays denied — TCP, UDP, DNS, HTTPS, IPv6 and
-  UNIX-socket cases all pass.
+| Case                  | Linux behaviour                                                                                | Property now asserted                                                                                                                                                                           |
+| --------------------- | ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Home directory        | `readdir` returns `[".npm", "work"]` — sandbox scaffolding, against a host home of six entries | A canary planted in the real host home is unreadable from inside, and its name never appears in any listing the run obtains. An entry count can coincide; a unique string cannot.               |
+| Write outside scratch | The write succeeds into the tmpfs, reads back inside the run, and is discarded                 | Neither host target exists on the host afterwards. Whether the call threw is the mechanism; whether the byte landed is the guarantee.                                                           |
+| `/proc`               | A fresh namespace-private procfs holding two PIDs, `environ` already scrubbed by `minimalEnv`  | The host's own PID is absent from the process table the run can see, and no host environment variable name appears anywhere in it. Not a PID count — the specific thing that must not be there. |
+| Listening socket      | Binds inside an unshared netns nothing can reach                                               | While the run holds a listener open on `0.0.0.0`, the host cannot connect and read the run's payload back. Unreachability, not bind failure.                                                    |
 
-None of the four is fixable from our side: the tmpfs strategy, the mandatory
-`/proc` mount and the absence of a `bind()` filter are all ASRT's, and its
-config exposes no knob for any of them. The bind case is the sharpest of the
-four, because the config _looks_ like it covers it — we already pass
-`network.allowLocalBinding: false`. Verified against the shipped 0.0.74 code:
-`allowLocalBinding` is referenced only in `macos-sandbox-utils.js`. The Linux
-path never reads it, so the option is silently macOS-only and the setting is
-inert on Linux. Rewriting the assertions to accept the
-Linux shape is the other option, and it is deliberately **not** taken here —
-the four tests encode the macOS mechanism, and a human should decide whether
-the contract is the mechanism or the outcome before anyone edits them. Until
-then `SandboxEnforcement` carries the difference in its notes on Linux, so a
-consumer reading the enforcement report is told rather than surprised.
+Each is kept honest by a positive-evidence assertion — the run must show it
+reached the operation — so a run that dies early fails rather than passing
+vacuously, and by a `process.platform === "darwin"` clause that still pins the
+Seatbelt errno where that is worth pinning. **Each was verified to go red when
+the corresponding containment is actually removed**, on ubuntu-24.04/arm64,
+by patching the sandbox in a scratch copy: dropping the home directory from
+`denyRead` makes the canary readable; binding the host targets read-write
+makes both writes land; removing _both_ PID-namespace layers and binding the
+host procfs puts the host's own PID in the table (418 entries, against 2);
+and stripping `--unshare-net` lets the host read the listener's payload. A
+test that cannot be made to fail is not a test.
+
+One qualification, recorded rather than smoothed over: the `/proc` case's
+_environment_ half could not be independently falsified. `--unshare-user` is
+still in force under every break that leaves the sandbox able to run, and it
+blocks `/proc/<pid>/environ` across the user namespace regardless of the PID
+namespace. The process-table half is the load-bearing assertion; the
+environment half is a second net that would catch a leak of a shape these
+breaks cannot produce.
+
+**Found while doing this: ASRT's default write paths are a real escape, on
+both platforms.** `getDefaultWritePaths()` in `sandbox-utils.js` unconditionally
+unions `~/.npm/_logs`, `~/.claude/debug`, `/tmp/claude` and
+`/private/tmp/claude` into the writable set — `allowOnly: [...getDefaultWritePaths(), ...userAllowWrite]`
+— and ASRT's own source carries the warning that these "are intentionally
+broad for compatibility but may allow access to files from other processes."
+Nothing in our config asked for them. Measured, with the suite's ordinary
+config:
+
+- **macOS**: a sandboxed script wrote `~/.npm/_logs/PROBE-ESCAPE.txt` and the
+  file appeared on the host with the script's content. Reading it back, and
+  listing the directory, were denied (`EPERM`) — a write-only escape.
+- **Linux**: the same write landed on the host, _and_ the directory's real
+  contents were readable, including a host-planted canary file. A read-write
+  escape.
+
+This is not the namespace-vs-permission difference above; it is a hole in the
+property the write and home cases assert, and it exists on `main` today. The
+write half is closable from our side — ASRT maps `filesystem.denyWrite` to
+`denyWithinAllow`, so naming those four paths there is refused as `EPERM` on
+macOS and `EROFS` on Linux; verified, with the full hostile suite still green
+on both platforms afterwards. The read half is **not** closable at 0.0.74:
+the path stays bind-mounted for the write allowance, so `denyWrite` makes it
+read-only rather than absent, and the host's log contents remain readable on
+Linux. `/tmp/claude` additionally deserves thought before being denied — ASRT
+sets `TMPDIR` to it for the sandboxed process, and `minimalEnv`'s loop lets
+that value win over the scratch dir it sets first.
+
+**The rewrite is landed; the escape is not fixed.** Rewriting the four
+assertions is a correction — containment was measured to hold in those four
+cases — but it must not be read as a statement that nothing else escapes. The
+`denyWrite` fix and the residual Linux read leak are a security decision for a
+human, not an agent, and `SandboxEnforcement` carries both the mechanism
+difference and this gap in its notes on Linux until then.
 
 ## 19.8 Measured: the question corpus, end to end
 

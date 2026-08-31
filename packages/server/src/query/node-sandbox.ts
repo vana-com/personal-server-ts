@@ -315,6 +315,17 @@ function buildEnforcement(sandboxAvailable: boolean): SandboxEnforcement {
     notes.push(
       "Linux confines by namespace, not by kernel permission check: a read-denied directory is replaced with an empty private tmpfs rather than returning EACCES, so operations against it succeed against nothing instead of failing. Measured: the home directory lists only sandbox scaffolding and none of the host's contents; a write outside the scratch dir appears to succeed into that tmpfs and is discarded, with no file ever created on the host; /proc is a fresh namespace-private procfs holding two PIDs and the run's own already-scrubbed environ; and a listening socket binds inside an unshared network namespace that nothing outside can reach. Confinement holds in every one of those cases — but a script observing its own syscalls sees success where macOS returns an error.",
     );
+    notes.push(
+      "KNOWN GAP, Linux: the contents of ~/.npm/_logs are readable inside the sandbox. ASRT unconditionally unions its getDefaultWritePaths() into the write allow-list, which on Linux means a bind mount that survives our denyRead of the home directory. Measured: a host-planted file in that directory was read back in full from inside a run. Not closable through the 0.0.74 config — denyWrite makes the bind read-only, not absent.",
+    );
+  }
+  if (sandboxAvailable) {
+    // Both platforms. Reported unconditionally because it is a write that
+    // reaches the host filesystem outside the scratch dir, which is exactly
+    // what `filesystemWrite: true` would otherwise be taken to exclude.
+    notes.push(
+      "KNOWN GAP, all platforms: a sandboxed script can create files under ASRT's default write paths — ~/.npm/_logs, ~/.claude/debug, /tmp/claude, /private/tmp/claude — and they land on the real host filesystem. ASRT unions these into the write allow-list regardless of our allowWrite, and its own source warns they 'may allow access to files from other processes'. Measured on macOS (write only; reads denied EPERM) and Linux (read and write). Closable by naming those paths in filesystem.denyWrite, which is a security decision not yet taken.",
+    );
   }
   // The memory caveat is the same on both platforms, and used to be reported
   // only on macOS because Linux was assumed to have a kernel limit behind it.

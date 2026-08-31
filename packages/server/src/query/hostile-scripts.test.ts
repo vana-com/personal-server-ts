@@ -5,6 +5,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { connect } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -29,6 +30,23 @@ import { createNodeSandbox } from "./node-sandbox.js";
  *
  * Nothing here reaches the network. The network cases assert egress is
  * denied; if one ever succeeds the test fails loudly rather than retrying.
+ *
+ * ## Outcome, not mechanism
+ *
+ * The two supported platforms deny differently, and four cases here used to
+ * encode the macOS spelling of the denial rather than the guarantee behind
+ * it. Seatbelt applies a kernel policy over the real filesystem and returns a
+ * permission error; bubblewrap substitutes an empty private namespace — a
+ * `--tmpfs` over a read-denied directory, a fresh procfs, an unshared netns —
+ * so the same call *succeeds against nothing*. Both contain; only one raises
+ * an errno. Measured on ubuntu-24.04, both architectures — design §19.7.1.
+ *
+ * So the confinement cases below assert the property — no host content is
+ * observable, no byte lands on the host, no host process or host environment
+ * is visible, nothing outside can reach in — by a route that either mechanism
+ * satisfies and a real breach would not. Where the macOS mechanism is itself
+ * worth pinning, it is kept as an extra `process.platform === "darwin"`
+ * assertion beside the platform-neutral one, never in place of it.
  */
 
 const RUN_MS = 20_000;
@@ -44,6 +62,30 @@ let secretFile: string;
 let scratch: string;
 let sandbox: ReturnType<typeof createNodeSandbox>;
 
+/**
+ * Every file this suite plants in the real host home carries this prefix, so
+ * `afterAll` can sweep them whether the run passed, failed or breached.
+ */
+const HOST_HOME_PREFIX = ".ps-query-hostile-test-";
+/**
+ * The payload of the home-directory canary. Confining the home directory is
+ * asserted by planting this outside and failing if it is ever observed
+ * inside — a unique string cannot coincide the way an entry *count* can, and
+ * unlike an errno it means the same thing under either denial mechanism.
+ * Deliberately never interpolated into a hostile script, so its presence in a
+ * run's output can only mean the run read it off the host.
+ */
+const HOME_CANARY_CONTENT = "PS-QUERY-HOME-CANARY-MUST-NEVER-BE-READABLE";
+/** Names, not contents: what a `/proc` environment leak would spell. */
+const PROC_ENV_CANARY = "PS_QUERY_PROC_CANARY";
+/** What the host must fail to read back off a socket the sandbox opened. */
+const INBOUND_PAYLOAD = "PS-QUERY-INSIDE-SANDBOX-LISTENER";
+
+let homeCanaryName: string;
+let homeCanaryFile: string;
+/** Host paths the write case aims at; asserted absent, and swept after. */
+let hostWriteTargets: string[];
+
 beforeAll(() => {
   dataRoot = mkdtempSync(join(tmpdir(), "ps-query-data-"));
   grantedFile = join(dataRoot, "oura_sleep.json");
@@ -55,12 +97,33 @@ beforeAll(() => {
   writeFileSync(secretFile, "TOPSECRET-NOT-IN-GRANT");
 
   scratch = mkdtempSync(join(tmpdir(), "ps-query-scratch-"));
+
+  // Planted in the *real* host home, which the sandbox denies wholesale. The
+  // suite never asserts on how that denial is spelled, only that this content
+  // and this name stay unobservable from inside.
+  homeCanaryName = `${HOST_HOME_PREFIX}canary-${process.pid}`;
+  homeCanaryFile = join(homedir(), homeCanaryName);
+  writeFileSync(homeCanaryFile, HOME_CANARY_CONTENT);
+
+  hostWriteTargets = [
+    // Inside the granted scope's own root but outside the scratch dir: the
+    // nearest thing to a plausible escape.
+    join(dataRoot, "written-by-sandbox.txt"),
+    // And the user's home, which is denied by a different rule.
+    join(homedir(), `${HOST_HOME_PREFIX}written-by-sandbox-${process.pid}.txt`),
+  ];
+
   sandbox = createNodeSandbox({ dataRoot });
 });
 
 afterAll(() => {
   for (const d of [dataRoot, scratch]) {
     if (d && existsSync(d)) rmSync(d, { recursive: true, force: true });
+  }
+  // Never leave anything of ours in the user's home, including a file a
+  // breach put there.
+  for (const f of [homeCanaryFile, ...(hostWriteTargets ?? [])]) {
+    if (f && existsSync(f)) rmSync(f, { force: true });
   }
 });
 
@@ -85,6 +148,48 @@ async function run(script: string, over?: Partial<SandboxSpec>) {
 /** Combined output, for asserting on breach/denial tokens. */
 function out(r: SandboxResult): string {
   return `${r.stdout}\n${r.stderr}`;
+}
+
+/**
+ * Try, from the host, to reach a listener the sandbox may have opened, and
+ * return what came back — or `null` if nothing did.
+ *
+ * This is the inbound half of the network contract. Bind *failure* is one way
+ * to get it and is what Seatbelt does; bubblewrap gets the same guarantee by
+ * putting the bind inside an unshared network namespace whose loopback is not
+ * the host's, so the bind succeeds against an interface nothing outside can
+ * route to. Reachability is the property both satisfy.
+ *
+ * A bare successful connect is not treated as a breach — something unrelated
+ * could hold the port — only receiving the run's own payload is, which is why
+ * the sandboxed listener answers with one.
+ */
+async function probeInboundFromHost(
+  port: number,
+  payload: string,
+  budgetMs: number,
+): Promise<string | null> {
+  const deadline = Date.now() + budgetMs;
+  while (Date.now() < deadline) {
+    const got = await new Promise<string | null>((resolve) => {
+      const socket = connect({ port, host: "127.0.0.1" });
+      let buf = "";
+      const finish = (v: string | null) => {
+        socket.destroy();
+        resolve(v);
+      };
+      socket.setTimeout(500, () => finish(null));
+      socket.on("error", () => finish(null));
+      socket.on("data", (d) => {
+        buf += String(d);
+        if (buf.includes(payload)) finish(buf);
+      });
+      socket.on("close", () => resolve(buf.includes(payload) ? buf : null));
+    });
+    if (got !== null) return got;
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  return null;
 }
 
 /**
@@ -154,16 +259,60 @@ describe.skipIf(!supported)("hostile scripts fail closed", () => {
   );
 
   it(
-    "denies reading the user's home directory",
+    "cannot observe any content of the user's home directory",
     async () => {
+      // The property is that no host-home content reaches the run. It is
+      // deliberately not "readdir raises an errno": that is only the macOS
+      // spelling. On Linux the home directory is replaced by an empty private
+      // tmpfs, so `readdir` succeeds and returns sandbox scaffolding — a
+      // success against nothing, not a read of the host.
+      //
+      // Counting entries cannot separate those two, and a count can coincide
+      // outright. A canary planted outside and read from inside can: if the
+      // run sees it the home directory is genuinely exposed, and if it does
+      // not then no host content is reachable however the denial was spelled.
+      // The script prints whatever it managed to read, so a leak arrives in
+      // the output as evidence rather than as a token the script had to stay
+      // well-behaved enough to emit.
       const r = await run(`
       const fs = require("fs");
       try {
-        const n = fs.readdirSync(${JSON.stringify(homedir())}).length;
-        console.log("BREACH-READ-HOME entries=" + n);
+        const d = fs.readFileSync(${JSON.stringify(homeCanaryFile)}, "utf8");
+        console.log("BREACH-READ-HOME-CANARY " + d);
+      } catch (e) { console.log("DENIED-READ-HOME-CANARY " + e.code); }
+      try {
+        const names = fs.readdirSync(${JSON.stringify(homedir())});
+        console.log("HOME-LISTING " + JSON.stringify(names));
       } catch (e) { console.log("DENIED-READ-HOME " + e.code); }
     `);
-      expectFailedClosed(r, "BREACH-READ-HOME");
+      // The guarantee: neither the canary's contents nor even its name is
+      // observable, by the direct read or through the directory listing.
+      expect(
+        out(r),
+        "host home content was readable inside the sandbox",
+      ).not.toContain(HOME_CANARY_CONTENT);
+      expect(
+        out(r),
+        "the host home's real directory listing reached the sandbox",
+      ).not.toContain(homeCanaryName);
+      expect(out(r)).not.toContain("BREACH-READ-HOME-CANARY");
+      // Positive evidence the script ran far enough to attempt the read, so
+      // a run that died early cannot pass the negatives vacuously.
+      expect(out(r), "the script never reached the canary read").toContain(
+        "DENIED-READ-HOME-CANARY",
+      );
+      // The macOS mechanism, kept rather than dropped: Seatbelt denies by
+      // kernel permission check, so both operations raise an errno there. On
+      // Linux they succeed against an empty tmpfs instead, which the
+      // assertions above already prove holds no host content.
+      if (process.platform === "darwin") {
+        expect(out(r), "Seatbelt should refuse the home read").toMatch(
+          /DENIED-READ-HOME-CANARY (EPERM|EACCES|ENOENT)/,
+        );
+        expect(out(r), "Seatbelt should refuse the home listing").toMatch(
+          /DENIED-READ-HOME (EPERM|EACCES|ENOENT)/,
+        );
+      }
     },
     RUN_MS,
   );
@@ -249,16 +398,51 @@ describe.skipIf(!supported)("hostile scripts fail closed", () => {
   );
 
   it(
-    "denies binding a listening socket",
+    "nothing outside can reach a socket the sandbox opens",
     async () => {
-      const r = await run(`
+      // The egress suite above covers outbound. This case is the other
+      // direction: whether model-authored code can open a door into the run.
+      //
+      // Asserting that `listen()` fails tests the mechanism, and only one
+      // platform's. Seatbelt refuses the bind; bubblewrap allows it inside an
+      // unshared network namespace that nothing outside can route to — and
+      // ASRT's `network.allowLocalBinding: false`, which we do pass, is
+      // referenced only in its macOS code and is inert on Linux. Both still
+      // deliver the guarantee, so assert the guarantee: while the run holds a
+      // listener open on every interface, the host tries to connect and must
+      // not get the run's payload back.
+      const port = 18731;
+      const running = run(`
       const net = require("net");
-      const srv = net.createServer();
-      srv.on("error", (e) => { console.log("DENIED-BIND " + e.code); process.exit(0); });
-      srv.listen(18731, "127.0.0.1", () => { console.log("BREACH-BIND"); process.exit(0); });
-      setTimeout(() => { console.log("DENIED-BIND timeout"); process.exit(0); }, 4000);
+      const srv = net.createServer((c) => { c.end(${JSON.stringify(
+        INBOUND_PAYLOAD,
+      )}); });
+      srv.on("error", (e) => { console.log("BIND-THREW " + e.code); process.exit(0); });
+      srv.listen(${port}, "0.0.0.0", () => { console.log("BIND-RETURNED"); });
+      setTimeout(() => { console.log("BIND-WINDOW-CLOSED"); process.exit(0); }, 6000);
     `);
-      expectFailedClosed(r, "BREACH-BIND");
+      // Probe while that window is open, then collect the run.
+      const reached = await probeInboundFromHost(port, INBOUND_PAYLOAD, 5_000);
+      const r = await running;
+
+      // The guarantee.
+      expect(
+        reached,
+        "the host reached a listening socket opened inside the sandbox",
+      ).toBeNull();
+      // Positive evidence the bind was actually attempted, so a run that
+      // never executed cannot pass by simply having opened nothing.
+      expect(out(r), "the script never attempted the bind").toMatch(
+        /BIND-RETURNED|BIND-THREW /,
+      );
+      // The macOS mechanism, kept: Seatbelt refuses the bind outright, and
+      // `allowLocalBinding: false` is the setting that does it.
+      if (process.platform === "darwin") {
+        expect(out(r), "Seatbelt should refuse the bind").toContain(
+          "BIND-THREW",
+        );
+        expect(out(r)).not.toContain("BIND-RETURNED");
+      }
     },
     RUN_MS,
   );
@@ -279,22 +463,47 @@ describe.skipIf(!supported)("hostile scripts fail closed", () => {
   );
 
   it(
-    "denies writing outside the scratch dir",
+    "no write outside the scratch dir ever lands on the host",
     async () => {
-      const target = join(dataRoot, "written-by-sandbox.txt");
+      // Whether the call threw is the mechanism; whether the byte landed is
+      // the guarantee. Seatbelt refuses the write with an errno. Bubblewrap
+      // has replaced the target's directory with a private tmpfs, so the
+      // write returns success and even reads back *inside* the run — and is
+      // discarded with the namespace. Nothing reaches the host either way, so
+      // the assertion is on the host filesystem afterwards.
+      //
+      // Two targets, because they are denied by different rules: the granted
+      // scope's own root (the nearest plausible escape) and the user's home.
       const r = await run(`
       const fs = require("fs");
-      try {
-        fs.writeFileSync(${JSON.stringify(target)}, "x");
-        console.log("BREACH-WRITE-OUTSIDE");
-      } catch (e) { console.log("DENIED-WRITE " + e.code); }
+      for (const t of ${JSON.stringify(hostWriteTargets)}) {
+        try {
+          fs.writeFileSync(t, "x");
+          console.log("WRITE-CALL-RETURNED");
+        } catch (e) { console.log("WRITE-CALL-THREW " + e.code); }
+      }
     `);
-      expectFailedClosed(r, "BREACH-WRITE-OUTSIDE");
-      // The strongest assertion is on the filesystem, not on the output.
-      expect(
-        existsSync(target),
-        "file was actually created outside scratch",
-      ).toBe(false);
+      // The guarantee. Swept before asserting so that a breach cannot leave
+      // a file behind in the user's home on the way to failing the test.
+      const landed = hostWriteTargets.filter((t) => existsSync(t));
+      for (const t of landed) rmSync(t, { force: true });
+      expect(landed, "a sandboxed write created a file on the host").toEqual(
+        [],
+      );
+      // Positive evidence both writes were actually attempted, so a run that
+      // never executed cannot pass on an empty filesystem.
+      const attempts = out(r).match(/WRITE-CALL-(RETURNED|THREW)/g) ?? [];
+      expect(attempts, "the script did not attempt both writes").toHaveLength(
+        hostWriteTargets.length,
+      );
+      // The macOS mechanism, kept: Seatbelt refuses the syscall outright, so
+      // no write may report success there.
+      if (process.platform === "darwin") {
+        expect(out(r), "Seatbelt should refuse the write").toContain(
+          "WRITE-CALL-THREW",
+        );
+        expect(out(r)).not.toContain("WRITE-CALL-RETURNED");
+      }
     },
     RUN_MS,
   );
@@ -454,18 +663,96 @@ describe.skipIf(!supported)("hostile scripts fail closed", () => {
   );
 
   it(
-    "denies reading /proc (Linux) or /dev entries",
+    "cannot see the host's process table or the host's environment",
     async () => {
-      const target =
-        process.platform === "linux" ? "/proc/self/environ" : "/dev/kmem";
-      const r = await run(`
+      // This case stays platform-forked, and irreducibly so: macOS has no
+      // procfs at all, so there is no host process table for it to be absent
+      // from. The two arms therefore probe the same property — the host's
+      // running state is not observable — through the mechanism each platform
+      // actually has.
+      //
+      // On Linux `bwrap` mounts a fresh procfs the sandbox cannot work
+      // without, so "is /proc readable" is the wrong question; it is readable
+      // by design. The right question is what a leak would *look* like, and
+      // it has two shapes: the host's processes appearing in the table, and
+      // un-scrubbed host environment readable through `/proc/<pid>/environ`.
+      // Assert those two absences specifically. A small PID count is a
+      // symptom of the private namespace, not the property, and a count can
+      // coincide — so it is printed as evidence and not asserted on.
+      if (process.platform === "linux") {
+        process.env[PROC_ENV_CANARY] = "PROC-CANARY-SHOULD-NOT-APPEAR";
+        let r;
+        try {
+          // The script reports the environment variable *names* it can see
+          // anywhere in the process table. Names, not values, so the canary
+          // never has to be interpolated into the script: its appearance in
+          // the output can only mean the run read it out of a host process.
+          r = await run(`
       const fs = require("fs");
       try {
-        const d = fs.readFileSync(${JSON.stringify(target)});
+        const pids = fs.readdirSync("/proc").filter((n) => /^[0-9]+$/.test(n));
+        console.log("PROC-PIDS " + pids.join(","));
+        const names = new Set();
+        for (const pid of pids.concat(["self"])) {
+          try {
+            const raw = fs.readFileSync("/proc/" + pid + "/environ", "utf8");
+            for (const kv of raw.split("\u0000")) {
+              if (kv) names.add(kv.split("=")[0]);
+            }
+          } catch (e) { /* a pid that exited, or one we may not read */ }
+        }
+        console.log("PROC-ENV-NAMES " + [...names].sort().join(" "));
+        console.log("PROC-SWEEP-DONE");
+      } catch (e) { console.log("DENIED-PROC " + e.code); }
+    `);
+        } finally {
+          delete process.env[PROC_ENV_CANARY];
+        }
+        // Positive evidence: either the sweep completed, or /proc was denied
+        // outright. A run that died early satisfies neither.
+        expect(
+          out(r),
+          "the script neither swept /proc nor was denied it",
+        ).toMatch(/PROC-SWEEP-DONE|DENIED-PROC /);
+        if (out(r).includes("PROC-SWEEP-DONE")) {
+          // Shape one: the host's own process must not be in the table. This
+          // test process is running on the host by definition, so its PID is
+          // the one host PID guaranteed to exist while the assertion runs.
+          const pidLine = /PROC-PIDS (.*)/.exec(out(r));
+          expect(pidLine, "the sweep printed no PID list").not.toBeNull();
+          const pids = (pidLine?.[1] ?? "").split(",").filter(Boolean);
+          expect(pids, "the sweep saw no PIDs at all").not.toHaveLength(0);
+          expect(
+            pids,
+            "the host's own PID is visible in the sandbox's process table",
+          ).not.toContain(String(process.pid));
+          // Shape two: no host environment anywhere in that table. The canary
+          // is set on the host for the duration of the run, so seeing its
+          // name means a host process's environ was readable — which is what
+          // the un-namespaced /proc leak would actually look like.
+          const nameLine = /PROC-ENV-NAMES (.*)/.exec(out(r));
+          expect(nameLine, "the sweep printed no env names").not.toBeNull();
+          expect(
+            out(r),
+            "a host process's environment was readable through /proc",
+          ).not.toContain(PROC_ENV_CANARY);
+        }
+      } else {
+        // macOS: no procfs, so probe host memory directly instead. Seatbelt
+        // denies by permission check, so the original breach/denial shape is
+        // exactly right here and is kept unchanged.
+        const r = await run(`
+      const fs = require("fs");
+      try {
+        const d = fs.readFileSync("/dev/kmem");
         console.log("BREACH-PROCDEV bytes=" + d.length);
       } catch (e) { console.log("DENIED-PROCDEV " + e.code); }
     `);
-      expectFailedClosed(r, "BREACH-PROCDEV");
+        expectFailedClosed(r, "BREACH-PROCDEV");
+        expect(out(r), "Seatbelt should refuse the /dev read").toContain(
+          "DENIED-PROCDEV",
+        );
+      }
     },
     RUN_MS,
   );
