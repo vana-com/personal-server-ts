@@ -191,7 +191,7 @@ export async function createIndexedDbPsLiteRuntime(
     options.derivatives === undefined &&
     (options.inferenceProvider || psLiteInferenceConfigured(config))
   ) {
-    derivatives = createPsLiteDerivativeCompute({
+    const compute = createPsLiteDerivativeCompute({
       config,
       storage,
       store: await createPsLiteQuestionStore(stateStore),
@@ -210,6 +210,13 @@ export async function createIndexedDbPsLiteRuntime(
       requestSigner,
       logger: options.logger,
     });
+    derivatives = compute;
+    // NOTE: `compute.provider` is deliberately NOT auto-wired into `query`.
+    // Referencing the query engine from this module would put the ~1.1 MB
+    // QuickJS WASM blob in every PS-Lite bundle (esbuild inlines dynamic
+    // imports in single-file output; measured at +1,079,786 bytes). A host
+    // that wants the query layer passes `query: { ask: createLiteQueryAsk({
+    // provider }) }`, importing `query/wire.js` explicitly. See that file.
   } else if (derivatives === null && options.derivatives === undefined) {
     options.logger?.warn(
       { baseUrl: config.inference.baseUrl },
@@ -303,6 +310,9 @@ export async function createIndexedDbPsLiteRuntime(
     diagnostics,
     lineageGateway,
     derivatives,
+    // Host-supplied or absent; absent = /v1/query/ask answers 503, exactly as
+    // /v1/derivatives does when the compute layer is off.
+    query: options.query ?? null,
     saveConfig: async (nextConfig) => {
       const saved = await savePsLiteConfig(stateStore, nextConfig);
       Object.assign(config, saved);

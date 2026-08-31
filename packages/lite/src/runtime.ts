@@ -92,6 +92,17 @@ import {
   type McpOAuthAuthorizationStore,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import type { PsLiteStorageCapabilities } from "./storage.js";
+// Static import is safe, and must STAY safe: `http-route.ts` never imports the
+// query engine as a value — the runner is injected via `options.query.ask`. So
+// mounting the route does not put the ~1.1 MB QuickJS WASM blob in every
+// PS-Lite bundle (measured: +6,793 bytes on `ps-lite-debug.js`, against
+// +1,079,786 when the engine was reached with a dynamic import, which esbuild
+// inlines in single-file output). Do not import `./query/wire.js` here.
+import {
+  createLiteQueryConcurrency,
+  handleLiteQueryRequest,
+  type LiteQueryConfig,
+} from "./query/http-route.js";
 import {
   createDefaultPsLiteAccessLogStore,
   createDefaultPsLiteSaveConfig,
@@ -161,6 +172,21 @@ export interface PsLiteRuntimeOptions {
    * /v1/derivatives answering 503; see createPsLiteDerivativeCompute.
    */
   derivatives?: { store: QuestionStore; scheduler: RecomputeScheduler } | null;
+  /**
+   * Query layer (design §19.18, plan phase 8). When present, GET
+   * /v1/query/scopes and POST /v1/query/ask are mounted and the owner can ask
+   * questions of their own data; the model's code runs in a QuickJS-WASM VM
+   * (`query/quickjs-sandbox.ts`), never in the page's realm. Omit to leave
+   * /v1/query/ask answering 503, which is what PS-Lite did until now.
+   *
+   * The runner is INJECTED, not built here — see the import comment above for
+   * why. A host wires it with
+   * `query: { ask: createLiteQueryAsk({ provider }) }`, passing the SAME
+   * provider the derivative compute layer uses
+   * (`createPsLiteDerivativeCompute(...).provider`) so that E2EE and relay
+   * signing are inherited and no second inference path is created.
+   */
+  query?: LiteQueryConfig | null;
   accessToken?: string;
   /**
    * Write API sessions. When present, POST /v1/write/session is mounted and
@@ -694,6 +720,11 @@ export function createPsLiteRuntime(
   const now = options.now ?? (() => new Date());
   const auth = options.auth ?? createMissingAuthAdapter();
   const dataStorage = toDataStoragePort(options.storage);
+  // One per runtime, not per request: the in-flight count is what makes the
+  // ceiling mean anything across concurrent questions.
+  const queryConcurrency = createLiteQueryConcurrency(
+    options.query?.maxConcurrent ?? 1,
+  );
   // Wire diagnostics by default so GET /v1/diagnostics is always available.
   const diagnostics = options.diagnostics ?? new DiagnosticsRecorder();
   options = { ...options, diagnostics };
@@ -1113,6 +1144,22 @@ export function createPsLiteRuntime(
             tokenStore,
           });
         }
+
+        const queryResponse = await handleLiteQueryRequest(
+          request,
+          {
+            authorizeOwner: (req) => auth.authorizeOwner(req),
+            dataStorage,
+            accessLogWriter,
+            ...(options.serverOwner
+              ? { serverOwner: options.serverOwner }
+              : {}),
+            query: options.query ?? null,
+            now,
+          },
+          { basePath: "/v1/query", concurrency: queryConcurrency },
+        );
+        if (queryResponse) return queryResponse;
 
         const derivativesPrefix = "/v1/derivatives";
         if (url.pathname.startsWith(`${derivativesPrefix}/`)) {

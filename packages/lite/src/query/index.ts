@@ -53,3 +53,17 @@ export {
 } from "./lite-query-service.js";
 
 export { createLiteAskPersonalDataPort } from "./mcp-ask-port.js";
+
+export {
+  createLiteQueryConcurrency,
+  handleLiteQueryRequest,
+  type LiteQueryAsk,
+  type LiteQueryAskInput,
+  type LiteQueryConcurrency,
+  type LiteQueryConfig,
+  type LiteQueryRouteDeps,
+} from "./http-route.js";
+
+// Importing this module is what pulls the QuickJS engine into a bundle. It is
+// re-exported here for hosts; `runtime.ts` must never reach it. See wire.ts.
+export { createLiteQueryAsk, type CreateLiteQueryAskOptions } from "./wire.js";
