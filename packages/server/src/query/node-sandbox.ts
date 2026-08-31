@@ -149,29 +149,46 @@ function realOrSelf(p: string): string {
  * platforms; see {@link buildEnforcement} for the read half, which 0.0.74
  * cannot close.
  *
- * Only the four data-bearing paths are denied. The rest of
- * `getDefaultWritePaths()` is `/dev/stdout`, `/dev/stderr`, `/dev/null`,
- * `/dev/tty`, `/dev/dtracehelper` and `/dev/autofs_nowait` — character
- * devices a process needs in order to produce output at all, holding no
- * user data and carrying nothing off the host. Denying those would break
- * every run and buy nothing.
+ * **Derived from ASRT's own list, not a copy of it.** At 0.0.74 that list is
+ * the four paths above plus six character devices, and this takes the
+ * complement of {@link isCharacterDevice} — so it denies exactly what ASRT
+ * grants, minus what a process needs to produce output. A hardcoded copy
+ * would go stale silently: a future release adding a seventh default write
+ * path would widen the writable set while a deny list naming only today's
+ * four stayed green. Deriving makes a new path denied by default, so the
+ * failure mode of a dependency bump is a loud broken run rather than a quiet
+ * escape. That is the direction this file errs in everywhere else.
  *
- * Both spellings of the temp paths are emitted. On macOS `/tmp` is a symlink
- * to `/private/tmp`, and the two spellings were measured to behave
- * *differently* under ASRT's allow rules — a write to `/tmp/claude/X` was
- * refused while the same host file reached through `/private/tmp/claude/X`
- * succeeded. A deny list that names only one spelling therefore leaves the
- * other open, so every entry is emitted both literally and resolved.
+ * Both spellings of each path are emitted. On macOS `/tmp` is a symlink to
+ * `/private/tmp`, and the two spellings were measured to behave *differently*
+ * under ASRT's allow rules — a write to `/tmp/claude/X` was refused while the
+ * same host file reached through `/private/tmp/claude/X` succeeded. A deny
+ * list that names only one spelling therefore leaves the other open.
+ *
+ * Exported for the drift guard in `hostile-scripts.test.ts`, which drives
+ * ASRT's real list through a sandboxed run.
  */
-function asrtDefaultWritePathDenials(): string[] {
-  const home = homedir();
-  const literal = [
-    "/tmp/claude",
-    "/private/tmp/claude",
-    join(home, ".npm", "_logs"),
-    join(home, ".claude", "debug"),
-  ];
+export function asrtDefaultWritePathDenials(
+  defaultWritePaths: readonly string[],
+): string[] {
+  const literal = defaultWritePaths.filter((p) => !isCharacterDevice(p));
   return [...new Set([...literal, ...literal.map(realOrSelf)])];
+}
+
+/**
+ * The entries of `getDefaultWritePaths()` that must stay writable: the
+ * character devices a process needs in order to produce any output at all
+ * (`/dev/stdout`, `/dev/stderr`, `/dev/null`, `/dev/tty`, and macOS's
+ * `/dev/dtracehelper` and `/dev/autofs_nowait`). They hold no user data and
+ * carry nothing off the host. Everything else in that list is denied.
+ *
+ * Matched by prefix rather than by an enumerated set, deliberately: the point
+ * of deriving the deny list is that a path ASRT adds in a future release is
+ * denied by default. Enumerating the safe ones and denying the rest keeps that
+ * true; enumerating the *unsafe* ones would not.
+ */
+function isCharacterDevice(p: string): boolean {
+  return p === "/dev" || p.startsWith("/dev/");
 }
 
 /**
@@ -456,11 +473,19 @@ export interface NodeSandboxOptions {
 
 export function createNodeSandbox(options: NodeSandboxOptions): Sandbox {
   let manager: SandboxManagerApi | undefined;
+  /**
+   * ASRT's unconditional write grants, read from ASRT rather than copied.
+   * Captured alongside the manager because both come from the same dynamic
+   * import — the module is loaded lazily so an unsupported platform never
+   * pays for it.
+   */
+  let defaultWritePaths: string[] | undefined;
 
   async function loadManager() {
     if (manager) return manager;
     const mod = await import("@anthropic-ai/sandbox-runtime");
     manager = mod.SandboxManager;
+    defaultWritePaths = mod.getDefaultWritePaths();
     return manager;
   }
 
@@ -486,8 +511,8 @@ export function createNodeSandbox(options: NodeSandboxOptions): Sandbox {
         // Takes back the write paths ASRT grants unconditionally — see
         // {@link asrtDefaultWritePathDenials}. The scratch dir stays the only
         // writable location, which is what `allowWrite` was always meant to
-        // say.
-        denyWrite: asrtDefaultWritePathDenials(),
+        // say. `loadManager()` has run by here, so the list is populated.
+        denyWrite: asrtDefaultWritePathDenials(defaultWritePaths ?? []),
       },
       ...(seccompHelper === undefined
         ? {}

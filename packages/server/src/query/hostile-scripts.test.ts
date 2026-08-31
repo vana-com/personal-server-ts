@@ -11,6 +11,7 @@ import {
 import { connect } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { getDefaultWritePaths } from "@anthropic-ai/sandbox-runtime";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type {
   SandboxResult,
@@ -90,15 +91,22 @@ let homeCanaryFile: string;
 let hostWriteTargets: string[];
 /**
  * ASRT's own default write paths — the ones `getDefaultWritePaths()` unions
- * into the write allow-list whatever the caller asked for. See the test that
- * uses these.
+ * into the write allow-list whatever the caller asked for — minus the
+ * character devices a process needs to produce output.
+ *
+ * Read from ASRT rather than transcribed, so this is a **drift guard** as well
+ * as a regression test. A hardcoded list would go stale in lockstep with the
+ * deny list in `node-sandbox.ts`: an ASRT upgrade adding a seventh default
+ * write path would widen the writable set, and a suite writing only to
+ * yesterday's four would stay green while a fresh escape stood open. Derived,
+ * the case below writes to whatever ASRT actually grants today.
+ *
+ * At 0.0.74 this is `/tmp/claude`, `/private/tmp/claude`, `~/.npm/_logs` and
+ * `~/.claude/debug`.
  */
-const ASRT_DEFAULT_WRITE_DIRS = [
-  "/tmp/claude",
-  "/private/tmp/claude",
-  join(homedir(), ".npm", "_logs"),
-  join(homedir(), ".claude", "debug"),
-];
+const ASRT_DEFAULT_WRITE_DIRS = getDefaultWritePaths().filter(
+  (p) => p !== "/dev" && !p.startsWith("/dev/"),
+);
 /** One file per entry above; asserted absent on the host, and swept after. */
 let asrtWriteTargets: string[];
 /**
@@ -588,7 +596,7 @@ describe.skipIf(!supported)("hostile scripts fail closed", () => {
       // real escape being shipped.
       //
       // The case above aims at paths *our* config denies, which is the easy
-      // half. These four are different in kind: ASRT grants them itself.
+      // half. These are different in kind: ASRT grants them itself.
       // `SandboxManager` composes the write policy as
       // `allowOnly: [...getDefaultWritePaths(), ...userAllowWrite]`, so they
       // are writable regardless of what `allowWrite` says, and ASRT's own
@@ -597,6 +605,13 @@ describe.skipIf(!supported)("hostile scripts fail closed", () => {
       // sandboxed script's writes to all four landed on the real host
       // filesystem holding the script's bytes, on macOS (write-only; reads
       // refused EPERM) and on Linux (read and write).
+      //
+      // The targets come from ASRT's own `getDefaultWritePaths()`, so this
+      // also fails if a future release adds a path neither list anticipated.
+      expect(
+        asrtWriteTargets.length,
+        "no non-/dev default write paths — the derivation is wrong, and this case would pass vacuously",
+      ).toBeGreaterThan(0);
       //
       // Nothing about that is visible from inside a run, from the granted
       // scope, or from any assertion the rest of this file makes — which is

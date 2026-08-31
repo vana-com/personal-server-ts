@@ -1444,10 +1444,18 @@ ordinary config: every write refused, and no host file created.
 | `/tmp/claude`         | `EPERM` | `EROFS`                          |
 | `/private/tmp/claude` | `EPERM` | `ENOENT` (no such path on Linux) |
 
-Only those four are denied. The rest of `getDefaultWritePaths()` is
+The deny list is **derived from `getDefaultWritePaths()`, not transcribed from
+it**: everything ASRT grants is denied except `/dev/*`, which is
 `/dev/stdout`, `/dev/stderr`, `/dev/null`, `/dev/tty`, `/dev/dtracehelper` and
 `/dev/autofs_nowait` — character devices a process needs to produce output at
-all, holding no user data. Denying them would break every run and buy nothing.
+all, holding no user data. At 0.0.74 the complement is exactly the four paths
+above. Deriving matters because a hardcoded copy would go stale silently in
+lockstep with the test's copy: a release adding a seventh default write path
+would widen the writable set while both lists, naming only today's four, stayed
+green. Taking the complement of a small allow-set instead means a path ASRT
+adds later is denied by default, so a dependency bump fails loudly rather than
+quietly reopening this. The hostile suite derives its targets the same way, which
+makes it a drift guard as well as a regression test.
 
 Both spellings of the temp path are denied, because they were measured to
 behave _differently_: before the fix, a macOS write to `/tmp/claude/X` was
