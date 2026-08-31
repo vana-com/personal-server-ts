@@ -20,6 +20,7 @@
 
 import {
   decodeResultFrame,
+  mergePartiallyScanned,
   stripResultFrames,
   type CoverageCounters,
 } from "@opendatalabs/personal-server-ts-core/query/tools";
@@ -82,6 +83,7 @@ function failedCoverage(
 ): CoverageCounters {
   return {
     scopesScanned: [],
+    scopesPartiallyScanned: [],
     recordsScanned: 0,
     bytesScanned: 0,
     unreadable: 0,
@@ -159,6 +161,7 @@ export function createLiteToolHost(options: LiteToolHostOptions) {
       scopesScanned: [
         ...new Set([...prev.scopesScanned, ...next.scopesScanned]),
       ].sort(),
+      scopesPartiallyScanned: mergePartiallyScanned(prev, next),
       ...mergeScopeTotals(prev, next),
       scopesSkipped: [...skipped.values()],
       method,
@@ -192,6 +195,7 @@ export function createLiteToolHost(options: LiteToolHostOptions) {
       return (
         accumulated ?? {
           scopesScanned: [],
+          scopesPartiallyScanned: [],
           recordsScanned: 0,
           bytesScanned: 0,
           unreadable: 0,

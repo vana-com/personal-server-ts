@@ -23,7 +23,16 @@ function frameFor(
     string,
     { records: number; bytes: number; unreadable: number }
   >,
-  over: { method?: "full" | "prefiltered" } = {},
+  over: {
+    method?: "full" | "prefiltered";
+    /**
+     * Which of these scopes this run read but did not exhaust.
+     *
+     * Defaults to none, i.e. every scope in the frame was streamed end to end.
+     * A frame that names a scope here is the "sampled it" case.
+     */
+    partiallyScanned?: string[];
+  } = {},
 ) {
   const totals = Object.values(perScope).reduce(
     (a, t) => ({
@@ -37,6 +46,7 @@ function frameFor(
     v: 1 as const,
     coverage: {
       scopesScanned: Object.keys(perScope),
+      scopesPartiallyScanned: over.partiallyScanned ?? [],
       recordsScanned: totals.records,
       bytesScanned: totals.bytes,
       unreadable: totals.unreadable,
@@ -158,6 +168,79 @@ describe("coverage merged across runs in one request", () => {
     await host.execute("partial");
     await host.execute("full");
     expect(host.coverage().recordsScanned).toBe(340);
+  });
+});
+
+/**
+ * `scopesPartiallyScanned` merged across runs — the AND/OR call.
+ *
+ * A scope is partially scanned FOR THE REQUEST only if no run exhausted it.
+ * Once some turn streamed it end to end the request has seen every record, and
+ * a bounded read in another turn adds no doubt about what was covered — which
+ * is exactly the rule `CoverageLedger.completeScope` already applies inside one
+ * run, so having the merge disagree would make a two-turn request report a
+ * scope as sampled that a one-turn request with the same reads reported as
+ * covered.
+ *
+ * Pinned in both directions because the removed `complete` flag got a decision
+ * of precisely this shape backwards. The dangerous direction is the third
+ * case: a scope no run exhausted must never come out of the merge looking
+ * fully scanned.
+ */
+describe("scopesPartiallyScanned merged across runs in one request", () => {
+  it("clears a scope that a later turn read in full", async () => {
+    const host = hostOver([
+      frameFor(docs(100, 5), { partiallyScanned: ["documents.files"] }),
+      frameFor(docs(340, 22)),
+    ]);
+    await host.execute("bounded read");
+    await host.execute("then a full pass");
+    expect(host.coverage().scopesPartiallyScanned).toEqual([]);
+    expect(host.coverage().scopesScanned).toEqual(["documents.files"]);
+  });
+
+  it("clears it in the other order too, so the merge is not last-writer-wins", async () => {
+    const host = hostOver([
+      frameFor(docs(340, 22)),
+      frameFor(docs(100, 5), { partiallyScanned: ["documents.files"] }),
+    ]);
+    await host.execute("full pass");
+    await host.execute("then a bounded re-read");
+    expect(host.coverage().scopesPartiallyScanned).toEqual([]);
+  });
+
+  it("keeps a scope no turn ever exhausted", async () => {
+    // The direction that matters: two samples are still a sample. Nothing here
+    // reached `completeScope`, so the request may not present the scope as
+    // covered — this is the anti-sampling property at the request level.
+    const host = hostOver([
+      frameFor(docs(100, 5), { partiallyScanned: ["documents.files"] }),
+      frameFor(docs(120, 5), { partiallyScanned: ["documents.files"] }),
+    ]);
+    await host.execute("sample one window");
+    await host.execute("sample another window");
+    expect(host.coverage().scopesPartiallyScanned).toEqual(["documents.files"]);
+    // Still listed as scanned — it WAS read. The two lists say different
+    // things, and the second is what stops the first from being over-read.
+    expect(host.coverage().scopesScanned).toEqual(["documents.files"]);
+  });
+
+  it("tracks each scope independently", async () => {
+    const host = hostOver([
+      frameFor(
+        {
+          "documents.files": { records: 100, bytes: 1, unreadable: 0 },
+          "email.messages": { records: 900, bytes: 1, unreadable: 0 },
+        },
+        { partiallyScanned: ["documents.files"] },
+      ),
+      frameFor({
+        "email.messages": { records: 900, bytes: 1, unreadable: 0 },
+      }),
+    ]);
+    await host.execute("sample docs, stream email");
+    await host.execute("stream email again");
+    expect(host.coverage().scopesPartiallyScanned).toEqual(["documents.files"]);
   });
 });
 

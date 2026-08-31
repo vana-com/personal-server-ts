@@ -61,8 +61,42 @@ export type QueryStoppedBecause =
   | "ungroundedAnswer"
   | "error";
 
+/**
+ * Host-authored coverage as it travels on a {@link QueryAnswer}.
+ *
+ * **The key order of this object is a function of its content and nothing
+ * else.** It is built in exactly one place — the single object literal at the
+ * end of `agent/loop.ts`, in the declaration order below — so two runs that
+ * reach the same logical coverage by different code paths serialize to
+ * identical bytes. That is a precondition for putting coverage anywhere it is
+ * compared, diffed, logged or committed, and it is why every optional here is
+ * present-or-absent by its VALUE rather than by the order some branch happened
+ * to assign it. `agent/coverage-determinism.test.ts` pins the property.
+ *
+ * Deliberately NOT a superset of the tool layer's `CoverageCounters`
+ * (`tools/types.ts`). `perScope` is that type's private substrate for the
+ * cross-run subsumption merge and is not projected here: its key order follows
+ * the order scopes were first touched, which is script-execution order, so it
+ * is the one field whose serialization could never be a function of its
+ * content. Nothing downstream of this type ever read it.
+ */
 export interface QueryCoverage {
   scopesScanned: string[];
+  /**
+   * Which of {@link scopesScanned} were read but not streamed end to end.
+   *
+   * The surviving half of the removed `complete` flag, as a list of parts
+   * rather than a scalar over them: **the model cannot buy a completeness
+   * claim by sampling**, because a bounded read is host-recorded here and only
+   * a pass that actually exhausted the scope takes it out again. See
+   * `CoverageCounters.scopesPartiallyScanned` (`tools/types.ts`) for the
+   * unforgeability argument and `tools/coverage.ts` for why the flag itself
+   * is not coming back.
+   *
+   * A subset of `scopesScanned`. Optional only because a host that never
+   * reported has no list to give.
+   */
+  scopesPartiallyScanned?: string[];
   recordsScanned: number;
   /**
    * Bytes read across every scope this request touched.
@@ -93,6 +127,17 @@ export interface QueryCoverage {
   profilesSummarized?: string[];
   /** OS-sandbox policy violations observed during the run. */
   violations?: string[];
+  /**
+   * What the sandbox actually enforced, verbatim from
+   * `SandboxEnforcement.notes` via `CoverageCounters.enforcementNotes`.
+   *
+   * Declared rather than added: the real hosts return a `CoverageCounters`
+   * from `coverage()` and this field has always ridden onto the answer on the
+   * spread, undeclared, so no typed consumer could see the one field that says
+   * what containment was actually in force. Plan §4.3 — reduced capability
+   * must be visible — so it is projected explicitly, not dropped.
+   */
+  enforcementNotes?: string[];
 }
 
 export interface QueryCost {
@@ -170,6 +215,11 @@ export type QueryConfidence = "high" | "medium" | "low";
  */
 export const EMPTY_COVERAGE: QueryCoverage = Object.freeze({
   scopesScanned: [],
+  // Nothing was scanned, so nothing was partially scanned. Empty for the same
+  // reason `scopesScanned` is, and it cannot be read the other way round: a
+  // consumer asking "was anything sampled rather than exhausted" gets "no
+  // scope was read at all" from the zeroed counters beside it.
+  scopesPartiallyScanned: [],
   recordsScanned: 0,
   scopesSkipped: [],
 });
