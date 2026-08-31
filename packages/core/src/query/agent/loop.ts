@@ -338,15 +338,34 @@ export async function runQueryLoop(
   options: QueryLoopOptions,
 ): Promise<QueryAnswer> {
   const {
-    provider,
+    provider: rawProvider,
     tools,
-    model = provider.defaultModel,
+    model = options.provider.defaultModel,
     maxTurns = DEFAULT_MAX_TURNS,
     maxTokens = DEFAULT_MAX_TOKENS,
     emptyReplyRetries = EMPTY_REPLY_RETRIES,
     outputTailBytes = DEFAULT_OUTPUT_TAIL_BYTES,
     now = Date.now,
   } = options;
+
+  /**
+   * Calls put on the wire, counted where every one of them passes.
+   *
+   * Not the same as `turns`: a turn re-asks on an empty or malformed-tool-call
+   * reply, and the wrap-up turn is one more outside the budget. The relay
+   * meters CALLS per signer per UTC day, so a turn count cannot answer "how
+   * much of a signer's day did this question spend" — only this can. Counted
+   * by wrapping the provider rather than by incrementing at each call site, so
+   * a future call site cannot forget to count itself.
+   */
+  let relayCalls = 0;
+  const provider: InferenceProvider = {
+    ...rawProvider,
+    chat: (input) => {
+      relayCalls += 1;
+      return rawProvider.chat(input);
+    },
+  };
 
   const startedAt = now();
   // `budget.toolCalls` bounds MODEL TURNS, not script executions. The two were
@@ -616,6 +635,7 @@ export async function runQueryLoop(
     cost: {
       toolCalls: scriptRuns,
       modelTurns: turns,
+      relayCalls,
       inputTokens,
       outputTokens,
     },
