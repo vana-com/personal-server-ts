@@ -54,12 +54,22 @@ denominator nor a stack trace is lost.
 
 Coverage is host-authored (prompt doc §1). `runQueryLoop` copies
 `tools.coverage()` verbatim and only ever makes it _less_ complete — never
-more. A model asserting `{"coverage": {"complete": true}}` in its answer JSON is
-ignored; there is a test for exactly that.
+more. Coverage the model asserts in its answer block is ignored structurally,
+not filtered: `contract.ts` has no `coverage` key to parse, so there is nothing
+for a model claim to ride in on.
 
-`coverage.complete === false` is rendered into the **answer prose**, not just
-the metadata, because a caller that renders only `answer` must not be able to
-show a confident wrong result.
+A limit on what this run actually read is rendered into the **answer prose**,
+not just the metadata, because a caller that renders only `answer` must not be
+able to show a confident wrong result. `honestAnswerText` owns that text. There
+is no `coverage.complete` any more: it demanded every granted scope be read end
+to end, so it was false on nearly every real answer and the caveat fired
+unconditionally — which trains a reader to ignore the one that matters. The
+guarantee now rests on the parts, and each prose reason must be _specifically_
+wrong for this run: a zero read, a `stoppedBecause`, skipped scopes, scopes
+**sampled rather than exhausted** (`scopesPartiallyScanned` — the anti-sampling
+half of the old flag), unreadable records, and unprofiled scopes **this run
+actually read**. Grant-shaped facts — `profilesSummarized`, and the full
+unprofiled-scope list — stay in the metadata only.
 
 ## Reconciling with phase 4b
 

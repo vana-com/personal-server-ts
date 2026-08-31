@@ -778,6 +778,191 @@ describe("runQueryLoop — honesty invariants", () => {
     expect(out.coverage.unprofiledScopes).toContain("mystery.source");
     expect(out.answer).toContain("no source profile");
   });
+
+  /**
+   * The anti-sampling guarantee has to reach the answer TEXT.
+   *
+   * `scopesPartiallyScanned` is the surviving half of the removed `complete`
+   * flag, but for a while it shipped in `coverage` with nothing rendering it:
+   * a run that sampled 19 of 153 records produced an answer with no sampling
+   * caveat at all, so a caller rendering only `answer` could not tell a full
+   * pass from a window. That is exactly the confident-wrong-result the prose
+   * caveats exist to prevent.
+   */
+  it("says so in the answer text when a scope was sampled, not exhausted", async () => {
+    const provider = createFakeInferenceProvider({
+      respond: (_i, n) =>
+        reply(
+          n === 0
+            ? runBlock("vana.read('oura.sleep')")
+            : answerBlock({ answer: "7h" }),
+        ),
+    });
+    const out = await runQueryLoop(
+      { question: "q", grantedScopes: ["oura.sleep"] },
+      {
+        provider,
+        tools: fakeTools([
+          executed({
+            coverage: {
+              scopesScanned: ["oura.sleep"],
+              scopesPartiallyScanned: ["oura.sleep"],
+              recordsScanned: 19,
+              scopesSkipped: [],
+            },
+          }),
+        ]),
+      },
+    );
+    expect(out.coverage.scopesPartiallyScanned).toEqual(["oura.sleep"]);
+    expect(out.answer).toContain("incomplete");
+    expect(out.answer).toContain("sampled rather than read end to end");
+    expect(out.answer).toContain("oura.sleep");
+  });
+
+  /**
+   * The other direction, which is what stops the new branch from becoming
+   * `complete` again: a pass that actually exhausted the scope must NOT be
+   * caveated. A scope leaves `scopesPartiallyScanned` only on the strength of
+   * a read that reached `completeScope`, so an empty list is a real signal.
+   */
+  it("does not add a sampling caveat to a full pass", async () => {
+    const provider = createFakeInferenceProvider({
+      respond: (_i, n) =>
+        reply(
+          n === 0
+            ? runBlock("vana.readAll('oura.sleep')")
+            : answerBlock({ answer: "7h" }),
+        ),
+    });
+    const out = await runQueryLoop(
+      { question: "q", grantedScopes: ["oura.sleep"] },
+      {
+        provider,
+        tools: fakeTools([
+          executed({
+            coverage: {
+              scopesScanned: ["oura.sleep"],
+              scopesPartiallyScanned: [],
+              recordsScanned: 1030,
+              scopesSkipped: [],
+            },
+          }),
+        ]),
+      },
+    );
+    expect(out.coverage.scopesPartiallyScanned).toEqual([]);
+    expect(out.answer).not.toContain("sampled rather than read end to end");
+    expect(out.answer).not.toContain("incomplete");
+  });
+
+  /**
+   * The regression this narrowing exists for, found live.
+   *
+   * `coverage.unprofiledScopes` is grant-shaped — `buildSystemPrompt` computes
+   * it over the whole granted scope list before any read happens — so rendered
+   * raw it fired on every answer under a grant with any unprofiled scope. A
+   * sweep measured it on all 13 of 13 runs, including a probe that read only a
+   * profiled scope and touched none of the unprofiled ones. That is precisely
+   * the failure that removed `complete`, so the prose is keyed on the
+   * intersection with `scopesScanned` instead.
+   *
+   * The grant-shaped list stays in the metadata; only the prose narrows.
+   */
+  it("does not caveat unprofiled scopes this run never read", async () => {
+    const provider = createFakeInferenceProvider({
+      respond: (_i, n) =>
+        reply(
+          n === 0
+            ? runBlock("vana.readAll('oura.sleep')")
+            : answerBlock({ answer: "7h" }),
+        ),
+    });
+    const out = await runQueryLoop(
+      {
+        question: "q",
+        grantedScopes: ["oura.sleep", "mystery.source", "other.mystery"],
+      },
+      {
+        provider,
+        tools: fakeTools(
+          [
+            executed({
+              coverage: {
+                scopesScanned: ["oura.sleep"],
+                scopesPartiallyScanned: [],
+                recordsScanned: 1030,
+                scopesSkipped: [],
+              },
+            }),
+          ],
+          {
+            async listScopes() {
+              return [
+                { scope: "oura.sleep", itemCount: 1030 },
+                { scope: "mystery.source" },
+                { scope: "other.mystery" },
+              ];
+            },
+          },
+        ),
+      },
+    );
+    // Still reported as metadata — the field is not being deleted.
+    expect(out.coverage.unprofiledScopes).toEqual([
+      "mystery.source",
+      "other.mystery",
+    ]);
+    // But nothing bounds THIS answer: the only scope it read was profiled.
+    expect(out.answer).not.toContain("no source profile");
+    expect(out.answer).not.toContain("incomplete");
+  });
+
+  /** The narrowing must not lose the caveat when the run really did read one. */
+  it("caveats only the unprofiled scopes the run actually read", async () => {
+    const provider = createFakeInferenceProvider({
+      respond: (_i, n) =>
+        reply(
+          n === 0
+            ? runBlock("vana.readAll('mystery.source')")
+            : answerBlock({ answer: "7h" }),
+        ),
+    });
+    const out = await runQueryLoop(
+      {
+        question: "q",
+        grantedScopes: ["oura.sleep", "mystery.source", "other.mystery"],
+      },
+      {
+        provider,
+        tools: fakeTools(
+          [
+            executed({
+              coverage: {
+                scopesScanned: ["mystery.source"],
+                scopesPartiallyScanned: [],
+                recordsScanned: 12,
+                scopesSkipped: [],
+              },
+            }),
+          ],
+          {
+            async listScopes() {
+              return [
+                { scope: "oura.sleep", itemCount: 1030 },
+                { scope: "mystery.source" },
+                { scope: "other.mystery" },
+              ];
+            },
+          },
+        ),
+      },
+    );
+    expect(out.answer).toContain("no source profile");
+    expect(out.answer).toContain("mystery.source");
+    // The unprofiled scope it never touched stays out of the prose.
+    expect(out.answer).not.toContain("other.mystery");
+  });
 });
 
 describe("runQueryLoop — transcript trimmed to fit the relay's body cap", () => {
