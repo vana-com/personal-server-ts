@@ -1490,10 +1490,19 @@ same call succeeds. Nothing in ASRT needs `/tmp/claude` for itself — it is a
 command wrapper, its proxy runs on the host outside this policy, and `TMPDIR` is
 the only use of that path anywhere in its shipped JS.
 
-**The read half is not closable at 0.0.74, and stays open.** `denyWrite` maps to
-`denyWithinAllow`, which leaves the path bind-mounted in order to carry the
-write allowance it is denying — read-only rather than absent. Measured on
-Linux/arm64 _after_ the fix: a host-planted canary in `/tmp/claude`,
+**The read half is not closable at 0.0.74, and stays open — and it is worse than
+"not closable": `getDefaultWritePaths()` actively defeats our own
+`filesystem.denyRead`.** The two denials are implemented differently, and that
+asymmetry is the whole mechanism. `denyRead` mounts a tmpfs over the directory
+and then _re-binds the allowed write paths back on top of it_
+(`linux-sandbox-utils.js:636-646`, carrying upstream's own comment "tmpfs wiped
+any earlier write binds under this path — restore them"), so the four unioned
+defaults are restored over the very tmpfs meant to hide them. `denyWrite`, by
+contrast, only `--ro-bind`s (`:1106`), leaving the path mounted in order to
+carry the write allowance it is denying — read-only rather than absent. A
+denial we asked for loses to a grant we never asked for, by construction. The
+full trace is in `docs/260831-asrt-default-write-paths-read-escape.md`. Measured
+on Linux/arm64 _after_ the fix: a host-planted canary in `/tmp/claude`,
 `~/.npm/_logs` and `~/.claude/debug` was read back in full from inside a run,
 and `readdir` of each returned the real host contents. This is broader than an
 earlier draft recorded — it is every one of those paths that exists, not
@@ -3157,12 +3166,15 @@ variant removes the failure mode most likely to bite a WebView (a second fetch
 against a local origin that on iOS cannot set headers), which strengthens the
 case without settling it.
 
-**What would settle it**, precisely: build `.bench/probe.ts` into
-`apps/mobile-shell/assets/ps/`, load it in the Flutter shell on one real iOS
-device and one real Android device, and read the four fields it already emits —
-`moduleLoad`, `egressGlobalsPresent`, `mechanics`, `opfs.writable`. That is a
-single page load per device and it answers the whole condition. It needs
-hardware this machine does not have.
+**What would settle it**, precisely: bundle
+`packages/lite/src/query/device-probe.ts` (`npm run bundle-device-probe -w
+@opendatalabs/personal-server-ts-lite`) into `apps/mobile-shell/assets/ps/`,
+load it in the Flutter shell on one real iOS device and one real Android device,
+and read the four fields it emits — `moduleLoad`, `egressGlobalsPresent`,
+`mechanics`, `opfs.writable`. That is a single page load per device and it
+answers the whole condition. The probe and the Flutter-side wiring it needs are
+described in `docs/260831-mobile-wasm-probe.md`. It needs hardware this machine
+does not have.
 
 #### Containment: what Lite has, and what it does not
 
