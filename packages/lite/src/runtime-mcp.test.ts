@@ -41,7 +41,7 @@ import {
 import {
   createTestWallet,
   buildWeb3SignedHeader,
-} from "@opendatalabs/personal-server-ts-core/test-utils";
+} from "../../core/src/test-utils/index.js";
 import { createWeb3SignedPsLiteAuth } from "./runtime.js";
 import type {
   Builder,

@@ -3,7 +3,7 @@ import { pino } from "pino";
 import {
   createTestWallet,
   buildWeb3SignedHeader,
-} from "@opendatalabs/personal-server-ts-core/test-utils";
+} from "../../../core/src/test-utils/index.js";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type { SyncStatus } from "@opendatalabs/personal-server-ts-core/sync";
 import { syncRoutes } from "./sync.js";

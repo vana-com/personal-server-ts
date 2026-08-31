@@ -128,10 +128,6 @@
       "types": "./dist/storage/adapters/index.d.ts",
       "import": "./dist/storage/adapters/index.js"
     },
-    "./test-utils": {
-      "types": "./dist/test-utils/index.d.ts",
-      "import": "./dist/test-utils/index.js"
-    },
     "./payment": {
       "types": "./dist/payment/index.d.ts",
       "import": "./dist/payment/index.js"

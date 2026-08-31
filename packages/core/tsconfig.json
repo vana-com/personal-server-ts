@@ -20,5 +20,9 @@
   // moved to `query/evals/agent-answerer.ts` — it never had a product
   // consumer — so nothing product code reaches imports `evals/` any more and
   // the exclude can do its whole job.
-  "exclude": ["src/**/*.test.ts", "src/query/evals/**"]
+  // `src/test-utils/**` is the same story: wallet, storage and gateway
+  // fixtures that only `*.test.ts` and `scripts/e2e-*.ts` use. It had an
+  // `exports` entry, so 20 emitted files shipped in the tarball; nothing in
+  // product code imports it, so there is no type closure to pin.
+  "exclude": ["src/**/*.test.ts", "src/query/evals/**", "src/test-utils/**"]
 }

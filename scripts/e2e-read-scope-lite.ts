@@ -30,7 +30,7 @@ import { createInMemoryMcpConnectionStore } from "@opendatalabs/personal-server-
 import {
   createTestWallet,
   buildWeb3SignedHeader,
-} from "@opendatalabs/personal-server-ts-core/test-utils";
+} from "../packages/core/src/test-utils/index.js";
 import type {
   Builder,
   GatewayClient,
