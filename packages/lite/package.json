@@ -29,7 +29,8 @@
   ],
   "scripts": {
     "copy-tls": "mkdir -p dist/browser-tls-rustls && cp src/browser-tls-rustls/* dist/browser-tls-rustls/",
-    "build": "tsc --build && npm run copy-tls"
+    "build": "tsc --build && npm run copy-tls",
+    "bundle-device-probe": "esbuild src/query/device-probe-entry.ts --bundle --format=iife --platform=browser --target=safari16,chrome108 --outfile=dist/device-probe/vana-quickjs-device-probe.js"
   },
   "dependencies": {
     "@jitl/quickjs-singlefile-browser-release-sync": "0.32.0",
