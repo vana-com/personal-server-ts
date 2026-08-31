@@ -226,6 +226,322 @@ describe("runQueryLoop — the response contract", () => {
   });
 });
 
+/**
+ * An answer has to be backed by a read.
+ *
+ * The PS-Lite benchmark's single miss was a model that emitted a `vana:answer`
+ * over `recordsScanned: 0` and had it accepted, so a confabulation arrived
+ * wearing the shape of a finding. The host's record counter is the witness:
+ * only a confined run can move it.
+ */
+describe("runQueryLoop — an answer must be grounded in a read", () => {
+  /** A host that has never run anything, reporting so honestly. */
+  function unreadTools(over: Partial<QueryToolHost> = {}) {
+    return fakeTools([executed()], {
+      coverage: () => ({
+        scopesScanned: [],
+        recordsScanned: 0,
+        scopesSkipped: [],
+        complete: false,
+      }),
+      ...over,
+    });
+  }
+
+  it("refuses an answer emitted on a turn that ran no script", async () => {
+    const provider = createFakeInferenceProvider({
+      respond: () => reply(answerBlock({ answer: "About six and a half." })),
+    });
+    const out = await runQueryLoop(
+      { question: "how much did I sleep?", grantedScopes: ["oura.sleep"] },
+      { provider, tools: unreadTools() },
+    );
+
+    // The model's prose is not the answer; the refusal is.
+    expect(out.answer).not.toContain("About six and a half");
+    expect(out.coverage.stoppedBecause).toBe("ungroundedAnswer");
+    expect(out.coverage.complete).toBe(false);
+    expect(out.cost.toolCalls).toBe(0);
+  });
+
+  it("pushes back once, naming what the host counted", async () => {
+    const provider = createFakeInferenceProvider({
+      respond: () => reply(answerBlock({ answer: "About six and a half." })),
+    });
+    await runQueryLoop(
+      { question: "q", grantedScopes: ["oura.sleep"] },
+      { provider, tools: unreadTools() },
+    );
+
+    // Exactly one push-back, then the run ends — it must not spend the whole
+    // turn budget re-asking, since each turn is a relay call.
+    expect(provider.calls).toHaveLength(2);
+    const pushBack = provider.calls[1]?.messages.at(-1);
+    expect(pushBack?.role).toBe("user");
+    expect(pushBack?.content).toContain("0 records read");
+  });
+
+  it("accepts the answer once a script has read something", async () => {
+    // The same ungrounded first answer, but this time the model takes the
+    // push-back, reads data, and answers from it.
+    let ran = false;
+    const provider = createFakeInferenceProvider({
+      respond: (_i, n) =>
+        reply(
+          n === 1
+            ? runBlock("const s = await vana.readAll('oura.sleep');")
+            : answerBlock({ answer: "6.52 hours over 1030 nights." }),
+        ),
+    });
+    const out = await runQueryLoop(
+      { question: "q", grantedScopes: ["oura.sleep"] },
+      {
+        provider,
+        tools: unreadTools({
+          async execute() {
+            ran = true;
+            return executed({ stdout: "avg=6.52" });
+          },
+          // Stands in for the host accumulator: zero until a run reports.
+          coverage: () =>
+            ran
+              ? {
+                  scopesScanned: ["oura.sleep"],
+                  recordsScanned: 1030,
+                  scopesSkipped: [],
+                  complete: true,
+                }
+              : {
+                  scopesScanned: [],
+                  recordsScanned: 0,
+                  scopesSkipped: [],
+                  complete: false,
+                },
+        }),
+      },
+    );
+
+    expect(out.answer).toContain("6.52 hours");
+    expect(out.coverage.stoppedBecause).toBeUndefined();
+    expect(out.coverage.recordsScanned).toBe(1030);
+  });
+
+  it("refuses an answer after a script that scanned zero records", async () => {
+    // A script ran and completed, but read nothing. `toolCalls: 1` is not
+    // evidence of a read, which is why the guard reads the host's counter
+    // rather than the loop's own run count.
+    const provider = createFakeInferenceProvider({
+      respond: (_i, n) =>
+        reply(
+          n === 0
+            ? runBlock("const s = [];")
+            : answerBlock({ answer: "You averaged 6.5 hours." }),
+        ),
+    });
+    const emptyCoverage = {
+      scopesScanned: [],
+      recordsScanned: 0,
+      scopesSkipped: [],
+      complete: true,
+    };
+    const out = await runQueryLoop(
+      { question: "q", grantedScopes: ["oura.sleep"] },
+      {
+        provider,
+        tools: fakeTools([executed({ coverage: emptyCoverage })], {
+          coverage: () => emptyCoverage,
+        }),
+      },
+    );
+
+    expect(out.answer).not.toContain("6.5 hours");
+    expect(out.coverage.stoppedBecause).toBe("ungroundedAnswer");
+    expect(out.cost.toolCalls).toBeGreaterThan(0);
+  });
+
+  it("still lets a refused read be answered — the denial IS the finding", async () => {
+    // `tools/api.ts` throws `SCOPE_NOT_GRANTED` rather than returning `[]`, so
+    // a script cannot read a denial as "there is nothing there". Reporting
+    // that denial is an honest answer, and it necessarily scanned 0 records:
+    // the grounding rule must not swallow it. Note `error` maps to no
+    // `stoppedBecause`, so the flag cannot key off the termination alone.
+    const provider = createFakeInferenceProvider({
+      respond: (input, n) =>
+        n === 0
+          ? reply(runBlock("await vana.readAll('bank.transactions');"))
+          : // Echo what the host said back as the answer, as the eval harness
+            // does, so the assertion reads the sandbox's own words.
+            reply(
+              answerBlock({
+                answer: String(input.messages.at(-1)?.content ?? ""),
+              }),
+            ),
+    });
+    const denied = {
+      scopesScanned: [],
+      recordsScanned: 0,
+      scopesSkipped: [],
+      complete: false,
+    };
+    const out = await runQueryLoop(
+      { question: "how much did I spend?", grantedScopes: ["oura.sleep"] },
+      {
+        provider,
+        tools: fakeTools(
+          [
+            executed({
+              coverage: denied,
+              termination: "error",
+              error: {
+                code: "SCOPE_NOT_GRANTED",
+                message: 'scope "bank.transactions" is not in this grant',
+              },
+            }),
+          ],
+          { coverage: () => denied },
+        ),
+      },
+    );
+
+    expect(out.answer).toContain("not in this grant");
+    expect(out.coverage.stoppedBecause).not.toBe("ungroundedAnswer");
+  });
+
+  it("refuses a vana.result figure computed over zero records", async () => {
+    // The other door onto a clean final answer. A script that reports a
+    // number while the host counted nothing read produced it from nowhere.
+    const provider = createFakeInferenceProvider({
+      respond: () => reply(runBlock("vana.result({answer:'6.5h',value:6.5})")),
+    });
+    const empty = {
+      scopesScanned: [],
+      recordsScanned: 0,
+      scopesSkipped: [],
+      complete: false,
+    };
+    const out = await runQueryLoop(
+      { question: "q", grantedScopes: ["oura.sleep"] },
+      {
+        provider,
+        tools: fakeTools(
+          [
+            executed({
+              coverage: empty,
+              result: { answer: "6.5h", value: 6.5 },
+            }),
+          ],
+          { coverage: () => empty },
+        ),
+      },
+    );
+
+    expect(out.answer).not.toContain("6.5h");
+    expect(out.coverage.stoppedBecause).toBe("ungroundedAnswer");
+    // The refused figure must not survive into the answer.
+    expect(out.value).toBeUndefined();
+  });
+
+  it("accepts a vana.result figure once records were read", async () => {
+    const provider = createFakeInferenceProvider({
+      respond: () =>
+        reply(runBlock("vana.result({answer:'6.52h',value:6.52})")),
+    });
+    const out = await runQueryLoop(
+      { question: "q", grantedScopes: ["oura.sleep"] },
+      {
+        provider,
+        tools: fakeTools([
+          executed({ result: { answer: "6.52h", value: 6.52 } }),
+        ]),
+      },
+    );
+    expect(out.answer).toContain("6.52h");
+    expect(out.value).toBe(6.52);
+    expect(out.coverage.stoppedBecause).toBeUndefined();
+  });
+
+  it("still answers a grant question that reads no records (Q12)", async () => {
+    // The divergence from the answer branch, pinned. `vana.scopes()` returns
+    // host data and scans nothing, and Q12 is answered over an EMPTY grant
+    // where no counter can ever be non-zero. A figure-free `vana.result` here
+    // is honest, and refusing it would make the class unanswerable.
+    const provider = createFakeInferenceProvider({
+      respond: () => reply(runBlock("vana.result({answer:'visible-count:0'})")),
+    });
+    const empty = {
+      scopesScanned: [],
+      recordsScanned: 0,
+      scopesSkipped: [],
+      complete: false,
+    };
+    const out = await runQueryLoop(
+      { question: "what did this server tell the builder?", grantedScopes: [] },
+      {
+        provider,
+        tools: fakeTools(
+          [
+            executed({
+              coverage: empty,
+              result: { answer: "visible-count:0" },
+            }),
+          ],
+          { coverage: () => empty },
+        ),
+      },
+    );
+    expect(out.answer).toContain("visible-count:0");
+    expect(out.coverage.stoppedBecause).not.toBe("ungroundedAnswer");
+  });
+
+  it("pushes back once before failing a vana.result figure", async () => {
+    // Shares the answer branch's counter, so the model gets exactly one turn
+    // to write a script that reads something.
+    let ran = 0;
+    const empty = {
+      scopesScanned: [],
+      recordsScanned: 0,
+      scopesSkipped: [],
+      complete: false,
+    };
+    const provider = createFakeInferenceProvider({
+      respond: () => reply(runBlock("vana.result({answer:'6.5h',value:6.5})")),
+    });
+    await runQueryLoop(
+      { question: "q", grantedScopes: ["oura.sleep"] },
+      {
+        provider,
+        tools: fakeTools([], {
+          async execute() {
+            ran += 1;
+            return executed({
+              coverage: empty,
+              result: { answer: "6.5h", value: 6.5 },
+            });
+          },
+          coverage: () => empty,
+        }),
+      },
+    );
+    expect(ran).toBe(2);
+    const pushBack = provider.calls[1]?.messages.at(-1);
+    expect(pushBack?.content).toContain("0 records read");
+  });
+
+  it("says in the answer text that nothing was read", async () => {
+    // The refusal has to be legible to a reader of the answer, not only to a
+    // caller that inspects coverage — the same rule as `complete: false`.
+    const provider = createFakeInferenceProvider({
+      respond: () => reply(answerBlock({ answer: "Six and a half." })),
+    });
+    const out = await runQueryLoop(
+      { question: "q", grantedScopes: ["oura.sleep"] },
+      { provider, tools: unreadTools() },
+    );
+    expect(out.answer).toContain("incomplete");
+    expect(out.answer).toContain("without running a script that read any");
+  });
+});
+
 describe("runQueryLoop — honesty invariants", () => {
   it("an answer with no script run is never reported as complete", async () => {
     // A model that answers straight from its own prose has read nothing. The
