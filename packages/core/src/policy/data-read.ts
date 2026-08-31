@@ -62,6 +62,9 @@ export function parseGrantExpiresAtSeconds(value: unknown): number | null {
   return Number.isNaN(millis) ? null : Math.floor(millis / 1000);
 }
 
+/** Auth-result sentinels; see the reserved-grantId check below. */
+export const SENTINEL_GRANT_IDS = new Set(["owner", "policy-bypass"]);
+
 export async function verifyDataReadPolicy(
   input: DataReadPolicyInput,
   ports: DataReadPolicyPorts,
@@ -82,10 +85,27 @@ export async function verifyDataReadPolicy(
     });
   }
 
+  // "owner" / "policy-bypass" are server-internal auth-result sentinels that
+  // confer the unredacted owner view and the x402 payment exemption. Neither
+  // caller input nor a gateway-supplied grant id may ever occupy them.
+  if (SENTINEL_GRANT_IDS.has(input.grantId)) {
+    throw new GrantRequiredError({
+      reason: "Reserved grantId",
+      grantId: input.grantId,
+    });
+  }
+
   const grant = await ports.grantVerifier.getGrant(input.grantId);
   if (!grant) {
     throw new GrantRequiredError({
       reason: "Grant not found",
+      grantId: input.grantId,
+    });
+  }
+
+  if (SENTINEL_GRANT_IDS.has(grant.id)) {
+    throw new GrantRequiredError({
+      reason: "Grant resolved to a reserved id",
       grantId: input.grantId,
     });
   }

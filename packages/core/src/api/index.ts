@@ -962,7 +962,14 @@ function redactEnvelopeForGrantee(
           string,
           unknown
         >;
-        data = { ...data, metadata: metadataRest };
+        if (Object.keys(metadataRest).length === 0) {
+          // The lineage was the whole metadata object; leaving `{}` behind
+          // would still disclose that a metadata object existed.
+          const { metadata: _emptied, ...dataRest } = data;
+          data = dataRest;
+        } else {
+          data = { ...data, metadata: metadataRest };
+        }
       }
     } else {
       const { lineage: _consumed, ...dataRest } = data;

@@ -834,8 +834,30 @@ describe("mcp/read-client deletion gate", () => {
       },
     ];
 
-    function makeClient(authResult: { grantId: string; builder?: string }) {
-      return createMcpDataReadClient({
+    function makeClient(
+      authResult: { grantId: string; builder?: string },
+      options: {
+        data?: Record<string, unknown>;
+        blocks?: unknown[];
+        envelopeError?: Error;
+      } = {},
+    ) {
+      const envelopeData = options.data ?? {
+        note: "hello",
+        lineage: ["0xsource"],
+        metadata: { description: "d", lineage: ["0xsource"] },
+        $lineage: { sources: ["0xsource"], writtenAt: "2026-06-05" },
+        $writtenBy: { builder: "0xbeef", grantId: "g-w" },
+      };
+      const readEnvelope = options.envelopeError
+        ? vi.fn().mockRejectedValue(options.envelopeError)
+        : vi.fn().mockResolvedValue({
+            version: "1.0",
+            scope: "spine.health.summary",
+            collectedAt: "2026-06-05T00:00:00Z",
+            data: envelopeData,
+          });
+      const client = createMcpDataReadClient({
         serverOrigin: SERVER_ORIGIN,
         granteeAccount: createAccount(),
         dataApiDeps: {
@@ -853,12 +875,12 @@ describe("mcp/read-client deletion gate", () => {
               }) as never,
             findByFileId: vi.fn(),
             findUnsynced: vi.fn(),
-            readEnvelope: vi.fn(),
+            readEnvelope,
             readScopeBlocks: vi.fn().mockResolvedValue({
               scope: "spine.health.summary",
               collectedAt: "2026-06-05T00:00:00Z",
               contentKind: "vana-envelope",
-              blocks: structuredClone(STAMPED_BLOCKS),
+              blocks: structuredClone(options.blocks ?? STAMPED_BLOCKS),
               warnings: [],
             }),
             readBlockManifest: vi.fn().mockResolvedValue({
@@ -888,10 +910,11 @@ describe("mcp/read-client deletion gate", () => {
           accessLogWriter: { write: vi.fn() },
         },
       });
+      return { client, readEnvelope };
     }
 
-    it("redacts stamped keys and lineage blocks from a grantee block read", async () => {
-      const client = makeClient({ grantId: "grant-1", builder: "0x2222" });
+    it("redacts stamped keys and the consumed lineage from a grantee block read", async () => {
+      const { client } = makeClient({ grantId: "grant-1", builder: "0x2222" });
       const result = await client.readScopeBlocks({
         scope: "spine.health.summary",
         grantId: "grant-1",
@@ -906,20 +929,169 @@ describe("mcp/read-client deletion gate", () => {
       expect(paths).toContain("$.data.note[chars 0:5]");
 
       const dataBlock = result.blocks.find((b) => b.path === "$.data");
+      // JSON record: the consumed caller field is TOP-LEVEL `lineage`;
+      // `metadata.lineage` on a JSON record is user data and stays.
       expect(dataBlock?.value).toEqual({
         note: "hello",
-        metadata: { description: "d" },
+        metadata: { description: "d", lineage: ["0xsource"] },
       });
+      // Group labels naming a stamped key are sanitized, values stripped.
       const groupBlock = result.blocks.find(
-        (b) => b.path === "$.data.{$lineage:note}",
+        (b) => b.path === "$.data.{…:note}",
       );
       expect(groupBlock?.value).toEqual({ note: "grouped" });
+      expect(paths).not.toContain("$.data.{$lineage:note}");
+      const metaBlock = result.blocks.find((b) => b.path === "$.data.metadata");
+      expect(metaBlock?.value).toEqual({
+        description: "d",
+        lineage: ["0xsource"],
+      });
+    });
+
+    it("keeps an unstamped record's lineage field on a grantee block read", async () => {
+      // No `$lineage` evidence in the served blocks, so the decision comes
+      // from the stored envelope — which is unstamped.
+      const { client } = makeClient(
+        { grantId: "grant-1", builder: "0x2222" },
+        {
+          data: { note: "hello", lineage: ["user-data"] },
+          blocks: [
+            {
+              id: "b-data",
+              path: "$.data",
+              mediaType: "application/json",
+              value: { note: "hello", lineage: ["user-data"] },
+              sizeBytes: 60,
+            },
+            {
+              id: "b-caller-lin",
+              path: "$.data.lineage",
+              mediaType: "application/json",
+              value: ["user-data"],
+              sizeBytes: 20,
+            },
+          ],
+        },
+      );
+      const result = await client.readScopeBlocks({
+        scope: "spine.health.summary",
+        grantId: "grant-1",
+        maxBytes: 4096,
+      });
+      const callerLineage = result.blocks.find(
+        (b) => b.path === "$.data.lineage",
+      );
+      expect(callerLineage?.value).toEqual(["user-data"]);
+      const dataBlock = result.blocks.find((b) => b.path === "$.data");
+      expect(dataBlock?.value).toEqual({
+        note: "hello",
+        lineage: ["user-data"],
+      });
+    });
+
+    it("does not read the envelope when the served blocks carry no lineage-shaped content", async () => {
+      const { client, readEnvelope } = makeClient(
+        { grantId: "grant-1", builder: "0x2222" },
+        {
+          blocks: [
+            {
+              id: "b-items",
+              path: "$.data.conversations[0:2]",
+              mediaType: "application/json",
+              value: [{ n: 1 }, { n: 2 }],
+              sizeBytes: 40,
+            },
+          ],
+        },
+      );
+      const result = await client.readScopeBlocks({
+        scope: "spine.health.summary",
+        grantId: "grant-1",
+        maxBytes: 4096,
+      });
+      expect(result.blocks).toHaveLength(1);
+      expect(readEnvelope).not.toHaveBeenCalled();
+    });
+
+    it("drops metadata lineage from a stamped binary record's block read", async () => {
+      const { client } = makeClient(
+        { grantId: "grant-1", builder: "0x2222" },
+        {
+          data: {
+            $binary: true,
+            mimeType: "application/pdf",
+            sizeBytes: 10,
+            contentHash: "0xhash",
+            metadata: { description: "d", lineage: ["0xsource"] },
+            $lineage: { sources: ["0xsource"] },
+          },
+          blocks: [
+            {
+              id: "b-bin",
+              path: "$.data",
+              mediaType: "application/json",
+              value: {
+                contentKind: "document",
+                mimeType: "application/pdf",
+                metadata: { description: "d", lineage: ["0xsource"] },
+              },
+              sizeBytes: 90,
+            },
+          ],
+        },
+      );
+      const result = await client.readScopeBlocks({
+        scope: "spine.health.summary",
+        grantId: "grant-1",
+        maxBytes: 4096,
+      });
+      const dataBlock = result.blocks.find((b) => b.path === "$.data");
+      expect(dataBlock?.value).toEqual({
+        contentKind: "document",
+        mimeType: "application/pdf",
+        metadata: { description: "d" },
+      });
+    });
+
+    it("fails closed to full redaction when the envelope cannot be read", async () => {
+      // Lineage-shaped content with no visible $lineage evidence forces the
+      // envelope read; when that fails, both caller-lineage locations drop.
+      const { client, readEnvelope } = makeClient(
+        { grantId: "grant-1", builder: "0x2222" },
+        {
+          envelopeError: new Error("gone"),
+          blocks: [
+            {
+              id: "b-caller-lin",
+              path: "$.data.lineage",
+              mediaType: "application/json",
+              value: ["0xsource"],
+              sizeBytes: 20,
+            },
+            {
+              id: "b-meta",
+              path: "$.data.metadata",
+              mediaType: "application/json",
+              value: { lineage: ["0xsource"], description: "d" },
+              sizeBytes: 40,
+            },
+          ],
+        },
+      );
+      const result = await client.readScopeBlocks({
+        scope: "spine.health.summary",
+        grantId: "grant-1",
+        maxBytes: 4096,
+      });
+      expect(readEnvelope).toHaveBeenCalled();
+      const paths = result.blocks.map((b) => b.path);
+      expect(paths).not.toContain("$.data.lineage");
       const metaBlock = result.blocks.find((b) => b.path === "$.data.metadata");
       expect(metaBlock?.value).toEqual({ description: "d" });
     });
 
     it("serves the owner's block read unredacted", async () => {
-      const client = makeClient({ grantId: "owner", builder: "0xowner" });
+      const { client } = makeClient({ grantId: "owner", builder: "0xowner" });
       const result = await client.readScopeBlocks({
         scope: "spine.health.summary",
         grantId: "owner",
@@ -929,7 +1101,7 @@ describe("mcp/read-client deletion gate", () => {
     });
 
     it("hides stamped-key entries from a grantee manifest read", async () => {
-      const client = makeClient({ grantId: "grant-1", builder: "0x2222" });
+      const { client } = makeClient({ grantId: "grant-1", builder: "0x2222" });
       const manifest = await client.readBlockManifest?.({
         scope: "spine.health.summary",
         grantId: "grant-1",
@@ -938,12 +1110,14 @@ describe("mcp/read-client deletion gate", () => {
       expect(paths).not.toContain("$.data.$writtenBy");
       expect(paths).not.toContain("$.data.$lineage.sources[0:1]");
       expect(paths).not.toContain("$.data.lineage");
+      expect(paths).not.toContain("$.data.{$lineage:note}");
+      expect(paths).toContain("$.data.{…:note}");
       expect(paths).toContain("$.data");
       expect(paths).toContain("$.data.note[chars 0:5]");
     });
 
     it("keeps the owner's manifest read unredacted", async () => {
-      const client = makeClient({ grantId: "owner" });
+      const { client } = makeClient({ grantId: "owner" });
       const manifest = await client.readBlockManifest?.({
         scope: "spine.health.summary",
         grantId: "owner",

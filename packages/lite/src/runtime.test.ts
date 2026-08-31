@@ -332,6 +332,28 @@ describe("createPsLiteRuntime", () => {
     expect(body.error.errorCode).toBe("MISSING_AUTH");
   });
 
+  it("bearer builder auth refuses sentinel grantIds that would claim the owner view", async () => {
+    // The bearer adapter echoes the caller-supplied grantId into the auth
+    // result; "owner" / "policy-bypass" are server-internal sentinels that
+    // confer the unredacted owner view and payment exemption, so a builder
+    // token must never be able to mint them.
+    const auth = createBearerTokenPsLiteAuth({
+      ownerToken: "owner-token",
+      builderToken: "builder-token",
+    });
+    for (const sentinel of ["owner", "policy-bypass"]) {
+      await expect(
+        auth.authorizeBuilderRead({
+          request: new Request("https://ps.local/v1/data/instagram.profile", {
+            headers: { Authorization: "Bearer builder-token" },
+          }),
+          scope: "instagram.profile",
+          grantId: sentinel,
+        }),
+      ).rejects.toMatchObject({ errorCode: "GRANT_REQUIRED" });
+    }
+  });
+
   it("ingests successfully even without a gateway schema resolver", async () => {
     // Schema is best-effort in the canary flow. When the runtime is wired
     // without a gateway (no resolver), ingestion proceeds with schemaId

@@ -70,6 +70,24 @@ describe("trimSourceData", () => {
     expect(typeof cut.data).toBe("string");
     expect((cut.data as string).endsWith("...[truncated]")).toBe(true);
   });
+
+  it("drops the consumed caller lineage field from a stamped derivative source", () => {
+    const result = trimSourceData({
+      summary: "seven hours",
+      lineage: ["0xsource"],
+      $lineage: { sources: ["0xsource"], writtenAt: "2026-06-05" },
+      $writtenBy: { builder: "0xbeef" },
+    });
+    expect(result.data).toEqual({ summary: "seven hours" });
+  });
+
+  it("keeps a lineage field on an unstamped record", () => {
+    const result = trimSourceData({
+      summary: "root",
+      lineage: ["user-data"],
+    });
+    expect(result.data).toEqual({ summary: "root", lineage: ["user-data"] });
+  });
 });
 
 describe("buildQuestionMessages", () => {

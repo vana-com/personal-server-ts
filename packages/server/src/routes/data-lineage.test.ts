@@ -824,6 +824,96 @@ describe("derivative data routes", () => {
       expect(body.data.$lineage).toBeUndefined();
     });
 
+    it("omits the metadata object entirely when redaction empties it", async () => {
+      await seedSource();
+      const bytes = new TextEncoder().encode("%PDF-1.7 report");
+      const representation = {
+        contentType: "application/pdf",
+        filename: "report.pdf",
+        metadataHeader: JSON.stringify({ lineage: [SOURCE_ID] }),
+      };
+      const res = await app.request(`/${REPORT_SCOPE}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": representation.contentType,
+          "X-Filename": representation.filename,
+          "X-Vana-Metadata": representation.metadataHeader,
+          Authorization: `Bearer ${SESSION_TOKEN}`,
+          [WRITE_SIGNATURE_HEADER]: await buildWeb3SignedHeader({
+            wallet: builderWallet,
+            aud: SERVER_ORIGIN,
+            method: "POST",
+            uri: `/${REPORT_SCOPE}`,
+            body: await binaryWriteSignedBytes({ bytes, ...representation }),
+            grantId: WRITE_GRANT_ID,
+          }),
+        },
+        body: bytes,
+      });
+      expect(res.status).toBe(201);
+
+      const jsonRead = await builderRecordRead(REPORT_SCOPE, {
+        grantId: READ_REPORT_GRANT_ID,
+      });
+      expect((await jsonRead.json()).data.metadata).toBeUndefined();
+
+      const rawRead = await builderRecordRead(REPORT_SCOPE, {
+        grantId: READ_REPORT_GRANT_ID,
+        query: "?content=raw",
+      });
+      expect(rawRead.status).toBe(200);
+      expect(rawRead.headers.get("X-Vana-Metadata")).toBeNull();
+    });
+
+    it("keeps a JSON record's user metadata.lineage field on a grantee read", async () => {
+      // The JSON write path consumes only the TOP-LEVEL lineage field;
+      // metadata.lineage inside a JSON body is ordinary user data.
+      await seedSource();
+      const write = await sessionWrite(DERIVED_SCOPE, {
+        summary: "seven hours",
+        metadata: { lineage: "user-data" },
+        lineage: [SOURCE_ID],
+      });
+      expect(write.status).toBe(201);
+      const res = await builderRecordRead(DERIVED_SCOPE);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.metadata).toEqual({ lineage: "user-data" });
+      expect(body.data.lineage).toBeUndefined();
+      expect(body.data.$writtenBy).toBeUndefined();
+    });
+
+    it("serves the full envelope to a policy-bypass credential", async () => {
+      const localApp = dataRoutes({ ...deps, devToken: "dev-secret" });
+      const seed = await app.request(`/${SOURCE_SCOPE}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: await ownerHeader(
+            "POST",
+            `/${SOURCE_SCOPE}`,
+            JSON.stringify({ messages: ["hi"] }),
+          ),
+        },
+        body: JSON.stringify({ messages: ["hi"] }),
+      });
+      expect(seed.status).toBe(201);
+      const write = await sessionWrite(DERIVED_SCOPE, {
+        summary: "seven hours",
+        lineage: [SOURCE_ID],
+      });
+      expect(write.status).toBe(201);
+
+      const res = await localApp.request(`/${DERIVED_SCOPE}`, {
+        headers: { Authorization: "Bearer dev-secret" },
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.$writtenBy.builder).toBe(builderWallet.address);
+      expect(body.data.$lineage.sources).toEqual([SOURCE_ID]);
+      expect(body.data.lineage).toEqual([SOURCE_ID]);
+    });
+
     it("omits the consumed metadata lineage from a grantee raw read's X-Vana-Metadata", async () => {
       await seedSource();
       await writeBinaryDerivative();

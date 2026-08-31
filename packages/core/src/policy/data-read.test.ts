@@ -405,6 +405,49 @@ describe("verifyDataReadPolicy", () => {
       ),
     ).rejects.toMatchObject({ errorCode: "PS_UNAVAILABLE" });
   });
+
+  it("rejects a sentinel grantId so caller input can never claim the owner view", async () => {
+    for (const sentinel of ["owner", "policy-bypass"]) {
+      const getGrant = vi.fn().mockResolvedValue(makeGrant({ id: sentinel }));
+      await expect(
+        verifyDataReadPolicy(
+          {
+            signer: BUILDER_ADDRESS,
+            grantId: sentinel,
+            requestedScope: "instagram.profile",
+            serverOwner: "0xOwner",
+          },
+          {
+            authSessionVerifier: {
+              getBuilder: vi.fn().mockResolvedValue(builder),
+            },
+            grantVerifier: { getGrant },
+          },
+        ),
+      ).rejects.toMatchObject({ errorCode: "GRANT_REQUIRED" });
+      expect(getGrant).not.toHaveBeenCalled();
+    }
+  });
+
+  it("rejects a resolved grant whose id is a sentinel value", async () => {
+    const grant = makeGrant({ id: "owner" });
+    await expect(
+      verifyDataReadPolicy(
+        {
+          signer: BUILDER_ADDRESS,
+          grantId: "grant-123",
+          requestedScope: "instagram.profile",
+          serverOwner: "0xOwner",
+        },
+        {
+          authSessionVerifier: {
+            getBuilder: vi.fn().mockResolvedValue(builder),
+          },
+          grantVerifier: { getGrant: vi.fn().mockResolvedValue(grant) },
+        },
+      ),
+    ).rejects.toMatchObject({ errorCode: "GRANT_REQUIRED" });
+  });
 });
 
 describe("derivative grants never leak across a lineage edge", () => {
