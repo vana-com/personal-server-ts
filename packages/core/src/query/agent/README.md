@@ -35,17 +35,20 @@ made on the inference-path argument, not on browser safety.
 
 ## The two budgets, which are not the same budget
 
-| Budget                   | Bounds                            | Default         |
-| ------------------------ | --------------------------------- | --------------- |
-| sandbox `maxOutputBytes` | how much a script may **produce** | 1 MB            |
-| `transcript.ts`          | how much we may **send back**     | 1 MiB plaintext |
+| Budget                   | Bounds                            | Default           |
+| ------------------------ | --------------------------------- | ----------------- |
+| sandbox `maxOutputBytes` | how much a script may **produce** | 1 MB              |
+| `transcript.ts`          | how much we may **send back**     | 120 KiB plaintext |
 
-The relay caps a request body at 2 MiB (`INFERENCE_MAX_BODY_BYTES` on our
+The relay caps a request body at **256 KiB** (`INFERENCE_MAX_BODY_BYTES` on our
 gateway; Phala's own cap is 32 MiB, so ours binds). The body carries the _whole
 transcript_ every turn, so the cost is cumulative — with `maxToolCalls: 50` a
-naive per-turn rule still walks into a 413. `fitTranscript` drops the oldest
-turns and **says so in a marker message**; `truncateOutput` keeps head and tail
-so neither a printed denominator nor a stack trace is lost.
+naive per-turn rule still walks into a 413. The 120 KiB is **derived**, not
+picked: the cap less a 16 KiB envelope reserve, halved, because E2EE (on by
+default) encodes each message's content as hex and so doubles it. `fitTranscript`
+drops the oldest turns, **says so in a marker message**, and records the count in
+`coverage.violations`; `truncateOutput` keeps head and tail so neither a printed
+denominator nor a stack trace is lost.
 
 ## The invariant
 
