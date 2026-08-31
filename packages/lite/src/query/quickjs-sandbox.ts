@@ -730,7 +730,6 @@ export function verifyOutcome(
       ...doc,
       coverage: {
         ...doc.coverage,
-        complete: false,
         stoppedBecause: "memory",
       },
       error: doc.error ?? { code: "SILENT_EMPTY_RUN", message },
@@ -743,7 +742,9 @@ export function verifyOutcome(
  *
  * The ledger knows what was read; only the host knows why the reading stopped.
  * Strictly one-directional, like `applyGrantCoverage` on the Node side: it can
- * mark a run incomplete and never mark one complete.
+ * only add a reason the reading was bounded, never withdraw one. It never
+ * touches a counter, so it cannot make a run look like it read more than it
+ * did.
  */
 function finalizeCoverage(
   coverage: CoverageCounters,
@@ -751,16 +752,16 @@ function finalizeCoverage(
   acc: RunAccounting,
 ): CoverageCounters {
   if (termination === "wallClock") {
-    return { ...coverage, complete: false, stoppedBecause: "wallClock" };
+    return { ...coverage, stoppedBecause: "wallClock" };
   }
   if (termination === "memory") {
-    return { ...coverage, complete: false, stoppedBecause: "memory" };
+    return { ...coverage, stoppedBecause: "memory" };
   }
   if (termination === "error") {
-    return { ...coverage, complete: false, stoppedBecause: "error" };
+    return { ...coverage, stoppedBecause: "error" };
   }
   if (acc.error && acc.error.code !== "BUDGET_EXHAUSTED") {
-    return { ...coverage, complete: false, stoppedBecause: "error" };
+    return { ...coverage, stoppedBecause: "error" };
   }
   return coverage;
 }
@@ -848,7 +849,6 @@ function failed(
       unreadable: 0,
       perScope: {},
       scopesSkipped: [],
-      complete: false,
       method: "full",
       stoppedBecause: termination === "wallClock" ? "wallClock" : "error",
       enforcementNotes: enforcement.notes,

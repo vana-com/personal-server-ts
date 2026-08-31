@@ -91,7 +91,7 @@ export function createVanaApi(
   ctx: QueryToolContext,
   deps: QueryToolDeps,
 ): CreatedApi {
-  const coverage = new CoverageLedger(ctx.grantedScopes);
+  const coverage = new CoverageLedger();
   const notes: string[] = [];
   let result: ScriptResult | undefined;
   let toolCalls = 0;

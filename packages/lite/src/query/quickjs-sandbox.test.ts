@@ -285,17 +285,19 @@ describe("coverage is host-authored and the script cannot touch it", () => {
     expect(decoded.doc.result?.answer).toBe("done");
   });
 
-  it("marks a run incomplete when only part of the grant was read", async () => {
+  it("names only the granted scopes the script actually read", async () => {
+    // One of two granted scopes read. The host must not credit `mail`.
     const { decoded } = await run(`
       await vana.readAll("notes");
       vana.result({ answer: "partial" });
     `);
     expect(decoded.ok).toBe(true);
     if (!decoded.ok) return;
-    expect(decoded.doc.coverage.complete).toBe(false);
+    expect(decoded.doc.coverage.scopesScanned).toEqual(["notes"]);
+    expect(decoded.doc.coverage.recordsScanned).toBe(NOTES.length);
   });
 
-  it("marks a run complete when the whole grant was streamed", async () => {
+  it("names every granted scope when the whole grant was streamed", async () => {
     const { decoded } = await run(`
       await vana.readAll("notes");
       await vana.readAll("mail");
@@ -303,10 +305,18 @@ describe("coverage is host-authored and the script cannot touch it", () => {
     `);
     expect(decoded.ok).toBe(true);
     if (!decoded.ok) return;
-    expect(decoded.doc.coverage.complete).toBe(true);
+    expect(decoded.doc.coverage.scopesScanned.sort()).toEqual([
+      "mail",
+      "notes",
+    ]);
+    expect(decoded.doc.coverage.recordsScanned).toBe(
+      NOTES.length + MAIL.length,
+    );
   });
 
-  it("records a bounded read as a partial pass, never a full one", async () => {
+  it("counts a bounded read as only what it read, never the whole scope", async () => {
+    // The partial/full distinction survives as a counter: a 10-byte window
+    // over `notes` must not report the record count a full pass would.
     const { decoded } = await run(`
       await vana.read("notes", { maxBytes: 10 });
       await vana.readAll("mail");
@@ -314,7 +324,9 @@ describe("coverage is host-authored and the script cannot touch it", () => {
     `);
     expect(decoded.ok).toBe(true);
     if (!decoded.ok) return;
-    expect(decoded.doc.coverage.complete).toBe(false);
+    expect(decoded.doc.coverage.recordsScanned).toBeLessThan(
+      NOTES.length + MAIL.length,
+    );
   });
 });
 
@@ -384,16 +396,15 @@ describe("budget and termination are reported honestly", () => {
     expect(result.timedOut).toBe(true);
     expect(decoded.ok).toBe(true);
     if (!decoded.ok) return;
-    expect(decoded.doc.coverage.complete).toBe(false);
     expect(decoded.doc.coverage.stoppedBecause).toBe("wallClock");
   });
 
-  it("reports a script error as an error, with coverage still incomplete", async () => {
+  it("reports a script error as an error, with an error stop in coverage", async () => {
     const { decoded } = await run("throw new Error('boom')");
     expect(decoded.ok).toBe(true);
     if (!decoded.ok) return;
     expect(decoded.doc.error?.message).toContain("boom");
-    expect(decoded.doc.coverage.complete).toBe(false);
+    expect(decoded.doc.coverage.stoppedBecause).toBe("error");
   });
 
   it("still emits a decodable frame when the script produces nothing", async () => {
@@ -404,7 +415,6 @@ describe("budget and termination are reported honestly", () => {
     if (!decoded.ok) return;
     expect(result.termination).toBe("memory");
     expect(decoded.doc.error?.code).toBe("SILENT_EMPTY_RUN");
-    expect(decoded.doc.coverage.complete).toBe(false);
   });
 });
 
@@ -443,7 +453,6 @@ describe("the §19.17 mechanics, re-asserted against the shipped version", () =>
         unreadable: 0,
         perScope: {},
         scopesSkipped: [],
-        complete: true,
         method: "full" as const,
         enforcementNotes: [],
       },
@@ -453,7 +462,6 @@ describe("the §19.17 mechanics, re-asserted against the shipped version", () =>
     };
     const out = verifyOutcome(doc, "completed", { completed: false });
     expect(out.termination).toBe("memory");
-    expect(out.doc.coverage.complete).toBe(false);
     expect(out.doc.error?.code).toBe("SILENT_EMPTY_RUN");
   });
 
@@ -467,7 +475,6 @@ describe("the §19.17 mechanics, re-asserted against the shipped version", () =>
         unreadable: 0,
         perScope: { notes: { records: 3, bytes: 100, unreadable: 0 } },
         scopesSkipped: [],
-        complete: true,
         method: "full" as const,
         enforcementNotes: [],
       },
@@ -477,7 +484,6 @@ describe("the §19.17 mechanics, re-asserted against the shipped version", () =>
     };
     const out = verifyOutcome(doc, "completed", { completed: false });
     expect(out.termination).toBe("completed");
-    expect(out.doc.coverage.complete).toBe(true);
   });
 });
 

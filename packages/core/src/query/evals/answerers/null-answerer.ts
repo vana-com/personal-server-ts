@@ -26,7 +26,6 @@ export function createNullAnswerer(): EvalAnswerer {
             scope,
             reason: "null answerer",
           })),
-          complete: false,
         },
         determinism: "generated",
         cost: { toolCalls: 0, inputTokens: 0, outputTokens: 0, usd: 0 },

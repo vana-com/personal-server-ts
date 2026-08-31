@@ -13,7 +13,6 @@ function coverage(stoppedBecause?: QueryCoverage["stoppedBecause"]) {
     recordsScanned: 10,
     bytesScanned: 100,
     scopesSkipped: [],
-    complete: true,
   };
   return stoppedBecause ? { ...base, stoppedBecause } : base;
 }
@@ -109,7 +108,6 @@ describe("stoppedBecause describes why the run ended", () => {
     );
 
     expect(answer.coverage.stoppedBecause).toBe("error");
-    expect(answer.coverage.complete).toBe(false);
   });
 
   it("reports budget when the run simply ran out of turns", async () => {

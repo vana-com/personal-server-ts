@@ -298,7 +298,6 @@ describe("access logging", () => {
     const answer = (await res.json()) as {
       coverage: { complete: boolean; scopesSkipped: { scope: string }[] };
     };
-    expect(answer.coverage.complete).toBe(false);
     expect(answer.coverage.scopesSkipped.map((s) => s.scope)).toEqual(["a.b"]);
   });
 });
@@ -358,7 +357,6 @@ describe("the grant", () => {
       scope: "someone.elses",
       reason: "not in the caller's granted scopes",
     });
-    expect(answer.coverage.complete).toBe(false);
   });
 });
 

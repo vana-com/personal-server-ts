@@ -41,7 +41,6 @@ interface RunObservation {
   script?: string;
   recordsScanned: number;
   scopesScanned: string[];
-  complete: boolean;
   stoppedBecause?: string;
   inputTokens: number;
   outputTokens: number;
@@ -164,10 +163,7 @@ function report(
   out.push(
     `    coverage records ${recs.size} distinct ${JSON.stringify([...recs])}`,
   );
-  out.push(
-    `    coverage scopes  ${scopeSets.size} distinct set(s)` +
-      `   complete ${good.filter((o) => o.complete).length}/${good.length}`,
-  );
+  out.push(`    coverage scopes  ${scopeSets.size} distinct set(s)`);
 
   const tin = good.reduce((a, o) => a + o.inputTokens, 0);
   const tout = good.reduce((a, o) => a + o.outputTokens, 0);
@@ -242,7 +238,6 @@ async function main(): Promise<void> {
           ...(a.script !== undefined ? { script: a.script } : {}),
           recordsScanned: a.coverage.recordsScanned,
           scopesScanned: a.coverage.scopesScanned,
-          complete: a.coverage.complete,
           ...(stopped ? { stoppedBecause: stopped } : {}),
           inputTokens: a.cost.inputTokens,
           outputTokens: a.cost.outputTokens,
@@ -258,7 +253,6 @@ async function main(): Promise<void> {
           run: i,
           recordsScanned: 0,
           scopesScanned: [],
-          complete: false,
           inputTokens: 0,
           outputTokens: 0,
           durationMs: Date.now() - t0,

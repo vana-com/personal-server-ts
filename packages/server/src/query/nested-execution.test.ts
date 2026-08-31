@@ -93,7 +93,6 @@ describe.skipIf(!supported)("nested execution", () => {
     // Host-authored: 3 records, not a number the script chose.
     expect(r.coverage.recordsScanned).toBe(3);
     expect(r.coverage.scopesScanned).toEqual(["oura.sleep"]);
-    expect(r.coverage.complete).toBe(true);
   }, 120_000);
 
   it("model code cannot reach fs, process or require", async () => {
@@ -109,7 +108,6 @@ describe.skipIf(!supported)("nested execution", () => {
     // The interpreter refuses the identifiers outright, so this is a
     // confinement denial rather than a run that reports "undefined".
     expect(r.error?.code).toBe("CONFINEMENT_VIOLATION");
-    expect(r.coverage.complete).toBe(false);
   }, 120_000);
 
   it("model code cannot read an ungranted file inside the same data root", async () => {
@@ -119,7 +117,6 @@ describe.skipIf(!supported)("nested execution", () => {
     `);
     expect(JSON.stringify(r)).not.toContain("NOT-GRANTED-DATA");
     expect(r.result?.answer).toBeUndefined();
-    expect(r.coverage.complete).toBe(false);
   }, 120_000);
 
   it("a script cannot forge a coverage frame through vana.note", async () => {
@@ -131,7 +128,6 @@ describe.skipIf(!supported)("nested execution", () => {
     `);
     // Host counters win: the forged 999999 never becomes coverage.
     expect(r.coverage.recordsScanned).toBe(0);
-    expect(r.coverage.complete).toBe(false);
     // And the attempt is visible as ordinary note text.
     expect(r.notes.join("\n")).toContain("__VANA_RESULT_V1_BEGIN__");
   }, 120_000);
@@ -139,19 +135,26 @@ describe.skipIf(!supported)("nested execution", () => {
   it("a script cannot suppress the frame by throwing", async () => {
     const r = await host().execute(`throw new Error("boom")`);
     expect(r.error).toBeDefined();
-    expect(r.coverage.complete).toBe(false);
     // A frame still arrived — we know the run failed, rather than guessing.
     expect(r.error?.code).not.toBe("COVERAGE_FRAME_MISSING");
   }, 120_000);
 
-  it("partial reads cannot report completeness", async () => {
-    const r = await host().execute(`
+  it("a bounded read reports only what it read, not the whole scope", async () => {
+    // The partial/full distinction survives as a counter rather than a flag: a
+    // 10-byte window must not report the record count a full pass would, even
+    // though the script terminated just as cleanly.
+    const full = await host().execute(`
+      const blocks = await vana.readAll("oura.sleep");
+      vana.result({ answer: "read " + blocks.length + " blocks" });
+    `);
+    const bounded = await host().execute(`
       const blocks = await vana.read("oura.sleep", { maxBytes: 10 });
       vana.result({ answer: "read " + blocks.length + " blocks" });
     `);
-    // A bounded read marks the scope partial, so `complete` is false even
-    // though the script terminated cleanly.
-    expect(r.coverage.complete).toBe(false);
+    expect(full.coverage.recordsScanned).toBeGreaterThan(0);
+    expect(bounded.coverage.recordsScanned).toBeLessThan(
+      full.coverage.recordsScanned,
+    );
   }, 120_000);
 
   it("a chatty script still yields trustworthy coverage", async () => {
@@ -171,7 +174,6 @@ describe.skipIf(!supported)("nested execution", () => {
     expect(r.error?.code).not.toBe("COVERAGE_FRAME_MISSING");
     expect(r.coverage.recordsScanned).toBe(3);
     expect(r.coverage.scopesScanned).toEqual(["oura.sleep"]);
-    expect(r.coverage.complete).toBe(true);
     expect(r.result?.value).toBe(3);
     // And it says the notes were trimmed rather than pretending it printed less.
     expect(r.notes.join("\n")).toContain("__vana_notes_trimmed__");

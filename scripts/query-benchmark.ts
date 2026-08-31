@@ -113,7 +113,6 @@ interface Row {
   records: number;
   bytes: number;
   scopes: number;
-  complete: boolean;
   stoppedBecause?: string;
   method?: string;
   value?: number;
@@ -529,7 +528,6 @@ async function main(): Promise<void> {
         records: cov?.recordsScanned ?? 0,
         bytes: cov?.bytesScanned ?? 0,
         scopes: cov?.scopesScanned.length ?? 0,
-        complete: cov?.complete ?? false,
         stoppedBecause: cov?.stoppedBecause,
         method: cov?.method,
         value: answer?.value,
@@ -630,7 +628,6 @@ async function main(): Promise<void> {
       calls: median(rs.map((r) => r.toolCalls)),
       records: median(rs.map((r) => r.records)),
       bytes: median(rs.map((r) => r.bytes)),
-      anyComplete: rs.some((r) => r.complete),
       modes,
       values,
     };
@@ -639,7 +636,7 @@ async function main(): Promise<void> {
   process.stdout.write(
     `\n${"id".padEnd(4)} ${"class".padEnd(13)} ${"kind".padEnd(8)} ${"pass".padEnd(6)} ` +
       `${"ms".padStart(7)} ${"in".padStart(8)} ${"out".padStart(6)} ${"calls".padStart(5)} ` +
-      `${"records".padStart(8)} ${"cmpl".padStart(4)}  failure mode\n`,
+      `${"records".padStart(8)}  failure mode\n`,
   );
   for (const a of agg) {
     const score =
@@ -648,7 +645,7 @@ async function main(): Promise<void> {
       `${a.id.padEnd(4)} ${a.klass.padEnd(13)} ${a.kind.padEnd(8)} ${score.padEnd(6)} ` +
         `${String(a.ms).padStart(7)} ${String(a.inTok).padStart(8)} ${String(a.outTok).padStart(6)} ` +
         `${String(a.calls).padStart(5)} ${String(a.records).padStart(8)} ` +
-        `${(a.anyComplete ? "yes" : "no").padStart(4)}  ${a.modes.join("; ")}` +
+        ` ${a.modes.join("; ")}` +
         `${a.flaky ? "   << FLAKY" : ""}${a.modelGraded ? "  [model-graded]" : ""}\n`,
     );
   }
@@ -662,7 +659,6 @@ async function main(): Promise<void> {
       `run-totals: pass ${totals.pass}  fail ${totals.fail}  skip ${totals.skipped}\n` +
       `strict scoreboard: pass ${totals.strictPass} of ${totals.gradedRows} graded row(s)\n` +
       `tokens: ${totals.inputTokens} in / ${totals.outputTokens} out   wall ${(wall / 1000).toFixed(1)}s\n` +
-      `coverage.complete ever true: ${agg.some((a) => a.anyComplete) ? "YES" : "NO"}\n` +
       `raw: ${path}\n` +
       `rows: ${jsonlPath} (appended per row; re-run the same command to resume)\n`,
   );

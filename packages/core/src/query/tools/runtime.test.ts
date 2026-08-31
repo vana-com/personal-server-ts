@@ -66,7 +66,7 @@ describe("grant binding", () => {
       makeDeps(),
     );
     expect(out.error?.code).toBe("SCOPE_NOT_GRANTED");
-    expect(out.coverage.complete).toBe(false);
+    expect(out.coverage.scopesScanned).toEqual([]);
   });
 
   it("refuses an ungranted scope passed to search", async () => {
@@ -94,7 +94,7 @@ describe("coverage is host-authored (prompt contract §1)", () => {
     expect(out.result?.answer).toContain("999999");
   });
 
-  it("a script cannot mark an incomplete run complete", async () => {
+  it("a script cannot claim a granted scope it never read", async () => {
     const out = await runQueryScript(
       `
       await vana.readAll("oura.sleep");
@@ -104,11 +104,10 @@ describe("coverage is host-authored (prompt contract §1)", () => {
       makeCtx(["oura.sleep", "spotify.streams"]),
       makeDeps(),
     );
-    expect(out.coverage.complete).toBe(false);
     expect(out.coverage.scopesScanned).toEqual(["oura.sleep"]);
   });
 
-  it("is complete only when every granted scope was fully streamed", async () => {
+  it("counts every granted scope the script actually streamed", async () => {
     const out = await runQueryScript(
       `
       await vana.readAll("oura.sleep");
@@ -118,11 +117,14 @@ describe("coverage is host-authored (prompt contract §1)", () => {
       makeCtx(["oura.sleep", "spotify.streams"]),
       makeDeps(),
     );
-    expect(out.coverage.complete).toBe(true);
+    expect(out.coverage.scopesScanned).toEqual([
+      "oura.sleep",
+      "spotify.streams",
+    ]);
     expect(out.coverage.recordsScanned).toBe(5);
   });
 
-  it("marks a search-driven run as prefiltered, never complete", async () => {
+  it("marks a search-driven run as prefiltered", async () => {
     const out = await runQueryScript(
       `
       await vana.search("thai restaurant");
@@ -132,16 +134,24 @@ describe("coverage is host-authored (prompt contract §1)", () => {
       makeDeps(),
     );
     expect(out.coverage.method).toBe("prefiltered");
-    expect(out.coverage.complete).toBe(false);
   });
 
-  it("treats a bounded read as partial, not full", async () => {
-    const out = await runQueryScript(
+  it("counts a bounded read as only what it read, never the whole scope", async () => {
+    // The partial/full distinction survives as a counter, not as a flag: a
+    // windowed read must not report the record count a full pass would.
+    const full = await runQueryScript(
+      `await vana.readAll("oura.sleep"); vana.result({ answer: "x" });`,
+      makeCtx(["oura.sleep"]),
+      makeDeps(),
+    );
+    const bounded = await runQueryScript(
       `await vana.read("oura.sleep", { maxBytes: 100 }); vana.result({ answer: "x" });`,
       makeCtx(["oura.sleep"]),
       makeDeps(),
     );
-    expect(out.coverage.complete).toBe(false);
+    expect(bounded.coverage.recordsScanned).toBeLessThan(
+      full.coverage.recordsScanned,
+    );
   });
 
   it("surfaces sandbox enforcement notes rather than swallowing them", async () => {
@@ -173,7 +183,6 @@ describe("budgets are first-class outcomes, not errors", () => {
     );
     expect(out.error?.code).toBe("BUDGET_EXHAUSTED");
     expect(out.coverage.stoppedBecause).toBe("budget");
-    expect(out.coverage.complete).toBe(false);
   });
 
   const classifyDeps = () =>
@@ -204,7 +213,6 @@ describe("budgets are first-class outcomes, not errors", () => {
     );
     expect(out.classifyUsd).toBe(10);
     expect(out.coverage.stoppedBecause).toBe("budget");
-    expect(out.coverage.complete).toBe(false);
     expect(out.result?.answer).toBe("partial");
   });
 

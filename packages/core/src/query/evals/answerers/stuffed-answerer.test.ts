@@ -5,8 +5,8 @@
  * hold are the ones a comparison would be worthless without: it truncates
  * NEWEST-FIRST (plan §7's heuristic, not an arbitrary one), and its coverage
  * describes what it actually put in the prompt rather than what it was granted.
- * A baseline that quietly reported `complete: true` over a truncated slice
- * would make the agent arm look bad for being honest.
+ * A baseline that quietly reported a full pass over a truncated slice would
+ * make the agent arm look bad for being honest.
  */
 
 import { describe, expect, it } from "vitest";
@@ -90,12 +90,11 @@ describe("newest-first truncation", () => {
     });
 
     expect(answer.coverage.recordsScanned).toBe(20);
-    expect(answer.coverage.complete).toBe(true);
   });
 });
 
 describe("coverage describes the prompt, not the grant", () => {
-  it("reports incomplete coverage when truncation dropped records", async () => {
+  it("reports only the records it put in the prompt when truncating", async () => {
     const rows = notes(100);
     const { answerer } = harness(rows, 600);
 
@@ -105,9 +104,9 @@ describe("coverage describes the prompt, not the grant", () => {
     });
 
     expect(
-      answer.coverage.complete,
-      "a truncated slice is never complete",
-    ).toBe(false);
+      answer.coverage.method,
+      "a truncated slice is a prefiltered pass, not a full one",
+    ).toBe("prefiltered");
     expect(answer.coverage.recordsScanned).toBeLessThan(rows.length);
     expect(answer.coverage.recordsScanned).toBeGreaterThan(0);
   });

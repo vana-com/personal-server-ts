@@ -125,9 +125,10 @@ function defaultRunnerPath(): string {
 /**
  * Coverage for a run whose frame never arrived.
  *
- * Fails closed: no scopes scanned, nothing complete. A truncated frame is
- * indistinguishable from a hostile one, so both are treated as "we learned
- * nothing", never as a partial reading that might look total.
+ * Fails closed: no scopes scanned, no records, and an `error` stop. A
+ * truncated frame is indistinguishable from a hostile one, so both are treated
+ * as "we learned nothing", never as a partial reading that might look total.
+ * The zeroed counters are what carry that — see `EMPTY_COVERAGE`.
  */
 function failedCoverage(
   reason: "absent" | "truncated" | "malformed",
@@ -139,7 +140,6 @@ function failedCoverage(
     unreadable: 0,
     perScope: {},
     scopesSkipped: [],
-    complete: false,
     method: "full",
     stoppedBecause: "error",
     enforcementNotes: [`coverage frame ${reason}; no coverage can be trusted`],
@@ -164,8 +164,8 @@ export function createSandboxToolHost(options: SandboxToolHostOptions) {
    *
    * A question can take several turns, and coverage is a claim about the whole
    * request rather than about its last script. Merging is conservative in
-   * every direction: scopes union, counters sum, and `complete` is carried
-   * from the runs that earned it rather than from the last one to speak.
+   * every direction: scopes union, counters sum per scope, and the first
+   * abnormal termination seen is never superseded by a later success.
    */
   /**
    * Merge per-scope, then re-derive the totals.
@@ -232,30 +232,6 @@ export function createSandboxToolHost(options: SandboxToolHostOptions) {
       ].sort(),
       ...mergeScopeTotals(prev, next),
       scopesSkipped: [...skipped.values()],
-      /*
-       * Coverage only ACCUMULATES, so `complete` is a disjunction.
-       *
-       * ANDing it made the ordinary probe-then-compute shape permanently
-       * false: a first turn that calls `vana.scopes()` and reads nothing is
-       * `complete: false` by construction, and it poisoned a request whose
-       * second turn went on to stream every granted scope end to end. A later
-       * turn cannot un-read what an earlier one read, so refusing to credit
-       * the reading turn is not conservatism, it is a wrong answer.
-       *
-       * The disjunction is sound because a run's own `complete` already means
-       * "every scope in THIS grant was streamed end to end, nothing skipped,
-       * nothing partial, nothing stopped it" (`CoverageLedger.snapshot`), and
-       * every run in a request is ledgered against the same grant. So one
-       * `true` is a witness that the whole grant was covered.
-       *
-       * The prefilter taint is re-applied here, against the MERGED method,
-       * because it is the one conjunct the ledger enforces per run that a
-       * disjunction would otherwise drop. The `stoppedBecause` taint is not
-       * re-applied: `agent/loop.ts` already ANDs `stoppedBecause === undefined`
-       * into the request-level flag, and it — unlike this merge — knows whether
-       * the request ended cleanly or actually stopped.
-       */
-      complete: (prev.complete || next.complete) && method === "full",
       method,
       ...((prev.stoppedBecause ?? next.stoppedBecause)
         ? { stoppedBecause: prev.stoppedBecause ?? next.stoppedBecause }
@@ -300,7 +276,7 @@ export function createSandboxToolHost(options: SandboxToolHostOptions) {
     /** The OS-layer allowlist, exposed so the two-layer agreement is testable. */
     readPaths,
 
-    /** Accumulated across the request. Empty-and-incomplete before any run. */
+    /** Accumulated across the request. Zeroed before any run has reported. */
     coverage(): CoverageCounters {
       return (
         accumulated ?? {
@@ -310,7 +286,6 @@ export function createSandboxToolHost(options: SandboxToolHostOptions) {
           unreadable: 0,
           perScope: {},
           scopesSkipped: [],
-          complete: false,
           method: "full",
           enforcementNotes: [],
         }

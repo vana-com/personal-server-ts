@@ -7,7 +7,7 @@
  *   OS layer is actually handed, and against a real sandboxed script that
  *   tries to reach past it.
  * - Coverage stays honest (risk 3 / §19.16). A scope the request could not
- *   read must never leave `complete: true` standing.
+ *   read must always show up in `scopesSkipped`.
  * - A source with no T2 profile is flagged reduced-confidence (risk 3).
  * - Concurrency is bounded (risk 4).
  * - Envelope-shaped real data yields real record counts, not `1`.
@@ -143,43 +143,53 @@ describe("unwrapEnvelopeData", () => {
 });
 
 /* ------------------------------------------------------------------ *
- * applyGrantCoverage — completeness can only weaken
+ * applyGrantCoverage — it can only ADD a limit, never remove one
  * ------------------------------------------------------------------ */
 
 describe("applyGrantCoverage", () => {
-  const complete = {
+  const swept = {
     scopesScanned: ["a.b"],
     recordsScanned: 10,
     scopesSkipped: [],
-    complete: true,
   };
 
   it("is a no-op when every granted scope was reached", () => {
-    expect(applyGrantCoverage(complete, [])).toBe(complete);
+    expect(applyGrantCoverage(swept, [])).toBe(swept);
   });
 
-  it("turns a partial sweep's completeness false", () => {
-    const out = applyGrantCoverage(complete, [
+  it("records a granted scope the request could not reach as skipped", () => {
+    const out = applyGrantCoverage(swept, [
       { scope: "c.d", reason: "unreadable" },
     ]);
-    // §19.16 measured false completeness at 0 of 35 rows. A route that
-    // reports a complete scan over a partial one is the worst bug here.
-    expect(out.complete).toBe(false);
+    // §19.16 measured a confident total over a partial corpus at 0 of 35 rows.
+    // A route that sweeps two of three scopes and never mentions the third is
+    // the worst bug here, so the unreached scope must appear.
     expect(out.scopesSkipped).toEqual([{ scope: "c.d", reason: "unreadable" }]);
   });
 
-  it("never turns an incomplete sweep complete", () => {
-    const partial = { ...complete, complete: false };
-    expect(applyGrantCoverage(partial, []).complete).toBe(false);
-    expect(
-      applyGrantCoverage(partial, [{ scope: "c.d", reason: "x" }]).complete,
-    ).toBe(false);
+  it("never removes a limit already in the coverage it was handed", () => {
+    // The one-directionality that used to be expressed as "can never turn
+    // `complete` true". It has no way to launder a partial run into a total
+    // one: it cannot drop a skipped scope and it cannot touch a counter.
+    const bounded = {
+      ...swept,
+      scopesSkipped: [{ scope: "e.f", reason: "no text layer" }],
+      unreadable: 22,
+    };
+    const out = applyGrantCoverage(bounded, [{ scope: "c.d", reason: "x" }]);
+    expect(out.scopesSkipped).toEqual([
+      { scope: "e.f", reason: "no text layer" },
+      { scope: "c.d", reason: "x" },
+    ]);
+    expect(out.unreadable).toBe(22);
+    expect(out.recordsScanned).toBe(10);
+    expect(out.scopesScanned).toEqual(["a.b"]);
   });
 
   it("does not duplicate a scope the host already skipped", () => {
     const out = applyGrantCoverage(
       {
-        ...complete,
+        ...swept,
         scopesSkipped: [{ scope: "c.d", reason: "host said so" }],
       },
       [{ scope: "c.d", reason: "route said so" }],
@@ -449,7 +459,6 @@ describe("runQuery", () => {
       scope: "not.granted",
       reason: "not in the caller's granted scopes",
     });
-    expect(answer.coverage.complete).toBe(false);
   });
 
   it("answers honestly rather than throwing when nothing is readable", async () => {
@@ -463,13 +472,12 @@ describe("runQuery", () => {
       question: "anything?",
       createSandbox: () => recordingSandbox(),
     });
-    expect(answer.coverage.complete).toBe(false);
     expect(answer.coverage.recordsScanned).toBe(0);
     // No model turn was spent on a question with no corpus.
     expect(provider.calls).toHaveLength(0);
   });
 
-  it("folds an unreadable granted scope into coverage and drops completeness", async () => {
+  it("folds an unreadable granted scope into coverage as skipped", async () => {
     const sandbox = recordingSandbox();
     const answer = await runQuery({
       reader: {
@@ -488,7 +496,6 @@ describe("runQuery", () => {
       scope: "broken.scope",
       reason: "decrypt failed",
     });
-    expect(answer.coverage.complete).toBe(false);
   });
 
   it("flags a source with no T2 profile as reduced-confidence", async () => {
@@ -621,8 +628,6 @@ describe.runIf(osSandboxSupported)("runQuery under the real OS sandbox", () => {
     expect(JSON.stringify(event)).not.toContain("TOPSECRET");
     // (`answer.script` echoes the script text, "BREACH:" literal included, so
     // the meaningful assertion is on the secret's contents, not the marker.)
-    // And the run is not laundered into a complete one.
-    expect(answer.coverage.complete).toBe(false);
   }, 90_000);
 
   it("denies a script the scope its caller did not grant", async () => {
@@ -647,8 +652,8 @@ describe.runIf(osSandboxSupported)("runQuery under the real OS sandbox", () => {
     // the whole run having collapsed before it touched anything.
     expect(answer.coverage.scopesScanned).toEqual(["a.b"]);
     expect(answer.coverage.recordsScanned).toBe(2);
-    // A denied run is never a complete one.
-    expect(answer.coverage.complete).toBe(false);
+    // The ungranted scope never appears as read.
+    expect(answer.coverage.scopesScanned).not.toContain("not.granted");
   }, 90_000);
 
   it("succeeds on the same shape when the scope IS granted", async () => {

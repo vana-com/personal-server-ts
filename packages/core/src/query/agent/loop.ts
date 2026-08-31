@@ -182,12 +182,26 @@ const TERMINATION_TO_STOPPED: Record<string, QueryStoppedBecause | undefined> =
   };
 
 function honestAnswerText(answer: string, coverage: QueryCoverage): string {
-  // plan phase 5: `coverage.complete === false` must be surfaced in the answer
-  // TEXT, not only in metadata. This is what makes an absence answer honest,
-  // and it is the host's job because the model is not trusted to do it.
-  if (coverage.complete) return answer;
-
+  // plan phase 5: a limit on what was actually read must be surfaced in the
+  // answer TEXT, not only in metadata. This is what makes an absence answer
+  // honest, and it is the host's job because the model is not trusted to do it.
+  //
+  // Each reason below is a host-authored counter that is *specifically* wrong
+  // for this run. That is the whole change from the old `coverage.complete`
+  // gate: the flag demanded every granted scope be read end to end, which no
+  // real question does, so it appended this caveat to every answer regardless
+  // of whether anything was actually amiss.
   const reasons: string[] = [];
+
+  // Fails closed, and this is the disjunct that carries `EMPTY_COVERAGE`'s
+  // guarantee. `recordsScanned` and `scopesScanned` are host-authored and only
+  // a confined run can move them, so zero across zero scopes means nothing was
+  // ever reported — a contract violation burned both attempts, or the coverage
+  // frame never arrived. "We learned nothing" must not be able to render as a
+  // confident total, so it is caveated even when nothing else went wrong.
+  if (coverage.recordsScanned <= 0 && coverage.scopesScanned.length === 0) {
+    reasons.push("no record in any granted scope was read");
+  }
   if (coverage.stoppedBecause) {
     reasons.push(
       {
@@ -228,10 +242,10 @@ function honestAnswerText(answer: string, coverage: QueryCoverage): string {
     );
   }
 
-  const detail =
-    reasons.length > 0
-      ? ` This answer is incomplete: ${reasons.join("; ")}.`
-      : " This answer is incomplete.";
+  // Nothing the host observed bounds this answer, so it stands as written.
+  if (reasons.length === 0) return answer;
+
+  const detail = ` This answer is incomplete: ${reasons.join("; ")}.`;
 
   const scanned =
     coverage.recordsScanned > 0
@@ -582,8 +596,9 @@ export async function runQueryLoop(
       // or failed run is itself the host-authored finding an absence answer
       // rests on. See its declaration.
       //
-      // Deliberately not merged into `coverage.complete`: an incomplete
-      // answer is still an answer, whereas this one has nothing behind it.
+      // Deliberately its own stop reason rather than just another bounded
+      // reading: a partial answer is still an answer, whereas this one has
+      // nothing behind it.
       if (!sawRunFailure && (tools.coverage()?.recordsScanned ?? 0) === 0) {
         // Pushed back once, then the question fails outright — the same shape
         // as the contract repair above, and for the same reason: a model that
@@ -750,10 +765,7 @@ export async function runQueryLoop(
   // Coverage is the tool layer's, not the model's, not this loop's.
   // Accumulated across every run in this request, not just the last one.
   const hostCoverage = tools.coverage() ?? EMPTY_COVERAGE;
-  const coverage: QueryCoverage = {
-    ...hostCoverage,
-    complete: hostCoverage.complete && stoppedBecause === undefined,
-  };
+  const coverage: QueryCoverage = { ...hostCoverage };
   if (stoppedBecause) {
     coverage.stoppedBecause = stoppedBecause;
   } else if (endedCleanly) {

@@ -112,8 +112,8 @@ function stubToolHost(): QueryToolHost {
           scopesScanned: ["oura.sleep"],
           recordsScanned: SLEEP_ROWS.length,
           scopesSkipped: [],
-          // Never `true`: nothing was executed and nothing was enforced.
-          complete: false,
+          // `error`, always: nothing was executed and nothing was enforced, so
+          // no reading this reports can be trusted.
           stoppedBecause: "error",
         },
         notes: ["STUB HOST - no script was executed and nothing was enforced"],
@@ -256,7 +256,9 @@ async function main(): Promise<void> {
   console.log(
     `  stoppedBecause   ${answer.coverage.stoppedBecause ?? "(none)"}`,
   );
-  console.log(`  coverage.complete ${answer.coverage.complete}`);
+  console.log(
+    `  scopes scanned   ${answer.coverage.scopesScanned.join(", ") || "(none)"}`,
+  );
   console.log(`  receipts         ${answer.receiptIds?.length ?? 0}`);
   console.log(`  multi-turn       ${repaired ? "yes" : "no"}`);
 

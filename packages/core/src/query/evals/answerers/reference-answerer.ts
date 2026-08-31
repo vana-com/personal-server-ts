@@ -72,7 +72,6 @@ export function createReferenceAnswerer(source: FixtureSource): EvalAnswerer {
           scopesScanned: ["oura.sleep"],
           recordsScanned: trap.naiveRows,
           scopesSkipped: [],
-          complete: true,
         },
       };
     }
@@ -86,7 +85,6 @@ export function createReferenceAnswerer(source: FixtureSource): EvalAnswerer {
           scopesScanned: request.grantedScopes,
           recordsScanned: needle.occurrences,
           scopesSkipped: [],
-          complete: true,
           method: "full",
         },
       };
@@ -104,7 +102,6 @@ export function createReferenceAnswerer(source: FixtureSource): EvalAnswerer {
           scopesScanned: request.grantedScopes,
           recordsScanned: identity.rowsScanned,
           scopesSkipped: [],
-          complete: true,
         },
       };
     }
@@ -121,7 +118,6 @@ export function createReferenceAnswerer(source: FixtureSource): EvalAnswerer {
           scopesScanned: ["bank.transactions"],
           recordsScanned: recurring.transactions,
           scopesSkipped: [],
-          complete: true,
         },
       };
     }
@@ -140,7 +136,6 @@ export function createReferenceAnswerer(source: FixtureSource): EvalAnswerer {
           scopesScanned: request.grantedScopes,
           recordsScanned: absence.readable,
           scopesSkipped: [],
-          complete: false,
           unreadable: absence.unreadable,
           method: "full",
         },
@@ -160,7 +155,6 @@ export function createReferenceAnswerer(source: FixtureSource): EvalAnswerer {
           scopesScanned: request.grantedScopes,
           recordsScanned: 0,
           scopesSkipped: [],
-          complete: true,
         },
       };
     }
@@ -186,7 +180,6 @@ export function createReferenceAnswerer(source: FixtureSource): EvalAnswerer {
           scopesScanned: request.grantedScopes,
           recordsScanned: trip.jpyTransactions,
           scopesSkipped: [],
-          complete: true,
         },
       };
     }
@@ -209,7 +202,6 @@ export function createReferenceAnswerer(source: FixtureSource): EvalAnswerer {
           scopesScanned: request.grantedScopes,
           recordsScanned: person.factMentions,
           scopesSkipped: [],
-          complete: true,
         },
       };
     }
@@ -248,7 +240,6 @@ export function createReferenceAnswerer(source: FixtureSource): EvalAnswerer {
             scopesScanned: request.grantedScopes,
             recordsScanned: nutrition.matchedDays + nutrition.runDaysWithoutLog,
             scopesSkipped: [],
-            complete: true,
           },
         };
       }
@@ -268,7 +259,6 @@ export function createReferenceAnswerer(source: FixtureSource): EvalAnswerer {
           scopesScanned: request.grantedScopes,
           recordsScanned: conditional.matchedDays + conditional.unmatchedDays,
           scopesSkipped: [],
-          complete: true,
         },
       };
     }
@@ -283,7 +273,6 @@ export function createReferenceAnswerer(source: FixtureSource): EvalAnswerer {
         scopesScanned: request.grantedScopes,
         recordsScanned: 0,
         scopesSkipped: [],
-        complete: false,
       },
     };
   };

@@ -5,6 +5,7 @@ import {
   type InferenceChatResult,
 } from "../../derivatives/inference.js";
 import { runQueryLoop } from "./loop.js";
+import { EMPTY_COVERAGE } from "./types.js";
 import type {
   ExecutedRun,
   QueryScriptResult,
@@ -39,7 +40,6 @@ function executed(over: Partial<ExecutedRun> = {}): ExecutedRun {
       scopesScanned: ["oura.sleep"],
       recordsScanned: 1030,
       scopesSkipped: [],
-      complete: true,
     },
     notes: [],
     termination: "completed",
@@ -76,13 +76,115 @@ function fakeTools(
           scopesScanned: [],
           recordsScanned: 0,
           scopesSkipped: [],
-          complete: false,
         }
       );
     },
     ...over,
   } as QueryToolHost & { executed: string[] };
 }
+
+/**
+ * `EMPTY_COVERAGE` fails closed, and this is the pin for it.
+ *
+ * It used to carry that property by means of `complete: false`, which
+ * `honestAnswerText` gated on. The flag is gone — it demanded every granted
+ * scope be read end to end, so it was false on every real run and appended a
+ * blanket caveat to every answer. The guarantee itself must survive, and it now
+ * rests on the counters: `recordsScanned: 0` over `scopesScanned: []` is
+ * host-authored, only a confined run can move either, and that condition alone
+ * forces the caveat.
+ *
+ * This is the "no confined run ever reported" path — a contract violation burned
+ * both attempts, or the coverage frame never arrived — so `tools.coverage()`
+ * yields nothing and the loop falls back to the constant. "We learned nothing"
+ * must not be able to render as a confident total.
+ */
+describe("EMPTY_COVERAGE fails closed", () => {
+  /** A host whose accumulator never reported, forcing the fallback. */
+  const silentHost = () =>
+    fakeTools([executed()], {
+      coverage: () =>
+        undefined as unknown as ReturnType<QueryToolHost["coverage"]>,
+    });
+
+  it("is the zeroed shape, with no counter left undefined", () => {
+    expect(EMPTY_COVERAGE.recordsScanned).toBe(0);
+    expect(EMPTY_COVERAGE.scopesScanned).toEqual([]);
+    expect(EMPTY_COVERAGE.scopesSkipped).toEqual([]);
+  });
+
+  it("caveats the answer text when no run ever reported", async () => {
+    const provider = createFakeInferenceProvider({
+      respond: () => reply(answerBlock({ answer: "Exactly 42 of them." })),
+    });
+    const out = await runQueryLoop(
+      { question: "how many?", grantedScopes: ["oura.sleep"] },
+      { provider, tools: silentHost() },
+    );
+
+    // The answer must not stand as written. This is the whole property: the
+    // caveat is in the TEXT, because a caller that renders only `answer` must
+    // still see that nothing was read.
+    expect(out.answer).toContain("incomplete");
+    expect(out.answer).toContain("no record in any granted scope was read");
+    expect(out.coverage.recordsScanned).toBe(0);
+    expect(out.coverage.scopesScanned).toEqual([]);
+  });
+
+  it("caveats even when the grounding guard is exempted", async () => {
+    // The sharp pin. Ordinarily a zero-record answer is refused outright by
+    // the grounding guard, which would mask this property — but a run that
+    // FAILED exempts that guard (a refusal is itself a host-authored finding
+    // an absence answer can rest on), so the model's prose is accepted. On
+    // this path the zeroed counters are the only thing standing between "we
+    // learned nothing" and a confident total.
+    const provider = createFakeInferenceProvider({
+      // Turn 1 runs a script, which the host refuses. Turn 2 answers anyway.
+      respond: (_i, n) =>
+        n === 0
+          ? reply(runBlock("await vana.readAll('not.granted');"))
+          : reply(answerBlock({ answer: "You have never done that." })),
+    });
+    const out = await runQueryLoop(
+      { question: "have I ever?", grantedScopes: ["oura.sleep"] },
+      {
+        provider,
+        tools: fakeTools(
+          [
+            executed({
+              termination: "error",
+              error: { code: "SCOPE_NOT_GRANTED", message: "refused" },
+            }),
+          ],
+          {
+            coverage: () =>
+              undefined as unknown as ReturnType<QueryToolHost["coverage"]>,
+          },
+        ),
+      },
+    );
+
+    // The model's prose survives — the guard was exempted — so the caveat is
+    // the only protection left, and it must be there.
+    expect(out.answer).toContain("You have never done that");
+    expect(out.answer).toContain("incomplete");
+    expect(out.answer).toContain("no record in any granted scope was read");
+  });
+
+  it("does not report a record count it never observed", async () => {
+    // The fallback cannot invent a reading. If this ever reported a non-zero
+    // count, the caveat above would stop firing and an empty run would render
+    // as a total one.
+    const provider = createFakeInferenceProvider({
+      respond: () => reply(answerBlock({ answer: "All 5000 of them." })),
+    });
+    const out = await runQueryLoop(
+      { question: "how many?", grantedScopes: ["oura.sleep"] },
+      { provider, tools: silentHost() },
+    );
+    expect(out.answer).not.toMatch(/\d+ record\(s\) across/);
+  });
+});
 
 describe("runQueryLoop — happy path", () => {
   it("runs a script then returns the model's answer", async () => {
@@ -105,7 +207,6 @@ describe("runQueryLoop — happy path", () => {
     );
 
     expect(out.answer).toContain("6.52 hours");
-    expect(out.coverage.complete).toBe(true);
     expect(out.coverage.recordsScanned).toBe(1030);
     expect(out.script).toContain("vana.readAll");
     // One script ran across two model turns. These were one number before and
@@ -192,13 +293,11 @@ describe("runQueryLoop — the response contract", () => {
             scopesScanned: ["oura.sleep"],
             recordsScanned: 1030,
             scopesSkipped: [],
-            complete: true,
           }),
         }),
       },
     );
     expect(out.answer).toContain("6.52h");
-    expect(out.coverage.complete).toBe(true);
     // The repair message went back as a user turn.
     const repairTurn = provider.calls[1]?.messages.at(-1);
     expect(repairTurn?.content).toContain(
@@ -215,7 +314,6 @@ describe("runQueryLoop — the response contract", () => {
       { provider, tools: fakeTools() },
     );
     expect(out.answer).toContain("could not produce a valid script");
-    expect(out.coverage.complete).toBe(false);
     expect(out.coverage.stoppedBecause).toBe("contractViolation");
     // Exactly two model turns: the first attempt and the one repair — and
     // zero tool calls, because neither turn produced a runnable script. The
@@ -242,7 +340,6 @@ describe("runQueryLoop — an answer must be grounded in a read", () => {
         scopesScanned: [],
         recordsScanned: 0,
         scopesSkipped: [],
-        complete: false,
       }),
       ...over,
     });
@@ -260,7 +357,6 @@ describe("runQueryLoop — an answer must be grounded in a read", () => {
     // The model's prose is not the answer; the refusal is.
     expect(out.answer).not.toContain("About six and a half");
     expect(out.coverage.stoppedBecause).toBe("ungroundedAnswer");
-    expect(out.coverage.complete).toBe(false);
     expect(out.cost.toolCalls).toBe(0);
   });
 
@@ -309,13 +405,11 @@ describe("runQueryLoop — an answer must be grounded in a read", () => {
                   scopesScanned: ["oura.sleep"],
                   recordsScanned: 1030,
                   scopesSkipped: [],
-                  complete: true,
                 }
               : {
                   scopesScanned: [],
                   recordsScanned: 0,
                   scopesSkipped: [],
-                  complete: false,
                 },
         }),
       },
@@ -342,7 +436,6 @@ describe("runQueryLoop — an answer must be grounded in a read", () => {
       scopesScanned: [],
       recordsScanned: 0,
       scopesSkipped: [],
-      complete: true,
     };
     const out = await runQueryLoop(
       { question: "q", grantedScopes: ["oura.sleep"] },
@@ -381,7 +474,6 @@ describe("runQueryLoop — an answer must be grounded in a read", () => {
       scopesScanned: [],
       recordsScanned: 0,
       scopesSkipped: [],
-      complete: false,
     };
     const out = await runQueryLoop(
       { question: "how much did I spend?", grantedScopes: ["oura.sleep"] },
@@ -417,7 +509,6 @@ describe("runQueryLoop — an answer must be grounded in a read", () => {
       scopesScanned: [],
       recordsScanned: 0,
       scopesSkipped: [],
-      complete: false,
     };
     const out = await runQueryLoop(
       { question: "q", grantedScopes: ["oura.sleep"] },
@@ -472,7 +563,6 @@ describe("runQueryLoop — an answer must be grounded in a read", () => {
       scopesScanned: [],
       recordsScanned: 0,
       scopesSkipped: [],
-      complete: false,
     };
     const out = await runQueryLoop(
       { question: "what did this server tell the builder?", grantedScopes: [] },
@@ -501,7 +591,6 @@ describe("runQueryLoop — an answer must be grounded in a read", () => {
       scopesScanned: [],
       recordsScanned: 0,
       scopesSkipped: [],
-      complete: false,
     };
     const provider = createFakeInferenceProvider({
       respond: () => reply(runBlock("vana.result({answer:'6.5h',value:6.5})")),
@@ -529,7 +618,7 @@ describe("runQueryLoop — an answer must be grounded in a read", () => {
 
   it("says in the answer text that nothing was read", async () => {
     // The refusal has to be legible to a reader of the answer, not only to a
-    // caller that inspects coverage — the same rule as `complete: false`.
+    // caller that inspects coverage — the same rule the zeroed counters carry.
     const provider = createFakeInferenceProvider({
       respond: () => reply(answerBlock({ answer: "Six and a half." })),
     });
@@ -543,11 +632,11 @@ describe("runQueryLoop — an answer must be grounded in a read", () => {
 });
 
 describe("runQueryLoop — honesty invariants", () => {
-  it("an answer with no script run is never reported as complete", async () => {
+  it("caveats an answer whose run read nothing, and reports the zero", async () => {
     // A model that answers straight from its own prose has read nothing. The
-    // host accumulator has no runs to report, so coverage is empty and
-    // incomplete — and the answer text has to say so. Without this, a
-    // hallucinated answer inherits a confident-looking default.
+    // host accumulator has no runs to report, so the counters are zero — and
+    // the answer text has to say so. Without this, a hallucinated answer
+    // inherits a confident-looking default.
     const provider = createFakeInferenceProvider({
       respond: () => reply(answerBlock({ answer: "About six and a half." })),
     });
@@ -555,13 +644,12 @@ describe("runQueryLoop — honesty invariants", () => {
       { question: "how much did I sleep?", grantedScopes: ["oura.sleep"] },
       { provider, tools: fakeTools() },
     );
-    expect(out.coverage.complete).toBe(false);
     expect(out.coverage.recordsScanned).toBe(0);
     expect(out.answer).toContain("incomplete");
   });
 
-  it("surfaces incompleteness in the ANSWER TEXT, not only metadata", async () => {
-    // plan phase 5: coverage.complete === false must be visible to a reader of
+  it("surfaces a bounded reading in the ANSWER TEXT, not only metadata", async () => {
+    // plan phase 5: a limit on what was read must be visible to a reader of
     // the answer. Metadata alone lets a caller render a confident wrong answer.
     const provider = createFakeInferenceProvider({
       respond: () =>
@@ -576,7 +664,6 @@ describe("runQueryLoop — honesty invariants", () => {
             scopesScanned: ["docs"],
             recordsScanned: 318,
             scopesSkipped: [{ scope: "email", reason: "not granted" }],
-            complete: false,
             unreadable: 22,
           }),
         }),
@@ -585,10 +672,9 @@ describe("runQueryLoop — honesty invariants", () => {
     expect(out.answer).toContain("incomplete");
     expect(out.answer).toContain("22 record(s) could not be read");
     expect(out.answer).toContain("email (not granted)");
-    expect(out.coverage.complete).toBe(false);
   });
 
-  it("never lets the host report complete when the run stopped early", async () => {
+  it("carries a sandbox kill into stoppedBecause and into the answer text", async () => {
     const provider = createFakeInferenceProvider({
       respond: () => reply(runBlock("forever()")),
     });
@@ -596,14 +682,14 @@ describe("runQueryLoop — honesty invariants", () => {
       { question: "q", grantedScopes: ["oura.sleep"] },
       {
         provider,
-        // The host reports complete; the loop must still refuse it because
-        // the run was cut short.
+        // The sandbox cut the run short. That has to reach both the metadata
+        // and the prose, whatever the run managed to read first.
         tools: fakeTools([executed({ termination: "cpu" })]),
         maxTurns: 1,
       },
     );
-    expect(out.coverage.complete).toBe(false);
     expect(out.coverage.stoppedBecause).toBe("cpu");
+    expect(out.answer).toContain("CPU limit");
   });
 
   it("takes coverage from the host, ignoring what the model asserts", async () => {
@@ -613,7 +699,7 @@ describe("runQueryLoop — honesty invariants", () => {
         reply(
           answerBlock({
             answer: "Scanned all 999999 records, complete coverage.",
-            coverage: { complete: true, recordsScanned: 999_999 },
+            coverage: { recordsScanned: 999_999 },
           }),
         ),
     });
@@ -626,13 +712,11 @@ describe("runQueryLoop — honesty invariants", () => {
             scopesScanned: ["oura.sleep"],
             recordsScanned: 12,
             scopesSkipped: [],
-            complete: false,
           }),
         }),
       },
     );
     expect(out.coverage.recordsScanned).toBe(12);
-    expect(out.coverage.complete).toBe(false);
   });
 
   it("reports budget exhaustion as an outcome, not an error", async () => {
@@ -648,7 +732,6 @@ describe("runQueryLoop — honesty invariants", () => {
       { provider, tools: fakeTools() },
     );
     expect(out.coverage.stoppedBecause).toBe("budget");
-    expect(out.coverage.complete).toBe(false);
     expect(out.cost.toolCalls).toBe(3);
     expect(out.answer).toContain("budget");
   });
@@ -688,7 +771,6 @@ describe("runQueryLoop — honesty invariants", () => {
             scopesScanned: ["mystery.source"],
             recordsScanned: 5,
             scopesSkipped: [],
-            complete: false,
           }),
         }),
       },

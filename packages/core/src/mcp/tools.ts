@@ -1845,7 +1845,7 @@ const askPersonalData: McpToolDefinition = {
   name: "ask_personal_data",
   title: "Ask personal data",
   description:
-    "Answer a question across granted scopes with sandboxed code. Returns the answer plus coverage: records scanned, scopes skipped, whether the scan was complete. Use for aggregation, exhaustive search, or absence answers.",
+    "Answer a question across granted scopes with sandboxed code. Returns the answer plus host-authored coverage counters: scopes scanned, records scanned, scopes skipped, records that could not be read. Use for aggregation, exhaustive search, or absence answers.",
   inputSchema: {
     question: z.string().min(1).max(2000).describe("The question to answer."),
     scopes: z

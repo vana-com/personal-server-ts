@@ -17,10 +17,9 @@ import { buildAgentAnswerer } from "./query-eval-harness.js";
  *
  * It used to pass every manifest scope on every question, so `grantedScopes`
  * was all 18 whatever the case declared. That is not a cosmetic difference:
- * the model was handed the whole corpus to answer a two-scope question,
- * `coverage.complete`'s "every granted scope accounted for" conjunct could
- * never fire because no question needs all 18, and every scope-binding
- * assertion downstream was grading against a grant nobody had asked for.
+ * the model was handed the whole corpus to answer a two-scope question, and
+ * every scope-binding assertion downstream was grading against a grant nobody
+ * had asked for.
  *
  * These run the real nested path — the confined interpreter inside the OS
  * sandbox — because the binding is enforced in two places (`api.ts`'s

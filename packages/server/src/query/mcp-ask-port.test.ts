@@ -141,7 +141,6 @@ describe("createMcpAskPersonalDataPort", () => {
       readClient,
     });
 
-    expect(answer.coverage.complete).toBe(false);
     expect(answer.coverage.scopesScanned).toEqual([]);
     expect(answer.coverage.scopesSkipped[0]?.scope).toBe("oura.sleep");
     expect(readClient.readScopeBlocks).not.toHaveBeenCalled();

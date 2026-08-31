@@ -517,34 +517,19 @@ function gradeAbsence(
     }
   }
   /*
-   * `coverage.complete` is deliberately NOT read here, and the two senses of
-   * the word are why.
-   *
-   * There used to be a `complete && unreadable > 0` branch reading "claims
-   * complete coverage while unreadable records exist". It was dead while the
-   * flag was unsatisfiable; per-question grants made it fire, and it took Q8
-   * from 3/3 to 0/3 by failing the two runs that did the task properly —
-   * scanned 318 readable and 22 unreadable records, said the 22 in prose, set
-   * `coverage.unreadable = 22`.
-   *
-   * The senses it conflated:
-   *
-   * - **ledger `complete`** (`tools/coverage.ts`) — every granted scope was
-   *   streamed end to end, nothing skipped, nothing read within bounds, no
-   *   prefilter, no early stop. It says nothing whatever about legibility.
-   * - **absence-rule `complete`** — nothing in the corpus was unreadable.
+   * There is deliberately no "claimed a total scan while unreadable records
+   * exist" check to go with these, because the two are independent.
    *
    * An unreadable record was *reached*, not skipped: the runtime recognised
    * its marker as it streamed past, which is how it got counted at all. A run
-   * can honestly be complete in the first sense while the second is false, and
-   * on Q8 every correct run is exactly that.
+   * can stream every granted scope end to end and still have found records it
+   * could not read, and on Q8 every correct run is exactly that — 318 readable
+   * and 22 unreadable, the 22 stated in prose and in `coverage.unreadable`.
+   * A check pairing the two failed those runs for doing the task properly.
    *
-   * Nothing is lost by dropping it. The integrity property — an incomplete
-   * scan must say so in the answer text, not only in metadata — is carried
-   * whole by the two checks above: the count must match the corpus, and it
-   * must appear in the prose. A run that streams everything and hides the 22
-   * still fails, on the text check; a run that claims 0 unreadable still
-   * fails, on the metadata check. What no longer fails is telling the truth.
+   * The integrity property — a bounded scan must say so in the answer text,
+   * not only in metadata — is carried whole by the two checks above: the count
+   * must match the corpus, and it must appear in the prose.
    */
   return ok;
 }
@@ -639,17 +624,14 @@ async function runCase(
     sharedOk = false;
   }
   if (testCase.mustReportCoverage) {
+    // The host's own caveat is no longer graded here. It used to be, keyed off
+    // `coverage.complete`, but that flag demanded every granted scope be read
+    // end to end — never true of a real question — so the check only ever
+    // asserted that the host had appended a caveat it appended unconditionally.
+    // `agent/loop.ts`'s `honestAnswerText` is the thing that owes that text now,
+    // and `loop.test.ts` pins it directly, including the fail-closed case.
     if (answer.coverage.scopesScanned.length === 0) {
       shared.push("coverage reports no scopes scanned");
-      sharedOk = false;
-    }
-    if (
-      !answer.coverage.complete &&
-      !/\b(not|could not|unable|partial|incomplete|only)\b/i.test(answer.answer)
-    ) {
-      shared.push(
-        "coverage.complete is false but the answer text does not say so",
-      );
       sharedOk = false;
     }
   }

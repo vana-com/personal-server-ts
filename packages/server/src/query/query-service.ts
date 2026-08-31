@@ -24,11 +24,10 @@
  *
  * 3. **Coverage stays honest.** `runQueryLoop` assembles coverage from
  *    host counters, and a scope that never materialized is invisible to that
- *    host — which would let a partial sweep report `complete: true`. So every
+ *    host — which would let a partial sweep look like a clean one. So every
  *    scope the grant named and this request could not read is folded back in
- *    as `scopesSkipped` and forces `complete: false`. See
- *    {@link applyGrantCoverage}, the one place that can weaken completeness
- *    and never strengthen it.
+ *    as `scopesSkipped`. See {@link applyGrantCoverage}, the one place that
+ *    can add a limit to coverage and never remove one.
  *
  * 4. **Concurrency is bounded.** Ten consumers asking scan-shaped questions
  *    is ten full scans (plan §3 risk 4). See {@link createQueryConcurrency}.
@@ -37,9 +36,10 @@
  *
  * No result cache: plan §6 leaves that gated on an eval-verified result,
  * because a cache over a wrong answer freezes the error permanently. No
- * `vana.search` wiring: design §19.16 measured that it destroys
- * `coverage.complete` (six complete rows to zero), and completeness is the
- * property that distinguishes this from a naive LLM call.
+ * `vana.search` wiring: design §19.16 measured that it collapses how much of
+ * the granted data actually gets read (six exhaustive rows to zero), and
+ * reading the data is the property that distinguishes this from a naive LLM
+ * call.
  */
 
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -47,6 +47,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  EMPTY_COVERAGE,
   parseTurn,
   runQueryLoop,
   type QueryAnswer,
@@ -307,13 +308,15 @@ export async function materializeGrant(
  *
  * `runQueryLoop` builds coverage from the sandbox host's counters, and the
  * host only ever knew about scopes that materialized. Without this, a request
- * granted eight scopes that could only read six would report a *complete*
- * scan of six and never mention the other two — plan §3's worst bug, a
- * confident total over a partial corpus.
+ * granted eight scopes that could only read six would report a clean scan of
+ * six and never mention the other two — plan §3's worst bug, a confident total
+ * over a partial corpus.
  *
- * Strictly one-directional: it can add skipped scopes and it can turn
- * `complete` false. It can never turn `complete` true, so it cannot launder a
- * partial run into a total one.
+ * Strictly one-directional: it only ever ADDS to `scopesSkipped`, and never
+ * removes an entry or touches a counter. A named-but-unread scope therefore
+ * always reaches the answer text, because `honestAnswerText` caveats on a
+ * non-empty `scopesSkipped`. It cannot launder a partial run into a total one
+ * because it has no way to raise `recordsScanned` or `scopesScanned`.
  */
 export function applyGrantCoverage(
   coverage: QueryCoverage,
@@ -325,7 +328,7 @@ export function applyGrantCoverage(
     ...coverage.scopesSkipped,
     ...skipped.filter((s) => !seen.has(s.scope)),
   ];
-  return { ...coverage, scopesSkipped: merged, complete: false };
+  return { ...coverage, scopesSkipped: merged };
 }
 
 /* ------------------------------------------------------------------ *
@@ -417,7 +420,7 @@ export function resolveMaxConcurrent(
  * The budget and limits the eval harness runs under, verbatim.
  *
  * Shared with `scripts/query-eval-harness.ts` in value so that
- * `coverage.recordsScanned`, `unreadable` and `complete` mean at this API
+ * `coverage.recordsScanned`, `scopesScanned` and `unreadable` mean at this API
  * boundary exactly what they mean on a graded row. Changing one without the
  * other would make the benchmark stop predicting the product.
  */
@@ -560,15 +563,9 @@ export async function runQuery(options: RunQueryOptions): Promise<QueryAnswer> {
         answer:
           "No readable scope was available for this question, so there is nothing to compute an answer from.",
         citations: [],
-        coverage: applyGrantCoverage(
-          {
-            scopesScanned: [],
-            recordsScanned: 0,
-            scopesSkipped: [],
-            complete: false,
-          },
-          skipped,
-        ),
+        // Spread rather than passed straight through: `EMPTY_COVERAGE` is
+        // frozen, and this object goes on to be handed to a caller.
+        coverage: applyGrantCoverage({ ...EMPTY_COVERAGE }, skipped),
         determinism: "generated",
         cost: { toolCalls: 0, inputTokens: 0, outputTokens: 0 },
       };

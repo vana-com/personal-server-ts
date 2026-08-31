@@ -4,7 +4,7 @@
  * `QueryAnswer.coverage` is assembled by the host from its own counters, never
  * from anything the model or its script says — the integrity rule in
  * `docs/260828-query-layer-prompt.md` §1. A script that scans 30 of 300 records
- * cannot report completeness, because it does not author that field.
+ * cannot report 300 scanned, because it does not author that counter.
  */
 
 export interface QueryBudget {
@@ -28,7 +28,7 @@ export interface QueryCitation {
 
 /**
  * Why a run stopped early. `budget` is a first-class outcome, not an error
- * (prompt doc §3): the run ends with a partial answer and `complete: false`.
+ * (prompt doc §3): the run ends with a partial answer that says it stopped.
  */
 export type QueryStoppedBecause =
   | "budget"
@@ -75,8 +75,6 @@ export interface QueryCoverage {
    */
   bytesScanned?: number;
   scopesSkipped: { scope: string; reason: string }[];
-  /** False ⇒ the answer text must say so. Host-authored. */
-  complete: boolean;
   /** Records present but unreadable — what makes an absence answer honest. */
   unreadable?: number;
   /** "prefiltered" marks a semantically-narrowed pass (prompt doc §5, Q9/Q15). */
@@ -152,14 +150,26 @@ export type QueryConfidence = "high" | "medium" | "low";
 /**
  * Coverage for a run that produced none.
  *
- * Fails closed: nothing scanned, nothing complete. Used when no confined run
- * ever reported — a contract violation burned both attempts, or the coverage
- * frame never arrived. The alternative, defaulting to an empty-but-complete
- * shape, would let "we learned nothing" render as a confident total.
+ * Used when no confined run ever reported — a contract violation burned both
+ * attempts, or the coverage frame never arrived.
+ *
+ * **Fails closed**, and it is worth being precise about how, because this
+ * shape no longer carries a `complete: false` to do it. The guarantee is that
+ * "we learned nothing" can never render as a confident total, and it now rests
+ * on the counters themselves: `recordsScanned: 0` over `scopesScanned: []`.
+ * Both are host-authored and only a confined run can move them, so this shape
+ * is indistinguishable — by construction — from any other run that read
+ * nothing. `agent/loop.ts`'s `honestAnswerText` keys the "this answer is
+ * incomplete" caveat off exactly that condition, so an answer built on this
+ * coverage is always caveated in the answer TEXT, not merely in metadata.
+ *
+ * The property therefore holds for the same reason it did before, one
+ * indirection shorter: the flag was only ever a restatement of the zero.
+ * Raising either counter here would break it, which is what
+ * `EMPTY_COVERAGE fails closed` in `loop.test.ts` pins.
  */
 export const EMPTY_COVERAGE: QueryCoverage = Object.freeze({
   scopesScanned: [],
   recordsScanned: 0,
   scopesSkipped: [],
-  complete: false,
 });
