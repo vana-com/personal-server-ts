@@ -57,9 +57,11 @@ console.log(answer.answer, answer.coverage, answer.cost);
   ` ```vana:run `, the parser reports `unknown-tag` and repairs once. A high
   repair rate is a prompt problem, not a parser problem — tune the prompt, and
   record the rate, because it is a cost multiplier on every question.
-- **Body size.** Watch for HTTP 413. `fitTranscript` budgets plaintext at 1 MiB
-  against the relay's 2 MiB cap, but the E2EE-encoded body is larger than the
-  plaintext we measure. If a 413 appears, lower `TRANSCRIPT_SAFETY_FACTOR`
-  rather than raising the relay cap.
+- **Body size.** Watch for HTTP 413. `fitTranscript` budgets plaintext at
+  120 KiB against the relay's 256 KiB cap, halved for the E2EE hex expansion
+  that makes the encoded body twice the plaintext we measure. If a 413 still
+  appears, raise `REQUEST_OVERHEAD_RESERVE_BYTES` rather than raising the relay
+  cap — and check `coverage.violations` for dropped turns, which is what a
+  transcript hitting the budget looks like when it does NOT 413.
 - **`x-receipt-id`.** Should be present on every turn and is collected into
   `answer.receiptIds`. Missing receipts mean the ACI path is not what we think.

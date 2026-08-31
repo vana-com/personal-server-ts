@@ -4,8 +4,9 @@
  * WHY THIS EXISTS, AND WHY IT IS NOT THE SANDBOX'S `maxOutputBytes`:
  *
  * The Vana inference relay (`../data-gateway`) caps a request body at
- * `INFERENCE_MAX_BODY_BYTES` = 2 MiB. Phala's own cap is 32 MiB, so ours is
- * the binding one. A code-as-content loop feeds script output back as the next
+ * `INFERENCE_MAX_BODY_BYTES` = 256 KiB. Phala's own cap is 32 MiB, so ours is
+ * still the binding one — but it is 256 KiB, not the 2 MiB this module assumed
+ * until 2026-08-31. A code-as-content loop feeds script output back as the next
  * message's *content*, and the request body carries the whole transcript on
  * every turn — so the cost is cumulative, not per-turn. With `maxToolCalls`
  * defaulting to 50, a naive "8KB per turn" rule still walks into a 413 once
@@ -23,20 +24,61 @@
 
 import type { InferenceMessage } from "../../derivatives/inference.js";
 
-/** The relay's body cap. Ours, not Phala's — ours is the binding one. */
-export const RELAY_MAX_BODY_BYTES = 2 * 1024 * 1024;
+/**
+ * The relay's body cap. Ours, not Phala's — ours is still the binding one.
+ *
+ * `DEFAULT_INFERENCE_MAX_BODY_BYTES` at `data-gateway/lib/inference.ts:35`,
+ * enforced as a 413 `BODY_TOO_LARGE` at
+ * `data-gateway/api/v1/inference/chat/completions.ts:100-107`. It is measured
+ * on the *exact bytes the client streams* (`readRequestBody`, same file
+ * :165-207), which is the serialized body AFTER encryption — so E2EE expansion
+ * counts against this number, it is not free.
+ */
+export const RELAY_MAX_BODY_BYTES = 256 * 1024;
 
 /**
- * Headroom under the relay cap for JSON overhead, the E2EE ciphertext
- * expansion (base64 of AES-GCM output, ~4/3 plus tag and nonce), the model
- * name and routing fields. E2EE is on by default, so the encoded body is
- * meaningfully larger than the plaintext we measure here.
+ * Wire expansion of one message's content when `INFERENCE_E2EE` is on, which
+ * is the DEFAULT. `encryptField` returns lowercase **hex**, not base64
+ * (`../../derivatives/e2ee/suite.ts:170-192`), so the multiplier is 2 — not
+ * the ~4/3 an earlier comment here claimed. Hex needs no JSON string escaping,
+ * so 2x is exact rather than a floor.
  */
-export const TRANSCRIPT_SAFETY_FACTOR = 0.5;
+export const E2EE_CONTENT_EXPANSION = 2;
 
-/** Default ceiling on the plaintext transcript we will assemble. */
+/**
+ * Fixed bytes E2EE adds per message on top of the 2x: `encryptField`
+ * concatenates a 32-byte X25519 ephemeral public key, a 12-byte AES-GCM nonce
+ * and the 16-byte tag ahead of the ciphertext, and hex doubles all of it. The
+ * X-E2EE-* values travel as headers, which the gateway does not count.
+ */
+export const E2EE_MESSAGE_FRAMING_BYTES = 2 * (32 + 12 + 16);
+
+/**
+ * Room for everything in the body that is not message content, so the budget
+ * below is derived from the relay cap rather than guessed at as a fraction.
+ *
+ * It covers: the top-level `model`, `max_tokens` and `requestFields`
+ * (`../../derivatives/inference.ts:385-391`, ~110 bytes); the per-message
+ * `{"role":…,"content":…}` JSON, which `transcriptBytes` under-charges by
+ * ~15 bytes each; and `E2EE_MESSAGE_FRAMING_BYTES` per message. At
+ * `DEFAULT_MAX_TURNS` = 20 the transcript is ~42 messages, costing ~6.6 KiB of
+ * the reserve, so 16 KiB leaves room for a caller that raises
+ * `budget.toolCalls` to roughly 60 turns before the reserve itself is the
+ * thing that runs out.
+ */
+export const REQUEST_OVERHEAD_RESERVE_BYTES = 16 * 1024;
+
+/**
+ * Default ceiling on the plaintext transcript we will assemble.
+ *
+ * Derived, not chosen: whatever survives the reserve, divided by the E2EE
+ * expansion. Sized for the E2EE-on case because that is the default AND the
+ * binding one — with E2EE off the body is only JSON-escaped plaintext (~1.15x
+ * on script output), comfortably inside the same cap.
+ */
 export const DEFAULT_TRANSCRIPT_BUDGET_BYTES = Math.floor(
-  RELAY_MAX_BODY_BYTES * TRANSCRIPT_SAFETY_FACTOR,
+  (RELAY_MAX_BODY_BYTES - REQUEST_OVERHEAD_RESERVE_BYTES) /
+    E2EE_CONTENT_EXPANSION,
 );
 
 /**

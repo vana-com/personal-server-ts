@@ -697,3 +697,89 @@ describe("runQueryLoop — honesty invariants", () => {
     expect(out.answer).toContain("no source profile");
   });
 });
+
+describe("runQueryLoop — transcript trimmed to fit the relay's body cap", () => {
+  /**
+   * Assistant scripts are NOT capped by `truncateOutput` (only run results
+   * are), so a few verbose turns are the realistic way a transcript reaches
+   * the budget. Each script here is ~50 KiB against a 120 KiB budget, so the
+   * fit starts dropping turns partway through.
+   */
+  function verboseScript(n: number): string {
+    return runBlock(`// ${"x".repeat(50_000)}\nconst t = ${n};`);
+  }
+
+  it("records dropped turns in coverage.violations, not just in the transcript", async () => {
+    const provider = createFakeInferenceProvider({
+      respond: (_i, n) =>
+        reply(
+          n < 6
+            ? verboseScript(n)
+            : answerBlock({
+                answer: "6.52 hours over 1030 nights.",
+                citations: [{ scope: "oura.sleep" }],
+              }),
+        ),
+    });
+
+    const out = await runQueryLoop(
+      { question: "How much did I sleep?", grantedScopes: ["oura.sleep"] },
+      { provider, tools: fakeTools([executed({ stdout: "avg=6.52" })]) },
+    );
+
+    // The marker message tells the model. This asserts the HOST also knows:
+    // with the old 1 MiB budget nothing was ever dropped, so there was no
+    // violation to record and the run looked untrimmed.
+    const violations = out.coverage.violations ?? [];
+    expect(
+      violations.some((v) => v.includes("dropped from the transcript")),
+    ).toBe(true);
+    expect(violations.some((v) => v.includes("262144"))).toBe(true);
+  });
+
+  it("still answers — trimming beats the 413 it replaces", async () => {
+    const provider = createFakeInferenceProvider({
+      respond: (_i, n) =>
+        reply(
+          n < 6
+            ? verboseScript(n)
+            : answerBlock({
+                answer: "6.52 hours over 1030 nights.",
+                citations: [{ scope: "oura.sleep" }],
+              }),
+        ),
+    });
+
+    const out = await runQueryLoop(
+      { question: "How much did I sleep?", grantedScopes: ["oura.sleep"] },
+      { provider, tools: fakeTools([executed({ stdout: "avg=6.52" })]) },
+    );
+
+    expect(out.answer).toContain("6.52 hours");
+  });
+
+  it("leaves coverage.violations clear when nothing had to be dropped", async () => {
+    const provider = createFakeInferenceProvider({
+      respond: (_i, n) =>
+        reply(
+          n === 0
+            ? runBlock("const s = await vana.readAll('oura.sleep');")
+            : answerBlock({
+                answer: "6.52 hours over 1030 nights.",
+                citations: [{ scope: "oura.sleep" }],
+              }),
+        ),
+    });
+
+    const out = await runQueryLoop(
+      { question: "How much did I sleep?", grantedScopes: ["oura.sleep"] },
+      { provider, tools: fakeTools([executed({ stdout: "avg=6.52" })]) },
+    );
+
+    expect(
+      (out.coverage.violations ?? []).some((v) =>
+        v.includes("dropped from the transcript"),
+      ),
+    ).toBe(false);
+  });
+});

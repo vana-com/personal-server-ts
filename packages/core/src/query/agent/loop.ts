@@ -34,6 +34,7 @@ import {
 import type { QueryToolHost } from "./tool-host.js";
 import {
   DEFAULT_OUTPUT_TAIL_BYTES,
+  RELAY_MAX_BODY_BYTES,
   fitTranscript,
   renderRunResult,
 } from "./transcript.js";
@@ -333,6 +334,8 @@ async function wrapUpTurn(input: {
   messages: InferenceMessage[];
   maxTokens: number;
   reason: QueryStoppedBecause;
+  /** Told how many turns the wrap-up's own fit dropped; see `droppedTurns`. */
+  onDroppedTurns: (turns: number) => void;
 }): Promise<Awaited<ReturnType<InferenceProvider["chat"]>> | undefined> {
   const fitted = fitTranscript([
     ...input.messages,
@@ -346,6 +349,7 @@ async function wrapUpTurn(input: {
         "it as `value`; if you never computed one, omit it rather than guessing.",
     },
   ]);
+  input.onDroppedTurns(fitted.droppedTurns);
   try {
     return await input.provider.chat({
       model: input.model,
@@ -456,6 +460,15 @@ export async function runQueryLoop(
   let stoppedBecause: QueryStoppedBecause | undefined;
   const receiptIds: string[] = [];
   const violations: string[] = [];
+  /**
+   * Most turns `fitTranscript` had to drop to stay under the relay's body cap.
+   * The in-transcript marker tells the MODEL its history is partial; this
+   * carries the same fact to the HOST, so a caller reading only `coverage`
+   * cannot mistake a trimmed run for a whole one. Tracked as a maximum rather
+   * than a sum because the transcript is re-fitted from scratch every turn, so
+   * the same dropped turn is counted again on each subsequent fit.
+   */
+  let droppedTurns = 0;
 
   let finalAnswer: string | undefined;
   let finalCitations: QueryCitation[] = [];
@@ -482,6 +495,7 @@ export async function runQueryLoop(
     }
 
     const fitted = fitTranscript(messages);
+    droppedTurns = Math.max(droppedTurns, fitted.droppedTurns);
     turns += 1;
 
     // Snapshot: `messages` keeps growing, and a provider that retains what it
@@ -710,6 +724,9 @@ export async function runQueryLoop(
       messages,
       maxTokens,
       reason: stoppedBecause,
+      onDroppedTurns: (n) => {
+        droppedTurns = Math.max(droppedTurns, n);
+      },
     });
     if (wrapUp) {
       turns += 1;
@@ -751,6 +768,11 @@ export async function runQueryLoop(
   }
   if (system.summarizedScopes.length > 0) {
     coverage.profilesSummarized = system.summarizedScopes;
+  }
+  if (droppedTurns > 0) {
+    violations.push(
+      `${droppedTurns} earlier turn(s) were dropped from the transcript to stay under the relay's ${RELAY_MAX_BODY_BYTES}-byte body cap`,
+    );
   }
   if (violations.length > 0) coverage.violations = violations;
 
