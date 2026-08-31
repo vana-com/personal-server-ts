@@ -191,6 +191,17 @@ function honestAnswerText(answer: string, coverage: QueryCoverage): string {
   // gate: the flag demanded every granted scope be read end to end, which no
   // real question does, so it appended this caveat to every answer regardless
   // of whether anything was actually amiss.
+  //
+  // The test every reason here has to pass is therefore "is this specifically
+  // wrong for THIS run", not "is this a property of the grant or the config".
+  // A reason that fails it re-creates `complete`'s failure under a new name:
+  // it fires on nearly every answer, and a caveat that always fires trains a
+  // reader to skip the one that matters. Two fields on `QueryCoverage` are
+  // deliberately NOT rendered here for exactly that reason —
+  // `profilesSummarized` (a prompt-budget property, identical on every run
+  // under the same grant) and the raw grant-shaped `unprofiledScopes` (see
+  // below) — and they stay in the metadata, where a consumer that cares about
+  // the grant's shape can read them.
   const reasons: string[] = [];
 
   // Fails closed, and this is the disjunct that carries `EMPTY_COVERAGE`'s
@@ -231,14 +242,61 @@ function honestAnswerText(answer: string, coverage: QueryCoverage): string {
         .join(", ")}`,
     );
   }
+  // The anti-sampling guarantee, in the answer TEXT rather than only in
+  // metadata. This is the surviving half of `complete` — its load-bearing
+  // conjunct was `#partiallyScanned.size === 0`, so the model could not buy a
+  // completeness claim by sampling — and until this branch existed the list
+  // shipped in `coverage` with nothing rendering it, so a run that sampled 12%
+  // of a scope produced an answer with no sampling caveat at all. A caller
+  // that renders only `answer` could not tell a full pass from a window.
+  //
+  // Run-shaped by construction: a scope lands here only via
+  // `CoverageLedger.partialScope`, which only an actual bounded read calls,
+  // and leaves again only on the strength of a pass that reached
+  // `completeScope` (`tools/coverage.ts`).
+  //
+  // Gated on present-and-non-empty rather than failing closed on absence.
+  // `CoverageCounters.scopesPartiallyScanned` is a required field and every
+  // real host populates it, so absence here means no host ever reported —
+  // which the zero-read disjunct above already caveats. The fail-closed
+  // reading of an omitted list belongs to `mergePartiallyScanned`, which is
+  // where the host contract is guarded; duplicating it here would caveat
+  // hand-built coverage that scanned nothing partially.
+  if ((coverage.scopesPartiallyScanned ?? []).length > 0) {
+    reasons.push(
+      `these scopes were sampled rather than read end to end: ${coverage.scopesPartiallyScanned!.join(", ")}`,
+    );
+  }
   if (typeof coverage.unreadable === "number" && coverage.unreadable > 0) {
     reasons.push(
       `${coverage.unreadable.toLocaleString("en-US")} record(s) could not be read`,
     );
   }
-  if ((coverage.unprofiledScopes ?? []).length > 0) {
+  // Narrowed to the scopes this run actually READ that had no profile, rather
+  // than every unprofiled scope in the grant.
+  //
+  // `coverage.unprofiledScopes` is grant-shaped: it comes from
+  // `buildSystemPrompt`, which calls `renderProfiles` over the whole granted
+  // scope list, so it is fixed before any read happens and is identical for
+  // every question asked under the same grant. Rendered raw it did precisely
+  // what `complete` did — measured live, all 13 runs of a sweep carried "no
+  // source profile exists for [9 scopes]", including a probe that read only a
+  // profiled scope and touched none of the nine.
+  //
+  // The honest signal is the intersection with what was scanned, and it needs
+  // no new derivation: `scopesScanned` is host-authored, every scope in it
+  // passed `requireGranted` in `tools/api.ts` so it is drawn from the same
+  // identifier space as the granted list, and `scopesPartiallyScanned` is a
+  // subset of `scopesScanned` — so intersecting with `scopesScanned` alone
+  // already covers a scope that was only sampled. The full grant-shaped list
+  // stays on `QueryCoverage.unprofiledScopes` for a consumer that wants it;
+  // what changes is only which of it reaches the prose.
+  const unprofiledScopesRead = (coverage.unprofiledScopes ?? []).filter(
+    (scope) => coverage.scopesScanned.includes(scope),
+  );
+  if (unprofiledScopesRead.length > 0) {
     reasons.push(
-      `no source profile exists for ${coverage.unprofiledScopes!.join(", ")}, so their structure was inferred rather than known`,
+      `no source profile exists for ${unprofiledScopesRead.join(", ")}, so their structure was inferred rather than known`,
     );
   }
 
