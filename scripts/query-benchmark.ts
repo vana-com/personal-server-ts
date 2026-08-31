@@ -102,6 +102,14 @@ interface Row {
   inTok: number;
   outTok: number;
   toolCalls: number;
+  /** Model turns, including repair retries and the wrap-up turn. */
+  turns?: number;
+  /**
+   * Inference calls put on the wire. Higher than `turns` whenever a reply was
+   * re-asked. This is the unit `data-gateway` meters per signer per UTC day,
+   * so a sweep that records only tokens cannot say whether a question fits.
+   */
+  relayCalls?: number;
   records: number;
   bytes: number;
   scopes: number;
@@ -516,6 +524,8 @@ async function main(): Promise<void> {
         inTok: result.cost.inputTokens,
         outTok: result.cost.outputTokens,
         toolCalls: result.cost.toolCalls,
+        turns: result.cost.modelTurns,
+        relayCalls: result.cost.relayCalls,
         records: cov?.recordsScanned ?? 0,
         bytes: cov?.bytesScanned ?? 0,
         scopes: cov?.scopesScanned.length ?? 0,

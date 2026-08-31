@@ -89,6 +89,13 @@ export interface EvalCaseResult {
   durationMs: number;
   cost: {
     toolCalls: number;
+    /** Model turns, including repair retries and the wrap-up turn. */
+    modelTurns?: number;
+    /**
+     * Inference calls put on the wire — the unit the relay meters per signer
+     * per UTC day. Carried through so a sweep records it; see `QueryCost`.
+     */
+    relayCalls?: number;
     inputTokens: number;
     outputTokens: number;
     usd?: number;

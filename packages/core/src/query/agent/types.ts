@@ -97,6 +97,18 @@ export interface QueryCost {
    * volume; `toolCalls` counts only turns that ran a script.
    */
   modelTurns?: number;
+  /**
+   * Inference calls actually put on the wire, which is neither `toolCalls` nor
+   * `modelTurns`.
+   *
+   * A turn can issue several: an empty or malformed-tool-call reply is re-asked
+   * (`EMPTY_REPLY_RETRIES`, `MALFORMED_TOOL_CALL_RETRIES`) and each re-ask is a
+   * fresh call, and the wrap-up turn adds one more outside the turn budget.
+   * `data-gateway` meters CALLS per signer per UTC day
+   * (`lib/inference-quota.ts` `DEFAULT_INFERENCE_SIGNER_REQUESTS_PER_DAY`), so
+   * this is the number that quota sees and `modelTurns` understates it.
+   */
+  relayCalls?: number;
   inputTokens: number;
   outputTokens: number;
   usd?: number;
