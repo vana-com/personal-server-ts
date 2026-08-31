@@ -107,6 +107,11 @@ export function createSqliteQuestionStore(
   const listAll = db.prepare(
     "SELECT * FROM derivative_questions ORDER BY created_at ASC, question_id ASC",
   );
+  // The status route polls list({ derivedScope }) on every reader request;
+  // this is the query idx_derivative_questions_derived_scope exists for.
+  const listByDerivedScope = db.prepare(
+    "SELECT * FROM derivative_questions WHERE derived_scope = ? ORDER BY created_at ASC, question_id ASC",
+  );
   const getOne = db.prepare(
     "SELECT * FROM derivative_questions WHERE question_id = ?",
   );
@@ -136,7 +141,11 @@ export function createSqliteQuestionStore(
 
   return {
     async list(filter) {
-      return (listAll.all() as Row[])
+      const rows =
+        filter?.derivedScope !== undefined
+          ? (listByDerivedScope.all(filter.derivedScope) as Row[])
+          : (listAll.all() as Row[]);
+      return rows
         .map(toRegistration)
         .filter((registration) => matchesQuestionFilter(registration, filter));
     },

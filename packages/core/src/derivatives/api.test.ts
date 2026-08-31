@@ -632,22 +632,72 @@ describe("GET /v1/derivatives/status", () => {
     expect(((await res.json()) as { status: string }).status).toBe("pending");
   });
 
-  it("reports the most recently updated registration when several share the scope", async () => {
+  it("a served answer wins over a newer failed duplicate on the same scope", async () => {
+    // Data serving is registration-agnostic: if any registration is ready,
+    // the scope HAS an answer, and the reader must not be told "failed" by
+    // a duplicate that never wrote anything.
     const { deps, store } = createDeps();
     const first = await seedOwnerQuestion(deps);
     const second = await seedOwnerQuestion(deps);
     await store.update(first, {
       status: "ready",
       updatedAt: "2026-08-27T10:00:01.000Z",
+      lastComputedAt: "2026-08-27T10:00:01.000Z",
+      derivedVersion: 3,
     });
     await store.update(second, {
       status: "failed",
+      error: "upstream down",
       updatedAt: "2026-08-27T12:00:00.000Z",
     });
     const res = await call(deps, "GET", "/status?derivedScope=coach.weekly", {
       token: READER_TOKEN,
     });
-    expect(((await res.json()) as { status: string }).status).toBe("failed");
+    const json = (await res.json()) as {
+      status: string;
+      derivedVersion: number | null;
+    };
+    expect(json.status).toBe("ready");
+    expect(json.derivedVersion).toBe(3);
+  });
+
+  it("an in-flight recompute wins over failed; among equals the newest speaks", async () => {
+    const { deps, store } = createDeps();
+    const first = await seedOwnerQuestion(deps);
+    const second = await seedOwnerQuestion(deps);
+    const third = await seedOwnerQuestion(deps);
+    await store.update(first, {
+      status: "failed",
+      updatedAt: "2026-08-27T12:00:00.000Z",
+    });
+    await store.update(second, {
+      status: "stale",
+      updatedAt: "2026-08-27T10:00:01.000Z",
+    });
+    await store.update(third, {
+      status: "failed",
+      updatedAt: "2026-08-27T11:00:00.000Z",
+    });
+    const res = await call(deps, "GET", "/status?derivedScope=coach.weekly", {
+      token: READER_TOKEN,
+    });
+    expect(((await res.json()) as { status: string }).status).toBe("stale");
+
+    // All failed: the newest failure is the one that speaks.
+    await store.update(second, {
+      status: "failed",
+      error: "later",
+      errorCode: "internal",
+      updatedAt: "2026-08-27T13:00:00.000Z",
+    });
+    const allFailed = await call(
+      deps,
+      "GET",
+      "/status?derivedScope=coach.weekly",
+      { token: READER_TOKEN },
+    );
+    const json = (await allFailed.json()) as { errorCode: string | null };
+    expect(json.errorCode).toBe("internal");
   });
 
   it("computes retryAfterSeconds from the scheduler's next retry", async () => {
@@ -664,6 +714,28 @@ describe("GET /v1/derivatives/status", () => {
     });
     const json = (await res.json()) as { retryAfterSeconds: number | null };
     expect(json.retryAfterSeconds).toBe(300);
+  });
+
+  it("never serves an errorCode for a non-failed status", async () => {
+    // A stale row can still carry an old errorCode (stores written before
+    // markStale cleared it). The reader contract is: null unless failed.
+    const { deps, store } = createDeps();
+    const questionId = await seedOwnerQuestion(deps);
+    await store.update(questionId, {
+      status: "stale",
+      error: "upstream down",
+      errorCode: "inference_unavailable",
+      updatedAt: "2026-08-27T11:00:00.000Z",
+    });
+    const res = await call(deps, "GET", "/status?derivedScope=coach.weekly", {
+      token: READER_TOKEN,
+    });
+    const json = (await res.json()) as {
+      status: string;
+      errorCode: string | null;
+    };
+    expect(json.status).toBe("stale");
+    expect(json.errorCode).toBeNull();
   });
 
   it("refuses a scope that fails the grammar before authorizing anything", async () => {

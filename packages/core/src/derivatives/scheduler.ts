@@ -6,6 +6,7 @@
  */
 
 import { computeDataPointId } from "../sync/data-point-id.js";
+import type { ComputeOutcome } from "./compute.js";
 import type { QuestionStore } from "./types.js";
 
 export interface SchedulerTimers {
@@ -15,8 +16,12 @@ export interface SchedulerTimers {
 
 export interface RecomputeSchedulerOptions {
   store: QuestionStore;
-  /** Runs one compute; must not throw for compute failures. */
-  compute(questionId: string): Promise<unknown>;
+  /**
+   * Runs one compute; must not throw for compute failures. The outcome is
+   * what the retry logic classifies — a wrapper that swallows it (returns
+   * void) silently disables automatic retries, so forward it.
+   */
+  compute(questionId: string): Promise<ComputeOutcome | void>;
   /** Quiet period after a source change (default 5s). */
   debounceMs?: number;
   /**
@@ -92,6 +97,17 @@ const DEFAULT_RETRY_DELAYS_MS: readonly number[] = [60_000, 300_000, 1_800_000];
  * for a failed outcome whose stored class is the one transient kind. A
  * callback that resolves anything else (older wiring, tests) never retries.
  */
+/**
+ * A compute skipped because the runtime is unavailable (PS-Lite with the
+ * hosting tab inactive). During a retry chain this must not end the chain:
+ * nothing else would ever reschedule a failed question.
+ */
+function isRuntimeSkipOutcome(outcome: unknown): boolean {
+  if (typeof outcome !== "object" || outcome === null) return false;
+  const shaped = outcome as { status?: unknown; reason?: unknown };
+  return shaped.status === "skipped" && shaped.reason === "runtime-unavailable";
+}
+
 function isTransientFailureOutcome(outcome: unknown): boolean {
   if (typeof outcome !== "object" || outcome === null) return false;
   const shaped = outcome as {
@@ -178,6 +194,12 @@ export function createRecomputeScheduler(
         .then(async (outcome) => {
           state.running = null;
           state.retryAtMs = null;
+          const retryable =
+            isTransientFailureOutcome(outcome) ||
+            // A runtime-unavailable skip DURING a chain consumes an attempt
+            // instead of ending the chain; on a fresh compute it keeps the
+            // pre-retry behavior (pending/stale, reswept by start()).
+            (isRuntimeSkipOutcome(outcome) && state.retryAttempts > 0);
           if (state.rerun) {
             // A source changed during the run: that supersedes any retry.
             state.rerun = false;
@@ -185,7 +207,15 @@ export function createRecomputeScheduler(
             await markStale(questionId);
             schedule(questionId, 0);
           } else if (
-            isTransientFailureOutcome(outcome) &&
+            retryable &&
+            // A pending timer means a source change or explicit recompute
+            // arrived during the run and already scheduled a fresher run;
+            // replacing its 5s debounce with a 60s retry would delay the
+            // recompute of data this compute never saw.
+            state.timer === null &&
+            // After stop() nothing may be scheduled; without this a compute
+            // that settles late would record a retryAtMs no timer backs.
+            !stopped &&
             state.retryAttempts < retryDelaysMs.length
           ) {
             const delayMs = retryDelaysMs[state.retryAttempts]!;
@@ -208,6 +238,10 @@ export function createRecomputeScheduler(
     if (state.timer !== null) timers.clearTimeout(state.timer);
     state.timer = timers.setTimeout(() => {
       state.timer = null;
+      // Whatever this timer was (debounce or retry), any promised retry is
+      // now being consumed: a past retryAtMs would pin the status route's
+      // retryAfterSeconds at 0 for the whole in-flight compute.
+      state.retryAtMs = null;
       run(questionId);
     }, delayMs);
   }
@@ -218,6 +252,9 @@ export function createRecomputeScheduler(
     if (registration.status === "ready" || registration.status === "failed") {
       await options.store.update(questionId, {
         status: "stale",
+        // The reader contract says errorCode is null unless failed; a stale
+        // question is a recompute in progress, not a terminal failure.
+        errorCode: null,
         updatedAt: now().toISOString(),
       });
     }

@@ -599,6 +599,35 @@ describe("/v1/derivatives/questions (composed app)", () => {
       expect(res.status).toBe(403);
     });
 
+    it("accepts the SDK's credential shape: grantId in the query, not the envelope", async () => {
+      const readApp = readerApp();
+      const registered = await readApp.request("/v1/derivatives/questions", {
+        method: "POST",
+        headers: { ...owner, "Content-Type": "application/json" },
+        body: JSON.stringify(question),
+      });
+      expect(registered.status).toBe(201);
+
+      // The SDK sends grantId as ?grantId=, outside the signed payload,
+      // exactly as it does on GET /v1/data/<scope>.
+      const path =
+        "/v1/derivatives/status?derivedScope=coach.weekly" +
+        `&grantId=${WRITE_GRANT_ID}`;
+      const res = await readApp.request(path, {
+        method: "GET",
+        headers: {
+          Authorization: await buildWeb3SignedHeader({
+            wallet: builderWallet,
+            aud: SERVER_ORIGIN,
+            method: "GET",
+            uri: "/v1/derivatives/status",
+          }),
+        },
+      });
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { status: string }).status).toBe("pending");
+    });
+
     it("answers 404 for a covered scope with no question behind it", async () => {
       const readApp = readerApp();
       const res = await readerStatus(readApp, "coach.weekly");

@@ -28,6 +28,7 @@ import {
 } from "../errors/catalog.js";
 import { parseJsonObjectBody } from "../contracts/http.js";
 import { parseDataScopeContract } from "../contracts/data.js";
+import { selectedGrantId } from "../api/index.js";
 import type {
   PersonalServerApiAuthPort,
   PersonalServerApiDispatchOptions,
@@ -234,16 +235,33 @@ async function handleStatusRoute(
     );
   }
   const derivedScope = scopeResult.scope;
-  await deps.auth.authorizeBuilderRead({ request, scope: derivedScope });
+  await deps.auth.authorizeBuilderRead({
+    request,
+    scope: derivedScope,
+    grantId: selectedGrantId(request, url),
+  });
   const registrations = await store.list({ derivedScope });
   if (registrations.length === 0) {
     throw new DerivativeQuestionNotFoundError({ derivedScope });
   }
-  // Several registrations may share a derived scope; the one updated last
-  // is the one whose lifecycle governs what a reader will get.
-  const registration = registrations.reduce((latest, candidate) =>
-    candidate.updatedAt >= latest.updatedAt ? candidate : latest,
-  );
+  // Several registrations may share a derived scope, and data serving is
+  // registration-agnostic: if ANY of them is ready, the scope has an answer
+  // and the reader must not be told "failed" by a duplicate that never
+  // wrote anything. Report the most optimistic true state — ready, then an
+  // in-flight recompute, then never-computed, then failed — and within a
+  // class let the most recently updated registration speak.
+  const STATUS_PRECEDENCE: Record<QuestionRegistration["status"], number> = {
+    ready: 0,
+    stale: 1,
+    pending: 2,
+    failed: 3,
+  };
+  const registration = registrations.reduce((best, candidate) => {
+    const byStatus =
+      STATUS_PRECEDENCE[candidate.status] - STATUS_PRECEDENCE[best.status];
+    if (byStatus !== 0) return byStatus < 0 ? candidate : best;
+    return candidate.updatedAt >= best.updatedAt ? candidate : best;
+  });
   const nextRetryAt = scheduler.nextRetryAt?.(registration.questionId) ?? null;
   const retryAfterSeconds =
     nextRetryAt === null
@@ -258,7 +276,9 @@ async function handleStatusRoute(
     lastComputedAt: registration.lastComputedAt,
     derivedVersion: registration.derivedVersion,
     derivedCollectedAt: registration.derivedCollectedAt,
-    errorCode: registration.errorCode,
+    // Null unless failed, whatever an old store row holds: a stale question
+    // is a recompute in progress, not a terminal failure.
+    errorCode: registration.status === "failed" ? registration.errorCode : null,
     retryAfterSeconds,
   });
 }

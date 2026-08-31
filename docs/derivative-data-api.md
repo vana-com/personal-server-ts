@@ -652,6 +652,7 @@ Registration view (POST, GET, list and recompute):
   "registeredBy": { "kind": "builder", "builder": "0x...", "grantId": "0x..." },
   "status": "ready",
   "error": null,
+  "errorCode": null,
   "createdAt": "...",
   "updatedAt": "...",
   "lastComputedAt": "2026-08-31T09:12:44.000Z",
