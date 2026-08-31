@@ -915,7 +915,9 @@ function resolveLineageGrantView(
  * record — the same convention as resolveLineageGrantView: no result, or the
  * "owner" / "policy-bypass" sentinels. Everything else is a grantee.
  */
-function isOwnerView(authResult: PersonalServerReadAuthResult | void): boolean {
+export function isOwnerView(
+  authResult: PersonalServerReadAuthResult | void,
+): boolean {
   return (
     authResult === undefined ||
     authResult.grantId === "owner" ||

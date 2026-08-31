@@ -31,12 +31,90 @@ import { signMcpGranteeRequest } from "./grantee.js";
 import {
   assertScopeNotDeleted,
   handlePersonalServerDataRequest,
+  isOwnerView,
   reportPersonalServerReadFulfillment,
   resolveReadDeletion,
   type PersonalServerDataApiDeps,
   type ReadDeletionEntry,
 } from "../api/index.js";
 import { ProtocolError } from "../errors/catalog.js";
+
+/**
+ * Block sidecars are built from the FULL stored envelope, so they carry the
+ * server-stamped `$writtenBy` / `$lineage` keys and the consumed caller
+ * lineage field that grantee reads of the record itself never see. The same
+ * redaction applies here at serve time: dedicated blocks under those paths
+ * are dropped, and data-level object payloads (`$.data`, grouped-key blocks,
+ * `$.data.metadata`) have the keys stripped. Unlike the envelope path, the
+ * caller `lineage` field is dropped unconditionally on block reads: a block
+ * payload alone cannot show whether `$lineage` was stamped, and the write
+ * path validates any top-level `lineage`, so an unstamped one is legacy-only
+ * — failing closed here loses nothing a grantee is entitled to.
+ */
+const REDACTED_BLOCK_PATHS = [
+  "$.data.$writtenBy",
+  "$.data.$lineage",
+  "$.data.lineage",
+  "$.data.metadata.lineage",
+];
+
+function isRedactedBlockPath(path: string): boolean {
+  return REDACTED_BLOCK_PATHS.some(
+    (prefix) =>
+      path === prefix ||
+      (path.startsWith(prefix) && /[.[{]/.test(path.charAt(prefix.length))),
+  );
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function stripDataLevelKeys(
+  value: Record<string, unknown>,
+): Record<string, unknown> {
+  const {
+    $writtenBy: _writtenBy,
+    $lineage: _lineage,
+    lineage: _callerLineage,
+    ...rest
+  } = value;
+  if (isPlainObject(rest["metadata"])) {
+    const { lineage: _metadataLineage, ...metadataRest } = rest["metadata"];
+    rest["metadata"] = metadataRest;
+  }
+  return rest;
+}
+
+function redactBlockValue(path: string, value: unknown): unknown {
+  if (!isPlainObject(value)) return value;
+  if (path === "$.data" || /^\$\.data\.\{.*\}$/.test(path)) {
+    return stripDataLevelKeys(value);
+  }
+  if (path === "$.data.metadata" || /^\$\.data\.metadata\.\{.*\}$/.test(path)) {
+    const { lineage: _metadataLineage, ...rest } = value;
+    return rest;
+  }
+  if (path === "$" && isPlainObject(value["data"])) {
+    return { ...value, data: stripDataLevelKeys(value["data"]) };
+  }
+  return value;
+}
+
+function redactBlockRefsForGrantee<T extends { path: string }>(
+  blocks: T[],
+): T[] {
+  return blocks.filter((block) => !isRedactedBlockPath(block.path));
+}
+
+function redactBlockPayloadsForGrantee<
+  T extends { path: string; value: unknown },
+>(blocks: T[]): T[] {
+  return redactBlockRefsForGrantee(blocks).map((block) => ({
+    ...block,
+    value: redactBlockValue(block.path, block.value),
+  }));
+}
 
 export interface McpScopeMetadata {
   scope: string;
@@ -469,7 +547,13 @@ export function createMcpDataReadClient(
             userAgent,
           });
         }
-        return { status: 200, ...result };
+        return isOwnerView(authResult)
+          ? { status: 200, ...result }
+          : {
+              status: 200,
+              ...result,
+              blocks: redactBlockPayloadsForGrantee(result.blocks),
+            };
       } catch (err) {
         if (err instanceof ProtocolError) {
           throw new McpDataReadError(err.code, err.toJSON());
@@ -519,6 +603,12 @@ export function createMcpDataReadClient(
       // Logged like any other grant-gated read, but never reported as a read
       // fulfillment: a table of contents carries no block values.
       await writeReadAccessLog(request, { scope, grantId, authResult });
+      if (manifest && !isOwnerView(authResult)) {
+        return {
+          ...manifest,
+          blocks: redactBlockRefsForGrantee(manifest.blocks),
+        };
+      }
       return manifest;
     },
 
