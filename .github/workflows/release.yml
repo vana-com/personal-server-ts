@@ -23,6 +23,8 @@ jobs:
           node-version: 22
           cache: npm
           registry-url: https://registry.npmjs.org
+      # Same suite as CI — see .github/actions/setup-sandbox.
+      - uses: ./.github/actions/setup-sandbox
       - run: npm ci
       - run: npm run build
       - run: npm test
