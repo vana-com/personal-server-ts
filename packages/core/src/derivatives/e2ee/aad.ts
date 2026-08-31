@@ -4,7 +4,7 @@
  * pinned by the spec test vectors in aad.test.ts.
  */
 
-import { canonicalJsonBytes } from "./jcs.js";
+import { canonicalJsonBytes } from "../../json/jcs.js";
 
 export const E2EE_REQUEST_AAD_PURPOSE = "aci.e2ee.request.v2";
 export const E2EE_RESPONSE_AAD_PURPOSE = "aci.e2ee.response.v2";

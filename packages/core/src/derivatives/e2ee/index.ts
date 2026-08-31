@@ -1,4 +1,4 @@
-export { canonicalJsonBytes, canonicalizeJson } from "./jcs.js";
+export { canonicalJsonBytes, canonicalizeJson } from "../../json/jcs.js";
 export {
   E2EE_REQUEST_AAD_PURPOSE,
   E2EE_RESPONSE_AAD_PURPOSE,
