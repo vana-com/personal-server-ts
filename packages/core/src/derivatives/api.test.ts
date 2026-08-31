@@ -753,6 +753,31 @@ describe("GET /v1/derivatives/status", () => {
     expect(readSpy).not.toHaveBeenCalled();
   });
 
+  it("serves a short poll hint while the retry compute is in flight", async () => {
+    const store = createInMemoryQuestionStore();
+    const scheduler = {
+      requestRecompute: vi.fn(),
+      markSourceChanged: vi.fn(),
+      nextRetryAt: vi.fn(() => null),
+      retryInFlight: vi.fn(() => true),
+    };
+    const { deps } = createDeps({ compute: { store, scheduler } });
+    const questionId = await seedOwnerQuestion(deps);
+    await store.update(questionId, {
+      status: "failed",
+      error: "upstream down",
+      errorCode: "inference_unavailable",
+      updatedAt: "2026-08-27T11:00:00.000Z",
+    });
+    const res = await call(deps, "GET", "/status?derivedScope=coach.weekly", {
+      token: READER_TOKEN,
+    });
+    const json = (await res.json()) as { retryAfterSeconds: number | null };
+    // Not null: null is the terminal "will never retry" signature, and a
+    // retry is running right now. Not 0: that invites a tight poll loop.
+    expect(json.retryAfterSeconds).toBe(5);
+  });
+
   it("only accepts GET", async () => {
     const { deps } = createDeps();
     const res = await call(deps, "POST", "/status?derivedScope=coach.weekly", {

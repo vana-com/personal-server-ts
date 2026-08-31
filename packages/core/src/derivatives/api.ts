@@ -51,6 +51,9 @@ import {
 /** Registration bodies are small; anything larger is refused up front. */
 export const MAX_QUESTION_BODY_BYTES = 16 * 1024;
 
+/** Poll hint served while a retry compute is in flight (no scheduled time). */
+const RETRY_IN_FLIGHT_POLL_SECONDS = 5;
+
 export interface PersonalServerDerivativesApiDeps {
   auth: Pick<
     PersonalServerApiAuthPort,
@@ -72,6 +75,8 @@ export interface PersonalServerDerivativesApiDeps {
        * status route then reports no retry.
        */
       nextRetryAt?(questionId: string): string | null;
+      /** True while a retry compute is running (timer fired, not settled). */
+      retryInFlight?(questionId: string): boolean;
     };
   } | null;
   now?: () => Date;
@@ -263,13 +268,18 @@ async function handleStatusRoute(
     return candidate.updatedAt >= best.updatedAt ? candidate : best;
   });
   const nextRetryAt = scheduler.nextRetryAt?.(registration.questionId) ?? null;
+  // While the retry compute is RUNNING there is no scheduled time, but null
+  // would be the terminal "will never retry" signature; serve a short poll
+  // hint instead. 0 is never served — it invites a tight poll loop.
   const retryAfterSeconds =
-    nextRetryAt === null
-      ? null
-      : Math.max(
-          0,
+    nextRetryAt !== null
+      ? Math.max(
+          1,
           Math.ceil((Date.parse(nextRetryAt) - now().getTime()) / 1000),
-        );
+        )
+      : scheduler.retryInFlight?.(registration.questionId)
+        ? RETRY_IN_FLIGHT_POLL_SECONDS
+        : null;
   return jsonResponse({
     derivedScope: registration.derivedScope,
     status: registration.status,

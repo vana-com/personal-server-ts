@@ -578,6 +578,40 @@ describe("retry interleavings (review findings)", () => {
     // No pending retry while it runs: a past timestamp would pin the
     // status route's retryAfterSeconds at 0 and invite a tight poll loop.
     expect(scheduler.nextRetryAt("q-1")).toBeNull();
+    // But the retry is RUNNING, not abandoned: without this signal the
+    // status route would serve the terminal failed-with-no-retry signature
+    // for the whole in-flight window.
+    expect(scheduler.retryInFlight("q-1")).toBe(true);
+    settle(undefined);
+    await scheduler.whenIdle();
+    expect(scheduler.retryInFlight("q-1")).toBe(false);
+  });
+
+  it("a debounce run is not reported as a retry in flight", async () => {
+    const store = createInMemoryQuestionStore({ initial: [reg()] });
+    const timers = manualTimers();
+    let settle!: (value: unknown) => void;
+    const compute = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          settle = resolve;
+        }),
+    );
+    const scheduler = createRecomputeScheduler({
+      store,
+      compute: compute as (
+        questionId: string,
+      ) => Promise<ComputeOutcome | void>,
+      debounceMs: 5_000,
+      retryDelaysMs: [60_000],
+      timers: timers.api,
+      now: () => NOW,
+    });
+    scheduler.markSourceChanged("oura.sleep");
+    await scheduler.whenIdle();
+    timers.fireAll(); // debounce fires; compute hangs
+    await Promise.resolve();
+    expect(scheduler.retryInFlight("q-1")).toBe(false);
     settle(undefined);
     await scheduler.whenIdle();
   });

@@ -715,12 +715,19 @@ Authorization: Web3Signed <base64url(payload)>.<sig>
 
 The view is deliberately narrow: the question text, the source scopes, the
 question id, the registrar and the raw `error` string stay owner-only.
-`errorCode` is the closed vocabulary above. `retryAfterSeconds` is the next
-automatic retry the scheduler has pending (null when none) — poll on that
-cadence instead of guessing. When several registrations share the derived
-scope, the most recently updated one answers. A covered scope with no
-question behind it is 404; an uncovered scope is refused before any lookup,
-so the route discloses nothing about which scopes have questions.
+`errorCode` is the closed vocabulary above, and is null unless `status` is
+`failed`. `retryAfterSeconds` is the next automatic retry the scheduler has
+pending — poll on that cadence instead of guessing. While a retry compute
+is actually running it has no scheduled time, so a short poll hint (5) is
+served instead; null means no retry is pending or running, the terminal
+state. When several registrations share the derived scope, the most
+optimistic true state answers — `ready`, then `stale`, then `pending`,
+then `failed`, the most recently updated within a class — because data
+serving is registration-agnostic: if any registration is ready, the scope
+HAS an answer, and a duplicate that never wrote anything must not report
+it away. A covered scope with no question behind it is 404; an uncovered
+scope is refused before any lookup, so the route discloses nothing about
+which scopes have questions.
 
 ### Status machine
 

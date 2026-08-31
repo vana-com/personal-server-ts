@@ -67,6 +67,13 @@ export interface RecomputeScheduler {
    * or an explicit recompute.
    */
   nextRetryAt(questionId: string): string | null;
+  /**
+   * True while a retry compute is actually RUNNING (its timer fired, the
+   * compute has not settled). `nextRetryAt` is null in that window; without
+   * this signal a status reader would see the terminal
+   * failed-with-no-retry signature during every in-flight retry.
+   */
+  retryInFlight(questionId: string): boolean;
   /** Resolves once no compute or store lookup is pending or timed. */
   whenIdle(): Promise<void>;
   /** Cancel pending timers. In-flight computes finish on their own. */
@@ -88,6 +95,10 @@ interface QuestionState {
   retryAttempts: number;
   /** When the pending retry timer fires (epoch ms), if one is set. */
   retryAtMs: number | null;
+  /** The pending timer is a retry (not a debounce). */
+  retryScheduled: boolean;
+  /** A retry compute is running right now. */
+  retryRunning: boolean;
 }
 
 const DEFAULT_RETRY_DELAYS_MS: readonly number[] = [60_000, 300_000, 1_800_000];
@@ -160,6 +171,8 @@ export function createRecomputeScheduler(
         rerun: false,
         retryAttempts: 0,
         retryAtMs: null,
+        retryScheduled: false,
+        retryRunning: false,
       };
       states.set(questionId, state);
     }
@@ -194,6 +207,7 @@ export function createRecomputeScheduler(
         .then(async (outcome) => {
           state.running = null;
           state.retryAtMs = null;
+          state.retryRunning = false;
           const retryable =
             isTransientFailureOutcome(outcome) ||
             // A runtime-unavailable skip DURING a chain consumes an attempt
@@ -222,6 +236,7 @@ export function createRecomputeScheduler(
             state.retryAttempts += 1;
             state.retryAtMs = now().getTime() + delayMs;
             schedule(questionId, delayMs);
+            state.retryScheduled = true;
           } else {
             state.retryAttempts = 0;
             if (!states.get(questionId)?.timer) {
@@ -240,8 +255,12 @@ export function createRecomputeScheduler(
       state.timer = null;
       // Whatever this timer was (debounce or retry), any promised retry is
       // now being consumed: a past retryAtMs would pin the status route's
-      // retryAfterSeconds at 0 for the whole in-flight compute.
+      // retryAfterSeconds at 0 for the whole in-flight compute. A firing
+      // RETRY timer hands over to retryRunning so the in-flight window is
+      // still distinguishable from a terminal failure.
       state.retryAtMs = null;
+      state.retryRunning = state.retryScheduled;
+      state.retryScheduled = false;
       run(questionId);
     }, delayMs);
   }
@@ -265,12 +284,16 @@ export function createRecomputeScheduler(
     if (!state) return;
     state.retryAttempts = 0;
     state.retryAtMs = null;
+    state.retryScheduled = false;
   }
 
   return {
     nextRetryAt(questionId) {
       const retryAtMs = states.get(questionId)?.retryAtMs;
       return retryAtMs == null ? null : new Date(retryAtMs).toISOString();
+    },
+    retryInFlight(questionId) {
+      return states.get(questionId)?.retryRunning ?? false;
     },
     markSourceChanged(scope, opts) {
       if (stopped) return;
@@ -352,6 +375,7 @@ export function createRecomputeScheduler(
         state.timer = null;
         state.retryAttempts = 0;
         state.retryAtMs = null;
+        state.retryScheduled = false;
       }
     },
     start() {
