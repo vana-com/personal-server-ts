@@ -20,6 +20,13 @@ export interface RecomputeSchedulerOptions {
   /** Quiet period after a source change (default 5s). */
   debounceMs?: number;
   /**
+   * Backoff steps for automatic retry of a compute that failed with the
+   * transient class (`errorCode: "inference_unavailable"`). Default
+   * 1m, 5m, 30m; empty disables retry. Non-transient failures never
+   * retry — they wait for a source change or an explicit recompute.
+   */
+  retryDelaysMs?: readonly number[];
+  /**
    * Lets `markSourceChanged` recognise a new version that was computed FROM
    * a question's own derived scope (its `$lineage` names the derived data
    * point id) and skip that question: a cross-replica cycle then settles
@@ -48,6 +55,13 @@ export interface RecomputeScheduler {
   ): void;
   /** Schedule one question; `immediate` skips the debounce (owner recompute). */
   requestRecompute(questionId: string, options?: { immediate?: boolean }): void;
+  /**
+   * Next scheduled automatic retry for a failed question (ISO time), or
+   * null when none is pending. In-memory, like the rest of the scheduler:
+   * a restart drops the chain and the question waits for a source change
+   * or an explicit recompute.
+   */
+  nextRetryAt(questionId: string): string | null;
   /** Resolves once no compute or store lookup is pending or timed. */
   whenIdle(): Promise<void>;
   /** Cancel pending timers. In-flight computes finish on their own. */
@@ -65,6 +79,29 @@ interface QuestionState {
   timer: unknown | null;
   running: Promise<void> | null;
   rerun: boolean;
+  /** Consecutive transient failures already retried. */
+  retryAttempts: number;
+  /** When the pending retry timer fires (epoch ms), if one is set. */
+  retryAtMs: number | null;
+}
+
+const DEFAULT_RETRY_DELAYS_MS: readonly number[] = [60_000, 300_000, 1_800_000];
+
+/**
+ * Structural check on the compute callback's resolved value: retry is only
+ * for a failed outcome whose stored class is the one transient kind. A
+ * callback that resolves anything else (older wiring, tests) never retries.
+ */
+function isTransientFailureOutcome(outcome: unknown): boolean {
+  if (typeof outcome !== "object" || outcome === null) return false;
+  const shaped = outcome as {
+    status?: unknown;
+    registration?: { errorCode?: unknown } | null;
+  };
+  return (
+    shaped.status === "failed" &&
+    shaped.registration?.errorCode === "inference_unavailable"
+  );
 }
 
 const defaultTimers: SchedulerTimers = {
@@ -77,6 +114,7 @@ export function createRecomputeScheduler(
   options: RecomputeSchedulerOptions,
 ): RecomputeScheduler {
   const debounceMs = options.debounceMs ?? 5_000;
+  const retryDelaysMs = options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
   const timers = options.timers ?? defaultTimers;
   const now = options.now ?? (() => new Date());
   const states = new Map<string, QuestionState>();
@@ -100,7 +138,13 @@ export function createRecomputeScheduler(
   function stateFor(questionId: string): QuestionState {
     let state = states.get(questionId);
     if (!state) {
-      state = { timer: null, running: null, rerun: false };
+      state = {
+        timer: null,
+        running: null,
+        rerun: false,
+        retryAttempts: 0,
+        retryAtMs: null,
+      };
       states.set(questionId, state);
     }
     return state;
@@ -119,24 +163,40 @@ export function createRecomputeScheduler(
       Promise.resolve()
         .then(() => options.compute(questionId))
         .then(
-          () => undefined,
-          (err) =>
+          (outcome) => outcome,
+          (err) => {
             warn(
               {
                 questionId,
                 error: err instanceof Error ? err.name : String(err),
               },
               "Derivative compute threw",
-            ),
+            );
+            return undefined;
+          },
         )
-        .then(async () => {
+        .then(async (outcome) => {
           state.running = null;
+          state.retryAtMs = null;
           if (state.rerun) {
+            // A source changed during the run: that supersedes any retry.
             state.rerun = false;
+            state.retryAttempts = 0;
             await markStale(questionId);
             schedule(questionId, 0);
-          } else if (!states.get(questionId)?.timer) {
-            states.delete(questionId);
+          } else if (
+            isTransientFailureOutcome(outcome) &&
+            state.retryAttempts < retryDelaysMs.length
+          ) {
+            const delayMs = retryDelaysMs[state.retryAttempts]!;
+            state.retryAttempts += 1;
+            state.retryAtMs = now().getTime() + delayMs;
+            schedule(questionId, delayMs);
+          } else {
+            state.retryAttempts = 0;
+            if (!states.get(questionId)?.timer) {
+              states.delete(questionId);
+            }
           }
         }),
     );
@@ -163,7 +223,18 @@ export function createRecomputeScheduler(
     }
   }
 
+  function resetRetry(questionId: string): void {
+    const state = states.get(questionId);
+    if (!state) return;
+    state.retryAttempts = 0;
+    state.retryAtMs = null;
+  }
+
   return {
+    nextRetryAt(questionId) {
+      const retryAtMs = states.get(questionId)?.retryAtMs;
+      return retryAtMs == null ? null : new Date(retryAtMs).toISOString();
+    },
     markSourceChanged(scope, opts) {
       if (stopped) return;
       const lineage = new Set(
@@ -191,6 +262,7 @@ export function createRecomputeScheduler(
               continue;
             }
             await markStale(registration.questionId);
+            resetRetry(registration.questionId);
             schedule(registration.questionId, debounceMs);
           }
         })().catch((err) =>
@@ -214,7 +286,10 @@ export function createRecomputeScheduler(
               "Could not mark derivative question stale",
             ),
           )
-          .then(() => schedule(questionId, opts?.immediate ? 0 : debounceMs)),
+          .then(() => {
+            resetRetry(questionId);
+            schedule(questionId, opts?.immediate ? 0 : debounceMs);
+          }),
       );
     },
     async whenIdle() {
@@ -238,6 +313,8 @@ export function createRecomputeScheduler(
       for (const state of states.values()) {
         if (state.timer !== null) timers.clearTimeout(state.timer);
         state.timer = null;
+        state.retryAttempts = 0;
+        state.retryAtMs = null;
       }
     },
     start() {

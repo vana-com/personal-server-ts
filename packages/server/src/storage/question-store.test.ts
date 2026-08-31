@@ -20,6 +20,7 @@ function registration(
     },
     status: "pending",
     error: null,
+    errorCode: null,
     createdAt: "2026-08-27T00:00:00.000Z",
     updatedAt: "2026-08-27T00:00:00.000Z",
     lastComputedAt: null,
@@ -143,5 +144,80 @@ describe("createSqliteQuestionStore", () => {
     );
     expect((await store.get("q-new"))!.recompute).toBe("snapshot");
     db.close();
+  });
+});
+
+describe("errorCode column", () => {
+  it("round-trips the failure class through update", async () => {
+    const db = initializeDatabase(":memory:");
+    const store = createSqliteQuestionStore(db);
+    await store.insert(registration());
+    await store.update("q-1", {
+      status: "failed",
+      error: "upstream down",
+      errorCode: "inference_unavailable",
+      updatedAt: "2026-08-27T01:00:00.000Z",
+    });
+    const stored = (await store.get("q-1"))!;
+    expect(stored.errorCode).toBe("inference_unavailable");
+    await store.update("q-1", {
+      status: "ready",
+      error: null,
+      errorCode: null,
+      updatedAt: "2026-08-27T02:00:00.000Z",
+    });
+    expect((await store.get("q-1"))!.errorCode).toBeNull();
+  });
+
+  it("migrates a pre-existing table without the column in place", async () => {
+    const db = initializeDatabase(":memory:");
+    // The table as PR #230 created it, without error_code.
+    db.exec(`CREATE TABLE derivative_questions (
+      question_id TEXT PRIMARY KEY,
+      derived_scope TEXT NOT NULL,
+      source_scopes TEXT NOT NULL,
+      question TEXT NOT NULL,
+      model TEXT,
+      registered_by TEXT NOT NULL,
+      status TEXT NOT NULL,
+      error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_computed_at TEXT,
+      derived_version INTEGER,
+      derived_collected_at TEXT
+    )`);
+    db.prepare(
+      `INSERT INTO derivative_questions (
+        question_id, derived_scope, source_scopes, question, model,
+        registered_by, status, error, created_at, updated_at,
+        last_computed_at, derived_version, derived_collected_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "q-old",
+      "coach.weekly",
+      JSON.stringify(["oura.sleep"]),
+      "How did I sleep?",
+      null,
+      JSON.stringify({ kind: "owner" }),
+      "failed",
+      "upstream down",
+      "2026-08-27T00:00:00.000Z",
+      "2026-08-27T00:00:00.000Z",
+      null,
+      null,
+      null,
+    );
+
+    const store = createSqliteQuestionStore(db);
+    const old = (await store.get("q-old"))!;
+    expect(old.errorCode).toBeNull();
+    await store.update("q-old", {
+      errorCode: "inference_unavailable",
+      updatedAt: "2026-08-27T01:00:00.000Z",
+    });
+    expect((await store.get("q-old"))!.errorCode).toBe("inference_unavailable");
+    // Opening the store twice must not fail on a second ALTER.
+    createSqliteQuestionStore(db);
   });
 });

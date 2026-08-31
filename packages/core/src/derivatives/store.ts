@@ -8,6 +8,8 @@ import type {
 function clone(registration: QuestionRegistration): QuestionRegistration {
   return {
     ...registration,
+    // Registrations persisted before the field existed load as null.
+    errorCode: registration.errorCode ?? null,
     sourceScopes: [...registration.sourceScopes],
     registeredBy: { ...registration.registeredBy },
   };

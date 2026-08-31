@@ -227,6 +227,7 @@ export async function createQuestionRegistration(
     registeredBy: input.registeredBy,
     status: "pending",
     error: null,
+    errorCode: null,
     createdAt: at,
     updatedAt: at,
     lastComputedAt: null,

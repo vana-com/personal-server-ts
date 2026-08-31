@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { NotOwnerError } from "../errors/catalog.js";
+import { NotOwnerError, ScopeMismatchError } from "../errors/catalog.js";
 import type {
   PersonalServerApiAuthPort,
   PersonalServerWriteAuthResult,
@@ -14,6 +14,7 @@ import type { RecomputeScheduler } from "./scheduler.js";
 const BASE = "http://ps.local/v1/derivatives";
 const OWNER_TOKEN = "owner-token";
 const BUILDER_TOKEN = "builder-token";
+const READER_TOKEN = "reader-token";
 const BUILDER = "0x2222222222222222222222222222222222222222" as const;
 const OTHER_BUILDER = "0x3333333333333333333333333333333333333333" as const;
 
@@ -28,6 +29,8 @@ function createAuth(
     builder?: `0x${string}`;
     /** The grant's scope entries handed over with the write auth result. */
     grantScopes?: string[] | null;
+    /** Scopes a READER_TOKEN read grant covers (status route tests). */
+    readScopes?: string[];
   } = {},
 ): PersonalServerApiAuthPort {
   const builderScopes = options.builderScopes ?? ["coach."];
@@ -38,13 +41,25 @@ function createAuth(
       : options.grantScopes;
   const token = (request: Request) =>
     request.headers.get("authorization")?.replace(/^Bearer /, "") ?? null;
+  const readScopes = options.readScopes ?? ["coach.weekly"];
   return {
     async authorizeOwner(request) {
       if (token(request) !== OWNER_TOKEN) throw new NotOwnerError();
     },
     async authorizeBuilderList() {},
-    async authorizeBuilderRead() {
-      return undefined;
+    async authorizeBuilderRead({ request, scope }) {
+      // Mirrors the real adapters: the owner passes, a reader passes only
+      // for a scope its grant covers, anything else fails closed.
+      if (token(request) === OWNER_TOKEN) {
+        return { builder: "owner", grantId: "owner" };
+      }
+      if (token(request) === READER_TOKEN) {
+        if (!readScopes.includes(scope)) {
+          throw new ScopeMismatchError({ requestedScope: scope });
+        }
+        return { builder, grantId: "read-grant-1" };
+      }
+      throw new NotOwnerError();
     },
     async authorizeWrite({ request, scope }) {
       if (token(request) === BUILDER_TOKEN) {
@@ -442,6 +457,7 @@ describe("handlePersonalServerDerivativesRequest", () => {
       registeredBy: { kind: "builder", builder: BUILDER, grantId: "grant-1" },
       status: "pending",
       error: null,
+      errorCode: null,
       createdAt: "2026-08-27T10:00:00.000Z",
       updatedAt: "2026-08-27T10:00:00.000Z",
       lastComputedAt: null,
@@ -514,5 +530,162 @@ describe("handlePersonalServerDerivativesRequest", () => {
         })
       ).status,
     ).toBe(405);
+  });
+});
+
+describe("GET /v1/derivatives/status", () => {
+  async function seedOwnerQuestion(
+    deps: PersonalServerDerivativesApiDeps,
+  ): Promise<string> {
+    const res = await call(deps, "POST", "/questions", {
+      token: OWNER_TOKEN,
+      body,
+    });
+    expect(res.status).toBe(201);
+    return ((await res.json()) as { questionId: string }).questionId;
+  }
+
+  it("requires a derivedScope query", async () => {
+    const { deps } = createDeps();
+    const res = await call(deps, "GET", "/status", { token: READER_TOKEN });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error.errorCode).toBe(
+      "DERIVATIVE_DERIVED_SCOPE_REQUIRED",
+    );
+  });
+
+  it("authorizes before looking anything up: an uncovered scope is refused even when a question exists", async () => {
+    const { deps } = createDeps({ auth: createAuth({ readScopes: [] }) });
+    await seedOwnerQuestion(deps);
+    const res = await call(deps, "GET", "/status?derivedScope=coach.weekly", {
+      token: READER_TOKEN,
+    });
+    expect(res.status).toBe(403);
+    expect((await res.json()).error.errorCode).toBe("SCOPE_MISMATCH");
+  });
+
+  it("answers 404 for a covered scope with no registered question", async () => {
+    const { deps } = createDeps();
+    const res = await call(deps, "GET", "/status?derivedScope=coach.weekly", {
+      token: READER_TOKEN,
+    });
+    expect(res.status).toBe(404);
+    expect((await res.json()).error.errorCode).toBe(
+      "DERIVATIVE_QUESTION_NOT_FOUND",
+    );
+  });
+
+  it("shows a reader the lifecycle of an owner-registered question and nothing else", async () => {
+    const { deps } = createDeps();
+    await seedOwnerQuestion(deps);
+    const res = await call(deps, "GET", "/status?derivedScope=coach.weekly", {
+      token: READER_TOKEN,
+    });
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(Object.keys(json).sort()).toEqual([
+      "derivedCollectedAt",
+      "derivedScope",
+      "derivedVersion",
+      "errorCode",
+      "lastComputedAt",
+      "retryAfterSeconds",
+      "status",
+    ]);
+    expect(json).toEqual({
+      derivedScope: "coach.weekly",
+      status: "pending",
+      lastComputedAt: null,
+      derivedVersion: null,
+      derivedCollectedAt: null,
+      errorCode: null,
+      retryAfterSeconds: null,
+    });
+  });
+
+  it("never discloses the question text, sources, id, registrar, model or raw error", async () => {
+    const { deps, store } = createDeps();
+    const questionId = await seedOwnerQuestion(deps);
+    await store.update(questionId, {
+      status: "failed",
+      error: "source scope oura.sleep is deleted",
+      updatedAt: "2026-08-27T11:00:00.000Z",
+    });
+    const res = await call(deps, "GET", "/status?derivedScope=coach.weekly", {
+      token: READER_TOKEN,
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain("oura.sleep");
+    expect(text).not.toContain("How did I sleep?");
+    expect(text).not.toContain(questionId);
+    expect(text).not.toContain("owner");
+  });
+
+  it("serves the owner through the same route", async () => {
+    const { deps } = createDeps();
+    await seedOwnerQuestion(deps);
+    const res = await call(deps, "GET", "/status?derivedScope=coach.weekly", {
+      token: OWNER_TOKEN,
+    });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { status: string }).status).toBe("pending");
+  });
+
+  it("reports the most recently updated registration when several share the scope", async () => {
+    const { deps, store } = createDeps();
+    const first = await seedOwnerQuestion(deps);
+    const second = await seedOwnerQuestion(deps);
+    await store.update(first, {
+      status: "ready",
+      updatedAt: "2026-08-27T10:00:01.000Z",
+    });
+    await store.update(second, {
+      status: "failed",
+      updatedAt: "2026-08-27T12:00:00.000Z",
+    });
+    const res = await call(deps, "GET", "/status?derivedScope=coach.weekly", {
+      token: READER_TOKEN,
+    });
+    expect(((await res.json()) as { status: string }).status).toBe("failed");
+  });
+
+  it("computes retryAfterSeconds from the scheduler's next retry", async () => {
+    const store = createInMemoryQuestionStore();
+    const scheduler = {
+      requestRecompute: vi.fn(),
+      markSourceChanged: vi.fn(),
+      nextRetryAt: vi.fn(() => "2026-08-27T10:05:00.000Z"),
+    };
+    const { deps } = createDeps({ compute: { store, scheduler } });
+    await seedOwnerQuestion(deps);
+    const res = await call(deps, "GET", "/status?derivedScope=coach.weekly", {
+      token: READER_TOKEN,
+    });
+    const json = (await res.json()) as { retryAfterSeconds: number | null };
+    expect(json.retryAfterSeconds).toBe(300);
+  });
+
+  it("refuses a scope that fails the grammar before authorizing anything", async () => {
+    const auth = createAuth();
+    const readSpy = vi.spyOn(auth, "authorizeBuilderRead");
+    const { deps } = createDeps({ auth });
+    const res = await call(
+      deps,
+      "GET",
+      "/status?derivedScope=Not%20A%20Scope",
+      { token: READER_TOKEN },
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error.errorCode).toBe("INVALID_SCOPE");
+    expect(readSpy).not.toHaveBeenCalled();
+  });
+
+  it("only accepts GET", async () => {
+    const { deps } = createDeps();
+    const res = await call(deps, "POST", "/status?derivedScope=coach.weekly", {
+      token: OWNER_TOKEN,
+    });
+    expect(res.status).toBe(405);
   });
 });

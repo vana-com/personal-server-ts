@@ -542,4 +542,67 @@ describe("/v1/derivatives/questions (composed app)", () => {
     });
     expect(anon.status).toBe(401);
   });
+
+  describe("GET /v1/derivatives/status (reader credential)", () => {
+    /** An app whose gateway grant is a bare READ entry on the derived scope
+     *  only — the consent-flow shape: no write entry, no source scopes. */
+    function readerApp() {
+      return createApp({
+        ...baseDeps,
+        gateway: createMockGateway(["coach.weekly"]),
+      });
+    }
+
+    async function readerStatus(
+      readApp: Hono,
+      derivedScope: string,
+    ): Promise<Response> {
+      const path = `/v1/derivatives/status?derivedScope=${derivedScope}`;
+      return readApp.request(path, {
+        method: "GET",
+        headers: {
+          Authorization: await buildWeb3SignedHeader({
+            wallet: builderWallet,
+            aud: SERVER_ORIGIN,
+            method: "GET",
+            // Like every Web3Signed read, the signature covers the path only.
+            uri: "/v1/derivatives/status",
+            grantId: WRITE_GRANT_ID,
+          }),
+        },
+      });
+    }
+
+    it("a bare read grant on the derived scope observes the lifecycle, nothing more", async () => {
+      const readApp = readerApp();
+      const registered = await readApp.request("/v1/derivatives/questions", {
+        method: "POST",
+        headers: { ...owner, "Content-Type": "application/json" },
+        body: JSON.stringify(question),
+      });
+      expect(registered.status).toBe(201);
+
+      const res = await readerStatus(readApp, "coach.weekly");
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as Record<string, unknown>;
+      expect(json.status).toBe("pending");
+      expect(json.derivedScope).toBe("coach.weekly");
+      expect(json).not.toHaveProperty("question");
+      expect(json).not.toHaveProperty("sourceScopes");
+      expect(json).not.toHaveProperty("questionId");
+      expect(json).not.toHaveProperty("registeredBy");
+    });
+
+    it("refuses a scope the grant does not cover, before any lookup", async () => {
+      const readApp = readerApp();
+      const res = await readerStatus(readApp, "other.scope");
+      expect(res.status).toBe(403);
+    });
+
+    it("answers 404 for a covered scope with no question behind it", async () => {
+      const readApp = readerApp();
+      const res = await readerStatus(readApp, "coach.weekly");
+      expect(res.status).toBe(404);
+    });
+  });
 });

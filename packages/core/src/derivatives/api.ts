@@ -27,6 +27,7 @@ import {
   ProtocolError,
 } from "../errors/catalog.js";
 import { parseJsonObjectBody } from "../contracts/http.js";
+import { parseDataScopeContract } from "../contracts/data.js";
 import type {
   PersonalServerApiAuthPort,
   PersonalServerApiDispatchOptions,
@@ -52,7 +53,10 @@ export const MAX_QUESTION_BODY_BYTES = 16 * 1024;
 export interface PersonalServerDerivativesApiDeps {
   auth: Pick<
     PersonalServerApiAuthPort,
-    "authorizeOwner" | "authorizeWrite" | "authorizeWriteSession"
+    | "authorizeOwner"
+    | "authorizeWrite"
+    | "authorizeWriteSession"
+    | "authorizeBuilderRead"
   >;
   /** Absent = the compute layer is not wired; every route answers 503. */
   compute?: {
@@ -60,7 +64,14 @@ export interface PersonalServerDerivativesApiDeps {
     scheduler: Pick<
       RecomputeScheduler,
       "requestRecompute" | "markSourceChanged"
-    >;
+    > & {
+      /**
+       * Next scheduled automatic retry of a failed question (ISO time), or
+       * null. Optional so a minimal scheduler stays a valid dependency; the
+       * status route then reports no retry.
+       */
+      nextRetryAt?(questionId: string): string | null;
+    };
   } | null;
   now?: () => Date;
   createQuestionId?: () => string;
@@ -173,6 +184,85 @@ async function loadForCaller(
   return { registration, writer };
 }
 
+/**
+ * `GET /v1/derivatives/status?derivedScope=<scope>`: the lifecycle of the
+ * question behind a derived scope, for the party that will READ the answer.
+ *
+ * Authorization is the data read's (`authorizeBuilderRead`, i.e. a live
+ * grant covering the derived scope, or the owner) — deliberately NOT the
+ * write-session path, because a consent-flow reader holds only a bare read
+ * entry and can never open a write session. Nothing is served and nothing
+ * is charged: this is authorization only, no x402 challenge and no
+ * RECORD_DATA_ACCESS receipt, the same bar as the lineage read.
+ *
+ * The view is deliberately narrow: lifecycle only. The question text, the
+ * source scopes, the question id, the registrar and the raw error string
+ * stay owner-only — `errorCode` is a closed vocabulary precisely so a
+ * stored error like "source scope X is deleted" cannot leak a scope name.
+ * Auth runs before the store lookup, so an uncovered caller cannot probe
+ * which scopes have questions behind them.
+ *
+ * Like every Web3Signed read (data, lineage), the signature covers the
+ * path, not the query; per-scope authorization is enforced live against
+ * the caller's grant on each request.
+ */
+async function handleStatusRoute(
+  request: Request,
+  url: URL,
+  deps: PersonalServerDerivativesApiDeps,
+  store: QuestionStore,
+  scheduler: NonNullable<
+    PersonalServerDerivativesApiDeps["compute"]
+  >["scheduler"],
+  now: () => Date,
+): Promise<Response> {
+  if (request.method !== "GET") {
+    return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+  }
+  const derivedScopeParam = url.searchParams.get("derivedScope");
+  if (!derivedScopeParam) {
+    throw new DerivativeDerivedScopeRequiredError();
+  }
+  // Same grammar gate as every scope-taking route, before anything is
+  // authorized: an arbitrary string never reaches the grant policy.
+  const scopeResult = parseDataScopeContract(derivedScopeParam);
+  if (!scopeResult.ok) {
+    return errorResponse(
+      scopeResult.status,
+      scopeResult.body.error,
+      scopeResult.body.message,
+    );
+  }
+  const derivedScope = scopeResult.scope;
+  await deps.auth.authorizeBuilderRead({ request, scope: derivedScope });
+  const registrations = await store.list({ derivedScope });
+  if (registrations.length === 0) {
+    throw new DerivativeQuestionNotFoundError({ derivedScope });
+  }
+  // Several registrations may share a derived scope; the one updated last
+  // is the one whose lifecycle governs what a reader will get.
+  const registration = registrations.reduce((latest, candidate) =>
+    candidate.updatedAt >= latest.updatedAt ? candidate : latest,
+  );
+  const nextRetryAt = scheduler.nextRetryAt?.(registration.questionId) ?? null;
+  const retryAfterSeconds =
+    nextRetryAt === null
+      ? null
+      : Math.max(
+          0,
+          Math.ceil((Date.parse(nextRetryAt) - now().getTime()) / 1000),
+        );
+  return jsonResponse({
+    derivedScope: registration.derivedScope,
+    status: registration.status,
+    lastComputedAt: registration.lastComputedAt,
+    derivedVersion: registration.derivedVersion,
+    derivedCollectedAt: registration.derivedCollectedAt,
+    errorCode: registration.errorCode,
+    retryAfterSeconds,
+  });
+}
+
 export async function handlePersonalServerDerivativesRequest(
   request: Request,
   deps: PersonalServerDerivativesApiDeps,
@@ -182,13 +272,19 @@ export async function handlePersonalServerDerivativesRequest(
     const url = new URL(request.url);
     const pathname = stripBasePath(url.pathname, options.basePath);
     const parts = pathname.split("/").filter(Boolean);
-    if (parts[0] !== "questions" || parts.length > 3) {
+    const isStatusRoute = parts[0] === "status" && parts.length === 1;
+    if (!isStatusRoute && (parts[0] !== "questions" || parts.length > 3)) {
       return errorResponse(404, "NOT_FOUND", "Not found");
     }
     const compute = deps.compute;
     if (!compute) throw new DerivativeComputeUnavailableError();
     const { store, scheduler } = compute;
     const now = deps.now ?? (() => new Date());
+
+    // /status — the reader-facing lifecycle view of a derived scope.
+    if (isStatusRoute) {
+      return await handleStatusRoute(request, url, deps, store, scheduler, now);
+    }
 
     // /questions
     if (parts.length === 1) {

@@ -684,6 +684,43 @@ computes.
 | 413    | `CONTENT_TOO_LARGE`                 | registration body over 16 KB                                         |
 | 503    | `DERIVATIVE_COMPUTE_UNAVAILABLE`    | the server has no compute layer wired                                |
 
+### Observing a question as the reader
+
+`GET /v1/derivatives/status?derivedScope=<scope>` is the lifecycle view for
+the party that will READ the answer — the consent-flow app that holds only
+a bare read entry on the derived scope and therefore can never open a write
+session. Authorization is the data read's (a live grant covering the scope,
+or the owner); nothing is served and nothing is charged, the same bar as
+the lineage read. Without it a reader polling `GET /v1/data/<scope>` cannot
+tell "computing right now" (404) from "failed and will never retry" (also
+404).
+
+```http
+GET /v1/derivatives/status?derivedScope=coach.weekly
+Authorization: Web3Signed <base64url(payload)>.<sig>
+```
+
+```json
+{
+  "derivedScope": "coach.weekly",
+  "status": "failed",
+  "lastComputedAt": "2026-08-31T09:12:44.000Z",
+  "derivedVersion": 3,
+  "derivedCollectedAt": "2026-08-31T09:12:44Z",
+  "errorCode": "inference_unavailable",
+  "retryAfterSeconds": 300
+}
+```
+
+The view is deliberately narrow: the question text, the source scopes, the
+question id, the registrar and the raw `error` string stay owner-only.
+`errorCode` is the closed vocabulary above. `retryAfterSeconds` is the next
+automatic retry the scheduler has pending (null when none) — poll on that
+cadence instead of guessing. When several registrations share the derived
+scope, the most recently updated one answers. A covered scope with no
+question behind it is 404; an uncovered scope is refused before any lookup,
+so the route discloses nothing about which scopes have questions.
+
 ### Status machine
 
 ```
@@ -710,8 +747,24 @@ Retry policy inside one compute: a transient inference failure (no
 response, 429, 5xx) and a transient gateway failure during the grant check
 are retried up to three attempts with backoff (1s, 4s); protocol failures
 (a revoked grant, an uncovered source, a 4xx from the provider) fail closed
-at once. A question left `failed` is recomputed on the next source change
-or `POST /recompute`.
+at once.
+
+Failures are classified into `errorCode`, a CLOSED vocabulary stored next
+to the free-text `error` and safe to serve to readers (it never carries a
+scope name, the question or provider detail):
+
+| `errorCode`             | Meaning                                          |
+| ----------------------- | ------------------------------------------------ |
+| `inference_unavailable` | transient provider/relay failure (retried)       |
+| `source_missing`        | a source scope is deleted or has no local data   |
+| `grant_invalid`         | the registering builder's grant no longer covers |
+| `internal`              | anything else, including permanent provider 4xx  |
+
+`inference_unavailable` is the one transient class: after the in-compute
+attempts are spent, the scheduler retries the question on a backoff
+schedule (default 1m, 5m, 30m; in-memory, so a restart drops the chain).
+Every other class — and an exhausted backoff — leaves the question
+`failed` until the next source change or `POST /recompute`.
 
 Before a compute of a builder-registered question the server re-runs the
 write policy against the live grant and the read coverage of every source:
