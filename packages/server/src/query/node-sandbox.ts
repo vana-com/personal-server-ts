@@ -1,7 +1,14 @@
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import type {
   Sandbox,
@@ -117,6 +124,73 @@ function realOrSelf(p: string): string {
 }
 
 /**
+ * The one host binary the Linux sandbox must be able to exec *inside* its own
+ * namespace.
+ *
+ * ASRT's Linux path is two-stage: `bwrap` builds the namespace, then execs
+ * ASRT's own `apply-seccomp` helper inside it to install the seccomp filter
+ * and become PID 1 of a nested PID namespace. ASRT resolves that helper on
+ * the **host** — a plain `existsSync` over its vendor directory — and then
+ * uses the same absolute path inside the namespace.
+ *
+ * The trap is that `denyRead` on Linux is not a kernel policy the way
+ * Seatbelt's is: it is `--tmpfs <dir>`. A denied directory is *replaced*, so
+ * nothing beneath it exists in the namespace at all. {@link broadDenyRead}
+ * denies `/home` and the user's home directory, and a checkout under either
+ * — `/home/runner/work/...` on a GitHub runner, `~/src/...` on a Linux
+ * workstation — puts
+ * `node_modules/@anthropic-ai/sandbox-runtime/vendor/seccomp/<arch>/apply-seccomp`
+ * inside that tmpfs. The helper then fails to exec with ENOENT and *every*
+ * run dies before the script starts, control cases included.
+ *
+ * Measured on ubuntu-24.04 / x86_64: `ls` of the helper inside
+ * `bwrap --ro-bind / / --tmpfs /home` reports "No such file or directory",
+ * and a single `--ro-bind <helper> <helper>` restores it. That is what
+ * putting the helper in `allowRead` emits.
+ *
+ * macOS never exercises this: Seatbelt applies a kernel policy over the real
+ * filesystem — nothing is unmounted — and needs no helper binary at all.
+ *
+ * Re-allowing this one file is deliberately *not* a widening of the
+ * grant-derived read allowlist. It is a statically linked binary shipped
+ * inside ASRT, holding no user data, in a namespace where `/usr`, `/bin` and
+ * `/lib` are already readable through bwrap's `--ro-bind / /`. No path that
+ * could carry user data becomes readable, so the property
+ * `hostile-scripts.test.ts` asserts — a script reads its granted scope paths
+ * and the run scratch dir, nothing else — is unchanged.
+ *
+ * The path is also handed back to ASRT as `seccomp.applyPath`, which it uses
+ * verbatim ahead of its own lookup. That makes "the path we re-allow" and
+ * "the path it execs" the same string by construction rather than by two
+ * lookups happening to agree.
+ */
+function linuxSeccompHelperPath(): string | undefined {
+  if (process.platform !== "linux") return undefined;
+  // Mirrors ASRT's own `getVendorArchitecture()`; it ships no other builds.
+  const arch =
+    process.arch === "x64" ? "x64" : process.arch === "arm64" ? "arm64" : null;
+  if (arch === null) return undefined;
+  try {
+    const resolveFrom = createRequire(import.meta.url);
+    const packageRoot = dirname(
+      resolveFrom.resolve("@anthropic-ai/sandbox-runtime/package.json"),
+    );
+    const helper = join(
+      packageRoot,
+      "vendor",
+      "seccomp",
+      arch,
+      "apply-seccomp",
+    );
+    return existsSync(helper) ? helper : undefined;
+  } catch {
+    // Nothing to re-allow. ASRT falls back to its own lookup and, if that
+    // also fails, reports seccomp as unavailable through `checkDependencies`.
+    return undefined;
+  }
+}
+
+/**
  * Build the child's environment from scratch rather than inheriting.
  *
  * `wrapWithSandboxArgv` returns an env derived from `process.env`, so
@@ -151,7 +225,7 @@ function minimalEnv(
 /** Wall-clock grace beyond the CPU limit before we escalate to SIGKILL. */
 const KILL_GRACE_MS = 2_000;
 /** How often the RSS watchdog samples. Memory is bounded by sampling on
- *  macOS, not by a kernel limit — see {@link buildEnforcement}. */
+ *  every platform, not by a kernel limit — see {@link buildEnforcement}. */
 const RSS_POLL_MS = 50;
 
 function shQuote(s: string): string {
@@ -163,27 +237,62 @@ function shQuote(s: string): string {
  * `setrlimit(2)` before `exec`, so they apply to the Node process and every
  * child it spawns.
  *
- * Platform reality, measured on macOS 26.5 / arm64:
- * - `ulimit -t` (RLIMIT_CPU) **works** — SIGXCPU, exit 152.
- * - `ulimit -v` (RLIMIT_AS) is **rejected by the kernel**
- *   ("cannot modify limit: Invalid argument") and a 4GB allocation then
- *   succeeds. We still emit it, guarded, because it does work on Linux.
- * - `ulimit -u` (RLIMIT_NPROC) is accepted and bounds fork bombs.
+ * The shell is not the same shell on both platforms, and that matters more
+ * than it looks: macOS `/bin/sh` is bash, Ubuntu's is **dash**, and their
+ * `ulimit` built-ins do not accept the same options. A limit spelled for one
+ * is silently absent on the other, because every line here is guarded with
+ * `|| true` so that a kernel or shell rejecting one limit cannot abort the
+ * run. Silence is the price of that guard, so each limit below is written to
+ * work on both, and each claim is measured.
+ *
+ * Platform reality, measured on macOS 26.5 / arm64 and on ubuntu-24.04:
+ * - `ulimit -t` (RLIMIT_CPU) works on both, with the soft/hard split below.
+ * - RLIMIT_NPROC is `-u` in bash and `-p` in dash, so both are attempted.
+ * - `ulimit -v` (RLIMIT_AS) is emitted on **neither**, and this is the
+ *   deliberate part.
+ *
+ * RLIMIT_AS bounds *virtual address space*, which is not the quantity
+ * `memoryMb` is about. V8 reserves a large virtual range up front regardless
+ * of how small its heap is, so `ulimit -v` set to a realistic memory budget
+ * does not cap a runaway allocation — it stops Node from starting at all.
+ * Measured on ubuntu-24.04: `ulimit -v 262144` (the suite's 256MB budget)
+ * followed by `node -e 'console.log(42)'` never reaches the script. macOS
+ * rejects the limit outright ("cannot modify limit: Invalid argument") and a
+ * 4GB allocation then succeeds, so it never enforced anything there either.
+ *
+ * An unusably coarse limit is not containment, and emitting it under
+ * `|| true` made it look like one. Memory is bounded by the RSS watchdog in
+ * `runOne`, on every platform, and {@link buildEnforcement} says so.
  */
 function ulimitPreamble(spec: SandboxSpec): string {
   const cpuSeconds = Math.max(1, Math.ceil(spec.cpuMs / 1000));
   const parts = [
-    // `|| true` so a kernel that rejects a limit does not abort the run;
-    // `enforcement` reports what actually took effect.
-    `ulimit -t ${cpuSeconds} 2>/dev/null || true`,
+    // RLIMIT_CPU, deliberately as a *split* soft/hard pair: `ulimit -t N`
+    // sets both, then `-S -t` lowers the soft one. With soft == hard the
+    // kernel raises SIGXCPU and escalates to SIGKILL in the same instant, and
+    // the run surfaces as a bare exit 137 that `runOne` cannot tell from any
+    // other kill — measured on ubuntu-24.04, where the budget fired within
+    // 21ms of `cpuMs` and was still classified `error` rather than `cpu`.
+    // (macOS delivered SIGXCPU cleanly, which is why this went unseen.) One
+    // second of headroom lets SIGXCPU land first — exit 152, which `runOne`
+    // does recognise — while the hard limit remains the backstop for a
+    // process that tries to ignore it.
+    `ulimit -t ${cpuSeconds + 1} 2>/dev/null || true`,
+    `ulimit -S -t ${cpuSeconds} 2>/dev/null || true`,
     `ulimit -c 0 2>/dev/null || true`,
   ];
   if (spec.maxProcesses !== undefined) {
-    parts.push(`ulimit -u ${spec.maxProcesses} 2>/dev/null || true`);
-  }
-  if (process.platform === "linux") {
-    // RLIMIT_AS in kilobytes. Linux enforces this; macOS does not.
-    parts.push(`ulimit -v ${spec.memoryMb * 1024} 2>/dev/null || true`);
+    // RLIMIT_NPROC. `-u` is the bash spelling; dash's ulimit has no `-u` at
+    // all and spells this limit `-p`. Emitting only `-u` under `|| true` left
+    // the process cap silently absent on every Linux run while
+    // `enforcement.processCount` went on claiming it — measured: a
+    // 400-process fork bomb under `maxProcesses: 24` produced
+    // "ulimit: Illegal option -u" and ran until the *memory* watchdog stopped
+    // it. `-p` is pipe size in bash, so it is only ever reached on a shell
+    // where `-u` failed.
+    parts.push(
+      `ulimit -u ${spec.maxProcesses} 2>/dev/null || ulimit -p ${spec.maxProcesses} 2>/dev/null || true`,
+    );
   }
   return parts.join("; ");
 }
@@ -193,20 +302,29 @@ function ulimitPreamble(spec: SandboxSpec): string {
  * hide — plan §4.3, "reduced capability must be visible".
  */
 function buildEnforcement(sandboxAvailable: boolean): SandboxEnforcement {
-  const linux = process.platform === "linux";
   const notes: string[] = [];
   if (!sandboxAvailable) {
     notes.push(
       "OS sandbox unavailable on this platform/installation; filesystem and network are NOT confined",
     );
   }
-  if (!linux) {
+  if (sandboxAvailable && process.platform === "linux") {
+    // Not a reduced capability, but a materially different shape of denial,
+    // and a consumer that assumes the macOS shape will misread it. Measured
+    // on ubuntu-24.04 (both architectures) — see design §19.7.1.
     notes.push(
-      "RLIMIT_AS is rejected by the macOS kernel, and neither RLIMIT_DATA nor --max-old-space-size bounds Buffer/external memory (measured: 4GB allocated under all three). Total memory is bounded by an RSS watchdog sampling every " +
-        RSS_POLL_MS +
-        "ms, so a burst allocation between samples can briefly exceed memoryMb.",
+      "Linux confines by namespace, not by kernel permission check: a read-denied directory is replaced with an empty private tmpfs rather than returning EACCES, so operations against it succeed against nothing instead of failing. Measured: the home directory lists only sandbox scaffolding and none of the host's contents; a write outside the scratch dir appears to succeed into that tmpfs and is discarded, with no file ever created on the host; /proc is a fresh namespace-private procfs holding two PIDs and the run's own already-scrubbed environ; and a listening socket binds inside an unshared network namespace that nothing outside can reach. Confinement holds in every one of those cases — but a script observing its own syscalls sees success where macOS returns an error.",
     );
   }
+  // The memory caveat is the same on both platforms, and used to be reported
+  // only on macOS because Linux was assumed to have a kernel limit behind it.
+  // It does not: see `ulimitPreamble`. Claiming a limit we do not impose is
+  // exactly the kind of thing `SandboxEnforcement` exists to prevent.
+  notes.push(
+    "Total memory is bounded by an out-of-process RSS watchdog sampling every " +
+      RSS_POLL_MS +
+      "ms, on every platform, so a burst allocation between samples can briefly exceed memoryMb. No kernel limit backs it: macOS rejects RLIMIT_AS outright and bounds neither Buffer nor external memory through RLIMIT_DATA or --max-old-space-size (measured: 4GB allocated under all three), and on Linux RLIMIT_AS bounds virtual address space rather than resident memory — set to a realistic memoryMb it stops Node starting at all rather than capping it.",
+  );
   return {
     filesystemRead: sandboxAvailable,
     filesystemWrite: sandboxAvailable,
@@ -243,15 +361,27 @@ export function createNodeSandbox(options: NodeSandboxOptions): Sandbox {
   async function ensureInitialized(spec: SandboxSpec): Promise<boolean> {
     const sm = await loadManager();
     if (!sm.isSupportedPlatform()) return false;
+    // See {@link linuxSeccompHelperPath}: on Linux `denyRead` unmounts, so
+    // the sandbox's own helper has to be bound back in or nothing runs.
+    // Deliberately *not* passed through `realOrSelf` — Linux matches the
+    // literal path against the deny prefixes and binds that same string, and
+    // it is the literal path ASRT execs.
+    const seccompHelper = linuxSeccompHelperPath();
     await sm.initialize({
       filesystem: {
         denyRead: broadDenyRead(),
         // Re-allow exactly the granted files plus the scratch dir, resolved
         // so they match the kernel's view of the same paths.
-        allowRead: [...spec.readPaths, spec.writePath].map(realOrSelf),
+        allowRead: [
+          ...[...spec.readPaths, spec.writePath].map(realOrSelf),
+          ...(seccompHelper === undefined ? [] : [seccompHelper]),
+        ],
         allowWrite: [realOrSelf(spec.writePath)],
         denyWrite: [],
       },
+      ...(seccompHelper === undefined
+        ? {}
+        : { seccomp: { applyPath: seccompHelper } }),
       network: {
         // Zero egress. Not an allowlist with nothing in it by accident —
         // `denyNetwork: true` is non-negotiable in the spec type.
@@ -404,9 +534,9 @@ export function createNodeSandbox(options: NodeSandboxOptions): Sandbox {
         finish("wallClock");
       }, spec.wallClockMs);
 
-      // Memory watchdog. On macOS this is the *only* mechanism that bounds
-      // total process memory (see buildEnforcement notes), so it samples the
-      // whole process group, not just the direct child.
+      // Memory watchdog. This is the *only* mechanism that bounds total
+      // process memory, on every platform (see buildEnforcement notes), so it
+      // samples the whole process group, not just the direct child.
       let watchdogFailed: string | undefined;
       const rssTimer = setInterval(() => {
         if (child.pid === undefined) return;
@@ -439,8 +569,8 @@ export function createNodeSandbox(options: NodeSandboxOptions): Sandbox {
           }
           if (total / 1024 > spec.memoryMb) finish("memory");
         } catch (err) {
-          // Never swallow this. On macOS the watchdog is the *only* thing
-          // bounding memory, so a broken watchdog means the memory budget is
+          // Never swallow this. The watchdog is the *only* thing bounding
+          // memory anywhere, so a broken watchdog means the memory budget is
           // not enforced at all — and a silent catch here is exactly how that
           // ships unnoticed. Record it, stop claiming the enforcement, and
           // fail the run closed rather than letting it allocate freely.

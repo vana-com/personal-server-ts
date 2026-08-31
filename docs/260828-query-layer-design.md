@@ -1328,6 +1328,81 @@ limit and only a soft memory limit, and Node's `--permission` is explicitly
 documented as _not a security boundary_ against malicious code. Neither is
 usable here.
 
+### 19.7.1 Measured: what the OS layer actually enforces on Linux
+
+Phase 4a measured the OS layer on macOS/arm64 only; plan §6 recorded Linux as
+unverified. It is now measured, on ubuntu-24.04 under bubblewrap 0.9.0 with
+`@anthropic-ai/sandbox-runtime` 0.0.74, on both architectures — x86_64 for the
+failure CI hit, arm64 (native, no emulation) for the behavioural results,
+because an emulated x86_64 kernel rejects `prctl(PR_SET_SECCOMP)` outright and
+cannot run the seccomp stage at all.
+
+**Nothing ran at all, and the reason was a path.** Every sandboxed run on
+Linux died before the script started, control cases included, with
+`apply-seccomp: No such file or directory` — for a file that exists, is mode
+755, and is statically linked. ASRT's Linux path is two-stage: `bwrap` builds
+the namespace, then execs ASRT's own `apply-seccomp` helper _inside_ it. ASRT
+resolves that helper on the host and reuses the same absolute path inside. But
+`denyRead` on Linux is not a kernel policy the way Seatbelt's is — it is
+`--tmpfs <dir>`, which _replaces_ the directory. Our deny list contains `/home`
+and the user's home, so a checkout under either (`/home/runner/work/...` on a
+GitHub runner) puts the helper inside the tmpfs, and it ceases to exist in the
+namespace that has to exec it. macOS never exercises this: Seatbelt applies a
+policy over the real filesystem and needs no helper binary. The fix re-allows
+that one file — a vendored static binary holding no user data, in a namespace
+where `/usr` and `/bin` are already readable — and hands the same path back to
+ASRT as `seccomp.applyPath` so the path we re-allow and the path it execs are
+the same string by construction.
+
+**Three resource limits were claimed and not imposed.** All three were hidden
+by the same thing: every `ulimit` is guarded with `|| true`, so a limit the
+shell or kernel rejects fails silently while `SandboxEnforcement` goes on
+claiming it.
+
+| Limit          | What was wrong                                                                                                                                                                                                                                                                                                                         | Now                                                                                                                                                                              |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RLIMIT_AS`    | Emitted on Linux only. It bounds virtual address space, not resident memory; V8 reserves a large range regardless of heap size, so at the suite's 256MB budget `node -e 'console.log(42)'` never starts.                                                                                                                               | Removed on every platform. The RSS watchdog is the only memory mechanism anywhere, and it holds the 256MB budget on Linux — measured: the 4GB allocation terminates as `memory`. |
+| `RLIMIT_NPROC` | Spelled `ulimit -u`, which is bash. Ubuntu's `/bin/sh` is **dash**, whose `ulimit` has no `-u` at all and spells this limit `-p`. The process cap was therefore absent on every Linux run; a 400-process fork bomb under `maxProcesses: 24` printed "Illegal option -u" and ran until the _memory_ watchdog stopped it.                | `-u` with a `-p` fallback. Verified to set `Max processes` on dash, on Linux bash and on macOS `/bin/sh`.                                                                        |
+| `RLIMIT_CPU`   | `ulimit -t N` sets soft _and_ hard to N. Linux then raises SIGXCPU and escalates to SIGKILL in the same instant, so the budget fired on time (within 21ms of `cpuMs`) but surfaced as a bare exit 137 indistinguishable from any other kill, and was classified `error`. macOS delivered SIGXCPU cleanly, which is why it went unseen. | Hard limit one second above the soft one, so SIGXCPU lands first (exit 152) with the hard limit as the backstop.                                                                 |
+
+**Four hostile-script assertions still fail on Linux, and they are left
+failing.** All four are the same mechanism, and in none of them does anything
+escape. Linux confines by _namespace_ — a read-denied directory becomes an
+empty private tmpfs — where macOS confines by _permission check_. So the
+operation succeeds against nothing rather than returning an error, and an
+assertion written against the macOS shape reads that success as a breach.
+Measured, per case:
+
+- **Home directory readable.** `readdir` succeeds and returns
+  `[".npm", "work"]` against a host home of
+  `[".bash_logout", ".bashrc", ".cache", ".npm", ".profile", "work"]`. Both
+  entries are sandbox scaffolding. A canary planted in the real `~/.npm` reads
+  back `ENOENT` inside the sandbox. No host home content is reachable.
+- **Writes outside the scratch dir.** The write succeeds and reads back inside
+  the run; the host file never appears (`existsSync` is false on the host for
+  both the granted-root target and a `~/.npm` target). The write lands in the
+  tmpfs and is discarded. Every read-denied directory is writable this way,
+  because a tmpfs is writable by nature and ASRT's `denyWrite` cannot make one
+  read-only.
+- **`/proc` readable.** `bwrap` mounts a fresh procfs the sandbox cannot work
+  without. It holds two PIDs — `apply-seccomp` as PID 1 of the nested PID
+  namespace, and the script — and `/proc/self/environ` is the run's own
+  environment, which `minimalEnv` has already scrubbed of host variables (the
+  canary test passes). No host process or host environment is visible.
+- **Listening socket binds.** The bind succeeds on `127.0.0.1` and on
+  `0.0.0.0` inside a network namespace unshared from the host, which nothing
+  outside can reach. Egress stays denied — TCP, UDP, DNS, HTTPS, IPv6 and
+  UNIX-socket cases all pass.
+
+None of the four is fixable from our side: the tmpfs strategy, the mandatory
+`/proc` mount and the absence of a `bind()` filter are all ASRT's, and its
+config exposes no knob for any of them. Rewriting the assertions to accept the
+Linux shape is the other option, and it is deliberately **not** taken here —
+the four tests encode the macOS mechanism, and a human should decide whether
+the contract is the mechanism or the outcome before anyone edits them. Until
+then `SandboxEnforcement` carries the difference in its notes on Linux, so a
+consumer reading the enforcement report is told rather than surprised.
+
 ## 19.8 Measured: the question corpus, end to end
 
 The first end-to-end grading of §3's eighteen questions, run 2026-08-28 through
