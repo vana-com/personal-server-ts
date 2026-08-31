@@ -9,23 +9,6 @@
 export type QuestionStatus = "pending" | "ready" | "failed" | "stale";
 
 /**
- * How the answer is computed.
- *
- * - `completion` — one chat completion over the newest-first trimmed sources
- *   (`inference.maxSourceItems`). The path that ships today.
- * - `code` — the query layer: a bounded code-writing agent that runs generated
- *   JavaScript in a two-layer sandbox over the full granted scopes and returns
- *   an answer carrying citations and host-authored coverage. See
- *   `docs/260828-query-layer-implementation-plan.md`.
- *
- * The field is plumbed end to end here; the `code` compute path itself is
- * phase 7a and is not implemented yet. Registering `mode: "code"` is accepted
- * and persisted, and compute rejects it until that lands, so an operator
- * cannot silently get a `completion` answer for a `code` question.
- */
-export type QuestionMode = "completion" | "code";
-
-/**
  * When the answer recomputes: "on-change" follows every source change (the
  * original behavior and the default); "snapshot" computes at registration
  * and afterwards only on an explicit POST /questions/:id/recompute.
@@ -45,8 +28,6 @@ export interface QuestionRegistration {
   question: string;
   /** Model override; null = the provider's default. */
   model: string | null;
-  /** How the answer is computed. Defaults to `completion`. */
-  mode: QuestionMode;
   recompute: QuestionRecompute;
   registeredBy: QuestionRegisteredBy;
   status: QuestionStatus;
@@ -102,7 +83,6 @@ export interface QuestionRegistrationView {
   sourceScopes: string[];
   question: string;
   model: string | null;
-  mode: QuestionMode;
   recompute: QuestionRecompute;
   registeredBy: QuestionRegisteredBy;
   status: QuestionStatus;
@@ -123,7 +103,6 @@ export function questionRegistrationView(
     sourceScopes: [...registration.sourceScopes],
     question: registration.question,
     model: registration.model,
-    mode: registration.mode,
     recompute: registration.recompute,
     registeredBy: registration.registeredBy,
     status: registration.status,

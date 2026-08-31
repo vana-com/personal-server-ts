@@ -12,7 +12,6 @@ function registration(
     sourceScopes: ["oura.sleep", "chatgpt.conversations"],
     question: "How did I sleep?",
     model: null,
-    mode: "completion",
     recompute: "on-change",
     registeredBy: {
       kind: "builder",
@@ -147,14 +146,29 @@ describe("createSqliteQuestionStore", () => {
   });
 });
 
-describe("createSqliteQuestionStore mode column", () => {
-  it("round-trips both modes", async () => {
+describe("createSqliteQuestionStore vestigial mode column", () => {
+  it("loads rows that carry a legacy mode value", async () => {
     const db = initializeDatabase(":memory:");
     const store = createSqliteQuestionStore(db);
-    await store.insert(registration({ questionId: "q-c", mode: "code" }));
-    await store.insert(registration({ questionId: "q-p", mode: "completion" }));
-    expect((await store.get("q-c"))?.mode).toBe("code");
-    expect((await store.get("q-p"))?.mode).toBe("completion");
+    // Inserts no longer name the column; the NOT NULL DEFAULT covers it.
+    await store.insert(registration({ questionId: "q-x" }));
+    // A row written by the build that had modes, including the one that build
+    // accepted at registration and then failed at compute.
+    db.prepare(
+      "UPDATE derivative_questions SET mode = 'code' WHERE question_id = 'q-x'",
+    ).run();
+
+    const loaded = await store.get("q-x");
+    expect(loaded).not.toBeNull();
+    expect(loaded!.question).toBe("How did I sleep?");
+    expect(loaded!.recompute).toBe("on-change");
+    expect(loaded).not.toHaveProperty("mode");
+
+    // Still updatable, and still listed.
+    await store.update("q-x", { status: "ready" });
+    expect((await store.get("q-x"))!.status).toBe("ready");
+    expect((await store.list()).map((r) => r.questionId)).toEqual(["q-x"]);
+    db.close();
   });
 
   it("migrates a table created before the mode column existed", async () => {
@@ -194,30 +208,19 @@ describe("createSqliteQuestionStore mode column", () => {
     const store = createSqliteQuestionStore(db);
     expect(hasMode()).toBe(true);
 
-    // The pre-existing row survives and takes the behaviour it ran under.
+    // The pre-existing row survives.
     const legacy = await store.get("legacy");
     expect(legacy).not.toBeNull();
-    expect(legacy?.mode).toBe("completion");
     expect(legacy?.question).toBe("How did I sleep?");
     expect(legacy?.status).toBe("ready");
 
-    // The migrated table accepts new rows in either mode.
-    await store.insert(registration({ questionId: "q-new", mode: "code" }));
-    expect((await store.get("q-new"))?.mode).toBe("code");
+    // The migrated table still takes inserts, which no longer name the column.
+    await store.insert(registration({ questionId: "q-new" }));
+    expect((await store.get("q-new"))?.question).toBe("How did I sleep?");
 
     // Idempotent: reopening must not throw on a duplicate column.
     expect(() => createSqliteQuestionStore(db)).not.toThrow();
-    expect((await store.get("legacy"))?.mode).toBe("completion");
-  });
-
-  it("narrows an unrecognised mode written outside the store", async () => {
-    const db = initializeDatabase(":memory:");
-    const store = createSqliteQuestionStore(db);
-    await store.insert(registration({ questionId: "q-x" }));
-    db.prepare(
-      "UPDATE derivative_questions SET mode = 'agentic' WHERE question_id = 'q-x'",
-    ).run();
-    // A mode this build does not know must not reach the compute path.
-    expect((await store.get("q-x"))?.mode).toBe("completion");
+    expect((await store.get("legacy"))?.status).toBe("ready");
+    db.close();
   });
 });

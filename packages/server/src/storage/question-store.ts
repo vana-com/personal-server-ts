@@ -19,6 +19,10 @@ CREATE TABLE IF NOT EXISTS derivative_questions (
   source_scopes TEXT NOT NULL,
   question TEXT NOT NULL,
   model TEXT,
+  -- Vestigial. Registration no longer has a mode: every question takes the
+  -- one compute path. The column is kept because it shipped NOT NULL with a
+  -- default, so inserts that omit it still succeed and no DROP COLUMN
+  -- migration is needed. Nothing reads it.
   mode TEXT NOT NULL DEFAULT 'completion',
   recompute TEXT NOT NULL DEFAULT 'on-change',
   registered_by TEXT NOT NULL,
@@ -45,7 +49,6 @@ interface Row {
   source_scopes: string;
   question: string;
   model: string | null;
-  mode: string | null;
   recompute: QuestionRegistration["recompute"];
   registered_by: string;
   status: QuestionRegistration["status"];
@@ -64,9 +67,6 @@ function toRegistration(row: Row): QuestionRegistration {
     sourceScopes: JSON.parse(row.source_scopes) as string[],
     question: row.question,
     model: row.model,
-    // Narrowed rather than cast: a row written by a newer build, or by hand,
-    // must not smuggle an unknown mode into the compute path.
-    mode: row.mode === "code" ? "code" : "completion",
     recompute: row.recompute,
     registeredBy: JSON.parse(row.registered_by) as QuestionRegisteredBy,
     status: row.status,
@@ -80,14 +80,15 @@ function toRegistration(row: Row): QuestionRegistration {
 }
 
 /**
- * Adds the `mode` column to a table created before it existed.
+ * Adds the vestigial `mode` column to a table created before it existed.
  *
- * `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so a server
- * upgraded in place would otherwise keep the old shape and fail every insert.
- * Guarded by `PRAGMA table_info` rather than a caught `ALTER` so that a real
- * failure (locked database, disk full) surfaces here instead of resurfacing
- * later as a confusing insert error. Existing rows take the column default,
- * `completion`, which is the behaviour they were registered under.
+ * Registration no longer has a mode and nothing reads this column, but it
+ * shipped in a release, so databases in the wild may or may not have it.
+ * Kept (rather than replaced by a DROP COLUMN) because it is NOT NULL with a
+ * default: inserts that omit it succeed either way, so one dead column costs
+ * nothing and carries no migration risk. Guarded by `PRAGMA table_info` rather
+ * than a caught `ALTER`, so a real failure (locked database, disk full)
+ * surfaces here rather than resurfacing later as a confusing error.
  */
 function migrateModeColumn(db: Database.Database): void {
   const columns = db
@@ -130,11 +131,11 @@ export function createSqliteQuestionStore(
   );
   const insertOne = db.prepare(`
     INSERT INTO derivative_questions (
-      question_id, derived_scope, source_scopes, question, model, mode,
+      question_id, derived_scope, source_scopes, question, model,
       recompute, registered_by, status, error, created_at, updated_at,
       last_computed_at, derived_version, derived_collected_at
     ) VALUES (
-      @question_id, @derived_scope, @source_scopes, @question, @model, @mode,
+      @question_id, @derived_scope, @source_scopes, @question, @model,
       @recompute, @registered_by, @status, @error, @created_at, @updated_at,
       @last_computed_at, @derived_version, @derived_collected_at
     )`);
@@ -168,7 +169,6 @@ export function createSqliteQuestionStore(
         source_scopes: JSON.stringify(registration.sourceScopes),
         question: registration.question,
         model: registration.model,
-        mode: registration.mode,
         recompute: registration.recompute,
         registered_by: JSON.stringify(registration.registeredBy),
         status: registration.status,

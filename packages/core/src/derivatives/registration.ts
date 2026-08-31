@@ -13,7 +13,6 @@ import { assertDerivedScopeNaming } from "../lineage/lineage.js";
 import { isWriteScopeEntry } from "../policy/data-write.js";
 import { scopeCoveredByGrant } from "@opendatalabs/vana-sdk/browser";
 import type {
-  QuestionMode,
   QuestionRecompute,
   QuestionRegisteredBy,
   QuestionRegistration,
@@ -34,12 +33,8 @@ export interface ParsedQuestionInput {
   sourceScopes: string[];
   question: string;
   model: string | null;
-  mode: QuestionMode;
   recompute: QuestionRecompute;
 }
-
-/** Accepted `mode` values, in the order they are echoed in a 400. */
-export const QUESTION_MODES: readonly QuestionMode[] = ["completion", "code"];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -131,21 +126,6 @@ export function parseQuestionInput(body: unknown): ParsedQuestionInput {
     }
     model = body.model;
   }
-  // Absent or null means the shipping path, so an existing client that has
-  // never heard of `mode` keeps working unchanged.
-  let mode: QuestionMode = "completion";
-  if (body.mode !== undefined && body.mode !== null) {
-    if (
-      typeof body.mode !== "string" ||
-      !QUESTION_MODES.includes(body.mode as QuestionMode)
-    ) {
-      throw new DerivativeQuestionInvalidError(
-        `mode must be one of ${QUESTION_MODES.map((m) => `"${m}"`).join(", ")}`,
-        { field: "mode" },
-      );
-    }
-    mode = body.mode as QuestionMode;
-  }
   // Absent (or null, like model) keeps the original follow-every-change
   // behavior, so existing builder clients register exactly as before.
   let recompute: QuestionRecompute = "on-change";
@@ -164,7 +144,6 @@ export function parseQuestionInput(body: unknown): ParsedQuestionInput {
     sourceScopes,
     question: body.question,
     model,
-    mode,
     recompute,
   };
 }
@@ -244,7 +223,6 @@ export async function createQuestionRegistration(
     sourceScopes: parsed.sourceScopes,
     question: parsed.question,
     model: parsed.model,
-    mode: parsed.mode,
     recompute: parsed.recompute,
     registeredBy: input.registeredBy,
     status: "pending",

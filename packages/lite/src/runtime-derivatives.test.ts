@@ -140,20 +140,20 @@ describe("PS-Lite derivative compute", () => {
     expect(persisted?.questions.map((q) => q.questionId)).toEqual([questionId]);
     const reloaded = await createPsLiteQuestionStore(stateStore);
     expect((await reloaded.get(questionId))?.status).toBe("ready");
-    expect((await reloaded.get(questionId))?.mode).toBe("completion");
   });
 
-  it("rehydrates mode, defaulting rows written before the field existed", async () => {
+  it("rehydrates rows persisted with a legacy `mode` key", async () => {
     const stateStore = createMemoryPsLiteStateStore();
 
-    // Seed the state store the way an older build left it: no `mode` key at
-    // all on one row, an explicit `code` on another. There is no schema
-    // migration on Lite — rehydration is the migration.
-    const base = {
+    // Seed the state store the way the build that had modes left it. There is
+    // no schema migration on Lite — rehydration is the migration — so a
+    // stored `mode` must not stop a record from loading.
+    const seed = {
       derivedScope: "coach.weekly",
       sourceScopes: ["oura.sleep"],
       question: "How did I sleep?",
       model: null,
+      recompute: "on-change" as const,
       registeredBy: { kind: "owner" as const },
       status: "ready" as const,
       error: null,
@@ -166,29 +166,37 @@ describe("PS-Lite derivative compute", () => {
     await stateStore.set("derivative-questions-v1", {
       version: 1,
       questions: [
-        { ...base, questionId: "legacy" },
-        { ...base, questionId: "coded", mode: "code" },
-        { ...base, questionId: "bogus", mode: "agentic" },
+        { ...seed, questionId: "completionish", mode: "completion" },
+        { ...seed, questionId: "coded", mode: "code" },
+        { ...seed, questionId: "bogus", mode: "agentic" },
       ],
     });
 
     const store = await createPsLiteQuestionStore(stateStore);
-    // Missing mode takes the behaviour it was registered under.
-    expect((await store.get("legacy"))?.mode).toBe("completion");
-    // An explicit mode survives the round trip.
-    expect((await store.get("coded"))?.mode).toBe("code");
-    // A mode this build does not know must not reach the compute path.
-    expect((await store.get("bogus"))?.mode).toBe("completion");
+    for (const id of ["completionish", "coded", "bogus"]) {
+      const loaded = await store.get(id);
+      expect(loaded).not.toBeNull();
+      expect(loaded!.question).toBe("How did I sleep?");
+      expect(loaded!.status).toBe("ready");
+      expect(loaded!.recompute).toBe("on-change");
+    }
+    expect((await store.list()).map((q) => q.questionId).sort()).toEqual([
+      "bogus",
+      "coded",
+      "completionish",
+    ]);
 
-    // And the normalized value is what gets written back.
-    await store.update("legacy", { status: "stale" });
+    // A write-back over a legacy record still persists a loadable row.
+    await store.update("coded", { status: "stale" });
     const persisted = await stateStore.get<{
       version: 1;
       questions: QuestionRegistration[];
     }>("derivative-questions-v1");
     expect(
-      persisted?.questions.find((q) => q.questionId === "legacy")?.mode,
-    ).toBe("completion");
+      persisted?.questions.find((q) => q.questionId === "coded")?.status,
+    ).toBe("stale");
+    const again = await createPsLiteQuestionStore(stateStore);
+    expect((await again.get("coded"))?.status).toBe("stale");
   });
 
   it("defaults recompute to on-change for registrations saved before the field existed", async () => {
