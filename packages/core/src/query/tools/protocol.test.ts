@@ -11,6 +11,7 @@ import type { CoverageCounters } from "./types.js";
 
 const coverage: CoverageCounters = {
   scopesScanned: ["oura.sleep"],
+  scopesPartiallyScanned: [],
   recordsScanned: 3,
   bytesScanned: 128,
   scopesSkipped: [],

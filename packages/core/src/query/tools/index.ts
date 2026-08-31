@@ -24,7 +24,7 @@ export type {
   StoppedBecause,
 } from "./types.js";
 
-export { CoverageLedger } from "./coverage.js";
+export { CoverageLedger, mergePartiallyScanned } from "./coverage.js";
 export {
   QueryToolError,
   ScriptCompleted,

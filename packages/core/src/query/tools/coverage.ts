@@ -60,6 +60,66 @@ export function effectiveFor(t: ScopeTally): Tally {
 }
 
 /**
+ * Merge two runs' `scopesPartiallyScanned` at the request level.
+ *
+ * **A scope is partially scanned for the request only if NO run exhausted it.**
+ * The argument: `scopesPartiallyScanned` answers "could this scope have been
+ * sampled rather than covered", and once any single run has streamed the scope
+ * end to end, the request as a whole has seen every record in it. A bounded
+ * read in some other turn — a script that windows first and then does a full
+ * pass, which is ordinary code — adds no doubt about what was covered. This is
+ * exactly the rule {@link CoverageLedger.completeScope} already applies within
+ * one run, lifted unchanged to the request; having the two disagree would mean
+ * a two-turn request reporting a scope as sampled that a one-turn request with
+ * the same reads reported as covered.
+ *
+ * It is the *safe* direction as well as the honest one, because the direction
+ * that could launder a sample is the other one: reporting a scope as fully
+ * scanned when neither run exhausted it. That cannot happen here — a scope
+ * leaves this list only on the strength of a run that actually reached
+ * `completeScope`, which only a host loader run to exhaustion does.
+ *
+ * The old `complete` merge got a decision of exactly this shape backwards, so
+ * `coverage-merge.test.ts` / `lite-tool-host.merge.test.ts` pin this one in
+ * both directions.
+ *
+ * Shared rather than reimplemented per runtime: the Node and browser hosts
+ * already carry parallel copies of the per-scope total merge, and a second
+ * divergent copy of THIS rule is the one that would be dangerous.
+ */
+export function mergePartiallyScanned(
+  prev: Pick<CoverageCounters, "scopesScanned" | "scopesPartiallyScanned">,
+  next: Pick<CoverageCounters, "scopesScanned" | "scopesPartiallyScanned">,
+): string[] {
+  /**
+   * Fail closed on a side that declares no list, in the direction that cannot
+   * launder a sample.
+   *
+   * The field is required on {@link CoverageCounters}, and `decodeResultFrame`
+   * checks only that `coverage` is an object, so this guards a violated type
+   * contract the way `mergeScopeTotals` guards `perScope` — but the direction
+   * is the whole point. Reading absence as "nothing was partial" would let a
+   * frame that omits the field promote every scope it named to fully scanned,
+   * which is the sampling claim this list exists to refuse. Reading it as
+   * "everything it read might be partial" can only over-report doubt.
+   */
+  const partialOf = (
+    side: Pick<CoverageCounters, "scopesScanned" | "scopesPartiallyScanned">,
+  ): readonly string[] => side.scopesPartiallyScanned ?? side.scopesScanned;
+
+  const exhausted = new Set<string>();
+  for (const side of [prev, next]) {
+    const partial = new Set(partialOf(side));
+    for (const scope of side.scopesScanned) {
+      if (!partial.has(scope)) exhausted.add(scope);
+    }
+  }
+  return [...new Set([...partialOf(prev), ...partialOf(next)])]
+    .filter((scope) => !exhausted.has(scope))
+    .sort();
+}
+
+/**
  * Host-authored coverage counters (prompt contract §1).
  *
  * **The model may never assert coverage.** This ledger is incremented by the
@@ -73,24 +133,44 @@ export function effectiveFor(t: ScopeTally): Tally {
  *
  * There was one, derived here: true only when every granted scope had been
  * streamed end to end or explicitly skipped, nothing was partial, nothing was
- * prefiltered, and nothing stopped the run. It was removed because that
- * conjunction is not a property real requests can satisfy. A grant is issued
- * per *consent*, not per question, so a 12-scope grant is ordinary while the
- * question in front of it legitimately needs two scopes; the other ten are
- * then never read and the flag is false. It measured the shape of the grant,
- * not the quality of the answer, and it was false on all 43 measured runs.
+ * prefiltered, and nothing stopped the run. It was removed because it measured
+ * the shape of the GRANT rather than the quality of the answer: on the owner
+ * HTTP path the grant defaults to the whole data store
+ * (`routes/query.ts`, `MAX_OWNER_SCOPES = 500`), so the flag was false on
+ * nearly every real answer and `agent/loop.ts` appended "this answer is
+ * incomplete" to all of them — which trains a reader to ignore the one caveat
+ * that matters.
  *
- * A flag that is always false is not a safety property, it is noise, and worse
- * than noise here: `agent/loop.ts` appended "this answer is incomplete" to
- * *every* answer on the strength of it, which trains a reader to ignore the
- * one caveat that matters.
+ * It was NOT, as an earlier version of this comment said, structurally
+ * incapable of firing. Every all-false tally behind that claim (43/43, and the
+ * 78- and 132-run sweeps) predates `00acde9` "fix(query): ask each question
+ * under its own grant" (2026-08-29), which fixed two harness bugs. Recorded
+ * artifacts after it show `complete` firing 48/54, 45/54 and 35/54, and design
+ * §19.16 carries those numbers. The removal stands on the grant-shape argument
+ * above; it never stood on "it can never be true".
  *
- * What replaces it is nothing — by decision. The counters below are shipped as
- * they are and a consumer judges: `scopesScanned` against the scopes it
- * granted, `recordsScanned`, `scopesSkipped`, `unreadable`, `method` and
- * `stoppedBecause` each say something specific and each is separately
- * actionable. Do not reintroduce a scalar summary (a ratio, a score, a flag)
- * over them without a consumer that can act on it differently from the parts.
+ * Do not reintroduce a scalar summary (a ratio, a score, a flag) over the
+ * counters without a consumer that can act on it differently from the parts.
+ * The counters are shipped as they are and a consumer judges: `scopesScanned`
+ * against the scopes it granted, `scopesPartiallyScanned`, `recordsScanned`,
+ * `scopesSkipped`, `unreadable`, `method` and `stoppedBecause` each say
+ * something specific and each is separately actionable.
+ *
+ * ## The anti-sampling half of it survives, as a list
+ *
+ * `complete`'s load-bearing conjunct was `#partiallyScanned.size === 0`: a
+ * bounded read falsified it, so the model could not buy a completeness claim
+ * by sampling. That was measured at 0 false completeness across 80 runs
+ * (design §19.16) and is separately valuable from the flag it rode on —
+ * but once `snapshot()` folded the partial and the fully-scanned sets into one
+ * `scopesScanned` list, nothing in the shipped surface distinguished a scope
+ * streamed end to end from one sampled through a window.
+ *
+ * So the parts are shipped: `scopesPartiallyScanned` names exactly the scopes
+ * in `scopesScanned` that were read but not exhausted. A list, per the rule
+ * above — not a scalar over the parts, and not `complete` under a new name: it
+ * says nothing about scopes the question never needed, which is the failure
+ * that removed the flag.
  */
 export class CoverageLedger {
   readonly #fullyScanned = new Set<string>();
@@ -196,6 +276,12 @@ export class CoverageLedger {
     }
     return {
       scopesScanned: scanned,
+      // Sorted, like `scopesScanned`, so the list is a function of which
+      // scopes were sampled and not of the order the script touched them.
+      // `completeScope` removes from this set, so a scope read both ways
+      // reports as fully scanned — the ledger's rule, and the one the
+      // cross-run merges lift to the request level.
+      scopesPartiallyScanned: [...this.#partiallyScanned].sort(),
       recordsScanned: totals.records,
       bytesScanned: totals.bytes,
       unreadable: totals.unreadable,

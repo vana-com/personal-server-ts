@@ -765,28 +765,95 @@ export async function runQueryLoop(
   // Coverage is the tool layer's, not the model's, not this loop's.
   // Accumulated across every run in this request, not just the last one.
   const hostCoverage = tools.coverage() ?? EMPTY_COVERAGE;
-  const coverage: QueryCoverage = { ...hostCoverage };
-  if (stoppedBecause) {
-    coverage.stoppedBecause = stoppedBecause;
-  } else if (endedCleanly) {
-    // The host merge carries the first abnormal termination it saw across the
-    // whole request and never lets a later success supersede it, so a run that
-    // recovered still reported `error`. Only the control-flow field is
-    // cleared; every counter stays exactly as the host authored it.
-    delete coverage.stoppedBecause;
-  }
-  if (system.unprofiledScopes.length > 0) {
-    coverage.unprofiledScopes = system.unprofiledScopes;
-  }
-  if (system.summarizedScopes.length > 0) {
-    coverage.profilesSummarized = system.summarizedScopes;
-  }
+
   if (droppedTurns > 0) {
     violations.push(
       `${droppedTurns} earlier turn(s) were dropped from the transcript to stay under the relay's ${RELAY_MAX_BODY_BYTES}-byte body cap`,
     );
   }
-  if (violations.length > 0) coverage.violations = violations;
+
+  // The host merge carries the first abnormal termination it saw across the
+  // whole request and never lets a later success supersede it, so a run that
+  // recovered still reported `error`. Only the control-flow field is resolved
+  // here; every counter stays exactly as the host authored it.
+  const resolvedStoppedBecause =
+    stoppedBecause ?? (endedCleanly ? undefined : hostCoverage.stoppedBecause);
+  // A local finding supersedes the host's, and the host's stands when there is
+  // no local one — the same precedence the mutations had, expressed as a value
+  // so it cannot also decide where the key lands.
+  const resolvedUnprofiledScopes =
+    system.unprofiledScopes.length > 0
+      ? system.unprofiledScopes
+      : hostCoverage.unprofiledScopes;
+  const resolvedProfilesSummarized =
+    system.summarizedScopes.length > 0
+      ? system.summarizedScopes
+      : hostCoverage.profilesSummarized;
+  const resolvedViolations =
+    violations.length > 0 ? violations : hostCoverage.violations;
+
+  /**
+   * One literal, every key in one declared position, in `QueryCoverage`
+   * declaration order. The serialization of this object is therefore a
+   * function of its content and nothing else.
+   *
+   * It used to be spread-then-mutate, which made the key order depend on how
+   * the run got here rather than on what it found. Three ways, all of them
+   * producing the same logical coverage with different bytes: a
+   * `stoppedBecause` the host carried landed at the host's mid position while
+   * one this loop set landed last; the spread base was either `EMPTY_COVERAGE`
+   * (three keys) or a real `CoverageCounters` snapshot (nine), so the trailing
+   * keys sat in different places; and `perScope` rode in with its keys in the
+   * order the scopes were first touched.
+   *
+   * Two rules keep it that way. Every optional is present-or-absent by its
+   * VALUE, via a conditional spread rather than a later assignment — the
+   * project idiom, cf. `renderRunResult`'s `error` above and `snapshot()` in
+   * `tools/coverage.ts`. And each is tested with `!== undefined` rather than
+   * for truthiness, so a real `0` from `bytesScanned` or `unreadable` is
+   * reported instead of vanishing. A bare `key: undefined` would be worse than
+   * absent: `JSON.stringify` drops it but the JCS canonicalizer
+   * (`json/jcs.ts`), which the on-chain `dataHash` commitment runs through,
+   * throws on an undefined member.
+   *
+   * `perScope` is not projected. See {@link QueryCoverage}: it is the tool
+   * layer's substrate for the cross-run subsumption merge, it is read there
+   * off `CoverageCounters` and nowhere else, and its key order is
+   * script-execution order rather than content. Dropping it from this
+   * projection leaves that merge untouched.
+   */
+  const coverage: QueryCoverage = {
+    scopesScanned: hostCoverage.scopesScanned,
+    ...(hostCoverage.scopesPartiallyScanned !== undefined
+      ? { scopesPartiallyScanned: hostCoverage.scopesPartiallyScanned }
+      : {}),
+    recordsScanned: hostCoverage.recordsScanned,
+    ...(hostCoverage.bytesScanned !== undefined
+      ? { bytesScanned: hostCoverage.bytesScanned }
+      : {}),
+    scopesSkipped: hostCoverage.scopesSkipped,
+    ...(hostCoverage.unreadable !== undefined
+      ? { unreadable: hostCoverage.unreadable }
+      : {}),
+    ...(hostCoverage.method !== undefined
+      ? { method: hostCoverage.method }
+      : {}),
+    ...(resolvedStoppedBecause !== undefined
+      ? { stoppedBecause: resolvedStoppedBecause }
+      : {}),
+    ...(resolvedUnprofiledScopes !== undefined
+      ? { unprofiledScopes: resolvedUnprofiledScopes }
+      : {}),
+    ...(resolvedProfilesSummarized !== undefined
+      ? { profilesSummarized: resolvedProfilesSummarized }
+      : {}),
+    ...(resolvedViolations !== undefined
+      ? { violations: resolvedViolations }
+      : {}),
+    ...(hostCoverage.enforcementNotes !== undefined
+      ? { enforcementNotes: hostCoverage.enforcementNotes }
+      : {}),
+  };
 
   const answer: QueryAnswer = {
     answer: honestAnswerText(finalAnswer, coverage),

@@ -13,6 +13,7 @@ const honest = (records: number): RunDocument => ({
   v: 1,
   coverage: {
     scopesScanned: ["oura.sleep"],
+    scopesPartiallyScanned: [],
     recordsScanned: records,
     bytesScanned: records * 64,
     scopesSkipped: [],

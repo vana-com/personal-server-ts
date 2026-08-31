@@ -85,6 +85,30 @@ export type CoverageMethod = "full" | "prefiltered";
  */
 export interface CoverageCounters {
   scopesScanned: string[];
+  /**
+   * Which of {@link scopesScanned} were read but NOT streamed end to end.
+   *
+   * The load-bearing half of the removed `complete` flag, kept as a list of
+   * parts rather than restored as a scalar. `complete` was gated on
+   * `#partiallyScanned.size === 0`, and that conjunct is what stopped the model
+   * from buying a completeness claim by sampling — 0 false positives across 80
+   * runs (design §19.16). The flag itself went because the owner path grants
+   * the whole data store, so it was false on nearly every real answer; the
+   * anti-sampling property is separately valuable and was surfaced by nothing
+   * once `snapshot()` folded partial and full scopes into one
+   * `scopesScanned` list.
+   *
+   * Host-authored and unforgeable, on the same footing as every counter here:
+   * a scope lands in this list only via `CoverageLedger.partialScope`, which
+   * only `vana.read`'s bounded path calls, and leaves it only via
+   * `completeScope`, which only `vana.readAll` and `vana.stream` call after the
+   * host's loader has actually run to exhaustion. The script picks which method
+   * to call; it cannot make a bounded read report as a full pass, and it cannot
+   * reach the ledger's private set at all.
+   *
+   * A subset of `scopesScanned`, never a scope absent from it.
+   */
+  scopesPartiallyScanned: string[];
   recordsScanned: number;
   bytesScanned: number;
   scopesSkipped: { scope: string; reason: string }[];

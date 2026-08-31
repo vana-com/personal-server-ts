@@ -20,6 +20,7 @@ import type { CoverageCounters } from "./types.js";
 
 const coverage: CoverageCounters = {
   scopesScanned: ["oura.sleep", "chatgpt.conversations"],
+  scopesPartiallyScanned: [],
   recordsScanned: 119_758,
   bytesScanned: 8_531_996,
   scopesSkipped: [{ scope: "documents.files", reason: "no text layer" }],

@@ -214,6 +214,7 @@ void main().catch((err: unknown) => {
     v: 1,
     coverage: {
       scopesScanned: [],
+      scopesPartiallyScanned: [],
       recordsScanned: 0,
       bytesScanned: 0,
       unreadable: 0,
