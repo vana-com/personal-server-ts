@@ -15,7 +15,7 @@ import {
   buildWeb3SignedHeader,
   createMemoryDataStorage,
   createTestWallet,
-} from "@opendatalabs/personal-server-ts-core/test-utils";
+} from "../../../core/src/test-utils/index.js";
 import { createFakeInferenceProvider } from "@opendatalabs/personal-server-ts-core/derivatives";
 import type {
   AccessLogEntry,

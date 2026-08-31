@@ -8,7 +8,7 @@ import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schema
 import {
   buildWeb3SignedHeader,
   createTestWallet,
-} from "@opendatalabs/personal-server-ts-core/test-utils";
+} from "../../core/src/test-utils/index.js";
 import { startPersonalServer } from "./client.js";
 
 const ownerWallet = createTestWallet(8);

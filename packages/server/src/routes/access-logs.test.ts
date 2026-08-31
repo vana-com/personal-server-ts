@@ -7,7 +7,7 @@ import type {
 import {
   createTestWallet,
   buildWeb3SignedHeader,
-} from "@opendatalabs/personal-server-ts-core/test-utils";
+} from "../../../core/src/test-utils/index.js";
 import { accessLogsRoutes } from "./access-logs.js";
 
 const logger = pino({ level: "silent" });

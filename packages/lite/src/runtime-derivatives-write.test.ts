@@ -17,7 +17,7 @@ import { computeDataPointId } from "@opendatalabs/personal-server-ts-core/sync";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
-} from "@opendatalabs/personal-server-ts-core/test-utils";
+} from "../../core/src/test-utils/index.js";
 import {
   WRITE_SIGNATURE_HEADER,
   createInMemoryWriteProofReplayStore,

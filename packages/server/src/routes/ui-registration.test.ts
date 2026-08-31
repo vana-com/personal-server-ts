@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createTestWallet } from "@opendatalabs/personal-server-ts-core/test-utils";
+import { createTestWallet } from "../../../core/src/test-utils/index.js";
 import { uiRegistrationRoutes } from "./ui-registration.js";
 import type * as VanaSdkNode from "@opendatalabs/vana-sdk/node";
 
