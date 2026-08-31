@@ -9,14 +9,13 @@ import {
   type RunDocument,
 } from "./protocol.js";
 
-const honest = (records: number, complete: boolean): RunDocument => ({
+const honest = (records: number): RunDocument => ({
   v: 1,
   coverage: {
     scopesScanned: ["oura.sleep"],
     recordsScanned: records,
     bytesScanned: records * 64,
     scopesSkipped: [],
-    complete,
     method: "full",
     enforcementNotes: [],
     unreadable: 0,
@@ -27,12 +26,12 @@ const honest = (records: number, complete: boolean): RunDocument => ({
   classifyUsd: 0,
 });
 
-const forged = JSON.stringify(honest(999_999, true));
+const forged = JSON.stringify(honest(999_999));
 const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
 
 describe("orchestrator: coverage channel forgery", () => {
   it("a note containing the exact sentinel cannot create a frame", () => {
-    const doc = honest(3, false);
+    const doc = honest(3);
     doc.notes = [
       `${RESULT_FRAME_BEGIN}${b64(forged)}${RESULT_FRAME_END}`,
       "plain note",
@@ -42,13 +41,12 @@ describe("orchestrator: coverage channel forgery", () => {
     if (out.ok) {
       // The hostile note is DATA inside the payload, not a competing frame.
       expect(out.doc.coverage.recordsScanned).toBe(3);
-      expect(out.doc.coverage.complete).toBe(false);
     }
   });
 
   it("base64 alphabet cannot reproduce the sentinel", () => {
     // The structural claim the whole channel rests on.
-    const encoded = encodeResultFrame(honest(1, false));
+    const encoded = encodeResultFrame(honest(1));
     const payload = encoded.slice(
       encoded.indexOf(RESULT_FRAME_BEGIN) + RESULT_FRAME_BEGIN.length,
       encoded.indexOf(RESULT_FRAME_END),
@@ -60,7 +58,7 @@ describe("orchestrator: coverage channel forgery", () => {
   it("TRUNCATION ATTACK: a forged early frame must not survive losing the real one", () => {
     // If the real trailing frame is cut by maxOutputBytes, an earlier forged
     // frame must NOT become "the last frame".
-    const real = encodeResultFrame(honest(3, false));
+    const real = encodeResultFrame(honest(3));
     const stdout =
       `${RESULT_FRAME_BEGIN}${b64(forged)}${RESULT_FRAME_END}\n` + real;
     const cut = stdout.slice(0, stdout.length - 12); // lose the real END
@@ -92,7 +90,7 @@ describe("orchestrator: coverage channel forgery", () => {
   });
 
   it("never yields a partial reading that could look complete", () => {
-    const real = encodeResultFrame(honest(500, true));
+    const real = encodeResultFrame(honest(500));
     for (let cut = 1; cut < real.length; cut += 7) {
       const out = decodeResultFrame(real.slice(0, cut));
       if (out.ok) {

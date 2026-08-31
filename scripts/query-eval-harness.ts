@@ -163,13 +163,11 @@ export async function buildAgentAnswerer(
    * The scopes ONE request may read, from that request's own grant.
    *
    * Handing the host every manifest scope made `grantedScopes` all 18 on every
-   * question however few the case declared, and quietly weakened four separate
-   * things at once: the model was given the whole corpus to answer a
-   * two-scope question; `coverage.complete`'s `everyGrantedScopeAccountedFor`
-   * conjunct became unsatisfiable by construction, because no question needs
-   * all 18; and `mustReportCoverage`, `gradeAbsence` and the scope-binding
-   * assertions all graded against a grant nobody had asked for. A grant is a
-   * per-request fact, so the list is built per request.
+   * question however few the case declared, and quietly weakened three
+   * separate things at once: the model was given the whole corpus to answer a
+   * two-scope question; and `mustReportCoverage`, `gradeAbsence` and the
+   * scope-binding assertions all graded against a grant nobody had asked for.
+   * A grant is a per-request fact, so the list is built per request.
    */
   const scopesFor = (grantedScopes: readonly string[]) => {
     const granted = new Set(grantedScopes);

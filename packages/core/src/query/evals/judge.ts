@@ -146,8 +146,7 @@ export function buildJudgePrompt(
     testCase.notes ?? "(none)",
     "",
     "COVERAGE REPORTED BY HOST (not by the answer; the host authored these):",
-    `complete=${answer.coverage.complete}, ` +
-      `method=${answer.coverage.method ?? "n/a"}, ` +
+    `method=${answer.coverage.method ?? "n/a"}, ` +
       `records=${answer.coverage.recordsScanned}, ` +
       `scopes=${answer.coverage.scopesScanned.join("|") || "none"}, ` +
       `stoppedBecause=${answer.coverage.stoppedBecause ?? "n/a"}`,

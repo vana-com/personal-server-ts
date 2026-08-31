@@ -33,12 +33,13 @@
  * ## What is deliberately not here
  *
  * No result cache (plan §6 leaves it gated on an eval-verified result), no
- * `vana.search` wiring (design §19.16 measured that it destroys
- * `coverage.complete`), and no concurrency gate — a page runs one question at
+ * `vana.search` wiring (design §19.16 measured that it collapses how much of
+ * the grant gets read), and no concurrency gate — a page runs one question at
  * a time by construction, where a server can be asked ten at once.
  */
 
 import {
+  EMPTY_COVERAGE,
   parseTurn,
   runQueryLoop,
   type QueryAnswer,
@@ -283,9 +284,10 @@ export function resolveGrant(
 /**
  * Fold the scopes this request could not reach back into coverage.
  *
- * Strictly one-directional: it can add skipped scopes and turn `complete`
- * false, and can never turn `complete` true, so it cannot launder a partial
- * run into a total one.
+ * Strictly one-directional: it only ever ADDS to `scopesSkipped`, and never
+ * removes an entry or touches a counter, so it cannot launder a partial run
+ * into a total one. A named-but-unread scope always reaches the answer text,
+ * because `honestAnswerText` caveats on a non-empty `scopesSkipped`.
  */
 export function applyGrantCoverage(
   coverage: QueryCoverage,
@@ -297,7 +299,7 @@ export function applyGrantCoverage(
     ...coverage.scopesSkipped,
     ...skipped.filter((s) => !seen.has(s.scope)),
   ];
-  return { ...coverage, scopesSkipped: merged, complete: false };
+  return { ...coverage, scopesSkipped: merged };
 }
 
 /* ------------------------------------------------------------------ *
@@ -308,8 +310,8 @@ export function applyGrantCoverage(
  * Budget and limits, matched in value to `QUERY_SANDBOX_BUDGET` /
  * `QUERY_SANDBOX_LIMITS` on the Node route.
  *
- * Matched deliberately: `recordsScanned`, `unreadable` and `complete` have to
- * mean the same thing on both runtimes or the Lite-vs-Node comparison measures
+ * Matched deliberately: `recordsScanned`, `scopesScanned` and `unreadable` have
+ * to mean the same thing on both runtimes or the Lite-vs-Node comparison measures
  * the limits rather than the runtimes. The one value that could not be copied
  * is memory — 512 MB is a *process* ceiling on Node and here it is the VM heap
  * — and design §19.17 measured the working set at 32 MB for a 20 MB grant and
@@ -443,15 +445,9 @@ export async function runLiteQuery(
       answer:
         "No readable scope was available for this question, so there is nothing to compute an answer from.",
       citations: [],
-      coverage: applyGrantCoverage(
-        {
-          scopesScanned: [],
-          recordsScanned: 0,
-          scopesSkipped: [],
-          complete: false,
-        },
-        skipped,
-      ),
+      // Spread rather than passed straight through: `EMPTY_COVERAGE` is
+      // frozen, and this object goes on to be handed to a caller.
+      coverage: applyGrantCoverage({ ...EMPTY_COVERAGE }, skipped),
       determinism: "generated",
       cost: { toolCalls: 0, inputTokens: 0, outputTokens: 0 },
     };

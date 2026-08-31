@@ -171,7 +171,6 @@ function answerWith(
       scopesScanned: ["slack.messages"],
       recordsScanned: 4200,
       scopesSkipped: [],
-      complete: false,
       method: "prefiltered",
     },
     determinism: "generated",

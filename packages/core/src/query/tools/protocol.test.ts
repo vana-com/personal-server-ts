@@ -14,7 +14,6 @@ const coverage: CoverageCounters = {
   recordsScanned: 3,
   bytesScanned: 128,
   scopesSkipped: [],
-  complete: true,
   method: "full",
   enforcementNotes: [],
   unreadable: 0,

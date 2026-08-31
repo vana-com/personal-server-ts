@@ -17,7 +17,6 @@ const fence = "```";
  */
 function stubTools(coverage: {
   recordsScanned: number;
-  complete: boolean;
   unreadable?: number;
 }): QueryToolHost {
   return {
@@ -30,7 +29,6 @@ function stubTools(coverage: {
           scopesScanned: ["oura.sleep"],
           recordsScanned: coverage.recordsScanned,
           scopesSkipped: [],
-          complete: coverage.complete,
         },
         notes: [],
         termination: "completed",
@@ -44,7 +42,6 @@ function stubTools(coverage: {
       scopesScanned: ["oura.sleep"],
       recordsScanned: coverage.recordsScanned,
       scopesSkipped: [],
-      complete: coverage.complete,
       ...(coverage.unreadable === undefined
         ? {}
         : { unreadable: coverage.unreadable }),
@@ -70,7 +67,7 @@ describe("createAgentAnswerer", () => {
 
     const answerer = createAgentAnswerer({
       provider,
-      tools: stubTools({ recordsScanned: 1030, complete: true }),
+      tools: stubTools({ recordsScanned: 1030 }),
       name: "agent-loop-test",
     });
 
@@ -127,7 +124,7 @@ describe("createAgentAnswerer", () => {
       ],
       answerer: createAgentAnswerer({
         provider,
-        tools: stubTools({ recordsScanned: 1030, complete: true }),
+        tools: stubTools({ recordsScanned: 1030 }),
         name: "agent-no-value",
       }),
       seed: 1,
@@ -142,7 +139,7 @@ describe("createAgentAnswerer", () => {
     expect(report.results[0]?.actual).toBeUndefined();
   });
 
-  it("fails a case honestly when the host's coverage is incomplete", async () => {
+  it("fails a case honestly when the host counted unreadable records", async () => {
     // The model asserts a confident "never"; the host counted an unreadable
     // remainder. The graded outcome must reflect the host, not the model.
     const provider = createFakeInferenceProvider({
@@ -158,7 +155,6 @@ describe("createAgentAnswerer", () => {
       provider,
       tools: stubTools({
         recordsScanned: 318,
-        complete: false,
         unreadable: 22,
       }),
     });
@@ -168,7 +164,6 @@ describe("createAgentAnswerer", () => {
       grantedScopes: ["oura.sleep"],
     });
 
-    expect(result.coverage.complete).toBe(false);
     expect(result.coverage.unreadable).toBe(22);
     // The honesty rule: the caveat is in the prose, not just the metadata.
     expect(result.answer).toContain("22 record(s) could not be read");
@@ -180,7 +175,7 @@ describe("createAgentAnswerer", () => {
     });
     const answerer = createAgentAnswerer({
       provider,
-      tools: stubTools({ recordsScanned: 0, complete: false }),
+      tools: stubTools({ recordsScanned: 0 }),
     });
     const result = await answerer.answer({
       question: "q",

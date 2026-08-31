@@ -219,7 +219,6 @@ void main().catch((err: unknown) => {
       unreadable: 0,
       perScope: {},
       scopesSkipped: [],
-      complete: false,
       method: "full",
       stoppedBecause: "error",
       enforcementNotes: [],

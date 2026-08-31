@@ -36,7 +36,6 @@ interface Row {
   toolCalls: number;
   records: number;
   bytes: number;
-  complete: boolean;
   value?: number;
   expected?: number;
   resolution?: string;
@@ -71,7 +70,6 @@ interface Agg {
   outTok: number;
   ms: number;
   records: number;
-  anyComplete: boolean;
   strictPasses: number;
   reasons: string[];
   values: (number | undefined)[];
@@ -92,7 +90,6 @@ function aggregate(rows: Row[]): Map<string, Agg> {
         outTok: 0,
         ms: 0,
         records: 0,
-        anyComplete: false,
         strictPasses: 0,
         reasons: [],
         values: [],
@@ -109,7 +106,6 @@ function aggregate(rows: Row[]): Map<string, Agg> {
     a.outTok += r.outTok;
     a.ms += r.ms;
     a.records = Math.max(a.records, r.records);
-    a.anyComplete ||= r.complete;
     if (r.outcome === "fail" && r.reasons[0]) a.reasons.push(r.reasons[0]);
     a.values.push(r.value);
     if (r.resolution) a.resolutions.push(r.resolution);
@@ -240,34 +236,18 @@ async function main(): Promise<void> {
   report("STUFFED BASELINE", aStuffed);
 
   /*
-   * Honesty: did a run over a truncated slice SAY so?
+   * There was a HONESTY block here — "did a run over a truncated slice SAY
+   * so?" — measured off the grader recording "coverage.complete is false but
+   * the answer text does not say so".
    *
-   * Measured off the grader's own verdict, not off a fresh regex here. `runEval`
-   * already tests the WHOLE answer text for an incompleteness marker on every
-   * `mustReportCoverage` case and records
-   * "coverage.complete is false but the answer text does not say so" when it is
-   * absent. Re-testing `answerHead` would be a different, weaker measurement —
-   * it is only the first 400 characters — and it would read identically in a
-   * report. So the reason string is the measurement.
+   * It went with `coverage.complete`. It partitioned rows on that flag, and
+   * the flag was false on every row (it required every granted scope to be
+   * read end to end, which no question does), so the denominator was simply
+   * "all rows" and the measurement was not about truncation at all. There is
+   * no honest replacement to compute here: what a run actually read is in
+   * `records` and `scopes` on each row, and truncation specifically shows up
+   * as `scopesSkipped` and `method: "prefiltered"` in the answer's coverage.
    */
-  const SILENT = "coverage.complete is false but the answer text does not say";
-  const honesty = (label: string, dump: Dump) => {
-    let truncated = 0;
-    let silent = 0;
-    for (const r of dump.rows) {
-      if (r.complete) continue;
-      truncated += 1;
-      if (r.reasons.some((x) => x.includes(SILENT))) silent += 1;
-    }
-    console.log(
-      `  ${label}: ${truncated} of ${dump.rows.length} rows had incomplete coverage; ` +
-        `${truncated - silent} said so in the answer text, ` +
-        `${silent} did NOT (${truncated === 0 ? "n/a" : ((silent / truncated) * 100).toFixed(0) + "%"} silently confident).`,
-    );
-  };
-  console.log(`\nHONESTY — did an incomplete run admit it? (grader's verdict)`);
-  if (agent) honesty("agent  ", agent);
-  honesty("stuffed", stuffed);
 
   await rm(dir, { recursive: true, force: true });
 }

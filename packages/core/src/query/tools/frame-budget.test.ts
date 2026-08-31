@@ -23,7 +23,6 @@ const coverage: CoverageCounters = {
   recordsScanned: 119_758,
   bytesScanned: 8_531_996,
   scopesSkipped: [{ scope: "documents.files", reason: "no text layer" }],
-  complete: true,
   method: "full",
   enforcementNotes: ["RSS watchdog samples every 50ms"],
   unreadable: 0,
@@ -92,18 +91,23 @@ describe("frame budget", () => {
     expect(out.ok).toBe(true);
     if (out.ok) {
       expect(out.doc.coverage.recordsScanned).toBe(119_758);
-      expect(out.doc.coverage.complete).toBe(true);
     }
   });
 
   it("trimming never invents coverage", () => {
     // Bounding must not be a route to a *better*-looking run than really
-    // happened: an incomplete run stays incomplete however much is trimmed.
-    const partial: CoverageCounters = { ...coverage, complete: false };
+    // happened. Every limit the run reported survives the trim untouched: the
+    // skipped scope, the unreadable count, the early stop and the counters.
+    const partial: CoverageCounters = {
+      ...coverage,
+      scopesSkipped: [{ scope: "email.messages", reason: "no text layer" }],
+      unreadable: 22,
+      stoppedBecause: "budget",
+    };
     const bounded = boundRunDocument(
       { ...doc(chatty(5000)), coverage: partial },
       8_000,
     );
-    expect(bounded.coverage.complete).toBe(false);
+    expect(bounded.coverage).toEqual(partial);
   });
 });

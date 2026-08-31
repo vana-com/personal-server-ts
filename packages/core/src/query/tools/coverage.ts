@@ -69,47 +69,30 @@ export function effectiveFor(t: ScopeTally): Tally {
  * field. A script that scans 30 of 300 records cannot claim it scanned 300,
  * because it does not author the field.
  *
- * `complete` is deliberately *derived*, never settable: true only when every
- * granted scope was streamed end to end and nothing stopped the run early.
+ * ## There is no summary `complete` flag, deliberately
  *
- * ## Why the derivation is unchanged despite 132 false runs
+ * There was one, derived here: true only when every granted scope had been
+ * streamed end to end or explicitly skipped, nothing was partial, nothing was
+ * prefiltered, and nothing stopped the run. It was removed because that
+ * conjunction is not a property real requests can satisfy. A grant is issued
+ * per *consent*, not per question, so a 12-scope grant is ordinary while the
+ * question in front of it legitimately needs two scopes; the other ten are
+ * then never read and the flag is false. It measured the shape of the grant,
+ * not the quality of the answer, and it was false on all 43 measured runs.
  *
- * It was reported as too strict to fire on a multi-scope grant, and therefore
- * as noise. Measured instead of assumed, that is wrong, and the flag stays as
- * it is. Every script from the 54-run `dogfood` N=3 benchmark was replayed
- * through this ledger offline, with no model calls:
+ * A flag that is always false is not a safety property, it is noise, and worse
+ * than noise here: `agent/loop.ts` appended "this answer is incomplete" to
+ * *every* answer on the strength of it, which trains a reader to ignore the
+ * one caveat that matters.
  *
- * | conjunct                        | runs it made `complete` false |
- * | ------------------------------- | ----------------------------- |
- * | some granted scope never read   | 40 / 51                       |
- * | the run stopped (`error`)       | 30 / 51                       |
- * | a bounded read (`partialScope`) | 0 / 51                        |
- * | a scope skipped                 | 0 / 51                        |
- * | `method === "prefiltered"`      | 0 / 51                        |
- *
- * **`complete` was true on 10 of those 51 runs**, including on two- and
- * three-scope grants — so the derivation is satisfiable, and loosening it
- * would destroy the signal it currently carries. The 40 are honest: Q8's run
- * never read `email.messages` before answering an absence question over it,
- * and Q11's never read `oura.heartrate` before answering about heart rate.
- * Those are exactly the reads whose absence should falsify a coverage claim.
- *
- * The flag nevertheless read as always-false at the *request* level for two
- * reasons outside this file, neither of them a defect in this derivation, and
- * both since fixed:
- *
- *  - the eval harness granted the tool host all 18 corpus scopes rather than
- *    the case's two or three, which made `everyGrantedScopeAccountedFor`
- *    unsatisfiable there — no question needs all 18. The harness now narrows
- *    the host to the request's own grant (`scripts/query-eval-harness.ts`);
- *  - the request-level merge ANDed each run's flag, so one exploratory turn
- *    that read nothing poisoned a request that later read everything. It now
- *    ORs them, which is sound precisely *because* the conjuncts above are
- *    evaluated per run against the same grant: one true run is a witness that
- *    the whole grant was covered (`server/query/sandbox-tool-host.ts`).
+ * What replaces it is nothing — by decision. The counters below are shipped as
+ * they are and a consumer judges: `scopesScanned` against the scopes it
+ * granted, `recordsScanned`, `scopesSkipped`, `unreadable`, `method` and
+ * `stoppedBecause` each say something specific and each is separately
+ * actionable. Do not reintroduce a scalar summary (a ratio, a score, a flag)
+ * over them without a consumer that can act on it differently from the parts.
  */
 export class CoverageLedger {
-  readonly #granted: Set<string>;
   readonly #fullyScanned = new Set<string>();
   readonly #partiallyScanned = new Set<string>();
   readonly #skipped = new Map<string, string>();
@@ -117,10 +100,6 @@ export class CoverageLedger {
   #method: CoverageMethod = "full";
   #stopped: StoppedBecause | undefined;
   #enforcementNotes: string[] = [];
-
-  constructor(grantedScopes: readonly string[]) {
-    this.#granted = new Set(grantedScopes);
-  }
 
   #tally(scope: string): ScopeTally {
     let t = this.#perScope.get(scope);
@@ -215,11 +194,6 @@ export class CoverageLedger {
       perScope[scope] = effective;
       totals = addTally(totals, effective);
     }
-    const everyGrantedScopeAccountedFor =
-      this.#granted.size > 0 &&
-      [...this.#granted].every(
-        (s) => this.#fullyScanned.has(s) || this.#skipped.has(s),
-      );
     return {
       scopesScanned: scanned,
       recordsScanned: totals.records,
@@ -230,12 +204,6 @@ export class CoverageLedger {
         scope,
         reason,
       })),
-      complete:
-        everyGrantedScopeAccountedFor &&
-        this.#skipped.size === 0 &&
-        this.#partiallyScanned.size === 0 &&
-        this.#method === "full" &&
-        this.#stopped === undefined,
       method: this.#method,
       ...(this.#stopped ? { stoppedBecause: this.#stopped } : {}),
       enforcementNotes: [...this.#enforcementNotes],

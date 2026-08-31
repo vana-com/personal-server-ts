@@ -30,7 +30,8 @@
  * **What it cannot do, and does not pretend to.** Coverage is host-authored
  * here exactly as it is in the agent arm (prompt doc §1) — this module counts
  * what it actually put in the prompt and reports that. When truncation drops
- * anything, `complete` is false and the dropped scopes are named. Nothing is
+ * anything, the dropped scopes are named in `scopesSkipped` and `method`
+ * becomes `prefiltered`. Nothing is
  * rounded up to satisfy the grader. An absence question asked over a truncated
  * slice SHOULD fail, and that failure is the measurement.
  *
@@ -462,7 +463,7 @@ export function createStuffedAnswerer(
     let selection = select(budget);
     let shrinks = 0;
 
-    const coverage = (complete: boolean): QueryCoverage => ({
+    const coverage = (): QueryCoverage => ({
       scopesScanned: [...selection.includedByScope.keys()],
       recordsScanned: selection.included,
       bytesScanned: selection.usedChars,
@@ -472,7 +473,6 @@ export function createStuffedAnswerer(
           scope,
           reason: "no records fit the newest-first context budget",
         })),
-      complete,
       unreadable: selection.unreadable,
       method: selection.omitted === 0 ? "full" : "prefiltered",
       ...(rendered.unprofiledScopes.length > 0
@@ -494,7 +494,7 @@ export function createStuffedAnswerer(
     const failed = (text: string, reason: QueryCoverage["stoppedBecause"]) => ({
       answer: text,
       citations: [] as QueryCitation[],
-      coverage: { ...coverage(false), stoppedBecause: reason },
+      coverage: { ...coverage(), stoppedBecause: reason },
       determinism: "generated" as const,
       cost: cost(),
       ...(receiptIds.length > 0 ? { receiptIds } : {}),
@@ -553,10 +553,10 @@ export function createStuffedAnswerer(
     return {
       answer: parsed.answer,
       citations: parsed.citations,
-      // `complete` is derived from what was actually put in the prompt, never
-      // from anything the model said. Truncation makes it false, and no answer
-      // can talk its way out of that.
-      coverage: coverage(selection.omitted === 0 && granted.length > 0),
+      // Coverage is derived from what was actually put in the prompt, never
+      // from anything the model said. Truncation shows up as `scopesSkipped`
+      // and `method: "prefiltered"`, and no answer can talk its way out of it.
+      coverage: coverage(),
       determinism: "generated",
       cost: cost(),
       ...(parsed.value !== undefined ? { value: parsed.value } : {}),

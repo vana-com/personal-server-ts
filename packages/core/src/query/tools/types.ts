@@ -88,7 +88,6 @@ export interface CoverageCounters {
   recordsScanned: number;
   bytesScanned: number;
   scopesSkipped: { scope: string; reason: string }[];
-  complete: boolean;
   /**
    * Records that were present but could not be read — a scanned PDF with no
    * text layer, an undecodable attachment.

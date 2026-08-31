@@ -15,7 +15,7 @@
  * is the cross-run merge, and it is duplicated deliberately and verbatim in
  * behaviour — `lite-tool-host.merge.test.ts` asserts the same properties the
  * Node suite asserts, so a divergence fails a test rather than quietly
- * changing what `complete` means on one runtime.
+ * changing what a counter means on one runtime.
  */
 
 import {
@@ -87,7 +87,6 @@ function failedCoverage(
     unreadable: 0,
     perScope: {},
     scopesSkipped: [],
-    complete: false,
     method: "full",
     stoppedBecause: "error",
     enforcementNotes: [`coverage frame ${reason}; no coverage can be trusted`],
@@ -162,16 +161,6 @@ export function createLiteToolHost(options: LiteToolHostOptions) {
       ].sort(),
       ...mergeScopeTotals(prev, next),
       scopesSkipped: [...skipped.values()],
-      /*
-       * Coverage only ACCUMULATES, so `complete` is a disjunction. A later
-       * turn cannot un-read what an earlier one read, so ANDing it would make
-       * the ordinary probe-then-compute shape permanently false. The prefilter
-       * taint is re-applied against the MERGED method because it is the one
-       * conjunct a disjunction would otherwise drop; the `stoppedBecause`
-       * taint is not, because `agent/loop.ts` already ANDs it in and — unlike
-       * this merge — knows whether the request ended cleanly.
-       */
-      complete: (prev.complete || next.complete) && method === "full",
       method,
       ...((prev.stoppedBecause ?? next.stoppedBecause)
         ? { stoppedBecause: prev.stoppedBecause ?? next.stoppedBecause }
@@ -208,7 +197,6 @@ export function createLiteToolHost(options: LiteToolHostOptions) {
           unreadable: 0,
           perScope: {},
           scopesSkipped: [],
-          complete: false,
           method: "full",
           enforcementNotes: [],
         }

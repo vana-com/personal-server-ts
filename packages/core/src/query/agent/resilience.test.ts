@@ -42,7 +42,6 @@ function host(): QueryToolHost {
         scopesScanned: ["oura.sleep"],
         recordsScanned: 10,
         scopesSkipped: [],
-        complete: false,
       },
       notes: [],
       termination: "completed",
@@ -55,7 +54,6 @@ function host(): QueryToolHost {
       scopesScanned: ["oura.sleep"],
       recordsScanned: 10,
       scopesSkipped: [],
-      complete: false,
     }),
   } as unknown as QueryToolHost;
 }
@@ -108,7 +106,6 @@ describe("a null reply is retried, not fatal", () => {
       { provider, tools: host() },
     );
 
-    expect(out.coverage.complete).toBe(false);
     expect(out.coverage.stoppedBecause).toBe("error");
     expect(out.answer).toMatch(/no content/i);
   });
@@ -202,7 +199,6 @@ describe("a discarded tool call is not a truncation", () => {
     // The run must stay diagnosable: the reason reaches `coverage`, under its
     // own name rather than the catch-all `error`.
     expect(out.coverage.stoppedBecause).toBe("malformedToolCall");
-    expect(out.coverage.complete).toBe(false);
     expect(out.answer).toMatch(/could not parse/i);
     expect(out.answer).toMatch(/not a truncation/i);
   });
@@ -322,7 +318,6 @@ describe("budget exhaustion ends on a partial answer", () => {
     expect(out.answer).toContain("partial");
     expect(out.value).toBe(6.1);
     // A partial answer must still be reported as partial.
-    expect(out.coverage.complete).toBe(false);
     expect(out.coverage.stoppedBecause).toBe("budget");
   });
 

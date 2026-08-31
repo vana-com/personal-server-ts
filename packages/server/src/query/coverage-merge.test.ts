@@ -23,7 +23,7 @@ function frameFor(
     string,
     { records: number; bytes: number; unreadable: number }
   >,
-  over: { complete?: boolean; method?: "full" | "prefiltered" } = {},
+  over: { method?: "full" | "prefiltered" } = {},
 ) {
   const totals = Object.values(perScope).reduce(
     (a, t) => ({
@@ -42,7 +42,6 @@ function frameFor(
       unreadable: totals.unreadable,
       perScope,
       scopesSkipped: [],
-      complete: over.complete ?? false,
       method: over.method ?? ("full" as const),
       enforcementNotes: [],
     },
@@ -163,76 +162,21 @@ describe("coverage merged across runs in one request", () => {
 });
 
 /**
- * `complete` accumulates; it does not decay.
+ * The prefilter taint outlives the turn that caused it.
  *
- * The merge used to AND each run's flag, which meant the ordinary shape —
- * probe the scope list, then compute — was `complete: false` forever, because
- * the probe turn reads nothing and is honestly incomplete on its own. A later
- * turn cannot un-read what an earlier one read, so the request-level flag is a
- * disjunction over the turns.
- *
- * What keeps that from being a loosening: a single run's `complete` already
- * asserts that EVERY scope in the grant was streamed end to end with nothing
- * skipped, partial or stopped (`core/query/tools/coverage.ts`), and every run
- * in a request is ledgered against the same grant — so one `true` witnesses
- * the whole grant. The prefilter taint is the one conjunct a disjunction would
- * drop, so it is re-applied here against the merged method.
+ * Prompt §5 gap 2: once any turn ranked rather than scanned, the answer must
+ * say "the earliest found" rather than "the earliest". A later exhaustive turn
+ * must not clear that, so the taint is re-applied against the MERGED method
+ * rather than taken from the last run to speak.
  */
-describe("coverage.complete merged across runs in one request", () => {
-  it("survives a probe turn that read nothing", async () => {
+describe("method merged across runs in one request", () => {
+  it("stays prefiltered once any turn prefiltered", async () => {
     const host = hostOver([
-      frameFor({}), // `vana.scopes()` and nothing else
-      frameFor(docs(340, 22), { complete: true }),
-    ]);
-    await host.execute("what scopes are there?");
-    await host.execute("now read all of it");
-    expect(host.coverage().complete).toBe(true);
-  });
-
-  it("is not undone by a later bounded read of an already-complete scope", async () => {
-    const host = hostOver([
-      frameFor(docs(340, 22), { complete: true }),
-      frameFor(docs(50, 0)), // re-reads a window it has already covered
-    ]);
-    await host.execute("stream everything");
-    await host.execute("look again at the first fifty");
-    const coverage = host.coverage();
-    expect(coverage.complete).toBe(true);
-    expect(coverage.recordsScanned, "the full pass still subsumes").toBe(340);
-  });
-
-  it("stays false when no single turn covered the grant", async () => {
-    // Two partial turns do not add up to a complete one: neither run can say
-    // the grant was streamed, and the merge must not infer it from the pair.
-    const host = hostOver([frameFor(docs(100, 5)), frameFor(docs(120, 3))]);
-    await host.execute("first window");
-    await host.execute("second window");
-    expect(host.coverage().complete).toBe(false);
-  });
-
-  it("is dropped by a prefiltered turn anywhere in the request", async () => {
-    // Prompt §5 gap 2: once any turn ranked rather than scanned, the answer
-    // must say "the earliest found". A complete flag would contradict that in
-    // metadata, so the taint outlives the turn that caused it.
-    const host = hostOver([
-      frameFor(docs(340, 22), { complete: true }),
       frameFor(docs(10, 0), { method: "prefiltered" }),
+      frameFor(docs(340, 22)),
     ]);
-    await host.execute("stream everything");
-    await host.execute("then search");
-    const coverage = host.coverage();
-    expect(coverage.method).toBe("prefiltered");
-    expect(coverage.complete).toBe(false);
-  });
-
-  it("is dropped when a frame never arrives, until a later turn earns it", async () => {
-    const host = hostOver([
-      "no frame at all",
-      frameFor(docs(340, 22), { complete: true }),
-    ]);
-    await host.execute("truncated");
-    expect(host.coverage().complete).toBe(false);
-    await host.execute("stream everything");
-    expect(host.coverage().complete).toBe(true);
+    await host.execute("search");
+    await host.execute("then stream everything");
+    expect(host.coverage().method).toBe("prefiltered");
   });
 });

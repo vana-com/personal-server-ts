@@ -199,7 +199,7 @@ describe("extractNumber", () => {
  *
  * What is under test is the grader, not an answerer, so the answer is stated
  * outright rather than produced. Everything the shared checks need — a
- * citation, scanned scopes, complete coverage — is satisfied, leaving the
+ * citation, scanned scopes, a real record count — is satisfied, leaving the
  * numeric rules as the only thing that can fail.
  */
 function scripted(fields: {
@@ -223,7 +223,6 @@ function scripted(fields: {
           scopesScanned: request.grantedScopes,
           recordsScanned: 1000,
           scopesSkipped: [],
-          complete: true,
           ...fields.coverage,
         },
         determinism: "generated",
@@ -392,18 +391,20 @@ describe("dual-rule grading", () => {
 });
 
 /* ------------------------------------------------------------------ */
-/* Absence grading: the two senses of "complete"                       */
+/* Absence grading: reached-but-unreadable is not skipped                */
 /* ------------------------------------------------------------------ */
 
 /**
- * Q8 went 3/3 → 0/3 when per-question grants made `coverage.complete`
- * satisfiable, and the runs it started failing were the correct ones.
+ * Q8 went 3/3 → 0/3 under a grader that paired "streamed every granted scope"
+ * with "nothing was unreadable", and the runs it started failing were the
+ * correct ones.
  *
- * The ledger's `complete` means every granted scope was streamed end to end;
- * the absence rule read it as "nothing was unreadable". An unreadable record
- * was reached, not skipped, so both can hold at once. These cases pin the
- * reconciliation and, more to the point, pin the integrity property that
- * survives it: an incomplete scan must say so in the answer text.
+ * The two are independent. An unreadable record was *reached*, not skipped —
+ * the runtime recognised its marker as it streamed past, which is how it got
+ * counted — so a run can stream a scope end to end and still have found
+ * records it could not read. These cases pin the integrity property that
+ * matters: the unreadable count must match the corpus AND appear in the
+ * answer text.
  */
 describe("absence grading", () => {
   const q8Coverage = (): { recordsScanned: number; unreadable: number } => {
@@ -420,7 +421,7 @@ describe("absence grading", () => {
         answer:
           `No conflicting agreement was found across the ${recordsScanned} readable ` +
           `documents; ${unreadable} documents have no text layer and could not be read.`,
-        coverage: { recordsScanned, unreadable, complete: true },
+        coverage: { recordsScanned, unreadable },
       }),
     );
     expect(result.reasons).toEqual([]);
@@ -428,7 +429,7 @@ describe("absence grading", () => {
   }, 30_000);
 
   it("REJECTS a run that reports no unreadable records when there are some", async () => {
-    // The negative control on the metadata axis: `complete` is honest here,
+    // The negative control on the metadata axis: the scan itself was fine,
     // and the answer is still wrong about what it managed to read.
     const { recordsScanned, unreadable } = q8Coverage();
     const result = await run(
@@ -437,7 +438,7 @@ describe("absence grading", () => {
         answer:
           `No conflicting agreement was found. All ${recordsScanned} documents ` +
           `were read, and ${unreadable} is not a count of anything.`,
-        coverage: { recordsScanned, unreadable: 0, complete: true },
+        coverage: { recordsScanned, unreadable: 0 },
       }),
     );
     expect(result.outcome).toBe("fail");
@@ -452,7 +453,7 @@ describe("absence grading", () => {
       "Q8",
       scripted({
         answer: `No conflicting agreement was found across ${recordsScanned} documents.`,
-        coverage: { recordsScanned, unreadable, complete: true },
+        coverage: { recordsScanned, unreadable },
       }),
     );
     expect(result.outcome).toBe("fail");
@@ -477,7 +478,7 @@ describe("absence grading", () => {
           `No conflicting agreement was found. The most recent amendment is ` +
           `dated December ${unreadable}, and ${recordsScanned} documents were ` +
           `scanned in ${unreadable} seconds.`,
-        coverage: { recordsScanned, unreadable, complete: true },
+        coverage: { recordsScanned, unreadable },
       }),
     );
     expect(result.outcome).toBe("fail");
@@ -507,7 +508,7 @@ describe("absence grading", () => {
         "Q8",
         scripted({
           answer: `No conflicting agreement was found; ${wording}.`,
-          coverage: { recordsScanned, unreadable, complete: true },
+          coverage: { recordsScanned, unreadable },
         }),
       );
       expect(result.reasons, wording).toEqual([]);

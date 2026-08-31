@@ -78,7 +78,7 @@ describe("unreadable records are counted by the host", () => {
   it("is host-authored: the ledger is never reachable from a script", () => {
     // The ledger is closed over by the API factory and never bound into the
     // script's realm, so incrementing it is the only way the number moves.
-    const ledger = new CoverageLedger(["documents.files"]);
+    const ledger = new CoverageLedger();
     ledger.fullPass("documents.files", {
       records: 10,
       bytes: 0,

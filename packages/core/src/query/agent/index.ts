@@ -18,6 +18,13 @@ export type {
   QueryStoppedBecause,
 } from "./types.js";
 
+/**
+ * Exported so the two query services build their "no readable scope" coverage
+ * from the same frozen, fail-closed constant the loop falls back to, rather
+ * than each restating the zeroed literal. One definition, one place to break.
+ */
+export { EMPTY_COVERAGE } from "./types.js";
+
 export {
   ANSWER_TAG,
   RESPONSE_CONTRACT_VERSION,

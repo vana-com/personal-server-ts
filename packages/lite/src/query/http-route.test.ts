@@ -74,7 +74,6 @@ const ANSWER: QueryAnswer = {
     scopesScanned: ["notes.entries"],
     recordsScanned: 3,
     scopesSkipped: [],
-    complete: true,
   },
 } as unknown as QueryAnswer;
 
