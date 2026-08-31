@@ -398,10 +398,19 @@ describe("upload worker", () => {
     const STALE_409 = new Error(
       "Gateway error: 409 Stale expectedVersion 1: must be strictly greater than the stored value 1",
     );
-    // The dataHash the worker computes for makeEnvelope()'s plaintext.
-    const ENVELOPE_DATA_HASH = keccak256(
-      new TextEncoder().encode(JSON.stringify(makeEnvelope())),
-    );
+    // The dataHash the worker computes for makeEnvelope(). Frozen as a
+    // literal rather than recomputed from the expression under test: the
+    // previous version of this constant re-ran the worker's own
+    // `keccak256(TextEncoder().encode(JSON.stringify(envelope)))` recipe, so
+    // it tracked any serialization change instead of catching it and the
+    // adopt-branch assertions below passed vacuously. See the
+    // "dataHash commitment (golden vector)" block for the derivation of the
+    // canonical preimage this pins.
+    // keccak256 of:
+    // {"collectedAt":"2026-01-21T10:00:00Z","data":{"username":"testuser"},
+    //  "scope":"instagram.profile","version":"1.0"}
+    const ENVELOPE_DATA_HASH =
+      "0xb0a6f71f4dbd99adafde95eddfdedce2b6cdf95973e064b88bf6de13ae4a11bb";
     const REGISTRY_ID = computeDataPointId(OWNER, SCOPE);
 
     function makeRecord(overrides?: {
@@ -1158,5 +1167,178 @@ describe("uploadOne — derivative registration (lineage)", () => {
     await uploadOne(deps, makeEntry());
     expect(deps.gateway.registerDataPoint).toHaveBeenCalled();
     expect(deps.lineageGateway.registerDataPoint).not.toHaveBeenCalled();
+  });
+});
+
+describe("dataHash commitment (golden vector)", () => {
+  const SCOPE_KEY = new Uint8Array(32).fill(0xbb);
+  const ENCRYPTED_BYTES = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (deriveScopeKey as ReturnType<typeof vi.fn>).mockReturnValue(SCOPE_KEY);
+    (encryptWithPassword as ReturnType<typeof vi.fn>).mockResolvedValue(
+      ENCRYPTED_BYTES,
+    );
+  });
+
+  /**
+   * A fixed, realistic envelope whose keys are written deliberately OUT of
+   * canonical order. It exercises every rule that could silently change the
+   * commitment: nested objects at depth, arrays (whose order must be
+   * PRESERVED — only object keys sort), integer-like keys (which JS hoists to
+   * the front of `Object.keys` in numeric order, so `"10"` must still sort
+   * before `"2"` lexicographically), unicode passed through unescaped,
+   * escaped quotes and control characters, integers, floats, null and bool.
+   */
+  function goldenEnvelope(): DataFileEnvelope {
+    return {
+      version: "1.0",
+      scope: SCOPE,
+      collectedAt: "2026-01-01T00:00:00.000Z",
+      data: {
+        username: "testuser",
+        followers: 1234,
+        ratio: 0.5,
+        verified: true,
+        bio: 'café ☕ "quoted"\n',
+        tags: ["zebra", "apple", "mango"],
+        posts: [
+          { id: 2, caption: "second" },
+          { id: 1, caption: "first" },
+        ],
+        counts: { 10: "ten", 2: "two", 1: "one" },
+        nested: { z: { b: 1, a: 2 }, a: 3 },
+        missing: null,
+      },
+    };
+  }
+
+  /**
+   * The RFC 8785 canonical preimage of goldenEnvelope(), written out by hand
+   * from the spec — NOT produced by canonicalJsonBytes. Note `posts` and
+   * `tags` keep their authored order while every object's keys are sorted,
+   * and `counts` orders "1" < "10" < "2".
+   */
+  const GOLDEN_CANONICAL_JSON =
+    '{"collectedAt":"2026-01-01T00:00:00.000Z","data":{"bio":"café ☕ \\"quoted\\"\\n","counts":{"1":"one","10":"ten","2":"two"},"followers":1234,"missing":null,"nested":{"a":3,"z":{"a":2,"b":1}},"posts":[{"caption":"second","id":2},{"caption":"first","id":1}],"ratio":0.5,"tags":["zebra","apple","mango"],"username":"testuser","verified":true},"scope":"instagram.profile","version":"1.0"}';
+
+  /**
+   * keccak256 of GOLDEN_CANONICAL_JSON's UTF-8 bytes, frozen as a literal.
+   * Nothing in the worker is consulted to produce this number, so a change to
+   * the serialization — or to the hash function, or to the choice of preimage
+   * — makes this test fail rather than silently re-baseline. That is the
+   * entire point: `dataHash` is a permanent on-chain commitment.
+   */
+  const GOLDEN_DATA_HASH =
+    "0x4a9c7982b4407307766108419d5dff9548da391cac60332333949e6547bbb324";
+
+  function registeredDataHash(deps: UploadWorkerDeps): string {
+    const call = (deps.signer.signAddData as ReturnType<typeof vi.fn>).mock
+      .calls[0][0];
+    return call.dataHash;
+  }
+
+  it("keeps the two frozen literals mutually consistent", () => {
+    // Cross-check via viem, independent of our canonicalization code: proves
+    // GOLDEN_DATA_HASH really is the hash of GOLDEN_CANONICAL_JSON, so a
+    // reviewer can audit the preimage by reading it.
+    expect(keccak256(new TextEncoder().encode(GOLDEN_CANONICAL_JSON))).toBe(
+      GOLDEN_DATA_HASH,
+    );
+  });
+
+  it("commits to the frozen golden hash for a fixed envelope", async () => {
+    const deps = makeMockDeps();
+    deps.storage.readEnvelope = vi.fn().mockResolvedValue(goldenEnvelope());
+
+    await uploadOne(deps, makeEntry());
+
+    expect(registeredDataHash(deps)).toBe(GOLDEN_DATA_HASH);
+  });
+
+  it("is independent of key insertion order", async () => {
+    // Same logical content, every object's keys authored in a different
+    // order. This is the property the canonicalization exists to provide:
+    // two replicas assembling the same record must agree on the commitment,
+    // or the adopt/dedupe check mints a redundant on-chain version.
+    const reordered: DataFileEnvelope = {
+      data: {
+        missing: null,
+        nested: { a: 3, z: { a: 2, b: 1 } },
+        counts: { 1: "one", 2: "two", 10: "ten" },
+        posts: [
+          { caption: "second", id: 2 },
+          { caption: "first", id: 1 },
+        ],
+        tags: ["zebra", "apple", "mango"],
+        bio: 'café ☕ "quoted"\n',
+        verified: true,
+        ratio: 0.5,
+        followers: 1234,
+        username: "testuser",
+      },
+      collectedAt: "2026-01-01T00:00:00.000Z",
+      scope: SCOPE,
+      version: "1.0",
+    };
+
+    // Guard the guard: the two envelopes really do serialize differently
+    // under the old plain-JSON.stringify recipe, so this test would have
+    // been unable to pass before the change.
+    expect(JSON.stringify(reordered)).not.toBe(
+      JSON.stringify(goldenEnvelope()),
+    );
+
+    const a = makeMockDeps();
+    a.storage.readEnvelope = vi.fn().mockResolvedValue(goldenEnvelope());
+    await uploadOne(a, makeEntry());
+
+    const b = makeMockDeps();
+    b.storage.readEnvelope = vi.fn().mockResolvedValue(reordered);
+    await uploadOne(b, makeEntry());
+
+    expect(registeredDataHash(b)).toBe(registeredDataHash(a));
+    expect(registeredDataHash(b)).toBe(GOLDEN_DATA_HASH);
+  });
+
+  it("still commits to the ordered content, not just the key set", async () => {
+    // Canonicalization must NOT reorder arrays. A permuted array is
+    // different content and must produce a different commitment.
+    const permutedArray = goldenEnvelope();
+    (permutedArray.data as Record<string, unknown>).tags = [
+      "apple",
+      "mango",
+      "zebra",
+    ];
+
+    const deps = makeMockDeps();
+    deps.storage.readEnvelope = vi.fn().mockResolvedValue(permutedArray);
+    await uploadOne(deps, makeEntry());
+
+    expect(registeredDataHash(deps)).not.toBe(GOLDEN_DATA_HASH);
+  });
+
+  it("encrypts and uploads the plain JSON bytes, not the canonical form", async () => {
+    // The stored blob deliberately stays the JSON.stringify serialization:
+    // the download worker writes a decrypted envelope straight to local
+    // storage, and verifyStoredWriterAttribution re-hashes a stored
+    // builder-written record's `data` with JSON.stringify against the
+    // builder's signed bodyHash. Storing key-sorted bytes would reorder that
+    // payload on every replica and fail BODY_HASH_MISMATCH.
+    const deps = makeMockDeps();
+    const envelope = goldenEnvelope();
+    deps.storage.readEnvelope = vi.fn().mockResolvedValue(envelope);
+
+    await uploadOne(deps, makeEntry());
+
+    const encryptedArg = (encryptWithPassword as ReturnType<typeof vi.fn>).mock
+      .calls[0][0] as Uint8Array;
+    expect(new TextDecoder().decode(encryptedArg)).toBe(
+      JSON.stringify(envelope),
+    );
+    expect(new TextDecoder().decode(encryptedArg)).not.toBe(
+      GOLDEN_CANONICAL_JSON,
+    );
   });
 });

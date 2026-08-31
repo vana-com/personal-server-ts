@@ -1,15 +1,25 @@
 /**
- * RFC 8785 JSON Canonicalization Scheme (JCS), the subset the E2EE v2 and
- * ACI protocols need: object members sorted by UTF-16 code units, no
- * whitespace, ES number-to-string serialization, JSON.stringify string
- * escaping (which is the RFC 8785 escaping: the two-character forms for
- * control characters that have them, `\u00xx` lowercase otherwise, no
- * escaping of non-ASCII).
+ * RFC 8785 JSON Canonicalization Scheme (JCS): object members sorted by
+ * UTF-16 code units, no whitespace, ES number-to-string serialization,
+ * JSON.stringify string escaping (which is the RFC 8785 escaping: the
+ * two-character forms for control characters that have them, `\u00xx`
+ * lowercase otherwise, no escaping of non-ASCII).
+ *
+ * This lives in a neutral module rather than under `derivatives/e2ee/`
+ * because it is a shared serialization primitive, not an E2EE concern: the
+ * E2EE v2 / ACI protocols derive AAD and attestation bytes from it, and the
+ * sync upload worker derives the on-chain `dataHash` commitment from it.
+ * A subsystem-owned copy would invite a second, divergent implementation.
  *
  * Only JSON data is accepted: `undefined`, functions, symbols, bigints and
  * non-finite numbers throw instead of being silently dropped, since a
  * canonical form that differs from the peer's would only show up as an
- * AEAD failure.
+ * AEAD failure or a hash mismatch.
+ *
+ * Note on `toJSON`: unlike `JSON.stringify`, this does NOT honour a
+ * `toJSON` method — a `Date` canonicalizes to `{}`, not to its ISO string.
+ * Callers must pass plain JSON data (parsed JSON, or values that never hold
+ * class instances). See `jcs.test.ts`.
  */
 
 export function canonicalizeJson(value: unknown): string {
