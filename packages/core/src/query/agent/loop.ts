@@ -601,6 +601,49 @@ export async function runQueryLoop(
     // script error, not a termination reason.
     if (mapped || result.error) sawRunFailure = true;
 
+    // `vana.result(...)` terminates the run from inside the script, so it is
+    // the OTHER door onto a clean final answer, and it was unguarded.
+    //
+    // The test here is deliberately narrower than the one on the answer
+    // branch above, because on this path "zero records" does not mean "saw
+    // nothing". A script can legitimately answer a question about the GRANT
+    // rather than about records: `vana.scopes()` returns host-authored data
+    // and reads no records, and the Q12 eval case is answered over an EMPTY
+    // grant, where no counter can ever be non-zero. Refusing every
+    // zero-record `vana.result` would make that whole class unanswerable —
+    // it would be wrong, not merely inconvenient.
+    //
+    // What cannot be legitimate is a computed QUANTITY over no data: a script
+    // reporting a numeric `value` while the host counted no records read has
+    // produced a statistic from nothing. That is the provable subset, and the
+    // only one refused here. A fabricated number carried in prose alone is
+    // indistinguishable from a legitimate metadata answer using the host's
+    // counters, so it is knowingly NOT caught.
+    //
+    // Checked before `resultValue` is stored, so a refused figure cannot
+    // survive into a later turn's answer.
+    if (
+      result.result?.answer !== undefined &&
+      typeof result.result.value === "number" &&
+      !sawRunFailure &&
+      (tools.coverage()?.recordsScanned ?? 0) === 0
+    ) {
+      // Same push-back-once-then-fail as the answer branch, sharing its
+      // counter: the script committed in code, but the MODEL still gets a
+      // turn to write one that reads something.
+      if (ungroundedAnswers >= 1) {
+        stoppedBecause = "ungroundedAnswer";
+        finalAnswer =
+          "I could not answer this question from your data. The script " +
+          "reported a computed figure while the host counted no records " +
+          "read, twice, so there was nothing behind the number.";
+        break;
+      }
+      ungroundedAnswers += 1;
+      messages.push({ role: "user", content: UNGROUNDED_ANSWER_MESSAGE });
+      continue;
+    }
+
     if (result.result?.value !== undefined) resultValue = result.result.value;
     if (result.result?.resolution !== undefined) {
       resultResolution = result.result.resolution;

@@ -407,6 +407,126 @@ describe("runQueryLoop — an answer must be grounded in a read", () => {
     expect(out.coverage.stoppedBecause).not.toBe("ungroundedAnswer");
   });
 
+  it("refuses a vana.result figure computed over zero records", async () => {
+    // The other door onto a clean final answer. A script that reports a
+    // number while the host counted nothing read produced it from nowhere.
+    const provider = createFakeInferenceProvider({
+      respond: () => reply(runBlock("vana.result({answer:'6.5h',value:6.5})")),
+    });
+    const empty = {
+      scopesScanned: [],
+      recordsScanned: 0,
+      scopesSkipped: [],
+      complete: false,
+    };
+    const out = await runQueryLoop(
+      { question: "q", grantedScopes: ["oura.sleep"] },
+      {
+        provider,
+        tools: fakeTools(
+          [
+            executed({
+              coverage: empty,
+              result: { answer: "6.5h", value: 6.5 },
+            }),
+          ],
+          { coverage: () => empty },
+        ),
+      },
+    );
+
+    expect(out.answer).not.toContain("6.5h");
+    expect(out.coverage.stoppedBecause).toBe("ungroundedAnswer");
+    // The refused figure must not survive into the answer.
+    expect(out.value).toBeUndefined();
+  });
+
+  it("accepts a vana.result figure once records were read", async () => {
+    const provider = createFakeInferenceProvider({
+      respond: () =>
+        reply(runBlock("vana.result({answer:'6.52h',value:6.52})")),
+    });
+    const out = await runQueryLoop(
+      { question: "q", grantedScopes: ["oura.sleep"] },
+      {
+        provider,
+        tools: fakeTools([
+          executed({ result: { answer: "6.52h", value: 6.52 } }),
+        ]),
+      },
+    );
+    expect(out.answer).toContain("6.52h");
+    expect(out.value).toBe(6.52);
+    expect(out.coverage.stoppedBecause).toBeUndefined();
+  });
+
+  it("still answers a grant question that reads no records (Q12)", async () => {
+    // The divergence from the answer branch, pinned. `vana.scopes()` returns
+    // host data and scans nothing, and Q12 is answered over an EMPTY grant
+    // where no counter can ever be non-zero. A figure-free `vana.result` here
+    // is honest, and refusing it would make the class unanswerable.
+    const provider = createFakeInferenceProvider({
+      respond: () => reply(runBlock("vana.result({answer:'visible-count:0'})")),
+    });
+    const empty = {
+      scopesScanned: [],
+      recordsScanned: 0,
+      scopesSkipped: [],
+      complete: false,
+    };
+    const out = await runQueryLoop(
+      { question: "what did this server tell the builder?", grantedScopes: [] },
+      {
+        provider,
+        tools: fakeTools(
+          [
+            executed({
+              coverage: empty,
+              result: { answer: "visible-count:0" },
+            }),
+          ],
+          { coverage: () => empty },
+        ),
+      },
+    );
+    expect(out.answer).toContain("visible-count:0");
+    expect(out.coverage.stoppedBecause).not.toBe("ungroundedAnswer");
+  });
+
+  it("pushes back once before failing a vana.result figure", async () => {
+    // Shares the answer branch's counter, so the model gets exactly one turn
+    // to write a script that reads something.
+    let ran = 0;
+    const empty = {
+      scopesScanned: [],
+      recordsScanned: 0,
+      scopesSkipped: [],
+      complete: false,
+    };
+    const provider = createFakeInferenceProvider({
+      respond: () => reply(runBlock("vana.result({answer:'6.5h',value:6.5})")),
+    });
+    await runQueryLoop(
+      { question: "q", grantedScopes: ["oura.sleep"] },
+      {
+        provider,
+        tools: fakeTools([], {
+          async execute() {
+            ran += 1;
+            return executed({
+              coverage: empty,
+              result: { answer: "6.5h", value: 6.5 },
+            });
+          },
+          coverage: () => empty,
+        }),
+      },
+    );
+    expect(ran).toBe(2);
+    const pushBack = provider.calls[1]?.messages.at(-1);
+    expect(pushBack?.content).toContain("0 records read");
+  });
+
   it("says in the answer text that nothing was read", async () => {
     // The refusal has to be legible to a reader of the answer, not only to a
     // caller that inspects coverage — the same rule as `complete: false`.
