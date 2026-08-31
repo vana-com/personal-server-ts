@@ -1,6 +1,9 @@
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
+  realpathSync,
+  rmdirSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -85,6 +88,26 @@ let homeCanaryName: string;
 let homeCanaryFile: string;
 /** Host paths the write case aims at; asserted absent, and swept after. */
 let hostWriteTargets: string[];
+/**
+ * ASRT's own default write paths — the ones `getDefaultWritePaths()` unions
+ * into the write allow-list whatever the caller asked for. See the test that
+ * uses these.
+ */
+const ASRT_DEFAULT_WRITE_DIRS = [
+  "/tmp/claude",
+  "/private/tmp/claude",
+  join(homedir(), ".npm", "_logs"),
+  join(homedir(), ".claude", "debug"),
+];
+/** One file per entry above; asserted absent on the host, and swept after. */
+let asrtWriteTargets: string[];
+/**
+ * Directories from {@link ASRT_DEFAULT_WRITE_DIRS} this suite had to create
+ * because the machine did not have them. Removed again in `afterAll` so the
+ * test leaves no trace, and tracked separately from ones that were already
+ * there, which must survive.
+ */
+let asrtDirsCreated: string[];
 
 beforeAll(() => {
   dataRoot = mkdtempSync(join(tmpdir(), "ps-query-data-"));
@@ -113,6 +136,26 @@ beforeAll(() => {
     join(homedir(), `${HOST_HOME_PREFIX}written-by-sandbox-${process.pid}.txt`),
   ];
 
+  // The ASRT default write paths, made real. A write refused because the
+  // directory does not exist on this machine is not evidence of anything, so
+  // each one is created if absent — otherwise the assertion below would pass
+  // vacuously on a clean checkout and only ever fail on a developer's laptop.
+  asrtDirsCreated = [];
+  for (const d of ASRT_DEFAULT_WRITE_DIRS) {
+    if (existsSync(d)) continue;
+    try {
+      mkdirSync(d, { recursive: true });
+      asrtDirsCreated.push(d);
+    } catch {
+      // Unwritable by the test user (a locked-down /tmp, say). The write case
+      // still asserts the host file is absent; it just cannot also prove the
+      // directory was there. Nothing else depends on it.
+    }
+  }
+  asrtWriteTargets = ASRT_DEFAULT_WRITE_DIRS.map((d) =>
+    join(d, `${HOST_HOME_PREFIX}asrt-default-${process.pid}.txt`),
+  );
+
   sandbox = createNodeSandbox({ dataRoot });
 });
 
@@ -122,8 +165,21 @@ afterAll(() => {
   }
   // Never leave anything of ours in the user's home, including a file a
   // breach put there.
-  for (const f of [homeCanaryFile, ...(hostWriteTargets ?? [])]) {
+  for (const f of [
+    homeCanaryFile,
+    ...(hostWriteTargets ?? []),
+    ...(asrtWriteTargets ?? []),
+  ]) {
     if (f && existsSync(f)) rmSync(f, { force: true });
+  }
+  // Only the ones this suite created, and only while still empty, so a
+  // directory the machine was already using is never removed.
+  for (const d of asrtDirsCreated ?? []) {
+    try {
+      rmdirSync(d);
+    } catch {
+      // Non-empty or already gone. Either way, not ours to force.
+    }
   }
 });
 
@@ -504,6 +560,127 @@ describe.skipIf(!supported)("hostile scripts fail closed", () => {
         );
         expect(out(r)).not.toContain("WRITE-CALL-RETURNED");
       }
+    },
+    RUN_MS,
+  );
+
+  it(
+    "no write to ASRT's own default write paths lands on the host",
+    async () => {
+      // The assertion that was missing, and the one that would have caught a
+      // real escape being shipped.
+      //
+      // The case above aims at paths *our* config denies, which is the easy
+      // half. These four are different in kind: ASRT grants them itself.
+      // `SandboxManager` composes the write policy as
+      // `allowOnly: [...getDefaultWritePaths(), ...userAllowWrite]`, so they
+      // are writable regardless of what `allowWrite` says, and ASRT's own
+      // source warns they "may allow access to files from other processes".
+      // Measured before `node-sandbox.ts` named them in `denyWrite`: a
+      // sandboxed script's writes to all four landed on the real host
+      // filesystem holding the script's bytes, on macOS (write-only; reads
+      // refused EPERM) and on Linux (read and write).
+      //
+      // Nothing about that is visible from inside a run, from the granted
+      // scope, or from any assertion the rest of this file makes — which is
+      // exactly why it survived. The property is the same one the case above
+      // asserts, applied to the paths a dependency opened rather than the
+      // ones we did: no byte reaches the host outside the scratch dir.
+      //
+      // Scope, stated rather than left to silence: this asserts the **write**
+      // half only. The read half is not closable at ASRT 0.0.74 — `denyWrite`
+      // maps to `denyWithinAllow`, which leaves the path bind-mounted and
+      // therefore readable on Linux. That gap is carried in
+      // `SandboxEnforcement.notes` and design §19.7.1, not asserted here,
+      // because a test that must pass cannot assert something still open.
+      const r = await run(`
+      const fs = require("fs");
+      for (const t of ${JSON.stringify(asrtWriteTargets)}) {
+        try {
+          fs.writeFileSync(t, "BREACH-PAYLOAD");
+          console.log("ASRT-WRITE-RETURNED " + t);
+        } catch (e) { console.log("ASRT-WRITE-THREW " + t + " " + e.code); }
+      }
+    `);
+      // The guarantee. Swept before asserting so a breach cannot leave a file
+      // in the user's home on its way to failing the test.
+      const landed = asrtWriteTargets.filter((t) => existsSync(t));
+      for (const t of landed) rmSync(t, { force: true });
+      expect(
+        landed,
+        "a sandboxed write reached the host through ASRT's default write paths",
+      ).toEqual([]);
+      // Positive evidence every write was actually attempted, so a run that
+      // died early cannot pass on an empty filesystem.
+      const attempts = out(r).match(/ASRT-WRITE-(RETURNED|THREW)/g) ?? [];
+      expect(
+        attempts,
+        "the script did not attempt every default-write-path write",
+      ).toHaveLength(asrtWriteTargets.length);
+      // The macOS mechanism, kept beside the platform-neutral guarantee:
+      // `denyWithinAllow` becomes a Seatbelt deny rule, so the syscall is
+      // refused outright and no write may report success.
+      if (process.platform === "darwin") {
+        expect(out(r), "Seatbelt should refuse the write").toContain(
+          "ASRT-WRITE-THREW",
+        );
+        expect(out(r)).not.toContain("ASRT-WRITE-RETURNED");
+      }
+    },
+    RUN_MS,
+  );
+
+  it(
+    "the run's temp dir is its own scratch dir, not a shared host directory",
+    async () => {
+      // The other half of the same escape, and the one a script reaches
+      // without naming a path at all.
+      //
+      // ASRT sets `TMPDIR=/tmp/claude` for the sandboxed process — one of the
+      // default write paths above — via an `env VAR=value` prefix on the argv
+      // it returns, which is applied at exec time and so wins over any
+      // environment the caller composes. The effect was that `os.tmpdir()`
+      // inside a run pointed at a shared host directory, aiming every library
+      // that writes a temp file out of the sandbox by default.
+      //
+      // So the property is not just "the write is refused" but "the temp dir
+      // is somewhere legitimate" — and both halves matter: a temp dir that
+      // was merely denied would be contained but broken, which is what ASRT
+      // 0.0.74 leaves behind on its own (measured on macOS: `os.tmpdir()` was
+      // `/tmp/claude` and `mkdtempSync` under it failed with EPERM).
+      const r = await run(`
+      const fs = require("fs");
+      const os = require("os");
+      const path = require("path");
+      console.log("TMPDIR-IS " + os.tmpdir());
+      try {
+        const d = fs.mkdtempSync(path.join(os.tmpdir(), "probe-"));
+        console.log("TMPDIR-WRITABLE " + d);
+      } catch (e) { console.log("TMPDIR-UNWRITABLE " + e.code); }
+    `);
+      const reported = out(r)
+        .match(/^TMPDIR-IS (.*)$/m)?.[1]
+        ?.trim();
+      // Positive evidence the run got far enough to report anything.
+      expect(reported, "the script never reported its temp dir").toBeTruthy();
+      for (const d of ASRT_DEFAULT_WRITE_DIRS) {
+        expect(
+          reported,
+          `the run's temp dir is ASRT's shared ${d}, not its own scratch dir`,
+        ).not.toContain(d);
+      }
+      // Positively: it is inside the scratch dir this run was given. Compared
+      // against the realpath because macOS reaches the scratch dir through
+      // /private, and the run sees the resolved spelling.
+      expect(
+        realpathSync(reported!).startsWith(realpathSync(scratch)),
+        `temp dir ${reported} is outside the run's scratch dir ${scratch}`,
+      ).toBe(true);
+      // And it actually works, so this cannot be satisfied by pointing TMPDIR
+      // at somewhere unusable.
+      expect(out(r), "the run's own temp dir was not writable").toContain(
+        "TMPDIR-WRITABLE",
+      );
     },
     RUN_MS,
   );

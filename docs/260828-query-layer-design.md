@@ -1424,23 +1424,84 @@ config:
   escape.
 
 This is not the namespace-vs-permission difference above; it is a hole in the
-property the write and home cases assert, and it exists on `main` today. The
-write half is closable from our side — ASRT maps `filesystem.denyWrite` to
-`denyWithinAllow`, so naming those four paths there is refused as `EPERM` on
-macOS and `EROFS` on Linux; verified, with the full hostile suite still green
-on both platforms afterwards. The read half is **not** closable at 0.0.74:
-the path stays bind-mounted for the write allowance, so `denyWrite` makes it
-read-only rather than absent, and the host's log contents remain readable on
-Linux. `/tmp/claude` additionally deserves thought before being denied — ASRT
-sets `TMPDIR` to it for the sandboxed process, and `minimalEnv`'s loop lets
-that value win over the scratch dir it sets first.
+property the write and home cases assert. Correcting an earlier draft of this
+section: it does **not** exist on `main`. `@anthropic-ai/sandbox-runtime`
+arrives with this branch — neither the dependency nor `node-sandbox.ts` is
+present on `origin/main` — so this was a defect about to ship, not one already
+shipped. That is the only reason it was an agent's to close rather than a
+disclosure.
 
-**The rewrite is landed; the escape is not fixed.** Rewriting the four
-assertions is a correction — containment was measured to hold in those four
-cases — but it must not be read as a statement that nothing else escapes. The
-`denyWrite` fix and the residual Linux read leak are a security decision for a
-human, not an agent, and `SandboxEnforcement` carries both the mechanism
-difference and this gap in its notes on Linux until then.
+**The write half is now closed, on both platforms.** ASRT maps
+`filesystem.denyWrite` to `denyWithinAllow`, which is applied _within_
+`allowOnly` — the one supported way to subtract from a set we never added to.
+`node-sandbox.ts` names the four paths there. Measured after, with the suite's
+ordinary config: every write refused, and no host file created.
+
+| Path                  | macOS   | Linux                            |
+| --------------------- | ------- | -------------------------------- |
+| `~/.npm/_logs`        | `EPERM` | `EROFS`                          |
+| `~/.claude/debug`     | `EPERM` | `EROFS`                          |
+| `/tmp/claude`         | `EPERM` | `EROFS`                          |
+| `/private/tmp/claude` | `EPERM` | `ENOENT` (no such path on Linux) |
+
+Only those four are denied. The rest of `getDefaultWritePaths()` is
+`/dev/stdout`, `/dev/stderr`, `/dev/null`, `/dev/tty`, `/dev/dtracehelper` and
+`/dev/autofs_nowait` — character devices a process needs to produce output at
+all, holding no user data. Denying them would break every run and buy nothing.
+
+Both spellings of the temp path are denied, because they were measured to
+behave _differently_: before the fix, a macOS write to `/tmp/claude/X` was
+refused while the same host file reached through `/private/tmp/claude/X`
+succeeded. A deny list naming one spelling leaves the other open.
+
+**`/tmp/claude` was the interesting one, and the answer was not simply to deny
+it.** ASRT sets `TMPDIR` to it for the sandboxed process so that "temp-file
+writers land in a path the FS sandbox allows". Denying the path without
+addressing `TMPDIR` would leave `os.tmpdir()` pointing at a location the policy
+refuses — contained, but broken. Two things resolved it:
+
+- **The scratch dir is now authoritative.** `TMPDIR` (and `HOME`) are pinned to
+  the run's own scratch dir, which is the one location `allowWrite` grants, is
+  per-run, and is swept afterwards. That serves ASRT's stated intent properly
+  rather than defeating it.
+- **`minimalEnv` alone could not do it.** ASRT does not hand `TMPDIR` back only
+  in the env object: `wrapWithSandboxArgv` returns an argv of the form
+  `env TMPDIR=… … sandbox-exec -p <profile> /bin/sh -c <cmd>`, so the
+  assignment is applied by `env` at exec time, after any environment the caller
+  composed. Measured: with `TMPDIR: scratch` set after `minimalEnv`'s loop, a
+  run still reported `os.tmpdir() === "/tmp/claude"`. The pin therefore lives in
+  the inner `/bin/sh` preamble, which runs after every one of those layers.
+  `minimalEnv`'s ordering is fixed too, but as the second line of defence.
+
+This half mattered more than the explicit-path writes: it aimed every library
+that writes a temp file out of the sandbox by default, without a script ever
+naming a path. And ASRT's own intent was not being met anyway — measured on
+macOS before the change, `os.tmpdir()` was `/tmp/claude` and `mkdtempSync` under
+it failed with `EPERM`. After: `os.tmpdir()` is the run's scratch dir and the
+same call succeeds. Nothing in ASRT needs `/tmp/claude` for itself — it is a
+command wrapper, its proxy runs on the host outside this policy, and `TMPDIR` is
+the only use of that path anywhere in its shipped JS.
+
+**The read half is not closable at 0.0.74, and stays open.** `denyWrite` maps to
+`denyWithinAllow`, which leaves the path bind-mounted in order to carry the
+write allowance it is denying — read-only rather than absent. Measured on
+Linux/arm64 _after_ the fix: a host-planted canary in `/tmp/claude`,
+`~/.npm/_logs` and `~/.claude/debug` was read back in full from inside a run,
+and `readdir` of each returned the real host contents. This is broader than an
+earlier draft recorded — it is every one of those paths that exists, not
+`~/.npm/_logs` alone. Closing it needs an ASRT release that stops unioning these
+paths in, or a config surface for opting out. It is carried verbatim in
+`SandboxEnforcement.notes` on Linux, so a consumer is told rather than left to
+assume.
+
+**A regression test now holds the write half.** `hostile-scripts.test.ts` gains
+two cases: one writes to all four default write paths and asserts no host file
+exists afterwards; one asserts the run's temp dir is inside its own scratch dir
+and is writable. Both were verified to go red with the fix reverted, on both
+platforms — on macOS all four writes landed on the host, on Linux the three that
+exist there did, and the temp-dir case reported `/tmp/claude`. The write case
+asserts the write half only, and says so in its own comment, because a test that
+must pass cannot assert something still open.
 
 ## 19.8 Measured: the question corpus, end to end
 

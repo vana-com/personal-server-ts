@@ -124,6 +124,57 @@ function realOrSelf(p: string): string {
 }
 
 /**
+ * ASRT's own default write paths, which it grants unconditionally and which
+ * this sandbox has to take back.
+ *
+ * `SandboxManager` builds the write policy as
+ * `allowOnly: [...getDefaultWritePaths(), ...userAllowWrite]` — the defaults
+ * are unioned in regardless of what the caller asked for, and ASRT's source
+ * carries its own warning that they "are intentionally broad for
+ * compatibility but may allow access to files from other processes". Nothing
+ * in this file's config requested them. Measured before this deny list
+ * existed, with the suite's ordinary spec:
+ *
+ * - **macOS**: a sandboxed script wrote `~/.npm/_logs/PROBE-ESCAPE.txt`,
+ *   `~/.claude/debug/PROBE-ESCAPE.txt` and `/private/tmp/claude/PROBE-ESCAPE.txt`,
+ *   and all three appeared on the host holding the script's bytes. Reading
+ *   them back was denied (`EPERM`) — a write-only escape.
+ * - **Linux**: the same writes landed on the host *and* the directories' real
+ *   contents were readable, a host-planted canary included. A read-write
+ *   escape.
+ *
+ * ASRT maps `filesystem.denyWrite` to `denyWithinAllow`, which is applied
+ * *within* `allowOnly` — so naming these here is the one supported way to
+ * subtract from a set we never added to. It closes the write half on both
+ * platforms; see {@link buildEnforcement} for the read half, which 0.0.74
+ * cannot close.
+ *
+ * Only the four data-bearing paths are denied. The rest of
+ * `getDefaultWritePaths()` is `/dev/stdout`, `/dev/stderr`, `/dev/null`,
+ * `/dev/tty`, `/dev/dtracehelper` and `/dev/autofs_nowait` — character
+ * devices a process needs in order to produce output at all, holding no
+ * user data and carrying nothing off the host. Denying those would break
+ * every run and buy nothing.
+ *
+ * Both spellings of the temp paths are emitted. On macOS `/tmp` is a symlink
+ * to `/private/tmp`, and the two spellings were measured to behave
+ * *differently* under ASRT's allow rules — a write to `/tmp/claude/X` was
+ * refused while the same host file reached through `/private/tmp/claude/X`
+ * succeeded. A deny list that names only one spelling therefore leaves the
+ * other open, so every entry is emitted both literally and resolved.
+ */
+function asrtDefaultWritePathDenials(): string[] {
+  const home = homedir();
+  const literal = [
+    "/tmp/claude",
+    "/private/tmp/claude",
+    join(home, ".npm", "_logs"),
+    join(home, ".claude", "debug"),
+  ];
+  return [...new Set([...literal, ...literal.map(realOrSelf)])];
+}
+
+/**
  * The one host binary the Linux sandbox must be able to exec *inside* its own
  * namespace.
  *
@@ -208,17 +259,21 @@ function minimalEnv(
   sandboxEnv: NodeJS.ProcessEnv,
   scratch: string,
 ): NodeJS.ProcessEnv {
-  const out: NodeJS.ProcessEnv = {
-    PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
-    HOME: scratch,
-    TMPDIR: scratch,
-    LANG: "C",
-  };
+  const out: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(sandboxEnv)) {
     if (v === undefined) continue;
     // Only what the sandbox wrapper itself added or rewrote.
     if (process.env[k] !== v) out[k] = v;
   }
+  // Applied *after* the loop, not before it. These four name where the run
+  // lives, and the run's own scratch dir is the answer to all of them, so a
+  // value the wrapper introduced must not overwrite them. ASRT does introduce
+  // one: `TMPDIR=/tmp/claude`. Note this is necessary but *not* sufficient —
+  // see {@link scratchTmpdirPreamble} for the half that actually wins.
+  out.PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
+  out.HOME = scratch;
+  out.TMPDIR = scratch;
+  out.LANG = "C";
   return out;
 }
 
@@ -230,6 +285,45 @@ const RSS_POLL_MS = 50;
 
 function shQuote(s: string): string {
   return `'${s.replaceAll("'", `'\\''`)}'`;
+}
+
+/**
+ * Pin `TMPDIR` (and `HOME`) to the run's own scratch dir, from inside the
+ * sandboxed shell, where it is the last word.
+ *
+ * ASRT's `generateProxyEnvVars` emits `TMPDIR=/tmp/claude` — one of the
+ * default write paths {@link asrtDefaultWritePathDenials} takes back — so
+ * that "temp-file writers land in a path the FS sandbox allows". It does not
+ * hand that back only in the env object: `wrapWithSandboxArgv` builds the
+ * argv as `env TMPDIR=… … /usr/bin/sandbox-exec -p <profile> /bin/sh -c <cmd>`
+ * (`bwrap --setenv` on Linux). The assignment is therefore applied by `env`
+ * at exec time, *after* the environment {@link minimalEnv} composed — which
+ * is why ordering `minimalEnv` correctly is necessary but cannot win on its
+ * own. Measured: with `TMPDIR: scratch` set after that loop, a run still
+ * reported `os.tmpdir() === "/tmp/claude"`.
+ *
+ * The inner `/bin/sh -c` runs after every one of those layers, so an
+ * assignment here is the one that the script observes.
+ *
+ * Why it matters rather than being tidiness: `/tmp/claude` is a shared host
+ * directory. Before this, `os.tmpdir()` inside a run pointed at it, so every
+ * library that writes a temp file was aimed out of the sandbox by default —
+ * the escape's most likely route, reached without a script ever naming a path.
+ * And ASRT's own stated intent was not even being met: measured on macOS
+ * before this change, `mkdtempSync(os.tmpdir())` failed with `EPERM`, so the
+ * "writable temp dir" was already broken while the path stayed live enough to
+ * escape through. Redirecting to the scratch dir serves that intent properly
+ * — it is the one location `allowWrite` grants, it is per-run, and it is swept
+ * afterwards — and is what makes denying `/tmp/claude` safe rather than merely
+ * strict.
+ *
+ * Nothing in ASRT needs `/tmp/claude` for itself: it is a command wrapper, its
+ * proxy runs on the host outside this policy, and `TMPDIR` is the only use of
+ * that path anywhere in its shipped JS.
+ */
+function scratchTmpdirPreamble(scratch: string): string {
+  const q = shQuote(scratch);
+  return `TMPDIR=${q}; HOME=${q}; export TMPDIR HOME`;
 }
 
 /**
@@ -316,15 +410,16 @@ function buildEnforcement(sandboxAvailable: boolean): SandboxEnforcement {
       "Linux confines by namespace, not by kernel permission check: a read-denied directory is replaced with an empty private tmpfs rather than returning EACCES, so operations against it succeed against nothing instead of failing. Measured: the home directory lists only sandbox scaffolding and none of the host's contents; a write outside the scratch dir appears to succeed into that tmpfs and is discarded, with no file ever created on the host; /proc is a fresh namespace-private procfs holding two PIDs and the run's own already-scrubbed environ; and a listening socket binds inside an unshared network namespace that nothing outside can reach. Confinement holds in every one of those cases — but a script observing its own syscalls sees success where macOS returns an error.",
     );
     notes.push(
-      "KNOWN GAP, Linux: the contents of ~/.npm/_logs are readable inside the sandbox. ASRT unconditionally unions its getDefaultWritePaths() into the write allow-list, which on Linux means a bind mount that survives our denyRead of the home directory. Measured: a host-planted file in that directory was read back in full from inside a run. Not closable through the 0.0.74 config — denyWrite makes the bind read-only, not absent.",
+      "KNOWN GAP, Linux: the contents of ASRT's default write paths — ~/.npm/_logs, ~/.claude/debug, /tmp/claude, /private/tmp/claude — are readable inside the sandbox. ASRT unconditionally unions getDefaultWritePaths() into the write allow-list, which on Linux means a bind mount that survives our denyRead of the home directory. Writing to them is now denied (see the all-platforms note), but denyWrite maps to denyWithinAllow, which makes the bind read-only rather than absent: the path stays mounted in order to carry the write allowance it is being denied. So the read half is NOT closable through the 0.0.74 config, and remains open. Measured: a host-planted file in ~/.npm/_logs was read back in full from inside a run. Closing it needs an ASRT release that stops unioning these paths in, or a config surface for opting out of them.",
     );
   }
   if (sandboxAvailable) {
-    // Both platforms. Reported unconditionally because it is a write that
-    // reaches the host filesystem outside the scratch dir, which is exactly
-    // what `filesystemWrite: true` would otherwise be taken to exclude.
+    // Both platforms. Reported unconditionally: the write escape is closed
+    // but the fact that it took an explicit deny to close it — and that the
+    // paths are still mounted — is a property of this dependency a consumer
+    // should be told about, not a detail to drop once it is handled.
     notes.push(
-      "KNOWN GAP, all platforms: a sandboxed script can create files under ASRT's default write paths — ~/.npm/_logs, ~/.claude/debug, /tmp/claude, /private/tmp/claude — and they land on the real host filesystem. ASRT unions these into the write allow-list regardless of our allowWrite, and its own source warns they 'may allow access to files from other processes'. Measured on macOS (write only; reads denied EPERM) and Linux (read and write). Closable by naming those paths in filesystem.denyWrite, which is a security decision not yet taken.",
+      "ASRT unions its own getDefaultWritePaths() — ~/.npm/_logs, ~/.claude/debug, /tmp/claude, /private/tmp/claude — into the write allow-list regardless of our allowWrite, and its own source warns they 'may allow access to files from other processes'. Left alone this is a real escape: measured, a sandboxed script's writes to all four landed on the real host filesystem, on macOS (write only; reads denied EPERM) and on Linux (read and write). We take them back via filesystem.denyWrite, which ASRT applies as denyWithinAllow — verified to refuse the same writes with EPERM on macOS and EROFS on Linux. The scratch dir is the only writable location. TMPDIR is pinned to the scratch dir for the same reason: ASRT otherwise sets it to /tmp/claude, which would send every os.tmpdir() write at a denied path.",
     );
   }
   // The memory caveat is the same on both platforms, and used to be reported
@@ -388,7 +483,11 @@ export function createNodeSandbox(options: NodeSandboxOptions): Sandbox {
           ...(seccompHelper === undefined ? [] : [seccompHelper]),
         ],
         allowWrite: [realOrSelf(spec.writePath)],
-        denyWrite: [],
+        // Takes back the write paths ASRT grants unconditionally — see
+        // {@link asrtDefaultWritePathDenials}. The scratch dir stays the only
+        // writable location, which is what `allowWrite` was always meant to
+        // say.
+        denyWrite: asrtDefaultWritePathDenials(),
       },
       ...(seccompHelper === undefined
         ? {}
@@ -498,7 +597,7 @@ export function createNodeSandbox(options: NodeSandboxOptions): Sandbox {
       }
 
       const nodePath = options.nodePath ?? process.execPath;
-      const inner = `${ulimitPreamble(spec)}; exec ${shQuote(nodePath)} ${shQuote(scriptPath)}`;
+      const inner = `${scratchTmpdirPreamble(scratch)}; ${ulimitPreamble(spec)}; exec ${shQuote(nodePath)} ${shQuote(scriptPath)}`;
 
       const sm = await loadManager();
       const commandId = `query-${started}-${Math.random().toString(36).slice(2)}`;
