@@ -95,6 +95,16 @@ export interface ExecuteOutcome {
  * loudly beats falling back to an unbundled path: without the bundle there is
  * no confined interpreter, and silently running without one is the exact
  * unsoundness this whole arrangement exists to remove.
+ *
+ * Inside a `pkg` binary these are `/snapshot` paths, and that is fine — this
+ * path is only ever `readFileSync`'d by the host, and `buildRunnerProgram`
+ * inlines the *bytes* into the program string that `node-sandbox.ts` writes to
+ * the run's scratch dir. The sandbox therefore only ever sees a real file, and
+ * no snapshot path crosses the boundary. Contrast `./pkg-runtime.js`, which
+ * exists for the paths that genuinely do cross it: the interpreter the OS
+ * layer execs and the seccomp helper it bind-mounts. The one requirement `pkg`
+ * adds here is that `dist/query/runner.js` be listed in the build's assets, or
+ * neither candidate resolves and this throws.
  */
 function defaultRunnerPath(): string {
   const here = dirname(fileURLToPath(import.meta.url));

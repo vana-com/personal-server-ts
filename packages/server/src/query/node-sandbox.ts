@@ -17,6 +17,14 @@ import type {
   SandboxSpec,
   SandboxTermination,
 } from "@opendatalabs/personal-server-ts-core/query";
+import { resolveRootPath } from "../config/paths.js";
+import {
+  isPackagedBinary,
+  materializeFromSnapshot,
+  packagedBinDir,
+  resolveSandboxNodePath,
+  type SandboxNodePath,
+} from "./pkg-runtime.js";
 
 /**
  * ASRT exports `SandboxManager` as a singleton value, not a class, so its
@@ -232,7 +240,7 @@ function isCharacterDevice(p: string): boolean {
  * "the path it execs" the same string by construction rather than by two
  * lookups happening to agree.
  */
-function linuxSeccompHelperPath(): string | undefined {
+function linuxSeccompHelperPath(materializeDir?: string): string | undefined {
   if (process.platform !== "linux") return undefined;
   // Mirrors ASRT's own `getVendorArchitecture()`; it ships no other builds.
   const arch =
@@ -250,7 +258,18 @@ function linuxSeccompHelperPath(): string | undefined {
       arch,
       "apply-seccomp",
     );
-    return existsSync(helper) ? helper : undefined;
+    if (!existsSync(helper)) return undefined;
+    // Under `pkg` the vendored helper resolves onto the virtual snapshot
+    // filesystem. This process can read it, but bwrap cannot bind a snapshot
+    // path and the kernel cannot exec one — and both are exactly what happens
+    // to this string. Copy it out to `<root>/bin/` first; off `pkg` the path
+    // is already real and this returns it untouched.
+    return materializeDir === undefined
+      ? helper
+      : materializeFromSnapshot(helper, materializeDir, {
+          version: `${SANDBOX_RUNTIME_VERSION}_${arch}`,
+          mode: 0o755,
+        });
   } catch {
     // Nothing to re-allow. ASRT falls back to its own lookup and, if that
     // also fails, reports seccomp as unavailable through `checkDependencies`.
@@ -469,6 +488,14 @@ export interface NodeSandboxOptions {
   dataRoot: string;
   /** Node binary used to run scripts. Defaults to the current one. */
   nodePath?: string;
+  /**
+   * The server's data root, only consulted inside a `pkg` binary — see
+   * `./pkg-runtime.js`. That build has no usable `process.execPath` and no
+   * bindable path to the vendored seccomp helper, so both are looked up
+   * under `<root>/bin/`, the layout `../tunnel/binary.ts` already installs
+   * frpc into. Defaults to the configured root.
+   */
+  storageRoot?: string;
 }
 
 export function createNodeSandbox(options: NodeSandboxOptions): Sandbox {
@@ -480,6 +507,31 @@ export function createNodeSandbox(options: NodeSandboxOptions): Sandbox {
    * pays for it.
    */
   let defaultWritePaths: string[] | undefined;
+
+  /**
+   * The data root, resolved only inside a `pkg` binary. Off `pkg` it stays
+   * `undefined`, so nothing is materialised and no path is consulted that was
+   * not consulted before.
+   */
+  const packagedRoot =
+    options.storageRoot ??
+    (isPackagedBinary()
+      ? resolveRootPath(process.env.PERSONAL_SERVER_ROOT_PATH)
+      : undefined);
+
+  /**
+   * The interpreter the OS layer execs, resolved once. Off `pkg` this is
+   * `process.execPath` exactly as before; inside one it is a real Node the
+   * embedder supplied, or a refusal to run at all.
+   */
+  let interpreter: SandboxNodePath | undefined;
+  const resolveInterpreter = (): SandboxNodePath => {
+    interpreter ??= resolveSandboxNodePath({
+      ...(options.nodePath === undefined ? {} : { nodePath: options.nodePath }),
+      ...(packagedRoot === undefined ? {} : { storageRoot: packagedRoot }),
+    });
+    return interpreter;
+  };
 
   async function loadManager() {
     if (manager) return manager;
@@ -497,7 +549,19 @@ export function createNodeSandbox(options: NodeSandboxOptions): Sandbox {
     // Deliberately *not* passed through `realOrSelf` — Linux matches the
     // literal path against the deny prefixes and binds that same string, and
     // it is the literal path ASRT execs.
-    const seccompHelper = linuxSeccompHelperPath();
+    const seccompHelper = linuxSeccompHelperPath(
+      packagedRoot === undefined ? undefined : packagedBinDir(packagedRoot),
+    );
+    // Same shape as the seccomp helper: a host-side executable the sandbox
+    // has to be able to read, named as one path rather than by opening a
+    // region. Only present when the interpreter is *not* the one already
+    // running — a `<root>/bin/node` sits under the home directory that
+    // `broadDenyRead` closes, so without this the sandbox cannot exec it.
+    // Off `pkg` the resolved path is `process.execPath` and this is empty,
+    // leaving the emitted policy exactly as it was.
+    const resolved = resolveInterpreter();
+    const interpreterAllow =
+      resolved.ok && resolved.bind ? [realOrSelf(resolved.path)] : [];
     await sm.initialize({
       filesystem: {
         denyRead: broadDenyRead(),
@@ -506,6 +570,7 @@ export function createNodeSandbox(options: NodeSandboxOptions): Sandbox {
         allowRead: [
           ...[...spec.readPaths, spec.writePath].map(realOrSelf),
           ...(seccompHelper === undefined ? [] : [seccompHelper]),
+          ...interpreterAllow,
         ],
         allowWrite: [realOrSelf(spec.writePath)],
         // Takes back the write paths ASRT grants unconditionally — see
@@ -539,6 +604,13 @@ export function createNodeSandbox(options: NodeSandboxOptions): Sandbox {
           available: false as const,
           reason: `@anthropic-ai/sandbox-runtime@${SANDBOX_RUNTIME_VERSION} does not support ${process.platform}`,
         };
+      }
+      // Reported here as well as refused at `run`, so a caller that asks
+      // before running learns the sandbox is unusable rather than discovering
+      // it one question later.
+      const nodePath = resolveInterpreter();
+      if (!nodePath.ok) {
+        return { available: false as const, reason: nodePath.reason };
       }
       const deps = sm.checkDependencies();
       if (deps && "ok" in deps && deps.ok === false) {
@@ -588,6 +660,24 @@ export function createNodeSandbox(options: NodeSandboxOptions): Sandbox {
       const scriptPath = join(scratch, "script.js");
       writeFileSync(scriptPath, script, { mode: 0o400 });
 
+      // Ahead of `ensureInitialized`, because there is no point establishing a
+      // policy for a program that has nothing to run it.
+      const nodePath = resolveInterpreter();
+      if (!nodePath.ok) {
+        rmSync(scratch, { recursive: true, force: true });
+        return {
+          stdout: "",
+          stderr: `refusing to run: no Node interpreter for the sandbox — ${nodePath.reason}`,
+          exitCode: -1,
+          timedOut: false,
+          truncated: false,
+          durationMs: Date.now() - started,
+          termination: "sandboxUnavailable",
+          enforcement: buildEnforcement(false),
+          violations: [],
+        };
+      }
+
       let sandboxAvailable = false;
       try {
         sandboxAvailable = await ensureInitialized(spec);
@@ -621,8 +711,7 @@ export function createNodeSandbox(options: NodeSandboxOptions): Sandbox {
         };
       }
 
-      const nodePath = options.nodePath ?? process.execPath;
-      const inner = `${scratchTmpdirPreamble(scratch)}; ${ulimitPreamble(spec)}; exec ${shQuote(nodePath)} ${shQuote(scriptPath)}`;
+      const inner = `${scratchTmpdirPreamble(scratch)}; ${ulimitPreamble(spec)}; exec ${shQuote(nodePath.path)} ${shQuote(scriptPath)}`;
 
       const sm = await loadManager();
       const commandId = `query-${started}-${Math.random().toString(36).slice(2)}`;
