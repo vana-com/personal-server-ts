@@ -619,7 +619,7 @@ Registration body:
   "derivedScope": "coach.weekly",
   "sourceScopes": ["chatgpt.conversations", "oura.sleep"],
   "question": "How did my sleep relate to my mood this week?",
-  "model": "z-ai/glm-5.2",
+  "model": "z-ai/glm-5.3-flash",
   "recompute": "snapshot"
 }
 ```
@@ -830,7 +830,7 @@ in registration order and `writtenAt` = the compute time. The record body:
   "question": "How did my sleep relate to my mood this week?",
   "answer": "...",
   "evidence": "...",
-  "model": "z-ai/glm-5.2",
+  "model": "z-ai/glm-5.3-flash",
   "computedAt": "2026-08-31T09:12:44.000Z",
   "sources": [
     { "scope": "chatgpt.conversations", "version": 12, "collectedAt": "..." },
@@ -862,10 +862,19 @@ The provider is an OpenAI-compatible chat completions client over `fetch`
 | Key                             | Default                          | Meaning                                                              |
 | ------------------------------- | -------------------------------- | -------------------------------------------------------------------- |
 | `inference.baseUrl`             | `https://inference.phala.com/v1` | chat completions base; set to the Vana inference relay in production |
-| `inference.model`               | `z-ai/glm-5.2`                   | default model                                                        |
+| `inference.model`               | `z-ai/glm-5.3-flash`             | default model                                                        |
 | `inference.e2ee`                | `true`                           | end to end encryption of prompt and answer to the Phala gateway      |
 | `inference.maxSourceItems`      | `50`                             | newest items kept per source scope                                   |
 | `inference.recomputeDebounceMs` | `5000`                           | quiet period after a source change                                   |
+
+Both persistence paths write the parsed config back with every default
+materialized (`config.json` on the Node server, the stored config record in
+PS-Lite), so an install pins the model it first ran and a default bump would
+otherwise reach fresh installs only. On load, a persisted `inference.model`
+that is a _superseded_ default (the list in
+`SUPERSEDED_INFERENCE_MODELS`) is moved forward to the current default and
+persisted; any other value is left alone, because it can only have come from
+an operator or a host that chose it.
 
 Environment overrides (Node server only): `INFERENCE_BASE_URL`,
 `INFERENCE_MODEL`, `INFERENCE_E2EE` (`false` turns encryption off), and

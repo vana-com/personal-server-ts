@@ -59,13 +59,18 @@ import {
   IngestPersistedError,
 } from "../contracts/index.js";
 import type {
+  DataFileEnvelope,
   DataPortabilityGatewayConfig,
   GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../signing/index.js";
-import type { WriterAttribution } from "../write/attribution.js";
+import {
+  WRITER_ATTRIBUTION_KEY,
+  type WriterAttribution,
+} from "../write/attribution.js";
 import {
   extractLineageField,
+  LINEAGE_KEY,
   prepareLineage,
   type StoredLineage,
 } from "../lineage/lineage.js";
@@ -915,6 +920,75 @@ function resolveLineageGrantView(
   return { grantId };
 }
 
+/**
+ * True when a read auth result entitles the caller to the owner's view of a
+ * record — the same convention as resolveLineageGrantView: no result, or the
+ * "owner" / "policy-bypass" sentinels. Everything else is a grantee.
+ */
+export function isOwnerView(
+  authResult: PersonalServerReadAuthResult | void,
+): boolean {
+  return (
+    authResult === undefined ||
+    authResult.grantId === "owner" ||
+    authResult.grantId === "policy-bypass"
+  );
+}
+
+/**
+ * The envelope view a grantee read is entitled to. The server-stamped
+ * `$writtenBy` (writing builder's address, grantId, signature) and
+ * `$lineage` (the owner's source data-point ids, dictionary-attackable back
+ * to scopes since dataPointId = keccak(owner, scope)) never leave the server
+ * on a grantee read: the owner reads them from storage, and grantees get the
+ * graph only through the grant-redacted lineage endpoint. When `$lineage` is
+ * present, the caller-supplied lineage field it mirrors (top-level `lineage`
+ * on a JSON record, `metadata.lineage` on a binary one) carries the same ids
+ * and is dropped with it; without the stamp such a field is ordinary user
+ * data and stays. Redaction is at serve time only — the stored envelope, its
+ * dataHash commitment, and the owner's view are unchanged.
+ */
+function redactEnvelopeForGrantee(
+  envelope: DataFileEnvelope,
+): DataFileEnvelope {
+  const {
+    [WRITER_ATTRIBUTION_KEY]: attribution,
+    [LINEAGE_KEY]: storedLineage,
+    ...rest
+  } = envelope.data;
+  if (attribution === undefined && storedLineage === undefined) {
+    return envelope;
+  }
+  let data: Record<string, unknown> = rest;
+  if (storedLineage !== undefined) {
+    if (isBinaryEnvelope(envelope)) {
+      const metadata = data["metadata"];
+      if (
+        metadata !== null &&
+        typeof metadata === "object" &&
+        !Array.isArray(metadata)
+      ) {
+        const { lineage: _consumed, ...metadataRest } = metadata as Record<
+          string,
+          unknown
+        >;
+        if (Object.keys(metadataRest).length === 0) {
+          // The lineage was the whole metadata object; leaving `{}` behind
+          // would still disclose that a metadata object existed.
+          const { metadata: _emptied, ...dataRest } = data;
+          data = dataRest;
+        } else {
+          data = { ...data, metadata: metadataRest };
+        }
+      }
+    } else {
+      const { lineage: _consumed, ...dataRest } = data;
+      data = dataRest;
+    }
+  }
+  return { ...envelope, data };
+}
+
 export async function handlePersonalServerDataRequest(
   request: Request,
   deps: PersonalServerDataApiDeps,
@@ -1042,6 +1116,21 @@ export async function handlePersonalServerDataRequest(
           body: result.body,
         });
       }
+      // A lineage view discloses the derivation graph, so a served view is
+      // logged like a data read (refusals above return without an entry).
+      await deps.accessLogWriter.write({
+        logId: deps.createLogId?.() ?? crypto.randomUUID(),
+        grantId: authResult?.grantId ?? "owner",
+        builder: authResult?.builder ?? "unknown",
+        action: "lineage",
+        scope: scopeResult.scope,
+        timestamp: (deps.now ?? (() => new Date()))().toISOString(),
+        ipAddress:
+          request.headers.get("x-forwarded-for") ??
+          request.headers.get("x-real-ip") ??
+          "unknown",
+        userAgent: request.headers.get("user-agent") ?? "unknown",
+      });
       return jsonResponse({ data: result.data, proof: result.proof });
     }
 
@@ -1190,6 +1279,10 @@ export async function handlePersonalServerDataRequest(
         return contractErrorResponse(result);
       }
 
+      const servedEnvelope = isOwnerView(authResult)
+        ? result.envelope
+        : redactEnvelopeForGrantee(result.envelope);
+
       const logId = deps.createLogId?.() ?? crypto.randomUUID();
       const timestamp = (deps.now ?? (() => new Date()))().toISOString();
       const ipAddress =
@@ -1237,7 +1330,7 @@ export async function handlePersonalServerDataRequest(
       // original media type, so a builder can download the file directly. The
       // X-PAYMENT-RESPONSE header (if any) rides along on the raw response too.
       if (wantsRawContent) {
-        if (!isBinaryEnvelope(result.envelope)) {
+        if (!isBinaryEnvelope(servedEnvelope)) {
           return jsonResponse(
             {
               error: "NOT_BINARY_SCOPE",
@@ -1246,7 +1339,7 @@ export async function handlePersonalServerDataRequest(
             { status: 400, headers },
           );
         }
-        const decoded = decodeBinaryEnvelope(result.envelope);
+        const decoded = decodeBinaryEnvelope(servedEnvelope);
         headers["Content-Type"] = decoded.mimeType;
         headers["Content-Length"] = String(decoded.bytes.length);
         if (decoded.filename) {
@@ -1264,7 +1357,7 @@ export async function handlePersonalServerDataRequest(
         });
         return response;
       }
-      const response = jsonResponse(result.envelope, { headers });
+      const response = jsonResponse(servedEnvelope, { headers });
       reportReadFulfillment();
       return response;
     }

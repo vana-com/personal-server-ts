@@ -108,9 +108,15 @@ export function trimSourceData(
     total = 0;
     if (Array.isArray(data)) return trimArray(data, limit);
     if (isRecord(data)) {
+      // A stamped derivative also stores the caller lineage field the server
+      // consumed; it carries the same source data-point ids as `$lineage`
+      // and must not reach the prompt, or a question could echo them into
+      // an answer a grantee reads.
+      const stamped = "$lineage" in data;
       const out: Record<string, unknown> = {};
       for (const [key, value] of Object.entries(data)) {
         if (RESERVED_KEYS.has(key)) continue;
+        if (stamped && key === "lineage") continue;
         out[key] = Array.isArray(value) ? trimArray(value, limit) : value;
       }
       return out;

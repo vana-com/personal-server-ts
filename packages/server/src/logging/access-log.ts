@@ -1,20 +1,11 @@
 import { mkdir, appendFile } from "node:fs/promises";
 import { join } from "node:path";
+import type {
+  AccessLogEntry,
+  AccessLogWriter,
+} from "@opendatalabs/personal-server-ts-core/logging/access-log";
 
-export interface AccessLogEntry {
-  logId: string;
-  grantId: string;
-  builder: string;
-  action: "read" | "write" | "delete";
-  scope: string;
-  timestamp: string;
-  ipAddress: string;
-  userAgent: string;
-}
-
-export interface AccessLogWriter {
-  write(entry: AccessLogEntry): Promise<void>;
-}
+export type { AccessLogEntry, AccessLogWriter };
 
 function formatDateForFilename(isoTimestamp: string): string {
   const date = new Date(isoTimestamp);

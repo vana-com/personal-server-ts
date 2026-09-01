@@ -2,7 +2,16 @@ import { describe, it, expect } from "vitest";
 import { join } from "node:path";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { ServerConfigSchema } from "./server-config.js";
+import {
+  DEFAULTS,
+  ServerConfigSchema,
+  SUPERSEDED_INFERENCE_MODELS,
+  withCurrentInferenceModel,
+} from "./server-config.js";
+import {
+  DEFAULT_INFERENCE_BASE_URL,
+  DEFAULT_INFERENCE_MODEL,
+} from "../derivatives/inference.js";
 import { loadConfig, saveConfig } from "../../../server/src/config/loader.js";
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
@@ -45,6 +54,64 @@ describe("ServerConfigSchema — sync fields", () => {
     });
 
     expect(config.storage.config.vana?.apiUrl).toBe("https://storage.vana.org");
+  });
+});
+
+describe("withCurrentInferenceModel", () => {
+  it("moves a superseded default forward", () => {
+    const stored = ServerConfigSchema.parse({
+      inference: { model: SUPERSEDED_INFERENCE_MODELS[0] },
+    });
+
+    const next = withCurrentInferenceModel(stored);
+
+    expect(next.inference.model).toBe(DEFAULTS.inference.model);
+    expect(next).not.toBe(stored);
+  });
+
+  it("carries every other field through untouched", () => {
+    const stored = ServerConfigSchema.parse({
+      server: { origin: "https://lite.example" },
+      inference: {
+        model: SUPERSEDED_INFERENCE_MODELS[0],
+        maxSourceItems: 7,
+        e2ee: false,
+      },
+      sync: { lastProcessedTimestamp: "2026-08-31T09:12:44.000Z" },
+    });
+
+    const next = withCurrentInferenceModel(stored);
+
+    expect(next.inference.maxSourceItems).toBe(7);
+    expect(next.inference.e2ee).toBe(false);
+    expect(next.server.origin).toBe("https://lite.example");
+    expect(next.sync.lastProcessedTimestamp).toBe("2026-08-31T09:12:44.000Z");
+    // The input is not mutated: the caller decides whether to persist.
+    expect(stored.inference.model).toBe(SUPERSEDED_INFERENCE_MODELS[0]);
+  });
+
+  it("returns the same object for the current default and for a chosen model", () => {
+    const current = ServerConfigSchema.parse({});
+    expect(withCurrentInferenceModel(current)).toBe(current);
+
+    const chosen = ServerConfigSchema.parse({
+      inference: { model: "openai/gpt-4o-mini" },
+    });
+    expect(withCurrentInferenceModel(chosen)).toBe(chosen);
+    expect(withCurrentInferenceModel(chosen).inference.model).toBe(
+      "openai/gpt-4o-mini",
+    );
+  });
+
+  it("never supersedes the current default", () => {
+    expect(SUPERSEDED_INFERENCE_MODELS).not.toContain(DEFAULTS.inference.model);
+  });
+
+  it("keeps the schema default and the provider default in step", () => {
+    // Two definitions, one choice: a config without an `inference.model` and a
+    // provider built without one must reach the same model.
+    expect(DEFAULTS.inference.model).toBe(DEFAULT_INFERENCE_MODEL);
+    expect(DEFAULTS.inference.baseUrl).toBe(DEFAULT_INFERENCE_BASE_URL);
   });
 });
 
