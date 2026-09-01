@@ -9,5 +9,20 @@
     "sourceMap": true
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["src/**/*.test.ts"]
+  // The eval harness is test scaffolding, not part of the published surface:
+  // it is excluded from the build and has no `exports` entry. It is still
+  // typechecked by `tsconfig.typecheck-tests.json` and still run by vitest;
+  // `scripts/` reach it by relative path into `src/`.
+  // No `files` override. It used to force-emit `evals/types.ts`,
+  // `evals/readings.ts` and `evals/fixtures/profiles.ts` past this `exclude`,
+  // because `query/agent/answerer.ts` type-imported `EvalAnswerer` and the
+  // published `./query/agent` types would otherwise dangle. That adapter has
+  // moved to `query/evals/agent-answerer.ts` — it never had a product
+  // consumer — so nothing product code reaches imports `evals/` any more and
+  // the exclude can do its whole job.
+  // `src/test-utils/**` is the same story: wallet, storage and gateway
+  // fixtures that only `*.test.ts` and `scripts/e2e-*.ts` use. It had an
+  // `exports` entry, so 20 emitted files shipped in the tarball; nothing in
+  // product code imports it, so there is no type closure to pin.
+  "exclude": ["src/**/*.test.ts", "src/query/evals/**", "src/test-utils/**"]
 }

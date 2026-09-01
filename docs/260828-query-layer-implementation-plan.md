@@ -1,0 +1,822 @@
+# Query layer: implementation plan
+
+Companion to `docs/260828-query-layer-design.md` (rationale, evidence,
+measurements). This document is the build order. It assumes no prior context
+beyond the repo.
+
+## 0. What we are building, in one paragraph
+
+We are replacing the Personal Server's current "newest 50 items, 200k chars,
+one prompt" answering path with a **bounded code-writing agent that runs inside
+a two-layer sandbox over the user's granted scopes**: the agent receives a
+question, reads short per-source prose describing each scope's shape and its
+implicit rules, writes a script against a capability-confined tool API, runs it
+against the raw files with OS-enforced read scoping and zero network egress,
+and returns an answer carrying citations and coverage metadata. Almost nothing
+is precomputed — measured on a 222MB, ten-source corpus, every non-semantic
+question (averages, joins, groupings, exhaustive scans of all 95MB of prose)
+answers in 2–240ms directly off raw files, so the only artifacts we build ahead
+of time are (a) **T2 source profiles**, the hand-written prose that stops an
+agent silently mis-parsing naps or regenerated chat branches, and (b) **verified
+scripts**, persisted as SKILL.md skills so a repeated question shape replays
+deterministically instead of being regenerated; anything else is materialized
+only when it is _expensive per query and reused across queries_ (whole-corpus
+LLM classification at $5–16/pass) or when it must exist as a durable record for
+grant, lineage or payment reasons, in which case it is written as an ordinary
+**derivative with `$lineage`** and invalidated by the scheduler that already
+ships. Against the original question corpus this covers the exact-aggregation
+class (SQL-shaped code, deterministic arithmetic, stated denominators), the
+exhaustive/absence class (a total scan that _knows_ it was total and returns the
+count — the completeness guarantee no retrieval system could give), the
+relational/join class (entity aliasing then joining), and the introspection
+class (grants and access logs, never content); the representative-synthesis and
+latent-inference classes are handled by the same loop calling the model as a
+function over an exhaustively enumerated set, materializing that pass as a
+derivative on second use.
+
+## 1. Ground rules
+
+- **Everything is a derivative.** Answers, scripts and any materialized
+  intermediate are written through the existing write path with `$lineage`
+  pointing at source data point ids. See `docs/derivative-data-api.md`.
+- **Grants bind early and at the OS.** A consumer's grant determines which files
+  the sandbox can read and which tools are registered. Never a post-filter.
+- **The Personal Server authors the code** (design §16.5). The consumer supplies
+  a question; the PS generates, runs, caches and attributes. This keeps grant
+  enforcement, payment metering and access logging on our side of the boundary.
+- **Determinism where possible.** Arithmetic happens in generated code, never in
+  model prose. A cached script replays exactly.
+- **Honest failure.** "I scanned X and found nothing" is a first-class result.
+  Every tool returns coverage metadata.
+
+## 2. Phases
+
+Phases 1–3 are gates: they produce numbers that decide phases 5–7. Do not skip
+them, and do not build the materialization layer before phase 7 says to.
+
+---
+
+### Phase 1 — Graded question set (gate)
+
+Nothing downstream is decidable without this.
+
+**Build:** `packages/core/src/query/evals/` with a fixture corpus and a runner.
+
+- Port the generator from the design work:
+  `scratchpad/gen.js` + `gen2.js` produce a 222MB, 13-file, ~10-source corpus
+  (Oura with naps, 228k Spotify streams with podcast rows, 10.4k ChatGPT
+  conversations with regenerated sibling branches, Slack, email, notes, bank,
+  calendar, browser history). Re-implement as a seeded, deterministic TS
+  fixture generator so runs are reproducible; commit the generator, not the
+  corpus.
+- Encode the 18 questions from design §3 as cases:
+
+```ts
+interface QueryEvalCase {
+  id: string; // "Q1"
+  question: string;
+  class:
+    | "aggregation"
+    | "exhaustive"
+    | "synthesis"
+    | "inference"
+    | "relational"
+    | "introspection";
+  scopes: string[]; // scopes a consumer must hold to ask it
+  expect:
+    | {
+        kind: "numeric";
+        value: number;
+        tolerance: number;
+        denominator?: number;
+      }
+    | { kind: "set"; contains: string[]; excludes?: string[] }
+    | { kind: "absence"; mustReportCoverage: true }
+    | { kind: "judged"; rubric: string };
+  mustCite: boolean;
+  mustReportCoverage: boolean;
+}
+```
+
+- Include the two measured trap cases explicitly, because they are the
+  regression tests for T2:
+  - **Q1 sleep average** — correct 6.48h (main sleep only) vs 5.81h (naps
+    included): an 11.5% error.
+  - **ChatGPT message count** — correct 119,758 via `current_node` walk vs
+    137,736 by naive `mapping.values()` flatten: +15.0% phantom messages.
+
+**Done when:** `npm run eval` prints per-case pass/fail, per-class rollups,
+wall-clock and token cost, against a pluggable answerer interface.
+
+**DONE 2026-08-28.** `npm run eval` runs the seeded corpus (default `small`,
+~9MB, ~90ms; `--profile full` for ~277MB) and grades 18 cases: **9 pass with
+hard expected values, 9 skip as judged cases** pending a judge. `--answerer
+null` is the harness's own control and fails all 9 gradeable cases with
+specific diagnostics — including the coverage-honesty check from the prompt
+contract §1 ("coverage.complete is false but the answer text does not say
+so"). Exit code is 1 on any failure.
+
+Corpus is **21 files / 15 scopes**, not the 13 files this plan assumed (the old
+generators actually produced 16). Seed is `20260828`.
+
+**Q12 could not be encoded** — it reads the server's own grant/access ledger,
+which the fixture does not model. It needs `vana.introspect()` and a
+grant-ledger fixture; recorded as a gap, not silently passed. **Q13**'s
+forward-looking half is unexercised (no future calendar data) and **Q18** uses
+`total_calories` as an intake proxy because the corpus has no nutrition log.
+Both are honest limitations of the fixture, not of the design.
+
+The `QueryEvalCase` interface above gained four fields, all flagged by the
+implementer: `referenceFacts` (a rubric is not checkable without ground truth),
+`expectedCoverage` (the `{kind:"absence"}` shape cannot express exact
+readable/unreadable counts), `requiresJudge`, and `notes`.
+
+---
+
+### Phase 2 — Determinism measurement (gate)
+
+The number nobody in the literature has, and it decides how much we materialize.
+
+**Build:** an eval mode that runs each aggregation case **N=10** times through a
+code-writing answerer and reports variance.
+
+**Measure:** identical-answer rate, numeric spread, and whether the _generated
+script_ differs run to run even when the answer matches.
+
+**Decides:**
+
+- Low variance → cached scripts are an optimization; regeneration is acceptable.
+- High variance → script caching (phase 6) becomes mandatory for every
+  numeric class, and we materialize more aggressively in phase 7.
+
+**MEASURED 2026-08-28 — full tables in design §15.3.** Harness:
+`scripts/query-determinism.ts`, `--repeat N` (default 10), offline by default,
+`--live` to spend. "Identical" is reported two ways — exact match on `value`
+and match within tolerance — because they come apart: a model that rounds
+inconsistently scores badly on the first and perfectly on the second, and only
+the second is correctness.
+
+**Headline: script variance is total, and it is not the sampler.** 43/43
+distinct scripts unpinned; **60/60 distinct at `temperature: 0`**, raw and after
+normalizing whitespace and comments. The offline control was 1/10 distinct with
+sd 0, so the harness measures the model rather than itself. Value determinism
+turned out to be a property of the _question_: Q11 identical 9/9, Q1 outside
+tolerance 3 of 9. Coverage never stabilised — Q11 scanned 14k–34k records for
+one question — and `complete` was false in **every one of 121 runs**, so that
+flag currently carries no information.
+
+**The "high variance → caching mandatory" branch is met, on grounds no sampler
+configuration can undo.** Two things qualify it, and neither is optional:
+
+1. **Q14 returned the same wrong number every run** — 550824 against 7727.24,
+   because no profile told it to apply FX. Caching a script that was never
+   eval-verified freezes an error forever, deterministically. Phase 6b's clause
+   "ran successfully _and_ passed its eval case" is the only thing standing
+   between script caching and a permanent silent error; it is load-bearing, not
+   incidental.
+2. **Q1's instability is set resolution, not arithmetic.** "Last month" was
+   read as trailing-30, calendar-December and trailing-31 across runs — three
+   defensible readings. So a cached script freezes an _interpretation_. The
+   cached artifact must therefore persist the resolution it chose, not just its
+   code; prompt rule 5 already makes the model state that resolution.
+
+Follow-ups from this measurement, both since done: the **bank/currency profile**
+(and six more — ten profiles now), and the **`fx.rates` corpus scope**, added
+after the profile work showed Q14 was unpassable for a reason that was not the
+model's fault — the corpus held no exchange rate anywhere and the sandbox has
+zero network egress, so only the grader knew the rate and only the exact
+constant `149.5` passed. A **`dogfood` fixture profile** (18.8MB, 19 files, 18
+scopes) now carries real topical prose in place of the 40-word filler, giving
+knowable ground truth to the seven questions design §18.5 admitted were
+unmeasurable in substance.
+
+---
+
+### Phase 3 — Relay capability check (gate, small)
+
+Determines the harness (design §19.4). **DONE 2026-08-28 — answered from
+source, without calling the relay.**
+
+As originally written this phase asked the wrong question. It said "check
+whether `inference.baseUrl` (default `https://inference.phala.com/v1`)
+implements the Responses API" — but in a real deployment `inference.baseUrl` is
+`<gateway>/v1/inference`, and **the two hops have opposite answers**:
+
+| Hop                                                 | Responses API?                                                                                                                                                                              |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Our `data-gateway`** (what the PS actually calls) | **No.** Exactly three inference routes: `POST /v1/inference/chat/completions` plus two attestation reads. No Responses route on `main` or `dev`, none in flight.                            |
+| **Phala upstream** (what the gateway forwards to)   | **Yes.** `.route("/v1/responses", post(responses))`, create-only opaque passthrough; the docs' example uses `z-ai/glm-5.2`. Support is per-upstream and per-model, not a gateway guarantee. |
+
+**And it does not matter, because E2EE cannot travel on Responses at all.**
+Phala returns a hard `400 e2ee_unsupported_endpoint`: `spec/e2ee-v2.md` §5
+defines encryptable field paths only for the `messages[]`/`choices[]` shape and
+mandates rejection for any endpoint it does not cover. Our own implementation
+matches that surface exactly — `phala.ts` encrypts `messages.{i}.content`,
+`inference.ts::readContent` reads `choices.{i}.message.content`, and `aad.ts`
+binds the field path into the AAD, so a Responses body gives the scheme nothing
+to name.
+
+So **"Responses supported → Codex viable" is a false implication.** Reaching
+Codex would require building and deploying a new signed gateway route, _and_
+setting `inference.e2ee = false`, _and_ accepting that Codex is a subprocess
+wrapper that cannot run in `packages/lite` at all (two harnesses), _and_ still
+building phase 4b, since Codex sandboxes the process but does not make
+out-of-grant scopes unnameable.
+
+**Phase 4 stands as written.** Revisit only if Phala ships an E2EE v3 that
+defines Responses field paths. The residual decision — whether giving up E2EE
+is ever worth Codex's sandbox — is a human call, not an agent's.
+
+Tool-calling on the relay is confirmed supported on chat completions
+(`tools` / `tool_choice`), recorded as a capability only: phase 5's
+code-as-content decision means we do not use it while E2EE is on.
+
+A probe script exists to confirm the gateway result live. It is deliberately
+**unsigned**: the gateway is Vercel with an explicit rewrite allowlist and no
+catch-all, so an absent route is answered 404 by the platform before any
+handler runs, while a present route reaches the handler and rejects an unsigned
+request with our own JSON error shape. That difference is the whole signal, it
+triggers no inference, and it costs nothing.
+
+---
+
+### Phase 4 — Sandbox (two layers)
+
+No harness we surveyed ships this; it is ours regardless. Both layers are
+required — see design §19.7.
+
+**4a. OS enforcement.** **Layering matters here:** `packages/core` is imported by
+`packages/lite` and must stay browser-safe, so it may not import
+`sandbox-runtime` or any Node built-in. Follow the existing ports pattern
+(`packages/core/src/ports/index.ts`):
+
+- `packages/core/src/query/ports.ts` — declare `CodeExecutionPort` (the
+  `Sandbox` interface below), pure types only.
+- `packages/server/src/query/node-sandbox.ts` — the Node implementation
+  (`sandbox-runtime` wrapping a subprocess).
+- `packages/lite/src/query-sandbox.ts` — the browser implementation (blob worker
+  under CSP, §4.1).
+
+Add a `./query` subpath to `packages/core/package.json` `exports`, matching the
+existing convention.
+
+```ts
+interface SandboxSpec {
+  readPaths: string[]; // absolute, exactly the granted scope files
+  writePath: string; // one scratch dir, discarded after the run
+  denyNetwork: true; // non-negotiable
+  cpuMs: number; // default 30_000
+  memoryMb: number; // default 512
+  wallClockMs: number; // default 60_000
+  maxOutputBytes: number; // default 1_000_000
+}
+interface SandboxResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  timedOut: boolean;
+  truncated: boolean;
+  durationMs: number;
+}
+export interface Sandbox {
+  run(script: string, spec: SandboxSpec): Promise<SandboxResult>;
+}
+```
+
+Default implementation: `@anthropic-ai/sandbox-runtime` (Apache-2.0; Seatbelt on
+macOS, bubblewrap+seccomp on Linux, restricted user on Windows) wrapping a Node
+subprocess. **Pin the version** — it is a Beta Research Preview under
+`anthropic-experimental`. **Verify on day one whether it enforces CPU/memory
+quotas or only access control**; if only access control, add `rlimit`s at spawn.
+
+Fallback if that fails: Deno subprocess with `--allow-read=<paths>`
+`--deny-net`, accepting the extra runtime dependency.
+
+PS-Lite: `quickjs-emscripten` (MIT, WASM, real memory and interrupt limits) —
+no native modules, reduced capability, and it must _say_ it is reduced.
+
+**Acceptance:** a test suite of hostile scripts — read outside `readPaths`,
+open a socket, resolve DNS, fork-bomb, allocate 4GB, spin forever, write outside
+the scratch dir, symlink escape. All must fail closed. This suite is the
+security contract; treat a new bypass as a P0.
+
+**4b. Capability confinement.** `packages/core/src/query/tools/`
+
+The generated code calls a registered tool API and nothing else — the
+`codemode` pattern (design §19.6). Tools are registered **per request from the
+consumer's grant**, so out-of-scope data is not merely denied, it is unnameable.
+
+```ts
+interface QueryToolContext {
+  grantedScopes: string[];
+  resolveScopePath(scope: string): string; // throws if not granted
+  budget: { toolCalls: number; outputBytes: number };
+}
+```
+
+Minimum tool set: `listScopes()`, `readScope(scope, opts)`,
+`searchScopes(query, scopes)` (reuse `packages/core/src/mcp/search`, do not
+duplicate it — PR #231's mistake), `recordCitation(...)`, `reportCoverage(...)`.
+
+**BUILT 2026-08-28, and it is stronger than "registered tools".** The tool set
+shipped is the prompt-contract §3 `vana.*` API, and the confinement is a real
+acorn-parsed tree-walking evaluator, not a registry over native execution — see
+the corrected §1 of `260828-query-layer-prompt.md` for why native execution in
+the subprocess was unsound. Verified by phase 4b's own suite plus 22
+independent orchestrator escape attempts committed at
+`packages/core/src/query/tools/orchestrator-escape.test.ts` (Reflect, a Proxy
+get trap, an error-stack constructor walk, the Symbol registry, async and
+generator function constructors, and a sloppy-mode `this` alias to
+`globalThis`) — all refused.
+
+Boundary: `scopes`, `readAll`, `read`, `stream`, `note` and `result` run
+in-process inside the confined evaluator; `search`, `classify` and `introspect`
+are bridged to host authority and are called O(1)–O(few) times, so the round
+trip is irrelevant.
+
+**A new dependency:** `acorn` (MIT, browser-safe) is now a real dependency of
+`packages/core`. It was initially a phantom — imported but undeclared,
+resolving only via root hoisting, which would have broken a published install.
+
+---
+
+### Phase 5 — Agent loop
+
+`packages/core/src/query/agent/`
+
+**DECIDED 2026-08-28 (phase 5): our own loop, against the existing
+`InferenceProvider`. Not pi, and not `@ai-sdk/openai-compatible` either.**
+
+The plan's own rule settled it — _do not introduce a second inference path_.
+`packages/core/src/derivatives/inference.ts` already carries E2EE field
+encryption, Web3Signed relay auth, `bodyHash`-over-post-encryption-bytes
+signing, receipt passthrough and an `onRejected` retry seam. **`pi-ai` is a
+second inference path.** Routing through it means either bypassing all of that
+or reimplementing it inside pi's provider abstraction — more work than the loop
+itself, and a duplicate of a security-critical file. Separately, most of
+pi-agent-core's value (tool registry, sessions, compaction, the `ExecutionEnv`
+shell) is built around wire tool-calling, which E2EE rules out. The result adds
+**zero new dependencies**.
+
+**pi's browser-safety question has evidence** (plan §6 open item, _not_ closed):
+`pi-agent-core` bundles clean for `platform:"browser"` — 540KB, zero `node:`
+refs — and `pi-ai`'s `node:fs/promises` / `node:os` hits are genuine dynamic
+imports on the OAuth file-credential path. §4.4's claim checks out. pi remains
+viable if the harness choice is ever reopened; it was rejected on the
+inference-path argument, not on portability.
+
+Original text, kept for the record: the default was
+`@earendil-works/pi-agent-core` + `@earendil-works/pi-ai`, with our own
+~200–500 line loop on `@ai-sdk/openai-compatible` as the fallback.
+
+**E2EE vs tool-calling — decided.** Since the design snapshot, `3a21eb3` landed
+Phala E2EE v2 (`inference.e2ee`, **default true**; `INFERENCE_E2EE=false`
+overrides). It encrypts **per field**: each `messages[i].content` on the way out
+and exactly one `choices[i].message.content` on the way back, AAD-bound to
+nonce/timestamp/keys/response id. Everything else travels as clear JSON, and a
+tool-only reply has no `content` to decrypt. `main`'s `inference.ts` has **zero**
+tool-calling support today; PR #231 built it on a pre-E2EE base and added a hard
+guard refusing tools under E2EE, on protocol grounds. **They are mutually
+exclusive per request, not merely unintegrated.**
+
+This costs us nothing, because **our architecture does not need wire-level tool
+calling.** We are a _code_ loop, not a tool loop: the model emits a script in its
+message content, we execute it in the sandbox, and we feed the result back as
+the next message's content. Both directions are exactly the fields E2EE
+encrypts, so the script and its results stay encrypted end to end — strictly
+better than tool traffic, which would travel in clear JSON beside the
+ciphertext. The evidence also favours it independently: CodeAct reports up to
+20% higher success than JSON tool-calling on API-Bank.
+
+Decision: **E2EE stays on by default and the loop is code-as-content.** Wire
+tool-calling is an optional fast path only when an operator sets
+`inference.e2ee=false`; if built, it must fail closed when E2EE is on, exactly
+as PR #231 does. Requires a strict, versioned response contract (one fenced code
+block, or a JSON object with `script` / `answer`) plus a repair retry on parse
+failure — build this in phase 5 and make it an eval case.
+
+**Lift from PR #231** (`gh pr view 231`; do not build on the branch). Note
+`main`'s `inference.ts` has moved since that branch forked (`3d573ab`), so this
+is a **rebase, not a cherry-pick**:
+
+- Its tool-calling wire support only if we take the `e2ee=false` fast path
+  above; otherwise skip it entirely.
+- The `mode` field plumbing across `registration.ts` / `types.ts` / the question
+  store, including the PRAGMA-guarded migration and PS-Lite rehydration. This is
+  the part worth having either way.
+
+**Relay auth — reuse, do not reimplement.** `ac53bdd` makes the server sign
+relay requests: `aud` = origin, method, `pathname+search`, and `bodyHash` over
+the **post-encryption** bytes, via `createRequestSigner`
+(`packages/core/src/signing/request-signer.ts`) — the same signer already used
+for lineage reads. `INFERENCE_API_KEY`, when set, wins and skips signing. A
+signing failure is permanent (`relay_signing_failed`, no retry). New error codes
+to handle: `relay_signing_failed`, `e2ee_attestation_*`.
+
+**Gateway constraints the loop must respect** (found 2026-08-28 in
+`data-gateway` during phase 3; none of these appeared in this plan before, and
+each one bites a code loop harder than it bit one-shot derivative compute):
+
+1. **`INFERENCE_MAX_BODY_BYTES` = 2 MiB on our gateway** (Phala's own cap is
+   32 MiB). A code-as-content loop feeds script output back as the next
+   message's content, so a large scan result 413s at the relay. The loop needs
+   its **own output budget on what it feeds back**, separate from the sandbox's
+   `maxOutputBytes` — truncate and say so rather than failing the turn.
+2. **`INFERENCE_MODEL_ALLOWLIST` defaults to exactly `z-ai/glm-5.2`.** This
+   plan treats the model as PS-side config; it is not. Any model change is a
+   gateway env change plus a redeploy.
+3. **The gateway has no rate limiting** (`docs/INFERENCE_RELAY.md` says
+   "TODO"). An agent loop makes far more relay calls than one-shot compute did.
+   The only guards today are the registration bar, the model allowlist, the
+   body cap and Phala's quota — so the loop's own `budget.toolCalls` is
+   currently the _only_ thing bounding call volume. Treat it as load-bearing.
+
+Also note the gateway's auth shape: `uri` is the path and **query strings are
+refused outright**, and authorization requires a live personal-server
+registration in the gateway's `servers` table (server address or owner
+address). The query layer inherits that bar unchanged.
+
+**Config default vs deployed topology.** `packages/core/src/schemas/server-config.ts`
+defaults `inference.baseUrl` to `https://inference.phala.com/v1` — the
+direct-provider local-dev mode — while the deployed path is
+`<gateway>/v1/inference`. That mismatch is what made this plan's phase 3 ask
+the wrong question in the first place. Do not infer the deployed topology from
+the default.
+
+**If the query layer ever registers or lists questions as a builder** (not
+owner), note `d91124d`: the write-attribution proof's signed `uri` now covers
+`pathname+search` with canonicalized param order, there is an optional `nonce`
+claim, a new `authorizeWriteSession` auth-port method (404 vs 401 semantics),
+and a new `DERIVATIVE_DERIVED_SCOPE_REQUIRED` (400). Breaking for any client
+signing bare paths.
+
+Discard `agentic.ts` itself: a fixed two-tool retrieval loop is the design we
+argued against, and it cannot do arithmetic. Keep its eval number as prior art
+(8% → 80% retrieval accuracy over newest-first truncation on a 36k-chunk
+corpus).
+
+**Loop contract:**
+
+```ts
+interface QueryRequest {
+  question: string;
+  grantedScopes: string[];
+  budget?: { toolCalls?: number; wallClockMs?: number; usd?: number };
+}
+interface QueryAnswer {
+  answer: string;
+  citations: { scope: string; recordId?: string; blockRef?: string }[];
+  coverage: {
+    scopesScanned: string[];
+    recordsScanned: number;
+    scopesSkipped: { scope: string; reason: string }[];
+    complete: boolean; // false ⇒ the answer must say so
+  };
+  script?: string; // the code that produced it
+  determinism: "replayed" | "generated";
+  cost: {
+    toolCalls: number;
+    inputTokens: number;
+    outputTokens: number;
+    usd?: number;
+  };
+}
+```
+
+`coverage.complete === false` must be surfaced in `answer` text, not just in
+metadata. This is what makes an absence answer honest.
+
+---
+
+### Phase 6 — T2 source profiles and script persistence
+
+**6a. Source profiles.** `packages/core/src/query/profiles/<source>.md`
+
+Short prose (target ~4KB, per the Cube evidence: +17–23pp on NL→SQL from a
+small disambiguation doc), loaded into the agent's context for any granted
+scope. One per source, hand-written by us, versioned, shipped with the code —
+never authored by the user.
+
+Each profile states: file layout and shapes; field meanings and units; the
+**implicit rules** (this is the point); metric definitions; and known gaps.
+
+Write three first, and make them pass the phase-1 trap cases:
+
+- **Oura** — durations in seconds; a day can hold multiple sleep periods, so
+  `sleep` rows are _not_ 1:1 with `daily_sleep`; "sleep" means main-period
+  `total_sleep_duration`, not time in bed, naps excluded unless asked.
+- **ChatGPT** — the export is a full snapshot, never incremental; edits and
+  regenerations are sibling children, not overwrites; the only correct
+  reconstruction walks `current_node` back through `parent` and reverses.
+- **Spotify** — podcast and track rows share one schema with no type flag
+  (discriminate on which field cluster is non-null); `skipped` alone is
+  unreliable, use `skipped OR reason_end IN ('backbtn','unknown','endplay','fwdbtn')`;
+  ~2.6% of rows have overlapping timestamps and need dedup.
+
+**6b. Verified scripts as skills.** Adopt **SKILL.md** (agentskills.io; already
+implemented by pi, dsh, Goose, OpenCode, Crush, Gemini CLI, Letta). A script
+that ran successfully and passed its eval case is persisted as a skill keyed by
+question shape + source schema version, and **replayed** rather than
+regenerated. Persist as a derivative so it carries lineage, is inspectable, and
+is deletable by the user.
+
+Replay invalidation: reuse `derivatives/scheduler.ts` — a source change marks
+dependent skills stale exactly as it does questions today.
+
+---
+
+### Phase 7 — Wire into derivatives, and materialize only if graded
+
+**7a.** Add `mode: "code"` alongside the existing compute path in
+`packages/core/src/derivatives/compute.ts`. Keep the current path until phase 1
+evals show the new one is better, then make it the default. Record shape is
+unchanged except for `mode`, `script`, `coverage` and `citations`.
+
+**7b.** Materialize **only** where the evals prove it. Apply the rule:
+
+> Precompute only what is expensive per query **and** reused across queries — or
+> what must exist as a durable record for grant, lineage or payment reasons.
+
+Measured baselines: scans are 2–240ms and fail the test; a whole-corpus LLM
+classification pass is $5–16 and passes it on the second question. Embeddings
+are **not** in v1 — agentic keyword search reaches ~91–95% of RAG on text, and
+FTS is already in the repo. Any proposal to add a vector index must first beat
+lexical on the phase-1 set, per source.
+
+---
+
+### Phase 8 — MCP surface
+
+Extend `packages/core/src/mcp/tools.ts` with one workflow-scoped tool, not a
+pile of primitives:
+
+- `ask_personal_data(question, scopes?, budget?)` → `QueryAnswer`.
+
+Keep the existing primitives (`list_granted_scopes`, `read_scope`,
+`list_scope_blocks`, `search_personal_context`, `get_scope_file`) for consumers
+that want to drive their own loop. Respect the existing per-scope payment path:
+a sweep across many scopes has metering and access-log consequences a single
+`read_scope` did not — settle and log per scope touched.
+
+## 3. Risks the implementer must not paper over
+
+1. **Sandbox escape.** The hostile-script suite in 4a is the contract. Data
+   under a grant is one bad `readPaths` computation away from exposure.
+2. **Prompt injection.** The user's own data is untrusted input; a malicious
+   email can try to steer generated code. Code execution shrinks the surface by
+   keeping raw content out of the model's reasoning context, but does not
+   eliminate it — results still flow back. Zero egress is the containment.
+3. **Silent wrongness.** The 11.5% and 15.0% errors are what T2 exists to stop.
+   Any new source without a profile must be flagged as reduced-confidence in
+   `coverage`, not answered as if it were understood.
+4. **Concurrency.** Ten consumers asking scan-shaped questions is ten full
+   scans. Bound concurrent sandboxes and consider a short-lived result cache
+   keyed by (question, scope versions).
+5. **PS-Lite divergence.** No native modules and no local inference: decide
+   deliberately what it degrades to, and make it say so.
+6. **Scale.** At ~2GB the scan numbers move from milliseconds to seconds and
+   phase 7's calculus changes. Re-run phase 1 at 10x before assuming it holds.
+
+## 4. Runtime portability: PS full vs PS-Lite
+
+PS-Lite is a **browser/WebView runtime** (`packages/lite`, "Browser/WebView
+Personal Server Lite runtime boundary"): storage is OPFS with an IndexedDB
+fallback (`RuntimeStoragePort.kind = "browser-indexeddb-opfs"`), the question
+store persists through the runtime state store, and inference is a fetch-based
+OpenAI-compatible provider. There is no filesystem, no subprocess, and no
+native module.
+
+The architecture ports. The sandbox mechanism and the performance profile do
+not.
+
+|                                                 | PS full (Node)                           | PS-Lite (browser/WebView)                             |
+| ----------------------------------------------- | ---------------------------------------- | ----------------------------------------------------- |
+| Derivatives, lineage, scheduler, question store | ✅ same code                             | ✅ already wired (`packages/lite/src/derivatives.ts`) |
+| T2 source profiles                              | ✅                                       | ✅ same files                                         |
+| Capability-confined tool API                    | ✅                                       | ✅ same code                                          |
+| Coverage / citation contract                    | ✅                                       | ✅                                                    |
+| Lexical search                                  | MiniSearch (pure JS)                     | ✅ same                                               |
+| Agent loop                                      | `pi-agent-core` in-process               | ⚠️ verify browser-safety                              |
+| **OS-enforced sandbox**                         | Seatbelt / bubblewrap / restricted token | ❌ impossible — no subprocess                         |
+| Code execution                                  | Node subprocess under `sandbox-runtime`  | Worker + CSP, or QuickJS-WASM                         |
+| Scan performance                                | measured 2–240 ms                        | **1 to 2 orders of magnitude slower**                 |
+
+### 4.1 Lite has no ambient authority to subtract
+
+This is what makes Lite tractable rather than blocked. On Node the sandbox
+exists to _remove_ capabilities the process already has. In the browser there is
+no filesystem to scope — data is reachable only through `DataStoragePort`, so
+the injected tool API is the sole channel by construction. Capability
+confinement (phase 4b) is the whole boundary in Lite, and it is the same code.
+
+**Egress: blob-worker + CSP.** Verified behaviour, and the detail is
+load-bearing:
+
+- `connect-src 'none'` blocks `fetch`, `XMLHttpRequest`, `WebSocket`,
+  `EventSource` and `sendBeacon` — but **not WebRTC**. Delete
+  `RTCPeerConnection` explicitly.
+- A same-origin `new Worker(url)` **does not inherit the document's CSP**; the
+  header must be set on that script's own HTTP response. But a **`blob:` URL
+  worker does inherit the creator's CSP** — which suits us exactly, since
+  generated code is naturally a blob. Spawn it from a strictly-CSP'd controller
+  and `connect-src 'none'` comes for free.
+- Deleting `fetch`/`WebSocket` as defence in depth is worth doing but fragile:
+  they are usually _inherited prototype_ properties, so `delete self.fetch` is a
+  **silent no-op**. Delete from the defining prototype, before untrusted code
+  runs.
+
+**QuickJS-WASM** (`quickjs-emscripten` v0.32.0, MIT, ~640KB sync variant) is the
+fallback where CSP cannot be guaranteed. Verified to run in a Worker (its built
+glue branches on `WorkerGlobalScope`), with real `setMemoryLimit`,
+`setInterruptHandler` and `setMaxStackSize`. No host bindings exist unless we
+inject them, so egress is blocked by construction.
+
+Two CSP interactions to get right: loading the QuickJS `.wasm` is itself a
+network fetch that `connect-src 'none'` would block — **fetch the bytes before
+locking CSP down** — and instantiating it needs `script-src 'wasm-unsafe-eval'`,
+which notably does **not** re-enable JS `eval`.
+
+### 4.2 The conclusion that inverts on Lite
+
+Design §17.3 concluded "don't precompute, scans are cheap." **That conclusion is
+a function of scan speed, and Lite scans slower.** The rule is unchanged; its
+threshold moves:
+
+> Precompute only what is expensive per query and reused across queries.
+
+On Lite more things clear that bar. Expect Lite to need T1-style materialized
+rows for hot sources where full PS does not. **Run the phase-1 eval set under
+the Lite runtime as a separate profile** and let it decide Lite's
+materialization set independently. The Node numbers will not transfer.
+
+How much slower is **unmeasured and unmeasurable from the literature**: no
+benchmark exists anywhere for QuickJS on our workload shape (tens of MB of JSON
+parsing plus string scanning), and `quickjs-emscripten` adds FFI marshaling
+across the WASM boundary — large payloads are precisely its worst case. Do not
+design around a guessed multiplier. **Run a throwaway benchmark on the real data
+shape before committing to QuickJS**; prefer the blob-worker path, which runs on
+V8 at native speed, wherever CSP can be guaranteed.
+
+### 4.3 Lite-specific constraints to design for
+
+- **Storage quota and eviction.** IndexedDB is evictable; OPFS needs
+  `navigator.storage.persist()`. A materialized index that silently disappears
+  is worse than none — check persistence and report it in `coverage`.
+- **Memory.** Do not parse a 53MB scope in one go. Read through the existing
+  `storage/blocks` manifest and cursor, which already bound reads.
+- **No local inference fallback.** Lite must reach the relay; with
+  `inference.baseUrl` at the direct-provider default the compute layer stays off
+  and returns 503 `DERIVATIVE_COMPUTE_UNAVAILABLE`. The query layer inherits
+  this. Good news: PS-Lite already wires the same request signer and E2EE as the
+  Node server (`packages/lite/src/browser-runtime.ts`, `derivatives.ts`), so the
+  phase-5 relay story is identical on both runtimes.
+- **Reduced capability must be visible.** When Lite answers via a weaker path,
+  `coverage` must say so. A silently degraded answer is the failure mode this
+  design exists to avoid.
+
+### 4.4 Harness portability — verified
+
+Checked by extracting the published tarballs, not by reading READMEs:
+
+- **`@earendil-works/pi-agent-core@0.84.3`** — `agentLoop()` itself has **zero
+  Node built-in imports**: a pure control loop, browser-safe. Its
+  `NodeExecutionEnv` (the only shipped filesystem/shell backend) uses
+  `node:fs`/`child_process`/`os`/`path`, but sits behind a separate `./node`
+  export subpath. **`ExecutionEnv` is a public exported interface**, so an
+  OPFS-backed implementation is dependency injection, not a fork. The `bash`
+  tool cannot port — there is no subprocess in a browser — which costs us
+  nothing, since Lite's execution path is the blob worker.
+- **`@earendil-works/pi-ai@0.84.3`** — the main `.` export (types, event stream,
+  retry, fetch/WebSocket providers) has no Node imports reachable in normal use;
+  Node-only paths (Bedrock's `@smithy/node-http-handler`, CLI, OAuth) are
+  dynamically imported and code-splittable.
+- Caveat: **there is no official browser build for either package.** This is
+  inference from source, not a vendor guarantee. Treat a Lite smoke test as part
+  of phase 5's definition of done.
+- **`@ai-sdk/openai-compatible@3.0.40`** (Apache-2.0) — confirmed clean: zero
+  Node imports in `dist`, fetch-only. (Its `undici` dependency is never actually
+  imported; it only appears in an error-string match.) This remains the fallback
+  loop's foundation and is the safer choice if pi's Lite smoke test fails.
+
+Still to verify before building: whether the WebView host can guarantee
+`connect-src 'none'` for the controller document (decides blob-worker vs
+QuickJS), and what corpus size Lite realistically holds under OPFS — the 222MB
+benchmark is a desktop figure, and no reliable large-file OPFS throughput
+numbers were found.
+
+## 5. Repo conventions an implementation agent must follow
+
+- **`packages/core` must stay browser-safe.** It is consumed by `packages/lite`.
+  Anything Node-specific goes behind a port (§ phase 4a) and lands in
+  `packages/server`. This is the single easiest way to break the build in a way
+  tests on Node will not catch.
+- **Tests are colocated `*.test.ts`, run with vitest.** Every new module gets
+  one. `npm run build` is `tsc --build`; both must pass.
+- **Conventional commits** (commitlint, `@commitlint/config-conventional`).
+  PR titles are validated by CI — a `[Don't merge]`-style prefix fails the check
+  (this is why PR #231 shows a red title check).
+- ~~**Config** goes in `packages/core/src/schemas/server-config.ts` under a new
+  `query` block with defaults, alongside the existing `inference` block. Suggested
+  keys: `query.enabled`, `query.maxToolCalls`, `query.wallClockMs`,
+  `query.cpuMs`, `query.memoryMb`, `query.maxOutputBytes`, `query.skillCache`.
+  Add env overrides only for the Node server, matching `INFERENCE_*` precedent.~~
+  **Superseded — the block was written, never read, and is now deleted.** It
+  shipped as ~52 lines of schema whose only reader was its own 42-line unit
+  test: `app.ts` mounted `/v1/query` unconditionally, the sole runtime gate
+  being `inferenceProvider === undefined → 503`; the five budgets were
+  superseded by the hardcoded `QUERY_SANDBOX_BUDGET` / `QUERY_SANDBOX_LIMITS`
+  in `query-service.ts` (and `LITE_QUERY_*` on the Lite side); and
+  `skillCache` had no implementation anywhere. A documented `enabled: false`
+  that an operator would read as "the feature is off" while the route serves
+  is worse than no switch at all, so the block went rather than the reading.
+  Wiring it was the considered alternative and was rejected on two grounds.
+  `enabled` could only ever gate the Node route — PS-Lite runs in a browser
+  and cannot read `ServerConfig` at all — so the switch would have been half a
+  switch, which is the same class of lie. And `skillCache` has no feature
+  behind it to wire: building script replay is exactly the caching decision
+  §6 reserves for a human ("caching must be gated on an eval-verified result
+  or it freezes errors permanently"). Wiring the rest and leaving `skillCache`
+  dead would have left the worst state of the three — some fields real, some
+  decorative, with nothing marking which. A real kill switch remains available
+  later; it should be added when something reads it, and it should cover both
+  runtimes.
+- **Error codes** go in `packages/core/src/errors/catalog.ts` next to the
+  existing `DERIVATIVE_*` codes.
+- **T2 profiles are shipped assets.** ~~They are `.md` files that must reach
+  `dist`; add a build copy step and a `files` entry.~~ **Superseded 2026-08-28
+  (phase 6a).** Reading `.md` at runtime conflicts with this section's own
+  first bullet — `packages/core` must stay browser-safe, so a file read would
+  need a port, and a port for static text that never changes is machinery for
+  nothing. The `.md` files remain the authored source of truth; a generated
+  `profiles.generated.ts` inlines them as string constants, and a test re-reads
+  the `.md` and fails on drift. No build copy step, no `files` change, and the
+  loader has zero Node imports.
+- **Reuse, don't duplicate.** `packages/core/src/mcp/search` already holds the
+  MiniSearch index; extend it rather than building a second one (PR #231's
+  mistake). Same for `createRequestSigner` and the `storage/blocks` cursor.
+- The repo ships review skills under `.agents/skills/` (`code-review`,
+  `autoreview`, `test-reviewer`, `atomic-commit-slicing`) — use them.
+
+## 6. What is still open
+
+None of these block starting; each is an experiment whose result feeds a
+decision. Do not let an implementation agent silently pick an answer.
+
+| Open item                                                              | Blocks                                            | Resolved by                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ---------------------------------------------------------------------- | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ~~Determinism of regenerated aggregation code~~                        | ~~how much we materialize~~                       | **MEASURED 2026-08-28, phase 2 — see design §15.3.** Script variance total (43/43 distinct); value determinism varies by question (Q11 9/9, Q1 6/9); coverage swings 3.3×; temperature unpinned. The "high variance → caching mandatory" branch is met, but Q14 returned the same wrong number 4/4, so caching must be gated on an eval-verified result or it freezes errors permanently. **The resulting decision is a human's, not an agent's.**                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ~~Does the relay speak the OpenAI Responses API?~~                     | ~~whether Codex CLI's sandbox becomes available~~ | **RESOLVED 2026-08-28, phase 3.** Our gateway does not expose it; Phala does; E2EE cannot travel on it either way. Codex stays out and phase 4 stands. The _decision_ to trade E2EE for a sandbox remains a human call if anyone wants to reopen it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| QuickJS throughput on tens of MB of JSON                               | whether Lite can use the paranoid path at all     | throwaway benchmark, §4.2                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Can the WebView host guarantee `connect-src 'none'`?                   | blob-worker vs QuickJS on Lite                    | §4.1                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Realistic Lite corpus size under OPFS                                  | Lite's materialization set                        | Phase 1, Lite profile                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ~~Does `sandbox-runtime` enforce CPU/memory, or only access control?~~ | ~~whether we add `rlimit`s at spawn~~             | **ANSWERED 2026-08-28, phase 4a: access control only.** Confirmed from the extracted tarball, not the README — the config schema has no cpu/memory/rlimit key, and `wrapWithSandboxArgv()` returns argv for the caller to spawn, so it never spawns the process and could not impose limits in principle. Covered with `RLIMIT_CPU`, `RLIMIT_NPROC` and an out-of-process RSS watchdog; macOS rejects `RLIMIT_AS` outright and silently ignores `RLIMIT_DATA`, and `--max-old-space-size` does not bound Buffers. **Now also measured on Linux (ubuntu-24.04, x86_64 and arm64) — see design §19.7.1.** Three of those limits were claimed and not imposed there: `RLIMIT_AS` stops Node starting rather than capping it (removed on every platform; the RSS watchdog holds the budget on Linux too), `RLIMIT_NPROC` was spelled `ulimit -u` which dash — Ubuntu's `/bin/sh` — does not have, and `RLIMIT_CPU` fired on time but as SIGKILL rather than SIGXCPU. All three are fixed and re-measured. Windows remains unverified. **Recorded against this row, not resolving it:** access control is not only what it enforces, it is also what it _grants_ — `getDefaultWritePaths()` is unioned into the write allow-list unconditionally, and measured on both platforms a sandboxed script's writes to all four of its data-bearing paths reached the real host filesystem. Closed via `denyWrite`; the read half is not closable at 0.0.74. Design §19.7.1. |
+| Does `pi-agent-core` actually run in a browser?                        | harness choice for Lite                           | **Evidence, not a closure (phase 5).** `pi-agent-core` bundles clean for `platform:"browser"` (540KB, zero `node:` refs); `pi-ai`'s `node:fs/promises`/`node:os` hits are genuine dynamic imports on the OAuth path. §4.4's claim checks out. **Moot for the Node loop** — pi was rejected because `pi-ai` would be a second inference path duplicating E2EE, relay signing and receipts. Still open for Lite.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+
+**Opened by the live work, and not yet decided** (added 2026-08-28):
+
+| Open item                                                | Blocks                                               | Evidence so far                                                                                                                                                                                                                                                                        |
+| -------------------------------------------------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `coverage.complete` was false in **78 consecutive runs** | whether the flag means anything; Q8-class trust      | Its derivation — true only when every granted scope was streamed end to end — may be too strict to ever fire on a multi-scope grant. A flag that is always false is not a safety property, it is noise. Needs a decision, not a code change.                                           |
+| Q5's grading: surfacing ambiguity vs resolving it        | what "correct" means for the entity-resolution class | Q5 found the needle on all four planted anchors, then noticed there are two Sarahs and presented both. The eval failed it for naming the decoy. Design §3 demands resolution; arguably surfacing ambiguity is better than guessing. **A human should decide which the corpus grades.** |
+| Q11 does not exercise the trap it appears to             | whether the HR-contamination rule is tested at all   | Its expected value derives from `oura_sleep.average_heart_rate`, not `oura_heartrate` rows, so the `heartrate.source` filter is never needed. 8 of 10 runs skipped it and passed.                                                                                                      |
+| Cost tracks turn count, not semantic difficulty          | phase 7's materialization calculus                   | Design §18.3 predicts semantic questions dominate spend via per-item `classify`. Measured, spend is nearly flat (top question 2.3× the cheapest) and **no question ever called `classify`**. The cost model in §18.3 does not describe what the loop actually does.                    |
+
+**Already decided, do not relitigate:** the Personal Server authors the code
+(design §16.5); E2EE stays on and the loop is code-as-content (phase 5);
+embeddings are out of v1 (design §15.3); no ingest-time pipeline (design §17.3).
+
+## 7. Prior art: PR #231
+
+An abandoned experiment (`maciej/derivative-agentic-loop`, "[Don't merge]") — it
+will not be merged. It is still the closest thing to a baseline we have, and two
+things are worth taking:
+
+1. **The `mode` field plumbing** across `registration.ts` / `types.ts` / the
+   question store — PRAGMA-guarded migration and PS-Lite rehydration, already
+   solved. This is the main lift.
+2. **Its eval number as a baseline to beat**: 8% → 80% retrieval accuracy over
+   newest-first truncation on a 36k-chunk ChatGPT corpus. Our phase-1 set should
+   reproduce that comparison so we can show the code loop beats the tool loop,
+   not just the old truncation heuristic.
+
+Do **not** take `agentic.ts` (a fixed two-tool retrieval loop — the design we
+argued against, and it cannot do arithmetic), and do not take its tool-calling
+wire support while E2EE is on. Note its `inference.ts` forked at `3d573ab`,
+before E2EE landed, so anything from it is a rebase, not a cherry-pick.
+
+## 8. Order of work
+
+1. Phase 1 (evals) — blocks everything. Build the Node profile first, the Lite
+   profile immediately after (§4.2).
+2. Phase 3 (relay check) — small, may re-open the harness choice.
+3. Phase 4a (OS sandbox, Node) + hostile-script suite; §4.1 execution path for
+   Lite in parallel.
+4. Phase 5 (loop) + lift PR #231's `inference.ts` tool-calling. Verify pi's
+   browser-safety here (§4.4).
+5. Phase 4b (capability confinement — one implementation, both runtimes) +
+   Phase 6a (three source profiles).
+6. Phase 2 (determinism) — now runnable end to end, on both runtimes.
+7. Phase 6b (skills) — mandatory if phase 2 shows high variance.
+8. Phase 7 (derivative mode, then materialization only where graded — separately
+   per runtime).
+9. Phase 8 (MCP surface).

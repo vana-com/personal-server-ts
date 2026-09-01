@@ -145,3 +145,82 @@ describe("createSqliteQuestionStore", () => {
     db.close();
   });
 });
+
+describe("createSqliteQuestionStore vestigial mode column", () => {
+  it("loads rows that carry a legacy mode value", async () => {
+    const db = initializeDatabase(":memory:");
+    const store = createSqliteQuestionStore(db);
+    // Inserts no longer name the column; the NOT NULL DEFAULT covers it.
+    await store.insert(registration({ questionId: "q-x" }));
+    // A row written by the build that had modes, including the one that build
+    // accepted at registration and then failed at compute.
+    db.prepare(
+      "UPDATE derivative_questions SET mode = 'code' WHERE question_id = 'q-x'",
+    ).run();
+
+    const loaded = await store.get("q-x");
+    expect(loaded).not.toBeNull();
+    expect(loaded!.question).toBe("How did I sleep?");
+    expect(loaded!.recompute).toBe("on-change");
+    expect(loaded).not.toHaveProperty("mode");
+
+    // Still updatable, and still listed.
+    await store.update("q-x", { status: "ready" });
+    expect((await store.get("q-x"))!.status).toBe("ready");
+    expect((await store.list()).map((r) => r.questionId)).toEqual(["q-x"]);
+    db.close();
+  });
+
+  it("migrates a table created before the mode column existed", async () => {
+    const db = initializeDatabase(":memory:");
+
+    // Reproduce the pre-mode schema exactly, then seed a row through it, so
+    // this is a real in-place upgrade rather than a fresh table with a default.
+    db.exec(
+      "CREATE TABLE derivative_questions (" +
+        "question_id TEXT PRIMARY KEY, derived_scope TEXT NOT NULL, " +
+        "source_scopes TEXT NOT NULL, question TEXT NOT NULL, model TEXT, " +
+        "registered_by TEXT NOT NULL, status TEXT NOT NULL, error TEXT, " +
+        "created_at TEXT NOT NULL, updated_at TEXT NOT NULL, " +
+        "last_computed_at TEXT, derived_version INTEGER, " +
+        "derived_collected_at TEXT)",
+    );
+    db.prepare(
+      "INSERT INTO derivative_questions (question_id, derived_scope, " +
+        "source_scopes, question, model, registered_by, status, error, " +
+        "created_at, updated_at, last_computed_at, derived_version, " +
+        "derived_collected_at) VALUES ('legacy', 'coach.weekly', " +
+        "'[\"oura.sleep\"]', 'How did I sleep?', NULL, " +
+        "'{\"kind\":\"owner\"}', 'ready', NULL, " +
+        "'2026-08-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z', " +
+        "NULL, NULL, NULL)",
+    ).run();
+
+    const hasMode = (): boolean =>
+      (
+        db.prepare("PRAGMA table_info(derivative_questions)").all() as Array<{
+          name: string;
+        }>
+      ).some((c) => c.name === "mode");
+    expect(hasMode()).toBe(false);
+
+    // Opening the store performs the migration.
+    const store = createSqliteQuestionStore(db);
+    expect(hasMode()).toBe(true);
+
+    // The pre-existing row survives.
+    const legacy = await store.get("legacy");
+    expect(legacy).not.toBeNull();
+    expect(legacy?.question).toBe("How did I sleep?");
+    expect(legacy?.status).toBe("ready");
+
+    // The migrated table still takes inserts, which no longer name the column.
+    await store.insert(registration({ questionId: "q-new" }));
+    expect((await store.get("q-new"))?.question).toBe("How did I sleep?");
+
+    // Idempotent: reopening must not throw on a duplicate column.
+    expect(() => createSqliteQuestionStore(db)).not.toThrow();
+    expect((await store.get("legacy"))?.status).toBe("ready");
+    db.close();
+  });
+});

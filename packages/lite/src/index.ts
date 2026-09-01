@@ -183,3 +183,50 @@ export {
   type PsLitePersistenceBundle,
   type PsLitePersistenceRuntimeOptions,
 } from "./persistence.js";
+
+/**
+ * The query layer (design §19.17, plan phase 4a/8).
+ *
+ * PS-Lite answers `ask_personal_data` by running model-authored code in a
+ * QuickJS-WASM VM over a per-request in-memory grant. Re-exported from `./query`
+ * so a host can wire the port without reaching into the package's internals.
+ */
+export {
+  applyGrantCoverage as applyLiteGrantCoverage,
+  createLiteAskPersonalDataPort,
+  createLiteQueryAsk,
+  createLiteQueryConcurrency,
+  handleLiteQueryRequest,
+  createLiteToolHost,
+  createQuickJsSandbox,
+  loadQuickJsModule,
+  materializeGrantInMemory,
+  probeVmGlobals,
+  quickJsEnforcement,
+  resolveGrant as resolveLiteGrant,
+  runLiteQuery,
+  unwrapEnvelopeData as unwrapLiteEnvelopeData,
+  verifyOutcome as verifyLiteSandboxOutcome,
+  EGRESS_GLOBALS as LITE_EGRESS_GLOBALS,
+  LITE_QUERY_BUDGET,
+  LITE_QUERY_LIMITS,
+  MAX_STACK_BYTES as LITE_QUICKJS_MAX_STACK_BYTES,
+  VIRTUAL_GRANT_ROOT as LITE_VIRTUAL_GRANT_ROOT,
+  type LiteExecuteOutcome,
+  type LiteGrantedScope,
+  type LiteMaterializedGrant,
+  type LiteMaterializedScope,
+  type LiteQueryEvent,
+  type LiteQueryEventSink,
+  type LiteScopePayload,
+  type LiteQueryAsk,
+  type LiteQueryAskInput,
+  type LiteQueryConcurrency,
+  type LiteQueryConfig,
+  type LiteQueryRouteDeps,
+  type LiteScopeReader,
+  type LiteSkippedScope,
+  type LiteToolHost,
+  type QuickJsSandboxOptions,
+  type RunLiteQueryOptions,
+} from "./query/index.js";

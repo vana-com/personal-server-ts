@@ -1,0 +1,108 @@
+diff --git a/docs/260828-query-layer-prompt.md b/docs/260828-query-layer-prompt.md
+index e9a0df0..bd73a1b 100644
+--- a/docs/260828-query-layer-prompt.md
++++ b/docs/260828-query-layer-prompt.md
+@@ -192,9 +192,23 @@ Anything outside the block is ignored.
+ 
+ **Rules that matter more than being helpful:**
+ 
+-1. **Compute, never estimate.** Averages, counts, sums and joins must be
+-   computed in code. Never eyeball numbers from data you have read into your
+-   context, and never round a computed figure into a vaguer one.
++1. **Compute, never estimate, and report the number you computed.** Averages,
++   counts, sums and joins must be computed in code. Never eyeball numbers from
++   data you have read into your context, and never round a computed figure into
++   a vaguer one.
++
++   Every figure you report must be one your final script produced. Print it,
++   then carry that printed number into the answer verbatim — never restate a
++   figure from memory, from an earlier turn, or from a script you have since
++   changed. If a number you want to report was computed by an earlier run,
++   recompute it in your final script before reporting it. Two numbers for the
++   same thing that look alike are not the same number.
++
++   Say what produced it. Beside the figure you headline, name the computation
++   behind it — the field or series it was computed from and the operation
++   applied — so a reader can match the number in your answer to the step that
++   produced it. `value` carries that same number, bare and unrounded.
++
+ 2. **Read the profile first.** `vana.scopes()` returns a `profile` for each
+    scope describing its shape and its non-obvious rules. These rules are not
+    suggestions — they encode how the data is actually structured, and ignoring
+diff --git a/packages/core/src/query/agent/prompt.ts b/packages/core/src/query/agent/prompt.ts
+index 3244185..9ab2776 100644
+--- a/packages/core/src/query/agent/prompt.ts
++++ b/packages/core/src/query/agent/prompt.ts
+@@ -14,7 +14,7 @@
+ import { renderProfiles } from "../profiles/index.js";
+ 
+ /** Bump on any edit to `SYSTEM_PROMPT_TEMPLATE`. */
+-export const SYSTEM_PROMPT_VERSION = "vana-query-prompt/4";
++export const SYSTEM_PROMPT_VERSION = "vana-query-prompt/5";
+ 
+ /**
+  * Verbatim from the prompt doc §4. Edit the doc and this together, or the
+@@ -60,9 +60,22 @@ was rejected and what to use instead.
+ 
+ **Rules that matter more than being helpful:**
+ 
+-1. **Compute, never estimate.** Averages, counts, sums and joins must be
+-   computed in code. Never eyeball numbers from data you have read into your
+-   context, and never round a computed figure into a vaguer one.
++1. **Compute, never estimate, and report the number you computed.** Averages,
++   counts, sums and joins must be computed in code. Never eyeball numbers from
++   data you have read into your context, and never round a computed figure into
++   a vaguer one.
++
++   Every figure you report must be one your final script produced. Print it,
++   then carry that printed number into the answer verbatim — never restate a
++   figure from memory, from an earlier turn, or from a script you have since
++   changed. If a number you want to report was computed by an earlier run,
++   recompute it in your final script before reporting it. Two numbers for the
++   same thing that look alike are not the same number.
++
++   Say what produced it. Beside the figure you headline, name the computation
++   behind it — the field or series it was computed from and the operation
++   applied — so a reader can match the number in your answer to the step that
++   produced it. \`value\` carries that same number, bare and unrounded.
+ 2. **Read the profile first.** \`vana.scopes()\` returns a \`profile\` for each
+    scope describing its shape and its non-obvious rules. These rules are not
+    suggestions — they encode how the data is actually structured, and ignoring
+diff --git a/packages/core/src/query/evals/answerers/stuffed-answerer.ts b/packages/core/src/query/evals/answerers/stuffed-answerer.ts
+index 0d3befe..3b6ace8 100644
+--- a/packages/core/src/query/evals/answerers/stuffed-answerer.ts
++++ b/packages/core/src/query/evals/answerers/stuffed-answerer.ts
+@@ -175,7 +175,7 @@ interface Candidate {
+  * The system prompt.
+  *
+  * Written once, as the obvious translation of the shipped agent prompt
+- * (`agent/prompt.ts`, `vana-query-prompt/4`) into a world with no script API:
++ * (`agent/prompt.ts`, `vana-query-prompt/5`) into a world with no script API:
+  * the same response contract, the same ten rules minus the two that are purely
+  * about the script API, the same `{{SCOPES}}` and `{{PROFILES}}` slots. It has
+  * not been tuned against any result — see the module header.
+@@ -202,9 +202,21 @@ Omit it only when the answer genuinely is not one number.
+ 
+ **Rules that matter more than being helpful:**
+ 
+-1. **Be exact.** Averages, counts, sums and joins must be worked out over the
+-   actual records below, one by one. Never eyeball a number from the shape of
+-   the data, and never round a figure you worked out into a vaguer one.
++1. **Be exact, and report the number you worked out.** Averages, counts, sums
++   and joins must be worked out over the actual records below, one by one.
++   Never eyeball a number from the shape of the data, and never round a figure
++   you worked out into a vaguer one.
++
++   Every figure you report must be one you worked out here, from the records
++   below — never restate a figure from memory, from an earlier turn, or from a
++   working you have since revised. If a number you want to report came from
++   earlier, work it out again before reporting it. Two numbers for the same
++   thing that look alike are not the same number.
++
++   Say what produced it. Beside the figure you headline, name the working
++   behind it — the field or series it was worked out from and the operation
++   applied — so a reader can match the number in your answer to the step that
++   produced it. \`value\` carries that same number, bare and unrounded.
+ 2. **Read the profile first.** Each scope below has a source profile
+    describing its shape and its non-obvious rules. These rules are not
+    suggestions — they encode how the data is actually structured, and ignoring

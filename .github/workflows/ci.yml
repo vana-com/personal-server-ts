@@ -33,6 +33,9 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
+      # The query layer's sandbox tests need a working OS sandbox; without it
+      # the sandbox correctly refuses to run and the suite goes red.
+      - uses: ./.github/actions/setup-sandbox
       - run: npm ci
       - run: npm run build
       - run: npm test

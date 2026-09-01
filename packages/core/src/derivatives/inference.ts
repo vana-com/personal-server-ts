@@ -137,6 +137,57 @@ export const DEFAULT_INFERENCE_REQUEST_FIELDS: Record<string, unknown> = {
   provider: { aci_verified: true, zdr: true },
 };
 
+/**
+ * What went wrong, as a value rather than as prose.
+ *
+ * Callers used to tell these apart by matching on `message`, because status
+ * and `errorType` cannot: `emptyContent` and `malformedToolCall` both arrive
+ * as a 200 with no `error` object at all. That put a retry policy downstream
+ * of an error string — `agent/loop.ts` doubled its completion budget for both,
+ * which is right for one and pointless for the other. The distinction is made
+ * here, where the response body is in scope, and travels as data.
+ */
+export type InferenceErrorCode =
+  /** No response at all: DNS, TLS, timeout, abort. */
+  | "transport"
+  /** The relay signer refused. Permanent — never retry into a storm. */
+  | "relaySigningFailed"
+  /** A non-2xx. `status` and `errorType` carry the detail. */
+  | "httpError"
+  /** 2xx whose body did not parse. */
+  | "notJson"
+  /** The E2EE seam failed: key fetch, encryption or decryption. */
+  | "e2ee"
+  /**
+   * 2xx carrying no usable assistant content, cause unstated.
+   *
+   * A reasoning model that spent its whole allowance thinking lands here, so
+   * a larger completion budget is a reasonable response.
+   */
+  | "emptyContent"
+  /**
+   * 2xx carrying no assistant content *because the provider dropped a tool
+   * call it could not parse* — `finish_reason` says so.
+   *
+   * Distinct from `emptyContent` in the only way that matters operationally:
+   * the model was not short of room, so re-asking with a larger budget cannot
+   * help. See {@link TOOL_CALL_FINISH_REASON}.
+   */
+  | "malformedToolCall";
+
+/**
+ * `finish_reason` values meaning "the content you wanted became a tool call".
+ *
+ * Gemini's OpenAI-compat surface reports a dropped tool call as
+ * `"function_call_filter: MALFORMED_FUNCTION_CALL"` on a 200 with no content;
+ * OpenAI's own `"tool_calls"` is the same situation for us, since this client
+ * never sends tools (E2EE encrypts message content per field and a tool-only
+ * reply has no content to decrypt — see `query/agent/loop.ts`). Either way the
+ * reply is unusable for a reason that has nothing to do with the token budget.
+ */
+const TOOL_CALL_FINISH_REASON =
+  /malformed_function_call|malformed_tool_call|function_call_filter|^tool_calls$/i;
+
 /** Thrown for a non-2xx or malformed provider reply. Carries no prompt text. */
 export class InferenceRequestError extends Error {
   /** OpenAI-style `error.type` of the rejection, when the body had one. */
@@ -146,16 +197,33 @@ export class InferenceRequestError extends Error {
    * status: no response, 429 or 5xx are retried.
    */
   public readonly retryable: boolean | undefined;
+  /** Structured discriminator; see {@link InferenceErrorCode}. */
+  public readonly code: InferenceErrorCode;
+  /**
+   * The choice's `finish_reason`, when the reply had one.
+   *
+   * Kept beside `code` because it is the *evidence* for the classification and
+   * a provider can invent a value this module has never seen. A diagnostic
+   * that says only "malformedToolCall" cannot be checked against the wire.
+   */
+  public readonly finishReason: string | null;
 
   constructor(
     message: string,
     public readonly status: number | null,
-    options: { errorType?: string | null; retryable?: boolean } = {},
+    options: {
+      errorType?: string | null;
+      retryable?: boolean;
+      code: InferenceErrorCode;
+      finishReason?: string | null;
+    },
   ) {
     super(message);
     this.name = "InferenceRequestError";
     this.errorType = options.errorType ?? null;
     this.retryable = options.retryable;
+    this.code = options.code;
+    this.finishReason = options.finishReason ?? null;
   }
 }
 
@@ -206,6 +274,35 @@ function readContent(body: unknown): ReadChoice | null {
   return null;
 }
 
+/** `choices[0].finish_reason` of a parsed body, when it carries one. */
+function readFinishReason(body: unknown): string | null {
+  if (!isRecord(body) || !Array.isArray(body.choices)) return null;
+  const first: unknown = body.choices[0];
+  if (!isRecord(first)) return null;
+  return typeof first.finish_reason === "string" ? first.finish_reason : null;
+}
+
+/**
+ * Why a 2xx carried no usable content: a dropped tool call, or nothing said.
+ *
+ * Reads the classification off `finish_reason` rather than guessing from the
+ * shape of the missing content, because the two look identical on the wire —
+ * both arrive as a `message` with no `content` — and only `finish_reason`
+ * distinguishes them.
+ */
+function classifyEmptyReply(finishReason: string | null): {
+  code: InferenceErrorCode;
+  finishReason: string | null;
+} {
+  return {
+    code:
+      finishReason !== null && TOOL_CALL_FINISH_REASON.test(finishReason)
+        ? "malformedToolCall"
+        : "emptyContent",
+    finishReason,
+  };
+}
+
 /** OpenAI-style `{ error: { type } }` of a rejection; never its message. */
 async function readErrorType(response: Response): Promise<string | null> {
   try {
@@ -235,7 +332,11 @@ async function signOrThrow(
     throw new InferenceRequestError(
       `inference request could not be signed (${name})`,
       null,
-      { errorType: "relay_signing_failed", retryable: false },
+      {
+        errorType: "relay_signing_failed",
+        retryable: false,
+        code: "relaySigningFailed",
+      },
     );
   }
 }
@@ -316,6 +417,7 @@ export function createOpenAiCompatibleInferenceProvider(
       throw new InferenceRequestError(
         `inference request failed before a response (${name})`,
         null,
+        { code: "transport" },
       );
     }
     if (!response.ok) {
@@ -334,7 +436,7 @@ export function createOpenAiCompatibleInferenceProvider(
             errorType ? ` (${errorType})` : ""
           }`,
           response.status,
-          { errorType },
+          { errorType, code: "httpError" },
         ),
       };
     }
@@ -345,6 +447,7 @@ export function createOpenAiCompatibleInferenceProvider(
       throw new InferenceRequestError(
         "inference response was not JSON",
         response.status,
+        { code: "notJson" },
       );
     }
     const choice = readContent(parsed);
@@ -352,6 +455,7 @@ export function createOpenAiCompatibleInferenceProvider(
       throw new InferenceRequestError(
         "inference response carried no assistant content",
         response.status,
+        classifyEmptyReply(readFinishReason(parsed)),
       );
     }
     let content = choice.content;
@@ -370,6 +474,7 @@ export function createOpenAiCompatibleInferenceProvider(
       throw new InferenceRequestError(
         "inference response carried no assistant content",
         response.status,
+        classifyEmptyReply(readFinishReason(parsed)),
       );
     }
     const receiptId = response.headers.get("x-receipt-id") ?? undefined;

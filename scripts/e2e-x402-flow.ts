@@ -83,6 +83,7 @@ import {
   nextPaymentNonce,
   type X402Challenge,
 } from "../packages/core/src/payment/index.js";
+import { canonicalJsonBytes } from "../packages/core/src/json/jcs.js";
 import { ServerConfigSchema } from "../packages/core/src/schemas/server-config.js";
 import { createServer } from "../packages/server/src/bootstrap.js";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
@@ -690,7 +691,14 @@ async function main(): Promise<void> {
     const ingestedPlaintext = new TextEncoder().encode(
       JSON.stringify(ingestedEnvelope),
     );
-    const dataHash = keccak256(ingestedPlaintext);
+    // dataHash commits to the RFC 8785 canonical form of what the stored
+    // bytes decode to, not to the JSON.stringify bytes themselves (which
+    // stay the encrypted/stored plaintext and the sizeBytes basis below).
+    const dataHash = keccak256(
+      canonicalJsonBytes(
+        JSON.parse(new TextDecoder().decode(ingestedPlaintext)),
+      ),
+    );
     const metadataHash = keccak256(
       stringToHex(
         JSON.stringify({

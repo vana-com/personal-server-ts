@@ -1,0 +1,54 @@
+name: Set up the OS sandbox
+description: >-
+  Install and enable what @anthropic-ai/sandbox-runtime needs to confine
+  model-authored query scripts on a Linux runner. Without this the query
+  layer's sandbox refuses to run (by design) and every sandbox test fails.
+
+runs:
+  using: composite
+  steps:
+    # ASRT's Linux path hard-requires all three. `checkDependencies()` in
+    # @anthropic-ai/sandbox-runtime reports, verbatim on a bare ubuntu-24.04
+    # runner:
+    #   "Sandbox dependencies not available: ripgrep (rg) not found,
+    #    bubblewrap (bwrap) not installed, socat not installed"
+    #
+    #   - bwrap   — the sandbox itself (mount + network namespaces).
+    #   - socat   — the Unix-socket network bridge. Required even though we
+    #               run with zero egress: ASRT initialises the bridge
+    #               unconditionally on Linux.
+    #   - rg      — linuxGetMandatoryDenyPaths() shells out to ripgrep to
+    #               expand glob deny-patterns into concrete paths for bwrap.
+    #               (macOS never needs it: seatbelt takes regexes directly.)
+    - name: Install bubblewrap, socat and ripgrep
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends bubblewrap socat ripgrep
+
+    # Ubuntu 24.04 ships kernel.apparmor_restrict_unprivileged_userns=1, which
+    # denies unprivileged CLONE_NEWUSER to any unconfined binary. Neither the
+    # `bubblewrap` nor the `apparmor` package on noble ships a profile for
+    # bwrap, so bwrap is unconfined and therefore denied:
+    #   "bwrap: No permissions to create new namespace, likely because the
+    #    kernel does not allow non-privileged user namespaces."
+    # actions/runner-images declined to disable this in the image
+    # (actions/runner-images#11489), so each job must do it.
+    #
+    # This does NOT weaken our sandbox — it re-enables the kernel facility the
+    # sandbox is built on, on an ephemeral runner VM that is destroyed with the
+    # job. The alternative (an AppArmor profile granting bwrap `userns create`)
+    # buys nothing on a single-tenant throwaway VM.
+    - name: Permit unprivileged user namespaces (bubblewrap needs them)
+      shell: bash
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+    # Fail loudly here rather than as 21 confusing assertion errors later. If
+    # the runner image changes under us, this step names the reason.
+    - name: Verify the sandbox can actually run
+      shell: bash
+      run: |
+        set -euo pipefail
+        command -v bwrap socat rg
+        bwrap --ro-bind / / --unshare-all --die-with-parent /bin/true
+        echo "bubblewrap can create a namespace; the OS sandbox layer is live."

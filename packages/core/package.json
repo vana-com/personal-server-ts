@@ -1,7 +1,7 @@
 {
   "name": "@opendatalabs/personal-server-ts-core",
   "version": "0.0.1",
-  "description": "Protocol logic for the Vana Personal Server — auth, grants, scopes, storage, keys",
+  "description": "Protocol logic for the Vana Personal Server \u2014 auth, grants, scopes, storage, keys",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -92,6 +92,10 @@
       "types": "./dist/ports/index.d.ts",
       "import": "./dist/ports/index.js"
     },
+    "./query": {
+      "types": "./dist/query/ports.d.ts",
+      "import": "./dist/query/ports.js"
+    },
     "./logging/access-log": {
       "types": "./dist/logging/access-log.d.ts",
       "import": "./dist/logging/access-log.js"
@@ -124,10 +128,6 @@
       "types": "./dist/storage/adapters/index.d.ts",
       "import": "./dist/storage/adapters/index.js"
     },
-    "./test-utils": {
-      "types": "./dist/test-utils/index.d.ts",
-      "import": "./dist/test-utils/index.js"
-    },
     "./payment": {
       "types": "./dist/payment/index.d.ts",
       "import": "./dist/payment/index.js"
@@ -135,6 +135,18 @@
     "./write": {
       "types": "./dist/write/index.d.ts",
       "import": "./dist/write/index.js"
+    },
+    "./query/agent": {
+      "types": "./dist/query/agent/index.d.ts",
+      "import": "./dist/query/agent/index.js"
+    },
+    "./query/tools": {
+      "types": "./dist/query/tools/index.d.ts",
+      "import": "./dist/query/tools/index.js"
+    },
+    "./mcp/search": {
+      "types": "./dist/mcp/search/index.d.ts",
+      "import": "./dist/mcp/search/index.js"
     }
   },
   "scripts": {
@@ -143,6 +155,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@opendatalabs/vana-sdk": "3.14.0",
+    "acorn": "^8.16.0",
     "minisearch": "^7.2.0",
     "unpdf": "^1.6.2",
     "viem": "^2.54.2",

@@ -19,6 +19,11 @@ CREATE TABLE IF NOT EXISTS derivative_questions (
   source_scopes TEXT NOT NULL,
   question TEXT NOT NULL,
   model TEXT,
+  -- Vestigial. Registration no longer has a mode: every question takes the
+  -- one compute path. The column is kept because it shipped NOT NULL with a
+  -- default, so inserts that omit it still succeed and no DROP COLUMN
+  -- migration is needed. Nothing reads it.
+  mode TEXT NOT NULL DEFAULT 'completion',
   recompute TEXT NOT NULL DEFAULT 'on-change',
   registered_by TEXT NOT NULL,
   status TEXT NOT NULL,
@@ -74,17 +79,49 @@ function toRegistration(row: Row): QuestionRegistration {
   };
 }
 
+/**
+ * Adds the vestigial `mode` column to a table created before it existed.
+ *
+ * Registration no longer has a mode and nothing reads this column, but it
+ * shipped in a release, so databases in the wild may or may not have it.
+ * Kept (rather than replaced by a DROP COLUMN) because it is NOT NULL with a
+ * default: inserts that omit it succeed either way, so one dead column costs
+ * nothing and carries no migration risk. Guarded by `PRAGMA table_info` rather
+ * than a caught `ALTER`, so a real failure (locked database, disk full)
+ * surfaces here rather than resurfacing later as a confusing error.
+ */
+function migrateModeColumn(db: Database.Database): void {
+  const columns = db
+    .prepare("PRAGMA table_info(derivative_questions)")
+    .all() as Array<{ name: string }>;
+  if (columns.some((column) => column.name === "mode")) return;
+  db.exec(
+    "ALTER TABLE derivative_questions ADD COLUMN mode TEXT NOT NULL DEFAULT 'completion'",
+  );
+}
+
+/**
+ * Adds the `recompute` column to a table created before it existed, on the
+ * same terms as `migrateModeColumn`: guarded by `PRAGMA table_info`, so it is
+ * a no-op on a database that already has the column. Existing rows take the
+ * column default, `on-change`, the follow-every-change behavior they were
+ * registered under.
+ */
+function migrateRecomputeColumn(db: Database.Database): void {
+  const columns = db
+    .prepare("PRAGMA table_info(derivative_questions)")
+    .all() as Array<{ name: string }>;
+  if (columns.some((column) => column.name === "recompute")) return;
+  db.exec(ADD_RECOMPUTE_COLUMN_SQL);
+}
+
 export function createSqliteQuestionStore(
   db: Database.Database,
 ): QuestionStore {
   db.exec(CREATE_TABLE_SQL);
   db.exec(CREATE_INDEX_SQL);
-  const columns = db
-    .prepare("PRAGMA table_info(derivative_questions)")
-    .all() as Array<{ name: string }>;
-  if (!columns.some((column) => column.name === "recompute")) {
-    db.exec(ADD_RECOMPUTE_COLUMN_SQL);
-  }
+  migrateModeColumn(db);
+  migrateRecomputeColumn(db);
 
   const listAll = db.prepare(
     "SELECT * FROM derivative_questions ORDER BY created_at ASC, question_id ASC",
@@ -94,8 +131,8 @@ export function createSqliteQuestionStore(
   );
   const insertOne = db.prepare(`
     INSERT INTO derivative_questions (
-      question_id, derived_scope, source_scopes, question, model, recompute,
-      registered_by, status, error, created_at, updated_at,
+      question_id, derived_scope, source_scopes, question, model,
+      recompute, registered_by, status, error, created_at, updated_at,
       last_computed_at, derived_version, derived_collected_at
     ) VALUES (
       @question_id, @derived_scope, @source_scopes, @question, @model,

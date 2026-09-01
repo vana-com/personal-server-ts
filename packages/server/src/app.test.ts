@@ -15,7 +15,7 @@ import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logg
 import {
   createTestWallet,
   buildWeb3SignedHeader,
-} from "@opendatalabs/personal-server-ts-core/test-utils";
+} from "../../core/src/test-utils/index.js";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import pino from "pino";
@@ -878,6 +878,63 @@ describe("createApp", () => {
       expect(
         lowerList(res.headers.get("Access-Control-Expose-Headers")),
       ).toContain("x-vana-metadata");
+    });
+  });
+
+  /**
+   * The query layer's first real entrypoint (implementation plan phase 8).
+   *
+   * Before this, nothing in the server imported `query/agent` or either
+   * sandbox — the only consumers were `scripts/` and tests. A route that is
+   * built but never registered is the exact failure mode worth a test of its
+   * own, so this asserts it is mounted and owner-gated from the assembled
+   * app, not just from the route module.
+   */
+  describe("/v1/query", () => {
+    it("is mounted and requires owner auth", async () => {
+      const app = makeApp();
+      const res = await app.request("/v1/query/scopes");
+      // 401, not the 404 an unregistered route would give.
+      expect(res.status).toBe(401);
+    });
+
+    it("answers the owner, and reports the concurrency ceiling", async () => {
+      const app = makeApp();
+      const res = await app.request("/v1/query/scopes", {
+        headers: {
+          authorization: await buildWeb3SignedHeader({
+            wallet: ownerWallet,
+            aud: SERVER_ORIGIN,
+            method: "GET",
+            uri: "/v1/query/scopes",
+          }),
+        },
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { maxConcurrentQueries: number };
+      expect(body.maxConcurrentQueries).toBeGreaterThanOrEqual(1);
+    });
+
+    it("answers 503 for a question when no inference provider is wired", async () => {
+      // `makeApp` supplies none, which is the default deployment shape: the
+      // route degrades visibly rather than half-working.
+      const app = makeApp();
+      const body = JSON.stringify({ question: "how much did I sleep?" });
+      const res = await app.request("/v1/query/ask", {
+        method: "POST",
+        headers: {
+          authorization: await buildWeb3SignedHeader({
+            wallet: ownerWallet,
+            aud: SERVER_ORIGIN,
+            method: "POST",
+            uri: "/v1/query/ask",
+            body: new TextEncoder().encode(body),
+          }),
+        },
+        body,
+      });
+      expect(res.status).toBe(503);
+      expect((await res.json()).error.errorCode).toBe("INFERENCE_UNAVAILABLE");
     });
   });
 });

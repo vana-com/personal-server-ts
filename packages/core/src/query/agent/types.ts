@@ -1,0 +1,225 @@
+/**
+ * The query layer's request/answer contract (implementation plan phase 5).
+ *
+ * `QueryAnswer.coverage` is assembled by the host from its own counters, never
+ * from anything the model or its script says — the integrity rule in
+ * `docs/260828-query-layer-prompt.md` §1. A script that scans 30 of 300 records
+ * cannot report 300 scanned, because it does not author that counter.
+ */
+
+export interface QueryBudget {
+  /** Maximum model turns. Also the only bound on relay call volume today. */
+  toolCalls?: number;
+  wallClockMs?: number;
+  usd?: number;
+}
+
+export interface QueryRequest {
+  question: string;
+  grantedScopes: string[];
+  budget?: QueryBudget;
+}
+
+export interface QueryCitation {
+  scope: string;
+  recordId?: string;
+  blockRef?: string;
+}
+
+/**
+ * Why a run stopped early. `budget` is a first-class outcome, not an error
+ * (prompt doc §3): the run ends with a partial answer that says it stopped.
+ */
+export type QueryStoppedBecause =
+  | "budget"
+  | "wallClock"
+  | "cpu"
+  | "memory"
+  | "outputCap"
+  | "policyDenied"
+  | "sandboxUnavailable"
+  | "contractViolation"
+  /**
+   * The provider kept returning a reply with no content because it discarded a
+   * tool call it could not parse.
+   *
+   * Its own reason rather than `error` because it is a specific, recognisable
+   * provider behaviour with a specific non-response — do not raise the token
+   * budget, it is not a truncation — and because a run that stopped this way
+   * has to be distinguishable from one that crashed. See `agent/loop.ts`.
+   */
+  | "malformedToolCall"
+  /**
+   * The model committed to an answer that no read stands behind — it answered
+   * over `recordsScanned: 0`.
+   *
+   * Its own reason rather than `contractViolation` because the reply was
+   * perfectly well formed; what was missing was the data. A run that stopped
+   * this way produced prose, not a finding, and a caller has to be able to
+   * tell the two apart. See `agent/loop.ts`.
+   */
+  | "ungroundedAnswer"
+  | "error";
+
+/**
+ * Host-authored coverage as it travels on a {@link QueryAnswer}.
+ *
+ * **The key order of this object is a function of its content and nothing
+ * else.** It is built in exactly one place — the single object literal at the
+ * end of `agent/loop.ts`, in the declaration order below — so two runs that
+ * reach the same logical coverage by different code paths serialize to
+ * identical bytes. That is a precondition for putting coverage anywhere it is
+ * compared, diffed, logged or committed, and it is why every optional here is
+ * present-or-absent by its VALUE rather than by the order some branch happened
+ * to assign it. `agent/coverage-determinism.test.ts` pins the property.
+ *
+ * Deliberately NOT a superset of the tool layer's `CoverageCounters`
+ * (`tools/types.ts`). `perScope` is that type's private substrate for the
+ * cross-run subsumption merge and is not projected here: its key order follows
+ * the order scopes were first touched, which is script-execution order, so it
+ * is the one field whose serialization could never be a function of its
+ * content. Nothing downstream of this type ever read it.
+ */
+export interface QueryCoverage {
+  scopesScanned: string[];
+  /**
+   * Which of {@link scopesScanned} were read but not streamed end to end.
+   *
+   * The surviving half of the removed `complete` flag, as a list of parts
+   * rather than a scalar over them: **the model cannot buy a completeness
+   * claim by sampling**, because a bounded read is host-recorded here and only
+   * a pass that actually exhausted the scope takes it out again. See
+   * `CoverageCounters.scopesPartiallyScanned` (`tools/types.ts`) for the
+   * unforgeability argument and `tools/coverage.ts` for why the flag itself
+   * is not coming back.
+   *
+   * A subset of `scopesScanned`. Optional only because a host that never
+   * reported has no list to give.
+   */
+  scopesPartiallyScanned?: string[];
+  recordsScanned: number;
+  /**
+   * Bytes read across every scope this request touched.
+   *
+   * Host-authored, from the loader rather than from anything a script claims.
+   * Optional only because a run that read nothing has no figure to report —
+   * it is populated on every real read path, and was previously travelling on
+   * the runtime object while undeclared here, so no typed consumer could see
+   * it.
+   */
+  bytesScanned?: number;
+  scopesSkipped: { scope: string; reason: string }[];
+  /** Records present but unreadable — what makes an absence answer honest. */
+  unreadable?: number;
+  /** "prefiltered" marks a semantically-narrowed pass (prompt doc §5, Q9/Q15). */
+  method?: "full" | "prefiltered";
+  stoppedBecause?: QueryStoppedBecause;
+  /**
+   * Scopes reached with no T2 profile. Plan §3 risk 3: a source without a
+   * profile is reduced-confidence and must be flagged, not answered as if it
+   * were understood.
+   */
+  unprofiledScopes?: string[];
+  /**
+   * Set when profile prose was summarized to fit the prompt budget. Plan §4.3:
+   * reduced capability must be visible.
+   */
+  profilesSummarized?: string[];
+  /** OS-sandbox policy violations observed during the run. */
+  violations?: string[];
+  /**
+   * What the sandbox actually enforced, verbatim from
+   * `SandboxEnforcement.notes` via `CoverageCounters.enforcementNotes`.
+   *
+   * Declared rather than added: the real hosts return a `CoverageCounters`
+   * from `coverage()` and this field has always ridden onto the answer on the
+   * spread, undeclared, so no typed consumer could see the one field that says
+   * what containment was actually in force. Plan §4.3 — reduced capability
+   * must be visible — so it is projected explicitly, not dropped.
+   */
+  enforcementNotes?: string[];
+}
+
+export interface QueryCost {
+  /** Scripts actually executed. Not the same as model turns — see below. */
+  toolCalls: number;
+  /**
+   * Model turns consumed, including repair retries and the wrap-up turn.
+   *
+   * This is what `budget.toolCalls` actually bounds and what drives relay
+   * volume; `toolCalls` counts only turns that ran a script.
+   */
+  modelTurns?: number;
+  /**
+   * Inference calls actually put on the wire, which is neither `toolCalls` nor
+   * `modelTurns`.
+   *
+   * A turn can issue several: an empty or malformed-tool-call reply is re-asked
+   * (`EMPTY_REPLY_RETRIES`, `MALFORMED_TOOL_CALL_RETRIES`) and each re-ask is a
+   * fresh call, and the wrap-up turn adds one more outside the turn budget.
+   * `data-gateway` meters CALLS per signer per UTC day
+   * (`lib/inference-quota.ts` `DEFAULT_INFERENCE_SIGNER_REQUESTS_PER_DAY`), so
+   * this is the number that quota sees and `modelTurns` understates it.
+   */
+  relayCalls?: number;
+  inputTokens: number;
+  outputTokens: number;
+  usd?: number;
+}
+
+export interface QueryAnswer {
+  answer: string;
+  citations: QueryCitation[];
+  coverage: QueryCoverage;
+  /** The code that produced the answer, when a script ran. */
+  script?: string;
+  determinism: "replayed" | "generated";
+  cost: QueryCost;
+  /** The numeric result when the answer has one. */
+  value?: number;
+  /**
+   * How the model resolved the set it aggregated over, when the question named
+   * one the data does not define. Graded separately from the number: a run
+   * that resolves the set differently but *states* the resolution is a
+   * different outcome from one that silently picked wrong, and until this
+   * field existed both rendered as the same failing row.
+   */
+  resolution?: string;
+  /** Relay receipt ids seen across the run (`x-receipt-id`). */
+  receiptIds?: string[];
+}
+
+/** Model-declared confidence from a `vana:answer` block. Never coverage. */
+export type QueryConfidence = "high" | "medium" | "low";
+
+/**
+ * Coverage for a run that produced none.
+ *
+ * Used when no confined run ever reported — a contract violation burned both
+ * attempts, or the coverage frame never arrived.
+ *
+ * **Fails closed**, and it is worth being precise about how, because this
+ * shape no longer carries a `complete: false` to do it. The guarantee is that
+ * "we learned nothing" can never render as a confident total, and it now rests
+ * on the counters themselves: `recordsScanned: 0` over `scopesScanned: []`.
+ * Both are host-authored and only a confined run can move them, so this shape
+ * is indistinguishable — by construction — from any other run that read
+ * nothing. `agent/loop.ts`'s `honestAnswerText` keys the "this answer is
+ * incomplete" caveat off exactly that condition, so an answer built on this
+ * coverage is always caveated in the answer TEXT, not merely in metadata.
+ *
+ * The property therefore holds for the same reason it did before, one
+ * indirection shorter: the flag was only ever a restatement of the zero.
+ * Raising either counter here would break it, which is what
+ * `EMPTY_COVERAGE fails closed` in `loop.test.ts` pins.
+ */
+export const EMPTY_COVERAGE: QueryCoverage = Object.freeze({
+  scopesScanned: [],
+  // Nothing was scanned, so nothing was partially scanned. Empty for the same
+  // reason `scopesScanned` is, and it cannot be read the other way round: a
+  // consumer asking "was anything sampled rather than exhausted" gets "no
+  // scope was read at all" from the zeroed counters beside it.
+  scopesPartiallyScanned: [],
+  recordsScanned: 0,
+  scopesSkipped: [],
+});

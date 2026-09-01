@@ -5,7 +5,7 @@ import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
 import {
   createTestWallet,
   buildWeb3SignedHeader,
-} from "@opendatalabs/personal-server-ts-core/test-utils";
+} from "../../../core/src/test-utils/index.js";
 import {
   createInMemoryWriteSessionStore,
   hashWriteSessionToken,

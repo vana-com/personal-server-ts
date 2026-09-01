@@ -77,10 +77,10 @@ describe("mcp/tools", () => {
     expect(response.status).toBe(200);
     const body = await response.text();
     expect(() => JSON.parse(body)).not.toThrow();
-    // Budget raised from 4000 when list_scope_blocks was added; the point is
-    // that tools/list stays small enough to cross the relay in one go, not the
-    // exact number.
-    expect(new TextEncoder().encode(body).byteLength).toBeLessThan(5000);
+    // Budget raised from 4000 when list_scope_blocks was added and from 5000
+    // when ask_personal_data was; the point is that tools/list stays small
+    // enough to cross the relay in one go, not the exact number.
+    expect(new TextEncoder().encode(body).byteLength).toBeLessThan(6000);
   });
 
   it("advertises no timeoutMs larger than the dispatcher will allow", async () => {

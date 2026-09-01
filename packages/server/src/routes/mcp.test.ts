@@ -37,7 +37,7 @@ import {
 import {
   createTestWallet,
   buildWeb3SignedHeader,
-} from "@opendatalabs/personal-server-ts-core/test-utils";
+} from "../../../core/src/test-utils/index.js";
 import type {
   Builder,
   GatewayClient,
@@ -1818,6 +1818,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
       "list_scope_blocks",
       "get_scope_file",
       "search_personal_context",
+      "ask_personal_data",
     ]);
   });
 });

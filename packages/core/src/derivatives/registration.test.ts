@@ -5,6 +5,7 @@ import {
   parseQuestionInput,
 } from "./registration.js";
 import { createInMemoryQuestionStore } from "./store.js";
+import { questionRegistrationView } from "./types.js";
 
 const valid = {
   derivedScope: "coach.weekly",
@@ -24,6 +25,17 @@ describe("parseQuestionInput", () => {
     expect(parseQuestionInput({ ...valid, model: "z-ai/glm-5.2" }).model).toBe(
       "z-ai/glm-5.2",
     );
+  });
+
+  it("ignores a `mode` the way it ignores any other unknown body key", () => {
+    // There is one compute path now, so `mode` is not a field. It is not
+    // rejected either: this parser reads only the keys it knows, so a stale
+    // client that still sends one registers exactly as if it had not.
+    for (const stale of ["completion", "code", "agentic", 1, {}]) {
+      const parsed = parseQuestionInput({ ...valid, mode: stale });
+      expect(parsed).not.toHaveProperty("mode");
+      expect(parsed.question).toBe(valid.question);
+    }
   });
 
   it("accepts both recompute policies and defaults a null to on-change", () => {
@@ -159,5 +171,44 @@ describe("createQuestionRegistration", () => {
       }),
     ).rejects.toMatchObject({ errorCode: "DERIVATIVE_CYCLE", code: 409 });
     expect(await store.get("q-2")).toBeNull();
+  });
+});
+
+describe("createInMemoryQuestionStore", () => {
+  it("loads a seeded registration that still carries a legacy `mode`", async () => {
+    // A build that predates this change wrote `mode` onto every record. The
+    // in-memory store is the one PS-Lite rehydrates into, so a record that
+    // still has the key must round-trip rather than be rejected or read wrong.
+    const legacy = {
+      questionId: "q-legacy",
+      derivedScope: "coach.weekly",
+      sourceScopes: ["oura.sleep"],
+      question: "How did I sleep?",
+      model: null,
+      mode: "code",
+      recompute: "on-change" as const,
+      registeredBy: { kind: "owner" as const },
+      status: "ready" as const,
+      error: null,
+      createdAt: "2026-08-01T00:00:00.000Z",
+      updatedAt: "2026-08-01T00:00:00.000Z",
+      lastComputedAt: null,
+      derivedVersion: null,
+      derivedCollectedAt: null,
+    };
+    const store = createInMemoryQuestionStore({ initial: [legacy] });
+
+    const loaded = await store.get("q-legacy");
+    expect(loaded).not.toBeNull();
+    expect(loaded!.question).toBe("How did I sleep?");
+    expect(loaded!.status).toBe("ready");
+    expect(loaded!.recompute).toBe("on-change");
+    // The dead key is carried, not interpreted: it reaches no compute path,
+    // and the public view is built by explicit field picks.
+    expect(questionRegistrationView(loaded!)).not.toHaveProperty("mode");
+
+    // And it stays loadable across an update.
+    await store.update("q-legacy", { status: "stale" });
+    expect((await store.get("q-legacy"))!.status).toBe("stale");
   });
 });

@@ -14,7 +14,7 @@ import {
 import {
   createTestWallet,
   buildWeb3SignedHeader,
-} from "@opendatalabs/personal-server-ts-core/test-utils";
+} from "../../../core/src/test-utils/index.js";
 import { grantsRoutes } from "./grants.js";
 
 const logger = pino({ level: "silent" });

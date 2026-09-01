@@ -14,7 +14,7 @@ import { createScopeDeletionTracker } from "@opendatalabs/personal-server-ts-cor
 import {
   buildWeb3SignedHeader,
   createTestWallet,
-} from "@opendatalabs/personal-server-ts-core/test-utils";
+} from "../../core/src/test-utils/index.js";
 import {
   createDataFileEnvelope,
   RECORD_DATA_ACCESS_TYPES,

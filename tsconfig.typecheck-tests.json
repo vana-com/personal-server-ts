@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "incremental": false,
+    "types": ["node"]
+  },
+  "include": [
+    "packages/core/src/query/**/*.ts",
+    "packages/server/src/query/**/*.ts",
+    "scripts/query-*.ts"
+  ]
+}

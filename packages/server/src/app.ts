@@ -23,6 +23,13 @@ import {
 import { derivativesRoutes } from "./routes/derivatives.js";
 import { grantsRoutes } from "./routes/grants.js";
 import { accessLogsRoutes } from "./routes/access-logs.js";
+import { queryRoutes } from "./routes/query.js";
+import { createNodeDataStorage } from "./storage/node-data-storage.js";
+import {
+  createQueryConcurrency,
+  resolveMaxConcurrent,
+} from "./query/query-service.js";
+import { createMcpAskPersonalDataPort } from "./query/mcp-ask-port.js";
 import { syncRoutes } from "./routes/sync.js";
 import {
   mcpActivityRoutes,
@@ -52,6 +59,7 @@ import type {
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
 import type {
+  InferenceProvider,
   QuestionStore,
   RecomputeScheduler,
 } from "@opendatalabs/personal-server-ts-core/derivatives";
@@ -97,6 +105,21 @@ export interface AppDeps {
   tokenStore?: TokenStore;
   runtimeAvailability?: RuntimeAvailabilityPort;
   dataStorage?: DataStoragePort;
+  /**
+   * Inference for the query layer's agent loop (implementation plan phase 8).
+   *
+   * The same provider the derivative compute layer already uses, so the query
+   * layer inherits E2EE, Web3Signed relay auth and receipt passthrough rather
+   * than opening a second inference path. Optional and additive: absent,
+   * `/v1/query/ask` answers 503 and nothing else changes.
+   */
+  inferenceProvider?: InferenceProvider;
+  /**
+   * Questions the query layer may run at once, across `/v1/query/ask` and
+   * `ask_personal_data` together. Defaults to `PS_QUERY_MAX_CONCURRENT`, then
+   * to `DEFAULT_MAX_CONCURRENT_QUERIES`.
+   */
+  maxConcurrentQueries?: number;
   /**
    * Gateway base URL — wired into the data route so the GET handler can
    * forward validated X-PAYMENTs to POST /v1/escrow/pay via direct fetch.
@@ -294,6 +317,39 @@ export function createApp(deps: AppDeps): Hono {
     }),
   );
 
+  // ONE ceiling for the whole process, shared by the HTTP route and the MCP
+  // tool. Two independent limiters would let a server configured for four
+  // concurrent scans run eight (plan §3 risk 4).
+  const queryConcurrency = createQueryConcurrency(
+    resolveMaxConcurrent(deps.maxConcurrentQueries),
+  );
+
+  // Mount query routes (all owner auth). The query layer's first real
+  // entrypoint: the owner asks a question and the answer is computed by
+  // sandboxed code over exactly the scopes their grant covers, one
+  // access-log row per scope touched.
+  app.route(
+    "/v1/query",
+    queryRoutes({
+      concurrency: queryConcurrency,
+      logger: deps.logger,
+      serverOrigin: deps.serverOrigin,
+      serverOwner: deps.serverOwner,
+      gateway: deps.gateway,
+      devToken: deps.devToken,
+      accessToken: deps.accessToken,
+      tokenStore: deps.tokenStore,
+      accessLogWriter: deps.accessLogWriter,
+      dataStorage:
+        deps.dataStorage ??
+        createNodeDataStorage({
+          indexManager: deps.indexManager,
+          hierarchyOptions: deps.hierarchyOptions,
+        }),
+      inferenceProvider: deps.inferenceProvider,
+    }),
+  );
+
   // Mount sync routes (all owner auth)
   app.route(
     "/v1/sync",
@@ -343,6 +399,15 @@ export function createApp(deps: AppDeps): Hono {
     oauthAuthorizationStore: mcpOAuthAuthorizationStore,
     oauthApprovalUrl: deps.mcpOAuthApprovalUrl,
     activityRecorder: mcpActivityRecorder,
+    // Backs `ask_personal_data`. Only when inference is configured — without
+    // a provider there is no agent loop to run, and the tool says so rather
+    // than failing mid-call.
+    askPersonalData: deps.inferenceProvider
+      ? createMcpAskPersonalDataPort({
+          provider: deps.inferenceProvider,
+          concurrency: queryConcurrency,
+        })
+      : undefined,
   };
 
   app.route("/", mcpOAuthRoutes(mcpRouteDeps));

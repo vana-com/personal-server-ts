@@ -14,6 +14,7 @@ import type {
   DataStoragePort,
   PendingBlobDeletionStore,
 } from "../../ports/index.js";
+import { canonicalJsonBytes } from "../../json/jcs.js";
 import { computeDataPointId } from "../data-point-id.js";
 import {
   deletionTimestamp,
@@ -254,19 +255,57 @@ export async function uploadOne(
   const encrypted = await encryptWithPassword(plaintext, scopeKeyHex);
 
   // 4. Compute the on-chain commitments.
-  //   dataHash     = keccak256 of the plaintext envelope JSON. Commits to the
-  //                  canonical content, not the ciphertext — OpenPGP
-  //                  password-based encryption embeds random salts so
+  //   dataHash     = keccak256 of the RFC 8785 (JCS) canonical form of the
+  //                  envelope. Commits to the content, not the ciphertext —
+  //                  OpenPGP password-based encryption embeds random salts so
   //                  re-encrypting the same plaintext yields different bytes;
-  //                  hashing the plaintext keeps the on-chain commitment
+  //                  hashing the content keeps the on-chain commitment
   //                  reproducible across replicas serving the same version.
-  //   metadataHash = keccak256 of canonical-JSON({scope, collectedAt,
-  //                  sizeBytes}). Commits to the off-chain metadata that
+  //
+  //                  It is canonicalized rather than plain JSON.stringify'd
+  //                  because insertion order is NOT part of a record's
+  //                  identity: two replicas that assemble the same logical
+  //                  envelope with different key order must agree on the
+  //                  commitment, or the dedupe at the 409 handler below
+  //                  misses and mints a redundant on-chain version.
+  //
+  //                  Deliberately NOT the bytes we encrypt: `plaintext` above
+  //                  stays the plain JSON.stringify form. The download worker
+  //                  writes a decrypted envelope straight to local storage,
+  //                  and `verifyStoredWriterAttribution` re-hashes a stored
+  //                  builder-written record's `data` with JSON.stringify to
+  //                  check it against the builder's signed bodyHash. Storing
+  //                  key-sorted bytes would reorder that payload on every
+  //                  replica that downloads it and fail BODY_HASH_MISMATCH.
+  //
+  //                  The preimage is the canonical form of what the stored
+  //                  blob DECODES to, not of the in-memory `envelope`, so the
+  //                  commitment stays third-party verifiable by exactly:
+  //                  download → decrypt → JSON.parse → JCS → keccak256.
+  //                  Round-tripping through the stored bytes also keeps this
+  //                  total where JCS alone is not: JCS throws on `undefined`
+  //                  members and bigints, which `JSON.stringify` silently
+  //                  drops or rejects. PS-Lite's IndexedDB fallback store
+  //                  hands `readEnvelope` back the very object that was
+  //                  written with no serialization barrier, so a member
+  //                  `JSON.stringify` would have dropped must not become a
+  //                  hard upload failure here.
+  //   metadataHash = keccak256 of JSON({scope, collectedAt, sizeBytes}).
+  //                  Left on plain JSON.stringify deliberately: the preimage
+  //                  is an object literal built right here with three
+  //                  statically-ordered primitive fields, so its
+  //                  serialization is already fixed at the call site and JCS
+  //                  would buy no determinism — only a second breaking hash
+  //                  change. Canonicalize it if and when it ever grows a
+  //                  caller-supplied or conditionally-spread field.
+  //                  Commits to the off-chain metadata that
   //                  describes this version without leaking the payload. DPv2
   //                  is scope-addressed with no schema concept — the gateway
   //                  neither records nor registers schemas — so no schemaId is
   //                  looked up or committed.
-  const dataHash = keccak256(plaintext);
+  const dataHash = keccak256(
+    canonicalJsonBytes(JSON.parse(new TextDecoder().decode(plaintext))),
+  );
   const metadataHash = keccak256(
     stringToHex(
       JSON.stringify({

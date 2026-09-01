@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { recoverMessageAddress } from "viem";
-import { createTestWallet } from "@opendatalabs/personal-server-ts-core/test-utils";
+import { createTestWallet } from "../../../core/src/test-utils/index.js";
 import {
   generateSignedClaim,
   base64urlEncode,

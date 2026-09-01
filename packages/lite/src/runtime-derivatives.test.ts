@@ -142,6 +142,63 @@ describe("PS-Lite derivative compute", () => {
     expect((await reloaded.get(questionId))?.status).toBe("ready");
   });
 
+  it("rehydrates rows persisted with a legacy `mode` key", async () => {
+    const stateStore = createMemoryPsLiteStateStore();
+
+    // Seed the state store the way the build that had modes left it. There is
+    // no schema migration on Lite — rehydration is the migration — so a
+    // stored `mode` must not stop a record from loading.
+    const seed = {
+      derivedScope: "coach.weekly",
+      sourceScopes: ["oura.sleep"],
+      question: "How did I sleep?",
+      model: null,
+      recompute: "on-change" as const,
+      registeredBy: { kind: "owner" as const },
+      status: "ready" as const,
+      error: null,
+      createdAt: "2026-08-01T00:00:00.000Z",
+      updatedAt: "2026-08-01T00:00:00.000Z",
+      lastComputedAt: null,
+      derivedVersion: null,
+      derivedCollectedAt: null,
+    };
+    await stateStore.set("derivative-questions-v1", {
+      version: 1,
+      questions: [
+        { ...seed, questionId: "completionish", mode: "completion" },
+        { ...seed, questionId: "coded", mode: "code" },
+        { ...seed, questionId: "bogus", mode: "agentic" },
+      ],
+    });
+
+    const store = await createPsLiteQuestionStore(stateStore);
+    for (const id of ["completionish", "coded", "bogus"]) {
+      const loaded = await store.get(id);
+      expect(loaded).not.toBeNull();
+      expect(loaded!.question).toBe("How did I sleep?");
+      expect(loaded!.status).toBe("ready");
+      expect(loaded!.recompute).toBe("on-change");
+    }
+    expect((await store.list()).map((q) => q.questionId).sort()).toEqual([
+      "bogus",
+      "coded",
+      "completionish",
+    ]);
+
+    // A write-back over a legacy record still persists a loadable row.
+    await store.update("coded", { status: "stale" });
+    const persisted = await stateStore.get<{
+      version: 1;
+      questions: QuestionRegistration[];
+    }>("derivative-questions-v1");
+    expect(
+      persisted?.questions.find((q) => q.questionId === "coded")?.status,
+    ).toBe("stale");
+    const again = await createPsLiteQuestionStore(stateStore);
+    expect((await again.get("coded"))?.status).toBe("stale");
+  });
+
   it("defaults recompute to on-change for registrations saved before the field existed", async () => {
     const stateStore = createMemoryPsLiteStateStore();
     const legacy = {

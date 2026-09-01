@@ -94,8 +94,8 @@ export interface CreateServerOptions {
   /**
    * Inference provider for the derivative compute layer. Defaults to the
    * OpenAI-compatible client on `config.inference` (env overrides:
-   * INFERENCE_BASE_URL, INFERENCE_MODEL, INFERENCE_API_KEY). Tests inject
-   * a fake.
+   * INFERENCE_BASE_URL, INFERENCE_MODEL, INFERENCE_API_KEY,
+   * INFERENCE_E2EE, INFERENCE_REQUEST_FIELDS). Tests inject a fake.
    */
   inferenceProvider?: InferenceProvider;
   /** @deprecated Use rootPath instead. */
@@ -121,6 +121,38 @@ export interface CreateServerOptions {
 }
 
 const DEFAULT_LOCAL_APPROVAL_PORT = 34127;
+
+/**
+ * `INFERENCE_REQUEST_FIELDS` — extra top-level fields on every chat request.
+ *
+ * Unset leaves `config.inference.requestFields` (the Phala routing hint) in
+ * place, so default behaviour is unchanged. `none` or `{}` sends no extra
+ * fields, which is what a non-Phala provider wants. Anything else must be a
+ * JSON object; a malformed value throws at boot rather than silently sending
+ * the wrong body — the request bytes are what the signature covers.
+ */
+export function parseRequestFields(
+  raw: string | undefined,
+  fallback: Record<string, unknown>,
+): Record<string, unknown> {
+  if (raw === undefined) return fallback;
+  const trimmed = raw.trim();
+  if (trimmed === "" || trimmed.toLowerCase() === "none") return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    throw new Error(
+      "INFERENCE_REQUEST_FIELDS must be a JSON object, `none`, or unset",
+    );
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(
+      "INFERENCE_REQUEST_FIELDS must be a JSON object, `none`, or unset",
+    );
+  }
+  return parsed as Record<string, unknown>;
+}
 
 function resolveLocalApprovalPort(serverPort: number): number {
   const raw = process.env.LOCAL_AUTH_PORT;
@@ -340,6 +372,13 @@ export async function createServer(
   // Local development only: production relays hold the provider key. A key
   // means the base URL is a provider, not the relay, so nothing is signed.
   const inferenceApiKey = process.env.INFERENCE_API_KEY;
+  // Extra body fields on every chat-completions request. Defaults to the
+  // Vana / Phala routing hint; set INFERENCE_REQUEST_FIELDS to `none` (or
+  // `{}`) when pointing baseUrl at a provider where the hint is meaningless.
+  const inferenceRequestFields = parseRequestFields(
+    process.env.INFERENCE_REQUEST_FIELDS,
+    config.inference.requestFields,
+  );
   // The Vana inference relay only forwards requests signed by the owner or
   // by one of the owner's active registered servers; this is the same
   // server-key signer the lineage reads use.
@@ -351,6 +390,7 @@ export async function createServer(
       model: process.env.INFERENCE_MODEL ?? config.inference.model,
       apiKey: inferenceApiKey,
       requestSigner: inferenceSigner,
+      requestFields: inferenceRequestFields,
       encryption: inferenceE2ee
         ? createPhalaE2eeEncryption({
             baseUrl: inferenceBaseUrl,
@@ -560,6 +600,10 @@ export async function createServer(
     accessLogWriter,
     accessLogReader,
     readFulfillmentReporter: options?.readFulfillmentReporter,
+    // The same provider the derivative compute layer uses, handed to the
+    // query layer's agent loop (/v1/query, ask_personal_data). One inference
+    // path, so E2EE and relay signing are inherited rather than re-derived.
+    inferenceProvider,
     dataStorage,
     scopeDeletions,
     cloudMode,

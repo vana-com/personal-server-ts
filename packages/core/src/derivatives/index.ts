@@ -52,6 +52,9 @@ export {
   type FakeInferenceProviderOptions,
   type InferenceChatInput,
   type InferenceChatResult,
+  // Required to construct an `InferenceRequestError`, so a consumer that
+  // implements `InferenceProvider` cannot throw one without it.
+  type InferenceErrorCode,
   type InferenceMessage,
   type InferenceProvider,
   type InferenceRequestEncryption,
@@ -67,6 +70,14 @@ export {
   type DerivativeAnswerRecord,
   type QuestionComputeDeps,
 } from "./compute.js";
+export {
+  QueryRecordMappingError,
+  buildQueryAnswerRecord,
+  queryAnswerRecordKeys,
+  type BuildQueryAnswerRecordInput,
+  type QueryAnswerRecordBuild,
+  type QueryRecordSource,
+} from "./query-record.js";
 export {
   createRecomputeScheduler,
   type RecomputeScheduler,

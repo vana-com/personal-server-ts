@@ -25,8 +25,8 @@
     "test:watch": "vitest",
     "test:e2e": "vitest run --config tests/e2e/vitest.config.ts",
     "lint": "tsc --noEmit",
-    "lint:eslint": "eslint 'packages/*/src/**/*.ts'",
-    "lint:eslint:fix": "eslint --fix 'packages/*/src/**/*.ts'",
+    "lint:eslint": "eslint 'packages/*/src/**/*.ts' 'scripts/**/*.ts'",
+    "lint:eslint:fix": "eslint --fix 'packages/*/src/**/*.ts' 'scripts/**/*.ts'",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "register-server": "tsx --env-file-if-exists=.env scripts/register-server.ts",
@@ -40,8 +40,10 @@
     "e2e:write-api": "tsx scripts/e2e-write-api.ts",
     "e2e:read-scope-lite": "tsx scripts/e2e-read-scope-lite.ts",
     "e2ee:smoke": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/e2ee-smoke.ts",
-    "validate": "npm run lint && npm run lint:eslint && npm run format:check && npm test",
-    "prepare": "husky"
+    "validate": "npm run lint && npm run lint:query-tests && npm run lint:eslint && npm run format:check && npm test",
+    "prepare": "husky",
+    "eval": "tsx scripts/query-eval.ts",
+    "lint:query-tests": "tsc -p tsconfig.typecheck-tests.json"
   },
   "lint-staged": {
     "*.{ts,js}": [

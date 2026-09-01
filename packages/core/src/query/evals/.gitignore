@@ -1,0 +1,5 @@
+# Generated corpora are never committed — the generator is the artifact.
+# The full profile is ~237MB and reproduces from a seed in about a second.
+corpus/
+corpus-*/
+*.corpus/

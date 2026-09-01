@@ -16,18 +16,37 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The canary version is derived from the newest v-tag, and the
+          # default shallow clone fetches none, so `git describe` silently
+          # falls back and every canary publishes as 0.0.1.
+          fetch-tags: true
+          fetch-depth: 0
       - uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
           registry-url: https://registry.npmjs.org
+      # Same suite as CI — see .github/actions/setup-sandbox.
+      - uses: ./.github/actions/setup-sandbox
       - run: npm ci
       - run: npm run build
       - run: npm test
       - run: npm run test:e2e
       - name: Set canary version
         run: |
-          BASE_VERSION=$(node -p "require('./packages/cli/package.json').version")
+          # The in-repo package.json versions are all 0.0.1: semantic-release
+          # computes the real version from git tags at publish time and never
+          # writes it back. Deriving the canary base from the file therefore
+          # produced 0.0.1-canary.<sha>, which sorts *below* every released
+          # version, so `npm install @canary` worked but no semver range could
+          # ever resolve it. Take the newest tag instead and bump the patch, so
+          # the canary sits above the last release and below the next one.
+          LATEST_TAG=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || echo "v0.0.0")
+          BASE_VERSION=$(node -p "
+            const [maj, min, pat] = process.argv[1].replace(/^v/, '').split('.').map(Number);
+            [maj, min, pat + 1].join('.')
+          " "$LATEST_TAG")
           SHORT_SHA=$(git rev-parse --short HEAD)
           CANARY_VERSION="${BASE_VERSION}-canary.${SHORT_SHA}"
           echo "CANARY_VERSION=${CANARY_VERSION}" >> "$GITHUB_ENV"

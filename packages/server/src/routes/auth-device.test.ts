@@ -5,7 +5,7 @@ import pino from "pino";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
-} from "@opendatalabs/personal-server-ts-core/test-utils";
+} from "../../../core/src/test-utils/index.js";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const TEST_REMOTE_ADDR_HEADER = "x-test-remote-addr";

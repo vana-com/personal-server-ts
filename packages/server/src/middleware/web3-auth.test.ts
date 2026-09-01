@@ -4,7 +4,7 @@ import { createWeb3AuthMiddleware } from "./web3-auth.js";
 import {
   createTestWallet,
   buildWeb3SignedHeader,
-} from "@opendatalabs/personal-server-ts-core/test-utils";
+} from "../../../core/src/test-utils/index.js";
 import type { VerifiedAuth } from "@opendatalabs/vana-sdk/node";
 
 const SERVER_ORIGIN = "http://localhost:8080";

@@ -122,6 +122,96 @@ describe("createOpenAiCompatibleInferenceProvider", () => {
     }
   });
 
+  it("classifies a contentless reply by finish_reason, not by its message", async () => {
+    /*
+     * The two look identical on the wire — a 200 whose `message` has no usable
+     * `content` — and only `finish_reason` separates them. The distinction is
+     * load-bearing downstream: `query/agent/loop.ts` doubles its completion
+     * budget for `emptyContent` and deliberately does not for
+     * `malformedToolCall`, where the budget is not what failed.
+     *
+     * The malformed spelling here is the one measured on the sweep: Gemini's
+     * OpenAI-compat surface drops the tool call and reports it this way.
+     */
+    const cases: {
+      body: unknown;
+      code: string;
+      finishReason: string | null;
+    }[] = [
+      {
+        body: {
+          choices: [
+            {
+              message: { role: "assistant" },
+              finish_reason: "function_call_filter: MALFORMED_FUNCTION_CALL",
+            },
+          ],
+        },
+        code: "malformedToolCall",
+        finishReason: "function_call_filter: MALFORMED_FUNCTION_CALL",
+      },
+      {
+        body: { choices: [{ message: {} }, {}] },
+        code: "emptyContent",
+        finishReason: null,
+      },
+      {
+        body: {
+          choices: [{ message: { content: "  " }, finish_reason: "length" }],
+        },
+        code: "emptyContent",
+        finishReason: "length",
+      },
+      {
+        body: { choices: [{ message: {}, finish_reason: "tool_calls" }] },
+        code: "malformedToolCall",
+        finishReason: "tool_calls",
+      },
+    ];
+
+    for (const { body, code, finishReason } of cases) {
+      const provider = createOpenAiCompatibleInferenceProvider({
+        fetch: fetchReplying(body) as unknown as typeof fetch,
+      });
+      await expect(
+        provider.chat({ model: "m", messages: [] }),
+      ).rejects.toMatchObject({
+        name: "InferenceRequestError",
+        message: "inference response carried no assistant content",
+        code,
+        finishReason,
+      });
+    }
+  });
+
+  it("codes the failures that are not a contentless reply", async () => {
+    // The negative control on the discriminator: `code` must not become a
+    // synonym for "empty". A rejection and an unparseable body are neither,
+    // and the loop's retry ladders must not claim them.
+    const rejected = createOpenAiCompatibleInferenceProvider({
+      fetch: fetchReplying(
+        { error: { type: "bad" } },
+        {
+          status: 400,
+        },
+      ) as unknown as typeof fetch,
+    });
+    await expect(
+      rejected.chat({ model: "m", messages: [] }),
+    ).rejects.toMatchObject({ code: "httpError", finishReason: null });
+
+    const garbage = createOpenAiCompatibleInferenceProvider({
+      fetch: (async () =>
+        new Response("not json", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })) as unknown as typeof fetch,
+    });
+    await expect(
+      garbage.chat({ model: "m", messages: [] }),
+    ).rejects.toMatchObject({ code: "notJson" });
+  });
+
   it("runs the E2EE seam around the request when one is supplied", async () => {
     const fetchMock = fetchReplying(
       { choices: [{ message: { content: "ENC(reply)" } }] },

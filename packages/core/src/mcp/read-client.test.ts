@@ -770,4 +770,131 @@ describe("mcp/read-client deletion gate", () => {
     expect(authorizeBuilderRead).not.toHaveBeenCalled();
     expect(readBlockManifest).not.toHaveBeenCalled();
   });
+
+  /**
+   * `readScopeEnvelope` is the query layer's read path (implementation plan
+   * phase 8). Its whole justification is that it is the ORDINARY read: if it
+   * ever stopped running the data handler, `ask_personal_data` would become
+   * an unmetered, unlogged bulk read of the caller's grant.
+   */
+  describe("readScopeEnvelope", () => {
+    const ENVELOPE = {
+      version: 1,
+      scope: "instagram.profile",
+      collectedAt: "2026-06-05T00:00:00Z",
+      data: { items: [{ id: 1 }, { id: 2 }, { id: 3 }] },
+    };
+
+    function createEnvelopeClient() {
+      const authorizeBuilderRead = vi
+        .fn()
+        .mockResolvedValue({ builder: "0xbuilder", grantId: "grant-1" });
+      const accessLogWriter = { write: vi.fn() };
+      const client = createMcpDataReadClient({
+        serverOrigin: SERVER_ORIGIN,
+        granteeAccount: createAccount(),
+        dataApiDeps: {
+          storage: {
+            kind: "custom",
+            listScopes: () => ({ scopes: [], total: 0 }),
+            listVersions: vi.fn(),
+            countVersions: vi.fn(),
+            findEntry: () =>
+              ({
+                scope: "instagram.profile",
+                collectedAt: "2026-06-05T00:00:00Z",
+                fileId: "file-1",
+                version: 4,
+                sizeBytes: 10,
+              }) as never,
+            findByFileId: vi.fn(),
+            findUnsynced: vi.fn(),
+            readEnvelope: vi.fn().mockResolvedValue(ENVELOPE),
+            writeEnvelope: vi.fn(),
+            insertEntry: vi.fn(),
+            updateFileId: vi.fn(),
+            deleteScope: vi.fn(),
+            deleteByFileId: vi.fn(),
+          },
+          auth: {
+            authorizeOwner: vi.fn(),
+            authorizeBuilderList: vi.fn(),
+            authorizeBuilderRead,
+          },
+          accessLogWriter,
+        },
+      });
+      return { client, authorizeBuilderRead, accessLogWriter };
+    }
+
+    it("returns the whole envelope, grant-checked and access-logged", async () => {
+      const { client, authorizeBuilderRead, accessLogWriter } =
+        createEnvelopeClient();
+
+      const result = await client.readScopeEnvelope!({
+        scope: "instagram.profile",
+        grantId: "grant-1",
+      });
+
+      // The complete envelope, not a bounded page: the query layer needs
+      // every record or its coverage figures are a total over a partial read.
+      expect(result.envelope).toEqual(ENVELOPE);
+      expect(result.version).toBe("4");
+      expect(result.collectedAt).toBe("2026-06-05T00:00:00Z");
+
+      // The same grant check every builder read runs...
+      expect(authorizeBuilderRead).toHaveBeenCalledTimes(1);
+      expect(authorizeBuilderRead.mock.calls[0]![0]).toMatchObject({
+        scope: "instagram.profile",
+      });
+      // ...and exactly one access-log row for the one scope touched. N scopes
+      // swept is N calls here, so it is N rows.
+      expect(accessLogWriter.write).toHaveBeenCalledTimes(1);
+      expect(accessLogWriter.write.mock.calls[0]![0]).toMatchObject({
+        action: "read",
+        scope: "instagram.profile",
+        grantId: "grant-1",
+      });
+    });
+
+    it("refuses, without logging a read, when the scope has no local version", async () => {
+      const accessLogWriter = { write: vi.fn() };
+      const denied = createMcpDataReadClient({
+        serverOrigin: SERVER_ORIGIN,
+        granteeAccount: createAccount(),
+        dataApiDeps: {
+          storage: {
+            kind: "custom",
+            listScopes: () => ({ scopes: [], total: 0 }),
+            listVersions: vi.fn(),
+            countVersions: vi.fn(),
+            findEntry: () => undefined,
+            findByFileId: vi.fn(),
+            findUnsynced: vi.fn(),
+            readEnvelope: vi.fn(),
+            writeEnvelope: vi.fn(),
+            insertEntry: vi.fn(),
+            updateFileId: vi.fn(),
+            deleteScope: vi.fn(),
+            deleteByFileId: vi.fn(),
+          },
+          auth: {
+            authorizeOwner: vi.fn(),
+            authorizeBuilderList: vi.fn(),
+            authorizeBuilderRead: vi.fn(),
+          },
+          accessLogWriter,
+        },
+      });
+
+      await expect(
+        denied.readScopeEnvelope!({
+          scope: "instagram.profile",
+          grantId: "grant-1",
+        }),
+      ).rejects.toMatchObject({ status: 404 });
+      // Nothing was served, so nothing is logged as served.
+      expect(accessLogWriter.write).not.toHaveBeenCalled();
+    });
+  });
 });

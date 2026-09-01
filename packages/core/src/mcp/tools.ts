@@ -15,6 +15,7 @@ import type { McpConnectionRecord } from "./types.js";
 import type { McpDataReadClient } from "./read-client.js";
 import { McpDataReadError } from "./read-client.js";
 import type { McpActivityRecorder } from "./activity.js";
+import type { QueryAnswer, QueryBudget } from "../query/agent/types.js";
 import { MiniSearchIndex, type SearchDocument } from "./search/index.js";
 import { MAX_SELECTED_BLOCK_IDS } from "../storage/blocks/index.js";
 import {
@@ -23,10 +24,51 @@ import {
   rawScopeResourceUri,
 } from "./resources.js";
 
+/**
+ * One granted scope the query layer may read, with the grant that covers it.
+ *
+ * Concrete scope ids only — wildcards are expanded against the connection's
+ * grants before they reach here, so the port never has to re-derive the
+ * grant and cannot widen it.
+ */
+export interface McpAskPersonalDataScope {
+  scope: string;
+  grantId: string;
+}
+
+export interface McpAskPersonalDataInput {
+  question: string;
+  /** Already grant-checked. Never wider than the connection's own scopes. */
+  scopes: McpAskPersonalDataScope[];
+  budget?: QueryBudget;
+  /**
+   * The connection's own read path. The port must read each scope through it,
+   * exactly once, so every scope the sweep touches gets the grant check, the
+   * access-log row and (on a paying session) the settlement that a single
+   * `read_scope` would have got.
+   */
+  readClient: McpDataReadClient;
+}
+
+/**
+ * Runs a question through the query layer's agent loop.
+ *
+ * Injected rather than imported because the loop needs an OS sandbox and an
+ * `InferenceProvider`, and neither can exist in `packages/core` — the sandbox
+ * is a Node subprocess and core stays browser-safe. The Node server supplies
+ * the implementation; PS-Lite would supply a Worker-based one. Absent, the
+ * tool says so instead of answering.
+ */
+export interface McpAskPersonalDataPort {
+  ask(input: McpAskPersonalDataInput): Promise<QueryAnswer>;
+}
+
 export interface McpToolContext {
   connection: McpConnectionRecord;
   readClient: McpDataReadClient;
   activityRecorder?: McpActivityRecorder;
+  /** Phase 8's query surface. Absent ⇒ `ask_personal_data` reports it. */
+  askPersonalData?: McpAskPersonalDataPort;
 }
 
 export type McpToolResultContent =
@@ -1763,6 +1805,168 @@ const getScopeFile: McpToolDefinition = {
   },
 };
 
+/**
+ * Ceiling on scopes one question may sweep.
+ *
+ * Every scope in the grant is read in full and materialized for the sandbox,
+ * so this bounds both the read fan-out and the on-disk working set. Well
+ * above the 18-scope corpus the query layer is graded on.
+ */
+const MAX_ASK_SCOPES = 64;
+
+/**
+ * `ask_personal_data` — phase 8's workflow-scoped query tool.
+ *
+ * One tool, not a pile of primitives: the caller asks a question in natural
+ * language and gets back a `QueryAnswer` whose `coverage` says how much of
+ * their data was actually read. The existing primitives stay for consumers
+ * that want to drive their own loop.
+ *
+ * ## Why this refuses to run on a paying session
+ *
+ * Phase 8 requires the sweep to "settle and log per scope touched". Logging
+ * scales fine — `readClient` writes one access-log row per scope read, with a
+ * fresh `logId`. Settlement does not. An x402 proof is bound to one
+ * `(grantId, dataPointId, version, recordId, paymentNonce)` tuple: the nonce
+ * and recordId are single-use (gateway DB constraint plus the on-chain
+ * `_usedRecordIds` set) and `verifyPayment` rejects an accessRecord whose
+ * dataPointId or version does not match the entry being served. So N scopes
+ * need N separately signed proofs, and a tool call carries at most one — the
+ * loop cannot pause mid-sweep to have the caller sign the next.
+ *
+ * Inventing a batched settlement would mean a new wire format the gateway
+ * does not accept, which is a decision for a human, not for this tool. So on
+ * a payment-enforcing session it declines and names the chargeable scopes,
+ * the same shape `search_personal_context` already uses for the same reason.
+ * On the owner's own connection — the desktop app's path — reads are free by
+ * design and the sweep runs.
+ */
+const askPersonalData: McpToolDefinition = {
+  name: "ask_personal_data",
+  title: "Ask personal data",
+  description:
+    "Answer a question across granted scopes with sandboxed code. Returns the answer plus host-authored coverage counters: scopes scanned, records scanned, scopes skipped, records that could not be read. Use for aggregation, exhaustive search, or absence answers.",
+  inputSchema: {
+    question: z.string().min(1).max(2000).describe("The question to answer."),
+    scopes: z
+      .array(z.string().min(1).max(SEARCH_SCOPE_MAX_CHARS))
+      .min(1)
+      .max(SEARCH_REQUESTED_SCOPES_LIMIT)
+      .optional()
+      .describe("Narrow to these granted scopes. Omit for all."),
+    budget: z
+      .object({
+        toolCalls: z.number().int().min(1).max(30).optional(),
+        wallClockMs: z.number().int().min(1000).max(600_000).optional(),
+      })
+      .optional()
+      .describe("Caps on model turns and wall clock."),
+  },
+  async handler(args, { connection, readClient, askPersonalData: port }) {
+    if (!port) {
+      return textResult(
+        {
+          error: "query_unavailable",
+          message:
+            "This server has no query engine configured; use read_scope and search_personal_context instead.",
+        },
+        true,
+      );
+    }
+    const question =
+      typeof args.question === "string" ? args.question.trim() : "";
+    if (question === "") {
+      return textResult(
+        { error: "question is required and must be a non-empty string" },
+        true,
+      );
+    }
+
+    // Narrow, never widen: the default is the connection's own scopes, and a
+    // named scope outside the grant is rejected rather than read.
+    // `normalizeScopeListInput` returns `[]` for an absent list, so the
+    // fallback is on emptiness rather than on nullishness — `??` here would
+    // silently sweep nothing.
+    const narrowed = normalizeScopeListInput(args.scopes);
+    const requestedScopes =
+      narrowed.length > 0 ? narrowed : uniqueScopes(connection);
+    const resolved = await resolveSearchScopes({
+      connection,
+      maxScopes: MAX_ASK_SCOPES,
+      discoveryTimeoutMs: DEFAULT_SEARCH_DISCOVERY_TIMEOUT_MS,
+      readClient,
+      requestedScopes,
+    });
+
+    if (resolved.scopes.length === 0) {
+      return textResult(
+        {
+          error: "no_granted_scope",
+          message:
+            "No granted scope matched this request, so there is nothing to compute an answer from.",
+          grantedScopes: uniqueScopes(connection),
+          errors: resolved.errors,
+        },
+        true,
+      );
+    }
+
+    if (readClient.enforcesPayment) {
+      return textResult(
+        {
+          error: "payment_required_for_sweep",
+          message:
+            "ask_personal_data reads every named scope in full and cannot settle one x402 proof per scope in a single call. Retrieve these scopes with read_scope, each with its own `payment` proof.",
+          paymentRequiredScopes: resolved.scopes,
+        },
+        true,
+      );
+    }
+
+    const scopes: McpAskPersonalDataScope[] = [];
+    for (const scope of resolved.scopes) {
+      const grant = resolveGrantForScope(connection, scope);
+      // resolveSearchScopes already grant-checked every entry; this is the
+      // belt-and-braces re-check that turns a future refactor into a dropped
+      // scope rather than an ungranted read.
+      if (grant) scopes.push({ scope, grantId: grant.grantId });
+    }
+
+    const budget =
+      typeof args.budget === "object" && args.budget !== null
+        ? (args.budget as QueryBudget)
+        : undefined;
+
+    try {
+      const answer = await port.ask({
+        question,
+        scopes,
+        readClient,
+        ...(budget ? { budget } : {}),
+      });
+      return textResult({
+        ...answer,
+        // What the caller asked about but could not be swept, alongside the
+        // host-authored coverage. Kept separate from `coverage.scopesSkipped`
+        // so the coverage object still means exactly what it means in the
+        // eval harness.
+        ...(resolved.skippedScopes.length > 0
+          ? { skippedScopes: resolved.skippedScopes }
+          : {}),
+        ...(resolved.errors.length > 0 ? { scopeErrors: resolved.errors } : {}),
+      });
+    } catch (err) {
+      return textResult(
+        {
+          error: "query_failed",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        true,
+      );
+    }
+  },
+};
+
 export const MCP_TOOLS: readonly McpToolDefinition[] = [
   listGrantedSources,
   listGrantedScopes,
@@ -1771,4 +1975,5 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
   listScopeBlocks,
   getScopeFile,
   searchPersonalContext,
+  askPersonalData,
 ] as const;

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type * as ChildProcess from "node:child_process";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { createTestWallet } from "@opendatalabs/personal-server-ts-core/test-utils";
+import { createTestWallet } from "../../../core/src/test-utils/index.js";
 import { loadOrCreateServerAccount } from "../keys/server-account.js";
 import { TunnelManager } from "./manager.js";
 

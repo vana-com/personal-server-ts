@@ -28,7 +28,7 @@
  */
 
 import type { RequestSigner } from "../../signing/request-signer.js";
-import { canonicalJsonBytes } from "./jcs.js";
+import { canonicalJsonBytes } from "../../json/jcs.js";
 import {
   E2EE_ALGO_X25519,
   bytesToHex,
