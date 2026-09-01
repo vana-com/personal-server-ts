@@ -715,6 +715,9 @@ Authorization: Web3Signed <base64url(payload)>.<sig>
 
 The view is deliberately narrow: the question text, the source scopes, the
 question id, the registrar and the raw `error` string stay owner-only.
+`grant_invalid` is part of that: only a builder-registered question can
+produce it, so a reader who is neither the owner nor the registrar reads
+`internal` instead of learning who registered the question.
 `errorCode` is the closed vocabulary above, and is null unless `status` is
 `failed`. `retryAfterSeconds` is the next automatic retry the scheduler has
 pending — poll on that cadence instead of guessing. While a retry compute

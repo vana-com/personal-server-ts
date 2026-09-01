@@ -16,6 +16,7 @@ const OWNER_TOKEN = "owner-token";
 const BUILDER_TOKEN = "builder-token";
 const READER_TOKEN = "reader-token";
 const BUILDER = "0x2222222222222222222222222222222222222222" as const;
+const OTHER_READER = "0x3333333333333333333333333333333333333333" as const;
 const OTHER_BUILDER = "0x3333333333333333333333333333333333333333" as const;
 
 /**
@@ -31,6 +32,12 @@ function createAuth(
     grantScopes?: string[] | null;
     /** Scopes a READER_TOKEN read grant covers (status route tests). */
     readScopes?: string[];
+    /**
+     * Who the READER_TOKEN is. Defaults to the registering builder, which is
+     * the common case (a builder reading back its own answer); a test that
+     * needs a THIRD-PARTY reader sets a different address.
+     */
+    readerBuilder?: `0x${string}`;
   } = {},
 ): PersonalServerApiAuthPort {
   const builderScopes = options.builderScopes ?? ["coach."];
@@ -57,7 +64,10 @@ function createAuth(
         if (!readScopes.includes(scope)) {
           throw new ScopeMismatchError({ requestedScope: scope });
         }
-        return { builder, grantId: "read-grant-1" };
+        return {
+          builder: options.readerBuilder ?? builder,
+          grantId: "read-grant-1",
+        };
       }
       throw new NotOwnerError();
     },
@@ -714,6 +724,72 @@ describe("GET /v1/derivatives/status", () => {
     });
     const json = (await res.json()) as { retryAfterSeconds: number | null };
     expect(json.retryAfterSeconds).toBe(300);
+  });
+
+  it("hides grant_invalid from a reader that did not register the question", async () => {
+    // Only a builder-registered question runs the live grant re-check, so
+    // grant_invalid names the registrar class the rest of this view hides.
+    const { deps, store } = createDeps({
+      auth: createAuth({ readerBuilder: OTHER_READER }),
+    });
+    const registered = await call(deps, "POST", "/questions", {
+      token: BUILDER_TOKEN,
+      body,
+    });
+    expect(registered.status).toBe(201);
+    const { questionId } = (await registered.json()) as { questionId: string };
+    await store.update(questionId, {
+      status: "failed",
+      error: "grant no longer covers oura.sleep",
+      errorCode: "grant_invalid",
+      updatedAt: "2026-08-27T11:00:00.000Z",
+    });
+
+    const res = await call(deps, "GET", "/status?derivedScope=coach.weekly", {
+      token: READER_TOKEN,
+    });
+    const json = (await res.json()) as { status: string; errorCode: string };
+    expect(json.status).toBe("failed");
+    expect(json.errorCode).toBe("internal");
+  });
+
+  it("serves grant_invalid to the registrar and to the owner", async () => {
+    const { deps, store } = createDeps();
+    const registered = await call(deps, "POST", "/questions", {
+      token: BUILDER_TOKEN,
+      body,
+    });
+    const { questionId } = (await registered.json()) as { questionId: string };
+    await store.update(questionId, {
+      status: "failed",
+      error: "grant no longer covers oura.sleep",
+      errorCode: "grant_invalid",
+      updatedAt: "2026-08-27T11:00:00.000Z",
+    });
+
+    // The default reader IS the registering builder: it learns nothing about
+    // itself that it did not already know, and this is the class it can act on.
+    const registrar = await call(
+      deps,
+      "GET",
+      "/status?derivedScope=coach.weekly",
+      { token: READER_TOKEN },
+    );
+    expect(((await registrar.json()) as { errorCode: string }).errorCode).toBe(
+      "grant_invalid",
+    );
+
+    const asOwner = await call(
+      deps,
+      "GET",
+      "/status?derivedScope=coach.weekly",
+      {
+        token: OWNER_TOKEN,
+      },
+    );
+    expect(((await asOwner.json()) as { errorCode: string }).errorCode).toBe(
+      "grant_invalid",
+    );
   });
 
   it("never serves an errorCode for a non-failed status", async () => {

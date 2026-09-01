@@ -205,6 +205,9 @@ async function loadForCaller(
  * source scopes, the question id, the registrar and the raw error string
  * stay owner-only — `errorCode` is a closed vocabulary precisely so a
  * stored error like "source scope X is deleted" cannot leak a scope name.
+ * One class needs the same care as the raw string: `grant_invalid` arises
+ * only from a builder-registered question, so a third-party reader gets
+ * `internal` instead of learning who registered.
  * Auth runs before the store lookup, so an uncovered caller cannot probe
  * which scopes have questions behind them.
  *
@@ -240,11 +243,12 @@ async function handleStatusRoute(
     );
   }
   const derivedScope = scopeResult.scope;
-  await deps.auth.authorizeBuilderRead({
-    request,
-    scope: derivedScope,
-    grantId: selectedGrantId(request, url),
-  });
+  const auth =
+    (await deps.auth.authorizeBuilderRead({
+      request,
+      scope: derivedScope,
+      grantId: selectedGrantId(request, url),
+    })) ?? undefined;
   const registrations = await store.list({ derivedScope });
   if (registrations.length === 0) {
     throw new DerivativeQuestionNotFoundError({ derivedScope });
@@ -280,6 +284,24 @@ async function handleStatusRoute(
       : scheduler.retryInFlight?.(registration.questionId)
         ? RETRY_IN_FLIGHT_POLL_SECONDS
         : null;
+  // `grant_invalid` can only come from the live re-check of a REGISTERING
+  // BUILDER's grant, which an owner-registered question never runs. Serving
+  // it to a third-party reader would therefore disclose the registrar class
+  // the rest of this view withholds. The owner and the registrar itself lose
+  // nothing — they are the two parties who can act on it — and everyone else
+  // reads the honest generic class: something is wrong server-side and no
+  // retry is coming.
+  const registrarView =
+    auth === undefined ||
+    auth.grantId === "owner" ||
+    auth.grantId === "policy-bypass" ||
+    (registration.registeredBy.kind === "builder" &&
+      typeof auth.builder === "string" &&
+      sameBuilder(registration.registeredBy.builder, auth.builder));
+  const disclosedErrorCode =
+    registration.errorCode === "grant_invalid" && !registrarView
+      ? "internal"
+      : registration.errorCode;
   return jsonResponse({
     derivedScope: registration.derivedScope,
     status: registration.status,
@@ -288,7 +310,7 @@ async function handleStatusRoute(
     derivedCollectedAt: registration.derivedCollectedAt,
     // Null unless failed, whatever an old store row holds: a stale question
     // is a recompute in progress, not a terminal failure.
-    errorCode: registration.status === "failed" ? registration.errorCode : null,
+    errorCode: registration.status === "failed" ? disclosedErrorCode : null,
     retryAfterSeconds,
   });
 }
