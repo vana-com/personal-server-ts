@@ -457,7 +457,17 @@ function decodePathPart(value: string | undefined): string {
   return decodeURIComponent(value ?? "");
 }
 
-function selectedGrantId(request: Request, url: URL): string | undefined {
+/**
+ * The grant the caller nominates for a read: `?grantId=` or the
+ * `x-ps-grant-id` header, the SDK's shape on every read route. Exported so
+ * the derivatives status route authorizes with exactly the same inputs as
+ * a data read — a credential that reads /v1/data/<scope> must not be
+ * refused by /v1/derivatives/status.
+ */
+export function selectedGrantId(
+  request: Request,
+  url: URL,
+): string | undefined {
   return (
     url.searchParams.get("grantId") ??
     request.headers.get("x-ps-grant-id") ??

@@ -6,6 +6,7 @@
  */
 
 import { computeDataPointId } from "../sync/data-point-id.js";
+import type { ComputeOutcome } from "./compute.js";
 import type { QuestionStore } from "./types.js";
 
 export interface SchedulerTimers {
@@ -15,10 +16,21 @@ export interface SchedulerTimers {
 
 export interface RecomputeSchedulerOptions {
   store: QuestionStore;
-  /** Runs one compute; must not throw for compute failures. */
-  compute(questionId: string): Promise<unknown>;
+  /**
+   * Runs one compute; must not throw for compute failures. The outcome is
+   * what the retry logic classifies — a wrapper that swallows it (returns
+   * void) silently disables automatic retries, so forward it.
+   */
+  compute(questionId: string): Promise<ComputeOutcome | void>;
   /** Quiet period after a source change (default 5s). */
   debounceMs?: number;
+  /**
+   * Backoff steps for automatic retry of a compute that failed with the
+   * transient class (`errorCode: "inference_unavailable"`). Default
+   * 1m, 5m, 30m; empty disables retry. Non-transient failures never
+   * retry — they wait for a source change or an explicit recompute.
+   */
+  retryDelaysMs?: readonly number[];
   /**
    * Lets `markSourceChanged` recognise a new version that was computed FROM
    * a question's own derived scope (its `$lineage` names the derived data
@@ -48,6 +60,20 @@ export interface RecomputeScheduler {
   ): void;
   /** Schedule one question; `immediate` skips the debounce (owner recompute). */
   requestRecompute(questionId: string, options?: { immediate?: boolean }): void;
+  /**
+   * Next scheduled automatic retry for a failed question (ISO time), or
+   * null when none is pending. In-memory, like the rest of the scheduler:
+   * a restart drops the chain and the question waits for a source change
+   * or an explicit recompute.
+   */
+  nextRetryAt(questionId: string): string | null;
+  /**
+   * True while a retry compute is actually RUNNING (its timer fired, the
+   * compute has not settled). `nextRetryAt` is null in that window; without
+   * this signal a status reader would see the terminal
+   * failed-with-no-retry signature during every in-flight retry.
+   */
+  retryInFlight(questionId: string): boolean;
   /** Resolves once no compute or store lookup is pending or timed. */
   whenIdle(): Promise<void>;
   /** Cancel pending timers. In-flight computes finish on their own. */
@@ -65,6 +91,44 @@ interface QuestionState {
   timer: unknown | null;
   running: Promise<void> | null;
   rerun: boolean;
+  /** Consecutive transient failures already retried. */
+  retryAttempts: number;
+  /** When the pending retry timer fires (epoch ms), if one is set. */
+  retryAtMs: number | null;
+  /** The pending timer is a retry (not a debounce). */
+  retryScheduled: boolean;
+  /** A retry compute is running right now. */
+  retryRunning: boolean;
+}
+
+const DEFAULT_RETRY_DELAYS_MS: readonly number[] = [60_000, 300_000, 1_800_000];
+
+/**
+ * Structural check on the compute callback's resolved value: retry is only
+ * for a failed outcome whose stored class is the one transient kind. A
+ * callback that resolves anything else (older wiring, tests) never retries.
+ */
+/**
+ * A compute skipped because the runtime is unavailable (PS-Lite with the
+ * hosting tab inactive). During a retry chain this must not end the chain:
+ * nothing else would ever reschedule a failed question.
+ */
+function isRuntimeSkipOutcome(outcome: unknown): boolean {
+  if (typeof outcome !== "object" || outcome === null) return false;
+  const shaped = outcome as { status?: unknown; reason?: unknown };
+  return shaped.status === "skipped" && shaped.reason === "runtime-unavailable";
+}
+
+function isTransientFailureOutcome(outcome: unknown): boolean {
+  if (typeof outcome !== "object" || outcome === null) return false;
+  const shaped = outcome as {
+    status?: unknown;
+    registration?: { errorCode?: unknown } | null;
+  };
+  return (
+    shaped.status === "failed" &&
+    shaped.registration?.errorCode === "inference_unavailable"
+  );
 }
 
 const defaultTimers: SchedulerTimers = {
@@ -77,6 +141,7 @@ export function createRecomputeScheduler(
   options: RecomputeSchedulerOptions,
 ): RecomputeScheduler {
   const debounceMs = options.debounceMs ?? 5_000;
+  const retryDelaysMs = options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
   const timers = options.timers ?? defaultTimers;
   const now = options.now ?? (() => new Date());
   const states = new Map<string, QuestionState>();
@@ -100,7 +165,15 @@ export function createRecomputeScheduler(
   function stateFor(questionId: string): QuestionState {
     let state = states.get(questionId);
     if (!state) {
-      state = { timer: null, running: null, rerun: false };
+      state = {
+        timer: null,
+        running: null,
+        rerun: false,
+        retryAttempts: 0,
+        retryAtMs: null,
+        retryScheduled: false,
+        retryRunning: false,
+      };
       states.set(questionId, state);
     }
     return state;
@@ -119,24 +192,56 @@ export function createRecomputeScheduler(
       Promise.resolve()
         .then(() => options.compute(questionId))
         .then(
-          () => undefined,
-          (err) =>
+          (outcome) => outcome,
+          (err) => {
             warn(
               {
                 questionId,
                 error: err instanceof Error ? err.name : String(err),
               },
               "Derivative compute threw",
-            ),
+            );
+            return undefined;
+          },
         )
-        .then(async () => {
+        .then(async (outcome) => {
           state.running = null;
+          state.retryAtMs = null;
+          state.retryRunning = false;
+          const retryable =
+            isTransientFailureOutcome(outcome) ||
+            // A runtime-unavailable skip DURING a chain consumes an attempt
+            // instead of ending the chain; on a fresh compute it keeps the
+            // pre-retry behavior (pending/stale, reswept by start()).
+            (isRuntimeSkipOutcome(outcome) && state.retryAttempts > 0);
           if (state.rerun) {
+            // A source changed during the run: that supersedes any retry.
             state.rerun = false;
+            state.retryAttempts = 0;
             await markStale(questionId);
             schedule(questionId, 0);
-          } else if (!states.get(questionId)?.timer) {
-            states.delete(questionId);
+          } else if (
+            retryable &&
+            // A pending timer means a source change or explicit recompute
+            // arrived during the run and already scheduled a fresher run;
+            // replacing its 5s debounce with a 60s retry would delay the
+            // recompute of data this compute never saw.
+            state.timer === null &&
+            // After stop() nothing may be scheduled; without this a compute
+            // that settles late would record a retryAtMs no timer backs.
+            !stopped &&
+            state.retryAttempts < retryDelaysMs.length
+          ) {
+            const delayMs = retryDelaysMs[state.retryAttempts]!;
+            state.retryAttempts += 1;
+            state.retryAtMs = now().getTime() + delayMs;
+            schedule(questionId, delayMs);
+            state.retryScheduled = true;
+          } else {
+            state.retryAttempts = 0;
+            if (!states.get(questionId)?.timer) {
+              states.delete(questionId);
+            }
           }
         }),
     );
@@ -148,6 +253,14 @@ export function createRecomputeScheduler(
     if (state.timer !== null) timers.clearTimeout(state.timer);
     state.timer = timers.setTimeout(() => {
       state.timer = null;
+      // Whatever this timer was (debounce or retry), any promised retry is
+      // now being consumed: a past retryAtMs would pin the status route's
+      // retryAfterSeconds at 0 for the whole in-flight compute. A firing
+      // RETRY timer hands over to retryRunning so the in-flight window is
+      // still distinguishable from a terminal failure.
+      state.retryAtMs = null;
+      state.retryRunning = state.retryScheduled;
+      state.retryScheduled = false;
       run(questionId);
     }, delayMs);
   }
@@ -158,12 +271,30 @@ export function createRecomputeScheduler(
     if (registration.status === "ready" || registration.status === "failed") {
       await options.store.update(questionId, {
         status: "stale",
+        // The reader contract says errorCode is null unless failed; a stale
+        // question is a recompute in progress, not a terminal failure.
+        errorCode: null,
         updatedAt: now().toISOString(),
       });
     }
   }
 
+  function resetRetry(questionId: string): void {
+    const state = states.get(questionId);
+    if (!state) return;
+    state.retryAttempts = 0;
+    state.retryAtMs = null;
+    state.retryScheduled = false;
+  }
+
   return {
+    nextRetryAt(questionId) {
+      const retryAtMs = states.get(questionId)?.retryAtMs;
+      return retryAtMs == null ? null : new Date(retryAtMs).toISOString();
+    },
+    retryInFlight(questionId) {
+      return states.get(questionId)?.retryRunning ?? false;
+    },
     markSourceChanged(scope, opts) {
       if (stopped) return;
       const lineage = new Set(
@@ -191,6 +322,7 @@ export function createRecomputeScheduler(
               continue;
             }
             await markStale(registration.questionId);
+            resetRetry(registration.questionId);
             schedule(registration.questionId, debounceMs);
           }
         })().catch((err) =>
@@ -214,7 +346,10 @@ export function createRecomputeScheduler(
               "Could not mark derivative question stale",
             ),
           )
-          .then(() => schedule(questionId, opts?.immediate ? 0 : debounceMs)),
+          .then(() => {
+            resetRetry(questionId);
+            schedule(questionId, opts?.immediate ? 0 : debounceMs);
+          }),
       );
     },
     async whenIdle() {
@@ -238,6 +373,9 @@ export function createRecomputeScheduler(
       for (const state of states.values()) {
         if (state.timer !== null) timers.clearTimeout(state.timer);
         state.timer = null;
+        state.retryAttempts = 0;
+        state.retryAtMs = null;
+        state.retryScheduled = false;
       }
     },
     start() {

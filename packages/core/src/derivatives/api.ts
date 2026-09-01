@@ -27,6 +27,8 @@ import {
   ProtocolError,
 } from "../errors/catalog.js";
 import { parseJsonObjectBody } from "../contracts/http.js";
+import { parseDataScopeContract } from "../contracts/data.js";
+import { selectedGrantId } from "../api/index.js";
 import type {
   PersonalServerApiAuthPort,
   PersonalServerApiDispatchOptions,
@@ -49,10 +51,16 @@ import {
 /** Registration bodies are small; anything larger is refused up front. */
 export const MAX_QUESTION_BODY_BYTES = 16 * 1024;
 
+/** Poll hint served while a retry compute is in flight (no scheduled time). */
+const RETRY_IN_FLIGHT_POLL_SECONDS = 5;
+
 export interface PersonalServerDerivativesApiDeps {
   auth: Pick<
     PersonalServerApiAuthPort,
-    "authorizeOwner" | "authorizeWrite" | "authorizeWriteSession"
+    | "authorizeOwner"
+    | "authorizeWrite"
+    | "authorizeWriteSession"
+    | "authorizeBuilderRead"
   >;
   /** Absent = the compute layer is not wired; every route answers 503. */
   compute?: {
@@ -60,7 +68,16 @@ export interface PersonalServerDerivativesApiDeps {
     scheduler: Pick<
       RecomputeScheduler,
       "requestRecompute" | "markSourceChanged"
-    >;
+    > & {
+      /**
+       * Next scheduled automatic retry of a failed question (ISO time), or
+       * null. Optional so a minimal scheduler stays a valid dependency; the
+       * status route then reports no retry.
+       */
+      nextRetryAt?(questionId: string): string | null;
+      /** True while a retry compute is running (timer fired, not settled). */
+      retryInFlight?(questionId: string): boolean;
+    };
   } | null;
   now?: () => Date;
   createQuestionId?: () => string;
@@ -173,6 +190,131 @@ async function loadForCaller(
   return { registration, writer };
 }
 
+/**
+ * `GET /v1/derivatives/status?derivedScope=<scope>`: the lifecycle of the
+ * question behind a derived scope, for the party that will READ the answer.
+ *
+ * Authorization is the data read's (`authorizeBuilderRead`, i.e. a live
+ * grant covering the derived scope, or the owner) — deliberately NOT the
+ * write-session path, because a consent-flow reader holds only a bare read
+ * entry and can never open a write session. Nothing is served and nothing
+ * is charged: this is authorization only, no x402 challenge and no
+ * RECORD_DATA_ACCESS receipt, the same bar as the lineage read.
+ *
+ * The view is deliberately narrow: lifecycle only. The question text, the
+ * source scopes, the question id, the registrar and the raw error string
+ * stay owner-only — `errorCode` is a closed vocabulary precisely so a
+ * stored error like "source scope X is deleted" cannot leak a scope name.
+ * One class needs the same care as the raw string: `grant_invalid` arises
+ * only from a builder-registered question, so a third-party reader gets
+ * `internal` instead of learning who registered.
+ * Auth runs before the store lookup, so an uncovered caller cannot probe
+ * which scopes have questions behind them.
+ *
+ * Like every Web3Signed read (data, lineage), the signature covers the
+ * path, not the query; per-scope authorization is enforced live against
+ * the caller's grant on each request.
+ */
+async function handleStatusRoute(
+  request: Request,
+  url: URL,
+  deps: PersonalServerDerivativesApiDeps,
+  store: QuestionStore,
+  scheduler: NonNullable<
+    PersonalServerDerivativesApiDeps["compute"]
+  >["scheduler"],
+  now: () => Date,
+): Promise<Response> {
+  if (request.method !== "GET") {
+    return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+  }
+  const derivedScopeParam = url.searchParams.get("derivedScope");
+  if (!derivedScopeParam) {
+    throw new DerivativeDerivedScopeRequiredError();
+  }
+  // Same grammar gate as every scope-taking route, before anything is
+  // authorized: an arbitrary string never reaches the grant policy.
+  const scopeResult = parseDataScopeContract(derivedScopeParam);
+  if (!scopeResult.ok) {
+    return errorResponse(
+      scopeResult.status,
+      scopeResult.body.error,
+      scopeResult.body.message,
+    );
+  }
+  const derivedScope = scopeResult.scope;
+  const auth =
+    (await deps.auth.authorizeBuilderRead({
+      request,
+      scope: derivedScope,
+      grantId: selectedGrantId(request, url),
+    })) ?? undefined;
+  const registrations = await store.list({ derivedScope });
+  if (registrations.length === 0) {
+    throw new DerivativeQuestionNotFoundError({ derivedScope });
+  }
+  // Several registrations may share a derived scope, and data serving is
+  // registration-agnostic: if ANY of them is ready, the scope has an answer
+  // and the reader must not be told "failed" by a duplicate that never
+  // wrote anything. Report the most optimistic true state — ready, then an
+  // in-flight recompute, then never-computed, then failed — and within a
+  // class let the most recently updated registration speak.
+  const STATUS_PRECEDENCE: Record<QuestionRegistration["status"], number> = {
+    ready: 0,
+    stale: 1,
+    pending: 2,
+    failed: 3,
+  };
+  const registration = registrations.reduce((best, candidate) => {
+    const byStatus =
+      STATUS_PRECEDENCE[candidate.status] - STATUS_PRECEDENCE[best.status];
+    if (byStatus !== 0) return byStatus < 0 ? candidate : best;
+    return candidate.updatedAt >= best.updatedAt ? candidate : best;
+  });
+  const nextRetryAt = scheduler.nextRetryAt?.(registration.questionId) ?? null;
+  // While the retry compute is RUNNING there is no scheduled time, but null
+  // would be the terminal "will never retry" signature; serve a short poll
+  // hint instead. 0 is never served — it invites a tight poll loop.
+  const retryAfterSeconds =
+    nextRetryAt !== null
+      ? Math.max(
+          1,
+          Math.ceil((Date.parse(nextRetryAt) - now().getTime()) / 1000),
+        )
+      : scheduler.retryInFlight?.(registration.questionId)
+        ? RETRY_IN_FLIGHT_POLL_SECONDS
+        : null;
+  // `grant_invalid` can only come from the live re-check of a REGISTERING
+  // BUILDER's grant, which an owner-registered question never runs. Serving
+  // it to a third-party reader would therefore disclose the registrar class
+  // the rest of this view withholds. The owner and the registrar itself lose
+  // nothing — they are the two parties who can act on it — and everyone else
+  // reads the honest generic class: something is wrong server-side and no
+  // retry is coming.
+  const registrarView =
+    auth === undefined ||
+    auth.grantId === "owner" ||
+    auth.grantId === "policy-bypass" ||
+    (registration.registeredBy.kind === "builder" &&
+      typeof auth.builder === "string" &&
+      sameBuilder(registration.registeredBy.builder, auth.builder));
+  const disclosedErrorCode =
+    registration.errorCode === "grant_invalid" && !registrarView
+      ? "internal"
+      : registration.errorCode;
+  return jsonResponse({
+    derivedScope: registration.derivedScope,
+    status: registration.status,
+    lastComputedAt: registration.lastComputedAt,
+    derivedVersion: registration.derivedVersion,
+    derivedCollectedAt: registration.derivedCollectedAt,
+    // Null unless failed, whatever an old store row holds: a stale question
+    // is a recompute in progress, not a terminal failure.
+    errorCode: registration.status === "failed" ? disclosedErrorCode : null,
+    retryAfterSeconds,
+  });
+}
+
 export async function handlePersonalServerDerivativesRequest(
   request: Request,
   deps: PersonalServerDerivativesApiDeps,
@@ -182,13 +324,19 @@ export async function handlePersonalServerDerivativesRequest(
     const url = new URL(request.url);
     const pathname = stripBasePath(url.pathname, options.basePath);
     const parts = pathname.split("/").filter(Boolean);
-    if (parts[0] !== "questions" || parts.length > 3) {
+    const isStatusRoute = parts[0] === "status" && parts.length === 1;
+    if (!isStatusRoute && (parts[0] !== "questions" || parts.length > 3)) {
       return errorResponse(404, "NOT_FOUND", "Not found");
     }
     const compute = deps.compute;
     if (!compute) throw new DerivativeComputeUnavailableError();
     const { store, scheduler } = compute;
     const now = deps.now ?? (() => new Date());
+
+    // /status — the reader-facing lifecycle view of a derived scope.
+    if (isStatusRoute) {
+      return await handleStatusRoute(request, url, deps, store, scheduler, now);
+    }
 
     // /questions
     if (parts.length === 1) {

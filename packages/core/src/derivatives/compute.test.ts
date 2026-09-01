@@ -33,6 +33,7 @@ function registration(
     registeredBy: { kind: "owner" },
     status: "pending",
     error: null,
+    errorCode: null,
     createdAt: "2026-08-27T00:00:00.000Z",
     updatedAt: "2026-08-27T00:00:00.000Z",
     lastComputedAt: null,
@@ -641,5 +642,92 @@ describe("computeQuestion with E2EE to a fake Phala gateway", () => {
     );
     expect(gateway.requests).toHaveLength(0);
     expect(gateway.attestationRequests).toHaveLength(1);
+  });
+});
+
+describe("failure classification (errorCode)", () => {
+  it("classifies a transient inference failure as inference_unavailable", async () => {
+    const d = deps({
+      provider: createFakeInferenceProvider({
+        respond: () => {
+          throw new InferenceRequestError("upstream down", 503);
+        },
+      }),
+    });
+    await seed(d.storage, "oura.sleep", {});
+    await seed(d.storage, "chatgpt.conversations", {});
+    expect((await computeQuestion("q-1", d)).status).toBe("failed");
+    expect((await d.store.get("q-1"))!.errorCode).toBe("inference_unavailable");
+  });
+
+  it("classifies a permanent inference failure as internal, not retryable", async () => {
+    const d = deps({
+      provider: createFakeInferenceProvider({
+        respond: () => {
+          throw new InferenceRequestError("bad request", 400);
+        },
+      }),
+    });
+    await seed(d.storage, "oura.sleep", {});
+    await seed(d.storage, "chatgpt.conversations", {});
+    expect((await computeQuestion("q-1", d)).status).toBe("failed");
+    expect((await d.store.get("q-1"))!.errorCode).toBe("internal");
+  });
+
+  it("classifies an absent source as source_missing", async () => {
+    const d = deps();
+    await seed(d.storage, "oura.sleep", {});
+    expect((await computeQuestion("q-1", d)).status).toBe("failed");
+    expect((await d.store.get("q-1"))!.errorCode).toBe("source_missing");
+  });
+
+  it("classifies a tombstoned source as source_missing", async () => {
+    const tracker = {
+      resolve: async (scope: string) =>
+        scope === "chatgpt.conversations"
+          ? {
+              deleted: true,
+              deletedAt: "2026-08-26T00:00:00.000Z",
+              version: null,
+              source: "gateway",
+            }
+          : { deleted: false },
+    } as unknown as ScopeDeletionTracker;
+    const d = deps({ scopeDeletions: tracker });
+    await seed(d.storage, "oura.sleep", {});
+    await seed(d.storage, "chatgpt.conversations", {});
+    expect((await computeQuestion("q-1", d)).status).toBe("failed");
+    expect((await d.store.get("q-1"))!.errorCode).toBe("source_missing");
+  });
+
+  it("classifies a narrowed builder grant as grant_invalid", async () => {
+    const d = deps({
+      store: createInMemoryQuestionStore({ initial: [builderRegistration()] }),
+      writePolicyPorts: policyPorts(["write:coach.weekly", "oura.sleep"]),
+    });
+    await seed(d.storage, "oura.sleep", {});
+    await seed(d.storage, "chatgpt.conversations", {});
+    expect((await computeQuestion("q-1", d)).status).toBe("failed");
+    expect((await d.store.get("q-1"))!.errorCode).toBe("grant_invalid");
+  });
+
+  it("clears errorCode when a later compute succeeds", async () => {
+    const d = deps({
+      store: createInMemoryQuestionStore({
+        initial: [
+          registration({
+            status: "stale",
+            error: "upstream down",
+            errorCode: "inference_unavailable",
+          }),
+        ],
+      }),
+    });
+    await seed(d.storage, "oura.sleep", {});
+    await seed(d.storage, "chatgpt.conversations", {});
+    expect((await computeQuestion("q-1", d)).status).toBe("ready");
+    const stored = (await d.store.get("q-1"))!;
+    expect(stored.error).toBeNull();
+    expect(stored.errorCode).toBeNull();
   });
 });

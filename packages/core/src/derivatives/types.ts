@@ -15,6 +15,17 @@ export type QuestionStatus = "pending" | "ready" | "failed" | "stale";
  */
 export type QuestionRecompute = "snapshot" | "on-change";
 
+/**
+ * Closed vocabulary for the machine-readable failure class. Deliberately
+ * coarse: it is served to readers of the derived scope through the status
+ * route, so it must never carry a scope name, the question or provider
+ * detail. `inference_unavailable` is the one transient class (the scheduler
+ * retries it); everything else stays failed until a source change or an
+ * explicit recompute.
+ */
+export type QuestionErrorCode =
+  "inference_unavailable" | "source_missing" | "grant_invalid" | "internal";
+
 /** Who registered the question; a builder is bound to the write grant. */
 export type QuestionRegisteredBy =
   | { kind: "owner" }
@@ -33,6 +44,8 @@ export interface QuestionRegistration {
   status: QuestionStatus;
   /** Short failure reason (never the prompt or the data). Null unless failed. */
   error: string | null;
+  /** Machine-readable failure class; null unless failed. */
+  errorCode: QuestionErrorCode | null;
   createdAt: string;
   updatedAt: string;
   lastComputedAt: string | null;
@@ -46,6 +59,7 @@ export type QuestionRegistrationPatch = Partial<
     QuestionRegistration,
     | "status"
     | "error"
+    | "errorCode"
     | "updatedAt"
     | "lastComputedAt"
     | "derivedVersion"
@@ -87,6 +101,7 @@ export interface QuestionRegistrationView {
   registeredBy: QuestionRegisteredBy;
   status: QuestionStatus;
   error: string | null;
+  errorCode: QuestionErrorCode | null;
   createdAt: string;
   updatedAt: string;
   lastComputedAt: string | null;
@@ -107,6 +122,7 @@ export function questionRegistrationView(
     registeredBy: registration.registeredBy,
     status: registration.status,
     error: registration.error,
+    errorCode: registration.errorCode,
     createdAt: registration.createdAt,
     updatedAt: registration.updatedAt,
     lastComputedAt: registration.lastComputedAt,

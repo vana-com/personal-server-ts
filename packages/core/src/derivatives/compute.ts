@@ -36,7 +36,11 @@ import {
   trimSourceData,
   type PromptSource,
 } from "./prompt.js";
-import type { QuestionRegistration, QuestionStore } from "./types.js";
+import type {
+  QuestionErrorCode,
+  QuestionRegistration,
+  QuestionStore,
+} from "./types.js";
 
 export interface ComputeLogger {
   info?(payload: Record<string, unknown>, message: string): void;
@@ -148,10 +152,37 @@ export interface DerivativeAnswerRecord {
 
 /** A failure message safe to persist: never the prompt, never the data. */
 class ComputeFailure extends Error {
-  constructor(message: string) {
+  readonly code: QuestionErrorCode | undefined;
+  constructor(message: string, code?: QuestionErrorCode) {
     super(message);
     this.name = "ComputeFailure";
+    this.code = code;
   }
+}
+
+/**
+ * The machine-readable failure class stored next to the short reason. It is
+ * what the status route serves to readers of the derived scope, so it is a
+ * CLOSED vocabulary: never a scope name, never provider detail. It also
+ * drives the scheduler's automatic retry — `inference_unavailable` is the
+ * one transient class.
+ */
+function classifyComputeError(err: unknown): QuestionErrorCode {
+  if (err instanceof ComputeFailure) return err.code ?? "internal";
+  if (err instanceof InferenceRequestError) {
+    return isRetryableInferenceError(err)
+      ? "inference_unavailable"
+      : "internal";
+  }
+  if (err instanceof ProtocolError) {
+    const grantShaped =
+      err.errorCode === "DERIVATIVE_SOURCE_NOT_GRANTED" ||
+      err.errorCode === "SCOPE_MISMATCH" ||
+      err.errorCode === "UNREGISTERED_BUILDER" ||
+      err.errorCode.startsWith("GRANT_");
+    return grantShaped ? "grant_invalid" : "internal";
+  }
+  return "internal";
 }
 
 function shortError(err: unknown): string {
@@ -281,10 +312,16 @@ async function loadSource(
     entry,
   );
   if (deletion) {
-    throw new ComputeFailure(`source scope ${scope} is deleted`);
+    throw new ComputeFailure(
+      `source scope ${scope} is deleted`,
+      "source_missing",
+    );
   }
   if (!entry) {
-    throw new ComputeFailure(`source scope ${scope} has no local data`);
+    throw new ComputeFailure(
+      `source scope ${scope} has no local data`,
+      "source_missing",
+    );
   }
   let envelope;
   try {
@@ -478,6 +515,7 @@ export async function computeQuestion(
     const updated = await deps.store.update(questionId, {
       status: "ready",
       error: null,
+      errorCode: null,
       updatedAt: computedAt,
       lastComputedAt: computedAt,
       derivedVersion: entry?.version ?? null,
@@ -521,10 +559,12 @@ export async function computeQuestion(
     };
   } catch (err) {
     const error = shortError(err);
+    const errorCode = classifyComputeError(err);
     const at = now().toISOString();
     const updated = await deps.store.update(questionId, {
       status: "failed",
       error,
+      errorCode,
       updatedAt: at,
     });
     deps.logger?.warn?.(
@@ -533,7 +573,12 @@ export async function computeQuestion(
     );
     return {
       status: "failed",
-      registration: updated ?? { ...registration, status: "failed", error },
+      registration: updated ?? {
+        ...registration,
+        status: "failed",
+        error,
+        errorCode,
+      },
       error,
     };
   }

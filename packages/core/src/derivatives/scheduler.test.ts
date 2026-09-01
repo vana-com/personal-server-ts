@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { createRecomputeScheduler, type SchedulerTimers } from "./scheduler.js";
+import type { ComputeOutcome } from "./compute.js";
 import { createInMemoryQuestionStore } from "./store.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
 import type { QuestionRegistration } from "./types.js";
@@ -17,6 +18,7 @@ function registration(
     registeredBy: { kind: "owner" },
     status: "ready",
     error: null,
+    errorCode: null,
     createdAt: "2026-08-27T00:00:00.000Z",
     updatedAt: "2026-08-27T00:00:00.000Z",
     lastComputedAt: "2026-08-27T00:00:00.000Z",
@@ -300,5 +302,376 @@ describe("createRecomputeScheduler", () => {
     scheduler.markSourceChanged("oura.sleep");
     await scheduler.whenIdle();
     expect(compute).not.toHaveBeenCalled();
+  });
+});
+
+describe("automatic retry of transient failures", () => {
+  const NOW = new Date("2026-08-27T10:00:00.000Z");
+
+  function failedOutcome(errorCode: "inference_unavailable" | "internal") {
+    return {
+      status: "failed" as const,
+      registration: registration({ status: "failed", errorCode }),
+      error: "upstream down",
+    };
+  }
+
+  function readyOutcome() {
+    return { status: "ready" as const, registration: registration() };
+  }
+
+  function retryScheduler(outcomes: unknown[]) {
+    const store = createInMemoryQuestionStore({
+      initial: [registration({ status: "pending" })],
+    });
+    const timers = manualTimers();
+    const compute = vi.fn(
+      async () => outcomes.shift() as ComputeOutcome | undefined,
+    );
+    const scheduler = createRecomputeScheduler({
+      store,
+      compute,
+      debounceMs: 5_000,
+      retryDelaysMs: [60_000, 300_000],
+      timers: timers.api,
+      now: () => NOW,
+    });
+    return { scheduler, timers, compute, store };
+  }
+
+  it("retries an inference_unavailable failure on a backoff schedule and then gives up", async () => {
+    const { scheduler, timers, compute } = retryScheduler([
+      failedOutcome("inference_unavailable"),
+      failedOutcome("inference_unavailable"),
+      failedOutcome("inference_unavailable"),
+    ]);
+    scheduler.requestRecompute("q-1", { immediate: true });
+    await scheduler.whenIdle();
+    timers.fireAll();
+    await scheduler.whenIdle();
+    expect(compute).toHaveBeenCalledTimes(1);
+    // First retry after the first backoff step.
+    expect(timers.pending().map((t) => t.ms)).toEqual([60_000]);
+    expect(scheduler.nextRetryAt("q-1")).toBe("2026-08-27T10:01:00.000Z");
+
+    timers.fireAll();
+    await scheduler.whenIdle();
+    expect(compute).toHaveBeenCalledTimes(2);
+    expect(timers.pending().map((t) => t.ms)).toEqual([300_000]);
+    expect(scheduler.nextRetryAt("q-1")).toBe("2026-08-27T10:05:00.000Z");
+
+    timers.fireAll();
+    await scheduler.whenIdle();
+    expect(compute).toHaveBeenCalledTimes(3);
+    // Backoff exhausted: no further timer, nothing promised.
+    expect(timers.pending()).toEqual([]);
+    expect(scheduler.nextRetryAt("q-1")).toBeNull();
+  });
+
+  it("does not retry a non-transient failure", async () => {
+    const { scheduler, timers, compute } = retryScheduler([
+      failedOutcome("internal"),
+    ]);
+    scheduler.requestRecompute("q-1", { immediate: true });
+    await scheduler.whenIdle();
+    timers.fireAll();
+    await scheduler.whenIdle();
+    expect(compute).toHaveBeenCalledTimes(1);
+    expect(timers.pending()).toEqual([]);
+    expect(scheduler.nextRetryAt("q-1")).toBeNull();
+  });
+
+  it("a success resets the backoff chain", async () => {
+    const { scheduler, timers, compute } = retryScheduler([
+      failedOutcome("inference_unavailable"),
+      readyOutcome(),
+      failedOutcome("inference_unavailable"),
+    ]);
+    scheduler.requestRecompute("q-1", { immediate: true });
+    await scheduler.whenIdle();
+    timers.fireAll();
+    await scheduler.whenIdle();
+    timers.fireAll(); // retry 1 -> success
+    await scheduler.whenIdle();
+    expect(compute).toHaveBeenCalledTimes(2);
+    expect(timers.pending()).toEqual([]);
+    expect(scheduler.nextRetryAt("q-1")).toBeNull();
+
+    // A fresh failure starts from the FIRST step again.
+    scheduler.requestRecompute("q-1", { immediate: true });
+    await scheduler.whenIdle();
+    timers.fireAll();
+    await scheduler.whenIdle();
+    expect(compute).toHaveBeenCalledTimes(3);
+    expect(timers.pending().map((t) => t.ms)).toEqual([60_000]);
+  });
+
+  it("a source change during the retry window supersedes the retry and resets the chain", async () => {
+    const { scheduler, timers, compute } = retryScheduler([
+      failedOutcome("inference_unavailable"),
+      failedOutcome("inference_unavailable"),
+      failedOutcome("inference_unavailable"),
+    ]);
+    scheduler.requestRecompute("q-1", { immediate: true });
+    await scheduler.whenIdle();
+    timers.fireAll();
+    await scheduler.whenIdle();
+    timers.fireAll(); // retry 1 -> fails again, next step 300s
+    await scheduler.whenIdle();
+    expect(timers.pending().map((t) => t.ms)).toEqual([300_000]);
+
+    scheduler.markSourceChanged("oura.sleep");
+    await scheduler.whenIdle();
+    // The retry timer is replaced by the debounce timer; the chain restarts.
+    expect(timers.pending().map((t) => t.ms)).toEqual([5_000]);
+    expect(scheduler.nextRetryAt("q-1")).toBeNull();
+    timers.fireAll();
+    await scheduler.whenIdle();
+    expect(compute).toHaveBeenCalledTimes(3);
+    expect(timers.pending().map((t) => t.ms)).toEqual([60_000]);
+  });
+
+  it("reports no retry for an unknown question", async () => {
+    const { scheduler } = retryScheduler([]);
+    expect(scheduler.nextRetryAt("nope")).toBeNull();
+  });
+
+  it("stop() clears any scheduled retry", async () => {
+    const { scheduler, timers } = retryScheduler([
+      failedOutcome("inference_unavailable"),
+    ]);
+    scheduler.requestRecompute("q-1", { immediate: true });
+    await scheduler.whenIdle();
+    timers.fireAll();
+    await scheduler.whenIdle();
+    expect(scheduler.nextRetryAt("q-1")).not.toBeNull();
+    scheduler.stop();
+    expect(timers.pending()).toEqual([]);
+    expect(scheduler.nextRetryAt("q-1")).toBeNull();
+  });
+});
+
+describe("retry interleavings (review findings)", () => {
+  const NOW = new Date("2026-08-27T10:00:00.000Z");
+
+  function reg(overrides: Partial<QuestionRegistration> = {}) {
+    return registration({ status: "pending", ...overrides });
+  }
+
+  function failedOutcome() {
+    return {
+      status: "failed" as const,
+      registration: reg({
+        status: "failed",
+        errorCode: "inference_unavailable",
+      }),
+      error: "upstream down",
+    };
+  }
+
+  it("a source change during the in-flight compute keeps the 5s debounce; the retry branch must not clobber it", async () => {
+    const store = createInMemoryQuestionStore({ initial: [reg()] });
+    const timers = manualTimers();
+    let settle!: (value: unknown) => void;
+    let calls = 0;
+    const compute = vi.fn(() => {
+      calls += 1;
+      if (calls === 1) {
+        return new Promise((resolve) => {
+          settle = resolve;
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+    const scheduler = createRecomputeScheduler({
+      store,
+      compute: compute as (
+        questionId: string,
+      ) => Promise<ComputeOutcome | void>,
+      debounceMs: 5_000,
+      retryDelaysMs: [60_000, 300_000],
+      timers: timers.api,
+      now: () => NOW,
+    });
+
+    scheduler.requestRecompute("q-1", { immediate: true });
+    await scheduler.whenIdle();
+    timers.fireAll(); // compute 1 starts and hangs
+    await Promise.resolve();
+    expect(calls).toBe(1);
+
+    // Fresh data lands while the compute is in flight: debounce scheduled.
+    scheduler.markSourceChanged("oura.sleep");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(timers.pending().map((t) => t.ms)).toEqual([5_000]);
+
+    // The in-flight compute now settles with a transient failure. The
+    // pending debounce must survive; no 60s retry may replace it.
+    settle(failedOutcome());
+    await scheduler.whenIdle();
+    expect(timers.pending().map((t) => t.ms)).toEqual([5_000]);
+    expect(scheduler.nextRetryAt("q-1")).toBeNull();
+  });
+
+  it("a transient failure that settles after stop() leaves no phantom retry promise", async () => {
+    const store = createInMemoryQuestionStore({ initial: [reg()] });
+    const timers = manualTimers();
+    let settle!: (value: unknown) => void;
+    const compute = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          settle = resolve;
+        }),
+    );
+    const scheduler = createRecomputeScheduler({
+      store,
+      compute: compute as (
+        questionId: string,
+      ) => Promise<ComputeOutcome | void>,
+      debounceMs: 5_000,
+      retryDelaysMs: [60_000],
+      timers: timers.api,
+      now: () => NOW,
+    });
+    scheduler.requestRecompute("q-1", { immediate: true });
+    await scheduler.whenIdle();
+    timers.fireAll(); // compute starts and hangs
+    await Promise.resolve();
+    scheduler.stop();
+    settle(failedOutcome());
+    await scheduler.whenIdle();
+    expect(timers.pending()).toEqual([]);
+    expect(scheduler.nextRetryAt("q-1")).toBeNull();
+  });
+
+  it("while the retry compute is in flight, no retry is promised (retryAt cleared when the timer fires)", async () => {
+    const store = createInMemoryQuestionStore({ initial: [reg()] });
+    const timers = manualTimers();
+    let calls = 0;
+    let settle!: (value: unknown) => void;
+    const compute = vi.fn(() => {
+      calls += 1;
+      if (calls === 1) return Promise.resolve(failedOutcome());
+      return new Promise((resolve) => {
+        settle = resolve;
+      });
+    });
+    const scheduler = createRecomputeScheduler({
+      store,
+      compute: compute as (
+        questionId: string,
+      ) => Promise<ComputeOutcome | void>,
+      debounceMs: 5_000,
+      retryDelaysMs: [60_000],
+      timers: timers.api,
+      now: () => NOW,
+    });
+    scheduler.requestRecompute("q-1", { immediate: true });
+    await scheduler.whenIdle();
+    timers.fireAll(); // compute 1 -> transient failure -> retry in 60s
+    await scheduler.whenIdle();
+    expect(scheduler.nextRetryAt("q-1")).toBe("2026-08-27T10:01:00.000Z");
+
+    timers.fireAll(); // retry fires; compute 2 hangs
+    await Promise.resolve();
+    expect(calls).toBe(2);
+    // No pending retry while it runs: a past timestamp would pin the
+    // status route's retryAfterSeconds at 0 and invite a tight poll loop.
+    expect(scheduler.nextRetryAt("q-1")).toBeNull();
+    // But the retry is RUNNING, not abandoned: without this signal the
+    // status route would serve the terminal failed-with-no-retry signature
+    // for the whole in-flight window.
+    expect(scheduler.retryInFlight("q-1")).toBe(true);
+    settle(undefined);
+    await scheduler.whenIdle();
+    expect(scheduler.retryInFlight("q-1")).toBe(false);
+  });
+
+  it("a debounce run is not reported as a retry in flight", async () => {
+    const store = createInMemoryQuestionStore({ initial: [reg()] });
+    const timers = manualTimers();
+    let settle!: (value: unknown) => void;
+    const compute = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          settle = resolve;
+        }),
+    );
+    const scheduler = createRecomputeScheduler({
+      store,
+      compute: compute as (
+        questionId: string,
+      ) => Promise<ComputeOutcome | void>,
+      debounceMs: 5_000,
+      retryDelaysMs: [60_000],
+      timers: timers.api,
+      now: () => NOW,
+    });
+    scheduler.markSourceChanged("oura.sleep");
+    await scheduler.whenIdle();
+    timers.fireAll(); // debounce fires; compute hangs
+    await Promise.resolve();
+    expect(scheduler.retryInFlight("q-1")).toBe(false);
+    settle(undefined);
+    await scheduler.whenIdle();
+  });
+
+  it("a runtime-unavailable skip mid-chain reschedules the retry instead of dropping the chain", async () => {
+    const store = createInMemoryQuestionStore({ initial: [reg()] });
+    const timers = manualTimers();
+    const outcomes: Array<ComputeOutcome | undefined> = [
+      failedOutcome(),
+      { status: "skipped", reason: "runtime-unavailable" },
+      failedOutcome(),
+    ];
+    const compute = vi.fn(
+      async () => outcomes.shift() as ComputeOutcome | undefined,
+    );
+    const scheduler = createRecomputeScheduler({
+      store,
+      compute: compute as (
+        questionId: string,
+      ) => Promise<ComputeOutcome | void>,
+      debounceMs: 5_000,
+      retryDelaysMs: [60_000, 300_000, 1_800_000],
+      timers: timers.api,
+      now: () => NOW,
+    });
+    scheduler.requestRecompute("q-1", { immediate: true });
+    await scheduler.whenIdle();
+    timers.fireAll(); // failure -> retry in 60s
+    await scheduler.whenIdle();
+    expect(timers.pending().map((t) => t.ms)).toEqual([60_000]);
+
+    timers.fireAll(); // retry fires but the runtime is unavailable
+    await scheduler.whenIdle();
+    // The chain continues instead of ending with a failed question that
+    // nothing will ever recompute.
+    expect(timers.pending().map((t) => t.ms)).toEqual([300_000]);
+    expect(scheduler.nextRetryAt("q-1")).not.toBeNull();
+  });
+
+  it("marking a failed question stale clears its errorCode", async () => {
+    const store = createInMemoryQuestionStore({
+      initial: [
+        reg({
+          status: "failed",
+          error: "upstream down",
+          errorCode: "inference_unavailable",
+        }),
+      ],
+    });
+    const timers = manualTimers();
+    const scheduler = createRecomputeScheduler({
+      store,
+      compute: vi.fn(async () => undefined),
+      debounceMs: 5_000,
+      timers: timers.api,
+    });
+    scheduler.markSourceChanged("oura.sleep");
+    await scheduler.whenIdle();
+    const stored = (await store.get("q-1"))!;
+    expect(stored.status).toBe("stale");
+    expect(stored.errorCode).toBeNull();
   });
 });

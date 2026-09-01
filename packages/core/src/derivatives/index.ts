@@ -1,5 +1,6 @@
 export {
   questionRegistrationView,
+  type QuestionErrorCode,
   type QuestionRecompute,
   type QuestionRegisteredBy,
   type QuestionRegistration,
