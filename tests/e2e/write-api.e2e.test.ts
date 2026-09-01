@@ -13,7 +13,6 @@ import {
   createTestWallet,
   buildWeb3SignedHeader,
 } from "../../packages/core/src/test-utils/index.js";
-import { verifyStoredWriterAttribution } from "../../packages/core/src/write/attribution.js";
 
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
@@ -173,7 +172,7 @@ describe("Write API (e2e)", () => {
     expect(body.error.errorCode).toBe("SCOPE_MISMATCH");
   });
 
-  it("read-back with a SEPARATE read-grant succeeds and carries the attribution", async () => {
+  it("read-back with a SEPARATE read-grant succeeds without the server-stamped attribution", async () => {
     gateway.setGrant(READ_GRANT_ID, {
       id: READ_GRANT_ID,
       scopes: [SCOPE],
@@ -194,25 +193,12 @@ describe("Write API (e2e)", () => {
     const envelope = await res.json();
     expect(envelope.scope).toBe(SCOPE);
     expect(envelope.data.note).toBe("hello from the builder");
-    // Builder attribution stored with the record (Tim's cryptographic
-    // attribution): identity + payload signature + grant.
-    const attribution = envelope.data.$writtenBy;
-    expect(attribution.builder.toLowerCase()).toBe(
-      builderWallet.address.toLowerCase(),
-    );
-    expect(attribution.grantId).toBe(WRITE_GRANT_ID);
-    expect(attribution.signature).toContain(".");
-    expect(attribution.bodyHash).toMatch(/^sha256:/);
-    // A third party holding only the record can verify who wrote it: the
-    // stored data re-hashes to the signed bodyHash, the proof recovers to
-    // the builder.
-    const verified = await verifyStoredWriterAttribution(envelope, {
-      expectedOrigin: server.url,
-    });
-    expect(verified.builder.toLowerCase()).toBe(
-      builderWallet.address.toLowerCase(),
-    );
-    expect(verified.grantId).toBe(WRITE_GRANT_ID);
+    // The builder attribution is stored with the record but never served on
+    // a grantee read (the writing builder's identity must not leak to other
+    // grantees); the owner's read and the verify path retain it. Covered at
+    // the route level in data-lineage.test.ts.
+    expect(envelope.data.$writtenBy).toBeUndefined();
+    expect(envelope.data.$lineage).toBeUndefined();
   });
 
   it("a session write to an uncovered scope is rejected", async () => {

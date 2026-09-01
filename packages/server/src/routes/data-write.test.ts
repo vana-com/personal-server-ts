@@ -655,10 +655,9 @@ describe("POST /v1/data/:scope with a write session", () => {
     expect(res.status).toBe(200);
     const envelope = await res.json();
     expect(envelope.data.note).toBe("readable");
-    // Attribution rides along on the read — verifiable by the reader.
-    expect(envelope.data[WRITER_ATTRIBUTION_KEY].builder).toBe(
-      builderWallet.address,
-    );
+    // The server-stamped attribution stays server-side on grantee reads
+    // (the connector-identity rule); the owner's read still carries it.
+    expect(envelope.data[WRITER_ATTRIBUTION_KEY]).toBeUndefined();
   });
 
   it("rejects an expired session token", async () => {

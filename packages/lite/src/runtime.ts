@@ -500,6 +500,15 @@ export function createBearerTokenPsLiteAuth(
           reason: "No grantId in request",
         });
       }
+      // This adapter echoes the caller-supplied grantId into the auth
+      // result, so it must never mint the server-internal sentinels that
+      // confer the unredacted owner view and the x402 payment exemption.
+      if (input.grantId === "owner" || input.grantId === "policy-bypass") {
+        throw new GrantRequiredError({
+          reason: "Reserved grantId",
+          grantId: input.grantId,
+        });
+      }
       return { grantId: input.grantId };
     },
   };
