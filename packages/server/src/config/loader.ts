@@ -2,6 +2,7 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
   ServerConfigSchema,
+  withCurrentInferenceModel,
   type ServerConfig,
 } from "@opendatalabs/personal-server-ts-core/schemas";
 import { resolveRootPath } from "./paths.js";
@@ -75,7 +76,11 @@ export async function loadConfig(
   // Allow env vars to override config-file values (useful for cloud / Docker deployments)
   applyEnvOverrides(parsed);
 
-  const config = ServerConfigSchema.parse(parsed);
+  // The write-back below materializes every schema default into the file, so
+  // the model this install first ran is pinned on disk from then on. Move a
+  // superseded default forward before it is written and before Desktop reads
+  // it back out as an explicit `configDefaults` entry.
+  const config = withCurrentInferenceModel(ServerConfigSchema.parse(parsed));
 
   // Write back so that defaults are visible and editable in config.json
   const serialized = JSON.stringify(config, null, 2) + "\n";

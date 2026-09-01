@@ -3,6 +3,10 @@ import { join } from "node:path";
 import { access, mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { loadConfig } from "./loader.js";
+import {
+  DEFAULTS,
+  SUPERSEDED_INFERENCE_MODELS,
+} from "@opendatalabs/personal-server-ts-core/schemas";
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "config-test-"));
@@ -293,6 +297,50 @@ describe("loadConfig", () => {
           },
         );
       });
+    });
+  });
+
+  it("moves a persisted superseded inference model forward and writes it back", async () => {
+    await withTempDir(async (dir) => {
+      const configPath = join(dir, "config.json");
+      // What an install that first booted on the previous default has on disk:
+      // loadConfig itself wrote the model there.
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          server: { port: 9090 },
+          inference: {
+            model: SUPERSEDED_INFERENCE_MODELS[0],
+            maxSourceItems: 7,
+          },
+        }),
+      );
+
+      const config = await loadConfig({ configPath });
+
+      expect(config.inference.model).toBe(DEFAULTS.inference.model);
+      // Only the model moves; the rest of the file is untouched.
+      expect(config.inference.maxSourceItems).toBe(7);
+      expect(config.server.port).toBe(9090);
+
+      // Written back, so Desktop hands the moved value to the runtime as an
+      // explicit configDefaults entry instead of the pinned old one.
+      const onDisk = JSON.parse(await readFile(configPath, "utf-8"));
+      expect(onDisk.inference.model).toBe(DEFAULTS.inference.model);
+    });
+  });
+
+  it("leaves a chosen inference model alone", async () => {
+    await withTempDir(async (dir) => {
+      const configPath = join(dir, "config.json");
+      await writeFile(
+        configPath,
+        JSON.stringify({ inference: { model: "openai/gpt-4o-mini" } }),
+      );
+
+      const config = await loadConfig({ configPath });
+
+      expect(config.inference.model).toBe("openai/gpt-4o-mini");
     });
   });
 

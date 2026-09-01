@@ -61,7 +61,7 @@ export const DEFAULTS = {
     // layer calls. Point it at the Vana inference relay (which holds the
     // provider key) or straight at a provider for local development.
     baseUrl: "https://inference.phala.com/v1",
-    model: "z-ai/glm-5.2",
+    model: "z-ai/glm-5.3-flash",
     // End to end encryption of prompt and answer to the Phala gateway
     // (E2EE v2): the relay only sees ciphertext. Set false only for local
     // development against a provider without ACI attestation.
@@ -215,3 +215,46 @@ export type GatewayConfig = {
     feeRegistry: string;
   };
 };
+
+/**
+ * Model ids that shipped as {@link DEFAULTS}`.inference.model` before the
+ * current one.
+ *
+ * A persisted config that still names one of these was never a choice anyone
+ * made. Both persistence paths materialize schema defaults into the stored
+ * config on first boot — `loadConfig` writes the parsed config back to
+ * `server.json`, PS Lite stores the parsed config under its config key — so
+ * every install pins whatever default it first ran, and Desktop then hands
+ * that pinned value back as an explicit `configDefaults` entry. Without a
+ * forward step a default bump reaches new installs only.
+ *
+ * Anything outside this list is left alone: it can only have come from an
+ * operator editing the config or a host choosing a model, and that choice
+ * outranks ours.
+ */
+export const SUPERSEDED_INFERENCE_MODELS: readonly string[] = ["z-ai/glm-5.2"];
+
+/**
+ * Move a superseded default model forward to the current one.
+ *
+ * Returns the same object when there is nothing to move, so a caller can
+ * persist on identity change alone:
+ *
+ * ```ts
+ * const next = withCurrentInferenceModel(stored);
+ * if (next !== stored) await save(next);
+ * ```
+ */
+export function withCurrentInferenceModel(config: ServerConfig): ServerConfig {
+  const model = config.inference.model;
+  if (
+    model === DEFAULTS.inference.model ||
+    !SUPERSEDED_INFERENCE_MODELS.includes(model)
+  ) {
+    return config;
+  }
+  return {
+    ...config,
+    inference: { ...config.inference, model: DEFAULTS.inference.model },
+  };
+}

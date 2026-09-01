@@ -1,6 +1,9 @@
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
-import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
+import {
+  ServerConfigSchema,
+  withCurrentInferenceModel,
+} from "@opendatalabs/personal-server-ts-core/schemas";
 import {
   deriveMasterKey,
   deriveScopeKey,
@@ -503,13 +506,19 @@ export async function loadOrCreatePsLiteConfig(
     await store.set(CONFIG_KEY, config);
     return config;
   }
-  // A persisted config exists. The gateway block (url, chainId, contracts) and
-  // the payment toggle are environment/deployment config, not instance state —
-  // when the caller's defaults move them (a contract redeploy, or flipping
-  // x402 payment via env), the stored snapshot must follow, or EIP-712 signing
-  // keeps using the stale verifyingContract / payment stays at its old value.
-  // Instance state (server.origin, sync cursor, etc.) stays persisted.
-  const stored = ServerConfigSchema.parse(existing);
+  // A persisted config exists. The branch above stored the parsed config,
+  // defaults and all, so the model this browser first booted is pinned in
+  // IndexedDB from then on. Move a superseded default forward before anything
+  // else reads the config.
+  const parsed = ServerConfigSchema.parse(existing);
+  const stored = withCurrentInferenceModel(parsed);
+  if (stored !== parsed) await store.set(CONFIG_KEY, stored);
+  // The gateway block (url, chainId, contracts) and the payment toggle are
+  // environment/deployment config, not instance state — when the caller's
+  // defaults move them (a contract redeploy, or flipping x402 payment via
+  // env), the stored snapshot must follow, or EIP-712 signing keeps using the
+  // stale verifyingContract / payment stays at its old value. Instance state
+  // (server.origin, sync cursor, etc.) stays persisted.
   if (!(defaults?.gateway || defaults?.payment)) return stored;
   const reconciled = ServerConfigSchema.parse({
     ...stored,
