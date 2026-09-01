@@ -9,6 +9,10 @@ import {
   savePsLiteConfig,
 } from "./state.js";
 import { createMemoryPsLiteStateStore } from "./test-support/memory.js";
+import {
+  DEFAULTS,
+  SUPERSEDED_INFERENCE_MODELS,
+} from "@opendatalabs/personal-server-ts-core/schemas";
 
 const OWNER_SIGNATURE =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b" as const;
@@ -274,6 +278,40 @@ describe("PS Lite browser state", () => {
       payment: { enabled: false },
     });
     expect(off.payment.enabled).toBe(false);
+  });
+
+  it("moves a stored superseded inference model forward and persists it", async () => {
+    const store = createMemoryPsLiteStateStore();
+
+    // A browser that first booted on the previous default: the parsed config,
+    // model included, is what got stored.
+    const first = await loadOrCreatePsLiteConfig(store);
+    await savePsLiteConfig(store, {
+      ...first,
+      inference: { ...first.inference, model: SUPERSEDED_INFERENCE_MODELS[0] },
+    });
+
+    const migrated = await loadOrCreatePsLiteConfig(store);
+    expect(migrated.inference.model).toBe(DEFAULTS.inference.model);
+
+    // Persisted, not recomputed on each boot: a read with no defaults at all
+    // (the early-return path) still sees the moved value.
+    await expect(loadOrCreatePsLiteConfig(store)).resolves.toMatchObject({
+      inference: { model: DEFAULTS.inference.model },
+    });
+  });
+
+  it("leaves a chosen inference model alone", async () => {
+    const store = createMemoryPsLiteStateStore();
+    const first = await loadOrCreatePsLiteConfig(store);
+    await savePsLiteConfig(store, {
+      ...first,
+      inference: { ...first.inference, model: "openai/gpt-4o-mini" },
+    });
+
+    await expect(loadOrCreatePsLiteConfig(store)).resolves.toMatchObject({
+      inference: { model: "openai/gpt-4o-mini" },
+    });
   });
 
   it("leaves stored config untouched when no gateway defaults are given", async () => {

@@ -106,7 +106,7 @@ export interface InferenceRequestEncryption {
 }
 
 export const DEFAULT_INFERENCE_BASE_URL = "https://inference.phala.com/v1";
-export const DEFAULT_INFERENCE_MODEL = "z-ai/glm-5.2";
+export const DEFAULT_INFERENCE_MODEL = "z-ai/glm-5.3-flash";
 export const DEFAULT_INFERENCE_TIMEOUT_MS = 120_000;
 export const DEFAULT_INFERENCE_MAX_TOKENS = 2_048;
 
