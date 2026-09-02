@@ -312,6 +312,8 @@ Done in parts on 2026-09-02 (Spikes 1 to 4, `docs/260902-enclave-spike-results.m
 
 Resolved 2026-09-02: owner-approved question intents; blob reads stay public; sealed ciphertext in Gateway Postgres; raw-read version pinned at admission; attestation via Gateway admission plus KMS cert chain; no second wrap; 5 min revocation staleness window.
 
+Step 2 contract (endpoints, SDK types, tables, signing intents, PR order): `260902-identity-contract.md`. Resolved there 2026-09-02: identity endpoints unauthenticated in v1; sealing AAD and key paths carry the epoch; Gateway mirrors SDK identity types with a devDependency shape test.
+
 ## Review log
 
 2026-09-02, Maciej: all blocking items incorporated (decisions 9 to 12, 15 to 18, desktop migration, sign-off section). Decisions as given recorded as 1, 2, 5 to 8, 19 to 21. Dismissed: naming a per-user-CVM trigger; multiple sandboxes per CVM is the design (decision 13), not a staging step. Questions answered: desktop out of read path (decision 3); no rotation in v1 with DRK plan; latency estimates and `?wait` tier; V1 rule exceptions; two signatures at signup.
