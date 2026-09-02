@@ -18,7 +18,7 @@
   "scripts": {
     "start": "npm run build && node --env-file-if-exists=.env packages/server/dist/index.js",
     "dev": "tsc --build && tsx watch --env-file-if-exists=.env packages/server/src/index.ts",
-    "build": "rm -rf packages/core/dist packages/core/tsconfig.tsbuildinfo && npm run build -w @opendatalabs/personal-server-ts-core && rm -rf packages/lite/dist packages/lite/tsconfig.tsbuildinfo && npm run build -w @opendatalabs/personal-server-ts-lite && rm -rf packages/server/dist packages/server/tsconfig.tsbuildinfo && npm run build -w @opendatalabs/personal-server-ts-server && rm -rf packages/cli/dist packages/cli/tsconfig.tsbuildinfo && npm run build -w @opendatalabs/personal-server-ts && tsc --build scripts",
+    "build": "rm -rf packages/core/dist packages/core/tsconfig.tsbuildinfo && npm run build -w @opendatalabs/personal-server-ts-core && rm -rf packages/lite/dist packages/lite/tsconfig.tsbuildinfo && npm run build -w @opendatalabs/personal-server-ts-lite && rm -rf packages/server/dist packages/server/tsconfig.tsbuildinfo && npm run build -w @opendatalabs/personal-server-ts-server && rm -rf packages/cli/dist packages/cli/tsconfig.tsbuildinfo && npm run build -w @opendatalabs/personal-server-ts && rm -rf packages/enclave/dist packages/enclave/tsconfig.tsbuildinfo && npm run build -w @opendatalabs/personal-server-ts-enclave && tsc --build scripts",
     "clean": "tsc --build --clean && npm run clean:dist",
     "clean:dist": "rm -rf packages/*/dist packages/*/tsconfig.tsbuildinfo",
     "test": "vitest run",

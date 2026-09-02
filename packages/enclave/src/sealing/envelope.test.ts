@@ -1,0 +1,118 @@
+import { describe, expect, it } from "vitest";
+import { randomBytes } from "node:crypto";
+import { createFakeDstackClient } from "../dstack/fake.js";
+import { userPsId } from "../identity/paths.js";
+import {
+  SEALED_ENVELOPE_VERSION,
+  UnsealError,
+  seal,
+  unseal,
+} from "./envelope.js";
+
+const APP = "app-a";
+const OWNER = "0x1234567890AbcdEF1234567890aBcdef12345678" as const;
+const USER_A = userPsId(14800, OWNER);
+const USER_B = userPsId(14800, "0x0000000000000000000000000000000000000001");
+const SIGNATURE_BYTES = 65;
+
+describe("seal / unseal", () => {
+  it("round-trips on a second node with the same appId", async () => {
+    const secret = new Uint8Array(randomBytes(SIGNATURE_BYTES));
+    const nodeA = createFakeDstackClient({ appId: APP, instanceId: "a" });
+    const nodeB = createFakeDstackClient({ appId: APP, instanceId: "b" });
+
+    const envelope = await seal(nodeA, USER_A, secret);
+    const opened = await unseal(nodeB, USER_A, envelope);
+
+    expect(envelope.v).toBe(SEALED_ENVELOPE_VERSION);
+    expect(Buffer.from(opened)).toEqual(Buffer.from(secret));
+  });
+
+  it("uses distinct IVs for content and key wrap", async () => {
+    const client = createFakeDstackClient({ appId: APP });
+    const envelope = await seal(
+      client,
+      USER_A,
+      new Uint8Array(SIGNATURE_BYTES),
+    );
+
+    expect(envelope.iv).not.toBe(envelope.wrappedContentKey.iv);
+  });
+
+  it("fails when presented for another user (AAD mismatch)", async () => {
+    const client = createFakeDstackClient({ appId: APP });
+    const envelope = await seal(
+      client,
+      USER_A,
+      new Uint8Array(SIGNATURE_BYTES),
+    );
+
+    await expect(unseal(client, USER_B, envelope)).rejects.toBeInstanceOf(
+      UnsealError,
+    );
+  });
+
+  it("fails under a different appId", async () => {
+    const envelope = await seal(
+      createFakeDstackClient({ appId: APP }),
+      USER_A,
+      new Uint8Array(SIGNATURE_BYTES),
+    );
+
+    await expect(
+      unseal(createFakeDstackClient({ appId: "app-b" }), USER_A, envelope),
+    ).rejects.toBeInstanceOf(UnsealError);
+  });
+
+  it("fails on a tampered ciphertext byte", async () => {
+    const client = createFakeDstackClient({ appId: APP });
+    const envelope = await seal(
+      client,
+      USER_A,
+      new Uint8Array(SIGNATURE_BYTES),
+    );
+    const bytes = Buffer.from(envelope.ciphertext, "base64");
+    bytes[0] ^= 1;
+
+    await expect(
+      unseal(client, USER_A, {
+        ...envelope,
+        ciphertext: bytes.toString("base64"),
+      }),
+    ).rejects.toBeInstanceOf(UnsealError);
+  });
+
+  it("fails on a tampered wrapped key", async () => {
+    const client = createFakeDstackClient({ appId: APP });
+    const envelope = await seal(
+      client,
+      USER_A,
+      new Uint8Array(SIGNATURE_BYTES),
+    );
+    const bytes = Buffer.from(envelope.wrappedContentKey.tag, "base64");
+    bytes[0] ^= 1;
+
+    await expect(
+      unseal(client, USER_A, {
+        ...envelope,
+        wrappedContentKey: {
+          ...envelope.wrappedContentKey,
+          tag: bytes.toString("base64"),
+        },
+      }),
+    ).rejects.toBeInstanceOf(UnsealError);
+  });
+
+  it("rejects an unknown version", async () => {
+    const client = createFakeDstackClient({ appId: APP });
+    const envelope = await seal(
+      client,
+      USER_A,
+      new Uint8Array(SIGNATURE_BYTES),
+    );
+
+    await expect(
+      unseal(client, USER_A, { ...envelope, v: 2 as unknown as 1 }),
+    ).rejects.toBeInstanceOf(UnsealError);
+  });
+});
