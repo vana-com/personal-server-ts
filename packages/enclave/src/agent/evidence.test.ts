@@ -1,23 +1,25 @@
 import { secp256k1 } from "@noble/curves/secp256k1";
-import { keccak256 } from "viem";
+import { hexToBytes, keccak256, toHex } from "viem";
 import { publicKeyToAddress } from "viem/accounts";
 import {
   createFakeDstackClient,
   fakeKmsRootPublicKey,
 } from "../dstack/fake.js";
 import { buildEvidence } from "./evidence.js";
+import { recoverAppRoot, recoverKmsRoot } from "./chain.js";
 
 const OWNER = "0x1111111111111111111111111111111111111111";
 const CHAIN_ID = 14_800;
+const FAKE_APP_ID = "0000000000000000000000000000000000000001";
 
 describe("buildEvidence", () => {
   it("builds complete deterministic identity evidence", async () => {
     const first = await buildEvidence(
-      createFakeDstackClient({ appId: "identity-app" }),
+      createFakeDstackClient({ appId: FAKE_APP_ID }),
       { ownerAddress: OWNER, chainId: CHAIN_ID, epoch: 1 },
     );
     const second = await buildEvidence(
-      createFakeDstackClient({ appId: "identity-app" }),
+      createFakeDstackClient({ appId: FAKE_APP_ID }),
       { ownerAddress: OWNER, chainId: CHAIN_ID, epoch: 1 },
     );
     const kmsRoot = secp256k1.ProjectivePoint.fromHex(
@@ -41,10 +43,26 @@ describe("buildEvidence", () => {
     expect(first.quote.length).toBeGreaterThan(2);
     expect(first.kmsRootFingerprint).toBe(keccak256(kmsRoot));
     expect(publicKeyToAddress(first.publicKey)).toBe(first.address);
+
+    const appRoot = await recoverAppRoot(
+      first.purpose,
+      first.publicKey,
+      first.signatureChain[0],
+    );
+    const recoveredKmsRoot = await recoverKmsRoot(
+      first.appId,
+      appRoot,
+      first.signatureChain[1],
+    );
+    const compressedKmsRoot = secp256k1.ProjectivePoint.fromHex(
+      hexToBytes(recoveredKmsRoot),
+    ).toRawBytes(true);
+
+    expect(toHex(compressedKmsRoot)).toBe(toHex(fakeKmsRootPublicKey()));
   });
 
   it("derives a different address for another epoch", async () => {
-    const client = createFakeDstackClient({ appId: "identity-app" });
+    const client = createFakeDstackClient({ appId: FAKE_APP_ID });
     const first = await buildEvidence(client, {
       ownerAddress: OWNER,
       chainId: CHAIN_ID,

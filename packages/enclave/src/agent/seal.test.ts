@@ -26,6 +26,7 @@ import type { SealRequestBody } from "./types.js";
 
 const CHAIN_ID = 14_800;
 const EPOCH = 2;
+const FAKE_APP_ID = "0000000000000000000000000000000000000002";
 
 function owner(label: string) {
   return privateKeyToAccount(keccak256(toBytes(`enclave-agent-test:${label}`)));
@@ -40,7 +41,7 @@ async function fixture(
   request: SealRequestBody;
   signature: `0x${string}`;
 }> {
-  const client = createFakeDstackClient({ appId: "seal-app" });
+  const client = createFakeDstackClient({ appId: FAKE_APP_ID });
   const ownerAccount = owner(label);
   const id = userPsId(CHAIN_ID, ownerAccount.address);
   const identity = await deriveEnclaveIdentity(client, id, EPOCH);

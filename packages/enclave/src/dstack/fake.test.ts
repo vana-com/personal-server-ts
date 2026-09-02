@@ -4,7 +4,8 @@ import { keccak256, recoverPublicKey, toHex } from "viem";
 import { SIGNATURE_CHAIN_LINK_BYTES } from "./client.js";
 import { createFakeDstackClient, fakeKmsRootPublicKey } from "./fake.js";
 
-const APP = "app-a";
+const APP = "0000000000000000000000000000000000000001";
+const OTHER_APP = "0000000000000000000000000000000000000002";
 const PATH = "users/x/wallet/ethereum/secp256k1/v1";
 const COMPRESSED = true;
 
@@ -39,10 +40,9 @@ describe("fake dstack client", () => {
     const client = createFakeDstackClient({ appId: APP });
     const base = await client.deriveKey(PATH, "p");
     const otherPath = await client.deriveKey(`${PATH}-other`, "p");
-    const otherApp = await createFakeDstackClient({ appId: "app-b" }).deriveKey(
-      PATH,
-      "p",
-    );
+    const otherApp = await createFakeDstackClient({
+      appId: OTHER_APP,
+    }).deriveKey(PATH, "p");
 
     expect(Buffer.from(otherPath.key)).not.toEqual(Buffer.from(base.key));
     expect(Buffer.from(otherApp.key)).not.toEqual(Buffer.from(base.key));
@@ -63,7 +63,8 @@ describe("fake dstack client", () => {
     );
     const kmsRootHex = await recoverCompressed(
       Buffer.concat([
-        Buffer.from(`dstack-kms-issued:${APP}`, "utf8"),
+        Buffer.from("dstack-kms-issued:", "utf8"),
+        Buffer.from(APP, "hex"),
         Buffer.from(appRootHex, "hex"),
       ]),
       signatureChain[1],
@@ -71,6 +72,12 @@ describe("fake dstack client", () => {
 
     expect(kmsRootHex).toBe(
       Buffer.from(fakeKmsRootPublicKey()).toString("hex"),
+    );
+  });
+
+  it("rejects a non-hex appId", () => {
+    expect(() => createFakeDstackClient({ appId: "app-a" })).toThrow(
+      "fake dstack appId must be 40 lowercase hex characters",
     );
   });
 });

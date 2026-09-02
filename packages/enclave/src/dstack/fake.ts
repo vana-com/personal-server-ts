@@ -5,9 +5,10 @@
  * key is HKDF-SHA256(salt "RATLS", app root key, info = path). `purpose` does
  * not touch the key; it only appears in signatureChain[0], exactly as on the
  * real agent. Two fakes with one appId agree on every key, as two CVMs under
- * one app_id do. Signature chains are real secp256k1 signatures over the
- * real agent's messages, so a verifier can be tested here; the "KMS root" is
- * a fixed fake key, so nothing here is attested.
+ * one app_id do. Fake app IDs use the real agent's bare 40-character hex
+ * form. Signature chains are real secp256k1 signatures over the real agent's
+ * messages, so a verifier can be tested here; the "KMS root" is a fixed fake
+ * key, so nothing here is attested.
  */
 
 import { createHash, hkdfSync } from "node:crypto";
@@ -35,6 +36,7 @@ const KMS_ISSUED_PREFIX = "dstack-kms-issued";
 const DEFAULT_COMPOSE_HASH = "fake-compose-hash";
 const DEFAULT_INSTANCE_ID = "fake-instance";
 const COMPRESSED = true;
+const APP_ID_PATTERN = /^[0-9a-f]{40}$/;
 
 export interface FakeDstackOptions {
   appId: string;
@@ -45,6 +47,10 @@ export interface FakeDstackOptions {
 export function createFakeDstackClient(
   options: FakeDstackOptions,
 ): DstackClient {
+  if (!APP_ID_PATTERN.test(options.appId)) {
+    throw new Error("fake dstack appId must be 40 lowercase hex characters");
+  }
+
   const info: DstackInfo = {
     appId: options.appId,
     composeHash: options.composeHash ?? DEFAULT_COMPOSE_HASH,
@@ -86,7 +92,8 @@ async function fakeDerivedKey(
   const link1 = await signLink(
     FAKE_KMS_ROOT_KEY,
     Buffer.concat([
-      Buffer.from(`${KMS_ISSUED_PREFIX}:${appId}`, "utf8"),
+      Buffer.from(`${KMS_ISSUED_PREFIX}:`, "utf8"),
+      Buffer.from(appId, "hex"),
       appRootPubkey,
     ]),
   );

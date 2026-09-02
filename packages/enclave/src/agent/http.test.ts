@@ -24,6 +24,7 @@ const OWNER = privateKeyToAccount(OWNER_KEY);
 const OTHER = privateKeyToAccount(OTHER_KEY);
 const CHAIN_ID = 14_800;
 const EPOCH = 2;
+const FAKE_APP_ID = "0000000000000000000000000000000000000003";
 const JSON_HEADERS = {
   authorization: `Bearer ${SECRET}`,
   "content-type": "application/json",
@@ -34,7 +35,7 @@ let origin = "";
 
 beforeEach(async () => {
   server = createAgentServer({
-    client: createFakeDstackClient({ appId: "http-app" }),
+    client: createFakeDstackClient({ appId: FAKE_APP_ID }),
     secret: SECRET,
   });
   await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
@@ -58,7 +59,7 @@ async function sealRequest(
   signer = OWNER,
   deliveryOwner = OWNER.address,
 ): Promise<{ request: SealRequestBody; signature: Hex }> {
-  const client = createFakeDstackClient({ appId: "http-app" });
+  const client = createFakeDstackClient({ appId: FAKE_APP_ID });
   const id = userPsId(CHAIN_ID, OWNER.address);
   const identity = await deriveEnclaveIdentity(client, id, EPOCH);
   const signature = await signer.signMessage({
@@ -117,7 +118,7 @@ describe("agent HTTP server", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({
-      appId: "http-app",
+      appId: FAKE_APP_ID,
       composeHash: "fake-compose-hash",
       instanceId: "fake-instance",
       osVersion: "fake",
@@ -147,7 +148,7 @@ describe("agent HTTP server", () => {
       secretHash: Hex;
     };
     const recovered = await unseal(
-      createFakeDstackClient({ appId: "http-app" }),
+      createFakeDstackClient({ appId: FAKE_APP_ID }),
       userPsId(CHAIN_ID, OWNER.address),
       EPOCH,
       body.envelope,

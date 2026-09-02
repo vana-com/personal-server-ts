@@ -21,7 +21,7 @@ import { createFakeDstackClient } from "../dstack/fake.js";
 import { FIRST_EPOCH, userPsId } from "../identity/paths.js";
 import { seal, unseal } from "./envelope.js";
 
-const APP = "identity-app";
+const APP = "0000000000000000000000000000000000000001";
 const CHAIN_ID = 14800;
 const SCOPE = "fixture";
 const BLOB_BYTES = 1024;

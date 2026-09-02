@@ -4,8 +4,8 @@ import { createFakeDstackClient } from "../dstack/fake.js";
 import { FIRST_EPOCH, userPsId } from "./paths.js";
 import { deriveEnclaveAccount, deriveEnclaveIdentity } from "./wallet.js";
 
-const APP_A = "app-a";
-const APP_B = "app-b";
+const APP_A = "0000000000000000000000000000000000000001";
+const APP_B = "0000000000000000000000000000000000000002";
 const OWNER = "0x1234567890AbcdEF1234567890aBcdef12345678" as const;
 const ID = userPsId(14800, OWNER);
 const NEXT_EPOCH = FIRST_EPOCH + 1;

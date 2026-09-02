@@ -10,7 +10,7 @@ import { createAgentServer } from "./http.js";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 8787;
-const DEFAULT_FAKE_APP_ID = "fake-app";
+const DEFAULT_FAKE_APP_ID = "0000000000000000000000000000000000000001";
 const FAKE_DSTACK_ENABLED = "1";
 const EXIT_FAILURE = 1;
 const SIGTERM = "SIGTERM";

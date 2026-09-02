@@ -10,7 +10,8 @@ import {
   unseal,
 } from "./envelope.js";
 
-const APP = "app-a";
+const APP = "0000000000000000000000000000000000000001";
+const OTHER_APP = "0000000000000000000000000000000000000002";
 const OWNER = "0x1234567890AbcdEF1234567890aBcdef12345678" as const;
 const USER_A = userPsId(14800, OWNER);
 const USER_B = userPsId(14800, "0x0000000000000000000000000000000000000001");
@@ -80,7 +81,7 @@ describe("seal / unseal", () => {
 
     await expect(
       unseal(
-        createFakeDstackClient({ appId: "app-b" }),
+        createFakeDstackClient({ appId: OTHER_APP }),
         USER_A,
         FIRST_EPOCH,
         envelope,
