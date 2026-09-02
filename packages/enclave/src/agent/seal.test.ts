@@ -107,6 +107,16 @@ describe("sealDelivery", () => {
     );
   });
 
+  it("rejects an ownerAddress that differs from the request", async () => {
+    const { client, request } = await fixture("owner", {
+      ownerAddress: owner("other-delivery-owner").address,
+    });
+
+    await expect(sealDelivery(client, request)).rejects.toBeInstanceOf(
+      OwnerMismatch,
+    );
+  });
+
   it("rejects a retired epoch", async () => {
     const { client, request } = await fixture();
 

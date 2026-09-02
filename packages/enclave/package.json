@@ -36,6 +36,6 @@
     "viem": "^2.54.2"
   },
   "devDependencies": {
-    "@opendatalabs/vana-sdk": "3.22.0-pr.207.e47cd30"
+    "@opendatalabs/vana-sdk": "3.22.0-pr.207.5c11fe3"
   }
 }

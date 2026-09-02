@@ -21,6 +21,7 @@ const SECRET = "agent-test-secret";
 const OWNER_KEY = keccak256(toBytes("enclave-agent-test:http-owner"));
 const OTHER_KEY = keccak256(toBytes("enclave-agent-test:http-other"));
 const OWNER = privateKeyToAccount(OWNER_KEY);
+const OTHER = privateKeyToAccount(OTHER_KEY);
 const CHAIN_ID = 14_800;
 const EPOCH = 2;
 const JSON_HEADERS = {
@@ -55,6 +56,7 @@ afterEach(async () => {
 
 async function sealRequest(
   signer = OWNER,
+  deliveryOwner = OWNER.address,
 ): Promise<{ request: SealRequestBody; signature: Hex }> {
   const client = createFakeDstackClient({ appId: "http-app" });
   const id = userPsId(CHAIN_ID, OWNER.address);
@@ -67,7 +69,7 @@ async function sealRequest(
     userPsId: id,
     epoch: EPOCH,
     enclaveAddress: identity.address,
-    ownerAddress: OWNER.address,
+    ownerAddress: deliveryOwner,
     masterSignature: signature,
     issuedAt: Math.floor(Date.now() / 1000),
   };
@@ -168,7 +170,15 @@ describe("agent HTTP server", () => {
   });
 
   it("maps an owner mismatch to 422", async () => {
-    const { request } = await sealRequest(privateKeyToAccount(OTHER_KEY));
+    const { request } = await sealRequest(OTHER);
+    const response = await post("/agent/v1/secrets/seal", request);
+
+    expect(response.status).toBe(422);
+    expect(await response.json()).toEqual({ error: "OWNER_MISMATCH" });
+  });
+
+  it("maps a delivery ownerAddress mismatch to 422", async () => {
+    const { request } = await sealRequest(OWNER, OTHER.address);
     const response = await post("/agent/v1/secrets/seal", request);
 
     expect(response.status).toBe(422);

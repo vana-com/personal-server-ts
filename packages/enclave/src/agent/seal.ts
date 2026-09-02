@@ -67,6 +67,9 @@ export async function sealDelivery(
   plaintext.fill(0);
 
   validateDelivery(delivery, request, id, account.address);
+  if (getAddress(delivery.ownerAddress) !== getAddress(request.ownerAddress)) {
+    throw new OwnerMismatch();
+  }
 
   let recoveredOwner: `0x${string}`;
   try {
@@ -114,12 +117,12 @@ function validateDelivery(
   accountAddress: `0x${string}`,
 ): void {
   try {
+    getAddress(delivery.ownerAddress);
     if (
       delivery.v !== DELIVERY_VERSION ||
       delivery.userPsId !== id ||
       delivery.epoch !== request.epoch ||
       getAddress(delivery.enclaveAddress) !== getAddress(accountAddress) ||
-      getAddress(delivery.ownerAddress) !== getAddress(request.ownerAddress) ||
       !Number.isInteger(delivery.issuedAt) ||
       typeof delivery.masterSignature !== "string"
     ) {
