@@ -8,6 +8,7 @@ import {
   toBytes,
 } from "viem";
 import {
+  FIRST_EPOCH,
   USER_PS_ID_DOMAIN,
   sealingPath,
   userPsId,
@@ -18,6 +19,8 @@ const OWNER = "0x1234567890AbcdEF1234567890aBcdef12345678" as const;
 const CHAIN_ID = 14800;
 const FIXED_ID =
   "0x0000000000000000000000000000000000000000000000000000000000000abc" as const;
+const NEXT_EPOCH = FIRST_EPOCH + 1;
+const INVALID_EPOCHS = [0, -1, 1.5];
 
 describe("userPsId", () => {
   it("is keccak256(domain || uint256(chainId) || address)", () => {
@@ -54,14 +57,28 @@ describe("userPsId", () => {
 
 describe("paths", () => {
   it("wallet path is exact", () => {
-    expect(walletPath(FIXED_ID)).toBe(
+    expect(walletPath(FIXED_ID, FIRST_EPOCH)).toBe(
       `users/${FIXED_ID}/wallet/ethereum/secp256k1/v1`,
     );
   });
 
   it("sealing path is exact", () => {
-    expect(sealingPath(FIXED_ID)).toBe(
+    expect(sealingPath(FIXED_ID, FIRST_EPOCH)).toBe(
       `users/${FIXED_ID}/secrets/master-signature/v1`,
     );
+  });
+
+  it("changes paths with the epoch", () => {
+    expect(walletPath(FIXED_ID, NEXT_EPOCH)).not.toBe(
+      walletPath(FIXED_ID, FIRST_EPOCH),
+    );
+    expect(sealingPath(FIXED_ID, NEXT_EPOCH)).not.toBe(
+      sealingPath(FIXED_ID, FIRST_EPOCH),
+    );
+  });
+
+  it.each(INVALID_EPOCHS)("rejects invalid epoch %s", (epoch) => {
+    expect(() => walletPath(FIXED_ID, epoch)).toThrow(Error);
+    expect(() => sealingPath(FIXED_ID, epoch)).toThrow(Error);
   });
 });

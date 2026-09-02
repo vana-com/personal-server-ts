@@ -18,7 +18,7 @@ import {
 } from "@opendatalabs/vana-sdk/node";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { createFakeDstackClient } from "../dstack/fake.js";
-import { userPsId } from "../identity/paths.js";
+import { FIRST_EPOCH, userPsId } from "../identity/paths.js";
 import { seal, unseal } from "./envelope.js";
 
 const APP = "identity-app";
@@ -59,10 +59,15 @@ describe("SDK sealing compatibility", () => {
     const blob = await encryptWithPassword(plaintext, scopePassword(signature));
 
     const nodeA = createFakeDstackClient({ appId: APP, instanceId: "node-a" });
-    const envelope = await seal(nodeA, id, deriveMasterKey(signature));
+    const envelope = await seal(
+      nodeA,
+      id,
+      FIRST_EPOCH,
+      deriveMasterKey(signature),
+    );
 
     const nodeB = createFakeDstackClient({ appId: APP, instanceId: "node-b" });
-    const unsealed = await unseal(nodeB, id, envelope);
+    const unsealed = await unseal(nodeB, id, FIRST_EPOCH, envelope);
     const recovered = `0x${Buffer.from(unsealed).toString("hex")}` as const;
     const decrypted = await decryptWithPassword(blob, scopePassword(recovered));
 
@@ -81,6 +86,7 @@ describe("SDK sealing compatibility", () => {
     const envelope = await seal(
       node,
       userPsId(CHAIN_ID, owner.address),
+      FIRST_EPOCH,
       deriveMasterKey(signature),
     );
     const other = userPsId(
@@ -88,6 +94,6 @@ describe("SDK sealing compatibility", () => {
       privateKeyToAccount(generatePrivateKey()).address,
     );
 
-    await expect(unseal(node, other, envelope)).rejects.toThrow();
+    await expect(unseal(node, other, FIRST_EPOCH, envelope)).rejects.toThrow();
   });
 });

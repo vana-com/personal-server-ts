@@ -3,21 +3,24 @@
  *
  *   userPsId = keccak256("vana.ps-enclave.v1" || chainId || ownerAddress)
  *
- *   users/{userPsId}/wallet/ethereum/secp256k1/v1   -> enclave wallet
- *   users/{userPsId}/secrets/master-signature/v1    -> sealing key
+ *   users/{userPsId}/wallet/ethereum/secp256k1/v{epoch}   -> enclave wallet
+ *   users/{userPsId}/secrets/master-signature/v{epoch}    -> sealing key
  *
  * dstack scopes derivation to the CVM app_id, then the path, so the same
  * app_id on any node recovers the same keys. Wallet and sealing paths differ,
- * so compromise of one derived key says nothing about the other.
+ * so compromise of one derived key says nothing about the other. Epoch is the
+ * identity generation after revoke + re-enable, so it rotates both keys.
  */
 
 import { encodePacked, getAddress, keccak256 } from "viem";
 
 export const USER_PS_ID_DOMAIN = "vana.ps-enclave.v1";
+export const FIRST_EPOCH = 1;
 
 const USERS_PREFIX = "users";
-export const WALLET_PATH_SUFFIX = "wallet/ethereum/secp256k1/v1";
-export const SEALING_PATH_SUFFIX = "secrets/master-signature/v1";
+const EPOCH_PREFIX = "v";
+export const WALLET_PATH_PREFIX = "wallet/ethereum/secp256k1";
+export const SEALING_PATH_PREFIX = "secrets/master-signature";
 
 // `purpose` labels the key in dstack's signature chain; distinct per use.
 export const WALLET_PURPOSE = "vana.ps-enclave.wallet.v1";
@@ -42,10 +45,18 @@ export function userPsId(
   return keccak256(packed);
 }
 
-export function walletPath(id: UserPsId): string {
-  return `${USERS_PREFIX}/${id}/${WALLET_PATH_SUFFIX}`;
+export function walletPath(id: UserPsId, epoch: number): string {
+  return `${USERS_PREFIX}/${id}/${WALLET_PATH_PREFIX}/${epochSegment(epoch)}`;
 }
 
-export function sealingPath(id: UserPsId): string {
-  return `${USERS_PREFIX}/${id}/${SEALING_PATH_SUFFIX}`;
+export function sealingPath(id: UserPsId, epoch: number): string {
+  return `${USERS_PREFIX}/${id}/${SEALING_PATH_PREFIX}/${epochSegment(epoch)}`;
+}
+
+function epochSegment(epoch: number): string {
+  if (!Number.isInteger(epoch) || epoch < FIRST_EPOCH) {
+    throw new Error(`epoch must be an integer >= ${FIRST_EPOCH}`);
+  }
+
+  return `${EPOCH_PREFIX}${epoch}`;
 }

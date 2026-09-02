@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
 import { createFakeDstackClient } from "../dstack/fake.js";
-import { userPsId } from "../identity/paths.js";
+import { FIRST_EPOCH, userPsId } from "../identity/paths.js";
 import {
   SEALED_ENVELOPE_VERSION,
   UnsealError,
   seal,
+  sealingAad,
   unseal,
 } from "./envelope.js";
 
@@ -14,6 +15,7 @@ const OWNER = "0x1234567890AbcdEF1234567890aBcdef12345678" as const;
 const USER_A = userPsId(14800, OWNER);
 const USER_B = userPsId(14800, "0x0000000000000000000000000000000000000001");
 const SIGNATURE_BYTES = 65;
+const NEXT_EPOCH = FIRST_EPOCH + 1;
 
 describe("seal / unseal", () => {
   it("round-trips on a second node with the same appId", async () => {
@@ -21,8 +23,8 @@ describe("seal / unseal", () => {
     const nodeA = createFakeDstackClient({ appId: APP, instanceId: "a" });
     const nodeB = createFakeDstackClient({ appId: APP, instanceId: "b" });
 
-    const envelope = await seal(nodeA, USER_A, secret);
-    const opened = await unseal(nodeB, USER_A, envelope);
+    const envelope = await seal(nodeA, USER_A, FIRST_EPOCH, secret);
+    const opened = await unseal(nodeB, USER_A, FIRST_EPOCH, envelope);
 
     expect(envelope.v).toBe(SEALED_ENVELOPE_VERSION);
     expect(Buffer.from(opened)).toEqual(Buffer.from(secret));
@@ -33,6 +35,7 @@ describe("seal / unseal", () => {
     const envelope = await seal(
       client,
       USER_A,
+      FIRST_EPOCH,
       new Uint8Array(SIGNATURE_BYTES),
     );
 
@@ -44,23 +47,44 @@ describe("seal / unseal", () => {
     const envelope = await seal(
       client,
       USER_A,
+      FIRST_EPOCH,
       new Uint8Array(SIGNATURE_BYTES),
     );
 
-    await expect(unseal(client, USER_B, envelope)).rejects.toBeInstanceOf(
-      UnsealError,
+    await expect(
+      unseal(client, USER_B, FIRST_EPOCH, envelope),
+    ).rejects.toBeInstanceOf(UnsealError);
+  });
+
+  it("wrong epoch fails", async () => {
+    const client = createFakeDstackClient({ appId: APP });
+    const envelope = await seal(
+      client,
+      USER_A,
+      FIRST_EPOCH,
+      new Uint8Array(SIGNATURE_BYTES),
     );
+
+    await expect(
+      unseal(client, USER_A, NEXT_EPOCH, envelope),
+    ).rejects.toBeInstanceOf(UnsealError);
   });
 
   it("fails under a different appId", async () => {
     const envelope = await seal(
       createFakeDstackClient({ appId: APP }),
       USER_A,
+      FIRST_EPOCH,
       new Uint8Array(SIGNATURE_BYTES),
     );
 
     await expect(
-      unseal(createFakeDstackClient({ appId: "app-b" }), USER_A, envelope),
+      unseal(
+        createFakeDstackClient({ appId: "app-b" }),
+        USER_A,
+        FIRST_EPOCH,
+        envelope,
+      ),
     ).rejects.toBeInstanceOf(UnsealError);
   });
 
@@ -69,13 +93,14 @@ describe("seal / unseal", () => {
     const envelope = await seal(
       client,
       USER_A,
+      FIRST_EPOCH,
       new Uint8Array(SIGNATURE_BYTES),
     );
     const bytes = Buffer.from(envelope.ciphertext, "base64");
     bytes[0] ^= 1;
 
     await expect(
-      unseal(client, USER_A, {
+      unseal(client, USER_A, FIRST_EPOCH, {
         ...envelope,
         ciphertext: bytes.toString("base64"),
       }),
@@ -87,13 +112,14 @@ describe("seal / unseal", () => {
     const envelope = await seal(
       client,
       USER_A,
+      FIRST_EPOCH,
       new Uint8Array(SIGNATURE_BYTES),
     );
     const bytes = Buffer.from(envelope.wrappedContentKey.tag, "base64");
     bytes[0] ^= 1;
 
     await expect(
-      unseal(client, USER_A, {
+      unseal(client, USER_A, FIRST_EPOCH, {
         ...envelope,
         wrappedContentKey: {
           ...envelope.wrappedContentKey,
@@ -108,11 +134,23 @@ describe("seal / unseal", () => {
     const envelope = await seal(
       client,
       USER_A,
+      FIRST_EPOCH,
       new Uint8Array(SIGNATURE_BYTES),
     );
 
     await expect(
-      unseal(client, USER_A, { ...envelope, v: 2 as unknown as 1 }),
+      unseal(client, USER_A, FIRST_EPOCH, {
+        ...envelope,
+        v: 2 as unknown as 1,
+      }),
     ).rejects.toBeInstanceOf(UnsealError);
+  });
+});
+
+describe("sealingAad", () => {
+  it("encodes userPsId/epoch as UTF-8", () => {
+    expect(sealingAad(USER_A, FIRST_EPOCH)).toEqual(
+      Buffer.from(`${USER_A}/${FIRST_EPOCH}`, "utf8"),
+    );
   });
 });

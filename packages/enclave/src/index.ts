@@ -13,10 +13,11 @@ export {
   type FakeDstackOptions,
 } from "./dstack/fake.js";
 export {
-  SEALING_PATH_SUFFIX,
+  FIRST_EPOCH,
+  SEALING_PATH_PREFIX,
   SEALING_PURPOSE,
   USER_PS_ID_DOMAIN,
-  WALLET_PATH_SUFFIX,
+  WALLET_PATH_PREFIX,
   WALLET_PURPOSE,
   sealingPath,
   userPsId,
@@ -35,6 +36,7 @@ export {
   SEALED_ENVELOPE_VERSION,
   UnsealError,
   seal,
+  sealingAad,
   unseal,
   type AesGcmBox,
   type SealedEnvelope,

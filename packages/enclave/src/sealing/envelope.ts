@@ -1,13 +1,13 @@
 /**
  * Sealing envelope for a user's master signature.
  *
- *   secret ──AES-256-GCM(contentKey, AAD=userPsId)──> iv, ciphertext, tag
- *   contentKey ──AES-256-GCM(sealingKey, AAD=userPsId)──> wrappedContentKey
- *   sealingKey = dstack key at users/{userPsId}/secrets/master-signature/v1
+ *   secret ──AES-256-GCM(contentKey, AAD=userPsId/epoch)──> iv, ciphertext, tag
+ *   contentKey ──AES-256-GCM(sealingKey, AAD=userPsId/epoch)──> wrappedContentKey
+ *   sealingKey = dstack key at users/{userPsId}/secrets/master-signature/v{epoch}
  *
  * Only the envelope persists. Any node under the same app_id re-derives the
- * sealing key and unwraps. AAD binds both layers to userPsId, so an envelope
- * presented for another user fails authentication. The content-key layer
+ * sealing key and unwraps. AAD binds both layers to userPsId and epoch, so an
+ * envelope from a previous epoch fails authentication. The content-key layer
  * makes a vendor exit a re-wrap of 32 bytes, not a re-encryption of the secret.
  */
 
@@ -26,6 +26,7 @@ const CONTENT_KEY_BYTES = 32;
 const GCM_IV_BYTES = 12;
 const GCM_TAG_BYTES = 16;
 const ENCODING = "base64";
+const AAD_SEPARATOR = "/";
 
 /** One AES-GCM ciphertext; fields are base64. */
 export interface AesGcmBox {
@@ -49,12 +50,13 @@ export class UnsealError extends Error {
 export async function seal(
   client: DstackClient,
   id: UserPsId,
+  epoch: number,
   secret: Uint8Array,
 ): Promise<SealedEnvelope> {
-  const aad = aadFor(id);
+  const aad = sealingAad(id, epoch);
   const contentKey = randomBytes(CONTENT_KEY_BYTES);
   const { key: sealingKey } = await client.deriveKey(
-    sealingPath(id),
+    sealingPath(id, epoch),
     SEALING_PURPOSE,
   );
 
@@ -68,15 +70,16 @@ export async function seal(
 export async function unseal(
   client: DstackClient,
   id: UserPsId,
+  epoch: number,
   envelope: SealedEnvelope,
 ): Promise<Uint8Array> {
   if (envelope.v !== SEALED_ENVELOPE_VERSION) {
     throw new UnsealError(`unsupported envelope version ${envelope.v}`);
   }
 
-  const aad = aadFor(id);
+  const aad = sealingAad(id, epoch);
   const { key: sealingKey } = await client.deriveKey(
-    sealingPath(id),
+    sealingPath(id, epoch),
     SEALING_PURPOSE,
   );
 
@@ -87,8 +90,8 @@ export async function unseal(
   return secret;
 }
 
-function aadFor(id: UserPsId): Buffer {
-  return Buffer.from(id, "utf8");
+export function sealingAad(id: UserPsId, epoch: number): Buffer {
+  return Buffer.from(`${id}${AAD_SEPARATOR}${epoch}`, "utf8");
 }
 
 function encrypt(

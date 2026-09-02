@@ -1,6 +1,6 @@
 /**
- * Enclave wallet: the dstack-derived key at walletPath(userPsId), used as the
- * secp256k1 private key directly. RAW bytes on purpose: the SDK's
+ * Enclave wallet: the dstack-derived key at walletPath(userPsId, epoch), used
+ * as the secp256k1 private key directly. RAW bytes on purpose: the SDK's
  * `toViemAccountSecure` SHA-256-hashes the key first, which would make the
  * wallet differ from the key the agent itself signs with for this path. Using
  * the raw scalar keeps the public key in signatureChain[0] equal to this
@@ -33,6 +33,7 @@ export interface ServerAccount {
 export interface EnclaveIdentity {
   address: `0x${string}`;
   publicKey: `0x${string}`;
+  epoch: number;
   /** dstack signature chain for the wallet key; see DerivedKey. */
   signatureChain: Uint8Array[];
 }
@@ -47,8 +48,9 @@ type ViemAccount = ReturnType<typeof privateKeyToAccount>;
 export async function deriveEnclaveAccount(
   client: DstackClient,
   id: UserPsId,
+  epoch: number,
 ): Promise<EnclaveAccount> {
-  const { key } = await client.deriveKey(walletPath(id), WALLET_PURPOSE);
+  const { key } = await client.deriveKey(walletPath(id, epoch), WALLET_PURPOSE);
   const privateKey = toHex(key);
   const account = privateKeyToAccount(privateKey);
 
@@ -69,9 +71,10 @@ export async function deriveEnclaveAccount(
 export async function deriveEnclaveIdentity(
   client: DstackClient,
   id: UserPsId,
+  epoch: number,
 ): Promise<EnclaveIdentity> {
   const { key, signatureChain } = await client.deriveKey(
-    walletPath(id),
+    walletPath(id, epoch),
     WALLET_PURPOSE,
   );
   const account = privateKeyToAccount(toHex(key));
@@ -80,6 +83,7 @@ export async function deriveEnclaveIdentity(
   return {
     address: account.address,
     publicKey: account.publicKey,
+    epoch,
     signatureChain,
   };
 }
