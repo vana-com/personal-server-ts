@@ -184,7 +184,7 @@ Command: `REPO=$PWD npx tsx spikes/jobs/recovery.mts` (Gateway on :3000). Worker
 
 ### Kill criteria
 
-Not tripped locally: p95 submit -> claim at 50 jobs/min with three workers = 220 ms (criterion: > 2 s), no connection exhaustion (2-3 connections). **The criterion is defined for Vercel + Neon and cannot be passed or tripped by these numbers**: one warm Node process and a local pg pool remove cold starts, per-invocation connection setup, Neon WebSocket latency and the 250 ms wait-poll cost that the criterion is about. Status: **pending the preview run below**.
+Not tripped locally: p95 submit -> claim at 50 jobs/min with three workers = 220 ms (criterion: > 2 s), no connection exhaustion (2-3 connections). **The criterion is defined for Vercel + Neon and cannot be passed or tripped by these numbers**: one warm Node process and a local pg pool remove cold starts, per-invocation connection setup, Neon WebSocket latency and the 250 ms wait-poll cost that the criterion is about. Status: **passed on the preview run below** (p95 submit→claim 1.6 s at 50/min with three workers; 3 Neon connections).
 
 ### Consequences for the architecture doc
 
@@ -194,38 +194,48 @@ Not tripped locally: p95 submit -> claim at 50 jobs/min with three workers = 220
 - Job model, lease: `claim_expires_at` + `claimed_by` fencing + sweep-before-claim recovers a dead node in `TTL - time since last heartbeat + poll interval` with no cron; the `cron: expire claims` row in the data-gateway ownership table becomes optional (belt and braces), not required.
 - Workflows / Infrastructure: the `?wait=25` tier returned inline for 100% of wait clients at every load, because the fake node finishes in ~1.3 s; the inline fraction is a property of node latency (Spike 3 cold start + hydration), not of the queue. Function `maxDuration` for `api/v1/jobs.ts` must be >= 30 s (set); on the Hobby plan that is at the 60 s cap, fine.
 - Trust: `authenticateBuilder` records the signer as `builder_address` and nothing else is checked (`TODO(job-admission)`: builder registration, grant validity, rate limit). Node auth is the operator secret + `X-Node-Id` (`TODO(tee-attestation)`). The Gateway never decodes either ciphertext (size is measured from the base64, hash is node-reported); keep that as an invariant in "Invariants across workflows".
-- Decision 20 trigger: undecided until the preview numbers exist.
+- Decision 20 trigger: not fired on the preview (p95 submit→claim 1,586 ms < 2 s; Neon max 3 connections). Margin is small and poll-dominated: a long-poll claim or a lower poll interval is the first lever before a dedicated queue.
 
-### Preview deployment (operator, not run)
+### Preview run (Vercel `dp-rpc-moksha` preview + Neon branch, 2026-09-02)
+
+Date: 2026-09-02. Operator: Claude (local machine, Vercel user `kahtaf`, Neon user `kahtaf@opendatalabs.xyz`). CVMs: none. Commit: `a124aab` on `spike/jobs` (worktree `../data-gateway-spike-jobs`, not pushed; no code change needed for the preview).
+
+Environment: Vercel project `dp-rpc-moksha` (team `opendatalabs`), preview deployment `dpl_FRwx2xdrfNZXo1vDhGWQtGSVEGBD` behind stable alias `https://dp-rpc-moksha-spike-jobs.vercel.app`, per-deployment runtime env `GATEWAY_PUBLIC_ORIGIN=<alias>`, `NEON_URL=<spike-jobs pooled>`, `CRON_SECRET=<throwaway>`; functions in `iad1`. Neon branch `spike-jobs` (`br-lucky-bar-apacbuzd`, parent `moksha`, pooled endpoint), schema `0052_jobs.sql`. Workers and load driver on the operator laptop (WORK_MS 200, claim poll 1 s, lease 30 s, bypass header). Production untouched.
+
+First run failed, root causes:
+
+1. Submit `401 GATEWAY_PUBLIC_ORIGIN must be set in production`: Vercel sets `NODE_ENV=production` on previews, so `expectedRequestOrigins` (`lib/web3-signed.ts`) refuses the Host fallback. Fix: `vercel alias set <deployment> dp-rpc-moksha-spike-jobs.vercel.app` gives a URL known before deploy; deploy with `-e GATEWAY_PUBLIC_ORIGIN=https://dp-rpc-moksha-spike-jobs.vercel.app`, alias the new deployment, sign and poll against the alias. (CLI deploys from a git worktree carry no branch metadata, so no `-git-spike-jobs-` alias exists.)
+2. Claim `500 INTERNAL_ERROR`: function logs (`vercel logs <url> --scope opendatalabs --json`) show `NEON_URL environment variable is not set` at `db/index.ts:31`; the first deploy's `-e NEON_URL=` was empty (neonctl subshell returned nothing). Redeployed with a verified non-empty value. Not a code bug.
+
+Commands:
 
 ```bash
-# Neon branch + schema (Neon URL and Vercel project come from the operator's environment; never commit them)
-neonctl branches create --project-id "$NEON_PROJECT_ID" --name spike-jobs --parent main
-export NEON_URL="$(neonctl connection-string spike-jobs --project-id "$NEON_PROJECT_ID" --pooled)"
-psql "$NEON_URL" -v ON_ERROR_STOP=1 -f db/migrations/0052_jobs.sql     # idempotent; or NEON_URL=... npm run db:push
-
-# Vercel preview from the spike branch (worktree ../data-gateway-spike-jobs)
-vercel link --yes --project "$VERCEL_PROJECT"                            # once per worktree
-vercel env add NEON_URL preview spike/jobs <<<"$NEON_URL"                # branch-scoped preview var
-vercel env add CRON_SECRET preview spike/jobs <<<"$(openssl rand -hex 32)"   # node routes require it on preview
-PREVIEW_URL="$(vercel deploy --yes 2>/dev/null)"                         # prints https://data-gateway-<hash>-<team>.vercel.app
-# if the team has Deployment Protection on, add `-H "x-vercel-protection-bypass: $BYPASS"` to the curl/fetch
-# calls below or disable it for this deployment; the load driver and worker do not set that header yet.
-
-# Three workers, then the same matrix against the preview (the signed audience is the preview origin)
-export GATEWAY_URL="$PREVIEW_URL" CRON_SECRET="<the value added above>"
-for i in 1 2 3; do NODE_ID=w$i npx tsx scripts/jobs-worker.ts > worker-$i.log 2>&1 & done
-for R in 1 10 50; do npx tsx load-tests/jobs-load.ts --rate $R --duration 600 --wait-fraction 0.5 --out load-tests/results/preview-w3-r$R.json; done
-# Neon connections during the 50/min run (Neon console > Monitoring, or):
-psql "$NEON_URL" -c "select count(*) from pg_stat_activity where datname = current_database()"
-# Function duration: Vercel dashboard > Observability > Functions, filter path /api/v1/jobs and /api/v1/jobs/claim, 50/min window.
-# Kill test: NODE_ID=victim WORK_MS=120000 CLAIM_TTL_SECONDS=15 npx tsx scripts/jobs-worker.ts & then `kill -9` its node child and start a rescuer.
-
-# Tear down
-pkill -f jobs-worker.ts; vercel remove "$PREVIEW_URL" --yes; neonctl branches delete spike-jobs --project-id "$NEON_PROJECT_ID"
+vercel deploy --yes --scope opendatalabs -e GATEWAY_PUBLIC_ORIGIN=https://dp-rpc-moksha-spike-jobs.vercel.app -e NEON_URL="$NEON_URL" -e CRON_SECRET="$CRON_SECRET"
+vercel alias set <deployment-url> dp-rpc-moksha-spike-jobs.vercel.app --scope opendatalabs
+bash operator scratchpad/run-preview-matrix.sh 600 3          # 3 workers; 1, 10, 50 jobs/min x 10 min each; results/preview-w3-r*.json
+node operator scratchpad/conn-sampler.mjs results/neon-connections.jsonl   # every 5 s (started by hand: the script's copy died on an empty NEON_URL)
+node operator scratchpad/aggregate.mjs operator scratchpad                        # table below
+bash operator scratchpad/run-recovery.sh                                   # kill test, results/recovery.log
 ```
 
-Kill criterion to apply to the preview numbers: p95 submit -> claim > 2 s at 50 jobs/min with three workers, or Neon connections exhausted. Expect submit -> claim to stay poll-dominated (~0.5 s p50 per idle worker) plus Neon round trips; the number to watch is the `submit HTTP 202` column (pure gateway + Neon cost per call) and the claim route's function seconds.
+Numbers (3 workers, 10 min per row, ms, p50 / p95; `wait` = `?wait=25` clients, `poll` = the rest):
+
+| rate/min | submitted | completed | errors | submit -> claim | claim -> complete | submit -> result (wait) | submit -> result (poll) | submit HTTP 202   | inline fraction | Neon clients max |
+| -------- | --------- | --------- | ------ | --------------- | ----------------- | ----------------------- | ----------------------- | ----------------- | --------------- | ---------------- |
+| 1        | 10        | 8         | 2      | 550 / 1089      | 457 / 1835        | 2739 / 7226 (n=3)       | 1691 / 4615 (n=5)       | 204 / 2517 (n=5)  | 1.00            | 2                |
+| 10       | 100       | 96        | 4      | 250 / 952       | 305 / 1074        | 1068 / 3991 (n=46)      | 1247 / 4976 (n=50)      | 259 / 2749 (n=50) | 1.00            | 2                |
+| 50       | 500       | 471       | 29     | 423 / 1586      | 340 / 916         | 1153 / 4201 (n=226)     | 1328 / 6240 (n=245)     | 116 / 712 (n=245) | 1.00            | 3                |
+
+- Errors are all client-side `fetch failed` (undici, laptop to Vercel: 29 of 500 submits and 14 worker calls at 50/min); every accepted job completed. The 1-worker set was skipped (not needed for the kill criterion).
+- Neon: 403 samples over 30 min, max 3 client connections, max 2 active (pooled endpoint; Vercel functions reuse one Neon serverless pool each). No exhaustion.
+- Vercel function duration: the CLI exposes no duration field and keeps only the last 100 log entries, so the matrix window is gone. Handler-logged claim time (sweep + `FOR UPDATE SKIP LOCKED` claim, inside the function) from the recovery window: n=8, p50 16 ms, p95 17 ms. The gap to `submit HTTP 202` p50 116 to 259 ms is Vercel routing plus TLS from the laptop.
+- Recovery (`run-recovery.sh`: victim worker WORK_MS 20 s, lease 15 s, 10/min load for 2 min, `pkill -9 -f jobs-worker.ts` 5 s into a job, rescuer started at once): orphan completed by `rescuer` as attempt 2, kill -> complete 15.2 s (= lease TTL; sweep runs on the next claim). First attempt was invalid: `kill -9` on the `npx` wrapper left the node child alive and it finished the job itself.
+
+Kill criterion (p95 submit -> claim > 2 s at 50/min with 3 workers, or Neon exhaustion): **passed**, p95 1586 ms and 3 connections. Margin is thin: about 500 ms is the 1 s worker poll, the rest is two laptop -> Vercel -> Neon round trips per claim. Local run was 220 ms; the preview cost is network, not the queue.
+
+Consequence for decision 20: queue on Vercel stays accepted; the dedicated-queue trigger does not fire. Watch `submit -> claim` p95 in the wake experiment; a worker poll under 1 s or a long-poll claim buys most of the margin back if it drifts toward 2 s.
+
+Teardown done: `vercel remove` of both spike deployments (`d84wyagzg`, `km1om9ime`; alias removed with them), Neon branch `spike-jobs` deleted, keychain items `spike-jobs-cron` and `spike-jobs-bypass` deleted. Still open for the operator: revoke the "Protection Bypass for Automation" secret in the Vercel dashboard (`dp-rpc-moksha` > Settings > Deployment Protection). Other `kahtaf` previews on `dp-rpc-moksha` (feat/identity-schema, other sessions) were left alone.
 
 ## Spike 3: sandbox inside the CVM
 
