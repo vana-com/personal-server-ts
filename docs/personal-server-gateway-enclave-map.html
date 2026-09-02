@@ -1,0 +1,2348 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Personal Server - Always Available Architecture</title>
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fira+Mono:wght@400;500&amp;family=Hanken+Grotesk:wght@400;500;600&amp;display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --paper: #fcfcfa;
+        --surface: #f8f7f1;
+        --white: #ffffff;
+        --ink: #111111;
+        --muted: #6b6b6b;
+        --soft: #7a7874;
+        --rule: rgba(17, 17, 17, 0.12);
+        --accent: #4141fc;
+        --accent-tint: rgba(65, 65, 252, 0.09);
+        --accent-soft: rgba(65, 65, 252, 0.05);
+        --shadow-node: drop-shadow(0 1px 1.5px rgba(17, 17, 17, 0.1));
+        --shadow-glow: drop-shadow(0 0 5px rgba(65, 65, 252, 0.35));
+        --sans: "Hanken Grotesk", "Helvetica Neue", Arial, sans-serif;
+        --mono: "Fira Mono", ui-monospace, Menlo, monospace;
+        --motion-fast: 160ms;
+        --motion-step: 480ms;
+        --motion-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+        --packet-duration: 1.8s;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: var(--sans);
+      }
+
+      main {
+        width: min(100%, 1600px);
+        margin: 0 auto;
+        padding: 56px 24px 72px;
+      }
+
+      header {
+        margin-bottom: 20px;
+        padding-bottom: 16px;
+        border-bottom: 1px solid var(--rule);
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(26px, 2.6vw, 34px);
+        font-weight: 600;
+        letter-spacing: -0.035em;
+        line-height: 1.05;
+      }
+
+      .frame {
+        min-width: 0;
+        overflow-x: auto;
+        overscroll-behavior-x: contain;
+        -webkit-overflow-scrolling: touch;
+      }
+
+      svg {
+        display: block;
+        width: 100%;
+        min-width: 760px;
+        height: auto;
+      }
+
+      .workspace {
+        display: grid;
+        grid-template-columns: minmax(0, 2fr) minmax(320px, 0.82fr);
+        grid-template-rows: auto 1fr;
+        gap: 24px;
+        align-items: start;
+      }
+
+      .zone {
+        fill: rgba(17, 17, 17, 0.018);
+        stroke: rgba(17, 17, 17, 0.14);
+        stroke-width: 1;
+      }
+
+      .zone.confidential {
+        fill: rgba(65, 65, 252, 0.03);
+        stroke: rgba(65, 65, 252, 0.38);
+      }
+
+      .zone-label {
+        fill: var(--muted);
+        font-family: var(--mono);
+        font-size: 15px;
+        font-weight: 500;
+        letter-spacing: 0.16em;
+      }
+
+      .zone-label.confidential {
+        fill: var(--accent);
+      }
+
+      .zone-note {
+        fill: var(--soft);
+        font-family: var(--sans);
+        font-size: 13px;
+      }
+
+      .node-mask {
+        fill: var(--paper);
+      }
+
+      .node {
+        fill: var(--white);
+        stroke: rgba(17, 17, 17, 0.55);
+        stroke-width: 1.25;
+        filter: var(--shadow-node);
+        transition:
+          stroke var(--motion-fast) ease,
+          fill var(--motion-fast) ease;
+      }
+
+      .node-name {
+        fill: var(--ink);
+        font-family: var(--sans);
+        font-size: 17px;
+        font-weight: 600;
+        text-anchor: middle;
+      }
+
+      .node-sub {
+        fill: var(--muted);
+        font-family: var(--sans);
+        font-size: 14px;
+        text-anchor: middle;
+      }
+
+      /* Sandboxes are ephemeral: dashed, and absent during registration until provisioned. */
+      .enclave-node .node {
+        stroke-dasharray: 6 4;
+      }
+      .enclave-node {
+        transition: opacity var(--motion-step) var(--motion-ease);
+      }
+      body:has(#workflow-register[open]) .enclave-user-1 {
+        opacity: 0;
+      }
+      body:has(#step-register-8:is(:hover, :focus-visible, .is-active))
+        .enclave-user-1 {
+        opacity: 1;
+      }
+
+      /* TEE 2 does not exist until it answers the attestation challenge. */
+      .tee-spare-node {
+        transition: opacity var(--motion-step) var(--motion-ease);
+      }
+      body:has(#workflow-scale[open]) .tee-spare-node {
+        opacity: 0;
+      }
+      body:has(#step-scale-2:is(:hover, :focus-visible, .is-active))
+        .tee-spare-node,
+      body:has(#step-scale-3:is(:hover, :focus-visible, .is-active))
+        .tee-spare-node,
+      body:has(#step-scale-4:is(:hover, :focus-visible, .is-active))
+        .tee-spare-node,
+      body:has(#step-scale-5:is(:hover, :focus-visible, .is-active))
+        .tee-spare-node {
+        opacity: 1;
+      }
+
+      .app-shell {
+        fill: rgba(255, 255, 255, 0.42);
+        stroke: rgba(17, 17, 17, 0.2);
+        stroke-width: 1;
+        transition:
+          stroke var(--motion-fast) ease,
+          fill var(--motion-fast) ease;
+      }
+
+      .app-label {
+        fill: var(--muted);
+        font-family: var(--sans);
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+      }
+
+      .workflow-route {
+        opacity: 0;
+        fill: none;
+        stroke: #9e9d97;
+        stroke-width: 1.75;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        marker-end: url(#ps-workflow-arrow);
+        pointer-events: none;
+        transition:
+          opacity var(--motion-fast) ease,
+          stroke var(--motion-fast) ease,
+          stroke-width var(--motion-fast) ease;
+      }
+
+      body:has(#workflow-register[open]) .wf-register,
+      body:has(#workflow-raw-enclave[open]) .wf-raw-enclave,
+      body:has(#workflow-inference[open]) .wf-inference,
+      body:has(#workflow-wake[open]) .wf-wake,
+      body:has(#workflow-scale[open]) .wf-scale {
+        opacity: 0.25;
+      }
+
+      body:has(#step-register-1:is(:hover, :focus-visible, .is-active))
+        .route-register-1,
+      body:has(#step-register-2:is(:hover, :focus-visible, .is-active))
+        .route-register-2,
+      body:has(#step-register-3:is(:hover, :focus-visible, .is-active))
+        .route-register-3,
+      body:has(#step-register-4:is(:hover, :focus-visible, .is-active))
+        .route-register-4,
+      body:has(#step-register-5:is(:hover, :focus-visible, .is-active))
+        .route-register-5,
+      body:has(#step-register-6:is(:hover, :focus-visible, .is-active))
+        .route-register-6,
+      body:has(#step-register-7:is(:hover, :focus-visible, .is-active))
+        .route-register-7,
+      body:has(#step-register-8:is(:hover, :focus-visible, .is-active))
+        .route-register-8,
+      body:has(#step-raw-enclave-1:is(:hover, :focus-visible, .is-active))
+        .route-raw-enclave-1,
+      body:has(#step-raw-enclave-2:is(:hover, :focus-visible, .is-active))
+        .route-raw-enclave-2,
+      body:has(#step-raw-enclave-3:is(:hover, :focus-visible, .is-active))
+        .route-raw-enclave-3,
+      body:has(#step-raw-enclave-4:is(:hover, :focus-visible, .is-active))
+        .route-raw-enclave-4,
+      body:has(#step-raw-enclave-5:is(:hover, :focus-visible, .is-active))
+        .route-raw-enclave-5,
+      body:has(#step-raw-enclave-6:is(:hover, :focus-visible, .is-active))
+        .route-raw-enclave-6,
+      body:has(#step-inference-1:is(:hover, :focus-visible, .is-active))
+        .route-inference-1,
+      body:has(#step-inference-2:is(:hover, :focus-visible, .is-active))
+        .route-inference-2,
+      body:has(#step-inference-3:is(:hover, :focus-visible, .is-active))
+        .route-inference-3,
+      body:has(#step-inference-4:is(:hover, :focus-visible, .is-active))
+        .route-inference-4,
+      body:has(#step-inference-5:is(:hover, :focus-visible, .is-active))
+        .route-inference-5,
+      body:has(#step-inference-6:is(:hover, :focus-visible, .is-active))
+        .route-inference-6,
+      body:has(#step-inference-7:is(:hover, :focus-visible, .is-active))
+        .route-inference-7,
+      body:has(#step-inference-8:is(:hover, :focus-visible, .is-active))
+        .route-inference-8,
+      body:has(#step-wake-1:is(:hover, :focus-visible, .is-active))
+        .route-wake-1,
+      body:has(#step-wake-2:is(:hover, :focus-visible, .is-active))
+        .route-wake-2,
+      body:has(#step-wake-3:is(:hover, :focus-visible, .is-active))
+        .route-wake-3,
+      body:has(#step-wake-4:is(:hover, :focus-visible, .is-active))
+        .route-wake-4,
+      body:has(#step-scale-1:is(:hover, :focus-visible, .is-active))
+        .route-scale-1,
+      body:has(#step-scale-2:is(:hover, :focus-visible, .is-active))
+        .route-scale-2,
+      body:has(#step-scale-3:is(:hover, :focus-visible, .is-active))
+        .route-scale-3,
+      body:has(#step-scale-4:is(:hover, :focus-visible, .is-active))
+        .route-scale-4,
+      body:has(#step-scale-5:is(:hover, :focus-visible, .is-active))
+        .route-scale-5 {
+        opacity: 1;
+        stroke: var(--accent);
+        stroke-width: 2.75;
+        marker-end: url(#ps-workflow-arrow-accent);
+        filter: var(--shadow-glow);
+      }
+
+      .packet {
+        opacity: 0;
+        offset-rotate: 0deg;
+        pointer-events: none;
+      }
+
+      .packet-reset .packet {
+        animation: none !important;
+        opacity: 0 !important;
+      }
+
+      .packet circle {
+        fill: var(--white);
+        stroke: var(--accent);
+        stroke-width: 2;
+        filter: var(--shadow-node);
+      }
+
+      .packet .halo {
+        fill: rgba(65, 65, 252, 0.12);
+        stroke: none;
+        filter: none;
+      }
+
+      .packet-icon {
+        display: none;
+      }
+
+      @keyframes packet-travel {
+        from {
+          offset-distance: 0%;
+        }
+        to {
+          offset-distance: 100%;
+        }
+      }
+
+      body:has(#step-register-1:is(:hover, :focus-visible, .is-active))
+        .packet-register {
+        opacity: 1;
+        offset-path: path(
+          "M264 464 H288 Q296 464 296 456 V312 Q296 304 304 304 H340"
+        );
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-register-2:is(:hover, :focus-visible, .is-active))
+        .packet-register {
+        opacity: 1;
+        offset-path: path("M540 272 H620");
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-register-3:is(:hover, :focus-visible, .is-active))
+        .packet-register {
+        opacity: 1;
+        offset-path: path("M620 258 H540");
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-register-4:is(:hover, :focus-visible, .is-active))
+        .packet-register {
+        opacity: 1;
+        offset-path: path(
+          "M340 320 H320 Q312 320 312 328 V472 Q312 480 304 480 H264"
+        );
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-register-5:is(:hover, :focus-visible, .is-active))
+        .packet-register {
+        opacity: 1;
+        offset-path: path(
+          "M264 464 H288 Q296 464 296 456 V312 Q296 304 304 304 H340"
+        );
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-register-6:is(:hover, :focus-visible, .is-active))
+        .packet-register {
+        opacity: 1;
+        offset-path: path(
+          "M264 464 H288 Q296 464 296 456 V312 Q296 304 304 304 H340"
+        );
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-register-7:is(:hover, :focus-visible, .is-active))
+        .packet-register {
+        opacity: 1;
+        offset-path: path("M540 272 H620");
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-register-8:is(:hover, :focus-visible, .is-active))
+        .packet-register {
+        opacity: 1;
+        offset-path: path("M740 288 V332");
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+
+      body:has(#step-raw-enclave-1:is(:hover, :focus-visible, .is-active))
+        .packet-raw-enclave {
+        opacity: 1;
+        offset-path: path(
+          "M264 242 H288 Q296 242 296 250 V280 Q296 288 304 288 H340"
+        );
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-raw-enclave-2:is(:hover, :focus-visible, .is-active))
+        .packet-raw-enclave {
+        opacity: 1;
+        offset-path: path("M540 272 H620");
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-raw-enclave-3:is(:hover, :focus-visible, .is-active))
+        .packet-raw-enclave {
+        opacity: 1;
+        offset-path: path("M740 288 V332");
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-raw-enclave-4:is(:hover, :focus-visible, .is-active))
+        .packet-raw-enclave {
+        opacity: 1;
+        offset-path: path(
+          "M540 504 H568 Q576 504 576 496 V364 Q576 356 584 356 H640"
+        );
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-raw-enclave-5:is(:hover, :focus-visible, .is-active))
+        .packet-raw-enclave {
+        opacity: 1;
+        offset-path: path(
+          "M640 348 H600 Q592 348 592 340 V308 Q592 300 584 300 H540"
+        );
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-raw-enclave-6:is(:hover, :focus-visible, .is-active))
+        .packet-raw-enclave {
+        opacity: 1;
+        offset-path: path(
+          "M340 300 H320 Q312 300 312 292 V254 Q312 246 304 246 H264"
+        );
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+
+      body:has(#step-inference-1:is(:hover, :focus-visible, .is-active))
+        .packet-inference {
+        opacity: 1;
+        offset-path: path(
+          "M264 242 H288 Q296 242 296 250 V280 Q296 288 304 288 H340"
+        );
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-inference-2:is(:hover, :focus-visible, .is-active))
+        .packet-inference {
+        opacity: 1;
+        offset-path: path("M540 272 H620");
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-inference-3:is(:hover, :focus-visible, .is-active))
+        .packet-inference {
+        opacity: 1;
+        offset-path: path("M740 288 V332");
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-inference-4:is(:hover, :focus-visible, .is-active))
+        .packet-inference {
+        opacity: 1;
+        offset-path: path(
+          "M540 504 H568 Q576 504 576 496 V364 Q576 356 584 356 H640"
+        );
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-inference-5:is(:hover, :focus-visible, .is-active))
+        .packet-inference {
+        opacity: 1;
+        offset-path: path("M840 368 H900");
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-inference-6:is(:hover, :focus-visible, .is-active))
+        .packet-inference {
+        opacity: 1;
+        offset-path: path("M900 380 H840");
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-inference-7:is(:hover, :focus-visible, .is-active))
+        .packet-inference {
+        opacity: 1;
+        offset-path: path(
+          "M640 348 H600 Q592 348 592 340 V308 Q592 300 584 300 H540"
+        );
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-inference-8:is(:hover, :focus-visible, .is-active))
+        .packet-inference {
+        opacity: 1;
+        offset-path: path(
+          "M340 300 H320 Q312 300 312 292 V254 Q312 246 304 246 H264"
+        );
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+
+      body:has(#step-wake-1:is(:hover, :focus-visible, .is-active))
+        .packet-wake {
+        opacity: 1;
+        offset-path: path(
+          "M264 464 H288 Q296 464 296 456 V312 Q296 304 304 304 H340"
+        );
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-wake-2:is(:hover, :focus-visible, .is-active))
+        .packet-wake {
+        opacity: 1;
+        offset-path: path("M540 272 H620");
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-wake-3:is(:hover, :focus-visible, .is-active))
+        .packet-wake {
+        opacity: 1;
+        offset-path: path("M740 288 V332");
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-wake-4:is(:hover, :focus-visible, .is-active))
+        .packet-wake {
+        opacity: 1;
+        offset-path: path(
+          "M540 504 H568 Q576 504 576 496 V364 Q576 356 584 356 H640"
+        );
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+
+      body:has(#step-scale-1:is(:hover, :focus-visible, .is-active))
+        .packet-scale {
+        opacity: 1;
+        offset-path: path(
+          "M540 316 H552 Q560 316 560 324 V606 Q560 614 568 614 H600"
+        );
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-scale-2:is(:hover, :focus-visible, .is-active))
+        .packet-scale {
+        opacity: 1;
+        offset-path: path(
+          "M600 630 H556 Q548 630 548 622 V338 Q548 330 540 330"
+        );
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-scale-3:is(:hover, :focus-visible, .is-active))
+        .packet-scale {
+        opacity: 1;
+        offset-path: path(
+          "M600 630 H556 Q548 630 548 622 V338 Q548 330 540 330"
+        );
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-scale-4:is(:hover, :focus-visible, .is-active))
+        .packet-scale {
+        opacity: 1;
+        offset-path: path(
+          "M540 316 H552 Q560 316 560 324 V606 Q560 614 568 614 H600"
+        );
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+      body:has(#step-scale-5:is(:hover, :focus-visible, .is-active))
+        .packet-scale {
+        opacity: 1;
+        offset-path: path(
+          "M600 630 H556 Q548 630 548 622 V338 Q548 330 540 330"
+        );
+        animation: packet-travel var(--packet-duration) linear both;
+      }
+
+      body:has(#step-register-1:is(:hover, :focus-visible, .is-active))
+        .packet-register
+        .icon-request,
+      body:has(#step-register-2:is(:hover, :focus-visible, .is-active))
+        .packet-register
+        .icon-request,
+      body:has(#step-register-3:is(:hover, :focus-visible, .is-active))
+        .packet-register
+        .icon-identity,
+      body:has(#step-register-4:is(:hover, :focus-visible, .is-active))
+        .packet-register
+        .icon-identity,
+      body:has(#step-register-5:is(:hover, :focus-visible, .is-active))
+        .packet-register
+        .icon-request,
+      body:has(#step-register-6:is(:hover, :focus-visible, .is-active))
+        .packet-register
+        .icon-lock,
+      body:has(#step-register-7:is(:hover, :focus-visible, .is-active))
+        .packet-register
+        .icon-lock,
+      body:has(#step-register-8:is(:hover, :focus-visible, .is-active))
+        .packet-register
+        .icon-key,
+      body:has(#step-raw-enclave-1:is(:hover, :focus-visible, .is-active))
+        .packet-raw-enclave
+        .icon-request,
+      body:has(#step-raw-enclave-2:is(:hover, :focus-visible, .is-active))
+        .packet-raw-enclave
+        .icon-request,
+      body:has(#step-raw-enclave-3:is(:hover, :focus-visible, .is-active))
+        .packet-raw-enclave
+        .icon-key,
+      body:has(#step-raw-enclave-4:is(:hover, :focus-visible, .is-active))
+        .packet-raw-enclave
+        .icon-lock,
+      body:has(#step-raw-enclave-5:is(:hover, :focus-visible, .is-active))
+        .packet-raw-enclave
+        .icon-lock,
+      body:has(#step-raw-enclave-6:is(:hover, :focus-visible, .is-active))
+        .packet-raw-enclave
+        .icon-lock,
+      body:has(#step-inference-1:is(:hover, :focus-visible, .is-active))
+        .packet-inference
+        .icon-lock,
+      body:has(#step-inference-2:is(:hover, :focus-visible, .is-active))
+        .packet-inference
+        .icon-lock,
+      body:has(#step-inference-3:is(:hover, :focus-visible, .is-active))
+        .packet-inference
+        .icon-key,
+      body:has(#step-inference-4:is(:hover, :focus-visible, .is-active))
+        .packet-inference
+        .icon-lock,
+      body:has(#step-inference-5:is(:hover, :focus-visible, .is-active))
+        .packet-inference
+        .icon-lock,
+      body:has(#step-inference-6:is(:hover, :focus-visible, .is-active))
+        .packet-inference
+        .icon-lock,
+      body:has(#step-inference-7:is(:hover, :focus-visible, .is-active))
+        .packet-inference
+        .icon-lock,
+      body:has(#step-inference-8:is(:hover, :focus-visible, .is-active))
+        .packet-inference
+        .icon-lock,
+      body:has(#step-wake-1:is(:hover, :focus-visible, .is-active))
+        .packet-wake
+        .icon-request,
+      body:has(#step-wake-2:is(:hover, :focus-visible, .is-active))
+        .packet-wake
+        .icon-request,
+      body:has(#step-wake-3:is(:hover, :focus-visible, .is-active))
+        .packet-wake
+        .icon-key,
+      body:has(#step-wake-4:is(:hover, :focus-visible, .is-active))
+        .packet-wake
+        .icon-lock,
+      body:has(#step-scale-1:is(:hover, :focus-visible, .is-active))
+        .packet-scale
+        .icon-request,
+      body:has(#step-scale-2:is(:hover, :focus-visible, .is-active))
+        .packet-scale
+        .icon-identity,
+      body:has(#step-scale-3:is(:hover, :focus-visible, .is-active))
+        .packet-scale
+        .icon-request,
+      body:has(#step-scale-4:is(:hover, :focus-visible, .is-active))
+        .packet-scale
+        .icon-request,
+      body:has(#step-scale-5:is(:hover, :focus-visible, .is-active))
+        .packet-scale
+        .icon-request {
+        display: block;
+      }
+
+      .workflows {
+        grid-column: 2;
+        grid-row: 1 / 3;
+        min-width: 0;
+        margin: 0;
+        padding: 18px 20px 8px;
+        background: var(--white);
+        border: 1px solid var(--rule);
+        border-radius: 14px;
+        counter-reset: workflow;
+      }
+
+      .workflows h2 {
+        margin: 0 0 6px;
+        font-size: 13px;
+        font-family: var(--mono);
+        font-weight: 500;
+        letter-spacing: 0.16em;
+        color: var(--muted);
+        text-transform: uppercase;
+      }
+
+      .workflow {
+        counter-increment: workflow;
+        border-top: 1px solid var(--rule);
+      }
+
+      .workflow summary {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        min-height: 48px;
+        padding: 8px 2px;
+        font-size: 15px;
+        font-weight: 600;
+        cursor: pointer;
+        list-style: none;
+        transition: color var(--motion-fast) ease;
+      }
+
+      .workflow summary::before {
+        content: counter(workflow, decimal-leading-zero);
+        color: var(--soft);
+        font-family: var(--mono);
+        font-size: 12px;
+        font-weight: 400;
+      }
+
+      .workflow[open] summary,
+      .workflow[open] summary::before {
+        color: var(--accent);
+      }
+      .workflow summary:hover {
+        color: var(--accent);
+      }
+
+      .workflow summary::-webkit-details-marker {
+        display: none;
+      }
+      .workflow summary::after {
+        content: "+";
+        margin-left: auto;
+        color: var(--soft);
+        font-size: 20px;
+        font-weight: 400;
+        transition:
+          transform var(--motion-step) var(--motion-ease),
+          color var(--motion-fast) ease;
+      }
+      .workflow[open] summary::after {
+        content: "+";
+        color: var(--accent);
+        transform: rotate(45deg);
+      }
+      .workflow summary:focus-visible {
+        outline: 3px solid var(--accent);
+        outline-offset: 4px;
+        border-radius: 6px;
+      }
+
+      .workflow ol {
+        display: grid;
+        gap: 2px;
+        margin: 0 0 12px;
+        padding: 0;
+        list-style: none;
+        counter-reset: workflow-step;
+      }
+
+      .workflow-step {
+        counter-increment: workflow-step;
+        display: grid;
+        grid-template-columns: 24px 1fr;
+        gap: 10px;
+        align-items: start;
+        min-height: 38px;
+        padding: 7px 9px;
+        border-radius: 9px;
+        font-size: 14px;
+        line-height: 1.4;
+        color: var(--muted);
+        cursor: pointer;
+        transition:
+          background var(--motion-fast) ease,
+          color var(--motion-fast) ease;
+      }
+
+      .workflow-step::before {
+        content: counter(workflow-step);
+        display: grid;
+        place-items: center;
+        width: 22px;
+        height: 22px;
+        margin-top: -1px;
+        border: 1px solid var(--rule);
+        border-radius: 50%;
+        color: var(--soft);
+        background: var(--white);
+        font-family: var(--mono);
+        font-size: 11px;
+        transition:
+          background var(--motion-fast) ease,
+          color var(--motion-fast) ease,
+          border-color var(--motion-fast) ease;
+      }
+
+      .workflow-step:hover,
+      .workflow-step:focus-visible,
+      .workflow-step.is-active {
+        outline: none;
+        color: var(--ink);
+        background: var(--accent-soft);
+      }
+
+      .workflow-step:is(:hover, :focus-visible, .is-active)::before {
+        border-color: var(--accent);
+        background: var(--accent);
+        color: var(--white);
+      }
+
+      .legend {
+        grid-column: 1;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 22px;
+        margin: 8px 0 0;
+        padding: 0 8px;
+        list-style: none;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .legend li {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .legend svg {
+        width: 20px;
+        height: 20px;
+        min-width: 0;
+        flex: none;
+      }
+
+      .legend .swatch-dashed {
+        width: 22px;
+        height: 14px;
+        border: 1.5px dashed rgba(17, 17, 17, 0.55);
+        border-radius: 3px;
+      }
+
+      /* Clickable components and the detail panel. */
+      .component {
+        cursor: pointer;
+        outline: none;
+      }
+      .component:is(:hover, :focus-visible) :is(.node, .app-shell),
+      .component.is-selected :is(.node, .app-shell) {
+        stroke: var(--accent);
+        stroke-width: 1.75;
+        fill: rgba(65, 65, 252, 0.035);
+      }
+      .component:is(:hover, :focus-visible) .node,
+      .component.is-selected .node {
+        fill: #f7f7ff;
+      }
+
+      .detail-panel {
+        position: fixed;
+        top: 0;
+        right: 0;
+        z-index: 10;
+        height: 100%;
+        width: min(380px, 100%);
+        padding: 32px 32px 36px;
+        background: var(--white);
+        border-left: 1px solid var(--rule);
+        box-shadow: -16px 0 40px rgba(17, 17, 17, 0.07);
+        overflow-y: auto;
+        transform: translateX(100%);
+        visibility: hidden;
+        transition:
+          transform var(--motion-step) var(--motion-ease),
+          visibility 0s linear var(--motion-step);
+      }
+
+      .detail-panel.is-open {
+        transform: none;
+        visibility: visible;
+        transition-delay: 0s;
+      }
+
+      .detail-close {
+        position: absolute;
+        top: 18px;
+        right: 18px;
+        width: 34px;
+        height: 34px;
+        border: 1px solid var(--rule);
+        border-radius: 50%;
+        background: var(--white);
+        color: var(--muted);
+        font-size: 18px;
+        line-height: 1;
+        cursor: pointer;
+        transition:
+          color var(--motion-fast) ease,
+          border-color var(--motion-fast) ease;
+      }
+
+      .detail-close:hover {
+        color: var(--accent);
+        border-color: var(--accent);
+      }
+
+      .detail-close:focus-visible {
+        outline: 3px solid var(--accent);
+        outline-offset: 2px;
+      }
+
+      .detail-zone {
+        margin: 0 0 12px;
+        color: var(--accent);
+        font-family: var(--mono);
+        font-size: 12px;
+        letter-spacing: 0.12em;
+      }
+
+      .detail-title {
+        margin: 0 0 14px;
+        padding-bottom: 14px;
+        border-bottom: 1px solid var(--rule);
+        font-size: 24px;
+        font-weight: 600;
+        letter-spacing: -0.025em;
+      }
+
+      .detail-body {
+        margin: 0;
+        font-size: 15px;
+        line-height: 1.55;
+        color: var(--ink);
+      }
+      .detail-body p {
+        margin: 0 0 10px;
+      }
+
+      .detail-links-label {
+        margin: 20px 0 6px;
+        color: var(--soft);
+        font-family: var(--mono);
+        font-size: 12px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .detail-links {
+        display: grid;
+        gap: 6px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        font-family: var(--mono);
+        font-size: 12.5px;
+        line-height: 1.4;
+      }
+
+      .detail-links li {
+        padding: 7px 10px;
+        border: 1px solid var(--rule);
+        border-radius: 8px;
+        background: var(--surface);
+      }
+
+      .detail-links a {
+        color: var(--accent);
+        text-decoration: none;
+        word-break: break-word;
+      }
+      .detail-links a:hover {
+        text-decoration: underline;
+      }
+      .detail-links .is-planned {
+        color: var(--soft);
+        border-style: dashed;
+        background: transparent;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before,
+        *::after {
+          animation-duration: 0.001ms !important;
+          animation-iteration-count: 1 !important;
+          transition-duration: 0.001ms !important;
+        }
+        .packet {
+          display: none !important;
+        }
+      }
+
+      @media print {
+        .workflow-route,
+        .packet {
+          display: none !important;
+        }
+        .workflow > ol {
+          display: grid !important;
+        }
+      }
+
+      @media (max-width: 720px) {
+        main {
+          padding: 32px 12px 48px;
+        }
+        svg {
+          min-width: 1000px;
+        }
+        .workflows h2 {
+          font-size: 22px;
+        }
+        .workflow-step {
+          font-size: 14px;
+        }
+      }
+
+      @media (max-width: 1040px) {
+        .workspace {
+          display: block;
+        }
+        .workflows {
+          margin-top: 20px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Personal Server - Always Available Architecture</h1>
+      </header>
+
+      <div class="workspace" data-motion-root>
+        <div class="frame">
+          <svg
+            viewBox="10 110 1040 580"
+            role="img"
+            aria-labelledby="ps-map-title ps-map-desc"
+          >
+            <title id="ps-map-title">
+              Personal Server - Always Available Architecture
+            </title>
+            <desc id="ps-map-desc">
+              Personal Server components grouped into the user device, shared
+              blind infrastructure, and a horizontally scalable TEE pool. Each
+              TEE orchestrator manages isolated per-user PS Enclaves, which can
+              call shared Private Inference.
+            </desc>
+            <defs>
+              <marker
+                id="ps-workflow-arrow"
+                markerWidth="10"
+                markerHeight="8"
+                refX="9"
+                refY="4"
+                orient="auto"
+                markerUnits="userSpaceOnUse"
+              >
+                <polygon points="0 0, 10 4, 0 8" fill="#858580" />
+              </marker>
+              <marker
+                id="ps-workflow-arrow-accent"
+                markerWidth="10"
+                markerHeight="8"
+                refX="9"
+                refY="4"
+                orient="auto"
+                markerUnits="userSpaceOnUse"
+              >
+                <polygon points="0 0, 10 4, 0 8" fill="#4141fc" />
+              </marker>
+              <symbol id="packet-request" viewBox="0 0 24 24">
+                <path
+                  d="M7 3h7l4 4v14H7z M14 3v5h4 M10 12h5 M10 16h5"
+                  fill="none"
+                  stroke="#4141fc"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </symbol>
+              <symbol id="packet-lock" viewBox="0 0 24 24">
+                <rect
+                  x="5"
+                  y="10"
+                  width="14"
+                  height="11"
+                  rx="2"
+                  fill="none"
+                  stroke="#4141fc"
+                  stroke-width="2"
+                />
+                <path
+                  d="M8 10V7a4 4 0 0 1 8 0v3 M12 14v3"
+                  fill="none"
+                  stroke="#4141fc"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                />
+              </symbol>
+              <symbol id="packet-key" viewBox="0 0 24 24">
+                <circle
+                  cx="8"
+                  cy="12"
+                  r="4"
+                  fill="none"
+                  stroke="#4141fc"
+                  stroke-width="2"
+                />
+                <path
+                  d="M12 12h9 M17 12v3 M20 12v2"
+                  fill="none"
+                  stroke="#4141fc"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                />
+              </symbol>
+              <symbol id="packet-identity" viewBox="0 0 24 24">
+                <circle
+                  cx="12"
+                  cy="8"
+                  r="3"
+                  fill="none"
+                  stroke="#4141fc"
+                  stroke-width="2"
+                />
+                <path
+                  d="M6 20c0-4 2-6 6-6s6 2 6 6"
+                  fill="none"
+                  stroke="#4141fc"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                />
+              </symbol>
+            </defs>
+
+            <rect width="1060" height="720" fill="#fcfcfa" />
+
+            <!-- Trust groups. -->
+            <rect class="zone" x="20" y="120" width="280" height="560" rx="8" />
+            <text class="zone-label" x="40" y="160">USER DEVICE</text>
+            <text class="zone-note" x="40" y="188">
+              private · may be offline
+            </text>
+
+            <rect
+              class="zone"
+              x="320"
+              y="120"
+              width="240"
+              height="560"
+              rx="8"
+            />
+            <text class="zone-label" x="340" y="160">HOSTED + BLIND</text>
+            <text class="zone-note" x="340" y="188">
+              always on · ciphertext only
+            </text>
+
+            <rect
+              class="zone confidential"
+              x="580"
+              y="120"
+              width="460"
+              height="560"
+              rx="8"
+            />
+            <text class="zone-label confidential" x="600" y="160">
+              CONFIDENTIAL COMPUTE
+            </text>
+            <text class="zone-note" x="600" y="188">
+              plaintext stays inside · dashed sandboxes are ephemeral
+            </text>
+
+            <!-- App containers sit behind their Personal Server capability. -->
+            <g
+              class="component"
+              data-component="mobile-app"
+              tabindex="0"
+              role="button"
+            >
+              <rect
+                class="app-shell"
+                x="40"
+                y="280"
+                width="240"
+                height="104"
+                rx="8"
+              />
+              <text class="app-label" x="56" y="306">Vana Mobile App</text>
+            </g>
+            <g
+              class="component"
+              data-component="web-app"
+              tabindex="0"
+              role="button"
+            >
+              <rect
+                class="app-shell"
+                x="40"
+                y="400"
+                width="240"
+                height="104"
+                rx="8"
+              />
+              <text class="app-label" x="56" y="426">Vana Web App</text>
+            </g>
+            <g
+              class="component"
+              data-component="desktop-app"
+              tabindex="0"
+              role="button"
+            >
+              <rect
+                class="app-shell"
+                x="40"
+                y="520"
+                width="240"
+                height="128"
+                rx="8"
+              />
+              <text class="app-label" x="56" y="546">Vana Desktop App</text>
+            </g>
+
+            <!-- TEE capacity units and their user-isolated sandboxes. -->
+            <g
+              class="component"
+              data-component="tee"
+              tabindex="0"
+              role="button"
+            >
+              <rect
+                class="app-shell"
+                x="600"
+                y="208"
+                width="280"
+                height="360"
+                rx="8"
+              />
+              <text class="app-label" x="620" y="236">TEE 1</text>
+            </g>
+            <g
+              class="component"
+              data-component="orchestrator"
+              tabindex="0"
+              role="button"
+            >
+              <rect
+                class="app-shell"
+                x="620"
+                y="252"
+                width="240"
+                height="280"
+                rx="8"
+              />
+              <text class="app-label" x="638" y="280">
+                PS Enclave Orchestrator
+              </text>
+            </g>
+            <g
+              class="component tee-spare-node"
+              data-component="tee-spare"
+              tabindex="0"
+              role="button"
+            >
+              <rect
+                class="app-shell"
+                x="600"
+                y="592"
+                width="280"
+                height="56"
+                rx="8"
+              />
+              <text class="app-label" x="620" y="626">TEE 2</text>
+            </g>
+
+            <!-- Workflow routes are revealed by the open accordion. -->
+            <path
+              class="workflow-route wf-register wf-wake route-register-1 route-register-5 route-register-6 route-wake-1"
+              d="M264 464 H288 Q296 464 296 456 V312 Q296 304 304 304 H340"
+              aria-hidden="true"
+            />
+            <path
+              class="workflow-route wf-register wf-raw-enclave wf-inference wf-wake route-register-2 route-register-7 route-raw-enclave-2 route-inference-2 route-wake-2"
+              d="M540 272 H620"
+              aria-hidden="true"
+            />
+            <path
+              class="workflow-route wf-register route-register-3"
+              d="M620 258 H540"
+              aria-hidden="true"
+            />
+            <path
+              class="workflow-route wf-register route-register-4"
+              d="M340 320 H320 Q312 320 312 328 V472 Q312 480 304 480 H264"
+              aria-hidden="true"
+            />
+            <path
+              class="workflow-route wf-raw-enclave wf-inference route-raw-enclave-1 route-inference-1"
+              d="M264 242 H288 Q296 242 296 250 V280 Q296 288 304 288 H340"
+              aria-hidden="true"
+            />
+            <path
+              class="workflow-route wf-raw-enclave wf-inference route-raw-enclave-6 route-inference-8"
+              d="M340 300 H320 Q312 300 312 292 V254 Q312 246 304 246 H264"
+              aria-hidden="true"
+            />
+            <path
+              class="workflow-route wf-register wf-raw-enclave wf-inference wf-wake route-register-8 route-raw-enclave-3 route-inference-3 route-wake-3"
+              d="M740 288 V332"
+              aria-hidden="true"
+            />
+            <path
+              class="workflow-route wf-raw-enclave wf-inference wf-wake route-raw-enclave-4 route-inference-4 route-wake-4"
+              d="M540 504 H568 Q576 504 576 496 V364 Q576 356 584 356 H640"
+              aria-hidden="true"
+            />
+            <path
+              class="workflow-route wf-raw-enclave wf-inference route-raw-enclave-5 route-inference-7"
+              d="M640 348 H600 Q592 348 592 340 V308 Q592 300 584 300 H540"
+              aria-hidden="true"
+            />
+            <path
+              class="workflow-route wf-inference route-inference-5"
+              d="M840 368 H900"
+              aria-hidden="true"
+            />
+            <path
+              class="workflow-route wf-inference route-inference-6"
+              d="M900 380 H840"
+              aria-hidden="true"
+            />
+            <path
+              class="workflow-route wf-scale route-scale-1 route-scale-4"
+              d="M540 316 H552 Q560 316 560 324 V606 Q560 614 568 614 H600"
+              aria-hidden="true"
+            />
+            <path
+              class="workflow-route wf-scale route-scale-2 route-scale-3 route-scale-5"
+              d="M600 630 H556 Q548 630 548 622 V338 Q548 330 540 330"
+              aria-hidden="true"
+            />
+
+            <!-- One icon packet per workflow; the hovered step selects its path and type. -->
+            <g
+              class="packet packet-register"
+              aria-hidden="true"
+              focusable="false"
+            >
+              <circle class="halo" cx="0" cy="0" r="24" />
+              <circle cx="0" cy="0" r="16" />
+              <use
+                class="packet-icon icon-request"
+                href="#packet-request"
+                x="-10"
+                y="-10"
+                width="20"
+                height="20"
+              />
+              <use
+                class="packet-icon icon-lock"
+                href="#packet-lock"
+                x="-10"
+                y="-10"
+                width="20"
+                height="20"
+              />
+              <use
+                class="packet-icon icon-key"
+                href="#packet-key"
+                x="-10"
+                y="-10"
+                width="20"
+                height="20"
+              />
+              <use
+                class="packet-icon icon-identity"
+                href="#packet-identity"
+                x="-10"
+                y="-10"
+                width="20"
+                height="20"
+              />
+            </g>
+            <g
+              class="packet packet-raw-enclave"
+              aria-hidden="true"
+              focusable="false"
+            >
+              <circle class="halo" cx="0" cy="0" r="24" />
+              <circle cx="0" cy="0" r="16" />
+              <use
+                class="packet-icon icon-request"
+                href="#packet-request"
+                x="-10"
+                y="-10"
+                width="20"
+                height="20"
+              />
+              <use
+                class="packet-icon icon-lock"
+                href="#packet-lock"
+                x="-10"
+                y="-10"
+                width="20"
+                height="20"
+              />
+              <use
+                class="packet-icon icon-key"
+                href="#packet-key"
+                x="-10"
+                y="-10"
+                width="20"
+                height="20"
+              />
+              <use
+                class="packet-icon icon-identity"
+                href="#packet-identity"
+                x="-10"
+                y="-10"
+                width="20"
+                height="20"
+              />
+            </g>
+            <g
+              class="packet packet-inference"
+              aria-hidden="true"
+              focusable="false"
+            >
+              <circle class="halo" cx="0" cy="0" r="24" />
+              <circle cx="0" cy="0" r="16" />
+              <use
+                class="packet-icon icon-request"
+                href="#packet-request"
+                x="-10"
+                y="-10"
+                width="20"
+                height="20"
+              />
+              <use
+                class="packet-icon icon-lock"
+                href="#packet-lock"
+                x="-10"
+                y="-10"
+                width="20"
+                height="20"
+              />
+              <use
+                class="packet-icon icon-key"
+                href="#packet-key"
+                x="-10"
+                y="-10"
+                width="20"
+                height="20"
+              />
+              <use
+                class="packet-icon icon-identity"
+                href="#packet-identity"
+                x="-10"
+                y="-10"
+                width="20"
+                height="20"
+              />
+            </g>
+            <g class="packet packet-scale" aria-hidden="true" focusable="false">
+              <circle class="halo" cx="0" cy="0" r="24" />
+              <circle cx="0" cy="0" r="16" />
+              <use
+                class="packet-icon icon-request"
+                href="#packet-request"
+                x="-10"
+                y="-10"
+                width="20"
+                height="20"
+              />
+              <use
+                class="packet-icon icon-lock"
+                href="#packet-lock"
+                x="-10"
+                y="-10"
+                width="20"
+                height="20"
+              />
+              <use
+                class="packet-icon icon-key"
+                href="#packet-key"
+                x="-10"
+                y="-10"
+                width="20"
+                height="20"
+              />
+              <use
+                class="packet-icon icon-identity"
+                href="#packet-identity"
+                x="-10"
+                y="-10"
+                width="20"
+                height="20"
+              />
+            </g>
+            <g class="packet packet-wake" aria-hidden="true" focusable="false">
+              <circle class="halo" cx="0" cy="0" r="24" />
+              <circle cx="0" cy="0" r="16" />
+              <use
+                class="packet-icon icon-request"
+                href="#packet-request"
+                x="-10"
+                y="-10"
+                width="20"
+                height="20"
+              />
+              <use
+                class="packet-icon icon-lock"
+                href="#packet-lock"
+                x="-10"
+                y="-10"
+                width="20"
+                height="20"
+              />
+              <use
+                class="packet-icon icon-key"
+                href="#packet-key"
+                x="-10"
+                y="-10"
+                width="20"
+                height="20"
+              />
+              <use
+                class="packet-icon icon-identity"
+                href="#packet-identity"
+                x="-10"
+                y="-10"
+                width="20"
+                height="20"
+              />
+            </g>
+
+            <!-- User device. -->
+            <g
+              class="component"
+              data-component="builder"
+              tabindex="0"
+              role="button"
+            >
+              <rect
+                class="node-mask"
+                x="56"
+                y="208"
+                width="208"
+                height="56"
+                rx="8"
+              />
+              <rect
+                class="node"
+                x="56"
+                y="208"
+                width="208"
+                height="56"
+                rx="8"
+              />
+              <text class="node-name" x="160" y="242">Builder App</text>
+            </g>
+
+            <g
+              class="component"
+              data-component="ps-lite"
+              tabindex="0"
+              role="button"
+            >
+              <rect
+                class="node-mask"
+                x="56"
+                y="320"
+                width="208"
+                height="48"
+                rx="8"
+              />
+              <rect
+                class="node"
+                x="56"
+                y="320"
+                width="208"
+                height="48"
+                rx="8"
+              />
+              <text class="node-name" x="160" y="350">PS Lite (no server)</text>
+            </g>
+
+            <g
+              class="component"
+              data-component="ps-lite"
+              tabindex="0"
+              role="button"
+            >
+              <rect
+                class="node-mask"
+                x="56"
+                y="440"
+                width="208"
+                height="48"
+                rx="8"
+              />
+              <rect
+                class="node"
+                x="56"
+                y="440"
+                width="208"
+                height="48"
+                rx="8"
+              />
+              <text class="node-name" x="160" y="470">PS Lite (no server)</text>
+            </g>
+
+            <g
+              class="component"
+              data-component="ps-full"
+              tabindex="0"
+              role="button"
+            >
+              <rect
+                class="node-mask"
+                x="56"
+                y="568"
+                width="208"
+                height="56"
+                rx="8"
+              />
+              <rect
+                class="node"
+                x="56"
+                y="568"
+                width="208"
+                height="56"
+                rx="8"
+              />
+              <text class="node-name" x="160" y="602">PS Full</text>
+            </g>
+
+            <!-- Shared and blind. -->
+            <g
+              class="component"
+              data-component="gateway"
+              tabindex="0"
+              role="button"
+            >
+              <rect
+                class="node-mask"
+                x="340"
+                y="240"
+                width="200"
+                height="96"
+                rx="8"
+              />
+              <rect
+                class="node"
+                x="340"
+                y="240"
+                width="200"
+                height="96"
+                rx="8"
+              />
+              <text class="node-name" x="440" y="296">Data Gateway</text>
+            </g>
+
+            <g class="component" data-component="r2" tabindex="0" role="button">
+              <rect
+                class="node-mask"
+                x="340"
+                y="456"
+                width="200"
+                height="96"
+                rx="8"
+              />
+              <rect
+                class="node"
+                x="340"
+                y="456"
+                width="200"
+                height="96"
+                rx="8"
+              />
+              <text class="node-name" x="440" y="500">Vana Storage</text>
+              <text class="node-sub" x="440" y="526">Cloudflare R2</text>
+            </g>
+
+            <!-- Confidential compute. -->
+            <g
+              class="enclave-node enclave-user-1 component"
+              data-component="enclave"
+              tabindex="0"
+              role="button"
+            >
+              <rect
+                class="node-mask"
+                x="640"
+                y="332"
+                width="200"
+                height="64"
+                rx="8"
+              />
+              <rect
+                class="node"
+                x="640"
+                y="332"
+                width="200"
+                height="64"
+                rx="8"
+              />
+              <text class="node-name" x="740" y="370">PS Enclave · User 1</text>
+            </g>
+
+            <g
+              class="enclave-node enclave-user-2 component"
+              data-component="enclave"
+              tabindex="0"
+              role="button"
+            >
+              <rect
+                class="node-mask"
+                x="640"
+                y="420"
+                width="200"
+                height="64"
+                rx="8"
+              />
+              <rect
+                class="node"
+                x="640"
+                y="420"
+                width="200"
+                height="64"
+                rx="8"
+              />
+              <text class="node-name" x="740" y="458">PS Enclave · User 2</text>
+            </g>
+
+            <g
+              class="component"
+              data-component="inference"
+              tabindex="0"
+              role="button"
+            >
+              <rect
+                class="node-mask"
+                x="900"
+                y="252"
+                width="120"
+                height="280"
+                rx="8"
+              />
+              <rect
+                class="node"
+                x="900"
+                y="252"
+                width="120"
+                height="280"
+                rx="8"
+              />
+              <text class="node-name" x="960" y="382">Private</text>
+              <text class="node-name" x="960" y="408">Inference</text>
+            </g>
+          </svg>
+        </div>
+
+        <ul class="legend" aria-label="Diagram legend">
+          <li>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <use href="#packet-request" /></svg
+            >signed request
+          </li>
+          <li>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <use href="#packet-lock" /></svg
+            >ciphertext
+          </li>
+          <li>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <use href="#packet-key" /></svg
+            >key material
+          </li>
+          <li>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <use href="#packet-identity" /></svg
+            >identity
+          </li>
+          <li>
+            <span class="swatch-dashed" aria-hidden="true"></span>ephemeral
+          </li>
+        </ul>
+
+        <section class="workflows" aria-labelledby="workflows-title">
+          <h2 id="workflows-title">Workflows</h2>
+
+          <details
+            class="workflow"
+            id="workflow-register"
+            name="personal-server-workflow"
+          >
+            <summary>Register PS Enclave</summary>
+            <ol>
+              <li class="workflow-step" id="step-register-1" tabindex="0">
+                Vana Web App asks the Gateway to prepare the user’s enclave
+                identity.
+              </li>
+              <li class="workflow-step" id="step-register-2" tabindex="0">
+                The Gateway places an identity-only request on an attested TEE
+                orchestrator.
+              </li>
+              <li class="workflow-step" id="step-register-3" tabindex="0">
+                The orchestrator derives the deterministic wallet via dstack KMS
+                and returns only the public identity and attestation evidence.
+                No sandbox starts.
+              </li>
+              <li class="workflow-step" id="step-register-4" tabindex="0">
+                Vana Web App verifies the evidence, shows the identity, and asks
+                for consent.
+              </li>
+              <li class="workflow-step" id="step-register-5" tabindex="0">
+                The owner signs. Vana Web App submits the registration to the
+                Gateway, which records it and settles on-chain.
+              </li>
+              <li class="workflow-step" id="step-register-6" tabindex="0">
+                Vana Web App sends the owner’s master-key signature, encrypted
+                to the attested TEE. The Gateway relays it blind.
+              </li>
+              <li class="workflow-step" id="step-register-7" tabindex="0">
+                The TEE seals the signature under a user-scoped KMS key. Only
+                ciphertext is stored.
+              </li>
+              <li class="workflow-step" id="step-register-8" tabindex="0">
+                Prewarm: the orchestrator provisions the user’s sandbox,
+                injecting the wallet and unsealed data root. The PS Enclave now
+                exists, until its idle TTL.
+              </li>
+            </ol>
+          </details>
+
+          <details
+            class="workflow"
+            id="workflow-raw-enclave"
+            name="personal-server-workflow"
+          >
+            <summary>Raw read · PS Enclave</summary>
+            <ol>
+              <li class="workflow-step" id="step-raw-enclave-1" tabindex="0">
+                Builder App sends a signed read request: grant, scope, deadline.
+                No user data.
+              </li>
+              <li class="workflow-step" id="step-raw-enclave-2" tabindex="0">
+                The Gateway verifies builder and grant and queues the job. A TEE
+                orchestrator with capacity claims it.
+              </li>
+              <li class="workflow-step" id="step-raw-enclave-3" tabindex="0">
+                The orchestrator derives the user’s wallet, unseals the
+                master-key signature, and starts or reuses the user’s sandbox
+                with only that key material.
+              </li>
+              <li class="workflow-step" id="step-raw-enclave-4" tabindex="0">
+                The PS Enclave fetches only the granted scope’s encrypted files
+                from Vana Storage and decrypts them inside the sandbox.
+              </li>
+              <li class="workflow-step" id="step-raw-enclave-5" tabindex="0">
+                The PS Enclave re-checks the grant and returns the result
+                encrypted to the builder’s key.
+              </li>
+              <li class="workflow-step" id="step-raw-enclave-6" tabindex="0">
+                The Gateway returns ciphertext. Builder App decrypts.
+              </li>
+            </ol>
+          </details>
+
+          <details
+            class="workflow"
+            id="workflow-inference"
+            name="personal-server-workflow"
+          >
+            <summary>Private inference</summary>
+            <ol>
+              <li class="workflow-step" id="step-inference-1" tabindex="0">
+                Builder App encrypts the question to the user’s registered PS
+                Enclave key and sends it with signed job metadata.
+              </li>
+              <li class="workflow-step" id="step-inference-2" tabindex="0">
+                The Gateway verifies builder and grant and queues the job. A TEE
+                orchestrator claims it; inference never routes to PS Full.
+              </li>
+              <li class="workflow-step" id="step-inference-3" tabindex="0">
+                The orchestrator derives the user’s wallet, unseals the
+                master-key signature, and starts or reuses the user’s sandbox
+                with only that key material.
+              </li>
+              <li class="workflow-step" id="step-inference-4" tabindex="0">
+                The PS Enclave fetches only the source scopes’ encrypted files
+                from Vana Storage and decrypts them inside the sandbox.
+              </li>
+              <li class="workflow-step" id="step-inference-5" tabindex="0">
+                The PS Enclave checks the question against owner consent, builds
+                a bounded prompt, and encrypts it to the attested Private
+                Inference key. The Gateway relays the bytes blind.
+              </li>
+              <li class="workflow-step" id="step-inference-6" tabindex="0">
+                Private Inference returns the answer encrypted to the PS
+                Enclave’s ephemeral key.
+              </li>
+              <li class="workflow-step" id="step-inference-7" tabindex="0">
+                The PS Enclave decrypts the answer, keeps lineage owner-side,
+                and returns only the answer encrypted to the builder’s key.
+              </li>
+              <li class="workflow-step" id="step-inference-8" tabindex="0">
+                The Gateway returns the answer ciphertext. Builder App decrypts;
+                source data never left the sandbox.
+              </li>
+            </ol>
+          </details>
+
+          <details
+            class="workflow"
+            id="workflow-wake"
+            name="personal-server-workflow"
+          >
+            <summary>Wake PS Enclave</summary>
+            <ol>
+              <li class="workflow-step" id="step-wake-1" tabindex="0">
+                After login, Vana Web App asks the Gateway to prewarm the user’s
+                PS Enclave.
+              </li>
+              <li class="workflow-step" id="step-wake-2" tabindex="0">
+                The Gateway checks for an active sandbox. If none, it selects a
+                TEE with capacity and places a startup assignment.
+              </li>
+              <li class="workflow-step" id="step-wake-3" tabindex="0">
+                The orchestrator derives the same wallet, unseals the master-key
+                signature, and starts the sandbox with only that user’s key
+                material.
+              </li>
+              <li class="workflow-step" id="step-wake-4" tabindex="0">
+                The sandbox hydrates encrypted files from Vana Storage as jobs
+                need them and stays warm for an activity TTL.
+              </li>
+            </ol>
+          </details>
+
+          <details
+            class="workflow"
+            id="workflow-scale"
+            name="personal-server-workflow"
+          >
+            <summary>Scale out · add TEE 2</summary>
+            <ol>
+              <li class="workflow-step" id="step-scale-1" tabindex="0">
+                An operator provisions a new TEE with the same pinned app_id and
+                image, and registers it with the Gateway.
+              </li>
+              <li class="workflow-step" id="step-scale-2" tabindex="0">
+                The new node answers the Gateway’s attestation challenge.
+              </li>
+              <li class="workflow-step" id="step-scale-3" tabindex="0">
+                The node verifies its PS image, passes a KMS canary, and
+                heartbeats ready.
+              </li>
+              <li class="workflow-step" id="step-scale-4" tabindex="0">
+                The operator admits it. The Gateway can now place any user’s
+                sandbox here.
+              </li>
+              <li class="workflow-step" id="step-scale-5" tabindex="0">
+                Scale-down: the operator drains the node, then destroys it.
+              </li>
+            </ol>
+          </details>
+        </section>
+      </div>
+    </main>
+
+    <aside
+      class="detail-panel"
+      data-detail-panel
+      aria-labelledby="detail-title"
+      aria-hidden="true"
+    >
+      <button
+        class="detail-close"
+        type="button"
+        aria-label="Close"
+        data-detail-close
+      >
+        ×
+      </button>
+      <p class="detail-zone" data-detail-zone></p>
+      <h3 class="detail-title" id="detail-title" data-detail-title></h3>
+      <div class="detail-body" data-detail-body></div>
+      <p class="detail-links-label">Code</p>
+      <ul class="detail-links" data-detail-links></ul>
+    </aside>
+
+    <script data-detail-panel-controls>
+      (() => {
+        const DESCRIPTIONS = {
+          builder: {
+            zone: "USER DEVICE",
+            title: "Builder App",
+            links: [
+              {
+                label: "vana-sdk",
+                href: "https://github.com/vana-com/vana-sdk",
+              },
+              {
+                label: "playlist-shelf-app (example)",
+                href: "https://github.com/vana-com/playlist-shelf-app",
+              },
+            ],
+            body: [
+              "Third-party app holding a grant. Talks only to the fixed Gateway URL.",
+              "Signs raw-read jobs (grant, scope, deadline, no user data) and encrypts inference questions to the user’s PS Enclave key. Decrypts results with its registered key.",
+            ],
+          },
+          "mobile-app": {
+            zone: "USER DEVICE",
+            title: "Vana Mobile App",
+            links: [
+              {
+                label: "unity-surfaces/apps/mobile",
+                href: "https://github.com/vana-com/unity-surfaces/tree/main/apps/mobile",
+              },
+              {
+                label: "unity-surfaces/apps/mobile-shell",
+                href: "https://github.com/vana-com/unity-surfaces/tree/main/apps/mobile-shell",
+              },
+            ],
+            body: [
+              "Owner surface. Authenticates the user, signs consent and registration, and can prewarm the enclave after login. Hosts no server and needs no inbound URL.",
+            ],
+          },
+          "web-app": {
+            zone: "USER DEVICE",
+            title: "Vana Web App",
+            links: [
+              {
+                label: "unity-surfaces/apps/web",
+                href: "https://github.com/vana-com/unity-surfaces/tree/main/apps/web",
+              },
+            ],
+            body: [
+              "Owner surface. Authenticates the user, verifies enclave attestation, signs consent and registration, and can prewarm the enclave after login. Hosts no server and needs no inbound URL.",
+            ],
+          },
+          "desktop-app": {
+            zone: "USER DEVICE",
+            title: "Vana Desktop App",
+            links: [
+              {
+                label: "unity-surfaces/apps/desktop",
+                href: "https://github.com/vana-com/unity-surfaces/tree/main/apps/desktop",
+              },
+            ],
+            body: [
+              "Hosts PS Full on a user-controlled machine and hands it the master-key signature through its environment. Collector and owner-local server only.",
+            ],
+          },
+          "ps-lite": {
+            zone: "USER DEVICE",
+            title: "PS Lite (no server)",
+            links: [
+              {
+                label: "unity-surfaces/apps/account (signing)",
+                href: "https://github.com/vana-com/unity-surfaces/tree/main/apps/account",
+              },
+              {
+                label: "personal-server-ts/packages/lite (to retire)",
+                href: "https://github.com/vana-com/personal-server-ts/tree/main/packages/lite",
+              },
+            ],
+            body: [
+              "Owner-side wallet and consent client. Signs the server registration and the master-key message, and verifies the enclave identity it is asked to approve.",
+              "Accepts no builder traffic. The always-on server role moved to PS Enclave.",
+            ],
+          },
+          "ps-full": {
+            zone: "USER DEVICE",
+            title: "PS Full",
+            links: [
+              {
+                label: "personal-server-ts",
+                href: "https://github.com/vana-com/personal-server-ts",
+              },
+            ],
+            body: [
+              "Optional Personal Server on a user device. Collects, encrypts, and uploads the owner’s data, and serves the owner locally (MCP, agents).",
+              "Not a builder executor in v1: the enclave answers every builder request. Kept runtime-agnostic so it can be re-admitted later.",
+            ],
+          },
+          gateway: {
+            zone: "HOSTED + BLIND",
+            title: "Data Gateway",
+            links: [
+              {
+                label: "data-gateway",
+                href: "https://github.com/vana-com/data-gateway",
+              },
+            ],
+            body: [
+              "The fixed Personal Server URL builders use. Authenticates requests, checks grants and payment, runs the blind job queue, tracks PS Full presence and TEE capacity, and relays inference bytes.",
+              "Sees signed control metadata and ciphertext only. Never user plaintext, questions, results, owner signatures, or keys.",
+            ],
+          },
+          r2: {
+            zone: "HOSTED + BLIND",
+            title: "Vana Storage",
+            links: [
+              {
+                label: "vana-storage",
+                href: "https://github.com/vana-com/vana-storage",
+              },
+            ],
+            body: [
+              "Encrypted blob storage on Cloudflare R2, keyed by owner, scope, and version. Blobs are encrypted under per-scope keys derived from the owner’s master-key signature.",
+              "PS Full and PS Enclave read the same blobs. Storage never holds a key.",
+            ],
+          },
+          tee: {
+            zone: "CONFIDENTIAL COMPUTE",
+            title: "TEE 1",
+            links: [
+              {
+                label: "personal-server-ts/packages/enclave (not yet created)",
+                href: null,
+              },
+            ],
+            body: [
+              "One attested dstack confidential VM. Runs a shared orchestrator plus one sandbox per active user.",
+              "Nodes are interchangeable: every node with the same pinned app_id derives the same user wallets and sealing keys, so any admitted node can serve any user.",
+            ],
+          },
+          orchestrator: {
+            zone: "CONFIDENTIAL COMPUTE",
+            title: "PS Enclave Orchestrator",
+            links: [
+              {
+                label: "personal-server-ts/packages/enclave (not yet created)",
+                href: null,
+              },
+            ],
+            body: [
+              "Trusted node agent inside the CVM. Claims jobs from the Gateway, derives user wallets and sealing keys from dstack KMS, starts and destroys sandboxes, and hands each one only its own key material.",
+              "It is in every user’s trust base. Sandboxes never receive the dstack socket, host filesystem, or another user’s mounts.",
+            ],
+          },
+          enclave: {
+            zone: "CONFIDENTIAL COMPUTE",
+            title: "PS Enclave",
+            links: [
+              {
+                label: "personal-server-ts",
+                href: "https://github.com/vana-com/personal-server-ts",
+              },
+              { label: "enclave profile (not yet created)", href: null },
+            ],
+            body: [
+              "Ephemeral per-user sandbox running the PS enclave profile. Holds the user’s wallet and master-key signature in memory only.",
+              "Hydrates just the scopes a job needs from Vana Storage, re-checks the grant before touching plaintext, and encrypts results to the builder. Destroyed at idle TTL; recreated identically on any node.",
+            ],
+          },
+          "tee-spare": {
+            zone: "CONFIDENTIAL COMPUTE",
+            title: "TEE 2",
+            links: [
+              {
+                label: "personal-server-ts/packages/enclave (not yet created)",
+                href: null,
+              },
+            ],
+            body: [
+              "Extra capacity an operator adds by hand in v1 with scripts in personal-server-ts. Same app_id and measurements, so it derives the same identities. Admitted only after attestation; drained before teardown.",
+            ],
+          },
+          inference: {
+            zone: "CONFIDENTIAL COMPUTE",
+            title: "Private Inference",
+            links: [
+              {
+                label: "data-gateway/api/v1/inference (relay)",
+                href: "https://github.com/vana-com/data-gateway/tree/main/api/v1/inference",
+              },
+              {
+                label: "personal-server-ts e2ee client",
+                href: "https://github.com/vana-com/personal-server-ts/tree/main/packages/core/src/derivatives/e2ee",
+              },
+            ],
+            body: [
+              "Attested inference provider such as Phala. Receives prompts encrypted end to end from the PS Enclave (X25519, HKDF, AES-GCM) and answers to its ephemeral key.",
+              "The Gateway relays the bytes and injects the provider credential. No silent fallback to a non-private provider.",
+            ],
+          },
+        };
+
+        const panel = document.querySelector("[data-detail-panel]");
+        const zoneEl = panel.querySelector("[data-detail-zone]");
+        const titleEl = panel.querySelector("[data-detail-title]");
+        const bodyEl = panel.querySelector("[data-detail-body]");
+        const linksEl = panel.querySelector("[data-detail-links]");
+
+        // Missing href means the repo does not exist yet; render plain text.
+        const linkItem = ({ label, href }) => {
+          const item = document.createElement("li");
+          if (!href) {
+            item.textContent = label;
+            item.classList.add("is-planned");
+            return item;
+          }
+          const anchor = Object.assign(document.createElement("a"), {
+            textContent: label,
+            href,
+            target: "_blank",
+            rel: "noopener",
+          });
+          item.append(anchor);
+          return item;
+        };
+        const components = [...document.querySelectorAll(".component")];
+        let selected = null;
+
+        const close = () => {
+          panel.classList.remove("is-open");
+          panel.setAttribute("aria-hidden", "true");
+          selected?.classList.remove("is-selected");
+          selected = null;
+        };
+
+        const open = (component) => {
+          const entry = DESCRIPTIONS[component.dataset.component];
+          if (!entry) return;
+          if (selected === component) return close();
+
+          selected?.classList.remove("is-selected");
+          selected = component;
+          component.classList.add("is-selected");
+
+          zoneEl.textContent = entry.zone;
+          titleEl.textContent = entry.title;
+          bodyEl.replaceChildren(
+            ...entry.body.map((text) =>
+              Object.assign(document.createElement("p"), { textContent: text }),
+            ),
+          );
+          linksEl.replaceChildren(...entry.links.map(linkItem));
+          panel.classList.add("is-open");
+          panel.setAttribute("aria-hidden", "false");
+        };
+
+        components.forEach((component) => {
+          component.addEventListener("click", (event) => {
+            event.stopPropagation();
+            open(component);
+          });
+          component.addEventListener("keydown", (event) => {
+            if (event.key !== "Enter" && event.key !== " ") return;
+            event.preventDefault();
+            open(component);
+          });
+        });
+
+        panel
+          .querySelector("[data-detail-close]")
+          .addEventListener("click", close);
+        panel.addEventListener("click", (event) => event.stopPropagation());
+        document.addEventListener("click", close);
+        document.addEventListener("keydown", (event) => {
+          if (event.key === "Escape") close();
+        });
+      })();
+    </script>
+    <script data-diagram-controls>
+      (() => {
+        const workflows = [...document.querySelectorAll(".workflow")];
+        const motionRoot = document.querySelector("[data-motion-root]");
+        const reducedMotion = window.matchMedia(
+          "(prefers-reduced-motion: reduce)",
+        );
+        let playbackController = null;
+        let activeWorkflow = null;
+        let activeIndex = -1;
+
+        const stepsFor = (workflow) => [
+          ...workflow.querySelectorAll(".workflow-step"),
+        ];
+
+        const stopPlayback = () => {
+          playbackController?.abort();
+          playbackController = null;
+        };
+
+        const setStep = (workflow, index) => {
+          motionRoot.classList.add("packet-reset");
+          document
+            .querySelectorAll(".workflow-step.is-active")
+            .forEach((step) => step.classList.remove("is-active"));
+          const steps = stepsFor(workflow);
+          activeWorkflow = workflow;
+          activeIndex = Math.max(0, Math.min(index, steps.length - 1));
+          steps[activeIndex]?.classList.add("is-active");
+          void motionRoot.offsetWidth;
+          motionRoot.classList.remove("packet-reset");
+        };
+
+        const pauseAt = (step) => {
+          stopPlayback();
+          const workflow = step.closest(".workflow");
+          setStep(workflow, stepsFor(workflow).indexOf(step));
+        };
+
+        const play = (workflow) => {
+          stopPlayback();
+          if (reducedMotion.matches) return;
+          const steps = stepsFor(workflow);
+          const hold = 20000 / steps.length;
+          document.documentElement.style.setProperty(
+            "--packet-duration",
+            `${hold / 1000}s`,
+          );
+          const packet = document.querySelector(
+            `.packet-${workflow.id.replace("workflow-", "")}`,
+          );
+          const controller = new AbortController();
+          playbackController = controller;
+          let index = 0;
+
+          const advance = () => {
+            if (controller.signal.aborted || !workflow.open)
+              return stopPlayback();
+            setStep(workflow, index);
+            index += 1;
+            if (index < steps.length) {
+              packet.addEventListener(
+                "animationend",
+                (event) => {
+                  if (event.animationName === "packet-travel") advance();
+                },
+                { once: true, signal: controller.signal },
+              );
+            } else {
+              playbackController = null;
+            }
+          };
+
+          advance();
+        };
+
+        workflows.forEach((workflow) => {
+          workflow.addEventListener("toggle", () => {
+            if (workflow.open) play(workflow);
+            else if (activeWorkflow === workflow) {
+              stopPlayback();
+              workflow
+                .querySelectorAll(".is-active")
+                .forEach((step) => step.classList.remove("is-active"));
+            }
+          });
+
+          stepsFor(workflow).forEach((step) => {
+            step.addEventListener("pointerenter", () => pauseAt(step));
+            step.addEventListener("click", () => pauseAt(step));
+            step.addEventListener("focus", () => pauseAt(step));
+          });
+        });
+
+        document.addEventListener("visibilitychange", () => {
+          if (document.hidden) stopPlayback();
+        });
+      })();
+    </script>
+  </body>
+</html>
