@@ -207,7 +207,6 @@
       }
 
       body:has(#workflow-register[open]) .wf-register,
-      body:has(#workflow-raw-full[open]) .wf-raw-full,
       body:has(#workflow-raw-enclave[open]) .wf-raw-enclave,
       body:has(#workflow-inference[open]) .wf-inference,
       body:has(#workflow-wake[open]) .wf-wake,
@@ -231,14 +230,6 @@
         .route-register-7,
       body:has(#step-register-8:is(:hover, :focus-visible, .is-active))
         .route-register-8,
-      body:has(#step-raw-full-1:is(:hover, :focus-visible, .is-active))
-        .route-raw-full-1,
-      body:has(#step-raw-full-2:is(:hover, :focus-visible, .is-active))
-        .route-raw-full-2,
-      body:has(#step-raw-full-3:is(:hover, :focus-visible, .is-active))
-        .route-raw-full-3,
-      body:has(#step-raw-full-4:is(:hover, :focus-visible, .is-active))
-        .route-raw-full-4,
       body:has(#step-raw-enclave-1:is(:hover, :focus-visible, .is-active))
         .route-raw-enclave-1,
       body:has(#step-raw-enclave-2:is(:hover, :focus-visible, .is-active))
@@ -383,39 +374,6 @@
         .packet-register {
         opacity: 1;
         offset-path: path("M740 288 V332");
-        animation: packet-travel var(--packet-duration) linear both;
-      }
-
-      body:has(#step-raw-full-1:is(:hover, :focus-visible, .is-active))
-        .packet-raw-full {
-        opacity: 1;
-        offset-path: path(
-          "M264 242 H288 Q296 242 296 250 V280 Q296 288 304 288 H340"
-        );
-        animation: packet-travel var(--packet-duration) linear both;
-      }
-      body:has(#step-raw-full-2:is(:hover, :focus-visible, .is-active))
-        .packet-raw-full {
-        opacity: 1;
-        offset-path: path(
-          "M340 328 H312 Q304 328 304 336 V592 Q304 600 296 600 H264"
-        );
-        animation: packet-travel var(--packet-duration) linear both;
-      }
-      body:has(#step-raw-full-3:is(:hover, :focus-visible, .is-active))
-        .packet-raw-full {
-        opacity: 1;
-        offset-path: path(
-          "M264 612 H304 Q312 612 312 604 V332 Q312 324 320 324 H340"
-        );
-        animation: packet-travel var(--packet-duration) linear both;
-      }
-      body:has(#step-raw-full-4:is(:hover, :focus-visible, .is-active))
-        .packet-raw-full {
-        opacity: 1;
-        offset-path: path(
-          "M340 300 H320 Q312 300 312 292 V254 Q312 246 304 246 H264"
-        );
         animation: packet-travel var(--packet-duration) linear both;
       }
 
@@ -615,18 +573,6 @@
       body:has(#step-register-8:is(:hover, :focus-visible, .is-active))
         .packet-register
         .icon-key,
-      body:has(#step-raw-full-1:is(:hover, :focus-visible, .is-active))
-        .packet-raw-full
-        .icon-request,
-      body:has(#step-raw-full-2:is(:hover, :focus-visible, .is-active))
-        .packet-raw-full
-        .icon-request,
-      body:has(#step-raw-full-3:is(:hover, :focus-visible, .is-active))
-        .packet-raw-full
-        .icon-lock,
-      body:has(#step-raw-full-4:is(:hover, :focus-visible, .is-active))
-        .packet-raw-full
-        .icon-lock,
       body:has(#step-raw-enclave-1:is(:hover, :focus-visible, .is-active))
         .packet-raw-enclave
         .icon-request,
@@ -1327,22 +1273,12 @@
               aria-hidden="true"
             />
             <path
-              class="workflow-route wf-raw-full wf-raw-enclave wf-inference route-raw-full-1 route-raw-enclave-1 route-inference-1"
+              class="workflow-route wf-raw-enclave wf-inference route-raw-enclave-1 route-inference-1"
               d="M264 242 H288 Q296 242 296 250 V280 Q296 288 304 288 H340"
               aria-hidden="true"
             />
             <path
-              class="workflow-route wf-raw-full route-raw-full-2"
-              d="M340 328 H312 Q304 328 304 336 V592 Q304 600 296 600 H264"
-              aria-hidden="true"
-            />
-            <path
-              class="workflow-route wf-raw-full route-raw-full-3"
-              d="M264 612 H304 Q312 612 312 604 V332 Q312 324 320 324 H340"
-              aria-hidden="true"
-            />
-            <path
-              class="workflow-route wf-raw-full wf-raw-enclave wf-inference route-raw-full-4 route-raw-enclave-6 route-inference-8"
+              class="workflow-route wf-raw-enclave wf-inference route-raw-enclave-6 route-inference-8"
               d="M340 300 H320 Q312 300 312 292 V254 Q312 246 304 246 H264"
               aria-hidden="true"
             />
@@ -1385,46 +1321,6 @@
             <!-- One icon packet per workflow; the hovered step selects its path and type. -->
             <g
               class="packet packet-register"
-              aria-hidden="true"
-              focusable="false"
-            >
-              <circle class="halo" cx="0" cy="0" r="24" />
-              <circle cx="0" cy="0" r="16" />
-              <use
-                class="packet-icon icon-request"
-                href="#packet-request"
-                x="-10"
-                y="-10"
-                width="20"
-                height="20"
-              />
-              <use
-                class="packet-icon icon-lock"
-                href="#packet-lock"
-                x="-10"
-                y="-10"
-                width="20"
-                height="20"
-              />
-              <use
-                class="packet-icon icon-key"
-                href="#packet-key"
-                x="-10"
-                y="-10"
-                width="20"
-                height="20"
-              />
-              <use
-                class="packet-icon icon-identity"
-                href="#packet-identity"
-                x="-10"
-                y="-10"
-                width="20"
-                height="20"
-              />
-            </g>
-            <g
-              class="packet packet-raw-full"
               aria-hidden="true"
               focusable="false"
             >
@@ -1918,31 +1814,6 @@
 
           <details
             class="workflow"
-            id="workflow-raw-full"
-            name="personal-server-workflow"
-          >
-            <summary>Raw read · PS Full</summary>
-            <ol>
-              <li class="workflow-step" id="step-raw-full-1" tabindex="0">
-                Builder App sends a signed read request: grant, scope, deadline.
-                No user data.
-              </li>
-              <li class="workflow-step" id="step-raw-full-2" tabindex="0">
-                The Gateway verifies builder and grant and queues the job. PS
-                Full is online and claims it.
-              </li>
-              <li class="workflow-step" id="step-raw-full-3" tabindex="0">
-                PS Full re-checks the grant, reads its already-synced local
-                data, and returns the result encrypted to the builder’s key.
-              </li>
-              <li class="workflow-step" id="step-raw-full-4" tabindex="0">
-                The Gateway returns ciphertext. Builder App decrypts.
-              </li>
-            </ol>
-          </details>
-
-          <details
-            class="workflow"
             id="workflow-raw-enclave"
             name="personal-server-workflow"
           >
@@ -2159,8 +2030,8 @@
               },
             ],
             body: [
-              "Hosts PS Full on a user-controlled machine and hands it the master-key signature through its environment.",
-            ],
+            "Hosts PS Full on a user-controlled machine and hands it the master-key signature through its environment. Collector and owner-local server only.",
+          ],
           },
           "ps-lite": {
             zone: "USER DEVICE",
@@ -2190,9 +2061,9 @@
               },
             ],
             body: [
-              "Optional Personal Server on a user device. Syncs and decrypts the owner’s data locally at startup, so reads never wait on Vana Storage.",
-              "Claims raw-read jobs from the Gateway when online, current, and capable. Never an inference target. The system stays available when it is offline.",
-            ],
+            "Optional Personal Server on a user device. Collects, encrypts, and uploads the owner’s data, and serves the owner locally (MCP, agents).",
+            "Not a builder executor in v1: the enclave answers every builder request. Kept runtime-agnostic so it can be re-admitted later.",
+          ],
           },
           gateway: {
             zone: "HOSTED + BLIND",
@@ -2227,7 +2098,7 @@
             title: "TEE 1",
             links: [
               {
-                label: "ps-enclave-orchestrator (new repo, not yet created)",
+                label: "personal-server-ts/packages/enclave (not yet created)",
                 href: null,
               },
             ],
@@ -2241,7 +2112,7 @@
             title: "PS Enclave Orchestrator",
             links: [
               {
-                label: "ps-enclave-orchestrator (new repo, not yet created)",
+                label: "personal-server-ts/packages/enclave (not yet created)",
                 href: null,
               },
             ],
@@ -2270,7 +2141,7 @@
             title: "TEE 2",
             links: [
               {
-                label: "ps-enclave-orchestrator (new repo, not yet created)",
+                label: "personal-server-ts/packages/enclave (not yet created)",
                 href: null,
               },
             ],
