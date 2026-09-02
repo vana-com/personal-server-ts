@@ -1072,14 +1072,19 @@ export function createPsLiteRuntime(
               serverOwner: options.serverOwner,
               serverSigner: x402ServerSigner,
               lineageGateway: options.lineageGateway,
-              // Recompute on refresh: a new local version marks every
-              // question that reads the scope stale.
+              // A new local version marks every question that reads the
+              // scope stale; the recompute waits for a reader.
               onDataWritten: options.derivatives
                 ? (event) =>
                     options.derivatives?.scheduler.markSourceChanged(
                       event.scope,
                       { lineageSources: event.lineageSources },
                     )
+                : undefined,
+              // And an authorized read of a derived scope is that reader.
+              onDataRead: options.derivatives
+                ? (event) =>
+                    options.derivatives?.scheduler.markDemand(event.scope)
                 : undefined,
             },
             { basePath: dataPrefix },

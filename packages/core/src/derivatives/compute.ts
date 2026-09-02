@@ -74,9 +74,9 @@ export interface QuestionComputeDeps {
   writePolicyPorts?: DataWritePolicyPorts;
   /**
    * Called after the derivative is written and the question marked ready,
-   * so a question that reads THIS derived scope recomputes in turn
-   * (A -> B -> C chains). The compute path never goes through the HTTP
-   * ingest hook.
+   * so a question that reads THIS derived scope goes stale in turn and
+   * recomputes when its own answer is read (A -> B -> C chains). The
+   * compute path never goes through the HTTP ingest hook.
    */
   onDerivedWritten?: (event: {
     scope: string;

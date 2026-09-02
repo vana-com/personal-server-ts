@@ -372,7 +372,7 @@ export async function createServer(
     logger,
     compute: (questionId) =>
       computeQuestion(questionId, {
-        // A -> B -> C: a question reading this derived scope recomputes.
+        // A -> B -> C: a question reading this derived scope goes stale.
         onDerivedWritten: (event) =>
           derivativeScheduler.markSourceChanged(event.scope, {
             lineageSources: event.lineageSources,

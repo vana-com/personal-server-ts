@@ -274,7 +274,9 @@ describe("/v1/derivatives/questions (composed app)", () => {
     expect(provider.calls).toHaveLength(1);
     expect(provider.calls[0]!.messages[1]!.content).toContain('"score":70');
 
-    // A new source version marks the question stale and recomputes.
+    // A new source version marks the question stale and computes nothing:
+    // the answer is recomputed when someone asks for it, not when the
+    // sources happen to refresh.
     nextSecond();
     expect(
       (
@@ -283,6 +285,24 @@ describe("/v1/derivatives/questions (composed app)", () => {
         })
       ).status,
     ).toBe(201);
+    await scheduler.whenIdle();
+    const stale = await app.request(`/v1/derivatives/questions/${id}`, {
+      headers: owner,
+    });
+    expect(await stale.json()).toMatchObject({
+      status: "stale",
+      derivedVersion: 1,
+    });
+    expect(provider.calls).toHaveLength(1);
+
+    // Reading the derived scope is that demand. The read answers from what
+    // is stored (it is never held up by inference) and the recompute runs
+    // behind it.
+    const demandRead = await app.request("/v1/data/coach.weekly", {
+      headers: owner,
+    });
+    expect(demandRead.status).toBe(200);
+    expect((await demandRead.json()).data.answer).toBe("fake answer");
     await scheduler.whenIdle();
     const after = await app.request(`/v1/derivatives/questions/${id}`, {
       headers: owner,
@@ -293,6 +313,11 @@ describe("/v1/derivatives/questions (composed app)", () => {
     });
     expect(provider.calls).toHaveLength(2);
     expect(provider.calls[1]!.messages[1]!.content).toContain('"score":90');
+
+    // Reading a fresh answer computes nothing more.
+    await app.request("/v1/data/coach.weekly", { headers: owner });
+    await scheduler.whenIdle();
+    expect(provider.calls).toHaveLength(2);
 
     // A write into an unrelated scope leaves it alone.
     nextSecond();

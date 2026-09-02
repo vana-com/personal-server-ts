@@ -1,6 +1,6 @@
 /**
  * Question registration: input validation, the naming rule (shared with the
- * lineage write path) and the cycle guard that keeps recompute-on-refresh
+ * lineage write path) and the cycle guard that keeps a chain of recomputes
  * bounded.
  */
 
@@ -149,10 +149,10 @@ export function parseQuestionInput(body: unknown): ParsedQuestionInput {
 }
 
 /**
- * Recompute-on-refresh follows edges source -> derived. A registration whose
- * derived scope can reach one of its own sources through other
- * registrations would recompute forever (A from B, B from A). Refuse it.
- * Returns the offending path (derived scope back to itself) or null.
+ * Staleness follows edges source -> derived. A registration whose derived
+ * scope can reach one of its own sources through other registrations would
+ * recompute forever (A from B, B from A). Refuse it. Returns the offending
+ * path (derived scope back to itself) or null.
  */
 export function findDerivationCycle(
   candidate: Pick<QuestionRegistration, "derivedScope" | "sourceScopes">,
