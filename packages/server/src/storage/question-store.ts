@@ -7,6 +7,7 @@
 import type Database from "better-sqlite3";
 import {
   matchesQuestionFilter,
+  type AnswerShape,
   type QuestionErrorCode,
   type QuestionRegisteredBy,
   type QuestionRegistration,
@@ -20,6 +21,7 @@ CREATE TABLE IF NOT EXISTS derivative_questions (
   source_scopes TEXT NOT NULL,
   question TEXT NOT NULL,
   model TEXT,
+  answer_shape TEXT,
   recompute TEXT NOT NULL DEFAULT 'on-change',
   registered_by TEXT NOT NULL,
   status TEXT NOT NULL,
@@ -45,6 +47,19 @@ function ensureErrorCodeColumn(db: Database.Database): void {
   db.exec("ALTER TABLE derivative_questions ADD COLUMN error_code TEXT");
 }
 
+/**
+ * Same in-place migration for the declared answer shape (stored as its
+ * JSON): rows written before it existed read back as null, which is the
+ * free-text answer the question was registered with.
+ */
+function ensureAnswerShapeColumn(db: Database.Database): void {
+  const columns = db
+    .prepare("PRAGMA table_info(derivative_questions)")
+    .all() as Array<{ name: string }>;
+  if (columns.some((column) => column.name === "answer_shape")) return;
+  db.exec("ALTER TABLE derivative_questions ADD COLUMN answer_shape TEXT");
+}
+
 const CREATE_INDEX_SQL =
   "CREATE INDEX IF NOT EXISTS idx_derivative_questions_derived_scope ON derivative_questions (derived_scope)";
 
@@ -59,6 +74,7 @@ interface Row {
   source_scopes: string;
   question: string;
   model: string | null;
+  answer_shape: string | null;
   recompute: QuestionRegistration["recompute"];
   registered_by: string;
   status: QuestionRegistration["status"];
@@ -78,6 +94,9 @@ function toRegistration(row: Row): QuestionRegistration {
     sourceScopes: JSON.parse(row.source_scopes) as string[],
     question: row.question,
     model: row.model,
+    answerShape: row.answer_shape
+      ? (JSON.parse(row.answer_shape) as AnswerShape)
+      : null,
     recompute: row.recompute,
     registeredBy: JSON.parse(row.registered_by) as QuestionRegisteredBy,
     status: row.status,
@@ -96,6 +115,7 @@ export function createSqliteQuestionStore(
 ): QuestionStore {
   db.exec(CREATE_TABLE_SQL);
   ensureErrorCodeColumn(db);
+  ensureAnswerShapeColumn(db);
   db.exec(CREATE_INDEX_SQL);
   const columns = db
     .prepare("PRAGMA table_info(derivative_questions)")
@@ -117,12 +137,13 @@ export function createSqliteQuestionStore(
   );
   const insertOne = db.prepare(`
     INSERT INTO derivative_questions (
-      question_id, derived_scope, source_scopes, question, model, recompute,
-      registered_by, status, error, error_code, created_at, updated_at,
+      question_id, derived_scope, source_scopes, question, model, answer_shape,
+      recompute, registered_by, status, error, error_code, created_at, updated_at,
       last_computed_at, derived_version, derived_collected_at
     ) VALUES (
       @question_id, @derived_scope, @source_scopes, @question, @model,
-      @recompute, @registered_by, @status, @error, @error_code, @created_at, @updated_at,
+      @answer_shape, @recompute, @registered_by, @status, @error, @error_code,
+      @created_at, @updated_at,
       @last_computed_at, @derived_version, @derived_collected_at
     )`);
   const updateOne = db.prepare(`
@@ -160,6 +181,9 @@ export function createSqliteQuestionStore(
         source_scopes: JSON.stringify(registration.sourceScopes),
         question: registration.question,
         model: registration.model,
+        answer_shape: registration.answerShape
+          ? JSON.stringify(registration.answerShape)
+          : null,
         recompute: registration.recompute,
         registered_by: JSON.stringify(registration.registeredBy),
         status: registration.status,

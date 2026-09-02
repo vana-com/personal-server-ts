@@ -14,6 +14,7 @@ function registration(
     sourceScopes: ["oura.sleep"],
     question: "q",
     model: null,
+    answerShape: null,
     recompute: "on-change",
     registeredBy: { kind: "owner" },
     status: "ready",
