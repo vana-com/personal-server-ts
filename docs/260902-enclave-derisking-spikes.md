@@ -6,7 +6,7 @@ Parent: `260901-personal-server-gateway-enclave-architecture.md` (decisions 19 t
 
 ## Purpose
 
-Prove or kill the four assumptions the architecture rests on before any product code is written. Output is numbers and facts in `spikes/RESULTS.md`. Code is reusable: it lands in its target package as the first real module, with tests against fakes, and the spike is a thin script over it.
+Prove or kill the four assumptions the architecture rests on before any product code is written. Output is numbers and facts in `docs/260902-enclave-spike-results.md`. Code is reusable: it lands in its target package as the first real module, with tests against fakes, and the spike is a thin script over it.
 
 ## Ground rules
 
@@ -21,7 +21,7 @@ Prove or kill the four assumptions the architecture rests on before any product 
 - Record every number with the command that produced it. A spike with no numbers is not done.
 - Kill criteria are binding. If one trips, stop, write it up, do not work around it.
 
-## Spike 0: dstack facts (done 2026-09-02, see `spikes/RESULTS.md`)
+## Spike 0: dstack facts (done 2026-09-02, see `docs/260902-enclave-spike-results.md`)
 
 Goal: replace assumptions in the architecture doc with cited facts.
 
@@ -34,11 +34,11 @@ Questions, each answered with a doc link:
 5. Does dstack OS 0.5.x allow an alternative container runtime (gVisor `runsc`) or privileged containers? Is nested virtualization exposed?
 6. Phala CLI commands to create, update, and destroy a CVM from a compose file with an explicit `app_id`.
 
-Deliverable: `spikes/RESULTS.md` section "dstack facts". Update the architecture doc's Identity section with citations.
+Deliverable: `docs/260902-enclave-spike-results.md` section "dstack facts". Update the architecture doc's Identity section with citations.
 
 Kill: none. This spike informs the others.
 
-## Spike 1: deterministic identity (passed 2026-09-02, see `spikes/RESULTS.md`)
+## Spike 1: deterministic identity (passed 2026-09-02, see `docs/260902-enclave-spike-results.md`)
 
 Goal: the same user wallet on any node with the same `app_id`, and after a compose update.
 
@@ -88,7 +88,7 @@ Record: isolation level achieved; cold start p50 and p95; hydration times; memor
 
 Kill: no isolation stronger than a plain container is possible, and the plain container leaks the dstack socket or host namespaces. Then the shared-CVM design needs one CVM per user, which changes cost and cold start.
 
-## Spike 4: blind job queue on Vercel plus Neon (local run done 2026-09-02, preview run pending; see `spikes/RESULTS.md`)
+## Spike 4: blind job queue on Vercel plus Neon (local run done 2026-09-02, preview run pending; see `docs/260902-enclave-spike-results.md`)
 
 Goal: claim latency, poll cost, and the `?wait` tier under realistic load.
 
@@ -111,7 +111,7 @@ Chain the spikes: a job submitted through the Spike 4 Gateway is claimed by the 
 
 ## Results file
 
-`spikes/RESULTS.md`, one section per spike, this shape:
+`docs/260902-enclave-spike-results.md`, one section per spike, this shape:
 
 ```text
 ## Spike N: <name>
