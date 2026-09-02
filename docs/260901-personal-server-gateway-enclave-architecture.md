@@ -1,410 +1,332 @@
-# Personal Server: Gateway + Full + Enclave
+# Personal Server: Gateway + Enclave
 
-Status: working architecture note  
-Date: 2026-09-01
+Status: working architecture note, **not ratified** (pending Anna's sign-off, see Open 1)  
+Date: 2026-09-02
 
 ## Purpose
 
-Define the proposed Personal Server architecture before producing another diagram. This document separates decisions already made from transport, lifecycle, and isolation questions that still need design work.
+Define the always-available Personal Server: a fixed Gateway URL for builders, an ephemeral per-user enclave that answers, and owner surfaces that only sign. Decisions first, then mechanics, then what is still open.
 
-### V1 decision rule
+## V1 rule
 
-Prefer the least complex design and the fewest changes to the existing stack. Security must be good enough for production, but v1 accepts bounded, explicit trust in the shared TEE Node Agent and pragmatic key reuse rather than adding new protocols for watertight isolation. Defer hardening that does not close an immediate plaintext-exposure or cross-user boundary.
+Fewest changes to the existing stack. Accept bounded, explicit trust in the shared TEE node agent and pragmatic key reuse. Defer hardening that does not close a plaintext or cross-user boundary.
 
-## Decisions so far
+Exceptions (known defects the rule must not protect):
 
-### No separate PS Edge
+1. **Gateway is refuse-only.** It may deny; it can never redirect a job, swap a key, or change registration state.
+2. **Grants are owner-signed, always.** No server-delegate minting.
+3. **Registration carries nonce and deadline.** Contract change, `DataPortabilityServers` V3.
+4. **Revocation is user-signed and settled on-chain.**
 
-The always-on coordination layer belongs in DP RPC / `data-gateway`. It is not another Personal Server and does not need a separate PS Edge product or deployment.
+The master signature stays the root of every data key in v1 by decision (see Compromise and rotation).
 
-The Data Gateway becomes the fixed Personal Server URL used by builders. It owns:
+## Decisions
 
-- request admission and authentication;
-- grant and payment checks;
-- a blind asynchronous job queue;
-- PS Full presence and capability information;
-- TEE capacity and health information;
-- runtime selection, job status, retries, and receipts;
-- ciphertext and operational metadata, but no user plaintext.
+### Product
 
-### No PS Lite server
+1. **One Personal Server per user.** Desktop and enclave identities are internal. One screen: your data, your apps, every grant with revoke.
+2. **Two user-facing states**: _on_ and _ready for apps_. Internal readiness states stay in logs and a diagnostics view. If readiness takes minutes, say so once and let the user leave.
+3. **Desktop leaves the builder read path.** Desktop collects, encrypts, uploads, and serves the owner locally. The enclave answers every builder request. Desktop-only users get no builder access (today's behaviour when the desktop is offline). The job worker stays runtime-agnostic so desktop can be re-admitted later.
+4. **No PS Lite server.** Web and mobile become wallet and consent surfaces. Stop registering PS Lite first; delete `packages/lite` after the enclave serves real users. This retires shipped code: web and mobile-shell host `packages/lite` behind `personal-server-relay` today.
+5. **External-wallet users in scope.** Owner is an EOA. Privy signs silently via Account intents; external wallets sign via prompts. Both need deterministic (RFC 6979) `personal_sign`; ERC-1271 smart wallets are out.
+6. **Mobile in scope** as onboarding with a limited connector set. Ingestion needs no PS: the app encrypts client-side, uploads to `vana-storage`, registers data points at the Gateway; the enclave syncs.
+7. **Builder private key is a server secret**, like a Stripe secret key. Results stay encrypted to it. Browser apps read through their own backend.
+8. **One SDK read call.** Direct-read versus job-path migration is hidden in the SDK. Builder writes are v1.1.
 
-The web, desktop, and mobile surfaces in `unity-surfaces` become owner-facing wallet and consent experiences only. They do not need to host an HTTP server or accept inbound builder traffic.
+### Trust
 
-This retires shipped code, not a hypothetical. `personal-server-ts/packages/lite` is a browser/WebView Personal Server with its own random identity, sync, MCP, and derivatives. `unity-surfaces/apps/web` and `apps/mobile-shell` host it today and accept builder reads and delegated writes over the `personal-server-relay` WebSocket relay. `vana-sdk` also exports a replayable `ps-lite-owner` binding message. All of this needs an explicit retirement path.
+9. **Gateway is refuse-only.** Before touching plaintext the runtime verifies: the owner-signed grant (signer equals owner; scope, grantee, expiry from the payload); the builder-signed registration with `publicKeyToAddress(publicKey) == granteeAddress == grant.granteeId`; its own owner-signed registration; and revocation state on chain over RPC, falling back to Gateway state within a 5 min staleness window. Today `policy/data-read.ts` trusts Gateway rows and the Gateway supplies the result key. Both change.
+10. **Grants owner-signed.** The `serverSigner.signGrantRegistration` delegate path is removed for the enclave and deprecated for desktop. A Vana-run enclave registered as the user's server must not be able to mint grants.
+11. **Registration nonce and deadline.** The Gateway settles the four-field owner signature into `DataPortabilityServersV2.registerServerWithSignature`, so replay protection is a V3 struct change (`nonce`, `deadline` on registration and deregistration). Bridge: Gateway refuses already-settled signatures and retired epochs; node agent refuses to derive for a retired epoch.
+12. **Revocation** is owner-signed (already true at the Gateway), settled on-chain, deletes the sealed master-signature ciphertext from every store and backup, and retires the KMS path. Re-enable uses path `v2` and a fresh registration.
+13. **Multiple user sandboxes per CVM is the design**, not a v1 compromise. Conditions: node agent small, reviewed, measurement-pinned; public claims about Vana's access match what the node agent can do. No per-user CVM trigger is defined; revisit only if a regulator or Anna's review requires it.
+14. **No data-key rotation in v1**, by decision. See Compromise and rotation.
 
-The owner surface:
+### Money and limits
 
-- authenticates the user;
-- displays and signs consent;
-- registers or revokes a Personal Server;
-- may prewarm the user's PS Enclave after login;
-- does not need a tunnel or a publicly reachable URL.
+15. **Payments from day one.** Every job carries `price` (may be zero), `payer` (builder), `paymentState`. Access receipt issues when the encrypted result is durably committed.
+16. **Inference bills two line items**, compute (per model call) and access (per derived-scope read). Builder pays both. Owner never pays for a builder's question.
+17. **Attested inference only in v1.** Standard providers are out; a later version needs a per-grant privacy class the owner consents to. No silent fallback.
+18. **Per-builder rate limits** at job admission before launch. The Gateway has none today; the relay quota is per signer, and the signer is the user's enclave wallet, so one app can burn a user's allowance and Vana's spend. Quota is attributed to the builder behind the job.
 
-### PS Full remains optional
+### Infrastructure
 
-PS Full runs on a user-controlled desktop or other local device. When it is online, current, capable of the requested operation, and reachable through the Gateway, it is the preferred executor.
+19. **Activate on the Gateway row.** Enclave serves once the row exists, marked `confirming`; rolled back if the chain rejects. A job served under a row the chain later rejects is bounded by the owner signature existing.
+20. **Queue on Vercel accepted** with conditions: the wake experiment runs through it. Trigger for a dedicated queue: p95 submit-to-claim above 2 s, sustained 50 jobs/min, or Neon connection exhaustion.
+21. **dstack verified before load-bearing.** Spike 1 (2026-09-02, Phala Cloud, dstack 0.5.9) confirmed the same wallet and sealing key on a second CVM under one `app_id` and across a compose change, and a different wallet under another `app_id`. Semantics cited from upstream in `spikes/RESULTS.md` (Spike 0). Remaining: wake-chain latency and sandbox isolation (Spikes 2 to 4).
+22. **Manual scaling.** Operator scripts in `personal-server-ts` provision CVMs with dstack tooling and admit or drain them through Gateway operator-only endpoints. No Fleet Director. `data-gateway` has no admin UI; `apps/metrics` is product analytics, not a Gateway console.
+23. **All enclave code in `personal-server-ts`.** No new repo. Agent and PS image ship in one compose, one approved hash.
+24. **Key reuse.** Registered secp256k1 keys serve as ECIES inbox (enclave) and result key (builder). Already shipped in the SDK. Separate keys deferred unless review finds a concrete flaw.
+25. **Question intents live in Gateway control state**, encrypted. Grant readiness and answer readiness are separate. Builder receives an answer-only DTO; lineage stays owner-side.
+26. **Phala KMS (off-chain) anchors the fleet `app_id`** in v1: `--custom-app-id` with a nonce; the Phala Cloud workspace account approves compose changes; no per-device revocation, so node compromise is handled by drain, compose-hash rotation, and re-provisioning. On-chain KMS is the upgrade path if contract-owned approval or `removeDevice` becomes a requirement. Keys derived under the two modes differ, so switching is a re-provisioning event.
 
-PS Full is an optimization for user control and cost. The system must remain available when it is offline.
+### Requires sign-off: reversal of the June browser-PS decision
 
-### PS Enclave is the always-available fallback
+In June the PS stayed in the browser so Vana never holds user data on its own machines. This design reverses that: Vana-operated hardware holds plaintext transiently inside an attested sandbox and holds the sealed data-unlock secret durably; Vana cannot read either outside the enclave, but Vana operates the enclave and the KMS is Phala's. Consent copy must state the revocation guarantee: revoking deletes Vana's sealed copy of the secret and retires the identity. That guarantee is operational (deletion plus node-agent refusal), not cryptographic; dstack cannot revoke a deterministic key. Anna signs off before this note is final.
 
-The TEE creates a wallet for the user's PS Enclave. The owner explicitly consents to registering that wallet and its public key as one of their Personal Servers.
+## Components
 
-The PS Enclave wallet and data keys are allowed to exist in plaintext inside the attested TEE. They must not be exposed to the Data Gateway, TEE host operator, or another user's sandbox.
+| Component               | Role                                                                                             | Sees                                                  |
+| ----------------------- | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------- |
+| Data Gateway (`dp-rpc`) | Fixed PS URL. Auth, grants, payment, rate limits, blind job queue, TEE registry, inference relay | Signed metadata, ciphertext                           |
+| Vana Storage (R2)       | Encrypted blobs `{owner}/{scope}/{version}`                                                      | Ciphertext                                            |
+| TEE node (dstack CVM)   | Node agent plus one gVisor sandbox per active user                                               | Plaintext inside sandboxes; agent in every user's TCB |
+| PS Enclave              | Ephemeral per-user PS. Wallet and master signature in memory only                                | Own user's plaintext                                  |
+| Private inference       | Attested provider (Phala) via Gateway blind relay                                                | Encrypted prompt                                      |
+| Desktop (PS Full)       | Collector and owner-local server. Not a builder executor                                         | Own plaintext                                         |
+| Web, mobile             | Wallet and consent. No server                                                                    | Nothing at rest beyond cached signature               |
 
-The wallet must be stable across sandbox teardown and movement between TEE nodes. A new random wallet on every wake would require repeated owner registration and would change the PS identity.
+## Identity and keys
 
-#### Near-term wallet derivation
+**Enclave wallet.** `userPsId = keccak256("vana.ps-enclave.v1" || chainId || ownerAddress)`. The node key agent calls dstack v0 `getKey(path)` with `users/{userPsId}/wallet/ethereum/secp256k1/v1`. Verified upstream (Spike 0, `spikes/RESULTS.md`): KMS derives the app root key from its root and `app_id` only; the guest derives `HKDF-SHA256(app_root, path)`. `purpose` and `algorithm` do not enter the KDF, so the path string is the only separation. Every CVM with the same `app_id` recovers the same wallet; `compose_hash` and `instance_id` are not inputs. Pin SDK `@phala/dstack-sdk` 0.5.8 and dstack OS 0.5.x: the 0.6 `/v1` API uses a different KDF, so an OS major bump is a re-provisioning event, not a rolling upgrade. Wallet bytes are the raw 32-byte key (not `toViemAccountSecure`), recorded once and never changed.
 
-Use dstack KMS deterministic key derivation instead of persisting a randomly generated wallet file.
+`app_id` is a namespace, not proof of code. Separately require attestation, approved OS image, approved `compose_hash`, pinned image digests. Two ways to pin `app_id`: Phala KMS (`--custom-app-id` with a nonce; Phala's control plane approves compose changes for the workspace) or on-chain KMS (`app_id` is a `DstackApp` contract address; the contract owner calls `addComposeHash`/`removeComposeHash`, and several hashes can be live for rolling upgrades). Decision 26 picks. Second and later nodes are `phala cvms replicate`, not fresh deploys. Persist only public data. Never derive this wallet from the master signature: desktop holds that secret and could impersonate the enclave.
 
-1. Define a public user Personal Server identifier:
+**Identity before registration.** The key agent derives the wallet without starting a sandbox and returns address, public key, derivation metadata, and attestation evidence. The owner signs against that.
 
-   ```text
-   userPsId = keccak256("vana.ps-enclave.v1" || chainId || ownerAddress)
-   ```
+**Data root.** Scope keys derive from the raw 65-byte `vana-master-key-v1` signature (`vana-sdk/.../crypto/keys/derive.ts`), not from any wallet. A different signature strands every blob, so the enclave needs the exact bytes. Desktop already ships them as `VANA_MASTER_KEY_SIGNATURE`.
 
-2. Run each horizontally interchangeable TEE node with the same approved dstack application identity. In the initial shared-CVM design, a trusted key agent inside that CVM requests `GetKey("users/{userPsId}/wallet/ethereum/secp256k1/v1")`.
-3. dstack binds deterministic key derivation to the outer CVM's application identity and the path, so the same approved application identity and user path recover the same wallet on any authorized node.
-4. Persist only the public address, public key, derivation version, application identity, and registration. Do not store the wallet private key in R2, the Gateway, or a node-local sealed file.
-5. Revoking the registered PS prevents that identity from serving future requests. A future key epoch can use a new derivation path and owner-approved registration.
+**Sealing.** The owner surface delivers the signature over an attested channel. Inside the TEE: random per-user content key encrypts the signature; `GetKey("users/{userPsId}/secrets/master-signature/v1")` wraps the content key. Ciphertext is bound to `userPsId` as AAD so a node cannot be tricked into unsealing user A's secret for user B's sandbox. Only ciphertext persists. Wallet path and sealing path are domain-separated. Envelope form makes vendor exit one re-wrap job. On wake the node unwraps in memory and injects `VANA_MASTER_KEY_SIGNATURE` into the sandbox only.
 
-The dstack `app_id` is the stable cryptographic namespace of the outer PS Enclave application. Conceptually, KMS first scopes its root to `app_id`, then derives the requested path beneath that application root. The same KMS root, `app_id`, and path produce the same key; another application using the same path does not. This is what lets horizontally interchangeable nodes recover the same user identities without sharing a mnemonic or wallet files.
+**PS changes required** (`packages/server/src/bootstrap.ts:196-226`): PS never deletes the variable from `process.env` and keeps the raw signature in a closure; the dev UI (default on) serves it to the browser as `psLiteBootstrap`; frpc inherits the full env; `VANA_OWNER_PRIVATE_KEY` is a second secret. The enclave profile disables dev UI and tunnel, scrubs env, never sets the owner key, and any future subprocess uses an allowlisted env, separate UID, restricted `/proc`. JavaScript cannot zeroize; sandbox destruction is the final boundary.
 
-For the shared-CVM MVP, explicitly pin one production PS Enclave fleet `app_id` across every node and normal runtime upgrade. Do not let it default to a changing compose digest or every upgrade may change every wallet. Treat the stable `app_id` only as a key namespace—not proof of approved code—and separately require valid attestation, approved dstack OS/TCB state, approved `compose_hash` and pinned PS image digests before admitting a node or releasing keys. Rolling upgrades temporarily allow both old and new approved measurements while preserving the same `app_id`.
+**Shared-CVM trust.** `app_id` identifies the outer CVM, not the inner sandbox. The node agent can derive every user's path. Sandboxes never receive the dstack socket, Docker socket, host filesystem, or another user's mounts. KMS-enforced per-user isolation needs one CVM per user; deferred (decision 13).
 
-This has an explicit trust consequence: dstack `app_id` identifies the outer confidential VM, not an inner gVisor, container, or nested sandbox. In a shared CVM, the node key agent and coordinator are in every user's trusted computing base and can technically derive every user's path. Inner user sandboxes must never receive the dstack socket; they receive only their own derived key through a narrow, memory-only handoff. The coordinator must validate the Gateway's authenticated user/job binding before asking the key agent for that path.
+### Compromise and rotation
 
-If Vana requires KMS-enforced isolation even from the node coordinator, each user must run as a separately attested CVM with a user-specific application identity, or Vana must build a user-aware key service that can authenticate the inner sandbox boundary. Ordinary containers or gVisor inside one CVM do not provide a hardware-attested identity that dstack KMS can distinguish. The near-term shared-CVM model accepts the coordinator in the TCB to keep density and cold starts practical.
+- **Node compromise.** Drain, quarantine, remove its measurement, rotate compose hash. On-chain KMS supports `removeDevice` and `removeComposeHash`; Phala KMS exposes no per-device control. Users active on it have an exposed data root; notify. No re-key in v1.
+- **KMS root compromise.** Delete all sealed rows, move to sealing path `v2`, re-provision every user under fresh consent.
+- **User rotation.** Revoke and re-enable gives a new identity and sealing. The data root cannot rotate.
+- **Before GA**: data root key (DRK) with epochs. Random per-user key wrapped to the master signature; scope keys derive from `DRK || epoch`. Rotation is a new epoch plus background re-encryption. Cost: key-management design, one-time migration of every blob, epoch metadata. Per-scope escrow costs the same migration with more keys.
+- **Vendor exit.** Re-wrap content keys inside the old enclave while the old KMS is alive. No Vana-held second wrap: Vana never holds a path to the data root outside the enclave. Proposed to Anna as the stance.
 
-In both models, attestation policy must bind the stable application identity to approved runtime measurements. A custom `app_id` alone is not proof that approved code is running.
+## Encryption layers
 
-The address cannot be calculated publicly from a secret KMS root. During onboarding, the attested node key agent should derive the wallet without starting the full PS and return its address, public key, derivation metadata, and verifiable KMS/attestation evidence before the owner signs registration. This does not require syncing R2 data or keeping a user sandbox warm. Once registered, any approved TEE node with the same dstack application identity can recover the same wallet on demand.
+| Layer            | Scheme                                                              | Note                                                                                                                                                |
+| ---------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Stored data      | master signature → HKDF scope key → OpenPGP blob                    | Unchanged                                                                                                                                           |
+| Builder messages | SDK ECIES (secp256k1, AES-256-CBC + HMAC) to registered keys        | No AAD, no recipient binding, no sender auth. Job, grant, deadline, builder key bind inside the plaintext under a signature. HashCloak audit exists |
+| PS → inference   | Phala E2EE v2, X25519 + HKDF + AES-GCM per field, via Gateway relay | Default `inference.baseUrl` is direct Phala; relay only when configured                                                                             |
 
-Do not derive this enclave wallet from the user's existing Vana master-key signature. PS Full also holds that secret; deriving the enclave signing identity from it would allow a compromised PS Full to impersonate PS Enclave.
+ECIES wire format is `iv(16) || ephemPub(65) || ct || mac(32)`. Gateway stores builder and server keys as unvalidated strings, so the SDK normalises 33/64/65-byte forms at the boundary. Moving to one deterministic enclave inbox removes the old `prepare → select → encrypt` round trip and any multi-recipient envelope.
 
-#### Wallet recovery is not data-key recovery
+**Phala relay flow (exists today, `packages/core/src/derivatives/e2ee/`):**
 
-The deterministic PS wallet authenticates the enclave to the Gateway, storage, and protocol. It does not decrypt the user's R2 blobs. Current scope keys are derived from the exact raw `vana-master-key-v1` owner signature, not from the owner address or PS wallet.
+1. PS signs `GET /v1/inference/aci/attestation?nonce=<32 bytes>` with its server wallet; Gateway checks the signer is the owner or a live registered PS, injects the Phala key, relays bytes.
+2. PS validates the ACI report: nonce, canonical workload-keyset digest, freshness, E2EE v2, X25519 key shape.
+3. PS encrypts each prompt field with a fresh ephemeral X25519 key; AAD binds purpose, algo, model, field path, nonce, timestamp.
+4. PS signs the exact encrypted bytes and posts `/v1/inference/chat/completions`; Gateway checks signature and quota, injects the key, byte-relays request and response. PS decrypts. No streaming today.
 
-During owner provisioning, the owner surface must deliver that exact signature through an attested encrypted channel. Inside the TEE, it should be encrypted under a separate deterministic sealing key such as `GetKey("users/{userPsId}/secrets/master-signature/v1")`; only the ciphertext is persisted. On another node, the approved TEE application recovers the same sealing key, unwraps the signature in memory, and derives the existing scope keys. The PS wallet key and master-signature sealing key must use different domain-separated paths.
+Gaps to close: DCAP `verifyEvidence` unwired; unsigned fallback to `inference.phala.com` on 404/405; legacy unchallenged `/v1/inference/attestation/report`. Fail closed in production.
 
-For v1, inject the unwrapped signature into the user sandbox as the existing `VANA_MASTER_KEY_SIGNATURE` environment variable. Desktop PS Full already uses exactly this mechanism (`unity-surfaces/apps/desktop/personal-server/index.js:821-823`). The variable exists only in the user sandbox, is never placed in the outer Node Agent environment, and is never logged or persisted.
+## Job model
 
-Current PS behaviour falls short of that target. Required changes (`packages/server/src/bootstrap.ts:196-226`):
+`jobId`; owner, builder, grant, scope, operation; encrypted request or pointer; pinned scope version; assigned node and assignment expiry; state `queued | claimed | running | completed | failed | expired | cancelled`; claim owner and expiry; `claimed_at`, `completed_at`, `deadline_at`; attempt and `failure_reason`; encrypted result pointer, hash, size, expiry; `price`, `payer`, `paymentState`, receipts.
 
-- PS validates the signature and derives the master key at boot but never deletes it from `process.env`. It also keeps the raw signature in a closure and passes it into `createApp` as `ownerSignature`.
-- With `devUi.enabled` (default `true`) the raw signature is served to the browser as `psLiteBootstrap` JSON on `/ui` (`packages/server/src/app.ts:385-396`). The enclave profile must disable this.
-- The frpc subprocess is spawned without an `env` option and inherits the full environment (`packages/server/src/tunnel/manager.ts:262`). There are no agent/tool subprocesses yet; MCP tools run in-process. Any future subprocess must use an explicit allowlisted environment (precedent: `pdpp/reference-implementation/runtime/connector-child-environment.ts`), a separate unprivileged UID, and restricted `/proc`/ptrace access.
-- `VANA_OWNER_PRIVATE_KEY` is a second secret env var read at boot and cross-checked against the owner. The enclave profile must never set it.
+Login may prewarm the sandbox; it cannot be the only trigger, because a builder may submit while the owner is logged out. An authorized job wakes or creates the sandbox on demand.
 
-Core dumps and debug environment endpoints remain disabled. JavaScript cannot guarantee zeroization, so sandbox destruction is the final cleanup boundary; this is an accepted v1 tradeoff.
+Runtimes pull: heartbeat and claim from the Gateway, no inbound connections. Queue in Postgres; the claim is one `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING` statement, no explicit transaction (Spike 4, `spikes/RESULTS.md`). Lease plus fencing plus sweep-before-claim recovered a killed worker in 13.8 s without a cron. A 1 s claim poll sets the submit-to-claim floor (p50 ≈ half the interval per idle worker) and costs 60 invocations per worker per minute idle; decide before launch between a long-poll claim (`/v1/jobs/claim?wait=25`) and backoff on 204. Fast tier: `POST /v1/jobs?wait=25` holds up to 25 s and returns inline, else `202` and the SDK polls. Metadata-only webhooks v1.1. Large results stream-encrypt to a private R2 bucket and return a handle.
 
-Do not ask the wallet to recreate the signature on every wake. A changed signature would derive different scope keys and strand previously encrypted blobs. Revocation and rotation of this durable data-root secret require a separate migration/re-encryption design from PS wallet rotation.
+Duplicate execution around an ambiguous failure is answered by stable `jobId` and idempotent commit. With desktop out of the read path there is one executor per user, so no presence TTL, per-user lease, or storage conditional PUT in v1. Raw-read version is pinned at admission; retries return identical bytes.
 
-### Shared-CVM isolation for v1
+## Workflows
 
-V1 uses one multi-user outer dstack CVM with a trusted Node Agent and one gVisor-class sandbox per active user. The Node Agent is explicitly inside every user's trusted computing base. One outer CVM per user and nested microVM isolation are deferred.
+Target flows. None exists yet.
 
-The coordinator runs once per TEE node. It creates, monitors, and destroys user sandboxes, but should not mount several users' plaintext into its own filesystem or expose a privileged Docker socket to a sandbox.
+### 1. Register the enclave
 
-### Prewarm is an optimization
+1. Web asks the Gateway to prepare the identity; a node derives it and returns public identity plus evidence. No sandbox starts.
+2. Web verifies evidence: the Gateway has already admitted the node after DCAP, and the browser verifies the two-link `signature_chain` (app root key over the derived key; KMS root over `app_id || app_root_pubkey`) against the pinned KMS anchor `DstackKms.kmsInfo().k256Pubkey`, and that `app_id` is ours. This is a secp256k1 signature chain, not an X.509 chain. Web shows one prompt: "Enable your always-on Personal Server", including the revocation guarantee.
+3. Two signatures under that consent: registration (EIP-712) and the master-key `personal_sign`. Silent for Privy, prompts for external wallets, one if the master signature is cached from login. No background signing afterwards.
+4. Web submits registration to `POST /v1/servers` with the Gateway URL. Row is `confirming`; enclave is _on_. Gateway settles on-chain.
+5. Web sends the master signature over the attested channel; the TEE seals it; ciphertext persists as a Gateway Postgres row; delete-on-revoke covers Neon backups within the PITR window.
+6. Prewarm provisions the sandbox; _ready for apps_ when scopes hydrate.
 
-Login may prewarm the user's sandbox and begin data synchronization. It cannot be the only activation trigger because a builder may submit an authorized request while the owner is logged out.
+Today web couples registration to a booted PS Lite with a relay URL (`web-personal-server-session.ts:843-883`). Registration fee, when enabled on chain, returns 503 because escrow supports only `grant` and `data_access`.
 
-An authorized builder request must also be able to wake or create the sandbox on demand.
+**Desktop migration.** Existing desktop registrations use tunnel URLs; the Gateway URL is a new `serverId`. Desktop shows one prompt; the owner signs new registration plus old deregistration. Old row is `retiring` until settled, `stale` after 30 days without presence. If the user never opens desktop, enabling the enclave from web or mobile includes deregistering stale desktop rows.
 
-### Private inference remains swappable
+### 2. Builder raw read
 
-For v1, all builder-triggered inference runs in PS Enclave. PS Full is not an inference target. This gives builders one stable encrypted inbox—the registered deterministic enclave key—and allows the Gateway to retry an inference job on any admitted TEE node without placement negotiation or builder re-encryption.
+1. Builder submits signed metadata: grant, scope, deadline, idempotency key. No user data, no encryption.
+2. Gateway verifies builder, grant, payment policy, rate limits; queues with `price`, `payer`.
+3. A node claims, derives the wallet, unseals the signature, starts or reuses the sandbox, hydrates only the pinned scope and version.
+4. PS verifies grant, registration, and builder key from signed artifacts; checks revocation on chain; redacts grantee-hidden fields; encrypts to the builder key; commits ciphertext. Receipt issues.
+5. Builder fetches, verifies, decrypts. Lost acknowledgement never loses the result.
 
-PS Enclave may call a selected inference provider. The provider can be private and attested, such as Tinfoil, or a standard provider such as Gemini when the user and grant permit that privacy class.
+Today: DCR returns a per-user `personalServerUrl` (Account, not Gateway); SDK readers call `res.json()` and cannot read binary; PS ignores `grant.status` and `paymentStatus` while the Gateway requires `confirmed|finalized` and `paid`; payment happens before delivery.
 
-There must be no silent fallback from private inference to a non-private provider.
+### 3. Inference answer
 
-## Proposed request lifecycle
+1. Owner approves question, source scopes, derived scope. Intent stored inactive in the Gateway, encrypted to the enclave key.
+2. Owner-signed grant to the derived scope only. Today a builder question needs bare read on every source scope (`DERIVATIVE_SOURCE_NOT_GRANTED`) and web mints `dcr.scopes` verbatim; this is a consent-model change. The builder proposes the question at DCR; the owner approves the exact text and scopes; the enclave matches the ciphertext to the approved intent.
+3. Gateway places the compute job after grant commit. Enclave hydrates source scopes, verifies the question matches the approved intent, builds a bounded prompt, sends it over the Phala relay.
+4. PS decrypts the answer, records lineage owner-side, encrypts an answer-only DTO to the builder. Durable before complete. Two receipts: compute and access.
 
-### 1. Owner registration
+Today: question registrations live in one PS's SQLite; web starts compute without awaiting, then mints the grant; payload includes question, evidence, and sources.
 
-1. The Gateway computes the public `userPsId` and places an identity-only provisioning request on an eligible attested TEE node.
-2. The node's trusted key agent asks dstack KMS for the deterministic user wallet path and returns only its address, public key, derivation metadata, and evidence.
-3. The owner surface verifies or displays the attested PS identity and requested capabilities.
-4. The owner consents and signs the server registration.
-5. The Data Gateway records the PS address, public key, capabilities, derivation version, application identity, and revocation state.
-6. The key agent wipes the derived private key from the provisioning operation. No private wallet state needs to be persisted.
+### 4. Sandbox TTL and wake
 
-The current Gateway already models Personal Servers with an owner address, server address, public key, and URL (`data-gateway/db/schema.ts:161-258`). The public key is not a separate encryption key: registration requires an uncompressed secp256k1 key whose address equals `serverAddress` (`api/v1/servers.ts:315-348`), so it is the signing key. The new design changes the URL into the stable Gateway address plus internal runtime routing rather than exposing each runtime directly.
+1. Idle TTL: `warm → expiring` atomically; cancel if a job arrives. Destroy sandbox, tmpfs, plaintext SQLite. Keep only encrypted manifest and index caches.
+2. Next job: Gateway creates or joins one per-user startup assignment on an admitted node.
+3. Node derives the wallet, unseals, injects, starts the enclave profile. PS verifies its own registration, reconciles manifest and tombstones, hydrates, reports readiness.
+4. Inference ciphertext is retryable on any node because every node derives the same key.
 
-Two constraints follow. `serverId = keccak256(domain, serverAddress, publicKey, serverUrl)` on both Gateway and chain (`lib/servers.ts:59-76`), so moving an existing PS to the Gateway URL creates a new `serverId`. The owner-signed typed data has four fields (owner, server, public key, URL) with no nonce or deadline (`vana-sdk/.../protocol/eip712.ts:139-146`), so capabilities, derivation version, and application identity are Gateway-asserted unless the SDK typed data grows, and a registration signature is replayable for the same tuple.
+Today: `/health` is process health only and green during reconciliation; PS never checks at execution that it is still registered.
 
-### 2. Warm-up
+### 5. Operator adds a TEE
+
+1. Operator runs `scripts/tee/provision` (dstack tooling, pinned `app_id`, approved compose, pinned image) and registers the node's expected identity via an operator-only endpoint (separate operator secret, not `CRON_SECRET`).
+2. Node answers a nonce challenge; verifier checks quote, OS/TCB, `app_id`, `compose_hash`, transport key, KMS-root fingerprint.
+3. Node verifies the PS image, runs a KMS derivation canary, heartbeats `ready`.
+4. Operator admits. Gateway alone reserves capacity.
+5. Drain: stop claims, finish, wipe, destroy.
 
-1. Login sends a prewarm request to the Gateway.
-2. The Gateway checks whether an eligible sandbox is already active.
-3. If not, it selects a TEE node with capacity.
-4. The node key agent derives the deterministic wallet and hands only that user's key to the new sandbox in memory; the sandbox then lazy-loads the minimum data needed.
-5. The sandbox remains warm for an activity-based TTL, for example one hour.
+Today: no node, admission, or capacity state exists. KMS authorization and Gateway admission are separate gates; a wrong KMS root looks healthy but derives every wallet wrong, hence the canary. Outer-CVM attestation does not approve the PS image the agent pulls; image digest pinning does.
+
+### Invariants across workflows
+
+- Registration, chain activation, node presence, process health, scope readiness, grant readiness, answer readiness are separate states. Registration never implies data is ready.
+- Gateway checks declared metadata; the runtime reauthorizes against signed artifacts immediately before plaintext. Gateway is refuse-only.
+- Every claim and completion is fenced and idempotent; side-effecting work has stronger serialization.
+- Gateway sees signed control metadata, never plaintext, questions, results, owner signatures, or keys.
+- Node agent is in every user's TCB; sandboxes never receive dstack or host-control sockets.
+- Revocation reaches Gateway placement, runtime execution and result fetch, storage delegation, and KMS release.
 
-### 3. Builder request
+## Ownership
 
-1. For a raw read, the builder submits signed control metadata—grant, scope, deadline, and idempotency key. The request contains no user data and does not need application-layer encryption. Gateway resolves the builder's existing registered public key for the response.
-2. For inference, the builder encrypts the question directly to the user's registered deterministic PS Enclave key and submits the ciphertext with signed job metadata.
-3. Gateway verifies the builder, grant, scope, payment policy, size, and rate limits. It may route raw reads to present PS Full or PS Enclave; inference always routes to PS Enclave.
-4. The selected runtime claims the job, reauthorizes it, decrypts only the granted data, and performs the operation.
-5. The PS encrypts the raw result or answer to the builder before it leaves the runtime. Gateway stores or relays ciphertext only.
+Legend: `+` new, `~` edit, `−` deprecate after a real user runs the new path end to end.
 
-## Encryption model
+### personal-server-ts
+
+```text
+packages/core        ~ scope-filtered sync port, signed-artifact reauth (grant, registration, builder key),
+                       chain revocation check, answer-only derivative DTO, portable question intents,
+                       ECIES result envelope, readiness state
+packages/server      ~ enclave profile: key-provider port (no key.json), env scrub, dev UI off,
+                       drain/readiness endpoints
+                     + jobs/ worker: pull, claim, execute, commit (runtime-agnostic)
+                     ~ desktop profile: collector and owner-local server only; tunnel optional, then removed
+packages/enclave     + node agent: heartbeat, claim, sandbox lifecycle, dstack key agent, envelope sealing
+packages/lite        − retire after PS Lite stops being registered and the enclave serves real users
+deploy/dstack        + CVM compose pinning agent + PS digests
+scripts/tee          + provision, admit, drain, list
+```
 
-Use three encryption layers with distinct jobs. PS wallets are authentication identities; they do not derive the keys that encrypt R2 data.
+Dependency direction: `enclave` imports `server` and `core` public APIs; nothing in `core` or `server` imports `enclave` or touches the dstack socket. The sandbox never receives the dstack socket, host filesystem, Docker socket, or another user's mounts.
 
-| Layer                   | Scheme                                                                   | Purpose                                                                                                                                          |
-| ----------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Stored user data        | Existing master-signature → per-scope key → encrypted R2 blob            | Lets PS Full and PS Enclave read the same data when both receive the exact user data root. Keep unchanged.                                       |
-| Builder messages        | Vana secp256k1 ECIES envelope using registered PS/builder public keys    | Encrypt inference questions to PS Enclave and encrypt raw results/answers to builders. Raw-read control metadata remains signed but unencrypted. |
-| PS → inference provider | Existing Phala E2EE v2 using attested X25519 + HKDF-SHA256 + AES-256-GCM | Protects the expanded prompt and answer from the Data Gateway while the external model computes.                                                 |
+### data-gateway
 
-V1 reuses the registered PS Enclave secp256k1 public key as its stable encrypted inbox and the registered builder public key for results. This signing/ECDH key reuse is already shipped: the SDK's `encryptWithWalletPublicKey` encrypts to EOA keys, and PS registers the same key it signs with. Separately derived inbox and per-job response keys are deferred unless a focused cryptographic review finds a concrete vulnerability in the existing ECIES construction (HashCloak audit, `vana-sdk/audits/2025-10-hashcloak-ecies-audit.pdf`).
+```text
+api/v1/jobs          + builder submit (with ?wait=25), status, result fetch; runtime claim, heartbeat, complete, fail
+api/v1/tee-nodes     + attestation challenge, heartbeat; operator admit, drain, list
+api/v1/identity      + identity-only derivation request; sealed master-signature store (Postgres row,
+                       delete on revoke incl. backups)
+api/v1/servers       ~ Gateway URL as serverUrl; several identities per owner; V3 nonce/deadline;
+                       replay and retired-epoch refusal; desktop migration (retiring, stale)
+api/v1/inference     ~ quota attributed to the builder behind the job; remove unchallenged attestation route
+lib/rate-limit       + per-builder and per owner-builder token buckets at job admission (none exists today)
+lib/receipts         + price, payer, paymentState on every job; access and compute receipts
+lib/liveness         ~ one server-liveness predicate replacing the current three
+                       (writes: any non-revoked server; lineage reads and inference: confirmed|finalized and paid)
+lib/tee              + DCAP verifier, measurement policy, KMS derivation canary
+lib/operator-auth    ~ operator secret or allowlist separate from cron secret
+db                   + tee_nodes, jobs, job_attempts, result_handles, identity_records, sealed_secrets,
+                       question_intents
+storage              + private R2 bucket for large ciphertext results (no object storage exists today)
+cron                 + expire claims, purge result handles, mark stale registrations
+```
 
-The SDK ECIES is eccrypto-compatible: ECDH x-coordinate → SHA-512 → AES-256-CBC + HMAC-SHA256, wire `iv || ephemPub || ct || mac` (`vana-sdk/packages/vana-sdk/src/crypto/ecies/base.ts`). It has no AAD, does not bind the recipient key, has no version byte, and no sender authentication. Job, grant, deadline, and builder-key binding therefore go inside the plaintext under a separate signature; the envelope alone cannot provide them. Gateway stores builder and server keys as unvalidated strings, so the SDK must normalise 33/64/65-byte forms at the boundary.
+Pull-based: nodes heartbeat and claim, no inbound connections. Queue in Postgres with `FOR UPDATE SKIP LOCKED` (existing `settlement_outbox` pattern). Vercel caps functions at 300 s; Postgres is Neon over WebSocket.
 
-### Existing PS → Phala inference E2EE
+### vana-sdk
 
-The remembered inference flow is present in the current checkouts. Note the default `inference.baseUrl` is `https://inference.phala.com/v1`, direct to Phala (`packages/core/src/schemas/server-config.ts:63`); the relay path below applies only when `INFERENCE_BASE_URL` points at the Gateway. The precise responsibility split is:
+```text
+protocol/jobs        + job, claim, heartbeat, result-handle types shared by Gateway, PS, agent
+protocol/identity    + enclave identity evidence types
+protocol/eip712      ~ registration and deregistration typed data gain nonce and deadline (V3)
+crypto/envelope      + ECIES message envelope with inner binding (job, grant, deadline, builder key) + signature
+direct/              ~ one read call: submit → wait/poll → decrypt; binary results; direct read hidden behind
+                       migration flag
+direct/access-request-client ~ DCR returns the Gateway URL
+ingest/              + client-side collect, encrypt, upload, register data points (mobile and web, no PS)
+protocol/personal-server-write ~ through the Gateway job path (v1.1)
+personal-server-lite/ − retire owner-binding message with PS Lite
+```
 
-1. The PS generates a fresh 32-byte nonce and signs `GET /v1/inference/aci/attestation?nonce=...` with its registered server wallet.
-2. The Data Gateway checks that the signer is the owner or a live registered PS, injects its Phala API key, and relays the attestation response byte for byte.
-3. The PS validates the ACI report's nonce, canonical workload-keyset digest, freshness, advertised E2EE version, and X25519 key shape.
-4. The PS creates an ephemeral X25519 keypair and encrypts each prompt content field with X25519 + HKDF-SHA256 + AES-256-GCM. The authenticated data binds the model, nonce, timestamp, and field path.
-5. The PS signs the exact encrypted request bytes and sends `POST /v1/inference/chat/completions` to the Data Gateway.
-6. The Gateway checks the signature and quota, injects the Phala API key, and forwards the exact body and E2EE headers. It does not encrypt or decrypt the content.
-7. Phala encrypts response fields to the PS's ephemeral client key. The Gateway byte-relays the JSON or SSE response, and the PS decrypts it. PS does not currently request streaming.
+Job protocol types live here, not in `packages/enclave`, so Gateway, PS, and agent import one definition. SDK docs state: builder private key is a server secret; browser apps read through their own backend.
 
-For v1, only PS Enclave uses this path for builder-triggered inference. It does **not** by itself protect the Builder → PS question or the PS → Builder answer; those use the Vana ECIES envelope above.
+### unity-surfaces
 
-There are three material security gaps in the current path:
+```text
+apps/account
+  lib/signing        ~ reuse registration and owner-binding intents; + attested-channel delivery of the master signature
+  DCR API            ~ return Gateway URL; question intents to Gateway; derived-scope-only, owner-signed grants
+apps/web
+  features/personal-server − PS Lite runtime and relay client
+                     + enclave client: identity prep, evidence check (KMS cert chain, app_id), registration submit,
+                       prewarm, status
+  consent            + "Enable your always-on Personal Server": identity, evidence, revocation guarantee,
+                       one consent, two signatures
+                     + two user states (on, ready for apps); diagnostics view for internal states
+                     ~ DCR approval: owner approves question text and scopes; derived-scope-only grant;
+                       await answer readiness
+                     + one Personal Server screen: your data, your apps, every grant with revoke
+apps/mobile, mobile-shell − WebView PS Lite, relay, ps bundle
+                     + ingest via SDK with a limited connector set; sign-in triggers prewarm; same consent screens
+apps/desktop         ~ collector and owner-local only; one-prompt migration to Gateway URL registration;
+                       tunnel optional, then gone
+```
 
-1. Full TDX/DCAP quote verification is an optional `verifyEvidence` hook and is not wired by the server bootstrap. Without it, the client verifies the nonce-to-keyset binding and internal report structure, but ultimately trusts the report received from the configured TLS origin.
-2. When the relay answers 404/405 for `/aci/attestation`, the client falls back unsigned to `https://inference.phala.com/v1` (`attestation.ts:383-408`), widening the trusted origin.
-3. Gateway also exposes a legacy unchallenged `GET /v1/inference/attestation/report` behind the same auth bar.
+### vana-storage
 
-Production should fail closed unless the hardware evidence, measurements, and approved runtime policy have been verified. The relay authorises the server address or the owner address of any live registration and enforces a per-signer daily quota (`INFERENCE_SIGNER_REQUESTS_PER_DAY`, default 20) plus a global budget on one shared operator key (`data-gateway/db/schema.ts:1687,1724`). Making PS Enclave the sole inference executor needs a quota model.
+```text
+auth/gateway-client  ~ adopt the inference relay's liveness predicate; revocation-aware cache (60 s positive cache today)
+middleware/auth      = blob GET/HEAD stay public by decision; security rests on keys
+blobs                = no conditional PUT needed in v1 (single executor per user); range reads only if profiling justifies
+```
 
-### Builder → PS message flow
+### Other repositories
 
-Raw reads do not need an encrypted request. The signed request contains only control metadata already required by the Gateway for authorization and routing. Gateway may choose PS Full or PS Enclave after submission, and the selected runtime encrypts the raw result to the builder.
+- `vana-smart-contracts`: `~` `DataPortabilityServers` V3 adds `nonce` and `deadline` to `ServerRegistration` and `ServerDeregistration`. `serverAddress` stays a permanent global claim; `publicKey` immutable; grant content an off-chain URI.
+- `personal-server-relay`, `vana-frp`: `−` after SDK migration. Load-bearing today; keep running through the transition.
+- Builder apps such as `playlist-shelf-app`: `~` async job UX through the SDK; drop reopen-tab guidance.
 
-Inference questions are confidential and always target PS Enclave in v1. The builder encrypts once to the deterministic registered enclave public key and submits the ciphertext directly as a job. Every admitted TEE node derives the same enclave key, so Gateway can retry or reroute within the enclave fleet without builder involvement.
+## Sequencing
 
-This removes the `prepare → select → encrypt` round trip, multi-recipient envelopes, shared Full/Enclave private keys, and inference fallback to PS Full.
+1. Derisking slice: `packages/enclave`, enclave profile, `api/v1/jobs`, `api/v1/tee-nodes`, `protocol/jobs`. One node, one test user, one scripted builder, one raw read, sandbox recreated on a second node mid-test.
+2. Identity and consent: `api/v1/identity`, Account signing, consent and Personal Server screens.
+3. Builder migration: SDK envelope and job flow, DCR to Gateway URL, contracts V3.
+4. Inference: intents, derived-scope grants, DCAP wired, rate limits, receipts.
+5. Deprecations.
 
-### Result delivery
+### Wake experiment
 
-The result can safely pass through the Data Gateway if it is encrypted to the builder before leaving the PS runtime.
+After consent UX is settled, on Phala Cloud (dstack OS 0.5.x) through the Vercel queue: (a) `GetKey` under pinned `app_id` is identical on a second CVM and after a compose update; (b) submit → claim → ready → first byte, p50 and p95, warm and cold, small and large scope; (c) sandbox memory and density per node. Replaces every estimate here (warm 1.5 to 3 s, cold 5 to 20 s) and decides decisions 20 and 21.
 
-The builder already has a registered secp256k1 public key, though no SDK code path encrypts to it today. Therefore the simplest async result path is:
+## Open
 
-1. PS produces plaintext inside PS Full or PS Enclave.
-2. PS encrypts the result to the registered builder public key.
-3. Gateway stores or relays ciphertext and marks the job complete.
-4. Builder polls by job ID or receives a metadata-only webhook notification.
-5. Builder downloads and decrypts the result.
+1. Anna's sign-off on the June reversal, revocation wording, and the no-second-wrap stance. Blocks ratification.
 
-A webhook does not need to carry plaintext. It can contain only `jobId`, status, expiry, and an authenticated result handle. This avoids webhook body confidentiality, retry, and payload-size problems.
+Resolved 2026-09-02: owner-approved question intents; blob reads stay public; sealed ciphertext in Gateway Postgres; raw-read version pinned at admission; attestation via Gateway admission plus KMS cert chain; no second wrap; 5 min revocation staleness window.
 
-For very large raw reads, the PS can stream-encrypt to object storage and return a short-lived result handle rather than buffering the entire result in the Gateway database.
+## Review log
 
-## Routing, leases, and duplicate execution
+2026-09-02, Maciej: all blocking items incorporated (decisions 9 to 12, 15 to 18, desktop migration, sign-off section). Decisions as given recorded as 1, 2, 5 to 8, 19 to 21. Dismissed: naming a per-user-CVM trigger; multiple sandboxes per CVM is the design (decision 13), not a staging step. Questions answered: desktop out of read path (decision 3); no rotation in v1 with DRK plan; latency estimates and `?wait` tier; V1 rule exceptions; two signatures at signup.
 
-There is no inherent **PS Full fallback lease** in this model. That phrase mixed together three different mechanisms.
+## Code facts (verified 2026-09-01)
 
-### 1. Presence TTL
+Checkouts: `personal-server-ts 1ce460d`, `data-gateway 3d0d754`, `vana-sdk 42be961`, `unity-surfaces ed26254a`, `vana-storage 1961dcf`, `vana-smart-contracts f37545c`, `personal-server-relay b00101d`, `vana-frp a711769`, `playlist-shelf-app 72ae070`.
 
-The Gateway needs a short-lived presence record saying PS Full is online, reachable, and capable. This is not an execution lease. If the heartbeat expires, the Gateway stops selecting PS Full.
-
-### 2. Job claim
-
-Every queued job needs an atomic claim so only one executor drains it at a time. The claim may have an expiry so another worker can recover the job if the first worker dies.
-
-This is ordinary queue infrastructure, not a per-user runtime lease.
-
-Duplicate execution is still possible around uncertain failure boundaries:
-
-- PS Full claims a job from the Gateway.
-- PS Full completes it, but the connection drops before acknowledging completion.
-- Gateway cannot tell whether execution happened and retries through PS Enclave.
-
-The same ambiguity exists when a TEE worker dies after doing the work but before marking the queue row complete. The answer is a stable job ID and idempotent execution/commit, not necessarily a user-wide lease.
-
-For a raw read, duplicate execution mostly wastes work and may duplicate payment or access receipts. For an agent action, transformation, or external side effect, it can be materially harmful.
-
-### 3. Per-user runtime exclusivity
-
-A lease saying “only one runtime may act for this user” is necessary only if PS Full and PS Enclave can concurrently mutate shared state in ways that cannot be reconciled.
-
-It may be unnecessary if:
-
-- R2 objects are immutable or versioned (not true today: `vana-storage` PUT overwrites in place with no object versioning or conditional PUT; versioning is only the PS-side `{scope}/{version}` key convention, and `vana-storage/docs/260202-vana-storage-design.md` §11.2 documents the resulting multi-writer corruption);
-- every write has an idempotency key;
-- the Gateway serializes or conditionally commits mutations;
-- index and cache state can be rebuilt from the durable source of truth;
-- agent side effects use their own idempotency controls.
-
-If PS runtimes write directly to mutable per-user state without a centralized compare-and-swap or version rule, then stale PS Full presence plus an active enclave can produce conflicting writes. In that design, a per-user writer lease or single-writer epoch becomes useful.
-
-The preferred direction is to keep runtime selection lightweight and make writes versioned and idempotent, rather than locking an entire user to one runtime for all reads. Because storage has no CAS today, a storage-side conditional PUT or a per-user writer epoch is required before Full and Enclave may both write.
-
-## Minimal job model
-
-The Gateway likely needs these durable concepts:
-
-- `jobId`: stable idempotency and correlation key;
-- `owner`, `builder`, `grant`, `scope`, and operation type;
-- encrypted request envelope or pointer;
-- required runtime kind, assigned runtime identity, and assignment expiry;
-- state: `preparing`, `queued`, `claimed`, `running`, `completed`, `failed`, `expired`, or `cancelled`;
-- claim owner and claim expiry;
-- attempt number and retry reason;
-- encrypted result pointer, result hash, size, and expiry;
-- payment and access receipt state.
-
-The queue can live in the Gateway database initially if claims are atomic and polling load is acceptable. The Gateway already runs this pattern: `settlement_outbox` plus `FOR UPDATE SKIP LOCKED` drains on one-minute Vercel crons (`api/v1/settle.ts`). Vercel functions cap at 300 s and Postgres is Neon over WebSocket, so node long-polling is a new load profile. A dedicated queue can replace it later without changing the public job protocol.
-
-## Implementation ownership
-
-| Repository                                | Primary changes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `data-gateway`                            | Add PS Full presence/capabilities, TEE node registry and attestation status, identity records, job preparations, blind jobs/attempts/claims, capacity reservations, encrypted result handles, idempotency and fencing. Use Postgres for control state and opaque private R2 objects for large ciphertext (no object storage exists today). Pick one server-liveness predicate: writes accept any non-revoked server (`lib/data-point-registration.ts:35-52`), while lineage reads and inference require `confirmed                                                                                                                                                                                                                                                                                                                                                                | finalized`and`paid` (`lib/inference.ts:236-256`). |
-| `personal-server-ts`                      | Inject a `ServerAccount`/key provider instead of always creating `key.json` (the `ServerAccount` interface already exists; `packages/lite` and `core/src/mcp/grantee.ts` generate further random keys); consume `VANA_MASTER_KEY_SIGNATURE` in the enclave profile and scrub it (see above); build the profile on `CLOUD_MODE`, which already disables the local approval listener and interactive login but also fetches `PS_ACCESS_TOKEN` from GCE metadata; disable tunnel and dev UI by config; add targeted scope hydration (sync is owner-wide, `listDataPointsByOwner` has no scope filter), readiness/drain hooks (`runtimeAvailability` is unwired in the Node bootstrap), and separation of plaintext runtime state from encrypted caches; add operator scripts (`scripts/tee/*`) for TEE provisioning, admission, and drain. Keep dstack-specific code out of PS core. |
-| `vana-sdk`                                | Keep the existing registration typed data; add identity evidence types and a single job submission flow: sign raw-read metadata or encrypt an inference question to PS Enclave, then submit → poll → decrypt. Preserve direct reads temporarily for migration: two readers exist (`direct/personal-server-read.ts` with the x402 loop, `protocol/personal-server-data.ts` with envelope schema), both call `res.json()` and cannot read binary. `session-relay` already implements init → poll → claim with `webhookUrl`, the nearest precedent for the job API. Write paths (`protocol/personal-server-write.ts`, write sessions in `derivative-questions.ts`) also target a reachable PS and need a Gateway route. Bind messages and results to job, grant, deadlines, and builder key.                                                                                         |
-| `unity-surfaces`                          | Request and verify the attested enclave identity before a full PS exists; reuse the existing owner registration signing flow (desktop silent-signing already requires a trust token); submit registration directly to the Gateway; retire PS Lite hosting from `apps/web` and `apps/mobile-shell`; DCR lives in Account here, not in the Gateway, and must return the Gateway URL instead of `personalServerUrl`; grants are minted PS-side via `serverSigner.signGrantRegistration` under an owner bearer token, with a `grantVersion` collision workaround in web; model consent, registration, readiness, and runtime availability as separate states.                                                                                                                                                                                                                         |
-| `vana-storage`                            | Keep encrypted R2 blob storage and PS delegated writes. Fix `verifyServerDelegation` (`src/auth/gateway-client.ts:25-52`), which checks only owner match on `GET /v1/servers/:address` and caches positives for 60 s, so revoked, pending, failed, or unpaid servers keep writing; adopt the inference relay predicate. Blob `GET`/`HEAD` is fully unauthenticated (`src/middleware/auth.ts:147-165`); decide whether ciphertext reads need auth. Conditional reads (`If-None-Match`, ETag) already exist; add range reads later only if cold-start profiling justifies them.                                                                                                                                                                                                                                                                                                     |
-| `vana-frp` / `personal-server-relay`      | Load-bearing today: `tunnel.enabled` defaults to `true`, the registered `serverUrl` is the tunnel or relay URL, and DCR completion hard-fails without external routing. The browser relay is a single-instance VM on a raw IP. The new Gateway job path is outbound pull and needs neither. Retire them from the primary flow after SDK migration.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `vana-smart-contracts`                    | No initial contract change: `Server { owner, serverAddress, publicKey, url }` with owner-signed `addServerWithSignature` accepts the deterministic EOA, public key, and fixed Gateway URL; no on-chain fee. Constraints: `serverAddress` is a permanent global claim and `publicKey` is immutable (only `updateServer(url)`), so a key epoch needs a new address and the Gateway's revoke-then-re-register path cannot settle. There is no on-chain server deregistration, only per-user `untrustServer`; revocation is Gateway state. Grant content is an off-chain URI. Revisit only if key rotation, runtime policy, or derivation metadata must become consensus state.                                                                                                                                                                                                       |
-| Builder apps such as `playlist-shelf-app` | Prefer absorbing transport changes through `vana-sdk`; update pending/retry/error UX for async jobs and remove reopen-browser-tab guidance when the legacy path is retired.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-
-The new orchestrator boundary should be pull-based: attested nodes heartbeat and claim work from the Gateway, so neither Vercel functions nor TEE nodes need long-lived inbound control connections. A privileged lifecycle helper may be Rust while the Node Agent remains TypeScript. The sandbox must never receive the dstack socket, host filesystem, Docker socket, arbitrary key-domain input, or another user's mounts.
-
-## Common workflow validation
-
-Validated against the latest `main` checkouts on 2026-09-01: `personal-server-ts` `1ce460d`, `data-gateway` `3d0d754`, `vana-sdk` `42be961`, `unity-surfaces` `ed26254a`, `vana-storage` `1961dcf`, `playlist-shelf-app` `72ae070`, `vana-smart-contracts` `f37545c`, `personal-server-relay` `b00101d`, and `vana-frp` `a711769`. `pdpp` `9202f6b0a` was checked and is the Personal Data Portability Protocol spec; it has no TEE, dstack, or KMS material and supports nothing here beyond the child-environment allowlist precedent.
-
-These are target flows. Identity provisioning, stable-Gateway jobs, node orchestration, targeted hydration, and result E2EE do not exist yet.
-
-No dstack SDK, client, or spec exists in any checkout; every `dstack` string in the workspace is a mocked Phala `key_id`. The KMS `GetKey`, `app_id`, and `compose_hash` semantics in "Near-term wallet derivation" match upstream dstack documentation as understood on 2026-09-01 but are unverified here. Verify against upstream before they become load-bearing; a wrong assumption changes every wallet.
-
-### 1. New web user with no PS Full
-
-1. `unity-surfaces` authenticates the user and resolves the canonical owner wallet.
-2. Web asks the Gateway to prepare the user's enclave identity. An admitted TEE Node Key Agent derives the deterministic wallet from the stable fleet `app_id` and canonical user key domain, returning public identity and fresh evidence only.
-3. Web verifies the owner/network binding, public key/address, KMS root, `app_id`, approved runtime measurements, and fixed Gateway URL.
-4. **Prompt once here:** “Enable your always-on Personal Server.” The consent covers registering a long-lived enclave delegate and provisioning the data-unlock secret. Declining leaves the Vana account usable but without always-on builder access.
-5. Under that consent, Account produces two distinct artifacts: the owner-signed server registration and the exact reusable `vana-master-key-v1` signature. Web sends the latter through an attested encrypted channel; only its KMS-sealed ciphertext persists.
-6. Web submits the existing owner-signed server registration directly to `POST /v1/servers` with the deterministic address and fixed Gateway URL. No full PS needs to boot.
-7. Gateway records `pending` and settles on-chain. UI keeps `identity_ready`, `secret_sealed`, `registration_pending`, `registration_active`, `sandbox_cold`, `warming`, and `data_ready` distinct.
-
-Current reusable paths are Account owner-binding and registration signing in `unity-surfaces/apps/account/src/lib/signing/personal-server-intent-service.ts`, the SDK registration typed data in `vana-sdk/.../personal-server-registration.ts`, and Gateway verification in `data-gateway/api/v1/servers.ts`. Current Web couples registration to a booted PS session: `registerIfNeeded` awaits `ready({ publicUrl: true })`, the PS builds the typed data from its own key, and the PS submits it (`apps/web/src/features/personal-server/web-personal-server-session.ts:843-883`). Registration therefore also blocks on relay connectivity, and `prepareRegistration` in PS core must accept an external URL.
-
-**Ordering holes:** decide whether a pending Gateway row or only confirmed/finalized chain state activates the enclave (the Gateway relayer submits on-chain from a one-minute cron, so that latency is Gateway-paced); the server-registration fee flag is read from the on-chain FeeRegistry per request, and when enabled `POST /v1/servers` returns 503 because escrow supports only `grant` and `data_access`, so enclave registration can break without a deploy; the four-field registration signature has no nonce or deadline and is replayable; registration must never imply that a sandbox or its data is ready.
-
-### 2. Builder reads raw data by grant and scope
-
-1. Owner consent creates the grant directly with the owner wallet or through a lightweight enclave signing operation (today the PS signs it as owner delegate via `serverSigner.signGrantRegistration`); wait until the grant is live before advertising read readiness.
-2. DCR (Account in `unity-surfaces`, not the Gateway) returns the fixed Gateway URL instead of today's per-user `personalServerUrl`, plus grant ID and approved scopes. Builder submits one signed raw-read job containing operation, scope, idempotency key, and deadline. It contains no user data and needs no encrypted request envelope; Gateway resolves the builder's registered result key.
-3. Gateway validates builder and live grant, assigns present/capable PS Full or PS Enclave, and queues the job with a stable ID.
-4. If an assigned runtime fails before execution, Gateway may safely reassign the same metadata-only raw-read job to the other runtime.
-5. Selected runtime claims the job with a fenced attempt. An enclave derives the same wallet on any admitted node, unwraps the exact owner signature, starts/reuses the user sandbox, and hydrates only the pinned scope/version from R2.
-6. PS reads the signed job metadata and rechecks builder, owner, grantee, scope, grant revocation/expiry/status, tombstones, and selected data version immediately before plaintext access.
-7. Payment and delivery ordering remain deferred. PS redacts grantee-hidden fields, encrypts the raw result to the registered builder key, signs its provenance, and durably commits ciphertext.
-8. Builder fetches, verifies, decrypts, and only then acknowledges product completion. A lost acknowledgement must not lose the encrypted result.
-
-Current direct paths are `vana-sdk/.../personal-server-read.ts`, PS authorization in `personal-server-ts/packages/core/src/policy/data-read.ts`, payment/access records in `packages/core/src/api/index.ts`, and R2 download/decryption in `packages/core/src/sync/workers/download.ts`.
-
-**Ordering holes:** no async job APIs or canonical envelope; no targeted scope hydration; scope/version semantics must be pinned; grant must be rechecked at execution and result fetch; current payment happens before successful delivery; PS and Gateway disagree on live grant checks (PS deliberately ignores `grant.status` and `paymentStatus`, `policy/data-read.ts:39-42`); raw binary reads skip one fulfillment-report path; the SDK readers cannot consume binary bodies.
-
-### 3. Builder receives an inference answer, not the source dataset
-
-1. Owner approves a question, source scopes, and derived output scope. Store a deterministic question intent as inactive first.
-2. Mint and confirm the builder's grant to the derived scope only; never grant the source scopes. Activate the compute job only after grant commit so failed grant creation cannot cause orphan inference spend. This changes the consent model: today a builder question requires bare read on every source scope in the same grant (`DERIVATIVE_SOURCE_NOT_GRANTED`, `docs/derivative-data-api.md`), and web mints `dcr.scopes` verbatim. The enclave must instead verify the decrypted question matches an owner-approved intent.
-3. Gateway places the encrypted compute job. Enclave wakes and hydrates only the source scopes inside the sandbox.
-4. PS rechecks owner consent and delivery grant, pins source versions, builds a bounded prompt, and sends it through the existing Phala E2EE relay. Source data and prompt remain encrypted past the PS boundary.
-5. PS decrypts the model response, produces an answer-only builder DTO, and separately records owner/audit lineage and provider receipt. Make the encrypted answer or derivative durable before marking compute complete.
-6. PS encrypts only the answer envelope to the registered builder key. Gateway stores ciphertext; builder fetches and decrypts it without receiving source records.
-
-Current compute and prompt paths are `packages/core/src/derivatives/compute.ts` and `prompt.ts`; current blind inference is `packages/core/src/derivatives/e2ee/phala.ts` through `data-gateway/api/v1/inference/chat/completions.ts`. Recent derivative status APIs help polling but remain local to one PS.
-
-**Ordering holes:** question registrations live only in local SQLite and do not follow the user between runtimes; Full and Enclave schedulers could recompute the same question; current web owner flow (`use-data-connection-request-flow.ts:1121-1160`) registers questions and starts compute without awaiting, then mints the grant and completes the DCR; `ready_for_read` in the SDK/surfaces can therefore precede answer readiness; current derivative payload contains question/evidence/source metadata rather than a strict answer-only DTO; full TDX/DCAP verification is still not wired into inference bootstrap; compute billing versus derived-data access billing is unresolved.
-
-### 4. Sandbox TTL expires and the user returns
-
-1. At idle TTL, atomically transition the user assignment `warm → expiring`; reject or CAS-cancel teardown if a new job arrives.
-2. Stop accepting work, drain bounded background tasks, destroy sandbox/process/tmpfs/mounts/plaintext SQLite, and retain only explicitly encrypted manifest/index caches. Release the slot.
-3. Later, Gateway admits a new job, selects PS Enclave, and atomically creates or joins one per-user startup assignment on an admitted node.
-4. Node Key Agent constructs the user key domains itself, derives the same registered wallet, unwraps the sealed historical master signature, validates its owner, and injects it into the sandbox as `VANA_MASTER_KEY_SIGNATURE`.
-5. Node starts the enclave PS profile. PS verifies wallet registration, reconciles the encrypted manifest/tombstones, hydrates required scopes, and reports explicit job readiness.
-6. Execute the job and refresh the activity TTL. Because every enclave node derives the same registered key, enclave-targeted inference ciphertext may be retried on another enclave node. Raw-read jobs contain no encrypted request and may be reassigned to Full or Enclave.
-
-Current `createServer().cleanup()` and `syncManager.stop()` are reusable, but `key.json`, exact-secret recovery, manifest-first hydration, assignment CAS, and orchestration-grade readiness are missing. Current `/health` is only process health and may be green while full reconciliation is still running. PS today only polls the Gateway for its `serverId` to gate the tunnel; there is no execution-time check that it is still registered and unrevoked.
-
-### 5. An operator adds another TEE
-
-V1 scales manually. An operator watches queue age, unplaced jobs, and heartbeat freshness (Datadog gauges from the existing metrics cron) and provisions or drains nodes by hand. Automated scaling is deferred.
-
-1. Operator runs `personal-server-ts` operator scripts (`scripts/tee/provision`, `admit`, `drain`, `list`), which ship beside the enclave profile. `provision` drives the dstack tooling to create a CVM with the exact stable fleet `app_id`, approved compose/runtime policy, pinned image digest, and existing replicated KMS root.
-2. The script registers the node's expected identity with the Gateway through an operator-only endpoint. `data-gateway` has no admin UI today; the only operator surface is bearer-secret endpoints gated by `lib/operator-auth.ts` (`CRON_SECRET`). Add `GET/POST /v1/operator/tee-nodes` and `PATCH /v1/operator/tee-nodes/:id` (admit, drain) behind a separate operator secret or a Web3Signed operator allowlist, not the cron secret.
-3. New Node Agent answers a Gateway nonce challenge. Verifier checks the vendor quote, OS/TCB state, stable `app_id`, approved `compose_hash`, transport key, KMS-root fingerprint, and production mode.
-4. Node pre-pulls and verifies the PS image, tests KMS access and sandbox isolation, then heartbeats `warming → ready` with slots, memory, CPU, cache disk, and image readiness.
-5. Operator admits the node. Gateway alone reserves capacity and assigns fenced claims.
-6. Scale-down: operator marks the node draining. It stops new claims, finishes jobs, wipes warm sandboxes, and only then does the operator destroy the CVM. Abrupt failure expires claims and requeues only safe/idempotent work.
-
-**Ordering holes:** no node/admission/capacity/provision state exists; wrong KMS root can look healthy but derive every wallet incorrectly, so admission needs a deterministic canary; KMS authorization and Gateway admission are separate gates; outer-CVM attestation does not automatically approve dynamically loaded PS images; heartbeat capacity still requires transactional reservations; inference or agent side effects cannot be made exactly once without provider/tool idempotency.
-
-### Cross-workflow invariants
-
-- Registration, chain activation, node presence, process health, scope readiness, grant readiness, and answer readiness are separate states.
-- Gateway checks declared metadata; the selected PS always reauthorizes immediately before accessing plaintext.
-- Every queue claim and completion is fenced and idempotent; mutating/side-effecting work has stronger serialization or reconciliation.
-- Gateway sees signed control metadata but never user plaintext, inference questions, results, owner signatures, or derived keys.
-- Shared-CVM Node Agent remains in every user's TCB; inner sandboxes never receive dstack or host-control sockets.
-- Revocation must affect Gateway placement, PS execution/result fetch, storage delegation, and future KMS/secret release.
-
-## Decisions recorded
-
-1. Reuse registered secp256k1 PS and builder public keys for the Vana ECIES message envelope in v1. Separate inbox and per-job response keys are deferred.
-2. Persist only KMS-sealed ciphertext for the exact historical `vana-master-key-v1` signature. Inject its plaintext into the user sandbox through the existing `VANA_MASTER_KEY_SIGNATURE` environment variable at bootstrap, then scrub the PS/tool environment.
-3. Accept the shared Node Agent in every user's TCB. Use one multi-user dstack CVM with gVisor-class per-user sandboxes; one CVM per user is deferred.
-4. Defer payment capture, delivery receipts, side-effect reconciliation, and detailed job-retention policy to a later decision.
-5. Store portable encrypted question intents in Gateway job/control state, separate grant readiness from answer readiness, return an answer-only builder DTO, keep detailed lineage owner-side, and never silently downgrade private inference.
-6. Scale the TEE pool manually in v1. Operator scripts in `personal-server-ts` (beside the enclave profile) provision CVMs with dstack tooling and admit or drain them through Gateway operator-only endpoints.
-
-## Still open
-
-1. Whether enclave activation requires only a valid Gateway registration row or confirmed/finalized on-chain registration.
-2. Where the small sealed master-signature ciphertext lives. The lowest-change default is the existing Gateway Postgres row; private opaque R2 is only needed if policy forbids secret ciphertext in Postgres.
-3. KMS-root backup and provider migration. Losing or changing the root changes every deterministic wallet and prevents unsealing user data roots.
-4. Raw-read version semantics: pin the version at job admission or define “latest at execution.” Pinning is safer for retries; latest is simpler for callers.
-5. The minimum sandbox/tool containment needed to keep agents from reading the bootstrap environment: separate unprivileged UID, restricted `/proc`/ptrace, explicit child-process environment, no core dumps, and TTL wipe.
-6. Who authors an inference question. "Builder request" step 2 has the builder encrypt a question to the enclave; workflow 3 has the owner approve one. Decide whether the builder's ciphertext must match an owner-approved intent and how the enclave checks that.
-7. How the owner surface verifies node attestation for the attested encrypted channel and identity evidence. Browsers cannot run DCAP verification; either the Gateway pre-verifies admission and the surface trusts a KMS-signed app certificate chain, or a separate verifier service is needed.
-8. Two active registered servers per owner (PS Full and PS Enclave). Confirm grants, DCR, storage delegation, and `listServersByOwner` consumers handle more than one live server.
-9. PS Full transport. Pull against Vercel functions means polling cost and wake latency; define the poll interval or a push channel.
-10. Builder and PS write paths through the Gateway. The job model covers reads and inference only.
-11. Whether `vana-storage` blob reads need authentication and revocation, given ciphertext is publicly readable by key today.
-
-## Current code references
-
-- `data-gateway/docs/INFERENCE_RELAY.md`: current blind inference relay contract, visibility, auth, quotas, and attestation passthrough.
-- `data-gateway/api/v1/inference/chat/completions.ts`: authenticates the registered PS, injects the provider credential, and relays the exact encrypted request and response bytes.
-- `data-gateway/api/v1/inference/aci/attestation.ts`: relays the nonce-bound ACI attestation report byte for byte.
-- `personal-server-ts/packages/core/src/derivatives/e2ee/attestation.ts`: validates nonce, keyset binding, freshness, and key shape; full hardware-evidence verification remains an optional hook with a TODO.
-- `personal-server-ts/packages/core/src/derivatives/e2ee/phala.ts`: performs field-level request encryption and response decryption using the attested X25519 key.
-- `personal-server-ts/packages/core/src/derivatives/e2ee/suite.ts`: X25519, HKDF-SHA256, and AES-256-GCM cryptographic suite.
-- `personal-server-ts/packages/core/src/derivatives/inference.ts`: signs and submits the encrypted OpenAI-compatible request and decrypts the response inside the PS.
-- `personal-server-ts/packages/server/src/bootstrap.ts`: enables Phala E2EE by default and wires the registered server signer to the relay; it does not currently wire a hardware evidence verifier.
-- `personal-server-ts/packages/server/src/keys/server-account.ts`: currently creates a random key and persists `key.json`; enclave reuse needs an injected `ServerAccount`/key-provider port.
-- `vana-sdk/packages/vana-sdk/src/crypto/keys/derive.ts`: current data master and scope keys depend on the exact raw owner signature, which must be provisioned separately from the deterministic PS wallet.
-- `data-gateway/db/schema.ts`: builder public keys and Personal Server public keys are already first-class fields.
-- `data-gateway/api/v1/servers.ts`: owner-signed server registration already accepts server identity, public key, and URL.
-- `vana-sdk/packages/vana-sdk/src/direct/personal-server-read.ts`: current builder read is signed HTTPS followed by direct JSON parsing.
-- `personal-server-ts/packages/core/src/api/index.ts`: current PS returns decrypted JSON or decoded raw bytes after authorization.
-- `vana-sdk/packages/vana-sdk/README.md`: ECIES primitives already exist in both Node and browser SDK entry points.
+- `packages/server/src/keys/server-account.ts` writes a random `key.json`; `ServerAccount` interface exists as the injection seam; `packages/lite` and `mcp/grantee.ts` generate more random keys.
+- `packages/core/src/sync/workers/download.ts` syncs owner-wide; `listDataPointsByOwner` has no scope filter.
+- `CLOUD_MODE` disables local approval and interactive login but fetches `PS_ACCESS_TOKEN` from GCE metadata.
+- `data-gateway`: Vercel functions, Neon Postgres, Drizzle, no object storage, no rate limiting, no admin UI, crons for settle and metrics (Datadog). Server lifecycle `pending|submitting|confirmed|finalized|failed`; `serverAddress` globally unique; relayer submits on-chain.
+- `data-gateway/api/v1/servers.ts:469-482`: 503 when the server-registration fee is enabled on chain.
+- `vana-sdk` ECIES: native `secp256k1` (Node) and `@noble` (browser), eccrypto-compatible; `encryptWithWalletPublicKey` already encrypts to EOA keys. Two direct readers exist. `session-relay` has an init → poll → claim → webhook shape.
+- `unity-surfaces/apps/account/.../personal-server-intent-service.ts` signs registration (EIP-712) and owner binding (`vana-master-key-v1`) via Privy; desktop silent-signing requires a trust token. Web keeps the master signature in `localStorage` for 8 h; desktop in the OS keychain; mobile in secure storage.
+- `vana-storage/src/auth/gateway-client.ts:25-52` checks only owner match, so revoked, pending, failed, and unpaid servers keep writing; positives cached 60 s. Blob `GET/HEAD` skip auth. PUT overwrites; `If-None-Match` exists, range does not.
+- `IDataPortabilityServers.sol`: `Server { owner, serverAddress, publicKey, url }`, `updateServer(url)` only, no fee, per-user `untrustServer`. Gateway settles via `DataPortabilityServersV2.registerServerWithSignature` and `deregisterServerWithSignature`.
+- Inference E2EE: `derivatives/e2ee/attestation.ts` (report checks, `verifyEvidence` TODO), `phala.ts` (per-field encryption), `suite.ts` (X25519, HKDF, AES-GCM), `aad.ts`, `derivatives/inference.ts` (sign exact bytes); Gateway `api/v1/inference/chat/completions.ts`, `aci/attestation.ts`, `docs/INFERENCE_RELAY.md`. `bootstrap.ts` enables E2EE by default but wires no evidence verifier.
+- PS read path today: `policy/data-read.ts` (builder, grant, scope, grantee, owner, expiry; deliberately ignores `grant.status` and `paymentStatus`), `api/index.ts` (x402 payment then read; tombstones; raw branch skips `reportReadFulfillment`), `sync/workers/download.ts`. Compute: `derivatives/compute.ts`, `prompt.ts`; questions in `server/src/storage/question-store.ts` (SQLite).
+- `pdpp` is the portability protocol spec; no TEE material. Its `connector-child-environment.ts` is the env-allowlist precedent.
