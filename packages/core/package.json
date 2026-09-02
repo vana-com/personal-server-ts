@@ -141,7 +141,7 @@
     "build": "tsc --build"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@opendatalabs/vana-sdk": "3.14.0",
     "minisearch": "^7.2.0",
     "unpdf": "^1.6.2",
