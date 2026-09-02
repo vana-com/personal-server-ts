@@ -34,7 +34,7 @@ Consequence: "rolling upgrades allow old and new measurements" is an on-chain KM
 
 - TDX quote: MRTD = OVMF; RTMR0 virtual hardware; RTMR1 kernel; RTMR2 cmdline + initrd; RTMR3 event log records compose hash, app id, instance id, key provider. Verifier replays the event log. `report_data` is caller-supplied. https://github.com/Dstack-TEE/dstack/blob/master/docs/attestation-tdx.md
 - KMS root k256 public key: `DstackKms.kmsInfo().k256Pubkey` on chain, KMS RPC `GetMeta`, or `phala kms phala`. Pin it out of band.
-- App key chain (v0): link 0 = app root key over `keccak256(purpose || ":" || hex(pubkey))`; link 1 = KMS root over `keccak256("dstack-kms-issued" || ":" || app_id || sec1_compressed(app_root_pubkey))`. Verify link 1 against the pinned anchor and confirm `app_id` is ours. No SDK ships a chain verifier. https://github.com/Dstack-TEE/dstack/blob/master/docs/guest-api-v0.md#verifying-a-chain
+- App key chain (v0), verified against a live vector on 2026-09-02 (`spike-vector-1`, dstack 0.5.9; sources `guest-agent/src/rpc_service.rs:612-628`, `kms/src/crypto.rs:23-40`, `ra-tls/src/api_v1.rs:158-165` at `9826215`): link 0 = app root key over `keccak256(utf8(purpose || ":" || lowercase_hex(sec1_compressed(pubkey))))` (33-byte key, no `0x`); link 1 = KMS root over `keccak256("dstack-kms-issued" || ":" || app_id_raw_20_bytes || sec1_compressed(app_root_pubkey))` (no separator before the key). Raw keccak digest, no Ethereum prefix; signature `r || s || v`, `v` in {0,1}. First implementations in vana-sdk, data-gateway and packages/enclave all guessed wrong (uncompressed pubkey, hex-text app_id) and were corrected from this vector.
 - Hardware: Intel DCAP (`dcap-qvl`), Phala `POST /api/v1/attestations/verify`, or `dstack-verifier`.
 - One KMS root per KMS instance; Phala KMS is one off-chain root for the cloud; on-chain KMS nodes are Phala-operated, governed per chain.
 
@@ -283,3 +283,23 @@ Kill criterion: none defined for step 4; hydration is now VERIFIED (upper bound,
 Cleanup: `phala cvms delete <uuid> --force` for both; `phala cvms list --json | jq '[.items[] | select(.cvmName | startswith("spike-"))]'` = `[]` (re-checked by Claude after exit). Keys and local PS roots deleted. Residue: 51 throwaway encrypted blobs and registry rows remain on Moksha dev storage/gateway (owner keys destroyed, so only admin deletion can remove them).
 
 Validation: launcher tests 5/5; typecheck, lint, format, build pass; 9 pre-existing `packages/server/src/client.test.ts` 5 s timeouts unrelated to the change.
+
+### Chain vector (2026-09-02)
+
+Captured from `spike-vector-1` (destroyed). Public data only; pinned as a regression test in vana-sdk, data-gateway and packages/enclave.
+
+```json
+{
+  "appId": "205730c6547ad5884e8eddba3ace7406efb1260d",
+  "path": "users/spikevector/wallet/ethereum/secp256k1/v1",
+  "purpose": "wallet",
+  "publicKeyCompressed": "026d004dca2082e5cf067b34142f8d99568116c330f93671d1761abb2e155c01ea",
+  "publicKeyUncompressed": "046d004dca2082e5cf067b34142f8d99568116c330f93671d1761abb2e155c01eaf465173f6068dacd0bab448e6c0be4016deaf21e07021be1100491f651272be2",
+  "signatureChain0": "310fcdedac7f5a8c665072fb694946fd45d30df61d1eb30ae9dd94e0c586fc212021059c11952fa40ae57f91a36f13617a0cf30496db52af8599289c3c5ff48c00",
+  "signatureChain1": "394d8e0863b49b8459c11515f8f6a10f34a543b607faaeac00b121d8d321366a1ec91b1bb889904fe064425eeee05e4e7ad4292da3b2f034b3897adf6a87bb6c00",
+  "appRootPublicKey": "02724f8036ee1ca252ab10adbd511540273813973f5e6a2321645320d498af4464",
+  "kmsRootPublicKey": "0334c76e0c3f52ec64cbf9bbf5c910c272330166fd656c0a86bb330963e46910e1",
+  "composeHash": "068f954f2c651c39cadafc275dc6d0083ec34e592268a590dcaef35920587ac2",
+  "osImageHash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033"
+}
+```
