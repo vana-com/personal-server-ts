@@ -253,10 +253,33 @@ The published image `vanaorg/personal-server@sha256:dc6dfd47cd658aa05d473863d658
 
 Density is a RAM-only ceiling, not a validated operating density: concurrent multi-sandbox CPU, memory pressure, agent memory, and 16-vCPU contention remain UNVERIFIED (`phala instance-types --json` gives 16 vCPU for `tdx.2xlarge`).
 
-Hydration remains UNVERIFIED for both 1 MB and 50 MB owners: no local Gateway/storage fixture was reachable inside the CVM and current sync requires a registered server. Required follow-up: provide non-production Gateway/storage endpoints plus encrypted owner fixtures and an observable sync-complete signal, then time `/health` to completion (`packages/server/src/bootstrap.ts`; `rg -n 'sync|registration' packages/server/src/bootstrap.ts`).
+Hydration: measured, see the Hydration section below.
 
 Teardown passed: before stop, `/data/index.db` existed at 4,096 bytes; after `docker rm --force --volumes`, `docker inspect ps-run-1` returned `No such object` and `docker volume ls --format '{{json .}}'` returned `[]` (measurement log command above, sections `sqlite before stop` and `teardown evidence`).
 
 Kill criterion: **passed**. Isolation stronger than plain runc worked, and the plain fallback did not leak either host socket. Consequence for the architecture doc: keep shared CVMs, use one gVisor sandbox per user under a small trusted management runtime, do not nest gVisor inside Sysbox on dstack 0.5.9, bake and pin `runsc` plus a repaired Personal Server image, and treat 240 as an unverified RAM ceiling rather than capacity. Hydration and concurrent-density claims must stay `UNVERIFIED` until the follow-up measurements exist.
 
 Cleanup: all five Spike 3 CVMs were deleted with `phala cvms delete <exact-uuid> --force`; `phala cvms list --json | jq '[.items[] | select(.cvmName | startswith("spike-sandbox-"))]'` returned `[]` after 2026-09-02T18:12:07Z (`date -u +%FT%TZ`). No production or `spike-identity-*` CVM was modified.
+
+### Hydration (step 4, measured 2026-09-02)
+
+Date: 2026-09-02. Operator: Codex via acpx (handoff `../personal-server-ts-spike-sandbox/HANDOFF-hydration.md`, untracked; log `operator scratchpad`). Branch `spike/sandbox`, commits `453dde1` harness, `b20b419`, `326fead` fixes, `2de9596` results (`HYDRATION-RESULTS.md` in the worktree, full detail and commands there; not pushed). CVMs: `spike-hydration-1` `31662c48-2fcf-41ee-b9f7-623d7e5d7aa2` (measurement), `8700bc34-2430-4c27-999c-7ef63f481644` (failed packaging, destroyed). dstack OS 0.5.9 `bd369a8c`, `tdx.small` 1 vCPU / 2 GiB, gVisor `runsc-ptrace`, tmpfs `/data`.
+
+Environment: Moksha only. Gateway `https://dp-rpc-dev.vana.org` (chain 14800; the PS default `data-gateway-env-dev-opendatalabs.vercel.app` is 404), storage `https://storage.vana.org` chain 14800. Two throwaway owners (`openssl rand -hex 32`, deleted after). Registration via `POST /ui/api/registration/server` accepted the future dstack public URL (HTTP 200). Fixtures via `POST /v1/data/:scope` (`scripts/hydration-fixture.ts`): 1 blob = 1,048,798 encrypted bytes; 50 blobs = 52,439,940 encrypted bytes (measured by downloading every ciphertext).
+
+Sync complete = `/v1/sync/status` has `lastSync`, `syncing=false`, `pendingFiles=0`, no errors, and authenticated `/v1/data?limit=100` shows the expected scope count. `readyMs` = `docker create` to first `/health` 200.
+
+| metric                        |     p50 ms |     p95 ms | runs | command                                                                                                                                            |
+| ----------------------------- | ---------: | ---------: | ---: | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1 MB: start -> `/health` 200  | 10,018.593 | 10,376.963 |    5 | `phala logs hydration-agent --cvm-id 31662c48-2fcf-41ee-b9f7-623d7e5d7aa2 --stderr -n 250`; percentile `node -e` snippet in `HYDRATION-RESULTS.md` |
+| 1 MB: start -> sync complete  | 11,694.089 | 15,250.018 |    5 | same                                                                                                                                               |
+| 50 MB: start -> `/health` 200 | 10,130.254 | 11,118.323 |    5 | same                                                                                                                                               |
+| 50 MB: start -> sync complete | 60,661.877 | 65,420.338 |    5 | same                                                                                                                                               |
+
+Raw (ms): small ready 10376.96 9993.68 10018.59 10271.98 9591.93; small synced 15250.02 11622.35 11694.09 11785.28 11163.27; large ready 10240.63 11118.32 9680.11 9744.46 10130.25; large synced 64483.05 65420.34 59048.59 60661.88 58888.29.
+
+Kill criterion: none defined for step 4; hydration is now VERIFIED (upper bound, owner-wide sync). Consequence: `/health` and hydrated are distinct states; gate user work on sync complete and budget about 65 s p95 for a 50 MB owner on 1 vCPU (about 50 s of that is sync after health).
+
+Cleanup: `phala cvms delete <uuid> --force` for both; `phala cvms list --json | jq '[.items[] | select(.cvmName | startswith("spike-"))]'` = `[]` (re-checked by Claude after exit). Keys and local PS roots deleted. Residue: 51 throwaway encrypted blobs and registry rows remain on Moksha dev storage/gateway (owner keys destroyed, so only admin deletion can remove them).
+
+Validation: launcher tests 5/5; typecheck, lint, format, build pass; 9 pre-existing `packages/server/src/client.test.ts` 5 s timeouts unrelated to the change.
