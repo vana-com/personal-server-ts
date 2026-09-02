@@ -38,7 +38,7 @@ Deliverable: `spikes/RESULTS.md` section "dstack facts". Update the architecture
 
 Kill: none. This spike informs the others.
 
-## Spike 1: deterministic identity (about half a day)
+## Spike 1: deterministic identity (passed 2026-09-02, see `spikes/RESULTS.md`)
 
 Goal: the same user wallet on any node with the same `app_id`, and after a compose update.
 
@@ -55,7 +55,7 @@ Record: addresses and key hashes per step; whether step 4 required KMS re-author
 
 Kill: step 3 or 4 yields a different address. Then deterministic identity without persisted secrets is not available and the architecture needs sealed wallet files or one CVM per user.
 
-## Spike 2: seal and unseal across nodes (about half a day, after Spike 1)
+## Spike 2: seal and unseal across nodes (passed 2026-09-02)
 
 Goal: a master signature sealed on node A decrypts a real blob on node B.
 
@@ -71,7 +71,7 @@ Record: envelope size; unseal time; confirmation the plaintext hash matches; the
 
 Kill: node B cannot unwrap with the Spike 1 key. Same consequence as Spike 1.
 
-## Spike 3: sandbox inside the CVM (about 1 day, informed by Spike 0 question 5)
+## Spike 3: sandbox inside the CVM (passed 2026-09-02; hydration and density unverified)
 
 Goal: know how a per-user sandbox can run inside dstack, what it costs, and how fast it starts.
 

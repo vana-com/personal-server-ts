@@ -39,7 +39,7 @@ The master signature stays the root of every data key in v1 by decision (see Com
 10. **Grants owner-signed.** The `serverSigner.signGrantRegistration` delegate path is removed for the enclave and deprecated for desktop. A Vana-run enclave registered as the user's server must not be able to mint grants.
 11. **Registration nonce and deadline.** The Gateway settles the four-field owner signature into `DataPortabilityServersV2.registerServerWithSignature`, so replay protection is a V3 struct change (`nonce`, `deadline` on registration and deregistration). Bridge: Gateway refuses already-settled signatures and retired epochs; node agent refuses to derive for a retired epoch.
 12. **Revocation** is owner-signed (already true at the Gateway), settled on-chain, deletes the sealed master-signature ciphertext from every store and backup, and retires the KMS path. Re-enable uses path `v2` and a fresh registration.
-13. **Multiple user sandboxes per CVM is the design**, not a v1 compromise. Conditions: node agent small, reviewed, measurement-pinned; public claims about Vana's access match what the node agent can do. No per-user CVM trigger is defined; revisit only if a regulator or Anna's review requires it.
+13. **Multiple user sandboxes per CVM is the design**, not a v1 compromise. Conditions: node agent small, reviewed, measurement-pinned; public claims about Vana's access match what the node agent can do. No per-user CVM trigger is defined; revisit only if a regulator or Anna's review requires it. Spike 3 (2026-09-02, dstack 0.5.9) fixed the shape: one gVisor `runsc` (ptrace platform) sandbox per user, launched by a small trusted management container that holds the sockets; the sandbox runs as uid 1000 with zero capabilities, read-only root, a 256 MiB tmpfs, and no dstack or Docker socket. Sysbox works for nested Docker but gVisor does not nest inside it on 0.5.9. `runsc` and the PS image are baked and pinned in the compose.
 14. **No data-key rotation in v1**, by decision. See Compromise and rotation.
 
 ### Money and limits
@@ -53,7 +53,7 @@ The master signature stays the root of every data key in v1 by decision (see Com
 
 19. **Activate on the Gateway row.** Enclave serves once the row exists, marked `confirming`; rolled back if the chain rejects. A job served under a row the chain later rejects is bounded by the owner signature existing.
 20. **Queue on Vercel accepted** with conditions: the wake experiment runs through it. Trigger for a dedicated queue: p95 submit-to-claim above 2 s, sustained 50 jobs/min, or Neon connection exhaustion.
-21. **dstack verified before load-bearing.** Spike 1 (2026-09-02, Phala Cloud, dstack 0.5.9) confirmed the same wallet and sealing key on a second CVM under one `app_id` and across a compose change, and a different wallet under another `app_id`. Semantics cited from upstream in `spikes/RESULTS.md` (Spike 0). Remaining: wake-chain latency and sandbox isolation (Spikes 2 to 4).
+21. **dstack verified.** Spikes 0 to 3 (2026-09-02, Phala Cloud, dstack 0.5.9; `spikes/RESULTS.md`): same wallet and sealing key on a second CVM under one `app_id` and across a compose change; different `app_id` gives a different wallet; a master signature sealed on node A unsealed on node B in 4.9 ms and decrypted a real SDK blob, and the wrong user id failed AAD; gVisor sandbox cold start to `/health` 7.5 s p50, 7.7 s p95 (warm image, PS boot dominated); 119 MiB idle and 136 MiB active per sandbox, a RAM-only ceiling of 240 per `tdx.2xlarge`. Still unverified: hydration for 1 MB and 50 MB owners (needs a non-production Gateway and storage reachable from the CVM), concurrent density, and the wake chain through a Vercel preview.
 22. **Manual scaling.** Operator scripts in `personal-server-ts` provision CVMs with dstack tooling and admit or drain them through Gateway operator-only endpoints. No Fleet Director. `data-gateway` has no admin UI; `apps/metrics` is product analytics, not a Gateway console.
 23. **All enclave code in `personal-server-ts`.** No new repo. Agent and PS image ship in one compose, one approved hash.
 24. **Key reuse.** Registered secp256k1 keys serve as ECIES inbox (enclave) and result key (builder). Already shipped in the SDK. Separate keys deferred unless review finds a concrete flaw.
@@ -204,10 +204,12 @@ packages/core        ~ scope-filtered sync port, signed-artifact reauth (grant, 
                        chain revocation check, answer-only derivative DTO, portable question intents,
                        ECIES result envelope, readiness state
 packages/server      ~ enclave profile: key-provider port (no key.json), env scrub, dev UI off,
-                       drain/readiness endpoints
+                       drain/readiness endpoints; fix the published image (vanaorg/personal-server
+                       exits with ERR_MODULE_NOT_FOUND @opendatalabs/vana-sdk, Spike 3)
                      + jobs/ worker: pull, claim, execute, commit (runtime-agnostic)
                      ~ desktop profile: collector and owner-local server only; tunnel optional, then removed
 packages/enclave     + node agent: heartbeat, claim, sandbox lifecycle, dstack key agent, envelope sealing
+                       (spike/enclave has dstack port + fake, paths, wallet, sealing; spike/sandbox has the gVisor launcher)
 packages/lite        − retire after PS Lite stops being registered and the enclave serves real users
 deploy/dstack        + CVM compose pinning agent + PS digests
 scripts/tee          + provision, admit, drain, list
@@ -302,7 +304,7 @@ blobs                = no conditional PUT needed in v1 (single executor per user
 
 ### Wake experiment
 
-After consent UX is settled, on Phala Cloud (dstack OS 0.5.x) through the Vercel queue: (a) `GetKey` under pinned `app_id` is identical on a second CVM and after a compose update; (b) submit → claim → ready → first byte, p50 and p95, warm and cold, small and large scope; (c) sandbox memory and density per node. Replaces every estimate here (warm 1.5 to 3 s, cold 5 to 20 s) and decides decisions 20 and 21.
+Done in parts on 2026-09-02 (Spikes 1 to 4, `spikes/RESULTS.md`): derivation identical across CVMs and compose updates; local queue submit → claim p95 220 ms at 50 jobs/min with 3 workers, `?wait=25` result p95 534 ms; sandbox cold start 7.5 s p50. Remaining: the same queue numbers on a Vercel preview with a Neon branch (commands in RESULTS.md), and hydration timing with a reachable non-production Gateway and storage. Those two runs close decision 20 and the cold-start estimate.
 
 ## Open
 
