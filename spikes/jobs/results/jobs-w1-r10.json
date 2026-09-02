@@ -1,0 +1,67 @@
+{
+  "config": {
+    "ratePerMinute": 10,
+    "durationSeconds": 180,
+    "waitFraction": 0.5,
+    "out": "/private/tmp/claude-501/-Users-kahtaf-Documents-workspace-vana-personal-server-ts/6ef68f02-83fb-4895-89f5-0c64d3884777/scratchpad/results/jobs-w1-r10.json",
+    "gatewayUrl": "http://localhost:3000",
+    "waitSeconds": 25
+  },
+  "startedAt": "2026-09-02T17:06:03.969Z",
+  "endedAt": "2026-09-02T17:09:03.969Z",
+  "counts": {
+    "submitted": 30,
+    "completed": 30,
+    "otherTerminal": 0,
+    "errors": 0,
+    "waitClients": 9,
+    "inline": 9,
+    "deferred202": 0
+  },
+  "inlineFraction": 1,
+  "metrics": [
+    {
+      "metric": "submit_to_claim_ms",
+      "n": 30,
+      "p50": 539,
+      "p95": 968,
+      "max": 1005
+    },
+    {
+      "metric": "claim_to_complete_ms",
+      "n": 30,
+      "p50": 208,
+      "p95": 227,
+      "max": 238
+    },
+    {
+      "metric": "submit_to_result_ms_wait",
+      "n": 9,
+      "p50": 1054,
+      "p95": 1312,
+      "max": 1312
+    },
+    {
+      "metric": "submit_to_result_ms_poll",
+      "n": 21,
+      "p50": 1030,
+      "p95": 1541,
+      "max": 1582
+    },
+    {
+      "metric": "submit_http_ms_202",
+      "n": 21,
+      "p50": 9,
+      "p95": 41,
+      "max": 44
+    },
+    {
+      "metric": "submit_http_ms_wait",
+      "n": 9,
+      "p50": 1054,
+      "p95": 1310,
+      "max": 1310
+    }
+  ],
+  "errors": []
+}
