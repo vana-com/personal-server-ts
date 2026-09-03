@@ -611,7 +611,7 @@ async function main(): Promise<void> {
         retiredSecretResult,
         409,
         () => true,
-        "Expected 409 IDENTITY_RETIRED for the epoch-1 ciphertext; gateway api/v1/identity/[userPsId]/secret.ts:46-55 looks up the latest epoch with findLatest and incorrectly returns 400 FIELD_MISMATCH",
+        "Expected 409 IDENTITY_RETIRED for the epoch-1 ciphertext",
       );
     },
   );
