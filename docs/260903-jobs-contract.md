@@ -207,6 +207,8 @@ export function openJobResult(
 
 Mapping: spike `lib/jobs/types.ts:8-46` constants are byte-identical; `JobRecord` (`:48-75`) stays Gateway-internal; the spike's `pinnedVersion: string` and `requestCiphertext: base64` (`api/v1/jobs.ts:192-199`) are kept. New versus spike: `jobId` chosen by the client (bound inside the ciphertext; the Gateway rejects a mismatch with the idempotency row), `fencingToken`, `identity` in the claim, `resultHandle`. `SealedEnvelope` imported from `protocol/identity.ts:166`.
 
+**Amendments 2026-09-03 (from vana-sdk #209 review).** `openJobResult(ciphertext, builderPrivateKey, ecies, expect: { jobId; scope?; version? })`. `auth.bodyHash = sha256(canonicalJobRequestBytes(request))` where `canonicalJobRequestBytes` (exported) is JSON with keys sorted recursively, no whitespace, UTF-8; `sealJobRequest` encrypts the same bytes. Gateway views `GET /v1/grants/:id` and `GET /v1/builders/:address` carry the registration `signature` so the sandbox can re-verify (§1 step 6). Published as `3.22.0-pr.209.13d545d`.
+
 ## 3. data-gateway
 
 Auth conventions: builder = Web3Signed request signature (`lib/web3-signed.ts:173-200`, spike `http.ts:79-99`); node = `Authorization: Bearer <nodeSecret>` + `X-Node-Id` verified against `tee_nodes.secret_hash` (replaces `rejectUnauthorizedOperator`, spike `http.ts:47-58`); operator = `Bearer CRON_SECRET` (`lib/operator-auth.ts:24-48`; separate `OPERATOR_SECRET` env with fallback to `CRON_SECRET`, arch :179).
