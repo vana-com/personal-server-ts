@@ -318,6 +318,30 @@ describe("runJob", () => {
     expect(fixture.deps.logger.warn).toHaveBeenCalledOnce();
   });
 
+  it("logs sandbox acquisition errors with their bounded cause chain", async () => {
+    const fixture = await createFixture();
+    const dockerError = new Error("docker create exited with code 125");
+    const runtimeError = new Error("sandbox runtime failed", {
+      cause: dockerError,
+    });
+    dockerError.cause = runtimeError;
+    vi.spyOn(fixture.runtime, "start").mockRejectedValue(runtimeError);
+
+    await runJob(fixture.job, fixture.identity, fixture.deps);
+
+    expect(fixture.deps.logger.warn).toHaveBeenCalledWith(
+      {
+        jobId: JOB_ID,
+        stage: "sandbox-acquire",
+        error: { name: "Error", message: "sandbox runtime failed" },
+        causes: [
+          { name: "Error", message: "docker create exited with code 125" },
+        ],
+      },
+      "Enclave job stage failed",
+    );
+  });
+
   it("fails a request with invalid ciphertext", async () => {
     const fixture = await createFixture();
     const ciphertext = Buffer.from(fixture.job.requestCiphertext, "base64");

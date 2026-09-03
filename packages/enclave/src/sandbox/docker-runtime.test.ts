@@ -11,6 +11,11 @@ const USER_PS_ID = `0x${"12".repeat(32)}` as Hex;
 const ACCESS_TOKEN = "access-token";
 const MASTER_KEY_SIGNATURE = `0x${"11".repeat(65)}`;
 const IMAGE = "example/personal-server@sha256:digest";
+const STDERR_TAIL_BYTES = 2_048;
+
+const { execFileMock } = vi.hoisted(() => ({ execFileMock: vi.fn() }));
+
+vi.mock("node:child_process", () => ({ execFile: execFileMock }));
 
 function sandboxSpec(env: Record<string, string> = {}): SandboxSpec {
   return {
@@ -58,6 +63,32 @@ function scriptedDocker(
 }
 
 describe("docker sandbox runtime", () => {
+  it("surfaces a bounded stderr tail when docker create fails", async () => {
+    const prefix = "x".repeat(STDERR_TAIL_BYTES);
+    const diagnostic = "runtime runsc-ptrace is unavailable";
+    execFileMock.mockImplementationOnce(
+      (_binary, _args, _options, callback) => {
+        callback(
+          new Error(`Command failed: docker create ${ACCESS_TOKEN}`),
+          "",
+          `${prefix}${ACCESS_TOKEN}${MASTER_KEY_SIGNATURE}${diagnostic}`,
+        );
+      },
+    );
+    const runtime = createDockerRuntime();
+
+    const error = await runtime.start(sandboxSpec()).catch((cause) => cause);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(diagnostic);
+    expect((error as Error).message).not.toContain(prefix);
+    expect((error as Error).message).not.toContain(ACCESS_TOKEN);
+    expect((error as Error).message).not.toContain(MASTER_KEY_SIGNATURE);
+    expect((error as Error).cause).toMatchObject({
+      message: "Command failed: docker create [REDACTED]",
+    });
+  });
+
   it("creates an exactly hardened gVisor container", async () => {
     const docker = scriptedDocker();
     const runtime = createDockerRuntime({

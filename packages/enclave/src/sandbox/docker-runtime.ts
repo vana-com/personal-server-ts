@@ -38,6 +38,7 @@ const HOST_PORT_FORMAT =
 const RUNNING_VALUE = "true";
 const SYNC_TOKEN_MESSAGE = "Sandbox sync requires PS_ACCESS_TOKEN";
 const INVALID_DOCKER_HOST = "DOCKER_HOST must have a hostname";
+const STDERR_TAIL_LENGTH = 2_048;
 const SECRET_ENV_KEY_SET = new Set<string>(SECRET_ENV_KEYS);
 
 const FIXED_ENV = {
@@ -207,9 +208,9 @@ function runDocker(
       binary,
       [command, ...args],
       { env: { ...env, DOCKER_HOST: host } },
-      (error, stdout) => {
+      (error, stdout, stderr) => {
         if (error) {
-          reject(error);
+          reject(dockerCommandError(command, error, stderr, env));
           return;
         }
 
@@ -217,6 +218,35 @@ function runDocker(
       },
     );
   });
+}
+
+function dockerCommandError(
+  command: string,
+  error: Error,
+  stderr: string,
+  env?: Record<string, string>,
+): Error {
+  const cause = new Error(redactSecrets(error.message, env));
+  cause.name = error.name;
+  const stderrTail = redactSecrets(stderr.trim(), env).slice(
+    -STDERR_TAIL_LENGTH,
+  );
+  if (!stderrTail) {
+    return cause;
+  }
+
+  return new Error(`Docker ${command} failed: ${stderrTail}`, { cause });
+}
+
+function redactSecrets(value: string, env?: Record<string, string>): string {
+  let redacted = value;
+  for (const secret of Object.values(env ?? {})) {
+    if (secret) {
+      redacted = redacted.replaceAll(secret, "[REDACTED]");
+    }
+  }
+
+  return redacted;
 }
 
 function createArgs(

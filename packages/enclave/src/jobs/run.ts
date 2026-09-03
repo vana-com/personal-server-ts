@@ -47,6 +47,7 @@ const UNSEAL_STAGE = "unseal";
 const SANDBOX_ACQUIRE_STAGE = "sandbox-acquire";
 const COMPLETE_STAGE = "complete";
 const UNKNOWN_ERROR = "unknown";
+const MAX_ERROR_CAUSES = 5;
 const RESULT_HASH_PATTERN = /^0x[0-9a-fA-F]{64}$/;
 const JOB_FAILURE_CODES = new Set<string>([
   "AUTH_INVALID",
@@ -347,14 +348,42 @@ function logStageFailure(
   stage: string,
   error: unknown,
 ): void {
+  const [root, ...causes] = errorChain(error);
+
   logger.warn(
     {
       jobId,
       stage,
-      error: error instanceof Error ? error.name : UNKNOWN_ERROR,
+      error: root,
+      causes,
     },
     JOB_STAGE_FAILURE_MESSAGE,
   );
+}
+
+interface LoggedError {
+  name: string;
+  message: string;
+}
+
+function errorChain(error: unknown): LoggedError[] {
+  const chain: LoggedError[] = [];
+  const seen = new Set<Error>();
+  let current = error;
+
+  while (chain.length <= MAX_ERROR_CAUSES && current instanceof Error) {
+    if (seen.has(current)) {
+      break;
+    }
+
+    seen.add(current);
+    chain.push({ name: current.name, message: current.message });
+    current = current.cause;
+  }
+
+  return chain.length > 0
+    ? chain
+    : [{ name: UNKNOWN_ERROR, message: UNKNOWN_ERROR }];
 }
 
 function requestMatches(
