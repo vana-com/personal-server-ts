@@ -3,6 +3,7 @@ import type { HealthProbe, SyncProbe } from "./probes.js";
 import { probeHealth, probeSync } from "./probes.js";
 import {
   assertSandboxEnv,
+  SECRET_ENV_KEYS,
   type SandboxHandle,
   type SandboxRuntime,
   type SandboxSpec,
@@ -37,6 +38,7 @@ const HOST_PORT_FORMAT =
 const RUNNING_VALUE = "true";
 const SYNC_TOKEN_MESSAGE = "Sandbox sync requires PS_ACCESS_TOKEN";
 const INVALID_DOCKER_HOST = "DOCKER_HOST must have a hostname";
+const SECRET_ENV_KEY_SET = new Set<string>(SECRET_ENV_KEYS);
 
 const FIXED_ENV = {
   CLOUD_MODE: "true",
@@ -54,7 +56,11 @@ export interface ContainerInspection {
 
 /** DockerClient promoted from spike/sandbox launcher.ts. */
 export interface DockerClient {
-  run(command: string, args: string[]): Promise<string>;
+  run(
+    command: string,
+    args: string[],
+    env?: Record<string, string>,
+  ): Promise<string>;
   inspect(id: string): Promise<ContainerInspection>;
 }
 
@@ -98,6 +104,7 @@ export function createDockerRuntime(
       const containerId = await docker.run(
         CREATE_COMMAND,
         createArgs(name, spec.image, environment),
+        secretEnv(environment),
       );
 
       try {
@@ -164,7 +171,7 @@ function createDockerClient(options: DockerClientOptions): DockerClient {
   const host = options.host ?? DEFAULT_DOCKER_HOST;
 
   return {
-    run: (command, args) => runDocker(binary, host, command, args),
+    run: (command, args, env) => runDocker(binary, host, command, args, env),
     async inspect(id): Promise<ContainerInspection> {
       const [running, hostPortValue] = await Promise.all([
         runDocker(binary, host, INSPECT_COMMAND, [
@@ -193,12 +200,13 @@ function runDocker(
   host: string,
   command: string,
   args: string[],
+  env?: Record<string, string>,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(
       binary,
       [command, ...args],
-      { env: { DOCKER_HOST: host } },
+      { env: { ...env, DOCKER_HOST: host } },
       (error, stdout) => {
         if (error) {
           reject(error);
@@ -235,11 +243,19 @@ function createArgs(
   ];
 
   for (const [key, value] of Object.entries(environment).sort()) {
-    args.push("--env", `${key}=${value}`);
+    args.push("--env", SECRET_ENV_KEY_SET.has(key) ? key : `${key}=${value}`);
   }
   args.push(image);
 
   return args;
+}
+
+function secretEnv(
+  environment: Record<string, string>,
+): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(environment).filter(([key]) => SECRET_ENV_KEY_SET.has(key)),
+  );
 }
 
 interface HealthWaitOptions {

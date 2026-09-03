@@ -9,6 +9,7 @@ import type { SandboxSpec } from "./runtime.js";
 
 const USER_PS_ID = `0x${"12".repeat(32)}` as Hex;
 const ACCESS_TOKEN = "access-token";
+const MASTER_KEY_SIGNATURE = `0x${"11".repeat(65)}`;
 const IMAGE = "example/personal-server@sha256:digest";
 
 function sandboxSpec(env: Record<string, string> = {}): SandboxSpec {
@@ -17,7 +18,7 @@ function sandboxSpec(env: Record<string, string> = {}): SandboxSpec {
     epoch: 7,
     image: IMAGE,
     env: {
-      VANA_MASTER_KEY_SIGNATURE: `0x${"11".repeat(65)}`,
+      VANA_MASTER_KEY_SIGNATURE: MASTER_KEY_SIGNATURE,
       PS_ACCESS_TOKEN: ACCESS_TOKEN,
       PS_SERVER_ADDRESS: `0x${"22".repeat(20)}`,
       PS_SERVER_PUBLIC_KEY: `0x${"33".repeat(33)}`,
@@ -29,13 +30,23 @@ function sandboxSpec(env: Record<string, string> = {}): SandboxSpec {
 
 function scriptedDocker(
   inspections: ContainerInspection[] = [{ running: true, hostPort: 49_152 }],
-): DockerClient & { calls: Array<{ command: string; args: string[] }> } {
-  const calls: Array<{ command: string; args: string[] }> = [];
+): DockerClient & {
+  calls: Array<{
+    command: string;
+    args: string[];
+    env?: Record<string, string>;
+  }>;
+} {
+  const calls: Array<{
+    command: string;
+    args: string[];
+    env?: Record<string, string>;
+  }> = [];
 
   return {
     calls,
-    async run(command, args) {
-      calls.push({ command, args });
+    async run(command, args, env?: Record<string, string>) {
+      calls.push({ command, args, ...(env ? { env } : {}) });
       if (command === "create") return "container-id";
 
       return "";
@@ -84,7 +95,7 @@ describe("docker sandbox runtime", () => {
         "--env",
         "PERSONAL_SERVER_ROOT_PATH=/data",
         "--env",
-        `PS_ACCESS_TOKEN=${ACCESS_TOKEN}`,
+        "PS_ACCESS_TOKEN",
         "--env",
         `PS_SERVER_ADDRESS=0x${"22".repeat(20)}`,
         "--env",
@@ -96,10 +107,16 @@ describe("docker sandbox runtime", () => {
         "--env",
         "TUNNEL_ENABLED=false",
         "--env",
-        `VANA_MASTER_KEY_SIGNATURE=0x${"11".repeat(65)}`,
+        "VANA_MASTER_KEY_SIGNATURE",
         IMAGE,
       ],
+      env: {
+        PS_ACCESS_TOKEN: ACCESS_TOKEN,
+        VANA_MASTER_KEY_SIGNATURE: MASTER_KEY_SIGNATURE,
+      },
     });
+    expect(docker.calls[0]?.args.join(" ")).not.toContain(ACCESS_TOKEN);
+    expect(docker.calls[0]?.args.join(" ")).not.toContain(MASTER_KEY_SIGNATURE);
     expect(docker.calls[0]?.args).not.toContain("--mount");
   });
 
