@@ -150,7 +150,7 @@ export function createPsLiteDerivativeCompute(
     logger,
     compute: (questionId) =>
       computeQuestion(questionId, {
-        // A -> B -> C: a question reading this derived scope recomputes.
+        // A -> B -> C: a question reading this derived scope goes stale.
         onDerivedWritten: (event) =>
           scheduler.markSourceChanged(event.scope, {
             lineageSources: event.lineageSources,

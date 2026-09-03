@@ -537,9 +537,13 @@ What runs where:
    assembles a prompt, calls the inference provider and writes the answer
    into `derivedScope` with lineage = the source data point ids;
 3. every time a source scope gets a new local version (ingest or sync) the
-   question is marked `stale` and recomputed after a quiet period, unless
-   it was registered with `recompute: "snapshot"`;
-4. the builder polls the question for `ready`, then reads `derivedScope`.
+   question is marked `stale`, and nothing is computed, unless it was
+   registered with `recompute: "snapshot"` (which ignores source changes
+   entirely);
+4. the next authorized demand for the answer runs the compute: a read of
+   `derivedScope`, a `GET /v1/derivatives/status?derivedScope=` poll, or an
+   explicit `POST /questions/:id/recompute`;
+5. the builder polls the question for `ready`, then reads `derivedScope`.
 
 ### Endpoints
 
@@ -638,8 +642,9 @@ Registration body:
 
 `model` is optional (the server default applies). `answerShape` is optional
 and is covered in "The declared answer shape" below; leaving it out is the
-free-text answer. `recompute` is optional
-too: `"on-change"` (the default) recomputes on every source change, while
+free-text answer. `recompute` is optional too: `"on-change"` (the default)
+marks the answer stale on every source change and recomputes it the next
+time someone asks for it, while
 `"snapshot"` computes once at registration and afterwards only on an
 explicit `POST /questions/:id/recompute`; any other value is 400
 `DERIVATIVE_QUESTION_INVALID`. Validation, in order:
@@ -649,10 +654,10 @@ present, follows the grammar below; the naming rule
 (the derived scope must not share its first segment with any source,
 400 `LINEAGE_SCOPE_UNDER_SOURCE_PREFIX`); and the registration must not make
 the derived scope a transitive source of itself through other registrations
-(409 `DERIVATIVE_CYCLE`), which is what keeps recompute-on-refresh bounded.
-Sources do not have to exist yet: a missing source fails the compute
-("source scope X has no local data") and the question recomputes once the
-scope arrives.
+(409 `DERIVATIVE_CYCLE`), which is what keeps a chain of recomputes
+bounded. Sources do not have to exist yet: a missing source fails the
+compute ("source scope X has no local data") and the question recomputes
+once the scope arrives and someone reads the answer.
 
 Registration view (POST, GET, list and recompute):
 
@@ -782,7 +787,11 @@ session. Authorization is the data read's (a live grant covering the scope,
 or the owner); nothing is served and nothing is charged, the same bar as
 the lineage read. Without it a reader polling `GET /v1/data/<scope>` cannot
 tell "computing right now" (404) from "failed and will never retry" (also
-404).
+404). An authorized poll is also demand: it wakes a question that is
+waiting for a compute, so a reader that finds the scope stale is not
+polling a status nothing is working towards. The view it returns is the
+state that poll starts from; the run it triggered reports itself in the
+next poll.
 
 ```http
 GET /v1/derivatives/status?derivedScope=coach.weekly
@@ -830,17 +839,61 @@ stale --compute ok--> ready
 stale --compute err-> failed
 ```
 
-`pending` is "never computed"; it stays `pending` while scheduled. A source
-change during a running compute makes the scheduler run once more when it
-finishes (one compute in flight per question, changes coalesce). Recompute
-after a change waits `inference.recomputeDebounceMs` (default 5000);
-`POST /recompute` (owner, or the registering builder retrying after a
-failure) runs immediately. A question registered with
-`recompute: "snapshot"` never takes the source-change edge: it computes at
-registration and on `POST /recompute` only. On boot the server reschedules
-every question a previous run left `pending` or `stale`. `failed` carries a short `error` (a status code,
+`pending` is "never computed"; it stays `pending` until a compute lands. A
+source change marks the answer `stale` and schedules nothing (see "Compute
+is just-in-time" below). A source change DURING a running compute puts the
+question back to `stale` when that compute settles, because the answer it
+wrote never saw the new data. `POST /recompute` (owner, or the registering
+builder retrying after a failure) runs immediately, one compute in flight
+per question. A question registered with `recompute: "snapshot"` never
+takes the source-change edge: it computes at registration and on
+`POST /recompute` only. On boot the server reschedules every question a
+previous run left `pending`; a `stale` one has a version to serve and waits
+for a reader, so a restart (in PS-Lite, every tab that opens) buys no
+inference. `failed` carries a short `error` (a status code,
 a scope name, an error class); the prompt and the data are never stored in
 it.
+
+### Compute is just-in-time
+
+A source refresh marks the answer stale; it does not recompute it. The
+recompute happens the next time someone actually asks for the answer:
+
+| Demand                                         | Who may trigger it                                    |
+| ---------------------------------------------- | ----------------------------------------------------- |
+| `GET /v1/data/<derivedScope>`                  | a live grant covering the derived scope, or the owner |
+| `GET /v1/derivatives/status?derivedScope=`     | the same                                              |
+| `POST /v1/derivatives/questions/:id/recompute` | the owner or the registering builder (immediate)      |
+
+Otherwise the inference bill scales with how often the owner's sources
+refresh rather than with how often anyone reads the answer: a user who
+refreshes their ChatGPT history nightly would pay for a recompute every
+night even if no app ever read the result.
+
+Three rules make that safe:
+
+- Authorization first. The trigger sits behind the same gate as the data it
+  serves and runs only after that gate passed, so an unauthenticated or
+  refused request never spends an inference call.
+- One compute per question. Every trigger goes through the scheduler, which
+  runs one compute per question at a time, so N concurrent readers cause
+  one compute rather than N.
+- Reads are never blocked on inference. A read serves the version that is
+  stored (stale is not wrong) and the recompute runs behind it; the fresh
+  answer lands in a later read. A derived scope with nothing stored yet
+  answers 404 exactly as before, and the reader polls the status route
+  while the compute it just triggered runs.
+
+Only a question that is WAITING for a compute is woken: `stale` and
+`pending`. A `ready` one has nothing to do, and a `failed` one belongs to
+its backoff chain or to an explicit recompute, so polling a question that
+keeps failing cannot spend a call per poll. Demand does pull a promised
+retry forward, since the reader is asking now, and keeps the attempt count
+so a chain that keeps failing still ends.
+
+The `recompute` policy is unchanged on the wire: `"on-change"` and
+`"snapshot"` are still the only two values. What `"on-change"` means is
+"stale on change, computed on demand".
 
 Retry policy inside one compute: a transient inference failure (no
 response, 429, 5xx) and a transient gateway failure during the grant check
@@ -863,7 +916,8 @@ scope name, the question or provider detail):
 attempts are spent, the scheduler retries the question on a backoff
 schedule (default 1m, 5m, 30m; in-memory, so a restart drops the chain).
 Every other class — and an exhausted backoff — leaves the question
-`failed` until the next source change or `POST /recompute`.
+`failed` until the next source change (which makes it stale, so the next
+reader recomputes it) or `POST /recompute`.
 
 Before a compute of a builder-registered question the server re-runs the
 write policy against the live grant and the read coverage of every source:
@@ -884,7 +938,8 @@ descends from the question's own derived scope.
 
 Chains: the compute path writes through the owner ingest contract, not
 HTTP, so it notifies the scheduler itself; a question that reads a derived
-scope recomputes when that scope is recomputed (A -> B -> C).
+scope goes stale when that scope is recomputed, and recomputes when its own
+answer is read (A -> B -> C, each link paid for by a reader).
 
 ### Trim rule and prompt
 
@@ -975,7 +1030,7 @@ The provider is an OpenAI-compatible chat completions client over `fetch`
 | `inference.model`               | `z-ai/glm-5.3-flash`             | default model                                                        |
 | `inference.e2ee`                | `true`                           | end to end encryption of prompt and answer to the Phala gateway      |
 | `inference.maxSourceItems`      | `50`                             | newest items kept per source scope                                   |
-| `inference.recomputeDebounceMs` | `5000`                           | quiet period after a source change                                   |
+| `inference.recomputeDebounceMs` | `5000`                           | quiet period before a recompute requested without `immediate`        |
 
 Both persistence paths write the parsed config back with every default
 materialized (`config.json` on the Node server, the stored config record in
@@ -1012,7 +1067,8 @@ PS-Lite never calls a provider directly: with `inference.baseUrl` left at
 the direct-provider default the compute layer stays off and
 `/v1/derivatives` answers 503 `DERIVATIVE_COMPUTE_UNAVAILABLE`; set it to
 the relay. Deactivating the runtime stops the scheduler; activating it
-reschedules `pending` and `stale` questions.
+reschedules `pending` questions (a `stale` one waits for a reader, so
+opening a tab costs nothing).
 
 Every request carries `provider: { aci_verified: true, zdr: true }` and
 `max_tokens` (2048); the response headers `x-receipt-id` and

@@ -59,16 +59,22 @@ async function flush() {
 }
 
 describe("createRecomputeScheduler", () => {
-  it("marks registrations that read a changed scope stale and debounces the recompute", async () => {
+  it("a source change marks registrations stale and schedules no compute", async () => {
     const store = createInMemoryQuestionStore({
       initial: [
-        registration({ questionId: "q-1", sourceScopes: ["oura.sleep"] }),
+        registration({
+          questionId: "q-1",
+          derivedScope: "coach.weekly",
+          sourceScopes: ["oura.sleep"],
+        }),
         registration({
           questionId: "q-2",
+          derivedScope: "coach.monthly",
           sourceScopes: ["chatgpt.conversations"],
         }),
         registration({
           questionId: "q-3",
+          derivedScope: "coach.daily",
           sourceScopes: ["oura.sleep"],
           status: "pending",
         }),
@@ -88,29 +94,177 @@ describe("createRecomputeScheduler", () => {
 
     expect((await store.get("q-1"))!.status).toBe("stale");
     expect((await store.get("q-2"))!.status).toBe("ready");
-    // Never computed: stays pending (still scheduled).
+    // Never computed: a source change does not invent a result for it.
     expect((await store.get("q-3"))!.status).toBe("pending");
-    expect(timers.pending().map((t) => t.ms)).toEqual([5_000, 5_000]);
-    expect(compute).not.toHaveBeenCalled();
-
-    // A second change inside the quiet period resets the timer, no extra run.
-    scheduler.markSourceChanged("oura.sleep");
-    await scheduler.whenIdle();
-    expect(timers.pending()).toHaveLength(2);
-
+    // The whole point: a nightly refresh of the sources costs nothing until
+    // someone asks for an answer.
+    expect(timers.pending()).toEqual([]);
     timers.fireAll();
     await scheduler.whenIdle();
+    expect(compute).not.toHaveBeenCalled();
+
+    // A reader of one derived scope pays for that question, and only it.
+    scheduler.markDemand("coach.weekly");
+    await scheduler.whenIdle();
+    expect(timers.pending().map((t) => t.ms)).toEqual([0]);
+    timers.fireAll();
+    await scheduler.whenIdle();
+    expect(compute.mock.calls.map((call) => call[0])).toEqual(["q-1"]);
+  });
+
+  it("collapses concurrent demand for one question into a single compute", async () => {
+    const store = createInMemoryQuestionStore({
+      initial: [registration({ status: "stale" })],
+    });
+    const timers = manualTimers();
+    let release!: () => void;
+    const compute = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    const scheduler = createRecomputeScheduler({
+      store,
+      compute,
+      debounceMs: 0,
+      timers: timers.api,
+    });
+
+    // Five readers arrive before anything runs: one timer, one compute.
+    for (let reader = 0; reader < 5; reader += 1) {
+      scheduler.markDemand("coach.weekly");
+    }
+    await flush();
+    expect(timers.pending()).toHaveLength(1);
+    timers.fireAll();
+    await flush();
+    expect(compute).toHaveBeenCalledTimes(1);
+
+    // Readers that arrive while it runs join that run instead of queueing
+    // another one behind it.
+    scheduler.markDemand("coach.weekly");
+    scheduler.markDemand("coach.weekly");
+    await flush();
+    expect(timers.pending()).toEqual([]);
+    release();
+    await scheduler.whenIdle();
+    expect(compute).toHaveBeenCalledTimes(1);
+  });
+
+  it("demand wakes only a question that is waiting for a compute", async () => {
+    const store = createInMemoryQuestionStore({
+      initial: [
+        registration({ questionId: "q-ready", derivedScope: "a.ready" }),
+        registration({
+          questionId: "q-failed",
+          derivedScope: "a.failed",
+          status: "failed",
+          error: "upstream down",
+          errorCode: "inference_unavailable",
+        }),
+        registration({
+          questionId: "q-pending",
+          derivedScope: "a.pending",
+          status: "pending",
+        }),
+        registration({
+          questionId: "q-stale",
+          derivedScope: "a.stale",
+          status: "stale",
+        }),
+      ],
+    });
+    const timers = manualTimers();
+    const compute = vi.fn(async () => undefined);
+    const scheduler = createRecomputeScheduler({
+      store,
+      compute,
+      debounceMs: 0,
+      timers: timers.api,
+    });
+
+    for (const scope of ["a.ready", "a.failed", "a.pending", "a.stale"]) {
+      scheduler.markDemand(scope);
+    }
+    await scheduler.whenIdle();
+    timers.fireAll();
+    await scheduler.whenIdle();
+    // `ready` has nothing to do; `failed` belongs to its backoff chain or to
+    // an explicit recompute, so polling it cannot spend a call per poll.
     expect(compute.mock.calls.map((call) => call[0]).sort()).toEqual([
-      "q-1",
-      "q-3",
+      "q-pending",
+      "q-stale",
     ]);
   });
 
-  it("markSourceChanged skips snapshot questions; an explicit recompute still runs them", async () => {
+  it("a source change during a running compute leaves the answer stale for the next reader", async () => {
+    const store = createInMemoryQuestionStore({
+      initial: [registration({ status: "stale" })],
+    });
+    const timers = manualTimers();
+    let release!: () => void;
+    let calls = 0;
+    const compute = vi.fn(async (questionId: string) => {
+      calls += 1;
+      // Only the first run hangs; the test drives when it lands.
+      if (calls === 1) {
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      }
+      // What a real compute does when it lands: the answer is written and
+      // the question reports ready.
+      await store.update(questionId, {
+        status: "ready",
+        updatedAt: "2026-08-27T01:00:00.000Z",
+      });
+      return undefined;
+    });
+    const scheduler = createRecomputeScheduler({
+      store,
+      compute,
+      debounceMs: 0,
+      timers: timers.api,
+    });
+
+    scheduler.markDemand("coach.weekly");
+    await flush();
+    timers.fireAll();
+    await flush();
+    expect(compute).toHaveBeenCalledTimes(1);
+
+    scheduler.markSourceChanged("oura.sleep");
+    await flush();
+    release();
+    await scheduler.whenIdle();
+
+    // The answer that just landed never saw the new data, so it goes back to
+    // stale — and still nothing is scheduled.
+    expect((await store.get("q-1"))!.status).toBe("stale");
+    expect(timers.pending()).toEqual([]);
+    expect(compute).toHaveBeenCalledTimes(1);
+
+    scheduler.markDemand("coach.weekly");
+    await scheduler.whenIdle();
+    timers.fireAll();
+    await scheduler.whenIdle();
+    expect(compute).toHaveBeenCalledTimes(2);
+  });
+
+  it("a snapshot question is untouched by a source change and by demand; an explicit recompute still runs it", async () => {
     const store = createInMemoryQuestionStore({
       initial: [
-        registration({ questionId: "q-snap", recompute: "snapshot" }),
-        registration({ questionId: "q-live", recompute: "on-change" }),
+        registration({
+          questionId: "q-snap",
+          derivedScope: "coach.snapshot",
+          recompute: "snapshot",
+        }),
+        registration({
+          questionId: "q-live",
+          derivedScope: "coach.weekly",
+          recompute: "on-change",
+        }),
       ],
     });
     const timers = manualTimers();
@@ -126,6 +280,14 @@ describe("createRecomputeScheduler", () => {
     await scheduler.whenIdle();
     expect((await store.get("q-snap"))!.status).toBe("ready");
     expect((await store.get("q-live"))!.status).toBe("stale");
+    // Reading the snapshot's scope serves the version it computed at
+    // registration; it never triggers a new one.
+    scheduler.markDemand("coach.snapshot");
+    await scheduler.whenIdle();
+    expect(timers.pending()).toEqual([]);
+
+    scheduler.markDemand("coach.weekly");
+    await scheduler.whenIdle();
     timers.fireAll();
     await scheduler.whenIdle();
     expect(compute.mock.calls.map((call) => call[0])).toEqual(["q-live"]);
@@ -142,7 +304,7 @@ describe("createRecomputeScheduler", () => {
     ]);
   });
 
-  it("runs one compute per question at a time and reruns once after a change during the run", async () => {
+  it("runs one compute per question at a time and reruns once after an explicit recompute during the run", async () => {
     const store = createInMemoryQuestionStore({ initial: [registration()] });
     const timers = manualTimers();
     let release: () => void = () => undefined;
@@ -165,9 +327,9 @@ describe("createRecomputeScheduler", () => {
     await flush();
     expect(compute).toHaveBeenCalledTimes(1);
 
-    // Two changes while in flight coalesce into a single rerun.
-    scheduler.markSourceChanged("oura.sleep");
-    scheduler.markSourceChanged("oura.sleep");
+    // Two explicit recomputes while in flight coalesce into a single rerun.
+    scheduler.requestRecompute("q-1", { immediate: true });
+    scheduler.requestRecompute("q-1", { immediate: true });
     await flush();
     timers.fireAll();
     await flush();
@@ -217,12 +379,16 @@ describe("createRecomputeScheduler", () => {
     await scheduler.whenIdle();
     expect((await store.get("q-1"))!.status).toBe("ready");
     expect((await store.get("q-2"))!.status).toBe("stale");
+    // Both derived scopes are read; only the stale question computes.
+    scheduler.markDemand("coach.weekly");
+    scheduler.markDemand("other.view");
+    await scheduler.whenIdle();
     timers.fireAll();
     await scheduler.whenIdle();
     expect(compute.mock.calls.map((call) => call[0])).toEqual(["q-2"]);
   });
 
-  it("the first start() reschedules questions a previous process left pending or stale", async () => {
+  it("the first start() reschedules questions a previous process left pending, and no others", async () => {
     const store = createInMemoryQuestionStore({
       initial: [
         registration({ questionId: "q-ready", status: "ready" }),
@@ -241,21 +407,21 @@ describe("createRecomputeScheduler", () => {
     // Boot: no stop() ever happened, the store simply came back populated.
     scheduler.start();
     await scheduler.whenIdle();
-    expect(timers.pending()).toHaveLength(2);
+    // Only the question that has never produced an answer. A stale one has
+    // a version to serve and waits for a reader, so restarting (or, in
+    // PS-Lite, opening a tab) buys no inference.
+    expect(timers.pending()).toHaveLength(1);
     timers.fireAll();
     await scheduler.whenIdle();
-    expect(compute.mock.calls.map((call) => call[0]).sort()).toEqual([
-      "q-pending",
-      "q-stale",
-    ]);
+    expect(compute.mock.calls.map((call) => call[0])).toEqual(["q-pending"]);
     // While running, another start() must not replay anything.
     scheduler.start();
     await scheduler.whenIdle();
     expect(timers.pending()).toHaveLength(0);
-    expect(compute).toHaveBeenCalledTimes(2);
+    expect(compute).toHaveBeenCalledTimes(1);
   });
 
-  it("start() after stop() reschedules pending and stale questions", async () => {
+  it("start() after stop() reschedules pending questions", async () => {
     const store = createInMemoryQuestionStore({
       initial: [
         registration({ questionId: "q-ready", status: "ready" }),
@@ -276,13 +442,10 @@ describe("createRecomputeScheduler", () => {
     scheduler.start();
     scheduler.start();
     await scheduler.whenIdle();
-    expect(timers.pending()).toHaveLength(2);
+    expect(timers.pending()).toHaveLength(1);
     timers.fireAll();
     await scheduler.whenIdle();
-    expect(compute.mock.calls.map((call) => call[0]).sort()).toEqual([
-      "q-pending",
-      "q-stale",
-    ]);
+    expect(compute.mock.calls.map((call) => call[0])).toEqual(["q-pending"]);
   });
 
   it("stop cancels pending timers", async () => {
@@ -301,6 +464,7 @@ describe("createRecomputeScheduler", () => {
     scheduler.stop();
     expect(timers.pending()).toHaveLength(0);
     scheduler.markSourceChanged("oura.sleep");
+    scheduler.markDemand("coach.weekly");
     await scheduler.whenIdle();
     expect(compute).not.toHaveBeenCalled();
   });
@@ -407,8 +571,8 @@ describe("automatic retry of transient failures", () => {
     expect(timers.pending().map((t) => t.ms)).toEqual([60_000]);
   });
 
-  it("a source change during the retry window supersedes the retry and resets the chain", async () => {
-    const { scheduler, timers, compute } = retryScheduler([
+  it("a source change during the retry window leaves the retry chain standing", async () => {
+    const { scheduler, timers, compute, store } = retryScheduler([
       failedOutcome("inference_unavailable"),
       failedOutcome("inference_unavailable"),
       failedOutcome("inference_unavailable"),
@@ -423,13 +587,58 @@ describe("automatic retry of transient failures", () => {
 
     scheduler.markSourceChanged("oura.sleep");
     await scheduler.whenIdle();
-    // The retry timer is replaced by the debounce timer; the chain restarts.
-    expect(timers.pending().map((t) => t.ms)).toEqual([5_000]);
-    expect(scheduler.nextRetryAt("q-1")).toBeNull();
+    // The change adds no compute of its own, and it does not cancel the
+    // one already promised: the retry recomputes from current data anyway.
+    expect(timers.pending().map((t) => t.ms)).toEqual([300_000]);
+    expect(scheduler.nextRetryAt("q-1")).toBe("2026-08-27T10:05:00.000Z");
+    // Never computed, so there is no answer to call stale.
+    expect((await store.get("q-1"))!.status).toBe("pending");
+
     timers.fireAll();
     await scheduler.whenIdle();
     expect(compute).toHaveBeenCalledTimes(3);
+    // Both backoff steps are spent; nothing further is promised.
+    expect(timers.pending()).toEqual([]);
+  });
+
+  it("demand pulls a promised retry forward instead of adding a second compute", async () => {
+    const { scheduler, timers, compute, store } = retryScheduler([
+      failedOutcome("inference_unavailable"),
+      failedOutcome("inference_unavailable"),
+    ]);
+    scheduler.requestRecompute("q-1", { immediate: true });
+    await scheduler.whenIdle();
+    timers.fireAll();
+    await scheduler.whenIdle();
     expect(timers.pending().map((t) => t.ms)).toEqual([60_000]);
+    // What the compute wrote when it failed (the fake outcome above only
+    // reports it).
+    await store.update("q-1", {
+      status: "failed",
+      error: "upstream down",
+      errorCode: "inference_unavailable",
+    });
+
+    // The question is `failed`, so demand leaves it to the chain.
+    scheduler.markDemand("coach.weekly");
+    await scheduler.whenIdle();
+    expect(timers.pending().map((t) => t.ms)).toEqual([60_000]);
+
+    // A source change makes it stale (a recompute is owed): the reader now
+    // waiting must not sit out the rest of the backoff, and must not cause
+    // a compute of its own either.
+    scheduler.markSourceChanged("oura.sleep");
+    await scheduler.whenIdle();
+    scheduler.markDemand("coach.weekly");
+    scheduler.markDemand("coach.weekly");
+    await scheduler.whenIdle();
+    expect(timers.pending().map((t) => t.ms)).toEqual([0]);
+    timers.fireAll();
+    await scheduler.whenIdle();
+    expect(compute).toHaveBeenCalledTimes(2);
+    // The chain continues from where it was rather than restarting, so a
+    // reader cannot keep a failing question retrying for ever.
+    expect(timers.pending().map((t) => t.ms)).toEqual([300_000]);
   });
 
   it("reports no retry for an unknown question", async () => {
@@ -470,7 +679,7 @@ describe("retry interleavings (review findings)", () => {
     };
   }
 
-  it("a source change during the in-flight compute keeps the 5s debounce; the retry branch must not clobber it", async () => {
+  it("a source change during the in-flight compute schedules nothing and leaves the retry branch to run", async () => {
     const store = createInMemoryQuestionStore({ initial: [reg()] });
     const timers = manualTimers();
     let settle!: (value: unknown) => void;
@@ -501,17 +710,17 @@ describe("retry interleavings (review findings)", () => {
     await Promise.resolve();
     expect(calls).toBe(1);
 
-    // Fresh data lands while the compute is in flight: debounce scheduled.
+    // Fresh data lands while the compute is in flight: nothing is scheduled.
     scheduler.markSourceChanged("oura.sleep");
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(timers.pending().map((t) => t.ms)).toEqual([5_000]);
+    expect(timers.pending()).toEqual([]);
 
-    // The in-flight compute now settles with a transient failure. The
-    // pending debounce must survive; no 60s retry may replace it.
+    // The in-flight compute now settles with a transient failure. Its retry
+    // is scheduled as usual and will read the new data when it fires.
     settle(failedOutcome());
     await scheduler.whenIdle();
-    expect(timers.pending().map((t) => t.ms)).toEqual([5_000]);
-    expect(scheduler.nextRetryAt("q-1")).toBeNull();
+    expect(timers.pending().map((t) => t.ms)).toEqual([60_000]);
+    expect(scheduler.nextRetryAt("q-1")).toBe("2026-08-27T10:01:00.000Z");
   });
 
   it("a transient failure that settles after stop() leaves no phantom retry promise", async () => {
@@ -588,7 +797,7 @@ describe("retry interleavings (review findings)", () => {
     expect(scheduler.retryInFlight("q-1")).toBe(false);
   });
 
-  it("a debounce run is not reported as a retry in flight", async () => {
+  it("a demand run is not reported as a retry in flight", async () => {
     const store = createInMemoryQuestionStore({ initial: [reg()] });
     const timers = manualTimers();
     let settle!: (value: unknown) => void;
@@ -608,9 +817,9 @@ describe("retry interleavings (review findings)", () => {
       timers: timers.api,
       now: () => NOW,
     });
-    scheduler.markSourceChanged("oura.sleep");
+    scheduler.markDemand("coach.weekly");
     await scheduler.whenIdle();
-    timers.fireAll(); // debounce fires; compute hangs
+    timers.fireAll(); // demand fires; compute hangs
     await Promise.resolve();
     expect(scheduler.retryInFlight("q-1")).toBe(false);
     settle(undefined);

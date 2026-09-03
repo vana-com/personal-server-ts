@@ -11,9 +11,12 @@ import { cloneAnswerShape, type AnswerShape } from "./answer-shape.js";
 export type QuestionStatus = "pending" | "ready" | "failed" | "stale";
 
 /**
- * When the answer recomputes: "on-change" follows every source change (the
- * original behavior and the default); "snapshot" computes at registration
- * and afterwards only on an explicit POST /questions/:id/recompute.
+ * When the answer recomputes: "on-change" (the default) goes stale on every
+ * source change and recomputes on the next authorized demand for the answer;
+ * "snapshot" computes at registration and afterwards only on an explicit
+ * POST /questions/:id/recompute. Two values, and only these two: the SDK
+ * validates the field against them, so the meaning of "on-change" moves
+ * rather than the vocabulary.
  */
 export type QuestionRecompute = "snapshot" | "on-change";
 

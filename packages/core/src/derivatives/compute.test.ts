@@ -483,7 +483,7 @@ describe("computeQuestion", () => {
     expect(fakeCalls(d)).toHaveLength(0);
   });
 
-  it("fires onDerivedWritten so a chain A -> B -> C refreshes C when A changes", async () => {
+  it("fires onDerivedWritten so a chain A -> B -> C refreshes C on demand when A changes", async () => {
     const storage = createMemoryDataStorage();
     const store = createInMemoryQuestionStore({
       initial: [
@@ -526,12 +526,28 @@ describe("computeQuestion", () => {
     scheduler.requestRecompute("q-b", { immediate: true });
     await scheduler.whenIdle();
     expect((await store.get("q-b"))!.status).toBe("ready");
+    // B landing does not compute C; C waits for a reader of its own scope.
+    expect((await store.get("q-c"))!.status).toBe("pending");
+    expect(provider.calls).toHaveLength(1);
+    scheduler.markDemand("c.final");
+    await scheduler.whenIdle();
     expect((await store.get("q-c"))!.status).toBe("ready");
     expect(provider.calls).toHaveLength(2);
 
-    // A changes: B recomputes, then C recomputes from the new B.
+    // A changes: both answers go stale, and neither costs anything yet.
     await seed(storage, "a.raw", { v: 2 }, "2026-08-21T00:00:00Z");
     scheduler.markSourceChanged("a.raw");
+    await scheduler.whenIdle();
+    expect(provider.calls).toHaveLength(2);
+    expect((await store.get("q-b"))!.status).toBe("stale");
+
+    // A reader of B pays for B, which marks C stale in turn; a reader of C
+    // then pays for C, and it reads the B that was just written.
+    scheduler.markDemand("b.mid");
+    await scheduler.whenIdle();
+    expect(provider.calls).toHaveLength(3);
+    expect((await store.get("q-c"))!.status).toBe("stale");
+    scheduler.markDemand("c.final");
     await scheduler.whenIdle();
     expect(provider.calls).toHaveLength(4);
     expect(storage.countVersions("b.mid")).toBe(2);

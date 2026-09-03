@@ -1,8 +1,15 @@
 /**
  * Recompute scheduler: marks registrations stale when one of their source
- * scopes changes and runs the compute after a quiet period, one in flight
- * per question. Timers and the clock are injectable so tests drive it
- * deterministically.
+ * scopes changes and runs the compute when someone actually asks for the
+ * answer, one in flight per question. Timers and the clock are injectable
+ * so tests drive it deterministically.
+ *
+ * Compute is just-in-time, not preemptive. A source refresh only marks the
+ * answer stale; the recompute happens on the next authorized demand (a read
+ * of the derived scope, the reader-facing status route, or an explicit
+ * `POST /questions/:id/recompute`). Otherwise the inference bill would
+ * scale with how often the owner's sources refresh rather than with how
+ * often anyone reads the answer.
  */
 
 import { computeDataPointId } from "../sync/data-point-id.js";
@@ -22,7 +29,11 @@ export interface RecomputeSchedulerOptions {
    * void) silently disables automatic retries, so forward it.
    */
   compute(questionId: string): Promise<ComputeOutcome | void>;
-  /** Quiet period after a source change (default 5s). */
+  /**
+   * Quiet period before a recompute that was requested without `immediate`
+   * (default 5s). A source change schedules nothing at all, and demand runs
+   * at once, so nothing on the default deployment waits on this.
+   */
   debounceMs?: number;
   /**
    * Backoff steps for automatic retry of a compute that failed with the
@@ -49,7 +60,8 @@ export interface RecomputeScheduler {
   /**
    * A scope got a new local version (ingest or sync). Every registration
    * that lists it as a source is marked `stale` (if it had a result) and
-   * scheduled. Fire and forget; failures are logged.
+   * NOTHING is scheduled: the recompute waits for demand. Fire and forget;
+   * failures are logged.
    */
   markSourceChanged(
     scope: string,
@@ -58,6 +70,20 @@ export interface RecomputeScheduler {
       lineageSources?: readonly string[];
     },
   ): void;
+  /**
+   * An authorized caller asked for the answer behind `derivedScope` — a read
+   * of the derived data, or the reader-facing status route. Every
+   * `on-change` question on that scope that is waiting for a compute
+   * (`stale` or `pending`) runs now; one already running or already
+   * scheduled is left alone, so N concurrent readers cause one compute.
+   *
+   * Callers MUST authorize first: this spends an inference call, and the
+   * whole point of running on demand is that the bill follows real reads.
+   * A `failed` question is not woken (its backoff chain or an explicit
+   * recompute owns it) so that polling a permanently failing question
+   * cannot spend a call per poll. Fire and forget; failures are logged.
+   */
+  markDemand(derivedScope: string): void;
   /** Schedule one question; `immediate` skips the debounce (owner recompute). */
   requestRecompute(questionId: string, options?: { immediate?: boolean }): void;
   /**
@@ -79,10 +105,14 @@ export interface RecomputeScheduler {
   /** Cancel pending timers. In-flight computes finish on their own. */
   stop(): void;
   /**
-   * Schedule every question left `pending` or `stale` (immediately). The
-   * first call is the boot reschedule: a restarted process only holds what
-   * the store holds, and those questions have no other way back onto a
-   * timer. Later calls resume after `stop()`; idempotent while running.
+   * Schedule every question left `pending` (immediately). The first call is
+   * the boot reschedule: a question that has never produced an answer is
+   * owed the compute its registration asked for, and a restarted process
+   * only holds what the store holds. A `stale` question is NOT swept — it
+   * has an answer to serve and waits for demand, otherwise every restart
+   * (and in PS-Lite every tab that opens) would pay for the recomputes this
+   * scheduler exists to defer. Later calls resume after `stop()`;
+   * idempotent while running.
    */
   start(): void;
 }
@@ -99,6 +129,12 @@ interface QuestionState {
   retryScheduled: boolean;
   /** A retry compute is running right now. */
   retryRunning: boolean;
+  /**
+   * A source changed while the current compute was reading: the answer it
+   * is about to write does not reflect that change, so the question goes
+   * back to `stale` when it settles.
+   */
+  sourceChangedDuringRun: boolean;
 }
 
 const DEFAULT_RETRY_DELAYS_MS: readonly number[] = [60_000, 300_000, 1_800_000];
@@ -173,6 +209,7 @@ export function createRecomputeScheduler(
         retryAtMs: null,
         retryScheduled: false,
         retryRunning: false,
+        sourceChangedDuringRun: false,
       };
       states.set(questionId, state);
     }
@@ -208,6 +245,11 @@ export function createRecomputeScheduler(
           state.running = null;
           state.retryAtMs = null;
           state.retryRunning = false;
+          // Consumed here whichever branch wins: a rerun and a retry both
+          // recompute from current data, so only the branch that schedules
+          // nothing has to put the question back to `stale`.
+          const sourceChangedDuringRun = state.sourceChangedDuringRun;
+          state.sourceChangedDuringRun = false;
           const retryable =
             isTransientFailureOutcome(outcome) ||
             // A runtime-unavailable skip DURING a chain consumes an attempt
@@ -239,6 +281,12 @@ export function createRecomputeScheduler(
             state.retryScheduled = true;
           } else {
             state.retryAttempts = 0;
+            if (sourceChangedDuringRun) {
+              // Fresh data landed while this compute was reading, so the
+              // answer it just wrote is already behind. Say so — and
+              // schedule nothing: the next reader triggers the recompute.
+              await markStale(questionId);
+            }
             if (!states.get(questionId)?.timer) {
               states.delete(questionId);
             }
@@ -263,6 +311,22 @@ export function createRecomputeScheduler(
       state.retryScheduled = false;
       run(questionId);
     }, delayMs);
+  }
+
+  /**
+   * Run this question because someone asked for its answer. Idempotent by
+   * design: a compute already in flight or already timed is the compute the
+   * demand wants, so concurrent readers collapse into one run. A pending
+   * RETRY timer is the exception — its backoff is a fallback for nobody
+   * asking, and a reader is asking now — so demand pulls it forward,
+   * keeping the attempt count (an exhausting chain stays bounded).
+   */
+  function scheduleDemand(questionId: string): void {
+    const state = stateFor(questionId);
+    if (state.running !== null) return;
+    if (state.timer !== null && !state.retryScheduled) return;
+    schedule(questionId, 0);
+    state.retryScheduled = false;
   }
 
   async function markStale(questionId: string): Promise<void> {
@@ -321,14 +385,58 @@ export function createRecomputeScheduler(
               // The new version descends from this question's own output.
               continue;
             }
+            // A change lands on a question whose compute is in flight: that
+            // compute never saw the new data, so its result must not settle
+            // as `ready`. Read the flag before and after the store write —
+            // the run can finish inside that await.
+            const state = states.get(registration.questionId);
+            const runningBefore = state?.running != null;
             await markStale(registration.questionId);
-            resetRetry(registration.questionId);
-            schedule(registration.questionId, debounceMs);
+            if (state && (runningBefore || state.running !== null)) {
+              state.sourceChangedDuringRun = true;
+            }
+            // Nothing is scheduled: the recompute is owed, not started. Any
+            // retry timer the question already carries stays as it is; the
+            // retry recomputes from current data anyway.
           }
         })().catch((err) =>
           warn(
             { scope, error: err instanceof Error ? err.name : String(err) },
             "Could not mark derivative questions stale",
+          ),
+        ),
+      );
+    },
+    markDemand(derivedScope) {
+      if (stopped) return;
+      void track(
+        (async () => {
+          const affected = await options.store.list({ derivedScope });
+          for (const registration of affected) {
+            if (registration.recompute === "snapshot") {
+              // A snapshot answers from the version it computed at
+              // registration; only an explicit recompute replaces it.
+              continue;
+            }
+            if (
+              registration.status !== "stale" &&
+              registration.status !== "pending"
+            ) {
+              // `ready` has nothing to compute, and `failed` belongs to its
+              // backoff chain or to an explicit recompute: a reader polling
+              // a question that keeps failing must not spend an inference
+              // call per poll.
+              continue;
+            }
+            scheduleDemand(registration.questionId);
+          }
+        })().catch((err) =>
+          warn(
+            {
+              derivedScope,
+              error: err instanceof Error ? err.name : String(err),
+            },
+            "Could not schedule derivative questions on demand",
           ),
         ),
       );
@@ -385,10 +493,10 @@ export function createRecomputeScheduler(
       void track(
         (async () => {
           for (const registration of await options.store.list()) {
-            if (
-              registration.status === "pending" ||
-              registration.status === "stale"
-            ) {
+            // Only never-answered questions. A `stale` one has a previous
+            // version to serve and is recomputed on demand, so a restart
+            // costs nothing.
+            if (registration.status === "pending") {
               schedule(registration.questionId, 0);
             }
           }

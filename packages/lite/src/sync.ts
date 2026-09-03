@@ -78,7 +78,7 @@ export interface PsLiteSyncOptions {
   logger?: Logger;
   /** Registers derivatives (envelopes carrying `$lineage`) with their lineage. */
   lineageGateway?: Pick<LineageGatewayPort, "registerDataPoint">;
-  /** Post-index download hook (derivative recompute on refresh). */
+  /** Post-index download hook (marks derivative questions stale). */
   onDataPointIndexed?: DownloadWorkerDeps["onDataPointIndexed"];
 }
 

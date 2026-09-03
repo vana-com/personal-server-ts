@@ -303,8 +303,8 @@ export interface PersonalServerDataApiDeps {
   /**
    * Called after a write is committed (owner or builder, JSON or binary).
    * The derivative compute layer uses it to mark questions that read the
-   * scope stale (recompute on refresh). Best-effort: a throwing hook is
-   * swallowed, the write already succeeded.
+   * scope stale; the recompute itself waits for a reader (see onDataRead).
+   * Best-effort: a throwing hook is swallowed, the write already succeeded.
    */
   onDataWritten?: (event: {
     scope: string;
@@ -312,6 +312,17 @@ export interface PersonalServerDataApiDeps {
     /** The stamped `$lineage.sources` of the written record, if any. */
     lineageSources?: string[];
   }) => void;
+  /**
+   * Called on GET /v1/data/:scope once the read is authorized (a live grant
+   * covering the scope, or the owner) and the scope is not tombstoned, and
+   * before anything is served. The derivative compute layer uses it to run
+   * a question whose answer is stale just in time: a source refresh only
+   * marks the answer stale, and this is the demand that pays for the
+   * recompute. Called for every scope — the compute layer decides whether a
+   * question is behind it. Best-effort and non-blocking: a throwing hook is
+   * swallowed and the read is never delayed by inference.
+   */
+  onDataRead?: (event: { scope: string }) => void;
 }
 
 export interface PersonalServerAccessLogsApiDeps {
@@ -817,6 +828,24 @@ function notifyDataWritten(
   }
 }
 
+function notifyDataRead(
+  deps: Pick<PersonalServerDataApiDeps, "onDataRead" | "logger">,
+  event: { scope: string },
+): void {
+  if (!deps.onDataRead) return;
+  try {
+    deps.onDataRead(event);
+  } catch (err) {
+    deps.logger?.warn?.(
+      {
+        scope: event.scope,
+        error: err instanceof Error ? err.message : String(err),
+      },
+      "onDataRead hook failed; the read is unaffected",
+    );
+  }
+}
+
 function notifyNewData(
   syncManager: PersonalServerDataApiDeps["syncManager"],
 ): void {
@@ -1162,6 +1191,16 @@ export async function handlePersonalServerDataRequest(
       // and before payment (so nobody is charged for deleted data). Covers
       // both a stale local copy of a tombstoned scope and a local miss.
       await assertScopeNotDeleted(deps, scopeResult.scope, selectedEntry);
+
+      // Demand: this authorized read is what pays for a recompute of a
+      // derivative whose sources have moved on. It runs after the gates
+      // above (an unauthenticated or refused read must never spend an
+      // inference call) and before the payment dance, because the status
+      // route grants the same caller the same trigger for free — gating it
+      // on payment would buy nothing and would leave a never-computed
+      // answer unreachable through this route. Nothing here blocks: a
+      // previous version is served now, the fresh one lands in a later read.
+      notifyDataRead(deps, { scope: scopeResult.scope });
 
       // X402 payment dance for builder reads. Owner-exempt reads (the
       // grantId sentinels "owner" / "policy-bypass") skip payment entirely
