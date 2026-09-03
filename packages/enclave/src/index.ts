@@ -27,8 +27,10 @@ export {
 export {
   deriveEnclaveAccount,
   deriveEnclaveIdentity,
+  deriveEnclaveKey,
   type EnclaveAccount,
   type EnclaveIdentity,
+  type EnclaveKey,
   type ServerAccount,
   type SignTypedDataParams,
 } from "./identity/wallet.js";

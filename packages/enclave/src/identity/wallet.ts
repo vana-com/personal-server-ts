@@ -7,7 +7,8 @@
  * wallet's, so a verifier can tie the address to the attested app.
  */
 
-import { privateKeyToAccount } from "viem/accounts";
+import { secp256k1 } from "@noble/curves/secp256k1";
+import { privateKeyToAccount, publicKeyToAddress } from "viem/accounts";
 import { toHex, type TypedDataDomain } from "viem";
 import type { DstackClient } from "../dstack/client.js";
 import { WALLET_PURPOSE, walletPath, type UserPsId } from "./paths.js";
@@ -38,6 +39,13 @@ export interface EnclaveIdentity {
   signatureChain: Uint8Array[];
 }
 
+export interface EnclaveKey {
+  key: Uint8Array;
+  address: `0x${string}`;
+  publicKey: `0x${string}`;
+  signatureChain: Uint8Array[];
+}
+
 /** Full account, same shape packages/server persists in key.json plus signers. */
 export interface EnclaveAccount extends ServerAccount {
   privateKey: `0x${string}`;
@@ -50,40 +58,62 @@ export async function deriveEnclaveAccount(
   id: UserPsId,
   epoch: number,
 ): Promise<EnclaveAccount> {
-  const { key } = await client.deriveKey(walletPath(id, epoch), WALLET_PURPOSE);
+  const { key } = await deriveEnclaveKey(client, id, epoch);
   const privateKey = toHex(key);
-  const account = privateKeyToAccount(privateKey);
 
-  return {
-    address: account.address,
-    publicKey: account.publicKey,
-    privateKey,
-    signTypedData: (params) => signTypedData(account, params),
-    signMessage: (message) => account.signMessage({ message }),
-  };
+  try {
+    const account = privateKeyToAccount(privateKey);
+    return {
+      address: account.address,
+      publicKey: account.publicKey,
+      privateKey,
+      signTypedData: (params) => signTypedData(account, params),
+      signMessage: (message) => account.signMessage({ message }),
+    };
+  } finally {
+    key.fill(0);
+  }
 }
 
 /**
  * Identity before registration: address and public key, nothing else kept.
- * The key buffer we hold is zero-filled; JavaScript cannot scrub the copies
- * viem made, so this narrows exposure rather than eliminating it.
+ * The derived key buffer is zero-filled after computing its public values.
  */
 export async function deriveEnclaveIdentity(
   client: DstackClient,
   id: UserPsId,
   epoch: number,
 ): Promise<EnclaveIdentity> {
+  const { key, address, publicKey, signatureChain } = await deriveEnclaveKey(
+    client,
+    id,
+    epoch,
+  );
+  key.fill(0);
+
+  return {
+    address,
+    publicKey,
+    epoch,
+    signatureChain,
+  };
+}
+
+export async function deriveEnclaveKey(
+  client: DstackClient,
+  id: UserPsId,
+  epoch: number,
+): Promise<EnclaveKey> {
   const { key, signatureChain } = await client.deriveKey(
     walletPath(id, epoch),
     WALLET_PURPOSE,
   );
-  const account = privateKeyToAccount(toHex(key));
-  key.fill(0);
+  const publicKey = toHex(secp256k1.getPublicKey(key, false));
 
   return {
-    address: account.address,
-    publicKey: account.publicKey,
-    epoch,
+    key,
+    address: publicKeyToAddress(publicKey),
+    publicKey,
     signatureChain,
   };
 }

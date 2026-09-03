@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { recoverMessageAddress } from "viem";
+import { DSTACK_KEY_BYTES } from "../dstack/client.js";
 import { createFakeDstackClient } from "../dstack/fake.js";
 import { FIRST_EPOCH, userPsId } from "./paths.js";
-import { deriveEnclaveAccount, deriveEnclaveIdentity } from "./wallet.js";
+import {
+  deriveEnclaveAccount,
+  deriveEnclaveIdentity,
+  deriveEnclaveKey,
+} from "./wallet.js";
 
 const APP_A = "0000000000000000000000000000000000000001";
 const APP_B = "0000000000000000000000000000000000000002";
@@ -12,6 +17,16 @@ const NEXT_EPOCH = FIRST_EPOCH + 1;
 const UNCOMPRESSED_PUBKEY_HEX_LENGTH = 2 + 65 * 2;
 
 describe("deriveEnclaveAccount", () => {
+  it("matches the raw enclave key", async () => {
+    const client = createFakeDstackClient({ appId: APP_A });
+    const key = await deriveEnclaveKey(client, ID, FIRST_EPOCH);
+    const account = await deriveEnclaveAccount(client, ID, FIRST_EPOCH);
+
+    expect(key.address).toBe(account.address);
+    expect(key.publicKey).toBe(account.publicKey);
+    expect(key.key).toHaveLength(DSTACK_KEY_BYTES);
+  });
+
   it("same appId and path on two clients gives the same address", async () => {
     const one = await deriveEnclaveAccount(
       createFakeDstackClient({ appId: APP_A, instanceId: "node-1" }),

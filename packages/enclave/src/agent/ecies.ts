@@ -46,15 +46,21 @@ export function decryptEcies(
   const keyMaterial = createHash("sha512").update(shared).digest();
   const encKey = keyMaterial.subarray(0, ENC_KEY_BYTES);
   const macKey = keyMaterial.subarray(ENC_KEY_BYTES);
-  const authenticated = payload.subarray(0, macStart);
-  const expectedMac = createHmac("sha256", macKey)
-    .update(authenticated)
-    .digest();
 
-  if (!timingSafeEqual(mac, expectedMac)) {
-    throw new Error("ECIES authentication failed");
+  try {
+    const authenticated = payload.subarray(0, macStart);
+    const expectedMac = createHmac("sha256", macKey)
+      .update(authenticated)
+      .digest();
+
+    if (!timingSafeEqual(mac, expectedMac)) {
+      throw new Error("ECIES authentication failed");
+    }
+
+    const decipher = createDecipheriv(CIPHER, encKey, iv);
+    return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  } finally {
+    sharedPoint.fill(0);
+    keyMaterial.fill(0);
   }
-
-  const decipher = createDecipheriv(CIPHER, encKey, iv);
-  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 }

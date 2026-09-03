@@ -6,7 +6,7 @@ import type {
 import { getAddress, hexToBytes, recoverMessageAddress, toHex } from "viem";
 import type { DstackClient } from "../dstack/client.js";
 import { FIRST_EPOCH, userPsId } from "../identity/paths.js";
-import { deriveEnclaveAccount } from "../identity/wallet.js";
+import { deriveEnclaveKey } from "../identity/wallet.js";
 import { seal } from "../sealing/envelope.js";
 import { decryptEcies } from "./ecies.js";
 import {
@@ -38,21 +38,19 @@ export async function sealDelivery(
   }
 
   const id = userPsId(request.chainId, request.ownerAddress);
-  const account = await deriveEnclaveAccount(client, id, request.epoch);
-  if (getAddress(account.address) !== getAddress(request.enclaveAddress)) {
-    account.privateKey = "0x";
+  const derived = await deriveEnclaveKey(client, id, request.epoch);
+  if (getAddress(derived.address) !== getAddress(request.enclaveAddress)) {
+    derived.key.fill(0);
     throw new EnclaveAddressMismatch();
   }
 
-  const privateKey = hexToBytes(account.privateKey);
-  account.privateKey = "0x";
   let plaintext: Uint8Array;
   try {
-    plaintext = decryptEcies(privateKey, hexToBytes(request.ciphertext));
+    plaintext = decryptEcies(derived.key, hexToBytes(request.ciphertext));
   } catch {
     throw new DeliveryInvalid();
   } finally {
-    privateKey.fill(0);
+    derived.key.fill(0);
   }
 
   let delivery: MasterSignatureDelivery;
@@ -66,7 +64,7 @@ export async function sealDelivery(
   }
   plaintext.fill(0);
 
-  validateDelivery(delivery, request, id, account.address);
+  validateDelivery(delivery, request, id, derived.address);
   if (getAddress(delivery.ownerAddress) !== getAddress(request.ownerAddress)) {
     throw new OwnerMismatch();
   }

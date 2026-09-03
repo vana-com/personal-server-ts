@@ -54,17 +54,24 @@ export async function seal(
   secret: Uint8Array,
 ): Promise<SealedEnvelope> {
   const aad = sealingAad(id, epoch);
-  const contentKey = randomBytes(CONTENT_KEY_BYTES);
   const { key: sealingKey } = await client.deriveKey(
     sealingPath(id, epoch),
     SEALING_PURPOSE,
   );
 
-  const box = encrypt(contentKey, secret, aad);
-  const wrappedContentKey = encrypt(sealingKey, contentKey, aad);
-  contentKey.fill(0);
+  try {
+    const contentKey = randomBytes(CONTENT_KEY_BYTES);
+    try {
+      const box = encrypt(contentKey, secret, aad);
+      const wrappedContentKey = encrypt(sealingKey, contentKey, aad);
 
-  return { v: SEALED_ENVELOPE_VERSION, wrappedContentKey, ...box };
+      return { v: SEALED_ENVELOPE_VERSION, wrappedContentKey, ...box };
+    } finally {
+      contentKey.fill(0);
+    }
+  } finally {
+    sealingKey.fill(0);
+  }
 }
 
 export async function unseal(
@@ -83,11 +90,16 @@ export async function unseal(
     SEALING_PURPOSE,
   );
 
-  const contentKey = decrypt(sealingKey, envelope.wrappedContentKey, aad);
-  const secret = decrypt(contentKey, envelope, aad);
-  contentKey.fill(0);
-
-  return secret;
+  try {
+    const contentKey = decrypt(sealingKey, envelope.wrappedContentKey, aad);
+    try {
+      return decrypt(contentKey, envelope, aad);
+    } finally {
+      contentKey.fill(0);
+    }
+  } finally {
+    sealingKey.fill(0);
+  }
 }
 
 export function sealingAad(id: UserPsId, epoch: number): Buffer {
