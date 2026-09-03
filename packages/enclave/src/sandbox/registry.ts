@@ -129,9 +129,7 @@ export function createSandboxRegistry(
         entries,
         runtime: options.runtime,
         idleTtlMs,
-        now,
         setTimer,
-        isDraining: () => draining,
       });
     },
     async drain(): Promise<void> {
@@ -263,9 +261,7 @@ interface ExpiryOptions {
   entries: Map<string, RegistryEntry>;
   runtime: SandboxRuntime;
   idleTtlMs: number;
-  now: () => number;
   setTimer: SetTimer;
-  isDraining: () => boolean;
 }
 
 function scheduleExpiry(options: ExpiryOptions): void {
@@ -298,17 +294,12 @@ async function expireEntry(options: ExpiryOptions): Promise<void> {
     return;
   }
 
+  const handleId = options.entry.handle.id;
+  destroyEntry(options.entries, options.key, options.entry);
   try {
-    await options.runtime.stop(options.entry.handle.id);
-    destroyEntry(options.entries, options.key, options.entry);
+    await options.runtime.stop(handleId);
   } catch {
-    if (options.isDraining()) {
-      return;
-    }
-
-    options.entry.state = "ready";
-    options.entry.lastUsedAt = options.now();
-    scheduleExpiry(options);
+    return;
   }
 }
 

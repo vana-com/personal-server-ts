@@ -10,6 +10,15 @@ import type { SandboxHandle, SandboxRuntime, SandboxSpec } from "./runtime.js";
 
 const USER_PS_ID = `0x${"12".repeat(32)}` as Hex;
 
+function deferred<T>() {
+  let resolvePromise: (value: T) => void = () => {};
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+
+  return { promise, resolve: resolvePromise };
+}
+
 class FakeClock {
   nowMs = 0;
   timers: Array<{
@@ -132,6 +141,34 @@ describe("sandbox registry", () => {
 
     expect(second).toEqual(first);
     expect(runtime.stops).toEqual([]);
+  });
+
+  it("starts a fresh sandbox while an expired sandbox is stopping", async () => {
+    const stopping = deferred<void>();
+    const runtime = memoryRuntime();
+    runtime.stop = vi.fn(() => stopping.promise);
+    const clock = new FakeClock();
+    const registry = createSandboxRegistry({
+      runtime,
+      max: 1,
+      idleTtlMs: 100,
+      now: clock.now,
+      setTimer: clock.setTimer,
+    });
+    const first = await registry.acquire("owner:1", buildSpec);
+    registry.release("owner:1");
+
+    clock.advance(100);
+    clock.advance(0);
+    await flush();
+    const second = await registry.acquire("owner:1", buildSpec);
+
+    expect(second.handle.id).not.toBe(first.handle.id);
+    expect(runtime.starts).toHaveLength(2);
+
+    stopping.resolve();
+    await flush();
+    expect(registry.activeCount()).toBe(1);
   });
 
   it("evicts the least recently used idle sandbox", async () => {
