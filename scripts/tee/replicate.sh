@@ -19,8 +19,6 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$script_dir/common.sh"
 phala_node_id=18
 NODE_ID=$name
-readonly CVM_READY_ATTEMPTS=120
-readonly CVM_READY_INTERVAL_SECONDS=5
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -48,6 +46,7 @@ done
 command -v openssl >/dev/null || { echo "openssl is required" >&2; exit 1; }
 command -v phala >/dev/null || { echo "phala CLI is required" >&2; exit 1; }
 command -v node >/dev/null || { echo "Node.js is required" >&2; exit 1; }
+command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
 
 NODE_SECRET=$(openssl rand -hex 32)
 create_secure_env_file
@@ -153,5 +152,6 @@ fi
 
 printf 'uuid=%s\napp_id=%s\nagent_url=%s\nagent_url_source=%s\n' \
   "$uuid" "$app_id" "$agent_url" "$domain_path"
+verify_agent_node_id "$agent_url" "$NODE_ID" "$ENCLAVE_AGENT_SECRET"
 capacity=${SANDBOX_MAX:-20}
 print_registration_payload "$NODE_ID" "$app_id" "$compose_hash" "$agent_url" "$capacity"

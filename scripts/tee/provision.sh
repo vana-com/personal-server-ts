@@ -65,6 +65,7 @@ done
 : "${ENCLAVE_AGENT_SECRET:?ENCLAVE_AGENT_SECRET must be set in the environment}"
 command -v phala >/dev/null || { echo "phala CLI is required" >&2; exit 1; }
 command -v node >/dev/null || { echo "Node.js is required" >&2; exit 1; }
+command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
 [[ -f $compose ]] || { echo "Compose file not found: $compose" >&2; exit 1; }
 
 identity_only=false
@@ -210,6 +211,7 @@ printf 'uuid=%s\napp_id=%s\nnonce=%s\nagent_url=%s\nagent_url_source=%s\n' \
   "$uuid" "$app_id" "$nonce" "$agent_url" "$domain_path"
 
 if [[ $identity_only == false ]]; then
+  verify_agent_node_id "$agent_url" "$NODE_ID" "$ENCLAVE_AGENT_SECRET"
   capacity=${SANDBOX_MAX:-20}
   print_registration_payload "$NODE_ID" "$app_id" "$compose_hash" "$agent_url" "$capacity"
 fi

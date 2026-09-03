@@ -66,11 +66,11 @@ All nodes serving one owner's jobs must otherwise be replicas under one
 `app_id`.
 
 The registration payload's `nodeId` must exactly equal the CVM's baked
-`NODE_ID`. The script uses one value for both, but do not hand-edit it: a typo
-or a hand-edited registration nodeId that differs from the CVM's baked
-`NODE_ID` just looks like a heartbeat that never arrives — no error surfaces
-anywhere. `/agent/v1/health` does not expose `NODE_ID`, so there is no live
-cross-check.
+`NODE_ID`. Before printing the payload, both scripts poll `/agent/v1/health`
+with `ENCLAVE_AGENT_SECRET` until the agent reports its baked `nodeId`. A match
+continues; a mismatch fails immediately and names both values. An unreachable
+or not-yet-booted agent is retried for up to 120 attempts at five-second
+intervals, then fails without printing a registration payload.
 
 The agent begins node heartbeats immediately. Once a fresh heartbeat records
 the expected compose hash, admit the node:
