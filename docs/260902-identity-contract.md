@@ -224,6 +224,7 @@ Tests: `tests/identity-handlers.test.ts` mocking `../db/index.js` and the agent 
 9. **Fleet replicas share one `app_id`** (a different `app_id` cannot decrypt the fleet's jobs); each replica gets its own `NODE_ID`/`NODE_SECRET` via `phala cvms replicate -e <env-file>`.
 10. **Account builds against throwaway vana-sdk #208** (main + escrow #186 + #207, dist-tag `pr-208`) until #186 merges; close #208 then.
 11. **Web consent panel** ships behind `NEXT_PUBLIC_PS_ENCLAVE_ENABLED` (default off), copy marked draft in `enclave-copy.ts`, revoke disabled until the SDK has a deregistration builder.
+12. **Web external-wallet owners are refused in v1 (2026-09-03, unity-surfaces #990 review).** The browser fallback that signed `vana-master-key-v1` and ECIES-encrypted client-side is removed (raw signature never in web JS, section 4). Account's signing exchange (`POST /api/v1/signing-exchanges`) accepts Desktop clients only, so Web shows a non-retryable "not supported yet" state. Decision 5 (external wallets in scope) still needs an Account change: open the exchange to Web sessions, or an Account-origin signing route that returns ciphertext only.
 
 ### Critical files
 
