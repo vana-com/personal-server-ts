@@ -306,6 +306,8 @@ blobs                = no conditional PUT needed in v1 (single executor per user
 
 Done in parts on 2026-09-02 (Spikes 1 to 4, `docs/260902-enclave-spike-results.md`): derivation identical across CVMs and compose updates; local queue submit → claim p95 220 ms at 50 jobs/min with 3 workers, `?wait=25` result p95 534 ms; sandbox cold start 7.5 s p50. Hydration measured 2026-09-02 (50 MB owner: 65 s p95 to sync complete on 1 vCPU). Queue on a Vercel preview measured the same day (submit→claim p95 1.6 s at 50/min, three workers); decision 20's trigger did not fire, with little margin. Remaining: the chained run (job through the preview queue to a CVM sandbox) once the node agent and job routes are real code.
 
+**Identity flow verified end to end (2026-09-03).** Node agent (`packages/enclave`, registry-free compose in `deploy/dstack`) on two Phala CVMs under one `app_id`, Gateway preview (`api/v1/identity`) with a Neon branch, scripted owner (`scripts/e2e-identity.ts`): prepare, evidence verify against the live KMS root, V2 registration, sealed delivery, idempotency, three negatives, revoke to epoch 2, all pass; a delivery encrypted to node A's evidence key was unsealed by node B through product code. Agent boot to healthy 124 s including CVM boot (install at boot; production pins an image digest). Still unverified: concurrent density and the chained wake run.
+
 ## Open
 
 1. Anna's sign-off on the June reversal, revocation wording, and the no-second-wrap stance. Blocks ratification.
