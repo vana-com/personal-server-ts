@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import {
   createGatewayClient,
+  GatewayHttpError,
   LeaseLostError,
   NodeNotAdmittedError,
 } from "./gateway-client.js";
@@ -13,14 +14,16 @@ const FENCING_TOKEN = 2;
 let server: Server;
 let origin: string;
 let responder: (request: IncomingMessage) => number;
+let responseBody: unknown;
 
 beforeEach(async () => {
   responder = () => 204;
+  responseBody = { code: "ERROR" };
   server = createServer((request, response) => {
     response.statusCode = responder(request);
     if (response.statusCode !== 204) {
       response.setHeader("content-type", "application/json");
-      response.end(JSON.stringify({ code: "ERROR" }));
+      response.end(JSON.stringify(responseBody));
       return;
     }
 
@@ -41,6 +44,46 @@ afterEach(async () => {
 });
 
 describe("GatewayClient", () => {
+  it("returns a valid successful claim body", async () => {
+    responder = () => 200;
+    responseBody = {
+      job: {
+        jobId: JOB_ID,
+        fencingToken: FENCING_TOKEN,
+        requestCiphertext: "ciphertext",
+      },
+      identity: {
+        userPsId: "0x01",
+        epoch: 1,
+        enclaveAddress: "0x1111111111111111111111111111111111111111",
+        enclavePublicKey: "0x02",
+        sealedEnvelope: {},
+      },
+    };
+    const client = createGatewayClient({
+      baseUrl: origin,
+      nodeId: NODE_ID,
+      nodeSecret: NODE_SECRET,
+    });
+
+    await expect(
+      client.claim(25, { leaseSeconds: 30, capacity: 20 }),
+    ).resolves.toEqual(responseBody);
+  });
+
+  it("rejects a malformed successful claim body", async () => {
+    responder = () => 200;
+    const client = createGatewayClient({
+      baseUrl: origin,
+      nodeId: NODE_ID,
+      nodeSecret: NODE_SECRET,
+    });
+
+    await expect(
+      client.claim(25, { leaseSeconds: 30, capacity: 20 }),
+    ).rejects.toBeInstanceOf(GatewayHttpError);
+  });
+
   it("sends node headers and maps an empty claim to null", async () => {
     responder = (request) => {
       expect(request.url).toBe("/v1/jobs/claim?wait=25");

@@ -5,6 +5,8 @@ import type { ClaimResponse } from "./types.js";
 const BACKOFF_MS = 5_000;
 const CLAIM_FAILURE_MESSAGE = "Gateway claim loop unavailable";
 const CLAIM_RECOVERY_MESSAGE = "Gateway claim loop recovered";
+const JOB_RUN_FAILURE_MESSAGE = "Claimed job run failed";
+const UNKNOWN_ERROR = "unknown";
 
 export interface JobLogger {
   info(context: Record<string, unknown>, message: string): void;
@@ -73,6 +75,11 @@ export function startClaimLoop(options: ClaimLoopOptions): ClaimLoop {
       running = 1;
       try {
         await options.run(claim.job, claim.identity);
+      } catch (error) {
+        options.logger.warn(
+          { jobId: claim.job.jobId, error: errorSummary(error) },
+          JOB_RUN_FAILURE_MESSAGE,
+        );
       } finally {
         running = 0;
       }
@@ -97,4 +104,12 @@ export function startClaimLoop(options: ClaimLoopOptions): ClaimLoop {
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function errorSummary(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return UNKNOWN_ERROR;
+  }
+
+  return `${error.name}: ${error.message}`;
 }

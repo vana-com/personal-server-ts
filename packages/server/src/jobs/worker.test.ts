@@ -32,6 +32,7 @@ import type {
   ProtocolGatewayPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
+import { deriveBuilderId } from "@opendatalabs/personal-server-ts-core/policy";
 import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
 import { privateKeyToAccount } from "viem/accounts";
 import { executeJob, JobFailure, type JobWorkerDeps } from "./worker.js";
@@ -41,7 +42,6 @@ const DEADLINE = "2026-09-03T12:05:00.000Z";
 const SCOPE = "instagram.profile";
 const AUTH_AUDIENCE = "http://localhost:8080";
 const RECORD_VALUE = "TOP_SECRET_RECORD";
-const GRANTEE_ID = `0x${"44".repeat(32)}` as const;
 const GRANT_ID = `0x${"55".repeat(32)}` as const;
 // SDK jobs.test.ts fixture: builderPublicKey is the literal "0x1234".
 const VECTOR_PUBLIC_KEY = "0x1234" as const;
@@ -78,6 +78,16 @@ const gatewayConfig = {
     feeRegistry: owner.address,
   },
 } satisfies DataPortabilityGatewayConfig;
+const BUILDER_APP_URL = "https://builder.example";
+const GRANTEE_ID = deriveBuilderId(
+  {
+    ownerAddress: builderOwner.address,
+    granteeAddress: builder.address,
+    publicKey: builderAccount.publicKey,
+    appUrl: BUILDER_APP_URL,
+  },
+  gatewayConfig,
+);
 
 type SignedGrant = GatewayGrantResponse & { signature?: string };
 type SignedBuilder = Builder & { signature?: string };
@@ -97,7 +107,7 @@ async function createFixture(): Promise<Fixture> {
     ownerAddress: builderOwner.address,
     granteeAddress: builder.address,
     publicKey: builderAccount.publicKey,
-    appUrl: "https://builder.example",
+    appUrl: BUILDER_APP_URL,
     addedAt: NOW.toISOString(),
   };
   builderRecord.signature = await builderOwner.signTypedData({

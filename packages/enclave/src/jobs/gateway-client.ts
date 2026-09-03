@@ -108,7 +108,17 @@ export function createGatewayClient(
         throw httpError(response);
       }
 
-      return (await response.json()) as ClaimResponse;
+      let claim: unknown;
+      try {
+        claim = await response.json();
+      } catch {
+        throw new GatewayHttpError(response.status);
+      }
+      if (!isClaimResponse(claim)) {
+        throw new GatewayHttpError(response.status);
+      }
+
+      return claim;
     },
     heartbeat(jobId, body): Promise<FencedResponse> {
       return request(
@@ -150,4 +160,25 @@ function httpError(response: Response): Error {
   }
 
   return new GatewayHttpError(response.status);
+}
+
+function isClaimResponse(value: unknown): value is ClaimResponse {
+  if (!isRecord(value) || !isRecord(value.job) || !isRecord(value.identity)) {
+    return false;
+  }
+
+  return (
+    typeof value.job.jobId === "string" &&
+    typeof value.job.fencingToken === "number" &&
+    typeof value.job.requestCiphertext === "string" &&
+    typeof value.identity.userPsId === "string" &&
+    typeof value.identity.epoch === "number" &&
+    typeof value.identity.enclaveAddress === "string" &&
+    typeof value.identity.enclavePublicKey === "string" &&
+    isRecord(value.identity.sealedEnvelope)
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

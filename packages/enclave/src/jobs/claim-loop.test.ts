@@ -42,6 +42,42 @@ function loggerFake(): JobLogger {
 }
 
 describe("claim loop", () => {
+  it("continues claiming after a job run rejects", async () => {
+    const gateway = gatewayFake();
+    const registry = registryFake();
+    const logger = loggerFake();
+    const lastClaim = deferred<ClaimResponse | null>();
+    vi.mocked(gateway.claim)
+      .mockResolvedValueOnce(CLAIM)
+      .mockResolvedValueOnce(CLAIM)
+      .mockImplementationOnce(() => lastClaim.promise);
+    const run = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("run failed"))
+      .mockResolvedValueOnce(undefined);
+    const loop = startClaimLoop({
+      gateway,
+      run,
+      registry,
+      leaseSeconds: 30,
+      wait: 25,
+      capacity: 20,
+      logger,
+    });
+
+    await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(gateway.claim).toHaveBeenCalledTimes(3));
+    expect(loop.running()).toBe(0);
+    expect(logger.warn).toHaveBeenCalledWith(
+      { jobId: "job-1", error: "Error: run failed" },
+      "Claimed job run failed",
+    );
+
+    const draining = loop.drain();
+    lastClaim.resolve(null);
+    await draining;
+  });
+
   it("runs claims sequentially and drain waits for in-flight work", async () => {
     const gateway = gatewayFake();
     const registry = registryFake();

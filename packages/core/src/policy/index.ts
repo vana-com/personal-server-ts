@@ -5,6 +5,7 @@ export {
   type DataReadPolicyPorts,
 } from "./data-read.js";
 export {
+  deriveBuilderId,
   verifySignedArtifacts,
   type SignedArtifactInput,
   type SignedBuilder,
