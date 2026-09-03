@@ -2,6 +2,7 @@ import { agentConfigFromEnv } from "./bootstrap.js";
 
 const TAGGED_IMAGE = "personal-server:test";
 const DIGEST_IMAGE = `personal-server@sha256:${"a".repeat(64)}`;
+const IMAGE_ID = `sha256:${"b".repeat(64)}`;
 
 describe("agentConfigFromEnv", () => {
   it("boots the fake with the default app id", async () => {
@@ -129,6 +130,22 @@ describe("agentConfigFromEnv", () => {
     });
   });
 
+  it("accepts a Docker image id for the docker runtime", () => {
+    const config = agentConfigFromEnv({
+      DSTACK_FAKE: "1",
+      ENCLAVE_AGENT_SECRET: "agent-secret",
+      GATEWAY_URL: "https://gateway.example",
+      NODE_ID: "node-1",
+      NODE_SECRET: "node-secret",
+      PS_IMAGE: IMAGE_ID,
+    });
+
+    expect(config.jobs).toMatchObject({
+      runtime: "docker",
+      image: IMAGE_ID,
+    });
+  });
+
   it("rejects a tagged image for the docker runtime", () => {
     expect(() =>
       agentConfigFromEnv({
@@ -139,7 +156,24 @@ describe("agentConfigFromEnv", () => {
         NODE_SECRET: "node-secret",
         PS_IMAGE: TAGGED_IMAGE,
       }),
-    ).toThrow("PS_IMAGE must use a sha256 digest for the docker runtime");
+    ).toThrow(
+      "PS_IMAGE must be a sha256 digest (name@sha256:<64 hex>) or a Docker image id (sha256:<64 hex>) for the docker runtime",
+    );
+  });
+
+  it("rejects a malformed Docker image id", () => {
+    expect(() =>
+      agentConfigFromEnv({
+        DSTACK_FAKE: "1",
+        ENCLAVE_AGENT_SECRET: "agent-secret",
+        GATEWAY_URL: "https://gateway.example",
+        NODE_ID: "node-1",
+        NODE_SECRET: "node-secret",
+        PS_IMAGE: "sha256:short",
+      }),
+    ).toThrow(
+      "PS_IMAGE must be a sha256 digest (name@sha256:<64 hex>) or a Docker image id (sha256:<64 hex>) for the docker runtime",
+    );
   });
 
   it("rejects an insecure gateway URL for the docker runtime", () => {

@@ -16,10 +16,11 @@ const DEFAULT_SYNC_MODE = "enabled";
 const MILLISECONDS_PER_SECOND = 1_000;
 const MIN_POSITIVE_INTEGER = 1;
 const MIN_NONNEGATIVE_INTEGER = 0;
-const DOCKER_IMAGE_PATTERN = /^.+@sha256:[0-9a-f]{64}$/;
+const DOCKER_IMAGE_DIGEST_PATTERN = /^.+@sha256:[0-9a-f]{64}$/;
+const DOCKER_IMAGE_ID_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const HTTPS_PROTOCOL = "https:";
 const DOCKER_IMAGE_ERROR =
-  "PS_IMAGE must use a sha256 digest for the docker runtime";
+  "PS_IMAGE must be a sha256 digest (name@sha256:<64 hex>) or a Docker image id (sha256:<64 hex>) for the docker runtime";
 const DOCKER_GATEWAY_ERROR =
   "GATEWAY_URL must use https for the docker runtime";
 
@@ -117,7 +118,11 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
   } catch {
     throw new Error("GATEWAY_URL must be a valid URL");
   }
-  if (runtime === "docker" && !DOCKER_IMAGE_PATTERN.test(image)) {
+  if (
+    runtime === "docker" &&
+    !DOCKER_IMAGE_DIGEST_PATTERN.test(image) &&
+    !DOCKER_IMAGE_ID_PATTERN.test(image)
+  ) {
     throw new Error(DOCKER_IMAGE_ERROR);
   }
   if (runtime === "docker" && gatewayUrl.protocol !== HTTPS_PROTOCOL) {
