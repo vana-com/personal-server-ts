@@ -7,6 +7,10 @@ import { createFakeDstackClient } from "../dstack/fake.js";
 import type { DstackClient } from "../dstack/client.js";
 import { WALLET_PURPOSE, type UserPsId } from "../identity/paths.js";
 import { deriveEnclaveIdentity } from "../identity/wallet.js";
+import {
+  createDockerRuntime,
+  type DockerClient,
+} from "../sandbox/docker-runtime.js";
 import { createSandboxRegistry } from "../sandbox/registry.js";
 import type {
   SandboxHandle,
@@ -292,6 +296,55 @@ describe("runJob", () => {
       ].sort(),
     );
     expect(fixture.keyFill).toHaveBeenCalledWith(0);
+  });
+
+  it("awaits the configured work delay on the docker runtime path", async () => {
+    const fixture = await createFixture();
+    const sandboxPort = Number(new URL(sandboxOrigin).port);
+    const docker: DockerClient = {
+      run: vi.fn(async (command) =>
+        command === "create" ? "container-id" : "",
+      ),
+      inspect: vi.fn().mockResolvedValue({
+        running: true,
+        hostPort: sandboxPort,
+      }),
+    };
+    const runtime = createDockerRuntime({
+      docker,
+      runtimeHost: "127.0.0.1",
+      health: async () => true,
+    });
+    fixture.deps.registry = createSandboxRegistry({ runtime });
+    fixture.deps.workDelayMs = 120_000;
+    let finishDelay: (() => void) | undefined;
+    fixture.deps.sleep = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishDelay = resolve;
+        }),
+    );
+    fixture.deps.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(RESULT), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    const running = runJob(fixture.job, fixture.identity, fixture.deps);
+    await vi.waitFor(() =>
+      expect(fixture.deps.sleep).toHaveBeenCalledWith(120_000),
+    );
+
+    expect(fixture.deps.fetch).not.toHaveBeenCalled();
+    finishDelay?.();
+    await running;
+    expect(fixture.deps.fetch).toHaveBeenCalledOnce();
+    expect(docker.run).toHaveBeenCalledWith(
+      "create",
+      expect.any(Array),
+      expect.any(Object),
+    );
   });
 
   it("fails a request whose inner binding does not match the claim", async () => {
