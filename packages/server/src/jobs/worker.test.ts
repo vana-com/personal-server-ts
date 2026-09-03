@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { pino } from "pino";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -6,14 +7,20 @@ import {
   NodeECIESProvider,
   builderRegistrationDomain,
   grantRegistrationDomain,
+  parseWeb3SignedHeader,
+  verifyWeb3Signed,
   type Builder,
   type DataFileEnvelope,
   type DataPortabilityGatewayConfig,
   type GatewayGrantResponse,
 } from "@opendatalabs/vana-sdk/node";
-import { openJobResult } from "@opendatalabs/vana-sdk/crypto/envelope/job";
+import {
+  canonicalJobRequestBytes,
+  openJobResult,
+} from "@opendatalabs/vana-sdk/crypto/envelope/job";
 import {
   MAX_INLINE_RESULT_BYTES,
+  type JobRequest,
   type JobRequestEnvelope,
 } from "@opendatalabs/vana-sdk/protocol/jobs";
 import {
@@ -26,7 +33,6 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/ports";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
-import { canonicalJsonBytes } from "@opendatalabs/personal-server-ts-core/policy";
 import { privateKeyToAccount } from "viem/accounts";
 import { executeJob, JobFailure, type JobWorkerDeps } from "./worker.js";
 
@@ -36,6 +42,21 @@ const SCOPE = "instagram.profile";
 const RECORD_VALUE = "TOP_SECRET_RECORD";
 const GRANTEE_ID = `0x${"44".repeat(32)}` as const;
 const GRANT_ID = `0x${"55".repeat(32)}` as const;
+const VECTOR_PUBLIC_KEY = `0x04${"00".repeat(64)}` as const;
+const VECTOR_REQUEST = {
+  v: 1,
+  jobId: "00000000-0000-4000-8000-000000000001",
+  owner: "0x0000000000000000000000000000000000000001",
+  builder: "0x0000000000000000000000000000000000000002",
+  builderPublicKey: VECTOR_PUBLIC_KEY,
+  grantId: `0x${"00".repeat(32)}`,
+  scope: "profile.email",
+  operation: "raw_read",
+  pinnedVersion: null,
+  deadline: "2026-01-01T00:00:00.000Z",
+} satisfies JobRequest;
+const VECTOR_CANONICAL_JSON =
+  '{"builder":"0x0000000000000000000000000000000000000002","builderPublicKey":"0x0400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","deadline":"2026-01-01T00:00:00.000Z","grantId":"0x0000000000000000000000000000000000000000000000000000000000000000","jobId":"00000000-0000-4000-8000-000000000001","operation":"raw_read","owner":"0x0000000000000000000000000000000000000001","pinnedVersion":null,"scope":"profile.email","v":1}';
 const owner = createTestWallet(20);
 const builder = createTestWallet(21);
 const builderOwner = createTestWallet(22);
@@ -210,7 +231,7 @@ async function signRequest(
     aud: "http://localhost:8080",
     method: "POST",
     uri: "/v1/jobs/execute",
-    body: canonicalJsonBytes(request),
+    body: canonicalJobRequestBytes(request),
     iat: Math.floor(NOW.getTime() / 1_000) - 1,
     exp: Math.floor(NOW.getTime() / 1_000) + 300,
   });
@@ -232,6 +253,34 @@ async function expectFailure(
 }
 
 describe("executeJob", () => {
+  it("verifies builder auth over the SDK canonical request hash", async () => {
+    const bytes = canonicalJobRequestBytes(VECTOR_REQUEST);
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const auth = await buildWeb3SignedHeader({
+      wallet: builder,
+      aud: "http://localhost:8080",
+      method: "POST",
+      uri: "/v1/jobs/execute",
+      body: bytes,
+      iat: Math.floor(NOW.getTime() / 1_000) - 1,
+      exp: Math.floor(NOW.getTime() / 1_000) + 300,
+    });
+    const verified = await verifyWeb3Signed({
+      headerValue: auth,
+      expectedOrigin: "http://localhost:8080",
+      expectedMethod: "POST",
+      expectedPath: "/v1/jobs/execute",
+      bodyBytes: bytes,
+      now: Math.floor(NOW.getTime() / 1_000),
+    });
+
+    // TODO(sdk-jobs): assert the pinned hash once its builderPublicKey fixture ships.
+    expect(new TextDecoder().decode(bytes)).toBe(VECTOR_CANONICAL_JSON);
+    expect(new TextDecoder().decode(bytes)).not.toContain("\n");
+    expect(parseWeb3SignedHeader(auth).payload.bodyHash).toBe(`sha256:${hash}`);
+    expect(verified.signer.toLowerCase()).toBe(builder.address.toLowerCase());
+  });
+
   it("redacts and encrypts a raw-read result to the builder key", async () => {
     const fixture = await createFixture();
     const response = await executeJob(fixture.envelope, fixture.deps);

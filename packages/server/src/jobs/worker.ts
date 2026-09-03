@@ -18,7 +18,6 @@ import type {
   ProtocolGatewayPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
 import {
-  canonicalJsonBytes,
   verifyDataReadPolicy,
   verifySignedArtifacts,
 } from "@opendatalabs/personal-server-ts-core/policy";
@@ -28,7 +27,10 @@ import {
   verifyWeb3Signed,
   type DataPortabilityGatewayConfig,
 } from "@opendatalabs/vana-sdk/node";
-import { sealJobResult } from "@opendatalabs/vana-sdk/crypto/envelope/job";
+import {
+  canonicalJobRequestBytes,
+  sealJobResult,
+} from "@opendatalabs/vana-sdk/crypto/envelope/job";
 import {
   JOB_PROTOCOL_VERSION,
   MAX_INLINE_RESULT_BYTES,
@@ -268,7 +270,7 @@ async function verifyJobAuth(
       expectedOrigin: parsed.payload.aud,
       expectedMethod: POST,
       expectedPath: EXECUTE_PATH,
-      bodyBytes: canonicalJsonBytes(envelope.request),
+      bodyBytes: canonicalJobRequestBytes(envelope.request),
       now: Math.floor(now.getTime() / MILLISECONDS_PER_SECOND),
     });
   } catch {
