@@ -10,7 +10,7 @@
 #
 # Production pins agent and sandbox image digests under one approved compose
 # hash (architecture decision 23). This registry-free variant is for level-B
-# testing only; PS_IMAGE is a local tag built at boot, not a digest.
+# testing only; PS_IMAGE is resolved from a local tag to an image id at boot.
 services:
   agent:
     image: node:24-alpine
@@ -64,6 +64,8 @@ services:
         date -u +%FT%TZ
         date -u +%FT%TZ
         docker build -f Dockerfile -t "$${PS_IMAGE}" .
+        PS_IMAGE="$$(docker image inspect --format '{{.Id}}' "$${PS_IMAGE}")"
+        export PS_IMAGE
         date -u +%FT%TZ
         date -u +%FT%TZ
         npm run build -w @opendatalabs/personal-server-ts-enclave
