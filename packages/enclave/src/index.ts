@@ -7,7 +7,7 @@ export {
   type DstackInfo,
   type DstackQuote,
 } from "./dstack/client.js";
-export { DSTACK_SDK_VERSION, createRealDstackClient } from "./dstack/real.js";
+export { createRealDstackClient } from "./dstack/real.js";
 export {
   createFakeDstackClient,
   type FakeDstackOptions,

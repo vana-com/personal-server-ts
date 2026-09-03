@@ -40,7 +40,9 @@ export async function buildEvidence(
     publicKey: identity.publicKey,
     appId: normalizeHex(info.appId),
     composeHash: normalizeHex(info.composeHash),
-    // The dstack port does not expose osImageHash yet.
+    ...(info.osImageHash === undefined
+      ? {}
+      : { osImageHash: normalizeHex(info.osImageHash) }),
     purpose: WALLET_PURPOSE,
     signatureChain: [signatureChain[0], signatureChain[1]],
     quote: toHex(attestation.quote),

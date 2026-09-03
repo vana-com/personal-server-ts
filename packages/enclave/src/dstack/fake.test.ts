@@ -8,6 +8,8 @@ const APP = "0000000000000000000000000000000000000001";
 const OTHER_APP = "0000000000000000000000000000000000000002";
 const PATH = "users/x/wallet/ethereum/secp256k1/v1";
 const COMPRESSED = true;
+const HASH_PATTERN = /^[0-9a-f]{64}$/;
+const INSTANCE_ID_PATTERN = /^[0-9a-f]{40}$/;
 
 // Same recipe a real verifier runs over the agent's chain.
 async function recoverCompressed(
@@ -25,6 +27,14 @@ async function recoverCompressed(
 }
 
 describe("fake dstack client", () => {
+  it("returns agent-shaped hex info", async () => {
+    const info = await createFakeDstackClient({ appId: APP }).info();
+
+    expect(info.composeHash).toMatch(HASH_PATTERN);
+    expect(info.instanceId).toMatch(INSTANCE_ID_PATTERN);
+    expect(info.osImageHash).toMatch(HASH_PATTERN);
+  });
+
   it("derives from (appId, path) only; purpose does not change the key", async () => {
     const client = createFakeDstackClient({ appId: APP });
     const a = await client.deriveKey(PATH, "purpose-a");

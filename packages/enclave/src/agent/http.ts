@@ -34,6 +34,7 @@ const NOT_FOUND_MESSAGE = "route not found";
 const BODY_TOO_LARGE_MESSAGE = "request body is too large";
 const BAD_REQUEST_MESSAGE = "request body is invalid";
 const INTERNAL_MESSAGE = "internal server error";
+const UNKNOWN_ERROR = "unknown";
 
 export interface AgentServerOptions {
   client: DstackClient;
@@ -41,6 +42,7 @@ export interface AgentServerOptions {
 }
 
 class BodyTooLarge extends Error {}
+class BadRequest extends Error {}
 
 export function createAgentServer(options: AgentServerOptions): Server {
   return createServer((request, response) => {
@@ -108,11 +110,16 @@ async function handleRequest(
       return;
     }
 
+    console.error({
+      path,
+      error:
+        error instanceof Error
+          ? `${error.name}: ${error.message}`
+          : UNKNOWN_ERROR,
+    });
     sendError(response, INTERNAL_ERROR, "INTERNAL", INTERNAL_MESSAGE);
   }
 }
-
-class BadRequest extends Error {}
 
 function isAuthorized(request: IncomingMessage, secret: string): boolean {
   const header = request.headers[AUTHORIZATION_HEADER];

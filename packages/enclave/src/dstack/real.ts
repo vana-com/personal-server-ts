@@ -11,7 +11,7 @@
  *     /run/dstack/dstack.sock; DSTACK_SIMULATOR_ENDPOINT overrides.
  *   getKey(path?: string, purpose?: string, algorithm?: string)
  *     : Promise<{ key: Uint8Array(32); signature_chain: Uint8Array[2] }>
- *   info(): Promise<{ app_id; instance_id; app_cert; tcb_info; compose_hash; ... }>
+ *   info(): Promise<{ app_id; instance_id; app_cert; tcb_info; compose_hash; os_image_hash; ... }>
  *   getQuote(report_data: string | Buffer | Uint8Array)
  *     : Promise<{ quote: Hex; event_log: string }>
  *   version(): Promise<{ version: string; rev: string }>   // agent >= 0.5.7, throws older
@@ -41,9 +41,6 @@ import {
   type DstackQuote,
 } from "./client.js";
 
-/** Pinned in packages/enclave/package.json; printed by the probe for the record. */
-export const DSTACK_SDK_VERSION = "0.5.8";
-
 const SECP256K1 = "secp256k1";
 const HEX_PREFIX = "0x";
 
@@ -62,11 +59,13 @@ export function createRealDstackClient(endpoint?: string): DstackClient {
 // come back empty there.
 async function readInfo(sdk: SdkDstackClient): Promise<DstackInfo> {
   const info = await sdk.info();
+  const osImageHash = info.os_image_hash ?? info.tcb_info?.os_image_hash;
 
   return {
     appId: info.app_id,
     composeHash: info.compose_hash ?? info.tcb_info?.compose_hash ?? "",
     instanceId: info.instance_id,
+    ...(osImageHash === undefined ? {} : { osImageHash }),
     osVersion: await readVersion(sdk),
   };
 }

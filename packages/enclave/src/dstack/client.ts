@@ -21,6 +21,8 @@ export interface DstackInfo {
   composeHash: string;
   /** This CVM instance. Differs between replicas of one app. */
   instanceId: string;
+  /** dstack OS image measurement from 0.5.x info().os_image_hash. */
+  osImageHash?: string;
   /** Guest agent version when the agent exposes it (dstack >= 0.5.7). */
   osVersion?: string;
 }

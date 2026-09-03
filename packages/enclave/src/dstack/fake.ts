@@ -23,18 +23,31 @@ import {
   type DstackQuote,
 } from "./client.js";
 
-const HKDF_DIGEST = "sha256";
+const SHA256 = "sha256";
+const HKDF_DIGEST = SHA256;
 /** Same salt the guest agent uses for path derivation. */
 const DSTACK_KDF_SALT = "RATLS";
 /** Fake-only salt turning appId into an app root key. */
 const FAKE_APP_ROOT_SALT = "vana.ps-enclave.fake-dstack.app-root.v1";
 /** Fake KMS root: fixed so chains from any fake instance verify alike. */
-const FAKE_KMS_ROOT_KEY = createHash("sha256")
+const FAKE_KMS_ROOT_KEY = createHash(SHA256)
   .update("vana.ps-enclave.fake-dstack.kms-root.v1")
   .digest();
 const KMS_ISSUED_PREFIX = "dstack-kms-issued";
-const DEFAULT_COMPOSE_HASH = "fake-compose-hash";
-const DEFAULT_INSTANCE_ID = "fake-instance";
+const DEFAULT_COMPOSE_INPUT = "vana.ps-enclave.fake-dstack.compose";
+const DEFAULT_INSTANCE_INPUT = "vana.ps-enclave.fake-dstack.instance";
+const DEFAULT_OS_IMAGE_INPUT = "vana.ps-enclave.fake-dstack.os-image";
+const INSTANCE_ID_HEX_CHARS = 40;
+const DEFAULT_COMPOSE_HASH = createHash(SHA256)
+  .update(DEFAULT_COMPOSE_INPUT)
+  .digest("hex");
+const DEFAULT_INSTANCE_ID = createHash(SHA256)
+  .update(DEFAULT_INSTANCE_INPUT)
+  .digest("hex")
+  .slice(0, INSTANCE_ID_HEX_CHARS);
+const DEFAULT_OS_IMAGE_HASH = createHash(SHA256)
+  .update(DEFAULT_OS_IMAGE_INPUT)
+  .digest("hex");
 const COMPRESSED = true;
 const APP_ID_PATTERN = /^[0-9a-f]{40}$/;
 
@@ -42,6 +55,7 @@ export interface FakeDstackOptions {
   appId: string;
   composeHash?: string;
   instanceId?: string;
+  osImageHash?: string;
 }
 
 export function createFakeDstackClient(
@@ -55,6 +69,7 @@ export function createFakeDstackClient(
     appId: options.appId,
     composeHash: options.composeHash ?? DEFAULT_COMPOSE_HASH,
     instanceId: options.instanceId ?? DEFAULT_INSTANCE_ID,
+    osImageHash: options.osImageHash ?? DEFAULT_OS_IMAGE_HASH,
     osVersion: "fake",
   };
   const appRootKey = fakeAppRootKey(options.appId);
@@ -132,7 +147,7 @@ async function signLink(
 
 // Not a TDX quote: a stable digest so callers can exercise plumbing.
 function fakeQuote(appId: string, reportData: Uint8Array): DstackQuote {
-  const quote = createHash("sha256")
+  const quote = createHash(SHA256)
     .update(appId, "utf8")
     .update(reportData)
     .digest();

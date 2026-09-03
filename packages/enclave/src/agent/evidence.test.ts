@@ -11,6 +11,7 @@ import { recoverAppRoot, recoverKmsRoot } from "./chain.js";
 const OWNER = "0x1111111111111111111111111111111111111111";
 const CHAIN_ID = 14_800;
 const FAKE_APP_ID = "0000000000000000000000000000000000000001";
+const HEX_HASH_PATTERN = /^0x[0-9a-f]{64}$/;
 
 describe("buildEvidence", () => {
   it("builds complete deterministic identity evidence", async () => {
@@ -36,6 +37,7 @@ describe("buildEvidence", () => {
     });
     expect(first.appId).toMatch(/^0x/);
     expect(first.composeHash).toMatch(/^0x/);
+    expect(first.osImageHash).toMatch(HEX_HASH_PATTERN);
     expect(first.publicKey).toHaveLength(2 + 65 * 2);
     expect(first.signatureChain).toHaveLength(2);
     expect(first.signatureChain[0]).toHaveLength(2 + 65 * 2);
