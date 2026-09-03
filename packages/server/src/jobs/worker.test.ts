@@ -42,7 +42,10 @@ const SCOPE = "instagram.profile";
 const RECORD_VALUE = "TOP_SECRET_RECORD";
 const GRANTEE_ID = `0x${"44".repeat(32)}` as const;
 const GRANT_ID = `0x${"55".repeat(32)}` as const;
-const VECTOR_PUBLIC_KEY = `0x04${"00".repeat(64)}` as const;
+// SDK jobs.test.ts fixture: builderPublicKey is the literal "0x1234".
+const VECTOR_PUBLIC_KEY = "0x1234" as const;
+const VECTOR_HASH =
+  "0xc610d7c24e7a8b952db6e7f2ce902fec090016e44bf30a8908021432678d81a0";
 const VECTOR_REQUEST = {
   v: 1,
   jobId: "00000000-0000-4000-8000-000000000001",
@@ -56,7 +59,7 @@ const VECTOR_REQUEST = {
   deadline: "2026-01-01T00:00:00.000Z",
 } satisfies JobRequest;
 const VECTOR_CANONICAL_JSON =
-  '{"builder":"0x0000000000000000000000000000000000000002","builderPublicKey":"0x0400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","deadline":"2026-01-01T00:00:00.000Z","grantId":"0x0000000000000000000000000000000000000000000000000000000000000000","jobId":"00000000-0000-4000-8000-000000000001","operation":"raw_read","owner":"0x0000000000000000000000000000000000000001","pinnedVersion":null,"scope":"profile.email","v":1}';
+  '{"builder":"0x0000000000000000000000000000000000000002","builderPublicKey":"0x1234","deadline":"2026-01-01T00:00:00.000Z","grantId":"0x0000000000000000000000000000000000000000000000000000000000000000","jobId":"00000000-0000-4000-8000-000000000001","operation":"raw_read","owner":"0x0000000000000000000000000000000000000001","pinnedVersion":null,"scope":"profile.email","v":1}';
 const owner = createTestWallet(20);
 const builder = createTestWallet(21);
 const builderOwner = createTestWallet(22);
@@ -274,9 +277,9 @@ describe("executeJob", () => {
       now: Math.floor(NOW.getTime() / 1_000),
     });
 
-    // TODO(sdk-jobs): assert the pinned hash once its builderPublicKey fixture ships.
     expect(new TextDecoder().decode(bytes)).toBe(VECTOR_CANONICAL_JSON);
     expect(new TextDecoder().decode(bytes)).not.toContain("\n");
+    expect(`0x${hash}`).toBe(VECTOR_HASH);
     expect(parseWeb3SignedHeader(auth).payload.bodyHash).toBe(`sha256:${hash}`);
     expect(verified.signer.toLowerCase()).toBe(builder.address.toLowerCase());
   });
