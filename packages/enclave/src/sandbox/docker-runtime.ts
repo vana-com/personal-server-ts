@@ -29,11 +29,14 @@ const REMOVE_COMMAND = "rm";
 const FORCE_FLAG = "--force";
 const VOLUMES_FLAG = "--volumes";
 const FORMAT_FLAG = "--format";
+const PUBLISH_FLAG = "--publish";
+const PUBLISHED_PORT = `0:${CONTAINER_PORT}`;
 const RUNNING_FORMAT = "{{.State.Running}}";
-const IP_ADDRESS_FORMAT =
-  "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}";
+const HOST_PORT_FORMAT =
+  '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}';
 const RUNNING_VALUE = "true";
 const SYNC_TOKEN_MESSAGE = "Sandbox sync requires PS_ACCESS_TOKEN";
+const INVALID_DOCKER_HOST = "DOCKER_HOST must have a hostname";
 
 const FIXED_ENV = {
   CLOUD_MODE: "true",
@@ -46,7 +49,7 @@ const FIXED_ENV = {
 
 export interface ContainerInspection {
   running: boolean;
-  ipAddress?: string;
+  hostPort?: number;
 }
 
 /** DockerClient promoted from spike/sandbox launcher.ts. */
@@ -58,6 +61,7 @@ export interface DockerClient {
 export interface DockerRuntimeOptions {
   docker?: DockerClient;
   dockerHost?: string;
+  runtimeHost?: string;
   dockerBinary?: string;
   healthTimeoutMs?: number;
   syncTimeoutMs?: number;
@@ -70,12 +74,14 @@ export interface DockerRuntimeOptions {
 export function createDockerRuntime(
   options: DockerRuntimeOptions = {},
 ): SandboxRuntime {
+  const dockerHost = options.dockerHost ?? DEFAULT_DOCKER_HOST;
   const docker =
     options.docker ??
     createDockerClient({
       binary: options.dockerBinary,
-      host: options.dockerHost,
+      host: dockerHost,
     });
+  const runtimeHost = options.runtimeHost ?? hostFromDocker(dockerHost);
   const health = options.health ?? probeHealth;
   const sync = options.sync ?? probeSync;
   const sleep = options.sleep ?? delay;
@@ -101,6 +107,7 @@ export function createDockerRuntime(
           containerId,
           name,
           docker,
+          runtimeHost,
           health,
           sleep,
           now,
@@ -159,7 +166,7 @@ function createDockerClient(options: DockerClientOptions): DockerClient {
   return {
     run: (command, args) => runDocker(binary, host, command, args),
     async inspect(id): Promise<ContainerInspection> {
-      const [running, ipAddress] = await Promise.all([
+      const [running, hostPortValue] = await Promise.all([
         runDocker(binary, host, INSPECT_COMMAND, [
           FORMAT_FLAG,
           RUNNING_FORMAT,
@@ -167,14 +174,15 @@ function createDockerClient(options: DockerClientOptions): DockerClient {
         ]),
         runDocker(binary, host, INSPECT_COMMAND, [
           FORMAT_FLAG,
-          IP_ADDRESS_FORMAT,
+          HOST_PORT_FORMAT,
           id,
         ]),
       ]);
+      const hostPort = parseHostPort(hostPortValue);
 
       return {
         running: running === RUNNING_VALUE,
-        ...(ipAddress ? { ipAddress } : {}),
+        ...(hostPort === undefined ? {} : { hostPort }),
       };
     },
   };
@@ -222,6 +230,8 @@ function createArgs(
     NO_NEW_PRIVILEGES,
     "--tmpfs",
     DATA_TMPFS,
+    PUBLISH_FLAG,
+    PUBLISHED_PORT,
   ];
 
   for (const [key, value] of Object.entries(environment).sort()) {
@@ -236,6 +246,7 @@ interface HealthWaitOptions {
   containerId: string;
   name: string;
   docker: DockerClient;
+  runtimeHost: string;
   health: HealthProbe;
   sleep: (milliseconds: number) => Promise<void>;
   now: () => number;
@@ -250,8 +261,15 @@ async function waitForHealth(options: HealthWaitOptions): Promise<string> {
       throw new Error(`Sandbox ${options.name} exited before becoming healthy`);
     }
 
-    if (inspection.ipAddress) {
-      const origin = `http://${inspection.ipAddress}:${CONTAINER_PORT}`;
+    if (inspection.hostPort !== undefined) {
+      /*
+       * agent -> sandbox-runtime:<hostPort> -> dind DNAT -> sandbox:8080
+       *
+       * Sibling sandboxes can reach published dind ports. Every sandbox API
+       * route uses its own PS_ACCESS_TOKEN bearer; --icc=false only blocks
+       * direct container-to-container traffic.
+       */
+      const origin = `http://${options.runtimeHost}:${inspection.hostPort}`;
       if (await options.health(origin)) {
         return origin;
       }
@@ -265,6 +283,28 @@ async function waitForHealth(options: HealthWaitOptions): Promise<string> {
 
     await options.sleep(POLL_INTERVAL_MS);
   }
+}
+
+function hostFromDocker(dockerHost: string): string {
+  const hostname = new URL(dockerHost).hostname;
+  if (!hostname) {
+    throw new Error(INVALID_DOCKER_HOST);
+  }
+
+  return hostname;
+}
+
+function parseHostPort(value: string): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const hostPort = Number(value);
+  if (!Number.isSafeInteger(hostPort) || hostPort <= 0) {
+    return undefined;
+  }
+
+  return hostPort;
 }
 
 interface SyncWaitOptions {

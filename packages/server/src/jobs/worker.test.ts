@@ -198,6 +198,11 @@ async function createFixture(): Promise<Fixture> {
     getServer: vi.fn().mockResolvedValue({
       id: "server-1",
       ownerAddress: owner.address,
+      serverAddress: server.address,
+      publicKey: server.publicKey,
+      serverUrl: AUTH_AUDIENCE,
+      addedAt: NOW.toISOString(),
+      revokedAt: null,
     }),
     getSchemaForScope: vi.fn(),
     getDataPoint: vi.fn(),
@@ -334,6 +339,21 @@ describe("executeJob", () => {
     );
 
     await expectFailure(fixture, "AUTH_INVALID");
+  });
+
+  it("rejects a revoked server registration", async () => {
+    const fixture = await createFixture();
+    vi.mocked(fixture.gateway.getServer).mockResolvedValue({
+      id: "server-1",
+      ownerAddress: owner.address,
+      serverAddress: server.address,
+      publicKey: server.publicKey,
+      serverUrl: AUTH_AUDIENCE,
+      addedAt: NOW.toISOString(),
+      revokedAt: NOW.toISOString(),
+    });
+
+    await expectFailure(fixture, "SERVER_NOT_REGISTERED");
   });
 
   it("reports every contract failure code with the required retryability", async () => {

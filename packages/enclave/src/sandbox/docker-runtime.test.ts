@@ -28,9 +28,7 @@ function sandboxSpec(env: Record<string, string> = {}): SandboxSpec {
 }
 
 function scriptedDocker(
-  inspections: ContainerInspection[] = [
-    { running: true, ipAddress: "172.18.0.2" },
-  ],
+  inspections: ContainerInspection[] = [{ running: true, hostPort: 49_152 }],
 ): DockerClient & { calls: Array<{ command: string; args: string[] }> } {
   const calls: Array<{ command: string; args: string[] }> = [];
 
@@ -75,6 +73,8 @@ describe("docker sandbox runtime", () => {
         "no-new-privileges:true",
         "--tmpfs",
         "/data:rw,noexec,nosuid,nodev,size=256m,uid=1000,gid=1000,mode=0700",
+        "--publish",
+        "0:8080",
         "--env",
         "CLOUD_MODE=true",
         "--env",
@@ -101,6 +101,28 @@ describe("docker sandbox runtime", () => {
       ],
     });
     expect(docker.calls[0]?.args).not.toContain("--mount");
+  });
+
+  it("waits for the mapped port and uses the runtime host", async () => {
+    const docker = scriptedDocker([
+      { running: true },
+      { running: true, hostPort: 49_153 },
+    ]);
+    const health = vi.fn().mockResolvedValue(true);
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const runtime = createDockerRuntime({
+      docker,
+      dockerHost: "tcp://runtime.internal:2375",
+      health,
+      sleep,
+    });
+
+    const handle = await runtime.start(sandboxSpec());
+
+    expect(sleep).toHaveBeenCalledOnce();
+    expect(health).toHaveBeenCalledOnce();
+    expect(health).toHaveBeenCalledWith("http://runtime.internal:49153");
+    expect(handle.origin).toBe("http://runtime.internal:49153");
   });
 
   it("removes a container that exits before health", async () => {

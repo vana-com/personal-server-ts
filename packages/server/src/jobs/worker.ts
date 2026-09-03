@@ -173,6 +173,7 @@ async function executeJobUnsafe(
   const registration = await deps.gateway.getServer(deps.serverAddress);
   if (
     !registration ||
+    registration.revokedAt !== null ||
     !sameAddress(registration.ownerAddress, deps.serverOwner)
   ) {
     throw new JobFailure(
