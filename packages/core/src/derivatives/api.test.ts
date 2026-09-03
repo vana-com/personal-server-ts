@@ -174,9 +174,46 @@ describe("handlePersonalServerDerivativesRequest", () => {
       registeredBy: { kind: "owner" },
     });
     expect(await store.get("q-1")).not.toBeNull();
+    expect(json.answerShape).toBeNull();
     expect(scheduler.requestRecompute).toHaveBeenCalledWith("q-1", {
       immediate: true,
     });
+  });
+
+  it("stores a declared answer shape and returns it in the registration view", async () => {
+    const { deps, store } = createDeps();
+    const res = await call(deps, "POST", "/questions", {
+      token: OWNER_TOKEN,
+      body: {
+        ...body,
+        answerShape: {
+          fields: [{ name: "score", type: "integer", min: 1, max: 5 }],
+        },
+      },
+    });
+    expect(res.status).toBe(201);
+    const expected = {
+      fields: [
+        { name: "score", type: "integer", required: true, min: 1, max: 5 },
+      ],
+    };
+    expect((await res.json()).answerShape).toEqual(expected);
+    expect((await store.get("q-1"))!.answerShape).toEqual(expected);
+  });
+
+  it("refuses a malformed answer shape with DERIVATIVE_QUESTION_INVALID", async () => {
+    const { deps } = createDeps();
+    const res = await call(deps, "POST", "/questions", {
+      token: OWNER_TOKEN,
+      body: {
+        ...body,
+        answerShape: { fields: [{ name: "score", type: "spreadsheet" }] },
+      },
+    });
+    expect(res.status).toBe(400);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("DERIVATIVE_QUESTION_INVALID");
+    expect(json.error.details).toMatchObject({ field: "answerShape" });
   });
 
   it("stores an explicit recompute policy and rejects an unknown one", async () => {
@@ -464,6 +501,7 @@ describe("handlePersonalServerDerivativesRequest", () => {
       sourceScopes: ["oura.sleep"],
       question: "How did I sleep?",
       model: null,
+      answerShape: null,
       recompute: "on-change",
       registeredBy: { kind: "builder", builder: BUILDER, grantId: "grant-1" },
       status: "pending",

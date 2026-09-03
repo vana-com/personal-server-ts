@@ -29,10 +29,22 @@ import {
   verifyDataWritePolicy,
   type DataWritePolicyPorts,
 } from "../policy/data-write.js";
-import { InferenceRequestError, type InferenceProvider } from "./inference.js";
+import {
+  InferenceRequestError,
+  type InferenceChatResult,
+  type InferenceMessage,
+  type InferenceProvider,
+} from "./inference.js";
+import {
+  compileAnswerShape,
+  renderShapedAnswer,
+  validateAnswerShape,
+} from "./answer-shape.js";
 import {
   buildQuestionMessages,
+  buildShapeRetryMessages,
   parseAnswer,
+  parseShapedAnswer,
   trimSourceData,
   type PromptSource,
 } from "./prompt.js";
@@ -140,6 +152,12 @@ export interface DerivativeAnswerRecord {
   questionId: string;
   question: string;
   answer: string;
+  /**
+   * The validated structured answer, present only when the question
+   * declared an answer shape. `answer` stays a string either way (readers
+   * depend on it), holding a rendering of this value.
+   */
+  answerData?: Record<string, unknown>;
   evidence: string | null;
   model: string;
   computedAt: string;
@@ -192,6 +210,89 @@ function shortError(err: unknown): string {
   // Unknown errors may quote data (a JSON parse error echoes its input);
   // keep the class name only.
   return `compute failed (${err instanceof Error ? err.name : "Error"})`;
+}
+
+/** One compute's answer, whatever path produced it. */
+interface ProducedAnswer {
+  reply: InferenceChatResult;
+  answer: string;
+  evidence: string | null;
+  /** Null for a free-text question. */
+  answerData: Record<string, unknown> | null;
+}
+
+/**
+ * Ask the model, and for a question that declared an answer shape hold the
+ * reply to it. A reply that does not match gets ONE corrective turn (the
+ * model's own reply plus what was wrong with it); a second miss fails the
+ * compute rather than writing a derivative the builder cannot trust. The
+ * failure class is `internal`: the reader-facing vocabulary is closed and
+ * an unknown value would break clients parsing it as an enum.
+ */
+async function produceAnswer(
+  deps: QuestionComputeDeps,
+  registration: QuestionRegistration,
+  model: string,
+  messages: InferenceMessage[],
+): Promise<ProducedAnswer> {
+  const ask = (turns: InferenceMessage[]) =>
+    withRetries(
+      deps,
+      () =>
+        deps.provider.chat({
+          model,
+          messages: turns,
+          maxTokens: deps.maxTokens,
+        }),
+      isRetryableInferenceError,
+    );
+
+  const shape = registration.answerShape;
+  if (!shape) {
+    const reply = await ask(messages);
+    const parsed = parseAnswer(reply.content);
+    return {
+      reply,
+      answer: parsed.answer,
+      evidence: parsed.evidence,
+      answerData: null,
+    };
+  }
+
+  const compiled = compileAnswerShape(shape);
+  let turns = messages;
+  for (let attempt = 0; ; attempt += 1) {
+    const reply = await ask(turns);
+    const candidates = parseShapedAnswer(reply.content);
+    let issues = ["the reply was not a JSON object"];
+    for (const [index, candidate] of candidates.entries()) {
+      const checked = validateAnswerShape(shape, compiled, candidate.answer);
+      if (checked.ok) {
+        return {
+          reply,
+          answer: renderShapedAnswer(shape, checked.value),
+          evidence: candidate.evidence,
+          answerData: checked.value,
+        };
+      }
+      // The first candidate is the best framing of the reply, so its
+      // issues are the ones worth handing back.
+      if (index === 0) issues = checked.issues;
+    }
+    if (attempt >= 1) break;
+    turns = buildShapeRetryMessages({
+      messages,
+      reply: reply.content,
+      issues,
+      answerShape: shape,
+    });
+  }
+  throw new ComputeFailure(
+    `answer did not match the declared shape (fields: ${shape.fields
+      .map((field) => field.name)
+      .join(", ")})`,
+    "internal",
+  );
 }
 
 /**
@@ -443,14 +544,11 @@ export async function computeQuestion(
     const messages = buildQuestionMessages({
       question: registration.question,
       sources,
+      answerShape: registration.answerShape,
     });
     const model = registration.model ?? deps.provider.defaultModel;
-    const reply = await withRetries(
-      deps,
-      () => deps.provider.chat({ model, messages, maxTokens: deps.maxTokens }),
-      isRetryableInferenceError,
-    );
-    const parsed = parseAnswer(reply.content);
+    const produced = await produceAnswer(deps, registration, model, messages);
+    const reply = produced.reply;
 
     const computedAt = now().toISOString();
     const lineageIds = registration.sourceScopes.map((scope) =>
@@ -459,8 +557,9 @@ export async function computeQuestion(
     const record: DerivativeAnswerRecord = {
       questionId: registration.questionId,
       question: registration.question,
-      answer: parsed.answer,
-      evidence: parsed.evidence,
+      answer: produced.answer,
+      ...(produced.answerData ? { answerData: produced.answerData } : {}),
+      evidence: produced.evidence,
       model,
       computedAt,
       sources: sources.map((source) => ({

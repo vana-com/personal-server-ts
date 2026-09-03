@@ -11,6 +11,7 @@ import {
 import { parseDataScopeContract } from "../contracts/data.js";
 import { assertDerivedScopeNaming } from "../lineage/lineage.js";
 import { isWriteScopeEntry } from "../policy/data-write.js";
+import { parseAnswerShapeInput, type AnswerShape } from "./answer-shape.js";
 import { scopeCoveredByGrant } from "@opendatalabs/vana-sdk/browser";
 import type {
   QuestionRecompute,
@@ -33,6 +34,7 @@ export interface ParsedQuestionInput {
   sourceScopes: string[];
   question: string;
   model: string | null;
+  answerShape: AnswerShape | null;
   recompute: QuestionRecompute;
 }
 
@@ -126,6 +128,10 @@ export function parseQuestionInput(body: unknown): ParsedQuestionInput {
     }
     model = body.model;
   }
+  // Absent (or null) keeps the free-text answer: the model is asked for a
+  // prose answer and nothing about the reply is enforced beyond the token
+  // cap, exactly as before this field existed.
+  const answerShape = parseAnswerShapeInput(body.answerShape);
   // Absent (or null, like model) keeps the original follow-every-change
   // behavior, so existing builder clients register exactly as before.
   let recompute: QuestionRecompute = "on-change";
@@ -144,6 +150,7 @@ export function parseQuestionInput(body: unknown): ParsedQuestionInput {
     sourceScopes,
     question: body.question,
     model,
+    answerShape,
     recompute,
   };
 }
@@ -223,6 +230,7 @@ export async function createQuestionRegistration(
     sourceScopes: parsed.sourceScopes,
     question: parsed.question,
     model: parsed.model,
+    answerShape: parsed.answerShape,
     recompute: parsed.recompute,
     registeredBy: input.registeredBy,
     status: "pending",
