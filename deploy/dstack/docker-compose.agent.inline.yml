@@ -1,0 +1,29 @@
+# Registry-free bootstrap: clone + npm ci + build adds minutes of operator-measured boot cost.
+# Production pins image digests under one approved compose hash (decision 23), then uses `phala cvms replicate` for additional nodes.
+services:
+  agent:
+    image: node:24-alpine
+    restart: "no"
+    working_dir: /app
+    ports:
+      - "8787:8787"
+    environment:
+      - ENCLAVE_AGENT_SECRET
+      - ENCLAVE_AGENT_HOST=0.0.0.0
+      - ENCLAVE_AGENT_PORT=8787
+      - GIT_REF=feat/enclave-deploy
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        date -u +%FT%TZ
+        apk add --no-cache git
+        git clone --depth 1 --branch "$$GIT_REF" https://github.com/vana-com/personal-server-ts .
+        npm ci --no-audit --no-fund
+        date -u +%FT%TZ
+        npm run build -w @opendatalabs/personal-server-ts-enclave
+        date -u +%FT%TZ
+        date -u +%FT%TZ
+        exec npm run start:agent -w @opendatalabs/personal-server-ts-enclave

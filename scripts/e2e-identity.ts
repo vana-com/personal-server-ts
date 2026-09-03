@@ -25,6 +25,8 @@ const DEFAULT_CHAIN_ID = 14_800;
 const TWO_HOURS_SECONDS = 2 * 60 * 60;
 const REVOCATION_WINDOW_SECONDS = 10 * 60;
 const SECRET_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
+// Let the same driver reach Vercel-protected Gateway deployments.
+const VERCEL_PROTECTION_BYPASS = process.env.VERCEL_PROTECTION_BYPASS;
 
 interface RequestDetails {
   method: string;
@@ -147,6 +149,9 @@ async function requestJson(
       method,
       headers: {
         ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+        ...(VERCEL_PROTECTION_BYPASS
+          ? { "x-vercel-protection-bypass": VERCEL_PROTECTION_BYPASS }
+          : {}),
         ...headers,
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
