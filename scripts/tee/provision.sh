@@ -16,7 +16,7 @@ shift
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
-git_ref=feat/enclave-deploy
+git_ref=main
 node_id=18
 compose="$repo_root/deploy/dstack/docker-compose.agent.inline.yml"
 app_id=
@@ -84,6 +84,12 @@ fi
 [[ $app_id =~ ^[0-9a-fA-F]{40}$ ]] || { echo "app_id must be 40 hexadecimal characters" >&2; exit 1; }
 [[ $nonce =~ ^[0-9]+$ ]] || { echo "nonce must be a non-negative integer" >&2; exit 1; }
 
+env_file=$(mktemp)
+chmod 600 "$env_file"
+trap 'rm -f "$env_file"' EXIT
+printf 'ENCLAVE_AGENT_SECRET=%s\nGIT_REF=%s\n' \
+  "$ENCLAVE_AGENT_SECRET" "$git_ref" >"$env_file"
+
 deploy_json=$(
   phala deploy \
     -n "$name" \
@@ -97,8 +103,7 @@ deploy_json=$(
     --wait \
     --public-logs \
     --json \
-    -e "ENCLAVE_AGENT_SECRET=$ENCLAVE_AGENT_SECRET" \
-    -e "GIT_REF=$git_ref"
+    -e "$env_file"
 )
 
 # `phala deploy --json` prints progress lines before the JSON body; keep the body only.

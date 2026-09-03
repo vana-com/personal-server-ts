@@ -11,7 +11,8 @@ services:
       - ENCLAVE_AGENT_SECRET
       - ENCLAVE_AGENT_HOST=0.0.0.0
       - ENCLAVE_AGENT_PORT=8787
-      - GIT_REF=feat/enclave-deploy
+      # Literal KEY=value overrides encrypted env, breaking --ref; feat/enclave-deploy no longer exists.
+      - GIT_REF
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
     command:
@@ -20,7 +21,7 @@ services:
       - |
         date -u +%FT%TZ
         apk add --no-cache git
-        git clone --depth 1 --branch "$$GIT_REF" https://github.com/vana-com/personal-server-ts .
+        git clone --depth 1 --branch "$${GIT_REF:-main}" https://github.com/vana-com/personal-server-ts .
         npm ci --no-audit --no-fund
         date -u +%FT%TZ
         npm run build -w @opendatalabs/personal-server-ts-enclave
