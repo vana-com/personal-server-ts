@@ -73,6 +73,7 @@ function startJobs(
         image: config.image,
         leaseSeconds: config.leaseSeconds,
         sync: config.sync,
+        logger,
         workDelayMs: config.workDelayMs,
       }),
     registry,

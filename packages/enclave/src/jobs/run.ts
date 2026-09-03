@@ -9,6 +9,7 @@ import { deriveEnclaveKey } from "../identity/wallet.js";
 import type { SandboxRegistry } from "../sandbox/registry.js";
 import type { SandboxSpec } from "../sandbox/runtime.js";
 import { unseal } from "../sealing/envelope.js";
+import type { JobLogger } from "./claim-loop.js";
 import { LeaseLostError, type GatewayClient } from "./gateway-client.js";
 import {
   JobEnvelopeError,
@@ -29,12 +30,14 @@ const OK = 200;
 const EXECUTE_TIMEOUT_MS = 120_000;
 const HEARTBEAT_DIVISOR = 3;
 const MILLISECONDS_PER_SECOND = 1_000;
+const MIN_TIMER_DELAY_MS = 0;
 const INVALID_REQUEST_REASON = "REQUEST_INVALID";
 const DEADLINE_REASON = "DEADLINE_PASSED";
 const SYNC_ENABLED = "true";
 const SYNC_DISABLED = "false";
 const ENCRYPT_UNAVAILABLE = "ECIES encryption is unavailable";
 const NORMALIZE_UNAVAILABLE = "ECIES key normalization is unavailable";
+const LEASE_EXPIRED_MESSAGE = "Job lease expired without confirmation";
 const RESULT_HASH_PATTERN = /^0x[0-9a-fA-F]{64}$/;
 const JOB_FAILURE_CODES = new Set<string>([
   "AUTH_INVALID",
@@ -63,6 +66,7 @@ export interface RunJobDeps {
   image: string;
   leaseSeconds: number;
   sync: SyncMode;
+  logger: JobLogger;
   workDelayMs?: number;
   fetch?: typeof fetch;
   now?: () => number;
@@ -191,8 +195,11 @@ interface LeaseState {
 
 function startLease(job: ClaimedJob, deps: RunJobDeps): LeaseState {
   const controller = new AbortController();
+  const now = deps.now ?? Date.now;
   let leaseLost = false;
+  let leaseDeadline = parseLeaseDeadline(job.claimExpiresAt, now());
   let pending = Promise.resolve();
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   const intervalMs =
     (deps.leaseSeconds * MILLISECONDS_PER_SECOND) / HEARTBEAT_DIVISOR;
   const timer = setInterval(() => {
@@ -202,19 +209,59 @@ function startLease(job: ClaimedJob, deps: RunJobDeps): LeaseState {
       }
 
       try {
-        await deps.gateway.heartbeat(job.jobId, {
+        const response = await deps.gateway.heartbeat(job.jobId, {
           fencingToken: job.fencingToken,
           leaseSeconds: deps.leaseSeconds,
         });
+        if (response.claimExpiresAt) {
+          leaseDeadline = parseLeaseDeadline(response.claimExpiresAt, now());
+          armDeadline();
+        }
       } catch (error) {
         if (error instanceof LeaseLostError) {
-          leaseLost = true;
-          controller.abort();
+          loseLease();
+          return;
+        }
+        if (now() >= leaseDeadline) {
+          expireLease();
         }
       }
     });
   }, intervalMs);
   timer.unref();
+  armDeadline();
+
+  function armDeadline(): void {
+    if (deadlineTimer) {
+      clearTimeout(deadlineTimer);
+    }
+
+    const delayMs = Math.max(MIN_TIMER_DELAY_MS, leaseDeadline - now());
+    deadlineTimer = setTimeout(expireLease, delayMs);
+    deadlineTimer.unref();
+  }
+
+  function expireLease(): void {
+    if (leaseLost) {
+      return;
+    }
+    if (now() < leaseDeadline) {
+      armDeadline();
+      return;
+    }
+
+    loseLease();
+    deps.logger.warn({ jobId: job.jobId }, LEASE_EXPIRED_MESSAGE);
+  }
+
+  function loseLease(): void {
+    if (leaseLost) {
+      return;
+    }
+
+    leaseLost = true;
+    controller.abort();
+  }
 
   return {
     signal: controller.signal,
@@ -222,8 +269,17 @@ function startLease(job: ClaimedJob, deps: RunJobDeps): LeaseState {
     settled: () => pending,
     stop(): void {
       clearInterval(timer);
+      if (deadlineTimer) {
+        clearTimeout(deadlineTimer);
+      }
     },
   };
+}
+
+function parseLeaseDeadline(value: string, fallback: number): number {
+  const deadline = Date.parse(value);
+
+  return Number.isFinite(deadline) ? deadline : fallback;
 }
 
 async function decryptRequest(

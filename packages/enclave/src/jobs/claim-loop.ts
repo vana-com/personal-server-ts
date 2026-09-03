@@ -35,8 +35,8 @@ export interface ClaimLoop {
 
 export function startClaimLoop(options: ClaimLoopOptions): ClaimLoop {
   const sleep = options.sleep ?? delay;
+  const inFlight = new Set<Promise<void>>();
   let isDraining = false;
-  let running = 0;
   let unavailable = false;
   let drainPromise: Promise<void> | undefined;
 
@@ -44,11 +44,16 @@ export function startClaimLoop(options: ClaimLoopOptions): ClaimLoop {
 
   async function claimUntilDrain(): Promise<void> {
     while (!isDraining) {
+      if (inFlight.size >= options.capacity) {
+        await Promise.race(inFlight);
+        continue;
+      }
+
       let claim: ClaimResponse | null;
       try {
         claim = await options.gateway.claim(options.wait, {
           leaseSeconds: options.leaseSeconds,
-          capacity: options.capacity,
+          capacity: options.capacity - inFlight.size,
         });
         if (unavailable) {
           unavailable = false;
@@ -72,17 +77,26 @@ export function startClaimLoop(options: ClaimLoopOptions): ClaimLoop {
         continue;
       }
 
-      running = 1;
-      try {
-        await options.run(claim.job, claim.identity);
-      } catch (error) {
-        options.logger.warn(
-          { jobId: claim.job.jobId, error: errorSummary(error) },
-          JOB_RUN_FAILURE_MESSAGE,
-        );
-      } finally {
-        running = 0;
-      }
+      startRun(claim);
+    }
+
+    await Promise.all(inFlight);
+  }
+
+  function startRun(claim: ClaimResponse): void {
+    const runPromise = runClaim(claim);
+    inFlight.add(runPromise);
+    void runPromise.then(() => inFlight.delete(runPromise));
+  }
+
+  async function runClaim(claim: ClaimResponse): Promise<void> {
+    try {
+      await options.run(claim.job, claim.identity);
+    } catch (error) {
+      options.logger.warn(
+        { jobId: claim.job.jobId, error: errorSummary(error) },
+        JOB_RUN_FAILURE_MESSAGE,
+      );
     }
   }
 
@@ -94,7 +108,7 @@ export function startClaimLoop(options: ClaimLoopOptions): ClaimLoop {
       return drainPromise;
     },
     running(): number {
-      return running;
+      return inFlight.size;
     },
     draining(): boolean {
       return isDraining;

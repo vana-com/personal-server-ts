@@ -191,6 +191,7 @@ async function createFixture(): Promise<Fixture> {
     image: "personal-server:test",
     leaseSeconds: 30,
     sync: "disabled",
+    logger: { info: vi.fn(), warn: vi.fn() },
     now: () => NOW_MS,
   };
 
@@ -230,12 +231,12 @@ function gatewayFake(): GatewayClient {
   };
 }
 
-function fencedResponse() {
+function fencedResponse(claimExpiresAt = DEADLINE) {
   return {
     success: true as const,
     jobId: JOB_ID,
     state: "running" as const,
-    claimExpiresAt: DEADLINE,
+    claimExpiresAt,
   };
 }
 
@@ -370,6 +371,137 @@ describe("runJob", () => {
     await vi.advanceTimersByTimeAsync(10_000);
     await running;
 
+    expect(fixture.gateway.fail).not.toHaveBeenCalled();
+    expect(fixture.gateway.complete).not.toHaveBeenCalled();
+  });
+
+  it("aborts after heartbeat failures pass the confirmed lease deadline", async () => {
+    vi.useFakeTimers();
+    const fixture = await createFixture();
+    let currentTime = NOW_MS;
+    let resolveFetch: ((response: Response) => void) | undefined;
+    const aborted = vi.fn();
+    fixture.job.claimExpiresAt = new Date(NOW_MS + 15_000).toISOString();
+    fixture.deps.now = () => currentTime;
+    vi.mocked(fixture.gateway.heartbeat).mockRejectedValue(
+      new Error("gateway unavailable"),
+    );
+    fixture.deps.fetch = vi.fn((_input, init) => {
+      return new Promise<Response>((resolve, reject) => {
+        resolveFetch = resolve;
+        init?.signal?.addEventListener("abort", () => {
+          aborted();
+          reject(new Error("abort"));
+        });
+      });
+    }) as typeof fetch;
+    const running = runJob(fixture.job, fixture.identity, fixture.deps);
+    await waitForExecute(fixture.deps.fetch);
+
+    currentTime += 10_000;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(aborted).not.toHaveBeenCalled();
+
+    currentTime += 10_000;
+    await vi.advanceTimersByTimeAsync(10_000);
+    resolveFetch?.(
+      new Response(JSON.stringify(jobError("VERSION_MISMATCH", true)), {
+        status: 409,
+      }),
+    );
+    await running;
+
+    expect(aborted).toHaveBeenCalledOnce();
+    expect(fixture.gateway.fail).not.toHaveBeenCalled();
+    expect(fixture.gateway.complete).not.toHaveBeenCalled();
+  });
+
+  it("aborts at the lease deadline while a heartbeat is still pending", async () => {
+    vi.useFakeTimers();
+    const fixture = await createFixture();
+    let currentTime = NOW_MS;
+    let rejectHeartbeat: ((error: Error) => void) | undefined;
+    let resolveFetch: ((response: Response) => void) | undefined;
+    const aborted = vi.fn();
+    fixture.job.claimExpiresAt = new Date(NOW_MS + 15_000).toISOString();
+    fixture.deps.now = () => currentTime;
+    vi.mocked(fixture.gateway.heartbeat).mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectHeartbeat = reject;
+        }),
+    );
+    fixture.deps.fetch = vi.fn((_input, init) => {
+      return new Promise<Response>((resolve, reject) => {
+        resolveFetch = resolve;
+        init?.signal?.addEventListener("abort", () => {
+          aborted();
+          reject(new Error("abort"));
+        });
+      });
+    }) as typeof fetch;
+    const running = runJob(fixture.job, fixture.identity, fixture.deps);
+    await waitForExecute(fixture.deps.fetch);
+
+    currentTime += 15_000;
+    await vi.advanceTimersByTimeAsync(15_000);
+    const abortsAtDeadline = aborted.mock.calls.length;
+
+    rejectHeartbeat?.(new Error("heartbeat timeout"));
+    resolveFetch?.(
+      new Response(JSON.stringify(jobError("VERSION_MISMATCH", true)), {
+        status: 409,
+      }),
+    );
+    await running;
+
+    expect(abortsAtDeadline).toBe(1);
+    expect(fixture.deps.logger.warn).toHaveBeenCalledOnce();
+    expect(fixture.gateway.fail).not.toHaveBeenCalled();
+    expect(fixture.gateway.complete).not.toHaveBeenCalled();
+  });
+
+  it("uses a later successful heartbeat to extend the lease deadline", async () => {
+    vi.useFakeTimers();
+    const fixture = await createFixture();
+    let currentTime = NOW_MS;
+    let resolveFetch: ((response: Response) => void) | undefined;
+    const aborted = vi.fn();
+    fixture.job.claimExpiresAt = new Date(NOW_MS + 25_000).toISOString();
+    fixture.deps.now = () => currentTime;
+    vi.mocked(fixture.gateway.heartbeat)
+      .mockRejectedValueOnce(new Error("gateway unavailable"))
+      .mockResolvedValueOnce(
+        fencedResponse(new Date(NOW_MS + 50_000).toISOString()),
+      );
+    fixture.deps.fetch = vi.fn((_input, init) => {
+      return new Promise<Response>((resolve, reject) => {
+        resolveFetch = resolve;
+        init?.signal?.addEventListener("abort", () => {
+          aborted();
+          reject(new Error("abort"));
+        });
+      });
+    }) as typeof fetch;
+    const running = runJob(fixture.job, fixture.identity, fixture.deps);
+    await waitForExecute(fixture.deps.fetch);
+
+    currentTime += 10_000;
+    await vi.advanceTimersByTimeAsync(10_000);
+    currentTime += 10_000;
+    await vi.advanceTimersByTimeAsync(10_000);
+    currentTime += 5_000;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(aborted).not.toHaveBeenCalled();
+
+    resolveFetch?.(
+      new Response(JSON.stringify(jobError("VERSION_MISMATCH", true)), {
+        status: 409,
+      }),
+    );
+    await running;
+
+    expect(fixture.gateway.heartbeat).toHaveBeenCalledTimes(2);
     expect(fixture.gateway.fail).not.toHaveBeenCalled();
     expect(fixture.gateway.complete).not.toHaveBeenCalled();
   });
