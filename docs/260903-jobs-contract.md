@@ -284,6 +284,8 @@ tee_nodes: id varchar(128) PK, app_id varchar(42) NN, compose_hash varchar(66) N
 
 Level-A run order: SDK build → GW `dev:pg` + `0053` + `0054` + `dev:server` → agent (`DSTACK_FAKE=1 SANDBOX_RUNTIME=fake`) → `POST /v1/tee-nodes` + admit → `npm run e2e:job` → second agent for the lease-recovery step.
 
+**Full e2e joins (2026-09-03, builder app → desktop data → TEE PS → result).** Three joins between proven legs: (1) desktop-uploaded data hydrated by the sandbox: the desktop bundles personal-server-ts core whose default `dataRegistry` (`packages/core/src/schemas/server-config.ts:25`, `0x8f1e…1867`) differs from the canonical Moksha DataRegistry (`0x8C87…Cb7C`, SDK and docs); the Gateway under test must match the client, and the core default is a defect to fix; the desktop cannot send a Vercel bypass header, so test previews run unprotected for the window; a desktop registration and an enclave registration for one owner coexist (`servers.serverAddress` unique, owner only indexed; `GET /v1/servers?owner=` newest first). (2) Owner-signed grants: the web flow signs grants with the PS Lite delegate key, which the sandbox rejects (decision 10); Account gains intent `personal_server.grant_registration.v1` and web an owner-signed grant path for enclave owners (unity-surfaces `feat/owner-signed-grant`). (3) Builder half against an existing owner: `scripts/e2e-job.ts` gains `E2E_BUILDER_ONLY=1` with `OWNER_ADDRESS`, `GRANT_ID`, `BUILDER_PRIVATE_KEY` (personal-server-ts `feat/e2e-job-existing-owner`).
+
 ## 7. Open questions (answers applied overnight, confirmed 2026-09-03 by Kahtaf)
 
 1. **PS signing inside the sandbox.** Recommend: never in v1 (section 4b); no agent signing endpoint. Revisit if step-4 receipts need `signRecordDataAccess`.
