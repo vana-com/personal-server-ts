@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 <name> [--ref <git-ref>] [--node-id <id>] [--compose <path> | --inline] [--app-id <id> --nonce <n>]" >&2
+  echo "Usage: $0 <name> [--ref <git-ref>] [--node-id <id>] [--compose <path> | --inline (registry-free jobs)] [--app-id <id> --nonce <n>]" >&2
 }
 
 if [[ $# -lt 1 ]]; then
@@ -18,7 +18,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
 git_ref=main
 node_id=18
-inline_compose="$repo_root/deploy/dstack/docker-compose.agent.inline.yml"
+inline_compose="$repo_root/deploy/dstack/docker-compose.enclave.inline.yml"
 compose="$repo_root/deploy/dstack/docker-compose.enclave.yml"
 app_id=
 nonce=
@@ -74,7 +74,12 @@ else
   : "${NODE_ID:?NODE_ID must be set in the environment}"
   : "${GATEWAY_URL:?GATEWAY_URL must be set in the environment}"
   : "${PS_IMAGE:?PS_IMAGE must be set in the environment}"
-  if [[ ! $PS_IMAGE =~ ^.+@sha256:[[:xdigit:]]{64}$ ]]; then
+  if [[ ${compose##*/} == docker-compose.enclave.inline.yml ]]; then
+    if [[ ! $PS_IMAGE =~ ^[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+$ ]]; then
+      echo "PS_IMAGE must be a local image tag such as vanaorg/personal-server:level-b" >&2
+      exit 1
+    fi
+  elif [[ ! $PS_IMAGE =~ ^.+@sha256:[[:xdigit:]]{64}$ ]]; then
     echo "PS_IMAGE must be an image digest such as vanaorg/personal-server@sha256:<64 hex characters>" >&2
     exit 1
   fi
@@ -115,7 +120,7 @@ printf 'ENCLAVE_AGENT_SECRET=%s\nGIT_REF=%s\n' \
 if [[ $identity_only == false ]]; then
   printf 'NODE_SECRET=%s\nNODE_ID=%s\nGATEWAY_URL=%s\nPS_IMAGE=%s\n' \
     "$NODE_SECRET" "$NODE_ID" "$GATEWAY_URL" "$PS_IMAGE" >>"$env_file"
-  for optional_name in SANDBOX_MAX SANDBOX_IDLE_TTL_SECONDS LEASE_SECONDS; do
+  for optional_name in SANDBOX_MAX SANDBOX_IDLE_TTL_SECONDS LEASE_SECONDS VERCEL_PROTECTION_BYPASS WORK_DELAY_MS SANDBOX_SYNC; do
     optional_value=${!optional_name:-}
     if [[ -n $optional_value ]]; then
       printf '%s=%s\n' "$optional_name" "$optional_value" >>"$env_file"

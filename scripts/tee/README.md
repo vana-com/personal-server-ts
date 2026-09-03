@@ -25,9 +25,13 @@ level-B clone bootstrap fetches that exact commit and verifies the checkout;
 production follows architecture decision 23 and uses a digest-pinned agent
 image under one approved compose hash. `SANDBOX_MAX`,
 `SANDBOX_IDLE_TTL_SECONDS`, and `LEASE_SECONDS` are optional and default to 20,
-600, and 30. Use `--inline` (or pass the inline compose with `--compose`) for the
-old identity-only deployment; it keeps branch-name support and requires only
-`ENCLAVE_AGENT_SECRET`.
+600, and 30.
+
+Use `--inline` for the registry-free level-B jobs variant, which builds the
+root `Dockerfile` inside the CVM and therefore requires `PS_IMAGE` to be a tag.
+The default enclave compose continues to require a digest. The old
+identity-only `docker-compose.agent.inline.yml` remains available through
+`--compose <path>` and keeps branch-name support.
 
 The nested Docker daemon binds its unauthenticated TCP API to the private
 compose interface. Firewall rules drop Docker API traffic originating from
