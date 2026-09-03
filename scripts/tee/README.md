@@ -58,9 +58,24 @@ Use `replicate.sh` to add a cheaper replica that retains the source CVM's
 `app_id`, so dstack derives the same owner job keys. Export the same fleet
 settings used for provisioning (`ENCLAVE_AGENT_SECRET`, `GATEWAY_URL`,
 `GIT_REF`, `PS_IMAGE`, and any optional sandbox settings); the script generates
-a fresh 32-byte `NODE_SECRET`. Its `--node-id` is the numeric Phala placement
-ID, while `--tee-node-id` is the identity registered with the Gateway and
-defaults to `<name>`.
+a fresh 32-byte `NODE_SECRET`. Exactly one secret destination is required:
+`--secret-out` creates a new mode-0600 file and refuses to overwrite an existing
+path, while `--secret-keychain` creates a macOS generic-password item and
+refuses to update an existing item. The script never prints the secret.
+
+```sh
+scripts/tee/replicate.sh replica-a <source-cvm-uuid> \
+  --secret-out ./replica-a.node-secret
+
+scripts/tee/replicate.sh replica-b <source-cvm-uuid> \
+  --secret-keychain personal-server-fleet/replica-b
+security find-generic-password -s personal-server-fleet -a replica-b -w
+```
+
+The raw secret in the output file, or the value recovered from Keychain, is the
+value to paste once into the registration payload's `secret` placeholder. The
+script's `--node-id` is the numeric Phala placement ID, while `--tee-node-id` is
+the identity registered with the Gateway and defaults to `<name>`.
 
 A fresh `provision.sh` deploy creates an independent `app_id`; use that only
 when the new node should deliberately be unable to decrypt the fleet's jobs.
@@ -100,7 +115,8 @@ export NODE_ID=slow-node
 export WORK_DELAY_MS=120000
 scripts/tee/provision.sh slow-node --ref <40-hex-commit-sha>
 unset WORK_DELAY_MS
-scripts/tee/replicate.sh fast-node <slow-node-cvm-uuid> --node-id <phala-placement-id>
+scripts/tee/replicate.sh fast-node <slow-node-cvm-uuid> \
+  --node-id <phala-placement-id> --secret-out ./fast-node.node-secret
 E2E_REMOTE=1 E2E_RECOVERY=1 E2E_NODE_IDS=slow-node,fast-node npm run e2e:job
 ```
 

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 <name> <source-cvm-uuid> [--node-id <phala-placement-id>] [--tee-node-id <gateway-node-id>]" >&2
+  echo "Usage: $0 <name> <source-cvm-uuid> [--node-id <phala-placement-id>] [--tee-node-id <gateway-node-id>] (--secret-out <path> | --secret-keychain <service>/<account>)" >&2
 }
 
 if [[ $# -lt 2 ]]; then
@@ -19,6 +19,8 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$script_dir/common.sh"
 phala_node_id=18
 NODE_ID=$name
+secret_out=
+secret_keychain=
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -32,12 +34,44 @@ while [[ $# -gt 0 ]]; do
       NODE_ID=$2
       shift 2
       ;;
+    --secret-out)
+      [[ $# -ge 2 ]] || { usage; exit 1; }
+      secret_out=$2
+      shift 2
+      ;;
+    --secret-keychain)
+      [[ $# -ge 2 ]] || { usage; exit 1; }
+      secret_keychain=$2
+      shift 2
+      ;;
     *)
       usage
       exit 1
       ;;
   esac
 done
+
+if [[ -n $secret_out && -n $secret_keychain ]] || [[ -z $secret_out && -z $secret_keychain ]]; then
+  echo "Exactly one of --secret-out or --secret-keychain is required." >&2
+  usage
+  exit 1
+fi
+if [[ -n $secret_out && ( -e $secret_out || -L $secret_out ) ]]; then
+  echo "Secret output already exists; refusing to overwrite: $secret_out" >&2
+  exit 1
+fi
+if [[ -n $secret_keychain ]]; then
+  if [[ $secret_keychain != */* ]]; then
+    echo "--secret-keychain must be <service>/<account>." >&2
+    exit 1
+  fi
+  keychain_service=${secret_keychain%%/*}
+  keychain_account=${secret_keychain#*/}
+  if [[ -z $keychain_service || -z $keychain_account ]]; then
+    echo "--secret-keychain requires a non-empty service and account." >&2
+    exit 1
+  fi
+fi
 
 : "${ENCLAVE_AGENT_SECRET:?ENCLAVE_AGENT_SECRET must be set in the environment}"
 : "${GATEWAY_URL:?GATEWAY_URL must be set in the environment}"
@@ -47,8 +81,22 @@ command -v openssl >/dev/null || { echo "openssl is required" >&2; exit 1; }
 command -v phala >/dev/null || { echo "phala CLI is required" >&2; exit 1; }
 command -v node >/dev/null || { echo "Node.js is required" >&2; exit 1; }
 command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
+if [[ -n $secret_keychain ]]; then
+  command -v security >/dev/null || { echo "macOS security CLI is required for --secret-keychain" >&2; exit 1; }
+fi
 
 NODE_SECRET=$(openssl rand -hex 32)
+if [[ -n $secret_out ]]; then
+  if ! (umask 077; set -o noclobber; printf '%s\n' "$NODE_SECRET" >"$secret_out"); then
+    echo "Could not create secret output without overwriting: $secret_out" >&2
+    exit 1
+  fi
+else
+  security add-generic-password \
+    -s "$keychain_service" \
+    -a "$keychain_account" \
+    -w "$NODE_SECRET"
+fi
 create_secure_env_file
 printf 'ENCLAVE_AGENT_SECRET=%s\nGIT_REF=%s\n' \
   "$ENCLAVE_AGENT_SECRET" "$GIT_REF" >"$env_file"
