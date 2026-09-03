@@ -75,6 +75,9 @@ else
   : "${NODE_SECRET:?NODE_SECRET must be set in the environment}"
   : "${NODE_ID:?NODE_ID must be set in the environment}"
   : "${GATEWAY_URL:?GATEWAY_URL must be set in the environment}"
+  if [[ ${compose##*/} == docker-compose.enclave.inline.yml && -z ${PS_IMAGE:-} ]]; then
+    PS_IMAGE=personal-server:local
+  fi
   : "${PS_IMAGE:?PS_IMAGE must be set in the environment}"
   if [[ ${compose##*/} == docker-compose.enclave.inline.yml ]]; then
     if [[ ! $PS_IMAGE =~ ^[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+$ ]]; then

@@ -17,8 +17,8 @@ node scripts/tee/kms-root.mjs
 `provision.sh` defaults to `deploy/dstack/docker-compose.enclave.yml`. The
 agent receives only the dstack socket and reaches the privileged nested Docker
 runtime over the private compose network. `PS_IMAGE` must be a digest built
-from this branch's root `Dockerfile`; do not use a tag. The previously published
-digest lacks the runtime Vana SDK dependency and exits with
+from this branch's root `Dockerfile`; do not use a tag. An out-of-date published
+digest may lack runtime dependencies and exit with errors such as
 `ERR_MODULE_NOT_FOUND @opendatalabs/vana-sdk`.
 
 For the enclave compose, `--ref` must be an immutable 40-hex commit SHA. The
@@ -29,8 +29,10 @@ image under one approved compose hash. `SANDBOX_MAX`,
 600, and 30.
 
 Use `--inline` for the registry-free level-B jobs variant, which builds the
-root `Dockerfile` inside the CVM and therefore requires `PS_IMAGE` to be a tag.
-The default enclave compose continues to require a digest. The old
+root `Dockerfile` inside the CVM and resolves its own `PS_IMAGE` to a Docker
+image id. The operator does not need to supply `PS_IMAGE`; the local build tag
+defaults to `personal-server:local`, and an explicitly supplied tag is still
+accepted. The default enclave compose continues to require a digest. The old
 identity-only `docker-compose.agent.inline.yml` remains available through
 `--compose <path>` and keeps branch-name support.
 
