@@ -251,6 +251,12 @@ async function main(): Promise<void> {
     /\/$/,
     "",
   );
+  // Optional second Gateway (pointed at another node) for the seal step: proves
+  // a secret encrypted to node A's key is unsealed by node B under one app id.
+  const sealGatewayUrl = (process.env.SEAL_GATEWAY_URL ?? gatewayUrl).replace(
+    /\/+$/,
+    "",
+  );
   const chainId = asPositiveInteger(process.env.CHAIN_ID, DEFAULT_CHAIN_ID);
   const fakeAnchors = fakeGatewayAnchors();
   const anchors: EnclaveTrustAnchors = {
@@ -379,7 +385,7 @@ async function main(): Promise<void> {
       };
       const result = await requestJson(
         "POST",
-        `${gatewayUrl}/v1/identity/${expectedUserPsId}/secret`,
+        `${sealGatewayUrl}/v1/identity/${expectedUserPsId}/secret`,
         submission,
       );
       const body = record(result.response.body);
@@ -414,7 +420,7 @@ async function main(): Promise<void> {
     };
     const result = await requestJson(
       "POST",
-      `${gatewayUrl}/v1/identity/${expectedUserPsId}/secret`,
+      `${sealGatewayUrl}/v1/identity/${expectedUserPsId}/secret`,
       submission,
     );
     const code = record(result.response.body)?.code;
@@ -448,7 +454,7 @@ async function main(): Promise<void> {
     };
     const result = await requestJson(
       "POST",
-      `${gatewayUrl}/v1/identity/${expectedUserPsId}/secret`,
+      `${sealGatewayUrl}/v1/identity/${expectedUserPsId}/secret`,
       epochOneSubmission,
     );
     const parsed = sealedResponse(result.response.body);
@@ -498,7 +504,7 @@ async function main(): Promise<void> {
 
     const secretResult = await requestJson(
       "POST",
-      `${gatewayUrl}/v1/identity/${expectedUserPsId}/secret`,
+      `${sealGatewayUrl}/v1/identity/${expectedUserPsId}/secret`,
       epochOneSubmission,
     );
     const repeatedSecret = sealedResponse(secretResult.response.body);
@@ -598,7 +604,7 @@ async function main(): Promise<void> {
 
       const retiredSecretResult = await requestJson(
         "POST",
-        `${gatewayUrl}/v1/identity/${expectedUserPsId}/secret`,
+        `${sealGatewayUrl}/v1/identity/${expectedUserPsId}/secret`,
         epochOneSubmission,
       );
       requireResponse(
