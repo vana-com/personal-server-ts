@@ -30,6 +30,8 @@ export interface SyncManagerOptions {
   deleteData?: DeleteDataPort | null;
   /** Durable retry marker for blob deletions that failed after the tombstone. */
   pendingBlobDeletions?: PendingBlobDeletionStore;
+  /** Select download-only operation for runtimes that cannot sign uploads. */
+  transferMode?: "upload-download" | "download-only";
 }
 
 export type SyncCanRunResult =
@@ -73,6 +75,7 @@ export function createSyncManager(
   const pollInterval = options?.pollInterval ?? 60_000;
   const uploadBatchSize = options?.uploadBatchSize ?? 50;
   const notifyDebounceMs = options?.notifyDebounceMs ?? 500;
+  const transferMode = options?.transferMode ?? "upload-download";
 
   let intervalId: ReturnType<typeof setInterval> | null = null;
   let notifyTimerId: ReturnType<typeof setTimeout> | null = null;
@@ -136,51 +139,8 @@ export function createSyncManager(
 
         // Finish blob deletions whose tombstone landed but whose storage
         // DELETE did not. Cheap when nothing is pending; never blocks sync.
-        try {
-          await retryPendingBlobDeletions({
-            deleteData: options?.deleteData,
-            pendingBlobDeletions: options?.pendingBlobDeletions,
-            dataPointFeed,
-            serverOwner: uploadDeps.serverOwner,
-            storage: uploadDeps.storage,
-            logger: uploadDeps.logger,
-          });
-        } catch (err) {
-          uploadDeps.logger.warn(
-            { error: (err as Error).message },
-            "Pending blob deletion retry failed",
-          );
-        }
-
-        try {
-          // Upload unsynced local files
-          const uploadResults = await uploadAll(workerUploadDeps, {
-            batchSize: uploadBatchSize,
-            onError(entry, error) {
-              pushError({
-                fileId: entry.fileId,
-                scope: entry.scope,
-                message: `Upload failed for ${entry.path}: ${error.message}`,
-                timestamp: new Date().toISOString(),
-              });
-            },
-          });
-          uploadDeps.logger.debug(
-            { uploaded: uploadResults.length },
-            "Upload cycle complete",
-          );
-        } catch (err) {
-          const syncError: SyncError = {
-            fileId: null,
-            scope: null,
-            message: `Upload cycle failed: ${(err as Error).message}`,
-            timestamp: new Date().toISOString(),
-          };
-          pushError(syncError);
-          uploadDeps.logger.error(
-            { error: (err as Error).message },
-            "Upload cycle failed",
-          );
+        if (transferMode === "upload-download") {
+          await runUploadCycle();
         }
 
         try {
@@ -224,6 +184,54 @@ export function createSyncManager(
       await cycleInFlight;
     } finally {
       cycleInFlight = null;
+    }
+  }
+
+  async function runUploadCycle(): Promise<void> {
+    try {
+      await retryPendingBlobDeletions({
+        deleteData: options?.deleteData,
+        pendingBlobDeletions: options?.pendingBlobDeletions,
+        dataPointFeed,
+        serverOwner: uploadDeps.serverOwner,
+        storage: uploadDeps.storage,
+        logger: uploadDeps.logger,
+      });
+    } catch (err) {
+      uploadDeps.logger.warn(
+        { error: (err as Error).message },
+        "Pending blob deletion retry failed",
+      );
+    }
+
+    try {
+      const uploadResults = await uploadAll(workerUploadDeps, {
+        batchSize: uploadBatchSize,
+        onError(entry, error) {
+          pushError({
+            fileId: entry.fileId,
+            scope: entry.scope,
+            message: `Upload failed for ${entry.path}: ${error.message}`,
+            timestamp: new Date().toISOString(),
+          });
+        },
+      });
+      uploadDeps.logger.debug(
+        { uploaded: uploadResults.length },
+        "Upload cycle complete",
+      );
+    } catch (err) {
+      const syncError: SyncError = {
+        fileId: null,
+        scope: null,
+        message: `Upload cycle failed: ${(err as Error).message}`,
+        timestamp: new Date().toISOString(),
+      };
+      pushError(syncError);
+      uploadDeps.logger.error(
+        { error: (err as Error).message },
+        "Upload cycle failed",
+      );
     }
   }
 

@@ -101,6 +101,20 @@ describe("SyncManager", () => {
     await manager.stop();
   });
 
+  it("runs download-only cycles when uploads are disabled", async () => {
+    const manager = createSyncManager(
+      makeMockUploadDeps(),
+      makeMockDownloadDeps(),
+      { transferMode: "download-only" },
+    );
+
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(uploadAll).not.toHaveBeenCalled();
+    expect(downloadAll).toHaveBeenCalledTimes(1);
+  });
+
   it("stop() prevents further cycles", async () => {
     const uploadDeps = makeMockUploadDeps();
     const downloadDeps = makeMockDownloadDeps();

@@ -61,6 +61,8 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/ports";
 import type { TokenStore } from "./token-store.js";
 import type { Logger } from "pino";
+import { enclaveJobRoutes } from "./routes/enclave-jobs.js";
+import type { JobRequestEnvelope, JobExecuteResponse } from "./jobs/types.js";
 
 export interface IdentityInfo {
   address: `0x${string}`;
@@ -146,6 +148,8 @@ export interface AppDeps {
    * in-memory store (api-auth); hosts may supply a shared one.
    */
   writeProofReplayStore?: WriteProofReplayStore;
+  profile?: "standard" | "enclave";
+  jobWorker?: (envelope: JobRequestEnvelope) => Promise<JobExecuteResponse>;
 }
 
 export function createApp(deps: AppDeps): Hono {
@@ -180,6 +184,16 @@ export function createApp(deps: AppDeps): Hono {
       runtimeAvailability: deps.runtimeAvailability,
     }),
   );
+
+  if (deps.profile === "enclave" && deps.jobWorker && deps.accessToken) {
+    app.route(
+      "/enclave/v1/jobs",
+      enclaveJobRoutes({
+        accessToken: deps.accessToken,
+        executeJob: deps.jobWorker,
+      }),
+    );
+  }
 
   // Mount data routes (ingest + read + delete)
   app.route(
