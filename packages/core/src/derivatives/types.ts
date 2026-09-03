@@ -6,6 +6,8 @@
  * docs/derivative-data-api.md, "Compute (question to derivative)".
  */
 
+import { cloneAnswerShape, type AnswerShape } from "./answer-shape.js";
+
 export type QuestionStatus = "pending" | "ready" | "failed" | "stale";
 
 /**
@@ -39,6 +41,11 @@ export interface QuestionRegistration {
   question: string;
   /** Model override; null = the provider's default. */
   model: string | null;
+  /**
+   * The declared shape of the answer, enforced at compute time; null = the
+   * free-text answer (the original behavior).
+   */
+  answerShape: AnswerShape | null;
   recompute: QuestionRecompute;
   registeredBy: QuestionRegisteredBy;
   status: QuestionStatus;
@@ -97,6 +104,7 @@ export interface QuestionRegistrationView {
   sourceScopes: string[];
   question: string;
   model: string | null;
+  answerShape: AnswerShape | null;
   recompute: QuestionRecompute;
   registeredBy: QuestionRegisteredBy;
   status: QuestionStatus;
@@ -118,6 +126,7 @@ export function questionRegistrationView(
     sourceScopes: [...registration.sourceScopes],
     question: registration.question,
     model: registration.model,
+    answerShape: cloneAnswerShape(registration.answerShape),
     recompute: registration.recompute,
     registeredBy: registration.registeredBy,
     status: registration.status,

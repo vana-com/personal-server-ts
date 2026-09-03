@@ -7,6 +7,7 @@
  * provider call the compute step makes.
  */
 
+import { describeAnswerShape, type AnswerShape } from "./answer-shape.js";
 import type { InferenceMessage } from "./inference.js";
 
 export const DEFAULT_MAX_SOURCE_ITEMS = 50;
@@ -155,18 +156,43 @@ export interface PromptSource {
   truncated: boolean;
 }
 
-export const SYSTEM_PROMPT = [
+const GROUNDING = [
   "You answer a question about a person using ONLY the user data provided in the message.",
   "Do not use outside knowledge and do not guess; if the data does not support an answer, say so in the answer.",
+];
+
+export const SYSTEM_PROMPT = [
+  ...GROUNDING,
   "Respond with a single JSON object and nothing else, with exactly these fields:",
   '  "answer": string, the answer to the question, written for the person the data belongs to;',
   '  "evidence": string, a short summary of which parts of the data support the answer.',
 ].join("\n");
 
+/**
+ * The system prompt for a question that declared an answer shape: the same
+ * grounding, but `answer` is the declared object rather than prose. The
+ * prompt is not the boundary (the reply is validated against the compiled
+ * shape afterwards); it is what makes the model produce a matching reply
+ * on the first try.
+ */
+export function shapedSystemPrompt(shape: AnswerShape): string {
+  return [
+    ...GROUNDING,
+    "Respond with a single JSON object and nothing else, with exactly these fields:",
+    '  "answer": object, holding exactly the fields listed below and no others;',
+    '  "evidence": string, a short summary of which parts of the data support the answer.',
+    'The "answer" object holds:',
+    ...describeAnswerShape(shape),
+    "Use the declared type for every field: a number field is a JSON number, not a string.",
+    "Do not add fields, do not rename them and do not put prose outside them.",
+  ].join("\n");
+}
+
 /** Assemble the chat messages for one compute. */
 export function buildQuestionMessages(input: {
   question: string;
   sources: readonly PromptSource[];
+  answerShape?: AnswerShape | null;
 }): InferenceMessage[] {
   const sections = input.sources.map((source) => {
     const note =
@@ -187,11 +213,47 @@ export function buildQuestionMessages(input: {
     "## User data",
     ...sections,
     "",
-    "Answer the question as a JSON object with the fields answer and evidence.",
+    input.answerShape
+      ? "Answer the question as a JSON object with the fields answer and evidence, where answer holds exactly the declared fields."
+      : "Answer the question as a JSON object with the fields answer and evidence.",
   ].join("\n");
   return [
-    { role: "system", content: SYSTEM_PROMPT },
+    {
+      role: "system",
+      content: input.answerShape
+        ? shapedSystemPrompt(input.answerShape)
+        : SYSTEM_PROMPT,
+    },
     { role: "user", content: user },
+  ];
+}
+
+/**
+ * The corrective turn after a reply that did not match the declared shape:
+ * the model's own reply back as context, then what was wrong with it. The
+ * issue list comes from zod and states constraints only, so nothing of the
+ * user data is restated here that the model did not already send.
+ */
+export function buildShapeRetryMessages(input: {
+  messages: readonly InferenceMessage[];
+  reply: string;
+  issues: readonly string[];
+  answerShape: AnswerShape;
+}): InferenceMessage[] {
+  return [
+    ...input.messages,
+    { role: "assistant", content: input.reply },
+    {
+      role: "user",
+      content: [
+        "That reply did not match the required answer shape:",
+        ...input.issues.map((issue) => `- ${issue}`),
+        "",
+        'Answer again as a single JSON object with the fields answer and evidence, where "answer" holds:',
+        ...describeAnswerShape(input.answerShape),
+        "Return the JSON object and nothing else.",
+      ].join("\n"),
+    },
   ];
 }
 
@@ -201,11 +263,11 @@ export interface ParsedAnswer {
 }
 
 /**
- * Read the model's JSON answer. Tolerates a fenced code block or leading
- * prose around the object; falls back to the whole text as the answer when
- * no object can be parsed (the answer is still the model's, just unframed).
+ * The framings a model wraps its JSON in: a fenced code block, the bare
+ * text, and the span between the first `{` and the last `}`. Deduplicated,
+ * because a bare object is all three at once.
  */
-export function parseAnswer(content: string): ParsedAnswer {
+function jsonFramings(content: string): string[] {
   const candidates: string[] = [content.trim()];
   const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(content);
   if (fenced?.[1]) candidates.unshift(fenced[1].trim());
@@ -214,7 +276,16 @@ export function parseAnswer(content: string): ParsedAnswer {
   if (first !== -1 && last > first) {
     candidates.push(content.slice(first, last + 1));
   }
-  for (const candidate of candidates) {
+  return [...new Set(candidates)];
+}
+
+/**
+ * Read the model's JSON answer. Tolerates a fenced code block or leading
+ * prose around the object; falls back to the whole text as the answer when
+ * no object can be parsed (the answer is still the model's, just unframed).
+ */
+export function parseAnswer(content: string): ParsedAnswer {
+  for (const candidate of jsonFramings(content)) {
     try {
       const parsed: unknown = JSON.parse(candidate);
       if (isRecord(parsed) && typeof parsed.answer === "string") {
@@ -229,4 +300,37 @@ export function parseAnswer(content: string): ParsedAnswer {
     }
   }
   return { answer: content.trim(), evidence: null };
+}
+
+export interface ParsedShapedAnswer {
+  /** The object to check against the compiled shape; never validated here. */
+  answer: Record<string, unknown>;
+  evidence: string | null;
+}
+
+/**
+ * Read the model's reply for a question that declared a shape. Returns
+ * every object worth checking, best first: the `answer` member of the
+ * envelope, then the envelope itself for a model that put the declared
+ * fields at the top level. Empty when nothing parsed as an object at all,
+ * which is a shape failure like any other.
+ */
+export function parseShapedAnswer(content: string): ParsedShapedAnswer[] {
+  const found: ParsedShapedAnswer[] = [];
+  for (const candidate of jsonFramings(content)) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(candidate);
+    } catch {
+      continue;
+    }
+    if (!isRecord(parsed)) continue;
+    const evidence =
+      typeof parsed.evidence === "string" ? parsed.evidence : null;
+    if (isRecord(parsed.answer)) {
+      found.push({ answer: parsed.answer, evidence });
+    }
+    found.push({ answer: parsed, evidence });
+  }
+  return found;
 }

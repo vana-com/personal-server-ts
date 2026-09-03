@@ -1,3 +1,4 @@
+import { cloneAnswerShape } from "./answer-shape.js";
 import type {
   QuestionRegistration,
   QuestionRegistrationPatch,
@@ -10,6 +11,7 @@ function clone(registration: QuestionRegistration): QuestionRegistration {
     ...registration,
     // Registrations persisted before the field existed load as null.
     errorCode: registration.errorCode ?? null,
+    answerShape: cloneAnswerShape(registration.answerShape ?? null),
     sourceScopes: [...registration.sourceScopes],
     registeredBy: { ...registration.registeredBy },
   };

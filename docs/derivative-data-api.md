@@ -532,7 +532,7 @@ in both positions (`coach.*` and `write:coach.*`).
 What runs where:
 
 1. the builder registers
-   `{ derivedScope, sourceScopes, question, model?, recompute? }`;
+   `{ derivedScope, sourceScopes, question, model?, answerShape?, recompute? }`;
 2. the Personal Server reads the sources from LOCAL storage, trims them,
    assembles a prompt, calls the inference provider and writes the answer
    into `derivedScope` with lineage = the source data point ids;
@@ -620,17 +620,32 @@ Registration body:
   "sourceScopes": ["chatgpt.conversations", "oura.sleep"],
   "question": "How did my sleep relate to my mood this week?",
   "model": "z-ai/glm-5.3-flash",
+  "answerShape": {
+    "fields": [
+      { "name": "score", "type": "integer", "min": 1, "max": 5 },
+      { "name": "mood", "type": "enum", "values": ["up", "down", "flat"] },
+      {
+        "name": "reason",
+        "type": "string",
+        "maxLength": 200,
+        "required": false
+      }
+    ]
+  },
   "recompute": "snapshot"
 }
 ```
 
-`model` is optional (the server default applies). `recompute` is optional
+`model` is optional (the server default applies). `answerShape` is optional
+and is covered in "The declared answer shape" below; leaving it out is the
+free-text answer. `recompute` is optional
 too: `"on-change"` (the default) recomputes on every source change, while
 `"snapshot"` computes once at registration and afterwards only on an
 explicit `POST /questions/:id/recompute`; any other value is 400
 `DERIVATIVE_QUESTION_INVALID`. Validation, in order:
 scopes follow the scope grammar; 1 to 16 distinct source scopes, none equal
-to the derived scope; `question` is 1 to 8000 characters; the naming rule
+to the derived scope; `question` is 1 to 8000 characters; `answerShape`, when
+present, follows the grammar below; the naming rule
 (the derived scope must not share its first segment with any source,
 400 `LINEAGE_SCOPE_UNDER_SOURCE_PREFIX`); and the registration must not make
 the derived scope a transitive source of itself through other registrations
@@ -648,6 +663,17 @@ Registration view (POST, GET, list and recompute):
   "sourceScopes": ["chatgpt.conversations", "oura.sleep"],
   "question": "...",
   "model": null,
+  "answerShape": {
+    "fields": [
+      {
+        "name": "score",
+        "type": "integer",
+        "required": true,
+        "min": 1,
+        "max": 5
+      }
+    ]
+  },
   "recompute": "on-change",
   "registeredBy": { "kind": "builder", "builder": "0x...", "grantId": "0x..." },
   "status": "ready",
@@ -674,7 +700,7 @@ computes.
 
 | Status | errorCode                           | When                                                                 |
 | ------ | ----------------------------------- | -------------------------------------------------------------------- |
-| 400    | `DERIVATIVE_QUESTION_INVALID`       | body shape, scope grammar, limits                                    |
+| 400    | `DERIVATIVE_QUESTION_INVALID`       | body shape, scope grammar, limits, `answerShape` grammar             |
 | 400    | `LINEAGE_SCOPE_UNDER_SOURCE_PREFIX` | naming rule                                                          |
 | 400    | `DERIVATIVE_DERIVED_SCOPE_REQUIRED` | builder list call with no `?derivedScope=`                           |
 | 401    | `WRITE_ATTRIBUTION_INVALID`         | the proof does not cover this exact request (uri, query included)    |
@@ -684,6 +710,68 @@ computes.
 | 409    | `DERIVATIVE_CYCLE`                  | the registration would make the derived scope its own source         |
 | 413    | `CONTENT_TOO_LARGE`                 | registration body over 16 KB                                         |
 | 503    | `DERIVATIVE_COMPUTE_UNAVAILABLE`    | the server has no compute layer wired                                |
+
+### The declared answer shape
+
+Without `answerShape` the answer is free text: the model is asked for a
+prose `answer` string and nothing about the reply is enforced beyond the
+token cap. That is as wide as the sources, because a question can ask for
+them verbatim and get them back in the string. A registration may instead
+declare, up front, the fields its answer is made of; the server then
+instructs the model to answer in that shape and VALIDATES the reply against
+it before writing anything, so a 1-5 score is a number between 1 and 5 and
+not a field the raw conversations can be poured into. Fields the model
+returns that were not declared are dropped, never stored.
+
+The declaration is also what makes a recompute the same promise as the
+first compute: a later version matches the shape the approved one did.
+
+The grammar is a flat list of named fields. No nesting, no free-text keys,
+and any key that is not listed for the field's type is refused, so a shape
+cannot carry a second prompt past the 8000-character cap on `question`.
+
+```json
+{
+  "fields": [
+    { "name": "score", "type": "integer", "min": 1, "max": 5 },
+    { "name": "ratio", "type": "number", "min": 0, "max": 1 },
+    { "name": "burnedOut", "type": "boolean", "required": false },
+    { "name": "mood", "type": "enum", "values": ["up", "down", "flat"] },
+    { "name": "reason", "type": "string", "maxLength": 200, "required": false }
+  ]
+}
+```
+
+| Type      | Accepts                    | Constraints         |
+| --------- | -------------------------- | ------------------- |
+| `string`  | a JSON string              | `maxLength`         |
+| `number`  | a finite JSON number       | `min`, `max`        |
+| `integer` | a finite whole JSON number | `min`, `max`        |
+| `boolean` | `true` or `false`          | none                |
+| `enum`    | exactly one of `values`    | `values` (required) |
+
+`required` is optional on every field and defaults to `true`: a declared
+field is part of the promise. An optional field the model omits or returns
+as `null` is left out of the stored value. The registration view echoes the
+shape with `required` and a string's `maxLength` resolved, so it always says
+exactly what is enforced.
+
+Limits, all of them refused with 400 `DERIVATIVE_QUESTION_INVALID` and
+`details.field = "answerShape"`:
+
+| Limit                         | Value                                          |
+| ----------------------------- | ---------------------------------------------- |
+| fields per shape              | 1 to 16                                        |
+| field name                    | 1 to 64 chars, `[A-Za-z][A-Za-z0-9_]*`         |
+| duplicate field names         | refused                                        |
+| `maxLength` on a string       | 1 to 4000, and the default when absent         |
+| `min` / `max`                 | finite; whole numbers on an `integer` field    |
+| enum `values`                 | 1 to 32 distinct values                        |
+| one enum value                | 1 to 64 chars, no line breaks or tabs          |
+| a key not listed for the type | refused (no `description`, no nested `fields`) |
+
+Worst case that is about 3 KB of field names and enum values reaching the
+prompt, well under what the question text alone may carry.
 
 ### Observing a question as the reader
 
@@ -818,6 +906,20 @@ and a user message with the question followed by one section per source
 JSON). The reply is parsed as JSON (a fenced block or surrounding prose is
 tolerated); when no object parses the whole text is the answer.
 
+A question that declared an `answerShape` gets the same grounding with a
+different answer contract: `answer` is an OBJECT and the system prompt
+lists every declared field with its type, its bounds and whether it is
+required. The reply is then checked against the shape (the `answer` member
+first, the whole envelope second, for a model that skipped the wrapper).
+The prompt is not the boundary; the check is. A reply that does not match
+gets exactly ONE corrective turn - its own reply back as context plus the
+constraints it broke, which are zod's messages and never echo the value
+received - and a second miss fails the compute rather than writing a
+derivative the builder cannot trust. The failure is `internal`
+(`answer did not match the declared shape (fields: ...)`), because the
+reader-facing `errorCode` vocabulary is closed and an unknown value would
+break clients parsing it as an enum.
+
 ### The derived record
 
 Written through the owner ingest path (no `$writtenBy`), with
@@ -828,7 +930,8 @@ in registration order and `writtenAt` = the compute time. The record body:
 {
   "questionId": "5f0c...",
   "question": "How did my sleep relate to my mood this week?",
-  "answer": "...",
+  "answer": "score: 4\nmood: up",
+  "answerData": { "score": 4, "mood": "up" },
   "evidence": "...",
   "model": "z-ai/glm-5.3-flash",
   "computedAt": "2026-08-31T09:12:44.000Z",
@@ -841,6 +944,13 @@ in registration order and `writtenAt` = the compute time. The record body:
   "$lineage": { "sources": ["0x5b1a...9c", "0x9e77...02"], "writtenAt": "..." }
 }
 ```
+
+`answerData` is present only for a question that declared an `answerShape`,
+and holds the validated value: the declared fields, in declaration order,
+with the optional ones the model left out omitted. `answer` stays a STRING
+either way, because readers depend on it; for a shaped answer it holds a
+`name: value` line per present field, a rendering of `answerData`, which is
+the authoritative one.
 
 `sources[].version` is the local index version of each source at compute
 time (lineage itself is version-less, see "Identifiers"). `inference` is

@@ -8,7 +8,9 @@ import {
   createFakeInferenceProvider,
   createOpenAiCompatibleInferenceProvider,
   InferenceRequestError,
+  type FakeInferenceProviderOptions,
 } from "./inference.js";
+import { parseAnswerShapeInput } from "./answer-shape.js";
 import { createPhalaE2eeEncryption } from "./e2ee/phala.js";
 import { createFakeE2eeGateway } from "../test-utils/e2ee-gateway.js";
 import { createRecomputeScheduler } from "./scheduler.js";
@@ -29,6 +31,7 @@ function registration(
     sourceScopes: ["oura.sleep", "chatgpt.conversations"],
     question: "How did I sleep?",
     model: null,
+    answerShape: null,
     recompute: "on-change",
     registeredBy: { kind: "owner" },
     status: "pending",
@@ -729,5 +732,155 @@ describe("failure classification (errorCode)", () => {
     const stored = (await d.store.get("q-1"))!;
     expect(stored.error).toBeNull();
     expect(stored.errorCode).toBeNull();
+  });
+});
+
+describe("computeQuestion with a declared answer shape", () => {
+  const answerShape = parseAnswerShapeInput({
+    fields: [
+      { name: "score", type: "integer", min: 1, max: 5 },
+      { name: "reason", type: "string", maxLength: 200, required: false },
+    ],
+  })!;
+
+  function shapedDeps(
+    respond: FakeInferenceProviderOptions["respond"],
+  ): ReturnType<typeof deps> {
+    return deps({
+      store: createInMemoryQuestionStore({
+        initial: [registration({ answerShape })],
+      }),
+      provider: createFakeInferenceProvider({ respond }),
+    });
+  }
+
+  async function seedSources(d: ReturnType<typeof deps>) {
+    await seed(d.storage, "oura.sleep", { nights: [{ score: 70 }] });
+    await seed(d.storage, "chatgpt.conversations", { items: [{ title: "x" }] });
+  }
+
+  async function derivedRecord(d: ReturnType<typeof deps>) {
+    const entry = d.storage.findEntry({ scope: "coach.weekly" })!;
+    const envelope = await d.storage.readEnvelope(
+      "coach.weekly",
+      entry.collectedAt,
+    );
+    return envelope.data as Record<string, unknown>;
+  }
+
+  it("writes the validated object next to a rendered answer string", async () => {
+    const d = shapedDeps(async () => ({
+      content: JSON.stringify({
+        answer: { score: 4, reason: "two good nights" },
+        evidence: "oura.sleep",
+      }),
+    }));
+    await seedSources(d);
+
+    expect((await computeQuestion("q-1", d)).status).toBe("ready");
+    const record = await derivedRecord(d);
+    expect(record.answerData).toEqual({ score: 4, reason: "two good nights" });
+    // `answer` stays a string: readers depend on it.
+    expect(record.answer).toBe("score: 4\nreason: two good nights");
+    expect(record.evidence).toBe("oura.sleep");
+    expect(fakeCalls(d)).toHaveLength(1);
+    // The shape reached the model, not just the validator.
+    expect(fakeCalls(d)[0]!.messages[0]!.content).toContain(
+      '"score": integer between 1 and 5 (required)',
+    );
+  });
+
+  it("drops what the model returned beyond the declared fields", async () => {
+    const d = shapedDeps(async () => ({
+      content: JSON.stringify({
+        answer: {
+          score: 4,
+          rawConversations: ["every message the prompt saw"],
+        },
+        evidence: "e",
+      }),
+    }));
+    await seedSources(d);
+
+    expect((await computeQuestion("q-1", d)).status).toBe("ready");
+    const record = await derivedRecord(d);
+    expect(record.answerData).toEqual({ score: 4 });
+    expect(JSON.stringify(record)).not.toContain("rawConversations");
+  });
+
+  it("retries once with a corrective turn when the first reply misses", async () => {
+    const d = shapedDeps(async (_input, index) => ({
+      content:
+        index === 0
+          ? JSON.stringify({ answer: { score: "great" }, evidence: "e" })
+          : JSON.stringify({ answer: { score: 5 }, evidence: "e" }),
+    }));
+    await seedSources(d);
+
+    expect((await computeQuestion("q-1", d)).status).toBe("ready");
+    expect((await derivedRecord(d)).answerData).toEqual({ score: 5 });
+    const calls = fakeCalls(d);
+    expect(calls).toHaveLength(2);
+    // The retry carries the original turns, the bad reply and the reason.
+    expect(calls[1]!.messages).toHaveLength(4);
+    expect(calls[1]!.messages[2]).toMatchObject({ role: "assistant" });
+    expect(calls[1]!.messages[3]!.content).toContain(
+      "did not match the required answer shape",
+    );
+    expect(calls[1]!.messages[3]!.content).toContain("expected number");
+  });
+
+  it("fails the compute when the retry misses too", async () => {
+    const d = shapedDeps(async () => ({
+      content: JSON.stringify({
+        answer: { score: 9, reason: "out of range" },
+        evidence: "e",
+      }),
+    }));
+    await seedSources(d);
+
+    const outcome = await computeQuestion("q-1", d);
+    expect(outcome.status).toBe("failed");
+    expect(fakeCalls(d)).toHaveLength(2);
+    const stored = (await d.store.get("q-1"))!;
+    expect(stored.status).toBe("failed");
+    expect(stored.error).toBe(
+      "answer did not match the declared shape (fields: score, reason)",
+    );
+    // The reader-facing vocabulary is closed, so a shape miss is `internal`.
+    expect(stored.errorCode).toBe("internal");
+    // Nothing is written: a derivative the builder cannot trust is worse
+    // than none.
+    expect(d.storage.findEntry({ scope: "coach.weekly" })).toBeUndefined();
+  });
+
+  it("fails when the reply holds no JSON object at all", async () => {
+    const d = shapedDeps(async () => ({ content: "I would say a four." }));
+    await seedSources(d);
+
+    expect((await computeQuestion("q-1", d)).status).toBe("failed");
+    expect((await d.store.get("q-1"))!.errorCode).toBe("internal");
+  });
+
+  it("leaves a question with no declared shape exactly as it was", async () => {
+    const d = deps({
+      provider: createFakeInferenceProvider({
+        respond: async () => ({
+          content: JSON.stringify({
+            answer: "You slept well.",
+            evidence: "oura.sleep",
+          }),
+        }),
+      }),
+    });
+    await seedSources(d);
+
+    expect((await computeQuestion("q-1", d)).status).toBe("ready");
+    const record = await derivedRecord(d);
+    expect(record.answer).toBe("You slept well.");
+    expect(record.evidence).toBe("oura.sleep");
+    expect("answerData" in record).toBe(false);
+    expect(fakeCalls(d)).toHaveLength(1);
+    expect(fakeCalls(d)[0]!.messages[0]!.content).toContain('"answer": string');
   });
 });

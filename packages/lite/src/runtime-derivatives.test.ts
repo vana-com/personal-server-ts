@@ -142,7 +142,7 @@ describe("PS-Lite derivative compute", () => {
     expect((await reloaded.get(questionId))?.status).toBe("ready");
   });
 
-  it("defaults recompute to on-change for registrations saved before the field existed", async () => {
+  it("defaults recompute and the answer shape for registrations saved before the fields existed", async () => {
     const stateStore = createMemoryPsLiteStateStore();
     const legacy = {
       questionId: "q-legacy",
@@ -164,7 +164,9 @@ describe("PS-Lite derivative compute", () => {
       questions: [legacy],
     });
     const store = await createPsLiteQuestionStore(stateStore);
-    expect((await store.get("q-legacy"))!.recompute).toBe("on-change");
+    const restored = (await store.get("q-legacy"))!;
+    expect(restored.recompute).toBe("on-change");
+    expect(restored.answerShape).toBeNull();
   });
 
   it("activate() on a fresh runtime reschedules questions a previous session left pending", async () => {
