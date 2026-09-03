@@ -47,10 +47,14 @@ const GRANTEE_ID = deriveBuilderId(
 type SignedGrant = GatewayGrantResponse & { signature?: string };
 type SignedBuilder = Builder & { signature?: string };
 
-async function signedArtifacts(): Promise<{
+async function signedArtifacts(options?: {
+  signedExpiresAt?: string;
+  gatewayExpiresAt?: string | null;
+}): Promise<{
   grant: SignedGrant;
   builder: SignedBuilder;
 }> {
+  const signedExpiresAt = options?.signedExpiresAt ?? "0";
   const builder: SignedBuilder = {
     id: GRANTEE_ID,
     ownerAddress: builderOwner.address,
@@ -78,7 +82,7 @@ async function signedArtifacts(): Promise<{
     scopes: ["instagram.profile"],
     status: "confirmed",
     addedAt: "2026-09-03T00:00:00.000Z",
-    expiresAt: "0",
+    expiresAt: signedExpiresAt,
     expired: false,
     revokedAt: null,
     revocationSignature: null,
@@ -109,6 +113,10 @@ async function signedArtifacts(): Promise<{
       expiresAt: grant.expiresAt,
     },
   });
+  grant.expiresAt =
+    options?.gatewayExpiresAt === undefined
+      ? signedExpiresAt
+      : options.gatewayExpiresAt;
 
   return { grant, builder };
 }
@@ -148,6 +156,65 @@ describe("verifySignedArtifacts", () => {
         ownerAddress: owner.address,
       }),
     ).resolves.toBeUndefined();
+  });
+
+  it("accepts an ISO grant expiry returned by the Gateway", async () => {
+    const expiresAt = 1_820_007_918;
+    const artifacts = await signedArtifacts({
+      signedExpiresAt: String(expiresAt),
+      gatewayExpiresAt: new Date(expiresAt * 1000).toISOString(),
+    });
+
+    await expect(
+      verifySignedArtifacts({
+        ...artifacts,
+        gatewayConfig,
+        ownerAddress: owner.address,
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("accepts a decimal-string grant expiry", async () => {
+    const artifacts = await signedArtifacts({
+      signedExpiresAt: "1820007918",
+    });
+
+    await expect(
+      verifySignedArtifacts({
+        ...artifacts,
+        gatewayConfig,
+        ownerAddress: owner.address,
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it.each(["0", null])(
+    "accepts a perpetual grant expiry encoded as %s",
+    async (gatewayExpiresAt) => {
+      const artifacts = await signedArtifacts({ gatewayExpiresAt });
+
+      await expect(
+        verifySignedArtifacts({
+          ...artifacts,
+          gatewayConfig,
+          ownerAddress: owner.address,
+        }),
+      ).resolves.toBeUndefined();
+    },
+  );
+
+  it("fails closed for an invalid Gateway grant expiry", async () => {
+    const artifacts = await signedArtifacts({
+      gatewayExpiresAt: "not-a-date",
+    });
+
+    await expect(
+      verifySignedArtifacts({
+        ...artifacts,
+        gatewayConfig,
+        ownerAddress: owner.address,
+      }),
+    ).rejects.toBeInstanceOf(SignedArtifactInvalidError);
   });
 
   it("fails closed when signed gateway artifacts are missing", async () => {

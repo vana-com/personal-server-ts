@@ -29,6 +29,16 @@ const DOMAIN_TYPE =
   "DataPortabilityDomain(uint256 chainId,address verifyingContract)";
 const DOMAIN_TYPE_HASH = keccak256(toHex(DOMAIN_TYPE));
 
+function grantExpiryToUint256(value: string | null): string {
+  if (value === null || value === "" || value === "0") return "0";
+  if (/^\d+$/u.test(value)) return value;
+
+  const millis = Date.parse(value);
+  if (!Number.isNaN(millis)) return String(Math.floor(millis / 1000));
+
+  throw new SignedArtifactInvalidError({ artifact: "grant" });
+}
+
 export interface SignedArtifactInput {
   grant: SignedGrant;
   builder: SignedBuilder;
@@ -55,7 +65,7 @@ export async function verifySignedArtifacts(
       granteeId: input.grant.granteeId as `0x${string}`,
       scopes: input.grant.scopes,
       grantVersion: input.grant.grantVersion,
-      expiresAt: input.grant.expiresAt ?? "0",
+      expiresAt: grantExpiryToUint256(input.grant.expiresAt),
       signature: input.grant.signature as `0x${string}`,
     });
   } catch {

@@ -113,7 +113,7 @@ const REMOTE_ENABLED = "1";
 const GRANT_VERSION_ONE = 1n;
 const GRANT_VERSION_REVOKED = 2n;
 const GRANT_VERSION_FRESH = 3n;
-const NO_EXPIRY = 0n;
+const GRANT_EXPIRY_SECONDS_FROM_NOW = 365 * 24 * 60 * 60;
 const JSON_CONTENT_TYPE = "application/json";
 const FAKE_IMAGE = "unused-in-level-a";
 const OWNER_RECORD = { hello: "jobs", n: 1 } as const;
@@ -679,7 +679,9 @@ async function createGrant(
     granteeId: builderId,
     scopes: [JOB_SCOPE],
     grantVersion: version,
-    expiresAt: NO_EXPIRY,
+    expiresAt: BigInt(
+      Math.floor(Date.now() / 1000) + GRANT_EXPIRY_SECONDS_FROM_NOW,
+    ),
   };
   const signature = await ctx.owner.signTypedData({
     domain: grantRegistrationDomain(ctx.gatewayConfig),
