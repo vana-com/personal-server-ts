@@ -100,6 +100,7 @@ function startJobs(
   let drainPromise: Promise<void> | undefined;
 
   return {
+    nodeId: config.nodeId,
     activeCount: () => registry.activeCount(),
     draining: () => claimLoop.draining(),
     drain(): Promise<void> {

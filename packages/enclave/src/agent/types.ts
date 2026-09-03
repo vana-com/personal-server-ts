@@ -27,6 +27,7 @@ export interface HealthResponse {
   appId: string;
   composeHash: string;
   instanceId: string;
+  nodeId: string | null;
   osImageHash?: string;
   osVersion?: string;
   activeSandboxes: number;

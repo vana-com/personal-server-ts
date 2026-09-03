@@ -27,6 +27,7 @@ const OTHER = privateKeyToAccount(OTHER_KEY);
 const CHAIN_ID = 14_800;
 const EPOCH = 2;
 const FAKE_APP_ID = "0000000000000000000000000000000000000003";
+const JOB_NODE_ID = "node-jobs";
 const HEALTH_PATH = "/agent/v1/health";
 const IDENTITY_PATH = "/agent/v1/identity";
 const SEAL_PATH = "/agent/v1/secrets/seal";
@@ -157,6 +158,7 @@ describe("agent HTTP server", () => {
       instanceId: string;
       osImageHash: string;
       osVersion: string;
+      nodeId: string | null;
       activeSandboxes: number;
       draining: boolean;
     };
@@ -165,6 +167,7 @@ describe("agent HTTP server", () => {
     expect(body).toMatchObject({
       appId: FAKE_APP_ID,
       osVersion: "fake",
+      nodeId: null,
       activeSandboxes: 0,
       draining: false,
     });
@@ -175,6 +178,7 @@ describe("agent HTTP server", () => {
 
   it("reports jobs state and drains through the operator route", async () => {
     const jobs = {
+      nodeId: JOB_NODE_ID,
       activeCount: vi.fn().mockReturnValue(3),
       draining: vi.fn().mockReturnValue(true),
       drain: vi.fn().mockResolvedValue(undefined),
@@ -186,6 +190,7 @@ describe("agent HTTP server", () => {
       headers: JSON_HEADERS,
     });
     expect(await health.json()).toMatchObject({
+      nodeId: JOB_NODE_ID,
       activeSandboxes: 3,
       draining: true,
     });

@@ -44,6 +44,7 @@ export interface AgentServerOptions {
 }
 
 export interface AgentJobsControl {
+  nodeId: string;
   activeCount(): number;
   draining(): boolean;
   drain(): Promise<void>;
@@ -84,6 +85,7 @@ async function handleRequest(
         OK,
         await readHealth(
           options.client,
+          options.jobs?.nodeId ?? null,
           options.jobs?.activeCount() ?? 0,
           options.jobs?.draining() ?? false,
         ),
