@@ -101,6 +101,9 @@ deploy_json=$(
     -e "GIT_REF=$git_ref"
 )
 
+# `phala deploy --json` prints progress lines before the JSON body; keep the body only.
+deploy_json=$(printf '%s\n' "$deploy_json" | sed -n '/^{/,$p')
+
 uuid=$(
   node -e '
     const value = JSON.parse(process.argv[1]);
