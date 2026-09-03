@@ -31,6 +31,7 @@ export interface AgentJobsConfig {
   leaseSeconds: number;
   dockerHost: string;
   psEntry?: string;
+  fakeRoot?: string;
   sync: SandboxSyncMode;
   workDelayMs: number;
 }
@@ -120,6 +121,9 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
     leaseSeconds,
     dockerHost: env.DOCKER_HOST ?? DEFAULT_DOCKER_HOST,
     ...(runtime === "fake" && env.PS_ENTRY ? { psEntry: env.PS_ENTRY } : {}),
+    ...(runtime === "fake" && env.SANDBOX_FAKE_ROOT
+      ? { fakeRoot: env.SANDBOX_FAKE_ROOT }
+      : {}),
     sync,
     workDelayMs,
   };

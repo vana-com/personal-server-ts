@@ -1,8 +1,8 @@
 import { spawn as nodeSpawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import type { HealthProbe, SyncProbe } from "./probes.js";
@@ -49,6 +49,7 @@ export type SpawnFn = (
 
 export interface FakeRuntimeOptions {
   psEntry?: string;
+  fakeRoot?: string;
   spawn?: SpawnFn;
   healthTimeoutMs?: number;
   syncTimeoutMs?: number;
@@ -62,6 +63,7 @@ export interface FakeRuntimeOptions {
 interface RunningSandbox {
   child: SpawnChild;
   root: string;
+  preserveRoot: boolean;
   running: boolean;
 }
 
@@ -77,6 +79,7 @@ export function createFakeRuntime(
   const pickPort = options.pickPort ?? freePort;
   const healthTimeoutMs = options.healthTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS;
   const syncTimeoutMs = options.syncTimeoutMs ?? DEFAULT_SYNC_TIMEOUT_MS;
+  const configuredRoot = options.fakeRoot;
   const sandboxes = new Map<string, RunningSandbox>();
 
   return {
@@ -86,7 +89,13 @@ export function createFakeRuntime(
       const id = sandboxId(spec);
       const port = await pickPort();
       const origin = `http://${LOOPBACK_HOST}:${port}`;
-      const root = await mkdtemp(`${tmpdir()}/${TEMP_ROOT_PREFIX}`);
+      const preserveRoot = configuredRoot !== undefined;
+      const root = preserveRoot
+        ? join(configuredRoot, `${spec.userPsId}-${spec.epoch}`)
+        : await mkdtemp(`${tmpdir()}/${TEMP_ROOT_PREFIX}`);
+      if (preserveRoot) {
+        await mkdir(root, { recursive: true });
+      }
       const environment = childEnv(spec, port, origin, root);
       let child: SpawnChild;
       try {
@@ -95,11 +104,13 @@ export function createFakeRuntime(
           stdio: ["ignore", "pipe", "pipe"],
         });
       } catch (error) {
-        await rm(root, { recursive: true, force: true });
+        if (!preserveRoot) {
+          await rm(root, { recursive: true, force: true });
+        }
         throw error;
       }
 
-      const running = { child, root, running: true };
+      const running = { child, root, preserveRoot, running: true };
       sandboxes.set(id, running);
       child.once?.("exit", () => {
         running.running = false;
@@ -284,7 +295,9 @@ async function stopSandbox(
   if (sandbox.running) {
     sandbox.child.kill(FORCE_KILL_SIGNAL);
   }
-  await rm(sandbox.root, { recursive: true, force: true });
+  if (!sandbox.preserveRoot) {
+    await rm(sandbox.root, { recursive: true, force: true });
+  }
 }
 
 function delay(milliseconds: number): Promise<void> {

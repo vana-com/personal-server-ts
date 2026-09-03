@@ -108,6 +108,7 @@ function createRuntime(
   if (config.runtime === "fake") {
     return createFakeRuntime({
       ...(config.psEntry ? { psEntry: config.psEntry } : {}),
+      ...(config.fakeRoot ? { fakeRoot: config.fakeRoot } : {}),
     });
   }
 

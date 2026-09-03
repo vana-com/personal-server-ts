@@ -41,6 +41,7 @@ describe("agentConfigFromEnv", () => {
       NODE_SECRET: "node-secret",
       PS_IMAGE: "personal-server:test",
       SANDBOX_RUNTIME: "fake",
+      SANDBOX_FAKE_ROOT: "/tmp/sandboxes",
       PS_ENTRY: "/tmp/server.js",
       SANDBOX_MAX: "4",
       SANDBOX_IDLE_TTL_SECONDS: "9",
@@ -60,6 +61,7 @@ describe("agentConfigFromEnv", () => {
       leaseSeconds: 60,
       dockerHost: "tcp://sandbox-runtime:2375",
       psEntry: "/tmp/server.js",
+      fakeRoot: "/tmp/sandboxes",
       sync: "disabled",
       workDelayMs: 250,
     });

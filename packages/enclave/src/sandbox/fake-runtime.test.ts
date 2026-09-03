@@ -1,3 +1,6 @@
+import { access, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import type { Hex } from "viem";
@@ -99,5 +102,33 @@ describe("fake sandbox runtime", () => {
       "token",
     );
     await runtime.stop(handle.id);
+  });
+
+  it("uses and preserves a deterministic configured root", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "ps-fake-root-test-"));
+    const expectedRoot = join(parent, `${USER_PS_ID}-5`);
+    const spawn = vi.fn<SpawnFn>().mockReturnValue(fakeChild());
+    const runtime = createFakeRuntime({
+      fakeRoot: parent,
+      spawn,
+      health: async () => true,
+      pickPort: async () => 43_212,
+    });
+
+    try {
+      const handle = await runtime.start({
+        userPsId: USER_PS_ID,
+        epoch: 5,
+        image: "unused",
+        env: { SYNC_ENABLED: "false" },
+      });
+      const options = spawn.mock.calls[0]?.[2];
+
+      expect(options?.env.PERSONAL_SERVER_ROOT_PATH).toBe(expectedRoot);
+      await runtime.stop(handle.id);
+      await expect(access(expectedRoot)).resolves.toBeUndefined();
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
   });
 });

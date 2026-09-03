@@ -52,7 +52,6 @@ COPY --from=build --chown=vana:vana /app/packages/lite/node_modules/ packages/li
 
 COPY --from=build --chown=vana:vana /app/packages/server/package.json packages/server/package.json
 COPY --from=build --chown=vana:vana /app/packages/server/dist/ packages/server/dist/
-COPY --from=build --chown=vana:vana /app/packages/server/node_modules/ packages/server/node_modules/
 
 # Data directory for SQLite DB, keys, logs
 RUN mkdir -p /data && chown vana:vana /data
