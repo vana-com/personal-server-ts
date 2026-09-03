@@ -14,7 +14,8 @@
 services:
   agent:
     image: node:24-alpine
-    restart: "no"
+    # A crash must not leave a running CVM unable to serve jobs.
+    restart: unless-stopped
     working_dir: /app
     ports:
       - "8787:8787"
@@ -71,7 +72,8 @@ services:
 
   sandbox-runtime:
     image: docker:27-dind
-    restart: "no"
+    # A crash must not leave a running CVM unable to serve jobs.
+    restart: unless-stopped
     privileged: true
     cgroup: host
     environment:
