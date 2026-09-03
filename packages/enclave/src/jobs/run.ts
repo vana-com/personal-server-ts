@@ -37,7 +37,16 @@ const SYNC_ENABLED = "true";
 const SYNC_DISABLED = "false";
 const ENCRYPT_UNAVAILABLE = "ECIES encryption is unavailable";
 const NORMALIZE_UNAVAILABLE = "ECIES key normalization is unavailable";
+const INVALID_CIPHERTEXT = "Invalid job request ciphertext";
 const LEASE_EXPIRED_MESSAGE = "Job lease expired without confirmation";
+const NODE_DERIVATION_MISMATCH_MESSAGE =
+  "Derived enclave key does not match the claimed identity";
+const JOB_STAGE_FAILURE_MESSAGE = "Enclave job stage failed";
+const DECRYPT_STAGE = "decrypt";
+const UNSEAL_STAGE = "unseal";
+const SANDBOX_ACQUIRE_STAGE = "sandbox-acquire";
+const COMPLETE_STAGE = "complete";
+const UNKNOWN_ERROR = "unknown";
 const RESULT_HASH_PATTERN = /^0x[0-9a-fA-F]{64}$/;
 const JOB_FAILURE_CODES = new Set<string>([
   "AUTH_INVALID",
@@ -88,18 +97,24 @@ export async function runJob(
   let acquired = false;
 
   try {
-    let envelope: JobRequestEnvelope | undefined;
+    let decrypted: DecryptResult;
     try {
-      envelope = await decryptRequest(job, identity, deps.client);
-    } catch {
+      decrypted = await decryptRequest(job, identity, deps.client);
+    } catch (error) {
+      logStageFailure(deps.logger, job.jobId, DECRYPT_STAGE, error);
       return;
     }
-    if (!envelope || lease.lost()) {
+    if (decrypted.kind === "node-fault") {
+      deps.logger.warn({ jobId: job.jobId }, NODE_DERIVATION_MISMATCH_MESSAGE);
+      return;
+    }
+    if (decrypted.kind === "invalid" || lease.lost()) {
       if (!lease.lost()) {
         await failJob(job, INVALID_REQUEST_REASON, deps.gateway);
       }
       return;
     }
+    const { envelope } = decrypted;
     if (!requestMatches(envelope, job, now())) {
       await failJob(job, failureReason(envelope, now()), deps.gateway);
       return;
@@ -113,7 +128,8 @@ export async function runJob(
         identity.epoch,
         identity.sealedEnvelope,
       );
-    } catch {
+    } catch (error) {
+      logStageFailure(deps.logger, job.jobId, UNSEAL_STAGE, error);
       return;
     }
 
@@ -126,7 +142,8 @@ export async function runJob(
         return spec;
       });
       acquired = true;
-    } catch {
+    } catch (error) {
+      logStageFailure(deps.logger, job.jobId, SANDBOX_ACQUIRE_STAGE, error);
       return;
     } finally {
       signature.fill(0);
@@ -177,6 +194,7 @@ export async function runJob(
         return;
       }
 
+      logStageFailure(deps.logger, job.jobId, COMPLETE_STAGE, error);
       return;
     }
   } finally {
@@ -288,7 +306,7 @@ async function decryptRequest(
   job: ClaimedJob,
   identity: ClaimedIdentity,
   client: DstackClient,
-): Promise<JobRequestEnvelope | undefined> {
+): Promise<DecryptResult> {
   const derived = await deriveEnclaveKey(
     client,
     identity.userPsId,
@@ -297,22 +315,46 @@ async function decryptRequest(
 
   try {
     if (getAddress(derived.address) !== getAddress(identity.enclaveAddress)) {
-      return undefined;
+      return { kind: "node-fault" };
     }
 
-    return await openJobRequest(
-      job.requestCiphertext,
-      derived.key,
-      DECRYPT_ONLY_ECIES,
-    );
+    return {
+      kind: "envelope",
+      envelope: await openJobRequest(
+        job.requestCiphertext,
+        derived.key,
+        DECRYPT_ONLY_ECIES,
+      ),
+    };
   } catch (error) {
     if (error instanceof JobEnvelopeError) {
-      return undefined;
+      return { kind: "invalid" };
     }
-    return undefined;
+    throw error;
   } finally {
     derived.key.fill(0);
   }
+}
+
+type DecryptResult =
+  | { kind: "envelope"; envelope: JobRequestEnvelope }
+  | { kind: "invalid" }
+  | { kind: "node-fault" };
+
+function logStageFailure(
+  logger: JobLogger,
+  jobId: string,
+  stage: string,
+  error: unknown,
+): void {
+  logger.warn(
+    {
+      jobId,
+      stage,
+      error: error instanceof Error ? error.name : UNKNOWN_ERROR,
+    },
+    JOB_STAGE_FAILURE_MESSAGE,
+  );
 }
 
 function requestMatches(
@@ -479,15 +521,19 @@ const DECRYPT_ONLY_ECIES: ECIESProvider = {
     privateKey: Uint8Array,
     encrypted: ECIESEncrypted,
   ): Promise<Uint8Array> {
-    return decryptEcies(
-      privateKey,
-      Buffer.concat([
-        encrypted.iv,
-        encrypted.ephemPublicKey,
-        encrypted.ciphertext,
-        encrypted.mac,
-      ]),
-    );
+    try {
+      return decryptEcies(
+        privateKey,
+        Buffer.concat([
+          encrypted.iv,
+          encrypted.ephemPublicKey,
+          encrypted.ciphertext,
+          encrypted.mac,
+        ]),
+      );
+    } catch {
+      throw new JobEnvelopeError(INVALID_CIPHERTEXT);
+    }
   },
   async encrypt(): Promise<ECIESEncrypted> {
     throw new Error(ENCRYPT_UNAVAILABLE);

@@ -32,6 +32,7 @@ const EPOCH = 2;
 const NOW_MS = Date.parse("2026-09-03T12:00:00.000Z");
 const DEADLINE = "2026-09-03T12:05:00.000Z";
 const JOB_ID = "job-1";
+const TAMPER_BIT = 1;
 const RESULT = {
   resultCiphertext: "ciphertext",
   resultHash: `0x${"66".repeat(32)}`,
@@ -296,6 +297,32 @@ describe("runJob", () => {
   it("fails a request whose inner binding does not match the claim", async () => {
     const fixture = await createFixture();
     fixture.job.scope = "profile.other";
+
+    await runJob(fixture.job, fixture.identity, fixture.deps);
+
+    expect(fixture.gateway.fail).toHaveBeenCalledWith(JOB_ID, {
+      fencingToken: 1,
+      reason: "REQUEST_INVALID",
+    });
+    expect(fixture.gateway.complete).not.toHaveBeenCalled();
+  });
+
+  it("lets the lease lapse when the derived node identity mismatches", async () => {
+    const fixture = await createFixture();
+    fixture.identity.enclaveAddress = OWNER;
+
+    await runJob(fixture.job, fixture.identity, fixture.deps);
+
+    expect(fixture.gateway.fail).not.toHaveBeenCalled();
+    expect(fixture.gateway.complete).not.toHaveBeenCalled();
+    expect(fixture.deps.logger.warn).toHaveBeenCalledOnce();
+  });
+
+  it("fails a request with invalid ciphertext", async () => {
+    const fixture = await createFixture();
+    const ciphertext = Buffer.from(fixture.job.requestCiphertext, "base64");
+    ciphertext[ciphertext.length - 1] ^= TAMPER_BIT;
+    fixture.job.requestCiphertext = ciphertext.toString("base64");
 
     await runJob(fixture.job, fixture.identity, fixture.deps);
 
