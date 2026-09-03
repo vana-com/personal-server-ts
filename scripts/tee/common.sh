@@ -47,6 +47,61 @@ verify_agent_node_id() {
   done
 }
 
+resolve_cvm_registration_metadata() {
+  local cvm_json=$1
+  local app_id=$2
+  local domain_result
+  local domain
+
+  if ! compose_hash=$(
+    node -e '
+      const value = JSON.parse(process.argv[1]);
+      const candidates = [
+        value.compose_hash,
+        value.composeHash,
+        value.app_compose_hash,
+        value.cvm?.compose_hash,
+        value.status?.compose_hash,
+      ];
+      const hash = candidates.find((candidate) => typeof candidate === "string" && candidate.length > 0);
+      if (!hash) process.exit(1);
+      process.stdout.write(hash);
+    ' "$cvm_json" 2>/dev/null
+  ); then
+    echo "Could not locate a compose hash in any expected field." >&2
+    echo "Tried: compose_hash, composeHash, app_compose_hash, cvm.compose_hash, status.compose_hash." >&2
+    echo "Raw 'phala cvms get' JSON follows:" >&2
+    echo "$cvm_json" >&2
+    return 1
+  fi
+
+  if ! domain_result=$(
+    node -e '
+      const value = JSON.parse(process.argv[1]);
+      const candidates = [
+        ["dstack_app_domain", value.dstack_app_domain],
+        ["gateway_domain", value.gateway_domain],
+        ["gateway.base_domain", value.gateway?.base_domain],
+        ["default_gateway_domain", value.default_gateway_domain],
+      ];
+      const match = candidates.find(([, domain]) => typeof domain === "string" && domain.length > 0);
+      if (!match) process.exit(1);
+      process.stdout.write(`${match[0]} ${match[1]}`);
+    ' "$cvm_json" 2>/dev/null
+  ); then
+    echo "Could not locate the public app domain; raw 'phala cvms get' JSON follows:" >&2
+    echo "$cvm_json" >&2
+    return 1
+  fi
+
+  domain_path=${domain_result%% *}
+  domain=${domain_result#* }
+  domain=${domain#https://}
+  domain=${domain#http://}
+  domain=${domain%%/*}
+  agent_url="https://${app_id}-8787.${domain}"
+}
+
 print_registration_payload() {
   local node_id=$1
   local app_id=$2

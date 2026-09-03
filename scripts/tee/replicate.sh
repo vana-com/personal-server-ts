@@ -106,49 +106,7 @@ for ((attempt = 1; attempt <= CVM_READY_ATTEMPTS; attempt += 1)); do
   sleep "$CVM_READY_INTERVAL_SECONDS"
 done
 
-compose_hash=$(
-  node -e '
-    const value = JSON.parse(process.argv[1]);
-    const candidates = [
-      value.compose_hash,
-      value.composeHash,
-      value.app_compose_hash,
-      value.cvm?.compose_hash,
-      value.status?.compose_hash,
-    ];
-    const hash = candidates.find((candidate) => typeof candidate === "string" && candidate.length > 0);
-    if (!hash) process.exit(1);
-    process.stdout.write(hash);
-  ' "$cvm_json"
-)
-domain_result=$(
-  node -e '
-    const value = JSON.parse(process.argv[1]);
-    const candidates = [
-      ["dstack_app_domain", value.dstack_app_domain],
-      ["gateway_domain", value.gateway_domain],
-      ["gateway.base_domain", value.gateway?.base_domain],
-      ["default_gateway_domain", value.default_gateway_domain],
-    ];
-    const match = candidates.find(([, domain]) => typeof domain === "string" && domain.length > 0);
-    if (!match) process.exit(1);
-    process.stdout.write(`${match[0]} ${match[1]}`);
-  ' "$cvm_json" 2>/dev/null
-) || true
-
-agent_url=unavailable
-domain_path=unavailable
-if [[ -n $domain_result ]]; then
-  domain_path=${domain_result%% *}
-  domain=${domain_result#* }
-  domain=${domain#https://}
-  domain=${domain#http://}
-  domain=${domain%%/*}
-  agent_url="https://${app_id}-8787.${domain}"
-else
-  echo "Could not locate the public app domain; raw 'phala cvms get' JSON follows:" >&2
-  echo "$cvm_json" >&2
-fi
+resolve_cvm_registration_metadata "$cvm_json" "$app_id"
 
 printf 'uuid=%s\napp_id=%s\nagent_url=%s\nagent_url_source=%s\n' \
   "$uuid" "$app_id" "$agent_url" "$domain_path"
