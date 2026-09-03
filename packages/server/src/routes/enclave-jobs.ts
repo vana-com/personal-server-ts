@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import { isAddress, isHex, type Address, type Hex } from "viem";
 import {
   JOB_OPERATIONS,
+  JOB_PROTOCOL_VERSION,
   type JobRequestEnvelope,
 } from "@opendatalabs/vana-sdk/protocol/jobs";
 import { createBodyLimit } from "../middleware/body-limit.js";
@@ -89,7 +90,7 @@ function isJobEnvelope(value: unknown): value is JobRequestEnvelope {
   return (
     value.auth !== "" &&
     typeof value.auth === "string" &&
-    request.v === 1 &&
+    request.v === JOB_PROTOCOL_VERSION &&
     typeof request.jobId === "string" &&
     isAddressValue(request.owner) &&
     isAddressValue(request.builder) &&
