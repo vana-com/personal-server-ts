@@ -18,8 +18,9 @@ const NO_NEW_PRIVILEGES = "no-new-privileges:true";
 const DATA_TMPFS =
   "/data:rw,noexec,nosuid,nodev,size=256m,uid=1000,gid=1000,mode=0700";
 const CONTAINER_PORT = 8080;
-const DEFAULT_HEALTH_TIMEOUT_MS = 60_000;
-const DEFAULT_SYNC_TIMEOUT_MS = 20 * 60_000;
+const MILLISECONDS_PER_MINUTE = 60_000;
+const DEFAULT_HEALTH_TIMEOUT_MS = 2 * MILLISECONDS_PER_MINUTE;
+const DEFAULT_SYNC_TIMEOUT_MS = 20 * MILLISECONDS_PER_MINUTE;
 const POLL_INTERVAL_MS = 250;
 const NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 const SYNC_DISABLED = "false";

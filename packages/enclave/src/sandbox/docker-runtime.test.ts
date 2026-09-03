@@ -173,6 +173,23 @@ describe("docker sandbox runtime", () => {
     expect(handle.origin).toBe("http://runtime.internal:49153");
   });
 
+  it("allows two minutes for concurrent cold starts by default", async () => {
+    const docker = scriptedDocker([
+      { running: true, hostPort: 49_153 },
+      { running: true, hostPort: 49_153 },
+    ]);
+    const health = vi.fn().mockResolvedValueOnce(false).mockResolvedValue(true);
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const now = vi.fn().mockReturnValueOnce(0).mockReturnValue(60_000);
+    const runtime = createDockerRuntime({ docker, health, sleep, now });
+
+    await expect(runtime.start(sandboxSpec())).resolves.toMatchObject({
+      id: "container-id",
+    });
+    expect(health).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledOnce();
+  });
+
   it("removes a container that exits before health", async () => {
     const docker = scriptedDocker([{ running: false }]);
     const runtime = createDockerRuntime({
