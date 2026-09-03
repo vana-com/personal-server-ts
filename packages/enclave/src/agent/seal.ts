@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import type {
-  MASTER_SIGNATURE_DELIVERY_VERSION,
-  MasterSignatureDelivery,
+import {
+  MASTER_SIGNATURE_DELIVERY_MAX_AGE_SECONDS,
+  type MASTER_SIGNATURE_DELIVERY_VERSION,
+  type MasterSignatureDelivery,
 } from "@opendatalabs/vana-sdk/protocol/identity";
 import { getAddress, hexToBytes, recoverMessageAddress, toHex } from "viem";
 import type { DstackClient } from "../dstack/client.js";
@@ -21,7 +22,6 @@ import type { SealRequestBody, SealResult } from "./types.js";
 /** = SDK crypto/keys/derive.ts MASTER_KEY_MESSAGE. */
 export const MASTER_KEY_MESSAGE = "vana-master-key-v1";
 
-const MAX_DELIVERY_AGE_SECONDS = 600;
 const SIGNATURE_BYTES = 65;
 const HASH_ALGORITHM = "sha256";
 const DELIVERY_VERSION =
@@ -134,7 +134,10 @@ function validateDelivery(
   }
 
   const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - delivery.issuedAt) > MAX_DELIVERY_AGE_SECONDS) {
+  if (
+    Math.abs(now - delivery.issuedAt) >
+    MASTER_SIGNATURE_DELIVERY_MAX_AGE_SECONDS
+  ) {
     throw new StaleDelivery();
   }
 }

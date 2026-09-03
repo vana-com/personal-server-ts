@@ -5,6 +5,7 @@ import {
   serializeECIES,
 } from "@opendatalabs/vana-sdk/node";
 import {
+  MASTER_SIGNATURE_DELIVERY_MAX_AGE_SECONDS,
   MASTER_SIGNATURE_DELIVERY_VERSION,
   type MasterSignatureDelivery,
 } from "@opendatalabs/vana-sdk/protocol/identity";
@@ -127,9 +128,11 @@ describe("sealDelivery", () => {
     ).rejects.toBeInstanceOf(EpochRetired);
   });
 
-  it("rejects a delivery older than 600 seconds", async () => {
+  it("rejects a delivery older than the SDK maximum age", async () => {
     const { client, request } = await fixture("owner", {
-      issuedAt: Math.floor(Date.now() / 1000) - 601,
+      issuedAt:
+        Math.floor(Date.now() / 1000) -
+        (MASTER_SIGNATURE_DELIVERY_MAX_AGE_SECONDS + 1),
     });
 
     await expect(sealDelivery(client, request)).rejects.toBeInstanceOf(

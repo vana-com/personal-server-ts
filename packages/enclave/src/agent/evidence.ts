@@ -49,6 +49,7 @@ export async function buildEvidence(
     ...(attestation.eventLog === undefined
       ? {}
       : { eventLog: attestation.eventLog }),
+    // Fingerprint hashes the uncompressed KMS root; Gateway uses 0x04..., while SDK anchors accept either form.
     kmsRootFingerprint: keccak256(kmsRoot).toLowerCase() as Hex,
   };
 }
