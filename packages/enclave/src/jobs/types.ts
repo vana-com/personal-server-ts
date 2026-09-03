@@ -5,6 +5,7 @@ export {
   openJobRequest,
 } from "@opendatalabs/vana-sdk/crypto/envelope/job";
 export {
+  CLAIM_POLL_FLOOR_MS,
   DEFAULT_LEASE_SECONDS,
   MAX_LEASE_SECONDS,
   MAX_WAIT_SECONDS,

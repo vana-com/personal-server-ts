@@ -1,6 +1,6 @@
 import type { SandboxRegistry } from "../sandbox/registry.js";
 import type { GatewayClient } from "./gateway-client.js";
-import type { ClaimResponse } from "./types.js";
+import { CLAIM_POLL_FLOOR_MS, type ClaimResponse } from "./types.js";
 
 const BACKOFF_MS = 5_000;
 const CLAIM_FAILURE_MESSAGE = "Gateway claim loop unavailable";
@@ -50,6 +50,7 @@ export function startClaimLoop(options: ClaimLoopOptions): ClaimLoop {
       }
 
       let claim: ClaimResponse | null;
+      const claimStartedAt = Date.now();
       try {
         claim = await options.gateway.claim(options.wait, {
           leaseSeconds: options.leaseSeconds,
@@ -73,7 +74,14 @@ export function startClaimLoop(options: ClaimLoopOptions): ClaimLoop {
         continue;
       }
 
-      if (isDraining || !claim) {
+      if (!claim) {
+        const remaining = CLAIM_POLL_FLOOR_MS - (Date.now() - claimStartedAt);
+        if (!isDraining && remaining > 0) {
+          await sleep(remaining);
+        }
+        continue;
+      }
+      if (isDraining) {
         continue;
       }
 

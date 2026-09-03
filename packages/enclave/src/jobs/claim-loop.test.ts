@@ -1,4 +1,5 @@
 import { vi } from "vitest";
+import { CLAIM_POLL_FLOOR_MS } from "@opendatalabs/vana-sdk/protocol/jobs";
 import type { SandboxRegistry } from "../sandbox/registry.js";
 import { startClaimLoop, type JobLogger } from "./claim-loop.js";
 import type { GatewayClient } from "./gateway-client.js";
@@ -8,6 +9,7 @@ const CLAIM = {
   job: { jobId: "job-1" },
   identity: { userPsId: "0x01" },
 } as unknown as ClaimResponse;
+const MAX_CLAIMS_PER_FLOOR = 2;
 
 function deferred<T>() {
   let resolvePromise: (value: T) => void = () => {};
@@ -42,6 +44,48 @@ function loggerFake(): JobLogger {
 }
 
 describe("claim loop", () => {
+  it("waits for the poll floor after an immediate empty claim", async () => {
+    vi.useFakeTimers();
+    const gateway = gatewayFake();
+    const lastClaim = deferred<ClaimResponse | null>();
+    vi.mocked(gateway.claim)
+      .mockResolvedValueOnce(null)
+      .mockImplementationOnce(() => lastClaim.promise);
+    const sleep = vi.fn(
+      (milliseconds: number) =>
+        new Promise<void>((resolve) => setTimeout(resolve, milliseconds)),
+    );
+    const loop = startClaimLoop({
+      gateway,
+      run: vi.fn(),
+      registry: registryFake(),
+      leaseSeconds: 30,
+      wait: 25,
+      capacity: 20,
+      logger: loggerFake(),
+      sleep,
+    });
+
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sleep).toHaveBeenCalledOnce();
+      const delay = sleep.mock.calls[0]?.[0] ?? 0;
+      expect(delay).toBeGreaterThan(0);
+      expect(delay).toBeLessThanOrEqual(CLAIM_POLL_FLOOR_MS);
+
+      await vi.advanceTimersByTimeAsync(CLAIM_POLL_FLOOR_MS);
+      expect(gateway.claim.mock.calls.length).toBeLessThanOrEqual(
+        MAX_CLAIMS_PER_FLOOR,
+      );
+
+      const draining = loop.drain();
+      lastClaim.resolve(null);
+      await draining;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("continues claiming after a job run rejects", async () => {
     const gateway = gatewayFake();
     const registry = registryFake();
