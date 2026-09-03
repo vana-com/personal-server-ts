@@ -297,9 +297,9 @@ blobs                = no conditional PUT needed in v1 (single executor per user
 ## Sequencing
 
 1. Derisking slice: `packages/enclave`, enclave profile, `api/v1/jobs`, `api/v1/tee-nodes`, `protocol/jobs`. One node, one test user, one scripted builder, one raw read, sandbox recreated on a second node mid-test.
-2. Identity and consent: `api/v1/identity`, Account signing, consent and Personal Server screens.
+2. Identity and consent: `api/v1/identity`, Account signing, consent and Personal Server screens. Follow-up before GA, not blocking the e2e release: Web external-wallet owners (decision 5) need an Account signing exchange open to Web sessions or a ciphertext-only signing route; v1 Web refuses them (identity contract, section 6.12).
 3. Builder migration: SDK envelope and job flow, DCR to Gateway URL, contracts V3.
-4. Inference: intents, derived-scope grants, DCAP wired, rate limits, receipts.
+4. Inference: intents, derived-scope grants, DCAP wired, rate limits, receipts, on-chain revocation check over RPC with the 5 min Gateway-state staleness fallback (decision 9; the derisking slice checks Gateway `revokedAt` only).
 5. Deprecations.
 
 ### Wake experiment
