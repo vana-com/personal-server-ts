@@ -31,6 +31,8 @@
     "format:check": "prettier --check .",
     "register-server": "tsx --env-file-if-exists=.env scripts/register-server.ts",
     "register-builder": "tsx --env-file-if-exists=.env scripts/register-builder.ts",
+    "print-fake-anchors": "tsx scripts/print-fake-anchors.ts",
+    "e2e:identity": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/e2e-identity.ts",
     "e2e:x402": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/e2e-x402-flow.ts",
     "e2e:x402-lite": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/e2e-x402-lite.ts",
     "e2e:sync": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/e2e-storage-sync.ts",
@@ -58,7 +60,7 @@
   "devDependencies": {
     "@commitlint/cli": "^21.2.0",
     "@commitlint/config-conventional": "^21.2.0",
-    "@opendatalabs/vana-sdk": "3.13.0",
+    "@opendatalabs/vana-sdk": "3.22.0-pr.207.0dbb052",
     "@semantic-release/commit-analyzer": "^13.0.1",
     "@semantic-release/github": "^12.0.9",
     "@semantic-release/npm": "^13.1.5",

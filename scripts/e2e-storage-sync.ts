@@ -137,6 +137,12 @@ const GATEWAY_CONFIG: DataPortabilityGatewayConfig = {
     dataPortabilityGrantees:
       process.env["DATA_PORTABILITY_GRANTEES_CONTRACT"] ??
       "0x8325C0A0948483EdA023A1A2Fd895e62C5131234",
+    dataPortabilityEscrow:
+      process.env["DATA_PORTABILITY_ESCROW_CONTRACT"] ??
+      "0x07d7769081adc3a3DBe91f5E4B98E9A5a6B292e3",
+    feeRegistry:
+      process.env["FEE_REGISTRY_CONTRACT"] ??
+      "0xb4FA18443E0FA6cdC0280D20b8cCDB2377D13Bf2",
   },
 };
 
