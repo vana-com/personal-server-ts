@@ -16,7 +16,7 @@ import type { DstackClient } from "../dstack/client.js";
 import { userPsId } from "../identity/paths.js";
 import { deriveEnclaveIdentity } from "../identity/wallet.js";
 import { unseal } from "../sealing/envelope.js";
-import { createAgentServer } from "./http.js";
+import { createAgentServer, type AgentJobsControl } from "./http.js";
 import type { SealRequestBody } from "./types.js";
 
 const SECRET = "agent-test-secret";
@@ -30,6 +30,7 @@ const FAKE_APP_ID = "0000000000000000000000000000000000000003";
 const HEALTH_PATH = "/agent/v1/health";
 const IDENTITY_PATH = "/agent/v1/identity";
 const SEAL_PATH = "/agent/v1/secrets/seal";
+const DRAIN_PATH = "/agent/v1/drain";
 const INVALID_ADDRESS = "invalid-address";
 const INVALID_HEX = "invalid-hex";
 const VALID_HEX = "0x00";
@@ -46,10 +47,12 @@ let origin = "";
 
 async function startServer(
   client: DstackClient = createFakeDstackClient({ appId: FAKE_APP_ID }),
+  jobs?: AgentJobsControl,
 ): Promise<void> {
   server = createAgentServer({
     client,
     secret: SECRET,
+    ...(jobs ? { jobs } : {}),
   });
   await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
   const address = server.address();
@@ -154,16 +157,43 @@ describe("agent HTTP server", () => {
       instanceId: string;
       osImageHash: string;
       osVersion: string;
+      activeSandboxes: number;
+      draining: boolean;
     };
 
     expect(response.status).toBe(200);
     expect(body).toMatchObject({
       appId: FAKE_APP_ID,
       osVersion: "fake",
+      activeSandboxes: 0,
+      draining: false,
     });
     expect(body.composeHash).toMatch(HASH_PATTERN);
     expect(body.instanceId).toMatch(INSTANCE_ID_PATTERN);
     expect(body.osImageHash).toMatch(HASH_PATTERN);
+  });
+
+  it("reports jobs state and drains through the operator route", async () => {
+    const jobs = {
+      activeCount: vi.fn().mockReturnValue(3),
+      draining: vi.fn().mockReturnValue(true),
+      drain: vi.fn().mockResolvedValue(undefined),
+    } satisfies AgentJobsControl;
+    await stopServer();
+    await startServer(createFakeDstackClient({ appId: FAKE_APP_ID }), jobs);
+
+    const health = await fetch(`${origin}${HEALTH_PATH}`, {
+      headers: JSON_HEADERS,
+    });
+    expect(await health.json()).toMatchObject({
+      activeSandboxes: 3,
+      draining: true,
+    });
+
+    const drain = await post(DRAIN_PATH, {});
+    expect(drain.status).toBe(200);
+    expect(await drain.json()).toEqual({ draining: true });
+    expect(jobs.drain).toHaveBeenCalledOnce();
   });
 
   it("returns INTERNAL and logs an unexpected health failure", async () => {

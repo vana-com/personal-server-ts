@@ -29,4 +29,6 @@ export interface HealthResponse {
   instanceId: string;
   osImageHash?: string;
   osVersion?: string;
+  activeSandboxes: number;
+  draining: boolean;
 }

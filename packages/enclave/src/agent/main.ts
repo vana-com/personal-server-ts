@@ -5,20 +5,128 @@
  */
 
 import { agentConfigFromEnv } from "./bootstrap.js";
-import { createAgentServer } from "./http.js";
+import { createAgentServer, type AgentJobsControl } from "./http.js";
+import { startClaimLoop, type JobLogger } from "../jobs/claim-loop.js";
+import { createGatewayClient } from "../jobs/gateway-client.js";
+import { startNodeHeartbeat } from "../jobs/node-heartbeat.js";
+import { runJob } from "../jobs/run.js";
+import { MAX_WAIT_SECONDS } from "../jobs/types.js";
+import { createDockerRuntime } from "../sandbox/docker-runtime.js";
+import { createFakeRuntime } from "../sandbox/fake-runtime.js";
+import { createSandboxRegistry } from "../sandbox/registry.js";
+import type { SandboxRuntime } from "../sandbox/runtime.js";
 
 const EXIT_FAILURE = 1;
 const SIGTERM = "SIGTERM";
+const CONSOLE_LOGGER: JobLogger = {
+  info(context, message): void {
+    console.error({ level: "info", ...context, message });
+  },
+  warn(context, message): void {
+    console.error({ level: "warn", ...context, message });
+  },
+};
 
 try {
-  const { client, host, port, secret } = agentConfigFromEnv(process.env);
-  const server = createAgentServer({ client, secret });
+  const { client, host, jobs, port, secret } = agentConfigFromEnv(process.env);
+  const jobsControl = jobs ? startJobs(client, jobs) : undefined;
+  const server = createAgentServer({
+    client,
+    secret,
+    ...(jobsControl ? { jobs: jobsControl } : {}),
+  });
 
   server.listen(port, host);
-  process.once(SIGTERM, () => server.close());
+  process.once(SIGTERM, () => {
+    void shutdown(server, jobsControl);
+  });
 } catch (error) {
   console.error(
     error instanceof Error ? error.message : "enclave agent failed to start",
   );
   process.exitCode = EXIT_FAILURE;
+}
+
+function startJobs(
+  client: ReturnType<typeof agentConfigFromEnv>["client"],
+  config: NonNullable<ReturnType<typeof agentConfigFromEnv>["jobs"]>,
+): AgentJobsControl {
+  const runtime = createRuntime(config);
+  const registry = createSandboxRegistry({
+    runtime,
+    max: config.sandboxMax,
+    idleTtlMs: config.idleTtlMs,
+  });
+  const gateway = createGatewayClient({
+    baseUrl: config.gatewayUrl,
+    nodeId: config.nodeId,
+    nodeSecret: config.nodeSecret,
+  });
+  const logger = CONSOLE_LOGGER;
+  const claimLoop = startClaimLoop({
+    gateway,
+    run: (job, identity) =>
+      runJob(job, identity, {
+        client,
+        gateway,
+        registry,
+        image: config.image,
+        leaseSeconds: config.leaseSeconds,
+        sync: config.sync,
+        workDelayMs: config.workDelayMs,
+      }),
+    registry,
+    leaseSeconds: config.leaseSeconds,
+    wait: MAX_WAIT_SECONDS,
+    capacity: config.sandboxMax,
+    logger,
+  });
+  const nodeHeartbeat = startNodeHeartbeat({
+    gateway,
+    nodeId: config.nodeId,
+    client,
+    registry,
+    capacity: config.sandboxMax,
+    logger,
+  });
+  let drainPromise: Promise<void> | undefined;
+
+  return {
+    activeCount: () => registry.activeCount(),
+    draining: () => claimLoop.draining(),
+    drain(): Promise<void> {
+      drainPromise ??= claimLoop.drain().finally(() => nodeHeartbeat.stop());
+
+      return drainPromise;
+    },
+  };
+}
+
+function createRuntime(
+  config: NonNullable<ReturnType<typeof agentConfigFromEnv>["jobs"]>,
+): SandboxRuntime {
+  if (config.runtime === "fake") {
+    return createFakeRuntime({
+      ...(config.psEntry ? { psEntry: config.psEntry } : {}),
+    });
+  }
+
+  return createDockerRuntime({ dockerHost: config.dockerHost });
+}
+
+async function shutdown(
+  server: ReturnType<typeof createAgentServer>,
+  jobs: AgentJobsControl | undefined,
+): Promise<void> {
+  await jobs?.drain();
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve();
+    });
+  });
 }

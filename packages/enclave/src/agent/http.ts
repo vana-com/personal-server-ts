@@ -21,6 +21,7 @@ const BODY_LIMIT_BYTES = 64 * 1024;
 const HEALTH_ROUTE = "/agent/v1/health";
 const IDENTITY_ROUTE = "/agent/v1/identity";
 const SEAL_ROUTE = "/agent/v1/secrets/seal";
+const DRAIN_ROUTE = "/agent/v1/drain";
 const GET = "GET";
 const POST = "POST";
 const OK = 200;
@@ -39,6 +40,13 @@ const UNKNOWN_ERROR = "unknown";
 export interface AgentServerOptions {
   client: DstackClient;
   secret: string;
+  jobs?: AgentJobsControl;
+}
+
+export interface AgentJobsControl {
+  activeCount(): number;
+  draining(): boolean;
+  drain(): Promise<void>;
 }
 
 class BodyTooLarge extends Error {}
@@ -71,7 +79,21 @@ async function handleRequest(
 
   try {
     if (request.method === GET && path === HEALTH_ROUTE) {
-      sendJson(response, OK, await readHealth(options.client));
+      sendJson(
+        response,
+        OK,
+        await readHealth(
+          options.client,
+          options.jobs?.activeCount() ?? 0,
+          options.jobs?.draining() ?? false,
+        ),
+      );
+      return;
+    }
+
+    if (request.method === POST && path === DRAIN_ROUTE) {
+      await options.jobs?.drain();
+      sendJson(response, OK, { draining: true });
       return;
     }
 
