@@ -212,10 +212,10 @@ Commands:
 ```bash
 vercel deploy --yes --scope opendatalabs -e GATEWAY_PUBLIC_ORIGIN=https://dp-rpc-moksha-spike-jobs.vercel.app -e NEON_URL="$NEON_URL" -e CRON_SECRET="$CRON_SECRET"
 vercel alias set <deployment-url> dp-rpc-moksha-spike-jobs.vercel.app --scope opendatalabs
-bash operator scratchpad/run-preview-matrix.sh 600 3          # 3 workers; 1, 10, 50 jobs/min x 10 min each; results/preview-w3-r*.json
-node operator scratchpad/conn-sampler.mjs results/neon-connections.jsonl   # every 5 s (started by hand: the script's copy died on an empty NEON_URL)
-node operator scratchpad/aggregate.mjs operator scratchpad                        # table below
-bash operator scratchpad/run-recovery.sh                                   # kill test, results/recovery.log
+bash <scratchpad>/run-preview-matrix.sh 600 3          # 3 workers; 1, 10, 50 jobs/min x 10 min each; results/preview-w3-r*.json
+node <scratchpad>/conn-sampler.mjs results/neon-connections.jsonl   # every 5 s (started by hand: the script's copy died on an empty NEON_URL)
+node <scratchpad>/aggregate.mjs <scratchpad>                        # table below
+bash <scratchpad>/run-recovery.sh                                   # kill test, results/recovery.log
 ```
 
 Numbers (3 workers, 10 min per row, ms, p50 / p95; `wait` = `?wait=25` clients, `poll` = the rest):
@@ -273,7 +273,7 @@ Cleanup: all five Spike 3 CVMs were deleted with `phala cvms delete <exact-uuid>
 
 ### Hydration (step 4, measured 2026-09-02)
 
-Date: 2026-09-02. Operator: Codex via acpx (handoff `../personal-server-ts-spike-sandbox/HANDOFF-hydration.md`, untracked; log `operator scratchpad`). Branch `spike/sandbox`, commits `453dde1` harness, `b20b419`, `326fead` fixes, `2de9596` results (`HYDRATION-RESULTS.md` in the worktree, full detail and commands there; not pushed). CVMs: `spike-hydration-1` `31662c48-2fcf-41ee-b9f7-623d7e5d7aa2` (measurement), `8700bc34-2430-4c27-999c-7ef63f481644` (failed packaging, destroyed). dstack OS 0.5.9 `bd369a8c`, `tdx.small` 1 vCPU / 2 GiB, gVisor `runsc-ptrace`, tmpfs `/data`.
+Date: 2026-09-02. Operator: Codex via acpx (handoff `../personal-server-ts-spike-sandbox/HANDOFF-hydration.md`, untracked). Branch `spike/sandbox`, commits `453dde1` harness, `b20b419`, `326fead` fixes, `2de9596` results (`HYDRATION-RESULTS.md` in the worktree, full detail and commands there; not pushed). CVMs: `spike-hydration-1` `31662c48-2fcf-41ee-b9f7-623d7e5d7aa2` (measurement), `8700bc34-2430-4c27-999c-7ef63f481644` (failed packaging, destroyed). dstack OS 0.5.9 `bd369a8c`, `tdx.small` 1 vCPU / 2 GiB, gVisor `runsc-ptrace`, tmpfs `/data`.
 
 Environment: Moksha only. Gateway `https://dp-rpc-dev.vana.org` (chain 14800; the PS default `data-gateway-env-dev-opendatalabs.vercel.app` is 404), storage `https://storage.vana.org` chain 14800. Two throwaway owners (`openssl rand -hex 32`, deleted after). Registration via `POST /ui/api/registration/server` accepted the future dstack public URL (HTTP 200). Fixtures via `POST /v1/data/:scope` (`scripts/hydration-fixture.ts`): 1 blob = 1,048,798 encrypted bytes; 50 blobs = 52,439,940 encrypted bytes (measured by downloading every ciphertext).
 
