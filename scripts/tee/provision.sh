@@ -166,7 +166,7 @@ printf 'uuid=%s\napp_id=%s\nnonce=%s\nagent_url=%s\nagent_url_source=%s\n' \
   "$uuid" "$app_id" "$nonce" "$agent_url" "$domain_path"
 
 if [[ $identity_only == false ]]; then
-  verify_agent_node_id "$agent_url" "$NODE_ID" "$ENCLAVE_AGENT_SECRET"
+  verify_agent_node_id "$agent_url" "$NODE_ID" "$ENCLAVE_AGENT_SECRET" "$uuid"
   capacity=${SANDBOX_MAX:-20}
   print_registration_payload "$NODE_ID" "$app_id" "$compose_hash" "$agent_url" "$capacity"
 fi

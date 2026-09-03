@@ -110,6 +110,6 @@ resolve_cvm_registration_metadata "$cvm_json" "$app_id"
 
 printf 'uuid=%s\napp_id=%s\nagent_url=%s\nagent_url_source=%s\n' \
   "$uuid" "$app_id" "$agent_url" "$domain_path"
-verify_agent_node_id "$agent_url" "$NODE_ID" "$ENCLAVE_AGENT_SECRET"
+verify_agent_node_id "$agent_url" "$NODE_ID" "$ENCLAVE_AGENT_SECRET" "$uuid"
 capacity=${SANDBOX_MAX:-20}
 print_registration_payload "$NODE_ID" "$app_id" "$compose_hash" "$agent_url" "$capacity"
