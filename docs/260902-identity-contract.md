@@ -128,15 +128,28 @@ export interface EnclaveTrustAnchors {
   kmsRootPubkey: Hex;
   appIds: Hex[];
 } // per chainId constants exported here
+export interface ExpectedIdentity {
+  ownerAddress: Address;
+  chainId: number;
+  epoch: number;
+}
+export const MASTER_SIGNATURE_DELIVERY_MAX_AGE_SECONDS = 600;
+// Throws. Checks pubkey -> address, both chain links (compressed-key preimages,
+// raw app_id), anchors.kmsRootPubkey in COMPRESSED form (as kmsInfo().k256Pubkey
+// reports it), appId allowlist, purpose, and that userPsId/owner/chainId/epoch
+// equal `expected` (userPsId recomputed). Fails closed on empty anchors.
 export function verifyEnclaveIdentityEvidence(
   e: EnclaveIdentityEvidence,
   anchors: EnclaveTrustAnchors,
-): Promise<void>; // throws
+  expected: ExpectedIdentity,
+): Promise<void>;
+// Rejects unless masterSignature recovers to e.ownerAddress over MASTER_KEY_MESSAGE.
 export function buildMasterSignatureDelivery(
   e: EnclaveIdentityEvidence,
   masterSignature: Hex,
   now?: number,
-): MasterSignatureDelivery;
+): Promise<MasterSignatureDelivery>;
+// Rejects unless publicKeyToAddress(publicKey) == d.enclaveAddress.
 export function encryptMasterSignatureDelivery(
   d: MasterSignatureDelivery,
   publicKey: Hex,
@@ -177,7 +190,7 @@ Text over jsonb matches existing conventions (`schema.ts:2-16` imports no `jsonb
 
 **Delete-on-revoke hook.** `api/v1/servers/[address].ts:389-400` does a single `update servers set revoked_at ...`. Wrap it in `db.transaction` (pattern `api/v1/servers.ts:533`) and add: `update identity_records set state='retired', retired_at=now() where enclave_address=$serverAddress and state!='retired'`; `delete from sealed_secrets where (user_ps_id, epoch) in (...)`. Hard delete, not soft. Neon PITR backups expire with the window (operational, no code). `POST /v1/identity` after retire derives `epoch+1`.
 
-**Attestation verification v1 (`lib/tee/kms-chain.ts`, decision 26; DCAP deferred to step 4).** Checked, in order, before any row is written: (1) `publicKeyToAddress(publicKey) == address` (`viem/accounts`, as `servers.ts:328`); (2) recover app-root pubkey from `signatureChain[0]` over `keccak256(purpose || ":" || hex(publicKey))`; (3) recover KMS root from `signatureChain[1]` over `keccak256("dstack-kms-issued" || ":" || appId || sec1_compressed(appRootPub))` and compare to `ENCLAVE_KMS_ROOT_PUBKEY` env (from `phala kms phala` / `DstackKms.kmsInfo().k256Pubkey`, spike doc Q4); (4) `appId ∈ ENCLAVE_APP_ID_ALLOWLIST` (csv env; the SDK ships the same values per chainId for the browser, GW env is authoritative, mismatch fails closed); (5) `composeHash` recorded, not enforced in step 2 (Spike 1 showed env updates rotate it; enforcement joins the `tee_nodes` measurement policy in step 1/4). Quote is stored opaque. UNVERIFIED: exact preimage encoding of link 0 (`hex(pubkey)` compressed vs uncompressed, `0x` or not) and of the `app_id` bytes in link 1; pin against `dstack` `kms/src/crypto.rs` and a captured vector from a real CVM (Spike 1 recorded link values at spike doc line 104 but not the pubkey, so a fresh capture is needed for the test fixture).
+**Attestation verification v1 (`lib/tee/kms-chain.ts`, decision 26; DCAP deferred to step 4).** Checked, in order, before any row is written: (1) `publicKeyToAddress(publicKey) == address` (`viem/accounts`, as `servers.ts:328`); (2) recover app-root pubkey from `signatureChain[0]` over `keccak256(utf8(purpose || ":" || lowercase_hex(sec1_compressed(publicKey))))`; (3) recover KMS root from `signatureChain[1]` over `keccak256("dstack-kms-issued" || ":" || app_id_raw_20_bytes || sec1_compressed(appRootPub))` and compare to `ENCLAVE_KMS_ROOT_PUBKEY` env in compressed form (from `phala kms phala` / `DstackKms.kmsInfo().k256Pubkey`, spike doc Q4; encodings verified against dstack source and a live CVM vector, spike results doc "Chain vector"); (4) `appId ∈ ENCLAVE_APP_ID_ALLOWLIST` (csv env; the SDK ships the same values per chainId for the browser, GW env is authoritative, mismatch fails closed); (5) `composeHash` recorded, not enforced in step 2 (Spike 1 showed env updates rotate it; enforcement joins the `tee_nodes` measurement policy in step 1/4). Quote is stored opaque. Preimage encodings verified 2026-09-02; the live vector is pinned as a test in all three repos.
 
 Tests: `tests/identity-handlers.test.ts` mocking `../db/index.js` and the agent client (pattern `tests/builders-post-handler.test.ts:24-37`); `tests/kms-chain.test.ts` with a generated chain (`@noble/curves`) plus the captured vector; Postgres-gated `tests/identity-postgres.test.ts` (`vitest.config.ts:6` include).
 
