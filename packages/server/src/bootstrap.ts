@@ -425,6 +425,7 @@ export async function createServer(
       config,
       serverOwner,
       serverAccount,
+      reads: isEnclave ? "public" : "signed",
     });
 
     const cursor = createSyncCursor(syncCursorPath, {

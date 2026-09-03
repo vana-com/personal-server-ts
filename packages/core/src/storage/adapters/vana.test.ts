@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Capture the config handed to the SDK provider factory so we can assert the
 // resolved chainId passthrough without hitting the network. Hoisted so the
@@ -18,6 +18,7 @@ vi.mock("@opendatalabs/vana-sdk/browser", () => ({
 
 import { ServerConfigSchema } from "../../schemas/server-config.js";
 import type { ServerAccount } from "../../keys/server-account.js";
+import { ServerSigningUnavailableError } from "../../errors/catalog.js";
 import { createVanaSyncStorageAdapter } from "./vana.js";
 
 const OWNER = "0xAbC0000000000000000000000000000000000001" as `0x${string}`;
@@ -30,7 +31,10 @@ const account: ServerAccount = {
   signTypedData: async () => "0xsig" as `0x${string}`,
 };
 
-function buildAdapter(overrides: Record<string, unknown>) {
+function buildAdapter(
+  overrides: Record<string, unknown>,
+  reads?: "signed" | "public",
+) {
   const config = ServerConfigSchema.parse({
     storage: { backend: "vana", config: { vana: {} } },
     ...overrides,
@@ -39,6 +43,7 @@ function buildAdapter(overrides: Record<string, unknown>) {
     config,
     serverOwner: OWNER,
     serverAccount: account,
+    ...(reads ? { reads } : {}),
   });
   return adapter;
 }
@@ -46,6 +51,28 @@ function buildAdapter(overrides: Record<string, unknown>) {
 describe("createVanaSyncStorageAdapter — chain-scoped storage", () => {
   beforeEach(() => {
     createVanaStorageProvider.mockClear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("downloads public blobs without constructing a signer", async () => {
+    const body = new Uint8Array([1, 2, 3]);
+    const fetchMock = vi.fn().mockResolvedValue(new Response(body));
+    vi.stubGlobal("fetch", fetchMock);
+    const adapter = buildAdapter({ gateway: { chainId: 14800 } }, "public");
+    const url = `https://storage.vana.org/v1/chains/14800/blobs/${OWNER_LOWER}/scope.name/v1`;
+
+    await expect(adapter.download(url)).resolves.toEqual(body);
+    expect(fetchMock).toHaveBeenCalledWith(url, { method: "GET" });
+    expect(createVanaStorageProvider).not.toHaveBeenCalled();
+    await expect(adapter.upload("scope.name/v1", body)).rejects.toBeInstanceOf(
+      ServerSigningUnavailableError,
+    );
+    await expect(adapter.delete(url)).rejects.toBeInstanceOf(
+      ServerSigningUnavailableError,
+    );
   });
 
   it("scopes blob paths by the gateway chainId (moksha, 14800)", () => {
