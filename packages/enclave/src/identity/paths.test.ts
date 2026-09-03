@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { userPsId as sdkUserPsId } from "@opendatalabs/vana-sdk/protocol/identity";
 import {
   concat,
   hexToBytes,
@@ -39,6 +40,10 @@ describe("userPsId", () => {
     expect(userPsId(CHAIN_ID, OWNER.toLowerCase() as `0x${string}`)).toBe(
       userPsId(CHAIN_ID, OWNER),
     );
+  });
+
+  it("matches the SDK userPsId bytes", () => {
+    expect(userPsId(CHAIN_ID, OWNER)).toBe(sdkUserPsId(CHAIN_ID, OWNER));
   });
 
   it("differs by chain and owner", () => {

@@ -28,6 +28,11 @@ const CHAIN_ID = 14_800;
 const EPOCH = 2;
 const FAKE_APP_ID = "0000000000000000000000000000000000000003";
 const HEALTH_PATH = "/agent/v1/health";
+const IDENTITY_PATH = "/agent/v1/identity";
+const SEAL_PATH = "/agent/v1/secrets/seal";
+const INVALID_ADDRESS = "invalid-address";
+const INVALID_HEX = "invalid-hex";
+const VALID_HEX = "0x00";
 const INFO_FAILURE = "info failed";
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
 const INSTANCE_ID_PATTERN = /^[0-9a-f]{40}$/;
@@ -190,7 +195,7 @@ describe("agent HTTP server", () => {
   });
 
   it("returns identity evidence", async () => {
-    const response = await post("/agent/v1/identity", {
+    const response = await post(IDENTITY_PATH, {
       ownerAddress: OWNER.address,
       chainId: CHAIN_ID,
       epoch: EPOCH,
@@ -206,7 +211,7 @@ describe("agent HTTP server", () => {
 
   it("seals a valid delivery", async () => {
     const { request, signature } = await sealRequest();
-    const response = await post("/agent/v1/secrets/seal", request);
+    const response = await post(SEAL_PATH, request);
     const body = (await response.json()) as {
       envelope: Parameters<typeof unseal>[3];
       secretHash: Hex;
@@ -225,7 +230,7 @@ describe("agent HTTP server", () => {
 
   it("maps a retired epoch to 409", async () => {
     const { request } = await sealRequest();
-    const response = await post("/agent/v1/secrets/seal", {
+    const response = await post(SEAL_PATH, {
       ...request,
       minEpoch: EPOCH + 1,
     });
@@ -235,21 +240,21 @@ describe("agent HTTP server", () => {
 
   it("maps an owner mismatch to 422", async () => {
     const { request } = await sealRequest(OTHER);
-    const response = await post("/agent/v1/secrets/seal", request);
+    const response = await post(SEAL_PATH, request);
 
     await expectError(response, 422, "OWNER_MISMATCH");
   });
 
   it("maps a delivery ownerAddress mismatch to 422", async () => {
     const { request } = await sealRequest(OWNER, OTHER.address);
-    const response = await post("/agent/v1/secrets/seal", request);
+    const response = await post(SEAL_PATH, request);
 
     await expectError(response, 422, "OWNER_MISMATCH");
   });
 
   it("rejects bodies over 64 KiB", async () => {
     const response = await post(
-      "/agent/v1/identity",
+      IDENTITY_PATH,
       JSON.stringify({ padding: "x".repeat(64 * 1024) }),
     );
 
@@ -257,9 +262,63 @@ describe("agent HTTP server", () => {
   });
 
   it("rejects bad JSON", async () => {
-    const response = await post("/agent/v1/identity", "{");
+    const response = await post(IDENTITY_PATH, "{");
 
     await expectError(response, 400, "BAD_REQUEST");
+  });
+
+  it.each([
+    [
+      "bad ownerAddress",
+      IDENTITY_PATH,
+      { ownerAddress: INVALID_ADDRESS, chainId: CHAIN_ID, epoch: EPOCH },
+    ],
+    [
+      "zero epoch",
+      IDENTITY_PATH,
+      { ownerAddress: OWNER.address, chainId: CHAIN_ID, epoch: 0 },
+    ],
+    [
+      "fractional chainId",
+      IDENTITY_PATH,
+      { ownerAddress: OWNER.address, chainId: 1.5, epoch: EPOCH },
+    ],
+    [
+      "non-hex ciphertext",
+      SEAL_PATH,
+      {
+        ownerAddress: OWNER.address,
+        chainId: CHAIN_ID,
+        epoch: EPOCH,
+        enclaveAddress: OTHER.address,
+        ciphertext: INVALID_HEX,
+      },
+    ],
+    [
+      "zero minEpoch",
+      SEAL_PATH,
+      {
+        ownerAddress: OWNER.address,
+        chainId: CHAIN_ID,
+        epoch: EPOCH,
+        enclaveAddress: OTHER.address,
+        ciphertext: VALID_HEX,
+        minEpoch: 0,
+      },
+    ],
+    ["JSON array", IDENTITY_PATH, []],
+  ])("returns BAD_REQUEST for %s", async (_label, path, body) => {
+    const response = await post(path, body);
+
+    await expectError(response, 400, "BAD_REQUEST");
+  });
+
+  it("returns NOT_FOUND for the wrong method on a known route", async () => {
+    const response = await fetch(`${origin}${IDENTITY_PATH}`, {
+      headers: JSON_HEADERS,
+    });
+
+    await expectError(response, 404, "NOT_FOUND");
   });
 
   it("returns 404 for unknown paths", async () => {

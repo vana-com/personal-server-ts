@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
 import { secp256k1 } from "@noble/curves/secp256k1";
-import { hexToBytes, keccak256, toHex } from "viem";
+import { verifyEnclaveIdentityEvidence } from "@opendatalabs/vana-sdk/protocol/identity";
+import { concat, hexToBytes, keccak256, toHex } from "viem";
 import { publicKeyToAddress } from "viem/accounts";
 import {
   createFakeDstackClient,
@@ -12,6 +14,7 @@ const OWNER = "0x1111111111111111111111111111111111111111";
 const CHAIN_ID = 14_800;
 const FAKE_APP_ID = "0000000000000000000000000000000000000001";
 const HEX_HASH_PATTERN = /^0x[0-9a-f]{64}$/;
+const SHA256 = "sha256";
 
 describe("buildEvidence", () => {
   it("builds complete deterministic identity evidence", async () => {
@@ -45,6 +48,25 @@ describe("buildEvidence", () => {
     expect(first.quote.length).toBeGreaterThan(2);
     expect(first.kmsRootFingerprint).toBe(keccak256(kmsRoot));
     expect(publicKeyToAddress(first.publicKey)).toBe(first.address);
+    await expect(
+      verifyEnclaveIdentityEvidence(
+        first,
+        {
+          kmsRootPubkey: toHex(kmsRoot),
+          appIds: [`0x${FAKE_APP_ID}`],
+        },
+        { ownerAddress: OWNER, chainId: CHAIN_ID, epoch: 1 },
+      ),
+    ).resolves.toBeUndefined();
+
+    const reportData = hexToBytes(
+      keccak256(concat([first.userPsId, first.address])),
+    );
+    const expectedQuote = createHash(SHA256)
+      .update(FAKE_APP_ID, "utf8")
+      .update(reportData)
+      .digest();
+    expect(first.quote).toBe(toHex(expectedQuote));
 
     const appRoot = await recoverAppRoot(
       first.purpose,

@@ -8,7 +8,7 @@ import {
   MASTER_SIGNATURE_DELIVERY_VERSION,
   type MasterSignatureDelivery,
 } from "@opendatalabs/vana-sdk/protocol/identity";
-import { keccak256, sha256, toBytes, toHex } from "viem";
+import { hexToBytes, keccak256, sha256, toBytes, toHex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { createFakeDstackClient } from "../dstack/fake.js";
 import { userPsId } from "../identity/paths.js";
@@ -27,6 +27,7 @@ import type { SealRequestBody } from "./types.js";
 const CHAIN_ID = 14_800;
 const EPOCH = 2;
 const FAKE_APP_ID = "0000000000000000000000000000000000000002";
+const MAC_FLIP_MASK = 1;
 
 function owner(label: string) {
   return privateKeyToAccount(keccak256(toBytes(`enclave-agent-test:${label}`)));
@@ -172,6 +173,34 @@ describe("sealDelivery", () => {
 
     await expect(
       sealDelivery(client, { ...request, ciphertext: toHex(toBytes("bad")) }),
+    ).rejects.toBeInstanceOf(DeliveryInvalid);
+  });
+
+  it("rejects a ciphertext with a tampered MAC", async () => {
+    const { client, request } = await fixture();
+    const ciphertext = hexToBytes(request.ciphertext);
+    ciphertext[ciphertext.length - 1] ^= MAC_FLIP_MASK;
+
+    await expect(
+      sealDelivery(client, { ...request, ciphertext: toHex(ciphertext) }),
+    ).rejects.toBeInstanceOf(DeliveryInvalid);
+  });
+
+  it("rejects a delivery encrypted to another identity", async () => {
+    const { client, delivery, request } = await fixture();
+    const otherOwner = owner("other-identity");
+    const otherId = userPsId(CHAIN_ID, otherOwner.address);
+    const otherIdentity = await deriveEnclaveIdentity(client, otherId, EPOCH);
+    const encrypted = await new NodeECIESProvider().encrypt(
+      toBytes(otherIdentity.publicKey),
+      new TextEncoder().encode(JSON.stringify(delivery)),
+    );
+
+    await expect(
+      sealDelivery(client, {
+        ...request,
+        ciphertext: `0x${serializeECIES(encrypted)}`,
+      }),
     ).rejects.toBeInstanceOf(DeliveryInvalid);
   });
 
