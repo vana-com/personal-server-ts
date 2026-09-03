@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 <name> [--ref <git-ref>] [--node-id <id>] [--compose <path>] [--app-id <id> --nonce <n>]" >&2
+  echo "Usage: $0 <name> [--ref <git-ref>] [--node-id <id>] [--compose <path> | --inline] [--app-id <id> --nonce <n>]" >&2
 }
 
 if [[ $# -lt 1 ]]; then
@@ -18,7 +18,8 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
 git_ref=main
 node_id=18
-compose="$repo_root/deploy/dstack/docker-compose.agent.inline.yml"
+inline_compose="$repo_root/deploy/dstack/docker-compose.agent.inline.yml"
+compose="$repo_root/deploy/dstack/docker-compose.enclave.yml"
 app_id=
 nonce=
 
@@ -38,6 +39,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { usage; exit 1; }
       compose=$2
       shift 2
+      ;;
+    --inline)
+      compose=$inline_compose
+      shift
       ;;
     --app-id)
       [[ $# -ge 2 ]] || { usage; exit 1; }
@@ -60,6 +65,20 @@ done
 command -v phala >/dev/null || { echo "phala CLI is required" >&2; exit 1; }
 command -v node >/dev/null || { echo "Node.js is required" >&2; exit 1; }
 [[ -f $compose ]] || { echo "Compose file not found: $compose" >&2; exit 1; }
+
+identity_only=false
+if [[ ${compose##*/} == docker-compose.agent.inline.yml ]]; then
+  identity_only=true
+else
+  : "${NODE_SECRET:?NODE_SECRET must be set in the environment}"
+  : "${NODE_ID:?NODE_ID must be set in the environment}"
+  : "${GATEWAY_URL:?GATEWAY_URL must be set in the environment}"
+  : "${PS_IMAGE:?PS_IMAGE must be set in the environment}"
+  if [[ ! $PS_IMAGE =~ ^.+@sha256:[[:xdigit:]]{64}$ ]]; then
+    echo "PS_IMAGE must be an image digest such as vanaorg/personal-server@sha256:<64 hex characters>" >&2
+    exit 1
+  fi
+fi
 
 if [[ -n $app_id || -n $nonce ]]; then
   if [[ -z $app_id || -z $nonce ]]; then
@@ -89,6 +108,16 @@ chmod 600 "$env_file"
 trap 'rm -f "$env_file"' EXIT
 printf 'ENCLAVE_AGENT_SECRET=%s\nGIT_REF=%s\n' \
   "$ENCLAVE_AGENT_SECRET" "$git_ref" >"$env_file"
+if [[ $identity_only == false ]]; then
+  printf 'NODE_SECRET=%s\nNODE_ID=%s\nGATEWAY_URL=%s\nPS_IMAGE=%s\n' \
+    "$NODE_SECRET" "$NODE_ID" "$GATEWAY_URL" "$PS_IMAGE" >>"$env_file"
+  for optional_name in SANDBOX_MAX SANDBOX_IDLE_TTL_SECONDS LEASE_SECONDS; do
+    optional_value=${!optional_name:-}
+    if [[ -n $optional_value ]]; then
+      printf '%s=%s\n' "$optional_name" "$optional_value" >>"$env_file"
+    fi
+  done
+fi
 
 deploy_json=$(
   phala deploy \
@@ -119,6 +148,21 @@ uuid=$(
 )
 
 cvm_json=$(phala cvms get "$uuid" --json)
+compose_hash=$(
+  node -e '
+    const value = JSON.parse(process.argv[1]);
+    const candidates = [
+      value.compose_hash,
+      value.composeHash,
+      value.app_compose_hash,
+      value.cvm?.compose_hash,
+      value.status?.compose_hash,
+    ];
+    const hash = candidates.find((candidate) => typeof candidate === "string" && candidate.length > 0);
+    if (!hash) process.exit(1);
+    process.stdout.write(hash);
+  ' "$cvm_json" 2>/dev/null
+) || true
 domain_result=$(
   node -e '
     const value = JSON.parse(process.argv[1]);
@@ -150,3 +194,21 @@ fi
 
 printf 'uuid=%s\napp_id=%s\nnonce=%s\nagent_url=%s\nagent_url_source=%s\n' \
   "$uuid" "$app_id" "$nonce" "$agent_url" "$domain_path"
+
+if [[ $identity_only == false ]]; then
+  capacity=${SANDBOX_MAX:-20}
+  echo "Register this node with POST /v1/tee-nodes using this payload:"
+  node -e '
+    const [nodeId, appId, composeHash, publicUrl, capacity] = process.argv.slice(1);
+    const payload = {
+      nodeId,
+      appId: appId.startsWith("0x") ? appId : `0x${appId}`,
+      ...(composeHash ? { composeHash: composeHash.startsWith("0x") ? composeHash : `0x${composeHash}` } : {}),
+      publicUrl,
+      capacity: Number(capacity),
+      secret: "<NODE_SECRET: send once>",
+    };
+    process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+  ' "$NODE_ID" "$app_id" "$compose_hash" "$agent_url" "$capacity"
+  echo "Replace the secret placeholder in the registration body once; NODE_SECRET is not printed."
+fi

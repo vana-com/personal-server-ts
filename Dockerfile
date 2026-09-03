@@ -2,7 +2,7 @@
 FROM node:22-alpine AS build
 
 # build-base provides gcc/g++/make for better-sqlite3 native addon
-RUN apk add --no-cache build-base python3 git
+RUN apk add --no-cache build-base python3
 
 WORKDIR /app
 
@@ -12,11 +12,7 @@ COPY packages/core/package.json packages/core/
 COPY packages/lite/package.json packages/lite/
 COPY packages/server/package.json packages/server/
 COPY packages/cli/package.json packages/cli/
-
-RUN git clone --branch main --depth 1 https://github.com/vana-com/vana-sdk.git /vana-sdk \
-  && cd /vana-sdk \
-  && npm ci \
-  && npm run build --workspace @opendatalabs/vana-sdk
+COPY packages/enclave/package.json packages/enclave/
 
 RUN npm ci
 
@@ -46,13 +42,17 @@ WORKDIR /app
 COPY --from=build --chown=vana:vana /app/package.json /app/package-lock.json ./
 COPY --from=build --chown=vana:vana /app/node_modules/ node_modules/
 
-# Each workspace package needs package.json and dist/. Workspace dependencies are
-# available through the root node_modules copied above.
+# Each runtime workspace needs package.json and dist/. Dependencies that npm keeps
+# workspace-local after pruning must be copied beside that workspace.
 COPY --from=build --chown=vana:vana /app/packages/core/package.json packages/core/package.json
 COPY --from=build --chown=vana:vana /app/packages/core/dist/ packages/core/dist/
+COPY --from=build --chown=vana:vana /app/packages/core/node_modules/ packages/core/node_modules/
+
+COPY --from=build --chown=vana:vana /app/packages/lite/node_modules/ packages/lite/node_modules/
 
 COPY --from=build --chown=vana:vana /app/packages/server/package.json packages/server/package.json
 COPY --from=build --chown=vana:vana /app/packages/server/dist/ packages/server/dist/
+COPY --from=build --chown=vana:vana /app/packages/server/node_modules/ packages/server/node_modules/
 
 # Data directory for SQLite DB, keys, logs
 RUN mkdir -p /data && chown vana:vana /data
