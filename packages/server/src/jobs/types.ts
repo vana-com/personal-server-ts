@@ -1,37 +1,4 @@
-import type { Address, Hex } from "viem";
-
-// TODO(sdk-jobs): replace with import from "@opendatalabs/vana-sdk/protocol/jobs" once the prerelease is pinned.
-export const JOB_PROTOCOL_VERSION = 1;
-export const JOB_OPERATIONS = ["raw_read", "inference"] as const;
-export type JobOperation = (typeof JOB_OPERATIONS)[number];
-export const MAX_INLINE_RESULT_BYTES = 1_048_576;
-
-export interface JobRequest {
-  v: 1;
-  jobId: string;
-  owner: Address;
-  builder: Address;
-  builderPublicKey: Hex;
-  grantId: Hex;
-  scope: string;
-  operation: JobOperation;
-  pinnedVersion: string | null;
-  deadline: string;
-}
-
-export interface JobRequestEnvelope {
-  request: JobRequest;
-  auth: string;
-}
-
-export interface JobResult {
-  v: 1;
-  jobId: string;
-  scope: string;
-  version: string | null;
-  contentType: string;
-  body: string;
-}
+import type { Hex } from "viem";
 
 export type JobFailureCode =
   | "AUTH_INVALID"

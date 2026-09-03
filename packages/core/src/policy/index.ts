@@ -10,6 +10,7 @@ export {
   type SignedBuilder,
   type SignedGrant,
 } from "./signed-artifacts.js";
+export { canonicalJsonBytes } from "./canonical-json.js";
 export {
   WRITE_SCOPE_PREFIX,
   isWriteScopeEntry,

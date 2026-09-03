@@ -1,13 +1,15 @@
 import { timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 import { isAddress, isHex, type Address, type Hex } from "viem";
+import {
+  JOB_OPERATIONS,
+  type JobRequestEnvelope,
+} from "@opendatalabs/vana-sdk/protocol/jobs";
 import { createBodyLimit } from "../middleware/body-limit.js";
-import { JOB_OPERATIONS } from "../jobs/types.js";
 import type {
   JobExecuteError,
   JobExecuteResponse,
   JobFailureCode,
-  JobRequestEnvelope,
 } from "../jobs/types.js";
 import { JobFailure } from "../jobs/worker.js";
 

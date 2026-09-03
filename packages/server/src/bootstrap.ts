@@ -3,7 +3,6 @@ import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { privateKeyToAccount } from "viem/accounts";
-import { fromHex } from "viem";
 
 const require = createRequire(import.meta.url);
 const pkg = require("../package.json") as { version: string };
@@ -20,7 +19,6 @@ import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-c
 import {
   createGatewayClient,
   NodeECIESProvider,
-  serializeECIES,
 } from "@opendatalabs/vana-sdk/node";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { createAccessLogWriter } from "./logging/access-log.js";
@@ -570,17 +568,7 @@ export async function createServer(
             gateway: gatewayClient,
             gatewayConfig: config.gateway,
             storage: dataStorage,
-            ecies: {
-              async encrypt(publicKey, plaintext) {
-                const keyBytes =
-                  typeof publicKey === "string"
-                    ? fromHex(publicKey, "bytes")
-                    : publicKey;
-                const encrypted = await ecies.encrypt(keyBytes, plaintext);
-
-                return Buffer.from(serializeECIES(encrypted), "hex");
-              },
-            },
+            ecies,
             logger,
             accessLogWriter,
             scopeDeletions,

@@ -62,7 +62,8 @@ import type {
 import type { TokenStore } from "./token-store.js";
 import type { Logger } from "pino";
 import { enclaveJobRoutes } from "./routes/enclave-jobs.js";
-import type { JobRequestEnvelope, JobExecuteResponse } from "./jobs/types.js";
+import type { JobRequestEnvelope } from "@opendatalabs/vana-sdk/protocol/jobs";
+import type { JobExecuteResponse } from "./jobs/types.js";
 
 export interface IdentityInfo {
   address: `0x${string}`;

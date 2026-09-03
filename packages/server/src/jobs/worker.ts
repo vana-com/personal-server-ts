@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
   assertScopeNotDeleted,
   redactEnvelopeForGrantee,
@@ -18,6 +18,7 @@ import type {
   ProtocolGatewayPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
 import {
+  canonicalJsonBytes,
   verifyDataReadPolicy,
   verifySignedArtifacts,
 } from "@opendatalabs/personal-server-ts-core/policy";
@@ -27,17 +28,18 @@ import {
   verifyWeb3Signed,
   type DataPortabilityGatewayConfig,
 } from "@opendatalabs/vana-sdk/node";
-import type { Logger } from "pino";
-import { isAddressEqual, type Address, type Hex } from "viem";
-import { publicKeyToAddress } from "viem/accounts";
+import { sealJobResult } from "@opendatalabs/vana-sdk/crypto/envelope/job";
 import {
   JOB_PROTOCOL_VERSION,
   MAX_INLINE_RESULT_BYTES,
-  type JobExecuteResponse,
-  type JobFailureCode,
   type JobRequestEnvelope,
   type JobResult,
-} from "./types.js";
+} from "@opendatalabs/vana-sdk/protocol/jobs";
+import type { ECIESProvider } from "@opendatalabs/vana-sdk/crypto/ecies/interface";
+import type { Logger } from "pino";
+import { isAddressEqual, type Address, type Hex } from "viem";
+import { publicKeyToAddress } from "viem/accounts";
+import type { JobExecuteResponse, JobFailureCode } from "./types.js";
 
 const RAW_READ = "raw_read";
 const EXECUTE_PATH = "/v1/jobs/execute";
@@ -46,13 +48,6 @@ const JSON_CONTENT_TYPE = "application/json";
 const UNKNOWN_METADATA = "unknown";
 const MILLISECONDS_PER_SECOND = 1_000;
 
-export interface JobEcies {
-  encrypt(
-    publicKey: Uint8Array | Hex,
-    plaintext: Uint8Array,
-  ): Promise<Uint8Array>;
-}
-
 export interface JobWorkerDeps {
   serverOwner: Address;
   serverAddress: Address;
@@ -60,7 +55,7 @@ export interface JobWorkerDeps {
   gateway: ProtocolGatewayPort;
   gatewayConfig: DataPortabilityGatewayConfig;
   storage: DataStoragePort;
-  ecies: JobEcies;
+  ecies: ECIESProvider;
   now?: () => Date;
   logger: Logger;
   accessLogWriter: AccessLogWriter;
@@ -226,11 +221,12 @@ async function executeJobUnsafe(
     contentType: JSON_CONTENT_TYPE,
     body: Buffer.from(JSON.stringify(redacted)).toString("base64"),
   };
-  const encrypted = await deps.ecies.encrypt(
+  const sealed = await sealJobResult(
+    result,
     request.builderPublicKey,
-    Buffer.from(JSON.stringify(result)),
+    deps.ecies,
   );
-  if (encrypted.byteLength > MAX_INLINE_RESULT_BYTES) {
+  if (sealed.size > MAX_INLINE_RESULT_BYTES) {
     throw new JobFailure(
       "RESULT_TOO_LARGE",
       "encrypted result is too large",
@@ -254,9 +250,9 @@ async function executeJobUnsafe(
   );
 
   return {
-    resultCiphertext: Buffer.from(encrypted).toString("base64"),
-    resultHash: `0x${createHash("sha256").update(encrypted).digest("hex")}`,
-    resultSize: encrypted.byteLength,
+    resultCiphertext: sealed.ciphertext,
+    resultHash: sealed.hash,
+    resultSize: sealed.size,
   };
 }
 
@@ -272,7 +268,7 @@ async function verifyJobAuth(
       expectedOrigin: parsed.payload.aud,
       expectedMethod: POST,
       expectedPath: EXECUTE_PATH,
-      bodyBytes: Buffer.from(JSON.stringify(envelope.request)),
+      bodyBytes: canonicalJsonBytes(envelope.request),
       now: Math.floor(now.getTime() / MILLISECONDS_PER_SECOND),
     });
   } catch {

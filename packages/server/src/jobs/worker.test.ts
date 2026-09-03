@@ -5,14 +5,17 @@ import {
   GRANT_REGISTRATION_TYPES,
   NodeECIESProvider,
   builderRegistrationDomain,
-  deserializeECIES,
   grantRegistrationDomain,
-  serializeECIES,
   type Builder,
   type DataFileEnvelope,
   type DataPortabilityGatewayConfig,
   type GatewayGrantResponse,
 } from "@opendatalabs/vana-sdk/node";
+import { openJobResult } from "@opendatalabs/vana-sdk/crypto/envelope/job";
+import {
+  MAX_INLINE_RESULT_BYTES,
+  type JobRequestEnvelope,
+} from "@opendatalabs/vana-sdk/protocol/jobs";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
@@ -23,9 +26,8 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/ports";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
-import { fromHex } from "viem";
+import { canonicalJsonBytes } from "@opendatalabs/personal-server-ts-core/policy";
 import { privateKeyToAccount } from "viem/accounts";
-import { MAX_INLINE_RESULT_BYTES, type JobRequestEnvelope } from "./types.js";
 import { executeJob, JobFailure, type JobWorkerDeps } from "./worker.js";
 
 const NOW = new Date("2026-09-03T12:00:00.000Z");
@@ -190,17 +192,7 @@ async function createFixture(): Promise<Fixture> {
     gateway,
     gatewayConfig,
     storage,
-    ecies: {
-      async encrypt(publicKey, plaintext) {
-        const key =
-          typeof publicKey === "string"
-            ? fromHex(publicKey, "bytes")
-            : publicKey;
-        const encrypted = await eciesProvider.encrypt(key, plaintext);
-
-        return Buffer.from(serializeECIES(encrypted), "hex");
-      },
-    },
+    ecies: eciesProvider,
     now: () => NOW,
     logger: pino({ level: "silent" }),
     accessLogWriter,
@@ -218,7 +210,7 @@ async function signRequest(
     aud: "http://localhost:8080",
     method: "POST",
     uri: "/v1/jobs/execute",
-    body: Buffer.from(JSON.stringify(request)),
+    body: canonicalJsonBytes(request),
     iat: Math.floor(NOW.getTime() / 1_000) - 1,
     exp: Math.floor(NOW.getTime() / 1_000) + 300,
   });
@@ -243,21 +235,12 @@ describe("executeJob", () => {
   it("redacts and encrypts a raw-read result to the builder key", async () => {
     const fixture = await createFixture();
     const response = await executeJob(fixture.envelope, fixture.deps);
-    const encrypted = deserializeECIES(
-      Buffer.from(response.resultCiphertext, "base64").toString("hex"),
+    const result = await openJobResult(
+      response.resultCiphertext,
+      builder.privateKey,
+      new NodeECIESProvider(),
+      { jobId: "job-1", scope: SCOPE, version: "7" },
     );
-    const plaintext = await new NodeECIESProvider().decrypt(
-      fromHex(builder.privateKey, "bytes"),
-      encrypted,
-    );
-    const result = JSON.parse(Buffer.from(plaintext).toString()) as {
-      v: number;
-      jobId: string;
-      scope: string;
-      version: string;
-      contentType: string;
-      body: string;
-    };
     const redacted = JSON.parse(Buffer.from(result.body, "base64").toString());
 
     expect(result).toMatchObject({
@@ -356,9 +339,12 @@ describe("executeJob", () => {
       {
         code: "RESULT_TOO_LARGE",
         mutate({ deps }) {
-          deps.ecies.encrypt = vi
-            .fn()
-            .mockResolvedValue(new Uint8Array(MAX_INLINE_RESULT_BYTES + 1));
+          vi.spyOn(deps.ecies, "encrypt").mockResolvedValue({
+            iv: new Uint8Array(16),
+            ephemPublicKey: new Uint8Array(65),
+            ciphertext: new Uint8Array(MAX_INLINE_RESULT_BYTES),
+            mac: new Uint8Array(32),
+          });
         },
       },
       {

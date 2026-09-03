@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { JobRequestEnvelope } from "../jobs/types.js";
+import type { JobRequestEnvelope } from "@opendatalabs/vana-sdk/protocol/jobs";
 import { JobFailure } from "../jobs/worker.js";
 import { enclaveJobRoutes } from "./enclave-jobs.js";
 
