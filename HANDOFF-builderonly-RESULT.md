@@ -60,3 +60,10 @@ The repository-wide Prettier check reports the pre-existing, user-owned
 untracked `HANDOFF-builderonly.md`. That file was deliberately left untouched
 and excluded from this change. Prettier passes for every file in this result's
 change slice.
+
+## Fix round 2
+
+B1 incorrectly read `state` from the nested identity evidence, and B2 treated
+the API's parsed `scopes` array as database JSON text. B1 now checks the
+top-level response state, while B2 validates and uses the returned non-empty
+string array directly. The no-network lint and formatting gates still pass.

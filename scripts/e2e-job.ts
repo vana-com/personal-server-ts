@@ -1302,11 +1302,12 @@ async function runBuilderOnly(ctx: BuilderOnlyContext): Promise<void> {
       "GET",
       `${ctx.gatewayUrl}/v1/identity?owner=${encodeURIComponent(ctx.ownerAddress)}&chainId=${ctx.chainId}`,
     );
-    const fetchedIdentity = record(record(result.response.body)?.identity);
+    const body = record(result.response.body);
+    const fetchedIdentity = record(body?.identity);
     requireResponse(
       result,
       HTTP_OK,
-      () => fetchedIdentity?.state === "sealed",
+      () => body?.state === "sealed",
       "Expected the owner identity to be sealed",
     );
     identity = fetchedIdentity as unknown as IdentityResponse["identity"];
@@ -1330,6 +1331,7 @@ async function runBuilderOnly(ctx: BuilderOnlyContext): Promise<void> {
       `${ctx.gatewayUrl}/v1/grants/${encodeURIComponent(ctx.grantId)}`,
     );
     const grant = record(record(grantResult.response.body)?.data);
+    const grantedScopes = grant?.scopes;
     requireResponse(
       grantResult,
       HTTP_OK,
@@ -1337,20 +1339,15 @@ async function runBuilderOnly(ctx: BuilderOnlyContext): Promise<void> {
         typeof grant?.granteeId === "string" &&
         grant.granteeId.toLowerCase() === String(builder!.id).toLowerCase() &&
         grant.revokedAt == null &&
-        typeof grant.scopes === "string",
+        Array.isArray(grantedScopes) &&
+        grantedScopes.length > 0 &&
+        grantedScopes.every((value: unknown) => typeof value === "string"),
       "Expected an active grant for the registered builder",
     );
 
-    const parsedScopes = JSON.parse(grant!.scopes as string) as unknown;
-    if (
-      !Array.isArray(parsedScopes) ||
-      parsedScopes.length === 0 ||
-      parsedScopes.some((value) => typeof value !== "string")
-    ) {
-      throw new Error("Grant scopes must be a non-empty JSON string array");
-    }
-    scope = ctx.scope ?? parsedScopes[0];
-    if (!parsedScopes.includes(scope)) {
+    const scopes = grantedScopes as string[];
+    scope = ctx.scope ?? scopes[0];
+    if (!scopes.includes(scope)) {
       throw new Error(`Scope ${scope} is not present in the grant`);
     }
 
