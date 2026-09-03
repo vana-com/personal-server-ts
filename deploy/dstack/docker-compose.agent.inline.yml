@@ -25,5 +25,4 @@ services:
         date -u +%FT%TZ
         npm run build -w @opendatalabs/personal-server-ts-enclave
         date -u +%FT%TZ
-        date -u +%FT%TZ
         exec npm run start:agent -w @opendatalabs/personal-server-ts-enclave
