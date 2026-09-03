@@ -99,6 +99,18 @@ async function post(path: string, body: unknown, headers = JSON_HEADERS) {
   });
 }
 
+async function expectError(
+  response: Response,
+  status: number,
+  code: string,
+): Promise<void> {
+  const body = (await response.json()) as { code: string; error: string };
+
+  expect(response.status).toBe(status);
+  expect(body.code).toBe(code);
+  expect(body.error.length).toBeGreaterThan(0);
+}
+
 describe("agent HTTP server", () => {
   it.each([
     ["missing", undefined],
@@ -108,7 +120,7 @@ describe("agent HTTP server", () => {
     const headers = authorization ? { authorization } : undefined;
     const response = await fetch(`${origin}/agent/v1/health`, { headers });
 
-    expect(response.status).toBe(401);
+    await expectError(response, 401, "UNAUTHORIZED");
   });
 
   it("returns health information", async () => {
@@ -166,24 +178,21 @@ describe("agent HTTP server", () => {
       minEpoch: EPOCH + 1,
     });
 
-    expect(response.status).toBe(409);
-    expect(await response.json()).toEqual({ error: "EPOCH_RETIRED" });
+    await expectError(response, 409, "EPOCH_RETIRED");
   });
 
   it("maps an owner mismatch to 422", async () => {
     const { request } = await sealRequest(OTHER);
     const response = await post("/agent/v1/secrets/seal", request);
 
-    expect(response.status).toBe(422);
-    expect(await response.json()).toEqual({ error: "OWNER_MISMATCH" });
+    await expectError(response, 422, "OWNER_MISMATCH");
   });
 
   it("maps a delivery ownerAddress mismatch to 422", async () => {
     const { request } = await sealRequest(OWNER, OTHER.address);
     const response = await post("/agent/v1/secrets/seal", request);
 
-    expect(response.status).toBe(422);
-    expect(await response.json()).toEqual({ error: "OWNER_MISMATCH" });
+    await expectError(response, 422, "OWNER_MISMATCH");
   });
 
   it("rejects bodies over 64 KiB", async () => {
@@ -192,14 +201,13 @@ describe("agent HTTP server", () => {
       JSON.stringify({ padding: "x".repeat(64 * 1024) }),
     );
 
-    expect(response.status).toBe(413);
+    await expectError(response, 413, "BODY_TOO_LARGE");
   });
 
   it("rejects bad JSON", async () => {
     const response = await post("/agent/v1/identity", "{");
 
-    expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({ error: "BAD_REQUEST" });
+    await expectError(response, 400, "BAD_REQUEST");
   });
 
   it("returns 404 for unknown paths", async () => {
@@ -207,6 +215,6 @@ describe("agent HTTP server", () => {
       headers: JSON_HEADERS,
     });
 
-    expect(response.status).toBe(404);
+    await expectError(response, 404, "NOT_FOUND");
   });
 });

@@ -29,6 +29,11 @@ const UNAUTHORIZED = 401;
 const NOT_FOUND = 404;
 const BODY_TOO_LARGE = 413;
 const INTERNAL_ERROR = 500;
+const UNAUTHORIZED_MESSAGE = "authorization required";
+const NOT_FOUND_MESSAGE = "route not found";
+const BODY_TOO_LARGE_MESSAGE = "request body is too large";
+const BAD_REQUEST_MESSAGE = "request body is invalid";
+const INTERNAL_MESSAGE = "internal server error";
 
 export interface AgentServerOptions {
   client: DstackClient;
@@ -58,7 +63,7 @@ async function handleRequest(
   path: string,
 ): Promise<void> {
   if (!isAuthorized(request, options.secret)) {
-    sendJson(response, UNAUTHORIZED, { error: "UNAUTHORIZED" });
+    sendError(response, UNAUTHORIZED, "UNAUTHORIZED", UNAUTHORIZED_MESSAGE);
     return;
   }
 
@@ -80,24 +85,30 @@ async function handleRequest(
       return;
     }
 
-    sendJson(response, NOT_FOUND, { error: "NOT_FOUND" });
+    sendError(response, NOT_FOUND, "NOT_FOUND", NOT_FOUND_MESSAGE);
   } catch (error) {
     if (error instanceof BodyTooLarge) {
-      sendJson(response, BODY_TOO_LARGE, { error: "BODY_TOO_LARGE" });
+      sendError(
+        response,
+        BODY_TOO_LARGE,
+        "BODY_TOO_LARGE",
+        BODY_TOO_LARGE_MESSAGE,
+      );
       return;
     }
 
     if (error instanceof AgentError) {
-      sendJson(response, error.status, { error: error.code });
+      // AgentError messages are fixed internal strings and never include input.
+      sendError(response, error.status, error.code, error.message);
       return;
     }
 
     if (error instanceof SyntaxError || error instanceof BadRequest) {
-      sendJson(response, BAD_REQUEST, { error: "BAD_REQUEST" });
+      sendError(response, BAD_REQUEST, "BAD_REQUEST", BAD_REQUEST_MESSAGE);
       return;
     }
 
-    sendJson(response, INTERNAL_ERROR, { error: "INTERNAL" });
+    sendError(response, INTERNAL_ERROR, "INTERNAL", INTERNAL_MESSAGE);
   }
 }
 
@@ -202,4 +213,13 @@ function sendJson(
   response.statusCode = status;
   response.setHeader(CONTENT_TYPE_HEADER, JSON_CONTENT_TYPE);
   response.end(JSON.stringify(body));
+}
+
+function sendError(
+  response: ServerResponse,
+  status: number,
+  code: string,
+  message: string,
+): void {
+  sendJson(response, status, { code, error: message });
 }
