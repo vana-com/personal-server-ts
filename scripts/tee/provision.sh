@@ -156,7 +156,7 @@ uuid=$(
 )
 
 cvm_json=$(phala cvms get "$uuid" --json)
-compose_hash=$(
+if ! compose_hash=$(
   node -e '
     const value = JSON.parse(process.argv[1]);
     const candidates = [
@@ -170,7 +170,13 @@ compose_hash=$(
     if (!hash) process.exit(1);
     process.stdout.write(hash);
   ' "$cvm_json" 2>/dev/null
-) || true
+); then
+  echo "Could not locate a compose hash in any expected field." >&2
+  echo "Tried: compose_hash, composeHash, app_compose_hash, cvm.compose_hash, status.compose_hash." >&2
+  echo "Raw 'phala cvms get' JSON follows:" >&2
+  echo "$cvm_json" >&2
+  exit 1
+fi
 domain_result=$(
   node -e '
     const value = JSON.parse(process.argv[1]);
