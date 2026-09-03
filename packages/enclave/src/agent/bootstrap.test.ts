@@ -48,6 +48,7 @@ describe("agentConfigFromEnv", () => {
       LEASE_SECONDS: "60",
       SANDBOX_SYNC: "disabled",
       WORK_DELAY_MS: "250",
+      VERCEL_PROTECTION_BYPASS: "preview-secret",
     });
 
     expect(config.jobs).toEqual({
@@ -64,6 +65,7 @@ describe("agentConfigFromEnv", () => {
       fakeRoot: "/tmp/sandboxes",
       sync: "disabled",
       workDelayMs: 250,
+      gatewayBypassSecret: "preview-secret",
     });
   });
 

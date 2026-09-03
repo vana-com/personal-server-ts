@@ -14,12 +14,14 @@ import {
   buildPersonalServerRegistrationTypedData,
   buildWeb3SignedHeader,
   builderRegistrationDomain,
+  createGatewayClient,
   grantRegistrationDomain,
   grantRevocationDomain,
   type Builder,
   type DataPortabilityGatewayConfig,
   type GatewayClient,
   type GatewayGrantResponse,
+  type ServerInfo,
 } from "@opendatalabs/vana-sdk/node";
 import {
   canonicalJobRequestBytes,
@@ -45,6 +47,7 @@ import {
   privateKeyToAccount,
   type PrivateKeyAccount,
 } from "viem/accounts";
+import type { ServerAccount } from "../packages/core/src/keys/server-account.js";
 import { ServerConfigSchema } from "../packages/core/src/schemas/server-config.js";
 import { createFakeDstackClient } from "../packages/enclave/src/dstack/fake.js";
 import { createServer } from "../packages/server/src/bootstrap.js";
@@ -82,6 +85,11 @@ const AGENT_READY_TIMEOUT_MS = 15_000;
 const HEARTBEAT_TIMEOUT_MS = 30_000;
 const JOB_TIMEOUT_MS = 60_000;
 const RECOVERY_TIMEOUT_MS = 90_000;
+const REMOTE_RECOVERY_TIMEOUT_MS = 300_000;
+const REMOTE_CLAIM_TIMEOUT_MS = 15_000;
+const REMOTE_SEED_TIMEOUT_MS = 120_000;
+const REMOTE_HEARTBEAT_MAX_AGE_MS = 60_000;
+const MAX_RECOVERY_SUBMISSIONS = 8;
 const POLL_INTERVAL_MS = 1_000;
 const LEASE_KILL_DELAY_MS = 5_000;
 const LEASE_WORK_DELAY_MS = 120_000;
@@ -101,6 +109,7 @@ const HTTP_NOT_FOUND = 404;
 const EXIT_SUCCESS = 0;
 const EXIT_FAILURE = 1;
 const TRUE_VALUE = "1";
+const REMOTE_ENABLED = "1";
 const GRANT_VERSION_ONE = 1n;
 const GRANT_VERSION_REVOKED = 2n;
 const GRANT_VERSION_FRESH = 3n;
@@ -136,6 +145,10 @@ interface JobContext {
   ownerSignature: Hex;
   userPsId: Hex;
   ecies: NodeECIESProvider;
+  remote: boolean;
+  remoteNodeIds: string[];
+  warmRuns: number;
+  recovery: boolean;
 }
 
 interface RegisteredBuilder {
@@ -164,11 +177,23 @@ let cleanupStarted = false;
 let rootToRemove: string | undefined;
 let cleanupContext:
   { gatewayUrl: string; operatorSecret: string; fakeRoot: string } | undefined;
+let originalFetch: typeof fetch | undefined;
 
 function positiveInt(raw: string | undefined, fallback: number): number {
   const value = raw === undefined ? fallback : Number(raw);
   if (!Number.isInteger(value) || value < MIN_POSITIVE_INTEGER) {
     throw new Error(`Expected a positive integer, received ${raw ?? value}`);
+  }
+
+  return value;
+}
+
+function nonnegativeInt(raw: string | undefined, fallback: number): number {
+  const value = raw === undefined ? fallback : Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(
+      `Expected a non-negative integer, received ${raw ?? value}`,
+    );
   }
 
   return value;
@@ -188,15 +213,25 @@ async function buildContext(): Promise<JobContext> {
     /\/+$/,
     "",
   );
+  installGatewayBypass(gatewayUrl, process.env.VERCEL_PROTECTION_BYPASS);
+  const remote = process.env.E2E_REMOTE === REMOTE_ENABLED;
+  const remoteNodeIds = (process.env.E2E_NODE_IDS ?? "")
+    .split(",")
+    .map((nodeId) => nodeId.trim())
+    .filter(Boolean);
+  if (remote && remoteNodeIds.length === 0) {
+    throw new Error("E2E_NODE_IDS is required when E2E_REMOTE=1");
+  }
   const operatorSecret = process.env.OPERATOR_SECRET ?? process.env.CRON_SECRET;
   if (!operatorSecret) {
     throw new Error("OPERATOR_SECRET or CRON_SECRET is required");
   }
   const chainId = positiveInt(process.env.CHAIN_ID, DEFAULT_CHAIN_ID);
-  const fakeRoot =
-    process.env.SANDBOX_FAKE_ROOT ??
-    (await mkdtemp(join(tmpdir(), "vana-job-e2e-")));
-  rootToRemove = fakeRoot;
+  const fakeRoot = remote
+    ? ""
+    : (process.env.SANDBOX_FAKE_ROOT ??
+      (await mkdtemp(join(tmpdir(), "vana-job-e2e-"))));
+  rootToRemove = remote ? undefined : fakeRoot;
   const owner = privateKeyToAccount(hexKey(process.env.OWNER_PRIVATE_KEY));
   const ownerSignature = await owner.signMessage({
     message: MASTER_KEY_MESSAGE,
@@ -214,6 +249,34 @@ async function buildContext(): Promise<JobContext> {
     ownerSignature,
     userPsId: userPsId(chainId, owner.address),
     ecies: new NodeECIESProvider(),
+    remote,
+    remoteNodeIds,
+    warmRuns: nonnegativeInt(process.env.E2E_WARM_RUNS, 0),
+    recovery: process.env.E2E_RECOVERY === TRUE_VALUE,
+  };
+}
+
+function installGatewayBypass(
+  gatewayUrl: string,
+  secret: string | undefined,
+): void {
+  if (!secret || originalFetch) return;
+  const gatewayOrigin = new URL(gatewayUrl).origin;
+  originalFetch = globalThis.fetch;
+  globalThis.fetch = (input, init) => {
+    const requestUrl = new URL(
+      input instanceof Request ? input.url : input.toString(),
+    );
+    if (requestUrl.origin !== gatewayOrigin) {
+      return originalFetch!(input, init);
+    }
+    const headers = new Headers(
+      input instanceof Request ? input.headers : undefined,
+    );
+    new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
+    headers.set("x-vercel-protection-bypass", secret);
+
+    return originalFetch!(input, { ...init, headers });
   };
 }
 
@@ -441,6 +504,32 @@ async function admitNode(ctx: JobContext, nodeId: string): Promise<void> {
   );
 }
 
+async function verifyRemoteNodes(ctx: JobContext): Promise<string> {
+  const result = await operatorRequest(ctx, "GET", "/v1/tee-nodes");
+  const nodes = Array.isArray(result.response.body)
+    ? result.response.body.map(record)
+    : [];
+  const now = Date.now();
+  for (const nodeId of ctx.remoteNodeIds) {
+    const node = nodes.find((candidate) => candidate?.nodeId === nodeId);
+    const heartbeat =
+      typeof node?.lastHeartbeatAt === "string"
+        ? Date.parse(node.lastHeartbeatAt)
+        : Number.NaN;
+    if (
+      node?.state !== "admitted" ||
+      !Number.isFinite(heartbeat) ||
+      now - heartbeat > REMOTE_HEARTBEAT_MAX_AGE_MS
+    ) {
+      throw new Error(
+        `Remote node ${nodeId} is not admitted with a heartbeat from the last 60 seconds`,
+      );
+    }
+  }
+
+  return `nodeIds=${ctx.remoteNodeIds.join(",")}`;
+}
+
 async function registerBuilder(ctx: JobContext): Promise<RegisteredBuilder> {
   const privateKey = generatePrivateKey();
   const account = privateKeyToAccount(privateKey);
@@ -566,7 +655,11 @@ function sandboxRoot(ctx: JobContext): string {
   return join(ctx.fakeRoot, `${ctx.userPsId}-${FIRST_EPOCH}`);
 }
 
-async function seedRecord(ctx: JobContext): Promise<void> {
+async function seedRecord(ctx: JobContext): Promise<string | undefined> {
+  if (ctx.remote) {
+    return seedRemoteRecord(ctx);
+  }
+
   const root = sandboxRoot(ctx);
   const origin = `http://${AGENT_HOST}:${SEED_SERVER_PORT}`;
   const config = ServerConfigSchema.parse({
@@ -610,6 +703,137 @@ async function seedRecord(ctx: JobContext): Promise<void> {
     await server.cleanup();
   }
   await unlink(join(root, "key.json"));
+
+  return undefined;
+}
+
+async function seedRemoteRecord(ctx: JobContext): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "vana-job-seed-"));
+  const origin = `http://${AGENT_HOST}:${SEED_SERVER_PORT}`;
+  const config = ServerConfigSchema.parse({
+    server: { port: SEED_SERVER_PORT, origin },
+    gateway: { ...ctx.gatewayConfig, url: ctx.gatewayUrl },
+    storage: { backend: "vana" },
+    sync: { enabled: true },
+    tunnel: { enabled: false },
+    devUi: { enabled: false },
+    logging: { level: "error" },
+  });
+  const serverAccount: ServerAccount = {
+    address: ctx.owner.address,
+    publicKey: ctx.owner.publicKey,
+    signMessage: (message) => ctx.owner.signMessage({ message }),
+    signTypedData: (params) => ctx.owner.signTypedData(params),
+  };
+  const gatewayClient = ownerSeedGateway(ctx, serverAccount);
+  const server = await createServer(config, {
+    rootPath: root,
+    ownerSignature: ctx.ownerSignature,
+    gatewayClient,
+    serverAccount,
+  });
+  try {
+    if (!server.syncManager) {
+      throw new Error("Remote seed server did not start its sync manager");
+    }
+    const rawBody = JSON.stringify(OWNER_RECORD);
+    const authorization = await buildAuth(
+      ctx.owner,
+      origin,
+      "POST",
+      `/v1/data/${JOB_SCOPE}`,
+      new TextEncoder().encode(rawBody),
+    );
+    const response = await server.app.request(
+      `${origin}/v1/data/${JOB_SCOPE}`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: authorization,
+          "Content-Type": JSON_CONTENT_TYPE,
+        },
+        body: rawBody,
+      },
+    );
+    if (response.status !== HTTP_CREATED) {
+      throw new Error(`Record seed failed with status ${response.status}`);
+    }
+
+    await server.startBackgroundServices();
+    await server.syncManager.trigger();
+    const deadline = Date.now() + REMOTE_SEED_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      const status = server.syncManager.getStatus();
+      if (status.errors.length > 0) {
+        throw new Error(
+          `Remote seed sync failed: ${JSON.stringify(status.errors)}`,
+        );
+      }
+      const version = await remoteScopeVersion(ctx);
+      if (status.pendingFiles === 0 && !status.syncing && version) {
+        return version;
+      }
+      await delay(POLL_INTERVAL_MS);
+    }
+
+    const status = server.syncManager.getStatus();
+    throw new Error(
+      `Remote seed timed out: pending=${status.pendingFiles} syncing=${status.syncing} errors=${JSON.stringify(status.errors)}`,
+    );
+  } finally {
+    await server.cleanup();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+function ownerSeedGateway(
+  ctx: JobContext,
+  serverAccount: ServerAccount,
+): GatewayClient {
+  const gateway = createGatewayClient(ctx.gatewayUrl);
+  const ownerServer: ServerInfo = {
+    id: "owner-seed",
+    ownerAddress: ctx.owner.address,
+    serverAddress: serverAccount.address,
+    publicKey: serverAccount.publicKey,
+    serverUrl: "http://127.0.0.1/e2e-owner-seed",
+    addedAt: new Date().toISOString(),
+    revokedAt: null,
+  };
+
+  // This fixture signs as the owner, so uploads do not need a registered
+  // Personal Server. Satisfy only the local sync gate; all network operations
+  // still use the real SDK client.
+  return new Proxy(gateway, {
+    get(target, property, receiver) {
+      if (property === "getServer") {
+        return async () => ownerServer;
+      }
+      const value = Reflect.get(target, property, receiver) as unknown;
+
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+async function remoteScopeVersion(
+  ctx: JobContext,
+): Promise<string | undefined> {
+  const result = await requestJson(
+    "GET",
+    `${ctx.gatewayUrl}/v1/data?user=${encodeURIComponent(ctx.owner.address)}&limit=100`,
+  );
+  if (result.response.status !== HTTP_OK) return undefined;
+  const rows = record(record(result.response.body)?.data)?.dataPoints;
+  if (!Array.isArray(rows)) return undefined;
+  const match = rows
+    .map(record)
+    .find((candidate) => candidate?.scope === JOB_SCOPE);
+  const version = match?.expectedVersion;
+
+  return typeof version === "string" || typeof version === "number"
+    ? String(version)
+    : undefined;
 }
 
 async function buildAuth(
@@ -753,6 +977,7 @@ async function assertResult(
   ctx: JobContext,
   builderKey: Hex,
   status: JobStatus,
+  expectedVersion?: string,
 ): Promise<void> {
   if (!status.resultCiphertext) {
     throw new Error("Completed job did not include resultCiphertext");
@@ -765,6 +990,11 @@ async function assertResult(
   );
   if (typeof result.version !== "string") {
     throw new Error("Job result version was not a string");
+  }
+  if (expectedVersion && result.version !== String(expectedVersion)) {
+    throw new Error(
+      `Expected job result version ${expectedVersion}, received ${result.version}`,
+    );
   }
   if (result.contentType !== JSON_CONTENT_TYPE) {
     throw new Error(`Unexpected result content type ${result.contentType}`);
@@ -779,6 +1009,120 @@ async function assertResult(
   if ("$writtenBy" in (data ?? {})) {
     throw new Error("Job result disclosed owner-only $writtenBy metadata");
   }
+}
+
+async function submitAndDecrypt(
+  ctx: JobContext,
+  identity: IdentityResponse["identity"],
+  builder: RegisteredBuilder,
+  grantId: Hex,
+  expectedVersion: string | undefined,
+): Promise<{ job: CreatedJob; submitMs: number }> {
+  const job = await createJob({
+    ctx,
+    identity,
+    builder: builder.account,
+    grantId,
+  });
+  const submittedAt = performance.now();
+  const result = await submitJob(ctx, builder.account, job, JOB_WAIT_SECONDS);
+  const submitMs = Math.round(performance.now() - submittedAt);
+  const status = jobFromResult(result);
+  requireResponse(
+    result,
+    HTTP_OK,
+    () => status?.state === "completed" && status.attempt === 1,
+    "Expected the raw read job to complete inline on attempt 1",
+  );
+  await assertResult(ctx, builder.privateKey, status!, expectedVersion);
+
+  return { job, submitMs };
+}
+
+async function recoverRemoteLease(
+  ctx: JobContext,
+  identity: IdentityResponse["identity"],
+  builder: RegisteredBuilder,
+  grantId: Hex,
+  expectedVersion: string | undefined,
+): Promise<string> {
+  for (let attempt = 1; attempt <= MAX_RECOVERY_SUBMISSIONS; attempt += 1) {
+    const recoveryJob = await createJob({
+      ctx,
+      identity,
+      builder: builder.account,
+      grantId,
+    });
+    const submitted = await submitJob(
+      ctx,
+      builder.account,
+      recoveryJob,
+      NO_WAIT_SECONDS,
+    );
+    requireResponse(
+      submitted,
+      HTTP_ACCEPTED,
+      (body) => record(body)?.state === "queued",
+      "Expected lease-recovery job submission to queue",
+    );
+    const slowStatus = await waitForSlowClaim(
+      ctx,
+      builder.account,
+      recoveryJob.request.jobId,
+    );
+    if (!slowStatus) continue;
+
+    console.error(
+      `RECOVERY_JOB ${recoveryJob.request.jobId} in flight on the slow node; stop that node now`,
+    );
+    const status = await pollJob(
+      ctx,
+      builder.account,
+      recoveryJob.request.jobId,
+      REMOTE_RECOVERY_TIMEOUT_MS,
+    );
+    if (status.state !== "completed" || status.attempt !== 2) {
+      throw new Error(
+        `Expected attempt-2 completion, received ${status.state}:${status.attempt}`,
+      );
+    }
+    await assertResult(ctx, builder.privateKey, status, expectedVersion);
+
+    return `jobId=${recoveryJob.request.jobId}`;
+  }
+
+  throw new Error(
+    `Fast node claimed all ${MAX_RECOVERY_SUBMISSIONS} recovery jobs`,
+  );
+}
+
+async function waitForSlowClaim(
+  ctx: JobContext,
+  builder: PrivateKeyAccount,
+  jobId: string,
+): Promise<JobStatus | undefined> {
+  const deadline = Date.now() + REMOTE_CLAIM_TIMEOUT_MS;
+  let lastStatus: JobStatus | undefined;
+  while (Date.now() < deadline) {
+    const result = await getJob(ctx, builder, jobId);
+    lastStatus = jobFromResult(result);
+    if (lastStatus?.state === "completed" && lastStatus.attempt === 1) {
+      return undefined;
+    }
+    if (
+      lastStatus &&
+      ["failed", "expired", "cancelled"].includes(lastStatus.state)
+    ) {
+      throw new Error(
+        `Recovery candidate ended as ${lastStatus.state}:${lastStatus.attempt}`,
+      );
+    }
+    await delay(POLL_INTERVAL_MS);
+  }
+
+  return lastStatus && ["claimed", "running"].includes(lastStatus.state)
+    ? lastStatus
+    : undefined;
 }
 
 async function registerJobAgent(
@@ -825,6 +1169,10 @@ async function cleanup(): Promise<void> {
   if (rootToRemove && process.env.KEEP_E2E_ROOT !== KEEP_ROOT) {
     await rm(rootToRemove, { recursive: true, force: true });
   }
+  if (originalFetch) {
+    globalThis.fetch = originalFetch;
+    originalFetch = undefined;
+  }
 }
 
 function delay(milliseconds: number): Promise<void> {
@@ -839,8 +1187,9 @@ async function main(): Promise<void> {
     process.env.DATA_PORTABILITY_SERVER_CONTRACT ??
       PERSONAL_SERVER_REGISTRATION_DEFAULT_VERIFYING_CONTRACT,
   );
-  const identityPort = await freePort(DEFAULT_AGENT_PORT);
-  const identityAgent = await startAgent(ctx, identityPort);
+  const identityAgent = ctx.remote
+    ? undefined
+    : await startAgent(ctx, await freePort(DEFAULT_AGENT_PORT));
   let identity: IdentityResponse | undefined;
   let builder: RegisteredBuilder | undefined;
   let grantId: Hex | undefined;
@@ -933,13 +1282,19 @@ async function main(): Promise<void> {
       (body) => record(body)?.sealed === true,
       "Expected the master signature to be sealed",
     );
-    stopAgent(identityAgent);
+    if (identityAgent) stopAgent(identityAgent);
   });
 
-  await runStep("5", "register and admit node A", ["4"], async () => {
-    agentA = await registerJobAgent(ctx, "node-a");
-    return `nodeId=${agentA.nodeId}`;
-  });
+  await runStep(
+    "5",
+    ctx.remote ? "verify remote nodes" : "register and admit node A",
+    ["4"],
+    async () => {
+      if (ctx.remote) return verifyRemoteNodes(ctx);
+      agentA = await registerJobAgent(ctx, "node-a");
+      return `nodeId=${agentA.nodeId}`;
+    },
+  );
 
   await runStep("6", "register builder", ["5"], async () => {
     builder = await registerBuilder(ctx);
@@ -951,34 +1306,42 @@ async function main(): Promise<void> {
     return `grantId=${grantId}`;
   });
 
+  let expectedVersion: string | undefined;
   await runStep("8", "seed one record", ["7"], async () => {
-    await seedRecord(ctx);
-    await access(join(sandboxRoot(ctx), "index.db"));
+    expectedVersion = await seedRecord(ctx);
+    if (!ctx.remote) await access(join(sandboxRoot(ctx), "index.db"));
+    return expectedVersion ? `expectedVersion=${expectedVersion}` : undefined;
   });
 
   let completedJob: CreatedJob | undefined;
   await runStep("9", "submit and decrypt raw read", ["8"], async () => {
-    completedJob = await createJob({
+    const completed = await submitAndDecrypt(
       ctx,
-      identity: identity!.identity,
-      builder: builder!.account,
-      grantId: grantId!,
-    });
-    const result = await submitJob(
-      ctx,
-      builder!.account,
-      completedJob,
-      JOB_WAIT_SECONDS,
+      identity!.identity,
+      builder!,
+      grantId!,
+      expectedVersion,
     );
-    const status = jobFromResult(result);
-    requireResponse(
-      result,
-      HTTP_OK,
-      () => status?.state === "completed" && status.attempt === 1,
-      "Expected the raw read job to complete inline on attempt 1",
-    );
-    await assertResult(ctx, builder!.privateKey, status!);
+    completedJob = completed.job;
+    return `submit_ms=${completed.submitMs}`;
   });
+
+  if (ctx.warmRuns > 0) {
+    await runStep("9w", "warm submit and decrypt cycles", ["9"], async () => {
+      const timings: number[] = [];
+      for (let run = 0; run < ctx.warmRuns; run += 1) {
+        const completed = await submitAndDecrypt(
+          ctx,
+          identity!.identity,
+          builder!,
+          grantId!,
+          expectedVersion,
+        );
+        timings.push(completed.submitMs);
+      }
+      return `warm_ms=${timings.join(",")}`;
+    });
+  }
 
   await runStep("10", "enforce job status ownership", ["9"], async () => {
     const own = await getJob(
@@ -1094,6 +1457,17 @@ async function main(): Promise<void> {
   });
 
   await runStep("13", "recover an expired lease", ["12"], async () => {
+    if (ctx.remote) {
+      if (!ctx.recovery) return "skipped: E2E_RECOVERY unset";
+      return recoverRemoteLease(
+        ctx,
+        identity!.identity,
+        builder!,
+        grantId!,
+        expectedVersion,
+      );
+    }
+
     stopAgent(agentA!);
     const agentB = await registerJobAgent(ctx, "node-b", LEASE_WORK_DELAY_MS);
     const recoveryJob = await createJob({
@@ -1128,7 +1502,7 @@ async function main(): Promise<void> {
         `Expected attempt-2 completion, received ${status.state}:${status.attempt}`,
       );
     }
-    await assertResult(ctx, builder!.privateKey, status);
+    await assertResult(ctx, builder!.privateKey, status, expectedVersion);
   });
 
   printSummary();

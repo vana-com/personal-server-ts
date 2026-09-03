@@ -61,6 +61,9 @@ function startJobs(
     baseUrl: config.gatewayUrl,
     nodeId: config.nodeId,
     nodeSecret: config.nodeSecret,
+    ...(config.gatewayBypassSecret
+      ? { fetch: gatewayFetch(config.gatewayBypassSecret) }
+      : {}),
   });
   const logger = CONSOLE_LOGGER;
   const claimLoop = startClaimLoop({
@@ -71,6 +74,10 @@ function startJobs(
         gateway,
         registry,
         image: config.image,
+        gatewayUrl: config.gatewayUrl,
+        ...(config.gatewayBypassSecret
+          ? { gatewayBypassSecret: config.gatewayBypassSecret }
+          : {}),
         leaseSeconds: config.leaseSeconds,
         sync: config.sync,
         logger,
@@ -100,6 +107,18 @@ function startJobs(
 
       return drainPromise;
     },
+  };
+}
+
+function gatewayFetch(secret: string): typeof fetch {
+  return (input, init) => {
+    const headers = new Headers(
+      input instanceof Request ? input.headers : undefined,
+    );
+    new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
+    headers.set("x-vercel-protection-bypass", secret);
+
+    return fetch(input, { ...init, headers });
   };
 }
 

@@ -21,6 +21,8 @@ export const SANDBOX_ENV_KEYS = [
   "PS_ACCESS_TOKEN",
   "PS_SERVER_ADDRESS",
   "PS_SERVER_PUBLIC_KEY",
+  "GATEWAY_URL",
+  "VERCEL_PROTECTION_BYPASS",
 ] as const;
 
 export type SandboxEnvKey = (typeof SANDBOX_ENV_KEYS)[number];

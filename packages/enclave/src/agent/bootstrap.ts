@@ -34,6 +34,7 @@ export interface AgentJobsConfig {
   fakeRoot?: string;
   sync: SandboxSyncMode;
   workDelayMs: number;
+  gatewayBypassSecret?: string;
 }
 
 export interface AgentConfig {
@@ -126,6 +127,9 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
       : {}),
     sync,
     workDelayMs,
+    ...(env.VERCEL_PROTECTION_BYPASS
+      ? { gatewayBypassSecret: env.VERCEL_PROTECTION_BYPASS }
+      : {}),
   };
 }
 

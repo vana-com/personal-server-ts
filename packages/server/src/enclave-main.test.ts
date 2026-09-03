@@ -29,6 +29,7 @@ describe("readEnclaveEnv", () => {
     vi.clearAllMocks();
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
 
     if (originalOwnerKey === undefined) {
       delete process.env.VANA_OWNER_PRIVATE_KEY;
@@ -95,4 +96,51 @@ describe("readEnclaveEnv", () => {
       expect(config.sync.enabled).toBe(expected);
     },
   );
+
+  it("uses the sandbox gateway and adds preview bypass only for its origin", async () => {
+    const config = ServerConfigSchema.parse({});
+    const context = {
+      app: { fetch: vi.fn() },
+      logger: { info: vi.fn() },
+      startBackgroundServices: vi.fn(),
+      cleanup: vi.fn(),
+    };
+    const requestFetch = vi.fn().mockResolvedValue(new Response());
+    serviceMocks.loadConfig.mockResolvedValue(config);
+    serviceMocks.createServer.mockResolvedValue(context);
+    serviceMocks.listenHttpServer.mockResolvedValue({ close: vi.fn() });
+    vi.spyOn(process, "on").mockImplementation(() => process);
+    vi.stubGlobal("fetch", requestFetch);
+    vi.stubEnv("VANA_MASTER_KEY_SIGNATURE", MASTER_SIGNATURE);
+    vi.stubEnv("PS_ACCESS_TOKEN", "sandbox-token");
+    vi.stubEnv("PS_SERVER_ADDRESS", SERVER_ADDRESS);
+    vi.stubEnv("PS_SERVER_PUBLIC_KEY", SERVER_PUBLIC_KEY);
+    vi.stubEnv("GATEWAY_URL", "https://preview.example/base");
+    vi.stubEnv("VERCEL_PROTECTION_BYPASS", "preview-secret");
+
+    await runEnclaveMain();
+    await fetch("https://preview.example/v1/data", {
+      headers: { Accept: "application/json" },
+    });
+    await fetch("https://storage.example/file");
+
+    expect(config.gateway.url).toBe("https://preview.example/base");
+    expect(requestFetch).toHaveBeenNthCalledWith(
+      1,
+      "https://preview.example/v1/data",
+      expect.objectContaining({ headers: expect.any(Headers) }),
+    );
+    const protectedHeaders = new Headers(
+      requestFetch.mock.calls[0]?.[1]?.headers,
+    );
+    expect(protectedHeaders.get("accept")).toBe("application/json");
+    expect(protectedHeaders.get("x-vercel-protection-bypass")).toBe(
+      "preview-secret",
+    );
+    expect(requestFetch).toHaveBeenNthCalledWith(
+      2,
+      "https://storage.example/file",
+      undefined,
+    );
+  });
 });

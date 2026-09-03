@@ -60,6 +60,16 @@ export async function runEnclaveMain(): Promise<void> {
   const enclaveEnv = readEnclaveEnv(process.env);
   const rootPath = process.env.PERSONAL_SERVER_ROOT_PATH;
   const config = await loadConfig({ rootPath });
+  if (process.env.GATEWAY_URL) {
+    config.gateway.url = process.env.GATEWAY_URL;
+  }
+  // Preview-testing hook; production fetch behaviour is unchanged when unset.
+  if (process.env.VERCEL_PROTECTION_BYPASS) {
+    installGatewayBypass(
+      config.gateway.url,
+      process.env.VERCEL_PROTECTION_BYPASS,
+    );
+  }
   config.sync.enabled = process.env.SYNC_ENABLED !== SYNC_DISABLED;
   config.devUi.enabled = false;
   config.tunnel.enabled = false;
@@ -92,4 +102,25 @@ export async function runEnclaveMain(): Promise<void> {
   };
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
+}
+
+function installGatewayBypass(gatewayUrl: string, secret: string): void {
+  const gatewayOrigin = new URL(gatewayUrl).origin;
+  const requestFetch = globalThis.fetch;
+  globalThis.fetch = (input, init) => {
+    const requestUrl = new URL(
+      input instanceof Request ? input.url : input.toString(),
+    );
+    if (requestUrl.origin !== gatewayOrigin) {
+      return requestFetch(input, init);
+    }
+
+    const headers = new Headers(
+      input instanceof Request ? input.headers : undefined,
+    );
+    new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
+    headers.set("x-vercel-protection-bypass", secret);
+
+    return requestFetch(input, { ...init, headers });
+  };
 }

@@ -189,6 +189,8 @@ async function createFixture(): Promise<Fixture> {
     gateway,
     registry,
     image: "personal-server:test",
+    gatewayUrl: "https://gateway.example",
+    gatewayBypassSecret: "preview-secret",
     leaseSeconds: 30,
     sync: "disabled",
     logger: { info: vi.fn(), warn: vi.fn() },
@@ -270,18 +272,24 @@ describe("runJob", () => {
         PS_SERVER_ADDRESS: fixture.identity.enclaveAddress,
         PS_SERVER_PUBLIC_KEY: fixture.identity.enclavePublicKey,
         SYNC_ENABLED: "false",
+        GATEWAY_URL: "https://gateway.example",
+        VERCEL_PROTECTION_BYPASS: "preview-secret",
       },
     });
     expect(fixture.runtime.specs[0]?.env.PS_ACCESS_TOKEN).toMatch(
       /^[0-9a-f]{64}$/,
     );
-    expect(Object.keys(fixture.runtime.specs[0]?.env ?? {}).sort()).toEqual([
-      "PS_ACCESS_TOKEN",
-      "PS_SERVER_ADDRESS",
-      "PS_SERVER_PUBLIC_KEY",
-      "SYNC_ENABLED",
-      "VANA_MASTER_KEY_SIGNATURE",
-    ]);
+    expect(Object.keys(fixture.runtime.specs[0]?.env ?? {}).sort()).toEqual(
+      [
+        "PS_ACCESS_TOKEN",
+        "PS_SERVER_ADDRESS",
+        "PS_SERVER_PUBLIC_KEY",
+        "SYNC_ENABLED",
+        "VANA_MASTER_KEY_SIGNATURE",
+        "VERCEL_PROTECTION_BYPASS",
+        "GATEWAY_URL",
+      ].sort(),
+    );
     expect(fixture.keyFill).toHaveBeenCalledWith(0);
   });
 
