@@ -211,7 +211,7 @@ Tests: `tests/identity-handlers.test.ts` mocking `../db/index.js` and the agent 
 5. **unity-surfaces A** `feat(account): enclave delivery intent` — files in section 4; SDK bump to pr-tag; route tests mirroring `intents/personal-server-owner-binding/sign/__tests__/route.test.ts`.
 6. **unity-surfaces B** `feat(web): enclave consent and Personal Server screen` — enclave client, consent UI, two user states.
 
-## 6. Resolved 2026-09-02
+## 6. Resolved 2026-09-02, confirmed 2026-09-03 (Kahtaf)
 
 1. **Auth on `POST /v1/identity` and `/secret`: unauthenticated in v1.** Web has no silent generic request signer; the Agent's owner-recovery check authenticates the secret; per-owner and per-IP limits land with `lib/rate-limit` (step 4).
 2. **Trust anchors for the browser**: constants in `protocol/identity.ts` keyed by chainId (1480, 14800); Gateway env is authoritative; mismatch fails closed.
@@ -219,6 +219,11 @@ Tests: `tests/identity-handlers.test.ts` mocking `../db/index.js` and the agent 
 4. **Register before seal.** _On_ requires both; a sealed-but-unregistered row is harmless and retried.
 5. **`composeHash` recorded, not enforced** in step 2; enforcement joins the `tee_nodes` measurement policy.
 6. **Gateway stays SDK-free at runtime**: identity DTOs mirrored in `lib/identity-types.ts`; the SDK is a devDependency for a shape-equality test (local `file:` during development, published pr-tag before merge).
+7. **`kmsRootFingerprint = keccak256(uncompressed KMS root)`** everywhere; the SDK compares anchors in compressed form and accepts either encoding; Gateway env accepts both.
+8. **DCAP quote verification stays at step 4.** Until then the owner/chain/epoch binding lives only in `report_data`; the bearer-authenticated Gateway-to-agent channel is the backstop.
+9. **Fleet replicas share one `app_id`** (a different `app_id` cannot decrypt the fleet's jobs); each replica gets its own `NODE_ID`/`NODE_SECRET` via `phala cvms replicate -e <env-file>`.
+10. **Account builds against throwaway vana-sdk #208** (main + escrow #186 + #207, dist-tag `pr-208`) until #186 merges; close #208 then.
+11. **Web consent panel** ships behind `NEXT_PUBLIC_PS_ENCLAVE_ENABLED` (default off), copy marked draft in `enclave-copy.ts`, revoke disabled until the SDK has a deregistration builder.
 
 ### Critical files
 

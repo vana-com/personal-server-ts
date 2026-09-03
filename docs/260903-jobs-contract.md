@@ -1,6 +1,6 @@
 # Jobs contract (step 1, derisking slice)
 
-Status: design, 2026-09-03. Section 7 answers are recommendations applied overnight; Kahtaf confirms or reopens.
+Status: design, 2026-09-03. Section 7 answers confirmed by Kahtaf 2026-09-03.
 Parent: `260901-personal-server-gateway-enclave-architecture.md` decisions 3, 9, 13, 15, 19, 20, 22-24 (lines 29, 38, 42, 47, 54-59); Job model (:122-130); Workflows 2, 4, 5 (:149-185); Invariants (:187-194). Spikes 3 and 4 (`260902-enclave-spike-results.md` :145-262). Extends `260902-identity-contract.md` (agent surface :25-29, Gateway env :197). Repos: `/Users/kahtaf/Documents/workspace_vana/{vana-sdk-identity,data-gateway-identity,personal-server-ts-enclave}` (+ spikes `data-gateway-spike-jobs`, `personal-server-ts-spike-sandbox`).
 
 ## 1. Flow
@@ -284,10 +284,13 @@ tee_nodes: id varchar(128) PK, app_id varchar(42) NN, compose_hash varchar(66) N
 
 Level-A run order: SDK build → GW `dev:pg` + `0053` + `0054` + `dev:server` → agent (`DSTACK_FAKE=1 SANDBOX_RUNTIME=fake`) → `POST /v1/tee-nodes` + admit → `npm run e2e:job` → second agent for the lease-recovery step.
 
-## 7. Open questions (recommended answers applied 2026-09-03, pending confirmation)
+## 7. Open questions (answers applied overnight, confirmed 2026-09-03 by Kahtaf)
 
 1. **PS signing inside the sandbox.** Recommend: never in v1 (section 4b); no agent signing endpoint. Revisit if step-4 receipts need `signRecordDataAccess`.
 2. **Inline result cap.** Recommend 1 MiB inline (spike `complete.ts:18`, base64 text validated to 1 MB, spike :191); `result_handles` table created empty; R2 v1.1.
 3. **Long-poll vs 1 s poll.** Recommend `claim?wait=25` with a 1 s server-side re-check: same DB statement count as the 1 s poll, ~25x fewer invocations, submit→claim p95 ≈ 1 s with one idle node; fall back to 1 s client poll (`jobs-worker.ts:25`) if Vercel function-seconds on the held claim exceed the invocation savings in the preview run (decision 20 trigger).
 4. **Node bearer vs signed heartbeats.** Recommend per-node bearer (`secret_hash`) for v1, generated before `phala deploy` so no env update rotates `compose_hash`; attested node sessions (DCAP, `lib/tee`) replace it in step 4 (spike `http.ts:41-45` TODO).
 5. **Sandboxes per CVM.** Recommend `SANDBOX_MAX=20` on `tdx.2xlarge` for v1 and raise only after a concurrent-density measurement (240 is RAM-only, spike :254); idle TTL 10 min.
+6. **Builder auth binding.** Confirmed: `auth.bodyHash = sha256(canonicalJobRequestBytes(request))` (keys sorted recursively, no whitespace, UTF-8); audience = configured Gateway origin.
+7. **Admission ignores grant and builder `status`/`paymentStatus`** (`lib/jobs/admission.ts`). Confirmed for this slice; enforced together with payments at step 4.
+8. **Public API changes in personal-server-ts #245** approved under the visibility rule: `redactEnvelopeForGrantee` exported, sync adapter `reads` option, `createServer` `profile`/`serverAccount`, `AppDeps.profile`/`AppDeps.jobWorker`, `createSyncManager` `transferMode`.
