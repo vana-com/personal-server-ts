@@ -128,4 +128,24 @@ then claims and completes the same job as attempt 2, which the driver asserts.
 `WORK_DELAY_MS` artificially delays every job and is only for this test. Leave
 it unset on production nodes and on the fast recovery node.
 
+## Builder-only run
+
+Use builder-only mode to verify a registered builder against an existing grant
+from a real owner flow without access to the owner's private key:
+
+```sh
+E2E_BUILDER_ONLY=1 \
+E2E_REMOTE=1 \
+E2E_SKIP_BUILDER_REGISTRATION=1 \
+GATEWAY_URL=https://gateway.example \
+OWNER_ADDRESS=0x... \
+GRANT_ID=0x... \
+BUILDER_PRIVATE_KEY=0x... \
+npm run e2e:job
+```
+
+Set `SCOPE` to select a granted scope (the first grant scope is used by
+default), and set `E2E_BUILDER_ONLY_NEGATIVES=1` to also test a wrong builder
+signature. Existing Gateway bypass, chain, and contract overrides still apply.
+
 The last command prints the uncompressed KMS root key; use that form for the Gateway's `ENCLAVE_KMS_ROOT_PUBKEY`. Configure the Gateway with `ENCLAVE_AGENT_URL`, `ENCLAVE_AGENT_SECRET`, `ENCLAVE_KMS_ROOT_PUBKEY`, and `ENCLAVE_APP_ID_ALLOWLIST=0x<app_id>`.

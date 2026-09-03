@@ -41,7 +41,7 @@ import {
   type IdentityResponse,
   type SealedSecretSubmission,
 } from "@opendatalabs/vana-sdk/protocol/identity";
-import { getAddress, isHex, type Hex } from "viem";
+import { getAddress, isAddress, isHex, type Address, type Hex } from "viem";
 import {
   generatePrivateKey,
   privateKeyToAccount,
@@ -120,6 +120,23 @@ const OWNER_RECORD = { hello: "jobs", n: 1 } as const;
 const DECRYPT_FAILURE_REASON = "REQUEST_INVALID";
 const SHA256 = "sha256";
 const JOB_FAILURE_CODES = new Set(["AUTH_INVALID", "BUILDER_MISMATCH"]);
+const E2E_BUILDER_ONLY_ENV = "E2E_BUILDER_ONLY";
+const E2E_BUILDER_ONLY_NEGATIVES_ENV = "E2E_BUILDER_ONLY_NEGATIVES";
+const E2E_SKIP_BUILDER_REGISTRATION_ENV = "E2E_SKIP_BUILDER_REGISTRATION";
+const E2E_REMOTE_ENV = "E2E_REMOTE";
+const OWNER_ADDRESS_ENV = "OWNER_ADDRESS";
+const OWNER_PRIVATE_KEY_ENV = "OWNER_PRIVATE_KEY";
+const BUILDER_PRIVATE_KEY_ENV = "BUILDER_PRIVATE_KEY";
+const GRANT_ID_ENV = "GRANT_ID";
+const SCOPE_ENV = "SCOPE";
+const E2E_RECOVERY_ENV = "E2E_RECOVERY";
+const E2E_WARM_RUNS_ENV = "E2E_WARM_RUNS";
+
+// Builder-only mode verifies our registered builder against a grant created by
+// a real owner flow without requiring or controlling the owner's private key.
+// Set E2E_BUILDER_ONLY=1, E2E_REMOTE=1, E2E_SKIP_BUILDER_REGISTRATION=1,
+// OWNER_ADDRESS, GRANT_ID, and BUILDER_PRIVATE_KEY; SCOPE and negatives are
+// optional.
 
 interface AgentProcess {
   child: ChildProcess;
@@ -151,6 +168,21 @@ interface JobContext {
   recovery: boolean;
 }
 
+interface BuilderOnlyContext {
+  gatewayUrl: string;
+  chainId: number;
+  gatewayConfig: DataPortabilityGatewayConfig;
+  ownerAddress: Address;
+  ecies: NodeECIESProvider;
+  builder: PrivateKeyAccount;
+  builderPrivateKey: Hex;
+  grantId: Hex;
+  scope?: string;
+  negatives: boolean;
+}
+
+type JobClientContext = Pick<JobContext, "gatewayUrl" | "ecies">;
+
 interface RegisteredBuilder {
   account: PrivateKeyAccount;
   id: Hex;
@@ -158,10 +190,11 @@ interface RegisteredBuilder {
 }
 
 interface JobEnvelopeOptions {
-  ctx: JobContext;
+  ctx: JobContext | BuilderOnlyContext;
   identity: IdentityResponse["identity"];
   builder: PrivateKeyAccount;
   grantId: Hex;
+  scope?: string;
   authSigner?: PrivateKeyAccount;
   encryptionKey?: Hex;
 }
@@ -206,6 +239,74 @@ function hexKey(raw: string | undefined): Hex {
   }
 
   return key;
+}
+
+function requiredEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`${name} is required in builder-only mode`);
+
+  return value;
+}
+
+function requiredHex(name: string): Hex {
+  const value = requiredEnv(name) as Hex;
+  if (!isHex(value) || value.length !== 66) {
+    throw new Error(`${name} must be a 32-byte 0x-prefixed hex value`);
+  }
+
+  return value;
+}
+
+function buildBuilderOnlyContext(): BuilderOnlyContext {
+  if (process.env[OWNER_PRIVATE_KEY_ENV] !== undefined) {
+    throw new Error(
+      `${OWNER_PRIVATE_KEY_ENV} has no meaning in builder-only mode`,
+    );
+  }
+  if (process.env[E2E_RECOVERY_ENV] !== undefined) {
+    throw new Error(`${E2E_RECOVERY_ENV} has no meaning in builder-only mode`);
+  }
+  if (nonnegativeInt(process.env[E2E_WARM_RUNS_ENV], 0) !== 0) {
+    throw new Error(
+      `${E2E_WARM_RUNS_ENV} must be unset or zero in builder-only mode`,
+    );
+  }
+
+  const rawOwnerAddress = requiredEnv(OWNER_ADDRESS_ENV);
+  if (!isAddress(rawOwnerAddress)) {
+    throw new Error(`${OWNER_ADDRESS_ENV} must be a valid EVM address`);
+  }
+  const grantId = requiredHex(GRANT_ID_ENV);
+  const builderPrivateKey = requiredHex(BUILDER_PRIVATE_KEY_ENV);
+  if (process.env[E2E_REMOTE_ENV] !== REMOTE_ENABLED) {
+    throw new Error(
+      `${E2E_REMOTE_ENV}=1 is required when ${E2E_BUILDER_ONLY_ENV}=1`,
+    );
+  }
+  if (process.env[E2E_SKIP_BUILDER_REGISTRATION_ENV] !== TRUE_VALUE) {
+    throw new Error(
+      `Builder registration requires an owner signature; set ${E2E_SKIP_BUILDER_REGISTRATION_ENV}=1 in builder-only mode`,
+    );
+  }
+  const chainId = positiveInt(process.env.CHAIN_ID, DEFAULT_CHAIN_ID);
+  const gatewayUrl = (process.env.GATEWAY_URL ?? DEFAULT_GATEWAY_URL).replace(
+    /\/+$/,
+    "",
+  );
+  installGatewayBypass(gatewayUrl, process.env.VERCEL_PROTECTION_BYPASS);
+
+  return {
+    gatewayUrl,
+    chainId,
+    gatewayConfig: gatewayConfigFor(chainId),
+    ownerAddress: getAddress(rawOwnerAddress),
+    ecies: new NodeECIESProvider(),
+    builder: privateKeyToAccount(builderPrivateKey),
+    builderPrivateKey,
+    grantId,
+    scope: process.env[SCOPE_ENV],
+    negatives: process.env[E2E_BUILDER_ONLY_NEGATIVES_ENV] === TRUE_VALUE,
+  };
 }
 
 async function buildContext(): Promise<JobContext> {
@@ -862,14 +963,18 @@ async function buildAuth(
 async function createJob(options: JobEnvelopeOptions): Promise<CreatedJob> {
   const jobId = randomUUID();
   const deadline = new Date(Date.now() + JOB_DEADLINE_MS).toISOString();
+  const ownerAddress =
+    "owner" in options.ctx
+      ? options.ctx.owner.address
+      : options.ctx.ownerAddress;
   const request: JobRequest = {
     v: FIRST_EPOCH,
     jobId,
-    owner: options.ctx.owner.address,
+    owner: ownerAddress,
     builder: options.builder.address,
     builderPublicKey: options.builder.publicKey,
     grantId: options.grantId,
-    scope: JOB_SCOPE,
+    scope: options.scope ?? JOB_SCOPE,
     operation: RAW_READ,
     pinnedVersion: null,
     deadline,
@@ -908,7 +1013,7 @@ async function createJob(options: JobEnvelopeOptions): Promise<CreatedJob> {
 }
 
 async function submitJob(
-  ctx: JobContext,
+  ctx: JobClientContext,
   builder: PrivateKeyAccount,
   job: CreatedJob,
   waitSeconds: number,
@@ -937,7 +1042,7 @@ function jobFromResult(result: HttpResult): JobStatus | undefined {
 }
 
 async function getJob(
-  ctx: JobContext,
+  ctx: JobClientContext,
   builder: PrivateKeyAccount,
   jobId: string,
 ): Promise<HttpResult> {
@@ -950,7 +1055,7 @@ async function getJob(
 }
 
 async function pollJob(
-  ctx: JobContext,
+  ctx: JobClientContext,
   builder: PrivateKeyAccount,
   jobId: string,
   timeoutMs: number,
@@ -1188,7 +1293,165 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
 }
 
+async function runBuilderOnly(ctx: BuilderOnlyContext): Promise<void> {
+  let identity: IdentityResponse["identity"] | undefined;
+  let scope: string | undefined;
+
+  await runStep("B1", "fetch sealed identity", [], async () => {
+    const result = await requestJson(
+      "GET",
+      `${ctx.gatewayUrl}/v1/identity?owner=${encodeURIComponent(ctx.ownerAddress)}&chainId=${ctx.chainId}`,
+    );
+    const fetchedIdentity = record(record(result.response.body)?.identity);
+    requireResponse(
+      result,
+      HTTP_OK,
+      () => fetchedIdentity?.state === "sealed",
+      "Expected the owner identity to be sealed",
+    );
+    identity = fetchedIdentity as unknown as IdentityResponse["identity"];
+  });
+
+  await runStep("B2", "verify builder grant", ["B1"], async () => {
+    const builderResult = await requestJson(
+      "GET",
+      `${ctx.gatewayUrl}/v1/builders/${encodeURIComponent(ctx.builder.address)}`,
+    );
+    const builder = record(record(builderResult.response.body)?.data);
+    requireResponse(
+      builderResult,
+      HTTP_OK,
+      () => typeof builder?.id === "string" && isHex(builder.id),
+      "Expected the registered builder to include an id",
+    );
+
+    const grantResult = await requestJson(
+      "GET",
+      `${ctx.gatewayUrl}/v1/grants/${encodeURIComponent(ctx.grantId)}`,
+    );
+    const grant = record(record(grantResult.response.body)?.data);
+    requireResponse(
+      grantResult,
+      HTTP_OK,
+      () =>
+        typeof grant?.granteeId === "string" &&
+        grant.granteeId.toLowerCase() === String(builder!.id).toLowerCase() &&
+        grant.revokedAt == null &&
+        typeof grant.scopes === "string",
+      "Expected an active grant for the registered builder",
+    );
+
+    const parsedScopes = JSON.parse(grant!.scopes as string) as unknown;
+    if (
+      !Array.isArray(parsedScopes) ||
+      parsedScopes.length === 0 ||
+      parsedScopes.some((value) => typeof value !== "string")
+    ) {
+      throw new Error("Grant scopes must be a non-empty JSON string array");
+    }
+    scope = ctx.scope ?? parsedScopes[0];
+    if (!parsedScopes.includes(scope)) {
+      throw new Error(`Scope ${scope} is not present in the grant`);
+    }
+
+    return `builderId=${String(builder!.id)} scope=${scope}`;
+  });
+
+  await runStep("B3", "submit and decrypt raw read", ["B2"], async () => {
+    const job = await createJob({
+      ctx,
+      identity: identity!,
+      builder: ctx.builder,
+      grantId: ctx.grantId,
+      scope,
+    });
+    const submittedAt = performance.now();
+    const result = await submitJob(ctx, ctx.builder, job, JOB_WAIT_SECONDS);
+    let status = jobFromResult(result);
+    if (result.response.status === HTTP_ACCEPTED) {
+      status = await pollJob(
+        ctx,
+        ctx.builder,
+        job.request.jobId,
+        JOB_TIMEOUT_MS,
+      );
+    } else {
+      requireResponse(
+        result,
+        HTTP_OK,
+        () => status !== undefined,
+        "Expected an inline or queued job response",
+      );
+    }
+    const submitMs = Math.round(performance.now() - submittedAt);
+    if (status?.state !== "completed") {
+      throw new Error(
+        `Job ended as ${status?.state ?? "unknown"}:${status?.failureReason ?? "unknown"}`,
+      );
+    }
+    if (!status.resultCiphertext) {
+      throw new Error("Completed job did not include resultCiphertext");
+    }
+
+    const opened = await openJobResult(
+      status.resultCiphertext,
+      ctx.builderPrivateKey,
+      ctx.ecies,
+      { jobId: status.jobId, scope: scope! },
+    );
+    if (opened.contentType !== JSON_CONTENT_TYPE) {
+      throw new Error(`Unexpected result content type ${opened.contentType}`);
+    }
+    const envelope = record(
+      JSON.parse(Buffer.from(opened.body, "base64").toString("utf8")),
+    );
+    const payload = envelope?.data;
+    const shape = Array.isArray(payload)
+      ? `record_count=${payload.length}`
+      : `payload_not_list top_level_keys=${Object.keys(record(payload) ?? {}).length}`;
+
+    return `${shape} scope=${scope} version=${opened.version} submit_ms=${submitMs}`;
+  });
+
+  await runStep("B4", "reject wrong builder key", ["B3"], async () => {
+    if (!ctx.negatives) {
+      return `skipped: ${E2E_BUILDER_ONLY_NEGATIVES_ENV} unset`;
+    }
+    const wrongAuth = await createJob({
+      ctx,
+      identity: identity!,
+      builder: ctx.builder,
+      grantId: ctx.grantId,
+      scope,
+      authSigner: privateKeyToAccount(generatePrivateKey()),
+    });
+    await submitJob(ctx, ctx.builder, wrongAuth, JOB_WAIT_SECONDS);
+    const status = await pollJob(
+      ctx,
+      ctx.builder,
+      wrongAuth.request.jobId,
+      JOB_TIMEOUT_MS,
+    );
+    if (
+      status.state !== "failed" ||
+      !JOB_FAILURE_CODES.has(status.failureReason ?? "")
+    ) {
+      throw new Error(
+        `Unexpected wrong-auth outcome ${status.state}:${status.failureReason}`,
+      );
+    }
+  });
+
+  printSummary();
+  process.exitCode = hasStepFailures() ? EXIT_FAILURE : EXIT_SUCCESS;
+}
+
 async function main(): Promise<void> {
+  if (process.env[E2E_BUILDER_ONLY_ENV] === TRUE_VALUE) {
+    await runBuilderOnly(buildBuilderOnlyContext());
+    return;
+  }
+
   const ctx = await buildContext();
   cleanupContext = ctx;
   const anchors = fakeGatewayAnchors();
