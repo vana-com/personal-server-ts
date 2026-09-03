@@ -9,6 +9,7 @@ export NODE_ID=node-1
 export GATEWAY_URL=https://gateway.example
 export PS_IMAGE=vanaorg/personal-server@sha256:...
 scripts/tee/provision.sh <name> --ref <40-hex-commit-sha>
+scripts/tee/replicate.sh <name> <source-cvm-uuid> --node-id <phala-placement-id>
 scripts/tee/destroy.sh <uuid>
 node scripts/tee/kms-root.mjs
 ```
@@ -48,6 +49,28 @@ curl -fsS -X POST "$GATEWAY_URL/v1/tee-nodes" \
   -H 'Content-Type: application/json' \
   --data @node-registration.json
 ```
+
+## Replicating a fleet node
+
+Use `replicate.sh` to add a cheaper replica that retains the source CVM's
+`app_id`, so dstack derives the same owner job keys. Export the same fleet
+settings used for provisioning (`ENCLAVE_AGENT_SECRET`, `GATEWAY_URL`,
+`GIT_REF`, `PS_IMAGE`, and any optional sandbox settings); the script generates
+a fresh 32-byte `NODE_SECRET`. Its `--node-id` is the numeric Phala placement
+ID, while `--tee-node-id` is the identity registered with the Gateway and
+defaults to `<name>`.
+
+A fresh `provision.sh` deploy creates an independent `app_id`; use that only
+when the new node should deliberately be unable to decrypt the fleet's jobs.
+All nodes serving one owner's jobs must otherwise be replicas under one
+`app_id`.
+
+The registration payload's `nodeId` must exactly equal the CVM's baked
+`NODE_ID`. The script uses one value for both, but do not hand-edit it: a typo
+or a hand-edited registration nodeId that differs from the CVM's baked
+`NODE_ID` just looks like a heartbeat that never arrives — no error surfaces
+anywhere. `/agent/v1/health` does not expose `NODE_ID`, so there is no live
+cross-check.
 
 The agent begins node heartbeats immediately. Once a fresh heartbeat records
 the expected compose hash, admit the node:

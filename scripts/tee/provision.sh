@@ -16,6 +16,7 @@ shift
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
+source "$script_dir/common.sh"
 git_ref=main
 node_id=18
 inline_compose="$repo_root/deploy/dstack/docker-compose.enclave.inline.yml"
@@ -112,9 +113,7 @@ fi
 [[ $app_id =~ ^[0-9a-fA-F]{40}$ ]] || { echo "app_id must be 40 hexadecimal characters" >&2; exit 1; }
 [[ $nonce =~ ^[0-9]+$ ]] || { echo "nonce must be a non-negative integer" >&2; exit 1; }
 
-env_file=$(mktemp)
-chmod 600 "$env_file"
-trap 'rm -f "$env_file"' EXIT
+create_secure_env_file
 printf 'ENCLAVE_AGENT_SECRET=%s\nGIT_REF=%s\n' \
   "$ENCLAVE_AGENT_SECRET" "$git_ref" >"$env_file"
 if [[ $identity_only == false ]]; then
@@ -206,18 +205,5 @@ printf 'uuid=%s\napp_id=%s\nnonce=%s\nagent_url=%s\nagent_url_source=%s\n' \
 
 if [[ $identity_only == false ]]; then
   capacity=${SANDBOX_MAX:-20}
-  echo "Register this node with POST /v1/tee-nodes using this payload:"
-  node -e '
-    const [nodeId, appId, composeHash, publicUrl, capacity] = process.argv.slice(1);
-    const payload = {
-      nodeId,
-      appId: appId.startsWith("0x") ? appId : `0x${appId}`,
-      ...(composeHash ? { composeHash: composeHash.startsWith("0x") ? composeHash : `0x${composeHash}` } : {}),
-      publicUrl,
-      capacity: Number(capacity),
-      secret: "<NODE_SECRET: send once>",
-    };
-    process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
-  ' "$NODE_ID" "$app_id" "$compose_hash" "$agent_url" "$capacity"
-  echo "Replace the secret placeholder in the registration body once; NODE_SECRET is not printed."
+  print_registration_payload "$NODE_ID" "$app_id" "$compose_hash" "$agent_url" "$capacity"
 fi
