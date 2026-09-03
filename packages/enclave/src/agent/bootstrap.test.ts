@@ -72,6 +72,31 @@ describe("agentConfigFromEnv", () => {
     });
   });
 
+  it("warns when an artificial work delay is enabled", () => {
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+
+    agentConfigFromEnv({
+      DSTACK_FAKE: "1",
+      ENCLAVE_AGENT_SECRET: "agent-secret",
+      GATEWAY_URL: "https://gateway.example",
+      NODE_ID: "node-1",
+      NODE_SECRET: "node-secret",
+      PS_IMAGE: TAGGED_IMAGE,
+      SANDBOX_RUNTIME: "fake",
+      WORK_DELAY_MS: "120000",
+    });
+
+    expect(consoleError).toHaveBeenCalledWith({
+      level: "warn",
+      workDelayMs: 120_000,
+      message:
+        "WORK_DELAY_MS=120000ms is set — this node artificially delays every job; do not use in production",
+    });
+    consoleError.mockRestore();
+  });
+
   it("stays identity-only when the jobs credentials are incomplete", () => {
     const config = agentConfigFromEnv({
       DSTACK_FAKE: "1",

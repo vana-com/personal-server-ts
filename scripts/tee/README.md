@@ -87,4 +87,27 @@ curl -fsS -X POST "$AGENT_URL/agent/v1/drain" \
   -H "Authorization: Bearer $ENCLAVE_AGENT_SECRET"
 ```
 
+## Remote lease-recovery test
+
+Provision the slow node with `WORK_DELAY_MS=120000`, then unset it before
+provisioning or replicating the fast node. Run the remote e2e with
+`E2E_REMOTE=1`, `E2E_RECOVERY=1`, and both registration IDs in `E2E_NODE_IDS`.
+
+```sh
+export NODE_ID=slow-node
+export WORK_DELAY_MS=120000
+scripts/tee/provision.sh slow-node --ref <40-hex-commit-sha>
+unset WORK_DELAY_MS
+scripts/tee/replicate.sh fast-node <slow-node-cvm-uuid> --node-id <phala-placement-id>
+E2E_REMOTE=1 E2E_RECOVERY=1 E2E_NODE_IDS=slow-node,fast-node npm run e2e:job
+```
+
+The driver detects the slow node's `claimed` or `running` job within 15 seconds
+and prints `RECOVERY_JOB <id> in flight on the slow node; stop that node now`.
+At that point, drain the slow node with `POST /agent/v1/drain`. The fast node
+then claims and completes the same job as attempt 2, which the driver asserts.
+
+`WORK_DELAY_MS` artificially delays every job and is only for this test. Leave
+it unset on production nodes and on the fast recovery node.
+
 The last command prints the uncompressed KMS root key; use that form for the Gateway's `ENCLAVE_KMS_ROOT_PUBKEY`. Configure the Gateway with `ENCLAVE_AGENT_URL`, `ENCLAVE_AGENT_SECRET`, `ENCLAVE_KMS_ROOT_PUBKEY`, and `ENCLAVE_APP_ID_ALLOWLIST=0x<app_id>`.

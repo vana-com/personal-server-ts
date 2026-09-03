@@ -123,6 +123,13 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
   if (runtime === "docker" && gatewayUrl.protocol !== HTTPS_PROTOCOL) {
     throw new Error(DOCKER_GATEWAY_ERROR);
   }
+  if (workDelayMs > MIN_NONNEGATIVE_INTEGER) {
+    console.error({
+      level: "warn",
+      workDelayMs,
+      message: `WORK_DELAY_MS=${workDelayMs}ms is set — this node artificially delays every job; do not use in production`,
+    });
+  }
 
   return {
     gatewayUrl: env.GATEWAY_URL,

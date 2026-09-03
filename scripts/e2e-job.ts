@@ -1045,6 +1045,9 @@ async function submitAndDecrypt(
   return { job, submitMs };
 }
 
+// Provision one remote node with WORK_DELAY_MS=120000 and keep the other fast.
+// Once this detects claimed/running within 15s and prints the stop instruction,
+// drain the slow node; the fast node must complete the same job on attempt 2.
 async function recoverRemoteLease(
   ctx: JobContext,
   identity: IdentityResponse["identity"],
