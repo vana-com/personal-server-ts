@@ -39,6 +39,7 @@ import { executeJob, JobFailure, type JobWorkerDeps } from "./worker.js";
 const NOW = new Date("2026-09-03T12:00:00.000Z");
 const DEADLINE = "2026-09-03T12:05:00.000Z";
 const SCOPE = "instagram.profile";
+const AUTH_AUDIENCE = "http://localhost:8080";
 const RECORD_VALUE = "TOP_SECRET_RECORD";
 const GRANTEE_ID = `0x${"44".repeat(32)}` as const;
 const GRANT_ID = `0x${"55".repeat(32)}` as const;
@@ -213,6 +214,7 @@ async function createFixture(): Promise<Fixture> {
     serverOwner: owner.address,
     serverAddress: server.address,
     serverPublicKey: server.publicKey,
+    authAudience: AUTH_AUDIENCE,
     gateway,
     gatewayConfig,
     storage,
@@ -228,10 +230,11 @@ async function createFixture(): Promise<Fixture> {
 async function signRequest(
   request: JobRequestEnvelope["request"],
   signer = builder,
+  audience = AUTH_AUDIENCE,
 ): Promise<string> {
   return buildWeb3SignedHeader({
     wallet: signer,
-    aud: "http://localhost:8080",
+    aud: audience,
     method: "POST",
     uri: "/v1/jobs/execute",
     body: canonicalJobRequestBytes(request),
@@ -310,6 +313,17 @@ describe("executeJob", () => {
     expect(fixture.deps.accessLogWriter.write).toHaveBeenCalledWith(
       expect.objectContaining({ grantId: GRANT_ID, scope: SCOPE }),
     );
+  });
+
+  it("rejects builder auth for another audience", async () => {
+    const fixture = await createFixture();
+    fixture.envelope.auth = await signRequest(
+      fixture.envelope.request,
+      builder,
+      "https://other.example",
+    );
+
+    await expectFailure(fixture, "AUTH_INVALID");
   });
 
   it("reports every contract failure code with the required retryability", async () => {

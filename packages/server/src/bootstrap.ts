@@ -71,6 +71,8 @@ import {
 } from "@opendatalabs/personal-server-ts-core/derivatives";
 import { executeJob } from "./jobs/worker.js";
 
+const TRAILING_SLASHES = /\/+$/;
+
 export interface ServerContext {
   app: Hono;
   logger: Logger;
@@ -565,6 +567,7 @@ export async function createServer(
             serverOwner,
             serverAddress: serverAccount.address,
             serverPublicKey: serverAccount.publicKey,
+            authAudience: config.gateway.url.replace(TRAILING_SLASHES, ""),
             gateway: gatewayClient,
             gatewayConfig: config.gateway,
             storage: dataStorage,

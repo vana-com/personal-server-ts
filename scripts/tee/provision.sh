@@ -78,6 +78,10 @@ else
     echo "PS_IMAGE must be an image digest such as vanaorg/personal-server@sha256:<64 hex characters>" >&2
     exit 1
   fi
+  if [[ ! $git_ref =~ ^[[:xdigit:]]{40}$ ]]; then
+    echo "--ref must be a 40-hex commit SHA for the enclave compose; branch names are mutable" >&2
+    exit 1
+  fi
 fi
 
 if [[ -n $app_id || -n $nonce ]]; then

@@ -8,7 +8,7 @@ export NODE_SECRET="$(openssl rand -hex 32)"
 export NODE_ID=node-1
 export GATEWAY_URL=https://gateway.example
 export PS_IMAGE=vanaorg/personal-server@sha256:...
-scripts/tee/provision.sh <name> --ref feat/enclave-jobs
+scripts/tee/provision.sh <name> --ref <40-hex-commit-sha>
 scripts/tee/destroy.sh <uuid>
 node scripts/tee/kms-root.mjs
 ```
@@ -20,11 +20,19 @@ from this branch's root `Dockerfile`; do not use a tag. The previously published
 digest lacks the runtime Vana SDK dependency and exits with
 `ERR_MODULE_NOT_FOUND @opendatalabs/vana-sdk`.
 
-The compose clones `GIT_REF` (default `main`); pass `--ref <branch>` to test a
-branch. `SANDBOX_MAX`, `SANDBOX_IDLE_TTL_SECONDS`, and `LEASE_SECONDS` are
-optional and default to 20, 600, and 30. Use `--inline` (or pass the inline
-compose with `--compose`) for the old identity-only deployment; it requires
-only `ENCLAVE_AGENT_SECRET`.
+For the enclave compose, `--ref` must be an immutable 40-hex commit SHA. The
+level-B clone bootstrap fetches that exact commit and verifies the checkout;
+production follows architecture decision 23 and uses a digest-pinned agent
+image under one approved compose hash. `SANDBOX_MAX`,
+`SANDBOX_IDLE_TTL_SECONDS`, and `LEASE_SECONDS` are optional and default to 20,
+600, and 30. Use `--inline` (or pass the inline compose with `--compose`) for the
+old identity-only deployment; it keeps branch-name support and requires only
+`ENCLAVE_AGENT_SECRET`.
+
+The nested Docker daemon binds its unauthenticated TCP API to the private
+compose interface. Firewall rules drop Docker API traffic originating from
+`docker0` and `br-+`, and `--icc=false` prevents Personal Server sandboxes from
+talking directly to one another.
 
 The provisioner prints a registration payload without revealing `NODE_SECRET`.
 Save it as `node-registration.json`, replace its placeholder once, and register

@@ -10,6 +10,7 @@ const REQUIRED_ENV = [
   "PS_SERVER_ADDRESS",
   "PS_SERVER_PUBLIC_KEY",
 ] as const;
+const SYNC_DISABLED = "false";
 
 export interface EnclaveEnv {
   ownerSignature: Hex;
@@ -59,6 +60,7 @@ export async function runEnclaveMain(): Promise<void> {
   const enclaveEnv = readEnclaveEnv(process.env);
   const rootPath = process.env.PERSONAL_SERVER_ROOT_PATH;
   const config = await loadConfig({ rootPath });
+  config.sync.enabled = process.env.SYNC_ENABLED !== SYNC_DISABLED;
   config.devUi.enabled = false;
   config.tunnel.enabled = false;
 

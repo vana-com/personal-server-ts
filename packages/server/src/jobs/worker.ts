@@ -23,7 +23,6 @@ import {
 } from "@opendatalabs/personal-server-ts-core/policy";
 import type { ScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
 import {
-  parseWeb3SignedHeader,
   verifyWeb3Signed,
   type DataPortabilityGatewayConfig,
 } from "@opendatalabs/vana-sdk/node";
@@ -54,6 +53,7 @@ export interface JobWorkerDeps {
   serverOwner: Address;
   serverAddress: Address;
   serverPublicKey: Hex;
+  authAudience: string;
   gateway: ProtocolGatewayPort;
   gatewayConfig: DataPortabilityGatewayConfig;
   storage: DataStoragePort;
@@ -107,7 +107,7 @@ async function executeJobUnsafe(
     throw new JobFailure("DEADLINE_PASSED", "job deadline passed", false);
   }
 
-  const auth = await verifyJobAuth(envelope, now);
+  const auth = await verifyJobAuth(envelope, deps.authAudience, now);
   if (!sameAddress(auth.signer, request.builder)) {
     throw new JobFailure(
       "BUILDER_MISMATCH",
@@ -260,14 +260,14 @@ async function executeJobUnsafe(
 
 async function verifyJobAuth(
   envelope: JobRequestEnvelope,
+  authAudience: string,
   now: Date,
 ): Promise<{ signer: Address }> {
   try {
-    const parsed = parseWeb3SignedHeader(envelope.auth);
-
+    // aud = Gateway origin; contract section 1 step 1 amendment.
     return await verifyWeb3Signed({
       headerValue: envelope.auth,
-      expectedOrigin: parsed.payload.aud,
+      expectedOrigin: authAudience,
       expectedMethod: POST,
       expectedPath: EXECUTE_PATH,
       bodyBytes: canonicalJobRequestBytes(envelope.request),
