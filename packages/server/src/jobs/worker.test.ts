@@ -356,6 +356,39 @@ describe("executeJob", () => {
     await expectFailure(fixture, "SERVER_NOT_REGISTERED");
   });
 
+  it("retries transport failures while reading the grant", async () => {
+    const fixture = await createFixture();
+    vi.mocked(fixture.gateway.getGrant).mockRejectedValue(
+      new Error("Gateway error: 503"),
+    );
+
+    await expectFailure(fixture, "INTERNAL", true);
+  });
+
+  it("retries transport failures while reading the builder", async () => {
+    const fixture = await createFixture();
+    vi.mocked(fixture.gateway.getBuilder).mockRejectedValue(
+      new Error("Gateway error: 503"),
+    );
+
+    await expectFailure(fixture, "INTERNAL", true);
+  });
+
+  it("rejects a registration for another server public key", async () => {
+    const fixture = await createFixture();
+    vi.mocked(fixture.gateway.getServer).mockResolvedValue({
+      id: "server-1",
+      ownerAddress: owner.address,
+      serverAddress: server.address,
+      publicKey: builderAccount.publicKey,
+      serverUrl: AUTH_AUDIENCE,
+      addedAt: NOW.toISOString(),
+      revokedAt: null,
+    });
+
+    await expectFailure(fixture, "SERVER_NOT_REGISTERED");
+  });
+
   it("reports every contract failure code with the required retryability", async () => {
     const scenarios: Array<{
       code: JobFailure["code"];

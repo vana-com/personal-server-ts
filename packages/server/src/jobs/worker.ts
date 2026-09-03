@@ -8,6 +8,7 @@ import {
   DataDeletedError,
   GrantRevokedError,
   InvalidSignatureError,
+  ProtocolError,
   SignedArtifactInvalidError,
   SignedArtifactMissingError,
   UnregisteredBuilderError,
@@ -48,6 +49,7 @@ const POST = "POST";
 const JSON_CONTENT_TYPE = "application/json";
 const UNKNOWN_METADATA = "unknown";
 const MILLISECONDS_PER_SECOND = 1_000;
+const JOB_EXECUTION_FAILED_LOG = "Enclave job execution failed";
 
 export interface JobWorkerDeps {
   serverOwner: Address;
@@ -86,6 +88,10 @@ export async function executeJob(
       throw error;
     }
 
+    deps.logger.warn(
+      { jobId: envelope.request.jobId, error: errorSummary(error) },
+      JOB_EXECUTION_FAILED_LOG,
+    );
     throw new JobFailure("INTERNAL", "job execution failed", true);
   }
 }
@@ -174,7 +180,8 @@ async function executeJobUnsafe(
   if (
     !registration ||
     registration.revokedAt !== null ||
-    !sameAddress(registration.ownerAddress, deps.serverOwner)
+    !sameAddress(registration.ownerAddress, deps.serverOwner) ||
+    registration.publicKey.toLowerCase() !== deps.serverPublicKey.toLowerCase()
   ) {
     throw new JobFailure(
       "SERVER_NOT_REGISTERED",
@@ -293,8 +300,11 @@ function mapPolicyFailure(error: unknown): JobFailure {
       false,
     );
   }
+  if (error instanceof ProtocolError) {
+    return new JobFailure("GRANT_INVALID", "grant is invalid", false);
+  }
 
-  return new JobFailure("GRANT_INVALID", "grant is invalid", false);
+  return new JobFailure("INTERNAL", "policy verification failed", true);
 }
 
 function mapArtifactFailure(error: unknown): JobFailure {
@@ -315,12 +325,21 @@ function mapArtifactFailure(error: unknown): JobFailure {
       false,
     );
   }
+  if (error instanceof ProtocolError) {
+    return new JobFailure(
+      "SIGNED_ARTIFACT_INVALID",
+      "signed artifact is invalid",
+      false,
+    );
+  }
 
-  return new JobFailure(
-    "SIGNED_ARTIFACT_INVALID",
-    "signed artifact is invalid",
-    false,
-  );
+  return new JobFailure("INTERNAL", "artifact verification failed", true);
+}
+
+function errorSummary(error: unknown): string {
+  return error instanceof Error
+    ? `${error.name}: ${error.message}`
+    : String(error);
 }
 
 function validDeadline(deadline: string, now: Date): boolean {
