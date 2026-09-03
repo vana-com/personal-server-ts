@@ -1,5 +1,8 @@
 import { agentConfigFromEnv } from "./bootstrap.js";
 
+const TAGGED_IMAGE = "personal-server:test";
+const DIGEST_IMAGE = `personal-server@sha256:${"a".repeat(64)}`;
+
 describe("agentConfigFromEnv", () => {
   it("boots the fake with the default app id", async () => {
     const config = agentConfigFromEnv({
@@ -39,7 +42,7 @@ describe("agentConfigFromEnv", () => {
       GATEWAY_URL: "https://gateway.example",
       NODE_ID: "node-1",
       NODE_SECRET: "node-secret",
-      PS_IMAGE: "personal-server:test",
+      PS_IMAGE: TAGGED_IMAGE,
       SANDBOX_RUNTIME: "fake",
       SANDBOX_FAKE_ROOT: "/tmp/sandboxes",
       PS_ENTRY: "/tmp/server.js",
@@ -56,7 +59,7 @@ describe("agentConfigFromEnv", () => {
       nodeId: "node-1",
       nodeSecret: "node-secret",
       runtime: "fake",
-      image: "personal-server:test",
+      image: TAGGED_IMAGE,
       sandboxMax: 4,
       idleTtlMs: 9_000,
       leaseSeconds: 60,
@@ -87,7 +90,7 @@ describe("agentConfigFromEnv", () => {
       GATEWAY_URL: "https://gateway.example",
       NODE_ID: "node-1",
       NODE_SECRET: "node-secret",
-      PS_IMAGE: "personal-server:test",
+      PS_IMAGE: DIGEST_IMAGE,
     });
 
     expect(config.jobs).toMatchObject({
@@ -98,6 +101,50 @@ describe("agentConfigFromEnv", () => {
       dockerHost: "tcp://sandbox-runtime:2375",
       sync: "enabled",
       workDelayMs: 0,
+    });
+  });
+
+  it("rejects a tagged image for the docker runtime", () => {
+    expect(() =>
+      agentConfigFromEnv({
+        DSTACK_FAKE: "1",
+        ENCLAVE_AGENT_SECRET: "agent-secret",
+        GATEWAY_URL: "https://gateway.example",
+        NODE_ID: "node-1",
+        NODE_SECRET: "node-secret",
+        PS_IMAGE: TAGGED_IMAGE,
+      }),
+    ).toThrow("PS_IMAGE must use a sha256 digest for the docker runtime");
+  });
+
+  it("rejects an insecure gateway URL for the docker runtime", () => {
+    expect(() =>
+      agentConfigFromEnv({
+        DSTACK_FAKE: "1",
+        ENCLAVE_AGENT_SECRET: "agent-secret",
+        GATEWAY_URL: "http://gateway.example",
+        NODE_ID: "node-1",
+        NODE_SECRET: "node-secret",
+        PS_IMAGE: DIGEST_IMAGE,
+      }),
+    ).toThrow("GATEWAY_URL must use https for the docker runtime");
+  });
+
+  it("accepts a tagged image and http gateway for the fake runtime", () => {
+    const config = agentConfigFromEnv({
+      DSTACK_FAKE: "1",
+      ENCLAVE_AGENT_SECRET: "agent-secret",
+      GATEWAY_URL: "http://gateway.example",
+      NODE_ID: "node-1",
+      NODE_SECRET: "node-secret",
+      PS_IMAGE: TAGGED_IMAGE,
+      SANDBOX_RUNTIME: "fake",
+    });
+
+    expect(config.jobs).toMatchObject({
+      gatewayUrl: "http://gateway.example",
+      image: TAGGED_IMAGE,
+      runtime: "fake",
     });
   });
 
@@ -114,7 +161,7 @@ describe("agentConfigFromEnv", () => {
         GATEWAY_URL: "https://gateway.example",
         NODE_ID: "node-1",
         NODE_SECRET: "node-secret",
-        PS_IMAGE: "personal-server:test",
+        PS_IMAGE: TAGGED_IMAGE,
         [name]: value,
       }),
     ).toThrow(expected);
