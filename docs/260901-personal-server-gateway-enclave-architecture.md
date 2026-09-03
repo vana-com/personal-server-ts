@@ -314,7 +314,7 @@ Done in parts on 2026-09-02 (Spikes 1 to 4, `docs/260902-enclave-spike-results.m
 
 Resolved 2026-09-02: owner-approved question intents; blob reads stay public; sealed ciphertext in Gateway Postgres; raw-read version pinned at admission; attestation via Gateway admission plus KMS cert chain; no second wrap; 5 min revocation staleness window.
 
-Step 2 contract (endpoints, SDK types, tables, signing intents, PR order): `260902-identity-contract.md`. Resolved there 2026-09-02: identity endpoints unauthenticated in v1; sealing AAD and key paths carry the epoch; Gateway mirrors SDK identity types with a devDependency shape test.
+Step 2 contract (endpoints, SDK types, tables, signing intents, PR order): `260902-identity-contract.md`. Step 1 slice contract (jobs, tee-nodes, sandbox lifecycle, worker, e2e): `260903-jobs-contract.md`. Resolved there 2026-09-02: identity endpoints unauthenticated in v1; sealing AAD and key paths carry the epoch; Gateway mirrors SDK identity types with a devDependency shape test.
 
 ## Review log
 
