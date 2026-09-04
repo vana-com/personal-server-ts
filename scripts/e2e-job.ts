@@ -117,10 +117,10 @@ const GRANT_VERSION_FRESH = 3n;
 const GRANT_EXPIRY_SECONDS_FROM_NOW = 365 * 24 * 60 * 60;
 const JSON_CONTENT_TYPE = "application/json";
 const FAKE_IMAGE = "unused-in-level-a";
-const OWNER_RECORD = { hello: "jobs", n: 1 } as const;
 const DECRYPT_FAILURE_REASON = "REQUEST_INVALID";
 const SHA256 = "sha256";
 const JOB_FAILURE_CODES = new Set(["AUTH_INVALID", "BUILDER_MISMATCH"]);
+const E2E_RECORD_BYTES_ENV = "E2E_RECORD_BYTES";
 const E2E_BUILDER_ONLY_ENV = "E2E_BUILDER_ONLY";
 const E2E_BUILDER_ONLY_NEGATIVES_ENV = "E2E_BUILDER_ONLY_NEGATIVES";
 const E2E_SKIP_BUILDER_REGISTRATION_ENV = "E2E_SKIP_BUILDER_REGISTRATION";
@@ -132,6 +132,24 @@ const GRANT_ID_ENV = "GRANT_ID";
 const SCOPE_ENV = "SCOPE";
 const E2E_RECOVERY_ENV = "E2E_RECOVERY";
 const E2E_WARM_RUNS_ENV = "E2E_WARM_RUNS";
+const PAD_PATTERN =
+  "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+interface OwnerRecord {
+  hello: "jobs";
+  n: 1;
+  pad?: string;
+}
+
+// DATA_INGEST_MAX_SIZE is 50 MiB, so exercise the large fixture at 48_000_000.
+// Build this once per run so local and remote seeding reuse the same large string.
+const OWNER_RECORD = buildOwnerRecord(
+  nonnegativeInt(process.env[E2E_RECORD_BYTES_ENV], 0),
+);
+const OWNER_RECORD_JSON = JSON.stringify(OWNER_RECORD);
+const OWNER_RECORD_HASH = createHash(SHA256)
+  .update(OWNER_RECORD_JSON)
+  .digest("hex");
 
 // Builder-only mode verifies our registered builder against a grant created by
 // a real owner flow without requiring or controlling the owner's private key.
@@ -231,6 +249,24 @@ function nonnegativeInt(raw: string | undefined, fallback: number): number {
   }
 
   return value;
+}
+
+function buildOwnerRecord(targetBytes: number): OwnerRecord {
+  if (targetBytes === 0) return { hello: "jobs", n: 1 };
+
+  const empty = JSON.stringify({ hello: "jobs", n: 1, pad: "" });
+  const emptyBytes = Buffer.byteLength(empty);
+  if (targetBytes < emptyBytes - 16) {
+    throw new Error(
+      `${E2E_RECORD_BYTES_ENV} must be 0 or at least ${emptyBytes - 16}`,
+    );
+  }
+  const padBytes = Math.max(0, targetBytes - emptyBytes);
+  const pad = PAD_PATTERN.repeat(
+    Math.ceil(padBytes / PAD_PATTERN.length),
+  ).slice(0, padBytes);
+
+  return { hello: "jobs", n: 1, pad };
 }
 
 function hexKey(raw: string | undefined): Hex {
@@ -788,7 +824,7 @@ async function seedRecord(ctx: JobContext): Promise<string | undefined> {
     gatewayClient: seedGateway(),
   });
   try {
-    const rawBody = JSON.stringify(OWNER_RECORD);
+    const rawBody = OWNER_RECORD_JSON;
     const authorization = await buildAuth(
       ctx.owner,
       origin,
@@ -856,7 +892,7 @@ async function seedRemoteRecord(ctx: JobContext): Promise<string> {
     if (!server.syncManager) {
       throw new Error("Remote seed server did not start its sync manager");
     }
-    const rawBody = JSON.stringify(OWNER_RECORD);
+    const rawBody = OWNER_RECORD_JSON;
     const authorization = await buildAuth(
       ctx.owner,
       origin,
@@ -1099,16 +1135,21 @@ async function pollJob(
 
 async function assertResult(
   ctx: JobContext,
+  builder: PrivateKeyAccount,
   builderKey: Hex,
   status: JobStatus,
   expectedVersion?: string,
-): Promise<void> {
-  const result = await fetchAndOpenResult(
-    ctx.ecies,
+  submittedAt = performance.now(),
+) {
+  const fetched = await fetchAndOpenResult(
+    ctx,
+    builder,
     builderKey,
     status,
     JOB_SCOPE,
+    submittedAt,
   );
+  const { result } = fetched;
   if (typeof result.version !== "string") {
     throw new Error("Job result version was not a string");
   }
@@ -1122,37 +1163,101 @@ async function assertResult(
   }
   const envelope = record(JSON.parse(new TextDecoder().decode(result.body)));
   const data = record(envelope?.data);
-  if (data?.hello !== OWNER_RECORD.hello || data.n !== OWNER_RECORD.n) {
-    throw new Error("Decrypted job result did not contain the seeded record");
+  const dataJson = JSON.stringify(data);
+  const dataHash =
+    dataJson === undefined
+      ? undefined
+      : createHash(SHA256).update(dataJson).digest("hex");
+  if (dataHash !== OWNER_RECORD_HASH) {
+    throw new Error("Decrypted job result did not equal the seeded record");
   }
   if ("$writtenBy" in (data ?? {})) {
     throw new Error("Job result disclosed owner-only $writtenBy metadata");
   }
+
+  return fetched;
 }
 
 async function fetchAndOpenResult(
-  ecies: NodeECIESProvider,
+  ctx: JobClientContext & { chainId: number },
+  builder: PrivateKeyAccount,
   builderKey: Hex,
   status: JobStatus,
   scope: string,
+  submittedAt = performance.now(),
 ) {
   if (!status.result) {
     throw new Error("Completed job did not include a result object handle");
   }
-  const response = await fetch(status.result.url);
+  const expectedObjectKey = `jobresults/${ctx.chainId}/${status.jobId}`;
+  if (status.result.objectKey !== expectedObjectKey) {
+    throw new Error(
+      `Unexpected result object key ${status.result.objectKey}; expected ${expectedObjectKey}`,
+    );
+  }
+  const objectUrl = new URL(status.result.url);
+  const expectedPath = `/v1/job-results/${ctx.chainId}/${status.jobId}`;
+  if (!objectUrl.pathname.endsWith(expectedPath)) {
+    throw new Error(
+      `Unexpected result object URL path ${objectUrl.pathname}; expected suffix ${expectedPath}`,
+    );
+  }
+
+  const rawStatus = await getJob(ctx, builder, status.jobId);
+  requireResponse(
+    rawStatus,
+    HTTP_OK,
+    (body) => record(record(body)?.job)?.state === "completed",
+    "Expected completed raw job status",
+  );
+  if (JSON.stringify(rawStatus.response.body).includes('"resultCiphertext"')) {
+    throw new Error("Raw job status disclosed resultCiphertext");
+  }
+
+  const fetchStartedAt = performance.now();
+  const response = await fetch(status.result.url, { method: "GET" });
+  const ttfbMs = Math.round(performance.now() - submittedAt);
   if (!response.ok) {
     throw new Error(`Result object GET failed with status ${response.status}`);
   }
   const bytes = new Uint8Array(await response.arrayBuffer());
+  const fetchMs = Math.round(performance.now() - fetchStartedAt);
   const hash = `0x${createHash("sha256").update(bytes).digest("hex")}`;
   if (bytes.byteLength !== status.result.size || hash !== status.result.hash) {
     throw new Error("Result object metadata did not match the sealed bytes");
   }
 
-  return openJobResult(bytes, builderKey, ecies, {
+  const head = await fetch(status.result.url, { method: "HEAD" });
+  if (
+    head.status !== HTTP_OK ||
+    head.headers.get("content-length") !== String(status.result.size)
+  ) {
+    throw new Error("Result object HEAD metadata did not match status size");
+  }
+
+  for (const suffix of ["", "/"]) {
+    const listingUrl = `${objectUrl.origin}/v1/job-results/${ctx.chainId}${suffix}`;
+    const listing = await fetch(listingUrl, { method: "GET" });
+    const listingBody = await listing.text();
+    if (listing.ok || listingBody.includes(status.jobId)) {
+      throw new Error(`Result object collection was exposed at ${listingUrl}`);
+    }
+  }
+
+  const decryptStartedAt = performance.now();
+  const result = await openJobResult(bytes, builderKey, ctx.ecies, {
     jobId: status.jobId,
     scope,
   });
+  const decryptMs = Math.round(performance.now() - decryptStartedAt);
+
+  return {
+    result,
+    ttfbMs,
+    fetchMs,
+    decryptMs,
+    resultSize: bytes.byteLength,
+  };
 }
 
 async function submitAndDecrypt(
@@ -1161,7 +1266,14 @@ async function submitAndDecrypt(
   builder: RegisteredBuilder,
   grantId: Hex,
   expectedVersion: string | undefined,
-): Promise<{ job: CreatedJob; submitMs: number }> {
+): Promise<{
+  job: CreatedJob;
+  submitMs: number;
+  ttfbMs: number;
+  fetchMs: number;
+  decryptMs: number;
+  resultSize: number;
+}> {
   const job = await createJob({
     ctx,
     identity,
@@ -1178,9 +1290,16 @@ async function submitAndDecrypt(
     () => status?.state === "completed" && status.attempt === 1,
     "Expected the raw read job to complete inline on attempt 1",
   );
-  await assertResult(ctx, builder.privateKey, status!, expectedVersion);
+  const fetched = await assertResult(
+    ctx,
+    builder.account,
+    builder.privateKey,
+    status!,
+    expectedVersion,
+    submittedAt,
+  );
 
-  return { job, submitMs };
+  return { job, submitMs, ...fetched };
 }
 
 // Provision one remote node with WORK_DELAY_MS=120000 and keep the other fast.
@@ -1233,7 +1352,13 @@ async function recoverRemoteLease(
         `Expected attempt-2 completion, received ${status.state}:${status.attempt}`,
       );
     }
-    await assertResult(ctx, builder.privateKey, status, expectedVersion);
+    await assertResult(
+      ctx,
+      builder.account,
+      builder.privateKey,
+      status,
+      expectedVersion,
+    );
 
     return `jobId=${recoveryJob.request.jobId}`;
   }
@@ -1419,12 +1544,15 @@ async function runBuilderOnly(ctx: BuilderOnlyContext): Promise<void> {
         `Job ended as ${status?.state ?? "unknown"}:${status?.failureReason ?? "unknown"}`,
       );
     }
-    const opened = await fetchAndOpenResult(
-      ctx.ecies,
+    const fetched = await fetchAndOpenResult(
+      ctx,
+      ctx.builder,
       ctx.builderPrivateKey,
       status,
       scope!,
+      submittedAt,
     );
+    const { result: opened } = fetched;
     if (opened.contentType !== JSON_CONTENT_TYPE) {
       throw new Error(`Unexpected result content type ${opened.contentType}`);
     }
@@ -1434,7 +1562,7 @@ async function runBuilderOnly(ctx: BuilderOnlyContext): Promise<void> {
       ? `record_count=${payload.length}`
       : `payload_not_list top_level_keys=${Object.keys(record(payload) ?? {}).length}`;
 
-    return `${shape} scope=${scope} version=${opened.version} submit_ms=${submitMs}`;
+    return `${shape} scope=${scope} version=${opened.version} submit_ms=${submitMs} ttfb_ms=${fetched.ttfbMs} fetch_ms=${fetched.fetchMs} decrypt_ms=${fetched.decryptMs} result_size=${fetched.resultSize}`;
   });
 
   await runStep("B4", "reject wrong builder key", ["B3"], async () => {
@@ -1619,7 +1747,7 @@ async function main(): Promise<void> {
       expectedVersion,
     );
     completedJob = completed.job;
-    return `submit_ms=${completed.submitMs}`;
+    return `submit_ms=${completed.submitMs} ttfb_ms=${completed.ttfbMs} fetch_ms=${completed.fetchMs} decrypt_ms=${completed.decryptMs} result_size=${completed.resultSize}`;
   });
 
   if (ctx.warmRuns > 0) {
@@ -1798,7 +1926,13 @@ async function main(): Promise<void> {
         `Expected attempt-2 completion, received ${status.state}:${status.attempt}`,
       );
     }
-    await assertResult(ctx, builder!.privateKey, status, expectedVersion);
+    await assertResult(
+      ctx,
+      builder!.account,
+      builder!.privateKey,
+      status,
+      expectedVersion,
+    );
   });
 
   printSummary();
