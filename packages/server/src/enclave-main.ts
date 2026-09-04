@@ -63,6 +63,22 @@ export async function runEnclaveMain(): Promise<void> {
   if (process.env.GATEWAY_URL) {
     config.gateway.url = process.env.GATEWAY_URL;
   }
+  if (process.env.STORAGE_API_URL) {
+    let storageApiUrl: URL;
+    try {
+      storageApiUrl = new URL(process.env.STORAGE_API_URL);
+    } catch {
+      throw new Error("STORAGE_API_URL must be a valid absolute https URL");
+    }
+    if (storageApiUrl.protocol !== "https:") {
+      throw new Error("STORAGE_API_URL must be a valid absolute https URL");
+    }
+    config.storage.backend = "vana";
+    config.storage.config.vana = {
+      ...config.storage.config.vana,
+      apiUrl: process.env.STORAGE_API_URL,
+    };
+  }
   // Preview-testing hook; production fetch behaviour is unchanged when unset.
   if (process.env.VERCEL_PROTECTION_BYPASS) {
     installGatewayBypass(

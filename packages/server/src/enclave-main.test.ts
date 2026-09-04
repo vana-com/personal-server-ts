@@ -22,6 +22,26 @@ const MASTER_SIGNATURE = `0x${"11".repeat(65)}`;
 const SERVER_ADDRESS = "0x2222222222222222222222222222222222222222";
 const SERVER_PUBLIC_KEY = `0x04${"33".repeat(64)}`;
 
+function prepareEnclaveRun() {
+  const config = ServerConfigSchema.parse({});
+  const context = {
+    app: { fetch: vi.fn() },
+    logger: { info: vi.fn() },
+    startBackgroundServices: vi.fn(),
+    cleanup: vi.fn(),
+  };
+  serviceMocks.loadConfig.mockResolvedValue(config);
+  serviceMocks.createServer.mockResolvedValue(context);
+  serviceMocks.listenHttpServer.mockResolvedValue({ close: vi.fn() });
+  vi.spyOn(process, "on").mockImplementation(() => process);
+  vi.stubEnv("VANA_MASTER_KEY_SIGNATURE", MASTER_SIGNATURE);
+  vi.stubEnv("PS_ACCESS_TOKEN", "sandbox-token");
+  vi.stubEnv("PS_SERVER_ADDRESS", SERVER_ADDRESS);
+  vi.stubEnv("PS_SERVER_PUBLIC_KEY", SERVER_PUBLIC_KEY);
+
+  return config;
+}
+
 describe("readEnclaveEnv", () => {
   const originalOwnerKey = process.env.VANA_OWNER_PRIVATE_KEY;
 
@@ -143,4 +163,38 @@ describe("readEnclaveEnv", () => {
       undefined,
     );
   });
+
+  it("leaves storage configuration unchanged when STORAGE_API_URL is unset", async () => {
+    const config = prepareEnclaveRun();
+    vi.stubEnv("STORAGE_API_URL", undefined);
+
+    await runEnclaveMain();
+
+    expect(config.storage).toEqual({
+      backend: "local",
+      config: { vana: { apiUrl: "https://storage.vana.org" } },
+    });
+  });
+
+  it("uses STORAGE_API_URL as the vana storage backend", async () => {
+    const config = prepareEnclaveRun();
+    vi.stubEnv("STORAGE_API_URL", "https://storage-dev.vana.org");
+
+    await runEnclaveMain();
+
+    expect(config.storage).toEqual({
+      backend: "vana",
+      config: { vana: { apiUrl: "https://storage-dev.vana.org" } },
+    });
+  });
+
+  it.each(["http://storage.example", "storage.example"])(
+    "rejects invalid STORAGE_API_URL %s",
+    async (storageApiUrl) => {
+      prepareEnclaveRun();
+      vi.stubEnv("STORAGE_API_URL", storageApiUrl);
+
+      await expect(runEnclaveMain()).rejects.toThrow("STORAGE_API_URL");
+    },
+  );
 });
