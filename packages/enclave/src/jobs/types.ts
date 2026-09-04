@@ -21,7 +21,7 @@ export {
 } from "@opendatalabs/vana-sdk/protocol/jobs";
 
 export type ClaimResponse = Omit<SdkClaimResponse, "job"> & {
-  job: SdkClaimResponse["job"] & { chainId: number };
+  job: SdkClaimResponse["job"] & { chainId?: number };
 };
 
 // JOB_EXECUTE_WIRE_START

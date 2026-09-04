@@ -270,7 +270,7 @@ function jobError(code: string, retryable: boolean): JobExecuteError {
 }
 
 describe("runJob", () => {
-  it("decrypts, wakes the sandbox, and completes the fenced job", async () => {
+  it("runs a claim with a matching chain id", async () => {
     const fixture = await createFixture();
 
     await runJob(fixture.job, fixture.identity, fixture.deps);
@@ -324,18 +324,39 @@ describe("runJob", () => {
     expect(fixture.keyFill).toHaveBeenCalledWith(0);
   });
 
-  it("rejects a Gateway job for a different sandbox chain", async () => {
+  it("uses the configured chain when the claim omits chainId", async () => {
+    const fixture = await createFixture();
+    delete fixture.job.chainId;
+
+    await runJob(fixture.job, fixture.identity, fixture.deps);
+
+    expect(fixture.gateway.complete).toHaveBeenCalledWith(JOB_ID, {
+      fencingToken: 1,
+      ...RESULT,
+    });
+    expect(fixture.gateway.fail).not.toHaveBeenCalled();
+    expect(fixture.runtime.specs[0]?.env.CHAIN_ID).toBe(String(CHAIN_ID));
+  });
+
+  it("fails a Gateway job for a different sandbox chain", async () => {
     const fixture = await createFixture();
     fixture.job.chainId = 1480;
 
-    await expect(
-      runJob(fixture.job, fixture.identity, fixture.deps),
-    ).rejects.toMatchObject({
-      name: "SandboxChainMismatchError",
-      expectedChainId: CHAIN_ID,
-      receivedChainId: 1480,
+    await runJob(fixture.job, fixture.identity, fixture.deps);
+
+    expect(fixture.gateway.fail).toHaveBeenCalledWith(JOB_ID, {
+      fencingToken: 1,
+      reason: "CHAIN_MISMATCH",
     });
+    expect(fixture.gateway.complete).not.toHaveBeenCalled();
     expect(fixture.runtime.specs).toHaveLength(0);
+    expect(fixture.deps.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jobId: JOB_ID,
+        error: expect.objectContaining({ name: "SandboxChainMismatchError" }),
+      }),
+      "Enclave job stage failed",
+    );
   });
 
   it("forwards the configured storage API URL to the sandbox", async () => {

@@ -85,11 +85,39 @@ describe("GatewayClient", () => {
     ).rejects.toBeInstanceOf(GatewayHttpError);
   });
 
-  it("rejects a claim without a supported chain id", async () => {
+  it("accepts a deployed Gateway claim without a chain id", async () => {
     responder = () => 200;
     responseBody = {
       job: {
         jobId: JOB_ID,
+        fencingToken: FENCING_TOKEN,
+        requestCiphertext: "ciphertext",
+      },
+      identity: {
+        userPsId: "0x01",
+        epoch: 1,
+        enclaveAddress: "0x1111111111111111111111111111111111111111",
+        enclavePublicKey: "0x02",
+        sealedEnvelope: {},
+      },
+    };
+    const client = createGatewayClient({
+      baseUrl: origin,
+      nodeId: NODE_ID,
+      nodeSecret: NODE_SECRET,
+    });
+
+    await expect(
+      client.claim(25, { leaseSeconds: 30, capacity: 20 }),
+    ).resolves.toEqual(responseBody);
+  });
+
+  it("rejects a claim with an unsupported chain id", async () => {
+    responder = () => 200;
+    responseBody = {
+      job: {
+        jobId: JOB_ID,
+        chainId: 1,
         fencingToken: FENCING_TOKEN,
         requestCiphertext: "ciphertext",
       },

@@ -34,6 +34,7 @@ const MILLISECONDS_PER_SECOND = 1_000;
 const MIN_TIMER_DELAY_MS = 0;
 const INVALID_REQUEST_REASON = "REQUEST_INVALID";
 const DEADLINE_REASON = "DEADLINE_PASSED";
+const CHAIN_MISMATCH_REASON = "CHAIN_MISMATCH";
 const SYNC_ENABLED = "true";
 const SYNC_DISABLED = "false";
 const ENCRYPT_UNAVAILABLE = "ECIES encryption is unavailable";
@@ -47,6 +48,7 @@ const DECRYPT_STAGE = "decrypt";
 const UNSEAL_STAGE = "unseal";
 const SANDBOX_ACQUIRE_STAGE = "sandbox-acquire";
 const COMPLETE_STAGE = "complete";
+const CHAIN_VALIDATION_STAGE = "chain-validation";
 const UNKNOWN_ERROR = "unknown";
 const MAX_ERROR_CAUSES = 5;
 const RESULT_HASH_PATTERN = /^0x[0-9a-fA-F]{64}$/;
@@ -106,8 +108,12 @@ export async function runJob(
   identity: ClaimedIdentity,
   deps: RunJobDeps,
 ): Promise<void> {
-  if (job.chainId !== deps.chainId) {
-    throw new SandboxChainMismatchError(deps.chainId, job.chainId);
+  const jobChainId = job.chainId ?? deps.chainId;
+  if (jobChainId !== deps.chainId) {
+    const error = new SandboxChainMismatchError(deps.chainId, jobChainId);
+    logStageFailure(deps.logger, job.jobId, CHAIN_VALIDATION_STAGE, error);
+    await failJob(job, CHAIN_MISMATCH_REASON, deps.gateway);
+    return;
   }
   const lease = startLease(job, deps);
   const now = deps.now ?? Date.now;

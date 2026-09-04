@@ -171,7 +171,8 @@ function isClaimResponse(value: unknown): value is ClaimResponse {
 
   return (
     typeof value.job.jobId === "string" &&
-    (value.job.chainId === MAINNET_CHAIN_ID ||
+    (value.job.chainId === undefined ||
+      value.job.chainId === MAINNET_CHAIN_ID ||
       value.job.chainId === MOKSHA_CHAIN_ID) &&
     typeof value.job.fencingToken === "number" &&
     typeof value.job.requestCiphertext === "string" &&
