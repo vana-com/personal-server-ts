@@ -29,6 +29,10 @@ RUN npm run build --workspace @opendatalabs/personal-server-ts-core \
 # Prune dev dependencies after build
 RUN npm prune --omit=dev
 
+# npm may hoist every dependency for a workspace, leaving no workspace-local
+# node_modules directory for the legacy builder's runtime-stage COPY commands.
+RUN for d in packages/*; do mkdir -p "$d/node_modules"; done
+
 # ---------- runtime stage ----------
 FROM node:22-alpine
 
