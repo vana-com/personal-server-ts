@@ -67,7 +67,7 @@ export interface PersonalServerDerivativesApiDeps {
     store: QuestionStore;
     scheduler: Pick<
       RecomputeScheduler,
-      "requestRecompute" | "markSourceChanged"
+      "requestRecompute" | "markSourceChanged" | "markDemand"
     > & {
       /**
        * Next scheduled automatic retry of a failed question (ISO time), or
@@ -253,6 +253,14 @@ async function handleStatusRoute(
   if (registrations.length === 0) {
     throw new DerivativeQuestionNotFoundError({ derivedScope });
   }
+  // Demand. Asking for the lifecycle of an answer IS asking for the answer:
+  // a reader that finds the scope stale would otherwise poll a status that
+  // nothing is working towards. Strictly after the authorization above —
+  // an unauthenticated or refused poll must never spend an inference call —
+  // and through the scheduler, which collapses concurrent demand into one
+  // compute. The view below is the state the demand starts from; the run
+  // reports itself through the next poll.
+  scheduler.markDemand(derivedScope);
   // Several registrations may share a derived scope, and data serving is
   // registration-agnostic: if ANY of them is ready, the scope has an answer
   // and the reader must not be told "failed" by a duplicate that never

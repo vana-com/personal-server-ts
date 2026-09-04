@@ -229,13 +229,17 @@ export function createApp(deps: AppDeps): Hono {
       lineageGateway: deps.lineageGateway,
       writeSessionStore,
       writeProofReplayStore,
-      // Recompute on refresh: a new local version of a scope marks every
-      // question that reads it stale.
+      // A new local version of a scope marks every question that reads it
+      // stale; the recompute waits for a reader.
       onDataWritten: deps.derivativeCompute
         ? (event) =>
             deps.derivativeCompute?.scheduler.markSourceChanged(event.scope, {
               lineageSources: event.lineageSources,
             })
+        : undefined,
+      // And an authorized read of a derived scope is that reader.
+      onDataRead: deps.derivativeCompute
+        ? (event) => deps.derivativeCompute?.scheduler.markDemand(event.scope)
         : undefined,
       mountPath: "/v1/data",
     }),

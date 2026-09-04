@@ -12,6 +12,7 @@ function registration(
     sourceScopes: ["oura.sleep", "chatgpt.conversations"],
     question: "How did I sleep?",
     model: null,
+    answerShape: null,
     recompute: "on-change",
     registeredBy: {
       kind: "builder",
@@ -143,6 +144,91 @@ describe("createSqliteQuestionStore", () => {
       registration({ questionId: "q-new", recompute: "snapshot" }),
     );
     expect((await store.get("q-new"))!.recompute).toBe("snapshot");
+    db.close();
+  });
+});
+
+describe("answerShape column", () => {
+  const shape = {
+    fields: [
+      { name: "score", type: "integer" as const, required: true, max: 5 },
+      {
+        name: "mood",
+        type: "enum" as const,
+        required: false,
+        values: ["up", "down"],
+      },
+    ],
+  };
+
+  it("round-trips a declared shape and keeps a free-text question null", async () => {
+    const db = initializeDatabase(":memory:");
+    const store = createSqliteQuestionStore(db);
+    await store.insert(registration({ answerShape: shape }));
+    await store.insert(
+      registration({
+        questionId: "q-free",
+        createdAt: "2026-08-27T00:00:01.000Z",
+      }),
+    );
+    expect((await store.get("q-1"))!.answerShape).toEqual(shape);
+    expect((await store.get("q-free"))!.answerShape).toBeNull();
+    // A status update must not drop the shape: it is not in the UPDATE.
+    await store.update("q-1", {
+      status: "ready",
+      updatedAt: "2026-08-27T01:00:00.000Z",
+    });
+    expect((await store.get("q-1"))!.answerShape).toEqual(shape);
+    db.close();
+  });
+
+  it("migrates a table created before the column existed in place", async () => {
+    const db = initializeDatabase(":memory:");
+    // The table as PR #236 left it, with recompute but no answer_shape.
+    db.exec(`CREATE TABLE derivative_questions (
+      question_id TEXT PRIMARY KEY,
+      derived_scope TEXT NOT NULL,
+      source_scopes TEXT NOT NULL,
+      question TEXT NOT NULL,
+      model TEXT,
+      recompute TEXT NOT NULL DEFAULT 'on-change',
+      registered_by TEXT NOT NULL,
+      status TEXT NOT NULL,
+      error TEXT,
+      error_code TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_computed_at TEXT,
+      derived_version INTEGER,
+      derived_collected_at TEXT
+    )`);
+    db.prepare(
+      `INSERT INTO derivative_questions (
+        question_id, derived_scope, source_scopes, question, registered_by,
+        status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "q-old",
+      "coach.weekly",
+      JSON.stringify(["oura.sleep"]),
+      "How did I sleep?",
+      JSON.stringify({ kind: "owner" }),
+      "ready",
+      "2026-08-27T00:00:00.000Z",
+      "2026-08-27T00:00:00.000Z",
+    );
+
+    const store = createSqliteQuestionStore(db);
+    // A registration written before shapes existed keeps the free-text
+    // answer it was registered with.
+    expect((await store.get("q-old"))!.answerShape).toBeNull();
+    await store.insert(
+      registration({ questionId: "q-new", answerShape: shape }),
+    );
+    expect((await store.get("q-new"))!.answerShape).toEqual(shape);
+    // Opening the store twice must not fail on a second ALTER.
+    createSqliteQuestionStore(db);
+    expect((await createSqliteQuestionStore(db).list()).length).toBe(2);
     db.close();
   });
 });
