@@ -117,6 +117,28 @@ describe("fake sandbox runtime", () => {
     await runtime.stop(handle.id);
   });
 
+  it("stops every in-memory sandbox during boot reconciliation", async () => {
+    const child = fakeChild();
+    const runtime = createFakeRuntime({
+      spawn: vi.fn<SpawnFn>().mockReturnValue(child),
+      health: async () => true,
+      pickPort: async () => 43_213,
+    });
+    const handle = await runtime.start({
+      userPsId: USER_PS_ID,
+      epoch: 6,
+      image: "unused",
+      env: { SYNC_ENABLED: "false" },
+    });
+
+    await runtime.reconcile();
+
+    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+    await expect(runtime.inspect(handle.id)).resolves.toEqual({
+      running: false,
+    });
+  });
+
   it("uses and preserves a deterministic configured root", async () => {
     const parent = await mkdtemp(join(tmpdir(), "ps-fake-root-test-"));
     const expectedRoot = join(parent, `${USER_PS_ID}-5`);

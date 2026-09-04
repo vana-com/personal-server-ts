@@ -54,6 +54,7 @@ function memoryRuntime(): SandboxRuntime & {
   return {
     starts,
     stops,
+    async reconcile() {},
     async start(spec) {
       starts.push(spec);
 
@@ -119,6 +120,31 @@ describe("sandbox registry", () => {
 
     expect(runtime.stops).toEqual([handle.id]);
     expect(registry.activeCount()).toBe(0);
+  });
+
+  it("logs an idle sandbox force-removal failure", async () => {
+    const runtime = memoryRuntime();
+    runtime.stop = vi.fn().mockRejectedValue(new Error("docker unavailable"));
+    const logger = { warn: vi.fn() };
+    const clock = new FakeClock();
+    const registry = createSandboxRegistry({
+      runtime,
+      logger,
+      idleTtlMs: 100,
+      now: clock.now,
+      setTimer: clock.setTimer,
+    });
+    const { handle } = await registry.acquire("owner:1", buildSpec);
+
+    registry.release("owner:1");
+    clock.advance(100);
+    clock.advance(0);
+    await flush();
+
+    expect(logger.warn).toHaveBeenCalledWith(
+      { sandboxId: handle.id, error: "Error: docker unavailable" },
+      "Failed to force-remove sandbox",
+    );
   });
 
   it("cancels teardown when an expiring sandbox is claimed", async () => {

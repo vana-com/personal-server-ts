@@ -24,10 +24,15 @@ export type SetTimer = (
 
 export interface RegistryOptions {
   runtime: SandboxRuntime;
+  logger?: SandboxRegistryLogger;
   max?: number;
   idleTtlMs?: number;
   now?: () => number;
   setTimer?: SetTimer;
+}
+
+export interface SandboxRegistryLogger {
+  warn(context: Record<string, unknown>, message: string): void;
 }
 
 export interface SandboxLease {
@@ -71,6 +76,7 @@ export function createSandboxRegistry(
   const max = options.max ?? SANDBOX_MAX;
   const idleTtlMs =
     options.idleTtlMs ?? SANDBOX_IDLE_TTL_SECONDS * MILLISECONDS_PER_SECOND;
+  const logger = options.logger ?? consoleRegistryLogger;
   let draining = false;
 
   return {
@@ -104,6 +110,7 @@ export function createSandboxRegistry(
         victim: victim?.entry,
         entries,
         runtime: options.runtime,
+        logger,
         buildSpec,
         isDraining: () => draining,
       });
@@ -128,6 +135,7 @@ export function createSandboxRegistry(
         entry,
         entries,
         runtime: options.runtime,
+        logger,
         idleTtlMs,
         setTimer,
       });
@@ -150,7 +158,7 @@ export function createSandboxRegistry(
 
         destroyEntry(entries, key, entry);
 
-        return [options.runtime.stop(entry.handle.id)];
+        return [forceRemove(options.runtime, entry.handle.id, logger)];
       });
 
       try {
@@ -200,6 +208,7 @@ interface StartEntryOptions {
   victim?: RegistryEntry;
   entries: Map<string, RegistryEntry>;
   runtime: SandboxRuntime;
+  logger: SandboxRegistryLogger;
   buildSpec: (accessToken: string) => SandboxSpec;
   isDraining: () => boolean;
 }
@@ -207,7 +216,11 @@ interface StartEntryOptions {
 async function startEntry(options: StartEntryOptions): Promise<SandboxHandle> {
   try {
     if (options.victim?.handle) {
-      await options.runtime.stop(options.victim.handle.id);
+      await forceRemove(
+        options.runtime,
+        options.victim.handle.id,
+        options.logger,
+      );
     }
     if (options.isDraining()) {
       throw new Error(DRAINING_MESSAGE);
@@ -216,7 +229,7 @@ async function startEntry(options: StartEntryOptions): Promise<SandboxHandle> {
     const spec = options.buildSpec(options.entry.accessToken);
     const handle = await options.runtime.start(spec);
     if (options.isDraining()) {
-      await options.runtime.stop(handle.id);
+      await forceRemove(options.runtime, handle.id, options.logger);
       throw new Error(DRAINING_MESSAGE);
     }
 
@@ -260,6 +273,7 @@ interface ExpiryOptions {
   entry: RegistryEntry;
   entries: Map<string, RegistryEntry>;
   runtime: SandboxRuntime;
+  logger: SandboxRegistryLogger;
   idleTtlMs: number;
   setTimer: SetTimer;
 }
@@ -296,10 +310,21 @@ async function expireEntry(options: ExpiryOptions): Promise<void> {
 
   const handleId = options.entry.handle.id;
   destroyEntry(options.entries, options.key, options.entry);
+  await forceRemove(options.runtime, handleId, options.logger);
+}
+
+async function forceRemove(
+  runtime: SandboxRuntime,
+  sandboxId: string,
+  logger: SandboxRegistryLogger,
+): Promise<void> {
   try {
-    await options.runtime.stop(handleId);
-  } catch {
-    return;
+    await runtime.stop(sandboxId);
+  } catch (error) {
+    logger.warn(
+      { sandboxId, error: String(error) },
+      "Failed to force-remove sandbox",
+    );
   }
 }
 
@@ -321,3 +346,9 @@ function defaultSetTimer(
 ): RegistryTimer {
   return setTimeout(callback, milliseconds);
 }
+
+const consoleRegistryLogger: SandboxRegistryLogger = {
+  warn(context, message): void {
+    console.error({ level: "warn", ...context, message });
+  },
+};

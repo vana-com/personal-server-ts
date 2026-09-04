@@ -66,15 +66,17 @@ describe("docker sandbox runtime", () => {
   it("surfaces a bounded stderr tail when docker create fails", async () => {
     const prefix = "x".repeat(STDERR_TAIL_BYTES);
     const diagnostic = "runtime runsc-ptrace is unavailable";
-    execFileMock.mockImplementationOnce(
-      (_binary, _args, _options, callback) => {
+    execFileMock
+      .mockImplementationOnce((_binary, _args, _options, callback) => {
+        callback(new Error("No such container"), "", "No such container");
+      })
+      .mockImplementationOnce((_binary, _args, _options, callback) => {
         callback(
           new Error(`Command failed: docker create ${ACCESS_TOKEN}`),
           "",
           `${prefix}${ACCESS_TOKEN}${MASTER_KEY_SIGNATURE}${diagnostic}`,
         );
-      },
-    );
+      });
     const runtime = createDockerRuntime();
 
     const error = await runtime.start(sandboxSpec()).catch((cause) => cause);
@@ -100,10 +102,16 @@ describe("docker sandbox runtime", () => {
     await runtime.start(sandboxSpec());
 
     expect(docker.calls[0]).toEqual({
+      command: "rm",
+      args: ["--force", "--volumes", `ps-${USER_PS_ID.slice(2)}-7`],
+    });
+    expect(docker.calls[1]).toEqual({
       command: "create",
       args: [
         "--name",
         `ps-${USER_PS_ID.slice(2)}-7`,
+        "--label",
+        "org.vana.personal-server.sandbox=true",
         "--runtime",
         "runsc-ptrace",
         "--user",
@@ -146,9 +154,33 @@ describe("docker sandbox runtime", () => {
         VANA_MASTER_KEY_SIGNATURE: MASTER_KEY_SIGNATURE,
       },
     });
-    expect(docker.calls[0]?.args.join(" ")).not.toContain(ACCESS_TOKEN);
-    expect(docker.calls[0]?.args.join(" ")).not.toContain(MASTER_KEY_SIGNATURE);
-    expect(docker.calls[0]?.args).not.toContain("--mount");
+    expect(docker.calls[1]?.args.join(" ")).not.toContain(ACCESS_TOKEN);
+    expect(docker.calls[1]?.args.join(" ")).not.toContain(MASTER_KEY_SIGNATURE);
+    expect(docker.calls[1]?.args).not.toContain("--mount");
+  });
+
+  it("removes every labeled sandbox during boot reconciliation", async () => {
+    const docker = scriptedDocker();
+    docker.run = vi
+      .fn()
+      .mockResolvedValueOnce("orphan-1\norphan-2")
+      .mockResolvedValue("");
+    const runtime = createDockerRuntime({ docker });
+
+    await runtime.reconcile();
+
+    expect(docker.run).toHaveBeenNthCalledWith(1, "ps", [
+      "--all",
+      "--quiet",
+      "--filter",
+      "name=^/ps-",
+    ]);
+    expect(docker.run).toHaveBeenNthCalledWith(2, "rm", [
+      "--force",
+      "--volumes",
+      "orphan-1",
+      "orphan-2",
+    ]);
   });
 
   it("waits for the mapped port and uses the runtime host", async () => {

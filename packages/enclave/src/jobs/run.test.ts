@@ -60,6 +60,8 @@ class MemoryRuntime implements SandboxRuntime {
 
   constructor(private readonly origin: string) {}
 
+  async reconcile(): Promise<void> {}
+
   async start(spec: SandboxSpec): Promise<SandboxHandle> {
     this.specs.push(spec);
 

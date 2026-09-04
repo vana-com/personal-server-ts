@@ -16,6 +16,7 @@ services:
     image: node:24-alpine
     # A crash must not leave a running CVM unable to serve jobs.
     restart: unless-stopped
+    stop_grace_period: 120s
     working_dir: /app
     ports:
       - "8787:8787"

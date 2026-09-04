@@ -46,6 +46,7 @@ export interface SandboxHandle {
 }
 
 export interface SandboxRuntime {
+  reconcile(): Promise<void>;
   start(spec: SandboxSpec): Promise<SandboxHandle>;
   stop(id: string): Promise<void>;
   inspect(id: string): Promise<{ running: boolean }>;

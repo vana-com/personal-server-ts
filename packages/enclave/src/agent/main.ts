@@ -5,6 +5,7 @@
  */
 
 import { agentConfigFromEnv } from "./bootstrap.js";
+import { drainWithTimeout } from "./lifecycle.js";
 import { createAgentServer, type AgentJobsControl } from "./http.js";
 import { startClaimLoop, type JobLogger } from "../jobs/claim-loop.js";
 import { createGatewayClient } from "../jobs/gateway-client.js";
@@ -18,6 +19,7 @@ import type { SandboxRuntime } from "../sandbox/runtime.js";
 
 const EXIT_FAILURE = 1;
 const SIGTERM = "SIGTERM";
+const AGENT_DRAIN_TIMEOUT_MS = 110_000;
 const CONSOLE_LOGGER: JobLogger = {
   info(context, message): void {
     console.error({ level: "info", ...context, message });
@@ -27,33 +29,44 @@ const CONSOLE_LOGGER: JobLogger = {
   },
 };
 
-try {
-  const { client, host, jobs, port, secret } = agentConfigFromEnv(process.env);
-  const jobsControl = jobs ? startJobs(client, jobs) : undefined;
-  const server = createAgentServer({
-    client,
-    secret,
-    ...(jobsControl ? { jobs: jobsControl } : {}),
-  });
+void main();
 
-  server.listen(port, host);
-  process.once(SIGTERM, () => {
-    void shutdown(server, jobsControl);
-  });
-} catch (error) {
-  console.error(
-    error instanceof Error ? error.message : "enclave agent failed to start",
-  );
-  process.exitCode = EXIT_FAILURE;
+async function main(): Promise<void> {
+  try {
+    const { client, host, jobs, port, secret } = agentConfigFromEnv(
+      process.env,
+    );
+    const jobsControl = jobs ? await startJobs(client, jobs) : undefined;
+    const server = createAgentServer({
+      client,
+      secret,
+      ...(jobsControl ? { jobs: jobsControl } : {}),
+    });
+
+    server.listen(port, host);
+    process.once(SIGTERM, () => {
+      void shutdown(server, jobsControl).catch((error: unknown) => {
+        CONSOLE_LOGGER.warn({ error: String(error) }, "Agent shutdown failed");
+        process.exitCode = EXIT_FAILURE;
+      });
+    });
+  } catch (error) {
+    console.error(
+      error instanceof Error ? error.message : "enclave agent failed to start",
+    );
+    process.exitCode = EXIT_FAILURE;
+  }
 }
 
-function startJobs(
+async function startJobs(
   client: ReturnType<typeof agentConfigFromEnv>["client"],
   config: NonNullable<ReturnType<typeof agentConfigFromEnv>["jobs"]>,
-): AgentJobsControl {
+): Promise<AgentJobsControl> {
   const runtime = createRuntime(config);
+  await runtime.reconcile();
   const registry = createSandboxRegistry({
     runtime,
+    logger: CONSOLE_LOGGER,
     max: config.sandboxMax,
     idleTtlMs: config.idleTtlMs,
   });
@@ -143,7 +156,13 @@ async function shutdown(
   server: ReturnType<typeof createAgentServer>,
   jobs: AgentJobsControl | undefined,
 ): Promise<void> {
-  await jobs?.drain();
+  if (jobs) {
+    await drainWithTimeout(
+      () => jobs.drain(),
+      AGENT_DRAIN_TIMEOUT_MS,
+      CONSOLE_LOGGER,
+    );
+  }
   await new Promise<void>((resolve, reject) => {
     server.close((error) => {
       if (error) {

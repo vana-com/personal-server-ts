@@ -83,6 +83,11 @@ export function createFakeRuntime(
   const sandboxes = new Map<string, RunningSandbox>();
 
   return {
+    async reconcile(): Promise<void> {
+      await Promise.all(
+        [...sandboxes.keys()].map((id) => stopSandbox(id, sandboxes)),
+      );
+    },
     async start(spec): Promise<SandboxHandle> {
       assertSandboxEnv(spec.env);
 

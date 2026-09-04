@@ -25,6 +25,7 @@ const POLL_INTERVAL_MS = 250;
 const NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 const SYNC_DISABLED = "false";
 const CREATE_COMMAND = "create";
+const LIST_COMMAND = "ps";
 const START_COMMAND = "start";
 const INSPECT_COMMAND = "inspect";
 const REMOVE_COMMAND = "rm";
@@ -37,6 +38,13 @@ const RUNNING_FORMAT = "{{.State.Running}}";
 const HOST_PORT_FORMAT =
   '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}';
 const RUNNING_VALUE = "true";
+const ALL_FLAG = "--all";
+const QUIET_FLAG = "--quiet";
+const FILTER_FLAG = "--filter";
+const LABEL_FLAG = "--label";
+const SANDBOX_LABEL = "org.vana.personal-server.sandbox=true";
+const SANDBOX_NAME_FILTER = "name=^/ps-";
+const NOT_FOUND_PATTERN = /No such container/i;
 const SYNC_TOKEN_MESSAGE = "Sandbox sync requires PS_ACCESS_TOKEN";
 const INVALID_DOCKER_HOST = "DOCKER_HOST must have a hostname";
 const STDERR_TAIL_LENGTH = 2_048;
@@ -98,11 +106,24 @@ export function createDockerRuntime(
   const syncTimeoutMs = options.syncTimeoutMs ?? DEFAULT_SYNC_TIMEOUT_MS;
 
   return {
+    async reconcile(): Promise<void> {
+      const output = await docker.run(LIST_COMMAND, [
+        ALL_FLAG,
+        QUIET_FLAG,
+        FILTER_FLAG,
+        SANDBOX_NAME_FILTER,
+      ]);
+      const ids = output.split(/\s+/).filter(Boolean);
+      if (ids.length > 0) {
+        await docker.run(REMOVE_COMMAND, [FORCE_FLAG, VOLUMES_FLAG, ...ids]);
+      }
+    },
     async start(spec): Promise<SandboxHandle> {
       assertSandboxEnv(spec.env);
 
       const name = sandboxName(spec);
       const environment = { ...spec.env, ...FIXED_ENV };
+      await removeExistingSandbox(docker, name);
       const containerId = await docker.run(
         CREATE_COMMAND,
         createArgs(name, spec.image, environment),
@@ -258,6 +279,8 @@ function createArgs(
   const args = [
     "--name",
     name,
+    LABEL_FLAG,
+    SANDBOX_LABEL,
     "--runtime",
     GVISOR_RUNTIME,
     "--user",
@@ -279,6 +302,20 @@ function createArgs(
   args.push(image);
 
   return args;
+}
+
+async function removeExistingSandbox(
+  docker: DockerClient,
+  name: string,
+): Promise<void> {
+  try {
+    await docker.run(REMOVE_COMMAND, [FORCE_FLAG, VOLUMES_FLAG, name]);
+  } catch (error) {
+    if (error instanceof Error && NOT_FOUND_PATTERN.test(error.message)) {
+      return;
+    }
+    throw error;
+  }
 }
 
 function secretEnv(
