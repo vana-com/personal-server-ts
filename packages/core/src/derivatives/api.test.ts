@@ -105,9 +105,10 @@ function createDeps(overrides: Partial<PersonalServerDerivativesApiDeps> = {}) {
   const scheduler = {
     requestRecompute: vi.fn(),
     markSourceChanged: vi.fn(),
+    markDemand: vi.fn(),
   } satisfies Pick<
     RecomputeScheduler,
-    "requestRecompute" | "markSourceChanged"
+    "requestRecompute" | "markSourceChanged" | "markDemand"
   >;
   let counter = 0;
   const deps: PersonalServerDerivativesApiDeps = {
@@ -173,9 +174,46 @@ describe("handlePersonalServerDerivativesRequest", () => {
       registeredBy: { kind: "owner" },
     });
     expect(await store.get("q-1")).not.toBeNull();
+    expect(json.answerShape).toBeNull();
     expect(scheduler.requestRecompute).toHaveBeenCalledWith("q-1", {
       immediate: true,
     });
+  });
+
+  it("stores a declared answer shape and returns it in the registration view", async () => {
+    const { deps, store } = createDeps();
+    const res = await call(deps, "POST", "/questions", {
+      token: OWNER_TOKEN,
+      body: {
+        ...body,
+        answerShape: {
+          fields: [{ name: "score", type: "integer", min: 1, max: 5 }],
+        },
+      },
+    });
+    expect(res.status).toBe(201);
+    const expected = {
+      fields: [
+        { name: "score", type: "integer", required: true, min: 1, max: 5 },
+      ],
+    };
+    expect((await res.json()).answerShape).toEqual(expected);
+    expect((await store.get("q-1"))!.answerShape).toEqual(expected);
+  });
+
+  it("refuses a malformed answer shape with DERIVATIVE_QUESTION_INVALID", async () => {
+    const { deps } = createDeps();
+    const res = await call(deps, "POST", "/questions", {
+      token: OWNER_TOKEN,
+      body: {
+        ...body,
+        answerShape: { fields: [{ name: "score", type: "spreadsheet" }] },
+      },
+    });
+    expect(res.status).toBe(400);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("DERIVATIVE_QUESTION_INVALID");
+    expect(json.error.details).toMatchObject({ field: "answerShape" });
   });
 
   it("stores an explicit recompute policy and rejects an unknown one", async () => {
@@ -463,6 +501,7 @@ describe("handlePersonalServerDerivativesRequest", () => {
       sourceScopes: ["oura.sleep"],
       question: "How did I sleep?",
       model: null,
+      answerShape: null,
       recompute: "on-change",
       registeredBy: { kind: "builder", builder: BUILDER, grantId: "grant-1" },
       status: "pending",
@@ -715,6 +754,7 @@ describe("GET /v1/derivatives/status", () => {
     const scheduler = {
       requestRecompute: vi.fn(),
       markSourceChanged: vi.fn(),
+      markDemand: vi.fn(),
       nextRetryAt: vi.fn(() => "2026-08-27T10:05:00.000Z"),
     };
     const { deps } = createDeps({ compute: { store, scheduler } });
@@ -834,6 +874,7 @@ describe("GET /v1/derivatives/status", () => {
     const scheduler = {
       requestRecompute: vi.fn(),
       markSourceChanged: vi.fn(),
+      markDemand: vi.fn(),
       nextRetryAt: vi.fn(() => null),
       retryInFlight: vi.fn(() => true),
     };
@@ -852,6 +893,69 @@ describe("GET /v1/derivatives/status", () => {
     // Not null: null is the terminal "will never retry" signature, and a
     // retry is running right now. Not 0: that invites a tight poll loop.
     expect(json.retryAfterSeconds).toBe(5);
+  });
+
+  it("an authorized poll is demand: it asks the scheduler to run the question", async () => {
+    const { deps, scheduler } = createDeps();
+    await seedOwnerQuestion(deps);
+    const res = await call(deps, "GET", "/status?derivedScope=coach.weekly", {
+      token: READER_TOKEN,
+    });
+    expect(res.status).toBe(200);
+    expect(scheduler.markDemand).toHaveBeenCalledWith("coach.weekly");
+    // Once per poll, and always through the scheduler, which is where
+    // concurrent demand collapses into a single compute.
+    expect(scheduler.markDemand).toHaveBeenCalledTimes(1);
+  });
+
+  it("the owner's poll is demand too", async () => {
+    const { deps, scheduler } = createDeps();
+    await seedOwnerQuestion(deps);
+    await call(deps, "GET", "/status?derivedScope=coach.weekly", {
+      token: OWNER_TOKEN,
+    });
+    expect(scheduler.markDemand).toHaveBeenCalledWith("coach.weekly");
+  });
+
+  it("a refused or unauthenticated poll never becomes demand", async () => {
+    // Cost is the reason compute waits for a reader, so the trigger sits
+    // strictly behind the same gate as the data read: an uncovered grant,
+    // an unknown credential and a scope that fails the grammar all spend
+    // nothing.
+    const { deps, scheduler } = createDeps({
+      auth: createAuth({ readScopes: [] }),
+    });
+    await seedOwnerQuestion(deps);
+    const refused = await call(
+      deps,
+      "GET",
+      "/status?derivedScope=coach.weekly",
+      { token: READER_TOKEN },
+    );
+    expect(refused.status).toBe(403);
+    const anonymous = await call(
+      deps,
+      "GET",
+      "/status?derivedScope=coach.weekly",
+    );
+    expect(anonymous.status).toBe(401);
+    const malformed = await call(
+      deps,
+      "GET",
+      "/status?derivedScope=Not%20A%20Scope",
+      { token: READER_TOKEN },
+    );
+    expect(malformed.status).toBe(400);
+    expect(scheduler.markDemand).not.toHaveBeenCalled();
+  });
+
+  it("a covered scope with no question behind it wakes nothing", async () => {
+    const { deps, scheduler } = createDeps();
+    const res = await call(deps, "GET", "/status?derivedScope=coach.weekly", {
+      token: READER_TOKEN,
+    });
+    expect(res.status).toBe(404);
+    expect(scheduler.markDemand).not.toHaveBeenCalled();
   });
 
   it("only accepts GET", async () => {

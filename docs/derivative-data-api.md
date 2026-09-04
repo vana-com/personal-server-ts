@@ -532,14 +532,18 @@ in both positions (`coach.*` and `write:coach.*`).
 What runs where:
 
 1. the builder registers
-   `{ derivedScope, sourceScopes, question, model?, recompute? }`;
+   `{ derivedScope, sourceScopes, question, model?, answerShape?, recompute? }`;
 2. the Personal Server reads the sources from LOCAL storage, trims them,
    assembles a prompt, calls the inference provider and writes the answer
    into `derivedScope` with lineage = the source data point ids;
 3. every time a source scope gets a new local version (ingest or sync) the
-   question is marked `stale` and recomputed after a quiet period, unless
-   it was registered with `recompute: "snapshot"`;
-4. the builder polls the question for `ready`, then reads `derivedScope`.
+   question is marked `stale`, and nothing is computed, unless it was
+   registered with `recompute: "snapshot"` (which ignores source changes
+   entirely);
+4. the next authorized demand for the answer runs the compute: a read of
+   `derivedScope`, a `GET /v1/derivatives/status?derivedScope=` poll, or an
+   explicit `POST /questions/:id/recompute`;
+5. the builder polls the question for `ready`, then reads `derivedScope`.
 
 ### Endpoints
 
@@ -620,24 +624,40 @@ Registration body:
   "sourceScopes": ["chatgpt.conversations", "oura.sleep"],
   "question": "How did my sleep relate to my mood this week?",
   "model": "z-ai/glm-5.3-flash",
+  "answerShape": {
+    "fields": [
+      { "name": "score", "type": "integer", "min": 1, "max": 5 },
+      { "name": "mood", "type": "enum", "values": ["up", "down", "flat"] },
+      {
+        "name": "reason",
+        "type": "string",
+        "maxLength": 200,
+        "required": false
+      }
+    ]
+  },
   "recompute": "snapshot"
 }
 ```
 
-`model` is optional (the server default applies). `recompute` is optional
-too: `"on-change"` (the default) recomputes on every source change, while
+`model` is optional (the server default applies). `answerShape` is optional
+and is covered in "The declared answer shape" below; leaving it out is the
+free-text answer. `recompute` is optional too: `"on-change"` (the default)
+marks the answer stale on every source change and recomputes it the next
+time someone asks for it, while
 `"snapshot"` computes once at registration and afterwards only on an
 explicit `POST /questions/:id/recompute`; any other value is 400
 `DERIVATIVE_QUESTION_INVALID`. Validation, in order:
 scopes follow the scope grammar; 1 to 16 distinct source scopes, none equal
-to the derived scope; `question` is 1 to 8000 characters; the naming rule
+to the derived scope; `question` is 1 to 8000 characters; `answerShape`, when
+present, follows the grammar below; the naming rule
 (the derived scope must not share its first segment with any source,
 400 `LINEAGE_SCOPE_UNDER_SOURCE_PREFIX`); and the registration must not make
 the derived scope a transitive source of itself through other registrations
-(409 `DERIVATIVE_CYCLE`), which is what keeps recompute-on-refresh bounded.
-Sources do not have to exist yet: a missing source fails the compute
-("source scope X has no local data") and the question recomputes once the
-scope arrives.
+(409 `DERIVATIVE_CYCLE`), which is what keeps a chain of recomputes
+bounded. Sources do not have to exist yet: a missing source fails the
+compute ("source scope X has no local data") and the question recomputes
+once the scope arrives and someone reads the answer.
 
 Registration view (POST, GET, list and recompute):
 
@@ -648,6 +668,17 @@ Registration view (POST, GET, list and recompute):
   "sourceScopes": ["chatgpt.conversations", "oura.sleep"],
   "question": "...",
   "model": null,
+  "answerShape": {
+    "fields": [
+      {
+        "name": "score",
+        "type": "integer",
+        "required": true,
+        "min": 1,
+        "max": 5
+      }
+    ]
+  },
   "recompute": "on-change",
   "registeredBy": { "kind": "builder", "builder": "0x...", "grantId": "0x..." },
   "status": "ready",
@@ -674,7 +705,7 @@ computes.
 
 | Status | errorCode                           | When                                                                 |
 | ------ | ----------------------------------- | -------------------------------------------------------------------- |
-| 400    | `DERIVATIVE_QUESTION_INVALID`       | body shape, scope grammar, limits                                    |
+| 400    | `DERIVATIVE_QUESTION_INVALID`       | body shape, scope grammar, limits, `answerShape` grammar             |
 | 400    | `LINEAGE_SCOPE_UNDER_SOURCE_PREFIX` | naming rule                                                          |
 | 400    | `DERIVATIVE_DERIVED_SCOPE_REQUIRED` | builder list call with no `?derivedScope=`                           |
 | 401    | `WRITE_ATTRIBUTION_INVALID`         | the proof does not cover this exact request (uri, query included)    |
@@ -685,6 +716,68 @@ computes.
 | 413    | `CONTENT_TOO_LARGE`                 | registration body over 16 KB                                         |
 | 503    | `DERIVATIVE_COMPUTE_UNAVAILABLE`    | the server has no compute layer wired                                |
 
+### The declared answer shape
+
+Without `answerShape` the answer is free text: the model is asked for a
+prose `answer` string and nothing about the reply is enforced beyond the
+token cap. That is as wide as the sources, because a question can ask for
+them verbatim and get them back in the string. A registration may instead
+declare, up front, the fields its answer is made of; the server then
+instructs the model to answer in that shape and VALIDATES the reply against
+it before writing anything, so a 1-5 score is a number between 1 and 5 and
+not a field the raw conversations can be poured into. Fields the model
+returns that were not declared are dropped, never stored.
+
+The declaration is also what makes a recompute the same promise as the
+first compute: a later version matches the shape the approved one did.
+
+The grammar is a flat list of named fields. No nesting, no free-text keys,
+and any key that is not listed for the field's type is refused, so a shape
+cannot carry a second prompt past the 8000-character cap on `question`.
+
+```json
+{
+  "fields": [
+    { "name": "score", "type": "integer", "min": 1, "max": 5 },
+    { "name": "ratio", "type": "number", "min": 0, "max": 1 },
+    { "name": "burnedOut", "type": "boolean", "required": false },
+    { "name": "mood", "type": "enum", "values": ["up", "down", "flat"] },
+    { "name": "reason", "type": "string", "maxLength": 200, "required": false }
+  ]
+}
+```
+
+| Type      | Accepts                    | Constraints         |
+| --------- | -------------------------- | ------------------- |
+| `string`  | a JSON string              | `maxLength`         |
+| `number`  | a finite JSON number       | `min`, `max`        |
+| `integer` | a finite whole JSON number | `min`, `max`        |
+| `boolean` | `true` or `false`          | none                |
+| `enum`    | exactly one of `values`    | `values` (required) |
+
+`required` is optional on every field and defaults to `true`: a declared
+field is part of the promise. An optional field the model omits or returns
+as `null` is left out of the stored value. The registration view echoes the
+shape with `required` and a string's `maxLength` resolved, so it always says
+exactly what is enforced.
+
+Limits, all of them refused with 400 `DERIVATIVE_QUESTION_INVALID` and
+`details.field = "answerShape"`:
+
+| Limit                         | Value                                          |
+| ----------------------------- | ---------------------------------------------- |
+| fields per shape              | 1 to 16                                        |
+| field name                    | 1 to 64 chars, `[A-Za-z][A-Za-z0-9_]*`         |
+| duplicate field names         | refused                                        |
+| `maxLength` on a string       | 1 to 4000, and the default when absent         |
+| `min` / `max`                 | finite; whole numbers on an `integer` field    |
+| enum `values`                 | 1 to 32 distinct values                        |
+| one enum value                | 1 to 64 chars, no line breaks or tabs          |
+| a key not listed for the type | refused (no `description`, no nested `fields`) |
+
+Worst case that is about 3 KB of field names and enum values reaching the
+prompt, well under what the question text alone may carry.
+
 ### Observing a question as the reader
 
 `GET /v1/derivatives/status?derivedScope=<scope>` is the lifecycle view for
@@ -694,7 +787,11 @@ session. Authorization is the data read's (a live grant covering the scope,
 or the owner); nothing is served and nothing is charged, the same bar as
 the lineage read. Without it a reader polling `GET /v1/data/<scope>` cannot
 tell "computing right now" (404) from "failed and will never retry" (also
-404).
+404). An authorized poll is also demand: it wakes a question that is
+waiting for a compute, so a reader that finds the scope stale is not
+polling a status nothing is working towards. The view it returns is the
+state that poll starts from; the run it triggered reports itself in the
+next poll.
 
 ```http
 GET /v1/derivatives/status?derivedScope=coach.weekly
@@ -742,17 +839,61 @@ stale --compute ok--> ready
 stale --compute err-> failed
 ```
 
-`pending` is "never computed"; it stays `pending` while scheduled. A source
-change during a running compute makes the scheduler run once more when it
-finishes (one compute in flight per question, changes coalesce). Recompute
-after a change waits `inference.recomputeDebounceMs` (default 5000);
-`POST /recompute` (owner, or the registering builder retrying after a
-failure) runs immediately. A question registered with
-`recompute: "snapshot"` never takes the source-change edge: it computes at
-registration and on `POST /recompute` only. On boot the server reschedules
-every question a previous run left `pending` or `stale`. `failed` carries a short `error` (a status code,
+`pending` is "never computed"; it stays `pending` until a compute lands. A
+source change marks the answer `stale` and schedules nothing (see "Compute
+is just-in-time" below). A source change DURING a running compute puts the
+question back to `stale` when that compute settles, because the answer it
+wrote never saw the new data. `POST /recompute` (owner, or the registering
+builder retrying after a failure) runs immediately, one compute in flight
+per question. A question registered with `recompute: "snapshot"` never
+takes the source-change edge: it computes at registration and on
+`POST /recompute` only. On boot the server reschedules every question a
+previous run left `pending`; a `stale` one has a version to serve and waits
+for a reader, so a restart (in PS-Lite, every tab that opens) buys no
+inference. `failed` carries a short `error` (a status code,
 a scope name, an error class); the prompt and the data are never stored in
 it.
+
+### Compute is just-in-time
+
+A source refresh marks the answer stale; it does not recompute it. The
+recompute happens the next time someone actually asks for the answer:
+
+| Demand                                         | Who may trigger it                                    |
+| ---------------------------------------------- | ----------------------------------------------------- |
+| `GET /v1/data/<derivedScope>`                  | a live grant covering the derived scope, or the owner |
+| `GET /v1/derivatives/status?derivedScope=`     | the same                                              |
+| `POST /v1/derivatives/questions/:id/recompute` | the owner or the registering builder (immediate)      |
+
+Otherwise the inference bill scales with how often the owner's sources
+refresh rather than with how often anyone reads the answer: a user who
+refreshes their ChatGPT history nightly would pay for a recompute every
+night even if no app ever read the result.
+
+Three rules make that safe:
+
+- Authorization first. The trigger sits behind the same gate as the data it
+  serves and runs only after that gate passed, so an unauthenticated or
+  refused request never spends an inference call.
+- One compute per question. Every trigger goes through the scheduler, which
+  runs one compute per question at a time, so N concurrent readers cause
+  one compute rather than N.
+- Reads are never blocked on inference. A read serves the version that is
+  stored (stale is not wrong) and the recompute runs behind it; the fresh
+  answer lands in a later read. A derived scope with nothing stored yet
+  answers 404 exactly as before, and the reader polls the status route
+  while the compute it just triggered runs.
+
+Only a question that is WAITING for a compute is woken: `stale` and
+`pending`. A `ready` one has nothing to do, and a `failed` one belongs to
+its backoff chain or to an explicit recompute, so polling a question that
+keeps failing cannot spend a call per poll. Demand does pull a promised
+retry forward, since the reader is asking now, and keeps the attempt count
+so a chain that keeps failing still ends.
+
+The `recompute` policy is unchanged on the wire: `"on-change"` and
+`"snapshot"` are still the only two values. What `"on-change"` means is
+"stale on change, computed on demand".
 
 Retry policy inside one compute: a transient inference failure (no
 response, 429, 5xx) and a transient gateway failure during the grant check
@@ -775,7 +916,8 @@ scope name, the question or provider detail):
 attempts are spent, the scheduler retries the question on a backoff
 schedule (default 1m, 5m, 30m; in-memory, so a restart drops the chain).
 Every other class — and an exhausted backoff — leaves the question
-`failed` until the next source change or `POST /recompute`.
+`failed` until the next source change (which makes it stale, so the next
+reader recomputes it) or `POST /recompute`.
 
 Before a compute of a builder-registered question the server re-runs the
 write policy against the live grant and the read coverage of every source:
@@ -796,7 +938,8 @@ descends from the question's own derived scope.
 
 Chains: the compute path writes through the owner ingest contract, not
 HTTP, so it notifies the scheduler itself; a question that reads a derived
-scope recomputes when that scope is recomputed (A -> B -> C).
+scope goes stale when that scope is recomputed, and recomputes when its own
+answer is read (A -> B -> C, each link paid for by a reader).
 
 ### Trim rule and prompt
 
@@ -818,6 +961,20 @@ and a user message with the question followed by one section per source
 JSON). The reply is parsed as JSON (a fenced block or surrounding prose is
 tolerated); when no object parses the whole text is the answer.
 
+A question that declared an `answerShape` gets the same grounding with a
+different answer contract: `answer` is an OBJECT and the system prompt
+lists every declared field with its type, its bounds and whether it is
+required. The reply is then checked against the shape (the `answer` member
+first, the whole envelope second, for a model that skipped the wrapper).
+The prompt is not the boundary; the check is. A reply that does not match
+gets exactly ONE corrective turn - its own reply back as context plus the
+constraints it broke, which are zod's messages and never echo the value
+received - and a second miss fails the compute rather than writing a
+derivative the builder cannot trust. The failure is `internal`
+(`answer did not match the declared shape (fields: ...)`), because the
+reader-facing `errorCode` vocabulary is closed and an unknown value would
+break clients parsing it as an enum.
+
 ### The derived record
 
 Written through the owner ingest path (no `$writtenBy`), with
@@ -828,7 +985,8 @@ in registration order and `writtenAt` = the compute time. The record body:
 {
   "questionId": "5f0c...",
   "question": "How did my sleep relate to my mood this week?",
-  "answer": "...",
+  "answer": "score: 4\nmood: up",
+  "answerData": { "score": 4, "mood": "up" },
   "evidence": "...",
   "model": "z-ai/glm-5.3-flash",
   "computedAt": "2026-08-31T09:12:44.000Z",
@@ -841,6 +999,13 @@ in registration order and `writtenAt` = the compute time. The record body:
   "$lineage": { "sources": ["0x5b1a...9c", "0x9e77...02"], "writtenAt": "..." }
 }
 ```
+
+`answerData` is present only for a question that declared an `answerShape`,
+and holds the validated value: the declared fields, in declaration order,
+with the optional ones the model left out omitted. `answer` stays a STRING
+either way, because readers depend on it; for a shaped answer it holds a
+`name: value` line per present field, a rendering of `answerData`, which is
+the authoritative one.
 
 `sources[].version` is the local index version of each source at compute
 time (lineage itself is version-less, see "Identifiers"). `inference` is
@@ -865,7 +1030,7 @@ The provider is an OpenAI-compatible chat completions client over `fetch`
 | `inference.model`               | `z-ai/glm-5.3-flash`             | default model                                                        |
 | `inference.e2ee`                | `true`                           | end to end encryption of prompt and answer to the Phala gateway      |
 | `inference.maxSourceItems`      | `50`                             | newest items kept per source scope                                   |
-| `inference.recomputeDebounceMs` | `5000`                           | quiet period after a source change                                   |
+| `inference.recomputeDebounceMs` | `5000`                           | quiet period before a recompute requested without `immediate`        |
 
 Both persistence paths write the parsed config back with every default
 materialized (`config.json` on the Node server, the stored config record in
@@ -902,7 +1067,8 @@ PS-Lite never calls a provider directly: with `inference.baseUrl` left at
 the direct-provider default the compute layer stays off and
 `/v1/derivatives` answers 503 `DERIVATIVE_COMPUTE_UNAVAILABLE`; set it to
 the relay. Deactivating the runtime stops the scheduler; activating it
-reschedules `pending` and `stale` questions.
+reschedules `pending` questions (a `stale` one waits for a reader, so
+opening a tab costs nothing).
 
 Every request carries `provider: { aci_verified: true, zdr: true }` and
 `max_tokens` (2048); the response headers `x-receipt-id` and

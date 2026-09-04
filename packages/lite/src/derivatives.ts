@@ -30,9 +30,15 @@ import type { PsLiteStateStore } from "./state.js";
 
 const QUESTIONS_KEY = "derivative-questions-v1";
 
-/** What older builds persisted: `recompute` did not exist yet. */
-type PersistedQuestionRegistration = Omit<QuestionRegistration, "recompute"> &
-  Partial<Pick<QuestionRegistration, "recompute">>;
+/**
+ * What older builds persisted: neither `recompute` nor `answerShape`
+ * existed yet.
+ */
+type PersistedQuestionRegistration = Omit<
+  QuestionRegistration,
+  "recompute" | "answerShape"
+> &
+  Partial<Pick<QuestionRegistration, "recompute" | "answerShape">>;
 
 interface PsLiteQuestionsState {
   version: 1;
@@ -45,11 +51,13 @@ export async function createPsLiteQuestionStore(
 ): Promise<QuestionStore> {
   const saved = await stateStore.get<PsLiteQuestionsState>(QUESTIONS_KEY);
   // Registrations saved before the recompute policy existed keep the old
-  // follow-every-change behavior.
+  // follow-every-change behavior, and ones saved before answer shapes keep
+  // the free-text answer.
   const initial = (saved?.version === 1 ? saved.questions : []).map(
     (question) => ({
       ...question,
       recompute: question.recompute ?? "on-change",
+      answerShape: question.answerShape ?? null,
     }),
   );
   return createInMemoryQuestionStore({
@@ -142,7 +150,7 @@ export function createPsLiteDerivativeCompute(
     logger,
     compute: (questionId) =>
       computeQuestion(questionId, {
-        // A -> B -> C: a question reading this derived scope recomputes.
+        // A -> B -> C: a question reading this derived scope goes stale.
         onDerivedWritten: (event) =>
           scheduler.markSourceChanged(event.scope, {
             lineageSources: event.lineageSources,

@@ -6,12 +6,17 @@
  * docs/derivative-data-api.md, "Compute (question to derivative)".
  */
 
+import { cloneAnswerShape, type AnswerShape } from "./answer-shape.js";
+
 export type QuestionStatus = "pending" | "ready" | "failed" | "stale";
 
 /**
- * When the answer recomputes: "on-change" follows every source change (the
- * original behavior and the default); "snapshot" computes at registration
- * and afterwards only on an explicit POST /questions/:id/recompute.
+ * When the answer recomputes: "on-change" (the default) goes stale on every
+ * source change and recomputes on the next authorized demand for the answer;
+ * "snapshot" computes at registration and afterwards only on an explicit
+ * POST /questions/:id/recompute. Two values, and only these two: the SDK
+ * validates the field against them, so the meaning of "on-change" moves
+ * rather than the vocabulary.
  */
 export type QuestionRecompute = "snapshot" | "on-change";
 
@@ -39,6 +44,11 @@ export interface QuestionRegistration {
   question: string;
   /** Model override; null = the provider's default. */
   model: string | null;
+  /**
+   * The declared shape of the answer, enforced at compute time; null = the
+   * free-text answer (the original behavior).
+   */
+  answerShape: AnswerShape | null;
   recompute: QuestionRecompute;
   registeredBy: QuestionRegisteredBy;
   status: QuestionStatus;
@@ -97,6 +107,7 @@ export interface QuestionRegistrationView {
   sourceScopes: string[];
   question: string;
   model: string | null;
+  answerShape: AnswerShape | null;
   recompute: QuestionRecompute;
   registeredBy: QuestionRegisteredBy;
   status: QuestionStatus;
@@ -118,6 +129,7 @@ export function questionRegistrationView(
     sourceScopes: [...registration.sourceScopes],
     question: registration.question,
     model: registration.model,
+    answerShape: cloneAnswerShape(registration.answerShape),
     recompute: registration.recompute,
     registeredBy: registration.registeredBy,
     status: registration.status,

@@ -19,6 +19,7 @@ describe("parseQuestionInput", () => {
       sourceScopes: ["chatgpt.conversations", "oura.sleep"],
       question: valid.question,
       model: null,
+      answerShape: null,
       recompute: "on-change",
     });
     expect(parseQuestionInput({ ...valid, model: "z-ai/glm-5.2" }).model).toBe(
@@ -67,10 +68,42 @@ describe("parseQuestionInput", () => {
     ["model not a string", { ...valid, model: 1 }],
     ["unknown recompute policy", { ...valid, recompute: "weekly" }],
     ["recompute not a string", { ...valid, recompute: true }],
+    ["answerShape not an object", { ...valid, answerShape: "score" }],
+    ["answerShape with no fields", { ...valid, answerShape: { fields: [] } }],
+    [
+      "answerShape field of an unknown type",
+      { ...valid, answerShape: { fields: [{ name: "s", type: "object" }] } },
+    ],
   ])("rejects %s with DERIVATIVE_QUESTION_INVALID", (_label, body) => {
     expect(() => parseQuestionInput(body)).toThrow(
       expect.objectContaining({ errorCode: "DERIVATIVE_QUESTION_INVALID" }),
     );
+  });
+
+  it("accepts a declared answer shape and normalizes its optional parts", () => {
+    expect(
+      parseQuestionInput({
+        ...valid,
+        answerShape: {
+          fields: [
+            { name: "score", type: "integer", min: 1, max: 5 },
+            { name: "reason", type: "string", maxLength: 200, required: false },
+          ],
+        },
+      }).answerShape,
+    ).toEqual({
+      fields: [
+        { name: "score", type: "integer", required: true, min: 1, max: 5 },
+        { name: "reason", type: "string", required: false, maxLength: 200 },
+      ],
+    });
+  });
+
+  it("treats an absent or null answerShape as the free-text answer", () => {
+    expect(parseQuestionInput(valid).answerShape).toBeNull();
+    expect(
+      parseQuestionInput({ ...valid, answerShape: null }).answerShape,
+    ).toBe(null);
   });
 
   it("applies the lineage naming rule (derived scope under a source namespace)", () => {
@@ -138,6 +171,26 @@ describe("createQuestionRegistration", () => {
       derivedVersion: null,
     });
     expect(await store.get("q-1")).toEqual(registration);
+  });
+
+  it("stores the declared answer shape with the registration", async () => {
+    const store = createInMemoryQuestionStore();
+    const registration = await createQuestionRegistration({
+      body: {
+        ...valid,
+        answerShape: { fields: [{ name: "score", type: "integer", max: 5 }] },
+      },
+      registeredBy: { kind: "owner" },
+      store,
+      questionId: "q-1",
+      now: () => new Date("2026-08-27T10:00:00.000Z"),
+    });
+    expect(registration.answerShape).toEqual({
+      fields: [{ name: "score", type: "integer", required: true, max: 5 }],
+    });
+    expect((await store.get("q-1"))!.answerShape).toEqual(
+      registration.answerShape,
+    );
   });
 
   it("refuses a registration that would create a recompute cycle", async () => {
