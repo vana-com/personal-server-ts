@@ -99,6 +99,10 @@ command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
 if [[ -n $secret_keychain ]]; then
   command -v security >/dev/null || { echo "macOS security CLI is required for --secret-keychain" >&2; exit 1; }
 fi
+if ! git -C "$repo_root" fetch -q origin "$git_ref"; then
+  echo "Git ref '$git_ref' is not available on origin; push the commit before updating the CVM." >&2
+  exit 1
+fi
 
 NODE_SECRET=$(openssl rand -hex 32)
 if [[ -n $secret_out ]]; then
@@ -171,8 +175,9 @@ resolve_cvm_registration_metadata "$cvm_json" "$app_id"
 printf 'uuid=%s\napp_id=%s\nagent_url=%s\nagent_url_source=%s\n' \
   "$uuid" "$app_id" "$agent_url" "$domain_path"
 
-# The old agent can remain healthy briefly after deploy. Wait until it either
-# disappears or already reports the replacement identity before strict checks.
+# The old agent can remain healthy briefly after deploy. Wait until the health
+# endpoint reports the replacement identity before running strict checks.
+new_node_ready=false
 for ((attempt = 1; attempt <= CVM_READY_ATTEMPTS; attempt += 1)); do
   if ! health_response=$(curl -sS \
     --connect-timeout "$CURL_CONNECT_TIMEOUT_SECONDS" \
@@ -180,12 +185,18 @@ for ((attempt = 1; attempt <= CVM_READY_ATTEMPTS; attempt += 1)); do
     -H "Authorization: Bearer $ENCLAVE_AGENT_SECRET" \
     -w $'\n%{http_code}' \
     "${agent_url}/agent/v1/health" 2>/dev/null); then
-    break
+    if [[ $attempt -lt $CVM_READY_ATTEMPTS ]]; then
+      sleep "$CVM_READY_INTERVAL_SECONDS"
+    fi
+    continue
   fi
   http_status=${health_response##*$'\n'}
   health_json=${health_response%$'\n'*}
   if [[ ! $http_status =~ ^2[[:digit:]]{2}$ ]]; then
-    break
+    if [[ $attempt -lt $CVM_READY_ATTEMPTS ]]; then
+      sleep "$CVM_READY_INTERVAL_SECONDS"
+    fi
+    continue
   fi
   actual_node_id=$(
     node -e '
@@ -195,12 +206,18 @@ for ((attempt = 1; attempt <= CVM_READY_ATTEMPTS; attempt += 1)); do
     ' "$health_json" 2>/dev/null || true
   )
   if [[ $actual_node_id == "$NODE_ID" ]]; then
+    new_node_ready=true
     break
   fi
   if [[ $attempt -lt $CVM_READY_ATTEMPTS ]]; then
     sleep "$CVM_READY_INTERVAL_SECONDS"
   fi
 done
+if [[ $new_node_ready == false ]]; then
+  echo "Updated agent did not report NODE_ID '$NODE_ID' after $CVM_READY_ATTEMPTS attempts: ${agent_url}/agent/v1/health" >&2
+  print_agent_logs "$uuid"
+  exit 1
+fi
 
 verify_agent_node_id "$agent_url" "$NODE_ID" "$ENCLAVE_AGENT_SECRET" "$uuid"
 capacity=${SANDBOX_MAX:-20}
