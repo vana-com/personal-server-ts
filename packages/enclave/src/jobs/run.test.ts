@@ -328,6 +328,31 @@ describe("runJob", () => {
     expect(fixture.keyFill).toHaveBeenCalledWith(0);
   });
 
+  it("defers a completion failure to lease recovery", async () => {
+    const fixture = await createFixture();
+    const completionError = new Error("complete unavailable");
+    vi.mocked(fixture.gateway.complete).mockRejectedValue(completionError);
+    const release = vi.spyOn(fixture.deps.registry, "release");
+
+    await runJob(fixture.job, fixture.identity, fixture.deps);
+
+    expect(fixture.gateway.complete).toHaveBeenCalledWith(JOB_ID, {
+      fencingToken: 1,
+      ...RESULT,
+    });
+    expect(fixture.gateway.fail).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledWith(`${USER_PS_ID}:${EPOCH}`);
+    expect(fixture.deps.logger.warn).toHaveBeenCalledWith(
+      {
+        jobId: JOB_ID,
+        stage: "complete",
+        error: { name: "Error", message: "complete unavailable" },
+        causes: [],
+      },
+      "Enclave job stage failed",
+    );
+  });
+
   it("uses the configured chain when the claim omits chainId", async () => {
     const fixture = await createFixture();
     delete fixture.job.chainId;
