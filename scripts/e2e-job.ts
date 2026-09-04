@@ -110,6 +110,7 @@ const EXIT_SUCCESS = 0;
 const EXIT_FAILURE = 1;
 const TRUE_VALUE = "1";
 const REMOTE_ENABLED = "1";
+// STORAGE_API_URL optionally keeps remote seeding and job execution on the same storage host.
 const GRANT_VERSION_ONE = 1n;
 const GRANT_VERSION_REVOKED = 2n;
 const GRANT_VERSION_FRESH = 3n;
@@ -456,6 +457,9 @@ async function startAgent(
               PS_ENTRY: resolve("packages/server/dist/index.js"),
               PS_IMAGE: FAKE_IMAGE,
               LEASE_SECONDS: String(LEASE_SECONDS),
+              ...(process.env.STORAGE_API_URL
+                ? { STORAGE_API_URL: process.env.STORAGE_API_URL }
+                : {}),
               ...(node.workDelayMs === undefined
                 ? {}
                 : { WORK_DELAY_MS: String(node.workDelayMs) }),
@@ -822,7 +826,16 @@ async function seedRemoteRecord(ctx: JobContext): Promise<string> {
   const config = ServerConfigSchema.parse({
     server: { port: SEED_SERVER_PORT, origin },
     gateway: { ...ctx.gatewayConfig, url: ctx.gatewayUrl },
-    storage: { backend: "vana" },
+    storage: {
+      backend: "vana",
+      ...(process.env.STORAGE_API_URL
+        ? {
+            config: {
+              vana: { apiUrl: process.env.STORAGE_API_URL },
+            },
+          }
+        : {}),
+    },
     sync: { enabled: true },
     tunnel: { enabled: false },
     devUi: { enabled: false },
