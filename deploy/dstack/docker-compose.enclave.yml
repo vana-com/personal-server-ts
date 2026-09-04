@@ -16,7 +16,7 @@
 # with ERR_MODULE_NOT_FOUND for @opendatalabs/vana-sdk.
 services:
   agent:
-    image: node:24-alpine
+    image: "${AGENT_IMAGE:?AGENT_IMAGE must be a digest-pinned image reference}"
     # A crash must not leave a running CVM unable to serve jobs.
     restart: unless-stopped
     stop_grace_period: 120s
@@ -81,7 +81,7 @@ services:
         exec npm run start:agent -w @opendatalabs/personal-server-ts-enclave
 
   sandbox-runtime:
-    image: docker:27-dind
+    image: "${DIND_IMAGE:?DIND_IMAGE must be a digest-pinned image reference}"
     # A crash must not leave a running CVM unable to serve jobs.
     restart: unless-stopped
     privileged: true

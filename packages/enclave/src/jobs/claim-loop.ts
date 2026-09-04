@@ -7,8 +7,11 @@ const CLAIM_FAILURE_MESSAGE = "Gateway claim loop unavailable";
 const CLAIM_RECOVERY_MESSAGE = "Gateway claim loop recovered";
 const JOB_RUN_FAILURE_MESSAGE = "Claimed job run failed";
 const UNKNOWN_ERROR = "unknown";
+export const NODE_FAULT = "node-fault";
+export type JobRunResult = void | typeof NODE_FAULT;
 
 export interface JobLogger {
+  error(context: Record<string, unknown>, message: string): void;
   info(context: Record<string, unknown>, message: string): void;
   warn(context: Record<string, unknown>, message: string): void;
 }
@@ -18,7 +21,7 @@ export interface ClaimLoopOptions {
   run(
     job: ClaimResponse["job"],
     identity: ClaimResponse["identity"],
-  ): Promise<void>;
+  ): Promise<JobRunResult>;
   registry: SandboxRegistry;
   leaseSeconds: number;
   wait: number;
@@ -99,7 +102,10 @@ export function startClaimLoop(options: ClaimLoopOptions): ClaimLoop {
 
   async function runClaim(claim: ClaimResponse): Promise<void> {
     try {
-      await options.run(claim.job, claim.identity);
+      const result = await options.run(claim.job, claim.identity);
+      if (result === NODE_FAULT) {
+        void beginDrain();
+      }
     } catch (error) {
       options.logger.warn(
         { jobId: claim.job.jobId, error: errorSummary(error) },
@@ -108,12 +114,16 @@ export function startClaimLoop(options: ClaimLoopOptions): ClaimLoop {
     }
   }
 
+  function beginDrain(): Promise<void> {
+    isDraining = true;
+    drainPromise ??= loopPromise.then(() => options.registry.drain());
+
+    return drainPromise;
+  }
+
   return {
     drain(): Promise<void> {
-      isDraining = true;
-      drainPromise ??= loopPromise.then(() => options.registry.drain());
-
-      return drainPromise;
+      return beginDrain();
     },
     running(): number {
       return inFlight.size;

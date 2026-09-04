@@ -4,6 +4,8 @@ Prerequisites: Phala CLI 1.1.21 logged in and Node.js 24.
 
 ```sh
 export ENCLAVE_AGENT_SECRET=...
+export AGENT_IMAGE=node@sha256:...
+export DIND_IMAGE=docker@sha256:...
 export NODE_SECRET="$(openssl rand -hex 32)"
 export NODE_ID=node-1
 export GATEWAY_URL=https://gateway.example
@@ -16,10 +18,11 @@ node scripts/tee/kms-root.mjs
 
 `provision.sh` defaults to `deploy/dstack/docker-compose.enclave.yml`. The
 agent receives only the dstack socket and reaches the privileged nested Docker
-runtime over the private compose network. `PS_IMAGE` must be a digest built
-from this branch's root `Dockerfile`; do not use a tag. An out-of-date published
-digest may lack runtime dependencies and exit with errors such as
-`ERR_MODULE_NOT_FOUND @opendatalabs/vana-sdk`.
+runtime over the private compose network. `AGENT_IMAGE` and `DIND_IMAGE` must
+be digest-pinned base images; provisioning rejects mutable tags. `PS_IMAGE`
+must be a digest built from this branch's root `Dockerfile`; do not use a tag.
+An out-of-date published digest may lack runtime dependencies and exit with
+errors such as `ERR_MODULE_NOT_FOUND @opendatalabs/vana-sdk`.
 
 For the enclave compose, `--ref` must be an immutable 40-hex commit SHA. The
 level-B clone bootstrap fetches that exact commit and verifies the checkout;
@@ -117,6 +120,12 @@ To stop new claims, wait for running jobs, and destroy all sandboxes:
 curl -fsS -X POST "$AGENT_URL/agent/v1/drain" \
   -H "Authorization: Bearer $ENCLAVE_AGENT_SECRET"
 ```
+
+If Docker reports a non-transient create/start fault such as an unavailable
+image/runtime or invalid resource limit, the agent logs `Sandbox node fault;
+draining agent` at error level and automatically stops claiming. Operators can
+confirm the state from `GET /agent/v1/health` (`draining: true`); the affected
+job is not failed and becomes claimable by another node when its lease lapses.
 
 ## Rolling out a compose change
 

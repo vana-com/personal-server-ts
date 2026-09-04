@@ -63,6 +63,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 : "${ENCLAVE_AGENT_SECRET:?ENCLAVE_AGENT_SECRET must be set in the environment}"
+: "${AGENT_IMAGE:?AGENT_IMAGE must be set to a digest-pinned image reference}"
+if [[ ! $AGENT_IMAGE =~ ^.+@sha256:[[:xdigit:]]{64}$ ]]; then
+  echo "AGENT_IMAGE must be an image digest such as node@sha256:<64 hex characters>" >&2
+  exit 1
+fi
 command -v phala >/dev/null || { echo "phala CLI is required" >&2; exit 1; }
 command -v node >/dev/null || { echo "Node.js is required" >&2; exit 1; }
 command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
@@ -72,6 +77,11 @@ identity_only=false
 if [[ ${compose##*/} == docker-compose.agent.inline.yml ]]; then
   identity_only=true
 else
+  : "${DIND_IMAGE:?DIND_IMAGE must be set to a digest-pinned image reference}"
+  if [[ ! $DIND_IMAGE =~ ^.+@sha256:[[:xdigit:]]{64}$ ]]; then
+    echo "DIND_IMAGE must be an image digest such as docker@sha256:<64 hex characters>" >&2
+    exit 1
+  fi
   : "${NODE_SECRET:?NODE_SECRET must be set in the environment}"
   : "${NODE_ID:?NODE_ID must be set in the environment}"
   : "${GATEWAY_URL:?GATEWAY_URL must be set in the environment}"

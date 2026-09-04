@@ -21,6 +21,9 @@ const EXIT_FAILURE = 1;
 const SIGTERM = "SIGTERM";
 const AGENT_DRAIN_TIMEOUT_MS = 110_000;
 const CONSOLE_LOGGER: JobLogger = {
+  error(context, message): void {
+    console.error({ level: "error", ...context, message });
+  },
   info(context, message): void {
     console.error({ level: "info", ...context, message });
   },

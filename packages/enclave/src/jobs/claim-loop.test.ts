@@ -40,10 +40,33 @@ function registryFake(): SandboxRegistry {
 }
 
 function loggerFake(): JobLogger {
-  return { info: vi.fn(), warn: vi.fn() };
+  return { error: vi.fn(), info: vi.fn(), warn: vi.fn() };
 }
 
 describe("claim loop", () => {
+  it("stops claiming after a job reports a node fault", async () => {
+    const gateway = gatewayFake();
+    const registry = registryFake();
+    vi.mocked(gateway.claim).mockResolvedValue(CLAIM);
+    const run = vi.fn().mockResolvedValue("node-fault");
+    const loop = startClaimLoop({
+      gateway,
+      run,
+      registry,
+      leaseSeconds: 30,
+      wait: 25,
+      capacity: 1,
+      logger: loggerFake(),
+    });
+
+    await vi.waitFor(() => expect(loop.draining()).toBe(true));
+    await loop.drain();
+
+    expect(gateway.claim).toHaveBeenCalledOnce();
+    expect(run).toHaveBeenCalledOnce();
+    expect(registry.drain).toHaveBeenCalledOnce();
+  });
+
   it("waits for the poll floor after an immediate empty claim", async () => {
     vi.useFakeTimers();
     const gateway = gatewayFake();

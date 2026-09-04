@@ -11,7 +11,7 @@ import type { SandboxRegistry } from "../sandbox/registry.js";
 import type { SandboxSpec } from "../sandbox/runtime.js";
 import type { SandboxContracts } from "../agent/bootstrap.js";
 import { unseal } from "../sealing/envelope.js";
-import type { JobLogger } from "./claim-loop.js";
+import { NODE_FAULT, type JobLogger, type JobRunResult } from "./claim-loop.js";
 import { LeaseLostError, type GatewayClient } from "./gateway-client.js";
 import {
   JobEnvelopeError,
@@ -36,7 +36,6 @@ const MIN_TIMER_DELAY_MS = 0;
 const INVALID_REQUEST_REASON = "REQUEST_INVALID";
 const DEADLINE_REASON = "DEADLINE_PASSED";
 const CHAIN_MISMATCH_REASON = "CHAIN_MISMATCH";
-const SANDBOX_UNAVAILABLE_REASON = "SANDBOX_UNAVAILABLE";
 const SYNC_ENABLED = "true";
 const SYNC_DISABLED = "false";
 const ENCRYPT_UNAVAILABLE = "ECIES encryption is unavailable";
@@ -46,6 +45,7 @@ const LEASE_EXPIRED_MESSAGE = "Job lease expired without confirmation";
 const NODE_DERIVATION_MISMATCH_MESSAGE =
   "Derived enclave key does not match the claimed identity";
 const JOB_STAGE_FAILURE_MESSAGE = "Enclave job stage failed";
+const SANDBOX_NODE_FAULT_MESSAGE = "Sandbox node fault; draining agent";
 const DECRYPT_STAGE = "decrypt";
 const UNSEAL_STAGE = "unseal";
 const SANDBOX_ACQUIRE_STAGE = "sandbox-acquire";
@@ -112,7 +112,7 @@ export async function runJob(
   job: ClaimedJob,
   identity: ClaimedIdentity,
   deps: RunJobDeps,
-): Promise<void> {
+): Promise<JobRunResult> {
   const jobChainId = job.chainId ?? deps.chainId;
   if (jobChainId !== deps.chainId) {
     const error = new SandboxChainMismatchError(deps.chainId, jobChainId);
@@ -174,10 +174,11 @@ export async function runJob(
       });
       acquired = true;
     } catch (error) {
-      logStageFailure(deps.logger, job.jobId, SANDBOX_ACQUIRE_STAGE, error);
       if (isNonTransientDockerSandboxError(error)) {
-        await failJob(job, SANDBOX_UNAVAILABLE_REASON, deps.gateway);
+        logNodeFault(deps.logger, job.jobId, error);
+        return NODE_FAULT;
       }
+      logStageFailure(deps.logger, job.jobId, SANDBOX_ACQUIRE_STAGE, error);
       return;
     } finally {
       signature.fill(0);
@@ -401,6 +402,20 @@ function logStageFailure(
       causes,
     },
     JOB_STAGE_FAILURE_MESSAGE,
+  );
+}
+
+function logNodeFault(logger: JobLogger, jobId: string, error: unknown): void {
+  const [root, ...causes] = errorChain(error);
+
+  logger.error(
+    {
+      jobId,
+      stage: SANDBOX_ACQUIRE_STAGE,
+      error: root,
+      causes,
+    },
+    SANDBOX_NODE_FAULT_MESSAGE,
   );
 }
 

@@ -2,7 +2,7 @@
 # Production pins image digests under one approved compose hash (decision 23), then uses `phala cvms replicate` for additional nodes.
 services:
   agent:
-    image: node:24-alpine
+    image: "${AGENT_IMAGE:?AGENT_IMAGE must be a digest-pinned image reference}"
     restart: "no"
     working_dir: /app
     ports:

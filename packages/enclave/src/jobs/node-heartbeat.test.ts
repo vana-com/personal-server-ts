@@ -28,7 +28,11 @@ describe("node heartbeat", () => {
     const registry = {
       activeCount: vi.fn().mockReturnValue(3),
     } as unknown as SandboxRegistry;
-    const logger = { info: vi.fn(), warn: vi.fn() } satisfies JobLogger;
+    const logger = {
+      error: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+    } satisfies JobLogger;
     const heartbeat = startNodeHeartbeat({
       gateway,
       nodeId: NODE_ID,
@@ -64,7 +68,11 @@ describe("node heartbeat", () => {
       .mockRejectedValueOnce(new Error("offline"))
       .mockRejectedValueOnce(new Error("offline"))
       .mockResolvedValue({ state: "admitted" });
-    const logger = { info: vi.fn(), warn: vi.fn() } satisfies JobLogger;
+    const logger = {
+      error: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+    } satisfies JobLogger;
     const heartbeat = startNodeHeartbeat({
       gateway,
       nodeId: NODE_ID,

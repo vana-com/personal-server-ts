@@ -55,6 +55,7 @@ interface Fixture {
   request: JobRequestEnvelope;
   runtime: MemoryRuntime;
   keyFill: ReturnType<typeof vi.fn>;
+  errorLog: ReturnType<typeof vi.fn>;
 }
 
 class MemoryRuntime implements SandboxRuntime {
@@ -179,6 +180,7 @@ async function createFixture(): Promise<Fixture> {
     idleTtlMs: 60_000,
   });
   const keyFill = vi.fn();
+  const errorLog = vi.fn();
   const client: DstackClient = {
     ...baseClient,
     async deriveKey(path, purpose) {
@@ -212,7 +214,7 @@ async function createFixture(): Promise<Fixture> {
     gatewayBypassSecret: "preview-secret",
     leaseSeconds: 30,
     sync: "disabled",
-    logger: { info: vi.fn(), warn: vi.fn() },
+    logger: { error: errorLog, info: vi.fn(), warn: vi.fn() },
     now: () => NOW_MS,
   };
 
@@ -225,6 +227,7 @@ async function createFixture(): Promise<Fixture> {
     request,
     runtime,
     keyFill,
+    errorLog,
   };
 }
 
@@ -504,7 +507,7 @@ describe("runJob", () => {
     );
   });
 
-  it("fails the job when sandbox creation is permanently unavailable", async () => {
+  it("returns a node fault when sandbox creation is permanently unavailable", async () => {
     const fixture = await createFixture();
     vi.spyOn(fixture.runtime, "start").mockRejectedValue(
       new Error(
@@ -512,19 +515,23 @@ describe("runJob", () => {
       ),
     );
 
-    await runJob(fixture.job, fixture.identity, fixture.deps);
+    const result = await runJob(fixture.job, fixture.identity, fixture.deps);
 
-    expect(fixture.gateway.fail).toHaveBeenCalledWith(JOB_ID, {
-      fencingToken: 1,
-      reason: "SANDBOX_UNAVAILABLE",
-    });
+    expect(result).toBe("node-fault");
+    expect(fixture.gateway.fail).not.toHaveBeenCalled();
     expect(fixture.gateway.complete).not.toHaveBeenCalled();
-    expect(fixture.deps.logger.warn).toHaveBeenCalledWith(
-      expect.objectContaining({
+    expect(fixture.errorLog).toHaveBeenCalledWith(
+      {
         jobId: JOB_ID,
         stage: "sandbox-acquire",
-      }),
-      "Enclave job stage failed",
+        error: {
+          name: "Error",
+          message:
+            "Docker create failed: range of CPUs is from 0.01 to 1.00, as there are only 1 CPUs available",
+        },
+        causes: [],
+      },
+      "Sandbox node fault; draining agent",
     );
   });
 
