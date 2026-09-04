@@ -46,6 +46,9 @@ services:
       - SANDBOX_PIDS_LIMIT
       - SANDBOX_IDLE_TTL_SECONDS
       - LEASE_SECONDS
+      - VERCEL_PROTECTION_BYPASS
+      - WORK_DELAY_MS
+      - SANDBOX_SYNC
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
     depends_on:
