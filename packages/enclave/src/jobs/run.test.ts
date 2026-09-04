@@ -38,6 +38,7 @@ const NOW_MS = Date.parse("2026-09-03T12:00:00.000Z");
 const DEADLINE = "2026-09-03T12:05:00.000Z";
 const JOB_ID = "job-1";
 const CHAIN_ID = 14_800;
+const AGENT_URL = "http://agent:8787";
 const TAMPER_BIT = 1;
 const RESULT = {
   resultCiphertext: "ciphertext",
@@ -200,6 +201,7 @@ async function createFixture(): Promise<Fixture> {
     registry,
     image: "personal-server:test",
     gatewayUrl: "https://gateway.example",
+    agentUrl: AGENT_URL,
     chainId: CHAIN_ID,
     contracts: {
       dataRegistry: "0x1111111111111111111111111111111111111111",
@@ -290,6 +292,7 @@ describe("runJob", () => {
         PS_SERVER_PUBLIC_KEY: fixture.identity.enclavePublicKey,
         SYNC_ENABLED: "false",
         GATEWAY_URL: "https://gateway.example",
+        ENCLAVE_AGENT_URL: AGENT_URL,
         CHAIN_ID: String(CHAIN_ID),
         DATA_REGISTRY_CONTRACT: "0x1111111111111111111111111111111111111111",
         DATA_PORTABILITY_SERVER_CONTRACT:
@@ -313,6 +316,7 @@ describe("runJob", () => {
         "VANA_MASTER_KEY_SIGNATURE",
         "VERCEL_PROTECTION_BYPASS",
         "GATEWAY_URL",
+        "ENCLAVE_AGENT_URL",
         "CHAIN_ID",
         "DATA_REGISTRY_CONTRACT",
         "DATA_PORTABILITY_SERVER_CONTRACT",

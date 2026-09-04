@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { Hex } from "viem";
+import type { Address, Hex } from "viem";
 import {
   createSandboxRegistry,
   SandboxCapacityError,
@@ -9,6 +9,7 @@ import {
 import type { SandboxHandle, SandboxRuntime, SandboxSpec } from "./runtime.js";
 
 const USER_PS_ID = `0x${"12".repeat(32)}` as Hex;
+const OWNER = `0x${"34".repeat(20)}` as Address;
 
 function deferred<T>() {
   let resolvePromise: (value: T) => void = () => {};
@@ -98,6 +99,36 @@ describe("sandbox registry", () => {
     expect(second).toEqual(first);
     expect(first.accessToken).toMatch(/^[0-9a-f]{64}$/);
     expect(runtime.starts).toHaveLength(1);
+  });
+
+  it("resolves only jobs actively bound to the sandbox bearer", async () => {
+    const registry = createSandboxRegistry({ runtime: memoryRuntime() });
+    const lease = await registry.acquire("owner:1", buildSpec);
+    const job = {
+      jobId: "job-1",
+      chainId: 14_800,
+      owner: OWNER,
+      userPsId: USER_PS_ID,
+      epoch: 1,
+      serverAddress: OWNER,
+    };
+
+    const unbind = registry.bindJob("owner:1", job);
+    expect(registry.lookupJob(lease.accessToken, job.jobId)).toEqual({
+      kind: "active",
+      job,
+    });
+    expect(registry.lookupJob(lease.accessToken, "other-job")).toEqual({
+      kind: "inactive",
+    });
+    expect(registry.lookupJob("wrong-token", job.jobId)).toEqual({
+      kind: "unauthorized",
+    });
+
+    unbind();
+    expect(registry.lookupJob(lease.accessToken, job.jobId)).toEqual({
+      kind: "inactive",
+    });
   });
 
   it("tears an idle sandbox down after its TTL", async () => {

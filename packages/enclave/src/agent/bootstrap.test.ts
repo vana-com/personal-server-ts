@@ -90,6 +90,7 @@ describe("agentConfigFromEnv", () => {
       workDelayMs: 250,
       gatewayBypassSecret: "preview-secret",
       storageApiUrl: "https://storage-dev.vana.org",
+      sandboxAgentUrl: "http://agent:8787",
       chainId: MAINNET_CHAIN_ID,
       contracts: {
         dataRegistry: DATA_REGISTRY,

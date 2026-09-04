@@ -1,4 +1,5 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import type { ActiveSandboxJob, SandboxJobLookup } from "../agent/types.js";
 import type { SandboxHandle, SandboxRuntime, SandboxSpec } from "./runtime.js";
 
 export const SANDBOX_MAX = 20;
@@ -46,6 +47,8 @@ export interface SandboxRegistry {
     buildSpec: (accessToken: string) => SandboxSpec,
   ): Promise<SandboxLease>;
   release(key: string): void;
+  bindJob(key: string, job: ActiveSandboxJob): () => void;
+  lookupJob(accessToken: string, jobId: string): SandboxJobLookup;
   drain(): Promise<void>;
   activeCount(): number;
 }
@@ -57,6 +60,7 @@ interface RegistryEntry {
   accessToken: string;
   useCount: number;
   expiryVersion: number;
+  activeJobs: Map<string, ActiveSandboxJob>;
   startPromise?: Promise<SandboxHandle>;
 }
 
@@ -97,6 +101,7 @@ export function createSandboxRegistry(
         accessToken: randomBytes(ACCESS_TOKEN_BYTES).toString("hex"),
         useCount: 1,
         expiryVersion: 0,
+        activeJobs: new Map(),
       };
       entries.set(key, entry);
 
@@ -140,6 +145,28 @@ export function createSandboxRegistry(
         setTimer,
       });
     },
+    bindJob(key, job): () => void {
+      const entry = entries.get(key);
+      if (!entry || entry.state === "destroyed") {
+        throw new Error(UNAVAILABLE_MESSAGE);
+      }
+      entry.activeJobs.set(job.jobId, job);
+
+      return () => {
+        if (entry.activeJobs.get(job.jobId) === job) {
+          entry.activeJobs.delete(job.jobId);
+        }
+      };
+    },
+    lookupJob(accessToken, jobId): SandboxJobLookup {
+      const entry = findByAccessToken(entries, accessToken);
+      if (!entry) {
+        return { kind: "unauthorized" };
+      }
+      const job = entry.activeJobs.get(jobId);
+
+      return job ? { kind: "active", job } : { kind: "inactive" };
+    },
     async drain(): Promise<void> {
       draining = true;
       for (const entry of entries.values()) {
@@ -171,6 +198,24 @@ export function createSandboxRegistry(
       return entries.size;
     },
   };
+}
+
+function findByAccessToken(
+  entries: Map<string, RegistryEntry>,
+  accessToken: string,
+): RegistryEntry | undefined {
+  const supplied = Buffer.from(accessToken, "utf8");
+  for (const entry of entries.values()) {
+    const expected = Buffer.from(entry.accessToken, "utf8");
+    if (
+      supplied.length === expected.length &&
+      timingSafeEqual(supplied, expected)
+    ) {
+      return entry;
+    }
+  }
+
+  return undefined;
 }
 
 function acquireExisting(

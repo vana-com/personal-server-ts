@@ -19,6 +19,7 @@ const MAX_PORT = 65_535;
 const DEFAULT_DOCKER_HOST = "tcp://sandbox-runtime:2375";
 const DEFAULT_SANDBOX_RUNTIME = "docker";
 const DEFAULT_SYNC_MODE = "enabled";
+const DEFAULT_SANDBOX_AGENT_URL = "http://agent:8787";
 const MILLISECONDS_PER_SECOND = 1_000;
 const MIN_POSITIVE_INTEGER = 1;
 const MIN_NONNEGATIVE_INTEGER = 0;
@@ -58,6 +59,7 @@ export type SandboxSyncMode = "enabled" | "disabled";
 export interface AgentJobsConfig {
   gatewayUrl: string;
   storageApiUrl: string;
+  sandboxAgentUrl: string;
   chainId: SupportedChainId;
   contracts: SandboxContracts;
   nodeId: string;
@@ -196,6 +198,7 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
   return {
     gatewayUrl: env.GATEWAY_URL,
     storageApiUrl: storageApiUrlValue,
+    sandboxAgentUrl: env.SANDBOX_AGENT_URL ?? DEFAULT_SANDBOX_AGENT_URL,
     chainId,
     contracts,
     nodeId: env.NODE_ID,

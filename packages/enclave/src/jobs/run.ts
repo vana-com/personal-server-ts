@@ -79,6 +79,7 @@ export interface RunJobDeps {
   image: string;
   gatewayUrl: string;
   storageApiUrl?: string;
+  agentUrl: string;
   chainId: number;
   contracts: SandboxContracts;
   gatewayBypassSecret?: string;
@@ -191,14 +192,24 @@ export async function runJob(
       return;
     }
 
-    const result = await executeSandbox({
-      origin: sandbox.handle.origin,
-      accessToken: sandbox.accessToken,
-      envelope,
-      timeoutMs: Math.min(remainingMs, EXECUTE_TIMEOUT_MS),
-      requestFetch,
-      leaseSignal: lease.signal,
-    });
+    const result = await executeSandbox(
+      {
+        origin: sandbox.handle.origin,
+        accessToken: sandbox.accessToken,
+        envelope,
+        timeoutMs: Math.min(remainingMs, EXECUTE_TIMEOUT_MS),
+        requestFetch,
+        leaseSignal: lease.signal,
+      },
+      deps.registry.bindJob(registryKey, {
+        jobId: job.jobId,
+        chainId: jobChainId,
+        owner: job.owner,
+        userPsId: identity.userPsId,
+        epoch: identity.epoch,
+        serverAddress: identity.enclaveAddress,
+      }),
+    );
     await lease.settled();
     if (lease.lost() || result.kind === "retry") {
       return;
@@ -452,6 +463,7 @@ function sandboxSpec(
       PS_SERVER_PUBLIC_KEY: identity.enclavePublicKey,
       SYNC_ENABLED: deps.sync === "enabled" ? SYNC_ENABLED : SYNC_DISABLED,
       GATEWAY_URL: deps.gatewayUrl,
+      ENCLAVE_AGENT_URL: deps.agentUrl,
       CHAIN_ID: String(deps.chainId),
       DATA_REGISTRY_CONTRACT: deps.contracts.dataRegistry,
       DATA_PORTABILITY_SERVER_CONTRACT: deps.contracts.dataPortabilityServer,
@@ -481,7 +493,10 @@ interface ExecuteOptions {
   leaseSignal: AbortSignal;
 }
 
-async function executeSandbox(options: ExecuteOptions): Promise<ExecuteResult> {
+async function executeSandbox(
+  options: ExecuteOptions,
+  unbindJob: () => void,
+): Promise<ExecuteResult> {
   try {
     const response = await options.requestFetch(
       `${options.origin}${EXECUTE_PATH}`,
@@ -509,6 +524,8 @@ async function executeSandbox(options: ExecuteOptions): Promise<ExecuteResult> {
     return { kind: "fail", reason: body.error.code };
   } catch {
     return { kind: "retry" };
+  } finally {
+    unbindJob();
   }
 }
 

@@ -89,6 +89,7 @@ async function startJobs(
         image: config.image,
         gatewayUrl: config.gatewayUrl,
         storageApiUrl: config.storageApiUrl,
+        agentUrl: config.sandboxAgentUrl,
         chainId: config.chainId,
         contracts: config.contracts,
         ...(config.gatewayBypassSecret
@@ -117,8 +118,11 @@ async function startJobs(
 
   return {
     nodeId: config.nodeId,
+    storageApiUrl: config.storageApiUrl,
     activeCount: () => registry.activeCount(),
     draining: () => claimLoop.draining(),
+    lookupSandboxJob: (accessToken, jobId) =>
+      registry.lookupJob(accessToken, jobId),
     drain(): Promise<void> {
       drainPromise ??= claimLoop.drain().finally(() => nodeHeartbeat.stop());
 
