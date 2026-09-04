@@ -12,10 +12,11 @@ import {
   type DockerClient,
 } from "../sandbox/docker-runtime.js";
 import { createSandboxRegistry } from "../sandbox/registry.js";
-import type {
-  SandboxHandle,
-  SandboxRuntime,
-  SandboxSpec,
+import {
+  assertSandboxEnv,
+  type SandboxHandle,
+  type SandboxRuntime,
+  type SandboxSpec,
 } from "../sandbox/runtime.js";
 import { seal } from "../sealing/envelope.js";
 import { LeaseLostError, type GatewayClient } from "./gateway-client.js";
@@ -308,6 +309,9 @@ describe("runJob", () => {
     expect(fixture.runtime.specs[0]?.env.STORAGE_API_URL).toBe(
       "https://storage-dev.vana.org",
     );
+    expect(() =>
+      assertSandboxEnv(fixture.runtime.specs[0]?.env ?? {}),
+    ).not.toThrow();
   });
 
   it("awaits the configured work delay on the docker runtime path", async () => {

@@ -22,6 +22,19 @@ function fakeChild(): SpawnChild & { kill: ReturnType<typeof vi.fn> } {
 }
 
 describe("fake sandbox runtime", () => {
+  it("rejects environment keys outside the sandbox allowlist", async () => {
+    const runtime = createFakeRuntime();
+
+    await expect(
+      runtime.start({
+        userPsId: USER_PS_ID,
+        epoch: 2,
+        image: "unused",
+        env: { DATABASE_URL: "secret" },
+      }),
+    ).rejects.toThrow("Unknown sandbox environment key: DATABASE_URL");
+  });
+
   it("spawns the Personal Server with isolated sandbox environment", async () => {
     const child = fakeChild();
     const spawn = vi.fn<SpawnFn>().mockReturnValue(child);
