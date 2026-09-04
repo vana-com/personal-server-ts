@@ -7,6 +7,7 @@ import type { DstackClient } from "../dstack/client.js";
 import { decryptEcies } from "../agent/ecies.js";
 import { deriveEnclaveKey } from "../identity/wallet.js";
 import { isNonTransientDockerSandboxError } from "../sandbox/docker-runtime.js";
+import { SandboxSyncBlockedError } from "../sandbox/probes.js";
 import type { SandboxRegistry } from "../sandbox/registry.js";
 import type { SandboxSpec } from "../sandbox/runtime.js";
 import type { SandboxContracts } from "../agent/bootstrap.js";
@@ -36,6 +37,7 @@ const MIN_TIMER_DELAY_MS = 0;
 const INVALID_REQUEST_REASON = "REQUEST_INVALID";
 const DEADLINE_REASON = "DEADLINE_PASSED";
 const CHAIN_MISMATCH_REASON = "CHAIN_MISMATCH";
+const SANDBOX_SYNC_BLOCKED_REASON = "SANDBOX_SYNC_BLOCKED";
 const SYNC_ENABLED = "true";
 const SYNC_DISABLED = "false";
 const ENCRYPT_UNAVAILABLE = "ECIES encryption is unavailable";
@@ -72,6 +74,10 @@ const JOB_FAILURE_CODES = new Set<string>([
   "RESULT_UPLOAD_FAILED",
   "RESULT_TOO_LARGE",
   "INTERNAL",
+]);
+const TERMINAL_SYNC_BLOCK_REASONS = new Set([
+  "unregistered",
+  "registration_check_failed",
 ]);
 
 type ClaimedJob = ClaimResponse["job"];
@@ -222,6 +228,14 @@ export async function runJob(
           acquireStartedAt,
           now(),
         );
+        return;
+      }
+      if (
+        error instanceof SandboxSyncBlockedError &&
+        TERMINAL_SYNC_BLOCK_REASONS.has(error.reason)
+      ) {
+        logStageFailure(deps.logger, job.jobId, SANDBOX_ACQUIRE_STAGE, error);
+        await failJob(job, SANDBOX_SYNC_BLOCKED_REASON, deps.gateway);
         return;
       }
       if (isNonTransientDockerSandboxError(error)) {

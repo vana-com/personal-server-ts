@@ -12,6 +12,22 @@ export interface SyncStatus {
   lastSync?: string | null;
   pendingFiles?: number;
   errors?: Array<{ message?: string }>;
+  blocked?: SyncBlockedReason | null;
+}
+
+export interface SyncBlockedReason {
+  reason: string;
+  message: string;
+}
+
+export class SandboxSyncBlockedError extends Error {
+  constructor(
+    public readonly reason: string,
+    message: string,
+  ) {
+    super(`${SYNC_ERROR_PREFIX}${reason}: ${message}`);
+    this.name = "SandboxSyncBlockedError";
+  }
 }
 
 export type HealthProbe = (origin: string) => Promise<boolean>;
@@ -61,6 +77,12 @@ export async function probeSyncStatus(
     }
 
     const status = (await response.json()) as SyncStatus;
+    if (status.blocked) {
+      throw new SandboxSyncBlockedError(
+        status.blocked.reason,
+        status.blocked.message,
+      );
+    }
     if (status.errors?.length) {
       const messages = status.errors.map(
         (error) => error.message ?? "unknown error",

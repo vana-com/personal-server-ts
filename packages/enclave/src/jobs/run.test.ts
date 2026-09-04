@@ -18,6 +18,7 @@ import {
   type SandboxRuntime,
   type SandboxSpec,
 } from "../sandbox/runtime.js";
+import { SandboxSyncBlockedError } from "../sandbox/probes.js";
 import { seal } from "../sealing/envelope.js";
 import { LeaseLostError, type GatewayClient } from "./gateway-client.js";
 import { runJob, type RunJobDeps } from "./run.js";
@@ -517,6 +518,25 @@ describe("runJob", () => {
       "Enclave job stage failed",
     );
   });
+
+  it.each(["unregistered", "registration_check_failed"])(
+    "fails the job and releases the registry when sync is blocked by %s",
+    async (reason) => {
+      const fixture = await createFixture();
+      vi.spyOn(fixture.runtime, "start").mockRejectedValue(
+        new SandboxSyncBlockedError(reason, "registration is unavailable"),
+      );
+
+      await runJob(fixture.job, fixture.identity, fixture.deps);
+
+      expect(fixture.gateway.fail).toHaveBeenCalledWith(JOB_ID, {
+        fencingToken: 1,
+        reason: "SANDBOX_SYNC_BLOCKED",
+      });
+      expect(fixture.gateway.complete).not.toHaveBeenCalled();
+      expect(fixture.deps.registry.activeCount()).toBe(0);
+    },
+  );
 
   it("returns a node fault when sandbox creation is permanently unavailable", async () => {
     const fixture = await createFixture();
