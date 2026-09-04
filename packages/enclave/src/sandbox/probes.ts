@@ -19,6 +19,14 @@ export type SyncProbe = (
   origin: string,
   accessToken: string,
 ) => Promise<boolean>;
+export interface SyncProbeResult {
+  ready: boolean;
+  status?: SyncStatus;
+}
+export type SyncStatusProbe = (
+  origin: string,
+  accessToken: string,
+) => Promise<SyncProbeResult>;
 
 export async function probeHealth(origin: string): Promise<boolean> {
   try {
@@ -36,13 +44,20 @@ export async function probeSync(
   origin: string,
   accessToken: string,
 ): Promise<boolean> {
+  return (await probeSyncStatus(origin, accessToken)).ready;
+}
+
+export async function probeSyncStatus(
+  origin: string,
+  accessToken: string,
+): Promise<SyncProbeResult> {
   try {
     const response = await fetch(`${origin}${SYNC_STATUS_PATH}`, {
       headers: { [AUTHORIZATION_HEADER]: `${BEARER_PREFIX}${accessToken}` },
       signal: AbortSignal.timeout(SYNC_REQUEST_TIMEOUT_MS),
     });
     if (!response.ok) {
-      return false;
+      return { ready: false };
     }
 
     const status = (await response.json()) as SyncStatus;
@@ -54,14 +69,18 @@ export async function probeSync(
       throw new Error(`${SYNC_ERROR_PREFIX}${messages.join("; ")}`);
     }
 
-    return (
-      !status.syncing && Boolean(status.lastSync) && status.pendingFiles === 0
-    );
+    return {
+      ready:
+        !status.syncing &&
+        Boolean(status.lastSync) &&
+        status.pendingFiles === 0,
+      status,
+    };
   } catch (error) {
     if (error instanceof Error && error.message.startsWith(SYNC_ERROR_PREFIX)) {
       throw error;
     }
 
-    return false;
+    return { ready: false };
   }
 }

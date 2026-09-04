@@ -45,7 +45,10 @@ export interface SandboxSpec {
   epoch: number;
   image: string;
   env: Record<string, string>;
+  onProgress?: (event: SandboxStartEvent) => void;
 }
+
+export type SandboxStartEvent = "healthy" | "synced";
 
 export interface SandboxHandle {
   id: string;

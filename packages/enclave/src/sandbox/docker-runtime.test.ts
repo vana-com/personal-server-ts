@@ -321,6 +321,42 @@ describe("docker sandbox runtime", () => {
     expect(sleep).toHaveBeenCalledOnce();
   });
 
+  it("logs the latest health status every 30 seconds while waiting", async () => {
+    vi.useFakeTimers();
+    const docker = scriptedDocker();
+    docker.inspect = vi.fn().mockResolvedValue({
+      running: true,
+      hostPort: 49_152,
+    });
+    const health = vi.fn().mockResolvedValue(false);
+    const logger = { info: vi.fn() };
+    const runtime = createDockerRuntime({
+      docker,
+      health,
+      logger,
+      healthTimeoutMs: 31_000,
+    });
+
+    const starting = runtime.start(sandboxSpec());
+    const outcome = starting.catch((error: unknown) => error);
+    await vi.waitFor(() => expect(health).toHaveBeenCalledOnce());
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(logger.info).toHaveBeenCalledWith(
+      {
+        name: `ps-${USER_PS_ID.slice(2)}-7`,
+        waitingMs: 30_000,
+        lastStatus: "unhealthy",
+      },
+      "Waiting for sandbox health",
+    );
+
+    await vi.advanceTimersByTimeAsync(1_250);
+    await expect(outcome).resolves.toMatchObject({
+      message: expect.stringContaining("did not become healthy within 31000ms"),
+    });
+  });
+
   it("removes a container that exits before health", async () => {
     const docker = scriptedDocker([{ running: false }]);
     const runtime = createDockerRuntime({
@@ -352,6 +388,49 @@ describe("docker sandbox runtime", () => {
       runtime.start(sandboxSpec({ SYNC_ENABLED: "true" })),
     ).rejects.toThrow("Sandbox sync failed");
     expect(docker.calls.at(-1)?.command).toBe("rm");
+  });
+
+  it("logs the latest sync status every 30 seconds while waiting", async () => {
+    vi.useFakeTimers();
+    const docker = scriptedDocker();
+    const logger = { info: vi.fn() };
+    const status = {
+      syncing: true,
+      pendingFiles: 4,
+      lastSync: null,
+      errors: [],
+    };
+    let ready = false;
+    const syncStatus = vi.fn(async () => ({
+      ready,
+      status,
+    }));
+    const runtime = createDockerRuntime({
+      docker,
+      health: async () => true,
+      logger,
+      syncStatus,
+    });
+
+    const starting = runtime.start(sandboxSpec({ SYNC_ENABLED: "true" }));
+    await vi.waitFor(() => expect(syncStatus).toHaveBeenCalledOnce());
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(logger.info).toHaveBeenCalledWith(
+      {
+        name: `ps-${USER_PS_ID.slice(2)}-7`,
+        waitingMs: 30_000,
+        syncing: true,
+        pendingFiles: 4,
+        lastSync: null,
+        errorCount: 0,
+      },
+      "Waiting for sandbox sync",
+    );
+
+    ready = true;
+    await vi.advanceTimersByTimeAsync(250);
+    await starting;
   });
 
   it("skips sync when explicitly disabled", async () => {

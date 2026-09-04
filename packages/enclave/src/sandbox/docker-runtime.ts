@@ -2,8 +2,8 @@ import { execFile } from "node:child_process";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { HealthProbe, SyncProbe } from "./probes.js";
-import { probeHealth, probeSync } from "./probes.js";
+import type { HealthProbe, SyncProbe, SyncStatusProbe } from "./probes.js";
+import { probeHealth, probeSyncStatus } from "./probes.js";
 import {
   assertSandboxEnv,
   SECRET_ENV_KEYS,
@@ -25,6 +25,7 @@ const MILLISECONDS_PER_MINUTE = 60_000;
 const DEFAULT_HEALTH_TIMEOUT_MS = 2 * MILLISECONDS_PER_MINUTE;
 const DEFAULT_SYNC_TIMEOUT_MS = 20 * MILLISECONDS_PER_MINUTE;
 const POLL_INTERVAL_MS = 250;
+const WAIT_LOG_INTERVAL_MS = 30_000;
 const NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 const SYNC_DISABLED = "false";
 const CREATE_COMMAND = "create";
@@ -103,11 +104,17 @@ export interface DockerRuntimeOptions {
   syncTimeoutMs?: number;
   health?: HealthProbe;
   sync?: SyncProbe;
+  syncStatus?: SyncStatusProbe;
+  logger?: SandboxWaitLogger;
   sleep?: (milliseconds: number) => Promise<void>;
   now?: () => number;
   memory?: string;
   cpus?: string;
   pidsLimit?: number;
+}
+
+export interface SandboxWaitLogger {
+  info(context: Record<string, unknown>, message: string): void;
 }
 
 export function isNonTransientDockerSandboxError(error: unknown): boolean {
@@ -135,7 +142,14 @@ export function createDockerRuntime(
     });
   const runtimeHost = options.runtimeHost ?? hostFromDocker(dockerHost);
   const health = options.health ?? probeHealth;
-  const sync = options.sync ?? probeSync;
+  const sync = options.sync;
+  const syncStatus =
+    options.syncStatus ??
+    (sync
+      ? async (origin: string, accessToken: string) => ({
+          ready: await sync(origin, accessToken),
+        })
+      : probeSyncStatus);
   const sleep = options.sleep ?? delay;
   const now = options.now ?? Date.now;
   const healthTimeoutMs = options.healthTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS;
@@ -197,7 +211,9 @@ export function createDockerRuntime(
           now,
           deadline: startedAt + healthTimeoutMs,
           timeoutMs: healthTimeoutMs,
+          logger: options.logger,
         });
+        spec.onProgress?.("healthy");
 
         if (spec.env.SYNC_ENABLED !== SYNC_DISABLED) {
           const accessToken = spec.env.PS_ACCESS_TOKEN;
@@ -205,17 +221,21 @@ export function createDockerRuntime(
             throw new Error(SYNC_TOKEN_MESSAGE);
           }
 
+          const syncStartedAt = now();
           await waitForSync({
             origin,
             name,
             accessToken,
-            sync,
+            syncStatus,
             sleep,
             now,
-            deadline: startedAt + syncTimeoutMs,
+            startedAt: syncStartedAt,
+            deadline: syncStartedAt + syncTimeoutMs,
             timeoutMs: syncTimeoutMs,
+            logger: options.logger,
           });
         }
+        spec.onProgress?.("synced");
 
         return { id: containerId, origin };
       } catch (error) {
@@ -436,9 +456,13 @@ interface HealthWaitOptions {
   now: () => number;
   deadline: number;
   timeoutMs: number;
+  logger?: SandboxWaitLogger;
 }
 
 async function waitForHealth(options: HealthWaitOptions): Promise<string> {
+  const startedAt = options.deadline - options.timeoutMs;
+  let nextLogAt = WAIT_LOG_INTERVAL_MS;
+  let lastStatus = "port-unavailable";
   while (true) {
     const inspection = await options.docker.inspect(options.containerId);
     if (!inspection.running) {
@@ -457,9 +481,19 @@ async function waitForHealth(options: HealthWaitOptions): Promise<string> {
       if (await options.health(origin)) {
         return origin;
       }
+      lastStatus = "unhealthy";
     }
 
-    if (options.now() >= options.deadline) {
+    const currentTime = options.now();
+    const waitingMs = currentTime - startedAt;
+    if (waitingMs >= nextLogAt) {
+      options.logger?.info(
+        { name: options.name, waitingMs, lastStatus },
+        "Waiting for sandbox health",
+      );
+      nextLogAt += WAIT_LOG_INTERVAL_MS;
+    }
+    if (currentTime >= options.deadline) {
       throw new Error(
         `Sandbox ${options.name} did not become healthy within ${options.timeoutMs}ms`,
       );
@@ -495,16 +529,43 @@ interface SyncWaitOptions {
   origin: string;
   name: string;
   accessToken: string;
-  sync: SyncProbe;
+  syncStatus: SyncStatusProbe;
   sleep: (milliseconds: number) => Promise<void>;
   now: () => number;
+  startedAt: number;
   deadline: number;
   timeoutMs: number;
+  logger?: SandboxWaitLogger;
 }
 
 async function waitForSync(options: SyncWaitOptions): Promise<void> {
-  while (!(await options.sync(options.origin, options.accessToken))) {
-    if (options.now() >= options.deadline) {
+  let nextLogAt = WAIT_LOG_INTERVAL_MS;
+  while (true) {
+    const result = await options.syncStatus(
+      options.origin,
+      options.accessToken,
+    );
+    if (result.ready) {
+      return;
+    }
+
+    const currentTime = options.now();
+    const waitingMs = currentTime - options.startedAt;
+    if (waitingMs >= nextLogAt) {
+      options.logger?.info(
+        {
+          name: options.name,
+          waitingMs,
+          syncing: result.status?.syncing,
+          pendingFiles: result.status?.pendingFiles,
+          lastSync: result.status?.lastSync,
+          errorCount: result.status?.errors?.length ?? 0,
+        },
+        "Waiting for sandbox sync",
+      );
+      nextLogAt += WAIT_LOG_INTERVAL_MS;
+    }
+    if (currentTime >= options.deadline) {
       throw new Error(
         `Sandbox ${options.name} did not sync within ${options.timeoutMs}ms`,
       );

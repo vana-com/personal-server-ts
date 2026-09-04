@@ -161,6 +161,7 @@ function createRuntime(
     memory: config.sandboxMemory,
     cpus: config.sandboxCpus,
     pidsLimit: config.sandboxPidsLimit,
+    logger: CONSOLE_LOGGER,
   });
 }
 

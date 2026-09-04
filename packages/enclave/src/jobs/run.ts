@@ -49,6 +49,8 @@ const SANDBOX_NODE_FAULT_MESSAGE = "Sandbox node fault; draining agent";
 const DECRYPT_STAGE = "decrypt";
 const UNSEAL_STAGE = "unseal";
 const SANDBOX_ACQUIRE_STAGE = "sandbox-acquire";
+const WORK_DELAY_STAGE = "work-delay";
+const EXECUTE_STAGE = "execute";
 const COMPLETE_STAGE = "complete";
 const CHAIN_VALIDATION_STAGE = "chain-validation";
 const UNKNOWN_ERROR = "unknown";
@@ -122,6 +124,7 @@ export async function runJob(
   }
   const lease = startLease(job, deps);
   const now = deps.now ?? Date.now;
+  const runStartedAt = now();
   const requestFetch = deps.fetch ?? fetch;
   const sleep = deps.sleep ?? delay;
   const registryKey = `${identity.userPsId}:${identity.epoch}`;
@@ -139,10 +142,12 @@ export async function runJob(
       deps.logger.warn({ jobId: job.jobId }, NODE_DERIVATION_MISMATCH_MESSAGE);
       return;
     }
-    if (decrypted.kind === "invalid" || lease.lost()) {
-      if (!lease.lost()) {
-        await failJob(job, INVALID_REQUEST_REASON, deps.gateway);
-      }
+    if (lease.lost()) {
+      logLeaseLost(deps.logger, job.jobId, DECRYPT_STAGE, runStartedAt, now());
+      return;
+    }
+    if (decrypted.kind === "invalid") {
+      await failJob(job, INVALID_REQUEST_REASON, deps.gateway);
       return;
     }
     const { envelope } = decrypted;
@@ -165,15 +170,60 @@ export async function runJob(
     }
 
     let sandbox;
+    const acquireStartedAt = now();
+    const acquireEvents = new Set<string>();
+    logAcquisitionEvent(
+      deps.logger,
+      job.jobId,
+      "start",
+      acquireStartedAt,
+      now(),
+    );
     try {
       sandbox = await deps.registry.acquire(registryKey, (accessToken) => {
-        const spec = sandboxSpec(identity, deps, accessToken, signature);
+        const spec = sandboxSpec(
+          identity,
+          deps,
+          accessToken,
+          signature,
+          (event) => {
+            acquireEvents.add(event);
+            logAcquisitionEvent(
+              deps.logger,
+              job.jobId,
+              event,
+              acquireStartedAt,
+              now(),
+            );
+          },
+        );
         signature.fill(0);
 
         return spec;
       });
       acquired = true;
+      for (const event of ["healthy", "synced"] as const) {
+        if (!acquireEvents.has(event)) {
+          logAcquisitionEvent(
+            deps.logger,
+            job.jobId,
+            event,
+            acquireStartedAt,
+            now(),
+          );
+        }
+      }
     } catch (error) {
+      if (lease.lost()) {
+        logLeaseLost(
+          deps.logger,
+          job.jobId,
+          SANDBOX_ACQUIRE_STAGE,
+          acquireStartedAt,
+          now(),
+        );
+        return;
+      }
       if (isNonTransientDockerSandboxError(error)) {
         logNodeFault(deps.logger, job.jobId, error);
         return NODE_FAULT;
@@ -184,14 +234,29 @@ export async function runJob(
       signature.fill(0);
     }
     if (lease.lost()) {
+      logLeaseLost(
+        deps.logger,
+        job.jobId,
+        SANDBOX_ACQUIRE_STAGE,
+        acquireStartedAt,
+        now(),
+      );
       return;
     }
 
     if (deps.workDelayMs) {
+      const delayStartedAt = now();
       await sleep(deps.workDelayMs);
-    }
-    if (lease.lost()) {
-      return;
+      if (lease.lost()) {
+        logLeaseLost(
+          deps.logger,
+          job.jobId,
+          WORK_DELAY_STAGE,
+          delayStartedAt,
+          now(),
+        );
+        return;
+      }
     }
 
     const remainingMs = Date.parse(envelope.request.deadline) - now();
@@ -200,6 +265,7 @@ export async function runJob(
       return;
     }
 
+    const executeStartedAt = now();
     const result = await executeSandbox(
       {
         origin: sandbox.handle.origin,
@@ -219,7 +285,17 @@ export async function runJob(
       }),
     );
     await lease.settled();
-    if (lease.lost() || result.kind === "retry") {
+    if (lease.lost()) {
+      logLeaseLost(
+        deps.logger,
+        job.jobId,
+        EXECUTE_STAGE,
+        executeStartedAt,
+        now(),
+      );
+      return;
+    }
+    if (result.kind === "retry") {
       return;
     }
     if (result.kind === "fail") {
@@ -227,6 +303,7 @@ export async function runJob(
       return;
     }
 
+    const completeStartedAt = now();
     try {
       await deps.gateway.complete(job.jobId, {
         fencingToken: job.fencingToken,
@@ -236,6 +313,13 @@ export async function runJob(
       });
     } catch (error) {
       if (error instanceof LeaseLostError) {
+        logLeaseLost(
+          deps.logger,
+          job.jobId,
+          COMPLETE_STAGE,
+          completeStartedAt,
+          now(),
+        );
         return;
       }
 
@@ -419,6 +503,41 @@ function logNodeFault(logger: JobLogger, jobId: string, error: unknown): void {
   );
 }
 
+function logAcquisitionEvent(
+  logger: JobLogger,
+  jobId: string,
+  event: "start" | "healthy" | "synced",
+  startedAt: number,
+  currentTime: number,
+): void {
+  logger.info(
+    {
+      jobId,
+      stage: SANDBOX_ACQUIRE_STAGE,
+      event,
+      elapsedMs: Math.max(0, currentTime - startedAt),
+    },
+    "Sandbox acquisition progress",
+  );
+}
+
+function logLeaseLost(
+  logger: JobLogger,
+  jobId: string,
+  stage: string,
+  startedAt: number,
+  currentTime: number,
+): void {
+  logger.warn(
+    {
+      jobId,
+      stage,
+      elapsedMs: Math.max(0, currentTime - startedAt),
+    },
+    "Job lease lost",
+  );
+}
+
 interface LoggedError {
   name: string;
   message: string;
@@ -473,11 +592,13 @@ function sandboxSpec(
   deps: RunJobDeps,
   accessToken: string,
   signature: Uint8Array,
+  onProgress: NonNullable<SandboxSpec["onProgress"]>,
 ): SandboxSpec {
   return {
     userPsId: identity.userPsId,
     epoch: identity.epoch,
     image: deps.image,
+    onProgress,
     env: {
       VANA_MASTER_KEY_SIGNATURE: toHex(signature),
       PS_ACCESS_TOKEN: accessToken,

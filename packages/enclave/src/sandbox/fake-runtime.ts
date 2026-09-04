@@ -134,6 +134,7 @@ export function createFakeRuntime(
           deadline: startedAt + healthTimeoutMs,
           timeoutMs: healthTimeoutMs,
         });
+        spec.onProgress?.("healthy");
 
         if (spec.env.SYNC_ENABLED !== SYNC_DISABLED) {
           const accessToken = spec.env.PS_ACCESS_TOKEN;
@@ -152,6 +153,7 @@ export function createFakeRuntime(
             timeoutMs: syncTimeoutMs,
           });
         }
+        spec.onProgress?.("synced");
 
         return { id, origin };
       } catch (error) {

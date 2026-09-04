@@ -329,6 +329,17 @@ describe("runJob", () => {
     );
     expect(fixture.runtime.specs[0]?.env.STORAGE_API_URL).toBeUndefined();
     expect(fixture.keyFill).toHaveBeenCalledWith(0);
+    for (const event of ["start", "healthy", "synced"]) {
+      expect(fixture.deps.logger.info).toHaveBeenCalledWith(
+        {
+          jobId: JOB_ID,
+          stage: "sandbox-acquire",
+          event,
+          elapsedMs: 0,
+        },
+        "Sandbox acquisition progress",
+      );
+    }
   });
 
   it("defers a completion failure to lease recovery", async () => {
@@ -604,6 +615,39 @@ describe("runJob", () => {
     await running;
   });
 
+  it("warns when the lease is lost during sandbox acquisition", async () => {
+    vi.useFakeTimers();
+    const fixture = await createFixture();
+    let currentTime = NOW_MS;
+    let resolveStart: ((handle: SandboxHandle) => void) | undefined;
+    fixture.job.claimExpiresAt = new Date(NOW_MS + 1_000).toISOString();
+    fixture.deps.now = () => currentTime;
+    fixture.runtime.start = vi.fn(
+      () =>
+        new Promise<SandboxHandle>((resolve) => {
+          resolveStart = resolve;
+        }),
+    );
+
+    const running = runJob(fixture.job, fixture.identity, fixture.deps);
+    await vi.waitFor(() =>
+      expect(fixture.runtime.start).toHaveBeenCalledOnce(),
+    );
+    currentTime += 1_000;
+    await vi.advanceTimersByTimeAsync(1_000);
+    resolveStart?.({ id: "sandbox-1", origin: sandboxOrigin });
+    await running;
+
+    expect(fixture.deps.logger.warn).toHaveBeenCalledWith(
+      {
+        jobId: JOB_ID,
+        stage: "sandbox-acquire",
+        elapsedMs: 1_000,
+      },
+      "Job lease lost",
+    );
+  });
+
   it("aborts silently when a heartbeat loses the lease", async () => {
     vi.useFakeTimers();
     const fixture = await createFixture();
@@ -708,7 +752,10 @@ describe("runJob", () => {
     await running;
 
     expect(abortsAtDeadline).toBe(1);
-    expect(fixture.deps.logger.warn).toHaveBeenCalledOnce();
+    expect(fixture.deps.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ stage: "execute", elapsedMs: 15_000 }),
+      "Job lease lost",
+    );
     expect(fixture.gateway.fail).not.toHaveBeenCalled();
     expect(fixture.gateway.complete).not.toHaveBeenCalled();
   });
