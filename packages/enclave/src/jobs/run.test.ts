@@ -295,7 +295,19 @@ describe("runJob", () => {
         "GATEWAY_URL",
       ].sort(),
     );
+    expect(fixture.runtime.specs[0]?.env.STORAGE_API_URL).toBeUndefined();
     expect(fixture.keyFill).toHaveBeenCalledWith(0);
+  });
+
+  it("forwards the configured storage API URL to the sandbox", async () => {
+    const fixture = await createFixture();
+    fixture.deps.storageApiUrl = "https://storage-dev.vana.org";
+
+    await runJob(fixture.job, fixture.identity, fixture.deps);
+
+    expect(fixture.runtime.specs[0]?.env.STORAGE_API_URL).toBe(
+      "https://storage-dev.vana.org",
+    );
   });
 
   it("awaits the configured work delay on the docker runtime path", async () => {

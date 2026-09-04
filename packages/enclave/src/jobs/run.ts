@@ -75,6 +75,7 @@ export interface RunJobDeps {
   registry: SandboxRegistry;
   image: string;
   gatewayUrl: string;
+  storageApiUrl?: string;
   gatewayBypassSecret?: string;
   leaseSeconds: number;
   sync: SyncMode;
@@ -427,6 +428,7 @@ function sandboxSpec(
       PS_SERVER_PUBLIC_KEY: identity.enclavePublicKey,
       SYNC_ENABLED: deps.sync === "enabled" ? SYNC_ENABLED : SYNC_DISABLED,
       GATEWAY_URL: deps.gatewayUrl,
+      ...(deps.storageApiUrl ? { STORAGE_API_URL: deps.storageApiUrl } : {}),
       ...(deps.gatewayBypassSecret
         ? { VERCEL_PROTECTION_BYPASS: deps.gatewayBypassSecret }
         : {}),

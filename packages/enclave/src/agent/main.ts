@@ -75,6 +75,9 @@ function startJobs(
         registry,
         image: config.image,
         gatewayUrl: config.gatewayUrl,
+        ...(config.storageApiUrl
+          ? { storageApiUrl: config.storageApiUrl }
+          : {}),
         ...(config.gatewayBypassSecret
           ? { gatewayBypassSecret: config.gatewayBypassSecret }
           : {}),

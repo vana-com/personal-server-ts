@@ -53,6 +53,7 @@ describe("agentConfigFromEnv", () => {
       SANDBOX_SYNC: "disabled",
       WORK_DELAY_MS: "250",
       VERCEL_PROTECTION_BYPASS: "preview-secret",
+      STORAGE_API_URL: "https://storage-dev.vana.org",
     });
 
     expect(config.jobs).toEqual({
@@ -70,8 +71,41 @@ describe("agentConfigFromEnv", () => {
       sync: "disabled",
       workDelayMs: 250,
       gatewayBypassSecret: "preview-secret",
+      storageApiUrl: "https://storage-dev.vana.org",
     });
   });
+
+  it("omits the optional storage API URL when unset", () => {
+    const config = agentConfigFromEnv({
+      DSTACK_FAKE: "1",
+      ENCLAVE_AGENT_SECRET: "agent-secret",
+      GATEWAY_URL: "https://gateway.example",
+      NODE_ID: "node-1",
+      NODE_SECRET: "node-secret",
+      PS_IMAGE: TAGGED_IMAGE,
+      SANDBOX_RUNTIME: "fake",
+    });
+
+    expect(config.jobs).not.toHaveProperty("storageApiUrl");
+  });
+
+  it.each(["http://storage.example", "storage.example"])(
+    "rejects invalid STORAGE_API_URL %s",
+    (storageApiUrl) => {
+      expect(() =>
+        agentConfigFromEnv({
+          DSTACK_FAKE: "1",
+          ENCLAVE_AGENT_SECRET: "agent-secret",
+          GATEWAY_URL: "https://gateway.example",
+          NODE_ID: "node-1",
+          NODE_SECRET: "node-secret",
+          PS_IMAGE: TAGGED_IMAGE,
+          SANDBOX_RUNTIME: "fake",
+          STORAGE_API_URL: storageApiUrl,
+        }),
+      ).toThrow("STORAGE_API_URL");
+    },
+  );
 
   it.each(["fake", "docker"] as const)(
     "warns when an artificial work delay is enabled for the %s runtime",

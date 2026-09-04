@@ -29,6 +29,7 @@ export type SandboxSyncMode = "enabled" | "disabled";
 
 export interface AgentJobsConfig {
   gatewayUrl: string;
+  storageApiUrl?: string;
   nodeId: string;
   nodeSecret: string;
   runtime: SandboxRuntimeKind;
@@ -118,6 +119,17 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
   } catch {
     throw new Error("GATEWAY_URL must be a valid URL");
   }
+  if (env.STORAGE_API_URL) {
+    let storageApiUrl: URL;
+    try {
+      storageApiUrl = new URL(env.STORAGE_API_URL);
+    } catch {
+      throw new Error("STORAGE_API_URL must be a valid URL");
+    }
+    if (storageApiUrl.protocol !== HTTPS_PROTOCOL) {
+      throw new Error("STORAGE_API_URL must use https");
+    }
+  }
   if (
     runtime === "docker" &&
     !DOCKER_IMAGE_DIGEST_PATTERN.test(image) &&
@@ -138,6 +150,7 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
 
   return {
     gatewayUrl: env.GATEWAY_URL,
+    ...(env.STORAGE_API_URL ? { storageApiUrl: env.STORAGE_API_URL } : {}),
     nodeId: env.NODE_ID,
     nodeSecret: env.NODE_SECRET,
     runtime,
