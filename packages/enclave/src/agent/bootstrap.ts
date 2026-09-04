@@ -1,4 +1,5 @@
 import type { DstackClient } from "../dstack/client.js";
+import { isAddress } from "viem";
 import { createFakeDstackClient } from "../dstack/fake.js";
 import { createRealDstackClient } from "../dstack/real.js";
 import { DEFAULT_LEASE_SECONDS, MAX_LEASE_SECONDS } from "../jobs/types.js";
@@ -23,13 +24,36 @@ const DOCKER_IMAGE_ERROR =
   "PS_IMAGE must be a sha256 digest (name@sha256:<64 hex>) or a Docker image id (sha256:<64 hex>) for the docker runtime";
 const DOCKER_GATEWAY_ERROR =
   "GATEWAY_URL must use https for the docker runtime";
+const MAINNET_CHAIN_ID = 1_480;
+const MOKSHA_CHAIN_ID = 14_800;
+const DEFAULT_STORAGE_API_URLS = {
+  [MAINNET_CHAIN_ID]: "https://storage.vana.org",
+  [MOKSHA_CHAIN_ID]: "https://storage-dev.vana.org",
+} as const;
+const DEFAULT_CONTRACTS = {
+  dataRegistry: "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+  dataPortabilityPermissions: "0x4d3FA76064D88e0454cFc4CaD7e5FeC3e3124011",
+  dataPortabilityServer: "0xCae2CE0e9caa6643ed28186cF57bd40Bd9E17Eab",
+  dataPortabilityGrantees: "0x8325C0A0948483EdA023A1A2Fd895e62C5131234",
+} as const;
+
+export type SupportedChainId = typeof MAINNET_CHAIN_ID | typeof MOKSHA_CHAIN_ID;
+
+export interface SandboxContracts {
+  dataRegistry: string;
+  dataPortabilityPermissions: string;
+  dataPortabilityServer: string;
+  dataPortabilityGrantees: string;
+}
 
 export type SandboxRuntimeKind = "docker" | "fake";
 export type SandboxSyncMode = "enabled" | "disabled";
 
 export interface AgentJobsConfig {
   gatewayUrl: string;
-  storageApiUrl?: string;
+  storageApiUrl: string;
+  chainId: SupportedChainId;
+  contracts: SandboxContracts;
   nodeId: string;
   nodeSecret: string;
   runtime: SandboxRuntimeKind;
@@ -87,6 +111,8 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
   }
 
   const sync = readSync(env.SANDBOX_SYNC);
+  const chainId = readChainId(env.CHAIN_ID);
+  const contracts = readContracts(env);
   const sandboxMax = readInteger(
     env.SANDBOX_MAX,
     "SANDBOX_MAX",
@@ -119,10 +145,12 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
   } catch {
     throw new Error("GATEWAY_URL must be a valid URL");
   }
-  if (env.STORAGE_API_URL) {
+  const storageApiUrlValue =
+    env.STORAGE_API_URL ?? DEFAULT_STORAGE_API_URLS[chainId];
+  if (storageApiUrlValue) {
     let storageApiUrl: URL;
     try {
-      storageApiUrl = new URL(env.STORAGE_API_URL);
+      storageApiUrl = new URL(storageApiUrlValue);
     } catch {
       throw new Error("STORAGE_API_URL must be a valid URL");
     }
@@ -150,7 +178,9 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
 
   return {
     gatewayUrl: env.GATEWAY_URL,
-    ...(env.STORAGE_API_URL ? { storageApiUrl: env.STORAGE_API_URL } : {}),
+    storageApiUrl: storageApiUrlValue,
+    chainId,
+    contracts,
     nodeId: env.NODE_ID,
     nodeSecret: env.NODE_SECRET,
     runtime,
@@ -169,6 +199,53 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
       ? { gatewayBypassSecret: env.VERCEL_PROTECTION_BYPASS }
       : {}),
   };
+}
+
+function readChainId(value: string | undefined): SupportedChainId {
+  const chainId = value === undefined ? MOKSHA_CHAIN_ID : Number(value);
+  if (chainId !== MAINNET_CHAIN_ID && chainId !== MOKSHA_CHAIN_ID) {
+    throw new Error("CHAIN_ID must be 1480 or 14800");
+  }
+
+  return chainId;
+}
+
+function readContracts(env: NodeJS.ProcessEnv): SandboxContracts {
+  return {
+    dataRegistry: readAddress(
+      env.DATA_REGISTRY_CONTRACT,
+      "DATA_REGISTRY_CONTRACT",
+      DEFAULT_CONTRACTS.dataRegistry,
+    ),
+    dataPortabilityServer: readAddress(
+      env.DATA_PORTABILITY_SERVER_CONTRACT,
+      "DATA_PORTABILITY_SERVER_CONTRACT",
+      DEFAULT_CONTRACTS.dataPortabilityServer,
+    ),
+    dataPortabilityGrantees: readAddress(
+      env.DATA_PORTABILITY_GRANTEES_CONTRACT,
+      "DATA_PORTABILITY_GRANTEES_CONTRACT",
+      DEFAULT_CONTRACTS.dataPortabilityGrantees,
+    ),
+    dataPortabilityPermissions: readAddress(
+      env.DATA_PORTABILITY_PERMISSIONS_CONTRACT,
+      "DATA_PORTABILITY_PERMISSIONS_CONTRACT",
+      DEFAULT_CONTRACTS.dataPortabilityPermissions,
+    ),
+  };
+}
+
+function readAddress(
+  value: string | undefined,
+  name: string,
+  fallback: string,
+): string {
+  const address = value ?? fallback;
+  if (!isAddress(address)) {
+    throw new Error(`${name} must be an address`);
+  }
+
+  return address;
 }
 
 function readRuntime(value: string | undefined): SandboxRuntimeKind {

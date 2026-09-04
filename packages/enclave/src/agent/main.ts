@@ -88,9 +88,9 @@ async function startJobs(
         registry,
         image: config.image,
         gatewayUrl: config.gatewayUrl,
-        ...(config.storageApiUrl
-          ? { storageApiUrl: config.storageApiUrl }
-          : {}),
+        storageApiUrl: config.storageApiUrl,
+        chainId: config.chainId,
+        contracts: config.contracts,
         ...(config.gatewayBypassSecret
           ? { gatewayBypassSecret: config.gatewayBypassSecret }
           : {}),

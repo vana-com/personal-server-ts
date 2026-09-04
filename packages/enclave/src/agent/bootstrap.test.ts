@@ -3,6 +3,13 @@ import { agentConfigFromEnv } from "./bootstrap.js";
 const TAGGED_IMAGE = "personal-server:test";
 const DIGEST_IMAGE = `personal-server@sha256:${"a".repeat(64)}`;
 const IMAGE_ID = `sha256:${"b".repeat(64)}`;
+const MAINNET_CHAIN_ID = 1480;
+const MOKSHA_CHAIN_ID = 14800;
+const DATA_REGISTRY = "0x1111111111111111111111111111111111111111";
+const DATA_PORTABILITY_SERVER = "0x2222222222222222222222222222222222222222";
+const DATA_PORTABILITY_GRANTEES = "0x3333333333333333333333333333333333333333";
+const DATA_PORTABILITY_PERMISSIONS =
+  "0x4444444444444444444444444444444444444444";
 
 describe("agentConfigFromEnv", () => {
   it("boots the fake with the default app id", async () => {
@@ -54,6 +61,11 @@ describe("agentConfigFromEnv", () => {
       WORK_DELAY_MS: "250",
       VERCEL_PROTECTION_BYPASS: "preview-secret",
       STORAGE_API_URL: "https://storage-dev.vana.org",
+      CHAIN_ID: String(MAINNET_CHAIN_ID),
+      DATA_REGISTRY_CONTRACT: DATA_REGISTRY,
+      DATA_PORTABILITY_SERVER_CONTRACT: DATA_PORTABILITY_SERVER,
+      DATA_PORTABILITY_GRANTEES_CONTRACT: DATA_PORTABILITY_GRANTEES,
+      DATA_PORTABILITY_PERMISSIONS_CONTRACT: DATA_PORTABILITY_PERMISSIONS,
     });
 
     expect(config.jobs).toEqual({
@@ -72,10 +84,17 @@ describe("agentConfigFromEnv", () => {
       workDelayMs: 250,
       gatewayBypassSecret: "preview-secret",
       storageApiUrl: "https://storage-dev.vana.org",
+      chainId: MAINNET_CHAIN_ID,
+      contracts: {
+        dataRegistry: DATA_REGISTRY,
+        dataPortabilityServer: DATA_PORTABILITY_SERVER,
+        dataPortabilityGrantees: DATA_PORTABILITY_GRANTEES,
+        dataPortabilityPermissions: DATA_PORTABILITY_PERMISSIONS,
+      },
     });
   });
 
-  it("omits the optional storage API URL when unset", () => {
+  it("defaults Moksha jobs to the development storage API", () => {
     const config = agentConfigFromEnv({
       DSTACK_FAKE: "1",
       ENCLAVE_AGENT_SECRET: "agent-secret",
@@ -86,7 +105,28 @@ describe("agentConfigFromEnv", () => {
       SANDBOX_RUNTIME: "fake",
     });
 
-    expect(config.jobs).not.toHaveProperty("storageApiUrl");
+    expect(config.jobs).toMatchObject({
+      chainId: MOKSHA_CHAIN_ID,
+      storageApiUrl: "https://storage-dev.vana.org",
+    });
+  });
+
+  it("defaults mainnet jobs to the production storage API", () => {
+    const config = agentConfigFromEnv({
+      DSTACK_FAKE: "1",
+      ENCLAVE_AGENT_SECRET: "agent-secret",
+      GATEWAY_URL: "https://gateway.example",
+      NODE_ID: "node-1",
+      NODE_SECRET: "node-secret",
+      PS_IMAGE: TAGGED_IMAGE,
+      SANDBOX_RUNTIME: "fake",
+      CHAIN_ID: String(MAINNET_CHAIN_ID),
+    });
+
+    expect(config.jobs).toMatchObject({
+      chainId: MAINNET_CHAIN_ID,
+      storageApiUrl: "https://storage.vana.org",
+    });
   });
 
   it.each(["http://storage.example", "storage.example"])(
@@ -249,6 +289,7 @@ describe("agentConfigFromEnv", () => {
     ["SANDBOX_MAX", "0", "SANDBOX_MAX"],
     ["LEASE_SECONDS", "301", "LEASE_SECONDS"],
     ["SANDBOX_SYNC", "sometimes", "SANDBOX_SYNC"],
+    ["CHAIN_ID", "1", "CHAIN_ID"],
   ])("names %s in validation errors", (name, value, expected) => {
     expect(() =>
       agentConfigFromEnv({

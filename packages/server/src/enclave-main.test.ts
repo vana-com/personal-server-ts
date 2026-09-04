@@ -164,7 +164,7 @@ describe("readEnclaveEnv", () => {
     );
   });
 
-  it("leaves storage configuration unchanged when STORAGE_API_URL is unset", async () => {
+  it("defaults Moksha to the development storage API", async () => {
     const config = prepareEnclaveRun();
     vi.stubEnv("STORAGE_API_URL", undefined);
 
@@ -172,8 +172,50 @@ describe("readEnclaveEnv", () => {
 
     expect(config.storage).toEqual({
       backend: "local",
-      config: { vana: { apiUrl: "https://storage.vana.org" } },
+      config: { vana: { apiUrl: "https://storage-dev.vana.org" } },
     });
+  });
+
+  it("applies mainnet chain and contract environment configuration", async () => {
+    const config = prepareEnclaveRun();
+    vi.stubEnv("CHAIN_ID", "1480");
+    vi.stubEnv(
+      "DATA_REGISTRY_CONTRACT",
+      "0x1111111111111111111111111111111111111111",
+    );
+    vi.stubEnv(
+      "DATA_PORTABILITY_SERVER_CONTRACT",
+      "0x2222222222222222222222222222222222222222",
+    );
+    vi.stubEnv(
+      "DATA_PORTABILITY_GRANTEES_CONTRACT",
+      "0x3333333333333333333333333333333333333333",
+    );
+    vi.stubEnv(
+      "DATA_PORTABILITY_PERMISSIONS_CONTRACT",
+      "0x4444444444444444444444444444444444444444",
+    );
+
+    await runEnclaveMain();
+
+    expect(config.gateway).toMatchObject({
+      chainId: 1480,
+      contracts: {
+        dataRegistry: "0x1111111111111111111111111111111111111111",
+        dataPortabilityServer: "0x2222222222222222222222222222222222222222",
+        dataPortabilityGrantees: "0x3333333333333333333333333333333333333333",
+        dataPortabilityPermissions:
+          "0x4444444444444444444444444444444444444444",
+      },
+    });
+    expect(config.storage.config.vana?.apiUrl).toBe("https://storage.vana.org");
+  });
+
+  it.each(["1", "moksha"])("rejects invalid CHAIN_ID %s", async (chainId) => {
+    prepareEnclaveRun();
+    vi.stubEnv("CHAIN_ID", chainId);
+
+    await expect(runEnclaveMain()).rejects.toThrow("CHAIN_ID");
   });
 
   it("passes STORAGE_API_URL to vana storage without changing the backend", async () => {

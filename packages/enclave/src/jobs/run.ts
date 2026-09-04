@@ -8,6 +8,7 @@ import { decryptEcies } from "../agent/ecies.js";
 import { deriveEnclaveKey } from "../identity/wallet.js";
 import type { SandboxRegistry } from "../sandbox/registry.js";
 import type { SandboxSpec } from "../sandbox/runtime.js";
+import type { SandboxContracts } from "../agent/bootstrap.js";
 import { unseal } from "../sealing/envelope.js";
 import type { JobLogger } from "./claim-loop.js";
 import { LeaseLostError, type GatewayClient } from "./gateway-client.js";
@@ -76,6 +77,8 @@ export interface RunJobDeps {
   image: string;
   gatewayUrl: string;
   storageApiUrl?: string;
+  chainId: number;
+  contracts: SandboxContracts;
   gatewayBypassSecret?: string;
   leaseSeconds: number;
   sync: SyncMode;
@@ -86,11 +89,26 @@ export interface RunJobDeps {
   sleep?: (milliseconds: number) => Promise<void>;
 }
 
+export class SandboxChainMismatchError extends Error {
+  constructor(
+    public readonly expectedChainId: number,
+    public readonly receivedChainId: number,
+  ) {
+    super(
+      `Gateway job chain ${receivedChainId} does not match sandbox chain ${expectedChainId}`,
+    );
+    this.name = "SandboxChainMismatchError";
+  }
+}
+
 export async function runJob(
   job: ClaimedJob,
   identity: ClaimedIdentity,
   deps: RunJobDeps,
 ): Promise<void> {
+  if (job.chainId !== deps.chainId) {
+    throw new SandboxChainMismatchError(deps.chainId, job.chainId);
+  }
   const lease = startLease(job, deps);
   const now = deps.now ?? Date.now;
   const requestFetch = deps.fetch ?? fetch;
@@ -428,6 +446,13 @@ function sandboxSpec(
       PS_SERVER_PUBLIC_KEY: identity.enclavePublicKey,
       SYNC_ENABLED: deps.sync === "enabled" ? SYNC_ENABLED : SYNC_DISABLED,
       GATEWAY_URL: deps.gatewayUrl,
+      CHAIN_ID: String(deps.chainId),
+      DATA_REGISTRY_CONTRACT: deps.contracts.dataRegistry,
+      DATA_PORTABILITY_SERVER_CONTRACT: deps.contracts.dataPortabilityServer,
+      DATA_PORTABILITY_GRANTEES_CONTRACT:
+        deps.contracts.dataPortabilityGrantees,
+      DATA_PORTABILITY_PERMISSIONS_CONTRACT:
+        deps.contracts.dataPortabilityPermissions,
       ...(deps.storageApiUrl ? { STORAGE_API_URL: deps.storageApiUrl } : {}),
       ...(deps.gatewayBypassSecret
         ? { VERCEL_PROTECTION_BYPASS: deps.gatewayBypassSecret }

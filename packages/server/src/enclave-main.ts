@@ -11,6 +11,18 @@ const REQUIRED_ENV = [
   "PS_SERVER_PUBLIC_KEY",
 ] as const;
 const SYNC_DISABLED = "false";
+const MAINNET_CHAIN_ID = 1_480;
+const MOKSHA_CHAIN_ID = 14_800;
+const DEFAULT_STORAGE_API_URLS = {
+  [MAINNET_CHAIN_ID]: "https://storage.vana.org",
+  [MOKSHA_CHAIN_ID]: "https://storage-dev.vana.org",
+} as const;
+const CONTRACT_ENV = {
+  DATA_REGISTRY_CONTRACT: "dataRegistry",
+  DATA_PORTABILITY_SERVER_CONTRACT: "dataPortabilityServer",
+  DATA_PORTABILITY_GRANTEES_CONTRACT: "dataPortabilityGrantees",
+  DATA_PORTABILITY_PERMISSIONS_CONTRACT: "dataPortabilityPermissions",
+} as const;
 
 export interface EnclaveEnv {
   ownerSignature: Hex;
@@ -60,13 +72,27 @@ export async function runEnclaveMain(): Promise<void> {
   const enclaveEnv = readEnclaveEnv(process.env);
   const rootPath = process.env.PERSONAL_SERVER_ROOT_PATH;
   const config = await loadConfig({ rootPath });
+  const chainId = readChainId(process.env.CHAIN_ID);
+  config.gateway.chainId = chainId;
+  for (const [envName, contractName] of Object.entries(CONTRACT_ENV)) {
+    const address = process.env[envName];
+    if (!address) {
+      continue;
+    }
+    if (!isAddress(address)) {
+      throw new Error(`${envName} must be an address`);
+    }
+    config.gateway.contracts[contractName] = address;
+  }
   if (process.env.GATEWAY_URL) {
     config.gateway.url = process.env.GATEWAY_URL;
   }
-  if (process.env.STORAGE_API_URL) {
+  const storageApiUrlValue =
+    process.env.STORAGE_API_URL ?? DEFAULT_STORAGE_API_URLS[chainId];
+  if (storageApiUrlValue) {
     let storageApiUrl: URL;
     try {
-      storageApiUrl = new URL(process.env.STORAGE_API_URL);
+      storageApiUrl = new URL(storageApiUrlValue);
     } catch {
       throw new Error("STORAGE_API_URL must be a valid absolute https URL");
     }
@@ -75,7 +101,7 @@ export async function runEnclaveMain(): Promise<void> {
     }
     config.storage.config.vana = {
       ...config.storage.config.vana,
-      apiUrl: process.env.STORAGE_API_URL,
+      apiUrl: storageApiUrlValue,
     };
   }
   // Preview-testing hook; production fetch behaviour is unchanged when unset.
@@ -117,6 +143,15 @@ export async function runEnclaveMain(): Promise<void> {
   };
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
+}
+
+function readChainId(value: string | undefined): 1480 | 14800 {
+  const chainId = value === undefined ? MOKSHA_CHAIN_ID : Number(value);
+  if (chainId !== MAINNET_CHAIN_ID && chainId !== MOKSHA_CHAIN_ID) {
+    throw new Error("CHAIN_ID must be 1480 or 14800");
+  }
+
+  return chainId;
 }
 
 function installGatewayBypass(gatewayUrl: string, secret: string): void {

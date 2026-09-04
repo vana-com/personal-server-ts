@@ -19,6 +19,8 @@ const MILLISECONDS_PER_SECOND = 1_000;
 const NO_CONTENT = 204;
 const FORBIDDEN = 403;
 const CONFLICT = 409;
+const MAINNET_CHAIN_ID = 1_480;
+const MOKSHA_CHAIN_ID = 14_800;
 
 export interface GatewayClient {
   claim(wait: number, body: ClaimRequest): Promise<ClaimResponse | null>;
@@ -169,6 +171,8 @@ function isClaimResponse(value: unknown): value is ClaimResponse {
 
   return (
     typeof value.job.jobId === "string" &&
+    (value.job.chainId === MAINNET_CHAIN_ID ||
+      value.job.chainId === MOKSHA_CHAIN_ID) &&
     typeof value.job.fencingToken === "number" &&
     typeof value.job.requestCiphertext === "string" &&
     typeof value.identity.userPsId === "string" &&

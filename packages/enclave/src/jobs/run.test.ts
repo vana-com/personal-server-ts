@@ -37,6 +37,7 @@ const EPOCH = 2;
 const NOW_MS = Date.parse("2026-09-03T12:00:00.000Z");
 const DEADLINE = "2026-09-03T12:05:00.000Z";
 const JOB_ID = "job-1";
+const CHAIN_ID = 14_800;
 const TAMPER_BIT = 1;
 const RESULT = {
   resultCiphertext: "ciphertext",
@@ -150,6 +151,7 @@ async function createFixture(): Promise<Fixture> {
   );
   const job: ClaimResponse["job"] = {
     jobId: JOB_ID,
+    chainId: CHAIN_ID,
     owner: OWNER,
     builder: BUILDER,
     grantId: GRANT_ID,
@@ -198,6 +200,13 @@ async function createFixture(): Promise<Fixture> {
     registry,
     image: "personal-server:test",
     gatewayUrl: "https://gateway.example",
+    chainId: CHAIN_ID,
+    contracts: {
+      dataRegistry: "0x1111111111111111111111111111111111111111",
+      dataPortabilityServer: "0x2222222222222222222222222222222222222222",
+      dataPortabilityGrantees: "0x3333333333333333333333333333333333333333",
+      dataPortabilityPermissions: "0x4444444444444444444444444444444444444444",
+    },
     gatewayBypassSecret: "preview-secret",
     leaseSeconds: 30,
     sync: "disabled",
@@ -281,6 +290,14 @@ describe("runJob", () => {
         PS_SERVER_PUBLIC_KEY: fixture.identity.enclavePublicKey,
         SYNC_ENABLED: "false",
         GATEWAY_URL: "https://gateway.example",
+        CHAIN_ID: String(CHAIN_ID),
+        DATA_REGISTRY_CONTRACT: "0x1111111111111111111111111111111111111111",
+        DATA_PORTABILITY_SERVER_CONTRACT:
+          "0x2222222222222222222222222222222222222222",
+        DATA_PORTABILITY_GRANTEES_CONTRACT:
+          "0x3333333333333333333333333333333333333333",
+        DATA_PORTABILITY_PERMISSIONS_CONTRACT:
+          "0x4444444444444444444444444444444444444444",
         VERCEL_PROTECTION_BYPASS: "preview-secret",
       },
     });
@@ -296,10 +313,29 @@ describe("runJob", () => {
         "VANA_MASTER_KEY_SIGNATURE",
         "VERCEL_PROTECTION_BYPASS",
         "GATEWAY_URL",
+        "CHAIN_ID",
+        "DATA_REGISTRY_CONTRACT",
+        "DATA_PORTABILITY_SERVER_CONTRACT",
+        "DATA_PORTABILITY_GRANTEES_CONTRACT",
+        "DATA_PORTABILITY_PERMISSIONS_CONTRACT",
       ].sort(),
     );
     expect(fixture.runtime.specs[0]?.env.STORAGE_API_URL).toBeUndefined();
     expect(fixture.keyFill).toHaveBeenCalledWith(0);
+  });
+
+  it("rejects a Gateway job for a different sandbox chain", async () => {
+    const fixture = await createFixture();
+    fixture.job.chainId = 1480;
+
+    await expect(
+      runJob(fixture.job, fixture.identity, fixture.deps),
+    ).rejects.toMatchObject({
+      name: "SandboxChainMismatchError",
+      expectedChainId: CHAIN_ID,
+      receivedChainId: 1480,
+    });
+    expect(fixture.runtime.specs).toHaveLength(0);
   });
 
   it("forwards the configured storage API URL to the sandbox", async () => {

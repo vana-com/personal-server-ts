@@ -1,4 +1,5 @@
 import type { Hex } from "viem";
+import type { ClaimResponse as SdkClaimResponse } from "@opendatalabs/vana-sdk/protocol/jobs";
 
 export {
   JobEnvelopeError,
@@ -10,7 +11,6 @@ export {
   MAX_LEASE_SECONDS,
   MAX_WAIT_SECONDS,
   type ClaimRequest,
-  type ClaimResponse,
   type CompleteRequest,
   type FailRequest,
   type FencedResponse,
@@ -19,6 +19,10 @@ export {
   type JobRequestEnvelope,
   type TeeNodeHeartbeat,
 } from "@opendatalabs/vana-sdk/protocol/jobs";
+
+export type ClaimResponse = Omit<SdkClaimResponse, "job"> & {
+  job: SdkClaimResponse["job"] & { chainId: number };
+};
 
 // JOB_EXECUTE_WIRE_START
 export type JobFailureCode =
