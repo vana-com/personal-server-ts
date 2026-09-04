@@ -180,7 +180,8 @@ Today: `/health` is process health only and green during reconciliation; PS neve
 2. Node answers a nonce challenge; verifier checks quote, OS/TCB, `app_id`, `compose_hash`, transport key, KMS-root fingerprint.
 3. Node verifies the PS image, runs a KMS derivation canary, heartbeats `ready`.
 4. Operator admits. Gateway alone reserves capacity.
-5. Drain: stop claims, finish, wipe, destroy.
+5. Drain: stop claims, finish, wipe, destroy. Drain is graceful; only a removed node loses its leases (heartbeats refused), which is the recovery lever.
+6. Rolling a compose change: update each CVM in place (`phala deploy --cvm-id`, same `app_id`, so the KMS key and sealed identities survive), register it under a new node id (heartbeats match on `compose_hash`), admit, then drain and remove the old id. A replica inherits its source compose, so replication cannot carry a compose change.
 
 Today: no node, admission, or capacity state exists. KMS authorization and Gateway admission are separate gates; a wrong KMS root looks healthy but derives every wallet wrong, hence the canary. Outer-CVM attestation does not approve the PS image the agent pulls; image digest pinning does.
 
@@ -307,6 +308,8 @@ blobs                = no conditional PUT needed in v1 (single executor per user
 Done in parts on 2026-09-02 (Spikes 1 to 4, `docs/260902-enclave-spike-results.md`): derivation identical across CVMs and compose updates; local queue submit → claim p95 220 ms at 50 jobs/min with 3 workers, `?wait=25` result p95 534 ms; sandbox cold start 7.5 s p50. Hydration measured 2026-09-02 (50 MB owner: 65 s p95 to sync complete on 1 vCPU). Queue on a Vercel preview measured the same day (submit→claim p95 1.6 s at 50/min, three workers); decision 20's trigger did not fire, with little margin. Remaining: the chained run (job through the preview queue to a CVM sandbox) once the node agent and job routes are real code.
 
 **Identity flow verified end to end (2026-09-03).** Node agent (`packages/enclave`, registry-free compose in `deploy/dstack`) on two Phala CVMs under one `app_id`, Gateway preview (`api/v1/identity`) with a Neon branch, scripted owner (`scripts/e2e-identity.ts`): prepare, evidence verify against the live KMS root, V2 registration, sealed delivery, idempotency, three negatives, revoke to epoch 2, all pass; a delivery encrypted to node A's evidence key was unsealed by node B through product code. Agent boot to healthy 124 s including CVM boot (install at boot; production pins an image digest). **Chained wake measured (2026-09-03, level B for jobs).** A builder's raw-read job submitted to the Gateway preview was claimed by a node agent on a Phala CVM, which unsealed the owner's signature, booted a gVisor sandbox, hydrated from Moksha, executed the read and returned an encrypted result: cold 22 s mean (19 to 26 s), warm 1.3 s in an already-booted sandbox. Details and defects in `260903-jobs-contract.md`. Still unverified: concurrent density.
+
+**Full e2e passed (2026-09-04).** Real Privy owner (web + Account, Level C identity and owner-signed grant), registered builder, `POST /v1/jobs` on a Gateway preview, gVisor sandbox on a Phala CVM hydrating from the Moksha dev storage host, ECIES result decrypted by the builder: cold 34.8 s, warm 2.1 s; a real builder app (Lorebook) read the same grant through the SDK jobs client in 13 s. Density on `tdx.2xlarge`: 20 concurrent cold sandboxes, 20 of 20 in p95 25 s, so decision 13's `SANDBOX_MAX=20` holds. Details in `docs/260903-jobs-contract.md`.
 
 ## Open
 
