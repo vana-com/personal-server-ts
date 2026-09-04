@@ -26,6 +26,7 @@ services:
       # Literal KEY=value overrides encrypted env; use passthrough entries for operator values.
       - GIT_REF
       - GATEWAY_URL
+      - STORAGE_API_URL
       - NODE_ID
       - NODE_SECRET
       - SANDBOX_RUNTIME=docker

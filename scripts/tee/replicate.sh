@@ -102,7 +102,7 @@ printf 'ENCLAVE_AGENT_SECRET=%s\nGIT_REF=%s\n' \
   "$ENCLAVE_AGENT_SECRET" "$GIT_REF" >"$env_file"
 printf 'NODE_SECRET=%s\nNODE_ID=%s\nGATEWAY_URL=%s\nPS_IMAGE=%s\n' \
   "$NODE_SECRET" "$NODE_ID" "$GATEWAY_URL" "$PS_IMAGE" >>"$env_file"
-for optional_name in SANDBOX_MAX SANDBOX_IDLE_TTL_SECONDS LEASE_SECONDS VERCEL_PROTECTION_BYPASS WORK_DELAY_MS SANDBOX_SYNC; do
+for optional_name in SANDBOX_MAX SANDBOX_IDLE_TTL_SECONDS LEASE_SECONDS VERCEL_PROTECTION_BYPASS WORK_DELAY_MS SANDBOX_SYNC STORAGE_API_URL; do
   optional_value=${!optional_name:-}
   if [[ -n $optional_value ]]; then
     printf '%s=%s\n' "$optional_name" "$optional_value" >>"$env_file"

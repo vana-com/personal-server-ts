@@ -26,7 +26,9 @@ level-B clone bootstrap fetches that exact commit and verifies the checkout;
 production follows architecture decision 23 and uses a digest-pinned agent
 image under one approved compose hash. `SANDBOX_MAX`,
 `SANDBOX_IDLE_TTL_SECONDS`, and `LEASE_SECONDS` are optional and default to 20,
-600, and 30.
+600, and 30. `STORAGE_API_URL` is optional and defaults to the production
+storage host when unset; use `https://storage-dev.vana.org` for Moksha dev
+deployments.
 
 Use `--inline` for the registry-free level-B jobs variant, which builds the
 root `Dockerfile` inside the CVM and resolves its own `PS_IMAGE` to a Docker

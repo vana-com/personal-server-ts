@@ -28,6 +28,7 @@ services:
       - ENCLAVE_AGENT_PORT=8787
       - GIT_REF
       - GATEWAY_URL
+      - STORAGE_API_URL
       - NODE_ID
       - NODE_SECRET
       - SANDBOX_RUNTIME=docker
