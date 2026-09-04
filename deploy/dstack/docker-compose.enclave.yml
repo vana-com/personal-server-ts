@@ -59,9 +59,13 @@ services:
         apk add --no-cache docker-cli git
         : "$${GIT_REF:?GIT_REF must be a 40-hex commit SHA}"
         git init .
-        git remote add origin https://github.com/vana-com/personal-server-ts
+        if git remote get-url origin >/dev/null 2>&1; then
+          git remote set-url origin https://github.com/vana-com/personal-server-ts
+        else
+          git remote add origin https://github.com/vana-com/personal-server-ts
+        fi
         git fetch --depth 1 origin "$${GIT_REF}"
-        git checkout --detach FETCH_HEAD
+        git checkout --detach --force FETCH_HEAD
         resolved_ref="$$(git rev-parse HEAD)"
         if [ "$${resolved_ref}" != "$${GIT_REF}" ]; then
           echo "Checked out commit $${resolved_ref}, expected GIT_REF $${GIT_REF}" >&2
