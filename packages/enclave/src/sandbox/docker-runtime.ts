@@ -1,4 +1,7 @@
 import { execFile } from "node:child_process";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { HealthProbe, SyncProbe } from "./probes.js";
 import { probeHealth, probeSync } from "./probes.js";
 import {
@@ -49,6 +52,9 @@ const SYNC_TOKEN_MESSAGE = "Sandbox sync requires PS_ACCESS_TOKEN";
 const INVALID_DOCKER_HOST = "DOCKER_HOST must have a hostname";
 const STDERR_TAIL_LENGTH = 2_048;
 const SECRET_ENV_KEY_SET = new Set<string>(SECRET_ENV_KEYS);
+const SECRET_ENV_DIRECTORY_PREFIX = "ps-docker-env-";
+const SECRET_ENV_FILENAME = "sandbox.env";
+const SECRET_ENV_LINE_BREAK = /[\r\n]/;
 
 export const DEFAULT_SANDBOX_MEMORY = "512m";
 export const DEFAULT_SANDBOX_CPUS = "2";
@@ -74,6 +80,7 @@ export interface DockerClient {
     command: string,
     args: string[],
     env?: Record<string, string>,
+    redactions?: Record<string, string>,
   ): Promise<string>;
   inspect(id: string): Promise<ContainerInspection>;
 }
@@ -134,11 +141,26 @@ export function createDockerRuntime(
       const name = sandboxName(spec);
       const environment = { ...spec.env, ...FIXED_ENV };
       await removeExistingSandbox(docker, name);
-      const containerId = await docker.run(
-        CREATE_COMMAND,
-        createArgs(name, spec.image, environment, memory, cpus, pidsLimit),
-        secretEnv(environment),
-      );
+      const secretFile = await createSecretEnvFile(environment);
+      let containerId: string;
+      try {
+        containerId = await docker.run(
+          CREATE_COMMAND,
+          createArgs(
+            name,
+            spec.image,
+            environment,
+            memory,
+            cpus,
+            pidsLimit,
+            secretFile.path,
+          ),
+          undefined,
+          secretEnv(environment),
+        );
+      } finally {
+        await rm(secretFile.directory, { recursive: true, force: true });
+      }
 
       try {
         await docker.run(START_COMMAND, [containerId]);
@@ -204,7 +226,8 @@ function createDockerClient(options: DockerClientOptions): DockerClient {
   const host = options.host ?? DEFAULT_DOCKER_HOST;
 
   return {
-    run: (command, args, env) => runDocker(binary, host, command, args, env),
+    run: (command, args, env, redactions) =>
+      runDocker(binary, host, command, args, env, redactions),
     async inspect(id): Promise<ContainerInspection> {
       const [running, hostPortValue] = await Promise.all([
         runDocker(binary, host, INSPECT_COMMAND, [
@@ -234,6 +257,7 @@ function runDocker(
   command: string,
   args: string[],
   env?: Record<string, string>,
+  redactions?: Record<string, string>,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(
@@ -242,7 +266,7 @@ function runDocker(
       { env: { ...env, DOCKER_HOST: host } },
       (error, stdout, stderr) => {
         if (error) {
-          reject(dockerCommandError(command, error, stderr, env));
+          reject(dockerCommandError(command, error, stderr, redactions ?? env));
           return;
         }
 
@@ -288,6 +312,7 @@ function createArgs(
   memory: string,
   cpus: string,
   pidsLimit: number,
+  secretEnvFile: string,
 ): string[] {
   const args = [
     "--name",
@@ -316,11 +341,45 @@ function createArgs(
   ];
 
   for (const [key, value] of Object.entries(environment).sort()) {
-    args.push("--env", SECRET_ENV_KEY_SET.has(key) ? key : `${key}=${value}`);
+    if (!SECRET_ENV_KEY_SET.has(key)) {
+      args.push("--env", `${key}=${value}`);
+    }
   }
+  args.push("--env-file", secretEnvFile);
   args.push(image);
 
   return args;
+}
+
+interface SecretEnvFile {
+  directory: string;
+  path: string;
+}
+
+async function createSecretEnvFile(
+  environment: Record<string, string>,
+): Promise<SecretEnvFile> {
+  const secrets = secretEnv(environment);
+  for (const [key, value] of Object.entries(secrets)) {
+    if (SECRET_ENV_LINE_BREAK.test(value)) {
+      throw new Error(`${key} must not contain a line break`);
+    }
+  }
+  const directory = await mkdtemp(join(tmpdir(), SECRET_ENV_DIRECTORY_PREFIX));
+  try {
+    await chmod(directory, 0o700);
+    const path = join(directory, SECRET_ENV_FILENAME);
+    const content = Object.entries(secrets)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, value]) => `${key}=${value}\n`)
+      .join("");
+    await writeFile(path, content, { mode: 0o600, flag: "wx" });
+
+    return { directory, path };
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 async function removeExistingSandbox(

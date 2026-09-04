@@ -397,7 +397,12 @@ describe("runJob", () => {
     expect(docker.run).toHaveBeenCalledWith(
       "create",
       expect.any(Array),
-      expect.any(Object),
+      undefined,
+      expect.objectContaining({
+        VANA_MASTER_KEY_SIGNATURE: expect.any(String),
+        PS_ACCESS_TOKEN: expect.any(String),
+        VERCEL_PROTECTION_BYPASS: "preview-secret",
+      }),
     );
   });
 

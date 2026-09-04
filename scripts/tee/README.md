@@ -37,6 +37,11 @@ for Moksha and `https://storage.vana.org` for mainnet. Operators may override
 Moksha defaults. Provision, replicate, and update forward all of these optional
 variables to the agent and owner sandboxes.
 
+Sandbox credentials, including `VERCEL_PROTECTION_BYPASS`, are supplied to
+Docker through a mode-0600 env file in a private temporary directory. The agent
+deletes that file immediately after `docker create`; secret values are never
+placed on the Docker command line.
+
 Use `--inline` for the registry-free level-B jobs variant, which builds the
 root `Dockerfile` inside the CVM and resolves its own `PS_IMAGE` to a Docker
 image id. The operator does not need to supply `PS_IMAGE`; the local build tag

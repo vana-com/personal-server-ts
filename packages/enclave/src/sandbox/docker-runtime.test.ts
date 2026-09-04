@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Hex } from "viem";
+import { access, readFile, stat } from "node:fs/promises";
 import {
   createDockerRuntime,
   type ContainerInspection,
@@ -140,8 +141,6 @@ describe("docker sandbox runtime", () => {
         "--env",
         "PERSONAL_SERVER_ROOT_PATH=/data",
         "--env",
-        "PS_ACCESS_TOKEN",
-        "--env",
         `PS_SERVER_ADDRESS=0x${"22".repeat(20)}`,
         "--env",
         `PS_SERVER_PUBLIC_KEY=0x${"33".repeat(33)}`,
@@ -151,14 +150,10 @@ describe("docker sandbox runtime", () => {
         "SYNC_ENABLED=false",
         "--env",
         "TUNNEL_ENABLED=false",
-        "--env",
-        "VANA_MASTER_KEY_SIGNATURE",
+        "--env-file",
+        expect.stringMatching(/ps-docker-env-.*\/sandbox\.env$/),
         IMAGE,
       ],
-      env: {
-        PS_ACCESS_TOKEN: ACCESS_TOKEN,
-        VANA_MASTER_KEY_SIGNATURE: MASTER_KEY_SIGNATURE,
-      },
     });
     expect(docker.calls[1]?.args.join(" ")).not.toContain(ACCESS_TOKEN);
     expect(docker.calls[1]?.args.join(" ")).not.toContain(MASTER_KEY_SIGNATURE);
@@ -187,6 +182,56 @@ describe("docker sandbox runtime", () => {
         "128",
       ]),
     );
+  });
+
+  it("passes sandbox secrets through a private temporary env file", async () => {
+    let envFilePath = "";
+    let envFileContent = "";
+    let envFileMode = 0;
+    let createArgs: string[] = [];
+    let createEnv: Record<string, string> | undefined;
+    const docker: DockerClient = {
+      async run(command, args, env) {
+        if (command === "create") {
+          createArgs = args;
+          createEnv = env;
+          const envFileIndex = args.indexOf("--env-file");
+          expect(envFileIndex).toBeGreaterThan(-1);
+          envFilePath = args[envFileIndex + 1] ?? "";
+          envFileContent = await readFile(envFilePath, "utf8");
+          envFileMode = (await stat(envFilePath)).mode & 0o777;
+
+          return "container-id";
+        }
+
+        return "";
+      },
+      async inspect() {
+        return { running: true, hostPort: 49_152 };
+      },
+    };
+    const runtime = createDockerRuntime({
+      docker,
+      health: async () => true,
+    });
+
+    await runtime.start(
+      sandboxSpec({ VERCEL_PROTECTION_BYPASS: "preview-secret" }),
+    );
+
+    expect(envFileMode).toBe(0o600);
+    expect(envFileContent.split("\n").filter(Boolean).sort()).toEqual(
+      [
+        `PS_ACCESS_TOKEN=${ACCESS_TOKEN}`,
+        `VANA_MASTER_KEY_SIGNATURE=${MASTER_KEY_SIGNATURE}`,
+        "VERCEL_PROTECTION_BYPASS=preview-secret",
+      ].sort(),
+    );
+    expect(createArgs.join(" ")).not.toContain("preview-secret");
+    expect(createArgs.join(" ")).not.toContain(ACCESS_TOKEN);
+    expect(createArgs.join(" ")).not.toContain(MASTER_KEY_SIGNATURE);
+    expect(createEnv).toBeUndefined();
+    await expect(access(envFilePath)).rejects.toThrow();
   });
 
   it("removes every labeled sandbox during boot reconciliation", async () => {

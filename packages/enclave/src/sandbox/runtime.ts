@@ -34,6 +34,7 @@ export const SANDBOX_ENV_KEYS = [
 export const SECRET_ENV_KEYS = [
   "VANA_MASTER_KEY_SIGNATURE",
   "PS_ACCESS_TOKEN",
+  "VERCEL_PROTECTION_BYPASS",
 ] as const;
 
 export type SandboxEnvKey = (typeof SANDBOX_ENV_KEYS)[number];
