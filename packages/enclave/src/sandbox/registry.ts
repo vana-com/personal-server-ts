@@ -1,5 +1,6 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { ActiveSandboxJob, SandboxJobLookup } from "../agent/types.js";
+import { isAbortError, withAbort } from "./abort.js";
 import type { SyncStatus } from "./probes.js";
 import type { SandboxHandle, SandboxRuntime, SandboxSpec } from "./runtime.js";
 
@@ -46,6 +47,7 @@ export interface SandboxRegistry {
   acquire(
     key: string,
     buildSpec: (accessToken: string) => SandboxSpec,
+    signal?: AbortSignal,
   ): Promise<SandboxLease>;
   release(key: string): void;
   bindJob(key: string, job: ActiveSandboxJob): () => void;
@@ -97,48 +99,57 @@ export function createSandboxRegistry(
   const logger = options.logger ?? consoleRegistryLogger;
   let draining = false;
 
+  async function acquire(
+    key: string,
+    buildSpec: (accessToken: string) => SandboxSpec,
+    signal?: AbortSignal,
+  ): Promise<SandboxLease> {
+    if (draining) {
+      throw new Error(DRAINING_MESSAGE);
+    }
+
+    const existing = entries.get(key);
+    if (existing) {
+      return acquireExisting(existing, now, signal, () =>
+        acquire(key, buildSpec, signal),
+      );
+    }
+
+    const victim = capacityVictim(entries, max);
+    const entry: RegistryEntry = {
+      state: "starting",
+      lastUsedAt: now(),
+      accessToken: randomBytes(ACCESS_TOKEN_BYTES).toString("hex"),
+      useCount: 1,
+      expiryVersion: 0,
+      activeJobs: new Map(),
+      createdAt: new Date(now()).toISOString(),
+      lastSyncStatus: null,
+    };
+    entries.set(key, entry);
+
+    if (victim) {
+      destroyEntry(entries, victim.key, victim.entry);
+    }
+
+    entry.startPromise = startEntry({
+      key,
+      entry,
+      victim: victim?.entry,
+      entries,
+      runtime: options.runtime,
+      logger,
+      buildSpec,
+      isDraining: () => draining,
+      signal,
+    });
+    const handle = await entry.startPromise;
+
+    return { handle, accessToken: entry.accessToken };
+  }
+
   return {
-    async acquire(key, buildSpec): Promise<SandboxLease> {
-      if (draining) {
-        throw new Error(DRAINING_MESSAGE);
-      }
-
-      const existing = entries.get(key);
-      if (existing) {
-        return acquireExisting(existing, now);
-      }
-
-      const victim = capacityVictim(entries, max);
-      const entry: RegistryEntry = {
-        state: "starting",
-        lastUsedAt: now(),
-        accessToken: randomBytes(ACCESS_TOKEN_BYTES).toString("hex"),
-        useCount: 1,
-        expiryVersion: 0,
-        activeJobs: new Map(),
-        createdAt: new Date(now()).toISOString(),
-        lastSyncStatus: null,
-      };
-      entries.set(key, entry);
-
-      if (victim) {
-        destroyEntry(entries, victim.key, victim.entry);
-      }
-
-      entry.startPromise = startEntry({
-        key,
-        entry,
-        victim: victim?.entry,
-        entries,
-        runtime: options.runtime,
-        logger,
-        buildSpec,
-        isDraining: () => draining,
-      });
-      const handle = await entry.startPromise;
-
-      return { handle, accessToken: entry.accessToken };
-    },
+    acquire,
     release(key): void {
       const entry = entries.get(key);
       if (!entry || entry.state === "destroyed") {
@@ -264,6 +275,8 @@ function findByAccessToken(
 function acquireExisting(
   entry: RegistryEntry,
   now: () => number,
+  signal: AbortSignal | undefined,
+  retry: () => Promise<SandboxLease>,
 ): Promise<SandboxLease> {
   entry.useCount += 1;
   entry.lastUsedAt = now();
@@ -274,10 +287,20 @@ function acquireExisting(
   }
 
   if (entry.state === "starting" && entry.startPromise) {
-    return entry.startPromise.then((handle) => ({
-      handle,
-      accessToken: entry.accessToken,
-    }));
+    return withAbort(entry.startPromise, signal).then(
+      (handle) => ({ handle, accessToken: entry.accessToken }),
+      (error: unknown) => {
+        entry.useCount = Math.max(0, entry.useCount - 1);
+        if (
+          isAbortError(error) &&
+          !signal?.aborted &&
+          entry.state === "destroyed"
+        ) {
+          return retry();
+        }
+        throw error;
+      },
+    );
   }
 
   if (entry.state === "ready" && entry.handle) {
@@ -299,6 +322,7 @@ interface StartEntryOptions {
   logger: SandboxRegistryLogger;
   buildSpec: (accessToken: string) => SandboxSpec;
   isDraining: () => boolean;
+  signal?: AbortSignal;
 }
 
 async function startEntry(options: StartEntryOptions): Promise<SandboxHandle> {
@@ -322,7 +346,7 @@ async function startEntry(options: StartEntryOptions): Promise<SandboxHandle> {
       options.entry.lastSyncStatus = status.lastSyncStatus;
       onStatus?.(status);
     };
-    const handle = await options.runtime.start(spec);
+    const handle = await options.runtime.start(spec, options.signal);
     if (options.isDraining()) {
       await forceRemove(options.runtime, handle.id, options.logger);
       throw new Error(DRAINING_MESSAGE);

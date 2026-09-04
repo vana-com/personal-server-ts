@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { sleepWithAbort, throwIfAborted } from "./abort.js";
 import type {
   HealthProbe,
   SyncProbe,
@@ -153,8 +154,8 @@ export function createDockerRuntime(
   const syncStatus =
     options.syncStatus ??
     (sync
-      ? async (origin: string, accessToken: string) => ({
-          ready: await sync(origin, accessToken),
+      ? async (origin: string, accessToken: string, signal?: AbortSignal) => ({
+          ready: await sync(origin, accessToken, signal),
         })
       : probeSyncStatus);
   const sleep = options.sleep ?? delay;
@@ -178,7 +179,8 @@ export function createDockerRuntime(
         await docker.run(REMOVE_COMMAND, [FORCE_FLAG, VOLUMES_FLAG, ...ids]);
       }
     },
-    async start(spec): Promise<SandboxHandle> {
+    async start(spec, signal): Promise<SandboxHandle> {
+      throwIfAborted(signal);
       assertSandboxEnv(spec.env);
 
       const name = sandboxName(spec);
@@ -206,6 +208,7 @@ export function createDockerRuntime(
       }
 
       try {
+        throwIfAborted(signal);
         await docker.run(START_COMMAND, [containerId]);
         const startedAt = now();
         const createdAt = new Date(startedAt).toISOString();
@@ -221,6 +224,7 @@ export function createDockerRuntime(
           deadline: startedAt + healthTimeoutMs,
           timeoutMs: healthTimeoutMs,
           logger: options.logger,
+          signal,
         });
         spec.onProgress?.("healthy");
 
@@ -242,11 +246,13 @@ export function createDockerRuntime(
             deadline: syncStartedAt + syncTimeoutMs,
             timeoutMs: syncTimeoutMs,
             logger: options.logger,
+            signal,
             onStatus: (lastSyncStatus) =>
               spec.onStatus?.({ containerId, createdAt, lastSyncStatus }),
           });
         }
         spec.onProgress?.("synced");
+        throwIfAborted(signal);
 
         return { id: containerId, origin };
       } catch (error) {
@@ -473,6 +479,7 @@ interface HealthWaitOptions {
   deadline: number;
   timeoutMs: number;
   logger?: SandboxWaitLogger;
+  signal?: AbortSignal;
 }
 
 async function waitForHealth(options: HealthWaitOptions): Promise<string> {
@@ -480,6 +487,7 @@ async function waitForHealth(options: HealthWaitOptions): Promise<string> {
   let nextLogAt = WAIT_LOG_INTERVAL_MS;
   let lastStatus = "port-unavailable";
   while (true) {
+    throwIfAborted(options.signal);
     const inspection = await options.docker.inspect(options.containerId);
     if (!inspection.running) {
       throw new Error(`Sandbox ${options.name} exited before becoming healthy`);
@@ -494,7 +502,10 @@ async function waitForHealth(options: HealthWaitOptions): Promise<string> {
        * direct container-to-container traffic.
        */
       const origin = `http://${options.runtimeHost}:${inspection.hostPort}`;
-      if (await options.health(origin)) {
+      const healthy = options.signal
+        ? await options.health(origin, options.signal)
+        : await options.health(origin);
+      if (healthy) {
         return origin;
       }
       lastStatus = "unhealthy";
@@ -515,7 +526,7 @@ async function waitForHealth(options: HealthWaitOptions): Promise<string> {
       );
     }
 
-    await options.sleep(POLL_INTERVAL_MS);
+    await sleepWithAbort(options.sleep, POLL_INTERVAL_MS, options.signal);
   }
 }
 
@@ -553,15 +564,20 @@ interface SyncWaitOptions {
   timeoutMs: number;
   logger?: SandboxWaitLogger;
   onStatus?: (status: NonNullable<SyncProbeResult["status"]>) => void;
+  signal?: AbortSignal;
 }
 
 async function waitForSync(options: SyncWaitOptions): Promise<void> {
   let nextLogAt = WAIT_LOG_INTERVAL_MS;
   while (true) {
-    const result = await options.syncStatus(
-      options.origin,
-      options.accessToken,
-    );
+    throwIfAborted(options.signal);
+    const result = options.signal
+      ? await options.syncStatus(
+          options.origin,
+          options.accessToken,
+          options.signal,
+        )
+      : await options.syncStatus(options.origin, options.accessToken);
     if (result.status) {
       options.onStatus?.(result.status);
     }
@@ -591,7 +607,7 @@ async function waitForSync(options: SyncWaitOptions): Promise<void> {
       );
     }
 
-    await options.sleep(POLL_INTERVAL_MS);
+    await sleepWithAbort(options.sleep, POLL_INTERVAL_MS, options.signal);
   }
 }
 

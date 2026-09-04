@@ -383,6 +383,35 @@ describe("docker sandbox runtime", () => {
     });
   });
 
+  it("aborts a health wait and removes the container", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const docker = scriptedDocker();
+    docker.inspect = vi.fn().mockResolvedValue({
+      running: true,
+      hostPort: 49_152,
+    });
+    const health = vi.fn().mockResolvedValue(false);
+    const runtime = createDockerRuntime({
+      docker,
+      health,
+      healthTimeoutMs: 1_000,
+    });
+
+    const outcome = runtime
+      .start(sandboxSpec(), controller.signal)
+      .catch((error: unknown) => error);
+    await vi.waitFor(() => expect(health).toHaveBeenCalledOnce());
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    await expect(outcome).resolves.toMatchObject({ name: "AbortError" });
+    expect(docker.calls.at(-1)).toEqual({
+      command: "rm",
+      args: ["--force", "--volumes", "container-id"],
+    });
+  });
+
   it("removes a container that exits before health", async () => {
     const docker = scriptedDocker([{ running: false }]);
     const runtime = createDockerRuntime({
@@ -414,6 +443,31 @@ describe("docker sandbox runtime", () => {
       runtime.start(sandboxSpec({ SYNC_ENABLED: "true" })),
     ).rejects.toThrow("Sandbox sync failed");
     expect(docker.calls.at(-1)?.command).toBe("rm");
+  });
+
+  it("aborts a sync wait and removes the container", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const docker = scriptedDocker();
+    const syncStatus = vi.fn().mockResolvedValue({ ready: false });
+    const runtime = createDockerRuntime({
+      docker,
+      health: async () => true,
+      syncStatus,
+    });
+
+    const outcome = runtime
+      .start(sandboxSpec({ SYNC_ENABLED: "true" }), controller.signal)
+      .catch((error: unknown) => error);
+    await vi.waitFor(() => expect(syncStatus).toHaveBeenCalledOnce());
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(250);
+
+    await expect(outcome).resolves.toMatchObject({ name: "AbortError" });
+    expect(docker.calls.at(-1)).toEqual({
+      command: "rm",
+      args: ["--force", "--volumes", "container-id"],
+    });
   });
 
   it("logs the latest sync status every 30 seconds while waiting", async () => {

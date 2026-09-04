@@ -186,27 +186,31 @@ export async function runJob(
       now(),
     );
     try {
-      sandbox = await deps.registry.acquire(registryKey, (accessToken) => {
-        const spec = sandboxSpec(
-          identity,
-          deps,
-          accessToken,
-          signature,
-          (event) => {
-            acquireEvents.add(event);
-            logAcquisitionEvent(
-              deps.logger,
-              job.jobId,
-              event,
-              acquireStartedAt,
-              now(),
-            );
-          },
-        );
-        signature.fill(0);
+      sandbox = await deps.registry.acquire(
+        registryKey,
+        (accessToken) => {
+          const spec = sandboxSpec(
+            identity,
+            deps,
+            accessToken,
+            signature,
+            (event) => {
+              acquireEvents.add(event);
+              logAcquisitionEvent(
+                deps.logger,
+                job.jobId,
+                event,
+                acquireStartedAt,
+                now(),
+              );
+            },
+          );
+          signature.fill(0);
 
-        return spec;
-      });
+          return spec;
+        },
+        lease.signal,
+      );
       acquired = true;
       for (const event of ["healthy", "synced"] as const) {
         if (!acquireEvents.has(event)) {

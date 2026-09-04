@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
+import { sleepWithAbort, throwIfAborted } from "./abort.js";
 import type { HealthProbe, SyncProbe } from "./probes.js";
 import { probeHealth, probeSync } from "./probes.js";
 import {
@@ -88,7 +89,8 @@ export function createFakeRuntime(
         [...sandboxes.keys()].map((id) => stopSandbox(id, sandboxes)),
       );
     },
-    async start(spec): Promise<SandboxHandle> {
+    async start(spec, signal): Promise<SandboxHandle> {
+      throwIfAborted(signal);
       assertSandboxEnv(spec.env);
 
       const id = sandboxId(spec);
@@ -128,6 +130,7 @@ export function createFakeRuntime(
       forwardOutput(id, child);
 
       try {
+        throwIfAborted(signal);
         const startedAt = now();
         await waitForHealth({
           origin,
@@ -138,6 +141,7 @@ export function createFakeRuntime(
           now,
           deadline: startedAt + healthTimeoutMs,
           timeoutMs: healthTimeoutMs,
+          signal,
         });
         spec.onProgress?.("healthy");
 
@@ -156,9 +160,11 @@ export function createFakeRuntime(
             now,
             deadline: startedAt + syncTimeoutMs,
             timeoutMs: syncTimeoutMs,
+            signal,
           });
         }
         spec.onProgress?.("synced");
+        throwIfAborted(signal);
 
         return { id, origin };
       } catch (error) {
@@ -244,10 +250,16 @@ interface HealthWaitOptions {
   now: () => number;
   deadline: number;
   timeoutMs: number;
+  signal?: AbortSignal;
 }
 
 async function waitForHealth(options: HealthWaitOptions): Promise<void> {
-  while (!(await options.health(options.origin))) {
+  while (
+    !(options.signal
+      ? await options.health(options.origin, options.signal)
+      : await options.health(options.origin))
+  ) {
+    throwIfAborted(options.signal);
     if (!options.isRunning()) {
       throw new Error(`Sandbox ${options.id} exited before becoming healthy`);
     }
@@ -258,7 +270,7 @@ async function waitForHealth(options: HealthWaitOptions): Promise<void> {
       );
     }
 
-    await options.sleep(POLL_INTERVAL_MS);
+    await sleepWithAbort(options.sleep, POLL_INTERVAL_MS, options.signal);
   }
 }
 
@@ -271,17 +283,23 @@ interface SyncWaitOptions {
   now: () => number;
   deadline: number;
   timeoutMs: number;
+  signal?: AbortSignal;
 }
 
 async function waitForSync(options: SyncWaitOptions): Promise<void> {
-  while (!(await options.sync(options.origin, options.accessToken))) {
+  while (
+    !(options.signal
+      ? await options.sync(options.origin, options.accessToken, options.signal)
+      : await options.sync(options.origin, options.accessToken))
+  ) {
+    throwIfAborted(options.signal);
     if (options.now() >= options.deadline) {
       throw new Error(
         `Sandbox ${options.id} did not sync within ${options.timeoutMs}ms`,
       );
     }
 
-    await options.sleep(POLL_INTERVAL_MS);
+    await sleepWithAbort(options.sleep, POLL_INTERVAL_MS, options.signal);
   }
 }
 

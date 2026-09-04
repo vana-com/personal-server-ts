@@ -99,6 +99,50 @@ async function flush(): Promise<void> {
 }
 
 describe("sandbox registry", () => {
+  it("starts fresh for a live waiter after the in-flight start is aborted", async () => {
+    vi.useFakeTimers();
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+    let startCount = 0;
+    let resolveSecond: ((handle: SandboxHandle) => void) | undefined;
+    const runtime = memoryRuntime();
+    runtime.start = vi.fn(
+      (_spec, signal) =>
+        new Promise<SandboxHandle>((resolve, reject) => {
+          startCount += 1;
+          if (startCount === 1) {
+            firstController.signal.addEventListener("abort", () =>
+              reject(new DOMException("aborted", "AbortError")),
+            );
+            return;
+          }
+          signal?.addEventListener("abort", () =>
+            reject(new DOMException("aborted", "AbortError")),
+          );
+          resolveSecond = resolve;
+        }),
+    );
+    const registry = createSandboxRegistry({ runtime });
+
+    const first = registry
+      .acquire("owner:1", buildSpec, firstController.signal)
+      .catch((error: unknown) => error);
+    const second = registry.acquire(
+      "owner:1",
+      buildSpec,
+      secondController.signal,
+    );
+    firstController.abort();
+    await flush();
+
+    expect(runtime.start).toHaveBeenCalledTimes(2);
+    resolveSecond?.({ id: "sandbox-fresh", origin: "http://sandbox-fresh" });
+    await expect(first).resolves.toMatchObject({ name: "AbortError" });
+    await expect(second).resolves.toMatchObject({
+      handle: { id: "sandbox-fresh" },
+    });
+  });
+
   it("reports managed sandbox status and scopes log access", async () => {
     const runtime = memoryRuntime();
     const registry = createSandboxRegistry({ runtime });

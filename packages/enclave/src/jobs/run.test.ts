@@ -639,13 +639,16 @@ describe("runJob", () => {
     vi.useFakeTimers();
     const fixture = await createFixture();
     let currentTime = NOW_MS;
-    let resolveStart: ((handle: SandboxHandle) => void) | undefined;
+    let startSignal: AbortSignal | undefined;
     fixture.job.claimExpiresAt = new Date(NOW_MS + 1_000).toISOString();
     fixture.deps.now = () => currentTime;
     fixture.runtime.start = vi.fn(
-      () =>
-        new Promise<SandboxHandle>((resolve) => {
-          resolveStart = resolve;
+      (_spec, signal) =>
+        new Promise<SandboxHandle>((_resolve, reject) => {
+          startSignal = signal;
+          signal?.addEventListener("abort", () => {
+            reject(new DOMException("aborted", "AbortError"));
+          });
         }),
     );
 
@@ -655,9 +658,9 @@ describe("runJob", () => {
     );
     currentTime += 1_000;
     await vi.advanceTimersByTimeAsync(1_000);
-    resolveStart?.({ id: "sandbox-1", origin: sandboxOrigin });
     await running;
 
+    expect(startSignal?.aborted).toBe(true);
     expect(fixture.deps.logger.warn).toHaveBeenCalledWith(
       {
         jobId: JOB_ID,
