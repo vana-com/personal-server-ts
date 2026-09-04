@@ -3,6 +3,11 @@ import { isAddress } from "viem";
 import { createFakeDstackClient } from "../dstack/fake.js";
 import { createRealDstackClient } from "../dstack/real.js";
 import { DEFAULT_LEASE_SECONDS, MAX_LEASE_SECONDS } from "../jobs/types.js";
+import {
+  DEFAULT_SANDBOX_CPUS,
+  DEFAULT_SANDBOX_MEMORY,
+  DEFAULT_SANDBOX_PIDS_LIMIT,
+} from "../sandbox/docker-runtime.js";
 import { SANDBOX_IDLE_TTL_SECONDS, SANDBOX_MAX } from "../sandbox/registry.js";
 
 const DEFAULT_HOST = "127.0.0.1";
@@ -24,6 +29,7 @@ const DOCKER_IMAGE_ERROR =
   "PS_IMAGE must be a sha256 digest (name@sha256:<64 hex>) or a Docker image id (sha256:<64 hex>) for the docker runtime";
 const DOCKER_GATEWAY_ERROR =
   "GATEWAY_URL must use https for the docker runtime";
+const MEMORY_PATTERN = /^[1-9][0-9]*(?:\.[0-9]+)?[kmgt]?$/i;
 const MAINNET_CHAIN_ID = 1_480;
 const MOKSHA_CHAIN_ID = 14_800;
 const DEFAULT_STORAGE_API_URLS = {
@@ -59,6 +65,9 @@ export interface AgentJobsConfig {
   runtime: SandboxRuntimeKind;
   image: string;
   sandboxMax: number;
+  sandboxMemory: string;
+  sandboxCpus: string;
+  sandboxPidsLimit: number;
   idleTtlMs: number;
   leaseSeconds: number;
   dockerHost: string;
@@ -117,6 +126,14 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
     env.SANDBOX_MAX,
     "SANDBOX_MAX",
     SANDBOX_MAX,
+    MIN_POSITIVE_INTEGER,
+  );
+  const sandboxMemory = readMemory(env.SANDBOX_MEMORY);
+  const sandboxCpus = readCpus(env.SANDBOX_CPUS);
+  const sandboxPidsLimit = readInteger(
+    env.SANDBOX_PIDS_LIMIT,
+    "SANDBOX_PIDS_LIMIT",
+    DEFAULT_SANDBOX_PIDS_LIMIT,
     MIN_POSITIVE_INTEGER,
   );
   const idleTtlSeconds = readInteger(
@@ -186,6 +203,9 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
     runtime,
     image,
     sandboxMax,
+    sandboxMemory,
+    sandboxCpus,
+    sandboxPidsLimit,
     idleTtlMs: idleTtlSeconds * MILLISECONDS_PER_SECOND,
     leaseSeconds,
     dockerHost: env.DOCKER_HOST ?? DEFAULT_DOCKER_HOST,
@@ -199,6 +219,25 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
       ? { gatewayBypassSecret: env.VERCEL_PROTECTION_BYPASS }
       : {}),
   };
+}
+
+function readMemory(value: string | undefined): string {
+  const memory = value ?? DEFAULT_SANDBOX_MEMORY;
+  if (!MEMORY_PATTERN.test(memory)) {
+    throw new Error("SANDBOX_MEMORY must be a positive Docker memory value");
+  }
+
+  return memory;
+}
+
+function readCpus(value: string | undefined): string {
+  const cpus = value ?? DEFAULT_SANDBOX_CPUS;
+  const parsed = Number(cpus);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error("SANDBOX_CPUS must be a positive number");
+  }
+
+  return cpus;
 }
 
 function readChainId(value: string | undefined): SupportedChainId {

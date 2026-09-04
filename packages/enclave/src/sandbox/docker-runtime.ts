@@ -50,6 +50,10 @@ const INVALID_DOCKER_HOST = "DOCKER_HOST must have a hostname";
 const STDERR_TAIL_LENGTH = 2_048;
 const SECRET_ENV_KEY_SET = new Set<string>(SECRET_ENV_KEYS);
 
+export const DEFAULT_SANDBOX_MEMORY = "512m";
+export const DEFAULT_SANDBOX_CPUS = "2";
+export const DEFAULT_SANDBOX_PIDS_LIMIT = 256;
+
 const FIXED_ENV = {
   CLOUD_MODE: "true",
   DEV_UI_ENABLED: "false",
@@ -85,6 +89,9 @@ export interface DockerRuntimeOptions {
   sync?: SyncProbe;
   sleep?: (milliseconds: number) => Promise<void>;
   now?: () => number;
+  memory?: string;
+  cpus?: string;
+  pidsLimit?: number;
 }
 
 export function createDockerRuntime(
@@ -104,6 +111,9 @@ export function createDockerRuntime(
   const now = options.now ?? Date.now;
   const healthTimeoutMs = options.healthTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS;
   const syncTimeoutMs = options.syncTimeoutMs ?? DEFAULT_SYNC_TIMEOUT_MS;
+  const memory = options.memory ?? DEFAULT_SANDBOX_MEMORY;
+  const cpus = options.cpus ?? DEFAULT_SANDBOX_CPUS;
+  const pidsLimit = options.pidsLimit ?? DEFAULT_SANDBOX_PIDS_LIMIT;
 
   return {
     async reconcile(): Promise<void> {
@@ -126,7 +136,7 @@ export function createDockerRuntime(
       await removeExistingSandbox(docker, name);
       const containerId = await docker.run(
         CREATE_COMMAND,
-        createArgs(name, spec.image, environment),
+        createArgs(name, spec.image, environment, memory, cpus, pidsLimit),
         secretEnv(environment),
       );
 
@@ -275,12 +285,21 @@ function createArgs(
   name: string,
   image: string,
   environment: Record<string, string>,
+  memory: string,
+  cpus: string,
+  pidsLimit: number,
 ): string[] {
   const args = [
     "--name",
     name,
     LABEL_FLAG,
     SANDBOX_LABEL,
+    "--memory",
+    memory,
+    "--cpus",
+    cpus,
+    "--pids-limit",
+    String(pidsLimit),
     "--runtime",
     GVISOR_RUNTIME,
     "--user",

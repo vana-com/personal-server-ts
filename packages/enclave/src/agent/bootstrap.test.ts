@@ -56,6 +56,9 @@ describe("agentConfigFromEnv", () => {
       PS_ENTRY: "/tmp/server.js",
       SANDBOX_MAX: "4",
       SANDBOX_IDLE_TTL_SECONDS: "9",
+      SANDBOX_MEMORY: "768m",
+      SANDBOX_CPUS: "1.5",
+      SANDBOX_PIDS_LIMIT: "128",
       LEASE_SECONDS: "60",
       SANDBOX_SYNC: "disabled",
       WORK_DELAY_MS: "250",
@@ -76,6 +79,9 @@ describe("agentConfigFromEnv", () => {
       image: TAGGED_IMAGE,
       sandboxMax: 4,
       idleTtlMs: 9_000,
+      sandboxMemory: "768m",
+      sandboxCpus: "1.5",
+      sandboxPidsLimit: 128,
       leaseSeconds: 60,
       dockerHost: "tcp://sandbox-runtime:2375",
       psEntry: "/tmp/server.js",
@@ -204,6 +210,9 @@ describe("agentConfigFromEnv", () => {
       dockerHost: "tcp://sandbox-runtime:2375",
       sync: "enabled",
       workDelayMs: 0,
+      sandboxMemory: "512m",
+      sandboxCpus: "2",
+      sandboxPidsLimit: 256,
     });
   });
 
@@ -287,6 +296,9 @@ describe("agentConfigFromEnv", () => {
   it.each([
     ["SANDBOX_RUNTIME", "invalid", "SANDBOX_RUNTIME"],
     ["SANDBOX_MAX", "0", "SANDBOX_MAX"],
+    ["SANDBOX_MEMORY", "unlimited", "SANDBOX_MEMORY"],
+    ["SANDBOX_CPUS", "0", "SANDBOX_CPUS"],
+    ["SANDBOX_PIDS_LIMIT", "0", "SANDBOX_PIDS_LIMIT"],
     ["LEASE_SECONDS", "301", "LEASE_SECONDS"],
     ["SANDBOX_SYNC", "sometimes", "SANDBOX_SYNC"],
     ["CHAIN_ID", "1", "CHAIN_ID"],

@@ -41,6 +41,9 @@ services:
       - DOCKER_HOST=tcp://sandbox-runtime:2375
       - PS_IMAGE
       - SANDBOX_MAX
+      - SANDBOX_MEMORY
+      - SANDBOX_CPUS
+      - SANDBOX_PIDS_LIMIT
       - SANDBOX_IDLE_TTL_SECONDS
       - LEASE_SECONDS
     volumes:

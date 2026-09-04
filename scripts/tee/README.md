@@ -26,7 +26,9 @@ level-B clone bootstrap fetches that exact commit and verifies the checkout;
 production follows architecture decision 23 and uses a digest-pinned agent
 image under one approved compose hash. `SANDBOX_MAX`,
 `SANDBOX_IDLE_TTL_SECONDS`, and `LEASE_SECONDS` are optional and default to 20,
-600, and 30. `CHAIN_ID` accepts 1480 or 14800 and defaults to Moksha (14800).
+600, and 30. Each sandbox is limited by `SANDBOX_MEMORY`, `SANDBOX_CPUS`, and
+`SANDBOX_PIDS_LIMIT`, which default to `512m`, `2`, and `256`. `CHAIN_ID`
+accepts 1480 or 14800 and defaults to Moksha (14800).
 `STORAGE_API_URL` follows the chain when unset: `https://storage-dev.vana.org`
 for Moksha and `https://storage.vana.org` for mainnet. Operators may override
 `DATA_REGISTRY_CONTRACT`, `DATA_PORTABILITY_SERVER_CONTRACT`,

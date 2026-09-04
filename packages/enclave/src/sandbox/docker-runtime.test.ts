@@ -112,6 +112,12 @@ describe("docker sandbox runtime", () => {
         `ps-${USER_PS_ID.slice(2)}-7`,
         "--label",
         "org.vana.personal-server.sandbox=true",
+        "--memory",
+        "512m",
+        "--cpus",
+        "2",
+        "--pids-limit",
+        "256",
         "--runtime",
         "runsc-ptrace",
         "--user",
@@ -157,6 +163,30 @@ describe("docker sandbox runtime", () => {
     expect(docker.calls[1]?.args.join(" ")).not.toContain(ACCESS_TOKEN);
     expect(docker.calls[1]?.args.join(" ")).not.toContain(MASTER_KEY_SIGNATURE);
     expect(docker.calls[1]?.args).not.toContain("--mount");
+  });
+
+  it("applies configured sandbox resource limits", async () => {
+    const docker = scriptedDocker();
+    const runtime = createDockerRuntime({
+      docker,
+      memory: "768m",
+      cpus: "1.5",
+      pidsLimit: 128,
+      health: async () => true,
+    });
+
+    await runtime.start(sandboxSpec());
+
+    expect(docker.calls[1]?.args).toEqual(
+      expect.arrayContaining([
+        "--memory",
+        "768m",
+        "--cpus",
+        "1.5",
+        "--pids-limit",
+        "128",
+      ]),
+    );
   });
 
   it("removes every labeled sandbox during boot reconciliation", async () => {

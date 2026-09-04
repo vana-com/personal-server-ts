@@ -149,7 +149,12 @@ function createRuntime(
     });
   }
 
-  return createDockerRuntime({ dockerHost: config.dockerHost });
+  return createDockerRuntime({
+    dockerHost: config.dockerHost,
+    memory: config.sandboxMemory,
+    cpus: config.sandboxCpus,
+    pidsLimit: config.sandboxPidsLimit,
+  });
 }
 
 async function shutdown(
