@@ -292,6 +292,8 @@ Level-A run order: SDK build â†’ GW `dev:pg` + `0053` + `0054` + `dev:server` â†
 
 **Fleet placement rule (2026-09-04).** A CVM's public URL is `<app_id>-<port>.<node domain>`, so two replicas of one `app_id` on the same Phala physical node share a hostname and only one is reachable; the operator scripts' nodeId cross-check then reports the older CVM. Replicas of a fleet go on distinct physical nodes (`--node-id`), and a rolling replacement on the same node must delete the old CVM first.
 
+**Full e2e, attempt 2 (2026-09-04, node rebuilt from the expiry fix).** Identity, grant and signature re-verification pass; the job fails `SCOPE_NOT_FOUND`: the sandbox hydrates from the core default `https://storage.vana.org`, while the Moksha dev environment stores blobs at `https://storage-dev.vana.org` (`environments.json` `dev.storageApiUrl`), so a real owner's data is never downloaded. The enclave entry honours only `GATEWAY_URL`; the agent forwards no storage endpoint. Levels A and B missed it because the scripted seed wrote to the same default host, which also means spike data landed in the production storage namespace under chain 14800. Fix: `STORAGE_API_URL` through agent, compose, operator scripts, enclave entry and the e2e driver (personal-server-ts `fix/enclave-storage-endpoint`).
+
 ## 7. Open questions (answers applied overnight, confirmed 2026-09-03 by Kahtaf)
 
 1. **PS signing inside the sandbox.** Recommend: never in v1 (section 4b); no agent signing endpoint. Revisit if step-4 receipts need `signRecordDataAccess`.
