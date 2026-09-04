@@ -343,7 +343,8 @@ describe("executeJob", () => {
       new NodeECIESProvider(),
       { jobId: "job-1", scope: SCOPE, version: "7" },
     );
-    const redacted = JSON.parse(Buffer.from(result.body, "base64").toString());
+    expect(result.body).toBeInstanceOf(Uint8Array);
+    const redacted = JSON.parse(new TextDecoder().decode(result.body));
 
     expect(result).toMatchObject({
       v: 1,

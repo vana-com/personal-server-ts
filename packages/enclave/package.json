@@ -32,7 +32,7 @@
   "dependencies": {
     "@noble/curves": "^1.9.1",
     "@noble/hashes": "^1.8.0",
-    "@opendatalabs/vana-sdk": "3.23.0-pr.211.1da7c1b",
+    "@opendatalabs/vana-sdk": "3.23.0-pr.211.341f55d",
     "@phala/dstack-sdk": "0.5.8",
     "viem": "^2.54.2"
   }

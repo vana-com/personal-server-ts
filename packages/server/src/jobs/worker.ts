@@ -238,7 +238,7 @@ async function executeJobUnsafe(
     scope: request.scope,
     version: localVersion === 0 ? null : String(localVersion),
     contentType: JSON_CONTENT_TYPE,
-    body: Buffer.from(JSON.stringify(redacted)).toString("base64"),
+    body: new TextEncoder().encode(JSON.stringify(redacted)),
   };
   const sealed = await sealJobResult(
     result,

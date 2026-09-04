@@ -1120,9 +1120,7 @@ async function assertResult(
   if (result.contentType !== JSON_CONTENT_TYPE) {
     throw new Error(`Unexpected result content type ${result.contentType}`);
   }
-  const envelope = record(
-    JSON.parse(Buffer.from(result.body, "base64").toString("utf8")),
-  );
+  const envelope = record(JSON.parse(new TextDecoder().decode(result.body)));
   const data = record(envelope?.data);
   if (data?.hello !== OWNER_RECORD.hello || data.n !== OWNER_RECORD.n) {
     throw new Error("Decrypted job result did not contain the seeded record");
@@ -1430,9 +1428,7 @@ async function runBuilderOnly(ctx: BuilderOnlyContext): Promise<void> {
     if (opened.contentType !== JSON_CONTENT_TYPE) {
       throw new Error(`Unexpected result content type ${opened.contentType}`);
     }
-    const envelope = record(
-      JSON.parse(Buffer.from(opened.body, "base64").toString("utf8")),
-    );
+    const envelope = record(JSON.parse(new TextDecoder().decode(opened.body)));
     const payload = envelope?.data;
     const shape = Array.isArray(payload)
       ? `record_count=${payload.length}`
