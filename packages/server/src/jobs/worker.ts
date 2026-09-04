@@ -336,6 +336,13 @@ async function requestUploadSignature(
     );
   }
   if (!response.ok) {
+    if (response.status >= 500) {
+      throw new JobFailure(
+        "RESULT_UPLOAD_FAILED",
+        "result signing service is unavailable",
+        true,
+      );
+    }
     throw new JobFailure(
       "RESULT_SIGNING_REFUSED",
       "result upload signing was refused",

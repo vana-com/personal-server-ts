@@ -607,6 +607,19 @@ describe("executeJob", () => {
     await expectFailure(fixture, "RESULT_SIGNING_REFUSED", false);
   });
 
+  it.each([500, 503])(
+    "retries an agent signing failure with status %i",
+    async (status) => {
+      const fixture = await createFixture();
+      fixture.resultUploadFetch.mockReset();
+      fixture.resultUploadFetch.mockResolvedValueOnce(
+        new Response(null, { status }),
+      );
+
+      await expectFailure(fixture, "RESULT_UPLOAD_FAILED", true);
+    },
+  );
+
   it("retries a storage network failure", async () => {
     const fixture = await createFixture();
     fixture.resultUploadFetch.mockReset();
