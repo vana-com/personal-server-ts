@@ -7,6 +7,7 @@ import type {
   HeartbeatRequest,
   TeeNodeHeartbeat,
 } from "./types.js";
+import { normalizeJobId } from "./types.js";
 
 const AUTHORIZATION_HEADER = "Authorization";
 const CONTENT_TYPE_HEADER = "Content-Type";
@@ -118,6 +119,8 @@ export function createGatewayClient(
         throw new GatewayHttpError(response.status);
       }
 
+      claim.job.jobId = normalizeJobId(claim.job.jobId)!;
+
       return claim;
     },
     heartbeat(jobId, body): Promise<FencedResponse> {
@@ -168,7 +171,7 @@ function isClaimResponse(value: unknown): value is ClaimResponse {
   }
 
   return (
-    typeof value.job.jobId === "string" &&
+    normalizeJobId(value.job.jobId) !== undefined &&
     (value.job.chainId === undefined ||
       (typeof value.job.chainId === "number" &&
         Number.isFinite(value.job.chainId))) &&

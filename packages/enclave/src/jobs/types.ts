@@ -24,6 +24,15 @@ export type ClaimResponse = Omit<SdkClaimResponse, "job"> & {
   job: SdkClaimResponse["job"] & { chainId?: number };
 };
 
+const JOB_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export function normalizeJobId(value: unknown): string | undefined {
+  return typeof value === "string" && JOB_ID_PATTERN.test(value)
+    ? value.toLowerCase()
+    : undefined;
+}
+
 // JOB_EXECUTE_WIRE_START
 export type JobFailureCode =
   | "AUTH_INVALID"

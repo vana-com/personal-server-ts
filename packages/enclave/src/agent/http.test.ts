@@ -37,7 +37,7 @@ const DRAIN_PATH = "/agent/v1/drain";
 const RESULT_SIGNING_PATH = "/agent/v1/job-results/sign";
 const STORAGE_ORIGIN = "https://storage.example";
 const SANDBOX_TOKEN = "sandbox-access-token";
-const JOB_ID = "job-1";
+const JOB_ID = "123e4567-e89b-42d3-a456-426614174000";
 const INVALID_ADDRESS = "invalid-address";
 const INVALID_HEX = "invalid-hex";
 const VALID_HEX = "0x00";
@@ -309,6 +309,56 @@ describe("agent HTTP server", () => {
     } finally {
       errorSpy.mockRestore();
     }
+  });
+
+  it("normalizes an uppercase result-signing job id", async () => {
+    const jobs = jobsControl();
+    const lookup = vi.spyOn(jobs, "lookupSandboxJob");
+    await stopServer();
+    await startServer(createFakeDstackClient({ appId: FAKE_APP_ID }), jobs);
+
+    const response = await post(
+      RESULT_SIGNING_PATH,
+      {
+        jobId: JOB_ID.toUpperCase(),
+        chainId: CHAIN_ID,
+        owner: OWNER.address,
+        byteLength: 1,
+        bodyHash: `sha256:${"00".repeat(32)}`,
+      },
+      {
+        authorization: `Bearer ${SANDBOX_TOKEN}`,
+        "content-type": "application/json",
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(lookup).toHaveBeenCalledWith(SANDBOX_TOKEN, JOB_ID);
+  });
+
+  it("rejects a traversal result-signing job id", async () => {
+    const jobs = jobsControl();
+    const lookup = vi.spyOn(jobs, "lookupSandboxJob");
+    await stopServer();
+    await startServer(createFakeDstackClient({ appId: FAKE_APP_ID }), jobs);
+
+    const response = await post(
+      RESULT_SIGNING_PATH,
+      {
+        jobId: "../../chains/14800/owner/scope",
+        chainId: CHAIN_ID,
+        owner: OWNER.address,
+        byteLength: 1,
+        bodyHash: `sha256:${"00".repeat(32)}`,
+      },
+      {
+        authorization: `Bearer ${SANDBOX_TOKEN}`,
+        "content-type": "application/json",
+      },
+    );
+
+    await expectError(response, 400, "BAD_REQUEST");
+    expect(lookup).not.toHaveBeenCalled();
   });
 
   it("rejects a signing request authenticated with the operator secret", async () => {

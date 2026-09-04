@@ -10,6 +10,7 @@ import { isAddress, isHex, type Address, type Hex } from "viem";
 import type { DstackClient } from "../dstack/client.js";
 import { userPsId } from "../identity/paths.js";
 import { deriveEnclaveAccount } from "../identity/wallet.js";
+import { normalizeJobId } from "../jobs/types.js";
 import { buildEvidence } from "./evidence.js";
 import { AgentError } from "./errors.js";
 import { readHealth } from "./health.js";
@@ -332,9 +333,9 @@ function sealBody(value: unknown): SealRequestBody {
 
 function resultSigningBody(value: unknown): ResultSigningRequestBody {
   const body = record(value);
+  const jobId = normalizeJobId(body.jobId);
   if (
-    typeof body.jobId !== "string" ||
-    body.jobId.length === 0 ||
+    jobId === undefined ||
     !isPositiveInteger(body.chainId) ||
     (body.owner !== undefined && !isAddressValue(body.owner)) ||
     !isPositiveSafeInteger(body.byteLength) ||
@@ -345,7 +346,7 @@ function resultSigningBody(value: unknown): ResultSigningRequestBody {
   }
 
   return {
-    jobId: body.jobId,
+    jobId,
     chainId: body.chainId,
     ...(body.owner === undefined ? {} : { owner: body.owner }),
     byteLength: body.byteLength,

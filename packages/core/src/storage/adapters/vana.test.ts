@@ -75,6 +75,21 @@ describe("createVanaSyncStorageAdapter — chain-scoped storage", () => {
     );
   });
 
+  it.each(["%2f", "%5c"])(
+    "rejects an encoded %s separator in a public blob URL",
+    async (separator) => {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+      const adapter = buildAdapter({ gateway: { chainId: 14800 } }, "public");
+      const url = `https://storage.vana.org/v1/chains/14800/blobs/${OWNER_LOWER}/scope${separator}..${separator}other`;
+
+      await expect(adapter.download(url)).rejects.toThrow(
+        "Public blob URL does not match the configured storage namespace",
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
   it("scopes blob paths by the gateway chainId (moksha, 14800)", () => {
     const adapter = buildAdapter({ gateway: { chainId: 14800 } });
 

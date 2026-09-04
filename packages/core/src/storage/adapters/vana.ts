@@ -15,6 +15,7 @@ const PUBLIC_READS = "public";
 const DOWNLOAD_ERROR = "DOWNLOAD_ERROR";
 const DOWNLOAD_FAILED = "DOWNLOAD_FAILED";
 const VANA_STORAGE = "vana-storage";
+const ENCODED_PATH_SEPARATOR_PATTERN = /%(?:2f|5c)/i;
 
 /** Storage base URL the sync adapter targets (config override or SDK default). */
 export function resolveVanaStorageEndpoint(config: ServerConfig): string {
@@ -102,7 +103,11 @@ function createPublicReadAdapter(options: {
       async download(storageUrl) {
         let requestUrl: string;
         try {
-          requestUrl = new URL(storageUrl).href;
+          const parsed = new URL(storageUrl);
+          if (ENCODED_PATH_SEPARATOR_PATTERN.test(parsed.pathname)) {
+            throw invalidBlobUrl();
+          }
+          requestUrl = parsed.href;
         } catch {
           throw invalidBlobUrl();
         }

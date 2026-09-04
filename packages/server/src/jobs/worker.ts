@@ -52,6 +52,8 @@ const JOB_EXECUTION_FAILED_LOG = "Enclave job execution failed";
 const RESULT_SIGNING_PATH = "/agent/v1/job-results/sign";
 const RESULT_OBJECT_PREFIX = "jobresults";
 const PUT = "PUT";
+const JOB_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export interface JobWorkerDeps {
   serverOwner: Address;
@@ -116,6 +118,7 @@ async function executeJobUnsafe(
   if (request.operation !== RAW_READ) {
     throw new JobFailure("INTERNAL", "operation not supported", false);
   }
+  const jobId = normalizeJobId(request.jobId);
 
   const now = deps.now?.() ?? new Date();
   if (!validDeadline(request.deadline, now)) {
@@ -234,7 +237,7 @@ async function executeJobUnsafe(
   const redacted = redactEnvelopeForGrantee(read.envelope);
   const result: JobResult = {
     v: JOB_PROTOCOL_VERSION,
-    jobId: request.jobId,
+    jobId,
     scope: request.scope,
     version: localVersion === 0 ? null : String(localVersion),
     contentType: JSON_CONTENT_TYPE,
@@ -249,7 +252,7 @@ async function executeJobUnsafe(
   const digest = createHash("sha256").update(sealedBytes).digest("hex");
   const resultHash = `0x${digest}` as Hex;
   const resultSize = sealedBytes.byteLength;
-  const encodedJobId = encodeURIComponent(request.jobId);
+  const encodedJobId = encodeURIComponent(jobId);
   const owner = deps.serverOwner.toLowerCase();
   const resultObjectKey = `${RESULT_OBJECT_PREFIX}/${deps.resultUpload.chainId}/${encodedJobId}`;
   const uploadPath = `/v1/job-results/${deps.resultUpload.chainId}/${owner}/${encodedJobId}`;
@@ -257,7 +260,7 @@ async function executeJobUnsafe(
   const authorization = await requestUploadSignature(requestFetch, {
     agentEndpoint: deps.resultUpload.agentEndpoint,
     accessToken: deps.resultUpload.accessToken,
-    jobId: request.jobId,
+    jobId,
     chainId: deps.resultUpload.chainId,
     owner: deps.serverOwner,
     byteLength: resultSize,
@@ -426,6 +429,14 @@ async function verifyJobAuth(
   } catch {
     throw new JobFailure("AUTH_INVALID", "job authorization is invalid", false);
   }
+}
+
+function normalizeJobId(jobId: string): string {
+  if (!JOB_ID_PATTERN.test(jobId)) {
+    throw new JobFailure("INTERNAL", "job id is invalid", false);
+  }
+
+  return jobId.toLowerCase();
 }
 
 function mapPolicyFailure(error: unknown): JobFailure {

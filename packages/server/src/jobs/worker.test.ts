@@ -42,6 +42,7 @@ const SCOPE = "instagram.profile";
 const AUTH_AUDIENCE = "http://localhost:8080";
 const RECORD_VALUE = "TOP_SECRET_RECORD";
 const GRANT_ID = `0x${"55".repeat(32)}` as const;
+const JOB_ID = "123e4567-e89b-42d3-a456-426614174000";
 // SDK jobs.test.ts fixture: builderPublicKey is the literal "0x1234".
 const VECTOR_PUBLIC_KEY = "0x1234" as const;
 const VECTOR_HASH =
@@ -223,7 +224,7 @@ async function createFixture(): Promise<Fixture> {
     .mockResolvedValueOnce(new Response(null, { status: 201 }));
   const request = {
     v: 1 as const,
-    jobId: "job-1",
+    jobId: JOB_ID,
     owner: owner.address,
     builder: builder.address,
     builderPublicKey: builderAccount.publicKey,
@@ -341,14 +342,14 @@ describe("executeJob", () => {
       sealedBytes,
       builder.privateKey,
       new NodeECIESProvider(),
-      { jobId: "job-1", scope: SCOPE, version: "7" },
+      { jobId: JOB_ID, scope: SCOPE, version: "7" },
     );
     expect(result.body).toBeInstanceOf(Uint8Array);
     const redacted = JSON.parse(new TextDecoder().decode(result.body));
 
     expect(result).toMatchObject({
       v: 1,
-      jobId: "job-1",
+      jobId: JOB_ID,
       scope: SCOPE,
       version: "7",
       contentType: "application/json",
@@ -366,7 +367,7 @@ describe("executeJob", () => {
       },
     });
     expect(JSON.parse(signingInit.body as string)).toEqual({
-      jobId: "job-1",
+      jobId: JOB_ID,
       chainId: 14800,
       owner: owner.address,
       byteLength: sealedBytes.byteLength,
@@ -376,7 +377,7 @@ describe("executeJob", () => {
       Buffer.from(sealedBytes).toString("base64"),
     );
     expect(url).toBe(
-      `https://storage.example/v1/job-results/14800/${owner.address.toLowerCase()}/job-1`,
+      `https://storage.example/v1/job-results/14800/${owner.address.toLowerCase()}/${JOB_ID}`,
     );
     expect(init).toMatchObject({
       method: "PUT",
@@ -387,13 +388,40 @@ describe("executeJob", () => {
       body: sealedBytes,
     });
     expect(response).toEqual({
-      resultObjectKey: "jobresults/14800/job-1",
+      resultObjectKey: `jobresults/14800/${JOB_ID}`,
       resultHash: expectedHash,
       resultSize: sealedBytes.byteLength,
     });
     expect(fixture.deps.accessLogWriter.write).toHaveBeenCalledWith(
       expect.objectContaining({ grantId: GRANT_ID, scope: SCOPE }),
     );
+  });
+
+  it("normalizes an uppercase job id before building result paths", async () => {
+    const fixture = await createFixture();
+    fixture.envelope.request.jobId = JOB_ID.toUpperCase();
+    fixture.envelope.auth = await signRequest(fixture.envelope.request);
+
+    const response = await executeJob(fixture.envelope, fixture.deps);
+    const signingBody = JSON.parse(
+      fixture.resultUploadFetch.mock.calls[0]?.[1]?.body as string,
+    );
+    const uploadUrl = fixture.resultUploadFetch.mock.calls[1]?.[0];
+
+    expect(signingBody.jobId).toBe(JOB_ID);
+    expect(uploadUrl).toBe(
+      `https://storage.example/v1/job-results/14800/${owner.address.toLowerCase()}/${JOB_ID}`,
+    );
+    expect(response.resultObjectKey).toBe(`jobresults/14800/${JOB_ID}`);
+  });
+
+  it("rejects a traversal job id before building result paths", async () => {
+    const fixture = await createFixture();
+    fixture.envelope.request.jobId = "../../chains/14800/owner/scope";
+    fixture.envelope.auth = await signRequest(fixture.envelope.request);
+
+    await expectFailure(fixture, "INTERNAL");
+    expect(fixture.resultUploadFetch).not.toHaveBeenCalled();
   });
 
   it("rejects builder auth for another audience", async () => {

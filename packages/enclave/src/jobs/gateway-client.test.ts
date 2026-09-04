@@ -8,7 +8,7 @@ import {
 
 const NODE_ID = "node-1";
 const NODE_SECRET = "node-secret";
-const JOB_ID = "job-1";
+const JOB_ID = "123e4567-e89b-42d3-a456-426614174000";
 const FENCING_TOKEN = 2;
 
 let server: Server;
@@ -70,6 +70,62 @@ describe("GatewayClient", () => {
     await expect(
       client.claim(25, { leaseSeconds: 30, capacity: 20 }),
     ).resolves.toEqual(responseBody);
+  });
+
+  it("normalizes an uppercase claim job id", async () => {
+    responder = () => 200;
+    responseBody = {
+      job: {
+        jobId: JOB_ID.toUpperCase(),
+        chainId: 14800,
+        fencingToken: FENCING_TOKEN,
+        requestCiphertext: "ciphertext",
+      },
+      identity: {
+        userPsId: "0x01",
+        epoch: 1,
+        enclaveAddress: "0x1111111111111111111111111111111111111111",
+        enclavePublicKey: "0x02",
+        sealedEnvelope: {},
+      },
+    };
+    const client = createGatewayClient({
+      baseUrl: origin,
+      nodeId: NODE_ID,
+      nodeSecret: NODE_SECRET,
+    });
+
+    const claim = await client.claim(25, { leaseSeconds: 30, capacity: 20 });
+
+    expect(claim?.job.jobId).toBe(JOB_ID);
+  });
+
+  it("rejects a traversal claim job id", async () => {
+    responder = () => 200;
+    responseBody = {
+      job: {
+        jobId: "../../chains/14800/owner/scope",
+        chainId: 14800,
+        fencingToken: FENCING_TOKEN,
+        requestCiphertext: "ciphertext",
+      },
+      identity: {
+        userPsId: "0x01",
+        epoch: 1,
+        enclaveAddress: "0x1111111111111111111111111111111111111111",
+        enclavePublicKey: "0x02",
+        sealedEnvelope: {},
+      },
+    };
+    const client = createGatewayClient({
+      baseUrl: origin,
+      nodeId: NODE_ID,
+      nodeSecret: NODE_SECRET,
+    });
+
+    await expect(
+      client.claim(25, { leaseSeconds: 30, capacity: 20 }),
+    ).rejects.toBeInstanceOf(GatewayHttpError);
   });
 
   it("rejects a malformed successful claim body", async () => {
