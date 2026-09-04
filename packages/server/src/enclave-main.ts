@@ -73,7 +73,6 @@ export async function runEnclaveMain(): Promise<void> {
     if (storageApiUrl.protocol !== "https:") {
       throw new Error("STORAGE_API_URL must be a valid absolute https URL");
     }
-    config.storage.backend = "vana";
     config.storage.config.vana = {
       ...config.storage.config.vana,
       apiUrl: process.env.STORAGE_API_URL,

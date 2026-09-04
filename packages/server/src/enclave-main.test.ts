@@ -176,16 +176,21 @@ describe("readEnclaveEnv", () => {
     });
   });
 
-  it("uses STORAGE_API_URL as the vana storage backend", async () => {
-    const config = prepareEnclaveRun();
+  it("passes STORAGE_API_URL to vana storage without changing the backend", async () => {
+    prepareEnclaveRun();
     vi.stubEnv("STORAGE_API_URL", "https://storage-dev.vana.org");
 
     await runEnclaveMain();
 
-    expect(config.storage).toEqual({
-      backend: "vana",
-      config: { vana: { apiUrl: "https://storage-dev.vana.org" } },
-    });
+    expect(serviceMocks.createServer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        storage: {
+          backend: "local",
+          config: { vana: { apiUrl: "https://storage-dev.vana.org" } },
+        },
+      }),
+      expect.any(Object),
+    );
   });
 
   it.each(["http://storage.example", "storage.example"])(
