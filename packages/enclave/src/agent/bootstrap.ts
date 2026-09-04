@@ -1,3 +1,4 @@
+import os from "node:os";
 import type { DstackClient } from "../dstack/client.js";
 import { isAddress } from "viem";
 import { createFakeDstackClient } from "../dstack/fake.js";
@@ -238,6 +239,18 @@ function readCpus(value: string | undefined): string {
   const parsed = Number(cpus);
   if (!Number.isFinite(parsed) || parsed <= 0) {
     throw new Error("SANDBOX_CPUS must be a positive number");
+  }
+  const host = os.availableParallelism();
+  if (parsed > host) {
+    console.error({
+      level: "warn",
+      configured: parsed,
+      host,
+      effective: host,
+      message: "SANDBOX_CPUS exceeds host capacity; clamping",
+    });
+
+    return String(host);
   }
 
   return cpus;

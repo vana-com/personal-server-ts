@@ -1,3 +1,4 @@
+import os from "node:os";
 import { agentConfigFromEnv } from "./bootstrap.js";
 
 const TAGGED_IMAGE = "personal-server:test";
@@ -215,6 +216,59 @@ describe("agentConfigFromEnv", () => {
       sandboxCpus: "2",
       sandboxPidsLimit: 256,
     });
+  });
+
+  it("clamps the default sandbox CPUs to the host", () => {
+    const availableParallelism = vi
+      .spyOn(os, "availableParallelism")
+      .mockReturnValue(1);
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+
+    const config = agentConfigFromEnv({
+      DSTACK_FAKE: "1",
+      ENCLAVE_AGENT_SECRET: "agent-secret",
+      GATEWAY_URL: "https://gateway.example",
+      NODE_ID: "node-1",
+      NODE_SECRET: "node-secret",
+      PS_IMAGE: DIGEST_IMAGE,
+    });
+
+    expect(config.jobs?.sandboxCpus).toBe("1");
+    expect(consoleError).toHaveBeenCalledWith({
+      level: "warn",
+      configured: 2,
+      host: 1,
+      effective: 1,
+      message: "SANDBOX_CPUS exceeds host capacity; clamping",
+    });
+    availableParallelism.mockRestore();
+    consoleError.mockRestore();
+  });
+
+  it("keeps an explicit sandbox CPU limit within the host", () => {
+    const availableParallelism = vi
+      .spyOn(os, "availableParallelism")
+      .mockReturnValue(2);
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+
+    const config = agentConfigFromEnv({
+      DSTACK_FAKE: "1",
+      ENCLAVE_AGENT_SECRET: "agent-secret",
+      GATEWAY_URL: "https://gateway.example",
+      NODE_ID: "node-1",
+      NODE_SECRET: "node-secret",
+      PS_IMAGE: DIGEST_IMAGE,
+      SANDBOX_CPUS: "1.5",
+    });
+
+    expect(config.jobs?.sandboxCpus).toBe("1.5");
+    expect(consoleError).not.toHaveBeenCalled();
+    availableParallelism.mockRestore();
+    consoleError.mockRestore();
   });
 
   it("accepts a Docker image id for the docker runtime", () => {
