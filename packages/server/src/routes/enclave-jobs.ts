@@ -137,6 +137,7 @@ function statusFor(
     case "SIGNED_ARTIFACT_MISSING":
     case "SIGNED_ARTIFACT_INVALID":
     case "SERVER_NOT_REGISTERED":
+    case "RESULT_SIGNING_REFUSED":
       return 403;
     case "SCOPE_NOT_FOUND":
       return 404;
@@ -146,6 +147,7 @@ function statusFor(
       return 410;
     case "RESULT_TOO_LARGE":
       return 413;
+    case "RESULT_UPLOAD_FAILED":
     case "INTERNAL":
       return 500;
   }

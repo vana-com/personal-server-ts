@@ -37,12 +37,14 @@ export type JobFailureCode =
   | "SCOPE_NOT_FOUND"
   | "VERSION_MISMATCH"
   | "DEADLINE_PASSED"
+  | "RESULT_SIGNING_REFUSED"
+  | "RESULT_UPLOAD_FAILED"
   | "RESULT_TOO_LARGE"
   | "INTERNAL";
 
 export interface JobExecuteResponse {
-  /** Base64 ECIES bytes: iv || ephemeral public key || ciphertext || MAC. */
-  resultCiphertext: string;
+  /** Object key in vana-storage: `jobresults/{chainId}/{jobId}`. */
+  resultObjectKey: string;
   /** SHA-256 of ciphertext bytes. */
   resultHash: Hex;
   resultSize: number;

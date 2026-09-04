@@ -64,6 +64,8 @@ const JOB_FAILURE_CODES = new Set<string>([
   "SCOPE_NOT_FOUND",
   "VERSION_MISMATCH",
   "DEADLINE_PASSED",
+  "RESULT_SIGNING_REFUSED",
+  "RESULT_UPLOAD_FAILED",
   "RESULT_TOO_LARGE",
   "INTERNAL",
 ]);
@@ -222,7 +224,7 @@ export async function runJob(
     try {
       await deps.gateway.complete(job.jobId, {
         fencingToken: job.fencingToken,
-        resultCiphertext: result.response.resultCiphertext,
+        resultObjectKey: result.response.resultObjectKey,
         resultHash: result.response.resultHash,
         resultSize: result.response.resultSize,
       });
@@ -552,7 +554,8 @@ function isExecuteResponse(value: unknown): value is JobExecuteResponse {
   }
 
   return (
-    typeof value.resultCiphertext === "string" &&
+    typeof value.resultObjectKey === "string" &&
+    value.resultObjectKey.length > 0 &&
     isResultHash(value.resultHash) &&
     typeof value.resultSize === "number" &&
     Number.isInteger(value.resultSize) &&

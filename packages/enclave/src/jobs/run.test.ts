@@ -41,7 +41,7 @@ const CHAIN_ID = 14_800;
 const AGENT_URL = "http://agent:8787";
 const TAMPER_BIT = 1;
 const RESULT = {
-  resultCiphertext: "ciphertext",
+  resultObjectKey: `jobresults/${CHAIN_ID}/${JOB_ID}`,
   resultHash: `0x${"66".repeat(32)}`,
   resultSize: 10,
 } satisfies JobExecuteResponse;

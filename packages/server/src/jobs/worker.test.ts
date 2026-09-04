@@ -18,10 +18,9 @@ import {
   canonicalJobRequestBytes,
   openJobResult,
 } from "@opendatalabs/vana-sdk/crypto/envelope/job";
-import {
-  MAX_INLINE_RESULT_BYTES,
-  type JobRequest,
-  type JobRequestEnvelope,
+import type {
+  JobRequest,
+  JobRequestEnvelope,
 } from "@opendatalabs/vana-sdk/protocol/jobs";
 import {
   buildWeb3SignedHeader,
@@ -99,6 +98,7 @@ interface Fixture {
   builderRecord: SignedBuilder;
   gateway: ProtocolGatewayPort;
   storage: DataStoragePort;
+  resultUploadFetch: ReturnType<typeof vi.fn>;
 }
 
 async function createFixture(): Promise<Fixture> {
@@ -212,6 +212,15 @@ async function createFixture(): Promise<Fixture> {
   const accessLogWriter = {
     write: vi.fn().mockResolvedValue(undefined),
   } satisfies AccessLogWriter;
+  const resultUploadFetch = vi
+    .fn()
+    .mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ authorization: "Web3Signed result-signature" }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    )
+    .mockResolvedValueOnce(new Response(null, { status: 201 }));
   const request = {
     v: 1 as const,
     jobId: "job-1",
@@ -225,7 +234,7 @@ async function createFixture(): Promise<Fixture> {
     deadline: DEADLINE,
   };
   const envelope = { request, auth: await signRequest(request) };
-  const deps: JobWorkerDeps = {
+  const deps = {
     serverOwner: owner.address,
     serverAddress: server.address,
     serverPublicKey: server.publicKey,
@@ -237,9 +246,24 @@ async function createFixture(): Promise<Fixture> {
     now: () => NOW,
     logger: pino({ level: "silent" }),
     accessLogWriter,
-  };
+    resultUpload: {
+      storageEndpoint: "https://storage.example",
+      agentEndpoint: "http://agent:8787",
+      accessToken: "sandbox-token",
+      chainId: gatewayConfig.chainId,
+      fetch: resultUploadFetch,
+    },
+  } as unknown as JobWorkerDeps;
 
-  return { envelope, deps, grant, builderRecord, gateway, storage };
+  return {
+    envelope,
+    deps,
+    grant,
+    builderRecord,
+    gateway,
+    storage,
+    resultUploadFetch,
+  };
 }
 
 async function signRequest(
@@ -302,11 +326,19 @@ describe("executeJob", () => {
     expect(verified.signer.toLowerCase()).toBe(builder.address.toLowerCase());
   });
 
-  it("redacts and encrypts a raw-read result to the builder key", async () => {
+  it("stores raw sealed bytes and returns their object metadata", async () => {
     const fixture = await createFixture();
     const response = await executeJob(fixture.envelope, fixture.deps);
+    expect(fixture.resultUploadFetch).toHaveBeenCalledTimes(2);
+    const [signingUrl, signingInit] = fixture.resultUploadFetch.mock
+      .calls[0] as [string, RequestInit];
+    const [url, init] = fixture.resultUploadFetch.mock.calls[1] as [
+      string,
+      RequestInit,
+    ];
+    const sealedBytes = init.body as Uint8Array;
     const result = await openJobResult(
-      response.resultCiphertext,
+      sealedBytes,
       builder.privateKey,
       new NodeECIESProvider(),
       { jobId: "job-1", scope: SCOPE, version: "7" },
@@ -321,10 +353,44 @@ describe("executeJob", () => {
       contentType: "application/json",
     });
     expect(redacted.data).toEqual({ name: RECORD_VALUE });
-    expect(response.resultSize).toBe(
-      Buffer.from(response.resultCiphertext, "base64").byteLength,
+    const expectedHash = `0x${createHash("sha256")
+      .update(sealedBytes)
+      .digest("hex")}`;
+    expect(signingUrl).toBe("http://agent:8787/agent/v1/job-results/sign");
+    expect(signingInit).toMatchObject({
+      method: "POST",
+      headers: {
+        Authorization: "Bearer sandbox-token",
+        "Content-Type": "application/json",
+      },
+    });
+    expect(JSON.parse(signingInit.body as string)).toEqual({
+      jobId: "job-1",
+      chainId: 14800,
+      owner: owner.address,
+      byteLength: sealedBytes.byteLength,
+      bodyHash: `sha256:${expectedHash.slice(2)}`,
+    });
+    expect(signingInit.body).not.toContain(
+      Buffer.from(sealedBytes).toString("base64"),
     );
-    expect(response.resultHash).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(url).toBe(
+      `https://storage.example/v1/job-results/14800/${owner.address.toLowerCase()}/job-1`,
+    );
+    expect(init).toMatchObject({
+      method: "PUT",
+      headers: {
+        Authorization: "Web3Signed result-signature",
+        "Content-Type": "application/octet-stream",
+      },
+      body: sealedBytes,
+    });
+    expect(response).toEqual({
+      resultObjectKey: "jobresults/14800/job-1",
+      resultHash: expectedHash,
+      resultSize: sealedBytes.byteLength,
+    });
+    expect(response).not.toHaveProperty("resultCiphertext");
     expect(fixture.deps.accessLogWriter.write).toHaveBeenCalledWith(
       expect.objectContaining({ grantId: GRANT_ID, scope: SCOPE }),
     );
@@ -466,17 +532,6 @@ describe("executeJob", () => {
         },
       },
       {
-        code: "RESULT_TOO_LARGE",
-        mutate({ deps }) {
-          vi.spyOn(deps.ecies, "encrypt").mockResolvedValue({
-            iv: new Uint8Array(16),
-            ephemPublicKey: new Uint8Array(65),
-            ciphertext: new Uint8Array(MAX_INLINE_RESULT_BYTES),
-            mac: new Uint8Array(32),
-          });
-        },
-      },
-      {
         code: "INTERNAL",
         async mutate({ envelope }) {
           envelope.request.operation = "inference";
@@ -490,5 +545,52 @@ describe("executeJob", () => {
       await scenario.mutate(fixture);
       await expectFailure(fixture, scenario.code, scenario.retryable ?? false);
     }
+  });
+
+  it.each([
+    [413, "RESULT_TOO_LARGE", false],
+    [500, "RESULT_UPLOAD_FAILED", true],
+    [403, "RESULT_UPLOAD_FAILED", false],
+  ] as const)(
+    "maps storage status %i to %s (retryable=%s)",
+    async (status, code, retryable) => {
+      const fixture = await createFixture();
+      fixture.resultUploadFetch.mockReset();
+      fixture.resultUploadFetch
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({ authorization: "Web3Signed result-signature" }),
+            { status: 200 },
+          ),
+        )
+        .mockResolvedValueOnce(new Response(null, { status }));
+
+      await expectFailure(fixture, code, retryable);
+    },
+  );
+
+  it("does not retry an agent signing refusal", async () => {
+    const fixture = await createFixture();
+    fixture.resultUploadFetch.mockReset();
+    fixture.resultUploadFetch.mockResolvedValueOnce(
+      new Response(null, { status: 403 }),
+    );
+
+    await expectFailure(fixture, "RESULT_SIGNING_REFUSED", false);
+  });
+
+  it("retries a storage network failure", async () => {
+    const fixture = await createFixture();
+    fixture.resultUploadFetch.mockReset();
+    fixture.resultUploadFetch
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ authorization: "Web3Signed result-signature" }),
+          { status: 200 },
+        ),
+      )
+      .mockRejectedValueOnce(new Error("network unavailable"));
+
+    await expectFailure(fixture, "RESULT_UPLOAD_FAILED", true);
   });
 });

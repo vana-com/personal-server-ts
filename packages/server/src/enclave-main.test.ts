@@ -21,6 +21,7 @@ vi.mock("./listen.js", () => ({
 const MASTER_SIGNATURE = `0x${"11".repeat(65)}`;
 const SERVER_ADDRESS = "0x2222222222222222222222222222222222222222";
 const SERVER_PUBLIC_KEY = `0x04${"33".repeat(64)}`;
+const AGENT_URL = "http://agent:8787";
 
 function prepareEnclaveRun() {
   const config = ServerConfigSchema.parse({});
@@ -38,6 +39,7 @@ function prepareEnclaveRun() {
   vi.stubEnv("PS_ACCESS_TOKEN", "sandbox-token");
   vi.stubEnv("PS_SERVER_ADDRESS", SERVER_ADDRESS);
   vi.stubEnv("PS_SERVER_PUBLIC_KEY", SERVER_PUBLIC_KEY);
+  vi.stubEnv("ENCLAVE_AGENT_URL", AGENT_URL);
 
   return config;
 }
@@ -65,6 +67,7 @@ describe("readEnclaveEnv", () => {
       PS_ACCESS_TOKEN: "sandbox-token",
       PS_SERVER_ADDRESS: SERVER_ADDRESS,
       PS_SERVER_PUBLIC_KEY: SERVER_PUBLIC_KEY,
+      ENCLAVE_AGENT_URL: AGENT_URL,
     };
 
     const result = readEnclaveEnv(env);
@@ -74,6 +77,7 @@ describe("readEnclaveEnv", () => {
       accessToken: "sandbox-token",
       serverAddress: SERVER_ADDRESS,
       serverPublicKey: SERVER_PUBLIC_KEY,
+      agentUrl: AGENT_URL,
     });
     expect(env.VANA_MASTER_KEY_SIGNATURE).toBeUndefined();
   });
@@ -109,6 +113,7 @@ describe("readEnclaveEnv", () => {
       vi.stubEnv("PS_ACCESS_TOKEN", "sandbox-token");
       vi.stubEnv("PS_SERVER_ADDRESS", SERVER_ADDRESS);
       vi.stubEnv("PS_SERVER_PUBLIC_KEY", SERVER_PUBLIC_KEY);
+      vi.stubEnv("ENCLAVE_AGENT_URL", AGENT_URL);
       vi.stubEnv("SYNC_ENABLED", value);
 
       await runEnclaveMain();
@@ -135,6 +140,7 @@ describe("readEnclaveEnv", () => {
     vi.stubEnv("PS_ACCESS_TOKEN", "sandbox-token");
     vi.stubEnv("PS_SERVER_ADDRESS", SERVER_ADDRESS);
     vi.stubEnv("PS_SERVER_PUBLIC_KEY", SERVER_PUBLIC_KEY);
+    vi.stubEnv("ENCLAVE_AGENT_URL", AGENT_URL);
     vi.stubEnv("GATEWAY_URL", "https://preview.example/base");
     vi.stubEnv("VERCEL_PROTECTION_BYPASS", "preview-secret");
 
@@ -174,6 +180,17 @@ describe("readEnclaveEnv", () => {
       backend: "local",
       config: { vana: { apiUrl: "https://storage-dev.vana.org" } },
     });
+    expect(serviceMocks.createServer).toHaveBeenCalledWith(
+      config,
+      expect.objectContaining({
+        jobResultUpload: {
+          storageEndpoint: "https://storage-dev.vana.org",
+          agentEndpoint: AGENT_URL,
+          accessToken: "sandbox-token",
+          chainId: 14_800,
+        },
+      }),
+    );
   });
 
   it("applies mainnet chain and contract environment configuration", async () => {

@@ -9,6 +9,7 @@ const REQUIRED_ENV = [
   "PS_ACCESS_TOKEN",
   "PS_SERVER_ADDRESS",
   "PS_SERVER_PUBLIC_KEY",
+  "ENCLAVE_AGENT_URL",
 ] as const;
 const SYNC_DISABLED = "false";
 const MAINNET_CHAIN_ID = 1_480;
@@ -29,6 +30,7 @@ export interface EnclaveEnv {
   accessToken: string;
   serverAddress: Address;
   serverPublicKey: Hex;
+  agentUrl: string;
 }
 
 export function readEnclaveEnv(env: NodeJS.ProcessEnv): EnclaveEnv {
@@ -46,6 +48,7 @@ export function readEnclaveEnv(env: NodeJS.ProcessEnv): EnclaveEnv {
   const accessToken = env.PS_ACCESS_TOKEN as string;
   const serverAddress = env.PS_SERVER_ADDRESS as string;
   const serverPublicKey = env.PS_SERVER_PUBLIC_KEY as string;
+  const agentUrl = env.ENCLAVE_AGENT_URL as string;
 
   // Drop the master signature before config and application code can inspect env.
   delete env.VANA_MASTER_KEY_SIGNATURE;
@@ -59,12 +62,14 @@ export function readEnclaveEnv(env: NodeJS.ProcessEnv): EnclaveEnv {
   if (!isHex(serverPublicKey)) {
     throw new Error("PS_SERVER_PUBLIC_KEY must be hex encoded");
   }
+  assertHttpUrl(agentUrl, "ENCLAVE_AGENT_URL");
 
   return {
     ownerSignature,
     accessToken,
     serverAddress,
     serverPublicKey,
+    agentUrl,
   };
 }
 
@@ -124,6 +129,12 @@ export async function runEnclaveMain(): Promise<void> {
     ownerSignature: enclaveEnv.ownerSignature,
     serverAccount,
     profile: "enclave",
+    jobResultUpload: {
+      storageEndpoint: storageApiUrlValue,
+      agentEndpoint: enclaveEnv.agentUrl,
+      accessToken: enclaveEnv.accessToken,
+      chainId,
+    },
   });
   const server = await listenHttpServer({
     fetch: context.app.fetch,
@@ -143,6 +154,18 @@ export async function runEnclaveMain(): Promise<void> {
   };
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
+}
+
+function assertHttpUrl(value: string, name: string): void {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${name} must be a valid absolute http(s) URL`);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`${name} must be a valid absolute http(s) URL`);
+  }
 }
 
 function readChainId(value: string | undefined): 1480 | 14800 {

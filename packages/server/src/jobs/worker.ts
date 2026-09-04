@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   assertScopeNotDeleted,
   redactEnvelopeForGrantee,
@@ -33,7 +33,6 @@ import {
 } from "@opendatalabs/vana-sdk/crypto/envelope/job";
 import {
   JOB_PROTOCOL_VERSION,
-  MAX_INLINE_RESULT_BYTES,
   type JobRequestEnvelope,
   type JobResult,
 } from "@opendatalabs/vana-sdk/protocol/jobs";
@@ -50,6 +49,9 @@ const JSON_CONTENT_TYPE = "application/json";
 const UNKNOWN_METADATA = "unknown";
 const MILLISECONDS_PER_SECOND = 1_000;
 const JOB_EXECUTION_FAILED_LOG = "Enclave job execution failed";
+const RESULT_SIGNING_PATH = "/agent/v1/job-results/sign";
+const RESULT_OBJECT_PREFIX = "jobresults";
+const PUT = "PUT";
 
 export interface JobWorkerDeps {
   serverOwner: Address;
@@ -64,6 +66,13 @@ export interface JobWorkerDeps {
   logger: Logger;
   accessLogWriter: AccessLogWriter;
   scopeDeletions?: ScopeDeletionTracker;
+  resultUpload: {
+    storageEndpoint: string;
+    agentEndpoint: string;
+    accessToken: string;
+    chainId: number;
+    fetch?: typeof fetch;
+  };
 }
 
 export class JobFailure extends Error {
@@ -236,13 +245,30 @@ async function executeJobUnsafe(
     request.builderPublicKey,
     deps.ecies,
   );
-  if (sealed.size > MAX_INLINE_RESULT_BYTES) {
-    throw new JobFailure(
-      "RESULT_TOO_LARGE",
-      "encrypted result is too large",
-      false,
-    );
-  }
+  const sealedBytes = sealed.bytes;
+  const digest = createHash("sha256").update(sealedBytes).digest("hex");
+  const resultHash = `0x${digest}` as Hex;
+  const resultSize = sealedBytes.byteLength;
+  const encodedJobId = encodeURIComponent(request.jobId);
+  const owner = deps.serverOwner.toLowerCase();
+  const resultObjectKey = `${RESULT_OBJECT_PREFIX}/${deps.resultUpload.chainId}/${encodedJobId}`;
+  const uploadPath = `/v1/job-results/${deps.resultUpload.chainId}/${owner}/${encodedJobId}`;
+  const requestFetch = deps.resultUpload.fetch ?? fetch;
+  const authorization = await requestUploadSignature(requestFetch, {
+    agentEndpoint: deps.resultUpload.agentEndpoint,
+    accessToken: deps.resultUpload.accessToken,
+    jobId: request.jobId,
+    chainId: deps.resultUpload.chainId,
+    owner: deps.serverOwner,
+    byteLength: resultSize,
+    bodyHash: `sha256:${digest}`,
+  });
+  await uploadResult(requestFetch, {
+    storageEndpoint: deps.resultUpload.storageEndpoint,
+    path: uploadPath,
+    authorization,
+    body: sealedBytes,
+  });
 
   await deps.accessLogWriter.write({
     logId: randomUUID(),
@@ -260,10 +286,126 @@ async function executeJobUnsafe(
   );
 
   return {
-    resultCiphertext: sealed.ciphertext,
-    resultHash: sealed.hash,
-    resultSize: sealed.size,
+    resultObjectKey,
+    resultHash,
+    resultSize,
   };
+}
+
+interface UploadSignatureRequest {
+  agentEndpoint: string;
+  accessToken: string;
+  jobId: string;
+  chainId: number;
+  owner: Address;
+  byteLength: number;
+  bodyHash: string;
+}
+
+async function requestUploadSignature(
+  requestFetch: typeof fetch,
+  request: UploadSignatureRequest,
+): Promise<string> {
+  let response: Response;
+  try {
+    response = await requestFetch(
+      `${request.agentEndpoint.replace(/\/$/, "")}${RESULT_SIGNING_PATH}`,
+      {
+        method: POST,
+        headers: {
+          Authorization: `Bearer ${request.accessToken}`,
+          "Content-Type": JSON_CONTENT_TYPE,
+        },
+        body: JSON.stringify({
+          jobId: request.jobId,
+          chainId: request.chainId,
+          owner: request.owner,
+          byteLength: request.byteLength,
+          bodyHash: request.bodyHash,
+        }),
+      },
+    );
+  } catch {
+    throw new JobFailure(
+      "RESULT_UPLOAD_FAILED",
+      "result signing service is unavailable",
+      true,
+    );
+  }
+  if (!response.ok) {
+    throw new JobFailure(
+      "RESULT_SIGNING_REFUSED",
+      "result upload signing was refused",
+      false,
+    );
+  }
+
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    body = undefined;
+  }
+  if (
+    !body ||
+    typeof body !== "object" ||
+    !("authorization" in body) ||
+    typeof body.authorization !== "string" ||
+    !body.authorization.startsWith("Web3Signed ")
+  ) {
+    throw new JobFailure(
+      "RESULT_SIGNING_REFUSED",
+      "result upload signing response is invalid",
+      false,
+    );
+  }
+
+  return body.authorization;
+}
+
+interface ResultUploadRequest {
+  storageEndpoint: string;
+  path: string;
+  authorization: string;
+  body: Uint8Array;
+}
+
+async function uploadResult(
+  requestFetch: typeof fetch,
+  request: ResultUploadRequest,
+): Promise<void> {
+  let response: Response;
+  try {
+    const storageOrigin = new URL(request.storageEndpoint).origin;
+    response = await requestFetch(`${storageOrigin}${request.path}`, {
+      method: PUT,
+      headers: {
+        Authorization: request.authorization,
+        "Content-Type": "application/octet-stream",
+      },
+      body: Buffer.from(
+        request.body.buffer as ArrayBuffer,
+        request.body.byteOffset,
+        request.body.byteLength,
+      ),
+    });
+  } catch {
+    throw new JobFailure("RESULT_UPLOAD_FAILED", "result upload failed", true);
+  }
+  if (response.status === 413) {
+    throw new JobFailure(
+      "RESULT_TOO_LARGE",
+      "sealed result exceeds the 100 MB storage limit",
+      false,
+    );
+  }
+  if (!response.ok) {
+    throw new JobFailure(
+      "RESULT_UPLOAD_FAILED",
+      "result upload failed",
+      response.status >= 500,
+    );
+  }
 }
 
 async function verifyJobAuth(

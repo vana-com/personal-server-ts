@@ -61,7 +61,7 @@ describe("POST /enclave/v1/jobs/execute", () => {
 
   it("returns an encrypted job result", async () => {
     const result = {
-      resultCiphertext: "Y2lwaGVydGV4dA==",
+      resultObjectKey: "jobresults/14800/job-1",
       resultHash: `0x${"44".repeat(32)}` as const,
       resultSize: 10,
     };

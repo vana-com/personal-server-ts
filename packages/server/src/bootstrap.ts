@@ -69,7 +69,7 @@ import {
   type InferenceProvider,
   type RecomputeScheduler,
 } from "@opendatalabs/personal-server-ts-core/derivatives";
-import { executeJob } from "./jobs/worker.js";
+import { executeJob, type JobWorkerDeps } from "./jobs/worker.js";
 
 const TRAILING_SLASHES = /\/+$/;
 
@@ -108,6 +108,7 @@ export interface CreateServerOptions {
   serverDir?: string;
   dataDir?: string;
   ownerSignature?: `0x${string}`;
+  jobResultUpload?: JobWorkerDeps["resultUpload"];
   gatewayClient?: GatewayClient;
   /**
    * Deletion-aware gateway feed (`includeDeleted=true` listings + tombstone
@@ -561,8 +562,9 @@ export async function createServer(
   };
 
   const ecies = new NodeECIESProvider();
+  const resultUpload = options?.jobResultUpload;
   const jobWorker =
-    isEnclave && serverOwner && serverAccount
+    isEnclave && serverOwner && serverAccount && resultUpload
       ? (envelope: Parameters<typeof executeJob>[0]) =>
           executeJob(envelope, {
             serverOwner,
@@ -576,6 +578,7 @@ export async function createServer(
             logger,
             accessLogWriter,
             scopeDeletions,
+            resultUpload,
           })
       : undefined;
 

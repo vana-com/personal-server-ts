@@ -1103,14 +1103,11 @@ async function assertResult(
   status: JobStatus,
   expectedVersion?: string,
 ): Promise<void> {
-  if (!status.resultCiphertext) {
-    throw new Error("Completed job did not include resultCiphertext");
-  }
-  const result = await openJobResult(
-    status.resultCiphertext,
-    builderKey,
+  const result = await fetchAndOpenResult(
     ctx.ecies,
-    { jobId: status.jobId, scope: JOB_SCOPE },
+    builderKey,
+    status,
+    JOB_SCOPE,
   );
   if (typeof result.version !== "string") {
     throw new Error("Job result version was not a string");
@@ -1133,6 +1130,31 @@ async function assertResult(
   if ("$writtenBy" in (data ?? {})) {
     throw new Error("Job result disclosed owner-only $writtenBy metadata");
   }
+}
+
+async function fetchAndOpenResult(
+  ecies: NodeECIESProvider,
+  builderKey: Hex,
+  status: JobStatus,
+  scope: string,
+) {
+  if (!status.result) {
+    throw new Error("Completed job did not include a result object handle");
+  }
+  const response = await fetch(status.result.url);
+  if (!response.ok) {
+    throw new Error(`Result object GET failed with status ${response.status}`);
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const hash = `0x${createHash("sha256").update(bytes).digest("hex")}`;
+  if (bytes.byteLength !== status.result.size || hash !== status.result.hash) {
+    throw new Error("Result object metadata did not match the sealed bytes");
+  }
+
+  return openJobResult(bytes, builderKey, ecies, {
+    jobId: status.jobId,
+    scope,
+  });
 }
 
 async function submitAndDecrypt(
@@ -1399,15 +1421,11 @@ async function runBuilderOnly(ctx: BuilderOnlyContext): Promise<void> {
         `Job ended as ${status?.state ?? "unknown"}:${status?.failureReason ?? "unknown"}`,
       );
     }
-    if (!status.resultCiphertext) {
-      throw new Error("Completed job did not include resultCiphertext");
-    }
-
-    const opened = await openJobResult(
-      status.resultCiphertext,
-      ctx.builderPrivateKey,
+    const opened = await fetchAndOpenResult(
       ctx.ecies,
-      { jobId: status.jobId, scope: scope! },
+      ctx.builderPrivateKey,
+      status,
+      scope!,
     );
     if (opened.contentType !== JSON_CONTENT_TYPE) {
       throw new Error(`Unexpected result content type ${opened.contentType}`);
