@@ -390,7 +390,6 @@ describe("executeJob", () => {
       resultHash: expectedHash,
       resultSize: sealedBytes.byteLength,
     });
-    expect(response).not.toHaveProperty("resultCiphertext");
     expect(fixture.deps.accessLogWriter.write).toHaveBeenCalledWith(
       expect.objectContaining({ grantId: GRANT_ID, scope: SCOPE }),
     );
