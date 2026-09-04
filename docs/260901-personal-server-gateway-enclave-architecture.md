@@ -69,7 +69,7 @@ In June the PS stayed in the browser so Vana never holds user data on its own ma
 | Component               | Role                                                                                             | Sees                                                  |
 | ----------------------- | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------- |
 | Data Gateway (`dp-rpc`) | Fixed PS URL. Auth, grants, payment, rate limits, blind job queue, TEE registry, inference relay | Signed metadata, ciphertext                           |
-| Vana Storage (R2)       | Encrypted blobs `{owner}/{scope}/{version}`                                                      | Ciphertext                                            |
+| Vana Storage (R2)       | Encrypted blobs `{owner}/{scope}/{version}`; job results under `jobresults/`, TTL'd              | Ciphertext                                            |
 | TEE node (dstack CVM)   | Node agent plus one gVisor sandbox per active user                                               | Plaintext inside sandboxes; agent in every user's TCB |
 | PS Enclave              | Ephemeral per-user PS. Wallet and master signature in memory only                                | Own user's plaintext                                  |
 | Private inference       | Attested provider (Phala) via Gateway blind relay                                                | Encrypted prompt                                      |
@@ -125,7 +125,9 @@ Gaps to close: DCAP `verifyEvidence` unwired; unsigned fallback to `inference.ph
 
 Login may prewarm the sandbox; it cannot be the only trigger, because a builder may submit while the owner is logged out. An authorized job wakes or creates the sandbox on demand.
 
-Runtimes pull: heartbeat and claim from the Gateway, no inbound connections. Queue in Postgres; the claim is one `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING` statement, no explicit transaction (Spike 4, `docs/260902-enclave-spike-results.md`). Lease plus fencing plus sweep-before-claim recovered a killed worker in 13.8 s without a cron. A 1 s claim poll sets the submit-to-claim floor (p50 ≈ half the interval per idle worker) and costs 60 invocations per worker per minute idle; decide before launch between a long-poll claim (`/v1/jobs/claim?wait=25`) and backoff on 204. Fast tier: `POST /v1/jobs?wait=25` holds up to 25 s and returns inline, else `202` and the SDK polls. Metadata-only webhooks v1.1. Large results stream-encrypt to a private R2 bucket and return a handle.
+Runtimes pull: heartbeat and claim from the Gateway, no inbound connections. Queue in Postgres; the claim is one `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING` statement, no explicit transaction (Spike 4, `docs/260902-enclave-spike-results.md`). Lease plus fencing plus sweep-before-claim recovered a killed worker in 13.8 s without a cron. A 1 s claim poll sets the submit-to-claim floor (p50 ≈ half the interval per idle worker) and costs 60 invocations per worker per minute idle; decide before launch between a long-poll claim (`/v1/jobs/claim?wait=25`) and backoff on 204. Fast tier: `POST /v1/jobs?wait=25` holds up to 25 s and returns the handle, else `202` and the SDK polls. Metadata-only webhooks v1.1.
+
+**Result delivery (revised 2026-09-04).** Every result goes to object storage; there is no inline ciphertext path. The runtime stream-encrypts to the builder key and PUTs to the `jobresults/` prefix of the `vana-storage` bucket, then completes the job with metadata only (key, hash, size, expiry). The builder reads the object directly. The reasons are: Vercel caps a function request **or** response body at 4.5 MB, so an inline column can never carry a 20-50 MB scope and the pre-enclave direct read had no ceiling at all; a single path removes the size cliff, the tuning constant, and one of two expiry mechanisms; and keeping ciphertext off the Gateway leaves it a pure control plane. Objects are ECIES-sealed to the builder, so reads are public like every other blob (see `vana-storage` below) and the R2 lifecycle rule on the prefix expires them without anyone issuing deletes. `result_handles` keeps the logical expiry the Gateway enforces when it stops serving a handle; the lifecycle rule is the physical backstop.
 
 Duplicate execution around an ambiguous failure is answered by stable `jobId` and idempotent commit. With desktop out of the read path there is one executor per user, so no presence TTL, per-user lease, or storage conditional PUT in v1. Raw-read version is pinned at admission; retries return identical bytes.
 
@@ -151,8 +153,8 @@ Today web couples registration to a booted PS Lite with a relay URL (`web-person
 1. Builder submits signed metadata: grant, scope, deadline, idempotency key. No user data, no encryption.
 2. Gateway verifies builder, grant, payment policy, rate limits; queues with `price`, `payer`.
 3. A node claims, derives the wallet, unseals the signature, starts or reuses the sandbox, hydrates only the pinned scope and version.
-4. PS verifies grant, registration, and builder key from signed artifacts; checks revocation on chain; redacts grantee-hidden fields; encrypts to the builder key; commits ciphertext. Receipt issues.
-5. Builder fetches, verifies, decrypts. Lost acknowledgement never loses the result.
+4. PS verifies grant, registration, and builder key from signed artifacts; checks revocation on chain; redacts grantee-hidden fields; stream-encrypts to the builder key straight into `jobresults/`, then completes the job with the handle. Receipt issues on the handle commit.
+5. Builder reads the handle from job status and fetches the object directly from storage, verifies the hash, decrypts. Neither leg crosses the Gateway. Lost acknowledgement never loses the result: the object is written before the job completes, so a failed completion leaves an orphan the lifecycle rule reaps, never a missing result.
 
 Today: DCR returns a per-user `personalServerUrl` (Account, not Gateway); SDK readers call `res.json()` and cannot read binary; PS ignores `grant.status` and `paymentStatus` while the Gateway requires `confirmed|finalized` and `paid`; payment happens before delivery.
 
@@ -235,8 +237,10 @@ lib/tee              + DCAP verifier, measurement policy, KMS derivation canary
 lib/operator-auth    ~ operator secret or allowlist separate from cron secret
 db                   + tee_nodes, jobs, job_attempts, result_handles, identity_records, sealed_secrets,
                        question_intents
-storage              + private R2 bucket for large ciphertext results (no object storage exists today)
-cron                 + expire claims, purge result handles, mark stale registrations
+storage              = none. Results live in vana-storage under `jobresults/`; the Gateway stores the
+                       handle, never the bytes. No bucket, no credentials, no presigning here
+cron                 + expire claims, mark stale registrations. Result objects are reaped by the R2
+                       lifecycle rule, not by a cron
 ```
 
 Pull-based: nodes heartbeat and claim, no inbound connections. Queue in Postgres with `FOR UPDATE SKIP LOCKED` (existing `settlement_outbox` pattern). Vercel caps functions at 300 s; Postgres is Neon over WebSocket.
@@ -286,6 +290,15 @@ apps/desktop         ~ collector and owner-local only; one-prompt migration to G
 auth/gateway-client  ~ adopt the inference relay's liveness predicate; revocation-aware cache (60 s positive cache today)
 middleware/auth      = blob GET/HEAD stay public by decision; security rests on keys
 blobs                = no conditional PUT needed in v1 (single executor per user); range reads only if profiling justifies
+job results          + PUT /v1/job-results/{chainId}/{owner}/{jobId}, write auth reuses the existing
+                       delegated-server check (signer is a registered server for {owner});
+                       GET /v1/job-results/{chainId}/{jobId} public like every other blob read.
+                       R2 key is `jobresults/{chainId}/{jobId}` — a TOP-LEVEL prefix, because
+                       `toR2Key` puts owner before scope so a per-owner subfolder cannot be
+                       targeted by a lifecycle rule. Same bucket, outside every owner-delete prefix,
+                       excluded from per-owner usage metering
+                     + R2 object lifecycle rule on `jobresults/` (granularity is whole days; 1 day
+                       is the floor, so short-lived expiry is enforced logically at the Gateway)
 ```
 
 ### Other repositories
@@ -309,6 +322,8 @@ Done in parts on 2026-09-02 (Spikes 1 to 4, `docs/260902-enclave-spike-results.m
 ## Open
 
 1. Anna's sign-off on the June reversal, revocation wording, and the no-second-wrap stance. Blocks ratification.
+
+Resolved 2026-09-04: one result path, always object storage, no inline ciphertext column (Vercel caps a function request or response body at 4.5 MB, and the pre-enclave direct read had no ceiling, so an inline row is a regression that cannot reach 20-50 MB); results live in the existing `vana-storage` bucket under a top-level `jobresults/` prefix rather than a new private bucket, because the objects are sealed to the builder and an R2 lifecycle rule expires them with no purge cron and no new credentials.
 
 Resolved 2026-09-02: owner-approved question intents; blob reads stay public; sealed ciphertext in Gateway Postgres; raw-read version pinned at admission; attestation via Gateway admission plus KMS cert chain; no second wrap; 5 min revocation staleness window.
 
