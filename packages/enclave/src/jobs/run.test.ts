@@ -340,7 +340,7 @@ describe("runJob", () => {
 
   it("fails a Gateway job for a different sandbox chain", async () => {
     const fixture = await createFixture();
-    fixture.job.chainId = 1480;
+    fixture.job.chainId = 14_801;
 
     await runJob(fixture.job, fixture.identity, fixture.deps);
 

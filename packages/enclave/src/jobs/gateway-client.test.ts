@@ -112,12 +112,12 @@ describe("GatewayClient", () => {
     ).resolves.toEqual(responseBody);
   });
 
-  it("rejects a claim with an unsupported chain id", async () => {
+  it("accepts a finite future chain id for mismatch handling", async () => {
     responder = () => 200;
     responseBody = {
       job: {
         jobId: JOB_ID,
-        chainId: 1,
+        chainId: 14_801,
         fencingToken: FENCING_TOKEN,
         requestCiphertext: "ciphertext",
       },
@@ -137,7 +137,7 @@ describe("GatewayClient", () => {
 
     await expect(
       client.claim(25, { leaseSeconds: 30, capacity: 20 }),
-    ).rejects.toBeInstanceOf(GatewayHttpError);
+    ).resolves.toEqual(responseBody);
   });
 
   it("sends node headers and maps an empty claim to null", async () => {
