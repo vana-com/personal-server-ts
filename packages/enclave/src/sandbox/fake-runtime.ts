@@ -117,6 +117,11 @@ export function createFakeRuntime(
 
       const running = { child, root, preserveRoot, running: true };
       sandboxes.set(id, running);
+      spec.onStatus?.({
+        containerId: id,
+        createdAt: new Date(now()).toISOString(),
+        lastSyncStatus: null,
+      });
       child.once?.("exit", () => {
         running.running = false;
       });

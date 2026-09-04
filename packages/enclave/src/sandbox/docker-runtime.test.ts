@@ -282,6 +282,32 @@ describe("docker sandbox runtime", () => {
     ]);
   });
 
+  it("reads a bounded tail through docker logs", async () => {
+    const docker = scriptedDocker();
+    docker.run = vi.fn().mockResolvedValue("sandbox output");
+    const runtime = createDockerRuntime({ docker });
+
+    await expect(runtime.logs?.("container-id", 500)).resolves.toBe(
+      "sandbox output",
+    );
+    expect(docker.run).toHaveBeenCalledWith("logs", [
+      "--tail",
+      "500",
+      "container-id",
+    ]);
+  });
+
+  it("returns both stdout and stderr from docker logs", async () => {
+    execFileMock.mockImplementationOnce((_binary, _args, _options, callback) =>
+      callback(null, "stdout line\n", "stderr line\n"),
+    );
+    const runtime = createDockerRuntime();
+
+    await expect(runtime.logs?.("container-id", 100)).resolves.toBe(
+      "stdout line\nstderr line",
+    );
+  });
+
   it("waits for the mapped port and uses the runtime host", async () => {
     const docker = scriptedDocker([
       { running: true },

@@ -15,6 +15,7 @@ const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 8787;
 const DEFAULT_FAKE_APP_ID = "0000000000000000000000000000000000000001";
 const FAKE_DSTACK_ENABLED = "1";
+const SANDBOX_DEBUG_ENABLED = "1";
 const MIN_PORT = 1;
 const MAX_PORT = 65_535;
 const DEFAULT_DOCKER_HOST = "tcp://sandbox-runtime:2375";
@@ -78,6 +79,7 @@ export interface AgentJobsConfig {
   fakeRoot?: string;
   sync: SandboxSyncMode;
   workDelayMs: number;
+  sandboxDebug: boolean;
   gatewayBypassSecret?: string;
 }
 
@@ -219,6 +221,7 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
       : {}),
     sync,
     workDelayMs,
+    sandboxDebug: env.SANDBOX_DEBUG === SANDBOX_DEBUG_ENABLED,
     ...(env.VERCEL_PROTECTION_BYPASS
       ? { gatewayBypassSecret: env.VERCEL_PROTECTION_BYPASS }
       : {}),

@@ -35,6 +35,7 @@ const IDENTITY_PATH = "/agent/v1/identity";
 const SEAL_PATH = "/agent/v1/secrets/seal";
 const DRAIN_PATH = "/agent/v1/drain";
 const RESULT_SIGNING_PATH = "/agent/v1/job-results/sign";
+const SANDBOXES_PATH = "/agent/v1/sandboxes";
 const STORAGE_ORIGIN = "https://storage.example";
 const SANDBOX_TOKEN = "sandbox-access-token";
 const JOB_ID = "123e4567-e89b-42d3-a456-426614174000";
@@ -168,6 +169,7 @@ function jobsControl(
           },
         }
       : { kind: "inactive" },
+  sandboxDebug = false,
 ): AgentJobsControl {
   return {
     nodeId: JOB_NODE_ID,
@@ -175,6 +177,21 @@ function jobsControl(
     activeCount: vi.fn().mockReturnValue(1),
     draining: vi.fn().mockReturnValue(false),
     drain: vi.fn().mockResolvedValue(undefined),
+    sandboxDebug,
+    listSandboxes: vi.fn().mockResolvedValue([
+      {
+        key: "user:2",
+        containerId: "container-1",
+        running: true,
+        createdAt: "2026-09-04T12:00:00.000Z",
+        lastSyncStatus: {
+          syncing: false,
+          pendingFiles: 0,
+          lastSync: "2026-09-04T12:00:01.000Z",
+        },
+      },
+    ]),
+    sandboxLogs: vi.fn().mockResolvedValue("line one\nline two\n"),
     lookupSandboxJob(token, jobId) {
       return token === SANDBOX_TOKEN
         ? lookup(token, jobId)
@@ -184,6 +201,49 @@ function jobsControl(
 }
 
 describe("agent HTTP server", () => {
+  it("hides sandbox debug routes when SANDBOX_DEBUG is disabled", async () => {
+    await stopServer();
+    await startServer(
+      createFakeDstackClient({ appId: FAKE_APP_ID }),
+      jobsControl(),
+    );
+
+    const response = await fetch(`${origin}${SANDBOXES_PATH}`, {
+      headers: JSON_HEADERS,
+    });
+
+    await expectError(response, 404, "NOT_FOUND");
+  });
+
+  it("lists sandboxes when SANDBOX_DEBUG is enabled", async () => {
+    const jobs = jobsControl(undefined, true);
+    await stopServer();
+    await startServer(createFakeDstackClient({ appId: FAKE_APP_ID }), jobs);
+
+    const response = await fetch(`${origin}${SANDBOXES_PATH}`, {
+      headers: JSON_HEADERS,
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(await jobs.listSandboxes());
+  });
+
+  it("clamps sandbox log tails to 500 lines", async () => {
+    const jobs = jobsControl(undefined, true);
+    await stopServer();
+    await startServer(createFakeDstackClient({ appId: FAKE_APP_ID }), jobs);
+
+    const response = await fetch(
+      `${origin}${SANDBOXES_PATH}/container-1/logs?tail=999`,
+      { headers: JSON_HEADERS },
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("text/plain");
+    expect(await response.text()).toBe("line one\nline two\n");
+    expect(jobs.sandboxLogs).toHaveBeenCalledWith("container-1", 500);
+  });
+
   it.each([
     ["missing", undefined],
     ["wrong length", "Bearer no"],
@@ -230,6 +290,9 @@ describe("agent HTTP server", () => {
       activeCount: vi.fn().mockReturnValue(3),
       draining: vi.fn().mockReturnValue(true),
       drain: vi.fn().mockResolvedValue(undefined),
+      sandboxDebug: false,
+      listSandboxes: vi.fn().mockResolvedValue([]),
+      sandboxLogs: vi.fn().mockResolvedValue(undefined),
       lookupSandboxJob: vi.fn().mockReturnValue({ kind: "unauthorized" }),
     } satisfies AgentJobsControl;
     await stopServer();

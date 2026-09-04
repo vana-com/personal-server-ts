@@ -11,6 +11,7 @@ import type { DstackClient } from "../dstack/client.js";
 import { userPsId } from "../identity/paths.js";
 import { deriveEnclaveAccount } from "../identity/wallet.js";
 import { normalizeJobId } from "../jobs/types.js";
+import type { SandboxStatus } from "../sandbox/registry.js";
 import { buildEvidence } from "./evidence.js";
 import { AgentError } from "./errors.js";
 import { readHealth } from "./health.js";
@@ -32,6 +33,7 @@ const IDENTITY_ROUTE = "/agent/v1/identity";
 const SEAL_ROUTE = "/agent/v1/secrets/seal";
 const DRAIN_ROUTE = "/agent/v1/drain";
 const RESULT_SIGNING_ROUTE = "/agent/v1/job-results/sign";
+const SANDBOXES_ROUTE = "/agent/v1/sandboxes";
 const GET = "GET";
 const POST = "POST";
 const PUT = "PUT";
@@ -50,6 +52,11 @@ const INTERNAL_MESSAGE = "internal server error";
 const UNKNOWN_ERROR = "unknown";
 const BODY_HASH_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const RESULT_SIGNING_MESSAGE = "Signed job result upload";
+const DEFAULT_LOG_TAIL = 100;
+const MAX_LOG_TAIL = 500;
+const TEXT_CONTENT_TYPE = "text/plain; charset=utf-8";
+const SANDBOX_LOGS_PATH_PATTERN =
+  /^\/agent\/v1\/sandboxes\/([a-zA-Z0-9_.-]+)\/logs$/;
 
 export interface AgentServerOptions {
   client: DstackClient;
@@ -63,6 +70,9 @@ export interface AgentJobsControl {
   activeCount(): number;
   draining(): boolean;
   drain(): Promise<void>;
+  sandboxDebug: boolean;
+  listSandboxes(): Promise<SandboxStatus[]>;
+  sandboxLogs(containerId: string, tail: number): Promise<string | undefined>;
   lookupSandboxJob(accessToken: string, jobId: string): SandboxJobLookup;
 }
 
@@ -117,6 +127,33 @@ async function handleRequest(
     if (request.method === POST && path === DRAIN_ROUTE) {
       await options.jobs?.drain();
       sendJson(response, OK, { draining: true });
+      return;
+    }
+
+    if (request.method === GET && path === SANDBOXES_ROUTE) {
+      if (!options.jobs?.sandboxDebug) {
+        sendError(response, NOT_FOUND, "NOT_FOUND", NOT_FOUND_MESSAGE);
+        return;
+      }
+      sendJson(response, OK, await options.jobs.listSandboxes());
+      return;
+    }
+
+    const logsContainerId = sandboxLogsContainerId(path);
+    if (request.method === GET && logsContainerId) {
+      if (!options.jobs?.sandboxDebug) {
+        sendError(response, NOT_FOUND, "NOT_FOUND", NOT_FOUND_MESSAGE);
+        return;
+      }
+      const logs = await options.jobs.sandboxLogs(
+        logsContainerId,
+        logTail(request),
+      );
+      if (logs === undefined) {
+        sendError(response, NOT_FOUND, "NOT_FOUND", NOT_FOUND_MESSAGE);
+        return;
+      }
+      sendText(response, OK, logs);
       return;
     }
 
@@ -382,6 +419,26 @@ function requestPath(request: IncomingMessage): string {
   return new URL(request.url ?? "/", "http://agent.invalid").pathname;
 }
 
+function sandboxLogsContainerId(path: string): string | undefined {
+  return SANDBOX_LOGS_PATH_PATTERN.exec(path)?.[1];
+}
+
+function logTail(request: IncomingMessage): number {
+  const value = new URL(
+    request.url ?? "/",
+    "http://agent.invalid",
+  ).searchParams.get("tail");
+  if (value === null) {
+    return DEFAULT_LOG_TAIL;
+  }
+  const tail = Number(value);
+  if (!Number.isSafeInteger(tail) || tail <= 0) {
+    throw new BadRequest();
+  }
+
+  return Math.min(tail, MAX_LOG_TAIL);
+}
+
 function sendJson(
   response: ServerResponse,
   status: number,
@@ -390,6 +447,16 @@ function sendJson(
   response.statusCode = status;
   response.setHeader(CONTENT_TYPE_HEADER, JSON_CONTENT_TYPE);
   response.end(JSON.stringify(body));
+}
+
+function sendText(
+  response: ServerResponse,
+  status: number,
+  body: string,
+): void {
+  response.statusCode = status;
+  response.setHeader(CONTENT_TYPE_HEADER, TEXT_CONTENT_TYPE);
+  response.end(body);
 }
 
 function sendError(

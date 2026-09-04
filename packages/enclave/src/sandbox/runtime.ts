@@ -1,4 +1,5 @@
 import type { Hex } from "viem";
+import type { SyncStatus } from "./probes.js";
 
 /**
  * Sandbox boundary (promoted from spike/sandbox launcher.ts):
@@ -46,9 +47,16 @@ export interface SandboxSpec {
   image: string;
   env: Record<string, string>;
   onProgress?: (event: SandboxStartEvent) => void;
+  onStatus?: (status: SandboxRuntimeStatus) => void;
 }
 
 export type SandboxStartEvent = "healthy" | "synced";
+
+export interface SandboxRuntimeStatus {
+  containerId: string;
+  createdAt: string;
+  lastSyncStatus: SyncStatus | null;
+}
 
 export interface SandboxHandle {
   id: string;
@@ -60,6 +68,7 @@ export interface SandboxRuntime {
   start(spec: SandboxSpec): Promise<SandboxHandle>;
   stop(id: string): Promise<void>;
   inspect(id: string): Promise<{ running: boolean }>;
+  logs?(id: string, tail: number): Promise<string>;
 }
 
 const SANDBOX_ENV_KEY_SET = new Set<string>(SANDBOX_ENV_KEYS);

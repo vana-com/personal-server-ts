@@ -1,5 +1,6 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { ActiveSandboxJob, SandboxJobLookup } from "../agent/types.js";
+import type { SyncStatus } from "./probes.js";
 import type { SandboxHandle, SandboxRuntime, SandboxSpec } from "./runtime.js";
 
 export const SANDBOX_MAX = 20;
@@ -51,6 +52,16 @@ export interface SandboxRegistry {
   lookupJob(accessToken: string, jobId: string): SandboxJobLookup;
   drain(): Promise<void>;
   activeCount(): number;
+  listSandboxes(): Promise<SandboxStatus[]>;
+  sandboxLogs(containerId: string, tail: number): Promise<string | undefined>;
+}
+
+export interface SandboxStatus {
+  key: string;
+  containerId: string;
+  running: boolean;
+  createdAt: string;
+  lastSyncStatus: SyncStatus | null;
 }
 
 interface RegistryEntry {
@@ -62,6 +73,9 @@ interface RegistryEntry {
   expiryVersion: number;
   activeJobs: Map<string, ActiveSandboxJob>;
   startPromise?: Promise<SandboxHandle>;
+  containerId?: string;
+  createdAt: string;
+  lastSyncStatus: SyncStatus | null;
 }
 
 export class SandboxCapacityError extends Error {
@@ -102,6 +116,8 @@ export function createSandboxRegistry(
         useCount: 1,
         expiryVersion: 0,
         activeJobs: new Map(),
+        createdAt: new Date(now()).toISOString(),
+        lastSyncStatus: null,
       };
       entries.set(key, entry);
 
@@ -197,6 +213,33 @@ export function createSandboxRegistry(
     activeCount(): number {
       return entries.size;
     },
+    async listSandboxes(): Promise<SandboxStatus[]> {
+      const sandboxes = [...entries.entries()].flatMap(([key, entry]) =>
+        entry.containerId
+          ? [{ key, entry, containerId: entry.containerId }]
+          : [],
+      );
+
+      return Promise.all(
+        sandboxes.map(async ({ key, entry, containerId }) => ({
+          key,
+          containerId,
+          running: (await options.runtime.inspect(containerId)).running,
+          createdAt: entry.createdAt,
+          lastSyncStatus: entry.lastSyncStatus,
+        })),
+      );
+    },
+    sandboxLogs(containerId, tail): Promise<string | undefined> {
+      const managed = [...entries.values()].some(
+        (entry) => entry.containerId === containerId,
+      );
+      if (!managed || !options.runtime.logs) {
+        return Promise.resolve(undefined);
+      }
+
+      return options.runtime.logs(containerId, tail);
+    },
   };
 }
 
@@ -272,6 +315,13 @@ async function startEntry(options: StartEntryOptions): Promise<SandboxHandle> {
     }
 
     const spec = options.buildSpec(options.entry.accessToken);
+    const onStatus = spec.onStatus;
+    spec.onStatus = (status) => {
+      options.entry.containerId = status.containerId;
+      options.entry.createdAt = status.createdAt;
+      options.entry.lastSyncStatus = status.lastSyncStatus;
+      onStatus?.(status);
+    };
     const handle = await options.runtime.start(spec);
     if (options.isDraining()) {
       await forceRemove(options.runtime, handle.id, options.logger);

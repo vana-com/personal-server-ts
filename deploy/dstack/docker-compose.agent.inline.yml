@@ -11,6 +11,7 @@ services:
       - ENCLAVE_AGENT_SECRET
       - ENCLAVE_AGENT_HOST=0.0.0.0
       - ENCLAVE_AGENT_PORT=8787
+      - SANDBOX_DEBUG
       # Literal KEY=value overrides encrypted env, breaking --ref; feat/enclave-deploy no longer exists.
       - GIT_REF
     volumes:

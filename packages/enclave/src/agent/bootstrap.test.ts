@@ -63,6 +63,7 @@ describe("agentConfigFromEnv", () => {
       LEASE_SECONDS: "60",
       SANDBOX_SYNC: "disabled",
       WORK_DELAY_MS: "250",
+      SANDBOX_DEBUG: "1",
       VERCEL_PROTECTION_BYPASS: "preview-secret",
       STORAGE_API_URL: "https://storage-dev.vana.org",
       CHAIN_ID: String(MAINNET_CHAIN_ID),
@@ -89,6 +90,7 @@ describe("agentConfigFromEnv", () => {
       fakeRoot: "/tmp/sandboxes",
       sync: "disabled",
       workDelayMs: 250,
+      sandboxDebug: true,
       gatewayBypassSecret: "preview-secret",
       storageApiUrl: "https://storage-dev.vana.org",
       sandboxAgentUrl: "http://agent:8787",
@@ -215,6 +217,7 @@ describe("agentConfigFromEnv", () => {
       sandboxMemory: "512m",
       sandboxCpus: "2",
       sandboxPidsLimit: 256,
+      sandboxDebug: false,
     });
   });
 

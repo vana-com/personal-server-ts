@@ -48,6 +48,7 @@ class FakeClock {
 function memoryRuntime(): SandboxRuntime & {
   starts: SandboxSpec[];
   stops: string[];
+  logs: ReturnType<typeof vi.fn>;
 } {
   const starts: SandboxSpec[] = [];
   const stops: string[] = [];
@@ -58,6 +59,15 @@ function memoryRuntime(): SandboxRuntime & {
     async reconcile() {},
     async start(spec) {
       starts.push(spec);
+      spec.onStatus?.({
+        containerId: `sandbox-${starts.length}`,
+        createdAt: "2026-09-04T12:00:00.000Z",
+        lastSyncStatus: {
+          syncing: false,
+          pendingFiles: 0,
+          lastSync: "2026-09-04T12:00:01.000Z",
+        },
+      });
 
       return {
         id: `sandbox-${starts.length}`,
@@ -70,6 +80,7 @@ function memoryRuntime(): SandboxRuntime & {
     async inspect() {
       return { running: true };
     },
+    logs: vi.fn().mockResolvedValue("sandbox output"),
   };
 }
 
@@ -88,6 +99,34 @@ async function flush(): Promise<void> {
 }
 
 describe("sandbox registry", () => {
+  it("reports managed sandbox status and scopes log access", async () => {
+    const runtime = memoryRuntime();
+    const registry = createSandboxRegistry({ runtime });
+
+    await registry.acquire("owner:1", buildSpec);
+
+    await expect(registry.listSandboxes()).resolves.toEqual([
+      {
+        key: "owner:1",
+        containerId: "sandbox-1",
+        running: true,
+        createdAt: "2026-09-04T12:00:00.000Z",
+        lastSyncStatus: {
+          syncing: false,
+          pendingFiles: 0,
+          lastSync: "2026-09-04T12:00:01.000Z",
+        },
+      },
+    ]);
+    await expect(registry.sandboxLogs("sandbox-1", 500)).resolves.toBe(
+      "sandbox output",
+    );
+    await expect(
+      registry.sandboxLogs("unmanaged", 500),
+    ).resolves.toBeUndefined();
+    expect(runtime.logs).toHaveBeenCalledOnce();
+  });
+
   it("reuses ready sandboxes and preserves their access token", async () => {
     const runtime = memoryRuntime();
     const registry = createSandboxRegistry({ runtime, max: 2, idleTtlMs: 100 });

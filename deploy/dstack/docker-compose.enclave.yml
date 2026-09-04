@@ -27,6 +27,7 @@ services:
       - ENCLAVE_AGENT_SECRET
       - ENCLAVE_AGENT_HOST=0.0.0.0
       - ENCLAVE_AGENT_PORT=8787
+      - SANDBOX_DEBUG
       - GIT_REF
       - GATEWAY_URL
       - STORAGE_API_URL

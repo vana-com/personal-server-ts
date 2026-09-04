@@ -2,7 +2,12 @@ import { execFile } from "node:child_process";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { HealthProbe, SyncProbe, SyncStatusProbe } from "./probes.js";
+import type {
+  HealthProbe,
+  SyncProbe,
+  SyncProbeResult,
+  SyncStatusProbe,
+} from "./probes.js";
 import { probeHealth, probeSyncStatus } from "./probes.js";
 import {
   assertSandboxEnv,
@@ -32,6 +37,7 @@ const CREATE_COMMAND = "create";
 const LIST_COMMAND = "ps";
 const START_COMMAND = "start";
 const INSPECT_COMMAND = "inspect";
+const LOGS_COMMAND = "logs";
 const REMOVE_COMMAND = "rm";
 const FORCE_FLAG = "--force";
 const VOLUMES_FLAG = "--volumes";
@@ -46,6 +52,7 @@ const ALL_FLAG = "--all";
 const QUIET_FLAG = "--quiet";
 const FILTER_FLAG = "--filter";
 const LABEL_FLAG = "--label";
+const TAIL_FLAG = "--tail";
 const SANDBOX_LABEL = "org.vana.personal-server.sandbox=true";
 const SANDBOX_NAME_FILTER = "name=^/ps-";
 const NOT_FOUND_PATTERN = /No such container/i;
@@ -201,6 +208,8 @@ export function createDockerRuntime(
       try {
         await docker.run(START_COMMAND, [containerId]);
         const startedAt = now();
+        const createdAt = new Date(startedAt).toISOString();
+        spec.onStatus?.({ containerId, createdAt, lastSyncStatus: null });
         const origin = await waitForHealth({
           containerId,
           name,
@@ -233,6 +242,8 @@ export function createDockerRuntime(
             deadline: syncStartedAt + syncTimeoutMs,
             timeoutMs: syncTimeoutMs,
             logger: options.logger,
+            onStatus: (lastSyncStatus) =>
+              spec.onStatus?.({ containerId, createdAt, lastSyncStatus }),
           });
         }
         spec.onProgress?.("synced");
@@ -254,6 +265,9 @@ export function createDockerRuntime(
       const inspection = await docker.inspect(id);
 
       return { running: inspection.running };
+    },
+    logs(id, tail): Promise<string> {
+      return docker.run(LOGS_COMMAND, [TAIL_FLAG, String(tail), id]);
     },
   };
 }
@@ -312,7 +326,9 @@ function runDocker(
           return;
         }
 
-        resolve(stdout.trim());
+        resolve(
+          (command === LOGS_COMMAND ? `${stdout}${stderr}` : stdout).trim(),
+        );
       },
     );
   });
@@ -536,6 +552,7 @@ interface SyncWaitOptions {
   deadline: number;
   timeoutMs: number;
   logger?: SandboxWaitLogger;
+  onStatus?: (status: NonNullable<SyncProbeResult["status"]>) => void;
 }
 
 async function waitForSync(options: SyncWaitOptions): Promise<void> {
@@ -545,6 +562,9 @@ async function waitForSync(options: SyncWaitOptions): Promise<void> {
       options.origin,
       options.accessToken,
     );
+    if (result.status) {
+      options.onStatus?.(result.status);
+    }
     if (result.ready) {
       return;
     }

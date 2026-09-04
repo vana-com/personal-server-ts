@@ -124,6 +124,9 @@ async function startJobs(
     storageApiUrl: config.storageApiUrl,
     activeCount: () => registry.activeCount(),
     draining: () => claimLoop.draining(),
+    sandboxDebug: config.sandboxDebug,
+    listSandboxes: () => registry.listSandboxes(),
+    sandboxLogs: (containerId, tail) => registry.sandboxLogs(containerId, tail),
     lookupSandboxJob: (accessToken, jobId) =>
       registry.lookupJob(accessToken, jobId),
     drain(): Promise<void> {
