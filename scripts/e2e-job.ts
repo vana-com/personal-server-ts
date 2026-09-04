@@ -382,9 +382,9 @@ function installGatewayBypass(
   };
 }
 
-// These four env overrides mirror data-gateway's contract configuration. Its
-// `.env.example` uses a Moksha DataRegistry unlike the SDK's baked default:
-// https://github.com/vana-com/data-gateway/blob/main/.env.example
+// These env overrides support Gateways configured differently from the deployed
+// dev Gateway, which uses 0x8f1eFCdff3d0d5BB535e32620721c7EBed151867,
+// matching the core package and desktop app default.
 function gatewayConfigFor(chainId: number): DataPortabilityGatewayConfig {
   const defaults = ServerConfigSchema.parse({}).gateway.contracts;
 
@@ -392,9 +392,7 @@ function gatewayConfigFor(chainId: number): DataPortabilityGatewayConfig {
     chainId,
     contracts: {
       ...defaults,
-      dataRegistry:
-        process.env.DATA_REGISTRY_CONTRACT ??
-        "0x8C8788f98385F6ba1adD4234e551ABba0f82Cb7C",
+      dataRegistry: process.env.DATA_REGISTRY_CONTRACT ?? defaults.dataRegistry,
       dataPortabilityServer:
         process.env.DATA_PORTABILITY_SERVER_CONTRACT ??
         defaults.dataPortabilityServer,
