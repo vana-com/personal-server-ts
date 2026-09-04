@@ -6,6 +6,7 @@ import { getAddress, toHex, type Address, type Hex } from "viem";
 import type { DstackClient } from "../dstack/client.js";
 import { decryptEcies } from "../agent/ecies.js";
 import { deriveEnclaveKey } from "../identity/wallet.js";
+import { isNonTransientDockerSandboxError } from "../sandbox/docker-runtime.js";
 import type { SandboxRegistry } from "../sandbox/registry.js";
 import type { SandboxSpec } from "../sandbox/runtime.js";
 import type { SandboxContracts } from "../agent/bootstrap.js";
@@ -35,6 +36,7 @@ const MIN_TIMER_DELAY_MS = 0;
 const INVALID_REQUEST_REASON = "REQUEST_INVALID";
 const DEADLINE_REASON = "DEADLINE_PASSED";
 const CHAIN_MISMATCH_REASON = "CHAIN_MISMATCH";
+const SANDBOX_UNAVAILABLE_REASON = "SANDBOX_UNAVAILABLE";
 const SYNC_ENABLED = "true";
 const SYNC_DISABLED = "false";
 const ENCRYPT_UNAVAILABLE = "ECIES encryption is unavailable";
@@ -173,6 +175,9 @@ export async function runJob(
       acquired = true;
     } catch (error) {
       logStageFailure(deps.logger, job.jobId, SANDBOX_ACQUIRE_STAGE, error);
+      if (isNonTransientDockerSandboxError(error)) {
+        await failJob(job, SANDBOX_UNAVAILABLE_REASON, deps.gateway);
+      }
       return;
     } finally {
       signature.fill(0);

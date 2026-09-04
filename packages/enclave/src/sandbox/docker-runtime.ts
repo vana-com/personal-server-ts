@@ -55,6 +55,15 @@ const SECRET_ENV_KEY_SET = new Set<string>(SECRET_ENV_KEYS);
 const SECRET_ENV_DIRECTORY_PREFIX = "ps-docker-env-";
 const SECRET_ENV_FILENAME = "sandbox.env";
 const SECRET_ENV_LINE_BREAK = /[\r\n]/;
+const NON_TRANSIENT_SANDBOX_PATTERNS = [
+  /range of CPUs is from/i,
+  /invalid (?:cpu|memory|pids|resource)/i,
+  /minimum memory limit/i,
+  /no such image/i,
+  /manifest unknown/i,
+  /unknown(?: or invalid)? runtime/i,
+  /runtime .* (?:unavailable|not found)/i,
+];
 
 export const DEFAULT_SANDBOX_MEMORY = "512m";
 export const DEFAULT_SANDBOX_CPUS = "2";
@@ -99,6 +108,19 @@ export interface DockerRuntimeOptions {
   memory?: string;
   cpus?: string;
   pidsLimit?: number;
+}
+
+export function isNonTransientDockerSandboxError(error: unknown): boolean {
+  if (
+    !(error instanceof Error) ||
+    !/^Docker (?:create|start) failed:/i.test(error.message)
+  ) {
+    return false;
+  }
+
+  return NON_TRANSIENT_SANDBOX_PATTERNS.some((pattern) =>
+    pattern.test(error.message),
+  );
 }
 
 export function createDockerRuntime(

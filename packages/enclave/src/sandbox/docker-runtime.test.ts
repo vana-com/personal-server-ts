@@ -3,6 +3,7 @@ import type { Hex } from "viem";
 import { access, readFile, stat } from "node:fs/promises";
 import {
   createDockerRuntime,
+  isNonTransientDockerSandboxError,
   type ContainerInspection,
   type DockerClient,
 } from "./docker-runtime.js";
@@ -64,6 +65,29 @@ function scriptedDocker(
 }
 
 describe("docker sandbox runtime", () => {
+  it.each([
+    "range of CPUs is from 0.01 to 1.00",
+    "No such image: personal-server@sha256:missing",
+    "unknown runtime specified: runsc-ptrace",
+  ])("classifies permanent create failure: %s", (diagnostic) => {
+    expect(
+      isNonTransientDockerSandboxError(
+        new Error(`Docker create failed: ${diagnostic}`),
+      ),
+    ).toBe(true);
+  });
+
+  it.each(["daemon is busy", "network timeout"])(
+    "leaves transient create failure retryable: %s",
+    (diagnostic) => {
+      expect(
+        isNonTransientDockerSandboxError(
+          new Error(`Docker create failed: ${diagnostic}`),
+        ),
+      ).toBe(false);
+    },
+  );
+
   it("surfaces a bounded stderr tail when docker create fails", async () => {
     const prefix = "x".repeat(STDERR_TAIL_BYTES);
     const diagnostic = "runtime runsc-ptrace is unavailable";

@@ -504,6 +504,30 @@ describe("runJob", () => {
     );
   });
 
+  it("fails the job when sandbox creation is permanently unavailable", async () => {
+    const fixture = await createFixture();
+    vi.spyOn(fixture.runtime, "start").mockRejectedValue(
+      new Error(
+        "Docker create failed: range of CPUs is from 0.01 to 1.00, as there are only 1 CPUs available",
+      ),
+    );
+
+    await runJob(fixture.job, fixture.identity, fixture.deps);
+
+    expect(fixture.gateway.fail).toHaveBeenCalledWith(JOB_ID, {
+      fencingToken: 1,
+      reason: "SANDBOX_UNAVAILABLE",
+    });
+    expect(fixture.gateway.complete).not.toHaveBeenCalled();
+    expect(fixture.deps.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jobId: JOB_ID,
+        stage: "sandbox-acquire",
+      }),
+      "Enclave job stage failed",
+    );
+  });
+
   it("fails a request with invalid ciphertext", async () => {
     const fixture = await createFixture();
     const ciphertext = Buffer.from(fixture.job.requestCiphertext, "base64");
