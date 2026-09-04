@@ -106,6 +106,33 @@ curl -fsS -X POST "$AGENT_URL/agent/v1/drain" \
   -H "Authorization: Bearer $ENCLAVE_AGENT_SECRET"
 ```
 
+## Rolling out a compose change
+
+Replicas inherit the source CVM's compose, so replication does not roll out a
+compose change. Update each existing CVM in place with a fresh Gateway node ID:
+
+```sh
+scripts/tee/update.sh <cvm-uuid> --tee-node-id <new-id> \
+  --secret-out ./<new-id>.node-secret
+```
+
+Register the printed payload, admit `<new-id>` after its heartbeat arrives,
+then drain the old agent and remove its old Gateway node ID:
+
+```sh
+curl -fsS -X POST "$GATEWAY_URL/v1/tee-nodes/<new-id>/admit" \
+  -H "Authorization: Bearer $OPERATOR_SECRET"
+curl -fsS -X POST "$OLD_AGENT_URL/agent/v1/drain" \
+  -H "Authorization: Bearer $ENCLAVE_AGENT_SECRET"
+curl -fsS -X POST "$GATEWAY_URL/v1/tee-nodes/<old-id>/remove" \
+  -H "Authorization: Bearer $OPERATOR_SECRET"
+```
+
+`phala logs` returns only the first roughly 300 container log lines. Use the
+Phala dashboard log panel for runtime job stages and lease warnings; agent node
+ID dumps from the CLI are boot-only. A newly created CVM can stop after its
+first boot; recover it with `phala cvms start <uuid>`.
+
 ## Remote lease-recovery test
 
 Provision the slow node with `WORK_DELAY_MS=120000`, then unset it before
