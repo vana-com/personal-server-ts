@@ -154,6 +154,19 @@ Phala dashboard log panel for runtime job stages and lease warnings; agent node
 ID dumps from the CLI are boot-only. A newly created CVM can stop after its
 first boot; recover it with `phala cvms start <uuid>`.
 
+## Reading sandbox state on a CVM
+
+For the complete agent or dind container log, open the Phala dashboard log
+panel and choose `⋮` → **Open in New Window**; `phala logs` returns only the
+first roughly 300 lines. For temporary diagnosis only, provision with
+`SANDBOX_DEBUG=1` (do not enable it in production), then use the existing agent
+bearer with `GET /agent/v1/sandboxes` or `GET
+/agent/v1/sandboxes/<containerId>/logs?tail=500`. Acquisition emits
+`sandbox-acquire` events `start`, `healthy`, and `synced` with `elapsedMs`;
+while blocked, 30-second health/sync messages include the container name and
+latest health or sync status, and a lapsed lease logs `Job lease lost` with its
+stage and elapsed time.
+
 ## Remote lease-recovery test
 
 Provision the slow node with `WORK_DELAY_MS=120000`, then unset it before
