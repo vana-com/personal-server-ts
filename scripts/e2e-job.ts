@@ -136,8 +136,10 @@ const E2E_RECOVERY_ENV = "E2E_RECOVERY";
 const E2E_WARM_RUNS_ENV = "E2E_WARM_RUNS";
 const E2E_JOB_TIMEOUT_MS_ENV = "E2E_JOB_TIMEOUT_MS";
 const E2E_EXTRA_SCOPES_ENV = "E2E_EXTRA_SCOPES";
-const DECOY_SCOPE_PREFIX = "e2e.jobs.decoy";
+const DECOY_SCOPE_PREFIX = "e2e.decoy";
 const REMOTE_SCOPE_LIST_LIMIT = 1_000;
+const SANDBOX_DEBUG_PATH = "/agent/v1/sandboxes";
+const SANDBOX_LOG_TAIL = 500;
 const PAD_PATTERN =
   "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
@@ -701,6 +703,88 @@ async function verifyRemoteNodes(ctx: JobContext): Promise<string> {
   return `nodeIds=${ctx.remoteNodeIds.join(",")}`;
 }
 
+async function assertHydrationLogIfAvailable(
+  ctx: JobContext,
+  scope: string,
+): Promise<boolean> {
+  const result = await operatorRequest(ctx, "GET", "/v1/tee-nodes");
+  const nodes = Array.isArray(result.response.body)
+    ? result.response.body.map(record)
+    : [];
+  const registryKey = `${ctx.userPsId}:${FIRST_EPOCH}`;
+  let debugRouteAvailable = false;
+
+  for (const nodeId of ctx.remoteNodeIds) {
+    const node = nodes.find((candidate) => candidate?.nodeId === nodeId);
+    if (typeof node?.publicUrl !== "string") continue;
+
+    const baseUrl = node.publicUrl.replace(/\/+$/, "");
+    let response: Response;
+    try {
+      response = await fetch(`${baseUrl}${SANDBOX_DEBUG_PATH}`, {
+        headers: { Authorization: `Bearer ${ctx.agentSecret}` },
+      });
+    } catch {
+      continue;
+    }
+    if (!response.ok) continue;
+    debugRouteAvailable = true;
+
+    const sandboxes = await response.json();
+    if (!Array.isArray(sandboxes)) continue;
+    const sandbox = sandboxes
+      .map(record)
+      .find((candidate) => candidate?.key === registryKey);
+    if (typeof sandbox?.containerId !== "string") continue;
+
+    const logsResponse = await fetch(
+      `${baseUrl}${SANDBOX_DEBUG_PATH}/${encodeURIComponent(sandbox.containerId)}/logs?tail=${SANDBOX_LOG_TAIL}`,
+      { headers: { Authorization: `Bearer ${ctx.agentSecret}` } },
+    );
+    if (!logsResponse.ok) {
+      throw new Error(
+        `Sandbox logs request failed with status ${logsResponse.status}`,
+      );
+    }
+    const logs = await logsResponse.text();
+    if (!hasHydrationLog(logs, scope)) {
+      throw new Error(`Sandbox logs did not prove hydration for ${scope}`);
+    }
+
+    return true;
+  }
+
+  if (debugRouteAvailable) {
+    throw new Error(`Debug routes did not expose sandbox ${registryKey}`);
+  }
+
+  // TODO: make this assertion mandatory once remote e2e nodes consistently
+  // enable SANDBOX_DEBUG and expose their agent bearer to the harness.
+  return false;
+}
+
+function hasHydrationLog(logs: string, scope: string): boolean {
+  for (const line of logs.split("\n")) {
+    try {
+      const entry = record(JSON.parse(line));
+      if (
+        entry?.scope === scope &&
+        (entry?.msg === "Hydrated requested scope" ||
+          entry?.message === "Hydrated requested scope")
+      ) {
+        return true;
+      }
+    } catch {
+      // Pretty Pino output is checked below.
+    }
+  }
+
+  const escapedScope = scope.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(
+    `Hydrated requested scope(?:\\r?\\n[^\\r\\n]*){0,4}\\r?\\n\\s*scope:\\s*["']${escapedScope}["']`,
+  ).test(logs);
+}
+
 async function registerBuilder(ctx: JobContext): Promise<RegisteredBuilder> {
   const privateKey = generatePrivateKey();
   const account = privateKeyToAccount(privateKey);
@@ -969,8 +1053,9 @@ async function ingestSeedScopes(
       body: rawBody,
     });
     if (response.status !== HTTP_CREATED) {
+      const responseBody = await response.text();
       throw new Error(
-        `Record seed for ${scope} failed with status ${response.status}`,
+        `Record seed for ${scope} failed with status ${response.status}: ${responseBody || "<empty body>"}`,
       );
     }
   }
@@ -1822,7 +1907,7 @@ async function main(): Promise<void> {
     return `submit_ms=${completed.submitMs} complete_ms=${completed.completeMs} ttfb_ms=${completed.ttfbMs} fetch_ms=${completed.fetchMs} decrypt_ms=${completed.decryptMs} result_size=${completed.resultSize}`;
   });
 
-  if (ctx.extraScopes.length > 0) {
+  if (ctx.remote && ctx.extraScopes.length > 0) {
     await runStep("9d", "seed late decoy scopes", ["9"], async () => {
       const decoyVersions = await seedRecord(ctx, ctx.extraScopes);
       for (const [scope, version] of decoyVersions) {
@@ -1842,8 +1927,12 @@ async function main(): Promise<void> {
         seedVersions.get(scope),
         scope,
       );
+      const hydrationLogVerified = await assertHydrationLogIfAvailable(
+        ctx,
+        scope,
+      );
 
-      return `scope=${scope} submit_ms=${completed.submitMs} complete_ms=${completed.completeMs}`;
+      return `scope=${scope} submit_ms=${completed.submitMs} complete_ms=${completed.completeMs} hydration_log=${hydrationLogVerified ? "verified" : "unavailable"}`;
     });
   }
 
