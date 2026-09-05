@@ -1,6 +1,7 @@
 const VERCEL_PROTECTION_BYPASS = process.env.VERCEL_PROTECTION_BYPASS;
 const REDACTED = "<redacted>";
 const PRIVATE_KEYS = new Set(["authorization", "secret", "nodesecret"]);
+const NON_TERMINAL_JOB_STATES = new Set(["queued", "claimed", "running"]);
 type RequestPrivacy = "standard" | "secrets";
 
 interface RequestDetails {
@@ -200,6 +201,13 @@ export function record(value: unknown): Record<string, unknown> | undefined {
     return undefined;
   }
   return value as Record<string, unknown>;
+}
+
+export function isNonTerminalJobResponse(body: unknown): boolean {
+  const response = record(body);
+  const nestedJob = record(response?.job);
+  const state = nestedJob?.state ?? response?.state;
+  return typeof state === "string" && NON_TERMINAL_JOB_STATES.has(state);
 }
 
 export function hasStepFailures(): boolean {

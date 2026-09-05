@@ -55,6 +55,7 @@ import { saveConfig } from "../packages/server/src/config/index.js";
 import {
   StepFailure,
   hasStepFailures,
+  isNonTerminalJobResponse,
   printSummary,
   record,
   requestJson,
@@ -1294,13 +1295,14 @@ async function submitAndDecrypt(
   const result = await submitJob(ctx, builder.account, job, JOB_WAIT_SECONDS);
   const submitMs = Math.round(performance.now() - submittedAt);
   let status = jobFromResult(result);
+  const shouldPoll = isNonTerminalJobResponse(result.response.body);
   requireResponse(
     result,
-    result.response.status === HTTP_ACCEPTED ? HTTP_ACCEPTED : HTTP_OK,
-    () => status !== undefined,
+    [HTTP_OK, HTTP_ACCEPTED],
+    () => status !== undefined || shouldPoll,
     "Expected an inline or queued raw read job response",
   );
-  if (!isTerminalJob(status!)) {
+  if (!status || !isTerminalJob(status)) {
     status = await pollJob(
       ctx,
       builder.account,
@@ -1309,21 +1311,21 @@ async function submitAndDecrypt(
     );
   }
   const completeMs = Math.round(performance.now() - submittedAt);
-  if (status!.state !== "completed") {
+  if (status.state !== "completed") {
     throw new Error(
-      `Job ended as ${status!.state}; failureReason=${status!.failureReason ?? "null"}`,
+      `Job ended as ${status.state}; failureReason=${status.failureReason ?? "null"}`,
     );
   }
-  if (status!.attempt !== 1) {
+  if (status.attempt !== 1) {
     throw new Error(
-      `Expected the raw read job to complete on attempt 1, received attempt ${status!.attempt}`,
+      `Expected the raw read job to complete on attempt 1, received attempt ${status.attempt}`,
     );
   }
   const fetched = await assertResult(
     ctx,
     builder.account,
     builder.privateKey,
-    status!,
+    status,
     expectedVersion,
     submittedAt,
   );
