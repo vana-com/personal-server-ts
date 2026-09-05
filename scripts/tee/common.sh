@@ -7,24 +7,18 @@ readonly CURL_CONNECT_TIMEOUT_SECONDS=5
 readonly CURL_MAX_TIME_SECONDS=10
 readonly AGENT_LOG_LINES=50
 
-source_images_env() {
+load_images_env() {
   local images_env=$1
-  local had_ps_image=false
-  local had_ps_image_ref=false
-  local saved_ps_image=${PS_IMAGE-}
-  local saved_ps_image_ref=${PS_IMAGE_REF-}
+  local line
 
   [[ -f $images_env ]] || return 0
-  [[ ${PS_IMAGE+x} == x ]] && had_ps_image=true
-  [[ ${PS_IMAGE_REF+x} == x ]] && had_ps_image_ref=true
-  # shellcheck disable=SC1090
-  source "$images_env"
-  if [[ $had_ps_image == true ]]; then
-    PS_IMAGE=$saved_ps_image
-  fi
-  if [[ $had_ps_image_ref == true ]]; then
-    PS_IMAGE_REF=$saved_ps_image_ref
-  fi
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ ${PS_IMAGE+x} != x && $line =~ ^PS_IMAGE=[A-Za-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]; then
+      PS_IMAGE=${line#PS_IMAGE=}
+    elif [[ ${PS_IMAGE_REF+x} != x && $line =~ ^PS_IMAGE_REF=[0-9a-f]{40}$ ]]; then
+      PS_IMAGE_REF=${line#PS_IMAGE_REF=}
+    fi
+  done <"$images_env"
 }
 
 assert_ps_image_ref() {

@@ -88,13 +88,27 @@ if [[ ! $git_ref =~ ^[[:xdigit:]]{40}$ ]]; then
   exit 1
 fi
 
-source_images_env "$repo_root/deploy/dstack/images.env"
+if [[ ${compose##*/} == docker-compose.enclave.inline.yml ]]; then
+  if [[ -z ${PS_IMAGE:-} ]]; then
+    PS_IMAGE=personal-server:local
+  fi
+  if [[ ! $PS_IMAGE =~ ^[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+$ ]]; then
+    echo "PS_IMAGE must be a local image tag such as vanaorg/personal-server:level-b" >&2
+    exit 1
+  fi
+else
+  load_images_env "$repo_root/deploy/dstack/images.env"
+  : "${PS_IMAGE:?PS_IMAGE must be set in the environment}"
+  if [[ ! $PS_IMAGE =~ ^.+@sha256:[[:xdigit:]]{64}$ ]]; then
+    echo "PS_IMAGE must be an image digest such as vanaorg/personal-server@sha256:<64 hex characters>" >&2
+    exit 1
+  fi
+  GIT_REF=$git_ref
+  assert_ps_image_ref
+fi
 : "${ENCLAVE_AGENT_SECRET:?ENCLAVE_AGENT_SECRET must be set in the environment}"
 : "${GATEWAY_URL:?GATEWAY_URL must be set in the environment}"
-: "${PS_IMAGE:?PS_IMAGE must be set in the environment}"
 validate_image_digests
-GIT_REF=$git_ref
-assert_ps_image_ref
 command -v openssl >/dev/null || { echo "openssl is required" >&2; exit 1; }
 command -v phala >/dev/null || { echo "phala CLI is required" >&2; exit 1; }
 command -v node >/dev/null || { echo "Node.js is required" >&2; exit 1; }
