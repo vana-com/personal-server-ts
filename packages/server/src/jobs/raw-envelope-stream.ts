@@ -30,6 +30,7 @@ interface EnvelopePlan {
   prefix: Uint8Array;
   storedLineage: boolean;
   binary: boolean;
+  metadataIsObject: boolean;
   metadataHasKeptProperty: boolean;
 }
 
@@ -68,6 +69,7 @@ class EnvelopeScanner {
   private sawData = false;
   private storedLineage = false;
   private binary = false;
+  private metadataIsObject = false;
   private metadataHasKeptProperty = false;
 
   write(chunk: Uint8Array): void {
@@ -88,6 +90,7 @@ class EnvelopeScanner {
       prefix: encoder.encode(`${headerJson.slice(0, -1)},"data":`),
       storedLineage: this.storedLineage,
       binary: this.binary,
+      metadataIsObject: this.metadataIsObject,
       metadataHasKeptProperty: this.metadataHasKeptProperty,
     };
   }
@@ -131,6 +134,7 @@ class EnvelopeScanner {
     if (byte === 0x7b) {
       const path = childObjectPath(frame);
       if (path === "data") this.sawData = true;
+      if (path === "metadata") this.metadataIsObject = true;
       this.stack.push({
         type: "object",
         path,
@@ -359,7 +363,9 @@ function shouldKeepProperty(
   plan: EnvelopePlan,
 ): boolean {
   if (path === "root") return key === "data";
-  if (path === "metadata") return !(plan.storedLineage && key === "lineage");
+  if (path === "metadata") {
+    return !(plan.storedLineage && plan.binary && key === "lineage");
+  }
   if (path !== "data") return true;
   if (key === "$writtenBy" || key === "$lineage") return false;
   if (plan.storedLineage && !plan.binary && key === "lineage") return false;
@@ -367,6 +373,7 @@ function shouldKeepProperty(
     plan.storedLineage &&
     plan.binary &&
     key === "metadata" &&
+    plan.metadataIsObject &&
     !plan.metadataHasKeptProperty
   ) {
     return false;

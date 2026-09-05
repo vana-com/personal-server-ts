@@ -46,17 +46,75 @@ describe("openRedactedEnvelopeStream", () => {
       },
     },
   ])("matches the buffered grantee representation", async (value) => {
-    const stored = encoder.encode(JSON.stringify(value, null, 2));
-    const open = async () => chunkedStream(stored, 7);
-    const stream = await openRedactedEnvelopeStream(open);
-    const actual = await new Response(stream).text();
-    const expected = JSON.stringify(
-      redactEnvelopeForGrantee(DataFileEnvelopeSchema.parse(value)),
-    );
+    await expectStreamingParity(value);
+  });
 
-    expect(actual).toBe(expected);
+  it("matches the buffered redactor across metadata and lineage shapes", async () => {
+    const metadataShapes: Array<[string, unknown, boolean]> = [
+      ["object-only-lineage", { lineage: ["metadata-source"] }, true],
+      ["object-lineage-extra", { lineage: -2.5, caption: "visible" }, true],
+      ["object-without-lineage", { caption: "visible" }, true],
+      ["string", "just a note", true],
+      ["array", ["a"], true],
+      ["number", 42, true],
+      ["missing", undefined, false],
+    ];
+    const lineageShapes: Array<[string, unknown, boolean]> = [
+      ["array", ["caller-source"], true],
+      ["number", -2.5, true],
+      ["absent", undefined, false],
+    ];
+    const payloads = [null, true, -7, "text", [1, 2], { nested: "value" }];
+    let cases = 0;
+
+    for (const binary of [false, true]) {
+      for (const storedLineage of [false, true]) {
+        for (const [metadataName, metadata, hasMetadata] of metadataShapes) {
+          for (const [lineageName, lineage, hasLineage] of lineageShapes) {
+            for (const [index, marker] of payloads.entries()) {
+              const data: Record<string, unknown> = {
+                marker,
+                ...(binary
+                  ? {
+                      $binary: true,
+                      contentType: "application/octet-stream",
+                      content: "AAEC",
+                    }
+                  : {}),
+                ...(hasMetadata ? { metadata } : {}),
+                ...(hasLineage ? { lineage } : {}),
+                ...(storedLineage
+                  ? { $lineage: { sources: [`source-${index}`] } }
+                  : {}),
+              };
+              await expectStreamingParity({
+                version: "1.0",
+                scope: `parity.${metadataName}.${lineageName}`,
+                collectedAt: "2026-09-03T11:00:00.000Z",
+                data,
+              });
+              cases += 1;
+            }
+          }
+        }
+      }
+    }
+
+    expect(cases).toBe(504);
   });
 });
+
+async function expectStreamingParity(value: unknown): Promise<void> {
+  const stored = encoder.encode(JSON.stringify(value, null, 2));
+  const open = async () => chunkedStream(stored, 7);
+  const stream = await openRedactedEnvelopeStream(open);
+  const actual = await new Response(stream).text();
+  const expected = JSON.stringify(
+    redactEnvelopeForGrantee(DataFileEnvelopeSchema.parse(value)),
+  );
+
+  expect(actual).toBe(expected);
+}
 
 function chunkedStream(
   bytes: Uint8Array,
