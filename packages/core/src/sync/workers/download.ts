@@ -133,6 +133,47 @@ export interface DownloadAllOptions {
   retryMemory?: DownloadRetryMemory;
 }
 
+/**
+ * Hydrate exact owner scopes without listing the registry or changing the
+ * incremental cursor. This is the cold-start fast path; downloadAll remains
+ * responsible for the complete registry reconciliation.
+ */
+export async function downloadScopes(
+  deps: DownloadWorkerDeps,
+  scopes: string[],
+): Promise<DownloadResult[]> {
+  const feed = deps.dataPointFeed ?? feedFromGatewayClient(deps.gateway);
+  const results: DownloadResult[] = [];
+
+  for (const scope of scopes) {
+    const dataPoint = await feed.getDataPoint({
+      ownerAddress: deps.serverOwner,
+      scope,
+    });
+    if (!dataPoint) {
+      continue;
+    }
+
+    const deletedAt = deletionTimestamp(dataPoint);
+    if (deletedAt !== null) {
+      deps.scopeDeletions?.markDeleted(scope, {
+        deletedAt,
+        version: tombstoneVersion(dataPoint),
+      });
+      await reconcileDeletedDataPoint(deps, dataPoint, deletedAt);
+      continue;
+    }
+
+    deps.scopeDeletions?.markLive(scope);
+    const result = await downloadOne(deps, dataPoint);
+    if (result) {
+      results.push(result);
+    }
+  }
+
+  return results;
+}
+
 interface SyncFailureMetadata {
   stage?: SyncFailureStage;
   scope?: string;

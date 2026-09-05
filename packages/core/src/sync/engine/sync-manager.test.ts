@@ -20,10 +20,11 @@ vi.mock("../workers/upload.js", () => ({
 
 vi.mock("../workers/download.js", () => ({
   downloadAll: vi.fn(),
+  downloadScopes: vi.fn(),
 }));
 
 import { uploadAll } from "../workers/upload.js";
-import { downloadAll } from "../workers/download.js";
+import { downloadAll, downloadScopes } from "../workers/download.js";
 import { createSyncManager } from "./sync-manager.js";
 
 function makeMockLogger(): Logger {
@@ -77,6 +78,7 @@ describe("SyncManager", () => {
     vi.useFakeTimers();
     (uploadAll as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (downloadAll as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (downloadScopes as ReturnType<typeof vi.fn>).mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -98,6 +100,53 @@ describe("SyncManager", () => {
     expect(uploadAll).toHaveBeenCalledTimes(1);
     expect(downloadAll).toHaveBeenCalledTimes(1);
 
+    await manager.stop();
+  });
+
+  it("publishes boot hydration before the full download cycle resolves", async () => {
+    let releaseFullDownload!: () => void;
+    const fullDownload = new Promise<never[]>((resolve) => {
+      releaseFullDownload = () => resolve([]);
+    });
+    (downloadAll as ReturnType<typeof vi.fn>).mockReturnValue(fullDownload);
+    const manager = createSyncManager(
+      makeMockUploadDeps(),
+      makeMockDownloadDeps(),
+      {
+        hydrateScopes: ["chatgpt.conversations"],
+        transferMode: "download-only",
+      },
+    );
+
+    manager.start();
+    await vi.waitFor(() => expect(downloadAll).toHaveBeenCalledOnce());
+
+    expect(downloadScopes).toHaveBeenCalledWith(expect.anything(), [
+      "chatgpt.conversations",
+    ]);
+    expect(manager.getStatus()).toMatchObject({
+      syncing: true,
+      hydratedScopes: ["chatgpt.conversations"],
+      lastSync: null,
+    });
+
+    releaseFullDownload();
+    await manager.stop();
+  });
+
+  it("keeps full-cycle startup behavior when no hydration scopes are set", async () => {
+    const manager = createSyncManager(
+      makeMockUploadDeps(),
+      makeMockDownloadDeps(),
+      { transferMode: "download-only" },
+    );
+
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(downloadScopes).not.toHaveBeenCalled();
+    expect(downloadAll).toHaveBeenCalledOnce();
+    expect(manager.getStatus().hydratedScopes).toEqual([]);
     await manager.stop();
   });
 

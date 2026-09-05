@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 import type { DownloadWorkerDeps } from "./download.js";
-import { downloadOne, downloadAll } from "./download.js";
+import { downloadOne, downloadAll, downloadScopes } from "./download.js";
 import { createDownloadRetryMemory } from "../retry-memory.js";
 import type {
   DataFileEnvelope,
@@ -395,6 +395,92 @@ describe("download worker", () => {
         "Quarantined corrupt synced data point",
       );
       expect(deps.cursor.write).toHaveBeenCalledWith("opaque-cursor-2");
+    });
+  });
+
+  describe("downloadScopes", () => {
+    it("downloads only the requested scope without reading or writing the cursor", async () => {
+      const requestedScope = "chatgpt.conversations";
+      const records = Array.from({ length: 12 }, (_, index) =>
+        makeDataPointRecord({
+          id: `0x${String(index + 1).padStart(64, "0")}`,
+          scope: index === 7 ? requestedScope : `decoy.scope.${index}`,
+        }),
+      );
+      const deps = makeMockDeps();
+      deps.dataPointFeed = {
+        listDataPointsByOwner: vi.fn().mockResolvedValue({
+          dataPoints: records,
+          cursor: null,
+        }),
+        getDataPoint: vi.fn(
+          async ({ scope }) =>
+            records.find((record) => record.scope === scope) ?? null,
+        ),
+      };
+      const envelope = { ...makeEnvelope(), scope: requestedScope };
+      (decryptWithPassword as ReturnType<typeof vi.fn>).mockResolvedValue(
+        new TextEncoder().encode(JSON.stringify(envelope)),
+      );
+
+      await downloadScopes(deps, [requestedScope]);
+
+      expect(deps.dataPointFeed.getDataPoint).toHaveBeenCalledWith({
+        ownerAddress: OWNER,
+        scope: requestedScope,
+      });
+      expect(deps.dataPointFeed.listDataPointsByOwner).not.toHaveBeenCalled();
+      expect(deps.storageAdapter.download).toHaveBeenCalledTimes(1);
+      expect(deps.cursor.read).not.toHaveBeenCalled();
+      expect(deps.cursor.write).not.toHaveBeenCalled();
+    });
+
+    it("reconciles a requested tombstone and updates deletion memory", async () => {
+      const deletedAt = "2026-02-01T00:00:00.000Z";
+      const record = { ...makeDataPointRecord(), deletedAt };
+      const deps = makeMockDeps();
+      deps.storage.listVersions = vi.fn().mockReturnValue([
+        {
+          id: 1,
+          fileId: null,
+          schemaId: null,
+          path: RELATIVE_PATH,
+          scope: SCOPE,
+          collectedAt: COLLECTED_AT,
+          createdAt: COLLECTED_AT,
+          sizeBytes: 128,
+          version: 1,
+          dataPointId: DATA_POINT_ID,
+        },
+      ]);
+      deps.storage.deleteVersion = vi.fn().mockResolvedValue(true);
+      deps.dataPointFeed = {
+        listDataPointsByOwner: vi.fn(),
+        getDataPoint: vi.fn().mockResolvedValue(record),
+      };
+      deps.scopeDeletions = {
+        markDeleted: vi.fn(),
+        markLive: vi.fn(),
+        noteFeedSynced: vi.fn(),
+        knownDeletion: vi.fn(() => null),
+        feedAgeMs: vi.fn(() => null),
+        resolve: vi.fn(),
+        maxStalenessMs: 0,
+      };
+
+      await downloadScopes(deps, [SCOPE]);
+
+      expect(deps.storageAdapter.download).not.toHaveBeenCalled();
+      expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
+        SCOPE,
+        COLLECTED_AT,
+      );
+      expect(deps.scopeDeletions.markDeleted).toHaveBeenCalledWith(SCOPE, {
+        deletedAt,
+        version: EXPECTED_VERSION,
+      });
+      expect(deps.cursor.read).not.toHaveBeenCalled();
+      expect(deps.cursor.write).not.toHaveBeenCalled();
     });
   });
 
