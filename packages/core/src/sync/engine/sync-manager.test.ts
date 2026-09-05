@@ -121,9 +121,11 @@ describe("SyncManager", () => {
     manager.start();
     await vi.waitFor(() => expect(downloadAll).toHaveBeenCalledOnce());
 
-    expect(downloadScopes).toHaveBeenCalledWith(expect.anything(), [
-      "chatgpt.conversations",
-    ]);
+    expect(downloadScopes).toHaveBeenCalledWith(
+      expect.anything(),
+      ["chatgpt.conversations"],
+      { retryMemory: expect.anything() },
+    );
     expect(manager.getStatus()).toMatchObject({
       syncing: true,
       hydratedScopes: ["chatgpt.conversations"],
@@ -148,6 +150,29 @@ describe("SyncManager", () => {
     expect(downloadAll).toHaveBeenCalledOnce();
     expect(manager.getStatus().hydratedScopes).toEqual([]);
     await manager.stop();
+  });
+
+  it("falls back to the full cycle when boot hydration fails", async () => {
+    const downloadDeps = makeMockDownloadDeps();
+    (downloadScopes as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("gateway unavailable"),
+    );
+    const manager = createSyncManager(makeMockUploadDeps(), downloadDeps, {
+      hydrateScopes: ["chatgpt.conversations"],
+      transferMode: "download-only",
+    });
+
+    await manager.trigger();
+
+    expect(downloadAll).toHaveBeenCalledOnce();
+    expect(manager.getStatus()).toMatchObject({
+      hydratedScopes: [],
+      errors: [],
+    });
+    expect(downloadDeps.logger.warn).toHaveBeenCalledWith(
+      { error: "gateway unavailable" },
+      "Scope hydration failed; continuing with full sync",
+    );
   });
 
   it("runs download-only cycles when uploads are disabled", async () => {
@@ -221,6 +246,28 @@ describe("SyncManager", () => {
         reason: "unregistered",
         message: "Register this Personal Server before syncing.",
       },
+    });
+  });
+
+  it("keeps explicit hydration behind the runtime sync gate", async () => {
+    const downloadDeps = makeMockDownloadDeps();
+    const manager = createSyncManager(makeMockUploadDeps(), downloadDeps, {
+      canSync: () => ({
+        ok: false,
+        reason: "unregistered",
+        message: "Register this Personal Server before syncing.",
+      }),
+    });
+
+    await manager.hydrateScopes(["chatgpt.conversations"]);
+
+    expect(downloadScopes).not.toHaveBeenCalled();
+    expect(manager.getStatus()).toMatchObject({
+      blocked: {
+        reason: "unregistered",
+        message: "Register this Personal Server before syncing.",
+      },
+      hydratedScopes: [],
     });
   });
 

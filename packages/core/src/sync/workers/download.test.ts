@@ -482,6 +482,32 @@ describe("download worker", () => {
       expect(deps.cursor.read).not.toHaveBeenCalled();
       expect(deps.cursor.write).not.toHaveBeenCalled();
     });
+
+    it("quarantines a corrupt requested scope without throwing", async () => {
+      const deps = makeMockDeps();
+      deps.dataPointFeed = {
+        listDataPointsByOwner: vi.fn(),
+        getDataPoint: vi.fn().mockResolvedValue(makeDataPointRecord()),
+      };
+      deps.storageAdapter.download = vi
+        .fn()
+        .mockRejectedValue(
+          Object.assign(
+            new Error("vana-storage download failed: 404 Not Found"),
+            { name: "StorageError" },
+          ),
+        );
+      const retryMemory = createDownloadRetryMemory({ now: () => 0 });
+
+      await expect(
+        downloadScopes(deps, [SCOPE], { retryMemory }),
+      ).resolves.toEqual([]);
+
+      expect(deps.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ stage: "download", scope: SCOPE }),
+        "Quarantined corrupt synced data point",
+      );
+    });
   });
 
   describe("downloadAll — cross-cycle retry memory", () => {

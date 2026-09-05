@@ -128,8 +128,14 @@ export function createSyncManager(
   }
 
   async function hydrateScopesExclusive(scopes: string[]): Promise<void> {
+    // Resolve scopes individually so an earlier success remains observable if
+    // a later scope fails.
     for (const scope of new Set(scopes)) {
-      await downloadScopes(workerDownloadDeps, [scope]);
+      await downloadScopes(workerDownloadDeps, [scope], {
+        retryMemory: downloadRetryMemory,
+      });
+      // "Hydrated" means the remote scope was resolved, including an absent
+      // data point or tombstone; it does not guarantee local bytes exist.
       hydratedScopes.add(scope);
       downloadDeps.logger.info({ scope }, "Hydrated requested scope");
     }
@@ -158,18 +164,10 @@ export function createSyncManager(
             await hydrateScopesExclusive(startupHydrateScopes);
             needsStartupHydration = false;
           } catch (err) {
-            const syncError: SyncError = {
-              fileId: null,
-              scope: null,
-              message: `Scope hydration failed: ${(err as Error).message}`,
-              timestamp: new Date().toISOString(),
-            };
-            pushError(syncError);
-            downloadDeps.logger.error(
+            downloadDeps.logger.warn(
               { error: (err as Error).message },
-              "Scope hydration failed",
+              "Scope hydration failed; continuing with full sync",
             );
-            continue;
           }
         }
 
@@ -367,7 +365,16 @@ export function createSyncManager(
     },
 
     hydrateScopes(scopes) {
-      return exclusive(() => hydrateScopesExclusive(scopes));
+      return exclusive(async () => {
+        const canRun = await (options?.canSync?.() ?? { ok: true });
+        if (!canRun.ok) {
+          blocked = { reason: canRun.reason, message: canRun.message };
+          downloadDeps.logger.warn(blocked, "Scope hydration blocked");
+          return;
+        }
+        blocked = null;
+        await hydrateScopesExclusive(scopes);
+      });
     },
 
     notifyNewData() {
