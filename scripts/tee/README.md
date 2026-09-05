@@ -62,7 +62,7 @@ identity-only `docker-compose.agent.inline.yml` remains available through
 The nested Docker daemon binds its unauthenticated TCP API to the private
 compose interface. Firewall rules drop Docker API traffic originating from
 `docker0` and `br-+`, and `--icc=false` prevents Personal Server sandboxes from
-talking directly to one another.
+talking directly to one another. gVisor runs on the systrap platform.
 
 The provisioner prints a registration payload without revealing `NODE_SECRET`.
 Save it as `node-registration.json`, replace its placeholder once, and register

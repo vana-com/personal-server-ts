@@ -109,7 +109,8 @@ services:
         curl -fsSLO "$${gvisor_url}/gvisor.tar.bz2"
         printf '%s  %s\n' "$${gvisor_sha512}" gvisor.tar.bz2 | sha512sum -c -
         tar -xjf gvisor.tar.bz2 -C /usr/local/bin
-        runsc install --runtime runsc-ptrace -- --platform=ptrace
+        # systrap avoids ptrace syscall overhead; keep runsc-ptrace for the agent constant.
+        runsc install --runtime runsc-ptrace -- --platform=systrap
         runtime_host="$$(ip -4 addr show eth0 | awk '/inet / { sub(/\/.*/, "", $$2); print $$2; exit }')"
         if [ -z "$${runtime_host}" ]; then
           echo "Could not resolve the compose-network address; falling back to 0.0.0.0" >&2
