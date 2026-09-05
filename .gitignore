@@ -6,6 +6,7 @@ coverage/
 .env
 .env.*
 !.env.example
+deploy/dstack/images.env
 *.log
 # Build artifacts that may land in src/ (should go to dist/)
 packages/*/src/**/*.js
