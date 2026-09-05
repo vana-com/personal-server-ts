@@ -135,6 +135,9 @@ const SCOPE_ENV = "SCOPE";
 const E2E_RECOVERY_ENV = "E2E_RECOVERY";
 const E2E_WARM_RUNS_ENV = "E2E_WARM_RUNS";
 const E2E_JOB_TIMEOUT_MS_ENV = "E2E_JOB_TIMEOUT_MS";
+const E2E_EXTRA_SCOPES_ENV = "E2E_EXTRA_SCOPES";
+const DECOY_SCOPE_PREFIX = "e2e.jobs.decoy";
+const REMOTE_SCOPE_LIST_LIMIT = 1_000;
 const PAD_PATTERN =
   "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
@@ -189,6 +192,7 @@ interface JobContext {
   warmRuns: number;
   jobTimeoutMs: number;
   recovery: boolean;
+  extraScopes: string[];
 }
 
 interface BuilderOnlyContext {
@@ -226,6 +230,8 @@ interface CreatedJob {
   request: JobRequest;
   submission: JobSubmission;
 }
+
+type SeedVersions = Map<string, string | undefined>;
 
 const agents: AgentProcess[] = [];
 const nodeIds: string[] = [];
@@ -310,6 +316,11 @@ function buildBuilderOnlyContext(): BuilderOnlyContext {
   if (nonnegativeInt(process.env[E2E_WARM_RUNS_ENV], 0) !== 0) {
     throw new Error(
       `${E2E_WARM_RUNS_ENV} must be unset or zero in builder-only mode`,
+    );
+  }
+  if (nonnegativeInt(process.env[E2E_EXTRA_SCOPES_ENV], 0) !== 0) {
+    throw new Error(
+      `${E2E_EXTRA_SCOPES_ENV} must be unset or zero in builder-only mode`,
     );
   }
 
@@ -399,6 +410,12 @@ async function buildContext(): Promise<JobContext> {
       DEFAULT_E2E_JOB_TIMEOUT_MS,
     ),
     recovery: process.env.E2E_RECOVERY === TRUE_VALUE,
+    extraScopes: Array.from(
+      {
+        length: nonnegativeInt(process.env[E2E_EXTRA_SCOPES_ENV], 0),
+      },
+      (_, index) => `${DECOY_SCOPE_PREFIX}.${index + 1}`,
+    ),
   };
 }
 
@@ -724,7 +741,7 @@ async function createGrant(
   const message = {
     grantorAddress: ctx.owner.address,
     granteeId: builderId,
-    scopes: [JOB_SCOPE],
+    scopes: seededScopes(ctx),
     grantVersion: version,
     expiresAt: BigInt(
       Math.floor(Date.now() / 1000) + GRANT_EXPIRY_SECONDS_FROM_NOW,
@@ -756,6 +773,10 @@ async function createGrant(
   );
 
   return response!.grantId as Hex;
+}
+
+function seededScopes(ctx: JobContext): string[] {
+  return [JOB_SCOPE, ...ctx.extraScopes];
 }
 
 async function revokeGrant(ctx: JobContext, grantId: Hex): Promise<void> {
@@ -811,7 +832,7 @@ function sandboxRoot(ctx: JobContext): string {
   return join(ctx.fakeRoot, `${ctx.userPsId}-${FIRST_EPOCH}`);
 }
 
-async function seedRecord(ctx: JobContext): Promise<string | undefined> {
+async function seedRecord(ctx: JobContext): Promise<SeedVersions> {
   if (ctx.remote) {
     return seedRemoteRecord(ctx);
   }
@@ -833,37 +854,16 @@ async function seedRecord(ctx: JobContext): Promise<string | undefined> {
     gatewayClient: seedGateway(),
   });
   try {
-    const rawBody = OWNER_RECORD_JSON;
-    const authorization = await buildAuth(
-      ctx.owner,
-      origin,
-      "POST",
-      `/v1/data/${JOB_SCOPE}`,
-      new TextEncoder().encode(rawBody),
-    );
-    const response = await server.app.request(
-      `${origin}/v1/data/${JOB_SCOPE}`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: authorization,
-          "Content-Type": JSON_CONTENT_TYPE,
-        },
-        body: rawBody,
-      },
-    );
-    if (response.status !== HTTP_CREATED) {
-      throw new Error(`Record seed failed with status ${response.status}`);
-    }
+    await ingestSeedScopes(ctx, server, origin);
   } finally {
     await server.cleanup();
   }
   await unlink(join(root, "key.json"));
 
-  return undefined;
+  return new Map(seededScopes(ctx).map((scope) => [scope, undefined]));
 }
 
-async function seedRemoteRecord(ctx: JobContext): Promise<string> {
+async function seedRemoteRecord(ctx: JobContext): Promise<SeedVersions> {
   const root = await mkdtemp(join(tmpdir(), "vana-job-seed-"));
   const origin = `http://${AGENT_HOST}:${SEED_SERVER_PORT}`;
   const config = ServerConfigSchema.parse({
@@ -901,28 +901,7 @@ async function seedRemoteRecord(ctx: JobContext): Promise<string> {
     if (!server.syncManager) {
       throw new Error("Remote seed server did not start its sync manager");
     }
-    const rawBody = OWNER_RECORD_JSON;
-    const authorization = await buildAuth(
-      ctx.owner,
-      origin,
-      "POST",
-      `/v1/data/${JOB_SCOPE}`,
-      new TextEncoder().encode(rawBody),
-    );
-    const response = await server.app.request(
-      `${origin}/v1/data/${JOB_SCOPE}`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: authorization,
-          "Content-Type": JSON_CONTENT_TYPE,
-        },
-        body: rawBody,
-      },
-    );
-    if (response.status !== HTTP_CREATED) {
-      throw new Error(`Record seed failed with status ${response.status}`);
-    }
+    await ingestSeedScopes(ctx, server, origin);
 
     await server.startBackgroundServices();
     await server.syncManager.trigger();
@@ -934,9 +913,13 @@ async function seedRemoteRecord(ctx: JobContext): Promise<string> {
           `Remote seed sync failed: ${JSON.stringify(status.errors)}`,
         );
       }
-      const version = await remoteScopeVersion(ctx);
-      if (status.pendingFiles === 0 && !status.syncing && version) {
-        return version;
+      const versions = await remoteScopeVersions(ctx);
+      if (
+        status.pendingFiles === 0 &&
+        !status.syncing &&
+        versions.size === seededScopes(ctx).length
+      ) {
+        return versions;
       }
       await delay(POLL_INTERVAL_MS);
     }
@@ -948,6 +931,38 @@ async function seedRemoteRecord(ctx: JobContext): Promise<string> {
   } finally {
     await server.cleanup();
     await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function ingestSeedScopes(
+  ctx: JobContext,
+  server: Awaited<ReturnType<typeof createServer>>,
+  origin: string,
+): Promise<void> {
+  const rawBody = OWNER_RECORD_JSON;
+  const bodyBytes = new TextEncoder().encode(rawBody);
+  for (const scope of seededScopes(ctx)) {
+    const path = `/v1/data/${scope}`;
+    const authorization = await buildAuth(
+      ctx.owner,
+      origin,
+      "POST",
+      path,
+      bodyBytes,
+    );
+    const response = await server.app.request(`${origin}${path}`, {
+      method: "POST",
+      headers: {
+        Authorization: authorization,
+        "Content-Type": JSON_CONTENT_TYPE,
+      },
+      body: rawBody,
+    });
+    if (response.status !== HTTP_CREATED) {
+      throw new Error(
+        `Record seed for ${scope} failed with status ${response.status}`,
+      );
+    }
   }
 }
 
@@ -981,24 +996,30 @@ function ownerSeedGateway(
   });
 }
 
-async function remoteScopeVersion(
-  ctx: JobContext,
-): Promise<string | undefined> {
+async function remoteScopeVersions(ctx: JobContext): Promise<SeedVersions> {
   const result = await requestJson(
     "GET",
-    `${ctx.gatewayUrl}/v1/data?user=${encodeURIComponent(ctx.owner.address)}&limit=100`,
+    `${ctx.gatewayUrl}/v1/data?user=${encodeURIComponent(ctx.owner.address)}&limit=${REMOTE_SCOPE_LIST_LIMIT}`,
   );
-  if (result.response.status !== HTTP_OK) return undefined;
+  if (result.response.status !== HTTP_OK) return new Map();
   const rows = record(record(result.response.body)?.data)?.dataPoints;
-  if (!Array.isArray(rows)) return undefined;
-  const match = rows
-    .map(record)
-    .find((candidate) => candidate?.scope === JOB_SCOPE);
-  const version = match?.expectedVersion;
+  if (!Array.isArray(rows)) return new Map();
 
-  return typeof version === "string" || typeof version === "number"
-    ? String(version)
-    : undefined;
+  const requestedScopes = new Set(seededScopes(ctx));
+  const versions: SeedVersions = new Map();
+  for (const row of rows.map(record)) {
+    const scope = row?.scope;
+    const version = row?.expectedVersion;
+    if (
+      typeof scope === "string" &&
+      requestedScopes.has(scope) &&
+      (typeof version === "string" || typeof version === "number")
+    ) {
+      versions.set(scope, String(version));
+    }
+  }
+
+  return versions;
 }
 
 async function buildAuth(
@@ -1150,13 +1171,14 @@ async function assertResult(
   status: JobStatus,
   expectedVersion?: string,
   submittedAt = performance.now(),
+  scope = JOB_SCOPE,
 ) {
   const fetched = await fetchAndOpenResult(
     ctx,
     builder,
     builderKey,
     status,
-    JOB_SCOPE,
+    scope,
     submittedAt,
   );
   const { result } = fetched;
@@ -1276,6 +1298,7 @@ async function submitAndDecrypt(
   builder: RegisteredBuilder,
   grantId: Hex,
   expectedVersion: string | undefined,
+  scope = JOB_SCOPE,
 ): Promise<{
   job: CreatedJob;
   submitMs: number;
@@ -1290,6 +1313,7 @@ async function submitAndDecrypt(
     identity,
     builder: builder.account,
     grantId,
+    scope,
   });
   const submittedAt = performance.now();
   const result = await submitJob(ctx, builder.account, job, JOB_WAIT_SECONDS);
@@ -1328,6 +1352,7 @@ async function submitAndDecrypt(
     status,
     expectedVersion,
     submittedAt,
+    scope,
   );
 
   return { job, submitMs, completeMs, ...fetched };
@@ -1762,10 +1787,19 @@ async function main(): Promise<void> {
   });
 
   let expectedVersion: string | undefined;
+  let seedVersions: SeedVersions = new Map();
   await runStep("8", "seed one record", ["7"], async () => {
-    expectedVersion = await seedRecord(ctx);
+    seedVersions = await seedRecord(ctx);
+    expectedVersion = seedVersions.get(JOB_SCOPE);
     if (!ctx.remote) await access(join(sandboxRoot(ctx), "index.db"));
-    return expectedVersion ? `expectedVersion=${expectedVersion}` : undefined;
+    if (ctx.extraScopes.length === 0) {
+      return expectedVersion ? `expectedVersion=${expectedVersion}` : undefined;
+    }
+
+    const versionEvidence = expectedVersion
+      ? ` expectedVersion=${expectedVersion}`
+      : "";
+    return `scopes=${seededScopes(ctx).length}${versionEvidence}`;
   });
 
   let completedJob: CreatedJob | undefined;
@@ -1779,6 +1813,22 @@ async function main(): Promise<void> {
     );
     completedJob = completed.job;
     return `submit_ms=${completed.submitMs} complete_ms=${completed.completeMs} ttfb_ms=${completed.ttfbMs} fetch_ms=${completed.fetchMs} decrypt_ms=${completed.decryptMs} result_size=${completed.resultSize}`;
+  });
+
+  await runStep("9s", "warm cross-scope raw read", ["9"], async () => {
+    const scope = ctx.extraScopes.at(-1);
+    if (!scope) return `skipped: ${E2E_EXTRA_SCOPES_ENV} unset or zero`;
+
+    const completed = await submitAndDecrypt(
+      ctx,
+      identity!.identity,
+      builder!,
+      grantId!,
+      seedVersions.get(scope),
+      scope,
+    );
+
+    return `scope=${scope} submit_ms=${completed.submitMs} complete_ms=${completed.completeMs}`;
   });
 
   if (ctx.warmRuns > 0) {
