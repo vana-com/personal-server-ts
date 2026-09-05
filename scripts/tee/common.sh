@@ -7,6 +7,20 @@ readonly CURL_CONNECT_TIMEOUT_SECONDS=5
 readonly CURL_MAX_TIME_SECONDS=10
 readonly AGENT_LOG_LINES=50
 
+validate_image_digests() {
+  : "${AGENT_IMAGE:?AGENT_IMAGE must be set to a digest-pinned image reference}"
+  : "${DIND_IMAGE:?DIND_IMAGE must be set to a digest-pinned image reference}"
+
+  if [[ ! $AGENT_IMAGE =~ ^.+@sha256:[0-9a-f]{64}$ ]]; then
+    echo "AGENT_IMAGE must be an image digest such as node@sha256:<64 lowercase hex characters>" >&2
+    return 1
+  fi
+  if [[ ! $DIND_IMAGE =~ ^.+@sha256:[0-9a-f]{64}$ ]]; then
+    echo "DIND_IMAGE must be an image digest such as docker@sha256:<64 lowercase hex characters>" >&2
+    return 1
+  fi
+}
+
 create_secure_env_file() {
   env_file=$(mktemp)
   chmod 600 "$env_file"

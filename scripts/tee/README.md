@@ -80,6 +80,11 @@ a fresh 32-byte `NODE_SECRET`. Exactly one secret destination is required:
 path, while `--secret-keychain` creates a macOS generic-password item and
 refuses to update an existing item. The script never prints the secret.
 
+Replication and updates require the same digest-pinned `AGENT_IMAGE`,
+`DIND_IMAGE`, and `PS_IMAGE` values as provisioning. A replica inherits its
+source CVM's compose, so once the source uses a compose that requires an image
+variable, every replica must supply that variable too.
+
 ```sh
 scripts/tee/replicate.sh replica-a <source-cvm-uuid> \
   --secret-out ./replica-a.node-secret

@@ -77,6 +77,7 @@ fi
 : "${GATEWAY_URL:?GATEWAY_URL must be set in the environment}"
 : "${GIT_REF:?GIT_REF must be set in the environment}"
 : "${PS_IMAGE:?PS_IMAGE must be set in the environment}"
+validate_image_digests
 command -v openssl >/dev/null || { echo "openssl is required" >&2; exit 1; }
 command -v phala >/dev/null || { echo "phala CLI is required" >&2; exit 1; }
 command -v node >/dev/null || { echo "Node.js is required" >&2; exit 1; }
@@ -98,11 +99,11 @@ else
     -w "$NODE_SECRET"
 fi
 create_secure_env_file
-printf 'ENCLAVE_AGENT_SECRET=%s\nGIT_REF=%s\n' \
-  "$ENCLAVE_AGENT_SECRET" "$GIT_REF" >"$env_file"
+printf 'ENCLAVE_AGENT_SECRET=%s\nGIT_REF=%s\nAGENT_IMAGE=%s\nDIND_IMAGE=%s\n' \
+  "$ENCLAVE_AGENT_SECRET" "$GIT_REF" "$AGENT_IMAGE" "$DIND_IMAGE" >"$env_file"
 printf 'NODE_SECRET=%s\nNODE_ID=%s\nGATEWAY_URL=%s\nPS_IMAGE=%s\n' \
   "$NODE_SECRET" "$NODE_ID" "$GATEWAY_URL" "$PS_IMAGE" >>"$env_file"
-  for optional_name in SANDBOX_MAX SANDBOX_MEMORY SANDBOX_CPUS SANDBOX_PIDS_LIMIT SANDBOX_IDLE_TTL_SECONDS LEASE_SECONDS VERCEL_PROTECTION_BYPASS WORK_DELAY_MS SANDBOX_SYNC SANDBOX_DEBUG STORAGE_API_URL CHAIN_ID DATA_REGISTRY_CONTRACT DATA_PORTABILITY_SERVER_CONTRACT DATA_PORTABILITY_GRANTEES_CONTRACT DATA_PORTABILITY_PERMISSIONS_CONTRACT; do
+for optional_name in SANDBOX_MAX SANDBOX_MEMORY SANDBOX_CPUS SANDBOX_PIDS_LIMIT SANDBOX_IDLE_TTL_SECONDS LEASE_SECONDS VERCEL_PROTECTION_BYPASS WORK_DELAY_MS SANDBOX_SYNC SANDBOX_DEBUG STORAGE_API_URL CHAIN_ID DATA_REGISTRY_CONTRACT DATA_PORTABILITY_SERVER_CONTRACT DATA_PORTABILITY_GRANTEES_CONTRACT DATA_PORTABILITY_PERMISSIONS_CONTRACT; do
   optional_value=${!optional_name:-}
   if [[ -n $optional_value ]]; then
     printf '%s=%s\n' "$optional_name" "$optional_value" >>"$env_file"

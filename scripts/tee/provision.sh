@@ -63,11 +63,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 : "${ENCLAVE_AGENT_SECRET:?ENCLAVE_AGENT_SECRET must be set in the environment}"
-: "${AGENT_IMAGE:?AGENT_IMAGE must be set to a digest-pinned image reference}"
-if [[ ! $AGENT_IMAGE =~ ^.+@sha256:[[:xdigit:]]{64}$ ]]; then
-  echo "AGENT_IMAGE must be an image digest such as node@sha256:<64 hex characters>" >&2
-  exit 1
-fi
+validate_image_digests
 command -v phala >/dev/null || { echo "phala CLI is required" >&2; exit 1; }
 command -v node >/dev/null || { echo "Node.js is required" >&2; exit 1; }
 command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
@@ -77,11 +73,6 @@ identity_only=false
 if [[ ${compose##*/} == docker-compose.agent.inline.yml ]]; then
   identity_only=true
 else
-  : "${DIND_IMAGE:?DIND_IMAGE must be set to a digest-pinned image reference}"
-  if [[ ! $DIND_IMAGE =~ ^.+@sha256:[[:xdigit:]]{64}$ ]]; then
-    echo "DIND_IMAGE must be an image digest such as docker@sha256:<64 hex characters>" >&2
-    exit 1
-  fi
   : "${NODE_SECRET:?NODE_SECRET must be set in the environment}"
   : "${NODE_ID:?NODE_ID must be set in the environment}"
   : "${GATEWAY_URL:?GATEWAY_URL must be set in the environment}"
@@ -128,8 +119,8 @@ fi
 [[ $nonce =~ ^[0-9]+$ ]] || { echo "nonce must be a non-negative integer" >&2; exit 1; }
 
 create_secure_env_file
-printf 'ENCLAVE_AGENT_SECRET=%s\nGIT_REF=%s\n' \
-  "$ENCLAVE_AGENT_SECRET" "$git_ref" >"$env_file"
+printf 'ENCLAVE_AGENT_SECRET=%s\nGIT_REF=%s\nAGENT_IMAGE=%s\nDIND_IMAGE=%s\n' \
+  "$ENCLAVE_AGENT_SECRET" "$git_ref" "$AGENT_IMAGE" "$DIND_IMAGE" >"$env_file"
 if [[ $identity_only == false ]]; then
   printf 'NODE_SECRET=%s\nNODE_ID=%s\nGATEWAY_URL=%s\nPS_IMAGE=%s\n' \
     "$NODE_SECRET" "$NODE_ID" "$GATEWAY_URL" "$PS_IMAGE" >>"$env_file"
