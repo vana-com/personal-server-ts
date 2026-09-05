@@ -17,9 +17,9 @@ import { createFakeDstackClient } from "../dstack/fake.js";
 import type { DstackClient } from "../dstack/client.js";
 import { userPsId, type UserPsId } from "../identity/paths.js";
 import { deriveEnclaveIdentity } from "../identity/wallet.js";
-import { unseal } from "../sealing/envelope.js";
+import { seal, unseal } from "../sealing/envelope.js";
 import { createAgentServer, type AgentJobsControl } from "./http.js";
-import type { SealRequestBody } from "./types.js";
+import type { PrewarmRequestBody, SealRequestBody } from "./types.js";
 
 const SECRET = "agent-test-secret";
 const OWNER_KEY = keccak256(toBytes("enclave-agent-test:http-owner"));
@@ -36,6 +36,7 @@ const SEAL_PATH = "/agent/v1/secrets/seal";
 const DRAIN_PATH = "/agent/v1/drain";
 const RESULT_SIGNING_PATH = "/agent/v1/job-results/sign";
 const SANDBOXES_PATH = "/agent/v1/sandboxes";
+const PREWARM_PATH = "/agent/v1/sandboxes/prewarm";
 const STORAGE_ORIGIN = "https://storage.example";
 const SANDBOX_TOKEN = "sandbox-access-token";
 const JOB_ID = "123e4567-e89b-42d3-a456-426614174000";
@@ -53,6 +54,7 @@ const JSON_HEADERS = {
 let server: ReturnType<typeof createAgentServer> | undefined;
 let origin = "";
 let activeServerAddress: Address;
+let prewarmBody: PrewarmRequestBody;
 
 async function startServer(
   client: DstackClient = createFakeDstackClient({ appId: FAKE_APP_ID }),
@@ -81,13 +83,18 @@ async function stopServer(): Promise<void> {
 }
 
 beforeAll(async () => {
-  activeServerAddress = (
-    await deriveEnclaveIdentity(
-      createFakeDstackClient({ appId: FAKE_APP_ID }),
-      userPsId(CHAIN_ID, OWNER.address),
-      EPOCH,
-    )
-  ).address;
+  const client = createFakeDstackClient({ appId: FAKE_APP_ID });
+  const id = userPsId(CHAIN_ID, OWNER.address);
+  const identity = await deriveEnclaveIdentity(client, id, EPOCH);
+  activeServerAddress = identity.address;
+  prewarmBody = {
+    userPsId: id,
+    epoch: EPOCH,
+    enclaveAddress: identity.address,
+    enclavePublicKey: identity.publicKey,
+    sealedEnvelope: await seal(client, id, EPOCH, new Uint8Array(65).fill(7)),
+    scope: "chatgpt.conversations",
+  };
 });
 
 beforeEach(async () => {
@@ -194,10 +201,88 @@ function jobsControl(
         ? lookup(token, jobId)
         : { kind: "unauthorized" };
     },
+    prewarm: vi.fn(),
   };
 }
 
 describe("agent HTTP server", () => {
+  it("requires operator bearer auth for sandbox prewarm", async () => {
+    const response = await fetch(`${origin}${PREWARM_PATH}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(prewarmBody),
+    });
+
+    await expectError(response, 401, "UNAUTHORIZED");
+  });
+
+  it.each(["GET", "PUT"])(
+    "returns the sibling 404 semantics for %s sandbox prewarm",
+    async (method) => {
+      const response = await fetch(`${origin}${PREWARM_PATH}`, {
+        method,
+        headers: JSON_HEADERS,
+      });
+
+      await expectError(response, 404, "NOT_FOUND");
+    },
+  );
+
+  it.each([
+    ["missing identity", { scope: "chatgpt.conversations" }],
+    ["bad scope", { ...prewarmBody, scope: "chatgpt.*" }],
+    ["bad envelope", { ...prewarmBody, sealedEnvelope: { v: 1 } }],
+  ])("rejects sandbox prewarm with %s", async (_label, body) => {
+    const jobs = jobsControl();
+    await stopServer();
+    await startServer(createFakeDstackClient({ appId: FAKE_APP_ID }), jobs);
+
+    const response = await post(PREWARM_PATH, body);
+
+    await expectError(response, 400, "BAD_REQUEST");
+    expect(jobs.prewarm).not.toHaveBeenCalled();
+  });
+
+  it("accepts sandbox prewarm before background work settles", async () => {
+    let settle!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    const jobs = jobsControl();
+    vi.mocked(jobs.prewarm).mockImplementation(() => pending);
+    await stopServer();
+    await startServer(createFakeDstackClient({ appId: FAKE_APP_ID }), jobs);
+
+    const response = await Promise.race([
+      post(PREWARM_PATH, prewarmBody),
+      new Promise<"pending">((resolve) => setTimeout(resolve, 100, "pending")),
+    ]);
+
+    expect(response).not.toBe("pending");
+    if (response === "pending") {
+      throw new Error("prewarm response waited for background work");
+    }
+    expect(response.status).toBe(202);
+    expect(await response.json()).toEqual({ accepted: true });
+    expect(jobs.prewarm).toHaveBeenCalledWith(prewarmBody);
+    settle();
+    await pending;
+  });
+
+  it("accepts duplicate sandbox prewarm requests", async () => {
+    const jobs = jobsControl();
+    await stopServer();
+    await startServer(createFakeDstackClient({ appId: FAKE_APP_ID }), jobs);
+
+    const responses = await Promise.all([
+      post(PREWARM_PATH, prewarmBody),
+      post(PREWARM_PATH, prewarmBody),
+    ]);
+
+    expect(responses.map(({ status }) => status)).toEqual([202, 202]);
+    expect(jobs.prewarm).toHaveBeenCalledTimes(2);
+  });
+
   it("hides sandbox debug routes when SANDBOX_DEBUG is disabled", async () => {
     await stopServer();
     await startServer(
@@ -291,6 +376,7 @@ describe("agent HTTP server", () => {
       listSandboxes: vi.fn().mockResolvedValue([]),
       sandboxLogs: vi.fn().mockResolvedValue(undefined),
       lookupSandboxJob: vi.fn().mockReturnValue({ kind: "unauthorized" }),
+      prewarm: vi.fn(),
     } satisfies AgentJobsControl;
     await stopServer();
     await startServer(createFakeDstackClient({ appId: FAKE_APP_ID }), jobs);

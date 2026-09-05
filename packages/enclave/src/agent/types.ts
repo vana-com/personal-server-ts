@@ -2,6 +2,7 @@
 
 import type { Address, Hex } from "viem";
 import type { UserPsId } from "../identity/paths.js";
+import type { ClaimResponse } from "../jobs/types.js";
 import type { SealedEnvelope } from "../sealing/envelope.js";
 
 export interface IdentityRequestBody {
@@ -27,6 +28,10 @@ export interface ResultSigningRequestBody {
   /** Canonical Web3Signed body hash: `sha256:<64 lowercase hex>`. */
   bodyHash: string;
 }
+
+export type PrewarmRequestBody = ClaimResponse["identity"] & {
+  scope: string;
+};
 
 export interface ActiveSandboxJob {
   jobId: string;
