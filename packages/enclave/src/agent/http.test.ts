@@ -229,19 +229,58 @@ describe("agent HTTP server", () => {
   );
 
   it.each([
-    ["missing identity", { scope: "chatgpt.conversations" }],
-    ["bad scope", { ...prewarmBody, scope: "chatgpt.*" }],
-    ["bad envelope", { ...prewarmBody, sealedEnvelope: { v: 1 } }],
-  ])("rejects sandbox prewarm with %s", async (_label, body) => {
-    const jobs = jobsControl();
-    await stopServer();
-    await startServer(createFakeDstackClient({ appId: FAKE_APP_ID }), jobs);
+    {
+      label: "missing identity",
+      body: (_valid: PrewarmRequestBody) => ({
+        scope: "chatgpt.conversations",
+      }),
+      assertInvalidField: (body: Record<string, unknown>) => {
+        expect(body).not.toHaveProperty("userPsId");
+      },
+    },
+    {
+      label: "bad scope",
+      body: (valid: PrewarmRequestBody) => ({
+        ...valid,
+        scope: "chatgpt.*",
+      }),
+      assertInvalidField: (body: Record<string, unknown>) => {
+        expect(body).toMatchObject({
+          userPsId: prewarmBody.userPsId,
+          sealedEnvelope: prewarmBody.sealedEnvelope,
+          scope: "chatgpt.*",
+        });
+      },
+    },
+    {
+      label: "bad envelope",
+      body: (valid: PrewarmRequestBody) => ({
+        ...valid,
+        sealedEnvelope: { v: 1 },
+      }),
+      assertInvalidField: (body: Record<string, unknown>) => {
+        expect(body).toMatchObject({
+          userPsId: prewarmBody.userPsId,
+          sealedEnvelope: { v: 1 },
+          scope: prewarmBody.scope,
+        });
+      },
+    },
+  ])(
+    "rejects sandbox prewarm with $label",
+    async ({ body: buildBody, assertInvalidField }) => {
+      const jobs = jobsControl();
+      const body = buildBody(prewarmBody);
+      assertInvalidField(body);
+      await stopServer();
+      await startServer(createFakeDstackClient({ appId: FAKE_APP_ID }), jobs);
 
-    const response = await post(PREWARM_PATH, body);
+      const response = await post(PREWARM_PATH, body);
 
-    await expectError(response, 400, "BAD_REQUEST");
-    expect(jobs.prewarm).not.toHaveBeenCalled();
-  });
+      await expectError(response, 400, "BAD_REQUEST");
+      expect(jobs.prewarm).not.toHaveBeenCalled();
+    },
+  );
 
   it("accepts sandbox prewarm before background work settles", async () => {
     let settle!: () => void;

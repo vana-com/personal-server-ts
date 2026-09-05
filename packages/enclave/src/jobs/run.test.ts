@@ -67,6 +67,7 @@ interface Fixture {
 class MemoryRuntime implements SandboxRuntime {
   specs: SandboxSpec[] = [];
   hydratedScopes?: string[];
+  startGate?: Promise<void>;
 
   constructor(private readonly origin: string) {}
 
@@ -81,6 +82,7 @@ class MemoryRuntime implements SandboxRuntime {
         lastSyncStatus: { hydratedScopes: this.hydratedScopes },
       });
     }
+    await this.startGate;
 
     return { id: "sandbox-1", origin: this.origin };
   }
@@ -1006,11 +1008,53 @@ describe("prewarmSandbox", () => {
           userPsId: USER_PS_ID,
           epoch: EPOCH,
           scope: "profile.email",
-          elapsedMs: expect.any(Number),
+          elapsedMs: 0,
         }),
         "Sandbox acquisition progress",
       );
     }
+  });
+
+  it("derives sandbox identity instead of trusting caller-supplied keys", async () => {
+    const fixture = await createFixture();
+    const expectedAddress = fixture.identity.enclaveAddress;
+    const expectedPublicKey = fixture.identity.enclavePublicKey;
+    fixture.identity.enclaveAddress = `0x${"88".repeat(20)}`;
+    fixture.identity.enclavePublicKey = `0x04${"99".repeat(64)}`;
+
+    await prewarmSandbox(
+      fixture.identity,
+      fixture.request.request.scope,
+      prewarmDeps(fixture.deps),
+    );
+
+    expect(fixture.runtime.specs[0]?.env).toMatchObject({
+      PS_SERVER_ADDRESS: expectedAddress,
+      PS_SERVER_PUBLIC_KEY: expectedPublicKey,
+    });
+  });
+
+  it("joins an in-flight job acquire for the same owner", async () => {
+    const fixture = await createFixture();
+    let startSandbox!: () => void;
+    fixture.runtime.startGate = new Promise<void>((resolve) => {
+      startSandbox = resolve;
+    });
+    const acquire = vi.spyOn(fixture.deps.registry, "acquire");
+    const prewarming = prewarmSandbox(
+      fixture.identity,
+      fixture.request.request.scope,
+      prewarmDeps(fixture.deps),
+    );
+    await vi.waitFor(() => expect(fixture.runtime.specs).toHaveLength(1));
+
+    const running = runJob(fixture.job, fixture.identity, fixture.deps);
+    await vi.waitFor(() => expect(acquire).toHaveBeenCalledTimes(2));
+    expect(fixture.runtime.specs).toHaveLength(1);
+
+    startSandbox();
+    await Promise.all([prewarming, running]);
+    expect(fixture.runtime.specs).toHaveLength(1);
   });
 
   it("swallows and warns when sandbox acquisition fails", async () => {

@@ -10,7 +10,7 @@ import { createAgentServer, type AgentJobsControl } from "./http.js";
 import { startClaimLoop, type JobLogger } from "../jobs/claim-loop.js";
 import { createGatewayClient } from "../jobs/gateway-client.js";
 import { startNodeHeartbeat } from "../jobs/node-heartbeat.js";
-import { prewarmSandbox, runJob } from "../jobs/run.js";
+import { prewarmSandbox, runJob, type PrewarmDeps } from "../jobs/run.js";
 import { MAX_WAIT_SECONDS } from "../jobs/types.js";
 import { createDockerRuntime } from "../sandbox/docker-runtime.js";
 import { createFakeRuntime } from "../sandbox/fake-runtime.js";
@@ -89,27 +89,30 @@ async function startJobs(
       : {}),
   });
   const logger = CONSOLE_LOGGER;
+  const sandboxDeps = {
+    client,
+    registry,
+    image: config.image,
+    gatewayUrl: config.gatewayUrl,
+    storageApiUrl: config.storageApiUrl,
+    agentUrl: sandboxAgentUrl,
+    chainId: config.chainId,
+    contracts: config.contracts,
+    ...(config.gatewayBypassSecret
+      ? { gatewayBypassSecret: config.gatewayBypassSecret }
+      : {}),
+    sync: config.sync,
+    logger,
+    jobResultMaxBytes: config.jobResultMaxBytes,
+  } satisfies PrewarmDeps;
   const claimLoop = startClaimLoop({
     gateway,
     run: (job, identity) =>
       runJob(job, identity, {
-        client,
+        ...sandboxDeps,
         gateway,
-        registry,
-        image: config.image,
-        gatewayUrl: config.gatewayUrl,
-        storageApiUrl: config.storageApiUrl,
-        agentUrl: sandboxAgentUrl,
-        chainId: config.chainId,
-        contracts: config.contracts,
-        ...(config.gatewayBypassSecret
-          ? { gatewayBypassSecret: config.gatewayBypassSecret }
-          : {}),
         leaseSeconds: config.leaseSeconds,
-        sync: config.sync,
-        logger,
         workDelayMs: config.workDelayMs,
-        jobResultMaxBytes: config.jobResultMaxBytes,
       }),
     registry,
     leaseSeconds: config.leaseSeconds,
@@ -138,22 +141,7 @@ async function startJobs(
     lookupSandboxJob: (accessToken, jobId) =>
       registry.lookupJob(accessToken, jobId),
     prewarm(body): void {
-      void prewarmSandbox(body, body.scope, {
-        client,
-        registry,
-        image: config.image,
-        gatewayUrl: config.gatewayUrl,
-        storageApiUrl: config.storageApiUrl,
-        agentUrl: sandboxAgentUrl,
-        chainId: config.chainId,
-        contracts: config.contracts,
-        ...(config.gatewayBypassSecret
-          ? { gatewayBypassSecret: config.gatewayBypassSecret }
-          : {}),
-        sync: config.sync,
-        logger,
-        jobResultMaxBytes: config.jobResultMaxBytes,
-      });
+      void prewarmSandbox(body, body.scope, sandboxDeps);
     },
     drain(): Promise<void> {
       drainPromise ??= claimLoop.drain().finally(() => nodeHeartbeat.stop());
