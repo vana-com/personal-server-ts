@@ -78,6 +78,15 @@ export async function readDataFile(
   return DataFileEnvelopeSchema.parse(JSON.parse(content));
 }
 
+/** Read a data file without decoding or parsing its potentially large body. */
+export async function readDataFileBytes(
+  options: HierarchyManagerOptions,
+  scope: string,
+  collectedAt: string,
+): Promise<Uint8Array> {
+  return readFile(buildDataFilePath(options.dataDir, scope, collectedAt));
+}
+
 /** Read a bounded UTF-8 text prefix without parsing the full envelope. */
 export async function readDataFilePreview(
   options: HierarchyManagerOptions,

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   assertScopeNotDeleted,
   redactEnvelopeForGrantee,
+  redactJsonEnvelopeBytesForGrantee,
 } from "@opendatalabs/personal-server-ts-core/api";
 import { readDataContract } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
@@ -221,15 +222,12 @@ async function executeJobUnsafe(
 
     throw error;
   }
-  const read = await readDataContract({
-    storage: deps.storage,
-    scopeParam: request.scope,
-  });
-  if (!read.ok || !entry) {
+  if (!entry) {
     throw new JobFailure("SCOPE_NOT_FOUND", "scope not found", false);
   }
+  const body = await readRawReadBody(deps.storage, request.scope, entry);
   logExecutionStep(deps, jobId, "read", executionStartedAt, {
-    payloadBytes: entry.sizeBytes,
+    payloadBytes: body.byteLength,
   });
 
   const localVersion = await deps.storage.findLatestVersionByScope(
@@ -242,14 +240,13 @@ async function executeJobUnsafe(
     throw new JobFailure("VERSION_MISMATCH", "scope version mismatch", true);
   }
 
-  const redacted = redactEnvelopeForGrantee(read.envelope);
   const result: JobResult = {
     v: JOB_PROTOCOL_VERSION,
     jobId,
     scope: request.scope,
     version: localVersion === 0 ? null : String(localVersion),
     contentType: JSON_CONTENT_TYPE,
-    body: new TextEncoder().encode(JSON.stringify(redacted)),
+    body,
   };
   const sealed = await sealJobResult(
     result,
@@ -307,6 +304,25 @@ async function executeJobUnsafe(
     resultHash,
     resultSize,
   };
+}
+
+async function readRawReadBody(
+  storage: DataStoragePort,
+  scope: string,
+  entry: { collectedAt: string },
+): Promise<Uint8Array> {
+  if (storage.readEnvelopeBytes) {
+    return redactJsonEnvelopeBytesForGrantee(
+      await storage.readEnvelopeBytes(scope, entry.collectedAt),
+    );
+  }
+  const read = await readDataContract({ storage, scopeParam: scope });
+  if (!read.ok) {
+    throw new JobFailure("SCOPE_NOT_FOUND", "scope not found", false);
+  }
+  return new TextEncoder().encode(
+    JSON.stringify(redactEnvelopeForGrantee(read.envelope)),
+  );
 }
 
 function logExecutionStep(

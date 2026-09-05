@@ -25,6 +25,7 @@ import {
   buildWeb3SignedHeader,
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
+import { redactEnvelopeForGrantee } from "@opendatalabs/personal-server-ts-core/api";
 import type {
   DataStoragePort,
   ProtocolGatewayPort,
@@ -98,6 +99,7 @@ interface Fixture {
   builderRecord: SignedBuilder;
   gateway: ProtocolGatewayPort;
   storage: DataStoragePort;
+  dataEnvelope: DataFileEnvelope;
   resultUploadFetch: ReturnType<typeof vi.fn>;
 }
 
@@ -190,6 +192,11 @@ async function createFixture(): Promise<Fixture> {
     kind: "custom",
     findEntry: vi.fn().mockReturnValue(entry),
     readEnvelope: vi.fn().mockResolvedValue(dataEnvelope),
+    readEnvelopeBytes: vi
+      .fn()
+      .mockResolvedValue(
+        new TextEncoder().encode(JSON.stringify(dataEnvelope, null, 2)),
+      ),
     findLatestVersionByScope: vi.fn().mockResolvedValue(entry.version),
   } as unknown as DataStoragePort;
   const gateway = {
@@ -262,6 +269,7 @@ async function createFixture(): Promise<Fixture> {
     builderRecord,
     gateway,
     storage,
+    dataEnvelope,
     resultUploadFetch,
   };
 }
@@ -344,7 +352,8 @@ describe("executeJob", () => {
       { jobId: JOB_ID, scope: SCOPE, version: "7" },
     );
     expect(result.body).toBeInstanceOf(Uint8Array);
-    const redacted = JSON.parse(new TextDecoder().decode(result.body));
+    const bodyText = new TextDecoder().decode(result.body);
+    const redacted = JSON.parse(bodyText);
 
     expect(result).toMatchObject({
       v: 1,
@@ -354,6 +363,10 @@ describe("executeJob", () => {
       contentType: "application/json",
     });
     expect(redacted.data).toEqual({ name: RECORD_VALUE });
+    expect(bodyText).toBe(
+      JSON.stringify(redactEnvelopeForGrantee(fixture.dataEnvelope)),
+    );
+    expect(fixture.storage.readEnvelope).not.toHaveBeenCalled();
     for (const event of ["read", "seal", "sign", "upload", "done"]) {
       expect(fixture.deps.logger.info).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -369,7 +382,10 @@ describe("executeJob", () => {
       );
     }
     expect(fixture.deps.logger.info).toHaveBeenCalledWith(
-      expect.objectContaining({ event: "read", payloadBytes: 100 }),
+      expect.objectContaining({
+        event: "read",
+        payloadBytes: result.body.byteLength,
+      }),
       "Enclave job execution progress",
     );
     expect(fixture.deps.logger.info).toHaveBeenCalledWith(

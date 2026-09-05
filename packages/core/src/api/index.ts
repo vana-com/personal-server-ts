@@ -1018,6 +1018,8 @@ export function redactEnvelopeForGrantee(
   return { ...envelope, data };
 }
 
+export { redactJsonEnvelopeBytesForGrantee } from "./raw-envelope.js";
+
 export async function handlePersonalServerDataRequest(
   request: Request,
   deps: PersonalServerDataApiDeps,
