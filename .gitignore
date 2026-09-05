@@ -14,8 +14,9 @@ packages/*/src/**/*.js.map
 packages/*/src/**/*.d.ts
 packages/*/src/**/*.d.ts.map
 .sisyphus/
-HANDOFF-*.md
-REVIEW-*.md
+/HANDOFF-*.md
+/RESULT-*.md
+/REVIEW-*.md
 
 # Downloaded frpc binaries (managed at runtime)
 packages/server/bin/
