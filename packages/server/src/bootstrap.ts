@@ -566,6 +566,7 @@ export async function createServer(
 
   const ecies = new NodeECIESProvider();
   const resultUpload = options?.jobResultUpload;
+  const jobSyncManager = syncManager;
   const jobWorker =
     isEnclave && serverOwner && serverAccount && resultUpload
       ? (envelope: Parameters<typeof executeJob>[0]) =>
@@ -581,6 +582,9 @@ export async function createServer(
             logger,
             accessLogWriter,
             scopeDeletions,
+            hydrateScope: jobSyncManager
+              ? (scope) => jobSyncManager.hydrateScopes([scope])
+              : undefined,
             resultUpload,
           })
       : undefined;
