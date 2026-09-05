@@ -8,8 +8,8 @@
 #                                      [ps-<userPsId>-<epoch>, tmpfs /data,
 #                                       no dstack or Docker sockets]
 #
-# Production uses a digest-pinned agent image under one approved compose hash
-# (architecture decision 23). This clone bootstrap is for level-B testing only.
+# Production pins agent and sandbox image digests under one approved compose
+# hash (architecture decision 23), then checks out the requested source commit.
 #
 # PS_IMAGE must be a digest (vanaorg/personal-server@sha256:...) built from
 # this branch's Dockerfile.
