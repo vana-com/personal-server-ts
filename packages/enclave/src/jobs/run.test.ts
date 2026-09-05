@@ -213,6 +213,7 @@ async function createFixture(): Promise<Fixture> {
       dataPortabilityPermissions: "0x4444444444444444444444444444444444444444",
     },
     gatewayBypassSecret: "preview-secret",
+    jobResultMaxBytes: 64 * 1024 * 1024,
     leaseSeconds: 30,
     sync: "disabled",
     logger: { error: errorLog, info: vi.fn(), warn: vi.fn() },
@@ -306,6 +307,7 @@ describe("runJob", () => {
         DATA_PORTABILITY_PERMISSIONS_CONTRACT:
           "0x4444444444444444444444444444444444444444",
         VERCEL_PROTECTION_BYPASS: "preview-secret",
+        JOB_RESULT_MAX_BYTES: String(64 * 1024 * 1024),
       },
     });
     expect(fixture.runtime.specs[0]?.env.PS_ACCESS_TOKEN).toMatch(
@@ -319,6 +321,7 @@ describe("runJob", () => {
         "SYNC_ENABLED",
         "VANA_MASTER_KEY_SIGNATURE",
         "VERCEL_PROTECTION_BYPASS",
+        "JOB_RESULT_MAX_BYTES",
         "GATEWAY_URL",
         "ENCLAVE_AGENT_URL",
         "CHAIN_ID",
@@ -430,6 +433,15 @@ describe("runJob", () => {
     expect(() =>
       assertSandboxEnv(fixture.runtime.specs[0]?.env ?? {}),
     ).not.toThrow();
+  });
+
+  it("forwards the configured result byte budget to the sandbox", async () => {
+    const fixture = await createFixture();
+    fixture.deps.jobResultMaxBytes = 12_345;
+
+    await runJob(fixture.job, fixture.identity, fixture.deps);
+
+    expect(fixture.runtime.specs[0]?.env.JOB_RESULT_MAX_BYTES).toBe("12345");
   });
 
   it("awaits the configured work delay on the docker runtime path", async () => {
@@ -626,6 +638,20 @@ describe("runJob", () => {
     expect(fixture.gateway.fail).toHaveBeenCalledWith(JOB_ID, {
       fencingToken: 1,
       reason: "GRANT_REVOKED",
+    });
+    expect(fixture.gateway.complete).not.toHaveBeenCalled();
+  });
+
+  it("relays an over-budget result failure to the Gateway", async () => {
+    sandboxStatus = 413;
+    sandboxResponse = jobError("RESULT_TOO_LARGE", false);
+    const fixture = await createFixture();
+
+    await runJob(fixture.job, fixture.identity, fixture.deps);
+
+    expect(fixture.gateway.fail).toHaveBeenCalledWith(JOB_ID, {
+      fencingToken: 1,
+      reason: "RESULT_TOO_LARGE",
     });
     expect(fixture.gateway.complete).not.toHaveBeenCalled();
   });

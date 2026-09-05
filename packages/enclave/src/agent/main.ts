@@ -109,6 +109,7 @@ async function startJobs(
         sync: config.sync,
         logger,
         workDelayMs: config.workDelayMs,
+        jobResultMaxBytes: config.jobResultMaxBytes,
       }),
     registry,
     leaseSeconds: config.leaseSeconds,

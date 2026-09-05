@@ -208,6 +208,17 @@ describe("docker sandbox runtime", () => {
     );
   });
 
+  it("passes the result byte budget to the sandbox environment", async () => {
+    const docker = scriptedDocker();
+    const runtime = createDockerRuntime({ docker, health: async () => true });
+
+    await runtime.start(sandboxSpec({ JOB_RESULT_MAX_BYTES: "123456" }));
+
+    expect(docker.calls[1]?.args).toEqual(
+      expect.arrayContaining(["--env", "JOB_RESULT_MAX_BYTES=123456"]),
+    );
+  });
+
   it("passes sandbox secrets through a private temporary env file", async () => {
     let envFilePath = "";
     let envFileContent = "";

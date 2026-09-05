@@ -27,6 +27,7 @@ const ROUTE_RESOLUTION_TIMEOUT_MS = 5_000;
 const MILLISECONDS_PER_SECOND = 1_000;
 const MIN_POSITIVE_INTEGER = 1;
 const MIN_NONNEGATIVE_INTEGER = 0;
+const DEFAULT_JOB_RESULT_MAX_BYTES = 64 * 1024 * 1024;
 const DOCKER_IMAGE_DIGEST_PATTERN = /^.+@sha256:[0-9a-f]{64}$/;
 const DOCKER_IMAGE_ID_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const HTTPS_PROTOCOL = "https:";
@@ -81,6 +82,7 @@ export interface AgentJobsConfig {
   fakeRoot?: string;
   sync: SandboxSyncMode;
   workDelayMs: number;
+  jobResultMaxBytes: number;
   sandboxDebug: boolean;
   gatewayBypassSecret?: string;
 }
@@ -162,6 +164,12 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
     MIN_NONNEGATIVE_INTEGER,
     MIN_NONNEGATIVE_INTEGER,
   );
+  const jobResultMaxBytes = readInteger(
+    env.JOB_RESULT_MAX_BYTES,
+    "JOB_RESULT_MAX_BYTES",
+    DEFAULT_JOB_RESULT_MAX_BYTES,
+    MIN_POSITIVE_INTEGER,
+  );
 
   let gatewayUrl: URL;
   try {
@@ -225,6 +233,7 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
       : {}),
     sync,
     workDelayMs,
+    jobResultMaxBytes,
     sandboxDebug: env.SANDBOX_DEBUG === SANDBOX_DEBUG_ENABLED,
     ...(env.VERCEL_PROTECTION_BYPASS
       ? { gatewayBypassSecret: env.VERCEL_PROTECTION_BYPASS }

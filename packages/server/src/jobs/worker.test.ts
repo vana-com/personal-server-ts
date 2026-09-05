@@ -437,6 +437,34 @@ describe("executeJob", () => {
     );
   });
 
+  it("rejects an over-budget result before reading the stored bytes", async () => {
+    const fixture = await createFixture();
+    fixture.deps.resultMaxBytes = 99;
+
+    await expect(
+      executeJob(fixture.envelope, fixture.deps),
+    ).rejects.toMatchObject({
+      code: "RESULT_TOO_LARGE",
+      message: "job result is 100 bytes; limit is 99 bytes",
+      retryable: false,
+    });
+
+    expect(fixture.storage.readEnvelopeBytes).not.toHaveBeenCalled();
+    expect(fixture.storage.readEnvelope).not.toHaveBeenCalled();
+    expect(fixture.resultUploadFetch).not.toHaveBeenCalled();
+  });
+
+  it("reads and seals a result at the byte budget", async () => {
+    const fixture = await createFixture();
+    fixture.deps.resultMaxBytes = 100;
+
+    await expect(executeJob(fixture.envelope, fixture.deps)).resolves.toEqual(
+      expect.objectContaining({ resultSize: expect.any(Number) }),
+    );
+
+    expect(fixture.storage.readEnvelopeBytes).toHaveBeenCalledOnce();
+  });
+
   it("normalizes an uppercase job id before building result paths", async () => {
     const fixture = await createFixture();
     fixture.envelope.request.jobId = JOB_ID.toUpperCase();

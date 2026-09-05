@@ -98,6 +98,7 @@ export interface RunJobDeps {
   sync: SyncMode;
   logger: JobLogger;
   workDelayMs?: number;
+  jobResultMaxBytes: number;
   fetch?: typeof fetch;
   now?: () => number;
   sleep?: (milliseconds: number) => Promise<void>;
@@ -709,6 +710,7 @@ function sandboxSpec(
       SYNC_ENABLED: deps.sync === "enabled" ? SYNC_ENABLED : SYNC_DISABLED,
       GATEWAY_URL: deps.gatewayUrl,
       ENCLAVE_AGENT_URL: deps.agentUrl,
+      JOB_RESULT_MAX_BYTES: String(deps.jobResultMaxBytes),
       CHAIN_ID: String(deps.chainId),
       DATA_REGISTRY_CONTRACT: deps.contracts.dataRegistry,
       DATA_PORTABILITY_SERVER_CONTRACT: deps.contracts.dataPortabilityServer,

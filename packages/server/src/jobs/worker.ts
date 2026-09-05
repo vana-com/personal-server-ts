@@ -56,6 +56,7 @@ const RESULT_SIGNING_TIMEOUT_MS = 15_000;
 const RESULT_UPLOAD_TIMEOUT_MS = 120_000;
 const RESULT_OBJECT_PREFIX = "jobresults";
 const BYTES_PER_MIB = 1024 * 1024;
+export const DEFAULT_JOB_RESULT_MAX_BYTES = 64 * BYTES_PER_MIB;
 const PUT = "PUT";
 const JOB_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -73,6 +74,7 @@ export interface JobWorkerDeps {
   logger: Logger;
   accessLogWriter: AccessLogWriter;
   scopeDeletions?: ScopeDeletionTracker;
+  resultMaxBytes?: number;
   resultUpload: {
     storageEndpoint: string;
     agentEndpoint: string;
@@ -225,6 +227,16 @@ async function executeJobUnsafe(
   if (!entry) {
     throw new JobFailure("SCOPE_NOT_FOUND", "scope not found", false);
   }
+  const resultMaxBytes =
+    deps.resultMaxBytes ??
+    readJobResultMaxBytes(process.env.JOB_RESULT_MAX_BYTES);
+  if (entry.sizeBytes > resultMaxBytes) {
+    throw new JobFailure(
+      "RESULT_TOO_LARGE",
+      `job result is ${entry.sizeBytes} bytes; limit is ${resultMaxBytes} bytes`,
+      false,
+    );
+  }
   const body = await readRawReadBody(deps.storage, request.scope, entry);
   logExecutionStep(deps, jobId, "read", executionStartedAt, {
     payloadBytes: body.byteLength,
@@ -304,6 +316,15 @@ async function executeJobUnsafe(
     resultHash,
     resultSize,
   };
+}
+
+export function readJobResultMaxBytes(value: string | undefined): number {
+  if (value === undefined) return DEFAULT_JOB_RESULT_MAX_BYTES;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error("JOB_RESULT_MAX_BYTES must be a positive safe integer");
+  }
+  return parsed;
 }
 
 async function readRawReadBody(
