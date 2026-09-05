@@ -356,15 +356,29 @@ describe("executeJob", () => {
     expect(redacted.data).toEqual({ name: RECORD_VALUE });
     for (const event of ["read", "seal", "sign", "upload", "done"]) {
       expect(fixture.deps.logger.info).toHaveBeenCalledWith(
-        {
+        expect.objectContaining({
           jobId: JOB_ID,
           stage: "execute",
           event,
           elapsedMs: expect.any(Number),
-        },
+          rssMiB: expect.any(Number),
+          heapUsedMiB: expect.any(Number),
+          arrayBuffersMiB: expect.any(Number),
+        }),
         "Enclave job execution progress",
       );
     }
+    expect(fixture.deps.logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "read", payloadBytes: 100 }),
+      "Enclave job execution progress",
+    );
+    expect(fixture.deps.logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "seal",
+        sealedBytes: sealedBytes.byteLength,
+      }),
+      "Enclave job execution progress",
+    );
     const expectedHash = `0x${createHash("sha256")
       .update(sealedBytes)
       .digest("hex")}`;

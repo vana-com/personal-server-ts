@@ -54,6 +54,7 @@ const RESULT_SIGNING_PATH = "/agent/v1/job-results/sign";
 const RESULT_SIGNING_TIMEOUT_MS = 15_000;
 const RESULT_UPLOAD_TIMEOUT_MS = 120_000;
 const RESULT_OBJECT_PREFIX = "jobresults";
+const BYTES_PER_MIB = 1024 * 1024;
 const PUT = "PUT";
 const JOB_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -220,7 +221,6 @@ async function executeJobUnsafe(
 
     throw error;
   }
-  logExecutionStep(deps, jobId, "read", executionStartedAt);
   const read = await readDataContract({
     storage: deps.storage,
     scopeParam: request.scope,
@@ -228,6 +228,9 @@ async function executeJobUnsafe(
   if (!read.ok || !entry) {
     throw new JobFailure("SCOPE_NOT_FOUND", "scope not found", false);
   }
+  logExecutionStep(deps, jobId, "read", executionStartedAt, {
+    payloadBytes: entry.sizeBytes,
+  });
 
   const localVersion = await deps.storage.findLatestVersionByScope(
     request.scope,
@@ -239,7 +242,6 @@ async function executeJobUnsafe(
     throw new JobFailure("VERSION_MISMATCH", "scope version mismatch", true);
   }
 
-  logExecutionStep(deps, jobId, "seal", executionStartedAt);
   const redacted = redactEnvelopeForGrantee(read.envelope);
   const result: JobResult = {
     v: JOB_PROTOCOL_VERSION,
@@ -255,6 +257,9 @@ async function executeJobUnsafe(
     deps.ecies,
   );
   const sealedBytes = sealed.bytes;
+  logExecutionStep(deps, jobId, "seal", executionStartedAt, {
+    sealedBytes: sealedBytes.byteLength,
+  });
   const digest = createHash("sha256").update(sealedBytes).digest("hex");
   const resultHash = `0x${digest}` as Hex;
   const resultSize = sealedBytes.byteLength;
@@ -309,13 +314,19 @@ function logExecutionStep(
   jobId: string,
   event: "read" | "seal" | "sign" | "upload" | "done",
   startedAt: number,
+  details: Record<string, unknown> = {},
 ): void {
+  const memory = process.memoryUsage();
   deps.logger.info(
     {
       jobId,
       stage: "execute",
       event,
       elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      rssMiB: Math.round(memory.rss / BYTES_PER_MIB),
+      heapUsedMiB: Math.round(memory.heapUsed / BYTES_PER_MIB),
+      arrayBuffersMiB: Math.round(memory.arrayBuffers / BYTES_PER_MIB),
+      ...details,
     },
     JOB_EXECUTION_PROGRESS_LOG,
   );
