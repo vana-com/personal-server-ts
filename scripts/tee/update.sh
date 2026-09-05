@@ -88,10 +88,13 @@ if [[ ! $git_ref =~ ^[[:xdigit:]]{40}$ ]]; then
   exit 1
 fi
 
+source_images_env "$repo_root/deploy/dstack/images.env"
 : "${ENCLAVE_AGENT_SECRET:?ENCLAVE_AGENT_SECRET must be set in the environment}"
 : "${GATEWAY_URL:?GATEWAY_URL must be set in the environment}"
 : "${PS_IMAGE:?PS_IMAGE must be set in the environment}"
 validate_image_digests
+GIT_REF=$git_ref
+assert_ps_image_ref
 command -v openssl >/dev/null || { echo "openssl is required" >&2; exit 1; }
 command -v phala >/dev/null || { echo "phala CLI is required" >&2; exit 1; }
 command -v node >/dev/null || { echo "Node.js is required" >&2; exit 1; }

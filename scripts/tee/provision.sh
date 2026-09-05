@@ -62,6 +62,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+source_images_env "$repo_root/deploy/dstack/images.env"
 : "${ENCLAVE_AGENT_SECRET:?ENCLAVE_AGENT_SECRET must be set in the environment}"
 validate_image_digests
 command -v phala >/dev/null || { echo "phala CLI is required" >&2; exit 1; }
@@ -93,6 +94,8 @@ else
     echo "--ref must be a 40-hex commit SHA for the enclave compose; branch names are mutable" >&2
     exit 1
   fi
+  GIT_REF=$git_ref
+  assert_ps_image_ref
 fi
 
 if [[ -n $app_id || -n $nonce ]]; then

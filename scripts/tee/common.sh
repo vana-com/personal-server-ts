@@ -7,6 +7,41 @@ readonly CURL_CONNECT_TIMEOUT_SECONDS=5
 readonly CURL_MAX_TIME_SECONDS=10
 readonly AGENT_LOG_LINES=50
 
+source_images_env() {
+  local images_env=$1
+  local had_ps_image=false
+  local had_ps_image_ref=false
+  local saved_ps_image=${PS_IMAGE-}
+  local saved_ps_image_ref=${PS_IMAGE_REF-}
+
+  [[ -f $images_env ]] || return 0
+  [[ ${PS_IMAGE+x} == x ]] && had_ps_image=true
+  [[ ${PS_IMAGE_REF+x} == x ]] && had_ps_image_ref=true
+  # shellcheck disable=SC1090
+  source "$images_env"
+  if [[ $had_ps_image == true ]]; then
+    PS_IMAGE=$saved_ps_image
+  fi
+  if [[ $had_ps_image_ref == true ]]; then
+    PS_IMAGE_REF=$saved_ps_image_ref
+  fi
+}
+
+assert_ps_image_ref() {
+  if [[ -z ${PS_IMAGE_REF:-} ]]; then
+    echo "warning: PS_IMAGE_REF is not set; cannot verify that PS_IMAGE matches GIT_REF." >&2
+    return 0
+  fi
+  if [[ ! ${GIT_REF:-} =~ ^[[:xdigit:]]{40}$ ]]; then
+    echo "GIT_REF must be a 40-hex commit SHA when PS_IMAGE_REF is set." >&2
+    return 1
+  fi
+  if [[ $PS_IMAGE_REF != "$GIT_REF" ]]; then
+    echo "PS_IMAGE_REF '$PS_IMAGE_REF' must match GIT_REF '$GIT_REF'." >&2
+    return 1
+  fi
+}
+
 validate_image_digests() {
   : "${AGENT_IMAGE:?AGENT_IMAGE must be set to a digest-pinned image reference}"
   : "${DIND_IMAGE:?DIND_IMAGE must be set to a digest-pinned image reference}"
