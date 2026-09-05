@@ -142,4 +142,77 @@ printf '%s\\n' "$PS_IMAGE" "$PS_IMAGE_REF" "$GIT_REF" "$AGENT_IMAGE" "$DIND_IMAG
     expect(result.stderr).toContain("reached-phala-deploy");
     expect(result.stderr).not.toContain("PS_IMAGE must be a local image tag");
   });
+
+  it("does not load images.env for update's default inline compose", () => {
+    const root = temporaryRoot();
+    const scriptDirectory = join(root, "scripts/tee");
+    const deployDirectory = join(root, "deploy/dstack");
+    const binDirectory = join(root, "bin");
+    const marker = join(root, "executed");
+    mkdirSync(scriptDirectory, { recursive: true });
+    mkdirSync(deployDirectory, { recursive: true });
+    mkdirSync(binDirectory, { recursive: true });
+    copyFileSync(
+      join(repositoryRoot, "scripts/tee/common.sh"),
+      join(scriptDirectory, "common.sh"),
+    );
+    copyFileSync(
+      join(repositoryRoot, "scripts/tee/update.sh"),
+      join(scriptDirectory, "update.sh"),
+    );
+    writeFileSync(
+      join(deployDirectory, "docker-compose.enclave.inline.yml"),
+      "services: {}\n",
+    );
+    writeFileSync(
+      join(deployDirectory, "images.env"),
+      [
+        `PS_IMAGE=vanaorg/personal-server@sha256:${digest}`,
+        `PS_IMAGE_REF=${sha}`,
+        `touch ${marker}`,
+        "",
+      ].join("\n"),
+    );
+    const git = join(binDirectory, "git");
+    writeFileSync(
+      git,
+      `#!/bin/sh
+case "$*" in
+  *"rev-parse HEAD"*) printf '%s\\n' '${sha}'; exit 0 ;;
+  *) echo reached-git-fetch >&2; exit 77 ;;
+esac
+`,
+    );
+    chmodSync(git, 0o755);
+
+    const environment = { ...process.env };
+    delete environment.PS_IMAGE;
+    delete environment.PS_IMAGE_REF;
+    const result = spawnSync(
+      "bash",
+      [
+        join(scriptDirectory, "update.sh"),
+        "test-cvm",
+        "--tee-node-id",
+        "replacement-node",
+        "--secret-out",
+        join(root, "node-secret"),
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...environment,
+          PATH: `${binDirectory}:${process.env.PATH ?? ""}`,
+          ENCLAVE_AGENT_SECRET: "test-agent-secret",
+          GATEWAY_URL: "https://gateway.example",
+          AGENT_IMAGE: `node@sha256:${digest}`,
+          DIND_IMAGE: `docker@sha256:${digest}`,
+        },
+      },
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("reached-git-fetch");
+    expect(existsSync(marker)).toBe(false);
+  });
 });
