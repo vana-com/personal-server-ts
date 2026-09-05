@@ -297,6 +297,37 @@ describe("docker sandbox runtime", () => {
     ]);
   });
 
+  it("inspects container exit state with one docker call", async () => {
+    execFileMock.mockClear();
+    execFileMock.mockImplementationOnce((_binary, args, _options, callback) => {
+      expect(args).toEqual(["inspect", "container-id"]);
+      callback(
+        null,
+        JSON.stringify([
+          {
+            State: {
+              Running: false,
+              ExitCode: 137,
+              OOMKilled: true,
+              FinishedAt: "2026-09-04T12:01:00.000Z",
+            },
+            NetworkSettings: { Ports: { "8080/tcp": null } },
+          },
+        ]),
+        "",
+      );
+    });
+    const runtime = createDockerRuntime();
+
+    await expect(runtime.inspect("container-id")).resolves.toEqual({
+      running: false,
+      exitCode: 137,
+      oomKilled: true,
+      finishedAt: "2026-09-04T12:01:00.000Z",
+    });
+    expect(execFileMock).toHaveBeenCalledOnce();
+  });
+
   it("returns both stdout and stderr from docker logs", async () => {
     execFileMock.mockImplementationOnce((_binary, _args, _options, callback) =>
       callback(null, "stdout line\n", "stderr line\n"),

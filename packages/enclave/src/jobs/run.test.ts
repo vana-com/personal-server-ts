@@ -641,6 +641,35 @@ describe("runJob", () => {
     expect(fixture.gateway.complete).not.toHaveBeenCalled();
   });
 
+  it("warns with exit state when the sandbox dies during execution", async () => {
+    const fixture = await createFixture();
+    fixture.deps.fetch = vi
+      .fn()
+      .mockRejectedValue(new TypeError("fetch failed"));
+    fixture.runtime.inspect = vi.fn().mockResolvedValue({
+      running: false,
+      exitCode: 137,
+      oomKilled: true,
+      finishedAt: "2026-09-04T12:01:00.000Z",
+    });
+
+    await runJob(fixture.job, fixture.identity, fixture.deps);
+
+    expect(fixture.runtime.inspect).toHaveBeenCalledOnce();
+    expect(fixture.deps.logger.warn).toHaveBeenCalledWith(
+      {
+        jobId: JOB_ID,
+        stage: "execute",
+        reason: "sandbox-exited",
+        exitCode: 137,
+        oomKilled: true,
+      },
+      "Sandbox execution interrupted",
+    );
+    expect(fixture.gateway.fail).not.toHaveBeenCalled();
+    expect(fixture.gateway.complete).not.toHaveBeenCalled();
+  });
+
   it("heartbeats every lease third while execution is pending", async () => {
     vi.useFakeTimers();
     const fixture = await createFixture();

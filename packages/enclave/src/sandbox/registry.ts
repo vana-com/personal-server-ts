@@ -2,7 +2,12 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { ActiveSandboxJob, SandboxJobLookup } from "../agent/types.js";
 import { isAbortError, withAbort } from "./abort.js";
 import type { SyncStatus } from "./probes.js";
-import type { SandboxHandle, SandboxRuntime, SandboxSpec } from "./runtime.js";
+import type {
+  SandboxHandle,
+  SandboxInspection,
+  SandboxRuntime,
+  SandboxSpec,
+} from "./runtime.js";
 
 export const SANDBOX_MAX = 20;
 export const SANDBOX_IDLE_TTL_SECONDS = 600;
@@ -55,6 +60,7 @@ export interface SandboxRegistry {
   drain(): Promise<void>;
   activeCount(): number;
   listSandboxes(): Promise<SandboxStatus[]>;
+  inspectSandbox(containerId: string): Promise<SandboxStatus | undefined>;
   sandboxLogs(containerId: string, tail: number): Promise<string | undefined>;
 }
 
@@ -62,8 +68,10 @@ export interface SandboxStatus {
   key: string;
   containerId: string;
   running: boolean;
-  createdAt: string;
-  lastSyncStatus: SyncStatus | null;
+  exitCode: number | null;
+  oomKilled: boolean | null;
+  finishedAt: string | null;
+  error?: string;
 }
 
 interface RegistryEntry {
@@ -232,14 +240,21 @@ export function createSandboxRegistry(
       );
 
       return Promise.all(
-        sandboxes.map(async ({ key, entry, containerId }) => ({
-          key,
-          containerId,
-          running: (await options.runtime.inspect(containerId)).running,
-          createdAt: entry.createdAt,
-          lastSyncStatus: entry.lastSyncStatus,
-        })),
+        sandboxes.map(({ key, containerId }) =>
+          inspectSandbox(options.runtime, key, containerId),
+        ),
       );
+    },
+    inspectSandbox(containerId): Promise<SandboxStatus | undefined> {
+      const managed = [...entries.entries()].find(
+        ([, entry]) =>
+          entry.containerId === containerId || entry.handle?.id === containerId,
+      );
+      if (!managed) {
+        return Promise.resolve(undefined);
+      }
+
+      return inspectSandbox(options.runtime, managed[0], containerId);
     },
     sandboxLogs(containerId, tail): Promise<string | undefined> {
       const managed = [...entries.values()].some(
@@ -251,6 +266,43 @@ export function createSandboxRegistry(
 
       return options.runtime.logs(containerId, tail);
     },
+  };
+}
+
+async function inspectSandbox(
+  runtime: SandboxRuntime,
+  key: string,
+  containerId: string,
+): Promise<SandboxStatus> {
+  try {
+    const inspection = await runtime.inspect(containerId);
+
+    return sandboxStatus(key, containerId, inspection);
+  } catch (error) {
+    return {
+      key,
+      containerId,
+      running: false,
+      exitCode: null,
+      oomKilled: null,
+      finishedAt: null,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function sandboxStatus(
+  key: string,
+  containerId: string,
+  inspection: SandboxInspection,
+): SandboxStatus {
+  return {
+    key,
+    containerId,
+    running: inspection.running,
+    exitCode: inspection.exitCode ?? null,
+    oomKilled: inspection.oomKilled ?? null,
+    finishedAt: inspection.finishedAt ?? null,
   };
 }
 

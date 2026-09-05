@@ -14,6 +14,7 @@ import {
   assertSandboxEnv,
   SECRET_ENV_KEYS,
   type SandboxHandle,
+  type SandboxInspection,
   type SandboxRuntime,
   type SandboxSpec,
 } from "./runtime.js";
@@ -42,13 +43,8 @@ const LOGS_COMMAND = "logs";
 const REMOVE_COMMAND = "rm";
 const FORCE_FLAG = "--force";
 const VOLUMES_FLAG = "--volumes";
-const FORMAT_FLAG = "--format";
 const PUBLISH_FLAG = "--publish";
 const PUBLISHED_PORT = `0:${CONTAINER_PORT}`;
-const RUNNING_FORMAT = "{{.State.Running}}";
-const HOST_PORT_FORMAT =
-  '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}';
-const RUNNING_VALUE = "true";
 const ALL_FLAG = "--all";
 const QUIET_FLAG = "--quiet";
 const FILTER_FLAG = "--filter";
@@ -87,8 +83,7 @@ const FIXED_ENV = {
   SERVER_ORIGIN: `http://localhost:${CONTAINER_PORT}`,
 } as const;
 
-export interface ContainerInspection {
-  running: boolean;
+export interface ContainerInspection extends SandboxInspection {
   hostPort?: number;
 }
 
@@ -267,10 +262,8 @@ export function createDockerRuntime(
     async stop(id): Promise<void> {
       await docker.run(REMOVE_COMMAND, [FORCE_FLAG, VOLUMES_FLAG, id]);
     },
-    async inspect(id): Promise<{ running: boolean }> {
-      const inspection = await docker.inspect(id);
-
-      return { running: inspection.running };
+    inspect(id): Promise<ContainerInspection> {
+      return docker.inspect(id);
     },
     logs(id, tail): Promise<string> {
       return docker.run(LOGS_COMMAND, [TAIL_FLAG, String(tail), id]);
@@ -291,26 +284,46 @@ function createDockerClient(options: DockerClientOptions): DockerClient {
     run: (command, args, env, redactions) =>
       runDocker(binary, host, command, args, env, redactions),
     async inspect(id): Promise<ContainerInspection> {
-      const [running, hostPortValue] = await Promise.all([
-        runDocker(binary, host, INSPECT_COMMAND, [
-          FORMAT_FLAG,
-          RUNNING_FORMAT,
-          id,
-        ]),
-        runDocker(binary, host, INSPECT_COMMAND, [
-          FORMAT_FLAG,
-          HOST_PORT_FORMAT,
-          id,
-        ]),
-      ]);
-      const hostPort = parseHostPort(hostPortValue);
-
-      return {
-        running: running === RUNNING_VALUE,
-        ...(hostPort === undefined ? {} : { hostPort }),
-      };
+      return parseContainerInspection(
+        await runDocker(binary, host, INSPECT_COMMAND, [id]),
+      );
     },
   };
+}
+
+function parseContainerInspection(value: string): ContainerInspection {
+  const parsed = JSON.parse(value) as unknown;
+  const container = Array.isArray(parsed) ? asRecord(parsed[0]) : undefined;
+  const state = asRecord(container?.State);
+  if (
+    !state ||
+    typeof state.Running !== "boolean" ||
+    typeof state.ExitCode !== "number" ||
+    typeof state.OOMKilled !== "boolean" ||
+    typeof state.FinishedAt !== "string"
+  ) {
+    throw new Error("Docker inspect returned an invalid container state");
+  }
+
+  const networkSettings = asRecord(container?.NetworkSettings);
+  const ports = asRecord(networkSettings?.Ports);
+  const bindings = ports?.[`${CONTAINER_PORT}/tcp`];
+  const binding = Array.isArray(bindings) ? asRecord(bindings[0]) : undefined;
+  const hostPort = parseHostPort(binding?.HostPort);
+
+  return {
+    running: state.Running,
+    exitCode: state.ExitCode,
+    oomKilled: state.OOMKilled,
+    finishedAt: state.FinishedAt,
+    ...(hostPort === undefined ? {} : { hostPort }),
+  };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 }
 
 function runDocker(

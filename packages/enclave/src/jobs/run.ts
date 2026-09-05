@@ -312,18 +312,37 @@ export async function runJob(
         now(),
       );
     }
+    let sandboxExited = false;
+    if (result.kind === "retry" && result.status === undefined) {
+      const inspection = await deps.registry.inspectSandbox(sandbox.handle.id);
+      if (inspection && !inspection.running) {
+        sandboxExited = true;
+        deps.logger.warn(
+          {
+            jobId: job.jobId,
+            stage: EXECUTE_STAGE,
+            reason: "sandbox-exited",
+            exitCode: inspection.exitCode,
+            oomKilled: inspection.oomKilled,
+          },
+          "Sandbox execution interrupted",
+        );
+      }
+    }
     await lease.settled();
     if (lease.lost()) {
-      logExecuteInterrupted(
-        deps.logger,
-        job.jobId,
-        "lease-lost",
-        executeStartedAt,
-        now(),
-      );
+      if (!sandboxExited) {
+        logExecuteInterrupted(
+          deps.logger,
+          job.jobId,
+          "lease-lost",
+          executeStartedAt,
+          now(),
+        );
+      }
       return;
     }
-    if (result.kind === "retry" && result.interruption) {
+    if (result.kind === "retry" && result.interruption && !sandboxExited) {
       logExecuteInterrupted(
         deps.logger,
         job.jobId,

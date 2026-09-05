@@ -63,11 +63,18 @@ export interface SandboxHandle {
   origin: string;
 }
 
+export interface SandboxInspection {
+  running: boolean;
+  exitCode?: number;
+  oomKilled?: boolean;
+  finishedAt?: string;
+}
+
 export interface SandboxRuntime {
   reconcile(): Promise<void>;
   start(spec: SandboxSpec, signal?: AbortSignal): Promise<SandboxHandle>;
   stop(id: string): Promise<void>;
-  inspect(id: string): Promise<{ running: boolean }>;
+  inspect(id: string): Promise<SandboxInspection>;
   logs?(id: string, tail: number): Promise<string>;
 }
 

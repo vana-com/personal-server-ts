@@ -154,12 +154,9 @@ describe("sandbox registry", () => {
         key: "owner:1",
         containerId: "sandbox-1",
         running: true,
-        createdAt: "2026-09-04T12:00:00.000Z",
-        lastSyncStatus: {
-          syncing: false,
-          pendingFiles: 0,
-          lastSync: "2026-09-04T12:00:01.000Z",
-        },
+        exitCode: null,
+        oomKilled: null,
+        finishedAt: null,
       },
     ]);
     await expect(registry.sandboxLogs("sandbox-1", 500)).resolves.toBe(
@@ -169,6 +166,45 @@ describe("sandbox registry", () => {
       registry.sandboxLogs("unmanaged", 500),
     ).resolves.toBeUndefined();
     expect(runtime.logs).toHaveBeenCalledOnce();
+  });
+
+  it("reports exit state and tolerates failed inspection per sandbox", async () => {
+    const runtime = memoryRuntime();
+    runtime.inspect = vi.fn(async (id) => {
+      if (id === "sandbox-1") {
+        return {
+          running: false,
+          exitCode: 137,
+          oomKilled: true,
+          finishedAt: "2026-09-04T12:01:00.000Z",
+        };
+      }
+      throw new Error("No such container: sandbox-2");
+    });
+    const registry = createSandboxRegistry({ runtime });
+
+    await registry.acquire("owner:1", buildSpec);
+    await registry.acquire("owner:2", buildSpec);
+
+    await expect(registry.listSandboxes()).resolves.toEqual([
+      {
+        key: "owner:1",
+        containerId: "sandbox-1",
+        running: false,
+        exitCode: 137,
+        oomKilled: true,
+        finishedAt: "2026-09-04T12:01:00.000Z",
+      },
+      {
+        key: "owner:2",
+        containerId: "sandbox-2",
+        running: false,
+        exitCode: null,
+        oomKilled: null,
+        finishedAt: null,
+        error: "No such container: sandbox-2",
+      },
+    ]);
   });
 
   it("reuses ready sandboxes and preserves their access token", async () => {
