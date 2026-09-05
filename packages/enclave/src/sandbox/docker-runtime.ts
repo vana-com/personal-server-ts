@@ -591,19 +591,7 @@ async function waitForSync(options: SyncWaitOptions): Promise<void> {
   let nextLogAt = WAIT_LOG_INTERVAL_MS;
   while (true) {
     throwIfAborted(options.signal);
-    const result = options.signal
-      ? await options.syncStatus(
-          options.origin,
-          options.accessToken,
-          options.signal,
-          options.requestedScope,
-        )
-      : await options.syncStatus(
-          options.origin,
-          options.accessToken,
-          undefined,
-          options.requestedScope,
-        );
+    const result = await readSyncStatus(options);
     if (result.status) {
       options.onStatus?.(result.status);
     }
@@ -635,6 +623,21 @@ async function waitForSync(options: SyncWaitOptions): Promise<void> {
 
     await sleepWithAbort(options.sleep, POLL_INTERVAL_MS, options.signal);
   }
+}
+
+function readSyncStatus(options: SyncWaitOptions): Promise<SyncProbeResult> {
+  if (options.requestedScope !== undefined) {
+    return options.syncStatus(
+      options.origin,
+      options.accessToken,
+      options.signal,
+      options.requestedScope,
+    );
+  }
+
+  return options.signal
+    ? options.syncStatus(options.origin, options.accessToken, options.signal)
+    : options.syncStatus(options.origin, options.accessToken);
 }
 
 function sandboxName(spec: SandboxSpec): string {
