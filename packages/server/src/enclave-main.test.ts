@@ -122,6 +122,20 @@ describe("readEnclaveEnv", () => {
     },
   );
 
+  it("passes requested hydration scopes into server creation", async () => {
+    const config = prepareEnclaveRun();
+    vi.stubEnv("PS_HYDRATE_SCOPES", "chatgpt.conversations");
+
+    await runEnclaveMain();
+
+    expect(serviceMocks.createServer).toHaveBeenCalledWith(
+      config,
+      expect.objectContaining({
+        hydrateScopes: ["chatgpt.conversations"],
+      }),
+    );
+  });
+
   it("uses the sandbox gateway and adds preview bypass only for its origin", async () => {
     const config = ServerConfigSchema.parse({});
     const context = {

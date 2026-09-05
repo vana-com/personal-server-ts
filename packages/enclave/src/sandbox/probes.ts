@@ -13,6 +13,7 @@ export interface SyncStatus {
   syncing?: boolean;
   lastSync?: string | null;
   pendingFiles?: number;
+  hydratedScopes?: string[];
   errors?: Array<{ message?: string }>;
   blocked?: SyncBlockedReason | null;
 }
@@ -40,6 +41,7 @@ export type SyncProbe = (
   origin: string,
   accessToken: string,
   signal?: AbortSignal,
+  requestedScope?: string,
 ) => Promise<boolean>;
 export interface SyncProbeResult {
   ready: boolean;
@@ -49,6 +51,7 @@ export type SyncStatusProbe = (
   origin: string,
   accessToken: string,
   signal?: AbortSignal,
+  requestedScope?: string,
 ) => Promise<SyncProbeResult>;
 
 export async function probeHealth(
@@ -73,14 +76,17 @@ export async function probeSync(
   origin: string,
   accessToken: string,
   signal?: AbortSignal,
+  requestedScope?: string,
 ): Promise<boolean> {
-  return (await probeSyncStatus(origin, accessToken, signal)).ready;
+  return (await probeSyncStatus(origin, accessToken, signal, requestedScope))
+    .ready;
 }
 
 export async function probeSyncStatus(
   origin: string,
   accessToken: string,
   signal?: AbortSignal,
+  requestedScope?: string,
 ): Promise<SyncProbeResult> {
   try {
     const response = await fetch(`${origin}${SYNC_STATUS_PATH}`, {
@@ -107,10 +113,7 @@ export async function probeSyncStatus(
     }
 
     return {
-      ready:
-        !status.syncing &&
-        Boolean(status.lastSync) &&
-        status.pendingFiles === 0,
+      ready: isSyncReady(status, requestedScope),
       status,
     };
   } catch (error) {
@@ -123,6 +126,16 @@ export async function probeSyncStatus(
 
     return { ready: false };
   }
+}
+
+function isSyncReady(status: SyncStatus, requestedScope?: string): boolean {
+  if (requestedScope && status.hydratedScopes?.includes(requestedScope)) {
+    return true;
+  }
+
+  return (
+    !status.syncing && Boolean(status.lastSync) && status.pendingFiles === 0
+  );
 }
 
 function requestSignal(

@@ -1,11 +1,64 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { probeSync } from "./probes.js";
+import { probeSync, probeSyncStatus } from "./probes.js";
 
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
 describe("sandbox sync probe", () => {
+  it("is ready once the requested scope is hydrated during full sync", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            enabled: true,
+            running: true,
+            syncing: true,
+            lastSync: null,
+            pendingFiles: 0,
+            hydratedScopes: ["chatgpt.conversations"],
+            errors: [],
+          }),
+          { status: 200 },
+        ),
+      ),
+    );
+
+    const result = await probeSyncStatus(
+      "http://sandbox",
+      "token",
+      undefined,
+      "chatgpt.conversations",
+    );
+
+    expect(result.ready).toBe(true);
+  });
+
+  it("uses the full-sync predicate when no requested scope is provided", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            enabled: true,
+            running: true,
+            syncing: true,
+            lastSync: null,
+            pendingFiles: 0,
+            hydratedScopes: ["chatgpt.conversations"],
+            errors: [],
+          }),
+          { status: 200 },
+        ),
+      ),
+    );
+
+    await expect(probeSyncStatus("http://sandbox", "token")).resolves.toEqual(
+      expect.objectContaining({ ready: false }),
+    );
+  });
+
   it.each([
     ["unregistered", "Register this Personal Server before syncing."],
     [

@@ -149,8 +149,13 @@ export function createDockerRuntime(
   const syncStatus =
     options.syncStatus ??
     (sync
-      ? async (origin: string, accessToken: string, signal?: AbortSignal) => ({
-          ready: await sync(origin, accessToken, signal),
+      ? async (
+          origin: string,
+          accessToken: string,
+          signal?: AbortSignal,
+          requestedScope?: string,
+        ) => ({
+          ready: await sync(origin, accessToken, signal, requestedScope),
         })
       : probeSyncStatus);
   const sleep = options.sleep ?? delay;
@@ -234,6 +239,7 @@ export function createDockerRuntime(
             origin,
             name,
             accessToken,
+            requestedScope: spec.env.PS_HYDRATE_SCOPES,
             syncStatus,
             sleep,
             now,
@@ -569,6 +575,7 @@ interface SyncWaitOptions {
   origin: string;
   name: string;
   accessToken: string;
+  requestedScope?: string;
   syncStatus: SyncStatusProbe;
   sleep: (milliseconds: number) => Promise<void>;
   now: () => number;
@@ -589,8 +596,14 @@ async function waitForSync(options: SyncWaitOptions): Promise<void> {
           options.origin,
           options.accessToken,
           options.signal,
+          options.requestedScope,
         )
-      : await options.syncStatus(options.origin, options.accessToken);
+      : await options.syncStatus(
+          options.origin,
+          options.accessToken,
+          undefined,
+          options.requestedScope,
+        );
     if (result.status) {
       options.onStatus?.(result.status);
     }

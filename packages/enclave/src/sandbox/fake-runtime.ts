@@ -155,6 +155,7 @@ export function createFakeRuntime(
             origin,
             id,
             accessToken,
+            requestedScope: spec.env.PS_HYDRATE_SCOPES,
             sync,
             sleep,
             now,
@@ -278,6 +279,7 @@ interface SyncWaitOptions {
   origin: string;
   id: string;
   accessToken: string;
+  requestedScope?: string;
   sync: SyncProbe;
   sleep: (milliseconds: number) => Promise<void>;
   now: () => number;
@@ -289,8 +291,18 @@ interface SyncWaitOptions {
 async function waitForSync(options: SyncWaitOptions): Promise<void> {
   while (
     !(options.signal
-      ? await options.sync(options.origin, options.accessToken, options.signal)
-      : await options.sync(options.origin, options.accessToken))
+      ? await options.sync(
+          options.origin,
+          options.accessToken,
+          options.signal,
+          options.requestedScope,
+        )
+      : await options.sync(
+          options.origin,
+          options.accessToken,
+          undefined,
+          options.requestedScope,
+        ))
   ) {
     throwIfAborted(options.signal);
     if (options.now() >= options.deadline) {

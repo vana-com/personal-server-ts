@@ -219,6 +219,22 @@ describe("docker sandbox runtime", () => {
     );
   });
 
+  it("passes requested hydration scopes as a non-secret environment value", async () => {
+    const docker = scriptedDocker();
+    const runtime = createDockerRuntime({ docker, health: async () => true });
+
+    await runtime.start(
+      sandboxSpec({ PS_HYDRATE_SCOPES: "chatgpt.conversations" }),
+    );
+
+    expect(docker.calls[1]?.args).toEqual(
+      expect.arrayContaining([
+        "--env",
+        "PS_HYDRATE_SCOPES=chatgpt.conversations",
+      ]),
+    );
+  });
+
   it("passes sandbox secrets through a private temporary env file", async () => {
     let envFilePath = "";
     let envFileContent = "";
@@ -251,7 +267,10 @@ describe("docker sandbox runtime", () => {
     });
 
     await runtime.start(
-      sandboxSpec({ VERCEL_PROTECTION_BYPASS: "preview-secret" }),
+      sandboxSpec({
+        VERCEL_PROTECTION_BYPASS: "preview-secret",
+        PS_HYDRATE_SCOPES: "chatgpt.conversations",
+      }),
     );
 
     expect(envFileMode).toBe(0o600);
@@ -265,6 +284,13 @@ describe("docker sandbox runtime", () => {
     expect(createArgs.join(" ")).not.toContain("preview-secret");
     expect(createArgs.join(" ")).not.toContain(ACCESS_TOKEN);
     expect(createArgs.join(" ")).not.toContain(MASTER_KEY_SIGNATURE);
+    expect(envFileContent).not.toContain("PS_HYDRATE_SCOPES");
+    expect(createArgs).toEqual(
+      expect.arrayContaining([
+        "--env",
+        "PS_HYDRATE_SCOPES=chatgpt.conversations",
+      ]),
+    );
     expect(createEnv).toBeUndefined();
     await expect(access(envFilePath)).rejects.toThrow();
   });
@@ -485,6 +511,30 @@ describe("docker sandbox runtime", () => {
       runtime.start(sandboxSpec({ SYNC_ENABLED: "true" })),
     ).rejects.toThrow("Sandbox sync failed");
     expect(docker.calls.at(-1)?.command).toBe("rm");
+  });
+
+  it("threads the requested scope into the sync readiness probe", async () => {
+    const docker = scriptedDocker();
+    const syncStatus = vi.fn().mockResolvedValue({ ready: true });
+    const runtime = createDockerRuntime({
+      docker,
+      health: async () => true,
+      syncStatus,
+    });
+
+    await runtime.start(
+      sandboxSpec({
+        SYNC_ENABLED: "true",
+        PS_HYDRATE_SCOPES: "chatgpt.conversations",
+      }),
+    );
+
+    expect(syncStatus).toHaveBeenCalledWith(
+      expect.any(String),
+      ACCESS_TOKEN,
+      undefined,
+      "chatgpt.conversations",
+    );
   });
 
   it("aborts a sync wait and removes the container", async () => {

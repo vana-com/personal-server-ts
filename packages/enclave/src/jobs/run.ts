@@ -178,6 +178,7 @@ export async function runJob(
     let sandbox;
     const acquireStartedAt = now();
     const acquireEvents = new Set<string>();
+    let hydratedScopes: string[] | undefined;
     logAcquisitionEvent(
       deps.logger,
       job.jobId,
@@ -194,6 +195,7 @@ export async function runJob(
             deps,
             accessToken,
             signature,
+            envelope.request.scope,
             (event) => {
               acquireEvents.add(event);
               logAcquisitionEvent(
@@ -202,7 +204,11 @@ export async function runJob(
                 event,
                 acquireStartedAt,
                 now(),
+                event === "synced" ? hydratedScopes : undefined,
               );
+            },
+            (status) => {
+              hydratedScopes = status.lastSyncStatus?.hydratedScopes;
             },
           );
           signature.fill(0);
@@ -220,6 +226,7 @@ export async function runJob(
             event,
             acquireStartedAt,
             now(),
+            event === "synced" ? hydratedScopes : undefined,
           );
         }
       }
@@ -566,6 +573,7 @@ function logAcquisitionEvent(
   event: "start" | "healthy" | "synced",
   startedAt: number,
   currentTime: number,
+  hydratedScopes?: string[],
 ): void {
   logger.info(
     {
@@ -573,6 +581,7 @@ function logAcquisitionEvent(
       stage: SANDBOX_ACQUIRE_STAGE,
       event,
       elapsedMs: Math.max(0, currentTime - startedAt),
+      ...(hydratedScopes ? { hydratedScopes } : {}),
     },
     "Sandbox acquisition progress",
   );
@@ -695,18 +704,22 @@ function sandboxSpec(
   deps: RunJobDeps,
   accessToken: string,
   signature: Uint8Array,
+  requestedScope: string,
   onProgress: NonNullable<SandboxSpec["onProgress"]>,
+  onStatus: NonNullable<SandboxSpec["onStatus"]>,
 ): SandboxSpec {
   return {
     userPsId: identity.userPsId,
     epoch: identity.epoch,
     image: deps.image,
     onProgress,
+    onStatus,
     env: {
       VANA_MASTER_KEY_SIGNATURE: toHex(signature),
       PS_ACCESS_TOKEN: accessToken,
       PS_SERVER_ADDRESS: identity.enclaveAddress,
       PS_SERVER_PUBLIC_KEY: identity.enclavePublicKey,
+      PS_HYDRATE_SCOPES: requestedScope,
       SYNC_ENABLED: deps.sync === "enabled" ? SYNC_ENABLED : SYNC_DISABLED,
       GATEWAY_URL: deps.gatewayUrl,
       ENCLAVE_AGENT_URL: deps.agentUrl,

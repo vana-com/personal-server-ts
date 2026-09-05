@@ -97,6 +97,8 @@ export interface ServerContext {
 
 export interface CreateServerOptions {
   rootPath?: string;
+  /** Exact owner scopes to hydrate before the first full sync pass. */
+  hydrateScopes?: string[];
   /**
    * Inference provider for the derivative compute layer. Defaults to the
    * OpenAI-compatible client on `config.inference` (env overrides:
@@ -487,6 +489,7 @@ export async function createServer(
 
     syncManager = createSyncManager(uploadDeps, downloadDeps, {
       deleteData,
+      hydrateScopes: options?.hydrateScopes,
       pendingBlobDeletions,
       transferMode: isEnclave ? "download-only" : "upload-download",
       async canSync() {
