@@ -489,6 +489,26 @@ describe("executeJob", () => {
     expect(fixture.deps.hydrateScope).toHaveBeenCalledWith(SCOPE);
   });
 
+  it("keeps SCOPE_NOT_FOUND when hydration fails", async () => {
+    const fixture = await createFixture();
+    vi.mocked(fixture.storage.findEntry).mockReturnValue(undefined);
+    fixture.deps.hydrateScope = vi
+      .fn()
+      .mockRejectedValue(new Error("gateway unavailable"));
+
+    await expectFailure(fixture, "SCOPE_NOT_FOUND");
+
+    expect(fixture.deps.hydrateScope).toHaveBeenCalledOnce();
+    expect(fixture.deps.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jobId: JOB_ID,
+        scope: SCOPE,
+        error: "Error: gateway unavailable",
+      }),
+      "Job scope hydration failed",
+    );
+  });
+
   it("hydrates once before preserving a pinned version mismatch", async () => {
     const fixture = await createFixture();
     fixture.envelope.request.pinnedVersion = "8";
@@ -499,6 +519,27 @@ describe("executeJob", () => {
 
     expect(fixture.deps.hydrateScope).toHaveBeenCalledOnce();
     expect(fixture.deps.hydrateScope).toHaveBeenCalledWith(SCOPE);
+  });
+
+  it("keeps VERSION_MISMATCH when pinned-version hydration fails", async () => {
+    const fixture = await createFixture();
+    fixture.envelope.request.pinnedVersion = "8";
+    fixture.envelope.auth = await signRequest(fixture.envelope.request);
+    fixture.deps.hydrateScope = vi
+      .fn()
+      .mockRejectedValue(new Error("gateway unavailable"));
+
+    await expectFailure(fixture, "VERSION_MISMATCH", true);
+
+    expect(fixture.deps.hydrateScope).toHaveBeenCalledOnce();
+    expect(fixture.deps.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jobId: JOB_ID,
+        scope: SCOPE,
+        error: "Error: gateway unavailable",
+      }),
+      "Job scope hydration failed",
+    );
   });
 
   it("streams a multi-chunk result from a temporary file and removes it", async () => {

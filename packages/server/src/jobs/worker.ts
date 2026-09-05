@@ -59,6 +59,7 @@ const UNKNOWN_METADATA = "unknown";
 const MILLISECONDS_PER_SECOND = 1_000;
 const JOB_EXECUTION_FAILED_LOG = "Enclave job execution failed";
 const JOB_EXECUTION_PROGRESS_LOG = "Enclave job execution progress";
+const JOB_SCOPE_HYDRATION_FAILED_LOG = "Job scope hydration failed";
 const RESULT_SIGNING_PATH = "/agent/v1/job-results/sign";
 const RESULT_SIGNING_TIMEOUT_MS = 15_000;
 const RESULT_UPLOAD_TIMEOUT_MS = 120_000;
@@ -224,9 +225,16 @@ async function executeJobUnsafe(
   let hydrationAttempted = false;
   let entry = deps.storage.findEntry({ scope: request.scope });
   if (!entry && deps.hydrateScope) {
-    await deps.hydrateScope(request.scope);
     hydrationAttempted = true;
-    entry = deps.storage.findEntry({ scope: request.scope });
+    try {
+      await deps.hydrateScope(request.scope);
+      entry = deps.storage.findEntry({ scope: request.scope });
+    } catch (error) {
+      deps.logger.warn(
+        { jobId, scope: request.scope, error: errorSummary(error) },
+        JOB_SCOPE_HYDRATION_FAILED_LOG,
+      );
+    }
   }
 
   const resultMaxBytes =
@@ -244,9 +252,22 @@ async function executeJobUnsafe(
     deps.hydrateScope &&
     !hydrationAttempted
   ) {
-    await deps.hydrateScope(request.scope);
-    entry = deps.storage.findEntry({ scope: request.scope });
-    selected = await selectJobScope(deps, request.scope, entry, resultMaxBytes);
+    hydrationAttempted = true;
+    try {
+      await deps.hydrateScope(request.scope);
+      entry = deps.storage.findEntry({ scope: request.scope });
+      selected = await selectJobScope(
+        deps,
+        request.scope,
+        entry,
+        resultMaxBytes,
+      );
+    } catch (error) {
+      deps.logger.warn(
+        { jobId, scope: request.scope, error: errorSummary(error) },
+        JOB_SCOPE_HYDRATION_FAILED_LOG,
+      );
+    }
   }
   if (
     request.pinnedVersion !== null &&
