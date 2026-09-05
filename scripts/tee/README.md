@@ -10,6 +10,7 @@ export NODE_SECRET="$(openssl rand -hex 32)"
 export NODE_ID=node-1
 export GATEWAY_URL=https://gateway.example
 export PS_IMAGE=vanaorg/personal-server@sha256:...
+export PS_IMAGE_REF=<same-40-hex-commit-sha-as-GIT_REF>
 scripts/tee/provision.sh <name> --ref <40-hex-commit-sha>
 scripts/tee/replicate.sh <name> <source-cvm-uuid> --node-id <phala-placement-id>
 scripts/tee/destroy.sh <uuid>
@@ -21,8 +22,12 @@ agent receives only the dstack socket and reaches the privileged nested Docker
 runtime over the private compose network. `AGENT_IMAGE` and `DIND_IMAGE` must
 be digest-pinned base images; provisioning rejects mutable tags. `PS_IMAGE`
 must be a digest built from this branch's root `Dockerfile`; do not use a tag.
-An out-of-date published digest may lack runtime dependencies and exit with
-errors such as `ERR_MODULE_NOT_FOUND @opendatalabs/vana-sdk`.
+Run the Docker workflow on the branch, then download its `images.env` artifact
+to `deploy/dstack/images.env` or copy the two lines from the job summary. The
+scripts source that file when present, with explicit environment values taking
+precedence. `PS_IMAGE_REF` records the image's source commit and must match the
+40-hex `GIT_REF`; if it is omitted, the scripts warn that provenance is
+unverified.
 
 For the enclave compose, `--ref` must be an immutable 40-hex commit SHA. The
 level-B clone bootstrap fetches that exact commit and verifies the checkout;
