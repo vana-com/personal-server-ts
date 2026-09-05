@@ -2,20 +2,11 @@ name: Build and Push Docker Image
 
 on:
   workflow_dispatch:
-    inputs:
-      ref:
-        description: Git ref to build
-        required: false
-        default: ${{ github.ref }}
   push:
     branches:
       - main
       - "feat/**"
       - "perf/**"
-    paths-ignore:
-      - "*.md"
-      - "docs/**"
-      - ".github/workflows/!(docker.yml)"
 
 concurrency:
   group: docker-build-${{ github.ref }}
@@ -34,24 +25,44 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_SERVICE_ACCOUNT_PAT }}
 
+      - name: Prepare image tags
+        id: tags
+        env:
+          IMAGE_NAME: ${{ vars.DOCKERHUB_USERNAME }}/personal-server
+          IMAGE_SHA: ${{ github.sha }}
+          PUBLISH_LATEST: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          {
+            echo 'tags<<EOF'
+            printf '%s:%s\n' "$IMAGE_NAME" "$IMAGE_SHA"
+            if [[ "$PUBLISH_LATEST" == "true" ]]; then
+              printf '%s:latest\n' "$IMAGE_NAME"
+            fi
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - uses: docker/build-push-action@v7
         id: build
         with:
           context: .
           push: true
           platforms: linux/amd64
-          tags: |
-            ${{ vars.DOCKERHUB_USERNAME }}/personal-server:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/personal-server:latest', vars.DOCKERHUB_USERNAME) || '' }}
+          tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Record image digest
+        env:
+          PS_IMAGE: ${{ vars.DOCKERHUB_USERNAME }}/personal-server@${{ steps.build.outputs.digest }}
+          PS_IMAGE_REF: ${{ github.sha }}
         run: |
-          printf '%s\n' \
-            'PS_IMAGE=${{ vars.DOCKERHUB_USERNAME }}/personal-server@${{ steps.build.outputs.digest }}' \
-            'PS_IMAGE_REF=${{ github.sha }}' \
-            | tee images.env >> "$GITHUB_STEP_SUMMARY"
+          printf 'PS_IMAGE=%s\nPS_IMAGE_REF=%s\n' \
+            "$PS_IMAGE" "$PS_IMAGE_REF" > images.env
+          {
+            echo '```text'
+            cat images.env
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v6
         with:
