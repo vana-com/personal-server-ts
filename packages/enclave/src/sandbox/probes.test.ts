@@ -60,6 +60,41 @@ describe("sandbox sync probe", () => {
   });
 
   it.each([
+    ["another hydrated scope", ["instagram.profile"]],
+    ["an older server response", undefined],
+  ])(
+    "uses the full-sync predicate for a requested scope with %s",
+    async (_case, hydratedScopes) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue(
+          new Response(
+            JSON.stringify({
+              enabled: true,
+              running: true,
+              syncing: true,
+              lastSync: null,
+              pendingFiles: 0,
+              ...(hydratedScopes === undefined ? {} : { hydratedScopes }),
+              errors: [],
+            }),
+            { status: 200 },
+          ),
+        ),
+      );
+
+      await expect(
+        probeSyncStatus(
+          "http://sandbox",
+          "token",
+          undefined,
+          "chatgpt.conversations",
+        ),
+      ).resolves.toEqual(expect.objectContaining({ ready: false }));
+    },
+  );
+
+  it.each([
     ["unregistered", "Register this Personal Server before syncing."],
     [
       "registration_check_failed",
