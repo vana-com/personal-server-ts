@@ -4,7 +4,7 @@
  * DSTACK_FAKE=1 selects the fake and DSTACK_FAKE_APP_ID names its app.
  */
 
-import { agentConfigFromEnv } from "./bootstrap.js";
+import { agentConfigFromEnv, resolveSandboxAgentUrl } from "./bootstrap.js";
 import { drainWithTimeout } from "./lifecycle.js";
 import { createAgentServer, type AgentJobsControl } from "./http.js";
 import { startClaimLoop, type JobLogger } from "../jobs/claim-loop.js";
@@ -39,7 +39,7 @@ async function main(): Promise<void> {
     const { client, host, jobs, port, secret } = agentConfigFromEnv(
       process.env,
     );
-    const jobsControl = jobs ? await startJobs(client, jobs) : undefined;
+    const jobsControl = jobs ? await startJobs(client, jobs, port) : undefined;
     const server = createAgentServer({
       client,
       secret,
@@ -64,7 +64,14 @@ async function main(): Promise<void> {
 async function startJobs(
   client: ReturnType<typeof agentConfigFromEnv>["client"],
   config: NonNullable<ReturnType<typeof agentConfigFromEnv>["jobs"]>,
+  agentPort: number,
 ): Promise<AgentJobsControl> {
+  const sandboxAgentUrl = await resolveSandboxAgentUrl({
+    ...(config.sandboxAgentUrl ? { override: config.sandboxAgentUrl } : {}),
+    dockerHost: config.dockerHost,
+    agentPort,
+  });
+  CONSOLE_LOGGER.info({ sandboxAgentUrl }, "Sandbox agent URL resolved");
   const runtime = createRuntime(config);
   await runtime.reconcile();
   const registry = createSandboxRegistry({
@@ -92,7 +99,7 @@ async function startJobs(
         image: config.image,
         gatewayUrl: config.gatewayUrl,
         storageApiUrl: config.storageApiUrl,
-        agentUrl: config.sandboxAgentUrl,
+        agentUrl: sandboxAgentUrl,
         chainId: config.chainId,
         contracts: config.contracts,
         ...(config.gatewayBypassSecret

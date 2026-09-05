@@ -487,6 +487,7 @@ async function startAgent(
         ENCLAVE_AGENT_SECRET: ctx.agentSecret,
         ENCLAVE_AGENT_HOST: AGENT_HOST,
         ENCLAVE_AGENT_PORT: String(port),
+        SANDBOX_AGENT_URL: `http://${AGENT_HOST}:${port}`,
         ...(node
           ? {
               GATEWAY_URL: ctx.gatewayUrl,

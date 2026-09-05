@@ -1,4 +1,5 @@
 import os from "node:os";
+import { createConnection, isIPv4 } from "node:net";
 import type { DstackClient } from "../dstack/client.js";
 import { isAddress } from "viem";
 import { createFakeDstackClient } from "../dstack/fake.js";
@@ -21,7 +22,8 @@ const MAX_PORT = 65_535;
 const DEFAULT_DOCKER_HOST = "tcp://sandbox-runtime:2375";
 const DEFAULT_SANDBOX_RUNTIME = "docker";
 const DEFAULT_SYNC_MODE = "enabled";
-const DEFAULT_SANDBOX_AGENT_URL = "http://agent:8787";
+const DEFAULT_DOCKER_PORT = 2_375;
+const ROUTE_RESOLUTION_TIMEOUT_MS = 5_000;
 const MILLISECONDS_PER_SECOND = 1_000;
 const MIN_POSITIVE_INTEGER = 1;
 const MIN_NONNEGATIVE_INTEGER = 0;
@@ -61,7 +63,7 @@ export type SandboxSyncMode = "enabled" | "disabled";
 export interface AgentJobsConfig {
   gatewayUrl: string;
   storageApiUrl: string;
-  sandboxAgentUrl: string;
+  sandboxAgentUrl?: string;
   chainId: SupportedChainId;
   contracts: SandboxContracts;
   nodeId: string;
@@ -201,7 +203,9 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
   return {
     gatewayUrl: env.GATEWAY_URL,
     storageApiUrl: storageApiUrlValue,
-    sandboxAgentUrl: env.SANDBOX_AGENT_URL ?? DEFAULT_SANDBOX_AGENT_URL,
+    ...(env.SANDBOX_AGENT_URL
+      ? { sandboxAgentUrl: env.SANDBOX_AGENT_URL }
+      : {}),
     chainId,
     contracts,
     nodeId: env.NODE_ID,
@@ -226,6 +230,95 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
       ? { gatewayBypassSecret: env.VERCEL_PROTECTION_BYPASS }
       : {}),
   };
+}
+
+export interface SandboxAgentUrlOptions {
+  override?: string;
+  dockerHost: string;
+  agentPort: number;
+}
+
+interface SandboxAgentUrlDeps {
+  routeAddress?: (host: string, port: number) => Promise<string>;
+  networkInterfaces?: typeof os.networkInterfaces;
+}
+
+export async function resolveSandboxAgentUrl(
+  options: SandboxAgentUrlOptions,
+  deps: SandboxAgentUrlDeps = {},
+): Promise<string> {
+  if (options.override) {
+    return options.override;
+  }
+
+  let dockerUrl: URL;
+  try {
+    dockerUrl = new URL(options.dockerHost);
+  } catch {
+    throw new Error("DOCKER_HOST must be a valid URL");
+  }
+  const dockerPort = dockerUrl.port
+    ? Number(dockerUrl.port)
+    : DEFAULT_DOCKER_PORT;
+  const routeAddress = deps.routeAddress ?? localAddressForRoute;
+  let address: string | undefined;
+  try {
+    const routedAddress = await routeAddress(dockerUrl.hostname, dockerPort);
+    if (isIPv4(routedAddress)) {
+      address = routedAddress;
+    }
+  } catch {
+    // Fall back to the first externally reachable IPv4 on unusual hosts.
+  }
+  address ??= firstNonLoopbackIpv4(
+    (deps.networkInterfaces ?? os.networkInterfaces)(),
+  );
+  if (!address) {
+    throw new Error("Could not resolve an IPv4 address reachable by sandboxes");
+  }
+
+  return `http://${address}:${options.agentPort}`;
+}
+
+function localAddressForRoute(host: string, port: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection({ host, port });
+    let settled = false;
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const address = socket.localAddress;
+      socket.destroy();
+      if (error) {
+        reject(error);
+      } else if (address) {
+        resolve(address);
+      } else {
+        reject(new Error("Route did not select a local address"));
+      }
+    };
+    const timer = setTimeout(
+      () => finish(new Error("Timed out resolving the Docker host route")),
+      ROUTE_RESOLUTION_TIMEOUT_MS,
+    );
+    timer.unref();
+    socket.once("connect", () => finish());
+    socket.once("error", finish);
+  });
+}
+
+function firstNonLoopbackIpv4(
+  interfaces: ReturnType<typeof os.networkInterfaces>,
+): string | undefined {
+  for (const addresses of Object.values(interfaces)) {
+    const address = addresses?.find(
+      (candidate) => !candidate.internal && candidate.family === "IPv4",
+    );
+    if (address) return address.address;
+  }
+
+  return undefined;
 }
 
 function readMemory(value: string | undefined): string {

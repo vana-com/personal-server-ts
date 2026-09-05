@@ -1,5 +1,5 @@
 import os from "node:os";
-import { agentConfigFromEnv } from "./bootstrap.js";
+import { agentConfigFromEnv, resolveSandboxAgentUrl } from "./bootstrap.js";
 
 const TAGGED_IMAGE = "personal-server:test";
 const DIGEST_IMAGE = `personal-server@sha256:${"a".repeat(64)}`;
@@ -53,6 +53,7 @@ describe("agentConfigFromEnv", () => {
       NODE_SECRET: "node-secret",
       PS_IMAGE: TAGGED_IMAGE,
       SANDBOX_RUNTIME: "fake",
+      SANDBOX_AGENT_URL: "http://127.0.0.1:9876",
       SANDBOX_FAKE_ROOT: "/tmp/sandboxes",
       PS_ENTRY: "/tmp/server.js",
       SANDBOX_MAX: "4",
@@ -78,6 +79,7 @@ describe("agentConfigFromEnv", () => {
       nodeId: "node-1",
       nodeSecret: "node-secret",
       runtime: "fake",
+      sandboxAgentUrl: "http://127.0.0.1:9876",
       image: TAGGED_IMAGE,
       sandboxMax: 4,
       idleTtlMs: 9_000,
@@ -93,7 +95,6 @@ describe("agentConfigFromEnv", () => {
       sandboxDebug: true,
       gatewayBypassSecret: "preview-secret",
       storageApiUrl: "https://storage-dev.vana.org",
-      sandboxAgentUrl: "http://agent:8787",
       chainId: MAINNET_CHAIN_ID,
       contracts: {
         dataRegistry: DATA_REGISTRY,
@@ -219,6 +220,37 @@ describe("agentConfigFromEnv", () => {
       sandboxPidsLimit: 256,
       sandboxDebug: false,
     });
+  });
+
+  it("resolves the sandbox agent URL through the Docker host route", async () => {
+    const routeAddress = vi.fn().mockResolvedValue("172.19.0.3");
+
+    await expect(
+      resolveSandboxAgentUrl(
+        {
+          dockerHost: "tcp://sandbox-runtime:2375",
+          agentPort: 8787,
+        },
+        { routeAddress },
+      ),
+    ).resolves.toBe("http://172.19.0.3:8787");
+    expect(routeAddress).toHaveBeenCalledWith("sandbox-runtime", 2375);
+  });
+
+  it("keeps an explicit sandbox agent URL override", async () => {
+    const routeAddress = vi.fn();
+
+    await expect(
+      resolveSandboxAgentUrl(
+        {
+          override: "http://127.0.0.1:9876",
+          dockerHost: "tcp://sandbox-runtime:2375",
+          agentPort: 8787,
+        },
+        { routeAddress },
+      ),
+    ).resolves.toBe("http://127.0.0.1:9876");
+    expect(routeAddress).not.toHaveBeenCalled();
   });
 
   it("clamps the default sandbox CPUs to the host", () => {
