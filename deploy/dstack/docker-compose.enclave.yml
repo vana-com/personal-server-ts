@@ -8,12 +8,11 @@
 #                                      [ps-<userPsId>-<epoch>, tmpfs /data,
 #                                       no dstack or Docker sockets]
 #
-# Production uses a digest-pinned agent image under one approved compose hash
-# (architecture decision 23). This clone bootstrap is for level-B testing only.
+# Production pins agent and sandbox image digests under one approved compose
+# hash (architecture decision 23), then checks out the requested source commit.
 #
 # PS_IMAGE must be a digest (vanaorg/personal-server@sha256:...) built from
-# this branch's Dockerfile. The currently published digest fails at startup
-# with ERR_MODULE_NOT_FOUND for @opendatalabs/vana-sdk.
+# this branch's Dockerfile.
 services:
   agent:
     image: "${AGENT_IMAGE:?AGENT_IMAGE must be a digest-pinned image reference}"
@@ -62,6 +61,18 @@ services:
       - |
         date -u +%FT%TZ
         apk add --no-cache docker-cli git
+        : "$${PS_IMAGE:?PS_IMAGE must be set}"
+        for pull_attempt in 1 2 3; do
+          if docker pull "$$PS_IMAGE"; then
+            break
+          fi
+          if [ "$$pull_attempt" -eq 3 ]; then
+            echo "Failed to pull PS_IMAGE after 3 attempts: $$PS_IMAGE" >&2
+            exit 1
+          fi
+          echo "Failed to pull PS_IMAGE (attempt $$pull_attempt of 3); retrying in 10 seconds" >&2
+          sleep 10
+        done
         : "$${GIT_REF:?GIT_REF must be a 40-hex commit SHA}"
         git init .
         if git remote get-url origin >/dev/null 2>&1; then

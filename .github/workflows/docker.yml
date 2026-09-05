@@ -1,15 +1,15 @@
 name: Build and Push Docker Image
 
 on:
+  workflow_dispatch:
   push:
-    branches: [main]
-    paths-ignore:
-      - "*.md"
-      - "docs/**"
-      - ".github/workflows/!(docker.yml)"
+    branches:
+      - main
+      - "feat/**"
+      - "perf/**"
 
 concurrency:
-  group: docker-build
+  group: docker-build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -25,12 +25,46 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_SERVICE_ACCOUNT_PAT }}
 
+      - name: Prepare image tags
+        id: tags
+        env:
+          IMAGE_NAME: ${{ vars.DOCKERHUB_USERNAME }}/personal-server
+          IMAGE_SHA: ${{ github.sha }}
+          PUBLISH_LATEST: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          {
+            echo 'tags<<EOF'
+            printf '%s:%s\n' "$IMAGE_NAME" "$IMAGE_SHA"
+            if [[ "$PUBLISH_LATEST" == "true" ]]; then
+              printf '%s:latest\n' "$IMAGE_NAME"
+            fi
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - uses: docker/build-push-action@v7
+        id: build
         with:
           context: .
           push: true
-          tags: |
-            ${{ vars.DOCKERHUB_USERNAME }}/personal-server:latest
-            ${{ vars.DOCKERHUB_USERNAME }}/personal-server:${{ github.sha }}
+          platforms: linux/amd64
+          tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Record image digest
+        env:
+          PS_IMAGE: ${{ vars.DOCKERHUB_USERNAME }}/personal-server@${{ steps.build.outputs.digest }}
+          PS_IMAGE_REF: ${{ github.sha }}
+        run: |
+          printf 'PS_IMAGE=%s\nPS_IMAGE_REF=%s\n' \
+            "$PS_IMAGE" "$PS_IMAGE_REF" > images.env
+          {
+            echo '```text'
+            cat images.env
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: images.env
+          path: images.env

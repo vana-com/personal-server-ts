@@ -76,22 +76,27 @@ else
   : "${NODE_SECRET:?NODE_SECRET must be set in the environment}"
   : "${NODE_ID:?NODE_ID must be set in the environment}"
   : "${GATEWAY_URL:?GATEWAY_URL must be set in the environment}"
-  if [[ ${compose##*/} == docker-compose.enclave.inline.yml && -z ${PS_IMAGE:-} ]]; then
-    PS_IMAGE=personal-server:local
+  if [[ ! $git_ref =~ ^[[:xdigit:]]{40}$ ]]; then
+    echo "--ref must be a 40-hex commit SHA for the enclave compose; branch names are mutable" >&2
+    exit 1
   fi
-  : "${PS_IMAGE:?PS_IMAGE must be set in the environment}"
   if [[ ${compose##*/} == docker-compose.enclave.inline.yml ]]; then
+    if [[ -z ${PS_IMAGE:-} ]]; then
+      PS_IMAGE=personal-server:local
+    fi
     if [[ ! $PS_IMAGE =~ ^[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+$ ]]; then
       echo "PS_IMAGE must be a local image tag such as vanaorg/personal-server:level-b" >&2
       exit 1
     fi
-  elif [[ ! $PS_IMAGE =~ ^.+@sha256:[[:xdigit:]]{64}$ ]]; then
-    echo "PS_IMAGE must be an image digest such as vanaorg/personal-server@sha256:<64 hex characters>" >&2
-    exit 1
-  fi
-  if [[ ! $git_ref =~ ^[[:xdigit:]]{40}$ ]]; then
-    echo "--ref must be a 40-hex commit SHA for the enclave compose; branch names are mutable" >&2
-    exit 1
+  else
+    load_images_env "$repo_root/deploy/dstack/images.env"
+    : "${PS_IMAGE:?PS_IMAGE must be set in the environment}"
+    if [[ ! $PS_IMAGE =~ ^.+@sha256:[[:xdigit:]]{64}$ ]]; then
+      echo "PS_IMAGE must be an image digest such as vanaorg/personal-server@sha256:<64 hex characters>" >&2
+      exit 1
+    fi
+    GIT_REF=$git_ref
+    assert_ps_image_ref
   fi
 fi
 

@@ -7,6 +7,47 @@ readonly CURL_CONNECT_TIMEOUT_SECONDS=5
 readonly CURL_MAX_TIME_SECONDS=10
 readonly AGENT_LOG_LINES=50
 
+load_images_env() {
+  local images_env=$1
+  local line
+
+  [[ -f $images_env ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == PS_IMAGE=* ]]; then
+      if [[ $line =~ ^PS_IMAGE=[A-Za-z0-9._/:-]+@sha256:[0-9a-f]{64}$ ]]; then
+        if [[ ${PS_IMAGE+x} != x ]]; then
+          PS_IMAGE=${line#PS_IMAGE=}
+        fi
+      else
+        echo "warning: ignoring malformed PS_IMAGE line in $images_env." >&2
+      fi
+    elif [[ $line == PS_IMAGE_REF=* ]]; then
+      if [[ $line =~ ^PS_IMAGE_REF=[0-9a-f]{40}$ ]]; then
+        if [[ ${PS_IMAGE_REF+x} != x ]]; then
+          PS_IMAGE_REF=${line#PS_IMAGE_REF=}
+        fi
+      else
+        echo "warning: ignoring malformed PS_IMAGE_REF line in $images_env." >&2
+      fi
+    fi
+  done <"$images_env"
+}
+
+assert_ps_image_ref() {
+  if [[ -z ${PS_IMAGE_REF:-} ]]; then
+    echo "warning: PS_IMAGE_REF is not set; cannot verify that PS_IMAGE matches GIT_REF." >&2
+    return 0
+  fi
+  if [[ ! ${GIT_REF:-} =~ ^[[:xdigit:]]{40}$ ]]; then
+    echo "GIT_REF must be a 40-hex commit SHA when PS_IMAGE_REF is set." >&2
+    return 1
+  fi
+  if [[ $PS_IMAGE_REF != "$GIT_REF" ]]; then
+    echo "PS_IMAGE_REF '$PS_IMAGE_REF' must match GIT_REF '$GIT_REF'." >&2
+    return 1
+  fi
+}
+
 validate_image_digests() {
   : "${AGENT_IMAGE:?AGENT_IMAGE must be set to a digest-pinned image reference}"
   : "${DIND_IMAGE:?DIND_IMAGE must be set to a digest-pinned image reference}"
