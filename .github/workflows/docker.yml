@@ -1,15 +1,24 @@
 name: Build and Push Docker Image
 
 on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build
+        required: false
+        default: ${{ github.ref }}
   push:
-    branches: [main]
+    branches:
+      - main
+      - "feat/**"
+      - "perf/**"
     paths-ignore:
       - "*.md"
       - "docs/**"
       - ".github/workflows/!(docker.yml)"
 
 concurrency:
-  group: docker-build
+  group: docker-build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -26,11 +35,25 @@ jobs:
           password: ${{ secrets.DOCKERHUB_SERVICE_ACCOUNT_PAT }}
 
       - uses: docker/build-push-action@v7
+        id: build
         with:
           context: .
           push: true
+          platforms: linux/amd64
           tags: |
-            ${{ vars.DOCKERHUB_USERNAME }}/personal-server:latest
             ${{ vars.DOCKERHUB_USERNAME }}/personal-server:${{ github.sha }}
+            ${{ github.ref == 'refs/heads/main' && format('{0}/personal-server:latest', vars.DOCKERHUB_USERNAME) || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Record image digest
+        run: |
+          printf '%s\n' \
+            'PS_IMAGE=${{ vars.DOCKERHUB_USERNAME }}/personal-server@${{ steps.build.outputs.digest }}' \
+            'PS_IMAGE_REF=${{ github.sha }}' \
+            | tee images.env >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: images.env
+          path: images.env
