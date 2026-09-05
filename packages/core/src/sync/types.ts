@@ -10,6 +10,8 @@ export interface SyncStatus {
   lastSync: string | null; // ISO 8601
   lastProcessedTimestamp: string | null;
   pendingFiles: number;
+  /** Exact scopes hydrated independently of the registry cursor. */
+  hydratedScopes: string[];
   errors: SyncError[];
 }
 

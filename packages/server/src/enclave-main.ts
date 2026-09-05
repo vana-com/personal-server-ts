@@ -126,6 +126,7 @@ export async function runEnclaveMain(): Promise<void> {
   });
   const context = await createServer(config, {
     rootPath,
+    hydrateScopes: readHydrateScopes(process.env.PS_HYDRATE_SCOPES),
     ownerSignature: enclaveEnv.ownerSignature,
     serverAccount,
     profile: "enclave",
@@ -154,6 +155,18 @@ export async function runEnclaveMain(): Promise<void> {
   };
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
+}
+
+function readHydrateScopes(value: string | undefined): string[] | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const scopes = [
+    ...new Set(value.split(",").map((scope) => scope.trim())),
+  ].filter(Boolean);
+
+  return scopes.length > 0 ? scopes : undefined;
 }
 
 function assertHttpUrl(value: string, name: string): void {

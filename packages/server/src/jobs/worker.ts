@@ -25,6 +25,7 @@ import type {
   DataStoragePort,
   ProtocolGatewayPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
+import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
 import {
   verifyDataReadPolicy,
   verifySignedArtifacts,
@@ -58,6 +59,7 @@ const UNKNOWN_METADATA = "unknown";
 const MILLISECONDS_PER_SECOND = 1_000;
 const JOB_EXECUTION_FAILED_LOG = "Enclave job execution failed";
 const JOB_EXECUTION_PROGRESS_LOG = "Enclave job execution progress";
+const JOB_SCOPE_HYDRATION_FAILED_LOG = "Job scope hydration failed";
 const RESULT_SIGNING_PATH = "/agent/v1/job-results/sign";
 const RESULT_SIGNING_TIMEOUT_MS = 15_000;
 const RESULT_UPLOAD_TIMEOUT_MS = 120_000;
@@ -81,6 +83,8 @@ export interface JobWorkerDeps {
   logger: Logger;
   accessLogWriter: AccessLogWriter;
   scopeDeletions?: ScopeDeletionTracker;
+  /** Refresh one exact scope before retrying a local read selection. */
+  hydrateScope?: (scope: string) => Promise<void>;
   resultMaxBytes?: number;
   resultTempDir?: string;
   resultUpload: {
@@ -218,39 +222,56 @@ async function executeJobUnsafe(
     );
   }
 
-  const entry = deps.storage.findEntry({ scope: request.scope });
-  try {
-    await assertScopeNotDeleted(
-      { scopeDeletions: deps.scopeDeletions, serverOwner: deps.serverOwner },
-      request.scope,
-      entry,
-    );
-  } catch (error) {
-    if (error instanceof DataDeletedError) {
-      throw new JobFailure("SCOPE_NOT_FOUND", "scope not found", false);
+  let hydrationAttempted = false;
+  let entry = deps.storage.findEntry({ scope: request.scope });
+  if (!entry && deps.hydrateScope) {
+    hydrationAttempted = true;
+    try {
+      await deps.hydrateScope(request.scope);
+      entry = deps.storage.findEntry({ scope: request.scope });
+    } catch (error) {
+      deps.logger.warn(
+        { jobId, scope: request.scope, error: errorSummary(error) },
+        JOB_SCOPE_HYDRATION_FAILED_LOG,
+      );
     }
+  }
 
-    throw error;
-  }
-  if (!entry) {
-    throw new JobFailure("SCOPE_NOT_FOUND", "scope not found", false);
-  }
   const resultMaxBytes =
     deps.resultMaxBytes ??
     readJobResultMaxBytes(process.env.JOB_RESULT_MAX_BYTES);
-  if (entry.sizeBytes > resultMaxBytes) {
-    throw new JobFailure(
-      "RESULT_TOO_LARGE",
-      `job result is ${entry.sizeBytes} bytes; limit is ${resultMaxBytes} bytes`,
-      false,
-    );
-  }
-  const localVersion = await deps.storage.findLatestVersionByScope(
+  let selected = await selectJobScope(
+    deps,
     request.scope,
+    entry,
+    resultMaxBytes,
   );
   if (
     request.pinnedVersion !== null &&
-    String(localVersion) !== request.pinnedVersion
+    String(selected.localVersion) !== request.pinnedVersion &&
+    deps.hydrateScope &&
+    !hydrationAttempted
+  ) {
+    hydrationAttempted = true;
+    try {
+      await deps.hydrateScope(request.scope);
+      entry = deps.storage.findEntry({ scope: request.scope });
+      selected = await selectJobScope(
+        deps,
+        request.scope,
+        entry,
+        resultMaxBytes,
+      );
+    } catch (error) {
+      deps.logger.warn(
+        { jobId, scope: request.scope, error: errorSummary(error) },
+        JOB_SCOPE_HYDRATION_FAILED_LOG,
+      );
+    }
+  }
+  if (
+    request.pinnedVersion !== null &&
+    String(selected.localVersion) !== request.pinnedVersion
   ) {
     throw new JobFailure("VERSION_MISMATCH", "scope version mismatch", true);
   }
@@ -259,10 +280,14 @@ async function executeJobUnsafe(
     v: JOB_PROTOCOL_VERSION,
     jobId,
     scope: request.scope,
-    version: localVersion === 0 ? null : String(localVersion),
+    version: selected.localVersion === 0 ? null : String(selected.localVersion),
     contentType: JSON_CONTENT_TYPE,
   };
-  const body = await openRawReadBodyStream(deps.storage, request.scope, entry);
+  const body = await openRawReadBodyStream(
+    deps.storage,
+    request.scope,
+    selected.entry,
+  );
   const sealed = await sealJobResultStream(
     result,
     request.builderPublicKey,
@@ -330,7 +355,11 @@ async function executeJobUnsafe(
       userAgent: UNKNOWN_METADATA,
     });
     deps.logger.info(
-      { jobId: request.jobId, scope: request.scope, version: localVersion },
+      {
+        jobId: request.jobId,
+        scope: request.scope,
+        version: selected.localVersion,
+      },
       "Enclave job read served",
     );
     logExecutionStep(deps, jobId, "done", executionStartedAt);
@@ -339,6 +368,46 @@ async function executeJobUnsafe(
   } finally {
     await rm(tempDirectory, { recursive: true, force: true });
   }
+}
+
+interface SelectedJobScope {
+  entry: IndexEntry;
+  localVersion: number;
+}
+
+async function selectJobScope(
+  deps: JobWorkerDeps,
+  scope: string,
+  entry: IndexEntry | undefined,
+  resultMaxBytes: number,
+): Promise<SelectedJobScope> {
+  try {
+    await assertScopeNotDeleted(
+      { scopeDeletions: deps.scopeDeletions, serverOwner: deps.serverOwner },
+      scope,
+      entry,
+    );
+  } catch (error) {
+    if (error instanceof DataDeletedError) {
+      throw new JobFailure("SCOPE_NOT_FOUND", "scope not found", false);
+    }
+
+    throw error;
+  }
+  if (!entry) {
+    throw new JobFailure("SCOPE_NOT_FOUND", "scope not found", false);
+  }
+  if (entry.sizeBytes > resultMaxBytes) {
+    throw new JobFailure(
+      "RESULT_TOO_LARGE",
+      `job result is ${entry.sizeBytes} bytes; limit is ${resultMaxBytes} bytes`,
+      false,
+    );
+  }
+
+  const localVersion = await deps.storage.findLatestVersionByScope(scope);
+
+  return { entry, localVersion };
 }
 
 export function readJobResultMaxBytes(value: string | undefined): number {

@@ -61,6 +61,7 @@ interface Fixture {
 
 class MemoryRuntime implements SandboxRuntime {
   specs: SandboxSpec[] = [];
+  hydratedScopes?: string[];
 
   constructor(private readonly origin: string) {}
 
@@ -68,6 +69,13 @@ class MemoryRuntime implements SandboxRuntime {
 
   async start(spec: SandboxSpec): Promise<SandboxHandle> {
     this.specs.push(spec);
+    if (this.hydratedScopes) {
+      spec.onStatus?.({
+        containerId: "sandbox-1",
+        createdAt: new Date(NOW_MS).toISOString(),
+        lastSyncStatus: { hydratedScopes: this.hydratedScopes },
+      });
+    }
 
     return { id: "sandbox-1", origin: this.origin };
   }
@@ -295,6 +303,7 @@ describe("runJob", () => {
         VANA_MASTER_KEY_SIGNATURE: `0x${"07".repeat(65)}`,
         PS_SERVER_ADDRESS: fixture.identity.enclaveAddress,
         PS_SERVER_PUBLIC_KEY: fixture.identity.enclavePublicKey,
+        PS_HYDRATE_SCOPES: "profile.email",
         SYNC_ENABLED: "false",
         GATEWAY_URL: "https://gateway.example",
         ENCLAVE_AGENT_URL: AGENT_URL,
@@ -318,6 +327,7 @@ describe("runJob", () => {
         "PS_ACCESS_TOKEN",
         "PS_SERVER_ADDRESS",
         "PS_SERVER_PUBLIC_KEY",
+        "PS_HYDRATE_SCOPES",
         "SYNC_ENABLED",
         "VANA_MASTER_KEY_SIGNATURE",
         "VERCEL_PROTECTION_BYPASS",
@@ -358,6 +368,24 @@ describe("runJob", () => {
         elapsedMs: 0,
       },
       "Sandbox execution progress",
+    );
+  });
+
+  it("logs hydrated scopes with the sandbox-acquire completion", async () => {
+    const fixture = await createFixture();
+    fixture.runtime.hydratedScopes = [fixture.request.request.scope];
+
+    await runJob(fixture.job, fixture.identity, fixture.deps);
+
+    expect(fixture.deps.logger.info).toHaveBeenCalledWith(
+      {
+        jobId: JOB_ID,
+        stage: "sandbox-acquire",
+        event: "synced",
+        elapsedMs: 0,
+        hydratedScopes: ["profile.email"],
+      },
+      "Sandbox acquisition progress",
     );
   });
 

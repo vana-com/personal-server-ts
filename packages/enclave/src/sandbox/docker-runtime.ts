@@ -149,8 +149,13 @@ export function createDockerRuntime(
   const syncStatus =
     options.syncStatus ??
     (sync
-      ? async (origin: string, accessToken: string, signal?: AbortSignal) => ({
-          ready: await sync(origin, accessToken, signal),
+      ? async (
+          origin: string,
+          accessToken: string,
+          signal?: AbortSignal,
+          requestedScope?: string,
+        ) => ({
+          ready: await sync(origin, accessToken, signal, requestedScope),
         })
       : probeSyncStatus);
   const sleep = options.sleep ?? delay;
@@ -234,6 +239,7 @@ export function createDockerRuntime(
             origin,
             name,
             accessToken,
+            requestedScope: spec.env.PS_HYDRATE_SCOPES,
             syncStatus,
             sleep,
             now,
@@ -569,6 +575,7 @@ interface SyncWaitOptions {
   origin: string;
   name: string;
   accessToken: string;
+  requestedScope?: string;
   syncStatus: SyncStatusProbe;
   sleep: (milliseconds: number) => Promise<void>;
   now: () => number;
@@ -584,13 +591,7 @@ async function waitForSync(options: SyncWaitOptions): Promise<void> {
   let nextLogAt = WAIT_LOG_INTERVAL_MS;
   while (true) {
     throwIfAborted(options.signal);
-    const result = options.signal
-      ? await options.syncStatus(
-          options.origin,
-          options.accessToken,
-          options.signal,
-        )
-      : await options.syncStatus(options.origin, options.accessToken);
+    const result = await readSyncStatus(options);
     if (result.status) {
       options.onStatus?.(result.status);
     }
@@ -622,6 +623,21 @@ async function waitForSync(options: SyncWaitOptions): Promise<void> {
 
     await sleepWithAbort(options.sleep, POLL_INTERVAL_MS, options.signal);
   }
+}
+
+function readSyncStatus(options: SyncWaitOptions): Promise<SyncProbeResult> {
+  if (options.requestedScope !== undefined) {
+    return options.syncStatus(
+      options.origin,
+      options.accessToken,
+      options.signal,
+      options.requestedScope,
+    );
+  }
+
+  return options.signal
+    ? options.syncStatus(options.origin, options.accessToken, options.signal)
+    : options.syncStatus(options.origin, options.accessToken);
 }
 
 function sandboxName(spec: SandboxSpec): string {

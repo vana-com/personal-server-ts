@@ -133,6 +133,85 @@ export interface DownloadAllOptions {
   retryMemory?: DownloadRetryMemory;
 }
 
+export type DownloadScopesOptions = Pick<DownloadAllOptions, "retryMemory">;
+
+/**
+ * Hydrate exact owner scopes without listing the registry or changing the
+ * incremental cursor. This is the cold-start fast path; downloadAll remains
+ * responsible for the complete registry reconciliation.
+ */
+export async function downloadScopes(
+  deps: DownloadWorkerDeps,
+  scopes: string[],
+  options: DownloadScopesOptions = {},
+): Promise<DownloadResult[]> {
+  const feed = deps.dataPointFeed ?? feedFromGatewayClient(deps.gateway);
+  const results: DownloadResult[] = [];
+
+  for (const scope of scopes) {
+    const dataPoint = await feed.getDataPoint({
+      ownerAddress: deps.serverOwner,
+      scope,
+    });
+    if (!dataPoint) {
+      continue;
+    }
+
+    const deletedAt = deletionTimestamp(dataPoint);
+    if (deletedAt !== null) {
+      deps.scopeDeletions?.markDeleted(scope, {
+        deletedAt,
+        version: tombstoneVersion(dataPoint),
+      });
+      await reconcileDeletedDataPoint(deps, dataPoint, deletedAt);
+      continue;
+    }
+
+    deps.scopeDeletions?.markLive(scope);
+    const retryKey = downloadRetryKey(dataPoint);
+    const decision = options.retryMemory?.decide(retryKey) ?? "attempt";
+    if (decision !== "attempt") {
+      continue;
+    }
+    try {
+      const result = await downloadOne(deps, dataPoint);
+      options.retryMemory?.recordSuccess(retryKey);
+      if (result) {
+        results.push(result);
+      }
+    } catch (err) {
+      const metadata = getSyncFailureMetadata(err);
+      const classified = classifySyncFailure({
+        error: err,
+        fileId: dataPoint.id,
+        syncRunId: "scope-hydration",
+        stage: metadata.stage,
+        scope: metadata.scope ?? dataPoint.scope,
+        payloadKind: metadata.payloadKind,
+        encryptedSizeBytes: metadata.encryptedSizeBytes,
+      });
+      options.retryMemory?.recordFailure(retryKey, classified.issue.retryable);
+      if (classified.issue.retryable) {
+        throw err;
+      }
+      deps.logger.warn(
+        {
+          dataPointId: dataPoint.id,
+          scope: classified.issue.scope,
+          stage: classified.issue.stage,
+          payloadKind: classified.issue.payloadKind,
+          encryptedSizeBytes: classified.issue.encryptedSizeBytes,
+          errorClass: classified.issue.errorClass,
+          message: classified.issue.message,
+        },
+        "Quarantined corrupt synced data point",
+      );
+    }
+  }
+
+  return results;
+}
+
 interface SyncFailureMetadata {
   stage?: SyncFailureStage;
   scope?: string;

@@ -20,10 +20,11 @@ vi.mock("../workers/upload.js", () => ({
 
 vi.mock("../workers/download.js", () => ({
   downloadAll: vi.fn(),
+  downloadScopes: vi.fn(),
 }));
 
 import { uploadAll } from "../workers/upload.js";
-import { downloadAll } from "../workers/download.js";
+import { downloadAll, downloadScopes } from "../workers/download.js";
 import { createSyncManager } from "./sync-manager.js";
 
 function makeMockLogger(): Logger {
@@ -77,6 +78,7 @@ describe("SyncManager", () => {
     vi.useFakeTimers();
     (uploadAll as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (downloadAll as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (downloadScopes as ReturnType<typeof vi.fn>).mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -99,6 +101,78 @@ describe("SyncManager", () => {
     expect(downloadAll).toHaveBeenCalledTimes(1);
 
     await manager.stop();
+  });
+
+  it("publishes boot hydration before the full download cycle resolves", async () => {
+    let releaseFullDownload!: () => void;
+    const fullDownload = new Promise<never[]>((resolve) => {
+      releaseFullDownload = () => resolve([]);
+    });
+    (downloadAll as ReturnType<typeof vi.fn>).mockReturnValue(fullDownload);
+    const manager = createSyncManager(
+      makeMockUploadDeps(),
+      makeMockDownloadDeps(),
+      {
+        hydrateScopes: ["chatgpt.conversations"],
+        transferMode: "download-only",
+      },
+    );
+
+    manager.start();
+    await vi.waitFor(() => expect(downloadAll).toHaveBeenCalledOnce());
+
+    expect(downloadScopes).toHaveBeenCalledWith(
+      expect.anything(),
+      ["chatgpt.conversations"],
+      { retryMemory: expect.anything() },
+    );
+    expect(manager.getStatus()).toMatchObject({
+      syncing: true,
+      hydratedScopes: ["chatgpt.conversations"],
+      lastSync: null,
+    });
+
+    releaseFullDownload();
+    await manager.stop();
+  });
+
+  it("keeps full-cycle startup behavior when no hydration scopes are set", async () => {
+    const manager = createSyncManager(
+      makeMockUploadDeps(),
+      makeMockDownloadDeps(),
+      { transferMode: "download-only" },
+    );
+
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(downloadScopes).not.toHaveBeenCalled();
+    expect(downloadAll).toHaveBeenCalledOnce();
+    expect(manager.getStatus().hydratedScopes).toEqual([]);
+    await manager.stop();
+  });
+
+  it("falls back to the full cycle when boot hydration fails", async () => {
+    const downloadDeps = makeMockDownloadDeps();
+    (downloadScopes as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("gateway unavailable"),
+    );
+    const manager = createSyncManager(makeMockUploadDeps(), downloadDeps, {
+      hydrateScopes: ["chatgpt.conversations"],
+      transferMode: "download-only",
+    });
+
+    await manager.trigger();
+
+    expect(downloadAll).toHaveBeenCalledOnce();
+    expect(manager.getStatus()).toMatchObject({
+      hydratedScopes: [],
+      errors: [],
+    });
+    expect(downloadDeps.logger.warn).toHaveBeenCalledWith(
+      { error: "gateway unavailable" },
+      "Scope hydration failed; continuing with full sync",
+    );
   });
 
   it("runs download-only cycles when uploads are disabled", async () => {
@@ -154,6 +228,7 @@ describe("SyncManager", () => {
     const uploadDeps = makeMockUploadDeps();
     const downloadDeps = makeMockDownloadDeps();
     const manager = createSyncManager(uploadDeps, downloadDeps, {
+      hydrateScopes: ["chatgpt.conversations"],
       canSync: () => ({
         ok: false,
         reason: "unregistered",
@@ -164,12 +239,35 @@ describe("SyncManager", () => {
     await manager.trigger();
 
     expect(uploadAll).not.toHaveBeenCalled();
+    expect(downloadScopes).not.toHaveBeenCalled();
     expect(downloadAll).not.toHaveBeenCalled();
     expect(manager.getStatus()).toMatchObject({
       blocked: {
         reason: "unregistered",
         message: "Register this Personal Server before syncing.",
       },
+    });
+  });
+
+  it("keeps explicit hydration behind the runtime sync gate", async () => {
+    const downloadDeps = makeMockDownloadDeps();
+    const manager = createSyncManager(makeMockUploadDeps(), downloadDeps, {
+      canSync: () => ({
+        ok: false,
+        reason: "unregistered",
+        message: "Register this Personal Server before syncing.",
+      }),
+    });
+
+    await manager.hydrateScopes(["chatgpt.conversations"]);
+
+    expect(downloadScopes).not.toHaveBeenCalled();
+    expect(manager.getStatus()).toMatchObject({
+      blocked: {
+        reason: "unregistered",
+        message: "Register this Personal Server before syncing.",
+      },
+      hydratedScopes: [],
     });
   });
 
