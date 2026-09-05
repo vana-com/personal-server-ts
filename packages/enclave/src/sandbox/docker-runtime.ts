@@ -552,12 +552,12 @@ function hostFromDocker(dockerHost: string): string {
   return hostname;
 }
 
-function parseHostPort(value: string): number | undefined {
-  if (!value) {
+function parseHostPort(value: unknown): number | undefined {
+  if (typeof value !== "string" && typeof value !== "number") {
     return undefined;
   }
 
-  const hostPort = Number(value);
+  const hostPort = Number(String(value));
   if (!Number.isSafeInteger(hostPort) || hostPort <= 0) {
     return undefined;
   }
