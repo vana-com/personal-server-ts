@@ -48,6 +48,8 @@ const NODE_DERIVATION_MISMATCH_MESSAGE =
   "Derived enclave key does not match the claimed identity";
 const JOB_STAGE_FAILURE_MESSAGE = "Enclave job stage failed";
 const SANDBOX_NODE_FAULT_MESSAGE = "Sandbox node fault; draining agent";
+const EXECUTE_PROGRESS_MESSAGE = "Sandbox execution progress";
+const EXECUTE_INTERRUPTED_MESSAGE = "Sandbox execution interrupted";
 const DECRYPT_STAGE = "decrypt";
 const UNSEAL_STAGE = "unseal";
 const SANDBOX_ACQUIRE_STAGE = "sandbox-acquire";
@@ -284,6 +286,7 @@ export async function runJob(
     }
 
     const executeStartedAt = now();
+    logExecuteStart(deps.logger, job.jobId);
     const result = await executeSandbox(
       {
         origin: sandbox.handle.origin,
@@ -302,16 +305,35 @@ export async function runJob(
         serverAddress: identity.enclaveAddress,
       }),
     );
-    await lease.settled();
-    if (lease.lost()) {
-      logLeaseLost(
+    if (result.status !== undefined) {
+      logExecuteResponse(
         deps.logger,
         job.jobId,
-        EXECUTE_STAGE,
+        result.status,
+        result.kind,
+        executeStartedAt,
+        now(),
+      );
+    }
+    await lease.settled();
+    if (lease.lost()) {
+      logExecuteInterrupted(
+        deps.logger,
+        job.jobId,
+        "lease-lost",
         executeStartedAt,
         now(),
       );
       return;
+    }
+    if (result.kind === "retry" && result.interruption) {
+      logExecuteInterrupted(
+        deps.logger,
+        job.jobId,
+        result.interruption,
+        executeStartedAt,
+        now(),
+      );
     }
     if (result.kind === "retry") {
       return;
@@ -556,6 +578,52 @@ function logLeaseLost(
   );
 }
 
+function logExecuteStart(logger: JobLogger, jobId: string): void {
+  logger.info(
+    { jobId, stage: EXECUTE_STAGE, event: "start" },
+    EXECUTE_PROGRESS_MESSAGE,
+  );
+}
+
+function logExecuteResponse(
+  logger: JobLogger,
+  jobId: string,
+  status: number,
+  kind: ExecuteResult["kind"],
+  startedAt: number,
+  currentTime: number,
+): void {
+  logger.info(
+    {
+      jobId,
+      stage: EXECUTE_STAGE,
+      event: "response",
+      status,
+      kind,
+      elapsedMs: Math.max(0, currentTime - startedAt),
+    },
+    EXECUTE_PROGRESS_MESSAGE,
+  );
+}
+
+function logExecuteInterrupted(
+  logger: JobLogger,
+  jobId: string,
+  reason: ExecuteInterruption,
+  startedAt: number,
+  currentTime: number,
+): void {
+  logger.warn(
+    {
+      jobId,
+      stage: EXECUTE_STAGE,
+      reason,
+      elapsedMs: Math.max(0, currentTime - startedAt),
+    },
+    EXECUTE_INTERRUPTED_MESSAGE,
+  );
+}
+
 interface LoggedError {
   name: string;
   message: string;
@@ -641,9 +709,15 @@ function sandboxSpec(
 }
 
 type ExecuteResult =
-  | { kind: "complete"; response: JobExecuteResponse }
-  | { kind: "fail"; reason: string }
-  | { kind: "retry" };
+  | { kind: "complete"; response: JobExecuteResponse; status: number }
+  | { kind: "fail"; reason: string; status: number }
+  | {
+      kind: "retry";
+      status?: number;
+      interruption?: Exclude<ExecuteInterruption, "lease-lost">;
+    };
+
+type ExecuteInterruption = "lease-lost" | "timeout" | "aborted";
 
 interface ExecuteOptions {
   origin: string;
@@ -658,6 +732,8 @@ async function executeSandbox(
   options: ExecuteOptions,
   unbindJob: () => void,
 ): Promise<ExecuteResult> {
+  const timeoutSignal = AbortSignal.timeout(options.timeoutMs);
+  let responseStatus: number | undefined;
   try {
     const response = await options.requestFetch(
       `${options.origin}${EXECUTE_PATH}`,
@@ -668,26 +744,43 @@ async function executeSandbox(
           [CONTENT_TYPE_HEADER]: JSON_CONTENT_TYPE,
         },
         body: JSON.stringify(options.envelope),
-        signal: AbortSignal.any([
-          options.leaseSignal,
-          AbortSignal.timeout(options.timeoutMs),
-        ]),
+        signal: AbortSignal.any([options.leaseSignal, timeoutSignal]),
       },
     );
+    responseStatus = response.status;
     const body = (await response.json()) as unknown;
     if (response.status === OK && isExecuteResponse(body)) {
-      return { kind: "complete", response: body };
+      return { kind: "complete", response: body, status: response.status };
     }
     if (!isExecuteError(body) || body.error.retryable) {
-      return { kind: "retry" };
+      return { kind: "retry", status: response.status };
     }
 
-    return { kind: "fail", reason: body.error.code };
-  } catch {
-    return { kind: "retry" };
+    return { kind: "fail", reason: body.error.code, status: response.status };
+  } catch (error) {
+    const interruption =
+      timeoutSignal.aborted || isTimeoutError(error)
+        ? "timeout"
+        : isAbortError(error)
+          ? "aborted"
+          : undefined;
+
+    return {
+      kind: "retry",
+      ...(responseStatus === undefined ? {} : { status: responseStatus }),
+      ...(interruption ? { interruption } : {}),
+    };
   } finally {
     unbindJob();
   }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function isTimeoutError(error: unknown): boolean {
+  return error instanceof Error && error.name === "TimeoutError";
 }
 
 async function failJob(

@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { pino } from "pino";
 import { describe, expect, it, vi } from "vitest";
 import {
   BUILDER_REGISTRATION_TYPES,
@@ -245,7 +244,7 @@ async function createFixture(): Promise<Fixture> {
     storage,
     ecies: eciesProvider,
     now: () => NOW,
-    logger: pino({ level: "silent" }),
+    logger: { info: vi.fn(), warn: vi.fn() },
     accessLogWriter,
     resultUpload: {
       storageEndpoint: "https://storage.example",
@@ -355,6 +354,17 @@ describe("executeJob", () => {
       contentType: "application/json",
     });
     expect(redacted.data).toEqual({ name: RECORD_VALUE });
+    for (const event of ["read", "seal", "sign", "upload", "done"]) {
+      expect(fixture.deps.logger.info).toHaveBeenCalledWith(
+        {
+          jobId: JOB_ID,
+          stage: "execute",
+          event,
+          elapsedMs: expect.any(Number),
+        },
+        "Enclave job execution progress",
+      );
+    }
     const expectedHash = `0x${createHash("sha256")
       .update(sealedBytes)
       .digest("hex")}`;

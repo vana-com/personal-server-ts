@@ -49,6 +49,7 @@ const JSON_CONTENT_TYPE = "application/json";
 const UNKNOWN_METADATA = "unknown";
 const MILLISECONDS_PER_SECOND = 1_000;
 const JOB_EXECUTION_FAILED_LOG = "Enclave job execution failed";
+const JOB_EXECUTION_PROGRESS_LOG = "Enclave job execution progress";
 const RESULT_SIGNING_PATH = "/agent/v1/job-results/sign";
 const RESULT_OBJECT_PREFIX = "jobresults";
 const PUT = "PUT";
@@ -112,6 +113,7 @@ async function executeJobUnsafe(
   deps: JobWorkerDeps,
 ): Promise<JobExecuteResponse> {
   const { request } = envelope;
+  const executionStartedAt = performance.now();
   if (request.v !== JOB_PROTOCOL_VERSION) {
     throw new JobFailure("INTERNAL", "protocol version not supported", false);
   }
@@ -216,6 +218,7 @@ async function executeJobUnsafe(
 
     throw error;
   }
+  logExecutionStep(deps, jobId, "read", executionStartedAt);
   const read = await readDataContract({
     storage: deps.storage,
     scopeParam: request.scope,
@@ -234,6 +237,7 @@ async function executeJobUnsafe(
     throw new JobFailure("VERSION_MISMATCH", "scope version mismatch", true);
   }
 
+  logExecutionStep(deps, jobId, "seal", executionStartedAt);
   const redacted = redactEnvelopeForGrantee(read.envelope);
   const result: JobResult = {
     v: JOB_PROTOCOL_VERSION,
@@ -257,6 +261,7 @@ async function executeJobUnsafe(
   const resultObjectKey = `${RESULT_OBJECT_PREFIX}/${deps.resultUpload.chainId}/${encodedJobId}`;
   const uploadPath = `/v1/job-results/${deps.resultUpload.chainId}/${owner}/${encodedJobId}`;
   const requestFetch = deps.resultUpload.fetch ?? fetch;
+  logExecutionStep(deps, jobId, "sign", executionStartedAt);
   const authorization = await requestUploadSignature(requestFetch, {
     agentEndpoint: deps.resultUpload.agentEndpoint,
     accessToken: deps.resultUpload.accessToken,
@@ -266,6 +271,7 @@ async function executeJobUnsafe(
     byteLength: resultSize,
     bodyHash: `sha256:${digest}`,
   });
+  logExecutionStep(deps, jobId, "upload", executionStartedAt);
   await uploadResult(requestFetch, {
     storageEndpoint: deps.resultUpload.storageEndpoint,
     path: uploadPath,
@@ -287,12 +293,30 @@ async function executeJobUnsafe(
     { jobId: request.jobId, scope: request.scope, version: localVersion },
     "Enclave job read served",
   );
+  logExecutionStep(deps, jobId, "done", executionStartedAt);
 
   return {
     resultObjectKey,
     resultHash,
     resultSize,
   };
+}
+
+function logExecutionStep(
+  deps: JobWorkerDeps,
+  jobId: string,
+  event: "read" | "seal" | "sign" | "upload" | "done",
+  startedAt: number,
+): void {
+  deps.logger.info(
+    {
+      jobId,
+      stage: "execute",
+      event,
+      elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+    },
+    JOB_EXECUTION_PROGRESS_LOG,
+  );
 }
 
 interface UploadSignatureRequest {

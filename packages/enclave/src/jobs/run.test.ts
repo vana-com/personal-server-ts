@@ -341,6 +341,21 @@ describe("runJob", () => {
         "Sandbox acquisition progress",
       );
     }
+    expect(fixture.deps.logger.info).toHaveBeenCalledWith(
+      { jobId: JOB_ID, stage: "execute", event: "start" },
+      "Sandbox execution progress",
+    );
+    expect(fixture.deps.logger.info).toHaveBeenCalledWith(
+      {
+        jobId: JOB_ID,
+        stage: "execute",
+        event: "response",
+        status: 200,
+        kind: "complete",
+        elapsedMs: 0,
+      },
+      "Sandbox execution progress",
+    );
   });
 
   it("defers a completion failure to lease recovery", async () => {
@@ -671,9 +686,11 @@ describe("runJob", () => {
     );
   });
 
-  it("aborts silently when a heartbeat loses the lease", async () => {
+  it("warns when the lease is lost during sandbox execution", async () => {
     vi.useFakeTimers();
     const fixture = await createFixture();
+    let currentTime = NOW_MS;
+    fixture.deps.now = () => currentTime;
     vi.mocked(fixture.gateway.heartbeat).mockRejectedValue(
       new LeaseLostError(),
     );
@@ -687,9 +704,19 @@ describe("runJob", () => {
     const running = runJob(fixture.job, fixture.identity, fixture.deps);
     await waitForExecute(fixture.deps.fetch);
 
+    currentTime += 10_000;
     await vi.advanceTimersByTimeAsync(10_000);
     await running;
 
+    expect(fixture.deps.logger.warn).toHaveBeenCalledWith(
+      {
+        jobId: JOB_ID,
+        stage: "execute",
+        reason: "lease-lost",
+        elapsedMs: 10_000,
+      },
+      "Sandbox execution interrupted",
+    );
     expect(fixture.gateway.fail).not.toHaveBeenCalled();
     expect(fixture.gateway.complete).not.toHaveBeenCalled();
   });
@@ -776,8 +803,12 @@ describe("runJob", () => {
 
     expect(abortsAtDeadline).toBe(1);
     expect(fixture.deps.logger.warn).toHaveBeenCalledWith(
-      expect.objectContaining({ stage: "execute", elapsedMs: 15_000 }),
-      "Job lease lost",
+      expect.objectContaining({
+        stage: "execute",
+        reason: "lease-lost",
+        elapsedMs: 15_000,
+      }),
+      "Sandbox execution interrupted",
     );
     expect(fixture.gateway.fail).not.toHaveBeenCalled();
     expect(fixture.gateway.complete).not.toHaveBeenCalled();
