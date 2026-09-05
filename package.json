@@ -24,7 +24,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "vitest run --config tests/e2e/vitest.config.ts",
-    "lint": "tsc --noEmit",
+    "lint": "tsc --noEmit -p packages/core && tsc --noEmit -p packages/lite && tsc --noEmit -p packages/server && tsc --noEmit -p packages/cli && tsc --noEmit -p packages/enclave && tsc --noEmit -p scripts",
     "lint:eslint": "eslint 'packages/*/src/**/*.ts'",
     "lint:eslint:fix": "eslint --fix 'packages/*/src/**/*.ts'",
     "format": "prettier --write .",
