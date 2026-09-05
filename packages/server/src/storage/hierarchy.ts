@@ -10,6 +10,8 @@ import {
   stat,
   rm,
 } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { Readable } from "node:stream";
 import { dirname, join, relative } from "node:path";
 import { randomUUID } from "node:crypto";
 import {
@@ -85,6 +87,17 @@ export async function readDataFileBytes(
   collectedAt: string,
 ): Promise<Uint8Array> {
   return readFile(buildDataFilePath(options.dataDir, scope, collectedAt));
+}
+
+/** Open a fresh stream over a stored data file. */
+export function readDataFileStream(
+  options: HierarchyManagerOptions,
+  scope: string,
+  collectedAt: string,
+): ReadableStream<Uint8Array> {
+  return Readable.toWeb(
+    createReadStream(buildDataFilePath(options.dataDir, scope, collectedAt)),
+  ) as ReadableStream<Uint8Array>;
 }
 
 /** Read a bounded UTF-8 text prefix without parsing the full envelope. */

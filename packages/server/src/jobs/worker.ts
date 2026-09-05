@@ -1,4 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
+import { createReadStream, createWriteStream } from "node:fs";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import {
   assertScopeNotDeleted,
   redactEnvelopeForGrantee,
@@ -30,7 +36,7 @@ import {
 } from "@opendatalabs/vana-sdk/node";
 import {
   canonicalJobRequestBytes,
-  sealJobResult,
+  sealJobResultStream,
 } from "@opendatalabs/vana-sdk/crypto/envelope/job";
 import {
   JOB_PROTOCOL_VERSION,
@@ -42,6 +48,7 @@ import type { Logger } from "pino";
 import { isAddressEqual, type Address, type Hex } from "viem";
 import { publicKeyToAddress } from "viem/accounts";
 import type { JobExecuteResponse, JobFailureCode } from "./types.js";
+import { openRedactedEnvelopeStream } from "./raw-envelope-stream.js";
 
 const RAW_READ = "raw_read";
 const EXECUTE_PATH = "/v1/jobs/execute";
@@ -75,6 +82,7 @@ export interface JobWorkerDeps {
   accessLogWriter: AccessLogWriter;
   scopeDeletions?: ScopeDeletionTracker;
   resultMaxBytes?: number;
+  resultTempDir?: string;
   resultUpload: {
     storageEndpoint: string;
     agentEndpoint: string;
@@ -237,11 +245,6 @@ async function executeJobUnsafe(
       false,
     );
   }
-  const body = await readRawReadBody(deps.storage, request.scope, entry);
-  logExecutionStep(deps, jobId, "read", executionStartedAt, {
-    payloadBytes: body.byteLength,
-  });
-
   const localVersion = await deps.storage.findLatestVersionByScope(
     request.scope,
   );
@@ -252,70 +255,90 @@ async function executeJobUnsafe(
     throw new JobFailure("VERSION_MISMATCH", "scope version mismatch", true);
   }
 
-  const result: JobResult = {
+  const result: Omit<JobResult, "body"> = {
     v: JOB_PROTOCOL_VERSION,
     jobId,
     scope: request.scope,
     version: localVersion === 0 ? null : String(localVersion),
     contentType: JSON_CONTENT_TYPE,
-    body,
   };
-  const sealed = await sealJobResult(
+  const body = await openRawReadBodyStream(deps.storage, request.scope, entry);
+  const sealed = await sealJobResultStream(
     result,
     request.builderPublicKey,
     deps.ecies,
   );
-  const sealedBytes = sealed.bytes;
-  logExecutionStep(deps, jobId, "seal", executionStartedAt, {
-    sealedBytes: sealedBytes.byteLength,
-  });
-  const digest = createHash("sha256").update(sealedBytes).digest("hex");
-  const resultHash = `0x${digest}` as Hex;
-  const resultSize = sealedBytes.byteLength;
-  const encodedJobId = encodeURIComponent(jobId);
-  const owner = deps.serverOwner.toLowerCase();
-  const resultObjectKey = `${RESULT_OBJECT_PREFIX}/${deps.resultUpload.chainId}/${encodedJobId}`;
-  const uploadPath = `/v1/job-results/${deps.resultUpload.chainId}/${owner}/${encodedJobId}`;
-  const requestFetch = deps.resultUpload.fetch ?? fetch;
-  logExecutionStep(deps, jobId, "sign", executionStartedAt);
-  const authorization = await requestUploadSignature(requestFetch, {
-    agentEndpoint: deps.resultUpload.agentEndpoint,
-    accessToken: deps.resultUpload.accessToken,
-    jobId,
-    chainId: deps.resultUpload.chainId,
-    owner: deps.serverOwner,
-    byteLength: resultSize,
-    bodyHash: `sha256:${digest}`,
-  });
-  logExecutionStep(deps, jobId, "upload", executionStartedAt);
-  await uploadResult(requestFetch, {
-    storageEndpoint: deps.resultUpload.storageEndpoint,
-    path: uploadPath,
-    authorization,
-    body: sealedBytes,
-  });
+  const tempRoot =
+    deps.resultTempDir ?? process.env.PERSONAL_SERVER_ROOT_PATH ?? tmpdir();
+  await mkdir(tempRoot, { recursive: true });
+  const tempDirectory = await mkdtemp(join(tempRoot, ".job-result-"));
+  const sealedPath = join(tempDirectory, "sealed.bin");
+  try {
+    let payloadBytes = 0;
+    const countedBody = body.pipeThrough(
+      new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+          payloadBytes += chunk.byteLength;
+          controller.enqueue(chunk);
+        },
+      }),
+    );
+    const { digest, byteLength: resultSize } = await writeSealedResult(
+      sealedPath,
+      sealed.header,
+      countedBody.pipeThrough(sealed.transform),
+    );
+    logExecutionStep(deps, jobId, "read", executionStartedAt, {
+      payloadBytes,
+    });
+    logExecutionStep(deps, jobId, "seal", executionStartedAt, {
+      sealedBytes: resultSize,
+    });
+    const resultHash = `0x${digest}` as Hex;
+    const encodedJobId = encodeURIComponent(jobId);
+    const owner = deps.serverOwner.toLowerCase();
+    const resultObjectKey = `${RESULT_OBJECT_PREFIX}/${deps.resultUpload.chainId}/${encodedJobId}`;
+    const uploadPath = `/v1/job-results/${deps.resultUpload.chainId}/${owner}/${encodedJobId}`;
+    const requestFetch = deps.resultUpload.fetch ?? fetch;
+    logExecutionStep(deps, jobId, "sign", executionStartedAt);
+    const authorization = await requestUploadSignature(requestFetch, {
+      agentEndpoint: deps.resultUpload.agentEndpoint,
+      accessToken: deps.resultUpload.accessToken,
+      jobId,
+      chainId: deps.resultUpload.chainId,
+      owner: deps.serverOwner,
+      byteLength: resultSize,
+      bodyHash: `sha256:${digest}`,
+    });
+    logExecutionStep(deps, jobId, "upload", executionStartedAt);
+    await uploadResult(requestFetch, {
+      storageEndpoint: deps.resultUpload.storageEndpoint,
+      path: uploadPath,
+      authorization,
+      filePath: sealedPath,
+      byteLength: resultSize,
+    });
 
-  await deps.accessLogWriter.write({
-    logId: randomUUID(),
-    grantId: request.grantId,
-    builder: request.builder,
-    action: "read",
-    scope: request.scope,
-    timestamp: now.toISOString(),
-    ipAddress: UNKNOWN_METADATA,
-    userAgent: UNKNOWN_METADATA,
-  });
-  deps.logger.info(
-    { jobId: request.jobId, scope: request.scope, version: localVersion },
-    "Enclave job read served",
-  );
-  logExecutionStep(deps, jobId, "done", executionStartedAt);
+    await deps.accessLogWriter.write({
+      logId: randomUUID(),
+      grantId: request.grantId,
+      builder: request.builder,
+      action: "read",
+      scope: request.scope,
+      timestamp: now.toISOString(),
+      ipAddress: UNKNOWN_METADATA,
+      userAgent: UNKNOWN_METADATA,
+    });
+    deps.logger.info(
+      { jobId: request.jobId, scope: request.scope, version: localVersion },
+      "Enclave job read served",
+    );
+    logExecutionStep(deps, jobId, "done", executionStartedAt);
 
-  return {
-    resultObjectKey,
-    resultHash,
-    resultSize,
-  };
+    return { resultObjectKey, resultHash, resultSize };
+  } finally {
+    await rm(tempDirectory, { recursive: true, force: true });
+  }
 }
 
 export function readJobResultMaxBytes(value: string | undefined): number {
@@ -327,23 +350,66 @@ export function readJobResultMaxBytes(value: string | undefined): number {
   return parsed;
 }
 
-async function readRawReadBody(
+async function openRawReadBodyStream(
   storage: DataStoragePort,
   scope: string,
   entry: { collectedAt: string },
-): Promise<Uint8Array> {
+): Promise<ReadableStream<Uint8Array>> {
+  if (storage.readEnvelopeStream) {
+    return openRedactedEnvelopeStream(() =>
+      storage.readEnvelopeStream!(scope, entry.collectedAt),
+    );
+  }
   if (storage.readEnvelopeBytes) {
-    return redactJsonEnvelopeBytesForGrantee(
+    const bytes = redactJsonEnvelopeBytesForGrantee(
       await storage.readEnvelopeBytes(scope, entry.collectedAt),
     );
+    return oneChunkStream(bytes);
   }
   const read = await readDataContract({ storage, scopeParam: scope });
   if (!read.ok) {
     throw new JobFailure("SCOPE_NOT_FOUND", "scope not found", false);
   }
-  return new TextEncoder().encode(
-    JSON.stringify(redactEnvelopeForGrantee(read.envelope)),
+  return oneChunkStream(
+    new TextEncoder().encode(
+      JSON.stringify(redactEnvelopeForGrantee(read.envelope)),
+    ),
   );
+}
+
+function oneChunkStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+}
+
+async function writeSealedResult(
+  path: string,
+  header: Uint8Array,
+  ciphertext: ReadableStream<Uint8Array>,
+): Promise<{ digest: string; byteLength: number }> {
+  const hash = createHash("sha256");
+  let byteLength = 0;
+  const meter = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      hash.update(chunk);
+      byteLength += chunk.byteLength;
+      callback(null, chunk);
+    },
+  });
+  const source = Readable.from(
+    (async function* () {
+      yield header;
+      for await (const chunk of Readable.fromWeb(ciphertext as never)) {
+        yield chunk;
+      }
+    })(),
+  );
+  await pipeline(source, meter, createWriteStream(path));
+  return { digest: hash.digest("hex"), byteLength };
 }
 
 function logExecutionStep(
@@ -467,7 +533,8 @@ interface ResultUploadRequest {
   storageEndpoint: string;
   path: string;
   authorization: string;
-  body: Uint8Array;
+  filePath: string;
+  byteLength: number;
 }
 
 async function uploadResult(
@@ -476,6 +543,7 @@ async function uploadResult(
 ): Promise<void> {
   let response: Response;
   const timeoutSignal = AbortSignal.timeout(RESULT_UPLOAD_TIMEOUT_MS);
+  const body = createReadStream(request.filePath);
   try {
     const storageOrigin = new URL(request.storageEndpoint).origin;
     response = await requestFetch(`${storageOrigin}${request.path}`, {
@@ -483,14 +551,12 @@ async function uploadResult(
       headers: {
         Authorization: request.authorization,
         "Content-Type": "application/octet-stream",
+        "Content-Length": String(request.byteLength),
       },
-      body: Buffer.from(
-        request.body.buffer as ArrayBuffer,
-        request.body.byteOffset,
-        request.body.byteLength,
-      ),
+      body,
+      duplex: "half",
       signal: timeoutSignal,
-    });
+    } as unknown as RequestInit & { duplex: "half" });
   } catch {
     if (timeoutSignal.aborted) {
       throw new JobFailure(
@@ -500,6 +566,8 @@ async function uploadResult(
       );
     }
     throw new JobFailure("RESULT_UPLOAD_FAILED", "result upload failed", true);
+  } finally {
+    body.destroy();
   }
   if (response.status === 413) {
     throw new JobFailure(

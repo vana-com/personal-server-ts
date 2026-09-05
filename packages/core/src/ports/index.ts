@@ -93,6 +93,11 @@ export interface DataStoragePort extends RuntimeStoragePort {
   readEnvelope(scope: string, collectedAt: string): Promise<DataFileEnvelope>;
   /** Read the stored JSON envelope without parsing its potentially large data. */
   readEnvelopeBytes?(scope: string, collectedAt: string): Promise<Uint8Array>;
+  /** Open a fresh byte stream for the stored JSON envelope. May be called twice. */
+  readEnvelopeStream?(
+    scope: string,
+    collectedAt: string,
+  ): Promise<ReadableStream<Uint8Array>>;
   readEnvelopePreview?(
     scope: string,
     collectedAt: string,

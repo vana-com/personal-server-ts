@@ -3,6 +3,7 @@ import {
   deleteDataFile,
   readDataFile,
   readDataFileBytes,
+  readDataFileStream,
   readDataFilePreview,
   hasScopeBlocks,
   readScopeBlockManifest,
@@ -62,6 +63,9 @@ export function createNodeDataStorage(
     },
     readEnvelopeBytes(scope: string, collectedAt: string) {
       return readDataFileBytes(deps.hierarchyOptions, scope, collectedAt);
+    },
+    async readEnvelopeStream(scope: string, collectedAt: string) {
+      return readDataFileStream(deps.hierarchyOptions, scope, collectedAt);
     },
     readEnvelopePreview(scope: string, collectedAt: string, { maxBytes }) {
       return readDataFilePreview(

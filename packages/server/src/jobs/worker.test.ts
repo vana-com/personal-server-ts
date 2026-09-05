@@ -1,4 +1,10 @@
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import { stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Readable } from "node:stream";
+import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import {
   BUILDER_REGISTRATION_TYPES,
@@ -101,6 +107,8 @@ interface Fixture {
   storage: DataStoragePort;
   dataEnvelope: DataFileEnvelope;
   resultUploadFetch: ReturnType<typeof vi.fn>;
+  uploadedBytes(): Uint8Array;
+  uploadedBody(): unknown;
 }
 
 async function createFixture(): Promise<Fixture> {
@@ -219,6 +227,8 @@ async function createFixture(): Promise<Fixture> {
   const accessLogWriter = {
     write: vi.fn().mockResolvedValue(undefined),
   } satisfies AccessLogWriter;
+  let capturedUploadBytes = new Uint8Array();
+  let capturedUploadBody: unknown;
   const resultUploadFetch = vi
     .fn()
     .mockResolvedValueOnce(
@@ -227,7 +237,11 @@ async function createFixture(): Promise<Fixture> {
         { status: 200, headers: { "content-type": "application/json" } },
       ),
     )
-    .mockResolvedValueOnce(new Response(null, { status: 201 }));
+    .mockImplementationOnce(async (_url: string, init: RequestInit) => {
+      capturedUploadBody = init.body;
+      capturedUploadBytes = await collectRequestBody(init.body);
+      return new Response(null, { status: 201 });
+    });
   const request = {
     v: 1 as const,
     jobId: JOB_ID,
@@ -271,7 +285,17 @@ async function createFixture(): Promise<Fixture> {
     storage,
     dataEnvelope,
     resultUploadFetch,
+    uploadedBytes: () => capturedUploadBytes,
+    uploadedBody: () => capturedUploadBody,
   };
+}
+
+async function collectRequestBody(body: unknown): Promise<Uint8Array> {
+  if (body instanceof Uint8Array) return body;
+  if (!(body instanceof Readable)) throw new Error("expected a readable body");
+  const chunks: Buffer[] = [];
+  for await (const chunk of body) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
 }
 
 async function signRequest(
@@ -344,7 +368,7 @@ describe("executeJob", () => {
       string,
       RequestInit,
     ];
-    const sealedBytes = init.body as Uint8Array;
+    const sealedBytes = fixture.uploadedBytes();
     const result = await openJobResult(
       sealedBytes,
       builder.privateKey,
@@ -424,9 +448,11 @@ describe("executeJob", () => {
       headers: {
         Authorization: "Web3Signed result-signature",
         "Content-Type": "application/octet-stream",
+        "Content-Length": String(sealedBytes.byteLength),
       },
-      body: sealedBytes,
     });
+    expect((init as RequestInit & { duplex: string }).duplex).toBe("half");
+    expect(init.body).toBeInstanceOf(Readable);
     expect(response).toEqual({
       resultObjectKey: `jobresults/14800/${JOB_ID}`,
       resultHash: expectedHash,
@@ -435,6 +461,33 @@ describe("executeJob", () => {
     expect(fixture.deps.accessLogWriter.write).toHaveBeenCalledWith(
       expect.objectContaining({ grantId: GRANT_ID, scope: SCOPE }),
     );
+  });
+
+  it("streams a multi-chunk result from a temporary file and removes it", async () => {
+    const fixture = await createFixture();
+    const pad = "abc123".repeat(524_288);
+    const largeEnvelope = { ...fixture.dataEnvelope, data: { pad } };
+    const stored = new TextEncoder().encode(
+      JSON.stringify(largeEnvelope, null, 2),
+    );
+    vi.mocked(fixture.storage.findEntry).mockReturnValue({
+      ...fixture.storage.findEntry({ scope: SCOPE })!,
+      sizeBytes: stored.byteLength,
+    });
+    Object.assign(fixture.storage, {
+      readEnvelopeStream: vi.fn(async () => new Blob([stored]).stream()),
+    });
+    fixture.deps.resultMaxBytes = stored.byteLength;
+    fixture.deps.resultTempDir = tmpdir();
+
+    await executeJob(fixture.envelope, fixture.deps);
+
+    expect(fixture.uploadedBody()).toBeInstanceOf(Readable);
+    const uploadPath = (fixture.uploadedBody() as Readable & { path: string })
+      .path;
+    expect(uploadPath).toContain(join(tmpdir(), ".job-result-"));
+    await expect(stat(uploadPath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(fixture.uploadedBytes().byteLength).toBeGreaterThan(3 * 1024 * 1024);
   });
 
   it("rejects an over-budget result before reading the stored bytes", async () => {
@@ -770,6 +823,51 @@ describe("executeJob", () => {
     }
   });
 });
+
+describe.skipIf(Boolean(process.env.CI))("streaming seal memory probe", () => {
+  it("keeps peak array-buffer growth below 16 MiB for 48 MB", async () => {
+    const { stdout } = await promisify(execFile)(
+      process.execPath,
+      ["--expose-gc", "--input-type=module", "--eval", MEMORY_PROBE_SOURCE],
+      { cwd: process.cwd() },
+    );
+    expect(Number(stdout.trim())).toBeLessThan(16 * 1024 * 1024);
+  }, 30_000);
+});
+
+const MEMORY_PROBE_SOURCE = `
+import { NodeECIESProvider } from "@opendatalabs/vana-sdk/node";
+import { sealJobResultStream } from "@opendatalabs/vana-sdk/crypto/envelope/job";
+const publicKey = "0x04d793631af7aa0e709439dd47fc001acd0b0727670b6670ea528ac83cb0127f4a7f3d9cdfe06af2e79346b0eca7c168102b352936c29b7a742478ca579ee0e03b";
+global.gc();
+const baseline = process.memoryUsage().arrayBuffers;
+let peak = baseline;
+const sample = () => { global.gc(); peak = Math.max(peak, process.memoryUsage().arrayBuffers); };
+const sealed = await sealJobResultStream({
+  v: 1,
+  jobId: "${JOB_ID}",
+  scope: "${SCOPE}",
+  version: "7",
+  contentType: "application/json",
+}, publicKey, new NodeECIESProvider());
+const drain = (async () => {
+  const reader = sealed.transform.readable.getReader();
+  for (;;) {
+    const next = await reader.read();
+    sample();
+    if (next.done) break;
+  }
+})();
+const writer = sealed.transform.writable.getWriter();
+const input = new Uint8Array(1_000_000);
+for (let index = 0; index < 48; index += 1) {
+  await writer.write(input);
+  sample();
+}
+await writer.close();
+await drain;
+console.log(peak - baseline);
+`;
 
 function fakeAbortSignalTimeout(): ReturnType<
   typeof vi.spyOn<typeof AbortSignal, "timeout">
