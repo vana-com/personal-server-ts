@@ -203,6 +203,7 @@ describe("SyncManager", () => {
     const uploadDeps = makeMockUploadDeps();
     const downloadDeps = makeMockDownloadDeps();
     const manager = createSyncManager(uploadDeps, downloadDeps, {
+      hydrateScopes: ["chatgpt.conversations"],
       canSync: () => ({
         ok: false,
         reason: "unregistered",
@@ -213,6 +214,7 @@ describe("SyncManager", () => {
     await manager.trigger();
 
     expect(uploadAll).not.toHaveBeenCalled();
+    expect(downloadScopes).not.toHaveBeenCalled();
     expect(downloadAll).not.toHaveBeenCalled();
     expect(manager.getStatus()).toMatchObject({
       blocked: {
