@@ -21,7 +21,12 @@ import {
 import { SandboxSyncBlockedError } from "../sandbox/probes.js";
 import { seal } from "../sealing/envelope.js";
 import { LeaseLostError, type GatewayClient } from "./gateway-client.js";
-import { runJob, type RunJobDeps } from "./run.js";
+import {
+  prewarmSandbox,
+  runJob,
+  type PrewarmDeps,
+  type RunJobDeps,
+} from "./run.js";
 import type {
   ClaimResponse,
   JobExecuteError,
@@ -960,5 +965,111 @@ describe("runJob", () => {
     expect(fixture.gateway.heartbeat).toHaveBeenCalledTimes(2);
     expect(fixture.gateway.fail).not.toHaveBeenCalled();
     expect(fixture.gateway.complete).not.toHaveBeenCalled();
+  });
+});
+
+describe("prewarmSandbox", () => {
+  function prewarmDeps(deps: RunJobDeps): PrewarmDeps {
+    return deps;
+  }
+
+  it("acquires and releases the job sandbox with the requested scope", async () => {
+    const fixture = await createFixture();
+    const acquire = vi.spyOn(fixture.deps.registry, "acquire");
+    const release = vi.spyOn(fixture.deps.registry, "release");
+
+    await prewarmSandbox(
+      fixture.identity,
+      fixture.request.request.scope,
+      prewarmDeps(fixture.deps),
+    );
+
+    expect(acquire).toHaveBeenCalledOnce();
+    expect(acquire.mock.calls[0]?.[2]).toBeUndefined();
+    expect(release).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledWith(`${USER_PS_ID}:${EPOCH}`);
+    expect(fixture.runtime.specs).toHaveLength(1);
+    expect(fixture.runtime.specs[0]).toMatchObject({
+      userPsId: USER_PS_ID,
+      epoch: EPOCH,
+      image: "personal-server:test",
+      env: {
+        PS_HYDRATE_SCOPES: "profile.email",
+      },
+    });
+    for (const milestone of ["healthy", "synced"]) {
+      expect(fixture.deps.logger.info).toHaveBeenCalledWith(
+        expect.objectContaining({
+          stage: "sandbox-acquire",
+          event: "prewarm",
+          milestone,
+          userPsId: USER_PS_ID,
+          epoch: EPOCH,
+          scope: "profile.email",
+          elapsedMs: expect.any(Number),
+        }),
+        "Sandbox acquisition progress",
+      );
+    }
+  });
+
+  it("swallows and warns when sandbox acquisition fails", async () => {
+    const fixture = await createFixture();
+    const stop = vi.spyOn(fixture.runtime, "stop");
+    const registry = createSandboxRegistry({
+      runtime: fixture.runtime,
+      max: 1,
+      idleTtlMs: 60_000,
+    });
+    await registry.acquire("running-job", (accessToken) => ({
+      userPsId: USER_PS_ID,
+      epoch: EPOCH,
+      image: "personal-server:test",
+      env: { PS_ACCESS_TOKEN: accessToken },
+    }));
+    fixture.deps.registry = registry;
+
+    await expect(
+      prewarmSandbox(
+        fixture.identity,
+        fixture.request.request.scope,
+        prewarmDeps(fixture.deps),
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(fixture.deps.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stage: "prewarm",
+        userPsId: USER_PS_ID,
+        epoch: EPOCH,
+        scope: "profile.email",
+        error: expect.objectContaining({ name: "SandboxCapacityError" }),
+      }),
+      expect.any(String),
+    );
+    expect(fixture.runtime.specs).toHaveLength(1);
+    expect(stop).not.toHaveBeenCalled();
+    registry.release("running-job");
+  });
+
+  it("releases an acquired sandbox when later prewarm work fails", async () => {
+    const fixture = await createFixture();
+    const release = vi.spyOn(fixture.deps.registry, "release");
+    vi.mocked(fixture.deps.logger.info).mockImplementation((context) => {
+      if (context.milestone === "healthy") {
+        throw new Error("progress logger unavailable");
+      }
+    });
+
+    await expect(
+      prewarmSandbox(
+        fixture.identity,
+        fixture.request.request.scope,
+        prewarmDeps(fixture.deps),
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(release).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledWith(`${USER_PS_ID}:${EPOCH}`);
   });
 });

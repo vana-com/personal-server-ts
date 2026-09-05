@@ -82,6 +82,18 @@ const TERMINAL_SYNC_BLOCK_REASONS = new Set(["unregistered"]);
 type ClaimedJob = ClaimResponse["job"];
 type ClaimedIdentity = ClaimResponse["identity"];
 type SyncMode = "enabled" | "disabled";
+type SandboxSpecDeps = Pick<
+  RunJobDeps,
+  | "image"
+  | "gatewayUrl"
+  | "storageApiUrl"
+  | "agentUrl"
+  | "chainId"
+  | "contracts"
+  | "gatewayBypassSecret"
+  | "sync"
+  | "jobResultMaxBytes"
+>;
 
 export interface RunJobDeps {
   client: DstackClient;
@@ -104,6 +116,22 @@ export interface RunJobDeps {
   sleep?: (milliseconds: number) => Promise<void>;
 }
 
+export type PrewarmDeps = Pick<
+  RunJobDeps,
+  | "client"
+  | "registry"
+  | "image"
+  | "gatewayUrl"
+  | "storageApiUrl"
+  | "agentUrl"
+  | "chainId"
+  | "contracts"
+  | "gatewayBypassSecret"
+  | "sync"
+  | "logger"
+  | "jobResultMaxBytes"
+>;
+
 export class SandboxChainMismatchError extends Error {
   constructor(
     public readonly expectedChainId: number,
@@ -113,6 +141,92 @@ export class SandboxChainMismatchError extends Error {
       `Gateway job chain ${receivedChainId} does not match sandbox chain ${expectedChainId}`,
     );
     this.name = "SandboxChainMismatchError";
+  }
+}
+
+export async function prewarmSandbox(
+  identity: ClaimedIdentity,
+  scope: string,
+  deps: PrewarmDeps,
+): Promise<void> {
+  const registryKey = `${identity.userPsId}:${identity.epoch}`;
+  const startedAt = Date.now();
+  const acquireEvents = new Set<string>();
+  let hydratedScopes: string[] | undefined;
+  let signature: Uint8Array | undefined;
+  let acquired = false;
+
+  try {
+    signature = await unseal(
+      deps.client,
+      identity.userPsId,
+      identity.epoch,
+      identity.sealedEnvelope,
+    );
+    logPrewarmAcquisitionEvent(
+      deps.logger,
+      identity,
+      scope,
+      "start",
+      startedAt,
+    );
+    await deps.registry.acquire(registryKey, (accessToken) => {
+      const spec = sandboxSpec(
+        identity,
+        deps,
+        accessToken,
+        signature!,
+        scope,
+        (event) => {
+          acquireEvents.add(event);
+          logPrewarmAcquisitionEvent(
+            deps.logger,
+            identity,
+            scope,
+            event,
+            startedAt,
+            event === "synced" ? hydratedScopes : undefined,
+          );
+        },
+        (status) => {
+          hydratedScopes = status.lastSyncStatus?.hydratedScopes;
+        },
+      );
+      signature!.fill(0);
+
+      return spec;
+    });
+    acquired = true;
+    for (const event of ["healthy", "synced"] as const) {
+      if (!acquireEvents.has(event)) {
+        logPrewarmAcquisitionEvent(
+          deps.logger,
+          identity,
+          scope,
+          event,
+          startedAt,
+          event === "synced" ? hydratedScopes : undefined,
+        );
+      }
+    }
+  } catch (error) {
+    const [root, ...causes] = errorChain(error);
+    deps.logger.warn(
+      {
+        stage: "prewarm",
+        userPsId: identity.userPsId,
+        epoch: identity.epoch,
+        scope,
+        error: root,
+        causes,
+      },
+      "Sandbox prewarm failed",
+    );
+  } finally {
+    signature?.fill(0);
+    if (acquired) {
+      deps.registry.release(registryKey);
+    }
   }
 }
 
@@ -587,6 +701,29 @@ function logAcquisitionEvent(
   );
 }
 
+function logPrewarmAcquisitionEvent(
+  logger: JobLogger,
+  identity: ClaimedIdentity,
+  scope: string,
+  milestone: "start" | "healthy" | "synced",
+  startedAt: number,
+  hydratedScopes?: string[],
+): void {
+  logger.info(
+    {
+      stage: "sandbox-acquire",
+      event: "prewarm",
+      milestone,
+      userPsId: identity.userPsId,
+      epoch: identity.epoch,
+      scope,
+      elapsedMs: Math.max(0, Date.now() - startedAt),
+      ...(hydratedScopes ? { hydratedScopes } : {}),
+    },
+    "Sandbox acquisition progress",
+  );
+}
+
 function logLeaseLost(
   logger: JobLogger,
   jobId: string,
@@ -701,7 +838,7 @@ function failureReason(envelope: JobRequestEnvelope, nowMs: number): string {
 
 function sandboxSpec(
   identity: ClaimedIdentity,
-  deps: RunJobDeps,
+  deps: SandboxSpecDeps,
   accessToken: string,
   signature: Uint8Array,
   requestedScope: string,

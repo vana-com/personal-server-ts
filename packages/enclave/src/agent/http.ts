@@ -1,5 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import { buildWeb3SignedHeader } from "@opendatalabs/vana-sdk/node";
+import { ScopeSchema } from "@opendatalabs/vana-sdk/protocol/scopes";
 import {
   createServer,
   type IncomingMessage,
@@ -18,6 +19,7 @@ import { readHealth } from "./health.js";
 import { sealDelivery } from "./seal.js";
 import type {
   IdentityRequestBody,
+  PrewarmRequestBody,
   ResultSigningRequestBody,
   SandboxJobLookup,
   SealRequestBody,
@@ -34,10 +36,12 @@ const SEAL_ROUTE = "/agent/v1/secrets/seal";
 const DRAIN_ROUTE = "/agent/v1/drain";
 const RESULT_SIGNING_ROUTE = "/agent/v1/job-results/sign";
 const SANDBOXES_ROUTE = "/agent/v1/sandboxes";
+export const PREWARM_ROUTE = "/agent/v1/sandboxes/prewarm";
 const GET = "GET";
 const POST = "POST";
 const PUT = "PUT";
 const OK = 200;
+const ACCEPTED = 202;
 const BAD_REQUEST = 400;
 const UNAUTHORIZED = 401;
 const FORBIDDEN = 403;
@@ -74,6 +78,7 @@ export interface AgentJobsControl {
   listSandboxes(): Promise<SandboxStatus[]>;
   sandboxLogs(containerId: string, tail: number): Promise<string | undefined>;
   lookupSandboxJob(accessToken: string, jobId: string): SandboxJobLookup;
+  prewarm(body: PrewarmRequestBody): void;
 }
 
 class BodyTooLarge extends Error {}
@@ -166,6 +171,13 @@ async function handleRequest(
     if (request.method === POST && path === SEAL_ROUTE) {
       const body = sealBody(await readJson(request));
       sendJson(response, OK, await sealDelivery(options.client, body));
+      return;
+    }
+
+    if (request.method === POST && path === PREWARM_ROUTE && options.jobs) {
+      const body = prewarmRequestBody(await readJson(request));
+      sendJson(response, ACCEPTED, { accepted: true });
+      options.jobs.prewarm(body);
       return;
     }
 
@@ -345,6 +357,50 @@ function identityBody(value: unknown): IdentityRequestBody {
   };
 }
 
+function prewarmRequestBody(value: unknown): PrewarmRequestBody {
+  const body = record(value);
+  const sealedEnvelope = record(body.sealedEnvelope);
+  const wrappedContentKey = record(sealedEnvelope.wrappedContentKey);
+  const scope = ScopeSchema.safeParse(body.scope);
+  if (
+    !isHex(body.userPsId, { strict: true }) ||
+    body.userPsId.length !== 66 ||
+    !isPositiveInteger(body.epoch) ||
+    !isAddressValue(body.enclaveAddress) ||
+    !isHex(body.enclavePublicKey, { strict: true }) ||
+    body.enclavePublicKey.length !== 132 ||
+    sealedEnvelope.v !== 1 ||
+    !isBase64(sealedEnvelope.iv) ||
+    !isBase64(sealedEnvelope.ciphertext) ||
+    !isBase64(sealedEnvelope.tag) ||
+    !isBase64(wrappedContentKey.iv) ||
+    !isBase64(wrappedContentKey.ciphertext) ||
+    !isBase64(wrappedContentKey.tag) ||
+    !scope.success
+  ) {
+    throw new BadRequest();
+  }
+
+  return {
+    userPsId: body.userPsId,
+    epoch: body.epoch,
+    enclaveAddress: body.enclaveAddress,
+    enclavePublicKey: body.enclavePublicKey,
+    sealedEnvelope: {
+      v: 1,
+      iv: sealedEnvelope.iv,
+      ciphertext: sealedEnvelope.ciphertext,
+      tag: sealedEnvelope.tag,
+      wrappedContentKey: {
+        iv: wrappedContentKey.iv,
+        ciphertext: wrappedContentKey.ciphertext,
+        tag: wrappedContentKey.tag,
+      },
+    },
+    scope: scope.data,
+  };
+}
+
 function sealBody(value: unknown): SealRequestBody {
   const body = record(value);
   if (
@@ -409,6 +465,17 @@ function isPositiveSafeInteger(value: unknown): value is number {
 
 function isAddressValue(value: unknown): value is Address {
   return typeof value === "string" && isAddress(value);
+}
+
+function isBase64(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0) {
+    return false;
+  }
+  try {
+    return Buffer.from(value, "base64").toString("base64") === value;
+  } catch {
+    return false;
+  }
 }
 
 function sameAddress(left: string, right: string): boolean {
