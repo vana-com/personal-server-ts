@@ -77,10 +77,7 @@ const JOB_FAILURE_CODES = new Set<string>([
   "RESULT_TOO_LARGE",
   "INTERNAL",
 ]);
-const TERMINAL_SYNC_BLOCK_REASONS = new Set([
-  "unregistered",
-  "registration_check_failed",
-]);
+const TERMINAL_SYNC_BLOCK_REASONS = new Set(["unregistered"]);
 
 type ClaimedJob = ClaimResponse["job"];
 type ClaimedIdentity = ClaimResponse["identity"];

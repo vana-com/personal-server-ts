@@ -534,24 +534,44 @@ describe("runJob", () => {
     );
   });
 
-  it.each(["unregistered", "registration_check_failed"])(
-    "fails the job and releases the registry when sync is blocked by %s",
-    async (reason) => {
-      const fixture = await createFixture();
-      vi.spyOn(fixture.runtime, "start").mockRejectedValue(
-        new SandboxSyncBlockedError(reason, "registration is unavailable"),
-      );
+  it("fails the job and releases the registry when sync is blocked as unregistered", async () => {
+    const fixture = await createFixture();
+    vi.spyOn(fixture.runtime, "start").mockRejectedValue(
+      new SandboxSyncBlockedError(
+        "unregistered",
+        "registration is unavailable",
+      ),
+    );
 
-      await runJob(fixture.job, fixture.identity, fixture.deps);
+    await runJob(fixture.job, fixture.identity, fixture.deps);
 
-      expect(fixture.gateway.fail).toHaveBeenCalledWith(JOB_ID, {
-        fencingToken: 1,
-        reason: "SANDBOX_SYNC_BLOCKED",
-      });
-      expect(fixture.gateway.complete).not.toHaveBeenCalled();
-      expect(fixture.deps.registry.activeCount()).toBe(0);
-    },
-  );
+    expect(fixture.gateway.fail).toHaveBeenCalledWith(JOB_ID, {
+      fencingToken: 1,
+      reason: "SANDBOX_SYNC_BLOCKED",
+    });
+    expect(fixture.gateway.complete).not.toHaveBeenCalled();
+    expect(fixture.deps.registry.activeCount()).toBe(0);
+  });
+
+  it("keeps registration check failures retryable", async () => {
+    const fixture = await createFixture();
+    vi.spyOn(fixture.runtime, "start").mockRejectedValue(
+      new SandboxSyncBlockedError(
+        "registration_check_failed",
+        "registration is unavailable",
+      ),
+    );
+
+    await runJob(fixture.job, fixture.identity, fixture.deps);
+
+    expect(fixture.gateway.fail).not.toHaveBeenCalled();
+    expect(fixture.gateway.complete).not.toHaveBeenCalled();
+    expect(fixture.deps.registry.activeCount()).toBe(0);
+    expect(fixture.deps.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ jobId: JOB_ID, stage: "sandbox-acquire" }),
+      "Enclave job stage failed",
+    );
+  });
 
   it("returns a node fault when sandbox creation is permanently unavailable", async () => {
     const fixture = await createFixture();
