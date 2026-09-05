@@ -84,6 +84,7 @@ const JOB_DEADLINE_MS = 600_000;
 const AGENT_READY_TIMEOUT_MS = 15_000;
 const HEARTBEAT_TIMEOUT_MS = 30_000;
 const JOB_TIMEOUT_MS = 60_000;
+const DEFAULT_E2E_JOB_TIMEOUT_MS = 180_000;
 const RECOVERY_TIMEOUT_MS = 90_000;
 const REMOTE_RECOVERY_TIMEOUT_MS = 300_000;
 const REMOTE_CLAIM_TIMEOUT_MS = 15_000;
@@ -132,6 +133,7 @@ const GRANT_ID_ENV = "GRANT_ID";
 const SCOPE_ENV = "SCOPE";
 const E2E_RECOVERY_ENV = "E2E_RECOVERY";
 const E2E_WARM_RUNS_ENV = "E2E_WARM_RUNS";
+const E2E_JOB_TIMEOUT_MS_ENV = "E2E_JOB_TIMEOUT_MS";
 const PAD_PATTERN =
   "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
@@ -184,6 +186,7 @@ interface JobContext {
   remote: boolean;
   remoteNodeIds: string[];
   warmRuns: number;
+  jobTimeoutMs: number;
   recovery: boolean;
 }
 
@@ -390,6 +393,10 @@ async function buildContext(): Promise<JobContext> {
     remote,
     remoteNodeIds,
     warmRuns: nonnegativeInt(process.env.E2E_WARM_RUNS, 0),
+    jobTimeoutMs: positiveInt(
+      process.env[E2E_JOB_TIMEOUT_MS_ENV],
+      DEFAULT_E2E_JOB_TIMEOUT_MS,
+    ),
     recovery: process.env.E2E_RECOVERY === TRUE_VALUE,
   };
 }
@@ -1114,10 +1121,7 @@ async function pollJob(
   while (Date.now() < deadline) {
     last = await getJob(ctx, builder, jobId);
     const job = jobFromResult(last);
-    if (
-      job &&
-      ["completed", "failed", "expired", "cancelled"].includes(job.state)
-    ) {
+    if (job && isTerminalJob(job)) {
       return job;
     }
     await delay(POLL_INTERVAL_MS);
@@ -1131,6 +1135,10 @@ async function pollJob(
     },
     last?.response ?? { status: "TIMEOUT", body: null },
   );
+}
+
+function isTerminalJob(job: JobStatus): boolean {
+  return ["completed", "failed", "expired", "cancelled"].includes(job.state);
 }
 
 async function assertResult(
@@ -1269,6 +1277,7 @@ async function submitAndDecrypt(
 ): Promise<{
   job: CreatedJob;
   submitMs: number;
+  completeMs: number;
   ttfbMs: number;
   fetchMs: number;
   decryptMs: number;
@@ -1283,13 +1292,32 @@ async function submitAndDecrypt(
   const submittedAt = performance.now();
   const result = await submitJob(ctx, builder.account, job, JOB_WAIT_SECONDS);
   const submitMs = Math.round(performance.now() - submittedAt);
-  const status = jobFromResult(result);
+  let status = jobFromResult(result);
   requireResponse(
     result,
-    HTTP_OK,
-    () => status?.state === "completed" && status.attempt === 1,
-    "Expected the raw read job to complete inline on attempt 1",
+    result.response.status === HTTP_ACCEPTED ? HTTP_ACCEPTED : HTTP_OK,
+    () => status !== undefined,
+    "Expected an inline or queued raw read job response",
   );
+  if (!isTerminalJob(status!)) {
+    status = await pollJob(
+      ctx,
+      builder.account,
+      job.request.jobId,
+      ctx.jobTimeoutMs,
+    );
+  }
+  const completeMs = Math.round(performance.now() - submittedAt);
+  if (status!.state !== "completed") {
+    throw new Error(
+      `Job ended as ${status!.state}; failureReason=${status!.failureReason ?? "null"}`,
+    );
+  }
+  if (status!.attempt !== 1) {
+    throw new Error(
+      `Expected the raw read job to complete on attempt 1, received attempt ${status!.attempt}`,
+    );
+  }
   const fetched = await assertResult(
     ctx,
     builder.account,
@@ -1299,7 +1327,7 @@ async function submitAndDecrypt(
     submittedAt,
   );
 
-  return { job, submitMs, ...fetched };
+  return { job, submitMs, completeMs, ...fetched };
 }
 
 // Provision one remote node with WORK_DELAY_MS=120000 and keep the other fast.
@@ -1747,12 +1775,13 @@ async function main(): Promise<void> {
       expectedVersion,
     );
     completedJob = completed.job;
-    return `submit_ms=${completed.submitMs} ttfb_ms=${completed.ttfbMs} fetch_ms=${completed.fetchMs} decrypt_ms=${completed.decryptMs} result_size=${completed.resultSize}`;
+    return `submit_ms=${completed.submitMs} complete_ms=${completed.completeMs} ttfb_ms=${completed.ttfbMs} fetch_ms=${completed.fetchMs} decrypt_ms=${completed.decryptMs} result_size=${completed.resultSize}`;
   });
 
   if (ctx.warmRuns > 0) {
     await runStep("9w", "warm submit and decrypt cycles", ["9"], async () => {
-      const timings: number[] = [];
+      const submitTimings: number[] = [];
+      const completeTimings: number[] = [];
       for (let run = 0; run < ctx.warmRuns; run += 1) {
         const completed = await submitAndDecrypt(
           ctx,
@@ -1761,9 +1790,10 @@ async function main(): Promise<void> {
           grantId!,
           expectedVersion,
         );
-        timings.push(completed.submitMs);
+        submitTimings.push(completed.submitMs);
+        completeTimings.push(completed.completeMs);
       }
-      return `warm_ms=${timings.join(",")}`;
+      return `submit_ms=${submitTimings.join(",")} complete_ms=${completeTimings.join(",")}`;
     });
   }
 
