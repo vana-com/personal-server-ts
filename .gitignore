@@ -19,3 +19,7 @@ RESULT-*.md
 
 # Downloaded frpc binaries (managed at runtime)
 packages/server/bin/
+/HANDOFF-*.md
+/RESULT-*.md
+/REVIEW-*.md
+/PREWARM-*.md
