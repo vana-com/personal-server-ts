@@ -13,10 +13,22 @@ load_images_env() {
 
   [[ -f $images_env ]] || return 0
   while IFS= read -r line || [[ -n $line ]]; do
-    if [[ ${PS_IMAGE+x} != x && $line =~ ^PS_IMAGE=[A-Za-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]; then
-      PS_IMAGE=${line#PS_IMAGE=}
-    elif [[ ${PS_IMAGE_REF+x} != x && $line =~ ^PS_IMAGE_REF=[0-9a-f]{40}$ ]]; then
-      PS_IMAGE_REF=${line#PS_IMAGE_REF=}
+    if [[ $line == PS_IMAGE=* ]]; then
+      if [[ $line =~ ^PS_IMAGE=[A-Za-z0-9._/:-]+@sha256:[0-9a-f]{64}$ ]]; then
+        if [[ ${PS_IMAGE+x} != x ]]; then
+          PS_IMAGE=${line#PS_IMAGE=}
+        fi
+      else
+        echo "warning: ignoring malformed PS_IMAGE line in $images_env." >&2
+      fi
+    elif [[ $line == PS_IMAGE_REF=* ]]; then
+      if [[ $line =~ ^PS_IMAGE_REF=[0-9a-f]{40}$ ]]; then
+        if [[ ${PS_IMAGE_REF+x} != x ]]; then
+          PS_IMAGE_REF=${line#PS_IMAGE_REF=}
+        fi
+      else
+        echo "warning: ignoring malformed PS_IMAGE_REF line in $images_env." >&2
+      fi
     fi
   done <"$images_env"
 }
