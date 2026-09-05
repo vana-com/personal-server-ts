@@ -254,6 +254,11 @@ export async function downloadOne(
       payloadKind,
       encryptedSizeBytes,
     });
+  } finally {
+    // Decrypt returns an independent plaintext buffer. Clear the encrypted
+    // payload immediately instead of retaining a second large record until
+    // the rest of indexing completes or the next garbage collection.
+    encrypted.fill(0);
   }
 
   // 6. Parse as DataFileEnvelope (validate)

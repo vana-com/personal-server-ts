@@ -977,7 +977,7 @@ export function isOwnerView(
  * data and stays. Redaction is at serve time only — the stored envelope, its
  * dataHash commitment, and the owner's view are unchanged.
  */
-function redactEnvelopeForGrantee(
+export function redactEnvelopeForGrantee(
   envelope: DataFileEnvelope,
 ): DataFileEnvelope {
   const {
@@ -1017,6 +1017,8 @@ function redactEnvelopeForGrantee(
   }
   return { ...envelope, data };
 }
+
+export { redactJsonEnvelopeBytesForGrantee } from "./raw-envelope.js";
 
 export async function handlePersonalServerDataRequest(
   request: Request,

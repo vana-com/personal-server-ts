@@ -1,0 +1,39 @@
+{
+  "name": "@opendatalabs/personal-server-ts-enclave",
+  "version": "0.0.1",
+  "private": true,
+  "description": "TEE node key agent primitives for the Vana Personal Server: dstack port, deterministic identity, sealing",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vana-com/personal-server-ts.git",
+    "directory": "packages/enclave"
+  },
+  "homepage": "https://github.com/vana-com/personal-server-ts#readme",
+  "bugs": {
+    "url": "https://github.com/vana-com/personal-server-ts/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc --build",
+    "start:agent": "node dist/agent/main.js"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.9.1",
+    "@noble/hashes": "^1.8.0",
+    "@opendatalabs/vana-sdk": "3.23.0-pr.211.fa01520",
+    "@phala/dstack-sdk": "0.5.8",
+    "viem": "^2.54.2"
+  }
+}

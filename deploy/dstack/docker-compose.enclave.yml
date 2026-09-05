@@ -1,0 +1,127 @@
+# CVM
+#  |
+#  +-> agent [dstack.sock: enclave key] -- TCP 2375 --> sandbox-runtime
+#                                                   [dind, privileged]
+#                                                            |
+#                                                            v
+#                                                   gVisor sandboxes
+#                                      [ps-<userPsId>-<epoch>, tmpfs /data,
+#                                       no dstack or Docker sockets]
+#
+# Production uses a digest-pinned agent image under one approved compose hash
+# (architecture decision 23). This clone bootstrap is for level-B testing only.
+#
+# PS_IMAGE must be a digest (vanaorg/personal-server@sha256:...) built from
+# this branch's Dockerfile. The currently published digest fails at startup
+# with ERR_MODULE_NOT_FOUND for @opendatalabs/vana-sdk.
+services:
+  agent:
+    image: "${AGENT_IMAGE:?AGENT_IMAGE must be a digest-pinned image reference}"
+    # A crash must not leave a running CVM unable to serve jobs.
+    restart: unless-stopped
+    stop_grace_period: 120s
+    working_dir: /app
+    ports:
+      - "8787:8787"
+    environment:
+      - ENCLAVE_AGENT_SECRET
+      - ENCLAVE_AGENT_HOST=0.0.0.0
+      - ENCLAVE_AGENT_PORT=8787
+      - SANDBOX_DEBUG
+      - GIT_REF
+      - GATEWAY_URL
+      - STORAGE_API_URL
+      - CHAIN_ID
+      - DATA_REGISTRY_CONTRACT
+      - DATA_PORTABILITY_SERVER_CONTRACT
+      - DATA_PORTABILITY_GRANTEES_CONTRACT
+      - DATA_PORTABILITY_PERMISSIONS_CONTRACT
+      - NODE_ID
+      - NODE_SECRET
+      - SANDBOX_RUNTIME=docker
+      - DOCKER_HOST=tcp://sandbox-runtime:2375
+      - PS_IMAGE
+      - SANDBOX_MAX
+      - SANDBOX_MEMORY
+      - SANDBOX_CPUS
+      - SANDBOX_PIDS_LIMIT
+      - SANDBOX_IDLE_TTL_SECONDS
+      - LEASE_SECONDS
+      - VERCEL_PROTECTION_BYPASS
+      - WORK_DELAY_MS
+      - SANDBOX_SYNC
+      - JOB_RESULT_MAX_BYTES
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    depends_on:
+      sandbox-runtime:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        date -u +%FT%TZ
+        apk add --no-cache docker-cli git
+        : "$${GIT_REF:?GIT_REF must be a 40-hex commit SHA}"
+        git init .
+        if git remote get-url origin >/dev/null 2>&1; then
+          git remote set-url origin https://github.com/vana-com/personal-server-ts
+        else
+          git remote add origin https://github.com/vana-com/personal-server-ts
+        fi
+        git fetch --depth 1 origin "$${GIT_REF}"
+        git checkout --detach --force FETCH_HEAD
+        resolved_ref="$$(git rev-parse HEAD)"
+        if [ "$${resolved_ref}" != "$${GIT_REF}" ]; then
+          echo "Checked out commit $${resolved_ref}, expected GIT_REF $${GIT_REF}" >&2
+          exit 1
+        fi
+        npm ci --no-audit --no-fund
+        date -u +%FT%TZ
+        npm run build -w @opendatalabs/personal-server-ts-enclave
+        date -u +%FT%TZ
+        exec npm run start:agent -w @opendatalabs/personal-server-ts-enclave
+
+  sandbox-runtime:
+    image: "${DIND_IMAGE:?DIND_IMAGE must be a digest-pinned image reference}"
+    # A crash must not leave a running CVM unable to serve jobs.
+    restart: unless-stopped
+    privileged: true
+    cgroup: host
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        gvisor_release=20260817
+        gvisor_sha512=bd8271a7742f90e53373b2a8613f37f3ae2c765ff5e2e611a75a47167a323cab7519b149c50273307743491713525a14ad1b3e398651c93b16f3e248dfeff3dd
+        gvisor_url="https://storage.googleapis.com/gvisor/releases/release/$${gvisor_release}/x86_64"
+        apk add --no-cache bzip2 coreutils curl iproute2 iptables
+        cd /tmp
+        curl -fsSLO "$${gvisor_url}/gvisor.tar.bz2"
+        printf '%s  %s\n' "$${gvisor_sha512}" gvisor.tar.bz2 | sha512sum -c -
+        tar -xjf gvisor.tar.bz2 -C /usr/local/bin
+        runsc install --runtime runsc-ptrace -- --platform=ptrace
+        runtime_host="$$(ip -4 addr show eth0 | awk '/inet / { sub(/\/.*/, "", $$2); print $$2; exit }')"
+        if [ -z "$${runtime_host}" ]; then
+          echo "Could not resolve the compose-network address; falling back to 0.0.0.0" >&2
+          runtime_host=0.0.0.0
+        fi
+        # These rules deny nested sandboxes access to the unauthenticated Docker API.
+        # --icc=false separately denies direct traffic between sandbox containers.
+        iptables -I INPUT -i docker0 -p tcp --dport 2375 -j DROP
+        iptables -I INPUT -i br-+ -p tcp --dport 2375 -j DROP
+        exec dockerd --host="tcp://$${runtime_host}:2375" --host=unix:///var/run/docker.sock --tls=false --storage-driver=overlay2 --icc=false
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          runtime_host="$$(ip -4 addr show eth0 | awk '/inet / { sub(/\/.*/, "", $$2); print $$2; exit }')" &&
+          test -n "$${runtime_host}" &&
+          docker --host="tcp://$${runtime_host}:2375" info
+      interval: 2s
+      timeout: 2s
+      retries: 60
+      start_period: 5s

@@ -1,0 +1,696 @@
+import {
+  MASTER_KEY_MESSAGE as SDK_MASTER_KEY_MESSAGE,
+  NodeECIESProvider,
+  serializeECIES,
+  verifyWeb3Signed,
+} from "@opendatalabs/vana-sdk/node";
+import {
+  MASTER_SIGNATURE_DELIVERY_VERSION,
+  type MasterSignatureDelivery,
+} from "@opendatalabs/vana-sdk/protocol/identity";
+import { createHash } from "node:crypto";
+import { vi } from "vitest";
+import type { Address, Hex } from "viem";
+import { keccak256, toBytes } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { createFakeDstackClient } from "../dstack/fake.js";
+import type { DstackClient } from "../dstack/client.js";
+import { userPsId, type UserPsId } from "../identity/paths.js";
+import { deriveEnclaveIdentity } from "../identity/wallet.js";
+import { unseal } from "../sealing/envelope.js";
+import { createAgentServer, type AgentJobsControl } from "./http.js";
+import type { SealRequestBody } from "./types.js";
+
+const SECRET = "agent-test-secret";
+const OWNER_KEY = keccak256(toBytes("enclave-agent-test:http-owner"));
+const OTHER_KEY = keccak256(toBytes("enclave-agent-test:http-other"));
+const OWNER = privateKeyToAccount(OWNER_KEY);
+const OTHER = privateKeyToAccount(OTHER_KEY);
+const CHAIN_ID = 14_800;
+const EPOCH = 2;
+const FAKE_APP_ID = "0000000000000000000000000000000000000003";
+const JOB_NODE_ID = "node-jobs";
+const HEALTH_PATH = "/agent/v1/health";
+const IDENTITY_PATH = "/agent/v1/identity";
+const SEAL_PATH = "/agent/v1/secrets/seal";
+const DRAIN_PATH = "/agent/v1/drain";
+const RESULT_SIGNING_PATH = "/agent/v1/job-results/sign";
+const SANDBOXES_PATH = "/agent/v1/sandboxes";
+const STORAGE_ORIGIN = "https://storage.example";
+const SANDBOX_TOKEN = "sandbox-access-token";
+const JOB_ID = "123e4567-e89b-42d3-a456-426614174000";
+const INVALID_ADDRESS = "invalid-address";
+const INVALID_HEX = "invalid-hex";
+const VALID_HEX = "0x00";
+const INFO_FAILURE = "info failed";
+const HASH_PATTERN = /^[0-9a-f]{64}$/;
+const INSTANCE_ID_PATTERN = /^[0-9a-f]{40}$/;
+const JSON_HEADERS = {
+  authorization: `Bearer ${SECRET}`,
+  "content-type": "application/json",
+};
+
+let server: ReturnType<typeof createAgentServer> | undefined;
+let origin = "";
+let activeServerAddress: Address;
+
+async function startServer(
+  client: DstackClient = createFakeDstackClient({ appId: FAKE_APP_ID }),
+  jobs?: AgentJobsControl,
+): Promise<void> {
+  server = createAgentServer({
+    client,
+    secret: SECRET,
+    ...(jobs ? { jobs } : {}),
+  });
+  await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("test server did not bind a TCP port");
+  }
+  origin = `http://127.0.0.1:${address.port}`;
+}
+
+async function stopServer(): Promise<void> {
+  if (server) {
+    await new Promise<void>((resolve, reject) =>
+      server!.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+  server = undefined;
+}
+
+beforeAll(async () => {
+  activeServerAddress = (
+    await deriveEnclaveIdentity(
+      createFakeDstackClient({ appId: FAKE_APP_ID }),
+      userPsId(CHAIN_ID, OWNER.address),
+      EPOCH,
+    )
+  ).address;
+});
+
+beforeEach(async () => {
+  await startServer();
+});
+
+afterEach(async () => {
+  await stopServer();
+});
+
+async function sealRequest(
+  signer = OWNER,
+  deliveryOwner = OWNER.address,
+): Promise<{ request: SealRequestBody; signature: Hex }> {
+  const client = createFakeDstackClient({ appId: FAKE_APP_ID });
+  const id = userPsId(CHAIN_ID, OWNER.address);
+  const identity = await deriveEnclaveIdentity(client, id, EPOCH);
+  const signature = await signer.signMessage({
+    message: SDK_MASTER_KEY_MESSAGE,
+  });
+  const delivery: MasterSignatureDelivery = {
+    v: MASTER_SIGNATURE_DELIVERY_VERSION,
+    userPsId: id,
+    epoch: EPOCH,
+    enclaveAddress: identity.address,
+    ownerAddress: deliveryOwner,
+    masterSignature: signature,
+    issuedAt: Math.floor(Date.now() / 1000),
+  };
+  const encrypted = await new NodeECIESProvider().encrypt(
+    toBytes(identity.publicKey),
+    new TextEncoder().encode(JSON.stringify(delivery)),
+  );
+
+  return {
+    signature,
+    request: {
+      ownerAddress: OWNER.address,
+      chainId: CHAIN_ID,
+      epoch: EPOCH,
+      enclaveAddress: identity.address,
+      ciphertext: `0x${serializeECIES(encrypted)}`,
+    },
+  };
+}
+
+async function post(path: string, body: unknown, headers = JSON_HEADERS) {
+  return fetch(`${origin}${path}`, {
+    method: "POST",
+    headers,
+    body: typeof body === "string" ? body : JSON.stringify(body),
+  });
+}
+
+async function expectError(
+  response: Response,
+  status: number,
+  code: string,
+): Promise<void> {
+  const body = (await response.json()) as { code: string; error: string };
+
+  expect(response.status).toBe(status);
+  expect(body.code).toBe(code);
+  expect(body.error.length).toBeGreaterThan(0);
+}
+
+function jobsControl(
+  lookup: AgentJobsControl["lookupSandboxJob"] = (_token, jobId) =>
+    jobId === JOB_ID
+      ? {
+          kind: "active",
+          job: {
+            jobId: JOB_ID,
+            chainId: CHAIN_ID,
+            owner: OWNER.address,
+            userPsId: userPsId(CHAIN_ID, OWNER.address),
+            epoch: EPOCH,
+            serverAddress: activeServerAddress,
+          },
+        }
+      : { kind: "inactive" },
+  sandboxDebug = false,
+): AgentJobsControl {
+  return {
+    nodeId: JOB_NODE_ID,
+    storageApiUrl: STORAGE_ORIGIN,
+    activeCount: vi.fn().mockReturnValue(1),
+    draining: vi.fn().mockReturnValue(false),
+    drain: vi.fn().mockResolvedValue(undefined),
+    sandboxDebug,
+    listSandboxes: vi.fn().mockResolvedValue([
+      {
+        key: "user:2",
+        containerId: "container-1",
+        running: true,
+        exitCode: 0,
+        oomKilled: false,
+        finishedAt: "0001-01-01T00:00:00Z",
+      },
+    ]),
+    sandboxLogs: vi.fn().mockResolvedValue("line one\nline two\n"),
+    lookupSandboxJob(token, jobId) {
+      return token === SANDBOX_TOKEN
+        ? lookup(token, jobId)
+        : { kind: "unauthorized" };
+    },
+  };
+}
+
+describe("agent HTTP server", () => {
+  it("hides sandbox debug routes when SANDBOX_DEBUG is disabled", async () => {
+    await stopServer();
+    await startServer(
+      createFakeDstackClient({ appId: FAKE_APP_ID }),
+      jobsControl(),
+    );
+
+    const response = await fetch(`${origin}${SANDBOXES_PATH}`, {
+      headers: JSON_HEADERS,
+    });
+
+    await expectError(response, 404, "NOT_FOUND");
+  });
+
+  it("lists sandboxes when SANDBOX_DEBUG is enabled", async () => {
+    const jobs = jobsControl(undefined, true);
+    await stopServer();
+    await startServer(createFakeDstackClient({ appId: FAKE_APP_ID }), jobs);
+
+    const response = await fetch(`${origin}${SANDBOXES_PATH}`, {
+      headers: JSON_HEADERS,
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(await jobs.listSandboxes());
+  });
+
+  it("clamps sandbox log tails to 500 lines", async () => {
+    const jobs = jobsControl(undefined, true);
+    await stopServer();
+    await startServer(createFakeDstackClient({ appId: FAKE_APP_ID }), jobs);
+
+    const response = await fetch(
+      `${origin}${SANDBOXES_PATH}/container-1/logs?tail=999`,
+      { headers: JSON_HEADERS },
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("text/plain");
+    expect(await response.text()).toBe("line one\nline two\n");
+    expect(jobs.sandboxLogs).toHaveBeenCalledWith("container-1", 500);
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["wrong length", "Bearer no"],
+    ["same length", `Bearer ${"x".repeat(SECRET.length)}`],
+  ])("returns 401 for %s bearer auth", async (_label, authorization) => {
+    const headers = authorization ? { authorization } : undefined;
+    const response = await fetch(`${origin}${HEALTH_PATH}`, { headers });
+
+    await expectError(response, 401, "UNAUTHORIZED");
+  });
+
+  it("returns health information", async () => {
+    const response = await fetch(`${origin}${HEALTH_PATH}`, {
+      headers: JSON_HEADERS,
+    });
+    const body = (await response.json()) as {
+      appId: string;
+      composeHash: string;
+      instanceId: string;
+      osImageHash: string;
+      osVersion: string;
+      nodeId: string | null;
+      activeSandboxes: number;
+      draining: boolean;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({
+      appId: FAKE_APP_ID,
+      osVersion: "fake",
+      nodeId: null,
+      activeSandboxes: 0,
+      draining: false,
+    });
+    expect(body.composeHash).toMatch(HASH_PATTERN);
+    expect(body.instanceId).toMatch(INSTANCE_ID_PATTERN);
+    expect(body.osImageHash).toMatch(HASH_PATTERN);
+  });
+
+  it("reports jobs state and drains through the operator route", async () => {
+    const jobs = {
+      nodeId: JOB_NODE_ID,
+      storageApiUrl: STORAGE_ORIGIN,
+      activeCount: vi.fn().mockReturnValue(3),
+      draining: vi.fn().mockReturnValue(true),
+      drain: vi.fn().mockResolvedValue(undefined),
+      sandboxDebug: false,
+      listSandboxes: vi.fn().mockResolvedValue([]),
+      sandboxLogs: vi.fn().mockResolvedValue(undefined),
+      lookupSandboxJob: vi.fn().mockReturnValue({ kind: "unauthorized" }),
+    } satisfies AgentJobsControl;
+    await stopServer();
+    await startServer(createFakeDstackClient({ appId: FAKE_APP_ID }), jobs);
+
+    const health = await fetch(`${origin}${HEALTH_PATH}`, {
+      headers: JSON_HEADERS,
+    });
+    expect(await health.json()).toMatchObject({
+      nodeId: JOB_NODE_ID,
+      activeSandboxes: 3,
+      draining: true,
+    });
+
+    const drain = await post(DRAIN_PATH, {});
+    expect(drain.status).toBe(200);
+    expect(await drain.json()).toEqual({ draining: true });
+    expect(jobs.drain).toHaveBeenCalledOnce();
+  });
+
+  it("signs only the active sandbox job result with its bound owner", async () => {
+    await stopServer();
+    await startServer(
+      createFakeDstackClient({ appId: FAKE_APP_ID }),
+      jobsControl(),
+    );
+    const bytes = new TextEncoder().encode("sealed-result");
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const response = await post(
+        RESULT_SIGNING_PATH,
+        {
+          jobId: JOB_ID,
+          chainId: CHAIN_ID,
+          owner: OWNER.address,
+          byteLength: bytes.byteLength,
+          bodyHash: `sha256:${digest}`,
+        },
+        {
+          authorization: `Bearer ${SANDBOX_TOKEN}`,
+          "content-type": "application/json",
+        },
+      );
+      const body = (await response.json()) as { authorization: string };
+      const uri = `/v1/job-results/${CHAIN_ID}/${OWNER.address.toLowerCase()}/${JOB_ID}`;
+      const verified = await verifyWeb3Signed({
+        headerValue: body.authorization,
+        expectedOrigin: STORAGE_ORIGIN,
+        expectedMethod: "PUT",
+        expectedPath: uri,
+        bodyBytes: bytes,
+      });
+
+      expect(response.status).toBe(200);
+      expect(verified.signer.toLowerCase()).toBe(
+        (
+          await deriveEnclaveIdentity(
+            createFakeDstackClient({ appId: FAKE_APP_ID }),
+            userPsId(CHAIN_ID, OWNER.address),
+            EPOCH,
+          )
+        ).address.toLowerCase(),
+      );
+      expect(errorSpy).toHaveBeenCalledWith(
+        {
+          jobId: JOB_ID,
+          key: `jobresults/${CHAIN_ID}/${JOB_ID}`,
+          size: bytes.byteLength,
+        },
+        "Signed job result upload",
+      );
+      expect(JSON.stringify(errorSpy.mock.calls)).not.toContain(
+        body.authorization,
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("normalizes an uppercase result-signing job id", async () => {
+    const jobs = jobsControl();
+    const lookup = vi.spyOn(jobs, "lookupSandboxJob");
+    await stopServer();
+    await startServer(createFakeDstackClient({ appId: FAKE_APP_ID }), jobs);
+
+    const response = await post(
+      RESULT_SIGNING_PATH,
+      {
+        jobId: JOB_ID.toUpperCase(),
+        chainId: CHAIN_ID,
+        owner: OWNER.address,
+        byteLength: 1,
+        bodyHash: `sha256:${"00".repeat(32)}`,
+      },
+      {
+        authorization: `Bearer ${SANDBOX_TOKEN}`,
+        "content-type": "application/json",
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(lookup).toHaveBeenCalledWith(SANDBOX_TOKEN, JOB_ID);
+  });
+
+  it("rejects a traversal result-signing job id", async () => {
+    const jobs = jobsControl();
+    const lookup = vi.spyOn(jobs, "lookupSandboxJob");
+    await stopServer();
+    await startServer(createFakeDstackClient({ appId: FAKE_APP_ID }), jobs);
+
+    const response = await post(
+      RESULT_SIGNING_PATH,
+      {
+        jobId: "../../chains/14800/owner/scope",
+        chainId: CHAIN_ID,
+        owner: OWNER.address,
+        byteLength: 1,
+        bodyHash: `sha256:${"00".repeat(32)}`,
+      },
+      {
+        authorization: `Bearer ${SANDBOX_TOKEN}`,
+        "content-type": "application/json",
+      },
+    );
+
+    await expectError(response, 400, "BAD_REQUEST");
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
+  it("rejects a signing request authenticated with the operator secret", async () => {
+    await stopServer();
+    await startServer(
+      createFakeDstackClient({ appId: FAKE_APP_ID }),
+      jobsControl(),
+    );
+
+    const response = await post(RESULT_SIGNING_PATH, {
+      jobId: JOB_ID,
+      chainId: CHAIN_ID,
+      owner: OWNER.address,
+      byteLength: 1,
+      bodyHash: `sha256:${"00".repeat(32)}`,
+    });
+
+    await expectError(response, 401, "UNAUTHORIZED");
+  });
+
+  it.each([
+    ["inactive job", jobsControl(() => ({ kind: "inactive" }))],
+    [
+      "owner mismatch",
+      jobsControl(() => ({
+        kind: "active",
+        job: {
+          jobId: JOB_ID,
+          chainId: CHAIN_ID,
+          owner: OTHER.address,
+          userPsId: userPsId(CHAIN_ID, OTHER.address) as UserPsId,
+          epoch: EPOCH,
+          serverAddress: OTHER.address,
+        },
+      })),
+    ],
+  ])("refuses signing for %s", async (_label, jobs) => {
+    await stopServer();
+    await startServer(createFakeDstackClient({ appId: FAKE_APP_ID }), jobs);
+
+    const response = await post(
+      RESULT_SIGNING_PATH,
+      {
+        jobId: JOB_ID,
+        chainId: CHAIN_ID,
+        owner: OWNER.address,
+        byteLength: 1,
+        bodyHash: `sha256:${"00".repeat(32)}`,
+      },
+      {
+        authorization: `Bearer ${SANDBOX_TOKEN}`,
+        "content-type": "application/json",
+      },
+    );
+
+    await expectError(response, 403, "SIGNING_REFUSED");
+  });
+
+  it("refuses a chain id that differs from the active job", async () => {
+    await stopServer();
+    await startServer(
+      createFakeDstackClient({ appId: FAKE_APP_ID }),
+      jobsControl(),
+    );
+
+    const response = await post(
+      RESULT_SIGNING_PATH,
+      {
+        jobId: JOB_ID,
+        chainId: CHAIN_ID + 1,
+        owner: OWNER.address,
+        byteLength: 1,
+        bodyHash: `sha256:${"00".repeat(32)}`,
+      },
+      {
+        authorization: `Bearer ${SANDBOX_TOKEN}`,
+        "content-type": "application/json",
+      },
+    );
+
+    await expectError(response, 403, "SIGNING_REFUSED");
+  });
+
+  it.each([
+    ["zero byte length", { byteLength: 0 }],
+    ["non-canonical body hash", { bodyHash: `0x${"00".repeat(32)}` }],
+  ])("rejects signing input with %s", async (_label, override) => {
+    await stopServer();
+    await startServer(
+      createFakeDstackClient({ appId: FAKE_APP_ID }),
+      jobsControl(),
+    );
+
+    const response = await post(
+      RESULT_SIGNING_PATH,
+      {
+        jobId: JOB_ID,
+        chainId: CHAIN_ID,
+        owner: OWNER.address,
+        byteLength: 1,
+        bodyHash: `sha256:${"00".repeat(32)}`,
+        ...override,
+      },
+      {
+        authorization: `Bearer ${SANDBOX_TOKEN}`,
+        "content-type": "application/json",
+      },
+    );
+
+    await expectError(response, 400, "BAD_REQUEST");
+  });
+
+  it("returns INTERNAL and logs an unexpected health failure", async () => {
+    const client = createFakeDstackClient({ appId: FAKE_APP_ID });
+    client.info = async () => {
+      throw new Error(INFO_FAILURE);
+    };
+    await stopServer();
+    await startServer(client);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const response = await fetch(`${origin}${HEALTH_PATH}`, {
+        headers: JSON_HEADERS,
+      });
+
+      expect(response.status).toBe(500);
+      expect(await response.json()).toEqual({
+        code: "INTERNAL",
+        error: "internal server error",
+      });
+      expect(errorSpy).toHaveBeenCalledWith({
+        path: HEALTH_PATH,
+        error: `Error: ${INFO_FAILURE}`,
+      });
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("returns identity evidence", async () => {
+    const response = await post(IDENTITY_PATH, {
+      ownerAddress: OWNER.address,
+      chainId: CHAIN_ID,
+      epoch: EPOCH,
+    });
+    const body = (await response.json()) as {
+      ownerAddress: Address;
+      v: number;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({ ownerAddress: OWNER.address, v: 1 });
+  });
+
+  it("seals a valid delivery", async () => {
+    const { request, signature } = await sealRequest();
+    const response = await post(SEAL_PATH, request);
+    const body = (await response.json()) as {
+      envelope: Parameters<typeof unseal>[3];
+      secretHash: Hex;
+    };
+    const recovered = await unseal(
+      createFakeDstackClient({ appId: FAKE_APP_ID }),
+      userPsId(CHAIN_ID, OWNER.address),
+      EPOCH,
+      body.envelope,
+    );
+
+    expect(response.status).toBe(200);
+    expect(`0x${Buffer.from(recovered).toString("hex")}`).toBe(signature);
+    expect(body.secretHash).toMatch(/^0x[0-9a-f]{64}$/);
+  });
+
+  it("maps a retired epoch to 409", async () => {
+    const { request } = await sealRequest();
+    const response = await post(SEAL_PATH, {
+      ...request,
+      minEpoch: EPOCH + 1,
+    });
+
+    await expectError(response, 409, "EPOCH_RETIRED");
+  });
+
+  it("maps an owner mismatch to 422", async () => {
+    const { request } = await sealRequest(OTHER);
+    const response = await post(SEAL_PATH, request);
+
+    await expectError(response, 422, "OWNER_MISMATCH");
+  });
+
+  it("maps a delivery ownerAddress mismatch to 422", async () => {
+    const { request } = await sealRequest(OWNER, OTHER.address);
+    const response = await post(SEAL_PATH, request);
+
+    await expectError(response, 422, "OWNER_MISMATCH");
+  });
+
+  it("rejects bodies over 64 KiB", async () => {
+    const response = await post(
+      IDENTITY_PATH,
+      JSON.stringify({ padding: "x".repeat(64 * 1024) }),
+    );
+
+    await expectError(response, 413, "BODY_TOO_LARGE");
+  });
+
+  it("rejects bad JSON", async () => {
+    const response = await post(IDENTITY_PATH, "{");
+
+    await expectError(response, 400, "BAD_REQUEST");
+  });
+
+  it.each([
+    [
+      "bad ownerAddress",
+      IDENTITY_PATH,
+      { ownerAddress: INVALID_ADDRESS, chainId: CHAIN_ID, epoch: EPOCH },
+    ],
+    [
+      "zero epoch",
+      IDENTITY_PATH,
+      { ownerAddress: OWNER.address, chainId: CHAIN_ID, epoch: 0 },
+    ],
+    [
+      "fractional chainId",
+      IDENTITY_PATH,
+      { ownerAddress: OWNER.address, chainId: 1.5, epoch: EPOCH },
+    ],
+    [
+      "non-hex ciphertext",
+      SEAL_PATH,
+      {
+        ownerAddress: OWNER.address,
+        chainId: CHAIN_ID,
+        epoch: EPOCH,
+        enclaveAddress: OTHER.address,
+        ciphertext: INVALID_HEX,
+      },
+    ],
+    [
+      "zero minEpoch",
+      SEAL_PATH,
+      {
+        ownerAddress: OWNER.address,
+        chainId: CHAIN_ID,
+        epoch: EPOCH,
+        enclaveAddress: OTHER.address,
+        ciphertext: VALID_HEX,
+        minEpoch: 0,
+      },
+    ],
+    ["JSON array", IDENTITY_PATH, []],
+  ])("returns BAD_REQUEST for %s", async (_label, path, body) => {
+    const response = await post(path, body);
+
+    await expectError(response, 400, "BAD_REQUEST");
+  });
+
+  it("returns NOT_FOUND for the wrong method on a known route", async () => {
+    const response = await fetch(`${origin}${IDENTITY_PATH}`, {
+      headers: JSON_HEADERS,
+    });
+
+    await expectError(response, 404, "NOT_FOUND");
+  });
+
+  it("returns 404 for unknown paths", async () => {
+    const response = await fetch(`${origin}/agent/v1/missing`, {
+      headers: JSON_HEADERS,
+    });
+
+    await expectError(response, 404, "NOT_FOUND");
+  });
+});

@@ -204,6 +204,18 @@ describe("download worker", () => {
       });
     });
 
+    it("clears the encrypted download after decryption completes", async () => {
+      const deps = makeMockDeps();
+      const encrypted = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
+      (
+        deps.storageAdapter.download as ReturnType<typeof vi.fn>
+      ).mockResolvedValue(encrypted);
+
+      await downloadOne(deps, makeDataPointRecord());
+
+      expect(encrypted).toEqual(new Uint8Array(encrypted.byteLength));
+    });
+
     it("skips and attaches dataPointId when the same version already exists locally", async () => {
       const deps = makeMockDeps();
       const existingEntry: IndexEntry = {
