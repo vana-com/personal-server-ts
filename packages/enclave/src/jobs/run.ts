@@ -5,7 +5,7 @@ import type {
 import { getAddress, toHex, type Address, type Hex } from "viem";
 import type { DstackClient } from "../dstack/client.js";
 import { decryptEcies } from "../agent/ecies.js";
-import { deriveEnclaveKey } from "../identity/wallet.js";
+import { deriveEnclaveIdentity, deriveEnclaveKey } from "../identity/wallet.js";
 import { isNonTransientDockerSandboxError } from "../sandbox/docker-runtime.js";
 import { SandboxSyncBlockedError } from "../sandbox/probes.js";
 import type { SandboxRegistry } from "../sandbox/registry.js";
@@ -130,6 +130,7 @@ export type PrewarmDeps = Pick<
   | "sync"
   | "logger"
   | "jobResultMaxBytes"
+  | "now"
 >;
 
 export class SandboxChainMismatchError extends Error {
@@ -150,41 +151,53 @@ export async function prewarmSandbox(
   deps: PrewarmDeps,
 ): Promise<void> {
   const registryKey = `${identity.userPsId}:${identity.epoch}`;
-  const startedAt = Date.now();
+  const now = deps.now ?? Date.now;
+  const startedAt = now();
   const acquireEvents = new Set<string>();
   let hydratedScopes: string[] | undefined;
   let signature: Uint8Array | undefined;
   let acquired = false;
 
   try {
+    const derivedIdentity = await deriveEnclaveIdentity(
+      deps.client,
+      identity.userPsId,
+      identity.epoch,
+    );
+    const sandboxIdentity: ClaimedIdentity = {
+      ...identity,
+      enclaveAddress: derivedIdentity.address,
+      enclavePublicKey: derivedIdentity.publicKey,
+    };
     signature = await unseal(
       deps.client,
       identity.userPsId,
       identity.epoch,
       identity.sealedEnvelope,
     );
-    logPrewarmAcquisitionEvent(
-      deps.logger,
-      identity,
+    const sandboxSignature = signature;
+    const logKind: AcquisitionLogKind = {
+      kind: "prewarm",
+      userPsId: identity.userPsId,
+      epoch: identity.epoch,
       scope,
-      "start",
-      startedAt,
-    );
+    };
+    logAcquisitionEvent(deps.logger, logKind, "start", startedAt, now());
     await deps.registry.acquire(registryKey, (accessToken) => {
       const spec = sandboxSpec(
-        identity,
+        sandboxIdentity,
         deps,
         accessToken,
-        signature!,
+        sandboxSignature,
         scope,
         (event) => {
           acquireEvents.add(event);
-          logPrewarmAcquisitionEvent(
+          logAcquisitionEvent(
             deps.logger,
-            identity,
-            scope,
+            logKind,
             event,
             startedAt,
+            now(),
             event === "synced" ? hydratedScopes : undefined,
           );
         },
@@ -192,19 +205,19 @@ export async function prewarmSandbox(
           hydratedScopes = status.lastSyncStatus?.hydratedScopes;
         },
       );
-      signature!.fill(0);
+      sandboxSignature.fill(0);
 
       return spec;
     });
     acquired = true;
     for (const event of ["healthy", "synced"] as const) {
       if (!acquireEvents.has(event)) {
-        logPrewarmAcquisitionEvent(
+        logAcquisitionEvent(
           deps.logger,
-          identity,
-          scope,
+          logKind,
           event,
           startedAt,
+          now(),
           event === "synced" ? hydratedScopes : undefined,
         );
       }
@@ -295,7 +308,7 @@ export async function runJob(
     let hydratedScopes: string[] | undefined;
     logAcquisitionEvent(
       deps.logger,
-      job.jobId,
+      { kind: "job", jobId: job.jobId },
       "start",
       acquireStartedAt,
       now(),
@@ -314,7 +327,7 @@ export async function runJob(
               acquireEvents.add(event);
               logAcquisitionEvent(
                 deps.logger,
-                job.jobId,
+                { kind: "job", jobId: job.jobId },
                 event,
                 acquireStartedAt,
                 now(),
@@ -336,7 +349,7 @@ export async function runJob(
         if (!acquireEvents.has(event)) {
           logAcquisitionEvent(
             deps.logger,
-            job.jobId,
+            { kind: "job", jobId: job.jobId },
             event,
             acquireStartedAt,
             now(),
@@ -681,43 +694,36 @@ function logNodeFault(logger: JobLogger, jobId: string, error: unknown): void {
   );
 }
 
+type AcquisitionLogKind =
+  | { kind: "job"; jobId: string }
+  | {
+      kind: "prewarm";
+      userPsId: ClaimedIdentity["userPsId"];
+      epoch: number;
+      scope: string;
+    };
+
 function logAcquisitionEvent(
   logger: JobLogger,
-  jobId: string,
-  event: "start" | "healthy" | "synced",
+  kind: AcquisitionLogKind,
+  milestone: "start" | "healthy" | "synced",
   startedAt: number,
   currentTime: number,
   hydratedScopes?: string[],
 ): void {
   logger.info(
     {
-      jobId,
+      ...(kind.kind === "job"
+        ? { jobId: kind.jobId, event: milestone }
+        : {
+            event: "prewarm",
+            milestone,
+            userPsId: kind.userPsId,
+            epoch: kind.epoch,
+            scope: kind.scope,
+          }),
       stage: SANDBOX_ACQUIRE_STAGE,
-      event,
       elapsedMs: Math.max(0, currentTime - startedAt),
-      ...(hydratedScopes ? { hydratedScopes } : {}),
-    },
-    "Sandbox acquisition progress",
-  );
-}
-
-function logPrewarmAcquisitionEvent(
-  logger: JobLogger,
-  identity: ClaimedIdentity,
-  scope: string,
-  milestone: "start" | "healthy" | "synced",
-  startedAt: number,
-  hydratedScopes?: string[],
-): void {
-  logger.info(
-    {
-      stage: "sandbox-acquire",
-      event: "prewarm",
-      milestone,
-      userPsId: identity.userPsId,
-      epoch: identity.epoch,
-      scope,
-      elapsedMs: Math.max(0, Date.now() - startedAt),
       ...(hydratedScopes ? { hydratedScopes } : {}),
     },
     "Sandbox acquisition progress",
