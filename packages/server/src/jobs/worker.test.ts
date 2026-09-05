@@ -644,4 +644,97 @@ describe("executeJob", () => {
 
     await expectFailure(fixture, "RESULT_UPLOAD_FAILED", true);
   });
+
+  it("times out result signing as a retryable failure", async () => {
+    vi.useFakeTimers();
+    const timeout = fakeAbortSignalTimeout();
+    try {
+      const fixture = await createFixture();
+      fixture.resultUploadFetch.mockReset();
+      fixture.resultUploadFetch.mockImplementationOnce(hangUntilAborted);
+
+      const outcome = executeJob(fixture.envelope, fixture.deps).catch(
+        (error: unknown) => error,
+      );
+      await vi.waitFor(() =>
+        expect(fixture.resultUploadFetch).toHaveBeenCalledOnce(),
+      );
+      expect(
+        fixture.resultUploadFetch.mock.calls[0]?.[1]?.signal,
+      ).toBeDefined();
+      await vi.advanceTimersByTimeAsync(15_000);
+
+      await expect(outcome).resolves.toMatchObject({
+        code: "RESULT_UPLOAD_FAILED",
+        retryable: true,
+        message: "result signing request timed out after 15000ms",
+      });
+    } finally {
+      timeout.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("times out result upload as a retryable failure", async () => {
+    vi.useFakeTimers();
+    const timeout = fakeAbortSignalTimeout();
+    try {
+      const fixture = await createFixture();
+      fixture.resultUploadFetch.mockReset();
+      fixture.resultUploadFetch
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({ authorization: "Web3Signed result-signature" }),
+            { status: 200 },
+          ),
+        )
+        .mockImplementationOnce(hangUntilAborted);
+
+      const outcome = executeJob(fixture.envelope, fixture.deps).catch(
+        (error: unknown) => error,
+      );
+      await vi.waitFor(() =>
+        expect(fixture.resultUploadFetch).toHaveBeenCalledTimes(2),
+      );
+      expect(
+        fixture.resultUploadFetch.mock.calls[1]?.[1]?.signal,
+      ).toBeDefined();
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      await expect(outcome).resolves.toMatchObject({
+        code: "RESULT_UPLOAD_FAILED",
+        retryable: true,
+        message: "result upload timed out after 120000ms",
+      });
+    } finally {
+      timeout.mockRestore();
+      vi.useRealTimers();
+    }
+  });
 });
+
+function fakeAbortSignalTimeout(): ReturnType<
+  typeof vi.spyOn<typeof AbortSignal, "timeout">
+> {
+  return vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
+    const controller = new AbortController();
+    setTimeout(
+      () =>
+        controller.abort(new DOMException("request timed out", "TimeoutError")),
+      milliseconds,
+    );
+
+    return controller.signal;
+  });
+}
+
+function hangUntilAborted(
+  _input: string | URL | Request,
+  init?: RequestInit,
+): Promise<Response> {
+  return new Promise((_resolve, reject) => {
+    init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), {
+      once: true,
+    });
+  });
+}

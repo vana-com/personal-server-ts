@@ -51,6 +51,8 @@ const MILLISECONDS_PER_SECOND = 1_000;
 const JOB_EXECUTION_FAILED_LOG = "Enclave job execution failed";
 const JOB_EXECUTION_PROGRESS_LOG = "Enclave job execution progress";
 const RESULT_SIGNING_PATH = "/agent/v1/job-results/sign";
+const RESULT_SIGNING_TIMEOUT_MS = 15_000;
+const RESULT_UPLOAD_TIMEOUT_MS = 120_000;
 const RESULT_OBJECT_PREFIX = "jobresults";
 const PUT = "PUT";
 const JOB_ID_PATTERN =
@@ -334,6 +336,7 @@ async function requestUploadSignature(
   request: UploadSignatureRequest,
 ): Promise<string> {
   let response: Response;
+  const timeoutSignal = AbortSignal.timeout(RESULT_SIGNING_TIMEOUT_MS);
   try {
     response = await requestFetch(
       `${request.agentEndpoint.replace(/\/$/, "")}${RESULT_SIGNING_PATH}`,
@@ -350,9 +353,17 @@ async function requestUploadSignature(
           byteLength: request.byteLength,
           bodyHash: request.bodyHash,
         }),
+        signal: timeoutSignal,
       },
     );
   } catch {
+    if (timeoutSignal.aborted) {
+      throw new JobFailure(
+        "RESULT_UPLOAD_FAILED",
+        `result signing request timed out after ${RESULT_SIGNING_TIMEOUT_MS}ms`,
+        true,
+      );
+    }
     throw new JobFailure(
       "RESULT_UPLOAD_FAILED",
       "result signing service is unavailable",
@@ -378,6 +389,13 @@ async function requestUploadSignature(
   try {
     body = await response.json();
   } catch {
+    if (timeoutSignal.aborted) {
+      throw new JobFailure(
+        "RESULT_UPLOAD_FAILED",
+        `result signing request timed out after ${RESULT_SIGNING_TIMEOUT_MS}ms`,
+        true,
+      );
+    }
     body = undefined;
   }
   if (
@@ -409,6 +427,7 @@ async function uploadResult(
   request: ResultUploadRequest,
 ): Promise<void> {
   let response: Response;
+  const timeoutSignal = AbortSignal.timeout(RESULT_UPLOAD_TIMEOUT_MS);
   try {
     const storageOrigin = new URL(request.storageEndpoint).origin;
     response = await requestFetch(`${storageOrigin}${request.path}`, {
@@ -422,8 +441,16 @@ async function uploadResult(
         request.body.byteOffset,
         request.body.byteLength,
       ),
+      signal: timeoutSignal,
     });
   } catch {
+    if (timeoutSignal.aborted) {
+      throw new JobFailure(
+        "RESULT_UPLOAD_FAILED",
+        `result upload timed out after ${RESULT_UPLOAD_TIMEOUT_MS}ms`,
+        true,
+      );
+    }
     throw new JobFailure("RESULT_UPLOAD_FAILED", "result upload failed", true);
   }
   if (response.status === 413) {
