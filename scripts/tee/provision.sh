@@ -76,6 +76,10 @@ else
   : "${NODE_SECRET:?NODE_SECRET must be set in the environment}"
   : "${NODE_ID:?NODE_ID must be set in the environment}"
   : "${GATEWAY_URL:?GATEWAY_URL must be set in the environment}"
+  if [[ ! $git_ref =~ ^[[:xdigit:]]{40}$ ]]; then
+    echo "--ref must be a 40-hex commit SHA for the enclave compose; branch names are mutable" >&2
+    exit 1
+  fi
   if [[ ${compose##*/} == docker-compose.enclave.inline.yml ]]; then
     if [[ -z ${PS_IMAGE:-} ]]; then
       PS_IMAGE=personal-server:local
@@ -91,12 +95,6 @@ else
       echo "PS_IMAGE must be an image digest such as vanaorg/personal-server@sha256:<64 hex characters>" >&2
       exit 1
     fi
-  fi
-  if [[ ! $git_ref =~ ^[[:xdigit:]]{40}$ ]]; then
-    echo "--ref must be a 40-hex commit SHA for the enclave compose; branch names are mutable" >&2
-    exit 1
-  fi
-  if [[ ${compose##*/} != docker-compose.enclave.inline.yml ]]; then
     GIT_REF=$git_ref
     assert_ps_image_ref
   fi

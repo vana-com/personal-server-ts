@@ -79,6 +79,62 @@ printf '%s\\n' "$PS_IMAGE" "$PS_IMAGE_REF" "$GIT_REF" "$AGENT_IMAGE" "$DIND_IMAG
     ]);
   });
 
+  it("accepts a digest from a registry host with a port", () => {
+    const root = temporaryRoot();
+    const imagesEnv = join(root, "images.env");
+    const common = join(repositoryRoot, "scripts/tee/common.sh");
+    const image = `registry.example:5000/personal-server@sha256:${digest}`;
+    writeFileSync(imagesEnv, `PS_IMAGE=${image}\n`);
+
+    const result = spawnSync(
+      "bash",
+      [
+        "-c",
+        `set -euo pipefail
+source "$1"
+load_images_env "$2"
+printf '%s\\n' "$PS_IMAGE"`,
+        "test",
+        common,
+        imagesEnv,
+      ],
+      { encoding: "utf8" },
+    );
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout.trim()).toBe(image);
+  });
+
+  it("warns when a PS_IMAGE line nearly matches but is malformed", () => {
+    const root = temporaryRoot();
+    const imagesEnv = join(root, "images.env");
+    const common = join(repositoryRoot, "scripts/tee/common.sh");
+    writeFileSync(
+      imagesEnv,
+      `PS_IMAGE=vanaorg/personal-server@sha256:${digest}\r\n`,
+    );
+
+    const result = spawnSync(
+      "bash",
+      [
+        "-c",
+        `set -euo pipefail
+source "$1"
+load_images_env "$2"
+[[ \${PS_IMAGE+x} != x ]]`,
+        "test",
+        common,
+        imagesEnv,
+      ],
+      { encoding: "utf8" },
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain(
+      "warning: ignoring malformed PS_IMAGE line",
+    );
+  });
+
   it("does not load images.env for provision --inline", () => {
     const root = temporaryRoot();
     const scriptDirectory = join(root, "scripts/tee");
@@ -184,6 +240,9 @@ esac
 `,
     );
     chmodSync(git, 0o755);
+    const phala = join(binDirectory, "phala");
+    writeFileSync(phala, "#!/bin/sh\necho reached-phala >&2\nexit 77\n");
+    chmodSync(phala, 0o755);
 
     const environment = { ...process.env };
     delete environment.PS_IMAGE;
@@ -214,5 +273,45 @@ esac
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("reached-git-fetch");
     expect(existsSync(marker)).toBe(false);
+  });
+
+  it("rejects a mutable PS_IMAGE before replicate uses external tools", () => {
+    const root = temporaryRoot();
+    const scriptDirectory = join(root, "scripts/tee");
+    mkdirSync(scriptDirectory, { recursive: true });
+    copyFileSync(
+      join(repositoryRoot, "scripts/tee/common.sh"),
+      join(scriptDirectory, "common.sh"),
+    );
+    copyFileSync(
+      join(repositoryRoot, "scripts/tee/replicate.sh"),
+      join(scriptDirectory, "replicate.sh"),
+    );
+
+    const result = spawnSync(
+      "bash",
+      [
+        join(scriptDirectory, "replicate.sh"),
+        "replica-test",
+        "source-cvm",
+        "--secret-out",
+        join(root, "node-secret"),
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          ENCLAVE_AGENT_SECRET: "test-agent-secret",
+          GATEWAY_URL: "https://gateway.example",
+          GIT_REF: sha,
+          PS_IMAGE: "vanaorg/personal-server:latest",
+          AGENT_IMAGE: `node@sha256:${digest}`,
+          DIND_IMAGE: `docker@sha256:${digest}`,
+        },
+      },
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("PS_IMAGE must be an image digest");
   });
 });
