@@ -24,14 +24,18 @@ COPY packages/ packages/
 # compiles repo-local scripts that are intentionally absent from this image.
 RUN npm run build --workspace @opendatalabs/personal-server-ts-core \
   && npm run build --workspace @opendatalabs/personal-server-ts-lite \
-  && npm run build --workspace @opendatalabs/personal-server-ts-server
+  && npm run build --workspace @opendatalabs/personal-server-ts-server \
+  && npm run build:bundle --workspace @opendatalabs/personal-server-ts-server
 
-# Prune dev dependencies after build
-RUN npm prune --omit=dev
-
-# npm may hoist every dependency for a workspace, leaving no workspace-local
-# node_modules directory for the legacy builder's runtime-stage COPY commands.
-RUN for d in packages/*; do mkdir -p "$d/node_modules"; done
+# Install only the packages deliberately kept external to the bundle. Skip
+# lifecycle scripts, then reuse the better-sqlite3 addon built by npm ci.
+RUN mkdir -p /runtime-deps \
+  && cp packages/server/bundle-runtime/package.json \
+    packages/server/bundle-runtime/package-lock.json /runtime-deps/ \
+  && npm ci --prefix /runtime-deps --omit=dev --ignore-scripts \
+    --no-audit --no-fund --prefer-offline \
+  && cp -R node_modules/better-sqlite3/build \
+    /runtime-deps/node_modules/better-sqlite3/build
 
 # ---------- runtime stage ----------
 FROM node:22-alpine
@@ -42,20 +46,16 @@ RUN apk add --no-cache libstdc++ \
 
 WORKDIR /app
 
-# Copy built output and production node_modules from build stage
-COPY --from=build --chown=vana:vana /app/package.json /app/package-lock.json ./
-COPY --from=build --chown=vana:vana /app/node_modules/ node_modules/
-
-# Each runtime workspace needs package.json and dist/. Dependencies that npm keeps
-# workspace-local after pruning must be copied beside that workspace.
-COPY --from=build --chown=vana:vana /app/packages/core/package.json packages/core/package.json
-COPY --from=build --chown=vana:vana /app/packages/core/dist/ packages/core/dist/
-COPY --from=build --chown=vana:vana /app/packages/core/node_modules/ packages/core/node_modules/
-
-COPY --from=build --chown=vana:vana /app/packages/lite/node_modules/ packages/lite/node_modules/
-
+# Ship the bundle, its disk-resolved assets, and only external runtime packages.
+COPY --from=build --chown=vana:vana /runtime-deps/node_modules/ node_modules/
 COPY --from=build --chown=vana:vana /app/packages/server/package.json packages/server/package.json
-COPY --from=build --chown=vana:vana /app/packages/server/dist/ packages/server/dist/
+COPY --from=build --chown=vana:vana /app/packages/server/dist/package.json packages/server/dist/package.json
+COPY --from=build --chown=vana:vana /app/packages/server/dist/bundle/ packages/server/dist/bundle/
+COPY --from=build --chown=vana:vana /app/packages/server/dist/ui/ packages/server/dist/ui/
+
+# Preserve the established non-enclave invocation while resolving import.meta
+# from the bundle's real path. The image's default CMD uses the bundle directly.
+RUN ln -s bundle/enclave-main.mjs packages/server/dist/index.js
 
 # Data directory for SQLite DB, keys, logs
 RUN mkdir -p /data && chown vana:vana /data
@@ -79,4 +79,4 @@ USER vana
 # handles this (runs as root before docker run). For local dev, run with:
 #   docker run --user root -e ... vana/personal-server
 # or pre-chown the host directory.
-CMD ["node", "packages/server/dist/index.js"]
+CMD ["node", "packages/server/dist/bundle/enclave-main.mjs"]
