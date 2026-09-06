@@ -24,17 +24,17 @@ COPY packages/ packages/
 # compiles repo-local scripts that are intentionally absent from this image.
 RUN npm run build --workspace @opendatalabs/personal-server-ts-core \
   && npm run build --workspace @opendatalabs/personal-server-ts-lite \
-  && npm run build --workspace @opendatalabs/personal-server-ts-server \
-  && npm run build:bundle --workspace @opendatalabs/personal-server-ts-server
+  && npm run build --workspace @opendatalabs/personal-server-ts-server
 
 # Install only the packages deliberately kept external to the bundle. Skip
 # lifecycle scripts, then reuse the better-sqlite3 addon built by npm ci.
 RUN mkdir -p /runtime-deps \
   && cp packages/server/bundle-runtime/package.json \
     packages/server/bundle-runtime/package-lock.json /runtime-deps/ \
-  && npm ci --prefix /runtime-deps --omit=dev --ignore-scripts \
+  && cd /runtime-deps \
+  && npm ci --omit=dev --ignore-scripts \
     --no-audit --no-fund --prefer-offline \
-  && cp -R node_modules/better-sqlite3/build \
+  && cp -R /app/node_modules/better-sqlite3/build \
     /runtime-deps/node_modules/better-sqlite3/build
 
 # ---------- runtime stage ----------
@@ -48,7 +48,6 @@ WORKDIR /app
 
 # Ship the bundle, its disk-resolved assets, and only external runtime packages.
 COPY --from=build --chown=vana:vana /runtime-deps/node_modules/ node_modules/
-COPY --from=build --chown=vana:vana /app/packages/server/package.json packages/server/package.json
 COPY --from=build --chown=vana:vana /app/packages/server/dist/package.json packages/server/dist/package.json
 COPY --from=build --chown=vana:vana /app/packages/server/dist/bundle/ packages/server/dist/bundle/
 COPY --from=build --chown=vana:vana /app/packages/server/dist/ui/ packages/server/dist/ui/
