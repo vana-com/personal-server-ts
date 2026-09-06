@@ -142,6 +142,7 @@ const E2E_PREWARM_LEAD_MS_ENV = "E2E_PREWARM_LEAD_MS";
 const DEFAULT_E2E_PREWARM_LEAD_MS = 15_000;
 const PREWARM_EXPIRY_SECONDS_FROM_NOW = 60;
 const PREWARM_PATH = "/v1/prewarm";
+const PREWARM_RATE_LIMITED_CODE = "PREWARM_RATE_LIMITED";
 const DECOY_SCOPE_PREFIX = "e2e.decoy";
 const REMOTE_SCOPE_LIST_LIMIT = 1_000;
 const SANDBOX_DEBUG_PATH = "/agent/v1/sandboxes";
@@ -2056,6 +2057,7 @@ async function main(): Promise<void> {
   });
 
   let completedJob: CreatedJob | undefined;
+  let step9SubmitMs: number | undefined;
   await runStep("9", "submit and decrypt raw read", ["8"], async () => {
     const completed = await submitAndDecrypt(
       ctx,
@@ -2065,6 +2067,7 @@ async function main(): Promise<void> {
       expectedVersion,
     );
     completedJob = completed.job;
+    step9SubmitMs = completed.submitMs;
     return `submit_ms=${completed.submitMs} complete_ms=${completed.completeMs} ttfb_ms=${completed.ttfbMs} fetch_ms=${completed.fetchMs} decrypt_ms=${completed.decryptMs} result_size=${completed.resultSize}`;
   });
 
@@ -2074,26 +2077,42 @@ async function main(): Promise<void> {
       "prewarm cold owner and decrypt raw read",
       ["9"],
       async () => {
+        const coldSubmitMs = step9SubmitMs;
+        if (coldSubmitMs === undefined) {
+          throw new Error("Step 9 submit timing is unavailable");
+        }
         const fixture = await prepareFreshRemoteOwner(
           ctx,
           verifyingContract,
           anchors,
         );
         const prewarm = await postPrewarm(fixture.ctx);
-        requireResponse(
-          prewarm,
-          HTTP_ACCEPTED,
-          (body) => record(body)?.accepted === true,
-          "Expected prewarm request to be accepted",
-        );
-
-        const duplicate = await postPrewarm(fixture.ctx);
-        requireResponse(
-          duplicate,
-          HTTP_TOO_MANY_REQUESTS,
-          () => true,
-          "Expected a duplicate prewarm request to be rate limited",
-        );
+        const prewarmBody = record(prewarm.response.body);
+        let prewarmSource: "explicit" | "grant";
+        if (
+          prewarm.response.status === HTTP_ACCEPTED &&
+          prewarmBody?.accepted === true
+        ) {
+          prewarmSource = "explicit";
+          const duplicate = await postPrewarm(fixture.ctx);
+          requireResponse(
+            duplicate,
+            HTTP_TOO_MANY_REQUESTS,
+            (body) => record(body)?.code === PREWARM_RATE_LIMITED_CODE,
+            "Expected a duplicate prewarm request to be rate limited",
+          );
+        } else if (
+          prewarm.response.status === HTTP_TOO_MANY_REQUESTS &&
+          prewarmBody?.code === PREWARM_RATE_LIMITED_CODE
+        ) {
+          prewarmSource = "grant";
+        } else {
+          throw new StepFailure(
+            "Expected an accepted prewarm or a grant-triggered prewarm already in flight",
+            prewarm.request,
+            prewarm.response,
+          );
+        }
 
         const prewarmLeadMs = nonnegativeInt(
           process.env[E2E_PREWARM_LEAD_MS_ENV],
@@ -2108,7 +2127,7 @@ async function main(): Promise<void> {
           fixture.expectedVersion,
         );
 
-        return `prewarm_lead_ms=${prewarmLeadMs} submit_ms=${completed.submitMs} complete_ms=${completed.completeMs}`;
+        return `prewarm_source=${prewarmSource} prewarm_lead_ms=${prewarmLeadMs} step9_submit_ms=${coldSubmitMs} prewarm_submit_ms=${completed.submitMs} complete_ms=${completed.completeMs}`;
       },
     );
   }
