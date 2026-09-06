@@ -28,6 +28,8 @@ RUN npm run build --workspace @opendatalabs/personal-server-ts-core \
 
 # Install only the packages deliberately kept external to the bundle. Skip
 # lifecycle scripts, then reuse the better-sqlite3 addon built by npm ci.
+# secp256k1 lacks a linux-arm64 prebuild, so local arm64 images use its elliptic
+# fallback; the amd64 production CI image uses the bundled native prebuild.
 RUN mkdir -p /runtime-deps \
   && cp packages/server/bundle-runtime/package.json \
     packages/server/bundle-runtime/package-lock.json /runtime-deps/ \
