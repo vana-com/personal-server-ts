@@ -106,6 +106,7 @@ const NO_WAIT_SECONDS = 0;
 const HTTP_OK = 200;
 const HTTP_CREATED = 201;
 const HTTP_ACCEPTED = 202;
+const HTTP_TOO_MANY_REQUESTS = 429;
 const HTTP_FORBIDDEN = 403;
 const HTTP_NOT_FOUND = 404;
 const EXIT_SUCCESS = 0;
@@ -136,6 +137,11 @@ const E2E_RECOVERY_ENV = "E2E_RECOVERY";
 const E2E_WARM_RUNS_ENV = "E2E_WARM_RUNS";
 const E2E_JOB_TIMEOUT_MS_ENV = "E2E_JOB_TIMEOUT_MS";
 const E2E_EXTRA_SCOPES_ENV = "E2E_EXTRA_SCOPES";
+const E2E_PREWARM_ENV = "E2E_PREWARM";
+const E2E_PREWARM_LEAD_MS_ENV = "E2E_PREWARM_LEAD_MS";
+const DEFAULT_E2E_PREWARM_LEAD_MS = 15_000;
+const PREWARM_EXPIRY_SECONDS_FROM_NOW = 60;
+const PREWARM_PATH = "/v1/prewarm";
 const DECOY_SCOPE_PREFIX = "e2e.decoy";
 const REMOTE_SCOPE_LIST_LIMIT = 1_000;
 const SANDBOX_DEBUG_PATH = "/agent/v1/sandboxes";
@@ -234,6 +240,15 @@ interface CreatedJob {
 }
 
 type SeedVersions = Map<string, string | undefined>;
+
+const PREWARM_REQUEST_TYPES = {
+  PrewarmRequest: [
+    { name: "ownerAddress", type: "address" },
+    { name: "chainId", type: "uint256" },
+    { name: "scope", type: "string" },
+    { name: "expiresAt", type: "uint256" },
+  ],
+} as const;
 
 const agents: AgentProcess[] = [];
 const nodeIds: string[] = [];
@@ -815,6 +830,152 @@ async function registerBuilder(ctx: JobContext): Promise<RegisteredBuilder> {
   );
 
   return { account, id: body!.builderId as Hex, privateKey };
+}
+
+async function prepareFreshRemoteOwner(
+  ctx: JobContext,
+  verifyingContract: Address,
+  anchors: ReturnType<typeof fakeGatewayAnchors>,
+): Promise<{
+  ctx: JobContext;
+  identity: IdentityResponse["identity"];
+  builder: RegisteredBuilder;
+  grantId: Hex;
+  expectedVersion: string | undefined;
+}> {
+  const owner = privateKeyToAccount(generatePrivateKey());
+  const freshCtx: JobContext = {
+    ...ctx,
+    owner,
+    ownerSignature: await owner.signMessage({ message: MASTER_KEY_MESSAGE }),
+    userPsId: userPsId(ctx.chainId, owner.address),
+    extraScopes: [],
+  };
+  const prepared = await requestJson(
+    "POST",
+    `${freshCtx.gatewayUrl}/v1/identity`,
+    { ownerAddress: owner.address, chainId: freshCtx.chainId },
+  );
+  const identityResponse = prepared.response.body as IdentityResponse;
+  requireResponse(
+    prepared,
+    HTTP_OK,
+    () =>
+      identityResponse.created === true &&
+      identityResponse.state === "prepared" &&
+      identityResponse.identity.userPsId.toLowerCase() ===
+        freshCtx.userPsId.toLowerCase(),
+    "Expected a fresh prepared prewarm identity",
+  );
+
+  await verifyEnclaveIdentityEvidence(
+    identityResponse.identity,
+    {
+      kmsRootPubkey: (process.env.ENCLAVE_KMS_ROOT_PUBKEY ??
+        anchors.kmsRootPubkey) as Hex,
+      appIds: (process.env.ENCLAVE_APP_ID_ALLOWLIST ?? anchors.appId)
+        .split(",")
+        .map((appId) => appId.trim() as Hex),
+    },
+    {
+      ownerAddress: owner.address,
+      chainId: freshCtx.chainId,
+      epoch: FIRST_EPOCH,
+    },
+  );
+
+  const typedData = buildPersonalServerRegistrationTypedData({
+    ownerAddress: owner.address,
+    serverAddress: identityResponse.identity.address,
+    serverPublicKey: identityResponse.identity.publicKey,
+    serverUrl: identityResponse.serverUrl,
+    chainId: freshCtx.chainId,
+    verifyingContract,
+  });
+  const registrationSignature = await owner.signTypedData(typedData);
+  const registration = await requestJson(
+    "POST",
+    `${freshCtx.gatewayUrl}/v1/identity/${freshCtx.userPsId}/register`,
+    { version: "v2", message: typedData.message },
+    { Authorization: `Web3Signed ${registrationSignature}` },
+  );
+  requireResponse(
+    registration,
+    HTTP_CREATED,
+    (body) => record(body)?.state === "registered",
+    "Expected a registered prewarm identity",
+  );
+
+  const delivery = await buildMasterSignatureDelivery(
+    identityResponse.identity,
+    freshCtx.ownerSignature,
+  );
+  const ciphertext = await encryptMasterSignatureDelivery(
+    delivery,
+    identityResponse.identity.publicKey,
+    freshCtx.ecies,
+  );
+  const sealed = await requestJson(
+    "POST",
+    `${freshCtx.gatewayUrl}/v1/identity/${freshCtx.userPsId}/secret`,
+    {
+      userPsId: freshCtx.userPsId,
+      epoch: FIRST_EPOCH,
+      enclaveAddress: identityResponse.identity.address,
+      ciphertext,
+    } satisfies SealedSecretSubmission,
+  );
+  requireResponse(
+    sealed,
+    HTTP_CREATED,
+    (body) => record(body)?.sealed === true,
+    "Expected the prewarm master signature to be sealed",
+  );
+
+  await verifyRemoteNodes(freshCtx);
+  const builder = await registerBuilder(freshCtx);
+  const grantId = await createGrant(freshCtx, builder.id, GRANT_VERSION_ONE);
+  const versions = await seedRecord(freshCtx, [JOB_SCOPE], true);
+
+  return {
+    ctx: freshCtx,
+    identity: identityResponse.identity,
+    builder,
+    grantId,
+    expectedVersion: versions.get(JOB_SCOPE),
+  };
+}
+
+async function postPrewarm(ctx: JobContext): Promise<HttpResult> {
+  const expiresAt = BigInt(
+    Math.floor(Date.now() / 1000) + PREWARM_EXPIRY_SECONDS_FROM_NOW,
+  );
+  const message = {
+    ownerAddress: ctx.owner.address,
+    chainId: BigInt(ctx.chainId),
+    scope: JOB_SCOPE,
+    expiresAt,
+  };
+  const signature = await ctx.owner.signTypedData({
+    domain: {
+      name: "Vana Data Portability",
+      version: "1",
+      chainId: BigInt(ctx.chainId),
+      verifyingContract: getAddress(
+        ctx.gatewayConfig.contracts.dataPortabilityServer,
+      ),
+    },
+    types: PREWARM_REQUEST_TYPES,
+    primaryType: "PrewarmRequest",
+    message,
+  });
+
+  return requestJson("POST", `${ctx.gatewayUrl}${PREWARM_PATH}`, {
+    ...message,
+    chainId: ctx.chainId,
+    expiresAt: Number(expiresAt),
+    signature,
+  });
 }
 
 async function createGrant(
@@ -1906,6 +2067,51 @@ async function main(): Promise<void> {
     completedJob = completed.job;
     return `submit_ms=${completed.submitMs} complete_ms=${completed.completeMs} ttfb_ms=${completed.ttfbMs} fetch_ms=${completed.fetchMs} decrypt_ms=${completed.decryptMs} result_size=${completed.resultSize}`;
   });
+
+  if (ctx.remote && process.env[E2E_PREWARM_ENV] === TRUE_VALUE) {
+    await runStep(
+      "9p",
+      "prewarm cold owner and decrypt raw read",
+      ["9"],
+      async () => {
+        const fixture = await prepareFreshRemoteOwner(
+          ctx,
+          verifyingContract,
+          anchors,
+        );
+        const prewarm = await postPrewarm(fixture.ctx);
+        requireResponse(
+          prewarm,
+          HTTP_ACCEPTED,
+          (body) => record(body)?.accepted === true,
+          "Expected prewarm request to be accepted",
+        );
+
+        const duplicate = await postPrewarm(fixture.ctx);
+        requireResponse(
+          duplicate,
+          HTTP_TOO_MANY_REQUESTS,
+          () => true,
+          "Expected a duplicate prewarm request to be rate limited",
+        );
+
+        const prewarmLeadMs = nonnegativeInt(
+          process.env[E2E_PREWARM_LEAD_MS_ENV],
+          DEFAULT_E2E_PREWARM_LEAD_MS,
+        );
+        await delay(prewarmLeadMs);
+        const completed = await submitAndDecrypt(
+          fixture.ctx,
+          fixture.identity,
+          fixture.builder,
+          fixture.grantId,
+          fixture.expectedVersion,
+        );
+
+        return `prewarm_lead_ms=${prewarmLeadMs} submit_ms=${completed.submitMs} complete_ms=${completed.completeMs}`;
+      },
+    );
+  }
 
   if (ctx.remote && ctx.extraScopes.length > 0) {
     await runStep("9d", "seed late decoy scopes", ["9"], async () => {
