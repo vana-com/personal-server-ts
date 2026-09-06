@@ -38,6 +38,7 @@
   "scripts": {
     "copy-ui": "mkdir -p dist/ui && cp src/ui/index.html dist/ui/index.html && cp ../lite/src/browser-tls-rustls/browser_tls_rustls_bg.wasm dist/ui/browser_tls_rustls_bg.wasm",
     "bundle-ui": "esbuild src/ui/ps-lite-debug.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=dist/ui/ps-lite-debug.js",
+    "build:bundle": "mkdir -p dist/bundle && esbuild dist/index.js --bundle --platform=node --format=esm --target=node22 --outfile=dist/bundle/enclave-main.mjs --external:better-sqlite3 --external:pino --external:pino-pretty --external:thread-stream --packages=bundle --banner:js=\"import { createRequire as __bundleCreateRequire } from 'node:module'; import { fileURLToPath as __bundleFileURLToPath } from 'node:url'; import { dirname as __bundleDirname } from 'node:path'; const require = __bundleCreateRequire(import.meta.url); const __filename = __bundleFileURLToPath(import.meta.url); const __dirname = __bundleDirname(__filename);\" && cp package.json dist/package.json",
     "build": "tsc --build && npm run copy-ui && npm run bundle-ui",
     "start": "node dist/index.js",
     "dev": "node --watch dist/index.js"
@@ -54,6 +55,7 @@
     "viem": "^2.54.2"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.0"
+    "@types/better-sqlite3": "^7.6.0",
+    "esbuild": "0.28.1"
   }
 }
