@@ -548,6 +548,8 @@ export async function createServer(
     hierarchyOptions,
     serverOrigin: () => effectiveOrigin,
     localApprovalOrigin: () => effectiveLocalApprovalOrigin,
+    localApprovalPort,
+    serverPort: config.server.port,
     serverOwner,
     identity,
     gateway: gatewayClient,

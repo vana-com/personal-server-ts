@@ -881,3 +881,144 @@ describe("createApp", () => {
     });
   });
 });
+
+// Regression for the dev UI leak: /ui (and the dev-token-gated bootstrap that
+// carries the owner master-key signature) must be reachable ONLY through the
+// loopback auth listener — never via the main port, which the tunnel forwards.
+describe("dev UI loopback gate", () => {
+  const DEV_TOKEN = "dev-token-for-tests";
+  const OWNER_SIGNATURE = ("0x" + "ab".repeat(65)) as `0x${string}`;
+  const LOOPBACK_PORT = 4001;
+  const MAIN_PORT = 4000;
+  let tempDir: string;
+  let indexManager: IndexManager;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "app-ui-test-"));
+    indexManager = createIndexManager(initializeDatabase(":memory:"));
+  });
+
+  afterEach(async () => {
+    indexManager.close();
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  function makeUiApp(localApprovalPort: number | undefined) {
+    return createApp({
+      logger: pino({ level: "silent" }),
+      version: "0.0.1",
+      startedAt: new Date(),
+      indexManager,
+      hierarchyOptions: { dataDir: join(tempDir, "data") },
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+      accessLogReader: createMockAccessLogReader(),
+      devToken: DEV_TOKEN,
+      ownerSignature: OWNER_SIGNATURE,
+      localApprovalPort,
+    });
+  }
+
+  const viaMainPort = {
+    incoming: { socket: { localPort: MAIN_PORT, localAddress: "127.0.0.1" } },
+  };
+  const viaLoopback = {
+    incoming: {
+      socket: { localPort: LOOPBACK_PORT, localAddress: "127.0.0.1" },
+    },
+  };
+
+  it("404s /ui on the main (tunneled) port", async () => {
+    const app = makeUiApp(LOOPBACK_PORT);
+    const res = await app.request("/ui", {}, viaMainPort);
+    expect(res.status).toBe(404);
+    expect(await res.text()).not.toContain(DEV_TOKEN);
+  });
+
+  it("serves /ui on the loopback listener without the owner signature", async () => {
+    const app = makeUiApp(LOOPBACK_PORT);
+    const res = await app.request("/ui", {}, viaLoopback);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(`const TOKEN = "${DEV_TOKEN}";`);
+    expect(html).not.toContain(OWNER_SIGNATURE);
+    expect(html).not.toContain("ownerSignature");
+    expect(html).toContain("window.__PS_LITE_BOOTSTRAP__ = null;");
+  });
+
+  it("404s the bootstrap on the main port even with the dev token", async () => {
+    const app = makeUiApp(LOOPBACK_PORT);
+    const res = await app.request(
+      "/ui/api/bootstrap",
+      { headers: { authorization: `Bearer ${DEV_TOKEN}` } },
+      viaMainPort,
+    );
+    expect(res.status).toBe(404);
+    expect(await res.text()).not.toContain(OWNER_SIGNATURE);
+  });
+
+  it("returns the bootstrap on the loopback listener to a dev-token holder", async () => {
+    const app = makeUiApp(LOOPBACK_PORT);
+    const res = await app.request(
+      "/ui/api/bootstrap",
+      { headers: { authorization: `Bearer ${DEV_TOKEN}` } },
+      viaLoopback,
+    );
+    expect(res.status).toBe(200);
+    expect((await res.json()) as { ownerSignature: string }).toMatchObject({
+      ownerSignature: OWNER_SIGNATURE,
+    });
+  });
+
+  // Drive-by from a hostile page in the user's browser: cross-origin fetches
+  // always carry an Origin header naming the hostile site.
+  it("404s a cross-origin fetch of /ui on the loopback listener", async () => {
+    const app = makeUiApp(LOOPBACK_PORT);
+    const res = await app.request(
+      "/ui",
+      { headers: { origin: "https://evil.example" } },
+      viaLoopback,
+    );
+    expect(res.status).toBe(404);
+    expect(await res.text()).not.toContain(DEV_TOKEN);
+  });
+
+  // DNS rebinding: Host and Origin agree on an attacker-controlled name that
+  // resolves to 127.0.0.1; the request's own hostname must be loopback.
+  it("404s a DNS-rebound hostname on the loopback listener", async () => {
+    const app = makeUiApp(LOOPBACK_PORT);
+    const res = await app.request(
+      `http://attacker.example:${LOOPBACK_PORT}/ui`,
+      { headers: { origin: `http://attacker.example:${LOOPBACK_PORT}` } },
+      viaLoopback,
+    );
+    expect(res.status).toBe(404);
+    expect(await res.text()).not.toContain(DEV_TOKEN);
+  });
+
+  it("refuses a cross-origin preflight for the bootstrap instead of answering CORS", async () => {
+    const app = makeUiApp(LOOPBACK_PORT);
+    const res = await app.request(
+      "/ui/api/bootstrap",
+      {
+        method: "OPTIONS",
+        headers: {
+          origin: "https://evil.example",
+          "access-control-request-method": "GET",
+          "access-control-request-headers": "authorization",
+        },
+      },
+      viaLoopback,
+    );
+    expect(res.status).toBe(404);
+    expect(res.headers.get("access-control-allow-origin")).toBeNull();
+  });
+
+  it("404s /ui everywhere when no loopback listener is configured (cloud mode)", async () => {
+    const app = makeUiApp(undefined);
+    expect((await app.request("/ui", {}, viaLoopback)).status).toBe(404);
+    expect((await app.request("/ui", {}, viaMainPort)).status).toBe(404);
+  });
+});
