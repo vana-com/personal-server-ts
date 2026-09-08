@@ -72,6 +72,7 @@ import {
   readStoredLineage,
 } from "../lineage/lineage.js";
 import { isBinaryEnvelope } from "../contracts/binary.js";
+import { web3SignedProofId } from "../auth/proof-id.js";
 
 /** Header carrying the builder's signed-payload proof on a session write. */
 export const WRITE_SIGNATURE_HEADER = "x-vana-write-signature";
@@ -387,11 +388,14 @@ export async function verifyWriterAttribution(
   let releaseProof: (() => Promise<void>) | undefined;
   if (input.replayStore) {
     const store = input.replayStore;
-    const proofId = await sha256HexOf(
+    // Keyed on the signed payload (not the raw header): signature bytes are
+    // malleable, so a re-encoded replay would otherwise read as a new proof.
+    const proofId =
       nonce === undefined
-        ? headerValue
-        : `nonce:${input.builderAddress.toLowerCase()}:${nonce}`,
-    );
+        ? await web3SignedProofId(headerValue, verified.signer)
+        : await sha256HexOf(
+            `nonce:${input.builderAddress.toLowerCase()}:${nonce}`,
+          );
     const replayed = await store.consume(proofId, verified.payload.exp * 1000);
     if (replayed) {
       throw new ProtocolError(

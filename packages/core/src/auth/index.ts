@@ -7,3 +7,5 @@ export {
   type RequestAuth,
   type SessionTokenVerifierPort,
 } from "./request.js";
+
+export { web3SignedProofId } from "./proof-id.js";

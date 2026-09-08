@@ -17,7 +17,7 @@
  * "encrypt grantee private keys at rest" applies there).
  */
 
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import type { Logger } from "pino";
@@ -68,7 +68,10 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/api";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { createServerApiAuth } from "../api-auth.js";
-import { authenticateRequest } from "@opendatalabs/personal-server-ts-core/auth";
+import {
+  authenticateRequest,
+  web3SignedProofId,
+} from "@opendatalabs/personal-server-ts-core/auth";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -79,6 +82,12 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/ports";
 import type { TokenStore } from "../token-store.js";
 import { createNodeDataStorage } from "../storage/node-data-storage.js";
+
+/**
+ * Upper bound on a handshake proof's `exp - iat`. The SDK bounds only clock
+ * skew, so without this the replay window is whatever the signer chose.
+ */
+const MAX_SESSION_PROOF_LIFETIME_SEC = 15 * 60;
 
 export interface McpRouteDeps {
   logger: Logger;
@@ -925,15 +934,35 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
         400,
       );
     }
-    // Replay guard: bind to a digest of the exact proof header, remembered
-    // until the proof's own expiry (a replay only matters while still valid).
+    // Bound the replay window: the SDK checks only clock skew around `exp`,
+    // so without a cap the proof's lifetime is attacker-chosen. A handshake
+    // proof is signed immediately before use; it never needs to live long.
+    const { iat, exp: expSec } = authResult.auth.payload;
+    if (
+      typeof iat !== "number" ||
+      typeof expSec !== "number" ||
+      expSec - iat > MAX_SESSION_PROOF_LIFETIME_SEC
+    ) {
+      return c.json(
+        jsonError(
+          401,
+          "MCP_SESSION_PROOF_LIFETIME",
+          `The Web3Signed proof must expire within ${MAX_SESSION_PROOF_LIFETIME_SEC}s of its iat`,
+        ),
+        401,
+      );
+    }
+    // Replay guard: keyed on the SIGNED PAYLOAD + signer, remembered until
+    // the proof's own expiry (a replay only matters while still valid).
+    // Not on the raw header: signature bytes are malleable (v 27/28 vs 0/1,
+    // hex case, the (r, n-s) twin), and every re-encoding of a captured
+    // proof would otherwise count as a fresh one.
     const proofHeader = c.req.raw.headers.get("authorization") ?? "";
-    const proofId = createHash("sha256").update(proofHeader).digest("hex");
-    const expSec = authResult.auth.payload.exp;
-    const expiresAtMs =
-      (typeof expSec === "number"
-        ? expSec
-        : Math.floor(Date.now() / 1000) + 300) * 1000;
+    const proofId = await web3SignedProofId(
+      proofHeader,
+      authResult.auth.signer,
+    );
+    const expiresAtMs = expSec * 1000;
     try {
       const session = await createMcpSession(
         {
