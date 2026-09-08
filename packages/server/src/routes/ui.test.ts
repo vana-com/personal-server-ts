@@ -9,6 +9,10 @@ vi.mock("node:fs", () => ({
 
 describe("uiRoute", () => {
   const DEV_TOKEN = "test-dev-token-456";
+  const BOOTSTRAP = {
+    ownerSignature: "0xsignature" as `0x${string}`,
+    config: { gateway: { url: "https://gateway.example" } },
+  };
 
   beforeEach(() => {
     // Reset the cached HTML between tests by clearing the module-level cache
@@ -26,21 +30,21 @@ describe("uiRoute", () => {
     expect(html).not.toContain("__DEV_TOKEN__");
   });
 
-  it("injects PS Lite bootstrap config", async () => {
-    const app = uiRoute({
-      devToken: DEV_TOKEN,
-      psLiteBootstrap: {
-        ownerSignature: "0xsignature",
-        config: { gateway: { url: "https://gateway.example" } },
-      },
-    });
+  // The owner signature is the master-key signature: it recovers the owner
+  // identity and derives the storage encryption key. It must never be written
+  // into a page that any GET can fetch. The page obtains it at runtime from
+  // the dev-token-gated /api/bootstrap endpoint instead.
+  it("never embeds the PS Lite bootstrap (owner signature) in the HTML", async () => {
+    const app = uiRoute({ devToken: DEV_TOKEN, psLiteBootstrap: BOOTSTRAP });
 
     const res = await app.request("/");
 
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain('"ownerSignature":"0xsignature"');
+    expect(html).not.toContain("0xsignature");
+    expect(html).not.toContain("ownerSignature");
     expect(html).not.toContain("__PS_LITE_BOOTSTRAP_JSON__");
+    expect(html).toContain("window.__PS_LITE_BOOTSTRAP__ = null;");
   });
 
   it("returns HTML content type", async () => {
@@ -59,5 +63,49 @@ describe("uiRoute", () => {
 
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("application/javascript");
+  });
+
+  describe("GET /api/bootstrap", () => {
+    it("rejects a request without the dev token", async () => {
+      const app = uiRoute({ devToken: DEV_TOKEN, psLiteBootstrap: BOOTSTRAP });
+
+      const res = await app.request("/api/bootstrap");
+
+      expect(res.status).toBe(401);
+      expect(await res.text()).not.toContain("0xsignature");
+    });
+
+    it("rejects a wrong dev token", async () => {
+      const app = uiRoute({ devToken: DEV_TOKEN, psLiteBootstrap: BOOTSTRAP });
+
+      const res = await app.request("/api/bootstrap", {
+        headers: { authorization: "Bearer not-the-token" },
+      });
+
+      expect(res.status).toBe(401);
+      expect(await res.text()).not.toContain("0xsignature");
+    });
+
+    it("returns the bootstrap to a dev-token holder", async () => {
+      const app = uiRoute({ devToken: DEV_TOKEN, psLiteBootstrap: BOOTSTRAP });
+
+      const res = await app.request("/api/bootstrap", {
+        headers: { authorization: `Bearer ${DEV_TOKEN}` },
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get("cache-control")).toBe("no-store");
+      expect(await res.json()).toEqual(BOOTSTRAP);
+    });
+
+    it("404s when no bootstrap is configured", async () => {
+      const app = uiRoute({ devToken: DEV_TOKEN });
+
+      const res = await app.request("/api/bootstrap", {
+        headers: { authorization: `Bearer ${DEV_TOKEN}` },
+      });
+
+      expect(res.status).toBe(404);
+    });
   });
 });

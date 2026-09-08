@@ -12,6 +12,7 @@ import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logg
 import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
 import { healthRoute, type HealthDeps } from "./routes/health.js";
 import { corsMiddleware } from "./middleware/cors.js";
+import { requireLoopbackListener } from "./middleware/local-listener.js";
 import { dataRoutes } from "./routes/data.js";
 import { writeSessionRoutes } from "./routes/write-session.js";
 import {
@@ -86,6 +87,13 @@ export interface AppDeps {
   readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
   cloudMode?: boolean;
   devToken?: string;
+  /**
+   * Port of the loopback-only auth listener. The dev UI subtree is served
+   * only to connections that arrived on it (never via the tunnel).
+   */
+  localApprovalPort?: number;
+  /** Main server port; a loopback-port collision disables the dev UI. */
+  serverPort?: number;
   ownerSignature?: `0x${string}`;
   ownerPrivateKey?: `0x${string}`;
   accessToken?: string;
@@ -162,6 +170,20 @@ export function createApp(deps: AppDeps): Hono {
   // CORS — allow all origins for browser-based clients. Registered first so
   // OPTIONS preflights are answered before any route or auth code runs
   // (route sub-apps only register their real methods).
+  // Dev UI gate — registered BEFORE the permissive global CORS so a
+  // cross-origin preflight for /ui/* is refused rather than answered with
+  // `Access-Control-Allow-Origin: *`. The whole /ui subtree is served only to
+  // connections on the loopback auth listener: the tunnel forwards the main
+  // server port, so without this gate the page (and the dev token it
+  // carries, which is a full owner/policy bypass) is reachable by anyone who
+  // knows the public tunnel URL.
+  const uiLoopbackOnly = requireLoopbackListener({
+    localApprovalPort: deps.localApprovalPort,
+    serverPort: deps.serverPort,
+  });
+  app.use("/ui", uiLoopbackOnly);
+  app.use("/ui/*", uiLoopbackOnly);
+
   app.use("*", corsMiddleware());
 
   // Mount health route
@@ -384,7 +406,8 @@ export function createApp(deps: AppDeps): Hono {
     );
   }
 
-  // Mount dev UI routes when dev token is available
+  // Mount dev UI routes when dev token is available. The /ui subtree is
+  // already gated to the loopback auth listener above.
   if (deps.devToken) {
     app.route(
       "/ui",

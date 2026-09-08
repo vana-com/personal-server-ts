@@ -56,8 +56,12 @@ async function main(): Promise<void> {
       logger.info({ port: info.port, version: pkg.version }, "Server started");
 
       if (devToken) {
+        // The dev UI is served only on the loopback auth listener, never on
+        // the (tunneled) main port.
         logger.info(
-          { url: `http://localhost:${info.port}/ui` },
+          {
+            url: `http://127.0.0.1:${context.localApprovalPort ?? info.port}/ui`,
+          },
           "Dev UI available",
         );
         logger.info({ devToken }, "Dev token (ephemeral)");
