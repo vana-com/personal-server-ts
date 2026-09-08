@@ -842,7 +842,7 @@ function failureReason(envelope: JobRequestEnvelope, nowMs: number): string {
   return INVALID_REQUEST_REASON;
 }
 
-function sandboxSpec(
+export function sandboxSpec(
   identity: ClaimedIdentity,
   deps: SandboxSpecDeps,
   accessToken: string,

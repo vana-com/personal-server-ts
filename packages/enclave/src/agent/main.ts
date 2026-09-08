@@ -16,6 +16,7 @@ import { createDockerRuntime } from "../sandbox/docker-runtime.js";
 import { createFakeRuntime } from "../sandbox/fake-runtime.js";
 import { createSandboxRegistry } from "../sandbox/registry.js";
 import type { SandboxRuntime } from "../sandbox/runtime.js";
+import { startMcpIngress } from "../mcp/service.js";
 
 const EXIT_FAILURE = 1;
 const SIGTERM = "SIGTERM";
@@ -105,15 +106,24 @@ async function startJobs(
     logger,
     jobResultMaxBytes: config.jobResultMaxBytes,
   } satisfies PrewarmDeps;
+  const mcp = await startMcpIngress(
+    sandboxDeps,
+    process.env,
+    config.gatewayBypassSecret
+      ? gatewayFetch(config.gatewayBypassSecret)
+      : fetch,
+  );
   const claimLoop = startClaimLoop({
     gateway,
-    run: (job, identity) =>
-      runJob(job, identity, {
+    run: async (job, identity) => {
+      await mcp?.rememberIdentity(identity);
+      return runJob(job, identity, {
         ...sandboxDeps,
         gateway,
         leaseSeconds: config.leaseSeconds,
         workDelayMs: config.workDelayMs,
-      }),
+      });
+    },
     registry,
     leaseSeconds: config.leaseSeconds,
     wait: MAX_WAIT_SECONDS,
@@ -141,10 +151,21 @@ async function startJobs(
     lookupSandboxJob: (accessToken, jobId) =>
       registry.lookupJob(accessToken, jobId),
     prewarm(body): void {
-      void prewarmSandbox(body, body.scope, sandboxDeps);
+      if (!mcp) {
+        void prewarmSandbox(body, body.scope, sandboxDeps);
+        return;
+      }
+      void (async () => {
+        await mcp.rememberIdentity(body);
+        await prewarmSandbox(body, body.scope, sandboxDeps);
+      })().catch((error: unknown) =>
+        logger.warn({ error: String(error) }, "MCP prewarm state unavailable"),
+      );
     },
     drain(): Promise<void> {
-      drainPromise ??= claimLoop.drain().finally(() => nodeHeartbeat.stop());
+      drainPromise ??= Promise.all([claimLoop.drain(), mcp?.close()])
+        .then(() => undefined)
+        .finally(() => nodeHeartbeat.stop());
 
       return drainPromise;
     },

@@ -25,11 +25,13 @@ import { grantsRoutes } from "./routes/grants.js";
 import { accessLogsRoutes } from "./routes/access-logs.js";
 import { syncRoutes } from "./routes/sync.js";
 import {
+  executeMcpConnectionRequest,
   mcpActivityRoutes,
   mcpConnectionsRoutes,
   mcpOAuthRoutes,
   mcpStreamableHttpRoutes,
 } from "./routes/mcp.js";
+import { enclaveMcpRoutes } from "./routes/enclave-mcp.js";
 import {
   McpActivityRecorder,
   createInMemoryMcpConnectionStore,
@@ -138,6 +140,7 @@ export interface AppDeps {
   mcpOAuthAuthorizationStore?: McpOAuthAuthorizationStore;
   mcpOAuthApprovalUrl?: string | (() => string);
   mcpActivityRecorder?: McpActivityRecorder;
+  mcpHydrateScopes?: (scopes: string[]) => Promise<void>;
   /**
    * Write API session store shared between POST /v1/write/session (which
    * mints tokens) and the ingest endpoint (which redeems them). Defaults to
@@ -368,6 +371,21 @@ export function createApp(deps: AppDeps): Hono {
   app.route("/v1/mcp/connections", mcpConnectionsRoutes(mcpRouteDeps));
   app.route("/v1/mcp/activity", mcpActivityRoutes(mcpRouteDeps));
   app.route("/mcp", mcpStreamableHttpRoutes(mcpRouteDeps));
+  if (deps.profile === "enclave" && deps.accessToken && deps.serverOwner) {
+    app.route(
+      "/enclave/v1/mcp",
+      enclaveMcpRoutes({
+        accessToken: deps.accessToken,
+        serverOwner: deps.serverOwner,
+        execute: async (request, connection) => {
+          await deps.mcpHydrateScopes?.([
+            ...new Set(connection.grants.flatMap((grant) => grant.scopes)),
+          ]);
+          return executeMcpConnectionRequest(request, connection, mcpRouteDeps);
+        },
+      }),
+    );
+  }
 
   // Mount login flow v2 routes (self-hosted CLI auth, no auth required)
   if (deps.tokenStore) {

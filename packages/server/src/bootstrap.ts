@@ -590,6 +590,10 @@ export async function createServer(
       : undefined;
 
   const app = createApp({
+    mcpHydrateScopes:
+      isEnclave && jobSyncManager
+        ? (scopes) => jobSyncManager.hydrateScopes(scopes)
+        : undefined,
     logger,
     version: pkg.version,
     startedAt,

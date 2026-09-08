@@ -56,6 +56,7 @@ import {
   revokeMcpConnection,
   toMcpConnectionView,
   type McpConnectionGrant,
+  type McpConnectionRecord,
   type McpConnectionStore,
   type McpSessionStore,
   type McpOAuthAuthorizationStore,
@@ -196,7 +197,9 @@ function protectedResourceMetadata(origin: string) {
   };
 }
 
-function resolveApprovalUrl(deps: McpRouteDeps): string | null {
+function resolveApprovalUrl(
+  deps: Pick<McpRouteDeps, "oauthApprovalUrl">,
+): string | null {
   const value = deps.oauthApprovalUrl;
   if (!value) return null;
   return typeof value === "function" ? value() : value;
@@ -268,6 +271,28 @@ function buildDataApiDeps(deps: McpRouteDeps): PersonalServerDataApiDeps {
     runtimeAvailability: deps.runtimeAvailability,
     logger: deps.logger,
   };
+}
+
+/** Shared engine for ordinary MCP connections and authenticated TEE dispatch. */
+export function executeMcpConnectionRequest(
+  request: Request,
+  connection: McpConnectionRecord,
+  deps: McpRouteDeps,
+): Promise<Response> {
+  const granteeAccount = loadMcpGranteeAccount({
+    address: connection.granteeAddress,
+    publicKey: connection.granteePublicKey,
+    encryptedPrivateKey: connection.encryptedGranteePrivateKey,
+  });
+  return handleMcpStreamableHttpRequest(request, {
+    connection,
+    readClient: createMcpDataReadClient({
+      serverOrigin: resolveOrigin(deps.serverOrigin),
+      granteeAccount,
+      dataApiDeps: buildDataApiDeps(deps),
+    }),
+    activityRecorder: deps.activityRecorder,
+  });
 }
 
 /**
@@ -383,7 +408,22 @@ export function mcpConnectionsRoutes(deps: McpRouteDeps): Hono {
  * Mount at `/` so the well-known documents are served from the PS origin and
  * Claude can discover auth for the stable `/mcp` resource.
  */
-export function mcpOAuthRoutes(deps: McpRouteDeps): Hono {
+export type McpOAuthRouteDeps = Pick<
+  McpRouteDeps,
+  | "connectionStore"
+  | "oauthAuthorizationStore"
+  | "oauthApprovalUrl"
+  | "serverOrigin"
+  | "serverOwner"
+  | "gateway"
+  | "devToken"
+  | "accessToken"
+  | "tokenStore"
+  | "gatewayConfig"
+  | "serverSigner"
+>;
+
+export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
   const app = new Hono();
   const connectionStore =
     deps.connectionStore ?? createInMemoryMcpConnectionStore();

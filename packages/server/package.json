@@ -16,6 +16,10 @@
   "main": "./dist/api.js",
   "types": "./dist/api.d.ts",
   "exports": {
+    "./mcp/tee": {
+      "types": "./dist/mcp/index.d.ts",
+      "import": "./dist/mcp/index.js"
+    },
     ".": {
       "types": "./dist/api.d.ts",
       "import": "./dist/api.js"
