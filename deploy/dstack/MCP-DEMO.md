@@ -55,7 +55,7 @@ current MCP engine uses stateless POST/JSON responses; long-lived GET sessions
 and resumable streams are not introduced here. Persistent encrypted state does
 not itself provide protection against operator disk-snapshot rollback.
 
-## Proof required before calling the demo complete
+## Validation and observed proof
 
 - Full repository checks and independent review against the immediate parent.
 - Certificate issuance inside the CVM, public certificate/evidence binding,
@@ -65,4 +65,10 @@ not itself provide protection against operator disk-snapshot rollback.
 - Ingress restart retains OAuth state; code replay and revoked/wrong-owner
   requests fail, and no key or MCP payload appears in external logs.
 
-The implementation and local tests alone do not establish these live results.
+The 2026-09-08 run completed ordinary Claude OAuth/read, browser-closed sandbox
+wakeup, and full CVM/ingress restart with the same connection and certificate.
+See [the exact deployment and evidence report](../../docs/260908-mcp-tee-demo-results.md)
+for results and limits. Grant revocation, wrong-owner approval, and OAuth code
+replay are covered by automated tests; the report distinguishes those from
+live checks. Certificate history, independent local QVL, and accelerated
+renewal remain outside the completed proof.
