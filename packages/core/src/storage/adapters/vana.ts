@@ -27,7 +27,7 @@ export function resolveVanaStorageEndpoint(config: ServerConfig): string {
 export function createVanaSyncStorageAdapter(params: {
   config: ServerConfig;
   serverOwner: `0x${string}`;
-  serverAccount: ServerAccount;
+  serverAccount: Pick<ServerAccount, "address" | "signMessage">;
   reads?: "signed" | "public";
 }): StorageAdapter {
   const endpoint = resolveVanaStorageEndpoint(params.config);
