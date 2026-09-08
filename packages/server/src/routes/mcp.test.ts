@@ -1900,6 +1900,84 @@ describe("MCP /mcp/session (self-signing handshake)", () => {
     );
   });
 
+  // Signature malleability: the same secp256k1 signature has many byte
+  // encodings that recover to the same signer (v as 27/28 or 0/1, hex case,
+  // and the ECDSA (r, n-s) twin). A replay guard keyed on the raw header
+  // sees each encoding as a new proof. The guard must key on the signed
+  // payload, which no re-encoding can change.
+  function reencodeSignature(proof: string, variant: "v" | "case"): string {
+    const dot = proof.lastIndexOf(".");
+    const head = proof.slice(0, dot + 1);
+    const sig = proof.slice(dot + 1);
+    if (variant === "case") {
+      return head + sig.slice(0, 2) + sig.slice(2).toUpperCase();
+    }
+    const v = sig.slice(-2).toLowerCase();
+    const flipped =
+      v === "1b" ? "00" : v === "1c" ? "01" : v === "00" ? "1b" : "1c";
+    return head + sig.slice(0, -2) + flipped;
+  }
+
+  it("rejects a replay whose signature was re-encoded (v byte flipped)", async () => {
+    const app = buildApp({ gatewayConfig });
+    const proof = await sessionProof();
+    const first = await app.request("/mcp/session", {
+      method: "POST",
+      headers: { Authorization: proof },
+    });
+    expect(first.status).toBe(200);
+
+    const replay = await app.request("/mcp/session", {
+      method: "POST",
+      headers: { Authorization: reencodeSignature(proof, "v") },
+    });
+    expect(replay.status).toBe(401);
+    expect((await replay.json()).error.errorCode).toBe(
+      "MCP_SESSION_PROOF_REPLAY",
+    );
+  });
+
+  it("rejects a replay whose signature hex case was changed", async () => {
+    const app = buildApp({ gatewayConfig });
+    const proof = await sessionProof();
+    const first = await app.request("/mcp/session", {
+      method: "POST",
+      headers: { Authorization: proof },
+    });
+    expect(first.status).toBe(200);
+
+    const replay = await app.request("/mcp/session", {
+      method: "POST",
+      headers: { Authorization: reencodeSignature(proof, "case") },
+    });
+    expect(replay.status).toBe(401);
+    expect((await replay.json()).error.errorCode).toBe(
+      "MCP_SESSION_PROOF_REPLAY",
+    );
+  });
+
+  it("rejects a proof whose lifetime exceeds the server cap", async () => {
+    const app = buildApp({ gatewayConfig });
+    const now = Math.floor(Date.now() / 1000);
+    const longLived = await buildWeb3SignedHeader({
+      wallet: appWallet,
+      aud: SERVER_ORIGIN,
+      method: "POST",
+      uri: "/mcp/session",
+      grantId: GRANT_ID,
+      iat: now,
+      exp: now + 60 * 60 * 24, // a day: an attacker-chosen replay window
+    });
+    const res = await app.request("/mcp/session", {
+      method: "POST",
+      headers: { Authorization: longLived },
+    });
+    expect(res.status).toBe(401);
+    expect((await res.json()).error.errorCode).toBe(
+      "MCP_SESSION_PROOF_LIFETIME",
+    );
+  });
+
   it("rejects a handshake for a grant issued by a grantor that is not the server owner", async () => {
     const { gateway, grant } = makeGatewayForGrantee({
       granteeAddress: appWallet.address,
