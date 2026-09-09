@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { verifiedFleetEnvironment } from "../fleet/security-config.js";
 import { isAbsolute } from "node:path";
 import { serve } from "@hono/node-server";
 import { DEFAULTS } from "@opendatalabs/personal-server-ts-core/schemas";
@@ -61,6 +62,10 @@ export async function startFleetCentral(
   identity: FleetPeerIdentity;
   close(): Promise<void>;
 }> {
+  env = await verifiedFleetEnvironment(env, {
+    role: "controller",
+    identity: () => client.info(),
+  });
   if (env.CONTROLLER_TERM !== undefined && env.CONTROLLER_TERM !== "1")
     throw new Error("Only singleton controller term 1 is supported");
   const chainId = Number(env.CHAIN_ID ?? 14800);

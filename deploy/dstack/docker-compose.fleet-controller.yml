@@ -1,10 +1,11 @@
-# Moksha central role. Render AGENT_IMAGE and GIT_REF as reviewed literals in
-# measured compose. Admission JSON is runtime policy so reciprocal compose pins
-# do not create a hash cycle. This app MUST have a different app_id from workers.
+# Moksha central role. Replace all REPLACE_WITH markers with reviewed literals
+# before deployment. No executable/policy trust root comes from unmeasured env.
+# The signed runtime bundle permits staged reciprocal pins without a hash cycle.
+# This app MUST have a different app_id from workers.
 # One active controller only; flock fences duplicate processes sharing its volume.
 services:
   controller:
-    image: "${AGENT_IMAGE:?AGENT_IMAGE must be digest-pinned}"
+    image: "REPLACE_WITH_REVIEWED_AGENT_IMAGE_DIGEST"
     restart: unless-stopped
     stop_grace_period: 120s
     working_dir: /app
@@ -13,27 +14,8 @@ services:
       - "8791:8791"
       - "8792:8792"
     environment:
-      - GIT_REF
-      - CHAIN_ID=14800
-      - NODE_ID=moksha-personal-server-controller
-      - CONTROLLER_TERM=1
-      - GATEWAY_URL
-      - VERCEL_PROTECTION_BYPASS
-      - FLEET_STATE_PATH=/fleet-state/placements.json
-      - FLEET_WORKERS_JSON
-      - FLEET_GATEWAY_TOKEN
-      - FLEET_CONTROLLER_GATEWAY_TOKEN
-      - FLEET_CONTROLLER_ADMIN_TOKEN
-      - FLEET_CONTROL_PORT=8790
-      - FLEET_ADMIN_PORT=8791
-      - FLEET_PEER_PORT=8792
-      - MCP_PUBLIC_ORIGIN=https://mcp-dev.vana.org
-      - MCP_APPROVAL_URL=https://vana-web-enclave-preview.vercel.app/personal-server
-      - MCP_STATE_PATH=/mcp-state/state.sealed
-      - MCP_MIGRATION_REQUIRED=1
-      - MCP_INGRESS_HOST=0.0.0.0
-      - MCP_INGRESS_PORT=8788
-      - 'MCP_REDIRECT_URIS=["https://claude.ai/api/mcp/auth_callback","https://claude.com/api/mcp/auth_callback"]'
+      - FLEET_CONFIG_PUBLIC_KEY=REPLACE_WITH_OPERATOR_ED25519_SPKI_BASE64
+      - FLEET_SIGNED_CONFIG
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - fleet-state:/fleet-state
@@ -43,7 +25,9 @@ services:
       - -ec
       - |
         apk add --no-cache git util-linux
-        : "$${GIT_REF:?GIT_REF must be a 40-hex commit SHA}"
+        GIT_REF='REPLACE_WITH_REVIEWED_40_HEX_COMMIT'
+        test "$${#GIT_REF}" -eq 40
+        case "$${GIT_REF}" in *[!0-9a-f]*) exit 1;; esac
         git init .
         if git remote get-url origin >/dev/null 2>&1; then
           git remote set-url origin https://github.com/vana-com/personal-server-ts

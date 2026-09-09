@@ -34,6 +34,29 @@ Protected MCP migration uses that same verified channel; old writer is fenced
 before a snapshot is released, target reencrypts with its own dstack key, and
 operator tooling receives only counts/digests. No secrets leave either TEE.
 
+## Authenticated boot configuration
+
+Dstack encrypted environment values are not measured or authenticated. Every
+fleet application boot verifies an operator Ed25519 signature before deriving
+protected state keys or opening admin, migration, or peer listeners. The complete
+runtime configuration is returned as a new environment map; unsigned values are
+never merged. The signed payload binds role, node, current app and instance and
+has a maximum 24-hour validity window checked at startup. This limits replay of
+old signed configuration; it does not claim hardware monotonic rollback defense
+or terminate an already-running process when its boot window ends.
+
+Render the reviewed source commit, base image digest and operator SPKI public key
+as literal measured compose text. Templates use explicit REPLACE_WITH markers;
+no marker may remain at deployment. Only the signed bundle is passed through
+from the provider environment. Do not forward NODE_OPTIONS, alternate source
+refs, or policy/admin credentials outside the bundle. App and instance binding
+uses public dstack info after signature validation; all private state remains
+unopened until that comparison passes. This applies on every process restart.
+
+The paused central role permits an empty signed worker directory for initial
+attestation. Stage exact worker policies through a new operator-signed bundle,
+restart and verify fresh measurements before admitting peers or moving state.
+
 ## Peer protocol and approved identity
 
 The reachability URL uses ordinary HTTPS. Inner confidentiality and mutual
