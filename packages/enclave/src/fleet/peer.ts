@@ -41,6 +41,27 @@ interface PeerOptions {
 }
 const HANDSHAKE_MS = 30_000;
 const MAX_BYTES = 8 * 1024 * 1024;
+async function beforeDeadline<T>(
+  operation: Promise<T>,
+  deadline: number,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("Peer deadline expired")),
+          Math.max(0, deadline - Date.now()),
+        );
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function hello(identity: FleetPeerIdentity): { hello: Hello; key: KeyObject } {
   const keys = generateKeyPairSync("x25519");
   return {
@@ -213,10 +234,13 @@ export function createFleetPeerServer(
       sessions.delete(body.sessionId);
       if (!session || session.expires <= Date.now())
         throw new Error("Expired/replayed session");
-      await options.verifyPeer(
-        body.evidence,
-        digest(session.challenge),
-        session.challenge.client.identity,
+      await beforeDeadline(
+        options.verifyPeer(
+          body.evidence,
+          digest(session.challenge),
+          session.challenge.client.identity,
+        ),
+        session.expires,
       );
       if (session.expires <= Date.now()) throw new Error("Attestation expired");
       const shared = keys(
@@ -253,18 +277,24 @@ export function createFleetPeerServer(
   };
 }
 export function createFleetPeerClient(
-  options: PeerOptions & { baseUrl: string; fetch?: typeof fetch },
+  options: PeerOptions & {
+    baseUrl: string;
+    expectedPeer?: FleetPeerIdentity;
+    fetch?: typeof fetch;
+  },
 ) {
   const base = new URL(options.baseUrl);
   if (base.protocol !== "https:")
     throw new Error("Peer reachability must use HTTPS");
-  const post = async (path: string, body: unknown) => {
+  const post = async (path: string, body: unknown, deadline: number) => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error("Peer RPC deadline expired");
     const response = await (options.fetch ?? fetch)(new URL(path, base), {
       method: "POST",
       redirect: "error",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(125_000),
+      signal: AbortSignal.timeout(remaining),
     });
     if (!response.ok) throw new Error("Peer rejected request");
     return json(
@@ -278,10 +308,25 @@ export function createFleetPeerClient(
   return {
     async call<T = unknown>(method: string, body: unknown): Promise<T> {
       const started = Date.now();
+      const budget =
+        method === "renew"
+          ? 8_000
+          : method === "describe"
+            ? 30_000
+            : [
+                  "activity",
+                  "readiness",
+                  "worker.identity",
+                  "worker.seal",
+                ].includes(method)
+              ? 20_000
+              : 120_000;
+      const deadline = started + budget;
       const local = hello(options.identity);
       const received = (await post(
         "/fleet-peer/v1/challenge",
         local.hello,
+        Math.min(deadline, started + HANDSHAKE_MS),
       )) as { challenge: Challenge; evidence: FleetPeerEvidence };
       const c = received.challenge;
       if (
@@ -290,17 +335,40 @@ export function createFleetPeerClient(
         !/^[a-f0-9]{64}$/.test(c.sessionId)
       )
         throw new Error("Peer handshake substitution");
-      await options.verifyPeer(received.evidence, digest(c), c.server.identity);
+      await beforeDeadline(
+        options.verifyPeer(received.evidence, digest(c), c.server.identity),
+        Math.min(deadline, started + HANDSHAKE_MS),
+      );
+      if (options.expectedPeer) {
+        if (
+          Object.entries(options.expectedPeer).some(
+            ([key, value]) =>
+              c.server.identity[key as keyof FleetPeerIdentity] !== value,
+          )
+        )
+          throw new Error("Unexpected peer destination");
+      } else if (method !== "describe") {
+        throw new Error("An exact peer destination is required for RPC");
+      }
       if (Date.now() - started >= HANDSHAKE_MS)
         throw new Error("Attestation expired");
-      const proof = await evidence(options.client, c);
+      const proof = await beforeDeadline(
+        evidence(options.client, c),
+        Math.min(deadline, started + HANDSHAKE_MS),
+      );
+      if (Date.now() >= Math.min(deadline, started + HANDSHAKE_MS))
+        throw new Error("Peer handshake deadline expired");
       const shared = keys(local.key, c.server, c);
       try {
-        const result = (await post("/fleet-peer/v1/call", {
-          sessionId: c.sessionId,
-          evidence: proof,
-          packet: encrypt({ method, body }, shared.request, digest(c)),
-        })) as { packet: Packet };
+        const result = (await post(
+          "/fleet-peer/v1/call",
+          {
+            sessionId: c.sessionId,
+            evidence: proof,
+            packet: encrypt({ method, body }, shared.request, digest(c)),
+          },
+          deadline,
+        )) as { packet: Packet };
         return decrypt(result.packet, shared.response, digest(c)) as T;
       } finally {
         shared.request.fill(0);
@@ -313,6 +381,7 @@ export function fleetWorkerPort(
   client: ReturnType<typeof createFleetPeerClient>,
 ): FleetWorkerPort {
   return {
+    activity: (a) => client.call("activity", a),
     prepare: (r) => client.call("prepare", r),
     readiness: (r) => client.call("readiness", r),
     renew: (a) => client.call("renew", a),

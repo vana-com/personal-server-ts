@@ -38,6 +38,7 @@ it("encrypts both directions, binds the admitted peer and rejects replay", async
     client: createFakeDstackClient({ appId: "1".repeat(40) }),
     verifyPeer: verifier,
     baseUrl: "https://worker.invalid",
+    expectedPeer: identity("worker"),
     fetch: wire,
   });
   expect(await client.call("execute", { secret: "private plaintext" })).toEqual(
@@ -55,4 +56,41 @@ it("encrypts both directions, binds the admitted peer and rejects replay", async
     ).status,
   ).toBe(403);
   expect(calls).toBe(1);
+});
+
+it("refuses a different admitted worker before sending the owner payload", async () => {
+  const makeIdentity = (nodeId: string): FleetPeerIdentity => ({
+    role: "worker",
+    nodeId,
+    nodeIncarnation: `${nodeId}-inc`,
+    appId: "workers",
+    instanceId: nodeId,
+    composeHash: "approved",
+  });
+  const actual = makeIdentity("b"),
+    expected = makeIdentity("a");
+  let wireCalls = 0;
+  const handler = createFleetPeerServer({
+    identity: actual,
+    client: createFakeDstackClient({ appId: "1".repeat(40) }),
+    verifyPeer: async () => {},
+    dispatch: async () => {
+      throw new Error("must never receive owner A");
+    },
+  });
+  const client = createFleetPeerClient({
+    identity: { ...makeIdentity("controller"), role: "controller" },
+    expectedPeer: expected,
+    client: createFakeDstackClient({ appId: "1".repeat(40) }),
+    verifyPeer: async () => {},
+    baseUrl: "https://a.invalid",
+    fetch: async (input, init) => {
+      wireCalls++;
+      return handler(new Request(input, init));
+    },
+  });
+  await expect(
+    client.call("execute", { owner: "A", secret: "payload" }),
+  ).rejects.toThrow("Unexpected peer destination");
+  expect(wireCalls).toBe(1);
 });

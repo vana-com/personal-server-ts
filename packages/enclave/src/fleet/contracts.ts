@@ -46,7 +46,13 @@ export interface FleetExecuteResponse {
   contentType: string;
   body: string;
 }
+export interface FleetActivity {
+  assignment: FleetAssignment;
+  present: boolean;
+  busy: boolean;
+}
 export interface FleetWorkerPort {
+  activity(assignment: FleetAssignment): Promise<FleetActivity>;
   prepare(request: FleetPrepareRequest): Promise<FleetReadiness[]>;
   renew(assignment: FleetAssignment): Promise<void>;
   readiness(request: FleetPrepareRequest): Promise<FleetReadiness[]>;
