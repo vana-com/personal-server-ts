@@ -79,7 +79,11 @@ Event mode uses `rtmrs: [rtmr0, rtmr1, rtmr2]` plus exact `mrTd`, `osImageHash`
 and `keyProviderSpki` (lowercase DER SPKI hex). It replays the entire bounded event
 log into all four verified quote registers. Firmware entries are structurally
 validated; their register values remain exactly pinned. Every runtime event
-payload digest is recomputed using the dstack 0.5.9 algorithm. Exactly ten RTMR3
+payload digest is recomputed using the dstack 0.5.9 algorithm. GetQuote's empty
+runtime digest fields are reconstructed from their retained event type, name and
+payload before replay; a supplied digest must match. Firmware digests remain
+mandatory. Certificate logs with populated digests follow the same checks.
+Exactly ten RTMR3
 events must appear in order: system-preparing, app-id, compose-hash, instance-id,
 boot-mr-done, mr-kms, os-image-hash, key-provider, storage-fs, system-ready.
 The sentinels have empty payloads; app/compose/instance/OS match policy exactly;

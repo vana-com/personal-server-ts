@@ -259,3 +259,86 @@ it("retains exact four-register policy and the quote, challenge, TCB and debug g
     "Invalid Intel chain",
   );
 });
+
+it("verifies the real GetQuote wire log with empty runtime digests against all quoted registers", async () => {
+  const raw = fixture("getquote");
+  const events = raw.event_log.filter((entry) => entry.imr === 3);
+  expect(events).toHaveLength(10);
+  expect(events.every((entry) => entry.digest === "")).toBe(true);
+  const liveIdentity = {
+    ...identity,
+    appId: events[1]!.event_payload,
+    composeHash: events[2]!.event_payload,
+    instanceId: events[3]!.event_payload,
+  };
+  const livePolicy = {
+    ...policy,
+    identity: {
+      ...policy.identity,
+      appId: liveIdentity.appId,
+      composeHash: liveIdentity.composeHash,
+      instanceId: liveIdentity.instanceId,
+    },
+  };
+  vi.mocked(getCollateralAndVerify).mockResolvedValue(verified(raw) as never);
+  await expect(
+    createDcapPeerVerifier([livePolicy])(
+      evidence(raw),
+      challenge,
+      liveIdentity,
+    ),
+  ).resolves.toBeUndefined();
+});
+
+it.each([
+  "changed payload",
+  "reordered events",
+  "mismatched supplied digest",
+  "empty firmware digest",
+  "missing digest field",
+  "extra runtime record",
+])("rejects %s in the real raw GetQuote representation", async (change) => {
+  const quoted = fixture("getquote"),
+    altered = structuredClone(quoted);
+  const runtime = quoted.event_log.filter((entry) => entry.imr === 3);
+  const liveIdentity = {
+    ...identity,
+    appId: runtime[1]!.event_payload,
+    composeHash: runtime[2]!.event_payload,
+    instanceId: runtime[3]!.event_payload,
+  };
+  const livePolicy = {
+    ...policy,
+    identity: {
+      ...policy.identity,
+      appId: liveIdentity.appId,
+      composeHash: liveIdentity.composeHash,
+      instanceId: liveIdentity.instanceId,
+    },
+  };
+  const start = altered.event_log.findIndex((entry) => entry.imr === 3);
+  if (change === "changed payload")
+    altered.event_log[start + 1]!.event_payload = "00".repeat(20);
+  if (change === "reordered events")
+    [altered.event_log[start], altered.event_log[start + 1]] = [
+      altered.event_log[start + 1]!,
+      altered.event_log[start]!,
+    ];
+  if (change === "mismatched supplied digest")
+    altered.event_log[start]!.digest = "00".repeat(48);
+  if (change === "empty firmware digest") altered.event_log[0]!.digest = "";
+  if (change === "missing digest field")
+    Reflect.deleteProperty(altered.event_log[start]!, "digest");
+  if (change === "extra runtime record")
+    altered.event_log.push({ ...altered.event_log[start]! });
+  vi.mocked(getCollateralAndVerify).mockResolvedValue(
+    verified(quoted) as never,
+  );
+  await expect(
+    createDcapPeerVerifier([livePolicy])(
+      evidence(altered),
+      challenge,
+      liveIdentity,
+    ),
+  ).rejects.toThrow("Peer runtime events rejected");
+});

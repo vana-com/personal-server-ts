@@ -30,6 +30,17 @@ interface DstackEvent {
   event: string;
   event_payload: string;
 }
+function runtimeEventDigest(event: DstackEvent): string {
+  const type = Buffer.alloc(4);
+  type.writeUInt32LE(event.event_type);
+  return createHash("sha384")
+    .update(type)
+    .update(":")
+    .update(event.event)
+    .update(":")
+    .update(Buffer.from(event.event_payload, "hex"))
+    .digest("hex");
+}
 /** Authenticate payload semantics only after replaying the supplied log to the
  * verified quote. mr-kms may rotate under the exact approved KMS CA; this mode
  * deliberately does not pin the measurement of each KMS VM instance. */
@@ -61,14 +72,19 @@ function verifyDstackEvents(
       !Number.isInteger(value.event_type) ||
       value.event_type < 0 ||
       value.event_type > 0xffffffff ||
-      !isHex(value.digest, 48) ||
+      !(isHex(value.digest, 48) || (value.imr === 3 && value.digest === "")) ||
       typeof value.event !== "string" ||
       value.event.length > 256 ||
       !isHex(value.event_payload) ||
       value.event_payload.length > 64 * 1024
     )
       throw reject();
-    const event = value as DstackEvent;
+    let event = value as DstackEvent;
+    // GetQuote omits runtime digests; certificate TCB logs include them.
+    // Reconstruct only this documented runtime representation, then authenticate
+    // it through the same full replay and exact event profile below.
+    if (event.imr === 3 && event.digest === "")
+      event = { ...event, digest: runtimeEventDigest(event) };
     replayed[event.imr] = createHash("sha384")
       .update(replayed[event.imr]!)
       .update(Buffer.from(event.digest, "hex"))
@@ -115,16 +131,7 @@ function verifyDstackEvents(
         : event.event_payload !== expected[i]![1])
     )
       throw reject();
-    const type = Buffer.alloc(4);
-    type.writeUInt32LE(event.event_type);
-    const digest = createHash("sha384")
-      .update(type)
-      .update(":")
-      .update(event.event)
-      .update(":")
-      .update(Buffer.from(event.event_payload, "hex"))
-      .digest("hex");
-    if (digest !== event.digest) throw reject();
+    if (runtimeEventDigest(event) !== event.digest) throw reject();
   }
 }
 /** Full Intel chain/quote/TCB verification plus exact approved boot measurements.
