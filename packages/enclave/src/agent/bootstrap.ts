@@ -11,6 +11,7 @@ import {
   DEFAULT_SANDBOX_PIDS_LIMIT,
 } from "../sandbox/docker-runtime.js";
 import { SANDBOX_IDLE_TTL_SECONDS, SANDBOX_MAX } from "../sandbox/registry.js";
+import { isVerifiedFleetEnvironment } from "../fleet/security-config.js";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 8787;
@@ -96,6 +97,14 @@ export interface AgentConfig {
 }
 
 export function agentConfigFromEnv(env: NodeJS.ProcessEnv): AgentConfig {
+  if (
+    (env.FLEET_ENABLED === "true" ||
+      env.FLEET_CONFIG_PUBLIC_KEY !== undefined ||
+      env.FLEET_SIGNED_CONFIG !== undefined) &&
+    !isVerifiedFleetEnvironment(env)
+  ) {
+    throw new Error("Authenticated fleet security configuration is required");
+  }
   const secret = env.ENCLAVE_AGENT_SECRET;
   if (!secret) {
     throw new Error("ENCLAVE_AGENT_SECRET is required");

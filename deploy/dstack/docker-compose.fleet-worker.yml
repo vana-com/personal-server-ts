@@ -1,9 +1,10 @@
-# Moksha worker role. Render GIT_REF and PS_IMAGE as reviewed literals.
+# Moksha worker role. Replace all REPLACE_WITH_ markers before deployment.
 # Both workers must remain in the existing worker app/KMS domain.
-# MCP env is unset for worker2; set it only on the existing migration source.
+# Sign the complete worker config; include MCP only for the preserved source.
+# Never expose the public verification key as an externally allowed environment value.
 services:
   agent:
-    image: node@sha256:4caaaf42195bcd6f6f3559a413b20cb8f8ad089e231ee874cf7701643966689f
+    image: REPLACE_WITH_REVIEWED_AGENT_IMAGE_DIGEST
     restart: unless-stopped
     stop_grace_period: 120s
     working_dir: /app
@@ -11,32 +12,8 @@ services:
       - 8787:8787
       - 8789:8789
     environment:
-      - MCP_PUBLIC_ORIGIN
-      - MCP_APPROVAL_URL
-      - MCP_STATE_PATH=/mcp-state/state.sealed
-      - MCP_INGRESS_HOST=0.0.0.0
-      - MCP_INGRESS_PORT=8788
-      - MCP_REDIRECT_URIS=["https://claude.ai/api/mcp/auth_callback","https://claude.com/api/mcp/auth_callback"]
-      - ENCLAVE_AGENT_SECRET
-      - ENCLAVE_AGENT_HOST=0.0.0.0
-      - ENCLAVE_AGENT_PORT=8787
-      - SANDBOX_DEBUG=1
-      - GIT_REF
-      - GATEWAY_URL=https://dp-rpc-moksha-spike-b3.vercel.app
-      - STORAGE_API_URL=https://spikeb3-vana-storage.vana.workers.dev
-      - CHAIN_ID=14800
-      - NODE_ID
-      - NODE_SECRET
-      - FLEET_ENABLED=true
-      - FLEET_PEER_PORT=8789
-      - FLEET_PEER_POLICIES
-      - SANDBOX_RUNTIME=docker
-      - DOCKER_HOST=tcp://sandbox-runtime:2375
-      - PS_IMAGE
-      - SANDBOX_MAX=20
-      - SANDBOX_MEMORY=512m
-      - SANDBOX_CPUS=1
-      - SANDBOX_IDLE_TTL_SECONDS=30
+      - FLEET_CONFIG_PUBLIC_KEY=REPLACE_WITH_OPERATOR_ED25519_SPKI_BASE64
+      - FLEET_SIGNED_CONFIG
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - mcp-state:/mcp-state
@@ -49,9 +26,12 @@ services:
       - |
         date -u +%FT%TZ
         apk add --no-cache docker-cli git
-        : "$${PS_IMAGE:?PS_IMAGE must be set}"
+        PS_IMAGE='REPLACE_WITH_REVIEWED_PS_IMAGE_DIGEST'
+        GIT_REF='REPLACE_WITH_REVIEWED_40_HEX_COMMIT'
+        echo "$$GIT_REF" | grep -Eq '^[0-9a-f]{40}$$'
+        echo "$$PS_IMAGE" | grep -Eq '^.+@sha256:[0-9a-f]{64}$$' 
         for pull_attempt in 1 2 3; do
-          if docker pull "$$PS_IMAGE"; then
+          if docker --host=tcp://sandbox-runtime:2375 pull "$$PS_IMAGE"; then
             break
           fi
           if [ "$$pull_attempt" -eq 3 ]; then

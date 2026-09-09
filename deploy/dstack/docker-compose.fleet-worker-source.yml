@@ -1,10 +1,6 @@
 # Merge with docker-compose.fleet-worker.yml only for the existing MCP source.
 # Preserve its original named volumes and app identity through export/rollback.
 services:
-  agent:
-    environment:
-      - MCP_PUBLIC_ORIGIN=https://mcp-dev.vana.org
-      - MCP_APPROVAL_URL=https://vana-web-enclave-preview.vercel.app/personal-server
   mcp-tls:
     image: dstacktee/dstack-ingress:2.5@sha256:97285855a83ce6682447eb1f36e59c1927b9188a51b213e34d79acadd8425c78
     restart: unless-stopped
