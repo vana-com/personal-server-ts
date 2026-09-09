@@ -94,3 +94,72 @@ it("refuses a different admitted worker before sending the owner payload", async
   ).rejects.toThrow("Unexpected peer destination");
   expect(wireCalls).toBe(1);
 });
+
+it("rejects oversized public handshakes before asking dstack for a quote", async () => {
+  const client = createFakeDstackClient({ appId: "1".repeat(40) });
+  let quotes = 0;
+  const quote = client.quote;
+  client.quote = async (data) => {
+    quotes++;
+    return quote(data);
+  };
+  const identity: FleetPeerIdentity = {
+    role: "worker",
+    nodeId: "worker",
+    nodeIncarnation: "1",
+    appId: "app",
+    instanceId: "instance",
+    composeHash: "compose",
+  };
+  const handler = createFleetPeerServer({
+    identity,
+    client,
+    verifyPeer: async () => {},
+    dispatch: async () => null,
+  });
+  const response = await handler(
+    new Request("https://worker.invalid/fleet-peer/v1/challenge", {
+      method: "POST",
+      body: JSON.stringify({
+        identity,
+        nonce: "a".repeat(64),
+        publicKey: "key",
+        padding: "x".repeat(65_536),
+      }),
+    }),
+  );
+  expect(response.status).toBe(403);
+  expect(quotes).toBe(0);
+});
+
+it("accepts equivalent identities whose properties use a different order", async () => {
+  const worker: FleetPeerIdentity = {
+    appId: "app",
+    instanceId: "instance",
+    composeHash: "compose",
+    role: "worker",
+    nodeId: "worker",
+    nodeIncarnation: "1",
+  };
+  const controller: FleetPeerIdentity = {
+    ...worker,
+    role: "controller",
+    nodeId: "controller",
+  };
+  const dstack = createFakeDstackClient({ appId: "1".repeat(40) });
+  const handler = createFleetPeerServer({
+    identity: worker,
+    client: dstack,
+    verifyPeer: async () => {},
+    dispatch: async () => "accepted",
+  });
+  const client = createFleetPeerClient({
+    identity: controller,
+    expectedPeer: worker,
+    client: dstack,
+    verifyPeer: async () => {},
+    baseUrl: "https://worker.invalid",
+    fetch: async (input, init) => handler(new Request(input, init)),
+  });
+  await expect(client.call("execute", {})).resolves.toBe("accepted");
+});

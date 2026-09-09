@@ -65,13 +65,13 @@ async function beforeDeadline<T>(
 function hello(identity: FleetPeerIdentity): { hello: Hello; key: KeyObject } {
   const keys = generateKeyPairSync("x25519");
   return {
-    hello: {
+    hello: parseHello({
       identity,
       publicKey: keys.publicKey
         .export({ type: "spki", format: "der" })
         .toString("base64"),
       nonce: randomBytes(32).toString("hex"),
-    },
+    }),
     key: keys.privateKey,
   };
 }
@@ -155,7 +155,10 @@ async function evidence(
     ...(q.eventLog ? { eventLog: q.eventLog } : {}),
   };
 }
-async function json(request: Request): Promise<unknown> {
+async function json(
+  request: Request,
+  limit = MAX_BYTES * 1.5,
+): Promise<unknown> {
   const reader = request.body?.getReader();
   if (!reader) throw new Error("Missing body");
   let size = 0;
@@ -165,7 +168,7 @@ async function json(request: Request): Promise<unknown> {
       const result = await reader.read();
       if (result.done) break;
       size += result.value.length;
-      if (size > MAX_BYTES * 1.5) {
+      if (size > limit) {
         await reader.cancel();
         throw new Error("Peer body too large");
       }
@@ -175,6 +178,73 @@ async function json(request: Request): Promise<unknown> {
     reader.releaseLock();
   }
   return JSON.parse(Buffer.concat(chunks).toString());
+}
+function parseHello(value: unknown): Hello {
+  if (!value || typeof value !== "object")
+    throw new Error("Invalid peer hello");
+  const body = value as Record<string, unknown>;
+  if (!body.identity || typeof body.identity !== "object")
+    throw new Error("Invalid peer identity");
+  const claims = body.identity as Record<string, unknown>;
+  if (claims.role !== "controller" && claims.role !== "worker")
+    throw new Error("Invalid peer role");
+  const fields = [
+    "nodeId",
+    "nodeIncarnation",
+    "appId",
+    "instanceId",
+    "composeHash",
+  ] as const;
+  for (const field of fields)
+    if (
+      typeof claims[field] !== "string" ||
+      !claims[field] ||
+      claims[field].length > 256
+    )
+      throw new Error("Invalid peer identity field");
+  if (
+    typeof body.nonce !== "string" ||
+    !/^[a-f0-9]{64}$/.test(body.nonce) ||
+    typeof body.publicKey !== "string" ||
+    body.publicKey.length > 256
+  )
+    throw new Error("Invalid peer hello");
+  const publicKey = createPublicKey({
+    key: Buffer.from(body.publicKey, "base64"),
+    type: "spki",
+    format: "der",
+  });
+  if (publicKey.asymmetricKeyType !== "x25519")
+    throw new Error("Invalid peer key");
+  return {
+    identity: {
+      role: claims.role,
+      nodeId: claims.nodeId as string,
+      nodeIncarnation: claims.nodeIncarnation as string,
+      appId: claims.appId as string,
+      instanceId: claims.instanceId as string,
+      composeHash: claims.composeHash as string,
+    },
+    publicKey: body.publicKey,
+    nonce: body.nonce,
+  };
+}
+function parseEvidence(value: unknown): FleetPeerEvidence {
+  if (!value || typeof value !== "object")
+    throw new Error("Invalid peer evidence");
+  const body = value as Record<string, unknown>;
+  if (
+    typeof body.quote !== "string" ||
+    body.quote.length < 1 ||
+    body.quote.length > 256_000 ||
+    (body.eventLog !== undefined &&
+      (typeof body.eventLog !== "string" || body.eventLog.length > 512_000))
+  )
+    throw new Error("Peer evidence too large");
+  return {
+    quote: body.quote,
+    ...(typeof body.eventLog === "string" ? { eventLog: body.eventLog } : {}),
+  };
 }
 /** Dedicated listener; no bearer/plaintext RPC fallback. One-shot sessions avoid replay and nonce reuse. */
 export function createFleetPeerServer(
@@ -198,15 +268,7 @@ export function createFleetPeerServer(
         for (const [id, s] of sessions)
           if (s.expires <= Date.now()) sessions.delete(id);
         if (sessions.size >= 256) return new Response(null, { status: 429 });
-        const client = (await json(request)) as Hello;
-        if (
-          !client?.identity ||
-          typeof client.nonce !== "string" ||
-          !/^[a-f0-9]{64}$/.test(client.nonce) ||
-          typeof client.publicKey !== "string" ||
-          client.publicKey.length > 256
-        )
-          throw new Error("Invalid hello");
+        const client = parseHello(await json(request, 16 * 1024));
         const local = hello(options.identity);
         const challenge = {
           client,
@@ -236,7 +298,7 @@ export function createFleetPeerServer(
         throw new Error("Expired/replayed session");
       await beforeDeadline(
         options.verifyPeer(
-          body.evidence,
+          parseEvidence(body.evidence),
           digest(session.challenge),
           session.challenge.client.identity,
         ),
@@ -303,24 +365,21 @@ export function createFleetPeerClient(
         body: response.body,
         duplex: "half",
       } as RequestInit),
+      path.endsWith("/challenge") ? 768_000 : MAX_BYTES * 1.5,
     );
   };
   return {
     async call<T = unknown>(method: string, body: unknown): Promise<T> {
       const started = Date.now();
-      const budget =
-        method === "renew"
-          ? 8_000
-          : method === "describe"
-            ? 30_000
-            : [
-                  "activity",
-                  "readiness",
-                  "worker.identity",
-                  "worker.seal",
-                ].includes(method)
-              ? 20_000
-              : 120_000;
+      const budget = ["renew", "activity"].includes(method)
+        ? 8_000
+        : method === "describe"
+          ? 30_000
+          : ["release", "readiness", "worker.identity", "worker.seal"].includes(
+                method,
+              )
+            ? 20_000
+            : 120_000;
       const deadline = started + budget;
       const local = hello(options.identity);
       const received = (await post(
@@ -336,7 +395,11 @@ export function createFleetPeerClient(
       )
         throw new Error("Peer handshake substitution");
       await beforeDeadline(
-        options.verifyPeer(received.evidence, digest(c), c.server.identity),
+        options.verifyPeer(
+          parseEvidence(received.evidence),
+          digest(c),
+          c.server.identity,
+        ),
         Math.min(deadline, started + HANDSHAKE_MS),
       );
       if (options.expectedPeer) {

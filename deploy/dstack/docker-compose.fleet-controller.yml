@@ -1,0 +1,84 @@
+# Moksha central role. Render AGENT_IMAGE and GIT_REF as reviewed literals in
+# measured compose. Admission JSON is runtime policy so reciprocal compose pins
+# do not create a hash cycle. This app MUST have a different app_id from workers.
+# One active controller only; flock fences duplicate processes sharing its volume.
+services:
+  controller:
+    image: "${AGENT_IMAGE:?AGENT_IMAGE must be digest-pinned}"
+    restart: unless-stopped
+    stop_grace_period: 120s
+    working_dir: /app
+    ports:
+      - "8790:8790"
+      - "8791:8791"
+      - "8792:8792"
+    environment:
+      - GIT_REF
+      - CHAIN_ID=14800
+      - NODE_ID=moksha-personal-server-controller
+      - CONTROLLER_TERM=1
+      - GATEWAY_URL
+      - VERCEL_PROTECTION_BYPASS
+      - FLEET_STATE_PATH=/fleet-state/placements.json
+      - FLEET_WORKERS_JSON
+      - FLEET_GATEWAY_TOKEN
+      - FLEET_CONTROLLER_GATEWAY_TOKEN
+      - FLEET_CONTROLLER_ADMIN_TOKEN
+      - FLEET_CONTROL_PORT=8790
+      - FLEET_ADMIN_PORT=8791
+      - FLEET_PEER_PORT=8792
+      - MCP_PUBLIC_ORIGIN=https://mcp-dev.vana.org
+      - MCP_APPROVAL_URL=https://vana-web-enclave-preview.vercel.app/personal-server
+      - MCP_STATE_PATH=/mcp-state/state.sealed
+      - MCP_MIGRATION_REQUIRED=1
+      - MCP_INGRESS_HOST=0.0.0.0
+      - MCP_INGRESS_PORT=8788
+      - 'MCP_REDIRECT_URIS=["https://claude.ai/api/mcp/auth_callback","https://claude.com/api/mcp/auth_callback"]'
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - fleet-state:/fleet-state
+      - mcp-state:/mcp-state
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        apk add --no-cache git util-linux
+        : "$${GIT_REF:?GIT_REF must be a 40-hex commit SHA}"
+        git init .
+        if git remote get-url origin >/dev/null 2>&1; then
+          git remote set-url origin https://github.com/vana-com/personal-server-ts
+        else
+          git remote add origin https://github.com/vana-com/personal-server-ts
+        fi
+        git fetch --depth 1 origin "$${GIT_REF}"
+        git checkout --detach --force FETCH_HEAD
+        test "$$(git rev-parse HEAD)" = "$${GIT_REF}"
+        npm ci --no-audit --no-fund
+        npm run build -w @opendatalabs/personal-server-ts-enclave
+        mkdir -p /fleet-state
+        exec flock -n /fleet-state/controller.lock node packages/enclave/dist/central/main.js
+
+  mcp-tls:
+    image: dstacktee/dstack-ingress:2.5@sha256:97285855a83ce6682447eb1f36e59c1927b9188a51b213e34d79acadd8425c78
+    restart: unless-stopped
+    ports:
+      - "443:443"
+    environment:
+      - CHALLENGE_TYPE=tls-alpn-01
+      - DOMAIN=mcp-dev.vana.org
+      - TARGET_ENDPOINT=controller:8788
+      - GATEWAY_DOMAIN=_.dstack-pha-prod5.phala.network
+      - DNS_SETUP_MODE=wait
+      - DNS_SETUP_TIMEOUT=3600
+      - EVIDENCE_SERVER=true
+      - ALPN=http/1.1
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - mcp-certificates:/etc/letsencrypt
+      - mcp-evidence:/evidences
+
+volumes:
+  fleet-state:
+  mcp-state:
+  mcp-certificates:
+  mcp-evidence:

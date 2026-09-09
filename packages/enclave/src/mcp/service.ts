@@ -28,13 +28,14 @@ export interface McpMigrationSnapshot {
 }
 
 export interface McpIngressControl {
+  active(): Promise<boolean>;
   exportForMigration(request: {
     migrationId: string;
     targetPeer: { appId: string; instanceId: string };
   }): Promise<McpMigrationSnapshot>;
   importFromMigration(
     request: McpMigrationSnapshot,
-  ): Promise<{ connections: number; digest: string }>;
+  ): Promise<{ connections: number; digest: string; restartRequired: boolean }>;
   rememberIdentity(identity: McpWakeupIdentity): Promise<void>;
   close(): Promise<void>;
 }
@@ -170,6 +171,13 @@ export async function startMcpRouter(
       server.close((error) => (error ? reject(error) : resolve())),
     ));
   return {
+    active: async () => {
+      const status = await state.migrationStatus();
+      return (
+        !status.fenced &&
+        (env.MCP_MIGRATION_REQUIRED !== "1" || !!status.importedId)
+      );
+    },
     rememberIdentity: (identity) => state.rememberIdentity(identity),
     close,
     exportForMigration: async ({ migrationId, targetPeer }) => {
@@ -193,7 +201,8 @@ export async function startMcpRouter(
       try {
         if (createHash("sha256").update(snapshot).digest("hex") !== digest)
           throw new Error("Migration digest mismatch");
-        return await state.importSnapshot(snapshot, migrationId);
+        const receipt = await state.importSnapshot(snapshot, migrationId);
+        return { ...receipt, restartRequired: closed !== undefined };
       } finally {
         snapshot.fill(0);
       }
