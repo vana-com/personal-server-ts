@@ -75,6 +75,8 @@ export interface AgentJobsControl {
   draining(): boolean;
   drain(): Promise<void>;
   sandboxDebug: boolean;
+  fleetEnabled?: boolean;
+  nodeIncarnation?: string;
   listSandboxes(): Promise<SandboxStatus[]>;
   sandboxLogs(containerId: string, tail: number): Promise<string | undefined>;
   lookupSandboxJob(accessToken: string, jobId: string): SandboxJobLookup;
@@ -175,6 +177,15 @@ async function handleRequest(
     }
 
     if (request.method === POST && path === PREWARM_ROUTE && options.jobs) {
+      if (options.jobs.fleetEnabled) {
+        sendError(
+          response,
+          FORBIDDEN,
+          "FLEET_ASSIGNMENT_REQUIRED",
+          "Fleet controller assignment required",
+        );
+        return;
+      }
       const body = prewarmRequestBody(await readJson(request));
       sendJson(response, ACCEPTED, { accepted: true });
       options.jobs.prewarm(body);
@@ -270,6 +281,24 @@ async function handleResultSigning(
       bodyHash: body.bodyHash,
     });
 
+    // Derivation/signing are asynchronous; placement or attempt authorization
+    // may have expired since the initial lookup. Never release a late token.
+    const confirmed = options.jobs.lookupSandboxJob(token, body.jobId);
+    if (
+      confirmed.kind !== "active" ||
+      confirmed.job.jobId !== job.jobId ||
+      confirmed.job.epoch !== job.epoch ||
+      confirmed.job.userPsId !== job.userPsId ||
+      confirmed.job.chainId !== job.chainId ||
+      !sameAddress(confirmed.job.owner, job.owner) ||
+      !sameAddress(confirmed.job.serverAddress, job.serverAddress) ||
+      JSON.stringify(confirmed.job.assignment) !==
+        JSON.stringify(job.assignment)
+    ) {
+      sendError(response, FORBIDDEN, "SIGNING_REFUSED", "signing refused");
+      return;
+    }
+
     console.error(
       { jobId: job.jobId, key, size: body.byteLength },
       RESULT_SIGNING_MESSAGE,
@@ -340,7 +369,7 @@ async function readJson(request: IncomingMessage): Promise<unknown> {
   return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
 }
 
-function identityBody(value: unknown): IdentityRequestBody {
+export function identityBody(value: unknown): IdentityRequestBody {
   const body = record(value);
   if (
     !isAddressValue(body.ownerAddress) ||
@@ -401,7 +430,7 @@ function prewarmRequestBody(value: unknown): PrewarmRequestBody {
   };
 }
 
-function sealBody(value: unknown): SealRequestBody {
+export function sealBody(value: unknown): SealRequestBody {
   const body = record(value);
   if (
     !isAddressValue(body.ownerAddress) ||

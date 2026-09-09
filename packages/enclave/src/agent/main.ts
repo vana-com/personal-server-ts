@@ -1,3 +1,4 @@
+import { startFleetWorker } from "../fleet/worker-runtime.js";
 /**
  * Node agent entrypoint. ENCLAVE_AGENT_SECRET is required;
  * ENCLAVE_AGENT_HOST defaults to 127.0.0.1, ENCLAVE_AGENT_PORT to 8787;
@@ -113,17 +114,45 @@ async function startJobs(
       ? gatewayFetch(config.gatewayBypassSecret)
       : fetch,
   );
+  const fleet = await startFleetWorker({
+    env: process.env,
+    sandbox: sandboxDeps,
+    nodeId: config.nodeId,
+    nodeSecret: config.nodeSecret,
+    capacity: config.sandboxMax,
+    ...(mcp ? { migration: mcp } : {}),
+    ...(config.gatewayBypassSecret
+      ? { fetch: gatewayFetch(config.gatewayBypassSecret) }
+      : {}),
+  });
   const claimLoop = startClaimLoop({
     gateway,
-    run: async (job, identity) => {
-      await mcp?.rememberIdentity(identity);
-      return runJob(job, identity, {
-        ...sandboxDeps,
-        gateway,
-        leaseSeconds: config.leaseSeconds,
-        workDelayMs: config.workDelayMs,
-      });
+    run: async (job, identity, assignment) => {
+      if (!fleet) await mcp?.rememberIdentity(identity);
+      const work = () =>
+        runJob(job, identity, {
+          ...sandboxDeps,
+          ...(assignment && fleet
+            ? {
+                assignment,
+                assignmentSignal: fleet.worker.signal(assignment),
+                assertAssignment: () => fleet.worker.assertCurrent(assignment),
+              }
+            : {}),
+          gateway,
+          leaseSeconds: config.leaseSeconds,
+          workDelayMs: config.workDelayMs,
+        });
+      return assignment && fleet
+        ? fleet.worker.trackAssignment(assignment, work)
+        : work();
     },
+    ...(fleet
+      ? {
+          assignments: () => fleet.worker.assignments(),
+          assertAssignment: (a) => fleet.worker.assertCurrent(a),
+        }
+      : {}),
     registry,
     leaseSeconds: config.leaseSeconds,
     wait: MAX_WAIT_SECONDS,
@@ -142,14 +171,27 @@ async function startJobs(
 
   return {
     nodeId: config.nodeId,
+    ...(fleet
+      ? { nodeIncarnation: fleet.identity.nodeIncarnation, fleetEnabled: true }
+      : {}),
     storageApiUrl: config.storageApiUrl,
     activeCount: () => registry.activeCount(),
     draining: () => claimLoop.draining(),
     sandboxDebug: config.sandboxDebug,
     listSandboxes: () => registry.listSandboxes(),
     sandboxLogs: (containerId, tail) => registry.sandboxLogs(containerId, tail),
-    lookupSandboxJob: (accessToken, jobId) =>
-      registry.lookupJob(accessToken, jobId),
+    lookupSandboxJob: (accessToken, jobId) => {
+      const lookup = registry.lookupJob(accessToken, jobId);
+      if (fleet && lookup.kind === "active") {
+        if (!lookup.job.assignment) return { kind: "inactive" };
+        try {
+          fleet.worker.assertCurrent(lookup.job.assignment);
+        } catch {
+          return { kind: "inactive" };
+        }
+      }
+      return lookup;
+    },
     prewarm(body): void {
       if (!mcp) {
         void prewarmSandbox(body, body.scope, sandboxDeps);
@@ -163,7 +205,9 @@ async function startJobs(
       );
     },
     drain(): Promise<void> {
-      drainPromise ??= Promise.all([claimLoop.drain(), mcp?.close()])
+      drainPromise ??= claimLoop
+        .drain()
+        .then(() => Promise.all([fleet?.close(), mcp?.close()]))
         .then(() => undefined)
         .finally(() => nodeHeartbeat.stop());
 

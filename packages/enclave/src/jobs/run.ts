@@ -1,3 +1,5 @@
+import type { FleetAssignment } from "../fleet/contracts.js";
+import { fleetSandboxKey } from "../fleet/worker-key.js";
 import type {
   ECIESEncrypted,
   ECIESProvider,
@@ -96,6 +98,9 @@ type SandboxSpecDeps = Pick<
 >;
 
 export interface RunJobDeps {
+  assignment?: FleetAssignment;
+  assignmentSignal?: AbortSignal;
+  assertAssignment?: () => void;
   client: DstackClient;
   gateway: GatewayClient;
   registry: SandboxRegistry;
@@ -248,11 +253,20 @@ export async function runJob(
   identity: ClaimedIdentity,
   deps: RunJobDeps,
 ): Promise<JobRunResult> {
+  deps.assertAssignment?.();
+  if (
+    deps.assignment &&
+    (deps.assignment.chainId !== job.chainId ||
+      deps.assignment.userPsId.toLowerCase() !==
+        identity.userPsId.toLowerCase() ||
+      deps.assignment.identityEpoch !== identity.epoch)
+  )
+    throw new Error("Fleet job identity mismatch");
   const jobChainId = job.chainId ?? deps.chainId;
   if (jobChainId !== deps.chainId) {
     const error = new SandboxChainMismatchError(deps.chainId, jobChainId);
     logStageFailure(deps.logger, job.jobId, CHAIN_VALIDATION_STAGE, error);
-    await failJob(job, CHAIN_MISMATCH_REASON, deps.gateway);
+    await failJob(job, CHAIN_MISMATCH_REASON, deps.gateway, deps.assignment);
     return;
   }
   const lease = startLease(job, deps);
@@ -260,7 +274,9 @@ export async function runJob(
   const runStartedAt = now();
   const requestFetch = deps.fetch ?? fetch;
   const sleep = deps.sleep ?? delay;
-  const registryKey = `${identity.userPsId}:${identity.epoch}`;
+  const registryKey = deps.assignment
+    ? fleetSandboxKey(deps.assignment)
+    : `${identity.userPsId}:${identity.epoch}`;
   let acquired = false;
 
   try {
@@ -280,12 +296,17 @@ export async function runJob(
       return;
     }
     if (decrypted.kind === "invalid") {
-      await failJob(job, INVALID_REQUEST_REASON, deps.gateway);
+      await failJob(job, INVALID_REQUEST_REASON, deps.gateway, deps.assignment);
       return;
     }
     const { envelope } = decrypted;
     if (!requestMatches(envelope, job, now())) {
-      await failJob(job, failureReason(envelope, now()), deps.gateway);
+      await failJob(
+        job,
+        failureReason(envelope, now()),
+        deps.gateway,
+        deps.assignment,
+      );
       return;
     }
 
@@ -373,7 +394,12 @@ export async function runJob(
         TERMINAL_SYNC_BLOCK_REASONS.has(error.reason)
       ) {
         logStageFailure(deps.logger, job.jobId, SANDBOX_ACQUIRE_STAGE, error);
-        await failJob(job, SANDBOX_SYNC_BLOCKED_REASON, deps.gateway);
+        await failJob(
+          job,
+          SANDBOX_SYNC_BLOCKED_REASON,
+          deps.gateway,
+          deps.assignment,
+        );
         return;
       }
       if (isNonTransientDockerSandboxError(error)) {
@@ -413,7 +439,7 @@ export async function runJob(
 
     const remainingMs = Date.parse(envelope.request.deadline) - now();
     if (remainingMs <= 0) {
-      await failJob(job, DEADLINE_REASON, deps.gateway);
+      await failJob(job, DEADLINE_REASON, deps.gateway, deps.assignment);
       return;
     }
 
@@ -435,6 +461,7 @@ export async function runJob(
         userPsId: identity.userPsId,
         epoch: identity.epoch,
         serverAddress: identity.enclaveAddress,
+        ...(deps.assignment ? { assignment: deps.assignment } : {}),
       }),
     );
     if (result.status !== undefined) {
@@ -490,14 +517,16 @@ export async function runJob(
       return;
     }
     if (result.kind === "fail") {
-      await failJob(job, result.reason, deps.gateway);
+      await failJob(job, result.reason, deps.gateway, deps.assignment);
       return;
     }
 
+    deps.assertAssignment?.();
     const completeStartedAt = now();
     try {
       await deps.gateway.complete(job.jobId, {
         fencingToken: job.fencingToken,
+        ...(deps.assignment ? { assignment: deps.assignment } : {}),
         resultObjectKey: result.response.resultObjectKey,
         resultHash: result.response.resultHash,
         resultSize: result.response.resultSize,
@@ -551,6 +580,7 @@ function startLease(job: ClaimedJob, deps: RunJobDeps): LeaseState {
       try {
         const response = await deps.gateway.heartbeat(job.jobId, {
           fencingToken: job.fencingToken,
+          ...(deps.assignment ? { assignment: deps.assignment } : {}),
           leaseSeconds: deps.leaseSeconds,
         });
         if (response.claimExpiresAt) {
@@ -604,8 +634,10 @@ function startLease(job: ClaimedJob, deps: RunJobDeps): LeaseState {
   }
 
   return {
-    signal: controller.signal,
-    lost: () => leaseLost,
+    signal: deps.assignmentSignal
+      ? AbortSignal.any([controller.signal, deps.assignmentSignal])
+      : controller.signal,
+    lost: () => leaseLost || Boolean(deps.assignmentSignal?.aborted),
     settled: () => pending,
     stop(): void {
       clearInterval(timer);
@@ -961,11 +993,13 @@ async function failJob(
   job: ClaimedJob,
   reason: string,
   gateway: GatewayClient,
+  assignment?: FleetAssignment,
 ): Promise<void> {
   try {
     await gateway.fail(job.jobId, {
       fencingToken: job.fencingToken,
       reason,
+      ...(assignment ? { assignment } : {}),
     });
   } catch (error) {
     if (error instanceof LeaseLostError) {

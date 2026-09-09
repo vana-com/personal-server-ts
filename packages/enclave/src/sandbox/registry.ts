@@ -58,7 +58,9 @@ export interface SandboxRegistry {
   bindJob(key: string, job: ActiveSandboxJob): () => void;
   lookupJob(accessToken: string, jobId: string): SandboxJobLookup;
   drain(): Promise<void>;
+  evict(key: string): Promise<void>;
   activeCount(): number;
+  activity(key: string): { present: boolean; busy: boolean };
   listSandboxes(): Promise<SandboxStatus[]>;
   inspectSandbox(containerId: string): Promise<SandboxStatus | undefined>;
   sandboxLogs(containerId: string, tail: number): Promise<string | undefined>;
@@ -202,6 +204,19 @@ export function createSandboxRegistry(
 
       return job ? { kind: "active", job } : { kind: "inactive" };
     },
+    async evict(key): Promise<void> {
+      const entry = entries.get(key);
+      if (!entry) return;
+      // Keep the destroyed entry as a tombstone until its startup/stop settles.
+      // This prevents another acquire from racing teardown for this owner.
+      entry.state = "destroyed";
+      entry.expiryVersion += 1;
+      entry.activeJobs.clear();
+      entry.accessToken = randomBytes(ACCESS_TOKEN_BYTES).toString("hex");
+      if (entry.startPromise) await entry.startPromise.catch(() => undefined);
+      if (entry.handle) await options.runtime.stop(entry.handle.id);
+      if (entries.get(key) === entry) entries.delete(key);
+    },
     async drain(): Promise<void> {
       draining = true;
       for (const entry of entries.values()) {
@@ -228,6 +243,18 @@ export function createSandboxRegistry(
       } finally {
         entries.clear();
       }
+    },
+    activity(key) {
+      const entry = entries.get(key);
+      return {
+        present: Boolean(entry && entry.state !== "destroyed"),
+        busy: Boolean(
+          entry &&
+          (entry.state === "starting" ||
+            entry.useCount > 0 ||
+            entry.activeJobs.size > 0),
+        ),
+      };
     },
     activeCount(): number {
       return entries.size;
@@ -399,7 +426,8 @@ async function startEntry(options: StartEntryOptions): Promise<SandboxHandle> {
       onStatus?.(status);
     };
     const handle = await options.runtime.start(spec, options.signal);
-    if (options.isDraining()) {
+    options.entry.handle = handle;
+    if (options.isDraining() || options.entry.state === "destroyed") {
       await forceRemove(options.runtime, handle.id, options.logger);
       throw new Error(DRAINING_MESSAGE);
     }

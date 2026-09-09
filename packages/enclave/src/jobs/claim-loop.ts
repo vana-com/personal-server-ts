@@ -1,3 +1,5 @@
+import type { FleetAssignment } from "../fleet/contracts.js";
+import { sameAssignment } from "../fleet/contracts.js";
 import type { SandboxRegistry } from "../sandbox/registry.js";
 import type { GatewayClient } from "./gateway-client.js";
 import { CLAIM_POLL_FLOOR_MS, type ClaimResponse } from "./types.js";
@@ -21,7 +23,10 @@ export interface ClaimLoopOptions {
   run(
     job: ClaimResponse["job"],
     identity: ClaimResponse["identity"],
+    assignment?: FleetAssignment,
   ): Promise<JobRunResult>;
+  assignments?: () => FleetAssignment[];
+  assertAssignment?: (assignment: FleetAssignment) => void;
   registry: SandboxRegistry;
   leaseSeconds: number;
   wait: number;
@@ -41,6 +46,7 @@ export function startClaimLoop(options: ClaimLoopOptions): ClaimLoop {
   const inFlight = new Set<Promise<void>>();
   let isDraining = false;
   let unavailable = false;
+  let assignmentIndex = 0;
   let drainPromise: Promise<void> | undefined;
 
   const loopPromise = claimUntilDrain();
@@ -52,12 +58,19 @@ export function startClaimLoop(options: ClaimLoopOptions): ClaimLoop {
         continue;
       }
 
+      const assignments = options.assignments?.();
+      const assignment = assignments?.[assignmentIndex++ % assignments.length];
+      if (assignments && !assignment) {
+        await sleep(CLAIM_POLL_FLOOR_MS);
+        continue;
+      }
       let claim: ClaimResponse | null;
       const claimStartedAt = Date.now();
       try {
         claim = await options.gateway.claim(options.wait, {
           leaseSeconds: options.leaseSeconds,
           capacity: options.capacity - inFlight.size,
+          ...(assignment ? { assignment } : {}),
         });
         if (unavailable) {
           unavailable = false;
@@ -88,6 +101,35 @@ export function startClaimLoop(options: ClaimLoopOptions): ClaimLoop {
         continue;
       }
 
+      if (assignment) {
+        try {
+          options.assertAssignment?.(assignment);
+          if (
+            !claim.assignment ||
+            !sameAssignment(assignment, claim.assignment) ||
+            claim.identity.userPsId.toLowerCase() !==
+              assignment.userPsId.toLowerCase() ||
+            claim.identity.epoch !== assignment.identityEpoch ||
+            claim.job.chainId !== assignment.chainId
+          ) {
+            throw new Error("stale fleet claim");
+          }
+        } catch {
+          options.logger.warn(
+            { jobId: claim.job.jobId },
+            "Fleet claim rejected",
+          );
+          await sleep(CLAIM_POLL_FLOOR_MS);
+          continue;
+        }
+      } else if (claim.assignment) {
+        options.logger.warn(
+          { jobId: claim.job.jobId },
+          "Unexpected fleet claim rejected",
+        );
+        await sleep(CLAIM_POLL_FLOOR_MS);
+        continue;
+      }
       startRun(claim);
     }
 
@@ -102,7 +144,11 @@ export function startClaimLoop(options: ClaimLoopOptions): ClaimLoop {
 
   async function runClaim(claim: ClaimResponse): Promise<void> {
     try {
-      const result = await options.run(claim.job, claim.identity);
+      const result = await options.run(
+        claim.job,
+        claim.identity,
+        claim.assignment,
+      );
       if (result === NODE_FAULT) {
         void beginDrain();
       }

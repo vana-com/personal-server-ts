@@ -32,6 +32,7 @@ import {
   mcpStreamableHttpRoutes,
 } from "./routes/mcp.js";
 import { enclaveMcpRoutes } from "./routes/enclave-mcp.js";
+import { enclaveFleetRoutes } from "./routes/enclave-fleet.js";
 import {
   McpActivityRecorder,
   createInMemoryMcpConnectionStore,
@@ -372,6 +373,26 @@ export function createApp(deps: AppDeps): Hono {
   app.route("/v1/mcp/activity", mcpActivityRoutes(mcpRouteDeps));
   app.route("/mcp", mcpStreamableHttpRoutes(mcpRouteDeps));
   if (deps.profile === "enclave" && deps.accessToken && deps.serverOwner) {
+    app.route(
+      "/enclave/v1/fleet",
+      enclaveFleetRoutes({
+        accessToken: deps.accessToken,
+        hydrate: async (scopes) => {
+          if (!deps.mcpHydrateScopes)
+            throw new Error("Scoped hydration unavailable");
+          await deps.mcpHydrateScopes(scopes);
+        },
+        observe: async (scope) => {
+          const storage = deps.dataStorage;
+          const entry = storage?.findEntry({ scope });
+          const ready =
+            entry && storage?.hasScopeBlocks
+              ? await storage.hasScopeBlocks(scope, entry.collectedAt)
+              : false;
+          return { dataVersion: entry?.version ?? null, ready };
+        },
+      }),
+    );
     app.route(
       "/enclave/v1/mcp",
       enclaveMcpRoutes({

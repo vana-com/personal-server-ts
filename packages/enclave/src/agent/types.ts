@@ -1,3 +1,4 @@
+import type { FleetAssignment } from "../fleet/contracts.js";
 /** Agent-local HTTP request and response shapes. */
 
 import type { Address, Hex } from "viem";
@@ -34,6 +35,7 @@ export type PrewarmRequestBody = ClaimResponse["identity"] & {
 };
 
 export interface ActiveSandboxJob {
+  assignment?: FleetAssignment;
   jobId: string;
   chainId: number;
   owner: Address;
