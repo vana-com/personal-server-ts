@@ -34,6 +34,8 @@ export interface TeeMcpIngressDeps {
     binding: McpOwnerBinding,
   ): Promise<Response>;
   ownerReady?(binding: McpOwnerBinding): Promise<boolean>;
+  /** Runs only after signed grants are verified, before durable approval. */
+  beforeOwnerApproval?(binding: McpOwnerBinding): Promise<void>;
 }
 
 /** Public ingress: HTTPS terminates in the same CVM as this process. */
@@ -174,6 +176,11 @@ export function createTeeMcpIngress(deps: TeeMcpIngressDeps): Hono {
           },
           503,
         );
+      try {
+        await deps.beforeOwnerApproval?.(binding);
+      } catch {
+        return c.json({ error: "Owner scheduling unavailable" }, 503);
+      }
       await state.bindOwner(connection.id, binding);
       const approved = await approveMcpOAuthAuthorization(
         { authorizationId: authorization.id, grants: body.grants },

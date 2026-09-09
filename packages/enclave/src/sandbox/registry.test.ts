@@ -423,3 +423,27 @@ describe("sandbox registry", () => {
     expect(runtime.start).toHaveBeenCalledOnce();
   });
 });
+
+describe("fleet sandbox eviction", () => {
+  it("invalidates local result-signing tokens and removes only the assigned owner", async () => {
+    const runtime = memoryRuntime();
+    const registry = createSandboxRegistry({ runtime });
+    const first = await registry.acquire("first", buildSpec);
+    await registry.acquire("second", buildSpec);
+    registry.bindJob("first", {
+      jobId: "job",
+      chainId: 14800,
+      owner: OWNER,
+      userPsId: USER_PS_ID,
+      epoch: 1,
+      serverAddress: OWNER,
+    });
+    await registry.evict("first");
+    expect(registry.lookupJob(first.accessToken, "job")).toEqual({
+      kind: "unauthorized",
+    });
+    expect(runtime.stops).toEqual(["sandbox-1"]);
+    expect(registry.activeCount()).toBe(1);
+    await registry.drain();
+  });
+});

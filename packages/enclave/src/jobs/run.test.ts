@@ -1117,3 +1117,33 @@ describe("prewarmSandbox", () => {
     expect(release).toHaveBeenCalledWith(`${USER_PS_ID}:${EPOCH}`);
   });
 });
+
+it("refuses an expired fleet assignment before decrypting a claimed job", async () => {
+  const f = await createFixture();
+  const derive = vi.spyOn(f.client, "deriveKey");
+  await expect(
+    runJob(f.job, f.identity, {
+      ...f.deps,
+      assertAssignment: () => {
+        throw new Error("stale placement");
+      },
+    }),
+  ).rejects.toThrow("stale placement");
+  expect(derive).not.toHaveBeenCalled();
+  expect(f.runtime.specs).toHaveLength(0);
+  expect(f.gateway.complete).not.toHaveBeenCalled();
+});
+
+it("does not commit a sandbox result returned after fleet lease abort", async () => {
+  const f = await createFixture();
+  const controller = new AbortController();
+  await runJob(f.job, f.identity, {
+    ...f.deps,
+    assignmentSignal: controller.signal,
+    fetch: vi.fn(async () => {
+      controller.abort();
+      return Response.json(RESULT);
+    }),
+  });
+  expect(f.gateway.complete).not.toHaveBeenCalled();
+});

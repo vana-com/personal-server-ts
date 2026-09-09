@@ -1,3 +1,6 @@
+import { startFleetWorker } from "../fleet/worker-runtime.js";
+import { verifiedFleetEnvironment } from "../fleet/security-config.js";
+import { createRealDstackClient } from "../dstack/real.js";
 /**
  * Node agent entrypoint. ENCLAVE_AGENT_SECRET is required;
  * ENCLAVE_AGENT_HOST defaults to 127.0.0.1, ENCLAVE_AGENT_PORT to 8787;
@@ -37,10 +40,22 @@ void main();
 
 async function main(): Promise<void> {
   try {
-    const { client, host, jobs, port, secret } = agentConfigFromEnv(
-      process.env,
-    );
-    const jobsControl = jobs ? await startJobs(client, jobs, port) : undefined;
+    // The fleet compose always embeds this trust key as a measured literal.
+    // An unsigned FLEET_ENABLED=false cannot skip authentication on that image.
+    const raw = process.env;
+    const env =
+      raw.FLEET_CONFIG_PUBLIC_KEY !== undefined ||
+      raw.FLEET_SIGNED_CONFIG !== undefined ||
+      raw.FLEET_ENABLED === "true"
+        ? await verifiedFleetEnvironment(raw, {
+            role: "worker",
+            identity: () => createRealDstackClient().info(),
+          })
+        : raw;
+    const { client, host, jobs, port, secret } = agentConfigFromEnv(env);
+    const jobsControl = jobs
+      ? await startJobs(client, jobs, port, env)
+      : undefined;
     const server = createAgentServer({
       client,
       secret,
@@ -66,6 +81,7 @@ async function startJobs(
   client: ReturnType<typeof agentConfigFromEnv>["client"],
   config: NonNullable<ReturnType<typeof agentConfigFromEnv>["jobs"]>,
   agentPort: number,
+  env: NodeJS.ProcessEnv,
 ): Promise<AgentJobsControl> {
   const sandboxAgentUrl = await resolveSandboxAgentUrl({
     ...(config.sandboxAgentUrl ? { override: config.sandboxAgentUrl } : {}),
@@ -108,22 +124,50 @@ async function startJobs(
   } satisfies PrewarmDeps;
   const mcp = await startMcpIngress(
     sandboxDeps,
-    process.env,
+    env,
     config.gatewayBypassSecret
       ? gatewayFetch(config.gatewayBypassSecret)
       : fetch,
   );
+  const fleet = await startFleetWorker({
+    env,
+    sandbox: sandboxDeps,
+    nodeId: config.nodeId,
+    nodeSecret: config.nodeSecret,
+    capacity: config.sandboxMax,
+    ...(mcp ? { migration: mcp } : {}),
+    ...(config.gatewayBypassSecret
+      ? { fetch: gatewayFetch(config.gatewayBypassSecret) }
+      : {}),
+  });
   const claimLoop = startClaimLoop({
     gateway,
-    run: async (job, identity) => {
-      await mcp?.rememberIdentity(identity);
-      return runJob(job, identity, {
-        ...sandboxDeps,
-        gateway,
-        leaseSeconds: config.leaseSeconds,
-        workDelayMs: config.workDelayMs,
-      });
+    run: async (job, identity, assignment) => {
+      if (!fleet) await mcp?.rememberIdentity(identity);
+      const work = () =>
+        runJob(job, identity, {
+          ...sandboxDeps,
+          ...(assignment && fleet
+            ? {
+                assignment,
+                assignmentSignal: fleet.worker.signal(assignment),
+                assertAssignment: () => fleet.worker.assertCurrent(assignment),
+              }
+            : {}),
+          gateway,
+          leaseSeconds: config.leaseSeconds,
+          workDelayMs: config.workDelayMs,
+        });
+      return assignment && fleet
+        ? fleet.worker.trackAssignment(assignment, work)
+        : work();
     },
+    ...(fleet
+      ? {
+          assignments: () => fleet.worker.assignments(),
+          assertAssignment: (a) => fleet.worker.assertCurrent(a),
+        }
+      : {}),
     registry,
     leaseSeconds: config.leaseSeconds,
     wait: MAX_WAIT_SECONDS,
@@ -142,14 +186,27 @@ async function startJobs(
 
   return {
     nodeId: config.nodeId,
+    ...(fleet
+      ? { nodeIncarnation: fleet.identity.nodeIncarnation, fleetEnabled: true }
+      : {}),
     storageApiUrl: config.storageApiUrl,
     activeCount: () => registry.activeCount(),
     draining: () => claimLoop.draining(),
     sandboxDebug: config.sandboxDebug,
     listSandboxes: () => registry.listSandboxes(),
     sandboxLogs: (containerId, tail) => registry.sandboxLogs(containerId, tail),
-    lookupSandboxJob: (accessToken, jobId) =>
-      registry.lookupJob(accessToken, jobId),
+    lookupSandboxJob: (accessToken, jobId) => {
+      const lookup = registry.lookupJob(accessToken, jobId);
+      if (fleet && lookup.kind === "active") {
+        if (!lookup.job.assignment) return { kind: "inactive" };
+        try {
+          fleet.worker.assertCurrent(lookup.job.assignment);
+        } catch {
+          return { kind: "inactive" };
+        }
+      }
+      return lookup;
+    },
     prewarm(body): void {
       if (!mcp) {
         void prewarmSandbox(body, body.scope, sandboxDeps);
@@ -163,7 +220,9 @@ async function startJobs(
       );
     },
     drain(): Promise<void> {
-      drainPromise ??= Promise.all([claimLoop.drain(), mcp?.close()])
+      drainPromise ??= claimLoop
+        .drain()
+        .then(() => Promise.all([fleet?.close(), mcp?.close()]))
         .then(() => undefined)
         .finally(() => nodeHeartbeat.stop());
 

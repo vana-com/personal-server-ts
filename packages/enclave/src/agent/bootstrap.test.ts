@@ -13,6 +13,16 @@ const DATA_PORTABILITY_PERMISSIONS =
   "0x4444444444444444444444444444444444444444";
 
 describe("agentConfigFromEnv", () => {
+  it("rejects unsigned fleet configuration before runtime startup", () => {
+    expect(() =>
+      agentConfigFromEnv({
+        DSTACK_FAKE: "1",
+        ENCLAVE_AGENT_SECRET: "unsigned-agent-secret",
+        FLEET_ENABLED: "true",
+      }),
+    ).toThrow(/signed|authenticated/i);
+  });
+
   it("boots the fake with the default app id", async () => {
     const config = agentConfigFromEnv({
       DSTACK_FAKE: "1",
