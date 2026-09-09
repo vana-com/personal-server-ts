@@ -45,8 +45,16 @@ export function createFleetMcpRouting(options: {
   chainId: number;
   gatewayUrl: string;
   fetch?: typeof fetch;
-}): Pick<TeeMcpIngressDeps, "dispatch" | "ownerReady"> {
+}): Pick<TeeMcpIngressDeps, "dispatch" | "ownerReady" | "beforeOwnerApproval"> {
   return {
+    beforeOwnerApproval: async (binding) => {
+      if (options.controller.paused())
+        throw new Error("Fleet controller paused");
+      const owner = await resolveFleetOwner(binding, options);
+      await options.controller.enroll(owner);
+      if (options.controller.paused())
+        throw new Error("Fleet controller paused");
+    },
     ownerReady: async (binding) => {
       try {
         await resolveFleetOwner(binding, options);

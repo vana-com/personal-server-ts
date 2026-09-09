@@ -28,6 +28,17 @@ services:
         GIT_REF='REPLACE_WITH_REVIEWED_40_HEX_COMMIT'
         test "$${#GIT_REF}" -eq 40
         case "$${GIT_REF}" in *[!0-9a-f]*) exit 1;; esac
+        # /app is disposable source/build state, never a protected state volume.
+        # Recreate it after an interrupted fetch/build in this retained container.
+        test -r /proc/self/mountinfo
+        if [ -L /app ] || awk '$$5 == "/app" || index($$5, "/app/") == 1 { found=1 } END { exit !found }' /proc/self/mountinfo; then
+          echo "/app must be unmounted disposable source, not a symlink or state volume" >&2
+          exit 1
+        fi
+        cd /
+        rm -rf /app
+        mkdir /app
+        cd /app
         git init .
         if git remote get-url origin >/dev/null 2>&1; then
           git remote set-url origin https://github.com/vana-com/personal-server-ts

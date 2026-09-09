@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { isAbsolute } from "node:path";
 import { serve } from "@hono/node-server";
 import {
@@ -15,10 +16,13 @@ import {
   openMcpDurableState,
   verifyTeeMcpGrants,
   type McpWakeupIdentity,
+  type McpOwnerBinding,
+  type McpRollbackReceipt,
   type McpDurableState,
   type TeeMcpIngressDeps,
 } from "@opendatalabs/personal-server-ts-server/mcp/tee";
 import type { PrewarmDeps } from "../jobs/run.js";
+import { resolveMcpRollbackIdentity } from "./rollback.js";
 import { currentMcpIdentity, dispatchOwnerMcp } from "./dispatch.js";
 
 export interface McpMigrationSnapshot {
@@ -36,6 +40,10 @@ export interface McpIngressControl {
   importFromMigration(
     request: McpMigrationSnapshot,
   ): Promise<{ connections: number; digest: string; restartRequired: boolean }>;
+  prepareRollback(migrationId: string): Promise<McpRollbackReceipt>;
+  reconcileApprovedOwners(
+    resolve: (binding: McpOwnerBinding) => Promise<void>,
+  ): Promise<{ owners: number }>;
   rememberIdentity(identity: McpWakeupIdentity): Promise<void>;
   close(): Promise<void>;
 }
@@ -72,7 +80,10 @@ export async function startMcpRouter(
   requestFetch: typeof fetch,
   routing: (
     state: McpDurableState,
-  ) => Pick<TeeMcpIngressDeps, "ownerReady" | "dispatch">,
+  ) => Pick<
+    TeeMcpIngressDeps,
+    "ownerReady" | "dispatch" | "beforeOwnerApproval"
+  >,
 ): Promise<McpIngressControl | undefined> {
   if (!env.MCP_PUBLIC_ORIGIN) return undefined;
   const origin = new URL(env.MCP_PUBLIC_ORIGIN);
@@ -109,6 +120,34 @@ export async function startMcpRouter(
     });
   } finally {
     derived.key.fill(0);
+  }
+  const migration = await state.migrationStatus();
+  if (env.FLEET_ENABLED === "false" && migration.fenced)
+    throw new Error("MCP writer is fenced");
+  if (
+    env.FLEET_ENABLED === "false" &&
+    migration.importedId &&
+    !migration.rollbackActivated
+  ) {
+    const preparation = await state.getRollbackPreparation();
+    if (!env.NODE_ID || !env.NODE_SECRET)
+      throw new Error("Rollback recovery credentials required");
+    for (const prepared of preparation.owners) {
+      const current = await resolveMcpRollbackIdentity(prepared.binding, {
+        ...deps,
+        nodeId: env.NODE_ID,
+        nodeSecret: env.NODE_SECRET,
+        fetch: requestFetch,
+      });
+      if (
+        current.generation !== prepared.generation ||
+        !isDeepStrictEqual(current.identity, prepared.identity)
+      )
+        throw new Error(
+          "Rollback identity or generation changed after preparation",
+        );
+    }
+    await state.activateRollback(preparation.receipt);
   }
   const gateway = teeGatewayClient(deps.gatewayUrl, requestFetch);
   const gatewayConfig = {
@@ -176,6 +215,25 @@ export async function startMcpRouter(
       return (
         !status.fenced &&
         (env.MCP_MIGRATION_REQUIRED !== "1" || !!status.importedId)
+      );
+    },
+    reconcileApprovedOwners: (resolve) =>
+      state.exclusive(async () => {
+        const owners = await state.approvedOwnerBindings();
+        for (const binding of owners) await resolve(binding);
+        return { owners: owners.length };
+      }),
+    prepareRollback: async (migrationId) => {
+      await close();
+      if (env.FLEET_ENABLED !== "true" || !env.NODE_ID || !env.NODE_SECRET)
+        throw new Error("Fleet rollback recovery credentials required");
+      return state.prepareRollback(migrationId, (binding) =>
+        resolveMcpRollbackIdentity(binding, {
+          ...deps,
+          nodeId: env.NODE_ID!,
+          nodeSecret: env.NODE_SECRET!,
+          fetch: requestFetch,
+        }),
       );
     },
     rememberIdentity: (identity) => state.rememberIdentity(identity),

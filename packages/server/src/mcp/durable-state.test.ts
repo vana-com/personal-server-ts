@@ -5,9 +5,70 @@ import { randomBytes } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { createMcpConnection } from "@opendatalabs/personal-server-ts-core/mcp";
 import { openMcpDurableState } from "./durable-state.js";
+import { userPsId } from "@opendatalabs/vana-sdk/protocol/identity";
 
 const OWNER = "0x1111111111111111111111111111111111111111";
 const directories: string[] = [];
+
+it("prepares a fresh imported owner's wakeup envelope atomically for rollback without a job", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mcp-rollback-cache-"));
+  directories.push(directory);
+  const central = await openMcpDurableState({
+    path: join(directory, "central.sealed"),
+    key: randomBytes(32),
+  });
+  const created = await createMcpConnection(
+    { displayName: "fresh fleet owner" },
+    { store: central.connections, publicOrigin: "https://mcp-dev.vana.org" },
+  );
+  await central.bindOwner(created.connectionId, {
+    owner: OWNER,
+    chainId: 14800,
+  });
+  await central.connections.update(created.connectionId, {
+    status: "approved",
+  });
+  const path = join(directory, "source.sealed"),
+    key = randomBytes(32);
+  const source = await openMcpDurableState({ path, key });
+  await source.importSnapshot(
+    await central.fenceAndExport("rollback-cache-1", "source"),
+    "rollback-cache-1",
+  );
+  const identity = {
+    userPsId: userPsId(14800, OWNER),
+    epoch: 2,
+    enclaveAddress: OWNER,
+    enclavePublicKey: "0x04",
+    sealedEnvelope: {
+      v: 1,
+      iv: "iv",
+      ciphertext: "sealed-owner-material",
+      tag: "tag",
+      wrappedContentKey: { iv: "iv", ciphertext: "key", tag: "tag" },
+    },
+  } as const;
+  expect(await source.getIdentity(identity.userPsId)).toBeNull();
+  const receipt = await source.prepareRollback(
+    "rollback-cache-1",
+    async (binding) => {
+      expect(binding).toEqual({ owner: OWNER, chainId: 14800 });
+      return { identity, generation: 4 };
+    },
+  );
+  expect(receipt).toMatchObject({
+    migrationId: "rollback-cache-1",
+    owners: 1,
+    connections: 1,
+  });
+  const restarted = await openMcpDurableState({ path, key });
+  expect(await restarted.getIdentity(identity.userPsId)).toEqual(identity);
+  expect(await restarted.getRollbackPreparation()).toMatchObject({
+    receipt,
+    owners: [{ binding: { owner: OWNER, chainId: 14800 }, identity }],
+  });
+  expect(await readFile(path, "utf8")).not.toContain("sealed-owner-material");
+});
 
 afterEach(async () => {
   await Promise.all(
@@ -138,4 +199,91 @@ it("fences the old OAuth writer durably before exporting and restores connection
   await expect(
     openMcpDurableState({ path: targetPath, key: sourceKey }),
   ).rejects.toThrow();
+});
+
+it("invalidates rollback receipts on partial refresh, owner membership, cached identity, and snapshot changes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mcp-rollback-invalid-"));
+  directories.push(directory);
+  const central = await openMcpDurableState({
+    path: join(directory, "central.sealed"),
+    key: randomBytes(32),
+  });
+  const ids: string[] = [];
+  for (const owner of [OWNER, "0x2222222222222222222222222222222222222222"]) {
+    const created = await createMcpConnection(
+      { displayName: owner },
+      { store: central.connections, publicOrigin: "https://mcp-dev.vana.org" },
+    );
+    ids.push(created.connectionId);
+    await central.bindOwner(created.connectionId, { owner, chainId: 14800 });
+    await central.connections.update(created.connectionId, {
+      status: "approved",
+    });
+  }
+  const source = await openMcpDurableState({
+    path: join(directory, "source.sealed"),
+    key: randomBytes(32),
+  });
+  const snapshot = await central.fenceAndExport("rollback-invalid-1", "source");
+  await source.importSnapshot(snapshot, "rollback-invalid-1");
+  const identity = (owner: string, epoch = 2) => ({
+    userPsId: userPsId(14800, owner),
+    epoch,
+    enclaveAddress: owner,
+    enclavePublicKey: "0x04",
+    sealedEnvelope: {
+      v: 1 as const,
+      iv: "iv",
+      ciphertext: "ciphertext",
+      tag: "tag",
+      wrappedContentKey: { iv: "iv", ciphertext: "key", tag: "tag" },
+    },
+  });
+  const prepare = () =>
+    source.prepareRollback("rollback-invalid-1", async (binding) => ({
+      identity: identity(binding.owner),
+      generation: 4,
+    }));
+  await prepare();
+  const sameIdentity = identity(OWNER);
+  await source.rememberIdentity({
+    sealedEnvelope: sameIdentity.sealedEnvelope,
+    enclavePublicKey: sameIdentity.enclavePublicKey,
+    enclaveAddress: sameIdentity.enclaveAddress,
+    epoch: sameIdentity.epoch,
+    userPsId: sameIdentity.userPsId,
+  });
+  await expect(source.getRollbackPreparation()).resolves.toMatchObject({
+    receipt: { owners: 2 },
+  });
+  let resolved = 0;
+  await expect(
+    source.prepareRollback("rollback-invalid-1", async (binding) => {
+      if (++resolved === 2) throw new Error("second owner denied");
+      return { identity: identity(binding.owner, 3), generation: 5 };
+    }),
+  ).rejects.toThrow("second owner denied");
+  expect((await source.getIdentity(userPsId(14800, OWNER)))?.epoch).toBe(2);
+  await expect(source.getRollbackPreparation()).rejects.toThrow("not prepared");
+  await prepare();
+  await source.connections.update(ids[0]!, { status: "revoked" });
+  await expect(source.getRollbackPreparation()).rejects.toThrow("not prepared");
+  await source.connections.update(ids[0]!, { status: "approved" });
+  await prepare();
+  await source.rememberIdentity(identity(OWNER, 3));
+  await expect(source.getRollbackPreparation()).rejects.toThrow("changed");
+  await prepare();
+  const next = await openMcpDurableState({
+    path: join(directory, "next.sealed"),
+    key: randomBytes(32),
+  });
+  const emptySnapshot = await next.fenceAndExport(
+    "rollback-invalid-2",
+    "source",
+  );
+  await source.fenceAndExport("outward-invalid-2", "next");
+  await source.importSnapshot(emptySnapshot, "rollback-invalid-2");
+  await expect(source.getRollbackPreparation()).rejects.toThrow("not prepared");
+  expect(await central.approvedOwnerBindings()).toHaveLength(2);
+  await expect(central.connections.getById(ids[0]!)).rejects.toThrow("fenced");
 });

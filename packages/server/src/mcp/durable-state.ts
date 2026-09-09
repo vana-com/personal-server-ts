@@ -14,6 +14,7 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import type { Address } from "viem";
 import type { ClaimResponse } from "@opendatalabs/vana-sdk/protocol/jobs";
+import { userPsId } from "@opendatalabs/vana-sdk/protocol/identity";
 
 export type McpWakeupIdentity = ClaimResponse["identity"];
 
@@ -24,6 +25,23 @@ export interface McpOwnerBinding {
   chainId: number;
 }
 
+export interface McpRollbackIdentity {
+  identity: McpWakeupIdentity;
+  generation: number;
+}
+export interface McpRollbackReceipt {
+  migrationId: string;
+  digest: string;
+  owners: number;
+  connections: number;
+}
+interface RollbackPreparation {
+  importedDigest: string;
+  ownersDigest: string;
+  identities: Record<string, { digest: string; generation: number }>;
+  receipt: McpRollbackReceipt;
+}
+
 interface State {
   writer?: {
     fenced: boolean;
@@ -31,6 +49,12 @@ interface State {
     target?: string;
     importedId?: string;
     importedDigest?: string;
+    rollback?: RollbackPreparation;
+    rollbackActivated?: {
+      migrationId: string;
+      importedDigest: string;
+      receiptDigest: string;
+    };
   };
   connections: Record<string, McpConnectionRecord>;
   authorizations: Record<string, McpOAuthAuthorizationRecord>;
@@ -45,7 +69,25 @@ export interface McpDurableState {
     snapshot: Uint8Array,
     migrationId: string,
   ): Promise<{ connections: number; digest: string }>;
-  migrationStatus(): Promise<{ fenced: boolean; importedId?: string }>;
+  migrationStatus(): Promise<{
+    fenced: boolean;
+    importedId?: string;
+    rollbackActivated?: boolean;
+  }>;
+  activateRollback(receipt: McpRollbackReceipt): Promise<void>;
+  prepareRollback(
+    migrationId: string,
+    resolve: (binding: McpOwnerBinding) => Promise<McpRollbackIdentity>,
+  ): Promise<McpRollbackReceipt>;
+  getRollbackPreparation(): Promise<{
+    receipt: McpRollbackReceipt;
+    owners: {
+      binding: McpOwnerBinding;
+      identity: McpWakeupIdentity;
+      generation: number;
+    }[];
+  }>;
+  approvedOwnerBindings(): Promise<McpOwnerBinding[]>;
   connections: McpConnectionStore;
   authorizations: McpOAuthAuthorizationStore;
   bindOwner(connectionId: string, binding: McpOwnerBinding): Promise<void>;
@@ -131,10 +173,143 @@ export async function openMcpDurableState(options: {
   };
 
   return {
+    // Read-only membership reconciliation remains possible after writer fencing;
+    // it never exposes connection keys or permits an OAuth mutation.
+    approvedOwnerBindings: async () => {
+      await writes;
+      return structuredClone(rollbackOwners(state).bindings);
+    },
+    prepareRollback(migrationId, resolve) {
+      const operation = operations.then(() => {
+        const prepared = writes.then(async () => {
+          assertActive();
+          if (
+            !migrationId ||
+            state.writer?.importedId !== migrationId ||
+            !state.writer.importedDigest
+          )
+            throw new Error("Rollback requires the exact imported migration");
+          // A failed refresh must not leave an earlier receipt usable at boot.
+          const pending = structuredClone(state);
+          delete pending.writer!.rollback;
+          delete pending.writer!.rollbackActivated;
+          await persist(options.path, key, pending);
+          state = pending;
+          const required = rollbackOwners(state);
+          const draft = structuredClone(state);
+          const identities: RollbackPreparation["identities"] = {};
+          // Resolve one owner at a time on the small source TEE, without writing
+          // a partial cache or exposing owner bindings to the operator.
+          for (const binding of required.bindings) {
+            const resolved = await resolve(binding);
+            const id = userPsId(binding.chainId, binding.owner);
+            if (
+              resolved.identity.userPsId !== id ||
+              !Number.isSafeInteger(resolved.identity.epoch) ||
+              resolved.identity.epoch < 1 ||
+              !Number.isSafeInteger(resolved.generation) ||
+              resolved.generation < 0
+            )
+              throw new Error("Rollback identity does not match its owner");
+            draft.identities[id] = structuredClone(resolved.identity);
+            identities[id] = {
+              digest: rollbackDigest(resolved.identity),
+              generation: resolved.generation,
+            };
+          }
+          const receipt = {
+            migrationId,
+            digest: rollbackDigest({
+              migrationId,
+              importedDigest: state.writer!.importedDigest,
+              ownersDigest: required.digest,
+              identities,
+            }),
+            owners: required.bindings.length,
+            connections: required.connections,
+          };
+          draft.writer!.rollback = {
+            importedDigest: state.writer!.importedDigest!,
+            ownersDigest: required.digest,
+            identities,
+            receipt,
+          };
+          await persist(options.path, key, draft);
+          state = draft;
+          return structuredClone(receipt);
+        });
+        writes = prepared.catch(() => undefined);
+        return prepared;
+      });
+      operations = operation.catch(() => undefined);
+      return operation;
+    },
+    getRollbackPreparation: () =>
+      read((current) => {
+        const prepared = current.writer?.rollback;
+        const required = rollbackOwners(current);
+        if (
+          !prepared ||
+          prepared.receipt.migrationId !== current.writer?.importedId ||
+          prepared.importedDigest !== current.writer.importedDigest ||
+          prepared.ownersDigest !== required.digest ||
+          Object.keys(prepared.identities).length !== required.bindings.length
+        )
+          throw new Error(
+            "Rollback identities are not prepared for this imported state",
+          );
+        const owners = required.bindings.map((binding) => {
+          const id = userPsId(binding.chainId, binding.owner);
+          const identity = current.identities[id];
+          if (
+            !identity ||
+            prepared.identities[id]?.digest !== rollbackDigest(identity)
+          )
+            throw new Error("Rollback identity changed after preparation");
+          return {
+            binding,
+            identity,
+            generation: prepared.identities[id]!.generation,
+          };
+        });
+        return { receipt: prepared.receipt, owners };
+      }),
+    activateRollback: (receipt) =>
+      mutate((draft) => {
+        const prepared = draft.writer?.rollback;
+        if (
+          !prepared ||
+          receipt.migrationId !== draft.writer?.importedId ||
+          receipt.digest !== prepared.receipt.digest ||
+          prepared.importedDigest !== draft.writer.importedDigest ||
+          prepared.ownersDigest !== rollbackOwners(draft).digest ||
+          Object.entries(prepared.identities).some(
+            ([id, value]) =>
+              value.digest !== rollbackDigest(draft.identities[id]),
+          )
+        )
+          throw new Error("Rollback preparation changed before activation");
+        draft.writer.rollbackActivated = {
+          migrationId: receipt.migrationId,
+          importedDigest: prepared.importedDigest,
+          receiptDigest: receipt.digest,
+        };
+      }),
     migrationStatus: async () => {
       await writes;
       return {
         fenced: state.writer?.fenced ?? false,
+        ...(state.writer?.rollbackActivated
+          ? {
+              rollbackActivated:
+                state.writer.rollbackActivated.migrationId ===
+                  state.writer.importedId &&
+                state.writer.rollbackActivated.importedDigest ===
+                  state.writer.importedDigest &&
+                state.writer.rollbackActivated.receiptDigest ===
+                  state.writer.rollback?.receipt.digest,
+            }
+          : {}),
         ...(state.writer?.importedId
           ? { importedId: state.writer.importedId }
           : {}),
@@ -295,6 +470,44 @@ export async function openMcpDurableState(options: {
       operations = result.catch(() => undefined);
       return result;
     },
+  };
+}
+
+function rollbackDigest(value: unknown): string {
+  const canonical = JSON.stringify(value, (_key, item: unknown) => {
+    if (item && typeof item === "object" && !Array.isArray(item))
+      return Object.fromEntries(
+        Object.entries(item).sort(([a], [b]) => a.localeCompare(b)),
+      );
+    return item;
+  });
+  return createHash("sha256").update(canonical).digest("hex");
+}
+
+function rollbackOwners(state: State): {
+  bindings: McpOwnerBinding[];
+  digest: string;
+  connections: number;
+} {
+  const connections = Object.values(state.connections)
+    .filter((connection) => connection.status === "approved")
+    .sort((a, b) => a.id.localeCompare(b.id));
+  const bindings = new Map<string, McpOwnerBinding>();
+  const entries = connections.map((connection) => {
+    const binding = state.owners[connection.id];
+    if (!binding) throw new Error("Approved rollback connection has no owner");
+    const id = userPsId(binding.chainId, binding.owner);
+    bindings.set(id, binding);
+    return {
+      connectionId: connection.id,
+      owner: binding.owner.toLowerCase(),
+      chainId: binding.chainId,
+    };
+  });
+  return {
+    bindings: [...bindings.values()],
+    digest: rollbackDigest(entries),
+    connections: connections.length,
   };
 }
 

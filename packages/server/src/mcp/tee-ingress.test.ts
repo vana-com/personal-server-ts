@@ -15,6 +15,70 @@ afterEach(async () => {
   );
 });
 describe("TEE MCP ingress", () => {
+  it("keeps OAuth unapproved when fleet membership fails and retries before any MCP call", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tee-membership-"));
+    dirs.push(dir);
+    const state = await openMcpDurableState({
+      path: join(dir, "state"),
+      key: randomBytes(32),
+    });
+    const authorization = await createMcpOAuthAuthorization(
+      {
+        clientId: "claude",
+        redirectUri: "https://claude.ai/api/mcp/auth_callback",
+        codeChallenge: "a".repeat(43),
+        codeChallengeMethod: "S256",
+      },
+      {
+        connectionStore: state.connections,
+        authorizationStore: state.authorizations,
+        publicOrigin: "https://mcp-dev.vana.org",
+      },
+    );
+    const beforeOwnerApproval = vi
+      .fn()
+      .mockRejectedValue(new Error("membership unavailable"));
+    const app = createTeeMcpIngress({
+      state,
+      origin: "https://mcp-dev.vana.org",
+      approvalUrl: "https://vana.example/mcp",
+      allowedRedirectUris: ["https://claude.ai/api/mcp/auth_callback"],
+      gateway: {} as never,
+      verifyGrants: vi.fn(),
+      registerGrantee: vi.fn(),
+      dispatch: vi.fn(),
+      ownerReady: async () => true,
+      beforeOwnerApproval,
+    });
+    const approve = () =>
+      app.request(
+        `/v1/mcp/oauth/authorizations/${authorization.authorizationId}/approve`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            owner: OWNER,
+            chainId: 14800,
+            grants: [{ grantId: "0xabc", scopes: ["spotify.profile"] }],
+          }),
+        },
+      );
+    expect((await approve()).status).toBe(503);
+    const record = await state.authorizations.getById(
+      authorization.authorizationId,
+    );
+    expect(record?.status).toBe("pending");
+    expect(await state.getOwner(record!.connectionId)).toBeNull();
+    beforeOwnerApproval.mockResolvedValue(undefined);
+    expect((await approve()).status).toBe(200);
+    expect(beforeOwnerApproval).toHaveBeenLastCalledWith({
+      owner: OWNER,
+      chainId: 14800,
+    });
+    expect(
+      (await state.connections.getById(record!.connectionId))?.status,
+    ).toBe("approved");
+  });
   it.each(["restart", "migration"])(
     "redeems PKCE once and keeps the bearer owner binding after %s",
     async (mode) => {

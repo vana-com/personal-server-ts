@@ -7,7 +7,7 @@ import type { DstackClient } from "../dstack/client.js";
 import type { SupportedChainId } from "../agent/bootstrap.js";
 import { startMcpRouter, type McpMigrationSnapshot } from "../mcp/service.js";
 import { createFleetControlHttp } from "../fleet/controller-http.js";
-import { createFleetMcpRouting } from "../fleet/router.js";
+import { createFleetMcpRouting, resolveFleetOwner } from "../fleet/router.js";
 import {
   createFleetPeerClient,
   createFleetPeerServer,
@@ -213,6 +213,36 @@ export async function startFleetCentral(
       }),
   );
   if (!mcp) throw new Error("Central MCP public origin is required");
+  const reconcileApprovedOwners = () =>
+    mcp.reconcileApprovedOwners(async (binding) => {
+      const owner = await resolveFleetOwner(binding, {
+        chainId,
+        gatewayUrl,
+        fetch: gatewayFetch,
+      });
+      await controller.enroll(owner);
+    });
+  const drained = () =>
+    !controller
+      .snapshot()
+      .some(
+        (row) =>
+          row.assignment &&
+          Date.parse(row.assignment.leaseExpiresAt) > Date.now(),
+      );
+  const prepareRollback = async (body: unknown) => {
+    const { sourceNodeId, migrationId } = body as {
+      sourceNodeId: string;
+      migrationId: string;
+    };
+    if (!controller.paused() || (await mcp.active()) || !drained())
+      throw new Error("Fence and drain central before preparing rollback");
+    if (typeof migrationId !== "string" || migrationId.length < 8)
+      throw new Error("Migration ID required");
+    const peer = peers.get(sourceNodeId);
+    if (!peer) throw new Error("Migration peer is not admitted");
+    return peer.call("migration.prepare-rollback", { migrationId });
+  };
   const migrate = async (body: unknown) => {
     const { sourceNodeId, migrationId, direction } = body as {
       sourceNodeId: string;
@@ -235,6 +265,7 @@ export async function startFleetCentral(
           )
       )
         throw new Error("Quiesce and drain fleet before rollback export");
+      await reconcileApprovedOwners();
       const target = workers.find(
         (w) => w.policy.identity.nodeId === sourceNodeId,
       )!.policy.identity;
@@ -259,20 +290,26 @@ export async function startFleetCentral(
     activate: async () => {
       if (!(await mcp.active()))
         throw new Error("Protected state import required");
+      await controller.pause();
+      await reconcileApprovedOwners();
       await controller.resume();
       return { success: true, paused: false };
     },
     quiesce: async () => {
       await controller.pause();
-      await Promise.all(
-        controller.nodeStatus().map((node) => controller.drain(node.nodeId)),
-      );
+      const outcomes = await Promise.allSettled([
+        ...controller.nodeStatus().map((node) => controller.drain(node.nodeId)),
+        reconcileApprovedOwners(),
+      ]);
+      const failure = outcomes.find((result) => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
       return { success: true, paused: true, placements: controller.snapshot() };
     },
     identity: (body: unknown) => firstPeer().call("worker.identity", body),
     seal: (body: unknown) => firstPeer().call("worker.seal", body),
     admit,
     migrate,
+    prepareRollback,
   };
   const servers = [
     serve({

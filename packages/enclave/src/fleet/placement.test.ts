@@ -5,6 +5,29 @@ import { afterEach, expect, it, vi } from "vitest";
 import { openFleetController } from "./placement.js";
 import type { FleetWorkerPort } from "./contracts.js";
 const paths: string[] = [];
+it("records approved-owner membership while paused without allocating a sandbox", async () => {
+  const path = await mkdtemp(join(tmpdir(), "fleet-membership-"));
+  paths.push(path);
+  const enroll = vi.fn(),
+    publish = vi.fn();
+  const options = {
+    path: join(path, "state.json"),
+    enroll,
+    publish,
+    release: vi.fn(),
+    startPaused: true,
+  };
+  const controller = await openFleetController(options);
+  const owner = { chainId: 14800, userPsId: "owner", identityEpoch: 1 };
+  await controller.enroll(owner);
+  await controller.enroll(owner);
+  expect(controller.paused()).toBe(true);
+  expect(controller.assignment(owner)).toBeNull();
+  expect(publish).not.toHaveBeenCalled();
+  expect((await openFleetController(options)).snapshot()).toEqual([
+    expect.objectContaining({ owner, generation: 0, assignment: null }),
+  ]);
+});
 afterEach(async () => {
   await Promise.all(
     paths.splice(0).map((p) => rm(p, { recursive: true, force: true })),

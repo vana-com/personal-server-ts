@@ -9,6 +9,7 @@ export interface FleetControlHttpOptions {
   identity(body: unknown): Promise<unknown>;
   seal(body: unknown): Promise<unknown>;
   admit(body: unknown): Promise<unknown>;
+  prepareRollback(body: unknown): Promise<unknown>;
   migrate(body: unknown): Promise<unknown>;
   activate(): Promise<unknown>;
   quiesce(): Promise<unknown>;
@@ -109,6 +110,8 @@ export function createFleetControlHttp(
           await options.controller.drain(body.nodeId);
           return Response.json({ success: true });
         }
+        if (path === "/fleet/v1/prepare-rollback")
+          return Response.json(await options.prepareRollback(body));
         if (path === "/fleet/v1/migrate")
           return Response.json(await options.migrate(body));
         if (path === "/fleet/v1/status")

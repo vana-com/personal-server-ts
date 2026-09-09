@@ -144,9 +144,18 @@ it never extends an unreachable node forever.
 
 Central starts durably paused. Import alone does not allocate or reenroll owners.
 After verified state import and Gateway authority checks, an operator explicitly
-calls admin /fleet/v1/activate. /fleet/v1/quiesce durably pauses new allocation,
+calls admin /fleet/v1/activate. Activation resolves every approved connection
+owner's latest sealed epoch and enrolls that tuple while still paused, without
+allocating. An enrollment failure retains the pause and attempted membership
+rows so partial or ambiguous acknowledgments can be reconciled. OAuth approval
+enrolls the owner before persisting approval, even if no MCP read ever follows.
+/fleet/v1/quiesce durably pauses new allocation,
 public dispatch and periodic renewal, waits in-flight controller operations, and
-drains workers. Restart retains the pause and operator drain decisions. Fresh
+joins in-flight OAuth approvals before reconciling all approved owners again,
+including an epoch advanced without an MCP read. It begins draining immediately
+alongside reconciliation and joins both even if either fails; rollback export
+requires successful reconciliation.
+Restart retains the pause and operator drain decisions. Fresh
 attested health probes can restore node availability; a generation whose renewal
 failed stays blocked until its last possible lease expires even after readmission.
 
@@ -159,8 +168,10 @@ source disables generic claims and bearer prewarm and is a cutover step.
 Admin /fleet/v1/migrate accepts {sourceNodeId,migrationId}. Central calls the
 admitted source's migration.export. Source closes public ingress, waits existing
 HTTP requests, then atomically fences its OAuth writer on durable storage before
-returning the snapshot on the encrypted peer channel. All source state reads and
-writes fail after that fence, including after restart. Target rejects replacing
+returning the snapshot on the encrypted peer channel. OAuth state reads and
+writes fail after that fence, including after restart. A private read of approved
+owner binding metadata remains available for recovery reconciliation; it cannot
+read connection keys or permit OAuth mutations. Target rejects replacing
 an active nonempty writer, imports connections/authorizations/owner bindings as
 one snapshot, and reencrypts with its app-scoped dstack key. Admin receives only
 counts, digest and restartRequired. Identical import retries return the receipt
@@ -185,11 +196,38 @@ workers. The exact sequence is:
    placement/job lease and fleet mode. It fences stale attempts, retains history
    and allows legacy claims only by the chosen source node. Ordinary controller
    enrollment/publication is rejected while this explicit recovery mode is set.
-4. Only after successful database receipts, restart the chosen source with the
-   approved legacy runtime/flags, keep all other generic workers stopped, and
-   restore the verified Gateway routing/DNS. Central remains paused/fenced.
-   Prove the original ordinary Claude token/grant and an actual SDK job.
-5. To return to fleet, fence/stop legacy public execution and claims first,
+4. Call private central POST /fleet/v1/prepare-rollback with
+   {sourceNodeId,migrationId}. Central requires its writer fenced, the controller
+   paused, and all placements drained. Over the freshly attested encrypted peer,
+   the source resolves every imported approved owner using its dedicated node
+   credential at Gateway /v1/fleet?action=recovery-envelope. Gateway requires the
+   latest sealed epoch, exact rollback_legacy designated node and no live leases.
+   The source derives the identity, unseals the envelope and verifies the owner
+   signature inside the TEE. Only after all owners succeed does it atomically
+   persist the encrypted cache and a receipt bound to migration, snapshot,
+   approved membership, identities and recovery generations. A failed refresh
+   clears any prior receipt. The administrator receives only counts/digest.
+5. Restore the Gateway alias to a deployment of the reviewed recovery-capable
+   Gateway source configured for legacy mode, preserving the recovery endpoint
+   and direct source routing for new identities, sealing and prewarm. Then restart
+   the chosen source using the same reviewed current source/image and an approved
+   signed FLEET_ENABLED=false bundle. On the first legacy activation,
+   before opening MCP or the job claim loop it requires the exact preparation
+   receipt and repeats current recovery-envelope verification for every approved
+   owner. Changed epochs, generations, modes, envelopes or node designations fail
+   closed. It then atomically records successful legacy activation bound to the
+   imported migration/snapshot/receipt. Later ordinary legacy approvals, revocations
+   and identity rotations can restart without matching historical fleet membership;
+   per-request current-identity checks and Gateway claim fences still apply. A new
+   import resets activation, and an exported source remains durably fenced on
+   restart. This adds no hardware monotonic protection against disk rollback.
+   Do not restore the old source image or old OAuth state. Keep other generic
+   workers stopped. The old baseline Gateway binary lacks the recovery endpoint
+   required for the first legacy activation after an imported rollback.
+   Central remains paused/fenced. Prove the original ordinary Claude token/grant,
+   a fresh fleet-approved owner's MCP read without SDK prewarm, an actual SDK job,
+   and another source restart followed by the same MCP read.
+6. To return to fleet, fence/stop legacy public execution and claims first,
    transfer protected state back, and wait/fence outstanding legacy attempts.
    Operator Gateway POST /v1/fleet?action=resume takes {owner,expectedGeneration}
    under the same recovery credential and restores fleet mode. Restart central

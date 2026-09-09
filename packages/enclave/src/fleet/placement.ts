@@ -19,6 +19,8 @@ export interface FleetPlacementRow {
   generation: number;
   lastActivityAt: string;
   renewalBlocked?: boolean;
+  /** Successful metadata-only membership is retained for paused recovery. */
+  enrolled?: boolean;
   assignment: FleetAssignment | null;
 }
 export interface FleetAdmittedNode {
@@ -243,6 +245,31 @@ export async function openFleetController(options: FleetControllerOptions) {
       directory.paused = false;
       await persist();
     },
+    enroll(owner: FleetOwner): Promise<void> {
+      return ownerOperation(fleetOwnerKey(owner), async () => {
+        if (
+          !Number.isSafeInteger(owner.chainId) ||
+          !Number.isSafeInteger(owner.identityEpoch) ||
+          owner.identityEpoch < 1 ||
+          !owner.userPsId
+        )
+          throw new Error("Invalid owner");
+        const key = fleetOwnerKey(owner);
+        const row = (rows[key] ??= {
+          owner: structuredClone(owner),
+          generation: 0,
+          lastActivityAt: new Date(now()).toISOString(),
+          assignment: null,
+        });
+        if (row.enrolled) return;
+        // Record attempted membership before the remote transaction, including
+        // ambiguous acknowledgments that an operator must reconcile on rollback.
+        await persist();
+        await options.enroll(owner);
+        row.enrolled = true;
+        await persist();
+      });
+    },
     async admit(node: FleetAdmittedNode): Promise<void> {
       if (
         !node.nodeId ||
@@ -324,6 +351,8 @@ export async function openFleetController(options: FleetControllerOptions) {
           await persist();
         }
         await options.enroll(owner);
+        row.enrolled = true;
+        await persist();
         if (directory.paused) throw new Error("Fleet controller paused");
         const load = (node: FleetAdmittedNode): number =>
           Object.values(rows).filter(

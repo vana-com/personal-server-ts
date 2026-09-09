@@ -23,6 +23,7 @@ import { createFleetWorker, type LocalFleetWorker } from "./worker.js";
 import { createFleetWorkerBackend } from "./worker-backend.js";
 
 export interface FleetMigrationPort {
+  prepareRollback(migrationId: string): Promise<unknown>;
   exportForMigration(input: {
     migrationId: string;
     targetPeer: FleetPeerIdentity;
@@ -160,6 +161,12 @@ export async function startFleetWorker(options: {
             migrationId: input.migrationId,
             targetPeer: peer,
           });
+        }
+        case "migration.prepare-rollback": {
+          if (!options.migration) throw new Error("Migration unavailable");
+          return options.migration.prepareRollback(
+            (body as { migrationId: string }).migrationId,
+          );
         }
         case "migration.import": {
           if (!options.migration) throw new Error("Migration unavailable");

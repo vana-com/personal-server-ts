@@ -18,6 +18,7 @@ function fixture() {
     seal: vi.fn(),
     admit: vi.fn(),
     migrate: vi.fn(),
+    prepareRollback: vi.fn(async () => ({ owners: 1 })),
     activate: vi.fn(),
     quiesce: vi.fn(),
   };
@@ -74,4 +75,29 @@ it("does not enroll or allocate before migration and explicit activation", async
     ).status,
   ).toBe(503);
   expect(ensure).not.toHaveBeenCalled();
+});
+
+it("only private administration can prepare rollback identities", async () => {
+  const { common } = fixture();
+  for (const role of ["gateway", "admin"] as const) {
+    const handler = createFleetControlHttp({
+      ...common,
+      role,
+      credential: "a".repeat(32),
+    });
+    expect(
+      (
+        await handler(
+          request("/fleet/v1/prepare-rollback", "a".repeat(32), {
+            sourceNodeId: "source",
+            migrationId: "rollback-1",
+          }),
+        )
+      ).status,
+    ).toBe(role === "admin" ? 200 : 404);
+  }
+  expect(common.prepareRollback).toHaveBeenCalledExactlyOnceWith({
+    sourceNodeId: "source",
+    migrationId: "rollback-1",
+  });
 });
