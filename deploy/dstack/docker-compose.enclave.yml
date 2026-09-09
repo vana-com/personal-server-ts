@@ -125,6 +125,9 @@ services:
         # --icc=false separately denies direct traffic between sandbox containers.
         iptables -I INPUT -i docker0 -p tcp --dport 2375 -j DROP
         iptables -I INPUT -i br-+ -p tcp --dport 2375 -j DROP
+        # This entrypoint owns the new PID namespace; an abrupt CVM stop can leave
+        # both daemon PID files in the retained container filesystem.
+        rm -f /var/run/docker.pid /var/run/docker/containerd/containerd.pid
         exec dockerd --host="tcp://$${runtime_host}:2375" --host=unix:///var/run/docker.sock --tls=false --storage-driver=overlay2 --icc=false
     healthcheck:
       test:
