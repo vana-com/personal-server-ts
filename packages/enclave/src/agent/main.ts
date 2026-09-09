@@ -1,4 +1,6 @@
 import { startFleetWorker } from "../fleet/worker-runtime.js";
+import { verifiedFleetEnvironment } from "../fleet/security-config.js";
+import { createRealDstackClient } from "../dstack/real.js";
 /**
  * Node agent entrypoint. ENCLAVE_AGENT_SECRET is required;
  * ENCLAVE_AGENT_HOST defaults to 127.0.0.1, ENCLAVE_AGENT_PORT to 8787;
@@ -38,10 +40,22 @@ void main();
 
 async function main(): Promise<void> {
   try {
-    const { client, host, jobs, port, secret } = agentConfigFromEnv(
-      process.env,
-    );
-    const jobsControl = jobs ? await startJobs(client, jobs, port) : undefined;
+    // The fleet compose always embeds this trust key as a measured literal.
+    // An unsigned FLEET_ENABLED=false cannot skip authentication on that image.
+    const raw = process.env;
+    const env =
+      raw.FLEET_CONFIG_PUBLIC_KEY !== undefined ||
+      raw.FLEET_SIGNED_CONFIG !== undefined ||
+      raw.FLEET_ENABLED === "true"
+        ? await verifiedFleetEnvironment(raw, {
+            role: "worker",
+            identity: () => createRealDstackClient().info(),
+          })
+        : raw;
+    const { client, host, jobs, port, secret } = agentConfigFromEnv(env);
+    const jobsControl = jobs
+      ? await startJobs(client, jobs, port, env)
+      : undefined;
     const server = createAgentServer({
       client,
       secret,
@@ -67,6 +81,7 @@ async function startJobs(
   client: ReturnType<typeof agentConfigFromEnv>["client"],
   config: NonNullable<ReturnType<typeof agentConfigFromEnv>["jobs"]>,
   agentPort: number,
+  env: NodeJS.ProcessEnv,
 ): Promise<AgentJobsControl> {
   const sandboxAgentUrl = await resolveSandboxAgentUrl({
     ...(config.sandboxAgentUrl ? { override: config.sandboxAgentUrl } : {}),
@@ -109,13 +124,13 @@ async function startJobs(
   } satisfies PrewarmDeps;
   const mcp = await startMcpIngress(
     sandboxDeps,
-    process.env,
+    env,
     config.gatewayBypassSecret
       ? gatewayFetch(config.gatewayBypassSecret)
       : fetch,
   );
   const fleet = await startFleetWorker({
-    env: process.env,
+    env,
     sandbox: sandboxDeps,
     nodeId: config.nodeId,
     nodeSecret: config.nodeSecret,
