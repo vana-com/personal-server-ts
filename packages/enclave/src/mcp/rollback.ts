@@ -19,6 +19,7 @@ export interface McpRollbackIdentityDeps {
 }
 
 const MAX_RESPONSE_BYTES = 16 * 1024;
+const MAX_PUBLIC_IDENTITY_RESPONSE_BYTES = 256 * 1024;
 
 /** Proves rollback can serve the current owner before any cache is committed. */
 export async function resolveMcpRollbackIdentity(
@@ -30,7 +31,9 @@ export async function resolveMcpRollbackIdentity(
   const identityUrl = new URL("/v1/identity", deps.gatewayUrl);
   identityUrl.searchParams.set("owner", binding.owner);
   identityUrl.searchParams.set("chainId", String(binding.chainId));
-  const live = record(await readJson(identityUrl, {}, deps));
+  const live = record(
+    await readJson(identityUrl, {}, deps, MAX_PUBLIC_IDENTITY_RESPONSE_BYTES),
+  );
   const current = record(live.identity);
   if (
     live.state !== "sealed" ||
@@ -115,6 +118,7 @@ async function readJson(
   url: URL,
   init: RequestInit,
   deps: McpRollbackIdentityDeps,
+  maxBytes = MAX_RESPONSE_BYTES,
 ): Promise<unknown> {
   const response = await (deps.fetch ?? fetch)(url, {
     ...init,
@@ -130,7 +134,7 @@ async function readJson(
       const chunk = await reader.read();
       if (chunk.done) break;
       size += chunk.value.byteLength;
-      if (size > MAX_RESPONSE_BYTES) throw invalid();
+      if (size > maxBytes) throw invalid();
       chunks.push(chunk.value);
     }
     return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;

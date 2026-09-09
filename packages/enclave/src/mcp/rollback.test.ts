@@ -81,6 +81,34 @@ describe("MCP rollback identity hydration", () => {
     expect(JSON.parse(String(init?.body))).toEqual({ owner: f.material.owner });
   });
 
+  it("accepts a full public identity response exceeding 16 KiB", async () => {
+    const f = await fixture();
+    Object.assign(f.live, {
+      created: false,
+      serverId: "server-id",
+      serverStatus: "running",
+      serverUrl: "https://gateway.example",
+      identity: {
+        ...f.live.identity,
+        appId: "a".repeat(40),
+        composeHash: "b".repeat(64),
+        eventLog: "[]",
+        kmsRootFingerprint: "c".repeat(64),
+        osImageHash: "d".repeat(64),
+        purpose: "personal-server",
+        quote: "e".repeat(16_000),
+        signatureChain: [],
+        v: 1,
+      },
+    });
+    expect(
+      new TextEncoder().encode(JSON.stringify(f.live)).byteLength,
+    ).toBeGreaterThan(16 * 1024);
+    await expect(
+      resolveMcpRollbackIdentity(f.binding, f.deps),
+    ).resolves.toMatchObject({ identity: f.identity, generation: 4 });
+  });
+
   it.each(["owner", "epoch", "chain", "generation", "address", "publicKey"])(
     "rejects a recovery response with a mismatched %s before key derivation",
     async (field) => {
@@ -166,12 +194,31 @@ describe("MCP rollback identity hydration", () => {
     );
   });
 
-  it("bounds the response body and cancels an oversized stream", async () => {
+  it("retains the 16 KiB bound for recovery material and cancels an oversized stream", async () => {
     const f = await fixture();
     const cancel = vi.fn();
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(new Uint8Array(16 * 1024 + 1));
+      },
+      cancel,
+    });
+    f.deps.fetch
+      .mockReset()
+      .mockResolvedValueOnce(Response.json(f.live))
+      .mockResolvedValueOnce(new Response(stream));
+    await expect(resolveMcpRollbackIdentity(f.binding, f.deps)).rejects.toThrow(
+      "identity",
+    );
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("bounds the public identity response at 256 KiB and cancels an oversized stream", async () => {
+    const f = await fixture();
+    const cancel = vi.fn();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(256 * 1024 + 1));
       },
       cancel,
     });
