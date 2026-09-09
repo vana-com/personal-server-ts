@@ -8,7 +8,8 @@ export interface FleetSecurityConfigPayload {
   instanceId: string;
   nodeId: string;
   issuedAt: string;
-  expiresAt: string;
+  /** Null explicitly signs a deployment-lifetime policy; strings retain bounded expiry. */
+  expiresAt: string | null;
   env: Record<string, string>;
 }
 
@@ -137,7 +138,7 @@ function validatePayload(value: unknown): FleetSecurityConfigPayload {
     !boundedString(value.instanceId) ||
     !boundedString(value.nodeId) ||
     typeof value.issuedAt !== "string" ||
-    typeof value.expiresAt !== "string" ||
+    (value.expiresAt !== null && typeof value.expiresAt !== "string") ||
     !record(value.env)
   )
     throw invalid();
@@ -176,15 +177,16 @@ function validatePayload(value: unknown): FleetSecurityConfigPayload {
     throw invalid();
   if (env.MCP_PUBLIC_ORIGIN && MCP_REQUIRED.some((key) => !env[key]))
     throw invalid();
-  const issued = Date.parse(value.issuedAt),
-    expires = Date.parse(value.expiresAt);
+  const issued = Date.parse(value.issuedAt);
+  const expires = value.expiresAt === null ? null : Date.parse(value.expiresAt);
   if (
     !Number.isFinite(issued) ||
-    !Number.isFinite(expires) ||
     new Date(issued).toISOString() !== value.issuedAt ||
-    new Date(expires).toISOString() !== value.expiresAt ||
-    expires <= issued ||
-    expires - issued > MAX_VALIDITY_MS
+    (expires !== null &&
+      (!Number.isFinite(expires) ||
+        new Date(expires).toISOString() !== value.expiresAt ||
+        expires <= issued ||
+        expires - issued > MAX_VALIDITY_MS))
   )
     throw invalid();
   return value as unknown as FleetSecurityConfigPayload;
@@ -226,8 +228,9 @@ export function isVerifiedFleetEnvironment(env: NodeJS.ProcessEnv): boolean {
  * FLEET_CONFIG_PUBLIC_KEY must be a literal in measured compose, never an
  * allowed unmeasured substitution. The OS/image launcher must exclude injection
  * variables (e.g. NODE_OPTIONS) before Node starts; this cannot undo boot code.
- * Expiry is checked at startup. A valid bundle can be replayed for this same
- * instance within its signed window. Expiry relies on the runtime wall clock;
+ * Finite expiry is checked at startup; signed expiresAt:null is deployment-lived.
+ * A valid bundle can be replayed for this same instance within its signed window
+ * (indefinitely when explicitly non-expiring). Expiry relies on the runtime wall clock;
  * this is not disk rollback protection or a remote freshness proof. This
  * initial deployment verifier intentionally supports Moksha (14800) only. */
 export async function verifiedFleetEnvironment(
@@ -275,7 +278,7 @@ export async function verifiedFleetEnvironment(
       if (
         !Number.isFinite(now) ||
         Date.parse(payload.issuedAt) > now + 60_000 ||
-        Date.parse(payload.expiresAt) <= now
+        (payload.expiresAt !== null && Date.parse(payload.expiresAt) <= now)
       )
         throw invalid();
     };

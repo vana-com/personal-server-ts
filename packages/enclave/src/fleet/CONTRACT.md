@@ -49,9 +49,18 @@ fleet application boot verifies an operator Ed25519 signature before deriving
 protected state keys or opening admin, migration, or peer listeners. The complete
 runtime configuration is returned as a new environment map; unsigned values are
 never merged. The signed payload binds role, node, current app and instance and
-has a maximum 24-hour validity window checked at startup. This limits replay of
-old signed configuration; it does not claim hardware monotonic rollback defense
-or terminate an already-running process when its boot window ends.
+accepts an explicit signed `expiresAt: null` for deployment-lifetime configuration,
+so ordinary future restarts need no periodic re-signing. Existing timestamp-valued
+`expiresAt` bundles retain their maximum 24-hour validity window and startup expiry
+checks; `issuedAt` is always validated, including future-issued rejection. Null is
+part of the authenticated payload, never an unsigned environment override. To
+migrate an existing deployment, re-sign its reviewed complete configuration once
+with `expiresAt: null` and verify it locally before replacing its encrypted bundle.
+
+A non-expiring bundle can be replayed indefinitely on its bound app/instance;
+finite bundles only within their signed window. Neither claims hardware monotonic
+rollback defense or terminates an already-running process when its boot window
+ends. Changes to configuration still require a newly signed complete bundle.
 
 Render the reviewed source commit, base image digest and operator SPKI public key
 as literal measured compose text. Templates use explicit REPLACE_WITH markers;

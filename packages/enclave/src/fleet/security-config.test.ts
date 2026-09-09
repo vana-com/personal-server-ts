@@ -87,6 +87,53 @@ it("authenticates an instance-bound complete config without inheriting host over
   expect(isVerifiedFleetEnvironment({ ...env })).toBe(false);
   expect(identity).toHaveBeenCalledOnce();
 });
+it("accepts an explicitly non-expiring signed deployment config on a future restart", async () => {
+  const body = payload();
+  body.expiresAt = null;
+  await expect(
+    verifiedFleetEnvironment(
+      { FLEET_CONFIG_PUBLIC_KEY: publicKey, FLEET_SIGNED_CONFIG: bundle(body) },
+      {
+        role: "controller",
+        identity: async () => ({
+          appId: body.appId,
+          instanceId: body.instanceId,
+        }),
+        now: () => now + 10 * 365 * 86_400_000,
+      },
+    ),
+  ).resolves.toEqual(body.env);
+});
+it("rejects replacing a signed finite expiry with null", async () => {
+  const signed = JSON.parse(
+    Buffer.from(bundle(payload()).slice(7), "base64").toString("utf8"),
+  );
+  signed.payload.expiresAt = null;
+  const identity = vi.fn();
+  await expect(
+    verifiedFleetEnvironment(
+      {
+        FLEET_CONFIG_PUBLIC_KEY: publicKey,
+        FLEET_SIGNED_CONFIG: wire(JSON.stringify(signed)),
+      },
+      { role: "controller", identity, now: () => now + 2 * 86_400_000 },
+    ),
+  ).rejects.toThrow("Invalid fleet security configuration");
+  expect(identity).not.toHaveBeenCalled();
+});
+it("rejects a future-issued non-expiring policy before identity lookup", async () => {
+  const body = payload();
+  body.expiresAt = null;
+  body.issuedAt = new Date(now + 60_001).toISOString();
+  const identity = vi.fn();
+  await expect(
+    verifiedFleetEnvironment(
+      { FLEET_CONFIG_PUBLIC_KEY: publicKey, FLEET_SIGNED_CONFIG: bundle(body) },
+      { role: "controller", identity, now: () => now },
+    ),
+  ).rejects.toThrow("Invalid fleet security configuration");
+  expect(identity).not.toHaveBeenCalled();
+});
 it("accepts migration-disabled controller config for a net-new empty state", async () => {
   const body = payload();
   body.env.MCP_MIGRATION_REQUIRED = "0";
