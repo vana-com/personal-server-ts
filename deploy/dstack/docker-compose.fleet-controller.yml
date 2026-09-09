@@ -3,6 +3,8 @@
 # The signed runtime bundle permits staged reciprocal pins without a hash cycle.
 # This app MUST have a different app_id from workers.
 # One active controller only; flock fences duplicate processes sharing its volume.
+# The signed config selects lifecycle mode: MCP_MIGRATION_REQUIRED=0 for a
+# net-new empty MCP state, or 1 when a protected state import is required.
 services:
   controller:
     image: "REPLACE_WITH_REVIEWED_AGENT_IMAGE_DIGEST"

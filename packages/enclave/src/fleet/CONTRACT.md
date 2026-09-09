@@ -64,6 +64,10 @@ unopened until that comparison passes. This applies on every process restart.
 The paused central role permits an empty signed worker directory for initial
 attestation. Stage exact worker policies through a new operator-signed bundle,
 restart and verify fresh measurements before admitting peers or moving state.
+For a net-new deployment with an empty MCP state, sign
+`MCP_MIGRATION_REQUIRED=0`; it starts paused and may be activated after worker
+admission without an import. Set it to `1` only when returning to an existing
+protected MCP state, which must be imported before activation.
 
 ## Explicit KMS CA rotation policy
 

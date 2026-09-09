@@ -167,7 +167,8 @@ function validatePayload(value: unknown): FleetSecurityConfigPayload {
     env.CHAIN_ID !== "14800" ||
     env.NODE_ID !== value.nodeId ||
     (value.role === "controller" &&
-      (env.CONTROLLER_TERM !== "1" || env.MCP_MIGRATION_REQUIRED !== "1")) ||
+      (env.CONTROLLER_TERM !== "1" ||
+        !["0", "1"].includes(env.MCP_MIGRATION_REQUIRED!))) ||
     (value.role === "worker" &&
       (env.SANDBOX_RUNTIME !== "docker" ||
         !["true", "false"].includes(env.FLEET_ENABLED!)))

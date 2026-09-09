@@ -202,7 +202,7 @@ export async function startFleetCentral(
       contracts: { ...DEFAULTS.gateway.contracts },
       logger,
     },
-    { ...env, MCP_MIGRATION_REQUIRED: "1" },
+    env,
     gatewayFetch,
     () =>
       createFleetMcpRouting({

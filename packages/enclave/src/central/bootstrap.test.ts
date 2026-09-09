@@ -177,6 +177,96 @@ it("stages an authenticated empty directory paused and ignores unsigned runtime 
   }
 });
 
+it("activates a signed net-new empty controller without an imported MCP snapshot", async () => {
+  const path = await mkdtemp(join(tmpdir(), "central-net-new-"));
+  const dstack = createFakeDstackClient({ appId: "1".repeat(40) });
+  const info = await dstack.info();
+  const keys = generateKeyPairSync("ed25519");
+  const env = {
+    CHAIN_ID: "14800",
+    CONTROLLER_TERM: "1",
+    NODE_ID: "controller",
+    GATEWAY_URL: "https://gateway.invalid",
+    FLEET_STATE_PATH: join(path, "placements.json"),
+    FLEET_WORKERS_JSON: "[]",
+    FLEET_GATEWAY_TOKEN: "g".repeat(32),
+    FLEET_CONTROLLER_ADMIN_TOKEN: "a".repeat(32),
+    FLEET_CONTROLLER_GATEWAY_TOKEN: "r".repeat(32),
+    FLEET_CONTROL_HOST: "127.0.0.1",
+    FLEET_ADMIN_HOST: "127.0.0.1",
+    FLEET_PEER_HOST: "127.0.0.1",
+    FLEET_CONTROL_PORT: await freePort(),
+    FLEET_ADMIN_PORT: await freePort(),
+    FLEET_PEER_PORT: await freePort(),
+    MCP_PUBLIC_ORIGIN: "https://mcp-dev.vana.org",
+    MCP_APPROVAL_URL: "https://web.invalid/approve",
+    MCP_STATE_PATH: join(path, "mcp.sealed"),
+    MCP_INGRESS_HOST: "127.0.0.1",
+    MCP_INGRESS_PORT: await freePort(),
+    MCP_REDIRECT_URIS: '["https://claude.ai/api/mcp/auth_callback"]',
+    MCP_MIGRATION_REQUIRED: "0",
+  };
+  const payload: FleetSecurityConfigPayload = {
+    version: 1,
+    purpose: "vana.fleet.security-config",
+    role: "controller",
+    appId: info.appId,
+    instanceId: info.instanceId,
+    nodeId: env.NODE_ID,
+    issuedAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    env,
+  };
+  const requestFetch = vi.fn<typeof fetch>(async () => {
+    throw new Error("Net-new empty controller must not call Gateway");
+  });
+  let runtime: Awaited<ReturnType<typeof startFleetCentral>> | undefined;
+  try {
+    runtime = await startFleetCentral(
+      {
+        FLEET_CONFIG_PUBLIC_KEY: keys.publicKey
+          .export({ type: "spki", format: "der" })
+          .toString("base64"),
+        FLEET_SIGNED_CONFIG:
+          "base64:" +
+          Buffer.from(
+            JSON.stringify({
+              payload,
+              signature: sign(
+                null,
+                canonicalFleetConfigPayload(payload),
+                keys.privateKey,
+              ).toString("base64"),
+            }),
+          ).toString("base64"),
+      },
+      dstack,
+      requestFetch,
+    );
+    expect(runtime.controller.paused()).toBe(true);
+    const response = await fetch(
+      `http://127.0.0.1:${env.FLEET_ADMIN_PORT}/fleet/v1/activate`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${env.FLEET_CONTROLLER_ADMIN_TOKEN}`,
+        },
+        body: "{}",
+      },
+    );
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      success: true,
+      paused: false,
+    });
+    expect(runtime.controller.paused()).toBe(false);
+    expect(requestFetch).not.toHaveBeenCalled();
+  } finally {
+    await runtime?.close();
+    await rm(path, { recursive: true, force: true });
+  }
+});
+
 it("keeps imported approved owners paused on partial enrollment and reconciles a later epoch at quiesce without MCP activity", async () => {
   const path = await mkdtemp(join(tmpdir(), "central-imported-membership-"));
   const dstack = createFakeDstackClient({ appId: "1".repeat(40) });

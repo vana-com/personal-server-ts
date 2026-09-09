@@ -87,6 +87,25 @@ it("authenticates an instance-bound complete config without inheriting host over
   expect(isVerifiedFleetEnvironment({ ...env })).toBe(false);
   expect(identity).toHaveBeenCalledOnce();
 });
+it("accepts migration-disabled controller config for a net-new empty state", async () => {
+  const body = payload();
+  body.env.MCP_MIGRATION_REQUIRED = "0";
+  const env = await verifiedFleetEnvironment(
+    {
+      FLEET_CONFIG_PUBLIC_KEY: publicKey,
+      FLEET_SIGNED_CONFIG: bundle(body),
+    },
+    {
+      role: "controller",
+      identity: async () => ({
+        appId: body.appId,
+        instanceId: body.instanceId,
+      }),
+      now: () => now,
+    },
+  );
+  expect(env.MCP_MIGRATION_REQUIRED).toBe("0");
+});
 it("rejects forged policy/admin replacement before reading public identity or releasing config", async () => {
   const original = payload();
   const signed = JSON.parse(
