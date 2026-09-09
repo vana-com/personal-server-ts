@@ -1,5 +1,12 @@
+import type { FleetAssignment } from "../fleet/contracts.js";
 import type { Hex } from "viem";
-import type { ClaimResponse as SdkClaimResponse } from "@opendatalabs/vana-sdk/protocol/jobs";
+import type {
+  ClaimRequest as SdkClaimRequest,
+  CompleteRequest as SdkCompleteRequest,
+  FailRequest as SdkFailRequest,
+  HeartbeatRequest as SdkHeartbeatRequest,
+  ClaimResponse as SdkClaimResponse,
+} from "@opendatalabs/vana-sdk/protocol/jobs";
 
 export {
   JobEnvelopeError,
@@ -10,18 +17,23 @@ export {
   DEFAULT_LEASE_SECONDS,
   MAX_LEASE_SECONDS,
   MAX_WAIT_SECONDS,
-  type ClaimRequest,
-  type CompleteRequest,
-  type FailRequest,
   type FencedResponse,
-  type HeartbeatRequest,
   type JobRequest,
   type JobRequestEnvelope,
   type TeeNodeHeartbeat,
 } from "@opendatalabs/vana-sdk/protocol/jobs";
 
+export type ClaimRequest = SdkClaimRequest & { assignment?: FleetAssignment };
+export type CompleteRequest = SdkCompleteRequest & {
+  assignment?: FleetAssignment;
+};
+export type FailRequest = SdkFailRequest & { assignment?: FleetAssignment };
+export type HeartbeatRequest = SdkHeartbeatRequest & {
+  assignment?: FleetAssignment;
+};
 export type ClaimResponse = Omit<SdkClaimResponse, "job"> & {
   job: SdkClaimResponse["job"] & { chainId?: number };
+  assignment?: FleetAssignment;
 };
 
 const JOB_ID_PATTERN =

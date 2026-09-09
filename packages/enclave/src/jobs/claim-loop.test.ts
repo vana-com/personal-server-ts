@@ -283,3 +283,26 @@ describe("claim loop", () => {
     expect(logger.info).toHaveBeenCalledOnce();
   });
 });
+
+it("does not perform generic claims when fleet mode has no valid local assignments", async () => {
+  vi.useFakeTimers();
+  const gateway = gatewayFake();
+  const loop = startClaimLoop({
+    gateway,
+    run: vi.fn(),
+    registry: registryFake(),
+    leaseSeconds: 30,
+    wait: 0,
+    capacity: 1,
+    logger: loggerFake(),
+    assignments: () => [],
+    assertAssignment: () => {},
+  });
+  await vi.advanceTimersByTimeAsync(1_000);
+  const calls = vi.mocked(gateway.claim).mock.calls.length;
+  const drained = loop.drain();
+  await vi.advanceTimersByTimeAsync(5_000);
+  await drained;
+  vi.useRealTimers();
+  expect(calls).toBe(0);
+});

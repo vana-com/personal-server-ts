@@ -819,3 +819,31 @@ describe("agent HTTP server", () => {
     await expectError(response, 404, "NOT_FOUND");
   });
 });
+
+it("refuses a result upload authorization when placement expires during key derivation", async () => {
+  await stopServer();
+  const normal = jobsControl();
+  let lookups = 0;
+  const control = jobsControl((token, jobId) =>
+    ++lookups === 1
+      ? normal.lookupSandboxJob(token, jobId)
+      : { kind: "inactive" },
+  );
+  await startServer(createFakeDstackClient({ appId: FAKE_APP_ID }), control);
+  const response = await post(
+    RESULT_SIGNING_PATH,
+    {
+      jobId: JOB_ID,
+      chainId: CHAIN_ID,
+      owner: OWNER.address,
+      byteLength: 1,
+      bodyHash: `sha256:${"0".repeat(64)}`,
+    },
+    {
+      authorization: `Bearer ${SANDBOX_TOKEN}`,
+      "content-type": "application/json",
+    },
+  );
+  expect(response.status).toBe(403);
+  expect(await response.json()).toMatchObject({ code: "SIGNING_REFUSED" });
+});
