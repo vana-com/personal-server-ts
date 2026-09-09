@@ -89,3 +89,53 @@ describe("TEE MCP durable state", () => {
     ).toBeNull();
   });
 });
+
+it("fences the old OAuth writer durably before exporting and restores connection under a new TEE key", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mcp-migration-"));
+  directories.push(directory);
+  const sourcePath = join(directory, "source.sealed"),
+    targetPath = join(directory, "target.sealed");
+  const sourceKey = randomBytes(32),
+    targetKey = randomBytes(32);
+  const source = await openMcpDurableState({
+    path: sourcePath,
+    key: sourceKey,
+  });
+  const created = await createMcpConnection(
+    { displayName: "ordinary Claude" },
+    { store: source.connections, publicOrigin: "https://mcp-dev.vana.org" },
+  );
+  await source.bindOwner(created.connectionId, {
+    owner: OWNER,
+    chainId: 14800,
+  });
+  const before = await source.connections.getById(created.connectionId);
+  const snapshot = await source.fenceAndExport("migration-1", "target-app");
+  await expect(
+    source.connections.update(created.connectionId, { status: "revoked" }),
+  ).rejects.toThrow("fenced");
+  const restarted = await openMcpDurableState({
+    path: sourcePath,
+    key: sourceKey,
+  });
+  await expect(
+    restarted.connections.getById(created.connectionId),
+  ).rejects.toThrow("fenced");
+  const target = await openMcpDurableState({
+    path: targetPath,
+    key: targetKey,
+  });
+  await target.importSnapshot(snapshot, "migration-1");
+  snapshot.fill(0);
+  expect(await target.connections.getById(created.connectionId)).toEqual(
+    before,
+  );
+  expect(await target.getOwner(created.connectionId)).toEqual({
+    owner: OWNER,
+    chainId: 14800,
+  });
+  expect(await readFile(targetPath, "utf8")).not.toContain("ordinary Claude");
+  await expect(
+    openMcpDurableState({ path: targetPath, key: sourceKey }),
+  ).rejects.toThrow();
+});

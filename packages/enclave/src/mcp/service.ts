@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { serve } from "@hono/node-server";
 import {
@@ -14,11 +15,26 @@ import {
   openMcpDurableState,
   verifyTeeMcpGrants,
   type McpWakeupIdentity,
+  type McpDurableState,
+  type TeeMcpIngressDeps,
 } from "@opendatalabs/personal-server-ts-server/mcp/tee";
 import type { PrewarmDeps } from "../jobs/run.js";
 import { currentMcpIdentity, dispatchOwnerMcp } from "./dispatch.js";
 
+export interface McpMigrationSnapshot {
+  migrationId: string;
+  snapshotBase64: string;
+  digest: string;
+}
+
 export interface McpIngressControl {
+  exportForMigration(request: {
+    migrationId: string;
+    targetPeer: { appId: string; instanceId: string };
+  }): Promise<McpMigrationSnapshot>;
+  importFromMigration(
+    request: McpMigrationSnapshot,
+  ): Promise<{ connections: number; digest: string }>;
   rememberIdentity(identity: McpWakeupIdentity): Promise<void>;
   close(): Promise<void>;
 }
@@ -28,6 +44,34 @@ export async function startMcpIngress(
   deps: PrewarmDeps,
   env: NodeJS.ProcessEnv,
   requestFetch: typeof fetch,
+): Promise<McpIngressControl | undefined> {
+  return startMcpRouter(deps, env, requestFetch, (state) => {
+    const dispatchDeps = { ...deps, state, fetch: requestFetch };
+    return {
+      ownerReady: async (binding) => {
+        try {
+          await currentMcpIdentity(binding, dispatchDeps);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      dispatch: (request, connection, binding) =>
+        dispatchOwnerMcp(request, connection, binding, dispatchDeps),
+    };
+  });
+}
+
+export async function startMcpRouter(
+  deps: Pick<
+    PrewarmDeps,
+    "client" | "gatewayUrl" | "chainId" | "contracts" | "logger"
+  >,
+  env: NodeJS.ProcessEnv,
+  requestFetch: typeof fetch,
+  routing: (
+    state: McpDurableState,
+  ) => Pick<TeeMcpIngressDeps, "ownerReady" | "dispatch">,
 ): Promise<McpIngressControl | undefined> {
   if (!env.MCP_PUBLIC_ORIGIN) return undefined;
   const origin = new URL(env.MCP_PUBLIC_ORIGIN);
@@ -70,7 +114,6 @@ export async function startMcpIngress(
     chainId: deps.chainId,
     contracts: { ...DEFAULTS.gateway.contracts, ...deps.contracts },
   };
-  const dispatchDeps = { ...deps, state, fetch: requestFetch };
   const app = createTeeMcpIngress({
     origin: origin.origin,
     approvalUrl: env.MCP_APPROVAL_URL,
@@ -96,21 +139,23 @@ export async function startMcpIngress(
         gatewayConfig,
         chainId: deps.chainId,
       }),
-    ownerReady: async (binding) => {
-      try {
-        await currentMcpIdentity(binding, dispatchDeps);
-        return true;
-      } catch {
-        return false;
-      }
-    },
-    dispatch: (request, connection, binding) =>
-      dispatchOwnerMcp(request, connection, binding, dispatchDeps),
+    ...routing(state),
   });
   // This listener is reachable only by the TLS sidecar on the CVM network;
   // compose must not publish it through a separately terminated public port.
   const server = serve({
-    fetch: app.fetch,
+    fetch: async (request) => {
+      const status = await state.migrationStatus();
+      if (
+        status.fenced ||
+        (env.MCP_MIGRATION_REQUIRED === "1" && !status.importedId)
+      )
+        return Response.json(
+          { error: "MCP migration pending" },
+          { status: 503 },
+        );
+      return app.fetch(request);
+    },
     hostname: env.MCP_INGRESS_HOST ?? "0.0.0.0",
     port,
   });
@@ -119,12 +164,40 @@ export async function startMcpIngress(
     server.once("error", reject);
   });
   deps.logger.info({ origin: origin.origin, port }, "TEE MCP ingress started");
+  let closed: Promise<void> | undefined;
+  const close = (): Promise<void> =>
+    (closed ??= new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    ));
   return {
     rememberIdentity: (identity) => state.rememberIdentity(identity),
-    close: () =>
-      new Promise<void>((resolve, reject) =>
-        server.close((error) => (error ? reject(error) : resolve())),
-      ),
+    close,
+    exportForMigration: async ({ migrationId, targetPeer }) => {
+      await close();
+      const snapshot = await state.fenceAndExport(
+        migrationId,
+        `${targetPeer.appId}:${targetPeer.instanceId}`,
+      );
+      try {
+        return {
+          migrationId,
+          snapshotBase64: Buffer.from(snapshot).toString("base64"),
+          digest: createHash("sha256").update(snapshot).digest("hex"),
+        };
+      } finally {
+        snapshot.fill(0);
+      }
+    },
+    importFromMigration: async ({ migrationId, snapshotBase64, digest }) => {
+      const snapshot = Buffer.from(snapshotBase64, "base64");
+      try {
+        if (createHash("sha256").update(snapshot).digest("hex") !== digest)
+          throw new Error("Migration digest mismatch");
+        return await state.importSnapshot(snapshot, migrationId);
+      } finally {
+        snapshot.fill(0);
+      }
+    },
   };
 }
 
