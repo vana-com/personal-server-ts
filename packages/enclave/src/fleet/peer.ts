@@ -327,7 +327,11 @@ export function createFleetPeerServer(
                 session.challenge.client.identity,
               );
         return Response.json({
-          packet: encrypt(result, shared.response, digest(session.challenge)),
+          packet: encrypt(
+            result ?? null,
+            shared.response,
+            digest(session.challenge),
+          ),
         });
       } finally {
         shared.request.fill(0);
