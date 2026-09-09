@@ -238,13 +238,26 @@ export async function verifiedFleetEnvironment(
   },
 ): Promise<NodeJS.ProcessEnv> {
   try {
-    const document = raw.FLEET_SIGNED_CONFIG,
+    const wire = raw.FLEET_SIGNED_CONFIG,
       publicKey = raw.FLEET_CONFIG_PUBLIC_KEY;
     if (
-      !document ||
-      Buffer.byteLength(document) > MAX_BYTES ||
+      !wire ||
+      Buffer.byteLength(wire) > MAX_BYTES ||
+      !wire.startsWith("base64:") ||
       !publicKey ||
       publicKey.length > 1024
+    )
+      throw invalid();
+    // dstack 0.5.x writes env values through a systemd EnvironmentFile whose
+    // quoting does not preserve nested JSON backslashes. Only canonical base64
+    // transport is accepted; authentication still covers the decoded payload.
+    const encoded = wire.slice("base64:".length);
+    const bytes = Buffer.from(encoded, "base64");
+    const document = bytes.toString("utf8");
+    if (
+      !bytes.length ||
+      bytes.toString("base64") !== encoded ||
+      !Buffer.from(document, "utf8").equals(bytes)
     )
       throw invalid();
     const parsed: unknown = JSON.parse(document);

@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { generateKeyPairSync, sign } from "node:crypto";
 import { expect, it, vi } from "vitest";
 import {
@@ -50,14 +51,19 @@ function canonical(value: unknown): unknown {
     );
   return value;
 }
+function wire(document: string): string {
+  return `base64:${Buffer.from(document).toString("base64")}`;
+}
 function bundle(body: FleetSecurityConfigPayload) {
   const bytes = Buffer.from(
     "vana.fleet.security-config.v1\0" + JSON.stringify(canonical(body)),
   );
-  return JSON.stringify({
-    payload: body,
-    signature: sign(null, bytes, keys.privateKey).toString("base64"),
-  });
+  return wire(
+    JSON.stringify({
+      payload: body,
+      signature: sign(null, bytes, keys.privateKey).toString("base64"),
+    }),
+  );
 }
 it("authenticates an instance-bound complete config without inheriting host overrides", async () => {
   const body = payload();
@@ -83,7 +89,9 @@ it("authenticates an instance-bound complete config without inheriting host over
 });
 it("rejects forged policy/admin replacement before reading public identity or releasing config", async () => {
   const original = payload();
-  const signed = JSON.parse(bundle(original));
+  const signed = JSON.parse(
+    Buffer.from(bundle(original).slice(7), "base64").toString("utf8"),
+  );
   signed.payload.env.FLEET_WORKERS_JSON =
     '[{"url":"https://attacker.invalid"}]';
   signed.payload.env.FLEET_CONTROLLER_ADMIN_TOKEN = "attacker-knows-this";
@@ -92,7 +100,7 @@ it("rejects forged policy/admin replacement before reading public identity or re
     verifiedFleetEnvironment(
       {
         FLEET_CONFIG_PUBLIC_KEY: publicKey,
-        FLEET_SIGNED_CONFIG: JSON.stringify(signed),
+        FLEET_SIGNED_CONFIG: wire(JSON.stringify(signed)),
       },
       { role: "controller", identity, now: () => now },
     ),
@@ -253,10 +261,12 @@ it("uses canonical domain-separated bytes and accepts equivalent JSON key order"
     verifiedFleetEnvironment(
       {
         FLEET_CONFIG_PUBLIC_KEY: publicKey,
-        FLEET_SIGNED_CONFIG: JSON.stringify({
-          payload: body,
-          signature: noDomainSignature,
-        }),
+        FLEET_SIGNED_CONFIG: wire(
+          JSON.stringify({
+            payload: body,
+            signature: noDomainSignature,
+          }),
+        ),
       },
       { role: "controller", identity, now: () => now },
     ),
@@ -327,11 +337,13 @@ it("rejects absent, oversized and malformed inputs without disclosing secret con
     },
     {
       FLEET_CONFIG_PUBLIC_KEY: publicKey,
-      FLEET_SIGNED_CONFIG: JSON.stringify({
-        payload: body,
-        signature: "not-base64",
-        extra: true,
-      }),
+      FLEET_SIGNED_CONFIG: wire(
+        JSON.stringify({
+          payload: body,
+          signature: "not-base64",
+          extra: true,
+        }),
+      ),
     },
   ];
   for (const raw of invalidInputs) {
@@ -342,6 +354,74 @@ it("rejects absent, oversized and malformed inputs without disclosing secret con
         identity,
         now: () => now,
       }),
+    ).rejects.toThrow(/^Invalid fleet security configuration$/);
+    expect(identity).not.toHaveBeenCalled();
+  }
+});
+
+// dstack 0.5.9 parse_env_file::escape_value does not escape pre-existing
+// backslashes. Its systemd EnvironmentFile uses POSIX double-quote escapes.
+// This helper executes only local, generated test data, with no runtime secrets.
+function dstackEnvironmentRoundTrip(value: string): string {
+  const escaped = value.replace(/[\n"$`]/g, (c) =>
+    c === "\n" ? "\\n" : `\\${c}`,
+  );
+  const assignment = /[ \t|&;<>()$`\\"'\n]/.test(value)
+    ? `"${escaped}"`
+    : escaped;
+  return execFileSync(
+    "/bin/sh",
+    [
+      "-c",
+      `FLEET_SIGNED_CONFIG=${assignment}\nprintf '%s' "$FLEET_SIGNED_CONFIG"`,
+    ],
+    { encoding: "utf8" },
+  );
+}
+it("preserves signed nested JSON through dstack environment quoting using explicit base64 transport", async () => {
+  const body = payload();
+  const document = Buffer.from(bundle(body).slice(7), "base64").toString(
+    "utf8",
+  );
+  const damaged = dstackEnvironmentRoundTrip(document);
+  expect(damaged).not.toBe(document);
+  expect(() => JSON.parse(damaged)).toThrow();
+  const wire = `base64:${Buffer.from(document).toString("base64")}`;
+  expect(dstackEnvironmentRoundTrip(wire)).toBe(wire);
+  await expect(
+    verifiedFleetEnvironment(
+      {
+        FLEET_CONFIG_PUBLIC_KEY: publicKey,
+        FLEET_SIGNED_CONFIG: dstackEnvironmentRoundTrip(wire),
+      },
+      {
+        role: "controller",
+        now: () => now,
+        identity: async () => ({
+          appId: body.appId,
+          instanceId: body.instanceId,
+        }),
+      },
+    ),
+  ).resolves.toEqual(body.env);
+});
+
+it("rejects noncanonical base64, invalid UTF-8 and raw JSON before identity lookup", async () => {
+  const valid = bundle(payload());
+  for (const document of [
+    valid + "\n",
+    valid.slice(0, 12) + "!" + valid.slice(12),
+    "base64:",
+    "base64:" + Buffer.from([0xff, 0xfe]).toString("base64"),
+    Buffer.from(valid.slice(7), "base64").toString("utf8"),
+    "base64:" + "A".repeat(128 * 1024),
+  ]) {
+    const identity = vi.fn();
+    await expect(
+      verifiedFleetEnvironment(
+        { FLEET_CONFIG_PUBLIC_KEY: publicKey, FLEET_SIGNED_CONFIG: document },
+        { role: "controller", identity, now: () => now },
+      ),
     ).rejects.toThrow(/^Invalid fleet security configuration$/);
     expect(identity).not.toHaveBeenCalled();
   }

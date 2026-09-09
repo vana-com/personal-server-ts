@@ -36,6 +36,14 @@ operator tooling receives only counts/digests. No secrets leave either TEE.
 
 ## Authenticated boot configuration
 
+`FLEET_SIGNED_CONFIG` must contain `base64:` followed by canonical standard
+base64 of the complete UTF-8 JSON `{payload, signature}` document (including
+padding). The whole wire value is bounded to 128 KiB. Raw JSON is rejected:
+dstack 0.5.x environment-file escaping damages backslashes in nested JSON
+strings. Encoding changes only transport; the decoded document still passes
+all signature, schema, lifetime and TEE identity checks. Signers must verify
+this exact wire value locally before submitting encrypted environment values.
+
 Dstack encrypted environment values are not measured or authenticated. Every
 fleet application boot verifies an operator Ed25519 signature before deriving
 protected state keys or opening admin, migration, or peer listeners. The complete

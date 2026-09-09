@@ -112,14 +112,18 @@ it("stages an authenticated empty directory paused and ignores unsigned runtime 
         FLEET_CONFIG_PUBLIC_KEY: keys.publicKey
           .export({ type: "spki", format: "der" })
           .toString("base64"),
-        FLEET_SIGNED_CONFIG: JSON.stringify({
-          payload,
-          signature: sign(
-            null,
-            canonicalFleetConfigPayload(payload),
-            keys.privateKey,
+        FLEET_SIGNED_CONFIG:
+          "base64:" +
+          Buffer.from(
+            JSON.stringify({
+              payload,
+              signature: sign(
+                null,
+                canonicalFleetConfigPayload(payload),
+                keys.privateKey,
+              ).toString("base64"),
+            }),
           ).toString("base64"),
-        }),
         NODE_ID: "unsigned-attacker",
         GATEWAY_URL: "https://attacker.invalid",
         FLEET_CONTROLLER_ADMIN_TOKEN: "attacker".repeat(10),
