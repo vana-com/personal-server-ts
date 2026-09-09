@@ -1,4 +1,9 @@
-import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  randomBytes,
+} from "node:crypto";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 import type {
@@ -20,6 +25,13 @@ export interface McpOwnerBinding {
 }
 
 interface State {
+  writer?: {
+    fenced: boolean;
+    migrationId?: string;
+    target?: string;
+    importedId?: string;
+    importedDigest?: string;
+  };
   connections: Record<string, McpConnectionRecord>;
   authorizations: Record<string, McpOAuthAuthorizationRecord>;
   owners: Record<string, McpOwnerBinding>;
@@ -27,6 +39,13 @@ interface State {
 }
 
 export interface McpDurableState {
+  /** These methods are exposed only through an attested encrypted migration peer. */
+  fenceAndExport(migrationId: string, target: string): Promise<Uint8Array>;
+  importSnapshot(
+    snapshot: Uint8Array,
+    migrationId: string,
+  ): Promise<{ connections: number; digest: string }>;
+  migrationStatus(): Promise<{ fenced: boolean; importedId?: string }>;
   connections: McpConnectionStore;
   authorizations: McpOAuthAuthorizationStore;
   bindOwner(connectionId: string, binding: McpOwnerBinding): Promise<void>;
@@ -89,8 +108,13 @@ export async function openMcpDurableState(options: {
 
   let writes: Promise<unknown> = Promise.resolve();
   let operations: Promise<unknown> = Promise.resolve();
+  const assertActive = (): void => {
+    if (state.writer?.fenced)
+      throw new Error("MCP writer fenced for migration");
+  };
   const mutate = <T>(change: (draft: State) => T): Promise<T> => {
     const result = writes.then(async () => {
+      assertActive();
       const draft = structuredClone(state);
       const value = change(draft);
       await persist(options.path, key, draft);
@@ -102,10 +126,97 @@ export async function openMcpDurableState(options: {
   };
   const read = async <T>(select: (current: State) => T): Promise<T> => {
     await writes;
+    assertActive();
     return structuredClone(select(state));
   };
 
   return {
+    migrationStatus: async () => {
+      await writes;
+      return {
+        fenced: state.writer?.fenced ?? false,
+        ...(state.writer?.importedId
+          ? { importedId: state.writer.importedId }
+          : {}),
+      };
+    },
+    fenceAndExport(migrationId, target): Promise<Uint8Array> {
+      if (!migrationId || !target)
+        return Promise.reject(new Error("Migration identity required"));
+      const result = operations.then(async () => {
+        const exported = writes.then(async () => {
+          if (
+            state.writer?.fenced &&
+            (state.writer.migrationId !== migrationId ||
+              state.writer.target !== target)
+          )
+            throw new Error("MCP writer already fenced for another migration");
+          const draft = structuredClone(state);
+          draft.writer = { ...draft.writer, fenced: true, migrationId, target };
+          await persist(options.path, key, draft);
+          state = draft;
+          return Buffer.from(
+            JSON.stringify({ v: 1, migrationId, state: draft }),
+          );
+        });
+        writes = exported.catch(() => undefined);
+        return exported;
+      });
+      operations = result.catch(() => undefined);
+      return result;
+    },
+    importSnapshot(
+      snapshot,
+      migrationId,
+    ): Promise<{ connections: number; digest: string }> {
+      const result = operations.then(async () => {
+        const imported = writes.then(async () => {
+          const digest = createHash("sha256").update(snapshot).digest("hex");
+          if (
+            state.writer?.importedId === migrationId &&
+            state.writer.importedDigest === digest &&
+            !state.writer.fenced
+          )
+            return {
+              connections: Object.keys(state.connections).length,
+              digest,
+            };
+          if (
+            !state.writer?.fenced &&
+            (Object.keys(state.connections).length ||
+              Object.keys(state.authorizations).length)
+          )
+            throw new Error("Cannot replace active MCP writer");
+          const incoming = JSON.parse(
+            Buffer.from(snapshot).toString("utf8"),
+          ) as { v: number; migrationId: string; state: State };
+          if (
+            incoming.v !== 1 ||
+            incoming.migrationId !== migrationId ||
+            !incoming.state?.writer?.fenced ||
+            incoming.state.writer.migrationId !== migrationId ||
+            !incoming.state.connections ||
+            !incoming.state.authorizations ||
+            !incoming.state.owners ||
+            !incoming.state.identities
+          )
+            throw new Error("Invalid fenced MCP snapshot");
+          const draft = incoming.state;
+          draft.writer = {
+            fenced: false,
+            importedId: migrationId,
+            importedDigest: digest,
+          };
+          await persist(options.path, key, draft);
+          state = draft;
+          return { connections: Object.keys(draft.connections).length, digest };
+        });
+        writes = imported.catch(() => undefined);
+        return imported;
+      });
+      operations = result.catch(() => undefined);
+      return result;
+    },
     connections: {
       create: (record) =>
         mutate((draft) => {
