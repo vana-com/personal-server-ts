@@ -65,6 +65,34 @@ The paused central role permits an empty signed worker directory for initial
 attestation. Stage exact worker policies through a new operator-signed bundle,
 restart and verify fresh measurements before admitting peers or moving state.
 
+## Explicit KMS CA rotation policy
+
+The default `measurementMode: "exact"` (or omitted mode) still pins MRTD and all
+four RTMRs. The optional `measurementMode: "dstack-0.5.9-events"` changes the KMS
+trust boundary: the operator trusts the exact approved KMS CA to rotate its
+instances. It does **not** assert that the KMS VM measurement remains unchanged.
+The measured guest authenticates that CA before accepting KMS keys; its
+`key-provider` event records the CA SPKI. `mr-kms` may then vary between boots.
+This policy must be explicit in the operator-signed complete configuration.
+
+Event mode uses `rtmrs: [rtmr0, rtmr1, rtmr2]` plus exact `mrTd`, `osImageHash`
+and `keyProviderSpki` (lowercase DER SPKI hex). It replays the entire bounded event
+log into all four verified quote registers. Firmware entries are structurally
+validated; their register values remain exactly pinned. Every runtime event
+payload digest is recomputed using the dstack 0.5.9 algorithm. Exactly ten RTMR3
+events must appear in order: system-preparing, app-id, compose-hash, instance-id,
+boot-mr-done, mr-kms, os-image-hash, key-provider, storage-fs, system-ready.
+The sentinels have empty payloads; app/compose/instance/OS match policy exactly;
+key-provider is exactly the canonical KMS CA JSON; storage-fs is `zfs`.
+Only the `mr-kms` payload may vary, and it must be exactly 32 bytes. Unknown,
+missing, reordered or duplicate runtime events are rejected. The log must match
+this fresh verified quote; public provider metadata alone supplies no authority.
+Intel chain/TCB, DEBUG rejection and fresh report-data key binding are unchanged.
+
+The deployed dstack OS 0.5.9 pins source commit `282eeb27d22d8f091ad0fa5a90e638f85cf68751`.
+See its [event digest](https://github.com/Dstack-TEE/dstack/blob/282eeb27d22d8f091ad0fa5a90e638f85cf68751/cc-eventlog/src/runtime_events.rs)
+and [KMS authentication and measurement](https://github.com/Dstack-TEE/dstack/blob/282eeb27d22d8f091ad0fa5a90e638f85cf68751/dstack-util/src/system_setup.rs).
+
 ## Peer protocol and approved identity
 
 The reachability URL uses ordinary HTTPS. Inner confidentiality and mutual
@@ -75,7 +103,7 @@ only public evidence and encrypted packets. Each RPC performs a fresh handshake:
 2. Responder contributes an independent challenge/key and session ID, then quotes
    SHA-512(domain || serialized complete transcript) as all 64 report-data bytes.
 3. Caller runs Intel DCAP signature/certificate/TCB verification and compares
-   MRTD and every RTMR with its approved policy. It compares the exact intended
+   MRTD and RTMRs through its approved measurement policy. It compares the exact intended
    role/node/app/instance/compose and previously discovered node incarnation
    before encrypting any RPC. Discovery is the only unpinned operation and
    returns public identity only. Caller quotes the same complete transcript.
