@@ -163,3 +163,38 @@ it("accepts equivalent identities whose properties use a different order", async
   });
   await expect(client.call("execute", {})).resolves.toBe("accepted");
 });
+
+it("describes only the exact canonical identity later used by a pinned call", async () => {
+  const worker = {
+    role: "worker" as const,
+    nodeId: "a",
+    nodeIncarnation: "boot",
+    appId: "app",
+    instanceId: "instance",
+    composeHash: "compose",
+    osVersion: "0.5.9",
+  };
+  const dstack = createFakeDstackClient({ appId: "1".repeat(40) });
+  const handler = createFleetPeerServer({
+    identity: worker,
+    client: dstack,
+    verifyPeer: async () => {},
+    dispatch: async () => "accepted",
+  });
+  const options = {
+    identity: { ...worker, role: "controller" as const, nodeId: "controller" },
+    client: dstack,
+    verifyPeer: async () => {},
+    baseUrl: "https://worker.invalid",
+    fetch: (async (input, init) =>
+      handler(new Request(input, init))) as typeof fetch,
+  };
+  const described = await createFleetPeerClient(options).call<{
+    identity: FleetPeerIdentity;
+  }>("describe", {});
+  const pinned = createFleetPeerClient({
+    ...options,
+    expectedPeer: described.identity,
+  });
+  await expect(pinned.call("execute", {})).resolves.toBe("accepted");
+});

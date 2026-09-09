@@ -320,7 +320,7 @@ export function createFleetPeerServer(
           throw new Error("Invalid RPC method");
         const result =
           call.method === "describe"
-            ? { identity: options.identity }
+            ? { identity: session.challenge.server.identity }
             : await options.dispatch(
                 call.method,
                 call.body,
