@@ -1,4 +1,5 @@
 import { startFleetWorker } from "../fleet/worker-runtime.js";
+import { currentFleetSandbox } from "../fleet/worker-key.js";
 import {
   fleetConfigValidity,
   verifiedFleetEnvironment,
@@ -212,7 +213,20 @@ async function startJobs(
       }
       return lookup;
     },
-    lookupSandbox: (accessToken) => registry.lookupSandbox(accessToken),
+    lookupSandbox: (accessToken) => {
+      const lookup = registry.lookupSandbox(accessToken);
+      if (!fleet || lookup.kind !== "active") {
+        return lookup;
+      }
+
+      // This token signs and relays access records for its owner. Once the
+      // owner is re-placed, the sandbox its previous generation left behind
+      // must no longer serve or record, exactly as lookupSandboxJob refuses a
+      // job bound to a retired assignment.
+      return currentFleetSandbox(lookup.key, fleet.worker.assignments())
+        ? lookup
+        : { kind: "stale" };
+    },
     postAccessRecords: (records) => gateway.postAccessRecords({ records }),
     prewarm(body): void {
       if (!mcp) {

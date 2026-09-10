@@ -13,7 +13,7 @@ import type { FleetConfigValidity } from "../fleet/security-config.js";
 import { userPsId } from "../identity/paths.js";
 import { deriveEnclaveAccount } from "../identity/wallet.js";
 import { normalizeJobId } from "../jobs/types.js";
-import type { SandboxIdentity, SandboxStatus } from "../sandbox/registry.js";
+import type { SandboxLookup, SandboxStatus } from "../sandbox/registry.js";
 import {
   ACCESS_RECORD_ACTION,
   buildAccessRecord,
@@ -68,6 +68,8 @@ const BODY_HASH_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const RESULT_SIGNING_MESSAGE = "Signed job result upload";
 const ACCESS_RECORDS_MESSAGE = "Signed access records";
 const ACCESS_RECORDS_REFUSED = "access records refused";
+const STALE_PLACEMENT_CODE = "STALE_PLACEMENT";
+const STALE_PLACEMENT_MESSAGE = "stale placement";
 const OUTCOMES = new Set(["served", "denied"]);
 const SOURCES = new Set(["mcp", "api"]);
 const DEFAULT_LOG_TAIL = 100;
@@ -97,7 +99,7 @@ export interface AgentJobsControl {
   listSandboxes(): Promise<SandboxStatus[]>;
   sandboxLogs(containerId: string, tail: number): Promise<string | undefined>;
   lookupSandboxJob(accessToken: string, jobId: string): SandboxJobLookup;
-  lookupSandbox(accessToken: string): SandboxIdentity | null;
+  lookupSandbox(accessToken: string): SandboxLookup;
   postAccessRecords(records: SignedAccessRecord[]): Promise<void>;
   prewarm(body: PrewarmRequestBody): void;
 }
@@ -374,11 +376,25 @@ async function handleAccessRecords(
 
   try {
     const inputs = accessRecordsBody(await readJson(request));
-    const identity = options.jobs.lookupSandbox(token);
-    if (!identity) {
+    const lookup = options.jobs.lookupSandbox(token);
+    if (lookup.kind === "unauthorized") {
       sendError(response, UNAUTHORIZED, "UNAUTHORIZED", UNAUTHORIZED_MESSAGE);
       return;
     }
+
+    // The owner moved to another placement generation; a sandbox left over
+    // from the previous one may not record against them.
+    if (lookup.kind === "stale") {
+      sendError(
+        response,
+        FORBIDDEN,
+        STALE_PLACEMENT_CODE,
+        STALE_PLACEMENT_MESSAGE,
+      );
+      return;
+    }
+
+    const { identity } = lookup;
 
     const account = await deriveEnclaveAccount(
       options.client,

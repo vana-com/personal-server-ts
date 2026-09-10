@@ -64,7 +64,7 @@ export interface SandboxRegistry {
    * ever binding one, and the registry key is not always `userPsId:epoch`
    * (fleet placements key by assignment).
    */
-  lookupSandbox(accessToken: string): SandboxIdentity | null;
+  lookupSandbox(accessToken: string): SandboxLookup;
   drain(): Promise<void>;
   evict(key: string): Promise<void>;
   activeCount(): number;
@@ -78,6 +78,16 @@ export interface SandboxIdentity {
   userPsId: Hex;
   epoch: number;
 }
+
+/**
+ * `key` is the registry key of the matched entry. Fleet keys embed the
+ * placement generation, so a caller that knows the owner's current assignment
+ * can tell a live sandbox from one a previous generation left behind.
+ */
+export type SandboxLookup =
+  | { kind: "unauthorized" }
+  | { kind: "stale" }
+  | { kind: "active"; key: string; identity: SandboxIdentity };
 
 export interface SandboxStatus {
   key: string;
@@ -211,21 +221,25 @@ export function createSandboxRegistry(
       };
     },
     lookupJob(accessToken, jobId): SandboxJobLookup {
-      const entry = findByAccessToken(entries, accessToken);
-      if (!entry) {
+      const found = findByAccessToken(entries, accessToken);
+      if (!found) {
         return { kind: "unauthorized" };
       }
-      const job = entry.activeJobs.get(jobId);
+      const job = found.entry.activeJobs.get(jobId);
 
       return job ? { kind: "active", job } : { kind: "inactive" };
     },
-    lookupSandbox(accessToken): SandboxIdentity | null {
-      const entry = findByAccessToken(entries, accessToken);
-      if (!entry || entry.state === "destroyed") {
-        return null;
+    lookupSandbox(accessToken): SandboxLookup {
+      const found = findByAccessToken(entries, accessToken);
+      if (
+        !found ||
+        found.entry.state === "destroyed" ||
+        !found.entry.identity
+      ) {
+        return { kind: "unauthorized" };
       }
 
-      return entry.identity ?? null;
+      return { kind: "active", key: found.key, identity: found.entry.identity };
     },
     async evict(key): Promise<void> {
       const entry = entries.get(key);
@@ -359,15 +373,15 @@ function sandboxStatus(
 function findByAccessToken(
   entries: Map<string, RegistryEntry>,
   accessToken: string,
-): RegistryEntry | undefined {
+): { key: string; entry: RegistryEntry } | undefined {
   const supplied = Buffer.from(accessToken, "utf8");
-  for (const entry of entries.values()) {
+  for (const [key, entry] of entries) {
     const expected = Buffer.from(entry.accessToken, "utf8");
     if (
       supplied.length === expected.length &&
       timingSafeEqual(supplied, expected)
     ) {
-      return entry;
+      return { key, entry };
     }
   }
 

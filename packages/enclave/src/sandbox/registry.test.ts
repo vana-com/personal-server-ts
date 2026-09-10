@@ -255,13 +255,18 @@ describe("sandbox registry", () => {
     const lease = await registry.acquire("owner:1", buildSpec);
 
     expect(registry.lookupSandbox(lease.accessToken)).toEqual({
-      userPsId: USER_PS_ID,
-      epoch: 1,
+      kind: "active",
+      key: "owner:1",
+      identity: { userPsId: USER_PS_ID, epoch: 1 },
     });
-    expect(registry.lookupSandbox("wrong-token")).toBeNull();
+    expect(registry.lookupSandbox("wrong-token")).toEqual({
+      kind: "unauthorized",
+    });
 
     await registry.evict("owner:1");
-    expect(registry.lookupSandbox(lease.accessToken)).toBeNull();
+    expect(registry.lookupSandbox(lease.accessToken)).toEqual({
+      kind: "unauthorized",
+    });
   });
 
   it("tears an idle sandbox down after its TTL", async () => {
