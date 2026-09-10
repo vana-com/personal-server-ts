@@ -23,12 +23,22 @@ runtime over the private compose network. `AGENT_IMAGE` and `DIND_IMAGE` must
 be digest-pinned base images; provisioning rejects mutable tags. `PS_IMAGE`
 must be a digest built from this branch's root `Dockerfile`; do not use a tag.
 Run the Docker workflow on the branch, then download its `images.env` artifact
-to `deploy/dstack/images.env` or copy the two lines from the job summary. The
+to `deploy/dstack/images.env` or copy the lines from the job summary. The
 production-compose paths read only `PS_IMAGE` and `PS_IMAGE_REF` from that file
 and only when the corresponding environment value is unset; inline paths do
 not read it. `PS_IMAGE_REF` records the image's source commit and must match the
 40-hex `--ref`/`GIT_REF`; if it is omitted, the scripts warn that provenance is
 unverified.
+
+`images.env` also records the prebuilt fleet images: `AGENT_IMAGE` and
+`CONTROLLER_IMAGE` (one `personal-server-enclave` digest serving both roles,
+built by `Dockerfile.enclave`) and `RUNTIME_IMAGE`
+(`personal-server-sandbox-runtime`, built by
+`deploy/dstack/Dockerfile.sandbox-runtime`). Those lines never override the
+environment; they only reject a stale pin. If `AGENT_IMAGE` or `DIND_IMAGE`
+names one of those repositories, it must equal the recorded digest. A base
+image (`node@sha256:…`, `docker@sha256:…`) names a different repository, so the
+level-B composes that still build inside the CVM are unaffected.
 
 For the enclave compose, `--ref` must be an immutable 40-hex commit SHA. The
 level-B clone bootstrap fetches that exact commit and verifies the checkout;
@@ -74,6 +84,25 @@ curl -fsS -X POST "$GATEWAY_URL/v1/tee-nodes" \
   -H 'Content-Type: application/json' \
   --data @node-registration.json
 ```
+
+## Fleet composes
+
+`deploy/dstack/docker-compose.fleet-worker.yml` and
+`docker-compose.fleet-controller.yml` are rendered by the operator's signing
+tooling, not by these scripts. Replace
+`REPLACE_WITH_REVIEWED_AGENT_IMAGE_DIGEST` with `AGENT_IMAGE` and
+`REPLACE_WITH_REVIEWED_RUNTIME_IMAGE_DIGEST` with `RUNTIME_IMAGE` from the same
+`images.env`, and pin digests rather than tags so the compose hash stays
+deterministic.
+
+Both services run prebuilt images: the agent and controller start
+`packages/enclave/dist/agent/main.js` or `central/main.js` directly, and the
+sandbox runtime starts `dockerd` with gVisor already installed. No boot does
+`apk add`, `git fetch`, `npm ci`, or `tsc --build` any more, which removes about
+130 s of the measured 206 s from start to health.
+`REPLACE_WITH_REVIEWED_40_HEX_COMMIT` stays in both composes as measured
+provenance for the commit the enclave image was built from
+(`PS_IMAGE_REF` in `images.env`); nothing is fetched from it.
 
 ## Replicating a fleet node
 

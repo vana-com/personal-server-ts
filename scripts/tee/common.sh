@@ -6,6 +6,22 @@ readonly CVM_UNHEALTHY_TIMEOUT_SECONDS=${CVM_UNHEALTHY_TIMEOUT_SECONDS:-120}
 readonly CURL_CONNECT_TIMEOUT_SECONDS=5
 readonly CURL_MAX_TIME_SECONDS=10
 readonly AGENT_LOG_LINES=50
+readonly IMAGE_DIGEST_PATTERN='^[A-Za-z0-9._/-]+@sha256:[0-9a-f]{64}$'
+
+# images.env is build output, never an authority over the operator's
+# environment. Digests it records are kept under IMAGES_ENV_* so they can only
+# reject a mismatch, never substitute a value the operator did not choose.
+record_images_env_digest() {
+  local line=$1
+  local name=${line%%=*}
+  local value=${line#*=}
+
+  if [[ ! $value =~ $IMAGE_DIGEST_PATTERN ]]; then
+    echo "warning: ignoring malformed $name line in images.env." >&2
+    return 0
+  fi
+  printf -v "IMAGES_ENV_$name" '%s' "$value"
+}
 
 load_images_env() {
   local images_env=$1
@@ -13,7 +29,9 @@ load_images_env() {
 
   [[ -f $images_env ]] || return 0
   while IFS= read -r line || [[ -n $line ]]; do
-    if [[ $line == PS_IMAGE=* ]]; then
+    if [[ $line == AGENT_IMAGE=* || $line == CONTROLLER_IMAGE=* || $line == RUNTIME_IMAGE=* ]]; then
+      record_images_env_digest "$line"
+    elif [[ $line == PS_IMAGE=* ]]; then
       if [[ $line =~ ^PS_IMAGE=[A-Za-z0-9._/:-]+@sha256:[0-9a-f]{64}$ ]]; then
         if [[ ${PS_IMAGE+x} != x ]]; then
           PS_IMAGE=${line#PS_IMAGE=}
@@ -58,6 +76,26 @@ validate_image_digests() {
   fi
   if [[ ! $DIND_IMAGE =~ ^.+@sha256:[0-9a-f]{64}$ ]]; then
     echo "DIND_IMAGE must be an image digest such as docker@sha256:<64 lowercase hex characters>" >&2
+    return 1
+  fi
+}
+
+# Reject a stale pin of an image this branch builds. A base image (node,
+# docker) names a different repository and is left alone, so the level-B
+# composes that still build inside the CVM keep working.
+assert_built_image_digests() {
+  assert_image_matches_build AGENT_IMAGE IMAGES_ENV_AGENT_IMAGE || return 1
+  assert_image_matches_build DIND_IMAGE IMAGES_ENV_RUNTIME_IMAGE || return 1
+}
+
+assert_image_matches_build() {
+  local chosen=${!1:-}
+  local built=${!2:-}
+
+  [[ -n $built ]] || return 0
+  [[ ${chosen%@*} == "${built%@*}" ]] || return 0
+  if [[ $chosen != "$built" ]]; then
+    echo "$1 '$chosen' must match the digest recorded in images.env: '$built'." >&2
     return 1
   fi
 }

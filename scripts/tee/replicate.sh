@@ -75,6 +75,7 @@ if [[ -n $secret_keychain ]]; then
 fi
 
 load_images_env "$repo_root/deploy/dstack/images.env"
+assert_built_image_digests
 : "${ENCLAVE_AGENT_SECRET:?ENCLAVE_AGENT_SECRET must be set in the environment}"
 : "${GATEWAY_URL:?GATEWAY_URL must be set in the environment}"
 : "${GIT_REF:?GIT_REF must be set in the environment}"

@@ -90,6 +90,7 @@ else
     fi
   else
     load_images_env "$repo_root/deploy/dstack/images.env"
+    assert_built_image_digests
     : "${PS_IMAGE:?PS_IMAGE must be set in the environment}"
     if [[ ! $PS_IMAGE =~ ^.+@sha256:[[:xdigit:]]{64}$ ]]; then
       echo "PS_IMAGE must be an image digest such as vanaorg/personal-server@sha256:<64 hex characters>" >&2
