@@ -1,10 +1,20 @@
 import { timingSafeEqual } from "node:crypto";
 import type { FleetController } from "./placement.js";
 import type { FleetOwner, FleetScope } from "./contracts.js";
+/** Controller identity plus its signed-bundle window, reported on admin status
+ * so an operator can see the deployment a directory decision was made under. */
+export interface FleetStatusConfig {
+  issuedAt: string | null;
+  expiresAt: string | null;
+  composeHash: string;
+  appId: string;
+  instanceId: string;
+}
 export interface FleetControlHttpOptions {
   controller: FleetController;
   credential: string;
   role: "gateway" | "admin";
+  config?: FleetStatusConfig;
   active?: () => Promise<boolean>;
   identity(body: unknown): Promise<unknown>;
   seal(body: unknown): Promise<unknown>;
@@ -118,6 +128,7 @@ export function createFleetControlHttp(
           return Response.json({
             controllerTerm: 1,
             paused: options.controller.paused(),
+            config: options.config ?? null,
             nodes: options.controller.nodeStatus(),
             placements: options.controller.snapshot(),
           });

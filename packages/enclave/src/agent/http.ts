@@ -9,6 +9,7 @@ import {
 } from "node:http";
 import { isAddress, isHex, type Address, type Hex } from "viem";
 import type { DstackClient } from "../dstack/client.js";
+import type { FleetConfigValidity } from "../fleet/security-config.js";
 import { userPsId } from "../identity/paths.js";
 import { deriveEnclaveAccount } from "../identity/wallet.js";
 import { normalizeJobId } from "../jobs/types.js";
@@ -79,6 +80,9 @@ export interface AgentServerOptions {
   client: DstackClient;
   secret: string;
   jobs?: AgentJobsControl;
+  /** Signed-bundle window, surfaced on health so the pool loop can refuse
+   * to start a member whose configuration is about to expire. */
+  config?: FleetConfigValidity;
 }
 
 export interface AgentJobsControl {
@@ -146,6 +150,7 @@ async function handleRequest(
           options.jobs?.nodeId ?? null,
           options.jobs?.activeCount() ?? 0,
           options.jobs?.draining() ?? false,
+          options.config,
         ),
       );
       return;

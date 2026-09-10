@@ -4,6 +4,7 @@ import { expect, it, vi } from "vitest";
 import {
   verifiedFleetEnvironment,
   canonicalFleetConfigPayload,
+  fleetConfigValidity,
   isVerifiedFleetEnvironment,
   type FleetSecurityConfigPayload,
 } from "./security-config.js";
@@ -492,3 +493,38 @@ it("rejects noncanonical base64, invalid UTF-8 and raw JSON before identity look
     expect(identity).not.toHaveBeenCalled();
   }
 });
+it.each([
+  ["a finite window", new Date(now + 4 * 60 * 60 * 1000).toISOString()],
+  ["an explicit deployment lifetime", null],
+])(
+  "reports %s without exposing the bundle environment",
+  async (_label, expiresAt) => {
+    const body = payload();
+    body.expiresAt = expiresAt;
+    const env = await verifiedFleetEnvironment(
+      { FLEET_CONFIG_PUBLIC_KEY: publicKey, FLEET_SIGNED_CONFIG: bundle(body) },
+      {
+        role: "controller",
+        identity: async () => ({
+          appId: body.appId,
+          instanceId: body.instanceId,
+        }),
+        now: () => now,
+      },
+    );
+
+    const validity = fleetConfigValidity(env);
+    expect(validity).toEqual({
+      role: "controller",
+      nodeId: body.nodeId,
+      appId: body.appId,
+      instanceId: body.instanceId,
+      issuedAt: body.issuedAt,
+      expiresAt,
+    });
+    expect(JSON.stringify(validity)).not.toContain(
+      body.env.FLEET_CONTROLLER_ADMIN_TOKEN,
+    );
+    expect(fleetConfigValidity({ ...env })).toBeUndefined();
+  },
+);

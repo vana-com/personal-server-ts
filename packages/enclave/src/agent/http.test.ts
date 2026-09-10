@@ -15,6 +15,7 @@ import { keccak256, toBytes } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { createFakeDstackClient } from "../dstack/fake.js";
 import type { DstackClient } from "../dstack/client.js";
+import type { FleetConfigValidity } from "../fleet/security-config.js";
 import { userPsId, type UserPsId } from "../identity/paths.js";
 import { deriveEnclaveIdentity } from "../identity/wallet.js";
 import { seal, unseal } from "../sealing/envelope.js";
@@ -45,6 +46,8 @@ const INVALID_HEX = "invalid-hex";
 const VALID_HEX = "0x00";
 const INFO_FAILURE = "info failed";
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
+const CONFIG_ISSUED_AT = "2026-09-10T00:00:00.000Z";
+const CONFIG_EXPIRES_AT = "2026-09-10T12:00:00.000Z";
 const INSTANCE_ID_PATTERN = /^[0-9a-f]{40}$/;
 const JSON_HEADERS = {
   authorization: `Bearer ${SECRET}`,
@@ -59,11 +62,13 @@ let prewarmBody: PrewarmRequestBody;
 async function startServer(
   client: DstackClient = createFakeDstackClient({ appId: FAKE_APP_ID }),
   jobs?: AgentJobsControl,
+  config?: FleetConfigValidity,
 ): Promise<void> {
   server = createAgentServer({
     client,
     secret: SECRET,
     ...(jobs ? { jobs } : {}),
+    ...(config ? { config } : {}),
   });
   await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
   const address = server.address();
@@ -407,6 +412,54 @@ describe("agent HTTP server", () => {
     expect(body.composeHash).toMatch(HASH_PATTERN);
     expect(body.instanceId).toMatch(INSTANCE_ID_PATTERN);
     expect(body.osImageHash).toMatch(HASH_PATTERN);
+  });
+
+  it("reports a null signed-bundle window when the agent runs unsigned", async () => {
+    const response = await fetch(`${origin}${HEALTH_PATH}`, {
+      headers: JSON_HEADERS,
+    });
+    const text = await response.text();
+
+    expect(Object.keys(JSON.parse(text) as object).sort()).toEqual([
+      "activeSandboxes",
+      "appId",
+      "composeHash",
+      "configExpiresAt",
+      "configIssuedAt",
+      "draining",
+      "instanceId",
+      "nodeId",
+      "osImageHash",
+      "osVersion",
+    ]);
+    expect(text).toContain('"configIssuedAt":null');
+    expect(text).toContain('"configExpiresAt":null');
+  });
+
+  it.each([
+    ["a finite window", CONFIG_EXPIRES_AT],
+    ["a deployment-lifetime bundle", null],
+  ])("reports %s from the verified bundle", async (_label, expiresAt) => {
+    await stopServer();
+    await startServer(undefined, undefined, {
+      role: "worker",
+      nodeId: JOB_NODE_ID,
+      appId: FAKE_APP_ID,
+      instanceId: "0".repeat(40),
+      issuedAt: CONFIG_ISSUED_AT,
+      expiresAt,
+    });
+    const text = await (
+      await fetch(`${origin}${HEALTH_PATH}`, { headers: JSON_HEADERS })
+    ).text();
+
+    expect(text).toContain(`"configIssuedAt":"${CONFIG_ISSUED_AT}"`);
+    // A non-expiring bundle must stay literal null rather than a dropped key.
+    expect(text).toContain(
+      expiresAt === null
+        ? '"configExpiresAt":null'
+        : `"configExpiresAt":"${expiresAt}"`,
+    );
   });
 
   it("reports jobs state and drains through the operator route", async () => {

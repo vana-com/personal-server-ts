@@ -97,7 +97,17 @@ const REQUIRED = {
     "FLEET_PEER_POLICIES",
   ],
 } as const;
-const verifiedEnvironments = new WeakSet<object>();
+/** Bundle metadata an operator may safely read back. Never carries `env`. */
+export interface FleetConfigValidity {
+  role: FleetSecurityConfigPayload["role"];
+  nodeId: string;
+  appId: string;
+  instanceId: string;
+  issuedAt: string;
+  /** Null is the signed deployment-lifetime policy, not an absent value. */
+  expiresAt: string | null;
+}
+const verifiedEnvironments = new WeakMap<object, FleetConfigValidity>();
 const invalid = (): Error => new Error("Invalid fleet security configuration");
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -224,6 +234,15 @@ export function isVerifiedFleetEnvironment(env: NodeJS.ProcessEnv): boolean {
   return verifiedEnvironments.has(env);
 }
 
+/** Signed lifetime of a verified environment, for health and status surfaces.
+ * Operators and the pool loop need the window without ever seeing the bundle. */
+export function fleetConfigValidity(
+  env: NodeJS.ProcessEnv,
+): FleetConfigValidity | undefined {
+  const validity = verifiedEnvironments.get(env);
+  return validity && { ...validity };
+}
+
 /** Authenticates encrypted-env sender independently of dstack confidentiality.
  * FLEET_CONFIG_PUBLIC_KEY must be a literal in measured compose, never an
  * allowed unmeasured substitution. The OS/image launcher must exclude injection
@@ -309,7 +328,14 @@ export async function verifiedFleetEnvironment(
     const env: NodeJS.ProcessEnv = Object.freeze(
       Object.assign(Object.create(null), payload.env),
     );
-    verifiedEnvironments.add(env);
+    verifiedEnvironments.set(env, {
+      role: payload.role,
+      nodeId: payload.nodeId,
+      appId: payload.appId,
+      instanceId: payload.instanceId,
+      issuedAt: payload.issuedAt,
+      expiresAt: payload.expiresAt,
+    });
     return env;
   } catch {
     // Parse/crypto/provider errors can contain input; never log bundle contents.

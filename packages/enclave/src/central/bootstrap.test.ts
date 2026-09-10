@@ -642,3 +642,43 @@ it("accepts a full warm pool and refuses one member beyond the cap", async () =>
     await rm(path, { recursive: true, force: true });
   }
 });
+
+it("publishes the controller bundle window and identity on admin status", async () => {
+  const path = await mkdtemp(join(tmpdir(), "central-status-config-"));
+  const dstack = createFakeDstackClient({ appId: CONTROLLER_APP_ID });
+  const info = await dstack.info();
+  const keys = generateKeyPairSync("ed25519");
+  const env = await controllerEnv(path, []);
+  let runtime: Awaited<ReturnType<typeof startFleetCentral>> | undefined;
+  try {
+    runtime = await startFleetCentral(
+      signedConfig(env, info, keys, null),
+      dstack,
+      () => {
+        throw new Error("Must not call Gateway while staged");
+      },
+    );
+    const response = await fetch(
+      `http://127.0.0.1:${env.FLEET_ADMIN_PORT}/fleet/v1/status`,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+        body: "{}",
+      },
+    );
+    const text = await response.text();
+
+    expect((JSON.parse(text) as { config: unknown }).config).toEqual({
+      issuedAt: expect.any(String),
+      expiresAt: null,
+      composeHash: info.composeHash,
+      appId: info.appId,
+      instanceId: info.instanceId,
+    });
+    expect(text).toContain('"expiresAt":null');
+    expect(text).not.toContain(ADMIN_TOKEN);
+  } finally {
+    await runtime?.close();
+    await rm(path, { recursive: true, force: true });
+  }
+});

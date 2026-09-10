@@ -1,5 +1,8 @@
 import { startFleetWorker } from "../fleet/worker-runtime.js";
-import { verifiedFleetEnvironment } from "../fleet/security-config.js";
+import {
+  fleetConfigValidity,
+  verifiedFleetEnvironment,
+} from "../fleet/security-config.js";
 import { createRealDstackClient } from "../dstack/real.js";
 /**
  * Node agent entrypoint. ENCLAVE_AGENT_SECRET is required;
@@ -56,10 +59,12 @@ async function main(): Promise<void> {
     const jobsControl = jobs
       ? await startJobs(client, jobs, port, env)
       : undefined;
+    const config = fleetConfigValidity(env);
     const server = createAgentServer({
       client,
       secret,
       ...(jobsControl ? { jobs: jobsControl } : {}),
+      ...(config ? { config } : {}),
     });
 
     server.listen(port, host);

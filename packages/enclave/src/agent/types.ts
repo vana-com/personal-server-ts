@@ -63,4 +63,8 @@ export interface HealthResponse {
   osVersion?: string;
   activeSandboxes: number;
   draining: boolean;
+  /** Signed-bundle window. Null issuance means this agent runs unsigned;
+   * a null expiry on a signed bundle is the deployment-lifetime policy. */
+  configIssuedAt: string | null;
+  configExpiresAt: string | null;
 }

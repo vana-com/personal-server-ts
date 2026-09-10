@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { verifiedFleetEnvironment } from "../fleet/security-config.js";
+import {
+  fleetConfigValidity,
+  verifiedFleetEnvironment,
+} from "../fleet/security-config.js";
 import { isAbsolute } from "node:path";
 import { serve } from "@hono/node-server";
 import { DEFAULTS } from "@opendatalabs/personal-server-ts-core/schemas";
@@ -109,6 +112,7 @@ export async function startFleetCentral(
   const info = await client.info();
   if (workers.some((w) => w.policy.identity.appId === info.appId))
     throw new Error("Central and worker KMS app identities must differ");
+  const validity = fleetConfigValidity(env);
   const identity: FleetPeerIdentity = {
     role: "controller",
     nodeId: env.NODE_ID ?? "moksha-personal-server-controller",
@@ -291,6 +295,13 @@ export async function startFleetCentral(
   };
   const common = {
     controller,
+    config: {
+      issuedAt: validity?.issuedAt ?? null,
+      expiresAt: validity?.expiresAt ?? null,
+      composeHash: identity.composeHash,
+      appId: identity.appId,
+      instanceId: identity.instanceId,
+    },
     active: async () => !controller.paused() && (await mcp.active()),
     activate: async () => {
       if (!(await mcp.active()))

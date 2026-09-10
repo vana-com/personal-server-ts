@@ -19,6 +19,14 @@ relay existing identity/seal payloads to an admitted worker. Dedicated Gateway
 credential permits these operations only. Separate admin listener/credential
 permits /fleet/v1/admit and /fleet/v1/drain. Public ingress mounts neither.
 
+Admin POST /fleet/v1/status returns {controllerTerm,paused,config,nodes,
+placements}. `config` is {issuedAt,expiresAt,composeHash,appId,instanceId} for
+the controller's own verified bundle and identity; it never contains bundle
+environment values. A signed deployment-lifetime bundle serializes `expiresAt`
+as literal null, which is not the same as an absent field. Worker GET
+/agent/v1/health carries the same window as `configIssuedAt`/`configExpiresAt`;
+a null `configIssuedAt` means the agent runs unsigned.
+
 Worker adapter owns fleet/worker*.ts and agent/jobs/sandbox changes. Controller
 owns contracts.ts, fleet/peer*.ts, placement/controller/router/migration and
 central/. Peer transport invokes adapter methods prepare, renew, readiness,

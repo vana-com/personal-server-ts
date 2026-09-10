@@ -101,3 +101,33 @@ it("only private administration can prepare rollback identities", async () => {
     migrationId: "rollback-1",
   });
 });
+
+it("reports the controller bundle window on private status only", async () => {
+  const { common } = fixture();
+  const token = "a".repeat(32);
+  const config = {
+    issuedAt: "2026-09-10T00:00:00.000Z",
+    expiresAt: null,
+    composeHash: "c".repeat(64),
+    appId: "1".repeat(40),
+    instanceId: "2".repeat(40),
+  };
+  const admin = createFleetControlHttp({
+    ...common,
+    config,
+    role: "admin",
+    credential: token,
+  });
+  const gateway = createFleetControlHttp({
+    ...common,
+    config,
+    role: "gateway",
+    credential: token,
+  });
+
+  const response = await admin(request("/fleet/v1/status", token));
+  expect(response.status).toBe(200);
+  // A deployment-lifetime bundle must survive serialization as literal null.
+  expect(await response.text()).toContain('"expiresAt":null');
+  expect((await gateway(request("/fleet/v1/status", token))).status).toBe(404);
+});
