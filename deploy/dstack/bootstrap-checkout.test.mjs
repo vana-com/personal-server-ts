@@ -141,3 +141,54 @@ for (const template of templates) {
     });
   }
 }
+
+// The fleet composes were dropped from the checkout hardening above because
+// they no longer clone at boot. This guards that property directly: no
+// boot-time fetch or build, and every image pinned by digest (or still a
+// reviewed placeholder waiting for one).
+const fleetTemplates = [
+  "docker-compose.fleet-controller.yml",
+  "docker-compose.fleet-worker.yml",
+];
+
+const bootBuildSteps = [
+  /\bgit\s/,
+  /\bnpm\s+(ci|install)\b/,
+  /\bapk\s+add\b/,
+  /\bcurl\b/,
+  /\btsc\b/,
+  /^\s*build:/,
+];
+const imageLine = /^\s*image:\s*"?([^"\s]+)"?\s*$/;
+const imageDigest = /^\S+@sha256:[0-9a-f]{64}$/;
+const reviewedPlaceholder = /^REPLACE_WITH_REVIEWED_[A-Z0-9_]+$/;
+
+for (const template of fleetTemplates) {
+  test(`${template}: prebuilt images, no boot-time build`, () => {
+    const yaml = readFileSync(
+      fileURLToPath(new URL(template, import.meta.url)),
+      "utf8",
+    );
+    // Comments describe what was removed; only executable lines are checked.
+    const lines = yaml
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("#"));
+
+    const images = [];
+    for (const line of lines) {
+      for (const step of bootBuildSteps) {
+        assert.equal(step.test(line), false, `boot-time build step: ${line}`);
+      }
+      const image = line.match(imageLine)?.[1];
+      if (image) images.push(image);
+    }
+
+    assert.ok(images.length > 0, "no image: line found");
+    for (const image of images) {
+      assert.ok(
+        imageDigest.test(image) || reviewedPlaceholder.test(image),
+        `image must be a digest or a reviewed placeholder: ${image}`,
+      );
+    }
+  });
+}
