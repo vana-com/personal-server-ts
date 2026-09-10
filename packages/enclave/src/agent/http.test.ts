@@ -208,8 +208,15 @@ function jobsControl(
     },
     lookupSandbox: (token) =>
       token === SANDBOX_TOKEN
-        ? { userPsId: userPsId(CHAIN_ID, OWNER.address), epoch: EPOCH }
-        : null,
+        ? {
+            kind: "active",
+            key: `${userPsId(CHAIN_ID, OWNER.address)}:${EPOCH}`,
+            identity: {
+              userPsId: userPsId(CHAIN_ID, OWNER.address),
+              epoch: EPOCH,
+            },
+          }
+        : { kind: "unauthorized" },
     postAccessRecords: vi.fn().mockResolvedValue(undefined),
     prewarm: vi.fn(),
   };
@@ -473,7 +480,7 @@ describe("agent HTTP server", () => {
       listSandboxes: vi.fn().mockResolvedValue([]),
       sandboxLogs: vi.fn().mockResolvedValue(undefined),
       lookupSandboxJob: vi.fn().mockReturnValue({ kind: "unauthorized" }),
-      lookupSandbox: vi.fn().mockReturnValue(null),
+      lookupSandbox: vi.fn().mockReturnValue({ kind: "unauthorized" }),
       postAccessRecords: vi.fn().mockResolvedValue(undefined),
       prewarm: vi.fn(),
     } satisfies AgentJobsControl;

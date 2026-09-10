@@ -5,6 +5,7 @@ import { createFakeDstackClient } from "../dstack/fake.js";
 import { userPsId } from "../identity/paths.js";
 import { deriveEnclaveAccount } from "../identity/wallet.js";
 import { createAgentServer, type AgentJobsControl } from "./http.js";
+import type { SandboxLookup } from "../sandbox/registry.js";
 import {
   buildAccessRecord,
   canonicalJson,
@@ -22,6 +23,7 @@ const ACCESS_RECORDS_PATH = "/agent/v1/access-records";
 const OWNER = privateKeyToAccount(keccak256(toBytes("access-records:owner")));
 const GRANTEE = "0x1111111111111111111111111111111111111111";
 const USER_PS_ID = userPsId(CHAIN_ID, OWNER.address);
+const SANDBOX_KEY = `${USER_PS_ID}:${EPOCH}`;
 
 const SERVED: AccessRecordInput = {
   action: "read",
@@ -46,9 +48,10 @@ const DENIED: AccessRecordInput = {
 
 function jobsControl(
   posted: SignedAccessRecord[][],
-  identity: { userPsId: `0x${string}`; epoch: number } | null = {
-    userPsId: USER_PS_ID,
-    epoch: EPOCH,
+  lookup: SandboxLookup = {
+    kind: "active",
+    key: SANDBOX_KEY,
+    identity: { userPsId: USER_PS_ID, epoch: EPOCH },
   },
 ): AgentJobsControl {
   return {
@@ -61,7 +64,8 @@ function jobsControl(
     listSandboxes: async () => [],
     sandboxLogs: async () => undefined,
     lookupSandboxJob: () => ({ kind: "unauthorized" }),
-    lookupSandbox: (token) => (token === SANDBOX_TOKEN ? identity : null),
+    lookupSandbox: (token) =>
+      token === SANDBOX_TOKEN ? lookup : { kind: "unauthorized" },
     postAccessRecords: async (records) => {
       posted.push(records);
     },
@@ -171,6 +175,18 @@ describe("agent access records route", () => {
       const response = await post(origin, { records: [SERVED] }, "wrong-token");
       expect(response.status).toBe(401);
     });
+  });
+
+  it("rejects a sandbox left behind by a previous placement", async () => {
+    const posted: SignedAccessRecord[][] = [];
+    await withServer(jobsControl(posted, { kind: "stale" }), async (origin) => {
+      const response = await post(origin, { records: [SERVED] });
+      expect(response.status).toBe(403);
+      await expect(response.json()).resolves.toMatchObject({
+        code: "STALE_PLACEMENT",
+      });
+    });
+    expect(posted).toHaveLength(0);
   });
 
   it("rejects a request with no bearer token", async () => {
