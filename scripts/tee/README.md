@@ -33,13 +33,16 @@ holds no secrets. The controller admin token comes from the login keychain item
 state persists in `~/.vana/pool-loop-state.json`
 (`VANA_POOL_PATH`/`VANA_POOL_STATE_PATH` override both paths).
 
-The loop ticks every 15 s: it scales up only after 60 s with no free capacity
-and at most `MAX_RUNNING` members, scales down a member idle for 15 min while
-more than `MIN_RUNNING` remain, and stops a machine only once the controller
-reports it draining with no live lease. A member that has not been admitted
-8 minutes after start, or whose event log carries a second `mr-kms` entry, is
-restarted once and then quarantined. `--once` runs a single tick; `--dry-run`
-logs every decision without invoking `phala`.
+The loop ticks every 15 s: it brings the pool straight up to `MIN_RUNNING`,
+then scales up only after 60 s with no free capacity and at most `MAX_RUNNING`
+members, scales down a member idle for 15 min while more than `MIN_RUNNING`
+remain, and stops a machine only once the controller reports it draining with
+no live lease. A member that has not been admitted 8 minutes after start, or
+whose event log carries a second `mr-kms` entry, is restarted once and then
+quarantined; neither a stop nor a restart happens while a lease on it is still
+live. One loop runs per state file, fenced by a `<state>.lock` pidfile.
+`--once` runs a single tick; `--dry-run` logs every decision without invoking
+`phala`.
 
 `provision.sh` defaults to `deploy/dstack/docker-compose.enclave.yml`. The
 agent receives only the dstack socket and reaches the privileged nested Docker

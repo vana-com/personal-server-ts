@@ -2,7 +2,13 @@ import { describe, expect, it } from "vitest";
 // The loop is plain ESM so it can run from an operator laptop without a build.
 
 // @ts-expect-error - untyped operator script; the decision function is pure.
-import { ACTION, decidePoolActions, PHASE, REASON } from "./pool-loop.mjs";
+import {
+  ACTION,
+  decidePoolActions,
+  PHASE,
+  REASON,
+  revertMember,
+} from "./pool-loop.mjs";
 
 const NOW = Date.parse("2026-09-10T12:00:00.000Z");
 const MINUTE = 60_000;
@@ -238,12 +244,15 @@ describe("decidePoolActions", () => {
       health,
       state: first.state,
     });
+    // Quarantining drops the pool below MIN_RUNNING, so the floor replaces it.
     expect(types(second.actions)).toEqual([
       ACTION.alert,
       ACTION.stop,
       ACTION.alert,
+      ACTION.start,
     ]);
     expect(second.state.nodes["worker-3"].phase).toBe(PHASE.quarantined);
+    expect(second.state.nodes["worker-2"].phase).toBe(PHASE.starting);
   });
 
   it("restarts a member that never reaches admission within the deadline", () => {
@@ -340,15 +349,25 @@ describe("decidePoolActions", () => {
       restarts: 0,
     };
     const members = MEMBERS;
+    // A drain only happens above MIN_RUNNING, so two other members stay up and
+    // the warm floor asks for nothing once this one stops.
+    const others = {
+      "worker-1": runningState("worker-1"),
+      "worker-3": runningState("worker-3"),
+    };
 
     const busy = decidePoolActions({
       now: NOW,
       members,
       status: status(
-        [admitted("worker-1"), admitted("worker-2", { draining: true })],
+        [
+          admitted("worker-1"),
+          admitted("worker-2", { draining: true }),
+          admitted("worker-3"),
+        ],
         placements("worker-2", 1),
       ),
-      state: { nodes: { "worker-2": draining } },
+      state: { nodes: { ...others, "worker-2": draining } },
     });
     expect(busy.actions).toEqual([]);
 
@@ -358,8 +377,9 @@ describe("decidePoolActions", () => {
       status: status([
         admitted("worker-1"),
         admitted("worker-2", { draining: true }),
+        admitted("worker-3"),
       ]),
-      state: { nodes: { "worker-2": draining } },
+      state: { nodes: { ...others, "worker-2": draining } },
     });
     expect(clear.actions).toEqual([
       { type: ACTION.stop, nodeId: "worker-2", cvmId: "cvm-2" },
@@ -422,5 +442,203 @@ describe("decidePoolActions", () => {
     expect(actions).toEqual([
       { type: ACTION.alert, reason: REASON.noCandidate, nodeId: null },
     ]);
+  });
+
+  it("never credits the capacity of a member the controller cannot reach", () => {
+    // The ops plan's own state: W1/W2 saturated, W3 admitted earlier and since
+    // stopped. Crediting its four slots as free made the loop take no action.
+    const { actions, state } = decidePoolActions({
+      now: NOW,
+      members: MEMBERS,
+      status: status(
+        [
+          admitted("worker-1"),
+          admitted("worker-2"),
+          admitted("worker-3", { unavailable: true }),
+        ],
+        [
+          ...placements("worker-1", CAPACITY),
+          ...placements("worker-2", CAPACITY),
+        ],
+      ),
+      state: {
+        saturatedSince: NOW - 2 * MINUTE,
+        nodes: {
+          "worker-1": runningState("worker-1"),
+          "worker-2": runningState("worker-2"),
+          "worker-3": {
+            phase: PHASE.stopped,
+            since: NOW - 10 * MINUTE,
+            restarts: 1,
+          },
+        },
+      },
+    });
+
+    expect(actions).toEqual([
+      { type: ACTION.start, nodeId: "worker-3", cvmId: "cvm-3" },
+    ]);
+    expect(state.nodes["worker-3"]).toMatchObject({
+      phase: PHASE.starting,
+      restarts: 0,
+    });
+  });
+
+  it("starts members up to MIN_RUNNING before any saturation", () => {
+    const cold = status(["worker-1", "worker-2", "worker-3"].map(declared));
+
+    const first = decidePoolActions({
+      now: NOW,
+      members: MEMBERS,
+      status: cold,
+      state: {},
+    });
+    expect(first.actions).toEqual([
+      { type: ACTION.start, nodeId: "worker-1", cvmId: "cvm-1" },
+    ]);
+    expect(first.state.saturatedSince).toBeUndefined();
+
+    const second = decidePoolActions({
+      now: NOW,
+      members: MEMBERS,
+      status: cold,
+      state: first.state,
+    });
+    expect(second.actions).toEqual([
+      { type: ACTION.start, nodeId: "worker-2", cvmId: "cvm-2" },
+    ]);
+
+    // Two members are coming up, which is the floor: nothing more is started.
+    const third = decidePoolActions({
+      now: NOW,
+      members: MEMBERS,
+      status: cold,
+      state: second.state,
+    });
+    expect(third.actions).toEqual([]);
+  });
+
+  it("keeps the restart budget across an admitted tick", () => {
+    const { state } = decidePoolActions({
+      now: NOW,
+      members: MEMBERS,
+      status: status(["worker-1", "worker-2", "worker-3"].map(admitted)),
+      state: {
+        nodes: {
+          "worker-1": runningState("worker-1"),
+          "worker-2": runningState("worker-2"),
+          "worker-3": {
+            phase: PHASE.admitWait,
+            since: NOW - MINUTE,
+            restarts: 1,
+          },
+        },
+      },
+    });
+
+    expect(state.nodes["worker-3"]).toMatchObject({
+      phase: PHASE.running,
+      restarts: 1,
+    });
+  });
+
+  it("never restarts a member that still serves a live lease", () => {
+    const { actions, state } = decidePoolActions({
+      now: NOW,
+      members: MEMBERS,
+      status: status(
+        [
+          admitted("worker-1"),
+          admitted("worker-2"),
+          admitted("worker-3", { unavailable: true }),
+        ],
+        placements("worker-3", 1),
+      ),
+      state: {
+        nodes: {
+          "worker-1": runningState("worker-1"),
+          "worker-2": runningState("worker-2"),
+          "worker-3": {
+            phase: PHASE.admitWait,
+            since: NOW - 9 * MINUTE,
+            restarts: 0,
+          },
+        },
+      },
+    });
+
+    expect(actions.map((action) => action.reason)).toEqual([
+      REASON.admitDeadline,
+      REASON.restartBlocked,
+    ]);
+    expect(state.nodes["worker-3"]).toMatchObject({
+      phase: PHASE.admitWait,
+      restarts: 0,
+    });
+  });
+
+  it("ignores an admission record raised before the current boot", () => {
+    const { actions } = decidePoolActions({
+      now: NOW,
+      members: MEMBERS,
+      status: status([
+        admitted("worker-1"),
+        admitted("worker-2"),
+        declared("worker-3", {
+          lastAdmission: {
+            code: "PEER_EVENTS_REJECTED",
+            since: new Date(NOW - 5 * MINUTE).toISOString(),
+            attempts: 2,
+          },
+        }),
+      ]),
+      health: { "worker-3": { status: 200, configExpiresAt: null } },
+      state: {
+        nodes: {
+          "worker-1": runningState("worker-1"),
+          "worker-2": runningState("worker-2"),
+          "worker-3": {
+            phase: PHASE.starting,
+            since: NOW - MINUTE,
+            restarts: 1,
+          },
+        },
+      },
+    });
+
+    expect(actions).toEqual([{ type: ACTION.admit, nodeId: "worker-3" }]);
+  });
+
+  it("keeps the previous phase when a CVM command does not run", () => {
+    const previous = {
+      saturatedSince: NOW - 2 * MINUTE,
+      nodes: {
+        "worker-1": runningState("worker-1"),
+        "worker-2": runningState("worker-2"),
+        "worker-3": {
+          phase: PHASE.stopped,
+          since: NOW - 10 * MINUTE,
+          restarts: 0,
+        },
+      },
+    };
+    const { actions, state } = decidePoolActions({
+      now: NOW,
+      members: MEMBERS,
+      status: status(
+        [admitted("worker-1"), admitted("worker-2"), declared("worker-3")],
+        [
+          ...placements("worker-1", CAPACITY),
+          ...placements("worker-2", CAPACITY),
+        ],
+      ),
+      state: previous,
+    });
+    expect(state.nodes["worker-3"].phase).toBe(PHASE.starting);
+
+    revertMember(state, previous, actions[0].nodeId);
+
+    expect(state.nodes["worker-3"]).toEqual(previous.nodes["worker-3"]);
+    expect(state.saturatedSince).toBe(previous.saturatedSince);
   });
 });

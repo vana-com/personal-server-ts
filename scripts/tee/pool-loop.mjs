@@ -22,12 +22,17 @@
  *   node scripts/tee/pool-loop.mjs [--once] [--dry-run]
  */
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
+  closeSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
   realpathSync,
   renameSync,
-  writeFileSync,
+  rmSync,
+  writeSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -63,6 +68,13 @@ const DRAIN_ROUTE = "/fleet/v1/drain";
 const HEALTH_ROUTE = "/agent/v1/health";
 const STATE_FILE_MODE = 0o600;
 const STATE_DIRECTORY_MODE = 0o700;
+const LOCK_SUFFIX = ".lock";
+
+/** A member is addressed by name in a `phala api` path and in a URL base, so
+ * both identifiers stay inside the DNS-label charset. */
+const NODE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
+const CVM_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
+const HTTPS_PROTOCOL = "https:";
 
 /** Double mr-kms: the member booted, but its event log has 11 runtime events. */
 const DOUBLE_MR_KMS_CODE = "PEER_EVENTS_REJECTED";
@@ -98,6 +110,8 @@ export const REASON = Object.freeze({
   noCandidate: "NO_STARTABLE_MEMBER",
   quarantined: "MEMBER_QUARANTINED",
   stopBlocked: "STOP_BLOCKED",
+  restartBlocked: "RESTART_BLOCKED",
+  unknownMember: "MEMBER_NOT_IN_STATUS",
 });
 
 // ---------------------------------------------------------------- decisions
@@ -142,6 +156,13 @@ function restartOrQuarantine(view, ctx, reason) {
   ctx.actions.push(alert(reason, member.nodeId));
 
   if ((entry.restarts ?? 0) < MAX_RESTARTS) {
+    // A restart is a hard CVM cycle. One failed renew RPC is enough to mark a
+    // member unavailable, so never cycle it while it still serves live leases.
+    if (view.live > 0) {
+      ctx.actions.push(alert(REASON.restartBlocked, member.nodeId));
+      return;
+    }
+
     ctx.actions.push({
       type: ACTION.restart,
       nodeId: member.nodeId,
@@ -165,6 +186,17 @@ function restartOrQuarantine(view, ctx, reason) {
   enter(entry, PHASE.quarantined, ctx.now);
 }
 
+/** The controller's verdict on the member as it runs now. A record raised
+ * before this phase began described the previous boot, so a member that has
+ * just been restarted is not judged on the failure that restarted it. */
+function currentAdmission(view) {
+  const admission = view.node?.lastAdmission;
+  if (!admission) return null;
+
+  const since = Date.parse(admission.since);
+  return Number.isFinite(since) && since < view.entry.since ? null : admission;
+}
+
 function advanceAdmission(view, ctx) {
   const { entry, member, health } = view;
 
@@ -183,7 +215,7 @@ function advanceAdmission(view, ctx) {
   }
 
   // A second mr-kms event is a boot artefact one restart clears.
-  if (view.node?.lastAdmission?.code === DOUBLE_MR_KMS_CODE) {
+  if (currentAdmission(view)?.code === DOUBLE_MR_KMS_CODE) {
     restartOrQuarantine(view, ctx, REASON.doubleMrKms);
     return;
   }
@@ -232,7 +264,8 @@ function advanceMember(view, ctx) {
 
   if (admitted) {
     if (entry.phase !== PHASE.running) enter(entry, PHASE.running, ctx.now);
-    entry.restarts = 0;
+    // The restart budget spans the whole boot, not one admission: a member that
+    // flaps must reach the quarantine, so only a scale-up start clears it.
     if (view.live > 0) delete entry.idleSince;
     else entry.idleSince ??= ctx.now;
     return;
@@ -246,9 +279,29 @@ function advanceMember(view, ctx) {
   advanceAdmission(view, ctx);
 }
 
+const startable = (views, ctx) =>
+  views.find(
+    (view) =>
+      view.entry.phase === PHASE.stopped &&
+      (view.entry.cooldownUntil ?? 0) <= ctx.now &&
+      bundleStartable(view.member, ctx.now),
+  );
+
+function startMember(view, ctx, state) {
+  ctx.actions.push({
+    type: ACTION.start,
+    nodeId: view.member.nodeId,
+    cvmId: view.member.cvmId,
+  });
+  enter(view.entry, PHASE.starting, ctx.now);
+  // A fresh boot gets a fresh restart budget; nothing else resets it.
+  view.entry.restarts = 0;
+  delete state.saturatedSince;
+}
+
 function scaleUp(views, ctx, state) {
   const running = views.filter(isRunning);
-  const pending = views.some(
+  const pending = views.filter(
     (view) =>
       view.entry.phase === PHASE.starting ||
       view.entry.phase === PHASE.admitWait,
@@ -258,7 +311,21 @@ function scaleUp(views, ctx, state) {
     0,
   );
 
-  if (free > 0 || pending) {
+  // The warm floor comes before saturation. After a quarantine or a cold start
+  // the pool must climb back to MIN_RUNNING without first waiting out a full
+  // debounce of saturation and then a boot. A draining member still serves, so
+  // it counts until it actually stops.
+  const draining = views.filter((view) => view.entry.phase === PHASE.draining);
+  const warm = running.length + pending.length + draining.length;
+  if (warm < ctx.limits.minRunning) {
+    const cold = startable(views, ctx);
+    if (cold) {
+      startMember(cold, ctx, state);
+      return;
+    }
+  }
+
+  if (free > 0 || pending.length > 0) {
     delete state.saturatedSince;
     return;
   }
@@ -271,25 +338,13 @@ function scaleUp(views, ctx, state) {
     return;
   }
 
-  const candidate = views.find(
-    (view) =>
-      view.entry.phase === PHASE.stopped &&
-      (view.entry.cooldownUntil ?? 0) <= ctx.now &&
-      bundleStartable(view.member, ctx.now),
-  );
+  const candidate = startable(views, ctx);
   if (!candidate) {
     ctx.actions.push(alert(REASON.noCandidate));
     return;
   }
 
-  ctx.actions.push({
-    type: ACTION.start,
-    nodeId: candidate.member.nodeId,
-    cvmId: candidate.member.cvmId,
-  });
-  enter(candidate.entry, PHASE.starting, ctx.now);
-  candidate.entry.restarts = 0;
-  delete state.saturatedSince;
+  startMember(candidate, ctx, state);
 }
 
 function scaleDown(views, ctx) {
@@ -464,33 +519,47 @@ async function readHealth(member) {
   }
 }
 
+/** Whether the action reached the world. Only a phala CLI call can report
+ * false: an admit is retried next tick and a drain outlives its request. */
 async function applyAction(action, context) {
   if (action.type === ACTION.alert) {
     log({ level: "warn", ...action });
-    return;
+    return true;
   }
 
   log({ level: "info", dryRun: context.dryRun, ...action });
   if (action.type === ACTION.admit) {
-    if (context.dryRun) return;
+    if (context.dryRun) return true;
     // resume:true is the only path that clears a planned drain.
     await adminPost(context, ADMIT_ROUTE, {
       nodeId: action.nodeId,
       resume: true,
     }).catch((error) => log({ level: "warn", error: String(error) }));
-    return;
+    return true;
   }
 
   if (action.type === ACTION.drain) {
-    if (context.dryRun) return;
+    if (context.dryRun) return true;
     // Teardown may outlast the request; the reply and its timeout are ignored.
     await adminPost(context, DRAIN_ROUTE, { nodeId: action.nodeId }).catch(
       () => undefined,
     );
-    return;
+    return true;
   }
 
-  phala(cvmCommand(action.cvmId, action.type), context.dryRun);
+  return phala(cvmCommand(action.cvmId, action.type), context.dryRun);
+}
+
+/** A CVM command that never ran leaves the fleet as it was, so the phase,
+ * cooldown and debounce this tick committed for that member are fiction.
+ * Restoring them re-issues the same decision on the next tick. */
+export function revertMember(state, previous, nodeId) {
+  const prior = previous.nodes?.[nodeId];
+  if (prior) state.nodes[nodeId] = structuredClone(prior);
+  else delete state.nodes[nodeId];
+
+  if (previous.saturatedSince === undefined) delete state.saturatedSince;
+  else state.saturatedSince = previous.saturatedSince;
 }
 
 function readJson(path, fallback) {
@@ -504,11 +573,61 @@ function readJson(path, fallback) {
 
 function writeState(path, state) {
   mkdirSync(dirname(path), { recursive: true, mode: STATE_DIRECTORY_MODE });
-  const temporary = `${path}.tmp`;
-  writeFileSync(temporary, JSON.stringify(state, null, 2), {
-    mode: STATE_FILE_MODE,
-  });
-  renameSync(temporary, path);
+  // A unique name cannot collide with another writer's temporary, and the
+  // fsync makes the rename publish a complete file rather than an empty one.
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  try {
+    const handle = openSync(temporary, "wx", STATE_FILE_MODE);
+    try {
+      writeSync(handle, JSON.stringify(state, null, 2));
+      fsyncSync(handle);
+    } finally {
+      closeSync(handle);
+    }
+    renameSync(temporary, path);
+  } catch (error) {
+    rmSync(temporary, { force: true });
+    throw error;
+  }
+}
+
+const running = (pid) => {
+  if (!Number.isInteger(pid) || pid < 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the pid exists but belongs to another user.
+    return error.code === "EPERM";
+  }
+};
+
+/** One loop per state file. `wx` is atomic, so two loops cannot both take the
+ * lock; a lock left behind by a crash names a pid that no longer exists. */
+function acquireLock(statePath) {
+  const path = `${statePath}${LOCK_SUFFIX}`;
+  mkdirSync(dirname(path), { recursive: true, mode: STATE_DIRECTORY_MODE });
+
+  let handle;
+  try {
+    handle = openSync(path, "wx", STATE_FILE_MODE);
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    const owner = Number.parseInt(readFileSync(path, "utf8").trim(), 10);
+    if (running(owner))
+      throw new Error(`Pool loop ${owner} already holds ${path}`);
+
+    log({ level: "warn", message: "Clearing a stale pool lock", path, owner });
+    rmSync(path, { force: true });
+    handle = openSync(path, "wx", STATE_FILE_MODE);
+  }
+
+  try {
+    writeSync(handle, `${process.pid}\n`);
+  } finally {
+    closeSync(handle);
+  }
+  process.on("exit", () => rmSync(path, { force: true }));
 }
 
 async function tick(context) {
@@ -522,16 +641,61 @@ async function tick(context) {
     ),
   );
 
+  warnUnknownMembers(context, status);
+
+  const previous = readJson(context.statePath, {});
   const { actions, state } = decidePoolActions({
     now: Date.now(),
     members: context.members,
     status,
     health,
-    state: readJson(context.statePath, {}),
+    state: previous,
   });
 
-  for (const action of actions) await applyAction(action, context);
+  for (const action of actions) {
+    const applied = await applyAction(action, context);
+    if (!applied) revertMember(state, previous, action.nodeId);
+  }
   writeState(context.statePath, state);
+}
+
+const httpsUrl = (value) => {
+  try {
+    return new URL(value).protocol === HTTPS_PROTOCOL;
+  } catch {
+    return false;
+  }
+};
+
+/** pool.json is hand-edited. A typo in cvmId would retarget a stop at another
+ * machine, and publicUrl becomes the base of every health request, so both are
+ * checked before the first tick rather than at the first spawn. */
+function assertMember(member, index, poolPath) {
+  const invalid =
+    !member ||
+    !NODE_ID_PATTERN.test(member.nodeId ?? "") ||
+    !CVM_ID_PATTERN.test(member.cvmId ?? "") ||
+    !httpsUrl(member.publicUrl) ||
+    !Number.isSafeInteger(member.capacity) ||
+    member.capacity < 1;
+  if (invalid)
+    throw new Error(
+      `${poolPath} member ${index} needs a nodeId, cvmId, https publicUrl and capacity`,
+    );
+}
+
+/** A member the controller's signed config does not list can be started but
+ * never admitted, which otherwise looks like a boot that simply never finishes. */
+function warnUnknownMembers(context, status) {
+  if (!status) return;
+
+  const known = new Set(status.nodes.map((node) => node.nodeId));
+  for (const member of context.members) {
+    if (known.has(member.nodeId) || context.warned.has(member.nodeId)) continue;
+
+    context.warned.add(member.nodeId);
+    log({ level: "warn", reason: REASON.unknownMember, nodeId: member.nodeId });
+  }
 }
 
 function loadContext(argv) {
@@ -543,9 +707,11 @@ function loadContext(argv) {
     (Array.isArray(pool) ? undefined : pool.controllerAdminUrl);
   if (!Array.isArray(members) || !adminUrl)
     throw new Error(`${poolPath} must supply controllerAdminUrl and members`);
+  members.forEach((member, index) => assertMember(member, index, poolPath));
 
   return {
     members,
+    warned: new Set(),
     adminUrl,
     adminToken: () => {
       const token = keychainSecret(ADMIN_TOKEN_SERVICE);
@@ -561,6 +727,7 @@ function loadContext(argv) {
 
 async function main() {
   const context = loadContext(process.argv.slice(2));
+  acquireLock(context.statePath);
   log({ level: "info", message: "Pool loop started", dryRun: context.dryRun });
 
   for (;;) {
