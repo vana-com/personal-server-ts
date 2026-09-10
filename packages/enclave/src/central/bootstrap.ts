@@ -33,6 +33,9 @@ interface WorkerConfig {
   capacity: number;
   policy: FleetPeerPolicy;
 }
+/** Warm-pool size. Every member is pre-listed in the signed FLEET_WORKERS_JSON;
+ * the external pool loop only starts and stops those declared machines. */
+const MAX_FLEET_WORKERS = 4;
 const logger = {
   info: (context: object, message: string) =>
     console.error({ level: "info", ...context, message }),
@@ -90,7 +93,7 @@ export async function startFleetCentral(
   ) as WorkerConfig[];
   if (
     !Array.isArray(workers) ||
-    workers.length > 2 ||
+    workers.length > MAX_FLEET_WORKERS ||
     workers.some(
       (w) =>
         !w.policy ||
@@ -100,7 +103,9 @@ export async function startFleetCentral(
         w.capacity < 1,
     )
   )
-    throw new Error("Configure zero to two admitted Moksha workers");
+    throw new Error(
+      `Configure zero to ${MAX_FLEET_WORKERS} admitted Moksha workers`,
+    );
   const info = await client.info();
   if (workers.some((w) => w.policy.identity.appId === info.appId))
     throw new Error("Central and worker KMS app identities must differ");

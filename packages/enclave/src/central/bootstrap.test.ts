@@ -511,3 +511,134 @@ it("keeps imported approved owners paused on partial enrollment and reconciles a
     await rm(path, { recursive: true, force: true });
   }
 });
+
+const CONTROLLER_APP_ID = "1".repeat(40);
+const CONTROLLER_NODE_ID = "controller";
+const ADMIN_TOKEN = "a".repeat(32);
+const GATEWAY_TOKEN = "g".repeat(32);
+const REVERSE_TOKEN = "r".repeat(32);
+const WARM_POOL_CAP = 4;
+
+/** A directory entry whose HTTPS peer is deliberately unreachable in unit tests. */
+function workerEntry(index: number, capacity = 1) {
+  const hex = index.toString(16);
+  return {
+    url: `https://worker-${index}.invalid`,
+    capacity,
+    policy: {
+      identity: {
+        role: "worker" as const,
+        nodeId: `worker-${index}`,
+        appId: hex.repeat(40),
+        instanceId: hex.repeat(40),
+        composeHash: hex.repeat(64),
+      },
+      mrTd: "0".repeat(96),
+      rtmrs: ["0", "1", "2", "3"].map((c) => c.repeat(96)) as [
+        string,
+        string,
+        string,
+        string,
+      ],
+    },
+  };
+}
+
+async function controllerEnv(
+  path: string,
+  workers: ReturnType<typeof workerEntry>[],
+): Promise<Record<string, string>> {
+  return {
+    CHAIN_ID: "14800",
+    CONTROLLER_TERM: "1",
+    NODE_ID: CONTROLLER_NODE_ID,
+    GATEWAY_URL: "https://gateway.invalid",
+    FLEET_STATE_PATH: join(path, "placements.json"),
+    FLEET_WORKERS_JSON: JSON.stringify(workers),
+    FLEET_GATEWAY_TOKEN: GATEWAY_TOKEN,
+    FLEET_CONTROLLER_ADMIN_TOKEN: ADMIN_TOKEN,
+    FLEET_CONTROLLER_GATEWAY_TOKEN: REVERSE_TOKEN,
+    FLEET_CONTROL_HOST: "127.0.0.1",
+    FLEET_ADMIN_HOST: "127.0.0.1",
+    FLEET_PEER_HOST: "127.0.0.1",
+    FLEET_CONTROL_PORT: await freePort(),
+    FLEET_ADMIN_PORT: await freePort(),
+    FLEET_PEER_PORT: await freePort(),
+    MCP_PUBLIC_ORIGIN: "https://mcp-dev.vana.org",
+    MCP_APPROVAL_URL: "https://web.invalid/approve",
+    MCP_STATE_PATH: join(path, "mcp.sealed"),
+    MCP_INGRESS_HOST: "127.0.0.1",
+    MCP_INGRESS_PORT: await freePort(),
+    MCP_REDIRECT_URIS: '["https://claude.ai/api/mcp/auth_callback"]',
+    MCP_MIGRATION_REQUIRED: "0",
+  };
+}
+
+function signedConfig(
+  env: Record<string, string>,
+  info: { appId: string; instanceId: string },
+  keys: ReturnType<typeof generateKeyPairSync<"ed25519">>,
+  expiresAt: string | null = new Date(Date.now() + 60_000).toISOString(),
+): Record<string, string> {
+  const payload: FleetSecurityConfigPayload = {
+    version: 1,
+    purpose: "vana.fleet.security-config",
+    role: "controller",
+    appId: info.appId,
+    instanceId: info.instanceId,
+    nodeId: env.NODE_ID!,
+    issuedAt: new Date().toISOString(),
+    expiresAt,
+    env,
+  };
+  return {
+    FLEET_CONFIG_PUBLIC_KEY: keys.publicKey
+      .export({ type: "spki", format: "der" })
+      .toString("base64"),
+    FLEET_SIGNED_CONFIG:
+      "base64:" +
+      Buffer.from(
+        JSON.stringify({
+          payload,
+          signature: sign(
+            null,
+            canonicalFleetConfigPayload(payload),
+            keys.privateKey,
+          ).toString("base64"),
+        }),
+      ).toString("base64"),
+  };
+}
+
+it("accepts a full warm pool and refuses one member beyond the cap", async () => {
+  const path = await mkdtemp(join(tmpdir(), "central-pool-cap-"));
+  const dstack = createFakeDstackClient({ appId: CONTROLLER_APP_ID });
+  const info = await dstack.info();
+  const keys = generateKeyPairSync("ed25519");
+  const members = Array.from({ length: WARM_POOL_CAP + 1 }, (_, index) =>
+    workerEntry(index + 2),
+  );
+  const unreachable = vi.fn<typeof fetch>(async () => {
+    throw new Error("Worker is stopped");
+  });
+  let runtime: Awaited<ReturnType<typeof startFleetCentral>> | undefined;
+  try {
+    const full = await controllerEnv(path, members.slice(0, WARM_POOL_CAP));
+    runtime = await startFleetCentral(
+      signedConfig(full, info, keys),
+      dstack,
+      unreachable,
+    );
+    expect(runtime.controller.paused()).toBe(true);
+
+    const oversized = await controllerEnv(path, members);
+    await expect(
+      startFleetCentral(signedConfig(oversized, info, keys), dstack, () => {
+        throw new Error("Must not reach a worker");
+      }),
+    ).rejects.toThrow(`Configure zero to ${WARM_POOL_CAP}`);
+  } finally {
+    await runtime?.close();
+    await rm(path, { recursive: true, force: true });
+  }
+});
