@@ -27,6 +27,8 @@ const DROPPED_CAPABILITIES = "ALL";
 const NO_NEW_PRIVILEGES = "no-new-privileges:true";
 const DATA_TMPFS_PREFIX = "/data:rw,noexec,nosuid,nodev,size=";
 const DATA_TMPFS_SUFFIX = ",uid=1000,gid=1000,mode=0700";
+const DATA_SIZE_PATTERN = /^[1-9][0-9]*(?:\.[0-9]+)?[kmgt]?$/i;
+const INVALID_DATA_SIZE = "dataSize must be a positive Docker memory value";
 /** Denser pools trade this per-sandbox scratch tmpfs against agent headroom. */
 const dataTmpfs = (size: string): string =>
   `${DATA_TMPFS_PREFIX}${size}${DATA_TMPFS_SUFFIX}`;
@@ -171,6 +173,10 @@ export function createDockerRuntime(
   const cpus = options.cpus ?? DEFAULT_SANDBOX_CPUS;
   const pidsLimit = options.pidsLimit ?? DEFAULT_SANDBOX_PIDS_LIMIT;
   const dataSize = options.dataSize ?? DEFAULT_SANDBOX_DATA_SIZE;
+  // The size lands in the middle of the tmpfs option list, where a trailing
+  // `,exec` would override the leading `noexec`. Every caller is checked here,
+  // not only the one that reads the value out of the environment.
+  if (!DATA_SIZE_PATTERN.test(dataSize)) throw new Error(INVALID_DATA_SIZE);
 
   return {
     async reconcile(): Promise<void> {

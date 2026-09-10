@@ -226,6 +226,12 @@ describe("docker sandbox runtime", () => {
     );
   });
 
+  it("refuses a data size that would append its own mount options", () => {
+    expect(() =>
+      createDockerRuntime({ docker: scriptedDocker(), dataSize: "256m,exec" }),
+    ).toThrow("dataSize");
+  });
+
   it("passes the result byte budget to the sandbox environment", async () => {
     const docker = scriptedDocker();
     const runtime = createDockerRuntime({ docker, health: async () => true });
