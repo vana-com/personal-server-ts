@@ -228,6 +228,47 @@ describe("GatewayClient", () => {
     ).rejects.toBeInstanceOf(LeaseLostError);
   });
 
+  it("posts signed access records with the node bearer", async () => {
+    const seen: { url?: string; auth?: string; body?: string } = {};
+    const client = createGatewayClient({
+      baseUrl: origin,
+      nodeId: NODE_ID,
+      nodeSecret: NODE_SECRET,
+      fetch: async (input, init) => {
+        seen.url = String(input);
+        seen.auth = (init?.headers as Record<string, string>).Authorization;
+        seen.body = String(init?.body);
+        return new Response(null, { status: 202 });
+      },
+    });
+    const records = [
+      {
+        payload: {
+          action: "read",
+          chainId: 14_800,
+          epoch: 1,
+          grantId: "grant-1",
+          granteeAddress: `0x${"11".repeat(20)}`,
+          logId: "log-1",
+          nodeId: NODE_ID,
+          occurredAt: "2026-09-09T00:00:00.000Z",
+          outcome: "served",
+          scope: "instagram.profile",
+          source: "mcp",
+          userPsId: `0x${"22".repeat(32)}`,
+        },
+        signature: `0x${"33".repeat(65)}`,
+      },
+    ] as Parameters<typeof client.postAccessRecords>[0]["records"];
+
+    await expect(
+      client.postAccessRecords({ records }),
+    ).resolves.toBeUndefined();
+    expect(seen.url).toBe(`${origin}/v1/access-records`);
+    expect(seen.auth).toBe(`Bearer ${NODE_SECRET}`);
+    expect(JSON.parse(seen.body!)).toEqual({ records });
+  });
+
   it("maps a forbidden node request to NodeNotAdmittedError", async () => {
     responder = () => 403;
     const client = createGatewayClient({

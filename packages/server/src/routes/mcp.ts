@@ -292,6 +292,11 @@ export function executeMcpConnectionRequest(
       dataApiDeps: buildDataApiDeps(deps),
     }),
     activityRecorder: deps.activityRecorder,
+    // Denied tool calls are recorded by the wrapper, not the read path.
+    reporterDeps: {
+      readFulfillmentReporter: deps.readFulfillmentReporter,
+      logger: deps.logger,
+    },
   });
 }
 

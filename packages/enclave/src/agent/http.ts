@@ -12,7 +12,15 @@ import type { DstackClient } from "../dstack/client.js";
 import { userPsId } from "../identity/paths.js";
 import { deriveEnclaveAccount } from "../identity/wallet.js";
 import { normalizeJobId } from "../jobs/types.js";
-import type { SandboxStatus } from "../sandbox/registry.js";
+import type { SandboxIdentity, SandboxStatus } from "../sandbox/registry.js";
+import {
+  ACCESS_RECORD_ACTION,
+  buildAccessRecord,
+  canonicalJson,
+  MAX_ACCESS_RECORDS,
+  type AccessRecordInput,
+  type SignedAccessRecord,
+} from "./access-records.js";
 import { buildEvidence } from "./evidence.js";
 import { AgentError } from "./errors.js";
 import { readHealth } from "./health.js";
@@ -35,6 +43,7 @@ const IDENTITY_ROUTE = "/agent/v1/identity";
 const SEAL_ROUTE = "/agent/v1/secrets/seal";
 const DRAIN_ROUTE = "/agent/v1/drain";
 const RESULT_SIGNING_ROUTE = "/agent/v1/job-results/sign";
+const ACCESS_RECORDS_ROUTE = "/agent/v1/access-records";
 const SANDBOXES_ROUTE = "/agent/v1/sandboxes";
 const PREWARM_ROUTE = "/agent/v1/sandboxes/prewarm";
 const GET = "GET";
@@ -56,6 +65,10 @@ const INTERNAL_MESSAGE = "internal server error";
 const UNKNOWN_ERROR = "unknown";
 const BODY_HASH_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const RESULT_SIGNING_MESSAGE = "Signed job result upload";
+const ACCESS_RECORDS_MESSAGE = "Signed access records";
+const ACCESS_RECORDS_REFUSED = "access records refused";
+const OUTCOMES = new Set(["served", "denied"]);
+const SOURCES = new Set(["mcp", "api"]);
 const DEFAULT_LOG_TAIL = 100;
 const MAX_LOG_TAIL = 500;
 const TEXT_CONTENT_TYPE = "text/plain; charset=utf-8";
@@ -80,6 +93,8 @@ export interface AgentJobsControl {
   listSandboxes(): Promise<SandboxStatus[]>;
   sandboxLogs(containerId: string, tail: number): Promise<string | undefined>;
   lookupSandboxJob(accessToken: string, jobId: string): SandboxJobLookup;
+  lookupSandbox(accessToken: string): SandboxIdentity | null;
+  postAccessRecords(records: SignedAccessRecord[]): Promise<void>;
   prewarm(body: PrewarmRequestBody): void;
 }
 
@@ -108,6 +123,11 @@ async function handleRequest(
 ): Promise<void> {
   if (request.method === POST && path === RESULT_SIGNING_ROUTE) {
     await handleResultSigning(options, request, response);
+    return;
+  }
+
+  if (request.method === POST && path === ACCESS_RECORDS_ROUTE) {
+    await handleAccessRecords(options, request, response);
     return;
   }
 
@@ -330,6 +350,76 @@ async function handleResultSigning(
   }
 }
 
+/**
+ * Sign and relay one batch of access records. Authenticated by the sandbox's
+ * own access token, like result signing — the sandbox PS holds no agent
+ * secret. Records the sandbox cannot vouch for (identity, node) are stamped
+ * here, never taken from the body.
+ */
+async function handleAccessRecords(
+  options: AgentServerOptions,
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> {
+  const token = bearerToken(request);
+  if (!token || !options.jobs) {
+    sendError(response, UNAUTHORIZED, "UNAUTHORIZED", UNAUTHORIZED_MESSAGE);
+    return;
+  }
+
+  try {
+    const inputs = accessRecordsBody(await readJson(request));
+    const identity = options.jobs.lookupSandbox(token);
+    if (!identity) {
+      sendError(response, UNAUTHORIZED, "UNAUTHORIZED", UNAUTHORIZED_MESSAGE);
+      return;
+    }
+
+    const account = await deriveEnclaveAccount(
+      options.client,
+      identity.userPsId,
+      identity.epoch,
+    );
+    const signed: SignedAccessRecord[] = [];
+    for (const input of inputs) {
+      const record = buildAccessRecord(input, identity, options.jobs.nodeId);
+      const signature = await account.signMessage(canonicalJson(record));
+      signed.push({ payload: record, signature });
+    }
+
+    await options.jobs.postAccessRecords(signed);
+
+    console.error(
+      { count: signed.length, userPsId: identity.userPsId },
+      ACCESS_RECORDS_MESSAGE,
+    );
+    sendJson(response, ACCEPTED, { accepted: signed.length });
+  } catch (error) {
+    if (error instanceof BodyTooLarge) {
+      sendError(
+        response,
+        BODY_TOO_LARGE,
+        "BODY_TOO_LARGE",
+        BODY_TOO_LARGE_MESSAGE,
+      );
+      return;
+    }
+    if (error instanceof SyntaxError || error instanceof BadRequest) {
+      sendError(response, BAD_REQUEST, "BAD_REQUEST", BAD_REQUEST_MESSAGE);
+      return;
+    }
+
+    console.error({
+      path: ACCESS_RECORDS_ROUTE,
+      error:
+        error instanceof Error
+          ? `${error.name}: ${error.message}`
+          : UNKNOWN_ERROR,
+    });
+    sendError(response, INTERNAL_ERROR, "INTERNAL", ACCESS_RECORDS_REFUSED);
+  }
+}
+
 function isAuthorized(request: IncomingMessage, secret: string): boolean {
   const token = bearerToken(request);
   if (token === undefined) {
@@ -474,6 +564,63 @@ function resultSigningBody(value: unknown): ResultSigningRequestBody {
     byteLength: body.byteLength,
     bodyHash: body.bodyHash,
   };
+}
+
+export function accessRecordsBody(value: unknown): AccessRecordInput[] {
+  const body = record(value);
+  if (
+    !Array.isArray(body.records) ||
+    body.records.length === 0 ||
+    body.records.length > MAX_ACCESS_RECORDS
+  ) {
+    throw new BadRequest();
+  }
+
+  return body.records.map(accessRecord);
+}
+
+function accessRecord(value: unknown): AccessRecordInput {
+  const body = record(value);
+  const denied = body.outcome === "denied";
+  if (
+    body.action !== ACCESS_RECORD_ACTION ||
+    !isPositiveInteger(body.chainId) ||
+    !isNonEmptyString(body.grantId) ||
+    !isAddressValue(body.granteeAddress) ||
+    !isNonEmptyString(body.logId) ||
+    !isIsoTimestamp(body.occurredAt) ||
+    !OUTCOMES.has(body.outcome as string) ||
+    !isNonEmptyString(body.scope) ||
+    !SOURCES.has(body.source as string) ||
+    (body.tool !== undefined && !isNonEmptyString(body.tool)) ||
+    (denied
+      ? !isNonEmptyString(body.denyReason)
+      : body.denyReason !== undefined)
+  ) {
+    throw new BadRequest();
+  }
+
+  return {
+    action: ACCESS_RECORD_ACTION,
+    chainId: body.chainId,
+    ...(denied ? { denyReason: body.denyReason as string } : {}),
+    grantId: body.grantId as string,
+    granteeAddress: body.granteeAddress,
+    logId: body.logId as string,
+    occurredAt: body.occurredAt as string,
+    outcome: body.outcome as AccessRecordInput["outcome"],
+    scope: body.scope as string,
+    source: body.source as AccessRecordInput["source"],
+    ...(body.tool === undefined ? {} : { tool: body.tool as string }),
+  };
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  return isNonEmptyString(value) && !Number.isNaN(Date.parse(value));
 }
 
 function record(value: unknown): Record<string, unknown> {

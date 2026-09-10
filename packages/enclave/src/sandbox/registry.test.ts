@@ -250,6 +250,20 @@ describe("sandbox registry", () => {
     });
   });
 
+  it("resolves a sandbox identity from its access token without a job", async () => {
+    const registry = createSandboxRegistry({ runtime: memoryRuntime() });
+    const lease = await registry.acquire("owner:1", buildSpec);
+
+    expect(registry.lookupSandbox(lease.accessToken)).toEqual({
+      userPsId: USER_PS_ID,
+      epoch: 1,
+    });
+    expect(registry.lookupSandbox("wrong-token")).toBeNull();
+
+    await registry.evict("owner:1");
+    expect(registry.lookupSandbox(lease.accessToken)).toBeNull();
+  });
+
   it("tears an idle sandbox down after its TTL", async () => {
     const runtime = memoryRuntime();
     const clock = new FakeClock();
