@@ -29,7 +29,7 @@ load_images_env() {
 
   [[ -f $images_env ]] || return 0
   while IFS= read -r line || [[ -n $line ]]; do
-    if [[ $line == AGENT_IMAGE=* || $line == CONTROLLER_IMAGE=* || $line == RUNTIME_IMAGE=* ]]; then
+    if [[ $line == AGENT_IMAGE=* || $line == RUNTIME_IMAGE=* ]]; then
       record_images_env_digest "$line"
     elif [[ $line == PS_IMAGE=* ]]; then
       if [[ $line =~ ^PS_IMAGE=[A-Za-z0-9._/:-]+@sha256:[0-9a-f]{64}$ ]]; then
@@ -88,12 +88,27 @@ assert_built_image_digests() {
   assert_image_matches_build DIND_IMAGE IMAGES_ENV_RUNTIME_IMAGE || return 1
 }
 
+# Repository of an image reference, without its tag or digest, so that
+# `repo:latest` still matches the built `repo@sha256:…`. A registry port
+# (`host:5000/repo`) lives before the last `/`, so only the final path segment
+# can carry a tag.
+image_repo() {
+  local ref=${1%@*}
+  local last=${ref##*/}
+
+  [[ $last == *:* ]] || {
+    printf '%s' "$ref"
+    return 0
+  }
+  printf '%s' "${ref%:*}"
+}
+
 assert_image_matches_build() {
   local chosen=${!1:-}
   local built=${!2:-}
 
   [[ -n $built ]] || return 0
-  [[ ${chosen%@*} == "${built%@*}" ]] || return 0
+  [[ $(image_repo "$chosen") == "$(image_repo "$built")" ]] || return 0
   if [[ $chosen != "$built" ]]; then
     echo "$1 '$chosen' must match the digest recorded in images.env: '$built'." >&2
     return 1

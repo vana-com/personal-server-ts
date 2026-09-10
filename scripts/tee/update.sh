@@ -98,7 +98,6 @@ if [[ ${compose##*/} == docker-compose.enclave.inline.yml ]]; then
   fi
 else
   load_images_env "$repo_root/deploy/dstack/images.env"
-  assert_built_image_digests
   : "${PS_IMAGE:?PS_IMAGE must be set in the environment}"
   if [[ ! $PS_IMAGE =~ ^.+@sha256:[[:xdigit:]]{64}$ ]]; then
     echo "PS_IMAGE must be an image digest such as vanaorg/personal-server@sha256:<64 hex characters>" >&2
@@ -110,6 +109,7 @@ fi
 : "${ENCLAVE_AGENT_SECRET:?ENCLAVE_AGENT_SECRET must be set in the environment}"
 : "${GATEWAY_URL:?GATEWAY_URL must be set in the environment}"
 validate_image_digests
+assert_built_image_digests
 command -v openssl >/dev/null || { echo "openssl is required" >&2; exit 1; }
 command -v phala >/dev/null || { echo "phala CLI is required" >&2; exit 1; }
 command -v node >/dev/null || { echo "Node.js is required" >&2; exit 1; }

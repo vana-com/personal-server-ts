@@ -75,12 +75,12 @@ if [[ -n $secret_keychain ]]; then
 fi
 
 load_images_env "$repo_root/deploy/dstack/images.env"
-assert_built_image_digests
 : "${ENCLAVE_AGENT_SECRET:?ENCLAVE_AGENT_SECRET must be set in the environment}"
 : "${GATEWAY_URL:?GATEWAY_URL must be set in the environment}"
 : "${GIT_REF:?GIT_REF must be set in the environment}"
 : "${PS_IMAGE:?PS_IMAGE must be set in the environment}"
 validate_image_digests
+assert_built_image_digests
 if [[ ! $PS_IMAGE =~ ^.+@sha256:[[:xdigit:]]{64}$ ]]; then
   echo "PS_IMAGE must be an image digest such as vanaorg/personal-server@sha256:<64 hex characters>" >&2
   exit 1
