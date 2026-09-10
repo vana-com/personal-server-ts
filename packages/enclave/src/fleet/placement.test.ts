@@ -121,14 +121,268 @@ it("expires an ambiguous failed renewal instead of extending the dead worker for
   await controller.ensure(owner, []);
   now = 11000;
   await controller.renew();
+
+  // A blocked renewal whose lease is still live may still be executing: the
+  // row keeps its slot and the sandbox is not released underneath it. The
+  // second consecutive failure is what blocks it; the first only spends grace.
   now = 21000;
   await controller.renew();
-  now = 41001;
+  expect(controller.snapshot()[0]?.assignment).toMatchObject({ nodeId: "a" });
+  expect(controller.nodeStatus()[0]).toMatchObject({ nodeId: "a", live: 1 });
+  expect(a.release).not.toHaveBeenCalled();
+
+  // Once it expires the row is a corpse: reaped, not skipped forever.
+  now = 51001;
+  await controller.renew();
+  expect(controller.snapshot()[0]?.assignment).toBeNull();
+  expect(a.release).toHaveBeenCalledTimes(1);
+  expect(a.release).toHaveBeenCalledWith(
+    expect.objectContaining({
+      nodeId: "a",
+      nodeIncarnation: "a1",
+      generation: 1,
+    }),
+  );
+  expect(controller.nodeStatus()[0]).toMatchObject({ nodeId: "a", live: 0 });
+  expect(await controller.prune(["b"])).toEqual({
+    removed: ["a"],
+    retained: [],
+  });
+
   expect(await controller.ensure(owner, [])).toMatchObject({
     nodeId: "b",
     generation: 2,
   });
-  expect(a.renew).toHaveBeenCalledTimes(1);
+  expect(a.renew).toHaveBeenCalledTimes(2);
+});
+
+it("reaps an expired placement even when the worker refuses the release", async () => {
+  const path = await mkdtemp(join(tmpdir(), "fleet-reap-"));
+  paths.push(path);
+  let now = 1000;
+  const worker: FleetWorkerPort = {
+    activity: vi.fn(async (assignment) => ({
+      assignment,
+      present: true,
+      busy: false,
+    })),
+    prepare: vi.fn(async () => []),
+    readiness: vi.fn(async () => []),
+    renew: vi.fn(async () => {
+      throw new Error("partition");
+    }),
+    execute: vi.fn(),
+    release: vi.fn(async () => {
+      throw new Error("unreachable");
+    }),
+  };
+  const controller = await openFleetController({
+    path: join(path, "state.json"),
+    enroll: vi.fn(),
+    publish: vi.fn(),
+    release: vi.fn(),
+    now: () => now,
+  });
+  await controller.admit({
+    nodeId: "a",
+    nodeIncarnation: "a1",
+    capacity: 1,
+    worker,
+  });
+  const owner = { chainId: 14800, userPsId: "owner", identityEpoch: 1 };
+  await controller.ensure(owner, []);
+  now = 11000;
+  await controller.renew();
+
+  now = 41001;
+  await expect(controller.renew()).resolves.toBeUndefined();
+
+  expect(controller.snapshot()[0]?.assignment).toBeNull();
+  expect(controller.nodeStatus()[0]).toMatchObject({ live: 0 });
+});
+
+it("keeps an owner in place through a single stalled renewal", async () => {
+  const path = await mkdtemp(join(tmpdir(), "fleet-grace-"));
+  paths.push(path);
+  let now = 1000;
+  let stalls = 1;
+  const worker: FleetWorkerPort = {
+    activity: vi.fn(async (assignment) => ({
+      assignment,
+      present: true,
+      busy: false,
+    })),
+    prepare: vi.fn(async () => []),
+    readiness: vi.fn(async () => []),
+    renew: vi.fn(async () => {
+      if (stalls-- > 0) throw new Error("Peer RPC deadline expired");
+    }),
+    execute: vi.fn(),
+    release: vi.fn(),
+  };
+  const events: string[] = [];
+  const controller = await openFleetController({
+    path: join(path, "state.json"),
+    enroll: vi.fn(),
+    publish: vi.fn(),
+    release: vi.fn(),
+    now: () => now,
+    event: (event) => {
+      events.push(event);
+    },
+  });
+  await controller.admit({
+    nodeId: "a",
+    nodeIncarnation: "a1",
+    capacity: 1,
+    worker,
+  });
+  const owner = { chainId: 14800, userPsId: "owner", identityEpoch: 1 };
+  await controller.ensure(owner, []);
+
+  // A controller-side stall trips one tick. The member keeps its slot, the row
+  // keeps its generation, and nothing is latched.
+  now = 11000;
+  await controller.renew();
+  expect(controller.nodeStatus()[0]).toMatchObject({
+    nodeId: "a",
+    unavailable: false,
+    live: 1,
+  });
+  expect(controller.snapshot()[0]).toMatchObject({
+    generation: 1,
+    renewalBlocked: false,
+  });
+  expect(events).toContain("placement_renewal_deferred");
+  expect(events).not.toContain("placement_renewal_failed");
+
+  now = 21000;
+  await controller.renew();
+  expect(controller.snapshot()[0]?.assignment).toMatchObject({
+    generation: 1,
+    leaseExpiresAt: new Date(51000).toISOString(),
+  });
+
+  // The success ended the streak, so a later isolated stall spends grace again
+  // instead of landing on an exhausted counter.
+  stalls = 1;
+  now = 31000;
+  await controller.renew();
+  expect(controller.nodeStatus()[0]).toMatchObject({
+    unavailable: false,
+    live: 1,
+  });
+  expect(controller.snapshot()[0]).toMatchObject({
+    generation: 1,
+    renewalBlocked: false,
+  });
+});
+
+it("demotes on the first renewal an attestation refusal rejects", async () => {
+  const path = await mkdtemp(join(tmpdir(), "fleet-terminal-"));
+  paths.push(path);
+  let now = 1000;
+  const worker: FleetWorkerPort = {
+    activity: vi.fn(async (assignment) => ({
+      assignment,
+      present: true,
+      busy: false,
+    })),
+    prepare: vi.fn(async () => []),
+    readiness: vi.fn(async () => []),
+    renew: vi.fn(async () => {
+      throw new Error("Peer measurements rejected");
+    }),
+    execute: vi.fn(),
+    release: vi.fn(),
+  };
+  const controller = await openFleetController({
+    path: join(path, "state.json"),
+    enroll: vi.fn(),
+    publish: vi.fn(),
+    release: vi.fn(),
+    now: () => now,
+  });
+  await controller.admit({
+    nodeId: "a",
+    nodeIncarnation: "a1",
+    capacity: 1,
+    worker,
+  });
+  const owner = { chainId: 14800, userPsId: "owner", identityEpoch: 1 };
+  await controller.ensure(owner, []);
+
+  // The grace covers stalls, never a verdict on the peer itself.
+  now = 11000;
+  await controller.renew();
+  expect(controller.nodeStatus()[0]).toMatchObject({ unavailable: true });
+  expect(controller.snapshot()[0]).toMatchObject({ renewalBlocked: true });
+  expect(worker.renew).toHaveBeenCalledTimes(1);
+
+  now = 41001;
+  await controller.renew();
+  expect(controller.snapshot()[0]?.assignment).toBeNull();
+  expect(controller.nodeStatus()[0]).toMatchObject({ live: 0 });
+});
+
+it("releases a renewal block once the member answers again", async () => {
+  const path = await mkdtemp(join(tmpdir(), "fleet-unlatch-"));
+  paths.push(path);
+  let now = 1000;
+  let stalls = 2;
+  const worker: FleetWorkerPort = {
+    activity: vi.fn(async (assignment) => ({
+      assignment,
+      present: true,
+      busy: false,
+    })),
+    prepare: vi.fn(async () => []),
+    readiness: vi.fn(async () => []),
+    renew: vi.fn(async () => {
+      if (stalls-- > 0) throw new Error("Peer RPC deadline expired");
+    }),
+    execute: vi.fn(),
+    release: vi.fn(),
+  };
+  const controller = await openFleetController({
+    path: join(path, "state.json"),
+    enroll: vi.fn(),
+    publish: vi.fn(),
+    release: vi.fn(),
+    now: () => now,
+  });
+  const member = {
+    nodeId: "a",
+    nodeIncarnation: "a1",
+    capacity: 1,
+    worker,
+  };
+  await controller.admit(member);
+  const owner = { chainId: 14800, userPsId: "owner", identityEpoch: 1 };
+  await controller.ensure(owner, []);
+
+  now = 11000;
+  await controller.renew();
+  now = 21000;
+  await controller.renew();
+  expect(controller.nodeStatus()[0]).toMatchObject({ unavailable: true });
+  expect(controller.snapshot()[0]).toMatchObject({ renewalBlocked: true });
+
+  // The warm-pool loop re-admits the member while the lease is still live. The
+  // block must lift with it, or the lease lapses and every owner is evicted.
+  now = 25000;
+  await controller.admit(member);
+  now = 31000;
+  await controller.renew();
+  expect(controller.nodeStatus()[0]).toMatchObject({
+    unavailable: false,
+    live: 1,
+  });
+  expect(controller.snapshot()[0]).toMatchObject({
+    generation: 1,
+    renewalBlocked: false,
+  });
+  expect(await controller.ensure(owner, [])).toMatchObject({ generation: 1 });
 });
 
 it("renewal during slow hydration preserves the ready state and latest lease", async () => {
@@ -378,6 +632,7 @@ it("declares a stopped pool member as visible, unselectable and drainable", asyn
       capacity: 2,
       draining: false,
       unavailable: true,
+      live: 0,
     },
   ]);
   await expect(controller.ensure(owner, [])).rejects.toThrow(
