@@ -21,9 +21,15 @@ import type { McpDataReadClient } from "./read-client.js";
 import {
   MAX_MCP_TOOL_TIMEOUT_MS,
   MCP_TOOLS,
+  resolveGrantForScope,
   type McpToolContext,
   type McpToolResultContent,
 } from "./tools.js";
+import {
+  READ_FULFILLMENT_NONE,
+  reportPersonalServerReadDenial,
+  type PersonalServerReadReporterDeps,
+} from "../api/index.js";
 import type { McpActivityRecorder, McpActivityStatus } from "./activity.js";
 import {
   RAW_SCOPE_RESOURCE_TEMPLATES,
@@ -34,6 +40,8 @@ export interface HandleMcpRequestOptions {
   connection: McpConnectionRecord;
   readClient: McpDataReadClient;
   activityRecorder?: McpActivityRecorder;
+  /** Emits one access record per denied data tool call; see reportToolDenial. */
+  reporterDeps?: PersonalServerReadReporterDeps;
   serverName?: string;
   serverVersion?: string;
 }
@@ -119,6 +127,96 @@ function buildActivityStartParams(
     }
   }
   return params;
+}
+
+/**
+ * Tools that reach the owner's data. Only these produce access records — the
+ * discovery tools (`list_granted_*`, `request_scope_access`) touch none.
+ */
+const DATA_TOOLS = new Set([
+  "get_scope_file",
+  "list_scope_blocks",
+  "read_scope",
+  "search_personal_context",
+]);
+
+/**
+ * Tool error codes that mean "the read was refused", as opposed to a failure
+ * (timeout, storage error). Only these are worth an access record: they are
+ * decisions about the grantee's access, not incidents.
+ */
+const DENY_CODES = new Set([
+  "payment_required",
+  "scope_deleted",
+  "scope_not_granted",
+  "unauthorized",
+]);
+
+const PAYMENT_REQUIRED_CODE = "payment_required";
+
+/**
+ * Extract the deny code from a tool result, or undefined when the call was
+ * served or failed for a non-deny reason. `read_scope` signals a chargeable
+ * scope with a top-level `payment_required: true` rather than an error code.
+ */
+function denyCode(result: {
+  content: McpToolResultContent[];
+  isError?: boolean;
+}): string | undefined {
+  if (!result.isError) return undefined;
+
+  const first = result.content[0];
+  if (first?.type !== "text") return undefined;
+
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(first.text) as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+
+  if (typeof body.error === "string" && DENY_CODES.has(body.error)) {
+    return body.error;
+  }
+
+  return body[PAYMENT_REQUIRED_CODE] === true
+    ? PAYMENT_REQUIRED_CODE
+    : undefined;
+}
+
+/**
+ * One access record per denied data tool call. Fire-and-forget by contract:
+ * the tool result is already computed and is returned regardless.
+ */
+function reportToolDenial(
+  options: HandleMcpRequestOptions,
+  tool: string,
+  args: Record<string, unknown>,
+  result: { content: McpToolResultContent[]; isError?: boolean },
+): void {
+  if (!options.reporterDeps || !DATA_TOOLS.has(tool)) return;
+
+  const reason = denyCode(result);
+  if (!reason) return;
+
+  // The denied scope, if the call named one; a multi-scope search records the
+  // first, since the owner's decision is one record per tool call.
+  const scope =
+    buildActivityStartParams(tool, args).scopes?.[0] ?? READ_FULFILLMENT_NONE;
+
+  reportPersonalServerReadDenial(options.reporterDeps, {
+    builder: options.connection.granteeAddress,
+    denyReason: reason,
+    grantId:
+      resolveGrantForScope(options.connection, scope)?.grantId ??
+      READ_FULFILLMENT_NONE,
+    logId: crypto.randomUUID(),
+    outcome: "denied",
+    scope,
+    servedAt: new Date().toISOString(),
+    source: "mcp",
+    tool,
+  });
 }
 
 function extractActivityFinishParams(
@@ -304,6 +402,7 @@ export function createMcpServerForConnection(
             tool.name,
             timeoutMs,
           );
+          reportToolDenial(options, tool.name, args, result);
           if (activityId && recorder) {
             const handlerDurationMs = Math.round(
               performance.now() - handlerStartedAt,

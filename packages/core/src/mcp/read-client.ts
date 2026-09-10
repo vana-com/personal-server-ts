@@ -729,8 +729,10 @@ export function createMcpDataReadClient(
             grantId: authResult.grantId,
             ipAddress,
             logId,
+            outcome: "served",
             scope,
             servedAt: timestamp,
+            source: "mcp",
             userAgent,
           });
         }

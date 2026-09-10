@@ -150,19 +150,45 @@ export interface PersonalServerWriteSessionResult {
   releaseProof?: () => Promise<void>;
 }
 
+/** A read the server actually served, or one it refused. */
+export type PersonalServerReadOutcome = "served" | "denied";
+
+/** Which surface the read came in on. */
+export type PersonalServerReadSource = "mcp" | "api";
+
+/**
+ * Stand-in for a grant/grantee that does not exist on a denial — a scope that
+ * no grant covers has no grant id and no builder to attribute the read to.
+ */
+export const READ_FULFILLMENT_NONE = "none";
+
 export interface PersonalServerReadFulfillment {
+  /** Grantee address, or `READ_FULFILLMENT_NONE` on a denial. */
   builder: string;
+  /** Deny code (e.g. `scope_not_granted`); only set when outcome is denied. */
+  denyReason?: string;
   fileId?: string;
+  /** Grant id, or `READ_FULFILLMENT_NONE` on a denial. */
   grantId: string;
-  ipAddress: string;
+  /** Absent on surfaces that carry no request metadata (MCP tool calls). */
+  ipAddress?: string;
   logId: string;
+  outcome: PersonalServerReadOutcome;
   scope: string;
   servedAt: string;
-  userAgent: string;
+  source: PersonalServerReadSource;
+  /** MCP tool name; absent on the plain HTTP read path. */
+  tool?: string;
+  userAgent?: string;
 }
 
 export interface PersonalServerReadFulfillmentReporter {
   report(event: PersonalServerReadFulfillment): Promise<void>;
+  /**
+   * Optional: reporters that only settle served reads (relay-gated Lite) can
+   * omit it and denials are simply not recorded.
+   */
+  reportDenied?(event: PersonalServerReadFulfillment): Promise<void>;
 }
 
 export interface PersonalServerApiAuthPort {
@@ -863,8 +889,14 @@ function shouldReportReadFulfillment(grantId: string): boolean {
   );
 }
 
+/** Everything the fulfillment reporters need; see the MCP tool wrapper. */
+export type PersonalServerReadReporterDeps = Pick<
+  PersonalServerDataApiDeps,
+  "logger" | "readFulfillmentReporter"
+>;
+
 function warnReadFulfillmentReporterFailed(
-  deps: PersonalServerDataApiDeps,
+  deps: PersonalServerReadReporterDeps,
   event: PersonalServerReadFulfillment,
   err: unknown,
 ): void {
@@ -881,18 +913,38 @@ function warnReadFulfillmentReporterFailed(
 }
 
 export function reportPersonalServerReadFulfillment(
-  deps: PersonalServerDataApiDeps,
+  deps: PersonalServerReadReporterDeps,
   event: PersonalServerReadFulfillment,
 ): void {
-  if (
-    !deps.readFulfillmentReporter ||
-    !shouldReportReadFulfillment(event.grantId)
-  ) {
+  const reporter = deps.readFulfillmentReporter;
+  if (!reporter || !shouldReportReadFulfillment(event.grantId)) {
     return;
   }
+  fireReadReport(deps, event, reporter.report.bind(reporter));
+}
+
+/**
+ * Denials mirror fulfillments but skip the grant filter: a refused read has no
+ * grant to filter on, and the record is what proves the refusal happened.
+ */
+export function reportPersonalServerReadDenial(
+  deps: PersonalServerReadReporterDeps,
+  event: PersonalServerReadFulfillment,
+): void {
+  const reporter = deps.readFulfillmentReporter;
+  if (!reporter?.reportDenied) return;
+  fireReadReport(deps, event, reporter.reportDenied.bind(reporter));
+}
+
+/** Fire-and-forget: reporting must never fail or delay the read it describes. */
+function fireReadReport(
+  deps: PersonalServerReadReporterDeps,
+  event: PersonalServerReadFulfillment,
+  send: (event: PersonalServerReadFulfillment) => Promise<void>,
+): void {
   try {
-    void Promise.resolve(deps.readFulfillmentReporter.report(event)).catch(
-      (err) => warnReadFulfillmentReporterFailed(deps, event, err),
+    void Promise.resolve(send(event)).catch((err) =>
+      warnReadFulfillmentReporterFailed(deps, event, err),
     );
   } catch (err) {
     warnReadFulfillmentReporterFailed(deps, event, err);
@@ -1354,8 +1406,10 @@ export async function handlePersonalServerDataRequest(
           grantId: authResult.grantId,
           ipAddress,
           logId,
+          outcome: "served",
           scope: scopeResult.scope,
           servedAt: timestamp,
+          source: "api",
           userAgent,
         });
       };

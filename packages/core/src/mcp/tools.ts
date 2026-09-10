@@ -248,7 +248,7 @@ class OperationTimeoutError extends Error {
  * tool surface never offers Claude a scope its grant won't actually pass
  * server-side.
  */
-function resolveGrantForScope(
+export function resolveGrantForScope(
   connection: McpConnectionRecord,
   scope: string,
 ): { grantId: string; scopes: string[] } | null {
