@@ -623,6 +623,7 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
       return c.json({
         access_token: token.accessToken,
         token_type: "Bearer",
+        expires_in: token.expiresIn,
         ...(token.scope ? { scope: token.scope } : {}),
       });
     } catch (err) {
