@@ -168,7 +168,10 @@ export interface PersonalServerReadFulfillment {
   /** Deny code (e.g. `scope_not_granted`); only set when outcome is denied. */
   denyReason?: string;
   fileId?: string;
-  /** Grant id, or `READ_FULFILLMENT_NONE` on a denial. */
+  /**
+   * Grant id. A denial names the grant the refused call arrived on: the
+   * Gateway stores a 32-byte id, so `READ_FULFILLMENT_NONE` is refused there.
+   */
   grantId: string;
   /** Absent on surfaces that carry no request metadata (MCP tool calls). */
   ipAddress?: string;

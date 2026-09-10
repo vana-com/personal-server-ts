@@ -204,12 +204,21 @@ function reportToolDenial(
   const scope =
     buildActivityStartParams(tool, args).scopes?.[0] ?? READ_FULFILLMENT_NONE;
 
+  // A refusal is filed under the grant the call arrived on. A scope no grant
+  // covers has no grant of its own, but the connection's grant is the access
+  // relationship the owner's feed groups by — and the Gateway only stores a
+  // 32-byte grant id, so `READ_FULFILLMENT_NONE` here is refused on ingest and
+  // takes its whole batch down with it. A connection left with no grant at all
+  // has nothing to attribute the refusal to, so it reports nothing.
+  const grantId =
+    resolveGrantForScope(options.connection, scope)?.grantId ??
+    options.connection.grants[0]?.grantId;
+  if (!grantId) return;
+
   reportPersonalServerReadDenial(options.reporterDeps, {
     builder: options.connection.granteeAddress,
     denyReason: reason,
-    grantId:
-      resolveGrantForScope(options.connection, scope)?.grantId ??
-      READ_FULFILLMENT_NONE,
+    grantId,
     logId: crypto.randomUUID(),
     outcome: "denied",
     scope,
