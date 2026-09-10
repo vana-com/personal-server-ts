@@ -687,6 +687,7 @@ it("keeps stopped members visible and warns once per admission failure code", as
         capacity: 1,
         draining: false,
         unavailable: true,
+        live: 0,
       })),
     );
     // One warn per member for the first code; every repeat drops to debug.

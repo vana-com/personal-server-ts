@@ -71,6 +71,17 @@ const placements = (nodeId: string, count: number) =>
     },
   }));
 
+/** Rows whose lease lapsed. The controller reaps them on its next renew tick;
+ * until then the loop must still read the slots they hold as free. */
+const expired = (nodeId: string, count: number) =>
+  placements(nodeId, count).map((row) => ({
+    ...row,
+    assignment: {
+      ...row.assignment,
+      leaseExpiresAt: new Date(NOW - MINUTE).toISOString(),
+    },
+  }));
+
 function status(nodes: object[], rows: object[] = [], config: object = {}) {
   return {
     controllerTerm: 1,
@@ -159,6 +170,36 @@ describe("decidePoolActions", () => {
       { type: ACTION.start, nodeId: "worker-3", cvmId: "cvm-3" },
     ]);
     expect(second.state.nodes["worker-3"].phase).toBe(PHASE.starting);
+  });
+
+  it("never counts an unreaped expired placement against free capacity", () => {
+    const snapshot = status(
+      [admitted("worker-1"), admitted("worker-2"), declared("worker-3")],
+      [...expired("worker-1", CAPACITY), ...expired("worker-2", CAPACITY)],
+    );
+    const state = {
+      nodes: {
+        "worker-1": runningState("worker-1"),
+        "worker-2": runningState("worker-2"),
+      },
+    };
+
+    const first = decidePoolActions({
+      now: NOW,
+      members: MEMBERS,
+      status: snapshot,
+      state,
+    });
+    const second = decidePoolActions({
+      now: NOW + MINUTE,
+      members: MEMBERS,
+      status: snapshot,
+      state: first.state,
+    });
+
+    expect(types(first.actions)).toEqual([]);
+    expect(first.state.saturatedSince).toBeUndefined();
+    expect(types(second.actions)).toEqual([]);
   });
 
   it("refuses to start beyond MAX_RUNNING and reports it", () => {

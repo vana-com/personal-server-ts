@@ -20,7 +20,10 @@ credential permits these operations only. Separate admin listener/credential
 permits /fleet/v1/admit and /fleet/v1/drain. Public ingress mounts neither.
 
 Admin POST /fleet/v1/status returns {controllerTerm,paused,config,nodes,
-placements}. Each entry of `nodes` carries `lastAdmission`, either null or
+placements}. Each entry of `nodes` carries `live`, the number of placement rows
+holding an unexpired lease on that member — the only count of occupied slots;
+`placements` rows are raw and may include an expired lease the next renew tick
+has yet to reap. Each entry also carries `lastAdmission`, either null or
 {code,since,attempts}. `code` comes from a closed allow-list of reviewed
 verifier and identity refusals — PEER_EVENTS_REJECTED (a second mr-kms event),
 PEER_MEASUREMENTS_REJECTED, PEER_TCB_REJECTED, PEER_NOT_ADMITTED,

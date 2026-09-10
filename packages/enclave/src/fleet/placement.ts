@@ -158,6 +158,15 @@ export async function openFleetController(options: FleetControllerOptions) {
   };
   const healthy = (nodeId: string): boolean =>
     !directory.nodes[nodeId]?.unavailable;
+  /** Rows holding an unexpired lease on a member. An expired row owns no slot:
+   * the worker retired it at its own earlier deadline, `ensure` re-places its
+   * owner elsewhere, and `renew` reaps it. */
+  const liveOn = (nodeId: string): number =>
+    Object.values(rows).filter(
+      (r) =>
+        r.assignment?.nodeId === nodeId &&
+        Date.parse(r.assignment.leaseExpiresAt) > now(),
+    ).length;
   const emit = (event: string, assignment: FleetAssignment): void =>
     options.event?.(event, {
       userPsId: assignment.userPsId,
@@ -423,12 +432,7 @@ export async function openFleetController(options: FleetControllerOptions) {
         row.enrolled = true;
         await persist();
         if (directory.paused) throw new Error("Fleet controller paused");
-        const load = (node: FleetAdmittedNode): number =>
-          Object.values(rows).filter(
-            (r) =>
-              r.assignment?.nodeId === node.nodeId &&
-              Date.parse(r.assignment.leaseExpiresAt) > now(),
-          ).length;
+        const load = (node: FleetAdmittedNode): number => liveOn(node.nodeId);
         const node = [...nodes.values()]
           .filter(
             (n) =>
@@ -526,8 +530,29 @@ export async function openFleetController(options: FleetControllerOptions) {
           leaseOperation(key, async () => {
             const assignment = rows[key]?.assignment;
             if (directory.paused) return;
+            if (!assignment) return;
+            // A failed renewal blocks the row and lets the lease lapse, and the
+            // guard below then skips it forever: status keeps reporting a dead
+            // placement as ready and `prune` keeps its member. Expiry already
+            // fences the sandbox, so reap the row. e.g. a renewal that failed
+            // at 20:52 must not still hold a slot on that node at 21:07.
+            if (Date.parse(assignment.leaseExpiresAt) <= now()) {
+              const member = nodes.get(assignment.nodeId);
+              if (member?.nodeIncarnation === assignment.nodeIncarnation) {
+                try {
+                  await member.worker.release(structuredClone(assignment));
+                } catch {
+                  // A refused release is not a reason to keep a dead row: the
+                  // lease, not the acknowledgment, is what fences the sandbox.
+                  emit("placement_reap_failed", assignment);
+                }
+              }
+              rows[key]!.renewalBlocked = false;
+              await forget(assignment);
+              return;
+            }
+
             if (
-              !assignment ||
               !current(assignment) ||
               assignment.state === "draining" ||
               rows[key]?.renewalBlocked ||
@@ -616,8 +641,13 @@ export async function openFleetController(options: FleetControllerOptions) {
         ),
       );
     },
-    nodeStatus(): NodeRecord[] {
-      return structuredClone(Object.values(directory.nodes));
+    /** Directory records plus each member's live placement count, so status
+     * consumers do not each reimplement the lease filter. */
+    nodeStatus(): (NodeRecord & { live: number })[] {
+      return Object.values(directory.nodes).map((node) => ({
+        ...structuredClone(node),
+        live: liveOn(node.nodeId),
+      }));
     },
     snapshot(): FleetPlacementRow[] {
       return structuredClone(Object.values(rows));
