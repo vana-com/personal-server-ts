@@ -470,10 +470,12 @@ function phala(args, dryRun) {
   return true;
 }
 
+// The CLI refuses a bare method argument: it must arrive through -X.
 const cvmCommand = (cvmId, operation) => [
   "api",
-  "POST",
   `/cvms/${cvmId}/${operation}`,
+  "-X",
+  "POST",
 ];
 
 async function adminPost(context, route, body) {
