@@ -8,6 +8,7 @@ import type {
   TeeNodeHeartbeat,
 } from "./types.js";
 import { normalizeJobId } from "./types.js";
+import type { SignedAccessRecord } from "../agent/access-records.js";
 
 const AUTHORIZATION_HEADER = "Authorization";
 const CONTENT_TYPE_HEADER = "Content-Type";
@@ -20,6 +21,7 @@ const MILLISECONDS_PER_SECOND = 1_000;
 const NO_CONTENT = 204;
 const FORBIDDEN = 403;
 const CONFLICT = 409;
+const ACCESS_RECORDS_PATH = "/v1/access-records";
 
 export interface GatewayClient {
   claim(wait: number, body: ClaimRequest): Promise<ClaimResponse | null>;
@@ -30,6 +32,7 @@ export interface GatewayClient {
     nodeId: string,
     body: TeeNodeHeartbeat,
   ): Promise<{ state: string }>;
+  postAccessRecords(body: { records: SignedAccessRecord[] }): Promise<void>;
 }
 
 export interface GatewayClientOptions {
@@ -150,6 +153,18 @@ export function createGatewayClient(
         body,
         REQUEST_TIMEOUT_MS,
       );
+    },
+    // 202 with no body; nothing to parse, so it does not go through request().
+    async postAccessRecords(body): Promise<void> {
+      const response = await requestFetch(`${baseUrl}${ACCESS_RECORDS_PATH}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      if (!response.ok) {
+        throw httpError(response);
+      }
     },
   };
 }

@@ -1,4 +1,5 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import type { Hex } from "viem";
 import type { ActiveSandboxJob, SandboxJobLookup } from "../agent/types.js";
 import { isAbortError, withAbort } from "./abort.js";
 import type { SyncStatus } from "./probes.js";
@@ -57,6 +58,13 @@ export interface SandboxRegistry {
   release(key: string): void;
   bindJob(key: string, job: ActiveSandboxJob): () => void;
   lookupJob(accessToken: string, jobId: string): SandboxJobLookup;
+  /**
+   * Resolve a sandbox access token to the identity the sandbox runs as.
+   * Unlike lookupJob this needs no job: an MCP sandbox serves reads without
+   * ever binding one, and the registry key is not always `userPsId:epoch`
+   * (fleet placements key by assignment).
+   */
+  lookupSandbox(accessToken: string): SandboxIdentity | null;
   drain(): Promise<void>;
   evict(key: string): Promise<void>;
   activeCount(): number;
@@ -64,6 +72,11 @@ export interface SandboxRegistry {
   listSandboxes(): Promise<SandboxStatus[]>;
   inspectSandbox(containerId: string): Promise<SandboxStatus | undefined>;
   sandboxLogs(containerId: string, tail: number): Promise<string | undefined>;
+}
+
+export interface SandboxIdentity {
+  userPsId: Hex;
+  epoch: number;
 }
 
 export interface SandboxStatus {
@@ -79,6 +92,8 @@ export interface SandboxStatus {
 interface RegistryEntry {
   handle?: SandboxHandle;
   state: SandboxState;
+  /** Set once the spec is built; see startEntry. */
+  identity?: SandboxIdentity;
   lastUsedAt: number;
   accessToken: string;
   useCount: number;
@@ -203,6 +218,14 @@ export function createSandboxRegistry(
       const job = entry.activeJobs.get(jobId);
 
       return job ? { kind: "active", job } : { kind: "inactive" };
+    },
+    lookupSandbox(accessToken): SandboxIdentity | null {
+      const entry = findByAccessToken(entries, accessToken);
+      if (!entry || entry.state === "destroyed") {
+        return null;
+      }
+
+      return entry.identity ?? null;
     },
     async evict(key): Promise<void> {
       const entry = entries.get(key);
@@ -418,6 +441,7 @@ async function startEntry(options: StartEntryOptions): Promise<SandboxHandle> {
     }
 
     const spec = options.buildSpec(options.entry.accessToken);
+    options.entry.identity = { userPsId: spec.userPsId, epoch: spec.epoch };
     const onStatus = spec.onStatus;
     spec.onStatus = (status) => {
       options.entry.containerId = status.containerId;

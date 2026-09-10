@@ -207,6 +207,8 @@ async function startJobs(
       }
       return lookup;
     },
+    lookupSandbox: (accessToken) => registry.lookupSandbox(accessToken),
+    postAccessRecords: (records) => gateway.postAccessRecords({ records }),
     prewarm(body): void {
       if (!mcp) {
         void prewarmSandbox(body, body.scope, sandboxDeps);
