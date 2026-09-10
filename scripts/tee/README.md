@@ -15,7 +15,31 @@ scripts/tee/provision.sh <name> --ref <40-hex-commit-sha>
 scripts/tee/replicate.sh <name> <source-cvm-uuid> --node-id <phala-placement-id>
 scripts/tee/destroy.sh <uuid>
 node scripts/tee/kms-root.mjs
+node scripts/tee/pool-loop.mjs --dry-run
 ```
+
+## Warm-pool loop
+
+`pool-loop.mjs` starts and stops pre-declared fleet members and drives their
+admission through the controller's admin listener. It never calls the Gateway:
+Gateway admit forwards no `resume` and Gateway drain is one-way to removed.
+
+It reads `~/.vana/pool.json` — either an array of
+`{nodeId,cvmId,publicUrl,capacity,bundleExpiresAt,composeHash?}` with
+`VANA_FLEET_ADMIN_URL` set, or `{controllerAdminUrl, members:[...]}`. That file
+holds no secrets. The controller admin token comes from the login keychain item
+`vana-fleet-admin` and each member's `ENCLAVE_AGENT_SECRET` from
+`vana-fleet-agent-<nodeId>`, read per command and never written to disk. Phase
+state persists in `~/.vana/pool-loop-state.json`
+(`VANA_POOL_PATH`/`VANA_POOL_STATE_PATH` override both paths).
+
+The loop ticks every 15 s: it scales up only after 60 s with no free capacity
+and at most `MAX_RUNNING` members, scales down a member idle for 15 min while
+more than `MIN_RUNNING` remain, and stops a machine only once the controller
+reports it draining with no live lease. A member that has not been admitted
+8 minutes after start, or whose event log carries a second `mr-kms` entry, is
+restarted once and then quarantined. `--once` runs a single tick; `--dry-run`
+logs every decision without invoking `phala`.
 
 `provision.sh` defaults to `deploy/dstack/docker-compose.enclave.yml`. The
 agent receives only the dstack socket and reaches the privileged nested Docker
