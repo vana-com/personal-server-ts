@@ -154,7 +154,17 @@ with a kernel flock in the central launcher. This is the permitted dedicated
 controller store rather than a new Gateway scheduler. Generation tombstones and
 operator drain decisions persist across restart; readiness observations do not
 survive and must be freshly queried. Admission verifies a fresh peer before
-installing its runtime adapter. Exactly one active controller app is an operating
+installing its runtime adapter.
+
+Central declares every configured member at boot, before its first attestation
+attempt. A declared entry carries an empty incarnation and `unavailable: true`,
+installs no runtime adapter, and is therefore never selectable; it exists so a
+stopped warm-pool machine is visible in status and can be durably drained while
+it is down. Attestation later admits the same entry and keeps its drain
+decision. Directory entries the signed policy no longer lists are pruned at
+boot, except one a placement row still references, which is retained and warned
+about. Repeated admission failures are logged edge-triggered: the first failure
+of a code warns, repeats of that code are debug, and admission logs info. Exactly one active controller app is an operating
 invariant; stop/fence its old instance before any replacement.
 
 Worker activity reports {assignment,present,busy} without waking a sandbox.

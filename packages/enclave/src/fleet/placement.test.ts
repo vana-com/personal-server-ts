@@ -348,3 +348,108 @@ it("persists a recovery pause and never reenrolls on restart until explicit acti
   await restarted.resume();
   expect(restarted.paused()).toBe(false);
 });
+
+it("declares a stopped pool member as visible, unselectable and drainable", async () => {
+  const path = await mkdtemp(join(tmpdir(), "fleet-declare-"));
+  paths.push(path);
+  const worker: FleetWorkerPort = {
+    activity: vi.fn(),
+    prepare: vi.fn(async () => []),
+    readiness: vi.fn(async () => []),
+    renew: vi.fn(),
+    execute: vi.fn(),
+    release: vi.fn(),
+  };
+  const options = {
+    path: join(path, "state.json"),
+    enroll: vi.fn(),
+    publish: vi.fn(),
+    release: vi.fn(),
+  };
+  const controller = await openFleetController(options);
+  const owner = { chainId: 14800, userPsId: "owner", identityEpoch: 1 };
+  await controller.declare({ nodeId: "stopped", capacity: 2 });
+  await controller.declare({ nodeId: "stopped", capacity: 9 });
+
+  expect(controller.nodeStatus()).toEqual([
+    {
+      nodeId: "stopped",
+      nodeIncarnation: "",
+      capacity: 2,
+      draining: false,
+      unavailable: true,
+    },
+  ]);
+  await expect(controller.ensure(owner, [])).rejects.toThrow(
+    "Fleet capacity unavailable",
+  );
+  await expect(controller.drain("stopped")).resolves.toBeUndefined();
+  expect(controller.nodeStatus()[0]?.draining).toBe(true);
+
+  // A later attestation must clear neither the operator drain nor the capacity.
+  await controller.admit({
+    nodeId: "stopped",
+    nodeIncarnation: "i1",
+    capacity: 2,
+    worker,
+  });
+  expect(controller.nodeStatus()[0]).toMatchObject({
+    draining: true,
+    unavailable: false,
+  });
+
+  // Only an explicit resume clears the operator's durable drain decision.
+  await controller.admit({
+    nodeId: "stopped",
+    nodeIncarnation: "i2",
+    capacity: 2,
+    worker,
+    draining: false,
+  });
+  expect(controller.nodeStatus()[0]).toMatchObject({
+    draining: false,
+    unavailable: false,
+  });
+  expect((await openFleetController(options)).nodeStatus()).toHaveLength(1);
+});
+
+it("prunes retired directory members but keeps one a placement still references", async () => {
+  const path = await mkdtemp(join(tmpdir(), "fleet-prune-"));
+  paths.push(path);
+  const worker: FleetWorkerPort = {
+    activity: vi.fn(async (assignment) => ({
+      assignment,
+      present: true,
+      busy: false,
+    })),
+    prepare: vi.fn(async () => []),
+    readiness: vi.fn(async () => []),
+    renew: vi.fn(),
+    execute: vi.fn(),
+    release: vi.fn(),
+  };
+  const options = {
+    path: join(path, "state.json"),
+    enroll: vi.fn(),
+    publish: vi.fn(),
+    release: vi.fn(),
+  };
+  const controller = await openFleetController(options);
+  await controller.admit({
+    nodeId: "held",
+    nodeIncarnation: "h1",
+    capacity: 1,
+    worker,
+  });
+  await controller.declare({ nodeId: "orphan", capacity: 1 });
+  await controller.ensure(
+    { chainId: 14800, userPsId: "owner", identityEpoch: 1 },
+    [],
+  );
+
+  expect(await controller.prune(["kept"])).toEqual({
+    removed: ["orphan"],
+    retained: ["held"],
+  });
+  expect(controller.nodeStatus().map((node) => node.nodeId)).toEqual(["held"]);
+});

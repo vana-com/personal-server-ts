@@ -38,6 +38,16 @@ interface NodeRecord {
   draining: boolean;
   unavailable: boolean;
 }
+/** A pool member the signed policy lists but which has never attested. */
+export interface FleetDeclaredNode {
+  nodeId: string;
+  capacity: number;
+}
+export interface FleetPruneResult {
+  removed: string[];
+  /** Retired members a placement row still references; kept for the operator. */
+  retained: string[];
+}
 interface Directory {
   v: 1;
   paused: boolean;
@@ -269,6 +279,46 @@ export async function openFleetController(options: FleetControllerOptions) {
         row.enrolled = true;
         await persist();
       });
+    },
+    /** Publish a configured member before it can attest. The in-memory adapter
+     * map stays empty, so the allocator never selects it, but it is visible in
+     * status and an operator can durably drain it while it is stopped. */
+    async declare(node: FleetDeclaredNode): Promise<void> {
+      if (
+        !node.nodeId ||
+        !Number.isSafeInteger(node.capacity) ||
+        node.capacity < 1
+      )
+        throw new Error("Invalid worker declaration");
+      if (directory.nodes[node.nodeId]) return;
+
+      directory.nodes[node.nodeId] = {
+        nodeId: node.nodeId,
+        nodeIncarnation: "",
+        capacity: node.capacity,
+        draining: false,
+        unavailable: true,
+      };
+      await persist();
+    },
+    /** Forget directory entries the signed policy no longer lists. An entry a
+     * placement row still references is retained rather than silently dropped. */
+    async prune(configured: string[]): Promise<FleetPruneResult> {
+      const keep = new Set(configured);
+      const result: FleetPruneResult = { removed: [], retained: [] };
+      for (const nodeId of Object.keys(directory.nodes)) {
+        if (keep.has(nodeId)) continue;
+        if (Object.values(rows).some((r) => r.assignment?.nodeId === nodeId)) {
+          result.retained.push(nodeId);
+          continue;
+        }
+
+        delete directory.nodes[nodeId];
+        nodes.delete(nodeId);
+        result.removed.push(nodeId);
+      }
+      if (result.removed.length) await persist();
+      return result;
     },
     async admit(node: FleetAdmittedNode): Promise<void> {
       if (

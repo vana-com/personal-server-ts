@@ -643,6 +643,81 @@ it("accepts a full warm pool and refuses one member beyond the cap", async () =>
   }
 });
 
+const ADMISSION_TICK_MS = 30_000;
+
+interface LogEntry {
+  level: string;
+  message: string;
+  nodeId?: string;
+  code?: string;
+  attempts?: number;
+}
+
+function logEntries(
+  spy: { mock: { calls: unknown[][] } },
+  level: string,
+): LogEntry[] {
+  return spy.mock.calls
+    .map(([entry]) => entry as LogEntry)
+    .filter((entry) => entry.level === level);
+}
+
+it("keeps stopped members visible and warns once per admission failure code", async () => {
+  const path = await mkdtemp(join(tmpdir(), "central-declare-"));
+  const dstack = createFakeDstackClient({ appId: CONTROLLER_APP_ID });
+  const info = await dstack.info();
+  const keys = generateKeyPairSync("ed25519");
+  const env = await controllerEnv(path, [workerEntry(2), workerEntry(3)]);
+  const logs = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  let refusal = new Error("Worker is stopped");
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  let runtime: Awaited<ReturnType<typeof startFleetCentral>> | undefined;
+  try {
+    runtime = await startFleetCentral(
+      signedConfig(env, info, keys),
+      dstack,
+      () => Promise.reject(refusal),
+    );
+    await vi.advanceTimersByTimeAsync(3 * ADMISSION_TICK_MS);
+
+    expect(runtime.controller.nodeStatus()).toEqual(
+      ["worker-2", "worker-3"].map((nodeId) => ({
+        nodeId,
+        nodeIncarnation: "",
+        capacity: 1,
+        draining: false,
+        unavailable: true,
+      })),
+    );
+    // One warn per member for the first code; every repeat drops to debug.
+    expect(
+      logEntries(logs, "warn").map(({ nodeId, code, attempts }) => ({
+        nodeId,
+        code,
+        attempts,
+      })),
+    ).toEqual([
+      { nodeId: "worker-2", code: "UNAVAILABLE", attempts: 1 },
+      { nodeId: "worker-3", code: "UNAVAILABLE", attempts: 1 },
+    ]);
+    expect(logEntries(logs, "debug").length).toBeGreaterThanOrEqual(6);
+
+    refusal = new Error("Peer runtime events rejected");
+    await vi.advanceTimersByTimeAsync(ADMISSION_TICK_MS);
+    expect(logEntries(logs, "warn").map((entry) => entry.code)).toEqual([
+      "UNAVAILABLE",
+      "UNAVAILABLE",
+      "PEER_EVENTS_REJECTED",
+      "PEER_EVENTS_REJECTED",
+    ]);
+  } finally {
+    vi.useRealTimers();
+    logs.mockRestore();
+    await runtime?.close();
+    await rm(path, { recursive: true, force: true });
+  }
+});
+
 it("publishes the controller bundle window and identity on admin status", async () => {
   const path = await mkdtemp(join(tmpdir(), "central-status-config-"));
   const dstack = createFakeDstackClient({ appId: CONTROLLER_APP_ID });

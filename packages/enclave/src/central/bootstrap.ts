@@ -40,6 +40,8 @@ interface WorkerConfig {
  * the external pool loop only starts and stops those declared machines. */
 const MAX_FLEET_WORKERS = 4;
 const logger = {
+  debug: (context: object, message: string) =>
+    console.error({ level: "debug", ...context, message }),
   info: (context: object, message: string) =>
     console.error({ level: "info", ...context, message }),
   warn: (context: object, message: string) =>
@@ -47,6 +49,31 @@ const logger = {
   error: (context: object, message: string) =>
     console.error({ level: "error", ...context, message }),
 };
+const ADMITTED_CODE = "ADMITTED";
+const UNAVAILABLE_CODE = "UNAVAILABLE";
+/** Closed allow-list of reviewed peer-verifier and identity refusals. Nothing a
+ * remote worker can influence ever reaches a log line or the status surface. */
+const ADMISSION_CODES = new Map([
+  ["Peer runtime events rejected", "PEER_EVENTS_REJECTED"],
+  ["Peer measurements rejected", "PEER_MEASUREMENTS_REJECTED"],
+  ["Peer TCB rejected", "PEER_TCB_REJECTED"],
+  ["Peer not admitted", "PEER_NOT_ADMITTED"],
+  ["Peer key/challenge binding rejected", "PEER_BINDING_REJECTED"],
+  ["Debug TDX forbidden", "PEER_DEBUG_TDX"],
+  ["Worker identity mismatch", "IDENTITY_MISMATCH"],
+]);
+const ADMISSION_FAILED_MESSAGE = "Worker admission unavailable";
+const ADMISSION_RECOVERED_MESSAGE = "Worker peer admitted";
+const RETIRED_MEMBER_MESSAGE = "Retired worker still holds a placement row";
+interface AdmissionState {
+  code: string;
+  since: string;
+  attempts: number;
+}
+function admissionCode(error: unknown): string {
+  const message = error instanceof Error ? error.message : "";
+  return ADMISSION_CODES.get(message) ?? UNAVAILABLE_CODE;
+}
 function required(env: NodeJS.ProcessEnv, key: string): string {
   const value = env[key];
   if (!value) throw new Error(`${key} is required`);
@@ -157,6 +184,58 @@ export async function startFleetCentral(
       await gateway("release", assignment);
     },
   });
+  // Every configured member is published before the first attestation attempt,
+  // so a stopped machine appears in status and can be drained while it is down.
+  const retired = await controller.prune(
+    workers.map((w) => w.policy.identity.nodeId),
+  );
+  for (const nodeId of retired.retained)
+    logger.warn({ nodeId }, RETIRED_MEMBER_MESSAGE);
+  await Promise.all(
+    workers.map((worker) =>
+      controller.declare({
+        nodeId: worker.policy.identity.nodeId,
+        capacity: worker.capacity,
+      }),
+    ),
+  );
+
+  // Edge-triggered admission logging. A stopped pool member must not warn on
+  // every 30 s re-attest tick, but a new refusal code and recovery must be seen.
+  const admissions = new Map<string, AdmissionState>();
+  const recordAdmitFailure = (nodeId: string, error: unknown): void => {
+    const code = admissionCode(error);
+    const prior = admissions.get(nodeId);
+    const repeated = prior?.code === code;
+    const state: AdmissionState = {
+      code,
+      since: repeated ? prior.since : new Date().toISOString(),
+      attempts: repeated ? prior.attempts + 1 : 1,
+    };
+    admissions.set(nodeId, state);
+    const report = repeated ? logger.debug : logger.warn;
+    report(
+      { nodeId, code, attempts: state.attempts },
+      ADMISSION_FAILED_MESSAGE,
+    );
+  };
+  const recordAdmitSuccess = (
+    nodeId: string,
+    nodeIncarnation: string,
+  ): void => {
+    const prior = admissions.get(nodeId);
+    admissions.set(nodeId, {
+      code: ADMITTED_CODE,
+      since: new Date().toISOString(),
+      attempts: 1,
+    });
+    if (prior?.code === ADMITTED_CODE) return;
+
+    logger.info(
+      { nodeId, nodeIncarnation, previous: prior?.code ?? null },
+      ADMISSION_RECOVERED_MESSAGE,
+    );
+  };
   const peers = new Map<string, ReturnType<typeof createFleetPeerClient>>();
   const admit = async (body: unknown) => {
     const { nodeId, resume } = body as { nodeId: string; resume?: boolean };
@@ -192,10 +271,7 @@ export async function startFleetCentral(
       ...(resume === true ? { draining: false } : {}),
     });
     peers.set(nodeId, pinnedPeer);
-    logger.info(
-      { nodeId, nodeIncarnation: remote.identity.nodeIncarnation },
-      "Worker peer admitted",
-    );
+    recordAdmitSuccess(nodeId, remote.identity.nodeIncarnation);
     return { success: true, identity: remote.identity };
   };
   const firstPeer = () => {
@@ -404,33 +480,22 @@ export async function startFleetCentral(
       }),
     );
   });
-  schedule(30_000, async () => {
-    await Promise.all(
+  const attestAll = () =>
+    Promise.all(
       workers.map(async (worker) => {
+        const nodeId = worker.policy.identity.nodeId;
         try {
-          await admit({ nodeId: worker.policy.identity.nodeId });
-        } catch {
-          logger.warn(
-            { nodeId: worker.policy.identity.nodeId },
-            "Worker health attestation unavailable",
-          );
+          await admit({ nodeId });
+        } catch (error) {
+          recordAdmitFailure(nodeId, error);
         }
       }),
     );
+  schedule(30_000, async () => {
+    await attestAll();
   });
   // Staging may precede worker activation. No admission failure silently relaxes policy.
-  void Promise.all(
-    workers.map(async (worker) => {
-      try {
-        await admit({ nodeId: worker.policy.identity.nodeId });
-      } catch {
-        logger.warn(
-          { nodeId: worker.policy.identity.nodeId },
-          "Worker admission pending",
-        );
-      }
-    }),
-  );
+  void attestAll();
   logger.info(
     {
       nodeId: identity.nodeId,
