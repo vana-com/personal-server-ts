@@ -1,6 +1,7 @@
 import { createPublicOnlyAccount } from "@opendatalabs/personal-server-ts-core/keys";
 import { isAddress, isHex, type Address, type Hex } from "viem";
 import { createServer } from "./bootstrap.js";
+import { createAccessReporter } from "./jobs/access-reporter.js";
 import { loadConfig } from "./config/index.js";
 import { listenHttpServer } from "./listen.js";
 
@@ -124,12 +125,20 @@ export async function runEnclaveMain(): Promise<void> {
     address: enclaveEnv.serverAddress,
     publicKey: enclaveEnv.serverPublicKey,
   });
+  // Enclave only: MCP reads become enclave-signed access records. Other
+  // profiles have no agent to sign them, so they report nothing.
+  const accessReporter = createAccessReporter({
+    agentEndpoint: enclaveEnv.agentUrl,
+    accessToken: enclaveEnv.accessToken,
+    chainId,
+  });
   const context = await createServer(config, {
     rootPath,
     hydrateScopes: readHydrateScopes(process.env.PS_HYDRATE_SCOPES),
     ownerSignature: enclaveEnv.ownerSignature,
     serverAccount,
     profile: "enclave",
+    readFulfillmentReporter: accessReporter,
     jobResultUpload: {
       storageEndpoint: storageApiUrlValue,
       agentEndpoint: enclaveEnv.agentUrl,
@@ -150,7 +159,7 @@ export async function runEnclaveMain(): Promise<void> {
   const shutdown = (signal: string) => {
     context.logger.info({ signal }, "Shutdown signal received");
     server.close(() => {
-      void context.cleanup();
+      void accessReporter.stop().then(() => context.cleanup());
     });
   };
   process.on("SIGTERM", () => shutdown("SIGTERM"));
