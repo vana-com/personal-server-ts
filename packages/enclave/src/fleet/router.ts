@@ -3,9 +3,10 @@ import {
   userPsId,
   type IdentityResponse,
 } from "@opendatalabs/vana-sdk/protocol/identity";
-import type {
-  McpOwnerBinding,
-  TeeMcpIngressDeps,
+import {
+  McpOwnerAccessRevokedError,
+  type McpOwnerBinding,
+  type TeeMcpIngressDeps,
 } from "@opendatalabs/personal-server-ts-server/mcp/tee";
 import type { FleetController } from "./placement.js";
 import { sameAssignment, type FleetOwner } from "./contracts.js";
@@ -25,10 +26,12 @@ export async function resolveFleetOwner(
   if (!response.ok) throw new Error("Current owner identity unavailable");
   const live = (await response.json()) as IdentityResponse;
   const id = userPsId(binding.chainId, binding.owner);
+  // A retired or unsealed identity is the owner withdrawing enclave access
+  // (deregistered, epoch bumped, delegation revoked), not a gateway outage.
+  if (live.state !== "sealed" || !live.sealed || !live.identity)
+    throw new McpOwnerAccessRevokedError();
+
   if (
-    live.state !== "sealed" ||
-    !live.sealed ||
-    !live.identity ||
     live.identity.userPsId !== id ||
     live.identity.ownerAddress.toLowerCase() !== binding.owner.toLowerCase() ||
     live.identity.chainId !== binding.chainId

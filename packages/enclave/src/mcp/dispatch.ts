@@ -3,10 +3,11 @@ import {
   type IdentityResponse,
 } from "@opendatalabs/vana-sdk/protocol/identity";
 import type { McpConnectionRecord } from "@opendatalabs/personal-server-ts-core/mcp";
-import type {
-  McpDurableState,
-  McpOwnerBinding,
-  McpWakeupIdentity,
+import {
+  McpOwnerAccessRevokedError,
+  type McpDurableState,
+  type McpOwnerBinding,
+  type McpWakeupIdentity,
 } from "@opendatalabs/personal-server-ts-server/mcp/tee";
 import { deriveEnclaveIdentity } from "../identity/wallet.js";
 import { unseal } from "../sealing/envelope.js";
@@ -34,10 +35,12 @@ export async function currentMcpIdentity(
   });
   if (!response.ok) throw new Error("MCP identity is unavailable");
   const live = (await response.json()) as IdentityResponse;
+  // A retired or unsealed identity is the owner withdrawing enclave access
+  // (deregistered, epoch bumped, delegation revoked), not a gateway outage.
+  if (live.state !== "sealed" || !live.sealed || !live.identity)
+    throw new McpOwnerAccessRevokedError();
+
   if (
-    live.state !== "sealed" ||
-    !live.sealed ||
-    !live.identity ||
     live.identity.userPsId !== id ||
     live.identity.ownerAddress.toLowerCase() !== binding.owner.toLowerCase() ||
     live.identity.chainId !== binding.chainId ||

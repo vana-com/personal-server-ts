@@ -13,6 +13,22 @@ import { mcpOAuthRoutes } from "../routes/mcp.js";
 import { createBodyLimit } from "../middleware/body-limit.js";
 import type { McpDurableState, McpOwnerBinding } from "./durable-state.js";
 
+/** Stable, non-retryable code for a caller whose owner withdrew enclave access
+ * (server deregistered, identity epoch bumped, delegation revoked). Retrying
+ * cannot help; the owner has to approve this enclave again. */
+export const OWNER_ACCESS_REVOKED_CODE = "OWNER_ACCESS_REVOKED";
+const OWNER_ACCESS_REVOKED_MESSAGE =
+  "Owner access to this enclave was revoked; ask the owner to approve it again";
+
+/** Thrown by `dispatch`/`ownerReady` providers when the live protocol identity
+ * shows the owner no longer authorizes this enclave. */
+export class McpOwnerAccessRevokedError extends Error {
+  constructor() {
+    super(OWNER_ACCESS_REVOKED_MESSAGE);
+    this.name = "McpOwnerAccessRevokedError";
+  }
+}
+
 export interface TeeMcpIngressDeps {
   state: McpDurableState;
   origin: string;
@@ -224,15 +240,26 @@ export function createTeeMcpIngress(deps: TeeMcpIngressDeps): Hono {
       oauthAuthorizationStore: state.authorizations,
     }),
   );
-  app.onError(
-    () =>
-      new Response(JSON.stringify({ error: "MCP request unavailable" }), {
-        status: 503,
-        headers: {
-          "content-type": "application/json",
-          "cache-control": "no-store",
-        },
-      }),
-  );
+  app.onError((error) => {
+    // A revoked owner is a terminal answer, not the transient 503 every other
+    // ingress failure gets: the MCP client must stop retrying this connection.
+    if (error instanceof McpOwnerAccessRevokedError)
+      return jsonError(403, {
+        error: OWNER_ACCESS_REVOKED_CODE,
+        message: OWNER_ACCESS_REVOKED_MESSAGE,
+      });
+
+    return jsonError(503, { error: "MCP request unavailable" });
+  });
   return app;
+}
+
+function jsonError(status: number, body: Record<string, string>): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+    },
+  });
 }
