@@ -22,11 +22,12 @@
  *     revoke from the user's perspective.
  */
 
-import type {
-  McpConnectionRecord,
-  McpConnectionStore,
-  McpOAuthAuthorizationRecord,
-  McpOAuthAuthorizationStore,
+import {
+  isMcpTokenExpired,
+  type McpConnectionRecord,
+  type McpConnectionStore,
+  type McpOAuthAuthorizationRecord,
+  type McpOAuthAuthorizationStore,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 
 const DEFAULT_DB_NAME = "personal-server-lite";
@@ -222,6 +223,7 @@ export function createIndexedDbMcpConnectionStore(
       );
       if (!record) return null;
       if (record.status !== "approved") return null;
+      if (isMcpTokenExpired(record)) return null;
       return { ...record };
     },
 

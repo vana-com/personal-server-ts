@@ -6,11 +6,12 @@ import {
 } from "node:crypto";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { dirname } from "node:path";
-import type {
-  McpConnectionRecord,
-  McpConnectionStore,
-  McpOAuthAuthorizationRecord,
-  McpOAuthAuthorizationStore,
+import {
+  isMcpTokenExpired,
+  type McpConnectionRecord,
+  type McpConnectionStore,
+  type McpOAuthAuthorizationRecord,
+  type McpOAuthAuthorizationStore,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import type { Address } from "viem";
 import type { ClaimResponse } from "@opendatalabs/vana-sdk/protocol/jobs";
@@ -406,7 +407,9 @@ export async function openMcpDurableState(options: {
           (current) =>
             Object.values(current.connections).find(
               (record) =>
-                record.tokenHash === hash && record.status === "approved",
+                record.tokenHash === hash &&
+                record.status === "approved" &&
+                !isMcpTokenExpired(record),
             ) ?? null,
         ),
       update: (id, patch) =>

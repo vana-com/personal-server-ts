@@ -56,6 +56,11 @@ export interface McpConnectionRecord {
   encryptedGranteePrivateKey: McpEncryptedPrivateKey;
   /** SHA-256 hex of the raw connection token. The raw token is only returned once on creation. */
   tokenHash: string;
+  /**
+   * ISO expiry of the current token. Absent means expired: a record written
+   * before this field existed has no proven lifetime, so it fails closed.
+   */
+  tokenExpiresAt?: string;
   status: McpConnectionStatus;
   grants: McpConnectionGrant[];
   createdAt: string;
@@ -69,9 +74,10 @@ export interface McpConnectionStore {
   list(): Promise<McpConnectionRecord[]>;
   getById(id: string): Promise<McpConnectionRecord | null>;
   /**
-   * Look up an *approved, non-revoked* connection by the SHA-256 hash of the
-   * raw connection token presented in the URL. Returns null for unknown,
-   * pending, or revoked tokens. Updates `lastUsedAt`.
+   * Look up an *approved, non-revoked, unexpired* connection by the SHA-256
+   * hash of the raw connection token presented in the URL. Returns null for
+   * unknown, pending, revoked tokens, and for any token whose
+   * `tokenExpiresAt` has passed or is absent. Updates `lastUsedAt`.
    */
   getByTokenHash(tokenHash: string): Promise<McpConnectionRecord | null>;
   update(
@@ -86,6 +92,7 @@ export interface McpConnectionStore {
         | "lastUsedAt"
         | "displayName"
         | "tokenHash"
+        | "tokenExpiresAt"
       >
     >,
   ): Promise<McpConnectionRecord | null>;

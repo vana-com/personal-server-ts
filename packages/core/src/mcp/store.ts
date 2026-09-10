@@ -14,6 +14,7 @@ import type {
   McpOAuthAuthorizationRecord,
   McpOAuthAuthorizationStore,
 } from "./types.js";
+import { isMcpTokenExpired } from "./token-expiry.js";
 
 export function createInMemoryMcpConnectionStore(): McpConnectionStore {
   const byId = new Map<string, McpConnectionRecord>();
@@ -43,6 +44,7 @@ export function createInMemoryMcpConnectionStore(): McpConnectionStore {
       const record = byId.get(id);
       if (!record) return null;
       if (record.status !== "approved") return null;
+      if (isMcpTokenExpired(record)) return null;
       return { ...record };
     },
 

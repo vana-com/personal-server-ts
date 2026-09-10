@@ -23,6 +23,7 @@ import {
   redeemMcpOAuthAuthorizationCode,
   revokeMcpConnection,
 } from "./connection-api.js";
+import { MCP_TOKEN_TTL_MS } from "./token-expiry.js";
 import { ensureMcpGranteeRegistered } from "./builder-registration.js";
 
 const PUBLIC_ORIGIN = "https://example-session.relay.test";
@@ -273,6 +274,68 @@ describe("mcp/connection-api", () => {
         { authorizationStore, connectionStore },
       ),
     ).rejects.toThrow(/already been used/i);
+  });
+
+  it("expires the redeemed bearer after the TTL and fails closed without one", async () => {
+    const connectionStore = createInMemoryMcpConnectionStore();
+    const authorizationStore = createInMemoryMcpOAuthAuthorizationStore();
+    const codeVerifier = "correct-horse-battery-staple";
+
+    // Redeem far enough in the past that the minted expiry has already passed.
+    const stale = await redeemAt(
+      new Date(Date.now() - MCP_TOKEN_TTL_MS - 60_000),
+    );
+    expect(stale.token.expiresIn).toBe(MCP_TOKEN_TTL_MS / 1000);
+    expect(
+      await connectionStore.getByTokenHash(
+        await hashConnectionToken(stale.token.accessToken),
+      ),
+    ).toBeNull();
+
+    // A fresh redeem stamps issue + TTL and resolves.
+    const issuedAt = new Date();
+    const fresh = await redeemAt(issuedAt);
+    const hash = await hashConnectionToken(fresh.token.accessToken);
+    expect(await connectionStore.getByTokenHash(hash)).toMatchObject({
+      tokenExpiresAt: new Date(
+        issuedAt.getTime() + MCP_TOKEN_TTL_MS,
+      ).toISOString(),
+    });
+
+    // A record from before the field existed is expired on read, not forever.
+    await connectionStore.update(fresh.connectionId, {
+      tokenExpiresAt: undefined,
+    });
+    expect(await connectionStore.getByTokenHash(hash)).toBeNull();
+
+    async function redeemAt(now: Date) {
+      const created = await createMcpOAuthAuthorization(
+        {
+          clientId: "claude-client",
+          redirectUri: REDIRECT_URI,
+          codeChallenge: await pkceChallenge(codeVerifier),
+          codeChallengeMethod: "S256",
+        },
+        { connectionStore, authorizationStore, publicOrigin: PUBLIC_ORIGIN },
+      );
+      const approved = await approveMcpOAuthAuthorization(
+        {
+          authorizationId: created.authorizationId,
+          grants: [{ grantId: "grant-1", scopes: ["chatgpt.history"] }],
+        },
+        { connectionStore, authorizationStore },
+      );
+      const token = await redeemMcpOAuthAuthorizationCode(
+        {
+          authorizationCode: approved.authorizationCode,
+          codeVerifier,
+          clientId: "claude-client",
+          redirectUri: REDIRECT_URI,
+        },
+        { authorizationStore, connectionStore, now: () => now },
+      );
+      return { token, connectionId: created.connectionId };
+    }
   });
 
   it("self-registers the generated MCP grantee when it is missing", async () => {

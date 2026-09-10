@@ -31,12 +31,17 @@ import type {
   McpOAuthAuthorizationRecord,
   McpOAuthAuthorizationStore,
 } from "./types.js";
+import { MCP_TOKEN_TTL_MS, mcpTokenExpiry } from "./token-expiry.js";
 
 const TOKEN_BYTES = 32;
 const OAUTH_AUTHORIZATION_TTL_MS = 10 * 60 * 1000;
 
 function nowIso(now?: () => Date): string {
   return (now ? now() : new Date()).toISOString();
+}
+
+function nowMs(now?: () => Date): number {
+  return (now ? now() : new Date()).getTime();
 }
 
 function randomBytes(byteLength: number): Uint8Array {
@@ -116,6 +121,7 @@ export async function createMcpConnection(
     granteePublicKey: grantee.key.publicKey,
     encryptedGranteePrivateKey: grantee.key.encryptedPrivateKey,
     tokenHash,
+    tokenExpiresAt: mcpTokenExpiry(nowMs(options.now)),
     status: "pending",
     grants: [],
     createdAt,
@@ -596,6 +602,8 @@ export interface RedeemMcpOAuthAuthorizationCodeOptions {
 
 export interface RedeemMcpOAuthAuthorizationCodeOutput {
   accessToken: string;
+  /** Seconds until the bearer stops resolving — RFC 6749 `expires_in`. */
+  expiresIn: number;
   scope?: string;
 }
 
@@ -652,10 +660,12 @@ export async function redeemMcpOAuthAuthorizationCode(
 
   const accessToken = randomToken();
   const tokenHash = await hashConnectionToken(accessToken);
+  const tokenExpiresAt = mcpTokenExpiry(nowMs(options.now));
   const updatedConnection = await options.connectionStore.update(
     record.connectionId,
     {
       tokenHash,
+      tokenExpiresAt,
     },
   );
   if (!updatedConnection) {
@@ -672,6 +682,7 @@ export async function redeemMcpOAuthAuthorizationCode(
 
   return {
     accessToken,
+    expiresIn: Math.floor(MCP_TOKEN_TTL_MS / 1000),
     ...(record.scope ? { scope: record.scope } : {}),
   };
 }

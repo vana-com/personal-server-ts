@@ -3,7 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createMcpOAuthAuthorization } from "@opendatalabs/personal-server-ts-core/mcp";
+import {
+  createMcpOAuthAuthorization,
+  MCP_TOKEN_TTL_MS,
+  revokeMcpConnection,
+} from "@opendatalabs/personal-server-ts-core/mcp";
 import { openMcpDurableState } from "./durable-state.js";
 import {
   createTeeMcpIngress,
@@ -158,9 +162,11 @@ describe("TEE MCP ingress", () => {
       expect(tokens.map((response) => response.status).sort()).toEqual([
         200, 400,
       ]);
-      const token = (
-        await tokens.find((response) => response.status === 200)!.json()
-      ).access_token;
+      const issued = await tokens
+        .find((response) => response.status === 200)!
+        .json();
+      expect(issued.expires_in).toBe(MCP_TOKEN_TTL_MS / 1000);
+      const token = issued.access_token;
       if (mode === "migration") {
         const snapshot = await state.fenceAndExport(
           "oauth-migration",
@@ -226,6 +232,7 @@ describe("TEE MCP ingress", () => {
       granteePublicKey: "0x02",
       encryptedGranteePrivateKey: { kind: "plaintext", privateKey: "0x01" },
       tokenHash: createHash("sha256").update(token).digest("hex"),
+      tokenExpiresAt: new Date(Date.now() + MCP_TOKEN_TTL_MS).toISOString(),
       status: "approved",
       grants: [{ grantId: "0xabc", scopes: ["spotify.profile"] }],
       createdAt: new Date().toISOString(),
@@ -264,6 +271,87 @@ describe("TEE MCP ingress", () => {
     expect(unavailable.status).toBe(503);
     expect((await unavailable.json()).error).toBe("MCP request unavailable");
   });
+  it("stops resolving a bearer once its TTL passes, when it has no TTL, and after a revoke", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tee-ttl-"));
+    dirs.push(dir);
+    const state = await openMcpDurableState({
+      path: join(dir, "state"),
+      key: randomBytes(32),
+    });
+    const dispatch = vi.fn().mockResolvedValue(new Response("{}"));
+    const app = createTeeMcpIngress({
+      state,
+      origin: "https://mcp-dev.vana.org",
+      approvalUrl: "https://vana.example/mcp",
+      allowedRedirectUris: ["https://claude.ai/api/mcp/auth_callback"],
+      gateway: {} as never,
+      verifyGrants: vi.fn(),
+      registerGrantee: vi.fn(),
+      dispatch,
+    });
+
+    const seed = async (id: string, tokenExpiresAt: string | undefined) => {
+      const token = randomBytes(32).toString("hex");
+      await state.connections.create({
+        id,
+        displayName: "Claude",
+        granteeAddress: OWNER,
+        granteePublicKey: "0x02",
+        encryptedGranteePrivateKey: { kind: "plaintext", privateKey: "0x01" },
+        tokenHash: createHash("sha256").update(token).digest("hex"),
+        ...(tokenExpiresAt ? { tokenExpiresAt } : {}),
+        status: "approved",
+        grants: [{ grantId: "0xabc", scopes: ["spotify.profile"] }],
+        createdAt: new Date().toISOString(),
+      } as never);
+      await state.bindOwner(id, { owner: OWNER, chainId: 14800 });
+      return token;
+    };
+    const call = (token: string) =>
+      app.request("/mcp", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", method: "tools/list", id: 1 }),
+      });
+
+    const live = await seed(
+      "live",
+      new Date(Date.now() + MCP_TOKEN_TTL_MS).toISOString(),
+    );
+    expect((await call(live)).status).toBe(200);
+
+    // Same bearer, TTL now behind us: the unknown-token answer, not a 403.
+    await state.connections.update("live", {
+      tokenExpiresAt: new Date(Date.now() - 1000).toISOString(),
+    });
+    const expired = await call(live);
+    expect(expired.status).toBe(401);
+    expect(await expired.json()).toEqual({
+      error: "MCP authorization required",
+    });
+    expect(expired.headers.get("WWW-Authenticate")).toContain(
+      "resource_metadata=",
+    );
+
+    // Pre-TTL records carry no proven lifetime, so they read as expired.
+    const legacy = await seed("legacy", undefined);
+    expect((await call(legacy)).status).toBe(401);
+
+    // Per-connection revoke is the kill switch the fleet still needs a route for.
+    const revocable = await seed(
+      "revocable",
+      new Date(Date.now() + MCP_TOKEN_TTL_MS).toISOString(),
+    );
+    expect((await call(revocable)).status).toBe(200);
+    await revokeMcpConnection("revocable", { store: state.connections });
+    expect((await call(revocable)).status).toBe(401);
+
+    expect(dispatch).toHaveBeenCalledTimes(2);
+  });
+
   it("does not bind an owner or approve OAuth when signed grant verification fails", async () => {
     const dir = await mkdtemp(join(tmpdir(), "tee-mcp-"));
     dirs.push(dir);

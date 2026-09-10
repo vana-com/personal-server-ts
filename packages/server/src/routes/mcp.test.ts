@@ -24,6 +24,7 @@ import { pino } from "pino";
 import { Hono } from "hono";
 import {
   approveMcpConnection,
+  MCP_TOKEN_TTL_MS,
   createInMemoryMcpConnectionStore,
   createInMemoryMcpOAuthAuthorizationStore,
   createMcpConnection,
@@ -440,6 +441,37 @@ describe("MCP /mcp/:token route", () => {
     expect(res.status).toBe(401);
     expect((await res.json()).error.errorCode).toBe("INVALID_TOKEN");
   });
+
+  it("returns 401 once an approved token passes its TTL", async () => {
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store, publicOrigin: SERVER_ORIGIN },
+    );
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "grant-ttl", scopes: ["chatgpt.history"] }],
+      },
+      { store },
+    );
+    const call = () =>
+      app.request(`/mcp/${encodeURIComponent(created.connectionToken)}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
+      });
+    expect((await call()).status).toBe(200);
+
+    await store.update(created.connectionId, {
+      tokenExpiresAt: new Date(Date.now() - 1000).toISOString(),
+    });
+    const res = await call();
+    expect(res.status).toBe(401);
+    expect((await res.json()).error.errorCode).toBe("INVALID_TOKEN");
+  });
 });
 
 describe("MCP OAuth routes", () => {
@@ -611,6 +643,7 @@ describe("MCP OAuth routes", () => {
     expect(token.status).toBe(200);
     const tokenBody = await token.json();
     expect(tokenBody.token_type).toBe("Bearer");
+    expect(tokenBody.expires_in).toBe(MCP_TOKEN_TTL_MS / 1000);
 
     const approvedConnection = await store.getByTokenHash(
       await hashConnectionToken(tokenBody.access_token),
