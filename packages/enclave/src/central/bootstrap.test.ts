@@ -710,6 +710,18 @@ it("keeps stopped members visible and warns once per admission failure code", as
       "PEER_EVENTS_REJECTED",
       "PEER_EVENTS_REJECTED",
     ]);
+
+    const status = (await (
+      await fetch(`http://127.0.0.1:${env.FLEET_ADMIN_PORT}/fleet/v1/status`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+        body: "{}",
+      })
+    ).json()) as { nodes: { nodeId: string; lastAdmission: unknown }[] };
+    expect(status.nodes.map((node) => node.lastAdmission)).toEqual([
+      { code: "PEER_EVENTS_REJECTED", since: expect.any(String), attempts: 1 },
+      { code: "PEER_EVENTS_REJECTED", since: expect.any(String), attempts: 1 },
+    ]);
   } finally {
     vi.useRealTimers();
     logs.mockRestore();

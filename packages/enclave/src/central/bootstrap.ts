@@ -371,6 +371,7 @@ export async function startFleetCentral(
   };
   const common = {
     controller,
+    admissions: () => Object.fromEntries(admissions),
     config: {
       issuedAt: validity?.issuedAt ?? null,
       expiresAt: validity?.expiresAt ?? null,

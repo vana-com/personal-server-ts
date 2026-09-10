@@ -118,6 +118,17 @@ it("rejects event payload lies even when the old digest/log replay still matches
     createDcapPeerVerifier([policy])(evidence(f), challenge, identity),
   ).rejects.toThrow("Peer runtime events rejected");
 });
+it("rejects a repeated mr-kms event with the exact message central maps to a code", async () => {
+  const f = structuredClone(after);
+  const index = f.event_log.findIndex((entry) => entry.event === "mr-kms");
+  f.event_log.splice(index + 1, 0, structuredClone(f.event_log[index]!));
+  remeasure(f);
+  vi.mocked(getCollateralAndVerify).mockResolvedValue(verified(f) as never);
+  // Central's closed allow-list keys PEER_EVENTS_REJECTED on this exact string.
+  await expect(
+    createDcapPeerVerifier([policy])(evidence(f), challenge, identity),
+  ).rejects.toThrow(/^Peer runtime events rejected$/);
+});
 it("rejects reordered, duplicate, missing, unknown and unapproved events even with matching quoted replay", async () => {
   const changes: ((events: Event[]) => void)[] = [
     (e) => {

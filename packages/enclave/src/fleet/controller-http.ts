@@ -10,11 +10,19 @@ export interface FleetStatusConfig {
   appId: string;
   instanceId: string;
 }
+/** Last admission outcome for one member: a code from the controller's closed
+ * allow-list, when that code was first seen, and how often it has repeated. */
+export interface FleetAdmissionRecord {
+  code: string;
+  since: string;
+  attempts: number;
+}
 export interface FleetControlHttpOptions {
   controller: FleetController;
   credential: string;
   role: "gateway" | "admin";
   config?: FleetStatusConfig;
+  admissions?: () => Record<string, FleetAdmissionRecord>;
   active?: () => Promise<boolean>;
   identity(body: unknown): Promise<unknown>;
   seal(body: unknown): Promise<unknown>;
@@ -124,14 +132,19 @@ export function createFleetControlHttp(
           return Response.json(await options.prepareRollback(body));
         if (path === "/fleet/v1/migrate")
           return Response.json(await options.migrate(body));
-        if (path === "/fleet/v1/status")
+        if (path === "/fleet/v1/status") {
+          const admissions = options.admissions?.() ?? {};
           return Response.json({
             controllerTerm: 1,
             paused: options.controller.paused(),
             config: options.config ?? null,
-            nodes: options.controller.nodeStatus(),
+            nodes: options.controller.nodeStatus().map((node) => ({
+              ...node,
+              lastAdmission: admissions[node.nodeId] ?? null,
+            })),
             placements: options.controller.snapshot(),
           });
+        }
       }
       return new Response(null, { status: 404 });
     } catch (error) {

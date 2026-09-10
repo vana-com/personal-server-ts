@@ -20,7 +20,13 @@ credential permits these operations only. Separate admin listener/credential
 permits /fleet/v1/admit and /fleet/v1/drain. Public ingress mounts neither.
 
 Admin POST /fleet/v1/status returns {controllerTerm,paused,config,nodes,
-placements}. `config` is {issuedAt,expiresAt,composeHash,appId,instanceId} for
+placements}. Each entry of `nodes` carries `lastAdmission`, either null or
+{code,since,attempts}. `code` comes from a closed allow-list of reviewed
+verifier and identity refusals — PEER_EVENTS_REJECTED (a second mr-kms event),
+PEER_MEASUREMENTS_REJECTED, PEER_TCB_REJECTED, PEER_NOT_ADMITTED,
+PEER_BINDING_REJECTED, PEER_DEBUG_TDX, IDENTITY_MISMATCH, ADMITTED, and
+UNAVAILABLE for anything else — so no remote-influenced error text is exposed.
+`config` is {issuedAt,expiresAt,composeHash,appId,instanceId} for
 the controller's own verified bundle and identity; it never contains bundle
 environment values. A signed deployment-lifetime bundle serializes `expiresAt`
 as literal null, which is not the same as an absent field. Worker GET

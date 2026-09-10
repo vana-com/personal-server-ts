@@ -131,3 +131,53 @@ it("reports the controller bundle window on private status only", async () => {
   expect(await response.text()).toContain('"expiresAt":null');
   expect((await gateway(request("/fleet/v1/status", token))).status).toBe(404);
 });
+
+it("annotates each directory member with its last admission outcome", async () => {
+  const { common } = fixture();
+  const token = "a".repeat(32);
+  const node = {
+    nodeId: "worker-2",
+    nodeIncarnation: "",
+    capacity: 4,
+    draining: false,
+    unavailable: true,
+  };
+  const lastAdmission = {
+    code: "PEER_EVENTS_REJECTED",
+    since: "2026-09-10T00:00:00.000Z",
+    attempts: 3,
+  };
+  const admin = createFleetControlHttp({
+    ...common,
+    controller: {
+      ...common.controller,
+      nodeStatus: () => [node],
+    } as unknown as FleetController,
+    admissions: () => ({ [node.nodeId]: lastAdmission }),
+    role: "admin",
+    credential: token,
+  });
+
+  const body = (await (
+    await admin(request("/fleet/v1/status", token))
+  ).json()) as { nodes: unknown[] };
+  expect(body.nodes).toEqual([{ ...node, lastAdmission }]);
+});
+
+it("reports a member that has never been admitted as a null outcome", async () => {
+  const { common } = fixture();
+  const token = "a".repeat(32);
+  const admin = createFleetControlHttp({
+    ...common,
+    controller: {
+      ...common.controller,
+      nodeStatus: () => [{ nodeId: "worker-3" }],
+    } as unknown as FleetController,
+    role: "admin",
+    credential: token,
+  });
+
+  expect(
+    await (await admin(request("/fleet/v1/status", token))).text(),
+  ).toContain('"lastAdmission":null');
+});
