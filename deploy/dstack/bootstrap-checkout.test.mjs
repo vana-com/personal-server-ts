@@ -14,9 +14,9 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
+// The fleet composes run prebuilt images and no longer clone at boot, so only
+// the level-B templates still have a checkout bootstrap to harden.
 const templates = [
-  "docker-compose.fleet-worker.yml",
-  "docker-compose.fleet-controller.yml",
   "docker-compose.enclave.yml",
   "docker-compose.enclave.inline.yml",
   "docker-compose.mcp-demo.yml",

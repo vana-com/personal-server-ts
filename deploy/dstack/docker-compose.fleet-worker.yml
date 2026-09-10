@@ -2,6 +2,8 @@
 # Both workers must remain in the existing worker app/KMS domain.
 # Sign the complete worker config; include MCP only for the preserved source.
 # Never expose the public verification key as an externally allowed environment value.
+# Both services run prebuilt digest-pinned images; nothing is fetched or built
+# at boot. AGENT_IMAGE and RUNTIME_IMAGE come from the branch's images.env.
 services:
   agent:
     image: REPLACE_WITH_REVIEWED_AGENT_IMAGE_DIGEST
@@ -25,11 +27,12 @@ services:
       - -ec
       - |
         date -u +%FT%TZ
-        apk add --no-cache docker-cli git
         PS_IMAGE='REPLACE_WITH_REVIEWED_PS_IMAGE_DIGEST'
+        # GIT_REF records the source commit the agent image was built from.
+        # It is measured provenance only; no checkout happens here.
         GIT_REF='REPLACE_WITH_REVIEWED_40_HEX_COMMIT'
         echo "$$GIT_REF" | grep -Eq '^[0-9a-f]{40}$$'
-        echo "$$PS_IMAGE" | grep -Eq '^.+@sha256:[0-9a-f]{64}$$' 
+        echo "$$PS_IMAGE" | grep -Eq '^.+@sha256:[0-9a-f]{64}$$'
         for pull_attempt in 1 2 3; do
           if docker --host=tcp://sandbox-runtime:2375 pull "$$PS_IMAGE"; then
             break
@@ -41,38 +44,10 @@ services:
           echo "Failed to pull PS_IMAGE (attempt $$pull_attempt of 3); retrying in 10 seconds" >&2
           sleep 10
         done
-        : "$${GIT_REF:?GIT_REF must be a 40-hex commit SHA}"
-        # /app is disposable source/build state, never a protected state volume.
-        # Recreate it after an interrupted fetch/build in this retained container.
-        test -r /proc/self/mountinfo
-        if [ -L /app ] || awk '$$5 == "/app" || index($$5, "/app/") == 1 { found=1 } END { exit !found }' /proc/self/mountinfo; then
-          echo "/app must be unmounted disposable source, not a symlink or state volume" >&2
-          exit 1
-        fi
-        cd /
-        rm -rf /app
-        mkdir /app
-        cd /app
-        git init .
-        if git remote get-url origin >/dev/null 2>&1; then
-          git remote set-url origin https://github.com/vana-com/personal-server-ts
-        else
-          git remote add origin https://github.com/vana-com/personal-server-ts
-        fi
-        git fetch --depth 1 origin "$${GIT_REF}"
-        git checkout --detach --force FETCH_HEAD
-        resolved_ref="$$(git rev-parse HEAD)"
-        if [ "$${resolved_ref}" != "$${GIT_REF}" ]; then
-          echo "Checked out commit $${resolved_ref}, expected GIT_REF $${GIT_REF}" >&2
-          exit 1
-        fi
-        npm ci --no-audit --no-fund
         date -u +%FT%TZ
-        npm run build -w @opendatalabs/personal-server-ts-enclave
-        date -u +%FT%TZ
-        exec npm run start:agent -w @opendatalabs/personal-server-ts-enclave
+        exec node packages/enclave/dist/agent/main.js
   sandbox-runtime:
-    image: docker@sha256:f649ef046008ca7f926a2571c32b0ac22e5c59eb61b959617f9acc2a4c638cf5
+    image: REPLACE_WITH_REVIEWED_RUNTIME_IMAGE_DIGEST
     restart: unless-stopped
     privileged: true
     cgroup: host
@@ -83,16 +58,6 @@ services:
       - -ec
     command:
       - |
-        gvisor_release=20260817
-        gvisor_sha512=bd8271a7742f90e53373b2a8613f37f3ae2c765ff5e2e611a75a47167a323cab7519b149c50273307743491713525a14ad1b3e398651c93b16f3e248dfeff3dd
-        gvisor_url="https://storage.googleapis.com/gvisor/releases/release/$${gvisor_release}/x86_64"
-        apk add --no-cache bzip2 coreutils curl iproute2 iptables
-        cd /tmp
-        curl -fsSLO "$${gvisor_url}/gvisor.tar.bz2"
-        printf '%s  %s\n' "$${gvisor_sha512}" gvisor.tar.bz2 | sha512sum -c -
-        tar -xjf gvisor.tar.bz2 -C /usr/local/bin
-        # systrap avoids ptrace syscall overhead; keep runsc-ptrace for the agent constant.
-        runsc install --runtime runsc-ptrace -- --platform=systrap
         runtime_host="$$(ip -4 addr show eth0 | awk '/inet / { sub(/\/.*/, "", $$2); print $$2; exit }')"
         if [ -z "$${runtime_host}" ]; then
           echo "Could not resolve the compose-network address; falling back to 0.0.0.0" >&2

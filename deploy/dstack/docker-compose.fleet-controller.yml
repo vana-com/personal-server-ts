@@ -5,6 +5,8 @@
 # One active controller only; flock fences duplicate processes sharing its volume.
 # The signed config selects lifecycle mode: MCP_MIGRATION_REQUIRED=0 for a
 # net-new empty MCP state, or 1 when a protected state import is required.
+# The controller runs the prebuilt enclave image (AGENT_IMAGE in images.env,
+# the same image the workers run); nothing is fetched or built at boot.
 services:
   controller:
     image: "REPLACE_WITH_REVIEWED_AGENT_IMAGE_DIGEST"
@@ -26,32 +28,11 @@ services:
       - /bin/sh
       - -ec
       - |
-        apk add --no-cache git util-linux
+        # GIT_REF records the source commit the controller image was built from.
+        # It is measured provenance only; no checkout happens here.
         GIT_REF='REPLACE_WITH_REVIEWED_40_HEX_COMMIT'
         test "$${#GIT_REF}" -eq 40
         case "$${GIT_REF}" in *[!0-9a-f]*) exit 1;; esac
-        # /app is disposable source/build state, never a protected state volume.
-        # Recreate it after an interrupted fetch/build in this retained container.
-        test -r /proc/self/mountinfo
-        if [ -L /app ] || awk '$$5 == "/app" || index($$5, "/app/") == 1 { found=1 } END { exit !found }' /proc/self/mountinfo; then
-          echo "/app must be unmounted disposable source, not a symlink or state volume" >&2
-          exit 1
-        fi
-        cd /
-        rm -rf /app
-        mkdir /app
-        cd /app
-        git init .
-        if git remote get-url origin >/dev/null 2>&1; then
-          git remote set-url origin https://github.com/vana-com/personal-server-ts
-        else
-          git remote add origin https://github.com/vana-com/personal-server-ts
-        fi
-        git fetch --depth 1 origin "$${GIT_REF}"
-        git checkout --detach --force FETCH_HEAD
-        test "$$(git rev-parse HEAD)" = "$${GIT_REF}"
-        npm ci --no-audit --no-fund
-        npm run build -w @opendatalabs/personal-server-ts-enclave
         mkdir -p /fleet-state
         exec flock -n /fleet-state/controller.lock node packages/enclave/dist/central/main.js
 
