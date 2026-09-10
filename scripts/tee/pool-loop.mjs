@@ -49,6 +49,9 @@ const ADMIT_DEADLINE_MS = 8 * MINUTE_MS;
 const COOLDOWN_MS = 5 * MINUTE_MS;
 /** Longer than the controller's 120 s drain grace, so a drain can finish. */
 const DRAIN_TIMEOUT_MS = 180 * SECOND_MS;
+/** A stop is asynchronous: the controller keeps reporting the member admitted
+ * for another 30-45 s. Longer than that window, so the flag can be trusted. */
+const STOP_GRACE_MS = 180 * SECOND_MS;
 const MIN_RUNNING = 2;
 const MAX_RUNNING = 4;
 /** Freeze rather than move owners onto a controller about to lose its bundle. */
@@ -123,6 +126,10 @@ const alert = (reason, nodeId = null) => ({
 });
 
 const isRunning = (view) => view.entry.phase === PHASE.running;
+
+/** An always-on member: scale-down may never take it, and the floor wakes it
+ * before any other. It is a property of the machine, not of the pool size. */
+const isPinned = (view) => view.member.pinned === true;
 
 /** A stopped member is only startable while its own signed bundle stays valid
  * for long enough to be worth booting; null expiry is deployment-lived. */
@@ -253,24 +260,62 @@ function advanceDrain(view, ctx) {
   delete entry.idleSince;
 }
 
+/**
+ * Whether the controller's admitted flag describes the member as it runs now.
+ * A loop-issued stop, restart or start is asynchronous: the CVM keeps answering
+ * and the controller keeps reporting `unavailable: false` for another 30-45 s,
+ * so outside `running` the bare flag proves nothing.
+ *
+ *   stop ─┬─ unavailable / absent ───────────────────► the stop landed
+ *         ├─ admitted, inside the grace ─────────────► still the old machine
+ *         └─ admitted past it, admission after the ──► genuinely back up
+ *            stop
+ */
+function settledAdmitted(view, ctx) {
+  const { entry } = view;
+  if (!view.node || view.node.unavailable === true) return false;
+  if (entry.phase === PHASE.running) return true;
+
+  const since = Date.parse(view.node.lastAdmission?.since ?? "");
+  const readmitted = Number.isFinite(since) && since > entry.since;
+
+  // A loop-issued start is confirmed by the readmission alone; every other
+  // phase must also outlive the window in which the old flag still stands.
+  if (entry.startedByLoop) return readmitted;
+  return readmitted && ctx.now - entry.since >= STOP_GRACE_MS;
+}
+
+function holdRunning(view, ctx) {
+  const { entry } = view;
+  if (entry.phase !== PHASE.running) enter(entry, PHASE.running, ctx.now);
+
+  // The restart budget spans the whole boot, not one admission: a member that
+  // flaps must reach the quarantine. Only a loop-issued start that actually
+  // reached admission clears it — never a stop the loop itself asked for.
+  if (entry.startedByLoop) {
+    entry.restarts = 0;
+    delete entry.startedByLoop;
+  }
+
+  if (view.live > 0) delete entry.idleSince;
+  else entry.idleSince ??= ctx.now;
+}
+
 function advanceMember(view, ctx) {
   const { entry } = view;
-  const admitted = !!view.node && view.node.unavailable !== true;
 
   if (entry.phase === PHASE.draining) {
     advanceDrain(view, ctx);
     return;
   }
 
-  if (admitted) {
-    if (entry.phase !== PHASE.running) enter(entry, PHASE.running, ctx.now);
-    // The restart budget spans the whole boot, not one admission: a member that
-    // flaps must reach the quarantine, so only a scale-up start clears it.
-    if (view.live > 0) delete entry.idleSince;
-    else entry.idleSince ??= ctx.now;
+  if (settledAdmitted(view, ctx)) {
+    holdRunning(view, ctx);
     return;
   }
 
+  // Only an explicit start leaves these phases, so the admit deadline can never
+  // fire on a machine that is stopped on purpose.
   if (entry.phase === PHASE.stopped || entry.phase === PHASE.quarantined)
     return;
 
@@ -279,13 +324,16 @@ function advanceMember(view, ctx) {
   advanceAdmission(view, ctx);
 }
 
-const startable = (views, ctx) =>
-  views.find(
-    (view) =>
-      view.entry.phase === PHASE.stopped &&
-      (view.entry.cooldownUntil ?? 0) <= ctx.now &&
-      bundleStartable(view.member, ctx.now),
-  );
+const wakeable = (view, ctx) =>
+  view.entry.phase === PHASE.stopped &&
+  (view.entry.cooldownUntil ?? 0) <= ctx.now &&
+  bundleStartable(view.member, ctx.now);
+
+/** Pinned members are always-on, so they are the first the pool wakes. */
+const startable = (views, ctx) => {
+  const cold = views.filter((view) => wakeable(view, ctx));
+  return cold.find(isPinned) ?? cold[0];
+};
 
 function startMember(view, ctx, state) {
   ctx.actions.push({
@@ -294,8 +342,8 @@ function startMember(view, ctx, state) {
     cvmId: view.member.cvmId,
   });
   enter(view.entry, PHASE.starting, ctx.now);
-  // A fresh boot gets a fresh restart budget; nothing else resets it.
-  view.entry.restarts = 0;
+  // The fresh restart budget is earned by reaching admission, not by asking.
+  view.entry.startedByLoop = true;
   delete state.saturatedSince;
 }
 
@@ -310,6 +358,15 @@ function scaleUp(views, ctx, state) {
     (total, view) => total + Math.max(0, view.capacity - view.live),
     0,
   );
+
+  // A pinned member is always-on. It is woken ahead of the warm floor, which
+  // counts machines: three running members already satisfy a floor of two while
+  // the small always-on machine sits stopped.
+  const asleep = views.find((view) => isPinned(view) && wakeable(view, ctx));
+  if (asleep) {
+    startMember(asleep, ctx, state);
+    return;
+  }
 
   // The warm floor comes before saturation. After a quarantine or a cold start
   // the pool must climb back to MIN_RUNNING without first waiting out a full
@@ -351,9 +408,12 @@ function scaleDown(views, ctx) {
   const running = views.filter(isRunning);
   if (running.length <= ctx.limits.minRunning) return;
 
+  // Scale-down ranks only the members it is allowed to take: draining the
+  // longest-idle machine of all once cost the pool its always-on tdx.small.
   const idle = running
     .filter(
       (view) =>
+        !isPinned(view) &&
         view.live === 0 &&
         view.entry.idleSince !== undefined &&
         ctx.now - view.entry.idleSince >= IDLE_MS,
@@ -679,10 +739,11 @@ function assertMember(member, index, poolPath) {
     !CVM_ID_PATTERN.test(member.cvmId ?? "") ||
     !httpsUrl(member.publicUrl) ||
     !Number.isSafeInteger(member.capacity) ||
-    member.capacity < 1;
+    member.capacity < 1 ||
+    (member.pinned !== undefined && typeof member.pinned !== "boolean");
   if (invalid)
     throw new Error(
-      `${poolPath} member ${index} needs a nodeId, cvmId, https publicUrl and capacity`,
+      `${poolPath} member ${index} needs a nodeId, cvmId, https publicUrl, capacity and an optional boolean pinned`,
     );
 }
 

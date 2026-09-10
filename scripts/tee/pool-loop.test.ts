@@ -14,12 +14,13 @@ const NOW = Date.parse("2026-09-10T12:00:00.000Z");
 const MINUTE = 60_000;
 const CAPACITY = 4;
 
-const member = (nodeId: string, cvmId: string) => ({
+const member = (nodeId: string, cvmId: string, extra: object = {}) => ({
   nodeId,
   cvmId,
   publicUrl: `https://${nodeId}.invalid`,
   capacity: CAPACITY,
   bundleExpiresAt: null,
+  ...extra,
 });
 
 const MEMBERS = [
@@ -47,6 +48,18 @@ const declared = (nodeId: string, extra: object = {}) => ({
   lastAdmission: null,
   ...extra,
 });
+
+/** An admission the controller raised after the loop's own command: only this
+ * proves the flag describes the machine as it runs now. */
+const readmitted = (nodeId: string, at: number, extra: object = {}) =>
+  admitted(nodeId, {
+    lastAdmission: {
+      code: "ADMITTED",
+      since: new Date(at).toISOString(),
+      attempts: 1,
+    },
+    ...extra,
+  });
 
 const placements = (nodeId: string, count: number) =>
   Array.from({ length: count }, (_, index) => ({
@@ -400,6 +413,7 @@ describe("decidePoolActions", () => {
       ),
       state: {
         nodes: {
+          "worker-1": runningState("worker-1"),
           "worker-2": {
             phase: PHASE.draining,
             since: NOW - 4 * MINUTE,
@@ -480,7 +494,7 @@ describe("decidePoolActions", () => {
     ]);
     expect(state.nodes["worker-3"]).toMatchObject({
       phase: PHASE.starting,
-      restarts: 0,
+      restarts: 1,
     });
   });
 
@@ -522,14 +536,18 @@ describe("decidePoolActions", () => {
     const { state } = decidePoolActions({
       now: NOW,
       members: MEMBERS,
-      status: status(["worker-1", "worker-2", "worker-3"].map(admitted)),
+      status: status([
+        admitted("worker-1"),
+        admitted("worker-2"),
+        readmitted("worker-3", NOW - MINUTE),
+      ]),
       state: {
         nodes: {
           "worker-1": runningState("worker-1"),
           "worker-2": runningState("worker-2"),
           "worker-3": {
             phase: PHASE.admitWait,
-            since: NOW - MINUTE,
+            since: NOW - 10 * MINUTE,
             restarts: 1,
           },
         },
@@ -640,5 +658,233 @@ describe("decidePoolActions", () => {
 
     expect(state.nodes["worker-3"]).toEqual(previous.nodes["worker-3"]);
     expect(state.saturatedSince).toBe(previous.saturatedSince);
+  });
+
+  // 2026-09-10 soak, 20:19:40Z-20:30:20Z: the loop stopped worker-3, the
+  // controller kept reporting it admitted for 34 s, the tick inside that window
+  // rewrote `stopped` to `running`, and 8 min later the admit deadline restarted
+  // a machine that was stopped on purpose.
+  describe("a stop the controller has not caught up with", () => {
+    const stopped = (extra: object = {}) => ({
+      nodes: {
+        "worker-1": runningState("worker-1"),
+        "worker-2": runningState("worker-2"),
+        "worker-3": {
+          phase: PHASE.stopped,
+          since: NOW,
+          restarts: 0,
+          cooldownUntil: NOW + 5 * MINUTE,
+          ...extra,
+        },
+      },
+    });
+
+    it("keeps the stopped phase while the admitted flag is still standing", () => {
+      const { actions, state } = decidePoolActions({
+        now: NOW + 30_000,
+        members: MEMBERS,
+        status: status(["worker-1", "worker-2", "worker-3"].map(admitted)),
+        state: stopped(),
+      });
+
+      expect(actions).toEqual([]);
+      expect(state.nodes["worker-3"]).toMatchObject({
+        phase: PHASE.stopped,
+        since: NOW,
+        restarts: 0,
+      });
+    });
+
+    it("never spends the restart budget on a member it stopped itself", () => {
+      // The tick that used to fire ADMIT_DEADLINE_EXCEEDED: 9 min after the
+      // stop, with the controller's demotion long since arrived.
+      const { actions, state } = decidePoolActions({
+        now: NOW + 9 * MINUTE,
+        members: MEMBERS,
+        status: status([
+          admitted("worker-1"),
+          admitted("worker-2"),
+          admitted("worker-3", { unavailable: true }),
+        ]),
+        health: { "worker-3": { status: 200, configExpiresAt: null } },
+        state: stopped(),
+      });
+
+      expect(actions).toEqual([]);
+      expect(state.nodes["worker-3"]).toMatchObject({
+        phase: PHASE.stopped,
+        restarts: 0,
+      });
+    });
+
+    it("reclaims a stopped member only on an admission raised after the stop", () => {
+      const past = decidePoolActions({
+        now: NOW + 4 * MINUTE,
+        members: MEMBERS,
+        status: status([
+          admitted("worker-1"),
+          admitted("worker-2"),
+          readmitted("worker-3", NOW - MINUTE),
+        ]),
+        state: stopped(),
+      });
+      expect(past.state.nodes["worker-3"].phase).toBe(PHASE.stopped);
+
+      const back = decidePoolActions({
+        now: NOW + 4 * MINUTE,
+        members: MEMBERS,
+        status: status([
+          admitted("worker-1"),
+          admitted("worker-2"),
+          readmitted("worker-3", NOW + MINUTE),
+        ]),
+        state: stopped(),
+      });
+      expect(back.state.nodes["worker-3"].phase).toBe(PHASE.running);
+    });
+  });
+
+  // Same soak, 20:30:55Z: scale-down drained worker-1 - the always-on
+  // tdx.small - because defect 1 had just rebooted the two mediums, leaving W1
+  // the longest idle. MIN_RUNNING counts machines, so it never noticed.
+  describe("pinned members", () => {
+    const PINNED = [
+      member("worker-1", "cvm-1", { pinned: true }),
+      member("worker-2", "cvm-2", { pinned: true }),
+      member("worker-3", "cvm-3"),
+    ];
+    const idle = (nodeId: string, minutes: number) =>
+      runningState(nodeId, { idleSince: NOW - minutes * MINUTE });
+
+    it("drains a non-pinned member even when a pinned one is idler", () => {
+      const { actions } = decidePoolActions({
+        now: NOW,
+        members: PINNED,
+        status: status(
+          ["worker-1", "worker-2", "worker-3"].map((id) => admitted(id)),
+        ),
+        state: {
+          nodes: {
+            "worker-1": idle("worker-1", 40),
+            "worker-2": idle("worker-2", 30),
+            "worker-3": idle("worker-3", 20),
+          },
+        },
+      });
+
+      expect(actions).toEqual([{ type: ACTION.drain, nodeId: "worker-3" }]);
+    });
+
+    it("keeps a pinned member up once it is the only idle one left", () => {
+      const { actions } = decidePoolActions({
+        now: NOW,
+        members: PINNED,
+        status: status(
+          ["worker-1", "worker-2", "worker-3"].map((id) => admitted(id)),
+        ),
+        state: {
+          nodes: {
+            "worker-1": idle("worker-1", 40),
+            "worker-2": idle("worker-2", 30),
+            "worker-3": runningState("worker-3", { idleSince: NOW }),
+          },
+        },
+      });
+
+      expect(actions).toEqual([]);
+    });
+
+    it("wakes a stopped pinned member while the numeric floor is satisfied", () => {
+      // The pool the soak drifted to: three running, the always-on small one
+      // stopped. `warm >= MIN_RUNNING`, so only the pin brings it back.
+      const { actions, state } = decidePoolActions({
+        now: NOW,
+        members: [...PINNED, member("worker-4", "cvm-4")],
+        status: status([
+          admitted("worker-1", { unavailable: true }),
+          admitted("worker-2"),
+          admitted("worker-3"),
+          admitted("worker-4"),
+        ]),
+        state: {
+          nodes: {
+            "worker-1": {
+              phase: PHASE.stopped,
+              since: NOW - 10 * MINUTE,
+              restarts: 1,
+            },
+            "worker-2": idle("worker-2", 20),
+            "worker-3": idle("worker-3", 20),
+            "worker-4": idle("worker-4", 20),
+          },
+        },
+      });
+
+      // The drain of the idlest non-pinned member rides along; worker-2 is not
+      // a candidate for it.
+      expect(actions).toEqual([
+        { type: ACTION.start, nodeId: "worker-1", cvmId: "cvm-1" },
+        { type: ACTION.drain, nodeId: "worker-3" },
+      ]);
+      expect(state.nodes["worker-1"]).toMatchObject({
+        phase: PHASE.starting,
+        restarts: 1,
+      });
+    });
+
+    it("leaves a quarantined pinned member alone", () => {
+      const { actions } = decidePoolActions({
+        now: NOW,
+        members: PINNED,
+        status: status([
+          admitted("worker-1", { unavailable: true }),
+          admitted("worker-2"),
+          admitted("worker-3"),
+        ]),
+        state: {
+          nodes: {
+            "worker-1": {
+              phase: PHASE.quarantined,
+              since: NOW - 10 * MINUTE,
+              restarts: 1,
+            },
+            "worker-2": runningState("worker-2", { idleSince: NOW }),
+            "worker-3": runningState("worker-3", { idleSince: NOW }),
+          },
+        },
+      });
+
+      expect(actions).toEqual([]);
+    });
+
+    it("gives a landed start a fresh restart budget", () => {
+      const { state } = decidePoolActions({
+        now: NOW + MINUTE,
+        members: PINNED,
+        status: status([
+          readmitted("worker-1", NOW + 30_000),
+          admitted("worker-2"),
+          admitted("worker-3"),
+        ]),
+        state: {
+          nodes: {
+            "worker-1": {
+              phase: PHASE.starting,
+              since: NOW,
+              restarts: 1,
+              startedByLoop: true,
+            },
+            "worker-2": runningState("worker-2", { idleSince: NOW }),
+            "worker-3": runningState("worker-3", { idleSince: NOW }),
+          },
+        },
+      });
+
+      expect(state.nodes["worker-1"]).toMatchObject({
+        phase: PHASE.running,
+        restarts: 0,
+      });
+      expect(state.nodes["worker-1"].startedByLoop).toBeUndefined();
+    });
   });
 });
