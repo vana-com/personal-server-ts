@@ -263,6 +263,7 @@ function createRuntime(
   return createDockerRuntime({
     dockerHost: config.dockerHost,
     memory: config.sandboxMemory,
+    dataSize: config.sandboxDataSize,
     cpus: config.sandboxCpus,
     pidsLimit: config.sandboxPidsLimit,
     logger: CONSOLE_LOGGER,

@@ -25,8 +25,11 @@ const GVISOR_RUNTIME = "runsc-ptrace";
 const CONTAINER_USER = "1000:1000";
 const DROPPED_CAPABILITIES = "ALL";
 const NO_NEW_PRIVILEGES = "no-new-privileges:true";
-const DATA_TMPFS =
-  "/data:rw,noexec,nosuid,nodev,size=256m,uid=1000,gid=1000,mode=0700";
+const DATA_TMPFS_PREFIX = "/data:rw,noexec,nosuid,nodev,size=";
+const DATA_TMPFS_SUFFIX = ",uid=1000,gid=1000,mode=0700";
+/** Denser pools trade this per-sandbox scratch tmpfs against agent headroom. */
+const dataTmpfs = (size: string): string =>
+  `${DATA_TMPFS_PREFIX}${size}${DATA_TMPFS_SUFFIX}`;
 const CONTAINER_PORT = 8080;
 const MILLISECONDS_PER_MINUTE = 60_000;
 const DEFAULT_HEALTH_TIMEOUT_MS = 2 * MILLISECONDS_PER_MINUTE;
@@ -73,6 +76,7 @@ const NON_TRANSIENT_SANDBOX_PATTERNS = [
 export const DEFAULT_SANDBOX_MEMORY = "512m";
 export const DEFAULT_SANDBOX_CPUS = "2";
 export const DEFAULT_SANDBOX_PIDS_LIMIT = 256;
+export const DEFAULT_SANDBOX_DATA_SIZE = "256m";
 
 const FIXED_ENV = {
   CLOUD_MODE: "true",
@@ -114,6 +118,7 @@ export interface DockerRuntimeOptions {
   memory?: string;
   cpus?: string;
   pidsLimit?: number;
+  dataSize?: string;
 }
 
 export interface SandboxWaitLogger {
@@ -165,6 +170,7 @@ export function createDockerRuntime(
   const memory = options.memory ?? DEFAULT_SANDBOX_MEMORY;
   const cpus = options.cpus ?? DEFAULT_SANDBOX_CPUS;
   const pidsLimit = options.pidsLimit ?? DEFAULT_SANDBOX_PIDS_LIMIT;
+  const dataSize = options.dataSize ?? DEFAULT_SANDBOX_DATA_SIZE;
 
   return {
     async reconcile(): Promise<void> {
@@ -198,6 +204,7 @@ export function createDockerRuntime(
             memory,
             cpus,
             pidsLimit,
+            dataSize,
             secretFile.path,
           ),
           undefined,
@@ -395,6 +402,7 @@ function createArgs(
   memory: string,
   cpus: string,
   pidsLimit: number,
+  dataSize: string,
   secretEnvFile: string,
 ): string[] {
   const args = [
@@ -418,7 +426,7 @@ function createArgs(
     "--security-opt",
     NO_NEW_PRIVILEGES,
     "--tmpfs",
-    DATA_TMPFS,
+    dataTmpfs(dataSize),
     PUBLISH_FLAG,
     PUBLISHED_PORT,
   ];

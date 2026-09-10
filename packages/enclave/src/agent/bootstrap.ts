@@ -7,6 +7,7 @@ import { createRealDstackClient } from "../dstack/real.js";
 import { DEFAULT_LEASE_SECONDS, MAX_LEASE_SECONDS } from "../jobs/types.js";
 import {
   DEFAULT_SANDBOX_CPUS,
+  DEFAULT_SANDBOX_DATA_SIZE,
   DEFAULT_SANDBOX_MEMORY,
   DEFAULT_SANDBOX_PIDS_LIMIT,
 } from "../sandbox/docker-runtime.js";
@@ -74,6 +75,7 @@ export interface AgentJobsConfig {
   image: string;
   sandboxMax: number;
   sandboxMemory: string;
+  sandboxDataSize: string;
   sandboxCpus: string;
   sandboxPidsLimit: number;
   idleTtlMs: number;
@@ -146,7 +148,16 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
     SANDBOX_MAX,
     MIN_POSITIVE_INTEGER,
   );
-  const sandboxMemory = readMemory(env.SANDBOX_MEMORY);
+  const sandboxMemory = readMemory(
+    env.SANDBOX_MEMORY,
+    "SANDBOX_MEMORY",
+    DEFAULT_SANDBOX_MEMORY,
+  );
+  const sandboxDataSize = readMemory(
+    env.SANDBOX_DATA_SIZE,
+    "SANDBOX_DATA_SIZE",
+    DEFAULT_SANDBOX_DATA_SIZE,
+  );
   const sandboxCpus = readCpus(env.SANDBOX_CPUS);
   const sandboxPidsLimit = readInteger(
     env.SANDBOX_PIDS_LIMIT,
@@ -231,6 +242,7 @@ function jobsConfig(env: NodeJS.ProcessEnv): AgentJobsConfig | undefined {
     image,
     sandboxMax,
     sandboxMemory,
+    sandboxDataSize,
     sandboxCpus,
     sandboxPidsLimit,
     idleTtlMs: idleTtlSeconds * MILLISECONDS_PER_SECOND,
@@ -339,10 +351,14 @@ function firstNonLoopbackIpv4(
   return undefined;
 }
 
-function readMemory(value: string | undefined): string {
-  const memory = value ?? DEFAULT_SANDBOX_MEMORY;
+function readMemory(
+  value: string | undefined,
+  key: string,
+  fallback: string,
+): string {
+  const memory = value ?? fallback;
   if (!MEMORY_PATTERN.test(memory)) {
-    throw new Error("SANDBOX_MEMORY must be a positive Docker memory value");
+    throw new Error(`${key} must be a positive Docker memory value`);
   }
 
   return memory;

@@ -95,6 +95,7 @@ describe("agentConfigFromEnv", () => {
       sandboxMax: 4,
       idleTtlMs: 9_000,
       sandboxMemory: "768m",
+      sandboxDataSize: "256m",
       sandboxCpus: "1.5",
       sandboxPidsLimit: 128,
       leaseSeconds: 60,
@@ -396,10 +397,30 @@ describe("agentConfigFromEnv", () => {
     });
   });
 
+  it("accepts an explicit sandbox data tmpfs size", () => {
+    const config = agentConfigFromEnv({
+      DSTACK_FAKE: "1",
+      ENCLAVE_AGENT_SECRET: "agent-secret",
+      GATEWAY_URL: "https://gateway.example",
+      NODE_ID: "node-1",
+      NODE_SECRET: "node-secret",
+      PS_IMAGE: TAGGED_IMAGE,
+      SANDBOX_RUNTIME: "fake",
+      SANDBOX_MAX: "4",
+      SANDBOX_DATA_SIZE: "192m",
+    });
+
+    expect(config.jobs).toMatchObject({
+      sandboxMax: 4,
+      sandboxDataSize: "192m",
+    });
+  });
+
   it.each([
     ["SANDBOX_RUNTIME", "invalid", "SANDBOX_RUNTIME"],
     ["SANDBOX_MAX", "0", "SANDBOX_MAX"],
     ["SANDBOX_MEMORY", "unlimited", "SANDBOX_MEMORY"],
+    ["SANDBOX_DATA_SIZE", "half", "SANDBOX_DATA_SIZE"],
     ["SANDBOX_CPUS", "0", "SANDBOX_CPUS"],
     ["SANDBOX_PIDS_LIMIT", "0", "SANDBOX_PIDS_LIMIT"],
     ["LEASE_SECONDS", "301", "LEASE_SECONDS"],

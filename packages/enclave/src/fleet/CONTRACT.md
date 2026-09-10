@@ -58,6 +58,11 @@ strings. Encoding changes only transport; the decoded document still passes
 all signature, schema, lifetime and TEE identity checks. Signers must verify
 this exact wire value locally before submitting encrypted environment values.
 
+Worker bundles may set `SANDBOX_DATA_SIZE` to resize each sandbox's `/data`
+tmpfs; unset keeps the previous 256m mount exactly. It trades scratch space for
+agent headroom when a signed bundle raises per-instance capacity. Adding a key
+to the allow-list needs no compose or attestation change.
+
 Dstack encrypted environment values are not measured or authenticated. Every
 fleet application boot verifies an operator Ed25519 signature before deriving
 protected state keys or opening admin, migration, or peer listeners. The complete

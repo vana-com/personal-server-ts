@@ -208,6 +208,24 @@ describe("docker sandbox runtime", () => {
     );
   });
 
+  it("resizes only the data tmpfs and keeps every other mount option", async () => {
+    const docker = scriptedDocker();
+    const runtime = createDockerRuntime({
+      docker,
+      dataSize: "192m",
+      health: async () => true,
+    });
+
+    await runtime.start(sandboxSpec());
+
+    expect(docker.calls[1]?.args).toEqual(
+      expect.arrayContaining([
+        "--tmpfs",
+        "/data:rw,noexec,nosuid,nodev,size=192m,uid=1000,gid=1000,mode=0700",
+      ]),
+    );
+  });
+
   it("passes the result byte budget to the sandbox environment", async () => {
     const docker = scriptedDocker();
     const runtime = createDockerRuntime({ docker, health: async () => true });
