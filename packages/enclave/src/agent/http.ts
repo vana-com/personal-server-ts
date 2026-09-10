@@ -384,7 +384,7 @@ async function handleAccessRecords(
     for (const input of inputs) {
       const record = buildAccessRecord(input, identity, options.jobs.nodeId);
       const signature = await account.signMessage(canonicalJson(record));
-      signed.push({ ...record, signature });
+      signed.push({ payload: record, signature });
     }
 
     await options.jobs.postAccessRecords(signed);

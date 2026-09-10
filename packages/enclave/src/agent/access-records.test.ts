@@ -150,16 +150,16 @@ describe("agent access records route", () => {
       USER_PS_ID,
       EPOCH,
     );
-    for (const record of posted[0]) {
-      expect(record.userPsId).toBe(USER_PS_ID);
-      expect(record.epoch).toBe(EPOCH);
-      expect(record.nodeId).toBe(NODE_ID);
-      expect(record).not.toHaveProperty("ownerAddress");
-      const { signature, ...unsigned } = record;
+    for (const { payload, signature } of posted[0]) {
+      expect(payload.userPsId).toBe(USER_PS_ID);
+      expect(payload.epoch).toBe(EPOCH);
+      expect(payload.nodeId).toBe(NODE_ID);
+      expect(payload).not.toHaveProperty("ownerAddress");
+      expect(payload).not.toHaveProperty("signature");
       await expect(
         verifyMessage({
           address: account.address,
-          message: canonicalJson(unsigned),
+          message: canonicalJson(payload),
           signature,
         }),
       ).resolves.toBe(true);

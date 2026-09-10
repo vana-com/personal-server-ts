@@ -44,7 +44,15 @@ export interface AccessRecord extends AccessRecordInput {
   userPsId: UserPsId;
 }
 
-export interface SignedAccessRecord extends AccessRecord {
+/**
+ * The wire envelope the Gateway parses: the signed bytes are the canonical
+ * JSON of `payload` alone, so nesting keeps the signature over exactly the
+ * fields that get stored.
+ *
+ *   { payload: { action: "read", ... }, signature: "0x.." }
+ */
+export interface SignedAccessRecord {
+  payload: AccessRecord;
   signature: Hex;
 }
 

@@ -243,18 +243,20 @@ describe("GatewayClient", () => {
     });
     const records = [
       {
-        action: "read",
-        chainId: 14_800,
-        epoch: 1,
-        grantId: "grant-1",
-        granteeAddress: `0x${"11".repeat(20)}`,
-        logId: "log-1",
-        nodeId: NODE_ID,
-        occurredAt: "2026-09-09T00:00:00.000Z",
-        outcome: "served",
-        scope: "instagram.profile",
-        source: "mcp",
-        userPsId: `0x${"22".repeat(32)}`,
+        payload: {
+          action: "read",
+          chainId: 14_800,
+          epoch: 1,
+          grantId: "grant-1",
+          granteeAddress: `0x${"11".repeat(20)}`,
+          logId: "log-1",
+          nodeId: NODE_ID,
+          occurredAt: "2026-09-09T00:00:00.000Z",
+          outcome: "served",
+          scope: "instagram.profile",
+          source: "mcp",
+          userPsId: `0x${"22".repeat(32)}`,
+        },
         signature: `0x${"33".repeat(65)}`,
       },
     ] as Parameters<typeof client.postAccessRecords>[0]["records"];
