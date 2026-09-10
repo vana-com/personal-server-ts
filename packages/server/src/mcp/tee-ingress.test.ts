@@ -5,7 +5,11 @@ import { createHash, randomBytes } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createMcpOAuthAuthorization } from "@opendatalabs/personal-server-ts-core/mcp";
 import { openMcpDurableState } from "./durable-state.js";
-import { createTeeMcpIngress } from "./tee-ingress.js";
+import {
+  createTeeMcpIngress,
+  McpOwnerAccessRevokedError,
+  OWNER_ACCESS_REVOKED_CODE,
+} from "./tee-ingress.js";
 
 const dirs: string[] = [];
 const OWNER = "0x1111111111111111111111111111111111111111";
@@ -206,6 +210,60 @@ describe("TEE MCP ingress", () => {
       expect(dispatch).toHaveBeenCalledTimes(1);
     },
   );
+
+  it("answers a revoked owner with a specific non-retryable code and keeps 503 for unrelated failures", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tee-revoked-"));
+    dirs.push(dir);
+    const state = await openMcpDurableState({
+      path: join(dir, "state"),
+      key: randomBytes(32),
+    });
+    const token = randomBytes(32).toString("hex");
+    const connection = {
+      id: "connection-1",
+      displayName: "Claude",
+      granteeAddress: OWNER,
+      granteePublicKey: "0x02",
+      encryptedGranteePrivateKey: { kind: "plaintext", privateKey: "0x01" },
+      tokenHash: createHash("sha256").update(token).digest("hex"),
+      status: "approved",
+      grants: [{ grantId: "0xabc", scopes: ["spotify.profile"] }],
+      createdAt: new Date().toISOString(),
+    } as never;
+    await state.connections.create(connection);
+    await state.bindOwner("connection-1", { owner: OWNER, chainId: 14800 });
+    const dispatch = vi
+      .fn()
+      .mockRejectedValue(new McpOwnerAccessRevokedError());
+    const app = createTeeMcpIngress({
+      state,
+      origin: "https://mcp-dev.vana.org",
+      approvalUrl: "https://vana.example/mcp",
+      allowedRedirectUris: ["https://claude.ai/api/mcp/auth_callback"],
+      gateway: {} as never,
+      verifyGrants: vi.fn(),
+      registerGrantee: vi.fn(),
+      dispatch,
+    });
+    const call = () =>
+      app.request("/mcp", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", method: "tools/list", id: 1 }),
+      });
+    const revoked = await call();
+    expect(revoked.status).toBe(403);
+    const body = await revoked.json();
+    expect(body.error).toBe(OWNER_ACCESS_REVOKED_CODE);
+    expect(JSON.stringify(body)).not.toContain(OWNER);
+    dispatch.mockRejectedValue(new Error("worker unavailable"));
+    const unavailable = await call();
+    expect(unavailable.status).toBe(503);
+    expect((await unavailable.json()).error).toBe("MCP request unavailable");
+  });
   it("does not bind an owner or approve OAuth when signed grant verification fails", async () => {
     const dir = await mkdtemp(join(tmpdir(), "tee-mcp-"));
     dirs.push(dir);

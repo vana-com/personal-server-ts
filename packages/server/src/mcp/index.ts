@@ -1,4 +1,9 @@
-export { createTeeMcpIngress, type TeeMcpIngressDeps } from "./tee-ingress.js";
+export {
+  createTeeMcpIngress,
+  McpOwnerAccessRevokedError,
+  OWNER_ACCESS_REVOKED_CODE,
+  type TeeMcpIngressDeps,
+} from "./tee-ingress.js";
 export {
   openMcpDurableState,
   type McpDurableState,
