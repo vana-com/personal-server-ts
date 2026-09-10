@@ -5,8 +5,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import {
   FLEET_LEASE_MS,
   FLEET_READINESS_MAX_AGE_MS,
+  FLEET_RENEW_MS,
   fleetOwnerKey,
   sameAssignment,
+  terminalAdmission,
   type FleetAssignment,
   type FleetOwner,
   type FleetReadiness,
@@ -14,11 +16,23 @@ import {
   type FleetWorkerPort,
 } from "./contracts.js";
 
+/** One failed renewal is not proof a member is gone: the peer RPC budget is 8 s
+ * and it must fit a full mutual-DCAP handshake, so a controller-side stall
+ * trips every renewal at once. Demote only on a streak. */
+const RENEW_FAILURE_GRACE = 2;
+/** The streak must still end while the lease is live, so a member that really
+ * stopped answering is demoted before the row expires and is reaped. */
+const RENEW_GRACE_MS = FLEET_LEASE_MS - FLEET_RENEW_MS;
+
 export interface FleetPlacementRow {
   owner: FleetOwner;
   generation: number;
   lastActivityAt: string;
   renewalBlocked?: boolean;
+  /** The block came from a worker RPC that may still have landed, so a later
+   * successful renewal to the same member releases it. A Gateway projection
+   * block is not releasable this way: only a fresh `ensure` clears it. */
+  renewalRetryable?: boolean;
   /** Successful metadata-only membership is retained for paused recovery. */
   enrolled?: boolean;
   assignment: FleetAssignment | null;
@@ -37,6 +51,10 @@ interface NodeRecord {
   capacity: number;
   draining: boolean;
   unavailable: boolean;
+  /** Consecutive failed renewal RPCs, and when that streak began. Persisted so
+   * a restart cannot hand a member that stopped answering a fresh grace. */
+  renewFailures?: number;
+  renewFailedSince?: string;
 }
 /** A pool member the signed policy lists but which has never attested. */
 export interface FleetDeclaredNode {
@@ -158,6 +176,29 @@ export async function openFleetController(options: FleetControllerOptions) {
   };
   const healthy = (nodeId: string): boolean =>
     !directory.nodes[nodeId]?.unavailable;
+  /** Records one failed renewal RPC and reports whether the grace still covers
+   * it. e.g. two controller stalls 5 s apart on 2026-09-10 each tripped a
+   * single tick on a different member; neither member was gone. */
+  const graceRemains = (nodeId: string): boolean => {
+    const record = directory.nodes[nodeId];
+    if (!record) return false;
+
+    const since = record.renewFailedSince ?? new Date(now()).toISOString();
+    record.renewFailures = (record.renewFailures ?? 0) + 1;
+    record.renewFailedSince = since;
+    return (
+      record.renewFailures < RENEW_FAILURE_GRACE &&
+      now() - Date.parse(since) < RENEW_GRACE_MS
+    );
+  };
+  const clearRenewFailures = (nodeId: string): boolean => {
+    const record = directory.nodes[nodeId];
+    if (!record?.renewFailures) return false;
+
+    delete record.renewFailures;
+    delete record.renewFailedSince;
+    return true;
+  };
   /** Rows holding an unexpired lease on a member. An expired row owns no slot:
    * the worker retired it at its own earlier deadline, `ensure` re-places its
    * owner elsewhere, and `renew` reaps it. */
@@ -457,6 +498,7 @@ export async function openFleetController(options: FleetControllerOptions) {
         };
         row.lastActivityAt = new Date(now()).toISOString();
         row.renewalBlocked = false;
+        row.renewalRetryable = false;
         row.assignment = assignment;
         await persist();
         emit("placement_starting", assignment);
@@ -548,14 +590,20 @@ export async function openFleetController(options: FleetControllerOptions) {
                 }
               }
               rows[key]!.renewalBlocked = false;
+              rows[key]!.renewalRetryable = false;
               await forget(assignment);
               return;
             }
 
+            const row = rows[key]!;
+            // A block left by an unconfirmed worker RPC is retried while the
+            // member is still healthy: answering again is what proves the node
+            // is there, and the owner keeps its generation instead of being
+            // evicted the moment the lease lapses.
             if (
               !current(assignment) ||
               assignment.state === "draining" ||
-              rows[key]?.renewalBlocked ||
+              (row.renewalBlocked && !row.renewalRetryable) ||
               !healthy(assignment.nodeId)
             )
               return;
@@ -572,6 +620,7 @@ export async function openFleetController(options: FleetControllerOptions) {
                 sameAssignment(rows[key]!.assignment!, assignment)
               ) {
                 rows[key]!.renewalBlocked = true;
+                rows[key]!.renewalRetryable = false;
                 observations.delete(key);
                 await persist();
               }
@@ -595,7 +644,26 @@ export async function openFleetController(options: FleetControllerOptions) {
                   }
                 }
               }
-            } catch {
+              // The member answered, so end its failure streak and release a
+              // block a previous unconfirmed renewal left on this row.
+              const ended = clearRenewFailures(node.nodeId);
+              const released = row.renewalBlocked && row.renewalRetryable;
+              if (released) {
+                row.renewalBlocked = false;
+                row.renewalRetryable = false;
+              }
+              if (ended || released) await persist();
+            } catch (error) {
+              // One timed-out handshake is a controller stall as often as a dead
+              // peer, so spend the grace before demoting. An allow-listed
+              // attestation or identity refusal is a verdict, not a stall: it
+              // demotes on the first failure, as `attestAll` already does.
+              if (!terminalAdmission(error) && graceRemains(node.nodeId)) {
+                await persist();
+                emit("placement_renewal_deferred", assignment);
+                return;
+              }
+
               // The worker might have received this extension. Retain precisely
               // that possible expiry, but never keep extending an unreachable node.
               if (
@@ -606,8 +674,10 @@ export async function openFleetController(options: FleetControllerOptions) {
               if (
                 rows[key]?.assignment &&
                 sameAssignment(rows[key]!.assignment!, assignment)
-              )
+              ) {
                 rows[key]!.renewalBlocked = true;
+                rows[key]!.renewalRetryable = true;
+              }
               observations.delete(key);
               await persist();
               emit("placement_renewal_failed", assignment);

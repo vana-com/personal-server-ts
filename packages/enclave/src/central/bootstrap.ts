@@ -25,6 +25,7 @@ import {
   type FleetController,
 } from "../fleet/placement.js";
 import {
+  admissionCode,
   FLEET_RENEW_MS,
   type FleetOwner,
   type FleetPeerIdentity,
@@ -50,18 +51,6 @@ const logger = {
     console.error({ level: "error", ...context, message }),
 };
 const ADMITTED_CODE = "ADMITTED";
-const UNAVAILABLE_CODE = "UNAVAILABLE";
-/** Closed allow-list of reviewed peer-verifier and identity refusals. Nothing a
- * remote worker can influence ever reaches a log line or the status surface. */
-const ADMISSION_CODES = new Map([
-  ["Peer runtime events rejected", "PEER_EVENTS_REJECTED"],
-  ["Peer measurements rejected", "PEER_MEASUREMENTS_REJECTED"],
-  ["Peer TCB rejected", "PEER_TCB_REJECTED"],
-  ["Peer not admitted", "PEER_NOT_ADMITTED"],
-  ["Peer key/challenge binding rejected", "PEER_BINDING_REJECTED"],
-  ["Debug TDX forbidden", "PEER_DEBUG_TDX"],
-  ["Worker identity mismatch", "IDENTITY_MISMATCH"],
-]);
 const ADMISSION_FAILED_MESSAGE = "Worker admission unavailable";
 const ADMISSION_RECOVERED_MESSAGE = "Worker peer admitted";
 const RETIRED_MEMBER_MESSAGE = "Retired worker still holds a placement row";
@@ -69,10 +58,6 @@ interface AdmissionState {
   code: string;
   since: string;
   attempts: number;
-}
-function admissionCode(error: unknown): string {
-  const message = error instanceof Error ? error.message : "";
-  return ADMISSION_CODES.get(message) ?? UNAVAILABLE_CODE;
 }
 function required(env: NodeJS.ProcessEnv, key: string): string {
   const value = env[key];

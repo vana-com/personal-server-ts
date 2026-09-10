@@ -75,6 +75,29 @@ export const FLEET_RPC_VERSION = 1;
 export const FLEET_LEASE_MS = 30_000;
 export const FLEET_RENEW_MS = 10_000;
 export const FLEET_READINESS_MAX_AGE_MS = 15_000;
+export const UNAVAILABLE_CODE = "UNAVAILABLE";
+/** Closed allow-list of reviewed peer-verifier and identity refusals. Nothing a
+ * remote worker can influence ever reaches a log line or the status surface. */
+const ADMISSION_CODES = new Map([
+  ["Peer runtime events rejected", "PEER_EVENTS_REJECTED"],
+  ["Peer measurements rejected", "PEER_MEASUREMENTS_REJECTED"],
+  ["Peer TCB rejected", "PEER_TCB_REJECTED"],
+  ["Peer not admitted", "PEER_NOT_ADMITTED"],
+  ["Peer key/challenge binding rejected", "PEER_BINDING_REJECTED"],
+  ["Debug TDX forbidden", "PEER_DEBUG_TDX"],
+  ["Worker identity mismatch", "IDENTITY_MISMATCH"],
+]);
+export function admissionCode(error: unknown): string {
+  const message = error instanceof Error ? error.message : "";
+  return ADMISSION_CODES.get(message) ?? UNAVAILABLE_CODE;
+}
+/** An allow-listed refusal is a verdict on the member itself, so it is
+ * terminal; anything else is a stall or a timeout the caller may retry. Shared
+ * with the renew path so one list decides both, e.g. a peer whose measurements
+ * were rejected demotes at once, an 8 s RPC deadline gets a grace window. */
+export function terminalAdmission(error: unknown): boolean {
+  return admissionCode(error) !== UNAVAILABLE_CODE;
+}
 
 export function fleetOwnerKey(owner: FleetOwner): string {
   return `${owner.chainId}:${owner.userPsId.toLowerCase()}:${owner.identityEpoch}`;
