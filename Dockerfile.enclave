@@ -5,7 +5,7 @@
 # composes used to run on every start.
 
 # ---------- build stage ----------
-FROM node:22-alpine AS build
+FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS build
 
 # build-base provides gcc/g++/make for the better-sqlite3 native addon
 RUN apk add --no-cache build-base python3
@@ -29,17 +29,20 @@ COPY packages/ packages/
 # the core, lite, and server dist trees the enclave imports at runtime.
 RUN npm run build -w @opendatalabs/personal-server-ts-enclave
 
-# Reinstall without dev dependencies. Lifecycle scripts are skipped because the
-# root `prepare` runs husky, a dev dependency; the better-sqlite3 addon that
-# npm ci already built is carried across instead. Sources are dead once dist
-# exists.
-RUN cp -R node_modules/better-sqlite3/build /tmp/better-sqlite3-build \
-  && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
-  && cp -R /tmp/better-sqlite3-build node_modules/better-sqlite3/build \
-  && rm -rf /tmp/better-sqlite3-build packages/*/src packages/*/tsconfig.tsbuildinfo
+# Drop dev dependencies in place. `npm prune` keeps every native addon the
+# install above built, whereas a `npm ci --omit=dev` reinstall would have to
+# skip lifecycle scripts (the root `prepare` runs husky, a dev dependency) and
+# so would leave any addon without a published prebuild unbuilt. Sources are
+# dead once dist exists.
+RUN npm prune --omit=dev \
+  && rm -rf packages/*/src packages/*/tsconfig.tsbuildinfo
+
+# A production dependency whose native addon did not survive the prune fails
+# here, at build time, rather than at first use inside the CVM.
+RUN node -e "require('better-sqlite3'); require('secp256k1/bindings')"
 
 # ---------- runtime stage ----------
-FROM node:22-alpine
+FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32
 
 # libstdc++ backs better-sqlite3; docker-cli drives the nested sandbox runtime
 # over tcp://sandbox-runtime:2375; util-linux provides the controller's flock.
