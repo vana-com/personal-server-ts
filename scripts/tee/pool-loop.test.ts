@@ -1,3 +1,6 @@
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 // The loop is plain ESM so it can run from an operator laptop without a build.
 
@@ -8,6 +11,7 @@ import {
   PHASE,
   REASON,
   revertMember,
+  tick,
 } from "./pool-loop.mjs";
 
 const NOW = Date.parse("2026-09-10T12:00:00.000Z");
@@ -927,5 +931,35 @@ describe("decidePoolActions", () => {
       });
       expect(state.nodes["worker-1"].startedByLoop).toBeUndefined();
     });
+  });
+});
+
+describe("tick", () => {
+  it("never writes the state file in dry-run mode", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pool-loop-dry-run-"));
+    const statePath = join(dir, "pool-loop-state.json");
+    // Compact, unindented on purpose: writeState always emits 2-space JSON,
+    // so any real write - even of unchanged content - would flip these bytes.
+    const fixture = JSON.stringify({
+      nodes: { "worker-1": runningState("worker-1") },
+    });
+    writeFileSync(statePath, fixture);
+
+    try {
+      await tick({
+        // Not a valid base URL: readStatus fails before any network call.
+        adminUrl: "invalid",
+        adminToken: () => "test-token",
+        members: [member("worker-1", "cvm-1")],
+        warned: new Set(),
+        statePath,
+        dryRun: true,
+        once: true,
+      });
+
+      expect(readFileSync(statePath, "utf8")).toBe(fixture);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

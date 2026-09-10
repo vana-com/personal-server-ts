@@ -633,6 +633,28 @@ function readJson(path, fallback) {
   }
 }
 
+/** Dry run decides but never persists, so a concurrently running real loop's
+ * state file is untouched. Logging the diff shows what it would have written. */
+function logStateDiff(previous, next) {
+  const nodeIds = new Set([
+    ...Object.keys(previous.nodes ?? {}),
+    ...Object.keys(next.nodes ?? {}),
+  ]);
+  const changed = {};
+  for (const nodeId of nodeIds) {
+    const before = previous.nodes?.[nodeId];
+    const after = next.nodes?.[nodeId];
+    if (JSON.stringify(before) !== JSON.stringify(after))
+      changed[nodeId] = { before, after };
+  }
+  log({
+    level: "info",
+    dryRun: true,
+    message: "Pool state would change",
+    changed,
+  });
+}
+
 function writeState(path, state) {
   mkdirSync(dirname(path), { recursive: true, mode: STATE_DIRECTORY_MODE });
   // A unique name cannot collide with another writer's temporary, and the
@@ -692,7 +714,7 @@ function acquireLock(statePath) {
   process.on("exit", () => rmSync(path, { force: true }));
 }
 
-async function tick(context) {
+export async function tick(context) {
   const status = await readStatus(context);
   const health = Object.fromEntries(
     await Promise.all(
@@ -717,6 +739,11 @@ async function tick(context) {
   for (const action of actions) {
     const applied = await applyAction(action, context);
     if (!applied) revertMember(state, previous, action.nodeId);
+  }
+
+  if (context.dryRun) {
+    logStateDiff(previous, state);
+    return;
   }
   writeState(context.statePath, state);
 }
@@ -790,7 +817,10 @@ function loadContext(argv) {
 
 async function main() {
   const context = loadContext(process.argv.slice(2));
-  acquireLock(context.statePath);
+  // A dry run must never compete with a real loop for its lock.
+  acquireLock(
+    context.dryRun ? `${context.statePath}.dry-run` : context.statePath,
+  );
   log({ level: "info", message: "Pool loop started", dryRun: context.dryRun });
 
   for (;;) {
