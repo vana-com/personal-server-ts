@@ -488,6 +488,10 @@ export async function startFleetCentral(
         try {
           await admit({ nodeId });
         } catch (error) {
+          // A member that stopped answering keeps its directory entry, so say
+          // it is unavailable: nothing else demotes it, and the warm-pool loop
+          // would otherwise credit its capacity as free.
+          await controller.markUnavailable(nodeId);
           recordAdmitFailure(nodeId, error);
         }
       }),

@@ -290,7 +290,16 @@ export async function openFleetController(options: FleetControllerOptions) {
         node.capacity < 1
       )
         throw new Error("Invalid worker declaration");
-      if (directory.nodes[node.nodeId]) return;
+      const declared = directory.nodes[node.nodeId];
+      if (declared) {
+        // A restart keeps the persisted entry but loses every worker port, so
+        // an entry the in-memory map does not back is not selectable and must
+        // not advertise capacity until it attests again. The drain stands.
+        if (nodes.has(node.nodeId) || declared.unavailable) return;
+        declared.unavailable = true;
+        await persist();
+        return;
+      }
 
       directory.nodes[node.nodeId] = {
         nodeId: node.nodeId,
@@ -337,6 +346,16 @@ export async function openFleetController(options: FleetControllerOptions) {
         unavailable: false,
       };
       nodes.set(node.nodeId, node);
+      await persist();
+    },
+    /** A member the controller can no longer attest stops being selectable and
+     * stops counting as free capacity. Its worker port is retained so a live
+     * lease can still be drained; the next admit clears the flag. */
+    async markUnavailable(nodeId: string): Promise<void> {
+      const record = directory.nodes[nodeId];
+      if (!record || record.unavailable) return;
+
+      record.unavailable = true;
       await persist();
     },
     assignment(owner: FleetOwner): FleetAssignment | null {

@@ -453,3 +453,61 @@ it("prunes retired directory members but keeps one a placement still references"
   });
   expect(controller.nodeStatus().map((node) => node.nodeId)).toEqual(["held"]);
 });
+
+it("demotes an admitted member the controller can no longer reach", async () => {
+  const path = await mkdtemp(join(tmpdir(), "fleet-unavailable-"));
+  paths.push(path);
+  const worker: FleetWorkerPort = {
+    activity: vi.fn(),
+    prepare: vi.fn(async () => []),
+    readiness: vi.fn(async () => []),
+    renew: vi.fn(),
+    execute: vi.fn(),
+    release: vi.fn(),
+  };
+  const options = {
+    path: join(path, "state.json"),
+    enroll: vi.fn(),
+    publish: vi.fn(),
+    release: vi.fn(),
+  };
+  const owner = { chainId: 14800, userPsId: "owner", identityEpoch: 1 };
+  const controller = await openFleetController(options);
+  await controller.declare({ nodeId: "member", capacity: 2 });
+  await controller.admit({
+    nodeId: "member",
+    nodeIncarnation: "i1",
+    capacity: 2,
+    worker,
+  });
+  expect(controller.nodeStatus()[0]).toMatchObject({ unavailable: false });
+
+  await controller.markUnavailable("member");
+
+  expect(controller.nodeStatus()[0]).toMatchObject({
+    unavailable: true,
+    draining: false,
+  });
+  await expect(controller.ensure(owner, [])).rejects.toThrow(
+    "Fleet capacity unavailable",
+  );
+
+  // A restart keeps the persisted entry but loses every admitted worker port,
+  // so the boot-time redeclaration must not report the member as available.
+  await controller.admit({
+    nodeId: "member",
+    nodeIncarnation: "i2",
+    capacity: 2,
+    worker,
+  });
+  await controller.drain("member");
+  const restarted = await openFleetController(options);
+  expect(restarted.nodeStatus()[0]).toMatchObject({ unavailable: false });
+
+  await restarted.declare({ nodeId: "member", capacity: 2 });
+
+  expect(restarted.nodeStatus()[0]).toMatchObject({
+    unavailable: true,
+    draining: true,
+  });
+});

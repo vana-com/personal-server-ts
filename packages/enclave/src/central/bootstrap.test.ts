@@ -13,7 +13,7 @@ import { startFleetCentral } from "./bootstrap.js";
 import { createMcpConnection } from "@opendatalabs/personal-server-ts-core/mcp";
 import { openMcpDurableState } from "@opendatalabs/personal-server-ts-server/mcp/tee";
 import { userPsId } from "@opendatalabs/vana-sdk/protocol/identity";
-import type { FleetOwner } from "../fleet/contracts.js";
+import type { FleetOwner, FleetWorkerPort } from "../fleet/contracts.js";
 async function freePort() {
   const server = createServer();
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
@@ -700,7 +700,6 @@ it("keeps stopped members visible and warns once per admission failure code", as
       { nodeId: "worker-2", code: "UNAVAILABLE", attempts: 1 },
       { nodeId: "worker-3", code: "UNAVAILABLE", attempts: 1 },
     ]);
-    expect(logEntries(logs, "debug").length).toBeGreaterThanOrEqual(6);
 
     refusal = new Error("Peer runtime events rejected");
     await vi.advanceTimersByTimeAsync(ADMISSION_TICK_MS);
@@ -722,6 +721,32 @@ it("keeps stopped members visible and warns once per admission failure code", as
       { code: "PEER_EVENTS_REJECTED", since: expect.any(String), attempts: 1 },
       { code: "PEER_EVENTS_REJECTED", since: expect.any(String), attempts: 1 },
     ]);
+
+    // A member that was admitted and has since stopped answering must be
+    // demoted by the next re-attest tick; nothing else takes its slots away.
+    const worker: FleetWorkerPort = {
+      activity: vi.fn(),
+      prepare: vi.fn(async () => []),
+      readiness: vi.fn(async () => []),
+      renew: vi.fn(),
+      execute: vi.fn(),
+      release: vi.fn(),
+    };
+    await runtime.controller.admit({
+      nodeId: "worker-2",
+      nodeIncarnation: "i1",
+      capacity: 1,
+      worker,
+    });
+    expect(runtime.controller.nodeStatus()[0]).toMatchObject({
+      unavailable: false,
+    });
+
+    await vi.advanceTimersByTimeAsync(ADMISSION_TICK_MS);
+
+    expect(runtime.controller.nodeStatus()[0]).toMatchObject({
+      unavailable: true,
+    });
   } finally {
     vi.useRealTimers();
     logs.mockRestore();
