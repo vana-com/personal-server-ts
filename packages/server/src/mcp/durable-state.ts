@@ -22,6 +22,29 @@ export type McpWakeupIdentity = ClaimResponse["identity"];
 
 const AAD = Buffer.from("vana.mcp.tee-state.v1");
 
+/** Whether a missing or unreadable sealed state file is a genuine first boot
+ * (`Optional`, today's default) or a lost durable volume (`Required`, set
+ * from the signed `MCP_STATE_REQUIRED=1`). */
+export enum McpStateRequirement {
+  Optional = "optional",
+  Required = "required",
+}
+
+/** Stable code for a required sealed MCP state file that was missing or
+ * could not be decrypted at boot. Distinguishes a lost durable volume from
+ * an ordinary first boot; callers must never fall back to fresh state. */
+export const MCP_STATE_REQUIRED_MISSING_CODE = "MCP_STATE_REQUIRED_MISSING";
+
+export class McpStateRequiredError extends Error {
+  constructor(cause: unknown) {
+    super(
+      "MCP durable state file is required (MCP_STATE_REQUIRED=1) but missing or unreadable",
+      { cause },
+    );
+    this.name = "McpStateRequiredError";
+  }
+}
+
 export interface McpOwnerBinding {
   owner: Address;
   chainId: number;
@@ -108,7 +131,9 @@ export interface McpDurableState {
 export async function openMcpDurableState(options: {
   path: string;
   key: Uint8Array;
+  requirement?: McpStateRequirement;
 }): Promise<McpDurableState> {
+  const requirement = options.requirement ?? McpStateRequirement.Optional;
   if (options.key.length !== 32)
     throw new Error("MCP state key must be 32 bytes");
   const key = Buffer.from(options.key);
@@ -147,6 +172,11 @@ export async function openMcpDurableState(options: {
       plaintext.fill(0);
     }
   } catch (error) {
+    // A missing file is a genuine first boot only when the caller has not
+    // demanded continuity; otherwise it, and any undecryptable file, means
+    // the durable volume was lost and must never be papered over.
+    if (requirement === McpStateRequirement.Required)
+      throw new McpStateRequiredError(error);
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 

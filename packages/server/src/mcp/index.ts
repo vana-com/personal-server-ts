@@ -6,6 +6,9 @@ export {
 } from "./tee-ingress.js";
 export {
   openMcpDurableState,
+  McpStateRequirement,
+  McpStateRequiredError,
+  MCP_STATE_REQUIRED_MISSING_CODE,
   type McpDurableState,
   type McpOwnerBinding,
   type McpWakeupIdentity,

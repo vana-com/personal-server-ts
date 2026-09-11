@@ -100,6 +100,11 @@ For a net-new deployment with an empty MCP state, sign
 admission without an import. Set it to `1` only when returning to an existing
 protected MCP state, which must be imported before activation.
 
+`MCP_STATE_REQUIRED=1` makes a missing or undecryptable sealed MCP state file
+a hard boot failure instead of a fresh first boot. Sign it once an existing
+sealed state is expected to survive every subsequent restart; a lost durable
+volume must never come back as a silently empty store.
+
 ## Explicit KMS CA rotation policy
 
 The default `measurementMode: "exact"` (or omitted mode) still pins MRTD and all
