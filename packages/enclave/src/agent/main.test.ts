@@ -2,6 +2,7 @@ import { vi } from "vitest";
 import type { Address, Hex } from "viem";
 import type { UserPsId } from "../identity/paths.js";
 import type { PrewarmRequestBody } from "./types.js";
+import type * as SandboxRegistry from "../sandbox/registry.js";
 
 const mocks = vi.hoisted(() => {
   const registry = {
@@ -79,7 +80,8 @@ vi.mock("../sandbox/fake-runtime.js", () => ({
     reconcile: vi.fn().mockResolvedValue(undefined),
   }),
 }));
-vi.mock("../sandbox/registry.js", () => ({
+vi.mock("../sandbox/registry.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxRegistry>()),
   createSandboxRegistry: vi.fn().mockReturnValue(mocks.registry),
 }));
 

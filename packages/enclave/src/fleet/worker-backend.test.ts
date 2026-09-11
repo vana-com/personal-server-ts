@@ -98,13 +98,15 @@ describe("worker peer execution", () => {
     await f.backend.prepare(f.request, signal);
     const result = await f.backend.execute(f.request, signal);
     expect(result.status).toBe(200);
-    expect(f.envelope).toHaveBeenCalledTimes(2);
-    expect(f.verifyGrants.mock.invocationCallOrder[0]).toBeLessThan(
-      f.envelope.mock.invocationCallOrder[1],
-    );
+    // One envelope for the warm lease, not one per acquire.
+    expect(f.envelope).toHaveBeenCalledTimes(1);
     expect(f.runtime.start).toHaveBeenCalledOnce();
     await f.backend.release(f.request.assignment);
     expect(f.runtime.stop).toHaveBeenCalledWith("sandbox-a");
+
+    // Releasing the lease drops the identity with it.
+    await f.backend.prepare(f.request, signal);
+    expect(f.envelope).toHaveBeenCalledTimes(2);
   });
   it("rejects a substituted owner or revoked grant before any envelope access or startup", async () => {
     const f = await setup();

@@ -4,7 +4,9 @@ import { isAddress } from "viem";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import {
   approveMcpOAuthAuthorization,
+  handleMcpHandshake,
   hashConnectionToken,
+  isMcpHandshake,
   toMcpOAuthAuthorizationView,
   type McpConnectionGrant,
   type McpConnectionRecord,
@@ -223,6 +225,17 @@ export function createTeeMcpIngress(deps: TeeMcpIngressDeps): Hono {
       return c.json({ error: "MCP authorization required" }, 401);
     }
     if (c.req.method !== "POST") return c.body(null, 405, { Allow: "POST" });
+    // The handshake reads the static tool table, nothing of the owner's, so it
+    // is answered here rather than through grant verification, placement and
+    // two attested peer hops per message — the three messages a fresh client
+    // sends cost ~18 s each on that path.
+    let body: unknown;
+    try {
+      body = await c.req.raw.clone().json();
+    } catch {
+      body = undefined;
+    }
+    if (isMcpHandshake(body)) return handleMcpHandshake(c.req.raw.clone());
     try {
       await deps.verifyGrants(connection, binding, connection.grants);
     } catch {

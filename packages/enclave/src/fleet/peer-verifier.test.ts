@@ -1,12 +1,30 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { beforeEach, expect, it, vi } from "vitest";
-import { getCollateralAndVerify } from "@phala/dcap-qvl";
+import { getCollateral, verify as verifyQuote } from "@phala/dcap-qvl";
 import {
   createDcapPeerVerifier,
   type FleetPeerPolicy,
 } from "./peer-verifier.js";
-vi.mock("@phala/dcap-qvl", () => ({ getCollateralAndVerify: vi.fn() }));
+// A TDX quote as the fleet's workers produce it: PCK chain inline (cert type 5),
+// so the verifier fetches only the FMSPC-scoped collateral.
+vi.mock("@phala/dcap-qvl", () => ({
+  constants: { PCK_CERT_CHAIN: 5 },
+  intel: {
+    getFmspc: () => Buffer.from("00806f050000", "hex"),
+    getCa: () => "platform",
+  },
+  Quote: {
+    parse: () => ({
+      header: { isSgx: () => false },
+      authData: { intoV3: () => ({ certificationData: { certType: 5 } }) },
+    }),
+  },
+  PHALA_PCCS_URL: "https://pccs.phala.network",
+  getCollateral: vi.fn(),
+  getCollateralAndVerify: vi.fn(),
+  verify: vi.fn(),
+}));
 interface Event {
   imr: number;
   event_type: number;
@@ -76,13 +94,16 @@ function evidence(f: Fixture) {
   };
 }
 beforeEach(() => {
-  vi.mocked(getCollateralAndVerify).mockReset();
+  vi.mocked(verifyQuote).mockReset();
+  vi.mocked(getCollateral)
+    .mockReset()
+    .mockResolvedValue({} as never);
 });
 it("accepts the real before/after event fixtures only under explicit approved KMS CA rotation policy", async () => {
   expect(before.rtmr3).not.toBe(after.rtmr3);
   const verify = createDcapPeerVerifier([policy]);
   for (const f of [before, after]) {
-    vi.mocked(getCollateralAndVerify).mockResolvedValue(verified(f) as never);
+    vi.mocked(verifyQuote).mockReturnValue(verified(f) as never);
     await expect(
       verify(evidence(f), challenge, identity),
     ).resolves.toBeUndefined();
@@ -113,7 +134,7 @@ it("rejects event payload lies even when the old digest/log replay still matches
   f.event_log.find((e) => e.event === "mr-kms")!.event_payload = "11".repeat(
     32,
   );
-  vi.mocked(getCollateralAndVerify).mockResolvedValue(verified(after) as never);
+  vi.mocked(verifyQuote).mockReturnValue(verified(after) as never);
   await expect(
     createDcapPeerVerifier([policy])(evidence(f), challenge, identity),
   ).rejects.toThrow("Peer runtime events rejected");
@@ -123,7 +144,7 @@ it("rejects a repeated mr-kms event with the exact message central maps to a cod
   const index = f.event_log.findIndex((entry) => entry.event === "mr-kms");
   f.event_log.splice(index + 1, 0, structuredClone(f.event_log[index]!));
   remeasure(f);
-  vi.mocked(getCollateralAndVerify).mockResolvedValue(verified(f) as never);
+  vi.mocked(verifyQuote).mockReturnValue(verified(f) as never);
   // Central's closed allow-list keys PEER_EVENTS_REJECTED on this exact string.
   await expect(
     createDcapPeerVerifier([policy])(evidence(f), challenge, identity),
@@ -183,14 +204,14 @@ it("rejects reordered, duplicate, missing, unknown and unapproved events even wi
     const f = structuredClone(after);
     change(f.event_log);
     remeasure(f);
-    vi.mocked(getCollateralAndVerify).mockResolvedValue(verified(f) as never);
+    vi.mocked(verifyQuote).mockReturnValue(verified(f) as never);
     await expect(
       createDcapPeerVerifier([policy])(evidence(f), challenge, identity),
     ).rejects.toThrow("Peer runtime events rejected");
   }
 });
 it("requires the supplied event log to match this verified quote and all pinned firmware registers", async () => {
-  vi.mocked(getCollateralAndVerify).mockResolvedValue(verified(after) as never);
+  vi.mocked(verifyQuote).mockReturnValue(verified(after) as never);
   for (const eventLog of [
     undefined,
     JSON.stringify(before.event_log),
@@ -206,9 +227,7 @@ it("requires the supplied event log to match this verified quote and all pinned 
     ).rejects.toThrow();
   const invalidFirmware = structuredClone(after);
   invalidFirmware.rtmr0 = "11".repeat(48);
-  vi.mocked(getCollateralAndVerify).mockResolvedValue(
-    verified(invalidFirmware) as never,
-  );
+  vi.mocked(verifyQuote).mockReturnValue(verified(invalidFirmware) as never);
   await expect(
     createDcapPeerVerifier([policy])(
       evidence(invalidFirmware),
@@ -216,7 +235,7 @@ it("requires the supplied event log to match this verified quote and all pinned 
       identity,
     ),
   ).rejects.toThrow("Peer measurements rejected");
-  vi.mocked(getCollateralAndVerify).mockResolvedValue(verified(after) as never);
+  vi.mocked(verifyQuote).mockReturnValue(verified(after) as never);
   await expect(
     createDcapPeerVerifier([{ ...policy, keyProviderSpki: "00" }])(
       evidence(after),
@@ -231,9 +250,7 @@ it("retains exact four-register policy and the quote, challenge, TCB and debug g
     mrTd: before.mrtd,
     rtmrs: [before.rtmr0, before.rtmr1, before.rtmr2, before.rtmr3],
   };
-  vi.mocked(getCollateralAndVerify).mockResolvedValue(
-    verified(before) as never,
-  );
+  vi.mocked(verifyQuote).mockReturnValue(verified(before) as never);
   await expect(
     createDcapPeerVerifier([exact])(
       { quote: evidence(before).quote },
@@ -241,7 +258,7 @@ it("retains exact four-register policy and the quote, challenge, TCB and debug g
       identity,
     ),
   ).resolves.toBeUndefined();
-  vi.mocked(getCollateralAndVerify).mockResolvedValue(verified(after) as never);
+  vi.mocked(verifyQuote).mockReturnValue(verified(after) as never);
   await expect(
     createDcapPeerVerifier([exact])(evidence(after), challenge, identity),
   ).rejects.toThrow("Peer measurements rejected");
@@ -251,7 +268,7 @@ it("retains exact four-register policy and the quote, challenge, TCB and debug g
   ).rejects.toThrow("Peer key/challenge binding rejected");
   const badStatus = verified(after);
   badStatus.status = "OutOfDate";
-  vi.mocked(getCollateralAndVerify).mockResolvedValue(badStatus as never);
+  vi.mocked(verifyQuote).mockReturnValue(badStatus as never);
   await expect(verifier(evidence(after), challenge, identity)).rejects.toThrow(
     "Peer TCB rejected",
   );
@@ -259,11 +276,11 @@ it("retains exact four-register policy and the quote, challenge, TCB and debug g
   const report = debug.report.asTd10();
   report.tdAttributes[0] = 1;
   debug.report.asTd10 = () => report;
-  vi.mocked(getCollateralAndVerify).mockResolvedValue(debug as never);
+  vi.mocked(verifyQuote).mockReturnValue(debug as never);
   await expect(verifier(evidence(after), challenge, identity)).rejects.toThrow(
     "Debug TDX forbidden",
   );
-  vi.mocked(getCollateralAndVerify).mockImplementation(() => {
+  vi.mocked(verifyQuote).mockImplementation(() => {
     throw new Error("Invalid Intel chain");
   });
   await expect(verifier(evidence(after), challenge, identity)).rejects.toThrow(
@@ -291,7 +308,7 @@ it("verifies the real GetQuote wire log with empty runtime digests against all q
       instanceId: liveIdentity.instanceId,
     },
   };
-  vi.mocked(getCollateralAndVerify).mockResolvedValue(verified(raw) as never);
+  vi.mocked(verifyQuote).mockReturnValue(verified(raw) as never);
   await expect(
     createDcapPeerVerifier([livePolicy])(
       evidence(raw),
@@ -342,9 +359,7 @@ it.each([
     Reflect.deleteProperty(altered.event_log[start]!, "digest");
   if (change === "extra runtime record")
     altered.event_log.push({ ...altered.event_log[start]! });
-  vi.mocked(getCollateralAndVerify).mockResolvedValue(
-    verified(quoted) as never,
-  );
+  vi.mocked(verifyQuote).mockReturnValue(verified(quoted) as never);
   await expect(
     createDcapPeerVerifier([livePolicy])(
       evidence(altered),
@@ -352,4 +367,34 @@ it.each([
       liveIdentity,
     ),
   ).rejects.toThrow("Peer runtime events rejected");
+});
+
+it("reuses one Intel collateral fetch per minute and still verifies every quote", async () => {
+  vi.useFakeTimers();
+  try {
+    const verifier = createDcapPeerVerifier([policy]);
+    vi.mocked(verifyQuote).mockReturnValue(verified(after) as never);
+    await verifier(evidence(after), challenge, identity);
+    await verifier(evidence(after), challenge, identity);
+    expect(getCollateral).toHaveBeenCalledTimes(1);
+    expect(verifyQuote).toHaveBeenCalledTimes(2);
+
+    // The window is what bounds a stale TCB verdict, so it must actually end.
+    vi.advanceTimersByTime(60_001);
+    await verifier(evidence(after), challenge, identity);
+    expect(getCollateral).toHaveBeenCalledTimes(2);
+
+    // A fetch that failed is not what the next peer is judged against.
+    vi.mocked(getCollateral).mockRejectedValueOnce(
+      new Error("PCS unreachable"),
+    );
+    vi.advanceTimersByTime(60_001);
+    await expect(
+      verifier(evidence(after), challenge, identity),
+    ).rejects.toThrow("PCS unreachable");
+    await verifier(evidence(after), challenge, identity);
+    expect(getCollateral).toHaveBeenCalledTimes(4);
+  } finally {
+    vi.useRealTimers();
+  }
 });

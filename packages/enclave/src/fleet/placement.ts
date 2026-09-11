@@ -608,25 +608,22 @@ export async function openFleetController(options: FleetControllerOptions) {
             )
               return;
             const node = nodes.get(assignment.nodeId)!;
+            // The worker arms its own retirement from the expiry this RPC
+            // carries, so the extension has to travel with it — but it is only
+            // kept once the renewal lands. A row that can never renew then
+            // lapses inside one lease (reaped above) instead of being pushed
+            // forward every tick and blocking its owner forever.
+            const held = assignment.leaseExpiresAt;
             assignment.leaseExpiresAt = new Date(
               now() + FLEET_LEASE_MS,
             ).toISOString();
             await persist();
-            try {
-              await publish(assignment);
-            } catch {
-              if (
-                rows[key]?.assignment &&
-                sameAssignment(rows[key]!.assignment!, assignment)
-              ) {
-                rows[key]!.renewalBlocked = true;
-                rows[key]!.renewalRetryable = false;
-                observations.delete(key);
-                await persist();
-              }
-              emit("placement_projection_failed", assignment);
-              return;
-            }
+            // The member is renewed before the Gateway is told. Its own
+            // retirement timer is what serves MCP, and the projection is a
+            // 15 s round trip on a 30 s lease taking a fleet-wide lock that
+            // owner enrollment takes too: ahead of the RPC it can spend the
+            // lease it is renewing, behind it it cannot.
+            let forgotten = false;
             try {
               await node.worker.renew(structuredClone(assignment));
               if (assignment.state === "ready") {
@@ -639,21 +636,18 @@ export async function openFleetController(options: FleetControllerOptions) {
                   try {
                     await node.worker.release(structuredClone(assignment));
                     await forget(assignment);
+                    forgotten = true;
                   } catch {
                     /* A concurrent begin may now own a reference. */
                   }
                 }
               }
-              // The member answered, so end its failure streak and release a
-              // block a previous unconfirmed renewal left on this row.
-              const ended = clearRenewFailures(node.nodeId);
-              const released = row.renewalBlocked && row.renewalRetryable;
-              if (released) {
-                row.renewalBlocked = false;
-                row.renewalRetryable = false;
-              }
-              if (ended || released) await persist();
             } catch (error) {
+              // Unconfirmed: the row keeps the expiry its last successful
+              // renewal bought. The worker may still hold the extension it was
+              // sent; the reap releases it once this lease lapses.
+              assignment.leaseExpiresAt = held;
+
               // One timed-out handshake is a controller stall as often as a dead
               // peer, so spend the grace before demoting. An allow-listed
               // attestation or identity refusal is a verdict, not a stall: it
@@ -664,8 +658,7 @@ export async function openFleetController(options: FleetControllerOptions) {
                 return;
               }
 
-              // The worker might have received this extension. Retain precisely
-              // that possible expiry, but never keep extending an unreachable node.
+              // Never keep extending an unreachable node.
               if (
                 directory.nodes[node.nodeId]?.nodeIncarnation ===
                 node.nodeIncarnation
@@ -681,7 +674,37 @@ export async function openFleetController(options: FleetControllerOptions) {
               observations.delete(key);
               await persist();
               emit("placement_renewal_failed", assignment);
+              return;
             }
+
+            // Only an extension the member confirmed is projected.
+            if (!forgotten)
+              try {
+                await publish(assignment);
+              } catch {
+                assignment.leaseExpiresAt = held;
+                if (
+                  rows[key]?.assignment &&
+                  sameAssignment(rows[key]!.assignment!, assignment)
+                ) {
+                  rows[key]!.renewalBlocked = true;
+                  rows[key]!.renewalRetryable = false;
+                  observations.delete(key);
+                  await persist();
+                }
+                emit("placement_projection_failed", assignment);
+                return;
+              }
+
+            // The member answered, so end its failure streak and release a
+            // block a previous unconfirmed renewal left on this row.
+            const ended = clearRenewFailures(node.nodeId);
+            const released = row.renewalBlocked && row.renewalRetryable;
+            if (released) {
+              row.renewalBlocked = false;
+              row.renewalRetryable = false;
+            }
+            if (ended || released) await persist();
           }),
         ),
       );
