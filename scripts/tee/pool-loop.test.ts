@@ -1,6 +1,8 @@
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 // The loop is plain ESM so it can run from an operator laptop without a build.
 
@@ -15,6 +17,7 @@ import {
   tick,
 } from "./pool-loop.mjs";
 
+const LOOP_PATH = fileURLToPath(new URL("./pool-loop.mjs", import.meta.url));
 const NOW = Date.parse("2026-09-10T12:00:00.000Z");
 const MINUTE = 60_000;
 const CAPACITY = 4;
@@ -1059,6 +1062,64 @@ describe("decidePoolActions", () => {
         startedByLoop: true,
       });
     });
+
+    // `restartOrQuarantine` never sets `startedByLoop`, so the loop's own hard
+    // restart was previously confirmed by whatever admission the controller
+    // still held - one raised before the machine rebooted.
+    const restarted = (at: number) => ({
+      phase: PHASE.admitWait,
+      since: NOW,
+      restarts: 1,
+      loopStartedAt: at,
+    });
+
+    it("ignores an admission raised before the loop's own restart", () => {
+      const { state } = decidePoolActions({
+        now: NOW,
+        members: MEMBERS,
+        status: status([
+          admitted("worker-1"),
+          admitted("worker-2"),
+          readmitted("worker-3", NOW - 10 * MINUTE),
+        ]),
+        state: {
+          nodes: {
+            "worker-1": runningState("worker-1"),
+            "worker-2": runningState("worker-2"),
+            "worker-3": restarted(NOW - 4 * MINUTE),
+          },
+        },
+      });
+
+      expect(state.nodes["worker-3"]).toMatchObject({
+        phase: PHASE.admitWait,
+        since: NOW,
+      });
+    });
+
+    it("adopts an admission the restarted member earned afterwards", () => {
+      const { state } = decidePoolActions({
+        now: NOW,
+        members: MEMBERS,
+        status: status([
+          admitted("worker-1"),
+          admitted("worker-2"),
+          readmitted("worker-3", NOW - 2 * MINUTE),
+        ]),
+        state: {
+          nodes: {
+            "worker-1": runningState("worker-1"),
+            "worker-2": runningState("worker-2"),
+            "worker-3": restarted(NOW - 4 * MINUTE),
+          },
+        },
+      });
+
+      expect(state.nodes["worker-3"]).toMatchObject({
+        phase: PHASE.running,
+        since: NOW - 2 * MINUTE,
+      });
+    });
   });
 
   // Same soak, 20:30:55Z: scale-down drained worker-1 - the always-on
@@ -1224,7 +1285,11 @@ describe("adoptState", () => {
             since: NOW - MINUTE,
             restarts: 0,
           },
-          "worker-2": runningState("worker-2"),
+          "worker-2": {
+            phase: PHASE.admitWait,
+            since: NOW - MINUTE,
+            restarts: 0,
+          },
           "worker-3": {
             phase: PHASE.starting,
             since: NOW - 30_000,
@@ -1241,6 +1306,59 @@ describe("adoptState", () => {
     expect(state.nodes["worker-2"]).toMatchObject({ phase: PHASE.stopped });
     // A member mid-boot is left for the loop's own next tick to decide.
     expect(state.nodes["worker-3"]).toMatchObject({ phase: PHASE.starting });
+  });
+
+  // The controller's admissions map is in memory and `declare` re-marks every
+  // persisted node unavailable for ~30 s after its own boot, so right after a
+  // roll - the window the README tells the operator to restart the loop in -
+  // every member reads unavailable with no admission.
+  it("never demotes a running member merely because the controller shows no admission", () => {
+    const input = {
+      now: NOW,
+      members: MEMBERS,
+      status: status(
+        MEMBERS.map((each) => declared(each.nodeId)),
+        placements("worker-1", 1),
+      ),
+      state: {
+        nodes: {
+          "worker-1": runningState("worker-1"),
+          "worker-2": runningState("worker-2"),
+          "worker-3": runningState("worker-3"),
+        },
+      },
+    };
+
+    const state = adoptState(input);
+
+    for (const each of MEMBERS)
+      expect(state.nodes[each.nodeId]).toMatchObject({
+        phase: PHASE.running,
+        since: NOW - 60 * MINUTE,
+      });
+    // ... and no `phala cvms start` is issued against machines that are up.
+    expect(types(decidePoolActions({ ...input, state }).actions)).not.toContain(
+      ACTION.start,
+    );
+  });
+
+  it("still demotes an unavailable member holding no live lease", () => {
+    const state = adoptState({
+      now: NOW,
+      members: MEMBERS,
+      status: status([declared("worker-1")]),
+      state: {
+        nodes: {
+          "worker-1": {
+            phase: PHASE.admitWait,
+            since: NOW - MINUTE,
+            restarts: 0,
+          },
+        },
+      },
+    });
+
+    expect(state.nodes["worker-1"]).toMatchObject({ phase: PHASE.stopped });
   });
 
   it("leaves state untouched when the controller is unreachable", () => {
@@ -1283,5 +1401,43 @@ describe("tick", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// The admin bearer rides every request and authorizes admit, drain, quiesce,
+// migrate and prepare-rollback; the controller listens as plain HTTP behind the
+// dstack TLS gateway, so a hand-edited http:// URL is that token in cleartext.
+describe("controllerAdminUrl", () => {
+  const run = (controllerAdminUrl: string) => {
+    const dir = mkdtempSync(join(tmpdir(), "pool-loop-admin-url-"));
+    try {
+      const poolPath = join(dir, "pool.json");
+      writeFileSync(
+        poolPath,
+        JSON.stringify({
+          controllerAdminUrl,
+          members: [member("worker-1", "cvm-1")],
+        }),
+      );
+      return spawnSync(process.execPath, [LOOP_PATH, "--once", "--dry-run"], {
+        encoding: "utf8",
+        env: { ...process.env, VANA_POOL_PATH: poolPath },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  it("refuses a plaintext admin URL before the first tick", () => {
+    const result = run("http://controller.invalid");
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("controllerAdminUrl must be an https URL");
+  });
+
+  it("accepts an https admin URL", () => {
+    expect(run("https://controller.invalid").stderr).not.toContain(
+      "controllerAdminUrl must be an https URL",
+    );
   });
 });

@@ -26,8 +26,9 @@ Gateway admit forwards no `resume` and Gateway drain is one-way to removed.
 
 It reads `~/.vana/pool.json` — either an array of
 `{nodeId,cvmId,publicUrl,capacity,bundleExpiresAt,composeHash?}` with
-`VANA_FLEET_ADMIN_URL` set, or `{controllerAdminUrl, members:[...]}`. That file
-holds no secrets. The controller admin token comes from the login keychain item
+`VANA_FLEET_ADMIN_URL` set, or `{controllerAdminUrl, members:[...]}`. Both the
+admin URL and every `publicUrl` must be `https`, or the loop refuses to start:
+the admin bearer rides every request. That file holds no secrets. The controller admin token comes from the login keychain item
 `vana-fleet-admin` and each member's `ENCLAVE_AGENT_SECRET` from
 `vana-fleet-agent-<nodeId>`, read per command and never written to disk. Phase
 state persists in `~/.vana/pool-loop-state.json`
@@ -56,11 +57,17 @@ slots. One loop runs per state file, fenced by a `<state>.lock` pidfile.
 
 Before its first tick, every start reconciles state against the controller's
 status: a member it did not itself act on this run is set to `running` if the
-controller has it ADMITTED, or `stopped` if the controller does not. A running
-or admit-wait member's `since` also self-heals every tick if it is somehow
-newer than the controller's own admission record, since the controller is the
-only authority on an admission it granted. After a roll: restart the loop; no
-state edits.
+controller has it ADMITTED. A missing admission is not evidence the machine is
+down - the controller's admissions map is in memory and every node reads
+unavailable for ~30 s after a controller boot - so it is demoted to `stopped`
+only when the controller reports it unavailable, it holds no live lease, and
+the loop does not already believe it to be running; otherwise the phase is left
+alone and an `ADOPT_UNDECIDED` line is logged. A running or admit-wait member's
+`since` also self-heals every tick if it is somehow newer than the controller's
+own admission record, since the controller is the only authority on an
+admission it granted - but never from an admission raised before the loop's own
+start or restart, which describes the machine that command replaced. After a
+roll: restart the loop; no state edits.
 
 `provision.sh` defaults to `deploy/dstack/docker-compose.enclave.yml`. The
 agent receives only the dstack socket and reaches the privileged nested Docker
