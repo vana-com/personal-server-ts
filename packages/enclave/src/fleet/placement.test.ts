@@ -925,3 +925,77 @@ it("re-places an owner whose worker has retired the lease as stale", async () =>
     generation: 2,
   });
 });
+
+it("spends the renew grace once per tick, not once per owner on the member", async () => {
+  const path = await mkdtemp(join(tmpdir(), "fleet-grace-capacity-"));
+  paths.push(path);
+  let now = 1000;
+  let stalled = true;
+  const events: string[] = [];
+  const worker: FleetWorkerPort = {
+    activity: vi.fn(async (assignment) => ({
+      assignment,
+      present: true,
+      busy: false,
+    })),
+    prepare: vi.fn(async () => []),
+    readiness: vi.fn(async () => []),
+    renew: vi.fn(async () => {
+      if (stalled) throw new Error("Peer RPC deadline expired");
+    }),
+    execute: vi.fn(),
+    release: vi.fn(),
+  };
+  const controller = await openFleetController({
+    path: join(path, "state.json"),
+    enroll: vi.fn(),
+    publish: vi.fn(),
+    release: vi.fn(),
+    now: () => now,
+    event: (event) => {
+      events.push(event);
+    },
+  });
+  await controller.admit({
+    nodeId: "a",
+    nodeIncarnation: "a1",
+    capacity: 3,
+    worker,
+  });
+  for (const userPsId of ["owner-1", "owner-2", "owner-3"])
+    await controller.ensure({ chainId: 14800, userPsId, identityEpoch: 1 }, []);
+  expect(controller.nodeStatus()[0]).toMatchObject({ live: 3 });
+
+  // `renew` fans the rows out together, so one stalled tick reaches the grace
+  // three times. Counting rows would demote this member on its second owner,
+  // inside the very first tick - the controller stall the grace exists for.
+  now = 11000;
+  await controller.renew();
+  expect(controller.nodeStatus()[0]).toMatchObject({
+    unavailable: false,
+    live: 3,
+  });
+  expect(events).toContain("placement_renewal_deferred");
+  expect(events).not.toContain("placement_renewal_failed");
+
+  // A tick the member answers ends the streak, so the next stall starts over.
+  stalled = false;
+  now = 16000;
+  await controller.renew();
+  stalled = true;
+
+  now = 21000;
+  await controller.renew();
+  expect(controller.nodeStatus()[0]).toMatchObject({
+    unavailable: false,
+    live: 3,
+  });
+  expect(events).not.toContain("placement_renewal_failed");
+
+  // Two consecutive stalled ticks demote, exactly as they do at capacity 1.
+  now = 26000;
+  await controller.renew();
+  expect(controller.nodeStatus()[0]).toMatchObject({ unavailable: true });
+  expect(controller.snapshot()[0]).toMatchObject({ renewalBlocked: true });
+  expect(events).toContain("placement_renewal_failed");
+});

@@ -176,6 +176,11 @@ export async function openFleetController(options: FleetControllerOptions) {
   };
   const healthy = (nodeId: string): boolean =>
     !directory.nodes[nodeId]?.unavailable;
+  /** The renew pass each node last failed in. Deliberately outside the
+   * persisted record: the counter restarts at 0 with the process, and a pass
+   * id read back from disk would swallow a real increment. */
+  const renewFailedPass = new Map<string, number>();
+  let renewPass = 0;
   /** Records one failed renewal RPC and reports whether the grace still covers
    * it. e.g. two controller stalls 5 s apart on 2026-09-10 each tripped a
    * single tick on a different member; neither member was gone. */
@@ -183,13 +188,19 @@ export async function openFleetController(options: FleetControllerOptions) {
     const record = directory.nodes[nodeId];
     if (!record) return false;
 
-    const since = record.renewFailedSince ?? new Date(now()).toISOString();
-    record.renewFailures = (record.renewFailures ?? 0) + 1;
-    record.renewFailedSince = since;
-    return (
-      record.renewFailures < RENEW_FAILURE_GRACE &&
-      now() - Date.parse(since) < RENEW_GRACE_MS
-    );
+    // `renew` fans every row out at once, so one stalled tick reaches here once
+    // per owner the member carries. Only the pass's first failing row counts:
+    // RENEW_FAILURE_GRACE stays two consecutive ticks at any capacity, instead
+    // of demoting a capacity-8 member on its second row of the same tick.
+    if (renewFailedPass.get(nodeId) !== renewPass) {
+      renewFailedPass.set(nodeId, renewPass);
+      record.renewFailures = (record.renewFailures ?? 0) + 1;
+      record.renewFailedSince ??= new Date(now()).toISOString();
+    }
+
+    const failures = record.renewFailures ?? 0;
+    const since = Date.parse(record.renewFailedSince ?? "");
+    return failures < RENEW_FAILURE_GRACE && now() - since < RENEW_GRACE_MS;
   };
   const clearRenewFailures = (nodeId: string): boolean => {
     const record = directory.nodes[nodeId];
@@ -565,6 +576,7 @@ export async function openFleetController(options: FleetControllerOptions) {
     },
     async renew(): Promise<void> {
       if (directory.paused) return;
+      renewPass += 1;
       // Per-owner lease transitions run concurrently. Slow startup, one dead
       // peer, or another owner's hydration cannot block all fleet renewals.
       await Promise.all(
