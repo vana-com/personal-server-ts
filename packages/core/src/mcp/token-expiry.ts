@@ -14,11 +14,13 @@ import type { McpConnectionRecord } from "./types.js";
 export const MCP_TOKEN_TTL_MS = 60 * 60 * 1000;
 
 /**
- * 30 d. The refresh token is single-use and rotates on every exchange, so its
+ * 7 d. The refresh token is single-use and rotates on every exchange, so its
  * lifetime bounds how long a connection survives without the owner touching
- * it — not how long a leaked credential is usable.
+ * it — not how long a leaked credential is usable. A week keeps an abandoned
+ * connection from lingering a month; an owner who uses the connection weekly
+ * never re-consents.
  */
-export const MCP_REFRESH_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+export const MCP_REFRESH_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** ISO expiry for an access token minted at `nowMs`. */
 export function mcpTokenExpiry(nowMs: number): string {

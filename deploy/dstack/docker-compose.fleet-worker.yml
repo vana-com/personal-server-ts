@@ -19,9 +19,17 @@ services:
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - mcp-state:/mcp-state
+    # Ordering only, deliberately not service_healthy. dstack runs
+    # `docker compose up -d` from a oneshot unit with no Restart=, so a runtime
+    # that stays unhealthy past its healthcheck budget fails the whole `up`,
+    # the agent container is never created, and nothing retries without an
+    # operator. Starting anyway turns that dead end into a retry loop: the pull
+    # below fails, the agent exits, and `restart: unless-stopped` tries again.
+    # No safety is lost — the runtime installs its iptables rules before dockerd
+    # listens, so an agent that reaches port 2375 reaches a locked-down daemon.
     depends_on:
       sandbox-runtime:
-        condition: service_healthy
+        condition: service_started
     command:
       - /bin/sh
       - -ec
