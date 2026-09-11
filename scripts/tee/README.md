@@ -440,3 +440,83 @@ default), and set `E2E_BUILDER_ONLY_NEGATIVES=1` to also test a wrong builder
 signature. Existing Gateway bypass, chain, and contract overrides still apply.
 
 The last command prints the uncompressed KMS root key; use that form for the Gateway's `ENCLAVE_KMS_ROOT_PUBKEY`. Configure the Gateway with `ENCLAVE_AGENT_URL`, `ENCLAVE_AGENT_SECRET`, `ENCLAVE_KMS_ROOT_PUBKEY`, and `ENCLAVE_APP_ID_ALLOWLIST=0x<app_id>`.
+
+## Rolling a fleet back (and forward again)
+
+A roll in either direction is the same procedure: the target head's already
+reviewed composes are re-staged byte for byte, so the dstack compose hash comes
+back identical to when that head was last measured and nothing is rebuilt. Only
+`issuedAt` and the staged reciprocal controller pins move. Rehearsed end to end
+on the four-worker preview fleet on 2026-09-11: **14m53s** back, **11m43s**
+forward, zero `409`s, one CVM restart.
+
+Before anything, stage the pins. Every worker's `FLEET_PEER_POLICIES` must carry
+the controller compose hash it is running on **and** the one it is rolling to,
+in that order, or the workers stop admitting the controller mid-roll.
+
+```sh
+kill -STOP "$TICKER_PID"                      # the loop must not act mid-roll
+python3 render-slice16.py rollback            # composes copied, issuedAt stamped
+python3 cvm-snapshot.py rollback cvm-before-rollback
+
+# 1. Stage all five composes, controller first. Fail-closed: the dummy env
+#    keeps each enclave from opening a listener until the signed bundle lands.
+for n in controller worker-1 worker-2 worker-3 worker-4; do
+  python3 stage-slice16.py rollback "$n"      # asserts the staged hash == expected
+done
+python3 settle16.py rollback                  # every CVM `running` before step 2
+
+# 2. Only then the signed configs, workers first.
+for n in worker-1 worker-2 worker-3 worker-4 controller; do
+  node sign-and-update-slice16.cjs rollback "$n"
+done
+python3 poll-health-slice16.py rollback       # 200 on the NEW hash, all five
+
+# 3. Rotate the Gateway rows one node at a time. The Gateway `drain` step
+#    propagates to the controller, so resume between nodes.
+for w in 1 2 3 4; do
+  node admit-gateway-slice16.cjs "$PLAN" "$PLAN_SHA256" "moksha-...-worker-$w"
+  node resume-worker.cjs "moksha-...-worker-$w"
+done
+kill -CONT "$TICKER_PID"
+```
+
+Then prove it: one SDK job to `completed` attempt 1, one MCP `tools/call` 200,
+`POST /fleet/v1/status` 200 with every member `draining:false,
+unavailable:false`, and `POST /agent/v1/identity` against each worker.
+
+Four things need a hand, in rough order of likelihood:
+
+- A member reads back `stopped` after its own `envs update` (exit 0). Recover
+  with `phala cvms start <uuid>`; staging also restarts an already-stopped CVM.
+- A member sits at `PEER_EVENTS_REJECTED` on its pre-roll incarnation and
+  `admit {resume:true}` returns 503. One `phala cvms restart <uuid>` re-measures
+  it; it readmits about 90 s later on a fresh incarnation.
+- A member returns `ADMITTED` but `draining:true`, the stale flag from an
+  earlier scale-down. One `admit {resume:true}` clears it; the rotation's
+  precondition is all four serving.
+- The loop stops a freshly rolled idle member on its first tick after
+  `kill -CONT`. That is `MIN_RUNNING` doing its job, not a failed roll.
+
+**Do not roll across a Gateway database change.** `drain` releases each of the
+node's placements through a CAS against `fleet_owners`; if the owner row is not
+in the database the controller is now talking to, `releaseAssignment` raises
+`FleetConflict('Stale release')`, `drain` fails closed, and the member's Gateway
+row can never be rotated. There is no operator path out of it — the rows have to
+be put back before the fleet can let go of them. Roll the fleet and cut the
+database over in separate windows.
+
+### Rolling the Gateway back
+
+The Gateway rolls back by alias, in about a second, and is worth reaching for
+before any fleet roll:
+
+```sh
+vercel inspect "https://$ALIAS" --scope "$SCOPE"     # record the current target
+vercel alias set "$PREVIOUS_DEPLOYMENT_URL" "$ALIAS" --scope "$SCOPE"
+# prove it: one SDK job to `completed`
+vercel alias set "$CURRENT_DEPLOYMENT_URL" "$ALIAS" --scope "$SCOPE"
+```
+
+Pause the ticker across the flip so the loop never reads one deployment's state
+and writes the other's. Measured: 1 s out, 2 s back, 31 s including the job.
