@@ -98,7 +98,22 @@ export interface AgentConfig {
   jobs?: AgentJobsConfig;
 }
 
-export function agentConfigFromEnv(env: NodeJS.ProcessEnv): AgentConfig {
+/**
+ * The node's one dstack client. Built before the config so boot can read Info
+ * through it once and every later caller is served from that cache.
+ */
+export function dstackClientFromEnv(env: NodeJS.ProcessEnv): DstackClient {
+  return env.DSTACK_FAKE === FAKE_DSTACK_ENABLED
+    ? createFakeDstackClient({
+        appId: env.DSTACK_FAKE_APP_ID ?? DEFAULT_FAKE_APP_ID,
+      })
+    : createRealDstackClient();
+}
+
+export function agentConfigFromEnv(
+  env: NodeJS.ProcessEnv,
+  client: DstackClient = dstackClientFromEnv(env),
+): AgentConfig {
   if (
     (env.FLEET_ENABLED === "true" ||
       env.FLEET_CONFIG_PUBLIC_KEY !== undefined ||
@@ -118,12 +133,7 @@ export function agentConfigFromEnv(env: NodeJS.ProcessEnv): AgentConfig {
     host: env.ENCLAVE_AGENT_HOST ?? DEFAULT_HOST,
     port: readPort(env.ENCLAVE_AGENT_PORT),
     secret,
-    client:
-      env.DSTACK_FAKE === FAKE_DSTACK_ENABLED
-        ? createFakeDstackClient({
-            appId: env.DSTACK_FAKE_APP_ID ?? DEFAULT_FAKE_APP_ID,
-          })
-        : createRealDstackClient(),
+    client,
     ...(jobs ? { jobs } : {}),
   };
 }

@@ -4,6 +4,7 @@ import type { GatewayClient as ProtocolGatewayClient } from "@opendatalabs/vana-
 import { DEFAULTS } from "@opendatalabs/personal-server-ts-core/schemas";
 import { verifyTeeMcpGrants } from "@opendatalabs/personal-server-ts-server/mcp/tee";
 import type { PrewarmDeps } from "../jobs/run.js";
+import { dstackInfo } from "../dstack/info-cache.js";
 import { buildEvidence } from "../agent/evidence.js";
 import { sealDelivery } from "../agent/seal.js";
 import { identityBody, sealBody } from "../agent/http.js";
@@ -63,7 +64,7 @@ export async function startFleetWorker(options: {
   const port = Number(options.env.FLEET_PEER_PORT ?? "8789");
   if (!Number.isSafeInteger(port) || port < 1 || port > 65535)
     throw new Error("FLEET_PEER_PORT invalid");
-  const info = await options.sandbox.client.info();
+  const info = await dstackInfo(options.sandbox.client);
   const identity: FleetPeerIdentity = {
     ...info,
     role: "worker",

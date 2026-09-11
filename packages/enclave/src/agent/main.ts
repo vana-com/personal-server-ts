@@ -4,14 +4,18 @@ import {
   fleetConfigValidity,
   verifiedFleetEnvironment,
 } from "../fleet/security-config.js";
-import { createRealDstackClient } from "../dstack/real.js";
+import { warmDstackInfo } from "../dstack/info-cache.js";
 /**
  * Node agent entrypoint. ENCLAVE_AGENT_SECRET is required;
  * ENCLAVE_AGENT_HOST defaults to 127.0.0.1, ENCLAVE_AGENT_PORT to 8787;
  * DSTACK_FAKE=1 selects the fake and DSTACK_FAKE_APP_ID names its app.
  */
 
-import { agentConfigFromEnv, resolveSandboxAgentUrl } from "./bootstrap.js";
+import {
+  agentConfigFromEnv,
+  dstackClientFromEnv,
+  resolveSandboxAgentUrl,
+} from "./bootstrap.js";
 import { drainWithTimeout } from "./lifecycle.js";
 import { createAgentServer, type AgentJobsControl } from "./http.js";
 import { startClaimLoop, type JobLogger } from "../jobs/claim-loop.js";
@@ -47,16 +51,21 @@ async function main(): Promise<void> {
     // The fleet compose always embeds this trust key as a measured literal.
     // An unsigned FLEET_ENABLED=false cannot skip authentication on that image.
     const raw = process.env;
+    const client = dstackClientFromEnv(raw);
     const env =
       raw.FLEET_CONFIG_PUBLIC_KEY !== undefined ||
       raw.FLEET_SIGNED_CONFIG !== undefined ||
       raw.FLEET_ENABLED === "true"
         ? await verifiedFleetEnvironment(raw, {
             role: "worker",
-            identity: () => createRealDstackClient().info(),
+            identity: () => warmDstackInfo(client, CONSOLE_LOGGER),
           })
         : raw;
-    const { client, host, jobs, port, secret } = agentConfigFromEnv(env);
+    const { host, jobs, port, secret } = agentConfigFromEnv(env, client);
+    // The one Info read this node makes. The guest agent answers it in ~15 s
+    // on some hosts, so it is paid here, once, before anything serves; every
+    // request path then reads the cache.
+    await warmDstackInfo(client, CONSOLE_LOGGER);
     const jobsControl = jobs
       ? await startJobs(client, jobs, port, env)
       : undefined;

@@ -2,10 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DstackInfo } from "../dstack/client.js";
 import { createFakeDstackClient } from "../dstack/fake.js";
 import {
-  HEALTH_INFO_BUDGET_MS,
-  HEALTH_INFO_TTL_MS,
-  readHealth,
-} from "./health.js";
+  DSTACK_INFO_BUDGET_MS,
+  DSTACK_INFO_TTL_MS,
+} from "../dstack/info-cache.js";
+import { readHealth } from "./health.js";
 
 const NODE_ID = "node-health";
 const FAKE_APP_ID = "0000000000000000000000000000000000000004";
@@ -59,7 +59,7 @@ describe("agent health", () => {
     const { client } = heldClient();
 
     const pending = readHealth(client, NODE_ID, 2, true);
-    await vi.advanceTimersByTimeAsync(HEALTH_INFO_BUDGET_MS);
+    await vi.advanceTimersByTimeAsync(DSTACK_INFO_BUDGET_MS);
 
     await expect(pending).resolves.toEqual({
       ...UNREACHABLE,
@@ -79,7 +79,7 @@ describe("agent health", () => {
       readHealth(client, NODE_ID),
       readHealth(client, NODE_ID),
     ]);
-    await vi.advanceTimersByTimeAsync(HEALTH_INFO_BUDGET_MS);
+    await vi.advanceTimersByTimeAsync(DSTACK_INFO_BUDGET_MS);
 
     await expect(both).resolves.toMatchObject([UNREACHABLE, UNREACHABLE]);
     expect(inFlight()).toBe(1);
@@ -89,7 +89,7 @@ describe("agent health", () => {
     vi.useFakeTimers();
     const { client, release } = heldClient();
     const pending = readHealth(client, NODE_ID);
-    await vi.advanceTimersByTimeAsync(HEALTH_INFO_BUDGET_MS);
+    await vi.advanceTimersByTimeAsync(DSTACK_INFO_BUDGET_MS);
 
     await expect(pending).resolves.toMatchObject(UNREACHABLE);
 
@@ -109,7 +109,7 @@ describe("agent health", () => {
 
     // Past the TTL a refresh starts but is never awaited, so this answer is
     // immediate even though the second read is still hanging.
-    await vi.advanceTimersByTimeAsync(HEALTH_INFO_TTL_MS);
+    await vi.advanceTimersByTimeAsync(DSTACK_INFO_TTL_MS);
 
     await expect(readHealth(client, NODE_ID)).resolves.toEqual(SERVED);
     expect(inFlight()).toBe(1);

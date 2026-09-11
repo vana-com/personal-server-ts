@@ -7,6 +7,11 @@ import {
   createFakeDstackClient,
   fakeKmsRootPublicKey,
 } from "../dstack/fake.js";
+import {
+  DSTACK_INFO_BUDGET_MS,
+  DstackInfoUnavailable,
+  warmDstackInfo,
+} from "../dstack/info-cache.js";
 import { buildEvidence } from "./evidence.js";
 import { recoverAppRoot, recoverKmsRoot } from "./chain.js";
 
@@ -99,5 +104,38 @@ describe("buildEvidence", () => {
     });
 
     expect(second.address).not.toBe(first.address);
+  });
+
+  it("mints from the boot read without a second Info call", async () => {
+    const client = createFakeDstackClient({ appId: FAKE_APP_ID });
+    const info = await warmDstackInfo(client);
+    client.info = () => Promise.reject(new Error("Info must not be called"));
+
+    const evidence = await buildEvidence(client, {
+      ownerAddress: OWNER,
+      chainId: CHAIN_ID,
+      epoch: 1,
+    });
+
+    expect(evidence.composeHash).toBe(`0x${info.composeHash}`);
+  });
+
+  it("refuses to mint while the compose hash is unknown", async () => {
+    vi.useFakeTimers();
+    const client = createFakeDstackClient({ appId: FAKE_APP_ID });
+    // A guest agent that never answers Info, as on the prod5 hosts.
+    client.info = () => new Promise<never>(() => undefined);
+
+    const refused = expect(
+      buildEvidence(client, {
+        ownerAddress: OWNER,
+        chainId: CHAIN_ID,
+        epoch: 1,
+      }),
+    ).rejects.toBeInstanceOf(DstackInfoUnavailable);
+    await vi.advanceTimersByTimeAsync(DSTACK_INFO_BUDGET_MS);
+
+    await refused;
+    vi.useRealTimers();
   });
 });
