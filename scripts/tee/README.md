@@ -213,21 +213,71 @@ Steps 2, 3, 6, 7 and 9 only — no app id, no `activate`, no MCP state flag chan
    controller's own `draining` flag.
 5. Repin `~/.vana/pool.json` to the new hashes, restart the loop, **no state edits**.
 
+### Fleet tooling
+
+Three commands cover render, sign and the Gateway rows. All three read one
+fleet manifest — `deploy/dstack/fleets/<fleet>.json`, which carries ids,
+measured pins and non-secret env only — and every credential is a keychain
+item named on the command line and read per invocation, never from a file.
+
+| command                         | does                                                                                                                                 |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `scripts/tee/render-fleet.py`   | renders the measured composes and one unsigned draft per node; `--stage` applies each compose and reads the real `compose_hash` back |
+| `scripts/tee/sign-fleet.cjs`    | signs each draft with the operator key, writes receipts; `--apply` settles the CVM, then `phala envs update` with the 409 retry      |
+| `scripts/tee/gateway-nodes.cjs` | `register`/`wait`/`admit`/`drain`/`remove`/`resume`, and `rotate` for the whole roll sequence                                        |
+
+Rolling the prod5 preview fleet to a new head:
+
+```sh
+# 1. Render, stage every compose (controller first), pin the read-back hashes.
+python3 scripts/tee/render-fleet.py \
+  --manifest deploy/dstack/fleets/preview-prod5.json \
+  --images-env <ci-docker-dir>/images.env \
+  --out rendered/ --stage --settle --write-manifest
+
+# 2. Sign each draft and push it as the sealed environment.
+node scripts/tee/sign-fleet.cjs \
+  --manifest deploy/dstack/fleets/preview-prod5.json \
+  --drafts rendered/ --key-item <signing-key item> --apply
+
+# 3. Rotate each worker's Gateway row onto the new hash.
+for node in worker-1 worker-2 worker-3 worker-4; do
+  node scripts/tee/gateway-nodes.cjs rotate \
+    --manifest deploy/dstack/fleets/preview-prod5.json \
+    --node "$node" --receipts receipts/
+done
+```
+
+A net-new fleet is the same without the staged prior hash: deploy each CVM
+fail-closed, fill the manifest's `measured` and `pinned` blocks from
+`harvest-identity.py`, render without `--stage`, sign with `--apply`, then
+`gateway-nodes.cjs register`, `wait` and `admit` per worker.
+
+Still done by hand: app-id allocation, the first `phala deploy -n <name>` of a
+net-new CVM, `harvest-identity.py` into the manifest, the controller's one-time
+`/fleet/v1/activate`, the `MCP_STATE_REQUIRED=1` re-sign, and `~/.vana/pool.json`.
+
+A keychain item whose ACL does not cover the `security` CLI needs
+`--keychain-reader <script>`: the script gets `{"service","account"}` on stdin
+and prints the secret.
+
+Tests: `python3 scripts/tee/render-fleet.test.py` and
+`node --test scripts/tee/fleet-common.test.mjs`. Neither calls `phala`.
+
 ### Known gaps
 
-| gap                                                                        | workaround                                                                                                                                          |
-| -------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| A byte-identical compose hashes differently on a different node            | always read `compose_hash` back from the staged CVM                                                                                                 |
-| Container logs unreachable on prod9 (`phala logs` → "Container not found") | serial console only                                                                                                                                 |
-| No resize verb; no base domain in `phala nodes list`                       | `phala api -X PATCH /cvms/<uuid>` with the new type, CVM stopped; `phala api /teepods` → `tproxy_base_domain`                                       |
-| Gateway `admit` → 500 for a node its `FLEET_CONTROLLER_URL` does not know  | point the Gateway at this fleet's controller, or leave the rows `pending`                                                                           |
-| No in-tree render/sign tooling yet                                         | interim: `render-drafts.py`, `sign-and-update.cjs`, `sign-reviewed-config-rehearsal.cjs` in `e2e-proof-2026-09-09/fleet-overnight/rehearsal-prod9/` |
+| gap                                                                        | workaround                                                                                                    |
+| -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| A byte-identical compose hashes differently on a different node            | always read `compose_hash` back from the staged CVM                                                           |
+| Container logs unreachable on prod9 (`phala logs` → "Container not found") | serial console only                                                                                           |
+| No resize verb; no base domain in `phala nodes list`                       | `phala api -X PATCH /cvms/<uuid>` with the new type, CVM stopped; `phala api /teepods` → `tproxy_base_domain` |
+| Gateway `admit` → 500 for a node its `FLEET_CONTROLLER_URL` does not know  | point the Gateway at this fleet's controller, or leave the rows `pending`                                     |
 
 ## Fleet composes
 
 `deploy/dstack/docker-compose.fleet-worker.yml` and
-`docker-compose.fleet-controller.yml` are rendered by the operator's signing
-tooling, not by these scripts. Replace
+`docker-compose.fleet-controller.yml` are rendered by `render-fleet.py`, not by
+`provision.sh`. Replace
 `REPLACE_WITH_REVIEWED_AGENT_IMAGE_DIGEST` with `AGENT_IMAGE` and
 `REPLACE_WITH_REVIEWED_RUNTIME_IMAGE_DIGEST` with `RUNTIME_IMAGE` from the same
 `images.env`, and pin digests rather than tags so the compose hash stays
