@@ -19,6 +19,8 @@ import {
   buildAccessRecord,
   canonicalJson,
   MAX_ACCESS_RECORDS,
+  refuseAccessRecord,
+  type AccessRecordContext,
   type AccessRecordInput,
   type SignedAccessRecord,
 } from "./access-records.js";
@@ -70,6 +72,9 @@ const ACCESS_RECORDS_MESSAGE = "Signed access records";
 const ACCESS_RECORDS_REFUSED = "access records refused";
 const STALE_PLACEMENT_CODE = "STALE_PLACEMENT";
 const STALE_PLACEMENT_MESSAGE = "stale placement";
+const RECORD_REFUSED_CODE = "ACCESS_RECORD_REFUSED";
+const RECORD_REFUSED_MESSAGE =
+  "access record disagrees with the agent's own view";
 const OUTCOMES = new Set(["served", "denied"]);
 const SOURCES = new Set(["mcp", "api"]);
 const DEFAULT_LOG_TAIL = 100;
@@ -89,6 +94,8 @@ export interface AgentServerOptions {
 
 export interface AgentJobsControl {
   nodeId: string;
+  /** The node's configured chain; what an access record is stamped with. */
+  chainId: number;
   storageApiUrl: string;
   activeCount(): number;
   draining(): boolean;
@@ -360,8 +367,10 @@ async function handleResultSigning(
 /**
  * Sign and relay one batch of access records. Authenticated by the sandbox's
  * own access token, like result signing — the sandbox PS holds no agent
- * secret. Records the sandbox cannot vouch for (identity, node) are stamped
- * here, never taken from the body.
+ * secret. Every field the agent can source itself — identity, node, chain,
+ * placement generation, the clock — is stamped here, and a body that disagrees
+ * is refused rather than signed: the enclave key must not put its name to a
+ * read on a foreign chain or one backdated out of the owner's feed.
  */
 async function handleAccessRecords(
   options: AgentServerOptions,
@@ -395,15 +404,40 @@ async function handleAccessRecords(
     }
 
     const { identity } = lookup;
+    const context: AccessRecordContext = {
+      identity,
+      nodeId: options.jobs.nodeId,
+      chainId: options.jobs.chainId,
+      ...(lookup.generation === undefined
+        ? {}
+        : { generation: lookup.generation }),
+    };
+
+    // One clock reading for the batch: every record in it is signed at the
+    // same moment, and the skew window is measured against that moment.
+    const now = Date.now();
+    const refusal = inputs
+      .map((input) => refuseAccessRecord(input, context, now))
+      .find((reason) => reason !== null);
+    if (refusal) {
+      sendError(
+        response,
+        BAD_REQUEST,
+        RECORD_REFUSED_CODE,
+        `${RECORD_REFUSED_MESSAGE}: ${refusal}`,
+      );
+      return;
+    }
 
     const account = await deriveEnclaveAccount(
       options.client,
       identity.userPsId,
       identity.epoch,
     );
+    const recordedAt = new Date(now).toISOString();
     const signed: SignedAccessRecord[] = [];
     for (const input of inputs) {
-      const record = buildAccessRecord(input, identity, options.jobs.nodeId);
+      const record = buildAccessRecord(input, context, recordedAt);
       const signature = await account.signMessage(canonicalJson(record));
       signed.push({ payload: record, signature });
     }
