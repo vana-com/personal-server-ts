@@ -217,6 +217,105 @@ describe("TEE MCP ingress", () => {
     },
   );
 
+  it("refreshes the bearer on the fleet path and keeps the owner binding", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tee-refresh-"));
+    dirs.push(dir);
+    const state = await openMcpDurableState({
+      path: join(dir, "state"),
+      key: randomBytes(32),
+    });
+    const redirectUri = "https://claude.ai/api/mcp/auth_callback";
+    const verifier = "v".repeat(48);
+    const authorization = await createMcpOAuthAuthorization(
+      {
+        clientId: "claude",
+        redirectUri,
+        codeChallenge: createHash("sha256")
+          .update(verifier)
+          .digest("base64url"),
+        codeChallengeMethod: "S256",
+      },
+      {
+        connectionStore: state.connections,
+        authorizationStore: state.authorizations,
+        publicOrigin: "https://mcp-dev.vana.org",
+      },
+    );
+    const dispatch = vi
+      .fn()
+      .mockResolvedValue(
+        Response.json({ jsonrpc: "2.0", id: 1, result: { tools: [] } }),
+      );
+    const app = createTeeMcpIngress({
+      state,
+      origin: "https://mcp-dev.vana.org",
+      approvalUrl: "https://vana.example/mcp",
+      allowedRedirectUris: [redirectUri],
+      gateway: {} as never,
+      verifyGrants: vi.fn().mockResolvedValue(undefined),
+      registerGrantee: vi.fn(),
+      dispatch,
+    });
+    const approved = await app.request(
+      `/v1/mcp/oauth/authorizations/${authorization.authorizationId}/approve`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          owner: OWNER,
+          chainId: 14800,
+          grants: [{ grantId: "0xabc", scopes: ["spotify.profile"] }],
+        }),
+      },
+    );
+    expect(approved.status).toBe(200);
+    const code = new URL((await approved.json()).redirectTo).searchParams.get(
+      "code",
+    )!;
+
+    const redeemed = await app.request("/mcp/oauth/token", {
+      method: "POST",
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        client_id: "claude",
+        redirect_uri: redirectUri,
+        code_verifier: verifier,
+      }).toString(),
+    });
+    expect(redeemed.status).toBe(200);
+    const issued = await redeemed.json();
+    expect(issued.expires_in).toBe(MCP_TOKEN_TTL_MS / 1000);
+
+    const refreshed = await app.request("/mcp/oauth/token", {
+      method: "POST",
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: issued.refresh_token,
+        client_id: "claude",
+      }).toString(),
+    });
+    expect(refreshed.status).toBe(200);
+    const renewed = await refreshed.json();
+    expect(renewed.access_token).not.toBe(issued.access_token);
+
+    // The refreshed bearer resolves the same connection, so the owner binding
+    // survives the rotation and the tool call needs no re-consent.
+    const response = await app.request("/mcp", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${renewed.access_token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", method: "tools/list", id: 1 }),
+    });
+    expect(response.status).toBe(200);
+    expect(dispatch.mock.calls[0]?.[2]).toEqual({
+      owner: OWNER,
+      chainId: 14800,
+    });
+  });
+
   it("answers a revoked owner with a specific non-retryable code and keeps 503 for unrelated failures", async () => {
     const dir = await mkdtemp(join(tmpdir(), "tee-revoked-"));
     dirs.push(dir);

@@ -24,6 +24,7 @@
 
 import {
   isMcpTokenExpired,
+  matchesMcpRefreshHash,
   type McpConnectionRecord,
   type McpConnectionStore,
   type McpOAuthAuthorizationRecord,
@@ -225,6 +226,21 @@ export function createIndexedDbMcpConnectionStore(
       if (record.status !== "approved") return null;
       if (isMcpTokenExpired(record)) return null;
       return { ...record };
+    },
+
+    async getByRefreshTokenHash(refreshTokenHash) {
+      // No IndexedDB index: a presented token may match either the current or
+      // the rotated-out hash, and the store holds a handful of connections.
+      const all = await runTx<McpConnectionRecord[]>(
+        resolved,
+        "readonly",
+        CONNECTION_INDEXES,
+        (store) => store.getAll(),
+      );
+      const record = all.find((candidate) =>
+        matchesMcpRefreshHash(candidate, refreshTokenHash),
+      );
+      return record ? { ...record } : null;
     },
 
     async update(id, patch) {

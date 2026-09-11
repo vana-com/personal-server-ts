@@ -540,9 +540,14 @@ describe("MCP OAuth routes", () => {
       "/.well-known/oauth-authorization-server",
     );
     expect(authServer.status).toBe(200);
-    expect((await authServer.json()).authorization_endpoint).toBe(
+    const metadata = await authServer.json();
+    expect(metadata.authorization_endpoint).toBe(
       `${SERVER_ORIGIN}/mcp/oauth/authorize`,
     );
+    expect(metadata.grant_types_supported).toEqual([
+      "authorization_code",
+      "refresh_token",
+    ]);
   });
 
   it("returns 404 for OAuth metadata when approval URL is missing", async () => {
@@ -652,6 +657,47 @@ describe("MCP OAuth routes", () => {
     expect(approvedConnection?.grants).toEqual([
       { grantId: "grant-mcp-1", scopes: ["chatgpt.history"] },
     ]);
+
+    // The client renews without a second consent screen, and the refresh
+    // token it just spent stops working.
+    const refresh = (refreshToken: string) =>
+      app.request("/mcp/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: refreshToken,
+          client_id: registered.client_id,
+        }),
+      });
+
+    const rotated = await refresh(tokenBody.refresh_token);
+    expect(rotated.status).toBe(200);
+    const rotatedBody = await rotated.json();
+    expect(rotatedBody.expires_in).toBe(MCP_TOKEN_TTL_MS / 1000);
+    expect(rotatedBody.access_token).not.toBe(tokenBody.access_token);
+    expect(
+      await store.getByTokenHash(
+        await hashConnectionToken(rotatedBody.access_token),
+      ),
+    ).toMatchObject({ status: "approved" });
+
+    const replay = await refresh(tokenBody.refresh_token);
+    expect(replay.status).toBe(400);
+    expect((await replay.json()).error).toBe("invalid_grant");
+
+    // Reuse detection took the whole family down with it.
+    expect((await refresh(rotatedBody.refresh_token)).status).toBe(400);
+  });
+
+  it("rejects an unknown grant type", async () => {
+    const res = await app.request("/mcp/oauth/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "client_credentials" }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("unsupported_grant_type");
   });
 });
 
