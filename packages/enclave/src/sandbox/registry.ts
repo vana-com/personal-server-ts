@@ -82,12 +82,19 @@ export interface SandboxIdentity {
 /**
  * `key` is the registry key of the matched entry. Fleet keys embed the
  * placement generation, so a caller that knows the owner's current assignment
- * can tell a live sandbox from one a previous generation left behind.
+ * can tell a live sandbox from one a previous generation left behind — and
+ * fills in `generation` from the assignment that matched, so what the agent
+ * signs names the placement rather than the key text.
  */
 export type SandboxLookup =
   | { kind: "unauthorized" }
   | { kind: "stale" }
-  | { kind: "active"; key: string; identity: SandboxIdentity };
+  | {
+      kind: "active";
+      key: string;
+      identity: SandboxIdentity;
+      generation?: number;
+    };
 
 export interface SandboxStatus {
   key: string;

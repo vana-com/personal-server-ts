@@ -9,6 +9,8 @@ import type { SandboxLookup } from "../sandbox/registry.js";
 import {
   buildAccessRecord,
   canonicalJson,
+  MAX_OCCURRED_AT_SKEW_MS,
+  type AccessRecordContext,
   type AccessRecordInput,
   type SignedAccessRecord,
 } from "./access-records.js";
@@ -24,6 +26,16 @@ const OWNER = privateKeyToAccount(keccak256(toBytes("access-records:owner")));
 const GRANTEE = "0x1111111111111111111111111111111111111111";
 const USER_PS_ID = userPsId(CHAIN_ID, OWNER.address);
 const SANDBOX_KEY = `${USER_PS_ID}:${EPOCH}`;
+const GENERATION = 7;
+const RECORDED_AT = "2026-09-09T00:00:01.000Z";
+// The agent bounds occurredAt to a skew window around its own clock, so a
+// record the route must accept is dated now, not at a fixed instant.
+const NOW_ISO = new Date().toISOString();
+const CONTEXT: AccessRecordContext = {
+  identity: { userPsId: USER_PS_ID, epoch: EPOCH },
+  nodeId: NODE_ID,
+  chainId: CHAIN_ID,
+};
 
 const SERVED: AccessRecordInput = {
   action: "read",
@@ -31,7 +43,7 @@ const SERVED: AccessRecordInput = {
   grantId: "grant-1",
   granteeAddress: GRANTEE,
   logId: "log-1",
-  occurredAt: "2026-09-09T00:00:00.000Z",
+  occurredAt: NOW_ISO,
   outcome: "served",
   scope: "instagram.profile",
   source: "mcp",
@@ -56,6 +68,7 @@ function jobsControl(
 ): AgentJobsControl {
   return {
     nodeId: NODE_ID,
+    chainId: CHAIN_ID,
     storageApiUrl: "https://storage.example",
     activeCount: () => 0,
     draining: () => false,
@@ -114,28 +127,50 @@ function post(
 describe("canonical access record JSON", () => {
   it("sorts keys, omits absent fields, and adds no whitespace", () => {
     const record = buildAccessRecord(
-      DENIED,
-      { userPsId: USER_PS_ID, epoch: EPOCH },
-      NODE_ID,
+      { ...DENIED, occurredAt: "2026-09-09T00:00:00.000Z" },
+      CONTEXT,
+      RECORDED_AT,
     );
     expect(canonicalJson(record)).toBe(
       `{"action":"read","chainId":14800,"denyReason":"scope_not_granted",` +
         `"epoch":3,"grantId":"none","granteeAddress":"${GRANTEE}",` +
         `"logId":"log-2","nodeId":"${NODE_ID}",` +
         `"occurredAt":"2026-09-09T00:00:00.000Z","outcome":"denied",` +
-        `"scope":"instagram.profile","source":"mcp","tool":"read_scope",` +
-        `"userPsId":"${USER_PS_ID}"}`,
+        `"recordedAt":"${RECORDED_AT}","scope":"instagram.profile",` +
+        `"source":"mcp","tool":"read_scope","userPsId":"${USER_PS_ID}"}`,
     );
   });
 
   it("is stable regardless of the order fields arrived in", () => {
-    const identity = { userPsId: USER_PS_ID, epoch: EPOCH };
     const shuffled = Object.fromEntries(
       Object.entries(SERVED).reverse(),
     ) as AccessRecordInput;
-    expect(canonicalJson(buildAccessRecord(shuffled, identity, NODE_ID))).toBe(
-      canonicalJson(buildAccessRecord(SERVED, identity, NODE_ID)),
+    expect(
+      canonicalJson(buildAccessRecord(shuffled, CONTEXT, RECORDED_AT)),
+    ).toBe(canonicalJson(buildAccessRecord(SERVED, CONTEXT, RECORDED_AT)));
+  });
+
+  it("stamps the agent's chain over whatever the body claimed", () => {
+    const record = buildAccessRecord(
+      { ...SERVED, chainId: 1 },
+      CONTEXT,
+      RECORDED_AT,
     );
+
+    expect(record.chainId).toBe(CHAIN_ID);
+  });
+
+  it("carries the placement generation only when the node is in a fleet", () => {
+    expect(buildAccessRecord(SERVED, CONTEXT, RECORDED_AT)).not.toHaveProperty(
+      "generation",
+    );
+    expect(
+      buildAccessRecord(
+        SERVED,
+        { ...CONTEXT, generation: GENERATION },
+        RECORDED_AT,
+      ).generation,
+    ).toBe(GENERATION);
   });
 });
 
@@ -158,6 +193,8 @@ describe("agent access records route", () => {
       expect(payload.userPsId).toBe(USER_PS_ID);
       expect(payload.epoch).toBe(EPOCH);
       expect(payload.nodeId).toBe(NODE_ID);
+      expect(payload.chainId).toBe(CHAIN_ID);
+      expect(Date.parse(payload.recordedAt)).toBeGreaterThan(0);
       expect(payload).not.toHaveProperty("ownerAddress");
       expect(payload).not.toHaveProperty("signature");
       await expect(
@@ -238,5 +275,60 @@ describe("agent access records route", () => {
       });
       expect(response.status).toBe(400);
     });
+  });
+
+  it("refuses a record naming a chain the node does not run", async () => {
+    const posted: SignedAccessRecord[][] = [];
+    await withServer(jobsControl(posted), async (origin) => {
+      const response = await post(origin, {
+        records: [{ ...SERVED, chainId: 1 }],
+      });
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toMatchObject({
+        code: "ACCESS_RECORD_REFUSED",
+      });
+    });
+    expect(posted).toHaveLength(0);
+  });
+
+  it("refuses a backdated record rather than signing it", async () => {
+    const posted: SignedAccessRecord[][] = [];
+    const backdated = new Date(
+      Date.now() - MAX_OCCURRED_AT_SKEW_MS - 1_000,
+    ).toISOString();
+    await withServer(jobsControl(posted), async (origin) => {
+      const response = await post(origin, {
+        records: [{ ...SERVED, occurredAt: backdated }],
+      });
+      expect(response.status).toBe(400);
+    });
+    expect(posted).toHaveLength(0);
+  });
+
+  it("refuses the whole batch when one record disagrees", async () => {
+    const posted: SignedAccessRecord[][] = [];
+    await withServer(jobsControl(posted), async (origin) => {
+      const response = await post(origin, {
+        records: [SERVED, { ...DENIED, chainId: 1 }],
+      });
+      expect(response.status).toBe(400);
+    });
+    expect(posted).toHaveLength(0);
+  });
+
+  it("stamps the placement generation the lookup matched", async () => {
+    const posted: SignedAccessRecord[][] = [];
+    const lookup: SandboxLookup = {
+      kind: "active",
+      key: SANDBOX_KEY,
+      identity: { userPsId: USER_PS_ID, epoch: EPOCH },
+      generation: GENERATION,
+    };
+    await withServer(jobsControl(posted, lookup), async (origin) => {
+      const response = await post(origin, { records: [SERVED] });
+      expect(response.status).toBe(202);
+    });
+
+    expect(posted[0]?.[0]?.payload.generation).toBe(GENERATION);
   });
 });

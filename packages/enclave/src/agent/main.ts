@@ -1,5 +1,5 @@
 import { startFleetWorker } from "../fleet/worker-runtime.js";
-import { currentFleetSandbox } from "../fleet/worker-key.js";
+import { currentFleetSandbox, fleetSandboxKey } from "../fleet/worker-key.js";
 import {
   fleetConfigValidity,
   verifiedFleetEnvironment,
@@ -192,6 +192,7 @@ async function startJobs(
 
   return {
     nodeId: config.nodeId,
+    chainId: config.chainId,
     ...(fleet
       ? { nodeIncarnation: fleet.identity.nodeIncarnation, fleetEnabled: true }
       : {}),
@@ -223,9 +224,20 @@ async function startJobs(
       // owner is re-placed, the sandbox its previous generation left behind
       // must no longer serve or record, exactly as lookupSandboxJob refuses a
       // job bound to a retired assignment.
-      return currentFleetSandbox(lookup.key, fleet.worker.assignments())
-        ? lookup
-        : { kind: "stale" };
+      const assignments = fleet.worker.assignments();
+      if (!currentFleetSandbox(lookup.key, assignments)) {
+        return { kind: "stale" };
+      }
+
+      // The generation an access record is stamped with comes from the
+      // assignment that matched, never from parsing the key back apart.
+      const assignment = assignments.find(
+        (a) => fleetSandboxKey(a) === lookup.key,
+      );
+
+      return assignment
+        ? { ...lookup, generation: assignment.generation }
+        : lookup;
     },
     postAccessRecords: (records) => gateway.postAccessRecords({ records }),
     prewarm(body): void {

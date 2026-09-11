@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PersonalServerReadFulfillment } from "@opendatalabs/personal-server-ts-core/api";
-import { createAccessReporter } from "./access-reporter.js";
+import {
+  ACCESS_RECORDS_DROPPED,
+  createAccessReporter,
+} from "./access-reporter.js";
 
 const AGENT_URL = "http://agent.invalid";
 const ACCESS_TOKEN = "sandbox-access-token";
@@ -88,8 +91,12 @@ describe("access reporter batching", () => {
     }
 
     expect(warn).toHaveBeenCalledWith(
-      expect.objectContaining({ dropped: expect.any(Number) }),
-      expect.stringContaining("queue is full"),
+      expect.objectContaining({
+        count: expect.any(Number),
+        droppedTotal: expect.any(Number),
+        reason: "queue_full",
+      }),
+      ACCESS_RECORDS_DROPPED,
     );
   });
 
@@ -115,15 +122,70 @@ describe("access reporter batching", () => {
     expect(warn).toHaveBeenCalled();
   });
 
-  it("warns but does not throw when the agent refuses the batch", async () => {
+  it("drops a refused batch without retrying and without throwing", async () => {
     const send = vi.fn(async () => new Response(null, { status: 400 }));
     const { instance, warn } = reporter(send as unknown as typeof fetch);
     await instance.report(event(1));
 
     await instance.stop();
+    // A 4xx is the agent refusing these records, not a blip worth repeating.
+    expect(send).toHaveBeenCalledTimes(1);
     expect(warn).toHaveBeenCalledWith(
-      expect.objectContaining({ status: 400 }),
-      expect.any(String),
+      expect.objectContaining({ count: 1, reason: "refused_400", attempts: 1 }),
+      ACCESS_RECORDS_DROPPED,
+    );
+  });
+
+  it("retries a transient failure with backoff before giving up", async () => {
+    const send = vi.fn(async () => {
+      throw new Error("connect ECONNREFUSED");
+    });
+    const { instance, warn } = reporter(send as unknown as typeof fetch);
+    await instance.report(event(1));
+
+    const flushed = instance.flush();
+    // Two backoffs (500 ms, 1 s) separate the three attempts.
+    await vi.advanceTimersByTimeAsync(2_000);
+    await flushed;
+
+    expect(send).toHaveBeenCalledTimes(3);
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ attempts: 3, droppedTotal: 1 }),
+      ACCESS_RECORDS_DROPPED,
+    );
+  });
+
+  it("delivers a batch that fails once and then succeeds", async () => {
+    let attempts = 0;
+    const send = vi.fn(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("connect ECONNREFUSED");
+      return new Response(null, { status: 202 });
+    });
+    const { instance, warn } = reporter(send as unknown as typeof fetch);
+    await instance.report(event(1));
+
+    const flushed = instance.flush();
+    await vi.advanceTimersByTimeAsync(500);
+    await flushed;
+
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("sends once on shutdown rather than waiting out the backoff", async () => {
+    const send = vi.fn(async () => {
+      throw new Error("connect ECONNREFUSED");
+    });
+    const { instance, warn } = reporter(send as unknown as typeof fetch);
+    await instance.report(event(1));
+
+    await instance.stop();
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ attempts: 1 }),
+      ACCESS_RECORDS_DROPPED,
     );
   });
 });

@@ -7,8 +7,11 @@
  *
  *   sandbox PS  --Bearer PS_ACCESS_TOKEN-->  agent  --node bearer-->  Gateway
  *
- * Reporting is best effort by contract: a read is never delayed, retried, or
- * failed because its record could not be delivered.
+ * Reporting is best effort by contract: a read is never delayed or failed
+ * because its record could not be delivered. Delivery itself is not best
+ * effort — a failed batch is retried with backoff, and a batch that is finally
+ * given up on is logged as dropped so the gap in the owner's audit trail is
+ * visible rather than silent (security #9).
  */
 
 import type {
@@ -28,6 +31,13 @@ const FLUSH_INTERVAL_MS = 5_000;
 /** Backstop for an unreachable agent: drop oldest rather than grow forever. */
 const MAX_QUEUED_RECORDS = 500;
 const REQUEST_TIMEOUT_MS = 10_000;
+/** Delivery attempts per batch before it is given up on and logged. */
+const MAX_SEND_ATTEMPTS = 3;
+/** Backoff between attempts: 500 ms, then 1 s. */
+const RETRY_BASE_DELAY_MS = 500;
+
+/** Log line a dropped batch always emits; the audit gap is a metric, not noise. */
+export const ACCESS_RECORDS_DROPPED = "Access records dropped";
 
 export interface AccessReporterLogger {
   warn(payload: Record<string, unknown>, message: string): void;
@@ -72,16 +82,17 @@ export function createAccessReporter(
   const queue: AccessRecordPayload[] = [];
   let timer: ReturnType<typeof setTimeout> | undefined;
   let sending: Promise<void> = Promise.resolve();
+  // Shutdown must not wait out the backoff; a stopping reporter sends once.
+  let stopping = false;
+  // Every record this reporter never delivered, across both drop paths.
+  let dropped = 0;
 
   function enqueue(event: PersonalServerReadFulfillment): void {
     queue.push(toPayload(options.chainId, event));
 
     if (queue.length > MAX_QUEUED_RECORDS) {
-      const dropped = queue.splice(0, queue.length - MAX_QUEUED_RECORDS);
-      logger.warn(
-        { dropped: dropped.length },
-        "Access record queue is full; oldest records dropped",
-      );
+      const overflow = queue.splice(0, queue.length - MAX_QUEUED_RECORDS);
+      drop(overflow, { reason: "queue_full" });
     }
 
     if (queue.length >= MAX_BATCH_RECORDS) {
@@ -120,7 +131,34 @@ export function createAccessReporter(
     return sending;
   }
 
+  /**
+   * Deliver one batch, retrying a transient failure with backoff.
+   *
+   *   attempt 1 --fail--> 500 ms --> attempt 2 --fail--> 1 s --> attempt 3
+   *
+   * A 4xx is the agent refusing these records, not a blip, so it is not
+   * retried. Whatever is finally undelivered goes through `drop`, which is the
+   * one place an audit gap becomes visible.
+   */
   async function send(records: AccessRecordPayload[]): Promise<void> {
+    for (let attempt = 1; attempt <= MAX_SEND_ATTEMPTS; attempt += 1) {
+      const outcome = await attemptSend(records);
+      if (outcome === null) return;
+
+      const lastChance = attempt === MAX_SEND_ATTEMPTS || stopping;
+      if (outcome.permanent || lastChance) {
+        drop(records, { ...outcome, attempts: attempt });
+        return;
+      }
+
+      await delay(RETRY_BASE_DELAY_MS * 2 ** (attempt - 1));
+    }
+  }
+
+  /** null when the batch landed; otherwise why it did not. */
+  async function attemptSend(
+    records: AccessRecordPayload[],
+  ): Promise<{ reason: string; permanent: boolean } | null> {
     try {
       const response = await requestFetch(endpoint, {
         method: POST,
@@ -131,23 +169,41 @@ export function createAccessReporter(
         body: JSON.stringify({ records }),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
-      if (response.ok) return;
+      if (response.ok) return null;
 
-      // Dropped, not retried: a record describes a read that already happened,
-      // and a retry queue would outlive the sandbox that owns the token.
-      logger.warn(
-        { count: records.length, status: response.status },
-        "Access records were refused",
-      );
+      return {
+        reason: `refused_${response.status}`,
+        permanent: response.status >= 400 && response.status < 500,
+      };
     } catch (err) {
-      logger.warn(
-        {
-          count: records.length,
-          error: err instanceof Error ? err.message : String(err),
-        },
-        "Access records could not be delivered",
-      );
+      return {
+        reason: err instanceof Error ? err.message : String(err),
+        permanent: false,
+      };
     }
+  }
+
+  /**
+   * Records that will never reach the Gateway. Reads were already served, so
+   * this is the audit trail's gap: it is counted and logged under one stable
+   * message, never swallowed.
+   */
+  function drop(
+    records: AccessRecordPayload[],
+    detail: { reason: string; attempts?: number },
+  ): void {
+    dropped += records.length;
+    logger.warn(
+      { count: records.length, droppedTotal: dropped, ...detail },
+      ACCESS_RECORDS_DROPPED,
+    );
+  }
+
+  function delay(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const handle = setTimeout(resolve, ms);
+      handle.unref?.();
+    });
   }
 
   return {
@@ -159,6 +215,7 @@ export function createAccessReporter(
     },
     flush,
     async stop(): Promise<void> {
+      stopping = true;
       clearFlushTimer();
       await flush();
     },
