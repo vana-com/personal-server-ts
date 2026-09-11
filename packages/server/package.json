@@ -41,18 +41,16 @@
     "!dist/bundle"
   ],
   "scripts": {
-    "copy-ui": "mkdir -p dist/ui && cp src/ui/index.html dist/ui/index.html && cp ../lite/src/browser-tls-rustls/browser_tls_rustls_bg.wasm dist/ui/browser_tls_rustls_bg.wasm",
-    "bundle-ui": "esbuild src/ui/ps-lite-debug.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=dist/ui/ps-lite-debug.js",
+    "copy-ui": "mkdir -p dist/ui && cp src/ui/index.html dist/ui/index.html",
     "build:bundle": "mkdir -p dist/bundle && esbuild dist/index.js --bundle --platform=node --format=esm --target=node22 --outfile=dist/bundle/enclave-main.mjs --external:better-sqlite3 --external:pino --external:pino-pretty --external:secp256k1 --external:thread-stream --packages=bundle --banner:js=\"import { createRequire as __bundleCreateRequire } from 'node:module'; import { fileURLToPath as __bundleFileURLToPath } from 'node:url'; import { dirname as __bundleDirname } from 'node:path'; const require = __bundleCreateRequire(import.meta.url); const __filename = __bundleFileURLToPath(import.meta.url); const __dirname = __bundleDirname(__filename);\" && cp package.json dist/package.json && npm run verify:bundle",
     "verify:bundle": "node dist/scripts/verify-bundle.js",
-    "build": "tsc --build && npm run copy-ui && npm run bundle-ui && npm run build:bundle",
+    "build": "tsc --build && npm run copy-ui && npm run build:bundle",
     "start": "node dist/index.js",
     "dev": "node --watch dist/index.js"
   },
   "dependencies": {
     "@hono/node-server": "^1.19.13",
     "@opendatalabs/personal-server-ts-core": "*",
-    "@opendatalabs/personal-server-ts-lite": "*",
     "@opendatalabs/vana-sdk": "3.23.0-pr.211.36da1d8",
     "better-sqlite3": "^12.11.1",
     "hono": "^4.12.27",

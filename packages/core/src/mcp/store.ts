@@ -1,11 +1,7 @@
 /**
- * In-memory `McpConnectionStore` — Phase 1 default for tests and as a fallback
- * runtime store. Production Web PS Lite is expected to back this with the same
- * IndexedDB state mechanism used for server-identity and token storage.
- *
- * The PS-Lite browser adapter for this port lives in
- * `packages/lite/src/mcp-store.ts` (not part of this change set yet) — that
- * adapter mirrors `createIndexedDbPsLiteTokenStore()`.
+ * In-memory `McpConnectionStore` — the default for tests and a fallback
+ * runtime store. Durable implementations of this port live with their host
+ * runtime (the enclave persists connection state inside the CVM).
  */
 
 import type {

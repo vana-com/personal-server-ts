@@ -13,7 +13,7 @@ import { describe, expect, it } from "vitest";
 const require = createRequire(import.meta.url);
 const releasePlugin = require("./semantic-release-pin-workspace-deps.cjs");
 
-const workspaces = ["core", "lite", "server", "cli"];
+const workspaces = ["core", "server", "cli"];
 
 describe("semantic release workspace versioning", () => {
   it("updates every workspace and lock entry atomically and idempotently", () => {

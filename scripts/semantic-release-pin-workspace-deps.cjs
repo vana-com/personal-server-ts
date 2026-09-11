@@ -12,7 +12,6 @@ const path = require("node:path");
 
 const PACKAGE_FILES = [
   "packages/core/package.json",
-  "packages/lite/package.json",
   "packages/server/package.json",
   "packages/cli/package.json",
 ];

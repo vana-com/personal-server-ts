@@ -617,7 +617,6 @@ export async function createServer(
     scopeDeletions,
     cloudMode,
     devToken,
-    ownerSignature: masterKeySignature,
     ownerPrivateKey,
     accessToken,
     tokenStore,

@@ -336,13 +336,6 @@
       <div class="status-dot"></div>
       <h1>PERSONAL SERVER</h1>
       <div class="header-spacer"></div>
-      <label class="runtime-picker">
-        <span>Runtime</span>
-        <select id="runtime-select">
-          <option value="node">Node</option>
-          <option value="browser">Browser</option>
-        </select>
-      </label>
     </header>
 
     <nav id="tabs">
@@ -671,9 +664,7 @@
     <script>
       const TOKEN = "__DEV_TOKEN__";
       const BASE = window.location.origin;
-      window.__PS_LITE_BOOTSTRAP__ = "__PS_LITE_BOOTSTRAP_JSON__";
       const runtimeState = {
-        active: "node",
         registration: { ownerPrivateKeyConfigured: false },
         devTokenExpired: false,
       };
@@ -796,37 +787,29 @@
       }
 
       async function runtimeApi(path, opts) {
-        return runtimeState.active === "browser"
-          ? psLiteApiRequest(path, opts)
-          : api(path, opts);
+        return api(path, opts);
       }
 
       async function runtimeListGrants() {
-        return runtimeState.active === "browser"
-          ? psLiteClient().listGrants()
-          : api("/v1/grants", { auth: "owner" });
+        return api("/v1/grants", { auth: "owner" });
       }
 
       async function runtimeCreateGrant(body) {
-        return runtimeState.active === "browser"
-          ? psLiteClient().createGrant(body)
-          : api("/v1/grants", {
-              method: "POST",
-              auth: "owner",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(body),
-            });
+        return api("/v1/grants", {
+          method: "POST",
+          auth: "owner",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
       }
 
       async function runtimeRevokeGrant(grantId) {
         var path = "/v1/grants/" + encodeURIComponent(grantId);
-        return runtimeState.active === "browser"
-          ? psLiteClient().revokeGrant(grantId)
-          : api(path, { method: "DELETE", auth: "owner" });
+        return api(path, { method: "DELETE", auth: "owner" });
       }
 
       function runtimeName() {
-        return runtimeState.active === "browser" ? "Browser" : "Node";
+        return "Node";
       }
 
       function registrationRequired(healthData) {
@@ -889,7 +872,6 @@
             host !== "0.0.0.0" &&
             host !== "::1" &&
             host !== "[::1]" &&
-            host !== "ps-lite.local" &&
             !host.startsWith("10.") &&
             !host.startsWith("192.168.") &&
             !/^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
@@ -900,41 +882,8 @@
       }
 
       async function selectedHealth() {
-        if (runtimeState.active === "node") return api("/health");
-
-        var result = await psLiteClient().status();
-        if (result.ok && result.data && !result.data.runtime) {
-          result = await psLiteClient().activate();
-        }
-        var data = result.data || {};
-        var runtime = data.runtime || {};
-        var relay = data.relay || {};
-        var registration = runtime.registration;
-        if (registration && relay.publicUrl) {
-          registration = Object.assign({}, registration, {
-            serverUrl: relay.publicUrl,
-          });
-        }
-        return {
-          status: result.status,
-          ok: result.ok,
-          data: Object.assign({}, runtime, {
-            apiOrigin: relay.publicUrl || runtime.apiOrigin,
-            registration: registration,
-            relay: relay,
-            runtime: {
-              kind: "ps-lite",
-              available: runtime.active !== false,
-            },
-          }),
-        };
+        return api("/health");
       }
-
-      el("runtime-select").addEventListener("change", function (e) {
-        runtimeState.active = e.target.value;
-        el("node-registration-status").textContent = "";
-        refreshSelectedPanel();
-      });
 
       // --- Health ---
       async function loadHealth() {
@@ -960,17 +909,7 @@
             ],
             ["owner", d.owner ?? "not configured", d.owner ? "ok" : "err"],
           ];
-          if (runtimeState.active === "browser") {
-            items.push([
-              "relay",
-              d.relay && d.relay.connected
-                ? "connected"
-                : d.relay
-                  ? d.relay.status
-                  : "disconnected",
-              d.relay && d.relay.connected ? "ok" : "warn",
-            ]);
-          } else if (d.tunnel) {
+          if (d.tunnel) {
             var tunnelValue = d.tunnel.status || "unknown";
             if (
               d.tunnel.status === "connected" &&
@@ -1511,9 +1450,6 @@
 
         try {
           var path = "/v1/data/" + encodeURIComponent(scope);
-          if (runtimeState.active === "browser") {
-            path += "?grantId=debug-grant";
-          }
           var result = await runtimeApi(path);
           showJson(content, result.data);
         } catch (e) {
@@ -1753,109 +1689,6 @@
       }
 
       el("send-api-btn").addEventListener("click", sendApiRequest);
-
-      // --- Browser Runtime Bridge ---
-      function psLiteClient() {
-        if (!window.psLiteDebug) {
-          throw new Error("Browser runtime bundle is still loading");
-        }
-        return window.psLiteDebug;
-      }
-
-      async function psLiteApiRequest(path, opts) {
-        opts = opts || {};
-        var body;
-        if (opts.body) {
-          try {
-            body = JSON.parse(opts.body);
-          } catch (e) {
-            body = opts.body;
-          }
-        }
-        var client = psLiteClient();
-        var url = new URL(path, "https://ps-lite.local");
-        var dataPrefix = "/v1/data";
-        if (
-          url.pathname === dataPrefix &&
-          (!opts.method || opts.method.toUpperCase() === "GET")
-        ) {
-          return client.listData({
-            scopePrefix: url.searchParams.get("scopePrefix") || undefined,
-            limit: numberParam(url.searchParams.get("limit")),
-            offset: numberParam(url.searchParams.get("offset")),
-          });
-        }
-        if (url.pathname.startsWith(dataPrefix + "/")) {
-          var dataSuffix = url.pathname.slice((dataPrefix + "/").length);
-          if (dataSuffix.endsWith("/versions")) {
-            return client.listVersions(
-              decodeURIComponent(dataSuffix.slice(0, -"/versions".length)),
-              {
-                limit: numberParam(url.searchParams.get("limit")),
-                offset: numberParam(url.searchParams.get("offset")),
-              },
-            );
-          }
-          var scope = decodeURIComponent(dataSuffix);
-          var method = (opts.method || "GET").toUpperCase();
-          if (method === "POST") {
-            return client.postData(scope, body);
-          }
-          if (method === "GET") {
-            return client.readData(scope, {
-              grantId: url.searchParams.get("grantId") || undefined,
-              fileId: url.searchParams.get("fileId") || undefined,
-              at: url.searchParams.get("at") || undefined,
-            });
-          }
-        }
-        if (
-          url.pathname === "/v1/sync/status" &&
-          (!opts.method || opts.method.toUpperCase() === "GET")
-        ) {
-          return client.syncStatus();
-        }
-        if (
-          url.pathname === "/v1/sync/trigger" &&
-          (opts.method || "GET").toUpperCase() === "POST"
-        ) {
-          return client.syncTrigger();
-        }
-        if (url.pathname === "/v1/grants") {
-          var grantMethod = (opts.method || "GET").toUpperCase();
-          if (grantMethod === "GET") return client.listGrants();
-          if (grantMethod === "POST") return client.createGrant(body);
-        }
-        if (url.pathname.startsWith("/v1/grants/")) {
-          var revokeMethod = (opts.method || "GET").toUpperCase();
-          if (revokeMethod === "DELETE") {
-            return client.revokeGrant(
-              decodeURIComponent(url.pathname.slice("/v1/grants/".length)),
-            );
-          }
-        }
-        return psLiteClient().request(path, {
-          method: opts.method || "GET",
-          body: body,
-          auth: opts.auth,
-          headers: opts.headers,
-        });
-      }
-
-      function numberParam(value) {
-        if (value === null || value === "") return undefined;
-        var parsed = Number(value);
-        return Number.isFinite(parsed) ? parsed : undefined;
-      }
-
-      window.addEventListener("ps-lite-relay-status", function () {
-        if (runtimeState.active === "browser") refreshSelectedPanel();
-      });
-      window.addEventListener("ps-lite-relay-log", function (event) {
-        if (runtimeState.active === "browser" && selectedPanel() === "health") {
-          el("node-registration-status").textContent = String(event.detail);
-        }
-      });
 
       // --- Connect Simulator ---
       var connectState = {
@@ -2187,6 +2020,5 @@
         return addr.slice(0, 6) + "..." + addr.slice(-4);
       }
     </script>
-    <script type="module" src="/ui/ps-lite-debug.js"></script>
   </body>
 </html>

@@ -42,7 +42,6 @@ jobs:
           const canaryVersion = process.env.CANARY_VERSION;
           const packageFiles = [
             "packages/core/package.json",
-            "packages/lite/package.json",
             "packages/server/package.json",
             "packages/cli/package.json",
           ];
@@ -54,19 +53,10 @@ jobs:
             if (path === "packages/server/package.json") {
               pkg.dependencies["@opendatalabs/personal-server-ts-core"] =
                 canaryVersion;
-              pkg.dependencies["@opendatalabs/personal-server-ts-lite"] =
-                canaryVersion;
-            }
-
-            if (path === "packages/lite/package.json") {
-              pkg.dependencies["@opendatalabs/personal-server-ts-core"] =
-                canaryVersion;
             }
 
             if (path === "packages/cli/package.json") {
               pkg.dependencies["@opendatalabs/personal-server-ts-core"] =
-                canaryVersion;
-              pkg.dependencies["@opendatalabs/personal-server-ts-lite"] =
                 canaryVersion;
               pkg.dependencies["@opendatalabs/personal-server-ts-server"] =
                 canaryVersion;
@@ -77,10 +67,6 @@ jobs:
           EOF
       - name: Publish core canary
         run: cd packages/core && npm publish --tag canary --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - name: Publish lite canary
-        run: cd packages/lite && npm publish --tag canary --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish server canary

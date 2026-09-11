@@ -1,19 +1,15 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import { uiRoute } from "./ui.js";
+import { vi } from "vitest";
 
 // Mock fs.readFileSync to avoid needing the actual HTML file during tests
 vi.mock("node:fs", () => ({
   readFileSync: () =>
-    '<html><script>const TOKEN = "__DEV_TOKEN__"; window.__PS_LITE_BOOTSTRAP__ = "__PS_LITE_BOOTSTRAP_JSON__";</script></html>',
+    '<html><script>const TOKEN = "__DEV_TOKEN__";</script></html>',
 }));
 
 describe("uiRoute", () => {
   const DEV_TOKEN = "test-dev-token-456";
-
-  beforeEach(() => {
-    // Reset the cached HTML between tests by clearing the module-level cache
-    // Since we mocked readFileSync, each test gets a fresh read
-  });
 
   it("serves HTML with dev token injected", async () => {
     const app = uiRoute({ devToken: DEV_TOKEN });
@@ -26,23 +22,6 @@ describe("uiRoute", () => {
     expect(html).not.toContain("__DEV_TOKEN__");
   });
 
-  it("injects PS Lite bootstrap config", async () => {
-    const app = uiRoute({
-      devToken: DEV_TOKEN,
-      psLiteBootstrap: {
-        ownerSignature: "0xsignature",
-        config: { gateway: { url: "https://gateway.example" } },
-      },
-    });
-
-    const res = await app.request("/");
-
-    expect(res.status).toBe(200);
-    const html = await res.text();
-    expect(html).toContain('"ownerSignature":"0xsignature"');
-    expect(html).not.toContain("__PS_LITE_BOOTSTRAP_JSON__");
-  });
-
   it("returns HTML content type", async () => {
     const app = uiRoute({ devToken: DEV_TOKEN });
 
@@ -50,14 +29,5 @@ describe("uiRoute", () => {
 
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/html");
-  });
-
-  it("serves the browser PS Lite debug bundle", async () => {
-    const app = uiRoute({ devToken: DEV_TOKEN });
-
-    const res = await app.request("/ps-lite-debug.js");
-
-    expect(res.status).toBe(200);
-    expect(res.headers.get("content-type")).toContain("application/javascript");
   });
 });
