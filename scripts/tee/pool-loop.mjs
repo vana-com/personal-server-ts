@@ -121,7 +121,18 @@ export const REASON = Object.freeze({
   stopBlocked: "STOP_BLOCKED",
   restartBlocked: "RESTART_BLOCKED",
   unknownMember: "MEMBER_NOT_IN_STATUS",
+  adoptUndecided: "ADOPT_UNDECIDED",
 });
+
+/** Placements on a member whose lease has not lapsed: the work a stop or a
+ * restart would actually cut off. The controller reaps expired rows on its own
+ * next renew tick, so until then they still appear in the snapshot. */
+const livePlacements = (status, now, nodeId) =>
+  status.placements.filter(
+    (row) =>
+      row.assignment?.nodeId === nodeId &&
+      Date.parse(row.assignment.leaseExpiresAt) > now,
+  ).length;
 
 // ---------------------------------------------------------------- decisions
 
@@ -252,6 +263,7 @@ function restartOrQuarantine(view, ctx, reason) {
     });
     entry.restarts = (entry.restarts ?? 0) + 1;
     enter(entry, PHASE.starting, ctx.now);
+    entry.loopStartedAt = ctx.now;
     return;
   }
 
@@ -398,6 +410,11 @@ function adoptAdmissionSince(view) {
 
   const since = Date.parse(node.lastAdmission?.since ?? "");
   if (!Number.isFinite(since) || since >= entry.since) return;
+  // An admission raised before the loop's own start or restart describes the
+  // machine that command replaced, so adopting it would hand `settledAdmitted`
+  // a readmission the rebooted member never proved - and count it toward
+  // MIN_RUNNING while its 8 min admit deadline is retroactively consumed.
+  if (since <= (entry.loopStartedAt ?? 0)) return;
 
   enter(entry, PHASE.running, since);
 }
@@ -448,6 +465,7 @@ function startMember(view, ctx, state) {
   enter(view.entry, PHASE.starting, ctx.now);
   // The fresh restart budget is earned by reaching admission, not by asking.
   view.entry.startedByLoop = true;
+  view.entry.loopStartedAt = ctx.now;
   delete state.saturatedSince;
 }
 
@@ -568,12 +586,7 @@ export function decidePoolActions(input) {
   }
 
   const records = new Map(status.nodes.map((node) => [node.nodeId, node]));
-  const liveOn = (nodeId) =>
-    status.placements.filter(
-      (row) =>
-        row.assignment?.nodeId === nodeId &&
-        Date.parse(row.assignment.leaseExpiresAt) > now,
-    ).length;
+  const liveOn = (nodeId) => livePlacements(status, now, nodeId);
 
   const views = members.map((member) => {
     const entry = (state.nodes[member.nodeId] ??= {
@@ -643,7 +656,33 @@ export function adoptState(input) {
       continue;
     }
 
-    if (entry.phase !== PHASE.stopped) enter(entry, PHASE.stopped, now);
+    if (entry.phase === PHASE.stopped) continue;
+
+    // A missing admission is not evidence the machine is down. The controller's
+    // admissions map is in memory and `declare` re-marks every persisted node
+    // unavailable for ~30 s after its own boot - precisely the window the
+    // README tells the operator to restart the loop in. So only demote a member
+    // the controller reports unavailable, holding no live lease, that the loop
+    // does not already believe to be running; otherwise leave the phase alone
+    // and let the loop's own next tick decide.
+    //
+    //   unavailable && live=0 && !running ─► stopped
+    //   anything else ────────────────────► untouched, ADOPT_UNDECIDED
+    if (
+      entry.phase !== PHASE.running &&
+      node?.unavailable === true &&
+      livePlacements(status, now, member.nodeId) === 0
+    ) {
+      enter(entry, PHASE.stopped, now);
+      continue;
+    }
+
+    log({
+      level: "warn",
+      reason: REASON.adoptUndecided,
+      nodeId: member.nodeId,
+      phase: entry.phase,
+    });
   }
 
   return state;
@@ -951,6 +990,11 @@ function loadContext(argv) {
     (Array.isArray(pool) ? undefined : pool.controllerAdminUrl);
   if (!Array.isArray(members) || !adminUrl)
     throw new Error(`${poolPath} must supply controllerAdminUrl and members`);
+  // The admin bearer rides every request and authorizes admit, drain, quiesce,
+  // migrate and prepare-rollback. The controller listens as plain HTTP behind
+  // the dstack TLS gateway, so an http:// typo here is a token in cleartext.
+  if (!httpsUrl(adminUrl))
+    throw new Error("controllerAdminUrl must be an https URL");
   members.forEach((member, index) => assertMember(member, index, poolPath));
 
   return {
