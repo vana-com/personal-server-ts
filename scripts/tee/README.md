@@ -2,6 +2,11 @@
 
 Prerequisites: Phala CLI 1.1.21 logged in and Node.js 24.
 
+`provision.sh`, `replicate.sh` and `update.sh` are the **pre-fleet (level B)**
+path: one standalone CVM, an unsigned environment and a Gateway node id. They
+cannot stage a signed fleet, so do not use them for a controller or a worker —
+see [From-scratch fleet (level A)](#from-scratch-fleet-level-a).
+
 ```sh
 export ENCLAVE_AGENT_SECRET=...
 export AGENT_IMAGE=node@sha256:...
@@ -136,6 +141,87 @@ curl -fsS -X POST "$GATEWAY_URL/v1/tee-nodes" \
   -H 'Content-Type: application/json' \
   --data @node-registration.json
 ```
+
+## From-scratch fleet (level A)
+
+Proven on prod9 2026-09-11: zero to 3 admitted CVMs, MCP ingress and Gateway
+rows in **13 min**. One app id per role; the workers share one, so dstack
+derives the same owner job keys for both.
+
+1. Allocate one app id per role — `phala api /kms/phala/next_app_id` — and keep
+   each `{app_id, nonce}` pair.
+2. Deploy every CVM fail-closed with `FLEET_SIGNED_CONFIG={}` in a mode-0600 env
+   file, so the first boot opens no listener:
+
+   ```sh
+   phala deploy -n <name> -c <compose> --custom-app-id <app-id> --nonce <n> \
+     --image dstack-0.5.9-bd369a8c --instance-type tdx.medium --disk-size 20G \
+     --node-id <teepod-id> --no-dev-os --kms phala -e <dummy-env> --json
+   ```
+
+3. Poll `phala api /cvms/<uuid>` until `status: running`. `--wait` returns in
+   4–7 s when the _record_ exists, not when the CVM runs.
+4. Harvest each CVM's measured identity. `/cvms/<uuid>` leaves `instance_id`
+   null forever; instance id, compose hash, mr-kms, key-provider SPKI and
+   MRTD/RTMRs all come from the attestation event log:
+
+   ```sh
+   python3 scripts/tee/harvest-identity.py --nodes nodes.json > identities.json
+   ```
+
+5. Render one signed-config draft per node from `identities.json`:
+   `expiresAt: null`, `issuedAt` at the current second (the verifier rejects
+   `now + 60 s`), and on a NET-NEW controller **both** `MCP_MIGRATION_REQUIRED=0`
+   and `MCP_STATE_REQUIRED=0`.
+6. Sign each draft and push it as the sealed environment:
+   `phala envs update <uuid> -e <sealed.env> --json`. That restart is what boots
+   the signed config. Read every secret from the keychain inline, per command.
+7. Health, 78–87 s after the env update: worker `GET :8787/agent/v1/health`,
+   controller `POST :8791/fleet/v1/status`, each with its bearer. All 200.
+8. **First deploy only** — `POST :8791/fleet/v1/activate` on the controller's
+   admin listener. A roll never needs it.
+9. Per worker, against the Gateway: `POST /v1/tee-nodes` with the row and node
+   secret, wait for a fresh heartbeat carrying the staged compose hash, then
+   `POST /v1/tee-nodes/<node-id>/admit`.
+10. Re-sign the controller with `MCP_STATE_REQUIRED=1` **only after** the first
+    real owner MCP connection has written sealed state. An OAuth DCR does not
+    write it, and signing 1 on an empty fleet crash-loops the controller.
+
+### Custom domain (optional)
+
+| record                           | value                               |
+| -------------------------------- | ----------------------------------- |
+| CNAME `<host>`                   | `_.dstack-pha-<node>.phala.network` |
+| TXT `_dstack-app-address.<host>` | `<app-id>:8788`                     |
+
+Keep `mcp-tls` with `GATEWAY_DOMAIN=<host>` once both records resolve. Until
+then `DNS_SETUP_MODE=wait` blocks the CVM 3600 s: drop `mcp-tls` and serve MCP
+on `https://<app-id>-8788.dstack-pha-<node>.phala.network`.
+
+### Rolling an existing fleet
+
+Steps 2, 3, 6, 7 and 9 only — no app id, no `activate`, no MCP state flag change.
+
+1. Stage every compose first, **the controller first**, so its real dstack
+   `compose_hash` is readable before any worker bundle is signed against it.
+2. Staged reciprocal pin: each worker's `FLEET_PEER_POLICIES` carries the
+   current **and** next controller hash, so it admits either side of the roll.
+3. Settle every CVM to `running` before its `envs update`. That ordering is what
+   keeps the 409 count at 0.
+4. Rotate each Gateway row `drain → remove → register → heartbeat → admit`, each
+   followed by a controller `admit {resume:true}`: a Gateway drain sets the
+   controller's own `draining` flag.
+5. Repin `~/.vana/pool.json` to the new hashes, restart the loop, **no state edits**.
+
+### Known gaps
+
+| gap                                                                        | workaround                                                                                                                                          |
+| -------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A byte-identical compose hashes differently on a different node            | always read `compose_hash` back from the staged CVM                                                                                                 |
+| Container logs unreachable on prod9 (`phala logs` → "Container not found") | serial console only                                                                                                                                 |
+| No resize verb; no base domain in `phala nodes list`                       | `phala api -X PATCH /cvms/<uuid>` with the new type, CVM stopped; `phala api /teepods` → `tproxy_base_domain`                                       |
+| Gateway `admit` → 500 for a node its `FLEET_CONTROLLER_URL` does not know  | point the Gateway at this fleet's controller, or leave the rows `pending`                                                                           |
+| No in-tree render/sign tooling yet                                         | interim: `render-drafts.py`, `sign-and-update.cjs`, `sign-reviewed-config-rehearsal.cjs` in `e2e-proof-2026-09-09/fleet-overnight/rehearsal-prod9/` |
 
 ## Fleet composes
 
