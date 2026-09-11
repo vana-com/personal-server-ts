@@ -1,7 +1,28 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import { getCollateralAndVerify } from "@phala/dcap-qvl";
+import {
+  constants,
+  getCollateral,
+  getCollateralAndVerify,
+  intel,
+  PHALA_PCCS_URL,
+  Quote,
+  verify,
+  type Collateral,
+  type VerifiedReport,
+} from "@phala/dcap-qvl";
 import type { FleetPeerIdentity } from "./contracts.js";
 import type { FleetPeerVerifier } from "./peer.js";
+/** Intel publishes TCB info, QE identity and CRLs per (FMSPC, CA, TEE) — not
+ * per quote — and fetching them costs ~0.55 s against a renew budget of 8 s.
+ * One fetch therefore serves a minute of handshakes. No verdict is cached:
+ * every quote is verified in full, against the PCK chain it carries itself,
+ * on every call, and `verify` rejects collateral whose FMSPC is not this
+ * quote's. */
+const COLLATERAL_CACHE_MS = 60_000;
+const MS_PER_SECOND = 1_000;
+/** Collateral with the one quote-specific part removed; `verify` then reads the
+ * PCK chain out of the quote in front of it. */
+type SharedCollateral = Collateral & { pck_certificate_chain: null };
 interface FleetPeerPolicyBase {
   identity: Omit<FleetPeerIdentity, "nodeIncarnation">;
   mrTd: string;
@@ -142,6 +163,47 @@ function verifyDstackEvents(
 export function createDcapPeerVerifier(
   policies: FleetPeerPolicy[],
 ): FleetPeerVerifier {
+  const collaterals = new Map<
+    string,
+    { collateral: Promise<SharedCollateral>; fetchedAt: number }
+  >();
+
+  async function fetchShared(raw: Buffer): Promise<SharedCollateral> {
+    const fetched = await getCollateral(PHALA_PCCS_URL, raw);
+    return { ...fetched, pck_certificate_chain: null };
+  }
+
+  function collateralFor(key: string, raw: Buffer): Promise<SharedCollateral> {
+    const hit = collaterals.get(key);
+    if (hit && Date.now() - hit.fetchedAt <= COLLATERAL_CACHE_MS)
+      return hit.collateral;
+
+    const collateral = fetchShared(raw);
+    collaterals.set(key, { collateral, fetchedAt: Date.now() });
+    // A failed fetch must not hold the window: drop it so the next peer retries.
+    collateral.catch(() => {
+      if (collaterals.get(key)?.collateral === collateral)
+        collaterals.delete(key);
+    });
+    return collateral;
+  }
+
+  async function verifyQuote(raw: Buffer): Promise<VerifiedReport> {
+    const quote = Quote.parse(raw);
+    // Only a quote carrying its own PCK chain can be verified against shared
+    // collateral; anything else keeps the SDK's one-shot path.
+    if (
+      quote.authData.intoV3().certificationData.certType !==
+      constants.PCK_CERT_CHAIN
+    )
+      return getCollateralAndVerify(raw);
+
+    const tee = quote.header.isSgx() ? "sgx" : "tdx";
+    const key = `${tee}:${hex(intel.getFmspc(quote))}:${intel.getCa(quote)}`;
+    const collateral = await collateralFor(key, raw);
+    return verify(raw, collateral, Math.floor(Date.now() / MS_PER_SECOND));
+  }
+
   return async (evidence, reportData, identity) => {
     const policy = policies.find((p) =>
       Object.entries(p.identity).every(
@@ -152,9 +214,7 @@ export function createDcapPeerVerifier(
       throw new Error("Peer not admitted");
     if (typeof evidence.quote !== "string" || evidence.quote.length > 256_000)
       throw new Error("Invalid peer quote");
-    const verified = await getCollateralAndVerify(
-      Buffer.from(evidence.quote, "base64"),
-    );
+    const verified = await verifyQuote(Buffer.from(evidence.quote, "base64"));
     if (!(policy.allowedTcbStatuses ?? ["UpToDate"]).includes(verified.status))
       throw new Error("Peer TCB rejected");
     const report = verified.report.asTd10() ?? verified.report.asTd15()?.base;
