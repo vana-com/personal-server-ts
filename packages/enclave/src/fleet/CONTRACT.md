@@ -189,6 +189,28 @@ within its bounded drain grace. A lost renewal acknowledgment retains its last
 possibly granted expiry and disables further renewal/allocation to that node;
 it never extends an unreachable node forever.
 
+## MCP OAuth token model
+
+The ingress mounts one OAuth server advertising `authorization_code` and
+`refresh_token`. Both grants return the same shape: an opaque 32-byte access
+token valid one hour (`expires_in` 3600), plus an opaque 32-byte refresh token
+valid thirty days and bound to the connection id and the issuing `client_id`.
+Durable state keeps only SHA-256 of each, never the raw token; the refresh hash
+is domain separated so a refresh token cannot resolve as a bearer.
+
+Every refresh rotates: one store update mints the new pair and retires the
+presented refresh token, keeping its hash as the previous one. Presenting that
+retired token is reuse — two holders have the family — so it returns 400
+`invalid_grant` and drops every refresh token on the connection; the access
+token keeps its own expiry, because cutting it short only punishes the client
+that behaved. Revoking a connection clears the refresh family for the same
+reason: the refresh token outlives the bearer by weeks.
+
+Expiry fails closed. A record with no `tokenExpiresAt` or `refreshExpiresAt`
+has no proven lifetime and reads as expired, so pre-TTL connections need one
+re-consent rather than living forever. Both fleet and local paths resolve
+tokens through the same predicates, so they cannot diverge.
+
 ## Activation, migration and rollback
 
 Central starts durably paused. Import alone does not allocate or reenroll owners.

@@ -8,6 +8,7 @@ import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 import {
   isMcpTokenExpired,
+  matchesMcpRefreshHash,
   type McpConnectionRecord,
   type McpConnectionStore,
   type McpOAuthAuthorizationRecord,
@@ -410,6 +411,13 @@ export async function openMcpDurableState(options: {
                 record.tokenHash === hash &&
                 record.status === "approved" &&
                 !isMcpTokenExpired(record),
+            ) ?? null,
+        ),
+      getByRefreshTokenHash: (hash) =>
+        read(
+          (current) =>
+            Object.values(current.connections).find((record) =>
+              matchesMcpRefreshHash(record, hash),
             ) ?? null,
         ),
       update: (id, patch) =>
