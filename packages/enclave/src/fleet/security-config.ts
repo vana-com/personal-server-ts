@@ -28,6 +28,7 @@ const COMMON_KEYS = [
   "MCP_INGRESS_HOST",
   "MCP_INGRESS_PORT",
   "MCP_MIGRATION_REQUIRED",
+  "MCP_STATE_REQUIRED",
   "FLEET_PEER_HOST",
   "FLEET_PEER_PORT",
 ];
@@ -180,7 +181,9 @@ function validatePayload(value: unknown): FleetSecurityConfigPayload {
     env.NODE_ID !== value.nodeId ||
     (value.role === "controller" &&
       (env.CONTROLLER_TERM !== "1" ||
-        !["0", "1"].includes(env.MCP_MIGRATION_REQUIRED!))) ||
+        !["0", "1"].includes(env.MCP_MIGRATION_REQUIRED!) ||
+        (env.MCP_STATE_REQUIRED !== undefined &&
+          !["0", "1"].includes(env.MCP_STATE_REQUIRED)))) ||
     (value.role === "worker" &&
       (env.SANDBOX_RUNTIME !== "docker" ||
         !["true", "false"].includes(env.FLEET_ENABLED!)))

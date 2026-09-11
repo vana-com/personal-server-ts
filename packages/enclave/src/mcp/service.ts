@@ -15,6 +15,7 @@ import {
   createTeeMcpIngress,
   openMcpDurableState,
   verifyTeeMcpGrants,
+  McpStateRequirement,
   type McpWakeupIdentity,
   type McpOwnerBinding,
   type McpRollbackReceipt,
@@ -117,6 +118,10 @@ export async function startMcpRouter(
     state = await openMcpDurableState({
       path: env.MCP_STATE_PATH,
       key: derived.key,
+      requirement:
+        env.MCP_STATE_REQUIRED === "1"
+          ? McpStateRequirement.Required
+          : McpStateRequirement.Optional,
     });
   } finally {
     derived.key.fill(0);

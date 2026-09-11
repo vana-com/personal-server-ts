@@ -4,7 +4,11 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { createMcpConnection } from "@opendatalabs/personal-server-ts-core/mcp";
-import { openMcpDurableState } from "./durable-state.js";
+import {
+  openMcpDurableState,
+  McpStateRequiredError,
+  McpStateRequirement,
+} from "./durable-state.js";
 import { userPsId } from "@opendatalabs/vana-sdk/protocol/identity";
 
 const OWNER = "0x1111111111111111111111111111111111111111";
@@ -286,4 +290,54 @@ it("invalidates rollback receipts on partial refresh, owner membership, cached i
   await expect(source.getRollbackPreparation()).rejects.toThrow("not prepared");
   expect(await central.approvedOwnerBindings()).toHaveLength(2);
   await expect(central.connections.getById(ids[0]!)).rejects.toThrow("fenced");
+});
+
+describe("MCP_STATE_REQUIRED", () => {
+  it("fails closed instead of starting fresh when the sealed file is missing", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mcp-state-required-"));
+    directories.push(directory);
+    const path = join(directory, "missing.sealed");
+    await expect(
+      openMcpDurableState({
+        path,
+        key: randomBytes(32),
+        requirement: McpStateRequirement.Required,
+      }),
+    ).rejects.toThrow(McpStateRequiredError);
+  });
+
+  it("loads normally when the sealed file is present", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mcp-state-required-"));
+    directories.push(directory);
+    const path = join(directory, "state.sealed");
+    const key = randomBytes(32);
+    const seeded = await openMcpDurableState({ path, key });
+    await seeded.rememberIdentity({
+      userPsId: userPsId(14800, OWNER),
+      epoch: 1,
+      enclaveAddress: OWNER,
+      enclavePublicKey: "0x04",
+      sealedEnvelope: {
+        v: 1,
+        iv: "iv",
+        ciphertext: "sealed-owner-material",
+        tag: "tag",
+        wrappedContentKey: { iv: "iv", ciphertext: "key", tag: "tag" },
+      },
+    });
+    const reopened = await openMcpDurableState({
+      path,
+      key,
+      requirement: McpStateRequirement.Required,
+    });
+    expect((await reopened.getIdentity(userPsId(14800, OWNER)))?.epoch).toBe(1);
+  });
+
+  it("still starts fresh on a missing file when unset, unchanged from today", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mcp-state-required-"));
+    directories.push(directory);
+    const path = join(directory, "missing.sealed");
+    const state = await openMcpDurableState({ path, key: randomBytes(32) });
+    expect(await state.getIdentity(userPsId(14800, OWNER))).toBeNull();
+  });
 });
