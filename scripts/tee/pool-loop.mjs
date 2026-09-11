@@ -109,6 +109,7 @@ export const REASON = Object.freeze({
   admitDeadline: "ADMIT_DEADLINE_EXCEEDED",
   doubleMrKms: "DOUBLE_MR_KMS",
   drainTimeout: "DRAIN_TIMEOUT",
+  stickyDrain: "STICKY_DRAIN",
   maxRunning: "MAX_RUNNING_REACHED",
   noCandidate: "NO_STARTABLE_MEMBER",
   quarantined: "MEMBER_QUARANTINED",
@@ -126,6 +127,13 @@ const alert = (reason, nodeId = null) => ({
 });
 
 const isRunning = (view) => view.entry.phase === PHASE.running;
+
+/** The phases in which the loop means the member to serve placements. */
+const SERVING_PHASES = Object.freeze([
+  PHASE.starting,
+  PHASE.admitWait,
+  PHASE.running,
+]);
 
 /** An always-on member: scale-down may never take it, and the floor wakes it
  * before any other. It is a property of the machine, not of the pool size. */
@@ -152,6 +160,68 @@ const drainedStoppable = (view) =>
 /** Quarantine stop guard. A member that never attested holds no placement. */
 const neverAdmittedStoppable = (view) =>
   (!view.node || view.node.unavailable === true) && view.live === 0;
+
+/** `admit {resume:true}` is idempotent, so re-issuing it costs nothing, but a
+ * tick asks for a member at most once however many paths call for it. */
+function pushAdmit(view, ctx) {
+  const { nodeId } = view.member;
+  if (
+    ctx.actions.some(
+      (action) => action.type === ACTION.admit && action.nodeId === nodeId,
+    )
+  )
+    return;
+  ctx.actions.push({ type: ACTION.admit, nodeId });
+}
+
+/**
+ * The controller's drain flag is sticky: it survives the member's own restart
+ * and its re-attest, and only an admit carrying `resume` clears it. When the
+ * controller's 30 s re-attest admits a member the loop just started, the loop
+ * never reaches its own admit-wait, so the flag an earlier scale-down left
+ * stands and the member is ADMITTED with no slots offered.
+ *
+ *   start ─► controller re-attest admits ─► ADMITTED, draining: true ─► 0 slots
+ *
+ * So any member the loop means to serve and is not itself draining gets the
+ * resume, once per tick, alerted once per episode.
+ */
+function clearStickyDrain(view, ctx) {
+  const { entry, node } = view;
+  if (node?.draining !== true || !SERVING_PHASES.includes(entry.phase)) {
+    delete entry.resumeSent;
+    return;
+  }
+
+  if (!entry.resumeSent) {
+    ctx.actions.push(alert(REASON.stickyDrain, view.member.nodeId));
+    entry.resumeSent = true;
+  }
+  pushAdmit(view, ctx);
+}
+
+/**
+ * The controller's signed directory decides which image may run, so the
+ * reference compose hash is the one health reported under the admission the
+ * controller currently stands behind; a newer admission replaces it. Only the
+ * image moving under an unchanged admission is a mismatch, and it is alerted,
+ * never restarted: a fleet roll re-admits and needs no repin anywhere.
+ */
+function trackComposeHash(view, ctx) {
+  const { entry, health, node } = view;
+  const hash = health?.composeHash;
+  if (!hash) return;
+
+  const since = node?.lastAdmission?.since ?? "";
+  if (!entry.admittedComposeHash || entry.admissionSince !== since) {
+    entry.admittedComposeHash = hash;
+    entry.admissionSince = since;
+    return;
+  }
+
+  if (hash !== entry.admittedComposeHash)
+    ctx.actions.push(alert(REASON.composeMismatch, view.member.nodeId));
+}
 
 function enter(entry, phase, now) {
   entry.phase = phase;
@@ -215,11 +285,10 @@ function advanceAdmission(view, ctx) {
     return;
   }
 
-  // An unexpected image must never be admitted, however healthy it looks.
-  if (member.composeHash && health.composeHash !== member.composeHash) {
-    restartOrQuarantine(view, ctx, REASON.composeMismatch);
-    return;
-  }
+  // pool.json's pin is a soft check the operator need not maintain across a
+  // roll: it warns, and the controller still decides whether to admit.
+  if (member.composeHash && health.composeHash !== member.composeHash)
+    ctx.actions.push(alert(REASON.composeMismatch, member.nodeId));
 
   // A second mr-kms event is a boot artefact one restart clears.
   if (currentAdmission(view)?.code === DOUBLE_MR_KMS_CODE) {
@@ -233,7 +302,7 @@ function advanceAdmission(view, ctx) {
   }
 
   // resume:true clears a planned drain; only the controller admit does that.
-  ctx.actions.push({ type: ACTION.admit, nodeId: member.nodeId });
+  pushAdmit(view, ctx);
   if (entry.phase !== PHASE.admitWait) entry.phase = PHASE.admitWait;
 }
 
@@ -295,7 +364,12 @@ function holdRunning(view, ctx) {
   if (entry.startedByLoop) {
     entry.restarts = 0;
     delete entry.startedByLoop;
+    // Whoever admitted it, the loop's own start is the one boot guaranteed to
+    // follow a drain, so the resume is sent once the member is up.
+    pushAdmit(view, ctx);
   }
+
+  trackComposeHash(view, ctx);
 
   if (view.live > 0) delete entry.idleSince;
   else entry.idleSince ??= ctx.now;
@@ -308,6 +382,8 @@ function advanceMember(view, ctx) {
     advanceDrain(view, ctx);
     return;
   }
+
+  clearStickyDrain(view, ctx);
 
   if (settledAdmitted(view, ctx)) {
     holdRunning(view, ctx);
@@ -633,6 +709,28 @@ function readJson(path, fallback) {
   }
 }
 
+/** Dry run decides but never persists, so a concurrently running real loop's
+ * state file is untouched. Logging the diff shows what it would have written. */
+function logStateDiff(previous, next) {
+  const nodeIds = new Set([
+    ...Object.keys(previous.nodes ?? {}),
+    ...Object.keys(next.nodes ?? {}),
+  ]);
+  const changed = {};
+  for (const nodeId of nodeIds) {
+    const before = previous.nodes?.[nodeId];
+    const after = next.nodes?.[nodeId];
+    if (JSON.stringify(before) !== JSON.stringify(after))
+      changed[nodeId] = { before, after };
+  }
+  log({
+    level: "info",
+    dryRun: true,
+    message: "Pool state would change",
+    changed,
+  });
+}
+
 function writeState(path, state) {
   mkdirSync(dirname(path), { recursive: true, mode: STATE_DIRECTORY_MODE });
   // A unique name cannot collide with another writer's temporary, and the
@@ -692,7 +790,7 @@ function acquireLock(statePath) {
   process.on("exit", () => rmSync(path, { force: true }));
 }
 
-async function tick(context) {
+export async function tick(context) {
   const status = await readStatus(context);
   const health = Object.fromEntries(
     await Promise.all(
@@ -717,6 +815,11 @@ async function tick(context) {
   for (const action of actions) {
     const applied = await applyAction(action, context);
     if (!applied) revertMember(state, previous, action.nodeId);
+  }
+
+  if (context.dryRun) {
+    logStateDiff(previous, state);
+    return;
   }
   writeState(context.statePath, state);
 }
@@ -790,7 +893,10 @@ function loadContext(argv) {
 
 async function main() {
   const context = loadContext(process.argv.slice(2));
-  acquireLock(context.statePath);
+  // A dry run must never compete with a real loop for its lock.
+  acquireLock(
+    context.dryRun ? `${context.statePath}.dry-run` : context.statePath,
+  );
   log({ level: "info", message: "Pool loop started", dryRun: context.dryRun });
 
   for (;;) {
