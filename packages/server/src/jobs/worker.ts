@@ -32,6 +32,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/policy";
 import type { ScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
 import {
+  parseWeb3SignedHeader,
   verifyWeb3Signed,
   type DataPortabilityGatewayConfig,
 } from "@opendatalabs/vana-sdk/node";
@@ -57,6 +58,8 @@ const POST = "POST";
 const JSON_CONTENT_TYPE = "application/json";
 const UNKNOWN_METADATA = "unknown";
 const MILLISECONDS_PER_SECOND = 1_000;
+// Mirrors the SDK's own Web3Signed clock skew allowance.
+const AUTH_CLOCK_SKEW_SECONDS = 60;
 const JOB_EXECUTION_FAILED_LOG = "Enclave job execution failed";
 const JOB_EXECUTION_PROGRESS_LOG = "Enclave job execution progress";
 const JOB_SCOPE_HYDRATION_FAILED_LOG = "Job scope hydration failed";
@@ -654,12 +657,39 @@ async function uploadResult(
   }
 }
 
+/**
+ * Verify the builder's inner Web3Signed proof over the decrypted job request.
+ *
+ * The proof carries the SDK's 300 s request TTL, which is sized for a live HTTP
+ * call. A job is signed at submit and verified here at claim, and the Gateway
+ * queues a job whenever the fleet is full: a 6-owner burst on a 4-slot fleet
+ * held two jobs for 391 s while a worker booted, past 300 s + 60 s skew, so an
+ * authorization the Gateway had accepted expired in the queue.
+ *
+ *     submit ──── queued (scale-up) ──── claim ──── execute
+ *       │ iat                             │ 391 s later
+ *       └── freshness proven HERE, once ──┘   binding proven here
+ *
+ * So freshness is anchored to the builder-signed `iat`, not to the claim clock —
+ * queue time never counts. Everything the proof binds (signer, audience, method,
+ * path, body hash over the canonical request) is still verified against this
+ * claim, and a proof dated in the future is still refused. The execution bound
+ * stays `request.deadline`: builder-signed, capped by the Gateway at submit, and
+ * checked against the real clock by {@link validDeadline}.
+ */
 async function verifyJobAuth(
   envelope: JobRequestEnvelope,
   authAudience: string,
   now: Date,
 ): Promise<{ signer: Address }> {
+  const nowSeconds = Math.floor(now.getTime() / MILLISECONDS_PER_SECOND);
+
   try {
+    const { payload } = parseWeb3SignedHeader(envelope.auth);
+    if (payload.iat > nowSeconds + AUTH_CLOCK_SKEW_SECONDS) {
+      throw new Error("job authorization is issued in the future");
+    }
+
     // aud = Gateway origin; contract section 1 step 1 amendment.
     return await verifyWeb3Signed({
       headerValue: envelope.auth,
@@ -667,7 +697,7 @@ async function verifyJobAuth(
       expectedMethod: POST,
       expectedPath: EXECUTE_PATH,
       bodyBytes: canonicalJobRequestBytes(envelope.request),
-      now: Math.floor(now.getTime() / MILLISECONDS_PER_SECOND),
+      now: payload.iat,
     });
   } catch {
     throw new JobFailure("AUTH_INVALID", "job authorization is invalid", false);
