@@ -337,19 +337,21 @@ describe("decidePoolActions", () => {
     ]);
   });
 
-  it("never admits a member whose compose hash is not the pinned one", () => {
+  // 2026-09-10 slice 5: pool.json still pinned the pre-roll hashes, so the loop
+  // restarted and then quarantined a worker the controller was happy to admit.
+  it("warns on a stale pool.json pin but still admits the member", () => {
     const { actions } = decidePoolActions({
       now: NOW,
       members: [
         MEMBERS[0]!,
         MEMBERS[1]!,
-        { ...MEMBERS[2]!, composeHash: "expected" },
+        { ...MEMBERS[2]!, composeHash: "pre-roll" },
       ],
       status: status([admitted("worker-1"), declared("worker-3")]),
       health: {
         "worker-3": {
           status: 200,
-          composeHash: "other",
+          composeHash: "rolled",
           configExpiresAt: null,
         },
       },
@@ -361,8 +363,192 @@ describe("decidePoolActions", () => {
       },
     });
 
-    expect(types(actions)).toEqual([ACTION.alert, ACTION.restart]);
-    expect(actions[0].reason).toBe(REASON.composeMismatch);
+    expect(actions).toEqual([
+      {
+        type: ACTION.alert,
+        reason: REASON.composeMismatch,
+        nodeId: "worker-3",
+      },
+      { type: ACTION.admit, nodeId: "worker-3" },
+    ]);
+  });
+
+  describe("the compose hash the controller admitted", () => {
+    const runningPair = (worker3: object) => ({
+      "worker-1": runningState("worker-1"),
+      "worker-2": runningState("worker-2"),
+      "worker-3": runningState("worker-3", worker3),
+    });
+    const health = (composeHash: string) => ({
+      "worker-3": { status: 200, composeHash, configExpiresAt: null },
+    });
+    const snapshot = (at: number) =>
+      status([
+        admitted("worker-1"),
+        admitted("worker-2"),
+        readmitted("worker-3", at),
+      ]);
+
+    it("records the hash health reports under the standing admission", () => {
+      const { actions, state } = decidePoolActions({
+        now: NOW,
+        members: MEMBERS,
+        status: snapshot(NOW - 10 * MINUTE),
+        health: health("rolled"),
+        state: { nodes: runningPair({}) },
+      });
+
+      expect(actions).toEqual([]);
+      expect(state.nodes["worker-3"]).toMatchObject({
+        admittedComposeHash: "rolled",
+      });
+    });
+
+    it("re-references a roll's fresh admission instead of alerting", () => {
+      const { actions, state } = decidePoolActions({
+        now: NOW,
+        members: MEMBERS,
+        status: snapshot(NOW - MINUTE),
+        health: health("rolled"),
+        state: {
+          nodes: runningPair({
+            admittedComposeHash: "pre-roll",
+            admissionSince: new Date(NOW - 10 * MINUTE).toISOString(),
+          }),
+        },
+      });
+
+      expect(actions).toEqual([]);
+      expect(state.nodes["worker-3"].admittedComposeHash).toBe("rolled");
+    });
+
+    it("alerts when the image moves under an unchanged admission", () => {
+      const { actions } = decidePoolActions({
+        now: NOW,
+        members: MEMBERS,
+        status: snapshot(NOW - 10 * MINUTE),
+        health: health("unexpected"),
+        state: {
+          nodes: runningPair({
+            admittedComposeHash: "admitted",
+            admissionSince: new Date(NOW - 10 * MINUTE).toISOString(),
+          }),
+        },
+      });
+
+      expect(actions).toEqual([
+        {
+          type: ACTION.alert,
+          reason: REASON.composeMismatch,
+          nodeId: "worker-3",
+        },
+      ]);
+    });
+  });
+
+  // 2026-09-10 slice 5, 00:01:24Z-00:03:20Z: the controller's own 30 s re-attest
+  // admitted the started member before the loop's admit-wait sent its resume,
+  // so it sat ADMITTED with `draining` still set and offered no slots for 116 s.
+  describe("a drain flag left standing on a serving member", () => {
+    const started = (extra: object = {}) => ({
+      nodes: {
+        "worker-1": runningState("worker-1"),
+        "worker-2": runningState("worker-2"),
+        "worker-3": {
+          phase: PHASE.starting,
+          since: NOW,
+          restarts: 0,
+          startedByLoop: true,
+          ...extra,
+        },
+      },
+    });
+
+    it("resumes a member the controller admitted first, exactly once", () => {
+      const { actions, state } = decidePoolActions({
+        now: NOW + MINUTE,
+        members: MEMBERS,
+        status: status([
+          admitted("worker-1"),
+          admitted("worker-2"),
+          readmitted("worker-3", NOW + 30_000, { draining: true }),
+        ]),
+        state: started(),
+      });
+
+      expect(actions).toEqual([
+        { type: ACTION.alert, reason: REASON.stickyDrain, nodeId: "worker-3" },
+        { type: ACTION.admit, nodeId: "worker-3" },
+      ]);
+      expect(state.nodes["worker-3"]).toMatchObject({
+        phase: PHASE.running,
+        resumeSent: true,
+      });
+    });
+
+    it("resumes a landed start even with no drain flag to clear", () => {
+      const { actions } = decidePoolActions({
+        now: NOW + MINUTE,
+        members: MEMBERS,
+        status: status([
+          admitted("worker-1"),
+          admitted("worker-2"),
+          readmitted("worker-3", NOW + 30_000),
+        ]),
+        state: started(),
+      });
+
+      expect(actions).toEqual([{ type: ACTION.admit, nodeId: "worker-3" }]);
+    });
+
+    it("alerts once per episode while it keeps re-issuing the resume", () => {
+      const { actions, state } = decidePoolActions({
+        now: NOW,
+        members: MEMBERS,
+        status: status([
+          admitted("worker-1"),
+          admitted("worker-2", { draining: true }),
+          admitted("worker-3"),
+        ]),
+        state: {
+          nodes: {
+            "worker-1": runningState("worker-1"),
+            "worker-2": runningState("worker-2", { resumeSent: true }),
+            "worker-3": runningState("worker-3"),
+          },
+        },
+      });
+
+      expect(actions).toEqual([{ type: ACTION.admit, nodeId: "worker-2" }]);
+      expect(state.nodes["worker-2"].resumeSent).toBe(true);
+    });
+
+    it("leaves the loop's own drain alone", () => {
+      const { actions } = decidePoolActions({
+        now: NOW,
+        members: MEMBERS,
+        status: status([
+          admitted("worker-1"),
+          admitted("worker-2"),
+          admitted("worker-3", { draining: true }),
+        ]),
+        state: {
+          nodes: {
+            "worker-1": runningState("worker-1"),
+            "worker-2": runningState("worker-2"),
+            "worker-3": {
+              phase: PHASE.draining,
+              since: NOW - MINUTE,
+              restarts: 0,
+            },
+          },
+        },
+      });
+
+      expect(actions).toEqual([
+        { type: ACTION.stop, nodeId: "worker-3", cvmId: "cvm-3" },
+      ]);
+    });
   });
 
   it("drains the longest idle member above MIN_RUNNING and never below it", () => {

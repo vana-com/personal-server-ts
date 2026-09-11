@@ -33,6 +33,13 @@ holds no secrets. The controller admin token comes from the login keychain item
 state persists in `~/.vana/pool-loop-state.json`
 (`VANA_POOL_PATH`/`VANA_POOL_STATE_PATH` override both paths).
 
+`pool.json` needs no repin on a fleet roll. The controller's signed directory
+decides which image may run: the loop takes its reference compose hash from the
+hash a member's health reported under the admission the controller currently
+stands behind, and a re-admission after a roll replaces it. The per-member
+`composeHash` is an optional soft check that warns on a mismatch; neither it
+nor the reference ever restarts or quarantines a member.
+
 The loop ticks every 15 s: it brings the pool straight up to `MIN_RUNNING`,
 then scales up only after 60 s with no free capacity and at most `MAX_RUNNING`
 members, scales down a member idle for 15 min while more than `MIN_RUNNING`
@@ -40,7 +47,10 @@ remain, and stops a machine only once the controller reports it draining with
 no live lease. A member that has not been admitted 8 minutes after start, or
 whose event log carries a second `mr-kms` entry, is restarted once and then
 quarantined; neither a stop nor a restart happens while a lease on it is still
-live. One loop runs per state file, fenced by a `<state>.lock` pidfile.
+live. A member that reaches the pool while the controller still carries its earlier
+`draining` flag is resumed with `admit {resume:true}` — whether the loop or the
+controller's own re-attest admitted it — so it never sits admitted with no
+slots. One loop runs per state file, fenced by a `<state>.lock` pidfile.
 `--once` runs a single tick; `--dry-run` logs every decision without invoking
 `phala`.
 
