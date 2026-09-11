@@ -1,4 +1,5 @@
 import type { DstackClient } from "../dstack/client.js";
+import { dstackInfo } from "../dstack/info-cache.js";
 import type { SandboxRegistry } from "../sandbox/registry.js";
 import type { Hex } from "viem";
 import type { GatewayClient } from "./gateway-client.js";
@@ -43,7 +44,7 @@ export function startNodeHeartbeat(
 
   async function sendHeartbeat(): Promise<void> {
     try {
-      const info = await options.client.info();
+      const info = await dstackInfo(options.client);
       await options.gateway.nodeHeartbeat(options.nodeId, {
         composeHash: hexValue(info.composeHash),
         instanceId: info.instanceId,

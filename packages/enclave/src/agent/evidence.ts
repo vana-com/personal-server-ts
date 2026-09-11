@@ -1,5 +1,6 @@
 import { concat, hexToBytes, keccak256, toHex, type Hex } from "viem";
 import type { DstackClient } from "../dstack/client.js";
+import { dstackInfo } from "../dstack/info-cache.js";
 import { userPsId, WALLET_PURPOSE } from "../identity/paths.js";
 import { deriveEnclaveIdentity } from "../identity/wallet.js";
 import type {
@@ -18,7 +19,7 @@ export async function buildEvidence(
 ): Promise<EnclaveIdentityEvidence> {
   const id = userPsId(request.chainId, request.ownerAddress);
   const identity = await deriveEnclaveIdentity(client, id, request.epoch);
-  const info = await client.info();
+  const info = await dstackInfo(client);
   const reportData = hexToBytes(keccak256(concat([id, identity.address])));
   // dstack accepts 32-byte report_data here and zero-pads it to 64 bytes.
   const attestation = await client.quote(reportData);

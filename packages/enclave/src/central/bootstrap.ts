@@ -7,6 +7,7 @@ import { isAbsolute } from "node:path";
 import { serve } from "@hono/node-server";
 import { DEFAULTS } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { DstackClient } from "../dstack/client.js";
+import { warmDstackInfo } from "../dstack/info-cache.js";
 import type { SupportedChainId } from "../agent/bootstrap.js";
 import { startMcpRouter, type McpMigrationSnapshot } from "../mcp/service.js";
 import { createFleetControlHttp } from "../fleet/controller-http.js";
@@ -82,7 +83,9 @@ export async function startFleetCentral(
 }> {
   env = await verifiedFleetEnvironment(env, {
     role: "controller",
-    identity: () => client.info(),
+    // The controller's one Info read. Unbudgeted here at boot, cached for
+    // every later caller; nothing reads the guest agent before this point.
+    identity: () => warmDstackInfo(client, logger),
   });
   if (env.CONTROLLER_TERM !== undefined && env.CONTROLLER_TERM !== "1")
     throw new Error("Only singleton controller term 1 is supported");
@@ -121,7 +124,7 @@ export async function startFleetCentral(
     throw new Error(
       `Configure zero to ${MAX_FLEET_WORKERS} admitted Moksha workers`,
     );
-  const info = await client.info();
+  const info = await warmDstackInfo(client, logger);
   if (workers.some((w) => w.policy.identity.appId === info.appId))
     throw new Error("Central and worker KMS app identities must differ");
   const validity = fleetConfigValidity(env);

@@ -24,7 +24,13 @@ const mocks = vi.hoisted(() => {
   };
 });
 
-const client = {};
+const client = {
+  info: vi.fn().mockResolvedValue({
+    appId: "0".repeat(40),
+    composeHash: "a".repeat(64),
+    instanceId: "b".repeat(40),
+  }),
+};
 const contracts = {
   dataRegistry: "0x1111111111111111111111111111111111111111",
   dataPortabilityServer: "0x2222222222222222222222222222222222222222",
@@ -63,6 +69,7 @@ vi.mock("./bootstrap.js", () => ({
     secret: "agent-secret",
   }),
   resolveSandboxAgentUrl: vi.fn().mockResolvedValue("http://agent:8787"),
+  dstackClientFromEnv: vi.fn().mockReturnValue(client),
 }));
 vi.mock("./http.js", () => ({ createAgentServer: mocks.createAgentServer }));
 vi.mock("../jobs/claim-loop.js", () => ({
@@ -89,6 +96,11 @@ describe("agent main prewarm wiring", () => {
   it("starts prewarm with the same sandbox dependencies as job execution", async () => {
     await import("./main.js");
     await vi.waitFor(() => expect(mocks.createAgentServer).toHaveBeenCalled());
+    // The node reads dstack Info once, at boot, before it serves anything.
+    expect(client.info).toHaveBeenCalledTimes(1);
+    expect(client.info.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.createAgentServer.mock.invocationCallOrder[0] ?? 0,
+    );
     const options = mocks.createAgentServer.mock.calls[0]?.[0] as {
       jobs: { prewarm(body: PrewarmRequestBody): void };
     };
