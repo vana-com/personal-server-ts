@@ -5,6 +5,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createMcpOAuthAuthorization,
+  handleMcpStreamableHttpRequest,
   MCP_TOKEN_TTL_MS,
   revokeMcpConnection,
 } from "@opendatalabs/personal-server-ts-core/mcp";
@@ -194,7 +195,7 @@ describe("TEE MCP ingress", () => {
           authorization: `Bearer ${token}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify({ jsonrpc: "2.0", method: "tools/list", id: 1 }),
+        body: JSON.stringify({ jsonrpc: "2.0", method: "tools/call", id: 1 }),
       });
       expect(response.status).toBe(200);
       expect(dispatch.mock.calls[0]?.[2]).toEqual({
@@ -307,7 +308,7 @@ describe("TEE MCP ingress", () => {
         authorization: `Bearer ${renewed.access_token}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({ jsonrpc: "2.0", method: "tools/list", id: 1 }),
+      body: JSON.stringify({ jsonrpc: "2.0", method: "tools/call", id: 1 }),
     });
     expect(response.status).toBe(200);
     expect(dispatch.mock.calls[0]?.[2]).toEqual({
@@ -358,7 +359,7 @@ describe("TEE MCP ingress", () => {
           authorization: `Bearer ${token}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify({ jsonrpc: "2.0", method: "tools/list", id: 1 }),
+        body: JSON.stringify({ jsonrpc: "2.0", method: "tools/call", id: 1 }),
       });
     const revoked = await call();
     expect(revoked.status).toBe(403);
@@ -413,7 +414,7 @@ describe("TEE MCP ingress", () => {
           authorization: `Bearer ${token}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify({ jsonrpc: "2.0", method: "tools/list", id: 1 }),
+        body: JSON.stringify({ jsonrpc: "2.0", method: "tools/call", id: 1 }),
       });
 
     const live = await seed(
@@ -502,5 +503,94 @@ describe("TEE MCP ingress", () => {
         ?.status,
     ).toBe("pending");
     expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it("answers the handshake itself, byte for byte, and dispatches everything else", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tee-handshake-"));
+    dirs.push(dir);
+    const state = await openMcpDurableState({
+      path: join(dir, "state"),
+      key: randomBytes(32),
+    });
+    const token = randomBytes(32).toString("hex");
+    await state.connections.create({
+      id: "connection-1",
+      displayName: "Claude",
+      granteeAddress: OWNER,
+      granteePublicKey: "0x02",
+      encryptedGranteePrivateKey: { kind: "plaintext", privateKey: "0x01" },
+      tokenHash: createHash("sha256").update(token).digest("hex"),
+      tokenExpiresAt: new Date(Date.now() + MCP_TOKEN_TTL_MS).toISOString(),
+      status: "approved",
+      grants: [{ grantId: "0xabc", scopes: ["spotify.profile"] }],
+      createdAt: new Date().toISOString(),
+    } as never);
+    await state.bindOwner("connection-1", { owner: OWNER, chainId: 14800 });
+    const dispatch = vi.fn().mockResolvedValue(new Response("{}"));
+    const verifyGrants = vi.fn().mockResolvedValue(undefined);
+    const app = createTeeMcpIngress({
+      state,
+      origin: "https://mcp-dev.vana.org",
+      approvalUrl: "https://vana.example/mcp",
+      allowedRedirectUris: ["https://claude.ai/api/mcp/auth_callback"],
+      gateway: {} as never,
+      verifyGrants,
+      registerGrantee: vi.fn(),
+      dispatch,
+    });
+    const post = (body: unknown, bearer = token) =>
+      new Request("https://mcp-dev.vana.org/mcp", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${bearer}`,
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify(body),
+      });
+    const initialize = {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "claude-ai", version: "1.0.0" },
+      },
+    };
+    const list = { jsonrpc: "2.0", id: 2, method: "tools/list" };
+
+    // The ingress answer has to be the one the owner's engine would have sent,
+    // or a client that handshakes here and calls tools there sees two servers.
+    for (const message of [
+      initialize,
+      list,
+      { ...list, id: 3, method: "ping" },
+      { jsonrpc: "2.0", method: "notifications/initialized" },
+    ]) {
+      const ingress = await app.fetch(post(message));
+      const engine = await handleMcpStreamableHttpRequest(post(message), {
+        connection: {} as never,
+        readClient: {} as never,
+      });
+      expect(ingress.status).toBe(engine.status);
+      expect(ingress.headers.get("content-type")).toBe(
+        engine.headers.get("content-type"),
+      );
+      expect(await ingress.text()).toBe(await engine.text());
+    }
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(verifyGrants).not.toHaveBeenCalled();
+
+    // A batch qualifies only as a whole, and the bearer still gates everything.
+    const ping = { ...list, id: 3, method: "ping" };
+    expect((await app.fetch(post([ping, list]))).status).toBe(200);
+    expect(dispatch).not.toHaveBeenCalled();
+    const fellThrough = [ping, { ...list, method: "tools/call" }];
+    await app.fetch(post(fellThrough));
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    // Reading the body to classify it must leave the dispatched one readable.
+    expect(await dispatch.mock.calls[0][0].json()).toEqual(fellThrough);
+    expect((await app.fetch(post(initialize, "unknown"))).status).toBe(401);
   });
 });
