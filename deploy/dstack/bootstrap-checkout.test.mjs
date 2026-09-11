@@ -192,3 +192,41 @@ for (const template of fleetTemplates) {
     }
   });
 }
+
+// The worker agent gates on a healthy sandbox-runtime: starting it against a
+// half-configured runtime cost every dstack /Info ~15 s on 2026-09-11, over the
+// Gateway's 15 s identity budget. That gate is only safe while the runtime's
+// healthcheck budget outlasts a slow dockerd, so both halves are pinned here.
+const RUNTIME_HEALTH_BUDGET_MS = 5 * 60 * 1000;
+
+test("docker-compose.fleet-worker.yml: agent waits for a converging runtime", () => {
+  const yaml = readFileSync(
+    fileURLToPath(new URL("docker-compose.fleet-worker.yml", import.meta.url)),
+    "utf8",
+  );
+  const lines = yaml
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("#"));
+  const seconds = (key) => {
+    const raw = lines.find((line) => line.trim().startsWith(`${key}:`));
+    return Number(raw?.split(":")[1]?.trim().replace("s", ""));
+  };
+
+  assert.ok(
+    lines.some((line) => line.trim() === "condition: service_healthy"),
+    "the agent must depend on a healthy sandbox-runtime",
+  );
+  assert.ok(
+    lines.some((line) => line.trim() === "restart: unless-stopped"),
+    "the agent must restart on its own after a failed start",
+  );
+
+  // Failures inside start_period never consume a retry, so the wait before
+  // compose calls the runtime unhealthy is start_period + retries x interval.
+  const budget =
+    (seconds("start_period") + seconds("retries") * seconds("interval")) * 1000;
+  assert.ok(
+    budget >= RUNTIME_HEALTH_BUDGET_MS,
+    `runtime healthcheck budget ${budget} ms is too short to converge`,
+  );
+});

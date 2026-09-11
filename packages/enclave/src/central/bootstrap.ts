@@ -259,8 +259,15 @@ export async function startFleetCentral(
     recordAdmitSuccess(nodeId, remote.identity.nodeIncarnation);
     return { success: true, identity: remote.identity };
   };
-  const firstPeer = () => {
-    const peer = peers.values().next().value;
+  // `peers` keeps insertion order, so taking its first entry pins every mint to
+  // the first node ever admitted — on 2026-09-11 that was a worker the pool
+  // loop had since stopped, and every identity mint spent 5.2 s failing to
+  // reach it. Ask the controller which members are still serving instead.
+  const servingPeer = () => {
+    const serving = controller
+      .nodeStatus()
+      .find((node) => !node.draining && !node.unavailable);
+    const peer = serving ? peers.get(serving.nodeId) : undefined;
     if (!peer) throw new Error("No admitted worker");
     return peer;
   };
@@ -383,8 +390,8 @@ export async function startFleetCentral(
       if (failure?.status === "rejected") throw failure.reason;
       return { success: true, paused: true, placements: controller.snapshot() };
     },
-    identity: (body: unknown) => firstPeer().call("worker.identity", body),
-    seal: (body: unknown) => firstPeer().call("worker.seal", body),
+    identity: (body: unknown) => servingPeer().call("worker.identity", body),
+    seal: (body: unknown) => servingPeer().call("worker.seal", body),
     admit,
     migrate,
     prepareRollback,
