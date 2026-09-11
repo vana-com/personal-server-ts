@@ -826,6 +826,59 @@ it("extends the lease only for a renewal that lands", async () => {
   expect(worker.release).toHaveBeenCalledTimes(1);
 });
 
+it("renews the member before the Gateway sees the extension, and never projects a refused one", async () => {
+  const path = await mkdtemp(join(tmpdir(), "fleet-order-"));
+  paths.push(path);
+  let now = 1000;
+  const worker: FleetWorkerPort = {
+    activity: vi.fn(async (assignment) => ({
+      assignment,
+      present: true,
+      busy: false,
+    })),
+    prepare: vi.fn(async () => []),
+    readiness: vi.fn(async () => []),
+    renew: vi.fn(),
+    execute: vi.fn(),
+    release: vi.fn(),
+  };
+  const publish = vi.fn();
+  const controller = await openFleetController({
+    path: join(path, "state.json"),
+    enroll: vi.fn(),
+    publish,
+    release: vi.fn(),
+    now: () => now,
+  });
+  await controller.admit({
+    nodeId: "a",
+    nodeIncarnation: "a1",
+    capacity: 1,
+    worker,
+  });
+  const owner = { chainId: 14800, userPsId: "owner", identityEpoch: 1 };
+  await controller.ensure(owner, []);
+  const allocation = publish.mock.calls.length;
+
+  // The Gateway round trip must not stand between the tick and the worker's
+  // own retirement timer, so the member is renewed first.
+  now = 11000;
+  await controller.renew();
+  expect(vi.mocked(worker.renew).mock.invocationCallOrder[0]).toBeLessThan(
+    publish.mock.invocationCallOrder[allocation]!,
+  );
+  expect(publish).toHaveBeenLastCalledWith(
+    expect.objectContaining({ leaseExpiresAt: new Date(41000).toISOString() }),
+  );
+
+  vi.mocked(worker.renew).mockRejectedValue(new Error("stale placement"));
+  now = 21000;
+  await controller.renew();
+  now = 31000;
+  await controller.renew();
+  expect(publish).toHaveBeenCalledTimes(allocation + 1);
+});
+
 it("re-places an owner whose worker has retired the lease as stale", async () => {
   const path = await mkdtemp(join(tmpdir(), "fleet-stale-"));
   paths.push(path);

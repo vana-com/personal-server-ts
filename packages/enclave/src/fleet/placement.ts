@@ -618,22 +618,12 @@ export async function openFleetController(options: FleetControllerOptions) {
               now() + FLEET_LEASE_MS,
             ).toISOString();
             await persist();
-            try {
-              await publish(assignment);
-            } catch {
-              assignment.leaseExpiresAt = held;
-              if (
-                rows[key]?.assignment &&
-                sameAssignment(rows[key]!.assignment!, assignment)
-              ) {
-                rows[key]!.renewalBlocked = true;
-                rows[key]!.renewalRetryable = false;
-                observations.delete(key);
-                await persist();
-              }
-              emit("placement_projection_failed", assignment);
-              return;
-            }
+            // The member is renewed before the Gateway is told. Its own
+            // retirement timer is what serves MCP, and the projection is a
+            // 15 s round trip on a 30 s lease taking a fleet-wide lock that
+            // owner enrollment takes too: ahead of the RPC it can spend the
+            // lease it is renewing, behind it it cannot.
+            let forgotten = false;
             try {
               await node.worker.renew(structuredClone(assignment));
               if (assignment.state === "ready") {
@@ -646,20 +636,12 @@ export async function openFleetController(options: FleetControllerOptions) {
                   try {
                     await node.worker.release(structuredClone(assignment));
                     await forget(assignment);
+                    forgotten = true;
                   } catch {
                     /* A concurrent begin may now own a reference. */
                   }
                 }
               }
-              // The member answered, so end its failure streak and release a
-              // block a previous unconfirmed renewal left on this row.
-              const ended = clearRenewFailures(node.nodeId);
-              const released = row.renewalBlocked && row.renewalRetryable;
-              if (released) {
-                row.renewalBlocked = false;
-                row.renewalRetryable = false;
-              }
-              if (ended || released) await persist();
             } catch (error) {
               // Unconfirmed: the row keeps the expiry its last successful
               // renewal bought. The worker may still hold the extension it was
@@ -692,7 +674,37 @@ export async function openFleetController(options: FleetControllerOptions) {
               observations.delete(key);
               await persist();
               emit("placement_renewal_failed", assignment);
+              return;
             }
+
+            // Only an extension the member confirmed is projected.
+            if (!forgotten)
+              try {
+                await publish(assignment);
+              } catch {
+                assignment.leaseExpiresAt = held;
+                if (
+                  rows[key]?.assignment &&
+                  sameAssignment(rows[key]!.assignment!, assignment)
+                ) {
+                  rows[key]!.renewalBlocked = true;
+                  rows[key]!.renewalRetryable = false;
+                  observations.delete(key);
+                  await persist();
+                }
+                emit("placement_projection_failed", assignment);
+                return;
+              }
+
+            // The member answered, so end its failure streak and release a
+            // block a previous unconfirmed renewal left on this row.
+            const ended = clearRenewFailures(node.nodeId);
+            const released = row.renewalBlocked && row.renewalRetryable;
+            if (released) {
+              row.renewalBlocked = false;
+              row.renewalRetryable = false;
+            }
+            if (ended || released) await persist();
           }),
         ),
       );
