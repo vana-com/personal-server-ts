@@ -4,7 +4,10 @@ import type { McpWakeupIdentity } from "@opendatalabs/personal-server-ts-server/
 import { deriveEnclaveIdentity } from "../identity/wallet.js";
 import { unseal } from "../sealing/envelope.js";
 import { sandboxSpec, type PrewarmDeps } from "../jobs/run.js";
-import type { SandboxLease } from "../sandbox/registry.js";
+import {
+  SANDBOX_IDLE_TTL_SECONDS,
+  type SandboxLease,
+} from "../sandbox/registry.js";
 import {
   sameAssignment,
   type FleetAssignment,
@@ -14,6 +17,13 @@ import {
   type FleetReadiness,
 } from "./contracts.js";
 import type { FleetWorkerBackend } from "./worker.js";
+
+const MS_PER_SECOND = 1_000;
+/** The envelope answers the same for as long as a placement holds its sandbox,
+ * and every fetch takes the Gateway's fleet-wide advisory lock — twice per MCP
+ * message, since prepare and execute each acquire. One fetch covers the
+ * sandbox's warm lifetime; the registry drops the sandbox at the same age. */
+const ENVELOPE_CACHE_MS = SANDBOX_IDLE_TTL_SECONDS * MS_PER_SECOND;
 
 export function createFleetWorkerBackend(options: {
   sandbox: PrewarmDeps;
@@ -25,11 +35,12 @@ export function createFleetWorkerBackend(options: {
   fetch?: typeof fetch;
 }): FleetWorkerBackend {
   const requestFetch = options.fetch ?? fetch;
-  async function identity(
-    a: FleetAssignment,
-    signal: AbortSignal,
-  ): Promise<McpWakeupIdentity> {
-    const result = await options.envelope(a, signal);
+  const envelopes = new Map<
+    string,
+    { response: FleetEnvelopeResponse; fetchedAt: number }
+  >();
+
+  function check(a: FleetAssignment, result: FleetEnvelopeResponse): void {
     if (
       !sameAssignment(a, result.assignment) ||
       result.identity.userPsId.toLowerCase() !== a.userPsId.toLowerCase() ||
@@ -37,6 +48,24 @@ export function createFleetWorkerBackend(options: {
       a.chainId !== options.sandbox.chainId
     )
       throw new Error("Fleet identity mismatch");
+  }
+
+  async function identity(
+    a: FleetAssignment,
+    signal: AbortSignal,
+  ): Promise<McpWakeupIdentity> {
+    // Keyed by owner, epoch and generation; a cached envelope still faces every
+    // check a fetched one does, against the assignment in hand.
+    const key = fleetSandboxKey(a);
+    const cached = envelopes.get(key);
+    if (cached && Date.now() - cached.fetchedAt <= ENVELOPE_CACHE_MS) {
+      check(a, cached.response);
+      return cached.response.identity;
+    }
+
+    const result = await options.envelope(a, signal);
+    check(a, result);
+    envelopes.set(key, { response: result, fetchedAt: Date.now() });
     return result.identity;
   }
   async function acquire(
@@ -190,7 +219,11 @@ export function createFleetWorkerBackend(options: {
         options.sandbox.registry.release(fleetSandboxKey(request.assignment));
       }
     },
-    release: (a) => options.sandbox.registry.evict(fleetSandboxKey(a)),
+    release: (a) => {
+      // The lease is gone, so the identity it was fetched under is too.
+      envelopes.delete(fleetSandboxKey(a));
+      return options.sandbox.registry.evict(fleetSandboxKey(a));
+    },
   };
 }
 async function readBounded(
