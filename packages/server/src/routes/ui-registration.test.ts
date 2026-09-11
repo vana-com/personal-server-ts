@@ -120,7 +120,6 @@ describe("uiRegistrationRoutes", () => {
       "http://10.0.0.2:18081",
       "http://192.168.1.10:18081",
       "http://172.16.1.10:18081",
-      "https://ps-lite.local",
     ]) {
       const res = await app.request("/registration/server", {
         method: "POST",

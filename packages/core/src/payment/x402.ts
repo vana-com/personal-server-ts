@@ -283,8 +283,7 @@ export async function buildChallenge(
 
 // Decode base64 to UTF-8. Tolerates standard + url-safe alphabets so clients
 // can use either. Uses the universally-available `atob` + Web text codecs
-// rather than Node's Buffer so this module remains browser-safe (consumed
-// by ps-lite as well as the Node server).
+// rather than Node's Buffer so this module remains browser-safe.
 function base64decode(input: string): string {
   let s = input.replace(/-/g, "+").replace(/_/g, "/");
   const pad = (4 - (s.length % 4)) % 4;

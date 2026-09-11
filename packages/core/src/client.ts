@@ -17,7 +17,7 @@ import type { AccessLogEntry } from "./logging/access-log.js";
 import type { ScopeSummary } from "./storage/index/types.js";
 import type { SyncStatus } from "./sync/types.js";
 
-export type PersonalServerKind = "node" | "lite";
+export type PersonalServerKind = "node";
 
 export type PersonalServerStatus =
   "starting" | "ready" | "unavailable" | "stopped" | "error";

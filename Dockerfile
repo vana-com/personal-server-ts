@@ -9,7 +9,6 @@ WORKDIR /app
 # Copy dependency manifests first for layer caching
 COPY package.json package-lock.json ./
 COPY packages/core/package.json packages/core/
-COPY packages/lite/package.json packages/lite/
 COPY packages/server/package.json packages/server/
 COPY packages/cli/package.json packages/cli/
 COPY packages/enclave/package.json packages/enclave/
@@ -23,7 +22,6 @@ COPY packages/ packages/
 # Build only the workspaces needed by the server image. The root build also
 # compiles repo-local scripts that are intentionally absent from this image.
 RUN npm run build --workspace @opendatalabs/personal-server-ts-core \
-  && npm run build --workspace @opendatalabs/personal-server-ts-lite \
   && npm run build --workspace @opendatalabs/personal-server-ts-server
 
 # Install only the packages deliberately kept external to the bundle. Skip

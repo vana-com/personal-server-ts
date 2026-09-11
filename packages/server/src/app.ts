@@ -92,7 +92,6 @@ export interface AppDeps {
   readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
   cloudMode?: boolean;
   devToken?: string;
-  ownerSignature?: `0x${string}`;
   ownerPrivateKey?: `0x${string}`;
   accessToken?: string;
   configPath?: string;
@@ -444,12 +443,6 @@ export function createApp(deps: AppDeps): Hono {
       "/ui",
       uiRoute({
         devToken: deps.devToken,
-        psLiteBootstrap: deps.ownerSignature
-          ? {
-              ownerSignature: deps.ownerSignature,
-              config: deps.config,
-            }
-          : null,
       }),
     );
 
