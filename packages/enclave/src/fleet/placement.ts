@@ -608,6 +608,12 @@ export async function openFleetController(options: FleetControllerOptions) {
             )
               return;
             const node = nodes.get(assignment.nodeId)!;
+            // The worker arms its own retirement from the expiry this RPC
+            // carries, so the extension has to travel with it — but it is only
+            // kept once the renewal lands. A row that can never renew then
+            // lapses inside one lease (reaped above) instead of being pushed
+            // forward every tick and blocking its owner forever.
+            const held = assignment.leaseExpiresAt;
             assignment.leaseExpiresAt = new Date(
               now() + FLEET_LEASE_MS,
             ).toISOString();
@@ -615,6 +621,7 @@ export async function openFleetController(options: FleetControllerOptions) {
             try {
               await publish(assignment);
             } catch {
+              assignment.leaseExpiresAt = held;
               if (
                 rows[key]?.assignment &&
                 sameAssignment(rows[key]!.assignment!, assignment)
@@ -654,6 +661,11 @@ export async function openFleetController(options: FleetControllerOptions) {
               }
               if (ended || released) await persist();
             } catch (error) {
+              // Unconfirmed: the row keeps the expiry its last successful
+              // renewal bought. The worker may still hold the extension it was
+              // sent; the reap releases it once this lease lapses.
+              assignment.leaseExpiresAt = held;
+
               // One timed-out handshake is a controller stall as often as a dead
               // peer, so spend the grace before demoting. An allow-listed
               // attestation or identity refusal is a verdict, not a stall: it
@@ -664,8 +676,7 @@ export async function openFleetController(options: FleetControllerOptions) {
                 return;
               }
 
-              // The worker might have received this extension. Retain precisely
-              // that possible expiry, but never keep extending an unreachable node.
+              // Never keep extending an unreachable node.
               if (
                 directory.nodes[node.nodeId]?.nodeIncarnation ===
                 node.nodeIncarnation
