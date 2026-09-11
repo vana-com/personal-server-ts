@@ -31,6 +31,9 @@ const FLUSH_INTERVAL_MS = 5_000;
 /** Backstop for an unreachable agent: drop oldest rather than grow forever. */
 const MAX_QUEUED_RECORDS = 500;
 const REQUEST_TIMEOUT_MS = 10_000;
+const HTTP_BAD_REQUEST = 400;
+const HTTP_SERVER_ERROR = 500;
+
 /** Delivery attempts per batch before it is given up on and logged. */
 const MAX_SEND_ATTEMPTS = 3;
 /** Backoff between attempts: 500 ms, then 1 s. */
@@ -71,6 +74,17 @@ interface AccessRecordPayload {
   scope: string;
   source: PersonalServerReadFulfillment["source"];
   tool?: string;
+}
+
+/** Why a batch did not land, and what the responder said about it. */
+interface SendFailure {
+  reason: string;
+  /** A refusal of these records rather than a blip: retrying changes nothing. */
+  permanent: boolean;
+  /** Error code from the refusal body, when it carried one. */
+  code?: string;
+  /** Positions in the batch the responder objected to, when it named them. */
+  rejected?: readonly number[];
 }
 
 export function createAccessReporter(
@@ -145,9 +159,16 @@ export function createAccessReporter(
       const outcome = await attemptSend(records);
       if (outcome === null) return;
 
+      // A 400 that names the records it objects to indicts those records, not
+      // the batch: the rest still describe reads the owner is owed.
+      if (outcome.rejected) {
+        await sendWithoutRejected(records, outcome);
+        return;
+      }
+
       const lastChance = attempt === MAX_SEND_ATTEMPTS || stopping;
       if (outcome.permanent || lastChance) {
-        drop(records, { ...outcome, attempts: attempt });
+        drop(records, { ...detailOf(outcome), attempts: attempt });
         return;
       }
 
@@ -155,10 +176,37 @@ export function createAccessReporter(
     }
   }
 
+  /**
+   * Drop only the records the responder named and resend the remainder once.
+   *
+   *   [a bad b] --400 index 1--> drop [bad] --resend--> [a b]
+   *
+   * One attempt, not the full backoff ladder: the batch has already cost a
+   * round trip, and a second refusal means the remainder is no better.
+   */
+  async function sendWithoutRejected(
+    records: AccessRecordPayload[],
+    failure: SendFailure,
+  ): Promise<void> {
+    const rejected = new Set(failure.rejected);
+    drop(
+      records.filter((_, index) => rejected.has(index)),
+      { ...detailOf(failure), attempts: 1 },
+    );
+
+    const remainder = records.filter((_, index) => !rejected.has(index));
+    if (remainder.length === 0) return;
+
+    const outcome = await attemptSend(remainder);
+    if (outcome === null) return;
+
+    drop(remainder, { ...detailOf(outcome), attempts: 1 });
+  }
+
   /** null when the batch landed; otherwise why it did not. */
   async function attemptSend(
     records: AccessRecordPayload[],
-  ): Promise<{ reason: string; permanent: boolean } | null> {
+  ): Promise<SendFailure | null> {
     try {
       const response = await requestFetch(endpoint, {
         method: POST,
@@ -173,7 +221,10 @@ export function createAccessReporter(
 
       return {
         reason: `refused_${response.status}`,
-        permanent: response.status >= 400 && response.status < 500,
+        permanent:
+          response.status >= HTTP_BAD_REQUEST &&
+          response.status < HTTP_SERVER_ERROR,
+        ...(await readRefusal(response, records.length)),
       };
     } catch (err) {
       return {
@@ -181,6 +232,20 @@ export function createAccessReporter(
         permanent: false,
       };
     }
+  }
+
+  /**
+   * What a dropped batch is logged with. `rejected` positions are meaningless
+   * once the records they point at are gone, so they stay out of the line.
+   */
+  function detailOf(failure: SendFailure): {
+    reason: string;
+    code?: string;
+  } {
+    return {
+      reason: failure.reason,
+      ...(failure.code === undefined ? {} : { code: failure.code }),
+    };
   }
 
   /**
@@ -220,6 +285,72 @@ export function createAccessReporter(
       await flush();
     },
   };
+}
+
+/**
+ * What a refusal body says: the error code, and — on a 400 — which records it
+ * objects to. Anything unparseable leaves both unset, so a bodyless refusal
+ * behaves exactly as it did before.
+ */
+async function readRefusal(
+  response: Response,
+  batchSize: number,
+): Promise<{ code?: string; rejected?: readonly number[] }> {
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return {};
+  }
+  if (typeof body !== "object" || body === null) return {};
+
+  const refusal = body as Record<string, unknown>;
+  const code = refusal["code"];
+  const rejected =
+    response.status === HTTP_BAD_REQUEST
+      ? rejectedIndices(refusal, batchSize)
+      : undefined;
+
+  return {
+    ...(typeof code === "string" ? { code } : {}),
+    ...(rejected === undefined ? {} : { rejected }),
+  };
+}
+
+/**
+ * Positions the responder objected to, in either shape it may use:
+ *
+ *   { rejected: [{ index: 1, code }, ...] }   per-record report
+ *   { error, index: 1 }                       single offending record
+ *
+ * Out-of-range or absent indices yield undefined, which keeps the caller on
+ * the whole-batch path rather than dropping records nobody named.
+ */
+function rejectedIndices(
+  refusal: Record<string, unknown>,
+  batchSize: number,
+): readonly number[] | undefined {
+  const entries = Array.isArray(refusal["rejected"])
+    ? refusal["rejected"]
+    : [refusal];
+
+  const indices = new Set<number>();
+  for (const entry of entries) {
+    if (typeof entry !== "object" || entry === null) continue;
+
+    const index = (entry as Record<string, unknown>)["index"];
+    if (isBatchIndex(index, batchSize)) indices.add(index);
+  }
+
+  return indices.size > 0 ? [...indices] : undefined;
+}
+
+function isBatchIndex(value: unknown, batchSize: number): value is number {
+  return (
+    Number.isInteger(value) &&
+    (value as number) >= 0 &&
+    (value as number) < batchSize
+  );
 }
 
 function toPayload(

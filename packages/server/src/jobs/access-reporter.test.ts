@@ -33,6 +33,17 @@ function okFetch() {
   return vi.fn(async () => new Response(null, { status: 202 }));
 }
 
+function refusal(status: number, body: unknown) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function logIdsOf(call: unknown[]) {
+  return bodyOf(call).records.map((record) => record.logId);
+}
+
 function reporter(fetchImpl: typeof fetch, warn = vi.fn()) {
   return {
     warn,
@@ -132,6 +143,119 @@ describe("access reporter batching", () => {
     expect(send).toHaveBeenCalledTimes(1);
     expect(warn).toHaveBeenCalledWith(
       expect.objectContaining({ count: 1, reason: "refused_400", attempts: 1 }),
+      ACCESS_RECORDS_DROPPED,
+    );
+  });
+
+  it("drops only the record a 400 names and resends the rest", async () => {
+    const send = vi.fn(async () =>
+      send.mock.calls.length === 1
+        ? // The Gateway rejected record 1; records 0 and 2 are untouched by it.
+          refusal(400, {
+            code: "INVALID_PAYLOAD",
+            error: "bad source",
+            index: 1,
+          })
+        : new Response(null, { status: 202 }),
+    );
+    const { instance, warn } = reporter(send as unknown as typeof fetch);
+    for (const i of [0, 1, 2]) await instance.report(event(i));
+
+    await instance.stop();
+
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(logIdsOf(send.mock.calls[0])).toEqual(["log-0", "log-1", "log-2"]);
+    expect(logIdsOf(send.mock.calls[1])).toEqual(["log-0", "log-2"]);
+    // Exactly one record is an audit gap, not three.
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        count: 1,
+        droppedTotal: 1,
+        reason: "refused_400",
+        code: "INVALID_PAYLOAD",
+      }),
+      ACCESS_RECORDS_DROPPED,
+    );
+  });
+
+  it("honours a per-record rejected list", async () => {
+    const send = vi.fn(async () =>
+      send.mock.calls.length === 1
+        ? refusal(400, {
+            code: "PARTIAL_REJECT",
+            rejected: [
+              { index: 0, code: "INVALID_PAYLOAD" },
+              { index: 2, code: "INVALID_PAYLOAD" },
+            ],
+          })
+        : new Response(null, { status: 202 }),
+    );
+    const { instance, warn } = reporter(send as unknown as typeof fetch);
+    for (const i of [0, 1, 2]) await instance.report(event(i));
+
+    await instance.stop();
+
+    expect(logIdsOf(send.mock.calls[1])).toEqual(["log-1"]);
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ count: 2, reason: "refused_400" }),
+      ACCESS_RECORDS_DROPPED,
+    );
+  });
+
+  it("drops the remainder too when the resend is refused as well", async () => {
+    const send = vi.fn(async () =>
+      send.mock.calls.length === 1
+        ? refusal(400, { code: "INVALID_PAYLOAD", index: 0 })
+        : refusal(400, { code: "IDENTITY_UNKNOWN", error: "unknown identity" }),
+    );
+    const { instance, warn } = reporter(send as unknown as typeof fetch);
+    for (const i of [0, 1]) await instance.report(event(i));
+
+    await instance.stop();
+
+    // One retry of the remainder, never a loop.
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ count: 1, code: "IDENTITY_UNKNOWN" }),
+      ACCESS_RECORDS_DROPPED,
+    );
+  });
+
+  it("keeps whole-batch drop when a 4xx names no record", async () => {
+    const send = vi.fn(async () =>
+      refusal(403, { code: "STALE_PLACEMENT", error: "stale placement" }),
+    );
+    const { instance, warn } = reporter(send as unknown as typeof fetch);
+    for (const i of [0, 1]) await instance.report(event(i));
+
+    await instance.stop();
+
+    expect(send).toHaveBeenCalledTimes(1);
+    // The count and the first error code are what makes the gap diagnosable.
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        count: 2,
+        reason: "refused_403",
+        code: "STALE_PLACEMENT",
+        attempts: 1,
+      }),
+      ACCESS_RECORDS_DROPPED,
+    );
+  });
+
+  it("ignores an out-of-range index rather than dropping an unnamed record", async () => {
+    const send = vi.fn(async () =>
+      refusal(400, { code: "INVALID_PAYLOAD", index: 7 }),
+    );
+    const { instance, warn } = reporter(send as unknown as typeof fetch);
+    await instance.report(event(0));
+
+    await instance.stop();
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ count: 1, reason: "refused_400" }),
       ACCESS_RECORDS_DROPPED,
     );
   });
