@@ -635,6 +635,55 @@ describe("executeJob", () => {
     await expectFailure(fixture, "AUTH_INVALID");
   });
 
+  // A full fleet queues a submit instead of refusing it, so the claim can land
+  // long after the builder signed: 391 s in the 2026-09-11 6-owner burst
+  // (e2e-proof-2026-09-09/fleet-overnight/autoscale-slice5/burst). That is past
+  // the proof's own 300 s TTL but well inside the job's 900 s deadline.
+  describe("a job claimed after a queue wait", () => {
+    const QUEUE_WAIT_MS = 400_000;
+    const LATE_DEADLINE = new Date(NOW.getTime() + 900_000).toISOString();
+
+    async function createQueuedFixture(): Promise<Fixture> {
+      const fixture = await createFixture();
+      fixture.envelope.request.deadline = LATE_DEADLINE;
+      fixture.envelope.auth = await signRequest(fixture.envelope.request);
+      fixture.deps.now = () => new Date(NOW.getTime() + QUEUE_WAIT_MS);
+
+      return fixture;
+    }
+
+    it("still honours the authorization signed at submit", async () => {
+      const fixture = await createQueuedFixture();
+
+      const response = await executeJob(fixture.envelope, fixture.deps);
+
+      expect(response.resultObjectKey).toBe(`jobresults/14800/${JOB_ID}`);
+    });
+
+    it("rejects a request tampered with after it was signed", async () => {
+      const fixture = await createQueuedFixture();
+      fixture.envelope.request.scope = "instagram.messages";
+
+      await expectFailure(fixture, "AUTH_INVALID");
+    });
+
+    it("rejects an authorization dated in the future", async () => {
+      const fixture = await createQueuedFixture();
+      const claimSeconds = Math.floor((NOW.getTime() + QUEUE_WAIT_MS) / 1_000);
+      fixture.envelope.auth = await buildWeb3SignedHeader({
+        wallet: builder,
+        aud: AUTH_AUDIENCE,
+        method: "POST",
+        uri: "/v1/jobs/execute",
+        body: canonicalJobRequestBytes(fixture.envelope.request),
+        iat: claimSeconds + 3_600,
+        exp: claimSeconds + 3_900,
+      });
+
+      await expectFailure(fixture, "AUTH_INVALID");
+    });
+  });
+
   it("rejects a revoked server registration", async () => {
     const fixture = await createFixture();
     vi.mocked(fixture.gateway.getServer).mockResolvedValue({
