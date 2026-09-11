@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 // @ts-expect-error - untyped operator script; the decision function is pure.
 import {
   ACTION,
+  adoptState,
   decidePoolActions,
   PHASE,
   REASON,
@@ -975,6 +976,91 @@ describe("decidePoolActions", () => {
     });
   });
 
+  // A roll left an operator hand-editing `since` after restoring phase by
+  // hand; the controller is the only authority on an admission it granted.
+  describe("adopts admission times from the controller", () => {
+    it("corrects a hand-stamped since newer than the controller's own admission", () => {
+      const { actions, state } = decidePoolActions({
+        now: NOW,
+        members: MEMBERS,
+        status: status([
+          admitted("worker-1"),
+          admitted("worker-2"),
+          readmitted("worker-3", NOW - 10 * MINUTE),
+        ]),
+        state: {
+          nodes: {
+            "worker-1": runningState("worker-1"),
+            "worker-2": runningState("worker-2"),
+            "worker-3": { phase: PHASE.admitWait, since: NOW, restarts: 0 },
+          },
+        },
+      });
+
+      expect(actions).toEqual([]);
+      expect(state.nodes["worker-3"]).toMatchObject({
+        phase: PHASE.running,
+        since: NOW - 10 * MINUTE,
+      });
+    });
+
+    it("also corrects since when the hand-edited phase already reads running", () => {
+      const { actions, state } = decidePoolActions({
+        now: NOW,
+        members: MEMBERS,
+        status: status([
+          admitted("worker-1"),
+          admitted("worker-2"),
+          readmitted("worker-3", NOW - 10 * MINUTE),
+        ]),
+        state: {
+          nodes: {
+            "worker-1": runningState("worker-1"),
+            "worker-2": runningState("worker-2"),
+            "worker-3": { phase: PHASE.running, since: NOW, restarts: 0 },
+          },
+        },
+      });
+
+      expect(actions).toEqual([]);
+      expect(state.nodes["worker-3"].since).toBe(NOW - 10 * MINUTE);
+    });
+
+    it("keeps a loop-issued start's own since even when newer than the controller's record", () => {
+      const { actions, state } = decidePoolActions({
+        now: NOW,
+        members: MEMBERS,
+        status: status([
+          admitted("worker-1"),
+          admitted("worker-2"),
+          readmitted("worker-3", NOW - 10 * MINUTE),
+        ]),
+        health: { "worker-3": { status: 200, configExpiresAt: null } },
+        state: {
+          nodes: {
+            "worker-1": runningState("worker-1"),
+            "worker-2": runningState("worker-2"),
+            "worker-3": {
+              phase: PHASE.admitWait,
+              since: NOW,
+              restarts: 0,
+              startedByLoop: true,
+            },
+          },
+        },
+      });
+
+      // Not adopted: this loop-issued start is confirmed by outliving the
+      // controller's flag, never by copying its timestamp.
+      expect(actions).toEqual([{ type: ACTION.admit, nodeId: "worker-3" }]);
+      expect(state.nodes["worker-3"]).toMatchObject({
+        phase: PHASE.admitWait,
+        since: NOW,
+        startedByLoop: true,
+      });
+    });
+  });
+
   // Same soak, 20:30:55Z: scale-down drained worker-1 - the always-on
   // tdx.small - because defect 1 had just rebooted the two mediums, leaving W1
   // the longest idle. MIN_RUNNING counts machines, so it never noticed.
@@ -1117,6 +1203,56 @@ describe("decidePoolActions", () => {
       });
       expect(state.nodes["worker-1"].startedByLoop).toBeUndefined();
     });
+  });
+});
+
+describe("adoptState", () => {
+  // Startup reconciliation, so a restart after a roll needs no state edits.
+  it("adopts an ADMITTED member into running and an unavailable one into stopped", () => {
+    const state = adoptState({
+      now: NOW,
+      members: MEMBERS,
+      status: status([
+        readmitted("worker-1", NOW - 5 * MINUTE),
+        admitted("worker-2", { unavailable: true }),
+        admitted("worker-3", { unavailable: true }),
+      ]),
+      state: {
+        nodes: {
+          "worker-1": {
+            phase: PHASE.stopped,
+            since: NOW - MINUTE,
+            restarts: 0,
+          },
+          "worker-2": runningState("worker-2"),
+          "worker-3": {
+            phase: PHASE.starting,
+            since: NOW - 30_000,
+            restarts: 0,
+          },
+        },
+      },
+    });
+
+    expect(state.nodes["worker-1"]).toMatchObject({
+      phase: PHASE.running,
+      since: NOW - 5 * MINUTE,
+    });
+    expect(state.nodes["worker-2"]).toMatchObject({ phase: PHASE.stopped });
+    // A member mid-boot is left for the loop's own next tick to decide.
+    expect(state.nodes["worker-3"]).toMatchObject({ phase: PHASE.starting });
+  });
+
+  it("leaves state untouched when the controller is unreachable", () => {
+    const previous = { nodes: { "worker-1": runningState("worker-1") } };
+    const state = adoptState({
+      now: NOW,
+      members: MEMBERS,
+      status: null,
+      state: previous,
+    });
+
+    expect(state).toEqual(previous);
   });
 });
 

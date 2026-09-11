@@ -19,6 +19,11 @@
  * credential is read from the login keychain per command and is never written
  * to a file. Durable phase state lives in ~/.vana/pool-loop-state.json.
  *
+ * On every start the loop reconciles that state against the controller's
+ * status before its first tick, so a restart after a roll needs no hand
+ * edits: an ADMITTED member becomes running, one the controller no longer
+ * admits becomes stopped.
+ *
  *   node scripts/tee/pool-loop.mjs [--once] [--dry-run]
  */
 import { spawnSync } from "node:child_process";
@@ -375,8 +380,31 @@ function holdRunning(view, ctx) {
   else entry.idleSince ??= ctx.now;
 }
 
+/**
+ * A hand-edited state file can stamp `since` later than the admission the
+ * controller actually performed - e.g. an operator restoring `running` after a
+ * roll and marking it admitted "now". The controller is the sole authority for
+ * an admission it granted, so once a member is running or admit-wait with no
+ * loop-issued start still pending confirmation, a `since` newer than the
+ * controller's own record is corrected to it and the member counts as settled.
+ * A loop-issued start keeps its own `since`: it is confirmed by outliving the
+ * controller's flag, not by copying it.
+ */
+function adoptAdmissionSince(view) {
+  const { entry, node } = view;
+  if (entry.startedByLoop) return;
+  if (entry.phase !== PHASE.running && entry.phase !== PHASE.admitWait) return;
+  if (!node || node.unavailable === true) return;
+
+  const since = Date.parse(node.lastAdmission?.since ?? "");
+  if (!Number.isFinite(since) || since >= entry.since) return;
+
+  enter(entry, PHASE.running, since);
+}
+
 function advanceMember(view, ctx) {
   const { entry } = view;
+  adoptAdmissionSince(view);
 
   if (entry.phase === PHASE.draining) {
     advanceDrain(view, ctx);
@@ -569,6 +597,56 @@ export function decidePoolActions(input) {
   scaleDown(views, ctx);
 
   return { actions: ctx.actions, state };
+}
+
+/**
+ * Startup reconciliation: run once per process start so a restart after a
+ * roll needs no hand-edited state. It trusts the controller's status for any
+ * member the loop has not itself acted on this run - a member ADMITTED there
+ * is simply running, and one the controller no longer admits is simply
+ * stopped. A member the loop is mid-boot on, draining, or has quarantined
+ * keeps its own state; the loop, not the snapshot, knows what happens next.
+ */
+export function adoptState(input) {
+  const { now, members, status } = input;
+  const state = structuredClone(input.state ?? {});
+  state.nodes ??= {};
+  if (!status) return state;
+
+  const records = new Map(status.nodes.map((node) => [node.nodeId, node]));
+  const ADOPTABLE_PHASES = new Set([
+    PHASE.stopped,
+    PHASE.admitWait,
+    PHASE.running,
+  ]);
+
+  for (const member of members) {
+    const entry = (state.nodes[member.nodeId] ??= {
+      phase: PHASE.stopped,
+      since: now,
+      restarts: 0,
+    });
+    if (!ADOPTABLE_PHASES.has(entry.phase)) continue;
+
+    const node = records.get(member.nodeId) ?? null;
+    const admitted = Boolean(
+      node && node.unavailable !== true && node.lastAdmission,
+    );
+
+    if (admitted) {
+      if (entry.phase !== PHASE.running)
+        enter(
+          entry,
+          PHASE.running,
+          Date.parse(node.lastAdmission.since) || now,
+        );
+      continue;
+    }
+
+    if (entry.phase !== PHASE.stopped) enter(entry, PHASE.stopped, now);
+  }
+
+  return state;
 }
 
 // ----------------------------------------------------------------------- I/O
@@ -891,6 +969,25 @@ function loadContext(argv) {
   };
 }
 
+/** Reconciles durable state with the controller once per process start, so a
+ * restart after a roll needs no hand edits. */
+async function adoptOnStartup(context) {
+  const status = await readStatus(context);
+  const previous = readJson(context.statePath, {});
+  const state = adoptState({
+    now: Date.now(),
+    members: context.members,
+    status,
+    state: previous,
+  });
+
+  if (context.dryRun) {
+    logStateDiff(previous, state);
+    return;
+  }
+  writeState(context.statePath, state);
+}
+
 async function main() {
   const context = loadContext(process.argv.slice(2));
   // A dry run must never compete with a real loop for its lock.
@@ -898,6 +995,7 @@ async function main() {
     context.dryRun ? `${context.statePath}.dry-run` : context.statePath,
   );
   log({ level: "info", message: "Pool loop started", dryRun: context.dryRun });
+  await adoptOnStartup(context);
 
   for (;;) {
     await tick(context);

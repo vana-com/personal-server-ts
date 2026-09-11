@@ -54,6 +54,14 @@ slots. One loop runs per state file, fenced by a `<state>.lock` pidfile.
 `--once` runs a single tick; `--dry-run` logs every decision without invoking
 `phala`.
 
+Before its first tick, every start reconciles state against the controller's
+status: a member it did not itself act on this run is set to `running` if the
+controller has it ADMITTED, or `stopped` if the controller does not. A running
+or admit-wait member's `since` also self-heals every tick if it is somehow
+newer than the controller's own admission record, since the controller is the
+only authority on an admission it granted. After a roll: restart the loop; no
+state edits.
+
 `provision.sh` defaults to `deploy/dstack/docker-compose.enclave.yml`. The
 agent receives only the dstack socket and reaches the privileged nested Docker
 runtime over the private compose network. `AGENT_IMAGE` and `DIND_IMAGE` must
