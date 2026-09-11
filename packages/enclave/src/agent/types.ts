@@ -55,12 +55,16 @@ export interface SealResult {
 }
 
 export interface HealthResponse {
-  appId: string;
-  composeHash: string;
-  instanceId: string;
+  /** The five dstack fields are absent together, and only while `dstack` is
+   * set: health answers within its budget whether or not the guest agent did. */
+  appId?: string;
+  composeHash?: string;
+  instanceId?: string;
   nodeId: string | null;
   osImageHash?: string;
   osVersion?: string;
+  /** Set to "unreachable" when the dstack guest agent has not answered once. */
+  dstack?: string;
   activeSandboxes: number;
   draining: boolean;
   /** Signed-bundle window. Null issuance means this agent runs unsigned;
