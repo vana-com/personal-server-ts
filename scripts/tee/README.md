@@ -450,6 +450,10 @@ back identical to when that head was last measured and nothing is rebuilt. Only
 on the four-worker preview fleet on 2026-09-11: **14m53s** back, **11m43s**
 forward, zero `409`s, one CVM restart.
 
+Pause the ticker from a detached shell, not a foreground one: a foreground
+`kill -STOP "$TICKER_PID"` self-resumes mid-roll. Use `nohup sh -c 'kill -STOP
+'"$TICKER_PID"'' &` (or a pause file the loop checks) instead.
+
 Before anything, stage the pins. Every worker's `FLEET_PEER_POLICIES` must carry
 the controller compose hash it is running on **and** the one it is rolling to,
 in that order, or the workers stop admitting the controller mid-roll.
@@ -485,7 +489,7 @@ Then prove it: one SDK job to `completed` attempt 1, one MCP `tools/call` 200,
 `POST /fleet/v1/status` 200 with every member `draining:false,
 unavailable:false`, and `POST /agent/v1/identity` against each worker.
 
-Four things need a hand, in rough order of likelihood:
+Five things need a hand, in rough order of likelihood:
 
 - A member reads back `stopped` after its own `envs update` (exit 0). Recover
   with `phala cvms start <uuid>`; staging also restarts an already-stopped CVM.
@@ -497,6 +501,8 @@ Four things need a hand, in rough order of likelihood:
   precondition is all four serving.
 - The loop stops a freshly rolled idle member on its first tick after
   `kill -CONT`. That is `MIN_RUNNING` doing its job, not a failed roll.
+- `drain` returns 500 within about 30 s of a member's own health going green.
+  Not the stale-owner failure above — just retry 60 s later.
 
 **Do not roll across a Gateway database change.** `drain` releases each of the
 node's placements through a CAS against `fleet_owners`; if the owner row is not

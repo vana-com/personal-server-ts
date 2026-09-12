@@ -16,6 +16,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const {
+  ensureReceiptsWritable,
   findNode,
   isBusy,
   loadManifest,
@@ -120,6 +121,8 @@ function assertStaged(name, node, composeText) {
 
 /** Push the sealed bundle, retrying the 409 a still-applying deploy returns. */
 async function updateEnv(name, uuid, bundle, receipts) {
+  // Refuse the push itself if the receipt can't be recorded, staged or final.
+  ensureReceiptsWritable(receipts);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `fleet-signed-${name}-`));
   fs.chmodSync(dir, 0o700);
   const attempts = [];
@@ -249,6 +252,14 @@ async function signNode({ manifest, name, node, args, secret, digests }) {
     assertStaged(name, node, composeText);
     const settleStartedAt = now();
     const runningAt = await settle(node.uuid);
+
+    // Recorded before the push, so a crash mid-push still leaves a receipt.
+    writeJson(path.join(args.receipts, `${name}-signed-config-receipt.json`), {
+      ...receipt,
+      applied: "pending",
+      timings: { settleStartedAt, runningAt },
+    });
+
     const attempts = await updateEnv(name, node.uuid, bundle, args.receipts);
     receipt.timings = {
       settleStartedAt,
@@ -258,6 +269,7 @@ async function signNode({ manifest, name, node, args, secret, digests }) {
     };
   }
 
+  // Finalize: replaces the pending stub once the push has actually settled.
   writeJson(
     path.join(args.receipts, `${name}-signed-config-receipt.json`),
     receipt,
@@ -289,6 +301,7 @@ async function main() {
 
   const manifest = loadManifest(args.manifest);
   args.receipts = args.receipts || args.drafts;
+  ensureReceiptsWritable(args.receipts);
   args.verifier = args.verifier || path.join(__dirname, "..", "..", VERIFIER);
   const account = args.keyAccount || DEFAULT_ACCOUNT;
   const secret = (item) =>

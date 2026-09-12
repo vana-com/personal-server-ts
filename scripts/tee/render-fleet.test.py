@@ -179,5 +179,66 @@ class Drafts(unittest.TestCase):
             self.draft("worker-1")
 
 
+class ManifestPatching(unittest.TestCase):
+    def setUp(self):
+        self.text = MANIFEST.read_text()
+        self.manifest = json.loads(self.text)
+        self.nodes = self.manifest["nodes"]
+
+    def test_no_change_leaves_the_file_untouched(self):
+        hashes = {n: v["pinned"]["composeHash"] for n, v in self.nodes.items()}
+
+        self.assertEqual(rf.patch_compose_hashes(self.text, self.nodes, hashes), self.text)
+
+    def test_only_the_changed_hash_moves(self):
+        new_hash = "b" * 64
+        hashes = {n: v["pinned"]["composeHash"] for n, v in self.nodes.items()}
+        hashes["worker-1"] = new_hash
+
+        patched = rf.patch_compose_hashes(self.text, self.nodes, hashes)
+
+        self.assertNotEqual(patched, self.text)
+        self.assertIn(new_hash, patched)
+        self.assertNotIn(self.nodes["worker-1"]["pinned"]["composeHash"], patched)
+        # every other node's pinned hash, and the rest of the file, is untouched
+        patched_manifest = json.loads(patched)
+        for name in self.nodes:
+            if name == "worker-1":
+                continue
+            self.assertEqual(
+                patched_manifest["nodes"][name]["pinned"]["composeHash"],
+                self.nodes[name]["pinned"]["composeHash"],
+            )
+
+    def test_preserves_key_order_and_indent(self):
+        hashes = {n: v["pinned"]["composeHash"] for n, v in self.nodes.items()}
+        hashes["controller"] = "c" * 64
+
+        patched = rf.patch_compose_hashes(self.text, self.nodes, hashes)
+        old_lines = self.text.splitlines()
+        new_lines = patched.splitlines()
+
+        self.assertEqual(len(old_lines), len(new_lines))
+        for old_line, new_line in zip(old_lines, new_lines):
+            if "composeHash" in old_line and self.nodes["controller"]["pinned"]["composeHash"] in old_line:
+                continue
+            self.assertEqual(old_line, new_line)
+
+    def test_refuses_a_hash_that_is_not_unique(self):
+        # Two nodes pinned to the same hash can't be told apart to patch safely.
+        shared = "d" * 64
+        text = self.text
+        for name in ("worker-1", "worker-2"):
+            old = self.nodes[name]["pinned"]["composeHash"]
+            text = text.replace('"composeHash": "%s"' % old, '"composeHash": "%s"' % shared, 1)
+            self.nodes[name]["pinned"]["composeHash"] = shared
+
+        hashes = {n: v["pinned"]["composeHash"] for n, v in self.nodes.items()}
+        hashes["worker-1"] = "e" * 64
+
+        with self.assertRaises(SystemExit):
+            rf.patch_compose_hashes(text, self.nodes, hashes)
+
+
 if __name__ == "__main__":
     unittest.main()

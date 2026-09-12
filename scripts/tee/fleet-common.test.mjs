@@ -2,7 +2,14 @@
 // signing and Gateway paths are exercised against a real fleet, never here.
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { readFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+} from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -120,6 +127,86 @@ test("loadManifest rejects a manifest with no trust root", () => {
     () => common.loadManifest(path.join(here, "..", "..", "package.json")),
     /Manifest/,
   );
+});
+
+test("ensureReceiptsWritable creates a missing dir", () => {
+  const parent = mkdtempSync(path.join(os.tmpdir(), "fleet-receipts-"));
+  const dir = path.join(parent, "receipts");
+
+  try {
+    assert.equal(existsSync(dir), false);
+    common.ensureReceiptsWritable(dir);
+    assert.equal(existsSync(dir), true);
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("ensureReceiptsWritable refuses a read-only dir", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "fleet-receipts-ro-"));
+
+  try {
+    chmodSync(dir, 0o500);
+    assert.throws(() => common.ensureReceiptsWritable(dir), /not writable/);
+  } finally {
+    chmodSync(dir, 0o700);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("detectRotateState resumes from wherever the row already sits", () => {
+  assert.equal(common.detectRotateState(undefined, 60_000), "removed");
+  assert.equal(
+    common.detectRotateState({ state: "removed" }, 60_000),
+    "removed",
+  );
+  assert.equal(
+    common.detectRotateState({ state: "draining" }, 60_000),
+    "draining",
+  );
+  assert.equal(
+    common.detectRotateState({ state: "admitted" }, 60_000),
+    "admitted",
+  );
+});
+
+test("detectRotateState splits pending on heartbeat freshness", () => {
+  const fresh = new Date().toISOString();
+  const stale = new Date(Date.now() - 120_000).toISOString();
+
+  assert.equal(
+    common.detectRotateState(
+      { state: "pending", lastHeartbeatAt: fresh },
+      60_000,
+    ),
+    "heartbeating",
+  );
+  assert.equal(
+    common.detectRotateState(
+      { state: "pending", lastHeartbeatAt: stale },
+      60_000,
+    ),
+    "registered",
+  );
+  assert.equal(
+    common.detectRotateState({ state: "pending" }, 60_000),
+    "registered",
+  );
+});
+
+test("detectRotateState refuses a state with no rotate plan", () => {
+  assert.throws(
+    () => common.detectRotateState({ nodeId: "n", state: "weird" }, 60_000),
+    /no rotate state/,
+  );
+});
+
+test("ROTATE_PLAN ends every state at admit + resume", () => {
+  for (const state of common.ROTATE_STATES) {
+    const plan = common.ROTATE_PLAN[state];
+
+    assert.deepEqual(plan.slice(-2), ["admit", "resume"]);
+  }
 });
 
 test("the shipped manifest names credentials but never carries one", () => {
