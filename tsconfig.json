@@ -4,6 +4,7 @@
     { "path": "packages/lite" },
     { "path": "packages/server" },
     { "path": "packages/cli" },
+    { "path": "packages/enclave" },
     { "path": "scripts" }
   ],
   "files": []

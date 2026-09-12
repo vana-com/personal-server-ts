@@ -21,9 +21,15 @@ import type { McpDataReadClient } from "./read-client.js";
 import {
   MAX_MCP_TOOL_TIMEOUT_MS,
   MCP_TOOLS,
+  resolveGrantForScope,
   type McpToolContext,
   type McpToolResultContent,
 } from "./tools.js";
+import {
+  READ_FULFILLMENT_NONE,
+  reportPersonalServerReadDenial,
+  type PersonalServerReadReporterDeps,
+} from "../api/index.js";
 import type { McpActivityRecorder, McpActivityStatus } from "./activity.js";
 import {
   RAW_SCOPE_RESOURCE_TEMPLATES,
@@ -34,12 +40,34 @@ export interface HandleMcpRequestOptions {
   connection: McpConnectionRecord;
   readClient: McpDataReadClient;
   activityRecorder?: McpActivityRecorder;
+  /** Emits one access record per denied data tool call; see reportToolDenial. */
+  reporterDeps?: PersonalServerReadReporterDeps;
   serverName?: string;
   serverVersion?: string;
 }
 
 const DEFAULT_SERVER_NAME = "vana-personal-server-mcp";
 const DEFAULT_SERVER_VERSION = "0.0.1";
+/** Stateless: no MCP session id is issued and POST answers with JSON, not SSE. */
+const TRANSPORT_OPTIONS = {
+  sessionIdGenerator: undefined,
+  enableJsonResponse: true,
+} as const;
+/** Methods whose answer is the same for every connection: the tool table is a
+ * static constant and no session is retained. e.g. a fresh remote connector
+ * probes with initialize + notifications/initialized + tools/list. */
+const HANDSHAKE_METHODS = new Set([
+  "initialize",
+  "notifications/initialized",
+  "ping",
+  "tools/list",
+]);
+const RAW_SCOPE_RESOURCE_CONFIG = {
+  title: "Raw scope file",
+  description:
+    "Original binary/unstructured file bytes for an approved Vana scope.",
+  mimeType: "application/octet-stream",
+} as const;
 const DEFAULT_MCP_TOOL_TIMEOUT_MS = 30_000;
 const MCP_TOOL_TIMEOUT_GRACE_MS = 1_000;
 
@@ -119,6 +147,105 @@ function buildActivityStartParams(
     }
   }
   return params;
+}
+
+/**
+ * Tools that reach the owner's data. Only these produce access records — the
+ * discovery tools (`list_granted_*`, `request_scope_access`) touch none.
+ */
+const DATA_TOOLS = new Set([
+  "get_scope_file",
+  "list_scope_blocks",
+  "read_scope",
+  "search_personal_context",
+]);
+
+/**
+ * Tool error codes that mean "the read was refused", as opposed to a failure
+ * (timeout, storage error). Only these are worth an access record: they are
+ * decisions about the grantee's access, not incidents.
+ */
+const DENY_CODES = new Set([
+  "payment_required",
+  "scope_deleted",
+  "scope_not_granted",
+  "unauthorized",
+]);
+
+const PAYMENT_REQUIRED_CODE = "payment_required";
+
+/**
+ * Extract the deny code from a tool result, or undefined when the call was
+ * served or failed for a non-deny reason. `read_scope` signals a chargeable
+ * scope with a top-level `payment_required: true` rather than an error code.
+ */
+function denyCode(result: {
+  content: McpToolResultContent[];
+  isError?: boolean;
+}): string | undefined {
+  if (!result.isError) return undefined;
+
+  const first = result.content[0];
+  if (first?.type !== "text") return undefined;
+
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(first.text) as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+
+  if (typeof body.error === "string" && DENY_CODES.has(body.error)) {
+    return body.error;
+  }
+
+  return body[PAYMENT_REQUIRED_CODE] === true
+    ? PAYMENT_REQUIRED_CODE
+    : undefined;
+}
+
+/**
+ * One access record per denied data tool call. Fire-and-forget by contract:
+ * the tool result is already computed and is returned regardless.
+ */
+function reportToolDenial(
+  options: HandleMcpRequestOptions,
+  tool: string,
+  args: Record<string, unknown>,
+  result: { content: McpToolResultContent[]; isError?: boolean },
+): void {
+  if (!options.reporterDeps || !DATA_TOOLS.has(tool)) return;
+
+  const reason = denyCode(result);
+  if (!reason) return;
+
+  // The denied scope, if the call named one; a multi-scope search records the
+  // first, since the owner's decision is one record per tool call.
+  const scope =
+    buildActivityStartParams(tool, args).scopes?.[0] ?? READ_FULFILLMENT_NONE;
+
+  // A refusal is filed under the grant the call arrived on. A scope no grant
+  // covers has no grant of its own, but the connection's grant is the access
+  // relationship the owner's feed groups by — and the Gateway only stores a
+  // 32-byte grant id, so `READ_FULFILLMENT_NONE` here is refused on ingest and
+  // takes its whole batch down with it. A connection left with no grant at all
+  // has nothing to attribute the refusal to, so it reports nothing.
+  const grantId =
+    resolveGrantForScope(options.connection, scope)?.grantId ??
+    options.connection.grants[0]?.grantId;
+  if (!grantId) return;
+
+  reportPersonalServerReadDenial(options.reporterDeps, {
+    builder: options.connection.granteeAddress,
+    denyReason: reason,
+    grantId,
+    logId: crypto.randomUUID(),
+    outcome: "denied",
+    scope,
+    servedAt: new Date().toISOString(),
+    source: "mcp",
+    tool,
+  });
 }
 
 function extractActivityFinishParams(
@@ -256,6 +383,15 @@ function markResponsePreparing(
   });
 }
 
+/** What a client sees of a tool in `tools/list`: owner-independent metadata. */
+function toolConfig(tool: (typeof MCP_TOOLS)[number]) {
+  return {
+    title: tool.title,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+  };
+}
+
 /**
  * Build a fresh `McpServer` instance bound to a single connection + read
  * client. Tools delegate to `MCP_TOOLS` so the surface stays in one place.
@@ -286,11 +422,7 @@ export function createMcpServerForConnection(
   for (const tool of MCP_TOOLS) {
     server.registerTool(
       tool.name,
-      {
-        title: tool.title,
-        description: tool.description,
-        inputSchema: tool.inputSchema,
-      },
+      toolConfig(tool),
       async (args: Record<string, unknown>) => {
         const recorder = options.activityRecorder;
         const activityId = recorder
@@ -304,6 +436,7 @@ export function createMcpServerForConnection(
             tool.name,
             timeoutMs,
           );
+          reportToolDenial(options, tool.name, args, result);
           if (activityId && recorder) {
             const handlerDurationMs = Math.round(
               performance.now() - handlerStartedAt,
@@ -368,12 +501,7 @@ export function createMcpServerForConnection(
     server.registerResource(
       `raw-scope-file-${index}`,
       new ResourceTemplate(template, { list: undefined }),
-      {
-        title: "Raw scope file",
-        description:
-          "Original binary/unstructured file bytes for an approved Vana scope.",
-        mimeType: "application/octet-stream",
-      },
+      RAW_SCOPE_RESOURCE_CONFIG,
       async (uri) => readRawScopeResource(uri, ctx),
     );
   });
@@ -408,10 +536,9 @@ export async function handleMcpStreamableHttpRequest(
 ): Promise<Response> {
   const { server, finishPendingActivities } =
     createMcpServerForConnection(options);
-  const transport = new WebStandardStreamableHTTPServerTransport({
-    sessionIdGenerator: undefined,
-    enableJsonResponse: true,
-  });
+  const transport = new WebStandardStreamableHTTPServerTransport(
+    TRANSPORT_OPTIONS,
+  );
 
   try {
     await server.connect(transport);
@@ -425,6 +552,64 @@ export async function handleMcpStreamableHttpRequest(
       errorMessage: err instanceof Error ? err.message : String(err),
     });
     throw err;
+  } finally {
+    await Promise.allSettled([transport.close(), server.close()]);
+  }
+}
+
+/**
+ * True when every JSON-RPC message in `body` is one this file can answer
+ * without the owner's data — see `HANDSHAKE_METHODS`. A batch qualifies only
+ * as a whole, so a tool call travelling with a handshake still reaches the
+ * owner's server.
+ */
+export function isMcpHandshake(body: unknown): boolean {
+  const messages = Array.isArray(body) ? body : [body];
+  return (
+    messages.length > 0 &&
+    messages.every(
+      (message) =>
+        !!message &&
+        typeof message === "object" &&
+        HANDSHAKE_METHODS.has(
+          (message as { method?: unknown }).method as string,
+        ),
+    )
+  );
+}
+
+/**
+ * Answer a handshake request from the static tool table. Same server identity,
+ * same registered surface and same transport as the full engine, so the bytes
+ * match what a dispatched call returns; the tool handlers are unreachable
+ * because no handshake method invokes one.
+ */
+export async function handleMcpHandshake(request: Request): Promise<Response> {
+  const server = new McpServer({
+    name: DEFAULT_SERVER_NAME,
+    version: DEFAULT_SERVER_VERSION,
+  });
+  const unreachable = () => {
+    throw new Error("Handshake server cannot serve data");
+  };
+
+  for (const tool of MCP_TOOLS)
+    server.registerTool(tool.name, toolConfig(tool), unreachable);
+  RAW_SCOPE_RESOURCE_TEMPLATES.forEach((template, index) =>
+    server.registerResource(
+      `raw-scope-file-${index}`,
+      new ResourceTemplate(template, { list: undefined }),
+      RAW_SCOPE_RESOURCE_CONFIG,
+      unreachable,
+    ),
+  );
+
+  const transport = new WebStandardStreamableHTTPServerTransport(
+    TRANSPORT_OPTIONS,
+  );
+  try {
+    await server.connect(transport);
+    return await transport.handleRequest(request);
   } finally {
     await Promise.allSettled([transport.close(), server.close()]);
   }

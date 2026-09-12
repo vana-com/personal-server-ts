@@ -117,6 +117,38 @@ export class ServerNotConfiguredError extends ProtocolError {
   }
 }
 
+export class SignedArtifactMissingError extends ProtocolError {
+  constructor(details?: Record<string, unknown>) {
+    super(
+      403,
+      "SIGNED_ARTIFACT_MISSING",
+      "Signed artifact is missing",
+      details,
+    );
+  }
+}
+
+export class SignedArtifactInvalidError extends ProtocolError {
+  constructor(details?: Record<string, unknown>) {
+    super(
+      403,
+      "SIGNED_ARTIFACT_INVALID",
+      "Signed artifact is invalid",
+      details,
+    );
+  }
+}
+
+export class ServerSigningUnavailableError extends ProtocolError {
+  constructor() {
+    super(
+      500,
+      "SERVER_SIGNING_UNAVAILABLE",
+      "Server signing is unavailable in this runtime",
+    );
+  }
+}
+
 // 413 — Payload errors
 
 export class ContentTooLargeError extends ProtocolError {

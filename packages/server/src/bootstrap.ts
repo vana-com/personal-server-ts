@@ -16,7 +16,10 @@ import {
   type IndexManager,
 } from "./storage/index-manager.js";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
-import { createGatewayClient } from "@opendatalabs/vana-sdk/node";
+import {
+  createGatewayClient,
+  NodeECIESProvider,
+} from "@opendatalabs/vana-sdk/node";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { createAccessLogWriter } from "./logging/access-log.js";
 import { createAccessLogReader } from "./logging/access-reader.js";
@@ -66,6 +69,9 @@ import {
   type InferenceProvider,
   type RecomputeScheduler,
 } from "@opendatalabs/personal-server-ts-core/derivatives";
+import { executeJob, type JobWorkerDeps } from "./jobs/worker.js";
+
+const TRAILING_SLASHES = /\/+$/;
 
 export interface ServerContext {
   app: Hono;
@@ -91,6 +97,8 @@ export interface ServerContext {
 
 export interface CreateServerOptions {
   rootPath?: string;
+  /** Exact owner scopes to hydrate before the first full sync pass. */
+  hydrateScopes?: string[];
   /**
    * Inference provider for the derivative compute layer. Defaults to the
    * OpenAI-compatible client on `config.inference` (env overrides:
@@ -102,6 +110,7 @@ export interface CreateServerOptions {
   serverDir?: string;
   dataDir?: string;
   ownerSignature?: `0x${string}`;
+  jobResultUpload?: JobWorkerDeps["resultUpload"];
   gatewayClient?: GatewayClient;
   /**
    * Deletion-aware gateway feed (`includeDeleted=true` listings + tombstone
@@ -118,6 +127,8 @@ export interface CreateServerOptions {
    * approval surface (e.g. the desktop app) pass it here.
    */
   mcpOAuthApprovalUrl?: string | (() => string);
+  profile?: "standard" | "enclave";
+  serverAccount?: ServerAccount;
 }
 
 const DEFAULT_LOCAL_APPROVAL_PORT = 34127;
@@ -150,6 +161,10 @@ export async function createServer(
 ): Promise<ServerContext> {
   const logger = createLogger(config.logging);
   const startedAt = new Date();
+  const isEnclave = options?.profile === "enclave";
+  if (isEnclave && process.env.VANA_OWNER_PRIVATE_KEY) {
+    throw new Error("VANA_OWNER_PRIVATE_KEY is forbidden in enclave profile");
+  }
 
   const storageRoot = resolveRootPath(
     options?.rootPath ?? options?.serverDir ?? DEFAULT_ROOT_PATH,
@@ -227,12 +242,13 @@ export async function createServer(
       );
     }
 
-    // Load or create server keypair from disk
+    // Enclaves receive public identity only; standard mode owns its key file.
     const keyPath = join(storageRoot, "key.json");
-    serverAccount = loadOrCreateServerAccount(keyPath);
+    serverAccount =
+      options?.serverAccount ?? loadOrCreateServerAccount(keyPath);
     logger.info(
       { owner: serverOwner, serverAddress: serverAccount.address },
-      "Server signing account loaded",
+      "Server account loaded",
     );
 
     serverSigner = createServerSigner(serverAccount, {
@@ -285,7 +301,7 @@ export async function createServer(
 
   // Download frpc binary eagerly (auth-independent) so it's ready when the user signs in
   let frpcBinaryPath = "";
-  if (config.tunnel.enabled) {
+  if (config.tunnel.enabled && !isEnclave) {
     try {
       frpcBinaryPath = await ensureFrpcBinary(storageRoot, {
         log: (msg) => logger.info(msg),
@@ -300,9 +316,10 @@ export async function createServer(
   // registers derivatives with their lineage. Needs the server account.
   // The one server-key request signer: lineage reads, and the inference
   // relay calls below, authenticate to the gateway with the same scheme.
-  const requestSigner = serverAccount
-    ? createRequestSigner(serverAccount)
-    : undefined;
+  const requestSigner =
+    serverAccount && !isEnclave
+      ? createRequestSigner(serverAccount)
+      : undefined;
   const lineageGateway: LineageGatewayPort | undefined = requestSigner
     ? createGatewayLineageClient({
         gatewayUrl: config.gateway.url,
@@ -411,6 +428,7 @@ export async function createServer(
       config,
       serverOwner,
       serverAccount,
+      reads: isEnclave ? "public" : "signed",
     });
 
     const cursor = createSyncCursor(syncCursorPath, {
@@ -452,24 +470,28 @@ export async function createServer(
     // Durable deletion: gateway tombstone signed with the same server
     // account + AddData signer uploads use, storage DELETE authorised with
     // the same Web3Signed signer the storage provider uploads with.
-    const deleteData = createGatewayDeleteDataPort({
-      gatewayUrl: config.gateway.url,
-      dataPointFeed,
-      serverOwner,
-      signer: serverSigner,
-      storage: {
-        endpoint: resolveVanaStorageEndpoint(config),
-        chainId: config.gateway.chainId,
-        signMessage: (message) => serverAccount.signMessage(message),
-      },
-    });
+    const deleteData = isEnclave
+      ? null
+      : createGatewayDeleteDataPort({
+          gatewayUrl: config.gateway.url,
+          dataPointFeed,
+          serverOwner,
+          signer: serverSigner,
+          storage: {
+            endpoint: resolveVanaStorageEndpoint(config),
+            chainId: config.gateway.chainId,
+            signMessage: (message) => serverAccount.signMessage(message),
+          },
+        });
     const pendingBlobDeletions = createFilePendingBlobDeletionStore(
       pendingBlobDeletionsPath,
     );
 
     syncManager = createSyncManager(uploadDeps, downloadDeps, {
       deleteData,
+      hydrateScopes: options?.hydrateScopes,
       pendingBlobDeletions,
+      transferMode: isEnclave ? "download-only" : "upload-download",
       async canSync() {
         try {
           const serverInfo = await gatewayClient.getServer(
@@ -506,14 +528,16 @@ export async function createServer(
   const accessLogReader = createAccessLogReader(logsDir);
 
   // Generate ephemeral dev token when devUi is enabled
-  const devToken = config.devUi.enabled ? generateDevToken() : undefined;
+  const devToken =
+    config.devUi.enabled && !isEnclave ? generateDevToken() : undefined;
 
   // Token store for /auth/device flow (self-hosted CLI auth)
   const tokenStore: TokenStore = createTokenStore(tokensPath, logger);
   const cloudMode = process.env.CLOUD_MODE === "true";
-  const localApprovalPort = cloudMode
-    ? undefined
-    : resolveLocalApprovalPort(config.server.port);
+  const localApprovalPort =
+    cloudMode || isEnclave
+      ? undefined
+      : resolveLocalApprovalPort(config.server.port);
 
   // Mutable origin — starts with config value, updated when tunnel connects
   let effectiveOrigin = config.server.origin;
@@ -540,7 +564,36 @@ export async function createServer(
     }
   };
 
+  const ecies = new NodeECIESProvider();
+  const resultUpload = options?.jobResultUpload;
+  const jobSyncManager = syncManager;
+  const jobWorker =
+    isEnclave && serverOwner && serverAccount && resultUpload
+      ? (envelope: Parameters<typeof executeJob>[0]) =>
+          executeJob(envelope, {
+            serverOwner,
+            serverAddress: serverAccount.address,
+            serverPublicKey: serverAccount.publicKey,
+            authAudience: config.gateway.url.replace(TRAILING_SLASHES, ""),
+            gateway: gatewayClient,
+            gatewayConfig: config.gateway,
+            storage: dataStorage,
+            ecies,
+            logger,
+            accessLogWriter,
+            scopeDeletions,
+            hydrateScope: jobSyncManager
+              ? (scope) => jobSyncManager.hydrateScopes([scope])
+              : undefined,
+            resultUpload,
+          })
+      : undefined;
+
   const app = createApp({
+    mcpHydrateScopes:
+      isEnclave && jobSyncManager
+        ? (scopes) => jobSyncManager.hydrateScopes(scopes)
+        : undefined,
     logger,
     version: pkg.version,
     startedAt,
@@ -576,6 +629,8 @@ export async function createServer(
     getTunnelStatus: () => tunnelManager?.getStatus() ?? null,
     mcpOAuthApprovalUrl: options?.mcpOAuthApprovalUrl,
     onServerRegistered: (serverId) => notifyServerRegistered(serverId),
+    profile: options?.profile,
+    jobWorker,
   });
 
   const cleanup = async () => {
@@ -615,7 +670,9 @@ export async function createServer(
       // Replay questions a previous run left pending or stale: nothing
       // else reschedules them after a restart (registration and source
       // changes only cover new activity).
-      derivativeScheduler.start();
+      if (!isEnclave) {
+        derivativeScheduler.start();
+      }
 
       // --- Gateway registration check (slow: HTTP call) ---
       if (serverAccount && identity) {
@@ -645,6 +702,7 @@ export async function createServer(
 
       // --- Tunnel setup (slow: subprocess wait) ---
       if (
+        !isEnclave &&
         config.tunnel.enabled &&
         serverOwner &&
         serverAccount &&

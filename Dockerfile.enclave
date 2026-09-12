@@ -1,0 +1,58 @@
+# Prebuilt fleet enclave image: one image serves both the worker agent
+# (packages/enclave/dist/agent/main.js) and the controller
+# (packages/enclave/dist/central/main.js). Baking node_modules and dist here
+# removes the per-boot `npm ci` (~32 s) and `tsc --build` (~44 s) that the CVM
+# composes used to run on every start.
+
+# ---------- build stage ----------
+FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS build
+
+# build-base provides gcc/g++/make for the better-sqlite3 native addon
+RUN apk add --no-cache build-base python3
+
+WORKDIR /app
+
+# Copy dependency manifests first for layer caching
+COPY package.json package-lock.json ./
+COPY packages/core/package.json packages/core/
+COPY packages/lite/package.json packages/lite/
+COPY packages/server/package.json packages/server/
+COPY packages/cli/package.json packages/cli/
+COPY packages/enclave/package.json packages/enclave/
+
+RUN npm ci
+
+COPY tsconfig.base.json ./
+COPY packages/ packages/
+
+# `tsc --build` follows the enclave's project references, so this also emits
+# the core, lite, and server dist trees the enclave imports at runtime.
+RUN npm run build -w @opendatalabs/personal-server-ts-enclave
+
+# Drop dev dependencies in place. `npm prune` keeps every native addon the
+# install above built, whereas a `npm ci --omit=dev` reinstall would have to
+# skip lifecycle scripts (the root `prepare` runs husky, a dev dependency) and
+# so would leave any addon without a published prebuild unbuilt. Sources are
+# dead once dist exists.
+RUN npm prune --omit=dev \
+  && rm -rf packages/*/src packages/*/tsconfig.tsbuildinfo
+
+# A production dependency whose native addon did not survive the prune fails
+# here, at build time, rather than at first use inside the CVM.
+RUN node -e "require('better-sqlite3'); require('secp256k1/bindings')"
+
+# ---------- runtime stage ----------
+FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32
+
+# libstdc++ backs better-sqlite3; docker-cli drives the nested sandbox runtime
+# over tcp://sandbox-runtime:2375; util-linux provides the controller's flock.
+RUN apk add --no-cache libstdc++ docker-cli util-linux
+
+WORKDIR /app
+
+COPY --from=build /app/package.json /app/package-lock.json ./
+COPY --from=build /app/node_modules/ node_modules/
+COPY --from=build /app/packages/ packages/
+
+# The compose command overrides this to select the agent or controller role.
+CMD ["node", "packages/enclave/dist/agent/main.js"]

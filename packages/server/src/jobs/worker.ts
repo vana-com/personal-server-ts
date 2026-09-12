@@ -1,0 +1,783 @@
+import { createHash, randomUUID } from "node:crypto";
+import { createReadStream, createWriteStream } from "node:fs";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import {
+  assertScopeNotDeleted,
+  redactEnvelopeForGrantee,
+  redactJsonEnvelopeBytesForGrantee,
+} from "@opendatalabs/personal-server-ts-core/api";
+import { readDataContract } from "@opendatalabs/personal-server-ts-core/contracts";
+import {
+  DataDeletedError,
+  GrantRevokedError,
+  InvalidSignatureError,
+  ProtocolError,
+  SignedArtifactInvalidError,
+  SignedArtifactMissingError,
+  UnregisteredBuilderError,
+} from "@opendatalabs/personal-server-ts-core/errors";
+import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
+import type {
+  DataStoragePort,
+  ProtocolGatewayPort,
+} from "@opendatalabs/personal-server-ts-core/ports";
+import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
+import {
+  verifyDataReadPolicy,
+  verifySignedArtifacts,
+} from "@opendatalabs/personal-server-ts-core/policy";
+import type { ScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
+import {
+  parseWeb3SignedHeader,
+  verifyWeb3Signed,
+  type DataPortabilityGatewayConfig,
+} from "@opendatalabs/vana-sdk/node";
+import {
+  canonicalJobRequestBytes,
+  sealJobResultStream,
+} from "@opendatalabs/vana-sdk/crypto/envelope/job";
+import {
+  JOB_PROTOCOL_VERSION,
+  type JobRequestEnvelope,
+  type JobResult,
+} from "@opendatalabs/vana-sdk/protocol/jobs";
+import type { ECIESProvider } from "@opendatalabs/vana-sdk/crypto/ecies/interface";
+import type { Logger } from "pino";
+import { isAddressEqual, type Address, type Hex } from "viem";
+import { publicKeyToAddress } from "viem/accounts";
+import type { JobExecuteResponse, JobFailureCode } from "./types.js";
+import { openRedactedEnvelopeStream } from "./raw-envelope-stream.js";
+
+const RAW_READ = "raw_read";
+const EXECUTE_PATH = "/v1/jobs/execute";
+const POST = "POST";
+const JSON_CONTENT_TYPE = "application/json";
+const UNKNOWN_METADATA = "unknown";
+const MILLISECONDS_PER_SECOND = 1_000;
+// Mirrors the SDK's own Web3Signed clock skew allowance.
+const AUTH_CLOCK_SKEW_SECONDS = 60;
+const JOB_EXECUTION_FAILED_LOG = "Enclave job execution failed";
+const JOB_EXECUTION_PROGRESS_LOG = "Enclave job execution progress";
+const JOB_SCOPE_HYDRATION_FAILED_LOG = "Job scope hydration failed";
+const RESULT_SIGNING_PATH = "/agent/v1/job-results/sign";
+const RESULT_SIGNING_TIMEOUT_MS = 15_000;
+const RESULT_UPLOAD_TIMEOUT_MS = 120_000;
+const RESULT_OBJECT_PREFIX = "jobresults";
+const BYTES_PER_MIB = 1024 * 1024;
+export const DEFAULT_JOB_RESULT_MAX_BYTES = 64 * BYTES_PER_MIB;
+const PUT = "PUT";
+const JOB_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export interface JobWorkerDeps {
+  serverOwner: Address;
+  serverAddress: Address;
+  serverPublicKey: Hex;
+  authAudience: string;
+  gateway: ProtocolGatewayPort;
+  gatewayConfig: DataPortabilityGatewayConfig;
+  storage: DataStoragePort;
+  ecies: ECIESProvider;
+  now?: () => Date;
+  logger: Logger;
+  accessLogWriter: AccessLogWriter;
+  scopeDeletions?: ScopeDeletionTracker;
+  /** Refresh one exact scope before retrying a local read selection. */
+  hydrateScope?: (scope: string) => Promise<void>;
+  resultMaxBytes?: number;
+  resultTempDir?: string;
+  resultUpload: {
+    storageEndpoint: string;
+    agentEndpoint: string;
+    accessToken: string;
+    chainId: number;
+    fetch?: typeof fetch;
+  };
+}
+
+export class JobFailure extends Error {
+  constructor(
+    public readonly code: JobFailureCode,
+    message: string,
+    public readonly retryable: boolean,
+  ) {
+    super(message);
+    this.name = "JobFailure";
+  }
+}
+
+export async function executeJob(
+  envelope: JobRequestEnvelope,
+  deps: JobWorkerDeps,
+): Promise<JobExecuteResponse> {
+  try {
+    return await executeJobUnsafe(envelope, deps);
+  } catch (error) {
+    if (error instanceof JobFailure) {
+      throw error;
+    }
+
+    deps.logger.warn(
+      { jobId: envelope.request.jobId, error: errorSummary(error) },
+      JOB_EXECUTION_FAILED_LOG,
+    );
+    throw new JobFailure("INTERNAL", "job execution failed", true);
+  }
+}
+
+async function executeJobUnsafe(
+  envelope: JobRequestEnvelope,
+  deps: JobWorkerDeps,
+): Promise<JobExecuteResponse> {
+  const { request } = envelope;
+  const executionStartedAt = performance.now();
+  if (request.v !== JOB_PROTOCOL_VERSION) {
+    throw new JobFailure("INTERNAL", "protocol version not supported", false);
+  }
+  if (request.operation !== RAW_READ) {
+    throw new JobFailure("INTERNAL", "operation not supported", false);
+  }
+  const jobId = normalizeJobId(request.jobId);
+
+  const now = deps.now?.() ?? new Date();
+  if (!validDeadline(request.deadline, now)) {
+    throw new JobFailure("DEADLINE_PASSED", "job deadline passed", false);
+  }
+
+  const auth = await verifyJobAuth(envelope, deps.authAudience, now);
+  if (!sameAddress(auth.signer, request.builder)) {
+    throw new JobFailure(
+      "BUILDER_MISMATCH",
+      "builder identity mismatch",
+      false,
+    );
+  }
+  if (!sameAddress(request.owner, deps.serverOwner)) {
+    throw new JobFailure("OWNER_MISMATCH", "job owner mismatch", false);
+  }
+
+  let grant;
+  try {
+    grant = await verifyDataReadPolicy(
+      {
+        signer: request.builder,
+        grantId: request.grantId,
+        requestedScope: request.scope,
+        serverOwner: deps.serverOwner,
+      },
+      { authSessionVerifier: deps.gateway, grantVerifier: deps.gateway },
+    );
+  } catch (error) {
+    throw mapPolicyFailure(error);
+  }
+
+  const builder = await deps.gateway.getBuilder(request.builder);
+  if (!builder) {
+    throw new JobFailure(
+      "BUILDER_MISMATCH",
+      "builder is not registered",
+      false,
+    );
+  }
+  try {
+    await verifySignedArtifacts({
+      grant,
+      builder,
+      gatewayConfig: deps.gatewayConfig,
+      ownerAddress: deps.serverOwner,
+    });
+  } catch (error) {
+    throw mapArtifactFailure(error);
+  }
+
+  let builderKeyAddress: Address;
+  try {
+    builderKeyAddress = publicKeyToAddress(builder.publicKey as Hex);
+  } catch {
+    throw new JobFailure(
+      "SIGNED_ARTIFACT_INVALID",
+      "builder public key is invalid",
+      false,
+    );
+  }
+  if (
+    !sameAddress(builderKeyAddress, request.builder) ||
+    builder.publicKey.toLowerCase() !== request.builderPublicKey.toLowerCase()
+  ) {
+    throw new JobFailure("BUILDER_MISMATCH", "builder key mismatch", false);
+  }
+
+  const registration = await deps.gateway.getServer(deps.serverAddress);
+  if (
+    !registration ||
+    registration.revokedAt !== null ||
+    !sameAddress(registration.ownerAddress, deps.serverOwner) ||
+    registration.publicKey.toLowerCase() !== deps.serverPublicKey.toLowerCase()
+  ) {
+    throw new JobFailure(
+      "SERVER_NOT_REGISTERED",
+      "server registration is invalid",
+      false,
+    );
+  }
+
+  let hydrationAttempted = false;
+  let entry = deps.storage.findEntry({ scope: request.scope });
+  if (!entry && deps.hydrateScope) {
+    hydrationAttempted = true;
+    try {
+      await deps.hydrateScope(request.scope);
+      entry = deps.storage.findEntry({ scope: request.scope });
+    } catch (error) {
+      deps.logger.warn(
+        { jobId, scope: request.scope, error: errorSummary(error) },
+        JOB_SCOPE_HYDRATION_FAILED_LOG,
+      );
+    }
+  }
+
+  const resultMaxBytes =
+    deps.resultMaxBytes ??
+    readJobResultMaxBytes(process.env.JOB_RESULT_MAX_BYTES);
+  let selected = await selectJobScope(
+    deps,
+    request.scope,
+    entry,
+    resultMaxBytes,
+  );
+  if (
+    request.pinnedVersion !== null &&
+    String(selected.localVersion) !== request.pinnedVersion &&
+    deps.hydrateScope &&
+    !hydrationAttempted
+  ) {
+    hydrationAttempted = true;
+    try {
+      await deps.hydrateScope(request.scope);
+      entry = deps.storage.findEntry({ scope: request.scope });
+      selected = await selectJobScope(
+        deps,
+        request.scope,
+        entry,
+        resultMaxBytes,
+      );
+    } catch (error) {
+      deps.logger.warn(
+        { jobId, scope: request.scope, error: errorSummary(error) },
+        JOB_SCOPE_HYDRATION_FAILED_LOG,
+      );
+    }
+  }
+  if (
+    request.pinnedVersion !== null &&
+    String(selected.localVersion) !== request.pinnedVersion
+  ) {
+    throw new JobFailure("VERSION_MISMATCH", "scope version mismatch", true);
+  }
+
+  const result: Omit<JobResult, "body"> = {
+    v: JOB_PROTOCOL_VERSION,
+    jobId,
+    scope: request.scope,
+    version: selected.localVersion === 0 ? null : String(selected.localVersion),
+    contentType: JSON_CONTENT_TYPE,
+  };
+  const body = await openRawReadBodyStream(
+    deps.storage,
+    request.scope,
+    selected.entry,
+  );
+  const sealed = await sealJobResultStream(
+    result,
+    request.builderPublicKey,
+    deps.ecies,
+  );
+  const tempRoot =
+    deps.resultTempDir ?? process.env.PERSONAL_SERVER_ROOT_PATH ?? tmpdir();
+  await mkdir(tempRoot, { recursive: true });
+  const tempDirectory = await mkdtemp(join(tempRoot, ".job-result-"));
+  const sealedPath = join(tempDirectory, "sealed.bin");
+  try {
+    let payloadBytes = 0;
+    const countedBody = body.pipeThrough(
+      new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+          payloadBytes += chunk.byteLength;
+          controller.enqueue(chunk);
+        },
+      }),
+    );
+    const { digest, byteLength: resultSize } = await writeSealedResult(
+      sealedPath,
+      sealed.header,
+      countedBody.pipeThrough(sealed.transform),
+    );
+    logExecutionStep(deps, jobId, "read", executionStartedAt, {
+      payloadBytes,
+    });
+    logExecutionStep(deps, jobId, "seal", executionStartedAt, {
+      sealedBytes: resultSize,
+    });
+    const resultHash = `0x${digest}` as Hex;
+    const encodedJobId = encodeURIComponent(jobId);
+    const owner = deps.serverOwner.toLowerCase();
+    const resultObjectKey = `${RESULT_OBJECT_PREFIX}/${deps.resultUpload.chainId}/${encodedJobId}`;
+    const uploadPath = `/v1/job-results/${deps.resultUpload.chainId}/${owner}/${encodedJobId}`;
+    const requestFetch = deps.resultUpload.fetch ?? fetch;
+    logExecutionStep(deps, jobId, "sign", executionStartedAt);
+    const authorization = await requestUploadSignature(requestFetch, {
+      agentEndpoint: deps.resultUpload.agentEndpoint,
+      accessToken: deps.resultUpload.accessToken,
+      jobId,
+      chainId: deps.resultUpload.chainId,
+      owner: deps.serverOwner,
+      byteLength: resultSize,
+      bodyHash: `sha256:${digest}`,
+    });
+    logExecutionStep(deps, jobId, "upload", executionStartedAt);
+    await uploadResult(requestFetch, {
+      storageEndpoint: deps.resultUpload.storageEndpoint,
+      path: uploadPath,
+      authorization,
+      filePath: sealedPath,
+      byteLength: resultSize,
+    });
+
+    await deps.accessLogWriter.write({
+      logId: randomUUID(),
+      grantId: request.grantId,
+      builder: request.builder,
+      action: "read",
+      scope: request.scope,
+      timestamp: now.toISOString(),
+      ipAddress: UNKNOWN_METADATA,
+      userAgent: UNKNOWN_METADATA,
+    });
+    deps.logger.info(
+      {
+        jobId: request.jobId,
+        scope: request.scope,
+        version: selected.localVersion,
+      },
+      "Enclave job read served",
+    );
+    logExecutionStep(deps, jobId, "done", executionStartedAt);
+
+    return { resultObjectKey, resultHash, resultSize };
+  } finally {
+    await rm(tempDirectory, { recursive: true, force: true });
+  }
+}
+
+interface SelectedJobScope {
+  entry: IndexEntry;
+  localVersion: number;
+}
+
+async function selectJobScope(
+  deps: JobWorkerDeps,
+  scope: string,
+  entry: IndexEntry | undefined,
+  resultMaxBytes: number,
+): Promise<SelectedJobScope> {
+  try {
+    await assertScopeNotDeleted(
+      { scopeDeletions: deps.scopeDeletions, serverOwner: deps.serverOwner },
+      scope,
+      entry,
+    );
+  } catch (error) {
+    if (error instanceof DataDeletedError) {
+      throw new JobFailure("SCOPE_NOT_FOUND", "scope not found", false);
+    }
+
+    throw error;
+  }
+  if (!entry) {
+    throw new JobFailure("SCOPE_NOT_FOUND", "scope not found", false);
+  }
+  if (entry.sizeBytes > resultMaxBytes) {
+    throw new JobFailure(
+      "RESULT_TOO_LARGE",
+      `job result is ${entry.sizeBytes} bytes; limit is ${resultMaxBytes} bytes`,
+      false,
+    );
+  }
+
+  const localVersion = await deps.storage.findLatestVersionByScope(scope);
+
+  return { entry, localVersion };
+}
+
+export function readJobResultMaxBytes(value: string | undefined): number {
+  if (value === undefined) return DEFAULT_JOB_RESULT_MAX_BYTES;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error("JOB_RESULT_MAX_BYTES must be a positive safe integer");
+  }
+  return parsed;
+}
+
+async function openRawReadBodyStream(
+  storage: DataStoragePort,
+  scope: string,
+  entry: { collectedAt: string },
+): Promise<ReadableStream<Uint8Array>> {
+  if (storage.readEnvelopeStream) {
+    return openRedactedEnvelopeStream(() =>
+      storage.readEnvelopeStream!(scope, entry.collectedAt),
+    );
+  }
+  if (storage.readEnvelopeBytes) {
+    const bytes = redactJsonEnvelopeBytesForGrantee(
+      await storage.readEnvelopeBytes(scope, entry.collectedAt),
+    );
+    return oneChunkStream(bytes);
+  }
+  const read = await readDataContract({ storage, scopeParam: scope });
+  if (!read.ok) {
+    throw new JobFailure("SCOPE_NOT_FOUND", "scope not found", false);
+  }
+  return oneChunkStream(
+    new TextEncoder().encode(
+      JSON.stringify(redactEnvelopeForGrantee(read.envelope)),
+    ),
+  );
+}
+
+function oneChunkStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+}
+
+async function writeSealedResult(
+  path: string,
+  header: Uint8Array,
+  ciphertext: ReadableStream<Uint8Array>,
+): Promise<{ digest: string; byteLength: number }> {
+  const hash = createHash("sha256");
+  let byteLength = 0;
+  const meter = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      hash.update(chunk);
+      byteLength += chunk.byteLength;
+      callback(null, chunk);
+    },
+  });
+  const source = Readable.from(
+    (async function* () {
+      yield header;
+      for await (const chunk of Readable.fromWeb(ciphertext as never)) {
+        yield chunk;
+      }
+    })(),
+  );
+  await pipeline(source, meter, createWriteStream(path));
+  return { digest: hash.digest("hex"), byteLength };
+}
+
+function logExecutionStep(
+  deps: JobWorkerDeps,
+  jobId: string,
+  event: "read" | "seal" | "sign" | "upload" | "done",
+  startedAt: number,
+  details: Record<string, unknown> = {},
+): void {
+  const memory = process.memoryUsage();
+  deps.logger.info(
+    {
+      jobId,
+      stage: "execute",
+      event,
+      elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      rssMiB: Math.round(memory.rss / BYTES_PER_MIB),
+      heapUsedMiB: Math.round(memory.heapUsed / BYTES_PER_MIB),
+      arrayBuffersMiB: Math.round(memory.arrayBuffers / BYTES_PER_MIB),
+      ...details,
+    },
+    JOB_EXECUTION_PROGRESS_LOG,
+  );
+}
+
+interface UploadSignatureRequest {
+  agentEndpoint: string;
+  accessToken: string;
+  jobId: string;
+  chainId: number;
+  owner: Address;
+  byteLength: number;
+  bodyHash: string;
+}
+
+async function requestUploadSignature(
+  requestFetch: typeof fetch,
+  request: UploadSignatureRequest,
+): Promise<string> {
+  let response: Response;
+  const timeoutSignal = AbortSignal.timeout(RESULT_SIGNING_TIMEOUT_MS);
+  try {
+    response = await requestFetch(
+      `${request.agentEndpoint.replace(/\/$/, "")}${RESULT_SIGNING_PATH}`,
+      {
+        method: POST,
+        headers: {
+          Authorization: `Bearer ${request.accessToken}`,
+          "Content-Type": JSON_CONTENT_TYPE,
+        },
+        body: JSON.stringify({
+          jobId: request.jobId,
+          chainId: request.chainId,
+          owner: request.owner,
+          byteLength: request.byteLength,
+          bodyHash: request.bodyHash,
+        }),
+        signal: timeoutSignal,
+      },
+    );
+  } catch {
+    if (timeoutSignal.aborted) {
+      throw new JobFailure(
+        "RESULT_UPLOAD_FAILED",
+        `result signing request timed out after ${RESULT_SIGNING_TIMEOUT_MS}ms`,
+        true,
+      );
+    }
+    throw new JobFailure(
+      "RESULT_UPLOAD_FAILED",
+      "result signing service is unavailable",
+      true,
+    );
+  }
+  if (!response.ok) {
+    if (response.status >= 500) {
+      throw new JobFailure(
+        "RESULT_UPLOAD_FAILED",
+        "result signing service is unavailable",
+        true,
+      );
+    }
+    throw new JobFailure(
+      "RESULT_SIGNING_REFUSED",
+      "result upload signing was refused",
+      false,
+    );
+  }
+
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    if (timeoutSignal.aborted) {
+      throw new JobFailure(
+        "RESULT_UPLOAD_FAILED",
+        `result signing request timed out after ${RESULT_SIGNING_TIMEOUT_MS}ms`,
+        true,
+      );
+    }
+    body = undefined;
+  }
+  if (
+    !body ||
+    typeof body !== "object" ||
+    !("authorization" in body) ||
+    typeof body.authorization !== "string" ||
+    !body.authorization.startsWith("Web3Signed ")
+  ) {
+    throw new JobFailure(
+      "RESULT_SIGNING_REFUSED",
+      "result upload signing response is invalid",
+      false,
+    );
+  }
+
+  return body.authorization;
+}
+
+interface ResultUploadRequest {
+  storageEndpoint: string;
+  path: string;
+  authorization: string;
+  filePath: string;
+  byteLength: number;
+}
+
+async function uploadResult(
+  requestFetch: typeof fetch,
+  request: ResultUploadRequest,
+): Promise<void> {
+  let response: Response;
+  const timeoutSignal = AbortSignal.timeout(RESULT_UPLOAD_TIMEOUT_MS);
+  const body = createReadStream(request.filePath);
+  try {
+    const storageOrigin = new URL(request.storageEndpoint).origin;
+    response = await requestFetch(`${storageOrigin}${request.path}`, {
+      method: PUT,
+      headers: {
+        Authorization: request.authorization,
+        "Content-Type": "application/octet-stream",
+        "Content-Length": String(request.byteLength),
+      },
+      body,
+      duplex: "half",
+      signal: timeoutSignal,
+    } as unknown as RequestInit & { duplex: "half" });
+  } catch {
+    if (timeoutSignal.aborted) {
+      throw new JobFailure(
+        "RESULT_UPLOAD_FAILED",
+        `result upload timed out after ${RESULT_UPLOAD_TIMEOUT_MS}ms`,
+        true,
+      );
+    }
+    throw new JobFailure("RESULT_UPLOAD_FAILED", "result upload failed", true);
+  } finally {
+    body.destroy();
+  }
+  if (response.status === 413) {
+    throw new JobFailure(
+      "RESULT_TOO_LARGE",
+      "sealed result exceeds the 100 MB storage limit",
+      false,
+    );
+  }
+  if (!response.ok) {
+    throw new JobFailure(
+      "RESULT_UPLOAD_FAILED",
+      "result upload failed",
+      response.status >= 500,
+    );
+  }
+}
+
+/**
+ * Verify the builder's inner Web3Signed proof over the decrypted job request.
+ *
+ * The proof carries the SDK's 300 s request TTL, which is sized for a live HTTP
+ * call. A job is signed at submit and verified here at claim, and the Gateway
+ * queues a job whenever the fleet is full: a 6-owner burst on a 4-slot fleet
+ * held two jobs for 391 s while a worker booted, past 300 s + 60 s skew, so an
+ * authorization the Gateway had accepted expired in the queue.
+ *
+ *     submit ──── queued (scale-up) ──── claim ──── execute
+ *       │ iat                             │ 391 s later
+ *       └── freshness proven HERE, once ──┘   binding proven here
+ *
+ * So freshness is anchored to the builder-signed `iat`, not to the claim clock —
+ * queue time never counts. Everything the proof binds (signer, audience, method,
+ * path, body hash over the canonical request) is still verified against this
+ * claim, and a proof dated in the future is still refused. The execution bound
+ * stays `request.deadline`: builder-signed, capped by the Gateway at submit, and
+ * checked against the real clock by {@link validDeadline}.
+ */
+async function verifyJobAuth(
+  envelope: JobRequestEnvelope,
+  authAudience: string,
+  now: Date,
+): Promise<{ signer: Address }> {
+  const nowSeconds = Math.floor(now.getTime() / MILLISECONDS_PER_SECOND);
+
+  try {
+    const { payload } = parseWeb3SignedHeader(envelope.auth);
+    if (payload.iat > nowSeconds + AUTH_CLOCK_SKEW_SECONDS) {
+      throw new Error("job authorization is issued in the future");
+    }
+
+    // aud = Gateway origin; contract section 1 step 1 amendment.
+    return await verifyWeb3Signed({
+      headerValue: envelope.auth,
+      expectedOrigin: authAudience,
+      expectedMethod: POST,
+      expectedPath: EXECUTE_PATH,
+      bodyBytes: canonicalJobRequestBytes(envelope.request),
+      now: payload.iat,
+    });
+  } catch {
+    throw new JobFailure("AUTH_INVALID", "job authorization is invalid", false);
+  }
+}
+
+function normalizeJobId(jobId: string): string {
+  if (!JOB_ID_PATTERN.test(jobId)) {
+    throw new JobFailure("INTERNAL", "job id is invalid", false);
+  }
+
+  return jobId.toLowerCase();
+}
+
+function mapPolicyFailure(error: unknown): JobFailure {
+  if (error instanceof GrantRevokedError) {
+    return new JobFailure("GRANT_REVOKED", "grant is revoked", false);
+  }
+  if (
+    error instanceof InvalidSignatureError ||
+    error instanceof UnregisteredBuilderError
+  ) {
+    return new JobFailure(
+      "BUILDER_MISMATCH",
+      "builder is not authorized",
+      false,
+    );
+  }
+  if (error instanceof ProtocolError) {
+    return new JobFailure("GRANT_INVALID", "grant is invalid", false);
+  }
+
+  return new JobFailure("INTERNAL", "policy verification failed", true);
+}
+
+function mapArtifactFailure(error: unknown): JobFailure {
+  if (error instanceof SignedArtifactMissingError) {
+    return new JobFailure(
+      "SIGNED_ARTIFACT_MISSING",
+      "signed artifact is missing",
+      false,
+    );
+  }
+  if (error instanceof GrantRevokedError) {
+    return new JobFailure("GRANT_REVOKED", "grant is revoked", false);
+  }
+  if (error instanceof SignedArtifactInvalidError) {
+    return new JobFailure(
+      "SIGNED_ARTIFACT_INVALID",
+      "signed artifact is invalid",
+      false,
+    );
+  }
+  if (error instanceof ProtocolError) {
+    return new JobFailure(
+      "SIGNED_ARTIFACT_INVALID",
+      "signed artifact is invalid",
+      false,
+    );
+  }
+
+  return new JobFailure("INTERNAL", "artifact verification failed", true);
+}
+
+function errorSummary(error: unknown): string {
+  return error instanceof Error
+    ? `${error.name}: ${error.message}`
+    : String(error);
+}
+
+function validDeadline(deadline: string, now: Date): boolean {
+  const timestamp = Date.parse(deadline);
+
+  return Number.isFinite(timestamp) && timestamp > now.getTime();
+}
+
+function sameAddress(left: string, right: string): boolean {
+  try {
+    return isAddressEqual(left as Address, right as Address);
+  } catch {
+    return false;
+  }
+}

@@ -1,0 +1,95 @@
+# Moksha worker role. Replace all REPLACE_WITH_ markers before deployment.
+# Both workers must remain in the existing worker app/KMS domain.
+# Sign the complete worker config; include MCP only for the preserved source.
+# Never expose the public verification key as an externally allowed environment value.
+# Both services run prebuilt digest-pinned images; nothing is fetched or built
+# at boot. AGENT_IMAGE and RUNTIME_IMAGE come from the branch's images.env.
+services:
+  agent:
+    image: REPLACE_WITH_REVIEWED_AGENT_IMAGE_DIGEST
+    restart: unless-stopped
+    stop_grace_period: 120s
+    working_dir: /app
+    ports:
+      - 8787:8787
+      - 8789:8789
+    environment:
+      - FLEET_CONFIG_PUBLIC_KEY=REPLACE_WITH_OPERATOR_ED25519_SPKI_BASE64
+      - FLEET_SIGNED_CONFIG
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - mcp-state:/mcp-state
+    # The agent must not run against a half-configured runtime. Starting on
+    # service_started alone cost every dstack guest-agent /Info ~15 s on the
+    # 2026-09-11 fleet (0.3 s before the roll), over the Gateway's 15 s identity
+    # budget. The dead end that motivated service_started is closed by the
+    # converging healthcheck below instead of by dropping the gate.
+    depends_on:
+      sandbox-runtime:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        date -u +%FT%TZ
+        PS_IMAGE='REPLACE_WITH_REVIEWED_PS_IMAGE_DIGEST'
+        # GIT_REF records the source commit the agent image was built from.
+        # It is measured provenance only; no checkout happens here.
+        GIT_REF='REPLACE_WITH_REVIEWED_40_HEX_COMMIT'
+        echo "$$GIT_REF" | grep -Eq '^[0-9a-f]{40}$$'
+        echo "$$PS_IMAGE" | grep -Eq '^.+@sha256:[0-9a-f]{64}$$'
+        for pull_attempt in 1 2 3; do
+          if docker --host=tcp://sandbox-runtime:2375 pull "$$PS_IMAGE"; then
+            break
+          fi
+          if [ "$$pull_attempt" -eq 3 ]; then
+            echo "Failed to pull PS_IMAGE after 3 attempts: $$PS_IMAGE" >&2
+            exit 1
+          fi
+          echo "Failed to pull PS_IMAGE (attempt $$pull_attempt of 3); retrying in 10 seconds" >&2
+          sleep 10
+        done
+        date -u +%FT%TZ
+        exec node packages/enclave/dist/agent/main.js
+  sandbox-runtime:
+    image: REPLACE_WITH_REVIEWED_RUNTIME_IMAGE_DIGEST
+    restart: unless-stopped
+    privileged: true
+    cgroup: host
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        runtime_host="$$(ip -4 addr show eth0 | awk '/inet / { sub(/\/.*/, "", $$2); print $$2; exit }')"
+        if [ -z "$${runtime_host}" ]; then
+          echo "Could not resolve the compose-network address; falling back to 0.0.0.0" >&2
+          runtime_host=0.0.0.0
+        fi
+        # These rules deny nested sandboxes access to the unauthenticated Docker API.
+        # --icc=false separately denies direct traffic between sandbox containers.
+        iptables -I INPUT -i docker0 -p tcp --dport 2375 -j DROP
+        iptables -I INPUT -i br-+ -p tcp --dport 2375 -j DROP
+        # This entrypoint owns the new PID namespace; an abrupt CVM stop can leave
+        # both daemon PID files in the retained container filesystem.
+        rm -f /var/run/docker.pid /var/run/docker/containerd/containerd.pid
+        exec dockerd --host="tcp://$${runtime_host}:2375" --host=unix:///var/run/docker.sock --tls=false --storage-driver=overlay2 --icc=false
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - runtime_host="$$(ip -4 addr show eth0 | awk '/inet / { sub(/\/.*/, "", $$2); print $$2; exit }')" && test -n "$${runtime_host}" && docker --host="tcp://$${runtime_host}:2375" info
+      # dstack runs `docker compose up -d` from a oneshot unit with no Restart=,
+      # so an unhealthy runtime fails the whole `up`, the agent container is
+      # never created, and nothing retries — the 2026-09-04 brick. Failures
+      # inside start_period never count against retries, so this budget waits
+      # 120 s + 60 x 5 s = 7 min for a slow dockerd before declaring it
+      # unhealthy. A runtime that never comes up is a broken image, which no
+      # start policy fixes.
+      interval: 5s
+      timeout: 2s
+      retries: 60
+      start_period: 120s
+volumes:
+  mcp-state: null

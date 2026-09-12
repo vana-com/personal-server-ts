@@ -31,12 +31,29 @@ import type {
   McpOAuthAuthorizationRecord,
   McpOAuthAuthorizationStore,
 } from "./types.js";
+import {
+  isMcpRefreshExpired,
+  MCP_TOKEN_TTL_MS,
+  mcpRefreshExpiry,
+  mcpTokenExpiry,
+} from "./token-expiry.js";
 
 const TOKEN_BYTES = 32;
 const OAUTH_AUTHORIZATION_TTL_MS = 10 * 60 * 1000;
 
+/** Store patch that drops every refresh token a connection still answers to. */
+const CLEARED_REFRESH_FAMILY = {
+  refreshTokenHash: undefined,
+  previousRefreshTokenHash: undefined,
+  refreshExpiresAt: undefined,
+} as const;
+
 function nowIso(now?: () => Date): string {
   return (now ? now() : new Date()).toISOString();
+}
+
+function nowMs(now?: () => Date): number {
+  return (now ? now() : new Date()).getTime();
 }
 
 function randomBytes(byteLength: number): Uint8Array {
@@ -116,6 +133,7 @@ export async function createMcpConnection(
     granteePublicKey: grantee.key.publicKey,
     encryptedGranteePrivateKey: grantee.key.encryptedPrivateKey,
     tokenHash,
+    tokenExpiresAt: mcpTokenExpiry(nowMs(options.now)),
     status: "pending",
     grants: [],
     createdAt,
@@ -222,9 +240,12 @@ export async function revokeMcpConnection(
   if (!existing) throw new McpConnectionNotFoundError(connectionId);
   if (existing.status === "revoked") return existing;
   const revokedAt = nowIso(options.now);
+  // The refresh token outlives the access token by weeks, so a revoke that
+  // left it in place would hand the holder a fresh bearer minutes later.
   const updated = await options.store.update(connectionId, {
     status: "revoked",
     revokedAt,
+    ...CLEARED_REFRESH_FAMILY,
   });
   if (!updated) throw new McpConnectionNotFoundError(connectionId);
   return updated;
@@ -594,10 +615,16 @@ export interface RedeemMcpOAuthAuthorizationCodeOptions {
   now?: () => Date;
 }
 
-export interface RedeemMcpOAuthAuthorizationCodeOutput {
+export interface McpOAuthTokenOutput {
   accessToken: string;
+  /** Presented to `grant_type=refresh_token` for the next pair. Single use. */
+  refreshToken: string;
+  /** Seconds until the bearer stops resolving — RFC 6749 `expires_in`. */
+  expiresIn: number;
   scope?: string;
 }
+
+export type RedeemMcpOAuthAuthorizationCodeOutput = McpOAuthTokenOutput;
 
 export async function redeemMcpOAuthAuthorizationCode(
   input: RedeemMcpOAuthAuthorizationCodeInput,
@@ -650,15 +677,15 @@ export async function redeemMcpOAuthAuthorizationCode(
     );
   }
 
-  const accessToken = randomToken();
-  const tokenHash = await hashConnectionToken(accessToken);
-  const updatedConnection = await options.connectionStore.update(
-    record.connectionId,
+  const issued = await issueMcpTokenPair(
     {
-      tokenHash,
+      connectionId: record.connectionId,
+      clientId: record.clientId,
+      issuedAtMs: nowMs(options.now),
     },
+    options.connectionStore,
   );
-  if (!updatedConnection) {
+  if (!issued) {
     throw new McpOAuthAuthorizationError(
       "invalid_grant",
       "MCP connection for authorization no longer exists",
@@ -671,9 +698,130 @@ export async function redeemMcpOAuthAuthorizationCode(
   });
 
   return {
-    accessToken,
+    ...issued,
     ...(record.scope ? { scope: record.scope } : {}),
   };
+}
+
+export interface RefreshMcpOAuthTokenInput {
+  refreshToken: string;
+  clientId: string;
+}
+
+export interface RefreshMcpOAuthTokenOptions {
+  connectionStore: McpConnectionStore;
+  now?: () => Date;
+}
+
+/**
+ * RFC 6749 §6 refresh grant with RFC 9700 §4.14.2 rotation: every exchange
+ * mints a new pair and retires the presented refresh token, so the MCP client
+ * renews silently instead of re-consenting once an hour.
+ */
+export async function refreshMcpOAuthToken(
+  input: RefreshMcpOAuthTokenInput,
+  options: RefreshMcpOAuthTokenOptions,
+): Promise<McpOAuthTokenOutput> {
+  const presentedHash = await hashMcpRefreshToken(input.refreshToken);
+  const connection =
+    await options.connectionStore.getByRefreshTokenHash(presentedHash);
+  if (!connection) {
+    throw new McpOAuthAuthorizationError(
+      "invalid_grant",
+      "Unknown MCP refresh token",
+    );
+  }
+
+  // Reuse detection. A rotated-out token still matching means two holders have
+  // the family — the legitimate client and a thief — and we cannot tell which
+  // one is calling, so the whole family dies. The access token keeps its own
+  // expiry: cutting it short would only punish the client that behaved.
+  if (connection.refreshTokenHash !== presentedHash) {
+    await options.connectionStore.update(connection.id, CLEARED_REFRESH_FAMILY);
+    throw new McpOAuthAuthorizationError(
+      "invalid_grant",
+      "MCP refresh token was already rotated; the refresh family is revoked",
+    );
+  }
+
+  if (connection.status !== "approved") {
+    throw new McpOAuthAuthorizationError(
+      "invalid_grant",
+      "MCP connection is not approved",
+    );
+  }
+  if (connection.clientId !== input.clientId) {
+    throw new McpOAuthAuthorizationError(
+      "invalid_grant",
+      "client_id does not match the issued refresh token",
+    );
+  }
+  if (isMcpRefreshExpired(connection, nowMs(options.now))) {
+    throw new McpOAuthAuthorizationError(
+      "invalid_grant",
+      "MCP refresh token expired",
+    );
+  }
+
+  const issued = await issueMcpTokenPair(
+    {
+      connectionId: connection.id,
+      clientId: input.clientId,
+      issuedAtMs: nowMs(options.now),
+      retiredRefreshHash: presentedHash,
+    },
+    options.connectionStore,
+  );
+  if (!issued) {
+    throw new McpOAuthAuthorizationError(
+      "invalid_grant",
+      "MCP connection no longer exists",
+    );
+  }
+
+  return issued;
+}
+
+interface IssueMcpTokenPairInput {
+  connectionId: string;
+  clientId: string;
+  issuedAtMs: number;
+  /** Hash of the refresh token this pair replaces, kept for reuse detection. */
+  retiredRefreshHash?: string;
+}
+
+/**
+ * Mint one access/refresh pair. The rotation is a single store `update`, so a
+ * concurrent refresh either sees the old pair or the new one — never a
+ * connection with the old refresh already dead and no new one issued.
+ */
+async function issueMcpTokenPair(
+  input: IssueMcpTokenPairInput,
+  store: McpConnectionStore,
+): Promise<Omit<McpOAuthTokenOutput, "scope"> | null> {
+  const accessToken = randomToken();
+  const refreshToken = randomToken();
+
+  const updated = await store.update(input.connectionId, {
+    clientId: input.clientId,
+    tokenHash: await hashConnectionToken(accessToken),
+    tokenExpiresAt: mcpTokenExpiry(input.issuedAtMs),
+    refreshTokenHash: await hashMcpRefreshToken(refreshToken),
+    previousRefreshTokenHash: input.retiredRefreshHash,
+    refreshExpiresAt: mcpRefreshExpiry(input.issuedAtMs),
+  });
+  if (!updated) return null;
+
+  return {
+    accessToken,
+    refreshToken,
+    expiresIn: Math.floor(MCP_TOKEN_TTL_MS / 1000),
+  };
+}
+
+/** Domain-separated so a refresh token can never resolve as a bearer. */
+async function hashMcpRefreshToken(token: string): Promise<string> {
+  return hashConnectionToken(`mcp-oauth-refresh:${token}`);
 }
 
 async function hashMcpOAuthAuthorizationCode(code: string): Promise<string> {

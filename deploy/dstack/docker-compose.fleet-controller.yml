@@ -1,0 +1,62 @@
+# Moksha central role. Replace all REPLACE_WITH markers with reviewed literals
+# before deployment. No executable/policy trust root comes from unmeasured env.
+# The signed runtime bundle permits staged reciprocal pins without a hash cycle.
+# This app MUST have a different app_id from workers.
+# One active controller only; flock fences duplicate processes sharing its volume.
+# The signed config selects lifecycle mode: MCP_MIGRATION_REQUIRED=0 for a
+# net-new empty MCP state, or 1 when a protected state import is required.
+# The controller runs the prebuilt enclave image (AGENT_IMAGE in images.env,
+# the same image the workers run); nothing is fetched or built at boot.
+services:
+  controller:
+    image: "REPLACE_WITH_REVIEWED_AGENT_IMAGE_DIGEST"
+    restart: unless-stopped
+    stop_grace_period: 120s
+    working_dir: /app
+    ports:
+      - "8790:8790"
+      - "8791:8791"
+      - "8792:8792"
+    environment:
+      - FLEET_CONFIG_PUBLIC_KEY=REPLACE_WITH_OPERATOR_ED25519_SPKI_BASE64
+      - FLEET_SIGNED_CONFIG
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - fleet-state:/fleet-state
+      - mcp-state:/mcp-state
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        # GIT_REF records the source commit the controller image was built from.
+        # It is measured provenance only; no checkout happens here.
+        GIT_REF='REPLACE_WITH_REVIEWED_40_HEX_COMMIT'
+        test "$${#GIT_REF}" -eq 40
+        case "$${GIT_REF}" in *[!0-9a-f]*) exit 1;; esac
+        mkdir -p /fleet-state
+        exec flock -n /fleet-state/controller.lock node packages/enclave/dist/central/main.js
+
+  mcp-tls:
+    image: dstacktee/dstack-ingress:2.5@sha256:97285855a83ce6682447eb1f36e59c1927b9188a51b213e34d79acadd8425c78
+    restart: unless-stopped
+    ports:
+      - "443:443"
+    environment:
+      - CHALLENGE_TYPE=tls-alpn-01
+      - DOMAIN=mcp-dev.vana.org
+      - TARGET_ENDPOINT=controller:8788
+      - GATEWAY_DOMAIN=_.dstack-pha-prod5.phala.network
+      - DNS_SETUP_MODE=wait
+      - DNS_SETUP_TIMEOUT=3600
+      - EVIDENCE_SERVER=true
+      - ALPN=http/1.1
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - mcp-certificates:/etc/letsencrypt
+      - mcp-evidence:/evidences
+
+volumes:
+  fleet-state:
+  mcp-state:
+  mcp-certificates:
+  mcp-evidence:

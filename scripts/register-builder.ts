@@ -58,7 +58,7 @@ async function main() {
     >[0]["domain"],
     types: BUILDER_REGISTRATION_TYPES,
     primaryType: "BuilderRegistration",
-    message: message as unknown as Record<string, unknown>,
+    message,
   });
 
   console.log("Registering builder with gateway...");

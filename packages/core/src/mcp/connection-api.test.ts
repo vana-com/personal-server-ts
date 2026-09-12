@@ -21,8 +21,10 @@ import {
   McpConnectionNotFoundError,
   McpConnectionStateError,
   redeemMcpOAuthAuthorizationCode,
+  refreshMcpOAuthToken,
   revokeMcpConnection,
 } from "./connection-api.js";
+import { MCP_REFRESH_TTL_MS, MCP_TOKEN_TTL_MS } from "./token-expiry.js";
 import { ensureMcpGranteeRegistered } from "./builder-registration.js";
 
 const PUBLIC_ORIGIN = "https://example-session.relay.test";
@@ -275,6 +277,68 @@ describe("mcp/connection-api", () => {
     ).rejects.toThrow(/already been used/i);
   });
 
+  it("expires the redeemed bearer after the TTL and fails closed without one", async () => {
+    const connectionStore = createInMemoryMcpConnectionStore();
+    const authorizationStore = createInMemoryMcpOAuthAuthorizationStore();
+    const codeVerifier = "correct-horse-battery-staple";
+
+    // Redeem far enough in the past that the minted expiry has already passed.
+    const stale = await redeemAt(
+      new Date(Date.now() - MCP_TOKEN_TTL_MS - 60_000),
+    );
+    expect(stale.token.expiresIn).toBe(MCP_TOKEN_TTL_MS / 1000);
+    expect(
+      await connectionStore.getByTokenHash(
+        await hashConnectionToken(stale.token.accessToken),
+      ),
+    ).toBeNull();
+
+    // A fresh redeem stamps issue + TTL and resolves.
+    const issuedAt = new Date();
+    const fresh = await redeemAt(issuedAt);
+    const hash = await hashConnectionToken(fresh.token.accessToken);
+    expect(await connectionStore.getByTokenHash(hash)).toMatchObject({
+      tokenExpiresAt: new Date(
+        issuedAt.getTime() + MCP_TOKEN_TTL_MS,
+      ).toISOString(),
+    });
+
+    // A record from before the field existed is expired on read, not forever.
+    await connectionStore.update(fresh.connectionId, {
+      tokenExpiresAt: undefined,
+    });
+    expect(await connectionStore.getByTokenHash(hash)).toBeNull();
+
+    async function redeemAt(now: Date) {
+      const created = await createMcpOAuthAuthorization(
+        {
+          clientId: "claude-client",
+          redirectUri: REDIRECT_URI,
+          codeChallenge: await pkceChallenge(codeVerifier),
+          codeChallengeMethod: "S256",
+        },
+        { connectionStore, authorizationStore, publicOrigin: PUBLIC_ORIGIN },
+      );
+      const approved = await approveMcpOAuthAuthorization(
+        {
+          authorizationId: created.authorizationId,
+          grants: [{ grantId: "grant-1", scopes: ["chatgpt.history"] }],
+        },
+        { connectionStore, authorizationStore },
+      );
+      const token = await redeemMcpOAuthAuthorizationCode(
+        {
+          authorizationCode: approved.authorizationCode,
+          codeVerifier,
+          clientId: "claude-client",
+          redirectUri: REDIRECT_URI,
+        },
+        { authorizationStore, connectionStore, now: () => now },
+      );
+      return { token, connectionId: created.connectionId };
+    }
+  });
+
   it("self-registers the generated MCP grantee when it is missing", async () => {
     const store = createInMemoryMcpConnectionStore();
     const created = await createMcpConnection(
@@ -315,4 +379,131 @@ describe("mcp/connection-api", () => {
       appUrl: "https://mcp-client.test",
     });
   });
+});
+
+describe("mcp/connection-api refresh grant", () => {
+  const CLIENT_ID = "claude-client";
+  const CODE_VERIFIER = "correct-horse-battery-staple";
+
+  it("redeem issues an access/refresh pair with a 1 h access TTL", async () => {
+    const { token } = await connect();
+
+    expect(token.expiresIn).toBe(3600);
+    expect(MCP_TOKEN_TTL_MS).toBe(3600 * 1000);
+    expect(token.refreshToken).toMatch(/^[A-Za-z0-9_-]{20,}$/);
+    expect(token.refreshToken).not.toBe(token.accessToken);
+  });
+
+  it("rotates the pair and retires the presented refresh token", async () => {
+    const { connectionStore, token } = await connect();
+
+    const rotated = await refreshMcpOAuthToken(
+      { refreshToken: token.refreshToken, clientId: CLIENT_ID },
+      { connectionStore },
+    );
+    expect(rotated.accessToken).not.toBe(token.accessToken);
+    expect(rotated.refreshToken).not.toBe(token.refreshToken);
+
+    // The new bearer resolves, and the new refresh token rotates again.
+    expect(
+      await connectionStore.getByTokenHash(
+        await hashConnectionToken(rotated.accessToken),
+      ),
+    ).toMatchObject({ status: "approved" });
+    await expect(
+      refreshMcpOAuthToken(
+        { refreshToken: rotated.refreshToken, clientId: CLIENT_ID },
+        { connectionStore },
+      ),
+    ).resolves.toMatchObject({ expiresIn: 3600 });
+  });
+
+  it("revokes the whole family when a rotated-out refresh token is replayed", async () => {
+    const { connectionStore, token } = await connect();
+
+    const rotated = await refreshMcpOAuthToken(
+      { refreshToken: token.refreshToken, clientId: CLIENT_ID },
+      { connectionStore },
+    );
+    await expect(
+      refreshMcpOAuthToken(
+        { refreshToken: token.refreshToken, clientId: CLIENT_ID },
+        { connectionStore },
+      ),
+    ).rejects.toThrow(/already rotated/i);
+
+    // Reuse detection kills the live refresh token too...
+    await expect(
+      refreshMcpOAuthToken(
+        { refreshToken: rotated.refreshToken, clientId: CLIENT_ID },
+        { connectionStore },
+      ),
+    ).rejects.toThrow(/unknown/i);
+
+    // ...but leaves the access token to its own expiry.
+    expect(
+      await connectionStore.getByTokenHash(
+        await hashConnectionToken(rotated.accessToken),
+      ),
+    ).toMatchObject({ status: "approved" });
+  });
+
+  it("rejects a refresh token that is mismatched, expired, or revoked", async () => {
+    const { connectionStore, connectionId, token } = await connect();
+
+    await expect(
+      refreshMcpOAuthToken(
+        { refreshToken: token.refreshToken, clientId: "someone-else" },
+        { connectionStore },
+      ),
+    ).rejects.toThrow(/client_id does not match/i);
+
+    const afterTtl = new Date(Date.now() + MCP_REFRESH_TTL_MS + 60_000);
+    await expect(
+      refreshMcpOAuthToken(
+        { refreshToken: token.refreshToken, clientId: CLIENT_ID },
+        { connectionStore, now: () => afterTtl },
+      ),
+    ).rejects.toThrow(/expired/i);
+
+    await revokeMcpConnection(connectionId, { store: connectionStore });
+    await expect(
+      refreshMcpOAuthToken(
+        { refreshToken: token.refreshToken, clientId: CLIENT_ID },
+        { connectionStore },
+      ),
+    ).rejects.toThrow(/unknown/i);
+  });
+
+  /** Full authorize → approve → redeem, returning the first token pair. */
+  async function connect() {
+    const connectionStore = createInMemoryMcpConnectionStore();
+    const authorizationStore = createInMemoryMcpOAuthAuthorizationStore();
+    const created = await createMcpOAuthAuthorization(
+      {
+        clientId: CLIENT_ID,
+        redirectUri: REDIRECT_URI,
+        codeChallenge: await pkceChallenge(CODE_VERIFIER),
+        codeChallengeMethod: "S256",
+      },
+      { connectionStore, authorizationStore, publicOrigin: PUBLIC_ORIGIN },
+    );
+    const approved = await approveMcpOAuthAuthorization(
+      {
+        authorizationId: created.authorizationId,
+        grants: [{ grantId: "grant-1", scopes: ["chatgpt.history"] }],
+      },
+      { connectionStore, authorizationStore },
+    );
+    const token = await redeemMcpOAuthAuthorizationCode(
+      {
+        authorizationCode: approved.authorizationCode,
+        codeVerifier: CODE_VERIFIER,
+        clientId: CLIENT_ID,
+        redirectUri: REDIRECT_URI,
+      },
+      { authorizationStore, connectionStore },
+    );
+    return { connectionStore, connectionId: created.connectionId, token };
+  }
 });

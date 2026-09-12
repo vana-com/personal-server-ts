@@ -26,11 +26,14 @@ import { grantsRoutes } from "./routes/grants.js";
 import { accessLogsRoutes } from "./routes/access-logs.js";
 import { syncRoutes } from "./routes/sync.js";
 import {
+  executeMcpConnectionRequest,
   mcpActivityRoutes,
   mcpConnectionsRoutes,
   mcpOAuthRoutes,
   mcpStreamableHttpRoutes,
 } from "./routes/mcp.js";
+import { enclaveMcpRoutes } from "./routes/enclave-mcp.js";
+import { enclaveFleetRoutes } from "./routes/enclave-fleet.js";
 import {
   McpActivityRecorder,
   createInMemoryMcpConnectionStore,
@@ -62,6 +65,9 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/ports";
 import type { TokenStore } from "./token-store.js";
 import type { Logger } from "pino";
+import { enclaveJobRoutes } from "./routes/enclave-jobs.js";
+import type { JobRequestEnvelope } from "@opendatalabs/vana-sdk/protocol/jobs";
+import type { JobExecuteResponse } from "./jobs/types.js";
 
 export interface IdentityInfo {
   address: `0x${string}`;
@@ -143,6 +149,7 @@ export interface AppDeps {
   mcpOAuthAuthorizationStore?: McpOAuthAuthorizationStore;
   mcpOAuthApprovalUrl?: string | (() => string);
   mcpActivityRecorder?: McpActivityRecorder;
+  mcpHydrateScopes?: (scopes: string[]) => Promise<void>;
   /**
    * Write API session store shared between POST /v1/write/session (which
    * mints tokens) and the ingest endpoint (which redeems them). Defaults to
@@ -154,6 +161,8 @@ export interface AppDeps {
    * in-memory store (api-auth); hosts may supply a shared one.
    */
   writeProofReplayStore?: WriteProofReplayStore;
+  profile?: "standard" | "enclave";
+  jobWorker?: (envelope: JobRequestEnvelope) => Promise<JobExecuteResponse>;
 }
 
 export function createApp(deps: AppDeps): Hono {
@@ -202,6 +211,16 @@ export function createApp(deps: AppDeps): Hono {
       runtimeAvailability: deps.runtimeAvailability,
     }),
   );
+
+  if (deps.profile === "enclave" && deps.jobWorker && deps.accessToken) {
+    app.route(
+      "/enclave/v1/jobs",
+      enclaveJobRoutes({
+        accessToken: deps.accessToken,
+        executeJob: deps.jobWorker,
+      }),
+    );
+  }
 
   // Mount data routes (ingest + read + delete)
   app.route(
@@ -375,6 +394,41 @@ export function createApp(deps: AppDeps): Hono {
   app.route("/v1/mcp/connections", mcpConnectionsRoutes(mcpRouteDeps));
   app.route("/v1/mcp/activity", mcpActivityRoutes(mcpRouteDeps));
   app.route("/mcp", mcpStreamableHttpRoutes(mcpRouteDeps));
+  if (deps.profile === "enclave" && deps.accessToken && deps.serverOwner) {
+    app.route(
+      "/enclave/v1/fleet",
+      enclaveFleetRoutes({
+        accessToken: deps.accessToken,
+        hydrate: async (scopes) => {
+          if (!deps.mcpHydrateScopes)
+            throw new Error("Scoped hydration unavailable");
+          await deps.mcpHydrateScopes(scopes);
+        },
+        observe: async (scope) => {
+          const storage = deps.dataStorage;
+          const entry = storage?.findEntry({ scope });
+          const ready =
+            entry && storage?.hasScopeBlocks
+              ? await storage.hasScopeBlocks(scope, entry.collectedAt)
+              : false;
+          return { dataVersion: entry?.version ?? null, ready };
+        },
+      }),
+    );
+    app.route(
+      "/enclave/v1/mcp",
+      enclaveMcpRoutes({
+        accessToken: deps.accessToken,
+        serverOwner: deps.serverOwner,
+        execute: async (request, connection) => {
+          await deps.mcpHydrateScopes?.([
+            ...new Set(connection.grants.flatMap((grant) => grant.scopes)),
+          ]);
+          return executeMcpConnectionRequest(request, connection, mcpRouteDeps);
+        },
+      }),
+    );
+  }
 
   // Mount login flow v2 routes (self-hosted CLI auth, no auth required)
   if (deps.tokenStore) {

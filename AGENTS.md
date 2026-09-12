@@ -2,8 +2,8 @@
 
 ## Repo shape
 
-- npm workspaces monorepo; use npm, not pnpm/yarn. Root build is `tsc --build` over `packages/core`, `packages/server`, `packages/cli`, and `scripts` via TS project references.
-- Package boundaries matter: `core` owns protocol/auth/grants/storage/keys/gateway/sync; `server` owns the Hono HTTP app and runtime bootstrap; `cli` is only a facade re-exporting core config and server bootstrap.
+- npm workspaces monorepo; use npm, not pnpm/yarn. Root build is `tsc --build` over `packages/core`, `packages/server`, `packages/cli`, `packages/enclave`, and `scripts` via TS project references.
+- Package boundaries matter: `core` owns protocol/auth/grants/storage/keys/gateway/sync; `server` owns the Hono HTTP app and runtime bootstrap; `cli` is only a facade re-exporting core config and server bootstrap; `enclave` owns the dstack port, deterministic identity, sealing and the node agent HTTP, and imports nothing from `core`/`server`.
 - Public API is controlled by package `exports`; update `packages/*/package.json` when moving exported files or subpaths.
 
 ## Commands that are easy to guess wrong

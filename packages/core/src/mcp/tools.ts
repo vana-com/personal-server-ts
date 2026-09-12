@@ -79,6 +79,10 @@ export interface McpToolDefinition {
   ): Promise<McpToolResult>;
 }
 
+/** Tool names the read path stamps onto access records. */
+const READ_SCOPE_TOOL = "read_scope";
+const SEARCH_PERSONAL_CONTEXT_TOOL = "search_personal_context";
+
 const STRUCTURED_CONTENT_TEXT_LIMIT_BYTES = 64 * 1024;
 const resultTextEncoder = new TextEncoder();
 
@@ -248,7 +252,7 @@ class OperationTimeoutError extends Error {
  * tool surface never offers Claude a scope its grant won't actually pass
  * server-side.
  */
-function resolveGrantForScope(
+export function resolveGrantForScope(
   connection: McpConnectionRecord,
   scope: string,
 ): { grantId: string; scopes: string[] } | null {
@@ -738,7 +742,7 @@ const requestScopeAccess: McpToolDefinition = {
 };
 
 const readScope: McpToolDefinition = {
-  name: "read_scope",
+  name: READ_SCOPE_TOOL,
   title: "Read scope",
   description:
     "Read approved scope blocks. Pass blockIds to fetch exact blocks; otherwise page with nextCursor.",
@@ -857,6 +861,7 @@ const readScope: McpToolDefinition = {
           cursor,
           maxBytes,
           payment,
+          tool: READ_SCOPE_TOOL,
           ...(blockIds.length > 0 ? { blockIds } : {}),
         }),
         timeoutMs,
@@ -1132,7 +1137,7 @@ function decodeSearchCursor(raw: string): SearchCursorPayload | null {
 }
 
 const searchPersonalContext: McpToolDefinition = {
-  name: "search_personal_context",
+  name: SEARCH_PERSONAL_CONTEXT_TOOL,
   title: "Search personal context",
   description:
     "Search approved scopes. Omit scopes for default sweep; name scopes for targeted search. Continue with nextSearchCursor. Free discovery/preview — it does not settle payments; chargeable scopes are returned in paymentRequiredScopes, fetch those via read_scope with a `payment` proof.",
@@ -1367,6 +1372,7 @@ const searchPersonalContext: McpToolDefinition = {
               grantId: grant.grantId,
               cursor,
               maxBytes,
+              tool: SEARCH_PERSONAL_CONTEXT_TOOL,
             }),
             perScopeTimeoutMs,
             `read blocks for ${scope}`,

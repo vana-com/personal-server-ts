@@ -360,6 +360,8 @@ export interface McpDataReadClient {
      */
     payment?: string;
     blockIds?: readonly string[];
+    /** MCP tool the read came from, stamped onto the served access record. */
+    tool?: string;
   }): Promise<McpDataReadBlocksResult>;
 
   /**
@@ -665,6 +667,7 @@ export function createMcpDataReadClient(
       maxBytes,
       payment,
       blockIds,
+      tool,
     }) {
       const storage = options.dataApiDeps.storage;
       if (!storage.readScopeBlocks) {
@@ -729,8 +732,11 @@ export function createMcpDataReadClient(
             grantId: authResult.grantId,
             ipAddress,
             logId,
+            outcome: "served",
             scope,
             servedAt: timestamp,
+            source: "mcp",
+            ...(tool ? { tool } : {}),
             userAgent,
           });
         }

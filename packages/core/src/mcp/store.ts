@@ -14,6 +14,7 @@ import type {
   McpOAuthAuthorizationRecord,
   McpOAuthAuthorizationStore,
 } from "./types.js";
+import { isMcpTokenExpired, matchesMcpRefreshHash } from "./token-expiry.js";
 
 export function createInMemoryMcpConnectionStore(): McpConnectionStore {
   const byId = new Map<string, McpConnectionRecord>();
@@ -43,7 +44,17 @@ export function createInMemoryMcpConnectionStore(): McpConnectionStore {
       const record = byId.get(id);
       if (!record) return null;
       if (record.status !== "approved") return null;
+      if (isMcpTokenExpired(record)) return null;
       return { ...record };
+    },
+
+    async getByRefreshTokenHash(refreshTokenHash) {
+      // Scanned, not indexed: a presented token may match either the current
+      // or the rotated-out hash, and a store holds a handful of connections.
+      const record = Array.from(byId.values()).find((candidate) =>
+        matchesMcpRefreshHash(candidate, refreshTokenHash),
+      );
+      return record ? { ...record } : null;
     },
 
     async update(id, patch) {

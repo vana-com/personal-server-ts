@@ -464,6 +464,28 @@ describe("createPsLiteRuntime + MCP OAuth routes", () => {
     expect(approvedConnection?.grants).toEqual([
       { grantId: "grant-mcp-1", scopes: ["chatgpt.history"] },
     ]);
+
+    // The Lite route rotates the pair too, so its 1 h bearer is not an hourly
+    // consent screen.
+    const refreshed = await bundle.runtime.fetch(
+      new Request(`${SERVER_ORIGIN}/mcp/oauth/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: tokenBody.refresh_token,
+          client_id: registered.client_id,
+        }),
+      }),
+    );
+    expect(refreshed.status).toBe(200);
+    const renewed = await refreshed.json();
+    expect(renewed.access_token).not.toBe(tokenBody.access_token);
+    expect(
+      await bundle.store.getByTokenHash(
+        await hashConnectionToken(renewed.access_token),
+      ),
+    ).toMatchObject({ status: "approved" });
   });
 });
 

@@ -194,6 +194,7 @@ describe("syncRoutes", () => {
           lastSync: null,
           lastProcessedTimestamp: null,
           pendingFiles: 0,
+          hydratedScopes: [],
           errors: [],
         });
       });
