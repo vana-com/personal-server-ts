@@ -87,6 +87,27 @@ def sha256_text(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def patch_compose_hashes(text, nodes, hashes):
+    """Rewrite only the composeHash values that changed, byte-for-byte
+    everywhere else - so an unrelated array or key order in the manifest is
+    never reflowed by re-serialising the whole file."""
+    for name, node in nodes.items():
+        old = node["pinned"]["composeHash"]
+        new = hashes[name]
+        if old == new:
+            continue
+
+        pattern = re.compile(r'("composeHash"\s*:\s*")%s(")' % re.escape(old))
+        if len(pattern.findall(text)) != 1:
+            raise SystemExit(
+                "%s: composeHash %s must appear exactly once to patch safely" % (name, old)
+            )
+
+        text = pattern.sub(lambda m: m.group(1) + new + m.group(2), text, count=1)
+
+    return text
+
+
 def read_images(path):
     """Read a CI images.env into {AGENT_IMAGE: <digest>, ...}."""
     pairs = [line.split("=", 1) for line in path.read_text().split()]
@@ -454,7 +475,8 @@ def parse_args():
 
 def main():
     args = parse_args()
-    manifest = json.loads(args.manifest.read_text())
+    manifest_text = args.manifest.read_text()
+    manifest = json.loads(manifest_text)
     nodes = manifest["nodes"]
     images = read_images(args.images_env)
     args.git_ref = args.git_ref or images.get("PS_IMAGE_REF")
@@ -509,10 +531,9 @@ def main():
     (args.out / RECEIPT_NAME).write_text(json.dumps(receipt, indent=2) + "\n")
 
     if args.write_manifest:
-        for name, compose_hash in hashes.items():
-            nodes[name]["pinned"]["composeHash"] = compose_hash
-
-        args.manifest.write_text(json.dumps(manifest, indent=2) + "\n")
+        # Patch in place: keeps the input's key order, indent and array
+        # layout untouched outside the hashes that actually changed.
+        args.manifest.write_text(patch_compose_hashes(manifest_text, nodes, hashes))
 
     print(json.dumps(receipt, indent=2))
 

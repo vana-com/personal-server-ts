@@ -11,7 +11,10 @@
 // manifest (or overridden here) and read per invocation.
 const path = require("node:path");
 const {
+  ROTATE_PLAN,
+  ROTATE_STATES,
   controllerAdminUrl,
+  detectRotateState,
   findNode,
   gatewayRow,
   loadManifest,
@@ -31,7 +34,9 @@ const USAGE = `gateway-nodes.cjs <verb> --manifest <fleet.json> --node <name>
   [--keychain-reader <script>]       non-interactive reader; stdin {service,account}
   [--receipts <dir>]                 default: the working directory
   [--allow-active]                   admit a node that still has live sandboxes
-  [--skip-health]                    skip the attested agent health fence`;
+  [--skip-health]                    skip the attested agent health fence
+  [--from <state>]                   rotate: resume from this state instead of
+                                      detecting it (${ROTATE_STATES.join(" | ")})`;
 
 const DEFAULT_ACCOUNT = "spike-agent";
 const NODES_PATH = "/v1/tee-nodes";
@@ -200,7 +205,12 @@ async function runVerb({ verb, manifest, name, node, args, secret, headers }) {
   throw new Error(`Unknown verb ${verb}`);
 }
 
-/** drain -> remove -> register -> heartbeat -> admit -> controller resume. */
+/**
+ * drain -> remove -> register -> heartbeat -> admit -> controller resume.
+ * Resumable: a rerun detects which of those the row already reached (or
+ * takes `--from`) and only runs what is left, instead of exiting on a row
+ * a prior attempt left mid-sequence.
+ */
 async function rotate(context) {
   const { manifest, name, node, args, secret, headers } = context;
   const row = gatewayRow(manifest, name);
@@ -217,22 +227,22 @@ async function rotate(context) {
   ).body.find((n) => n.nodeId === row.nodeId);
   steps.push({ step: "before", row: trimRow(before) });
 
-  if (before) {
-    if (before.state !== "admitted")
-      throw new Error(`${row.nodeId}: row is ${before.state}`);
-
-    await step("drain");
-    await step("remove");
+  const state = args.from || detectRotateState(before, HEARTBEAT_MAX_AGE_MS);
+  const plan = ROTATE_PLAN[state];
+  if (!plan) {
+    throw new Error(
+      `${row.nodeId}: unknown --from ${state} (${ROTATE_STATES.join(", ")})`,
+    );
   }
 
-  await step("register");
-  await step("wait");
-  await step("admit");
-  // A Gateway drain also set the controller's own flag; clear it.
   steps.push({
-    step: "resume",
-    ...(await controllerResume(manifest, row.nodeId, secret, args.adminItem)),
+    step: "state",
+    state,
+    source: args.from ? "override" : "detected",
+    plan,
   });
+
+  for (const verb of plan) await step(verb);
 
   return { steps };
 }

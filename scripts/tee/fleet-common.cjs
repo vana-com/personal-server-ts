@@ -26,6 +26,18 @@ const PRIVATE_MODE = 0o600;
 const AGENT_PORT_KEY = "ENCLAVE_AGENT_PORT";
 const ADMIN_PORT_KEY = "FLEET_ADMIN_PORT";
 
+// `rotate` is drain -> remove -> register -> wait -> admit -> resume. Each
+// state names the row's position in that sequence; the plan is what is still
+// left to do to reach `admitted` + a clean controller resume from there.
+const ROTATE_PLAN = {
+  admitted: ["drain", "remove", "register", "wait", "admit", "resume"],
+  draining: ["remove", "register", "wait", "admit", "resume"],
+  removed: ["register", "wait", "admit", "resume"],
+  registered: ["wait", "admit", "resume"],
+  heartbeating: ["admit", "resume"],
+};
+const ROTATE_STATES = Object.keys(ROTATE_PLAN);
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -131,6 +143,27 @@ function findNode(manifest, wanted) {
   return { name, node: manifest.nodes[name] };
 }
 
+/**
+ * Classify a Gateway row into the rotate state machine, so a rerun resumes
+ * instead of exiting `row is draining`. `before` is undefined when the row
+ * was already removed and dropped from the list.
+ */
+function detectRotateState(before, heartbeatMaxAgeMs) {
+  if (!before || before.state === "removed") return "removed";
+  if (before.state === "draining") return "draining";
+  if (before.state === "admitted") return "admitted";
+
+  if (before.state === "pending") {
+    const age = before.lastHeartbeatAt
+      ? Date.now() - Date.parse(before.lastHeartbeatAt)
+      : Infinity;
+
+    return age < heartbeatMaxAgeMs ? "heartbeating" : "registered";
+  }
+
+  throw new Error(`${before.nodeId}: no rotate state for row ${before.state}`);
+}
+
 const trimRow = (row) =>
   Object.fromEntries(
     Object.entries(row || {}).filter(([k]) => ROW_KEYS.includes(k)),
@@ -138,6 +171,17 @@ const trimRow = (row) =>
 
 /** `envs update` fails while a compose deploy is still applying; that retries. */
 const isBusy = (text) => /409|already in progress/i.test(text || "");
+
+/** Create the receipts dir if needed, and refuse to push without one. */
+function ensureReceiptsWritable(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+
+  try {
+    fs.accessSync(dir, fs.constants.W_OK);
+  } catch {
+    throw new Error(`Receipts dir ${dir} is not writable`);
+  }
+}
 
 function writeJson(file, value) {
   fs.writeFileSync(file, JSON.stringify(value, null, 2) + "\n");
@@ -162,8 +206,12 @@ function loadManifest(file) {
 }
 
 module.exports = {
+  ROTATE_PLAN,
+  ROTATE_STATES,
   ROW_KEYS,
   controllerAdminUrl,
+  detectRotateState,
+  ensureReceiptsWritable,
   findNode,
   gatewayRow,
   isBusy,
