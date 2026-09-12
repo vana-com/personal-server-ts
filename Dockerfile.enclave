@@ -15,7 +15,6 @@ WORKDIR /app
 # Copy dependency manifests first for layer caching
 COPY package.json package-lock.json ./
 COPY packages/core/package.json packages/core/
-COPY packages/lite/package.json packages/lite/
 COPY packages/server/package.json packages/server/
 COPY packages/cli/package.json packages/cli/
 COPY packages/enclave/package.json packages/enclave/
@@ -26,7 +25,7 @@ COPY tsconfig.base.json ./
 COPY packages/ packages/
 
 # `tsc --build` follows the enclave's project references, so this also emits
-# the core, lite, and server dist trees the enclave imports at runtime.
+# the core and server dist trees the enclave imports at runtime.
 RUN npm run build -w @opendatalabs/personal-server-ts-enclave
 
 # Drop dev dependencies in place. `npm prune` keeps every native addon the

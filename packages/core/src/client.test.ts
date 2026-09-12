@@ -26,9 +26,9 @@ const gatewayConfig = {
 describe("Personal Server client helpers", () => {
   it("normalizes health into the unified consumer info shape", () => {
     const info = createPersonalServerInfoFromHealth({
-      kind: "lite",
+      kind: "node",
       status: "ready",
-      localUrl: "https://ps-lite.local",
+      localUrl: "https://ps.local",
       publicUrl: "https://session.relay.example",
       health: {
         status: "healthy",
@@ -53,7 +53,7 @@ describe("Personal Server client helpers", () => {
     });
 
     expect(info).toMatchObject({
-      kind: "lite",
+      kind: "node",
       status: "ready",
       ownerAddress: "0x1111111111111111111111111111111111111111",
       server: {
@@ -62,7 +62,7 @@ describe("Personal Server client helpers", () => {
         serverId: null,
       },
       urls: {
-        local: "https://ps-lite.local",
+        local: "https://ps.local",
         public: "https://session.relay.example",
         apiOrigin: "https://session.relay.example",
         registration: "https://session.relay.example",

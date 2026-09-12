@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import * as shared from "./index.js";
-import * as lite from "./lite.js";
 import * as node from "./node.js";
 
 describe("personal-server-ts facade", () => {
@@ -15,6 +14,5 @@ describe("personal-server-ts facade", () => {
   it("exposes runtime starters only from runtime-specific entrypoints", () => {
     expect(typeof node.startPersonalServer).toBe("function");
     expect(typeof node.createServer).toBe("function");
-    expect(typeof lite.startPersonalServer).toBe("function");
   });
 });
