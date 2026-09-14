@@ -30,7 +30,7 @@
     "start:agent": "node dist/agent/main.js"
   },
   "dependencies": {
-    "@hono/node-server": "^1.19.13",
+    "@hono/node-server": "^1.19.17",
     "@noble/curves": "^1.9.1",
     "@noble/hashes": "^1.8.0",
     "@opendatalabs/personal-server-ts-core": "*",
