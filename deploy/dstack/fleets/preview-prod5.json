@@ -12,13 +12,14 @@
       "role": "controller",
       "nodeId": "moksha-personal-server-controller",
       "uuid": "ae2a9c3d-6163-4d94-a3e2-34c403eda4f7",
+      "cvmName": "moksha-personal-server-controller",
       "appId": "f8f00a86dbae7f4622e23d512d3929792c6fc9f4",
       "instanceType": "tdx.small",
       "compose": "docker-compose.fleet-controller.yml",
       "composeOut": "controller-compose.yml",
       "pinned": {
         "instanceId": "6223bcb478a5f5b7d11dae5713d9ff58501c090a",
-        "composeHash": "dd3a95f51ba1775c6386bd27d1bafacd748b207aee46099bdae8e998ca7cf1f2"
+        "composeHash": "19f1c07e506cb9f8600d275e660d4a5279d2f53c8785ab3a44ed2ffbde74c4f2"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -63,13 +64,14 @@
       "role": "worker",
       "nodeId": "moksha-personal-server-worker-1",
       "uuid": "87c32ca4-49c9-4a83-b0af-ef5465cbbe18",
+      "cvmName": "moksha-personal-server-worker-1",
       "appId": "ec9a39de98c760e1ded9f1e97016dc5f0e357cf2",
       "instanceType": "tdx.medium",
       "compose": "docker-compose.fleet-worker.yml",
       "composeOut": "worker-1-source-compose.yml",
       "pinned": {
         "instanceId": "1ac22335a2da1ca6a024396c4a557907279403ab",
-        "composeHash": "fbce5e4cfeeffce1d551b8f0a431e2dfe01a7e54d2e3ae9ced7a3678731b7692"
+        "composeHash": "3fa882c79605425d0261c8f605bd119f881368b54b3141e399529fe7bcf344ff"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -122,13 +124,14 @@
       "role": "worker",
       "nodeId": "moksha-personal-server-worker-2",
       "uuid": "1a5acf08-41b4-4524-9e0d-d8b520b5b9ae",
+      "cvmName": "moksha-personal-server-worker-2",
       "appId": "ec9a39de98c760e1ded9f1e97016dc5f0e357cf2",
       "instanceType": "tdx.medium",
       "compose": "docker-compose.fleet-worker.yml",
       "composeOut": "worker-compose.yml",
       "pinned": {
         "instanceId": "eeea1588a1f55b129a2b14b24a1002719976f6a0",
-        "composeHash": "625ae0938220a4eb4ced9a990c21263697e5aaed6d226581f828aac112dc95a2"
+        "composeHash": "81aabe5892c9f5fa419f09fb690592982c62bd118d90f44240002836533315c2"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -173,13 +176,14 @@
       "role": "worker",
       "nodeId": "moksha-personal-server-worker-3",
       "uuid": "537b9261-69ce-4efa-9b5e-cdb3576ea40e",
+      "cvmName": "moksha-personal-server-worker-2-rep-7n1yi",
       "appId": "ec9a39de98c760e1ded9f1e97016dc5f0e357cf2",
       "instanceType": "tdx.medium",
       "compose": "docker-compose.fleet-worker.yml",
       "composeOut": "worker-compose.yml",
       "pinned": {
         "instanceId": "f8039972d33e0e5b8b5d1c462c7f8986e36873d3",
-        "composeHash": "625ae0938220a4eb4ced9a990c21263697e5aaed6d226581f828aac112dc95a2"
+        "composeHash": "81aabe5892c9f5fa419f09fb690592982c62bd118d90f44240002836533315c2"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -224,13 +228,14 @@
       "role": "worker",
       "nodeId": "moksha-personal-server-worker-4",
       "uuid": "eb5e1d4d-18c1-4ac2-8e59-fb8f53004fa5",
+      "cvmName": "moksha-personal-server-worker-1-rep-a6kmd",
       "appId": "ec9a39de98c760e1ded9f1e97016dc5f0e357cf2",
       "instanceType": "tdx.medium",
       "compose": "docker-compose.fleet-worker.yml",
       "composeOut": "worker-compose.yml",
       "pinned": {
         "instanceId": "bcf10e49759e17bfb3e0bdf460b9b7e071722d00",
-        "composeHash": "625ae0938220a4eb4ced9a990c21263697e5aaed6d226581f828aac112dc95a2"
+        "composeHash": "81aabe5892c9f5fa419f09fb690592982c62bd118d90f44240002836533315c2"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
