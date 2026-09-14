@@ -1,0 +1,279 @@
+{
+  "fleet": "moksha-prod5",
+  "gatewayUrl": "https://dp-rpc.moksha.vana.org",
+  "gitRefCandidate": {
+    "TODO": "not a render-fleet.py manifest field; pass at render time as --git-ref (must equal images.env PS_IMAGE_REF)",
+    "candidateSha": "bf79a93a8ea6ccfcbd7914098dd50e228decad4b",
+    "candidateSource": "PS #245 head after the manifest push (gh pr view 245 --json headRefOid, 2026-09-14); CI build-and-push run 34890468903 published its images.env"
+  },
+  "gatewayDomain": "dstack-pha-prod5.phala.network",
+  "operatorPublicKeySpkiBase64": "MCowBQYDK2VwAyEAPPx3xJ6NkAsPk1gT2v9E3s/huSL9MVG3S9D8e/Eqzjg=",
+  "gatewaySecretRefs": {
+    "operator": "moksha-operator"
+  },
+  "nodes": {
+    "controller": {
+      "role": "controller",
+      "nodeId": "moksha-personal-server-controller",
+      "uuid": "ae2a9c3d-6163-4d94-a3e2-34c403eda4f7",
+      "cvmName": "moksha-personal-server-controller",
+      "appId": "f8f00a86dbae7f4622e23d512d3929792c6fc9f4",
+      "instanceType": "tdx.small",
+      "compose": "docker-compose.fleet-controller.yml",
+      "composeOut": "controller-compose.yml",
+      "pinned": {
+        "instanceId": "6223bcb478a5f5b7d11dae5713d9ff58501c090a",
+        "composeHash": "92e2acf8ae7dfbb29711c4925a15f80d6f21ff76450df786592ae20891bbd732"
+      },
+      "measured": {
+        "measurementMode": "dstack-0.5.9-events",
+        "mrTd": "f06dfda6dce1cf904d4e2bab1dc370634cf95cefa2ceb2de2eee127c9382698090d7a4a13e14c536ec6c9c3c8fa87077",
+        "rtmrs": [
+          "68102e7b524af310f7b7d426ce75481e36c40f5d513a9009c046e9d37e31551f0134d954b496a3357fd61d03f07ffe96",
+          "07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+          "df67e467e60edc1737bcf8e682d48131bfb427f523226aa7f197a7608e9b3784783fa759ef5b28191fa12f9ddb36b858"
+        ],
+        "osImageHash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+        "keyProviderSpki": "3059301306072a8648ce3d020106082a8648ce3d030107034200048844eb42ccdf8c52fd4f174f362fcb9bbd19c45fd48f1edec2d8f1ca23536ec1a74021b4cee610c074f8294d431b2b7fee2c39e5333fdaf0a4522d43fb159d9f"
+      },
+      "env": {
+        "CHAIN_ID": "14800",
+        "NODE_ID": "moksha-personal-server-controller",
+        "CONTROLLER_TERM": "1",
+        "GATEWAY_URL": "https://dp-rpc.moksha.vana.org",
+        "FLEET_STATE_PATH": "/fleet-state/controller.json",
+        "FLEET_CONTROL_HOST": "0.0.0.0",
+        "FLEET_CONTROL_PORT": "8790",
+        "FLEET_ADMIN_HOST": "0.0.0.0",
+        "FLEET_ADMIN_PORT": "8791",
+        "FLEET_PEER_HOST": "0.0.0.0",
+        "FLEET_PEER_PORT": "8792",
+        "MCP_MIGRATION_REQUIRED": "1",
+        "MCP_PUBLIC_ORIGIN": "https://mcp-dev.vana.org",
+        "MCP_APPROVAL_URL": "https://app-dev.vana.org/personal-server",
+        "MCP_STATE_PATH": "/mcp-state/state.sealed",
+        "MCP_INGRESS_HOST": "0.0.0.0",
+        "MCP_INGRESS_PORT": "8788",
+        "MCP_REDIRECT_URIS": "[\"https://claude.ai/api/mcp/auth_callback\",\"https://claude.com/api/mcp/auth_callback\"]",
+        "MCP_STATE_REQUIRED": "1"
+      },
+      "secretRefs": {
+        "FLEET_GATEWAY_TOKEN": "moksha-fleet-gateway-token",
+        "FLEET_CONTROLLER_GATEWAY_TOKEN": "moksha-fleet-controller-gateway-token",
+        "FLEET_CONTROLLER_ADMIN_TOKEN": "spike-b3-fleet-controller-admin-token"
+      }
+    },
+    "worker-1": {
+      "role": "worker",
+      "nodeId": "moksha-personal-server-worker-1",
+      "uuid": "87c32ca4-49c9-4a83-b0af-ef5465cbbe18",
+      "cvmName": "moksha-personal-server-worker-1",
+      "appId": "ec9a39de98c760e1ded9f1e97016dc5f0e357cf2",
+      "instanceType": "tdx.medium",
+      "compose": "docker-compose.fleet-worker.yml",
+      "composeOut": "worker-1-source-compose.yml",
+      "pinned": {
+        "instanceId": "1ac22335a2da1ca6a024396c4a557907279403ab",
+        "composeHash": "5d08e1983f6cc62606c1fbe035cedb967c8c3f9c9fad5e4f03593af711da1778"
+      },
+      "measured": {
+        "measurementMode": "dstack-0.5.9-events",
+        "mrTd": "f06dfda6dce1cf904d4e2bab1dc370634cf95cefa2ceb2de2eee127c9382698090d7a4a13e14c536ec6c9c3c8fa87077",
+        "rtmrs": [
+          "027b610ab0555482f8a3868524093bdf3cdbe2539f81dfeeb886864654cb2fe3422f7fc36d4bab6fa46683aad11d1ba7",
+          "07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+          "df67e467e60edc1737bcf8e682d48131bfb427f523226aa7f197a7608e9b3784783fa759ef5b28191fa12f9ddb36b858"
+        ],
+        "osImageHash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+        "keyProviderSpki": "3059301306072a8648ce3d020106082a8648ce3d030107034200048844eb42ccdf8c52fd4f174f362fcb9bbd19c45fd48f1edec2d8f1ca23536ec1a74021b4cee610c074f8294d431b2b7fee2c39e5333fdaf0a4522d43fb159d9f"
+      },
+      "env": {
+        "CHAIN_ID": "14800",
+        "NODE_ID": "moksha-personal-server-worker-1",
+        "GATEWAY_URL": "https://dp-rpc.moksha.vana.org",
+        "STORAGE_API_URL": "https://storage-dev.vana.org",
+        "ENCLAVE_AGENT_HOST": "0.0.0.0",
+        "ENCLAVE_AGENT_PORT": "8787",
+        "FLEET_ENABLED": "true",
+        "FLEET_PEER_HOST": "0.0.0.0",
+        "FLEET_PEER_PORT": "8789",
+        "SANDBOX_RUNTIME": "docker",
+        "DOCKER_HOST": "tcp://sandbox-runtime:2375",
+        "SANDBOX_MAX": "4",
+        "SANDBOX_MEMORY": "512m",
+        "SANDBOX_CPUS": "1",
+        "SANDBOX_IDLE_TTL_SECONDS": "600",
+        "MCP_PUBLIC_ORIGIN": "https://mcp-dev.vana.org",
+        "MCP_APPROVAL_URL": "https://app-dev.vana.org/personal-server",
+        "MCP_STATE_PATH": "/mcp-state/state.sealed",
+        "MCP_REDIRECT_URIS": "[\"https://claude.ai/api/mcp/auth_callback\",\"https://claude.com/api/mcp/auth_callback\"]",
+        "MCP_INGRESS_HOST": "0.0.0.0",
+        "MCP_INGRESS_PORT": "8788",
+        "MCP_MIGRATION_REQUIRED": "0"
+      },
+      "secretRefs": {
+        "ENCLAVE_AGENT_SECRET": "spike-b3-agent-secret",
+        "NODE_SECRET": "spike-b3-fleet-worker-1-node-secret"
+      },
+      "composeOverlays": ["docker-compose.fleet-worker-source.yml"],
+      "capacity": 4,
+      "gateway": {
+        "agentSecretRef": "spike-b3-agent-secret",
+        "nodeSecretRef": "spike-b3-fleet-worker-1-node-secret"
+      }
+    },
+    "worker-2": {
+      "role": "worker",
+      "nodeId": "moksha-personal-server-worker-2",
+      "uuid": "1a5acf08-41b4-4524-9e0d-d8b520b5b9ae",
+      "cvmName": "moksha-personal-server-worker-2",
+      "appId": "ec9a39de98c760e1ded9f1e97016dc5f0e357cf2",
+      "instanceType": "tdx.medium",
+      "compose": "docker-compose.fleet-worker.yml",
+      "composeOut": "worker-compose.yml",
+      "pinned": {
+        "instanceId": "eeea1588a1f55b129a2b14b24a1002719976f6a0",
+        "composeHash": "8673fed70db6b71ba6398465c2a6d17a3f4dc093b54bf169f12a27da20112c35"
+      },
+      "measured": {
+        "measurementMode": "dstack-0.5.9-events",
+        "mrTd": "f06dfda6dce1cf904d4e2bab1dc370634cf95cefa2ceb2de2eee127c9382698090d7a4a13e14c536ec6c9c3c8fa87077",
+        "rtmrs": [
+          "027b610ab0555482f8a3868524093bdf3cdbe2539f81dfeeb886864654cb2fe3422f7fc36d4bab6fa46683aad11d1ba7",
+          "07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+          "df67e467e60edc1737bcf8e682d48131bfb427f523226aa7f197a7608e9b3784783fa759ef5b28191fa12f9ddb36b858"
+        ],
+        "osImageHash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+        "keyProviderSpki": "3059301306072a8648ce3d020106082a8648ce3d030107034200048844eb42ccdf8c52fd4f174f362fcb9bbd19c45fd48f1edec2d8f1ca23536ec1a74021b4cee610c074f8294d431b2b7fee2c39e5333fdaf0a4522d43fb159d9f"
+      },
+      "env": {
+        "CHAIN_ID": "14800",
+        "NODE_ID": "moksha-personal-server-worker-2",
+        "GATEWAY_URL": "https://dp-rpc.moksha.vana.org",
+        "STORAGE_API_URL": "https://storage-dev.vana.org",
+        "ENCLAVE_AGENT_HOST": "0.0.0.0",
+        "ENCLAVE_AGENT_PORT": "8787",
+        "FLEET_ENABLED": "true",
+        "FLEET_PEER_HOST": "0.0.0.0",
+        "FLEET_PEER_PORT": "8789",
+        "SANDBOX_RUNTIME": "docker",
+        "DOCKER_HOST": "tcp://sandbox-runtime:2375",
+        "SANDBOX_MAX": "4",
+        "SANDBOX_MEMORY": "512m",
+        "SANDBOX_CPUS": "1",
+        "SANDBOX_IDLE_TTL_SECONDS": "600"
+      },
+      "secretRefs": {
+        "ENCLAVE_AGENT_SECRET": "spike-b3-fleet-worker-2-agent-secret",
+        "NODE_SECRET": "spike-b3-fleet-worker-2-node-secret"
+      },
+      "capacity": 4,
+      "gateway": {
+        "agentSecretRef": "spike-b3-fleet-worker-2-agent-secret",
+        "nodeSecretRef": "spike-b3-fleet-worker-2-node-secret"
+      }
+    },
+    "worker-3": {
+      "role": "worker",
+      "nodeId": "moksha-personal-server-worker-3",
+      "uuid": "537b9261-69ce-4efa-9b5e-cdb3576ea40e",
+      "cvmName": "moksha-personal-server-worker-2-rep-7n1yi",
+      "appId": "ec9a39de98c760e1ded9f1e97016dc5f0e357cf2",
+      "instanceType": "tdx.medium",
+      "compose": "docker-compose.fleet-worker.yml",
+      "composeOut": "worker-compose.yml",
+      "pinned": {
+        "instanceId": "f8039972d33e0e5b8b5d1c462c7f8986e36873d3",
+        "composeHash": "8673fed70db6b71ba6398465c2a6d17a3f4dc093b54bf169f12a27da20112c35"
+      },
+      "measured": {
+        "measurementMode": "dstack-0.5.9-events",
+        "mrTd": "f06dfda6dce1cf904d4e2bab1dc370634cf95cefa2ceb2de2eee127c9382698090d7a4a13e14c536ec6c9c3c8fa87077",
+        "rtmrs": [
+          "027b610ab0555482f8a3868524093bdf3cdbe2539f81dfeeb886864654cb2fe3422f7fc36d4bab6fa46683aad11d1ba7",
+          "07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+          "df67e467e60edc1737bcf8e682d48131bfb427f523226aa7f197a7608e9b3784783fa759ef5b28191fa12f9ddb36b858"
+        ],
+        "osImageHash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+        "keyProviderSpki": "3059301306072a8648ce3d020106082a8648ce3d030107034200048844eb42ccdf8c52fd4f174f362fcb9bbd19c45fd48f1edec2d8f1ca23536ec1a74021b4cee610c074f8294d431b2b7fee2c39e5333fdaf0a4522d43fb159d9f"
+      },
+      "env": {
+        "CHAIN_ID": "14800",
+        "NODE_ID": "moksha-personal-server-worker-3",
+        "GATEWAY_URL": "https://dp-rpc.moksha.vana.org",
+        "STORAGE_API_URL": "https://storage-dev.vana.org",
+        "ENCLAVE_AGENT_HOST": "0.0.0.0",
+        "ENCLAVE_AGENT_PORT": "8787",
+        "FLEET_ENABLED": "true",
+        "FLEET_PEER_HOST": "0.0.0.0",
+        "FLEET_PEER_PORT": "8789",
+        "SANDBOX_RUNTIME": "docker",
+        "DOCKER_HOST": "tcp://sandbox-runtime:2375",
+        "SANDBOX_MAX": "4",
+        "SANDBOX_MEMORY": "512m",
+        "SANDBOX_CPUS": "1",
+        "SANDBOX_IDLE_TTL_SECONDS": "600"
+      },
+      "secretRefs": {
+        "ENCLAVE_AGENT_SECRET": "spike-b3-worker-3-agent-secret",
+        "NODE_SECRET": "spike-b3-worker-3-node-secret"
+      },
+      "capacity": 4,
+      "gateway": {
+        "agentSecretRef": "spike-b3-worker-3-agent-secret",
+        "nodeSecretRef": "spike-b3-worker-3-node-secret"
+      }
+    },
+    "worker-4": {
+      "role": "worker",
+      "nodeId": "moksha-personal-server-worker-4",
+      "uuid": "eb5e1d4d-18c1-4ac2-8e59-fb8f53004fa5",
+      "cvmName": "moksha-personal-server-worker-1-rep-a6kmd",
+      "appId": "ec9a39de98c760e1ded9f1e97016dc5f0e357cf2",
+      "instanceType": "tdx.medium",
+      "compose": "docker-compose.fleet-worker.yml",
+      "composeOut": "worker-compose.yml",
+      "pinned": {
+        "instanceId": "bcf10e49759e17bfb3e0bdf460b9b7e071722d00",
+        "composeHash": "8673fed70db6b71ba6398465c2a6d17a3f4dc093b54bf169f12a27da20112c35"
+      },
+      "measured": {
+        "measurementMode": "dstack-0.5.9-events",
+        "mrTd": "f06dfda6dce1cf904d4e2bab1dc370634cf95cefa2ceb2de2eee127c9382698090d7a4a13e14c536ec6c9c3c8fa87077",
+        "rtmrs": [
+          "027b610ab0555482f8a3868524093bdf3cdbe2539f81dfeeb886864654cb2fe3422f7fc36d4bab6fa46683aad11d1ba7",
+          "07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+          "df67e467e60edc1737bcf8e682d48131bfb427f523226aa7f197a7608e9b3784783fa759ef5b28191fa12f9ddb36b858"
+        ],
+        "osImageHash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+        "keyProviderSpki": "3059301306072a8648ce3d020106082a8648ce3d030107034200048844eb42ccdf8c52fd4f174f362fcb9bbd19c45fd48f1edec2d8f1ca23536ec1a74021b4cee610c074f8294d431b2b7fee2c39e5333fdaf0a4522d43fb159d9f"
+      },
+      "env": {
+        "CHAIN_ID": "14800",
+        "NODE_ID": "moksha-personal-server-worker-4",
+        "GATEWAY_URL": "https://dp-rpc.moksha.vana.org",
+        "STORAGE_API_URL": "https://storage-dev.vana.org",
+        "ENCLAVE_AGENT_HOST": "0.0.0.0",
+        "ENCLAVE_AGENT_PORT": "8787",
+        "FLEET_ENABLED": "true",
+        "FLEET_PEER_HOST": "0.0.0.0",
+        "FLEET_PEER_PORT": "8789",
+        "SANDBOX_RUNTIME": "docker",
+        "DOCKER_HOST": "tcp://sandbox-runtime:2375",
+        "SANDBOX_MAX": "4",
+        "SANDBOX_MEMORY": "512m",
+        "SANDBOX_CPUS": "1",
+        "SANDBOX_IDLE_TTL_SECONDS": "600"
+      },
+      "secretRefs": {
+        "ENCLAVE_AGENT_SECRET": "spike-b3-worker-4-agent-secret",
+        "NODE_SECRET": "spike-b3-worker-4-node-secret"
+      },
+      "capacity": 4,
+      "gateway": {
+        "agentSecretRef": "spike-b3-worker-4-agent-secret",
+        "nodeSecretRef": "spike-b3-worker-4-node-secret"
+      }
+    }
+  }
+}
