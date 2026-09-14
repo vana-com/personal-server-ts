@@ -337,6 +337,7 @@ describe("mcp/read-client", () => {
         scope: "instagram.profile",
         grantId: "grant-1",
         maxBytes: 4096,
+        tool: "read_scope",
       }),
     ).resolves.toMatchObject({
       scope: "instagram.profile",
@@ -373,6 +374,7 @@ describe("mcp/read-client", () => {
         logId: "log-1",
         scope: "instagram.profile",
         servedAt: "2026-06-05T00:00:00.000Z",
+        tool: "read_scope",
       }),
     );
   });

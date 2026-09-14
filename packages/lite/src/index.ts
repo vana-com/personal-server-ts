@@ -80,6 +80,7 @@ export {
   createPsLiteSyncCursor,
   createPsLiteSyncManager,
   type PsLiteSyncOptions,
+  type PsLiteOwnerSyncSigner,
 } from "./sync.js";
 
 export {

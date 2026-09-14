@@ -169,7 +169,7 @@ async function registerServer(params: {
     >[0]["domain"],
     types: SERVER_REGISTRATION_TYPES,
     primaryType: "ServerRegistration",
-    message: message as unknown as Record<string, unknown>,
+    message,
   });
 
   const res = await fetch(`${params.gatewayUrl}/v1/servers`, {

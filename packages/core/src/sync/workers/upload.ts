@@ -31,7 +31,7 @@ export interface UploadWorkerDeps {
   storage: DataStoragePort;
   storageAdapter: StorageAdapter;
   gateway: GatewayClient;
-  signer: ServerSigner;
+  signer: Pick<ServerSigner, "signAddData" | "signLineageAttestation">;
   masterKey: Uint8Array;
   serverOwner: string;
   logger: Logger;

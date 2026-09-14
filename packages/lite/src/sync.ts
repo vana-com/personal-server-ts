@@ -22,7 +22,10 @@ import {
   createVanaSyncStorageAdapter,
   resolveVanaStorageEndpoint,
 } from "@opendatalabs/personal-server-ts-core/storage/adapters";
-import { createServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
+import {
+  createServerSigner,
+  type ServerSigner,
+} from "@opendatalabs/personal-server-ts-core/signing";
 import type { ServerAccount } from "@opendatalabs/personal-server-ts-core/keys";
 import {
   createGatewayClient,
@@ -56,6 +59,14 @@ interface SyncCursor {
   write(timestamp: string): Promise<void>;
 }
 
+/** Owner-authorized sync capability. Hosts mediate signing; no owner key enters Lite. */
+export interface PsLiteOwnerSyncSigner extends Pick<
+  ServerSigner,
+  "address" | "signAddData" | "signLineageAttestation"
+> {
+  signMessage(message: string): Promise<`0x${string}`>;
+}
+
 export interface PsLiteSyncOptions {
   config: ServerConfig;
   stateStore: PsLiteStateStore;
@@ -63,6 +74,8 @@ export interface PsLiteSyncOptions {
   ownerAddress?: `0x${string}`;
   ownerSignature: `0x${string}`;
   serverAccount: ServerAccount;
+  /** Uses owner authority for Storage and AddData, without server registration. */
+  ownerSyncSigner?: PsLiteOwnerSyncSigner;
   gateway?: GatewayClient;
   /**
    * Deletion-aware gateway feed. Defaults to a REST feed on the configured
@@ -219,18 +232,27 @@ export async function createPsLiteSyncManager(
     ownerAddress: options.ownerAddress,
     ownerSignature: options.ownerSignature,
   });
+  const syncAccount = options.ownerSyncSigner ?? options.serverAccount;
+  if (
+    options.ownerSyncSigner &&
+    syncAccount.address.toLowerCase() !== serverOwner.toLowerCase()
+  ) {
+    throw new Error("Owner sync signer must match the verified data owner");
+  }
   const masterKey = deriveMasterKey(options.ownerSignature);
   const gateway =
     options.gateway ?? createGatewayClient(options.config.gateway.url);
   const storageAdapter = createVanaSyncStorageAdapter({
     config: options.config,
     serverOwner,
-    serverAccount: options.serverAccount,
+    serverAccount: syncAccount,
   });
-  const signer = createServerSigner(options.serverAccount, {
-    chainId: options.config.gateway.chainId,
-    contracts: options.config.gateway.contracts,
-  });
+  const signer =
+    options.ownerSyncSigner ??
+    createServerSigner(options.serverAccount, {
+      chainId: options.config.gateway.chainId,
+      contracts: options.config.gateway.contracts,
+    });
   const cursor = createPsLiteSyncCursor(options.stateStore);
   const logger = createBrowserLogger(options.logger);
   const dataPointFeed =
@@ -249,7 +271,7 @@ export async function createPsLiteSyncManager(
     storage: {
       endpoint: resolveVanaStorageEndpoint(options.config),
       chainId: options.config.gateway.chainId,
-      signMessage: (message) => options.serverAccount.signMessage(message),
+      signMessage: (message) => syncAccount.signMessage(message),
     },
   });
   const pendingBlobDeletions = createPsLitePendingBlobDeletionStore(
@@ -288,6 +310,7 @@ export async function createPsLiteSyncManager(
       deleteData,
       pendingBlobDeletions,
       async canSync() {
+        if (options.ownerSyncSigner) return { ok: true };
         try {
           const serverInfo = await gateway.getServer(
             options.serverAccount.address,

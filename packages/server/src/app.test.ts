@@ -185,6 +185,36 @@ describe("createApp", () => {
     expect(body.status).toBe("healthy");
   });
 
+  it("mounts enclave jobs only for the enclave profile", async () => {
+    const common = {
+      logger: pino({ level: "silent" }),
+      version: "0.0.1",
+      startedAt: new Date(),
+      indexManager,
+      hierarchyOptions: { dataDir: join(tempDir, "data") },
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+      accessLogReader: createMockAccessLogReader(),
+      accessToken: CONTROL_PLANE_TOKEN,
+      jobWorker: vi.fn(),
+    };
+    const standard = createApp({ ...common, profile: "standard" });
+    const enclave = createApp({ ...common, profile: "enclave" });
+
+    const standardResponse = await standard.request(
+      "/enclave/v1/jobs/execute",
+      { method: "POST" },
+    );
+    const enclaveResponse = await enclave.request("/enclave/v1/jobs/execute", {
+      method: "POST",
+    });
+
+    expect(standardResponse.status).toBe(404);
+    expect(enclaveResponse.status).toBe(401);
+  });
+
   it("GET /v1/mcp/activity returns the owner activity snapshot", async () => {
     const app = makeApp();
     const auth = await buildWeb3SignedHeader({

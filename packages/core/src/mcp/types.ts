@@ -56,6 +56,26 @@ export interface McpConnectionRecord {
   encryptedGranteePrivateKey: McpEncryptedPrivateKey;
   /** SHA-256 hex of the raw connection token. The raw token is only returned once on creation. */
   tokenHash: string;
+  /**
+   * ISO expiry of the current token. Absent means expired: a record written
+   * before this field existed has no proven lifetime, so it fails closed.
+   */
+  tokenExpiresAt?: string;
+  /**
+   * OAuth `client_id` the current token pair was issued to. The refresh grant
+   * refuses a token presented by any other client.
+   */
+  clientId?: string;
+  /** SHA-256 hex of the current refresh token. Absent means no refresh grant. */
+  refreshTokenHash?: string;
+  /**
+   * SHA-256 hex of the refresh token this one replaced. Kept only so a replay
+   * of a rotated-out token is *detectable* rather than merely unknown — see
+   * the reuse-detection rule in `refreshMcpOAuthToken`.
+   */
+  previousRefreshTokenHash?: string;
+  /** ISO expiry of the refresh token. Absent means expired (fails closed). */
+  refreshExpiresAt?: string;
   status: McpConnectionStatus;
   grants: McpConnectionGrant[];
   createdAt: string;
@@ -69,11 +89,21 @@ export interface McpConnectionStore {
   list(): Promise<McpConnectionRecord[]>;
   getById(id: string): Promise<McpConnectionRecord | null>;
   /**
-   * Look up an *approved, non-revoked* connection by the SHA-256 hash of the
-   * raw connection token presented in the URL. Returns null for unknown,
-   * pending, or revoked tokens. Updates `lastUsedAt`.
+   * Look up an *approved, non-revoked, unexpired* connection by the SHA-256
+   * hash of the raw connection token presented in the URL. Returns null for
+   * unknown, pending, revoked tokens, and for any token whose
+   * `tokenExpiresAt` has passed or is absent. Updates `lastUsedAt`.
    */
   getByTokenHash(tokenHash: string): Promise<McpConnectionRecord | null>;
+  /**
+   * Look up a connection by the SHA-256 hash of a presented refresh token,
+   * matching either the current hash or the rotated-out previous one. Applies
+   * NO status or expiry filter — the refresh grant needs to tell a replayed
+   * token apart from an unknown one before it can react to reuse.
+   */
+  getByRefreshTokenHash(
+    refreshTokenHash: string,
+  ): Promise<McpConnectionRecord | null>;
   update(
     id: string,
     patch: Partial<
@@ -86,6 +116,11 @@ export interface McpConnectionStore {
         | "lastUsedAt"
         | "displayName"
         | "tokenHash"
+        | "tokenExpiresAt"
+        | "clientId"
+        | "refreshTokenHash"
+        | "previousRefreshTokenHash"
+        | "refreshExpiresAt"
       >
     >,
   ): Promise<McpConnectionRecord | null>;

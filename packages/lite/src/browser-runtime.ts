@@ -38,7 +38,7 @@ import {
   type PsLiteRuntime,
   type PsLiteRuntimeOptions,
 } from "./runtime.js";
-import { createPsLiteSyncManager } from "./sync.js";
+import { createPsLiteSyncManager, type PsLiteOwnerSyncSigner } from "./sync.js";
 import {
   createPsLiteDerivativeCompute,
   createPsLiteQuestionStore,
@@ -70,6 +70,7 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
    */
   inferenceProvider?: InferenceProvider;
   ownerSignature: `0x${string}`;
+  ownerSyncSigner?: PsLiteOwnerSyncSigner;
   dbName?: string;
   stateStoreName?: string;
   storageDbName?: string;
@@ -223,6 +224,7 @@ export async function createIndexedDbPsLiteRuntime(
       storage,
       ownerSignature: options.ownerSignature,
       ownerAddress: options.ownerAddress,
+      ownerSyncSigner: options.ownerSyncSigner,
       serverAccount: identity.account,
       gateway,
       dataPointFeed: options.dataPointFeed,

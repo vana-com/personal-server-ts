@@ -52,10 +52,12 @@ import {
   McpConnectionStateError,
   McpOAuthAuthorizationError,
   redeemMcpOAuthAuthorizationCode,
+  refreshMcpOAuthToken,
   toMcpOAuthAuthorizationView,
   revokeMcpConnection,
   toMcpConnectionView,
   type McpConnectionGrant,
+  type McpConnectionRecord,
   type McpConnectionStore,
   type McpSessionStore,
   type McpOAuthAuthorizationStore,
@@ -172,6 +174,20 @@ function mcpUnauthorized(
   );
 }
 
+/** Grant types this OAuth server implements — advertised and enforced here. */
+const AUTHORIZATION_CODE_GRANT = "authorization_code";
+const REFRESH_TOKEN_GRANT = "refresh_token";
+const SUPPORTED_GRANT_TYPES = [
+  AUTHORIZATION_CODE_GRANT,
+  REFRESH_TOKEN_GRANT,
+] as const;
+
+function isSupportedGrantType(
+  value: string,
+): value is (typeof SUPPORTED_GRANT_TYPES)[number] {
+  return (SUPPORTED_GRANT_TYPES as readonly string[]).includes(value);
+}
+
 function authorizationServerMetadata(origin: string) {
   return {
     issuer: origin,
@@ -179,7 +195,7 @@ function authorizationServerMetadata(origin: string) {
     token_endpoint: `${origin}/mcp/oauth/token`,
     registration_endpoint: `${origin}/mcp/oauth/register`,
     response_types_supported: ["code"],
-    grant_types_supported: ["authorization_code"],
+    grant_types_supported: [...SUPPORTED_GRANT_TYPES],
     token_endpoint_auth_methods_supported: ["none"],
     code_challenge_methods_supported: ["S256"],
     scopes_supported: ["vana:read"],
@@ -196,7 +212,9 @@ function protectedResourceMetadata(origin: string) {
   };
 }
 
-function resolveApprovalUrl(deps: McpRouteDeps): string | null {
+function resolveApprovalUrl(
+  deps: Pick<McpRouteDeps, "oauthApprovalUrl">,
+): string | null {
   const value = deps.oauthApprovalUrl;
   if (!value) return null;
   return typeof value === "function" ? value() : value;
@@ -268,6 +286,33 @@ function buildDataApiDeps(deps: McpRouteDeps): PersonalServerDataApiDeps {
     runtimeAvailability: deps.runtimeAvailability,
     logger: deps.logger,
   };
+}
+
+/** Shared engine for ordinary MCP connections and authenticated TEE dispatch. */
+export function executeMcpConnectionRequest(
+  request: Request,
+  connection: McpConnectionRecord,
+  deps: McpRouteDeps,
+): Promise<Response> {
+  const granteeAccount = loadMcpGranteeAccount({
+    address: connection.granteeAddress,
+    publicKey: connection.granteePublicKey,
+    encryptedPrivateKey: connection.encryptedGranteePrivateKey,
+  });
+  return handleMcpStreamableHttpRequest(request, {
+    connection,
+    readClient: createMcpDataReadClient({
+      serverOrigin: resolveOrigin(deps.serverOrigin),
+      granteeAccount,
+      dataApiDeps: buildDataApiDeps(deps),
+    }),
+    activityRecorder: deps.activityRecorder,
+    // Denied tool calls are recorded by the wrapper, not the read path.
+    reporterDeps: {
+      readFulfillmentReporter: deps.readFulfillmentReporter,
+      logger: deps.logger,
+    },
+  });
 }
 
 /**
@@ -383,7 +428,22 @@ export function mcpConnectionsRoutes(deps: McpRouteDeps): Hono {
  * Mount at `/` so the well-known documents are served from the PS origin and
  * Claude can discover auth for the stable `/mcp` resource.
  */
-export function mcpOAuthRoutes(deps: McpRouteDeps): Hono {
+export type McpOAuthRouteDeps = Pick<
+  McpRouteDeps,
+  | "connectionStore"
+  | "oauthAuthorizationStore"
+  | "oauthApprovalUrl"
+  | "serverOrigin"
+  | "serverOwner"
+  | "gateway"
+  | "devToken"
+  | "accessToken"
+  | "tokenStore"
+  | "gatewayConfig"
+  | "serverSigner"
+>;
+
+export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
   const app = new Hono();
   const connectionStore =
     deps.connectionStore ?? createInMemoryMcpConnectionStore();
@@ -462,7 +522,7 @@ export function mcpOAuthRoutes(deps: McpRouteDeps): Hono {
           ? body.redirect_uris
           : [],
         token_endpoint_auth_method: "none",
-        grant_types: ["authorization_code"],
+        grant_types: [...SUPPORTED_GRANT_TYPES],
         response_types: ["code"],
       },
       201,
@@ -556,28 +616,38 @@ export function mcpOAuthRoutes(deps: McpRouteDeps): Hono {
       );
     }
     const body = await parseFormBody(c.req.raw);
-    if (body.get("grant_type") !== "authorization_code") {
+    const grantType = body.get("grant_type") ?? "";
+    if (!isSupportedGrantType(grantType)) {
       return c.json(
         {
           error: "unsupported_grant_type",
-          error_description: "Only authorization_code is supported",
+          error_description: `Supported grant types: ${SUPPORTED_GRANT_TYPES.join(", ")}`,
         },
         400,
       );
     }
+    const clientId = body.get("client_id") ?? "";
     try {
-      const token = await redeemMcpOAuthAuthorizationCode(
-        {
-          authorizationCode: body.get("code") ?? "",
-          codeVerifier: body.get("code_verifier") ?? "",
-          clientId: body.get("client_id") ?? "",
-          redirectUri: body.get("redirect_uri") ?? "",
-        },
-        { authorizationStore, connectionStore },
-      );
+      const token =
+        grantType === REFRESH_TOKEN_GRANT
+          ? await refreshMcpOAuthToken(
+              { refreshToken: body.get("refresh_token") ?? "", clientId },
+              { connectionStore },
+            )
+          : await redeemMcpOAuthAuthorizationCode(
+              {
+                authorizationCode: body.get("code") ?? "",
+                codeVerifier: body.get("code_verifier") ?? "",
+                clientId,
+                redirectUri: body.get("redirect_uri") ?? "",
+              },
+              { authorizationStore, connectionStore },
+            );
       return c.json({
         access_token: token.accessToken,
         token_type: "Bearer",
+        expires_in: token.expiresIn,
+        refresh_token: token.refreshToken,
         ...(token.scope ? { scope: token.scope } : {}),
       });
     } catch (err) {

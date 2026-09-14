@@ -1,0 +1,24 @@
+# Prebuilt sandbox runtime: the pinned dind base with gVisor baked in. The CVM
+# used to download and bzip2-extract gVisor on every boot (~50 s of the
+# measured start-to-health time); the runtime is now part of the image digest.
+#
+# gVisor ships x86_64 binaries only, so this image is linux/amd64 only.
+FROM docker:27.5.1-dind@sha256:f649ef046008ca7f926a2571c32b0ac22e5c59eb61b959617f9acc2a4c638cf5
+
+# Runtime tools the boot command used to apk-add: iproute2 resolves the compose
+# address, iptables fences the Docker API, bzip2/coreutils unpack gVisor here.
+RUN apk add --no-cache bzip2 coreutils curl iproute2 iptables
+
+ARG GVISOR_RELEASE=20260817
+ARG GVISOR_SHA512=bd8271a7742f90e53373b2a8613f37f3ae2c765ff5e2e611a75a47167a323cab7519b149c50273307743491713525a14ad1b3e398651c93b16f3e248dfeff3dd
+
+# Verify the release against its published sha512 before it can run as a
+# runtime. systrap avoids ptrace syscall overhead; the runtime name stays
+# runsc-ptrace so the agent's runtime constant does not change.
+RUN cd /tmp \
+  && curl -fsSLO "https://storage.googleapis.com/gvisor/releases/release/${GVISOR_RELEASE}/x86_64/gvisor.tar.bz2" \
+  && printf '%s  %s\n' "${GVISOR_SHA512}" gvisor.tar.bz2 | sha512sum -c - \
+  && tar -xjf gvisor.tar.bz2 -C /usr/local/bin \
+  && rm -f gvisor.tar.bz2 \
+  && runsc install --runtime runsc-ptrace -- --platform=systrap \
+  && runsc --version

@@ -1,5 +1,6 @@
 export * from "./types.js";
 export * from "./store.js";
+export * from "./token-expiry.js";
 export * from "./grantee.js";
 export * from "./builder-registration.js";
 export * from "./read-client.js";

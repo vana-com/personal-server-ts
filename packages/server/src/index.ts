@@ -1,49 +1,20 @@
-import { createAdaptorServer } from "@hono/node-server";
-import type { AddressInfo } from "node:net";
 import { createRequire } from "node:module";
 import { loadConfig } from "./config/index.js";
 import { createServer } from "./bootstrap.js";
 import { verifyTunnelUrl } from "./tunnel/index.js";
+import { runEnclaveMain } from "./enclave-main.js";
+import { listenHttpServer, type NodeServer } from "./listen.js";
 
 const require = createRequire(import.meta.url);
 const pkg = require("../package.json") as { version: string };
 
 const DRAIN_TIMEOUT_MS = 5_000;
-type NodeFetchHandler = Parameters<typeof createAdaptorServer>[0]["fetch"];
-type NodeServer = ReturnType<typeof createAdaptorServer>;
-
-async function listenHttpServer(params: {
-  fetch: NodeFetchHandler;
-  port: number;
-  hostname?: string;
-  onListening?: (info: AddressInfo) => void;
-}): Promise<NodeServer> {
-  const server = createAdaptorServer({ fetch: params.fetch });
-
-  await new Promise<void>((resolve, reject) => {
-    const onError = (error: Error) => {
-      server.off("error", onError);
-      reject(error);
-    };
-
-    server.once("error", onError);
-    server.listen(params.port, params.hostname, () => {
-      server.off("error", onError);
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        reject(new Error("Could not resolve bound server address"));
-        return;
-      }
-
-      params.onListening?.(address);
-      resolve();
-    });
-  });
-
-  return server;
-}
-
 async function main(): Promise<void> {
+  if (process.env.ENCLAVE_MODE === "true") {
+    await runEnclaveMain();
+    return;
+  }
+
   const rootPath = process.env.PERSONAL_SERVER_ROOT_PATH;
   const config = await loadConfig({ rootPath });
   const context = await createServer(config, { rootPath });

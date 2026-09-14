@@ -1,15 +1,15 @@
 name: Build and Push Docker Image
 
 on:
+  workflow_dispatch:
   push:
-    branches: [main]
-    paths-ignore:
-      - "*.md"
-      - "docs/**"
-      - ".github/workflows/!(docker.yml)"
+    branches:
+      - main
+      - "feat/**"
+      - "perf/**"
 
 concurrency:
-  group: docker-build
+  group: docker-build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -25,12 +25,80 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_SERVICE_ACCOUNT_PAT }}
 
+      - name: Prepare image tags
+        id: tags
+        env:
+          IMAGE_NAME: ${{ vars.DOCKERHUB_USERNAME }}/personal-server
+          ENCLAVE_IMAGE_NAME: ${{ vars.DOCKERHUB_USERNAME }}/personal-server-enclave
+          RUNTIME_IMAGE_NAME: ${{ vars.DOCKERHUB_USERNAME }}/personal-server-sandbox-runtime
+          IMAGE_SHA: ${{ github.sha }}
+          PUBLISH_LATEST: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          emit() {
+            echo "$1<<EOF"
+            printf '%s:%s\n' "$2" "$IMAGE_SHA"
+            if [[ "$PUBLISH_LATEST" == "true" ]]; then
+              printf '%s:latest\n' "$2"
+            fi
+            echo 'EOF'
+          }
+          {
+            emit tags "$IMAGE_NAME"
+            emit enclave_tags "$ENCLAVE_IMAGE_NAME"
+            emit runtime_tags "$RUNTIME_IMAGE_NAME"
+          } >> "$GITHUB_OUTPUT"
+
       - uses: docker/build-push-action@v7
+        id: build
         with:
           context: .
           push: true
-          tags: |
-            ${{ vars.DOCKERHUB_USERNAME }}/personal-server:latest
-            ${{ vars.DOCKERHUB_USERNAME }}/personal-server:${{ github.sha }}
+          platforms: linux/amd64
+          tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # One enclave image serves both fleet roles; the compose command selects
+      # the agent or the controller entrypoint.
+      - uses: docker/build-push-action@v7
+        id: build-enclave
+        with:
+          context: .
+          file: Dockerfile.enclave
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.tags.outputs.enclave_tags }}
+          cache-from: type=gha,scope=enclave
+          cache-to: type=gha,mode=max,scope=enclave
+
+      # gVisor ships x86_64 binaries only, so this image is linux/amd64 only.
+      - uses: docker/build-push-action@v7
+        id: build-runtime
+        with:
+          context: deploy/dstack
+          file: deploy/dstack/Dockerfile.sandbox-runtime
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.tags.outputs.runtime_tags }}
+          cache-from: type=gha,scope=sandbox-runtime
+          cache-to: type=gha,mode=max,scope=sandbox-runtime
+
+      - name: Record image digests
+        env:
+          PS_IMAGE: ${{ vars.DOCKERHUB_USERNAME }}/personal-server@${{ steps.build.outputs.digest }}
+          PS_IMAGE_REF: ${{ github.sha }}
+          AGENT_IMAGE: ${{ vars.DOCKERHUB_USERNAME }}/personal-server-enclave@${{ steps.build-enclave.outputs.digest }}
+          RUNTIME_IMAGE: ${{ vars.DOCKERHUB_USERNAME }}/personal-server-sandbox-runtime@${{ steps.build-runtime.outputs.digest }}
+        run: |
+          printf 'PS_IMAGE=%s\nPS_IMAGE_REF=%s\nAGENT_IMAGE=%s\nCONTROLLER_IMAGE=%s\nRUNTIME_IMAGE=%s\n' \
+            "$PS_IMAGE" "$PS_IMAGE_REF" "$AGENT_IMAGE" "$AGENT_IMAGE" "$RUNTIME_IMAGE" > images.env
+          {
+            echo '```text'
+            cat images.env
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: images.env
+          path: images.env

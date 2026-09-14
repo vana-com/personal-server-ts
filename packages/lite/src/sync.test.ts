@@ -1,3 +1,15 @@
+import { privateKeyToAccount } from "viem/accounts";
+import { recoverTypedDataAddress } from "viem";
+import {
+  type AddDataMessage,
+  ADD_DATA_TYPES,
+  deriveMasterKey,
+  deriveScopeKey,
+  decryptWithPassword,
+  dataRegistryDomain,
+  parseWeb3SignedHeader,
+  verifyWeb3Signed,
+} from "@opendatalabs/vana-sdk/browser";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import {
@@ -24,6 +36,150 @@ describe("PS Lite sync", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
+  });
+
+  it("uploads with owner authority without a registered server", async () => {
+    const owner = privateKeyToAccount(`0x${"12".repeat(32)}`);
+    const ownerSignature = await owner.signMessage({
+      message: "vana-master-key-v1",
+    });
+    const config = ServerConfigSchema.parse({ sync: { enabled: true } });
+    const storage = createMemoryPsLiteStorage();
+    const envelope = createDataFileEnvelope(
+      "spotify.profile",
+      "2026-09-08T00:00:00.000Z",
+      { displayName: "Public Spotify" },
+      "https://schemas.example/spotify.profile.json",
+      SCHEMA_ID,
+    );
+    const write = await storage.writeEnvelope(envelope);
+    storage.insertEntry({
+      fileId: null,
+      schemaId: SCHEMA_ID,
+      path: write.relativePath,
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      sizeBytes: write.sizeBytes,
+    });
+    const stateStore = createMemoryPsLiteStateStore();
+    const identity = await loadOrCreatePsLiteServerIdentity({
+      store: stateStore,
+      ownerSignature,
+    });
+    const gateway = {
+      getServer: vi.fn().mockResolvedValue(null),
+      registerServer: vi.fn(),
+      registerDataPoint: vi
+        .fn()
+        .mockResolvedValue({ dataPointId: "0xowner-dp", expectedVersion: "1" }),
+    };
+    const url = `https://storage.vana.org/v1/chains/14800/blobs/${owner.address.toLowerCase()}/spotify.profile/1`;
+    const fetchMock = vi.fn().mockImplementation(
+      async () =>
+        new Response(
+          JSON.stringify({
+            url,
+            key: "spotify.profile/1",
+            size: 256,
+            etag: "owner",
+          }),
+          { status: 200 },
+        ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const { syncManager } = await createPsLiteSyncManager({
+      config,
+      storage,
+      stateStore,
+      ownerSignature,
+      serverAccount: identity.account,
+      ownerSyncSigner: {
+        address: owner.address,
+        signMessage: (message: string) => owner.signMessage({ message }),
+        signAddData: (message: AddDataMessage) =>
+          owner.signTypedData({
+            domain: dataRegistryDomain(config.gateway),
+            types: ADD_DATA_TYPES,
+            primaryType: "AddData",
+            message,
+          }),
+        signLineageAttestation: vi.fn(),
+      },
+      gateway: gateway as never,
+      dataPointFeed: {
+        getDataPoint: async () => null,
+        listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      },
+    });
+    try {
+      await syncManager.trigger();
+    } finally {
+      await syncManager.stop();
+    }
+    expect(storage.findUnsynced()).toEqual([]);
+    expect(gateway.getServer).not.toHaveBeenCalled();
+    expect(gateway.registerServer).not.toHaveBeenCalled();
+    const registration = gateway.registerDataPoint.mock.calls[0][0];
+    expect(
+      await recoverTypedDataAddress({
+        domain: dataRegistryDomain(config.gateway),
+        types: ADD_DATA_TYPES,
+        primaryType: "AddData",
+        message: {
+          ...registration,
+          expectedVersion: BigInt(registration.expectedVersion),
+        },
+        signature: registration.signature,
+      }),
+    ).toBe(owner.address);
+    const [uploadUrl, upload] = fetchMock.mock.calls.find(
+      ([, request]) => request.method === "PUT",
+    )!;
+    const parsed = parseWeb3SignedHeader(upload.headers.authorization);
+    const verified = await verifyWeb3Signed({
+      headerValue: upload.headers.authorization,
+      expectedOrigin: "https://storage.vana.org",
+      expectedMethod: "PUT",
+      expectedPath: new URL(uploadUrl).pathname,
+      bodyBytes: upload.body,
+    });
+    expect(verified.signer.toLowerCase()).toBe(owner.address.toLowerCase());
+    expect(parsed.payload.uri).toContain("/spotify.profile/1");
+    const key = deriveScopeKey(
+      deriveMasterKey(ownerSignature),
+      "spotify.profile",
+    );
+    const password = Array.from(key, (byte) =>
+      byte.toString(16).padStart(2, "0"),
+    ).join("");
+    const plaintext = await decryptWithPassword(upload.body, password);
+    expect(JSON.parse(new TextDecoder().decode(plaintext))).toEqual(envelope);
+    expect(new TextDecoder().decode(upload.body)).not.toContain(
+      "Public Spotify",
+    );
+  });
+
+  it("rejects an owner sync capability for a different owner", async () => {
+    const stateStore = createMemoryPsLiteStateStore();
+    const identity = await loadOrCreatePsLiteServerIdentity({
+      store: stateStore,
+      ownerSignature: OWNER_SIGNATURE,
+    });
+    await expect(
+      createPsLiteSyncManager({
+        config: ServerConfigSchema.parse({}),
+        stateStore,
+        storage: createMemoryPsLiteStorage(),
+        ownerSignature: OWNER_SIGNATURE,
+        serverAccount: identity.account,
+        ownerSyncSigner: {
+          address: identity.account.address,
+          signAddData: vi.fn(),
+          signLineageAttestation: vi.fn(),
+          signMessage: vi.fn(),
+        },
+      }),
+    ).rejects.toThrow("Owner sync signer must match the verified data owner");
   });
 
   it("uploads unsynced browser-local data and persists the data-point id", async () => {

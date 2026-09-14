@@ -2,7 +2,7 @@ import type { UploadWorkerDeps } from "../workers/upload.js";
 import type { DownloadWorkerDeps } from "../workers/download.js";
 import type { SyncStatus, SyncError, SyncBlockedReason } from "../types.js";
 import { uploadAll } from "../workers/upload.js";
-import { downloadAll } from "../workers/download.js";
+import { downloadAll, downloadScopes } from "../workers/download.js";
 import {
   deleteScope,
   retryPendingBlobDeletions,
@@ -30,6 +30,10 @@ export interface SyncManagerOptions {
   deleteData?: DeleteDataPort | null;
   /** Durable retry marker for blob deletions that failed after the tombstone. */
   pendingBlobDeletions?: PendingBlobDeletionStore;
+  /** Select download-only operation for runtimes that cannot sign uploads. */
+  transferMode?: "upload-download" | "download-only";
+  /** Exact owner scopes to hydrate before the first full download cycle. */
+  hydrateScopes?: string[];
 }
 
 export type SyncCanRunResult =
@@ -47,6 +51,9 @@ export interface SyncManager {
 
   /** Get current sync status */
   getStatus(): SyncStatus;
+
+  /** Download exact owner scopes without advancing the registry cursor. */
+  hydrateScopes(scopes: string[]): Promise<void>;
 
   /** Signal that new data has been ingested (next cycle picks it up) */
   notifyNewData(): void;
@@ -73,6 +80,8 @@ export function createSyncManager(
   const pollInterval = options?.pollInterval ?? 60_000;
   const uploadBatchSize = options?.uploadBatchSize ?? 50;
   const notifyDebounceMs = options?.notifyDebounceMs ?? 500;
+  const transferMode = options?.transferMode ?? "upload-download";
+  const startupHydrateScopes = [...new Set(options?.hydrateScopes ?? [])];
 
   let intervalId: ReturnType<typeof setInterval> | null = null;
   let notifyTimerId: ReturnType<typeof setTimeout> | null = null;
@@ -84,6 +93,8 @@ export function createSyncManager(
   let cycleInFlight: Promise<void> | null = null;
   let rerunRequested = false;
   let needsFullReconcile = true;
+  let needsStartupHydration = startupHydrateScopes.length > 0;
+  const hydratedScopes = new Set<string>();
   // One retry memory per manager (= per boot session): a blob that 404s is
   // attempted once per session, not once per cycle; transient storage errors
   // back off exponentially instead of re-firing on every cycle.
@@ -116,6 +127,20 @@ export function createSyncManager(
     return run;
   }
 
+  async function hydrateScopesExclusive(scopes: string[]): Promise<void> {
+    // Resolve scopes individually so an earlier success remains observable if
+    // a later scope fails.
+    for (const scope of new Set(scopes)) {
+      await downloadScopes(workerDownloadDeps, [scope], {
+        retryMemory: downloadRetryMemory,
+      });
+      // "Hydrated" means the remote scope was resolved, including an absent
+      // data point or tombstone; it does not guarantee local bytes exist.
+      hydratedScopes.add(scope);
+      downloadDeps.logger.info({ scope }, "Hydrated requested scope");
+    }
+  }
+
   async function runCycle(): Promise<void> {
     // Prevent concurrent cycles
     if (cycleInFlight) {
@@ -134,53 +159,22 @@ export function createSyncManager(
         }
         blocked = null;
 
-        // Finish blob deletions whose tombstone landed but whose storage
-        // DELETE did not. Cheap when nothing is pending; never blocks sync.
-        try {
-          await retryPendingBlobDeletions({
-            deleteData: options?.deleteData,
-            pendingBlobDeletions: options?.pendingBlobDeletions,
-            dataPointFeed,
-            serverOwner: uploadDeps.serverOwner,
-            storage: uploadDeps.storage,
-            logger: uploadDeps.logger,
-          });
-        } catch (err) {
-          uploadDeps.logger.warn(
-            { error: (err as Error).message },
-            "Pending blob deletion retry failed",
-          );
+        if (needsStartupHydration) {
+          try {
+            await hydrateScopesExclusive(startupHydrateScopes);
+            needsStartupHydration = false;
+          } catch (err) {
+            downloadDeps.logger.warn(
+              { error: (err as Error).message },
+              "Scope hydration failed; continuing with full sync",
+            );
+          }
         }
 
-        try {
-          // Upload unsynced local files
-          const uploadResults = await uploadAll(workerUploadDeps, {
-            batchSize: uploadBatchSize,
-            onError(entry, error) {
-              pushError({
-                fileId: entry.fileId,
-                scope: entry.scope,
-                message: `Upload failed for ${entry.path}: ${error.message}`,
-                timestamp: new Date().toISOString(),
-              });
-            },
-          });
-          uploadDeps.logger.debug(
-            { uploaded: uploadResults.length },
-            "Upload cycle complete",
-          );
-        } catch (err) {
-          const syncError: SyncError = {
-            fileId: null,
-            scope: null,
-            message: `Upload cycle failed: ${(err as Error).message}`,
-            timestamp: new Date().toISOString(),
-          };
-          pushError(syncError);
-          uploadDeps.logger.error(
-            { error: (err as Error).message },
-            "Upload cycle failed",
-          );
+        // Finish blob deletions whose tombstone landed but whose storage
+        // DELETE did not. Cheap when nothing is pending; never blocks sync.
+        if (transferMode === "upload-download") {
+          await runUploadCycle();
         }
 
         try {
@@ -224,6 +218,54 @@ export function createSyncManager(
       await cycleInFlight;
     } finally {
       cycleInFlight = null;
+    }
+  }
+
+  async function runUploadCycle(): Promise<void> {
+    try {
+      await retryPendingBlobDeletions({
+        deleteData: options?.deleteData,
+        pendingBlobDeletions: options?.pendingBlobDeletions,
+        dataPointFeed,
+        serverOwner: uploadDeps.serverOwner,
+        storage: uploadDeps.storage,
+        logger: uploadDeps.logger,
+      });
+    } catch (err) {
+      uploadDeps.logger.warn(
+        { error: (err as Error).message },
+        "Pending blob deletion retry failed",
+      );
+    }
+
+    try {
+      const uploadResults = await uploadAll(workerUploadDeps, {
+        batchSize: uploadBatchSize,
+        onError(entry, error) {
+          pushError({
+            fileId: entry.fileId,
+            scope: entry.scope,
+            message: `Upload failed for ${entry.path}: ${error.message}`,
+            timestamp: new Date().toISOString(),
+          });
+        },
+      });
+      uploadDeps.logger.debug(
+        { uploaded: uploadResults.length },
+        "Upload cycle complete",
+      );
+    } catch (err) {
+      const syncError: SyncError = {
+        fileId: null,
+        scope: null,
+        message: `Upload cycle failed: ${(err as Error).message}`,
+        timestamp: new Date().toISOString(),
+      };
+      pushError(syncError);
+      uploadDeps.logger.error(
+        { error: (err as Error).message },
+        "Upload cycle failed",
+      );
     }
   }
 
@@ -317,8 +359,22 @@ export function createSyncManager(
         lastSync,
         lastProcessedTimestamp,
         pendingFiles,
+        hydratedScopes: [...hydratedScopes],
         errors: [...errors],
       };
+    },
+
+    hydrateScopes(scopes) {
+      return exclusive(async () => {
+        const canRun = await (options?.canSync?.() ?? { ok: true });
+        if (!canRun.ok) {
+          blocked = { reason: canRun.reason, message: canRun.message };
+          downloadDeps.logger.warn(blocked, "Scope hydration blocked");
+          return;
+        }
+        blocked = null;
+        await hydrateScopesExclusive(scopes);
+      });
     },
 
     notifyNewData() {

@@ -22,11 +22,13 @@
  *     revoke from the user's perspective.
  */
 
-import type {
-  McpConnectionRecord,
-  McpConnectionStore,
-  McpOAuthAuthorizationRecord,
-  McpOAuthAuthorizationStore,
+import {
+  isMcpTokenExpired,
+  matchesMcpRefreshHash,
+  type McpConnectionRecord,
+  type McpConnectionStore,
+  type McpOAuthAuthorizationRecord,
+  type McpOAuthAuthorizationStore,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 
 const DEFAULT_DB_NAME = "personal-server-lite";
@@ -222,7 +224,23 @@ export function createIndexedDbMcpConnectionStore(
       );
       if (!record) return null;
       if (record.status !== "approved") return null;
+      if (isMcpTokenExpired(record)) return null;
       return { ...record };
+    },
+
+    async getByRefreshTokenHash(refreshTokenHash) {
+      // No IndexedDB index: a presented token may match either the current or
+      // the rotated-out hash, and the store holds a handful of connections.
+      const all = await runTx<McpConnectionRecord[]>(
+        resolved,
+        "readonly",
+        CONNECTION_INDEXES,
+        (store) => store.getAll(),
+      );
+      const record = all.find((candidate) =>
+        matchesMcpRefreshHash(candidate, refreshTokenHash),
+      );
+      return record ? { ...record } : null;
     },
 
     async update(id, patch) {
