@@ -672,6 +672,19 @@
       const TOKEN = "__DEV_TOKEN__";
       const BASE = window.location.origin;
       window.__PS_LITE_BOOTSTRAP__ = "__PS_LITE_BOOTSTRAP_JSON__";
+      // The owner (master-key) signature is never embedded in this page.
+      // Fetch it with the dev token so it only reaches a caller that can
+      // present the token in an Authorization header.
+      fetch(`${BASE}/ui/api/bootstrap`, {
+        headers: { Authorization: `Bearer ${TOKEN}` },
+      })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((b) => {
+          window.__PS_LITE_BOOTSTRAP__ = b;
+        })
+        .catch(() => {
+          window.__PS_LITE_BOOTSTRAP__ = null;
+        });
       const runtimeState = {
         active: "node",
         registration: { ownerPrivateKeyConfigured: false },

@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join, dirname, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -5,6 +6,13 @@ import { Hono } from "hono";
 
 export interface UiRouteDeps {
   devToken: string;
+  /**
+   * PS Lite debug bootstrap (owner master-key signature + config). NEVER
+   * rendered into the HTML — served only by `GET /api/bootstrap` to a caller
+   * presenting the dev token. The owner signature recovers the owner identity
+   * and derives the storage encryption key, so it must not sit in a page that
+   * any GET can fetch.
+   */
   psLiteBootstrap?: unknown;
 }
 
@@ -25,16 +33,15 @@ function getUiAssetPath(fileName: string): string {
   return distPath;
 }
 
-function loadHtml(devToken: string, psLiteBootstrap: unknown): string {
+function loadHtml(devToken: string): string {
   if (!cachedHtml) {
     cachedHtml = readFileSync(getHtmlPath(), "utf-8");
   }
+  // The bootstrap placeholder is always rendered as `null`; the page fetches
+  // the real value from /api/bootstrap with the dev token at runtime.
   return cachedHtml
     .replace("__DEV_TOKEN__", devToken)
-    .replace(
-      '"__PS_LITE_BOOTSTRAP_JSON__"',
-      JSON.stringify(psLiteBootstrap ?? null),
-    );
+    .replace('"__PS_LITE_BOOTSTRAP_JSON__"', "null");
 }
 
 function contentTypeFor(fileName: string): string {
@@ -43,12 +50,24 @@ function contentTypeFor(fileName: string): string {
   return "application/octet-stream";
 }
 
+function hasDevToken(
+  authHeader: string | undefined,
+  devToken: string,
+): boolean {
+  if (!authHeader) return false;
+  const expected = Buffer.from(`Bearer ${devToken}`);
+  const presented = Buffer.from(authHeader);
+  return (
+    expected.length === presented.length && timingSafeEqual(expected, presented)
+  );
+}
+
 export function uiRoute(deps: UiRouteDeps): Hono {
   const app = new Hono();
 
   app.get("/", (c) => {
     try {
-      const html = loadHtml(deps.devToken, deps.psLiteBootstrap);
+      const html = loadHtml(deps.devToken);
       return c.html(html);
     } catch {
       return c.json(
@@ -62,6 +81,29 @@ export function uiRoute(deps: UiRouteDeps): Hono {
         500,
       );
     }
+  });
+
+  // Dev-token-gated bootstrap for the browser PS Lite debug runtime. Keeps the
+  // owner signature out of the HTML: it is only returned to a caller that can
+  // present the dev token in an Authorization header (which a cross-origin
+  // page cannot attach without a CORS preflight).
+  app.get("/api/bootstrap", (c) => {
+    if (!hasDevToken(c.req.header("authorization"), deps.devToken)) {
+      return c.json(
+        {
+          error: {
+            code: 401,
+            errorCode: "MISSING_AUTH",
+            message: "Dev token required",
+          },
+        },
+        401,
+      );
+    }
+    if (!deps.psLiteBootstrap) {
+      return c.notFound();
+    }
+    return c.json(deps.psLiteBootstrap, 200, { "cache-control": "no-store" });
   });
 
   app.get("/:file", (c) => {

@@ -279,14 +279,27 @@ describe("createServer", () => {
 
     const token = ctx.devToken;
     expect(token).toBeDefined();
-    const res = await ctx.app.request("/ui/api/config", {
-      method: "PUT",
-      headers: {
-        authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
+    // The dev UI subtree is served only on the loopback auth listener;
+    // simulate a connection that arrived there.
+    const res = await ctx.app.request(
+      "/ui/api/config",
+      {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(config),
       },
-      body: JSON.stringify(config),
-    });
+      {
+        incoming: {
+          socket: {
+            localPort: ctx.localApprovalPort,
+            localAddress: "127.0.0.1",
+          },
+        },
+      },
+    );
     expect(res.status).toBe(200);
 
     const configOnDisk = JSON.parse(
