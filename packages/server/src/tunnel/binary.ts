@@ -200,11 +200,19 @@ export async function extractBinary(
 
 export interface EnsureFrpcOptions {
   log?: (msg: string) => void;
+  /**
+   * A preinstalled frpc to use instead of the downloaded one. Returned as-is
+   * when it exists; when it does not, the download path runs and says so,
+   * because a tunnel that never comes up is a worse failure than a binary
+   * from the wrong place.
+   */
+  binaryPath?: string;
 }
 
 /**
  * Main entry point: ensure the correct frpc binary is available.
  *
+ * 0. A preinstalled binary was named and exists — use it, touch nothing.
  * 1. Check version file — if version matches and binary exists, return path (fast path).
  * 2. Otherwise download, extract, chmod, write version file, return path.
  */
@@ -213,6 +221,19 @@ export async function ensureFrpcBinary(
   options?: EnsureFrpcOptions,
 ): Promise<string> {
   const log = options?.log ?? (() => {});
+
+  if (options?.binaryPath) {
+    try {
+      await access(options.binaryPath, constants.F_OK);
+      log(`Using preinstalled frpc at ${options.binaryPath}`);
+      return options.binaryPath;
+    } catch {
+      log(
+        `Preinstalled frpc not found at ${options.binaryPath}; falling back to download`,
+      );
+    }
+  }
+
   const binDir = join(storageRoot, "bin");
   const binaryPath = getBinaryPath(storageRoot);
 

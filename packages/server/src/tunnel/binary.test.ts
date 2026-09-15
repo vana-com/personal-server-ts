@@ -147,6 +147,45 @@ describe("tunnel/binary", () => {
   });
 
   describe("ensureFrpcBinary", () => {
+    it("uses a preinstalled binary and leaves the storage root untouched", async () => {
+      // The Desktop app ships frpc inside its signed bundle. Naming it here
+      // must mean nothing gets downloaded into the user's home directory.
+      const preinstalled = join(tempDir, "bundled-frpc");
+      await writeFile(preinstalled, "signed-binary");
+
+      const logs: string[] = [];
+      const result = await ensureFrpcBinary(join(tempDir, "storage"), {
+        log: (msg) => logs.push(msg),
+        binaryPath: preinstalled,
+      });
+
+      expect(result).toBe(preinstalled);
+      expect(logs.some((l) => l.includes("preinstalled"))).toBe(true);
+      await expect(access(join(tempDir, "storage", "bin"))).rejects.toThrow();
+    });
+
+    it("falls back to download, and says so, when the preinstalled binary is missing", async () => {
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = vi
+        .fn()
+        .mockRejectedValue(new Error("network disabled in test"));
+      const logs: string[] = [];
+
+      try {
+        await expect(
+          ensureFrpcBinary(tempDir, {
+            log: (msg) => logs.push(msg),
+            binaryPath: join(tempDir, "does-not-exist"),
+          }),
+        ).rejects.toThrow("network disabled in test");
+        expect(logs.some((l) => l.includes("falling back to download"))).toBe(
+          true,
+        );
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
     it("skips download when version matches and binary exists", async () => {
       // Set up a fake existing binary + version file
       const binDir = join(tempDir, "bin");
