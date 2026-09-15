@@ -44,14 +44,14 @@
         "FLEET_ADMIN_PORT": "8791",
         "FLEET_PEER_HOST": "0.0.0.0",
         "FLEET_PEER_PORT": "8792",
-        "MCP_MIGRATION_REQUIRED": "1",
+        "MCP_MIGRATION_REQUIRED": "0",
         "MCP_PUBLIC_ORIGIN": "REPLACE_WITH_MAINNET_MCP_PUBLIC_ORIGIN",
         "MCP_APPROVAL_URL": "REPLACE_WITH_MAINNET_MCP_APPROVAL_URL",
         "MCP_STATE_PATH": "/mcp-state/state.sealed",
         "MCP_INGRESS_HOST": "0.0.0.0",
         "MCP_INGRESS_PORT": "8788",
         "MCP_REDIRECT_URIS": "[\"https://claude.ai/api/mcp/auth_callback\",\"https://claude.com/api/mcp/auth_callback\"]",
-        "MCP_STATE_REQUIRED": "1"
+        "MCP_STATE_REQUIRED": "0"
       },
       "secretRefs": {
         "FLEET_GATEWAY_TOKEN": "mainnet-prod1-fleet-gateway-token",

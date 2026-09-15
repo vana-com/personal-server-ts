@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { expect, it, vi } from "vitest";
 import { createFakeDstackClient } from "../dstack/fake.js";
 import { startFleetCentral } from "./bootstrap.js";
-import { MAINNET_CHAIN_ID } from "../chain-id.js";
+import { MAINNET_CHAIN_ID, MAINNET_GATEWAY_ORIGIN } from "../chain-id.js";
 import { createMcpConnection } from "@opendatalabs/personal-server-ts-core/mcp";
 import { openMcpDurableState } from "@opendatalabs/personal-server-ts-server/mcp/tee";
 import { userPsId } from "@opendatalabs/vana-sdk/protocol/identity";
@@ -806,7 +806,7 @@ it("boots a controller whose signed config names mainnet", async () => {
     CHAIN_ID: String(MAINNET_CHAIN_ID),
     CONTROLLER_TERM: "1",
     NODE_ID: "controller",
-    GATEWAY_URL: "https://dp-rpc.invalid",
+    GATEWAY_URL: MAINNET_GATEWAY_ORIGIN,
     FLEET_STATE_PATH: join(path, "placements.json"),
     FLEET_WORKERS_JSON: "[]",
     FLEET_GATEWAY_TOKEN: "g".repeat(32),

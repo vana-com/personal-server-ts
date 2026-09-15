@@ -205,6 +205,40 @@ class ManifestFencing(unittest.TestCase):
         self.assertIn("nodes.controller.measured.rtmrs[1]", str(raised.exception))
 
 
+class ManifestTrustDomain(unittest.TestCase):
+    def setUp(self):
+        self.manifest = json.loads(MANIFEST.read_text())
+
+    def test_a_placeholder_key_is_caught(self):
+        nodes = self.manifest["nodes"]
+        nodes["REPLACE_WITH_WORKER_NAME"] = nodes.pop("worker-1")
+
+        with self.assertRaises(SystemExit) as raised:
+            rf.assert_manifest(self.manifest)
+
+        self.assertIn("nodes.REPLACE_WITH_WORKER_NAME", str(raised.exception))
+
+    def test_a_mixed_chain_manifest_is_refused(self):
+        self.manifest["nodes"]["worker-1"]["env"]["CHAIN_ID"] = "1480"
+
+        with self.assertRaises(SystemExit) as raised:
+            rf.assert_manifest(self.manifest)
+
+        self.assertIn("mixes chains", str(raised.exception))
+
+    def test_a_second_kms_root_is_refused(self):
+        self.manifest["nodes"]["worker-1"]["measured"]["keyProviderSpki"] = "other"
+
+        with self.assertRaises(SystemExit) as raised:
+            rf.assert_manifest(self.manifest)
+
+        self.assertIn("mixes KMS roots", str(raised.exception))
+
+    def test_a_manifest_without_nodes_is_refused(self):
+        with self.assertRaises(SystemExit):
+            rf.assert_manifest(["not", "a", "manifest"])
+
+
 class ManifestPatching(unittest.TestCase):
     def setUp(self):
         self.text = MANIFEST.read_text()
