@@ -38,6 +38,11 @@ IMAGE_MARKERS = {
 }
 GIT_REF_MARKER = "REPLACE_WITH_REVIEWED_40_HEX_COMMIT"
 SPKI_MARKER = "REPLACE_WITH_OPERATOR_ED25519_SPKI_BASE64"
+# mcp-tls asks the node's dstack Gateway for the custom domain's certificate, so
+# this has to be the fleet's OWN node. It was a prod5 literal in the compose,
+# which left every other fleet's mcp-tls waiting on Moksha's domain forever.
+GATEWAY_DOMAIN_MARKER = "REPLACE_WITH_DSTACK_GATEWAY_DOMAIN"
+GATEWAY_DOMAIN_PREFIX = "_."
 MARKER_PREFIX = "REPLACE_WITH_"
 
 # The one service whose environment the signed bundle reaches.
@@ -270,12 +275,16 @@ def merge_compose(base_text, overlay_text):
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
-def render_compose(text, images, git_ref, spki):
+def render_compose(text, images, git_ref, spki, gateway_domain):
     """Replace every REPLACE_WITH_ marker with its reviewed literal."""
     for marker, key in IMAGE_MARKERS.items():
         text = text.replace(marker, images[key])
 
-    return text.replace(GIT_REF_MARKER, git_ref).replace(SPKI_MARKER, spki)
+    return (
+        text.replace(GIT_REF_MARKER, git_ref)
+        .replace(SPKI_MARKER, spki)
+        .replace(GATEWAY_DOMAIN_MARKER, GATEWAY_DOMAIN_PREFIX + gateway_domain)
+    )
 
 
 def service_env(text, service):
@@ -607,7 +616,13 @@ def render_composes(manifest, nodes, args, images, out_dir):
         for overlay in node.get("composeOverlays", []):
             text = merge_compose(text, (compose_dir / overlay).read_text())
 
-        text = render_compose(text, images, args.git_ref, manifest["operatorPublicKeySpkiBase64"])
+        text = render_compose(
+            text,
+            images,
+            args.git_ref,
+            manifest["operatorPublicKeySpkiBase64"],
+            manifest["gatewayDomain"],
+        )
         assert_compose(
             target, text, images, args.git_ref,
             manifest["operatorPublicKeySpkiBase64"], ROLE_SERVICE[node["role"]],
