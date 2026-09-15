@@ -306,6 +306,37 @@ def service_env(text, service):
     return values
 
 
+def manifest_markers(value, path=""):
+    """Every REPLACE_WITH_ placeholder still left in a manifest, by JSON path."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from manifest_markers(item, "%s.%s" % (path, key))
+
+        return
+
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from manifest_markers(item, "%s[%d]" % (path, index))
+
+        return
+
+    if isinstance(value, str) and MARKER_PREFIX in value:
+        yield path.lstrip(".")
+
+
+def assert_manifest(manifest):
+    """Fence a fleet template before anything is rendered from it.
+
+    A new fleet's app ids, instance ids and KMS root (`keyProviderSpki`) only
+    exist once its CVMs are provisioned and measured, so the template ships
+    them as REPLACE_WITH_ placeholders. Rendering from those would sign a
+    config no enclave can ever authenticate - fail closed here instead.
+    """
+    unresolved = sorted(manifest_markers(manifest))
+    if unresolved:
+        raise SystemExit("Unresolved manifest placeholders: %s" % ", ".join(unresolved))
+
+
 def assert_compose(name, text, images, git_ref, spki, service):
     """Fence a rendered compose before it is ever staged or measured."""
     # The composes document their own markers in comments; only code counts.
@@ -597,6 +628,7 @@ def main():
     args = parse_args()
     manifest_text = args.manifest.read_text()
     manifest = json.loads(manifest_text)
+    assert_manifest(manifest)
     nodes = manifest["nodes"]
     images = read_images(args.images_env)
     args.git_ref = args.git_ref or images.get("PS_IMAGE_REF")

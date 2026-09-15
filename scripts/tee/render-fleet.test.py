@@ -15,6 +15,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 COMPOSE_DIR = REPO / "deploy" / "dstack"
 MANIFEST = REPO / "deploy" / "dstack" / "fleets" / "preview-prod5.json"
+TEMPLATE = REPO / "deploy" / "dstack" / "fleets" / "mainnet-prod1.json"
 
 SPKI = "MCowBQYDK2VwAyEAPPx3xJ6NkAsPk1gT2v9E3s/huSL9MVG3S9D8e/Eqzjg="
 GIT_REF = "5bb959976edaf575b67738afbfb783d0498da4d2"
@@ -180,6 +181,28 @@ class Drafts(unittest.TestCase):
 
         with self.assertRaises(SystemExit):
             self.draft("worker-1")
+
+
+class ManifestFencing(unittest.TestCase):
+    def test_a_provisioned_manifest_passes(self):
+        rf.assert_manifest(json.loads(MANIFEST.read_text()))
+
+    def test_the_mainnet_template_cannot_render(self):
+        # It ships with placeholder ids: rendering it would sign a config no
+        # enclave can authenticate, so it must fail before any draft is built.
+        with self.assertRaises(SystemExit):
+            rf.assert_manifest(json.loads(TEMPLATE.read_text()))
+
+    def test_it_names_every_unresolved_field(self):
+        manifest = json.loads(MANIFEST.read_text())
+        manifest["nodes"]["controller"]["appId"] = "REPLACE_WITH_APP_ID"
+        manifest["nodes"]["controller"]["measured"]["rtmrs"][1] = "REPLACE_WITH_RTMR1"
+
+        with self.assertRaises(SystemExit) as raised:
+            rf.assert_manifest(manifest)
+
+        self.assertIn("nodes.controller.appId", str(raised.exception))
+        self.assertIn("nodes.controller.measured.rtmrs[1]", str(raised.exception))
 
 
 class ManifestPatching(unittest.TestCase):
