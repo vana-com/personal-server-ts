@@ -8,7 +8,13 @@ instead. Those values are the inputs to a signed fleet config draft.
   harvest-identity.py --nodes nodes.json [--save-attestations DIR] > identities.json
 
 `nodes.json` maps a role name to at least `{"uuid": ..., "appId": ...}`; every
-other key on the entry is copied through to the output untouched.
+other key on the entry is copied through to the output untouched. An entry may
+also carry `instanceId`, the value the caller expects that CVM to attest.
+
+A fleet's workers are replicas of one app, so `appId` does NOT identify a CVM:
+four of them share `ec9a39de...`, and `phala cvms list` collapses them. Only
+the uuid addresses a single CVM, and only the attested `instance-id` proves
+which one answered - so both are checked per node and across the run.
 """
 
 import argparse
@@ -44,7 +50,7 @@ def measured_identity(attestation, expected_app_id):
         if e["imr"] == MEASURED_IMR
     }
 
-    # A mismatch means the CLI answered about a different CVM than we staged.
+    # Necessary but far from sufficient: replicas share one app id.
     if events["app-id"] != expected_app_id:
         raise SystemExit("app-id %s does not match %s" % (events["app-id"], expected_app_id))
 
@@ -61,6 +67,28 @@ def measured_identity(attestation, expected_app_id):
         "mrTd": tcb["mrtd"],
         "rtmrs": [tcb["rtmr0"], tcb["rtmr1"], tcb["rtmr2"]],
     }
+
+
+def assert_instance(name, node, identity, claimed):
+    """Prove the attestation came from the CVM this entry names.
+
+    Under one app id the app-id echo passes for every replica, so a uuid that
+    resolved to the wrong CVM - or the same CVM twice - would harvest a
+    plausible identity for the wrong node and pin a draft that bricks on boot.
+    The attested instance id is the only per-CVM value in the quote.
+    """
+    instance_id = identity["instanceId"]
+    expected = node.get("instanceId")
+
+    if expected and expected != instance_id:
+        raise SystemExit("%s: expected instance %s, attested %s" % (name, expected, instance_id))
+
+    if instance_id in claimed:
+        raise SystemExit(
+            "%s and %s both attested instance %s" % (claimed[instance_id], name, instance_id)
+        )
+
+    claimed[instance_id] = name
 
 
 def parse_args():
@@ -82,7 +110,7 @@ def main():
     if args.save_attestations:
         args.save_attestations.mkdir(parents=True, exist_ok=True)
 
-    identities = {}
+    identities, claimed = {}, {}
     for name, node in nodes.items():
         attestation = read_attestation(node["uuid"])
 
@@ -90,7 +118,9 @@ def main():
             path = args.save_attestations / ("%s-attestation.json" % name)
             path.write_text(json.dumps(attestation, indent=2) + "\n")
 
-        identities[name] = {**node, **measured_identity(attestation, node["appId"])}
+        identity = measured_identity(attestation, node["appId"])
+        assert_instance(name, node, identity, claimed)
+        identities[name] = {**node, **identity}
         print(
             "%s %s %s" % (name, identities[name]["instanceId"], identities[name]["composeHash"]),
             file=sys.stderr,

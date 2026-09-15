@@ -169,6 +169,12 @@ derives the same owner job keys for both.
    python3 scripts/tee/harvest-identity.py --nodes nodes.json > identities.json
    ```
 
+   Workers are replicas of one app, so `appId` names a fleet, not a CVM, and
+   `phala cvms list` collapses them: address each by uuid and let the harvester
+   check the attested `instance-id`. Give an entry an `instanceId` to assert the
+   one it must answer with. `render-fleet.py --stage` runs the same check
+   against `pinned.instanceId` and refuses to stage a manifest gone stale.
+
 5. Render one signed-config draft per node from `identities.json`:
    `expiresAt: null`, `issuedAt` at the current second (the verifier rejects
    `now + 60 s`), and on a NET-NEW controller **both** `MCP_MIGRATION_REQUIRED=0`
@@ -261,8 +267,9 @@ A keychain item whose ACL does not cover the `security` CLI needs
 `--keychain-reader <script>`: the script gets `{"service","account"}` on stdin
 and prints the secret.
 
-Tests: `python3 scripts/tee/render-fleet.test.py` and
-`node --test scripts/tee/fleet-common.test.mjs`. Neither calls `phala`.
+Tests: `python3 scripts/tee/render-fleet.test.py`,
+`python3 scripts/tee/harvest-identity.test.py` and
+`node --test scripts/tee/fleet-common.test.mjs`. None calls `phala`.
 
 ### Known gaps
 
