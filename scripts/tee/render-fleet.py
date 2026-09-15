@@ -658,7 +658,6 @@ def main():
     args = parse_args()
     manifest_text = args.manifest.read_text()
     manifest = json.loads(manifest_text)
-    assert_manifest(manifest)
     nodes = manifest["nodes"]
     images = read_images(args.images_env)
     args.git_ref = args.git_ref or images.get("PS_IMAGE_REF")
@@ -679,6 +678,11 @@ def main():
 
     args.out.mkdir(parents=True, exist_ok=True)
     composes = render_composes(manifest, nodes, args, images, args.out)
+
+    # Fenced here, not at load: a from-scratch fleet has to render its composes
+    # to create the CVMs that its ids come from. Composes carry no manifest id,
+    # so they are safe to write; everything past this point is not.
+    assert_manifest(manifest)
 
     hashes = {name: node["pinned"]["composeHash"] for name, node in nodes.items()}
     if args.stage:
