@@ -1,10 +1,10 @@
 {
   "fleet": "moksha-prod5",
   "gatewayUrl": "https://dp-rpc.moksha.vana.org",
-  "gitRefCandidate": {
-    "TODO": "not a render-fleet.py manifest field; pass at render time as --git-ref (must equal images.env PS_IMAGE_REF)",
-    "candidateSha": "bf79a93a8ea6ccfcbd7914098dd50e228decad4b",
-    "candidateSource": "PS #245 head after the manifest push (gh pr view 245 --json headRefOid, 2026-09-14); CI build-and-push run 34890468903 published its images.env"
+  "rolledGitRef": {
+    "NOTE": "not a render-fleet.py manifest field; pass at render time as --git-ref (must equal images.env PS_IMAGE_REF)",
+    "sha": "f95b83cb3a0e560d73f4cf26c70d386ef48833cc",
+    "source": "PS #245 merge commit, the ref the 2026-09-14 20:15-20:48Z roll rendered from; CI docker.yml run 34891259899 published ci-docker-f95b83c/images.env"
   },
   "gatewayDomain": "dstack-pha-prod5.phala.network",
   "operatorPublicKeySpkiBase64": "MCowBQYDK2VwAyEAPPx3xJ6NkAsPk1gT2v9E3s/huSL9MVG3S9D8e/Eqzjg=",
