@@ -4,7 +4,9 @@
 Nothing here calls phala; staging is exercised on the fleet, not in tests.
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import pathlib
 import unittest
@@ -32,6 +34,7 @@ def load_module():
 
 
 rf = load_module()
+STAGE_NODE = rf.stage_node
 
 
 def rendered(name, overlay=None):
@@ -224,20 +227,174 @@ class ManifestPatching(unittest.TestCase):
                 continue
             self.assertEqual(old_line, new_line)
 
-    def test_refuses_a_hash_that_is_not_unique(self):
-        # Two nodes pinned to the same hash can't be told apart to patch safely.
-        shared = "d" * 64
-        text = self.text
-        for name in ("worker-1", "worker-2"):
-            old = self.nodes[name]["pinned"]["composeHash"]
-            text = text.replace('"composeHash": "%s"' % old, '"composeHash": "%s"' % shared, 1)
-            self.nodes[name]["pinned"]["composeHash"] = shared
+    def test_patches_one_node_of_a_shared_hash(self):
+        # worker-2/3/4 boot the same compose, so one hash is pinned three times.
+        shared = self.nodes["worker-2"]["pinned"]["composeHash"]
+        self.assertEqual(
+            [self.nodes[n]["pinned"]["composeHash"] for n in ("worker-3", "worker-4")],
+            [shared, shared],
+        )
 
         hashes = {n: v["pinned"]["composeHash"] for n, v in self.nodes.items()}
-        hashes["worker-1"] = "e" * 64
+        hashes["worker-3"] = "e" * 64
+
+        patched = json.loads(rf.patch_compose_hashes(self.text, self.nodes, hashes))
+
+        self.assertEqual(patched["nodes"]["worker-3"]["pinned"]["composeHash"], "e" * 64)
+        self.assertEqual(patched["nodes"]["worker-2"]["pinned"]["composeHash"], shared)
+        self.assertEqual(patched["nodes"]["worker-4"]["pinned"]["composeHash"], shared)
+
+    def test_patches_every_node_of_a_shared_hash(self):
+        rolled = {"worker-2": "a" * 64, "worker-3": "b" * 64, "worker-4": "c" * 64}
+        hashes = {n: rolled.get(n, v["pinned"]["composeHash"]) for n, v in self.nodes.items()}
+
+        patched = json.loads(rf.patch_compose_hashes(self.text, self.nodes, hashes))
+
+        for name, new_hash in rolled.items():
+            self.assertEqual(patched["nodes"][name]["pinned"]["composeHash"], new_hash)
+
+    def patch_decoy(self, decoy, new_hash="2" * 64):
+        text = json.dumps(decoy, indent=2)
+
+        return json.loads(rf.patch_compose_hashes(text, decoy["nodes"], {"worker-1": new_hash}))
+
+    def test_a_nested_decoy_is_not_the_member(self):
+        # A `nodes`/`pinned` key deeper in the tree must not be patched in place
+        # of the real one, whichever comes first in the file.
+        patched = self.patch_decoy(
+            {
+                "history": {"nodes": {"worker-1": {"pinned": {"composeHash": "0" * 64}}}},
+                "nodes": {"worker-1": {"pinned": {"composeHash": "1" * 64}}},
+            }
+        )
+
+        self.assertEqual(patched["nodes"]["worker-1"]["pinned"]["composeHash"], "2" * 64)
+        self.assertEqual(
+            patched["history"]["nodes"]["worker-1"]["pinned"]["composeHash"], "0" * 64
+        )
+
+    def test_only_the_pin_itself_moves(self):
+        patched = self.patch_decoy(
+            {
+                "nodes": {
+                    "worker-1": {
+                        "pinned": {
+                            "was": {"composeHash": "0" * 64},
+                            "composeHash": "1" * 64,
+                        }
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(patched["nodes"]["worker-1"]["pinned"]["composeHash"], "2" * 64)
+        self.assertEqual(patched["nodes"]["worker-1"]["pinned"]["was"]["composeHash"], "0" * 64)
+
+    def test_a_brace_in_a_value_does_not_end_an_object(self):
+        # Signed env arrives as JSON inside a string; naive brace counting would
+        # close the node early and patch the wrong block.
+        patched = self.patch_decoy(
+            {
+                "nodes": {
+                    "worker-1": {
+                        "env": {"POLICY": '{"role":"worker"}'},
+                        "pinned": {"composeHash": "1" * 64},
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(patched["nodes"]["worker-1"]["pinned"]["composeHash"], "2" * 64)
+
+    def test_the_real_manifest_keeps_every_other_byte(self):
+        hashes = {n: v["pinned"]["composeHash"] for n, v in self.nodes.items()}
+        hashes["worker-4"] = "f" * 64
+
+        patched = rf.patch_compose_hashes(self.text, self.nodes, hashes)
+
+        self.assertEqual(
+            json.loads(patched)["nodes"]["worker-4"]["pinned"]["composeHash"], "f" * 64
+        )
+        self.assertEqual(
+            patched.replace("f" * 64, self.nodes["worker-4"]["pinned"]["composeHash"]),
+            self.text,
+        )
+
+
+class MemberSpan(unittest.TestCase):
+    def span(self, text, key):
+        start, end = rf.member_span(text, key, 0, len(text))
+
+        return json.loads(text[start:end])
+
+    def test_reads_a_direct_member(self):
+        self.assertEqual(self.span('{"a": {"b": 1}, "c": "x"}', "a"), {"b": 1})
+        self.assertEqual(self.span('{"a": {"b": 1}, "c": "x"}', "c"), "x")
+
+    def test_a_string_value_is_not_a_key(self):
+        self.assertEqual(self.span('{"a": "b", "b": {"real": 1}}', "b"), {"real": 1})
+
+    def test_an_array_value_is_not_the_object(self):
+        # `"pinned": [{...}]` must fail closed, not hand back the first element.
+        with self.assertRaises(SystemExit):
+            rf.member_span('{"pinned": [{"composeHash": "0"}]}', "pinned", 0, 33)
+
+    def test_an_escaped_quote_does_not_end_a_value(self):
+        self.assertEqual(self.span('{"a": "say \\"b\\": {}", "b": {"real": 1}}', "b"), {"real": 1})
+
+
+class StageGuards(unittest.TestCase):
+    """Driven through stage_all, so the guard's PLACEMENT is under test too."""
+
+    def setUp(self):
+        self.live = {"c-uuid": "c-live", "w-uuid": "w-live"}
+        self.nodes = {
+            "controller": self.node("controller", "c-uuid", "c-live"),
+            "worker-1": self.node("worker", "w-uuid", "w-live"),
+        }
+        self.staged = []
+        self.quiet = contextlib.redirect_stderr(io.StringIO())
+        self.quiet.__enter__()
+        rf.HARVEST.read_attestation = lambda uuid: {"instanceId": self.live[uuid]}
+        rf.HARVEST.measured_identity = lambda a, app: a
+        rf.stage_node = lambda name, node, path, out: self.staged.append(name) or ("d" * 64)
+
+    def tearDown(self):
+        self.quiet.__exit__(None, None, None)
+        rf.HARVEST, rf.stage_node = rf.load_harvester(), STAGE_NODE
+
+    def node(self, role, uuid, instance_id):
+        return {
+            "role": role,
+            "uuid": uuid,
+            "appId": "shared-app",
+            "pinned": {"instanceId": instance_id, "composeHash": "a" * 64},
+        }
+
+    def test_stages_every_node_when_the_pins_are_current(self):
+        self.assertEqual(rf.stage_all(self.nodes, pathlib.Path(".")).keys(), self.nodes.keys())
+        self.assertEqual(self.staged, ["controller", "worker-1"])
+
+    def test_a_stale_worker_pin_stages_nothing(self):
+        # The controller is staged first, so a late failure would already have
+        # restarted it: the fleet must be checked before anything is applied.
+        self.live["w-uuid"] = "w-replaced"
 
         with self.assertRaises(SystemExit):
-            rf.patch_compose_hashes(text, self.nodes, hashes)
+            rf.stage_all(self.nodes, pathlib.Path("."))
+
+        self.assertEqual(self.staged, [])
+
+    def test_two_nodes_resolving_to_one_cvm_stage_nothing(self):
+        # Replicas share an app id, so only the attested instance tells them
+        # apart; both entries answering alike means a uuid resolved wrong.
+        self.live["w-uuid"] = "c-live"
+        self.nodes["worker-1"]["pinned"]["instanceId"] = "c-live"
+
+        with self.assertRaises(SystemExit):
+            rf.stage_all(self.nodes, pathlib.Path("."))
+
+        self.assertEqual(self.staged, [])
 
 
 if __name__ == "__main__":

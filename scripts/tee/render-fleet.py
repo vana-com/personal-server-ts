@@ -20,6 +20,7 @@ worker's reciprocal pin.
 import argparse
 import datetime
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -59,6 +60,7 @@ IMAGE_LINE = re.compile(r"^\s+image:\s*(.+?)\s*$")
 # interpolated from unmeasured outer env before the compose is measured.
 OUTER_INTERPOLATION = re.compile(r"(?<!\$)\$\{")
 TOP_LEVEL_KEY = re.compile(r"^([A-Za-z_][A-Za-z0-9_.-]*):")
+COLON_NEXT = re.compile(r"\s*:")
 CHILD_KEY = re.compile(r"^ {2}([^\s:]+):")
 
 PHALA_TIMEOUT_SECONDS = 600
@@ -70,10 +72,28 @@ DUMMY_ENV_LINE = "FLEET_SIGNED_CONFIG={}\n"
 PRIVATE_MODE = 0o600
 
 RECEIPT_NAME = "render-receipt.json"
+HARVEST_PATH = pathlib.Path(__file__).resolve().parent / "harvest-identity.py"
 HASH_NOTE = (
     "composeFileSha256 is the rendered file's digest, NOT the dstack "
     "compose_hash. Pin drafts only to a hash read back from a staged CVM."
 )
+
+
+def load_harvester():
+    """harvest-identity.py, the one reader of a CVM's attested identity.
+
+    `phala api /cvms/<uuid>` returns `instance_id: null` forever, so the live
+    instance id is only in the quote. Attestation parsing stays in that module;
+    this one consumes it.
+    """
+    spec = importlib.util.spec_from_file_location("harvest_identity", HARVEST_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    return module
+
+
+HARVEST = load_harvester()
 
 
 def utc_now():
@@ -87,23 +107,107 @@ def sha256_text(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def string_end(text, start):
+    """Index just past the JSON string literal whose opening quote is at start."""
+    index, escaped = start + 1, False
+    while index < len(text):
+        char = text[index]
+        index += 1
+
+        if escaped:
+            escaped = False
+            continue
+
+        if char == "\\":
+            escaped = True
+            continue
+
+        if char == '"':
+            return index
+
+    raise SystemExit("Manifest string starting at %d is unterminated" % start)
+
+
+def object_span(text, start):
+    """The [start, end) span of the JSON object whose `{` is at `start`."""
+    depth, index = 0, start
+    while index < len(text):
+        char = text[index]
+        if char == '"':
+            index = string_end(text, index)
+            continue
+
+        index += 1
+        depth += (char == "{") - (char == "}")
+        if depth == 0:
+            return start, index
+
+    raise SystemExit("Manifest object starting at %d is unterminated" % start)
+
+
+def is_key(text, index):
+    """A JSON string is a key when the next thing after it is a colon."""
+    return COLON_NEXT.match(text, index) is not None
+
+
+def member_span(text, key, start, end):
+    """The span of `key`'s value, `key` being a DIRECT member of the object
+    whose `{` is at `start`. The value may be an object or a string.
+
+    Depth-aware on braces and brackets, and string literals are skipped whole,
+    so none of a same-named key deeper in the tree, an object inside an array,
+    or a brace inside a string value can be mistaken for this member.
+    """
+    depth, brackets, index, name = 0, 0, start, None
+    while index < end:
+        char = text[index]
+
+        if char == '"':
+            literal_end = string_end(text, index)
+            if depth == 1 and not brackets:
+                if is_key(text, literal_end):
+                    name = json.loads(text[index:literal_end])
+                elif name == key:
+                    return index, literal_end
+                else:
+                    name = None
+
+            index = literal_end
+            continue
+
+        if char == "{" and depth == 1 and not brackets and name == key:
+            return object_span(text, index)
+
+        depth += (char == "{") - (char == "}")
+        brackets += (char == "[") - (char == "]")
+        index += 1
+
+    raise SystemExit("Manifest object at %d has no %s member" % (start, key))
+
+
 def patch_compose_hashes(text, nodes, hashes):
     """Rewrite only the composeHash values that changed, byte-for-byte
     everywhere else - so an unrelated array or key order in the manifest is
-    never reflowed by re-serialising the whole file."""
+    never reflowed by re-serialising the whole file.
+
+    Each node is addressed by its own `nodes.<name>.pinned` block, never by the
+    hash value: worker-2/3/4 boot the same compose and legitimately share one
+    hash, and a value-keyed patch cannot tell those three apart.
+    """
     for name, node in nodes.items():
-        old = node["pinned"]["composeHash"]
         new = hashes[name]
-        if old == new:
+        if node["pinned"]["composeHash"] == new:
             continue
 
-        pattern = re.compile(r'("composeHash"\s*:\s*")%s(")' % re.escape(old))
-        if len(pattern.findall(text)) != 1:
-            raise SystemExit(
-                "%s: composeHash %s must appear exactly once to patch safely" % (name, old)
-            )
+        root = text.index("{")
+        nodes_start, nodes_end = member_span(text, "nodes", root, len(text))
+        node_start, node_end = member_span(text, name, nodes_start, nodes_end)
+        pinned_start, pinned_end = member_span(text, "pinned", node_start, node_end)
+        start, end = member_span(text, "composeHash", pinned_start, pinned_end)
+        if not HEX64.match(json.loads(text[start:end])):
+            raise SystemExit("%s: pinned.composeHash is not a 64-hex value" % name)
 
-        text = pattern.sub(lambda m: m.group(1) + new + m.group(2), text, count=1)
+        text = text[:start] + json.dumps(new) + text[end:]
 
     return text
 
@@ -353,6 +457,21 @@ def phala(args):
     return json.loads(out)
 
 
+def assert_pinned_instances(nodes):
+    """Fail closed if any manifest instance id went stale - before staging ANY.
+
+    render never re-harvests `pinned.instanceId`; it copies the value into the
+    draft, and the enclave rejects a bundle whose instanceId is not its own
+    (security-config.ts), so a stale pin bricks that node on its next boot,
+    silently and after signing. The whole fleet is checked up front: a stale
+    worker-3 must not leave the controller and workers 1-2 already restarted.
+    """
+    claimed = {}
+    for name, node in nodes.items():
+        attested = HARVEST.measured_identity(HARVEST.read_attestation(node["uuid"]), node["appId"])
+        HARVEST.assert_instance(name, node["pinned"], attested, claimed)
+
+
 def stage_node(name, node, compose_path, out_dir):
     """Apply one rendered compose to its CVM and read the real hash back."""
     before = phala(["api", "/cvms/" + node["uuid"], "--json"])
@@ -440,6 +559,7 @@ def render_composes(manifest, nodes, args, images, out_dir):
 
 def stage_all(nodes, out_dir):
     """Stage the controller first, so workers can pin its new hash."""
+    assert_pinned_instances(nodes)
     controller, _ = controller_of(nodes)
     order = [controller] + [n for n in nodes if n != controller]
     staged = {}
@@ -504,6 +624,10 @@ def main():
 
     if args.stage and args.settle:
         settle(nodes)
+        # Re-attest now the fleet is running again: staging restarts every CVM,
+        # and a node replaced during that window must not have the manifest's
+        # old instance id copied into its draft.
+        assert_pinned_instances(nodes)
 
     for name, compose_hash in hashes.items():
         if not HEX64.match(compose_hash):
