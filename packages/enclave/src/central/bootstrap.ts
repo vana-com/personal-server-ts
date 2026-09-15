@@ -8,7 +8,7 @@ import { serve } from "@hono/node-server";
 import { DEFAULTS } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { DstackClient } from "../dstack/client.js";
 import { warmDstackInfo } from "../dstack/info-cache.js";
-import type { SupportedChainId } from "../agent/bootstrap.js";
+import { isSupportedChain, MOKSHA_CHAIN_ID } from "../chain-id.js";
 import { startMcpRouter, type McpMigrationSnapshot } from "../mcp/service.js";
 import { createFleetControlHttp } from "../fleet/controller-http.js";
 import { createFleetMcpRouting, resolveFleetOwner } from "../fleet/router.js";
@@ -89,8 +89,11 @@ export async function startFleetCentral(
   });
   if (env.CONTROLLER_TERM !== undefined && env.CONTROLLER_TERM !== "1")
     throw new Error("Only singleton controller term 1 is supported");
-  const chainId = Number(env.CHAIN_ID ?? 14800);
-  if (chainId !== 14800) throw new Error("Fleet pilot is restricted to Moksha");
+  // The signed config already fixed CHAIN_ID; re-check it here so an
+  // unsigned-path regression cannot boot a controller on a foreign chain.
+  const chainId = Number(env.CHAIN_ID ?? MOKSHA_CHAIN_ID);
+  if (!isSupportedChain(chainId))
+    throw new Error("CHAIN_ID must be 1480 or 14800");
   const gatewayUrl = required(env, "GATEWAY_URL");
   if (new URL(gatewayUrl).protocol !== "https:")
     throw new Error("Gateway requires HTTPS");
@@ -278,7 +281,7 @@ export async function startFleetCentral(
     {
       client,
       gatewayUrl,
-      chainId: chainId as SupportedChainId,
+      chainId,
       contracts: { ...DEFAULTS.gateway.contracts },
       logger,
     },

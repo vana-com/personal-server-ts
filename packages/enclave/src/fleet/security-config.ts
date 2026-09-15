@@ -1,4 +1,9 @@
 import { createPublicKey, verify } from "node:crypto";
+import {
+  MAINNET_CHAIN_ID,
+  MAINNET_GATEWAY_ORIGIN,
+  readSignedChain,
+} from "../chain-id.js";
 
 export interface FleetSecurityConfigPayload {
   version: 1;
@@ -129,6 +134,29 @@ function exactKeys(value: Record<string, unknown>, keys: string[]): boolean {
 function boundedString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 256;
 }
+/** The signed chain, and the Gateway that chain is allowed to reach.
+ *
+ * Chain and Gateway were validated independently, so a config naming
+ * CHAIN_ID 1480 with the Moksha Gateway verified, and the node then handed its
+ * fleet credentials to the wrong chain's Gateway. Mainnet is pinned to its one
+ * production origin; Moksha stays open so preview fleets keep working. */
+function chainMatchesGateway(env: Record<string, string>): boolean {
+  const chainId = readSignedChain(env.CHAIN_ID);
+  if (chainId === undefined) return false;
+
+  if (chainId !== MAINNET_CHAIN_ID) return true;
+
+  return originOf(env.GATEWAY_URL) === MAINNET_GATEWAY_ORIGIN;
+}
+
+function originOf(url: string | undefined): string | undefined {
+  try {
+    return new URL(url!).origin;
+  } catch {
+    return undefined;
+  }
+}
+
 function validatePayload(value: unknown): FleetSecurityConfigPayload {
   if (
     !record(value) ||
@@ -177,7 +205,7 @@ function validatePayload(value: unknown): FleetSecurityConfigPayload {
   ])
     if (!env[key]) throw invalid();
   if (
-    env.CHAIN_ID !== "14800" ||
+    !chainMatchesGateway(env) ||
     env.NODE_ID !== value.nodeId ||
     (value.role === "controller" &&
       (env.CONTROLLER_TERM !== "1" ||

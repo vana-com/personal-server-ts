@@ -13,6 +13,12 @@ import {
 } from "../sandbox/docker-runtime.js";
 import { SANDBOX_IDLE_TTL_SECONDS, SANDBOX_MAX } from "../sandbox/registry.js";
 import { isVerifiedFleetEnvironment } from "../fleet/security-config.js";
+import {
+  isSupportedChain,
+  MAINNET_CHAIN_ID,
+  MOKSHA_CHAIN_ID,
+  type SupportedChainId,
+} from "../chain-id.js";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 8787;
@@ -38,8 +44,6 @@ const DOCKER_IMAGE_ERROR =
 const DOCKER_GATEWAY_ERROR =
   "GATEWAY_URL must use https for the docker runtime";
 const MEMORY_PATTERN = /^[1-9][0-9]*(?:\.[0-9]+)?[kmgt]?$/i;
-const MAINNET_CHAIN_ID = 1_480;
-const MOKSHA_CHAIN_ID = 14_800;
 const DEFAULT_STORAGE_API_URLS = {
   [MAINNET_CHAIN_ID]: "https://storage.vana.org",
   [MOKSHA_CHAIN_ID]: "https://storage-dev.vana.org",
@@ -51,7 +55,7 @@ const DEFAULT_CONTRACTS = {
   dataPortabilityGrantees: "0x8325C0A0948483EdA023A1A2Fd895e62C5131234",
 } as const;
 
-export type SupportedChainId = typeof MAINNET_CHAIN_ID | typeof MOKSHA_CHAIN_ID;
+export type { SupportedChainId };
 
 export interface SandboxContracts {
   dataRegistry: string;
@@ -398,7 +402,7 @@ function readCpus(value: string | undefined): string {
 
 function readChainId(value: string | undefined): SupportedChainId {
   const chainId = value === undefined ? MOKSHA_CHAIN_ID : Number(value);
-  if (chainId !== MAINNET_CHAIN_ID && chainId !== MOKSHA_CHAIN_ID) {
+  if (!isSupportedChain(chainId)) {
     throw new Error("CHAIN_ID must be 1480 or 14800");
   }
 

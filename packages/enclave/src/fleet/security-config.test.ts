@@ -8,6 +8,7 @@ import {
   isVerifiedFleetEnvironment,
   type FleetSecurityConfigPayload,
 } from "./security-config.js";
+import { MAINNET_CHAIN_ID, MAINNET_GATEWAY_ORIGIN } from "../chain-id.js";
 
 const now = Date.parse("2026-09-09T04:00:00.000Z");
 const keys = generateKeyPairSync("ed25519");
@@ -154,6 +155,79 @@ it("accepts migration-disabled controller config for a net-new empty state", asy
   );
   expect(env.MCP_MIGRATION_REQUIRED).toBe("0");
 });
+it("accepts a mainnet-configured controller on the same signed contract", async () => {
+  const body = payload();
+  body.env.CHAIN_ID = String(MAINNET_CHAIN_ID);
+  body.env.GATEWAY_URL = MAINNET_GATEWAY_ORIGIN;
+  const env = await verifiedFleetEnvironment(
+    {
+      FLEET_CONFIG_PUBLIC_KEY: publicKey,
+      FLEET_SIGNED_CONFIG: bundle(body),
+    },
+    {
+      role: "controller",
+      identity: async () => ({
+        appId: body.appId,
+        instanceId: body.instanceId,
+      }),
+      now: () => now,
+    },
+  );
+  expect(env.CHAIN_ID).toBe("1480");
+});
+it("rejects a mainnet config signed against another chain's Gateway", async () => {
+  // Chain and Gateway used to be checked independently, so this config
+  // verified and the node then handed its credentials to Moksha.
+  for (const gateway of [
+    "https://dp-rpc.moksha.vana.org",
+    "https://dp-rpc.vana.org.attacker.invalid",
+    "not-a-url",
+  ]) {
+    const body = payload();
+    body.env.CHAIN_ID = String(MAINNET_CHAIN_ID);
+    body.env.GATEWAY_URL = gateway;
+    const identity = vi.fn();
+    await expect(
+      verifiedFleetEnvironment(
+        {
+          FLEET_CONFIG_PUBLIC_KEY: publicKey,
+          FLEET_SIGNED_CONFIG: bundle(body),
+        },
+        { role: "controller", identity, now: () => now },
+      ),
+    ).rejects.toThrow("Invalid fleet security configuration");
+    expect(identity).not.toHaveBeenCalled();
+  }
+});
+it("rejects a non-canonical spelling of a supported chain id", async () => {
+  // Number() would read every one of these as 1480.
+  for (const chainId of ["0x5c8", " 1480", "1480.0", "1480 ", "+1480"]) {
+    const body = payload();
+    body.env.CHAIN_ID = chainId;
+    body.env.GATEWAY_URL = MAINNET_GATEWAY_ORIGIN;
+    await expect(
+      verifiedFleetEnvironment(
+        {
+          FLEET_CONFIG_PUBLIC_KEY: publicKey,
+          FLEET_SIGNED_CONFIG: bundle(body),
+        },
+        { role: "controller", identity: vi.fn(), now: () => now },
+      ),
+    ).rejects.toThrow("Invalid fleet security configuration");
+  }
+});
+it("rejects a signed config for a chain no fleet serves", async () => {
+  const body = payload();
+  body.env.CHAIN_ID = "1337";
+  const identity = vi.fn();
+  await expect(
+    verifiedFleetEnvironment(
+      { FLEET_CONFIG_PUBLIC_KEY: publicKey, FLEET_SIGNED_CONFIG: bundle(body) },
+      { role: "controller", identity, now: () => now },
+    ),
+  ).rejects.toThrow("Invalid fleet security configuration");
+  expect(identity).not.toHaveBeenCalled();
+});
 it("rejects forged policy/admin replacement before reading public identity or releasing config", async () => {
   const original = payload();
   const signed = JSON.parse(
@@ -233,7 +307,7 @@ it("requires exact version/purpose/fields and forbids boot injection even when s
       delete p.env.GATEWAY_URL;
     },
     (p: FleetSecurityConfigPayload) => {
-      p.env.CHAIN_ID = "1480";
+      p.env.CHAIN_ID = "1337";
     },
   ];
   for (const change of changes) {

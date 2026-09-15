@@ -1,0 +1,121 @@
+{
+  "fleet": "mainnet-prod1",
+  "gatewayUrl": "https://dp-rpc.vana.org",
+  "gatewayDomain": "REPLACE_WITH_MAINNET_DSTACK_GATEWAY_DOMAIN",
+  "operatorPublicKeySpkiBase64": "REPLACE_WITH_MAINNET_OPERATOR_ED25519_SPKI_BASE64",
+  "gatewaySecretRefs": {
+    "operator": "mainnet-prod1-operator",
+    "bypass": "mainnet-prod1-agent-bypass"
+  },
+  "nodes": {
+    "controller": {
+      "role": "controller",
+      "nodeId": "mainnet-personal-server-controller",
+      "uuid": "REPLACE_WITH_MAINNET_CONTROLLER_CVM_UUID",
+      "cvmName": "mainnet-personal-server-controller",
+      "appId": "REPLACE_WITH_MAINNET_CONTROLLER_APP_ID",
+      "instanceType": "tdx.small",
+      "compose": "docker-compose.fleet-controller.yml",
+      "composeOut": "controller-compose.yml",
+      "pinned": {
+        "instanceId": "REPLACE_WITH_MAINNET_CONTROLLER_INSTANCE_ID",
+        "composeHash": "REPLACE_WITH_MAINNET_CONTROLLER_COMPOSE_HASH"
+      },
+      "measured": {
+        "measurementMode": "dstack-0.5.9-events",
+        "mrTd": "REPLACE_WITH_MAINNET_CONTROLLER_MRTD",
+        "rtmrs": [
+          "REPLACE_WITH_MAINNET_CONTROLLER_RTMR0",
+          "REPLACE_WITH_MAINNET_CONTROLLER_RTMR1",
+          "REPLACE_WITH_MAINNET_CONTROLLER_RTMR2"
+        ],
+        "osImageHash": "REPLACE_WITH_MAINNET_OS_IMAGE_HASH",
+        "keyProviderSpki": "REPLACE_WITH_MAINNET_KMS_ROOT_SPKI"
+      },
+      "env": {
+        "CHAIN_ID": "1480",
+        "NODE_ID": "mainnet-personal-server-controller",
+        "CONTROLLER_TERM": "1",
+        "GATEWAY_URL": "https://dp-rpc.vana.org",
+        "FLEET_STATE_PATH": "/fleet-state/controller.json",
+        "FLEET_CONTROL_HOST": "0.0.0.0",
+        "FLEET_CONTROL_PORT": "8790",
+        "FLEET_ADMIN_HOST": "0.0.0.0",
+        "FLEET_ADMIN_PORT": "8791",
+        "FLEET_PEER_HOST": "0.0.0.0",
+        "FLEET_PEER_PORT": "8792",
+        "MCP_MIGRATION_REQUIRED": "0",
+        "MCP_PUBLIC_ORIGIN": "REPLACE_WITH_MAINNET_MCP_PUBLIC_ORIGIN",
+        "MCP_APPROVAL_URL": "REPLACE_WITH_MAINNET_MCP_APPROVAL_URL",
+        "MCP_STATE_PATH": "/mcp-state/state.sealed",
+        "MCP_INGRESS_HOST": "0.0.0.0",
+        "MCP_INGRESS_PORT": "8788",
+        "MCP_REDIRECT_URIS": "[\"https://claude.ai/api/mcp/auth_callback\",\"https://claude.com/api/mcp/auth_callback\"]",
+        "MCP_STATE_REQUIRED": "0"
+      },
+      "secretRefs": {
+        "FLEET_GATEWAY_TOKEN": "mainnet-prod1-fleet-gateway-token",
+        "FLEET_CONTROLLER_GATEWAY_TOKEN": "mainnet-prod1-fleet-controller-gateway-token",
+        "FLEET_CONTROLLER_ADMIN_TOKEN": "mainnet-prod1-fleet-controller-admin-token"
+      }
+    },
+    "worker-1": {
+      "role": "worker",
+      "nodeId": "mainnet-personal-server-worker-1",
+      "uuid": "REPLACE_WITH_MAINNET_WORKER_1_CVM_UUID",
+      "cvmName": "mainnet-personal-server-worker-1",
+      "appId": "REPLACE_WITH_MAINNET_WORKER_1_APP_ID",
+      "instanceType": "tdx.medium",
+      "compose": "docker-compose.fleet-worker.yml",
+      "composeOut": "worker-compose.yml",
+      "pinned": {
+        "instanceId": "REPLACE_WITH_MAINNET_WORKER_1_INSTANCE_ID",
+        "composeHash": "REPLACE_WITH_MAINNET_WORKER_1_COMPOSE_HASH"
+      },
+      "measured": {
+        "measurementMode": "dstack-0.5.9-events",
+        "mrTd": "REPLACE_WITH_MAINNET_WORKER_MRTD",
+        "rtmrs": [
+          "REPLACE_WITH_MAINNET_WORKER_RTMR0",
+          "REPLACE_WITH_MAINNET_WORKER_RTMR1",
+          "REPLACE_WITH_MAINNET_WORKER_RTMR2"
+        ],
+        "osImageHash": "REPLACE_WITH_MAINNET_OS_IMAGE_HASH",
+        "keyProviderSpki": "REPLACE_WITH_MAINNET_KMS_ROOT_SPKI"
+      },
+      "env": {
+        "CHAIN_ID": "1480",
+        "NODE_ID": "mainnet-personal-server-worker-1",
+        "GATEWAY_URL": "https://dp-rpc.vana.org",
+        "STORAGE_API_URL": "https://storage.vana.org",
+        "ENCLAVE_AGENT_HOST": "0.0.0.0",
+        "ENCLAVE_AGENT_PORT": "8787",
+        "FLEET_ENABLED": "true",
+        "FLEET_PEER_HOST": "0.0.0.0",
+        "FLEET_PEER_PORT": "8789",
+        "SANDBOX_RUNTIME": "docker",
+        "DOCKER_HOST": "tcp://sandbox-runtime:2375",
+        "SANDBOX_MAX": "4",
+        "SANDBOX_MEMORY": "512m",
+        "SANDBOX_CPUS": "1",
+        "SANDBOX_IDLE_TTL_SECONDS": "600",
+        "MCP_PUBLIC_ORIGIN": "REPLACE_WITH_MAINNET_MCP_PUBLIC_ORIGIN",
+        "MCP_APPROVAL_URL": "REPLACE_WITH_MAINNET_MCP_APPROVAL_URL",
+        "MCP_STATE_PATH": "/mcp-state/state.sealed",
+        "MCP_REDIRECT_URIS": "[\"https://claude.ai/api/mcp/auth_callback\",\"https://claude.com/api/mcp/auth_callback\"]",
+        "MCP_INGRESS_HOST": "0.0.0.0",
+        "MCP_INGRESS_PORT": "8788",
+        "MCP_MIGRATION_REQUIRED": "0"
+      },
+      "secretRefs": {
+        "ENCLAVE_AGENT_SECRET": "mainnet-prod1-worker-1-agent-secret",
+        "NODE_SECRET": "mainnet-prod1-worker-1-node-secret"
+      },
+      "capacity": 4,
+      "gateway": {
+        "agentSecretRef": "mainnet-prod1-worker-1-agent-secret",
+        "nodeSecretRef": "mainnet-prod1-worker-1-node-secret"
+      }
+    }
+  }
+}
