@@ -16,13 +16,19 @@ import { resolveRootPath } from "./paths.js";
  *   SERVER_PORT          — server.port (integer)
  *   SERVER_ORIGIN        — server.origin (URL)
  *   TUNNEL_ENABLED       — tunnel.enabled (boolean: "true"/"false")
+ *   TUNNEL_BINARY_PATH   — tunnel.binaryPath (a preinstalled frpc to run)
  *   DEV_UI_ENABLED       — devUi.enabled (boolean: "true"/"false")
  */
 function applyEnvOverrides(obj: Record<string, unknown>): void {
   if (process.env.CLOUD_MODE !== "true") return;
 
-  const { SERVER_PORT, SERVER_ORIGIN, TUNNEL_ENABLED, DEV_UI_ENABLED } =
-    process.env;
+  const {
+    SERVER_PORT,
+    SERVER_ORIGIN,
+    TUNNEL_ENABLED,
+    TUNNEL_BINARY_PATH,
+    DEV_UI_ENABLED,
+  } = process.env;
 
   if (SERVER_PORT !== undefined || SERVER_ORIGIN !== undefined) {
     const server = (obj.server as Record<string, unknown> | undefined) ?? {};
@@ -31,9 +37,11 @@ function applyEnvOverrides(obj: Record<string, unknown>): void {
     obj.server = server;
   }
 
-  if (TUNNEL_ENABLED !== undefined) {
+  if (TUNNEL_ENABLED !== undefined || TUNNEL_BINARY_PATH) {
     const tunnel = (obj.tunnel as Record<string, unknown> | undefined) ?? {};
-    tunnel.enabled = TUNNEL_ENABLED === "true";
+    if (TUNNEL_ENABLED !== undefined)
+      tunnel.enabled = TUNNEL_ENABLED === "true";
+    if (TUNNEL_BINARY_PATH) tunnel.binaryPath = TUNNEL_BINARY_PATH;
     obj.tunnel = tunnel;
   }
 

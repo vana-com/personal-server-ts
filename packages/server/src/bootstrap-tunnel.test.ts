@@ -66,6 +66,27 @@ describe("bootstrap tunnel gating (BUI-611)", () => {
     await rm(tempDir, { recursive: true, force: true });
   });
 
+  it("hands a configured tunnel.binaryPath to the binary resolver", async () => {
+    // The host that bundles a signed frpc names it in config; bootstrap must
+    // pass it through rather than always managing a downloaded copy.
+    tunnelMocks.ensureFrpcBinary.mockClear();
+    const config = ServerConfigSchema.parse({
+      tunnel: { enabled: true, binaryPath: "/bundle/Resources/frpc" },
+      sync: { enabled: false },
+    });
+    const ctx = await createServer(config, {
+      serverDir: tempDir,
+      dataDir: join(tempDir, "data"),
+      gatewayClient: makeGateway(vi.fn().mockResolvedValue({ id: "srv-1" })),
+    });
+
+    expect(tunnelMocks.ensureFrpcBinary).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ binaryPath: "/bundle/Resources/frpc" }),
+    );
+    await ctx.cleanup();
+  });
+
   it("connects immediately when the server is already registered", async () => {
     const getServer = vi.fn().mockResolvedValue({ id: "srv-1" });
     const ctx = await createServer(makeTunnelConfig(), {

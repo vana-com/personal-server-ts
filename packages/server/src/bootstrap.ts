@@ -305,6 +305,7 @@ export async function createServer(
     try {
       frpcBinaryPath = await ensureFrpcBinary(storageRoot, {
         log: (msg) => logger.info(msg),
+        binaryPath: config.tunnel.binaryPath,
       });
     } catch (err) {
       logger.warn({ err }, "Failed to download frpc binary - tunnel disabled");

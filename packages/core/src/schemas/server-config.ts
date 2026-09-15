@@ -174,6 +174,15 @@ export const ServerConfigSchema = z.object({
         .min(1)
         .max(65535)
         .default(DEFAULTS.tunnel.serverPort),
+      /**
+       * A preinstalled frpc executable to run instead of downloading one
+       * into the storage root. A host that ships inside a signed, notarized
+       * bundle (the Desktop app) sets this so the tunnel client carries the
+       * same signature as everything else it runs; an ad-hoc binary fetched
+       * into the user's home directory is what endpoint security flags.
+       * Absent = download and manage the binary as before.
+       */
+      binaryPath: z.string().min(1).optional(),
     })
     .default(DEFAULTS.tunnel),
   inference: z

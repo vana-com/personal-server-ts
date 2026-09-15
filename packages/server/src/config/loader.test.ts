@@ -226,6 +226,23 @@ describe("loadConfig", () => {
       });
     });
 
+    it("TUNNEL_BINARY_PATH names a preinstalled frpc", async () => {
+      await withTempDir(async (dir) => {
+        const configPath = join(dir, "config.json");
+        await writeFile(configPath, JSON.stringify({}));
+
+        await withEnv(
+          { CLOUD_MODE: "true", TUNNEL_BINARY_PATH: "/opt/frp/frpc" },
+          async () => {
+            const config = await loadConfig({ configPath });
+            expect(config.tunnel.binaryPath).toBe("/opt/frp/frpc");
+            // Other tunnel fields keep their defaults.
+            expect(config.tunnel.enabled).toBe(true);
+          },
+        );
+      });
+    });
+
     it("TUNNEL_ENABLED overrides default", async () => {
       await withTempDir(async (dir) => {
         const configPath = join(dir, "config.json");
