@@ -8,6 +8,7 @@ import {
   isVerifiedFleetEnvironment,
   type FleetSecurityConfigPayload,
 } from "./security-config.js";
+import { MAINNET_CHAIN_ID } from "../chain-id.js";
 
 const now = Date.parse("2026-09-09T04:00:00.000Z");
 const keys = generateKeyPairSync("ed25519");
@@ -154,6 +155,37 @@ it("accepts migration-disabled controller config for a net-new empty state", asy
   );
   expect(env.MCP_MIGRATION_REQUIRED).toBe("0");
 });
+it("accepts a mainnet-configured controller on the same signed contract", async () => {
+  const body = payload();
+  body.env.CHAIN_ID = String(MAINNET_CHAIN_ID);
+  const env = await verifiedFleetEnvironment(
+    {
+      FLEET_CONFIG_PUBLIC_KEY: publicKey,
+      FLEET_SIGNED_CONFIG: bundle(body),
+    },
+    {
+      role: "controller",
+      identity: async () => ({
+        appId: body.appId,
+        instanceId: body.instanceId,
+      }),
+      now: () => now,
+    },
+  );
+  expect(env.CHAIN_ID).toBe("1480");
+});
+it("rejects a signed config for a chain no fleet serves", async () => {
+  const body = payload();
+  body.env.CHAIN_ID = "1337";
+  const identity = vi.fn();
+  await expect(
+    verifiedFleetEnvironment(
+      { FLEET_CONFIG_PUBLIC_KEY: publicKey, FLEET_SIGNED_CONFIG: bundle(body) },
+      { role: "controller", identity, now: () => now },
+    ),
+  ).rejects.toThrow("Invalid fleet security configuration");
+  expect(identity).not.toHaveBeenCalled();
+});
 it("rejects forged policy/admin replacement before reading public identity or releasing config", async () => {
   const original = payload();
   const signed = JSON.parse(
@@ -233,7 +265,7 @@ it("requires exact version/purpose/fields and forbids boot injection even when s
       delete p.env.GATEWAY_URL;
     },
     (p: FleetSecurityConfigPayload) => {
-      p.env.CHAIN_ID = "1480";
+      p.env.CHAIN_ID = "1337";
     },
   ];
   for (const change of changes) {

@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { expect, it, vi } from "vitest";
 import { createFakeDstackClient } from "../dstack/fake.js";
 import { startFleetCentral } from "./bootstrap.js";
+import { MAINNET_CHAIN_ID } from "../chain-id.js";
 import { createMcpConnection } from "@opendatalabs/personal-server-ts-core/mcp";
 import { openMcpDurableState } from "@opendatalabs/personal-server-ts-server/mcp/tee";
 import { userPsId } from "@opendatalabs/vana-sdk/protocol/identity";
@@ -790,6 +791,80 @@ it("publishes the controller bundle window and identity on admin status", async 
     });
     expect(text).toContain('"expiresAt":null');
     expect(text).not.toContain(ADMIN_TOKEN);
+  } finally {
+    await runtime?.close();
+    await rm(path, { recursive: true, force: true });
+  }
+});
+
+it("boots a controller whose signed config names mainnet", async () => {
+  const path = await mkdtemp(join(tmpdir(), "central-mainnet-"));
+  const dstack = createFakeDstackClient({ appId: "1".repeat(40) });
+  const info = await dstack.info();
+  const keys = generateKeyPairSync("ed25519");
+  const env = {
+    CHAIN_ID: String(MAINNET_CHAIN_ID),
+    CONTROLLER_TERM: "1",
+    NODE_ID: "controller",
+    GATEWAY_URL: "https://dp-rpc.invalid",
+    FLEET_STATE_PATH: join(path, "placements.json"),
+    FLEET_WORKERS_JSON: "[]",
+    FLEET_GATEWAY_TOKEN: "g".repeat(32),
+    FLEET_CONTROLLER_ADMIN_TOKEN: "a".repeat(32),
+    FLEET_CONTROLLER_GATEWAY_TOKEN: "r".repeat(32),
+    FLEET_CONTROL_HOST: "127.0.0.1",
+    FLEET_ADMIN_HOST: "127.0.0.1",
+    FLEET_PEER_HOST: "127.0.0.1",
+    FLEET_CONTROL_PORT: await freePort(),
+    FLEET_ADMIN_PORT: await freePort(),
+    FLEET_PEER_PORT: await freePort(),
+    MCP_PUBLIC_ORIGIN: "https://mcp.invalid",
+    MCP_APPROVAL_URL: "https://web.invalid/approve",
+    MCP_STATE_PATH: join(path, "mcp.sealed"),
+    MCP_INGRESS_HOST: "127.0.0.1",
+    MCP_INGRESS_PORT: await freePort(),
+    MCP_REDIRECT_URIS: '["https://claude.ai/api/mcp/auth_callback"]',
+    MCP_MIGRATION_REQUIRED: "1",
+  };
+  const payload: FleetSecurityConfigPayload = {
+    version: 1,
+    purpose: "vana.fleet.security-config",
+    role: "controller",
+    appId: info.appId,
+    instanceId: info.instanceId,
+    nodeId: env.NODE_ID,
+    issuedAt: new Date().toISOString(),
+    expiresAt: null,
+    env,
+  };
+  let runtime: Awaited<ReturnType<typeof startFleetCentral>> | undefined;
+  try {
+    runtime = await startFleetCentral(
+      {
+        FLEET_CONFIG_PUBLIC_KEY: keys.publicKey
+          .export({ type: "spki", format: "der" })
+          .toString("base64"),
+        FLEET_SIGNED_CONFIG:
+          "base64:" +
+          Buffer.from(
+            JSON.stringify({
+              payload,
+              signature: sign(
+                null,
+                canonicalFleetConfigPayload(payload),
+                keys.privateKey,
+              ).toString("base64"),
+            }),
+          ).toString("base64"),
+      },
+      dstack,
+      vi.fn<typeof fetch>(async () => {
+        throw new Error("Must not call Gateway while staged");
+      }),
+    );
+
+    expect(runtime.identity.nodeId).toBe("controller");
+    expect(runtime.controller.paused()).toBe(true);
   } finally {
     await runtime?.close();
     await rm(path, { recursive: true, force: true });

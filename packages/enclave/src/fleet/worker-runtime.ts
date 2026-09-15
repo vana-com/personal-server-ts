@@ -22,6 +22,7 @@ import {
 } from "./peer-verifier.js";
 import { createFleetWorker, type LocalFleetWorker } from "./worker.js";
 import { createFleetWorkerBackend } from "./worker-backend.js";
+import { isSupportedChain } from "../chain-id.js";
 
 export interface FleetMigrationPort {
   prepareRollback(migrationId: string): Promise<unknown>;
@@ -50,8 +51,10 @@ export async function startFleetWorker(options: {
   fetch?: typeof fetch;
 }): Promise<FleetWorkerRuntime | undefined> {
   if (options.env.FLEET_ENABLED !== "true") return undefined;
-  if (options.sandbox.chainId !== 14800)
-    throw new Error("Fleet pilot only supports Moksha");
+  // Defence in depth behind the manifest: a worker only ever joins a fleet on
+  // the chain its signed CHAIN_ID names.
+  if (!isSupportedChain(options.sandbox.chainId))
+    throw new Error("CHAIN_ID must be 1480 or 14800");
   const policies = JSON.parse(
     options.env.FLEET_PEER_POLICIES ?? "[]",
   ) as FleetPeerPolicy[];

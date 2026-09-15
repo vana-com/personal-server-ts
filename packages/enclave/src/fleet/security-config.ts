@@ -1,4 +1,5 @@
 import { createPublicKey, verify } from "node:crypto";
+import { isSupportedChain } from "../chain-id.js";
 
 export interface FleetSecurityConfigPayload {
   version: 1;
@@ -177,7 +178,7 @@ function validatePayload(value: unknown): FleetSecurityConfigPayload {
   ])
     if (!env[key]) throw invalid();
   if (
-    env.CHAIN_ID !== "14800" ||
+    !isSupportedChain(Number(env.CHAIN_ID)) ||
     env.NODE_ID !== value.nodeId ||
     (value.role === "controller" &&
       (env.CONTROLLER_TERM !== "1" ||
