@@ -9,6 +9,8 @@ import importlib.util
 import io
 import json
 import pathlib
+import sys
+import tempfile
 import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -237,6 +239,36 @@ class ManifestTrustDomain(unittest.TestCase):
     def test_a_manifest_without_nodes_is_refused(self):
         with self.assertRaises(SystemExit):
             rf.assert_manifest(["not", "a", "manifest"])
+
+
+class TemplateStillRendersComposes(unittest.TestCase):
+    def test_composes_are_written_before_the_fence_trips(self):
+        # A new fleet cannot have ids until its CVMs exist, and its CVMs cannot
+        # exist until something renders the composes they are deployed from.
+        out = pathlib.Path(tempfile.mkdtemp())
+        argv = [
+            "render-fleet.py",
+            "--manifest", str(TEMPLATE),
+            "--images-env", str(out / "images.env"),
+            "--out", str(out),
+            "--compose-dir", str(COMPOSE_DIR),
+            "--git-ref", GIT_REF,
+        ]
+        (out / "images.env").write_text(
+            "\n".join("%s=%s" % (k, v) for k, v in IMAGES.items())
+            + "\nPS_IMAGE_REF=%s\n" % GIT_REF
+        )
+        saved = sys.argv
+        sys.argv = argv
+        try:
+            with self.assertRaises(SystemExit) as raised:
+                rf.main()
+        finally:
+            sys.argv = saved
+
+        self.assertIn("Unresolved manifest placeholders", str(raised.exception))
+        self.assertTrue((out / "controller-compose.yml").exists())
+        self.assertFalse(list(out.glob("*config.draft.json")))
 
 
 class ManifestPatching(unittest.TestCase):
