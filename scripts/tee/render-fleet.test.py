@@ -103,6 +103,46 @@ class GatewayDomain(unittest.TestCase):
         self.assertIn("GATEWAY_DOMAIN=_.dstack-pha-prod5.phala.network", text)
 
 
+class GatewayDomainFence(unittest.TestCase):
+    def test_a_newline_cannot_inject_a_second_endpoint(self):
+        # Codex demonstrated this against the first version of the fix: the
+        # injected TARGET_ENDPOINT rendered and assert_compose accepted it.
+        with self.assertRaises(SystemExit):
+            rf.canonical_gateway_domain(
+                "good.example\n      - TARGET_ENDPOINT=attacker.invalid:443"
+            )
+
+    def test_a_duplicate_singleton_key_is_refused(self):
+        text = rendered("docker-compose.fleet-controller.yml")
+        doubled = text.replace(
+            "      - TARGET_ENDPOINT=controller:8788",
+            "      - TARGET_ENDPOINT=controller:8788\n      - TARGET_ENDPOINT=x:1",
+            1,
+        )
+
+        with self.assertRaises(SystemExit) as raised:
+            rf.assert_compose("c.yml", doubled, IMAGES, GIT_REF, SPKI, "controller")
+
+        self.assertIn("TARGET_ENDPOINT", str(raised.exception))
+
+    def test_the_prefixed_form_does_not_double(self):
+        self.assertEqual(
+            rf.canonical_gateway_domain("_.dstack-pha-prod9.phala.network"),
+            "dstack-pha-prod9.phala.network",
+        )
+
+    def test_a_trailing_dot_is_dropped(self):
+        self.assertEqual(
+            rf.canonical_gateway_domain("dstack-pha-prod9.phala.network."),
+            "dstack-pha-prod9.phala.network",
+        )
+
+    def test_empty_and_missing_are_refused(self):
+        for value in ["", "   ", "_.", None, 42, "no-dot", "UPPER.example"]:
+            with self.assertRaises(SystemExit):
+                rf.canonical_gateway_domain(value)
+
+
 class Assertions(unittest.TestCase):
     def check(self, text, service="agent"):
         rf.assert_compose("t.yml", text, IMAGES, GIT_REF, SPKI, service)
