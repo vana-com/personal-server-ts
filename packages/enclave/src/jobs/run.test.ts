@@ -2,10 +2,10 @@ import { createServer, type Server } from "node:http";
 import { NodeECIESProvider } from "@opendatalabs/vana-sdk/node";
 import { sealJobRequest } from "@opendatalabs/vana-sdk/crypto/envelope/job";
 import { vi } from "vitest";
-import type { Address, Hex } from "viem";
+import { recoverTypedDataAddress, type Address, type Hex } from "viem";
 import { createFakeDstackClient } from "../dstack/fake.js";
 import type { DstackClient } from "../dstack/client.js";
-import { WALLET_PURPOSE, type UserPsId } from "../identity/paths.js";
+import { userPsId, WALLET_PURPOSE } from "../identity/paths.js";
 import { deriveEnclaveIdentity } from "../identity/wallet.js";
 import {
   createDockerRuntime,
@@ -33,9 +33,13 @@ import type {
   JobExecuteResponse,
   JobRequestEnvelope,
 } from "./types.js";
+import {
+  dataPointId,
+  RECORD_DATA_ACCESS_TYPES,
+  type JobAccessRecord,
+} from "./access-receipt.js";
 
 const APP_ID = "11".repeat(20);
-const USER_PS_ID = `0x${"22".repeat(32)}` as UserPsId;
 const OWNER = `0x${"33".repeat(20)}` as Address;
 const BUILDER = `0x${"44".repeat(20)}` as Address;
 const GRANT_ID = `0x${"55".repeat(32)}` as Hex;
@@ -44,6 +48,9 @@ const NOW_MS = Date.parse("2026-09-03T12:00:00.000Z");
 const DEADLINE = "2026-09-03T12:05:00.000Z";
 const JOB_ID = "job-1";
 const CHAIN_ID = 14_800;
+// The real derivation, not an arbitrary constant: the Gateway derives the same
+// value from (chainId, owner), and the agent refuses a claim where they differ.
+const USER_PS_ID = userPsId(CHAIN_ID, OWNER);
 const AGENT_URL = "http://agent:8787";
 const TAMPER_BIT = 1;
 const RESULT = {
@@ -292,6 +299,76 @@ function jobError(code: string, retryable: boolean): JobExecuteError {
 }
 
 describe("runJob", () => {
+  // The receipt is what lets the Gateway charge the read. The agent signs it
+  // from the claim alone: the sandbox holds no key and is never consulted.
+  it("attaches an enclave-signed receipt for a pinned read", async () => {
+    const fixture = await createFixture();
+    fixture.job.pinnedVersion = "4";
+
+    await runJob(fixture.job, fixture.identity, fixture.deps);
+
+    const [, body] = vi.mocked(fixture.gateway.complete).mock.calls[0]!;
+    const accessRecord = (body as { accessRecord?: JobAccessRecord })
+      .accessRecord;
+    expect(accessRecord).toMatchObject({
+      dataPointId: dataPointId(OWNER, "profile.email"),
+      version: "4",
+      accessor: BUILDER,
+    });
+
+    const signer = await recoverTypedDataAddress({
+      domain: {
+        name: "Vana Data Portability",
+        version: "1",
+        chainId: CHAIN_ID,
+        verifyingContract: "0x1111111111111111111111111111111111111111",
+      },
+      types: RECORD_DATA_ACCESS_TYPES as never,
+      primaryType: "RecordDataAccess",
+      message: {
+        ownerAddress: OWNER,
+        scope: "profile.email",
+        version: 4n,
+        accessor: BUILDER,
+        recordId: accessRecord!.recordId,
+      },
+      signature: accessRecord!.signature,
+    });
+    expect(signer).toBe(fixture.identity.enclaveAddress);
+  });
+
+  // A receipt that cannot be signed must not fail the job: the result is
+  // already durable and the builder is entitled to it. The Gateway refuses that
+  // completion and releases the reservation when the lease lapses.
+  it("still completes when the receipt cannot be signed", async () => {
+    const fixture = await createFixture();
+    fixture.job.pinnedVersion = "4";
+    // An unusable data-registry address makes the EIP-712 domain unbuildable,
+    // so signing throws exactly where a KMS or config fault would.
+    fixture.deps.contracts.dataRegistry = "not-an-address";
+
+    await runJob(fixture.job, fixture.identity, fixture.deps);
+
+    expect(fixture.gateway.complete).toHaveBeenCalledWith(JOB_ID, {
+      fencingToken: 1,
+      ...RESULT,
+    });
+    expect(fixture.gateway.fail).not.toHaveBeenCalled();
+  });
+
+  // No pinned version means no registered data point, so there is nothing to
+  // record and nothing the Gateway could charge.
+  it("sends no receipt when the read has no pinned version", async () => {
+    const fixture = await createFixture();
+
+    await runJob(fixture.job, fixture.identity, fixture.deps);
+
+    expect(fixture.gateway.complete).toHaveBeenCalledWith(JOB_ID, {
+      fencingToken: 1,
+      ...RESULT,
+    });
+  });
+
   it("runs a claim with a matching chain id", async () => {
     const fixture = await createFixture();
 

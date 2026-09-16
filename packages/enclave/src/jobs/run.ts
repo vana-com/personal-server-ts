@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type { FleetAssignment } from "../fleet/contracts.js";
 import { fleetSandboxKey } from "../fleet/worker-key.js";
 import type {
@@ -7,7 +8,13 @@ import type {
 import { getAddress, toHex, type Address, type Hex } from "viem";
 import type { DstackClient } from "../dstack/client.js";
 import { decryptEcies } from "../agent/ecies.js";
-import { deriveEnclaveIdentity, deriveEnclaveKey } from "../identity/wallet.js";
+import { userPsId } from "../identity/paths.js";
+import {
+  deriveEnclaveAccount,
+  deriveEnclaveIdentity,
+  deriveEnclaveKey,
+} from "../identity/wallet.js";
+import { signAccessReceipt, type JobAccessRecord } from "./access-receipt.js";
 import { isNonTransientDockerSandboxError } from "../sandbox/docker-runtime.js";
 import { SandboxSyncBlockedError } from "../sandbox/probes.js";
 import type { SandboxRegistry } from "../sandbox/registry.js";
@@ -58,6 +65,7 @@ const SANDBOX_ACQUIRE_STAGE = "sandbox-acquire";
 const WORK_DELAY_STAGE = "work-delay";
 const EXECUTE_STAGE = "execute";
 const COMPLETE_STAGE = "complete";
+const RECEIPT_STAGE = "access-receipt";
 const CHAIN_VALIDATION_STAGE = "chain-validation";
 const UNKNOWN_ERROR = "unknown";
 const MAX_ERROR_CAUSES = 5;
@@ -147,6 +155,64 @@ export class SandboxChainMismatchError extends Error {
       `Gateway job chain ${receivedChainId} does not match sandbox chain ${expectedChainId}`,
     );
     this.name = "SandboxChainMismatchError";
+  }
+}
+
+/**
+ * Sign the receipt for the read this node just served.
+ *
+ * Every field comes from the claim, never from the sandbox: the owner and scope
+ * the Gateway admitted, the version it pinned, and the builder the result was
+ * sealed to. The signer is the owner's enclave wallet, which registration put on
+ * chain as their server — the signer `recordDataAccess` verifies.
+ *
+ * To be exact about the boundary: a compromised sandbox cannot choose any field
+ * here, cannot mint a receipt outside an active job, and never sees the
+ * signature. What it can still do is report success for a job it was already
+ * authorized to run, and so cause that job's one receipt to be issued. Proving
+ * delivery independently would mean matching the completion against the upload
+ * the agent itself authorized, which is a separate change.
+ *
+ * A receipt that cannot be signed does not fail the job. The result is already
+ * durable and the builder is entitled to it; the Gateway refuses the completion
+ * and the reservation is released when the lease lapses, which costs the builder
+ * nothing.
+ */
+async function mintAccessReceipt(
+  job: ClaimResponse["job"],
+  identity: ClaimedIdentity,
+  chainId: number,
+  deps: RunJobDeps,
+): Promise<JobAccessRecord | undefined> {
+  if (job.pinnedVersion === null) return undefined;
+
+  try {
+    const account = await deriveEnclaveAccount(
+      deps.client,
+      identity.userPsId,
+      identity.epoch,
+    );
+    if (
+      getAddress(account.address) !== getAddress(identity.enclaveAddress) ||
+      userPsId(chainId, getAddress(job.owner)) !== identity.userPsId
+    ) {
+      throw new Error(NODE_DERIVATION_MISMATCH_MESSAGE);
+    }
+    return await signAccessReceipt(
+      account,
+      {
+        owner: getAddress(job.owner),
+        scope: job.scope,
+        version: BigInt(job.pinnedVersion),
+        accessor: getAddress(job.builder),
+        chainId,
+        dataRegistry: getAddress(deps.contracts.dataRegistry as Address),
+      },
+      randomBytes,
+    );
+  } catch (error) {
+    logStageFailure(deps.logger, job.jobId, RECEIPT_STAGE, error);
+    return undefined;
   }
 }
 
@@ -522,11 +588,23 @@ export async function runJob(
     }
 
     deps.assertAssignment?.();
+
+    // Sign the delivery receipt before completing. It is what lets the Gateway
+    // charge this read: it binds the reserved payment to an on-chain
+    // recordDataAccess, exactly as the legacy 402 challenge does. A read with no
+    // pinned version has no registered data point, so there is nothing to record
+    // and nothing that could be charged.
+    const accessRecord =
+      job.pinnedVersion === null
+        ? undefined
+        : await mintAccessReceipt(job, identity, jobChainId, deps);
+
     const completeStartedAt = now();
     try {
       await deps.gateway.complete(job.jobId, {
         fencingToken: job.fencingToken,
         ...(deps.assignment ? { assignment: deps.assignment } : {}),
+        ...(accessRecord ? { accessRecord } : {}),
         resultObjectKey: result.response.resultObjectKey,
         resultHash: result.response.resultHash,
         resultSize: result.response.resultSize,
