@@ -1,16 +1,21 @@
 import { Hono } from "hono";
+import type { Context } from "hono";
 import { cors } from "hono/cors";
-import { isAddress } from "viem";
+import { isAddress, type Address } from "viem";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import {
   approveMcpOAuthAuthorization,
   handleMcpHandshake,
   hashConnectionToken,
   isMcpHandshake,
+  revokeMcpConnection,
+  toMcpConnectionView,
   toMcpOAuthAuthorizationView,
   type McpConnectionGrant,
   type McpConnectionRecord,
 } from "@opendatalabs/personal-server-ts-core/mcp";
+import { authenticateRequest } from "@opendatalabs/personal-server-ts-core/auth";
+import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { mcpOAuthRoutes } from "../routes/mcp.js";
 import { createBodyLimit } from "../middleware/body-limit.js";
 import type { McpDurableState, McpOwnerBinding } from "./durable-state.js";
@@ -66,7 +71,7 @@ export function createTeeMcpIngress(deps: TeeMcpIngressDeps): Hono {
     "*",
     cors({
       origin: new URL(deps.approvalUrl).origin,
-      allowMethods: ["GET", "POST", "OPTIONS"],
+      allowMethods: ["GET", "POST", "DELETE", "OPTIONS"],
       allowHeaders: ["Content-Type", "Authorization", "MCP-Protocol-Version"],
       exposeHeaders: ["WWW-Authenticate"],
     }),
@@ -111,6 +116,32 @@ export function createTeeMcpIngress(deps: TeeMcpIngressDeps): Hono {
       await next();
     }),
   );
+  // An owner manages its own MCP connections. The PS routes compare the
+  // signer against one configured `serverOwner`; this CVM holds many owners
+  // in one sealed store, so here the signer IS the identity and the durable
+  // owner binding is what scopes the answer.
+  app.get("/v1/mcp/connections", async (c) => {
+    const owner = await authorizeOwner(c, deps.origin);
+    if (owner instanceof Response) return owner;
+    const owned = await ownerConnections(state, owner);
+    return c.json({ connections: owned.map(toMcpConnectionView) });
+  });
+  app.delete("/v1/mcp/connections/:id", async (c) => {
+    const owner = await authorizeOwner(c, deps.origin);
+    if (owner instanceof Response) return owner;
+    // Revoking only kills this client's token. The on-chain grant it reads
+    // under stands until the owner revokes that separately on the Gateway.
+    return state.exclusive(async () => {
+      const id = c.req.param("id");
+      const binding = await state.getOwner(id);
+      if (!binding || !isSameOwner(binding.owner, owner))
+        return c.json({ error: "Connection not found" }, 404);
+      const revoked = await revokeMcpConnection(id, {
+        store: state.connections,
+      });
+      return c.json(toMcpConnectionView(revoked));
+    });
+  });
   // The random pending authorization ID reveals only the new grantee's public
   // consent metadata. It does not authorize approval or return a private key.
   app.get("/v1/mcp/readiness", async (c) => {
@@ -265,6 +296,45 @@ export function createTeeMcpIngress(deps: TeeMcpIngressDeps): Hono {
     return jsonError(503, { error: "MCP request unavailable" });
   });
   return app;
+}
+
+/**
+ * Owner-signed (EIP-191 `Web3Signed`) identity for one management request.
+ * Deliberately no dev / control-plane / session bearer: on a shared ingress
+ * such a token would authenticate as every owner at once.
+ */
+async function authorizeOwner(
+  c: Context,
+  origin: string,
+): Promise<Address | Response> {
+  try {
+    const authenticated = await authenticateRequest({
+      request: c.req.raw,
+      serverOrigin: origin,
+    });
+    return authenticated.auth.signer;
+  } catch (error) {
+    if (error instanceof ProtocolError)
+      return c.json(error.toJSON(), error.code as 401 | 403);
+    throw error;
+  }
+}
+
+/** Connections bound to `owner`. An unbound one belongs to nobody yet. */
+async function ownerConnections(
+  state: McpDurableState,
+  owner: Address,
+): Promise<McpConnectionRecord[]> {
+  const owned: McpConnectionRecord[] = [];
+  for (const connection of await state.connections.list()) {
+    const binding = await state.getOwner(connection.id);
+    if (binding && isSameOwner(binding.owner, owner)) owned.push(connection);
+  }
+  return owned;
+}
+
+function isSameOwner(left: Address, right: Address): boolean {
+  return left.toLowerCase() === right.toLowerCase();
 }
 
 function jsonError(status: number, body: Record<string, string>): Response {

@@ -9,6 +9,10 @@ import {
   MCP_TOKEN_TTL_MS,
   revokeMcpConnection,
 } from "@opendatalabs/personal-server-ts-core/mcp";
+import {
+  buildWeb3SignedHeader,
+  createTestWallet,
+} from "@opendatalabs/personal-server-ts-core/test-utils";
 import { openMcpDurableState } from "./durable-state.js";
 import {
   createTeeMcpIngress,
@@ -592,5 +596,99 @@ describe("TEE MCP ingress", () => {
     // Reading the body to classify it must leave the dispatched one readable.
     expect(await dispatch.mock.calls[0][0].json()).toEqual(fellThrough);
     expect((await app.fetch(post(initialize, "unknown"))).status).toBe(401);
+  });
+
+  it("lists and revokes only the signing owner's own connections", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tee-connections-"));
+    dirs.push(dir);
+    const state = await openMcpDurableState({
+      path: join(dir, "state"),
+      key: randomBytes(32),
+    });
+    const origin = "https://mcp-dev.vana.org";
+    const owner = createTestWallet(1);
+    const stranger = createTestWallet(2);
+    const seed = async (id: string, boundTo: `0x${string}` | undefined) => {
+      await state.connections.create({
+        id,
+        displayName: `Claude ${id}`,
+        granteeAddress: OWNER,
+        granteePublicKey: "0x02",
+        encryptedGranteePrivateKey: { kind: "plaintext", privateKey: "0x01" },
+        tokenHash: createHash("sha256").update(id).digest("hex"),
+        refreshTokenHash: createHash("sha256").update(`${id}r`).digest("hex"),
+        tokenExpiresAt: new Date(Date.now() + MCP_TOKEN_TTL_MS).toISOString(),
+        status: "approved",
+        grants: [{ grantId: "0xabc", scopes: ["spotify.profile"] }],
+        createdAt: new Date().toISOString(),
+      } as never);
+      if (boundTo)
+        await state.bindOwner(id, { owner: boundTo, chainId: 14800 });
+    };
+    await seed("mine-1", owner.address);
+    await seed("theirs-1", stranger.address);
+    await seed("unbound-1", undefined);
+    const app = createTeeMcpIngress({
+      state,
+      origin,
+      approvalUrl: "https://vana.example/mcp",
+      allowedRedirectUris: ["https://claude.ai/api/mcp/auth_callback"],
+      gateway: {} as never,
+      verifyGrants: vi.fn(),
+      registerGrantee: vi.fn(),
+      dispatch: vi.fn(),
+    });
+    const signed = async (method: string, uri: string) => ({
+      authorization: await buildWeb3SignedHeader({
+        wallet: owner,
+        aud: origin,
+        method,
+        uri,
+      }),
+    });
+    const path = "/v1/mcp/connections";
+
+    const unsigned = await app.request(path);
+    expect(unsigned.status).toBe(401);
+
+    const listed = await app.request(path, {
+      headers: await signed("GET", path),
+    });
+    expect(listed.status).toBe(200);
+    const { connections } = await listed.json();
+    // An unbound connection belongs to nobody, a bound one only to its owner.
+    expect(connections.map((view: { id: string }) => view.id)).toEqual([
+      "mine-1",
+    ]);
+    expect(JSON.stringify(connections)).not.toContain("tokenHash");
+
+    // Another owner's connection is answered as if it did not exist.
+    const theirs = `${path}/theirs-1`;
+    const forbidden = await app.request(theirs, {
+      method: "DELETE",
+      headers: await signed("DELETE", theirs),
+    });
+    expect(forbidden.status).toBe(404);
+    expect((await state.connections.getById("theirs-1"))!.status).toBe(
+      "approved",
+    );
+
+    const mine = `${path}/mine-1`;
+    const revoked = await app.request(mine, {
+      method: "DELETE",
+      headers: await signed("DELETE", mine),
+    });
+    expect(revoked.status).toBe(200);
+    expect((await revoked.json()).status).toBe("revoked");
+    const stored = (await state.connections.getById("mine-1"))!;
+    expect(stored.status).toBe("revoked");
+    expect(stored.refreshTokenHash).toBeUndefined();
+
+    // Revoking twice is the same answer, so a replayed header changes nothing.
+    const again = await app.request(mine, {
+      method: "DELETE",
+      headers: await signed("DELETE", mine),
+    });
+    expect(again.status).toBe(200);
   });
 });
