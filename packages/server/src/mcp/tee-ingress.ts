@@ -15,7 +15,10 @@ import {
   type McpConnectionRecord,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import { authenticateRequest } from "@opendatalabs/personal-server-ts-core/auth";
-import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
+import {
+  ExpiredTokenError,
+  ProtocolError,
+} from "@opendatalabs/personal-server-ts-core/errors";
 import { mcpOAuthRoutes } from "../routes/mcp.js";
 import { createBodyLimit } from "../middleware/body-limit.js";
 import type { McpDurableState, McpOwnerBinding } from "./durable-state.js";
@@ -24,6 +27,9 @@ import type { McpDurableState, McpOwnerBinding } from "./durable-state.js";
  * (server deregistered, identity epoch bumped, delegation revoked). Retrying
  * cannot help; the owner has to approve this enclave again. */
 export const OWNER_ACCESS_REVOKED_CODE = "OWNER_ACCESS_REVOKED";
+/** A management claim authorizes one request; the signer picks its own `exp`,
+ * so cap what a captured header is worth rather than trusting that choice. */
+const MAX_CLAIM_AGE_SECONDS = 300;
 const OWNER_ACCESS_REVOKED_MESSAGE =
   "Owner access to this enclave was revoked; ask the owner to approve it again";
 
@@ -123,7 +129,7 @@ export function createTeeMcpIngress(deps: TeeMcpIngressDeps): Hono {
   app.get("/v1/mcp/connections", async (c) => {
     const owner = await authorizeOwner(c, deps.origin);
     if (owner instanceof Response) return owner;
-    const owned = await ownerConnections(state, owner);
+    const owned = await state.ownerConnections(owner);
     return c.json({ connections: owned.map(toMcpConnectionView) });
   });
   app.delete("/v1/mcp/connections/:id", async (c) => {
@@ -312,25 +318,16 @@ async function authorizeOwner(
       request: c.req.raw,
       serverOrigin: origin,
     });
+    const { exp = 0, iat = 0 } = authenticated.auth.payload;
+    const age = Math.floor(Date.now() / 1000) - iat;
+    if (exp - iat > MAX_CLAIM_AGE_SECONDS || age > MAX_CLAIM_AGE_SECONDS)
+      throw new ExpiredTokenError();
     return authenticated.auth.signer;
   } catch (error) {
     if (error instanceof ProtocolError)
       return c.json(error.toJSON(), error.code as 401 | 403);
     throw error;
   }
-}
-
-/** Connections bound to `owner`. An unbound one belongs to nobody yet. */
-async function ownerConnections(
-  state: McpDurableState,
-  owner: Address,
-): Promise<McpConnectionRecord[]> {
-  const owned: McpConnectionRecord[] = [];
-  for (const connection of await state.connections.list()) {
-    const binding = await state.getOwner(connection.id);
-    if (binding && isSameOwner(binding.owner, owner)) owned.push(connection);
-  }
-  return owned;
 }
 
 function isSameOwner(left: Address, right: Address): boolean {
