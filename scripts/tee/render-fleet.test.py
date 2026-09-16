@@ -20,6 +20,7 @@ MANIFEST = REPO / "deploy" / "dstack" / "fleets" / "preview-prod5.json"
 TEMPLATE = REPO / "deploy" / "dstack" / "fleets" / "mainnet-prod1.json"
 
 SPKI = "MCowBQYDK2VwAyEAPPx3xJ6NkAsPk1gT2v9E3s/huSL9MVG3S9D8e/Eqzjg="
+GATEWAY_DOMAIN = "dstack-pha-prod5.phala.network"
 GIT_REF = "5bb959976edaf575b67738afbfb783d0498da4d2"
 IMAGES = {
     "AGENT_IMAGE": "vanaorg/personal-server-enclave@sha256:" + "1" * 64,
@@ -45,7 +46,7 @@ def rendered(name, overlay=None):
     if overlay:
         text = rf.merge_compose(text, (COMPOSE_DIR / overlay).read_text())
 
-    return rf.render_compose(text, IMAGES, GIT_REF, SPKI)
+    return rf.render_compose(text, IMAGES, GIT_REF, SPKI, GATEWAY_DOMAIN)
 
 
 class ComposeRendering(unittest.TestCase):
@@ -81,6 +82,65 @@ class ComposeRendering(unittest.TestCase):
         )
         # The runtime's environment is a mapping, so no signed pair is read.
         self.assertEqual(rf.service_env(text, "sandbox-runtime"), [])
+
+
+class GatewayDomain(unittest.TestCase):
+    def test_it_follows_the_manifest_not_the_compose(self):
+        # It was a prod5 literal, so every non-Moksha fleet's mcp-tls waited on
+        # Moksha's domain and never got a certificate for its own host.
+        text = rf.render_compose(
+            (COMPOSE_DIR / "docker-compose.fleet-controller.yml").read_text(),
+            IMAGES, GIT_REF, SPKI, "dstack-pha-prod9.phala.network",
+        )
+
+        self.assertIn("GATEWAY_DOMAIN=_.dstack-pha-prod9.phala.network", text)
+        self.assertNotIn("prod5", text)
+
+    def test_moksha_renders_the_value_it_already_runs(self):
+        # The fix must not move the live fleet: same bytes, same compose hash.
+        text = rendered("docker-compose.fleet-controller.yml")
+
+        self.assertIn("GATEWAY_DOMAIN=_.dstack-pha-prod5.phala.network", text)
+
+
+class GatewayDomainFence(unittest.TestCase):
+    def test_a_newline_cannot_inject_a_second_endpoint(self):
+        # Codex demonstrated this against the first version of the fix: the
+        # injected TARGET_ENDPOINT rendered and assert_compose accepted it.
+        with self.assertRaises(SystemExit):
+            rf.canonical_gateway_domain(
+                "good.example\n      - TARGET_ENDPOINT=attacker.invalid:443"
+            )
+
+    def test_a_duplicate_singleton_key_is_refused(self):
+        text = rendered("docker-compose.fleet-controller.yml")
+        doubled = text.replace(
+            "      - TARGET_ENDPOINT=controller:8788",
+            "      - TARGET_ENDPOINT=controller:8788\n      - TARGET_ENDPOINT=x:1",
+            1,
+        )
+
+        with self.assertRaises(SystemExit) as raised:
+            rf.assert_compose("c.yml", doubled, IMAGES, GIT_REF, SPKI, "controller")
+
+        self.assertIn("TARGET_ENDPOINT", str(raised.exception))
+
+    def test_the_prefixed_form_does_not_double(self):
+        self.assertEqual(
+            rf.canonical_gateway_domain("_.dstack-pha-prod9.phala.network"),
+            "dstack-pha-prod9.phala.network",
+        )
+
+    def test_a_trailing_dot_is_dropped(self):
+        self.assertEqual(
+            rf.canonical_gateway_domain("dstack-pha-prod9.phala.network."),
+            "dstack-pha-prod9.phala.network",
+        )
+
+    def test_empty_and_missing_are_refused(self):
+        for value in ["", "   ", "_.", None, 42, "no-dot", "UPPER.example"]:
+            with self.assertRaises(SystemExit):
+                rf.canonical_gateway_domain(value)
 
 
 class Assertions(unittest.TestCase):
@@ -266,8 +326,10 @@ class TemplateStillRendersComposes(unittest.TestCase):
         finally:
             sys.argv = saved
 
-        self.assertIn("Unresolved manifest placeholders", str(raised.exception))
-        self.assertTrue((out / "controller-compose.yml").exists())
+        # gatewayDomain now reaches the controller compose, so a template that
+        # has not chosen its node fails at the compose fence instead of the
+        # manifest one. Either way: nothing signable is produced.
+        self.assertIn("REPLACE_WITH_", str(raised.exception))
         self.assertFalse(list(out.glob("*config.draft.json")))
 
 

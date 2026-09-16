@@ -45,7 +45,7 @@ services:
       - CHALLENGE_TYPE=tls-alpn-01
       - DOMAIN=mcp-dev.vana.org
       - TARGET_ENDPOINT=controller:8788
-      - GATEWAY_DOMAIN=_.dstack-pha-prod5.phala.network
+      - GATEWAY_DOMAIN=REPLACE_WITH_DSTACK_GATEWAY_DOMAIN
       - DNS_SETUP_MODE=wait
       - DNS_SETUP_TIMEOUT=3600
       - EVIDENCE_SERVER=true

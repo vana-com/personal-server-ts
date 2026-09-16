@@ -38,6 +38,20 @@ IMAGE_MARKERS = {
 }
 GIT_REF_MARKER = "REPLACE_WITH_REVIEWED_40_HEX_COMMIT"
 SPKI_MARKER = "REPLACE_WITH_OPERATOR_ED25519_SPKI_BASE64"
+# mcp-tls asks the node's dstack Gateway for the custom domain's certificate, so
+# this has to be the fleet's OWN node. It was a prod5 literal in the compose,
+# which left every other fleet's mcp-tls waiting on Moksha's domain forever.
+GATEWAY_DOMAIN_MARKER = "REPLACE_WITH_DSTACK_GATEWAY_DOMAIN"
+GATEWAY_DOMAIN_PREFIX = "_."
+# The domain is spliced into a MEASURED compose, so only a plain hostname is
+# allowed: a value carrying a newline would add a second environment entry -
+# another TARGET_ENDPOINT, say - and still render a signable file.
+GATEWAY_DOMAIN = re.compile(
+    r"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+    r"(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$"
+)
+# One controller, one TLS front door: a rendered compose names each exactly once.
+SINGLETON_COMPOSE_KEYS = ["GATEWAY_DOMAIN=", "TARGET_ENDPOINT="]
 MARKER_PREFIX = "REPLACE_WITH_"
 
 # The one service whose environment the signed bundle reaches.
@@ -270,12 +284,37 @@ def merge_compose(base_text, overlay_text):
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
-def render_compose(text, images, git_ref, spki):
+def canonical_gateway_domain(value):
+    """The fleet's dstack Gateway host, normalised once and fenced.
+
+    Accepts the bare host or the `_.`-prefixed form and returns the bare one, so
+    `_.x.example` cannot render as `_._.x.example` and a trailing dot cannot
+    reach a URL. Anything that is not a hostname stops the render.
+    """
+    if not isinstance(value, str):
+        raise SystemExit("gatewayDomain must be a string")
+
+    domain = value.strip()
+    if domain.startswith(GATEWAY_DOMAIN_PREFIX):
+        domain = domain[len(GATEWAY_DOMAIN_PREFIX) :]
+
+    domain = domain.rstrip(".")
+    if not GATEWAY_DOMAIN.match(domain):
+        raise SystemExit("gatewayDomain is not a hostname: %r" % value)
+
+    return domain
+
+
+def render_compose(text, images, git_ref, spki, gateway_domain):
     """Replace every REPLACE_WITH_ marker with its reviewed literal."""
     for marker, key in IMAGE_MARKERS.items():
         text = text.replace(marker, images[key])
 
-    return text.replace(GIT_REF_MARKER, git_ref).replace(SPKI_MARKER, spki)
+    return (
+        text.replace(GIT_REF_MARKER, git_ref)
+        .replace(SPKI_MARKER, spki)
+        .replace(GATEWAY_DOMAIN_MARKER, GATEWAY_DOMAIN_PREFIX + gateway_domain)
+    )
 
 
 def service_env(text, service):
@@ -391,6 +430,10 @@ def assert_compose(name, text, images, git_ref, spki, service):
     expected = ["%s=%s" % (PUBLIC_KEY_ENV, spki), SIGNED_CONFIG_ENV]
     if service_env(text, service) != expected:
         raise SystemExit("%s: %s environment is not the signed-config pair" % (name, service))
+
+    for key in SINGLETON_COMPOSE_KEYS:
+        if text.count(key) > 1:
+            raise SystemExit("%s: %s appears more than once" % (name, key.rstrip("=")))
 
 
 def measured_policy(node, role, compose_hash):
@@ -607,7 +650,13 @@ def render_composes(manifest, nodes, args, images, out_dir):
         for overlay in node.get("composeOverlays", []):
             text = merge_compose(text, (compose_dir / overlay).read_text())
 
-        text = render_compose(text, images, args.git_ref, manifest["operatorPublicKeySpkiBase64"])
+        text = render_compose(
+            text,
+            images,
+            args.git_ref,
+            manifest["operatorPublicKeySpkiBase64"],
+            manifest["gatewayDomain"],
+        )
         assert_compose(
             target, text, images, args.git_ref,
             manifest["operatorPublicKeySpkiBase64"], ROLE_SERVICE[node["role"]],
@@ -658,6 +707,7 @@ def main():
     args = parse_args()
     manifest_text = args.manifest.read_text()
     manifest = json.loads(manifest_text)
+    manifest["gatewayDomain"] = canonical_gateway_domain(manifest.get("gatewayDomain"))
     nodes = manifest["nodes"]
     images = read_images(args.images_env)
     args.git_ref = args.git_ref or images.get("PS_IMAGE_REF")
