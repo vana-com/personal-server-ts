@@ -27,6 +27,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import urllib.parse
 import tempfile
 import time
 
@@ -50,8 +51,13 @@ GATEWAY_DOMAIN = re.compile(
     r"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
     r"(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$"
 )
+# The certificate subject the dstack-ingress sidecar requests. It was a Moksha
+# literal too, so a mainnet controller asked Let's Encrypt to certify Moksha's
+# host and served self-signed for its own.
+MCP_DOMAIN_MARKER = "REPLACE_WITH_MCP_PUBLIC_DOMAIN"
+MCP_ORIGIN_ENV = "MCP_PUBLIC_ORIGIN"
 # One controller, one TLS front door: a rendered compose names each exactly once.
-SINGLETON_COMPOSE_KEYS = ["GATEWAY_DOMAIN=", "TARGET_ENDPOINT="]
+SINGLETON_COMPOSE_KEYS = ["GATEWAY_DOMAIN", "TARGET_ENDPOINT", "DOMAIN"]
 MARKER_PREFIX = "REPLACE_WITH_"
 
 # The one service whose environment the signed bundle reaches.
@@ -305,7 +311,18 @@ def canonical_gateway_domain(value):
     return domain
 
 
-def render_compose(text, images, git_ref, spki, gateway_domain):
+def mcp_domain(node):
+    """The host the node publishes MCP on, which is the cert it must hold."""
+    origin = node.get("env", {}).get(MCP_ORIGIN_ENV)
+    if not origin:
+        raise SystemExit("%s is required to render a TLS sidecar" % MCP_ORIGIN_ENV)
+
+    host = urllib.parse.urlparse(origin).hostname or ""
+
+    return canonical_gateway_domain(host)
+
+
+def render_compose(text, images, git_ref, spki, gateway_domain, domain):
     """Replace every REPLACE_WITH_ marker with its reviewed literal."""
     for marker, key in IMAGE_MARKERS.items():
         text = text.replace(marker, images[key])
@@ -314,6 +331,7 @@ def render_compose(text, images, git_ref, spki, gateway_domain):
         text.replace(GIT_REF_MARKER, git_ref)
         .replace(SPKI_MARKER, spki)
         .replace(GATEWAY_DOMAIN_MARKER, GATEWAY_DOMAIN_PREFIX + gateway_domain)
+        .replace(MCP_DOMAIN_MARKER, domain)
     )
 
 
@@ -432,8 +450,10 @@ def assert_compose(name, text, images, git_ref, spki, service):
         raise SystemExit("%s: %s environment is not the signed-config pair" % (name, service))
 
     for key in SINGLETON_COMPOSE_KEYS:
-        if text.count(key) > 1:
-            raise SystemExit("%s: %s appears more than once" % (name, key.rstrip("=")))
+        # Whole entries only: "DOMAIN=" is a substring of "GATEWAY_DOMAIN=".
+        entry = "- %s=" % key
+        if sum(1 for line in text.splitlines() if line.strip().startswith(entry)) > 1:
+            raise SystemExit("%s: %s appears more than once" % (name, key))
 
 
 def measured_policy(node, role, compose_hash):
@@ -656,6 +676,7 @@ def render_composes(manifest, nodes, args, images, out_dir):
             args.git_ref,
             manifest["operatorPublicKeySpkiBase64"],
             manifest["gatewayDomain"],
+            mcp_domain(node),
         )
         assert_compose(
             target, text, images, args.git_ref,
