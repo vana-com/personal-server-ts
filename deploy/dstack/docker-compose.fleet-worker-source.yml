@@ -8,9 +8,9 @@ services:
       - 443:443
     environment:
       - CHALLENGE_TYPE=tls-alpn-01
-      - DOMAIN=mcp-dev.vana.org
+      - DOMAIN=REPLACE_WITH_MCP_PUBLIC_DOMAIN
       - TARGET_ENDPOINT=agent:8788
-      - GATEWAY_DOMAIN=_.dstack-pha-prod5.phala.network
+      - GATEWAY_DOMAIN=REPLACE_WITH_DSTACK_GATEWAY_DOMAIN
       - DNS_SETUP_MODE=wait
       - DNS_SETUP_TIMEOUT=3600
       - EVIDENCE_SERVER=true

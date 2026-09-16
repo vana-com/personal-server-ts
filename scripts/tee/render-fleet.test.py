@@ -21,6 +21,7 @@ TEMPLATE = REPO / "deploy" / "dstack" / "fleets" / "mainnet-prod1.json"
 
 SPKI = "MCowBQYDK2VwAyEAPPx3xJ6NkAsPk1gT2v9E3s/huSL9MVG3S9D8e/Eqzjg="
 GATEWAY_DOMAIN = "dstack-pha-prod5.phala.network"
+MCP_DOMAIN = "mcp-dev.vana.org"
 GIT_REF = "5bb959976edaf575b67738afbfb783d0498da4d2"
 IMAGES = {
     "AGENT_IMAGE": "vanaorg/personal-server-enclave@sha256:" + "1" * 64,
@@ -46,7 +47,7 @@ def rendered(name, overlay=None):
     if overlay:
         text = rf.merge_compose(text, (COMPOSE_DIR / overlay).read_text())
 
-    return rf.render_compose(text, IMAGES, GIT_REF, SPKI, GATEWAY_DOMAIN)
+    return rf.render_compose(text, IMAGES, GIT_REF, SPKI, GATEWAY_DOMAIN, MCP_DOMAIN)
 
 
 class ComposeRendering(unittest.TestCase):
@@ -90,7 +91,7 @@ class GatewayDomain(unittest.TestCase):
         # Moksha's domain and never got a certificate for its own host.
         text = rf.render_compose(
             (COMPOSE_DIR / "docker-compose.fleet-controller.yml").read_text(),
-            IMAGES, GIT_REF, SPKI, "dstack-pha-prod9.phala.network",
+            IMAGES, GIT_REF, SPKI, "dstack-pha-prod9.phala.network", "mcp.vana.org",
         )
 
         self.assertIn("GATEWAY_DOMAIN=_.dstack-pha-prod9.phala.network", text)
@@ -141,6 +142,99 @@ class GatewayDomainFence(unittest.TestCase):
         for value in ["", "   ", "_.", None, 42, "no-dot", "UPPER.example"]:
             with self.assertRaises(SystemExit):
                 rf.canonical_gateway_domain(value)
+
+
+class McpDomain(unittest.TestCase):
+    def test_the_cert_subject_follows_the_node(self):
+        # DOMAIN is the name Let's Encrypt is asked to certify. It was pinned to
+        # Moksha's host, so a mainnet controller asked for a cert it could never
+        # validate and served self-signed on its own host.
+        node = {"env": {"MCP_PUBLIC_ORIGIN": "https://mcp.vana.org"}}
+        text = rf.render_compose(
+            (COMPOSE_DIR / "docker-compose.fleet-controller.yml").read_text(),
+            IMAGES, GIT_REF, SPKI, "dstack-pha-prod9.phala.network",
+            rf.mcp_domain(node),
+        )
+
+        self.assertIn("- DOMAIN=mcp.vana.org", text)
+        self.assertNotIn("mcp-dev", text)
+
+    def test_the_worker_overlay_is_templated_too(self):
+        # #311 fixed only the controller; this file kept both prod5 literals.
+        text = (COMPOSE_DIR / "docker-compose.fleet-worker-source.yml").read_text()
+
+        self.assertNotIn("mcp-dev.vana.org", text)
+        self.assertNotIn("prod5", text)
+
+    def test_a_missing_origin_stops_the_render(self):
+        with self.assertRaises(SystemExit):
+            rf.mcp_domain({"env": {}})
+
+    def test_a_junk_origin_is_refused(self):
+        with self.assertRaises(SystemExit):
+            rf.mcp_domain({"env": {"MCP_PUBLIC_ORIGIN": "https://not a host/"}})
+
+    def test_gateway_domain_is_not_mistaken_for_domain(self):
+        # "DOMAIN=" is a substring of "GATEWAY_DOMAIN="; the singleton fence
+        # must compare whole entries or every valid compose trips it.
+        rf.assert_compose(
+            "t.yml", rendered("docker-compose.fleet-controller.yml"),
+            IMAGES, GIT_REF, SPKI, "controller",
+        )
+
+
+class McpDomainRegressions(unittest.TestCase):
+    def test_a_worker_without_an_mcp_origin_still_renders(self):
+        # Codex P0: requiring the origin unconditionally aborted the Moksha
+        # render at worker-2, which has no MCP_PUBLIC_ORIGIN and no sidecar.
+        text = rf.render_compose(
+            (COMPOSE_DIR / "docker-compose.fleet-worker.yml").read_text(),
+            IMAGES, GIT_REF, SPKI, GATEWAY_DOMAIN, "",
+        )
+
+        # Same rule assert_compose uses: comments may name markers, code may not.
+        code = [l for l in text.splitlines() if not l.lstrip().startswith("#")]
+        self.assertNotIn("REPLACE_WITH_", "\n".join(code))
+
+    def test_a_quoted_duplicate_does_not_evade_the_fence(self):
+        text = rendered("docker-compose.fleet-controller.yml")
+        doubled = text.replace(
+            "      - TARGET_ENDPOINT=controller:8788",
+            '      - TARGET_ENDPOINT=controller:8788\n      - "TARGET_ENDPOINT=evil.example:443"',
+            1,
+        )
+
+        with self.assertRaises(SystemExit):
+            rf.assert_compose("t.yml", doubled, IMAGES, GIT_REF, SPKI, "controller")
+
+    def test_only_https_origins_are_accepted(self):
+        for origin in [
+            "http://mcp.vana.org",
+            "//mcp.vana.org",
+            "https://user@mcp.vana.org",
+            "https://mcp.vana.org/path",
+            "https://mcp.vana.org:8443",
+            "https://mcp.vana.org?x=1",
+            "https://",
+        ]:
+            with self.assertRaises(SystemExit, msg=origin):
+                rf.mcp_domain({"env": {"MCP_PUBLIC_ORIGIN": origin}})
+
+    def test_a_cert_subject_is_never_silently_rewritten(self):
+        # canonical_gateway_domain strips a leading "_." — a Gateway wildcard
+        # convention. Reusing it for a certificate subject would quietly certify
+        # a DIFFERENT name than the manifest asked for, so this rejects instead.
+        self.assertEqual(
+            rf.canonical_gateway_domain("_.mcp.vana.org"), "mcp.vana.org"
+        )
+        with self.assertRaises(SystemExit):
+            rf.certificate_host("_.mcp.vana.org")
+
+    def test_a_plain_https_origin_is_accepted(self):
+        self.assertEqual(
+            rf.mcp_domain({"env": {"MCP_PUBLIC_ORIGIN": "https://mcp.vana.org/"}}),
+            "mcp.vana.org",
+        )
 
 
 class Assertions(unittest.TestCase):

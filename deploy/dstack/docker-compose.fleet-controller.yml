@@ -43,7 +43,7 @@ services:
       - "443:443"
     environment:
       - CHALLENGE_TYPE=tls-alpn-01
-      - DOMAIN=mcp-dev.vana.org
+      - DOMAIN=REPLACE_WITH_MCP_PUBLIC_DOMAIN
       - TARGET_ENDPOINT=controller:8788
       - GATEWAY_DOMAIN=REPLACE_WITH_DSTACK_GATEWAY_DOMAIN
       - DNS_SETUP_MODE=wait
