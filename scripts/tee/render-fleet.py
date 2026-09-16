@@ -47,7 +47,7 @@ GATEWAY_DOMAIN_PREFIX = "_."
 # The domain is spliced into a MEASURED compose, so only a plain hostname is
 # allowed: a value carrying a newline would add a second environment entry -
 # another TARGET_ENDPOINT, say - and still render a signable file.
-GATEWAY_DOMAIN = re.compile(
+HOSTNAME = re.compile(
     r"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
     r"(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$"
 )
@@ -305,21 +305,56 @@ def canonical_gateway_domain(value):
         domain = domain[len(GATEWAY_DOMAIN_PREFIX) :]
 
     domain = domain.rstrip(".")
-    if not GATEWAY_DOMAIN.match(domain):
+    if not HOSTNAME.match(domain):
         raise SystemExit("gatewayDomain is not a hostname: %r" % value)
 
     return domain
 
 
+def certificate_host(value):
+    """A hostname for a certificate subject.
+
+    Deliberately NOT canonical_gateway_domain: that strips a leading `_.`,
+    which is a dstack Gateway wildcard convention and part of the name here.
+    """
+    host = value.strip().rstrip(".")
+    if not HOSTNAME.match(host):
+        raise SystemExit("MCP host is not a hostname: %r" % value)
+
+    return host
+
+
 def mcp_domain(node):
-    """The host the node publishes MCP on, which is the cert it must hold."""
+    """The host the node publishes MCP on, which is the cert it must hold.
+
+    The enclave requires an exact https origin, so anything the runtime would
+    later refuse is rejected here rather than after the config is signed and a
+    boot fails.
+    """
     origin = node.get("env", {}).get(MCP_ORIGIN_ENV)
     if not origin:
         raise SystemExit("%s is required to render a TLS sidecar" % MCP_ORIGIN_ENV)
 
-    host = urllib.parse.urlparse(origin).hostname or ""
+    parsed = urllib.parse.urlparse(origin.strip())
+    if (
+        parsed.scheme != "https"
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+        or parsed.username
+        or parsed.password
+        or "@" in parsed.netloc
+        or not parsed.hostname
+    ):
+        raise SystemExit("%s must be https://<host>: %r" % (MCP_ORIGIN_ENV, origin))
 
-    return canonical_gateway_domain(host)
+    try:
+        if parsed.port is not None:
+            raise SystemExit("%s must not carry a port: %r" % (MCP_ORIGIN_ENV, origin))
+    except ValueError:
+        raise SystemExit("%s has an invalid port: %r" % (MCP_ORIGIN_ENV, origin))
+
+    return certificate_host(parsed.hostname)
 
 
 def render_compose(text, images, git_ref, spki, gateway_domain, domain):
@@ -450,9 +485,16 @@ def assert_compose(name, text, images, git_ref, spki, service):
         raise SystemExit("%s: %s environment is not the signed-config pair" % (name, service))
 
     for key in SINGLETON_COMPOSE_KEYS:
-        # Whole entries only: "DOMAIN=" is a substring of "GATEWAY_DOMAIN=".
-        entry = "- %s=" % key
-        if sum(1 for line in text.splitlines() if line.strip().startswith(entry)) > 1:
+        # Whole entries only ("DOMAIN=" is a substring of "GATEWAY_DOMAIN="),
+        # but every spelling compose accepts: quoted, and mapping style.
+        entry = re.compile(r"^\s*-\s*[\"']?%s=" % re.escape(key))
+        mapping = re.compile(r"^\s*[\"']?%s[\"']?\s*:" % re.escape(key))
+        hits = sum(
+            1
+            for line in text.splitlines()
+            if entry.match(line) or mapping.match(line)
+        )
+        if hits > 1:
             raise SystemExit("%s: %s appears more than once" % (name, key))
 
 
@@ -670,13 +712,17 @@ def render_composes(manifest, nodes, args, images, out_dir):
         for overlay in node.get("composeOverlays", []):
             text = merge_compose(text, (compose_dir / overlay).read_text())
 
+        # Workers without a TLS sidecar carry no MCP origin, and must still
+        # render: requiring one unconditionally aborted the Moksha fleet at
+        # worker-2, which has no MCP_PUBLIC_ORIGIN.
+        domain = mcp_domain(node) if MCP_DOMAIN_MARKER in text else ""
         text = render_compose(
             text,
             images,
             args.git_ref,
             manifest["operatorPublicKeySpkiBase64"],
             manifest["gatewayDomain"],
-            mcp_domain(node),
+            domain,
         )
         assert_compose(
             target, text, images, args.git_ref,

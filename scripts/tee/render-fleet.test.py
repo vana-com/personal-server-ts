@@ -183,6 +183,60 @@ class McpDomain(unittest.TestCase):
         )
 
 
+class McpDomainRegressions(unittest.TestCase):
+    def test_a_worker_without_an_mcp_origin_still_renders(self):
+        # Codex P0: requiring the origin unconditionally aborted the Moksha
+        # render at worker-2, which has no MCP_PUBLIC_ORIGIN and no sidecar.
+        text = rf.render_compose(
+            (COMPOSE_DIR / "docker-compose.fleet-worker.yml").read_text(),
+            IMAGES, GIT_REF, SPKI, GATEWAY_DOMAIN, "",
+        )
+
+        # Same rule assert_compose uses: comments may name markers, code may not.
+        code = [l for l in text.splitlines() if not l.lstrip().startswith("#")]
+        self.assertNotIn("REPLACE_WITH_", "\n".join(code))
+
+    def test_a_quoted_duplicate_does_not_evade_the_fence(self):
+        text = rendered("docker-compose.fleet-controller.yml")
+        doubled = text.replace(
+            "      - TARGET_ENDPOINT=controller:8788",
+            '      - TARGET_ENDPOINT=controller:8788\n      - "TARGET_ENDPOINT=evil.example:443"',
+            1,
+        )
+
+        with self.assertRaises(SystemExit):
+            rf.assert_compose("t.yml", doubled, IMAGES, GIT_REF, SPKI, "controller")
+
+    def test_only_https_origins_are_accepted(self):
+        for origin in [
+            "http://mcp.vana.org",
+            "//mcp.vana.org",
+            "https://user@mcp.vana.org",
+            "https://mcp.vana.org/path",
+            "https://mcp.vana.org:8443",
+            "https://mcp.vana.org?x=1",
+            "https://",
+        ]:
+            with self.assertRaises(SystemExit, msg=origin):
+                rf.mcp_domain({"env": {"MCP_PUBLIC_ORIGIN": origin}})
+
+    def test_a_cert_subject_is_never_silently_rewritten(self):
+        # canonical_gateway_domain strips a leading "_." — a Gateway wildcard
+        # convention. Reusing it for a certificate subject would quietly certify
+        # a DIFFERENT name than the manifest asked for, so this rejects instead.
+        self.assertEqual(
+            rf.canonical_gateway_domain("_.mcp.vana.org"), "mcp.vana.org"
+        )
+        with self.assertRaises(SystemExit):
+            rf.certificate_host("_.mcp.vana.org")
+
+    def test_a_plain_https_origin_is_accepted(self):
+        self.assertEqual(
+            rf.mcp_domain({"env": {"MCP_PUBLIC_ORIGIN": "https://mcp.vana.org/"}}),
+            "mcp.vana.org",
+        )
+
+
 class Assertions(unittest.TestCase):
     def check(self, text, service="agent"):
         rf.assert_compose("t.yml", text, IMAGES, GIT_REF, SPKI, service)
