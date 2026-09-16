@@ -287,8 +287,16 @@ python3 scripts/tee/render-fleet.py \
 Every supplied id is re-read from `GET /v1/tee-nodes` and compared **at run
 time**, before and after staging: the file is an operator's assertion, the
 Gateway is the evidence, and a stale file fails loudly rather than pinning a
-draft that cannot boot. Nodes not listed still use the attestation, which stays
-the default. Get the ids from the Gateway, never from a previous render:
+draft that cannot boot. It refuses a node the Gateway does not list as
+`admitted`, a node listed twice, a key naming no node in the manifest, an id
+that is not 40 lowercase hex, and a `publicUrl` that is not exactly this
+fleet's `https://<instanceId>-<ENCLAVE_AGENT_PORT>.<gatewayDomain>` — a host
+chosen by whoever wrote the row must not choose the id. The Gateway read itself
+requires an https origin and refuses to follow a redirect, which would carry the
+operator bearer somewhere it was not issued.
+
+Nodes not listed still use the attestation, which stays the default. Get the ids
+from the Gateway, never from a previous render:
 
 ```sh
 curl -s -H "authorization: Bearer $(security find-generic-password -s <operator item> -w)" \
