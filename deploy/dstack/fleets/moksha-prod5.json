@@ -66,14 +66,14 @@
     "worker-1": {
       "role": "worker",
       "nodeId": "moksha-personal-server-worker-1",
-      "uuid": "87c32ca4-49c9-4a83-b0af-ef5465cbbe18",
-      "cvmName": "moksha-personal-server-worker-1",
+      "uuid": "1a5acf08-41b4-4524-9e0d-d8b520b5b9ae",
+      "cvmName": "moksha-personal-server-worker-2",
       "appId": "ec9a39de98c760e1ded9f1e97016dc5f0e357cf2",
       "instanceType": "tdx.medium",
       "compose": "docker-compose.fleet-worker.yml",
-      "composeOut": "worker-1-source-compose.yml",
+      "composeOut": "worker-compose.yml",
       "pinned": {
-        "instanceId": "1ac22335a2da1ca6a024396c4a557907279403ab",
+        "instanceId": "UNVERIFIABLE_SHARED_APP_ID_SEE_workerNaming",
         "composeHash": "5d08e1983f6cc62606c1fbe035cedb967c8c3f9c9fad5e4f03593af711da1778"
       },
       "measured": {
@@ -102,20 +102,12 @@
         "SANDBOX_MAX": "4",
         "SANDBOX_MEMORY": "512m",
         "SANDBOX_CPUS": "1",
-        "SANDBOX_IDLE_TTL_SECONDS": "600",
-        "MCP_PUBLIC_ORIGIN": "https://mcp-dev.vana.org",
-        "MCP_APPROVAL_URL": "https://app-dev.vana.org/personal-server",
-        "MCP_STATE_PATH": "/mcp-state/state.sealed",
-        "MCP_REDIRECT_URIS": "[\"https://claude.ai/api/mcp/auth_callback\",\"https://claude.com/api/mcp/auth_callback\"]",
-        "MCP_INGRESS_HOST": "0.0.0.0",
-        "MCP_INGRESS_PORT": "8788",
-        "MCP_MIGRATION_REQUIRED": "0"
+        "SANDBOX_IDLE_TTL_SECONDS": "600"
       },
       "secretRefs": {
         "ENCLAVE_AGENT_SECRET": "spike-b3-agent-secret",
         "NODE_SECRET": "spike-b3-fleet-worker-1-node-secret"
       },
-      "composeOverlays": ["docker-compose.fleet-worker-source.yml"],
       "capacity": 4,
       "gateway": {
         "agentSecretRef": "spike-b3-agent-secret",
@@ -125,14 +117,14 @@
     "worker-2": {
       "role": "worker",
       "nodeId": "moksha-personal-server-worker-2",
-      "uuid": "1a5acf08-41b4-4524-9e0d-d8b520b5b9ae",
-      "cvmName": "moksha-personal-server-worker-2",
+      "uuid": "87c32ca4-49c9-4a83-b0af-ef5465cbbe18",
+      "cvmName": "moksha-personal-server-worker-1",
       "appId": "ec9a39de98c760e1ded9f1e97016dc5f0e357cf2",
       "instanceType": "tdx.medium",
       "compose": "docker-compose.fleet-worker.yml",
-      "composeOut": "worker-compose.yml",
+      "composeOut": "worker-1-source-compose.yml",
       "pinned": {
-        "instanceId": "eeea1588a1f55b129a2b14b24a1002719976f6a0",
+        "instanceId": "UNVERIFIABLE_SHARED_APP_ID_SEE_workerNaming",
         "composeHash": "8673fed70db6b71ba6398465c2a6d17a3f4dc093b54bf169f12a27da20112c35"
       },
       "measured": {
@@ -161,7 +153,14 @@
         "SANDBOX_MAX": "4",
         "SANDBOX_MEMORY": "512m",
         "SANDBOX_CPUS": "1",
-        "SANDBOX_IDLE_TTL_SECONDS": "600"
+        "SANDBOX_IDLE_TTL_SECONDS": "600",
+        "MCP_PUBLIC_ORIGIN": "https://mcp-dev.vana.org",
+        "MCP_APPROVAL_URL": "https://app-dev.vana.org/personal-server",
+        "MCP_STATE_PATH": "/mcp-state/state.sealed",
+        "MCP_REDIRECT_URIS": "[\"https://claude.ai/api/mcp/auth_callback\",\"https://claude.com/api/mcp/auth_callback\"]",
+        "MCP_INGRESS_HOST": "0.0.0.0",
+        "MCP_INGRESS_PORT": "8788",
+        "MCP_MIGRATION_REQUIRED": "0"
       },
       "secretRefs": {
         "ENCLAVE_AGENT_SECRET": "spike-b3-fleet-worker-2-agent-secret",
@@ -171,7 +170,8 @@
       "gateway": {
         "agentSecretRef": "spike-b3-fleet-worker-2-agent-secret",
         "nodeSecretRef": "spike-b3-fleet-worker-2-node-secret"
-      }
+      },
+      "composeOverlays": ["docker-compose.fleet-worker-source.yml"]
     },
     "worker-3": {
       "role": "worker",
@@ -275,5 +275,10 @@
         "nodeSecretRef": "spike-b3-worker-4-node-secret"
       }
     }
+  },
+  "workerNaming": {
+    "NOTE": "Each entry is keyed by its Gateway nodeId; uuid/cvmName/composeOut/pinned describe the machine that serves it. The Phala CVM names are crossed against the node ids and that is the live truth: the CVM Phala calls moksha-personal-server-worker-2 serves node moksha-personal-server-worker-1. Verified 2026-09-16 three ways - per-uuid compose read, tee_nodes.compose_hash, and tee_nodes.secret_hash matching each node secret to its node id.",
+    "MCP": "Moksha MCP is served by the CONTROLLER (DNS _dstack-app-address.mcp-dev.vana.org resolves to the controller instance), same as mainnet. The mcp-tls service on worker 87c32ca4 is vestigial and not the live endpoint. It is kept this roll so the roll changes no shape; dropping it belongs to a dedicated roll.",
+    "instanceIds": "BLOCKER: both workers are replicas under app id ec9a39de..., and phala api /cvms/<uuid>/attestation resolves by APP ID, not uuid, so the same uuid returns a different replica quote between calls (measured 2026-09-16: five consecutive probes of 1a5acf08 returned eeea1588 four times and 1ac22335 once). instanceId therefore cannot be pinned for either worker, assert_pinned_instances passes or fails at random, and the signed config is instance-bound - a bundle signed against the wrong instance is refused at boot. This fleet cannot be rolled until the workers stop sharing one app id, or attestation becomes uuid-addressable. Same STOP as mainnet step 2. Everything else in these two entries IS verified: per-uuid compose read, tee_nodes.compose_hash and tee_nodes.secret_hash all agree."
   }
 }
