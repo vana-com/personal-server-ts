@@ -47,6 +47,10 @@ export const RECORD_DATA_ACCESS_TYPES = {
 };
 
 const RECORD_ID_BYTES = 32;
+/** The EIP-712 domain `DataRegistryV2` declares; both halves are protocol. */
+const DOMAIN_NAME = "Vana Data Portability";
+const DOMAIN_VERSION = "1";
+const PRIMARY_TYPE = "RecordDataAccess";
 
 /** What the Gateway binds to the payment row and later submits on chain. */
 export interface JobAccessRecord {
@@ -89,13 +93,13 @@ export async function signAccessReceipt(
 
   const signature = await account.signTypedData({
     domain: {
-      name: "Vana Data Portability",
-      version: "1",
+      name: DOMAIN_NAME,
+      version: DOMAIN_VERSION,
       chainId: input.chainId,
       verifyingContract: getAddress(input.dataRegistry),
     },
     types: { ...RECORD_DATA_ACCESS_TYPES },
-    primaryType: "RecordDataAccess",
+    primaryType: PRIMARY_TYPE,
     message: {
       ownerAddress: owner,
       scope: input.scope,
