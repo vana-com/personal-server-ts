@@ -1,4 +1,5 @@
 import type { FleetAssignment } from "../fleet/contracts.js";
+import type { JobAccessRecord } from "./access-receipt.js";
 import type { Hex } from "viem";
 import type {
   ClaimRequest as SdkClaimRequest,
@@ -26,6 +27,13 @@ export {
 export type ClaimRequest = SdkClaimRequest & { assignment?: FleetAssignment };
 export type CompleteRequest = SdkCompleteRequest & {
   assignment?: FleetAssignment;
+  /**
+   * The delivery receipt this node signed for the read, which is what lets the
+   * Gateway charge it. Declared here rather than taken from the SDK: the
+   * Gateway ships the fee ahead of the SDK that carries the field, and this
+   * package pins a 3.x prerelease.
+   */
+  accessRecord?: JobAccessRecord;
 };
 export type FailRequest = SdkFailRequest & { assignment?: FleetAssignment };
 export type HeartbeatRequest = SdkHeartbeatRequest & {
