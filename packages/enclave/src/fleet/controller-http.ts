@@ -39,6 +39,8 @@ function authorized(request: Request, credential: string): boolean {
     supplied.length === expected.length && timingSafeEqual(supplied, expected)
   );
 }
+/** Error code for a request the controller rejects without reaching a route. */
+const INVALID_REQUEST = "invalid_request";
 class FleetBodyLimitError extends Error {}
 async function boundedBody(request: Request): Promise<string> {
   const reader = request.body?.getReader();
@@ -77,7 +79,19 @@ export function createFleetControlHttp(
       const text = await boundedBody(request);
       if (Buffer.byteLength(text) > 256 * 1024)
         return new Response(null, { status: 413 });
-      const body = JSON.parse(text) as Record<string, unknown>;
+      // A bodyless POST still carries a body stream under @hono/node-server, so
+      // `curl -X POST` with no `-d` reads as "" — that means "no arguments".
+      // Anything else that will not parse is the caller's mistake, not an outage.
+      let body: Record<string, unknown>;
+      try {
+        body = JSON.parse(text.trim() === "" ? "{}" : text) as Record<
+          string,
+          unknown
+        >;
+      } catch {
+        return Response.json({ error: INVALID_REQUEST }, { status: 400 });
+      }
+
       const path = new URL(request.url).pathname;
       if (options.role === "gateway") {
         if (options.active && !(await options.active()))
@@ -101,7 +115,7 @@ export function createFleetControlHttp(
                     s.minimumVersion < 0)),
             )
           )
-            return Response.json({ error: "invalid_request" }, { status: 400 });
+            return Response.json({ error: INVALID_REQUEST }, { status: 400 });
           if (path.endsWith("/ensure"))
             return Response.json({
               assignment: await options.controller.ensure(owner, scopes),

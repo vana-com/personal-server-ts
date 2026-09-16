@@ -271,6 +271,22 @@ Tests: `python3 scripts/tee/render-fleet.test.py`,
 `python3 scripts/tee/harvest-identity.test.py` and
 `node --test scripts/tee/fleet-common.test.mjs`. None calls `phala`.
 
+### Curling the controller by hand
+
+Every controller route is a POST that reads a JSON body, so always send one —
+`-d '{}'` where the route takes no arguments:
+
+```sh
+AT=$(security find-generic-password -w -s <admin-token item> -a <account>)
+curl -sS -X POST -H "authorization: Bearer $AT" -H 'content-type: application/json' \
+  -d '{}' "$CONTROLLER_URL/fleet/v1/status"
+```
+
+A bodyless `-X POST` is read as `{}` too, so it also works; a body that is not
+JSON comes back `400 {"error":"invalid_request"}`. `401` is a bad token, `404`
+the wrong listener (the Gateway one is `:8790`, admin `:8791`), and
+`503 fleet_request_unavailable` is a real controller fault.
+
 ### Known gaps
 
 | gap                                                                        | workaround                                                                                                    |
