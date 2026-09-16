@@ -8,7 +8,7 @@
     "image": "dstack-0.5.9-bd369a8c"
   },
   "gatewayUrl": "https://dp-rpc.vana.org",
-  "gatewayDomain": "REPLACE_WITH_PROD9_DSTACK_GATEWAY_DOMAIN",
+  "gatewayDomain": "dstack-pha-prod9.phala.network",
   "operatorPublicKeySpkiBase64": "MCowBQYDK2VwAyEAlUQsBowphYvxDhv1nIIsrNBqGq2fc1FJTiXzVOuXleY=",
   "gatewaySecretRefs": {
     "operator": "mainnet-prod1-operator"
@@ -17,26 +17,26 @@
     "controller": {
       "role": "controller",
       "nodeId": "mainnet-personal-server-controller",
-      "uuid": "REPLACE_WITH_MAINNET_CONTROLLER_CVM_UUID",
+      "uuid": "ec5f71b5-f81b-4f30-bc7b-2d251eb7cc54",
       "cvmName": "mainnet-personal-server-controller",
-      "appId": "REPLACE_WITH_MAINNET_CONTROLLER_APP_ID",
+      "appId": "128f28d0ebbd242916c635108343d8086a7d9f0e",
       "instanceType": "tdx.small",
       "compose": "docker-compose.fleet-controller.yml",
       "composeOut": "controller-compose.yml",
       "pinned": {
-        "instanceId": "REPLACE_WITH_MAINNET_CONTROLLER_INSTANCE_ID",
-        "composeHash": "REPLACE_WITH_MAINNET_CONTROLLER_COMPOSE_HASH"
+        "instanceId": "b5399a837ff0456905ffe8c9938002b97c4f6792",
+        "composeHash": "a022c31ece029644a511aa4f48d0226751ccaa472893e7e4843bf8a824653a97"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
-        "mrTd": "REPLACE_WITH_MAINNET_CONTROLLER_MRTD",
+        "mrTd": "f06dfda6dce1cf904d4e2bab1dc370634cf95cefa2ceb2de2eee127c9382698090d7a4a13e14c536ec6c9c3c8fa87077",
         "rtmrs": [
-          "REPLACE_WITH_MAINNET_CONTROLLER_RTMR0",
-          "REPLACE_WITH_MAINNET_CONTROLLER_RTMR1",
-          "REPLACE_WITH_MAINNET_CONTROLLER_RTMR2"
+          "68102e7b524af310f7b7d426ce75481e36c40f5d513a9009c046e9d37e31551f0134d954b496a3357fd61d03f07ffe96",
+          "07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+          "df67e467e60edc1737bcf8e682d48131bfb427f523226aa7f197a7608e9b3784783fa759ef5b28191fa12f9ddb36b858"
         ],
-        "osImageHash": "REPLACE_WITH_MAINNET_OS_IMAGE_HASH",
-        "keyProviderSpki": "REPLACE_WITH_MAINNET_KMS_ROOT_SPKI"
+        "osImageHash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+        "keyProviderSpki": "3059301306072a8648ce3d020106082a8648ce3d030107034200048844eb42ccdf8c52fd4f174f362fcb9bbd19c45fd48f1edec2d8f1ca23536ec1a74021b4cee610c074f8294d431b2b7fee2c39e5333fdaf0a4522d43fb159d9f"
       },
       "env": {
         "CHAIN_ID": "1480",
@@ -68,26 +68,26 @@
     "worker-1": {
       "role": "worker",
       "nodeId": "mainnet-personal-server-worker-1",
-      "uuid": "REPLACE_WITH_MAINNET_WORKER_1_CVM_UUID",
+      "uuid": "ea776e4e-b3e3-4a31-8ed5-9e82bc1e9dd5",
       "cvmName": "mainnet-personal-server-worker-1",
-      "appId": "REPLACE_WITH_MAINNET_WORKER_APP_ID",
+      "appId": "01bb1b6dcaf1ea170f1480c5e53b093f384d939a",
       "instanceType": "tdx.medium",
       "compose": "docker-compose.fleet-worker.yml",
       "composeOut": "worker-compose.yml",
       "pinned": {
-        "instanceId": "REPLACE_WITH_MAINNET_WORKER_1_INSTANCE_ID",
-        "composeHash": "REPLACE_WITH_MAINNET_WORKER_1_COMPOSE_HASH"
+        "instanceId": "74ab19f73d2ad2b35d06776bf82e3c121b2d0763",
+        "composeHash": "933386114b7e4f3cedb7073c54e59fa58f5577c180c46676a4319986a2ad93a1"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
-        "mrTd": "REPLACE_WITH_MAINNET_WORKER_MRTD",
+        "mrTd": "f06dfda6dce1cf904d4e2bab1dc370634cf95cefa2ceb2de2eee127c9382698090d7a4a13e14c536ec6c9c3c8fa87077",
         "rtmrs": [
-          "REPLACE_WITH_MAINNET_WORKER_RTMR0",
-          "REPLACE_WITH_MAINNET_WORKER_RTMR1",
-          "REPLACE_WITH_MAINNET_WORKER_RTMR2"
+          "027b610ab0555482f8a3868524093bdf3cdbe2539f81dfeeb886864654cb2fe3422f7fc36d4bab6fa46683aad11d1ba7",
+          "07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+          "df67e467e60edc1737bcf8e682d48131bfb427f523226aa7f197a7608e9b3784783fa759ef5b28191fa12f9ddb36b858"
         ],
-        "osImageHash": "REPLACE_WITH_MAINNET_OS_IMAGE_HASH",
-        "keyProviderSpki": "REPLACE_WITH_MAINNET_KMS_ROOT_SPKI"
+        "osImageHash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+        "keyProviderSpki": "3059301306072a8648ce3d020106082a8648ce3d030107034200048844eb42ccdf8c52fd4f174f362fcb9bbd19c45fd48f1edec2d8f1ca23536ec1a74021b4cee610c074f8294d431b2b7fee2c39e5333fdaf0a4522d43fb159d9f"
       },
       "env": {
         "CHAIN_ID": "1480",
@@ -122,64 +122,10 @@
         "agentSecretRef": "mainnet-prod1-worker-1-agent-secret",
         "nodeSecretRef": "mainnet-prod1-worker-1-node-secret"
       }
-    },
-    "worker-2": {
-      "role": "worker",
-      "nodeId": "mainnet-personal-server-worker-2",
-      "uuid": "REPLACE_WITH_MAINNET_WORKER_2_CVM_UUID",
-      "cvmName": "mainnet-personal-server-worker-2",
-      "appId": "REPLACE_WITH_MAINNET_WORKER_APP_ID",
-      "instanceType": "tdx.medium",
-      "compose": "docker-compose.fleet-worker.yml",
-      "composeOut": "worker-compose.yml",
-      "pinned": {
-        "instanceId": "REPLACE_WITH_MAINNET_WORKER_2_INSTANCE_ID",
-        "composeHash": "REPLACE_WITH_MAINNET_WORKER_1_COMPOSE_HASH"
-      },
-      "measured": {
-        "measurementMode": "dstack-0.5.9-events",
-        "mrTd": "REPLACE_WITH_MAINNET_WORKER_MRTD",
-        "rtmrs": [
-          "REPLACE_WITH_MAINNET_WORKER_RTMR0",
-          "REPLACE_WITH_MAINNET_WORKER_RTMR1",
-          "REPLACE_WITH_MAINNET_WORKER_RTMR2"
-        ],
-        "osImageHash": "REPLACE_WITH_MAINNET_OS_IMAGE_HASH",
-        "keyProviderSpki": "REPLACE_WITH_MAINNET_KMS_ROOT_SPKI"
-      },
-      "env": {
-        "CHAIN_ID": "1480",
-        "NODE_ID": "mainnet-personal-server-worker-2",
-        "GATEWAY_URL": "https://dp-rpc.vana.org",
-        "STORAGE_API_URL": "https://storage.vana.org",
-        "ENCLAVE_AGENT_HOST": "0.0.0.0",
-        "ENCLAVE_AGENT_PORT": "8787",
-        "FLEET_ENABLED": "true",
-        "FLEET_PEER_HOST": "0.0.0.0",
-        "FLEET_PEER_PORT": "8789",
-        "SANDBOX_RUNTIME": "docker",
-        "DOCKER_HOST": "tcp://sandbox-runtime:2375",
-        "SANDBOX_MAX": "4",
-        "SANDBOX_MEMORY": "512m",
-        "SANDBOX_CPUS": "1",
-        "SANDBOX_IDLE_TTL_SECONDS": "600",
-        "MCP_PUBLIC_ORIGIN": "https://mcp.vana.org",
-        "MCP_APPROVAL_URL": "https://app.vana.org/personal-server",
-        "MCP_STATE_PATH": "/mcp-state/state.sealed",
-        "MCP_REDIRECT_URIS": "[\"https://claude.ai/api/mcp/auth_callback\",\"https://claude.com/api/mcp/auth_callback\"]",
-        "MCP_INGRESS_HOST": "0.0.0.0",
-        "MCP_INGRESS_PORT": "8788",
-        "MCP_MIGRATION_REQUIRED": "0"
-      },
-      "secretRefs": {
-        "ENCLAVE_AGENT_SECRET": "mainnet-prod1-worker-2-agent-secret",
-        "NODE_SECRET": "mainnet-prod1-worker-2-node-secret"
-      },
-      "capacity": 4,
-      "gateway": {
-        "agentSecretRef": "mainnet-prod1-worker-2-agent-secret",
-        "nodeSecretRef": "mainnet-prod1-worker-2-node-secret"
-      }
     }
-  }
+  },
+  "fleetShape": {
+    "NOTE": "One controller + one worker. The worker-2 replica (39600ebe-9f8a-40ac-8fde-2a585776bac1) was deleted during step 3 so the worker app id has a single live CVM - that is what makes phala api /cvms/<uuid>/attestation unambiguous on this fleet, unlike moksha-prod5. Before adding a second worker, read docs/260915-mainnet-prod1-staging-plan.md section 0a: a shared app id breaks instance-id harvesting."
+  },
+  "pinnedFrom": "Harvested live 2026-09-16 from each CVM by uuid, cross-checked two ways: the per-uuid compose read (phala api /cvms/<uuid>) and the Gateway admission record (dp-rpc/prd tee_nodes: worker-1 instance 74ab19f7, compose 0x933386114b7e). All three agree."
 }
