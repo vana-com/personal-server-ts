@@ -9,6 +9,10 @@ import {
   MCP_TOKEN_TTL_MS,
   revokeMcpConnection,
 } from "@opendatalabs/personal-server-ts-core/mcp";
+import {
+  buildWeb3SignedHeader,
+  createTestWallet,
+} from "@opendatalabs/personal-server-ts-core/test-utils";
 import { openMcpDurableState } from "./durable-state.js";
 import {
   createTeeMcpIngress,
@@ -592,5 +596,145 @@ describe("TEE MCP ingress", () => {
     // Reading the body to classify it must leave the dispatched one readable.
     expect(await dispatch.mock.calls[0][0].json()).toEqual(fellThrough);
     expect((await app.fetch(post(initialize, "unknown"))).status).toBe(401);
+  });
+
+  describe("owner connection management", () => {
+    const origin = "https://mcp-dev.vana.org";
+    const path = "/v1/mcp/connections";
+    const owner = createTestWallet(1);
+    const stranger = createTestWallet(2);
+
+    /** A worker CVM holds every owner's connections in one sealed store. */
+    async function sharedIngress() {
+      const dir = await mkdtemp(join(tmpdir(), "tee-connections-"));
+      dirs.push(dir);
+      const state = await openMcpDurableState({
+        path: join(dir, "state"),
+        key: randomBytes(32),
+      });
+      const seed = async (id: string, boundTo?: `0x${string}`) => {
+        await state.connections.create({
+          id,
+          displayName: `Claude ${id}`,
+          granteeAddress: OWNER,
+          granteePublicKey: "0x02",
+          encryptedGranteePrivateKey: { kind: "plaintext", privateKey: "0x01" },
+          tokenHash: createHash("sha256").update(id).digest("hex"),
+          refreshTokenHash: createHash("sha256").update(`${id}r`).digest("hex"),
+          tokenExpiresAt: new Date(Date.now() + MCP_TOKEN_TTL_MS).toISOString(),
+          status: "approved",
+          grants: [{ grantId: "0xabc", scopes: ["spotify.profile"] }],
+          createdAt: new Date().toISOString(),
+        } as never);
+        if (boundTo)
+          await state.bindOwner(id, { owner: boundTo, chainId: 14800 });
+      };
+      await seed("mine-1", owner.address);
+      await seed("theirs-1", stranger.address);
+      await seed("unbound-1");
+      const app = createTeeMcpIngress({
+        state,
+        origin,
+        approvalUrl: "https://vana.example/mcp",
+        allowedRedirectUris: ["https://claude.ai/api/mcp/auth_callback"],
+        gateway: {} as never,
+        verifyGrants: vi.fn(),
+        registerGrantee: vi.fn(),
+        dispatch: vi.fn(),
+      });
+      return { app, state };
+    }
+
+    const claim = (method: string, uri: string, lifetimeSeconds?: number) => {
+      const iat = Math.floor(Date.now() / 1000);
+      return buildWeb3SignedHeader({
+        wallet: owner,
+        aud: origin,
+        method,
+        uri,
+        ...(lifetimeSeconds ? { iat, exp: iat + lifetimeSeconds } : {}),
+      });
+    };
+
+    it("lists the signing owner's connections, and nothing private", async () => {
+      const { app } = await sharedIngress();
+
+      const listed = await app.request(path, {
+        headers: { authorization: await claim("GET", path) },
+      });
+
+      expect(listed.status).toBe(200);
+      const { connections } = await listed.json();
+      // An unbound connection belongs to nobody; a bound one only to its owner.
+      expect(connections).toEqual([
+        {
+          id: "mine-1",
+          displayName: "Claude mine-1",
+          granteeAddress: OWNER,
+          status: "approved",
+          grants: [{ grantId: "0xabc", scopes: ["spotify.profile"] }],
+          createdAt: expect.any(String),
+        },
+      ]);
+    });
+
+    it("refuses an unsigned request and a long-lived claim", async () => {
+      const { app } = await sharedIngress();
+
+      expect((await app.request(path)).status).toBe(401);
+      // The signer picks `exp`; an hour-long management claim is not honoured.
+      const longLived = await app.request(path, {
+        headers: { authorization: await claim("GET", path, 3600) },
+      });
+      expect(longLived.status).toBe(401);
+    });
+
+    it("answers a foreign, unbound or unknown connection identically", async () => {
+      const { app, state } = await sharedIngress();
+
+      const answers = [];
+      for (const id of ["theirs-1", "unbound-1", "no-such-connection"]) {
+        const uri = `${path}/${id}`;
+        const response = await app.request(uri, {
+          method: "DELETE",
+          headers: { authorization: await claim("DELETE", uri) },
+        });
+        answers.push([response.status, await response.text()]);
+      }
+
+      // One answer for all three: which ids exist is not the caller's to learn.
+      expect(new Set(answers.map(String)).size).toBe(1);
+      expect(answers[0]?.[0]).toBe(404);
+      expect((await state.connections.getById("theirs-1"))!.status).toBe(
+        "approved",
+      );
+    });
+
+    it("revokes the owner's own connection, and replaying the header changes nothing", async () => {
+      const { app, state } = await sharedIngress();
+      const uri = `${path}/mine-1`;
+      const authorization = await claim("DELETE", uri);
+
+      const revoked = await app.request(uri, {
+        method: "DELETE",
+        headers: { authorization },
+      });
+
+      expect(revoked.status).toBe(200);
+      expect((await revoked.json()).status).toBe("revoked");
+      const stored = (await state.connections.getById("mine-1"))!;
+      expect(stored.status).toBe("revoked");
+      // The refresh family goes with it, or the holder mints a fresh bearer.
+      expect(stored.refreshTokenHash).toBeUndefined();
+
+      const replayed = await app.request(uri, {
+        method: "DELETE",
+        headers: { authorization },
+      });
+      expect(replayed.status).toBe(200);
+      expect((await state.connections.getById("mine-1"))!.revokedAt).toBe(
+        stored.revokedAt,
+      );
+    });
   });
 });

@@ -114,6 +114,13 @@ export interface McpDurableState {
   }>;
   approvedOwnerBindings(): Promise<McpOwnerBinding[]>;
   connections: McpConnectionStore;
+  /**
+   * Connections bound to one owner, out of one snapshot. Scoped here rather
+   * than by filtering `connections.list()`: this store is shared by every
+   * owner on the CVM, and a caller-side filter would first copy all of them,
+   * private keys included.
+   */
+  ownerConnections(owner: Address): Promise<McpConnectionRecord[]>;
   authorizations: McpOAuthAuthorizationStore;
   bindOwner(connectionId: string, binding: McpOwnerBinding): Promise<void>;
   getOwner(connectionId: string): Promise<McpOwnerBinding | null>;
@@ -498,6 +505,15 @@ export async function openMcpDurableState(options: {
         draft.owners[connectionId] = structuredClone(binding);
       }),
     getOwner: (id) => read((current) => current.owners[id] ?? null),
+    ownerConnections: (owner) => {
+      const wanted = owner.toLowerCase();
+      return read((current) =>
+        Object.values(current.connections).filter(
+          (connection) =>
+            current.owners[connection.id]?.owner.toLowerCase() === wanted,
+        ),
+      );
+    },
     rememberIdentity: (identity) =>
       mutate((draft) => {
         const previous = draft.identities[identity.userPsId];
