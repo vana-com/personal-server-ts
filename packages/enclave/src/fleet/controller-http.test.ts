@@ -181,3 +181,29 @@ it("reports a member that has never been admitted as a null outcome", async () =
     await (await admin(request("/fleet/v1/status", token))).text(),
   ).toContain('"lastAdmission":null');
 });
+
+it("reads a bodyless POST as no arguments and a bad body as a caller error", async () => {
+  const { common } = fixture();
+  const token = "a".repeat(32);
+  const admin = createFleetControlHttp({
+    ...common,
+    role: "admin",
+    credential: token,
+  });
+  const post = (body: BodyInit | null) =>
+    admin(
+      new Request("https://controller.invalid/fleet/v1/status", {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+        body,
+      }),
+    );
+
+  // `curl -X POST` with no `-d` must read status, not look like an outage.
+  expect((await post(null)).status).toBe(200);
+  expect((await post("")).status).toBe(200);
+
+  const malformed = await post("{not json");
+  expect(malformed.status).toBe(400);
+  expect(await malformed.json()).toEqual({ error: "invalid_request" });
+});
