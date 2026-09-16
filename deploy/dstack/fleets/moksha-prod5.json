@@ -66,8 +66,8 @@
     "worker-1": {
       "role": "worker",
       "nodeId": "moksha-personal-server-worker-1",
-      "uuid": "87c32ca4-49c9-4a83-b0af-ef5465cbbe18",
-      "cvmName": "moksha-personal-server-worker-1",
+      "uuid": "1a5acf08-41b4-4524-9e0d-d8b520b5b9ae",
+      "cvmName": "moksha-personal-server-worker-2",
       "appId": "ec9a39de98c760e1ded9f1e97016dc5f0e357cf2",
       "instanceType": "tdx.medium",
       "compose": "docker-compose.fleet-worker.yml",
@@ -125,8 +125,8 @@
     "worker-2": {
       "role": "worker",
       "nodeId": "moksha-personal-server-worker-2",
-      "uuid": "1a5acf08-41b4-4524-9e0d-d8b520b5b9ae",
-      "cvmName": "moksha-personal-server-worker-2",
+      "uuid": "87c32ca4-49c9-4a83-b0af-ef5465cbbe18",
+      "cvmName": "moksha-personal-server-worker-1",
       "appId": "ec9a39de98c760e1ded9f1e97016dc5f0e357cf2",
       "instanceType": "tdx.medium",
       "compose": "docker-compose.fleet-worker.yml",
@@ -275,5 +275,8 @@
         "nodeSecretRef": "spike-b3-worker-4-node-secret"
       }
     }
+  },
+  "workerNaming": {
+    "NOTE": "The Phala CVM names and the Gateway node ids are crossed on this fleet, and that is the live truth, not a typo. The CVM Phala calls moksha-personal-server-worker-2 (uuid 1a5acf08) runs as Gateway node moksha-personal-server-worker-1, and vice versa. A node entry is keyed by its Gateway nodeId; uuid and cvmName describe the machine that serves it. Verified 2026-09-16 by attesting each uuid: instance and compose hash both match the pins below only in this arrangement."
   }
 }
