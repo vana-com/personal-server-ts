@@ -254,6 +254,55 @@ for node in worker-1 worker-2 worker-3 worker-4; do
 done
 ```
 
+### Replicas sharing an app id: harvest from the Gateway admission record
+
+`phala api /cvms/<uuid>/attestation` resolves by **app id**, not uuid. When two
+CVMs are replicas of one app it answers for whichever it likes, so the same uuid
+returns a different quote between calls — and stopping the other replica does
+not settle it (measured on `moksha-prod5`: with worker-2 stopped, worker-1's
+uuid still returned the stopped machine's quote 5 times out of 5). Mainnet hit
+this in the 2026-09-15 staging and cleared it only by deleting the replica.
+
+That makes the attested instance id unusable as the per-CVM discriminator
+`assert_pinned_instances` needs, and the signed config is instance-bound, so a
+draft pinned from the wrong quote bricks that node on its next boot.
+
+The Gateway saw each node's own quote once, at registration, and built that
+node's `publicUrl` from the instance id in it — keyed by node id, not app id.
+Pass those ids explicitly:
+
+```sh
+cat > instance-ids.json <<'JSON'
+{ "moksha-personal-server-worker-1": "<40-hex>",
+  "moksha-personal-server-worker-2": "<40-hex>" }
+JSON
+
+python3 scripts/tee/render-fleet.py \
+  --manifest deploy/dstack/fleets/moksha-prod5.json \
+  --images-env <ci-docker-dir>/images.env \
+  --instance-ids instance-ids.json \
+  --out rendered/ --stage --settle --write-manifest
+```
+
+Every supplied id is re-read from `GET /v1/tee-nodes` and compared **at run
+time**, before and after staging: the file is an operator's assertion, the
+Gateway is the evidence, and a stale file fails loudly rather than pinning a
+draft that cannot boot. It refuses a node the Gateway does not list as
+`admitted`, a node listed twice, a key naming no node in the manifest, an id
+that is not 40 lowercase hex, and a `publicUrl` that is not exactly this
+fleet's `https://<instanceId>-<ENCLAVE_AGENT_PORT>.<gatewayDomain>` — a host
+chosen by whoever wrote the row must not choose the id. The Gateway read itself
+requires an https origin and refuses to follow a redirect, which would carry the
+operator bearer somewhere it was not issued.
+
+Nodes not listed still use the attestation, which stays the default. Get the ids
+from the Gateway, never from a previous render:
+
+```sh
+curl -s -H "authorization: Bearer $(security find-generic-password -s <operator item> -w)" \
+  https://dp-rpc.moksha.vana.org/v1/tee-nodes | jq -r '.[] | .nodeId + " " + .publicUrl'
+```
+
 A net-new fleet is the same without the staged prior hash: deploy each CVM
 fail-closed, fill the manifest's `measured` and `pinned` blocks from
 `harvest-identity.py`, render without `--stage`, sign with `--apply`, then

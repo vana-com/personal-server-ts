@@ -40,6 +40,7 @@ def load_module():
 
 rf = load_module()
 STAGE_NODE = rf.stage_node
+GATEWAY_ROWS = rf.gateway_rows
 
 
 def rendered(name, overlay=None):
@@ -640,6 +641,161 @@ class StageGuards(unittest.TestCase):
             rf.stage_all(self.nodes, pathlib.Path("."))
 
         self.assertEqual(self.staged, [])
+
+
+class TrustedInstanceIds(unittest.TestCase):
+    """The opt-in for replicas whose attested instance id is ambiguous.
+
+    Driven through `load_trusted_instances` and the real `gateway_instance_ids`,
+    with only the HTTP boundary stubbed, so the parsing and the state check are
+    under test rather than a copy of them.
+    """
+
+    I1 = "1" * 40
+    I2 = "2" * 40
+
+    def setUp(self):
+        self.manifest = {
+            "gatewayUrl": "https://gateway.example",
+            "gatewayDomain": "fleet.example",
+            "gatewaySecretRefs": {"operator": "an-item"},
+        }
+        self.nodes = {
+            "worker-1": self.node("node-1", self.I1),
+            "worker-2": self.node("node-2", self.I2),
+        }
+        self.rows = [self.row("node-1", self.I1), self.row("node-2", self.I2)]
+        rf.gateway_rows = lambda manifest: self.rows
+
+    def tearDown(self):
+        rf.gateway_rows = GATEWAY_ROWS
+
+    def node(self, node_id, instance_id):
+        return {
+            "nodeId": node_id,
+            "uuid": "u-" + node_id,
+            "appId": "shared-app",
+            "env": {"ENCLAVE_AGENT_PORT": "8787"},
+            "pinned": {"instanceId": instance_id},
+        }
+
+    def row(self, node_id, instance_id, state="admitted", host="fleet.example", port="8787"):
+        return {
+            "nodeId": node_id,
+            "state": state,
+            "publicUrl": "https://%s-%s.%s" % (instance_id, port, host),
+        }
+
+    def supply(self, mapping):
+        path = pathlib.Path(tempfile.mkdtemp()) / "ids.json"
+        path.write_text(json.dumps(mapping))
+        return path
+
+    def trust(self, mapping):
+        return rf.load_trusted_instances(self.supply(mapping), self.manifest, self.nodes)
+
+    def test_ids_matching_the_gateway_are_trusted(self):
+        # Only what was supplied; worker-2 still goes to its attestation.
+        self.assertEqual(self.trust({"node-1": self.I1}), {"worker-1": self.I1})
+
+    def test_a_stale_file_is_refused(self):
+        # The file is an operator's assertion; the Gateway is the evidence.
+        with self.assertRaises(SystemExit) as raised:
+            self.trust({"node-1": self.I2})
+
+        self.assertIn("admission record says " + self.I1, str(raised.exception))
+
+    def test_a_typoed_node_id_is_refused_not_ignored(self):
+        # Falling through would put that node back on the ambiguous path.
+        with self.assertRaises(SystemExit) as raised:
+            self.trust({"node-l": self.I1})
+
+        self.assertIn("no node for", str(raised.exception))
+
+    def test_a_malformed_instance_id_is_refused(self):
+        with self.assertRaises(SystemExit) as raised:
+            self.trust({"node-1": "1ac22335"})
+
+        self.assertIn("40 lowercase hex", str(raised.exception))
+
+    def test_a_node_the_gateway_does_not_admit_is_refused(self):
+        # Pending, draining and removed are not something to pin against.
+        self.rows = [self.row("node-1", self.I1, state="draining")]
+
+        with self.assertRaises(SystemExit) as raised:
+            self.trust({"node-1": self.I1})
+
+        self.assertIn("no admitted node", str(raised.exception))
+
+    def test_two_rows_for_one_node_are_refused(self):
+        self.rows.append(self.row("node-1", self.I2))
+
+        with self.assertRaises(SystemExit) as raised:
+            self.trust({"node-1": self.I1})
+
+        self.assertIn("twice", str(raised.exception))
+
+    def test_a_public_url_on_a_foreign_host_is_refused(self):
+        # An attacker-influenced row must not get to choose the trusted id.
+        self.rows = [self.row("node-1", self.I1, host="attacker.example")]
+
+        with self.assertRaises(SystemExit) as raised:
+            self.trust({"node-1": self.I1})
+
+        self.assertIn("not this fleet's node URL", str(raised.exception))
+
+    def test_a_public_url_on_a_foreign_port_is_refused(self):
+        self.rows = [self.row("node-1", self.I1, port="1")]
+
+        with self.assertRaises(SystemExit):
+            self.trust({"node-1": self.I1})
+
+    def test_a_public_url_with_a_path_is_refused(self):
+        self.rows = [{"nodeId": "node-1", "state": "admitted",
+                      "publicUrl": "https://%s-8787.fleet.example/evil" % self.I1}]
+
+        with self.assertRaises(SystemExit):
+            self.trust({"node-1": self.I1})
+
+    def test_a_trusted_id_still_has_to_match_the_manifest_pin(self):
+        # Trust changes where the id comes from, never whether it is checked.
+        self.nodes["worker-1"]["pinned"]["instanceId"] = "a" * 40
+
+        with self.assertRaises(SystemExit):
+            rf.assert_pinned_instances(self.nodes, {"worker-1": self.I1})
+
+    def test_a_trusted_node_never_touches_the_attestation(self):
+        def explode(uuid):
+            raise AssertionError("read_attestation called for " + uuid)
+
+        rf.HARVEST.read_attestation = explode
+        try:
+            rf.assert_pinned_instances({"worker-1": self.nodes["worker-1"]}, {"worker-1": self.I1})
+        finally:
+            rf.HARVEST = rf.load_harvester()
+
+    def test_a_trusted_and_an_attested_node_cannot_claim_one_cvm(self):
+        # The duplicate guard has to span both sources, or a mixed run could
+        # pin two node ids to the same machine.
+        rf.HARVEST.read_attestation = lambda uuid: {"instanceId": self.I1}
+        rf.HARVEST.measured_identity = lambda a, app: a
+        self.nodes["worker-2"]["pinned"]["instanceId"] = self.I1
+        try:
+            with self.assertRaises(SystemExit) as raised:
+                rf.assert_pinned_instances(self.nodes, {"worker-1": self.I1})
+
+            self.assertIn("both attested", str(raised.exception))
+        finally:
+            rf.HARVEST = rf.load_harvester()
+
+    def test_a_non_https_gateway_url_is_refused(self):
+        rf.gateway_rows = GATEWAY_ROWS
+        self.manifest["gatewayUrl"] = "http://gateway.example"
+
+        with self.assertRaises(SystemExit) as raised:
+            rf.gateway_instance_ids(self.manifest, self.nodes)
+
+        self.assertIn("bare https origin", str(raised.exception))
 
 
 if __name__ == "__main__":

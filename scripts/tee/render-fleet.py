@@ -28,6 +28,7 @@ import re
 import subprocess
 import sys
 import urllib.parse
+import urllib.request
 import tempfile
 import time
 
@@ -93,6 +94,8 @@ PRIVATE_MODE = 0o600
 
 RECEIPT_NAME = "render-receipt.json"
 HARVEST_PATH = pathlib.Path(__file__).resolve().parent / "harvest-identity.py"
+# One Gateway read per assertion; it is a small JSON list on the operator API.
+GATEWAY_TIMEOUT_SECONDS = 30
 HASH_NOTE = (
     "composeFileSha256 is the rendered file's digest, NOT the dstack "
     "compose_hash. Pin drafts only to a hash read back from a staged CVM."
@@ -623,7 +626,156 @@ def phala(args):
     return json.loads(out)
 
 
-def assert_pinned_instances(nodes):
+INSTANCE_ID_RE = re.compile(r"^[0-9a-f]{40}$")
+# The Gateway is read once per assertion; it answers a small JSON list.
+ADMITTED_STATE = "admitted"
+
+
+def gateway_rows(manifest):
+    """Every node the Gateway currently lists, read live over the operator API.
+
+    Never over plain HTTP and never through a redirect: urllib copies the
+    Authorization header into the redirected request, so a redirect is a way to
+    hand the operator bearer to another host.
+    """
+    base = urllib.parse.urlsplit(manifest["gatewayUrl"].rstrip("/"))
+    if base.scheme != "https" or not base.netloc or base.username:
+        raise SystemExit("gatewayUrl must be a bare https origin: %s" % manifest["gatewayUrl"])
+
+    request = urllib.request.Request(
+        urllib.parse.urlunsplit((base.scheme, base.netloc, "/v1/tee-nodes", "", "")),
+        headers={"authorization": "Bearer " + keychain_secret(manifest["gatewaySecretRefs"]["operator"])},
+    )
+    opener = urllib.request.build_opener(NoRedirects)
+    try:
+        with opener.open(request, timeout=GATEWAY_TIMEOUT_SECONDS) as response:
+            rows = json.load(response)
+    except Exception as error:
+        raise SystemExit("Gateway /v1/tee-nodes is unreadable: %s" % error)
+
+    if not isinstance(rows, list):
+        raise SystemExit("Gateway /v1/tee-nodes did not answer a list")
+
+    return rows
+
+
+class NoRedirects(urllib.request.HTTPRedirectHandler):
+    """A redirect would carry the operator bearer somewhere it was not issued."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise SystemExit("Gateway /v1/tee-nodes redirected to %s; refusing" % newurl)
+
+
+def instance_from_public_url(public_url, manifest, node):
+    """The instance id inside a node's public URL, or None if it is not one.
+
+    Only the exact URL the Gateway builds for this fleet counts:
+    `https://<40-hex>-<agent port>.<gatewayDomain>` and nothing else. A host the
+    manifest does not name could be chosen by whoever wrote the row, and the
+    whole point is to take the id from evidence rather than from an assertion.
+    """
+    expected_port = node["env"]["ENCLAVE_AGENT_PORT"]
+    parts = urllib.parse.urlsplit(public_url or "")
+    if parts.scheme != "https" or parts.username or parts.path.strip("/") or parts.query or parts.fragment:
+        return None
+
+    label, separator, domain = parts.netloc.partition(".")
+    instance_id, dash, port = label.rpartition("-")
+    if not separator or domain != manifest["gatewayDomain"] or not dash or port != expected_port:
+        return None
+
+    return instance_id if INSTANCE_ID_RE.match(instance_id) else None
+
+
+def gateway_instance_ids(manifest, nodes):
+    """Each admitted node's instance id, as the Gateway recorded it.
+
+    `phala api /cvms/<uuid>/attestation` resolves by **app id**, so when two
+    CVMs are replicas of one app it answers for whichever it likes - the same
+    uuid returns a different quote between calls, and stopping the other
+    replica does not settle it. That makes the attested id unusable as the
+    per-CVM discriminator it is supposed to be.
+
+    The Gateway saw each node's own quote once, at registration, and built that
+    node's `publicUrl` from the instance id in it. So the URL it routes to today
+    carries the id, keyed by node id rather than by app id.
+
+    Only an `admitted` row counts. A pending, draining or removed node is not
+    something to pin a signed config against, and a duplicate row means the
+    Gateway cannot say which machine a node id is.
+    """
+    by_node = {node["nodeId"]: node for node in nodes.values()}
+    found = {}
+    for row in gateway_rows(manifest):
+        node_id = row.get("nodeId")
+        node = by_node.get(node_id)
+        if node is None or row.get("state") != ADMITTED_STATE:
+            continue
+        if node_id in found:
+            raise SystemExit("the Gateway lists %s twice; it cannot say which CVM it is" % node_id)
+
+        instance_id = instance_from_public_url(row.get("publicUrl"), manifest, node)
+        if instance_id is None:
+            raise SystemExit(
+                "%s: the Gateway's publicUrl is not this fleet's node URL: %r"
+                % (node_id, row.get("publicUrl"))
+            )
+        found[node_id] = instance_id
+
+    return found
+
+
+def keychain_secret(item):
+    """Read one login-keychain item by name. The value never touches disk."""
+    result = subprocess.run(
+        ["security", "find-generic-password", "-s", item, "-w"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit("keychain item %s is missing" % item)
+
+    return result.stdout.strip()
+
+
+def load_trusted_instances(path, manifest, nodes):
+    """Validate a nodeId->instanceId map against the Gateway, then trust it.
+
+    The file is an operator's assertion; the Gateway is the evidence. Every id
+    supplied has to match the live admission record or nothing is trusted, so a
+    stale file fails loudly instead of pinning a draft that bricks on boot.
+
+    Every supplied key must name a node in this manifest. A typo that silently
+    fell through would put that node back on the ambiguous attestation path -
+    the exact failure this flag exists to avoid - so it is an error instead.
+    """
+    supplied = json.loads(path.read_text())
+    if not isinstance(supplied, dict):
+        raise SystemExit("--instance-ids must be a JSON object of nodeId -> instanceId")
+
+    known = {node["nodeId"]: name for name, node in nodes.items()}
+    live = gateway_instance_ids(manifest, nodes)
+
+    trusted = {}
+    for node_id, instance_id in supplied.items():
+        if node_id not in known:
+            raise SystemExit("--instance-ids names %s, which this manifest has no node for" % node_id)
+        if not isinstance(instance_id, str) or not INSTANCE_ID_RE.match(instance_id):
+            raise SystemExit("%s: instance id must be 40 lowercase hex, got %r" % (node_id, instance_id))
+        if node_id not in live:
+            raise SystemExit("%s: the Gateway has no admitted node %s" % (known[node_id], node_id))
+        if instance_id != live[node_id]:
+            raise SystemExit(
+                "%s: --instance-ids says %s, the Gateway's admission record says %s"
+                % (known[node_id], instance_id, live[node_id])
+            )
+        trusted[known[node_id]] = live[node_id]
+
+    return trusted
+
+
+def assert_pinned_instances(nodes, trusted=None):
     """Fail closed if any manifest instance id went stale - before staging ANY.
 
     render never re-harvests `pinned.instanceId`; it copies the value into the
@@ -631,11 +783,21 @@ def assert_pinned_instances(nodes):
     (security-config.ts), so a stale pin bricks that node on its next boot,
     silently and after signing. The whole fleet is checked up front: a stale
     worker-3 must not leave the controller and workers 1-2 already restarted.
+
+    `trusted` supplies an id from the Gateway's admission record instead of the
+    attestation endpoint, for nodes whose app id is shared by a replica. It is
+    opt-in per node; everything else still goes to the quote.
     """
+    trusted = trusted or {}
     claimed = {}
     for name, node in nodes.items():
-        attested = HARVEST.measured_identity(HARVEST.read_attestation(node["uuid"]), node["appId"])
-        HARVEST.assert_instance(name, node["pinned"], attested, claimed)
+        if name in trusted:
+            identity = {"instanceId": trusted[name]}
+        else:
+            identity = HARVEST.measured_identity(
+                HARVEST.read_attestation(node["uuid"]), node["appId"]
+            )
+        HARVEST.assert_instance(name, node["pinned"], identity, claimed)
 
 
 def stage_node(name, node, compose_path, out_dir):
@@ -734,9 +896,9 @@ def render_composes(manifest, nodes, args, images, out_dir):
     return rendered
 
 
-def stage_all(nodes, out_dir):
+def stage_all(nodes, out_dir, trusted=None):
     """Stage the controller first, so workers can pin its new hash."""
-    assert_pinned_instances(nodes)
+    assert_pinned_instances(nodes, trusted)
     controller, _ = controller_of(nodes)
     order = [controller] + [n for n in nodes if n != controller]
     staged = {}
@@ -766,6 +928,16 @@ def parse_args():
     parser.add_argument("--stage", action="store_true", help="apply each compose and read its real hash back")
     parser.add_argument("--settle", action="store_true", help="with --stage, wait for every CVM to run")
     parser.add_argument("--write-manifest", action="store_true", help="persist staged hashes into the manifest")
+    parser.add_argument(
+        "--instance-ids",
+        type=pathlib.Path,
+        help=(
+            "JSON nodeId->instanceId, for nodes whose app id is shared by a "
+            "replica and whose attested id is therefore ambiguous. Each entry "
+            "is verified against the Gateway's live admission record before it "
+            "is trusted; everything not listed still uses the attestation."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -801,16 +973,21 @@ def main():
     # so they are safe to write; everything past this point is not.
     assert_manifest(manifest)
 
+    def trusted_now():
+        """Re-read every time: the point is current evidence, not a cached answer."""
+        return load_trusted_instances(args.instance_ids, manifest, nodes) if args.instance_ids else {}
+
     hashes = {name: node["pinned"]["composeHash"] for name, node in nodes.items()}
     if args.stage:
-        hashes = stage_all(nodes, args.out)
+        hashes = stage_all(nodes, args.out, trusted_now())
 
     if args.stage and args.settle:
         settle(nodes)
         # Re-attest now the fleet is running again: staging restarts every CVM,
         # and a node replaced during that window must not have the manifest's
-        # old instance id copied into its draft.
-        assert_pinned_instances(nodes)
+        # old instance id copied into its draft. The Gateway is re-read too, so
+        # a node that lost its admission mid-roll is caught here.
+        assert_pinned_instances(nodes, trusted_now())
 
     for name, compose_hash in hashes.items():
         if not HEX64.match(compose_hash):
