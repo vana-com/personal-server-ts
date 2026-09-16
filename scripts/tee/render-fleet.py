@@ -28,6 +28,7 @@ import re
 import subprocess
 import sys
 import urllib.parse
+import urllib.request
 import tempfile
 import time
 
@@ -93,6 +94,8 @@ PRIVATE_MODE = 0o600
 
 RECEIPT_NAME = "render-receipt.json"
 HARVEST_PATH = pathlib.Path(__file__).resolve().parent / "harvest-identity.py"
+# One Gateway read per assertion; it is a small JSON list on the operator API.
+GATEWAY_TIMEOUT_SECONDS = 30
 HASH_NOTE = (
     "composeFileSha256 is the rendered file's digest, NOT the dstack "
     "compose_hash. Pin drafts only to a hash read back from a staged CVM."
@@ -623,7 +626,82 @@ def phala(args):
     return json.loads(out)
 
 
-def assert_pinned_instances(nodes):
+INSTANCE_URL_RE = re.compile(r"^https://([0-9a-f]{40})-\d+\.")
+
+
+def gateway_instance_ids(manifest):
+    """Each admitted node's instance id, as the Gateway recorded it.
+
+    `phala api /cvms/<uuid>/attestation` resolves by **app id**, so when two
+    CVMs are replicas of one app it answers for whichever it likes - the same
+    uuid returns a different quote between calls, and stopping the other
+    replica does not settle it. That makes the attested id unusable as the
+    per-CVM discriminator it is supposed to be.
+
+    The Gateway saw each node's own quote once, at registration, and built that
+    node's `publicUrl` from the instance id in it. So the URL it routes to today
+    carries the id, keyed by node id rather than by app id. Read live, never
+    from a file: a stale mapping is exactly the failure this guards against.
+    """
+    token = keychain_secret(manifest["gatewaySecretRefs"]["operator"])
+    request = urllib.request.Request(
+        manifest["gatewayUrl"].rstrip("/") + "/v1/tee-nodes",
+        headers={"authorization": "Bearer " + token},
+    )
+    with urllib.request.urlopen(request, timeout=GATEWAY_TIMEOUT_SECONDS) as response:
+        rows = json.load(response)
+
+    found = {}
+    for row in rows:
+        match = INSTANCE_URL_RE.match(row.get("publicUrl") or "")
+        if match:
+            found[row["nodeId"]] = match.group(1)
+
+    return found
+
+
+def keychain_secret(item):
+    """Read one login-keychain item by name. The value never touches disk."""
+    result = subprocess.run(
+        ["security", "find-generic-password", "-s", item, "-w"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit("keychain item %s is missing" % item)
+
+    return result.stdout.strip()
+
+
+def load_trusted_instances(path, manifest, nodes):
+    """Validate a nodeId->instanceId map against the Gateway, then trust it.
+
+    The file is an operator's assertion; the Gateway is the evidence. Every id
+    supplied has to match the live admission record or nothing is trusted, so a
+    stale file fails loudly instead of pinning a draft that bricks on boot.
+    """
+    supplied = json.loads(path.read_text())
+    live = gateway_instance_ids(manifest)
+
+    trusted = {}
+    for name, node in nodes.items():
+        node_id = node["nodeId"]
+        if node_id not in supplied:
+            continue
+        if node_id not in live:
+            raise SystemExit("%s: the Gateway has no admitted node %s" % (name, node_id))
+        if supplied[node_id] != live[node_id]:
+            raise SystemExit(
+                "%s: --instance-ids says %s, the Gateway's admission record says %s"
+                % (name, supplied[node_id], live[node_id])
+            )
+        trusted[name] = live[node_id]
+
+    return trusted
+
+
+def assert_pinned_instances(nodes, trusted=None):
     """Fail closed if any manifest instance id went stale - before staging ANY.
 
     render never re-harvests `pinned.instanceId`; it copies the value into the
@@ -631,11 +709,21 @@ def assert_pinned_instances(nodes):
     (security-config.ts), so a stale pin bricks that node on its next boot,
     silently and after signing. The whole fleet is checked up front: a stale
     worker-3 must not leave the controller and workers 1-2 already restarted.
+
+    `trusted` supplies an id from the Gateway's admission record instead of the
+    attestation endpoint, for nodes whose app id is shared by a replica. It is
+    opt-in per node; everything else still goes to the quote.
     """
+    trusted = trusted or {}
     claimed = {}
     for name, node in nodes.items():
-        attested = HARVEST.measured_identity(HARVEST.read_attestation(node["uuid"]), node["appId"])
-        HARVEST.assert_instance(name, node["pinned"], attested, claimed)
+        if name in trusted:
+            identity = {"instanceId": trusted[name]}
+        else:
+            identity = HARVEST.measured_identity(
+                HARVEST.read_attestation(node["uuid"]), node["appId"]
+            )
+        HARVEST.assert_instance(name, node["pinned"], identity, claimed)
 
 
 def stage_node(name, node, compose_path, out_dir):
@@ -734,9 +822,9 @@ def render_composes(manifest, nodes, args, images, out_dir):
     return rendered
 
 
-def stage_all(nodes, out_dir):
+def stage_all(nodes, out_dir, trusted=None):
     """Stage the controller first, so workers can pin its new hash."""
-    assert_pinned_instances(nodes)
+    assert_pinned_instances(nodes, trusted)
     controller, _ = controller_of(nodes)
     order = [controller] + [n for n in nodes if n != controller]
     staged = {}
@@ -766,6 +854,16 @@ def parse_args():
     parser.add_argument("--stage", action="store_true", help="apply each compose and read its real hash back")
     parser.add_argument("--settle", action="store_true", help="with --stage, wait for every CVM to run")
     parser.add_argument("--write-manifest", action="store_true", help="persist staged hashes into the manifest")
+    parser.add_argument(
+        "--instance-ids",
+        type=pathlib.Path,
+        help=(
+            "JSON nodeId->instanceId, for nodes whose app id is shared by a "
+            "replica and whose attested id is therefore ambiguous. Each entry "
+            "is verified against the Gateway's live admission record before it "
+            "is trusted; everything not listed still uses the attestation."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -801,16 +899,28 @@ def main():
     # so they are safe to write; everything past this point is not.
     assert_manifest(manifest)
 
+    trusted = (
+        load_trusted_instances(args.instance_ids, manifest, nodes)
+        if args.instance_ids
+        else {}
+    )
+
     hashes = {name: node["pinned"]["composeHash"] for name, node in nodes.items()}
     if args.stage:
-        hashes = stage_all(nodes, args.out)
+        hashes = stage_all(nodes, args.out, trusted)
 
     if args.stage and args.settle:
         settle(nodes)
         # Re-attest now the fleet is running again: staging restarts every CVM,
         # and a node replaced during that window must not have the manifest's
-        # old instance id copied into its draft.
-        assert_pinned_instances(nodes)
+        # old instance id copied into its draft. The Gateway is re-read too, so
+        # a node that lost its admission mid-roll is caught here.
+        assert_pinned_instances(
+            nodes,
+            load_trusted_instances(args.instance_ids, manifest, nodes)
+            if args.instance_ids
+            else {},
+        )
 
     for name, compose_hash in hashes.items():
         if not HEX64.match(compose_hash):

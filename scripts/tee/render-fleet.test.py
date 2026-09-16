@@ -40,6 +40,7 @@ def load_module():
 
 rf = load_module()
 STAGE_NODE = rf.stage_node
+GATEWAY_INSTANCE_IDS = rf.gateway_instance_ids
 
 
 def rendered(name, overlay=None):
@@ -640,6 +641,87 @@ class StageGuards(unittest.TestCase):
             rf.stage_all(self.nodes, pathlib.Path("."))
 
         self.assertEqual(self.staged, [])
+
+
+class TrustedInstanceIds(unittest.TestCase):
+    """The opt-in for replicas whose attested instance id is ambiguous."""
+
+    def setUp(self):
+        self.manifest = {
+            "gatewayUrl": "https://gateway.example",
+            "gatewaySecretRefs": {"operator": "an-item"},
+        }
+        self.nodes = {
+            "worker-1": {"nodeId": "node-1", "uuid": "u1", "pinned": {"instanceId": "i1"}},
+            "worker-2": {"nodeId": "node-2", "uuid": "u2", "pinned": {"instanceId": "i2"}},
+        }
+        self.live = {"node-1": "i1", "node-2": "i2"}
+        rf.gateway_instance_ids = lambda manifest: self.live
+
+    def tearDown(self):
+        rf.gateway_instance_ids = GATEWAY_INSTANCE_IDS
+
+    def supply(self, mapping):
+        path = pathlib.Path(tempfile.mkdtemp()) / "ids.json"
+        path.write_text(json.dumps(mapping))
+        return path
+
+    def test_ids_matching_the_gateway_are_trusted(self):
+        trusted = rf.load_trusted_instances(
+            self.supply({"node-1": "i1"}), self.manifest, self.nodes
+        )
+
+        # Only what was supplied; worker-2 still goes to its attestation.
+        self.assertEqual(trusted, {"worker-1": "i1"})
+
+    def test_a_stale_file_is_refused(self):
+        # The file is an operator's assertion; the Gateway is the evidence.
+        with self.assertRaises(SystemExit) as raised:
+            rf.load_trusted_instances(
+                self.supply({"node-1": "yesterdays-id"}), self.manifest, self.nodes
+            )
+
+        self.assertIn("admission record says i1", str(raised.exception))
+
+    def test_a_node_the_gateway_does_not_know_is_refused(self):
+        with self.assertRaises(SystemExit) as raised:
+            rf.load_trusted_instances(
+                self.supply({"gone": "i2"}),
+                self.manifest,
+                {"worker-2": {**self.nodes["worker-2"], "nodeId": "gone"}},
+            )
+
+        self.assertIn("no admitted node gone", str(raised.exception))
+
+    def test_a_trusted_id_still_has_to_match_the_manifest_pin(self):
+        # Trust changes where the id comes from, never whether it is checked.
+        self.nodes["worker-1"]["pinned"]["instanceId"] = "a-stale-pin"
+
+        with self.assertRaises(SystemExit):
+            rf.assert_pinned_instances(self.nodes, {"worker-1": "i1"})
+
+    def test_a_trusted_node_never_touches_the_attestation(self):
+        def explode(uuid):
+            raise AssertionError("read_attestation called for " + uuid)
+
+        rf.HARVEST.read_attestation = explode
+        try:
+            rf.assert_pinned_instances({"worker-1": self.nodes["worker-1"]}, {"worker-1": "i1"})
+        finally:
+            rf.HARVEST = rf.load_harvester()
+
+    def test_the_publicUrl_carries_the_instance_id(self):
+        rows = [
+            {"nodeId": "node-1", "publicUrl": "https://" + "a" * 40 + "-8787.example.test"},
+            {"nodeId": "node-2", "publicUrl": "https://not-an-instance.example.test"},
+        ]
+        found = {}
+        for row in rows:
+            match = rf.INSTANCE_URL_RE.match(row["publicUrl"])
+            if match:
+                found[row["nodeId"]] = match.group(1)
+
+        self.assertEqual(found, {"node-1": "a" * 40})
 
 
 if __name__ == "__main__":
