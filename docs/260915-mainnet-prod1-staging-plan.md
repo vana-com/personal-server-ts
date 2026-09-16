@@ -4,6 +4,42 @@ Companion to `260914-mainnet-tee-plan.md` §4. Step 1 (code + tests) is on `main
 **Nothing here has been run.** Every command below is a Phala or Doppler mutation and needs
 Kahtaf's go per step. Node choice is settled: **prod9, node id 18** (`260915 day/mainnet-node-options.md`).
 
+## 0a. Instance ids: what is ground truth, and what is not (added 2026-09-16)
+
+Learned by rolling `moksha-prod5` the same day. Both workers crash-looped on
+`Invalid fleet security configuration` because each was pinned to the other
+machine's instance. Two sources looked authoritative and both were wrong:
+
+- **`phala api /cvms/<uuid>/attestation` resolves by app id, not uuid.** With
+  replicas under one app id it answers for whichever it likes — the same uuid
+  returned a different quote between calls (measured 2/6), and stopping the
+  other replica did **not** settle it (5/5 still returned the stopped machine).
+  Only deleting the replica cleared it on mainnet in step 3.
+- **A pre-roll `tee_nodes` row can be stale and crossed.** Moksha's rows had the
+  instance ids swapped against the node ids. `render-fleet.py --instance-ids`
+  reads that record, so it inherited the error and signed it.
+
+**Ground truth is the per-uuid staged compose read-back.** `stage_node` applies
+one compose to one uuid and reads its hash back, so a compose hash is
+unambiguously per-CVM. After staging, each machine's boot log prints its own
+`instanceId` beside the `composeHash` it is running; pair them:
+
+```
+compose <hash staged onto uuid X> -> that log's instanceId  =  uuid X's instance
+```
+
+Only after a successful roll is `tee_nodes` trustworthy again, because every
+node re-registers from its own quote.
+
+**For mainnet this is cheaper than it was on Moksha:** app id `01bb1b6d…` has a
+single live CVM (the worker-2 replica was deleted in step 3), so the attestation
+endpoint is unambiguous there. Verify that is still true before relying on it —
+`phala cvms list` collapses replicas, so count by uuid, not by name.
+
+Related: the controller's peer policies pin each worker's instance too. If a
+worker pin changes, **re-sign the controller as well**, or it answers
+`PEER_NOT_ADMITTED` and the Gateway's admit returns 500 on the controller's 503.
+
 ## 0. What the manifest already pins
 
 `deploy/dstack/fleets/mainnet-prod1.json` carries `provisioning` (nodeId 18 / prod9 / US-WEST-1,
