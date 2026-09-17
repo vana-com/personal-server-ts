@@ -88,7 +88,14 @@ async function writeDeclaration(document = DECLARATION): Promise<string> {
 function pdppConfig(declarationPaths: string[]) {
   return ServerConfigSchema.parse({
     tunnel: { enabled: false },
-    pdpp: { enabled: true, declarationPaths },
+    pdpp: {
+      enabled: true,
+      declarationPaths,
+      // redirect_uri is validated by exact match against this registration.
+      clients: [
+        { clientId: "music_recommendations", redirectUris: [REDIRECT] },
+      ],
+    },
   });
 }
 
@@ -548,5 +555,64 @@ describe("the real OAuth grant flow on a bootstrapped server", () => {
     };
     expect(context.active).toBe(true);
     expect(context.grant_id).toBe(grant_id);
+  });
+});
+
+describe("redirect_uri is validated on the bootstrapped server", () => {
+  beforeEach(async () => {
+    await seedScope("spotify.top_artists");
+    ctx = await boot(pdppConfig([await writeDeclaration()]));
+  });
+
+  /**
+   * The end-to-end form of the exfiltration attack: an attacker opens an
+   * authorization session pointing at their own host. If the AS accepts it,
+   * the owner approves a legitimate-looking screen and the code is delivered
+   * to the attacker, who holds the PKCE verifier because they chose the
+   * challenge.
+   */
+  async function authorizeWith(
+    redirectUri: string,
+    clientId = "music_recommendations",
+  ) {
+    return ctx!.app.request("/pdpp/v1/authorize", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        code_challenge: CHALLENGE,
+        code_challenge_method: "S256",
+        authorization_details: [
+          {
+            type: "https://pdpp.dev/data-access",
+            source: { id: SOURCE_ID },
+            purpose_code: "https://pdpp.dev/purpose/personalization",
+            access_mode: "continuous",
+            streams: [{ name: "top_artists" }],
+          },
+        ],
+      }),
+    });
+  }
+
+  it("EXPLOIT: refuses to open a session targeting an attacker host", async () => {
+    const response = await authorizeWith("https://evil.example.com/steal");
+    expect(response.status).toBe(400);
+    // No session exists, so no consent screen can ever be rendered for it.
+    expect((await response.json()).session_id).toBeUndefined();
+  });
+
+  it("refuses an unregistered client even with a plausible redirect", async () => {
+    const response = await authorizeWith(REDIRECT, "never_registered");
+    expect(response.status).toBe(400);
+  });
+
+  it("refuses a javascript: target", async () => {
+    expect((await authorizeWith("javascript:alert(1)")).status).toBe(400);
+  });
+
+  it("accepts the registered redirect", async () => {
+    expect((await authorizeWith(REDIRECT)).status).toBe(201);
   });
 });

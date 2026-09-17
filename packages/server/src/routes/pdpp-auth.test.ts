@@ -134,6 +134,12 @@ beforeEach(() => {
         sourceId === snapshot.source_id ? snapshot : null,
       inventoryFor: () => inventory,
       currentSubjectId: (_c: Context) => authenticatedSubject,
+      // Registered client metadata: redirect_uri is validated by exact match,
+      // so an attacker-chosen target cannot receive the authorization code.
+      registeredClient: (clientId) =>
+        clientId === "music_recommendations"
+          ? { client_id: clientId, redirect_uris: [REDIRECT] }
+          : null,
     }),
   );
 });
@@ -1027,5 +1033,71 @@ describe("existing OAuth behavior is untouched", () => {
     // here; PDPP must not shadow or claim that path.
     const response = await app.request("/oauth/token", { method: "POST" });
     expect(response.status).toBe(404);
+  });
+});
+
+describe("redirect_uri validation (RFC 6749 §3.1.2, §10.6)", () => {
+  /**
+   * The authorization code travels in the redirect. If the AS honours whatever
+   * `redirect_uri` a caller supplies, an attacker opens a session pointing at
+   * their own host, the owner approves what looks like a legitimate consent
+   * screen, and the code is delivered to the attacker.
+   *
+   * PKCE does not save this. The attacker chose the challenge, so they hold the
+   * verifier too — they redeem the stolen code and receive a grant-bound token.
+   */
+  async function approveWith(redirectUri: string) {
+    const ownerToken = tokens.issueOwnerToken({
+      subjectId: OWNER,
+    }).access_token;
+    const created = await post("/pdpp/v1/authorize", {
+      ...selectionBody(),
+      redirect_uri: redirectUri,
+    });
+    return { created, ownerToken };
+  }
+
+  it("EXPLOIT: refuses to exfiltrate a code to an attacker-chosen host", async () => {
+    const { created } = await approveWith("https://evil.example.com/steal");
+    expect(created.status).toBe(400);
+  });
+
+  it("refuses a javascript: redirect target", async () => {
+    const { created } = await approveWith("javascript:alert(document.cookie)");
+    expect(created.status).toBe(400);
+  });
+
+  it("refuses a data: redirect target", async () => {
+    const { created } = await approveWith("data:text/html,<script>1</script>");
+    expect(created.status).toBe(400);
+  });
+
+  it("refuses plain http for a non-loopback host", async () => {
+    const { created } = await approveWith("http://app.example.com/callback");
+    expect(created.status).toBe(400);
+  });
+
+  it("refuses a redirect carrying a fragment (RFC 6749 §3.1.2)", async () => {
+    const { created } = await approveWith("https://app.example.com/cb#frag");
+    expect(created.status).toBe(400);
+  });
+
+  it("refuses a near-miss on the registered host", async () => {
+    const { created } = await approveWith(
+      "https://app.example.com.evil.test/callback",
+    );
+    expect(created.status).toBe(400);
+  });
+
+  it("refuses a path that only prefixes the registered one", async () => {
+    const { created } = await approveWith(
+      "https://app.example.com/callback/../../evil",
+    );
+    expect(created.status).toBe(400);
+  });
+
+  it("accepts the exact registered redirect", async () => {
+    const { created } = await approveWith(REDIRECT);
+    expect(created.status).toBe(201);
   });
 });

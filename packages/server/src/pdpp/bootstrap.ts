@@ -130,6 +130,20 @@ export async function createPdppAuthDeps(
     // The owner-proof middleware below is what establishes that a caller is
     // that owner; this just names the subject grants bind to.
     currentSubjectId: () => subjectId,
+    // Redirect targets are validated by exact match against this. A client
+    // absent from the config gets null, which fails the request closed — an
+    // unregistered client cannot receive an authorization code.
+    registeredClient: (clientId) => {
+      const registered = config.pdpp.clients.find(
+        (candidate) => candidate.clientId === clientId,
+      );
+      return registered
+        ? {
+            client_id: registered.clientId,
+            redirect_uris: registered.redirectUris,
+          }
+        : null;
+    },
     requirePkce: config.pdpp.requirePkce,
     ownerAuth: {
       serverOrigin: options.serverOrigin,
