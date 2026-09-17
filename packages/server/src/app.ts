@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
@@ -258,6 +259,32 @@ export function createApp(deps: AppDeps): Hono {
         auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
         instancesForSubject: deps.pdpp.instancesForSubject,
+        // PDPP reads land in the SAME owner access feed as legacy
+        // `/v1/data/{scope}` reads. Adopting PDPP must not make an owner's
+        // access history less complete than it was before.
+        //
+        // The legacy entry shape is per-scope and per-builder, so the PDPP
+        // fields map on rather than extend it: `grantId` is the PDPP grant,
+        // `builder` is the PDPP client, and `scope` carries the stream. A
+        // denied or failed read is recorded too, which the legacy middleware
+        // cannot do — it only fires on 2xx.
+        accessLog: {
+          record: async (entry) => {
+            await deps.accessLogWriter.write({
+              logId: randomUUID(),
+              grantId: entry.grantId,
+              builder: entry.clientId,
+              action: "read",
+              scope: entry.stream,
+              timestamp: new Date().toISOString(),
+              ipAddress: entry.ipAddress,
+              userAgent: entry.userAgent,
+              ...(entry.outcome !== "completed" && {
+                outcome: entry.outcome,
+              }),
+            } as Parameters<typeof deps.accessLogWriter.write>[0]);
+          },
+        },
       }),
     );
     app.route(

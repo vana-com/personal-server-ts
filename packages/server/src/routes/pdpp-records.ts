@@ -37,6 +37,40 @@ export interface PdppRecordsRouteDeps {
    * to "the store already only contains one owner's data" when omitted.
    */
   instancesForSubject?: (subjectId: string) => string[];
+  /**
+   * Owner access feed. PDPP reads must appear in the SAME feed as legacy
+   * `/v1/data/{scope}` reads, or adopting PDPP would silently make an owner's
+   * access history less complete than it was before — the one thing a data
+   * portability product must not do.
+   *
+   * Optional so a deployment that has not wired a writer still boots; when it
+   * is absent no PDPP read is logged, which `records-bootstrap.ts` makes
+   * explicit rather than leaving to chance.
+   */
+  accessLog?: PdppAccessLogPort;
+}
+
+/**
+ * The slice of the owner access feed a PDPP read can populate.
+ *
+ * Deliberately narrower than `AccessLogWriter`: this route knows the grant,
+ * the client, the stream and the outcome, and nothing about scopes or
+ * builders in the legacy sense. Keeping the port small is what lets the
+ * bootstrap adapt it onto the existing writer without this module importing
+ * the legacy entry shape.
+ */
+export interface PdppAccessLogPort {
+  record(entry: {
+    grantId: string;
+    clientId: string;
+    /** `{source}.{stream}` — the legacy feed's `scope` position. */
+    stream: string;
+    operation: "read";
+    outcome: "completed" | "denied" | "failed";
+    requestId: string;
+    ipAddress: string;
+    userAgent: string;
+  }): Promise<void>;
 }
 
 function requestId(): string {
@@ -218,6 +252,49 @@ function rejectClientOnlyParams(c: Context) {
 
 export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   const app = new Hono();
+
+  /**
+   * Append one PDPP read to the owner access feed.
+   *
+   * Only CLIENT reads are logged. An owner reading their own store is not a
+   * third-party access event, and the legacy feed does not record those
+   * either — logging them would change what the feed means.
+   *
+   * Never throws: a feed write that fails must not turn a served read into an
+   * error, and must not turn a denial into a 500. Failures are surfaced by
+   * the writer's own logging, not by breaking the request.
+   */
+  async function logClientRead(
+    c: Context,
+    context: PdppTokenContext | undefined,
+    stream: string,
+    outcome: "completed" | "denied" | "failed",
+    reqId: string,
+  ): Promise<void> {
+    if (!deps.accessLog) return;
+    if (context?.tokenKind !== "client") return;
+    const grantId = context.grant?.grant_id;
+    const clientId = context.clientId;
+    if (!grantId || !clientId) return;
+
+    try {
+      await deps.accessLog.record({
+        clientId,
+        grantId,
+        ipAddress:
+          c.req.header("x-forwarded-for") ??
+          c.req.header("x-real-ip") ??
+          "unknown",
+        operation: "read",
+        outcome,
+        requestId: reqId,
+        stream,
+        userAgent: c.req.header("user-agent") ?? "unknown",
+      });
+    } catch {
+      // Intentionally swallowed; see the doc comment.
+    }
+  }
   app.use("*", async (c, next) => {
     const reqId = requestId();
     c.set("reqId" as never, reqId as never);
@@ -523,7 +600,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             ],
           }
         : undefined;
-      return c.json(
+      const response = c.json(
         {
           object: "list",
           has_more: moreVisible,
@@ -545,8 +622,21 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         200,
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
       );
+      await logClientRead(c, context, stream, "completed", reqId);
+      return response;
     } catch (err) {
-      return sendError(c, toPdppError(err), reqId);
+      const mapped = toPdppError(err);
+      // A refusal is an access event too: the §7 access feed must show denied
+      // attempts, not only successful ones, or an owner cannot see that an
+      // app tried to read something it was not granted.
+      await logClientRead(
+        c,
+        context,
+        c.req.param("stream"),
+        mapped.status === 500 ? "failed" : "denied",
+        reqId,
+      );
+      return sendError(c, mapped, reqId);
     }
   });
 
@@ -588,7 +678,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
 
       const data = projectFields(found.data, scope.fields);
 
-      return c.json(
+      const response = c.json(
         {
           object: "record",
           id: recordKey,
@@ -599,8 +689,18 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         200,
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
       );
+      await logClientRead(c, context, stream, "completed", reqId);
+      return response;
     } catch (err) {
-      return sendError(c, toPdppError(err), reqId);
+      const mapped = toPdppError(err);
+      await logClientRead(
+        c,
+        context,
+        c.req.param("stream"),
+        mapped.status === 500 ? "failed" : "denied",
+        reqId,
+      );
+      return sendError(c, mapped, reqId);
     }
   });
 
