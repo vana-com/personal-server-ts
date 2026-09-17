@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import type {
   PdppAuthorizationService,
+  PdppTokenContext,
   StreamGrant,
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
@@ -53,6 +54,23 @@ function toPdppError(err: unknown): PdppError {
     );
   }
   throw err;
+}
+
+/**
+ * `PdppTokenContext.subjectId` is optional in the real AS contract (it may
+ * be absent on an inactive token). By the time route code reaches an
+ * owner-token branch the token is already known active, so a missing
+ * subjectId here is an AS-side bug, not a client error — fail closed rather
+ * than pass `undefined` through to instance-scoping.
+ */
+function requireSubjectId(context: PdppTokenContext): string {
+  if (!context.subjectId) {
+    throw new PdppError(
+      "authentication_error",
+      "Token context is missing subject_id",
+    );
+  }
+  return context.subjectId;
 }
 
 function sendError(c: Context, err: PdppError, reqId: string) {
@@ -161,16 +179,16 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
 
     const instanceIds =
       context.tokenKind === "owner"
-        ? (deps.instancesForSubject?.(context.subjectId) ?? [])
+        ? (deps.instancesForSubject?.(requireSubjectId(context)) ?? [])
         : (context.grant?.streams.flatMap((s) => s.instance_ids) ?? []);
 
     const streams = deps.store.listStreams(instanceIds);
 
-    // A client token gets a closed projection: only streams its grant names,
-    // and counts/recency computed over only the records the grant actually
-    // exposes. The store's raw listing counts every record in the instance,
-    // so returning it unchanged would leak the existence and recency of
-    // records outside the grant's time_constraint / resources.
+    // A client token gets a closed projection: only the streams its grant
+    // names, and counts/recency computed over only the records the grant
+    // actually exposes. The store's raw listing counts every record in the
+    // instance, so returning it unchanged would leak the existence and
+    // recency of records outside the grant's time_constraint / resources.
     const visibleStreams =
       context.tokenKind === "owner"
         ? streams.map((s) => ({
@@ -284,7 +302,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const scope = resolveReadScope(context!, stream, declaration);
       const effectiveInstanceIds =
         context!.tokenKind === "owner"
-          ? (deps.instancesForSubject?.(context!.subjectId) ?? [])
+          ? (deps.instancesForSubject?.(requireSubjectId(context!)) ?? [])
           : scope.instanceIds;
 
       const { limit, clamped } = parseLimit(c.req.query("limit"));
@@ -293,23 +311,24 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         .query("fields")
         ?.split(",")
         .map((f) => f.trim());
-      const projectedFields =
+      const fields =
         context!.tokenKind === "client"
           ? scope.fields
           : requestedFields
             ? [...requestedFields]
             : undefined;
-      // The time_constraint is evaluated against the record's constraint
-      // field, so that field must survive the store's projection even when
-      // the grant does not include it. It is stripped again below, after
-      // filtering, so it never reaches the client.
-      const { fields, stripField } = withConstraintField(
-        projectedFields,
-        scope.streamGrant,
-      );
       const cursor = c.req.query("cursor");
 
       if (c.req.query("changes_since") !== undefined) {
+        // `fields` is passed here for ELIGIBILITY narrowing only (spec §4:
+        // a record whose only change was to an unauthorized field must not
+        // appear as "changed" at all). The store returns each row's RAW,
+        // unprojected data regardless of `fields` — response-shaping
+        // projection happens only at toRecordJson below, after
+        // recordWithinGrantTimeConstraint has already run against the real
+        // field value. This split matters: if the store projected the
+        // returned data too, a grant whose fields exclude the
+        // time_constraint field would silently break that filter.
         const page = deps.store.changesSince(stream, {
           instanceIds: effectiveInstanceIds,
           changesSince: c.req.query("changes_since"),
@@ -344,9 +363,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             ...(page.nextChangesSince && {
               next_changes_since: page.nextChangesSince,
             }),
-            data: visible.map((row) =>
-              toRecordJson(stream, stripFieldFromRow(row, stripField)),
-            ),
+            data: visible.map((row) => toRecordJson(stream, row, fields)),
             ...(clamped && { meta }),
           },
           200,
@@ -354,25 +371,27 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         );
       }
 
-      // Grant filtering happens AFTER the store pages, so a page of `limit`
+      // Same ordering requirement as the changes_since branch above: fetch
+      // unprojected, filter by time_constraint against the real value, then
+      // project fields only in toRecordJson.
+      // Grant filtering happens after the store pages, so a page of `limit`
       // stored rows can yield fewer than `limit` visible rows. Returning that
       // short page directly would make `limit` mean "at most N stored rows"
       // rather than "at most N records you may see", and would report
-      // `has_more`/`next_cursor` for a position in the unfiltered sequence.
-      // Instead, keep pulling pages until `limit` visible rows accumulate (or
-      // the stream runs out), then derive paging state from the filtered view.
+      // has_more/next_cursor for a position in the unfiltered sequence.
+      // Accumulate visible rows across store pages instead, then derive
+      // paging state from the filtered view.
       const visible: PdppRecordRow[] = [];
-      let nextCursor = cursor;
-      let hasMore = false;
+      let pageCursor = cursor;
+      let storeHasMore = false;
       do {
         const page = deps.store.listRecords(stream, {
           instanceIds: effectiveInstanceIds,
-          // Fetch one extra so a page that is entirely filtered out still
-          // makes progress instead of stalling on the same cursor.
+          // One extra, so a page that is entirely filtered out still makes
+          // progress rather than stalling on the same cursor.
           limit: limit + 1,
           order,
-          cursor: nextCursor,
-          fields,
+          cursor: pageCursor,
         });
         for (const row of page.data) {
           if (
@@ -383,12 +402,12 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           }
           if (visible.length > limit) break;
         }
-        nextCursor = page.nextCursor ?? undefined;
-        hasMore = page.hasMore;
-      } while (visible.length <= limit && hasMore && nextCursor);
+        pageCursor = page.nextCursor ?? undefined;
+        storeHasMore = page.hasMore;
+      } while (visible.length <= limit && storeHasMore && pageCursor);
 
-      // `limit + 1` visible rows means there is at least one more record the
-      // caller may see; trim it and report `has_more` from the filtered view.
+      // limit + 1 visible rows means at least one more record the caller may
+      // see; trim it and report has_more from the filtered view.
       const moreVisible = visible.length > limit;
       const data = moreVisible ? visible.slice(0, limit) : visible;
       const last = data[data.length - 1];
@@ -408,16 +427,14 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
               next_cursor: encodeCursor({
                 kind: "list",
                 order,
-                // Must match the store's own sort key exactly, or the cursor
+                // Must match the store's own sort key exactly or the cursor
                 // resumes at the wrong position. Both backends sort by
-                // (emittedAt, recordKey) — see `sortKey` in memory-store.ts.
+                // (emitted_at, record_key).
                 sortValue: last.emittedAt,
                 recordKey: last.recordKey,
               }),
             }),
-          data: data.map((row) =>
-            toRecordJson(stream, stripFieldFromRow(row, stripField)),
-          ),
+          data: data.map((row) => toRecordJson(stream, row, fields)),
           ...(meta && { meta }),
         },
         200,
@@ -441,7 +458,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
 
       const effectiveInstanceIds =
         context!.tokenKind === "owner"
-          ? (deps.instancesForSubject?.(context!.subjectId) ?? [])
+          ? (deps.instancesForSubject?.(requireSubjectId(context!)) ?? [])
           : scope.instanceIds;
 
       if (!recordKeyWithinGrantResources(recordKey, scope.streamGrant)) {
@@ -463,14 +480,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         throw new PdppError("not_found", "Record not found");
       }
 
-      const data =
-        scope.fields !== undefined
-          ? Object.fromEntries(
-              Object.entries(found.data).filter(([k]) =>
-                scope.fields!.includes(k),
-              ),
-            )
-          : found.data;
+      const data = projectFields(found.data, scope.fields);
 
       return c.json(
         {
@@ -506,7 +516,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       if (!declaration) throw new PdppError("not_found", "Stream not found");
 
       const effectiveInstanceIds =
-        deps.instancesForSubject?.(context!.subjectId) ?? [];
+        deps.instancesForSubject?.(requireSubjectId(context!)) ?? [];
       let deletedAny = false;
       for (const instance of effectiveInstanceIds) {
         if (
@@ -581,13 +591,32 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
 }
 
 /**
+ * Applies the grant's field projection to a record's data for the response
+ * body. Callers MUST filter by time_constraint against the record's
+ * unprojected data BEFORE calling this — projecting first would strip the
+ * time_constraint field before it can be compared, silently breaking the
+ * filter for any grant whose fields don't happen to include that field.
+ */
+function projectFields(
+  data: Record<string, unknown>,
+  fields: string[] | undefined,
+): Record<string, unknown> {
+  if (!fields) return data;
+  const projected: Record<string, unknown> = {};
+  for (const field of fields) {
+    if (field in data) projected[field] = data[field];
+  }
+  return projected;
+}
+
+/**
  * Walk a stream's records and return only those the grant exposes.
  *
  * Used for client-token stream listings, where `record_count` and
  * `last_updated` must describe the granted projection rather than the whole
- * instance. Fields are left unprojected on purpose: the caller only needs
- * counts and `emittedAt`, and the time_constraint must be evaluated against
- * an unprojected record (see `withConstraintField`).
+ * instance. Rows stay unprojected: the caller needs only counts and
+ * `emittedAt`, and the time_constraint must be evaluated against the record's
+ * real value.
  */
 function collectGrantVisibleRows(
   store: PdppRecordStore,
@@ -619,44 +648,11 @@ function collectGrantVisibleRows(
   return visible;
 }
 
-/**
- * Ensure a grant's `time_constraint` field survives the store's field
- * projection so the constraint can actually be evaluated.
- *
- * `recordWithinGrantTimeConstraint` reads `data[time_constraint.field]` and
- * treats an absent value as "outside the constraint". When the grant's field
- * set excludes the constraint field — which is the normal case, since the
- * owner consents to a time window without necessarily sharing the timestamp —
- * projecting first would delete the field and silently filter out every
- * record. So we add it to the store query and remove it after filtering.
- *
- * Returns the fields to query plus the field to strip afterwards (`undefined`
- * when nothing needs stripping: no constraint, no projection, or the field is
- * granted in its own right and must be returned).
- */
-function withConstraintField(
-  fields: string[] | undefined,
-  streamGrant: StreamGrant | undefined,
-): { fields: string[] | undefined; stripField?: string } {
-  const field = streamGrant?.time_constraint?.field;
-  // No projection means every field is already present.
-  if (!field || fields === undefined) return { fields };
-  if (fields.includes(field)) return { fields };
-  return { fields: [...fields, field], stripField: field };
-}
-
-/** Remove the constraint-only field added by `withConstraintField`. */
-function stripFieldFromRow(
+function toRecordJson(
+  stream: string,
   row: PdppRecordRow,
-  stripField: string | undefined,
-): PdppRecordRow {
-  if (!stripField || row.deleted || !row.data) return row;
-  if (!(stripField in row.data)) return row;
-  const { [stripField]: _removed, ...rest } = row.data;
-  return { ...row, data: rest };
-}
-
-function toRecordJson(stream: string, row: PdppRecordRow) {
+  fields: string[] | undefined,
+) {
   if (row.deleted) {
     return {
       object: "record",
@@ -671,7 +667,7 @@ function toRecordJson(stream: string, row: PdppRecordRow) {
     object: "record",
     id: row.recordKey,
     stream,
-    data: row.data,
+    data: projectFields(row.data, fields),
     emitted_at: row.emittedAt,
   };
 }

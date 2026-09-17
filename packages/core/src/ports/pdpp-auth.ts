@@ -65,8 +65,14 @@ export type PdppInactiveReason =
 
 export interface PdppTokenContext {
   active: boolean;
-  tokenKind: PdppTokenKind;
-  subjectId: string;
+  /**
+   * Optional to match the real AS lane's type exactly (`feat/pdpp-as-grants`,
+   * `packages/core/src/pdpp/types.ts`): an inactive token's context may omit
+   * this entirely. Route code must not assume it is present without also
+   * checking `active`.
+   */
+  tokenKind?: PdppTokenKind;
+  subjectId?: string;
   /** Client tokens only. */
   grant?: Grant;
   clientId?: string;

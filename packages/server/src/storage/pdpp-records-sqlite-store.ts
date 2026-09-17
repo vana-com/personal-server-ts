@@ -512,11 +512,19 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
         }
       }
 
+      // Return the RAW (unprojected) data here, not `projectedNow`.
+      // `projectedNow`/`priorProjected` above exist only to decide
+      // eligibility (did the grant-authorized projection change) without
+      // leaking a hidden-field change. A caller enforcing time_constraint
+      // against `data` needs the real field value; projecting here would
+      // silently break that filter for any grant whose fields don't happen
+      // to include the time_constraint field. Response field projection is
+      // the caller's job, applied after any filtering on real values.
       changed.push({
         instance: entry.instance,
         stream: entry.stream,
         recordKey: entry.record_key,
-        data: projectedNow,
+        data: currentData,
         version: entry.version,
         emittedAt: entry.emitted_at,
         deleted: false,

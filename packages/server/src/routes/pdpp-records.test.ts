@@ -175,6 +175,140 @@ describe("pdpp records routes: field projection", () => {
     const body = await res.json();
     expect(body.error.code).toBe("invalid_request");
   });
+
+  it("filters correctly on time_constraint even when the constraint field is not in the grant's authorized fields (list)", async () => {
+    // Regression: field projection must not run before time_constraint
+    // filtering. The grant's authorized fields below are ["id", "name"] --
+    // deliberately excluding "captured_at", the field the time_constraint
+    // is evaluated against. If projection ran first, captured_at would read
+    // as undefined by the time the filter checks it, and the filter would
+    // misbehave rather than compare against the record's real value.
+    const store = createMemoryRecordStore();
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "playlists",
+          key: "pl_in",
+          data: {
+            id: "pl_in",
+            name: "in range",
+            captured_at: "2026-03-01T00:00:00Z",
+          },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+        {
+          instance: "inst_1",
+          stream: "playlists",
+          key: "pl_out",
+          data: {
+            id: "pl_out",
+            name: "out of range",
+            captured_at: "2026-06-01T00:00:00Z",
+          },
+          emitted_at: "2026-04-02T00:00:00.000Z",
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+    );
+    const { app } = buildApp(
+      {
+        "client-tok": {
+          active: true,
+          tokenKind: "client",
+          subjectId: "sub_1",
+          grant: clientGrant({
+            fields: ["id", "name"],
+            time_constraint: {
+              field: "captured_at",
+              until: "2026-04-01T00:00:00Z",
+            },
+          }),
+        },
+      },
+      { store },
+    );
+
+    const res = await app.request("/streams/playlists/records", {
+      headers: { Authorization: "Bearer client-tok" },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const keys = body.data.map((r: { id: string }) => r.id);
+
+    // Correct behavior: pl_in (captured_at < until) is included, pl_out
+    // (captured_at >= until) is excluded -- proving the filter compared
+    // against the real captured_at value, not an already-stripped one.
+    expect(keys).toContain("pl_in");
+    expect(keys).not.toContain("pl_out");
+
+    // And the ungranted field never reaches the response regardless.
+    for (const record of body.data) {
+      expect(record.data).not.toHaveProperty("captured_at");
+    }
+  });
+
+  it("filters correctly on time_constraint even when the constraint field is not in the grant's authorized fields (changes_since)", async () => {
+    const store = createMemoryRecordStore();
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "playlists",
+          key: "pl_in",
+          data: {
+            id: "pl_in",
+            name: "in range",
+            captured_at: "2026-03-01T00:00:00Z",
+          },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+        {
+          instance: "inst_1",
+          stream: "playlists",
+          key: "pl_out",
+          data: {
+            id: "pl_out",
+            name: "out of range",
+            captured_at: "2026-06-01T00:00:00Z",
+          },
+          emitted_at: "2026-04-02T00:00:00.000Z",
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+    );
+    const { app } = buildApp(
+      {
+        "client-tok": {
+          active: true,
+          tokenKind: "client",
+          subjectId: "sub_1",
+          grant: clientGrant({
+            fields: ["id", "name"],
+            time_constraint: {
+              field: "captured_at",
+              until: "2026-04-01T00:00:00Z",
+            },
+          }),
+        },
+      },
+      { store },
+    );
+
+    const res = await app.request("/streams/playlists/records?changes_since=", {
+      headers: { Authorization: "Bearer client-tok" },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const keys = body.data.map((r: { id: string }) => r.id);
+    expect(keys).toContain("pl_in");
+    expect(keys).not.toContain("pl_out");
+    for (const record of body.data) {
+      expect(record.data).not.toHaveProperty("captured_at");
+    }
+  });
 });
 
 describe("pdpp records routes: changes_since eligibility", () => {
@@ -383,5 +517,107 @@ describe("pdpp records routes: cursor/order mismatch", () => {
     expect(page2.status).toBe(400);
     const body = await page2.json();
     expect(body.error.code).toBe("invalid_cursor");
+  });
+
+  it("paginates correctly across pages for a client token whose fields exclude the time_constraint field", async () => {
+    // Regression, cursor half: the sort/cursor key is envelope-level
+    // (emitted_at, record_key), never a projected data field, so a grant
+    // whose fields exclude an arbitrary data field must not disturb
+    // pagination continuity. Three records, `limit=1`, walk every page.
+    const store = createMemoryRecordStore();
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "playlists",
+          key: "pl_1",
+          data: { id: "pl_1", name: "a", captured_at: "2026-01-01T00:00:00Z" },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+        {
+          instance: "inst_1",
+          stream: "playlists",
+          key: "pl_2",
+          data: { id: "pl_2", name: "b", captured_at: "2026-01-02T00:00:00Z" },
+          emitted_at: "2026-04-02T00:00:00.000Z",
+        },
+        {
+          instance: "inst_1",
+          stream: "playlists",
+          key: "pl_3",
+          data: { id: "pl_3", name: "c", captured_at: "2026-01-03T00:00:00Z" },
+          emitted_at: "2026-04-03T00:00:00.000Z",
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+    );
+    const { app } = buildApp(
+      {
+        "client-tok": {
+          active: true,
+          tokenKind: "client",
+          subjectId: "sub_1",
+          grant: clientGrant({ fields: ["id", "name"] }), // excludes captured_at
+        },
+      },
+      { store },
+    );
+
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let i = 0; i < 3; i++) {
+      const url = cursor
+        ? `/streams/playlists/records?limit=1&order=asc&cursor=${encodeURIComponent(cursor)}`
+        : "/streams/playlists/records?limit=1&order=asc";
+      const res = await app.request(url, {
+        headers: { Authorization: "Bearer client-tok" },
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toHaveLength(1);
+      seen.push(body.data[0].id);
+      cursor = body.next_cursor;
+    }
+    expect(seen).toEqual(["pl_1", "pl_2", "pl_3"]);
+  });
+
+  it("scopes an owner-token read to its own subject's instances after the projection-ordering fix", async () => {
+    // Regression, owner-scoping half: confirms the fix to fields handling
+    // in the store calls did not disturb the separate instance-scoping path
+    // owner-token reads use. A record on an instance not returned by
+    // instancesForSubject must not appear.
+    const store = createMemoryRecordStore();
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "playlists",
+          key: "pl_mine",
+          data: { id: "pl_mine", name: "mine" },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+        {
+          instance: "inst_other",
+          stream: "playlists",
+          key: "pl_not_mine",
+          data: { id: "pl_not_mine", name: "not mine" },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+    );
+    const { app } = buildApp(
+      { "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" } },
+      { store, instancesForSubject: () => ["inst_1"] },
+    );
+    const res = await app.request("/streams/playlists/records", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+    const body = await res.json();
+    const keys = body.data.map((r: { id: string }) => r.id);
+    expect(keys).toContain("pl_mine");
+    expect(keys).not.toContain("pl_not_mine");
   });
 });
