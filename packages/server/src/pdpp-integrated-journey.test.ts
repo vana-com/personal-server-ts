@@ -790,6 +790,10 @@ describe("PDPP integrated journey (real AS + real RS in one app)", () => {
     expect(tokenRes.status).toBe(400);
     const body = await tokenRes.json();
     expect(body.access_token).toBeUndefined();
+    // Pin the reason, not just the status: a 400 from a malformed body or a
+    // client_id mismatch would otherwise satisfy this test without the
+    // verifier check ever running.
+    expect(body.error).toBe("invalid_grant");
   });
 
   it("refuses a stream the grant does not cover", async () => {

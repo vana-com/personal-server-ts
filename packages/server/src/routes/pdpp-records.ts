@@ -193,8 +193,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       context.tokenKind === "owner"
         ? streams.map((s) => ({
             name: s.stream,
-            recordCount: s.recordCount,
+            recordCount: s.recordCount as number | null,
             lastUpdated: s.lastUpdated,
+            countCapped: false,
           }))
         : streams
             .filter((s) =>
@@ -204,24 +205,23 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
               const streamGrant = context.grant?.streams.find(
                 (g) => g.name === s.stream,
               );
-              const granted = collectGrantVisibleRows(
-                deps.store,
-                s.stream,
-                streamGrant?.instance_ids ?? [],
-                streamGrant,
-              );
               return {
                 name: s.stream,
-                recordCount: granted.length,
-                lastUpdated: granted.reduce<string | null>(
-                  (latest, row) =>
-                    latest === null || row.emittedAt > latest
-                      ? row.emittedAt
-                      : latest,
-                  null,
+                ...summarizeGrantVisible(
+                  deps.store,
+                  s.stream,
+                  streamGrant?.instance_ids ?? [],
+                  streamGrant,
                 ),
               };
             });
+
+    // Report truncation explicitly rather than letting a capped count read as
+    // exact. `meta.warnings` is the same shape the list endpoint uses for
+    // `limit_clamped`.
+    const cappedStreams = visibleStreams
+      .filter((s) => s.countCapped)
+      .map((s) => s.name);
 
     return c.json(
       {
@@ -232,6 +232,16 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           record_count: s.recordCount,
           last_updated: s.lastUpdated,
         })),
+        ...(cappedStreams.length > 0 && {
+          meta: {
+            warnings: [
+              {
+                code: "record_count_not_counted",
+                message: `record_count is null for ${cappedStreams.join(", ")}: more than ${STREAM_COUNT_CAP} records match the grant`,
+              },
+            ],
+          },
+        }),
       },
       200,
       { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
@@ -610,24 +620,81 @@ function projectFields(
 }
 
 /**
- * Walk a stream's records and return only those the grant exposes.
+ * How many grant-visible records a client-token stream listing will count
+ * before it stops counting and says so.
  *
- * Used for client-token stream listings, where `record_count` and
- * `last_updated` must describe the granted projection rather than the whole
- * instance. Rows stay unprojected: the caller needs only counts and
- * `emittedAt`, and the time_constraint must be evaluated against the record's
- * real value.
+ * `GET /v1/streams` is a metadata endpoint, and the grant predicate cannot be
+ * pushed into the store today (`time_constraint` is evaluated in JS against
+ * each record's data), so an exact count costs a full scan plus a JSON parse
+ * per row. Letting that run unbounded makes the cheap metadata call strictly
+ * more expensive than the data call it summarizes — a request-amplification
+ * lever, multiplied by the number of streams in the grant.
+ *
+ * So the count is capped. Past the cap the response reports `record_count:
+ * null` and a `meta.warnings` entry rather than a confidently wrong number:
+ * an approximate count presented as exact is worse than an explicit "not
+ * counted", because a client cannot tell it was truncated.
  */
-function collectGrantVisibleRows(
+const STREAM_COUNT_CAP = 1_000;
+
+interface GrantVisibleSummary {
+  /** Exact count, or null when more than `STREAM_COUNT_CAP` records match. */
+  recordCount: number | null;
+  lastUpdated: string | null;
+  countCapped: boolean;
+}
+
+/**
+ * Summarize the records a grant exposes in one stream, for a client-token
+ * stream listing.
+ *
+ * `last_updated` is answered by scanning newest-first and stopping at the
+ * first grant-visible row, so the common case is a single store page rather
+ * than a walk of the whole stream. The count then walks only until the cap.
+ *
+ * Rows stay unprojected throughout: the `time_constraint` must be evaluated
+ * against the record's real value, not a projected one.
+ */
+function summarizeGrantVisible(
   store: PdppRecordStore,
   stream: string,
   instanceIds: string[],
   streamGrant: StreamGrant | undefined,
-): PdppRecordRow[] {
-  const visible: PdppRecordRow[] = [];
+): GrantVisibleSummary {
+  // `listRecords` already excludes tombstones, so a deleted row should not
+  // appear here; the guard keeps the narrowing honest rather than asserting.
+  const visible = (row: PdppRecordRow) =>
+    !row.deleted &&
+    recordKeyWithinGrantResources(row.recordKey, streamGrant) &&
+    recordWithinGrantTimeConstraint(row.data, streamGrant);
+
+  // Newest-first until the first visible row: that row's emittedAt is the
+  // grant-visible `last_updated`, and usually it is on the first page.
+  let lastUpdated: string | null = null;
   let cursor: string | undefined;
-  // Bounded walk: stream listings are metadata, not a data read path.
-  for (let guard = 0; guard < 1000; guard++) {
+  let pages = 0;
+  outer: while (pages++ < STREAM_COUNT_CAP) {
+    const page = store.listRecords(stream, {
+      instanceIds,
+      limit: MAX_LIMIT,
+      order: "desc",
+      cursor,
+    });
+    for (const row of page.data) {
+      if (visible(row)) {
+        lastUpdated = row.emittedAt;
+        break outer;
+      }
+    }
+    if (!page.hasMore || !page.nextCursor) break;
+    cursor = page.nextCursor;
+  }
+
+  // Count forward, stopping at the cap rather than scanning without bound.
+  let count = 0;
+  let capped = false;
+  cursor = undefined;
+  for (;;) {
     const page = store.listRecords(stream, {
       instanceIds,
       limit: MAX_LIMIT,
@@ -635,17 +702,21 @@ function collectGrantVisibleRows(
       cursor,
     });
     for (const row of page.data) {
-      if (
-        recordKeyWithinGrantResources(row.recordKey, streamGrant) &&
-        recordWithinGrantTimeConstraint(row.data, streamGrant)
-      ) {
-        visible.push(row);
+      if (visible(row)) count++;
+      if (count > STREAM_COUNT_CAP) {
+        capped = true;
+        break;
       }
     }
-    if (!page.hasMore || !page.nextCursor) break;
+    if (capped || !page.hasMore || !page.nextCursor) break;
     cursor = page.nextCursor;
   }
-  return visible;
+
+  return {
+    recordCount: capped ? null : count,
+    lastUpdated,
+    countCapped: capped,
+  };
 }
 
 function toRecordJson(
