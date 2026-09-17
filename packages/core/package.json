@@ -60,6 +60,10 @@
       "types": "./dist/storage/index/index.d.ts",
       "import": "./dist/storage/index/index.js"
     },
+    "./storage/pdpp-records": {
+      "types": "./dist/storage/pdpp-records/index.d.ts",
+      "import": "./dist/storage/pdpp-records/index.js"
+    },
     "./storage/blocks": {
       "types": "./dist/storage/blocks/index.d.ts",
       "import": "./dist/storage/blocks/index.js"
