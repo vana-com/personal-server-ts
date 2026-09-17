@@ -71,6 +71,20 @@ export const DEFAULTS = {
     // Quiet period after a source scope changes before a recompute starts.
     recomputeDebounceMs: 5_000,
   },
+  pdpp: {
+    // The PDPP Authorization Server is opt-in. Off by default so an existing
+    // deployment gains no new authorization surface on upgrade.
+    enabled: false,
+    // Absolute file paths of retained SourceDeclaration documents. There is
+    // deliberately no trust-all option and no default: an AS that accepts any
+    // declaration it can reach will issue grants over data it was never meant
+    // to speak for. Empty means this server retains none and issues nothing.
+    declarationPaths: [] as string[],
+    // Require PKCE (RFC 7636, S256) on the authorization-code flow. PDPP
+    // clients are public clients; without a verifier an intercepted code is
+    // redeemable by whoever intercepted it.
+    requirePkce: true,
+  },
 };
 
 export const StorageBackend = z.enum([
@@ -204,6 +218,17 @@ export const ServerConfigSchema = z.object({
         .default(DEFAULTS.inference.recomputeDebounceMs),
     })
     .default(DEFAULTS.inference),
+  pdpp: z
+    .object({
+      enabled: z.boolean().default(DEFAULTS.pdpp.enabled),
+      // No trust-all switch by design. A declaration is trusted because an
+      // operator retained this exact document, not because it was reachable.
+      declarationPaths: z
+        .array(z.string().min(1))
+        .default(DEFAULTS.pdpp.declarationPaths),
+      requirePkce: z.boolean().default(DEFAULTS.pdpp.requirePkce),
+    })
+    .default(DEFAULTS.pdpp),
 });
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;

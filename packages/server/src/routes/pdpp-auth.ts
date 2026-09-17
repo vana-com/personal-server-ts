@@ -36,12 +36,16 @@ import {
   fetchReview,
   PDPP_API_VERSION,
   resolveRequesterIdentity,
+  validateCodeChallenge,
   validateSelectionRequest,
   type DeclarationSnapshot,
   type InstanceInventory,
   type PdppAuthStore,
   type SelectionRequest,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
+import { createWeb3AuthMiddleware } from "../middleware/web3-auth.js";
+import { createOwnerCheckMiddleware } from "../middleware/owner-check.js";
+import type { TokenStore } from "../token-store.js";
 
 /** No-store on everything: tokens, codes, and review models are all sensitive. */
 const NO_STORE = {
@@ -76,8 +80,28 @@ export interface PdppAuthRouteDeps {
    * uses one notion of owner identity for both.
    */
   ownerSubjectId?(c: Context): string | null;
+  /**
+   * Owner-proof wiring. When supplied, `POST /owner/token` is guarded by the
+   * PS's existing `web3-auth` + `owner-check` middleware — the same wallet
+   * signature chain every other owner route uses — and the verified signer
+   * becomes the PDPP subject. Absent, the route falls back to
+   * `ownerSubjectId`/`currentSubjectId`, which is how the unit tests drive it.
+   */
+  ownerAuth?: {
+    serverOrigin: string | (() => string);
+    serverOwner?: `0x${string}`;
+    devToken?: string;
+    accessToken?: string;
+    tokenStore?: TokenStore;
+  };
   /** AS-policy grant expiry, when the deployment sets one. */
   grantExpiryFor?(request: SelectionRequest): string | undefined;
+  /**
+   * Require PKCE on the authorization code flow. Defaults to true and should
+   * stay true: PDPP clients are public clients, so without a verifier an
+   * intercepted code is redeemable by whoever intercepted it.
+   */
+  requirePkce?: boolean;
 }
 
 function errorResponse(
@@ -116,6 +140,28 @@ function negotiateVersion(
 export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   const app = new Hono();
 
+  // The owner-proof chain, when a deployment wires one. `web3-auth` verifies
+  // the Web3Signed wallet signature and populates `c.get("auth")`;
+  // `owner-check` compares the recovered signer against the configured server
+  // owner. Scoped to the token-exchange path only — the rest of the surface
+  // authenticates with the PDPP owner token that exchange produces.
+  if (deps.ownerAuth) {
+    app.use(
+      "/owner/token",
+      createWeb3AuthMiddleware({
+        serverOrigin: deps.ownerAuth.serverOrigin,
+        devToken: deps.ownerAuth.devToken,
+        accessToken: deps.ownerAuth.accessToken,
+        tokenStore: deps.ownerAuth.tokenStore,
+        serverOwner: deps.ownerAuth.serverOwner,
+      }),
+    );
+    app.use(
+      "/owner/token",
+      createOwnerCheckMiddleware(deps.ownerAuth.serverOwner),
+    );
+  }
+
   /**
    * Exchange an already-verified owner proof for a PDPP owner token.
    *
@@ -141,7 +187,15 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
    * deployment that maps wallets to subjects differently supplies its own.
    */
   app.post("/owner/token", (c) => {
-    const subjectId = deps.ownerSubjectId?.(c) ?? deps.currentSubjectId(c);
+    // With `ownerAuth` wired, the middleware above has already verified a
+    // wallet signature and confirmed the signer is the server owner, so
+    // `c.get("auth").signer` is a proven identity rather than a claim.
+    const verifiedSigner = (c.get("auth") as { signer?: string } | undefined)
+      ?.signer;
+    const subjectId =
+      deps.ownerSubjectId?.(c) ??
+      (deps.ownerAuth && verifiedSigner ? verifiedSigner : null) ??
+      deps.currentSubjectId(c);
     if (!subjectId) {
       // Reaching here means the owner middleware did not run or did not
       // populate a verified signer. Fail closed rather than inventing a
@@ -205,6 +259,8 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       client_id?: string;
       redirect_uri?: string;
       state?: string;
+      code_challenge?: string;
+      code_challenge_method?: string;
       client_display?: { name: string };
     };
     try {
@@ -232,6 +288,17 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         "invalid_request",
         "client_id and redirect_uri are required",
       );
+    }
+
+    // PKCE is validated before consent, not at redemption: a client whose flow
+    // is unusable should learn that before a human is asked to decide anything.
+    const pkceFailure = validateCodeChallenge(
+      body.code_challenge,
+      body.code_challenge_method,
+      { required: deps.requirePkce ?? true },
+    );
+    if (pkceFailure) {
+      return errorResponse(c, 400, "invalid_request", pkceFailure.message);
     }
 
     const request = details[0];
@@ -267,6 +334,8 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       }),
       redirectUri: body.redirect_uri,
       stateParam: body.state,
+      codeChallenge: body.code_challenge,
+      codeChallengeMethod: body.code_challenge_method,
       grantExpiresAt: deps.grantExpiryFor?.(request),
     });
 
@@ -374,8 +443,10 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       grantId: result.grant.grant_id,
       clientId: result.grant.client.client_id,
       redirectUri: session!.redirect_uri,
-      codeChallenge: null,
-      codeChallengeMethod: null,
+      // Carried from the authorization request, so redemption can prove the
+      // redeemer is the client that asked (RFC 7636 §4.4).
+      codeChallenge: session!.code_challenge ?? null,
+      codeChallengeMethod: session!.code_challenge_method ?? null,
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
     });
 
@@ -462,6 +533,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         code,
         clientId,
         redirectUri,
+        codeVerifier: asString(body.code_verifier) ?? undefined,
       });
       if (!result.ok) {
         return errorResponse(
