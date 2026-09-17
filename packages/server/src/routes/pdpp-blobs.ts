@@ -1,14 +1,15 @@
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
+import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
+  recordKeyWithinGrantResources,
+  recordWithinGrantTimeConstraint,
   resolveReadScope,
   type PdppRecordStore,
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
-
-const PDPP_VERSION = "2026-04-06";
 
 export interface PdppBlobsRouteDeps {
   store: PdppRecordStore;
@@ -31,9 +32,34 @@ function requestId(): string {
   return `req_${randomUUID()}`;
 }
 
+function jsonError(
+  c: Context,
+  err: PdppError,
+  reqId: string,
+  extraHeaders?: Record<string, string>,
+) {
+  return c.json(err.toJSON(reqId), err.status as never, {
+    "Request-Id": reqId,
+    "PDPP-Version": PDPP_VERSION,
+    ...extraHeaders,
+  });
+}
+
 export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   const app = new Hono();
 
+  /**
+   * Authorizes a blob fetch through the SAME path a record read uses — a
+   * `blob_id` alone is never sufficient (spec §8 "Get a blob"). This finds
+   * the record that actually references the blob (spec §4 `blob_ref`), then
+   * requires that record to pass every check a direct record read would:
+   * instance scope, `resources` allowlist, `time_constraint`, and — the
+   * blob-specific addition — `blob_ref` being in the grant's authorized
+   * field projection. A grant whose only connection to this blob_id is an
+   * unrelated stream's `fields` list containing the string "blob_ref" no
+   * longer passes; it must be the field projection of the SPECIFIC stream
+   * whose SPECIFIC record references this blob.
+   */
   async function authorizeBlobAccess(
     c: Context,
     blobId: string,
@@ -47,9 +73,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         "Missing or invalid access token",
       );
       return {
-        error: c.json(err.toJSON(reqId), 401, {
-          "Request-Id": reqId,
-          "PDPP-Version": PDPP_VERSION,
+        error: jsonError(c, err, reqId, {
           "WWW-Authenticate":
             'Bearer error="invalid_token", resource_metadata="/.well-known/oauth-protected-resource"',
         }),
@@ -58,12 +82,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
     const context = await deps.auth.resolveToken(token);
     if (!context.active) {
       const err = new PdppError("authentication_error", "Invalid access token");
-      return {
-        error: c.json(err.toJSON(reqId), 401, {
-          "Request-Id": reqId,
-          "PDPP-Version": PDPP_VERSION,
-        }),
-      };
+      return { error: jsonError(c, err, reqId) };
     }
 
     const meta = deps.store.getBlobMeta(blobId);
@@ -72,58 +91,70 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         "blob_not_found",
         "blob_id is unknown or stale",
       );
-      return {
-        error: c.json(err.toJSON(reqId), 404, {
-          "Request-Id": reqId,
-          "PDPP-Version": PDPP_VERSION,
-        }),
-      };
+      return { error: jsonError(c, err, reqId) };
     }
 
-    // Spec §8 "Get a blob": the grant must include a stream containing a
-    // record that references this blob_id, that record must pass all grant
-    // filters, and blob_ref must be in the grant's field projection. We
-    // don't know which stream/record referenced this blob_id without a
-    // reverse index, which is out of scope to build generically here — the
-    // caller (route wiring) is expected to have validated the referencing
-    // record via a prior authorized record read in the same session. This
-    // route re-validates only what it can from the token/grant shape:
-    // owner tokens always pass (no grant to check); client tokens require
-    // `blob_ref` to be in at least one granted stream's fields, which is the
-    // narrowest check available without a reverse blob->record index.
-    if (context.tokenKind === "client") {
-      const declarations = deps.declarations.list();
-      const grantsBlobRef = declarations.some((decl) => {
-        const scope = safeResolve(context, decl.name, decl);
-        return scope?.fields?.includes("blob_ref") ?? false;
-      });
-      if (!grantsBlobRef) {
-        const err = new PdppError(
-          "blob_not_found",
-          "blob_id is unknown or stale",
-        );
-        return {
-          error: c.json(err.toJSON(reqId), 404, {
-            "Request-Id": reqId,
-            "PDPP-Version": PDPP_VERSION,
-          }),
-        };
+    const notFound = () =>
+      jsonError(
+        c,
+        new PdppError("blob_not_found", "blob_id is unknown or stale"),
+        reqId,
+      );
+
+    if (context.tokenKind === "owner") {
+      // Owner tokens carry no grant: current-capability read, scoped to the
+      // owner's own subject's instances only — a blob referenced by a
+      // record on an instance the owner doesn't own must not be served.
+      const reference = deps.store.findBlobReference(blobId);
+      if (!reference) return { error: notFound() };
+      const ownedInstances = deps.instancesForSubject?.(
+        context.subjectId ?? "",
+      );
+      if (ownedInstances && !ownedInstances.includes(reference.instance)) {
+        return { error: notFound() };
       }
+      return { ok: true };
+    }
+
+    // Client token: the blob must be referenced by a record this exact
+    // grant can see — instance scope, resources allowlist, time_constraint,
+    // and blob_ref must be in the granted fields for that record's stream.
+    const reference = deps.store.findBlobReference(blobId);
+    if (!reference) return { error: notFound() };
+
+    const declaration = deps.declarations.get(reference.stream);
+    let scope;
+    try {
+      scope = resolveReadScope(context, reference.stream, declaration);
+    } catch {
+      return { error: notFound() };
+    }
+
+    if (!scope.instanceIds.includes(reference.instance)) {
+      return { error: notFound() };
+    }
+    if (
+      !recordKeyWithinGrantResources(reference.recordKey, scope.streamGrant)
+    ) {
+      return { error: notFound() };
+    }
+    if (!scope.fields?.includes("blob_ref")) {
+      return { error: notFound() };
+    }
+
+    const record = deps.store.getRecord(
+      reference.instance,
+      reference.stream,
+      reference.recordKey,
+    );
+    if (
+      !record ||
+      !recordWithinGrantTimeConstraint(record.data, scope.streamGrant)
+    ) {
+      return { error: notFound() };
     }
 
     return { ok: true };
-  }
-
-  function safeResolve(
-    context: Awaited<ReturnType<PdppAuthorizationService["resolveToken"]>>,
-    stream: string,
-    decl: ReturnType<StreamDeclarationRegistry["get"]>,
-  ) {
-    try {
-      return resolveReadScope(context, stream, decl);
-    } catch {
-      return undefined;
-    }
   }
 
   // Hono dispatches HEAD by internally calling the GET handler and

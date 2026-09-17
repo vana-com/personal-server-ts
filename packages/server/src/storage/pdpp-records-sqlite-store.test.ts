@@ -468,4 +468,94 @@ describe("sqlite record store", () => {
       },
     ]);
   });
+
+  describe("findBlobReference", () => {
+    it("finds the record that references a blob_id via data.blob_ref.blob_id", () => {
+      store.ingestBatch(
+        [
+          {
+            instance: "inst_1",
+            stream: "media",
+            key: "media_1",
+            data: { id: "media_1", blob_ref: { blob_id: "blob_x" } },
+            emitted_at: "2026-04-01T00:00:00.000Z",
+          },
+        ],
+        () => "append_only",
+        () => ["id"],
+      );
+      expect(store.findBlobReference("blob_x")).toEqual({
+        instance: "inst_1",
+        stream: "media",
+        recordKey: "media_1",
+      });
+    });
+
+    it("returns undefined when no record references the blob_id", () => {
+      expect(store.findBlobReference("blob_nonexistent")).toBeUndefined();
+    });
+
+    it("does not find a reference from a deleted record", () => {
+      store.ingestBatch(
+        [
+          {
+            instance: "inst_1",
+            stream: "media",
+            key: "media_1",
+            data: { id: "media_1", blob_ref: { blob_id: "blob_x" } },
+            emitted_at: "2026-04-01T00:00:00.000Z",
+          },
+        ],
+        () => "mutable_state",
+        () => ["id"],
+      );
+      store.deleteRecord(
+        "inst_1",
+        "media",
+        "media_1",
+        "2026-04-02T00:00:00.000Z",
+        "mutable_state",
+      );
+      expect(store.findBlobReference("blob_x")).toBeUndefined();
+    });
+  });
+
+  describe("schema migration", () => {
+    it("tracks a schema version and does not re-run migrations on reopen", () => {
+      store.ingestBatch(
+        [
+          {
+            instance: "inst_1",
+            stream: "media",
+            key: "media_1",
+            data: { id: "media_1", blob_ref: { blob_id: "blob_y" } },
+            emitted_at: "2026-04-01T00:00:00.000Z",
+          },
+        ],
+        () => "append_only",
+        () => ["id"],
+      );
+      // Reopening the same underlying db (without closing/recreating) must
+      // not error or duplicate schema objects -- migrate() is idempotent.
+      const reopened = createSqliteRecordStore(db);
+      expect(reopened.findBlobReference("blob_y")).toEqual({
+        instance: "inst_1",
+        stream: "media",
+        recordKey: "media_1",
+      });
+      const version = db
+        .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
+        .get() as { version: number };
+      expect(version.version).toBeGreaterThan(0);
+    });
+
+    it("refuses to open a database with a newer schema version than this build supports", () => {
+      db.prepare(
+        "UPDATE pdpp_schema_version SET version = 9999 WHERE id = 1",
+      ).run();
+      expect(() => createSqliteRecordStore(db)).toThrow(
+        /newer than this build supports/,
+      );
+    });
+  });
 });
