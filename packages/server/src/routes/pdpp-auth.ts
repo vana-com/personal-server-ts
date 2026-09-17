@@ -163,6 +163,21 @@ function negotiateVersion(
 export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   const app = new Hono();
 
+  // The selected version echoes back on every response (§9 AS item 17).
+  app.use("*", async (c, next) => {
+    const version = negotiateVersion(c);
+    if (!version.ok) {
+      return errorResponse(
+        c,
+        400,
+        "unsupported_version",
+        `PDPP-Version '${version.requested}' is not supported; this server implements ${PDPP_API_VERSION}`,
+      );
+    }
+    await next();
+    c.header("PDPP-Version", PDPP_API_VERSION);
+  });
+
   // The owner-proof chain, when a deployment wires one. `web3-auth` verifies
   // the Web3Signed wallet signature and populates `c.get("auth")`;
   // `owner-check` compares the recovered signer against the configured server
@@ -241,21 +256,6 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       "PDPP owner token issued to a verified owner",
     );
     return c.json(issued, 200, NO_STORE);
-  });
-
-  // The selected version echoes back on every response (§9 AS item 17).
-  app.use("*", async (c, next) => {
-    const version = negotiateVersion(c);
-    if (!version.ok) {
-      return errorResponse(
-        c,
-        400,
-        "unsupported_version",
-        `PDPP-Version '${version.requested}' is not supported; this server implements ${PDPP_API_VERSION}`,
-      );
-    }
-    await next();
-    c.header("PDPP-Version", PDPP_API_VERSION);
   });
 
   /**
@@ -623,10 +623,22 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   /**
    * RFC 7662 introspection.
    *
-   * For a co-located deployment the RS uses `resolveToken` directly; this
-   * endpoint exists for a separated AS/RS, where §8 requires the RS to
-   * authenticate. Authentication is the caller's owner token: only a party
-   * already trusted with owner scope may introspect.
+   * **The co-located deployment is the supported baseline**, and there the RS
+   * calls `resolveToken` directly — this endpoint is not on that path.
+   *
+   * **Known gap for the separated deployment (§9 AS item 18).** The only
+   * credential accepted here is a PDPP *owner* token: 15-minute TTL, mintable
+   * only from a wallet owner-proof. A standalone Resource Server cannot hold
+   * one, so the deployment topology this endpoint exists to serve cannot
+   * actually authenticate to it. Closing that needs a distinct RS client
+   * identity (client credentials, mTLS, or a registered RS principal) that is
+   * not owner scope, which is a deployment-model decision this build does not
+   * make.
+   *
+   * Stated plainly rather than papered over: this AS does **not** claim
+   * conformance for separated AS/RS introspection. It is conformant for the
+   * co-located equivalent §8 explicitly permits ("A co-located AS and RS MAY
+   * resolve the same context through a local equivalent").
    */
   app.post("/introspect", async (c) => {
     const callerToken = bearer(c);

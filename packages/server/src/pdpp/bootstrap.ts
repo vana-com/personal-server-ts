@@ -126,10 +126,34 @@ export async function createPdppAuthDeps(
     resolveDeclaration: registry.resolve,
     inventoryFor: (subject, sourceId) =>
       singleInstanceInventory(subject || subjectId, sourceId),
-    // This PS is single-owner: the authenticated owner is the only subject.
-    // The owner-proof middleware below is what establishes that a caller is
-    // that owner; this just names the subject grants bind to.
-    currentSubjectId: () => subjectId,
+    /**
+     * Bind the session's subject to an *authenticated* owner.
+     *
+     * This PS is single-owner, so there is only ever one subject — but "there
+     * is one subject" and "any caller may open a session bound to it" are
+     * different claims, and the second is the one that was wrong. Previously
+     * this ignored the request entirely and returned the configured owner, so
+     * an unauthenticated caller could create sessions against the owner's
+     * subject: consent-screen spam and unbounded session allocation, even
+     * though approval still required a real owner token.
+     *
+     * Now the caller must present an active PDPP owner token, and the subject
+     * it resolves to must be the configured owner. Single-owner stays a
+     * deployment property; it stops being an authentication bypass.
+     */
+    currentSubjectId: (c) => {
+      const header = c.req.header("authorization");
+      if (!header?.toLowerCase().startsWith("bearer ")) return null;
+      const presented = header.slice(7).trim();
+      if (presented.length === 0) return null;
+
+      const context = tokens.resolveToken(presented);
+      if (!context.active || context.tokenKind !== "owner") return null;
+      // A token for some other subject is not authority here, even though a
+      // single-owner deployment should never mint one.
+      if (context.subjectId !== subjectId) return null;
+      return subjectId;
+    },
     // Redirect targets are validated by exact match against this. A client
     // absent from the config gets null, which fails the request closed — an
     // unregistered client cannot receive an authorization code.

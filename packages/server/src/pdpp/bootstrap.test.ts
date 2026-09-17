@@ -228,7 +228,10 @@ describe("the real OAuth grant flow on a bootstrapped server", () => {
     // 1. The client asks, with PKCE.
     const authorized = await app.request("/pdpp/v1/authorize", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`,
+      },
       body: JSON.stringify({
         client_id: "music_recommendations",
         redirect_uri: REDIRECT,
@@ -353,7 +356,10 @@ describe("the real OAuth grant flow on a bootstrapped server", () => {
     // No challenge: refused before the owner is ever asked.
     const noPkce = await app.request("/pdpp/v1/authorize", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`,
+      },
       body: JSON.stringify({
         client_id: "music_recommendations",
         redirect_uri: REDIRECT,
@@ -373,7 +379,10 @@ describe("the real OAuth grant flow on a bootstrapped server", () => {
     // With a challenge, a code is issued — and is useless without the verifier.
     const authorized = await app.request("/pdpp/v1/authorize", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`,
+      },
       body: JSON.stringify({
         client_id: "music_recommendations",
         redirect_uri: REDIRECT,
@@ -434,7 +443,10 @@ describe("the real OAuth grant flow on a bootstrapped server", () => {
 
     const authorized = await app.request("/pdpp/v1/authorize", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`,
+      },
       body: JSON.stringify({
         client_id: "music_recommendations",
         redirect_uri: REDIRECT,
@@ -478,7 +490,10 @@ describe("the real OAuth grant flow on a bootstrapped server", () => {
 
     const authorized = await app.request("/pdpp/v1/authorize", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`,
+      },
       body: JSON.stringify({
         client_id: "music_recommendations",
         redirect_uri: REDIRECT,
@@ -575,9 +590,18 @@ describe("redirect_uri is validated on the bootstrapped server", () => {
     redirectUri: string,
     clientId = "music_recommendations",
   ) {
+    const minted = (await (
+      await ctx!.app.request("/pdpp/v1/owner/token", {
+        method: "POST",
+        headers: { authorization: `Bearer ${ctx!.devToken}` },
+      })
+    ).json()) as { access_token: string };
     return ctx!.app.request("/pdpp/v1/authorize", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${minted.access_token}`,
+      },
       body: JSON.stringify({
         client_id: clientId,
         redirect_uri: redirectUri,
@@ -614,5 +638,116 @@ describe("redirect_uri is validated on the bootstrapped server", () => {
 
   it("accepts the registered redirect", async () => {
     expect((await authorizeWith(REDIRECT)).status).toBe(201);
+  });
+});
+
+describe("review C5 — /authorize binds an authenticated owner", () => {
+  beforeEach(async () => {
+    await seedScope("spotify.top_artists");
+    ctx = await boot(pdppConfig([await writeDeclaration()]));
+  });
+
+  function authorizeBody() {
+    return {
+      client_id: "music_recommendations",
+      redirect_uri: REDIRECT,
+      code_challenge: CHALLENGE,
+      code_challenge_method: "S256",
+      authorization_details: [
+        {
+          type: "https://pdpp.dev/data-access",
+          source: { id: SOURCE_ID },
+          purpose_code: "https://pdpp.dev/purpose/personalization",
+          access_mode: "continuous",
+          streams: [{ name: "top_artists" }],
+        },
+      ],
+    };
+  }
+
+  it("refuses to open a session for an unauthenticated caller", async () => {
+    // Single-owner is a deployment property, not a licence for anyone to
+    // create sessions bound to the owner's subject. Previously this returned
+    // 201 and allocated a session against the owner.
+    const response = await ctx!.app.request("/pdpp/v1/authorize", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(authorizeBody()),
+    });
+    expect(response.status).toBe(401);
+  });
+
+  it("refuses a client token in place of an owner token", async () => {
+    const response = await ctx!.app.request("/pdpp/v1/authorize", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer pdpp_at_not_an_owner_token",
+      },
+      body: JSON.stringify(authorizeBody()),
+    });
+    expect(response.status).toBe(401);
+  });
+
+  it("opens a session for the authenticated owner and binds their subject", async () => {
+    const minted = (await (
+      await ctx!.app.request("/pdpp/v1/owner/token", {
+        method: "POST",
+        headers: { authorization: `Bearer ${ctx!.devToken}` },
+      })
+    ).json()) as { access_token: string };
+
+    const response = await ctx!.app.request("/pdpp/v1/authorize", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${minted.access_token}`,
+      },
+      body: JSON.stringify(authorizeBody()),
+    });
+    expect(response.status).toBe(201);
+
+    // The session is the owner's: their token reviews it.
+    const { session_id } = (await response.json()) as { session_id: string };
+    const reviewed = await ctx!.app.request(
+      `/pdpp/v1/authorize/${session_id}/review`,
+      { headers: { authorization: `Bearer ${minted.access_token}` } },
+    );
+    expect(reviewed.status).toBe(200);
+  });
+});
+
+describe("review C1 — PDPP-Version is the spec's HTTP contract version", () => {
+  beforeEach(async () => {
+    await seedScope("spotify.top_artists");
+    ctx = await boot(pdppConfig([await writeDeclaration()]));
+  });
+
+  it("accepts the normative header value from Core §8", async () => {
+    // Core §8 "API versioning" states `PDPP-Version: 2026-04-06`. The AS
+    // previously advertised the GRANT SCHEMA version here, which §7 says must
+    // not be conflated with the HTTP contract version — so a client pinning
+    // the spec's own value could reach the RS but not the AS.
+    const response = await ctx!.app.request("/pdpp/v1/owner/token", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${ctx!.devToken}`,
+        "pdpp-version": "2026-04-06",
+      },
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("pdpp-version")).toBe("2026-04-06");
+  });
+
+  it("rejects the grant schema version as an API version", async () => {
+    const response = await ctx!.app.request("/pdpp/v1/owner/token", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${ctx!.devToken}`,
+        "pdpp-version": "0.1.0",
+      },
+    });
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toBe("unsupported_version");
   });
 });

@@ -363,6 +363,46 @@ export function parseDeclaration(
   };
 }
 
+/**
+ * Read a response body, giving up as soon as it exceeds `limit` bytes.
+ *
+ * Returns null when the cap is passed. The stream is cancelled at that point,
+ * so a hostile or misconfigured host cannot make us hold more than the cap in
+ * memory however it frames the response. Falls back to a buffered read only
+ * when the runtime gives no readable stream, and still checks the size.
+ */
+async function readCapped(
+  response: Response,
+  limit: number,
+): Promise<string | null> {
+  const stream = response.body;
+  if (!stream) {
+    const buffered = await response.text();
+    return Buffer.byteLength(buffered, "utf8") > limit ? null : buffered;
+  }
+
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > limit) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return Buffer.concat(chunks.map((c) => Buffer.from(c))).toString("utf8");
+}
+
 /** Injected so tests exercise the bounds without real network access. */
 export type DeclarationFetcher = (
   url: string,
@@ -450,9 +490,13 @@ export async function retrieveDeclaration(
       };
     }
 
-    const body = await response.text();
-    // Check the actual body too: Content-Length may be absent or lying.
-    if (Buffer.byteLength(body, "utf8") > MAX_DECLARATION_BYTES) {
+    // Read incrementally and abort the moment the cap is passed. `text()`
+    // would buffer the whole response first, so a host that omits or lies
+    // about Content-Length could make us allocate an unbounded body and only
+    // then be told it was too large — the cap has to bound the allocation, not
+    // just the outcome.
+    const body = await readCapped(response, MAX_DECLARATION_BYTES);
+    if (body === null) {
       return {
         ok: false,
         failure: {
