@@ -25,7 +25,7 @@
       "composeOut": "controller-compose.yml",
       "pinned": {
         "instanceId": "b5399a837ff0456905ffe8c9938002b97c4f6792",
-        "composeHash": "b52e251261e4b18f63b5a010b05555f945755a8f61a63d2341a256f16b6f9bf4"
+        "composeHash": "c65e0ed291423064fb94792ab498f24705658ef6c72773573aa8f7fc1801d34b"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -76,7 +76,7 @@
       "composeOut": "worker-compose.yml",
       "pinned": {
         "instanceId": "74ab19f73d2ad2b35d06776bf82e3c121b2d0763",
-        "composeHash": "cceb9f2af74cde03d95acf1624a8310969b4aa157f3bdf1a96bf1728183c3105"
+        "composeHash": "f3a8a93c0be2a7c9c34979a773140714f8da5ec3652d89510d9a0f7c87b798cb"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -127,5 +127,5 @@
   "fleetShape": {
     "NOTE": "One controller + one worker. The worker-2 replica (39600ebe-9f8a-40ac-8fde-2a585776bac1) was deleted during step 3 so the worker app id has a single live CVM - that is what makes phala api /cvms/<uuid>/attestation unambiguous on this fleet, unlike moksha-prod5. Before adding a second worker, read docs/260915-mainnet-prod1-staging-plan.md section 0a: a shared app id breaks instance-id harvesting."
   },
-  "pinnedFrom": "Re-harvested by uuid after the step43 #322 controller-only roll at source 176c01ab8c0e6144ae0e64fdf0bfa273a25f40b7 (CI Docker run 35239436973); per-uuid staged compose read-back is ground truth. Re-harvest and commit after every roll."
+  "pinnedFrom": "Re-harvested by uuid after the step48 #325 controller+worker roll at source accaccae82253edc64c617361db4b3b2f4a72732 (CI Docker run 35273133698); per-uuid staged compose read-back is ground truth. Re-harvest and commit after every roll."
 }
