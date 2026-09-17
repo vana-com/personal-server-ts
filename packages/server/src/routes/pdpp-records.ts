@@ -86,10 +86,22 @@ function requireSubjectId(context: PdppTokenContext): string {
 }
 
 function sendError(c: Context, err: PdppError, reqId: string) {
-  return c.json(err.toJSON(reqId), err.status as never, {
+  // Every 401 carries the challenge, whichever branch produced it.
+  //
+  // Previously only the missing-token branch built one, so a client holding a
+  // STALE token -- the exact case §8's challenge exists to bootstrap -- got a
+  // bare 401 with no `WWW-Authenticate` and no pointer to the metadata it
+  // needed in order to re-authorize. Attaching it here rather than at each
+  // call site means a future 401 path cannot forget it.
+  const headers: Record<string, string> = {
     "Request-Id": reqId,
     "PDPP-Version": PDPP_VERSION,
-  });
+  };
+  if (err.status === 401) {
+    headers["WWW-Authenticate"] =
+      `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`;
+  }
+  return c.json(err.toJSON(reqId), err.status as never, headers);
 }
 
 /**

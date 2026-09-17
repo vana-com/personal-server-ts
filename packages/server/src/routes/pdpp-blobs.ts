@@ -39,11 +39,18 @@ function jsonError(
   reqId: string,
   extraHeaders?: Record<string, string>,
 ) {
-  return c.json(err.toJSON(reqId), err.status as never, {
+  // Every 401 carries the challenge, not just the missing-token branch: a
+  // client holding a STALE token is exactly who needs the pointer back to the
+  // metadata document in order to re-authorize.
+  const headers: Record<string, string> = {
     "Request-Id": reqId,
     "PDPP-Version": PDPP_VERSION,
+    ...(err.status === 401 && {
+      "WWW-Authenticate": `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`,
+    }),
     ...extraHeaders,
-  });
+  };
+  return c.json(err.toJSON(reqId), err.status as never, headers);
 }
 
 export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {

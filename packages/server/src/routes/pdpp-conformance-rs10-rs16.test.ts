@@ -172,3 +172,100 @@ describe("RS-16: the 401 challenge names a dereferenceable metadata URL", () => 
     );
   });
 });
+
+/**
+ * RS-16, the part the first fix missed.
+ *
+ * The challenge was built ONLY on the missing-token branch of `authenticate`.
+ * A token that was PRESENT and rejected by `resolveToken` -- expired, revoked,
+ * unknown -- returned a bare 401 with no `WWW-Authenticate` at all. That is
+ * precisely the client §8's challenge exists to help: one holding a stale
+ * token, which needs the pointer back to the metadata document in order to
+ * re-authorize. A client with no token at all was already the easy case.
+ *
+ * Reported against 8ba3265 with two curls to the same endpoint: no header at
+ * all returned the challenge, `Authorization: Bearer <invalid>` did not.
+ *
+ * The challenge is now attached wherever a 401 is emitted rather than at each
+ * call site, so a future 401 path cannot forget it.
+ */
+describe("RS-16: a REJECTED token is challenged, not just a missing one", () => {
+  const EXPECTED = `${ORIGIN}/.well-known/oauth-protected-resource`;
+
+  /** Resolves every token as inactive — the stale-token client. */
+  const rejectingAuth: PdppAuthorizationService = {
+    async resolveToken() {
+      return {
+        active: false,
+        tokenKind: "client" as const,
+        subjectId: "",
+        inactiveReason: "expired" as const,
+      };
+    },
+  };
+
+  function rejectingApp() {
+    const a = new Hono();
+    const store = createMemoryRecordStore();
+    a.route(
+      "/v1",
+      pdppRecordsRoutes({
+        store,
+        auth: rejectingAuth,
+        declarations,
+        instancesForSubject: () => ["i1"],
+      }),
+    );
+    a.route(
+      "/v1/blobs",
+      pdppBlobsRoutes({
+        store,
+        auth: rejectingAuth,
+        declarations,
+        instancesForSubject: () => ["i1"],
+      }),
+    );
+    return a;
+  }
+
+  it("challenges a rejected token on a record read", async () => {
+    const res = await rejectingApp().request(url("/v1/streams/s/records"), {
+      headers: { Authorization: "Bearer stale-token" },
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate")).toContain(
+      `resource_metadata="${EXPECTED}"`,
+    );
+  });
+
+  it("challenges a rejected token on a stream listing", async () => {
+    const res = await rejectingApp().request(url("/v1/streams"), {
+      headers: { Authorization: "Bearer stale-token" },
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate")).toContain(
+      `resource_metadata="${EXPECTED}"`,
+    );
+  });
+
+  it("challenges a rejected token on a blob fetch", async () => {
+    const res = await rejectingApp().request(url("/v1/blobs/b1"), {
+      headers: { Authorization: "Bearer stale-token" },
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate")).toContain(
+      `resource_metadata="${EXPECTED}"`,
+    );
+  });
+
+  it("does not attach a challenge to a non-401 error", async () => {
+    // A 400 is not an authentication failure; adding a challenge there would
+    // tell a client to re-authorize when its credentials were never the
+    // problem.
+    const res = await app().request(url("/v1/streams/s/records?bogus=1"), {
+      headers: AUTH,
+    });
+    expect(res.status).toBe(400);
+    expect(res.headers.get("www-authenticate")).toBeNull();
+  });
+});
