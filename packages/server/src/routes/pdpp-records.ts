@@ -1,7 +1,10 @@
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
-import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import type {
+  PdppAuthorizationService,
+  StreamGrant,
+} from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
   CursorExpiredError,
   InvalidCursorError,
@@ -249,12 +252,20 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         .query("fields")
         ?.split(",")
         .map((f) => f.trim());
-      const fields =
+      const projectedFields =
         context!.tokenKind === "client"
           ? scope.fields
           : requestedFields
             ? [...requestedFields]
             : undefined;
+      // The time_constraint is evaluated against the record's constraint
+      // field, so that field must survive the store's projection even when
+      // the grant does not include it. It is stripped again below, after
+      // filtering, so it never reaches the client.
+      const { fields, stripField } = withConstraintField(
+        projectedFields,
+        scope.streamGrant,
+      );
       const cursor = c.req.query("cursor");
 
       if (c.req.query("changes_since") !== undefined) {
@@ -292,7 +303,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             ...(page.nextChangesSince && {
               next_changes_since: page.nextChangesSince,
             }),
-            data: visible.map((row) => toRecordJson(stream, row)),
+            data: visible.map((row) =>
+              toRecordJson(stream, stripFieldFromRow(row, stripField)),
+            ),
             ...(clamped && { meta }),
           },
           200,
@@ -324,7 +337,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           object: "list",
           has_more: page.hasMore,
           ...(page.nextCursor && { next_cursor: page.nextCursor }),
-          data: visible.map((row) => toRecordJson(stream, row)),
+          data: visible.map((row) =>
+            toRecordJson(stream, stripFieldFromRow(row, stripField)),
+          ),
           ...(meta && { meta }),
         },
         200,
@@ -485,6 +500,43 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   });
 
   return app;
+}
+
+/**
+ * Ensure a grant's `time_constraint` field survives the store's field
+ * projection so the constraint can actually be evaluated.
+ *
+ * `recordWithinGrantTimeConstraint` reads `data[time_constraint.field]` and
+ * treats an absent value as "outside the constraint". When the grant's field
+ * set excludes the constraint field — which is the normal case, since the
+ * owner consents to a time window without necessarily sharing the timestamp —
+ * projecting first would delete the field and silently filter out every
+ * record. So we add it to the store query and remove it after filtering.
+ *
+ * Returns the fields to query plus the field to strip afterwards (`undefined`
+ * when nothing needs stripping: no constraint, no projection, or the field is
+ * granted in its own right and must be returned).
+ */
+function withConstraintField(
+  fields: string[] | undefined,
+  streamGrant: StreamGrant | undefined,
+): { fields: string[] | undefined; stripField?: string } {
+  const field = streamGrant?.time_constraint?.field;
+  // No projection means every field is already present.
+  if (!field || fields === undefined) return { fields };
+  if (fields.includes(field)) return { fields };
+  return { fields: [...fields, field], stripField: field };
+}
+
+/** Remove the constraint-only field added by `withConstraintField`. */
+function stripFieldFromRow(
+  row: PdppRecordRow,
+  stripField: string | undefined,
+): PdppRecordRow {
+  if (!stripField || row.deleted || !row.data) return row;
+  if (!(stripField in row.data)) return row;
+  const { [stripField]: _removed, ...rest } = row.data;
+  return { ...row, data: rest };
 }
 
 function toRecordJson(stream: string, row: PdppRecordRow) {
