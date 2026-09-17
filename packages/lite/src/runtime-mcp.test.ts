@@ -303,6 +303,81 @@ describe("createPsLiteRuntime + MCP owner routes", () => {
 });
 
 describe("createPsLiteRuntime + /mcp/:token route", () => {
+  it("persists a scope request for the owner and clears it after widening", async () => {
+    const bundle = buildRuntime();
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store: bundle.store, publicOrigin: SERVER_ORIGIN },
+    );
+    await bundle.runtime.fetch(
+      await ownerSigned(
+        "POST",
+        `/v1/mcp/connections/${created.connectionId}/approve`,
+        { grants: [{ grantId: "grant-1", scopes: ["instagram.profile"] }] },
+      ),
+    );
+    const toolCall = (id: number) =>
+      bundle.runtime.fetch(
+        new Request(
+          `${SERVER_ORIGIN}/mcp/${encodeURIComponent(created.connectionToken)}`,
+          {
+            method: "POST",
+            headers: {
+              Accept: "application/json, text/event-stream",
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id,
+              method: "tools/call",
+              params: {
+                name: "request_scope_access",
+                arguments: {
+                  scopes: ["chatgpt.history"],
+                  reason: "Answer from prior chats.",
+                },
+              },
+            }),
+          },
+        ),
+      );
+
+    const requested = await toolCall(1);
+    expect(requested.status).toBe(200);
+    expect(
+      JSON.parse((await requested.json()).result.content[0].text),
+    ).toMatchObject({
+      approvalRequired: true,
+      requestRecorded: true,
+    });
+    const ownerList = await bundle.runtime.fetch(
+      await ownerSigned("GET", "/v1/mcp/connections"),
+    );
+    expect(
+      (await ownerList.json()).connections[0].scopeAccessRequest,
+    ).toMatchObject({
+      scopes: ["chatgpt.history"],
+      reason: "Answer from prior chats.",
+    });
+
+    const widened = await bundle.runtime.fetch(
+      await ownerSigned(
+        "POST",
+        `/v1/mcp/connections/${created.connectionId}/approve`,
+        {
+          grants: [
+            { grantId: "grant-1", scopes: ["instagram.profile"] },
+            { grantId: "grant-2", scopes: ["chatgpt.history"] },
+          ],
+        },
+      ),
+    );
+    expect((await widened.json()).scopeAccessRequest).toBeUndefined();
+    expect(
+      JSON.parse((await (await toolCall(2)).json()).result.content[0].text),
+    ).toMatchObject({ approvalRequired: false, missingScopes: [] });
+  });
+
   it("returns OAuth discovery challenge on stable /mcp without bearer token", async () => {
     const { runtime } = buildRuntime({
       approvalUrl: "https://app-dev.vana.org/mcp/connect/claude",

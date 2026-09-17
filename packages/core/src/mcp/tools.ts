@@ -11,7 +11,10 @@
  */
 
 import { z } from "zod";
-import type { McpConnectionRecord } from "./types.js";
+import {
+  MCP_SCOPE_ACCESS_REQUEST_LIMIT,
+  type McpConnectionRecord,
+} from "./types.js";
 import type { McpDataReadClient } from "./read-client.js";
 import { McpDataReadError } from "./read-client.js";
 import type { McpActivityRecorder } from "./activity.js";
@@ -27,6 +30,10 @@ export interface McpToolContext {
   connection: McpConnectionRecord;
   readClient: McpDataReadClient;
   activityRecorder?: McpActivityRecorder;
+  requestScopeAccess?(input: { scopes: string[]; reason?: string }): Promise<{
+    connection: McpConnectionRecord;
+    requestRecorded: boolean;
+  }>;
 }
 
 export type McpToolResultContent =
@@ -225,6 +232,29 @@ const SEARCH_REQUESTED_SCOPES_LIMIT = MAX_SEARCH_SCOPES * 2;
 const SEARCH_SKIPPED_SCOPES_LIMIT = 50;
 const SEARCH_PREVIEW_CHARS = 600;
 const LIST_SCOPES_LIMIT = 200;
+const scopeAccessRequestInputShape = {
+  scopes: z
+    .array(z.string().min(1).max(SEARCH_SCOPE_MAX_CHARS))
+    .min(1)
+    .max(MCP_SCOPE_ACCESS_REQUEST_LIMIT)
+    .describe("Exact scope ids the MCP client wants to read."),
+  reason: z
+    .string()
+    .max(500)
+    .optional()
+    .describe("Brief reason to show the user."),
+} satisfies McpToolInputShape;
+
+export function parseScopeAccessRequestArguments(
+  value: unknown,
+): { scopes: string[]; reason?: string } | null {
+  const parsed = z.object(scopeAccessRequestInputShape).safeParse(value);
+  if (!parsed.success) return null;
+  const scopes = normalizeScopeListInput(parsed.data.scopes);
+  if (scopes.length === 0) return null;
+  const reason = parsed.data.reason?.trim();
+  return { scopes, ...(reason ? { reason } : {}) };
+}
 
 // Size thresholds for sizeClass classification (raw envelope bytes)
 const SIZE_CLASS_TINY_BYTES = 10_000;
@@ -698,32 +728,43 @@ const requestScopeAccess: McpToolDefinition = {
   name: "request_scope_access",
   title: "Request scope access",
   description:
-    "Check which requested scopes are missing from this MCP grant and tell the user to approve them in Vana.",
-  inputSchema: {
-    scopes: z
-      .array(z.string().min(1).max(SEARCH_SCOPE_MAX_CHARS))
-      .min(1)
-      .max(SEARCH_REQUESTED_SCOPES_LIMIT)
-      .describe("Exact scope ids the MCP client wants to read."),
-    reason: z
-      .string()
-      .max(500)
-      .optional()
-      .describe("Brief reason to show the user."),
-  },
-  async handler(args, { connection }) {
+    "Record missing scopes on this MCP connection for explicit owner approval in Vana.",
+  inputSchema: scopeAccessRequestInputShape,
+  async handler(args, { connection, requestScopeAccess }) {
     const requestedScopes = normalizeScopeListInput(args.scopes);
-    const grantedRequestedScopes = requestedScopes.filter((scope) =>
-      Boolean(resolveGrantForScope(connection, scope)),
+    let effectiveConnection = connection;
+    let grantedRequestedScopes = requestedScopes.filter((scope) =>
+      Boolean(resolveGrantForScope(effectiveConnection, scope)),
     );
-    const missingScopes = requestedScopes.filter(
+    let missingScopes = requestedScopes.filter(
       (scope) => !resolveGrantForScope(connection, scope),
     );
     const reason = typeof args.reason === "string" ? args.reason.trim() : "";
     const approvalRequired = missingScopes.length > 0;
+    const alreadyRecorded =
+      approvalRequired &&
+      missingScopes.every((scope) =>
+        connection.scopeAccessRequest?.scopes.includes(scope),
+      );
+    let requestRecorded = alreadyRecorded;
+    if (approvalRequired && requestScopeAccess) {
+      const outcome = await requestScopeAccess({
+        scopes: missingScopes,
+        ...(reason ? { reason } : {}),
+      });
+      effectiveConnection = outcome.connection;
+      requestRecorded = outcome.requestRecorded;
+      grantedRequestedScopes = requestedScopes.filter((scope) =>
+        Boolean(resolveGrantForScope(effectiveConnection, scope)),
+      );
+      missingScopes = requestedScopes.filter(
+        (scope) => !resolveGrantForScope(effectiveConnection, scope),
+      );
+    }
+    const finalApprovalRequired = missingScopes.length > 0;
 
     return textResult({
-      approvalRequired,
+      approvalRequired: finalApprovalRequired,
       client: {
         id: connection.id,
         displayName: connection.displayName,
@@ -732,10 +773,13 @@ const requestScopeAccess: McpToolDefinition = {
       requestedScopes,
       grantedRequestedScopes,
       missingScopes,
-      grantedScopes: uniqueScopes(connection),
+      grantedScopes: uniqueScopes(effectiveConnection),
       reason: reason || undefined,
-      nextAction: approvalRequired
-        ? "Ask the user to open Vana's Personal Server page and add the missing scopes to this MCP client. This tool cannot grant access by itself."
+      requestRecorded: finalApprovalRequired && requestRecorded,
+      nextAction: finalApprovalRequired
+        ? requestRecorded
+          ? "The request is waiting for owner approval in Vana. Access remains unchanged until the owner approves it."
+          : "Ask the user to open Vana's Personal Server page and add the missing scopes to this MCP client. This tool cannot grant access by itself."
         : "No new grant is needed for the requested scopes.",
     });
   },

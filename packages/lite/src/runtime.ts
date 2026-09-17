@@ -84,6 +84,7 @@ import {
   McpOAuthAuthorizationError,
   redeemMcpOAuthAuthorizationCode,
   refreshMcpOAuthToken,
+  requestMcpScopeAccess,
   toMcpOAuthAuthorizationView,
   revokeMcpConnection,
   toMcpConnectionView,
@@ -1758,6 +1759,12 @@ async function handleMcpRoute(input: {
       connection: record,
       readClient,
       activityRecorder: input.activityRecorder,
+      requestScopeAccess: async (request) => {
+        return requestMcpScopeAccess(
+          { connectionId: record.id, ...request },
+          { store: input.store, now: input.now },
+        );
+      },
     });
     void input.store
       .update(record.id, {

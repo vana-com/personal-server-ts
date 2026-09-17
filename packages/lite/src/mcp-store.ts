@@ -168,6 +168,38 @@ function runIndexQuery<T>(
   );
 }
 
+function mutateConnectionRecord(
+  opts: ResolvedOptions,
+  id: string,
+  update: (record: McpConnectionRecord) => McpConnectionRecord,
+): Promise<McpConnectionRecord | null> {
+  return openDb(opts, CONNECTION_INDEXES).then(
+    (db) =>
+      new Promise<McpConnectionRecord | null>((resolve, reject) => {
+        const transaction = db.transaction(opts.storeName, "readwrite");
+        const store = transaction.objectStore(opts.storeName);
+        const request = store.get(id) as IDBRequest<
+          McpConnectionRecord | undefined
+        >;
+        let result: McpConnectionRecord | null = null;
+        request.onsuccess = () => {
+          if (!request.result) return;
+          result = update(structuredClone(request.result));
+          store.put(result);
+        };
+        request.onerror = () => reject(request.error);
+        transaction.oncomplete = () => {
+          db.close();
+          resolve(result ? structuredClone(result) : null);
+        };
+        transaction.onerror = () => {
+          db.close();
+          reject(transaction.error);
+        };
+      }),
+  );
+}
+
 export function createIndexedDbMcpConnectionStore(
   options: IndexedDbMcpConnectionStoreOptions = {},
 ): McpConnectionStore {
@@ -243,22 +275,16 @@ export function createIndexedDbMcpConnectionStore(
       return record ? { ...record } : null;
     },
 
+    mutate(id, update) {
+      return mutateConnectionRecord(resolved, id, update);
+    },
+
     async update(id, patch) {
-      const existing = await runTx<McpConnectionRecord | undefined>(
+      return mutateConnectionRecord(
         resolved,
-        "readonly",
-        CONNECTION_INDEXES,
-        (store) => store.get(id),
+        id,
+        (existing): McpConnectionRecord => ({ ...existing, ...patch }),
       );
-      if (!existing) return null;
-      const updated: McpConnectionRecord = { ...existing, ...patch };
-      await runTx<IDBValidKey>(
-        resolved,
-        "readwrite",
-        CONNECTION_INDEXES,
-        (store) => store.put(updated),
-      );
-      return { ...updated };
     },
   };
 }

@@ -9,6 +9,8 @@ import {
   handleMcpHandshake,
   hashConnectionToken,
   isMcpHandshake,
+  parseScopeAccessRequestArguments,
+  requestMcpScopeAccess,
   revokeMcpConnection,
   toMcpConnectionView,
   toMcpOAuthAuthorizationView,
@@ -33,6 +35,25 @@ export const OWNER_ACCESS_REVOKED_CODE = "OWNER_ACCESS_REVOKED";
 const MAX_CLAIM_AGE_SECONDS = 300;
 const OWNER_ACCESS_REVOKED_MESSAGE =
   "Owner access to this enclave was revoked; ask the owner to approve it again";
+
+export function parseMcpScopeAccessRequest(
+  body: unknown,
+): { scopes: string[]; reason?: string } | null {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const message = body as Record<string, unknown>;
+  if (
+    message.jsonrpc !== "2.0" ||
+    (typeof message.id !== "string" && typeof message.id !== "number") ||
+    message.method !== "tools/call"
+  )
+    return null;
+  const params = message.params;
+  if (!params || typeof params !== "object" || Array.isArray(params))
+    return null;
+  const call = params as Record<string, unknown>;
+  if (call.name !== "request_scope_access") return null;
+  return parseScopeAccessRequestArguments(call.arguments);
+}
 
 /** Thrown by `dispatch`/`ownerReady` providers when the live protocol identity
  * shows the owner no longer authorizes this enclave. */
@@ -318,7 +339,17 @@ export function createTeeMcpIngress(deps: TeeMcpIngressDeps): Hono {
     } catch {
       return c.json({ error: "MCP grants are no longer valid" }, 403);
     }
-    return deps.dispatch(c.req.raw, connection, binding);
+    const scopeRequest = parseMcpScopeAccessRequest(body);
+    const dispatchConnection = scopeRequest
+      ? await state.exclusive(async () => {
+          const outcome = await requestMcpScopeAccess(
+            { connectionId: connection.id, ...scopeRequest },
+            { store: state.connections },
+          );
+          return outcome.connection;
+        })
+      : connection;
+    return deps.dispatch(c.req.raw, dispatchConnection, binding);
   });
   app.route(
     "/",

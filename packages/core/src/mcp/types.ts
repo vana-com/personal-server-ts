@@ -22,11 +22,18 @@
  */
 
 export type McpConnectionStatus = "pending" | "approved" | "revoked";
+export const MCP_SCOPE_ACCESS_REQUEST_LIMIT = 20;
 
 export interface McpConnectionGrant {
   grantId: string;
   scopes: string[];
   sourceId?: string;
+}
+
+export interface McpScopeAccessRequest {
+  scopes: string[];
+  reason?: string;
+  requestedAt: string;
 }
 
 /**
@@ -78,6 +85,8 @@ export interface McpConnectionRecord {
   refreshExpiresAt?: string;
   status: McpConnectionStatus;
   grants: McpConnectionGrant[];
+  /** Missing scopes the MCP client asked the owner to approve. */
+  scopeAccessRequest?: McpScopeAccessRequest;
   createdAt: string;
   approvedAt?: string;
   revokedAt?: string;
@@ -104,6 +113,11 @@ export interface McpConnectionStore {
   getByRefreshTokenHash(
     refreshTokenHash: string,
   ): Promise<McpConnectionRecord | null>;
+  /** Atomically replace one connection from its latest stored value. */
+  mutate(
+    id: string,
+    update: (record: McpConnectionRecord) => McpConnectionRecord,
+  ): Promise<McpConnectionRecord | null>;
   update(
     id: string,
     patch: Partial<
@@ -121,6 +135,7 @@ export interface McpConnectionStore {
         | "refreshTokenHash"
         | "previousRefreshTokenHash"
         | "refreshExpiresAt"
+        | "scopeAccessRequest"
       >
     >,
   ): Promise<McpConnectionRecord | null>;

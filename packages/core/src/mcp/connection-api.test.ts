@@ -22,6 +22,7 @@ import {
   McpConnectionStateError,
   redeemMcpOAuthAuthorizationCode,
   refreshMcpOAuthToken,
+  requestMcpScopeAccess,
   revokeMcpConnection,
 } from "./connection-api.js";
 import { MCP_REFRESH_TTL_MS, MCP_TOKEN_TTL_MS } from "./token-expiry.js";
@@ -188,6 +189,119 @@ describe("mcp/connection-api", () => {
     expect(view.granteeAddress).toBe(created.granteeAddress);
     expect("encryptedGranteePrivateKey" in view).toBe(false);
     expect("tokenHash" in view).toBe(false);
+  });
+
+  it("persists an owner-reviewable scope request and clears fulfilled scopes on widening", async () => {
+    const store = createInMemoryMcpConnectionStore();
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store, publicOrigin: PUBLIC_ORIGIN },
+    );
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "g1", scopes: ["instagram.profile"] }],
+      },
+      { store },
+    );
+
+    await requestMcpScopeAccess(
+      {
+        connectionId: created.connectionId,
+        scopes: ["chatgpt.history", "spotify.profile"],
+        reason: "Answer from prior chats and music.",
+      },
+      { store, now: () => new Date("2026-09-17T20:30:00.000Z") },
+    );
+    expect(
+      (await listMcpConnectionViews(store))[0]?.scopeAccessRequest,
+    ).toEqual({
+      scopes: ["chatgpt.history", "spotify.profile"],
+      reason: "Answer from prior chats and music.",
+      requestedAt: "2026-09-17T20:30:00.000Z",
+    });
+
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [
+          { grantId: "g1", scopes: ["instagram.profile"] },
+          { grantId: "g2", scopes: ["chatgpt.*"] },
+        ],
+      },
+      { store },
+    );
+    expect(
+      (await listMcpConnectionViews(store))[0]?.scopeAccessRequest,
+    ).toEqual({
+      scopes: ["spotify.profile"],
+      reason: "Answer from prior chats and music.",
+      requestedAt: "2026-09-17T20:30:00.000Z",
+    });
+
+    await requestMcpScopeAccess(
+      {
+        connectionId: created.connectionId,
+        scopes: ["chatgpt.history", "github.profile"],
+      },
+      { store, now: () => new Date("2026-09-17T20:31:00.000Z") },
+    );
+    expect(
+      (await listMcpConnectionViews(store))[0]?.scopeAccessRequest,
+    ).toEqual({
+      scopes: ["github.profile", "spotify.profile"],
+      reason: "Answer from prior chats and music.",
+      requestedAt: "2026-09-17T20:31:00.000Z",
+    });
+
+    await revokeMcpConnection(created.connectionId, { store });
+    await expect(
+      requestMcpScopeAccess(
+        { connectionId: created.connectionId, scopes: ["github.repositories"] },
+        { store },
+      ),
+    ).rejects.toBeInstanceOf(McpConnectionStateError);
+  });
+
+  it("keeps the existing request unchanged when the aggregate scope limit would be exceeded", async () => {
+    const store = createInMemoryMcpConnectionStore();
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store, publicOrigin: PUBLIC_ORIGIN },
+    );
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "g1", scopes: ["instagram.profile"] }],
+      },
+      { store },
+    );
+    const firstScopes = Array.from(
+      { length: 20 },
+      (_, index) => `source.scope-${String(index).padStart(2, "0")}`,
+    );
+    await expect(
+      requestMcpScopeAccess(
+        { connectionId: created.connectionId, scopes: firstScopes },
+        { store },
+      ),
+    ).resolves.toMatchObject({
+      requestRecorded: true,
+      connection: { scopeAccessRequest: { scopes: firstScopes } },
+    });
+
+    await expect(
+      requestMcpScopeAccess(
+        {
+          connectionId: created.connectionId,
+          scopes: ["source.scope-overflow"],
+        },
+        { store },
+      ),
+    ).resolves.toMatchObject({ requestRecorded: false });
+    expect(
+      (await store.getById(created.connectionId))?.scopeAccessRequest,
+    ).toMatchObject({ scopes: firstScopes });
   });
 
   it("buildMcpUrl trims trailing slash on origin", () => {

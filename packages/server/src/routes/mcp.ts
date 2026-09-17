@@ -53,6 +53,7 @@ import {
   McpOAuthAuthorizationError,
   redeemMcpOAuthAuthorizationCode,
   refreshMcpOAuthToken,
+  requestMcpScopeAccess,
   toMcpOAuthAuthorizationView,
   revokeMcpConnection,
   toMcpConnectionView,
@@ -815,6 +816,12 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       connection: record,
       readClient,
       activityRecorder: deps.activityRecorder,
+      requestScopeAccess: async (input) => {
+        return requestMcpScopeAccess(
+          { connectionId: record.id, ...input },
+          { store },
+        );
+      },
     });
     void store
       .update(record.id, { lastUsedAt: new Date().toISOString() })

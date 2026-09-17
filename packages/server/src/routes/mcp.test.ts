@@ -51,6 +51,7 @@ import { createIndexManager } from "../storage/index-manager.js";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import { dataRoutes } from "./data.js";
 import {
+  executeMcpConnectionRequest,
   mcpConnectionsRoutes,
   mcpOAuthRoutes,
   mcpStreamableHttpRoutes,
@@ -378,7 +379,165 @@ describe("MCP /mcp/:token route", () => {
         oauthApprovalUrl: "https://app-dev.vana.org/mcp/connect/claude",
       }),
     );
+    root.route(
+      "/v1/mcp/connections",
+      mcpConnectionsRoutes({
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway,
+        gatewayConfig,
+        serverSigner: {
+          signGrantRegistration: vi
+            .fn()
+            .mockResolvedValue("0xgrantsig" as `0x${string}`),
+        },
+        accessLogWriter: createMockAccessLogWriter(),
+        connectionStore: store,
+      }),
+    );
     app = root;
+  });
+
+  it("records a scope request for owner review and clears it after widening", async () => {
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store, publicOrigin: SERVER_ORIGIN },
+    );
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "grant-1", scopes: ["instagram.profile"] }],
+      },
+      { store },
+    );
+
+    const request = await app.request(
+      `/mcp/${encodeURIComponent(created.connectionToken)}`,
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json, text/event-stream",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: "scope-request",
+          method: "tools/call",
+          params: {
+            name: "request_scope_access",
+            arguments: {
+              scopes: ["chatgpt.history"],
+              reason: "Answer from prior chats.",
+            },
+          },
+        }),
+      },
+    );
+    expect(request.status).toBe(200);
+    const toolPayload = JSON.parse(
+      (await request.json()).result.content[0].text,
+    );
+    expect(toolPayload).toMatchObject({
+      missingScopes: ["chatgpt.history"],
+      requestRecorded: true,
+    });
+
+    const listPath = "/v1/mcp/connections";
+    const listAuth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: listPath,
+    });
+    const list = await app.request(listPath, {
+      headers: { Authorization: listAuth },
+    });
+    expect((await list.json()).connections[0].scopeAccessRequest).toMatchObject(
+      {
+        scopes: ["chatgpt.history"],
+        reason: "Answer from prior chats.",
+      },
+    );
+
+    const approvePath = `/v1/mcp/connections/${created.connectionId}/approve`;
+    const approveBody = JSON.stringify({
+      grants: [
+        { grantId: "grant-1", scopes: ["instagram.profile"] },
+        { grantId: "grant-2", scopes: ["chatgpt.history"] },
+      ],
+    });
+    const approveAuth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "POST",
+      uri: approvePath,
+      body: new TextEncoder().encode(approveBody),
+    });
+    const widened = await app.request(approvePath, {
+      method: "POST",
+      headers: {
+        Authorization: approveAuth,
+        "Content-Type": "application/json",
+      },
+      body: approveBody,
+    });
+    expect(widened.status).toBe(200);
+    expect((await widened.json()).scopeAccessRequest).toBeUndefined();
+  });
+
+  it("reports a controller-recorded TEE scope request without retrying sandbox persistence", async () => {
+    const created = await createMcpConnection(
+      { displayName: "TEE Claude" },
+      { store, publicOrigin: SERVER_ORIGIN },
+    );
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "grant-1", scopes: ["instagram.profile"] }],
+      },
+      { store },
+    );
+    const connection = await store.getById(created.connectionId);
+    expect(connection).not.toBeNull();
+    const response = await executeMcpConnectionRequest(
+      new Request("https://worker.local/mcp", {
+        method: "POST",
+        headers: {
+          Accept: "application/json, text/event-stream",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: "scope-request",
+          method: "tools/call",
+          params: {
+            name: "request_scope_access",
+            arguments: { scopes: ["chatgpt.history"] },
+          },
+        }),
+      }),
+      {
+        ...connection!,
+        scopeAccessRequest: {
+          scopes: ["chatgpt.history"],
+          requestedAt: "2026-09-17T20:30:00.000Z",
+        },
+      },
+      {
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway,
+        accessLogWriter: createMockAccessLogWriter(),
+        connectionStore: createInMemoryMcpConnectionStore(),
+        indexManager: createIndexManager(initializeDatabase(":memory:")),
+        hierarchyOptions: { dataDir: "/tmp" },
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain('"requestRecorded":true');
   });
 
   it("returns OAuth discovery challenge on stable /mcp without bearer token", async () => {

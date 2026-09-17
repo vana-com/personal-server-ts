@@ -457,6 +457,12 @@ export async function openMcpDurableState(options: {
               matchesMcpRefreshHash(record, hash),
             ) ?? null,
         ),
+      mutate: (id, update) =>
+        mutate((draft) => {
+          const record = draft.connections[id];
+          if (!record) return null;
+          return (draft.connections[id] = update(structuredClone(record)));
+        }),
       update: (id, patch) =>
         mutate((draft) => {
           const record = draft.connections[id];

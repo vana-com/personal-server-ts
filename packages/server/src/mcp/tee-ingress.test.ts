@@ -595,6 +595,47 @@ describe("TEE MCP ingress", () => {
     expect(dispatch).toHaveBeenCalledTimes(1);
     // Reading the body to classify it must leave the dispatched one readable.
     expect(await dispatch.mock.calls[0][0].json()).toEqual(fellThrough);
+
+    const scopeRequest = {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: {
+        name: "request_scope_access",
+        arguments: {
+          scopes: ["chatgpt.history", "chatgpt.history"],
+          reason: "  Answer from prior chats.  ",
+        },
+      },
+    };
+    await app.fetch(post(scopeRequest));
+    expect(
+      (await state.connections.getById("connection-1"))?.scopeAccessRequest,
+    ).toEqual({
+      scopes: ["chatgpt.history"],
+      reason: "Answer from prior chats.",
+      requestedAt: expect.any(String),
+    });
+    expect(dispatch.mock.calls[1]?.[1]).toMatchObject({
+      scopeAccessRequest: { scopes: ["chatgpt.history"] },
+    });
+    expect(await dispatch.mock.calls[1][0].json()).toEqual(scopeRequest);
+
+    const malformed = {
+      ...scopeRequest,
+      id: 5,
+      params: {
+        ...scopeRequest.params,
+        arguments: { scopes: [42] },
+      },
+    };
+    await app.fetch(post(malformed));
+    expect(dispatch.mock.calls[2]?.[1]).toMatchObject({
+      scopeAccessRequest: { scopes: ["chatgpt.history"] },
+    });
+    expect(
+      (await state.connections.getById("connection-1"))?.scopeAccessRequest,
+    ).toMatchObject({ scopes: ["chatgpt.history"] });
     expect((await app.fetch(post(initialize, "unknown"))).status).toBe(401);
   });
 
