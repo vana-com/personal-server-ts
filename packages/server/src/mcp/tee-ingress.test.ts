@@ -632,17 +632,18 @@ describe("TEE MCP ingress", () => {
       await seed("mine-1", owner.address);
       await seed("theirs-1", stranger.address);
       await seed("unbound-1");
+      const verifyGrants = vi.fn();
       const app = createTeeMcpIngress({
         state,
         origin,
         approvalUrl: "https://vana.example/mcp",
         allowedRedirectUris: ["https://claude.ai/api/mcp/auth_callback"],
         gateway: {} as never,
-        verifyGrants: vi.fn(),
+        verifyGrants,
         registerGrantee: vi.fn(),
         dispatch: vi.fn(),
       });
-      return { app, state };
+      return { app, state, verifyGrants };
     }
 
     const claim = (method: string, uri: string, lifetimeSeconds?: number) => {
@@ -664,7 +665,8 @@ describe("TEE MCP ingress", () => {
       });
 
       expect(listed.status).toBe(200);
-      const { connections } = await listed.json();
+      const { capabilities, connections } = await listed.json();
+      expect(capabilities).toEqual({ widen: true });
       // An unbound connection belongs to nobody; a bound one only to its owner.
       expect(connections).toEqual([
         {
@@ -676,6 +678,73 @@ describe("TEE MCP ingress", () => {
           createdAt: expect.any(String),
         },
       ]);
+    });
+
+    it("widens the owner's approved connection after verifying every grant", async () => {
+      const { app, state, verifyGrants } = await sharedIngress();
+      const uri = `${path}/mine-1/approve`;
+      const grants = [
+        { grantId: "0xabc", scopes: ["spotify.profile"] },
+        { grantId: "0xdef", scopes: ["chatgpt.conversations"] },
+      ];
+      const body = JSON.stringify({ grants });
+      const authorization = await buildWeb3SignedHeader({
+        wallet: owner,
+        aud: origin,
+        method: "POST",
+        uri,
+        body: new TextEncoder().encode(body),
+      });
+
+      const widened = await app.request(uri, {
+        method: "POST",
+        headers: {
+          authorization,
+          "content-type": "application/json",
+        },
+        body,
+      });
+
+      expect(widened.status).toBe(200);
+      expect((await widened.json()).grants).toEqual(grants);
+      expect((await state.connections.getById("mine-1"))?.grants).toEqual(
+        grants,
+      );
+      expect(verifyGrants).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "mine-1" }),
+        { owner: owner.address, chainId: 14800 },
+        grants,
+      );
+    });
+
+    it("refuses a replacement that drops an existing grant", async () => {
+      const { app, state, verifyGrants } = await sharedIngress();
+      const uri = `${path}/mine-1/approve`;
+      const body = JSON.stringify({
+        grants: [{ grantId: "0xdef", scopes: ["chatgpt.conversations"] }],
+      });
+      const authorization = await buildWeb3SignedHeader({
+        wallet: owner,
+        aud: origin,
+        method: "POST",
+        uri,
+        body: new TextEncoder().encode(body),
+      });
+
+      const response = await app.request(uri, {
+        method: "POST",
+        headers: {
+          authorization,
+          "content-type": "application/json",
+        },
+        body,
+      });
+
+      expect(response.status).toBe(400);
+      expect((await state.connections.getById("mine-1"))?.grants).toEqual([
+        { grantId: "0xabc", scopes: ["spotify.profile"] },
+      ]);
+      expect(verifyGrants).not.toHaveBeenCalled();
     });
 
     it("refuses an unsigned request and a long-lived claim", async () => {

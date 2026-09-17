@@ -4,6 +4,7 @@ import { cors } from "hono/cors";
 import { isAddress, type Address } from "viem";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import {
+  approveMcpConnection,
   approveMcpOAuthAuthorization,
   handleMcpHandshake,
   hashConnectionToken,
@@ -130,7 +131,46 @@ export function createTeeMcpIngress(deps: TeeMcpIngressDeps): Hono {
     const owner = await authorizeOwner(c, deps.origin);
     if (owner instanceof Response) return owner;
     const owned = await state.ownerConnections(owner);
-    return c.json({ connections: owned.map(toMcpConnectionView) });
+    return c.json({
+      capabilities: { widen: true },
+      connections: owned.map(toMcpConnectionView),
+    });
+  });
+  app.post("/v1/mcp/connections/:id/approve", async (c) => {
+    const owner = await authorizeOwner(c, deps.origin);
+    if (owner instanceof Response) return owner;
+
+    return state.exclusive(async () => {
+      let body: { grants?: unknown };
+      try {
+        body = await c.req.json();
+      } catch {
+        return c.json({ error: "Invalid JSON" }, 400);
+      }
+      if (!isGrantList(body.grants))
+        return c.json({ error: "Grants required" }, 400);
+
+      const id = c.req.param("id");
+      const binding = await state.getOwner(id);
+      const connection = await state.connections.getById(id);
+      if (!binding || !connection || !isSameOwner(binding.owner, owner))
+        return c.json({ error: "Connection not found" }, 404);
+      if (connection.status !== "approved")
+        return c.json({ error: "Connection is not approved" }, 409);
+      if (!includesGrants(body.grants, connection.grants))
+        return c.json({ error: "Existing grants required" }, 400);
+
+      try {
+        await deps.verifyGrants(connection, binding, body.grants);
+      } catch {
+        return c.json({ error: "Owner grant verification failed" }, 403);
+      }
+      const approved = await approveMcpConnection(
+        { connectionId: id, grants: body.grants },
+        { store: state.connections },
+      );
+      return c.json(toMcpConnectionView(approved));
+    });
   });
   app.delete("/v1/mcp/connections/:id", async (c) => {
     const owner = await authorizeOwner(c, deps.origin);
@@ -332,6 +372,40 @@ async function authorizeOwner(
 
 function isSameOwner(left: Address, right: Address): boolean {
   return left.toLowerCase() === right.toLowerCase();
+}
+
+function isGrantList(value: unknown): value is McpConnectionGrant[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every(
+      (grant) =>
+        grant &&
+        typeof grant === "object" &&
+        typeof grant.grantId === "string" &&
+        grant.grantId.length > 0 &&
+        Array.isArray(grant.scopes) &&
+        grant.scopes.length > 0 &&
+        grant.scopes.every(
+          (scope: unknown) => typeof scope === "string" && scope.length > 0,
+        ),
+    )
+  );
+}
+
+/** Widening may append grants or scopes, never silently remove prior access. */
+function includesGrants(
+  next: McpConnectionGrant[],
+  current: McpConnectionGrant[],
+): boolean {
+  return current.every((existing) =>
+    existing.scopes.every((scope) =>
+      next.some(
+        (grant) =>
+          grant.grantId === existing.grantId && grant.scopes.includes(scope),
+      ),
+    ),
+  );
 }
 
 function jsonError(status: number, body: Record<string, string>): Response {
