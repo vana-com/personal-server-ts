@@ -47,6 +47,7 @@ import {
   openPdppAuthStore,
   PdppTokenService,
   PDPP_DATA_ACCESS_TYPE,
+  computeS256Challenge,
   type DeclarationSnapshot,
   type PdppAuthStore,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
@@ -115,6 +116,16 @@ const SEEDED_PLAYLISTS = [
 
 /** The three records inside the grant window, newest-first (default order). */
 const IN_WINDOW_DESC = ["pl_5", "pl_3", "pl_1"];
+
+/**
+ * PKCE (RFC 7636) is mandatory on this AS: PDPP clients are public clients,
+ * so an intercepted authorization code must be useless without the verifier.
+ * The journey uses a real verifier and a real S256 challenge rather than a
+ * stub, so it exercises the AS's actual binding check at redemption.
+ */
+const CODE_VERIFIER =
+  "journey-verifier-0123456789abcdefghijklmnopqrstuvwxyz-ABCDEFG";
+const CODE_CHALLENGE = computeS256Challenge(CODE_VERIFIER);
 
 function createMockGateway(): GatewayClient {
   return {
@@ -360,6 +371,8 @@ describe("PDPP integrated journey (real AS + real RS in one app)", () => {
         client_id: CLIENT_ID,
         redirect_uri: REDIRECT_URI,
         client_display: { name: "Example App" },
+        code_challenge: CODE_CHALLENGE,
+        code_challenge_method: "S256",
         authorization_details: [
           {
             type: PDPP_DATA_ACCESS_TYPE,
@@ -417,6 +430,7 @@ describe("PDPP integrated journey (real AS + real RS in one app)", () => {
         code: code!,
         client_id: CLIENT_ID,
         redirect_uri: REDIRECT_URI,
+        code_verifier: CODE_VERIFIER,
       }).toString(),
     });
     expect(tokenRes.status).toBe(200);
@@ -632,6 +646,8 @@ describe("PDPP integrated journey (real AS + real RS in one app)", () => {
         client_id: CLIENT_ID,
         redirect_uri: REDIRECT_URI,
         client_display: { name: "Example App" },
+        code_challenge: CODE_CHALLENGE,
+        code_challenge_method: "S256",
         authorization_details: [
           {
             type: PDPP_DATA_ACCESS_TYPE,
@@ -678,6 +694,7 @@ describe("PDPP integrated journey (real AS + real RS in one app)", () => {
         code: code!,
         client_id: CLIENT_ID,
         redirect_uri: REDIRECT_URI,
+        code_verifier: CODE_VERIFIER,
       }).toString(),
     });
     const { access_token: accessToken } = await tokenRes.json();
@@ -701,6 +718,78 @@ describe("PDPP integrated journey (real AS + real RS in one app)", () => {
       created_at: "2026-04-05T00:00:00.000Z",
     });
     expect(body.data[0].data.owner_email).toBeUndefined();
+  });
+
+  /**
+   * PKCE must actually bind the code to the requesting client, not merely be
+   * accepted as a parameter. This drives the real flow up to a valid
+   * authorization code, then redeems it with the WRONG verifier: the AS must
+   * refuse, and no token may be issued. Without this, the happy-path PKCE
+   * assertions above would pass even if the AS ignored the verifier entirely.
+   */
+  it("refuses to redeem an authorization code with the wrong PKCE verifier", async () => {
+    const { app, ownerToken } = harness;
+    const ownerAuth = { Authorization: `Bearer ${ownerToken}` };
+
+    const authorizeRes = await app.request("/pdpp/v1/authorize", {
+      method: "POST",
+      headers: { ...ownerAuth, "content-type": "application/json" },
+      body: JSON.stringify({
+        client_id: CLIENT_ID,
+        redirect_uri: REDIRECT_URI,
+        client_display: { name: "Example App" },
+        code_challenge: CODE_CHALLENGE,
+        code_challenge_method: "S256",
+        authorization_details: [
+          {
+            type: PDPP_DATA_ACCESS_TYPE,
+            source: { id: SOURCE_ID },
+            purpose_code: "https://pdpp.dev/purpose/personalization",
+            access_mode: "continuous",
+            streams: [{ name: "playlists", fields: ["name"] }],
+          },
+        ],
+      }),
+    });
+    expect(authorizeRes.status).toBe(201);
+    const { session_id: sessionId } = await authorizeRes.json();
+
+    const reviewRes = await app.request(
+      `/pdpp/v1/authorize/${sessionId}/review`,
+      { headers: ownerAuth },
+    );
+    const review = (await reviewRes.json()).review;
+
+    const approveRes = await app.request(
+      `/pdpp/v1/authorize/${sessionId}/approve`,
+      {
+        method: "POST",
+        headers: { ...ownerAuth, "content-type": "application/json" },
+        body: JSON.stringify({ review_digest: review.review_digest }),
+      },
+    );
+    expect(approveRes.status).toBe(200);
+    const code = new URL(
+      (await approveRes.json()).redirect_uri,
+    ).searchParams.get("code");
+    expect(code).toBeTruthy();
+
+    // A real, unexpired, unredeemed code — but the wrong verifier. This is
+    // the intercepted-code case PKCE exists to stop.
+    const tokenRes = await app.request("/pdpp/v1/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: code!,
+        client_id: CLIENT_ID,
+        redirect_uri: REDIRECT_URI,
+        code_verifier: `${CODE_VERIFIER}-tampered`,
+      }).toString(),
+    });
+    expect(tokenRes.status).toBe(400);
+    const body = await tokenRes.json();
+    expect(body.access_token).toBeUndefined();
   });
 
   it("refuses a stream the grant does not cover", async () => {
