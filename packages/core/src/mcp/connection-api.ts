@@ -28,9 +28,11 @@ import type {
   McpConnectionRecord,
   McpConnectionStore,
   McpConnectionGrant,
+  McpScopeAccessRequest,
   McpOAuthAuthorizationRecord,
   McpOAuthAuthorizationStore,
 } from "./types.js";
+import { MCP_SCOPE_ACCESS_REQUEST_LIMIT } from "./types.js";
 import {
   isMcpRefreshExpired,
   MCP_TOKEN_TTL_MS,
@@ -203,28 +205,102 @@ export async function approveMcpConnection(
   input: ApproveMcpConnectionInput,
   options: ApproveMcpConnectionOptions,
 ): Promise<McpConnectionRecord> {
-  const existing = await options.store.getById(input.connectionId);
-  if (!existing) throw new McpConnectionNotFoundError(input.connectionId);
-  if (existing.status === "revoked") {
-    throw new McpConnectionStateError(
-      input.connectionId,
-      existing.status,
-      "pending or approved",
-    );
-  }
   if (!input.grants.length) {
     throw new Error(
       "approveMcpConnection requires at least one grant; the consent flow must mint grants first",
     );
   }
   const approvedAt = nowIso(options.now);
-  const updated = await options.store.update(input.connectionId, {
-    status: "approved",
-    grants: input.grants,
-    approvedAt,
+  const updated = await options.store.mutate(input.connectionId, (existing) => {
+    if (existing.status === "revoked") {
+      throw new McpConnectionStateError(
+        input.connectionId,
+        existing.status,
+        "pending or approved",
+      );
+    }
+    const pendingRequest = existing.scopeAccessRequest;
+    const remainingRequestScopes = pendingRequest?.scopes.filter(
+      (scope) => !input.grants.some((grant) => grantCoversScope(grant, scope)),
+    );
+    return {
+      ...existing,
+      status: "approved",
+      grants: input.grants,
+      approvedAt,
+      scopeAccessRequest:
+        pendingRequest &&
+        remainingRequestScopes &&
+        remainingRequestScopes.length > 0
+          ? { ...pendingRequest, scopes: remainingRequestScopes }
+          : undefined,
+    };
   });
   if (!updated) throw new McpConnectionNotFoundError(input.connectionId);
   return updated;
+}
+
+function grantCoversScope(grant: McpConnectionGrant, scope: string): boolean {
+  return grant.scopes.some(
+    (granted) =>
+      granted === "*" ||
+      granted === scope ||
+      (granted.endsWith(".*") && scope.startsWith(granted.slice(0, -1))),
+  );
+}
+
+export async function requestMcpScopeAccess(
+  input: { connectionId: string; scopes: string[]; reason?: string },
+  options: { store: McpConnectionStore; now?: () => Date },
+): Promise<{
+  connection: McpConnectionRecord;
+  requestRecorded: boolean;
+}> {
+  const requestedAt = nowIso(options.now);
+  const inputScopes = Array.from(
+    new Set(input.scopes.map((scope) => scope.trim()).filter(Boolean)),
+  ).sort();
+  const updated = await options.store.mutate(input.connectionId, (existing) => {
+    if (existing.status !== "approved") {
+      throw new McpConnectionStateError(
+        input.connectionId,
+        existing.status,
+        "approved",
+      );
+    }
+    const scopes = Array.from(
+      new Set(
+        [...(existing.scopeAccessRequest?.scopes ?? []), ...inputScopes]
+          .map((scope) => scope.trim())
+          .filter(
+            (scope) =>
+              scope.length > 0 &&
+              !existing.grants.some((grant) => grantCoversScope(grant, scope)),
+          ),
+      ),
+    ).sort();
+    if (scopes.length === 0) return existing;
+    if (scopes.length > MCP_SCOPE_ACCESS_REQUEST_LIMIT) return existing;
+    const reason = input.reason?.trim() || existing.scopeAccessRequest?.reason;
+    const request: McpScopeAccessRequest = {
+      scopes,
+      ...(reason ? { reason } : {}),
+      requestedAt,
+    };
+    return { ...existing, scopeAccessRequest: request };
+  });
+  if (!updated) throw new McpConnectionNotFoundError(input.connectionId);
+  const missingInputScopes = inputScopes.filter(
+    (scope) => !updated.grants.some((grant) => grantCoversScope(grant, scope)),
+  );
+  return {
+    connection: updated,
+    requestRecorded:
+      missingInputScopes.length > 0 &&
+      missingInputScopes.every((scope) =>
+        updated.scopeAccessRequest?.scopes.includes(scope),
+      ),
+  };
 }
 
 export interface RevokeMcpConnectionOptions {
@@ -261,6 +337,7 @@ export interface McpConnectionView {
   granteeAddress: `0x${string}`;
   status: "pending" | "approved" | "revoked";
   grants: McpConnectionGrant[];
+  scopeAccessRequest?: McpScopeAccessRequest;
   createdAt: string;
   approvedAt?: string;
   revokedAt?: string;
@@ -276,6 +353,7 @@ export function toMcpConnectionView(
     granteeAddress: record.granteeAddress,
     status: record.status,
     grants: record.grants,
+    scopeAccessRequest: record.scopeAccessRequest,
     createdAt: record.createdAt,
     approvedAt: record.approvedAt,
     revokedAt: record.revokedAt,

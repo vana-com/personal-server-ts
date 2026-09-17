@@ -279,6 +279,17 @@ describe("mcp/tools", () => {
   });
 
   it("request_scope_access reports missing scopes without granting access", async () => {
+    const connection = createConnection();
+    const requestScopeAccess = vi.fn().mockResolvedValue({
+      connection: {
+        ...connection,
+        scopeAccessRequest: {
+          scopes: ["chatgpt.conversations"],
+          requestedAt: "2026-09-17T20:30:00.000Z",
+        },
+      },
+      requestRecorded: true,
+    });
     const result = await getTool("request_scope_access").handler(
       {
         scopes: [
@@ -289,8 +300,9 @@ describe("mcp/tools", () => {
         reason: "Use ChatGPT history for the requested analysis.",
       },
       {
-        connection: createConnection(),
+        connection,
         readClient: createMinimalReadClient(),
+        requestScopeAccess,
       },
     );
 
@@ -309,20 +321,27 @@ describe("mcp/tools", () => {
       ],
       grantedRequestedScopes: ["instagram.profile", "chatgpt.history"],
       missingScopes: ["chatgpt.conversations"],
-      nextAction: expect.stringContaining("cannot grant access by itself"),
+      requestRecorded: true,
+      nextAction: expect.stringContaining("owner approval"),
     });
     expect(result.structuredContent).toMatchObject({
       approvalRequired: true,
       missingScopes: ["chatgpt.conversations"],
     });
+    expect(requestScopeAccess).toHaveBeenCalledWith({
+      scopes: ["chatgpt.conversations"],
+      reason: "Use ChatGPT history for the requested analysis.",
+    });
   });
 
   it("request_scope_access reports when requested scopes are already granted", async () => {
+    const requestScopeAccess = vi.fn();
     const result = await getTool("request_scope_access").handler(
       { scopes: ["instagram.profile", "chatgpt.history"] },
       {
         connection: createConnection(),
         readClient: createMinimalReadClient(),
+        requestScopeAccess,
       },
     );
 
@@ -331,6 +350,63 @@ describe("mcp/tools", () => {
       approvalRequired: false,
       missingScopes: [],
       grantedRequestedScopes: ["instagram.profile", "chatgpt.history"],
+      requestRecorded: false,
+      nextAction: "No new grant is needed for the requested scopes.",
+    });
+    expect(requestScopeAccess).not.toHaveBeenCalled();
+  });
+
+  it("request_scope_access reports when a bounded request could not be recorded", async () => {
+    const connection = createConnection();
+    const result = await getTool("request_scope_access").handler(
+      { scopes: ["chatgpt.conversations"] },
+      {
+        connection,
+        readClient: createMinimalReadClient(),
+        requestScopeAccess: vi.fn().mockResolvedValue({
+          connection,
+          requestRecorded: false,
+        }),
+      },
+    );
+
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      approvalRequired: true,
+      requestRecorded: false,
+      nextAction: expect.stringContaining("open Vana's Personal Server page"),
+    });
+  });
+
+  it("request_scope_access reports a scope granted during persistence as available", async () => {
+    const connection = createConnection();
+    const widened = {
+      ...connection,
+      grants: [
+        ...connection.grants,
+        { grantId: "grant-3", scopes: ["chatgpt.conversations"] },
+      ],
+      scopeAccessRequest: {
+        scopes: ["spotify.profile"],
+        requestedAt: "2026-09-17T20:29:00.000Z",
+      },
+    };
+    const result = await getTool("request_scope_access").handler(
+      { scopes: ["chatgpt.conversations"] },
+      {
+        connection,
+        readClient: createMinimalReadClient(),
+        requestScopeAccess: vi.fn().mockResolvedValue({
+          connection: widened,
+          requestRecorded: false,
+        }),
+      },
+    );
+
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      approvalRequired: false,
+      grantedRequestedScopes: ["chatgpt.conversations"],
+      missingScopes: [],
+      requestRecorded: false,
       nextAction: "No new grant is needed for the requested scopes.",
     });
   });

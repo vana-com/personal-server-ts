@@ -57,6 +57,18 @@ export function createInMemoryMcpConnectionStore(): McpConnectionStore {
       return record ? { ...record } : null;
     },
 
+    async mutate(id, update) {
+      const record = byId.get(id);
+      if (!record) return null;
+      const updated = update(structuredClone(record));
+      if (updated.tokenHash !== record.tokenHash) {
+        byTokenHash.delete(record.tokenHash);
+        byTokenHash.set(updated.tokenHash, id);
+      }
+      byId.set(id, structuredClone(updated));
+      return structuredClone(updated);
+    },
+
     async update(id, patch) {
       const record = byId.get(id);
       if (!record) return null;
