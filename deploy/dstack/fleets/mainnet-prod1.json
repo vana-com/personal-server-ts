@@ -25,7 +25,7 @@
       "composeOut": "controller-compose.yml",
       "pinned": {
         "instanceId": "b5399a837ff0456905ffe8c9938002b97c4f6792",
-        "composeHash": "3082a74e8fb4688fa29d04f02f63041934c68de3e1b9b661cfba641b7152bf31"
+        "composeHash": "b52e251261e4b18f63b5a010b05555f945755a8f61a63d2341a256f16b6f9bf4"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -127,5 +127,5 @@
   "fleetShape": {
     "NOTE": "One controller + one worker. The worker-2 replica (39600ebe-9f8a-40ac-8fde-2a585776bac1) was deleted during step 3 so the worker app id has a single live CVM - that is what makes phala api /cvms/<uuid>/attestation unambiguous on this fleet, unlike moksha-prod5. Before adding a second worker, read docs/260915-mainnet-prod1-staging-plan.md section 0a: a shared app id breaks instance-id harvesting."
   },
-  "pinnedFrom": "Harvested live from each CVM by uuid on 2026-09-17, after the #321 roll, and cross-checked against the Gateway admission record. Re-harvest after EVERY roll: render-fleet --write-manifest updates the working copy, not git, so a roll whose manifest is not committed leaves this file describing a fleet that no longer exists - which is how it went two rolls stale."
+  "pinnedFrom": "Re-harvested by uuid after the step43 #322 controller-only roll at source 176c01ab8c0e6144ae0e64fdf0bfa273a25f40b7 (CI Docker run 35239436973); per-uuid staged compose read-back is ground truth. Re-harvest and commit after every roll."
 }
