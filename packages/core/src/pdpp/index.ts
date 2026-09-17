@@ -107,6 +107,14 @@ export type {
 } from "./approval.js";
 
 export {
+  computeS256Challenge,
+  PKCE_METHOD_S256,
+  validateCodeChallenge,
+  verifyCodeVerifier,
+} from "./pkce.js";
+export type { PkceFailure, PkceFailureCode } from "./pkce.js";
+
+export {
   hashToken,
   newOpaqueToken,
   openPdppAuthStore,

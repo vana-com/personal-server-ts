@@ -16,6 +16,7 @@
  * §8 is the RS's positive-result cache, not slack in the AS.
  */
 
+import { verifyCodeVerifier } from "./pkce.js";
 import {
   newOpaqueToken,
   type PdppAuthStore,
@@ -108,6 +109,8 @@ export class PdppTokenService {
     code: string;
     clientId: string;
     redirectUri: string;
+    /** RFC 7636 verifier. Required when the code was issued with a challenge. */
+    codeVerifier?: string;
     now?: Date;
   }): TokenResult {
     const now = input.now ?? new Date();
@@ -145,6 +148,22 @@ export class PdppTokenService {
           code: "invalid_grant",
           message: "redirect_uri does not match the authorization request",
         },
+      };
+    }
+
+    // RFC 7636 §4.6. Checked after the code is burned, like the client and
+    // redirect checks above: an attacker who intercepted the code must not be
+    // able to probe verifiers against a code that stays alive between guesses.
+    // One wrong verifier costs them the code.
+    const pkceFailure = verifyCodeVerifier(
+      input.codeVerifier,
+      record.codeChallenge,
+      record.codeChallengeMethod,
+    );
+    if (pkceFailure) {
+      return {
+        ok: false,
+        failure: { code: "invalid_grant", message: pkceFailure.message },
       };
     }
 

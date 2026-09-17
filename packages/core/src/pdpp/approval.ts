@@ -51,6 +51,9 @@ export interface AuthorizationSession {
   requester: RequesterIdentity;
   redirect_uri: string;
   state_param?: string;
+  /** RFC 7636 challenge, carried to the authorization code minted on approval. */
+  code_challenge?: string;
+  code_challenge_method?: string;
   expires_at: string;
   status: SessionState;
   /** AS-policy grant expiry carried into issuance. */
@@ -92,6 +95,8 @@ export class AuthorizationSessionStore {
     requester: RequesterIdentity;
     redirectUri: string;
     stateParam?: string;
+    codeChallenge?: string;
+    codeChallengeMethod?: string;
     grantExpiresAt?: string;
     streamDescriptions?: Record<string, string>;
     now?: Date;
@@ -105,6 +110,10 @@ export class AuthorizationSessionStore {
       requester: input.requester,
       redirect_uri: input.redirectUri,
       ...(input.stateParam && { state_param: input.stateParam }),
+      ...(input.codeChallenge && { code_challenge: input.codeChallenge }),
+      ...(input.codeChallengeMethod && {
+        code_challenge_method: input.codeChallengeMethod,
+      }),
       expires_at: new Date(
         now.getTime() + REVIEW_SESSION_TTL_SECONDS * 1000,
       ).toISOString(),
@@ -445,8 +454,20 @@ export function approveAuthorization(input: {
   });
 
   if (!issuance.ok) {
+    // `resolution_failed` at APPROVAL time is staleness, not a bad request.
+    // The selection already resolved once — that is how the owner got a review
+    // to approve. If it no longer resolves, the world changed underneath them:
+    // most commonly a second instance was connected while the consent screen
+    // was open, which under §6 means the AS can no longer auto-resolve and the
+    // owner has a new choice to make.
+    //
+    // The distinction is load-bearing for the consent UI: `stale_review` routes
+    // to re-fetch and re-render, so the owner sees the new choice and decides
+    // again; `invalid_request` routes to "report a bug" and strands them. The
+    // canonical §6 drift case must land on the first.
     const code: ApprovalFailureCode =
-      issuance.failure.code === "stale_approval"
+      issuance.failure.code === "stale_approval" ||
+      issuance.failure.code === "resolution_failed"
         ? "stale_review"
         : issuance.failure.code === "ai_training_consent_required"
           ? "ai_training_consent_required"

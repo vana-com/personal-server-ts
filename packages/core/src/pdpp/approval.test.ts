@@ -474,10 +474,12 @@ describe("§7 / §9 AS item 15 — stale approvals are rejected", () => {
     });
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    // Resolution can no longer complete, so this surfaces as a resolution
-    // failure rather than a digest mismatch — either way, no grant is issued.
-    expect(result.failure.code).not.toBe("stale_review");
-    expect(["invalid_request", "stale_review"]).toContain(result.failure.code);
+    // This is the canonical §6 drift case and it MUST classify as staleness.
+    // The consent UI routes `stale_review` to re-fetch-and-re-render, so the
+    // owner sees the new instance choice and decides again; `invalid_request`
+    // would route to "report a bug" and strand them. Found by the consent lane
+    // driving a real adapter against this AS.
+    expect(result.failure.code).toBe("stale_review");
   });
 
   it("rejects approval when the resolved instance silently changed", () => {

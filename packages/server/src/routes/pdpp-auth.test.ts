@@ -16,6 +16,7 @@ import pino from "pino";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   AuthorizationSessionStore,
+  computeS256Challenge,
   openPdppAuthStore,
   PDPP_API_VERSION,
   PDPP_DATA_ACCESS_TYPE,
@@ -30,6 +31,9 @@ const logger = pino({ level: "silent" });
 const OWNER = "user_abc123";
 const OTHER_OWNER = "user_other";
 const REDIRECT = "https://app.example.com/callback";
+/** RFC 7636 §4.1 verifier + its S256 challenge, used by every code flow here. */
+const VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+const CHALLENGE = computeS256Challenge(VERIFIER);
 
 const snapshot: DeclarationSnapshot = {
   source_id: "https://registry.pdpp.dev/connectors/spotify",
@@ -63,6 +67,8 @@ function selectionBody(overrides: Record<string, unknown> = {}) {
     client_id: "music_recommendations",
     redirect_uri: REDIRECT,
     state: "xyz",
+    code_challenge: CHALLENGE,
+    code_challenge_method: "S256",
     client_display: { name: "Concert Finder" },
     authorization_details: [
       {
@@ -185,6 +191,7 @@ describe("the full authorization journey", () => {
       code,
       client_id: "music_recommendations",
       redirect_uri: REDIRECT,
+      code_verifier: VERIFIER,
     });
     expect(tokenResponse.status).toBe(200);
     // §1 of the delivery scope: every token response is no-store.
@@ -321,6 +328,38 @@ describe("staleness (§7 / §9 AS item 15)", () => {
     expect((await response.json()).error).toBe("stale_review");
   });
 
+  it("answers 409 when a SECOND instance connects after review", async () => {
+    // The canonical §6 drift case, and the one a consent UI must be able to
+    // recover from: the owner reviewed a single auto-resolved account, then
+    // connected another before approving. Re-resolution can no longer pick a
+    // handle, and that must surface as staleness (re-fetch and re-prompt) —
+    // not as invalid_request, which routes the UI to a dead end.
+    const { sessionId, ownerToken, digest } = await openSessionAndReview();
+    eligible = ["spotify-account-a", "spotify-account-b"];
+
+    const response = await post(
+      `/pdpp/v1/authorize/${sessionId}/approve`,
+      { review_digest: digest },
+      ownerAuth(ownerToken),
+    );
+    expect(response.status).toBe(409);
+    expect((await response.json()).error).toBe("stale_review");
+
+    // And the recovery path works: re-fetching now offers the choice.
+    const refetched = await app.request(
+      `/pdpp/v1/authorize/${sessionId}/review`,
+      { headers: ownerAuth(ownerToken) },
+    );
+    expect(refetched.status).toBe(200);
+    const body = (await refetched.json()) as {
+      instance_choice_required?: Array<{ candidates: string[] }>;
+    };
+    expect(body.instance_choice_required?.[0].candidates).toEqual([
+      "spotify-account-a",
+      "spotify-account-b",
+    ]);
+  });
+
   it("answers 409 for a digest the owner never saw", async () => {
     const { sessionId, ownerToken } = await openSessionAndReview();
     const response = await post(
@@ -350,6 +389,7 @@ describe("§9 AS item 19 — authorization codes are single-redemption", () => {
       code,
       client_id: "music_recommendations",
       redirect_uri: REDIRECT,
+      code_verifier: VERIFIER,
     };
     expect((await postForm("/pdpp/v1/token", fields)).status).toBe(200);
 
@@ -378,6 +418,7 @@ describe("§9 AS item 20 — refresh reuse burns the family", () => {
         code,
         client_id: "music_recommendations",
         redirect_uri: REDIRECT,
+        code_verifier: VERIFIER,
       })
     ).json()) as { access_token: string; refresh_token: string };
 
@@ -586,6 +627,290 @@ describe("the consent review model the UI renders", () => {
     expect(body.review.data.streams[0].instance_ids).toEqual([
       "spotify-account-a",
     ]);
+  });
+});
+
+describe("RFC 7636 — PKCE binds the code to the requesting client", () => {
+  /** Drive a real flow to an authorization code the attacker would intercept. */
+  async function codeFor(body = selectionBody()) {
+    const { sessionId, ownerToken, digest } = await openSessionAndReview(body);
+    const approved = await post(
+      `/pdpp/v1/authorize/${sessionId}/approve`,
+      { review_digest: digest },
+      ownerAuth(ownerToken),
+    );
+    const { redirect_uri } = (await approved.json()) as {
+      redirect_uri: string;
+    };
+    return new URL(redirect_uri).searchParams.get("code")!;
+  }
+
+  it("rejects an authorization request with no code_challenge", async () => {
+    // Public clients: without a challenge there is nothing to bind the code
+    // to, so an intercepted code would be redeemable by the interceptor.
+    const { code_challenge: _omitted, ...noChallenge } = selectionBody();
+    const response = await post("/pdpp/v1/authorize", noChallenge);
+    expect(response.status).toBe(400);
+  });
+
+  it("rejects the plain challenge method", async () => {
+    const body = {
+      ...selectionBody(),
+      code_challenge: CHALLENGE,
+      code_challenge_method: "plain",
+    };
+    const response = await post("/pdpp/v1/authorize", body);
+    expect(response.status).toBe(400);
+    expect((await response.json()).error_description).toContain("S256");
+  });
+
+  it("rejects an omitted method rather than defaulting to plain", async () => {
+    const body = {
+      ...selectionBody(),
+      code_challenge: CHALLENGE,
+      code_challenge_method: undefined,
+    };
+    const response = await post("/pdpp/v1/authorize", body);
+    expect(response.status).toBe(400);
+  });
+
+  it("fails PKCE before the owner is asked to consent", async () => {
+    // A client whose flow is unusable should learn that before a human makes
+    // a decision that will be thrown away.
+    const { code_challenge: _dropped, ...noChallenge } = selectionBody();
+    const response = await post("/pdpp/v1/authorize", noChallenge);
+    expect(response.status).toBe(400);
+    // No session was opened, so nothing can be reviewed or approved.
+    const body = (await response.json()) as { session_id?: string };
+    expect(body.session_id).toBeUndefined();
+  });
+
+  it("redeems with the correct verifier", async () => {
+    const code = await codeFor();
+    const response = await postForm("/pdpp/v1/token", {
+      grant_type: "authorization_code",
+      code,
+      client_id: "music_recommendations",
+      redirect_uri: REDIRECT,
+      code_verifier: VERIFIER,
+    });
+    expect(response.status).toBe(200);
+  });
+
+  it("REJECTS a stolen code redeemed with NO verifier", async () => {
+    // The core attack PKCE exists to stop.
+    const code = await codeFor();
+    const response = await postForm("/pdpp/v1/token", {
+      grant_type: "authorization_code",
+      code,
+      client_id: "music_recommendations",
+      redirect_uri: REDIRECT,
+    });
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toBe("invalid_grant");
+  });
+
+  it("REJECTS a stolen code redeemed with a WRONG verifier", async () => {
+    const code = await codeFor();
+    const response = await postForm("/pdpp/v1/token", {
+      grant_type: "authorization_code",
+      code,
+      client_id: "music_recommendations",
+      redirect_uri: REDIRECT,
+      code_verifier: "Z".repeat(43),
+    });
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toBe("invalid_grant");
+  });
+
+  it("REJECTS the challenge echoed back as the verifier", async () => {
+    // The challenge is public — it travelled in the authorization request.
+    const code = await codeFor();
+    const response = await postForm("/pdpp/v1/token", {
+      grant_type: "authorization_code",
+      code,
+      client_id: "music_recommendations",
+      redirect_uri: REDIRECT,
+      code_verifier: CHALLENGE,
+    });
+    expect(response.status).toBe(400);
+  });
+
+  it("burns the code on a failed verifier, so guesses cannot be replayed", async () => {
+    // Without this, an attacker holding a stolen code could brute-force the
+    // verifier against a code that stays alive between attempts.
+    const code = await codeFor();
+
+    const wrongGuess = await postForm("/pdpp/v1/token", {
+      grant_type: "authorization_code",
+      code,
+      client_id: "music_recommendations",
+      redirect_uri: REDIRECT,
+      code_verifier: "Q".repeat(43),
+    });
+    expect(wrongGuess.status).toBe(400);
+
+    // Even the legitimate client, with the real verifier, now gets nothing.
+    const withRealVerifier = await postForm("/pdpp/v1/token", {
+      grant_type: "authorization_code",
+      code,
+      client_id: "music_recommendations",
+      redirect_uri: REDIRECT,
+      code_verifier: VERIFIER,
+    });
+    expect(withRealVerifier.status).toBe(400);
+  });
+
+  it("issues no token on any rejected redemption", async () => {
+    const code = await codeFor();
+    await postForm("/pdpp/v1/token", {
+      grant_type: "authorization_code",
+      code,
+      client_id: "music_recommendations",
+      redirect_uri: REDIRECT,
+      code_verifier: "Z".repeat(43),
+    });
+
+    // Nothing was minted: the grant has no live client token to introspect.
+    const ownerToken = tokens.issueOwnerToken({
+      subjectId: OWNER,
+    }).access_token;
+    const grants = store.listGrantsForSubject(OWNER);
+    expect(grants.length).toBeGreaterThan(0);
+    const anyLive = await postForm(
+      "/pdpp/v1/introspect",
+      { token: "pdpp_at_nothing_was_issued" },
+      ownerAuth(ownerToken),
+    );
+    expect(await anyLive.json()).toEqual({ active: false });
+  });
+
+  it("binds each code to its own challenge across concurrent flows", async () => {
+    // Two flows with different verifiers: neither code may be redeemed with
+    // the other's verifier.
+    const otherVerifier = "a".repeat(43);
+    const otherChallenge = computeS256Challenge(otherVerifier);
+
+    const codeA = await codeFor();
+    const codeB = await codeFor({
+      ...selectionBody(),
+      code_challenge: otherChallenge,
+      code_challenge_method: "S256",
+    });
+
+    const crossed = await postForm("/pdpp/v1/token", {
+      grant_type: "authorization_code",
+      code: codeB,
+      client_id: "music_recommendations",
+      redirect_uri: REDIRECT,
+      code_verifier: VERIFIER,
+    });
+    expect(crossed.status).toBe(400);
+
+    // Each still works with its own verifier.
+    expect(
+      (
+        await postForm("/pdpp/v1/token", {
+          grant_type: "authorization_code",
+          code: codeA,
+          client_id: "music_recommendations",
+          redirect_uri: REDIRECT,
+          code_verifier: VERIFIER,
+        })
+      ).status,
+    ).toBe(200);
+  });
+});
+
+describe("owner-token exchange", () => {
+  it("mints an owner token for a request that passed the owner proof", async () => {
+    // The stubbed `currentSubjectId` stands in for the verified signer the
+    // web3-auth + owner-check middleware chain populates in production.
+    const response = await post("/pdpp/v1/owner/token", {});
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    const issued = (await response.json()) as {
+      access_token: string;
+      token_type: string;
+      expires_in: number;
+    };
+    expect(issued.token_type).toBe("Bearer");
+    // Short-lived: it authorizes consent decisions, not long-term access.
+    expect(issued.expires_in).toBeLessThanOrEqual(15 * 60);
+
+    // The minted token is a real owner token the decision endpoints accept.
+    const context = tokens.resolveToken(issued.access_token);
+    expect(context.active).toBe(true);
+    expect(context.tokenKind).toBe("owner");
+    expect(context.subjectId).toBe(OWNER);
+    expect(context.grant).toBeUndefined();
+  });
+
+  it("refuses to mint when no verified owner is present", async () => {
+    // Fails closed rather than inventing a subject: an owner token for an
+    // unidentified subject is the credential this design exists to prevent.
+    authenticatedSubject = null;
+    const response = await post("/pdpp/v1/owner/token", {});
+    expect(response.status).toBe(401);
+  });
+
+  it("mints a token usable end-to-end for approval", async () => {
+    const minted = (await (await post("/pdpp/v1/owner/token", {})).json()) as {
+      access_token: string;
+    };
+
+    const created = await post("/pdpp/v1/authorize", selectionBody());
+    const { session_id } = (await created.json()) as { session_id: string };
+
+    const reviewed = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review`,
+      { headers: ownerAuth(minted.access_token) },
+    );
+    expect(reviewed.status).toBe(200);
+    const { review } = (await reviewed.json()) as {
+      review: { review_digest: string };
+    };
+
+    const approved = await post(
+      `/pdpp/v1/authorize/${session_id}/approve`,
+      { review_digest: review.review_digest },
+      ownerAuth(minted.access_token),
+    );
+    expect(approved.status).toBe(200);
+  });
+
+  it("mints a token scoped to its own subject only", async () => {
+    // A token minted for one owner is not authority over another's session.
+    const mintedForOwner = (await (
+      await post("/pdpp/v1/owner/token", {})
+    ).json()) as { access_token: string };
+
+    const created = await post("/pdpp/v1/authorize", selectionBody());
+    const { session_id } = (await created.json()) as { session_id: string };
+
+    // A session belonging to a different subject.
+    const otherSession = sessions.create({
+      subjectId: OTHER_OWNER,
+      request: selectionBody().authorization_details[0] as never,
+      snapshot,
+      requester: {
+        client_id: "music_recommendations",
+        display_name: "Concert Finder",
+        app_approved: false,
+      },
+      redirectUri: REDIRECT,
+    });
+
+    const own = await app.request(`/pdpp/v1/authorize/${session_id}/review`, {
+      headers: ownerAuth(mintedForOwner.access_token),
+    });
+    expect(own.status).toBe(200);
+
+    const foreign = await app.request(
+      `/pdpp/v1/authorize/${otherSession.session_id}/review`,
+      { headers: ownerAuth(mintedForOwner.access_token) },
+    );
+    expect(foreign.status).toBe(404);
   });
 });
 

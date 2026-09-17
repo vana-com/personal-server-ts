@@ -55,6 +55,7 @@ import {
 import { createFilePendingBlobDeletionStore } from "./pending-blob-deletions.js";
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
+import { createPdppAuthDeps } from "./pdpp/bootstrap.js";
 import { generateDevToken } from "./dev-token.js";
 import { migrateLocalState } from "./migrations/local-state.js";
 import { createTokenStore, type TokenStore } from "./token-store.js";
@@ -590,7 +591,23 @@ export async function createServer(
           })
       : undefined;
 
+  // PDPP Authorization Server. Opt-in, and returns undefined unless the
+  // deployment has an owner, retained declarations, and readable auth state —
+  // so `/pdpp/v1` is mounted only when it can actually issue grants.
+  const pdppAuth = await createPdppAuthDeps({
+    config,
+    storageRoot,
+    logger,
+    indexManager,
+    serverOrigin: () => effectiveOrigin,
+    serverOwner,
+    devToken,
+    accessToken,
+    tokenStore,
+  });
+
   const app = createApp({
+    pdppAuth,
     mcpHydrateScopes:
       isEnclave && jobSyncManager
         ? (scopes) => jobSyncManager.hydrateScopes(scopes)
