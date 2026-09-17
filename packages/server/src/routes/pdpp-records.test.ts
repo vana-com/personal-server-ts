@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import {
   createMemoryRecordStore,
   createStreamDeclarationRegistry,
@@ -457,6 +458,28 @@ describe("pdpp records routes: version negotiation", () => {
     });
     expect(res.headers.get("PDPP-Version")).toBe("2026-04-06");
     expect(res.headers.get("Request-Id")).toMatch(/^req_/);
+  });
+
+  it("accepts the shared PDPP_VERSION constant explicitly (C1 regression seam)", async () => {
+    // Regression seam for C1 (AS and RS previously required mutually
+    // exclusive PDPP-Version values: RS "2026-04-06" vs AS "0.1.0"). This
+    // route now imports PDPP_VERSION from the shared
+    // @opendatalabs/personal-server-ts-core/pdpp-version module rather than
+    // declaring its own local constant. This test sends that exact shared
+    // value and confirms the RS surface accepts it -- the AS lane adopting
+    // the same import is the other half of this fix, tracked in this lane's
+    // contract file since this lane does not own AS-side files.
+    const { app } = buildApp({
+      "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+    });
+    const res = await app.request("/streams", {
+      headers: {
+        Authorization: "Bearer owner-tok",
+        "PDPP-Version": PDPP_VERSION,
+      },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("PDPP-Version")).toBe(PDPP_VERSION);
   });
 });
 

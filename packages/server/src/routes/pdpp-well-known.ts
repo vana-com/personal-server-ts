@@ -1,6 +1,5 @@
 import { Hono } from "hono";
-
-const PDPP_VERSION = "2026-04-06";
+import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 
 export interface PdppWellKnownRouteDeps {
   /** This resource server's own identifier (RFC 9728 §2 `resource`). */

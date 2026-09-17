@@ -1,6 +1,7 @@
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
+import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import type {
   PdppAuthorizationService,
   PdppTokenContext,
@@ -16,7 +17,6 @@ import {
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
-const PDPP_VERSION = "2026-04-06";
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
 
