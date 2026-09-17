@@ -12,6 +12,7 @@ import {
   encodeCursor,
   InvalidCursorError,
   recordKeyWithinGrantResources,
+  mapInactiveToError,
   recordWithinGrantTimeConstraint,
   resolveReadScope,
   type PdppRecordRow,
@@ -180,12 +181,15 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     const reqId = requestId();
     const { context, error } = await authenticate(c, reqId);
     if (error) return error;
-    if (!context?.active)
-      return sendError(
-        c,
-        new PdppError("authentication_error", "Invalid token"),
-        reqId,
-      );
+    // An inactive token must report the SAME reason here as on a record read.
+    // This branch used to answer a flat `authentication_error` (401) while
+    // `/streams/:stream/records` answered `grant_revoked` (403) for the very
+    // same token, so a client could not tell a revoked grant from a bad token
+    // depending only on which endpoint it happened to call first. Found by
+    // driving Context Gateway's real PdppContextClient against this server.
+    if (!context?.active) {
+      return sendError(c, mapInactiveToError(context!), reqId);
+    }
 
     const instanceIds =
       context.tokenKind === "owner"
