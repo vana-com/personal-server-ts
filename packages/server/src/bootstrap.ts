@@ -56,6 +56,7 @@ import { createFilePendingBlobDeletionStore } from "./pending-blob-deletions.js"
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
 import { createPdppAuthDeps } from "./pdpp/bootstrap.js";
+import { createPdppRecordsDeps } from "./pdpp/records-bootstrap.js";
 import { generateDevToken } from "./dev-token.js";
 import { migrateLocalState } from "./migrations/local-state.js";
 import { createTokenStore, type TokenStore } from "./token-store.js";
@@ -606,8 +607,24 @@ export async function createServer(
     tokenStore,
   });
 
+  // PDPP Resource Server. Mounts only alongside a mounted AS, so a real boot
+  // yields both halves over ONE token authority — the AS's own
+  // PdppTokenService, resolved in-process (Core §8 co-located). Without this
+  // a real server can issue a valid grant-bound token that has nothing to
+  // read, and cannot publish the RFC 9728 metadata a client needs to discover
+  // where to authorize.
+  const pdppRecords = createPdppRecordsDeps({
+    pdppAuth,
+    declarations: pdppAuth?.retainedDeclarations ?? [],
+    db,
+    serverOwner,
+    resource: effectiveOrigin,
+    logger,
+  });
+
   const app = createApp({
     pdppAuth,
+    pdpp: pdppRecords,
     mcpHydrateScopes:
       isEnclave && jobSyncManager
         ? (scopes) => jobSyncManager.hydrateScopes(scopes)

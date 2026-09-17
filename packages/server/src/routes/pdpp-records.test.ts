@@ -8,6 +8,7 @@ import type {
   Grant,
   PdppTokenContext,
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import { PDPP_API_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
   pdppRecordsRoutes,
   type PdppRecordsRouteDeps,
@@ -455,7 +456,7 @@ describe("pdpp records routes: version negotiation", () => {
     const res = await app.request("/streams", {
       headers: { Authorization: "Bearer owner-tok" },
     });
-    expect(res.headers.get("PDPP-Version")).toBe("2026-04-06");
+    expect(res.headers.get("PDPP-Version")).toBe(PDPP_API_VERSION);
     expect(res.headers.get("Request-Id")).toMatch(/^req_/);
   });
 });

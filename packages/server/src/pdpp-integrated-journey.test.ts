@@ -332,6 +332,14 @@ describe("PDPP integrated journey (real AS + real RS in one app)", () => {
         inventoryFor: () => ({ eligibleFor: () => [INSTANCE] }),
         // The owner is already authenticated by the PS session layer; this
         // journey drives that seam with the real owner token.
+        // `redirect_uri` is validated by exact match against a registered
+        // client, so the journey must register the one it uses. The AS
+        // refuses an unregistered client outright — there is no permissive
+        // fallback, which is what closes the open-redirect hole.
+        registeredClient: (clientId) =>
+          clientId === CLIENT_ID
+            ? { client_id: CLIENT_ID, redirect_uris: [REDIRECT_URI] }
+            : null,
         currentSubjectId: (c) => {
           const header = c.req.header("authorization") ?? "";
           if (!header.toLowerCase().startsWith("bearer ")) return null;

@@ -19,6 +19,7 @@ import { join } from "node:path";
 import type { Logger } from "pino";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
+import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
   AuthorizationSessionStore,
   openPdppAuthStore,
@@ -46,9 +47,20 @@ export interface CreatePdppAuthDepsOptions {
   tokenStore?: TokenStore;
 }
 
+/**
+ * The mounted AS plus the snapshots it retained.
+ *
+ * The Resource Server derives its per-stream shapes from these exact
+ * snapshots rather than re-reading config, so both halves enforce against the
+ * same retained document a grant was frozen against.
+ */
+export type PdppAuthBootResult = PdppAuthRouteDeps & {
+  retainedDeclarations: DeclarationSnapshot[];
+};
+
 export async function createPdppAuthDeps(
   options: CreatePdppAuthDepsOptions,
-): Promise<PdppAuthRouteDeps | undefined> {
+): Promise<PdppAuthBootResult | undefined> {
   const { config, logger } = options;
   if (!config.pdpp.enabled) return undefined;
 
@@ -123,6 +135,7 @@ export async function createPdppAuthDeps(
     store,
     tokens,
     sessions,
+    retainedDeclarations: registry.retained,
     resolveDeclaration: registry.resolve,
     inventoryFor: (subject, sourceId) =>
       singleInstanceInventory(subject || subjectId, sourceId),

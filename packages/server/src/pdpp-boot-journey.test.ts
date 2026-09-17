@@ -103,10 +103,21 @@ async function writeDeclaration(document = DECLARATION): Promise<string> {
   return path;
 }
 
+/**
+ * `redirect_uri` is validated by exact match against a registered client, so
+ * a real deployment must register one. The redirect-rejection test below
+ * relies on `https://evil.attacker.example/steal` NOT being in this list.
+ */
+const CLIENT_ID = "music_recommendations";
+
 function pdppConfig(declarationPaths: string[]) {
   return ServerConfigSchema.parse({
     tunnel: { enabled: false },
-    pdpp: { enabled: true, declarationPaths },
+    pdpp: {
+      enabled: true,
+      declarationPaths,
+      clients: [{ clientId: CLIENT_ID, redirectUris: [REDIRECT] }],
+    },
   });
 }
 
@@ -144,7 +155,7 @@ async function obtainGrantBoundToken(
     method: "POST",
     headers: { ...ownerAuth, "content-type": "application/json" },
     body: JSON.stringify({
-      client_id: "music_recommendations",
+      client_id: CLIENT_ID,
       redirect_uri: REDIRECT,
       code_challenge: CHALLENGE,
       code_challenge_method: "S256",
@@ -204,7 +215,7 @@ async function obtainGrantBoundToken(
     body: new URLSearchParams({
       grant_type: "authorization_code",
       code: code!,
-      client_id: "music_recommendations",
+      client_id: CLIENT_ID,
       redirect_uri: REDIRECT,
       code_verifier: VERIFIER,
     }).toString(),
@@ -359,7 +370,7 @@ describe("PDPP boot journey: real createServer", () => {
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        client_id: "music_recommendations",
+        client_id: CLIENT_ID,
         redirect_uri: "https://evil.attacker.example/steal",
         code_challenge: CHALLENGE,
         code_challenge_method: "S256",
@@ -379,6 +390,58 @@ describe("PDPP boot journey: real createServer", () => {
     // An unregistered redirect target must be refused before the owner is
     // ever shown a consent screen — RFC 6749 §3.1.2.4 / §10.6.
     expect(authorized.status).toBe(400);
+  });
+
+  /**
+   * One client, one `PDPP-Version`, both halves of the same server.
+   *
+   * The two lanes picked version constants independently and of different
+   * kinds — the AS used `PDPP_API_VERSION = "0.1.0"` (semver), the RS routes
+   * used `PDPP_VERSION = "2026-04-06"` (a date). Both surfaces hard-reject an
+   * unrecognized value, so before this was unified a client pinning either
+   * one could reach only half the server:
+   *
+   *   AS + "0.1.0"      -> 201     AS + "2026-04-06" -> 400 unsupported_version
+   *   RS + "2026-04-06" -> 200     RS + "0.1.0"      -> 400 unsupported_version
+   *
+   * Every existing test missed it by omitting the header or by sending the
+   * value matching the one surface under test. This sends ONE header to BOTH
+   * halves, which is the only shape that catches a divergence.
+   */
+  it("negotiates one PDPP-Version across both the AS and the RS", async () => {
+    ctx = await boot();
+    const { accessToken } = await obtainGrantBoundToken(ctx);
+    const owner = await ownerToken(ctx);
+
+    // Whatever the server echoes is the version a real client would pin.
+    const probe = await ctx.app.request("/v1/streams", {
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    const negotiated = probe.headers.get("PDPP-Version");
+    expect(negotiated).toBeTruthy();
+
+    // The RS accepts it and echoes it back.
+    const rs = await ctx.app.request("/v1/streams", {
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        "PDPP-Version": negotiated!,
+      },
+    });
+    expect(rs.status).toBe(200);
+    expect(rs.headers.get("PDPP-Version")).toBe(negotiated);
+
+    // The AS must accept the SAME value, not a different one.
+    const as = await ctx.app.request("/pdpp/v1/introspect", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${owner}`,
+        "content-type": "application/x-www-form-urlencoded",
+        "PDPP-Version": negotiated!,
+      },
+      body: new URLSearchParams({ token: accessToken }).toString(),
+    });
+    expect(as.status).toBe(200);
+    expect(as.headers.get("PDPP-Version")).toBe(negotiated);
   });
 
   /**

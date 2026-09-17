@@ -6,6 +6,7 @@ import type {
   PdppTokenContext,
   StreamGrant,
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import { PDPP_API_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
   CursorExpiredError,
   encodeCursor,
@@ -18,7 +19,16 @@ import {
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
-const PDPP_VERSION = "2026-04-06";
+/**
+ * The negotiated PDPP API version, shared with the Authorization Server.
+ *
+ * Both halves mount into one app and both hard-reject an unrecognized value,
+ * so a client that pins one version must be able to reach both. Importing the
+ * AS's constant rather than restating a literal is what keeps that true: the
+ * two surfaces previously diverged ("0.1.0" vs "2026-04-06"), and a client
+ * pinning either could reach only half the server.
+ */
+const PDPP_VERSION = PDPP_API_VERSION;
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
 
@@ -195,7 +205,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             name: s.stream,
             recordCount: s.recordCount as number | null,
             lastUpdated: s.lastUpdated,
-            countCapped: false,
+            budgetExhausted: false,
           }))
         : streams
             .filter((s) =>
@@ -220,7 +230,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     // exact. `meta.warnings` is the same shape the list endpoint uses for
     // `limit_clamped`.
     const cappedStreams = visibleStreams
-      .filter((s) => s.countCapped)
+      .filter((s) => s.budgetExhausted)
       .map((s) => s.name);
 
     return c.json(
@@ -237,7 +247,10 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             warnings: [
               {
                 code: "record_count_not_counted",
-                message: `record_count is null for ${cappedStreams.join(", ")}: more than ${STREAM_COUNT_CAP} records match the grant`,
+                // Machine-readable: clients must not parse the prose to learn
+                // which streams were truncated.
+                streams: cappedStreams,
+                message: `record_count is null for ${cappedStreams.join(", ")}: more than ${STREAM_COUNT_CAP} grant-visible records, or the scan budget was reached`,
               },
             ],
           },
@@ -637,20 +650,45 @@ function projectFields(
  */
 const STREAM_COUNT_CAP = 1_000;
 
+/**
+ * Rows either walk may scan before giving up, shared across both walks.
+ *
+ * The budget is in ROWS, not pages. An earlier version bounded the count walk
+ * at 1000 *pages* of 100 rows — 100,000 rows — which made a filtering grant
+ * the slow path: a `time_constraint` excluding the newest records forced the
+ * `last_updated` walk through every page looking for its first visible row.
+ * Measured 25s at 100k rows and 38s at 150k, against 137ms for an
+ * all-visible grant at 60k. One request, a normal grant, a time window
+ * excluding recent records.
+ */
+const STREAM_SCAN_ROW_BUDGET = 10_000;
+
 interface GrantVisibleSummary {
-  /** Exact count, or null when more than `STREAM_COUNT_CAP` records match. */
+  /**
+   * Exact count, or null when the scan budget ran out first. Null means
+   * "more than we were willing to count", never "unknown" or "error".
+   */
   recordCount: number | null;
+  /** Newest grant-visible record, or null if none was found within budget. */
   lastUpdated: string | null;
-  countCapped: boolean;
+  /** True when either walk hit the budget, so the summary is incomplete. */
+  budgetExhausted: boolean;
 }
 
 /**
  * Summarize the records a grant exposes in one stream, for a client-token
  * stream listing.
  *
- * `last_updated` is answered by scanning newest-first and stopping at the
- * first grant-visible row, so the common case is a single store page rather
- * than a walk of the whole stream. The count then walks only until the cap.
+ * Both walks are bounded by the same row budget, because both are adversarial
+ * in the same way: the grant decides which rows are visible, so a grant that
+ * hides the newest records makes `last_updated` expensive exactly as a grant
+ * with many visible records makes the count expensive. Neither may turn a
+ * metadata call into a full scan.
+ *
+ * When a walk exhausts its budget the caller reports null plus a warning. A
+ * confident `0`/`null` after an incomplete scan would be indistinguishable
+ * from a genuinely empty grant, which is the failure this bound exists to
+ * avoid.
  *
  * Rows stay unprojected throughout: the `time_constraint` must be evaluated
  * against the record's real value, not a projected one.
@@ -672,8 +710,9 @@ function summarizeGrantVisible(
   // grant-visible `last_updated`, and usually it is on the first page.
   let lastUpdated: string | null = null;
   let cursor: string | undefined;
-  let pages = 0;
-  outer: while (pages++ < STREAM_COUNT_CAP) {
+  let scanned = 0;
+  let lastUpdatedExhausted = true;
+  outer: while (scanned < STREAM_SCAN_ROW_BUDGET) {
     const page = store.listRecords(stream, {
       instanceIds,
       limit: MAX_LIMIT,
@@ -681,18 +720,27 @@ function summarizeGrantVisible(
       cursor,
     });
     for (const row of page.data) {
+      scanned++;
       if (visible(row)) {
         lastUpdated = row.emittedAt;
+        lastUpdatedExhausted = false;
         break outer;
       }
     }
-    if (!page.hasMore || !page.nextCursor) break;
+    if (!page.hasMore || !page.nextCursor) {
+      // Reached the end of the stream: "no visible rows" is a real answer,
+      // not a truncated one.
+      lastUpdatedExhausted = false;
+      break;
+    }
     cursor = page.nextCursor;
   }
 
-  // Count forward, stopping at the cap rather than scanning without bound.
+  // Count forward, stopping at the cap or the budget, whichever comes first.
   let count = 0;
   let capped = false;
+  let countExhausted = false;
+  scanned = 0;
   cursor = undefined;
   for (;;) {
     const page = store.listRecords(stream, {
@@ -702,20 +750,27 @@ function summarizeGrantVisible(
       cursor,
     });
     for (const row of page.data) {
+      scanned++;
       if (visible(row)) count++;
       if (count > STREAM_COUNT_CAP) {
         capped = true;
         break;
       }
+      if (scanned >= STREAM_SCAN_ROW_BUDGET) {
+        // Budget spent before the cap: we cannot claim this count is exact.
+        countExhausted = true;
+        break;
+      }
     }
-    if (capped || !page.hasMore || !page.nextCursor) break;
+    if (capped || countExhausted || !page.hasMore || !page.nextCursor) break;
     cursor = page.nextCursor;
   }
 
+  const incomplete = capped || countExhausted || lastUpdatedExhausted;
   return {
-    recordCount: capped ? null : count,
+    recordCount: capped || countExhausted ? null : count,
     lastUpdated,
-    countCapped: capped,
+    budgetExhausted: incomplete,
   };
 }
 

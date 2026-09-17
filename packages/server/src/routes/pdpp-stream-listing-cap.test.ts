@@ -145,6 +145,69 @@ describe("client stream listing bounds its count", () => {
     expect(body.data[0].last_updated).toBeTruthy();
   });
 
+  /**
+   * REGRESSION for a HIGH found by the combined server review.
+   *
+   * The first bounded version capped the COUNT walk but left the
+   * `last_updated` walk scanning up to 1000 pages of 100 rows. It exits early
+   * only on the first grant-VISIBLE row, so a grant whose time_constraint
+   * excludes the newest records walked every page: measured 25s at 100k rows
+   * and 38s at 150k, versus 137ms for an all-visible grant at 60k. That
+   * inverts the incentive — the filtering grant became the expensive one, and
+   * one ordinary request with a time window excluding recent records was a
+   * DoS.
+   *
+   * Here EVERY record is outside the grant window, which is exactly the
+   * adversarial shape: the `last_updated` walk can never exit early.
+   */
+  it("stays responsive when the grant excludes every record", async () => {
+    const store = createMemoryRecordStore();
+    store.ingestBatch(
+      Array.from({ length: 20_000 }, (_, i) => ({
+        instance: INSTANCE,
+        stream: "s",
+        key: `r${i}`,
+        data: {
+          id: `r${i}`,
+          name: `n${i}`,
+          // Before the grant's `since`, so nothing is ever visible.
+          created_at: "2020-01-01T00:00:00.000Z",
+        },
+        emitted_at: `2026-05-01T00:00:${String(i % 60).padStart(2, "0")}.${String(i).padStart(6, "0")}Z`,
+      })),
+      () => "mutable_state",
+      () => ["id"],
+    );
+
+    const a = new Hono();
+    a.route(
+      "/v1",
+      pdppRecordsRoutes({
+        store,
+        auth: clientAuth,
+        declarations,
+        instancesForSubject: () => [INSTANCE],
+      }),
+    );
+
+    const started = Date.now();
+    const res = await a.request("/v1/streams", { headers: AUTH });
+    const elapsedMs = Date.now() - started;
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    // Nothing is visible, and the scan was truncated — so the response must
+    // NOT claim a confident count of 0, which would be indistinguishable
+    // from a genuinely empty grant.
+    expect(body.data[0].record_count).toBeNull();
+    expect(body.meta.warnings[0].code).toBe("record_count_not_counted");
+    // Machine-readable, so a client need not parse the prose.
+    expect(body.meta.warnings[0].streams).toEqual(["s"]);
+
+    expect(elapsedMs).toBeLessThan(5_000);
+  });
+
   it("stays responsive on a stream far larger than the cap", async () => {
     const started = Date.now();
     const res = await app(20_000).request("/v1/streams", { headers: AUTH });
