@@ -69,6 +69,14 @@ import type { Logger } from "pino";
 import { enclaveJobRoutes } from "./routes/enclave-jobs.js";
 import type { JobRequestEnvelope } from "@opendatalabs/vana-sdk/protocol/jobs";
 import type { JobExecuteResponse } from "./jobs/types.js";
+import { pdppRecordsRoutes } from "./routes/pdpp-records.js";
+import { pdppBlobsRoutes } from "./routes/pdpp-blobs.js";
+import { pdppWellKnownRoutes } from "./routes/pdpp-well-known.js";
+import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import type {
+  PdppRecordStore,
+  StreamDeclarationRegistry,
+} from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
 export interface IdentityInfo {
   address: `0x${string}`;
@@ -172,6 +180,24 @@ export interface AppDeps {
   writeProofReplayStore?: WriteProofReplayStore;
   profile?: "standard" | "enclave";
   jobWorker?: (envelope: JobRequestEnvelope) => Promise<JobExecuteResponse>;
+  /**
+   * PDPP §4/§8 record model + Resource Server query surface. Absent = the
+   * PDPP routes are not mounted; existing deployments are unaffected. When
+   * present, all three must be present together (record store, token
+   * resolution, and stream declarations are mutually required).
+   */
+  pdpp?: {
+    store: PdppRecordStore;
+    auth: PdppAuthorizationService;
+    declarations: StreamDeclarationRegistry;
+    instancesForSubject?: (subjectId: string) => string[];
+    readBlobBytes?: (
+      blobId: string,
+    ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
+    /** This resource server's own identifier, RFC 9728 `resource` member. */
+    resource: string;
+    authorizationServers?: string[];
+  };
 }
 
 export function createApp(deps: AppDeps): Hono {
@@ -220,6 +246,39 @@ export function createApp(deps: AppDeps): Hono {
       runtimeAvailability: deps.runtimeAvailability,
     }),
   );
+
+  // PDPP §4 record model + §8 Resource Server query surface. Independent of
+  // the legacy DPP fileId/scope routes above; mounted only when a pdpp deps
+  // bundle is supplied.
+  if (deps.pdpp) {
+    app.route(
+      "/v1",
+      pdppRecordsRoutes({
+        store: deps.pdpp.store,
+        auth: deps.pdpp.auth,
+        declarations: deps.pdpp.declarations,
+        instancesForSubject: deps.pdpp.instancesForSubject,
+      }),
+    );
+    app.route(
+      "/v1/blobs",
+      pdppBlobsRoutes({
+        store: deps.pdpp.store,
+        auth: deps.pdpp.auth,
+        declarations: deps.pdpp.declarations,
+        instancesForSubject: deps.pdpp.instancesForSubject,
+        readBlobBytes: deps.pdpp.readBlobBytes,
+      }),
+    );
+    app.route(
+      "/.well-known",
+      pdppWellKnownRoutes({
+        resource: deps.pdpp.resource,
+        coreQueryBase: "/v1",
+        authorizationServers: deps.pdpp.authorizationServers,
+      }),
+    );
+  }
 
   if (deps.profile === "enclave" && deps.jobWorker && deps.accessToken) {
     app.route(
