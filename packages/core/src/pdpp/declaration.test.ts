@@ -281,3 +281,87 @@ describe("§5 — declaration acceptance", () => {
     expect(result.snapshot.source_kind).toBe("provider_native");
   });
 });
+
+describe("§10 / review C9 — the size cap bounds allocation, not just the outcome", () => {
+  it("aborts a stream that exceeds the cap without buffering it whole", async () => {
+    // A host that omits Content-Length and streams forever. If the cap only
+    // checked after `text()`, this would allocate unboundedly before failing.
+    let delivered = 0;
+    let cancelled = false;
+    const chunk = new Uint8Array(64 * 1024);
+
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        delivered += chunk.byteLength;
+        // Far more than the cap if anything let it run to completion.
+        if (delivered > MAX_DECLARATION_BYTES * 50) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(chunk);
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(body, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    const result = await retrieveDeclaration(
+      "https://registry.pdpp.dev/d.json",
+      SOURCE_ID,
+      openPolicy,
+      { fetcher },
+    );
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.failure.code).toBe("too_large");
+    // The property that matters: we stopped near the cap rather than reading
+    // the whole hostile stream. The exact figure is a little above the cap
+    // because ReadableStream pulls ahead by a few chunks before our reader
+    // sees them — bounded overshoot, not unbounded allocation. Asserted
+    // generously so stream-internal buffering changes do not make this flaky,
+    // but far below the ~12MB the producer was willing to send.
+    expect(delivered).toBeLessThan(MAX_DECLARATION_BYTES * 4);
+    expect(cancelled).toBe(true);
+  });
+
+  it("still rejects an oversized body that lies about content-length", async () => {
+    const huge = "x".repeat(MAX_DECLARATION_BYTES + 1024);
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(huge, {
+        status: 200,
+        headers: { "content-type": "application/json", "content-length": "10" },
+      }),
+    );
+    const result = await retrieveDeclaration(
+      "https://registry.pdpp.dev/d.json",
+      SOURCE_ID,
+      openPolicy,
+      { fetcher },
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.failure.code).toBe("too_large");
+  });
+
+  it("still accepts a declaration inside the cap", async () => {
+    const body = validDocument();
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse(body));
+    const result = await retrieveDeclaration(
+      "https://registry.pdpp.dev/d.json",
+      SOURCE_ID,
+      openPolicy,
+      { fetcher },
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.snapshot.digest).toBe(computeDeclarationDigest(body));
+  });
+});
