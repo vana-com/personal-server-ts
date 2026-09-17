@@ -67,6 +67,55 @@ const SOURCE_ID = "spotify";
 const INSTANCE = "inst_spotify_1";
 const ownerWallet = createTestWallet(0);
 
+/**
+ * Seeded playlists. `created_at` decides grant visibility (the grant's window
+ * is `since 2026-01-01`); `emitted_at` decides list ordering. In-window and
+ * out-of-window records alternate so that any page of stored rows contains a
+ * mix — the condition under which filter-after-pagination produces short
+ * pages and wrong cursors.
+ */
+const SEEDED_PLAYLISTS = [
+  {
+    id: "pl_1",
+    name: "road trip",
+    created_at: "2026-04-01T00:00:00.000Z",
+    emitted_at: "2026-05-01T00:00:00.000Z",
+  },
+  {
+    id: "pl_2",
+    name: "old favourites",
+    created_at: "2020-01-01T00:00:00.000Z",
+    emitted_at: "2026-05-02T00:00:00.000Z",
+  },
+  {
+    id: "pl_3",
+    name: "focus",
+    created_at: "2026-04-03T00:00:00.000Z",
+    emitted_at: "2026-05-03T00:00:00.000Z",
+  },
+  {
+    id: "pl_4",
+    name: "archive 2019",
+    created_at: "2019-06-01T00:00:00.000Z",
+    emitted_at: "2026-05-04T00:00:00.000Z",
+  },
+  {
+    id: "pl_5",
+    name: "summer",
+    created_at: "2026-04-05T00:00:00.000Z",
+    emitted_at: "2026-05-05T00:00:00.000Z",
+  },
+  {
+    id: "pl_6",
+    name: "throwback",
+    created_at: "2018-01-01T00:00:00.000Z",
+    emitted_at: "2026-05-06T00:00:00.000Z",
+  },
+];
+
+/** The three records inside the grant window, newest-first (default order). */
+const IN_WINDOW_DESC = ["pl_5", "pl_3", "pl_1"];
+
 function createMockGateway(): GatewayClient {
   return {
     isRegisteredBuilder: async () => true,
@@ -195,34 +244,25 @@ describe("PDPP integrated journey (real AS + real RS in one app)", () => {
 
   function makeHarness(dir: string, index: IndexManager): Harness {
     // --- Seed actual data into the real RS record store -------------------
+    //
+    // Six records, alternating in/out of the grant's time window. The
+    // interleaving matters: it is what makes filter-before-pagination
+    // observable. A grant window that happens to select a contiguous prefix
+    // would pass even with the pagination defect.
     const store = createMemoryRecordStore();
     const ingest = store.ingestBatch(
-      [
-        {
-          instance: INSTANCE,
-          stream: "playlists",
-          key: "pl_1",
-          data: {
-            id: "pl_1",
-            name: "road trip",
-            owner_email: "owner@example.com",
-            created_at: "2026-04-01T00:00:00.000Z",
-          },
-          emitted_at: "2026-04-01T00:00:00.000Z",
+      SEEDED_PLAYLISTS.map((row) => ({
+        instance: INSTANCE,
+        stream: "playlists",
+        key: row.id,
+        data: {
+          id: row.id,
+          name: row.name,
+          owner_email: "owner@example.com",
+          created_at: row.created_at,
         },
-        {
-          instance: INSTANCE,
-          stream: "playlists",
-          key: "pl_2",
-          data: {
-            id: "pl_2",
-            name: "old favourites",
-            owner_email: "owner@example.com",
-            created_at: "2020-01-01T00:00:00.000Z",
-          },
-          emitted_at: "2020-01-01T00:00:00.000Z",
-        },
-      ],
+        emitted_at: row.emitted_at,
+      })),
       () => "mutable_state",
       () => ["id"],
     );
@@ -445,14 +485,133 @@ describe("PDPP integrated journey (real AS + real RS in one app)", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
 
-    // pl_1 (created_at 2026) is inside the grant's `since`; pl_2 (2020) is not.
-    expect(body.data).toHaveLength(1);
-    expect(body.data[0].data.id).toBe("pl_1");
+    // Exactly the in-window records, newest-first; the 2018/2019/2020 ones
+    // are outside the grant's `since`.
+    expect(body.data.map((d: { data: { id: string } }) => d.data.id)).toEqual(
+      IN_WINDOW_DESC,
+    );
 
     // The constraint field was needed to evaluate the window, but it was
     // never granted — so it must not leak into the response.
-    expect(body.data[0].data).toEqual({ id: "pl_1", name: "road trip" });
+    expect(body.data[0].data).toEqual({ id: "pl_5", name: "summer" });
     expect(body.data[0].data.created_at).toBeUndefined();
+    expect(body.data[0].data.owner_email).toBeUndefined();
+  });
+
+  /**
+   * REGRESSION: grant filtering must happen BEFORE pagination.
+   *
+   * The store pages first and the route filtered afterwards, so a page of
+   * `limit` STORED rows could yield fewer than `limit` VISIBLE rows. With the
+   * interleaved seed above, `limit=2` returned only 1 record, and
+   * `has_more`/`next_cursor` described a position in the UNFILTERED sequence.
+   * `limit` must mean "at most N records you may see".
+   */
+  it("applies the grant filter before pagination, so limit and cursors count visible records", async () => {
+    const { accessToken } = await runAuthorizationJourney();
+    const auth = { Authorization: `Bearer ${accessToken}` };
+
+    const first = await harness.app.request(
+      "/v1/streams/playlists/records?limit=2",
+      { headers: auth },
+    );
+    expect(first.status).toBe(200);
+    const firstBody = await first.json();
+
+    // A full page of VISIBLE records, not a short page of stored rows.
+    expect(
+      firstBody.data.map((d: { data: { id: string } }) => d.data.id),
+    ).toEqual(IN_WINDOW_DESC.slice(0, 2));
+    expect(firstBody.has_more).toBe(true);
+    expect(firstBody.next_cursor).toBeTruthy();
+
+    // The cursor resumes in the filtered sequence, with no gap or repeat.
+    const second = await harness.app.request(
+      `/v1/streams/playlists/records?limit=2&cursor=${encodeURIComponent(firstBody.next_cursor)}`,
+      { headers: auth },
+    );
+    expect(second.status).toBe(200);
+    const secondBody = await second.json();
+    expect(
+      secondBody.data.map((d: { data: { id: string } }) => d.data.id),
+    ).toEqual(IN_WINDOW_DESC.slice(2));
+    // Terminal page: nothing further the client may see.
+    expect(secondBody.has_more).toBe(false);
+  });
+
+  /**
+   * REGRESSION: a client token must not learn about records outside its grant
+   * through stream-listing metadata. `record_count` / `last_updated` came
+   * straight from the store's instance-wide listing, which counted all six
+   * seeded records and reported the newest one's timestamp — leaking the
+   * existence and recency of data the grant does not expose.
+   */
+  it("does not leak non-granted records through client stream-listing metadata", async () => {
+    const { accessToken } = await runAuthorizationJourney();
+
+    const res = await harness.app.request("/v1/streams", {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    // Only the granted stream, counted over only the granted projection.
+    expect(body.data).toHaveLength(1);
+    expect(body.data[0].name).toBe("playlists");
+    expect(body.data[0].record_count).toBe(IN_WINDOW_DESC.length);
+    // Newest VISIBLE record (pl_5), not the newest stored record (pl_6).
+    expect(body.data[0].last_updated).toBe("2026-05-05T00:00:00.000Z");
+  });
+
+  /**
+   * changes_since must apply the same grant filter and the same projection as
+   * the list path, and must not expose the constraint field it needs
+   * internally to evaluate the time window.
+   */
+  it("applies grant filtering and projection consistently on the changes_since feed", async () => {
+    const { accessToken } = await runAuthorizationJourney();
+
+    const res = await harness.app.request(
+      "/v1/streams/playlists/records?changes_since=",
+      { headers: { Authorization: `Bearer ${accessToken}` } },
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.data).toHaveLength(IN_WINDOW_DESC.length);
+    for (const row of body.data) {
+      expect(Object.keys(row.data).sort()).toEqual(["id", "name"]);
+      expect(row.data.created_at).toBeUndefined();
+      expect(row.data.owner_email).toBeUndefined();
+    }
+  });
+
+  /**
+   * Owner tokens carry no grant: the owner reads their own store without a
+   * second grant authority, unprojected and unfiltered. This is the control
+   * that proves the fixes above narrowed the CLIENT path only and did not
+   * quietly constrain owner access.
+   */
+  it("leaves owner-token reads unfiltered and unprojected", async () => {
+    const res = await harness.app.request(
+      "/v1/streams/playlists/records?limit=100",
+      { headers: { Authorization: `Bearer ${harness.ownerToken}` } },
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    // Every seeded record, including those outside any grant window.
+    expect(body.data).toHaveLength(SEEDED_PLAYLISTS.length);
+    // Full record, including fields no client grant exposes.
+    expect(body.data[0].data.owner_email).toBe("owner@example.com");
+    expect(body.data[0].data.created_at).toBeTruthy();
+
+    // Owner stream listing sees the true instance-wide counts.
+    const streams = await harness.app.request("/v1/streams", {
+      headers: { Authorization: `Bearer ${harness.ownerToken}` },
+    });
+    const streamsBody = await streams.json();
+    expect(streamsBody.data[0].record_count).toBe(SEEDED_PLAYLISTS.length);
   });
 
   /**
@@ -529,15 +688,17 @@ describe("PDPP integrated journey (real AS + real RS in one app)", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
 
-    // Time constraint enforced: pl_2 (created_at 2020) is excluded.
-    expect(body.data).toHaveLength(1);
-    expect(body.data[0].data.id).toBe("pl_1");
+    // Time constraint enforced: the pre-2026 records are excluded.
+    expect(body.data.map((d: { data: { id: string } }) => d.data.id)).toEqual(
+      IN_WINDOW_DESC,
+    );
     // Field projection enforced: `owner_email` was never granted, so it must
-    // not appear even though it exists in the seeded record.
+    // not appear even though it exists in the seeded record. `created_at` IS
+    // granted here, so it must appear.
     expect(body.data[0].data).toEqual({
-      id: "pl_1",
-      name: "road trip",
-      created_at: "2026-04-01T00:00:00.000Z",
+      id: "pl_5",
+      name: "summer",
+      created_at: "2026-04-05T00:00:00.000Z",
     });
     expect(body.data[0].data.owner_email).toBeUndefined();
   });

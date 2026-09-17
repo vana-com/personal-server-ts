@@ -7,6 +7,7 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
   CursorExpiredError,
+  encodeCursor,
   InvalidCursorError,
   recordKeyWithinGrantResources,
   recordWithinGrantTimeConstraint,
@@ -164,12 +165,52 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         : (context.grant?.streams.flatMap((s) => s.instance_ids) ?? []);
 
     const streams = deps.store.listStreams(instanceIds);
+
+    // A client token gets a closed projection: only streams its grant names,
+    // and counts/recency computed over only the records the grant actually
+    // exposes. The store's raw listing counts every record in the instance,
+    // so returning it unchanged would leak the existence and recency of
+    // records outside the grant's time_constraint / resources.
+    const visibleStreams =
+      context.tokenKind === "owner"
+        ? streams.map((s) => ({
+            name: s.stream,
+            recordCount: s.recordCount,
+            lastUpdated: s.lastUpdated,
+          }))
+        : streams
+            .filter((s) =>
+              context.grant?.streams.some((g) => g.name === s.stream),
+            )
+            .map((s) => {
+              const streamGrant = context.grant?.streams.find(
+                (g) => g.name === s.stream,
+              );
+              const granted = collectGrantVisibleRows(
+                deps.store,
+                s.stream,
+                streamGrant?.instance_ids ?? [],
+                streamGrant,
+              );
+              return {
+                name: s.stream,
+                recordCount: granted.length,
+                lastUpdated: granted.reduce<string | null>(
+                  (latest, row) =>
+                    latest === null || row.emittedAt > latest
+                      ? row.emittedAt
+                      : latest,
+                  null,
+                ),
+              };
+            });
+
     return c.json(
       {
         object: "list",
-        data: streams.map((s) => ({
+        data: visibleStreams.map((s) => ({
           object: "stream",
-          name: s.stream,
+          name: s.name,
           record_count: s.recordCount,
           last_updated: s.lastUpdated,
         })),
@@ -313,18 +354,44 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         );
       }
 
-      const page = deps.store.listRecords(stream, {
-        instanceIds: effectiveInstanceIds,
-        limit,
-        order,
-        cursor,
-        fields,
-      });
-      const visible = page.data.filter(
-        (row) =>
-          recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
-          recordWithinGrantTimeConstraint(row.data, scope.streamGrant),
-      );
+      // Grant filtering happens AFTER the store pages, so a page of `limit`
+      // stored rows can yield fewer than `limit` visible rows. Returning that
+      // short page directly would make `limit` mean "at most N stored rows"
+      // rather than "at most N records you may see", and would report
+      // `has_more`/`next_cursor` for a position in the unfiltered sequence.
+      // Instead, keep pulling pages until `limit` visible rows accumulate (or
+      // the stream runs out), then derive paging state from the filtered view.
+      const visible: PdppRecordRow[] = [];
+      let nextCursor = cursor;
+      let hasMore = false;
+      do {
+        const page = deps.store.listRecords(stream, {
+          instanceIds: effectiveInstanceIds,
+          // Fetch one extra so a page that is entirely filtered out still
+          // makes progress instead of stalling on the same cursor.
+          limit: limit + 1,
+          order,
+          cursor: nextCursor,
+          fields,
+        });
+        for (const row of page.data) {
+          if (
+            recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
+            recordWithinGrantTimeConstraint(row.data, scope.streamGrant)
+          ) {
+            visible.push(row);
+          }
+          if (visible.length > limit) break;
+        }
+        nextCursor = page.nextCursor ?? undefined;
+        hasMore = page.hasMore;
+      } while (visible.length <= limit && hasMore && nextCursor);
+
+      // `limit + 1` visible rows means there is at least one more record the
+      // caller may see; trim it and report `has_more` from the filtered view.
+      const moreVisible = visible.length > limit;
+      const data = moreVisible ? visible.slice(0, limit) : visible;
+      const last = data[data.length - 1];
       const meta = clamped
         ? {
             warnings: [
@@ -335,9 +402,20 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       return c.json(
         {
           object: "list",
-          has_more: page.hasMore,
-          ...(page.nextCursor && { next_cursor: page.nextCursor }),
-          data: visible.map((row) =>
+          has_more: moreVisible,
+          ...(moreVisible &&
+            last && {
+              next_cursor: encodeCursor({
+                kind: "list",
+                order,
+                // Must match the store's own sort key exactly, or the cursor
+                // resumes at the wrong position. Both backends sort by
+                // (emittedAt, recordKey) — see `sortKey` in memory-store.ts.
+                sortValue: last.emittedAt,
+                recordKey: last.recordKey,
+              }),
+            }),
+          data: data.map((row) =>
             toRecordJson(stream, stripFieldFromRow(row, stripField)),
           ),
           ...(meta && { meta }),
@@ -500,6 +578,45 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   });
 
   return app;
+}
+
+/**
+ * Walk a stream's records and return only those the grant exposes.
+ *
+ * Used for client-token stream listings, where `record_count` and
+ * `last_updated` must describe the granted projection rather than the whole
+ * instance. Fields are left unprojected on purpose: the caller only needs
+ * counts and `emittedAt`, and the time_constraint must be evaluated against
+ * an unprojected record (see `withConstraintField`).
+ */
+function collectGrantVisibleRows(
+  store: PdppRecordStore,
+  stream: string,
+  instanceIds: string[],
+  streamGrant: StreamGrant | undefined,
+): PdppRecordRow[] {
+  const visible: PdppRecordRow[] = [];
+  let cursor: string | undefined;
+  // Bounded walk: stream listings are metadata, not a data read path.
+  for (let guard = 0; guard < 1000; guard++) {
+    const page = store.listRecords(stream, {
+      instanceIds,
+      limit: MAX_LIMIT,
+      order: "asc",
+      cursor,
+    });
+    for (const row of page.data) {
+      if (
+        recordKeyWithinGrantResources(row.recordKey, streamGrant) &&
+        recordWithinGrantTimeConstraint(row.data, streamGrant)
+      ) {
+        visible.push(row);
+      }
+    }
+    if (!page.hasMore || !page.nextCursor) break;
+    cursor = page.nextCursor;
+  }
+  return visible;
 }
 
 /**
