@@ -54,7 +54,21 @@ export interface PdppGrantBindingStore {
   getByPermission(permission: ChainPermissionRef): PdppGrantBinding | null;
 }
 
-/** True when two bindings agree on every field that defines the binding. */
+/**
+ * True when two bindings agree on every field that defines the binding.
+ *
+ * `granteeAddress` is compared, which makes grantee rotation an explicit
+ * conflict rather than a silent follow. That is deliberate. Context Gateway
+ * holds one Privy-custodied wallet per app, keyed `(ownerType, ownerId)` with
+ * a DB unique index, and its schema *models* rotation (`isCurrent` plus a
+ * partial unique index) although no code path performs one today — so the
+ * address is currently immutable per app in practice but not by design.
+ *
+ * If rotation ever ships, a rotated wallet is a different grantee, and the
+ * owner's existing consent must not transfer to it without a new decision.
+ * Rejecting the rewrite surfaces that as a failure instead of quietly
+ * repointing a retained grant at an address the owner never approved.
+ */
 function bindingsAgree(a: PdppGrantBinding, b: PdppGrantBinding): boolean {
   return (
     a.pdppGrantId === b.pdppGrantId &&

@@ -300,6 +300,34 @@ describe("PdppGrantBindingStore", () => {
     expect(() => store.putBinding(makeBinding())).not.toThrow();
   });
 
+  it("refuses to follow a rotated grantee wallet onto an existing grant", () => {
+    // Context Gateway models grantee-wallet rotation (isCurrent + a partial
+    // unique index) but implements none today, so the per-app address is
+    // immutable in practice and not by design. If rotation ships, a rotated
+    // wallet is a DIFFERENT grantee: the owner's existing consent must not
+    // transfer to it silently. This must fail rather than repoint the grant.
+    const store = createInMemoryPdppGrantBindingStore();
+    store.putBinding(makeBinding());
+
+    const ROTATED = "0x00000000000000000000000000000000000000FF" as const;
+    expectFailure(
+      () =>
+        store.putBinding(
+          makeBinding({
+            granteeAddress: ROTATED,
+            chainGrant: chainGrant({ granteeId: ROTATED }),
+          }),
+        ),
+      "INVALID_SIGNATURE",
+      /different binding already exists for this PDPP grant/i,
+    );
+
+    // The originally consented grantee still stands.
+    expect(store.getByPdppGrantId("pdpp-grant-1")?.granteeAddress).toBe(
+      GRANTEE,
+    );
+  });
+
   it("refuses to retarget an existing PDPP grant at a different permission", () => {
     const store = createInMemoryPdppGrantBindingStore();
     store.putBinding(makeBinding());
