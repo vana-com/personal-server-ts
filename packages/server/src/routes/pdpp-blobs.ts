@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import { resourceMetadataUrlFor } from "./pdpp-records.js";
 import {
   recordKeyWithinGrantResources,
   recordWithinGrantTimeConstraint,
@@ -74,8 +75,9 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       );
       return {
         error: jsonError(c, err, reqId, {
-          "WWW-Authenticate":
-            'Bearer error="invalid_token", resource_metadata="/.well-known/oauth-protected-resource"',
+          // Absolute, derived from this request's origin (RFC 9728 §5.1) --
+          // shares the records route's helper so the two cannot drift.
+          "WWW-Authenticate": `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`,
         }),
       };
     }
