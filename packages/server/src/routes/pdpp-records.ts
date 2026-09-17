@@ -11,6 +11,7 @@ import {
   CursorExpiredError,
   encodeCursor,
   InvalidCursorError,
+  InvalidCursorSyntaxError,
   recordKeyWithinGrantResources,
   mapInactiveToError,
   recordWithinGrantTimeConstraint,
@@ -48,7 +49,17 @@ function toPdppError(err: unknown): PdppError {
   if (err instanceof CursorExpiredError) {
     return new PdppError("cursor_expired", "changes_since cursor has expired");
   }
-  if (err instanceof InvalidCursorError) {
+  // Two distinct classes reach here and both mean "this cursor is not usable":
+  // the stores throw `InvalidCursorError` (decoded fine, but wrong order or
+  // wrong kind), while `decodeCursor` throws `InvalidCursorSyntaxError` for a
+  // token that is not even base64url JSON. Only the first was mapped, so a
+  // malformed cursor escaped as an unhandled throw -- a 500 with no PDPP error
+  // body, telling a client nothing and looking like a server fault when it was
+  // a bad request.
+  if (
+    err instanceof InvalidCursorError ||
+    err instanceof InvalidCursorSyntaxError
+  ) {
     return new PdppError(
       "invalid_cursor",
       "Cursor token is malformed, unrecognized, or was reused with a different order",
