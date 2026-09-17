@@ -76,6 +76,10 @@
       "types": "./dist/grants/index.d.ts",
       "import": "./dist/grants/index.js"
     },
+    "./pdpp": {
+      "types": "./dist/pdpp/index.d.ts",
+      "import": "./dist/pdpp/index.js"
+    },
     "./policy": {
       "types": "./dist/policy/index.d.ts",
       "import": "./dist/policy/index.js"

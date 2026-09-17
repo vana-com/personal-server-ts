@@ -49,6 +49,7 @@ import {
   createDeviceSessionLookup,
 } from "./routes/auth-device.js";
 import { oauthTokenRoutes } from "./routes/oauth-token.js";
+import { pdppAuthRoutes, type PdppAuthRouteDeps } from "./routes/pdpp-auth.js";
 import type {
   ScopeDeletionTracker,
   SyncManager,
@@ -148,6 +149,14 @@ export interface AppDeps {
   mcpConnectionStore?: McpConnectionStore;
   mcpOAuthAuthorizationStore?: McpOAuthAuthorizationStore;
   mcpOAuthApprovalUrl?: string | (() => string);
+  /**
+   * PDPP Core v0.1 Authorization Server. Absent = the `/pdpp/v1` surface is
+   * not mounted, and existing OAuth/MCP behavior is unchanged. This is a
+   * separate authority from `tokenStore`: PDPP tokens are grant-bound and
+   * live in their own store (spec §8 forbids a second grant authority behind
+   * one enforcement path).
+   */
+  pdppAuth?: PdppAuthRouteDeps;
   mcpActivityRecorder?: McpActivityRecorder;
   mcpHydrateScopes?: (scopes: string[]) => Promise<void>;
   /**
@@ -458,6 +467,13 @@ export function createApp(deps: AppDeps): Hono {
         deviceSessions: createDeviceSessionLookup(),
       }),
     );
+  }
+
+  // PDPP Core v0.1 Authorization Server (spec §6–§8). Mounted only when the
+  // deployment supplies a PDPP auth store, so servers that do not speak PDPP
+  // are byte-for-byte unchanged.
+  if (deps.pdppAuth) {
+    app.route("/pdpp/v1", pdppAuthRoutes(deps.pdppAuth));
   }
 
   // Mount dev UI routes when dev token is available. The /ui subtree is
