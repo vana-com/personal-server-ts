@@ -589,6 +589,98 @@ describe("the consent review model the UI renders", () => {
   });
 });
 
+describe("owner-token exchange", () => {
+  it("mints an owner token for a request that passed the owner proof", async () => {
+    // The stubbed `currentSubjectId` stands in for the verified signer the
+    // web3-auth + owner-check middleware chain populates in production.
+    const response = await post("/pdpp/v1/owner/token", {});
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    const issued = (await response.json()) as {
+      access_token: string;
+      token_type: string;
+      expires_in: number;
+    };
+    expect(issued.token_type).toBe("Bearer");
+    // Short-lived: it authorizes consent decisions, not long-term access.
+    expect(issued.expires_in).toBeLessThanOrEqual(15 * 60);
+
+    // The minted token is a real owner token the decision endpoints accept.
+    const context = tokens.resolveToken(issued.access_token);
+    expect(context.active).toBe(true);
+    expect(context.tokenKind).toBe("owner");
+    expect(context.subjectId).toBe(OWNER);
+    expect(context.grant).toBeUndefined();
+  });
+
+  it("refuses to mint when no verified owner is present", async () => {
+    // Fails closed rather than inventing a subject: an owner token for an
+    // unidentified subject is the credential this design exists to prevent.
+    authenticatedSubject = null;
+    const response = await post("/pdpp/v1/owner/token", {});
+    expect(response.status).toBe(401);
+  });
+
+  it("mints a token usable end-to-end for approval", async () => {
+    const minted = (await (await post("/pdpp/v1/owner/token", {})).json()) as {
+      access_token: string;
+    };
+
+    const created = await post("/pdpp/v1/authorize", selectionBody());
+    const { session_id } = (await created.json()) as { session_id: string };
+
+    const reviewed = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review`,
+      { headers: ownerAuth(minted.access_token) },
+    );
+    expect(reviewed.status).toBe(200);
+    const { review } = (await reviewed.json()) as {
+      review: { review_digest: string };
+    };
+
+    const approved = await post(
+      `/pdpp/v1/authorize/${session_id}/approve`,
+      { review_digest: review.review_digest },
+      ownerAuth(minted.access_token),
+    );
+    expect(approved.status).toBe(200);
+  });
+
+  it("mints a token scoped to its own subject only", async () => {
+    // A token minted for one owner is not authority over another's session.
+    const mintedForOwner = (await (
+      await post("/pdpp/v1/owner/token", {})
+    ).json()) as { access_token: string };
+
+    const created = await post("/pdpp/v1/authorize", selectionBody());
+    const { session_id } = (await created.json()) as { session_id: string };
+
+    // A session belonging to a different subject.
+    const otherSession = sessions.create({
+      subjectId: OTHER_OWNER,
+      request: selectionBody().authorization_details[0] as never,
+      snapshot,
+      requester: {
+        client_id: "music_recommendations",
+        display_name: "Concert Finder",
+        app_approved: false,
+      },
+      redirectUri: REDIRECT,
+    });
+
+    const own = await app.request(`/pdpp/v1/authorize/${session_id}/review`, {
+      headers: ownerAuth(mintedForOwner.access_token),
+    });
+    expect(own.status).toBe(200);
+
+    const foreign = await app.request(
+      `/pdpp/v1/authorize/${otherSession.session_id}/review`,
+      { headers: ownerAuth(mintedForOwner.access_token) },
+    );
+    expect(foreign.status).toBe(404);
+  });
+});
+
 describe("§6 — instance choice over the wire", () => {
   it("returns candidates instead of a review, then resolves on the pick", async () => {
     eligible = ["spotify-account-a", "spotify-account-b"];

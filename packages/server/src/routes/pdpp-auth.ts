@@ -49,6 +49,9 @@ const NO_STORE = {
   Pragma: "no-cache",
 } as const;
 
+/** Owner tokens are short-lived: they authorize consent decisions. */
+export const OWNER_TOKEN_TTL_SECONDS = 15 * 60;
+
 export interface PdppAuthRouteDeps {
   logger: Logger;
   store: PdppAuthStore;
@@ -66,6 +69,13 @@ export interface PdppAuthRouteDeps {
    * null when no owner session is present.
    */
   currentSubjectId(c: Context): string | null;
+  /**
+   * Resolve the PDPP subject for a request that already passed the PS owner
+   * proof (`web3-auth` + `owner-check`). Used only by
+   * `POST /owner/token`. Defaults to `currentSubjectId` when a deployment
+   * uses one notion of owner identity for both.
+   */
+  ownerSubjectId?(c: Context): string | null;
   /** AS-policy grant expiry, when the deployment sets one. */
   grantExpiryFor?(request: SelectionRequest): string | undefined;
 }
@@ -105,6 +115,56 @@ function negotiateVersion(
 
 export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   const app = new Hono();
+
+  /**
+   * Exchange an already-verified owner proof for a PDPP owner token.
+   *
+   * This endpoint mints no authority of its own. The caller must already have
+   * satisfied the PS's existing owner proof — the `web3-auth` middleware
+   * verifies a Web3Signed wallet signature and `owner-check` compares the
+   * recovered signer against the configured server owner. This route only
+   * converts that proof into the short-lived, grant-system credential the
+   * consent decision endpoints require.
+   *
+   * The indirection is deliberate and is the whole point of the design in
+   * `approval.ts`: a consent broker (Account/Web) never mints an owner token
+   * and never asserts owner identity. It holds a credential the PS issued to
+   * a verified wallet signer, so compromising the broker yields a token that
+   * expires, not the authority to approve anything for any subject.
+   *
+   * Mount this behind the same middleware chain as other owner routes:
+   *
+   *   app.use("/pdpp/v1/owner/token", createWeb3AuthMiddleware(...));
+   *   app.use("/pdpp/v1/owner/token", createOwnerCheckMiddleware(serverOwner));
+   *
+   * `ownerSubjectId` resolves the verified signer to the PDPP subject; a
+   * deployment that maps wallets to subjects differently supplies its own.
+   */
+  app.post("/owner/token", (c) => {
+    const subjectId = deps.ownerSubjectId?.(c) ?? deps.currentSubjectId(c);
+    if (!subjectId) {
+      // Reaching here means the owner middleware did not run or did not
+      // populate a verified signer. Fail closed rather than inventing a
+      // subject — an owner token for an unidentified subject is exactly the
+      // credential this design exists to prevent.
+      return errorResponse(
+        c,
+        401,
+        "unauthorized",
+        "a verified owner proof is required to obtain a PDPP owner token",
+      );
+    }
+
+    const issued = deps.tokens.issueOwnerToken({
+      subjectId,
+      ttlSeconds: OWNER_TOKEN_TTL_SECONDS,
+    });
+    deps.logger.info(
+      { subject_id: subjectId },
+      "PDPP owner token issued to a verified owner",
+    );
+    return c.json(issued, 200, NO_STORE);
+  });
 
   // The selected version echoes back on every response (§9 AS item 17).
   app.use("*", async (c, next) => {
