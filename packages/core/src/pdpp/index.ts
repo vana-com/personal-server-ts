@@ -107,6 +107,16 @@ export type {
 } from "./approval.js";
 
 export {
+  REDIRECT_FAILURES_ARE_NEVER_REDIRECTED,
+  validateRedirectUri,
+} from "./redirect.js";
+export type {
+  RedirectFailure,
+  RedirectFailureCode,
+  RegisteredRedirectPolicy,
+} from "./redirect.js";
+
+export {
   computeS256Challenge,
   PKCE_METHOD_S256,
   validateCodeChallenge,

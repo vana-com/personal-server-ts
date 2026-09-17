@@ -51,10 +51,12 @@ import {
   PDPP_API_VERSION,
   resolveRequesterIdentity,
   validateCodeChallenge,
+  validateRedirectUri,
   validateSelectionRequest,
   type DeclarationSnapshot,
   type InstanceInventory,
   type PdppAuthStore,
+  type RegisteredRedirectPolicy,
   type SelectionRequest,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { createWeb3AuthMiddleware } from "../middleware/web3-auth.js";
@@ -108,6 +110,13 @@ export interface PdppAuthRouteDeps {
     accessToken?: string;
     tokenStore?: TokenStore;
   };
+  /**
+   * Registered metadata for a client, used to validate `redirect_uri` by
+   * exact match (RFC 6749 §3.1.2.2). Returning null means the client is
+   * unregistered, and an unregistered client cannot receive an authorization
+   * code — the AS fails closed rather than trusting the requested target.
+   */
+  registeredClient?(clientId: string): RegisteredRedirectPolicy | null;
   /** AS-policy grant expiry, when the deployment sets one. */
   grantExpiryFor?(request: SelectionRequest): string | undefined;
   /**
@@ -302,6 +311,27 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         "invalid_request",
         "client_id and redirect_uri are required",
       );
+    }
+
+    // The authorization code travels in this redirect, so an unvalidated
+    // target is code exfiltration, not just an open redirect. PKCE does not
+    // help: an attacker who chose the redirect also chose the challenge and
+    // holds the verifier. RFC 6749 §4.1.2.1 forbids reporting this failure BY
+    // redirecting, so it is returned directly to the caller.
+    const redirectFailure = validateRedirectUri(
+      body.redirect_uri,
+      deps.registeredClient?.(body.client_id) ?? null,
+    );
+    if (redirectFailure) {
+      deps.logger.warn(
+        {
+          client_id: body.client_id,
+          redirect_uri: body.redirect_uri,
+          reason: redirectFailure.code,
+        },
+        "PDPP authorization refused: redirect_uri failed validation",
+      );
+      return errorResponse(c, 400, "invalid_request", redirectFailure.message);
     }
 
     // PKCE is validated before consent, not at redemption: a client whose flow

@@ -84,6 +84,12 @@ export const DEFAULTS = {
     // clients are public clients; without a verifier an intercepted code is
     // redeemable by whoever intercepted it.
     requirePkce: true,
+    // Registered clients. `redirect_uri` is validated by EXACT match against
+    // this list (RFC 6749 §3.1.2.2), because the authorization code is
+    // delivered through that redirect: an unvalidated target is code
+    // exfiltration, and PKCE does not help when the attacker chose the
+    // challenge. Empty means no client may start an authorization flow.
+    clients: [] as Array<{ clientId: string; redirectUris: string[] }>,
   },
 };
 
@@ -227,6 +233,16 @@ export const ServerConfigSchema = z.object({
         .array(z.string().min(1))
         .default(DEFAULTS.pdpp.declarationPaths),
       requirePkce: z.boolean().default(DEFAULTS.pdpp.requirePkce),
+      clients: z
+        .array(
+          z.object({
+            clientId: z.string().min(1),
+            // Absolute URIs only; the AS additionally enforces https (or
+            // loopback http) and exact matching at request time.
+            redirectUris: z.array(z.string().min(1)).min(1),
+          }),
+        )
+        .default(DEFAULTS.pdpp.clients),
     })
     .default(DEFAULTS.pdpp),
 });
