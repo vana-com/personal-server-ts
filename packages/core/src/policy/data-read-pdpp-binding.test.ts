@@ -298,8 +298,9 @@ describe("verifyDataReadPolicy — PDPP §6 grant binding", () => {
 
   it("fails closed when a PDPP read is attempted with no binding store configured", async () => {
     const h = harness();
-    await expectPolicyFailure(
-      verifyDataReadPolicy(
+    let thrown: unknown;
+    try {
+      await verifyDataReadPolicy(
         {
           signer: APP_A,
           grantId: "42",
@@ -311,9 +312,22 @@ describe("verifyDataReadPolicy — PDPP §6 grant binding", () => {
           authSessionVerifier: h.ports.authSessionVerifier,
           grantVerifier: h.ports.grantVerifier,
         },
-      ),
-      "SERVER_NOT_CONFIGURED",
-    );
+      );
+    } catch (error) {
+      thrown = error;
+    }
+
+    const err = thrown as {
+      errorCode?: string;
+      message?: string;
+      details?: Record<string, unknown>;
+    };
+    // The client learns only that nothing authorizes the read — not that the
+    // operator's server is misconfigured.
+    expect(err.errorCode).toBe("GRANT_REQUIRED");
+    expect(JSON.stringify(err.message)).not.toMatch(/configur/i);
+    // The operator still gets the real cause, in the logged details.
+    expect(err.details?.misconfigured).toBe(true);
   });
 
   // --- revocation ---------------------------------------------------------

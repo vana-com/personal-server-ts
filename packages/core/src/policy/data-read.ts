@@ -212,10 +212,17 @@ export async function verifyDataReadPolicy(
     // Fail closed. A PS that cannot check the binding must not serve the read
     // as if there were nothing to check — that would make the binding
     // bypassable by simply omitting the store.
+    //
+    // The client is told only that no binding authorizes the read. Reporting
+    // "this server is misconfigured" would disclose the operator's deployment
+    // state to an unauthorized caller, and the distinction is useless to a
+    // client either way: both mean "not authorized here". `misconfigured` is
+    // carried in the details for the operator's logs.
     if (!ports.pdppGrantBindings || !ports.chainDeployment) {
-      throw new ServerNotConfiguredError({
-        reason:
-          "PDPP grant binding store and chain deployment are required to serve a PDPP-authorized read",
+      throw new GrantRequiredError({
+        reason: "No binding authorizes this PDPP grant",
+        pdppGrantId: input.pdppGrantId,
+        misconfigured: true,
       });
     }
 
