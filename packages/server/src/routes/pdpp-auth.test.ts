@@ -589,6 +589,113 @@ describe("the consent review model the UI renders", () => {
   });
 });
 
+describe("§6 — instance choice over the wire", () => {
+  it("returns candidates instead of a review, then resolves on the pick", async () => {
+    eligible = ["spotify-account-a", "spotify-account-b"];
+    const ownerToken = tokens.issueOwnerToken({
+      subjectId: OWNER,
+    }).access_token;
+    const created = await post("/pdpp/v1/authorize", selectionBody());
+    const { session_id } = (await created.json()) as { session_id: string };
+
+    const pending = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review`,
+      { headers: ownerAuth(ownerToken) },
+    );
+    expect(pending.status).toBe(200);
+    const pendingBody = (await pending.json()) as {
+      review?: unknown;
+      instance_choice_required?: Array<{
+        stream: string;
+        candidates: string[];
+      }>;
+    };
+    expect(pendingBody.review).toBeUndefined();
+    expect(pendingBody.instance_choice_required).toEqual([
+      {
+        stream: "top_artists",
+        candidates: ["spotify-account-a", "spotify-account-b"],
+      },
+    ]);
+
+    // The owner picks; the choice rides along as a query parameter.
+    const picked = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review?${new URLSearchParams({
+        "instance[top_artists]": "spotify-account-b",
+      })}`,
+      { headers: ownerAuth(ownerToken) },
+    );
+    const pickedBody = (await picked.json()) as {
+      review: { data: { streams: Array<{ instance_ids: string[] }> } };
+    };
+    expect(pickedBody.review.data.streams[0].instance_ids).toEqual([
+      "spotify-account-b",
+    ]);
+  });
+
+  it("issues over exactly the chosen instance", async () => {
+    eligible = ["spotify-account-a", "spotify-account-b"];
+    const ownerToken = tokens.issueOwnerToken({
+      subjectId: OWNER,
+    }).access_token;
+    const created = await post("/pdpp/v1/authorize", selectionBody());
+    const { session_id } = (await created.json()) as { session_id: string };
+
+    const picked = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review?${new URLSearchParams({
+        "instance[top_artists]": "spotify-account-b",
+      })}`,
+      { headers: ownerAuth(ownerToken) },
+    );
+    const { review } = (await picked.json()) as {
+      review: { review_digest: string };
+    };
+
+    const approved = await post(
+      `/pdpp/v1/authorize/${session_id}/approve`,
+      {
+        review_digest: review.review_digest,
+        instance_choices: { top_artists: ["spotify-account-b"] },
+      },
+      ownerAuth(ownerToken),
+    );
+    expect(approved.status).toBe(200);
+    const { grant_id } = (await approved.json()) as { grant_id: string };
+    expect(store.getGrant(grant_id)!.grant.streams[0].instance_ids).toEqual([
+      "spotify-account-b",
+    ]);
+  });
+
+  it("answers 409 when the approved pick differs from the reviewed one", async () => {
+    eligible = ["spotify-account-a", "spotify-account-b"];
+    const ownerToken = tokens.issueOwnerToken({
+      subjectId: OWNER,
+    }).access_token;
+    const created = await post("/pdpp/v1/authorize", selectionBody());
+    const { session_id } = (await created.json()) as { session_id: string };
+
+    const picked = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review?${new URLSearchParams({
+        "instance[top_artists]": "spotify-account-b",
+      })}`,
+      { headers: ownerAuth(ownerToken) },
+    );
+    const { review } = (await picked.json()) as {
+      review: { review_digest: string };
+    };
+
+    const approved = await post(
+      `/pdpp/v1/authorize/${session_id}/approve`,
+      {
+        review_digest: review.review_digest,
+        instance_choices: { top_artists: ["spotify-account-a"] },
+      },
+      ownerAuth(ownerToken),
+    );
+    expect(approved.status).toBe(409);
+  });
+});
+
 describe("existing OAuth behavior is untouched", () => {
   it("serves PDPP under its own /pdpp/v1 prefix only", async () => {
     // The legacy /oauth/token surface is a different app and is not mounted

@@ -97,7 +97,9 @@ function pendingSession(request: SelectionRequest = selection()) {
     ownerToken,
     inventory: oneInstance,
   });
-  if (!review.ok) throw new Error("fixture: review fetch failed");
+  if (!review.ok || !review.result.review) {
+    throw new Error("fixture: review fetch failed");
+  }
   return {
     session,
     ownerToken,
@@ -281,6 +283,157 @@ describe("owner approval requires authentication, not affiliation", () => {
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.failure.code).toBe("session_not_found");
+  });
+});
+
+describe("§6 — instance choice is a consent step, not a dead end", () => {
+  const twoInstances: InstanceInventory = {
+    eligibleFor: () => ["account-a", "account-b"],
+  };
+
+  function sessionNeedingChoice() {
+    const session = sessions.create({
+      subjectId: OWNER,
+      request: selection(),
+      snapshot,
+      requester,
+      redirectUri: "https://app.example.com/callback",
+    });
+    const ownerToken = tokens.issueOwnerToken({
+      subjectId: OWNER,
+    }).access_token;
+    return { session, ownerToken };
+  }
+
+  it("surfaces the candidates instead of a review when a pick is needed", () => {
+    const { session, ownerToken } = sessionNeedingChoice();
+    const result = fetchReview({
+      sessions,
+      tokens,
+      sessionId: session.session_id,
+      ownerToken,
+      inventory: twoInstances,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // No review yet: there is no single decision to render.
+    expect(result.result.review).toBeUndefined();
+    expect(result.result.instance_choice_required).toEqual([
+      { stream: "top_artists", candidates: ["account-a", "account-b"] },
+    ]);
+  });
+
+  it("returns a reviewable decision once the owner picks", () => {
+    const { session, ownerToken } = sessionNeedingChoice();
+    const result = fetchReview({
+      sessions,
+      tokens,
+      sessionId: session.session_id,
+      ownerToken,
+      inventory: twoInstances,
+      instanceChoices: { top_artists: ["account-b"] },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.result.instance_choice_required).toBeUndefined();
+    expect(result.result.review?.data.streams[0].instance_ids).toEqual([
+      "account-b",
+    ]);
+  });
+
+  it("issues a grant over exactly the chosen instance", () => {
+    const { session, ownerToken } = sessionNeedingChoice();
+    const choices = { top_artists: ["account-b"] };
+    const reviewed = fetchReview({
+      sessions,
+      tokens,
+      sessionId: session.session_id,
+      ownerToken,
+      inventory: twoInstances,
+      instanceChoices: choices,
+    });
+    if (!reviewed.ok || !reviewed.result.review) return;
+
+    const result = approveAuthorization({
+      sessions,
+      tokens,
+      sessionId: session.session_id,
+      ownerToken,
+      reviewDigest: reviewed.result.review.review_digest,
+      inventory: twoInstances,
+      instanceChoices: choices,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.grant.streams[0].instance_ids).toEqual(["account-b"]);
+  });
+
+  it("rejects approval when the pick differs from the reviewed one", () => {
+    // Approving with a different handle than was reviewed must be stale, not
+    // a silent substitution of which account gets shared.
+    const { session, ownerToken } = sessionNeedingChoice();
+    const reviewed = fetchReview({
+      sessions,
+      tokens,
+      sessionId: session.session_id,
+      ownerToken,
+      inventory: twoInstances,
+      instanceChoices: { top_artists: ["account-b"] },
+    });
+    if (!reviewed.ok || !reviewed.result.review) return;
+
+    const result = approveAuthorization({
+      sessions,
+      tokens,
+      sessionId: session.session_id,
+      ownerToken,
+      reviewDigest: reviewed.result.review.review_digest,
+      inventory: twoInstances,
+      instanceChoices: { top_artists: ["account-a"] },
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.failure.code).toBe("stale_review");
+  });
+
+  it("cannot choose a handle the owner has not connected", () => {
+    // A pick narrows the eligible set; it never widens it.
+    const { session, ownerToken } = sessionNeedingChoice();
+    const result = fetchReview({
+      sessions,
+      tokens,
+      sessionId: session.session_id,
+      ownerToken,
+      inventory: twoInstances,
+      instanceChoices: { top_artists: ["someone-elses-account"] },
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it("asks for no choice when the request named its handles", () => {
+    const session = sessions.create({
+      subjectId: OWNER,
+      request: selection({
+        streams: [{ name: "top_artists", instance_ids: ["account-a"] }],
+      }),
+      snapshot,
+      requester,
+      redirectUri: "https://app.example.com/callback",
+    });
+    const ownerToken = tokens.issueOwnerToken({
+      subjectId: OWNER,
+    }).access_token;
+    const result = fetchReview({
+      sessions,
+      tokens,
+      sessionId: session.session_id,
+      ownerToken,
+      inventory: twoInstances,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.result.instance_choice_required).toBeUndefined();
+    expect(result.result.review).toBeDefined();
   });
 });
 

@@ -101,6 +101,7 @@ export type {
   ApprovalFailureCode,
   ApprovalResult,
   AuthorizationSession,
+  InstanceChoice,
   ReviewFetchResult,
   SessionState,
 } from "./approval.js";

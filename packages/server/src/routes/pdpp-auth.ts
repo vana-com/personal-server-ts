@@ -222,7 +222,15 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     );
   });
 
-  /** The consent review model, for the authenticated owner only. */
+  /**
+   * The consent review model, for the authenticated owner only.
+   *
+   * When a stream has several eligible instances and the request named none,
+   * the response carries `instance_choice_required` instead of a review: the
+   * owner picks, then re-fetches with `?instance[<stream>]=<handle>` repeated
+   * per handle. §6 forbids inferring fan-in from omission, so this is a
+   * consent step rather than a failure.
+   */
   app.get("/authorize/:session_id/review", (c) => {
     const sessionId = c.req.param("session_id");
     const session = deps.sessions.get(sessionId);
@@ -236,6 +244,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         session?.subject_id ?? "",
         session?.snapshot.source_id ?? "",
       ),
+      instanceChoices: parseInstanceChoices(c),
     });
 
     if (!result.ok) {
@@ -260,6 +269,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     let body: {
       review_digest?: string;
       explicit_ai_training_consent?: boolean;
+      instance_choices?: Record<string, string[]>;
     };
     try {
       body = await c.req.json();
@@ -277,6 +287,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         session?.subject_id ?? "",
         session?.snapshot.source_id ?? "",
       ),
+      instanceChoices: body.instance_choices,
       explicitAiTrainingConsent: body.explicit_ai_training_consent,
     });
 
@@ -533,4 +544,22 @@ function approvalStatus(code: string): 400 | 401 | 403 | 404 | 409 {
 
 function asString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * Read owner instance picks from repeated `instance[<stream>]=<handle>` query
+ * parameters, so a choice survives a plain GET re-fetch without the UI having
+ * to hold server state.
+ */
+function parseInstanceChoices(
+  c: Context,
+): Record<string, string[]> | undefined {
+  const choices: Record<string, string[]> = {};
+  const url = new URL(c.req.url);
+  for (const [key, value] of url.searchParams.entries()) {
+    const match = /^instance\[(.+)\]$/.exec(key);
+    if (!match || value.length === 0) continue;
+    (choices[match[1]] ??= []).push(value);
+  }
+  return Object.keys(choices).length > 0 ? choices : undefined;
 }
