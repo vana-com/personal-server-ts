@@ -22,6 +22,20 @@
  * Every response carries `Cache-Control: no-store` and `Pragma: no-cache`
  * (RFC 6749 §5.1 for token responses; delivery scope §1 requires it on every
  * token response specifically).
+ *
+ * Two things that cost integrators a debug cycle, so stated plainly:
+ *
+ *   - **Content types differ by endpoint.** `/authorize`, `/approve` and
+ *     `/deny` take JSON. `/token`, `/introspect` and `/revoke` take
+ *     `application/x-www-form-urlencoded`, because they follow the RFC 6749 /
+ *     7662 / 7009 wire conventions a standard OAuth client library already
+ *     speaks. Sending JSON to the form endpoints parses to an empty body and
+ *     reads as a missing parameter.
+ *   - **The review digest is nested.** `GET /authorize/:id/review` returns
+ *     `{ session_id, review, expires_at }`, so the digest is at
+ *     `review.review_digest`, not at the top level. The envelope also carries
+ *     `instance_choice_required` instead of `review` when the owner still has
+ *     an instance to pick.
  */
 
 import { Hono, type Context } from "hono";
