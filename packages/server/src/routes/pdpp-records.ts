@@ -1,7 +1,10 @@
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
-import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import type {
+  PdppAuthorizationService,
+  PdppTokenContext,
+} from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
   CursorExpiredError,
   InvalidCursorError,
@@ -49,6 +52,23 @@ function toPdppError(err: unknown): PdppError {
     );
   }
   throw err;
+}
+
+/**
+ * `PdppTokenContext.subjectId` is optional in the real AS contract (it may
+ * be absent on an inactive token). By the time route code reaches an
+ * owner-token branch the token is already known active, so a missing
+ * subjectId here is an AS-side bug, not a client error — fail closed rather
+ * than pass `undefined` through to instance-scoping.
+ */
+function requireSubjectId(context: PdppTokenContext): string {
+  if (!context.subjectId) {
+    throw new PdppError(
+      "authentication_error",
+      "Token context is missing subject_id",
+    );
+  }
+  return context.subjectId;
 }
 
 function sendError(c: Context, err: PdppError, reqId: string) {
@@ -157,7 +177,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
 
     const instanceIds =
       context.tokenKind === "owner"
-        ? (deps.instancesForSubject?.(context.subjectId) ?? [])
+        ? (deps.instancesForSubject?.(requireSubjectId(context)) ?? [])
         : (context.grant?.streams.flatMap((s) => s.instance_ids) ?? []);
 
     const streams = deps.store.listStreams(instanceIds);
@@ -240,7 +260,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const scope = resolveReadScope(context!, stream, declaration);
       const effectiveInstanceIds =
         context!.tokenKind === "owner"
-          ? (deps.instancesForSubject?.(context!.subjectId) ?? [])
+          ? (deps.instancesForSubject?.(requireSubjectId(context!)) ?? [])
           : scope.instanceIds;
 
       const { limit, clamped } = parseLimit(c.req.query("limit"));
@@ -348,7 +368,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
 
       const effectiveInstanceIds =
         context!.tokenKind === "owner"
-          ? (deps.instancesForSubject?.(context!.subjectId) ?? [])
+          ? (deps.instancesForSubject?.(requireSubjectId(context!)) ?? [])
           : scope.instanceIds;
 
       if (!recordKeyWithinGrantResources(recordKey, scope.streamGrant)) {
@@ -413,7 +433,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       if (!declaration) throw new PdppError("not_found", "Stream not found");
 
       const effectiveInstanceIds =
-        deps.instancesForSubject?.(context!.subjectId) ?? [];
+        deps.instancesForSubject?.(requireSubjectId(context!)) ?? [];
       let deletedAny = false;
       for (const instance of effectiveInstanceIds) {
         if (
