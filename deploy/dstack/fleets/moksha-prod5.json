@@ -3,8 +3,8 @@
   "gatewayUrl": "https://dp-rpc.moksha.vana.org",
   "rolledGitRef": {
     "NOTE": "not a render-fleet.py manifest field; pass at render time as --git-ref (must equal images.env PS_IMAGE_REF)",
-    "sha": "176c01ab8c0e6144ae0e64fdf0bfa273a25f40b7",
-    "source": "PS #322 merge commit; CI Docker run 35239436973 images.env; step43 controller-only roll"
+    "sha": "accaccae82253edc64c617361db4b3b2f4a72732",
+    "source": "PS #325 merge commit; CI Docker run 35273133698 images.env; step48 full controller+worker roll"
   },
   "gatewayDomain": "dstack-pha-prod5.phala.network",
   "operatorPublicKeySpkiBase64": "MCowBQYDK2VwAyEAPPx3xJ6NkAsPk1gT2v9E3s/huSL9MVG3S9D8e/Eqzjg=",
@@ -23,7 +23,7 @@
       "composeOut": "controller-compose.yml",
       "pinned": {
         "instanceId": "6223bcb478a5f5b7d11dae5713d9ff58501c090a",
-        "composeHash": "c82952138feeebdbff9ce80b68294955db107321e9bc1f9162135dc0853733c0"
+        "composeHash": "03d4a3560cd763f81c7f380b57283eafbad9dedf2b3419d6e7d2c964c318934b"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -74,7 +74,7 @@
       "composeOut": "worker-compose.yml",
       "pinned": {
         "instanceId": "eeea1588a1f55b129a2b14b24a1002719976f6a0",
-        "composeHash": "afab7e2945dd970f3ebf89207813f78f004f0088fba1deade7771f3dd8bcfec7"
+        "composeHash": "5e6015b31df5bf66cd517d62fc73802f8e9a943a8415b194f4a3e54c387cdf8e"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -125,7 +125,7 @@
       "composeOut": "worker-1-source-compose.yml",
       "pinned": {
         "instanceId": "1ac22335a2da1ca6a024396c4a557907279403ab",
-        "composeHash": "afab7e2945dd970f3ebf89207813f78f004f0088fba1deade7771f3dd8bcfec7"
+        "composeHash": "5e6015b31df5bf66cd517d62fc73802f8e9a943a8415b194f4a3e54c387cdf8e"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
