@@ -278,6 +278,15 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const cursor = c.req.query("cursor");
 
       if (c.req.query("changes_since") !== undefined) {
+        // `fields` is passed here for ELIGIBILITY narrowing only (spec §4:
+        // a record whose only change was to an unauthorized field must not
+        // appear as "changed" at all). The store returns each row's RAW,
+        // unprojected data regardless of `fields` — response-shaping
+        // projection happens only at toRecordJson below, after
+        // recordWithinGrantTimeConstraint has already run against the real
+        // field value. This split matters: if the store projected the
+        // returned data too, a grant whose fields exclude the
+        // time_constraint field would silently break that filter.
         const page = deps.store.changesSince(stream, {
           instanceIds: effectiveInstanceIds,
           changesSince: c.req.query("changes_since"),
@@ -312,7 +321,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             ...(page.nextChangesSince && {
               next_changes_since: page.nextChangesSince,
             }),
-            data: visible.map((row) => toRecordJson(stream, row)),
+            data: visible.map((row) => toRecordJson(stream, row, fields)),
             ...(clamped && { meta }),
           },
           200,
@@ -320,12 +329,14 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         );
       }
 
+      // Same ordering requirement as the changes_since branch above: fetch
+      // unprojected, filter by time_constraint against the real value, then
+      // project fields only in toRecordJson.
       const page = deps.store.listRecords(stream, {
         instanceIds: effectiveInstanceIds,
         limit,
         order,
         cursor,
-        fields,
       });
       const visible = page.data.filter(
         (row) =>
@@ -344,7 +355,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           object: "list",
           has_more: page.hasMore,
           ...(page.nextCursor && { next_cursor: page.nextCursor }),
-          data: visible.map((row) => toRecordJson(stream, row)),
+          data: visible.map((row) => toRecordJson(stream, row, fields)),
           ...(meta && { meta }),
         },
         200,
@@ -390,14 +401,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         throw new PdppError("not_found", "Record not found");
       }
 
-      const data =
-        scope.fields !== undefined
-          ? Object.fromEntries(
-              Object.entries(found.data).filter(([k]) =>
-                scope.fields!.includes(k),
-              ),
-            )
-          : found.data;
+      const data = projectFields(found.data, scope.fields);
 
       return c.json(
         {
@@ -507,7 +511,30 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   return app;
 }
 
-function toRecordJson(stream: string, row: PdppRecordRow) {
+/**
+ * Applies the grant's field projection to a record's data for the response
+ * body. Callers MUST filter by time_constraint against the record's
+ * unprojected data BEFORE calling this — projecting first would strip the
+ * time_constraint field before it can be compared, silently breaking the
+ * filter for any grant whose fields don't happen to include that field.
+ */
+function projectFields(
+  data: Record<string, unknown>,
+  fields: string[] | undefined,
+): Record<string, unknown> {
+  if (!fields) return data;
+  const projected: Record<string, unknown> = {};
+  for (const field of fields) {
+    if (field in data) projected[field] = data[field];
+  }
+  return projected;
+}
+
+function toRecordJson(
+  stream: string,
+  row: PdppRecordRow,
+  fields: string[] | undefined,
+) {
   if (row.deleted) {
     return {
       object: "record",
@@ -522,7 +549,7 @@ function toRecordJson(stream: string, row: PdppRecordRow) {
     object: "record",
     id: row.recordKey,
     stream,
-    data: row.data,
+    data: projectFields(row.data, fields),
     emitted_at: row.emittedAt,
   };
 }
