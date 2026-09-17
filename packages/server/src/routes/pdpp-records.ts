@@ -1,12 +1,12 @@
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
+import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import type {
   PdppAuthorizationService,
   PdppTokenContext,
   StreamGrant,
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
-import { PDPP_API_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
   CursorExpiredError,
   encodeCursor,
@@ -20,16 +20,6 @@ import {
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
-/**
- * The negotiated PDPP API version, shared with the Authorization Server.
- *
- * Both halves mount into one app and both hard-reject an unrecognized value,
- * so a client that pins one version must be able to reach both. Importing the
- * AS's constant rather than restating a literal is what keeps that true: the
- * two surfaces previously diverged ("0.1.0" vs "2026-04-06"), and a client
- * pinning either could reach only half the server.
- */
-const PDPP_VERSION = PDPP_API_VERSION;
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
 

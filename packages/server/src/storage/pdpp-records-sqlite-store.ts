@@ -23,15 +23,20 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
 /**
- * DDL for the desktop SQLite backend of the PDPP record persistence index.
+ * Schema migrations for the desktop SQLite backend of the PDPP record
+ * persistence index, applied in order and tracked in `pdpp_schema_version`
+ * so re-opening an existing database never re-runs or reinterprets an
+ * already-applied migration (C7: "no schema version, no ALTER path").
  *
- * `records` holds current state (one row per instance+stream+record_key).
- * `record_changes` holds full version history for mutable_state streams
+ * `pdpp_records` holds current state (one row per instance+stream+record_key).
+ * `pdpp_record_changes` holds full version history for mutable_state streams
  * (append_only streams only ever have one history row per key, at version 1,
- * since duplicates are no-ops). `blobs` holds binary payload metadata only;
- * actual bytes storage is out of scope for this table.
+ * since duplicates are no-ops). `pdpp_blobs` holds binary payload metadata
+ * only; actual bytes storage is out of scope for this table.
  */
-const SCHEMA_SQL = `
+const MIGRATIONS: string[] = [
+  // v1: initial schema.
+  `
 CREATE TABLE IF NOT EXISTS pdpp_records (
   instance TEXT NOT NULL,
   stream TEXT NOT NULL,
@@ -78,7 +83,64 @@ CREATE TABLE IF NOT EXISTS pdpp_write_clock (
   value INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO pdpp_write_clock (id, value) VALUES (1, 0);
-`;
+`,
+  // v2: blob_ref reverse index (C2 fix — blob authorization must be able to
+  // find the record that references a blob_id, not trust field-name
+  // presence alone). Extracted from data.blob_ref.blob_id at write time so
+  // lookup is an indexed column read, not a per-request JSON scan.
+  `
+ALTER TABLE pdpp_records ADD COLUMN blob_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_pdpp_records_blob_id
+  ON pdpp_records (blob_id);
+`,
+];
+
+function migrate(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS pdpp_schema_version (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      version INTEGER NOT NULL
+    );
+    INSERT OR IGNORE INTO pdpp_schema_version (id, version) VALUES (1, 0);
+  `);
+  const current = db
+    .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
+    .get() as { version: number };
+
+  const applyFrom = db.transaction((fromVersion: number) => {
+    for (let v = fromVersion; v < MIGRATIONS.length; v++) {
+      db.exec(MIGRATIONS[v]);
+    }
+    db.prepare("UPDATE pdpp_schema_version SET version = ? WHERE id = 1").run(
+      MIGRATIONS.length,
+    );
+  });
+
+  if (current.version < MIGRATIONS.length) {
+    applyFrom(current.version);
+  } else if (current.version > MIGRATIONS.length) {
+    // A newer schema version than this code knows how to read. Refuse to
+    // guess at compatibility rather than silently reinterpreting unknown
+    // state (matches the AS store's UnsupportedAuthStateError precedent).
+    throw new Error(
+      `pdpp_records database schema version ${current.version} is newer than this build supports (${MIGRATIONS.length}). Refusing to open — upgrade this build before opening this database.`,
+    );
+  }
+}
+
+function extractBlobId(data: Record<string, unknown> | null): string | null {
+  if (!data) return null;
+  const blobRef = data.blob_ref as { blob_id?: unknown } | undefined;
+  if (
+    blobRef &&
+    typeof blobRef === "object" &&
+    typeof blobRef.blob_id === "string"
+  ) {
+    return blobRef.blob_id;
+  }
+  return null;
+}
 
 interface RecordRowDb {
   instance: string;
@@ -132,7 +194,7 @@ function projectFields(
  */
 export function createSqliteRecordStore(db: Database): PdppRecordStore {
   db.pragma("journal_mode = WAL");
-  db.exec(SCHEMA_SQL);
+  migrate(db);
 
   const nextWriteSeq = db.prepare(
     "UPDATE pdpp_write_clock SET value = value + 1 WHERE id = 1 RETURNING value",
@@ -142,14 +204,15 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
     "SELECT * FROM pdpp_records WHERE instance = ? AND stream = ? AND record_key = ?",
   );
   const upsertCurrentStmt = db.prepare(`
-    INSERT INTO pdpp_records (instance, stream, record_key, data, version, emitted_at, deleted, deleted_at)
-    VALUES (@instance, @stream, @record_key, @data, @version, @emitted_at, @deleted, @deleted_at)
+    INSERT INTO pdpp_records (instance, stream, record_key, data, version, emitted_at, deleted, deleted_at, blob_id)
+    VALUES (@instance, @stream, @record_key, @data, @version, @emitted_at, @deleted, @deleted_at, @blob_id)
     ON CONFLICT (instance, stream, record_key) DO UPDATE SET
       data = excluded.data,
       version = excluded.version,
       emitted_at = excluded.emitted_at,
       deleted = excluded.deleted,
-      deleted_at = excluded.deleted_at
+      deleted_at = excluded.deleted_at,
+      blob_id = excluded.blob_id
   `);
   const insertHistoryStmt = db.prepare(`
     INSERT INTO pdpp_record_changes
@@ -163,6 +226,9 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
       mime_type = excluded.mime_type, size_bytes = excluded.size_bytes, sha256 = excluded.sha256
   `);
   const getBlobStmt = db.prepare("SELECT * FROM pdpp_blobs WHERE blob_id = ?");
+  const findBlobRefStmt = db.prepare(
+    "SELECT instance, stream, record_key FROM pdpp_records WHERE blob_id = ? AND deleted = 0 LIMIT 1",
+  );
 
   function latestVersion(
     instance: string,
@@ -215,6 +281,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
               emitted_at: envelope.emitted_at,
               deleted: 1,
               deleted_at: envelope.emitted_at,
+              blob_id: null,
             });
             insertHistoryStmt.run({
               instance: envelope.instance,
@@ -269,6 +336,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
             emitted_at: envelope.emitted_at,
             deleted: 0,
             deleted_at: null,
+            blob_id: extractBlobId(envelope.data),
           });
           insertHistoryStmt.run({
             instance: envelope.instance,
@@ -382,6 +450,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
         emitted_at: deletedAt,
         deleted: 1,
         deleted_at: deletedAt,
+        blob_id: null,
       });
       insertHistoryStmt.run({
         instance,
@@ -606,6 +675,16 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
         mimeType: row.mime_type,
         sizeBytes: row.size_bytes,
         sha256: row.sha256,
+      };
+    },
+    findBlobReference: (blobId: string) => {
+      const row = findBlobRefStmt.get(blobId) as
+        { instance: string; stream: string; record_key: string } | undefined;
+      if (!row) return undefined;
+      return {
+        instance: row.instance,
+        stream: row.stream,
+        recordKey: row.record_key,
       };
     },
     close: () => db.close(),

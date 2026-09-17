@@ -52,6 +52,10 @@
       "types": "./dist/errors/pdpp-catalog.d.ts",
       "import": "./dist/errors/pdpp-catalog.js"
     },
+    "./pdpp-version": {
+      "types": "./dist/pdpp-version.d.ts",
+      "import": "./dist/pdpp-version.js"
+    },
     "./ports/pdpp-auth": {
       "types": "./dist/ports/pdpp-auth.d.ts",
       "import": "./dist/ports/pdpp-auth.js"

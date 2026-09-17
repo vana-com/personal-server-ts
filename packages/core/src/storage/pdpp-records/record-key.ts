@@ -6,6 +6,26 @@
  * string-converted key values, in the order declared by the SourceDeclaration
  * `primary_key`. Every component is converted to a string before encoding,
  * even when the source value is a number, boolean, or date.
+ *
+ * Known encoding ambiguity (reviewed, not fixed — INFO, not exploitable):
+ * a single-field key whose literal string value happens to look like a
+ * minified JSON array, e.g. `'["a","b"]'`, encodes identically to the
+ * compound key `["a", "b"]`. Evaluated against how this collides in
+ * practice: `PdppRecordStore` keys every row by `(instance, stream,
+ * record_key)`, and a stream's declared `primary_key` arity is fixed at
+ * declaration time — a stream cannot be single-key for one record and
+ * compound-key for another. The ambiguous pair above can therefore only
+ * ever arise across two DIFFERENT streams (one single-key, one compound),
+ * which are different storage-key namespaces and never compared against
+ * each other. It cannot happen within one stream. It also does not widen a
+ * grant: `resources` matching is exact string `includes()`, never a prefix
+ * or substring match (`enforcement.ts`), so an aliased key string cannot be
+ * used to smuggle access to a record the grant didn't name. Not fixed here:
+ * changing the wire encoding (e.g. a type-tagged prefix) would need
+ * coordination with every existing reader of these keys (list/get/delete/
+ * blob routes here, and any client already parsing record IDs), which this
+ * lane should not do unilaterally for a risk that is bounded to data
+ * integrity within a single (currently impossible) same-stream collision.
  */
 
 import type { EnvelopeKey } from "./types.js";

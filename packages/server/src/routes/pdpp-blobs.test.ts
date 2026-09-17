@@ -4,7 +4,30 @@ import {
   createStreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { createFixtureAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth.test-utils";
+import type { Grant } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { pdppBlobsRoutes } from "./pdpp-blobs.js";
+
+function clientGrant(overrides: Partial<Grant["streams"][number]> = {}): Grant {
+  return {
+    version: "0.1.0",
+    grant_id: "grant_1",
+    issued_at: "2026-01-01T00:00:00Z",
+    subject: { id: "sub_1" },
+    client: { client_id: "client_1" },
+    source: { kind: "provider_native", id: "src_1" },
+    source_declaration: { version: "1" },
+    purpose_code: "test",
+    access_mode: "continuous",
+    streams: [
+      {
+        name: "media",
+        instance_ids: ["inst_1"],
+        fields: ["id", "blob_ref"],
+        ...overrides,
+      },
+    ],
+  };
+}
 
 const declarations = createStreamDeclarationRegistry([
   {
@@ -42,6 +65,21 @@ describe("pdpp blobs route", () => {
       sizeBytes: 10,
       sha256: "abc",
     });
+    // A blob_id alone is never sufficient (spec §8) -- even for an owner
+    // token, the blob must be referenced by an actual record.
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: "blob_1" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
     const app = pdppBlobsRoutes({
       store,
       auth: createFixtureAuthorizationService({
@@ -67,6 +105,19 @@ describe("pdpp blobs route", () => {
       sizeBytes: 10,
       sha256: "abc",
     });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: "blob_1" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
     const app = pdppBlobsRoutes({
       store,
       auth: createFixtureAuthorizationService({
@@ -82,6 +133,43 @@ describe("pdpp blobs route", () => {
     expect(res.headers.get("Content-Length")).toBe("10");
   });
 
+  it("rejects an owner token when the blob belongs to an instance outside instancesForSubject", async () => {
+    const store = createMemoryRecordStore();
+    store.putBlobMeta({
+      blobId: "blob_1",
+      mimeType: "image/jpeg",
+      sizeBytes: 10,
+      sha256: "abc",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_other",
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: "blob_1" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
+    const app = pdppBlobsRoutes({
+      store,
+      auth: createFixtureAuthorizationService({
+        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+      }),
+      declarations,
+      instancesForSubject: () => ["inst_1"], // does not include inst_other
+    });
+    const res = await app.request("/blob_1", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error.code).toBe("blob_not_found");
+  });
+
   it("returns 401 without a token", async () => {
     const store = createMemoryRecordStore();
     const app = pdppBlobsRoutes({
@@ -91,5 +179,137 @@ describe("pdpp blobs route", () => {
     });
     const res = await app.request("/blob_1");
     expect(res.status).toBe(401);
+  });
+
+  it("serves a blob to a client token whose grant covers the referencing record", async () => {
+    // Correctly-scoped case, spec §8 "Get a blob": the grant includes the
+    // stream, the referencing record's instance and resources are within
+    // scope, and blob_ref is in the granted fields.
+    const store = createMemoryRecordStore();
+    store.putBlobMeta({
+      blobId: "blob_ok",
+      mimeType: "image/jpeg",
+      sizeBytes: 3,
+      sha256: "abc",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: "blob_ok" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
+    const app = pdppBlobsRoutes({
+      store,
+      auth: createFixtureAuthorizationService({
+        "client-tok": {
+          active: true,
+          tokenKind: "client",
+          subjectId: "sub_1",
+          grant: clientGrant(),
+        },
+      }),
+      declarations,
+      readBlobBytes: async () => new Uint8Array(3),
+    });
+    const res = await app.request("/blob_ok", {
+      headers: { Authorization: "Bearer client-tok" },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Length")).toBe("3");
+  });
+
+  it("denies a client token whose grant does not cover the record referencing the blob (C2 regression)", async () => {
+    // The exact defect this fix closes: a grant scoped to a DIFFERENT
+    // instance and a DIFFERENT resources allowlist, naming no record that
+    // references this blob, must not be able to fetch it merely because
+    // some stream's field list happens to include "blob_ref".
+    const store = createMemoryRecordStore();
+    store.putBlobMeta({
+      blobId: "blob_private",
+      mimeType: "image/jpeg",
+      sizeBytes: 3,
+      sha256: "abc",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_private",
+          stream: "media",
+          key: "media_private",
+          data: { id: "media_private", blob_ref: { blob_id: "blob_private" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
+    const app = pdppBlobsRoutes({
+      store,
+      auth: createFixtureAuthorizationService({
+        "client-tok": {
+          active: true,
+          tokenKind: "client",
+          subjectId: "sub_1",
+          grant: clientGrant({
+            instance_ids: ["inst_other"],
+            resources: ["some_other_record"],
+          }),
+        },
+      }),
+      declarations,
+      readBlobBytes: async () => new Uint8Array(3),
+    });
+    const res = await app.request("/blob_private", {
+      headers: { Authorization: "Bearer client-tok" },
+    });
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error.code).toBe("blob_not_found");
+  });
+
+  it("denies a client token when blob_ref is not in the grant's authorized fields for the referencing stream", async () => {
+    const store = createMemoryRecordStore();
+    store.putBlobMeta({
+      blobId: "blob_1",
+      mimeType: "image/jpeg",
+      sizeBytes: 3,
+      sha256: "abc",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: "blob_1" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
+    const app = pdppBlobsRoutes({
+      store,
+      auth: createFixtureAuthorizationService({
+        "client-tok": {
+          active: true,
+          tokenKind: "client",
+          subjectId: "sub_1",
+          grant: clientGrant({ fields: ["id"] }), // blob_ref not granted
+        },
+      }),
+      declarations,
+    });
+    const res = await app.request("/blob_1", {
+      headers: { Authorization: "Bearer client-tok" },
+    });
+    expect(res.status).toBe(404);
   });
 });
