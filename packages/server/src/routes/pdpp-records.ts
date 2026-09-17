@@ -11,6 +11,7 @@ import {
   CursorExpiredError,
   encodeCursor,
   InvalidCursorError,
+  InvalidCursorSyntaxError,
   recordKeyWithinGrantResources,
   mapInactiveToError,
   recordWithinGrantTimeConstraint,
@@ -48,7 +49,17 @@ function toPdppError(err: unknown): PdppError {
   if (err instanceof CursorExpiredError) {
     return new PdppError("cursor_expired", "changes_since cursor has expired");
   }
-  if (err instanceof InvalidCursorError) {
+  // Two distinct classes reach here and both mean "this cursor is not usable":
+  // the stores throw `InvalidCursorError` (decoded fine, but wrong order or
+  // wrong kind), while `decodeCursor` throws `InvalidCursorSyntaxError` for a
+  // token that is not even base64url JSON. Only the first was mapped, so a
+  // malformed cursor escaped as an unhandled throw -- a 500 with no PDPP error
+  // body, telling a client nothing and looking like a server fault when it was
+  // a bad request.
+  if (
+    err instanceof InvalidCursorError ||
+    err instanceof InvalidCursorSyntaxError
+  ) {
     return new PdppError(
       "invalid_cursor",
       "Cursor token is malformed, unrecognized, or was reused with a different order",
@@ -75,10 +86,39 @@ function requireSubjectId(context: PdppTokenContext): string {
 }
 
 function sendError(c: Context, err: PdppError, reqId: string) {
-  return c.json(err.toJSON(reqId), err.status as never, {
+  // Every 401 carries the challenge, whichever branch produced it.
+  //
+  // Previously only the missing-token branch built one, so a client holding a
+  // STALE token -- the exact case §8's challenge exists to bootstrap -- got a
+  // bare 401 with no `WWW-Authenticate` and no pointer to the metadata it
+  // needed in order to re-authorize. Attaching it here rather than at each
+  // call site means a future 401 path cannot forget it.
+  const headers: Record<string, string> = {
     "Request-Id": reqId,
     "PDPP-Version": PDPP_VERSION,
-  });
+  };
+  if (err.status === 401) {
+    headers["WWW-Authenticate"] =
+      `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`;
+  }
+  return c.json(err.toJSON(reqId), err.status as never, headers);
+}
+
+/**
+ * The RFC 9728 protected-resource metadata URL for THIS request's origin.
+ *
+ * RFC 9728 §5.1 requires `resource_metadata` to be a URI the client can
+ * dereference. A relative path only resolves if the client already knows the
+ * origin -- which an unauthenticated client bootstrapping discovery from a
+ * failed read cannot be assumed to have. Deriving it from the request also
+ * keeps it correct behind a tunnel or proxy, where a hardcoded origin would
+ * point the client somewhere it cannot reach.
+ */
+export function resourceMetadataUrlFor(c: Context): string {
+  return new URL(
+    "/.well-known/oauth-protected-resource",
+    new URL(c.req.url).origin,
+  ).toString();
 }
 
 function unauthorized(c: Context, reqId: string, resourceMetadataUrl: string) {
@@ -118,6 +158,49 @@ function parseOrder(raw: string | undefined): "asc" | "desc" {
 
 const CLIENT_REJECTED_PARAMS = ["filter", "view", "expand", "expand_limit"];
 
+/**
+ * Query parameters each endpoint implements in v0.1.
+ *
+ * Spec-core.md §8: "Unknown parameters return 400". Silently ignoring one is
+ * worse than it looks -- a client that misspells `limit` as `limt`, or sends a
+ * parameter a later version defines, gets a 200 that quietly did something
+ * other than what was asked. Accepting an unknown constraint is
+ * indistinguishable from applying it.
+ *
+ * `filter`/`view`/`expand`/`expand_limit` are deliberately absent here and
+ * handled separately: they are KNOWN parameters that owner tokens may use and
+ * client tokens may not, so they earn a more specific message than "unknown".
+ */
+const KNOWN_QUERY_PARAMS: Record<string, readonly string[]> = {
+  listStreams: [],
+  streamMetadata: [],
+  listRecords: ["limit", "order", "cursor", "fields", "changes_since"],
+  getRecord: ["fields"],
+  deleteRecord: [],
+};
+
+/**
+ * Rejects any query parameter this endpoint does not implement.
+ *
+ * Bracketed forms (`filter[x]`) count as the base name so the client-token
+ * rejection above can give its more specific error rather than this one.
+ */
+function rejectUnknownParams(
+  c: Context,
+  endpoint: keyof typeof KNOWN_QUERY_PARAMS,
+) {
+  const allowed = KNOWN_QUERY_PARAMS[endpoint];
+  const url = new URL(c.req.url);
+  for (const key of url.searchParams.keys()) {
+    const base = key.replace(/\[.*$/, "");
+    if (allowed.includes(base)) continue;
+    if (CLIENT_REJECTED_PARAMS.includes(base)) continue;
+    throw new PdppError("invalid_request", `Unknown query parameter '${key}'`, {
+      param: key,
+    });
+  }
+}
+
 function rejectClientOnlyParams(c: Context) {
   const url = new URL(c.req.url);
   for (const key of url.searchParams.keys()) {
@@ -135,8 +218,6 @@ function rejectClientOnlyParams(c: Context) {
 
 export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   const app = new Hono();
-  const resourceMetadataUrl = "/.well-known/oauth-protected-resource";
-
   app.use("*", async (c, next) => {
     const reqId = requestId();
     c.set("reqId" as never, reqId as never);
@@ -147,7 +228,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     const header = c.req.header("Authorization");
     const token = header?.match(/^Bearer\s+(.+)$/i)?.[1];
     if (!token) {
-      return { error: unauthorized(c, reqId, resourceMetadataUrl) };
+      return { error: unauthorized(c, reqId, resourceMetadataUrlFor(c)) };
     }
     const context = await deps.auth.resolveToken(token);
     return { context };
@@ -171,6 +252,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     const reqId = requestId();
     const { context, error } = await authenticate(c, reqId);
     if (error) return error;
+    try {
+      rejectUnknownParams(c, "listStreams");
+    } catch (err) {
+      return sendError(c, toPdppError(err), reqId);
+    }
     // An inactive token must report the SAME reason here as on a record read.
     // This branch used to answer a flat `authentication_error` (401) while
     // `/streams/:stream/records` answered `grant_revoked` (403) for the very
@@ -261,6 +347,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     if (error) return error;
 
     try {
+      rejectUnknownParams(c, "streamMetadata");
       const stream = c.req.param("stream");
       const declaration = deps.declarations.get(stream);
       const scope = resolveReadScope(context!, stream, declaration);
@@ -312,6 +399,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     if (error) return error;
 
     try {
+      rejectUnknownParams(c, "listRecords");
       const stream = c.req.param("stream");
       if (context!.tokenKind === "client") rejectClientOnlyParams(c);
 
@@ -468,6 +556,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     if (error) return error;
 
     try {
+      rejectUnknownParams(c, "getRecord");
       const stream = c.req.param("stream");
       const recordKey = decodeURIComponent(c.req.param("id"));
       const declaration = deps.declarations.get(stream);
@@ -521,6 +610,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     if (error) return error;
 
     try {
+      rejectUnknownParams(c, "deleteRecord");
       if (context!.tokenKind !== "owner") {
         throw new PdppError(
           "authentication_error",
