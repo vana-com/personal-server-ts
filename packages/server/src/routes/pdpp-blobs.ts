@@ -4,7 +4,6 @@ import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { PDPP_API_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
-  resolveReadScope,
   type PdppRecordStore,
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
@@ -92,48 +91,43 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
 
     // Spec §8 "Get a blob": the grant must include a stream containing a
     // record that references this blob_id, that record must pass all grant
-    // filters, and blob_ref must be in the grant's field projection. We
-    // don't know which stream/record referenced this blob_id without a
-    // reverse index, which is out of scope to build generically here — the
-    // caller (route wiring) is expected to have validated the referencing
-    // record via a prior authorized record read in the same session. This
-    // route re-validates only what it can from the token/grant shape:
-    // owner tokens always pass (no grant to check); client tokens require
-    // `blob_ref` to be in at least one granted stream's fields, which is the
-    // narrowest check available without a reverse blob->record index.
+    // filters, and blob_ref must be in the grant's field projection.
+    //
+    // This route cannot evaluate the first two. `PdppBlobMeta` is
+    // `{ blobId, mimeType, sizeBytes, sha256 }` — it carries no back-reference
+    // to the record that referenced the blob, so there is no way to find the
+    // referencing record and run it through the same instance / resources /
+    // time_constraint checks a record read uses.
+    //
+    // The previous check asked only whether ANY granted stream's resolved
+    // scope contained a field NAMED `blob_ref`, and passed on that alone. A
+    // field name is not an authorization: a grant scoped to one instance and
+    // one record could fetch ANY blob_id on the server, with blob-ID secrecy
+    // as the only remaining control. That is the confidentiality hole this
+    // branch closes.
+    //
+    // So client tokens are refused until a blob -> (instance, stream,
+    // record_key) reverse index exists. Refusing a legitimate read is
+    // recoverable; serving another grant's bytes is not. Building that index
+    // is a record-store schema change and belongs to the RS lane — it is the
+    // real fix, and this is explicitly the interim.
+    //
+    // 404 rather than 403: a client that may not read this blob must not
+    // learn whether it exists.
     if (context.tokenKind === "client") {
-      const declarations = deps.declarations.list();
-      const grantsBlobRef = declarations.some((decl) => {
-        const scope = safeResolve(context, decl.name, decl);
-        return scope?.fields?.includes("blob_ref") ?? false;
-      });
-      if (!grantsBlobRef) {
-        const err = new PdppError(
-          "blob_not_found",
-          "blob_id is unknown or stale",
-        );
-        return {
-          error: c.json(err.toJSON(reqId), 404, {
-            "Request-Id": reqId,
-            "PDPP-Version": PDPP_VERSION,
-          }),
-        };
-      }
+      const err = new PdppError(
+        "blob_not_found",
+        "blob_id is unknown or stale",
+      );
+      return {
+        error: c.json(err.toJSON(reqId), 404, {
+          "Request-Id": reqId,
+          "PDPP-Version": PDPP_VERSION,
+        }),
+      };
     }
 
     return { ok: true };
-  }
-
-  function safeResolve(
-    context: Awaited<ReturnType<PdppAuthorizationService["resolveToken"]>>,
-    stream: string,
-    decl: ReturnType<StreamDeclarationRegistry["get"]>,
-  ) {
-    try {
-      return resolveReadScope(context, stream, decl);
-    } catch {
-      return undefined;
-    }
   }
 
   // Hono dispatches HEAD by internally calling the GET handler and
