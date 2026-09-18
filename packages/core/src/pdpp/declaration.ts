@@ -458,6 +458,31 @@ export function parseDeclaration(
       };
     }
 
+    // §5 `streams[].consent_time_field`: "MUST reference a field declared in
+    // the schema."
+    //
+    // Its own check, not folded into the one above, because this field is not
+    // read ordering — §6 makes its PRESENCE the authoritative signal that a
+    // stream is time-range-capable, and it is the field a `time_range` grant
+    // is evaluated against. An undeclared one therefore advertises a consent
+    // boundary with no column behind it: an owner who approves "the last six
+    // months" has that bound applied to nothing.
+    //
+    // Absence stays legal — §5: "Streams that cannot define a stable
+    // `consent_time_field` simply omit it."
+    if (
+      typeof s.consent_time_field === "string" &&
+      !fields.includes(s.consent_time_field)
+    ) {
+      return {
+        ok: false,
+        failure: {
+          code: "invalid_document",
+          message: `stream '${s.name}' names consent_time_field '${s.consent_time_field}', which its schema does not declare`,
+        },
+      };
+    }
+
     // §5 stream semantics. An unrecognized value is a rejection rather than a
     // silent fallback: coercing an unknown semantics to `mutable_state` would
     // upsert records a declaration may have meant to be immutable.
