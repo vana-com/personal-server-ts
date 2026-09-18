@@ -18,7 +18,7 @@
  * below prove the surface stays absent when the deployment cannot support it.
  */
 
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -749,5 +749,116 @@ describe("review C1 — PDPP-Version is the spec's HTTP contract version", () =>
     });
     expect(response.status).toBe(400);
     expect((await response.json()).error).toBe("unsupported_version");
+  });
+});
+
+/**
+ * The real boot path, fed the real normative producer document.
+ *
+ * The AS previously did not mount for a §5-conformant declaration at all. The
+ * deployment loader read the flat `source_id` directly, so a normative
+ * document — which nests it under `source.id` — was skipped BEFORE
+ * `parseDeclaration` (which understands both shapes) ever saw it. The whole
+ * failure surfaced as one warning about a missing field the document was
+ * never supposed to have, and then `/pdpp/v1` simply was not there.
+ *
+ * So the check that matters is not "does the parser accept this" — it always
+ * did — but "does a server booted the way the CLI boots it actually serve the
+ * AS for this document". That is what these drive, using the byte-for-byte
+ * Unity producer artifact rather than a hand-written substitute, because a
+ * fixture I wrote to match my own loader would prove nothing about the
+ * documents real producers publish.
+ */
+describe("the real boot path mounts the AS for a normative declaration", () => {
+  /** The vendored producer artifact: normative §5, no flat `source_id`. */
+  async function writeNormativeDeclaration(): Promise<string> {
+    const source = await readFile(
+      join(
+        import.meta.dirname,
+        "../../../core/src/pdpp/__fixtures__/instagram.source-declaration.json",
+      ),
+      "utf-8",
+    );
+    // Guard the premise: if this ever grows a flat source_id, these tests
+    // would silently stop covering the normative shape.
+    expect(JSON.parse(source).source_id).toBeUndefined();
+    expect(JSON.parse(source).source.id).toBe(
+      "https://registry.pdpp.dev/connectors/instagram",
+    );
+
+    const dir = join(tempDir, "declarations");
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, "instagram.source-declaration.json");
+    await writeFile(path, source, "utf-8");
+    return path;
+  }
+
+  it("mounts /pdpp/v1 for a normative-only document", async () => {
+    await seedScope("instagram.profile");
+    ctx = await boot(pdppConfig([await writeNormativeDeclaration()]));
+
+    const response = await ctx.app.request("/pdpp/v1/owner/token", {
+      method: "POST",
+      headers: { authorization: `Bearer ${ctx.devToken}` },
+    });
+
+    // Previously 404: nothing was retained, so the AS never mounted.
+    expect(response.status).toBe(200);
+  });
+
+  it("resolves the normative declaration in a real authorize request", async () => {
+    await seedScope("instagram.profile");
+    ctx = await boot(pdppConfig([await writeNormativeDeclaration()]));
+
+    const minted = await ctx.app.request("/pdpp/v1/owner/token", {
+      method: "POST",
+      headers: { authorization: `Bearer ${ctx.devToken}` },
+    });
+    expect(minted.status).toBe(200);
+    const { access_token } = (await minted.json()) as { access_token: string };
+
+    const authorized = await ctx.app.request("/pdpp/v1/authorize", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${access_token}`,
+      },
+      body: JSON.stringify({
+        client_id: "music_recommendations",
+        redirect_uri: REDIRECT,
+        state: "xyz",
+        code_challenge: CHALLENGE,
+        code_challenge_method: "S256",
+        authorization_details: [
+          {
+            type: "https://pdpp.dev/data-access",
+            source: { id: "https://registry.pdpp.dev/connectors/instagram" },
+            purpose_code: "https://pdpp.dev/purpose/personalization",
+            access_mode: "continuous",
+            streams: [{ name: "profile" }],
+          },
+        ],
+      }),
+    });
+
+    // The end of the chain: mounted, retained under the id the document
+    // nests, and resolvable by an authorize request naming that same id.
+    expect(authorized.status).toBe(201);
+
+    // And the fields projected out of the document's JSON Schema are real:
+    // the review the owner would see lists them.
+    const { session_id } = (await authorized.json()) as { session_id: string };
+    const reviewed = await ctx.app.request(
+      `/pdpp/v1/authorize/${session_id}/review`,
+      { headers: { authorization: `Bearer ${access_token}` } },
+    );
+    expect(reviewed.status).toBe(200);
+    const review = (await reviewed.json()) as {
+      review: { data: { streams: { name: string; fields: string[] }[] } };
+    };
+    const profile = review.review.data.streams.find(
+      (stream) => stream.name === "profile",
+    );
+    expect(profile?.fields.length).toBeGreaterThan(0);
   });
 });

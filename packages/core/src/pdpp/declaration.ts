@@ -170,6 +170,36 @@ export function checkDeclarationUrl(
  * needs — the checks that follow do that, and they run on the projected form
  * so one code path enforces both.
  */
+/**
+ * The source id a declaration document claims, in either shape.
+ *
+ * A caller that needs the id *before* parsing — a deployment loader keying
+ * retention by source, say — would otherwise have to reach into the document
+ * itself and pick a field. That is how the boot path came to accept only the
+ * internal flat `source_id` and silently skip every normative document, which
+ * left the AS unmounted with nothing but a warning to say why.
+ *
+ * Reading the shape is this module's job, so the question is answered here
+ * once. Returns null when neither shape carries a usable id; `parseDeclaration`
+ * remains the authority on whether the document is actually valid.
+ */
+export function declaredSourceId(body: string): string | null {
+  let doc: unknown;
+  try {
+    doc = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (typeof doc !== "object" || doc === null) return null;
+
+  // Normative §5: `source.id`. Internal/flat: `source_id`.
+  const nested = (doc as { source?: { id?: unknown } }).source?.id;
+  const flat = (doc as { source_id?: unknown }).source_id;
+  const id = typeof nested === "string" && nested.length > 0 ? nested : flat;
+
+  return typeof id === "string" && id.length > 0 ? id : null;
+}
+
 function normalizeNormativeDeclaration(
   doc: RawDeclarationDocument,
 ): RawDeclarationDocument {

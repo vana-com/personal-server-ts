@@ -141,6 +141,7 @@ export type {
 export {
   checkDeclarationUrl,
   computeDeclarationDigest,
+  declaredSourceId,
   DECLARATION_FETCH_TIMEOUT_MS,
   MAX_DECLARATION_BYTES,
   MAX_REDIRECTS,

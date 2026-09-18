@@ -22,6 +22,7 @@ import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
   AuthorizationSessionStore,
+  declaredSourceId,
   openPdppAuthStore,
   PdppTokenService,
   UnsupportedAuthStateError,
@@ -223,12 +224,21 @@ async function readDeclarations(
   for (const path of paths) {
     try {
       const document = await readFile(path, "utf-8");
-      // The source_id is the declaration's own claim; `parseDeclaration`
+      // The source id is the declaration's own claim; `parseDeclaration`
       // cross-checks it, so read it here only to key the retention.
-      const sourceId = (JSON.parse(document) as { source_id?: string })
-        .source_id;
-      if (typeof sourceId !== "string" || sourceId.length === 0) {
-        logger.warn({ path }, "PDPP declaration has no source_id — skipped");
+      //
+      // Asking Core for the id rather than picking a field keeps the boot path
+      // shape-agnostic. Reading `source_id` directly meant a normative §5
+      // document -- which nests it under `source.id` -- was skipped here before
+      // the parser (which handles both) ever saw it, so the AS never mounted
+      // and the only evidence was a warning about a missing field the document
+      // was never supposed to have.
+      const sourceId = declaredSourceId(document);
+      if (sourceId === null) {
+        logger.warn(
+          { path },
+          "PDPP declaration declares no source id — skipped",
+        );
         continue;
       }
       out.push({ sourceId, document });
