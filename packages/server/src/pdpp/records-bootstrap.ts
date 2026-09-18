@@ -166,5 +166,10 @@ function toStreamDeclarations(
     cursorField: "emitted_at",
     consentTimeField: stream.consent_time_field,
     requiredFields: stream.required_fields,
+    // §8 stream metadata reports both; carried from the retained declaration
+    // rather than reconstructed, so what a client is told matches what the
+    // owner consented against.
+    ...(stream.schema && { schema: stream.schema }),
+    ...(stream.selection && { selection: stream.selection }),
   }));
 }

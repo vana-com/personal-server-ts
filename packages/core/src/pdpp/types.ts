@@ -197,6 +197,10 @@ export interface DeclaredStream {
   consent_time_field?: string;
   /** Arity of the primary key; `resources` entries are validated against it. */
   primary_key: string[];
+  /** The stream's JSON Schema from a normative §5 declaration, when present. */
+  schema?: Record<string, unknown>;
+  /** Declared selection capabilities, e.g. `{ fields: true, resources: false }`. */
+  selection?: Record<string, unknown>;
 }
 
 export interface DeclaredView {

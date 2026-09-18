@@ -18,6 +18,21 @@ export interface StreamDeclaration {
   consentTimeField?: string;
   /** Always included in a sparse `fields` projection, even if not requested. */
   requiredFields: string[];
+  /**
+   * The stream's JSON Schema from the retained declaration (§5).
+   *
+   * §8 stream metadata carries this so a client can understand record shape
+   * without a second lookup. Optional because a deployment may boot from a
+   * private-shape declaration that has no schema to carry; the route then
+   * falls back to a field-name projection rather than fabricating one.
+   */
+  schema?: Record<string, unknown>;
+  /**
+   * The stream's declared selection capabilities (§5), e.g.
+   * `{ fields: true, resources: false }`. §8 metadata reports what the source
+   * supports so a client knows which selections are even expressible.
+   */
+  selection?: Record<string, unknown>;
 }
 
 export interface StreamDeclarationRegistry {

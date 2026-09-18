@@ -422,6 +422,14 @@ export function parseDeclaration(
         consent_time_field: s.consent_time_field,
       }),
       primary_key: s.primary_key as string[],
+      // Carried verbatim from the normative declaration so §8 metadata can
+      // report record shape and selection capability without a second lookup.
+      ...(typeof s.schema === "object" && s.schema !== null
+        ? { schema: s.schema as Record<string, unknown> }
+        : {}),
+      ...(typeof s.selection === "object" && s.selection !== null
+        ? { selection: s.selection as Record<string, unknown> }
+        : {}),
     });
   }
 

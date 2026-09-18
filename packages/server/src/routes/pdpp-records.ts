@@ -18,6 +18,7 @@ import {
   resolveReadScope,
   type PdppRecordRow,
   type PdppRecordStore,
+  type StreamDeclaration,
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
@@ -235,6 +236,80 @@ function rejectUnknownParams(
   }
 }
 
+/**
+ * Narrow a client's requested `fields` within what its grant already allows.
+ *
+ * Three rules, in order:
+ *   - a field outside the grant is a 400, not a silent drop. A client asking
+ *     for something it was never granted has made an error it needs to see;
+ *     quietly returning less would let it believe it received that field.
+ *   - the result is the intersection, so a request can only ever narrow.
+ *   - the declaration's required fields are re-added, because §8 keeps
+ *     schema-required fields in every projection regardless of the request.
+ *
+ * Returns the full granted set when no `fields` was requested, preserving the
+ * existing default.
+ */
+function narrowClientFields(
+  requested: string[] | undefined,
+  granted: string[] | undefined,
+  declaration: StreamDeclaration | undefined,
+): string[] | undefined {
+  if (!requested || requested.length === 0) return granted;
+  if (!granted) return requested;
+
+  const grantedSet = new Set(granted);
+  for (const field of requested) {
+    if (!grantedSet.has(field)) {
+      throw new PdppError(
+        "invalid_request",
+        `Field '${field}' is not in this grant's authorized fields for the stream`,
+        { param: "fields" },
+      );
+    }
+  }
+
+  const narrowed = new Set(requested.filter((f) => grantedSet.has(f)));
+  // The consent floor survives a sparse request.
+  for (const required of declaration?.requiredFields ?? []) {
+    if (grantedSet.has(required)) narrowed.add(required);
+  }
+  return Array.from(narrowed);
+}
+
+/**
+ * Project a declared JSON Schema down to exactly the granted fields.
+ *
+ * A client token must not learn that a field exists outside its grant, so
+ * `properties` is filtered rather than passed through, and `required` is
+ * intersected. Without a declared schema this degrades to bare property names
+ * — the previous behavior — rather than inventing structure.
+ */
+function projectSchemaToFields(
+  schema: Record<string, unknown> | undefined,
+  fields: string[] | undefined,
+): Record<string, unknown> {
+  const allowed = new Set(fields ?? []);
+  if (!schema) {
+    return {
+      properties: Object.fromEntries([...allowed].map((f) => [f, {}])),
+    };
+  }
+
+  const properties = (schema.properties ?? {}) as Record<string, unknown>;
+  const required = Array.isArray(schema.required)
+    ? (schema.required as string[]).filter((f) => allowed.has(f))
+    : [];
+
+  return {
+    ...schema,
+    properties: Object.fromEntries(
+      Object.entries(properties).filter(([name]) => allowed.has(name)),
+    ),
+    ...(required.length > 0 ? { required } : { required: [] }),
+  };
+}
+
 function rejectClientOnlyParams(c: Context) {
   const url = new URL(c.req.url);
   for (const key of url.searchParams.keys()) {
@@ -440,6 +515,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             query: {},
             views: [],
             relationships: [],
+            // §8 owner metadata carries the full declared schema and
+            // selection capability. Omitting them made this a public response
+            // contract mismatch that access-behavior fixtures could not see.
+            schema: declaration!.schema ?? null,
+            selection: declaration!.selection ?? null,
           },
           200,
           { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
@@ -456,11 +536,14 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           query: {},
           views: [],
           relationships: [],
-          schema: {
-            properties: Object.fromEntries(
-              (scope.fields ?? []).map((f) => [f, {}]),
-            ),
-          },
+          // Grant-closed: the declared schema projected to exactly the
+          // granted fields, so a client token learns record shape without
+          // learning the existence of fields it was not granted. Falls back
+          // to bare field names when the retained declaration carries no
+          // schema, rather than fabricating one.
+          schema: projectSchemaToFields(declaration!.schema, scope.fields),
+          // The frozen selection capability the grant was resolved against.
+          selection: declaration!.selection ?? null,
         },
         200,
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
@@ -493,9 +576,18 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         .query("fields")
         ?.split(",")
         .map((f) => f.trim());
+      // §8: `fields` is a sparse fieldset on the durable client surface, and
+      // an unsupported shape must not be silently ignored. A client token
+      // previously had its `fields` parsed and then discarded, so
+      // `?fields=id` returned every granted field — the response did
+      // something other than what was asked, with a 200.
+      //
+      // A client may only NARROW within its grant; it can never widen. So the
+      // request is validated against the granted set, then intersected with
+      // it, then the schema-required floor is re-added.
       const fields =
         context!.tokenKind === "client"
-          ? scope.fields
+          ? narrowClientFields(requestedFields, scope.fields, declaration)
           : requestedFields
             ? [...requestedFields]
             : undefined;
@@ -647,6 +739,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
 
     try {
       rejectUnknownParams(c, "getRecord");
+      // §8 requires client-token `expand[]` to be REJECTED before the
+      // declaration is consulted, on single-record reads as well as lists.
+      // Silently ignoring it told a client its request was honored when a
+      // narrower thing happened instead.
+      if (context!.tokenKind === "client") rejectClientOnlyParams(c);
       const stream = c.req.param("stream");
       const recordKey = decodeURIComponent(c.req.param("id"));
       const declaration = deps.declarations.get(stream);
