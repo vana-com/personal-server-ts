@@ -57,17 +57,20 @@ export interface PdppGrantBindingStore {
 /**
  * True when two bindings agree on every field that defines the binding.
  *
- * `granteeAddress` is compared, which makes grantee rotation an explicit
- * conflict rather than a silent follow. That is deliberate. Context Gateway
- * holds one Privy-custodied wallet per app, keyed `(ownerType, ownerId)` with
- * a DB unique index, and its schema *models* rotation (`isCurrent` plus a
- * partial unique index) although no code path performs one today — so the
- * address is currently immutable per app in practice but not by design.
+ * Both `granteeAddress` (the app's wallet) and `granteeId` (the builder id
+ * the chain grant names) are compared, which makes rotation of either an
+ * explicit conflict rather than a silent follow. That is deliberate. Context
+ * Gateway holds one Privy-custodied wallet per app, keyed `(ownerType,
+ * ownerId)` with a DB unique index, and its schema *models* rotation
+ * (`isCurrent` plus a partial unique index) although no code path performs
+ * one today — so the address is currently immutable per app in practice but
+ * not by design.
  *
- * If rotation ever ships, a rotated wallet is a different grantee, and the
- * owner's existing consent must not transfer to it without a new decision.
- * Rejecting the rewrite surfaces that as a failure instead of quietly
- * repointing a retained grant at an address the owner never approved.
+ * If rotation ever ships, a rotated wallet or builder id is a different
+ * grantee, and the owner's existing consent must not transfer to it without
+ * a new decision. Rejecting the rewrite surfaces that as a failure instead of
+ * quietly repointing a retained grant at an identity the owner never
+ * approved.
  */
 export function bindingsAgree(
   a: PdppGrantBinding,
@@ -78,6 +81,7 @@ export function bindingsAgree(
     samePermission(a.permission, b.permission) &&
     a.ownerAddress.toLowerCase() === b.ownerAddress.toLowerCase() &&
     a.granteeAddress.toLowerCase() === b.granteeAddress.toLowerCase() &&
+    a.granteeId.toLowerCase() === b.granteeId.toLowerCase() &&
     a.pdppClientId === b.pdppClientId
   );
 }

@@ -34,6 +34,7 @@ export {
   type ChainPermissionRef,
   type CreateBindingInput,
   type PdppGrantBinding,
+  type ResolvedBuilder,
   type VerifyBindingInput,
 } from "./pdpp-binding.js";
 export {

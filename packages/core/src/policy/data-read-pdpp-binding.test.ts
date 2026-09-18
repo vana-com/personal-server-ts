@@ -13,8 +13,7 @@
  * Limitation, stated plainly: no chain RPC and no live gateway is contacted,
  * so these prove the PS's *enforcement* of a binding, not that a given
  * permission exists on Vana mainnet. Read-time revocation here is the gateway's
- * `revokedAt`, which is the same field the deployed contract's `endBlock`
- * revocation surfaces through the Data Gateway.
+ * `revokedAt` field.
  */
 
 import { describe, expect, it } from "vitest";
@@ -26,6 +25,7 @@ import type {
 import {
   createPdppGrantBinding,
   type ChainPermissionRef,
+  type ResolvedBuilder,
 } from "../grants/pdpp-binding.js";
 import { createInMemoryPdppGrantBindingStore } from "../grants/pdpp-binding-store.js";
 
@@ -39,6 +39,16 @@ const APP_A = "0x00000000000000000000000000000000000000C1" as const;
 const APP_B = "0x00000000000000000000000000000000000000C2" as const;
 const CONTRACT = "0xD54523048AdD05b4d734aFaE7C68324Ebb7373eF" as const;
 
+// Builder ids (bytes32) are a DIFFERENT identity than the wallets above —
+// `Builder.id`/`GatewayGrantResponse.granteeId` never holds a wallet address
+// for a real gateway response. Distinct, differently-shaped values here are
+// what makes these fixtures catch a grantee-id/wallet mixup instead of
+// masking it.
+const BUILDER_ID_A =
+  "0x7f532b6a4ee5506cd7fe60e943ec4c80ebd1695508eb3258f959db21f8967f00" as const;
+const BUILDER_ID_B =
+  "0xf8ba74b1fe36f5a08c1038cb5af7ca1760ba010cb52cabfc35f2d09efb4e0a60" as const;
+
 const DEPLOYMENT = { chainId: 14800, contractAddress: CONTRACT } as const;
 
 const PERMISSION_A: ChainPermissionRef = {
@@ -49,11 +59,18 @@ const PERMISSION_A: ChainPermissionRef = {
 
 const SCOPE = "instagram.posts";
 
+const BUILDER_IDS: Record<`0x${string}`, `0x${string}`> = {
+  [APP_A]: BUILDER_ID_A,
+  [APP_B]: BUILDER_ID_B,
+};
+
 function builderFor(granteeAddress: `0x${string}`): Builder {
-  // The gateway keys a builder by its grantee address; `id` is what the chain
-  // grant's `granteeId` carries.
+  // The gateway keys a builder by its wallet address (`granteeAddress`), but
+  // reports a SEPARATE bytes32 `id` — the value chain grants name in
+  // `granteeId`. The two must never be the same string in a realistic
+  // fixture.
   return {
-    id: granteeAddress,
+    id: BUILDER_IDS[granteeAddress],
     ownerAddress: OWNER,
     granteeAddress,
     publicKey: "0x04key",
@@ -62,13 +79,17 @@ function builderFor(granteeAddress: `0x${string}`): Builder {
   } as Builder;
 }
 
+function resolvedBuilderFor(granteeAddress: `0x${string}`): ResolvedBuilder {
+  return { id: BUILDER_IDS[granteeAddress], granteeAddress };
+}
+
 function chainGrant(
   overrides: Partial<GatewayGrantResponse> = {},
 ): GatewayGrantResponse {
   return {
     id: "42",
     grantorAddress: OWNER,
-    granteeId: APP_A,
+    granteeId: BUILDER_ID_A,
     scopes: ["instagram.*"],
     status: "confirmed",
     addedAt: "2026-09-17T10:00:00.000Z",
@@ -113,6 +134,7 @@ function harness(
       permission: PERMISSION_A,
       serverOwner: OWNER,
       granteeAddress: APP_A,
+      resolvedBuilder: resolvedBuilderFor(APP_A),
       pdppClientId: "client-app-a",
       chainGrant: chainGrant(),
     });
@@ -213,7 +235,7 @@ describe("verifyDataReadPolicy — PDPP §6 grant binding", () => {
     const h = harness({
       grants: {
         "42": chainGrant(),
-        "43": chainGrant({ id: "43", granteeId: APP_B }),
+        "43": chainGrant({ id: "43", granteeId: BUILDER_ID_B }),
       },
     });
     await expectPolicyFailure(
@@ -239,7 +261,7 @@ describe("verifyDataReadPolicy — PDPP §6 grant binding", () => {
     const h = harness({
       grants: {
         "42": chainGrant(),
-        "43": chainGrant({ id: "43", granteeId: APP_B }),
+        "43": chainGrant({ id: "43", granteeId: BUILDER_ID_B }),
       },
     });
     await expectPolicyFailure(

@@ -42,6 +42,7 @@ import {
   type ChainPermissionRef,
   type PdppGrantBinding,
   type PdppGrantBindingStore,
+  type ResolvedBuilder,
 } from "@opendatalabs/personal-server-ts-core/grants";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
 import pino from "pino";
@@ -51,9 +52,18 @@ import { pdppRecordsRoutes } from "./pdpp-records.js";
 const logger = pino({ level: "silent" });
 
 const OWNER = "0x1111111111111111111111111111111111111111" as const;
+// 20-byte wallet — the app's Context Gateway grantee identity.
 const GRANTEE = "0x2222222222222222222222222222222222222222" as const;
 const OTHER_GRANTEE = "0x3333333333333333333333333333333333333333" as const;
 const CONTRACT = "0x4444444444444444444444444444444444444444" as const;
+// 32-byte builder id — a distinct identity from the wallet above.
+// `GatewayGrantResponse.granteeId` reports this, never the wallet.
+const BUILDER_ID =
+  "0x5555555555555555555555555555555555555555555555555555555555555555" as const;
+const RESOLVED_BUILDER: ResolvedBuilder = {
+  id: BUILDER_ID,
+  granteeAddress: GRANTEE,
+};
 const CHAIN_ID = 1480;
 const PERMISSION_ID = "42";
 const PDPP_GRANT = "grant_1";
@@ -104,8 +114,9 @@ function chainGrant(
   return {
     id: PERMISSION_ID,
     grantorAddress: OWNER,
-    granteeId: GRANTEE,
+    granteeId: BUILDER_ID,
     revokedAt: null,
+    expiresAt: null,
     ...overrides,
   } as GatewayGrantResponse;
 }
@@ -125,6 +136,7 @@ function boundBinding(): PdppGrantBinding {
   return createPdppGrantBinding({
     chainGrant: chainGrant(),
     granteeAddress: GRANTEE,
+    resolvedBuilder: RESOLVED_BUILDER,
     pdppClientId: CLIENT,
     pdppGrantId: PDPP_GRANT,
     permission: PERMISSION,
@@ -139,7 +151,11 @@ interface HarnessOptions {
   /** Omit enforcement entirely: the standalone-PDPP path. */
   enforce?: boolean;
   token?: PdppTokenContext;
+  /** Deterministic clock for expiry assertions. Defaults to a fixed instant. */
+  now?: () => Date;
 }
+
+const NOW = () => new Date("2026-06-01T00:00:00.000Z");
 
 function harness(options: HarnessOptions = {}) {
   const store = createMemoryRecordStore();
@@ -175,6 +191,7 @@ function harness(options: HarnessOptions = {}) {
           logger,
           readChainGrant: options.readChainGrant ?? (async () => chainGrant()),
           serverOwner: OWNER,
+          now: options.now ?? NOW,
         });
 
   const app = new Hono();
@@ -238,6 +255,64 @@ describe("chain revocation actually takes effect", () => {
   });
 });
 
+describe("expiry is enforced on the bearer path too", () => {
+  // `verifyPdppGrantBinding` only checks revocation. The legacy
+  // `/v1/data/:scope` chain-grant read path also checks `expiresAt`; this
+  // bearer path must match it rather than silently letting an expired grant
+  // keep reading.
+
+  it("denies a read once the grant's ISO expiresAt is in the past", async () => {
+    const app = harness({
+      readChainGrant: async () =>
+        chainGrant({ expiresAt: "2026-01-01T00:00:00.000Z" }), // before NOW
+    });
+
+    const response = await read(app);
+    expect(response.status).toBe(403);
+  });
+
+  it("denies a read once the grant's uint256-seconds expiresAt is in the past", async () => {
+    // Legacy encoding: decimal-string unix seconds.
+    const pastSeconds = Math.floor(
+      new Date("2026-01-01T00:00:00.000Z").getTime() / 1000,
+    ).toString();
+    const app = harness({
+      readChainGrant: async () => chainGrant({ expiresAt: pastSeconds }),
+    });
+
+    const response = await read(app);
+    expect(response.status).toBe(403);
+  });
+
+  it("allows a read when expiresAt is in the future", async () => {
+    const app = harness({
+      readChainGrant: async () =>
+        chainGrant({ expiresAt: "2027-01-01T00:00:00.000Z" }),
+    });
+
+    const response = await read(app);
+    expect(response.status).toBe(200);
+  });
+
+  it("allows a read when expiresAt is null (perpetual)", async () => {
+    const app = harness({
+      readChainGrant: async () => chainGrant({ expiresAt: null }),
+    });
+
+    const response = await read(app);
+    expect(response.status).toBe(200);
+  });
+
+  it('allows a read when expiresAt is the perpetual sentinel "0"', async () => {
+    const app = harness({
+      readChainGrant: async () => chainGrant({ expiresAt: "0" }),
+    });
+
+    const response = await read(app);
+    expect(response.status).toBe(200);
+  });
+});
+
 describe("the binding must name this owner and this app", () => {
   it("denies when the chain grant belongs to a different owner", async () => {
     const app = harness({
@@ -264,11 +339,12 @@ describe("the binding must name this owner and this app", () => {
   });
 
   it("denies a binding recorded for a different deployment", async () => {
-    // permissionId is a per-deployment counter, so a Moksha binding must not
+    // A binding recorded under Moksha configuration must not
     // authorize a mainnet read.
     const foreign = createPdppGrantBinding({
       chainGrant: chainGrant(),
       granteeAddress: GRANTEE,
+      resolvedBuilder: RESOLVED_BUILDER,
       pdppClientId: CLIENT,
       pdppGrantId: PDPP_GRANT,
       permission: { ...PERMISSION, chainId: 14800 },
@@ -315,6 +391,7 @@ describe("an unverifiable chain denies rather than opens", () => {
       binding: createPdppGrantBinding({
         chainGrant: chainGrant(),
         granteeAddress: GRANTEE,
+        resolvedBuilder: RESOLVED_BUILDER,
         pdppClientId: CLIENT,
         // A binding exists, but for a DIFFERENT PDPP grant.
         pdppGrantId: "grant_other",

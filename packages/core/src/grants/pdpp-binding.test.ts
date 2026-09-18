@@ -14,14 +14,36 @@ import {
   samePermission,
   verifyPdppGrantBinding,
   type ChainPermissionRef,
+  type ResolvedBuilder,
 } from "./pdpp-binding.js";
 import { createInMemoryPdppGrantBindingStore } from "./pdpp-binding-store.js";
 
 const OWNER = "0x00000000000000000000000000000000000000AA" as const;
 const OTHER_OWNER = "0x00000000000000000000000000000000000000BB" as const;
+// 20-byte wallet addresses — the app's Context Gateway grantee identity.
 const GRANTEE = "0x00000000000000000000000000000000000000C1" as const;
 const OTHER_GRANTEE = "0x00000000000000000000000000000000000000C2" as const;
 const CONTRACT = "0xD54523048AdD05b4d734aFaE7C68324Ebb7373eF" as const;
+
+// 32-byte builder ids — deliberately shaped and valued differently from any
+// wallet address above, since `Builder.id`/`GatewayGrantResponse.granteeId`
+// is a distinct bytes32 identifier, not a wallet. Real IDs are keccak256
+// digests; these are handwritten but the same shape.
+const BUILDER_ID =
+  "0x7f532b6a4ee5506cd7fe60e943ec4c80ebd1695508eb3258f959db21f8967f00" as const;
+const OTHER_BUILDER_ID =
+  "0xf8ba74b1fe36f5a08c1038cb5af7ca1760ba010cb52cabfc35f2d09efb4e0a60" as const;
+const ROTATED_BUILDER_ID =
+  "0x4868ccc0828d1f29900b39cfc3bfdb8ef69fb43da9fb670816e47ecb1d940b00" as const;
+
+const RESOLVED_BUILDER: ResolvedBuilder = {
+  id: BUILDER_ID,
+  granteeAddress: GRANTEE,
+};
+const OTHER_RESOLVED_BUILDER: ResolvedBuilder = {
+  id: OTHER_BUILDER_ID,
+  granteeAddress: OTHER_GRANTEE,
+};
 
 const PERMISSION: ChainPermissionRef = {
   chainId: 14800,
@@ -37,7 +59,7 @@ function chainGrant(
   return {
     id: "42",
     grantorAddress: OWNER,
-    granteeId: GRANTEE,
+    granteeId: BUILDER_ID,
     scopes: ["instagram.*"],
     status: "confirmed",
     addedAt: "2026-09-17T10:00:00.000Z",
@@ -90,6 +112,7 @@ function makeBinding(overrides: Record<string, unknown> = {}) {
     permission: PERMISSION,
     serverOwner: OWNER,
     granteeAddress: GRANTEE,
+    resolvedBuilder: RESOLVED_BUILDER,
     pdppClientId: "client-app-1",
     chainGrant: chainGrant(),
     ...overrides,
@@ -123,12 +146,24 @@ describe("createPdppGrantBinding", () => {
     ).toThrow(/not issued by this server's owner/i);
   });
 
-  it("rejects a chain grant issued to a different app", () => {
+  it("rejects a chain grant issued to a different builder id", () => {
     expectFailure(
       () =>
-        makeBinding({ chainGrant: chainGrant({ granteeId: OTHER_GRANTEE }) }),
+        makeBinding({
+          chainGrant: chainGrant({ granteeId: OTHER_BUILDER_ID }),
+        }),
       "INVALID_SIGNATURE",
-      /grantee does not match/i,
+      /builder id/i,
+    );
+  });
+
+  it("rejects a resolved builder whose wallet is not the requested app address", () => {
+    // The caller resolved the WRONG builder for the requested app address —
+    // everything downstream would silently verify a different app.
+    expectFailure(
+      () => makeBinding({ resolvedBuilder: OTHER_RESOLVED_BUILDER }),
+      "INVALID_SIGNATURE",
+      /resolved builder wallet/i,
     );
   });
 
@@ -145,6 +180,24 @@ describe("createPdppGrantBinding", () => {
       () => makeBinding({ chainGrant: chainGrant({ id: "999" }) }),
       "INVALID_SIGNATURE",
       /does not match the permission/i,
+    );
+  });
+
+  it("rejects a wallet address substituted for the registered builder id", () => {
+    // Regression proof for the confirmed grantee-ID vs wallet bug: the old
+    // implementation compared `chainGrant.granteeId` directly against
+    // `granteeAddress` (a wallet). A chain grant naming the CORRECT builder
+    // id must be accepted, but one that names something wallet-shaped (as if
+    // `granteeId` held an address, which it never does for a real gateway
+    // response) must be rejected as the wrong builder — it is not this app's
+    // builder id, coincidentally wallet-shaped or not.
+    expectFailure(
+      () =>
+        makeBinding({
+          chainGrant: chainGrant({ granteeId: GRANTEE }), // wallet-shaped, not BUILDER_ID
+        }),
+      "INVALID_SIGNATURE",
+      /builder id/i,
     );
   });
 });
@@ -242,7 +295,24 @@ describe("verifyPdppGrantBinding", () => {
       () =>
         verifyPdppGrantBinding({
           ...base,
-          chainGrant: chainGrant({ granteeId: OTHER_GRANTEE }),
+          chainGrant: chainGrant({ granteeId: OTHER_BUILDER_ID }),
+        }),
+      "INVALID_SIGNATURE",
+      /no longer matches the bound grantee/i,
+    );
+  });
+
+  it("rejects builder-id drift despite the correct request signer", () => {
+    // Regression proof: the old code compared the live grant's `granteeId`
+    // against `binding.granteeAddress` (a wallet). Since `binding.granteeId`
+    // now holds the real builder id, a rotation of that id must be caught by
+    // THIS check even though `requestSigner` (the wallet) still matches.
+    expectFailure(
+      () =>
+        verifyPdppGrantBinding({
+          ...base,
+          requestSigner: GRANTEE, // wallet unchanged
+          chainGrant: chainGrant({ granteeId: ROTATED_BUILDER_ID }), // builder id rotated
         }),
       "INVALID_SIGNATURE",
       /no longer matches the bound grantee/i,
@@ -252,8 +322,7 @@ describe("verifyPdppGrantBinding", () => {
 
 describe("samePermission", () => {
   it("does not confuse the same permission id on different chains", () => {
-    // permissionId is a per-deployment counter, so this is the exact
-    // collision a bare id would cause.
+    // The same grant id must remain scoped to its recorded deployment.
     expect(samePermission(PERMISSION, { ...PERMISSION, chainId: 1480 })).toBe(
       false,
     );
@@ -309,13 +378,19 @@ describe("PdppGrantBindingStore", () => {
     const store = createInMemoryPdppGrantBindingStore();
     store.putBinding(makeBinding());
 
-    const ROTATED = "0x00000000000000000000000000000000000000FF" as const;
+    const ROTATED_WALLET =
+      "0x00000000000000000000000000000000000000FF" as const;
+    const rotatedBuilder: ResolvedBuilder = {
+      id: BUILDER_ID,
+      granteeAddress: ROTATED_WALLET,
+    };
     expectFailure(
       () =>
         store.putBinding(
           makeBinding({
-            granteeAddress: ROTATED,
-            chainGrant: chainGrant({ granteeId: ROTATED }),
+            granteeAddress: ROTATED_WALLET,
+            resolvedBuilder: rotatedBuilder,
+            chainGrant: chainGrant({ granteeId: BUILDER_ID }),
           }),
         ),
       "INVALID_SIGNATURE",
@@ -326,6 +401,34 @@ describe("PdppGrantBindingStore", () => {
     expect(store.getByPdppGrantId("pdpp-grant-1")?.granteeAddress).toBe(
       GRANTEE,
     );
+  });
+
+  it("refuses to follow a rotated builder id onto an existing grant, wallet unchanged", () => {
+    // §6's identity is one grantee per builder/app; a builder-id rotation
+    // (Context Gateway re-registering the same wallet under a new builder id)
+    // is just as much a different grantee as a wallet rotation, and must be
+    // rejected the same way rather than silently accepted because the wallet
+    // still matches.
+    const store = createInMemoryPdppGrantBindingStore();
+    store.putBinding(makeBinding());
+
+    const rotatedIdBuilder: ResolvedBuilder = {
+      id: ROTATED_BUILDER_ID,
+      granteeAddress: GRANTEE,
+    };
+    expectFailure(
+      () =>
+        store.putBinding(
+          makeBinding({
+            resolvedBuilder: rotatedIdBuilder,
+            chainGrant: chainGrant({ granteeId: ROTATED_BUILDER_ID }),
+          }),
+        ),
+      "INVALID_SIGNATURE",
+      /different binding already exists for this PDPP grant/i,
+    );
+
+    expect(store.getByPdppGrantId("pdpp-grant-1")?.granteeId).toBe(BUILDER_ID);
   });
 
   it("refuses to retarget an existing PDPP grant at a different permission", () => {

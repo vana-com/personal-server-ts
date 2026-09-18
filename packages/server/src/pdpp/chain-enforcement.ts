@@ -24,13 +24,20 @@
  * opinion about what a valid binding is, and the two would drift. This file
  * only supplies inputs and translates the outcome.
  *
+ * `verifyPdppGrantBinding` checks revocation but NOT expiry — that axis is
+ * added here, immediately after it passes, using the same
+ * `parseGrantExpiresAtSeconds` the legacy chain-grant read path
+ * (`verifyDataReadPolicy`) uses. Without it, this bearer path would silently
+ * keep serving an expired-but-not-revoked grant that the legacy path already
+ * denies — a gap, not a design choice.
+ *
  * ## Fail closed, and the retryable distinction
  *
  * Every denial path answers "no". The only judgment this file makes is whether
  * a "no" is *definite* or merely *unknown*:
  *
- *   - No binding, wrong owner, wrong grantee, revoked → definite. Asking again
- *     changes nothing.
+ *   - No binding, wrong owner, wrong grantee, revoked, expired → definite.
+ *     Asking again changes nothing.
  *   - Gateway unreachable, RPC timeout, malformed response → unknown.
  *
  * Unknown must still deny. Not knowing is not permission, and an outage that
@@ -49,6 +56,7 @@ import {
   verifyPdppGrantBinding,
   type PdppGrantBindingStore,
 } from "@opendatalabs/personal-server-ts-core/grants";
+import { parseGrantExpiresAtSeconds } from "@opendatalabs/personal-server-ts-core/policy";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
 import type { Logger } from "pino";
 import type {
@@ -82,6 +90,12 @@ export interface ChainEnforcementOptions {
    */
   granteeAddressFor(clientId: string): `0x${string}` | null;
   logger: Logger;
+  /**
+   * Deterministic clock for expiry comparisons. Defaults to the real clock;
+   * tests inject a fixed value so expiry assertions aren't a race against
+   * wall time.
+   */
+  now?: () => Date;
 }
 
 export function chainPermissionEnforcement(
@@ -145,7 +159,6 @@ export function chainPermissionEnforcement(
           requestSigner: granteeAddress,
           serverOwner,
         });
-        return { ok: true };
       } catch (err) {
         // Every failure here is definite: owner mismatch, grantee mismatch,
         // wrong deployment, or revocation. None improve on retry.
@@ -155,6 +168,35 @@ export function chainPermissionEnforcement(
           retryable: false,
         };
       }
+
+      // `verifyPdppGrantBinding` does not check expiry — it only checks
+      // revocation. The legacy `/v1/data/:scope` chain-grant read path
+      // (`verifyDataReadPolicy`) enforces `grant.expiresAt`; this bearer path
+      // must not silently skip a check that path already makes. `chainGrant`
+      // is non-null here (a null grant already returned above via
+      // `verifyPdppGrantBinding`'s "not found = revoked" check).
+      const expiresAtSec = parseGrantExpiresAtSeconds(chainGrant!.expiresAt);
+      if (expiresAtSec === null) {
+        return {
+          ok: false,
+          reason: "Grant expiry is invalid",
+          retryable: false,
+        };
+      }
+      if (expiresAtSec > 0) {
+        const nowSec = Math.floor(
+          (options.now?.() ?? new Date()).getTime() / 1000,
+        );
+        if (expiresAtSec < nowSec) {
+          return {
+            ok: false,
+            reason: "Grant has expired",
+            retryable: false,
+          };
+        }
+      }
+
+      return { ok: true };
     },
   };
 }
