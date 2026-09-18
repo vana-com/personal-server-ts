@@ -1,0 +1,166 @@
+/**
+ * Durable retention for PDPP ↔ chain grant bindings (scope §6).
+ *
+ * The binding record is the only thing that crosses the gateway/chain
+ * boundary on our side; record payloads stay in PS storage and never enter
+ * this store. What is retained here is an identity join — PDPP grant id,
+ * chain permission ref, owner, grantee — and nothing about the data itself.
+ *
+ * ## Append-only by construction
+ *
+ * The port exposes `put` and `get` but no `update` and no `delete`. That is
+ * deliberate, and it is the mechanism that makes §6's revocation semantics
+ * correct rather than merely intended:
+ *
+ *   - A binding asserts a *historical* fact ("this consent authorized this
+ *     permission"), which does not stop being true when the grant is revoked.
+ *   - Revocation is a *current* fact, and lives on the chain grant, read live
+ *     at verification time.
+ *
+ * If revocation were mirrored into this store, the two would have to be kept
+ * in sync, and every window where they disagreed would be a window where a
+ * revoked grant still read as live. Not storing the status at all removes that
+ * class of bug instead of managing it.
+ *
+ * `putBinding` rejects a conflicting rewrite for the same key rather than
+ * overwriting, so a second binding cannot silently retarget an existing PDPP
+ * grant at a different permission, owner, or app.
+ */
+
+import { InvalidSignatureError } from "../errors/catalog.js";
+
+import {
+  isValidGrantVersion,
+  samePermission,
+  type ChainPermissionRef,
+  type PdppGrantBinding,
+} from "./pdpp-binding.js";
+
+/**
+ * Durable storage for grant bindings.
+ *
+ * Implementations back this with the deployment's real store (SQLite on
+ * desktop, the supplied runtime's durable state in Enclave). The interface is
+ * intentionally tiny so both can implement it without sharing a schema.
+ */
+export interface PdppGrantBindingStore {
+  /**
+   * Retain a binding. Idempotent for an identical re-put; throws on a
+   * conflicting one.
+   */
+  putBinding(binding: PdppGrantBinding): void;
+  /** Look up by the PDPP grant id (the consent artifact). */
+  getByPdppGrantId(pdppGrantId: string): PdppGrantBinding | null;
+  /**
+   * All bindings recorded against a chain permission, oldest first.
+   *
+   * Plural and non-unique on purpose: distinct PDPP grants can legitimately
+   * bind to the same permission over time (e.g. one consent superseding
+   * another at the chain level), and each retains its own observed
+   * `grantVersion`. Returning a single "the" binding here would silently
+   * pick one and hide the others — callers that need "is any binding for
+   * this permission still live" must check every entry themselves.
+   */
+  getBindingsForPermission(permission: ChainPermissionRef): PdppGrantBinding[];
+}
+
+/**
+ * True when two bindings agree on every field that defines the binding.
+ *
+ * Both `granteeAddress` (the app's wallet) and `granteeId` (the builder id
+ * the chain grant names) are compared, which makes rotation of either an
+ * explicit conflict rather than a silent follow. That is deliberate. Context
+ * Gateway holds one Privy-custodied wallet per app, keyed `(ownerType,
+ * ownerId)` with a DB unique index, and its schema *models* rotation
+ * (`isCurrent` plus a partial unique index) although no code path performs
+ * one today — so the address is currently immutable per app in practice but
+ * not by design.
+ *
+ * If rotation ever ships, a rotated wallet or builder id is a different
+ * grantee, and the owner's existing consent must not transfer to it without
+ * a new decision. Rejecting the rewrite surfaces that as a failure instead of
+ * quietly repointing a retained grant at an identity the owner never
+ * approved.
+ */
+export function bindingsAgree(
+  a: PdppGrantBinding,
+  b: PdppGrantBinding,
+): boolean {
+  return (
+    a.pdppGrantId === b.pdppGrantId &&
+    samePermission(a.permission, b.permission) &&
+    a.ownerAddress.toLowerCase() === b.ownerAddress.toLowerCase() &&
+    a.granteeAddress.toLowerCase() === b.granteeAddress.toLowerCase() &&
+    a.granteeId.toLowerCase() === b.granteeId.toLowerCase() &&
+    a.pdppClientId === b.pdppClientId &&
+    a.grantVersion === b.grantVersion
+  );
+}
+
+export function permissionKey(p: ChainPermissionRef): string {
+  return `${p.chainId}:${p.contractAddress.toLowerCase()}:${p.permissionId}`;
+}
+
+/** New bindings require a version; only migrated rows may retain null. */
+export function assertWritableGrantVersion(binding: PdppGrantBinding): void {
+  if (!isValidGrantVersion(binding.grantVersion)) {
+    throw new InvalidSignatureError({
+      reason:
+        "grantVersion must be a positive decimal uint256 string for a new binding; null is reserved for a preserved legacy row",
+      pdppGrantId: binding.pdppGrantId,
+      grantVersion: binding.grantVersion,
+    });
+  }
+}
+
+/**
+ * In-memory implementation, used by tests and by callers that have no durable
+ * store yet.
+ *
+ * This is a real implementation of the port's semantics — including the
+ * conflict rejection — not a stub that accepts everything. Tests exercising it
+ * are therefore testing the actual binding rules; only the persistence medium
+ * differs from a deployed store.
+ */
+export function createInMemoryPdppGrantBindingStore(): PdppGrantBindingStore {
+  const byGrantId = new Map<string, PdppGrantBinding>();
+  const byPermission = new Map<string, PdppGrantBinding[]>();
+
+  return {
+    putBinding(binding: PdppGrantBinding): void {
+      const existingByGrant = byGrantId.get(binding.pdppGrantId);
+      if (existingByGrant) {
+        if (!bindingsAgree(existingByGrant, binding)) {
+          throw new InvalidSignatureError({
+            reason: "A different binding already exists for this PDPP grant id",
+            pdppGrantId: binding.pdppGrantId,
+          });
+        }
+        return;
+      }
+
+      assertWritableGrantVersion(binding);
+
+      const key = permissionKey(binding.permission);
+      const list = byPermission.get(key) ?? [];
+      list.push(binding);
+      byPermission.set(key, list);
+      byGrantId.set(binding.pdppGrantId, binding);
+    },
+
+    getByPdppGrantId(pdppGrantId: string): PdppGrantBinding | null {
+      return byGrantId.get(pdppGrantId) ?? null;
+    },
+
+    getBindingsForPermission(
+      permission: ChainPermissionRef,
+    ): PdppGrantBinding[] {
+      const list = byPermission.get(permissionKey(permission)) ?? [];
+      return [...list].sort(
+        (a, b) =>
+          a.boundAt.localeCompare(b.boundAt) ||
+          a.pdppGrantId.localeCompare(b.pdppGrantId),
+      );
+    },
+  };
+}

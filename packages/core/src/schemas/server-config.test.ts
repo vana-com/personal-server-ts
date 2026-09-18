@@ -57,6 +57,69 @@ describe("ServerConfigSchema — sync fields", () => {
   });
 });
 
+describe("pdpp.clients[].grantLifetimeSeconds", () => {
+  it("is unset by default, preserving no-expiry behavior", () => {
+    const config = ServerConfigSchema.parse({
+      pdpp: {
+        clients: [{ clientId: "c1", redirectUris: ["https://app.example/cb"] }],
+      },
+    });
+    expect(config.pdpp.clients[0].grantLifetimeSeconds).toBeUndefined();
+  });
+
+  it("accepts a positive integer", () => {
+    const config = ServerConfigSchema.parse({
+      pdpp: {
+        clients: [
+          {
+            clientId: "c1",
+            redirectUris: ["https://app.example/cb"],
+            grantLifetimeSeconds: 3,
+          },
+        ],
+      },
+    });
+    expect(config.pdpp.clients[0].grantLifetimeSeconds).toBe(3);
+  });
+
+  it("rejects zero, negative, and non-integer durations", () => {
+    for (const grantLifetimeSeconds of [0, -1, 1.5]) {
+      expect(() =>
+        ServerConfigSchema.parse({
+          pdpp: {
+            clients: [
+              {
+                clientId: "c1",
+                redirectUris: ["https://app.example/cb"],
+                grantLifetimeSeconds,
+              },
+            ],
+          },
+        }),
+      ).toThrow();
+    }
+  });
+
+  it("rejects a duration that could overflow a computed expiry instant", () => {
+    // Well beyond the 100-year policy ceiling — this is the boundary that
+    // stops an operator config from producing `Date.now() + n * 1000`
+    // overflowing into an invalid or wrapped Date.
+    expect(() =>
+      ServerConfigSchema.parse({
+        pdpp: {
+          clients: [
+            {
+              clientId: "c1",
+              redirectUris: ["https://app.example/cb"],
+              grantLifetimeSeconds: Number.MAX_SAFE_INTEGER,
+            },
+          ],
+        },
+      }),
+    ).toThrow();
+  });
+});
+
 describe("withCurrentInferenceModel", () => {
   it("moves a superseded default forward", () => {
     const stored = ServerConfigSchema.parse({

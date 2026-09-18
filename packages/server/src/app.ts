@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
@@ -49,6 +50,7 @@ import {
   createDeviceSessionLookup,
 } from "./routes/auth-device.js";
 import { oauthTokenRoutes } from "./routes/oauth-token.js";
+import { pdppAuthRoutes, type PdppAuthRouteDeps } from "./routes/pdpp-auth.js";
 import type {
   ScopeDeletionTracker,
   SyncManager,
@@ -68,6 +70,14 @@ import type { Logger } from "pino";
 import { enclaveJobRoutes } from "./routes/enclave-jobs.js";
 import type { JobRequestEnvelope } from "@opendatalabs/vana-sdk/protocol/jobs";
 import type { JobExecuteResponse } from "./jobs/types.js";
+import { pdppRecordsRoutes } from "./routes/pdpp-records.js";
+import { pdppBlobsRoutes } from "./routes/pdpp-blobs.js";
+import { pdppWellKnownRoutes } from "./routes/pdpp-well-known.js";
+import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import type {
+  PdppRecordStore,
+  StreamDeclarationRegistry,
+} from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
 export interface IdentityInfo {
   address: `0x${string}`;
@@ -148,6 +158,14 @@ export interface AppDeps {
   mcpConnectionStore?: McpConnectionStore;
   mcpOAuthAuthorizationStore?: McpOAuthAuthorizationStore;
   mcpOAuthApprovalUrl?: string | (() => string);
+  /**
+   * PDPP Core v0.1 Authorization Server. Absent = the `/pdpp/v1` surface is
+   * not mounted, and existing OAuth/MCP behavior is unchanged. This is a
+   * separate authority from `tokenStore`: PDPP tokens are grant-bound and
+   * live in their own store (spec §8 forbids a second grant authority behind
+   * one enforcement path).
+   */
+  pdppAuth?: PdppAuthRouteDeps;
   mcpActivityRecorder?: McpActivityRecorder;
   mcpHydrateScopes?: (scopes: string[]) => Promise<void>;
   /**
@@ -163,6 +181,24 @@ export interface AppDeps {
   writeProofReplayStore?: WriteProofReplayStore;
   profile?: "standard" | "enclave";
   jobWorker?: (envelope: JobRequestEnvelope) => Promise<JobExecuteResponse>;
+  /**
+   * PDPP §4/§8 record model + Resource Server query surface. Absent = the
+   * PDPP routes are not mounted; existing deployments are unaffected. When
+   * present, all three must be present together (record store, token
+   * resolution, and stream declarations are mutually required).
+   */
+  pdpp?: {
+    store: PdppRecordStore;
+    auth: PdppAuthorizationService;
+    declarations: StreamDeclarationRegistry;
+    instancesForSubject?: (subjectId: string) => string[];
+    readBlobBytes?: (
+      blobId: string,
+    ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
+    /** This resource server's own identifier, RFC 9728 `resource` member. */
+    resource: string;
+    authorizationServers?: string[];
+  };
 }
 
 export function createApp(deps: AppDeps): Hono {
@@ -211,6 +247,65 @@ export function createApp(deps: AppDeps): Hono {
       runtimeAvailability: deps.runtimeAvailability,
     }),
   );
+
+  // PDPP §4 record model + §8 Resource Server query surface. Independent of
+  // the legacy DPP fileId/scope routes above; mounted only when a pdpp deps
+  // bundle is supplied.
+  if (deps.pdpp) {
+    app.route(
+      "/v1",
+      pdppRecordsRoutes({
+        store: deps.pdpp.store,
+        auth: deps.pdpp.auth,
+        declarations: deps.pdpp.declarations,
+        instancesForSubject: deps.pdpp.instancesForSubject,
+        // PDPP reads land in the SAME owner access feed as legacy
+        // `/v1/data/{scope}` reads. Adopting PDPP must not make an owner's
+        // access history less complete than it was before.
+        //
+        // The legacy entry shape is per-scope and per-builder, so the PDPP
+        // fields map on rather than extend it: `grantId` is the PDPP grant,
+        // `builder` is the PDPP client, and `scope` carries the stream. A
+        // denied or failed read is recorded too, which the legacy middleware
+        // cannot do — it only fires on 2xx.
+        accessLog: {
+          record: async (entry) => {
+            await deps.accessLogWriter.write({
+              logId: randomUUID(),
+              grantId: entry.grantId,
+              builder: entry.clientId,
+              action: "read",
+              scope: entry.stream,
+              timestamp: new Date().toISOString(),
+              ipAddress: entry.ipAddress,
+              userAgent: entry.userAgent,
+              ...(entry.outcome !== "completed" && {
+                outcome: entry.outcome,
+              }),
+            } as Parameters<typeof deps.accessLogWriter.write>[0]);
+          },
+        },
+      }),
+    );
+    app.route(
+      "/v1/blobs",
+      pdppBlobsRoutes({
+        store: deps.pdpp.store,
+        auth: deps.pdpp.auth,
+        declarations: deps.pdpp.declarations,
+        instancesForSubject: deps.pdpp.instancesForSubject,
+        readBlobBytes: deps.pdpp.readBlobBytes,
+      }),
+    );
+    app.route(
+      "/.well-known",
+      pdppWellKnownRoutes({
+        resource: deps.pdpp.resource,
+        coreQueryBase: "/v1",
+        authorizationServers: deps.pdpp.authorizationServers,
+      }),
+    );
+  }
 
   if (deps.profile === "enclave" && deps.jobWorker && deps.accessToken) {
     app.route(
@@ -458,6 +553,13 @@ export function createApp(deps: AppDeps): Hono {
         deviceSessions: createDeviceSessionLookup(),
       }),
     );
+  }
+
+  // PDPP Core v0.1 Authorization Server (spec §6–§8). Mounted only when the
+  // deployment supplies a PDPP auth store, so servers that do not speak PDPP
+  // are byte-for-byte unchanged.
+  if (deps.pdppAuth) {
+    app.route("/pdpp/v1", pdppAuthRoutes(deps.pdppAuth));
   }
 
   // Mount dev UI routes when dev token is available. The /ui subtree is

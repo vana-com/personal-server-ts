@@ -16,6 +16,8 @@ import {
   type GrantVerifierPort,
   type RuntimeAvailabilityPort,
 } from "../ports/index.js";
+import { verifyPdppGrantBinding } from "../grants/pdpp-binding.js";
+import type { PdppGrantBindingStore } from "../grants/pdpp-binding-store.js";
 
 export interface DataReadPolicyInput {
   signer: `0x${string}`;
@@ -31,11 +33,31 @@ export interface DataReadPolicyInput {
    * owner; the check also fails closed at runtime for untyped/JS callers.
    */
   serverOwner: `0x${string}`;
+  /**
+   * The PDPP grant id the caller is reading under, when the read is authorized
+   * through a PDPP grant rather than a bare chain grant (§6).
+   *
+   * Optional because the chain-grant read path predates PDPP and still works
+   * on its own. When present — and only then — the PDPP↔chain binding is
+   * enforced in addition to every existing check, never instead of one.
+   */
+  pdppGrantId?: string;
 }
 
 export interface DataReadPolicyPorts {
   authSessionVerifier: AuthSessionVerifierPort;
   grantVerifier: GrantVerifierPort;
+  /**
+   * Retained PDPP↔chain grant bindings. Required only to serve reads that
+   * present a `pdppGrantId`; a PS with no PDPP surface omits it.
+   */
+  pdppGrantBindings?: PdppGrantBindingStore;
+  /**
+   * The chain deployment this PS is configured against. Required alongside
+   * `pdppGrantBindings` so a binding recorded on one network cannot authorize
+   * a read on another.
+   */
+  chainDeployment?: { chainId: number; contractAddress: `0x${string}` };
   // feeVerifier is gone — payment is enforced by the X402 layer on
   // GET /v1/data/:scope, which forwards the builder's signed payment to
   // gateway.payForOperation. The policy no longer gates reads on
@@ -180,6 +202,57 @@ export async function verifyDataReadPolicy(
       grantId: grant.id,
       expected: input.serverOwner,
       actual: grant.grantorAddress ?? null,
+    });
+  }
+
+  // §6 — PDPP↔chain binding. Runs last, so it strengthens the chain-grant
+  // checks above rather than substituting for them: a read presenting a PDPP
+  // grant must satisfy BOTH authorities.
+  if (input.pdppGrantId !== undefined) {
+    // Fail closed. A PS that cannot check the binding must not serve the read
+    // as if there were nothing to check — that would make the binding
+    // bypassable by simply omitting the store.
+    //
+    // The client is told only that no binding authorizes the read. Reporting
+    // "this server is misconfigured" would disclose the operator's deployment
+    // state to an unauthorized caller, and the distinction is useless to a
+    // client either way: both mean "not authorized here". `misconfigured` is
+    // carried in the details for the operator's logs.
+    if (!ports.pdppGrantBindings || !ports.chainDeployment) {
+      throw new GrantRequiredError({
+        reason: "No binding authorizes this PDPP grant",
+        pdppGrantId: input.pdppGrantId,
+        misconfigured: true,
+      });
+    }
+
+    const binding = ports.pdppGrantBindings.getByPdppGrantId(input.pdppGrantId);
+    if (!binding) {
+      throw new GrantRequiredError({
+        reason: "No retained binding for this PDPP grant",
+        pdppGrantId: input.pdppGrantId,
+      });
+    }
+
+    // The binding must point at the very chain grant we just validated;
+    // otherwise a caller could pair a valid PDPP grant with an unrelated
+    // chain grant that happens to pass on its own.
+    if (binding.permission.permissionId !== grant.id) {
+      throw new ScopeMismatchError({
+        requestedScope: input.requestedScope,
+        reason: "PDPP binding does not reference the presented chain grant",
+        expected: binding.permission.permissionId,
+        actual: grant.id,
+      });
+    }
+
+    verifyPdppGrantBinding({
+      binding,
+      pdppGrantId: input.pdppGrantId,
+      serverOwner: input.serverOwner,
+      requestSigner: input.signer,
+      chainGrant: grant,
+      deployment: ports.chainDeployment,
     });
   }
 
