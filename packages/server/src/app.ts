@@ -268,6 +268,10 @@ export function createApp(deps: AppDeps): Hono {
         auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
         instancesForSubject: deps.pdpp.instancesForSubject,
+        // An `api_error` on the resource surface is a server fault and must
+        // leave a correlatable line behind; the route never reaches the
+        // global onError below, because it maps its own errors.
+        logger: deps.logger,
         // PDPP reads land in the SAME owner access feed as legacy
         // `/v1/data/{scope}` reads. Adopting PDPP must not make an owner's
         // access history less complete than it was before.
@@ -618,7 +622,22 @@ export function createApp(deps: AppDeps): Hono {
       return c.json(err.toJSON(), err.code as 401 | 403 | 413 | 503);
     }
 
-    deps.logger.error({ err }, "Unhandled error");
+    // The last-resort handler. Anything reaching it escaped a route's own
+    // mapping, so carry the same correlation fields the route handlers now
+    // emit — an operator should never have to tell two 500s apart by
+    // timestamp alone. The id goes out on the response too, so a user's bug
+    // report names the line in the log.
+    const requestId = randomUUID();
+    deps.logger.error(
+      {
+        requestId,
+        route: `${c.req.method} ${new URL(c.req.url).pathname}`,
+        errorCode: "INTERNAL_ERROR",
+        err,
+      },
+      "Unhandled error",
+    );
+    c.header("Request-Id", requestId);
     return c.json(
       {
         error: {

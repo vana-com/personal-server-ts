@@ -116,6 +116,67 @@ describe("pdpp records routes: authentication", () => {
   });
 });
 
+describe("pdpp records routes: 500 observability", () => {
+  // An unexpected store fault used to escape `toPdppError` as a rethrow, so
+  // the route emitted no PDPP error body of its own and the only record of it
+  // was the framework's generic handler — no route, no Request-Id, nothing to
+  // correlate with the client's response.
+  function appWithExplodingStore() {
+    const logged: Record<string, unknown>[] = [];
+    const store = createMemoryRecordStore();
+    const { app } = buildApp(
+      {
+        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+      },
+      {
+        store: {
+          ...store,
+          listRecords: () => {
+            throw new Error("store exploded");
+          },
+        } as never,
+        logger: {
+          error: (payload: Record<string, unknown>) => {
+            logged.push(payload);
+          },
+        } as never,
+      },
+    );
+    return { app, logged };
+  }
+
+  it("answers api_error with a Request-Id instead of an unhandled throw", async () => {
+    const { app } = appWithExplodingStore();
+
+    const res = await app.request("/streams/playlists/records", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+
+    expect(res.status).toBe(500);
+    expect(res.headers.get("Request-Id")).toMatch(/^req_/);
+    const body = await res.json();
+    expect(body.error.code).toBe("api_error");
+  });
+
+  it("logs the fault with route and the same request id it answered with", async () => {
+    const { app, logged } = appWithExplodingStore();
+
+    const res = await app.request("/streams/playlists/records", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toMatchObject({
+      route: "GET /v1/streams/:stream/records",
+      requestId: res.headers.get("Request-Id"),
+      errorCode: "api_error",
+    });
+    expect(JSON.stringify(logged[0])).toContain("store exploded");
+    // No token material in the line.
+    expect(JSON.stringify(logged[0])).not.toContain("owner-tok");
+  });
+});
+
 describe("pdpp records routes: field projection", () => {
   it("never exposes an unprojected field to a client token via list/get", async () => {
     const store = createMemoryRecordStore();

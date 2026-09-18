@@ -488,17 +488,125 @@ function notFound(): Response {
   return errorResponse(404, "NOT_FOUND", "Not found");
 }
 
+/**
+ * What a 500 out of this layer must leave behind.
+ *
+ * These handlers run INSIDE the Hono app, so an error they catch never
+ * reaches the framework's `onError` — which is the one place that used to
+ * log. The result was that any unexpected fault on `/v1/data` answered a
+ * bare `INTERNAL_ERROR` and left nothing in stdout, nothing in the access
+ * log, and nothing for an operator to work from. Diagnosing one meant
+ * patching the server.
+ *
+ * Deliberately no request body, no headers, no query string and no
+ * authorization material: the route and method are the diagnostic value, and
+ * a grant id or signed header in a log file is a credential at rest. The
+ * request id is minted here when the caller did not supply one so the log
+ * line and the response can always be correlated.
+ */
+export interface ApiErrorLogContext {
+  logger?: PersonalServerApiLogger;
+  /** Stable route label, e.g. `GET /v1/data/:scope`. Never the raw path. */
+  route: string;
+  /** Correlates the log line with the response. Minted if absent. */
+  requestId?: string;
+  /** Non-secret route parameters worth having in the line (e.g. scope). */
+  detail?: Record<string, string | undefined>;
+}
+
 async function withApiErrors(
   handler: () => Promise<Response> | Response,
+  context?: ApiErrorLogContext,
 ): Promise<Response> {
   try {
-    return await handler();
+    const response = await handler();
+    // A handled 4xx that means "the index and the disk disagree" is an
+    // operator-facing fault even though it is not a 500 — log it once, here,
+    // rather than at the contract that cannot see the route.
+    if (response.status === 404 && context) {
+      logMissingDataFile(response, context);
+    }
+    return response;
   } catch (err) {
     if (err instanceof ProtocolError) {
       return protocolErrorResponse(err);
     }
+    if (context) {
+      context.logger?.error?.(
+        {
+          route: context.route,
+          requestId: context.requestId ?? crypto.randomUUID(),
+          errorCode: "INTERNAL_ERROR",
+          ...stripUndefined(context.detail),
+          err: describeError(err),
+        },
+        "Unhandled error in personal server API",
+      );
+    }
     return errorResponse(500, "INTERNAL_ERROR", "Internal server error");
   }
+}
+
+/**
+ * The `DATA_FILE_MISSING` 404 the read contract produces, logged at the one
+ * layer that knows which route served it. Peeks at a clone so the response
+ * body stays readable by the caller.
+ */
+function logMissingDataFile(
+  response: Response,
+  context: ApiErrorLogContext,
+): void {
+  if (!context.logger?.error) return;
+  void response
+    .clone()
+    .json()
+    .then((body: unknown) => {
+      if (
+        typeof body !== "object" ||
+        body === null ||
+        (body as { error?: unknown }).error !== "DATA_FILE_MISSING"
+      ) {
+        return;
+      }
+      context.logger?.error?.(
+        {
+          route: context.route,
+          requestId: context.requestId ?? crypto.randomUUID(),
+          errorCode: "DATA_FILE_MISSING",
+          ...stripUndefined(context.detail),
+        },
+        "Indexed data file is missing on disk",
+      );
+    })
+    .catch(() => undefined);
+}
+
+/**
+ * An error rendered for a log line — name, message and stack only. Never the
+ * whole object: a thrown error can carry a request, a config or a token on an
+ * arbitrary property, and a structured logger would serialize all of it.
+ */
+function describeError(err: unknown): Record<string, unknown> {
+  if (err instanceof Error) {
+    return {
+      name: err.name,
+      message: err.message,
+      ...("code" in err && { code: (err as { code?: unknown }).code }),
+      stack: err.stack,
+    };
+  }
+  return { message: String(err) };
+}
+
+function stripUndefined(
+  detail: Record<string, string | undefined> | undefined,
+): Record<string, string> {
+  if (!detail) return {};
+  return Object.fromEntries(
+    Object.entries(detail).filter(
+      (pair): pair is [string, string] => pair[1] !== undefined,
+    ),
+  );
 }
 
 function normalizeLimit(value: string | null, fallback: number): number {
@@ -1155,6 +1263,15 @@ export async function handlePersonalServerDataRequest(
   deps: PersonalServerDataApiDeps,
   options: PersonalServerApiDispatchOptions = {},
 ): Promise<Response> {
+  // Filled in as the dispatch narrows, so a 500 thrown deep in a read is
+  // logged against the route that served it rather than a generic label. It
+  // is mutable for exactly that reason: the route is not known until the path
+  // has been parsed, and by then we are already inside the try.
+  const logContext: ApiErrorLogContext = {
+    logger: deps.logger,
+    route: `${request.method} ${options.basePath ?? "/v1/data"}`,
+    requestId: crypto.randomUUID(),
+  };
   return withApiErrors(async () => {
     const url = new URL(request.url);
     const pathname = stripBasePath(url.pathname, options.basePath);
@@ -1297,10 +1414,12 @@ export async function handlePersonalServerDataRequest(
 
     if (parts.length !== 1) return notFound();
     const scopeParam = decodePathPart(parts[0]);
+    logContext.route = `${request.method} ${options.basePath ?? "/v1/data"}/:scope`;
 
     if (request.method === "GET") {
       const scopeResult = parseDataScopeContract(scopeParam);
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
+      logContext.detail = { scope: scopeResult.scope };
       const selectedEntry = deps.storage.findEntry({
         scope: scopeResult.scope,
         fileId: url.searchParams.get("fileId") ?? undefined,
@@ -1815,7 +1934,7 @@ export async function handlePersonalServerDataRequest(
     }
 
     return methodNotAllowed();
-  });
+  }, logContext);
 }
 
 export async function handlePersonalServerAccessLogsRequest(
@@ -1844,40 +1963,46 @@ export async function handlePersonalServerSyncRequest(
   deps: PersonalServerSyncApiDeps,
   options: PersonalServerApiDispatchOptions = {},
 ): Promise<Response> {
-  return withApiErrors(async () => {
-    const url = new URL(request.url);
-    const pathname = stripBasePath(url.pathname, options.basePath);
+  return withApiErrors(
+    async () => {
+      const url = new URL(request.url);
+      const pathname = stripBasePath(url.pathname, options.basePath);
 
-    if (pathname === "/trigger") {
-      if (request.method !== "POST") return methodNotAllowed();
-      await deps.auth.authorizeOwner(request);
-      return contractResponse(await triggerSyncContract(deps.syncManager));
-    }
+      if (pathname === "/trigger") {
+        if (request.method !== "POST") return methodNotAllowed();
+        await deps.auth.authorizeOwner(request);
+        return contractResponse(await triggerSyncContract(deps.syncManager));
+      }
 
-    if (pathname === "/status") {
-      if (request.method !== "GET") return methodNotAllowed();
-      await deps.auth.authorizeOwner(request);
-      return contractResponse(getSyncStatusContract(deps.syncManager));
-    }
+      if (pathname === "/status") {
+        if (request.method !== "GET") return methodNotAllowed();
+        await deps.auth.authorizeOwner(request);
+        return contractResponse(getSyncStatusContract(deps.syncManager));
+      }
 
-    if (pathname.startsWith("/file/")) {
-      if (request.method !== "POST") return methodNotAllowed();
-      await deps.auth.authorizeOwner(request);
-      const fileId = decodeURIComponent(pathname.slice("/file/".length));
-      deps.logger?.info?.(
-        { fileId },
-        "File sync requested, triggering full sync",
-      );
-      return contractResponse(
-        await syncFileContract({
-          fileId,
-          syncManager: deps.syncManager,
-        }),
-      );
-    }
+      if (pathname.startsWith("/file/")) {
+        if (request.method !== "POST") return methodNotAllowed();
+        await deps.auth.authorizeOwner(request);
+        const fileId = decodeURIComponent(pathname.slice("/file/".length));
+        deps.logger?.info?.(
+          { fileId },
+          "File sync requested, triggering full sync",
+        );
+        return contractResponse(
+          await syncFileContract({
+            fileId,
+            syncManager: deps.syncManager,
+          }),
+        );
+      }
 
-    return notFound();
-  });
+      return notFound();
+    },
+    {
+      logger: deps.logger,
+      route: `${request.method} ${options.basePath ?? "/v1/sync"}`,
+    },
+  );
 }
 
 export async function handlePersonalServerGrantsRequest(

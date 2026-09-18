@@ -20,7 +20,16 @@ import {
 } from "../lineage/lineage.js";
 
 export type DataContractErrorCode =
-  "INVALID_SCOPE" | "INVALID_BODY" | "NOT_FOUND";
+  | "INVALID_SCOPE"
+  | "INVALID_BODY"
+  | "NOT_FOUND"
+  /**
+   * The scope IS indexed, but the file the index row names is not on disk.
+   * Distinct from `NOT_FOUND` (nothing indexed at all) on purpose: the two
+   * need different operator responses — one is "no data yet", the other is
+   * an index/storage divergence that wants repairing.
+   */
+  | "DATA_FILE_MISSING";
 
 export interface DataContractErrorBody {
   error: DataContractErrorCode;
@@ -377,14 +386,48 @@ export async function readDataContract(
     };
   }
 
+  // An index row whose backing file is gone is a 404, not a 500. The row
+  // says the version exists — `/versions` lists it and a client may name it
+  // explicitly — so the honest answer is "that version is not retrievable",
+  // with a code distinct from `NOT_FOUND` (nothing indexed) so an operator
+  // can tell a dangling row from an empty scope without reading a stack
+  // trace. Before this it escaped as a bare INTERNAL_ERROR 500.
+  let envelope;
+  try {
+    envelope = await input.storage.readEnvelope(
+      scopeResult.scope,
+      entry.collectedAt,
+    );
+  } catch (err) {
+    if (!isMissingFileError(err)) throw err;
+    return {
+      ok: false,
+      status: 404,
+      body: {
+        error: "DATA_FILE_MISSING",
+        message: `Indexed data for scope "${scopeResult.scope}" is no longer on disk`,
+      },
+    };
+  }
+
   return {
     ok: true,
     scope: scopeResult.scope,
-    envelope: await input.storage.readEnvelope(
-      scopeResult.scope,
-      entry.collectedAt,
-    ),
+    envelope,
   };
+}
+
+/**
+ * A read that failed because the bytes are not there — as opposed to any
+ * other storage fault, which stays a 500 because it is genuinely our bug.
+ * Matched on the Node error code rather than the message so it survives
+ * locale and wording changes; `ENOTDIR` is the same condition reached
+ * through a removed scope directory.
+ */
+function isMissingFileError(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const code = (err as { code?: unknown }).code;
+  return code === "ENOENT" || code === "ENOTDIR";
 }
 
 export async function ingestDataContract(

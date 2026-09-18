@@ -64,6 +64,17 @@ export interface PdppRecordsRouteDeps {
    * It fails closed on purpose — see `PdppChainEnforcementPort`.
    */
   chainEnforcement?: PdppChainEnforcementPort;
+  /**
+   * Where an `api_error` (500) goes. Optional so a deployment that wires no
+   * logger still boots, but without one a genuine server fault on this
+   * surface leaves nothing behind but the client's 500 — the exact
+   * observability hole that made a missing-file read take a day to diagnose.
+   */
+  logger?: PdppRouteLogger;
+}
+
+export interface PdppRouteLogger {
+  error(payload: Record<string, unknown>, message: string): void;
 }
 
 /**
@@ -162,7 +173,61 @@ function toPdppError(err: unknown): PdppError {
       "Cursor token is malformed, unrecognized, or was reused with a different order",
     );
   }
-  throw err;
+  // Anything else is our fault, not the client's. Rethrowing sent it past
+  // every route-level catch to the framework's generic handler, which
+  // answered a body that is not a PDPP error object and knows neither the
+  // route nor this request's `Request-Id` — so the line an operator finds in
+  // the log could not be tied to the response a client reported. Mapping it
+  // here keeps the wire contract intact (§8 Errors: `api_error`, 500) and
+  // gives the caller a correlatable id; `logApiError` writes the detail.
+  return new PdppError("api_error", "Internal server error");
+}
+
+/**
+ * The one place an `api_error` is recorded. Structured, and deliberately
+ * narrow: route, request id, error code, and the error's own name/message/
+ * stack. No Authorization header, no token, no grant, no record body — a
+ * resource server's log must not become a second copy of the data it
+ * protects, nor a place credentials come to rest.
+ */
+function logApiError(
+  deps: PdppRecordsRouteDeps,
+  route: string,
+  reqId: string,
+  err: unknown,
+): void {
+  if (!deps.logger) return;
+  deps.logger.error(
+    {
+      route,
+      requestId: reqId,
+      errorCode: "api_error",
+      err:
+        err instanceof Error
+          ? { name: err.name, message: err.message, stack: err.stack }
+          : { message: String(err) },
+    },
+    "PDPP resource server error",
+  );
+}
+
+/**
+ * Map a thrown error to its PDPP error, logging it first when it is a server
+ * fault rather than a client one — a 403 on a revoked grant is normal traffic
+ * and must not fill the log. Returns the mapped error so callers can both
+ * send it and (on the record routes) record the access-feed outcome from it.
+ */
+function mapAndLog(
+  deps: PdppRecordsRouteDeps,
+  route: string,
+  reqId: string,
+  err: unknown,
+): PdppError {
+  const mapped = toPdppError(err);
+  if (mapped.status === 500 && !(err instanceof PdppError)) {
+    logApiError(deps, route, reqId, err);
+  }
+  return mapped;
 }
 
 /**
@@ -518,7 +583,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     try {
       rejectUnknownParams(c, "listStreams");
     } catch (err) {
-      return sendError(c, toPdppError(err), reqId);
+      return sendError(
+        c,
+        mapAndLog(deps, "GET /v1/streams", reqId, err),
+        reqId,
+      );
     }
     // An inactive token must report the SAME reason here as on a record read.
     // This branch used to answer a flat `authentication_error` (401) while
@@ -660,7 +729,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
       );
     } catch (err) {
-      return sendError(c, toPdppError(err), reqId);
+      return sendError(
+        c,
+        mapAndLog(deps, "GET /v1/streams/:stream", reqId, err),
+        reqId,
+      );
     }
   });
 
@@ -827,7 +900,12 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       await logClientRead(c, context, stream, "completed", reqId);
       return response;
     } catch (err) {
-      const mapped = toPdppError(err);
+      const mapped = mapAndLog(
+        deps,
+        "GET /v1/streams/:stream/records",
+        reqId,
+        err,
+      );
       // A refusal is an access event too: the §7 access feed must show denied
       // attempts, not only successful ones, or an owner cannot see that an
       // app tried to read something it was not granted.
@@ -898,7 +976,12 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       await logClientRead(c, context, stream, "completed", reqId);
       return response;
     } catch (err) {
-      const mapped = toPdppError(err);
+      const mapped = mapAndLog(
+        deps,
+        "GET /v1/streams/:stream/records/:id",
+        reqId,
+        err,
+      );
       await logClientRead(
         c,
         context,
@@ -950,7 +1033,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         "PDPP-Version": PDPP_VERSION,
       });
     } catch (err) {
-      return sendError(c, toPdppError(err), reqId);
+      return sendError(
+        c,
+        mapAndLog(deps, "DELETE /v1/streams/:stream/records/:id", reqId, err),
+        reqId,
+      );
     }
   });
 
@@ -996,7 +1083,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
       );
     } catch (err) {
-      return sendError(c, toPdppError(err), reqId);
+      return sendError(
+        c,
+        mapAndLog(deps, "POST /v1/streams/:stream/records/ingest", reqId, err),
+        reqId,
+      );
     }
   });
 
