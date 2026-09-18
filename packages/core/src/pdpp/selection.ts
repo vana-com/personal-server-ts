@@ -302,8 +302,11 @@ export function validateSelectionRequest(
 
   const wildcards = streams.filter((s) => s.name === "*");
   if (wildcards.length > 0 && streams.length > 1) {
+    // §6 clause 6.8-3: a wildcard entry must be the only entry. Like the
+    // streams/preset exactly-one check above, this is a Source validation
+    // failure and must map to the same RFC 9396 code.
     return fail(
-      "invalid_request",
+      "source_validation_failed",
       "a wildcard stream entry must be the only entry in streams",
     );
   }
@@ -311,8 +314,10 @@ export function validateSelectionRequest(
   const seen = new Set<string>();
   for (const stream of streams) {
     if (seen.has(stream.name)) {
+      // §6 clause 6.8-3: stream names must be unique — also a Source
+      // validation failure.
       return fail(
-        "invalid_request",
+        "source_validation_failed",
         `stream '${stream.name}' appears more than once`,
       );
     }

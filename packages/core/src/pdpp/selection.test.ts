@@ -260,20 +260,28 @@ describe("§6 — wildcard rules", () => {
   });
 
   it("rejects a wildcard combined with another entry", () => {
-    // §6: "A wildcard entry MUST be the only entry in streams."
+    // §6: "A wildcard entry MUST be the only entry in streams." (clause
+    // 6.8-3). This is a Source validation failure like the streams/preset
+    // exactly-one case above, so it must carry the same failure code.
     const result = validateSelectionRequest(
       request({ streams: [{ name: "*" }, { name: "profile" }] }),
       snapshot,
     );
     expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.failure.code).toBe("source_validation_failed");
   });
 
   it("rejects duplicate stream names", () => {
+    // §6 clause 6.8-3: stream names must be unique. Also a Source
+    // validation failure.
     const result = validateSelectionRequest(
       request({ streams: [{ name: "profile" }, { name: "profile" }] }),
       snapshot,
     );
     expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.failure.code).toBe("source_validation_failed");
   });
 });
 
