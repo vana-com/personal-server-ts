@@ -177,6 +177,60 @@ describe("pdpp records routes: field projection", () => {
     expect(body.error.code).toBe("invalid_request");
   });
 
+  it("owner read succeeds without a filter, then the same request with an unsupported filter[...] is rejected with 400", async () => {
+    const store = createMemoryRecordStore();
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "playlists",
+          key: "pl_1",
+          data: { id: "pl_1", name: "visible" },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+    );
+    const { app } = buildApp(
+      {
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+        },
+      },
+      { store },
+    );
+
+    const okRes = await app.request("/streams/playlists/records", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+    expect(okRes.status).toBe(200);
+    const okBody = await okRes.json();
+    expect(okBody.data.map((r: { id: string }) => r.id)).toContain("pl_1");
+
+    for (const endpoint of [
+      "/streams",
+      "/streams/playlists",
+      "/streams/playlists/records",
+      "/streams/playlists/records/pl_1",
+    ]) {
+      for (const filter of [
+        "filter[name]=visible",
+        "filter[captured_at][gte]=2026-01-01",
+        "filter=anything",
+        "filter[name][bad][shape]=anything",
+      ]) {
+        const response = await app.request(`${endpoint}?${filter}`, {
+          headers: { Authorization: "Bearer owner-tok" },
+        });
+        expect(response.status).toBe(400);
+        expect((await response.json()).error.code).toBe("invalid_request");
+      }
+    }
+  });
+
   it("filters correctly on time_constraint even when the constraint field is not in the grant's authorized fields (list)", async () => {
     // Regression: field projection must not run before time_constraint
     // filtering. The grant's authorized fields below are ["id", "name"] --

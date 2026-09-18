@@ -291,7 +291,8 @@ function rejectUnknownParams(
   for (const key of url.searchParams.keys()) {
     const base = key.replace(/\[.*$/, "");
     if (allowed.includes(base)) continue;
-    if (CLIENT_REJECTED_PARAMS.includes(base)) continue;
+    // Filters are unsupported for both token kinds; never silently ignore them.
+    if (base !== "filter" && CLIENT_REJECTED_PARAMS.includes(base)) continue;
     throw new PdppError("invalid_request", `Unknown query parameter '${key}'`, {
       param: key,
     });
