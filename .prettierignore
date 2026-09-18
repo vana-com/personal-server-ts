@@ -4,3 +4,8 @@ coverage
 *.d.ts
 *.tsbuildinfo
 package-lock.json
+
+# Vendored producer artifacts. The `$pdpp` declaration digest is computed over
+# these files' EXACT BYTES, so reformatting them silently invalidates every
+# producer digest that references them. See __fixtures__/PROVENANCE.md.
+packages/core/src/pdpp/__fixtures__/*.source-declaration.json

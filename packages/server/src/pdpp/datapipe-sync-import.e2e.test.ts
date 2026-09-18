@@ -21,16 +21,23 @@
  * are transport, not behavior under test, and using real ones would test the
  * Gateway rather than this importer.
  *
- * What this does NOT prove, stated here so the test is not read as more than
- * it is: it does not prove interoperability with the Unity producer's current
- * declarations. Those use a different document schema (`connector_key`, no
- * `source_id`/`source_kind`) and digest a canonicalized re-serialization
- * rather than the retained bytes. Both are asserted as explicit rejections
- * below so the break cannot regress silently, but a passing suite here means
- * the PS half is correct, not that the producer is compatible.
+ * The declaration is the REAL delivered `SourceDeclaration` the Unity
+ * producer digests, read from disk rather than inlined. That distinction is
+ * the point: a fixture authored here would only prove PS agrees with itself,
+ * whereas reading the producer's own bytes is what makes the digest check an
+ * interoperability result. The `$pdpp` metadata is likewise shaped as the
+ * producer writes it.
+ *
+ * Division of labour with the parser lane, agreed rather than assumed: that
+ * lane owns asserting the projection itself (`fields` from
+ * `schema.properties`, the required floor from `schema.required`) against
+ * these same files. This test asserts what only it can — that the projection
+ * yields a stream a real `$pdpp` envelope actually imports against, and that
+ * the digest matches the document's own bytes end to end through the import
+ * path.
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -66,28 +73,38 @@ const INSTANCE = `instagram:${SUBJECT}`;
 const COLLECTED_AT = "2026-09-17T10:00:00.000Z";
 const EXPECTED_VERSION = "1";
 
-/** A real spec-core §5 SourceDeclaration, as a deployment retains it on disk. */
-const DECLARATION_DOCUMENT = JSON.stringify(
-  {
-    source_id: SOURCE_ID,
-    source_kind: "connector",
-    version: "0.1.0-local",
-    streams: [
-      {
-        name: "profile",
-        fields: ["id", "username", "full_name", "follower_count"],
-        required_fields: ["id", "username"],
-        primary_key: ["id"],
-      },
-    ],
-  },
-  null,
-  2,
+/**
+ * The REAL delivered SourceDeclaration, read from disk — never inlined.
+ *
+ * Inlining it would re-create the private-fixture problem: a document written
+ * here proves only that PS agrees with this test. These are the producer's
+ * own bytes, so the digest below is the value the producer actually stamps
+ * into `$pdpp`, and a passing digest check is an interoperability result
+ * rather than a self-consistency one.
+ *
+ * Read from the in-repo vendored copy rather than the delivery directory so
+ * the test is self-contained. The two are byte-identical, and the assertion
+ * immediately below pins that: if the vendored copy ever drifts from the
+ * digest the producer published, this fails rather than quietly testing a
+ * document no producer writes.
+ */
+const DECLARATION_PATH = join(
+  import.meta.dirname,
+  "../../../core/src/pdpp/__fixtures__/instagram.source-declaration.json",
 );
+const DECLARATION_DOCUMENT = readFileSync(DECLARATION_PATH, "utf-8");
 
 const DOCUMENT_DIGEST = createHash("sha256")
   .update(DECLARATION_DOCUMENT, "utf8")
   .digest("hex");
+
+/**
+ * The digest the producer published for this exact document (PR1098
+ * `bccc682e`), independently reproduced by two lanes. Pinned as a literal so
+ * a change to the document is a deliberate, visible act.
+ */
+const PUBLISHED_DIGEST =
+  "e4a9d0cb262f6b43956d7ff9cf17dd8851f3be1e3c3fe059bc18f022a29fbce5";
 
 const logger = pino({ level: "silent" });
 
@@ -209,6 +226,36 @@ function createStorageAdapter(blob: Uint8Array): StorageAdapter {
     download: async () => Uint8Array.from(blob),
   } as unknown as StorageAdapter;
 }
+
+describe("the declaration under test is the producer's own document", () => {
+  it("is byte-identical to the document the producer digested", () => {
+    // If this fails, the vendored fixture drifted (a reformat is enough) and
+    // every producer digest referencing it is silently invalid. Failing here
+    // is much cheaper than debugging a `digest_mismatch` at import.
+    expect(DOCUMENT_DIGEST).toBe(PUBLISHED_DIGEST);
+  });
+
+  it("is a normative Section 5 SourceDeclaration, not PS's internal shape", () => {
+    const raw = JSON.parse(DECLARATION_DOCUMENT) as Record<string, unknown>;
+    expect(raw.protocol_version).toBe("0.1.0");
+    expect(raw.source).toEqual({ kind: "connector", id: SOURCE_ID });
+    expect(raw.declaration_version).toBe("0.1.0-local");
+    // The normative document carries a JSON Schema, not a flat field list.
+    const stream = (raw.streams as Array<Record<string, unknown>>)[0];
+    expect(stream.schema).toBeDefined();
+    expect(stream).not.toHaveProperty("fields");
+  });
+
+  it("parses, and the retained snapshot digests to the document's own bytes", () => {
+    const parsed = parseDeclaration(DECLARATION_DOCUMENT, SOURCE_ID);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    // End-to-end byte-exactness: what PS retains hashes to what the producer
+    // stamped, with no canonicalization anywhere in between.
+    expect(parsed.snapshot.digest).toBe(PUBLISHED_DIGEST);
+    expect(parsed.snapshot.version).toBe("0.1.0-local");
+  });
+});
 
 describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
   let dir: string;
@@ -451,10 +498,11 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
     });
 
     it("rejects an envelope whose digest is over a canonicalized document", async () => {
-      // The exact interop break found against the Unity producer: digesting
-      // a key-sorted, minified re-serialization instead of the retained
-      // bytes. Semantically the same document; still not a proof that the
-      // producer read what the owner consented against.
+      // A regression guard for an interop break the producer has since
+      // fixed: it previously digested a key-sorted, minified
+      // re-serialization instead of the retained bytes. Semantically the
+      // same document, and still not proof the producer read what the owner
+      // consented against — so it must keep failing.
       const canonical = JSON.stringify(JSON.parse(DECLARATION_DOCUMENT));
       const canonicalDigest = createHash("sha256")
         .update(canonical, "utf8")
@@ -479,35 +527,30 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
       expect(store.listStreams([INSTANCE])).toEqual([]);
     });
 
-    it("refuses a declaration document PS cannot parse", () => {
-      // The other half of the interop break: the producer's canonical
-      // document uses `connector_key` and declares no `source_id` or
-      // `source_kind`, so no PS deployment can retain it at all.
-      const producerShaped = JSON.stringify({
-        connector_key: "instagram",
-        version: "0.1.0-local",
-        streams: [
+    it("retains nothing when a document declares a source it does not own", () => {
+      // The trust gate still has to hold now that the parser is permissive
+      // about document shape: a well-formed declaration is not automatically
+      // an authority over whatever source it names.
+      const registry = buildDeclarationRegistry({
+        declarations: [
           {
-            name: "profile",
-            fields: ["id", "username"],
-            required_fields: ["id"],
-            primary_key: ["id"],
+            sourceId: "https://registry.pdpp.dev/connectors/spotify",
+            document: DECLARATION_DOCUMENT,
           },
         ],
+        supportedConnectors: ["instagram", "spotify"],
+        logger,
       });
+      expect(registry.retained).toEqual([]);
+      expect(registry.retainedDocuments.size).toBe(0);
+    });
 
-      const parsed = parseDeclaration(producerShaped, SOURCE_ID);
-      expect(parsed.ok).toBe(false);
-      if (!parsed.ok) {
-        expect(parsed.failure.code).toBe("invalid_document");
-        expect(parsed.failure.message).toContain("source_id");
-      }
-
-      // And the registry consequently retains nothing, which is what makes
-      // the importer never see these envelopes.
+    it("retains nothing for a connector this server does not serve", () => {
       const registry = buildDeclarationRegistry({
-        declarations: [{ sourceId: SOURCE_ID, document: producerShaped }],
-        supportedConnectors: ["instagram"],
+        declarations: [{ sourceId: SOURCE_ID, document: DECLARATION_DOCUMENT }],
+        // This PS holds no Instagram data, so it must not become an
+        // authority over Instagram grants.
+        supportedConnectors: ["github"],
         logger,
       });
       expect(registry.retained).toEqual([]);
