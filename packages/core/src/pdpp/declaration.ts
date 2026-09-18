@@ -310,6 +310,121 @@ function findRemoteReference(node: unknown): string | null {
   return null;
 }
 
+/**
+ * The registered IANA top-level types. A closed set, unlike the subtypes.
+ */
+const TOP_LEVEL_MEDIA_TYPES = new Set([
+  "application",
+  "audio",
+  "example",
+  "font",
+  "haptics",
+  "image",
+  "message",
+  "model",
+  "multipart",
+  "text",
+  "video",
+]);
+
+/** RFC 6838 restricted-name grammar for a subtype (or a tree-prefixed one). */
+const SUBTYPE = /^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}$/;
+
+/**
+ * Is `value` a valid IANA media type (§4.8)?
+ *
+ * Checked against the GRAMMAR, not a registry snapshot. IANA adds subtypes
+ * continuously and without a spec revision, so refusing a well-formed subtype
+ * this server has not heard of would reject conforming declarations and turn
+ * the check into a registry-freshness test rather than a validity one. The
+ * top-level types are a closed set, so that half IS an exact check.
+ */
+function isValidMediaType(value: string): boolean {
+  // Parameters (`; charset=utf-8`) are part of a well-formed value; the
+  // type/subtype pair is what the clause constrains.
+  const [essence] = value.split(";");
+  const parts = essence.trim().split("/");
+  if (parts.length !== 2) return false;
+  const [type, subtype] = parts;
+  return TOP_LEVEL_MEDIA_TYPES.has(type.toLowerCase()) && SUBTYPE.test(subtype);
+}
+
+/**
+ * The first invalid declared `blob_ref` media type in a stream, as a reason.
+ *
+ * §4 shows `mime_type` inside a RECORD's `blob_ref`. A declaration describes
+ * record shape, so it can pin one in two places and both are checked rather
+ * than one being privileged:
+ *
+ *   - a `blob_fields` member listing blob-bearing fields and their types;
+ *   - a `const`/`enum` on a `blob_ref.mime_type` property inside the embedded
+ *     schema, which is how a declaration constrains any record field.
+ *
+ * Neither is mandatory: a stream declaring no blob field is untouched, which
+ * is the clause's own applicability condition.
+ */
+function findInvalidBlobMediaType(
+  stream: Record<string, unknown>,
+): string | null {
+  const blobFields = stream.blob_fields;
+  if (Array.isArray(blobFields)) {
+    for (const raw of blobFields) {
+      if (typeof raw !== "object" || raw === null) continue;
+      const { name, mime_type: mimeType } = raw as {
+        name?: unknown;
+        mime_type?: unknown;
+      };
+      if (typeof mimeType !== "string" || !isValidMediaType(mimeType)) {
+        return `declares blob_ref field '${String(name)}' with mime_type '${String(mimeType)}', which is not a valid IANA media type`;
+      }
+    }
+  }
+
+  return findInvalidSchemaMediaType(stream.schema);
+}
+
+/**
+ * A `const`/`enum` media type pinned on a `mime_type` property anywhere in the
+ * embedded schema, checked wherever it appears.
+ */
+function findInvalidSchemaMediaType(node: unknown): string | null {
+  if (Array.isArray(node)) {
+    for (const entry of node) {
+      const problem = findInvalidSchemaMediaType(entry);
+      if (problem) return problem;
+    }
+    return null;
+  }
+  if (typeof node !== "object" || node === null) return null;
+
+  const properties = (node as { properties?: unknown }).properties;
+  if (typeof properties === "object" && properties !== null) {
+    const pinned = (properties as Record<string, unknown>).mime_type;
+    if (typeof pinned === "object" && pinned !== null) {
+      const candidates = [
+        ...(typeof (pinned as { const?: unknown }).const === "string"
+          ? [(pinned as { const: string }).const]
+          : []),
+        ...(Array.isArray((pinned as { enum?: unknown }).enum)
+          ? ((pinned as { enum: unknown[] }).enum.filter(
+              (v) => typeof v === "string",
+            ) as string[])
+          : []),
+      ];
+      const bad = candidates.find((c) => !isValidMediaType(c));
+      if (bad !== undefined) {
+        return `pins mime_type '${bad}', which is not a valid IANA media type`;
+      }
+    }
+  }
+
+  for (const value of Object.values(node as Record<string, unknown>)) {
+    const problem = findInvalidSchemaMediaType(value);
+    if (problem) return problem;
+  }
+  return null;
+}
+
 export function computeDeclarationDigest(body: string): string {
   return createHash("sha256").update(body, "utf8").digest("hex");
 }
@@ -566,6 +681,21 @@ export function parseDeclaration(
           },
         };
       }
+    }
+
+    // §4.8: "`mime_type` MUST be a valid IANA media type." The value is what
+    // every consumer uses to decide how to interpret fetched bytes, so one no
+    // registry defines means each client guesses differently — and the guess
+    // is frozen into the document the owner's consent is written against.
+    const mediaTypeProblem = findInvalidBlobMediaType(s);
+    if (mediaTypeProblem) {
+      return {
+        ok: false,
+        failure: {
+          code: "invalid_document",
+          message: `stream '${s.name}' ${mediaTypeProblem}`,
+        },
+      };
     }
 
     // §5 stream semantics. An unrecognized value is a rejection rather than a
