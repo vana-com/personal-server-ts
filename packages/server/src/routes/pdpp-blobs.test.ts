@@ -917,3 +917,198 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
     expect(body.error.code).toBe("api_error");
   });
 });
+
+/**
+ * End-to-end proof that real ingestion (`store.storeBlobBytes`, the same
+ * atomic write GET wires against via `store.getBlobBytes`) actually reaches
+ * an authorized HTTP GET with exact bytes and headers -- not a stubbed
+ * `readBlobBytes` standing in for storage that doesn't exist. Wires
+ * `readBlobBytes` to `store.getBlobBytes` exactly the way `records-bootstrap.ts`
+ * wires real boot.
+ */
+describe.each(backends)(
+  "pdpp blobs route: real ingest-to-GET ($name store)",
+  ({ createStore }) => {
+    let stores: PdppRecordStore[] = [];
+    function newStore(): PdppRecordStore {
+      const s = createStore();
+      stores.push(s);
+      return s;
+    }
+    afterEach(() => {
+      for (const s of stores) s.close();
+      stores = [];
+    });
+
+    function appFor(
+      store: PdppRecordStore,
+      overrides: Partial<{
+        instancesForSubject: (subjectId: string) => string[];
+      }> = {},
+    ) {
+      return pdppBlobsRoutes({
+        store,
+        auth: createFixtureAuthorizationService({
+          "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+        }),
+        declarations,
+        instancesForSubject:
+          overrides.instancesForSubject ?? (() => ["inst_1"]),
+        readBlobBytes: async (blobId) => store.getBlobBytes(blobId),
+      });
+    }
+
+    it("serves the exact stored bytes and headers for a real ingested blob", async () => {
+      const store = newStore();
+      const payload = new Uint8Array([5, 4, 3, 2, 1, 0, 255]);
+      const meta = store.storeBlobBytes(payload, "application/octet-stream");
+      store.ingestBatch(
+        [
+          {
+            instance: "inst_1",
+            stream: "media",
+            key: "media_1",
+            data: { id: "media_1", blob_ref: { blob_id: meta.blobId } },
+            emitted_at: "2026-04-01T00:00:00.000Z",
+          },
+        ],
+        () => "append_only",
+        () => ["id"],
+      );
+      const app = appFor(store);
+      const res = await app.request(`/${meta.blobId}`, {
+        headers: { Authorization: "Bearer owner-tok" },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("Content-Type")).toBe("application/octet-stream");
+      expect(res.headers.get("Content-Length")).toBe(
+        String(payload.byteLength),
+      );
+      const returned = new Uint8Array(await res.arrayBuffer());
+      expect(Array.from(returned)).toEqual(Array.from(payload));
+    });
+
+    it("denies GET for an unauthorized grant even though the blob bytes are genuinely stored", async () => {
+      const store = newStore();
+      const payload = new Uint8Array([1, 2, 3]);
+      const meta = store.storeBlobBytes(payload, "image/jpeg");
+      store.ingestBatch(
+        [
+          {
+            instance: "inst_1",
+            stream: "media",
+            key: "media_1",
+            data: { id: "media_1", blob_ref: { blob_id: meta.blobId } },
+            emitted_at: "2026-04-01T00:00:00.000Z",
+          },
+        ],
+        () => "append_only",
+        () => ["id"],
+      );
+      // Owner-scoped instances resolver excludes inst_1 -- an authenticated
+      // but unauthorized-for-this-blob caller.
+      const app = appFor(store, { instancesForSubject: () => ["inst_other"] });
+      const res = await app.request(`/${meta.blobId}`, {
+        headers: { Authorization: "Bearer owner-tok" },
+      });
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body.error.code).toBe("blob_not_found");
+    });
+
+    it("denies GET once the only referencing record has been removed, even though the bytes are still stored", async () => {
+      const store = newStore();
+      const payload = new Uint8Array([1, 2, 3]);
+      const meta = store.storeBlobBytes(payload, "image/jpeg");
+      store.ingestBatch(
+        [
+          {
+            instance: "inst_1",
+            stream: "media",
+            key: "media_1",
+            data: { id: "media_1", blob_ref: { blob_id: meta.blobId } },
+            emitted_at: "2026-04-01T00:00:00.000Z",
+          },
+        ],
+        () => "mutable_state",
+        () => ["id"],
+      );
+      store.deleteRecord(
+        "inst_1",
+        "media",
+        "media_1",
+        "2026-04-02T00:00:00.000Z",
+        "mutable_state",
+      );
+      const app = appFor(store);
+      const res = await app.request(`/${meta.blobId}`, {
+        headers: { Authorization: "Bearer owner-tok" },
+      });
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body.error.code).toBe("blob_not_found");
+    });
+
+    it("fails closed on a real GET when the blob has metadata but was never given bytes (metadata-only row)", async () => {
+      const store = newStore();
+      store.putBlobMeta({
+        blobId: "blob_metadata_only",
+        mimeType: "image/jpeg",
+        sizeBytes: 3,
+        sha256: "abc",
+      });
+      store.ingestBatch(
+        [
+          {
+            instance: "inst_1",
+            stream: "media",
+            key: "media_1",
+            data: {
+              id: "media_1",
+              blob_ref: { blob_id: "blob_metadata_only" },
+            },
+            emitted_at: "2026-04-01T00:00:00.000Z",
+          },
+        ],
+        () => "append_only",
+        () => ["id"],
+      );
+      const app = appFor(store);
+      const res = await app.request("/blob_metadata_only", {
+        headers: { Authorization: "Bearer owner-tok" },
+      });
+      expect(res.status).toBe(500);
+      const body = await res.json();
+      expect(body.error.code).toBe("api_error");
+    });
+
+    it("fails closed on a real GET when the stored bytes have been corrupted relative to their metadata", async () => {
+      const store = newStore();
+      const payload = new Uint8Array([1, 2, 3]);
+      const meta = store.storeBlobBytes(payload, "image/jpeg");
+      // Simulate corruption discovered at read time: metadata now disagrees
+      // with the bytes actually on disk.
+      store.putBlobMeta({ ...meta, sha256: "0".repeat(64) });
+      store.ingestBatch(
+        [
+          {
+            instance: "inst_1",
+            stream: "media",
+            key: "media_1",
+            data: { id: "media_1", blob_ref: { blob_id: meta.blobId } },
+            emitted_at: "2026-04-01T00:00:00.000Z",
+          },
+        ],
+        () => "append_only",
+        () => ["id"],
+      );
+      const app = appFor(store);
+      const res = await app.request(`/${meta.blobId}`, {
+        headers: { Authorization: "Bearer owner-tok" },
+      });
+      expect(res.status).toBe(500);
+      const body = await res.json();
+      expect(body.error.code).toBe("api_error");
+    });
+  },
+);

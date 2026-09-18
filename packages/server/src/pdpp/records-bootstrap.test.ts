@@ -81,3 +81,30 @@ describe("createPdppRecordsDeps: instancesForSubject", () => {
     expect(instances).toEqual([]);
   });
 });
+
+describe("createPdppRecordsDeps: readBlobBytes", () => {
+  let db: Database.Database;
+  beforeEach(() => {
+    db = new Database(":memory:");
+  });
+  afterEach(() => db.close());
+
+  it("reads bytes back through the actual wired store, not a hand-injected reader", async () => {
+    const deps = createPdppRecordsDeps({
+      pdppAuth: fakePdppAuth(),
+      declarations: [DECLARATION],
+      db,
+      serverOwner: SERVER_OWNER,
+      resource: "https://ps.example.com",
+      logger: pino({ level: "silent" }),
+    });
+    expect(deps).toBeDefined();
+
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const meta = deps!.store.storeBlobBytes(bytes, "application/octet-stream");
+
+    const readBack = await deps!.readBlobBytes!(meta.blobId);
+    expect(readBack).toBeDefined();
+    expect(Array.from(readBack!)).toEqual(Array.from(bytes));
+  });
+});

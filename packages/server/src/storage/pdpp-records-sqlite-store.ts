@@ -1,4 +1,5 @@
 import type { Database } from "better-sqlite3";
+import { createHash } from "node:crypto";
 import {
   encodeRecordKey,
   keyMatchesData,
@@ -8,6 +9,7 @@ import {
   InvalidCursorSyntaxError,
   CursorExpiredError,
   InvalidCursorError,
+  BlobConflictError,
   type PdppRecordStore,
   type ChangesSinceOptions,
   type ChangesSincePage,
@@ -21,6 +23,10 @@ import {
   type StreamListing,
   type StreamSemantics,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+
+function blobIdForBytes(bytes: Uint8Array): string {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
 
 /**
  * Schema migrations for the desktop SQLite backend of the PDPP record
@@ -93,6 +99,17 @@ ALTER TABLE pdpp_records ADD COLUMN blob_id TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_pdpp_records_blob_id
   ON pdpp_records (blob_id);
+`,
+  // v3: actual blob byte storage, separate from `pdpp_blobs` metadata so an
+  // existing metadata-only row (legacy fixture, or a blob whose bytes were
+  // never ingested by this store) is untouched by this migration and simply
+  // has no matching pdpp_blob_bytes row -- getBlobBytes reports that as
+  // "unavailable", not as corruption.
+  `
+CREATE TABLE IF NOT EXISTS pdpp_blob_bytes (
+  blob_id TEXT PRIMARY KEY REFERENCES pdpp_blobs (blob_id),
+  bytes BLOB NOT NULL
+);
 `,
 ];
 
@@ -228,6 +245,12 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
   const getBlobStmt = db.prepare("SELECT * FROM pdpp_blobs WHERE blob_id = ?");
   const findBlobRefsStmt = db.prepare(
     "SELECT instance, stream, record_key FROM pdpp_records WHERE blob_id = ? AND deleted = 0",
+  );
+  const insertBlobBytesStmt = db.prepare(
+    "INSERT INTO pdpp_blob_bytes (blob_id, bytes) VALUES (@blob_id, @bytes)",
+  );
+  const getBlobBytesStmt = db.prepare(
+    "SELECT bytes FROM pdpp_blob_bytes WHERE blob_id = ?",
   );
 
   function latestVersion(
@@ -646,6 +669,111 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
     }));
   }
 
+  function getBlobMeta(blobId: string): PdppBlobMeta | undefined {
+    const row = getBlobStmt.get(blobId) as
+      | {
+          blob_id: string;
+          mime_type: string;
+          size_bytes: number;
+          sha256: string;
+        }
+      | undefined;
+    if (!row) return undefined;
+    return {
+      blobId: row.blob_id,
+      mimeType: row.mime_type,
+      sizeBytes: row.size_bytes,
+      sha256: row.sha256,
+    };
+  }
+
+  /** True only when a stored bytes row actually hash/size-matches `meta`. */
+  function storedBytesVerify(meta: PdppBlobMeta): boolean {
+    const row = getBlobBytesStmt.get(meta.blobId) as
+      { bytes: Buffer } | undefined;
+    if (!row) return false;
+    const stored = new Uint8Array(row.bytes);
+    if (stored.byteLength !== meta.sizeBytes) return false;
+    return createHash("sha256").update(stored).digest("hex") === meta.sha256;
+  }
+
+  function storeBlobBytes(bytes: Uint8Array, mimeType: string): PdppBlobMeta {
+    const blobId = blobIdForBytes(bytes);
+    const sha256 = blobId.slice("sha256:".length);
+    const candidate: PdppBlobMeta = {
+      blobId,
+      mimeType,
+      sizeBytes: bytes.byteLength,
+      sha256,
+    };
+
+    // The existing-row read and the write both happen inside one
+    // transaction, not a check-then-upsert outside it -- otherwise two
+    // concurrent writers for the same content could both see "no existing
+    // row" and race to insert, or one could complete a metadata-only row
+    // while another concurrently overwrites it.
+    const run = db.transaction((): PdppBlobMeta => {
+      const existing = getBlobMeta(blobId);
+
+      if (existing) {
+        if (
+          existing.mimeType !== mimeType ||
+          existing.sha256 !== sha256 ||
+          existing.sizeBytes !== bytes.byteLength
+        ) {
+          throw new BlobConflictError(blobId, existing);
+        }
+        const bytesRow = getBlobBytesStmt.get(blobId) as
+          { bytes: Buffer } | undefined;
+        if (!bytesRow) {
+          // Metadata-only row (legacy/test fixture via putBlobMeta, or a
+          // prior write that never got this far): complete it with real
+          // bytes now instead of reporting a false "already stored" no-op.
+          insertBlobBytesStmt.run({
+            blob_id: existing.blobId,
+            bytes: Buffer.from(bytes),
+          });
+          return existing;
+        }
+        if (!storedBytesVerify(existing)) {
+          // Bytes present but corrupt relative to their own metadata.
+          // Refuse rather than report success over broken content, and
+          // rather than silently repair -- the row stays exactly as it was
+          // (the transaction makes no writes on this branch).
+          throw new BlobConflictError(blobId, existing);
+        }
+        // Verified idempotent no-op: content and mimeType both match.
+        return existing;
+      }
+
+      putBlobStmt.run({
+        blob_id: candidate.blobId,
+        mime_type: candidate.mimeType,
+        size_bytes: candidate.sizeBytes,
+        sha256: candidate.sha256,
+      });
+      insertBlobBytesStmt.run({
+        blob_id: candidate.blobId,
+        bytes: Buffer.from(bytes),
+      });
+      return candidate;
+    });
+
+    return run();
+  }
+
+  function getBlobBytes(blobId: string): Uint8Array<ArrayBuffer> | undefined {
+    const meta = getBlobMeta(blobId);
+    if (!meta) return undefined;
+    const row = getBlobBytesStmt.get(blobId) as { bytes: Buffer } | undefined;
+    if (!row) return undefined;
+    const bytes = new Uint8Array(row.bytes);
+    if (bytes.byteLength !== meta.sizeBytes) return undefined;
+    const actualHash = createHash("sha256").update(bytes).digest("hex");
+    if (actualHash !== meta.sha256) return undefined;
+    return bytes as Uint8Array<ArrayBuffer>;
+  }
+
   return {
     ingestBatch,
     getRecord,
@@ -660,23 +788,9 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
         size_bytes: meta.sizeBytes,
         sha256: meta.sha256,
       }),
-    getBlobMeta: (blobId: string) => {
-      const row = getBlobStmt.get(blobId) as
-        | {
-            blob_id: string;
-            mime_type: string;
-            size_bytes: number;
-            sha256: string;
-          }
-        | undefined;
-      if (!row) return undefined;
-      return {
-        blobId: row.blob_id,
-        mimeType: row.mime_type,
-        sizeBytes: row.size_bytes,
-        sha256: row.sha256,
-      };
-    },
+    getBlobMeta,
+    storeBlobBytes,
+    getBlobBytes,
     findBlobReferences: (blobId: string) => {
       const rows = findBlobRefsStmt.all(blobId) as Array<{
         instance: string;

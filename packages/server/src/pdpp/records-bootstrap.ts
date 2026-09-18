@@ -56,6 +56,9 @@ export interface PdppRecordsDeps {
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
   instancesForSubject?: (subjectId: string) => string[];
+  readBlobBytes?: (
+    blobId: string,
+  ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
   resource: string;
   authorizationServers?: string[];
 }
@@ -109,8 +112,10 @@ export function createPdppRecordsDeps(
     "PDPP Resource Server mounted at /v1",
   );
 
+  const store = createSqliteRecordStore(options.db);
+
   return {
-    store: createSqliteRecordStore(options.db),
+    store,
     auth: coLocatedAuthorizationService(pdppAuth),
     declarations: createStreamDeclarationRegistry(streams),
     // This deployment has exactly one owner. A subject other than that
@@ -119,6 +124,12 @@ export function createPdppRecordsDeps(
     // above (lowercased address), so casing never causes a false mismatch.
     instancesForSubject: (subject) =>
       subject.toLowerCase() === subjectId ? instances : [],
+    // Real boot wiring for GET /v1/blobs/:blobId: reads the same store the
+    // blob was ingested into, so this deployment can only ever serve bytes
+    // it verifiably stored -- store.getBlobBytes re-verifies size/sha256
+    // against the recorded metadata on every read (fails closed on
+    // corruption or metadata-only rows) rather than trusting the disk blindly.
+    readBlobBytes: async (blobId) => store.getBlobBytes(blobId),
     resource: options.resource,
     // Co-located: this server is its own authorization server.
     authorizationServers: [options.resource],

@@ -98,6 +98,29 @@ export interface PdppBlobMeta {
   sha256: string;
 }
 
+/**
+ * A blob_id whose bytes are already stored under a DIFFERENT mime type than
+ * requested, or whose previously-stored bytes no longer hash/size-match
+ * their own recorded metadata. blob_id is content-derived from the bytes'
+ * SHA-256 as an IMPLEMENTATION convention of this store (spec-core.md §4
+ * "Binary data (blob_ref)" does not itself mandate content-derived ids), so
+ * a same-blob_id conflict can only happen when the same bytes are re-stored
+ * with a different declared mimeType, or when the existing stored bytes are
+ * corrupt relative to their own metadata — refusing beats guessing which
+ * caller's intent should win, and refusing beats silently reporting success
+ * over corrupt content.
+ */
+export class BlobConflictError extends Error {
+  constructor(
+    public readonly blobId: string,
+    public readonly existing: PdppBlobMeta,
+  ) {
+    super(
+      `blob ${blobId} conflicts with its stored metadata (mimeType '${existing.mimeType}', sizeBytes ${existing.sizeBytes}, sha256 ${existing.sha256})`,
+    );
+  }
+}
+
 export class CursorExpiredError extends Error {
   constructor() {
     super("changes_since cursor has expired");
