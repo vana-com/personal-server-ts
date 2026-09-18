@@ -346,6 +346,38 @@ export class PdppAuthStore {
       );
   }
 
+  /**
+   * Persist an issued grant and its authorization code as one durable unit.
+   *
+   * An owner approval produces exactly one grant and exactly one redeemable
+   * code; there is no meaningful state where one exists without the other.
+   * Without this, a failure between the two inserts (disk full, process
+   * kill) could leave a grant with no code ever issued for it — and, worse,
+   * strand the caller's in-memory approval state with nothing durable to
+   * show for it. Wrapping both in one transaction makes the local write
+   * atomic: it either lands completely or not at all, so a caller can retry
+   * the same approval decision safely on failure.
+   */
+  insertGrantWithAuthCode(input: {
+    grant: Grant;
+    subjectId: string;
+    reviewDigest: string;
+    consentEvidence?: unknown;
+    code: string;
+    authCode: AuthCodeRecord;
+  }): void {
+    const tx = this.db.transaction(() => {
+      this.insertGrant({
+        grant: input.grant,
+        subjectId: input.subjectId,
+        reviewDigest: input.reviewDigest,
+        consentEvidence: input.consentEvidence,
+      });
+      this.insertAuthCode(input.code, input.authCode);
+    });
+    tx();
+  }
+
   getGrant(grantId: string): StoredGrant | null {
     const row = this.db
       .prepare("SELECT * FROM pdpp_grants WHERE grant_id = ?")

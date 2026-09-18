@@ -522,26 +522,32 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       );
     }
 
-    // Persist the grant and its consent evidence, then mint a single-use
-    // authorization code for the redirect.
-    deps.store.insertGrant({
+    // Persist the grant and its authorization code as one durable unit
+    // before marking this session complete. Only
+    // once this succeeds does the session move to "approved" — if the write
+    // fails, the session stays "pending" so the same reviewed approval can
+    // be retried rather than being stranded as already-decided with nothing
+    // durable behind it.
+    const code = `pdpp_code_${crypto.randomUUID().replace(/-/g, "")}`;
+    deps.store.insertGrantWithAuthCode({
       grant: result.grant,
       subjectId: result.grant.subject.id,
       reviewDigest: result.consentEvidence.review_digest,
       consentEvidence: result.consentEvidence,
+      code,
+      authCode: {
+        grantId: result.grant.grant_id,
+        clientId: result.grant.client.client_id,
+        redirectUri: session!.redirect_uri,
+        // Carried from the authorization request, so redemption can prove the
+        // redeemer is the client that asked (RFC 7636 §4.4).
+        codeChallenge: session!.code_challenge ?? null,
+        codeChallengeMethod: session!.code_challenge_method ?? null,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      },
     });
 
-    const code = `pdpp_code_${crypto.randomUUID().replace(/-/g, "")}`;
-    deps.store.insertAuthCode(code, {
-      grantId: result.grant.grant_id,
-      clientId: result.grant.client.client_id,
-      redirectUri: session!.redirect_uri,
-      // Carried from the authorization request, so redemption can prove the
-      // redeemer is the client that asked (RFC 7636 §4.4).
-      codeChallenge: session!.code_challenge ?? null,
-      codeChallengeMethod: session!.code_challenge_method ?? null,
-      expiresAt: new Date(Date.now() + 60_000).toISOString(),
-    });
+    deps.sessions.setStatus(session!.session_id, "approved");
 
     const redirect = new URL(session!.redirect_uri);
     redirect.searchParams.set("code", code);

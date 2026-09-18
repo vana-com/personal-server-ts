@@ -390,6 +390,15 @@ export function fetchReview(input: {
  * unauthenticated caller cannot learn from the error whether their digest was
  * fresh — a spoofed approval with a perfectly valid digest gets the same
  * `unauthorized` as one with a garbage digest.
+ *
+ * This function does not mark the session `"approved"` — it only decides
+ * whether the review is valid and computes what to issue. The session
+ * transitions to `"approved"` only once the caller has durably persisted the
+ * grant and its authorization code (see `pdpp-auth.ts`'s approve route). A
+ * session marked approved before that write lands would leave a caller whose
+ * persistence failed with no way to retry: the session is already terminal
+ * (`status !== "pending"` above), so a retry of the same reviewed approval
+ * would be rejected as already-decided even though nothing durable exists.
  */
 export function approveAuthorization(input: {
   sessions: AuthorizationSessionStore;
@@ -475,7 +484,6 @@ export function approveAuthorization(input: {
     return { ok: false, failure: { code, message: issuance.failure.message } };
   }
 
-  input.sessions.setStatus(session.session_id, "approved");
   return {
     ok: true,
     grant: issuance.grant,

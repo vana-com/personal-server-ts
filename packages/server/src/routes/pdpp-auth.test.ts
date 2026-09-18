@@ -570,6 +570,95 @@ describe("denial", () => {
   });
 });
 
+describe("approval persistence failure (session/grant/code atomicity)", () => {
+  it("does not strand the session as approved when the durable write fails, and allows retry", async () => {
+    const { sessionId, ownerToken, digest } = await openSessionAndReview();
+
+    // Simulate a local persistence failure between the two durable writes
+    // (grant insert succeeds, auth-code insert fails) — e.g. disk full,
+    // or a constraint violation during approval.
+    const originalInsertAuthCode = store.insertAuthCode.bind(store);
+    let shouldFail = true;
+    store.insertAuthCode = ((
+      ...args: Parameters<typeof originalInsertAuthCode>
+    ) => {
+      if (shouldFail) {
+        shouldFail = false;
+        throw new Error("simulated disk failure during auth-code persistence");
+      }
+      return originalInsertAuthCode(...args);
+    }) as typeof store.insertAuthCode;
+
+    const failed = await post(
+      `/pdpp/v1/authorize/${sessionId}/approve`,
+      { review_digest: digest },
+      ownerAuth(ownerToken),
+    );
+    expect(failed.status).toBe(500);
+
+    // No grant should have survived the failed approval — otherwise a grant
+    // exists with no redeemable code, and no record of the failure.
+    const grantsAfterFailure = store.listGrantsForSubject(OWNER);
+    expect(grantsAfterFailure).toHaveLength(0);
+
+    // The owner must be able to retry the SAME reviewed approval. If the
+    // in-memory session was already marked "approved" before the durable
+    // write failed, this retry would be rejected as "already decided" even
+    // though nothing durable was ever persisted — stranding valid consent.
+    const retried = await post(
+      `/pdpp/v1/authorize/${sessionId}/approve`,
+      { review_digest: digest },
+      ownerAuth(ownerToken),
+    );
+    expect(retried.status).toBe(200);
+    const { redirect_uri, grant_id } = (await retried.json()) as {
+      redirect_uri: string;
+      grant_id: string;
+    };
+
+    // The retry must have produced a real, redeemable grant + code.
+    expect(store.getGrant(grant_id)).not.toBeNull();
+    const code = new URL(redirect_uri).searchParams.get("code");
+    expect(code).toBeTruthy();
+
+    const tokenResponse = await postForm("/pdpp/v1/token", {
+      grant_type: "authorization_code",
+      code: code!,
+      client_id: "music_recommendations",
+      redirect_uri: REDIRECT,
+      code_verifier: VERIFIER,
+    });
+    expect(tokenResponse.status).toBe(200);
+  });
+
+  it("rejects a concurrent duplicate approval of the same session, issuing exactly one grant", async () => {
+    // Two approval requests racing for the same reviewed session must not
+    // both succeed. Node's single-threaded, run-to-completion model makes
+    // this safe as long as nothing awaits between checking the session is
+    // pending and marking it approved — this proves that holds end-to-end.
+    const { sessionId, ownerToken, digest } = await openSessionAndReview();
+
+    const [first, second] = await Promise.all([
+      post(
+        `/pdpp/v1/authorize/${sessionId}/approve`,
+        { review_digest: digest },
+        ownerAuth(ownerToken),
+      ),
+      post(
+        `/pdpp/v1/authorize/${sessionId}/approve`,
+        { review_digest: digest },
+        ownerAuth(ownerToken),
+      ),
+    ]);
+
+    const statuses = [first.status, second.status].sort();
+    expect(statuses).toEqual([200, 400]);
+
+    const grants = store.listGrantsForSubject(OWNER);
+    expect(grants).toHaveLength(1);
+  });
+});
+
 describe("the consent review model the UI renders", () => {
   it("emits the four semantic categories separately", async () => {
     const ownerToken = tokens.issueOwnerToken({

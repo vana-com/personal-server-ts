@@ -502,17 +502,23 @@ describe("§7 / §9 AS item 15 — stale approvals are rejected", () => {
   });
 
   it("rejects a second approval of an already-decided session", () => {
+    // `approveAuthorization` itself does not mark the session decided — the
+    // caller does that only after durably persisting the grant (see
+    // `pdpp-auth.ts`), so a failed persistence leaves the session retryable.
+    // This test drives that full contract: caller marks the session approved
+    // once it has "persisted" the result, then a second approval attempt
+    // must be rejected.
     const { session, ownerToken, digest } = pendingSession();
-    expect(
-      approveAuthorization({
-        sessions,
-        tokens,
-        sessionId: session.session_id,
-        ownerToken,
-        reviewDigest: digest,
-        inventory: oneInstance,
-      }).ok,
-    ).toBe(true);
+    const first = approveAuthorization({
+      sessions,
+      tokens,
+      sessionId: session.session_id,
+      ownerToken,
+      reviewDigest: digest,
+      inventory: oneInstance,
+    });
+    expect(first.ok).toBe(true);
+    sessions.setStatus(session.session_id, "approved");
 
     const second = approveAuthorization({
       sessions,
@@ -525,6 +531,36 @@ describe("§7 / §9 AS item 15 — stale approvals are rejected", () => {
     expect(second.ok).toBe(false);
     if (second.ok) return;
     expect(second.failure.code).toBe("access_denied");
+  });
+
+  it("does not mark the session decided on its own — retrying after a would-be persistence failure still succeeds", () => {
+    // The regression this guards: approveAuthorization used to set the
+    // session to "approved" internally, before the caller had durably
+    // persisted anything. If persistence then failed, the session was
+    // already terminal and the owner's reviewed consent could never be
+    // retried. Calling approveAuthorization twice without ever advancing the
+    // session (as happens when the caller's persistence write throws) must
+    // succeed both times.
+    const { session, ownerToken, digest } = pendingSession();
+    const first = approveAuthorization({
+      sessions,
+      tokens,
+      sessionId: session.session_id,
+      ownerToken,
+      reviewDigest: digest,
+      inventory: oneInstance,
+    });
+    expect(first.ok).toBe(true);
+
+    const retry = approveAuthorization({
+      sessions,
+      tokens,
+      sessionId: session.session_id,
+      ownerToken,
+      reviewDigest: digest,
+      inventory: oneInstance,
+    });
+    expect(retry.ok).toBe(true);
   });
 
   it("rejects approval of an expired review session", () => {
