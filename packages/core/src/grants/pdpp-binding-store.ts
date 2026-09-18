@@ -69,7 +69,10 @@ export interface PdppGrantBindingStore {
  * Rejecting the rewrite surfaces that as a failure instead of quietly
  * repointing a retained grant at an address the owner never approved.
  */
-function bindingsAgree(a: PdppGrantBinding, b: PdppGrantBinding): boolean {
+export function bindingsAgree(
+  a: PdppGrantBinding,
+  b: PdppGrantBinding,
+): boolean {
   return (
     a.pdppGrantId === b.pdppGrantId &&
     samePermission(a.permission, b.permission) &&
@@ -79,7 +82,7 @@ function bindingsAgree(a: PdppGrantBinding, b: PdppGrantBinding): boolean {
   );
 }
 
-function permissionKey(p: ChainPermissionRef): string {
+export function permissionKey(p: ChainPermissionRef): string {
   return `${p.chainId}:${p.contractAddress.toLowerCase()}:${p.permissionId}`;
 }
 

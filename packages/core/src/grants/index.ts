@@ -37,6 +37,8 @@ export {
   type VerifyBindingInput,
 } from "./pdpp-binding.js";
 export {
+  bindingsAgree,
   createInMemoryPdppGrantBindingStore,
+  permissionKey,
   type PdppGrantBindingStore,
 } from "./pdpp-binding-store.js";
