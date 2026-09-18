@@ -24,6 +24,7 @@ import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { computeS256Challenge } from "@opendatalabs/personal-server-ts-core/pdpp";
+import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { createServer, type ServerContext } from "../bootstrap.js";
 import { initializeDatabase } from "../storage/index-schema.js";
 
@@ -85,16 +86,21 @@ async function writeDeclaration(document = DECLARATION): Promise<string> {
   return path;
 }
 
-function pdppConfig(declarationPaths: string[]) {
+function pdppConfig(
+  declarationPaths: string[],
+  clients: Array<{
+    clientId: string;
+    redirectUris: string[];
+    grantLifetimeSeconds?: number;
+  }> = [{ clientId: "music_recommendations", redirectUris: [REDIRECT] }],
+) {
   return ServerConfigSchema.parse({
     tunnel: { enabled: false },
     pdpp: {
       enabled: true,
       declarationPaths,
       // redirect_uri is validated by exact match against this registration.
-      clients: [
-        { clientId: "music_recommendations", redirectUris: [REDIRECT] },
-      ],
+      clients,
     },
   });
 }
@@ -861,4 +867,264 @@ describe("the real boot path mounts the AS for a normative declaration", () => {
     );
     expect(profile?.fields.length).toBeGreaterThan(0);
   });
+});
+
+/**
+ * Operator per-client grant lifetime policy (`pdpp.clients[].grantLifetimeSeconds`).
+ *
+ * This is deployment policy, not a protocol extension: the client never
+ * requests or sees an expiry parameter, and a client with no configured
+ * lifetime is unaffected — asserted below against the SAME declaration and
+ * SAME boot path, with an ordinary client registered alongside the
+ * short-lived one.
+ *
+ * The real clock is used (no wall-clock monkeypatch): the fixture client's
+ * lifetime is a few seconds and the test waits past it with a real
+ * `setTimeout`, matching the pattern already used elsewhere in this suite
+ * (see the restart test above and `bootstrap.test.ts`'s other `setTimeout`
+ * waits). Both clients share a SINGLE real sleep so the suite pays for one
+ * wait, not two.
+ */
+describe("operator per-client grant lifetime policy", () => {
+  const SHORT_LIVED_CLIENT = "expiring_widget";
+  const ORDINARY_CLIENT = "music_recommendations";
+  const GRANT_LIFETIME_SECONDS = 3;
+
+  beforeEach(async () => {
+    await seedScope("spotify.top_artists");
+    ctx = await boot(
+      pdppConfig(
+        [await writeDeclaration()],
+        [
+          { clientId: ORDINARY_CLIENT, redirectUris: [REDIRECT] },
+          {
+            clientId: SHORT_LIVED_CLIENT,
+            redirectUris: [REDIRECT],
+            grantLifetimeSeconds: GRANT_LIFETIME_SECONDS,
+          },
+        ],
+      ),
+    );
+  });
+
+  async function ownerToken(context: ServerContext): Promise<string> {
+    const response = await context.app.request("/pdpp/v1/owner/token", {
+      method: "POST",
+      headers: { authorization: `Bearer ${context.devToken}` },
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { access_token: string };
+    return body.access_token;
+  }
+
+  /**
+   * The subject the AS binds the owner to, derived the same way the server
+   * itself derives it from `KNOWN_SIG`. Used to compute the exact `instance`
+   * handle a seeded record must carry to be within the grant's resources.
+   */
+  async function ownerSubjectId(): Promise<string> {
+    const owner = await recoverServerOwner(KNOWN_SIG);
+    return owner.toLowerCase();
+  }
+
+  /**
+   * Seed a real, known `top_artists` record through the actual owner-token
+   * ingest route — not a store or DB bypass — so the read assertions below
+   * exercise the same RS enforcement path a real RS consumer would.
+   */
+  async function seedKnownRecord(
+    ownerAccessToken: string,
+    recordId: string,
+  ): Promise<void> {
+    const instance = `spotify:${await ownerSubjectId()}`;
+    const response = await ctx!.app.request(
+      "/v1/streams/top_artists/records/ingest",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${ownerAccessToken}`,
+        },
+        body: JSON.stringify({
+          instance,
+          key: recordId,
+          data: { id: recordId, name: "The Midnight" },
+          emitted_at: "2026-01-01T00:00:00.000Z",
+        }),
+      },
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { accepted: number };
+    expect(body.accepted).toBe(1);
+  }
+
+  /** Drive the real authorize -> review -> approve -> redeem journey for one client. */
+  async function issueGrantFor(clientId: string): Promise<{
+    accessToken: string;
+    ownerAccessToken: string;
+    grantExpiresAt?: string;
+  }> {
+    const app = ctx!.app;
+    const token = await ownerToken(ctx!);
+
+    const authorized = await app.request("/pdpp/v1/authorize", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        client_id: clientId,
+        redirect_uri: REDIRECT,
+        code_challenge: CHALLENGE,
+        code_challenge_method: "S256",
+        authorization_details: [
+          {
+            type: "https://pdpp.dev/data-access",
+            source: { id: SOURCE_ID },
+            purpose_code: "https://pdpp.dev/purpose/personalization",
+            access_mode: "continuous",
+            streams: [{ name: "top_artists" }],
+          },
+        ],
+      }),
+    });
+    expect(authorized.status).toBe(201);
+    const { session_id } = (await authorized.json()) as { session_id: string };
+
+    const reviewed = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review`,
+      { headers: { authorization: `Bearer ${token}` } },
+    );
+    expect(reviewed.status).toBe(200);
+    const { review } = (await reviewed.json()) as {
+      review: {
+        review_digest: string;
+        data: { expires_at?: string };
+      };
+    };
+
+    const approved = await app.request(
+      `/pdpp/v1/authorize/${session_id}/approve`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ review_digest: review.review_digest }),
+      },
+    );
+    expect(approved.status).toBe(200);
+    const { redirect_uri } = (await approved.json()) as {
+      redirect_uri: string;
+    };
+    const code = new URL(redirect_uri).searchParams.get("code")!;
+
+    const tokenResponse = await app.request("/pdpp/v1/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        client_id: clientId,
+        redirect_uri: REDIRECT,
+        code_verifier: VERIFIER,
+      }).toString(),
+    });
+    expect(tokenResponse.status).toBe(200);
+    const issued = (await tokenResponse.json()) as { access_token: string };
+    return {
+      accessToken: issued.access_token,
+      ownerAccessToken: token,
+      grantExpiresAt: review.data.expires_at,
+    };
+  }
+
+  /** Read the RS-facing enforcement view through the real /introspect route. */
+  async function introspect(
+    ownerAccessToken: string,
+    accessToken: string,
+  ): Promise<{ active: boolean }> {
+    const response = await ctx!.app.request("/pdpp/v1/introspect", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        authorization: `Bearer ${ownerAccessToken}`,
+      },
+      body: new URLSearchParams({ token: accessToken }).toString(),
+    });
+    return (await response.json()) as { active: boolean };
+  }
+
+  /** Read the known record through the real RS route, as the client would. */
+  async function readRecord(
+    clientAccessToken: string,
+    recordId: string,
+  ): Promise<Response> {
+    return ctx!.app.request(
+      `/v1/streams/top_artists/records/${encodeURIComponent(recordId)}`,
+      { headers: { authorization: `Bearer ${clientAccessToken}` } },
+    );
+  }
+
+  it(
+    "reads the known record before expiry, then refuses the SAME token after — leaving an ordinary client's grant unaffected",
+    async () => {
+      const RECORD_ID = "artist_1";
+
+      const shortLived = await issueGrantFor(SHORT_LIVED_CLIENT);
+      await seedKnownRecord(shortLived.ownerAccessToken, RECORD_ID);
+
+      // The policy the review computed is frozen into the session, and the
+      // owner sees it before approving — not just enforced silently later.
+      expect(shortLived.grantExpiresAt).toBeTruthy();
+      expect(Date.parse(shortLived.grantExpiresAt!)).toBeGreaterThan(
+        Date.now(),
+      );
+
+      const ordinary = await issueGrantFor(ORDINARY_CLIENT);
+      // No grantLifetimeSeconds configured for this client, so no AS-imposed
+      // expiry is computed at all.
+      expect(ordinary.grantExpiresAt).toBeUndefined();
+
+      // Positive, before the wait: the SAME token the short-lived client
+      // holds can read the SAME seeded record, and introspection agrees.
+      const beforeRead = await readRecord(shortLived.accessToken, RECORD_ID);
+      expect(beforeRead.status).toBe(200);
+      const beforeBody = (await beforeRead.json()) as {
+        data: { id: string; name: string };
+      };
+      expect(beforeBody.data.id).toBe(RECORD_ID);
+      expect(beforeBody.data.name).toBe("The Midnight");
+      expect(
+        (await introspect(shortLived.ownerAccessToken, shortLived.accessToken))
+          .active,
+      ).toBe(true);
+
+      // Wait past the configured lifetime once, using the real clock — both
+      // clients' post-wait assertions below share this single sleep.
+      await new Promise((resolve) =>
+        setTimeout(resolve, (GRANT_LIFETIME_SECONDS + 2) * 1000),
+      );
+
+      // The SAME token, unchanged, is now refused reading the SAME record —
+      // grant expiry, not a fabricated or alternate token or record.
+      const afterRead = await readRecord(shortLived.accessToken, RECORD_ID);
+      expect(afterRead.status).toBe(403);
+      expect((await afterRead.json()).error.code).toBe("grant_expired");
+      expect(
+        (await introspect(shortLived.ownerAccessToken, shortLived.accessToken))
+          .active,
+      ).toBe(false);
+
+      // The ordinary client's grant, issued alongside it, stays active past
+      // the same window: the policy is per-client, not global.
+      expect(
+        (await introspect(ordinary.ownerAccessToken, ordinary.accessToken))
+          .active,
+      ).toBe(true);
+    },
+    (GRANT_LIFETIME_SECONDS + 5) * 1000,
+  );
 });

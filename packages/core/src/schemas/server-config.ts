@@ -89,7 +89,15 @@ export const DEFAULTS = {
     // delivered through that redirect: an unvalidated target is code
     // exfiltration, and PKCE does not help when the attacker chose the
     // challenge. Empty means no client may start an authorization flow.
-    clients: [] as Array<{ clientId: string; redirectUris: string[] }>,
+    clients: [] as Array<{
+      clientId: string;
+      redirectUris: string[];
+      // Optional operator policy: cap how long a grant issued to this client
+      // stays active, in seconds. Unset means no AS-imposed expiry, exactly
+      // today's behavior. This is deployment policy, not something a client
+      // can request — there is deliberately no client-supplied expiry field.
+      grantLifetimeSeconds?: number;
+    }>,
     // Hosts this deployment allows to resolve URL-hosted (§6) client
     // identities. Empty means no client_id is ever fetched: registration in
     // `clients` above stays the only way a client is admitted, and this
@@ -245,6 +253,17 @@ export const ServerConfigSchema = z.object({
             // Absolute URIs only; the AS additionally enforces https (or
             // loopback http) and exact matching at request time.
             redirectUris: z.array(z.string().min(1)).min(1),
+            // Bounded well under the Date range limit (~±8.64e15ms, itself
+            // below Number.MAX_SAFE_INTEGER) so
+            // `Date.now() + grantLifetimeSeconds * 1000` can never overflow
+            // into an invalid or wrapped instant. 100 years is generous for
+            // an operator policy and nowhere near that limit.
+            grantLifetimeSeconds: z
+              .number()
+              .int()
+              .positive()
+              .max(100 * 365 * 24 * 60 * 60)
+              .optional(),
           }),
         )
         .default(DEFAULTS.pdpp.clients),

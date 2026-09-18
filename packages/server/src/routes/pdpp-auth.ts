@@ -127,8 +127,19 @@ export interface PdppAuthRouteDeps {
    * behavior exactly, and performs no outbound fetch.
    */
   resolveClientIdentity?(clientId: string): Promise<ClientIdentityResult>;
-  /** AS-policy grant expiry, when the deployment sets one. */
-  grantExpiryFor?(request: SelectionRequest): string | undefined;
+  /**
+   * AS-policy grant expiry, when the deployment sets one.
+   *
+   * `clientId` is the second argument (not folded into `request`) because it
+   * is authorization-request context, not part of the RFC 9396 selection
+   * request itself — Core's `SelectionRequest` stays binding-neutral and
+   * carries no client identity. `request` remains first for compatibility
+   * with any existing caller that only closed over it.
+   */
+  grantExpiryFor?(
+    request: SelectionRequest,
+    clientId: string,
+  ): string | undefined;
   /**
    * Require PKCE on the authorization code flow. Defaults to true and should
    * stay true: PDPP clients are public clients, so without a verifier an
@@ -418,7 +429,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       stateParam: body.state,
       codeChallenge: body.code_challenge,
       codeChallengeMethod: body.code_challenge_method,
-      grantExpiresAt: deps.grantExpiryFor?.(request),
+      grantExpiresAt: deps.grantExpiryFor?.(request, body.client_id),
     });
 
     deps.logger.info(

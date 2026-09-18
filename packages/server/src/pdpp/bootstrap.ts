@@ -197,6 +197,20 @@ export async function createPdppAuthDeps(
           }
         : null;
     },
+    // Operator grant-lifetime policy, per registered client. Only a client
+    // with a `grantLifetimeSeconds` in config gets a computed expiry; every
+    // other client (including one resolved via `resolveClientIdentity`) gets
+    // `undefined` here, which preserves the existing no-expiry behavior
+    // exactly. This is deployment policy read from static config, never from
+    // the request — there is no client-supplied expiry field to honor.
+    grantExpiryFor: (_request, clientId) => {
+      const registered = config.pdpp.clients.find(
+        (candidate) => candidate.clientId === clientId,
+      );
+      const lifetimeSeconds = registered?.grantLifetimeSeconds;
+      if (!lifetimeSeconds) return undefined;
+      return new Date(Date.now() + lifetimeSeconds * 1000).toISOString();
+    },
     // §6 URL-hosted identity for a client NOT in `clients` above. Left
     // unset (undefined, not a function that always fails) when the
     // allowlist is empty, so this deployment performs no outbound fetch and
