@@ -146,6 +146,72 @@ export function checkDeclarationUrl(
   return null;
 }
 
+/**
+ * Project a normative §5 `SourceDeclaration` onto the internal snapshot shape.
+ *
+ * Returns the document unchanged when it is already in the internal shape, so
+ * existing private fixtures keep working — this is a compatibility adapter,
+ * not a redefinition of either format.
+ *
+ * The projection is deliberately narrow:
+ *   - `source.id` / `source.kind` → `source_id` / `source_kind`
+ *   - `declaration_version`       → `version`
+ *   - per stream, `schema.properties` keys → `fields`, and `schema.required`
+ *     → `required_fields`
+ *
+ * Deriving fields from the JSON Schema is the substantive part. The internal
+ * model wants a flat allowlist because §6 field selection and §8 projection
+ * operate on top-level names; the normative model carries a real schema
+ * because a declaration must describe record shape, not just name it. Reading
+ * `properties` keys is the honest projection of one onto the other, and
+ * `required` is exactly the per-stream consent floor §6 already calls for.
+ *
+ * Nothing here validates the normative document beyond what the projection
+ * needs — the checks that follow do that, and they run on the projected form
+ * so one code path enforces both.
+ */
+function normalizeNormativeDeclaration(
+  doc: RawDeclarationDocument,
+): RawDeclarationDocument {
+  const source = (doc as { source?: unknown }).source;
+  if (typeof source !== "object" || source === null) return doc;
+
+  const { id, kind } = source as { id?: unknown; kind?: unknown };
+  const declarationVersion = (doc as { declaration_version?: unknown })
+    .declaration_version;
+
+  const streams = Array.isArray(doc.streams)
+    ? doc.streams.map((raw) => {
+        const stream = raw as Record<string, unknown>;
+        // Already internal-shaped: leave it alone rather than guessing.
+        if (Array.isArray(stream.fields)) return stream;
+
+        const schema = stream.schema as
+          | { properties?: Record<string, unknown>; required?: unknown }
+          | undefined;
+        if (!schema || typeof schema !== "object") return stream;
+
+        return {
+          ...stream,
+          fields: Object.keys(schema.properties ?? {}),
+          required_fields: Array.isArray(schema.required)
+            ? (schema.required as string[])
+            : [],
+        };
+      })
+    : doc.streams;
+
+  return {
+    ...doc,
+    ...(typeof id === "string" && { source_id: id }),
+    ...(typeof kind === "string" && { source_kind: kind }),
+    ...(typeof declarationVersion === "string" && {
+      version: declarationVersion,
+    }),
+    streams,
+  } as RawDeclarationDocument;
+}
+
 export function computeDeclarationDigest(body: string): string {
   return createHash("sha256").update(body, "utf8").digest("hex");
 }
@@ -195,6 +261,26 @@ export function parseDeclaration(
       },
     };
   }
+
+  // Accept the NORMATIVE §5 SourceDeclaration and project it onto this
+  // module's internal snapshot shape.
+  //
+  // PS historically parsed a private shape (`source_id`, `source_kind`,
+  // `version`, flat `fields[]`/`required_fields[]`). That shape is not the
+  // protocol: the published schema
+  // (`https://pdpp.dev/schemas/source-declaration/0.1.0`, `reference-contract`)
+  // requires `protocol_version`, nested `source {kind,id}`,
+  // `declaration_version`, `publisher`, `display`, and a real JSON-Schema
+  // `schema` per stream — and sets `additionalProperties: false`, so the
+  // private shape is affirmatively INVALID, not merely different.
+  //
+  // Normalizing here rather than loosening the checks below keeps the
+  // protocol boundary honest: a normative document is validated as normative,
+  // and the internal snapshot stays an internal detail. The raw bytes and
+  // their digest are untouched — `digest` above is computed over `body`
+  // exactly as retrieved, which is the property that proves a producer read
+  // the same bytes the owner consented against.
+  doc = normalizeNormativeDeclaration(doc);
 
   if (typeof doc.source_id !== "string" || doc.source_id.length === 0) {
     return {

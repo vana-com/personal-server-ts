@@ -1,0 +1,123 @@
+{
+  "protocol_version": "0.1.0",
+  "source": {
+    "kind": "connector",
+    "id": "https://registry.pdpp.dev/connectors/github"
+  },
+  "declaration_version": "0.5.1",
+  "publisher": {
+    "id": "https://registry.pdpp.dev/publishers/pdp-connect"
+  },
+  "display": {
+    "name": "GitHub"
+  },
+  "streams": [
+    {
+      "name": "user",
+      "description": "GitHub user profile",
+      "display": {
+        "label": "GitHub profile",
+        "detail": "GitHub account id, login, profile details, and profile timestamps."
+      },
+      "semantics": "mutable_state",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "login": {
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "bio": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "company": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "location": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "blog": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "twitter_username": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "avatar_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "login"
+        ]
+      },
+      "primary_key": [
+        "id"
+      ],
+      "cursor_field": "updated_at",
+      "consent_time_field": "created_at",
+      "selection": {
+        "fields": true,
+        "resources": false
+      },
+      "query": {
+        "range_filters": {
+          "updated_at": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ]
+        }
+      }
+    }
+  ],
+  "extensions": {}
+}
