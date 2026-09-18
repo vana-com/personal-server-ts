@@ -49,7 +49,69 @@ export interface PdppRecordsRouteDeps {
    * explicit rather than leaving to chance.
    */
   accessLog?: PdppAccessLogPort;
+  /**
+   * Vana chain enforcement for client reads. Absent by default, and absence
+   * is the chain-NEUTRAL path: a standalone PDPP deployment has no chain, so
+   * omitting this leaves the bearer path exactly as it was.
+   *
+   * When a deployment DOES set it, every client-token read must present a
+   * PDPP grant that is bound to a live chain permission. This is the gate the
+   * bearer path was missing: a PDPP token alone proved consent, but nothing
+   * checked the Vana permission that authorizes the read, so a chain-side
+   * revocation had no effect on a PDPP client and the ledger's authority was
+   * silently not enforced.
+   *
+   * It fails closed on purpose — see `PdppChainEnforcementPort`.
+   */
+  chainEnforcement?: PdppChainEnforcementPort;
 }
+
+/**
+ * The chain check a client read must pass, when a deployment enforces one.
+ *
+ * ## Why this is a port and not a direct chain call
+ *
+ * The route must not import a chain SDK: PDPP Core is chain-neutral, and a
+ * deployment with no chain must still serve reads. Keeping the dependency as
+ * an injected port is what lets standalone PDPP stay standalone while a Vana
+ * deployment enforces the ledger, without two code paths through the route.
+ *
+ * ## Fail closed, and the three outcomes are NOT interchangeable
+ *
+ * `authorize` answers one of three things, and the distinction matters
+ * because two of them deny while only one of those is worth retrying:
+ *
+ *   - `{ ok: true }` — a binding exists, the live chain grant is unrevoked,
+ *     the owner matches, and the grantee is this client's app.
+ *   - `{ ok: false, retryable: false }` — a definite denial. No binding, or
+ *     a revoked/mismatched one. The answer will not change by asking again.
+ *   - `{ ok: false, retryable: true }` — the chain or gateway could not be
+ *     reached, so we do not KNOW the answer.
+ *
+ * The third case is the one that decides whether this design is honest. Not
+ * knowing is not permission. Serving a read because the gateway was down
+ * would make an outage into an authorization bypass, and it would do so
+ * silently, which is worse than refusing. So an unknown answer denies, and
+ * is reported as `503` with `Retry-After` rather than `403`, because the
+ * client's grant may be perfectly valid and a permanent-looking refusal
+ * would send them to re-consent for no reason.
+ *
+ * This also means a binding is never accepted as nullable: a deployment that
+ * enforces the chain and cannot resolve a grant denies the read. There is no
+ * "no binding yet, allow it" state, because that state is indistinguishable
+ * from "never bound".
+ */
+export interface PdppChainEnforcementPort {
+  authorize(input: {
+    /** The PDPP grant presented by the client token. */
+    pdppGrantId: string;
+    /** The OAuth client the token was issued to. */
+    clientId: string;
+  }): Promise<PdppChainDecision>;
+}
+
+export type PdppChainDecision =
+  { ok: true } | { ok: false; retryable: boolean; reason: string };
 
 /**
  * The slice of the owner access feed a PDPP read can populate.
@@ -383,6 +445,70 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       return { error: unauthorized(c, reqId, resourceMetadataUrlFor(c)) };
     }
     const context = await deps.auth.resolveToken(token);
+
+    // Chain enforcement, when the deployment configures it. Placed here so
+    // EVERY endpoint is covered by one gate: a check added per-route is a
+    // check that a later route forgets, and an unenforced read path is
+    // exactly the defect this closes.
+    //
+    // Only client tokens are gated. An owner token is the owner reading their
+    // own data, which no chain permission mediates -- requiring a grantee
+    // permission for it would lock owners out of their own server.
+    if (deps.chainEnforcement && context?.active) {
+      if (context.tokenKind === "client") {
+        const grantId = context.grant?.grant_id;
+        if (!grantId) {
+          // An active client token with no grant cannot be bound to anything,
+          // so there is nothing to verify and nothing to allow.
+          return {
+            error: sendError(
+              c,
+              new PdppError("grant_revoked", "No chain binding for this grant"),
+              reqId,
+            ),
+          };
+        }
+
+        const decision = await deps.chainEnforcement.authorize({
+          clientId: context.clientId ?? "",
+          pdppGrantId: grantId,
+        });
+
+        if (!decision.ok) {
+          await logClientRead(c, context, "unknown", "denied", reqId);
+
+          // A retryable failure is NOT reported as a denial. The grant may be
+          // perfectly valid and the chain merely unreachable, so answering
+          // `grant_revoked` would send a good client off to re-consent over an
+          // outage. §8 defines no 503 code and inventing one would be a spec
+          // extension, so this maps to `api_error` (500) -- which is honest:
+          // the failure is on our side, not in the client's request. The
+          // `Retry-After` hint costs nothing and tells a well-behaved client
+          // to come back rather than give up.
+          if (decision.retryable) {
+            c.header("Retry-After", "5");
+            return {
+              error: sendError(
+                c,
+                new PdppError(
+                  "api_error",
+                  "Chain authorization could not be verified",
+                ),
+                reqId,
+              ),
+            };
+          }
+          return {
+            error: sendError(
+              c,
+              new PdppError("grant_revoked", decision.reason),
+              reqId,
+            ),
+          };
+        }
+      }
+    }
+
     return { context };
   }
 
