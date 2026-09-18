@@ -664,6 +664,10 @@ export async function createServer(
   const app = createApp({
     pdppAuth,
     pdpp: pdppRecords,
+    // The SAME stable delegate the download worker was given above, not a
+    // second importer: both arrival routes must resolve to one importer over
+    // one store, and this one is already late-bound to `pdppImporterImpl`.
+    pdppImporter,
     mcpHydrateScopes:
       isEnclave && jobSyncManager
         ? (scopes) => jobSyncManager.hydrateScopes(scopes)

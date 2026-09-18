@@ -52,6 +52,7 @@ import {
 import { oauthTokenRoutes } from "./routes/oauth-token.js";
 import { pdppAuthRoutes, type PdppAuthRouteDeps } from "./routes/pdpp-auth.js";
 import type {
+  PdppImporter,
   ScopeDeletionTracker,
   SyncManager,
 } from "@opendatalabs/personal-server-ts-core/sync";
@@ -141,6 +142,14 @@ export interface AppDeps {
     store: QuestionStore;
     scheduler: RecomputeScheduler;
   } | null;
+  /**
+   * PDPP record importer for locally-ingested envelopes. The bootstrap passes
+   * the same stable delegate it gives the sync download worker, so both
+   * arrival routes — gateway sync and local owner-authenticated POST —
+   * import through one importer into one store. Absent = no PDPP mounted,
+   * and `$pdpp` envelopes are stored and indexed exactly as before.
+   */
+  pdppImporter?: PdppImporter;
   getTunnelStatus?: HealthDeps["getTunnelStatus"];
   /**
    * Invoked when the /ui/api registration route confirms the server is
@@ -362,6 +371,11 @@ export function createApp(deps: AppDeps): Hono {
       onDataRead: deps.derivativeCompute
         ? (event) => deps.derivativeCompute?.scheduler.markDemand(event.scope)
         : undefined,
+      // The same stable importer delegate the sync download worker holds, so
+      // a local owner-authenticated ingest of a `$pdpp` envelope reaches the
+      // record store the resource server reads — see the importer's note in
+      // core's data API. Undefined when the deployment mounted no PDPP.
+      pdppImporter: deps.pdppImporter,
       mountPath: "/v1/data",
     }),
   );

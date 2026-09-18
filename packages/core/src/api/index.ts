@@ -24,6 +24,10 @@ import {
 } from "../sync/scope-deletions.js";
 import type { IndexEntry } from "../storage/index/types.js";
 import {
+  isPermanentRejection,
+  type PdppImporter,
+} from "../sync/pdpp-import.js";
+import {
   deleteScope as deleteScopeLocally,
   type DeleteScopeResult,
 } from "../sync/workers/delete.js";
@@ -341,6 +345,25 @@ export interface PersonalServerDataApiDeps {
     /** The stamped `$lineage.sources` of the written record, if any. */
     lineageSources?: string[];
   }) => void;
+  /**
+   * Import a locally-ingested envelope into the PDPP record store, when the
+   * deployment mounted one.
+   *
+   * The same importer, the same envelope shape and the same best-effort
+   * contract as the download worker's (`sync/workers/download.ts`). It is
+   * here because a `$pdpp`-annotated envelope can reach this server two ways
+   * — pulled from the gateway by sync, or POSTed to `/v1/data/:scope` by a
+   * local owner-authenticated producer — and only the first offered it to the
+   * importer. A record that arrived by the second route was stored and
+   * indexed but never became readable over the PDPP resource surface, which
+   * made a local producer's write silently half-land.
+   *
+   * Runs AFTER the legacy write and index, never in place of them, and a
+   * failure is logged and swallowed: the record is already durable by the
+   * time this runs, so throwing would turn a committed write into a 500 and
+   * invite a duplicate on retry.
+   */
+  pdppImporter?: PdppImporter;
   /**
    * Called on GET /v1/data/:scope once the read is authorized (a live grant
    * covering the scope, or the owner) and the scope is not tombstoned, and
@@ -853,6 +876,58 @@ function notifyDataWritten(
         error: err instanceof Error ? err.message : String(err),
       },
       "onDataWritten hook failed; record already stored",
+    );
+  }
+}
+
+/**
+ * Offer a just-ingested envelope to the PDPP importer.
+ *
+ * The local-ingest twin of the download worker's `importIntoPdpp`, and
+ * deliberately the same shape: same `ImportableEnvelope`, same total handling
+ * of every outcome, same permanent-vs-transient logging split. Keeping the
+ * two symmetric is the point — a `$pdpp` envelope must mean the same thing
+ * and reach the same store whether the gateway handed it over or a local
+ * producer POSTed it, otherwise "imported" would depend on which door the
+ * bytes came through.
+ *
+ * `skipped` is the ordinary legacy case (no `$pdpp` block) and stays silent.
+ * A rejection is a WARNING, not an error: it means the producer sent
+ * something this deployment could not verify — actionable, but not a failure
+ * of the write, which has already committed.
+ */
+function importIngestedIntoPdpp(
+  deps: Pick<PersonalServerDataApiDeps, "pdppImporter" | "logger">,
+  envelope: { scope: string; collectedAt: string; data: unknown },
+): void {
+  if (!deps.pdppImporter) return;
+  try {
+    const outcome = deps.pdppImporter.importEnvelope(envelope);
+    if (outcome.status === "rejected") {
+      const permanent = isPermanentRejection(outcome.rejection);
+      deps.logger?.warn?.(
+        {
+          scope: envelope.scope,
+          collectedAt: envelope.collectedAt,
+          code: outcome.rejection.code,
+          message: outcome.rejection.message,
+          permanent,
+        },
+        permanent
+          ? "Ingested data point was refused by the PDPP importer and will not be retried"
+          : "PDPP import unavailable for this ingested data point",
+      );
+    }
+  } catch (err) {
+    // A throwing importer is infrastructure failing, not the envelope being
+    // wrong. The record is stored and indexed already, so this must never
+    // turn a committed write into a 500.
+    deps.logger?.warn?.(
+      {
+        scope: envelope.scope,
+        error: err instanceof Error ? err.message : String(err),
+      },
+      "PDPP import threw on ingest; record already stored and indexed",
     );
   }
 }
@@ -1616,6 +1691,14 @@ export async function handlePersonalServerDataRequest(
         );
         await logBuilderWrite();
         notifyNewData(deps.syncManager);
+        // The parsed body is the envelope's `data`, which is where a producer
+        // stamps `$pdpp`. Offered here rather than inside the ingest contract
+        // so the import stays strictly after the record is durable.
+        importIngestedIntoPdpp(deps, {
+          scope: scopeResult.scope,
+          collectedAt: collectedAtValue,
+          data: parsed.body,
+        });
         notifyDataWritten(deps, {
           scope: scopeResult.scope,
           collectedAt: collectedAtValue,
