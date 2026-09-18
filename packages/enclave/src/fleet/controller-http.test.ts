@@ -207,3 +207,45 @@ it("reads a bodyless POST as no arguments and a bad body as a caller error", asy
   expect(malformed.status).toBe(400);
   expect(await malformed.json()).toEqual({ error: "invalid_request" });
 });
+
+it("rejects malformed maintenance requests before reaching lifecycle operations", async () => {
+  const { common } = fixture();
+  const token = "a".repeat(32);
+  const admin = createFleetControlHttp({
+    ...common,
+    role: "admin",
+    credential: token,
+  });
+  for (const route of ["activate", "quiesce"]) {
+    for (const body of [
+      null,
+      [],
+      "maintenance",
+      { mode: "other" },
+      { mode: "maintenance" },
+      { maintenanceId: "directory-roll-1" },
+      { mode: "maintenance", maintenanceId: "short" },
+      {
+        mode: "maintenance",
+        maintenanceId: "directory-roll-1",
+        reconcile: false,
+      },
+    ]) {
+      expect(
+        (await admin(request(`/fleet/v1/${route}`, token, body))).status,
+      ).toBe(400);
+    }
+    expect(
+      (
+        await admin(
+          request(`/fleet/v1/${route}`, "g".repeat(32), {
+            mode: "maintenance",
+            maintenanceId: "directory-roll-1",
+          }),
+        )
+      ).status,
+    ).toBe(401);
+  }
+  expect(common.activate).not.toHaveBeenCalled();
+  expect(common.quiesce).not.toHaveBeenCalled();
+});

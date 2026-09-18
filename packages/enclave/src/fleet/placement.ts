@@ -69,6 +69,7 @@ export interface FleetPruneResult {
 interface Directory {
   v: 1;
   paused: boolean;
+  maintenanceId?: string;
   rows: Record<string, FleetPlacementRow>;
   nodes: Record<string, NodeRecord>;
 }
@@ -307,14 +308,35 @@ export async function openFleetController(options: FleetControllerOptions) {
       return directory.paused;
     },
     async pause(): Promise<void> {
+      delete directory.maintenanceId;
       directory.paused = true;
       await persist();
       await ownerOperation.idle();
       await leaseOperation.idle();
     },
     async resume(): Promise<void> {
+      delete directory.maintenanceId;
       directory.paused = false;
+      try {
+        await persist();
+      } catch (error) {
+        directory.paused = true;
+        throw error;
+      }
+    },
+    async pauseForMaintenance(maintenanceId: string): Promise<void> {
+      if (directory.paused && directory.maintenanceId !== maintenanceId)
+        throw new Error("Controller is not active or maintenance-paused");
+      directory.paused = true;
+      directory.maintenanceId = maintenanceId;
       await persist();
+      await ownerOperation.idle();
+      await leaseOperation.idle();
+    },
+    async resumeFromMaintenance(maintenanceId: string): Promise<void> {
+      if (!directory.paused || directory.maintenanceId !== maintenanceId)
+        throw new Error("Maintenance pause required");
+      await api.resume();
     },
     enroll(owner: FleetOwner): Promise<void> {
       return ownerOperation(fleetOwnerKey(owner), async () => {

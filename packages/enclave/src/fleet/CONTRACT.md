@@ -231,6 +231,22 @@ joins in-flight OAuth approvals before reconciling all approved owners again,
 including an epoch advanced without an MCP read. It begins draining immediately
 alongside reconciliation and joins both even if either fails; rollback export
 requires successful reconciliation.
+For signed-directory maintenance of an already active controller, both admin
+routes accept only `{ "mode": "maintenance", "maintenanceId": "<unique-roll-id>" }`.
+The ID is 8–128 ASCII letters, digits, underscores or hyphens. Maintenance quiesce
+persists the allocation pause and that ID, joins in-flight placement operations,
+and does not enumerate approved owners, reconcile enrollment, or drain workers.
+Its `drained` field is only a current lease observation, not a teardown guarantee;
+operators must still establish natural idle before staging and drain specific
+spares through the existing node operation. Maintenance activate requires the
+same persisted ID and active imported MCP state. It does not reconcile owners.
+An initial/migration/recovery pause cannot authorize this shortcut; ordinary
+quiesce or activation invalidates the maintenance ID. Reuse a roll ID only for
+retries of that same pause. Lifecycle requests are serialized through completion,
+including failed reconciliation. Empty bodies retain the migration behavior above;
+unknown maintenance fields or modes fail closed. Owner authority checks on normal
+requests remain unchanged, and rollback export still reconciles explicitly.
+
 Restart retains the pause and operator drain decisions. Fresh
 attested health probes can restore node availability; a generation whose renewal
 failed stays blocked until its last possible lease expires even after readmission.

@@ -29,8 +29,8 @@ export interface FleetControlHttpOptions {
   admit(body: unknown): Promise<unknown>;
   prepareRollback(body: unknown): Promise<unknown>;
   migrate(body: unknown): Promise<unknown>;
-  activate(): Promise<unknown>;
-  quiesce(): Promise<unknown>;
+  activate(maintenanceId?: string): Promise<unknown>;
+  quiesce(maintenanceId?: string): Promise<unknown>;
 }
 function authorized(request: Request, credential: string): boolean {
   const supplied = Buffer.from(request.headers.get("authorization") ?? "");
@@ -131,10 +131,28 @@ export function createFleetControlHttp(
         if (path === "/fleet/v1/seal")
           return Response.json(await options.seal(body));
       } else {
-        if (path === "/fleet/v1/activate")
-          return Response.json(await options.activate());
-        if (path === "/fleet/v1/quiesce")
-          return Response.json(await options.quiesce());
+        if (path === "/fleet/v1/activate" || path === "/fleet/v1/quiesce") {
+          if (
+            !body ||
+            Array.isArray(body) ||
+            typeof body !== "object" ||
+            Object.keys(body).some(
+              (key) => key !== "mode" && key !== "maintenanceId",
+            ) ||
+            (body.mode === undefined
+              ? body.maintenanceId !== undefined
+              : body.mode !== "maintenance" ||
+                typeof body.maintenanceId !== "string" ||
+                !/^[a-zA-Z0-9_-]{8,128}$/.test(body.maintenanceId))
+          )
+            return Response.json({ error: INVALID_REQUEST }, { status: 400 });
+          const operation = path.endsWith("/activate")
+            ? options.activate
+            : options.quiesce;
+          return Response.json(
+            await operation(body.maintenanceId as string | undefined),
+          );
+        }
         if (path === "/fleet/v1/admit")
           return Response.json(await options.admit(body));
         if (path === "/fleet/v1/drain") {
