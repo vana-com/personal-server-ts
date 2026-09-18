@@ -19,11 +19,7 @@ export interface PdppBlobsRouteDeps {
   instancesForSubject?: (subjectId: string) => string[];
   /**
    * Loads raw blob bytes for a blob_id, or undefined if not locally stored.
-   * A simple content-addressed local store behind an interface — not a CDN.
-   * Optional: when absent, GET fails closed with `api_error` (500) rather
-   * than fabricating a 200 with no body — the route is still gated
-   * correctly, there is just no byte source wired up for this deployment
-   * (a caller building this out supplies the function).
+   * Optional: when absent or throwing, GET fails closed with `api_error` (500) instead of a fabricated 200.
    */
   readBlobBytes?: (
     blobId: string,
@@ -58,16 +54,9 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   const app = new Hono();
 
   /**
-   * Authorizes a blob fetch through the SAME path a record read uses — a
-   * `blob_id` alone is never sufficient (spec §8 "Get a blob"). This finds
-   * the record that actually references the blob (spec §4 `blob_ref`), then
-   * requires that record to pass every check a direct record read would:
-   * instance scope, `resources` allowlist, `time_constraint`, and — the
-   * blob-specific addition — `blob_ref` being in the grant's authorized
-   * field projection. A grant whose only connection to this blob_id is an
-   * unrelated stream's `fields` list containing the string "blob_ref" no
-   * longer passes; it must be the field projection of the SPECIFIC stream
-   * whose SPECIFIC record references this blob.
+   * Authorizes a blob fetch through the same path a record read uses (spec §8): finds the
+   * record referencing this blob_id, then applies instance scope, resources, time_constraint,
+   * and requires blob_ref in that record's specific granted field projection.
    */
   async function authorizeBlobAccess(
     c: Context,
@@ -167,12 +156,8 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
     return { ok: true };
   }
 
-  // Hono dispatches HEAD by internally calling the GET handler and
-  // discarding the body (`new Response(null, <GET response>)`), copying
-  // headers — there is no separate HEAD handler to register. Content-Length
-  // is always derived from blob metadata (`meta.sizeBytes`), not from the
-  // (optional) actual byte read, so HEAD size checks work even when
-  // `readBlobBytes` returns a byte count that happens to differ or is unset.
+  // Hono dispatches HEAD via the GET handler and discards the body, so no separate HEAD handler is
+  // needed. Content-Length always comes from blob metadata, not the actual byte read.
   app.get("/:blobId", async (c) => {
     const blobId = c.req.param("blobId");
     const authz = await authorizeBlobAccess(c, blobId);
@@ -192,17 +177,22 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       return c.body(null, 200, headers);
     }
 
-    const bytes = await deps.readBlobBytes?.(blobId);
-    if (!bytes) {
-      // Authorization succeeded, but this deployment has no byte source
-      // wired up (or the store lost the bytes for an otherwise-known blob).
-      // The client asked for content, not headers -- claiming 200 with an
-      // empty body and a nonzero Content-Length would be a fabricated
-      // truncated success indistinguishable from a valid zero-byte blob or
-      // a network truncation. Spec §8 defines no "bytes unavailable" code;
-      // `api_error` (500) is the same honest fail-closed mapping used for
-      // the chain-authorization outage above -- the failure is on our
-      // side, not the client's request.
+    let bytes: Uint8Array<ArrayBuffer> | undefined;
+    try {
+      bytes = await deps.readBlobBytes?.(blobId);
+    } catch {
+      // A throwing reader must not leak past this route to app.ts's generic
+      // handler, which returns a different (legacy) error shape. Map it to
+      // the same fail-closed api_error without exposing the reader's detail.
+      return jsonError(
+        c,
+        new PdppError("api_error", "Blob bytes are not available"),
+        reqId,
+      );
+    }
+    if (bytes === undefined) {
+      // No byte source wired up, or the store lost the bytes for an
+      // otherwise-known blob -- distinct from a genuine zero-byte blob.
       return jsonError(
         c,
         new PdppError("api_error", "Blob bytes are not available"),
