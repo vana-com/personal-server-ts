@@ -156,6 +156,17 @@ export type {
 } from "./declaration.js";
 
 export {
+  MAX_CLIENT_DOCUMENT_BYTES,
+  resolveUrlHostedClientIdentity,
+} from "./client-identity.js";
+export type {
+  ClientDocumentFetcher,
+  ClientIdentityFailure,
+  ClientIdentityFailureCode,
+  ClientIdentityResult,
+} from "./client-identity.js";
+
+export {
   mayRenderRemoteLogo,
   resolveRequesterIdentity,
   verifyClientIdDocument,

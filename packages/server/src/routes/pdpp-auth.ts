@@ -40,6 +40,7 @@
 
 import { Hono, type Context } from "hono";
 import type { Logger } from "pino";
+import type { ClientIdentityResult } from "@opendatalabs/personal-server-ts-core/pdpp";
 import type {
   AuthorizationSessionStore,
   PdppTokenService,
@@ -117,6 +118,12 @@ export interface PdppAuthRouteDeps {
    * code — the AS fails closed rather than trusting the requested target.
    */
   registeredClient?(clientId: string): RegisteredRedirectPolicy | null;
+  /**
+   * Resolve a URL-hosted client identity (§6) when a client is not locally
+   * registered. Optional: leaving it unset preserves registration-only
+   * behavior exactly, and performs no outbound fetch.
+   */
+  resolveClientIdentity?(clientId: string): Promise<ClientIdentityResult>;
   /** AS-policy grant expiry, when the deployment sets one. */
   grantExpiryFor?(request: SelectionRequest): string | undefined;
   /**
@@ -318,9 +325,29 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     // help: an attacker who chose the redirect also chose the challenge and
     // holds the verifier. RFC 6749 §4.1.2.1 forbids reporting this failure BY
     // redirecting, so it is returned directly to the caller.
+    // Local registration has highest precedence and costs no network call.
+    // Only when a client is NOT registered does §6 require us to try its
+    // URL-hosted identity: rejecting solely for absence of preregistration is
+    // the one reason the spec names as insufficient.
+    let redirectPolicy = deps.registeredClient?.(body.client_id) ?? null;
+    if (!redirectPolicy && deps.resolveClientIdentity) {
+      const resolved = await deps.resolveClientIdentity(body.client_id);
+      if (resolved.ok) {
+        redirectPolicy = resolved.policy;
+      } else {
+        // The refusal names the actual reason -- untrusted URL, unreachable,
+        // mismatched document -- rather than "not registered", so an operator
+        // can tell a policy denial from a broken client.
+        deps.logger.warn(
+          { client_id: body.client_id, reason: resolved.failure.code },
+          "PDPP authorization refused: URL-hosted client identity rejected",
+        );
+      }
+    }
+
     const redirectFailure = validateRedirectUri(
       body.redirect_uri,
-      deps.registeredClient?.(body.client_id) ?? null,
+      redirectPolicy,
     );
     if (redirectFailure) {
       deps.logger.warn(
