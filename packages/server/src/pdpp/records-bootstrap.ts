@@ -28,6 +28,7 @@
  * grant, and a resource server that cannot enforce is worse than absent.
  */
 
+import { createHash } from "node:crypto";
 import type { Database } from "better-sqlite3";
 import type { Logger } from "pino";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
@@ -41,6 +42,11 @@ import type {
   PdppAuthorizationService,
   Grant as PdppPortGrant,
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import {
+  createPdppImporter,
+  type PdppImporter,
+  type RetainedDeclaration,
+} from "@opendatalabs/personal-server-ts-core/sync";
 import type { PdppAuthRouteDeps } from "../routes/pdpp-auth.js";
 import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
 import { singleInstanceInventory } from "./deployment.js";
@@ -150,6 +156,80 @@ function coLocatedAuthorizationService(
 }
 
 /**
+ * Build the sync importer that maps qualifying DataPipe envelopes into the
+ * record store the RS reads from.
+ *
+ * Built from the SAME retained snapshots and the SAME instance derivation as
+ * the RS above, for the same reason given at the top of this file: a record
+ * imported under a different stream shape or a different instance handle than
+ * the RS enforces against is a record no grant can correctly reach. One
+ * retained declaration, one authority — on the write path too.
+ *
+ * Returns undefined when the RS did not mount. Importing into a store nothing
+ * can read would be write-only work, and it would do it against declarations
+ * this deployment has not accepted.
+ */
+export function createPdppSyncImporter(options: {
+  records: PdppRecordsDeps | undefined;
+  declarations: DeclarationSnapshot[];
+  /** Exact retained bytes per source id, from the AS boot. */
+  documents: Map<string, string>;
+  serverOwner: `0x${string}` | undefined;
+  logger: Logger;
+}): PdppImporter | undefined {
+  const { records, serverOwner, logger } = options;
+  if (!records || !serverOwner) return undefined;
+
+  const subjectId = serverOwner.toLowerCase();
+  const retained: RetainedDeclaration[] = [];
+  for (const snapshot of options.declarations) {
+    const document = options.documents.get(snapshot.source_id);
+    if (document === undefined) {
+      // A snapshot with no retained document cannot have its digest
+      // verified, and an unverifiable declaration must not be used as the
+      // authority for accepting writes. Skipping it is fail-closed: its
+      // envelopes are rejected as `unknown_source` rather than imported on
+      // the strength of a check that never ran.
+      logger.warn(
+        { sourceId: snapshot.source_id },
+        "PDPP declaration has no retained document — sync import disabled for this source",
+      );
+      continue;
+    }
+    retained.push({
+      sourceId: snapshot.source_id,
+      version: snapshot.version,
+      // Digest the exact retained bytes once, here, because this is the only
+      // place they exist and because the importer is bundled for the browser
+      // lite runtime where `node:crypto` is unavailable.
+      documentDigest: createHash("sha256")
+        .update(document, "utf8")
+        .digest("hex"),
+      streams: toStreamDeclarations(snapshot).map((stream) => ({
+        name: stream.name,
+        primaryKey: stream.primaryKey,
+        semantics: stream.semantics,
+      })),
+    });
+  }
+
+  if (retained.length === 0) return undefined;
+
+  logger.info(
+    { sources: retained.map((d) => d.sourceId) },
+    "PDPP sync importer enabled for synced DataPipe envelopes",
+  );
+
+  return createPdppImporter({
+    store: records.store,
+    declarations: retained,
+    instanceFor: (sourceId) =>
+      singleInstanceInventory(subjectId, sourceId).eligibleFor("")[0],
+    logger,
+  });
+}
+
+/**
  * Project a retained declaration onto the per-stream shapes the RS enforces.
  *
  * `cursorField` falls back to `emitted_at` because that is what both record
@@ -161,7 +241,11 @@ function toStreamDeclarations(
 ): StreamDeclaration[] {
   return snapshot.streams.map((stream) => ({
     name: stream.name,
-    semantics: "mutable_state" as const,
+    // From the declaration, defaulting to `mutable_state` when a declaration
+    // omits it so documents written before the field existed keep their exact
+    // meaning. Previously hardcoded, which silently coerced an `append_only`
+    // stream into upsert behavior and left a producer's claim unfalsifiable.
+    semantics: stream.semantics ?? ("mutable_state" as const),
     primaryKey: stream.primary_key,
     cursorField: "emitted_at",
     consentTimeField: stream.consent_time_field,

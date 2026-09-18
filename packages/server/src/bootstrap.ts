@@ -45,6 +45,7 @@ import {
   createGatewayDeleteDataPort,
   createScopeDeletionTracker,
   createSyncManager,
+  type PdppImporter,
   type SyncManager,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type { DataPointFeedPort } from "@opendatalabs/personal-server-ts-core/ports";
@@ -56,7 +57,10 @@ import { createFilePendingBlobDeletionStore } from "./pending-blob-deletions.js"
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
 import { createPdppAuthDeps } from "./pdpp/bootstrap.js";
-import { createPdppRecordsDeps } from "./pdpp/records-bootstrap.js";
+import {
+  createPdppRecordsDeps,
+  createPdppSyncImporter,
+} from "./pdpp/records-bootstrap.js";
 import { generateDevToken } from "./dev-token.js";
 import { migrateLocalState } from "./migrations/local-state.js";
 import { createTokenStore, type TokenStore } from "./token-store.js";
@@ -332,6 +336,23 @@ export async function createServer(
 
   // --- Sync engine setup ---
   let syncManager: SyncManager | null = null;
+  /**
+   * Late-bound PDPP importer.
+   *
+   * The sync engine is wired here, but the PDPP servers mount much further
+   * down: they need the index (to derive the connector inventory), the
+   * declarations and the auth store, none of which exist yet. Rather than
+   * reorder boot around the newer subsystem, the download worker holds this
+   * stable delegate and it starts importing the moment PDPP mounts. While
+   * PDPP is disabled or fails to mount, `importer` stays null and the
+   * delegate reports every envelope as skipped — sync behaves exactly as it
+   * did before this existed.
+   */
+  let pdppImporterImpl: PdppImporter | null = null;
+  const pdppImporter: PdppImporter = {
+    importEnvelope: (envelope) =>
+      pdppImporterImpl?.importEnvelope(envelope) ?? { status: "skipped" },
+  };
   // Deletion-aware registry view. Independent of sync: the data route uses
   // it to answer 410 for scopes the owner deleted even when sync is off.
   const dataPointFeed =
@@ -468,6 +489,7 @@ export async function createServer(
         derivativeScheduler.markSourceChanged(event.scope, {
           lineageSources: event.lineageSources,
         }),
+      pdppImporter,
     };
 
     // Durable deletion: gateway tombstone signed with the same server
@@ -621,6 +643,18 @@ export async function createServer(
     resource: effectiveOrigin,
     logger,
   });
+
+  // Close the sync→PDPP loop. Until this runs the download worker holds an
+  // inert delegate; from here a synced envelope carrying verified `$pdpp`
+  // metadata lands in the same store the RS serves reads from.
+  pdppImporterImpl =
+    createPdppSyncImporter({
+      records: pdppRecords,
+      declarations: pdppAuth?.retainedDeclarations ?? [],
+      documents: pdppAuth?.retainedDocuments ?? new Map(),
+      serverOwner,
+      logger,
+    }) ?? null;
 
   const app = createApp({
     pdppAuth,

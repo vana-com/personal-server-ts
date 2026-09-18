@@ -78,10 +78,17 @@ export function buildDeclarationRegistry(
 ): {
   resolve: (sourceId: string) => DeclarationSnapshot | null;
   retained: DeclarationSnapshot[];
+  /** The exact retained bytes per source id, for digest verification. */
+  retainedDocuments: Map<string, string>;
 } {
   const { logger } = options;
   const supported = new Set(options.supportedConnectors);
   const bySourceId = new Map<string, DeclarationSnapshot>();
+  // Only the documents that survived validation AND the connector gate. A
+  // rejected declaration must not leave its bytes behind for something else
+  // to verify against, or the trust policy would apply to the snapshot and
+  // not to the document.
+  const documentsBySourceId = new Map<string, string>();
 
   for (const configured of options.declarations) {
     const parsed = parseDeclaration(configured.document, configured.sourceId);
@@ -103,6 +110,7 @@ export function buildDeclarationRegistry(
     }
 
     bySourceId.set(parsed.snapshot.source_id, parsed.snapshot);
+    documentsBySourceId.set(parsed.snapshot.source_id, configured.document);
     logger.info(
       {
         sourceId: parsed.snapshot.source_id,
@@ -116,6 +124,7 @@ export function buildDeclarationRegistry(
   return {
     resolve: (sourceId: string) => bySourceId.get(sourceId) ?? null,
     retained: Array.from(bySourceId.values()),
+    retainedDocuments: documentsBySourceId,
   };
 }
 

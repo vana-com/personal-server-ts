@@ -56,6 +56,18 @@ export interface CreatePdppAuthDepsOptions {
  */
 export type PdppAuthBootResult = PdppAuthRouteDeps & {
   retainedDeclarations: DeclarationSnapshot[];
+  /**
+   * The exact documents behind `retainedDeclarations`, keyed by source id.
+   *
+   * The sync importer verifies a producer's claimed declaration digest, and
+   * the only honest thing to digest is the bytes that were actually
+   * retrieved. The auth store persists a parsed snapshot rather than the
+   * document, so re-digesting from storage would compare a re-serialization
+   * against a digest taken over the original — a check that can fail for
+   * formatting alone and proves nothing about what the producer read. These
+   * are those original bytes, carried forward from boot.
+   */
+  retainedDocuments: Map<string, string>;
 };
 
 export async function createPdppAuthDeps(
@@ -136,6 +148,7 @@ export async function createPdppAuthDeps(
     tokens,
     sessions,
     retainedDeclarations: registry.retained,
+    retainedDocuments: registry.retainedDocuments,
     resolveDeclaration: registry.resolve,
     inventoryFor: (subject, sourceId) =>
       singleInstanceInventory(subject || subjectId, sourceId),

@@ -31,6 +31,7 @@ import {
 } from "../issues.js";
 import { downloadRetryKey, type DownloadRetryMemory } from "../retry-memory.js";
 import { readStoredLineage } from "../../lineage/lineage.js";
+import type { PdppImporter } from "../pdpp-import.js";
 
 /**
  * Minimal diagnostics hook — keeps core free of lite-specific imports.
@@ -99,6 +100,19 @@ export interface DownloadWorkerDeps {
     /** The record's stamped `$lineage.sources`, when it is a derivative. */
     lineageSources?: string[];
   }) => void;
+  /**
+   * Import a decrypted envelope into the PDPP record store, when the
+   * deployment mounted one.
+   *
+   * Runs AFTER the legacy write and index above, and never in place of them:
+   * PDPP is an additional read surface over the same synced data, not a
+   * replacement for the storage every existing reader depends on. A failing
+   * import is logged and swallowed for the same reason — the data point is
+   * already durably stored and indexed by the time this runs, so throwing
+   * would block the sync cursor and stall the legacy path over a defect in
+   * the newer one.
+   */
+  pdppImporter?: PdppImporter;
 }
 
 export interface DeletionReconcileResult {
@@ -439,6 +453,8 @@ export async function downloadOne(
     "Downloaded and indexed data point",
   );
 
+  importIntoPdpp(deps, envelope, record.id);
+
   if (deps.onDataPointIndexed) {
     try {
       let lineageSources: string[] | undefined;
@@ -775,6 +791,46 @@ export async function repairLocalMissingBlockSidecars(
     );
   }
   return { repaired, missingEnvelopeEntries };
+}
+
+/**
+ * Offer a freshly indexed envelope to the PDPP importer.
+ *
+ * Deliberately total: every outcome is handled and none escapes. A rejection
+ * is a WARNING rather than an error because it means the producer sent
+ * something this deployment could not verify — actionable, but not a fault of
+ * this sync cycle, and not a reason to re-download a blob that arrived
+ * intact. `skipped` is the ordinary legacy case and stays silent.
+ */
+function importIntoPdpp(
+  deps: Pick<DownloadWorkerDeps, "pdppImporter" | "logger">,
+  envelope: { scope: string; collectedAt: string; data: unknown },
+  dataPointId: string,
+): void {
+  if (!deps.pdppImporter) return;
+  try {
+    const outcome = deps.pdppImporter.importEnvelope({
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      data: envelope.data,
+    });
+    if (outcome.status === "rejected") {
+      deps.logger.warn(
+        {
+          dataPointId,
+          scope: envelope.scope,
+          code: outcome.rejection.code,
+          message: outcome.rejection.message,
+        },
+        "Synced data point was not imported into the PDPP record store",
+      );
+    }
+  } catch (err) {
+    deps.logger.warn(
+      { dataPointId, scope: envelope.scope, error: (err as Error).message },
+      "PDPP import failed; data point remains indexed in local storage",
+    );
+  }
 }
 
 function createSyncRunId(): string {
