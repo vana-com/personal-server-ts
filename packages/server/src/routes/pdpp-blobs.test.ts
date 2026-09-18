@@ -312,4 +312,155 @@ describe("pdpp blobs route", () => {
     });
     expect(res.status).toBe(404);
   });
+
+  it("fails closed with a structured api_error when no readBlobBytes is wired up, instead of a fabricated 200", async () => {
+    const store = createMemoryRecordStore();
+    store.putBlobMeta({
+      blobId: "blob_1",
+      mimeType: "image/jpeg",
+      sizeBytes: 10,
+      sha256: "abc",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: "blob_1" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
+    const app = pdppBlobsRoutes({
+      store,
+      auth: createFixtureAuthorizationService({
+        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+      }),
+      declarations,
+      // readBlobBytes intentionally omitted.
+    });
+    const res = await app.request("/blob_1", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+    expect(res.status).toBe(500);
+    const body = await res.json();
+    expect(body.error.code).toBe("api_error");
+    expect(body.error.request_id).toBeTruthy();
+  });
+
+  it("fails closed with a structured api_error when the reader resolves undefined (bytes missing), instead of a 200 with an empty body", async () => {
+    const store = createMemoryRecordStore();
+    store.putBlobMeta({
+      blobId: "blob_1",
+      mimeType: "image/jpeg",
+      sizeBytes: 10,
+      sha256: "abc",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: "blob_1" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
+    const app = pdppBlobsRoutes({
+      store,
+      auth: createFixtureAuthorizationService({
+        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+      }),
+      declarations,
+      readBlobBytes: async () => undefined,
+    });
+    const res = await app.request("/blob_1", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+    expect(res.status).toBe(500);
+    const body = await res.json();
+    expect(body.error.code).toBe("api_error");
+    expect(body.error.type).toBe("api_error");
+  });
+
+  it("returns the exact stored bytes for a valid binary blob, byte-for-byte", async () => {
+    const store = createMemoryRecordStore();
+    const payload = new Uint8Array([0, 1, 2, 255, 254, 3, 3, 3]);
+    store.putBlobMeta({
+      blobId: "blob_1",
+      mimeType: "application/octet-stream",
+      sizeBytes: payload.byteLength,
+      sha256: "abc",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: "blob_1" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
+    const app = pdppBlobsRoutes({
+      store,
+      auth: createFixtureAuthorizationService({
+        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+      }),
+      declarations,
+      readBlobBytes: async () => payload,
+    });
+    const res = await app.request("/blob_1", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+    expect(res.status).toBe(200);
+    const returned = new Uint8Array(await res.arrayBuffer());
+    expect(Array.from(returned)).toEqual(Array.from(payload));
+  });
+
+  it("fails closed when the reader's byte count does not match declared sizeBytes, rather than misrepresenting Content-Length", async () => {
+    const store = createMemoryRecordStore();
+    store.putBlobMeta({
+      blobId: "blob_1",
+      mimeType: "image/jpeg",
+      sizeBytes: 10,
+      sha256: "abc",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: "blob_1" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
+    const app = pdppBlobsRoutes({
+      store,
+      auth: createFixtureAuthorizationService({
+        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+      }),
+      declarations,
+      readBlobBytes: async () => new Uint8Array(3), // does not match sizeBytes: 10
+    });
+    const res = await app.request("/blob_1", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+    expect(res.status).toBe(500);
+    const body = await res.json();
+    expect(body.error.code).toBe("api_error");
+  });
 });

@@ -20,9 +20,10 @@ export interface PdppBlobsRouteDeps {
   /**
    * Loads raw blob bytes for a blob_id, or undefined if not locally stored.
    * A simple content-addressed local store behind an interface — not a CDN.
-   * Optional: when absent, this route serves metadata-derived headers only
-   * and 501s the direct-response body (still gated correctly, just no byte
-   * source wired up — a caller building this out supplies the function).
+   * Optional: when absent, GET fails closed with `api_error` (500) rather
+   * than fabricating a 200 with no body — the route is still gated
+   * correctly, there is just no byte source wired up for this deployment
+   * (a caller building this out supplies the function).
    */
   readBlobBytes?: (
     blobId: string,
@@ -193,9 +194,30 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
 
     const bytes = await deps.readBlobBytes?.(blobId);
     if (!bytes) {
-      // Bytes storage not wired up for this deployment — headers are still
-      // authorization-correct, but there is no content to return.
-      return c.body(null, 200, headers);
+      // Authorization succeeded, but this deployment has no byte source
+      // wired up (or the store lost the bytes for an otherwise-known blob).
+      // The client asked for content, not headers -- claiming 200 with an
+      // empty body and a nonzero Content-Length would be a fabricated
+      // truncated success indistinguishable from a valid zero-byte blob or
+      // a network truncation. Spec §8 defines no "bytes unavailable" code;
+      // `api_error` (500) is the same honest fail-closed mapping used for
+      // the chain-authorization outage above -- the failure is on our
+      // side, not the client's request.
+      return jsonError(
+        c,
+        new PdppError("api_error", "Blob bytes are not available"),
+        reqId,
+      );
+    }
+    if (bytes.byteLength !== meta.sizeBytes) {
+      // The declared Content-Length must never silently misrepresent the
+      // returned body. Fail closed rather than let a stale/corrupt
+      // sizeBytes lie to the client about how much data follows.
+      return jsonError(
+        c,
+        new PdppError("api_error", "Stored blob size does not match metadata"),
+        reqId,
+      );
     }
     return c.body(bytes, 200, headers);
   });
