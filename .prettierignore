@@ -4,3 +4,9 @@ coverage
 *.d.ts
 *.tsbuildinfo
 package-lock.json
+
+# Producer-authored PDPP source declarations, vendored byte-for-byte.
+# Reformatting these changes their bytes, which silently invalidates the
+# producer digests every import verifies against -- surfacing later as an
+# unexplained digest_mismatch rather than as a diff anyone reads.
+packages/core/src/pdpp/__fixtures__/*.source-declaration.json

@@ -150,9 +150,12 @@ describe("§8 client `fields` narrows within the grant", () => {
   });
 
   it("keeps the required floor even when not requested", async () => {
-    const res = await app("client").request("/v1/streams/s/records?fields=name", {
-      headers: AUTH,
-    });
+    const res = await app("client").request(
+      "/v1/streams/s/records?fields=name",
+      {
+        headers: AUTH,
+      },
+    );
     const body = await res.json();
     // §8 keeps schema-required fields in every projection.
     expect(body.data[0].data.id).toBe("r1");

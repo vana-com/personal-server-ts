@@ -34,10 +34,7 @@ import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { computeDeclarationDigest, parseDeclaration } from "./declaration.js";
 
-const FIXTURES = join(
-  dirname(fileURLToPath(import.meta.url)),
-  "__fixtures__",
-);
+const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), "__fixtures__");
 
 const PRODUCER_DECLARATIONS = [
   {

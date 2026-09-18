@@ -26,10 +26,7 @@ import {
   createStreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
-import {
-  pdppRecordsRoutes,
-  type PdppAccessLogPort,
-} from "./pdpp-records.js";
+import { pdppRecordsRoutes, type PdppAccessLogPort } from "./pdpp-records.js";
 
 const INSTANCE = "i1";
 const AUTH = { Authorization: "Bearer t" };
