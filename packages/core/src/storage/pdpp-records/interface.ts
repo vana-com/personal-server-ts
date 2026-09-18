@@ -62,17 +62,20 @@ export interface PdppRecordStore {
   getBlobMeta(blobId: string): PdppBlobMeta | undefined;
 
   /**
-   * Finds the record that references a `blob_id` via `data.blob_ref.blob_id`
-   * (spec §4 "Binary data (blob_ref)"), if any. A `blob_id` alone is never
-   * sufficient to authorize access (spec §8 "Get a blob"): the resource
-   * server must verify the grant includes a stream containing a record that
-   * references this blob, that record passes all grant filters, and
-   * `blob_ref` is in the grant's authorized field projection. This lookup
-   * is what makes that verification possible instead of trusting field-name
-   * presence alone. Returns undefined if no ingested record currently
-   * references this blob_id.
+   * Finds every non-deleted record that references a `blob_id` via
+   * `data.blob_ref.blob_id` (spec §4 "Binary data (blob_ref)"). Identical
+   * blob bytes can legitimately be referenced by more than one record or
+   * instance, so callers must check every returned reference and grant
+   * access if ANY one passes their authorization constraints (spec §8 "Get
+   * a blob") -- an inaccessible reference must never hide an accessible
+   * one. A `blob_id` alone is never sufficient to authorize access: the
+   * resource server must verify the grant includes a stream containing a
+   * record that references this blob, that record passes all grant
+   * filters, and `blob_ref` is in the grant's authorized field projection.
+   * Returns an empty array if no ingested record currently references this
+   * blob_id.
    */
-  findBlobReference(blobId: string): BlobReference | undefined;
+  findBlobReferences(blobId: string): BlobReference[];
 
   close(): void;
 }

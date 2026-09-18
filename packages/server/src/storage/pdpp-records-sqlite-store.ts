@@ -226,8 +226,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
       mime_type = excluded.mime_type, size_bytes = excluded.size_bytes, sha256 = excluded.sha256
   `);
   const getBlobStmt = db.prepare("SELECT * FROM pdpp_blobs WHERE blob_id = ?");
-  const findBlobRefStmt = db.prepare(
-    "SELECT instance, stream, record_key FROM pdpp_records WHERE blob_id = ? AND deleted = 0 LIMIT 1",
+  const findBlobRefsStmt = db.prepare(
+    "SELECT instance, stream, record_key FROM pdpp_records WHERE blob_id = ? AND deleted = 0",
   );
 
   function latestVersion(
@@ -677,15 +677,17 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
         sha256: row.sha256,
       };
     },
-    findBlobReference: (blobId: string) => {
-      const row = findBlobRefStmt.get(blobId) as
-        { instance: string; stream: string; record_key: string } | undefined;
-      if (!row) return undefined;
-      return {
+    findBlobReferences: (blobId: string) => {
+      const rows = findBlobRefsStmt.all(blobId) as Array<{
+        instance: string;
+        stream: string;
+        record_key: string;
+      }>;
+      return rows.map((row) => ({
         instance: row.instance,
         stream: row.stream,
         recordKey: row.record_key,
-      };
+      }));
     },
     close: () => db.close(),
   };

@@ -469,7 +469,7 @@ describe("sqlite record store", () => {
     ]);
   });
 
-  describe("findBlobReference", () => {
+  describe("findBlobReferences", () => {
     it("finds the record that references a blob_id via data.blob_ref.blob_id", () => {
       store.ingestBatch(
         [
@@ -484,15 +484,17 @@ describe("sqlite record store", () => {
         () => "append_only",
         () => ["id"],
       );
-      expect(store.findBlobReference("blob_x")).toEqual({
-        instance: "inst_1",
-        stream: "media",
-        recordKey: "media_1",
-      });
+      expect(store.findBlobReferences("blob_x")).toEqual([
+        {
+          instance: "inst_1",
+          stream: "media",
+          recordKey: "media_1",
+        },
+      ]);
     });
 
-    it("returns undefined when no record references the blob_id", () => {
-      expect(store.findBlobReference("blob_nonexistent")).toBeUndefined();
+    it("returns an empty array when no record references the blob_id", () => {
+      expect(store.findBlobReferences("blob_nonexistent")).toEqual([]);
     });
 
     it("does not find a reference from a deleted record", () => {
@@ -516,7 +518,38 @@ describe("sqlite record store", () => {
         "2026-04-02T00:00:00.000Z",
         "mutable_state",
       );
-      expect(store.findBlobReference("blob_x")).toBeUndefined();
+      expect(store.findBlobReferences("blob_x")).toEqual([]);
+    });
+
+    it("finds every non-deleted record that references the same blob_id", () => {
+      store.ingestBatch(
+        [
+          {
+            instance: "inst_1",
+            stream: "media",
+            key: "media_1",
+            data: { id: "media_1", blob_ref: { blob_id: "blob_shared" } },
+            emitted_at: "2026-04-01T00:00:00.000Z",
+          },
+          {
+            instance: "inst_2",
+            stream: "media",
+            key: "media_2",
+            data: { id: "media_2", blob_ref: { blob_id: "blob_shared" } },
+            emitted_at: "2026-04-01T00:00:01.000Z",
+          },
+        ],
+        () => "append_only",
+        () => ["id"],
+      );
+      const references = store.findBlobReferences("blob_shared");
+      expect(references).toHaveLength(2);
+      expect(references).toEqual(
+        expect.arrayContaining([
+          { instance: "inst_1", stream: "media", recordKey: "media_1" },
+          { instance: "inst_2", stream: "media", recordKey: "media_2" },
+        ]),
+      );
     });
   });
 
@@ -538,11 +571,13 @@ describe("sqlite record store", () => {
       // Reopening the same underlying db (without closing/recreating) must
       // not error or duplicate schema objects -- migrate() is idempotent.
       const reopened = createSqliteRecordStore(db);
-      expect(reopened.findBlobReference("blob_y")).toEqual({
-        instance: "inst_1",
-        stream: "media",
-        recordKey: "media_1",
-      });
+      expect(reopened.findBlobReferences("blob_y")).toEqual([
+        {
+          instance: "inst_1",
+          stream: "media",
+          recordKey: "media_1",
+        },
+      ]);
       const version = db
         .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
         .get() as { version: number };

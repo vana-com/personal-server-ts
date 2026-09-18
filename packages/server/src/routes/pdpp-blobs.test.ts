@@ -1,8 +1,11 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
+import Database from "better-sqlite3";
 import {
   createMemoryRecordStore,
   createStreamDeclarationRegistry,
+  type PdppRecordStore,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
 import { createFixtureAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth.test-utils";
 import type { Grant } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { pdppBlobsRoutes } from "./pdpp-blobs.js";
@@ -39,9 +42,32 @@ const declarations = createStreamDeclarationRegistry([
   },
 ]);
 
-describe("pdpp blobs route", () => {
+const backends: Array<{
+  name: string;
+  createStore: () => PdppRecordStore;
+}> = [
+  { name: "memory", createStore: () => createMemoryRecordStore() },
+  {
+    name: "sqlite",
+    createStore: () => createSqliteRecordStore(new Database(":memory:")),
+  },
+];
+
+describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
+  let stores: PdppRecordStore[] = [];
+  function newStore(): PdppRecordStore {
+    const s = createStore();
+    stores.push(s);
+    return s;
+  }
+
+  afterEach(() => {
+    for (const s of stores) s.close();
+    stores = [];
+  });
+
   it("returns 404 blob_not_found for an unknown blob_id", async () => {
-    const store = createMemoryRecordStore();
+    const store = newStore();
     const app = pdppBlobsRoutes({
       store,
       auth: createFixtureAuthorizationService({
@@ -58,7 +84,7 @@ describe("pdpp blobs route", () => {
   });
 
   it("serves Content-Type/Content-Length/Cache-Control for an owner-authorized blob", async () => {
-    const store = createMemoryRecordStore();
+    const store = newStore();
     store.putBlobMeta({
       blobId: "blob_1",
       mimeType: "image/jpeg",
@@ -98,7 +124,7 @@ describe("pdpp blobs route", () => {
   });
 
   it("supports HEAD for size checks", async () => {
-    const store = createMemoryRecordStore();
+    const store = newStore();
     store.putBlobMeta({
       blobId: "blob_1",
       mimeType: "image/jpeg",
@@ -134,7 +160,7 @@ describe("pdpp blobs route", () => {
   });
 
   it("rejects an owner token when the blob belongs to an instance outside instancesForSubject", async () => {
-    const store = createMemoryRecordStore();
+    const store = newStore();
     store.putBlobMeta({
       blobId: "blob_1",
       mimeType: "image/jpeg",
@@ -171,7 +197,7 @@ describe("pdpp blobs route", () => {
   });
 
   it("returns 401 without a token", async () => {
-    const store = createMemoryRecordStore();
+    const store = newStore();
     const app = pdppBlobsRoutes({
       store,
       auth: createFixtureAuthorizationService({}),
@@ -185,7 +211,7 @@ describe("pdpp blobs route", () => {
     // Correctly-scoped case, spec §8 "Get a blob": the grant includes the
     // stream, the referencing record's instance and resources are within
     // scope, and blob_ref is in the granted fields.
-    const store = createMemoryRecordStore();
+    const store = newStore();
     store.putBlobMeta({
       blobId: "blob_ok",
       mimeType: "image/jpeg",
@@ -230,7 +256,7 @@ describe("pdpp blobs route", () => {
     // instance and a DIFFERENT resources allowlist, naming no record that
     // references this blob, must not be able to fetch it merely because
     // some stream's field list happens to include "blob_ref".
-    const store = createMemoryRecordStore();
+    const store = newStore();
     store.putBlobMeta({
       blobId: "blob_private",
       mimeType: "image/jpeg",
@@ -275,7 +301,7 @@ describe("pdpp blobs route", () => {
   });
 
   it("denies a client token when blob_ref is not in the grant's authorized fields for the referencing stream", async () => {
-    const store = createMemoryRecordStore();
+    const store = newStore();
     store.putBlobMeta({
       blobId: "blob_1",
       mimeType: "image/jpeg",
@@ -314,7 +340,7 @@ describe("pdpp blobs route", () => {
   });
 
   it("fails closed with a structured api_error when no readBlobBytes is wired up, instead of a fabricated 200", async () => {
-    const store = createMemoryRecordStore();
+    const store = newStore();
     store.putBlobMeta({
       blobId: "blob_1",
       mimeType: "image/jpeg",
@@ -352,7 +378,7 @@ describe("pdpp blobs route", () => {
   });
 
   it("fails closed with a structured api_error when the reader resolves undefined (bytes missing), instead of a 200 with an empty body", async () => {
-    const store = createMemoryRecordStore();
+    const store = newStore();
     store.putBlobMeta({
       blobId: "blob_1",
       mimeType: "image/jpeg",
@@ -390,7 +416,7 @@ describe("pdpp blobs route", () => {
   });
 
   it("fails closed with a structured api_error, not a leaked exception, when the reader throws", async () => {
-    const store = createMemoryRecordStore();
+    const store = newStore();
     store.putBlobMeta({
       blobId: "blob_1",
       mimeType: "image/jpeg",
@@ -434,7 +460,7 @@ describe("pdpp blobs route", () => {
   });
 
   it("returns a genuine zero-byte blob as a 200, distinct from absent bytes", async () => {
-    const store = createMemoryRecordStore();
+    const store = newStore();
     store.putBlobMeta({
       blobId: "blob_1",
       mimeType: "application/octet-stream",
@@ -471,7 +497,7 @@ describe("pdpp blobs route", () => {
   });
 
   it("returns the exact stored bytes for a valid binary blob, byte-for-byte", async () => {
-    const store = createMemoryRecordStore();
+    const store = newStore();
     const payload = new Uint8Array([0, 1, 2, 255, 254, 3, 3, 3]);
     store.putBlobMeta({
       blobId: "blob_1",
@@ -508,8 +534,223 @@ describe("pdpp blobs route", () => {
     expect(Array.from(returned)).toEqual(Array.from(payload));
   });
 
+  it("serves a blob when the FIRST reference is inaccessible but a SECOND reference to the same bytes is granted (any-visible-reference regression)", async () => {
+    // Identical blob bytes can legitimately be referenced by multiple
+    // records/instances. If the store only surfaced one reference (e.g. an
+    // unordered LIMIT 1 query), an inaccessible first record could hide an
+    // accessible second one and cause a false denial.
+    const store = newStore();
+    store.putBlobMeta({
+      blobId: "blob_shared",
+      mimeType: "image/jpeg",
+      sizeBytes: 3,
+      sha256: "abc",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_private",
+          stream: "media",
+          key: "media_private",
+          data: { id: "media_private", blob_ref: { blob_id: "blob_shared" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+        {
+          instance: "inst_1",
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: "blob_shared" } },
+          emitted_at: "2026-04-01T00:00:01.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
+    const app = pdppBlobsRoutes({
+      store,
+      auth: createFixtureAuthorizationService({
+        "client-tok": {
+          active: true,
+          tokenKind: "client",
+          subjectId: "sub_1",
+          // Grant covers only inst_1/media_1 -- not inst_private/media_private.
+          grant: clientGrant(),
+        },
+      }),
+      declarations,
+      readBlobBytes: async () => new Uint8Array(3),
+    });
+    const res = await app.request("/blob_shared", {
+      headers: { Authorization: "Bearer client-tok" },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Length")).toBe("3");
+  });
+
+  it("serves a blob to an owner token when the FIRST reference is on an unowned instance but a SECOND reference is on an owned one (owner any-visible-reference regression)", async () => {
+    const store = newStore();
+    store.putBlobMeta({
+      blobId: "blob_shared_owner",
+      mimeType: "image/jpeg",
+      sizeBytes: 3,
+      sha256: "abc",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_other",
+          stream: "media",
+          key: "media_other",
+          data: {
+            id: "media_other",
+            blob_ref: { blob_id: "blob_shared_owner" },
+          },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+        {
+          instance: "inst_1",
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: "blob_shared_owner" } },
+          emitted_at: "2026-04-01T00:00:01.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
+    const app = pdppBlobsRoutes({
+      store,
+      auth: createFixtureAuthorizationService({
+        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+      }),
+      declarations,
+      instancesForSubject: () => ["inst_1"], // does not include inst_other
+      readBlobBytes: async () => new Uint8Array(3),
+    });
+    const res = await app.request("/blob_shared_owner", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Length")).toBe("3");
+  });
+
+  it("denies a blob when NO visible reference passes authorization, even with multiple references (companion to the any-visible-reference regression)", async () => {
+    const store = newStore();
+    store.putBlobMeta({
+      blobId: "blob_shared_private",
+      mimeType: "image/jpeg",
+      sizeBytes: 3,
+      sha256: "abc",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_private_a",
+          stream: "media",
+          key: "media_a",
+          data: {
+            id: "media_a",
+            blob_ref: { blob_id: "blob_shared_private" },
+          },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+        {
+          instance: "inst_private_b",
+          stream: "media",
+          key: "media_b",
+          data: {
+            id: "media_b",
+            blob_ref: { blob_id: "blob_shared_private" },
+          },
+          emitted_at: "2026-04-01T00:00:01.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
+    const app = pdppBlobsRoutes({
+      store,
+      auth: createFixtureAuthorizationService({
+        "client-tok": {
+          active: true,
+          tokenKind: "client",
+          subjectId: "sub_1",
+          // Grant covers neither inst_private_a nor inst_private_b.
+          grant: clientGrant(),
+        },
+      }),
+      declarations,
+      readBlobBytes: async () => new Uint8Array(3),
+    });
+    const res = await app.request("/blob_shared_private", {
+      headers: { Authorization: "Bearer client-tok" },
+    });
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error.code).toBe("blob_not_found");
+  });
+
+  it("denies a blob whose only visible reference has been deleted, even when an unauthorized instance's reference still exists", async () => {
+    const store = newStore();
+    store.putBlobMeta({
+      blobId: "blob_deleted_ref",
+      mimeType: "image/jpeg",
+      sizeBytes: 3,
+      sha256: "abc",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: "blob_deleted_ref" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+        {
+          instance: "inst_other",
+          stream: "media",
+          key: "media_other",
+          data: {
+            id: "media_other",
+            blob_ref: { blob_id: "blob_deleted_ref" },
+          },
+          emitted_at: "2026-04-01T00:00:01.000Z",
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+    );
+    store.deleteRecord(
+      "inst_1",
+      "media",
+      "media_1",
+      "2026-04-02T00:00:00.000Z",
+      "mutable_state",
+    );
+    const app = pdppBlobsRoutes({
+      store,
+      auth: createFixtureAuthorizationService({
+        "client-tok": {
+          active: true,
+          tokenKind: "client",
+          subjectId: "sub_1",
+          grant: clientGrant(),
+        },
+      }),
+      declarations,
+      readBlobBytes: async () => new Uint8Array(3),
+    });
+    const res = await app.request("/blob_deleted_ref", {
+      headers: { Authorization: "Bearer client-tok" },
+    });
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error.code).toBe("blob_not_found");
+  });
+
   it("fails closed when the reader's byte count does not match declared sizeBytes, rather than misrepresenting Content-Length", async () => {
-    const store = createMemoryRecordStore();
+    const store = newStore();
     store.putBlobMeta({
       blobId: "blob_1",
       mimeType: "image/jpeg",

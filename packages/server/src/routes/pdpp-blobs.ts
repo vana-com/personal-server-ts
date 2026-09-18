@@ -54,9 +54,11 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   const app = new Hono();
 
   /**
-   * Authorizes a blob fetch through the same path a record read uses (spec §8): finds the
-   * record referencing this blob_id, then applies instance scope, resources, time_constraint,
-   * and requires blob_ref in that record's specific granted field projection.
+   * Authorizes a blob fetch through the same path a record read uses (spec §8): finds every
+   * record referencing this blob_id, then grants access if ANY one passes instance scope,
+   * resources, time_constraint, and has blob_ref in its record's specific granted field
+   * projection. Identical bytes can be referenced by more than one record, so an inaccessible
+   * reference must not hide an accessible one.
    */
   async function authorizeBlobAccess(
     c: Context,
@@ -100,60 +102,64 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         reqId,
       );
 
+    // Identical blob bytes can legitimately be referenced by more than one
+    // record or instance (e.g. re-ingested via a different stream). Access
+    // is granted if ANY visible reference passes its authorization check —
+    // an inaccessible reference must never hide an accessible one.
+    const references = deps.store.findBlobReferences(blobId);
+    if (references.length === 0) return { error: notFound() };
+
     if (context.tokenKind === "owner") {
       // Owner tokens carry no grant: current-capability read, scoped to the
       // owner's own subject's instances only — a blob referenced by a
       // record on an instance the owner doesn't own must not be served.
-      const reference = deps.store.findBlobReference(blobId);
-      if (!reference) return { error: notFound() };
       const ownedInstances = deps.instancesForSubject?.(
         context.subjectId ?? "",
       );
-      if (ownedInstances && !ownedInstances.includes(reference.instance)) {
-        return { error: notFound() };
-      }
+      const visible = references.some(
+        (reference) =>
+          !ownedInstances || ownedInstances.includes(reference.instance),
+      );
+      if (!visible) return { error: notFound() };
       return { ok: true };
     }
 
     // Client token: the blob must be referenced by a record this exact
     // grant can see — instance scope, resources allowlist, time_constraint,
     // and blob_ref must be in the granted fields for that record's stream.
-    const reference = deps.store.findBlobReference(blobId);
-    if (!reference) return { error: notFound() };
+    for (const reference of references) {
+      const declaration = deps.declarations.get(reference.stream);
+      let scope;
+      try {
+        scope = resolveReadScope(context, reference.stream, declaration);
+      } catch {
+        continue;
+      }
 
-    const declaration = deps.declarations.get(reference.stream);
-    let scope;
-    try {
-      scope = resolveReadScope(context, reference.stream, declaration);
-    } catch {
-      return { error: notFound() };
-    }
+      if (!scope.instanceIds.includes(reference.instance)) continue;
+      if (
+        !recordKeyWithinGrantResources(reference.recordKey, scope.streamGrant)
+      ) {
+        continue;
+      }
+      if (!scope.fields?.includes("blob_ref")) continue;
 
-    if (!scope.instanceIds.includes(reference.instance)) {
-      return { error: notFound() };
-    }
-    if (
-      !recordKeyWithinGrantResources(reference.recordKey, scope.streamGrant)
-    ) {
-      return { error: notFound() };
-    }
-    if (!scope.fields?.includes("blob_ref")) {
-      return { error: notFound() };
-    }
+      const record = deps.store.getRecord(
+        reference.instance,
+        reference.stream,
+        reference.recordKey,
+      );
+      if (
+        !record ||
+        !recordWithinGrantTimeConstraint(record.data, scope.streamGrant)
+      ) {
+        continue;
+      }
 
-    const record = deps.store.getRecord(
-      reference.instance,
-      reference.stream,
-      reference.recordKey,
-    );
-    if (
-      !record ||
-      !recordWithinGrantTimeConstraint(record.data, scope.streamGrant)
-    ) {
-      return { error: notFound() };
+      return { ok: true };
     }
 
-    return { ok: true };
+    return { error: notFound() };
   }
 
   // Hono dispatches HEAD via the GET handler and discards the body, so no separate HEAD handler is
