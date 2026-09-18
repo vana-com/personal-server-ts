@@ -51,6 +51,8 @@ import {
 } from "./routes/auth-device.js";
 import { oauthTokenRoutes } from "./routes/oauth-token.js";
 import { pdppAuthRoutes, type PdppAuthRouteDeps } from "./routes/pdpp-auth.js";
+import { pdppDeclarationRoutes } from "./routes/pdpp-declarations.js";
+import type { MutableDeclarationRegistry } from "./pdpp/declaration-registry.js";
 import type {
   PdppImporter,
   ScopeDeletionTracker,
@@ -175,6 +177,17 @@ export interface AppDeps {
    * one enforcement path).
    */
   pdppAuth?: PdppAuthRouteDeps;
+  /**
+   * Operator-authenticated declaration submission. Absent (or with no
+   * operator token) leaves the route unmounted and the declaration set
+   * exactly as config made it — the pre-existing behavior.
+   */
+  pdppDeclarations?: {
+    registry: MutableDeclarationRegistry;
+    supportedConnectors: string[];
+    /** Absent = the route is not mounted at all. */
+    operatorToken?: string;
+  };
   mcpActivityRecorder?: McpActivityRecorder;
   mcpHydrateScopes?: (scopes: string[]) => Promise<void>;
   /**
@@ -578,6 +591,24 @@ export function createApp(deps: AppDeps): Hono {
   // are byte-for-byte unchanged.
   if (deps.pdppAuth) {
     app.route("/pdpp/v1", pdppAuthRoutes(deps.pdppAuth));
+
+    // Declaration submission (§5 acceptance). Mounted at `/pdpp`, NOT under
+    // `/pdpp/v1`: it is an operator surface rather than part of the versioned
+    // client-facing AS contract, and the separation keeps the "must not be
+    // client-reachable" property visible in the path itself. Only mounted
+    // when an operator credential exists — the route refuses everything
+    // without one, so mounting it would be surface with no capability.
+    if (deps.pdppDeclarations?.operatorToken) {
+      app.route(
+        "/pdpp",
+        pdppDeclarationRoutes({
+          logger: deps.logger,
+          registry: deps.pdppDeclarations.registry,
+          supportedConnectors: deps.pdppDeclarations.supportedConnectors,
+          operatorToken: deps.pdppDeclarations.operatorToken,
+        }),
+      );
+    }
   }
 
   // Mount dev UI routes when dev token is available. The /ui subtree is

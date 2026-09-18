@@ -32,11 +32,14 @@ import type { PdppAuthRouteDeps } from "../routes/pdpp-auth.js";
 import type { TokenStore } from "../token-store.js";
 import { boundedClientDocumentFetcher } from "./client-document-fetch.js";
 import {
-  buildDeclarationRegistry,
   deriveSupportedConnectors,
   singleInstanceInventory,
   type ConfiguredDeclaration,
 } from "./deployment.js";
+import {
+  openDeclarationRegistry,
+  type MutableDeclarationRegistry,
+} from "./declaration-registry.js";
 
 export interface CreatePdppAuthDepsOptions {
   config: ServerConfig;
@@ -71,6 +74,15 @@ export type PdppAuthBootResult = PdppAuthRouteDeps & {
    * are those original bytes, carried forward from boot.
    */
   retainedDocuments: Map<string, string>;
+  /**
+   * The live registry behind `resolveDeclaration`. Handed out so the
+   * submission route can write to the same object the AS reads from — a
+   * submission that updated a copy would accept a declaration the grant path
+   * still cannot see, which is the restart problem wearing a new hat.
+   */
+  declarationRegistry: MutableDeclarationRegistry;
+  /** The connector gate this boot derived, so callers do not recompute it. */
+  supportedConnectors: string[];
 };
 
 export async function createPdppAuthDeps(
@@ -100,11 +112,34 @@ export async function createPdppAuthDeps(
     config.pdpp.declarationPaths,
     logger,
   );
-  const registry = buildDeclarationRegistry({
-    declarations,
+
+  // The durable registry the submission route writes to, seeded from the
+  // configured paths. A deployment that only ever configures declarations
+  // behaves exactly as before — same validator, same connector gate, same
+  // warnings — while a submitted declaration becomes resolvable in this
+  // lifetime and survives the next restart.
+  const declarationRegistry = openDeclarationRegistry({
+    path: join(options.storageRoot, "pdpp-declarations.db"),
     supportedConnectors,
     logger,
+    seed: declarations.map((d) => ({
+      sourceId: d.sourceId,
+      document: d.document,
+    })),
   });
+
+  const registry = {
+    resolve: declarationRegistry.resolve,
+    retained: declarationRegistry.list(),
+    retainedDocuments: new Map(
+      declarationRegistry
+        .list()
+        .map((snapshot) => [
+          snapshot.source_id,
+          declarationRegistry.documentFor(snapshot.source_id) ?? "",
+        ]),
+    ),
+  };
 
   if (registry.retained.length === 0) {
     logger.warn(
@@ -153,6 +188,8 @@ export async function createPdppAuthDeps(
     retainedDeclarations: registry.retained,
     retainedDocuments: registry.retainedDocuments,
     resolveDeclaration: registry.resolve,
+    declarationRegistry,
+    supportedConnectors,
     inventoryFor: (subject, sourceId) =>
       singleInstanceInventory(subject || subjectId, sourceId),
     /**

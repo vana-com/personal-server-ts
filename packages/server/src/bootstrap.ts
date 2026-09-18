@@ -663,6 +663,20 @@ export async function createServer(
 
   const app = createApp({
     pdppAuth,
+    // Declaration submission, gated on the control-plane credential the
+    // deployment already uses for operator surfaces (`PS_ACCESS_TOKEN`).
+    // Deliberately NOT a new config field: `loadConfig()` rewrites
+    // `config.json` with defaults on every boot, so a secret living there is
+    // a secret at rest in a file the server edits. Without the credential the
+    // route is not mounted and the declaration set stays exactly what config
+    // made it.
+    pdppDeclarations: pdppAuth
+      ? {
+          registry: pdppAuth.declarationRegistry,
+          supportedConnectors: pdppAuth.supportedConnectors,
+          operatorToken: accessToken,
+        }
+      : undefined,
     pdpp: pdppRecords,
     // The SAME stable delegate the download worker was given above, not a
     // second importer: both arrival routes must resolve to one importer over
