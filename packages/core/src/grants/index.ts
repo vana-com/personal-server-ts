@@ -29,6 +29,8 @@ export type {
 // identity; adds no field to any signed struct.
 export {
   createPdppGrantBinding,
+  grantVersionStillAuthorizes,
+  isValidGrantVersion,
   samePermission,
   verifyPdppGrantBinding,
   type ChainPermissionRef,
@@ -38,6 +40,7 @@ export {
   type VerifyBindingInput,
 } from "./pdpp-binding.js";
 export {
+  assertWritableGrantVersion,
   bindingsAgree,
   createInMemoryPdppGrantBindingStore,
   permissionKey,

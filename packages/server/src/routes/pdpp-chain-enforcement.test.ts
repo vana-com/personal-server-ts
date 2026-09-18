@@ -117,6 +117,7 @@ function chainGrant(
     granteeId: BUILDER_ID,
     revokedAt: null,
     expiresAt: null,
+    grantVersion: "1",
     ...overrides,
   } as GatewayGrantResponse;
 }
@@ -127,7 +128,7 @@ function bindingStore(initial?: PdppGrantBinding): PdppGrantBindingStore {
   if (initial) byGrant.set(initial.pdppGrantId, initial);
   return {
     getByPdppGrantId: (id) => byGrant.get(id) ?? null,
-    getByPermission: () => null,
+    getBindingsForPermission: () => [],
     putBinding: (b) => byGrant.set(b.pdppGrantId, b),
   };
 }

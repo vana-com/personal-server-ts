@@ -24,6 +24,7 @@ function makeBinding(
     granteeAddress: "0x00000000000000000000000000000000000000C1",
     pdppClientId: "client-app-1",
     granteeId: "0x00000000000000000000000000000000000000C1",
+    grantVersion: "1",
     boundAt: "2026-09-17T10:00:00.000Z",
     ...overrides,
   });
@@ -52,14 +53,14 @@ describe("createSqlitePdppGrantBindingStore", () => {
     store.putBinding(binding);
 
     expect(store.getByPdppGrantId("pdpp-grant-1")).toEqual(binding);
-    expect(store.getByPermission(PERMISSION)).toEqual(binding);
+    expect(store.getBindingsForPermission(PERMISSION)).toEqual([binding]);
   });
 
-  it("returns null for an unknown binding rather than throwing", () => {
+  it("returns null / empty for an unknown binding rather than throwing", () => {
     const db = new Database(":memory:");
     const store = createSqlitePdppGrantBindingStore(db);
     expect(store.getByPdppGrantId("nope")).toBeNull();
-    expect(store.getByPermission(PERMISSION)).toBeNull();
+    expect(store.getBindingsForPermission(PERMISSION)).toEqual([]);
   });
 
   it("is idempotent for an identical re-put", () => {
@@ -107,12 +108,12 @@ describe("createSqlitePdppGrantBindingStore", () => {
     store.putBinding(makeBinding());
 
     expect(
-      store.getByPermission({
+      store.getBindingsForPermission({
         ...PERMISSION,
         contractAddress:
           PERMISSION.contractAddress.toLowerCase() as `0x${string}`,
       }),
-    ).toEqual(makeBinding());
+    ).toEqual([makeBinding()]);
   });
 
   it("rejects a conflicting rewrite for the same PDPP grant id, with no partial row left behind", () => {
@@ -140,21 +141,93 @@ describe("createSqlitePdppGrantBindingStore", () => {
     expect(count.c).toBe(1);
   });
 
-  it("rejects a conflicting rewrite for the same permission, with no partial row left behind", () => {
+  it("rejects a re-put of the same PDPP grant id claiming a different grantVersion", () => {
     const db = new Database(":memory:");
     const store = createSqlitePdppGrantBindingStore(db);
-    store.putBinding(makeBinding());
+    store.putBinding(makeBinding({ grantVersion: "1" }));
 
     expectFailure(
-      () => store.putBinding(makeBinding({ pdppGrantId: "pdpp-grant-2" })),
-      /different binding already exists for this permission/i,
+      () => store.putBinding(makeBinding({ grantVersion: "2" })),
+      /different binding already exists for this PDPP grant/i,
     );
 
-    expect(store.getByPermission(PERMISSION)?.pdppGrantId).toBe("pdpp-grant-1");
+    expect(store.getByPdppGrantId("pdpp-grant-1")?.grantVersion).toBe("1");
     const count = db
       .prepare("SELECT COUNT(*) as c FROM pdpp_grant_bindings")
       .get() as { c: number };
     expect(count.c).toBe(1);
+  });
+
+  it("rejects a malformed grantVersion at write time", () => {
+    const db = new Database(":memory:");
+    const store = createSqlitePdppGrantBindingStore(db);
+
+    expectFailure(
+      () => store.putBinding(makeBinding({ grantVersion: "01" })),
+      /grantVersion/i,
+    );
+    expectFailure(
+      () => store.putBinding(makeBinding({ grantVersion: "0" })),
+      /grantVersion/i,
+    );
+    expectFailure(
+      () => store.putBinding(makeBinding({ grantVersion: "-1" })),
+      /grantVersion/i,
+    );
+
+    const count = db
+      .prepare("SELECT COUNT(*) as c FROM pdpp_grant_bindings")
+      .get() as { c: number };
+    expect(count.c).toBe(0);
+  });
+
+  it("rejects a null grantVersion on a new write — null is only readable back from a preserved legacy row", () => {
+    const db = new Database(":memory:");
+    const store = createSqlitePdppGrantBindingStore(db);
+
+    expectFailure(
+      () => store.putBinding(makeBinding({ grantVersion: null })),
+      /grantVersion must be a positive decimal uint256 string/i,
+    );
+
+    const count = db
+      .prepare("SELECT COUNT(*) as c FROM pdpp_grant_bindings")
+      .get() as { c: number };
+    expect(count.c).toBe(0);
+  });
+
+  it("rejects a runtime-numeric grantVersion on a new write, despite the string type", () => {
+    const db = new Database(":memory:");
+    const store = createSqlitePdppGrantBindingStore(db);
+
+    expectFailure(
+      () =>
+        store.putBinding(makeBinding({ grantVersion: 1 as unknown as string })),
+      /grantVersion must be a positive decimal uint256 string/i,
+    );
+
+    const count = db
+      .prepare("SELECT COUNT(*) as c FROM pdpp_grant_bindings")
+      .get() as { c: number };
+    expect(count.c).toBe(0);
+  });
+
+  it("two distinct grants at two different versions coexist on one permission", () => {
+    const db = new Database(":memory:");
+    const store = createSqlitePdppGrantBindingStore(db);
+    const first = makeBinding({ grantVersion: "1" });
+    const second = makeBinding({
+      pdppGrantId: "pdpp-grant-2",
+      grantVersion: "2",
+    });
+    store.putBinding(first);
+    store.putBinding(second);
+
+    expect(store.getBindingsForPermission(PERMISSION)).toEqual([first, second]);
+    const count = db
+      .prepare("SELECT COUNT(*) as c FROM pdpp_grant_bindings")
+      .get() as { c: number };
+    expect(count.c).toBe(2);
   });
 
   it("does not mirror any revocation status field", () => {
@@ -177,9 +250,9 @@ describe("createSqlitePdppGrantBindingStore", () => {
       permission: { ...PERMISSION, chainId: 1480 },
     });
     expect(() => store.putBinding(otherChain)).not.toThrow();
-    expect(store.getByPermission({ ...PERMISSION, chainId: 1480 })).toEqual(
-      otherChain,
-    );
+    expect(
+      store.getBindingsForPermission({ ...PERMISSION, chainId: 1480 }),
+    ).toEqual([otherChain]);
 
     // Same permissionId, same chain, different contract — also distinct.
     const otherContract = makeBinding({
@@ -206,7 +279,9 @@ describe("createSqlitePdppGrantBindingStore", () => {
       const db2 = new Database(dbPath);
       const store2 = createSqlitePdppGrantBindingStore(db2);
       expect(store2.getByPdppGrantId("pdpp-grant-1")).toEqual(makeBinding());
-      expect(store2.getByPermission(PERMISSION)).toEqual(makeBinding());
+      expect(store2.getBindingsForPermission(PERMISSION)).toEqual([
+        makeBinding(),
+      ]);
       db2.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -241,6 +316,62 @@ describe("createSqlitePdppGrantBindingStore", () => {
       content: "hi",
     });
     recordStore.close();
+  });
+
+  it("migration preserves a pre-existing legacy row, retrievable but with a null grantVersion", () => {
+    // Simulate a database created by the pre-migration build: only the
+    // original columns exist, and permission_key carried a UNIQUE index.
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE pdpp_grant_bindings_schema_version (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        version INTEGER NOT NULL
+      );
+      INSERT INTO pdpp_grant_bindings_schema_version (id, version) VALUES (1, 1);
+      CREATE TABLE pdpp_grant_bindings (
+        pdpp_grant_id TEXT PRIMARY KEY,
+        permission_key TEXT NOT NULL UNIQUE,
+        chain_id INTEGER NOT NULL,
+        contract_address TEXT NOT NULL,
+        permission_id TEXT NOT NULL,
+        owner_address TEXT NOT NULL,
+        grantee_address TEXT NOT NULL,
+        pdpp_client_id TEXT NOT NULL,
+        grantee_id TEXT NOT NULL,
+        bound_at TEXT NOT NULL
+      );
+      INSERT INTO pdpp_grant_bindings
+        (pdpp_grant_id, permission_key, chain_id, contract_address, permission_id,
+         owner_address, grantee_address, pdpp_client_id, grantee_id, bound_at)
+      VALUES
+        ('pdpp-grant-legacy', '14800:0xd54523048add05b4d734afae7c68324ebb7373ef:42', 14800,
+         '0xD54523048AdD05b4d734aFaE7C68324Ebb7373eF', '42',
+         '0x00000000000000000000000000000000000000AA',
+         '0x00000000000000000000000000000000000000C1',
+         'client-app-1', '0x00000000000000000000000000000000000000C1',
+         '2026-01-01T00:00:00.000Z');
+    `);
+
+    const store = createSqlitePdppGrantBindingStore(db);
+
+    const legacy = store.getByPdppGrantId("pdpp-grant-legacy");
+    expect(legacy).not.toBeNull();
+    expect(legacy?.grantVersion).toBeNull();
+    expect(store.getBindingsForPermission(PERMISSION)).toEqual([legacy]);
+
+    // The legacy row cannot authorize anything by itself — that is exercised
+    // by `grantVersionStillAuthorizes`/`verifyPdppGrantBinding` in
+    // pdpp-binding.test.ts, which denies a null retained version. This test
+    // only proves the migration keeps the row inspectable, not that it can
+    // acquire an invented version: a fresh put for the same identity but a
+    // real version must still be rejected as a conflicting rewrite.
+    expectFailure(
+      () =>
+        store.putBinding(
+          makeBinding({ pdppGrantId: "pdpp-grant-legacy", grantVersion: "1" }),
+        ),
+      /different binding already exists for this PDPP grant/i,
+    );
   });
 
   it("refuses to open a database with a newer schema version than this build supports", () => {

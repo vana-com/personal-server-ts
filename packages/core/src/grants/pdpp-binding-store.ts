@@ -30,6 +30,7 @@
 import { InvalidSignatureError } from "../errors/catalog.js";
 
 import {
+  isValidGrantVersion,
   samePermission,
   type ChainPermissionRef,
   type PdppGrantBinding,
@@ -50,8 +51,17 @@ export interface PdppGrantBindingStore {
   putBinding(binding: PdppGrantBinding): void;
   /** Look up by the PDPP grant id (the consent artifact). */
   getByPdppGrantId(pdppGrantId: string): PdppGrantBinding | null;
-  /** Look up by chain permission identity. */
-  getByPermission(permission: ChainPermissionRef): PdppGrantBinding | null;
+  /**
+   * All bindings recorded against a chain permission, oldest first.
+   *
+   * Plural and non-unique on purpose: distinct PDPP grants can legitimately
+   * bind to the same permission over time (e.g. one consent superseding
+   * another at the chain level), and each retains its own observed
+   * `grantVersion`. Returning a single "the" binding here would silently
+   * pick one and hide the others — callers that need "is any binding for
+   * this permission still live" must check every entry themselves.
+   */
+  getBindingsForPermission(permission: ChainPermissionRef): PdppGrantBinding[];
 }
 
 /**
@@ -82,12 +92,25 @@ export function bindingsAgree(
     a.ownerAddress.toLowerCase() === b.ownerAddress.toLowerCase() &&
     a.granteeAddress.toLowerCase() === b.granteeAddress.toLowerCase() &&
     a.granteeId.toLowerCase() === b.granteeId.toLowerCase() &&
-    a.pdppClientId === b.pdppClientId
+    a.pdppClientId === b.pdppClientId &&
+    a.grantVersion === b.grantVersion
   );
 }
 
 export function permissionKey(p: ChainPermissionRef): string {
   return `${p.chainId}:${p.contractAddress.toLowerCase()}:${p.permissionId}`;
+}
+
+/** New bindings require a version; only migrated rows may retain null. */
+export function assertWritableGrantVersion(binding: PdppGrantBinding): void {
+  if (!isValidGrantVersion(binding.grantVersion)) {
+    throw new InvalidSignatureError({
+      reason:
+        "grantVersion must be a positive decimal uint256 string for a new binding; null is reserved for a preserved legacy row",
+      pdppGrantId: binding.pdppGrantId,
+      grantVersion: binding.grantVersion,
+    });
+  }
 }
 
 /**
@@ -101,40 +124,43 @@ export function permissionKey(p: ChainPermissionRef): string {
  */
 export function createInMemoryPdppGrantBindingStore(): PdppGrantBindingStore {
   const byGrantId = new Map<string, PdppGrantBinding>();
-  const byPermission = new Map<string, PdppGrantBinding>();
+  const byPermission = new Map<string, PdppGrantBinding[]>();
 
   return {
     putBinding(binding: PdppGrantBinding): void {
       const existingByGrant = byGrantId.get(binding.pdppGrantId);
-      if (existingByGrant && !bindingsAgree(existingByGrant, binding)) {
-        throw new InvalidSignatureError({
-          reason: "A different binding already exists for this PDPP grant id",
-          pdppGrantId: binding.pdppGrantId,
-        });
+      if (existingByGrant) {
+        if (!bindingsAgree(existingByGrant, binding)) {
+          throw new InvalidSignatureError({
+            reason: "A different binding already exists for this PDPP grant id",
+            pdppGrantId: binding.pdppGrantId,
+          });
+        }
+        return;
       }
+
+      assertWritableGrantVersion(binding);
 
       const key = permissionKey(binding.permission);
-      const existingByPermission = byPermission.get(key);
-      if (
-        existingByPermission &&
-        !bindingsAgree(existingByPermission, binding)
-      ) {
-        throw new InvalidSignatureError({
-          reason: "A different binding already exists for this permission",
-          permission: key,
-        });
-      }
-
+      const list = byPermission.get(key) ?? [];
+      list.push(binding);
+      byPermission.set(key, list);
       byGrantId.set(binding.pdppGrantId, binding);
-      byPermission.set(key, binding);
     },
 
     getByPdppGrantId(pdppGrantId: string): PdppGrantBinding | null {
       return byGrantId.get(pdppGrantId) ?? null;
     },
 
-    getByPermission(permission: ChainPermissionRef): PdppGrantBinding | null {
-      return byPermission.get(permissionKey(permission)) ?? null;
+    getBindingsForPermission(
+      permission: ChainPermissionRef,
+    ): PdppGrantBinding[] {
+      const list = byPermission.get(permissionKey(permission)) ?? [];
+      return [...list].sort(
+        (a, b) =>
+          a.boundAt.localeCompare(b.boundAt) ||
+          a.pdppGrantId.localeCompare(b.pdppGrantId),
+      );
     },
   };
 }

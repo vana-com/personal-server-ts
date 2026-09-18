@@ -11,6 +11,8 @@ import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
 
 import {
   createPdppGrantBinding,
+  grantVersionStillAuthorizes,
+  isValidGrantVersion,
   samePermission,
   verifyPdppGrantBinding,
   type ChainPermissionRef,
@@ -81,6 +83,20 @@ function chainGrant(
 }
 
 /**
+ * A chain grant whose `grantVersion` is some untrusted runtime value the SDK
+ * type says can't happen (`number`, `null`, `undefined`) — simulating a
+ * gateway response that doesn't actually honor its own declared type.
+ */
+function chainGrantWithRawGrantVersion(
+  grantVersion: unknown,
+): GatewayGrantResponse {
+  return {
+    ...chainGrant(),
+    grantVersion,
+  } as unknown as GatewayGrantResponse;
+}
+
+/**
  * Assert a call fails with a specific catalog error AND a specific reason.
  *
  * `ProtocolError.message` is a fixed catalog string ("Invalid signature"),
@@ -128,6 +144,50 @@ describe("createPdppGrantBinding", () => {
     // The app's EXISTING grantee wallet is carried through unchanged.
     expect(binding.granteeAddress).toBe(GRANTEE);
     expect(binding.pdppClientId).toBe("client-app-1");
+    expect(binding.grantVersion).toBe("1");
+  });
+
+  it("throws when the chain grant's grantVersion is malformed", () => {
+    // A new binding must pin a real version; `null` is reserved for a
+    // legacy row a migration preserved, never for something created here.
+    expectFailure(
+      () =>
+        makeBinding({
+          chainGrant: chainGrant({ grantVersion: "not-a-number" }),
+        }),
+      "INVALID_SIGNATURE",
+      /grantVersion is missing or malformed/i,
+    );
+  });
+
+  it("throws when the chain grant's grantVersion is undefined at runtime", () => {
+    expectFailure(
+      () =>
+        makeBinding({
+          chainGrant: chainGrantWithRawGrantVersion(undefined),
+        }),
+      "INVALID_SIGNATURE",
+      /grantVersion is missing or malformed/i,
+    );
+  });
+
+  it("throws when the chain grant's grantVersion is null at runtime", () => {
+    expectFailure(
+      () => makeBinding({ chainGrant: chainGrantWithRawGrantVersion(null) }),
+      "INVALID_SIGNATURE",
+      /grantVersion is missing or malformed/i,
+    );
+  });
+
+  it("throws when the chain grant's grantVersion is a runtime number, despite the string type", () => {
+    // The SDK types `grantVersion: string`, but that is not enforced over
+    // the wire. A JSON payload can carry a bare number; `isValidGrantVersion`
+    // must reject it via `typeof`, not silently accept it through coercion.
+    expectFailure(
+      () => makeBinding({ chainGrant: chainGrantWithRawGrantVersion(1) }),
+      "INVALID_SIGNATURE",
+      /grantVersion is missing or malformed/i,
+    );
   });
 
   it("records no revocation status at all", () => {
@@ -302,6 +362,87 @@ describe("verifyPdppGrantBinding", () => {
     );
   });
 
+  it("fails when the live grantVersion is newer than the bound one (re-registration since binding)", () => {
+    // A newer version means the grant was re-registered since this binding
+    // was verified — including possibly to clear a revocation. This binding
+    // never observed that re-registration, so it must not vouch for it.
+    expectFailure(
+      () =>
+        verifyPdppGrantBinding({
+          ...base,
+          chainGrant: chainGrant({ grantVersion: "2" }),
+        }),
+      "INVALID_SIGNATURE",
+      /version no longer matches/i,
+    );
+  });
+
+  it("fails when the live grantVersion is older than the bound one", () => {
+    expectFailure(
+      () =>
+        verifyPdppGrantBinding({
+          ...base,
+          chainGrant: chainGrant({ grantVersion: "0" }),
+        }),
+      "INVALID_SIGNATURE",
+      /version no longer matches/i,
+    );
+  });
+
+  it("fails when the binding has no retained version (legacy row)", () => {
+    const legacyBinding = { ...base.binding, grantVersion: null };
+    expectFailure(
+      () => verifyPdppGrantBinding({ ...base, binding: legacyBinding }),
+      "INVALID_SIGNATURE",
+      /version no longer matches/i,
+    );
+  });
+
+  it("fails when the live grantVersion is malformed", () => {
+    expectFailure(
+      () =>
+        verifyPdppGrantBinding({
+          ...base,
+          chainGrant: chainGrant({ grantVersion: "01" }),
+        }),
+      "INVALID_SIGNATURE",
+      /version no longer matches/i,
+    );
+  });
+
+  it("fails when the live grantVersion is a runtime number, despite the string type", () => {
+    expectFailure(
+      () =>
+        verifyPdppGrantBinding({
+          ...base,
+          chainGrant: chainGrantWithRawGrantVersion(1),
+        }),
+      "INVALID_SIGNATURE",
+      /version no longer matches/i,
+    );
+  });
+
+  it("fails when the live grantVersion is null or undefined at runtime", () => {
+    expectFailure(
+      () =>
+        verifyPdppGrantBinding({
+          ...base,
+          chainGrant: chainGrantWithRawGrantVersion(null),
+        }),
+      "INVALID_SIGNATURE",
+      /version no longer matches/i,
+    );
+    expectFailure(
+      () =>
+        verifyPdppGrantBinding({
+          ...base,
+          chainGrant: chainGrantWithRawGrantVersion(undefined),
+        }),
+      "INVALID_SIGNATURE",
+      /version no longer matches/i,
+    );
+  });
+
   it("rejects builder-id drift despite the correct request signer", () => {
     // Regression proof: the old code compared the live grant's `granteeId`
     // against `binding.granteeAddress` (a wallet). Since `binding.granteeId`
@@ -317,6 +458,59 @@ describe("verifyPdppGrantBinding", () => {
       "INVALID_SIGNATURE",
       /no longer matches the bound grantee/i,
     );
+  });
+});
+
+describe("isValidGrantVersion", () => {
+  it.each(["1", "42", String(2n ** 256n - 1n)])("accepts %s", (v) =>
+    expect(isValidGrantVersion(v)).toBe(true),
+  );
+
+  it.each(["0", "-1", "01", "1.5", "abc", "", String(2n ** 256n)])(
+    "rejects %s",
+    (v) => expect(isValidGrantVersion(v)).toBe(false),
+  );
+
+  it.each([1, 42, true, false, null, undefined, {}, [], 1n])(
+    // Runtime values the `string` type says can't happen but the wire can
+    // still deliver. A bare `typeof` check must reject these before the
+    // regex/BigInt coercion gets a chance to accept them — this is the
+    // exact case a naive implementation gets wrong: `RegExp.test(1)` and
+    // `BigInt(1)` both happily coerce a number, so without the `typeof`
+    // guard `isValidGrantVersion(1)` would wrongly return `true`.
+    "rejects the non-string runtime value %s",
+    (v) => expect(isValidGrantVersion(v)).toBe(false),
+  );
+});
+
+describe("grantVersionStillAuthorizes", () => {
+  it("authorizes an exact match", () => {
+    expect(grantVersionStillAuthorizes("3", "3")).toBe(true);
+  });
+
+  it("denies null retained version", () => {
+    expect(grantVersionStillAuthorizes(null, "3")).toBe(false);
+  });
+
+  it("denies a newer live version", () => {
+    expect(grantVersionStillAuthorizes("3", "4")).toBe(false);
+  });
+
+  it("denies an older live version", () => {
+    expect(grantVersionStillAuthorizes("3", "2")).toBe(false);
+  });
+
+  it("denies a malformed live version even if it matches as a string", () => {
+    expect(grantVersionStillAuthorizes("01", "01")).toBe(false);
+  });
+
+  it("denies a runtime-numeric live version, despite the string type", () => {
+    expect(grantVersionStillAuthorizes("1", 1)).toBe(false);
+  });
+
+  it("denies a null or undefined live version", () => {
+    expect(grantVersionStillAuthorizes("1", null)).toBe(false);
+    expect(grantVersionStillAuthorizes("1", undefined)).toBe(false);
   });
 });
 
@@ -354,19 +548,57 @@ describe("PdppGrantBindingStore", () => {
     store.putBinding(binding);
 
     expect(store.getByPdppGrantId("pdpp-grant-1")).toEqual(binding);
-    expect(store.getByPermission(PERMISSION)).toEqual(binding);
+    expect(store.getBindingsForPermission(PERMISSION)).toEqual([binding]);
   });
 
-  it("returns null for an unknown binding rather than throwing", () => {
+  it("returns null / empty for an unknown binding rather than throwing", () => {
     const store = createInMemoryPdppGrantBindingStore();
     expect(store.getByPdppGrantId("nope")).toBeNull();
-    expect(store.getByPermission(PERMISSION)).toBeNull();
+    expect(store.getBindingsForPermission(PERMISSION)).toEqual([]);
   });
 
   it("is idempotent for an identical re-put", () => {
     const store = createInMemoryPdppGrantBindingStore();
     store.putBinding(makeBinding());
     expect(() => store.putBinding(makeBinding())).not.toThrow();
+  });
+
+  it("rejects a new binding with a null grantVersion", () => {
+    // `createPdppGrantBinding` already refuses to produce this; this proves
+    // the store enforces it independently for a hand-built binding too —
+    // `null` must never be creatable through `putBinding`, only readable
+    // back from a preserved legacy row.
+    const store = createInMemoryPdppGrantBindingStore();
+    expectFailure(
+      () => store.putBinding({ ...makeBinding(), grantVersion: null }),
+      "INVALID_SIGNATURE",
+      /grantVersion must be a positive decimal uint256 string/i,
+    );
+    expect(store.getByPdppGrantId("pdpp-grant-1")).toBeNull();
+  });
+
+  it("rejects a new binding with a malformed grantVersion", () => {
+    const store = createInMemoryPdppGrantBindingStore();
+    expectFailure(
+      () => store.putBinding({ ...makeBinding(), grantVersion: "01" }),
+      "INVALID_SIGNATURE",
+      /grantVersion must be a positive decimal uint256 string/i,
+    );
+    expect(store.getByPdppGrantId("pdpp-grant-1")).toBeNull();
+  });
+
+  it("rejects a new binding with a runtime-numeric grantVersion, despite the string type", () => {
+    const store = createInMemoryPdppGrantBindingStore();
+    expectFailure(
+      () =>
+        store.putBinding({
+          ...makeBinding(),
+          grantVersion: 1 as unknown as string,
+        }),
+      "INVALID_SIGNATURE",
+      /grantVersion must be a positive decimal uint256 string/i,
+    );
+    expect(store.getByPdppGrantId("pdpp-grant-1")).toBeNull();
   });
 
   it("refuses to follow a rotated grantee wallet onto an existing grant", () => {
@@ -448,14 +680,37 @@ describe("PdppGrantBindingStore", () => {
     );
   });
 
-  it("refuses to rebind an existing permission to a different PDPP grant", () => {
+  it("rejects a re-put of the same PDPP grant id at a different retained grantVersion", () => {
+    // The retained grantVersion is part of what the binding asserts. A
+    // second put for the same grant id claiming a different version is not
+    // a benign re-put — it is a conflicting claim about what was verified.
     const store = createInMemoryPdppGrantBindingStore();
-    store.putBinding(makeBinding());
+    store.putBinding(
+      makeBinding({ chainGrant: chainGrant({ grantVersion: "1" }) }),
+    );
 
     expectFailure(
-      () => store.putBinding(makeBinding({ pdppGrantId: "pdpp-grant-2" })),
+      () =>
+        store.putBinding(
+          makeBinding({ chainGrant: chainGrant({ grantVersion: "2" }) }),
+        ),
       "INVALID_SIGNATURE",
-      /different binding already exists for this permission/i,
+      /different binding already exists for this PDPP grant/i,
     );
+  });
+
+  it("lets two distinct PDPP grants bind the same permission at the same version", () => {
+    // A single chain permission can be the subject of more than one PDPP
+    // consent over time (e.g. re-consent after the app re-requests access).
+    // Both bindings must coexist and remain independently retrievable.
+    const store = createInMemoryPdppGrantBindingStore();
+    const first = makeBinding();
+    const second = makeBinding({ pdppGrantId: "pdpp-grant-2" });
+    store.putBinding(first);
+    store.putBinding(second);
+
+    expect(store.getByPdppGrantId("pdpp-grant-1")).toEqual(first);
+    expect(store.getByPdppGrantId("pdpp-grant-2")).toEqual(second);
+    expect(store.getBindingsForPermission(PERMISSION)).toEqual([first, second]);
   });
 });

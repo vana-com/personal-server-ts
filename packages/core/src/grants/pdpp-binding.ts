@@ -79,8 +79,32 @@ export interface PdppGrantBinding {
    * NOT the wallet address above — see the module doc.
    */
   granteeId: string;
+  /** Gateway version verified at binding time. Later versions invalidate this consent.
+   * `null` denotes a preserved legacy row and always denies access.
+   */
+  grantVersion: string | null;
   /** When the binding was recorded (ISO 8601). Provenance, not status. */
   boundAt: string;
+}
+
+/** Gateway versions are positive decimal uint256 strings without leading zeros. */
+const POSITIVE_DECIMAL_UINT256 = /^(0|[1-9][0-9]*)$/;
+const UINT256_MAX = 2n ** 256n - 1n;
+
+export function isValidGrantVersion(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  if (!POSITIVE_DECIMAL_UINT256.test(value) || value === "0") return false;
+  return BigInt(value) <= UINT256_MAX;
+}
+
+/** Re-registration can clear revocation, so even a newer version requires new consent. */
+export function grantVersionStillAuthorizes(
+  retainedVersion: string | null,
+  liveVersion: unknown,
+): boolean {
+  if (retainedVersion === null) return false;
+  if (!isValidGrantVersion(liveVersion)) return false;
+  return retainedVersion === liveVersion;
 }
 
 /** Case-insensitive comparison for hex-ish strings (addresses or bytes32 ids). */
@@ -138,7 +162,11 @@ export interface CreateBindingInput {
  *  - a chain grant whose `granteeId` is not the resolved builder's id
  *    (binding a grant issued to a *different* app),
  *  - a chain grant that is already revoked (never record a dead grant as live),
- *  - a chain grant whose id does not match the permission being bound.
+ *  - a chain grant whose id does not match the permission being bound,
+ *  - a chain grant whose `grantVersion` is missing or not a valid positive
+ *    decimal uint256 string (a new binding must pin a real version; `null`
+ *    is reserved for legacy rows a schema migration preserved, never for
+ *    something created through this function).
  */
 export function createPdppGrantBinding(
   input: CreateBindingInput,
@@ -194,6 +222,14 @@ export function createPdppGrantBinding(
     throw new GrantRevokedError({ grantId: chainGrant.id });
   }
 
+  if (!isValidGrantVersion(chainGrant.grantVersion)) {
+    throw new InvalidSignatureError({
+      reason: "Chain grant grantVersion is missing or malformed",
+      grantId: chainGrant.id,
+      actual: chainGrant.grantVersion,
+    });
+  }
+
   return Object.freeze({
     pdppGrantId: input.pdppGrantId,
     permission,
@@ -201,6 +237,7 @@ export function createPdppGrantBinding(
     granteeAddress,
     pdppClientId: input.pdppClientId,
     granteeId: chainGrant.granteeId,
+    grantVersion: chainGrant.grantVersion,
     boundAt: (input.now ?? new Date()).toISOString(),
   });
 }
@@ -318,6 +355,16 @@ export function verifyPdppGrantBinding(input: VerifyBindingInput): void {
 
   if (chainGrant.revokedAt !== null && chainGrant.revokedAt !== undefined) {
     throw new GrantRevokedError({ grantId: chainGrant.id });
+  }
+
+  if (
+    !grantVersionStillAuthorizes(binding.grantVersion, chainGrant.grantVersion)
+  ) {
+    throw new InvalidSignatureError({
+      reason: "Chain grant version no longer matches the bound grantVersion",
+      expected: binding.grantVersion,
+      actual: chainGrant.grantVersion,
+    });
   }
 
   // The live chain grant must still agree with the binding on both parties.
