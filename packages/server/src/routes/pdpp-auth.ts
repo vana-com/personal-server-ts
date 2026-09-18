@@ -1,7 +1,7 @@
 /**
  * PDPP Core v0.1.0 Authorization Server HTTP surface.
  *
- * Six endpoints under `/pdpp/v1`:
+ * The endpoints under `/pdpp/v1`:
  *
  *   POST /authorize                      — accept an RFC 9396 selection request
  *   GET  /authorize/:session_id/review   — the owner's consent review model
@@ -9,6 +9,7 @@
  *   POST /authorize/:session_id/deny     — authenticated owner denial
  *   POST /token                          — code redemption + refresh rotation
  *   POST /introspect                     — RFC 7662 introspection
+ *   GET  /grants                         — the owner's grants, with status
  *   POST /revoke                         — owner-initiated grant revocation
  *
  * This is deliberately a NEW surface rather than an extension of
@@ -58,10 +59,12 @@ import {
   validateRedirectUri,
   validateSelectionRequest,
   type DeclarationSnapshot,
+  type GrantStatus,
   type InstanceInventory,
   type PdppAuthStore,
   type RegisteredRedirectPolicy,
   type SelectionRequest,
+  type StoredGrant,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { createWeb3AuthMiddleware } from "../middleware/web3-auth.js";
 import { createOwnerCheckMiddleware } from "../middleware/owner-check.js";
@@ -727,28 +730,59 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   });
 
   /**
+   * List the owner's PDPP grants, newest first, with each one's status.
+   *
+   * Sits at `/grants` rather than under `/owner` because `/owner/*` is the
+   * wallet-proof-guarded path that mints owner tokens, while this route
+   * authenticates the same way `/revoke` does — with the owner token that
+   * exchange produced. It is the read half of the same owner grant-lifecycle
+   * pair, so it belongs beside its writer, not beside the credential mint.
+   *
+   * The projection is exactly the review's `existing_grants` shape plus
+   * `status` and `client_id`, so a surface that renders one can render the
+   * other. What it deliberately omits is everything that is authority or
+   * evidence rather than description: tokens, authorization codes, consent
+   * evidence and review digests. A grant list is for showing an owner what
+   * they have agreed to; none of those fields serve that, and each would turn
+   * a read-only listing into a credential leak.
+   *
+   * `status` widens `grantStatus` by one value the store models as a separate
+   * column: a `single_use` grant that has been redeemed reads `consumed`, not
+   * `active`, because it can never issue another token.
+   */
+  app.get("/grants", (c) => {
+    const caller = resolveOwner(c);
+    if (!caller.ok) return caller.response;
+
+    const clientFilter = c.req.query("client_id");
+    const now = new Date();
+    const grants = deps.store
+      .listGrantsForSubject(caller.subjectId)
+      .filter((stored) => !clientFilter || stored.clientId === clientFilter)
+      .map((stored) => ({
+        grant_id: stored.grant.grant_id,
+        client_id: stored.clientId,
+        status: listedGrantStatus(deps.store, stored, now),
+        issued_at: stored.grant.issued_at,
+        ...(stored.grant.expires_at && { expires_at: stored.grant.expires_at }),
+        access_mode: stored.grant.access_mode,
+        purpose_code: stored.grant.purpose_code,
+        streams: stored.grant.streams.map((s) => ({
+          name: s.name,
+          fields: s.fields,
+        })),
+      }));
+
+    return c.json({ grants }, 200, NO_STORE);
+  });
+
+  /**
    * Revoke a grant. Owner-authenticated, and scoped to the owner's own grants
    * — a valid owner token is not authority over another subject's grant.
    */
   app.post("/revoke", async (c) => {
-    const ownerToken = bearer(c);
-    if (!ownerToken) {
-      return errorResponse(
-        c,
-        401,
-        "unauthorized",
-        "an owner token is required",
-      );
-    }
-    const caller = deps.tokens.resolveToken(ownerToken);
-    if (!caller.active || caller.tokenKind !== "owner" || !caller.subjectId) {
-      return errorResponse(
-        c,
-        401,
-        "unauthorized",
-        "an active owner token is required",
-      );
-    }
+    const caller = resolveOwner(c);
+    if (!caller.ok) return caller.response;
 
     const body = await c.req.parseBody();
     const grantId = asString(body.grant_id);
@@ -770,7 +804,71 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     return c.json({ grant_id: grantId, status: "revoked" }, 200, NO_STORE);
   });
 
+  /**
+   * The single owner-token check the owner grant routes share.
+   *
+   * A client token is refused with the same 401 as no token at all: from the
+   * caller's side, holding the wrong kind of credential and holding none are
+   * the same answer, and distinguishing them would tell a client token holder
+   * that owner scope exists to be reached for.
+   */
+  function resolveOwner(
+    c: Context,
+  ):
+    | { ok: true; subjectId: string }
+    | { ok: false; response: ReturnType<typeof errorResponse> } {
+    const ownerToken = bearer(c);
+    if (!ownerToken) {
+      return {
+        ok: false,
+        response: errorResponse(
+          c,
+          401,
+          "unauthorized",
+          "an owner token is required",
+        ),
+      };
+    }
+    const caller = deps.tokens.resolveToken(ownerToken);
+    if (!caller.active || caller.tokenKind !== "owner" || !caller.subjectId) {
+      return {
+        ok: false,
+        response: errorResponse(
+          c,
+          401,
+          "unauthorized",
+          "an active owner token is required",
+        ),
+      };
+    }
+    return { ok: true, subjectId: caller.subjectId };
+  }
+
   return app;
+}
+
+/**
+ * The lifecycle value an owner should see for one grant.
+ *
+ * `grantStatus` answers active/expired/revoked. A redeemed `single_use` grant
+ * is none of those in the store's terms — it has not expired and nobody
+ * revoked it — yet it can never issue another token, so reporting it as
+ * "active" would tell the owner they still have live access they do not have.
+ */
+function listedGrantStatus(
+  store: PdppAuthStore,
+  stored: StoredGrant,
+  now: Date,
+): GrantStatus | "consumed" {
+  const status = store.grantStatus(stored, now);
+  if (
+    status === "active" &&
+    stored.grant.access_mode === "single_use" &&
+    stored.consumedAt
+  ) {
+    return "consumed";
+  }
+  return status;
 }
 
 function approvalStatus(code: string): 400 | 401 | 403 | 404 | 409 {

@@ -1345,3 +1345,258 @@ describe("redirect_uri validation (RFC 6749 §3.1.2, §10.6)", () => {
     expect(created.status).toBe(201);
   });
 });
+
+describe("GET /grants — the owner's own grants, with status", () => {
+  /**
+   * Seed a grant directly into the store so a test can pin a status the HTTP
+   * flow cannot produce on demand (expired, revoked, another subject's).
+   */
+  function seedGrant(overrides: {
+    grantId: string;
+    clientId: string;
+    subjectId?: string;
+    issuedAt?: string;
+    expiresAt?: string;
+    accessMode?: "continuous" | "single_use";
+    revoked?: boolean;
+  }) {
+    const subjectId = overrides.subjectId ?? OWNER;
+    const grant = {
+      version: "0.1.0",
+      grant_id: overrides.grantId,
+      issued_at: overrides.issuedAt ?? new Date().toISOString(),
+      ...(overrides.expiresAt && { expires_at: overrides.expiresAt }),
+      subject: { id: subjectId },
+      client: { client_id: overrides.clientId },
+      source: { kind: "connector" as const, id: snapshot.source_id },
+      source_declaration: { version: snapshot.version },
+      purpose_code: "https://pdpp.dev/purpose/personalization",
+      access_mode: overrides.accessMode ?? ("continuous" as const),
+      streams: [
+        {
+          name: "top_artists",
+          instance_ids: ["spotify-account-a"],
+          fields: ["id", "name"],
+        },
+      ],
+    };
+    store.insertGrantWithAuthCode({
+      grant,
+      subjectId,
+      reviewDigest: "seed-digest",
+      consentEvidence: { review_digest: "seed-digest" },
+      code: `pdpp_code_seed_${overrides.grantId}`,
+      authCode: {
+        grantId: overrides.grantId,
+        clientId: overrides.clientId,
+        redirectUri: REDIRECT,
+        codeChallenge: null,
+        codeChallengeMethod: null,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      },
+    });
+    if (overrides.revoked) store.revokeGrant(overrides.grantId);
+  }
+
+  type Listed = {
+    grant_id: string;
+    client_id: string;
+    status: string;
+    issued_at: string;
+    expires_at?: string;
+    access_mode: string;
+    purpose_code: string;
+    streams: Array<{ name: string; fields: string[] }>;
+  };
+
+  function listGrants(token: string | null, query = "") {
+    return app.request(`/pdpp/v1/grants${query}`, {
+      headers: token ? ownerAuth(token) : {},
+    });
+  }
+
+  it("lists the owner's grants with each one's status, newest first", async () => {
+    seedGrant({
+      grantId: "grant_active",
+      clientId: "music_recommendations",
+      issuedAt: new Date(Date.now() - 1_000).toISOString(),
+    });
+    seedGrant({
+      grantId: "grant_expired",
+      clientId: "music_recommendations",
+      issuedAt: new Date(Date.now() - 2_000).toISOString(),
+      expiresAt: new Date(Date.now() - 1_000).toISOString(),
+    });
+    seedGrant({
+      grantId: "grant_revoked",
+      clientId: "music_recommendations",
+      issuedAt: new Date(Date.now() - 3_000).toISOString(),
+      revoked: true,
+    });
+
+    const ownerToken = tokens.issueOwnerToken({
+      subjectId: OWNER,
+    }).access_token;
+    const response = await listGrants(ownerToken);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+
+    const { grants } = (await response.json()) as { grants: Listed[] };
+    // issued_at descending: the store orders, the route preserves it.
+    expect(grants.map((g) => g.grant_id)).toEqual([
+      "grant_active",
+      "grant_expired",
+      "grant_revoked",
+    ]);
+    expect(grants.map((g) => g.status)).toEqual([
+      "active",
+      "expired",
+      "revoked",
+    ]);
+
+    const [active] = grants;
+    expect(active.client_id).toBe("music_recommendations");
+    expect(active.access_mode).toBe("continuous");
+    expect(active.purpose_code).toBe(
+      "https://pdpp.dev/purpose/personalization",
+    );
+    expect(active.streams).toEqual([
+      { name: "top_artists", fields: ["id", "name"] },
+    ]);
+    // expires_at is present only when the grant has one.
+    expect(active).not.toHaveProperty("expires_at");
+    expect(grants[1].expires_at).toBeTruthy();
+  });
+
+  it("reports a consumed single_use grant as consumed, not active", async () => {
+    // Drive a real single_use flow: consumption happens atomically with the
+    // first token issuance, so only the wire path produces this state.
+    const { sessionId, ownerToken, digest } = await openSessionAndReview(
+      selectionBody({ access_mode: "single_use" }),
+    );
+    const approved = await post(
+      `/pdpp/v1/authorize/${sessionId}/approve`,
+      { review_digest: digest },
+      ownerAuth(ownerToken),
+    );
+    const { redirect_uri, grant_id } = (await approved.json()) as {
+      redirect_uri: string;
+      grant_id: string;
+    };
+
+    const beforeRedemption = (await (await listGrants(ownerToken)).json()) as {
+      grants: Listed[];
+    };
+    expect(
+      beforeRedemption.grants.find((g) => g.grant_id === grant_id)!.status,
+    ).toBe("active");
+
+    const redeemed = await postForm("/pdpp/v1/token", {
+      grant_type: "authorization_code",
+      code: new URL(redirect_uri).searchParams.get("code")!,
+      client_id: "music_recommendations",
+      redirect_uri: REDIRECT,
+      code_verifier: VERIFIER,
+    });
+    expect(redeemed.status).toBe(200);
+
+    const after = (await (await listGrants(ownerToken)).json()) as {
+      grants: Listed[];
+    };
+    expect(after.grants.find((g) => g.grant_id === grant_id)!.status).toBe(
+      "consumed",
+    );
+  });
+
+  it("filters to one client with client_id", async () => {
+    seedGrant({ grantId: "grant_music", clientId: "music_recommendations" });
+    seedGrant({ grantId: "grant_other", clientId: "other_client" });
+
+    const ownerToken = tokens.issueOwnerToken({
+      subjectId: OWNER,
+    }).access_token;
+    const response = await listGrants(
+      ownerToken,
+      "?client_id=music_recommendations",
+    );
+    expect(response.status).toBe(200);
+    const { grants } = (await response.json()) as { grants: Listed[] };
+    expect(grants.map((g) => g.grant_id)).toEqual(["grant_music"]);
+  });
+
+  it("refuses a request with no token", async () => {
+    seedGrant({ grantId: "grant_music", clientId: "music_recommendations" });
+    const response = await listGrants(null);
+    expect(response.status).toBe(401);
+    expect(await response.text()).not.toContain("grant_music");
+  });
+
+  it("refuses a client token — owner scope is not client scope", async () => {
+    const { sessionId, ownerToken, digest } = await openSessionAndReview();
+    const approved = await post(
+      `/pdpp/v1/authorize/${sessionId}/approve`,
+      { review_digest: digest },
+      ownerAuth(ownerToken),
+    );
+    const { redirect_uri } = (await approved.json()) as {
+      redirect_uri: string;
+    };
+    const issued = (await (
+      await postForm("/pdpp/v1/token", {
+        grant_type: "authorization_code",
+        code: new URL(redirect_uri).searchParams.get("code")!,
+        client_id: "music_recommendations",
+        redirect_uri: REDIRECT,
+        code_verifier: VERIFIER,
+      })
+    ).json()) as { access_token: string };
+
+    const response = await listGrants(issued.access_token);
+    expect(response.status).toBe(401);
+  });
+
+  it("never leaks another subject's grants", async () => {
+    seedGrant({ grantId: "grant_mine", clientId: "music_recommendations" });
+    seedGrant({
+      grantId: "grant_theirs",
+      clientId: "music_recommendations",
+      subjectId: OTHER_OWNER,
+    });
+
+    const ownerToken = tokens.issueOwnerToken({
+      subjectId: OWNER,
+    }).access_token;
+    const response = await listGrants(ownerToken);
+    const body = await response.text();
+    expect(body).toContain("grant_mine");
+    expect(body).not.toContain("grant_theirs");
+
+    // And the other subject sees only their own.
+    const theirToken = tokens.issueOwnerToken({
+      subjectId: OTHER_OWNER,
+    }).access_token;
+    const theirs = await (await listGrants(theirToken)).text();
+    expect(theirs).toContain("grant_theirs");
+    expect(theirs).not.toContain("grant_mine");
+  });
+
+  it("carries no tokens, consent evidence, review digests or codes", async () => {
+    seedGrant({ grantId: "grant_music", clientId: "music_recommendations" });
+    const ownerToken = tokens.issueOwnerToken({
+      subjectId: OWNER,
+    }).access_token;
+    const response = await listGrants(ownerToken);
+    const raw = await response.text();
+
+    for (const secret of [
+      "review_digest",
+      "seed-digest",
+      "consent_evidence",
+      "access_token",
+      "refresh_token",
+      "pdpp_code_",
+    ]) {
+      expect(raw).not.toContain(secret);
+    }
+  });
+});
