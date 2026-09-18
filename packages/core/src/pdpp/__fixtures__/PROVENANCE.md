@@ -28,8 +28,25 @@ independently by two lanes before being recorded here.
 | File                                | sha256 (exact bytes)                                               |
 | ----------------------------------- | ------------------------------------------------------------------ |
 | `instagram.source-declaration.json` | `e4a9d0cb262f6b43956d7ff9cf17dd8851f3be1e3c3fe059bc18f022a29fbce5` |
-| `github.source-declaration.json`    | `c08e321dcac20a77e5a7e52861fdd7de5def3725b8078f958d79189b059b67ed` |
+| `github.source-declaration.json`    | `00c64092177a2830f670bd2cab83eab788e0c23575ad26b5b5762064b97ab3bb` |
 | `youtube.source-declaration.json`   | `8292a2d3e3ab6ff2bbe87e3cbe7cb3efb719ee1ca7001be77c1724b12d68a046` |
+
+### GitHub declaration update, 2026-09-18
+
+`github.source-declaration.json` was re-copied from the producer when the
+GitHub Collection Profile's remaining streams gained retained declarations.
+It went from one stream to six: `user` (unchanged, byte-for-byte — diff the
+two revisions to confirm) plus `repositories`, `starred`, `issues`,
+`pull_requests` and `gists`. Every other top-level key is unchanged, so the
+whole diff is additive and the digest moved from `c08e321dcac2…` to
+`00c64092177a…` for that reason alone.
+
+The profile's seventh stream, `user_stats`, is **not** here. Its upstream
+`semantics` is `"append"`, which `parseDeclaration` rejects at the
+whole-document level (only `mutable_state` and `append_only` are admitted), so
+retaining it verbatim would unmount every GitHub stream including `user`.
+Resolving that needs the two specs to agree on the value, not a local edit —
+rewriting it to `append_only` here would put a claim in the producer's mouth.
 
 Verify with:
 

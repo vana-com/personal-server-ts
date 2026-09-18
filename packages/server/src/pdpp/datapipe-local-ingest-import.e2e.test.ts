@@ -106,7 +106,7 @@ const DOCUMENT_DIGEST = createHash("sha256")
  * fixture read above.
  */
 const PUBLISHED_DIGEST =
-  "c08e321dcac20a77e5a7e52861fdd7de5def3725b8078f958d79189b059b67ed";
+  "00c64092177a2830f670bd2cab83eab788e0c23575ad26b5b5762064b97ab3bb";
 
 const logger = pino({ level: "silent" });
 
