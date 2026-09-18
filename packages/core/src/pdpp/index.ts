@@ -90,6 +90,7 @@ export {
   mayIssueRefreshToken,
   PdppTokenService,
   toAuthorizationDetail,
+  toAuthorizationEntry,
 } from "./tokens.js";
 export type {
   TokenFailure,

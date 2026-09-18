@@ -442,6 +442,7 @@ export function fetchReview(input: {
     snapshot: session.snapshot,
     resolvedStreams: resolution.streams,
     omittedStreams: resolution.omittedStreams,
+    requestedStreams: resolution.requestedStreams,
     requester: session.requester,
     expiresAt: session.grant_expires_at,
     streamDescriptions: session.stream_descriptions,

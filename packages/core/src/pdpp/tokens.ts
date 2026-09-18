@@ -23,11 +23,14 @@ import {
   type StoredGrant,
 } from "./store.js";
 import {
+  isV02Grant,
   PDPP_DATA_ACCESS_TYPE,
+  PDPP_DATA_ACCESS_TYPE_V02,
   type AccessMode,
   type Grant,
   type InactiveReason,
   type PdppAuthorizationDetail,
+  type PdppAuthorizationEntry,
   type PdppIntrospectionResponse,
   type PdppTokenContext,
 } from "./types.js";
@@ -51,8 +54,13 @@ export interface TokenIssuanceResult {
    * response to return `authorization_details` as granted by the resource
    * owner and assigned to the access token — the same projection introspection
    * carries.
+   *
+   * One element per covered grant, each in its own revision's shape: a v0.1
+   * grant yields the v0.1 projection, a v0.2 grant yields `{ type, grant }`
+   * with the complete grant. v0.2 forbids a lossy summary, and the v0.1
+   * projection is one, so the two cannot share a shape.
    */
-  authorization_details: PdppAuthorizationDetail[];
+  authorization_details: PdppAuthorizationEntry[];
 }
 
 export type TokenFailureCode = "invalid_grant" | "invalid_request";
@@ -318,7 +326,7 @@ export class PdppTokenService {
         expires_in: expiresIn,
         ...(refreshToken && { refresh_token: refreshToken }),
         grant_id: grant.grant_id,
-        authorization_details: [toAuthorizationDetail(grant)],
+        authorization_details: [toAuthorizationEntry(grant)],
       },
     };
   }
@@ -438,7 +446,7 @@ export class PdppTokenService {
       grant_id: context.grant.grant_id,
       client_id: context.grant.client.client_id,
       // The complete resolved enforcement context, in one response (§9 item 18).
-      authorization_details: [toAuthorizationDetail(context.grant)],
+      authorization_details: [toAuthorizationEntry(context.grant)],
     };
   }
 
@@ -497,6 +505,30 @@ export class PdppTokenService {
  * entirely; retention is a policy commitment PDPP does not technically
  * enforce, so including it would invite an RS to act on it.
  */
+/**
+ * Project a grant onto the `authorization_details` element for *its own*
+ * revision.
+ *
+ * v0.1 gets the narrow enforcement projection below, unchanged. v0.2 gets
+ * `{ type, grant }` carrying the complete immutable grant, because v0.2 makes
+ * the result the client's source of truth and forbids substituting the
+ * original selection request or a lossy summary — and the v0.1 projection is
+ * precisely a lossy summary. It drops `retention`, `expires_at`, the resolved
+ * client identity, and the requested-vs-approved record, so a v0.2 client
+ * receiving it could not tell a narrowed grant from an unnarrowed one.
+ *
+ * Branching on the grant rather than on a caller-supplied flag is what keeps
+ * the two revisions from drifting: the same function serves the token response
+ * and introspection, so a client and an authenticated RS cannot be handed
+ * different facts about one grant.
+ */
+export function toAuthorizationEntry(grant: Grant): PdppAuthorizationEntry {
+  if (isV02Grant(grant)) {
+    return { type: PDPP_DATA_ACCESS_TYPE_V02, grant };
+  }
+  return toAuthorizationDetail(grant);
+}
+
 export function toAuthorizationDetail(grant: Grant): PdppAuthorizationDetail {
   return {
     type: PDPP_DATA_ACCESS_TYPE,

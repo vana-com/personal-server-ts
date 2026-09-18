@@ -29,6 +29,7 @@ import {
   type ClientClaims,
   type ClientDisplay,
   type DeclarationSnapshot,
+  type RequestedStream,
   type Retention,
   type SelectionRequest,
   type StreamGrant,
@@ -59,6 +60,27 @@ export interface ReviewStream {
   fields: string[];
   time_constraint?: { field: string; since?: string; until?: string };
   resources?: string[];
+  /**
+   * v0.2 consent-flow control. `optional` means the owner may remove this
+   * stream; the surface must not present it as compulsory.
+   */
+  necessity?: "required" | "optional";
+  /**
+   * v0.2: the fields and window the client asked for, before the owner's
+   * narrowing. The surface needs both ends to render a narrowing control at
+   * all — `fields` above is the current proposal, this is its ceiling.
+   */
+  requested_fields?: string[];
+  requested_time_range?: { since?: string; until?: string };
+  /**
+   * v0.2: the floor. A surface that lets the owner narrow below this is
+   * offering a choice that will refuse issuance, so it needs to know where
+   * the floor is in order to stop short of it — or to say why it cannot.
+   */
+  minimum?: {
+    fields?: string[];
+    time_range?: { since: string; until: string };
+  };
 }
 
 /**
@@ -239,6 +261,13 @@ export interface BuildReviewInput {
   resolvedStreams: StreamGrant[];
   /** v0.2: `resolveSelection`'s `omittedStreams`, bound into the digest. */
   omittedStreams?: string[];
+  /**
+   * v0.2: `resolveSelection`'s `requestedStreams`, the ceiling each retained
+   * stream was narrowed from. Rendering only — the resolved streams stay
+   * authoritative, and this stays out of the digest since it is a restatement
+   * of the request the session already pins, not a decision the owner makes.
+   */
+  requestedStreams?: RequestedStream[];
   requester: RequesterIdentity;
   /** AS-policy grant expiry, when the deployment sets one. */
   expiresAt?: string;
@@ -291,16 +320,25 @@ export function buildConsentReview(
       source: { kind: snapshot.source_kind, id: snapshot.source_id },
       source_declaration_version: snapshot.version,
       access_mode: request.access_mode,
-      streams: resolvedStreams.map((s) => ({
-        name: s.name,
-        ...(input.streamDescriptions?.[s.name] && {
-          description: input.streamDescriptions[s.name],
-        }),
-        instance_ids: s.instance_ids,
-        fields: s.fields,
-        ...(s.time_constraint && { time_constraint: s.time_constraint }),
-        ...(s.resources && { resources: s.resources }),
-      })),
+      streams: resolvedStreams.map((s) => {
+        const asked = input.requestedStreams?.find((r) => r.name === s.name);
+        return {
+          name: s.name,
+          ...(input.streamDescriptions?.[s.name] && {
+            description: input.streamDescriptions[s.name],
+          }),
+          instance_ids: s.instance_ids,
+          fields: s.fields,
+          ...(s.time_constraint && { time_constraint: s.time_constraint }),
+          ...(s.resources && { resources: s.resources }),
+          ...(asked && {
+            necessity: asked.necessity,
+            requested_fields: asked.fields,
+            ...(asked.time_range && { requested_time_range: asked.time_range }),
+            ...(asked.minimum && { minimum: asked.minimum }),
+          }),
+        };
+      }),
       ...(input.omittedStreams &&
         input.omittedStreams.length > 0 && {
           omitted_streams: input.omittedStreams,

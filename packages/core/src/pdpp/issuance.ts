@@ -160,6 +160,7 @@ export function issueGrant(input: IssueGrantInput): IssuanceResult {
     snapshot: input.snapshot,
     resolvedStreams: resolution.streams,
     omittedStreams: resolution.omittedStreams,
+    requestedStreams: resolution.requestedStreams,
     requester: input.requester,
     expiresAt: input.expiresAt,
     streamDescriptions: input.streamDescriptions,
