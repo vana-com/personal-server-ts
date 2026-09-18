@@ -169,6 +169,19 @@ export interface Grant {
 
 export interface DeclaredStream {
   name: string;
+  /**
+   * How records in this stream behave over time (§5).
+   *
+   * `mutable_state` records are upserted by key and carry version history;
+   * `append_only` records are immutable, so a duplicate key is a no-op rather
+   * than an update. Optional, defaulting to `mutable_state`, so declarations
+   * written before this field existed keep their current meaning exactly.
+   *
+   * Before this existed the RS hardcoded `mutable_state` for every stream,
+   * which made an `append_only` declaration silently coerced and the field
+   * unfalsifiable for an ingesting producer.
+   */
+  semantics?: "mutable_state" | "append_only";
   /** Top-level field names the stream's schema defines. */
   fields: string[];
   /**

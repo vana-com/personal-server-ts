@@ -308,10 +308,30 @@ export function parseDeclaration(
       };
     }
 
+    // §5 stream semantics. An unrecognized value is a rejection rather than a
+    // silent fallback: coercing an unknown semantics to `mutable_state` would
+    // upsert records a declaration may have meant to be immutable.
+    if (
+      s.semantics !== undefined &&
+      s.semantics !== "mutable_state" &&
+      s.semantics !== "append_only"
+    ) {
+      return {
+        ok: false,
+        failure: {
+          code: "invalid_document",
+          message: `stream '${s.name}' declares unsupported semantics '${String(s.semantics)}'`,
+        },
+      };
+    }
+
     streams.push({
       name: s.name,
       fields,
       required_fields: requiredFields,
+      ...(typeof s.semantics === "string" && {
+        semantics: s.semantics as "mutable_state" | "append_only",
+      }),
       ...(typeof s.consent_time_field === "string" && {
         consent_time_field: s.consent_time_field,
       }),

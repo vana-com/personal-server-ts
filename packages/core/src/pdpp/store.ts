@@ -66,6 +66,13 @@ CREATE TABLE IF NOT EXISTS pdpp_declarations (
   version TEXT NOT NULL,
   digest TEXT NOT NULL,
   snapshot_json TEXT NOT NULL,
+  -- The exact retrieved bytes. snapshot_json is the parsed snapshot, so
+  -- re-digesting it does not reproduce digest. Without the original document
+  -- the retained digest is unverifiable from the store alone, which is the
+  -- gap this column closes. Nullable because rows retained before this
+  -- column existed have no document to recover; readers must treat NULL as
+  -- cannot-verify, never as verified.
+  document TEXT,
   retrieved_at TEXT NOT NULL,
   PRIMARY KEY (source_id, version)
 );
@@ -203,6 +210,20 @@ export function openPdppAuthStore(dbPath: string): PdppAuthStore {
   db.pragma("foreign_keys = ON");
   db.exec(SCHEMA_SQL);
 
+  // Additive column migration. `CREATE TABLE IF NOT EXISTS` above does not
+  // alter an existing table, so a database created before `document` existed
+  // still lacks it. Adding a nullable column is backward compatible in both
+  // directions: an older build ignores it, and this build treats NULL as
+  // "not verifiable from the store" rather than as a failure. That is why
+  // this does NOT bump PDPP_AUTH_STATE_VERSION, which would throw
+  // UnsupportedAuthStateError and refuse to boot an existing deployment.
+  const declarationColumns = db
+    .prepare("PRAGMA table_info(pdpp_declarations)")
+    .all() as { name: string }[];
+  if (!declarationColumns.some((column) => column.name === "document")) {
+    db.exec("ALTER TABLE pdpp_declarations ADD COLUMN document TEXT");
+  }
+
   const meta = db
     .prepare("SELECT version FROM pdpp_state_meta WHERE id = 1")
     .get() as { version: number } | undefined;
@@ -229,23 +250,35 @@ export class PdppAuthStore {
   // -- declarations -------------------------------------------------------
 
   /**
-   * Retain a declaration snapshot. Idempotent per (source_id, version): a
-   * re-retrieval of the same revision must not disturb the retained bytes an
-   * issued grant points at, so we keep the first one.
+   * Retain a declaration snapshot, and the exact bytes it was parsed from.
+   *
+   * Idempotent per (source_id, version): a re-retrieval of the same revision
+   * must not disturb the retained facts an issued grant points at, so the
+   * first snapshot wins and is never overwritten.
+   *
+   * The one exception is BACKFILLING `document`. A deployment that retained a
+   * version before this column existed has a NULL document, and a plain
+   * `DO NOTHING` would leave it NULL forever — the existing row would keep
+   * winning on every restart, so the digest would stay unverifiable until the
+   * declaration version happened to change. `COALESCE` fills it in once and
+   * then never changes it, so backfill happens exactly when it is missing and
+   * the retained bytes remain immutable thereafter.
    */
-  retainDeclaration(snapshot: DeclarationSnapshot): void {
+  retainDeclaration(snapshot: DeclarationSnapshot, document?: string): void {
     this.db
       .prepare(
         `INSERT INTO pdpp_declarations
-           (source_id, version, digest, snapshot_json, retrieved_at)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT (source_id, version) DO NOTHING`,
+           (source_id, version, digest, snapshot_json, document, retrieved_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (source_id, version) DO UPDATE SET
+           document = COALESCE(pdpp_declarations.document, excluded.document)`,
       )
       .run(
         snapshot.source_id,
         snapshot.version,
         snapshot.digest,
         JSON.stringify(snapshot),
+        document ?? null,
         new Date().toISOString(),
       );
   }
@@ -260,6 +293,24 @@ export class PdppAuthStore {
       )
       .get(sourceId, version) as { snapshot_json: string } | undefined;
     return row ? (JSON.parse(row.snapshot_json) as DeclarationSnapshot) : null;
+  }
+
+  /**
+   * The exact retrieved bytes a retained declaration was parsed from.
+   *
+   * Returns null when this row predates the `document` column and has not been
+   * backfilled. A caller MUST treat null as "cannot verify from the store",
+   * never as "verified" — the whole point of this accessor is that re-digesting
+   * `snapshot_json` would silently produce a different value than the retained
+   * `digest`.
+   */
+  getDeclarationDocument(sourceId: string, version: string): string | null {
+    const row = this.db
+      .prepare(
+        "SELECT document FROM pdpp_declarations WHERE source_id = ? AND version = ?",
+      )
+      .get(sourceId, version) as { document: string | null } | undefined;
+    return row?.document ?? null;
   }
 
   // -- grants -------------------------------------------------------------
