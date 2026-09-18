@@ -90,6 +90,11 @@ export const DEFAULTS = {
     // exfiltration, and PKCE does not help when the attacker chose the
     // challenge. Empty means no client may start an authorization flow.
     clients: [] as Array<{ clientId: string; redirectUris: string[] }>,
+    // Hosts this deployment allows to resolve URL-hosted (§6) client
+    // identities. Empty means no client_id is ever fetched: registration in
+    // `clients` above stays the only way a client is admitted, and this
+    // server performs no outbound request for an unregistered one.
+    urlHostedClientHosts: [] as string[],
   },
 };
 
@@ -243,6 +248,12 @@ export const ServerConfigSchema = z.object({
           }),
         )
         .default(DEFAULTS.pdpp.clients),
+      // Opt-in allowlist: no host here means no client_id URL is ever
+      // fetched. A static registration in `clients` remains first choice and
+      // is always checked before this path runs.
+      urlHostedClientHosts: z
+        .array(z.string().min(1))
+        .default(DEFAULTS.pdpp.urlHostedClientHosts),
     })
     .default(DEFAULTS.pdpp),
 });

@@ -248,6 +248,31 @@ describe("the retrieved document must earn trust", () => {
     });
   });
 
+  it.each([
+    ["null", "null"],
+    ["an array", "[1,2,3]"],
+    ["a bare number", "42"],
+    ["a bare string", '"hello"'],
+  ])(
+    "refuses a document that is valid JSON but not an object: %s",
+    async (_label, body) => {
+      // `JSON.parse` accepts all of these without error. Only `null` used to
+      // throw when the resolver then read `.redirect_uris` off it; the others
+      // already degraded to `invalid_document` for other reasons. All four
+      // should fail the same documented way, not crash.
+      const result = await resolveUrlHostedClientIdentity({
+        clientId: CLIENT_ID,
+        fetcher: documentFetcher(body),
+        policy: POLICY,
+      });
+
+      expect(result).toMatchObject({
+        failure: { code: "invalid_document" },
+        ok: false,
+      });
+    },
+  );
+
   it("refuses a non-200 response", async () => {
     const result = await resolveUrlHostedClientIdentity({
       clientId: CLIENT_ID,

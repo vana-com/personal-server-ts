@@ -25,10 +25,12 @@ import {
   declaredSourceId,
   openPdppAuthStore,
   PdppTokenService,
+  resolveUrlHostedClientIdentity,
   UnsupportedAuthStateError,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
 import type { PdppAuthRouteDeps } from "../routes/pdpp-auth.js";
 import type { TokenStore } from "../token-store.js";
+import { boundedClientDocumentFetcher } from "./client-document-fetch.js";
 import {
   buildDeclarationRegistry,
   deriveSupportedConnectors,
@@ -195,6 +197,20 @@ export async function createPdppAuthDeps(
           }
         : null;
     },
+    // §6 URL-hosted identity for a client NOT in `clients` above. Left
+    // unset (undefined, not a function that always fails) when the
+    // allowlist is empty, so this deployment performs no outbound fetch and
+    // the route's registration-only fallback runs exactly as it did before
+    // this path existed.
+    resolveClientIdentity:
+      config.pdpp.urlHostedClientHosts.length > 0
+        ? (clientId) =>
+            resolveUrlHostedClientIdentity({
+              clientId,
+              fetcher: boundedClientDocumentFetcher,
+              policy: { trustedHosts: config.pdpp.urlHostedClientHosts },
+            })
+        : undefined,
     requirePkce: config.pdpp.requirePkce,
     ownerAuth: {
       serverOrigin: options.serverOrigin,

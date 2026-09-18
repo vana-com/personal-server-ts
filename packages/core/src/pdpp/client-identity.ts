@@ -177,13 +177,9 @@ export async function resolveUrlHostedClientIdentity(
     };
   }
 
-  let document: {
-    client_id?: unknown;
-    client_name?: unknown;
-    redirect_uris?: unknown;
-  };
+  let parsedJson: unknown;
   try {
-    document = JSON.parse(retrieved.body) as typeof document;
+    parsedJson = JSON.parse(retrieved.body);
   } catch {
     return {
       ok: false,
@@ -193,6 +189,25 @@ export async function resolveUrlHostedClientIdentity(
       },
     };
   }
+
+  // A JSON document need not be an object — `null`, an array, or a bare
+  // primitive all parse without error, and none of them can carry the
+  // fields below.
+  if (typeof parsedJson !== "object" || parsedJson === null) {
+    return {
+      ok: false,
+      failure: {
+        code: "invalid_document",
+        message: "client_id document is not a JSON object",
+      },
+    };
+  }
+
+  const document = parsedJson as {
+    client_id?: unknown;
+    client_name?: unknown;
+    redirect_uris?: unknown;
+  };
 
   if (!Array.isArray(document.redirect_uris)) {
     return {
