@@ -61,6 +61,7 @@ export {
 export type {
   BuildReviewInput,
   ConsentReviewModel,
+  ExistingGrant,
   RequesterIdentity,
   ReviewStream,
 } from "./review.js";

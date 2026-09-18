@@ -467,6 +467,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         session?.snapshot.source_id ?? "",
       ),
       instanceChoices: parseInstanceChoices(c),
+      store: deps.store,
     });
 
     if (!result.ok) {

@@ -30,10 +30,12 @@ import { randomBytes } from "node:crypto";
 import {
   buildConsentReview,
   type ConsentReviewModel,
+  type ExistingGrant,
   type RequesterIdentity,
 } from "./review.js";
 import { issueGrant, type ConsentEvidence } from "./issuance.js";
 import { resolveSelection, type InstanceInventory } from "./resolve.js";
+import type { PdppAuthStore } from "./store.js";
 import type { PdppTokenService } from "./tokens.js";
 import type { DeclarationSnapshot, Grant, SelectionRequest } from "./types.js";
 
@@ -293,6 +295,38 @@ function pendingInstanceChoices(
 }
 
 /**
+ * This client's currently-active grants for this owner, newest first —
+ * excludes revoked, expired, and consumed single-use grants, and never
+ * carries tokens, consent evidence, or review digests: informational only.
+ */
+function existingActiveGrantsForClient(
+  store: PdppAuthStore,
+  subjectId: string,
+  clientId: string,
+  now: Date,
+): ExistingGrant[] {
+  return store
+    .listGrantsForSubject(subjectId)
+    .filter((stored) => stored.clientId === clientId)
+    .filter(
+      (stored) =>
+        store.grantStatus(stored, now) === "active" &&
+        !(stored.grant.access_mode === "single_use" && stored.consumedAt),
+    )
+    .map((stored) => ({
+      grant_id: stored.grant.grant_id,
+      issued_at: stored.grant.issued_at,
+      ...(stored.grant.expires_at && { expires_at: stored.grant.expires_at }),
+      access_mode: stored.grant.access_mode,
+      purpose_code: stored.grant.purpose_code,
+      streams: stored.grant.streams.map((s) => ({
+        name: s.name,
+        fields: s.fields,
+      })),
+    }));
+}
+
+/**
  * Build the review an authenticated owner sees.
  *
  * Resolution runs here against current inventory, so the digest the owner is
@@ -307,6 +341,12 @@ export function fetchReview(input: {
   inventory: InstanceInventory;
   /** The owner's instance picks, keyed by stream, from a prior choice step. */
   instanceChoices?: Record<string, string[]>;
+  /**
+   * When given, the review lists this requesting client's other active
+   * grants for this owner, so the consent surface can say what is already
+   * shared. Approval itself is unaffected either way.
+   */
+  store?: PdppAuthStore;
   now?: Date;
 }):
   | { ok: true; result: ReviewFetchResult }
@@ -371,6 +411,14 @@ export function fetchReview(input: {
     requester: session.requester,
     expiresAt: session.grant_expires_at,
     streamDescriptions: session.stream_descriptions,
+    existingGrants: input.store
+      ? existingActiveGrantsForClient(
+          input.store,
+          session.subject_id,
+          session.requester.client_id,
+          now,
+        )
+      : undefined,
   });
 
   return {

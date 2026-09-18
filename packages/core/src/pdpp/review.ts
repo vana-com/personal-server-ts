@@ -62,6 +62,21 @@ export interface ReviewStream {
 }
 
 /**
+ * An already-active grant this same client holds for this owner, so the
+ * consent surface can say what is already shared. Deliberately excludes
+ * tokens, consent evidence, and the review digest — informational only, never
+ * an authority the RS or AS re-derives from.
+ */
+export interface ExistingGrant {
+  grant_id: string;
+  issued_at: string;
+  expires_at?: string;
+  access_mode: "single_use" | "continuous";
+  purpose_code: string;
+  streams: Array<{ name: string; fields: string[] }>;
+}
+
+/**
  * The four semantic categories §6 requires a conformant consent surface to
  * keep distinct. A renderer that wants to flatten them has to do so
  * deliberately; it cannot do so by accident.
@@ -102,6 +117,13 @@ export interface ConsentReviewModel {
   };
   /** Digest over the decision fields. The approval must carry this back. */
   review_digest: string;
+  /**
+   * This client's other active grants for this owner, newest first. Absent
+   * when there are none — kept out of the digest since it is informational,
+   * not a decision field, and can change between requests without staling
+   * the review.
+   */
+  existing_grants?: ExistingGrant[];
 }
 
 /**
@@ -200,6 +222,8 @@ export interface BuildReviewInput {
   expiresAt?: string;
   /** Declaration-authored stream descriptions, keyed by stream name. */
   streamDescriptions?: Record<string, string>;
+  /** This client's other active grants for this owner, newest first. */
+  existingGrants?: ExistingGrant[];
 }
 
 /**
@@ -265,5 +289,9 @@ export function buildConsentReview(
     },
     ...(boundClaims && { client_claims: boundClaims }),
     review_digest,
+    ...(input.existingGrants &&
+      input.existingGrants.length > 0 && {
+        existing_grants: input.existingGrants,
+      }),
   };
 }

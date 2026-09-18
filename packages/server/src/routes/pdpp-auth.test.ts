@@ -725,6 +725,135 @@ describe("the consent review model the UI renders", () => {
   });
 });
 
+describe("existing_grants — the review lists this client's active grants", () => {
+  /** Full authorize → review → approve, returning the issued grant_id. */
+  async function approveFlow(body = selectionBody()) {
+    const { sessionId, ownerToken, digest } = await openSessionAndReview(body);
+    const approved = await post(
+      `/pdpp/v1/authorize/${sessionId}/approve`,
+      { review_digest: digest },
+      ownerAuth(ownerToken),
+    );
+    expect(approved.status).toBe(200);
+    const { grant_id } = (await approved.json()) as { grant_id: string };
+    return grant_id;
+  }
+
+  /** Insert a grant directly into the store, bypassing the HTTP flow. */
+  function seedGrant(overrides: {
+    grantId: string;
+    clientId: string;
+    revoked?: boolean;
+  }) {
+    const grant = {
+      version: "0.1.0",
+      grant_id: overrides.grantId,
+      issued_at: new Date().toISOString(),
+      subject: { id: OWNER },
+      client: { client_id: overrides.clientId },
+      source: { kind: "connector" as const, id: snapshot.source_id },
+      source_declaration: { version: snapshot.version },
+      purpose_code: "https://pdpp.dev/purpose/personalization",
+      access_mode: "continuous" as const,
+      streams: [
+        {
+          name: "top_artists",
+          instance_ids: ["spotify-account-a"],
+          fields: ["id", "name"],
+        },
+      ],
+    };
+    store.insertGrantWithAuthCode({
+      grant,
+      subjectId: OWNER,
+      reviewDigest: "seed-digest",
+      code: `pdpp_code_seed_${overrides.grantId}`,
+      authCode: {
+        grantId: overrides.grantId,
+        clientId: overrides.clientId,
+        redirectUri: REDIRECT,
+        codeChallenge: null,
+        codeChallengeMethod: null,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      },
+    });
+    if (overrides.revoked) {
+      store.revokeGrant(overrides.grantId);
+    }
+  }
+
+  it("lists exactly the same client's active grant, excluding revoked and other-client grants", async () => {
+    // One active grant for music_recommendations.
+    const activeGrantId = await approveFlow();
+
+    // One revoked grant, also for music_recommendations.
+    const revokedGrantId = "grant_revoked_1";
+    seedGrant({
+      grantId: revokedGrantId,
+      clientId: "music_recommendations",
+      revoked: true,
+    });
+
+    // One grant belonging to a different client.
+    const otherClientGrantId = "grant_other_client_1";
+    seedGrant({ grantId: otherClientGrantId, clientId: "other_client" });
+
+    // A fresh session for music_recommendations: its review should list
+    // exactly the one active grant for that same client.
+    const ownerToken = tokens.issueOwnerToken({
+      subjectId: OWNER,
+    }).access_token;
+    const created = await post("/pdpp/v1/authorize", selectionBody());
+    const { session_id } = (await created.json()) as { session_id: string };
+    const reviewed = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review`,
+      { headers: ownerAuth(ownerToken) },
+    );
+    expect(reviewed.status).toBe(200);
+    const body = (await reviewed.json()) as {
+      review: {
+        existing_grants: Array<{
+          grant_id: string;
+          issued_at: string;
+          expires_at?: string;
+          access_mode: string;
+          purpose_code: string;
+          streams: Array<{ name: string; fields: string[] }>;
+        }>;
+      };
+    };
+
+    const grantIds = body.review.existing_grants.map((g) => g.grant_id);
+    expect(grantIds).toEqual([activeGrantId]);
+    expect(grantIds).not.toContain(revokedGrantId);
+    expect(grantIds).not.toContain(otherClientGrantId);
+    const [entry] = body.review.existing_grants;
+    expect(entry.access_mode).toBe("continuous");
+    expect(entry.purpose_code).toBe("https://pdpp.dev/purpose/personalization");
+    expect(entry.streams).toEqual([
+      { name: "top_artists", fields: expect.arrayContaining(["id"]) },
+    ]);
+    expect(entry).not.toHaveProperty("review_digest");
+    expect(entry).not.toHaveProperty("consent_evidence");
+  });
+
+  it("keeps approval behavior unchanged when existing grants are present", async () => {
+    await approveFlow();
+
+    // A second, independent approval for the same client must still issue
+    // normally — existing grants are informational only.
+    const { sessionId, ownerToken, digest } = await openSessionAndReview();
+    const approved = await post(
+      `/pdpp/v1/authorize/${sessionId}/approve`,
+      { review_digest: digest },
+      ownerAuth(ownerToken),
+    );
+    expect(approved.status).toBe(200);
+    const { grant_id } = (await approved.json()) as { grant_id: string };
+    expect(grant_id).toBeTruthy();
+  });
+});
+
 describe("RFC 7636 — PKCE binds the code to the requesting client", () => {
   /** Drive a real flow to an authorization code the attacker would intercept. */
   async function codeFor(body = selectionBody()) {
