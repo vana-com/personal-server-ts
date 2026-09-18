@@ -15,8 +15,27 @@
 /** The RFC 9396 `type` value that marks an authorization detail as PDPP. */
 export const PDPP_DATA_ACCESS_TYPE = "https://pdpp.dev/data-access";
 
-/** The grant schema version this implementation issues and accepts. */
+/**
+ * The v0.2 RFC 9396 `type`.
+ *
+ * v0.2 is deliberately a *separate* detail type rather than a compatible
+ * extension of v0.1. The revision changes authorization resolution (explicit
+ * minima) and disclosed-record semantics (a schema's `required` array is no
+ * longer a consent floor), so the two are not wire-compatible: the same
+ * request body resolves to a different grant under each. An AS implementing
+ * both MUST resolve each under its own revision, which is why every rule below
+ * branches on this constant rather than on the presence of a v0.2-only member.
+ *
+ * A client MUST NOT retry a rejected v0.2 request under the v0.1 type without
+ * a new authorization decision; nothing here silently downgrades one.
+ */
+export const PDPP_DATA_ACCESS_TYPE_V02 = "https://pdpp.dev/data-access/0.2";
+
+/** The v0.1 grant schema version. */
 export const PDPP_GRANT_VERSION = "0.1.0";
+
+/** The v0.2 grant schema version, issued for `PDPP_DATA_ACCESS_TYPE_V02`. */
+export const PDPP_GRANT_VERSION_V02 = "0.2.0";
 
 /**
  * The PDPP HTTP API contract version, sent and echoed in the `PDPP-Version`
@@ -70,6 +89,22 @@ export interface TimeRange {
   until?: string;
 }
 
+/**
+ * A v0.2 explicit authorization minimum: the floor below which the owner's
+ * narrowing cannot go without failing issuance for this stream.
+ *
+ * This describes *permission*, never data. A satisfied minimum says the grant
+ * permits those fields and that window; it asserts nothing about whether
+ * records exist in it, how fresh they are, or whether they suit the client's
+ * task. The client evaluates application sufficiency separately.
+ */
+export interface StreamMinimum {
+  /** Non-empty; declared top-level field names drawn from the expanded request. */
+  fields?: string[];
+  /** Both bounds finite, `since < until`; must sit inside the requested window. */
+  time_range?: { since: string; until: string };
+}
+
 export interface StreamRequest {
   /** Stream name, or `*` for every stream in the retained declaration. */
   name: string;
@@ -83,6 +118,12 @@ export interface StreamRequest {
   fields?: string[];
   /** Canonical key strings for specific records. */
   resources?: string[];
+  /**
+   * v0.2 only. The AS recognizes exactly `fields` and `time_range` here and
+   * rejects anything else — an unknown member would otherwise read as a
+   * satisfied condition the client believes it imposed.
+   */
+  minimum?: StreamMinimum;
 }
 
 /**
@@ -102,7 +143,7 @@ export interface Retention {
 
 /** One RFC 9396 `authorization_details` entry of PDPP type. */
 export interface SelectionRequest {
-  type: typeof PDPP_DATA_ACCESS_TYPE;
+  type: typeof PDPP_DATA_ACCESS_TYPE | typeof PDPP_DATA_ACCESS_TYPE_V02;
   /** A request carries `id` alone; provenance is derived, never asserted. */
   source: { id: string };
   purpose_code: string;
@@ -141,8 +182,35 @@ export interface StreamGrant {
   resources?: string[];
 }
 
+/**
+ * What the client asked for on one stream, as the grant records it alongside
+ * what was approved.
+ *
+ * v0.2 requires the grant to be the client's source of truth for the outcome,
+ * including any narrowing the owner applied. Without this the client cannot
+ * tell a narrowed grant from the request it sent — the approved `StreamGrant`
+ * alone is indistinguishable from an unnarrowed one, so a client would have to
+ * diff against its own memory of the request, which §7 forbids it from
+ * treating as authority.
+ */
+export interface RequestedStream {
+  name: string;
+  necessity: "required" | "optional";
+  /** The upper field limit as expanded from the request, before owner choices. */
+  fields: string[];
+  time_range?: TimeRange;
+  minimum?: StreamMinimum;
+}
+
+/** The v0.2 requested-vs-approved record. Absent on v0.1 grants. */
+export interface RequestedSelection {
+  streams: RequestedStream[];
+  /** Requested stream names the owner declined. Only optional streams can appear. */
+  omitted_streams?: string[];
+}
+
 export interface Grant {
-  /** This contract requires exactly `0.1.0`. */
+  /** `0.1.0` for v0.1 grants, `0.2.0` for v0.2. */
   version: string;
   grant_id: string;
   issued_at: string;
@@ -161,6 +229,16 @@ export interface Grant {
   retention?: Retention;
   /** Absent means no expiry. */
   expires_at?: string;
+  /**
+   * v0.2: what the client requested, beside the approved `streams` above.
+   * Absent on v0.1 grants, whose contract has no such member.
+   */
+  requested?: RequestedSelection;
+}
+
+/** True for a grant issued under the v0.2 detail type. */
+export function isV02Grant(grant: Grant): boolean {
+  return grant.version === PDPP_GRANT_VERSION_V02;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +324,27 @@ export interface PdppAuthorizationDetail {
 }
 
 /**
+ * The v0.2 client-visible authorization result: `{ type, grant }` carrying the
+ * complete immutable grant.
+ *
+ * v0.2 forbids substituting the original selection request or a lossy summary.
+ * The v0.1 detail above is exactly such a summary — it drops `retention`,
+ * `expires_at`, the resolved client identity, and (under v0.2) the
+ * requested-vs-approved record — so v0.2 carries the whole grant instead of a
+ * projection of it. Both shapes coexist: a token covering a v0.1 grant still
+ * returns the v0.1 detail, so an existing client sees no change.
+ */
+export interface PdppAuthorizationResultV02 {
+  type: typeof PDPP_DATA_ACCESS_TYPE_V02;
+  grant: Grant;
+}
+
+/** Either revision's element, as it appears in `authorization_details`. */
+export type PdppAuthorizationEntry =
+  | PdppAuthorizationDetail
+  | PdppAuthorizationResultV02;
+
+/**
  * RFC 7662 introspection response with the PDPP extension members. An inactive
  * token returns exactly `{ active: false }` — RFC 7662 §2.2 forbids leaking
  * anything else about a token that is revoked, expired, or simply unknown.
@@ -258,7 +357,13 @@ export interface PdppIntrospectionResponse {
   client_id?: string;
   /** Unix epoch seconds. Omitted when the token never expires. */
   exp?: number;
-  authorization_details?: PdppAuthorizationDetail[];
+  /**
+   * One element per covered grant, in that grant's own revision shape. v0.2
+   * requires the AS to return the same resolved grant facts to the client and
+   * to an authenticated RS apart from token-specific active-state and expiry,
+   * which is why this is the same projection the token response uses.
+   */
+  authorization_details?: PdppAuthorizationEntry[];
 }
 
 /** Why a token did not resolve. Drives the RS error; never echoed to the client. */

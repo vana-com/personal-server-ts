@@ -412,6 +412,14 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       // §9 AS item 5: the binding maps a Source validation failure to RFC 9396
       // `invalid_authorization_details`. Other shape failures map to
       // `invalid_request`.
+      //
+      // v0.2 names the same code for a malformed minimum ("Malformed or
+      // unsupported authorization details instead produce
+      // `invalid_authorization_details`"), and `invalid_minimum` reaches it
+      // through this default. That is deliberately the *shape* half of the
+      // v0.2 error split: an unsatisfiable-but-well-formed minimum is an
+      // owner-decision outcome and surfaces at approval as `access_denied`,
+      // not here.
       const oauthError =
         validation.failure.code === "invalid_request"
           ? "invalid_request"

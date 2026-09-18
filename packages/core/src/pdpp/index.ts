@@ -9,9 +9,12 @@
 
 export {
   PDPP_DATA_ACCESS_TYPE,
+  PDPP_DATA_ACCESS_TYPE_V02,
   PDPP_GRANT_VERSION,
+  PDPP_GRANT_VERSION_V02,
   PDPP_API_VERSION,
   AI_TRAINING_PURPOSE,
+  isV02Grant,
 } from "./types.js";
 export type {
   AccessMode,
@@ -25,13 +28,18 @@ export type {
   GrantStatus,
   InactiveReason,
   PdppAuthorizationDetail,
+  PdppAuthorizationEntry,
+  PdppAuthorizationResultV02,
   PdppIntrospectionResponse,
   PdppTokenContext,
   PdppTokenKind,
+  RequestedSelection,
+  RequestedStream,
   Retention,
   SelectionRequest,
   SourceKind,
   StreamGrant,
+  StreamMinimum,
   StreamRequest,
   TimeConstraint,
   TimeRange,
