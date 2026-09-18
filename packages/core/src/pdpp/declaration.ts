@@ -242,6 +242,74 @@ function normalizeNormativeDeclaration(
   } as RawDeclarationDocument;
 }
 
+/** The dialect §5 fixes for every embedded stream schema. */
+const SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema";
+
+/**
+ * Meta-validate one embedded stream schema (§5).
+ *
+ * "If `$schema` is present, it MUST equal
+ * `https://json-schema.org/draft/2020-12/schema`. [...] The AS MUST
+ * meta-validate each embedded stream schema before accepting the declaration.
+ * Embedded `$ref` and `$dynamicRef` values MUST be local fragment references.
+ * A declaration MUST NOT make consent interpretation depend on a mutable
+ * remote schema."
+ *
+ * That last sentence is what the reference check is for, and it is the reason
+ * a remote `$ref` is a refusal rather than a warning: a schema the AS never
+ * fetched and never froze can be changed by a third party after the owner has
+ * consented, which rewrites what the consent covers without the declaration
+ * changing at all.
+ *
+ * The walk is recursive because a `$ref` under `properties`, `items`, `$defs`
+ * or a combinator is exactly as remote as one at the root; a top-level-only
+ * check would be a formality rather than a fence.
+ *
+ * Returns a human-readable reason, or null when the schema is acceptable.
+ */
+function metaValidateSchema(schema: unknown): string | null {
+  if (typeof schema !== "object" || schema === null || Array.isArray(schema)) {
+    return "schema must be a JSON Schema object";
+  }
+
+  const dialect = (schema as { $schema?: unknown }).$schema;
+  if (dialect !== undefined && dialect !== SCHEMA_DIALECT) {
+    return `schema declares $schema '${String(dialect)}', but §5 fixes the dialect at ${SCHEMA_DIALECT}`;
+  }
+
+  return findRemoteReference(schema);
+}
+
+/**
+ * The first non-local `$ref`/`$dynamicRef` anywhere in `node`, as a reason.
+ *
+ * "Local fragment reference" means a value beginning with `#` — a pointer into
+ * this same document. Anything else names a document the AS does not hold.
+ */
+function findRemoteReference(node: unknown): string | null {
+  if (Array.isArray(node)) {
+    for (const entry of node) {
+      const problem = findRemoteReference(entry);
+      if (problem) return problem;
+    }
+    return null;
+  }
+  if (typeof node !== "object" || node === null) return null;
+
+  for (const keyword of ["$ref", "$dynamicRef"] as const) {
+    const value = (node as Record<string, unknown>)[keyword];
+    if (typeof value === "string" && !value.startsWith("#")) {
+      return `schema resolves ${keyword} '${value}', which is not a local fragment reference`;
+    }
+  }
+
+  for (const value of Object.values(node as Record<string, unknown>)) {
+    const problem = findRemoteReference(value);
+    if (problem) return problem;
+  }
+  return null;
+}
+
 export function computeDeclarationDigest(body: string): string {
   return createHash("sha256").update(body, "utf8").digest("hex");
 }
@@ -481,6 +549,23 @@ export function parseDeclaration(
           message: `stream '${s.name}' names consent_time_field '${s.consent_time_field}', which its schema does not declare`,
         },
       };
+    }
+
+    // §5: meta-validate the embedded schema before accepting the declaration.
+    // Only when one is present — the internal flat shape carries a field list
+    // and no schema, and §5's obligation is about the schema a normative
+    // document embeds.
+    if (s.schema !== undefined) {
+      const schemaProblem = metaValidateSchema(s.schema);
+      if (schemaProblem) {
+        return {
+          ok: false,
+          failure: {
+            code: "invalid_document",
+            message: `stream '${s.name}': ${schemaProblem}`,
+          },
+        };
+      }
     }
 
     // §5 stream semantics. An unrecognized value is a rejection rather than a
