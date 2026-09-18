@@ -424,6 +424,40 @@ export function parseDeclaration(
       };
     }
 
+    // §5 `streams[].schema`: "`primary_key` and `cursor_field` MUST reference
+    // fields declared here."
+    //
+    // Checked against `fields` rather than against `schema.properties`
+    // directly, because `fields` IS that projection for a normative document
+    // and is what the internal flat shape carries — so one check covers both
+    // shapes. Without it a declaration can promise record ordering over a
+    // field that does not exist; nothing catches the contradiction until read
+    // time, long after the owner consented to the document.
+    const undeclaredKey = (s.primary_key as string[]).filter(
+      (f) => !fields.includes(f),
+    );
+    if (undeclaredKey.length > 0) {
+      return {
+        ok: false,
+        failure: {
+          code: "invalid_document",
+          message: `stream '${s.name}' names primary_key fields its schema does not declare: ${undeclaredKey.join(", ")}`,
+        },
+      };
+    }
+    if (
+      typeof s.cursor_field === "string" &&
+      !fields.includes(s.cursor_field)
+    ) {
+      return {
+        ok: false,
+        failure: {
+          code: "invalid_document",
+          message: `stream '${s.name}' names cursor_field '${s.cursor_field}', which its schema does not declare`,
+        },
+      };
+    }
+
     // §5 stream semantics. An unrecognized value is a rejection rather than a
     // silent fallback: coercing an unknown semantics to `mutable_state` would
     // upsert records a declaration may have meant to be immutable.
