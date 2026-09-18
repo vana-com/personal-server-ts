@@ -698,3 +698,220 @@ describe("pdpp records routes: cursor/order mismatch", () => {
     expect(keys).not.toContain("pl_not_mine");
   });
 });
+
+describe("pdpp records routes: unsupported view/expand shapes", () => {
+  function ownerStoreWithRecord() {
+    const store = createMemoryRecordStore();
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "playlists",
+          key: "pl_1",
+          data: { id: "pl_1", name: "visible" },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+    );
+    return store;
+  }
+
+  it("owner read succeeds without view/expand, then the same shapes are rejected on both record endpoints", async () => {
+    const store = ownerStoreWithRecord();
+    const { app } = buildApp(
+      { "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" } },
+      { store },
+    );
+
+    const okList = await app.request("/streams/playlists/records", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+    expect(okList.status).toBe(200);
+    const okListBody = await okList.json();
+    expect(okListBody.data.map((r: { id: string }) => r.id)).toContain("pl_1");
+
+    const okGet = await app.request(
+      `/streams/playlists/records/${encodeURIComponent("pl_1")}`,
+      { headers: { Authorization: "Bearer owner-tok" } },
+    );
+    expect(okGet.status).toBe(200);
+
+    for (const endpoint of [
+      "/streams/playlists/records",
+      "/streams/playlists/records/pl_1",
+    ]) {
+      const expandCases = [
+        "expand[]=messages",
+        "expand[]=undeclared_relation",
+        "expand_limit[messages]=3",
+      ];
+      for (const q of expandCases) {
+        const res = await app.request(`${endpoint}?${q}`, {
+          headers: { Authorization: "Bearer owner-tok" },
+        });
+        expect(res.status).toBe(400);
+        expect((await res.json()).error.code).toBe("invalid_expand");
+      }
+
+      const viewCases = ["view=summary", "view=anything"];
+      for (const q of viewCases) {
+        const res = await app.request(`${endpoint}?${q}`, {
+          headers: { Authorization: "Bearer owner-tok" },
+        });
+        expect(res.status).toBe(400);
+        expect((await res.json()).error.code).toBe("invalid_request");
+      }
+    }
+  });
+
+  it("rejects owner expand/view on metadata and list-streams endpoints as invalid_request", async () => {
+    const store = ownerStoreWithRecord();
+    const { app } = buildApp(
+      { "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" } },
+      { store },
+    );
+
+    for (const endpoint of ["/streams", "/streams/playlists"]) {
+      const res1 = await app.request(`${endpoint}?view=summary`, {
+        headers: { Authorization: "Bearer owner-tok" },
+      });
+      expect(res1.status).toBe(400);
+      expect((await res1.json()).error.code).toBe("invalid_request");
+
+      for (const q of ["expand[]=messages", "expand_limit[messages]=3"]) {
+        const res = await app.request(`${endpoint}?${q}`, {
+          headers: { Authorization: "Bearer owner-tok" },
+        });
+        expect(res.status).toBe(400);
+        expect((await res.json()).error.code).toBe("invalid_request");
+      }
+    }
+  });
+
+  it("still rejects client-token view/expand/expand_limit as invalid_request without declaration lookup", async () => {
+    const store = ownerStoreWithRecord();
+    const { app } = buildApp(
+      {
+        "client-tok": {
+          active: true,
+          tokenKind: "client",
+          subjectId: "sub_1",
+          grant: clientGrant(),
+        },
+      },
+      {
+        store,
+        declarations: {
+          ...declarations,
+          get: () => {
+            throw new Error("Unexpected declaration lookup");
+          },
+        },
+      },
+    );
+
+    for (const endpoint of [
+      "/streams/playlists/records",
+      "/streams/playlists/records/pl_1",
+    ]) {
+      for (const q of [
+        "view=summary",
+        "expand[]=messages",
+        "expand_limit[messages]=3",
+      ]) {
+        const res = await app.request(`${endpoint}?${q}`, {
+          headers: { Authorization: "Bearer client-tok" },
+        });
+        expect(res.status).toBe(400);
+        expect((await res.json()).error.code).toBe("invalid_request");
+      }
+    }
+  });
+
+  it("rejects bare/malformed forms: bare 'expand', bare 'expand_limit', bare 'view'", async () => {
+    const store = ownerStoreWithRecord();
+    const { app } = buildApp(
+      { "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" } },
+      { store },
+    );
+
+    for (const q of ["expand=messages", "expand_limit=3", "view"]) {
+      const res = await app.request(`/streams/playlists/records?${q}`, {
+        headers: { Authorization: "Bearer owner-tok" },
+      });
+      expect(res.status).toBe(400);
+      expect(["invalid_expand", "invalid_request"]).toContain(
+        (await res.json()).error.code,
+      );
+    }
+  });
+
+  it("rejects bracketed forms of otherwise-supported base names instead of silently accepting them", async () => {
+    const store = ownerStoreWithRecord();
+    const { app } = buildApp(
+      { "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" } },
+      { store },
+    );
+
+    for (const q of [
+      "limit[x]=5",
+      "fields[x]=id",
+      "order[x]=asc",
+      "cursor[x]=abc",
+      "changes_since[x]=2026-01-01",
+    ]) {
+      const res = await app.request(`/streams/playlists/records?${q}`, {
+        headers: { Authorization: "Bearer owner-tok" },
+      });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error.code).toBe("invalid_request");
+    }
+
+    const getRes = await app.request(
+      "/streams/playlists/records/pl_1?fields[x]=id",
+      { headers: { Authorization: "Bearer owner-tok" } },
+    );
+    expect(getRes.status).toBe(400);
+    expect((await getRes.json()).error.code).toBe("invalid_request");
+  });
+
+  it("supported limit, order and fields still work for owner reads", async () => {
+    const store = ownerStoreWithRecord();
+    const { app } = buildApp(
+      { "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" } },
+      { store },
+    );
+
+    const res = await app.request(
+      "/streams/playlists/records?limit=10&order=asc&fields=id,name",
+      { headers: { Authorization: "Bearer owner-tok" } },
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.map((r: { id: string }) => r.id)).toContain("pl_1");
+
+    const changesRes = await app.request(
+      "/streams/playlists/records?changes_since=",
+      { headers: { Authorization: "Bearer owner-tok" } },
+    );
+    expect(changesRes.status).toBe(200);
+  });
+
+  it("owner stream metadata declares no optional query capabilities", async () => {
+    const store = ownerStoreWithRecord();
+    const { app } = buildApp(
+      { "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" } },
+      { store },
+    );
+    const res = await app.request("/streams/playlists", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.query).toEqual({});
+    expect(body.views).toEqual([]);
+    expect(body.relationships).toEqual([]);
+  });
+});

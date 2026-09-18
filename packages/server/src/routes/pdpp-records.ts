@@ -253,21 +253,7 @@ function parseOrder(raw: string | undefined): "asc" | "desc" {
   });
 }
 
-const CLIENT_REJECTED_PARAMS = ["filter", "view", "expand", "expand_limit"];
-
-/**
- * Query parameters each endpoint implements in v0.1.
- *
- * Spec-core.md §8: "Unknown parameters return 400". Silently ignoring one is
- * worse than it looks -- a client that misspells `limit` as `limt`, or sends a
- * parameter a later version defines, gets a 200 that quietly did something
- * other than what was asked. Accepting an unknown constraint is
- * indistinguishable from applying it.
- *
- * `filter`/`view`/`expand`/`expand_limit` are deliberately absent here and
- * handled separately: they are KNOWN parameters that owner tokens may use and
- * client tokens may not, so they earn a more specific message than "unknown".
- */
+/** Query parameters implemented by each endpoint. Unsupported shapes must fail. */
 const KNOWN_QUERY_PARAMS: Record<string, readonly string[]> = {
   listStreams: [],
   streamMetadata: [],
@@ -276,26 +262,39 @@ const KNOWN_QUERY_PARAMS: Record<string, readonly string[]> = {
   deleteRecord: [],
 };
 
-/**
- * Rejects any query parameter this endpoint does not implement.
- *
- * Bracketed forms (`filter[x]`) count as the base name so the client-token
- * rejection above can give its more specific error rather than this one.
- */
+/** Validate exact parameter names before consulting serving metadata. */
 function rejectUnknownParams(
   c: Context,
   endpoint: keyof typeof KNOWN_QUERY_PARAMS,
+  tokenKind?: PdppTokenContext["tokenKind"],
 ) {
   const allowed = KNOWN_QUERY_PARAMS[endpoint];
-  const url = new URL(c.req.url);
-  for (const key of url.searchParams.keys()) {
+  const recordRead = endpoint === "listRecords" || endpoint === "getRecord";
+  for (const key of new URL(c.req.url).searchParams.keys()) {
+    if (allowed.includes(key)) continue;
     const base = key.replace(/\[.*$/, "");
-    if (allowed.includes(base)) continue;
-    // Filters are unsupported for both token kinds; never silently ignore them.
-    if (base !== "filter" && CLIENT_REJECTED_PARAMS.includes(base)) continue;
-    throw new PdppError("invalid_request", `Unknown query parameter '${key}'`, {
-      param: key,
-    });
+    // Current serving metadata declares no expandable relations. Client
+    // requests must still receive invalid_request, before metadata lookup.
+    if (
+      recordRead &&
+      tokenKind === "owner" &&
+      (base === "expand" || base === "expand_limit")
+    ) {
+      throw new PdppError(
+        "invalid_expand",
+        "No expandable relation is declared",
+        {
+          param: key,
+        },
+      );
+    }
+    throw new PdppError(
+      "invalid_request",
+      `Unsupported query parameter '${key}'`,
+      {
+        param: key,
+      },
+    );
   }
 }
 
@@ -371,21 +370,6 @@ function projectSchemaToFields(
     ),
     ...(required.length > 0 ? { required } : { required: [] }),
   };
-}
-
-function rejectClientOnlyParams(c: Context) {
-  const url = new URL(c.req.url);
-  for (const key of url.searchParams.keys()) {
-    if (
-      CLIENT_REJECTED_PARAMS.some((p) => key === p || key.startsWith(`${p}[`))
-    ) {
-      throw new PdppError(
-        "invalid_request",
-        `Client tokens may not use '${key}' in v0.1`,
-        { param: key },
-      );
-    }
-  }
 }
 
 export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
@@ -686,9 +670,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     if (error) return error;
 
     try {
-      rejectUnknownParams(c, "listRecords");
+      rejectUnknownParams(c, "listRecords", context!.tokenKind);
       const stream = c.req.param("stream");
-      if (context!.tokenKind === "client") rejectClientOnlyParams(c);
 
       const declaration = deps.declarations.get(stream);
       const scope = resolveReadScope(context!, stream, declaration);
@@ -865,12 +848,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     if (error) return error;
 
     try {
-      rejectUnknownParams(c, "getRecord");
+      rejectUnknownParams(c, "getRecord", context!.tokenKind);
       // §8 requires client-token `expand[]` to be REJECTED before the
       // declaration is consulted, on single-record reads as well as lists.
       // Silently ignoring it told a client its request was honored when a
       // narrower thing happened instead.
-      if (context!.tokenKind === "client") rejectClientOnlyParams(c);
       const stream = c.req.param("stream");
       const recordKey = decodeURIComponent(c.req.param("id"));
       const declaration = deps.declarations.get(stream);
