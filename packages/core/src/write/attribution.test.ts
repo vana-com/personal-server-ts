@@ -327,6 +327,49 @@ describe("verifyWriterAttribution", () => {
     ).rejects.toMatchObject({ errorCode: "WRITE_ATTRIBUTION_INVALID" });
   });
 
+  // Signature malleability: v as 27/28 vs 0/1 and hex case both recover to
+  // the same signer, so a guard keyed on the raw header treats a re-encoded
+  // replay as a fresh proof. The guard must key on the signed payload.
+  it("rejects a replay whose signature bytes were re-encoded", async () => {
+    const replayStore = createInMemoryWriteProofReplayStore();
+    const original = await buildWriteRequest({});
+    const header = original.headers.get(WRITE_SIGNATURE_HEADER) ?? "";
+    const dot = header.lastIndexOf(".");
+    const sig = header.slice(dot + 1);
+    const v = sig.slice(-2).toLowerCase();
+    const flippedV =
+      v === "1b" ? "00" : v === "1c" ? "01" : v === "00" ? "1b" : "1c";
+    const reencoded = [
+      header.slice(0, dot + 1) + sig.slice(0, -2) + flippedV,
+      header.slice(0, dot + 1) + sig.slice(0, 2) + sig.slice(2).toUpperCase(),
+    ];
+
+    const first = await verifyWriterAttribution({
+      request: original.clone(),
+      builderAddress: builderWallet.address,
+      grantId: GRANT_ID,
+      serverOrigin: SERVER_ORIGIN,
+      replayStore,
+    });
+    expect(first.builder).toBe(builderWallet.address);
+
+    for (const variant of reencoded) {
+      const replay = await buildWriteRequest({ header: variant });
+      await expect(
+        verifyWriterAttribution({
+          request: replay,
+          builderAddress: builderWallet.address,
+          grantId: GRANT_ID,
+          serverOrigin: SERVER_ORIGIN,
+          replayStore,
+        }),
+      ).rejects.toMatchObject({
+        code: 401,
+        errorCode: "WRITE_ATTRIBUTION_REPLAY",
+      });
+    }
+  });
+
   it("consumes the proof so an identical write is rejected as a replay", async () => {
     const replayStore = createInMemoryWriteProofReplayStore();
     const request = await buildWriteRequest({});
