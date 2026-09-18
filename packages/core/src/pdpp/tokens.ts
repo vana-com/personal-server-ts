@@ -46,6 +46,13 @@ export interface TokenIssuanceResult {
   refresh_token?: string;
   /** Echoed so a client can bind its own state to the grant. */
   grant_id: string;
+  /**
+   * The approved RFC 9396 detail, as granted. RFC 9396 §7 requires the token
+   * response to return `authorization_details` as granted by the resource
+   * owner and assigned to the access token — the same projection introspection
+   * carries.
+   */
+  authorization_details: PdppAuthorizationDetail[];
 }
 
 export type TokenFailureCode = "invalid_grant" | "invalid_request";
@@ -311,6 +318,7 @@ export class PdppTokenService {
         expires_in: expiresIn,
         ...(refreshToken && { refresh_token: refreshToken }),
         grant_id: grant.grant_id,
+        authorization_details: [toAuthorizationDetail(grant)],
       },
     };
   }

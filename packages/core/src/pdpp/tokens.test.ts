@@ -108,6 +108,18 @@ describe("§9 AS item 19 — authorization codes consume atomically", () => {
     expect(result.issued.token_type).toBe("Bearer");
   });
 
+  it("carries the granted authorization_details, matching introspection (RFC 9396 §7)", () => {
+    const { code } = seedGrant("continuous");
+    const result = redeem(code);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    const introspected = tokens.introspect(result.issued.access_token);
+    expect(result.issued.authorization_details).toEqual(
+      introspected.authorization_details,
+    );
+  });
+
   it("rejects every later redemption with invalid_grant and issues nothing", () => {
     const { code } = seedGrant();
     const first = redeem(code);
@@ -263,6 +275,24 @@ describe("§9 AS item 20 — refresh tokens and family reuse", () => {
     if (!rotated.ok) return;
     expect(rotated.issued.refresh_token).toBeDefined();
     expect(rotated.issued.refresh_token).not.toBe(first.issued.refresh_token);
+  });
+
+  it("carries the granted authorization_details on refresh, matching introspection", () => {
+    const { code } = seedGrant("continuous");
+    const first = redeem(code);
+    expect(first.ok).toBe(true);
+    if (!first.ok || !first.issued.refresh_token) return;
+
+    const rotated = tokens.refresh({
+      refreshToken: first.issued.refresh_token,
+    });
+    expect(rotated.ok).toBe(true);
+    if (!rotated.ok) return;
+
+    const introspected = tokens.introspect(rotated.issued.access_token);
+    expect(rotated.issued.authorization_details).toEqual(
+      introspected.authorization_details,
+    );
   });
 
   it("revokes the family and all linked access tokens on reuse", () => {

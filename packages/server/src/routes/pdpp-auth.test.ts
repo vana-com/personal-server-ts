@@ -206,6 +206,7 @@ describe("the full authorization journey", () => {
     const issued = (await tokenResponse.json()) as {
       access_token: string;
       refresh_token?: string;
+      authorization_details?: unknown;
     };
     expect(issued.access_token).toBeTruthy();
     // continuous grant ⇒ a refresh token is issued.
@@ -228,6 +229,31 @@ describe("the full authorization journey", () => {
     expect(context.grant_id).toBe(grant_id);
     // The RS gets the complete resolved enforcement context in one response.
     expect(context.authorization_details[0].streams[0].fields).toContain("id");
+    // RFC 9396 §7: the token response MUST carry the authorization_details as
+    // granted — identical to what the RS later resolves via introspection.
+    expect(issued.authorization_details).toEqual(context.authorization_details);
+
+    // The refresh response carries the same granted authorization_details.
+    const refreshResponse = await postForm("/pdpp/v1/token", {
+      grant_type: "refresh_token",
+      refresh_token: issued.refresh_token!,
+    });
+    expect(refreshResponse.status).toBe(200);
+    const refreshed = (await refreshResponse.json()) as {
+      access_token: string;
+      authorization_details?: unknown;
+    };
+    const introspectedRefreshed = await postForm(
+      "/pdpp/v1/introspect",
+      { token: refreshed.access_token },
+      ownerAuth(ownerToken),
+    );
+    const refreshedContext = (await introspectedRefreshed.json()) as {
+      authorization_details: unknown;
+    };
+    expect(refreshed.authorization_details).toEqual(
+      refreshedContext.authorization_details,
+    );
 
     const revoked = await postForm(
       "/pdpp/v1/revoke",
