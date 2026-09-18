@@ -25,6 +25,7 @@ export type {
 export { downloadOne, type DownloadResult } from "./workers/download.js";
 export {
   createPdppImporter,
+  isPermanentRejection,
   normalizeDigest,
   PDPP_METADATA_KEY,
   SUPPORTED_PDPP_METADATA_VERSION,

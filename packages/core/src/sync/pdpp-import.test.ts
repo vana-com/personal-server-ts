@@ -18,13 +18,17 @@ import {
 } from "../storage/pdpp-records/index.js";
 import {
   createPdppImporter,
+  isPermanentRejection,
   normalizeDigest,
   type ImportableEnvelope,
   type PdppImporter,
+  type PdppImportRejectionCode,
   type RetainedDeclaration,
 } from "./pdpp-import.js";
 import type { Logger } from "../logger/index.js";
 
+const SCOPE = "instagram.profile";
+const COLLECTED_AT = "2026-09-17T10:00:00.000Z";
 const SOURCE_ID = "https://registry.pdpp.dev/connectors/instagram";
 
 /** A real declaration document, as a deployment would retain it on disk. */
@@ -164,6 +168,98 @@ describe("normalizeDigest", () => {
     expect(normalizeDigest("not-a-digest")).toBeNull();
     expect(normalizeDigest(`sha256:${"a".repeat(63)}`)).toBeNull();
     expect(normalizeDigest(`sha256:${"z".repeat(64)}`)).toBeNull();
+  });
+});
+
+describe("retry classification", () => {
+  it("treats envelope-describing rejections as permanent", () => {
+    // These describe the producer's bytes. Re-reading the same envelope on a
+    // later cycle cannot change the verdict.
+    for (const code of [
+      "malformed_metadata",
+      "unsupported_metadata_version",
+      "digest_mismatch",
+      "declaration_version_mismatch",
+      "scope_mismatch",
+      "unknown_stream",
+      "primary_key_mismatch",
+      "semantics_mismatch",
+      "record_key_mismatch",
+    ] as const) {
+      expect(isPermanentRejection({ code, message: "" })).toBe(true);
+    }
+  });
+
+  it("treats deployment-state rejections as transient", () => {
+    // These describe THIS deployment, not the envelope: a declaration not
+    // retained yet, an instance inventory not populated yet, a store that is
+    // briefly unhealthy. All three start working later, so calling them
+    // permanent is how an envelope gets stranded.
+    for (const code of [
+      "unknown_source",
+      "no_instance",
+      "store_rejected",
+    ] as const) {
+      expect(isPermanentRejection({ code, message: "" })).toBe(false);
+    }
+  });
+
+  it("treats an unrecognized code as transient", () => {
+    // Fail-closed: a new failure mode should be retried visibly rather than
+    // silently abandoned because nobody updated a list.
+    expect(
+      isPermanentRejection({
+        code: "something_new" as PdppImportRejectionCode,
+        message: "",
+      }),
+    ).toBe(false);
+  });
+
+  it("settles a version once its outcome cannot improve", () => {
+    const { importer } = setup();
+    expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(true);
+
+    expect(importer.importEnvelope(envelope()).status).toBe("imported");
+    expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(false);
+  });
+
+  it("settles a permanently-rejected version", () => {
+    const { importer } = setup();
+    importer.importEnvelope(envelope({ digest: `sha256:${"b".repeat(64)}` }));
+    expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(false);
+  });
+
+  it("settles a non-PDPP version so it is never re-read", () => {
+    const { importer } = setup();
+    const outcome = importer.importEnvelope({
+      scope: SCOPE,
+      collectedAt: COLLECTED_AT,
+      data: { id: "1" },
+    });
+    expect(outcome.status).toBe("skipped");
+    expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(false);
+  });
+
+  it("leaves a transiently-rejected version open for retry", () => {
+    const store = createMemoryRecordStore();
+    // No instance derivable yet — the deployment is still coming up.
+    const importer = createPdppImporter({
+      store,
+      declarations: [RETAINED],
+      instanceFor: () => undefined,
+      logger: silentLogger(),
+    });
+
+    expect(importer.importEnvelope(envelope()).status).toBe("rejected");
+    expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(true);
+  });
+
+  it("tracks versions independently", () => {
+    const { importer } = setup();
+    importer.importEnvelope(envelope());
+    expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(false);
+    // A different version of the same scope has its own verdict.
+    expect(importer.needsRetry(SCOPE, "2026-09-18T10:00:00.000Z")).toBe(true);
   });
 });
 

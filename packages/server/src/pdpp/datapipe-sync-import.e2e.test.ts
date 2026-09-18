@@ -219,6 +219,75 @@ function createLegacyStorage(): DataStoragePort & {
   };
 }
 
+/**
+ * A legacy storage port that PERSISTS its index across sync runs.
+ *
+ * `createLegacyStorage` above is fresh per call, which models a first-ever
+ * download and cannot express the case that matters here: a data point that
+ * is already in the local index when a later sync re-lists it. The retry path
+ * is exactly the path that only exists on the second run, so testing it needs
+ * an index that survives between runs.
+ *
+ * `downloads` counts adapter fetches so a retry can be shown to reuse the
+ * cached local envelope rather than re-fetching the blob.
+ */
+function createPersistentLegacyStorage(): DataStoragePort & {
+  envelopes: Map<string, DataFileEnvelope>;
+  entries: Array<{
+    dataPointId: string | null;
+    scope: string;
+    collectedAt: string;
+    path: string;
+    schemaId: string | null;
+    fileId: string | null;
+  }>;
+} {
+  const envelopes = new Map<string, DataFileEnvelope>();
+  const entries: Array<{
+    dataPointId: string | null;
+    scope: string;
+    collectedAt: string;
+    path: string;
+    schemaId: string | null;
+    fileId: string | null;
+  }> = [];
+  const keyOf = (scope: string, at: string) => `${scope}@${at}`;
+
+  return {
+    envelopes,
+    entries,
+    findByDataPointId: (id: string) =>
+      entries.find((e) => e.dataPointId === id),
+    findEntry: ({ scope, at }: { scope: string; at: string }) =>
+      entries.find((e) => e.scope === scope && e.collectedAt === at),
+    writeEnvelope: async (envelope: DataFileEnvelope) => {
+      envelopes.set(keyOf(envelope.scope, envelope.collectedAt), envelope);
+      return {
+        path: `/data/${envelope.scope}/${envelope.collectedAt}.json`,
+        relativePath: `${envelope.scope}/${envelope.collectedAt}.json`,
+        sizeBytes: 256,
+      };
+    },
+    insertEntry: async (entry: Record<string, unknown>) => {
+      entries.push(entry as unknown as (typeof entries)[number]);
+      return entry;
+    },
+    readEnvelope: async (scope: string, collectedAt: string) => {
+      const found = envelopes.get(keyOf(scope, collectedAt));
+      if (!found) throw new Error("no local envelope");
+      return found;
+    },
+    updateDataPointId: async () => true,
+    listVersions: () => [],
+    deleteVersion: async () => true,
+    listScopes: () => ({ scopes: [], total: 0 }),
+    deleteByFileId: async () => true,
+  } as unknown as DataStoragePort & {
+    envelopes: Map<string, DataFileEnvelope>;
+    entries: typeof entries;
+  };
+}
+
 function createStorageAdapter(blob: Uint8Array): StorageAdapter {
   return {
     urlForKey: (key: string) => `https://storage.test/${key}`,
@@ -478,6 +547,255 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
       limit: 50,
     });
     expect(changes.data).toHaveLength(1);
+  });
+
+  /**
+   * The retry path. Legacy indexing and PDPP import are two writes with no
+   * shared transaction, so the window between them is real: the envelope can
+   * be indexed while the import fails, or while no importer exists yet.
+   *
+   * The danger is that the legacy index is itself the dedup key. Once an
+   * entry exists, a later sync recognises the data point as already-handled
+   * and returns before decrypting — so without an explicit retry the record
+   * is stranded in local storage forever, invisible to every PDPP read, and
+   * no amount of re-syncing recovers it.
+   */
+  describe("retry after the import did not happen", () => {
+    /** Drive one sync run against a persistent index. */
+    async function syncWith(
+      storage: DataStoragePort,
+      envelope: DataFileEnvelope,
+      target: PdppImporter | undefined,
+      adapter: StorageAdapter,
+    ): Promise<void> {
+      await downloadOne(
+        {
+          storage,
+          storageAdapter: adapter,
+          gateway: {} as never,
+          cursor: {} as never,
+          masterKey,
+          serverOwner: OWNER,
+          logger,
+          pdppImporter: target,
+        } as never,
+        makeDataPointRecord(),
+      );
+    }
+
+    it("imports on a later sync after the first import failed", async () => {
+      const storage = createPersistentLegacyStorage();
+      const envelope = makeEnvelope({
+        id: "235680975",
+        username: "callumflack",
+        full_name: "Callum Flack",
+        $pdpp: pdppMetadata(),
+      });
+      const adapter = createStorageAdapter(
+        await encryptEnvelope(envelope, masterKey),
+      );
+
+      // Run 1: the importer is transiently broken — the store is unreachable,
+      // not the metadata invalid. Legacy indexing still succeeds.
+      let failing = true;
+      const flaky: PdppImporter = {
+        importEnvelope: (e) => {
+          if (failing) throw new Error("record store temporarily unavailable");
+          return importer.importEnvelope(e);
+        },
+        needsRetry: (scope, at) => importer.needsRetry(scope, at),
+      };
+      await syncWith(storage, envelope, flaky, adapter);
+
+      expect(storage.entries).toHaveLength(1);
+      expect(store.getRecord(INSTANCE, "profile", "235680975")).toBeUndefined();
+
+      // Run 2: the transient condition cleared. The data point is already in
+      // the local index, so this is precisely the dedup path.
+      failing = false;
+      await syncWith(storage, envelope, flaky, adapter);
+
+      const record = store.getRecord(INSTANCE, "profile", "235680975");
+      expect(record).toBeDefined();
+      expect(record?.data.username).toBe("callumflack");
+      // Exactly once: the retry must not manufacture a second revision.
+      expect(record?.version).toBe(1);
+    });
+
+    it("imports once the importer is enabled after an earlier sync", async () => {
+      const storage = createPersistentLegacyStorage();
+      const envelope = makeEnvelope({
+        id: "235680975",
+        username: "callumflack",
+        full_name: "Callum Flack",
+        $pdpp: pdppMetadata(),
+      });
+      const adapter = createStorageAdapter(
+        await encryptEnvelope(envelope, masterKey),
+      );
+
+      // Run 1: PDPP is not mounted at all (disabled, or booted after sync).
+      await syncWith(storage, envelope, undefined, adapter);
+      expect(storage.entries).toHaveLength(1);
+      expect(store.listStreams([INSTANCE])).toEqual([]);
+
+      // Run 2: PDPP now mounted. The envelope indexed before it existed must
+      // still reach the record store.
+      await syncWith(storage, envelope, importer, adapter);
+
+      const record = store.getRecord(INSTANCE, "profile", "235680975");
+      expect(record).toBeDefined();
+      expect(record?.version).toBe(1);
+    });
+
+    it("survives a restart: an entry indexed before PDPP existed still imports", async () => {
+      const storage = createPersistentLegacyStorage();
+      const envelope = makeEnvelope({
+        id: "235680975",
+        username: "callumflack",
+        full_name: "Callum Flack",
+        $pdpp: pdppMetadata(),
+      });
+      const adapter = createStorageAdapter(
+        await encryptEnvelope(envelope, masterKey),
+      );
+
+      await syncWith(storage, envelope, undefined, adapter);
+
+      // Restart: same DB file, fresh store and importer, same legacy index.
+      store.close();
+      const reopened = createSqliteRecordStore(new Database(dbPath));
+      store = reopened;
+      await syncWith(storage, envelope, buildImporter(reopened), adapter);
+
+      expect(
+        reopened.getRecord(INSTANCE, "profile", "235680975")?.version,
+      ).toBe(1);
+    });
+
+    it("reuses the cached local envelope instead of re-downloading", async () => {
+      const storage = createPersistentLegacyStorage();
+      const envelope = makeEnvelope({
+        id: "235680975",
+        username: "callumflack",
+        full_name: "Callum Flack",
+        $pdpp: pdppMetadata(),
+      });
+      let downloads = 0;
+      const counting = {
+        urlForKey: (key: string) => `https://storage.test/${key}`,
+        download: async () => {
+          downloads += 1;
+          return Uint8Array.from(await encryptEnvelope(envelope, masterKey));
+        },
+      } as unknown as StorageAdapter;
+
+      await syncWith(storage, envelope, undefined, counting);
+      expect(downloads).toBe(1);
+
+      // The retry has the plaintext envelope on disk already; re-fetching and
+      // re-decrypting the blob would be wasted network and CPU every cycle.
+      await syncWith(storage, envelope, importer, counting);
+      expect(downloads).toBe(1);
+      expect(store.getRecord(INSTANCE, "profile", "235680975")).toBeDefined();
+    });
+
+    it("does not re-import an entry that was already imported", async () => {
+      const storage = createPersistentLegacyStorage();
+      const envelope = makeEnvelope({
+        id: "235680975",
+        username: "callumflack",
+        full_name: "Callum Flack",
+        $pdpp: pdppMetadata(),
+      });
+      const adapter = createStorageAdapter(
+        await encryptEnvelope(envelope, masterKey),
+      );
+
+      const anchor = store.changesSince("profile", {
+        instanceIds: [INSTANCE],
+        limit: 50,
+      }).nextChangesSince;
+
+      await syncWith(storage, envelope, importer, adapter);
+      // Three further cycles over an already-imported, already-indexed point.
+      await syncWith(storage, envelope, importer, adapter);
+      await syncWith(storage, envelope, importer, adapter);
+      await syncWith(storage, envelope, importer, adapter);
+
+      expect(store.getRecord(INSTANCE, "profile", "235680975")?.version).toBe(
+        1,
+      );
+      const changes = store.changesSince("profile", {
+        instanceIds: [INSTANCE],
+        changesSince: anchor,
+        limit: 50,
+      });
+      expect(changes.data).toHaveLength(1);
+    });
+
+    it("does not retry an envelope whose metadata is invalid", async () => {
+      const storage = createPersistentLegacyStorage();
+      // Invalid metadata is a permanent verdict, not a transient one. Re-
+      // reading and re-verifying it on every cycle forever would be work that
+      // can never succeed.
+      const envelope = makeEnvelope({
+        id: "235680975",
+        username: "callumflack",
+        $pdpp: pdppMetadata({
+          declaration: {
+            source: "instagram",
+            version: "0.1.0-local",
+            upstreamCommit: null,
+            digest: `sha256:${"b".repeat(64)}`,
+          },
+        }),
+      });
+      const adapter = createStorageAdapter(
+        await encryptEnvelope(envelope, masterKey),
+      );
+
+      let calls = 0;
+      const counting: PdppImporter = {
+        importEnvelope: (e) => {
+          calls += 1;
+          return importer.importEnvelope(e);
+        },
+        needsRetry: (scope, at) => importer.needsRetry(scope, at),
+      };
+
+      await syncWith(storage, envelope, counting, adapter);
+      expect(calls).toBe(1);
+      await syncWith(storage, envelope, counting, adapter);
+
+      // Rejected once and not retried; nothing imported either way.
+      expect(calls).toBe(1);
+      expect(store.listStreams([INSTANCE])).toEqual([]);
+    });
+
+    it("does not retry a non-PDPP envelope", async () => {
+      const storage = createPersistentLegacyStorage();
+      const envelope = makeEnvelope({ id: "1", username: "legacy" });
+      const adapter = createStorageAdapter(
+        await encryptEnvelope(envelope, masterKey),
+      );
+
+      let calls = 0;
+      const counting: PdppImporter = {
+        importEnvelope: (e) => {
+          calls += 1;
+          return importer.importEnvelope(e);
+        },
+        needsRetry: (scope, at) => importer.needsRetry(scope, at),
+      };
+
+      await syncWith(storage, envelope, counting, adapter);
+      expect(calls).toBe(1);
+      // A legacy envelope carries no $pdpp and never will. Re-reading it
+      // every cycle would be permanent waste for every pre-PDPP data point.
+      await syncWith(storage, envelope, counting, adapter);
+      expect(calls).toBe(1);
+    });
   });
 
   describe("malformed and hostile metadata", () => {

@@ -128,6 +128,46 @@ export interface PdppImportRejection {
   message: string;
 }
 
+/**
+ * Rejection codes that describe the ENVELOPE rather than this deployment's
+ * current state. They are permanent verdicts: the same bytes re-read on a
+ * later cycle produce the same answer, so retrying them is work that can
+ * never succeed.
+ *
+ * `unknown_source` and `no_instance` are deliberately NOT here. Both depend
+ * on what this deployment has mounted — a declaration that is not retained
+ * yet, or an instance inventory that is not populated yet — and both start
+ * working once boot completes or an operator provisions the declaration.
+ * Treating them as permanent is exactly how an envelope gets stranded.
+ * `store_rejected` is likewise excluded: the store is infrastructure, and a
+ * write it refuses today may be accepted once it is healthy.
+ */
+const PERMANENT_REJECTION_CODES: ReadonlySet<PdppImportRejectionCode> = new Set(
+  [
+    "malformed_metadata",
+    "unsupported_metadata_version",
+    "digest_mismatch",
+    "declaration_version_mismatch",
+    "scope_mismatch",
+    "unknown_stream",
+    "primary_key_mismatch",
+    "semantics_mismatch",
+    "record_key_mismatch",
+  ],
+);
+
+/**
+ * Whether a rejection is a settled verdict about the envelope itself.
+ *
+ * Callers use this to decide whether re-offering the same envelope later
+ * could ever change the answer. Fail-closed by construction: an unrecognized
+ * code is treated as transient, so a new failure mode is retried (visibly,
+ * with a logged outcome) rather than silently abandoned.
+ */
+export function isPermanentRejection(rejection: PdppImportRejection): boolean {
+  return PERMANENT_REJECTION_CODES.has(rejection.code);
+}
+
 export type PdppImportOutcome =
   /** Not a PDPP-bearing envelope. Legacy-only, and not an error. */
   | { status: "skipped" }
@@ -163,6 +203,25 @@ export interface PdppImporterDeps {
 export interface PdppImporter {
   /** Import one decrypted envelope. Never throws; failures are outcomes. */
   importEnvelope(envelope: ImportableEnvelope): PdppImportOutcome;
+  /**
+   * Whether re-offering this already-indexed (scope, collectedAt) could still
+   * change anything.
+   *
+   * The retry path uses this to decide whether reading the envelope back off
+   * disk is worth doing at all. It answers false once an offer for that exact
+   * version has settled — imported, verified-unchanged, permanently rejected,
+   * or found to carry no `$pdpp` — because none of those can be changed by
+   * looking again. It answers true for a version never offered, and for one
+   * whose last attempt failed transiently.
+   *
+   * Deliberately in-memory and process-scoped. The answers it caches are all
+   * re-derivable: after a restart the first cycle re-reads each entry once and
+   * re-settles it. Persisting them would add schema and a migration to avoid
+   * a single bounded read per entry per boot, and would risk a stale "settled"
+   * row outliving the condition that produced it — the exact class of bug this
+   * whole retry path exists to fix.
+   */
+  needsRetry(scope: string, collectedAt: string): boolean;
 }
 
 interface PdppMetadata {
@@ -358,6 +417,36 @@ export function createPdppImporter(deps: PdppImporterDeps): PdppImporter {
   const bySourceId = new Map<string, RetainedDeclaration>();
   for (const declaration of deps.declarations) {
     bySourceId.set(declaration.sourceId, declaration);
+  }
+
+  /**
+   * Versions whose import outcome cannot change on a later offer. Bounded by
+   * the number of distinct (scope, collectedAt) pairs this process sees, and
+   * holding only a short key per entry.
+   */
+  const settled = new Set<string>();
+  const versionKey = (scope: string, collectedAt: string) =>
+    `${scope}@${collectedAt}`;
+
+  function needsRetry(scope: string, collectedAt: string): boolean {
+    return !settled.has(versionKey(scope, collectedAt));
+  }
+
+  /**
+   * Record whether this version is done with, so the retry path can stop
+   * reading it back off disk every cycle.
+   *
+   * Only a transient rejection stays unsettled — that is the one outcome a
+   * later cycle can genuinely improve on.
+   */
+  function importAndSettle(envelope: ImportableEnvelope): PdppImportOutcome {
+    const outcome = importEnvelope(envelope);
+    const retryable =
+      outcome.status === "rejected" && !isPermanentRejection(outcome.rejection);
+    if (!retryable) {
+      settled.add(versionKey(envelope.scope, envelope.collectedAt));
+    }
+    return outcome;
   }
 
   function importEnvelope(envelope: ImportableEnvelope): PdppImportOutcome {
@@ -560,5 +649,5 @@ export function createPdppImporter(deps: PdppImporterDeps): PdppImporter {
     };
   }
 
-  return { importEnvelope };
+  return { importEnvelope: importAndSettle, needsRetry };
 }

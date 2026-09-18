@@ -352,6 +352,11 @@ export async function createServer(
   const pdppImporter: PdppImporter = {
     importEnvelope: (envelope) =>
       pdppImporterImpl?.importEnvelope(envelope) ?? { status: "skipped" },
+    // Before PDPP mounts, nothing is settled: an entry indexed during that
+    // window must still be retried once the real importer attaches, which is
+    // the "enable PDPP after an earlier sync" case.
+    needsRetry: (scope, collectedAt) =>
+      pdppImporterImpl?.needsRetry(scope, collectedAt) ?? true,
   };
   // Deletion-aware registry view. Independent of sync: the data route uses
   // it to answer 410 for scopes the owner deleted even when sync is off.
