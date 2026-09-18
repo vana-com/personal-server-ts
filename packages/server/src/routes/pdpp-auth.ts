@@ -40,7 +40,10 @@
 
 import { Hono, type Context } from "hono";
 import type { Logger } from "pino";
-import type { ClientIdentityResult } from "@opendatalabs/personal-server-ts-core/pdpp";
+import type {
+  ClientIdentityResult,
+  ClientIdMetadataDocument,
+} from "@opendatalabs/personal-server-ts-core/pdpp";
 import type {
   AuthorizationSessionStore,
   PdppTokenService,
@@ -330,10 +333,17 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     // URL-hosted identity: rejecting solely for absence of preregistration is
     // the one reason the spec names as insufficient.
     let redirectPolicy = deps.registeredClient?.(body.client_id) ?? null;
+    // The document that earned redirect admission, carried forward so the
+    // consent surface shows the identity the verified domain asserted rather
+    // than whatever the client put in `client_display`. §6 ranks validated
+    // binding metadata above inline metadata; admitting on the document and
+    // then displaying the inline name would break that.
+    let validatedClientDocument: ClientIdMetadataDocument | undefined;
     if (!redirectPolicy && deps.resolveClientIdentity) {
       const resolved = await deps.resolveClientIdentity(body.client_id);
       if (resolved.ok) {
         redirectPolicy = resolved.policy;
+        validatedClientDocument = resolved.document;
       } else {
         // The refusal names the actual reason -- untrusted URL, unreachable,
         // mismatched document -- rather than "not registered", so an operator
@@ -401,6 +411,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       snapshot,
       requester: resolveRequesterIdentity({
         client_id: body.client_id,
+        document: validatedClientDocument,
         inline: body.client_display,
       }),
       redirectUri: body.redirect_uri,

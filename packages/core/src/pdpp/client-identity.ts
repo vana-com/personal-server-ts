@@ -35,7 +35,10 @@ import {
   checkDeclarationUrl,
   type DeclarationTrustPolicy,
 } from "./declaration.js";
-import { verifyClientIdDocument } from "./client-metadata.js";
+import {
+  verifyClientIdDocument,
+  type ClientIdMetadataDocument,
+} from "./client-metadata.js";
 import type { RegisteredRedirectPolicy } from "./redirect.js";
 
 /** Bodies larger than this are refused rather than buffered. */
@@ -69,7 +72,24 @@ export interface ResolveClientIdentityOptions {
 }
 
 export type ClientIdentityResult =
-  | { ok: true; policy: RegisteredRedirectPolicy; verifiedDomain: string }
+  | {
+      ok: true;
+      policy: RegisteredRedirectPolicy;
+      verifiedDomain: string;
+      /**
+       * The validated document itself, so the caller can resolve the requester
+       * identity from it.
+       *
+       * Returning this is what keeps redirect trust and displayed identity in
+       * agreement. The document is what earned the client its redirect
+       * admission; if the AS then rendered the client's inline
+       * `client_display` instead, the owner could be shown a name the verified
+       * domain never asserted. §6 ranks validated binding metadata above
+       * inline metadata, and the caller can only honor that ranking if it is
+       * handed the metadata.
+       */
+      document: ClientIdMetadataDocument;
+    }
   | { ok: false; failure: ClientIdentityFailure };
 
 /**
@@ -184,15 +204,25 @@ export async function resolveUrlHostedClientIdentity(
     };
   }
 
+  // A document that declares no usable name gets none, rather than an empty
+  // one. `resolveRequesterIdentity` falls back through inline metadata to the
+  // client_id itself, so an absent name must be absent -- a `{ name: "" }`
+  // would outrank the inline display and render a blank requester.
+  const documentName =
+    typeof document.client_name === "string" && document.client_name.length > 0
+      ? document.client_name
+      : undefined;
+
   // The identity check: the document must assert the URL it came from.
   // Without this, any host could publish a document claiming to be someone
   // else's client_id.
-  const verified = verifyClientIdDocument({
+  const candidate: ClientIdMetadataDocument = {
     client_id: String(document.client_id ?? ""),
-    display: { name: String(document.client_name ?? "") },
+    ...(documentName && { display: { name: documentName } }),
     https: true,
     retrieved_from: retrieved.finalUrl,
-  });
+  };
+  const verified = verifyClientIdDocument(candidate);
   if (!verified) {
     return {
       ok: false,
@@ -221,5 +251,9 @@ export async function resolveUrlHostedClientIdentity(
     ok: true,
     policy: { client_id: clientId, redirect_uris: redirectUris },
     verifiedDomain: verified.verifiedDomain,
+    // The same document that earned redirect admission, so the caller can
+    // resolve the displayed requester identity from it rather than from the
+    // client's inline assertion.
+    document: candidate,
   };
 }

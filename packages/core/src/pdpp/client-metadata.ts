@@ -39,7 +39,13 @@ export interface ClientIdMetadataDocument {
   retrieved_from: string;
   /** The client_id the document asserts. */
   client_id: string;
-  display: ClientDisplay;
+  /**
+   * Optional: a document may validly declare redirect_uris and no name. An
+   * absent name must stay absent rather than become `{ name: "" }`, which
+   * would outrank inline metadata in §6 precedence and render a blank
+   * requester on the consent surface.
+   */
+  display?: ClientDisplay;
   /** Whether retrieval used HTTPS. */
   https: boolean;
 }
