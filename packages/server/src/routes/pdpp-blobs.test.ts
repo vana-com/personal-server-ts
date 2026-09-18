@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import Database from "better-sqlite3";
 import {
   createMemoryRecordStore,
@@ -112,6 +112,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
         "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
       }),
       declarations,
+      instancesForSubject: () => ["inst_1"],
       readBlobBytes: async () => new Uint8Array(10),
     });
     const res = await app.request("/blob_1", {
@@ -150,6 +151,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
         "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
       }),
       declarations,
+      instancesForSubject: () => ["inst_1"],
     });
     const res = await app.request("/blob_1", {
       method: "HEAD",
@@ -192,6 +194,129 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       headers: { Authorization: "Bearer owner-tok" },
     });
     expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error.code).toBe("blob_not_found");
+  });
+
+  it("denies an owner token when instancesForSubject is not wired up (fail closed, not fail open)", async () => {
+    // No instancesForSubject resolver at all -- an owner token must not be
+    // treated as "sees everything" just because ownership couldn't be
+    // checked. Absence of the resolver must deny, not bypass.
+    const store = newStore();
+    store.putBlobMeta({
+      blobId: "blob_1",
+      mimeType: "image/jpeg",
+      sizeBytes: 10,
+      sha256: "abc",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: "blob_1" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
+    const readBlobBytes = vi.fn(async () => new Uint8Array(10));
+    const app = pdppBlobsRoutes({
+      readBlobBytes,
+      store,
+      auth: createFixtureAuthorizationService({
+        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+      }),
+      declarations,
+      // instancesForSubject intentionally omitted.
+    });
+    const res = await app.request("/blob_1", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+    expect(res.status).toBe(404);
+    expect(readBlobBytes).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(body.error.code).toBe("blob_not_found");
+  });
+
+  it("denies an owner token when instancesForSubject resolves an empty list", async () => {
+    const store = newStore();
+    store.putBlobMeta({
+      blobId: "blob_1",
+      mimeType: "image/jpeg",
+      sizeBytes: 10,
+      sha256: "abc",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: "blob_1" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
+    const readBlobBytes = vi.fn(async () => new Uint8Array(10));
+    const app = pdppBlobsRoutes({
+      readBlobBytes,
+      store,
+      auth: createFixtureAuthorizationService({
+        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+      }),
+      declarations,
+      instancesForSubject: () => [],
+    });
+    const res = await app.request("/blob_1", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+    expect(res.status).toBe(404);
+    expect(readBlobBytes).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(body.error.code).toBe("blob_not_found");
+  });
+
+  it("denies an owner token with no subjectId, even with instancesForSubject wired up", async () => {
+    const store = newStore();
+    store.putBlobMeta({
+      blobId: "blob_1",
+      mimeType: "image/jpeg",
+      sizeBytes: 10,
+      sha256: "abc",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: "blob_1" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
+    const readBlobBytes = vi.fn(async () => new Uint8Array(10));
+    const app = pdppBlobsRoutes({
+      readBlobBytes,
+      store,
+      auth: createFixtureAuthorizationService({
+        "owner-tok": { active: true, tokenKind: "owner" }, // no subjectId
+      }),
+      declarations,
+      instancesForSubject: () => ["inst_1"],
+    });
+    const res = await app.request("/blob_1", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+    expect(res.status).toBe(404);
+    expect(readBlobBytes).not.toHaveBeenCalled();
     const body = await res.json();
     expect(body.error.code).toBe("blob_not_found");
   });
@@ -366,6 +491,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
         "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
       }),
       declarations,
+      instancesForSubject: () => ["inst_1"],
       // readBlobBytes intentionally omitted.
     });
     const res = await app.request("/blob_1", {
@@ -404,6 +530,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
         "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
       }),
       declarations,
+      instancesForSubject: () => ["inst_1"],
       readBlobBytes: async () => undefined,
     });
     const res = await app.request("/blob_1", {
@@ -442,6 +569,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
         "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
       }),
       declarations,
+      instancesForSubject: () => ["inst_1"],
       readBlobBytes: async () => {
         throw new Error(
           "disk read failed: /var/blobs/blob_1 permission denied",
@@ -486,6 +614,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
         "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
       }),
       declarations,
+      instancesForSubject: () => ["inst_1"],
       readBlobBytes: async () => new Uint8Array(0),
     });
     const res = await app.request("/blob_1", {
@@ -524,6 +653,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
         "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
       }),
       declarations,
+      instancesForSubject: () => ["inst_1"],
       readBlobBytes: async () => payload,
     });
     const res = await app.request("/blob_1", {
@@ -776,6 +906,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
         "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
       }),
       declarations,
+      instancesForSubject: () => ["inst_1"],
       readBlobBytes: async () => new Uint8Array(3), // does not match sizeBytes: 10
     });
     const res = await app.request("/blob_1", {

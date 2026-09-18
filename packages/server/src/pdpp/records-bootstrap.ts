@@ -113,7 +113,12 @@ export function createPdppRecordsDeps(
     store: createSqliteRecordStore(options.db),
     auth: coLocatedAuthorizationService(pdppAuth),
     declarations: createStreamDeclarationRegistry(streams),
-    instancesForSubject: () => instances,
+    // This deployment has exactly one owner. A subject other than that
+    // owner (however it got an "owner"-kind token) owns none of these
+    // instances — comparison normalized the same way subjectId is derived
+    // above (lowercased address), so casing never causes a false mismatch.
+    instancesForSubject: (subject) =>
+      subject.toLowerCase() === subjectId ? instances : [],
     resource: options.resource,
     // Co-located: this server is its own authorization server.
     authorizationServers: [options.resource],
