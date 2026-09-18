@@ -315,12 +315,14 @@ export async function openFleetController(options: FleetControllerOptions) {
       await leaseOperation.idle();
     },
     async resume(): Promise<void> {
+      const maintenanceId = directory.maintenanceId;
       delete directory.maintenanceId;
       directory.paused = false;
       try {
         await persist();
       } catch (error) {
         directory.paused = true;
+        directory.maintenanceId = maintenanceId;
         throw error;
       }
     },

@@ -243,7 +243,10 @@ same persisted ID and active imported MCP state. It does not reconcile owners.
 An initial/migration/recovery pause cannot authorize this shortcut; ordinary
 quiesce or activation invalidates the maintenance ID. Reuse a roll ID only for
 retries of that same pause. Lifecycle requests are serialized through completion,
-including failed reconciliation. Empty bodies retain the migration behavior above;
+including failed reconciliation. This queue does not cover migration or rollback;
+operators must exclude those operations throughout directory maintenance.
+A failed resume state write retains the matching maintenance ID for a safe retry.
+Empty bodies retain the migration behavior above;
 unknown maintenance fields or modes fail closed. Owner authority checks on normal
 requests remain unchanged, and rollback export still reconciles explicitly.
 

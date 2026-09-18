@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
@@ -1040,4 +1040,31 @@ it("limits maintenance resume to its durable pause and invalidates it on recover
   expect(options.enroll).not.toHaveBeenCalled();
   expect(options.publish).not.toHaveBeenCalled();
   expect(options.release).not.toHaveBeenCalled();
+});
+
+it("retains maintenance resume authority after a failed state write", async () => {
+  const path = await mkdtemp(join(tmpdir(), "fleet-maintenance-retry-"));
+  paths.push(path);
+  const stateDirectory = join(path, "state");
+  const backup = join(path, "saved");
+  const options = {
+    path: join(stateDirectory, "placements.json"),
+    enroll: vi.fn(),
+    publish: vi.fn(),
+    release: vi.fn(),
+  };
+  const controller = await openFleetController(options);
+  await controller.pauseForMaintenance("directory-retry-1");
+  await rename(stateDirectory, backup);
+  await writeFile(stateDirectory, "block directory creation");
+  await expect(
+    controller.resumeFromMaintenance("directory-retry-1"),
+  ).rejects.toThrow();
+  expect(controller.paused()).toBe(true);
+  await rm(stateDirectory);
+  await rename(backup, stateDirectory);
+  await controller.resumeFromMaintenance("directory-retry-1");
+  expect(controller.paused()).toBe(false);
+  expect((await openFleetController(options)).paused()).toBe(false);
+  expect(options.enroll).not.toHaveBeenCalled();
 });
