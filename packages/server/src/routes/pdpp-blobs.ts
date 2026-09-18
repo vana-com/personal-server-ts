@@ -117,7 +117,8 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       // owned list must all deny rather than fall back to "visible to
       // everyone" — mirrors the record routes' `?? []` default.
       if (!context.subjectId) return { error: notFound() };
-      const ownedInstances = deps.instancesForSubject?.(context.subjectId) ?? [];
+      const ownedInstances =
+        deps.instancesForSubject?.(context.subjectId) ?? [];
       const visible = references.some((reference) =>
         ownedInstances.includes(reference.instance),
       );
