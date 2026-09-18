@@ -190,6 +190,10 @@ export async function createPdppAuthDeps(
     resolveDeclaration: registry.resolve,
     declarationRegistry,
     supportedConnectors,
+    // The AS's own issuer identity, for its metadata document. Carried as the
+    // same thunk-or-string `serverOrigin` already is, so a deployment that
+    // resolves its origin late still advertises the live one.
+    issuer: options.serverOrigin,
     inventoryFor: (subject, sourceId) =>
       singleInstanceInventory(subject || subjectId, sourceId),
     /**

@@ -54,6 +54,8 @@ import {
   denyAuthorization,
   fetchReview,
   PDPP_API_VERSION,
+  PDPP_DATA_ACCESS_TYPE,
+  PDPP_DATA_ACCESS_TYPE_V02,
   resolveRequesterIdentity,
   validateCodeChallenge,
   validateRedirectUri,
@@ -163,6 +165,14 @@ export interface PdppAuthRouteDeps {
    * cannot evidence acceptance must not assume it.
    */
   standingTermsFor?(clientId: string): RecipientTerms | null;
+  /**
+   * This authorization server's issuer identifier, used to build the absolute
+   * endpoint URLs in its metadata document. Absent omits the document
+   * entirely rather than publishing relative or guessed URLs — a client that
+   * cannot resolve the endpoints is worse off than one that finds no document
+   * and falls back to configuration.
+   */
+  issuer?: string | (() => string);
 }
 
 function errorResponse(
@@ -237,6 +247,63 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       createOwnerCheckMiddleware(deps.ownerAuth.serverOwner),
     );
   }
+
+  /**
+   * OAuth authorization-server metadata for the PDPP AS.
+   *
+   * v0.2 §8 requires an AS supporting the revision to advertise
+   * `https://pdpp.dev/data-access/0.2` in
+   * `authorization_details_types_supported`, and requires a client to
+   * establish support before requesting the type. Without this document a
+   * conformant client must not request v0.2 at all, so the implementation
+   * would be unreachable to exactly the clients that follow the spec.
+   *
+   * Both types are advertised: both are implemented, each resolves under its
+   * own revision, and dropping v0.1 would strand existing clients.
+   *
+   * This sits under `/pdpp/v1/` rather than at the origin root because the
+   * root document already describes the MCP OAuth authorization server — a
+   * different authority over different tokens. §8 warns against a second grant
+   * authority; merging the documents would present the two as one.
+   */
+  app.get("/.well-known/oauth-authorization-server", (c) => {
+    // A thunk, when the deployment resolves its own origin late (a bound port
+    // it does not know at construction time). Resolved per request so the
+    // document never advertises a stale origin.
+    const issuer =
+      typeof deps.issuer === "function" ? deps.issuer() : deps.issuer;
+    if (!issuer) {
+      return errorResponse(
+        c,
+        404,
+        "not_found",
+        "this deployment does not publish PDPP authorization-server metadata",
+      );
+    }
+    const base = `${issuer.replace(/\/$/, "")}/pdpp/v1`;
+    return c.json(
+      {
+        issuer,
+        authorization_endpoint: `${base}/authorize`,
+        token_endpoint: `${base}/token`,
+        introspection_endpoint: `${base}/introspect`,
+        revocation_endpoint: `${base}/revoke`,
+        authorization_details_types_supported: [
+          PDPP_DATA_ACCESS_TYPE,
+          PDPP_DATA_ACCESS_TYPE_V02,
+        ],
+        grant_types_supported: ["authorization_code", "refresh_token"],
+        response_types_supported: ["code"],
+        // PKCE is required on this flow, not merely supported: PDPP clients
+        // are public clients, so an intercepted code without a verifier is
+        // redeemable by whoever intercepted it.
+        code_challenge_methods_supported: ["S256"],
+        pdpp_api_version: PDPP_API_VERSION,
+      },
+      200,
+      NO_STORE,
+    );
+  });
 
   /**
    * Exchange an already-verified owner proof for a PDPP owner token.
