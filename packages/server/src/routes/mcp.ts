@@ -17,7 +17,7 @@
  * "encrypt grantee private keys at rest" applies there).
  */
 
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import type { Logger } from "pino";
@@ -71,7 +71,11 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/api";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { createServerApiAuth } from "../api-auth.js";
-import { authenticateRequest } from "@opendatalabs/personal-server-ts-core/auth";
+import {
+  authenticateRequest,
+  web3SignedProofId,
+  boundedProofExpiry,
+} from "@opendatalabs/personal-server-ts-core/auth";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -1002,16 +1006,15 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
         400,
       );
     }
-    // Replay guard: bind to a digest of the exact proof header, remembered
-    // until the proof's own expiry (a replay only matters while still valid).
-    const proofHeader = c.req.raw.headers.get("authorization") ?? "";
-    const proofId = createHash("sha256").update(proofHeader).digest("hex");
-    const expSec = authResult.auth.payload.exp;
-    const expiresAtMs =
-      (typeof expSec === "number"
-        ? expSec
-        : Math.floor(Date.now() / 1000) + 300) * 1000;
     try {
+      const expiresAtMs = boundedProofExpiry(
+        authResult.auth.payload,
+        "MCP_SESSION_PROOF_LIFETIME",
+      );
+      const proofId = await web3SignedProofId(
+        c.req.raw.headers.get("authorization") ?? "",
+        authResult.auth.signer,
+      );
       const session = await createMcpSession(
         {
           builderAddress: authResult.auth.signer,

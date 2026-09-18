@@ -720,10 +720,44 @@ export async function handleX402Cycle(
   return { kind: "gateway-error", status: gatewayRes.status, body: errorBody };
 }
 
-function collectedAt(now: () => Date): string {
-  return now()
-    .toISOString()
-    .replace(/\.\d{3}Z$/, "Z");
+const MAX_INGEST_STAMP_ADVANCE_SEC = 60;
+const pendingIngestStamps = new WeakMap<DataStoragePort, Set<string>>();
+
+/** Reserve before awaiting ingestion; keep the existing second-precision paths. */
+function reserveIngestStamp(
+  storage: DataStoragePort,
+  scope: string,
+  now: () => Date,
+): { value: string; release: () => void } {
+  let pending = pendingIngestStamps.get(storage);
+  if (!pending) {
+    pending = new Set();
+    pendingIngestStamps.set(storage, pending);
+  }
+  const base = Math.floor(now().getTime() / 1000) * 1000;
+  for (let bump = 0; bump < MAX_INGEST_STAMP_ADVANCE_SEC; bump += 1) {
+    const value = new Date(base + bump * 1000)
+      .toISOString()
+      .replace(/\.\d{3}Z$/, "Z");
+    const key = `${scope}:${value}`;
+    if (
+      pending.has(key) ||
+      storage.findEntry({ scope, at: value })?.collectedAt === value
+    )
+      continue;
+    pending.add(key);
+    return {
+      value,
+      release: () => {
+        pending.delete(key);
+      },
+    };
+  }
+  throw new ProtocolError(
+    429,
+    "INGEST_CAPACITY",
+    "Too many writes to this scope; retry after a minute",
+  );
 }
 
 /**
@@ -1477,6 +1511,7 @@ export async function handlePersonalServerDataRequest(
       // so the builder's retry with the same still-valid proof is accepted;
       // after commit the proof stays consumed (a retry would be a duplicate).
       let committed = false;
+      let releaseStamp: (() => void) | undefined;
       const failWrite = async <T>(response: T): Promise<T> => {
         await writeAuth?.releaseProof?.();
         return response;
@@ -1485,7 +1520,13 @@ export async function handlePersonalServerDataRequest(
         const scopeResult = parseDataScopeContract(scopeParam);
         if (!scopeResult.ok)
           return failWrite(contractErrorResponse(scopeResult));
-        const collectedAtValue = collectedAt(deps.now ?? (() => new Date()));
+        const stamp = reserveIngestStamp(
+          deps.storage,
+          scopeResult.scope,
+          deps.now ?? (() => new Date()),
+        );
+        releaseStamp = stamp.release;
+        const collectedAtValue = stamp.value;
         const status = deps.syncManager ? "syncing" : "stored";
         const afterTombstoneVersion = await ingestTombstoneMarker(
           deps,
@@ -1642,6 +1683,8 @@ export async function handlePersonalServerDataRequest(
           await writeAuth?.releaseProof?.();
         }
         throw err;
+      } finally {
+        releaseStamp?.();
       }
     }
 

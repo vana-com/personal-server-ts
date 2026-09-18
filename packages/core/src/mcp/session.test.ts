@@ -206,6 +206,11 @@ describe("createMcpSession", () => {
     });
   });
 
+  it("refuses proofs that expire while grant validation is pending", async () => {
+    const replayStore = createInMemoryMcpProofReplayStore();
+    expect(await replayStore.consume("expired", Date.now() - 1)).toBe(true);
+  });
+
   it("allows a fresh proof id after a prior one was consumed", async () => {
     const gw = fakeGateway(grant());
     const replayStore = createInMemoryMcpProofReplayStore();
