@@ -41,7 +41,14 @@ import {
 } from "./resolve.js";
 import type { PdppAuthStore } from "./store.js";
 import type { PdppTokenService } from "./tokens.js";
-import type { DeclarationSnapshot, Grant, SelectionRequest } from "./types.js";
+import { resolveCommitments } from "./commitments.js";
+import type {
+  DeclarationSnapshot,
+  Grant,
+  OwnerConditions,
+  RecipientTerms,
+  SelectionRequest,
+} from "./types.js";
 
 /** How long an owner has to act on a consent screen before it goes stale. */
 export const REVIEW_SESSION_TTL_SECONDS = 10 * 60;
@@ -85,6 +92,13 @@ export type ApprovalFailureCode =
    * them changed the status of the existing session-state case.
    */
   | "selection_refused"
+  /**
+   * v0.2: an owner condition on purpose or retention the recipient's authority
+   * does not cover. Separate from `selection_refused` because the resolution
+   * differs: the owner can adjust a selection themselves, but only the
+   * recipient can accept a term.
+   */
+  | "recipient_terms_unsupported"
   | "invalid_request";
 
 export interface ApprovalFailure {
@@ -364,6 +378,10 @@ export function fetchReview(input: {
    * their choice is incompatible while they can still change it.
    */
   ownerChoices?: OwnerChoices;
+  /** v0.2: conditions the owner attached beyond narrowing the data. */
+  ownerConditions?: OwnerConditions;
+  /** v0.2: standing terms the recipient authorized, when the AS tracks them. */
+  standingTerms?: RecipientTerms;
   /**
    * When given, the review lists this requesting client's other active
    * grants for this owner, so the consent surface can say what is already
@@ -436,7 +454,28 @@ export function fetchReview(input: {
     };
   }
 
+  // Resolved before the review is built, so an uncovered owner condition is
+  // reported to the surface rather than thrown out of `buildConsentReview`.
+  // v0.2 requires the owner to see the resolved commitments before approving,
+  // which means there is no review to show when they cannot be resolved.
+  const commitments = resolveCommitments({
+    request: session.request,
+    ownerConditions: input.ownerConditions,
+    standingTerms: input.standingTerms,
+    declarationVersion: session.snapshot.version,
+  });
+  if (!commitments.ok) {
+    return {
+      ok: false,
+      failure: {
+        code: "recipient_terms_unsupported",
+        message: commitments.failure.message,
+      },
+    };
+  }
+
   const review = buildConsentReview({
+    commitments: commitments.commitments,
     subjectId: session.subject_id,
     request: session.request,
     snapshot: session.snapshot,
@@ -504,6 +543,13 @@ export function approveAuthorization(input: {
    * fails as stale rather than silently issuing a different grant.
    */
   ownerChoices?: OwnerChoices;
+  /**
+   * The owner's v0.2 conditions and the standing terms that may cover them.
+   * These feed commitment resolution, whose output is a digest field, so a
+   * commitment other than the reviewed one fails as stale.
+   */
+  ownerConditions?: OwnerConditions;
+  standingTerms?: RecipientTerms;
   explicitAiTrainingConsent?: boolean;
   now?: Date;
 }): ApprovalResult {
@@ -545,6 +591,8 @@ export function approveAuthorization(input: {
     snapshot: session.snapshot,
     inventory: withInstanceChoices(input.inventory, input.instanceChoices),
     ownerChoices: input.ownerChoices,
+    ownerConditions: input.ownerConditions,
+    standingTerms: input.standingTerms,
     requester: session.requester,
     approvedReviewDigest: input.reviewDigest,
     explicitAiTrainingConsent: input.explicitAiTrainingConsent,
@@ -578,7 +626,9 @@ export function approveAuthorization(input: {
             // invalid request, since the client sent a well-formed one.
             issuance.failure.code === "access_denied"
             ? "selection_refused"
-            : "invalid_request";
+            : issuance.failure.code === "recipient_terms_unsupported"
+              ? "recipient_terms_unsupported"
+              : "invalid_request";
     return { ok: false, failure: { code, message: issuance.failure.message } };
   }
 

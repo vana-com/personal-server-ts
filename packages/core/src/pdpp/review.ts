@@ -25,10 +25,16 @@
 
 import { createHash } from "node:crypto";
 import {
+  resolveCommitments,
+  type ResolvedCommitments,
+} from "./commitments.js";
+import {
   AI_TRAINING_PURPOSE,
   type ClientClaims,
   type ClientDisplay,
   type DeclarationSnapshot,
+  type OwnerConditions,
+  type RecipientTerms,
   type RequestedStream,
   type Retention,
   type SelectionRequest,
@@ -268,6 +274,25 @@ export interface BuildReviewInput {
    * of the request the session already pins, not a decision the owner makes.
    */
   requestedStreams?: RequestedStream[];
+  /**
+   * v0.2: conditions the owner attached beyond narrowing the data, and the
+   * standing terms that may cover them.
+   *
+   * Resolution happens here rather than in the caller so the review and the
+   * digest cannot disagree about which commitments were shown. A condition
+   * outside the recipient's authority makes the whole review unavailable —
+   * there is nothing valid to show the owner — so `buildConsentReview` throws
+   * the same `CommitmentsFailure` the issuance path reports. Callers that can
+   * present a failure to the owner call `resolveCommitments` first.
+   */
+  ownerConditions?: OwnerConditions;
+  standingTerms?: RecipientTerms;
+  /**
+   * Pre-resolved commitments, when the caller already ran
+   * `resolveCommitments` (issuance does, so it can report a refusal rather
+   * than throw). Takes precedence over the two members above.
+   */
+  commitments?: ResolvedCommitments;
   requester: RequesterIdentity;
   /** AS-policy grant expiry, when the deployment sets one. */
   expiresAt?: string;
@@ -294,6 +319,12 @@ export function buildConsentReview(
     ? { attributed_to: requester.display_name, commitments: normalizedClaims }
     : undefined;
 
+  // The commitments the owner will see, resolved from the request or the
+  // recipient's standing terms. These are decision fields: a commitment the
+  // owner never reviewed must not be issuable, so they go into the digest.
+  const commitments =
+    input.commitments ?? resolveOrThrowCommitments(input);
+
   const review_digest = computeReviewDigest({
     subject_id: input.subjectId,
     client_id: requester.client_id,
@@ -301,15 +332,15 @@ export function buildConsentReview(
     source_kind: snapshot.source_kind,
     source_declaration_version: snapshot.version,
     declaration_digest: snapshot.digest,
-    purpose_code: request.purpose_code,
-    purpose_description: request.purpose_description,
+    purpose_code: commitments.purpose_code,
+    purpose_description: commitments.purpose_description,
     access_mode: request.access_mode,
     streams: resolvedStreams,
     ...(input.omittedStreams &&
       input.omittedStreams.length > 0 && {
         omitted_streams: input.omittedStreams,
       }),
-    retention: request.retention,
+    retention: commitments.retention,
     expires_at: input.expiresAt,
     client_claims: boundClaims,
   });
@@ -346,14 +377,14 @@ export function buildConsentReview(
       ...(input.expiresAt && { expires_at: input.expiresAt }),
     },
     policy: {
-      purpose_code: request.purpose_code,
-      ...(request.purpose_description && {
-        purpose_description: request.purpose_description,
+      purpose_code: commitments.purpose_code,
+      ...(commitments.purpose_description && {
+        purpose_description: commitments.purpose_description,
       }),
-      purpose_unregistered: !isRegisteredPurposeCode(request.purpose_code),
-      ...(request.retention && { retention: request.retention }),
+      purpose_unregistered: !isRegisteredPurposeCode(commitments.purpose_code),
+      ...(commitments.retention && { retention: commitments.retention }),
       requires_explicit_ai_training_consent:
-        request.purpose_code === AI_TRAINING_PURPOSE,
+        commitments.purpose_code === AI_TRAINING_PURPOSE,
     },
     ...(boundClaims && { client_claims: boundClaims }),
     review_digest,
@@ -362,4 +393,26 @@ export function buildConsentReview(
         existing_grants: input.existingGrants,
       }),
   };
+}
+
+/**
+ * Resolve commitments for a caller that cannot present a refusal.
+ *
+ * A condition outside the recipient's authority means there is no valid review
+ * to build — showing the owner the *unrefused* terms would be showing them a
+ * decision they cannot make. Throwing rather than silently falling back is
+ * what stops that: the issuance path resolves first and reports a refusal, and
+ * anything else fails loudly instead of rendering a lie.
+ */
+function resolveOrThrowCommitments(
+  input: BuildReviewInput,
+): ResolvedCommitments {
+  const resolved = resolveCommitments({
+    request: input.request,
+    ownerConditions: input.ownerConditions,
+    standingTerms: input.standingTerms,
+    declarationVersion: input.snapshot.version,
+  });
+  if (!resolved.ok) throw new Error(resolved.failure.message);
+  return resolved.commitments;
 }

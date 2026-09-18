@@ -33,6 +33,8 @@ export type {
   PdppIntrospectionResponse,
   PdppTokenContext,
   PdppTokenKind,
+  OwnerConditions,
+  RecipientTerms,
   RequestedSelection,
   RequestedStream,
   Retention,
@@ -51,6 +53,14 @@ export type {
   SelectionFailureCode,
   SelectionValidation,
 } from "./selection.js";
+
+export { REQUEST_TERMS_ID, resolveCommitments } from "./commitments.js";
+export type {
+  CommitmentsFailure,
+  CommitmentsResult,
+  ResolveCommitmentsInput,
+  ResolvedCommitments,
+} from "./commitments.js";
 
 export { resolveSelection } from "./resolve.js";
 export type {

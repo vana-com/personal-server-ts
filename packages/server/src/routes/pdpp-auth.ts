@@ -62,7 +62,9 @@ import {
   type GrantStatus,
   type InstanceInventory,
   type OwnerChoices,
+  type OwnerConditions,
   type PdppAuthStore,
+  type RecipientTerms,
   type RegisteredRedirectPolicy,
   type SelectionRequest,
   type StoredGrant,
@@ -150,6 +152,17 @@ export interface PdppAuthRouteDeps {
    * intercepted code is redeemable by whoever intercepted it.
    */
   requirePkce?: boolean;
+  /**
+   * Standing terms this client has authorized, when the deployment tracks
+   * them.
+   *
+   * Absent means the AS knows of no standing terms, which is the safe default
+   * rather than a gap: with no terms, only conditions the client's own request
+   * already covers can become commitments, and anything else refuses. v0.2 is
+   * explicit that a capability advertisement is not acceptance, so an AS that
+   * cannot evidence acceptance must not assume it.
+   */
+  standingTermsFor?(clientId: string): RecipientTerms | null;
 }
 
 function errorResponse(
@@ -480,6 +493,10 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       ),
       instanceChoices: parseInstanceChoices(c),
       ownerChoices: parseOwnerChoices(c),
+      ownerConditions: parseOwnerConditions(c),
+      standingTerms:
+        deps.standingTermsFor?.(session?.requester.client_id ?? "") ??
+        undefined,
       store: deps.store,
     });
 
@@ -508,6 +525,8 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       instance_choices?: Record<string, string[]>;
       /** v0.2 narrowing, in the same shape the review was fetched with. */
       owner_choices?: OwnerChoices;
+      /** v0.2 conditions on purpose/retention, as reviewed. */
+      owner_conditions?: OwnerConditions;
     };
     try {
       body = await c.req.json();
@@ -527,6 +546,10 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       ),
       instanceChoices: body.instance_choices,
       ownerChoices: body.owner_choices,
+      ownerConditions: body.owner_conditions,
+      standingTerms:
+        deps.standingTermsFor?.(session?.requester.client_id ?? "") ??
+        undefined,
       explicitAiTrainingConsent: body.explicit_ai_training_consent,
     });
 
@@ -894,7 +917,15 @@ function listedGrantStatus(
  * standard OAuth while Core keeps its precision.
  */
 function approvalOAuthError(code: string): string {
-  return code === "selection_refused" ? "access_denied" : code;
+  if (code === "selection_refused") return "access_denied";
+  // v0.2: an unsupported recipient term is reported as a structured
+  // authorization failure. `invalid_authorization_details` is the RFC 9396
+  // code for authorization details the AS will not honour, which is what an
+  // uncovered term makes them.
+  if (code === "recipient_terms_unsupported") {
+    return "invalid_authorization_details";
+  }
+  return code;
 }
 
 function approvalStatus(code: string): 400 | 401 | 403 | 404 | 409 {
@@ -904,6 +935,11 @@ function approvalStatus(code: string): 400 | 401 | 403 | 404 | 409 {
     case "session_not_found":
       return 404;
     case "stale_review":
+      return 409;
+    case "recipient_terms_unsupported":
+      // 409: the request and the owner's terms conflict, and neither side can
+      // fix it alone -- the recipient has to accept the term. Not 403, which
+      // would read as "the owner said no".
       return 409;
     case "selection_refused":
       // A refusal, not a malformed request: the client asked for something
@@ -955,6 +991,32 @@ function parseInstanceChoices(
  * wire keeps them different: declining an optional stream succeeds, while
  * emptying a stream's fields is a refusal.
  */
+/**
+ * Read the owner's v0.2 conditions from the review URL.
+ *
+ *   retention_max_duration / retention_on_expiry — proposed retention term
+ *   condition_purpose_code                       — proposed purpose code
+ *
+ * Both retention members are required together: a duration with no expiry
+ * action, or the reverse, is half a term, and half a term cannot be matched
+ * against what the recipient accepted.
+ */
+function parseOwnerConditions(c: Context): OwnerConditions | undefined {
+  const url = new URL(c.req.url);
+  const maxDuration = url.searchParams.get("retention_max_duration");
+  const onExpiry = url.searchParams.get("retention_on_expiry");
+  const purposeCode = url.searchParams.get("condition_purpose_code");
+
+  const conditions: OwnerConditions = {
+    ...(maxDuration &&
+      (onExpiry === "delete" || onExpiry === "anonymize") && {
+        retention: { max_duration: maxDuration, on_expiry: onExpiry },
+      }),
+    ...(purposeCode && { purpose_code: purposeCode }),
+  };
+  return Object.keys(conditions).length > 0 ? conditions : undefined;
+}
+
 function parseOwnerChoices(c: Context): OwnerChoices | undefined {
   const declined: string[] = [];
   const fields: Record<string, string[]> = {};

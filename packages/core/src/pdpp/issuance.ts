@@ -21,6 +21,7 @@ import {
   normalizeClientClaims,
   type RequesterIdentity,
 } from "./review.js";
+import { resolveCommitments } from "./commitments.js";
 import {
   resolveSelection,
   type InstanceInventory,
@@ -33,6 +34,8 @@ import {
   PDPP_GRANT_VERSION_V02,
   type DeclarationSnapshot,
   type Grant,
+  type OwnerConditions,
+  type RecipientTerms,
   type SelectionRequest,
 } from "./types.js";
 
@@ -42,6 +45,13 @@ export type IssuanceFailureCode =
   /** purpose/ai_training without explicit affirmative consent. */
   | "ai_training_consent_required"
   | "resolution_failed"
+  /**
+   * v0.2: an owner condition on purpose or retention that the recipient's
+   * applicable authority does not cover. Distinct from `access_denied` (a data
+   * selection the request's own requirements refuse): this one is about the
+   * terms of use, and only the recipient can resolve it.
+   */
+  | "recipient_terms_unsupported"
   | "access_denied";
 
 export interface IssuanceFailure {
@@ -68,6 +78,21 @@ export interface ConsentEvidence {
   client_claims?: { attributed_to: string; commitments: string[] };
   /** Recorded only for purpose codes that require it. */
   explicit_ai_training_consent?: boolean;
+  /**
+   * v0.2: the terms identity and version the commitments resolved from.
+   *
+   * v0.2 requires the AS to "retain the evidence identifying those terms and
+   * their version with the consent evidence". The version is the load-bearing
+   * half: a terms document can change, and without recording which text was in
+   * force at approval, "the recipient agreed" is unfalsifiable later.
+   *
+   * This lives in the consent evidence and NOT in the grant. v0.2 is explicit
+   * that Core represents commitments through its existing purpose and
+   * retention fields and defines no additional terms object; a terms member on
+   * the grant would read as a constraint the RS should enforce, which it is
+   * not.
+   */
+  recipient_terms?: { id: string; version: string };
 }
 
 export interface IssueGrantInput {
@@ -83,6 +108,10 @@ export interface IssueGrantInput {
    * owner never reviewed.
    */
   ownerChoices?: OwnerChoices;
+  /** v0.2: conditions the owner attached beyond narrowing the data. */
+  ownerConditions?: OwnerConditions;
+  /** v0.2: standing terms the recipient authorized, when the AS tracks them. */
+  standingTerms?: RecipientTerms;
   requester: RequesterIdentity;
   /** The digest the owner actually approved. */
   approvedReviewDigest: string;
@@ -113,20 +142,6 @@ function newGrantId(): string {
 export function issueGrant(input: IssueGrantInput): IssuanceResult {
   const now = input.now ?? new Date();
 
-  if (
-    input.request.purpose_code === AI_TRAINING_PURPOSE &&
-    input.explicitAiTrainingConsent !== true
-  ) {
-    return {
-      ok: false,
-      failure: {
-        code: "ai_training_consent_required",
-        message:
-          "purpose/ai_training requires explicit affirmative consent before a grant may be issued",
-      },
-    };
-  }
-
   const resolution = resolveSelection(
     input.request,
     input.snapshot,
@@ -153,8 +168,50 @@ export function issueGrant(input: IssueGrantInput): IssuanceResult {
     };
   }
 
+  // Resolve the recipient commitments before deriving the review. v0.2
+  // requires them resolved *before* owner approval, and an owner condition
+  // outside the recipient's authority means there was never a valid review to
+  // approve -- so this refuses rather than silently falling back to the
+  // client's original terms.
+  const commitmentsResult = resolveCommitments({
+    request: input.request,
+    ownerConditions: input.ownerConditions,
+    standingTerms: input.standingTerms,
+    declarationVersion: input.snapshot.version,
+  });
+  if (!commitmentsResult.ok) {
+    return {
+      ok: false,
+      failure: {
+        code: "recipient_terms_unsupported",
+        message: commitmentsResult.failure.message,
+      },
+    };
+  }
+  const commitments = commitmentsResult.commitments;
+
+  // Gated on the RESOLVED purpose, not the requested one. Under v0.2 an owner
+  // condition can substitute the purpose code when the recipient's authority
+  // covers it, so checking the request here would let `ai_training` arrive as
+  // a substitution and skip the one purpose code Core gives a protocol-level
+  // consent requirement.
+  if (
+    commitments.purpose_code === AI_TRAINING_PURPOSE &&
+    input.explicitAiTrainingConsent !== true
+  ) {
+    return {
+      ok: false,
+      failure: {
+        code: "ai_training_consent_required",
+        message:
+          "purpose/ai_training requires explicit affirmative consent before a grant may be issued",
+      },
+    };
+  }
+
   // Re-derive the review the owner would see from what we are about to issue.
   const review = buildConsentReview({
+    commitments,
     subjectId: input.subjectId,
     request: input.request,
     snapshot: input.snapshot,
@@ -195,16 +252,19 @@ export function issueGrant(input: IssueGrantInput): IssuanceResult {
     // Provenance comes from the accepted declaration, never from the request.
     source: { kind: input.snapshot.source_kind, id: input.snapshot.source_id },
     source_declaration: { version: input.snapshot.version },
-    purpose_code: input.request.purpose_code,
-    ...(input.request.purpose_description && {
-      purpose_description: input.request.purpose_description,
+    // The *resolved* commitments, not the raw request: an owner condition
+    // covered by the recipient's authority is the commitment that was
+    // reviewed, so it is the one that belongs in the grant.
+    purpose_code: commitments.purpose_code,
+    ...(commitments.purpose_description && {
+      purpose_description: commitments.purpose_description,
     }),
     access_mode: input.request.access_mode,
     streams: resolution.streams,
     ...(input.request.selection_preset && {
       selection_preset: input.request.selection_preset,
     }),
-    ...(input.request.retention && { retention: input.request.retention }),
+    ...(commitments.retention && { retention: commitments.retention }),
     ...(input.expiresAt && { expires_at: input.expiresAt }),
     // v0.2: what was asked for, beside what was approved. The client must be
     // able to work from the owner's actual approval *including* any narrowing,
@@ -235,9 +295,10 @@ export function issueGrant(input: IssueGrantInput): IssuanceResult {
         commitments: normalizedClaims,
       },
     }),
-    ...(input.request.purpose_code === AI_TRAINING_PURPOSE && {
+    ...(commitments.purpose_code === AI_TRAINING_PURPOSE && {
       explicit_ai_training_consent: true,
     }),
+    recipient_terms: commitments.evidence,
   };
 
   return { ok: true, grant, consentEvidence };

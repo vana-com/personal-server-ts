@@ -141,6 +141,47 @@ export interface Retention {
   on_expiry: "delete" | "anonymize";
 }
 
+/**
+ * Standing terms the recipient has already authorized, as the AS knows them.
+ *
+ * v0.2 draws a line the protocol cannot enforce after disclosure but can
+ * enforce before it: changing the *data selection* is the owner's to do, while
+ * changing the *terms of use* requires the recipient's authority. An owner can
+ * narrow what they share freely; an owner asking the recipient to hold it for
+ * a week instead of a month is proposing a different obligation, and PDPP must
+ * not record that as agreed when nobody agreed to it.
+ *
+ * The accepted lists are enumerations, not capabilities. A recipient that
+ * accepts a 7-day retention has accepted 7 days — not "whatever the owner
+ * asks, up to 7 days", and not "the ability to accept retention terms". v0.2
+ * is explicit that a capability advertisement alone is not acceptance.
+ */
+export interface RecipientTerms {
+  /** Identifies the terms. Retained with the consent evidence. */
+  id: string;
+  /**
+   * The version in force. Retained too: "the recipient agreed" is
+   * unfalsifiable later if the document can change and nothing records which
+   * text was in force at approval.
+   */
+  version: string;
+  /** Retention terms the recipient has accepted, exactly. */
+  accepted_retention?: Retention[];
+  /** Purpose codes the recipient has accepted, exactly. */
+  accepted_purpose_codes?: string[];
+}
+
+/**
+ * Conditions the owner attached to their approval, beyond narrowing the data.
+ *
+ * These are *proposals*, not decisions: each must be covered by the request or
+ * by recipient-authorized standing terms before it can become a commitment.
+ */
+export interface OwnerConditions {
+  retention?: Retention;
+  purpose_code?: string;
+}
+
 /** One RFC 9396 `authorization_details` entry of PDPP type. */
 export interface SelectionRequest {
   type: typeof PDPP_DATA_ACCESS_TYPE | typeof PDPP_DATA_ACCESS_TYPE_V02;
