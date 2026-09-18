@@ -26,9 +26,7 @@
       "name": "posts",
       "scope": "instagram.posts",
       "semantics": "mutable_state",
-      "primaryKey": [
-        "pdpp_snapshot"
-      ]
+      "primaryKey": ["pdpp_snapshot"]
     },
     "record": {
       "key": {
