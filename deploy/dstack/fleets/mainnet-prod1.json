@@ -25,7 +25,7 @@
       "composeOut": "controller-compose.yml",
       "pinned": {
         "instanceId": "b5399a837ff0456905ffe8c9938002b97c4f6792",
-        "composeHash": "c65e0ed291423064fb94792ab498f24705658ef6c72773573aa8f7fc1801d34b"
+        "composeHash": "046059632e9efb9655a108ba9418c4d4d5b9ad5936b03e36cdf3ac54d3a9482b"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -76,7 +76,7 @@
       "composeOut": "worker-compose.yml",
       "pinned": {
         "instanceId": "74ab19f73d2ad2b35d06776bf82e3c121b2d0763",
-        "composeHash": "f3a8a93c0be2a7c9c34979a773140714f8da5ec3652d89510d9a0f7c87b798cb"
+        "composeHash": "24999c4bd1034480b40d7bfdd8bf1ffbd27e50f184cd0b89b1379b94047d5dd4"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -122,10 +122,69 @@
         "agentSecretRef": "mainnet-prod1-worker-1-agent-secret",
         "nodeSecretRef": "mainnet-prod1-worker-1-node-secret"
       }
+    },
+    "worker-2": {
+      "role": "worker",
+      "nodeId": "mainnet-personal-server-worker-2",
+      "uuid": "b54812d0-4b4a-4436-bb41-75a387b5eda6",
+      "cvmName": "mainnet-personal-server-worker-1-rep-t948e",
+      "appId": "01bb1b6dcaf1ea170f1480c5e53b093f384d939a",
+      "instanceType": "tdx.medium",
+      "compose": "docker-compose.fleet-worker.yml",
+      "composeOut": "worker-compose.yml",
+      "pinned": {
+        "instanceId": "41725af12e5c5b234dd6f6d2ebb6e64994f4e985",
+        "composeHash": "24999c4bd1034480b40d7bfdd8bf1ffbd27e50f184cd0b89b1379b94047d5dd4"
+      },
+      "measured": {
+        "measurementMode": "dstack-0.5.9-events",
+        "mrTd": "f06dfda6dce1cf904d4e2bab1dc370634cf95cefa2ceb2de2eee127c9382698090d7a4a13e14c536ec6c9c3c8fa87077",
+        "rtmrs": [
+          "027b610ab0555482f8a3868524093bdf3cdbe2539f81dfeeb886864654cb2fe3422f7fc36d4bab6fa46683aad11d1ba7",
+          "07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+          "df67e467e60edc1737bcf8e682d48131bfb427f523226aa7f197a7608e9b3784783fa759ef5b28191fa12f9ddb36b858"
+        ],
+        "osImageHash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+        "keyProviderSpki": "3059301306072a8648ce3d020106082a8648ce3d030107034200048844eb42ccdf8c52fd4f174f362fcb9bbd19c45fd48f1edec2d8f1ca23536ec1a74021b4cee610c074f8294d431b2b7fee2c39e5333fdaf0a4522d43fb159d9f"
+      },
+      "env": {
+        "CHAIN_ID": "1480",
+        "NODE_ID": "mainnet-personal-server-worker-2",
+        "GATEWAY_URL": "https://dp-rpc.vana.org",
+        "STORAGE_API_URL": "https://storage.vana.org",
+        "ENCLAVE_AGENT_HOST": "0.0.0.0",
+        "ENCLAVE_AGENT_PORT": "8787",
+        "FLEET_ENABLED": "true",
+        "FLEET_PEER_HOST": "0.0.0.0",
+        "FLEET_PEER_PORT": "8789",
+        "SANDBOX_RUNTIME": "docker",
+        "DOCKER_HOST": "tcp://sandbox-runtime:2375",
+        "SANDBOX_MAX": "4",
+        "SANDBOX_MEMORY": "512m",
+        "SANDBOX_CPUS": "1",
+        "SANDBOX_IDLE_TTL_SECONDS": "600",
+        "MCP_PUBLIC_ORIGIN": "https://mcp.vana.org",
+        "MCP_APPROVAL_URL": "https://app.vana.org/personal-server",
+        "MCP_STATE_PATH": "/mcp-state/state.sealed",
+        "MCP_REDIRECT_URIS": "[\"https://claude.ai/api/mcp/auth_callback\",\"https://claude.com/api/mcp/auth_callback\"]",
+        "MCP_INGRESS_HOST": "0.0.0.0",
+        "MCP_INGRESS_PORT": "8788",
+        "MCP_MIGRATION_REQUIRED": "0"
+      },
+      "secretRefs": {
+        "ENCLAVE_AGENT_SECRET": "mainnet-prod1-worker-2-agent-secret",
+        "NODE_SECRET": "mainnet-prod1-worker-2-node-secret"
+      },
+      "capacity": 4,
+      "gateway": {
+        "agentSecretRef": "mainnet-prod1-worker-2-agent-secret",
+        "nodeSecretRef": "mainnet-prod1-worker-2-node-secret"
+      }
     }
   },
   "fleetShape": {
-    "NOTE": "One controller + one worker. The worker-2 replica (39600ebe-9f8a-40ac-8fde-2a585776bac1) was deleted during step 3 so the worker app id has a single live CVM - that is what makes phala api /cvms/<uuid>/attestation unambiguous on this fleet, unlike moksha-prod5. Before adding a second worker, read docs/260915-mainnet-prod1-staging-plan.md section 0a: a shared app id breaks instance-id harvesting."
+    "NOTE": "One controller + two tdx.medium capacity4 workers, mainnet worker2 added under existing shared app. Per-UUID staged readback and adjacent boot identity are binding ground truth; never resolve shared-app attestation to pick replica identity."
   },
-  "pinnedFrom": "Re-harvested by uuid after the step48 #325 controller+worker roll at source accaccae82253edc64c617361db4b3b2f4a72732 (CI Docker run 35273133698); per-uuid staged compose read-back is ground truth. Re-harvest and commit after every roll."
+  "pinnedFrom": "Re-harvested per UUID after combined de881ee5ae4f1c1582fff4b376ba755e89131f40 controller/worker roll and new W2 provisioning; reviewed immutable Docker run35376172620. Exact staged compose readbacks plus adjacent boot instance/hash are ground truth; normal signed config and runtime peer verification retained.",
+  "rolledGitRef": "de881ee5ae4f1c1582fff4b376ba755e89131f40"
 }
