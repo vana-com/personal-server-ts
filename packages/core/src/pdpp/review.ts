@@ -90,6 +90,14 @@ export interface ConsentReviewModel {
     source_declaration_version: string;
     access_mode: "single_use" | "continuous";
     streams: ReviewStream[];
+    /**
+     * v0.2: optional streams the owner's current choices have removed, so the
+     * surface can keep showing them as declined rather than making them
+     * vanish. v0.2 forbids presenting optional selections as compulsory; a
+     * declined stream that disappears from the review is the mirror failure —
+     * the owner cannot see what they turned off, or turn it back on.
+     */
+    omitted_streams?: string[];
     expires_at?: string;
   };
   /** Category 3: structured policy declarations. */
@@ -177,6 +185,18 @@ interface ReviewDecisionFields {
   purpose_description?: string;
   access_mode: string;
   streams: StreamGrant[];
+  /**
+   * v0.2: optional streams the owner's choices removed.
+   *
+   * This has to be a decision field, not just presentation. Two owners
+   * narrowing the same request to the same retained streams by different
+   * routes — one declining an optional stream, one narrowing it below its
+   * minimum — reach the same `streams` but reviewed different screens. More
+   * importantly, without it an approval could carry a narrowing the owner
+   * never saw whenever that narrowing only *removed* a stream, since removal
+   * leaves the surviving streams byte-identical.
+   */
+  omitted_streams?: string[];
   retention?: Retention;
   expires_at?: string;
   /** Bound with attribution when rendered; stays outside the grant regardless. */
@@ -217,6 +237,8 @@ export interface BuildReviewInput {
   snapshot: DeclarationSnapshot;
   /** The output of `resolveSelection` — fully concrete. */
   resolvedStreams: StreamGrant[];
+  /** v0.2: `resolveSelection`'s `omittedStreams`, bound into the digest. */
+  omittedStreams?: string[];
   requester: RequesterIdentity;
   /** AS-policy grant expiry, when the deployment sets one. */
   expiresAt?: string;
@@ -254,6 +276,10 @@ export function buildConsentReview(
     purpose_description: request.purpose_description,
     access_mode: request.access_mode,
     streams: resolvedStreams,
+    ...(input.omittedStreams &&
+      input.omittedStreams.length > 0 && {
+        omitted_streams: input.omittedStreams,
+      }),
     retention: request.retention,
     expires_at: input.expiresAt,
     client_claims: boundClaims,
@@ -275,6 +301,10 @@ export function buildConsentReview(
         ...(s.time_constraint && { time_constraint: s.time_constraint }),
         ...(s.resources && { resources: s.resources }),
       })),
+      ...(input.omittedStreams &&
+        input.omittedStreams.length > 0 && {
+          omitted_streams: input.omittedStreams,
+        }),
       ...(input.expiresAt && { expires_at: input.expiresAt }),
     },
     policy: {

@@ -61,6 +61,7 @@ import {
   type DeclarationSnapshot,
   type GrantStatus,
   type InstanceInventory,
+  type OwnerChoices,
   type PdppAuthStore,
   type RegisteredRedirectPolicy,
   type SelectionRequest,
@@ -478,6 +479,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         session?.snapshot.source_id ?? "",
       ),
       instanceChoices: parseInstanceChoices(c),
+      ownerChoices: parseOwnerChoices(c),
       store: deps.store,
     });
 
@@ -485,7 +487,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       return errorResponse(
         c,
         approvalStatus(result.failure.code),
-        result.failure.code,
+        approvalOAuthError(result.failure.code),
         result.failure.message,
       );
     }
@@ -504,6 +506,8 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       review_digest?: string;
       explicit_ai_training_consent?: boolean;
       instance_choices?: Record<string, string[]>;
+      /** v0.2 narrowing, in the same shape the review was fetched with. */
+      owner_choices?: OwnerChoices;
     };
     try {
       body = await c.req.json();
@@ -522,6 +526,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         session?.snapshot.source_id ?? "",
       ),
       instanceChoices: body.instance_choices,
+      ownerChoices: body.owner_choices,
       explicitAiTrainingConsent: body.explicit_ai_training_consent,
     });
 
@@ -529,7 +534,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       return errorResponse(
         c,
         approvalStatus(result.failure.code),
-        result.failure.code,
+        approvalOAuthError(result.failure.code),
         result.failure.message,
       );
     }
@@ -595,7 +600,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       return errorResponse(
         c,
         approvalStatus(result.failure.code),
-        result.failure.code,
+        approvalOAuthError(result.failure.code),
         result.failure.message,
       );
     }
@@ -879,6 +884,19 @@ function listedGrantStatus(
   return status;
 }
 
+/**
+ * The wire error for one Core approval-failure code.
+ *
+ * Core keeps `selection_refused` distinct so the two refusal shapes can carry
+ * different statuses and different UI handling, but PR #1 names
+ * `access_denied` as the OAuth error a client sees for a refused selection.
+ * This is the one place those two vocabularies meet, so a client reads
+ * standard OAuth while Core keeps its precision.
+ */
+function approvalOAuthError(code: string): string {
+  return code === "selection_refused" ? "access_denied" : code;
+}
+
 function approvalStatus(code: string): 400 | 401 | 403 | 404 | 409 {
   switch (code) {
     case "unauthorized":
@@ -887,6 +905,13 @@ function approvalStatus(code: string): 400 | 401 | 403 | 404 | 409 {
       return 404;
     case "stale_review":
       return 409;
+    case "selection_refused":
+      // A refusal, not a malformed request: the client asked for something
+      // well-formed and the owner's decision cannot satisfy it. 403 rather
+      // than 400 so a consent UI can tell "fix your request" from "this
+      // combination cannot be approved". `access_denied` keeps its existing
+      // 400 for an already-decided session.
+      return 403;
     default:
       return 400;
   }
@@ -911,5 +936,57 @@ function parseInstanceChoices(
     if (!match || value.length === 0) continue;
     (choices[match[1]] ??= []).push(value);
   }
+  return Object.keys(choices).length > 0 ? choices : undefined;
+}
+
+/**
+ * Read the owner's v0.2 narrowing from the review URL, so a re-fetch shows the
+ * current proposal without the UI having to hold server state — the same
+ * property `instance[...]` already has.
+ *
+ *   decline[<stream>]            — remove an optional stream (value ignored)
+ *   field[<stream>]=<name>       — repeated; the narrowed field list
+ *   since[<stream>]=<instant>    — narrowed window lower bound
+ *   until[<stream>]=<instant>    — narrowed window upper bound
+ *
+ * A repeated `field[...]` with no values cannot be expressed in a query
+ * string, which is why "share nothing from this stream" is `decline[...]`
+ * rather than an empty field list. The two are different decisions and the
+ * wire keeps them different: declining an optional stream succeeds, while
+ * emptying a stream's fields is a refusal.
+ */
+function parseOwnerChoices(c: Context): OwnerChoices | undefined {
+  const declined: string[] = [];
+  const fields: Record<string, string[]> = {};
+  const windows: Record<string, { since?: string; until?: string }> = {};
+
+  const url = new URL(c.req.url);
+  for (const [key, value] of url.searchParams.entries()) {
+    const decline = /^decline\[(.+)\]$/.exec(key);
+    if (decline) {
+      declined.push(decline[1]);
+      continue;
+    }
+    const field = /^field\[(.+)\]$/.exec(key);
+    if (field && value.length > 0) {
+      (fields[field[1]] ??= []).push(value);
+      continue;
+    }
+    const since = /^since\[(.+)\]$/.exec(key);
+    if (since && value.length > 0) {
+      (windows[since[1]] ??= {}).since = value;
+      continue;
+    }
+    const until = /^until\[(.+)\]$/.exec(key);
+    if (until && value.length > 0) {
+      (windows[until[1]] ??= {}).until = value;
+    }
+  }
+
+  const choices: OwnerChoices = {
+    ...(declined.length > 0 && { declined_streams: declined }),
+    ...(Object.keys(fields).length > 0 && { fields }),
+    ...(Object.keys(windows).length > 0 && { time_ranges: windows }),
+  };
   return Object.keys(choices).length > 0 ? choices : undefined;
 }

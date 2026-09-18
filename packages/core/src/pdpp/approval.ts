@@ -34,7 +34,11 @@ import {
   type RequesterIdentity,
 } from "./review.js";
 import { issueGrant, type ConsentEvidence } from "./issuance.js";
-import { resolveSelection, type InstanceInventory } from "./resolve.js";
+import {
+  resolveSelection,
+  type InstanceInventory,
+  type OwnerChoices,
+} from "./resolve.js";
 import type { PdppAuthStore } from "./store.js";
 import type { PdppTokenService } from "./tokens.js";
 import type { DeclarationSnapshot, Grant, SelectionRequest } from "./types.js";
@@ -69,7 +73,18 @@ export type ApprovalFailureCode =
   | "session_not_found"
   | "stale_review"
   | "ai_training_consent_required"
+  /** The session is already decided. Not a v0.2 refusal — see below. */
   | "access_denied"
+  /**
+   * v0.2: the owner's choices cannot satisfy the request's own requirements —
+   * a declined required stream, an unmet required minimum, or an approval with
+   * no stream left. PR #1 names `access_denied` as the OAuth error for this,
+   * but it is deliberately a *separate* Core code from the already-decided
+   * `access_denied` above: the two want different HTTP statuses and different
+   * consent-UI handling (adjust your choices vs. start over), and collapsing
+   * them changed the status of the existing session-state case.
+   */
+  | "selection_refused"
   | "invalid_request";
 
 export interface ApprovalFailure {
@@ -342,6 +357,14 @@ export function fetchReview(input: {
   /** The owner's instance picks, keyed by stream, from a prior choice step. */
   instanceChoices?: Record<string, string[]>;
   /**
+   * The owner's v0.2 narrowing so far. The review re-resolves against it, so
+   * the surface always shows the *current* proposal and its digest — which is
+   * what the owner then approves. A narrowing that would refuse issuance
+   * surfaces here as a failure rather than at approval, so the owner learns
+   * their choice is incompatible while they can still change it.
+   */
+  ownerChoices?: OwnerChoices;
+  /**
    * When given, the review lists this requesting client's other active
    * grants for this owner, so the consent surface can say what is already
    * shared. Approval itself is unaffected either way.
@@ -392,12 +415,22 @@ export function fetchReview(input: {
     session.request,
     session.snapshot,
     inventory,
+    input.ownerChoices,
   );
   if (!resolution.ok) {
+    // A narrowing incompatible with the request's own requirements is the
+    // owner's choice colliding with the client's floor, not a malformed
+    // request. Reporting it as `access_denied` is what lets the consent UI
+    // say "this combination cannot be approved" and let the owner adjust,
+    // rather than routing them to a bug report.
+    const refused =
+      resolution.failure.code === "minimum_not_met" ||
+      resolution.failure.code === "required_stream_declined" ||
+      resolution.failure.code === "no_streams_approved";
     return {
       ok: false,
       failure: {
-        code: "invalid_request",
+        code: refused ? "selection_refused" : "invalid_request",
         message: resolution.failure.message,
       },
     };
@@ -408,6 +441,7 @@ export function fetchReview(input: {
     request: session.request,
     snapshot: session.snapshot,
     resolvedStreams: resolution.streams,
+    omittedStreams: resolution.omittedStreams,
     requester: session.requester,
     expiresAt: session.grant_expires_at,
     streamDescriptions: session.stream_descriptions,
@@ -462,6 +496,13 @@ export function approveAuthorization(input: {
    * than silently issuing a grant over another instance.
    */
   instanceChoices?: Record<string, string[]>;
+  /**
+   * The owner's v0.2 narrowing, which must match the narrowing the review was
+   * rendered with. Like `instanceChoices`, it feeds resolution and so lands
+   * inside the recomputed digest: a narrowing other than the reviewed one
+   * fails as stale rather than silently issuing a different grant.
+   */
+  ownerChoices?: OwnerChoices;
   explicitAiTrainingConsent?: boolean;
   now?: Date;
 }): ApprovalResult {
@@ -502,6 +543,7 @@ export function approveAuthorization(input: {
     request: session.request,
     snapshot: session.snapshot,
     inventory: withInstanceChoices(input.inventory, input.instanceChoices),
+    ownerChoices: input.ownerChoices,
     requester: session.requester,
     approvedReviewDigest: input.reviewDigest,
     explicitAiTrainingConsent: input.explicitAiTrainingConsent,
@@ -528,7 +570,14 @@ export function approveAuthorization(input: {
         ? "stale_review"
         : issuance.failure.code === "ai_training_consent_required"
           ? "ai_training_consent_required"
-          : "invalid_request";
+          : // v0.2 names `access_denied` for a refused issuance: a required
+            // stream declined, a required minimum the narrowing cannot meet,
+            // or an empty approval. It is not staleness — re-reviewing
+            // changes nothing while the same choices stand — and not an
+            // invalid request, since the client sent a well-formed one.
+            issuance.failure.code === "access_denied"
+            ? "selection_refused"
+            : "invalid_request";
     return { ok: false, failure: { code, message: issuance.failure.message } };
   }
 

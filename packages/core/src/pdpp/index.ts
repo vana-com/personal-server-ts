@@ -55,6 +55,7 @@ export type {
 export { resolveSelection } from "./resolve.js";
 export type {
   InstanceInventory,
+  OwnerChoices,
   ResolutionFailure,
   ResolutionFailureCode,
   ResolutionResult,

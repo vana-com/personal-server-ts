@@ -21,10 +21,16 @@ import {
   normalizeClientClaims,
   type RequesterIdentity,
 } from "./review.js";
-import { resolveSelection, type InstanceInventory } from "./resolve.js";
+import {
+  resolveSelection,
+  type InstanceInventory,
+  type OwnerChoices,
+} from "./resolve.js";
 import {
   AI_TRAINING_PURPOSE,
+  PDPP_DATA_ACCESS_TYPE_V02,
   PDPP_GRANT_VERSION,
+  PDPP_GRANT_VERSION_V02,
   type DeclarationSnapshot,
   type Grant,
   type SelectionRequest,
@@ -71,6 +77,12 @@ export interface IssueGrantInput {
   snapshot: DeclarationSnapshot;
   /** Instance inventory as of *now*, re-read at approval time on purpose. */
   inventory: InstanceInventory;
+  /**
+   * v0.2 owner narrowing. Ignored for a v0.1 request, and bound into the
+   * review digest either way, so an approval cannot carry a narrowing the
+   * owner never reviewed.
+   */
+  ownerChoices?: OwnerChoices;
   requester: RequesterIdentity;
   /** The digest the owner actually approved. */
   approvedReviewDigest: string;
@@ -119,12 +131,23 @@ export function issueGrant(input: IssueGrantInput): IssuanceResult {
     input.request,
     input.snapshot,
     input.inventory,
+    input.ownerChoices,
   );
   if (!resolution.ok) {
+    // v0.2 splits these deliberately. An unsatisfiable required minimum, a
+    // declined required stream, or an empty approval is a *refusal* — the
+    // request was well-formed and the owner decided; the two are simply
+    // incompatible, and the OAuth binding reports it as `access_denied`. Every
+    // other resolution failure is drift the owner can recover from by
+    // re-reviewing, and stays `resolution_failed`.
+    const refused =
+      resolution.failure.code === "minimum_not_met" ||
+      resolution.failure.code === "required_stream_declined" ||
+      resolution.failure.code === "no_streams_approved";
     return {
       ok: false,
       failure: {
-        code: "resolution_failed",
+        code: refused ? "access_denied" : "resolution_failed",
         message: resolution.failure.message,
       },
     };
@@ -136,6 +159,7 @@ export function issueGrant(input: IssueGrantInput): IssuanceResult {
     request: input.request,
     snapshot: input.snapshot,
     resolvedStreams: resolution.streams,
+    omittedStreams: resolution.omittedStreams,
     requester: input.requester,
     expiresAt: input.expiresAt,
     streamDescriptions: input.streamDescriptions,
@@ -152,8 +176,10 @@ export function issueGrant(input: IssueGrantInput): IssuanceResult {
     };
   }
 
+  const isV02 = input.request.type === PDPP_DATA_ACCESS_TYPE_V02;
+
   const grant: Grant = {
-    version: PDPP_GRANT_VERSION,
+    version: isV02 ? PDPP_GRANT_VERSION_V02 : PDPP_GRANT_VERSION,
     grant_id: newGrantId(),
     issued_at: now.toISOString(),
     subject: { id: input.subjectId },
@@ -179,6 +205,18 @@ export function issueGrant(input: IssueGrantInput): IssuanceResult {
     }),
     ...(input.request.retention && { retention: input.request.retention }),
     ...(input.expiresAt && { expires_at: input.expiresAt }),
+    // v0.2: what was asked for, beside what was approved. The client must be
+    // able to work from the owner's actual approval *including* any narrowing,
+    // and §7 forbids it reconstructing that from its own copy of the request.
+    ...(isV02 &&
+      resolution.requestedStreams && {
+        requested: {
+          streams: resolution.requestedStreams,
+          ...(resolution.omittedStreams && {
+            omitted_streams: resolution.omittedStreams,
+          }),
+        },
+      }),
   };
 
   const normalizedClaims = normalizeClientClaims(input.request.client_claims);
