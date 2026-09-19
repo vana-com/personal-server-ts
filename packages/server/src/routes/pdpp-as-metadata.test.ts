@@ -33,12 +33,18 @@ import {
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pdppAuthRoutes } from "./pdpp-auth.js";
+import { pdppAsMetadataHandler, pdppAuthRoutes } from "./pdpp-auth.js";
 
 function harness() {
   const dir = mkdtempSync(join(tmpdir(), "pdpp-md-"));
   const store = openPdppAuthStore(join(dir, "auth.db"));
   const app = new Hono();
+  // Mirrors how src/app.ts mounts these: the router under /pdpp/v1, and the
+  // RFC 8414 location at the root, which lies outside that prefix.
+  app.get(
+    "/.well-known/oauth-authorization-server/pdpp/v1",
+    pdppAsMetadataHandler("https://ps.example.com"),
+  );
   app.route(
     "/pdpp/v1",
     pdppAuthRoutes({
@@ -128,6 +134,62 @@ describe("PDPP AS metadata", () => {
         "/pdpp/v1/.well-known/oauth-authorization-server",
       );
       expect(response.status).toBe(200);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+/**
+ * RFC 8414 §3: for an issuer with a path component, the metadata document is
+ * published at `/.well-known/oauth-authorization-server` with the issuer's path
+ * APPENDED — host-first, not path-first. This AS mounts under `/pdpp/v1` and
+ * published only the path-first (OIDC-style) form, so no client following RFC
+ * 8414 could discover it: the two locations are different URLs and only one is
+ * the registered well-known.
+ *
+ * Serving the RFC 8414 location does not reintroduce the collision the
+ * path-first placement was chosen to avoid. The MCP authorization server owns
+ * the BARE `/.well-known/oauth-authorization-server`; this one carries the
+ * `/pdpp/v1` suffix, so the two documents stay distinct and no reader can
+ * mistake one authority for the other.
+ */
+describe("PDPP AS metadata: RFC 8414 discovery location", () => {
+  it("publishes the document at the RFC 8414 path-aware well-known URL", async () => {
+    const { app, cleanup } = harness();
+    try {
+      const res = await app.request(
+        "/.well-known/oauth-authorization-server/pdpp/v1",
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.issuer).toBe("https://ps.example.com");
+      expect(body.introspection_endpoint).toBe(
+        "https://ps.example.com/pdpp/v1/introspect",
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("keeps serving the existing path-first location", async () => {
+    const { app, cleanup } = harness();
+    try {
+      const res = await app.request(
+        "/pdpp/v1/.well-known/oauth-authorization-server",
+      );
+      expect(res.status).toBe(200);
+      expect((await res.json()).issuer).toBe("https://ps.example.com");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("does not claim the bare well-known URL the MCP AS owns", async () => {
+    const { app, cleanup } = harness();
+    try {
+      const res = await app.request("/.well-known/oauth-authorization-server");
+      expect(res.status).toBe(404);
     } finally {
       cleanup();
     }

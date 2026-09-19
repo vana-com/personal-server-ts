@@ -208,6 +208,59 @@ function negotiateVersion(
   return { ok: true };
 }
 
+/**
+ * The PDPP AS metadata document, as a handler both of its locations share.
+ *
+ * Exported because the two URLs it is served at live in different routers: the
+ * path-first one inside `/pdpp/v1`, and the RFC 8414 §3 one
+ * (`/.well-known/oauth-authorization-server/pdpp/v1`) at the app root, outside
+ * this prefix. One handler rather than two so the documents can never drift --
+ * a client discovering through either must find the same authority.
+ *
+ * `issuer` is accepted as a thunk for deployments that resolve their own origin
+ * late (a bound port unknown at construction). It is resolved per request so
+ * the document never advertises a stale origin.
+ */
+export function pdppAsMetadataHandler(
+  issuerSource: PdppAuthRouteDeps["issuer"],
+): (c: Context) => Response {
+  return (c: Context) => {
+    const issuer =
+      typeof issuerSource === "function" ? issuerSource() : issuerSource;
+    if (!issuer) {
+      return errorResponse(
+        c,
+        404,
+        "not_found",
+        "this deployment does not publish PDPP authorization-server metadata",
+      );
+    }
+    const base = `${issuer.replace(/\/$/, "")}/pdpp/v1`;
+    return c.json(
+      {
+        issuer,
+        authorization_endpoint: `${base}/authorize`,
+        token_endpoint: `${base}/token`,
+        introspection_endpoint: `${base}/introspect`,
+        revocation_endpoint: `${base}/revoke`,
+        authorization_details_types_supported: [
+          PDPP_DATA_ACCESS_TYPE,
+          PDPP_DATA_ACCESS_TYPE_V02,
+        ],
+        grant_types_supported: ["authorization_code", "refresh_token"],
+        response_types_supported: ["code"],
+        // PKCE is required on this flow, not merely supported: PDPP clients
+        // are public clients, so an intercepted code without a verifier is
+        // redeemable by whoever intercepted it.
+        code_challenge_methods_supported: ["S256"],
+        pdpp_api_version: PDPP_API_VERSION,
+      },
+      200,
+      NO_STORE,
+    );
+  };
+}
+
 export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   const app = new Hono();
 
@@ -265,45 +318,20 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
    * root document already describes the MCP OAuth authorization server — a
    * different authority over different tokens. §8 warns against a second grant
    * authority; merging the documents would present the two as one.
+   *
+   * The SAME document is also served at the RFC 8414 §3 location
+   * (`/.well-known/oauth-authorization-server/pdpp/v1` — well-known first, the
+   * issuer's path appended), mounted by the app because it lies outside this
+   * router's prefix. Publishing only the path-first form above left the
+   * document undiscoverable to any client that follows RFC 8414, which is the
+   * only discovery rule the spec gives. The RFC location keeps the `/pdpp/v1`
+   * suffix, so it does not collide with the bare URL the MCP AS owns and the
+   * separation this comment describes is preserved.
    */
-  app.get("/.well-known/oauth-authorization-server", (c) => {
-    // A thunk, when the deployment resolves its own origin late (a bound port
-    // it does not know at construction time). Resolved per request so the
-    // document never advertises a stale origin.
-    const issuer =
-      typeof deps.issuer === "function" ? deps.issuer() : deps.issuer;
-    if (!issuer) {
-      return errorResponse(
-        c,
-        404,
-        "not_found",
-        "this deployment does not publish PDPP authorization-server metadata",
-      );
-    }
-    const base = `${issuer.replace(/\/$/, "")}/pdpp/v1`;
-    return c.json(
-      {
-        issuer,
-        authorization_endpoint: `${base}/authorize`,
-        token_endpoint: `${base}/token`,
-        introspection_endpoint: `${base}/introspect`,
-        revocation_endpoint: `${base}/revoke`,
-        authorization_details_types_supported: [
-          PDPP_DATA_ACCESS_TYPE,
-          PDPP_DATA_ACCESS_TYPE_V02,
-        ],
-        grant_types_supported: ["authorization_code", "refresh_token"],
-        response_types_supported: ["code"],
-        // PKCE is required on this flow, not merely supported: PDPP clients
-        // are public clients, so an intercepted code without a verifier is
-        // redeemable by whoever intercepted it.
-        code_challenge_methods_supported: ["S256"],
-        pdpp_api_version: PDPP_API_VERSION,
-      },
-      200,
-      NO_STORE,
-    );
-  });
+  app.get(
+    "/.well-known/oauth-authorization-server",
+    pdppAsMetadataHandler(deps.issuer),
+  );
 
   /**
    * Exchange an already-verified owner proof for a PDPP owner token.

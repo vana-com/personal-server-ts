@@ -50,7 +50,11 @@ import {
   createDeviceSessionLookup,
 } from "./routes/auth-device.js";
 import { oauthTokenRoutes } from "./routes/oauth-token.js";
-import { pdppAuthRoutes, type PdppAuthRouteDeps } from "./routes/pdpp-auth.js";
+import {
+  pdppAsMetadataHandler,
+  pdppAuthRoutes,
+  type PdppAuthRouteDeps,
+} from "./routes/pdpp-auth.js";
 import { pdppDeclarationRoutes } from "./routes/pdpp-declarations.js";
 import type { MutableDeclarationRegistry } from "./pdpp/declaration-registry.js";
 import type {
@@ -591,6 +595,19 @@ export function createApp(deps: AppDeps): Hono {
   // are byte-for-byte unchanged.
   if (deps.pdppAuth) {
     app.route("/pdpp/v1", pdppAuthRoutes(deps.pdppAuth));
+
+    // The RFC 8414 §3 discovery URL for the same document: well-known first,
+    // the issuer's `/pdpp/v1` path appended. Mounted here rather than inside
+    // the router above because it lies outside that prefix by construction.
+    //
+    // Without it the AS metadata was reachable only at the path-first
+    // (OIDC-style) URL, which no RFC 8414 client looks at -- so a conformant
+    // client could not discover this authorization server at all. The suffix
+    // keeps it distinct from the bare well-known the MCP AS owns.
+    app.get(
+      "/.well-known/oauth-authorization-server/pdpp/v1",
+      pdppAsMetadataHandler(deps.pdppAuth.issuer),
+    );
 
     // Declaration submission (§5 acceptance). Mounted at `/pdpp`, NOT under
     // `/pdpp/v1`: it is an operator surface rather than part of the versioned
