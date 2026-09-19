@@ -25,7 +25,7 @@
       "composeOut": "controller-compose.yml",
       "pinned": {
         "instanceId": "b5399a837ff0456905ffe8c9938002b97c4f6792",
-        "composeHash": "046059632e9efb9655a108ba9418c4d4d5b9ad5936b03e36cdf3ac54d3a9482b"
+        "composeHash": "0577b0d198de602e73de5ccca5bb641610b045a68480940628d14fb840729d0c"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -76,7 +76,7 @@
       "composeOut": "worker-compose.yml",
       "pinned": {
         "instanceId": "74ab19f73d2ad2b35d06776bf82e3c121b2d0763",
-        "composeHash": "24999c4bd1034480b40d7bfdd8bf1ffbd27e50f184cd0b89b1379b94047d5dd4"
+        "composeHash": "b830734d63f3b4dd818cecf3ef1aa2e04454a810de8f76f14712e2a59026bba3"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -134,7 +134,7 @@
       "composeOut": "worker-compose.yml",
       "pinned": {
         "instanceId": "41725af12e5c5b234dd6f6d2ebb6e64994f4e985",
-        "composeHash": "24999c4bd1034480b40d7bfdd8bf1ffbd27e50f184cd0b89b1379b94047d5dd4"
+        "composeHash": "b830734d63f3b4dd818cecf3ef1aa2e04454a810de8f76f14712e2a59026bba3"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -185,6 +185,6 @@
   "fleetShape": {
     "NOTE": "One controller + two tdx.medium capacity4 workers, mainnet worker2 added under existing shared app. Per-UUID staged readback and adjacent boot identity are binding ground truth; never resolve shared-app attestation to pick replica identity."
   },
-  "pinnedFrom": "Re-harvested per UUID after combined de881ee5ae4f1c1582fff4b376ba755e89131f40 controller/worker roll and new W2 provisioning; reviewed immutable Docker run35376172620. Exact staged compose readbacks plus adjacent boot instance/hash are ground truth; normal signed config and runtime peer verification retained.",
-  "rolledGitRef": "de881ee5ae4f1c1582fff4b376ba755e89131f40"
+  "pinnedFrom": "Re-harvested per UUID from immutable mainnet settled/bindings.json (02:21:16.593365Z) and postapply/bindings.json (02:28:24.018722Z), corroborated by signed apply and final idle health capture at 2026-09-19T02:52:40.084Z; exact existing UUID, app, instance, capacity, measured identity, secret references and resources preserved.",
+  "rolledGitRef": "84d19ffc3f4059c5a5d034c8f7e987f0c07bcfd9"
 }
