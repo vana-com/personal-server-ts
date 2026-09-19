@@ -17,7 +17,11 @@
 
 import { createHash } from "node:crypto";
 import { isIP } from "node:net";
-import type { DeclarationSnapshot, SourceKind } from "./types.js";
+import type {
+  DeclarationSnapshot,
+  DeclaredDisplay,
+  SourceKind,
+} from "./types.js";
 
 export const MAX_DECLARATION_BYTES = 256 * 1024;
 export const MAX_REDIRECTS = 3;
@@ -437,6 +441,27 @@ interface RawDeclarationDocument {
   streams?: unknown;
   views?: unknown;
   selection_presets?: unknown;
+  display?: unknown;
+}
+
+/**
+ * Read a stream's §5 `display` object, keeping only string members.
+ *
+ * Returns `{ display }` or undefined, so the caller can spread it and let an
+ * absent or empty object stay absent. `{ label: "" }` is treated as no label:
+ * §5's fallback chain is label → description → stream name, and an empty
+ * string would win that race and render nothing where a name belongs.
+ */
+function readDeclaredDisplay(
+  value: unknown,
+): { display: DeclaredDisplay } | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const { label, detail } = value as { label?: unknown; detail?: unknown };
+  const display: DeclaredDisplay = {
+    ...(typeof label === "string" && label.length > 0 && { label }),
+    ...(typeof detail === "string" && detail.length > 0 && { detail }),
+  };
+  return Object.keys(display).length > 0 ? { display } : undefined;
 }
 
 /**
@@ -720,6 +745,16 @@ export function parseDeclaration(
       name: s.name,
       fields,
       required_fields: requiredFields,
+      // §5 consent-surface copy. Carried verbatim and kept as two distinct
+      // fields: `display` is the consent-surface metadata the AS renders,
+      // `description` is explicitly not. Dropping either left the consent
+      // surface with nothing but the raw stream name to show the owner.
+      //
+      // Absence stays absence — an empty `display: {}` would make a renderer
+      // print a blank label where it must fall back to the stream name.
+      ...(typeof s.description === "string" &&
+        s.description.length > 0 && { description: s.description }),
+      ...(readDeclaredDisplay(s.display) ?? {}),
       ...(typeof s.semantics === "string" && {
         semantics: s.semantics as "mutable_state" | "append_only",
       }),
@@ -764,6 +799,9 @@ export function parseDeclaration(
     }
   }
 
+  const sourceDisplayName = (doc as { display?: { name?: unknown } }).display
+    ?.name;
+
   return {
     ok: true,
     snapshot: {
@@ -772,6 +810,13 @@ export function parseDeclaration(
       version: doc.version,
       digest,
       streams,
+      // §5 top-level `display.name`. Only carried when it is a non-empty
+      // string: a blank name would outrank the source id in the renderer's
+      // fallback chain and put an empty heading on the consent surface.
+      ...(typeof sourceDisplayName === "string" &&
+        sourceDisplayName.length > 0 && {
+          display: { name: sourceDisplayName },
+        }),
       ...(Array.isArray(doc.views) && {
         views: doc.views as DeclarationSnapshot["views"],
       }),

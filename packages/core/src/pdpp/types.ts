@@ -286,8 +286,39 @@ export function isV02Grant(grant: Grant): boolean {
 // Source declaration snapshot (§5, only the parts §6/§7 resolution needs)
 // ---------------------------------------------------------------------------
 
+/**
+ * §5 "Stream display metadata": human-readable copy for the consent UI.
+ *
+ * Authored by the connector maintainer, never by the requesting client. §5:
+ * "The requesting client MUST NOT be able to override or supplement these
+ * descriptions in the selection request. This separation ensures that the
+ * consent UI's data descriptions are trustworthy regardless of the client's
+ * intentions." That is what makes this the one data description on the consent
+ * surface a hostile client cannot write.
+ */
+export interface DeclaredDisplay {
+  /** Short consent-card name, e.g. "Who you follow". */
+  label?: string;
+  /**
+   * What the data includes and, where relevant, what it EXCLUDES — e.g.
+   * "…No DMs, profile details, or follower lists." The exclusion half is the
+   * part an owner cannot reconstruct from a field list.
+   */
+  detail?: string;
+}
+
 export interface DeclaredStream {
   name: string;
+  /**
+   * §5 `streams[].description`: a short summary of the stream's contents.
+   *
+   * Explicitly NOT consent-surface metadata — §5 points at `display` for that.
+   * Kept separate rather than coalesced so the AS can apply that precedence
+   * (label → description → name) instead of guessing at render time.
+   */
+  description?: string;
+  /** §5 consent-surface metadata. Absent means the declaration authored none. */
+  display?: DeclaredDisplay;
   /**
    * How records in this stream behave over time (§5).
    *
@@ -340,6 +371,14 @@ export interface DeclaredPreset {
 export interface DeclarationSnapshot {
   source_id: string;
   source_kind: SourceKind;
+  /**
+   * §5 top-level `display`: the source's human-readable name for consent UIs.
+   *
+   * Without it the consent surface can only name a source by its registry URL.
+   * Absent means the declaration authored none, and the surface falls back to
+   * the id rather than rendering a blank.
+   */
+  display?: { name?: string };
   /** Opaque revision identifier recorded into the grant. */
   version: string;
   /** Digest over the retrieved document, verified before the snapshot is trusted. */
