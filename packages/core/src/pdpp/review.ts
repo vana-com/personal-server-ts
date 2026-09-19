@@ -62,6 +62,21 @@ export interface ReviewStream {
   name: string;
   /** Declaration-authored description. Its own category — not a client claim. */
   description?: string;
+  /**
+   * §5 stream `display.label` — the short consent-card name for this stream,
+   * e.g. "Who you follow" rather than `following_accounts`.
+   *
+   * Read from the retained declaration snapshot, never from the request. §5
+   * forbids the requesting client from authoring or supplementing it, and the
+   * AS is the only role that can hold that line, because the renderer cannot
+   * tell from one payload which member the client wrote.
+   */
+  display_label?: string;
+  /**
+   * §5 stream `display.detail` — what the data includes and, where relevant,
+   * what it EXCLUDES. Same provenance rule as `display_label`.
+   */
+  display_detail?: string;
   instance_ids: string[];
   fields: string[];
   time_constraint?: { field: string; since?: string; until?: string };
@@ -114,7 +129,14 @@ export interface ConsentReviewModel {
   requester: RequesterIdentity;
   /** Category 2: declaration-authored data descriptions + protocol-enforced terms. */
   data: {
-    source: { kind: string; id: string };
+    /**
+     * `display_name` is §5's top-level `display.name` — the human name for the
+     * source. It accompanies `id` rather than replacing it: `id` is the
+     * protocol-enforced fact and the one 6.1-5 requires the owner to be able
+     * to see, so a surface that showed only the friendly name would hide which
+     * source was actually resolved.
+     */
+    source: { kind: string; id: string; display_name?: string };
     source_declaration_version: string;
     access_mode: "single_use" | "continuous";
     streams: ReviewStream[];
@@ -348,15 +370,33 @@ export function buildConsentReview(
   return {
     requester,
     data: {
-      source: { kind: snapshot.source_kind, id: snapshot.source_id },
+      source: {
+        kind: snapshot.source_kind,
+        id: snapshot.source_id,
+        ...(snapshot.display?.name && {
+          display_name: snapshot.display.name,
+        }),
+      },
       source_declaration_version: snapshot.version,
       access_mode: request.access_mode,
       streams: resolvedStreams.map((s) => {
         const asked = input.requestedStreams?.find((r) => r.name === s.name);
+        // §5 consent copy, read from the RETAINED SNAPSHOT. `request` is
+        // deliberately not consulted: that is the whole provenance guarantee.
+        const declared = snapshot.streams.find((d) => d.name === s.name);
         return {
           name: s.name,
-          ...(input.streamDescriptions?.[s.name] && {
-            description: input.streamDescriptions[s.name],
+          // The deployment-supplied map still wins where a caller set it, so
+          // this adds a source of copy without removing the existing one.
+          ...((input.streamDescriptions?.[s.name] ?? declared?.description) && {
+            description:
+              input.streamDescriptions?.[s.name] ?? declared?.description,
+          }),
+          ...(declared?.display?.label && {
+            display_label: declared.display.label,
+          }),
+          ...(declared?.display?.detail && {
+            display_detail: declared.display.detail,
           }),
           instance_ids: s.instance_ids,
           fields: s.fields,
