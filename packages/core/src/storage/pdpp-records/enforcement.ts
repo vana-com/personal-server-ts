@@ -1,6 +1,7 @@
 import { PdppError } from "../../errors/pdpp-catalog.js";
 import {
   findStreamGrant,
+  grantIsV02,
   withinTimeConstraint,
   type PdppTokenContext,
   type StreamGrant,
@@ -24,6 +25,21 @@ export interface ResolvedReadScope {
   instanceIds: string[];
   fields?: string[];
   streamGrant?: StreamGrant; // undefined for owner tokens (no grant)
+  /**
+   * Whether the declaration's schema-required fields are part of this scope's
+   * disclosure floor.
+   *
+   * True under a v0.1 grant, where §8's per-stream consent floor keeps
+   * schema-required fields in every projection. False under a v0.2 grant,
+   * where the disclosed members are exactly what the grant approved and a
+   * field must not be added "merely because the schema requires it".
+   *
+   * Carried on the scope rather than recomputed at each call site so the two
+   * revisions cannot drift apart between the list read, the single-record
+   * read, and the stream-metadata projection — three places that must agree
+   * about what a grant discloses.
+   */
+  schemaRequiredFloor: boolean;
 }
 
 export function resolveReadScope(
@@ -47,7 +63,9 @@ export function resolveReadScope(
     // module doesn't own instance-to-subject resolution (that's the RS
     // route layer's data-store lookup); it returns `undefined` fields (no
     // projection restriction) since an owner token has no grant field list.
-    return { instanceIds: [], fields: undefined };
+    // An owner token has no grant and so no projection to floor: the owner
+    // reads their own records whole.
+    return { instanceIds: [], fields: undefined, schemaRequiredFloor: false };
   }
 
   // Client token: requires an active resolved grant.
@@ -75,10 +93,21 @@ export function resolveReadScope(
     );
   }
 
+  // v0.2 reverses v0.1's consent floor. Under v0.1 the declaration's
+  // required fields are re-added here, so a record is never disclosed in a
+  // shape its own schema would reject. Under v0.2 that is a disclosure bug:
+  // the AS deliberately resolves a grant WITHOUT a schema-required field the
+  // owner did not approve, and re-adding it from the declaration undoes that
+  // narrowing one layer below the decision the owner actually made.
+  const schemaRequiredFloor = !grantIsV02(context.grant);
+
   return {
     instanceIds: streamGrant.instance_ids,
-    fields: withRequiredFields(streamGrant.fields, declaration.requiredFields),
+    fields: schemaRequiredFloor
+      ? withRequiredFields(streamGrant.fields, declaration.requiredFields)
+      : [...streamGrant.fields],
     streamGrant,
+    schemaRequiredFloor,
   };
 }
 

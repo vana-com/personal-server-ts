@@ -371,8 +371,14 @@ function rejectUnknownParams(
  *     for something it was never granted has made an error it needs to see;
  *     quietly returning less would let it believe it received that field.
  *   - the result is the intersection, so a request can only ever narrow.
- *   - the declaration's required fields are re-added, because §8 keeps
- *     schema-required fields in every projection regardless of the request.
+ *   - under a v0.1 grant ONLY, the declaration's required fields are re-added,
+ *     because v0.1 §8 keeps schema-required fields in every projection
+ *     regardless of the request. A v0.2 grant gets the bare intersection:
+ *     `v0.2-4-2` builds disclosed `data` from only the members permitted by
+ *     the grant AND the request-time selection, and `v0.2-4-1` forbids adding
+ *     one back because the schema requires it. Re-widening a sparse v0.2
+ *     request would disclose more than both the owner and the client asked
+ *     for, which is the one direction this function must never move.
  *
  * Returns the full granted set when no `fields` was requested, preserving the
  * existing default.
@@ -381,6 +387,7 @@ function narrowClientFields(
   requested: string[] | undefined,
   granted: string[] | undefined,
   declaration: StreamDeclaration | undefined,
+  schemaRequiredFloor: boolean,
 ): string[] | undefined {
   if (!requested || requested.length === 0) return granted;
   if (!granted) return requested;
@@ -397,9 +404,11 @@ function narrowClientFields(
   }
 
   const narrowed = new Set(requested.filter((f) => grantedSet.has(f)));
-  // The consent floor survives a sparse request.
-  for (const required of declaration?.requiredFields ?? []) {
-    if (grantedSet.has(required)) narrowed.add(required);
+  if (schemaRequiredFloor) {
+    // v0.1 only: the consent floor survives a sparse request.
+    for (const required of declaration?.requiredFields ?? []) {
+      if (grantedSet.has(required)) narrowed.add(required);
+    }
   }
   return Array.from(narrowed);
 }
@@ -770,7 +779,12 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       // it, then the schema-required floor is re-added.
       const fields =
         context!.tokenKind === "client"
-          ? narrowClientFields(requestedFields, scope.fields, declaration)
+          ? narrowClientFields(
+              requestedFields,
+              scope.fields,
+              declaration,
+              scope.schemaRequiredFloor,
+            )
           : requestedFields
             ? [...requestedFields]
             : undefined;
@@ -960,7 +974,26 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         throw new PdppError("not_found", "Record not found");
       }
 
-      const data = projectFields(found.data, scope.fields);
+      // `fields` is a declared parameter of this endpoint, and `v0.2-4-2`
+      // builds disclosed `data` from the grant AND the request-time
+      // selection. It was parsed nowhere, so `?fields=date` returned every
+      // granted field with a 200 — the response did something other than what
+      // was asked, and a client narrowing its own exposure did not get it.
+      const requestedFields = c.req
+        .query("fields")
+        ?.split(",")
+        .map((f) => f.trim());
+      const fields =
+        context!.tokenKind === "client"
+          ? narrowClientFields(
+              requestedFields,
+              scope.fields,
+              declaration,
+              scope.schemaRequiredFloor,
+            )
+          : (requestedFields ?? scope.fields);
+
+      const data = projectFields(found.data, fields);
 
       const response = c.json(
         {

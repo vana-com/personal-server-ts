@@ -44,6 +44,7 @@ export interface ClientDisplay {
 }
 
 export interface Grant {
+  /** `0.1.0` for a v0.1 grant, `0.2.0` for v0.2. */
   version: string;
   grant_id: string;
   issued_at: string;
@@ -58,6 +59,31 @@ export interface Grant {
   selection_preset?: string;
   retention?: { max_duration: string; on_expiry: "delete" | "anonymize" };
   expires_at?: string;
+}
+
+/**
+ * The grant schema version a v0.2 grant carries. Mirrors the AS lane's
+ * `PDPP_GRANT_VERSION_V02` (`packages/core/src/pdpp/types.ts`); kept as a
+ * literal here for the same reason the rest of this file is a mirror.
+ */
+export const GRANT_VERSION_V02 = "0.2.0";
+
+/**
+ * True for a grant issued under the v0.2 detail type.
+ *
+ * The RS needs this because the two revisions disclose DIFFERENT record
+ * shapes from the same grant members. Under v0.1 a stream's schema-required
+ * fields are added to every projection (the per-stream consent floor); under
+ * v0.2 that is forbidden — the disclosed members are exactly those the grant
+ * approved, and nothing is added because a schema requires it. Enforcing one
+ * rule for both would either undo the AS's v0.2 narrowing or silently shrink
+ * what an already-consented v0.1 grant discloses.
+ *
+ * An unrecognized version reads as v0.1: the conservative direction is to
+ * keep the floor, which discloses no field the grant does not name.
+ */
+export function grantIsV02(grant: Grant | undefined): boolean {
+  return grant?.version === GRANT_VERSION_V02;
 }
 
 export type PdppInactiveReason =
