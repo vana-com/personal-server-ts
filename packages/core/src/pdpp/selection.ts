@@ -123,6 +123,55 @@ function expandedRequestFields(
 }
 
 /**
+ * Validate a request `time_range`'s own shape, independent of which stream
+ * carries it.
+ *
+ * Shared by the named-stream path and the wildcard path so the two cannot
+ * disagree about what a well-formed window is. Before this was factored out,
+ * a wildcard's window skipped every check here — unparseable bounds, an
+ * inverted `since`/`until`, and an empty `{}` were all accepted, while the
+ * same values written longhand were rejected. A shorthand that validates less
+ * than the form it stands for is a hole, not a convenience.
+ *
+ * `value` is untrusted JSON, so the object and string types are checked
+ * rather than assumed: a `null` or a number here must be a validation failure,
+ * not a `TypeError` that the binding turns into a 500.
+ */
+function validateTimeRangeBounds(
+  value: unknown,
+  subject: string,
+): SelectionValidation {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return fail("invalid_request", `${subject} time_range must be an object`);
+  }
+  const { since, until } = value as { since?: unknown; until?: unknown };
+  if (since === undefined && until === undefined) {
+    return fail("invalid_request", `${subject} has an empty time_range`);
+  }
+  for (const [label, bound] of [
+    ["since", since],
+    ["until", until],
+  ] as const) {
+    if (bound === undefined) continue;
+    if (typeof bound !== "string" || Number.isNaN(Date.parse(bound))) {
+      return fail(
+        "invalid_request",
+        `${subject} time_range.${label} is not a valid ISO 8601 instant`,
+      );
+    }
+  }
+  if (typeof since === "string" && typeof until === "string") {
+    if (Date.parse(since) >= Date.parse(until)) {
+      return fail(
+        "invalid_request",
+        `${subject} time_range.since must precede time_range.until`,
+      );
+    }
+  }
+  return { ok: true };
+}
+
+/**
  * Validate one v0.2 `minimum` against the request that carries it.
  *
  * Everything here is a shape question answerable without the owner, the
@@ -171,9 +220,7 @@ function validateMinimum(
     const permitted = expandedRequestFields(stream, declared, snapshot);
     const outside = fields.filter((f) => !permitted.includes(f));
     if (outside.length > 0) {
-      return bad(
-        `fields outside the expanded request: ${outside.join(", ")}`,
-      );
+      return bad(`fields outside the expanded request: ${outside.join(", ")}`);
     }
   }
 
@@ -258,6 +305,35 @@ function validateStreamRequest(
         "minimum cannot be combined with a wildcard stream selection",
       );
     }
+    if (stream.time_range !== undefined) {
+      // A wildcard is shorthand for naming every declared stream, so it
+      // cannot mean something weaker than naming them. §6's rule for a named
+      // stream — "no consent_time_field, no time_range" — therefore applies
+      // to every stream the wildcard expands to.
+      //
+      // The alternative was to keep accepting this and let resolution drop
+      // the window for time-incapable streams, which is what the code did.
+      // That silently issued unbounded access to those streams from a request
+      // whose own words asked for a bounded one: the owner approved, and the
+      // client received, more than either had read. A request that cannot be
+      // carried out as written is refused, not quietly reinterpreted.
+      const incapable = snapshot.streams
+        .filter((s) => !s.consent_time_field)
+        .map((s) => s.name);
+      if (incapable.length > 0) {
+        return fail(
+          "unsupported_selection_parameter",
+          `wildcard time_range expands to stream(s) that declare no consent_time_field and cannot accept it: ${incapable.join(", ")}`,
+        );
+      }
+      // The window's own shape is checked by the same rule a named stream's
+      // is; a wildcard must not be the weaker form.
+      const bounds = validateTimeRangeBounds(
+        stream.time_range,
+        "wildcard stream selection",
+      );
+      if (!bounds.ok) return bounds;
+    }
     return { ok: true };
   }
 
@@ -320,32 +396,11 @@ function validateStreamRequest(
         `stream '${stream.name}' declares no consent_time_field and cannot accept time_range`,
       );
     }
-    const { since, until } = stream.time_range;
-    if (since === undefined && until === undefined) {
-      return fail(
-        "invalid_request",
-        `stream '${stream.name}' has an empty time_range`,
-      );
-    }
-    for (const [label, value] of [
-      ["since", since],
-      ["until", until],
-    ] as const) {
-      if (value !== undefined && Number.isNaN(Date.parse(value))) {
-        return fail(
-          "invalid_request",
-          `stream '${stream.name}' time_range.${label} is not a valid ISO 8601 instant`,
-        );
-      }
-    }
-    if (since !== undefined && until !== undefined) {
-      if (Date.parse(since) >= Date.parse(until)) {
-        return fail(
-          "invalid_request",
-          `stream '${stream.name}' time_range.since must precede time_range.until`,
-        );
-      }
-    }
+    const bounds = validateTimeRangeBounds(
+      stream.time_range,
+      `stream '${stream.name}'`,
+    );
+    if (!bounds.ok) return bounds;
   }
 
   if (stream.resources !== undefined) {
