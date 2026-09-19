@@ -405,7 +405,10 @@ function resolveOneStream(
 
   const window =
     revision === "0.2"
-      ? narrowTimeRange(request.time_range, choices?.time_ranges?.[declared.name])
+      ? narrowTimeRange(
+          request.time_range,
+          choices?.time_ranges?.[declared.name],
+        )
       : request.time_range;
 
   if (revision === "0.2") {
@@ -443,8 +446,15 @@ function resolveOneStream(
  * per-stream parameters with it — §6 says a wildcard's `instance_ids` apply to
  * every expanded stream, and each handle is then verified per stream by
  * `resolveInstances`. A preset expands from the snapshot instead.
+ *
+ * Exported because the consent surface must expand a request the same way
+ * resolution does. `approval.ts` collects the owner's pending instance
+ * choices over these expanded streams; when it derived its own list from
+ * `request.streams` alone, a `selection_preset` expanded to nothing there and
+ * to two eligible instances here, so the owner was never asked and the
+ * request died as unresolvable. One expansion, two readers.
  */
-function expandSelections(
+export function expandSelections(
   request: SelectionRequest,
   snapshot: DeclarationSnapshot,
 ): StreamRequest[] {
@@ -488,8 +498,7 @@ export function resolveSelection(
   inventory: InstanceInventory,
   choices?: OwnerChoices,
 ): ResolutionResult {
-  const revision =
-    request.type === PDPP_DATA_ACCESS_TYPE_V02 ? "0.2" : "0.1";
+  const revision = request.type === PDPP_DATA_ACCESS_TYPE_V02 ? "0.2" : "0.1";
   const selections = expandSelections(request, snapshot);
   if (selections.length === 0) {
     return failure(

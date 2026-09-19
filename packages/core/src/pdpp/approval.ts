@@ -35,6 +35,7 @@ import {
 } from "./review.js";
 import { issueGrant, type ConsentEvidence } from "./issuance.js";
 import {
+  expandSelections,
   resolveSelection,
   type InstanceInventory,
   type OwnerChoices,
@@ -298,26 +299,33 @@ function withInstanceChoices(
  * Find every stream that needs an owner choice, rather than stopping at the
  * first. A UI that asked about one stream at a time would make the owner
  * approve a moving target across several round trips.
+ *
+ * The streams are expanded by `expandSelections` — the same function
+ * resolution uses — so the three ways of naming streams (an explicit list, a
+ * wildcard, a `selection_preset`) all reach this step. They must: "omission
+ * is not fan-in, the owner picks" is a property of the request, not of the
+ * syntax it was written in.
+ *
+ * Deriving the list here instead let a preset expand to nothing, so the owner
+ * was never offered a choice, while resolution expanded it to a stream with
+ * two eligible instances and returned `instance_choice_required` — which this
+ * module then reported as an invalid request. A valid preset was unapprovable
+ * on any source with two connected instances, and the owner had no way to
+ * move. Sharing the expansion is what makes that class of divergence
+ * impossible rather than merely fixed.
  */
 function pendingInstanceChoices(
   session: AuthorizationSession,
   inventory: InstanceInventory,
 ): InstanceChoice[] {
   const choices: InstanceChoice[] = [];
-  const streams = session.request.streams ?? [];
-  const wildcard = streams.find((s) => s.name === "*");
 
-  const names = wildcard
-    ? session.snapshot.streams.map((s) => s.name)
-    : streams.map((s) => s.name);
-
-  for (const name of names) {
-    const requested = wildcard ?? streams.find((s) => s.name === name);
+  for (const stream of expandSelections(session.request, session.snapshot)) {
     // An explicitly named handle set is already a decision; no choice needed.
-    if (requested?.instance_ids && requested.instance_ids.length > 0) continue;
-    const eligible = inventory.eligibleFor(name);
+    if (stream.instance_ids && stream.instance_ids.length > 0) continue;
+    const eligible = inventory.eligibleFor(stream.name);
     if (eligible.length > 1) {
-      choices.push({ stream: name, candidates: eligible });
+      choices.push({ stream: stream.name, candidates: eligible });
     }
   }
   return choices;
