@@ -1,5 +1,9 @@
 import { timingSafeEqual } from "node:crypto";
-import type { FleetController } from "./placement.js";
+import {
+  FleetDrainConflictError,
+  FleetDrainInputError,
+  type FleetController,
+} from "./placement.js";
 import type { FleetOwner, FleetScope } from "./contracts.js";
 /** Controller identity plus its signed-bundle window, reported on admin status
  * so an operator can see the deployment a directory decision was made under. */
@@ -157,7 +161,13 @@ export function createFleetControlHttp(
           return Response.json(await options.admit(body));
         if (path === "/fleet/v1/drain") {
           if (typeof body.nodeId !== "string") throw new Error("Invalid node");
-          await options.controller.drain(body.nodeId);
+          if (
+            Object.keys(body).some(
+              (k) => k !== "nodeId" && k !== "expectedAssignments",
+            )
+          )
+            throw new FleetDrainInputError("Unknown drain argument");
+          await options.controller.drain(body.nodeId, body.expectedAssignments);
           return Response.json({ success: true });
         }
         if (path === "/fleet/v1/prepare-rollback")
@@ -180,6 +190,13 @@ export function createFleetControlHttp(
       }
       return new Response(null, { status: 404 });
     } catch (error) {
+      if (error instanceof FleetDrainInputError)
+        return Response.json({ error: INVALID_REQUEST }, { status: 400 });
+      if (error instanceof FleetDrainConflictError)
+        return Response.json(
+          { error: "fleet_drain_conflict" },
+          { status: 409 },
+        );
       if (error instanceof FleetBodyLimitError)
         return new Response(null, { status: 413 });
       return Response.json(

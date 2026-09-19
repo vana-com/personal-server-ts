@@ -24,6 +24,55 @@ const RENEW_FAILURE_GRACE = 2;
  * stopped answering is demoted before the row expires and is reaped. */
 const RENEW_GRACE_MS = FLEET_LEASE_MS - FLEET_RENEW_MS;
 
+export class FleetDrainConflictError extends Error {}
+export class FleetDrainInputError extends Error {}
+
+const assignmentFields = [
+  "chainId",
+  "userPsId",
+  "identityEpoch",
+  "nodeId",
+  "nodeIncarnation",
+  "generation",
+  "controllerTerm",
+  "state",
+  "leaseExpiresAt",
+] as const;
+function drainAssignments(value: unknown, nodeId: string): FleetAssignment[] {
+  if (!Array.isArray(value) || value.length > 64)
+    throw new FleetDrainInputError("Invalid drain expectation");
+  const keys = new Set<string>();
+  return value.map((item: unknown) => {
+    if (!item || typeof item !== "object" || Array.isArray(item))
+      throw new FleetDrainInputError("Invalid drain assignment");
+    const a = item as FleetAssignment;
+    if (
+      Object.keys(a).length !== assignmentFields.length ||
+      assignmentFields.some((k) => !Object.hasOwn(a, k)) ||
+      !Number.isSafeInteger(a.chainId) ||
+      a.chainId < 1 ||
+      typeof a.userPsId !== "string" ||
+      !/^0x[0-9a-fA-F]{64}$/.test(a.userPsId) ||
+      !Number.isSafeInteger(a.identityEpoch) ||
+      a.identityEpoch < 1 ||
+      a.nodeId !== nodeId ||
+      typeof a.nodeIncarnation !== "string" ||
+      !a.nodeIncarnation ||
+      !Number.isSafeInteger(a.generation) ||
+      a.generation < 1 ||
+      a.controllerTerm !== 1 ||
+      !["starting", "ready", "draining"].includes(a.state) ||
+      typeof a.leaseExpiresAt !== "string" ||
+      !Number.isFinite(Date.parse(a.leaseExpiresAt))
+    )
+      throw new FleetDrainInputError("Invalid drain assignment");
+    const key = fleetOwnerKey(a);
+    if (keys.has(key)) throw new FleetDrainInputError("Duplicate drain owner");
+    keys.add(key);
+    return structuredClone(a);
+  });
+}
+
 export interface FleetPlacementRow {
   owner: FleetOwner;
   generation: number;
@@ -135,6 +184,7 @@ export async function openFleetController(options: FleetControllerOptions) {
   const rows = directory.rows;
   const nodes = new Map<string, FleetAdmittedNode>();
   const observations = new Map<string, FleetReadiness[]>();
+  const guardedDrains = new Set<string>();
   const ownerOperation = serialByKey();
   const leaseOperation = serialByKey();
   let writes: Promise<unknown> = Promise.resolve();
@@ -415,6 +465,8 @@ export async function openFleetController(options: FleetControllerOptions) {
       return result;
     },
     async admit(node: FleetAdmittedNode): Promise<void> {
+      if (guardedDrains.has(node.nodeId))
+        throw new FleetDrainConflictError("Drain in progress");
       if (
         !node.nodeId ||
         !node.nodeIncarnation ||
@@ -745,7 +797,65 @@ export async function openFleetController(options: FleetControllerOptions) {
         ),
       );
     },
-    async drain(nodeId: string): Promise<void> {
+    async drain(nodeId: string, expectedAssignments?: unknown): Promise<void> {
+      if (guardedDrains.has(nodeId))
+        throw new FleetDrainConflictError("Drain in progress");
+      if (expectedAssignments !== undefined) {
+        const expected = drainAssignments(expectedAssignments, nodeId);
+        const record = directory.nodes[nodeId];
+        if (!record) throw new FleetDrainConflictError("Unknown worker");
+        const actual = Object.values(rows).flatMap((row) =>
+          row.assignment?.nodeId === nodeId ? [row.assignment] : [],
+        );
+        if (
+          actual.length !== expected.length ||
+          expected.some((a) => {
+            const current = rows[fleetOwnerKey(a)]?.assignment;
+            return (
+              !current || assignmentFields.some((k) => a[k] !== current[k])
+            );
+          })
+        )
+          throw new FleetDrainConflictError("Drain assignments changed");
+        // Selection and assignment insertion in ensure are synchronous. Validate
+        // the complete set and fence new selection before yielding to any I/O.
+        guardedDrains.add(nodeId);
+        record.draining = true;
+        try {
+          // On a failed/ambiguous write, retain the in-memory fence and release
+          // nothing. Never automatically resume a possibly durable operator drain.
+          await persist();
+          const node = nodes.get(nodeId);
+          const results = await Promise.allSettled(
+            expected.map((a) =>
+              ownerOperation(fleetOwnerKey(a), async () => {
+                const current = rows[fleetOwnerKey(a)]?.assignment;
+                if (!current || !sameAssignment(current, a))
+                  throw new FleetDrainConflictError(
+                    "Drain assignment changed while queued",
+                  );
+                if (!node || node.nodeIncarnation !== a.nodeIncarnation) {
+                  if (Date.parse(current.leaseExpiresAt) > now())
+                    throw new FleetDrainConflictError(
+                      "Prior worker lease still live",
+                    );
+                  await leaseOperation(fleetOwnerKey(a), () => forget(a));
+                } else
+                  await teardown(
+                    a,
+                    node.worker,
+                    options.drainGraceMs ?? 120_000,
+                  );
+              }),
+            ),
+          );
+          const failure = results.find((r) => r.status === "rejected");
+          if (failure?.status === "rejected") throw failure.reason;
+        } finally {
+          guardedDrains.delete(nodeId);
+        }
+        return;
+      }
       const node = nodes.get(nodeId);
       if (!directory.nodes[nodeId]) throw new Error("Unknown worker");
       directory.nodes[nodeId]!.draining = true;
