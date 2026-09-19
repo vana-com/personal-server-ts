@@ -209,6 +209,37 @@ describe("v0.2 authorize → review", () => {
     expect(body.error).toBe("invalid_authorization_details");
   });
 
+  // The wire half of the independent review's finding 4. Core's own table
+  // (`selection-malformed-json.test.ts`) proves validation returns a typed
+  // failure instead of throwing; this proves what that is worth at the
+  // boundary — a 400 with an RFC 9396 code, not the 500 a thrown TypeError
+  // produced. The distinction matters to a client, which cannot retry its way
+  // out of a 500 and cannot tell it from a broken server.
+  it.each([
+    ["minimum.time_range: null", { minimum: { time_range: null } }],
+    ["fields: null", { fields: null }],
+    ["resources: null", { resources: null }],
+    ["time_range: null", { time_range: null }],
+    ["minimum: an array", { minimum: [] }],
+    ["fields: a string", { fields: "date" }],
+  ])("answers 400, not 500, for %s in the body", async (_label, override) => {
+    const created = await post("/pdpp/v1/authorize", v02Body(override));
+    expect(created.status).toBe(400);
+    const body = (await created.json()) as { error: string };
+    expect(["invalid_request", "invalid_authorization_details"]).toContain(
+      body.error,
+    );
+  });
+
+  it("answers 400 for a malformed streams container", async () => {
+    const malformed = v02Body();
+    (malformed.authorization_details[0] as Record<string, unknown>).streams = [
+      null,
+    ];
+    const created = await post("/pdpp/v1/authorize", malformed);
+    expect(created.status).toBe(400);
+  });
+
   it("shows the owner the ceiling, the floor, and each stream's necessity", async () => {
     const { response } = await review();
     expect(response.status).toBe(200);
@@ -309,9 +340,7 @@ describe("the owner's narrowing survives the wire", () => {
         };
       };
     };
-    expect(body.review.data.streams[0].time_constraint?.since).toBe(
-      YEAR.since,
-    );
+    expect(body.review.data.streams[0].time_constraint?.since).toBe(YEAR.since);
   });
 });
 

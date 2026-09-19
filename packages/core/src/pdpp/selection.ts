@@ -225,7 +225,11 @@ function validateMinimum(
   }
 
   if (minimum.time_range !== undefined) {
-    const { since, until } = minimum.time_range;
+    const range: unknown = minimum.time_range;
+    if (typeof range !== "object" || range === null || Array.isArray(range)) {
+      return bad("time_range must be an object");
+    }
+    const { since, until } = range as { since?: unknown; until?: unknown };
     // Unlike a request `time_range`, a minimum window must be closed: an open
     // floor would mean "at least everything", which no narrowing can satisfy
     // and which the request's own upper limit already bounds.
@@ -266,6 +270,19 @@ function validateStreamRequest(
   snapshot: DeclarationSnapshot,
   revision: "0.1" | "0.2",
 ): SelectionValidation {
+  // The entry is untrusted JSON: `streams: [null]` and `streams: ["name"]`
+  // both reach here. Every check below reads a member off it, so the shape
+  // gate comes first or the first read throws.
+  if (typeof stream !== "object" || stream === null || Array.isArray(stream)) {
+    return fail("invalid_request", "each stream entry must be an object");
+  }
+  if (typeof stream.name !== "string" || stream.name.length === 0) {
+    return fail(
+      "invalid_request",
+      "each stream entry must carry a non-empty name",
+    );
+  }
+
   if (stream.necessity !== undefined) {
     if (stream.necessity !== "required" && stream.necessity !== "optional") {
       return fail(
@@ -372,10 +389,22 @@ function validateStreamRequest(
   }
 
   if (stream.fields !== undefined) {
+    if (!Array.isArray(stream.fields)) {
+      return fail(
+        "invalid_request",
+        `stream '${stream.name}' fields must be an array`,
+      );
+    }
     if (stream.fields.length === 0) {
       return fail(
         "invalid_request",
         `stream '${stream.name}' specifies an empty fields list`,
+      );
+    }
+    if (!stream.fields.every((f) => typeof f === "string" && f.length > 0)) {
+      return fail(
+        "invalid_request",
+        `stream '${stream.name}' fields must contain non-empty strings`,
       );
     }
     const absent = stream.fields.filter((f) => !declared.fields.includes(f));
@@ -404,6 +433,12 @@ function validateStreamRequest(
   }
 
   if (stream.resources !== undefined) {
+    if (!Array.isArray(stream.resources)) {
+      return fail(
+        "invalid_request",
+        `stream '${stream.name}' resources must be an array`,
+      );
+    }
     if (stream.resources.length === 0) {
       return fail(
         "invalid_request",
@@ -411,6 +446,12 @@ function validateStreamRequest(
       );
     }
     for (const raw of stream.resources) {
+      if (typeof raw !== "string") {
+        return fail(
+          "invalid_resource_key",
+          `stream '${stream.name}' resources must contain strings`,
+        );
+      }
       const problem = validateResourceKey(raw, declared.primary_key);
       if (problem) {
         return fail(
@@ -454,6 +495,14 @@ export function validateSelectionRequest(
     );
   }
 
+  if (
+    typeof request.source !== "object" ||
+    request.source === null ||
+    Array.isArray(request.source)
+  ) {
+    return fail("invalid_request", "source must be an object");
+  }
+
   if (request.source.id !== snapshot.source_id) {
     return fail(
       "invalid_request",
@@ -480,7 +529,15 @@ export function validateSelectionRequest(
   }
 
   if (request.retention !== undefined) {
-    const { on_expiry } = request.retention;
+    const retention: unknown = request.retention;
+    if (
+      typeof retention !== "object" ||
+      retention === null ||
+      Array.isArray(retention)
+    ) {
+      return fail("invalid_request", "retention must be an object");
+    }
+    const { on_expiry } = retention as { on_expiry?: unknown };
     if (on_expiry !== "delete" && on_expiry !== "anonymize") {
       // `archive` was dropped in v0.1 and is the likely wrong value here.
       return fail(
@@ -523,8 +580,26 @@ export function validateSelectionRequest(
   }
 
   const streams = request.streams ?? [];
+  if (!Array.isArray(streams)) {
+    return fail("invalid_request", "streams must be an array");
+  }
   if (streams.length === 0) {
     return fail("invalid_request", "streams must not be empty");
+  }
+
+  // Every check from here down reads `.name` off an entry — the wildcard
+  // scan, the uniqueness scan, and the per-stream validation — so the entry
+  // shapes are gated once, first, rather than at each read.
+  for (const entry of streams) {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      return fail("invalid_request", "each stream entry must be an object");
+    }
+    if (typeof entry.name !== "string" || entry.name.length === 0) {
+      return fail(
+        "invalid_request",
+        "each stream entry must carry a non-empty name",
+      );
+    }
   }
 
   const wildcards = streams.filter((s) => s.name === "*");
