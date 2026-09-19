@@ -31,6 +31,7 @@
  */
 
 import Database from "better-sqlite3";
+import { isDeepStrictEqual } from "node:util";
 import { parseDeclaration } from "@opendatalabs/personal-server-ts-core/pdpp";
 import type {
   DeclarationFailure,
@@ -40,7 +41,7 @@ import type { Logger } from "pino";
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS pdpp_current_declarations (
-  source_id TEXT PRIMARY KEY,
+  source_id TEXT NOT NULL,
   version TEXT NOT NULL,
   digest TEXT NOT NULL,
   snapshot_json TEXT NOT NULL,
@@ -48,8 +49,13 @@ CREATE TABLE IF NOT EXISTS pdpp_current_declarations (
   -- re-digesting it does NOT reproduce digest; a producer's claimed digest
   -- can only honestly be checked against what was actually submitted.
   document TEXT NOT NULL,
-  accepted_at TEXT NOT NULL
+  accepted_at TEXT NOT NULL,
+  is_current INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (source_id, version)
 );
+
+CREATE INDEX IF NOT EXISTS pdpp_current_declarations_current_idx
+  ON pdpp_current_declarations (source_id, is_current);
 `;
 
 export interface MutableDeclarationRegistry {
@@ -98,7 +104,7 @@ export function openDeclarationRegistry(
 ): MutableDeclarationRegistry {
   const db = new Database(options.path);
   db.pragma("journal_mode = WAL");
-  db.exec(SCHEMA_SQL);
+  migrateSchema(db);
 
   const supported = new Set(options.supportedConnectors);
 
@@ -135,24 +141,47 @@ export function openDeclarationRegistry(
       };
     }
 
-    db.prepare(
-      `INSERT INTO pdpp_current_declarations
-         (source_id, version, digest, snapshot_json, document, accepted_at)
-       VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT (source_id) DO UPDATE SET
-         version = excluded.version,
-         digest = excluded.digest,
-         snapshot_json = excluded.snapshot_json,
-         document = excluded.document,
-         accepted_at = excluded.accepted_at`,
-    ).run(
-      parsed.snapshot.source_id,
-      parsed.snapshot.version,
-      parsed.snapshot.digest,
-      JSON.stringify(parsed.snapshot),
-      document,
-      new Date().toISOString(),
-    );
+    const existing = db
+      .prepare(
+        `SELECT snapshot_json FROM pdpp_current_declarations
+         WHERE source_id = ? AND version = ?`,
+      )
+      .get(parsed.snapshot.source_id, parsed.snapshot.version) as
+      { snapshot_json: string } | undefined;
+    if (existing) {
+      const retained = JSON.parse(
+        existing.snapshot_json,
+      ) as DeclarationSnapshot;
+      if (!sameDeclarationContent(retained, parsed.snapshot)) {
+        return {
+          ok: false,
+          failure: {
+            code: "declaration_equivocation",
+            message:
+              "different content was already accepted under this (source.id, declaration_version) key",
+          },
+        };
+      }
+      return { ok: true, snapshot: retained };
+    }
+
+    db.transaction(() => {
+      db.prepare(
+        "UPDATE pdpp_current_declarations SET is_current = 0 WHERE source_id = ?",
+      ).run(parsed.snapshot.source_id);
+      db.prepare(
+        `INSERT INTO pdpp_current_declarations
+           (source_id, version, digest, snapshot_json, document, accepted_at, is_current)
+         VALUES (?, ?, ?, ?, ?, ?, 1)`,
+      ).run(
+        parsed.snapshot.source_id,
+        parsed.snapshot.version,
+        parsed.snapshot.digest,
+        JSON.stringify(parsed.snapshot),
+        document,
+        new Date().toISOString(),
+      );
+    })();
 
     return { ok: true, snapshot: parsed.snapshot };
   }
@@ -179,7 +208,8 @@ export function openDeclarationRegistry(
     resolve(sourceId) {
       const row = db
         .prepare(
-          "SELECT snapshot_json FROM pdpp_current_declarations WHERE source_id = ?",
+          `SELECT snapshot_json FROM pdpp_current_declarations
+           WHERE source_id = ? AND is_current = 1`,
         )
         .get(sourceId) as { snapshot_json: string } | undefined;
       return row
@@ -189,7 +219,8 @@ export function openDeclarationRegistry(
     documentFor(sourceId) {
       const row = db
         .prepare(
-          "SELECT document FROM pdpp_current_declarations WHERE source_id = ?",
+          `SELECT document FROM pdpp_current_declarations
+           WHERE source_id = ? AND is_current = 1`,
         )
         .get(sourceId) as { document: string } | undefined;
       return row?.document ?? null;
@@ -197,7 +228,8 @@ export function openDeclarationRegistry(
     list() {
       const rows = db
         .prepare(
-          "SELECT snapshot_json FROM pdpp_current_declarations ORDER BY source_id",
+          `SELECT snapshot_json FROM pdpp_current_declarations
+           WHERE is_current = 1 ORDER BY source_id`,
         )
         .all() as { snapshot_json: string }[];
       return rows.map(
@@ -209,6 +241,43 @@ export function openDeclarationRegistry(
       db.close();
     },
   };
+}
+
+function migrateSchema(db: Database.Database): void {
+  const columns = db
+    .prepare("PRAGMA table_info(pdpp_current_declarations)")
+    .all() as { name: string }[];
+  if (columns.length === 0) {
+    db.exec(SCHEMA_SQL);
+    return;
+  }
+  if (columns.some((column) => column.name === "is_current")) {
+    db.exec(SCHEMA_SQL);
+    return;
+  }
+
+  db.transaction(() => {
+    db.exec(
+      "ALTER TABLE pdpp_current_declarations RENAME TO pdpp_current_declarations_legacy",
+    );
+    db.exec(SCHEMA_SQL);
+    db.exec(
+      `INSERT INTO pdpp_current_declarations
+         (source_id, version, digest, snapshot_json, document, accepted_at, is_current)
+       SELECT source_id, version, digest, snapshot_json, document, accepted_at, 1
+       FROM pdpp_current_declarations_legacy`,
+    );
+    db.exec("DROP TABLE pdpp_current_declarations_legacy");
+  })();
+}
+
+function sameDeclarationContent(
+  a: DeclarationSnapshot,
+  b: DeclarationSnapshot,
+): boolean {
+  const { digest: _aDigest, ...aContent } = a;
+  const { digest: _bDigest, ...bContent } = b;
+  return isDeepStrictEqual(aContent, bContent);
 }
 
 /**

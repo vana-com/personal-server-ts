@@ -136,6 +136,27 @@ describe("POST /pdpp/declarations — acceptance", () => {
     expect((await second.json()).digest).toBe((await first.json()).digest);
   });
 
+  it("refuses different content under an accepted source and version", async () => {
+    await submit(declarationDocument());
+    const res = await submit(
+      declarationDocument({
+        streams: [
+          {
+            ...declarationDocument().streams[0],
+            name: "different_stream",
+          },
+        ],
+      }),
+    );
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("declaration_equivocation");
+    expect(registry.resolve(SOURCE_ID)?.streams[0]?.name).toBe("top_artists");
+    expect(registry.documentFor(SOURCE_ID)).toBe(
+      JSON.stringify(declarationDocument()),
+    );
+  });
+
   it("replaces the retained declaration when a newer version is submitted", async () => {
     await submit(declarationDocument());
     const res = await submit(
@@ -144,6 +165,20 @@ describe("POST /pdpp/declarations — acceptance", () => {
 
     expect(res.status).toBe(200);
     expect((await res.json()).version).toBe("2.0.0");
+    expect(registry.resolve(SOURCE_ID)?.version).toBe("2.0.0");
+
+    const equivocation = await submit(
+      declarationDocument({
+        streams: [
+          {
+            ...declarationDocument().streams[0],
+            name: "different_stream",
+          },
+        ],
+      }),
+    );
+    expect(equivocation.status).toBe(400);
+    expect((await equivocation.json()).error).toBe("declaration_equivocation");
     expect(registry.resolve(SOURCE_ID)?.version).toBe("2.0.0");
   });
 });

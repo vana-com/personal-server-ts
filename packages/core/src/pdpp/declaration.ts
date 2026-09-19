@@ -33,6 +33,7 @@ export type DeclarationFailureCode =
   | "digest_mismatch"
   | "source_id_mismatch"
   | "untrusted_source"
+  | "declaration_equivocation"
   | "unsupported_version";
 
 export interface DeclarationFailure {
