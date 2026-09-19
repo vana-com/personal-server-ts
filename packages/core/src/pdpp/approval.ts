@@ -73,6 +73,8 @@ export interface AuthorizationSession {
   /** AS-policy grant expiry carried into issuance. */
   grant_expires_at?: string;
   stream_descriptions?: Record<string, string>;
+  /** The owner's optional reason for denying. Never sent to the client. */
+  denial_reason?: string;
 }
 
 export type ApprovalFailureCode =
@@ -166,6 +168,18 @@ export class AuthorizationSessionStore {
   setStatus(sessionId: string, status: SessionState): void {
     const session = this.sessions.get(sessionId);
     if (session) session.status = status;
+  }
+
+  /**
+   * Retain the owner's reason for denying, beside the denial itself.
+   *
+   * Kept on the session rather than in the grant store because there is no
+   * grant: a denial produces no authorization, and the reason is the owner's
+   * note about a decision, not a term of one.
+   */
+  setDenialReason(sessionId: string, reason: string): void {
+    const session = this.sessions.get(sessionId);
+    if (session) session.denial_reason = reason;
   }
 }
 
@@ -656,6 +670,19 @@ export function denyAuthorization(input: {
   tokens: PdppTokenService;
   sessionId: string;
   ownerToken: string | undefined;
+  /**
+   * The owner's optional free-text reason for refusing.
+   *
+   * Retained with the denial, and deliberately NOT forwarded to the client:
+   * the OAuth binding answers a denial with `access_denied` and nothing more,
+   * so a reason that reached the requester would turn an optional courtesy
+   * into a disclosure the owner did not intend. It exists so the owner's own
+   * record of the decision says why.
+   *
+   * A consent surface must not offer a box whose contents are discarded. The
+   * parameter exists so the control on the screen is real.
+   */
+  reason?: string;
   now?: Date;
 }): { ok: true } | { ok: false; failure: ApprovalFailure } {
   const now = input.now ?? new Date();
@@ -679,5 +706,11 @@ export function denyAuthorization(input: {
   }
 
   input.sessions.setStatus(auth.session.session_id, "denied");
+  // Trimmed, and only when it carries something: an empty box is not a reason,
+  // and retaining "" would make a denial look annotated when it was not.
+  const reason = input.reason?.trim();
+  if (reason) {
+    input.sessions.setDenialReason(auth.session.session_id, reason);
+  }
   return { ok: true };
 }

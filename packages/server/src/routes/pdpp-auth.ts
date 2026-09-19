@@ -703,15 +703,27 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   });
 
   /** Deny. Terminal; no grant and no consent evidence beyond the denial. */
-  app.post("/authorize/:session_id/deny", (c) => {
+  app.post("/authorize/:session_id/deny", async (c) => {
     const sessionId = c.req.param("session_id");
     const session = deps.sessions.get(sessionId);
+
+    // The owner's optional note. Read defensively: a denial must succeed even
+    // when the body is absent or malformed, because refusing is the safe
+    // outcome and must never be blocked by the shape of an optional field.
+    let reason: string | undefined;
+    try {
+      const body = (await c.req.json()) as { reason?: unknown } | null;
+      if (typeof body?.reason === "string") reason = body.reason;
+    } catch {
+      reason = undefined;
+    }
 
     const result = denyAuthorization({
       sessions: deps.sessions,
       tokens: deps.tokens,
       sessionId,
       ownerToken: bearer(c),
+      ...(reason !== undefined && { reason }),
     });
 
     if (!result.ok) {
