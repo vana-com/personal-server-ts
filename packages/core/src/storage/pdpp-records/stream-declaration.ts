@@ -19,6 +19,21 @@ export interface StreamDeclaration {
   /** Always included in a sparse `fields` projection, even if not requested. */
   requiredFields: string[];
   /**
+   * Every top-level member the retained declaration declares for this stream.
+   *
+   * This is the RS's only authority for what a record of this stream MEANS. A
+   * v0.2 grant naming a member that is not here cannot be served: the RS
+   * cannot tell whether the member is absent from every record, was renamed,
+   * or is something the record happens to carry under that key — and each
+   * possible answer discloses a different, unverified thing. That read is
+   * refused with `disclosure_unavailable` rather than quietly resolved.
+   *
+   * Optional because a v0.1 deployment may boot from a declaration shape that
+   * carries no field list, and a v0.1 grant has no approved projection to
+   * check against. Absent means "no check", never "no fields".
+   */
+  declaredFields?: string[];
+  /**
    * The stream's JSON Schema from the retained declaration (§5).
    *
    * §8 stream metadata carries this so a client can understand record shape

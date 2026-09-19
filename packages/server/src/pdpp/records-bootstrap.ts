@@ -266,6 +266,12 @@ function toStreamDeclarations(
     cursorField: "emitted_at",
     consentTimeField: stream.consent_time_field,
     requiredFields: stream.required_fields,
+    // The declared member list, carried rather than dropped: it is what makes
+    // a v0.2 grant's approved projection checkable against the snapshot the
+    // grant was resolved from. Without it the RS would have to treat any
+    // granted field as servable and answer from whatever a record happened to
+    // carry.
+    declaredFields: stream.fields,
     // §8 stream metadata reports both; carried from the retained declaration
     // rather than reconstructed, so what a client is told matches what the
     // owner consented against.

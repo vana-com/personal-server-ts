@@ -31,6 +31,7 @@ export type PdppErrorCode =
   | "grant_expired"
   | "grant_revoked"
   | "grant_invalid"
+  | "disclosure_unavailable"
   | "blob_not_found"
   | "not_found"
   | "cursor_expired"
@@ -52,6 +53,7 @@ const STATUS_BY_CODE: Record<PdppErrorCode, number> = {
   grant_expired: 403,
   grant_revoked: 403,
   grant_invalid: 403,
+  disclosure_unavailable: 403,
   blob_not_found: 404,
   not_found: 404,
   cursor_expired: 410,
@@ -74,6 +76,7 @@ const TYPE_BY_CODE: Record<PdppErrorCode, PdppErrorType> = {
   grant_expired: "permission_error",
   grant_revoked: "permission_error",
   grant_invalid: "permission_error",
+  disclosure_unavailable: "permission_error",
   blob_not_found: "not_found_error",
   not_found: "not_found_error",
   cursor_expired: "gone_error",

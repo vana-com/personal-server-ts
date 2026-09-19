@@ -101,6 +101,35 @@ export function resolveReadScope(
   // narrowing one layer below the decision the owner actually made.
   const schemaRequiredFloor = !grantIsV02(context.grant);
 
+  // v0.2 only: can this RS actually serve the projection the grant approved?
+  //
+  // The retained declaration is the RS's only authority for what a record of
+  // this stream means. A granted member the declaration does not declare has
+  // no meaning the RS can stand behind: omitting it asserts "no such value"
+  // (unknown), nulling it is forbidden outright by `v0.2-4-3`, and serving
+  // whatever the record carries under that key discloses an undeclared member
+  // — which is repairing the projection with unauthorized data.
+  //
+  // So refuse, with the code the spec reserves for exactly this. The
+  // distinction from `grant_invalid` is the client's remedy: the grant is
+  // well-formed and this RS cannot serve it, so the answer is to reauthorize
+  // against the current declaration, not to treat the grant as corrupt.
+  //
+  // Checked here rather than at each endpoint because all three client read
+  // surfaces (list, single record, stream metadata) resolve through this
+  // function, and a refusal one of them forgot would be a surface that
+  // discloses what the other two refuse.
+  if (!schemaRequiredFloor && declaration.declaredFields) {
+    const declared = new Set(declaration.declaredFields);
+    const undeclared = streamGrant.fields.filter((f) => !declared.has(f));
+    if (undeclared.length > 0) {
+      throw new PdppError(
+        "disclosure_unavailable",
+        `Grant authorizes ${undeclared.join(", ")} on stream '${stream}', which the retained declaration does not declare; the projection cannot be served without disclosing an undeclared member`,
+      );
+    }
+  }
+
   return {
     instanceIds: streamGrant.instance_ids,
     fields: schemaRequiredFloor
