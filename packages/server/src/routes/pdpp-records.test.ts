@@ -976,3 +976,58 @@ describe("pdpp records routes: unsupported view/expand shapes", () => {
     expect(body.relationships).toEqual([]);
   });
 });
+
+describe("pdpp records routes: blob ingest", () => {
+  it("stores owner-uploaded blob bytes and returns the blob_id a record can reference", async () => {
+    const { app, store } = buildApp({
+      "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+    });
+
+    const bytes = new Uint8Array([1, 2, 3, 4, 5]);
+    const res = await app.request("/blobs/ingest", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer owner-tok",
+        "Content-Type": "image/jpeg",
+      },
+      body: bytes,
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(typeof body.blob_id).toBe("string");
+    expect(body.mime_type).toBe("image/jpeg");
+    expect(body.size_bytes).toBe(5);
+
+    // The point of the route: the bytes are retrievable afterwards, so a
+    // record referencing this blob_id has something for GET /blobs/:id to
+    // serve. A route that minted an id without persisting bytes would satisfy
+    // the response assertions above and still be useless.
+    expect(store.getBlobBytes(body.blob_id)).toEqual(bytes);
+    expect(store.getBlobMeta(body.blob_id)?.mimeType).toBe("image/jpeg");
+  });
+
+  it("refuses a client token: ingest is the owner's lane", async () => {
+    const { app } = buildApp({
+      "client-tok": {
+        active: true,
+        tokenKind: "client",
+        subjectId: "sub_1",
+        grant: clientGrant(),
+      },
+    });
+
+    const res = await app.request("/blobs/ingest", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer client-tok",
+        "Content-Type": "image/jpeg",
+      },
+      body: new Uint8Array([1, 2, 3]),
+    });
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error.code).toBe("authentication_error");
+  });
+});

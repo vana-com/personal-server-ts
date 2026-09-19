@@ -1091,6 +1091,65 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     }
   });
 
+  // Owner-authenticated blob ingest, the write half of GET /v1/blobs/:blob_id.
+  //
+  // The store has always been able to hold blob bytes and the read route has
+  // always been able to serve them, but nothing could put bytes in over HTTP:
+  // the only writers were in-process test fixtures. So a deployment could
+  // implement the whole §8 blob surface and still have no blob for anyone to
+  // fetch, which is not a hypothetical -- it is why the conformance suite's
+  // three RS-1 blob cases report `skip` against this server today. They need a
+  // persisted blob and a record referencing it, and declined to fabricate
+  // either.
+  //
+  // Owner-only for the same reason ingest above is: a client that could upload
+  // bytes could plant a blob and then read it back through its own grant.
+  // Body is the raw bytes; Content-Type is the declared media type, which is
+  // what the read route later serves back.
+  app.post("/blobs/ingest", async (c) => {
+    const reqId = requestId();
+    const { context, error } = await authenticate(c, reqId);
+    if (error) return error;
+
+    try {
+      if (context!.tokenKind !== "owner") {
+        throw new PdppError(
+          "authentication_error",
+          "Blob ingest requires an owner token",
+        );
+      }
+      const mimeType = c.req.header("content-type");
+      if (!mimeType) {
+        throw new PdppError(
+          "invalid_request",
+          "Content-Type is required: it is the blob's declared media type",
+        );
+      }
+      const bytes = new Uint8Array(await c.req.arrayBuffer());
+      if (bytes.length === 0) {
+        throw new PdppError("invalid_request", "Blob body is empty");
+      }
+
+      const meta = deps.store.storeBlobBytes(bytes, mimeType);
+      return c.json(
+        {
+          blob_id: meta.blobId,
+          mime_type: meta.mimeType,
+          size_bytes: meta.sizeBytes,
+          sha256: meta.sha256,
+        },
+        200,
+        { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+      );
+    } catch (err) {
+      return sendError(
+        c,
+        mapAndLog(deps, "POST /v1/blobs/ingest", reqId, err),
+        reqId,
+      );
+    }
+  });
+
   return app;
 }
 
