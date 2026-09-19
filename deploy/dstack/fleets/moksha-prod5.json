@@ -3,8 +3,8 @@
   "gatewayUrl": "https://dp-rpc.moksha.vana.org",
   "rolledGitRef": {
     "NOTE": "not a render-fleet.py manifest field; pass at render time as --git-ref (must equal images.env PS_IMAGE_REF)",
-    "sha": "de881ee5ae4f1c1582fff4b376ba755e89131f40",
-    "source": "PS #329 merge commit; CI Docker run35376172620 images.env; step56 full Moksha controller+worker roll"
+    "sha": "84d19ffc3f4059c5a5d034c8f7e987f0c07bcfd9",
+    "source": "PS #333 merge commit; CI Docker run35409500654 images.env; step64 unchanged-two-worker guarded-drain safety correction"
   },
   "gatewayDomain": "dstack-pha-prod5.phala.network",
   "operatorPublicKeySpkiBase64": "MCowBQYDK2VwAyEAPPx3xJ6NkAsPk1gT2v9E3s/huSL9MVG3S9D8e/Eqzjg=",
@@ -23,7 +23,7 @@
       "composeOut": "controller-compose.yml",
       "pinned": {
         "instanceId": "6223bcb478a5f5b7d11dae5713d9ff58501c090a",
-        "composeHash": "68b9a887f033657423baf4dd5d683ac3a33f07aa40dccb3a2b0a7778036e6f33"
+        "composeHash": "dc0fd054c84926a0354db4637b413fc350171e4f5f8d88ca449a9828a34ad770"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -74,7 +74,7 @@
       "composeOut": "worker-compose.yml",
       "pinned": {
         "instanceId": "eeea1588a1f55b129a2b14b24a1002719976f6a0",
-        "composeHash": "6a75081328be0c5b83de5813bc33b1ded1b3ff2f8050e5c0364864c7f6183c78"
+        "composeHash": "8a0f4ab7722b278ff9b1d5055e53b6219f0a4b208b355b44fccdf2ae7d43f050"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -125,7 +125,7 @@
       "composeOut": "worker-1-source-compose.yml",
       "pinned": {
         "instanceId": "1ac22335a2da1ca6a024396c4a557907279403ab",
-        "composeHash": "6a75081328be0c5b83de5813bc33b1ded1b3ff2f8050e5c0364864c7f6183c78"
+        "composeHash": "8a0f4ab7722b278ff9b1d5055e53b6219f0a4b208b355b44fccdf2ae7d43f050"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -179,5 +179,5 @@
     "instanceIds": "Instance ids are each machine self-reported during the 2026-09-16 roll, paired by the compose hash staging applied to that specific uuid, and then confirmed by the Gateway re-registering every node from its own quote. Do NOT take them from phala api /cvms/<uuid>/attestation (resolves by app id, answers for either replica) and do NOT take them from a pre-roll tee_nodes row: those were crossed against the node ids, which is what made the first attempt of this roll crash-loop both workers with Invalid fleet security configuration. render-fleet.py --instance-ids re-reads them from the Gateway at run time; after this roll that record is correct.",
     "rolled": "2026-09-16: rolled to main 847df7d. Before: controller 92e2acf8, worker-1 5d08e198, worker-2 8673fed7."
   },
-  "pinnedFrom": "Re-harvested per UUID after step56 A release de881ee5ae4f1c1582fff4b376ba755e89131f40 (Docker run35376172620): staged compose readback plus adjacent guest boot instance/hash pairs; existing identities unchanged. Normal signed startup and controller peer admission verified, Gateway rows rotated to fresh heartbeats/admitted at2026-09-18T18:08:44Z. Per-app Phala attestation lookup is not used as replica identity ground truth."
+  "pinnedFrom": "Re-harvested per UUID after step64 release84d19ffc3f4059c5a5d034c8f7e987f0c07bcfd9 (Docker run35409500654): exact compose readback plus adjacent guest boot instance/hash pairs at2026-09-19T01:21:56Z; existing identities unchanged. Normal signed startup and peer admission verified; guarded empty drains fenced rows before rotation, both Gateway nodes admitted and explicitly resumed at2026-09-19T01:21:12Z. Controller and worker2 each required one documented restart to restore the normal measured event profile, preserving signed bytes and durable volumes; worker1 needed no additional recovery restart. Shared-app Phala attestation lookup is not used as replica identity ground truth."
 }
