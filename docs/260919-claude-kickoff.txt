@@ -1,0 +1,39 @@
+Continue the Vana personal-server / TEE A–E work from this durable handoff:
+/Users/kahtaf/Documents/workspace_vana/personal-server-ts/docs/260919-claude-handoff.md
+
+You are the main ORCHESTRATOR. Do the complex reasoning, sequencing, and acceptance decisions yourself. Delegate investigations, code, commands, tests, deployments, receipts, and verification to smaller Claude subagents (Haiku for bounded straightforward work; Sonnet for implementation/operations needing greater capability). Give precise plans and acceptance criteria. A separate agent must independently review changes and proof; no self-review or autoreview. Keep only useful agents active, parallelize independent work, and use exactly one fleet/deployment operator across both environments. Do not spend Codex usage.
+
+First read the handoff and its linked evidence snapshot and newest local receipts. The earlier Codex operator may still be working: do not mutate anything until exclusive ownership has been explicitly handed over or I confirm the previous operator is stopped. Read-only local preparation can proceed meanwhile. This is coordination, not a request to reapprove already-authorized changes.
+
+The latest local receipt records Moksha POOL_LOOP_ENABLED=1 after PR150; effective deployment and lifecycle proof still require reconciliation. Never blindly repeat that write/deploy. PR150 is merged and database-tested. Finish the fixed-code Moksha lifecycle proof, independently verify it, then perform the already-approved mainnet rollout/proof. In parallel, independently review the corrected mainnet harness. Preserve all restrictions, source fences, real-clock waits, 121-second operator pacing, protected-owner exclusion, rollback/evidence requirements, and existing approvals in the handoff. Do not repeat completed C work or the waived/previously blocked security replay gate. Keep paid/private inference and GO LANES held.
+
+Persist through routine local failures and asynchronous builds instead of ending at a plan or idle agents. Report only meaningful milestones, failures, or needed user actions. Keep the handoff, concise receipts, RESULT.md and INDEX current so another orchestrator can resume. Do not call a source test or HTTP202 an E2E success; prove actual placements, guarded admission, idle drain/stop, pinned-worker preservation, and idempotence. When finished, report evidence-backed completed work and explicit remaining limitations.
+
+## Codex/Luna checkpoint — 2026-09-19
+
+Known completed and independently reviewed:
+
+- PR150 is merged at `785023c1` (pool resume hex normalization); the follow-up review commit `01ca38fa9c054839e17ed23e4908a72409aef023` contains the raw stored-value CAS correction. The operator reports the new-head real PostgreSQL suite at 12/12; do not rerun production tests or infer fleet state from CI.
+- The first live Moksha capacity cycle proved eight placements (W1/W2 at 4+4) and automatic W3 start. It did not prove the exact 60-second debounce, ninth assignment, or idle scale-down. The ninth request was never sent. Mainnet was not enabled or proven.
+- Mainnet source-only bundle remains separate and non-executable pending independent review. Author-remediated source hashes and receipt are in `.../step65-d-pool-inventory/mainnet-pool-live-proof`; `independent-review-luna.json` preserves the earlier findings and marks remediation pending independent review. The author receipt SHA was `7c8cda447280bf3a82c81097ffb8a14d5b84c453f0d78ecef3e5f343eb2e9b0d`.
+
+Current unresolved runtime state:
+
+- The historical 20:18:47 Moksha `POOL_LOOP_ENABLED=1` write and the 20:24:19Z `Not authorized` OFF attempt are superseded by the confirmed reconciliation: OFF materialized READY as `dpl_DdGpAj3kQuYpaqQYTJcg4f2WuU8L` at canonical `dp-rpc.moksha.vana.org`. Authenticated dry-run at 20:30:35.3Z returned HTTP 200 `{skipped:true,reason:disabled}`. The historical failure remains recorded as resolved. Current W3 is **running**, `in_progress:false`, UUID `eb5e1d4d-18c1-4ac2-8e59-fb8f53004fa5`; the earlier 20:24:07 DB capture showing `starting` is stale, not current.
+- Dry-run is not proof of cold adoption because `runTick(..., dry-run)` currently uses `previousTickAt=now`; a real apply tick is required to exercise persisted singleton last-tick adoption. A separate source-only dry-run fix is WIP in `/tmp/data-gateway-pool-dryrun-260919` and has not been committed, pushed, merged, or deployed. It must not guide runtime decisions until independently reviewed and real PostgreSQL-tested.
+
+Exact local operator receipts for reconciliation are:
+
+- Enable receipt: `/Users/kahtaf/Documents/workspace_vana/e2e-proof-2026-09-09/fleet-overnight/launch-handoff-260914/overnight-260915/out/step65-d-pool-inventory/moksha-pool-live-proof/ninth-owner-prep/enable-pr150-2020/doppler-enable-receipt.json` (flag write at 20:18:46–20:18:47Z).
+- READY deployment inspection: `/Users/kahtaf/Documents/workspace_vana/e2e-proof-2026-09-09/fleet-overnight/launch-handoff-260914/overnight-260915/out/step65-d-pool-inventory/moksha-pool-live-proof/ninth-owner-prep/enable-pr150-2020/deployment-inspect.json` (`dpl_6tQTiCGBRypaSY9JRErBWqHfbsPV`).
+- Dry-run receipt: `/Users/kahtaf/Documents/workspace_vana/e2e-proof-2026-09-09/fleet-overnight/launch-handoff-260914/overnight-260915/out/step65-d-pool-inventory/moksha-pool-live-proof/ninth-owner-prep/enable-pr150-2020/dryrun-receipt.json` (20:23:03.811Z).
+- Later DB/runtime receipt: the operator-reported 20:24:07Z capture showing W3 `starting` and provider restart in progress; its absolute path was not supplied in the handoff and remains pending reconciliation.
+- Historical OFF write/deployment result: operator receipt at 20:24:19.3Z reported `Not authorized`; this was later resolved by the confirmed READY OFF materialization documented below.
+
+Final OFF reconciliation receipt: `/Users/kahtaf/Documents/workspace_vana/e2e-proof-2026-09-09/fleet-overnight/launch-handoff-260914/overnight-260915/out/step65-d-pool-inventory/moksha-pool-live-proof/ninth-owner-prep/disable-reconcile-2024-retry/vercel.stdout`; raw SHA `308cfbb823d7309c5384f309f5d1a6b2d361fdaf1730c1e05f0e351118ea716c`, receipt SHA `76822c5e4613859fcac31ee0e9d822893da4c12636fe19607d613dd17c728e38`.
+
+Current W3 readback receipt: `/Users/kahtaf/Documents/workspace_vana/e2e-proof-2026-09-09/fleet-overnight/launch-handoff-260914/overnight-260915/out/step65-d-pool-inventory/moksha-pool-live-proof/ninth-owner-prep/disable-reconcile-2024-retry/w3-readback.json`; raw SHA `c79af36ddd4bdb401945fdd6b4ace5cacc19cb279bc3be4c3e5dcbad6f3955ab`, receipt SHA `9f13d70afc17f19cbb49bdeec64b5fbe0649a1609d76ca5bd3e19dc9ab5b3254`.
+
+The first Claude action must be a read-only reconciliation of W3’s current active/zero state. If zero-active is confirmed, continue the existing authorized guarded-empty controller drain and one provider stop; do not reset the DB or re-enable the loop. The dry-run WIP has no new tests run: the worktree is uncommitted and neither the proposed stale-singleton dry-run tests nor real PostgreSQL validation has been executed.
+
+Handoff constraints remain: one fleet/deployment operator; no protected owner; no CVM delete; no on-chain fees or settlement; no manual DB reset; normal cron only; 121-second operator pacing; real-clock 600-second leases and 15-minute idle observation; preserve rollback IDs and raw receipts; never print secrets. Obtain a final operator-owned effective Moksha state before resuming proof. Then prove W3/W4 admission, ninth assignment, no overcommit, natural idle drain/stop, pinned W1/W2 preservation, and idempotence. Keep mainnet held until Moksha E2E and independent mainnet source review are complete.

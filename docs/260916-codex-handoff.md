@@ -1,3 +1,5 @@
+> **Continuation status — 2026-09-19:** Read [the current Claude handoff](/Users/kahtaf/Documents/workspace_vana/personal-server-ts/docs/260919-claude-handoff.md) first. Status prose below is historical and superseded for A–E: C accepted; PR150 merged; Moksha re-enable recorded but deployment/lifecycle proof needs reconciliation; mainnet D proof pending; paid/private inference held. Existing operators may still be active; this update does not transfer ownership. Raw receipts remain unchanged.
+
 # Codex handoff — 2026-09-17 ~00:00Z (Claude weekly limit imminent)
 
 Orchestrator role moves to Codex (gpt-5.6-sol, medium). Everything below is current as of writing; verify live before acting.
