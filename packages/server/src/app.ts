@@ -284,6 +284,7 @@ export function createApp(deps: AppDeps): Hono {
         store: deps.pdpp.store,
         auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
+        ownerSubjectId: deps.serverOwner,
         instancesForSubject: deps.pdpp.instancesForSubject,
         // An `api_error` on the resource surface is a server fault and must
         // leave a correlatable line behind; the route never reaches the

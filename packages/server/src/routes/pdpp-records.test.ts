@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import {
   createMemoryRecordStore,
@@ -10,6 +10,7 @@ import type {
   PdppTokenContext,
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
+  MAX_BLOB_UPLOAD_BYTES,
   pdppRecordsRoutes,
   type PdppRecordsRouteDeps,
 } from "./pdpp-records.js";
@@ -65,6 +66,7 @@ function buildApp(
       store,
       auth,
       declarations,
+      ownerSubjectId: "sub_1",
       instancesForSubject: () => ["inst_1"],
       ...deps,
     }),
@@ -978,6 +980,87 @@ describe("pdpp records routes: unsupported view/expand shapes", () => {
 });
 
 describe("pdpp records routes: blob ingest", () => {
+  it("rejects a chunked body above the byte cap without storing it", async () => {
+    const { app, store } = buildApp({
+      "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+    });
+    const storeBlobBytes = vi.spyOn(store, "storeBlobBytes");
+    const chunk = new Uint8Array(1024 * 1024);
+    let chunksRead = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        chunksRead += 1;
+        controller.enqueue(chunk);
+      },
+      cancel() {
+        // A stalled source must not hold the size-limit response open.
+        return new Promise<void>(() => undefined);
+      },
+    });
+
+    const res = await app.request("/blobs/ingest", {
+      method: "POST",
+      duplex: "half",
+      headers: {
+        Authorization: "Bearer owner-tok",
+        "Content-Type": "application/octet-stream",
+      },
+      body,
+    });
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).error.code).toBe("invalid_request");
+    expect(storeBlobBytes).not.toHaveBeenCalled();
+    expect(chunksRead).toBeGreaterThan(
+      MAX_BLOB_UPLOAD_BYTES / chunk.byteLength,
+    );
+  });
+
+  it("rejects a malformed media type before persisting bytes", async () => {
+    const { app, store } = buildApp({
+      "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+    });
+    const storeBlobBytes = vi.spyOn(store, "storeBlobBytes");
+    const res = await app.request("/blobs/ingest", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer owner-tok",
+        "Content-Type": "not a media type",
+      },
+      body: new Uint8Array([1, 2, 3]),
+    });
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).error.code).toBe("invalid_request");
+    expect(storeBlobBytes).not.toHaveBeenCalled();
+  });
+
+  it("rejects an owner token for a different subject", async () => {
+    const { app } = buildApp(
+      {
+        "foreign-owner": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_foreign",
+        },
+      },
+      {
+        instancesForSubject: () => ["inst_foreign"],
+      },
+    );
+    const res = await app.request("/blobs/ingest", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer foreign-owner",
+        "Content-Type": "application/octet-stream",
+      },
+      body: new Uint8Array([1, 2, 3]),
+    });
+
+    expect(res.status).toBe(401);
+    expect((await res.json()).error.code).toBe("authentication_error");
+  });
+
   it("stores owner-uploaded blob bytes and returns the blob_id a record can reference", async () => {
     const { app, store } = buildApp({
       "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },

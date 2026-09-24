@@ -24,11 +24,74 @@ import {
 
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
+export const MAX_BLOB_UPLOAD_BYTES = 32 * 1024 * 1024;
+
+const BLOB_MEDIA_TYPE =
+  /^(application|audio|example|font|haptics|image|message|model|multipart|text|video)\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/i;
+
+function blobMediaType(contentType: string | undefined): string {
+  const mediaType = contentType?.split(";", 1)[0]?.trim().toLowerCase();
+  if (!mediaType || !BLOB_MEDIA_TYPE.test(mediaType)) {
+    throw new PdppError(
+      "invalid_request",
+      "Content-Type must be a valid media type",
+    );
+  }
+  return mediaType;
+}
+
+async function readBoundedBlobBytes(request: Request): Promise<Uint8Array> {
+  const contentLength = request.headers.get("content-length");
+  if (
+    contentLength !== null &&
+    (!/^\d+$/.test(contentLength) ||
+      Number(contentLength) > MAX_BLOB_UPLOAD_BYTES)
+  ) {
+    throw new PdppError(
+      "invalid_request",
+      "Blob body exceeds the 32 MiB limit",
+    );
+  }
+  const reader = request.body?.getReader();
+  if (!reader) throw new PdppError("invalid_request", "Blob body is empty");
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_BLOB_UPLOAD_BYTES) {
+      // Cancellation is best effort; a stalled source must not hold the 400 response.
+      void reader.cancel().catch(() => undefined);
+      throw new PdppError(
+        "invalid_request",
+        "Blob body exceeds the 32 MiB limit",
+      );
+    }
+    chunks.push(value);
+  }
+  if (size === 0) throw new PdppError("invalid_request", "Blob body is empty");
+  if (contentLength !== null && size !== Number(contentLength)) {
+    throw new PdppError(
+      "invalid_request",
+      "Content-Length does not match blob body",
+    );
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
 
 export interface PdppRecordsRouteDeps {
   store: PdppRecordStore;
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
+  /** The exact owner of this Personal Server; required for blob ingest. */
+  ownerSubjectId?: string;
   /**
    * Resolves every instance_id owned by a subject, for owner-token
    * current-capability reads (which carry no grant, so the effective
@@ -1145,23 +1208,21 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     if (error) return error;
 
     try {
-      if (context!.tokenKind !== "owner") {
+      if (
+        context!.tokenKind !== "owner" ||
+        !context!.subjectId ||
+        !deps.ownerSubjectId ||
+        context!.subjectId.toLowerCase() !==
+          deps.ownerSubjectId.toLowerCase() ||
+        !deps.instancesForSubject?.(context!.subjectId).length
+      ) {
         throw new PdppError(
           "authentication_error",
           "Blob ingest requires an owner token",
         );
       }
-      const mimeType = c.req.header("content-type");
-      if (!mimeType) {
-        throw new PdppError(
-          "invalid_request",
-          "Content-Type is required: it is the blob's declared media type",
-        );
-      }
-      const bytes = new Uint8Array(await c.req.arrayBuffer());
-      if (bytes.length === 0) {
-        throw new PdppError("invalid_request", "Blob body is empty");
-      }
+      const mimeType = blobMediaType(c.req.header("content-type"));
+      const bytes = await readBoundedBlobBytes(c.req.raw);
 
       const meta = deps.store.storeBlobBytes(bytes, mimeType);
       return c.json(
