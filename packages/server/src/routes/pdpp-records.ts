@@ -90,7 +90,7 @@ export interface PdppRecordsRouteDeps {
   store: PdppRecordStore;
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
-  /** The exact owner of this Personal Server; required for blob ingest. */
+  /** The exact owner of this Personal Server; required for ingest. */
   ownerSubjectId?: string;
   /**
    * Resolves every instance_id owned by a subject, for owner-token
@@ -1147,7 +1147,12 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     if (error) return error;
 
     try {
-      if (context!.tokenKind !== "owner") {
+      if (
+        context!.tokenKind !== "owner" ||
+        !context!.subjectId ||
+        !deps.ownerSubjectId ||
+        context!.subjectId.toLowerCase() !== deps.ownerSubjectId.toLowerCase()
+      ) {
         throw new PdppError(
           "authentication_error",
           "Ingest requires an owner token",
@@ -1166,6 +1171,14 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         emitted_at: e.emitted_at,
         op: e.op,
       }));
+      const ownedInstances =
+        deps.instancesForSubject?.(context!.subjectId) ?? [];
+      if (!envelopes.every((e) => ownedInstances.includes(e.instance))) {
+        throw new PdppError(
+          "authentication_error",
+          "Ingest requires an owned instance",
+        );
+      }
 
       const result = deps.store.ingestBatch(
         envelopes,

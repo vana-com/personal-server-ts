@@ -119,42 +119,34 @@ describe("sqlite record store", () => {
     expect(changesCount.n).toBe(1);
   });
 
-  it("rolls back the whole batch on a mid-transaction failure (no partial writes)", () => {
-    // Force a failure partway through the transaction by poisoning the
-    // history insert statement after the first row: simulate an I/O-level
-    // failure by closing the DB mid-transaction is not directly simulable
-    // via better-sqlite3 in a controlled way, so we assert the transaction
-    // wrapper itself: a thrown error inside db.transaction() rolls back
-    // uncommitted statements. We verify by making the second envelope's
-    // primary-key lookup throw (unsupported type), which happens INSIDE the
-    // transaction, and confirming the first envelope's write still commits
-    // (it does, because per-envelope rejection is design, not partial-batch
-    // failure) — then confirm a real thrown error (e.g. a locked DB) would
-    // roll back by directly testing db.transaction semantics.
-    let committedBeforeThrow = false;
-    expect(() => {
-      db.transaction(() => {
-        db.prepare(
-          "INSERT INTO pdpp_records (instance, stream, record_key, data, version, emitted_at, deleted, deleted_at) VALUES (?,?,?,?,?,?,?,?)",
-        ).run(
-          "inst_x",
-          "probe",
-          "k1",
-          "{}",
-          1,
-          "2026-01-01T00:00:00.000Z",
-          0,
-          null,
-        );
-        committedBeforeThrow = true;
-        throw new Error("simulated mid-transaction failure");
-      })();
-    }).toThrow("simulated mid-transaction failure");
-    expect(committedBeforeThrow).toBe(true);
-    const row = db
-      .prepare("SELECT * FROM pdpp_records WHERE instance = 'inst_x'")
-      .get();
-    expect(row).toBeUndefined(); // rolled back despite the write happening before the throw
+  it("rolls back current rows and history when a history insert fails", () => {
+    db.exec(`
+      CREATE TRIGGER fail_second_history BEFORE INSERT ON pdpp_record_changes
+      WHEN NEW.record_key = 'msg_2'
+      BEGIN SELECT RAISE(ABORT, 'injected history failure'); END;
+    `);
+    const envelopes: PdppRecordEnvelopeInput[] = ["msg_1", "msg_2"].map(
+      (id) => ({
+        instance: "inst_1",
+        stream: "messages",
+        key: id,
+        data: { id },
+        emitted_at: "2026-04-01T00:00:00.000Z",
+      }),
+    );
+
+    expect(() =>
+      store.ingestBatch(envelopes, messagesSemantics, messagesPk),
+    ).toThrow("injected history failure");
+    expect(store.getRecord("inst_1", "messages", "msg_1")).toBeUndefined();
+    expect(store.getRecord("inst_1", "messages", "msg_2")).toBeUndefined();
+    expect(
+      (
+        db.prepare("SELECT COUNT(*) AS n FROM pdpp_record_changes").get() as {
+          n: number;
+        }
+      ).n,
+    ).toBe(0);
   });
 
   it("produces a spec-shaped tombstone on owner delete", () => {

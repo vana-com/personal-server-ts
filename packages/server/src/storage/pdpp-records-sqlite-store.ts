@@ -374,10 +374,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
           });
           accepted += 1;
         } catch (err) {
-          rejected.push({
-            index,
-            reason: err instanceof RecordKeyError ? err.message : String(err),
-          });
+          if (!(err instanceof RecordKeyError)) throw err;
+          rejected.push({ index, reason: err.message });
         }
       });
     });
