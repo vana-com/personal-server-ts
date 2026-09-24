@@ -421,8 +421,7 @@ export interface PdppAuthorizationResultV02 {
 
 /** Either revision's element, as it appears in `authorization_details`. */
 export type PdppAuthorizationEntry =
-  | PdppAuthorizationDetail
-  | PdppAuthorizationResultV02;
+  PdppAuthorizationDetail | PdppAuthorizationResultV02;
 
 /**
  * RFC 7662 introspection response with the PDPP extension members. An inactive

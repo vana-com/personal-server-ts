@@ -130,7 +130,11 @@ describe("v0.2 schema-required fields are no longer a consent floor", () => {
     );
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.streams[0].fields).toEqual(["amount", "date", "private_note"]);
+    expect(result.streams[0].fields).toEqual([
+      "amount",
+      "date",
+      "private_note",
+    ]);
   });
 });
 

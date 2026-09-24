@@ -106,7 +106,8 @@ function issue(
     inventory,
     ownerChoices,
   );
-  if (!resolution.ok) throw new Error(`unresolvable: ${resolution.failure.code}`);
+  if (!resolution.ok)
+    throw new Error(`unresolvable: ${resolution.failure.code}`);
   const review = buildConsentReview({
     subjectId: "subject_example",
     request: selection,
@@ -252,9 +253,7 @@ describe("owner narrowing is bound into the approval", () => {
   it("refuses issuance when the owner declines every stream", () => {
     const selection: SelectionRequest = {
       ...request(PDPP_DATA_ACCESS_TYPE_V02),
-      streams: [
-        { name: "profile", necessity: "optional", fields: ["id"] },
-      ],
+      streams: [{ name: "profile", necessity: "optional", fields: ["id"] }],
     };
     const result = issueGrant({
       subjectId: "subject_example",

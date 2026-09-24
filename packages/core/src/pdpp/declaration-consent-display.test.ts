@@ -67,9 +67,7 @@ describe("§5 declaration display metadata reaches the snapshot", () => {
     // The detail says what is EXCLUDED as well as included. That exclusion is
     // the part an owner cannot reconstruct from a field list, and the part a
     // client must not be able to author.
-    expect(profile?.display?.detail).toContain(
-      "No posts or direct messages",
-    );
+    expect(profile?.display?.detail).toContain("No posts or direct messages");
   });
 
   it("keeps the stream description as a distinct, lower-precedence field", () => {

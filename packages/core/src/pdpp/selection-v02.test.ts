@@ -88,7 +88,10 @@ function transactionsStream(
 
 describe("v0.2 selection request shape", () => {
   it("accepts PR #1's twelve-month-limit, three-month-minimum example", () => {
-    const result = validateSelectionRequest(v02([transactionsStream()]), snapshot);
+    const result = validateSelectionRequest(
+      v02([transactionsStream()]),
+      snapshot,
+    );
     expect(result.ok).toBe(true);
   });
 
@@ -145,7 +148,9 @@ describe("v0.2 selection request shape", () => {
 
   it("rejects an empty minimum.fields array", () => {
     const result = validateSelectionRequest(
-      v02([{ name: "profile", fields: ["display_name"], minimum: { fields: [] } }]),
+      v02([
+        { name: "profile", fields: ["display_name"], minimum: { fields: [] } },
+      ]),
       snapshot,
     );
     expect(result.ok).toBe(false);
@@ -213,7 +218,13 @@ describe("v0.2 selection request shape", () => {
       views: [{ name: "ledger", fields: ["date", "amount"] }],
     };
     const result = validateSelectionRequest(
-      v02([{ name: "transactions", view: "ledger", minimum: { fields: ["amount"] } }]),
+      v02([
+        {
+          name: "transactions",
+          view: "ledger",
+          minimum: { fields: ["amount"] },
+        },
+      ]),
       withView,
     );
     expect(result.ok).toBe(true);
@@ -396,7 +407,10 @@ describe("revision isolation", () => {
 
   it("rejects an unknown detail type rather than treating it as PDPP", () => {
     const result = validateSelectionRequest(
-      { ...v02([transactionsStream()]), type: "https://pdpp.dev/data-access/9.9" as never },
+      {
+        ...v02([transactionsStream()]),
+        type: "https://pdpp.dev/data-access/9.9" as never,
+      },
       snapshot,
     );
     expect(result.ok).toBe(false);

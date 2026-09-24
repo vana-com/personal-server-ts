@@ -97,9 +97,7 @@ describe("PDPP AS metadata", () => {
       );
       const body = (await response.json()) as Record<string, unknown>;
       expect(body.issuer).toBe("https://ps.example.com");
-      expect(body.token_endpoint).toBe(
-        "https://ps.example.com/pdpp/v1/token",
-      );
+      expect(body.token_endpoint).toBe("https://ps.example.com/pdpp/v1/token");
       expect(body.introspection_endpoint).toBe(
         "https://ps.example.com/pdpp/v1/introspect",
       );
