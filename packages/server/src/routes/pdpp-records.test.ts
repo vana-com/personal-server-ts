@@ -979,6 +979,73 @@ describe("pdpp records routes: unsupported view/expand shapes", () => {
   });
 });
 
+describe("pdpp records routes: record ingest ownership", () => {
+  const envelope = {
+    instance: "inst_1",
+    key: "pl_1",
+    data: { id: "pl_1" },
+    emitted_at: "2026-04-01T00:00:00.000Z",
+  };
+
+  it("accepts an envelope for the token subject's owned instance", async () => {
+    const { app, store } = buildApp({
+      "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+    });
+    const res = await app.request("/streams/playlists/records/ingest", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer owner-tok",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(envelope),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ accepted: 1, rejected: [] });
+    expect(store.getRecord("inst_1", "playlists", "pl_1")?.data).toEqual({
+      id: "pl_1",
+    });
+  });
+
+  it.each([
+    ["another subject", "sub_other", "inst_1"],
+    ["an unowned instance", "sub_1", "inst_other"],
+  ])("rejects %s before writing", async (_case, subjectId, instance) => {
+    const { app, store } = buildApp({
+      "owner-tok": { active: true, tokenKind: "owner", subjectId },
+    });
+    const res = await app.request("/streams/playlists/records/ingest", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer owner-tok",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ ...envelope, instance }),
+    });
+
+    expect(res.status).toBe(401);
+    expect(store.getRecord(instance, "playlists", "pl_1")).toBeUndefined();
+  });
+
+  it("rejects a mixed batch without writing the owned envelope", async () => {
+    const { app, store } = buildApp({
+      "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+    });
+    const res = await app.request("/streams/playlists/records/ingest", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer owner-tok",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify([envelope, { ...envelope, instance: "inst_other" }]),
+    });
+
+    expect(res.status).toBe(401);
+    expect(store.getRecord("inst_1", "playlists", "pl_1")).toBeUndefined();
+    expect(store.getRecord("inst_other", "playlists", "pl_1")).toBeUndefined();
+  });
+});
+
 describe("pdpp records routes: blob ingest", () => {
   it("rejects a chunked body above the byte cap without storing it", async () => {
     const { app, store } = buildApp({
