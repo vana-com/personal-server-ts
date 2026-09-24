@@ -1134,15 +1134,54 @@ describe("GET /v1/data/:scope", () => {
     await ingestData("instagram.profile", { username: "test_user" }, app);
     await orphanTheBackingFile("instagram.profile");
 
-    await getWithAuth(app, "instagram.profile");
-
-    const logged = records.find((r) => r.errorCode === "DATA_FILE_MISSING");
-    expect(logged).toMatchObject({
-      route: "GET /v1/data/:scope",
-      scope: "instagram.profile",
-      errorCode: "DATA_FILE_MISSING",
-      requestId: expect.any(String),
+    let finishBodyRead!: () => void;
+    let bodyReadStarted!: () => void;
+    const bodyReadGate = new Promise<void>((resolve) => {
+      finishBodyRead = resolve;
     });
+    const bodyReadStartedPromise = new Promise<void>((resolve) => {
+      bodyReadStarted = resolve;
+    });
+    const clone = Response.prototype.clone;
+    const cloneSpy = vi
+      .spyOn(Response.prototype, "clone")
+      .mockImplementation(function (this: Response) {
+        const cloned = clone.call(this);
+        if (this.status !== 404) return cloned;
+        return {
+          json: async () => {
+            bodyReadStarted();
+            await bodyReadGate;
+            return cloned.json();
+          },
+        } as Response;
+      });
+
+    try {
+      let requestSettled = false;
+      const responsePromise = getWithAuth(app, "instagram.profile").then(
+        (response) => {
+          requestSettled = true;
+          return response;
+        },
+      );
+      await bodyReadStartedPromise;
+      expect(requestSettled).toBe(false);
+
+      finishBodyRead();
+      await responsePromise;
+
+      const logged = records.find((r) => r.errorCode === "DATA_FILE_MISSING");
+      expect(logged).toMatchObject({
+        route: "GET /v1/data/:scope",
+        scope: "instagram.profile",
+        errorCode: "DATA_FILE_MISSING",
+        requestId: expect.any(String),
+      });
+    } finally {
+      finishBodyRead();
+      cloneSpy.mockRestore();
+    }
   });
 
   it("logs unexpected 500s on the data route with route and request id", async () => {
