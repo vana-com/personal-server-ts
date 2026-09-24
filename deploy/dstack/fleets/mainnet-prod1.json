@@ -25,7 +25,7 @@
       "composeOut": "controller-compose.yml",
       "pinned": {
         "instanceId": "b5399a837ff0456905ffe8c9938002b97c4f6792",
-        "composeHash": "b52e251261e4b18f63b5a010b05555f945755a8f61a63d2341a256f16b6f9bf4"
+        "composeHash": "0577b0d198de602e73de5ccca5bb641610b045a68480940628d14fb840729d0c"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -76,7 +76,7 @@
       "composeOut": "worker-compose.yml",
       "pinned": {
         "instanceId": "74ab19f73d2ad2b35d06776bf82e3c121b2d0763",
-        "composeHash": "cceb9f2af74cde03d95acf1624a8310969b4aa157f3bdf1a96bf1728183c3105"
+        "composeHash": "b830734d63f3b4dd818cecf3ef1aa2e04454a810de8f76f14712e2a59026bba3"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -122,10 +122,205 @@
         "agentSecretRef": "mainnet-prod1-worker-1-agent-secret",
         "nodeSecretRef": "mainnet-prod1-worker-1-node-secret"
       }
+    },
+    "worker-2": {
+      "role": "worker",
+      "nodeId": "mainnet-personal-server-worker-2",
+      "uuid": "b54812d0-4b4a-4436-bb41-75a387b5eda6",
+      "cvmName": "mainnet-personal-server-worker-1-rep-t948e",
+      "appId": "01bb1b6dcaf1ea170f1480c5e53b093f384d939a",
+      "instanceType": "tdx.medium",
+      "compose": "docker-compose.fleet-worker.yml",
+      "composeOut": "worker-compose.yml",
+      "pinned": {
+        "instanceId": "41725af12e5c5b234dd6f6d2ebb6e64994f4e985",
+        "composeHash": "b830734d63f3b4dd818cecf3ef1aa2e04454a810de8f76f14712e2a59026bba3"
+      },
+      "measured": {
+        "measurementMode": "dstack-0.5.9-events",
+        "mrTd": "f06dfda6dce1cf904d4e2bab1dc370634cf95cefa2ceb2de2eee127c9382698090d7a4a13e14c536ec6c9c3c8fa87077",
+        "rtmrs": [
+          "027b610ab0555482f8a3868524093bdf3cdbe2539f81dfeeb886864654cb2fe3422f7fc36d4bab6fa46683aad11d1ba7",
+          "07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+          "df67e467e60edc1737bcf8e682d48131bfb427f523226aa7f197a7608e9b3784783fa759ef5b28191fa12f9ddb36b858"
+        ],
+        "osImageHash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+        "keyProviderSpki": "3059301306072a8648ce3d020106082a8648ce3d030107034200048844eb42ccdf8c52fd4f174f362fcb9bbd19c45fd48f1edec2d8f1ca23536ec1a74021b4cee610c074f8294d431b2b7fee2c39e5333fdaf0a4522d43fb159d9f"
+      },
+      "env": {
+        "CHAIN_ID": "1480",
+        "NODE_ID": "mainnet-personal-server-worker-2",
+        "GATEWAY_URL": "https://dp-rpc.vana.org",
+        "STORAGE_API_URL": "https://storage.vana.org",
+        "ENCLAVE_AGENT_HOST": "0.0.0.0",
+        "ENCLAVE_AGENT_PORT": "8787",
+        "FLEET_ENABLED": "true",
+        "FLEET_PEER_HOST": "0.0.0.0",
+        "FLEET_PEER_PORT": "8789",
+        "SANDBOX_RUNTIME": "docker",
+        "DOCKER_HOST": "tcp://sandbox-runtime:2375",
+        "SANDBOX_MAX": "4",
+        "SANDBOX_MEMORY": "512m",
+        "SANDBOX_CPUS": "1",
+        "SANDBOX_IDLE_TTL_SECONDS": "600",
+        "MCP_PUBLIC_ORIGIN": "https://mcp.vana.org",
+        "MCP_APPROVAL_URL": "https://app.vana.org/personal-server",
+        "MCP_STATE_PATH": "/mcp-state/state.sealed",
+        "MCP_REDIRECT_URIS": "[\"https://claude.ai/api/mcp/auth_callback\",\"https://claude.com/api/mcp/auth_callback\"]",
+        "MCP_INGRESS_HOST": "0.0.0.0",
+        "MCP_INGRESS_PORT": "8788",
+        "MCP_MIGRATION_REQUIRED": "0"
+      },
+      "secretRefs": {
+        "ENCLAVE_AGENT_SECRET": "mainnet-prod1-worker-2-agent-secret",
+        "NODE_SECRET": "mainnet-prod1-worker-2-node-secret"
+      },
+      "capacity": 4,
+      "gateway": {
+        "agentSecretRef": "mainnet-prod1-worker-2-agent-secret",
+        "nodeSecretRef": "mainnet-prod1-worker-2-node-secret"
+      }
+    },
+    "worker-3": {
+      "role": "worker",
+      "nodeId": "mainnet-personal-server-worker-3",
+      "uuid": "229b92cc-bcf7-43e9-b743-aac7b37abb8a",
+      "cvmName": "mainnet-personal-server-worker-3-replica",
+      "appId": "01bb1b6dcaf1ea170f1480c5e53b093f384d939a",
+      "instanceType": "tdx.medium",
+      "compose": "docker-compose.fleet-worker.yml",
+      "composeOut": "worker-compose.yml",
+      "pinned": {
+        "instanceId": "5b50441ad3e7ce35aa87a7f45f467fe7e8cb2988",
+        "composeHash": "b830734d63f3b4dd818cecf3ef1aa2e04454a810de8f76f14712e2a59026bba3"
+      },
+      "measured": {
+        "measurementMode": "dstack-0.5.9-events",
+        "mrTd": "f06dfda6dce1cf904d4e2bab1dc370634cf95cefa2ceb2de2eee127c9382698090d7a4a13e14c536ec6c9c3c8fa87077",
+        "rtmrs": [
+          "027b610ab0555482f8a3868524093bdf3cdbe2539f81dfeeb886864654cb2fe3422f7fc36d4bab6fa46683aad11d1ba7",
+          "07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+          "df67e467e60edc1737bcf8e682d48131bfb427f523226aa7f197a7608e9b3784783fa759ef5b28191fa12f9ddb36b858"
+        ],
+        "osImageHash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+        "keyProviderSpki": "3059301306072a8648ce3d020106082a8648ce3d030107034200048844eb42ccdf8c52fd4f174f362fcb9bbd19c45fd48f1edec2d8f1ca23536ec1a74021b4cee610c074f8294d431b2b7fee2c39e5333fdaf0a4522d43fb159d9f"
+      },
+      "env": {
+        "CHAIN_ID": "1480",
+        "NODE_ID": "mainnet-personal-server-worker-3",
+        "GATEWAY_URL": "https://dp-rpc.vana.org",
+        "STORAGE_API_URL": "https://storage.vana.org",
+        "ENCLAVE_AGENT_HOST": "0.0.0.0",
+        "ENCLAVE_AGENT_PORT": "8787",
+        "FLEET_ENABLED": "true",
+        "FLEET_PEER_HOST": "0.0.0.0",
+        "FLEET_PEER_PORT": "8789",
+        "SANDBOX_RUNTIME": "docker",
+        "DOCKER_HOST": "tcp://sandbox-runtime:2375",
+        "SANDBOX_MAX": "4",
+        "SANDBOX_MEMORY": "512m",
+        "SANDBOX_CPUS": "1",
+        "SANDBOX_IDLE_TTL_SECONDS": "600",
+        "MCP_PUBLIC_ORIGIN": "https://mcp.vana.org",
+        "MCP_APPROVAL_URL": "https://app.vana.org/personal-server",
+        "MCP_STATE_PATH": "/mcp-state/state.sealed",
+        "MCP_REDIRECT_URIS": "[\"https://claude.ai/api/mcp/auth_callback\",\"https://claude.com/api/mcp/auth_callback\"]",
+        "MCP_INGRESS_HOST": "0.0.0.0",
+        "MCP_INGRESS_PORT": "8788",
+        "MCP_MIGRATION_REQUIRED": "0"
+      },
+      "secretRefs": {
+        "ENCLAVE_AGENT_SECRET": "vana-step65-mainnet-worker-3-agent-secret-v2",
+        "NODE_SECRET": "vana-step65-mainnet-worker-3-node-secret-v2"
+      },
+      "capacity": 4,
+      "gateway": {
+        "agentSecretRef": "vana-step65-mainnet-worker-3-agent-secret-v2",
+        "nodeSecretRef": "vana-step65-mainnet-worker-3-node-secret-v2"
+      }
+    },
+    "worker-4": {
+      "role": "worker",
+      "nodeId": "mainnet-personal-server-worker-4",
+      "uuid": "09e18f90-cdd7-4d32-ac66-7eb8061ff8b3",
+      "cvmName": "mainnet-personal-server-worker-4-replica",
+      "appId": "01bb1b6dcaf1ea170f1480c5e53b093f384d939a",
+      "instanceType": "tdx.medium",
+      "compose": "docker-compose.fleet-worker.yml",
+      "composeOut": "worker-compose.yml",
+      "pinned": {
+        "instanceId": "97c9886a9ad63f4a0bf17f871dc12023e52b19fe",
+        "composeHash": "b830734d63f3b4dd818cecf3ef1aa2e04454a810de8f76f14712e2a59026bba3"
+      },
+      "measured": {
+        "measurementMode": "dstack-0.5.9-events",
+        "mrTd": "f06dfda6dce1cf904d4e2bab1dc370634cf95cefa2ceb2de2eee127c9382698090d7a4a13e14c536ec6c9c3c8fa87077",
+        "rtmrs": [
+          "027b610ab0555482f8a3868524093bdf3cdbe2539f81dfeeb886864654cb2fe3422f7fc36d4bab6fa46683aad11d1ba7",
+          "07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+          "df67e467e60edc1737bcf8e682d48131bfb427f523226aa7f197a7608e9b3784783fa759ef5b28191fa12f9ddb36b858"
+        ],
+        "osImageHash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+        "keyProviderSpki": "3059301306072a8648ce3d020106082a8648ce3d030107034200048844eb42ccdf8c52fd4f174f362fcb9bbd19c45fd48f1edec2d8f1ca23536ec1a74021b4cee610c074f8294d431b2b7fee2c39e5333fdaf0a4522d43fb159d9f"
+      },
+      "env": {
+        "CHAIN_ID": "1480",
+        "NODE_ID": "mainnet-personal-server-worker-4",
+        "GATEWAY_URL": "https://dp-rpc.vana.org",
+        "STORAGE_API_URL": "https://storage.vana.org",
+        "ENCLAVE_AGENT_HOST": "0.0.0.0",
+        "ENCLAVE_AGENT_PORT": "8787",
+        "FLEET_ENABLED": "true",
+        "FLEET_PEER_HOST": "0.0.0.0",
+        "FLEET_PEER_PORT": "8789",
+        "SANDBOX_RUNTIME": "docker",
+        "DOCKER_HOST": "tcp://sandbox-runtime:2375",
+        "SANDBOX_MAX": "4",
+        "SANDBOX_MEMORY": "512m",
+        "SANDBOX_CPUS": "1",
+        "SANDBOX_IDLE_TTL_SECONDS": "600",
+        "MCP_PUBLIC_ORIGIN": "https://mcp.vana.org",
+        "MCP_APPROVAL_URL": "https://app.vana.org/personal-server",
+        "MCP_STATE_PATH": "/mcp-state/state.sealed",
+        "MCP_REDIRECT_URIS": "[\"https://claude.ai/api/mcp/auth_callback\",\"https://claude.com/api/mcp/auth_callback\"]",
+        "MCP_INGRESS_HOST": "0.0.0.0",
+        "MCP_INGRESS_PORT": "8788",
+        "MCP_MIGRATION_REQUIRED": "0"
+      },
+      "secretRefs": {
+        "ENCLAVE_AGENT_SECRET": "vana-step65-mainnet-worker-4-agent-secret-v2",
+        "NODE_SECRET": "vana-step65-mainnet-worker-4-node-secret-v2"
+      },
+      "capacity": 4,
+      "gateway": {
+        "agentSecretRef": "vana-step65-mainnet-worker-4-agent-secret-v2",
+        "nodeSecretRef": "vana-step65-mainnet-worker-4-node-secret-v2"
+      }
     }
   },
   "fleetShape": {
-    "NOTE": "One controller + one worker. The worker-2 replica (39600ebe-9f8a-40ac-8fde-2a585776bac1) was deleted during step 3 so the worker app id has a single live CVM - that is what makes phala api /cvms/<uuid>/attestation unambiguous on this fleet, unlike moksha-prod5. Before adding a second worker, read docs/260915-mainnet-prod1-staging-plan.md section 0a: a shared app id breaks instance-id harvesting."
+    "NOTE": "One controller + two tdx.medium capacity4 workers, mainnet worker2 added under existing shared app. Per-UUID staged readback and adjacent boot identity are binding ground truth; never resolve shared-app attestation to pick replica identity."
   },
-  "pinnedFrom": "Re-harvested by uuid after the step43 #322 controller-only roll at source 176c01ab8c0e6144ae0e64fdf0bfa273a25f40b7 (CI Docker run 35239436973); per-uuid staged compose read-back is ground truth. Re-harvest and commit after every roll."
+  "pinnedFrom": "Pending final per-UUID staged readbacks and verified one-pass de881ee rollout; do not commit until reharvest.",
+  "rolledGitRef": "84d19ffc3f4059c5a5d034c8f7e987f0c07bcfd9",
+  "candidateStatus": "UNSIGNED_LOCAL_CANDIDATE_UUID_BINDINGS_VERIFIED",
+  "sourceManifestSha256": "ab8444a9a23920fec7a215274887a92e9de0379c428253603ad2804762eac356",
+  "identityEvidence": {
+    "worker-3": {
+      "metadataSha256": "b972abdd99352f9925ca457c384c9a4bd94a1c0dfa9cbb778a1f8c19dc6762b2",
+      "serialSha256": "fc07bd0005cd50083f5d1242a2ddc802efc145b60056762ecf404fc95ffbaa41",
+      "instanceId": "5b50441ad3e7ce35aa87a7f45f467fe7e8cb2988",
+      "serialEnvelopeSha256": "e2d94f39db3915b0ca1c3d290753f388b0869464ff53741ae941df9ccefeec5d",
+      "serialLogSha256": "e59f2e621d2df8fc46c2875b6876f84543810011ba0eae6a94d8d71c5a99c361",
+      "sourceCommand": "phala cvms serial-logs 229b92cc-bcf7-43e9-b743-aac7b37abb8a --json --timestamps"
+    },
+    "worker-4": {
+      "metadataSha256": "a97db59867ea431a8d5f817b2bf50b0a28b030e0e59a03cf1048ef69238ab45e",
+      "serialSha256": "068b650fc13c2ad3c643be0c893d25f5c63470ad69302bcd7f2d57a319a32997",
+      "instanceId": "97c9886a9ad63f4a0bf17f871dc12023e52b19fe",
+      "serialEnvelopeSha256": "fdcae7bc68a1858cb02af923209ff78e27e72cbe85dca156839eaa674d17ce44",
+      "serialLogSha256": "44b4abd5dcd467c68bf37d7fbc4a4cfacbc4f4b4e3dbed5ff662e7c28e109ede",
+      "sourceCommand": "phala cvms serial-logs 09e18f90-cdd7-4d32-ac66-7eb8061ff8b3 --json --timestamps"
+    }
+  }
 }

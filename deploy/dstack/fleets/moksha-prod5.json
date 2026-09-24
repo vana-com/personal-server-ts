@@ -3,8 +3,8 @@
   "gatewayUrl": "https://dp-rpc.moksha.vana.org",
   "rolledGitRef": {
     "NOTE": "not a render-fleet.py manifest field; pass at render time as --git-ref (must equal images.env PS_IMAGE_REF)",
-    "sha": "176c01ab8c0e6144ae0e64fdf0bfa273a25f40b7",
-    "source": "PS #322 merge commit; CI Docker run 35239436973 images.env; step43 controller-only roll"
+    "sha": "84d19ffc3f4059c5a5d034c8f7e987f0c07bcfd9",
+    "source": "PS #333 merge commit; CI Docker run35409500654 images.env; step64 unchanged-two-worker guarded-drain safety correction"
   },
   "gatewayDomain": "dstack-pha-prod5.phala.network",
   "operatorPublicKeySpkiBase64": "MCowBQYDK2VwAyEAPPx3xJ6NkAsPk1gT2v9E3s/huSL9MVG3S9D8e/Eqzjg=",
@@ -23,7 +23,7 @@
       "composeOut": "controller-compose.yml",
       "pinned": {
         "instanceId": "6223bcb478a5f5b7d11dae5713d9ff58501c090a",
-        "composeHash": "c82952138feeebdbff9ce80b68294955db107321e9bc1f9162135dc0853733c0"
+        "composeHash": "dc0fd054c84926a0354db4637b413fc350171e4f5f8d88ca449a9828a34ad770"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -74,7 +74,7 @@
       "composeOut": "worker-compose.yml",
       "pinned": {
         "instanceId": "eeea1588a1f55b129a2b14b24a1002719976f6a0",
-        "composeHash": "afab7e2945dd970f3ebf89207813f78f004f0088fba1deade7771f3dd8bcfec7"
+        "composeHash": "8a0f4ab7722b278ff9b1d5055e53b6219f0a4b208b355b44fccdf2ae7d43f050"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -125,7 +125,7 @@
       "composeOut": "worker-1-source-compose.yml",
       "pinned": {
         "instanceId": "1ac22335a2da1ca6a024396c4a557907279403ab",
-        "composeHash": "afab7e2945dd970f3ebf89207813f78f004f0088fba1deade7771f3dd8bcfec7"
+        "composeHash": "8a0f4ab7722b278ff9b1d5055e53b6219f0a4b208b355b44fccdf2ae7d43f050"
       },
       "measured": {
         "measurementMode": "dstack-0.5.9-events",
@@ -171,6 +171,118 @@
         "agentSecretRef": "spike-b3-fleet-worker-2-agent-secret",
         "nodeSecretRef": "spike-b3-fleet-worker-2-node-secret"
       }
+    },
+    "worker-3": {
+      "role": "worker",
+      "nodeId": "moksha-personal-server-worker-3",
+      "uuid": "eb5e1d4d-18c1-4ac2-8e59-fb8f53004fa5",
+      "cvmName": null,
+      "appId": "ec9a39de98c760e1ded9f1e97016dc5f0e357cf2",
+      "instanceType": "tdx.medium",
+      "compose": "docker-compose.fleet-worker.yml",
+      "composeOut": "worker-compose.yml",
+      "pinned": {
+        "composeHash": "8a0f4ab7722b278ff9b1d5055e53b6219f0a4b208b355b44fccdf2ae7d43f050",
+        "instanceId": "bcf10e49759e17bfb3e0bdf460b9b7e071722d00"
+      },
+      "measured": {
+        "measurementMode": "dstack-0.5.9-events",
+        "mrTd": "f06dfda6dce1cf904d4e2bab1dc370634cf95cefa2ceb2de2eee127c9382698090d7a4a13e14c536ec6c9c3c8fa87077",
+        "rtmrs": [
+          "027b610ab0555482f8a3868524093bdf3cdbe2539f81dfeeb886864654cb2fe3422f7fc36d4bab6fa46683aad11d1ba7",
+          "07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+          "df67e467e60edc1737bcf8e682d48131bfb427f523226aa7f197a7608e9b3784783fa759ef5b28191fa12f9ddb36b858"
+        ],
+        "osImageHash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+        "keyProviderSpki": "3059301306072a8648ce3d020106082a8648ce3d030107034200048844eb42ccdf8c52fd4f174f362fcb9bbd19c45fd48f1edec2d8f1ca23536ec1a74021b4cee610c074f8294d431b2b7fee2c39e5333fdaf0a4522d43fb159d9f",
+        "postBootInstanceId": "bcf10e49759e17bfb3e0bdf460b9b7e071722d00",
+        "postBootComposeHash": "8a0f4ab7722b278ff9b1d5055e53b6219f0a4b208b355b44fccdf2ae7d43f050",
+        "postBootComposeFileSha256": "27badc907d562c0723ec9b3560c1c5a276ee1b45792291e00f641daed3709bcb",
+        "postBootBindingReceipt": "postboot-harvest-20260919T1243Z/worker-3-binding.json"
+      },
+      "env": {
+        "CHAIN_ID": "14800",
+        "NODE_ID": "moksha-personal-server-worker-3",
+        "GATEWAY_URL": "https://dp-rpc.moksha.vana.org",
+        "STORAGE_API_URL": "https://storage-dev.vana.org",
+        "ENCLAVE_AGENT_HOST": "0.0.0.0",
+        "ENCLAVE_AGENT_PORT": "8787",
+        "FLEET_ENABLED": "true",
+        "FLEET_PEER_HOST": "0.0.0.0",
+        "FLEET_PEER_PORT": "8789",
+        "SANDBOX_RUNTIME": "docker",
+        "DOCKER_HOST": "tcp://sandbox-runtime:2375",
+        "SANDBOX_MAX": "4",
+        "SANDBOX_MEMORY": "512m",
+        "SANDBOX_CPUS": "1",
+        "SANDBOX_IDLE_TTL_SECONDS": "600"
+      },
+      "secretRefs": {
+        "ENCLAVE_AGENT_SECRET": "vana-step65-moksha-worker-3-agent-secret-v2",
+        "NODE_SECRET": "vana-step65-moksha-worker-3-node-secret-v2"
+      },
+      "capacity": 4,
+      "gateway": {
+        "agentSecretRef": "vana-step65-moksha-worker-3-agent-secret-v2",
+        "nodeSecretRef": "vana-step65-moksha-worker-3-node-secret-v2"
+      },
+      "plannedSpare": true
+    },
+    "worker-4": {
+      "role": "worker",
+      "nodeId": "moksha-personal-server-worker-4",
+      "uuid": "537b9261-69ce-4efa-9b5e-cdb3576ea40e",
+      "cvmName": null,
+      "appId": "ec9a39de98c760e1ded9f1e97016dc5f0e357cf2",
+      "instanceType": "tdx.medium",
+      "compose": "docker-compose.fleet-worker.yml",
+      "composeOut": "worker-compose.yml",
+      "pinned": {
+        "composeHash": "8a0f4ab7722b278ff9b1d5055e53b6219f0a4b208b355b44fccdf2ae7d43f050",
+        "instanceId": "f8039972d33e0e5b8b5d1c462c7f8986e36873d3"
+      },
+      "measured": {
+        "measurementMode": "dstack-0.5.9-events",
+        "mrTd": "f06dfda6dce1cf904d4e2bab1dc370634cf95cefa2ceb2de2eee127c9382698090d7a4a13e14c536ec6c9c3c8fa87077",
+        "rtmrs": [
+          "027b610ab0555482f8a3868524093bdf3cdbe2539f81dfeeb886864654cb2fe3422f7fc36d4bab6fa46683aad11d1ba7",
+          "07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+          "df67e467e60edc1737bcf8e682d48131bfb427f523226aa7f197a7608e9b3784783fa759ef5b28191fa12f9ddb36b858"
+        ],
+        "osImageHash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+        "keyProviderSpki": "3059301306072a8648ce3d020106082a8648ce3d030107034200048844eb42ccdf8c52fd4f174f362fcb9bbd19c45fd48f1edec2d8f1ca23536ec1a74021b4cee610c074f8294d431b2b7fee2c39e5333fdaf0a4522d43fb159d9f",
+        "postBootInstanceId": "f8039972d33e0e5b8b5d1c462c7f8986e36873d3",
+        "postBootComposeHash": "8a0f4ab7722b278ff9b1d5055e53b6219f0a4b208b355b44fccdf2ae7d43f050",
+        "postBootComposeFileSha256": "27badc907d562c0723ec9b3560c1c5a276ee1b45792291e00f641daed3709bcb",
+        "postBootBindingReceipt": "postboot-harvest-20260919T1243Z/worker-4-binding.json"
+      },
+      "env": {
+        "CHAIN_ID": "14800",
+        "NODE_ID": "moksha-personal-server-worker-4",
+        "GATEWAY_URL": "https://dp-rpc.moksha.vana.org",
+        "STORAGE_API_URL": "https://storage-dev.vana.org",
+        "ENCLAVE_AGENT_HOST": "0.0.0.0",
+        "ENCLAVE_AGENT_PORT": "8787",
+        "FLEET_ENABLED": "true",
+        "FLEET_PEER_HOST": "0.0.0.0",
+        "FLEET_PEER_PORT": "8789",
+        "SANDBOX_RUNTIME": "docker",
+        "DOCKER_HOST": "tcp://sandbox-runtime:2375",
+        "SANDBOX_MAX": "4",
+        "SANDBOX_MEMORY": "512m",
+        "SANDBOX_CPUS": "1",
+        "SANDBOX_IDLE_TTL_SECONDS": "600"
+      },
+      "secretRefs": {
+        "ENCLAVE_AGENT_SECRET": "vana-step65-moksha-worker-4-agent-secret-v2",
+        "NODE_SECRET": "vana-step65-moksha-worker-4-node-secret-v2"
+      },
+      "capacity": 4,
+      "gateway": {
+        "agentSecretRef": "vana-step65-moksha-worker-4-agent-secret-v2",
+        "nodeSecretRef": "vana-step65-moksha-worker-4-node-secret-v2"
+      },
+      "plannedSpare": true
     }
   },
   "workerNaming": {
@@ -178,5 +290,6 @@
     "MCP": "Moksha MCP is served by the CONTROLLER (DNS _dstack-app-address.mcp-dev.vana.org resolves to the controller instance), same as mainnet. The mcp-tls service on worker 87c32ca4 is vestigial and not the live endpoint. It is kept this roll so the roll changes no shape; dropping it belongs to a dedicated roll.",
     "instanceIds": "Instance ids are each machine self-reported during the 2026-09-16 roll, paired by the compose hash staging applied to that specific uuid, and then confirmed by the Gateway re-registering every node from its own quote. Do NOT take them from phala api /cvms/<uuid>/attestation (resolves by app id, answers for either replica) and do NOT take them from a pre-roll tee_nodes row: those were crossed against the node ids, which is what made the first attempt of this roll crash-loop both workers with Invalid fleet security configuration. render-fleet.py --instance-ids re-reads them from the Gateway at run time; after this roll that record is correct.",
     "rolled": "2026-09-16: rolled to main 847df7d. Before: controller 92e2acf8, worker-1 5d08e198, worker-2 8673fed7."
-  }
+  },
+  "pinnedFrom": "Re-harvested per UUID from Step65 signed five-node bundle and post-apply readbacks; exact worker/controller identities, compose hashes, measured identity, capacity, and secret refs are preserved from release 84d19ffc. W3/W4 are retained registered spares and are not pinned."
 }
