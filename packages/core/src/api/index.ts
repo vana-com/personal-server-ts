@@ -524,7 +524,7 @@ async function withApiErrors(
     // operator-facing fault even though it is not a 500 — log it once, here,
     // rather than at the contract that cannot see the route.
     if (response.status === 404 && context) {
-      logMissingDataFile(response, context);
+      await logMissingDataFile(response, context);
     }
     return response;
   } catch (err) {
@@ -552,33 +552,32 @@ async function withApiErrors(
  * layer that knows which route served it. Peeks at a clone so the response
  * body stays readable by the caller.
  */
-function logMissingDataFile(
+async function logMissingDataFile(
   response: Response,
   context: ApiErrorLogContext,
-): void {
+): Promise<void> {
   if (!context.logger?.error) return;
-  void response
-    .clone()
-    .json()
-    .then((body: unknown) => {
-      if (
-        typeof body !== "object" ||
-        body === null ||
-        (body as { error?: unknown }).error !== "DATA_FILE_MISSING"
-      ) {
-        return;
-      }
-      context.logger?.error?.(
-        {
-          route: context.route,
-          requestId: context.requestId ?? crypto.randomUUID(),
-          errorCode: "DATA_FILE_MISSING",
-          ...stripUndefined(context.detail),
-        },
-        "Indexed data file is missing on disk",
-      );
-    })
-    .catch(() => undefined);
+  try {
+    const body: unknown = await response.clone().json();
+    if (
+      typeof body !== "object" ||
+      body === null ||
+      (body as { error?: unknown }).error !== "DATA_FILE_MISSING"
+    ) {
+      return;
+    }
+    context.logger.error(
+      {
+        route: context.route,
+        requestId: context.requestId ?? crypto.randomUUID(),
+        errorCode: "DATA_FILE_MISSING",
+        ...stripUndefined(context.detail),
+      },
+      "Indexed data file is missing on disk",
+    );
+  } catch {
+    // A diagnostic log must not change the response sent to the caller.
+  }
 }
 
 /**
