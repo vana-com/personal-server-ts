@@ -24,10 +24,7 @@
  */
 
 import { createHash } from "node:crypto";
-import {
-  resolveCommitments,
-  type ResolvedCommitments,
-} from "./commitments.js";
+import { resolveCommitments, type ResolvedCommitments } from "./commitments.js";
 import {
   AI_TRAINING_PURPOSE,
   type ClientClaims,
@@ -344,8 +341,7 @@ export function buildConsentReview(
   // The commitments the owner will see, resolved from the request or the
   // recipient's standing terms. These are decision fields: a commitment the
   // owner never reviewed must not be issuable, so they go into the digest.
-  const commitments =
-    input.commitments ?? resolveOrThrowCommitments(input);
+  const commitments = input.commitments ?? resolveOrThrowCommitments(input);
 
   const review_digest = computeReviewDigest({
     subject_id: input.subjectId,

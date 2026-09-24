@@ -60,7 +60,11 @@ const requester: RequesterIdentity = {
 };
 
 const resolvedStreams: StreamGrant[] = [
-  { name: "profile", instance_ids: ["instagram:acct-a"], fields: ["id", "username"] },
+  {
+    name: "profile",
+    instance_ids: ["instagram:acct-a"],
+    fields: ["id", "username"],
+  },
 ];
 
 function request(overrides: Partial<SelectionRequest> = {}): SelectionRequest {
@@ -128,7 +132,10 @@ describe("review payload carries §5 consent display copy", () => {
             name: "profile",
             // Not members of the request contract; supplied here exactly as a
             // hostile client would try.
-            display: { label: "Harmless public info", detail: "Nothing personal" },
+            display: {
+              label: "Harmless public info",
+              detail: "Nothing personal",
+            },
             description: "Harmless public info",
           } as SelectionRequest["streams"][number],
         ],

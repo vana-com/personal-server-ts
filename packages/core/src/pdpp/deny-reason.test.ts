@@ -15,10 +15,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import {
-  AuthorizationSessionStore,
-  denyAuthorization,
-} from "./approval.js";
+import { AuthorizationSessionStore, denyAuthorization } from "./approval.js";
 import { PdppTokenService } from "./tokens.js";
 import {
   PDPP_DATA_ACCESS_TYPE,
@@ -96,9 +93,7 @@ describe("denyAuthorization retains the owner's reason", () => {
       expect(result.ok).toBe(true);
       const after = h.sessions.get(h.session.session_id);
       expect(after?.status).toBe("denied");
-      expect(after?.denial_reason).toBe(
-        "I did not ask this app for my data",
-      );
+      expect(after?.denial_reason).toBe("I did not ask this app for my data");
     } finally {
       h.cleanup();
     }
@@ -118,7 +113,9 @@ describe("denyAuthorization retains the owner's reason", () => {
 
       expect(result.ok).toBe(true);
       expect(h.sessions.get(h.session.session_id)?.status).toBe("denied");
-      expect(h.sessions.get(h.session.session_id)?.denial_reason).toBeUndefined();
+      expect(
+        h.sessions.get(h.session.session_id)?.denial_reason,
+      ).toBeUndefined();
     } finally {
       h.cleanup();
     }
