@@ -1127,6 +1127,92 @@ describe("P10c and method authority over HTTP", () => {
     expect(bPage2.body.data.map((r: any) => r.id)).toEqual(["b2"]);
   });
 
+  it("refuses a changes_since horizon that is not a non-negative integer", async () => {
+    const { token } = await bootSwitchable();
+    const instance = `oura:${owner}`;
+    await seedEvents(token, instance, ["a1", "a2"]);
+    const page = await read(
+      ctx!,
+      token,
+      "/v1/streams/events/records?changes_since=&limit=1",
+    );
+    const cursor = page.body.next_cursor as string;
+    const full = await read(
+      ctx!,
+      token,
+      "/v1/streams/events/records?changes_since=&limit=10",
+    );
+    const token1 = full.body.next_changes_since as string;
+    expect(token1).toBeTruthy();
+    const forge = (encoded: string, patch: Record<string, unknown>) =>
+      Buffer.from(
+        JSON.stringify({
+          ...JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")),
+          ...patch,
+        }),
+      ).toString("base64url");
+
+    // A reset after the session starts: a NaN horizon would compare false
+    // against reset_clock and pass the fence.
+    expect((await reset(ctx!, token, instance, "oura", 1, null)).status).toBe(
+      200,
+    );
+    for (const horizon of ["abc", "-1", "1.5", null]) {
+      const forged = await read(
+        ctx!,
+        token,
+        `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(forge(cursor, { horizon }))}`,
+      );
+      expect(forged.status).toBe(400);
+      expect(forged.body.error.code).toBe("invalid_cursor");
+    }
+    const since = await read(
+      ctx!,
+      token,
+      `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(forge(cursor, { sinceHorizon: "abc" }))}`,
+    );
+    expect(since.status).toBe(400);
+    const forgedSince = await read(
+      ctx!,
+      token,
+      `/v1/streams/events/records?changes_since=${encodeURIComponent(forge(token1, { horizon: "abc" }))}&limit=1`,
+    );
+    expect(forgedSince.status).toBe(400);
+    expect(forgedSince.body.error.code).toBe("invalid_cursor");
+  });
+
+  it("reads a binding over HTTP without creating a binding row", async () => {
+    const { token } = await bootSwitchable();
+    const instance = `oura:${owner}`;
+    const bindingRows = () => {
+      const db = new Database(join(tempDir, "index.db"), { readonly: true });
+      try {
+        return (
+          db
+            .prepare("SELECT COUNT(*) AS n FROM pdpp_instance_binding")
+            .get() as { n: number }
+        ).n;
+      } finally {
+        db.close();
+      }
+    };
+    const binding = await read(
+      ctx!,
+      token,
+      `/pdpp/instances/${encodeURIComponent(instance)}/binding`,
+    );
+    expect(binding.status).toBe(200);
+    expect(binding.body).toMatchObject({
+      method: null,
+      generation: 1,
+      empty: true,
+      configured_active_method: "oura",
+    });
+    expect(bindingRows()).toBe(0);
+    await seedEvents(token, instance, ["a1"]);
+    expect(bindingRows()).toBe(1);
+  });
+
   it("keeps a keyset cursor valid across later writes without a reset", async () => {
     const { token } = await bootSwitchable();
     const instance = `oura:${owner}`;

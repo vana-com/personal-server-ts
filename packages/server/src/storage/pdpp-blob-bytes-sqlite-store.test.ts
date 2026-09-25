@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import Database from "better-sqlite3";
-import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import { createTestBoundRecordStore } from "../__fixtures__/bound-record-store.js";
 import { BlobConflictError } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
 function sha256Hex(bytes: Uint8Array): string {
@@ -14,7 +14,7 @@ function sha256Hex(bytes: Uint8Array): string {
 describe("sqlite record store: blob bytes (in-memory db)", () => {
   it("stores bytes and derives blob_id from their content", () => {
     const db = new Database(":memory:");
-    const store = createSqliteRecordStore(db);
+    const store = createTestBoundRecordStore(db);
     const bytes = new Uint8Array([1, 2, 3, 4]);
     const meta = store.storeBlobBytes(bytes, "application/octet-stream");
     expect(meta.blobId).toBe(`sha256:${sha256Hex(bytes)}`);
@@ -25,7 +25,7 @@ describe("sqlite record store: blob bytes (in-memory db)", () => {
 
   it("reads back the exact bytes just stored", () => {
     const db = new Database(":memory:");
-    const store = createSqliteRecordStore(db);
+    const store = createTestBoundRecordStore(db);
     const bytes = new Uint8Array([9, 8, 7, 255, 0]);
     const meta = store.storeBlobBytes(bytes, "image/png");
     const readBack = store.getBlobBytes(meta.blobId);
@@ -36,7 +36,7 @@ describe("sqlite record store: blob bytes (in-memory db)", () => {
 
   it("re-storing identical bytes with the same mimeType is an idempotent no-op", () => {
     const db = new Database(":memory:");
-    const store = createSqliteRecordStore(db);
+    const store = createTestBoundRecordStore(db);
     const bytes = new Uint8Array([1, 2, 3]);
     const first = store.storeBlobBytes(bytes, "image/jpeg");
     const second = store.storeBlobBytes(bytes.slice(), "image/jpeg");
@@ -46,7 +46,7 @@ describe("sqlite record store: blob bytes (in-memory db)", () => {
 
   it("throws BlobConflictError when identical bytes are re-stored with a different mimeType, and does not corrupt the original", () => {
     const db = new Database(":memory:");
-    const store = createSqliteRecordStore(db);
+    const store = createTestBoundRecordStore(db);
     const bytes = new Uint8Array([1, 2, 3]);
     const meta = store.storeBlobBytes(bytes, "image/jpeg");
     expect(() => store.storeBlobBytes(bytes.slice(), "image/png")).toThrow(
@@ -59,7 +59,7 @@ describe("sqlite record store: blob bytes (in-memory db)", () => {
 
   it("returns undefined for a blob_id with metadata but no stored bytes (legacy/test fixture row)", () => {
     const db = new Database(":memory:");
-    const store = createSqliteRecordStore(db);
+    const store = createTestBoundRecordStore(db);
     store.putBlobMeta({
       blobId: "blob_legacy",
       mimeType: "image/jpeg",
@@ -72,7 +72,7 @@ describe("sqlite record store: blob bytes (in-memory db)", () => {
 
   it("fails closed when stored bytes no longer match the recorded metadata (corruption)", () => {
     const db = new Database(":memory:");
-    const store = createSqliteRecordStore(db);
+    const store = createTestBoundRecordStore(db);
     const bytes = new Uint8Array([1, 2, 3]);
     const meta = store.storeBlobBytes(bytes, "application/octet-stream");
     store.putBlobMeta({ ...meta, sha256: "0".repeat(64) });
@@ -82,7 +82,7 @@ describe("sqlite record store: blob bytes (in-memory db)", () => {
 
   it("fails closed when recorded sizeBytes no longer matches the stored payload length", () => {
     const db = new Database(":memory:");
-    const store = createSqliteRecordStore(db);
+    const store = createTestBoundRecordStore(db);
     const bytes = new Uint8Array([1, 2, 3]);
     const meta = store.storeBlobBytes(bytes, "application/octet-stream");
     store.putBlobMeta({ ...meta, sizeBytes: 999 });
@@ -92,7 +92,7 @@ describe("sqlite record store: blob bytes (in-memory db)", () => {
 
   it("supports a genuine zero-byte blob distinctly from an absent one", () => {
     const db = new Database(":memory:");
-    const store = createSqliteRecordStore(db);
+    const store = createTestBoundRecordStore(db);
     const meta = store.storeBlobBytes(
       new Uint8Array(0),
       "application/octet-stream",
@@ -105,7 +105,7 @@ describe("sqlite record store: blob bytes (in-memory db)", () => {
 
   it("completes a metadata-only row (matching mimeType, no bytes yet) instead of reporting a false no-op", () => {
     const db = new Database(":memory:");
-    const store = createSqliteRecordStore(db);
+    const store = createTestBoundRecordStore(db);
     const bytes = new Uint8Array([1, 2, 3]);
     const blobId = `sha256:${sha256Hex(bytes)}`;
     store.putBlobMeta({
@@ -126,7 +126,7 @@ describe("sqlite record store: blob bytes (in-memory db)", () => {
 
   it("does not return a false success when re-storing over existing corrupt bytes", () => {
     const db = new Database(":memory:");
-    const store = createSqliteRecordStore(db);
+    const store = createTestBoundRecordStore(db);
     const bytes = new Uint8Array([1, 2, 3]);
     const meta = store.storeBlobBytes(bytes, "application/octet-stream");
     store.putBlobMeta({ ...meta, sha256: "0".repeat(64) });
@@ -140,7 +140,7 @@ describe("sqlite record store: blob bytes (in-memory db)", () => {
 
   it("rejects mismatched MIME type without changing the persisted content", () => {
     const db = new Database(":memory:");
-    const store = createSqliteRecordStore(db);
+    const store = createTestBoundRecordStore(db);
     const bytes = new Uint8Array([1, 2, 3]);
     const original = store.storeBlobBytes(bytes, "image/jpeg");
 
@@ -166,7 +166,7 @@ describe("sqlite record store: storeBlobBytes transaction rollback (real on-disk
     dir = mkdtempSync(join(tmpdir(), "pdpp-blob-rollback-"));
     const dbPath = join(dir, "pdpp.db");
     const db = new Database(dbPath);
-    const store = createSqliteRecordStore(db);
+    const store = createTestBoundRecordStore(db);
     const bytes = new Uint8Array([1, 2, 3]);
     const blobId = `sha256:${sha256Hex(bytes)}`;
 
@@ -198,7 +198,7 @@ describe("sqlite record store: blob bytes (real on-disk database)", () => {
     const bytes = new Uint8Array([10, 20, 30, 40, 250]);
 
     const db1 = new Database(dbPath);
-    const store1 = createSqliteRecordStore(db1);
+    const store1 = createTestBoundRecordStore(db1);
     const meta = store1.storeBlobBytesForInstance({
       instance: "inst_1",
       method: "method_a",
@@ -209,7 +209,7 @@ describe("sqlite record store: blob bytes (real on-disk database)", () => {
     store1.close(); // closes the underlying db too
 
     const db2 = new Database(dbPath);
-    const store2 = createSqliteRecordStore(db2);
+    const store2 = createTestBoundRecordStore(db2);
     const readBack = store2.getBlobBytes(meta.blobId);
     expect(readBack).toBeDefined();
     expect(Array.from(readBack!)).toEqual(Array.from(bytes));
@@ -285,7 +285,7 @@ describe("sqlite record store: blob bytes (real on-disk database)", () => {
     // untouched; the pre-existing blob has no byte row (never had one) and
     // must fail closed, not fabricate bytes.
     const db = new Database(dbPath);
-    const store = createSqliteRecordStore(db);
+    const store = createTestBoundRecordStore(db);
 
     expect(store.getRecord("inst_1", "media", "media_1")?.data).toEqual({
       id: "media_1",
@@ -338,7 +338,7 @@ describe("metadata-only completion integrity", () => {
   it.each(["sha256", "sizeBytes"] as const)(
     "rejects incompatible %s before adding bytes",
     (field) => {
-      const store = createSqliteRecordStore(new Database(":memory:"));
+      const store = createTestBoundRecordStore(new Database(":memory:"));
       try {
         const bytes = new Uint8Array([1, 2, 3]);
         const correct = {

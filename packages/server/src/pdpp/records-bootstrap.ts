@@ -219,6 +219,11 @@ function coLocatedAuthorizationService(
  * the RS enforces against is a record no grant can correctly reach. One
  * retained declaration, one authority — on the write path too.
  *
+ * The SQLite store refuses every write from this importer with
+ * `method_required`: `$pdpp` metadata names no acquisition method or binding
+ * generation, so P8a and P8c cannot be applied to it. The importer reports
+ * that as a terminal `method_authority` rejection and does not retry it.
+ *
  * Returns undefined when the RS did not mount. Importing into a store nothing
  * can read would be write-only work, and it would do it against declarations
  * this deployment has not accepted.

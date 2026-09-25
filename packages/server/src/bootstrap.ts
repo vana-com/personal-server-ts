@@ -652,7 +652,8 @@ export async function createServer(
 
   // Close the sync→PDPP loop. Until this runs the download worker holds an
   // inert delegate; from here a synced envelope carrying verified `$pdpp`
-  // metadata lands in the same store the RS serves reads from.
+  // metadata reaches the store the RS serves reads from, which refuses it
+  // until the metadata carries a method and binding generation (P8a).
   pdppImporterImpl =
     createPdppSyncImporter({
       records: pdppRecords,

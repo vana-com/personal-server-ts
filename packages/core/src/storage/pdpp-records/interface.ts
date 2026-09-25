@@ -32,8 +32,8 @@ export interface PdppRecordStore {
    *
    * The SQLite PS backend also accepts a method and generation. It validates
    * the generation in this transaction and binds an empty instance to that
-   * method with its first accepted write. Omitting the binding for an
-   * instance already under method authority is rejected by that backend.
+   * method with its first accepted write. That backend rejects every
+   * envelope of a call that omits the binding, with `method_required`.
    *
    * `validateData` rejects an upsert whose data does not conform to the
    * declared stream schema; that envelope writes nothing.

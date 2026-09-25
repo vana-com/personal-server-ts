@@ -251,6 +251,16 @@ function ensureBinding(db: Database, instance: string): BindingRowDb {
     .get(instance) as BindingRowDb;
 }
 
+// A horizon that is not a non-negative integer would compare false against
+// every reset_clock and pass the P10c fence, so it is refused.
+function parseHorizon(value: unknown): number {
+  const horizon = Number(value);
+  if (!/^\d+$/.test(String(value)) || !Number.isSafeInteger(horizon)) {
+    throw new InvalidCursorError();
+  }
+  return horizon;
+}
+
 function instanceHasRecords(db: Database, instance: string): boolean {
   const row = db
     .prepare(
@@ -432,13 +442,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           binding.generation,
           envelopes,
         );
-      } else if (
-        envelopes.some((envelope) =>
-          db
-            .prepare("SELECT 1 FROM pdpp_instance_binding WHERE instance = ?")
-            .get(envelope.instance),
-        )
-      ) {
+      } else if (envelopes.length > 0) {
+        // P8a: every canonical write names its method and generation. A write
+        // without them (the sync importer, which has no method identity)
+        // cannot be checked against the binding or the blob claims, so it is
+        // refused whether or not the instance has a binding row yet.
         envelopes.forEach((_, index) =>
           results.push({
             index,
@@ -707,9 +715,19 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     return true;
   }
 
+  // Read-only: an instance with no row reports the row `ensureBinding` would
+  // create, without creating it.
   function getInstanceBinding(instance: string): PdppInstanceBinding {
+    const row = (db
+      .prepare("SELECT * FROM pdpp_instance_binding WHERE instance = ?")
+      .get(instance) as BindingRowDb | undefined) ?? {
+      instance,
+      method: null,
+      generation: 1,
+      reset_clock: 0,
+    };
     return {
-      ...toBinding(ensureBinding(db, instance)),
+      ...toBinding(row),
       empty: !instanceHasRecords(db, instance),
     };
   }
@@ -805,14 +823,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       const payload = decodeCursor(options.cursor);
       if (payload.kind !== "list") throw new InvalidCursorError();
       if (payload.order !== options.order) throw new InvalidCursorError();
-      if (
-        payload.horizon !== undefined &&
-        !/^\d+$/.test(String(payload.horizon))
-      ) {
-        throw new InvalidCursorError();
-      }
       const cursorHorizon =
-        payload.horizon === undefined ? null : Number(payload.horizon);
+        payload.horizon === undefined ? null : parseHorizon(payload.horizon);
       assertNotResetSince(options.instanceIds, [cursorHorizon]);
       // A legacy cursor that survives the fence read no reset instance; it
       // is anchored at the current clock from here on.
@@ -918,9 +930,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     if (options.cursor) {
       const payload = decodeCursor(options.cursor);
       if (payload.kind !== "changes_since") throw new InvalidCursorError();
-      horizon = Number(payload.horizon);
+      horizon = parseHorizon(payload.horizon);
       sinceHorizon =
-        payload.sinceHorizon !== null ? Number(payload.sinceHorizon) : null;
+        payload.sinceHorizon !== null
+          ? parseHorizon(payload.sinceHorizon)
+          : null;
       offset = payload.offset;
     } else if (options.changesSince) {
       let payload;
@@ -932,7 +946,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         throw err;
       }
       if (payload.kind !== "changes_since") throw new InvalidCursorError();
-      sinceHorizon = Number(payload.horizon);
+      sinceHorizon = parseHorizon(payload.horizon);
       horizon = (nextWriteSeq.get() as { value: number }).value;
     } else {
       sinceHorizon = null;
