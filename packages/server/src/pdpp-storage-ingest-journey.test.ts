@@ -18,6 +18,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { basename } from "node:path";
 import { tmpdir } from "node:os";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -86,11 +87,24 @@ function sha256(document: string): string {
 
 async function boot(
   declarationPaths: (string | { path: string; sha256: string })[],
+  methods?: { method_id: string; declaration_path: string }[],
 ) {
   return createServer(
     ServerConfigSchema.parse({
       tunnel: { enabled: false },
-      pdpp: { enabled: true, declarationPaths },
+      pdpp: {
+        enabled: true,
+        declarationPaths,
+        methods:
+          methods ??
+          declarationPaths.map((entry) => {
+            const path = typeof entry === "string" ? entry : entry.path;
+            return {
+              method_id: basename(path, ".json"),
+              declaration_path: path,
+            };
+          }),
+      },
     }),
     { serverDir: tempDir, dataDir: join(tempDir, "data") },
   );
@@ -129,9 +143,17 @@ async function ingest(
   token: string,
   stream: string,
   body: unknown,
+  methodOverride?: string,
+  generation = 1,
 ): Promise<{ status: number; body: IngestBody }> {
+  const first = Array.isArray(body) ? body[0] : body;
+  const instance =
+    first && typeof first === "object" && !Array.isArray(first)
+      ? (first as { instance?: string }).instance
+      : undefined;
+  const method = methodOverride ?? instance?.split(":", 1)[0] ?? "claude";
   const response = await context.app.request(
-    `/v1/streams/${stream}/records/ingest`,
+    `/v1/streams/${stream}/records/ingest?method=${encodeURIComponent(method)}&binding_generation=${generation}`,
     {
       method: "POST",
       headers: {
@@ -145,6 +167,52 @@ async function ingest(
     status: response.status,
     body: (await response.json()) as IngestBody,
   };
+}
+
+async function reset(
+  context: ServerContext,
+  token: string,
+  instance: string,
+  expectedMethod: string,
+  expectedGeneration: number,
+  nextMethod: string | null,
+) {
+  return context.app.request(
+    `/pdpp/instances/${encodeURIComponent(instance)}/reset`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        expected_method: expectedMethod,
+        expected_generation: expectedGeneration,
+        next_method: nextMethod,
+      }),
+    },
+  );
+}
+
+async function uploadBlob(
+  context: ServerContext,
+  token: string,
+  instance: string,
+  method: string,
+  generation: number,
+  bytes: Uint8Array,
+) {
+  return context.app.request(
+    `/v1/blobs/ingest?instance=${encodeURIComponent(instance)}&method=${encodeURIComponent(method)}&binding_generation=${generation}`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/octet-stream",
+      },
+      body: bytes,
+    },
+  );
 }
 
 async function read(context: ServerContext, token: string, path: string) {
@@ -169,6 +237,31 @@ function storeCounters() {
       .prepare("SELECT COUNT(*) AS n FROM pdpp_record_changes")
       .get() as { n: number };
     return { clock: clock.value, changes: changes.n };
+  } finally {
+    db.close();
+  }
+}
+
+function blobStoreCounters() {
+  const db = new Database(join(tempDir, "index.db"), { readonly: true });
+  try {
+    return {
+      metadata: (
+        db.prepare("SELECT COUNT(*) AS n FROM pdpp_blobs").get() as {
+          n: number;
+        }
+      ).n,
+      bytes: (
+        db.prepare("SELECT COUNT(*) AS n FROM pdpp_blob_bytes").get() as {
+          n: number;
+        }
+      ).n,
+      claims: (
+        db.prepare("SELECT COUNT(*) AS n FROM pdpp_blob_claims").get() as {
+          n: number;
+        }
+      ).n,
+    };
   } finally {
     db.close();
   }
@@ -513,5 +606,393 @@ describe("P4: ingest body limit", () => {
     expect((result.body as any).error.code).toBe("invalid_request");
     const listed = await read(ctx, token, "/v1/streams/profile/records");
     expect(listed.body.data).toEqual([]);
+  });
+});
+
+describe("P8: active method, owner reset, and generation-fenced blobs", () => {
+  it("locks an instance when configuration names multiple active methods", async () => {
+    const ouraPath = await writeDeclaration("oura", OURA_DECLARATION);
+    ctx = await boot(
+      [ouraPath],
+      [
+        { method_id: "oura", declaration_path: ouraPath },
+        { method_id: "oura-browser", declaration_path: ouraPath },
+      ],
+    );
+    const token = await ownerToken(ctx);
+    const response = await ingest(ctx, token, "events", {
+      instance: `oura:${owner}`,
+      key: "event-locked",
+      data: { id: "event-locked", kind: "locked" },
+      emitted_at: "2026-09-01T00:00:00Z",
+    });
+    expect(response.status).toBe(409);
+    expect((response.body as any).error.code).toBe(
+      "config_multiple_active_methods",
+    );
+  });
+
+  it("rejects an unclaimed blob reference without binding an empty instance", async () => {
+    const ouraPath = await writeDeclaration("oura", OURA_DECLARATION);
+    ctx = await boot([ouraPath]);
+    const token = await ownerToken(ctx);
+    const instance = `oura:${owner}`;
+    const result = await ingest(
+      ctx,
+      token,
+      "events",
+      {
+        instance,
+        key: "event-unclaimed",
+        data: {
+          id: "event-unclaimed",
+          kind: "image",
+          blob_ref: { blob_id: "sha256:missing" },
+        },
+        emitted_at: "2026-09-01T00:00:00Z",
+      },
+      "oura",
+    );
+    expect(result.body.results).toEqual([
+      { index: 0, outcome: "rejected", reason: "blob_unclaimed" },
+    ]);
+    const binding = await read(
+      ctx,
+      token,
+      `/pdpp/instances/${encodeURIComponent(instance)}/binding`,
+    );
+    expect(binding.body).toMatchObject({ method: null, empty: true });
+    expect(storeCounters()).toEqual({ clock: 0, changes: 0 });
+  });
+
+  it("rejects stale A writes after reset to B and expires pre-reset change tokens", async () => {
+    const ouraPath = await writeDeclaration("oura", OURA_DECLARATION);
+    const claudePath = await writeDeclaration("claude", CLAUDE_DECLARATION);
+    ctx = await boot([claudePath, ouraPath]);
+    const token = await ownerToken(ctx);
+    const instance = `oura:${owner}`;
+    const binding = await read(
+      ctx,
+      token,
+      `/pdpp/instances/${encodeURIComponent(instance)}/binding`,
+    );
+    expect(binding.body).toMatchObject({
+      method: null,
+      generation: 1,
+      empty: true,
+      configured_active_method: "oura",
+    });
+    const uploaded = await uploadBlob(
+      ctx,
+      token,
+      instance,
+      "oura",
+      1,
+      new TextEncoder().encode("method A image"),
+    );
+    expect(uploaded.status).toBe(200);
+    const blob = (await uploaded.json()) as { blob_id: string };
+
+    const event = await ingest(ctx, token, "events", {
+      instance,
+      key: "event-a",
+      data: {
+        id: "event-a",
+        kind: "sleep",
+        blob_ref: { blob_id: blob.blob_id },
+      },
+      emitted_at: "2026-09-01T00:00:00Z",
+    });
+    expect(outcomes(event.body)).toEqual(["accepted"]);
+    const mutable = await ingest(ctx, token, "profile", {
+      instance,
+      key: "user-a",
+      data: { user_id: "user-a", email: "a@example.com" },
+      emitted_at: "2026-09-01T00:00:00Z",
+    });
+    expect(outcomes(mutable.body)).toEqual(["accepted"]);
+
+    const baseline = await read(
+      ctx,
+      token,
+      "/v1/streams/events/records?changes_since=",
+    );
+    const oldToken = baseline.body.next_changes_since as string;
+    const switched = await reset(
+      ctx,
+      token,
+      instance,
+      "oura",
+      1,
+      "oura-browser",
+    );
+    expect(switched.status).toBe(200);
+    expect(await switched.json()).toMatchObject({
+      method: "oura-browser",
+      generation: 2,
+    });
+    expect(storeCounters()).toEqual({ clock: 4, changes: 0 });
+
+    const staleAAfterReset = await ingest(
+      ctx,
+      token,
+      "events",
+      {
+        instance,
+        key: "event-a-after-switch",
+        data: { id: "event-a-after-switch", kind: "late" },
+        emitted_at: "2026-09-02T00:00:00Z",
+      },
+      "oura",
+      1,
+    );
+    expect(staleAAfterReset.status).toBe(409);
+    expect((staleAAfterReset.body as any).error.code).toBe(
+      "binding_generation_mismatch",
+    );
+    const blobCountersAfterSwitch = blobStoreCounters();
+    const staleABlobAfterReset = await uploadBlob(
+      ctx,
+      token,
+      instance,
+      "oura",
+      1,
+      new TextEncoder().encode("stale A bytes after switch"),
+    );
+    expect(staleABlobAfterReset.status).toBe(409);
+    expect((await staleABlobAfterReset.json()).error.code).toBe(
+      "binding_generation_mismatch",
+    );
+    expect(blobStoreCounters()).toEqual(blobCountersAfterSwitch);
+
+    const resetAgain = await reset(
+      ctx,
+      token,
+      instance,
+      "oura",
+      1,
+      "oura-browser",
+    );
+    expect(resetAgain.status).toBe(200);
+    expect(await resetAgain.json()).toMatchObject({ status: "already_reset" });
+    const afterReset = await read(
+      ctx,
+      token,
+      `/v1/streams/events/records?changes_since=${encodeURIComponent(oldToken)}`,
+    );
+    expect(afterReset.status).toBe(410);
+
+    await ctx.cleanup();
+    ctx = await boot(
+      [claudePath, ouraPath],
+      [
+        { method_id: "claude", declaration_path: claudePath },
+        { method_id: "oura-browser", declaration_path: ouraPath },
+      ],
+    );
+    const newToken = await ownerToken(ctx);
+
+    const staleRecord = await ingest(
+      ctx,
+      newToken,
+      "events",
+      {
+        instance,
+        key: "event-a-late",
+        data: { id: "event-a-late", kind: "late" },
+        emitted_at: "2026-09-02T00:00:00Z",
+      },
+      "oura",
+      1,
+    );
+    expect(staleRecord.status).toBe(409);
+    expect(
+      (staleRecord.body as unknown as { error: { code: string } }).error.code,
+    ).toBe("method_inactive");
+    const staleBlob = await uploadBlob(
+      ctx,
+      newToken,
+      instance,
+      "oura",
+      1,
+      new TextEncoder().encode("late A bytes"),
+    );
+    expect(staleBlob.status).toBe(409);
+    expect((await staleBlob.json()).error.code).toBe("method_inactive");
+    const beforeStaleBlob = blobStoreCounters();
+    const staleGenerationBlob = await uploadBlob(
+      ctx,
+      newToken,
+      instance,
+      "oura-browser",
+      1,
+      new TextEncoder().encode("old generation browser bytes"),
+    );
+    expect(staleGenerationBlob.status).toBe(409);
+    expect((await staleGenerationBlob.json()).error.code).toBe(
+      "binding_generation_mismatch",
+    );
+    expect(blobStoreCounters()).toEqual(beforeStaleBlob);
+
+    const pendingBBlob = await uploadBlob(
+      ctx,
+      newToken,
+      instance,
+      "oura-browser",
+      2,
+      new TextEncoder().encode("pending B bytes"),
+    );
+    expect(pendingBBlob.status).toBe(200);
+    const repeatedReset = await reset(
+      ctx,
+      newToken,
+      instance,
+      "oura",
+      1,
+      "oura-browser",
+    );
+    expect(repeatedReset.status).toBe(200);
+    expect(await repeatedReset.json()).toMatchObject({
+      status: "already_reset",
+    });
+
+    const beforeStaleGeneration = storeCounters();
+    const staleGeneration = await ingest(
+      ctx,
+      newToken,
+      "events",
+      {
+        instance,
+        key: "event-b-stale-generation",
+        data: { id: "event-b-stale-generation", kind: "browser" },
+        emitted_at: "2026-09-02T00:00:00Z",
+      },
+      "oura-browser",
+      1,
+    );
+    expect(staleGeneration.status).toBe(409);
+    expect(
+      (staleGeneration.body as unknown as { error: { code: string } }).error
+        .code,
+    ).toBe("binding_generation_mismatch");
+    expect(storeCounters()).toEqual(beforeStaleGeneration);
+
+    const bRecord = await ingest(
+      ctx,
+      newToken,
+      "events",
+      {
+        instance,
+        key: "event-b",
+        data: { id: "event-b", kind: "browser" },
+        emitted_at: "2026-09-02T00:00:00Z",
+      },
+      "oura-browser",
+      2,
+    );
+    expect(bRecord.status).toBe(200);
+    expect(outcomes(bRecord.body)).toEqual(["accepted"]);
+  });
+
+  it("persists claimed blob bytes and sweeps stale and orphaned rows after restart", async () => {
+    const ouraPath = await writeDeclaration("oura", OURA_DECLARATION);
+    ctx = await boot([ouraPath]);
+    const token = await ownerToken(ctx);
+    const instance = `oura:${owner}`;
+    const payload = new TextEncoder().encode("persistent blob bytes");
+    const response = await uploadBlob(ctx, token, instance, "oura", 1, payload);
+    expect(response.status).toBe(200);
+    const { blob_id: blobId } = (await response.json()) as { blob_id: string };
+    const record = await ingest(ctx, token, "events", {
+      instance,
+      key: "event-with-blob",
+      data: {
+        id: "event-with-blob",
+        kind: "image",
+        blob_ref: { blob_id: blobId },
+      },
+      emitted_at: "2026-09-01T00:00:00Z",
+    });
+    expect(outcomes(record.body)).toEqual(["accepted"]);
+    const pendingUpload = await uploadBlob(
+      ctx,
+      token,
+      instance,
+      "oura",
+      1,
+      new TextEncoder().encode("pending current generation bytes"),
+    );
+    expect(pendingUpload.status).toBe(200);
+    const pendingBlobId = (await pendingUpload.json()).blob_id as string;
+
+    const db = new Database(join(tempDir, "index.db"));
+    try {
+      const staleId = "sha256:stale-claim";
+      const orphanId = "sha256:orphan";
+      for (const id of [staleId, orphanId]) {
+        db.prepare(
+          "INSERT INTO pdpp_blobs (blob_id, mime_type, size_bytes, sha256) VALUES (?, ?, ?, ?)",
+        ).run(id, "application/octet-stream", 3, id.slice("sha256:".length));
+        db.prepare(
+          "INSERT INTO pdpp_blob_bytes (blob_id, bytes) VALUES (?, ?)",
+        ).run(id, Buffer.from("old"));
+      }
+      db.prepare(
+        "INSERT INTO pdpp_blob_claims (blob_id, instance, generation) VALUES (?, ?, ?)",
+      ).run(staleId, instance, 0);
+    } finally {
+      db.close();
+    }
+
+    await ctx.cleanup();
+    ctx = await boot([ouraPath]);
+    const newToken = await ownerToken(ctx);
+    const fetched = await ctx.app.request(
+      `/v1/blobs/${encodeURIComponent(blobId)}`,
+      {
+        headers: { authorization: `Bearer ${newToken}` },
+      },
+    );
+    expect(fetched.status).toBe(200);
+    expect(new Uint8Array(await fetched.arrayBuffer())).toEqual(payload);
+
+    const verify = new Database(join(tempDir, "index.db"), { readonly: true });
+    try {
+      const stale = verify
+        .prepare("SELECT COUNT(*) AS n FROM pdpp_blobs WHERE blob_id = ?")
+        .get("sha256:stale-claim") as { n: number };
+      const orphan = verify
+        .prepare("SELECT COUNT(*) AS n FROM pdpp_blobs WHERE blob_id = ?")
+        .get("sha256:orphan") as { n: number };
+      const live = verify
+        .prepare("SELECT COUNT(*) AS n FROM pdpp_blob_claims WHERE blob_id = ?")
+        .get(blobId) as { n: number };
+      const pending = verify
+        .prepare("SELECT COUNT(*) AS n FROM pdpp_blob_claims WHERE blob_id = ?")
+        .get(pendingBlobId) as { n: number };
+      const staleBytes = verify
+        .prepare("SELECT COUNT(*) AS n FROM pdpp_blob_bytes WHERE blob_id = ?")
+        .get("sha256:stale-claim") as { n: number };
+      const orphanBytes = verify
+        .prepare("SELECT COUNT(*) AS n FROM pdpp_blob_bytes WHERE blob_id = ?")
+        .get("sha256:orphan") as { n: number };
+      expect({
+        stale: stale.n,
+        orphan: orphan.n,
+        live: live.n,
+        pending: pending.n,
+        staleBytes: staleBytes.n,
+        orphanBytes: orphanBytes.n,
+      }).toEqual({
+        stale: 0,
+        orphan: 0,
+        live: 1,
+        pending: 1,
+        staleBytes: 0,
+        orphanBytes: 0,
+      });
+    } finally {
+      verify.close();
+    }
   });
 });

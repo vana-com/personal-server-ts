@@ -24,6 +24,20 @@ import {
   type StreamSemantics,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
+export interface PdppInstanceBinding {
+  instance: string;
+  method: string | null;
+  generation: number;
+  resetClock: number;
+  empty?: boolean;
+}
+
+export class PdppBindingError extends Error {
+  constructor(public readonly reason: string) {
+    super(reason);
+  }
+}
+
 function blobIdForBytes(bytes: Uint8Array): string {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 }
@@ -37,8 +51,9 @@ function blobIdForBytes(bytes: Uint8Array): string {
  * `pdpp_records` holds current state (one row per instance+stream+record_key).
  * `pdpp_record_changes` holds full version history for mutable_state streams
  * (append_only streams only ever have one history row per key, at version 1,
- * since duplicates are no-ops). `pdpp_blobs` holds binary payload metadata
- * only; actual bytes storage is out of scope for this table.
+ * since duplicates are no-ops). `pdpp_blobs` holds blob metadata,
+ * `pdpp_blob_bytes` holds bytes, and `pdpp_blob_claims` ties pending uploads
+ * to an instance generation.
  */
 const MIGRATIONS: string[] = [
   // v1: initial schema.
@@ -111,6 +126,33 @@ CREATE TABLE IF NOT EXISTS pdpp_blob_bytes (
   bytes BLOB NOT NULL
 );
 `,
+  // v4: persist the method generation and generation-scoped blob claims.
+  // Existing instances remain unbound until their owner resets them.
+  `
+CREATE TABLE IF NOT EXISTS pdpp_instance_binding (
+  instance TEXT PRIMARY KEY,
+  method TEXT,
+  generation INTEGER NOT NULL CHECK (generation > 0),
+  reset_clock INTEGER NOT NULL DEFAULT 0
+);
+
+INSERT OR IGNORE INTO pdpp_instance_binding (instance, method, generation, reset_clock)
+SELECT DISTINCT instance, NULL, 1, 0 FROM pdpp_records;
+
+CREATE TABLE IF NOT EXISTS pdpp_blob_claims (
+  blob_id TEXT NOT NULL REFERENCES pdpp_blobs (blob_id),
+  instance TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  PRIMARY KEY (blob_id, instance)
+);
+
+INSERT OR IGNORE INTO pdpp_blob_claims (blob_id, instance, generation)
+SELECT DISTINCT r.blob_id, r.instance, b.generation
+FROM pdpp_records r
+JOIN pdpp_instance_binding b ON b.instance = r.instance
+JOIN pdpp_blobs m ON m.blob_id = r.blob_id
+WHERE r.blob_id IS NOT NULL AND r.deleted = 0;
+`,
 ];
 
 function migrate(db: Database): void {
@@ -144,6 +186,69 @@ function migrate(db: Database): void {
       `pdpp_records database schema version ${current.version} is newer than this build supports (${MIGRATIONS.length}). Refusing to open — upgrade this build before opening this database.`,
     );
   }
+}
+
+function sweepStaleBlobClaims(db: Database): void {
+  db.transaction(() => {
+    db.exec(`
+      DELETE FROM pdpp_blob_claims
+      WHERE NOT EXISTS (
+        SELECT 1 FROM pdpp_instance_binding b
+        WHERE b.instance = pdpp_blob_claims.instance
+          AND b.generation = pdpp_blob_claims.generation
+      );
+    `);
+    deleteUnclaimedBlobs(db);
+  })();
+}
+
+function deleteUnclaimedBlobs(db: Database): void {
+  db.exec(`
+    DELETE FROM pdpp_blob_bytes
+    WHERE blob_id IN (
+      SELECT blob_id FROM pdpp_blobs b
+      WHERE NOT EXISTS (SELECT 1 FROM pdpp_blob_claims c WHERE c.blob_id = b.blob_id)
+        AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.blob_id = b.blob_id AND r.deleted = 0)
+    );
+    DELETE FROM pdpp_blobs
+    WHERE NOT EXISTS (SELECT 1 FROM pdpp_blob_claims c WHERE c.blob_id = pdpp_blobs.blob_id)
+      AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.blob_id = pdpp_blobs.blob_id AND r.deleted = 0);
+  `);
+}
+
+interface BindingRowDb {
+  instance: string;
+  method: string | null;
+  generation: number;
+  reset_clock: number;
+}
+
+function toBinding(row: BindingRowDb): PdppInstanceBinding {
+  return {
+    instance: row.instance,
+    method: row.method,
+    generation: row.generation,
+    resetClock: row.reset_clock,
+  };
+}
+
+function ensureBinding(db: Database, instance: string): BindingRowDb {
+  db.prepare(
+    "INSERT OR IGNORE INTO pdpp_instance_binding (instance, method, generation, reset_clock) VALUES (?, NULL, 1, 0)",
+  ).run(instance);
+  return db
+    .prepare("SELECT * FROM pdpp_instance_binding WHERE instance = ?")
+    .get(instance) as BindingRowDb;
+}
+
+function instanceHasRecords(db: Database, instance: string): boolean {
+  const row = db
+    .prepare(
+      `SELECT EXISTS(SELECT 1 FROM pdpp_records WHERE instance = ?)
+        OR EXISTS(SELECT 1 FROM pdpp_record_changes WHERE instance = ?) AS has_records`,
+    )
+    .get(instance, instance) as { has_records: number };
+  return row.has_records === 1;
 }
 
 function extractBlobId(data: Record<string, unknown> | null): string | null {
@@ -209,9 +314,25 @@ function projectFields(
  * SQLite-backed PdppRecordStore for desktop persistence. Requires
  * `better-sqlite3` (already a `packages/server` dependency in this repo).
  */
-export function createSqliteRecordStore(db: Database): PdppRecordStore {
+export function createSqliteRecordStore(db: Database): PdppRecordStore & {
+  getInstanceBinding(instance: string): PdppInstanceBinding;
+  resetInstanceBinding(input: {
+    instance: string;
+    expectedMethod: string | null;
+    expectedGeneration: number;
+    nextMethod: string | null;
+  }): { binding: PdppInstanceBinding; alreadyReset: boolean };
+  storeBlobBytesForInstance(input: {
+    instance: string;
+    method: string;
+    generation: number;
+    bytes: Uint8Array;
+    mimeType: string;
+  }): PdppBlobMeta;
+} {
   db.pragma("journal_mode = WAL");
   migrate(db);
+  sweepStaleBlobClaims(db);
 
   const nextWriteSeq = db.prepare(
     "UPDATE pdpp_write_clock SET value = value + 1 WHERE id = 1 RETURNING value",
@@ -267,6 +388,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
     envelopes: PdppRecordEnvelopeInput[],
     streamSemantics: (stream: string, instance: string) => StreamSemantics,
     primaryKeyFields: (stream: string, instance: string) => string[],
+    binding?: { method: string; generation: number },
   ): IngestResult {
     const results: IngestOutcome[] = [];
 
@@ -277,6 +399,30 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
     // Reads inside the transaction see earlier writes of the same batch, so
     // two envelopes for one key are decided in order.
     const runBatch = db.transaction(() => {
+      let shouldBind = false;
+      if (binding && envelopes.length > 0) {
+        shouldBind = checkBinding(
+          binding.method,
+          binding.generation,
+          envelopes,
+        );
+      } else if (
+        envelopes.some((envelope) =>
+          db
+            .prepare("SELECT 1 FROM pdpp_instance_binding WHERE instance = ?")
+            .get(envelope.instance),
+        )
+      ) {
+        envelopes.forEach((_, index) =>
+          results.push({
+            index,
+            outcome: "rejected",
+            reason: "method_required",
+          }),
+        );
+        return;
+      }
+      let wroteAny = false;
       envelopes.forEach((envelope, index) => {
         const plan = planIngest(
           index,
@@ -301,7 +447,25 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
         if (!plan.write) return;
 
         const { recordKey, data } = plan.write;
+        const blobId = extractBlobId(data);
+        if (
+          binding &&
+          blobId &&
+          !db
+            .prepare(
+              "SELECT 1 FROM pdpp_blob_claims WHERE blob_id = ? AND instance = ? AND generation = (SELECT generation FROM pdpp_instance_binding WHERE instance = ?)",
+            )
+            .get(blobId, envelope.instance, envelope.instance)
+        ) {
+          results[results.length - 1] = {
+            index,
+            outcome: "rejected",
+            reason: "blob_unclaimed",
+          };
+          return;
+        }
         const deleted = data === null;
+        wroteAny = true;
         const version =
           latestVersion(envelope.instance, envelope.stream, recordKey) + 1;
         const writtenAt = nextWriteSeq.get() as { value: number };
@@ -316,7 +480,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
           emitted_at: envelope.emitted_at,
           deleted: deleted ? 1 : 0,
           deleted_at: deletedAt,
-          blob_id: extractBlobId(data),
+          blob_id: blobId,
         });
         insertHistoryStmt.run({
           instance: envelope.instance,
@@ -330,10 +494,91 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
           written_at: writtenAt.value,
         });
       });
+      if (shouldBind && binding && wroteAny) {
+        db.prepare(
+          "UPDATE pdpp_instance_binding SET method = ? WHERE instance = ? AND generation = ? AND method IS NULL",
+        ).run(binding.method, envelopes[0].instance, binding.generation);
+      }
     });
 
     runBatch();
     return summarizeIngest(results);
+  }
+
+  function checkBinding(
+    method: string,
+    generation: number,
+    envelopes: PdppRecordEnvelopeInput[],
+  ): boolean {
+    const instances = new Set(envelopes.map((envelope) => envelope.instance));
+    if (instances.size !== 1) throw new PdppBindingError("invalid_request");
+    const instance = [...instances][0];
+    const current = ensureBinding(db, instance);
+    if (current.generation !== generation) {
+      throw new PdppBindingError("binding_generation_mismatch");
+    }
+    if (current.method === method) return false;
+    if (current.method !== null) {
+      throw new PdppBindingError("instance_bound_to_other_method");
+    }
+    if (instanceHasRecords(db, instance)) {
+      throw new PdppBindingError("binding_required");
+    }
+    return true;
+  }
+
+  function getInstanceBinding(instance: string): PdppInstanceBinding {
+    return {
+      ...toBinding(ensureBinding(db, instance)),
+      empty: !instanceHasRecords(db, instance),
+    };
+  }
+
+  function resetInstanceBinding(input: {
+    instance: string;
+    expectedMethod: string | null;
+    expectedGeneration: number;
+    nextMethod: string | null;
+  }): { binding: PdppInstanceBinding; alreadyReset: boolean } {
+    return db.transaction(() => {
+      const current = ensureBinding(db, input.instance);
+      if (
+        current.method !== input.expectedMethod ||
+        current.generation !== input.expectedGeneration
+      ) {
+        const alreadyReset =
+          current.method === input.nextMethod &&
+          current.generation === input.expectedGeneration + 1 &&
+          !instanceHasRecords(db, input.instance);
+        if (alreadyReset)
+          return { binding: toBinding(current), alreadyReset: true };
+        throw new PdppBindingError("binding_generation_mismatch");
+      }
+
+      db.prepare("DELETE FROM pdpp_records WHERE instance = ?").run(
+        input.instance,
+      );
+      db.prepare("DELETE FROM pdpp_record_changes WHERE instance = ?").run(
+        input.instance,
+      );
+      db.prepare("DELETE FROM pdpp_blob_claims WHERE instance = ?").run(
+        input.instance,
+      );
+      deleteUnclaimedBlobs(db);
+      const resetClock = (nextWriteSeq.get() as { value: number }).value;
+      db.prepare(
+        "UPDATE pdpp_instance_binding SET method = ?, generation = ?, reset_clock = ? WHERE instance = ?",
+      ).run(
+        input.nextMethod,
+        input.expectedGeneration + 1,
+        resetClock,
+        input.instance,
+      );
+      return {
+        binding: toBinding(ensureBinding(db, input.instance)),
+        alreadyReset: false,
+      };
+    })();
   }
 
   function getRecord(
@@ -472,6 +717,25 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
     } else {
       sinceHorizon = null;
       horizon = (nextWriteSeq.get() as { value: number }).value;
+    }
+
+    const resetClocks =
+      options.instanceIds.length === 0
+        ? []
+        : (db
+            .prepare(
+              `SELECT reset_clock FROM pdpp_instance_binding
+               WHERE instance IN (${options.instanceIds.map(() => "?").join(",")}) AND reset_clock > 0`,
+            )
+            .all(...options.instanceIds) as { reset_clock: number }[]);
+    if (
+      resetClocks.some(
+        ({ reset_clock }) =>
+          horizon < reset_clock ||
+          (sinceHorizon !== null && sinceHorizon < reset_clock),
+      )
+    ) {
+      throw new CursorExpiredError();
     }
 
     const placeholders = options.instanceIds.map(() => "?").join(",");
@@ -712,6 +976,36 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
     return run();
   }
 
+  function storeBlobBytesForInstance(input: {
+    instance: string;
+    method: string;
+    generation: number;
+    bytes: Uint8Array;
+    mimeType: string;
+  }): PdppBlobMeta {
+    return db.transaction(() => {
+      const binding = ensureBinding(db, input.instance);
+      if (binding.generation !== input.generation) {
+        throw new PdppBindingError("binding_generation_mismatch");
+      }
+      if (binding.method !== input.method) {
+        if (binding.method !== null) {
+          throw new PdppBindingError("instance_bound_to_other_method");
+        }
+        if (instanceHasRecords(db, input.instance)) {
+          throw new PdppBindingError("binding_required");
+        }
+      }
+      const meta = storeBlobBytes(input.bytes, input.mimeType);
+      db.prepare(
+        `INSERT INTO pdpp_blob_claims (blob_id, instance, generation)
+         VALUES (?, ?, ?)
+         ON CONFLICT (blob_id, instance) DO UPDATE SET generation = excluded.generation`,
+      ).run(meta.blobId, input.instance, input.generation);
+      return meta;
+    })();
+  }
+
   function getBlobBytes(blobId: string): Uint8Array<ArrayBuffer> | undefined {
     const meta = getBlobMeta(blobId);
     if (!meta) return undefined;
@@ -726,6 +1020,9 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
 
   return {
     ingestBatch,
+    getInstanceBinding,
+    resetInstanceBinding,
+    storeBlobBytesForInstance,
     getRecord,
     listRecords,
     deleteRecord,

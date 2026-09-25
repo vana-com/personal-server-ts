@@ -647,6 +647,7 @@ export async function createServer(
     serverOwner,
     resource: effectiveOrigin,
     logger,
+    configuredMethods: pdppAuth?.configuredMethods,
   });
 
   // Close the sync→PDPP loop. Until this runs the download worker holds an

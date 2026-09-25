@@ -83,6 +83,9 @@ export const DEFAULTS = {
     // whose bytes no longer match is refused. The installer that verified
     // the signed artifact writes that digest.
     declarationPaths: [] as Array<string | { path: string; sha256: string }>,
+    // At most one acquisition method may write each retained source. The
+    // declaration path ties an artifact method id to the source it produces.
+    methods: [] as Array<{ method_id: string; declaration_path: string }>,
     // Require PKCE (RFC 7636, S256) on the authorization-code flow. PDPP
     // clients are public clients; without a verifier an intercepted code is
     // redeemable by whoever intercepted it.
@@ -258,6 +261,14 @@ export const ServerConfigSchema = z.object({
           ]),
         )
         .default(DEFAULTS.pdpp.declarationPaths),
+      methods: z
+        .array(
+          z.object({
+            method_id: z.string().min(1),
+            declaration_path: z.string().min(1),
+          }),
+        )
+        .default(DEFAULTS.pdpp.methods),
       requirePkce: z.boolean().default(DEFAULTS.pdpp.requirePkce),
       clients: z
         .array(

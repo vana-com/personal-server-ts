@@ -49,6 +49,7 @@ export function deriveSupportedConnectors(scopes: string[]): string[] {
 export interface ConfiguredDeclaration {
   sourceId: string;
   document: string;
+  path?: string;
 }
 
 export interface PdppDeclarationRegistryOptions {

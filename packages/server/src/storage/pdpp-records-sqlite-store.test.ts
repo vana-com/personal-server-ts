@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import Database from "better-sqlite3";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
-import type { PdppRecordStore } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type { PdppRecordEnvelopeInput } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
 function messagesSemantics() {
@@ -19,7 +18,7 @@ function playlistsPk() {
 
 describe("sqlite record store", () => {
   let db: InstanceType<typeof Database>;
-  let store: PdppRecordStore;
+  let store: ReturnType<typeof createSqliteRecordStore>;
 
   beforeEach(() => {
     db = new Database(":memory:");
@@ -42,6 +41,35 @@ describe("sqlite record store", () => {
     expect(result.accepted).toBe(1);
     const record = store.getRecord("inst_1", "messages", "msg_1");
     expect(record?.data).toEqual({ id: "msg_1", content: "hi" });
+  });
+
+  it("requires a method context after an instance enters method authority", () => {
+    const base: PdppRecordEnvelopeInput = {
+      instance: "inst_1",
+      stream: "messages",
+      key: "msg_1",
+      data: { id: "msg_1", content: "from method A" },
+      emitted_at: "2026-04-01T00:00:00.000Z",
+    };
+    store.getInstanceBinding("inst_1");
+    const accepted = store.ingestBatch([base], messagesSemantics, messagesPk, {
+      method: "method_a",
+      generation: 1,
+    });
+    expect(accepted.accepted).toBe(1);
+
+    const rejected = store.ingestBatch(
+      [{ ...base, data: { id: "msg_1", content: "method-blind overwrite" } }],
+      messagesSemantics,
+      messagesPk,
+    );
+    expect(rejected.results).toEqual([
+      { index: 0, outcome: "rejected", reason: "method_required" },
+    ]);
+    expect(store.getRecord("inst_1", "messages", "msg_1")?.data).toEqual({
+      id: "msg_1",
+      content: "from method A",
+    });
   });
 
   it("allocates monotonic versions for mutable_state upserts", () => {
