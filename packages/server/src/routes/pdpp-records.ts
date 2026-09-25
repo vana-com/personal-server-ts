@@ -28,6 +28,7 @@ import {
   type StreamDeclaration,
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+import { createRecordDataValidator } from "../pdpp/record-schema.js";
 
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
@@ -559,6 +560,7 @@ function projectSchemaToFields(
 
 export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   const app = new Hono();
+  const validateData = createRecordDataValidator(deps.declarations);
 
   /**
    * Append one PDPP read to the owner access feed.
@@ -1355,6 +1357,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         (_stream, instance) => declarationFor(instance).semantics,
         (_stream, instance) => declarationFor(instance).primaryKey,
         deps.bindingStore && method ? { method, generation } : undefined,
+        validateData,
       );
       stored.results.forEach((result, position) => {
         const index = admitted[position].index;
@@ -1480,6 +1483,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           generation,
           emittedAt,
           primaryKey: declaration.primaryKey,
+          validateData,
           envelopes: records.map((entry) => {
             const e = (
               entry !== null && typeof entry === "object" ? entry : {}
