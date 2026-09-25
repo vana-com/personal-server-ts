@@ -222,6 +222,28 @@ async function read(context: ServerContext, token: string, path: string) {
   return { status: response.status, body: (await response.json()) as any };
 }
 
+async function replace(
+  context: ServerContext,
+  token: string,
+  stream: string,
+  body: unknown,
+  method = "oura",
+  generation = 1,
+) {
+  const response = await context.app.request(
+    `/v1/streams/${stream}/records/replace?method=${encodeURIComponent(method)}&binding_generation=${generation}`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    },
+  );
+  return { status: response.status, body: (await response.json()) as any };
+}
+
 function outcomes(body: IngestBody) {
   return body.results.map((r) => r.outcome);
 }
@@ -1245,28 +1267,6 @@ describe("P7: stream snapshot replace", () => {
     emitted_at,
   });
 
-  async function replace(
-    context: ServerContext,
-    token: string,
-    stream: string,
-    body: unknown,
-    method = "oura",
-    generation = 1,
-  ) {
-    const response = await context.app.request(
-      `/v1/streams/${stream}/records/replace?method=${encodeURIComponent(method)}&binding_generation=${generation}`,
-      {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${token}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(body),
-      },
-    );
-    return { status: response.status, body: (await response.json()) as any };
-  }
-
   /** Every current row of the oura instance, including tombstones. */
   function currentRows() {
     const db = new Database(join(tempDir, "index.db"), { readonly: true });
@@ -1677,5 +1677,458 @@ describe("P7: stream snapshot replace", () => {
       { method: "POST", body: "{}" },
     );
     expect(response.status).toBe(404);
+  });
+});
+
+describe("P5: record data is validated against the declared stream schema", () => {
+  const WHOOP = "https://registry.pdpp.dev/connectors/whoop";
+
+  // A normative §5 declaration. `stages` uses 2020-12 `prefixItems` with
+  // `items: false`: a tuple of exactly [string, number]. Under draft-07 the
+  // same `items: false` would forbid every element, so an accepted tuple
+  // proves the 2020-12 dialect. `recorded_at` has a `format`, which 2020-12
+  // treats as an annotation.
+  function whoopDeclaration(version: string, requireScore: boolean) {
+    return JSON.stringify({
+      protocol_version: "0.1.0",
+      source: { kind: "connector", id: WHOOP },
+      declaration_version: version,
+      publisher: { id: "https://registry.pdpp.dev" },
+      display: { name: "Whoop" },
+      streams: [
+        {
+          name: "sleep",
+          semantics: "mutable_state",
+          primary_key: ["id"],
+          schema: {
+            $schema: "https://json-schema.org/draft/2020-12/schema",
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              score: { type: "integer", minimum: 0 },
+              stages: {
+                type: "array",
+                prefixItems: [{ type: "string" }, { type: "number" }],
+                items: false,
+              },
+              recorded_at: { type: "string", format: "date-time" },
+            },
+            required: requireScore ? ["id", "score"] : ["id"],
+            additionalProperties: false,
+          },
+        },
+      ],
+    });
+  }
+
+  const instance = () => `whoop:${owner}`;
+  const envelope = (
+    data: Record<string, unknown>,
+    emitted_at = "2026-09-01T00:00:00Z",
+  ) => ({
+    instance: instance(),
+    key: data.id as string,
+    data,
+    emitted_at,
+  });
+
+  function sleepRows() {
+    const db = new Database(join(tempDir, "index.db"), { readonly: true });
+    try {
+      return db
+        .prepare(
+          "SELECT record_key, data, version, deleted FROM pdpp_records WHERE stream = 'sleep' ORDER BY record_key",
+        )
+        .all();
+    } finally {
+      db.close();
+    }
+  }
+
+  async function bootWhoop(version = "1", requireScore = true) {
+    const path = await writeDeclaration(
+      "whoop",
+      whoopDeclaration(version, requireScore),
+    );
+    return boot([path]);
+  }
+
+  it("ingest: rejects each non-conforming record by index and writes only the conforming ones", async () => {
+    ctx = await bootWhoop();
+    const token = await ownerToken(ctx);
+    const before = storeCounters();
+
+    const result = await ingest(ctx, token, "sleep", [
+      envelope({ id: "s1", score: 80, stages: ["deep", 1.5] }),
+      envelope({ id: "s2", score: "high" }),
+      envelope({ id: "s3" }),
+      envelope({ id: "s4", score: 1, extra: true }),
+      envelope({ id: "s5", score: 1, stages: ["deep", 1.5, "rem"] }),
+      envelope({ id: "s6", score: 70, recorded_at: "not a date" }),
+    ]);
+    expect(result.status).toBe(200);
+    expect(result.body.results).toEqual([
+      { index: 0, outcome: "accepted" },
+      {
+        index: 1,
+        outcome: "rejected",
+        reason: "schema_violation: /score must be integer",
+      },
+      {
+        index: 2,
+        outcome: "rejected",
+        reason: "schema_violation: (root) must have required property 'score'",
+      },
+      {
+        index: 3,
+        outcome: "rejected",
+        reason: "schema_violation: (root) must NOT have additional properties",
+      },
+      {
+        index: 4,
+        outcome: "rejected",
+        reason: "schema_violation: /stages must NOT have more than 2 items",
+      },
+      { index: 5, outcome: "accepted" },
+    ]);
+    // Two writes, two clock ticks: a rejected record leaves no trace.
+    expect(storeCounters()).toEqual({
+      clock: before.clock + 2,
+      changes: before.changes + 2,
+    });
+    expect(sleepRows().map((r: any) => r.record_key)).toEqual(["s1", "s6"]);
+  });
+
+  it("ingest: a non-conforming upsert over a stored record leaves it unchanged, and a delete is not schema-checked", async () => {
+    ctx = await bootWhoop();
+    const token = await ownerToken(ctx);
+    await ingest(ctx, token, "sleep", [envelope({ id: "s1", score: 80 })]);
+    const rows = sleepRows();
+    const counters = storeCounters();
+
+    const bad = await ingest(ctx, token, "sleep", [
+      envelope({ id: "s1", score: -1 }, "2026-09-02T00:00:00Z"),
+    ]);
+    expect(bad.body.results).toEqual([
+      {
+        index: 0,
+        outcome: "rejected",
+        reason: "schema_violation: /score must be >= 0",
+      },
+    ]);
+    // The same request is rejected with the same reason every time.
+    const replay = await ingest(ctx, token, "sleep", [
+      envelope({ id: "s1", score: -1 }, "2026-09-02T00:00:00Z"),
+    ]);
+    expect(replay.body).toEqual(bad.body);
+    expect(sleepRows()).toEqual(rows);
+    expect(storeCounters()).toEqual(counters);
+
+    const deleted = await ingest(ctx, token, "sleep", [
+      {
+        instance: instance(),
+        key: "s1",
+        op: "delete",
+        emitted_at: "2026-09-03T00:00:00Z",
+      },
+    ]);
+    expect(outcomes(deleted.body)).toEqual(["accepted"]);
+  });
+
+  it("replace: applies a conforming snapshot, and one non-conforming record rejects it with nothing written", async () => {
+    ctx = await bootWhoop();
+    const token = await ownerToken(ctx);
+    const seeded = await ingest(ctx, token, "sleep", [
+      envelope({ id: "s1", score: 1 }),
+      envelope({ id: "s2", score: 2 }),
+    ]);
+    expect(outcomes(seeded.body)).toEqual(["accepted", "accepted"]);
+
+    const applied = await replace(
+      ctx,
+      token,
+      "sleep",
+      {
+        instance: instance(),
+        emitted_at: "2026-09-02T00:00:00Z",
+        records: [
+          envelope({ id: "s1", score: 1 }),
+          envelope({ id: "s3", score: 3 }),
+        ],
+      },
+      "whoop",
+    );
+    expect(applied.status).toBe(200);
+    expect(applied.body).toMatchObject({
+      accepted: 1,
+      unchanged: 1,
+      deleted: 1,
+      rejected: [],
+    });
+
+    const rows = sleepRows();
+    const counters = storeCounters();
+    // The invalid record is last, after an upsert and a new key, and the
+    // snapshot would tombstone s3: none of it may be written.
+    const rejected = await replace(
+      ctx,
+      token,
+      "sleep",
+      {
+        instance: instance(),
+        emitted_at: "2026-09-03T00:00:00Z",
+        records: [
+          envelope({ id: "s1", score: 10 }),
+          envelope({ id: "s4", score: 4 }),
+          envelope({ id: "s5", score: 5, stages: [1, "deep"] }),
+        ],
+      },
+      "whoop",
+    );
+    expect(rejected.status).toBe(422);
+    expect(rejected.body.rejected).toEqual([
+      { index: 2, reason: "schema_violation: /stages/0 must be string" },
+    ]);
+    expect(sleepRows()).toEqual(rows);
+    expect(storeCounters()).toEqual(counters);
+  });
+
+  it("replace: checks the binding before the schema, so a stale generation is 409 whatever the records hold", async () => {
+    ctx = await bootWhoop();
+    const token = await ownerToken(ctx);
+    await ingest(ctx, token, "sleep", [envelope({ id: "s1", score: 1 })]);
+    const counters = storeCounters();
+
+    const stale = await replace(
+      ctx,
+      token,
+      "sleep",
+      {
+        instance: instance(),
+        emitted_at: "2026-09-02T00:00:00Z",
+        records: [envelope({ id: "s1", score: "bad" })],
+      },
+      "whoop",
+      2,
+    );
+    expect(stale.status).toBe(409);
+    expect(stale.body.error.code).toBe("binding_generation_mismatch");
+    expect(storeCounters()).toEqual(counters);
+  });
+
+  it("validates new writes against the configured declaration version across restarts, and leaves stored rows alone", async () => {
+    // Version 1 does not require `score`.
+    ctx = await bootWhoop("1", false);
+    let token = await ownerToken(ctx);
+    const v1 = await ingest(ctx, token, "sleep", [envelope({ id: "s1" })]);
+    expect(outcomes(v1.body)).toEqual(["accepted"]);
+    await ctx.cleanup();
+
+    // Version 2 requires it. The stored row is not revalidated or removed,
+    // but re-sending the same content is rejected, on both write paths,
+    // even though it equals what is stored.
+    ctx = await bootWhoop("2", true);
+    token = await ownerToken(ctx);
+    const rows = sleepRows();
+    const counters = storeCounters();
+    const missing =
+      "schema_violation: (root) must have required property 'score'";
+    const again = await ingest(ctx, token, "sleep", [envelope({ id: "s1" })]);
+    expect(again.body.results).toEqual([
+      { index: 0, outcome: "rejected", reason: missing },
+    ]);
+    const replaced = await replace(
+      ctx,
+      token,
+      "sleep",
+      {
+        instance: instance(),
+        emitted_at: "2026-09-02T00:00:00Z",
+        records: [envelope({ id: "s1" })],
+      },
+      "whoop",
+    );
+    expect(replaced.status).toBe(422);
+    expect(replaced.body.rejected).toEqual([{ index: 0, reason: missing }]);
+    expect(sleepRows()).toEqual(rows);
+    expect(storeCounters()).toEqual(counters);
+    const stored = await read(ctx, token, "/v1/streams/sleep/records/s1");
+    expect(stored.status).toBe(200);
+    expect(stored.body.data).toEqual({ id: "s1" });
+    await ctx.cleanup();
+
+    // Back to version 1: the same record is `unchanged` again.
+    ctx = await bootWhoop("1", false);
+    token = await ownerToken(ctx);
+    const back = await ingest(ctx, token, "sleep", [envelope({ id: "s1" })]);
+    expect(outcomes(back.body)).toEqual(["unchanged"]);
+  });
+
+  it("refuses a declaration whose stream schema names another dialect, so nothing can be written under it", async () => {
+    const draft07 = JSON.parse(whoopDeclaration("1", true));
+    draft07.streams[0].schema.$schema =
+      "http://json-schema.org/draft-07/schema#";
+    const path = await writeDeclaration("whoop", JSON.stringify(draft07));
+    ctx = await boot([path]);
+    const response = await ctx.app.request("/pdpp/v1/owner/token", {
+      method: "POST",
+      headers: { authorization: `Bearer ${ctx.devToken}` },
+    });
+    expect(response.status).toBe(404);
+  });
+
+  function declarationWith(
+    source: string,
+    stream: string,
+    schema: Record<string, unknown>,
+  ) {
+    return JSON.stringify({
+      protocol_version: "0.1.0",
+      source: {
+        kind: "connector",
+        id: `https://registry.pdpp.dev/connectors/${source}`,
+      },
+      declaration_version: "1",
+      publisher: { id: "https://registry.pdpp.dev" },
+      display: { name: source },
+      streams: [
+        {
+          name: stream,
+          semantics: "mutable_state",
+          primary_key: ["id"],
+          schema: {
+            $schema: "https://json-schema.org/draft/2020-12/schema",
+            ...schema,
+          },
+        },
+      ],
+    });
+  }
+
+  it("rejects every upsert of a stream whose schema does not compile, with nothing written", async () => {
+    const path = await writeDeclaration(
+      "whoop",
+      declarationWith("whoop", "sleep", {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          score: { $ref: "#/$defs/missing" },
+        },
+      }),
+    );
+    ctx = await boot([path]);
+    const token = await ownerToken(ctx);
+    const before = storeCounters();
+
+    const result = await ingest(ctx, token, "sleep", [
+      envelope({ id: "s1", score: 1 }),
+      envelope({ id: "s2" }),
+    ]);
+    expect(result.status).toBe(200);
+    const unavailable =
+      "schema_unavailable: can't resolve reference #/$defs/missing from id #";
+    expect(result.body.results).toEqual([
+      { index: 0, outcome: "rejected", reason: unavailable },
+      { index: 1, outcome: "rejected", reason: unavailable },
+    ]);
+    expect(sleepRows()).toEqual([]);
+    expect(storeCounters()).toEqual(before);
+  });
+
+  it("validates each source's stream against its own schema when two sources declare the same stream name", async () => {
+    const schemaWith = (type: string) => ({
+      type: "object",
+      properties: { id: { type: "string" }, v: { type } },
+    });
+    ctx = await boot([
+      await writeDeclaration(
+        "alpha",
+        declarationWith("alpha", "profile", schemaWith("string")),
+      ),
+      await writeDeclaration(
+        "beta",
+        declarationWith("beta", "profile", schemaWith("number")),
+      ),
+    ]);
+    const token = await ownerToken(ctx);
+    const at = (source: string, id: string, v: unknown) => ({
+      instance: `${source}:${owner}`,
+      key: id,
+      data: { id, v },
+      emitted_at: "2026-09-01T00:00:00Z",
+    });
+
+    const alpha = await ingest(ctx, token, "profile", [
+      at("alpha", "p1", "text"),
+    ]);
+    expect(alpha.body.results).toEqual([{ index: 0, outcome: "accepted" }]);
+    const beta = await ingest(ctx, token, "profile", [
+      at("beta", "p1", "text"),
+      at("beta", "p2", 7),
+    ]);
+    expect(beta.body.results).toEqual([
+      {
+        index: 0,
+        outcome: "rejected",
+        reason: "schema_violation: /v must be number",
+      },
+      { index: 1, outcome: "accepted" },
+    ]);
+  });
+
+  it("keeps record-data keys out of the reason: only segments the schema names are shown", async () => {
+    const path = await writeDeclaration(
+      "whoop",
+      declarationWith("whoop", "sleep", {
+        type: "object",
+        $defs: {
+          contact: {
+            type: "object",
+            properties: { phone: { type: "string" } },
+          },
+        },
+        properties: {
+          id: { type: "string" },
+          contacts: {
+            type: "object",
+            additionalProperties: { $ref: "#/$defs/contact" },
+          },
+          tags: { type: "array", items: { type: "string" } },
+          byId: { type: "object", additionalProperties: { type: "string" } },
+        },
+      }),
+    );
+    ctx = await boot([path]);
+    const token = await ownerToken(ctx);
+
+    const result = await ingest(ctx, token, "sleep", [
+      envelope({ id: "s1", contacts: { "alice@example.com": { phone: 5 } } }),
+      envelope({ id: "s2", tags: ["a", 1] }),
+      envelope({ id: "s3", byId: { "5551234": 1 } }),
+      envelope({ id: "s4", contacts: { "bob@example.com": "x" } }),
+    ]);
+    expect(result.body.results).toEqual([
+      {
+        index: 0,
+        outcome: "rejected",
+        reason: "schema_violation: /contacts/*/phone must be string",
+      },
+      {
+        index: 1,
+        outcome: "rejected",
+        reason: "schema_violation: /tags/1 must be string",
+      },
+      {
+        index: 2,
+        outcome: "rejected",
+        reason: "schema_violation: /byId/* must be string",
+      },
+      {
+        index: 3,
+        outcome: "rejected",
+        reason: "schema_violation: /contacts/* must be object",
+      },
+    ]);
+    expect(JSON.stringify(result.body)).not.toMatch(/alice|bob|5551234/);
   });
 });

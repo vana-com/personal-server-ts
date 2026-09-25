@@ -1,3 +1,4 @@
+import type { RecordDataValidator } from "./ingest-plan.js";
 import type {
   ChangesSinceOptions,
   ChangesSincePage,
@@ -33,12 +34,16 @@ export interface PdppRecordStore {
    * the generation in this transaction and binds an empty instance to that
    * method with its first accepted write. Omitting the binding for an
    * instance already under method authority is rejected by that backend.
+   *
+   * `validateData` rejects an upsert whose data does not conform to the
+   * declared stream schema; that envelope writes nothing.
    */
   ingestBatch(
     envelopes: PdppRecordEnvelopeInput[],
     streamSemantics: (stream: string, instance: string) => StreamSemantics,
     primaryKeyFields: (stream: string, instance: string) => string[],
     binding?: { method: string; generation: number },
+    validateData?: RecordDataValidator,
   ): IngestResult;
 
   getRecord(

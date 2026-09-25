@@ -22,6 +22,7 @@ import {
   type PdppRecordEnvelopeInput,
   type PdppRecordRow,
   type PdppStoredRecord,
+  type RecordDataValidator,
   type StreamListing,
   type StreamSemantics,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
@@ -346,6 +347,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     emittedAt: string;
     envelopes: PdppRecordEnvelopeInput[];
     primaryKey: string[];
+    validateData?: RecordDataValidator;
   }): ReplaceStreamResult;
 } {
   db.pragma("journal_mode = WAL");
@@ -412,6 +414,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     streamSemantics: (stream: string, instance: string) => StreamSemantics,
     primaryKeyFields: (stream: string, instance: string) => string[],
     binding?: { method: string; generation: number },
+    validateData?: RecordDataValidator,
   ): IngestResult {
     const results: IngestOutcome[] = [];
 
@@ -465,6 +468,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
                 }
               : undefined;
           },
+          validateData,
         );
         results.push(plan.outcome);
         if (!plan.write) return;
@@ -571,6 +575,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     emittedAt: string;
     envelopes: PdppRecordEnvelopeInput[];
     primaryKey: string[];
+    validateData?: RecordDataValidator;
   }): ReplaceStreamResult {
     return db.transaction((): ReplaceStreamResult => {
       const shouldBind = checkInstanceBinding(
@@ -620,6 +625,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
                 }
               : undefined;
           },
+          input.validateData,
         );
         if (!plan.write) return void results.push(plan.outcome);
         const blobId = extractBlobId(plan.write.data);

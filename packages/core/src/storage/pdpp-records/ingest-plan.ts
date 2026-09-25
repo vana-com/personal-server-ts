@@ -32,12 +32,23 @@ export type IngestPlan =
       write: { recordKey: string; data: Record<string, unknown> | null };
     };
 
+/**
+ * Checks upsert `data` against the stream's declared schema (P5). Returns the
+ * rejection reason, or null when the data conforms.
+ */
+export type RecordDataValidator = (
+  stream: string,
+  instance: string,
+  data: Record<string, unknown>,
+) => string | null;
+
 export function planIngest(
   index: number,
   envelope: PdppRecordEnvelopeInput,
   semantics: StreamSemantics,
   primaryKey: string[],
   current: (recordKey: string) => CurrentContent | undefined,
+  validateData?: RecordDataValidator,
 ): IngestPlan {
   const reject = (reason: string): IngestPlan => ({
     outcome: { index, outcome: "rejected", reason },
@@ -93,6 +104,10 @@ export function planIngest(
     if (err instanceof RecordKeyError) return reject(err.message);
     throw err;
   }
+  // Before the equality check, so the outcome depends only on the data and
+  // the declared schema, never on what happens to be stored already.
+  const violation = validateData?.(envelope.stream, envelope.instance, data);
+  if (violation) return reject(violation);
 
   if (existing && !existing.deleted) {
     if (canonicalJson(existing.data) === canonicalJson(data)) {
