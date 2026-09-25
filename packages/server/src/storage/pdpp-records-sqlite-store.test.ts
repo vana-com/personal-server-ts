@@ -107,6 +107,42 @@ describe("sqlite record store", () => {
     });
   });
 
+  it("refuses a replace without a method and writes nothing", () => {
+    const raw = createSqliteRecordStore(db);
+    const count = () =>
+      db
+        .prepare(
+          `SELECT (SELECT COUNT(*) FROM pdpp_records) AS records,
+                  (SELECT COUNT(*) FROM pdpp_instance_binding) AS bindings,
+                  (SELECT value FROM pdpp_write_clock) AS clock`,
+        )
+        .get();
+    const before = count();
+    for (const method of ["", null as unknown as string]) {
+      expect(() =>
+        raw.replaceStream({
+          instance: "inst_1",
+          stream: "playlists",
+          method,
+          generation: 1,
+          emittedAt: "2026-04-01T00:00:00.000Z",
+          primaryKey: playlistsPk(),
+          envelopes: [
+            {
+              instance: "inst_1",
+              stream: "playlists",
+              key: "p1",
+              data: { id: "p1" },
+              emitted_at: "2026-04-01T00:00:00.000Z",
+            },
+          ],
+        }),
+      ).toThrow("method_required");
+    }
+    expect(count()).toEqual(before);
+    expect(raw.getInstanceBinding("inst_1").method).toBeNull();
+  });
+
   it("reads a binding without creating a row", () => {
     const before = db
       .prepare("SELECT COUNT(*) AS n FROM pdpp_instance_binding")

@@ -701,6 +701,10 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     method: string,
     generation: number,
   ): boolean {
+    // Only a named method may bind or write; an empty one would bind "".
+    if (typeof method !== "string" || method.length === 0) {
+      throw new PdppBindingError("method_required");
+    }
     const current = ensureBinding(db, instance);
     if (current.generation !== generation) {
       throw new PdppBindingError("binding_generation_mismatch");
