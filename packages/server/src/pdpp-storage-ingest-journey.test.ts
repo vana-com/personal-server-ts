@@ -996,3 +996,244 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
     }
   });
 });
+
+describe("P10c and method authority over HTTP", () => {
+  async function bootSwitchable() {
+    const ouraPath = await writeDeclaration("oura", OURA_DECLARATION);
+    const claudePath = await writeDeclaration("claude", CLAUDE_DECLARATION);
+    ctx = await boot([claudePath, ouraPath]);
+    return { ouraPath, claudePath, token: await ownerToken(ctx) };
+  }
+
+  async function seedEvents(
+    token: string,
+    instance: string,
+    keys: string[],
+    firstDay = 1,
+  ) {
+    const result = await ingest(
+      ctx!,
+      token,
+      "events",
+      keys.map((key, i) => ({
+        instance,
+        key,
+        data: { id: key, kind: "a" },
+        emitted_at: `2026-09-0${i + firstDay}T00:00:00Z`,
+      })),
+      "oura",
+    );
+    expect(outcomes(result.body)).toEqual(keys.map(() => "accepted"));
+  }
+
+  it("expires pre-reset list and changes_since page cursors, and never mixes A and B rows", async () => {
+    const { ouraPath, claudePath, token } = await bootSwitchable();
+    const instance = `oura:${owner}`;
+    await seedEvents(token, instance, ["a1", "a2", "a3"]);
+
+    const listPage = await read(
+      ctx!,
+      token,
+      "/v1/streams/events/records?order=asc&limit=1",
+    );
+    expect(listPage.body.data.map((r: any) => r.id)).toEqual(["a1"]);
+    const listCursor = listPage.body.next_cursor as string;
+    const changesPage = await read(
+      ctx!,
+      token,
+      "/v1/streams/events/records?changes_since=&limit=1",
+    );
+    const changesCursor = changesPage.body.next_cursor as string;
+    expect(changesCursor).toBeTruthy();
+
+    expect(
+      (await reset(ctx!, token, instance, "oura", 1, "oura-browser")).status,
+    ).toBe(200);
+    await ctx!.cleanup();
+    ctx = await boot(
+      [claudePath, ouraPath],
+      [
+        { method_id: "claude", declaration_path: claudePath },
+        { method_id: "oura-browser", declaration_path: ouraPath },
+      ],
+    );
+    const newToken = await ownerToken(ctx);
+    const bRecord = await ingest(
+      ctx,
+      newToken,
+      "events",
+      ["b1", "b2"].map((key, i) => ({
+        instance,
+        key,
+        data: { id: key, kind: "b" },
+        emitted_at: `2026-09-0${i + 8}T00:00:00Z`,
+      })),
+      "oura-browser",
+      2,
+    );
+    expect(outcomes(bRecord.body)).toEqual(["accepted", "accepted"]);
+
+    const staleList = await read(
+      ctx,
+      newToken,
+      `/v1/streams/events/records?order=asc&limit=1&cursor=${encodeURIComponent(listCursor)}`,
+    );
+    expect(staleList.status).toBe(410);
+    expect(staleList.body.error.code).toBe("cursor_expired");
+    const staleChanges = await read(
+      ctx,
+      newToken,
+      `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(changesCursor)}`,
+    );
+    expect(staleChanges.status).toBe(410);
+
+    // A listing started after the reset pages through B rows only. Its
+    // cursor is re-encoded by the route and must keep the store's horizon,
+    // or page 2 would be refused as a pre-reset cursor.
+    const bPage1 = await read(
+      ctx,
+      newToken,
+      "/v1/streams/events/records?order=asc&limit=1",
+    );
+    expect(bPage1.body.data.map((r: any) => r.id)).toEqual(["b1"]);
+    const bPage2 = await read(
+      ctx,
+      newToken,
+      `/v1/streams/events/records?order=asc&limit=1&cursor=${encodeURIComponent(bPage1.body.next_cursor)}`,
+    );
+    expect(bPage2.status).toBe(200);
+    expect(bPage2.body.data.map((r: any) => r.id)).toEqual(["b2"]);
+  });
+
+  it("keeps a keyset cursor valid across later writes without a reset", async () => {
+    const { token } = await bootSwitchable();
+    const instance = `oura:${owner}`;
+    await seedEvents(token, instance, ["a1", "a2"]);
+    const page1 = await read(
+      ctx!,
+      token,
+      "/v1/streams/events/records?order=asc&limit=1",
+    );
+    await seedEvents(token, instance, ["a3"], 3);
+    const page2 = await read(
+      ctx!,
+      token,
+      `/v1/streams/events/records?order=asc&limit=5&cursor=${encodeURIComponent(page1.body.next_cursor)}`,
+    );
+    expect(page2.status).toBe(200);
+    expect(page2.body.data.map((r: any) => r.id)).toEqual(["a2", "a3"]);
+  });
+
+  it("rejects an unknown method and another source's method as method_inactive", async () => {
+    const { token } = await bootSwitchable();
+    const instance = `oura:${owner}`;
+    for (const method of ["no-such-method", "claude"]) {
+      const response = await ingest(
+        ctx!,
+        token,
+        "events",
+        {
+          instance,
+          key: `k-${method}`,
+          data: { id: `k-${method}`, kind: "x" },
+          emitted_at: "2026-09-01T00:00:00Z",
+        },
+        method,
+      );
+      expect(response.status).toBe(409);
+      expect((response.body as any).error.code).toBe("method_inactive");
+      const blob = await uploadBlob(
+        ctx!,
+        token,
+        instance,
+        method,
+        1,
+        new TextEncoder().encode(`bytes for ${method}`),
+      );
+      expect(blob.status).toBe(409);
+      expect((await blob.json()).error.code).toBe("method_inactive");
+    }
+    expect(storeCounters()).toEqual({ clock: 0, changes: 0 });
+    expect(blobStoreCounters()).toEqual({ metadata: 0, bytes: 0, claims: 0 });
+  });
+
+  it("requires an owner reset before a configured method writes to a migrated instance", async () => {
+    const { ouraPath, claudePath } = await bootSwitchable();
+    const instance = `oura:${owner}`;
+    await ctx!.cleanup();
+    // A pre-binding instance: rows exist, the binding has no method.
+    const db = new Database(join(tempDir, "index.db"));
+    try {
+      db.prepare(
+        `INSERT INTO pdpp_records (instance, stream, record_key, data, version, emitted_at, deleted, deleted_at, blob_id)
+         VALUES (?, 'events', 'legacy', ?, 1, '2026-08-01T00:00:00Z', 0, NULL, NULL)`,
+      ).run(instance, JSON.stringify({ id: "legacy", kind: "old" }));
+    } finally {
+      db.close();
+    }
+    ctx = await boot([claudePath, ouraPath]);
+    const token = await ownerToken(ctx);
+
+    const binding = await read(
+      ctx,
+      token,
+      `/pdpp/instances/${encodeURIComponent(instance)}/binding`,
+    );
+    expect(binding.body).toMatchObject({
+      method: null,
+      generation: 1,
+      empty: false,
+    });
+    const write = await ingest(ctx, token, "events", {
+      instance,
+      key: "new",
+      data: { id: "new", kind: "a" },
+      emitted_at: "2026-09-01T00:00:00Z",
+    });
+    expect(write.status).toBe(409);
+    expect((write.body as any).error.code).toBe("binding_required");
+    const blob = await uploadBlob(
+      ctx,
+      token,
+      instance,
+      "oura",
+      1,
+      new TextEncoder().encode("migrated bytes"),
+    );
+    expect(blob.status).toBe(409);
+    expect((await blob.json()).error.code).toBe("binding_required");
+
+    const adopted = await ctx.app.request(
+      `/pdpp/instances/${encodeURIComponent(instance)}/reset`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          expected_method: null,
+          expected_generation: 1,
+          next_method: "oura",
+        }),
+      },
+    );
+    expect(adopted.status).toBe(200);
+    const after = await ingest(
+      ctx,
+      token,
+      "events",
+      {
+        instance,
+        key: "new",
+        data: { id: "new", kind: "a" },
+        emitted_at: "2026-09-01T00:00:00Z",
+      },
+      "oura",
+      2,
+    );
+    expect(outcomes(after.body)).toEqual(["accepted"]);
+    const listed = await read(ctx, token, "/v1/streams/events/records");
+    expect(listed.body.data.map((r: any) => r.id)).toEqual(["new"]);
+  });
+});

@@ -1012,6 +1012,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const visible: PdppRecordRow[] = [];
       let pageCursor = cursor;
       let storeHasMore = false;
+      let horizon: string | undefined;
       do {
         const page = deps.store.listRecords(stream, {
           instanceIds: effectiveInstanceIds,
@@ -1030,6 +1031,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           }
           if (visible.length > limit) break;
         }
+        horizon ??= page.horizon;
         pageCursor = page.nextCursor ?? undefined;
         storeHasMore = page.hasMore;
       } while (visible.length <= limit && storeHasMore && pageCursor);
@@ -1060,6 +1062,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
                 // (emitted_at, record_key).
                 sortValue: last.emittedAt,
                 recordKey: last.recordKey,
+                // Carry the store's reset fence (P10c) to the next page.
+                ...(horizon !== undefined && { horizon }),
               }),
             }),
           data: data.map((row) => toRecordJson(stream, row, fields)),
