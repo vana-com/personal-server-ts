@@ -17,7 +17,8 @@ export interface PdppRecordEnvelopeInput {
   key: EnvelopeKey;
   data: Record<string, unknown> | null;
   emitted_at: string;
-  op?: "upsert" | "delete";
+  /** Absent or `null` means upsert. */
+  op?: "upsert" | "delete" | null;
 }
 
 export interface PdppStoredRecord {

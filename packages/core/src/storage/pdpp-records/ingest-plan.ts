@@ -49,8 +49,10 @@ export function planIngest(
   if (typeof envelope.emitted_at !== "string" || !envelope.emitted_at) {
     return reject("emitted_at must be a non-empty string");
   }
+  // JSON `null` means absent, like a missing field: Desktop's blob host
+  // serializes `Option::None` as `"op": null`. Absent `op` is an upsert.
   if (
-    envelope.op !== undefined &&
+    envelope.op != null &&
     envelope.op !== "upsert" &&
     envelope.op !== "delete"
   ) {

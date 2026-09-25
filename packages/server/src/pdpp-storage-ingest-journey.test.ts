@@ -442,6 +442,27 @@ describe("P3: exact per-index outcomes", () => {
     expect(stored.body.emitted_at).toBe("2026-09-01T00:00:00Z");
   });
 
+  it("treats op: null as absent (an upsert) and still rejects an invalid op", async () => {
+    ctx = await bootBoth();
+    const token = await ownerToken(ctx);
+    const result = await ingest(ctx, token, "profile", [
+      { ...upsert("k1", { email: "a" }, "2026-09-01T00:00:00Z"), op: null },
+      { ...upsert("k1", { email: "a" }, "2026-09-02T00:00:00Z"), op: null },
+      { ...upsert("k2", {}, "2026-09-01T00:00:00Z"), op: "remove" },
+    ]);
+    expect(result.body.results).toEqual([
+      { index: 0, outcome: "accepted" },
+      { index: 1, outcome: "unchanged" },
+      {
+        index: 2,
+        outcome: "rejected",
+        reason: "op must be 'upsert' or 'delete'",
+      },
+    ]);
+    const stored = await read(ctx, token, "/v1/streams/profile/records/k1");
+    expect(stored.body.data).toEqual({ user_id: "k1", email: "a" });
+  });
+
   it("reports malformed envelopes by index without failing the request", async () => {
     ctx = await bootBoth();
     const token = await ownerToken(ctx);
