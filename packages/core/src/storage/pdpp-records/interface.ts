@@ -28,11 +28,17 @@ export interface PdppRecordStore {
    *
    * Declarations are looked up per envelope by `(stream, instance)`, since
    * one stream name can belong to several sources.
+   *
+   * The SQLite PS backend also accepts a method and generation. It validates
+   * the generation in this transaction and binds an empty instance to that
+   * method with its first accepted write. Omitting the binding for an
+   * instance already under method authority is rejected by that backend.
    */
   ingestBatch(
     envelopes: PdppRecordEnvelopeInput[],
     streamSemantics: (stream: string, instance: string) => StreamSemantics,
     primaryKeyFields: (stream: string, instance: string) => string[],
+    binding?: { method: string; generation: number },
   ): IngestResult;
 
   getRecord(

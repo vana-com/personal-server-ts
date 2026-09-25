@@ -54,6 +54,8 @@ import { singleInstanceInventory } from "./deployment.js";
 
 export interface PdppRecordsDeps {
   store: PdppRecordStore;
+  bindingStore: ReturnType<typeof createSqliteRecordStore>;
+  configuredMethods: Map<string, string[]>;
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
   instancesForSubject?: (subjectId: string) => string[];
@@ -74,6 +76,7 @@ export interface CreatePdppRecordsDepsOptions {
   serverOwner: `0x${string}` | undefined;
   resource: string;
   logger: Logger;
+  configuredMethods?: { sourceId: string; methodId: string }[];
 }
 
 export function createPdppRecordsDeps(
@@ -126,6 +129,16 @@ export function createPdppRecordsDeps(
     return undefined;
   }
   const instances = sources.map((source) => source.instance);
+  const configuredMethods = new Map<string, string[]>();
+  for (const configured of options.configuredMethods ?? []) {
+    const source = sources.find(
+      (candidate) => candidate.sourceId === configured.sourceId,
+    );
+    if (!source) continue;
+    const methodIds = configuredMethods.get(source.instance) ?? [];
+    methodIds.push(configured.methodId);
+    configuredMethods.set(source.instance, methodIds);
+  }
 
   logger.info(
     { streams: streams.map((s) => s.name), resource: options.resource },
@@ -133,9 +146,14 @@ export function createPdppRecordsDeps(
   );
 
   const store = createSqliteRecordStore(options.db);
+  for (const instance of configuredMethods.keys()) {
+    store.getInstanceBinding(instance);
+  }
 
   return {
     store,
+    bindingStore: store,
+    configuredMethods,
     auth: coLocatedAuthorizationService(pdppAuth),
     declarations: createSourceStreamDeclarationRegistry(sources),
     // This deployment has exactly one owner. A subject other than that

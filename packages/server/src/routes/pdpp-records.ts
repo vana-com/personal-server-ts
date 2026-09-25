@@ -1,5 +1,6 @@
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
+import { PdppBindingError } from "../storage/pdpp-records-sqlite-store.js";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import type {
@@ -121,6 +122,16 @@ function parseIngestBody(bytes: Uint8Array): unknown {
 
 export interface PdppRecordsRouteDeps {
   store: PdppRecordStore;
+  bindingStore?: {
+    storeBlobBytesForInstance(input: {
+      instance: string;
+      method: string;
+      generation: number;
+      bytes: Uint8Array;
+      mimeType: string;
+    }): ReturnType<PdppRecordStore["storeBlobBytes"]>;
+  };
+  configuredMethods?: Map<string, string[]>;
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
   /** The exact owner of this Personal Server; required for ingest. */
@@ -1253,6 +1264,19 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const body = parseIngestBody(
         await readBoundedBody(c.req.raw, MAX_INGEST_BODY_BYTES, "Ingest"),
       );
+      const method = c.req.query("method");
+      const rawGeneration = c.req.query("binding_generation");
+      const generation =
+        rawGeneration === undefined ? NaN : Number(rawGeneration);
+      if (
+        deps.bindingStore &&
+        (!method || !Number.isSafeInteger(generation) || generation < 1)
+      ) {
+        throw new PdppError(
+          "invalid_request",
+          "method and positive binding_generation query parameters are required",
+        );
+      }
       const entries = Array.isArray(body) ? body : [body];
 
       // Each entry gets exactly one outcome, by input index. Entries that
@@ -1286,6 +1310,15 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             "Ingest requires an owned instance",
           );
         }
+        if (deps.bindingStore && method) {
+          const configured = deps.configuredMethods?.get(e.instance) ?? [];
+          if (configured.length > 1) {
+            throw new PdppBindingError("config_multiple_active_methods");
+          }
+          if (configured.length !== 1 || configured[0] !== method) {
+            throw new PdppBindingError("method_inactive");
+          }
+        }
         if (!deps.declarations.forInstance(e.instance, stream)) {
           results[index] = {
             index,
@@ -1313,6 +1346,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         admitted.map((a) => a.envelope),
         (_stream, instance) => declarationFor(instance).semantics,
         (_stream, instance) => declarationFor(instance).primaryKey,
+        deps.bindingStore && method ? { method, generation } : undefined,
       );
       stored.results.forEach((result, position) => {
         const index = admitted[position].index;
@@ -1331,6 +1365,16 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
       );
     } catch (err) {
+      if (err instanceof PdppBindingError) {
+        return c.json(
+          {
+            error: { code: err.reason, message: err.reason },
+            request_id: reqId,
+          },
+          409,
+          { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+        );
+      }
       return sendError(
         c,
         mapAndLog(deps, "POST /v1/streams/:stream/records/ingest", reqId, err),
@@ -1374,13 +1418,55 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         );
       }
       const mimeType = blobMediaType(c.req.header("content-type"));
+      const instance = c.req.query("instance");
+      const method = c.req.query("method");
+      const rawGeneration = c.req.query("binding_generation");
+      const generation =
+        rawGeneration === undefined ? NaN : Number(rawGeneration);
+      if (
+        deps.bindingStore &&
+        (!instance ||
+          !deps.instancesForSubject?.(context!.subjectId).includes(instance))
+      ) {
+        throw new PdppError(
+          "authentication_error",
+          "Blob ingest requires an owned instance",
+        );
+      }
+      if (
+        deps.bindingStore &&
+        (!method || !Number.isSafeInteger(generation) || generation < 1)
+      ) {
+        throw new PdppError(
+          "invalid_request",
+          "instance, method, and positive binding_generation query parameters are required",
+        );
+      }
+      if (deps.bindingStore && method) {
+        const configured = deps.configuredMethods?.get(instance!) ?? [];
+        if (configured.length > 1) {
+          throw new PdppBindingError("config_multiple_active_methods");
+        }
+        if (configured.length !== 1 || configured[0] !== method) {
+          throw new PdppBindingError("method_inactive");
+        }
+      }
       const bytes = await readBoundedBody(
         c.req.raw,
         MAX_BLOB_UPLOAD_BYTES,
         "Blob",
       );
 
-      const meta = deps.store.storeBlobBytes(bytes, mimeType);
+      const meta =
+        deps.bindingStore && method
+          ? deps.bindingStore.storeBlobBytesForInstance({
+              instance: instance!,
+              method,
+              generation,
+              bytes,
+              mimeType,
+            })
+          : deps.store.storeBlobBytes(bytes, mimeType);
       return c.json(
         {
           blob_id: meta.blobId,
@@ -1392,6 +1478,16 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
       );
     } catch (err) {
+      if (err instanceof PdppBindingError) {
+        return c.json(
+          {
+            error: { code: err.reason, message: err.reason },
+            request_id: reqId,
+          },
+          409,
+          { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+        );
+      }
       return sendError(
         c,
         mapAndLog(deps, "POST /v1/blobs/ingest", reqId, err),

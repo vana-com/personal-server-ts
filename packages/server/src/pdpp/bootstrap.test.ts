@@ -99,6 +99,10 @@ function pdppConfig(
     pdpp: {
       enabled: true,
       declarationPaths,
+      methods: declarationPaths.map((declaration_path) => ({
+        method_id: "spotify",
+        declaration_path,
+      })),
       // redirect_uri is validated by exact match against this registration.
       clients,
     },
@@ -939,7 +943,7 @@ describe("operator per-client grant lifetime policy", () => {
   ): Promise<void> {
     const instance = `spotify:${await ownerSubjectId()}`;
     const response = await ctx!.app.request(
-      "/v1/streams/top_artists/records/ingest",
+      "/v1/streams/top_artists/records/ingest?method=spotify&binding_generation=1",
       {
         method: "POST",
         headers: {

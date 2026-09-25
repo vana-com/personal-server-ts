@@ -16,7 +16,7 @@
 
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { Logger } from "pino";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
@@ -75,6 +75,8 @@ export type PdppAuthBootResult = PdppAuthRouteDeps & {
    * are those original bytes, carried forward from boot.
    */
   retainedDocuments: Map<string, string>;
+  /** Configured artifact methods resolved through their retained declaration paths. */
+  configuredMethods: { sourceId: string; methodId: string }[];
   /**
    * The live registry behind `resolveDeclaration`. Handed out so the
    * submission route can write to the same object the AS reads from — a
@@ -115,6 +117,27 @@ export async function createPdppAuthDeps(
     config.pdpp.declarationPaths,
     logger,
   );
+  const declarationSourceByPath = new Map(
+    declarations
+      .filter((declaration) => declaration.path)
+      .map((declaration) => [resolve(declaration.path!), declaration.sourceId]),
+  );
+  const configuredMethods = config.pdpp.methods.flatMap((method) => {
+    const sourceId = declarationSourceByPath.get(
+      resolve(method.declaration_path),
+    );
+    if (!sourceId) {
+      logger.warn(
+        {
+          declarationPath: method.declaration_path,
+          methodId: method.method_id,
+        },
+        "PDPP method does not reference a retained declaration — method is inactive",
+      );
+      return [];
+    }
+    return [{ sourceId, methodId: method.method_id }];
+  });
 
   // The durable registry the submission route writes to, seeded from the
   // configured paths. Seeds and submissions share one validator; only
@@ -189,6 +212,7 @@ export async function createPdppAuthDeps(
     sessions,
     retainedDeclarations: registry.retained,
     retainedDocuments: registry.retainedDocuments,
+    configuredMethods,
     resolveDeclaration: registry.resolve,
     declarationRegistry,
     supportedConnectors,
@@ -327,7 +351,7 @@ async function readDeclarations(
         );
         continue;
       }
-      out.push({ sourceId, document });
+      out.push({ sourceId, document, path });
     } catch (err) {
       logger.warn(
         { path, err: (err as Error).message },

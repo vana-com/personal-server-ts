@@ -78,6 +78,7 @@ import { enclaveJobRoutes } from "./routes/enclave-jobs.js";
 import type { JobRequestEnvelope } from "@opendatalabs/vana-sdk/protocol/jobs";
 import type { JobExecuteResponse } from "./jobs/types.js";
 import { pdppRecordsRoutes } from "./routes/pdpp-records.js";
+import { pdppInstanceBindingRoutes } from "./routes/pdpp-instance-bindings.js";
 import { pdppBlobsRoutes } from "./routes/pdpp-blobs.js";
 import { pdppWellKnownRoutes } from "./routes/pdpp-well-known.js";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
@@ -215,6 +216,37 @@ export interface AppDeps {
    */
   pdpp?: {
     store: PdppRecordStore;
+    bindingStore: PdppRecordStore & {
+      getInstanceBinding(instance: string): {
+        instance: string;
+        method: string | null;
+        generation: number;
+        resetClock: number;
+        empty?: boolean;
+      };
+      resetInstanceBinding(input: {
+        instance: string;
+        expectedMethod: string | null;
+        expectedGeneration: number;
+        nextMethod: string | null;
+      }): {
+        binding: {
+          instance: string;
+          method: string | null;
+          generation: number;
+          resetClock: number;
+        };
+        alreadyReset: boolean;
+      };
+      storeBlobBytesForInstance(input: {
+        instance: string;
+        method: string;
+        generation: number;
+        bytes: Uint8Array;
+        mimeType: string;
+      }): ReturnType<PdppRecordStore["storeBlobBytes"]>;
+    };
+    configuredMethods: Map<string, string[]>;
     auth: PdppAuthorizationService;
     declarations: StreamDeclarationRegistry;
     instancesForSubject?: (subjectId: string) => string[];
@@ -279,6 +311,16 @@ export function createApp(deps: AppDeps): Hono {
   // bundle is supplied.
   if (deps.pdpp) {
     app.route(
+      "/",
+      pdppInstanceBindingRoutes({
+        store: deps.pdpp.bindingStore,
+        auth: deps.pdpp.auth,
+        ownerSubjectId: deps.serverOwner!,
+        instancesForSubject: deps.pdpp.instancesForSubject!,
+        configuredMethods: deps.pdpp.configuredMethods,
+      }),
+    );
+    app.route(
       "/v1",
       pdppRecordsRoutes({
         store: deps.pdpp.store,
@@ -286,6 +328,8 @@ export function createApp(deps: AppDeps): Hono {
         declarations: deps.pdpp.declarations,
         ownerSubjectId: deps.serverOwner,
         instancesForSubject: deps.pdpp.instancesForSubject,
+        bindingStore: deps.pdpp.bindingStore,
+        configuredMethods: deps.pdpp.configuredMethods,
         // An `api_error` on the resource surface is a server fault and must
         // leave a correlatable line behind; the route never reaches the
         // global onError below, because it maps its own errors.
