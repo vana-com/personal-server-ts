@@ -1,7 +1,9 @@
 import type { Database } from "better-sqlite3";
 import { createHash } from "node:crypto";
 import {
+  encodeRecordKey,
   planIngest,
+  RecordKeyError,
   summarizeIngest,
   decodeCursor,
   encodeCursor,
@@ -30,6 +32,13 @@ export interface PdppInstanceBinding {
   generation: number;
   resetClock: number;
   empty?: boolean;
+}
+
+/** Outcome of a P7 stream replace. `applied: false` means nothing was written. */
+export interface ReplaceStreamResult extends IngestResult {
+  applied: boolean;
+  /** Live keys tombstoned because the snapshot lacked them. */
+  deleted: number;
 }
 
 export class PdppBindingError extends Error {
@@ -329,6 +338,15 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     bytes: Uint8Array;
     mimeType: string;
   }): PdppBlobMeta;
+  replaceStream(input: {
+    instance: string;
+    stream: string;
+    method: string;
+    generation: number;
+    emittedAt: string;
+    envelopes: PdppRecordEnvelopeInput[];
+    primaryKey: string[];
+  }): ReplaceStreamResult;
 } {
   db.pragma("journal_mode = WAL");
   migrate(db);
@@ -456,11 +474,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         if (
           binding &&
           blobId &&
-          !db
-            .prepare(
-              "SELECT 1 FROM pdpp_blob_claims WHERE blob_id = ? AND instance = ? AND generation = (SELECT generation FROM pdpp_instance_binding WHERE instance = ?)",
-            )
-            .get(blobId, envelope.instance, envelope.instance)
+          !blobClaimedByCurrentGeneration(blobId, envelope.instance)
         ) {
           results[results.length - 1] = {
             index,
@@ -469,45 +483,192 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           };
           return;
         }
-        const deleted = data === null;
         wroteAny = true;
-        const version =
-          latestVersion(envelope.instance, envelope.stream, recordKey) + 1;
-        const writtenAt = nextWriteSeq.get() as { value: number };
-        const dataJson = deleted ? null : JSON.stringify(data);
-        const deletedAt = deleted ? envelope.emitted_at : null;
-        upsertCurrentStmt.run({
-          instance: envelope.instance,
-          stream: envelope.stream,
-          record_key: recordKey,
-          data: dataJson,
-          version,
-          emitted_at: envelope.emitted_at,
-          deleted: deleted ? 1 : 0,
-          deleted_at: deletedAt,
-          blob_id: blobId,
-        });
-        insertHistoryStmt.run({
-          instance: envelope.instance,
-          stream: envelope.stream,
-          record_key: recordKey,
-          version,
-          data: dataJson,
-          emitted_at: envelope.emitted_at,
-          deleted: deleted ? 1 : 0,
-          deleted_at: deletedAt,
-          written_at: writtenAt.value,
-        });
+        writeVersion(
+          envelope.instance,
+          envelope.stream,
+          recordKey,
+          data,
+          envelope.emitted_at,
+        );
       });
       if (shouldBind && binding && wroteAny) {
-        db.prepare(
-          "UPDATE pdpp_instance_binding SET method = ? WHERE instance = ? AND generation = ? AND method IS NULL",
-        ).run(binding.method, envelopes[0].instance, binding.generation);
+        bindMethod(envelopes[0].instance, binding);
       }
     });
 
     runBatch();
     return summarizeIngest(results);
+  }
+
+  function blobClaimedByCurrentGeneration(
+    blobId: string,
+    instance: string,
+  ): boolean {
+    return !!db
+      .prepare(
+        "SELECT 1 FROM pdpp_blob_claims WHERE blob_id = ? AND instance = ? AND generation = (SELECT generation FROM pdpp_instance_binding WHERE instance = ?)",
+      )
+      .get(blobId, instance, instance);
+  }
+
+  /** Writes the next version of a key: `data === null` is a tombstone. */
+  function writeVersion(
+    instance: string,
+    stream: string,
+    recordKey: string,
+    data: Record<string, unknown> | null,
+    emittedAt: string,
+  ): void {
+    const deleted = data === null;
+    const version = latestVersion(instance, stream, recordKey) + 1;
+    const writtenAt = nextWriteSeq.get() as { value: number };
+    const dataJson = deleted ? null : JSON.stringify(data);
+    const deletedAt = deleted ? emittedAt : null;
+    upsertCurrentStmt.run({
+      instance,
+      stream,
+      record_key: recordKey,
+      data: dataJson,
+      version,
+      emitted_at: emittedAt,
+      deleted: deleted ? 1 : 0,
+      deleted_at: deletedAt,
+      blob_id: extractBlobId(data),
+    });
+    insertHistoryStmt.run({
+      instance,
+      stream,
+      record_key: recordKey,
+      version,
+      data: dataJson,
+      emitted_at: emittedAt,
+      deleted: deleted ? 1 : 0,
+      deleted_at: deletedAt,
+      written_at: writtenAt.value,
+    });
+  }
+
+  function bindMethod(
+    instance: string,
+    binding: { method: string; generation: number },
+  ): void {
+    db.prepare(
+      "UPDATE pdpp_instance_binding SET method = ? WHERE instance = ? AND generation = ? AND method IS NULL",
+    ).run(binding.method, instance, binding.generation);
+  }
+
+  // P7: the records are the complete live set of (instance, stream) from a
+  // covered full refresh by the bound method. Under Q1 every live row of the
+  // instance was written by that method in this generation, so a live key the
+  // snapshot lacks has no other evidence and is tombstoned. Any rejected
+  // record rejects the whole request before anything is written.
+  function replaceStream(input: {
+    instance: string;
+    stream: string;
+    method: string;
+    generation: number;
+    emittedAt: string;
+    envelopes: PdppRecordEnvelopeInput[];
+    primaryKey: string[];
+  }): ReplaceStreamResult {
+    return db.transaction((): ReplaceStreamResult => {
+      const shouldBind = checkInstanceBinding(
+        input.instance,
+        input.method,
+        input.generation,
+      );
+
+      const seen = new Set<string>();
+      const results: IngestOutcome[] = [];
+      const writes: {
+        recordKey: string;
+        data: Record<string, unknown>;
+        emittedAt: string;
+      }[] = [];
+      input.envelopes.forEach((envelope, index) => {
+        const reject = (reason: string) =>
+          results.push({ index, outcome: "rejected", reason });
+        if (envelope.op === "delete") {
+          return reject("replace records must be upserts");
+        }
+        let recordKey: string;
+        try {
+          recordKey = encodeRecordKey(envelope.key);
+        } catch (err) {
+          if (err instanceof RecordKeyError) return reject(err.message);
+          throw err;
+        }
+        if (seen.has(recordKey)) return reject("duplicate key in snapshot");
+        seen.add(recordKey);
+
+        const plan = planIngest(
+          index,
+          envelope,
+          "mutable_state",
+          input.primaryKey,
+          (key) => {
+            const row = getCurrentStmt.get(
+              input.instance,
+              input.stream,
+              key,
+            ) as RecordRowDb | undefined;
+            return row
+              ? {
+                  deleted: row.deleted === 1,
+                  data: row.data ? JSON.parse(row.data) : null,
+                }
+              : undefined;
+          },
+        );
+        if (!plan.write) return void results.push(plan.outcome);
+        const blobId = extractBlobId(plan.write.data);
+        if (blobId && !blobClaimedByCurrentGeneration(blobId, input.instance)) {
+          return reject("blob_unclaimed");
+        }
+        results.push(plan.outcome);
+        writes.push({
+          recordKey,
+          data: plan.write.data!,
+          emittedAt: envelope.emitted_at,
+        });
+      });
+
+      const summary = summarizeIngest(results);
+      if (summary.rejected.length > 0) {
+        return { ...summary, applied: false, deleted: 0 };
+      }
+
+      for (const write of writes) {
+        writeVersion(
+          input.instance,
+          input.stream,
+          write.recordKey,
+          write.data,
+          write.emittedAt,
+        );
+      }
+      const missing = (
+        db
+          .prepare(
+            "SELECT record_key FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
+          )
+          .all(input.instance, input.stream) as { record_key: string }[]
+      ).filter(({ record_key }) => !seen.has(record_key));
+      for (const { record_key } of missing) {
+        writeVersion(
+          input.instance,
+          input.stream,
+          record_key,
+          null,
+          input.emittedAt,
+        );
+      }
+      if (shouldBind && (writes.length > 0 || missing.length > 0)) {
+        bindMethod(input.instance, input);
+      }
+      return { ...summary, applied: true, deleted: missing.length };
+    })();
   }
 
   function checkBinding(
@@ -517,7 +678,15 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   ): boolean {
     const instances = new Set(envelopes.map((envelope) => envelope.instance));
     if (instances.size !== 1) throw new PdppBindingError("invalid_request");
-    const instance = [...instances][0];
+    return checkInstanceBinding([...instances][0], method, generation);
+  }
+
+  /** P8a checks (2) and (3); true when this write binds an empty instance. */
+  function checkInstanceBinding(
+    instance: string,
+    method: string,
+    generation: number,
+  ): boolean {
     const current = ensureBinding(db, instance);
     if (current.generation !== generation) {
       throw new PdppBindingError("binding_generation_mismatch");
@@ -1054,6 +1223,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     getInstanceBinding,
     resetInstanceBinding,
     storeBlobBytesForInstance,
+    replaceStream,
     getRecord,
     listRecords,
     deleteRecord,
