@@ -84,6 +84,8 @@ export interface ListRecordsPage {
   data: PdppStoredRecord[];
   hasMore: boolean;
   nextCursor?: string;
+  /** Write clock this listing is fenced at; a re-encoded cursor must carry it. */
+  horizon?: string;
 }
 
 export interface ChangesSinceOptions {

@@ -337,6 +337,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   const nextWriteSeq = db.prepare(
     "UPDATE pdpp_write_clock SET value = value + 1 WHERE id = 1 RETURNING value",
   );
+  const readWriteClockStmt = db.prepare(
+    "SELECT value FROM pdpp_write_clock WHERE id = 1",
+  );
+  const readWriteClock = () =>
+    (readWriteClockStmt.get() as { value: number }).value;
 
   const getCurrentStmt = db.prepare(
     "SELECT * FROM pdpp_records WHERE instance = ? AND stream = ? AND record_key = ?",
@@ -592,16 +597,54 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     return toRow(row) as PdppStoredRecord;
   }
 
+  // P10c: a token whose horizon is below the reset_clock of any instance it
+  // reads spans a reset. `null` means the token predates horizons, so any
+  // reset of a read instance expires it.
+  function assertNotResetSince(
+    instanceIds: string[],
+    horizons: Array<number | null>,
+  ): void {
+    if (instanceIds.length === 0) return;
+    const resetClocks = db
+      .prepare(
+        `SELECT reset_clock FROM pdpp_instance_binding
+         WHERE instance IN (${instanceIds.map(() => "?").join(",")}) AND reset_clock > 0`,
+      )
+      .all(...instanceIds) as { reset_clock: number }[];
+    if (
+      resetClocks.some(({ reset_clock }) =>
+        horizons.some((h) => h === null || h < reset_clock),
+      )
+    ) {
+      throw new CursorExpiredError();
+    }
+  }
+
   function listRecords(
     stream: string,
     options: ListRecordsOptions,
   ): ListRecordsPage {
     let startAfter: { val: string; key: string } | null = null;
+    let horizon: number;
     if (options.cursor) {
       const payload = decodeCursor(options.cursor);
       if (payload.kind !== "list") throw new InvalidCursorError();
       if (payload.order !== options.order) throw new InvalidCursorError();
+      if (
+        payload.horizon !== undefined &&
+        !/^\d+$/.test(String(payload.horizon))
+      ) {
+        throw new InvalidCursorError();
+      }
+      const cursorHorizon =
+        payload.horizon === undefined ? null : Number(payload.horizon);
+      assertNotResetSince(options.instanceIds, [cursorHorizon]);
+      // A legacy cursor that survives the fence read no reset instance; it
+      // is anchored at the current clock from here on.
+      horizon = cursorHorizon ?? readWriteClock();
       startAfter = { val: payload.sortValue ?? "", key: payload.recordKey };
+    } else {
+      horizon = readWriteClock();
     }
 
     const placeholders = options.instanceIds.map(() => "?").join(",");
@@ -638,8 +681,10 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
               order: options.order,
               sortValue: last.emitted_at,
               recordKey: last.record_key,
+              horizon: String(horizon),
             })
           : undefined,
+      horizon: String(horizon),
     };
   }
 
@@ -719,24 +764,10 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       horizon = (nextWriteSeq.get() as { value: number }).value;
     }
 
-    const resetClocks =
-      options.instanceIds.length === 0
-        ? []
-        : (db
-            .prepare(
-              `SELECT reset_clock FROM pdpp_instance_binding
-               WHERE instance IN (${options.instanceIds.map(() => "?").join(",")}) AND reset_clock > 0`,
-            )
-            .all(...options.instanceIds) as { reset_clock: number }[]);
-    if (
-      resetClocks.some(
-        ({ reset_clock }) =>
-          horizon < reset_clock ||
-          (sinceHorizon !== null && sinceHorizon < reset_clock),
-      )
-    ) {
-      throw new CursorExpiredError();
-    }
+    assertNotResetSince(options.instanceIds, [
+      horizon,
+      sinceHorizon ?? horizon,
+    ]);
 
     const placeholders = options.instanceIds.map(() => "?").join(",");
 

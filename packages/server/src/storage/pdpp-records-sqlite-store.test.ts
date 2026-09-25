@@ -1,6 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import Database from "better-sqlite3";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import {
+  CursorExpiredError,
+  encodeCursor,
+} from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type { PdppRecordEnvelopeInput } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
 function messagesSemantics() {
@@ -611,6 +615,240 @@ describe("sqlite record store", () => {
       expect(() => createSqliteRecordStore(db)).toThrow(
         /newer than this build supports/,
       );
+    });
+  });
+
+  describe("reset fence (P8b, P8c, P10c)", () => {
+    const A = { method: "method_a", generation: 1 };
+    const bytes = (text: string) => new TextEncoder().encode(text);
+    const envelope = (
+      instance: string,
+      key: string,
+      emittedAt: string,
+      extra: Record<string, unknown> = {},
+    ): PdppRecordEnvelopeInput => ({
+      instance,
+      stream: "messages",
+      key,
+      data: { id: key, ...extra },
+      emitted_at: emittedAt,
+    });
+    const count = (sql: string, ...params: unknown[]) =>
+      (db.prepare(sql).get(...params) as { n: number }).n;
+    const snapshot = () => ({
+      records: count("SELECT COUNT(*) AS n FROM pdpp_records"),
+      changes: count("SELECT COUNT(*) AS n FROM pdpp_record_changes"),
+      blobs: count("SELECT COUNT(*) AS n FROM pdpp_blobs"),
+      bytes: count("SELECT COUNT(*) AS n FROM pdpp_blob_bytes"),
+      claims: count("SELECT COUNT(*) AS n FROM pdpp_blob_claims"),
+      clock: count("SELECT value AS n FROM pdpp_write_clock WHERE id = 1"),
+      binding: db
+        .prepare("SELECT * FROM pdpp_instance_binding ORDER BY instance")
+        .all(),
+    });
+    const seedA = () => {
+      store.getInstanceBinding("inst_a");
+      const blob = store.storeBlobBytesForInstance({
+        instance: "inst_a",
+        ...A,
+        bytes: bytes("A image"),
+        mimeType: "image/png",
+      });
+      const result = store.ingestBatch(
+        [
+          envelope("inst_a", "a1", "2026-04-01T00:00:00.000Z", {
+            blob_ref: { blob_id: blob.blobId },
+          }),
+          envelope("inst_a", "a2", "2026-04-02T00:00:00.000Z"),
+        ],
+        messagesSemantics,
+        messagesPk,
+        A,
+      );
+      expect(result.accepted).toBe(2);
+      return blob;
+    };
+    const resetToB = (instance = "inst_a") =>
+      store.resetInstanceBinding({
+        instance,
+        expectedMethod: "method_a",
+        expectedGeneration: 1,
+        nextMethod: "method_b",
+      });
+
+    it("rolls back every reset step when the transaction faults at its last write", () => {
+      seedA();
+      const before = snapshot();
+      // The binding update is the reset's final statement, so the deletes
+      // and the clock tick have already run when it aborts.
+      db.exec(`CREATE TRIGGER fault_reset BEFORE UPDATE ON pdpp_instance_binding
+        BEGIN SELECT RAISE(ABORT, 'injected reset fault'); END`);
+      expect(() => resetToB()).toThrow("injected reset fault");
+      expect(snapshot()).toEqual(before);
+      db.exec("DROP TRIGGER fault_reset");
+      expect(resetToB().binding).toMatchObject({
+        method: "method_b",
+        generation: 2,
+      });
+      expect(snapshot()).toMatchObject({
+        records: 0,
+        changes: 0,
+        blobs: 0,
+        bytes: 0,
+        claims: 0,
+      });
+    });
+
+    it("rolls back blob bytes and metadata when the upload claim write faults", () => {
+      store.getInstanceBinding("inst_a");
+      const before = snapshot();
+      db.exec(`CREATE TRIGGER fault_claim BEFORE INSERT ON pdpp_blob_claims
+        BEGIN SELECT RAISE(ABORT, 'injected claim fault'); END`);
+      expect(() =>
+        store.storeBlobBytesForInstance({
+          instance: "inst_a",
+          ...A,
+          bytes: bytes("never stored"),
+          mimeType: "image/png",
+        }),
+      ).toThrow("injected claim fault");
+      expect(snapshot()).toEqual(before);
+    });
+
+    it("expires a pre-reset list cursor instead of continuing with B rows", () => {
+      seedA();
+      const page1 = store.listRecords("messages", {
+        instanceIds: ["inst_a"],
+        limit: 1,
+        order: "asc",
+      });
+      expect(page1.data.map((r) => r.recordKey)).toEqual(["a1"]);
+      expect(page1.nextCursor).toBeDefined();
+      resetToB();
+      store.ingestBatch(
+        [envelope("inst_a", "b1", "2026-04-03T00:00:00.000Z")],
+        messagesSemantics,
+        messagesPk,
+        { method: "method_b", generation: 2 },
+      );
+      expect(() =>
+        store.listRecords("messages", {
+          instanceIds: ["inst_a"],
+          limit: 1,
+          order: "asc",
+          cursor: page1.nextCursor,
+        }),
+      ).toThrow(CursorExpiredError);
+      // A fresh listing after the reset pages normally.
+      const fresh = store.listRecords("messages", {
+        instanceIds: ["inst_a"],
+        limit: 1,
+        order: "asc",
+      });
+      expect(fresh.data.map((r) => r.recordKey)).toEqual(["b1"]);
+    });
+
+    it("keeps list cursors valid across writes and resets of instances they do not read", () => {
+      seedA();
+      store.getInstanceBinding("inst_c");
+      store.ingestBatch(
+        [
+          envelope("inst_c", "c1", "2026-04-01T00:00:00.000Z"),
+          envelope("inst_c", "c2", "2026-04-02T00:00:00.000Z"),
+        ],
+        messagesSemantics,
+        messagesPk,
+        A,
+      );
+      const page1 = store.listRecords("messages", {
+        instanceIds: ["inst_c"],
+        limit: 1,
+        order: "asc",
+      });
+      resetToB();
+      store.ingestBatch(
+        [envelope("inst_c", "c3", "2026-04-03T00:00:00.000Z")],
+        messagesSemantics,
+        messagesPk,
+        A,
+      );
+      const page2 = store.listRecords("messages", {
+        instanceIds: ["inst_c"],
+        limit: 5,
+        order: "asc",
+        cursor: page1.nextCursor,
+      });
+      expect(page2.data.map((r) => r.recordKey)).toEqual(["c2", "c3"]);
+    });
+
+    it("expires a pre-reset changes_since page cursor", () => {
+      seedA();
+      const page1 = store.changesSince("messages", {
+        instanceIds: ["inst_a"],
+        limit: 1,
+      });
+      expect(page1.nextCursor).toBeDefined();
+      resetToB();
+      expect(() =>
+        store.changesSince("messages", {
+          instanceIds: ["inst_a"],
+          limit: 1,
+          cursor: page1.nextCursor,
+        }),
+      ).toThrow(CursorExpiredError);
+    });
+
+    it("expires a legacy list cursor without a horizon only if a read instance was reset", () => {
+      seedA();
+      const legacy = encodeCursor({
+        kind: "list",
+        order: "asc",
+        sortValue: "2026-04-01T00:00:00.000Z",
+        recordKey: "a1",
+      });
+      const before = store.listRecords("messages", {
+        instanceIds: ["inst_a"],
+        limit: 5,
+        order: "asc",
+        cursor: legacy,
+      });
+      expect(before.data.map((r) => r.recordKey)).toEqual(["a2"]);
+      resetToB();
+      expect(() =>
+        store.listRecords("messages", {
+          instanceIds: ["inst_a"],
+          limit: 5,
+          order: "asc",
+          cursor: legacy,
+        }),
+      ).toThrow(CursorExpiredError);
+    });
+
+    it("keeps a blob shared with another instance through one reset", () => {
+      const blob = seedA();
+      store.getInstanceBinding("inst_c");
+      const shared = store.storeBlobBytesForInstance({
+        instance: "inst_c",
+        ...A,
+        bytes: bytes("A image"),
+        mimeType: "image/png",
+      });
+      expect(shared.blobId).toBe(blob.blobId);
+      store.ingestBatch(
+        [
+          envelope("inst_c", "c1", "2026-04-01T00:00:00.000Z", {
+            blob_ref: { blob_id: blob.blobId },
+          }),
+        ],
+        messagesSemantics,
+        messagesPk,
+        A,
+      );
+      resetToB();
+      expect(store.getBlobBytes(blob.blobId)).toEqual(bytes("A image"));
+      resetToB("inst_c");
+      expect(store.getBlobBytes(blob.blobId)).toBeUndefined();
+      expect(store.getBlobMeta(blob.blobId)).toBeUndefined();
     });
   });
 });
