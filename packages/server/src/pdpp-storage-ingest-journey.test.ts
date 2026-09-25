@@ -1447,6 +1447,95 @@ describe("P7: stream snapshot replace", () => {
     }
   });
 
+  it("tombstones only inside the replaced (instance, stream)", async () => {
+    ctx = await bootBoth();
+    const token = await ownerToken(ctx);
+    const instance = `oura:${owner}`;
+    // Same stream name on another instance, and another stream on this one.
+    const claude = await ingest(ctx, token, "profile", {
+      instance: `claude:${owner}`,
+      key: "c1",
+      data: { id: "c1", name: "c" },
+      emitted_at: "2026-09-01T00:00:00Z",
+    });
+    expect(outcomes(claude.body)).toEqual(["accepted"]);
+    const events = await ingest(ctx, token, "events", {
+      instance,
+      key: "e1",
+      data: { id: "e1", kind: "x" },
+      emitted_at: "2026-09-01T00:00:00Z",
+    });
+    expect(outcomes(events.body)).toEqual(["accepted"]);
+    const profile = await ingest(
+      ctx,
+      token,
+      "profile",
+      ["k1", "k2"].map((key) => ({
+        instance,
+        ...record(key, `${key}@a`, "2026-09-01T00:00:00Z"),
+      })),
+    );
+    expect(outcomes(profile.body)).toEqual(["accepted", "accepted"]);
+    const before = storeCounters();
+
+    const result = await replace(ctx, token, "profile", {
+      instance,
+      emitted_at: "2026-09-02T12:00:00Z",
+      records: [record("k1", "k1@a", "2026-09-02T00:00:00Z")],
+    });
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      accepted: 0,
+      unchanged: 1,
+      deleted: 1,
+    });
+    expect(storeCounters()).toEqual({
+      clock: before.clock + 1,
+      changes: before.changes + 1,
+    });
+    const db = new Database(join(tempDir, "index.db"), { readonly: true });
+    try {
+      expect(
+        db
+          .prepare(
+            "SELECT instance, stream, record_key, version, deleted FROM pdpp_records ORDER BY instance, stream, record_key",
+          )
+          .all(),
+      ).toEqual([
+        {
+          instance: `claude:${owner}`,
+          stream: "profile",
+          record_key: "c1",
+          version: 1,
+          deleted: 0,
+        },
+        {
+          instance,
+          stream: "events",
+          record_key: "e1",
+          version: 1,
+          deleted: 0,
+        },
+        {
+          instance,
+          stream: "profile",
+          record_key: "k1",
+          version: 1,
+          deleted: 0,
+        },
+        {
+          instance,
+          stream: "profile",
+          record_key: "k2",
+          version: 2,
+          deleted: 1,
+        },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
   it("rolls back every upsert and tombstone when a write faults mid-transaction", async () => {
     ctx = await bootBoth();
     const token = await ownerToken(ctx);
