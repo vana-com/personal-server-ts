@@ -38,6 +38,7 @@ import {
   mapSdkAuthError,
 } from "../middleware/web3-auth.js";
 import { createOwnerCheckMiddleware } from "../middleware/owner-check.js";
+import { escapeHtml, renderAccountPage } from "../ui/account-page.js";
 
 export interface LoginV2Deps {
   logger: Logger;
@@ -438,6 +439,10 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
 }
 
 // ── HTML pages ──────────────────────────────────────────────────────
+// Presentation lives in ../ui/account-page.ts so every page the Personal
+// Server shows a person shares Vana Account's look.
+
+const PAGE_ACCENT = "Personal Server";
 
 function approvePage(
   origin: string,
@@ -445,56 +450,25 @@ function approvePage(
   sessionId: string,
   localApprovalShortcutEnabled: boolean,
 ): string {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Authorize CLI — Personal Server</title>
-  <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: #f5f5f5; color: #1a1a1a;
-      display: flex; justify-content: center; align-items: center;
-      min-height: 100vh; padding: 1rem;
-    }
-    .card {
-      background: #fff; border-radius: 12px; padding: 2rem;
-      max-width: 420px; width: 100%;
-      box-shadow: 0 2px 8px rgba(0,0,0,.08);
-    }
-    h1 { font-size: 1.25rem; margin-bottom: 1.5rem; }
-    .info { background: #f8f9fa; border-radius: 8px; padding: 1rem; margin-bottom: 1.5rem; font-size: 0.875rem; }
-    .info dt { color: #666; margin-bottom: 0.25rem; }
-    .info dd { font-family: monospace; word-break: break-all; margin-bottom: 0.75rem; }
-    .info dd:last-child { margin-bottom: 0; }
-    .btn {
-      display: block; width: 100%; padding: 0.75rem 1.5rem;
-      background: #2563eb; color: #fff; border: none; border-radius: 8px;
-      font-size: 1rem; font-weight: 500; cursor: pointer;
-      transition: background 0.15s;
-    }
-    .btn:hover { background: #1d4ed8; }
-    .btn:disabled { background: #94a3b8; cursor: not-allowed; }
-    #status { text-align: center; margin-top: 1rem; font-size: 0.875rem; color: #666; }
-    .hint { margin-top: 1rem; font-size: 0.875rem; color: #666; line-height: 1.5; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>A CLI tool is requesting access to your Personal Server</h1>
-    <dl class="info">
-      <dt>Server</dt>
-      <dd>${escapeHtml(origin)}</dd>
-      <dt>Owner</dt>
-      <dd>${escapeHtml(owner)}</dd>
-    </dl>
-    <button class="btn" id="approveBtn" onclick="approve()">Approve</button>
-    <div id="status"></div>
-    <p class="hint" id="hint"></p>
-  </div>
-  <script>
+  return renderAccountPage({
+    title: "Authorize CLI — Personal Server",
+    headingAccent: PAGE_ACCENT,
+    heading: "Authorize CLI",
+    description:
+      "A CLI tool is requesting access to your Personal Server. Only approve if you started this sign-in yourself.",
+    bodyHtml: `
+        <dl class="unity-details">
+          <dt>Server</dt>
+          <dd>${escapeHtml(origin)}</dd>
+          <dt>Owner</dt>
+          <dd class="unity-mono">${escapeHtml(owner)}</dd>
+        </dl>
+        <p class="unity-status" id="hint"></p>
+        <p class="unity-status" id="status" role="status" aria-live="polite"></p>
+        <div class="unity-actions">
+          <button class="unity-button" id="approveBtn" type="button" onclick="approve()">Approve</button>
+        </div>`,
+    script: `
     const SESSION_ID = ${JSON.stringify(sessionId)};
     const OWNER_ADDRESS = ${JSON.stringify(owner)};
     const LOCAL_APPROVAL_SHORTCUT_ENABLED = ${JSON.stringify(localApprovalShortcutEnabled)};
@@ -581,10 +555,25 @@ function approvePage(
         "This browser is on the same machine as the Personal Server, so approval stays local.";
     }
 
+    function showStatus(message, isError) {
+      status.textContent = message;
+      status.className = isError ? "unity-error" : "unity-status";
+    }
+
+    function showAuthorized() {
+      document.getElementById("page-heading").innerHTML =
+        '<span class="unity-header-title-accent">${PAGE_ACCENT}</span><br>Device authorized!';
+      document.getElementById("page-description").textContent =
+        "You can close this tab and return to the CLI.";
+      document.querySelector(".unity-content").remove();
+      document.querySelector(".unity-panel").classList.add("unity-panel--slim");
+      document.title = "Authorized — Personal Server";
+    }
+
     async function approve() {
       btn.disabled = true;
       btn.textContent = remoteApproval ? 'Signing...' : 'Authorizing...';
-      status.textContent = "";
+      showStatus("", false);
       try {
         const headers = {};
         if (remoteApproval) {
@@ -597,99 +586,43 @@ function approvePage(
           headers,
         });
         if (res.ok) {
-          document.querySelector('.card').innerHTML =
-            '<h1 style="color:#16a34a">Device authorized!</h1>' +
-            '<p style="margin-top:1rem;color:#666">You can close this tab.</p>';
+          showAuthorized();
         } else {
           const data = await res.json();
-          status.textContent = data.error?.message || 'Authorization failed';
-          status.style.color = '#dc2626';
+          showStatus(data.error?.message || 'Authorization failed', true);
           btn.disabled = false;
           btn.textContent = 'Approve';
         }
       } catch (err) {
-        status.textContent = 'Network error — please try again';
-        status.style.color = '#dc2626';
+        showStatus('Network error — please try again', true);
         btn.disabled = false;
         btn.textContent = 'Approve';
       }
     }
-  </script>
-</body>
-</html>`;
+  `,
+  });
 }
 
 function successPage(): string {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Authorized — Personal Server</title>
-  <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: #f5f5f5; color: #1a1a1a;
-      display: flex; justify-content: center; align-items: center;
-      min-height: 100vh;
-    }
-    .card {
-      background: #fff; border-radius: 12px; padding: 2rem;
-      max-width: 420px; text-align: center;
-      box-shadow: 0 2px 8px rgba(0,0,0,.08);
-    }
-    h1 { color: #16a34a; font-size: 1.25rem; }
-    p { margin-top: 1rem; color: #666; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Device authorized!</h1>
-    <p>You can close this tab.</p>
-  </div>
-</body>
-</html>`;
+  return renderAccountPage({
+    title: "Authorized — Personal Server",
+    headingAccent: PAGE_ACCENT,
+    heading: "Device authorized!",
+    description: "You can close this tab and return to the CLI.",
+    slim: true,
+  });
 }
 
 function errorPage(message: string): string {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Error — Personal Server</title>
-  <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: #f5f5f5; color: #1a1a1a;
-      display: flex; justify-content: center; align-items: center;
-      min-height: 100vh;
-    }
-    .card {
-      background: #fff; border-radius: 12px; padding: 2rem;
-      max-width: 420px; text-align: center;
-      box-shadow: 0 2px 8px rgba(0,0,0,.08);
-    }
-    h1 { color: #dc2626; font-size: 1.25rem; }
-    p { margin-top: 1rem; color: #666; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Error</h1>
-    <p>${escapeHtml(message)}</p>
-  </div>
-</body>
-</html>`;
-}
-
-function escapeHtml(str: string): string {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+  return renderAccountPage({
+    title: "Error — Personal Server",
+    headingAccent: PAGE_ACCENT,
+    heading: "Error",
+    description: message,
+    bodyHtml: `
+        <p class="unity-status">Start the sign-in again from your terminal to get a new link.</p>`,
+    slim: true,
+  });
 }
 
 // Export for testing
