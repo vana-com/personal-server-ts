@@ -51,6 +51,10 @@ CREATE TABLE IF NOT EXISTS pdpp_current_declarations (
   document TEXT NOT NULL,
   accepted_at TEXT NOT NULL,
   is_current INTEGER NOT NULL DEFAULT 1,
+  -- 'configured' (seeded from config at boot) or 'submitted' (runtime
+  -- route). Boot config follows the current configured declaration, but
+  -- never displaces a submission.
+  origin TEXT NOT NULL DEFAULT 'configured',
   PRIMARY KEY (source_id, version)
 );
 
@@ -83,18 +87,21 @@ export interface OpenDeclarationRegistryOptions {
   /** SQLite file. Use `:memory:` for a registry that does not outlive it. */
   path: string;
   /**
-   * The connector inventory this PS serves. A declaration naming a source
-   * this server holds no data for is refused even when an operator submits
-   * it: a grant over data that cannot exist here is at best useless, and at
-   * worst a consent screen showing an owner something they are not sharing.
+   * The connector inventory this PS serves. A SUBMITTED declaration naming a
+   * source this server holds no data for is refused: a grant over data that
+   * cannot exist here is at best useless, and at worst a consent screen
+   * showing an owner something they are not sharing. Seeds are not gated;
+   * see `seed`.
    */
   supportedConnectors: string[];
   logger: Logger;
   /**
-   * Declarations from `config.pdpp.declarationPaths`, seeded on open so a
-   * deployment that has always configured its declarations keeps working
-   * unchanged. Submitted declarations win over seeds for the same source:
-   * an operator's explicit later decision is the more recent one.
+   * Declarations from `config.pdpp.declarationPaths`, seeded on open.
+   * Configuration is the operator's admission decision, so seeds skip the
+   * connector gate: a fresh server with no legacy data must still mount the
+   * sources it was configured for. Submitted declarations win over seeds for
+   * the same source: an operator's explicit later decision is the more
+   * recent one.
    */
   seed?: { sourceId: string; document: string }[];
 }
@@ -108,7 +115,10 @@ export function openDeclarationRegistry(
 
   const supported = new Set(options.supportedConnectors);
 
-  function accept(document: string): DeclarationSubmissionResult {
+  function accept(
+    document: string,
+    admission: "configured" | "submitted",
+  ): DeclarationSubmissionResult {
     // The submitted document names its own source, so there is no separately
     // supplied id to cross-check it against. Reading the claim first and
     // parsing against it means `source_id_mismatch` stays reachable for a
@@ -129,7 +139,7 @@ export function openDeclarationRegistry(
     if (!parsed.ok) return parsed;
 
     const connector = connectorNameFor(parsed.snapshot.source_id);
-    if (!supported.has(connector)) {
+    if (admission === "submitted" && !supported.has(connector)) {
       // `untrusted_source` rather than `invalid_document`: the document may
       // be perfectly well formed. What is refused is its authority here.
       return {
@@ -143,11 +153,11 @@ export function openDeclarationRegistry(
 
     const existing = db
       .prepare(
-        `SELECT snapshot_json FROM pdpp_current_declarations
+        `SELECT snapshot_json, is_current FROM pdpp_current_declarations
          WHERE source_id = ? AND version = ?`,
       )
       .get(parsed.snapshot.source_id, parsed.snapshot.version) as
-      { snapshot_json: string } | undefined;
+      { snapshot_json: string; is_current: number } | undefined;
     if (existing) {
       const retained = JSON.parse(
         existing.snapshot_json,
@@ -162,6 +172,19 @@ export function openDeclarationRegistry(
           },
         };
       }
+      // Configuration names the version that is current now, so a
+      // configured downgrade re-points to the retained earlier revision.
+      if (admission === "configured" && !existing.is_current) {
+        db.transaction(() => {
+          db.prepare(
+            "UPDATE pdpp_current_declarations SET is_current = 0 WHERE source_id = ?",
+          ).run(parsed.snapshot.source_id);
+          db.prepare(
+            `UPDATE pdpp_current_declarations SET is_current = 1
+             WHERE source_id = ? AND version = ?`,
+          ).run(parsed.snapshot.source_id, parsed.snapshot.version);
+        })();
+      }
       return { ok: true, snapshot: retained };
     }
 
@@ -171,8 +194,8 @@ export function openDeclarationRegistry(
       ).run(parsed.snapshot.source_id);
       db.prepare(
         `INSERT INTO pdpp_current_declarations
-           (source_id, version, digest, snapshot_json, document, accepted_at, is_current)
-         VALUES (?, ?, ?, ?, ?, ?, 1)`,
+           (source_id, version, digest, snapshot_json, document, accepted_at, is_current, origin)
+         VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
       ).run(
         parsed.snapshot.source_id,
         parsed.snapshot.version,
@@ -180,6 +203,7 @@ export function openDeclarationRegistry(
         JSON.stringify(parsed.snapshot),
         document,
         new Date().toISOString(),
+        admission,
       );
     })();
 
@@ -188,14 +212,19 @@ export function openDeclarationRegistry(
 
   // Seeds go through the same `accept` as a submission — one acceptance path,
   // so a configured declaration and a submitted one cannot diverge on what
-  // counts as valid. A seed for a source that already has a submission is
-  // skipped: the operator's later explicit decision wins over boot config.
+  // counts as valid. A seed for a source whose current declaration was
+  // submitted is skipped: the operator's later explicit decision wins over
+  // boot config. Otherwise the seed becomes current, so an installer that
+  // upgrades a declaration and restarts the server is followed.
   for (const seed of options.seed ?? []) {
-    const existing = db
-      .prepare("SELECT 1 FROM pdpp_current_declarations WHERE source_id = ?")
+    const submitted = db
+      .prepare(
+        `SELECT 1 FROM pdpp_current_declarations
+         WHERE source_id = ? AND is_current = 1 AND origin = 'submitted'`,
+      )
       .get(seed.sourceId);
-    if (existing) continue;
-    const result = accept(seed.document);
+    if (submitted) continue;
+    const result = accept(seed.document, "configured");
     if (!result.ok) {
       options.logger.warn(
         { sourceId: seed.sourceId, reason: result.failure.message },
@@ -236,7 +265,7 @@ export function openDeclarationRegistry(
         (r) => JSON.parse(r.snapshot_json) as DeclarationSnapshot,
       );
     },
-    submit: accept,
+    submit: (document) => accept(document, "submitted"),
     close() {
       db.close();
     },
@@ -252,6 +281,14 @@ function migrateSchema(db: Database.Database): void {
     return;
   }
   if (columns.some((column) => column.name === "is_current")) {
+    if (!columns.some((column) => column.name === "origin")) {
+      // Rows written before `origin` existed cannot be told apart. Treating
+      // them as configured lets boot config move past them; a submission
+      // that should outrank config must be submitted again.
+      db.exec(
+        "ALTER TABLE pdpp_current_declarations ADD COLUMN origin TEXT NOT NULL DEFAULT 'configured'",
+      );
+    }
     db.exec(SCHEMA_SQL);
     return;
   }

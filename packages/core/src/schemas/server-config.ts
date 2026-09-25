@@ -79,7 +79,10 @@ export const DEFAULTS = {
     // deliberately no trust-all option and no default: an AS that accepts any
     // declaration it can reach will issue grants over data it was never meant
     // to speak for. Empty means this server retains none and issues nothing.
-    declarationPaths: [] as string[],
+    // An entry may pin the file's sha256 (hex, over the exact bytes); a file
+    // whose bytes no longer match is refused. The installer that verified
+    // the signed artifact writes that digest.
+    declarationPaths: [] as Array<string | { path: string; sha256: string }>,
     // Require PKCE (RFC 7636, S256) on the authorization-code flow. PDPP
     // clients are public clients; without a verifier an intercepted code is
     // redeemable by whoever intercepted it.
@@ -243,7 +246,17 @@ export const ServerConfigSchema = z.object({
       // No trust-all switch by design. A declaration is trusted because an
       // operator retained this exact document, not because it was reachable.
       declarationPaths: z
-        .array(z.string().min(1))
+        .array(
+          z.union([
+            z.string().min(1),
+            z.object({
+              path: z.string().min(1),
+              sha256: z
+                .string()
+                .regex(/^[0-9a-f]{64}$/, "lowercase hex sha256"),
+            }),
+          ]),
+        )
         .default(DEFAULTS.pdpp.declarationPaths),
       requirePkce: z.boolean().default(DEFAULTS.pdpp.requirePkce),
       clients: z

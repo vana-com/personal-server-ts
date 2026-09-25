@@ -19,17 +19,20 @@ import type {
  */
 export interface PdppRecordStore {
   /**
-   * Validates key/data agreement per envelope, computes the canonical
-   * record_key, allocates the next version for mutable_state streams, and
-   * writes the whole batch atomically: a failure partway through rolls back
-   * every write from this call, it never leaves partial version/history
-   * state. Per-envelope validation failures (e.g. key/data mismatch) are
-   * reported in `rejected` and do not fail the rest of the batch.
+   * Decides each envelope with `planIngest` and writes the accepted ones
+   * atomically: a thrown error rolls back every write from this call, it
+   * never leaves partial version/history state. Each envelope gets exactly
+   * one outcome in `results`. A rejected envelope writes nothing and does
+   * not fail the rest of the batch. An `unchanged` envelope writes nothing
+   * either: no version, no history row, no write-clock tick.
+   *
+   * Declarations are looked up per envelope by `(stream, instance)`, since
+   * one stream name can belong to several sources.
    */
   ingestBatch(
     envelopes: PdppRecordEnvelopeInput[],
-    streamSemantics: (stream: string) => StreamSemantics,
-    primaryKeyFields: (stream: string) => string[],
+    streamSemantics: (stream: string, instance: string) => StreamSemantics,
+    primaryKeyFields: (stream: string, instance: string) => string[],
   ): IngestResult;
 
   getRecord(
