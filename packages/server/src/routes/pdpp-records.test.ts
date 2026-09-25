@@ -1,3 +1,4 @@
+import Database from "better-sqlite3";
 import { describe, it, expect, vi } from "vitest";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import {
@@ -14,6 +15,7 @@ import {
   pdppRecordsRoutes,
   type PdppRecordsRouteDeps,
 } from "./pdpp-records.js";
+import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
 
 const declarations = createStreamDeclarationRegistry([
   {
@@ -1184,5 +1186,73 @@ describe("pdpp records routes: blob ingest", () => {
     expect(res.status).toBe(401);
     const body = await res.json();
     expect(body.error.code).toBe("authentication_error");
+  });
+});
+
+describe("pdpp records routes: snapshot replace", () => {
+  it("refuses a client token for the owner subject with 401 and changes no rows", async () => {
+    const db = new Database(":memory:");
+    const store = createSqliteRecordStore(db);
+    const { app } = buildApp(
+      {
+        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+        "client-tok": {
+          active: true,
+          tokenKind: "client",
+          subjectId: "sub_1",
+          grant: clientGrant(),
+        },
+      },
+      {
+        store,
+        bindingStore: store,
+        configuredMethods: new Map([["inst_1", ["m1"]]]),
+      },
+    );
+    const replace = (token: string, records: unknown[]) =>
+      app.request(
+        "/streams/playlists/records/replace?method=m1&binding_generation=1",
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            instance: "inst_1",
+            emitted_at: "2026-09-02T00:00:00Z",
+            records,
+          }),
+        },
+      );
+    const seeded = await replace("owner-tok", [
+      {
+        key: "p1",
+        data: { id: "p1", name: "a" },
+        emitted_at: "2026-09-01T00:00:00Z",
+      },
+    ]);
+    expect(seeded.status).toBe(200);
+    const rows = () =>
+      db
+        .prepare(
+          "SELECT instance, stream, record_key, version, deleted FROM pdpp_records ORDER BY record_key",
+        )
+        .all();
+    const before = rows();
+    expect(before).toEqual([
+      {
+        instance: "inst_1",
+        stream: "playlists",
+        record_key: "p1",
+        version: 1,
+        deleted: 0,
+      },
+    ]);
+
+    const refused = await replace("client-tok", []);
+    expect(refused.status).toBe(401);
+    expect(rows()).toEqual(before);
+    db.close();
   });
 });

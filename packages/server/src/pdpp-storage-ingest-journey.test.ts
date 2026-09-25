@@ -1237,3 +1237,445 @@ describe("P10c and method authority over HTTP", () => {
     expect(listed.body.data.map((r: any) => r.id)).toEqual(["new"]);
   });
 });
+
+describe("P7: stream snapshot replace", () => {
+  const record = (key: string, email: string, emitted_at: string) => ({
+    key,
+    data: { user_id: key, email },
+    emitted_at,
+  });
+
+  async function replace(
+    context: ServerContext,
+    token: string,
+    stream: string,
+    body: unknown,
+    method = "oura",
+    generation = 1,
+  ) {
+    const response = await context.app.request(
+      `/v1/streams/${stream}/records/replace?method=${encodeURIComponent(method)}&binding_generation=${generation}`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+      },
+    );
+    return { status: response.status, body: (await response.json()) as any };
+  }
+
+  /** Every current row of the oura instance, including tombstones. */
+  function currentRows() {
+    const db = new Database(join(tempDir, "index.db"), { readonly: true });
+    try {
+      return db
+        .prepare(
+          "SELECT stream, record_key, data, version, emitted_at, deleted, deleted_at FROM pdpp_records ORDER BY stream, record_key",
+        )
+        .all();
+    } finally {
+      db.close();
+    }
+  }
+
+  async function seed(context: ServerContext, token: string) {
+    const instance = `oura:${owner}`;
+    const seeded = await ingest(
+      context,
+      token,
+      "profile",
+      ["k1", "k2", "k3"].map((key) => ({
+        instance,
+        ...record(key, `${key}@a`, "2026-09-01T00:00:00Z"),
+      })),
+    );
+    expect(outcomes(seeded.body)).toEqual(["accepted", "accepted", "accepted"]);
+    return instance;
+  }
+
+  it("upserts the snapshot and tombstones exactly the live keys it lacks", async () => {
+    ctx = await bootBoth();
+    const token = await ownerToken(ctx);
+    const instance = await seed(ctx, token);
+    const baseline = await read(
+      ctx,
+      token,
+      "/v1/streams/profile/records?changes_since=",
+    );
+    const token0 = baseline.body.next_changes_since as string;
+    const before = storeCounters();
+
+    const result = await replace(ctx, token, "profile", {
+      instance,
+      emitted_at: "2026-09-02T12:00:00Z",
+      records: [
+        record("k1", "k1@a", "2026-09-02T00:00:00Z"),
+        record("k2", "k2@b", "2026-09-02T00:00:00Z"),
+        record("k4", "k4@b", "2026-09-02T00:00:00Z"),
+      ],
+    });
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      accepted: 2,
+      unchanged: 1,
+      deleted: 1,
+      rejected: [],
+    });
+    expect(result.body.results.map((r: any) => r.outcome)).toEqual([
+      "unchanged",
+      "accepted",
+      "accepted",
+    ]);
+    // k2 new version, k4 version 1, k3 tombstone: three clock ticks.
+    expect(storeCounters()).toEqual({
+      clock: before.clock + 3,
+      changes: before.changes + 3,
+    });
+
+    const listed = await read(ctx, token, "/v1/streams/profile/records");
+    expect(
+      listed.body.data.map((r: any) => [r.id, r.data.email]).sort(),
+    ).toEqual([
+      ["k1", "k1@a"],
+      ["k2", "k2@b"],
+      ["k4", "k4@b"],
+    ]);
+    const k1 = await read(ctx, token, "/v1/streams/profile/records/k1");
+    expect(k1.body.emitted_at).toBe("2026-09-01T00:00:00Z");
+
+    const changed = await read(
+      ctx,
+      token,
+      `/v1/streams/profile/records?changes_since=${encodeURIComponent(token0)}`,
+    );
+    const byKey = Object.fromEntries(
+      changed.body.data.map((r: any) => [r.id, r]),
+    );
+    expect(Object.keys(byKey).sort()).toEqual(["k2", "k3", "k4"]);
+    expect(byKey.k3.deleted).toBe(true);
+    expect(byKey.k3.deleted_at).toBe("2026-09-02T12:00:00Z");
+
+    // The same snapshot again is exact: nothing written.
+    const settled = storeCounters();
+    const again = await replace(ctx, token, "profile", {
+      instance,
+      emitted_at: "2026-09-03T00:00:00Z",
+      records: [
+        record("k1", "k1@a", "2026-09-03T00:00:00Z"),
+        record("k2", "k2@b", "2026-09-03T00:00:00Z"),
+        record("k4", "k4@b", "2026-09-03T00:00:00Z"),
+      ],
+    });
+    expect(again.status).toBe(200);
+    expect(again.body).toMatchObject({ accepted: 0, unchanged: 3, deleted: 0 });
+    expect(storeCounters()).toEqual(settled);
+  });
+
+  it("writes nothing when any record is rejected", async () => {
+    ctx = await bootBoth();
+    const token = await ownerToken(ctx);
+    const instance = await seed(ctx, token);
+    const before = { counters: storeCounters(), rows: currentRows() };
+
+    const cases: { records: unknown[]; index: number; reason: RegExp }[] = [
+      {
+        // Key does not match data's primary key.
+        records: [
+          record("k1", "changed", "2026-09-02T00:00:00Z"),
+          {
+            key: "k9",
+            data: { user_id: "other" },
+            emitted_at: "2026-09-02T00:00:00Z",
+          },
+        ],
+        index: 1,
+        reason: /primary_key/,
+      },
+      {
+        records: [
+          record("k1", "changed", "2026-09-02T00:00:00Z"),
+          record("k1", "again", "2026-09-02T00:00:00Z"),
+        ],
+        index: 1,
+        reason: /duplicate key/,
+      },
+      {
+        records: [
+          record("k1", "changed", "2026-09-02T00:00:00Z"),
+          {
+            key: "k2",
+            data: null,
+            emitted_at: "2026-09-02T00:00:00Z",
+            op: "delete",
+          },
+        ],
+        index: 1,
+        reason: /must be upserts/,
+      },
+      {
+        records: [
+          record("k1", "changed", "2026-09-02T00:00:00Z"),
+          {
+            key: "k5",
+            data: {
+              user_id: "k5",
+              blob_ref: { blob_id: `sha256:${"0".repeat(64)}` },
+            },
+            emitted_at: "2026-09-02T00:00:00Z",
+          },
+        ],
+        index: 1,
+        reason: /blob_unclaimed/,
+      },
+    ];
+    for (const { records, index, reason } of cases) {
+      const result = await replace(ctx, token, "profile", {
+        instance,
+        emitted_at: "2026-09-02T12:00:00Z",
+        records,
+      });
+      expect(result.status).toBe(422);
+      expect(result.body.rejected).toHaveLength(1);
+      expect(result.body.rejected[0].index).toBe(index);
+      expect(result.body.rejected[0].reason).toMatch(reason);
+      expect({ counters: storeCounters(), rows: currentRows() }).toEqual(
+        before,
+      );
+    }
+  });
+
+  it("tombstones only inside the replaced (instance, stream)", async () => {
+    ctx = await bootBoth();
+    const token = await ownerToken(ctx);
+    const instance = `oura:${owner}`;
+    // Same stream name on another instance, and another stream on this one.
+    const claude = await ingest(ctx, token, "profile", {
+      instance: `claude:${owner}`,
+      key: "c1",
+      data: { id: "c1", name: "c" },
+      emitted_at: "2026-09-01T00:00:00Z",
+    });
+    expect(outcomes(claude.body)).toEqual(["accepted"]);
+    const events = await ingest(ctx, token, "events", {
+      instance,
+      key: "e1",
+      data: { id: "e1", kind: "x" },
+      emitted_at: "2026-09-01T00:00:00Z",
+    });
+    expect(outcomes(events.body)).toEqual(["accepted"]);
+    const profile = await ingest(
+      ctx,
+      token,
+      "profile",
+      ["k1", "k2"].map((key) => ({
+        instance,
+        ...record(key, `${key}@a`, "2026-09-01T00:00:00Z"),
+      })),
+    );
+    expect(outcomes(profile.body)).toEqual(["accepted", "accepted"]);
+    const before = storeCounters();
+
+    const result = await replace(ctx, token, "profile", {
+      instance,
+      emitted_at: "2026-09-02T12:00:00Z",
+      records: [record("k1", "k1@a", "2026-09-02T00:00:00Z")],
+    });
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      accepted: 0,
+      unchanged: 1,
+      deleted: 1,
+    });
+    expect(storeCounters()).toEqual({
+      clock: before.clock + 1,
+      changes: before.changes + 1,
+    });
+    const db = new Database(join(tempDir, "index.db"), { readonly: true });
+    try {
+      expect(
+        db
+          .prepare(
+            "SELECT instance, stream, record_key, version, deleted FROM pdpp_records ORDER BY instance, stream, record_key",
+          )
+          .all(),
+      ).toEqual([
+        {
+          instance: `claude:${owner}`,
+          stream: "profile",
+          record_key: "c1",
+          version: 1,
+          deleted: 0,
+        },
+        {
+          instance,
+          stream: "events",
+          record_key: "e1",
+          version: 1,
+          deleted: 0,
+        },
+        {
+          instance,
+          stream: "profile",
+          record_key: "k1",
+          version: 1,
+          deleted: 0,
+        },
+        {
+          instance,
+          stream: "profile",
+          record_key: "k2",
+          version: 2,
+          deleted: 1,
+        },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("rolls back every upsert and tombstone when a write faults mid-transaction", async () => {
+    ctx = await bootBoth();
+    const token = await ownerToken(ctx);
+    const instance = await seed(ctx, token);
+    const before = { counters: storeCounters(), rows: currentRows() };
+
+    // The tombstone of k3 is the last history insert of the replace.
+    const db = new Database(join(tempDir, "index.db"));
+    db.exec(`CREATE TRIGGER fault_replace BEFORE INSERT ON pdpp_record_changes
+      WHEN NEW.record_key = 'k3' AND NEW.deleted = 1
+      BEGIN SELECT RAISE(ABORT, 'injected replace fault'); END`);
+    try {
+      const result = await replace(ctx, token, "profile", {
+        instance,
+        emitted_at: "2026-09-02T12:00:00Z",
+        records: [
+          record("k1", "k1@b", "2026-09-02T00:00:00Z"),
+          record("k4", "k4@b", "2026-09-02T00:00:00Z"),
+        ],
+      });
+      expect(result.status).toBe(500);
+      expect({ counters: storeCounters(), rows: currentRows() }).toEqual(
+        before,
+      );
+    } finally {
+      db.exec("DROP TRIGGER fault_replace");
+      db.close();
+    }
+  });
+
+  it("refuses append_only streams, inactive methods, and stale generations with no change", async () => {
+    ctx = await bootBoth();
+    const token = await ownerToken(ctx);
+    const instance = await seed(ctx, token);
+    const events = await ingest(ctx, token, "events", {
+      instance,
+      key: "e1",
+      data: { id: "e1", kind: "x" },
+      emitted_at: "2026-09-01T00:00:00Z",
+    });
+    expect(outcomes(events.body)).toEqual(["accepted"]);
+    const before = { counters: storeCounters(), rows: currentRows() };
+    const snapshot = {
+      instance,
+      emitted_at: "2026-09-02T12:00:00Z",
+      records: [record("k1", "k1@b", "2026-09-02T00:00:00Z")],
+    };
+
+    const appendOnly = await replace(ctx, token, "events", {
+      ...snapshot,
+      records: [],
+    });
+    expect(appendOnly.status).toBe(400);
+    expect(appendOnly.body.error.message).toMatch(/mutable_state/);
+
+    const inactive = await replace(
+      ctx,
+      token,
+      "profile",
+      snapshot,
+      "oura-browser",
+    );
+    expect(inactive.status).toBe(409);
+    expect(inactive.body.error.code).toBe("method_inactive");
+
+    const stale = await replace(ctx, token, "profile", snapshot, "oura", 2);
+    expect(stale.status).toBe(409);
+    expect(stale.body.error.code).toBe("binding_generation_mismatch");
+
+    const notOwned = await replace(ctx, token, "profile", {
+      ...snapshot,
+      instance: "oura:0x0000000000000000000000000000000000000001",
+    });
+    expect(notOwned.status).toBe(401);
+
+    const malformed = await replace(ctx, token, "profile", {
+      instance,
+      records: [],
+    });
+    expect(malformed.status).toBe(400);
+
+    expect({ counters: storeCounters(), rows: currentRows() }).toEqual(before);
+
+    // After a reset the old generation is fenced; the new one replaces.
+    const resetResponse = await reset(ctx, token, instance, "oura", 1, "oura");
+    expect(resetResponse.status).toBe(200);
+    const old = await replace(ctx, token, "profile", snapshot, "oura", 1);
+    expect(old.status).toBe(409);
+    expect(old.body.error.code).toBe("binding_generation_mismatch");
+    const fresh = await replace(ctx, token, "profile", snapshot, "oura", 2);
+    expect(fresh.status).toBe(200);
+    expect(fresh.body).toMatchObject({ accepted: 1, deleted: 0 });
+  });
+
+  it("binds an empty unbound instance, and an empty snapshot tombstones every live key", async () => {
+    ctx = await bootBoth();
+    const token = await ownerToken(ctx);
+    const instance = `oura:${owner}`;
+    const binding = async () =>
+      read(
+        ctx!,
+        token,
+        `/pdpp/instances/${encodeURIComponent(instance)}/binding`,
+      );
+    expect((await binding()).body.method).toBeNull();
+
+    const first = await replace(ctx, token, "profile", {
+      instance,
+      emitted_at: "2026-09-01T12:00:00Z",
+      records: [
+        record("k1", "k1@a", "2026-09-01T00:00:00Z"),
+        record("k2", "k2@a", "2026-09-01T00:00:00Z"),
+      ],
+    });
+    expect(first.status).toBe(200);
+    expect((await binding()).body).toMatchObject({
+      method: "oura",
+      generation: 1,
+    });
+
+    const cleared = await replace(ctx, token, "profile", {
+      instance,
+      emitted_at: "2026-09-02T12:00:00Z",
+      records: [],
+    });
+    expect(cleared.status).toBe(200);
+    expect(cleared.body).toMatchObject({ accepted: 0, deleted: 2 });
+    const listed = await read(ctx, token, "/v1/streams/profile/records");
+    expect(listed.body.data).toEqual([]);
+  });
+
+  it("is not mounted when PDPP is disabled", async () => {
+    ctx = await createServer(
+      ServerConfigSchema.parse({ tunnel: { enabled: false } }),
+      { serverDir: tempDir, dataDir: join(tempDir, "data") },
+    );
+    const response = await ctx.app.request(
+      "/v1/streams/profile/records/replace?method=oura&binding_generation=1",
+      { method: "POST", body: "{}" },
+    );
+    expect(response.status).toBe(404);
+  });
+});

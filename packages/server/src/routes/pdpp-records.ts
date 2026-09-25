@@ -1,6 +1,9 @@
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
-import { PdppBindingError } from "../storage/pdpp-records-sqlite-store.js";
+import {
+  PdppBindingError,
+  type createSqliteRecordStore,
+} from "../storage/pdpp-records-sqlite-store.js";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import type {
@@ -130,6 +133,7 @@ export interface PdppRecordsRouteDeps {
       bytes: Uint8Array;
       mimeType: string;
     }): ReturnType<PdppRecordStore["storeBlobBytes"]>;
+    replaceStream: ReturnType<typeof createSqliteRecordStore>["replaceStream"];
   };
   configuredMethods?: Map<string, string[]>;
   auth: PdppAuthorizationService;
@@ -1386,6 +1390,160 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       );
     }
   });
+
+  // P7, owner-authenticated snapshot replace of one (instance, stream). A
+  // Vana PS contract, not Core. Body: `{instance, emitted_at, records[]}`;
+  // `records` is the complete live set from a covered full refresh by the
+  // instance's bound method, and `emitted_at` is the time stamped on the
+  // tombstone of each live key the snapshot lacks. One transaction: a binding
+  // failure is 409, any rejected record is 422, and neither writes anything.
+  // It exists only under method authority, so a server without configured
+  // methods does not mount it.
+  if (deps.bindingStore) {
+    const bindingStore = deps.bindingStore;
+    app.post("/streams/:stream/records/replace", async (c) => {
+      const reqId = requestId();
+      const { context, error } = await authenticate(c, reqId);
+      if (error) return error;
+      const headers = { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION };
+
+      try {
+        if (
+          context!.tokenKind !== "owner" ||
+          !context!.subjectId ||
+          !deps.ownerSubjectId ||
+          context!.subjectId.toLowerCase() !== deps.ownerSubjectId.toLowerCase()
+        ) {
+          throw new PdppError(
+            "authentication_error",
+            "Replace requires an owner token",
+          );
+        }
+        const stream = c.req.param("stream");
+        if (!deps.declarations.declares(stream)) {
+          throw new PdppError("not_found", "Stream not found");
+        }
+        const method = c.req.query("method");
+        const generation = Number(c.req.query("binding_generation") ?? NaN);
+        if (!method || !Number.isSafeInteger(generation) || generation < 1) {
+          throw new PdppError(
+            "invalid_request",
+            "method and positive binding_generation query parameters are required",
+          );
+        }
+        const body = parseIngestBody(
+          await readBoundedBody(c.req.raw, MAX_INGEST_BODY_BYTES, "Ingest"),
+        ) as Record<string, unknown>;
+        const { instance, emitted_at: emittedAt, records } = body;
+        if (
+          Array.isArray(body) ||
+          typeof instance !== "string" ||
+          typeof emittedAt !== "string" ||
+          !emittedAt ||
+          !Array.isArray(records)
+        ) {
+          throw new PdppError(
+            "invalid_request",
+            "Replace body must be {instance, emitted_at, records[]}",
+          );
+        }
+        const ownedInstances =
+          deps.instancesForSubject?.(context!.subjectId) ?? [];
+        if (!ownedInstances.includes(instance)) {
+          throw new PdppError(
+            "authentication_error",
+            "Replace requires an owned instance",
+          );
+        }
+        const configured = deps.configuredMethods?.get(instance) ?? [];
+        if (configured.length > 1) {
+          throw new PdppBindingError("config_multiple_active_methods");
+        }
+        if (configured.length !== 1 || configured[0] !== method) {
+          throw new PdppBindingError("method_inactive");
+        }
+        const declaration = deps.declarations.forInstance(instance, stream);
+        if (!declaration) {
+          throw new PdppError("not_found", "Stream not found");
+        }
+        if (declaration.semantics !== "mutable_state") {
+          throw new PdppError(
+            "invalid_request",
+            "Replace requires a mutable_state stream",
+          );
+        }
+
+        const result = bindingStore.replaceStream({
+          instance,
+          stream,
+          method,
+          generation,
+          emittedAt,
+          primaryKey: declaration.primaryKey,
+          envelopes: records.map((entry) => {
+            const e = (
+              entry !== null && typeof entry === "object" ? entry : {}
+            ) as Record<string, unknown>;
+            return {
+              instance,
+              stream,
+              key: e.key as PdppRecordEnvelopeInput["key"],
+              data: (e.data ?? null) as PdppRecordEnvelopeInput["data"],
+              emitted_at: e.emitted_at as string,
+              op: e.op as PdppRecordEnvelopeInput["op"],
+            };
+          }),
+        });
+        if (!result.applied) {
+          return c.json(
+            {
+              error: {
+                type: "invalid_request_error",
+                code: "invalid_request",
+                message: "Replace rejected; nothing was written",
+              },
+              rejected: result.rejected,
+              request_id: reqId,
+            },
+            422,
+            headers,
+          );
+        }
+        return c.json(
+          {
+            accepted: result.accepted,
+            unchanged: result.unchanged,
+            deleted: result.deleted,
+            rejected: result.rejected,
+            results: result.results,
+          },
+          200,
+          headers,
+        );
+      } catch (err) {
+        if (err instanceof PdppBindingError) {
+          return c.json(
+            {
+              error: { code: err.reason, message: err.reason },
+              request_id: reqId,
+            },
+            409,
+            headers,
+          );
+        }
+        return sendError(
+          c,
+          mapAndLog(
+            deps,
+            "POST /v1/streams/:stream/records/replace",
+            reqId,
+            err,
+          ),
+          reqId,
+        );
+      }
+    });
+  }
 
   // Owner-authenticated blob ingest, the write half of GET /v1/blobs/:blob_id.
   //

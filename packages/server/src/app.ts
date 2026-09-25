@@ -77,7 +77,10 @@ import type { Logger } from "pino";
 import { enclaveJobRoutes } from "./routes/enclave-jobs.js";
 import type { JobRequestEnvelope } from "@opendatalabs/vana-sdk/protocol/jobs";
 import type { JobExecuteResponse } from "./jobs/types.js";
-import { pdppRecordsRoutes } from "./routes/pdpp-records.js";
+import {
+  pdppRecordsRoutes,
+  type PdppRecordsRouteDeps,
+} from "./routes/pdpp-records.js";
 import { pdppInstanceBindingRoutes } from "./routes/pdpp-instance-bindings.js";
 import { pdppBlobsRoutes } from "./routes/pdpp-blobs.js";
 import { pdppWellKnownRoutes } from "./routes/pdpp-well-known.js";
@@ -245,6 +248,9 @@ export interface AppDeps {
         bytes: Uint8Array;
         mimeType: string;
       }): ReturnType<PdppRecordStore["storeBlobBytes"]>;
+      replaceStream: NonNullable<
+        PdppRecordsRouteDeps["bindingStore"]
+      >["replaceStream"];
     };
     configuredMethods: Map<string, string[]>;
     auth: PdppAuthorizationService;
