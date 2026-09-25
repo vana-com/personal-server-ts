@@ -1,9 +1,8 @@
 import type { Database } from "better-sqlite3";
 import { createHash } from "node:crypto";
 import {
-  encodeRecordKey,
-  keyMatchesData,
-  RecordKeyError,
+  planIngest,
+  summarizeIngest,
   decodeCursor,
   encodeCursor,
   InvalidCursorSyntaxError,
@@ -13,6 +12,7 @@ import {
   type PdppRecordStore,
   type ChangesSinceOptions,
   type ChangesSincePage,
+  type IngestOutcome,
   type IngestResult,
   type ListRecordsOptions,
   type ListRecordsPage,
@@ -265,123 +265,75 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore {
 
   function ingestBatch(
     envelopes: PdppRecordEnvelopeInput[],
-    streamSemantics: (stream: string) => StreamSemantics,
-    primaryKeyFields: (stream: string) => string[],
+    streamSemantics: (stream: string, instance: string) => StreamSemantics,
+    primaryKeyFields: (stream: string, instance: string) => string[],
   ): IngestResult {
-    const rejected: IngestResult["rejected"] = [];
-    let accepted = 0;
+    const results: IngestOutcome[] = [];
 
-    // The whole batch is one SQLite transaction: a failure partway rolls
-    // back every write from this call, never leaving partial version/
-    // record_changes state (validation rejections below don't count as
-    // "failure" — they're recorded and the transaction proceeds with the
-    // remaining valid envelopes).
+    // The whole batch is one SQLite transaction: a thrown error rolls back
+    // every write from this call, never leaving partial version/
+    // record_changes state. A rejected envelope is an outcome, not a
+    // failure: it writes nothing and the rest of the batch proceeds.
+    // Reads inside the transaction see earlier writes of the same batch, so
+    // two envelopes for one key are decided in order.
     const runBatch = db.transaction(() => {
       envelopes.forEach((envelope, index) => {
-        try {
-          const semantics = streamSemantics(envelope.stream);
-          const pkFields = primaryKeyFields(envelope.stream);
-          const recordKeyStr = encodeRecordKey(envelope.key);
+        const plan = planIngest(
+          index,
+          envelope,
+          streamSemantics(envelope.stream, envelope.instance),
+          primaryKeyFields(envelope.stream, envelope.instance),
+          (recordKey) => {
+            const row = getCurrentStmt.get(
+              envelope.instance,
+              envelope.stream,
+              recordKey,
+            ) as RecordRowDb | undefined;
+            return row
+              ? {
+                  deleted: row.deleted === 1,
+                  data: row.data ? JSON.parse(row.data) : null,
+                }
+              : undefined;
+          },
+        );
+        results.push(plan.outcome);
+        if (!plan.write) return;
 
-          if (envelope.op === "delete") {
-            if (semantics === "append_only") {
-              rejected.push({
-                index,
-                reason: "append_only streams do not support delete directives",
-              });
-              return;
-            }
-            const version =
-              latestVersion(envelope.instance, envelope.stream, recordKeyStr) +
-              1;
-            const writtenAt = nextWriteSeq.get() as { value: number };
-            upsertCurrentStmt.run({
-              instance: envelope.instance,
-              stream: envelope.stream,
-              record_key: recordKeyStr,
-              data: null,
-              version,
-              emitted_at: envelope.emitted_at,
-              deleted: 1,
-              deleted_at: envelope.emitted_at,
-              blob_id: null,
-            });
-            insertHistoryStmt.run({
-              instance: envelope.instance,
-              stream: envelope.stream,
-              record_key: recordKeyStr,
-              version,
-              data: null,
-              emitted_at: envelope.emitted_at,
-              deleted: 1,
-              deleted_at: envelope.emitted_at,
-              written_at: writtenAt.value,
-            });
-            accepted += 1;
-            return;
-          }
-
-          if (!envelope.data) {
-            rejected.push({ index, reason: "data is required for upsert" });
-            return;
-          }
-
-          if (!keyMatchesData(envelope.key, envelope.data, pkFields)) {
-            rejected.push({
-              index,
-              reason:
-                "envelope key does not match data's declared primary_key fields",
-            });
-            return;
-          }
-
-          const existing = getCurrentStmt.get(
-            envelope.instance,
-            envelope.stream,
-            recordKeyStr,
-          ) as RecordRowDb | undefined;
-
-          if (semantics === "append_only" && existing) {
-            // Duplicate key on append_only is a no-op, not an error.
-            return;
-          }
-
-          const version =
-            latestVersion(envelope.instance, envelope.stream, recordKeyStr) + 1;
-          const writtenAt = nextWriteSeq.get() as { value: number };
-          const dataJson = JSON.stringify(envelope.data);
-          upsertCurrentStmt.run({
-            instance: envelope.instance,
-            stream: envelope.stream,
-            record_key: recordKeyStr,
-            data: dataJson,
-            version,
-            emitted_at: envelope.emitted_at,
-            deleted: 0,
-            deleted_at: null,
-            blob_id: extractBlobId(envelope.data),
-          });
-          insertHistoryStmt.run({
-            instance: envelope.instance,
-            stream: envelope.stream,
-            record_key: recordKeyStr,
-            version,
-            data: dataJson,
-            emitted_at: envelope.emitted_at,
-            deleted: 0,
-            deleted_at: null,
-            written_at: writtenAt.value,
-          });
-          accepted += 1;
-        } catch (err) {
-          if (!(err instanceof RecordKeyError)) throw err;
-          rejected.push({ index, reason: err.message });
-        }
+        const { recordKey, data } = plan.write;
+        const deleted = data === null;
+        const version =
+          latestVersion(envelope.instance, envelope.stream, recordKey) + 1;
+        const writtenAt = nextWriteSeq.get() as { value: number };
+        const dataJson = deleted ? null : JSON.stringify(data);
+        const deletedAt = deleted ? envelope.emitted_at : null;
+        upsertCurrentStmt.run({
+          instance: envelope.instance,
+          stream: envelope.stream,
+          record_key: recordKey,
+          data: dataJson,
+          version,
+          emitted_at: envelope.emitted_at,
+          deleted: deleted ? 1 : 0,
+          deleted_at: deletedAt,
+          blob_id: extractBlobId(data),
+        });
+        insertHistoryStmt.run({
+          instance: envelope.instance,
+          stream: envelope.stream,
+          record_key: recordKey,
+          version,
+          data: dataJson,
+          emitted_at: envelope.emitted_at,
+          deleted: deleted ? 1 : 0,
+          deleted_at: deletedAt,
+          written_at: writtenAt.value,
+        });
       });
     });
 
     runBatch();
-    return { accepted, rejected };
+    return summarizeIngest(results);
   }
 
   function getRecord(

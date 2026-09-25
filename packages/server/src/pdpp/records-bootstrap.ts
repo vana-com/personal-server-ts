@@ -33,8 +33,9 @@ import type { Database } from "better-sqlite3";
 import type { Logger } from "pino";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
-  createStreamDeclarationRegistry,
+  createSourceStreamDeclarationRegistry,
   type PdppRecordStore,
+  type SourceStreamDeclarations,
   type StreamDeclaration,
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
@@ -83,29 +84,48 @@ export function createPdppRecordsDeps(
   // No authorization server means no authority to enforce against.
   if (!pdppAuth || !options.serverOwner) return undefined;
 
-  const streams = options.declarations.flatMap(toStreamDeclarations);
+  const subjectId = options.serverOwner.toLowerCase();
+
+  // Every instance handle this deployment can produce, derived the same way
+  // the AS derives them at issuance, so an owner read and a grant-bound read
+  // agree about which instances exist. Each instance holds exactly one
+  // source's records, so its streams are validated against that source's
+  // declaration and no other.
+  const sources: SourceStreamDeclarations[] = [];
+  for (const snapshot of options.declarations) {
+    const instance = singleInstanceInventory(
+      subjectId,
+      snapshot.source_id,
+    ).eligibleFor("")[0];
+    const claimant = sources.find((s) => s.instance === instance);
+    if (claimant) {
+      // Two source ids that derive one instance would write one set of
+      // rows under two authorities. Keep the first and refuse the rest.
+      logger.warn(
+        {
+          sourceId: snapshot.source_id,
+          instance,
+          claimedBy: claimant.sourceId,
+        },
+        "PDPP declaration shares an instance with another source — its streams are not mounted",
+      );
+      continue;
+    }
+    sources.push({
+      sourceId: snapshot.source_id,
+      instance,
+      streams: toStreamDeclarations(snapshot),
+    });
+  }
+
+  const streams = sources.flatMap((source) => source.streams);
   if (streams.length === 0) {
     logger.warn(
       "PDPP retained declarations define no streams — resource server not mounted",
     );
     return undefined;
   }
-
-  const subjectId = options.serverOwner.toLowerCase();
-
-  // Every instance handle this deployment can produce, derived the same way
-  // the AS derives them at issuance, so an owner read and a grant-bound read
-  // agree about which instances exist.
-  const instances = Array.from(
-    new Set(
-      options.declarations.map(
-        (snapshot) =>
-          singleInstanceInventory(subjectId, snapshot.source_id).eligibleFor(
-            "",
-          )[0],
-      ),
-    ),
-  );
+  const instances = sources.map((source) => source.instance);
 
   logger.info(
     { streams: streams.map((s) => s.name), resource: options.resource },
@@ -117,7 +137,7 @@ export function createPdppRecordsDeps(
   return {
     store,
     auth: coLocatedAuthorizationService(pdppAuth),
-    declarations: createStreamDeclarationRegistry(streams),
+    declarations: createSourceStreamDeclarationRegistry(sources),
     // This deployment has exactly one owner. A subject other than that
     // owner (however it got an "owner"-kind token) owns none of these
     // instances — comparison normalized the same way subjectId is derived

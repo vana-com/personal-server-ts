@@ -1001,7 +1001,12 @@ describe("pdpp records routes: record ingest ownership", () => {
     });
 
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ accepted: 1, rejected: [] });
+    expect(await res.json()).toEqual({
+      accepted: 1,
+      unchanged: 0,
+      rejected: [],
+      results: [{ index: 0, outcome: "accepted" }],
+    });
     expect(store.getRecord("inst_1", "playlists", "pl_1")?.data).toEqual({
       id: "pl_1",
     });

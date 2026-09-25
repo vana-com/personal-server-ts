@@ -144,15 +144,16 @@ describe("mounting is conditional on the deployment being able to serve PDPP", (
     expect(response.status).toBe(404);
   });
 
-  it("does not mount a declaration for a connector this server does not serve", async () => {
-    // The trust policy is derived from real inventory. This PS holds only
-    // instagram data, so a spotify declaration is refused — no trust-all.
+  it("mounts a configured declaration for a connector with no data here yet", async () => {
+    // Configuration is the admission decision. A fresh install holds no
+    // legacy data for the source it was just configured for, and must still
+    // mount it; only runtime submissions are held to the data inventory.
     await seedScope("instagram.profile");
     ctx = await boot(pdppConfig([await writeDeclaration()]));
     const response = await ctx.app.request("/pdpp/v1/owner/token", {
       method: "POST",
     });
-    expect(response.status).toBe(404);
+    expect(response.status).not.toBe(404);
   });
 
   it("does not mount a malformed declaration", async () => {

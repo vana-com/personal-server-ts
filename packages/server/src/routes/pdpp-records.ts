@@ -16,6 +16,9 @@ import {
   mapInactiveToError,
   recordWithinGrantTimeConstraint,
   resolveReadScope,
+  summarizeIngest,
+  type IngestOutcome,
+  type PdppRecordEnvelopeInput,
   type PdppRecordRow,
   type PdppRecordStore,
   type StreamDeclaration,
@@ -25,6 +28,12 @@ import {
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
 export const MAX_BLOB_UPLOAD_BYTES = 32 * 1024 * 1024;
+/**
+ * Desktop caps one connector run's captured records at 32 MiB, and it sends
+ * one record per ingest request. JSON escaping can grow a record's encoded
+ * size, so the limit leaves room above the capture cap rather than matching it.
+ */
+export const MAX_INGEST_BODY_BYTES = 64 * 1024 * 1024;
 
 const BLOB_MEDIA_TYPE =
   /^(application|audio|example|font|haptics|image|message|model|multipart|text|video)\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/i;
@@ -40,41 +49,49 @@ function blobMediaType(contentType: string | undefined): string {
   return mediaType;
 }
 
-async function readBoundedBlobBytes(request: Request): Promise<Uint8Array> {
+/**
+ * Read a request body of at most `maxBytes`, refusing early on a declared
+ * Content-Length over the limit and while streaming otherwise, so an
+ * oversize body is never buffered whole.
+ */
+async function readBoundedBody(
+  request: Request,
+  maxBytes: number,
+  label: "Blob" | "Ingest",
+): Promise<Uint8Array> {
+  const tooLarge = () =>
+    new PdppError(
+      "invalid_request",
+      `${label} body exceeds the ${maxBytes / (1024 * 1024)} MiB limit`,
+    );
   const contentLength = request.headers.get("content-length");
   if (
     contentLength !== null &&
-    (!/^\d+$/.test(contentLength) ||
-      Number(contentLength) > MAX_BLOB_UPLOAD_BYTES)
+    (!/^\d+$/.test(contentLength) || Number(contentLength) > maxBytes)
   ) {
-    throw new PdppError(
-      "invalid_request",
-      "Blob body exceeds the 32 MiB limit",
-    );
+    throw tooLarge();
   }
   const reader = request.body?.getReader();
-  if (!reader) throw new PdppError("invalid_request", "Blob body is empty");
+  if (!reader) throw new PdppError("invalid_request", `${label} body is empty`);
   const chunks: Uint8Array[] = [];
   let size = 0;
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
     size += value.byteLength;
-    if (size > MAX_BLOB_UPLOAD_BYTES) {
+    if (size > maxBytes) {
       // Cancellation is best effort; a stalled source must not hold the 400 response.
       void reader.cancel().catch(() => undefined);
-      throw new PdppError(
-        "invalid_request",
-        "Blob body exceeds the 32 MiB limit",
-      );
+      throw tooLarge();
     }
     chunks.push(value);
   }
-  if (size === 0) throw new PdppError("invalid_request", "Blob body is empty");
+  if (size === 0)
+    throw new PdppError("invalid_request", `${label} body is empty`);
   if (contentLength !== null && size !== Number(contentLength)) {
     throw new PdppError(
       "invalid_request",
-      "Content-Length does not match blob body",
+      `Content-Length does not match ${label.toLowerCase()} body`,
     );
   }
   const bytes = new Uint8Array(size);
@@ -84,6 +101,22 @@ async function readBoundedBlobBytes(request: Request): Promise<Uint8Array> {
     offset += chunk.byteLength;
   }
   return bytes;
+}
+
+function parseIngestBody(bytes: Uint8Array): unknown {
+  let body: unknown;
+  try {
+    body = JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    throw new PdppError("invalid_request", "Ingest body is not valid JSON");
+  }
+  if (body === null || typeof body !== "object") {
+    throw new PdppError(
+      "invalid_request",
+      "Ingest body must be a RECORD envelope or an array of envelopes",
+    );
+  }
+  return body;
 }
 
 export interface PdppRecordsRouteDeps {
@@ -648,6 +681,39 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     await next();
   });
 
+  /**
+   * The declaration a read of `stream` is measured against.
+   *
+   * A client reads under its grant, which names one source. An owner reads
+   * every owned instance whose source declares the stream; `ownerInstanceIds`
+   * is that set, so an owner read of a shared name never reaches an instance
+   * of a source that does not declare it. For an owner read the declaration
+   * only answers "does this stream exist"; records carry their own shape.
+   */
+  function readDeclaration(
+    context: PdppTokenContext,
+    stream: string,
+  ): {
+    declaration: StreamDeclaration | undefined;
+    ownerInstanceIds: string[];
+  } {
+    if (context.tokenKind !== "owner") {
+      return {
+        declaration: deps.declarations.get(stream, context.grant?.source.id),
+        ownerInstanceIds: [],
+      };
+    }
+    const owned = deps.instancesForSubject?.(requireSubjectId(context)) ?? [];
+    const ownerInstanceIds = owned.filter((instance) =>
+      deps.declarations.forInstance(instance, stream),
+    );
+    const declaration =
+      ownerInstanceIds.length > 0
+        ? deps.declarations.forInstance(ownerInstanceIds[0], stream)
+        : deps.declarations.get(stream);
+    return { declaration, ownerInstanceIds };
+  }
+
   app.get("/streams", async (c) => {
     const reqId = requestId();
     const { context, error } = await authenticate(c, reqId);
@@ -753,7 +819,23 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     try {
       rejectUnknownParams(c, "streamMetadata");
       const stream = c.req.param("stream");
-      const declaration = deps.declarations.get(stream);
+      const declaration =
+        context!.tokenKind === "client"
+          ? deps.declarations.get(stream, context!.grant?.source.id)
+          : deps.declarations.get(stream);
+      if (
+        !declaration &&
+        context!.tokenKind === "owner" &&
+        deps.declarations.declares(stream)
+      ) {
+        // An owner token spans every owned instance, and more than one
+        // source declares this name with its own key and schema. There is
+        // no single honest answer until owner reads can name an instance.
+        throw new PdppError(
+          "invalid_request",
+          `Stream '${stream}' is declared by more than one source`,
+        );
+      }
       const scope = resolveReadScope(context!, stream, declaration);
 
       if (context!.tokenKind === "owner") {
@@ -818,12 +900,13 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       rejectUnknownParams(c, "listRecords", context!.tokenKind);
       const stream = c.req.param("stream");
 
-      const declaration = deps.declarations.get(stream);
+      const { declaration, ownerInstanceIds } = readDeclaration(
+        context!,
+        stream,
+      );
       const scope = resolveReadScope(context!, stream, declaration);
       const effectiveInstanceIds =
-        context!.tokenKind === "owner"
-          ? (deps.instancesForSubject?.(requireSubjectId(context!)) ?? [])
-          : scope.instanceIds;
+        context!.tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds;
 
       const { limit, clamped } = parseLimit(c.req.query("limit"));
       const order = parseOrder(c.req.query("order"));
@@ -1010,13 +1093,14 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       // narrower thing happened instead.
       const stream = c.req.param("stream");
       const recordKey = decodeURIComponent(c.req.param("id"));
-      const declaration = deps.declarations.get(stream);
+      const { declaration, ownerInstanceIds } = readDeclaration(
+        context!,
+        stream,
+      );
       const scope = resolveReadScope(context!, stream, declaration);
 
       const effectiveInstanceIds =
-        context!.tokenKind === "owner"
-          ? (deps.instancesForSubject?.(requireSubjectId(context!)) ?? [])
-          : scope.instanceIds;
+        context!.tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds;
 
       if (!recordKeyWithinGrantResources(recordKey, scope.streamGrant)) {
         throw new PdppError("not_found", "Record not found");
@@ -1104,13 +1188,16 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       }
       const stream = c.req.param("stream");
       const recordKey = decodeURIComponent(c.req.param("id"));
-      const declaration = deps.declarations.get(stream);
-      if (!declaration) throw new PdppError("not_found", "Stream not found");
+      if (!deps.declarations.declares(stream)) {
+        throw new PdppError("not_found", "Stream not found");
+      }
 
       const effectiveInstanceIds =
         deps.instancesForSubject?.(requireSubjectId(context!)) ?? [];
       let deletedAny = false;
       for (const instance of effectiveInstanceIds) {
+        const declaration = deps.declarations.forInstance(instance, stream);
+        if (!declaration) continue;
         if (
           deps.store.deleteRecord(
             instance,
@@ -1159,35 +1246,87 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         );
       }
       const stream = c.req.param("stream");
-      const declaration = deps.declarations.get(stream);
-      if (!declaration) throw new PdppError("not_found", "Stream not found");
-
-      const body = await c.req.json();
-      const envelopes = (Array.isArray(body) ? body : [body]).map((e) => ({
-        instance: e.instance,
-        stream,
-        key: e.key,
-        data: e.data ?? null,
-        emitted_at: e.emitted_at,
-        op: e.op,
-      }));
-      const ownedInstances =
-        deps.instancesForSubject?.(context!.subjectId) ?? [];
-      if (!envelopes.every((e) => ownedInstances.includes(e.instance))) {
-        throw new PdppError(
-          "authentication_error",
-          "Ingest requires an owned instance",
-        );
+      if (!deps.declarations.declares(stream)) {
+        throw new PdppError("not_found", "Stream not found");
       }
 
-      const result = deps.store.ingestBatch(
-        envelopes,
-        () => declaration.semantics,
-        () => declaration.primaryKey,
+      const body = parseIngestBody(
+        await readBoundedBody(c.req.raw, MAX_INGEST_BODY_BYTES, "Ingest"),
       );
+      const entries = Array.isArray(body) ? body : [body];
+
+      // Each entry gets exactly one outcome, by input index. Entries that
+      // cannot reach the store are decided here; the rest go to the store in
+      // one batch and their outcomes are mapped back to input positions.
+      const results: IngestOutcome[] = new Array(entries.length);
+      const admitted: { index: number; envelope: PdppRecordEnvelopeInput }[] =
+        [];
+      const ownedInstances =
+        deps.instancesForSubject?.(context!.subjectId) ?? [];
+      entries.forEach((entry, index) => {
+        if (
+          entry === null ||
+          typeof entry !== "object" ||
+          Array.isArray(entry)
+        ) {
+          results[index] = {
+            index,
+            outcome: "rejected",
+            reason: "envelope must be a JSON object",
+          };
+          return;
+        }
+        const e = entry as Record<string, unknown>;
+        if (
+          typeof e.instance !== "string" ||
+          !ownedInstances.includes(e.instance)
+        ) {
+          throw new PdppError(
+            "authentication_error",
+            "Ingest requires an owned instance",
+          );
+        }
+        if (!deps.declarations.forInstance(e.instance, stream)) {
+          results[index] = {
+            index,
+            outcome: "rejected",
+            reason: `the source of instance '${e.instance}' does not declare stream '${stream}'`,
+          };
+          return;
+        }
+        admitted.push({
+          index,
+          envelope: {
+            instance: e.instance,
+            stream,
+            key: e.key as PdppRecordEnvelopeInput["key"],
+            data: (e.data ?? null) as PdppRecordEnvelopeInput["data"],
+            emitted_at: e.emitted_at as string,
+            op: e.op as PdppRecordEnvelopeInput["op"],
+          },
+        });
+      });
+
+      const declarationFor = (instance: string) =>
+        deps.declarations.forInstance(instance, stream)!;
+      const stored = deps.store.ingestBatch(
+        admitted.map((a) => a.envelope),
+        (_stream, instance) => declarationFor(instance).semantics,
+        (_stream, instance) => declarationFor(instance).primaryKey,
+      );
+      stored.results.forEach((result, position) => {
+        const index = admitted[position].index;
+        results[index] = { ...result, index };
+      });
+      const summary = summarizeIngest(results);
 
       return c.json(
-        { accepted: result.accepted, rejected: result.rejected },
+        {
+          accepted: summary.accepted,
+          unchanged: summary.unchanged,
+          rejected: summary.rejected,
+          results: summary.results,
+        },
         200,
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
       );
@@ -1235,7 +1374,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         );
       }
       const mimeType = blobMediaType(c.req.header("content-type"));
-      const bytes = await readBoundedBlobBytes(c.req.raw);
+      const bytes = await readBoundedBody(
+        c.req.raw,
+        MAX_BLOB_UPLOAD_BYTES,
+        "Blob",
+      );
 
       const meta = deps.store.storeBlobBytes(bytes, mimeType);
       return c.json(

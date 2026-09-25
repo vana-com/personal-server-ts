@@ -130,7 +130,10 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
     // grant can see — instance scope, resources allowlist, time_constraint,
     // and blob_ref must be in the granted fields for that record's stream.
     for (const reference of references) {
-      const declaration = deps.declarations.get(reference.stream);
+      const declaration = deps.declarations.forInstance(
+        reference.instance,
+        reference.stream,
+      );
       let scope;
       try {
         scope = resolveReadScope(context, reference.stream, declaration);

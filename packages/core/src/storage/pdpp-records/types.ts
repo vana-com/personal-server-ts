@@ -17,7 +17,8 @@ export interface PdppRecordEnvelopeInput {
   key: EnvelopeKey;
   data: Record<string, unknown> | null;
   emitted_at: string;
-  op?: "upsert" | "delete";
+  /** Absent or `null` means upsert. */
+  op?: "upsert" | "delete" | null;
 }
 
 export interface PdppStoredRecord {
@@ -47,9 +48,27 @@ export interface IngestRejection {
   reason: string;
 }
 
+/**
+ * What ingest did with one envelope.
+ *
+ * - `accepted`: a new version was written.
+ * - `unchanged`: the stored content already equals the envelope, so nothing
+ *   was written (no version, history row, or write-clock tick). For an
+ *   `append_only` key whose stored data differs, the first write stands and
+ *   the outcome carries `flag: "append_only_conflict"`.
+ * - `rejected`: the envelope is invalid; nothing was written for it.
+ */
+export type IngestOutcome =
+  | { index: number; outcome: "accepted" }
+  | { index: number; outcome: "unchanged"; flag?: "append_only_conflict" }
+  | { index: number; outcome: "rejected"; reason: string };
+
 export interface IngestResult {
   accepted: number;
+  unchanged: number;
   rejected: IngestRejection[];
+  /** One entry per input envelope, in input order. */
+  results: IngestOutcome[];
 }
 
 export interface ListRecordsOptions {

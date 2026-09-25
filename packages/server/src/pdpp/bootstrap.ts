@@ -14,6 +14,7 @@
  * without adding capability.
  */
 
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Logger } from "pino";
@@ -101,8 +102,10 @@ export async function createPdppAuthDeps(
     return undefined;
   }
 
-  // The connector inventory is what this PS actually holds, not a config
-  // assertion. A declaration for a source with no data here is refused.
+  // The connector inventory is what this PS holds. It gates runtime
+  // submissions only. A configured declaration is admitted without it: the
+  // operator (Desktop, after verifying the signed artifact) chose it, and a
+  // fresh server that holds no legacy data yet must still mount it.
   const { scopes } = options.indexManager.listDistinctScopes();
   const supportedConnectors = deriveSupportedConnectors(
     scopes.map((s) => s.scope),
@@ -114,10 +117,9 @@ export async function createPdppAuthDeps(
   );
 
   // The durable registry the submission route writes to, seeded from the
-  // configured paths. A deployment that only ever configures declarations
-  // behaves exactly as before — same validator, same connector gate, same
-  // warnings — while a submitted declaration becomes resolvable in this
-  // lifetime and survives the next restart.
+  // configured paths. Seeds and submissions share one validator; only
+  // submissions are held to the connector gate. A submitted declaration
+  // becomes resolvable in this lifetime and survives the next restart.
   const declarationRegistry = openDeclarationRegistry({
     path: join(options.storageRoot, "pdpp-declarations.db"),
     supportedConnectors,
@@ -288,13 +290,26 @@ export async function createPdppAuthDeps(
  * refuse to mount if nothing survives.
  */
 async function readDeclarations(
-  paths: string[],
+  entries: ServerConfig["pdpp"]["declarationPaths"],
   logger: Logger,
 ): Promise<ConfiguredDeclaration[]> {
   const out: ConfiguredDeclaration[] = [];
-  for (const path of paths) {
+  for (const entry of entries) {
+    const path = typeof entry === "string" ? entry : entry.path;
     try {
       const document = await readFile(path, "utf-8");
+      if (typeof entry !== "string") {
+        const actual = createHash("sha256")
+          .update(document, "utf8")
+          .digest("hex");
+        if (actual !== entry.sha256) {
+          logger.warn(
+            { path, expected: entry.sha256, actual },
+            "PDPP declaration does not match its pinned digest — skipped",
+          );
+          continue;
+        }
+      }
       // The source id is the declaration's own claim; `parseDeclaration`
       // cross-checks it, so read it here only to key the retention.
       //
