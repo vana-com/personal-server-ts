@@ -1019,6 +1019,87 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
   });
 });
 
+describe("$pdpp import over POST /v1/data", () => {
+  it("writes no canonical row and settles the envelope when no method is configured", async () => {
+    const WHOOP = "https://registry.pdpp.dev/connectors/whoop";
+    const document = JSON.stringify({
+      source_id: WHOOP,
+      source_kind: "connector",
+      version: "1",
+      streams: [
+        {
+          name: "sleep",
+          fields: ["id", "score"],
+          required_fields: ["id"],
+          primary_key: ["id"],
+          schema: {
+            type: "object",
+            properties: { id: { type: "string" }, score: { type: "integer" } },
+            required: ["id"],
+            additionalProperties: false,
+          },
+        },
+      ],
+    });
+    const path = await writeDeclaration("whoop", document);
+    ctx = await boot([path], []);
+    const logs: unknown[] = [];
+    const warn = ctx.logger.warn.bind(ctx.logger);
+    ctx.logger.warn = ((...args: unknown[]) => {
+      logs.push(args[0]);
+      return (warn as (...a: unknown[]) => void)(...args);
+    }) as typeof ctx.logger.warn;
+
+    const response = await ctx.app.request("/v1/data/whoop.sleep", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${ctx.devToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        id: "s1",
+        score: "not-an-integer",
+        extra: true,
+        $pdpp: {
+          version: 1,
+          sourceId: WHOOP,
+          declaration: {
+            source: "whoop",
+            version: "1",
+            upstreamCommit: null,
+            digest: `sha256:${sha256(document)}`,
+          },
+          stream: {
+            name: "sleep",
+            scope: "whoop.sleep",
+            semantics: "mutable_state",
+            primaryKey: ["id"],
+          },
+          record: { key: { id: "s1" }, op: "upsert" },
+        },
+      }),
+    });
+    expect(response.status).toBe(201);
+
+    const db = new Database(join(tempDir, "index.db"), { readonly: true });
+    try {
+      expect(
+        db.prepare("SELECT COUNT(*) AS n FROM pdpp_records").get(),
+      ).toEqual({ n: 0 });
+    } finally {
+      db.close();
+    }
+    expect(storeCounters()).toEqual({ clock: 0, changes: 0 });
+    expect(logs).toContainEqual(
+      expect.objectContaining({
+        code: "method_authority",
+        message: "method_required",
+        permanent: true,
+      }),
+    );
+  });
+});
+
 describe("P10c and method authority over HTTP", () => {
   async function bootSwitchable() {
     const ouraPath = await writeDeclaration("oura", OURA_DECLARATION);
