@@ -70,6 +70,7 @@ import {
   type RecomputeScheduler,
 } from "@opendatalabs/personal-server-ts-core/derivatives";
 import { executeJob, type JobWorkerDeps } from "./jobs/worker.js";
+import { openLocalMcpState } from "./mcp/local-state.js";
 
 const TRAILING_SLASHES = /\/+$/;
 
@@ -590,6 +591,17 @@ export async function createServer(
           })
       : undefined;
 
+  // Standard mode keeps MCP clients (e.g. a claude.ai connector) signed in
+  // across restarts. Enclaves use the TEE ingress's own sealed state.
+  const mcpState =
+    !isEnclave && masterKeySignature
+      ? await openLocalMcpState({
+          path: join(storageRoot, "mcp-state.json"),
+          masterKey: deriveMasterKey(masterKeySignature),
+          logger,
+        })
+      : undefined;
+
   const app = createApp({
     mcpHydrateScopes:
       isEnclave && jobSyncManager
@@ -629,6 +641,8 @@ export async function createServer(
     serverSigner,
     getTunnelStatus: () => tunnelManager?.getStatus() ?? null,
     mcpOAuthApprovalUrl: options?.mcpOAuthApprovalUrl,
+    mcpConnectionStore: mcpState?.connections,
+    mcpOAuthAuthorizationStore: mcpState?.authorizations,
     onServerRegistered: (serverId) => notifyServerRegistered(serverId),
     profile: options?.profile,
     jobWorker,
