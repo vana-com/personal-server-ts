@@ -204,6 +204,34 @@ describe("download worker", () => {
       });
     });
 
+    it("preserves envelope producer attribution and indexes it after a sync download", async () => {
+      const deps = makeMockDeps();
+      const source = {
+        projector_version: "1",
+        declaration_digest: "sha256:declaration",
+        inputs: [{ stream: "profile", changes_since_token: "opaque" }],
+        payload_sha256: "a".repeat(64),
+      };
+      const envelope = {
+        ...makeEnvelope(),
+        producer: "pdpp-projector",
+        producer_provenance: source,
+      };
+      (decryptWithPassword as ReturnType<typeof vi.fn>).mockResolvedValue(
+        new TextEncoder().encode(JSON.stringify(envelope)),
+      );
+
+      await downloadOne(deps, makeDataPointRecord());
+
+      expect(deps.storage.writeEnvelope).toHaveBeenCalledWith(envelope);
+      expect(deps.storage.insertEntry).toHaveBeenCalledWith(
+        expect.objectContaining({
+          producer: "pdpp-projector",
+          producerProvenance: JSON.stringify(source),
+        }),
+      );
+    });
+
     it("clears the encrypted download after decryption completes", async () => {
       const deps = makeMockDeps();
       const encrypted = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);

@@ -31,12 +31,14 @@ const logger = pino({ level: "silent" });
 const OWNER = "user_abc123";
 const OTHER_OWNER = "user_other";
 const REDIRECT = "https://app.example.com/callback";
+const SOURCE_ID = "https://registry.pdpp.dev/connectors/spotify";
+const OWNER_INSTANCE = "spotify-account-a";
 /** RFC 7636 §4.1 verifier + its S256 challenge, used by every code flow here. */
 const VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const CHALLENGE = computeS256Challenge(VERIFIER);
 
 const snapshot: DeclarationSnapshot = {
-  source_id: "https://registry.pdpp.dev/connectors/spotify",
+  source_id: SOURCE_ID,
   source_kind: "connector",
   version: "2026-08-11",
   digest: "d".repeat(64),
@@ -93,6 +95,14 @@ function post(
     headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify(body),
   });
+}
+
+function ownerTokenBody(overrides: Record<string, unknown> = {}) {
+  return {
+    source_id: SOURCE_ID,
+    instance_id: OWNER_INSTANCE,
+    ...overrides,
+  };
 }
 
 function postForm(
@@ -1076,7 +1086,7 @@ describe("owner-token exchange", () => {
   it("mints an owner token for a request that passed the owner proof", async () => {
     // The stubbed `currentSubjectId` stands in for the verified signer the
     // web3-auth + owner-check middleware chain populates in production.
-    const response = await post("/pdpp/v1/owner/token", {});
+    const response = await post("/pdpp/v1/owner/token", ownerTokenBody());
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
     const issued = (await response.json()) as {
@@ -1093,6 +1103,7 @@ describe("owner-token exchange", () => {
     expect(context.active).toBe(true);
     expect(context.tokenKind).toBe("owner");
     expect(context.subjectId).toBe(OWNER);
+    expect(context.instanceIds).toEqual([OWNER_INSTANCE]);
     expect(context.grant).toBeUndefined();
   });
 
@@ -1100,12 +1111,35 @@ describe("owner-token exchange", () => {
     // Fails closed rather than inventing a subject: an owner token for an
     // unidentified subject is the credential this design exists to prevent.
     authenticatedSubject = null;
-    const response = await post("/pdpp/v1/owner/token", {});
+    const response = await post("/pdpp/v1/owner/token", ownerTokenBody());
     expect(response.status).toBe(401);
   });
 
+  it("refuses to mint without exactly one requested instance", async () => {
+    const missing = await post("/pdpp/v1/owner/token", {
+      source_id: SOURCE_ID,
+    });
+    expect(missing.status).toBe(400);
+
+    const array = await post("/pdpp/v1/owner/token", {
+      source_id: SOURCE_ID,
+      instance_id: [OWNER_INSTANCE],
+    });
+    expect(array.status).toBe(400);
+  });
+
+  it("refuses to mint for an instance the owner does not own", async () => {
+    const response = await post(
+      "/pdpp/v1/owner/token",
+      ownerTokenBody({ instance_id: "spotify-account-b" }),
+    );
+    expect(response.status).toBe(403);
+  });
+
   it("mints a token usable end-to-end for approval", async () => {
-    const minted = (await (await post("/pdpp/v1/owner/token", {})).json()) as {
+    const minted = (await (
+      await post("/pdpp/v1/owner/token", ownerTokenBody())
+    ).json()) as {
       access_token: string;
     };
 
@@ -1132,7 +1166,7 @@ describe("owner-token exchange", () => {
   it("mints a token scoped to its own subject only", async () => {
     // A token minted for one owner is not authority over another's session.
     const mintedForOwner = (await (
-      await post("/pdpp/v1/owner/token", {})
+      await post("/pdpp/v1/owner/token", ownerTokenBody())
     ).json()) as { access_token: string };
 
     const created = await post("/pdpp/v1/authorize", selectionBody());

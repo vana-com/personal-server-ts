@@ -99,6 +99,8 @@ export interface PdppTokenContext {
    */
   tokenKind?: PdppTokenKind;
   subjectId?: string;
+  /** Owner tokens only. The RS enforces this persisted scope directly. */
+  instanceIds?: string[];
   /** Client tokens only. */
   grant?: Grant;
   clientId?: string;

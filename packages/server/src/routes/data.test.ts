@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm, readFile, readdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { pino } from "pino";
@@ -138,12 +139,14 @@ async function postWithOwnerAuth(
     contentType?: string;
     rawBody?: string;
     wallet?: typeof ownerWallet;
+    headers?: Record<string, string>;
   } = {},
 ) {
   const {
     contentType = "application/json",
     rawBody,
     wallet: signingWallet = ownerWallet,
+    headers = {},
   } = options;
   const requestBody =
     rawBody !== undefined
@@ -166,6 +169,7 @@ async function postWithOwnerAuth(
     headers: {
       "Content-Type": contentType,
       Authorization: auth,
+      ...headers,
     },
   };
   if (requestBody !== undefined) init.body = requestBody;
@@ -262,6 +266,34 @@ describe("POST /v1/data/:scope", () => {
     });
 
     expect(res.status).toBe(201);
+    localIndexManager.close();
+  });
+
+  it("rejects a PDPP owner token on legacy scope ingest without writing", async () => {
+    const localIndexManager = createIndexManager(
+      initializeDatabase(":memory:"),
+    );
+    const localApp = dataRoutes({
+      indexManager: localIndexManager,
+      hierarchyOptions,
+      logger,
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+    });
+
+    const res = await localApp.request("/instagram.profile", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer pdpp_owner_token",
+      },
+      body: JSON.stringify({ username: "pdpp-owner" }),
+    });
+
+    expect(res.status).toBe(401);
+    expect(localIndexManager.countByScope("instagram.profile")).toBe(0);
     localIndexManager.close();
   });
 
@@ -940,6 +972,35 @@ describe("GET /v1/data/:scope", () => {
     expect(json.scope).toBe("instagram.profile");
     expect(json.collectedAt).toBeDefined();
     expect(json.data).toEqual({ username: "test_user" });
+  });
+
+  it("serves an attributed projection to a grantee without changing data bytes", async () => {
+    const app = createApp();
+    const data = { username: "test_user" };
+    const provenance = {
+      projector_version: "1",
+      declaration_digest: "sha256:fixture",
+      inputs: [{ stream: "profile", changes_since_token: "opaque" }],
+      payload_sha256: createHash("sha256")
+        .update(JSON.stringify(data))
+        .digest("hex"),
+    };
+    const ingest = await postWithOwnerAuth(app, "instagram.profile", data, {
+      headers: {
+        "Vana-Producer": "pdpp-projector",
+        "Vana-Producer-Provenance": Buffer.from(
+          JSON.stringify(provenance),
+        ).toString("base64url"),
+      },
+    });
+    expect(ingest.status).toBe(201);
+
+    const response = await getWithAuth(app, "instagram.profile");
+    expect(response.status).toBe(200);
+    const envelope = await response.json();
+    expect(JSON.stringify(envelope.data)).toBe(JSON.stringify(data));
+    expect(envelope.producer).toBe("pdpp-projector");
+    expect(envelope.producer_provenance).toEqual(provenance);
   });
 
   it("reports read fulfillment for successful grant-backed reads", async () => {

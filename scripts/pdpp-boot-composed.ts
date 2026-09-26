@@ -23,9 +23,11 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { AddressInfo } from "node:net";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
+import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { createServer } from "../packages/server/src/bootstrap.js";
 import { listenHttpServer } from "../packages/server/src/listen.js";
 import { initializeDatabase } from "../packages/server/src/storage/index-schema.js";
+import { singleInstanceInventory } from "../packages/server/src/pdpp/deployment.js";
 
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
@@ -104,9 +106,17 @@ async function main(): Promise<void> {
   // A real owner token, minted through the mounted route behind the server's
   // own owner proof. The external test cannot mint one itself, which is the
   // point: only the owner's authenticated session can.
+  const subject = (await recoverServerOwner(KNOWN_SIG)).toLowerCase();
+  const instanceId = singleInstanceInventory(subject, SOURCE_ID).eligibleFor(
+    "",
+  )[0];
   const ownerRes = await ctx.app.request("/pdpp/v1/owner/token", {
     method: "POST",
-    headers: { authorization: `Bearer ${ctx.devToken}` },
+    headers: {
+      authorization: `Bearer ${ctx.devToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ source_id: SOURCE_ID, instance_id: instanceId }),
   });
   if (ownerRes.status !== 200) {
     throw new Error(`owner token mint failed: ${ownerRes.status}`);

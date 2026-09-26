@@ -130,7 +130,12 @@ describe("pdpp records routes: 500 observability", () => {
     const store = createMemoryRecordStore();
     const { app } = buildApp(
       {
-        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
       },
       {
         store: {
@@ -263,6 +268,7 @@ describe("pdpp records routes: field projection", () => {
           active: true,
           tokenKind: "owner",
           subjectId: "sub_1",
+          instanceIds: ["inst_1"],
         },
       },
       { store },
@@ -507,7 +513,14 @@ describe("pdpp records routes: tombstones", () => {
       () => ["id"],
     );
     const { app } = buildApp(
-      { "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" } },
+      {
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
+      },
       { store },
     );
 
@@ -555,7 +568,12 @@ describe("pdpp records routes: tombstones", () => {
 describe("pdpp records routes: version negotiation", () => {
   it("returns 400 unsupported_version for an unrecognized PDPP-Version header", async () => {
     const { app } = buildApp({
-      "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+      "owner-tok": {
+        active: true,
+        tokenKind: "owner",
+        subjectId: "sub_1",
+        instanceIds: ["inst_1"],
+      },
     });
     const res = await app.request("/streams", {
       headers: {
@@ -570,7 +588,12 @@ describe("pdpp records routes: version negotiation", () => {
 
   it("echoes the negotiated PDPP-Version on a normal response", async () => {
     const { app } = buildApp({
-      "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+      "owner-tok": {
+        active: true,
+        tokenKind: "owner",
+        subjectId: "sub_1",
+        instanceIds: ["inst_1"],
+      },
     });
     const res = await app.request("/streams", {
       headers: { Authorization: "Bearer owner-tok" },
@@ -589,7 +612,12 @@ describe("pdpp records routes: version negotiation", () => {
     // the same import is the other half of this fix, tracked in this lane's
     // contract file since this lane does not own AS-side files.
     const { app } = buildApp({
-      "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+      "owner-tok": {
+        active: true,
+        tokenKind: "owner",
+        subjectId: "sub_1",
+        instanceIds: ["inst_1"],
+      },
     });
     const res = await app.request("/streams", {
       headers: {
@@ -605,7 +633,12 @@ describe("pdpp records routes: version negotiation", () => {
 describe("pdpp records routes: pagination limit clamping", () => {
   it("clamps a limit above 100 and reports limit_clamped without erroring", async () => {
     const { app } = buildApp({
-      "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+      "owner-tok": {
+        active: true,
+        tokenKind: "owner",
+        subjectId: "sub_1",
+        instanceIds: ["inst_1"],
+      },
     });
     const res = await app.request("/streams/playlists/records?limit=500", {
       headers: { Authorization: "Bearer owner-tok" },
@@ -642,7 +675,14 @@ describe("pdpp records routes: cursor/order mismatch", () => {
       () => ["id"],
     );
     const { app } = buildApp(
-      { "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" } },
+      {
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
+      },
       { store },
     );
     const page1 = await app.request(
@@ -751,7 +791,14 @@ describe("pdpp records routes: cursor/order mismatch", () => {
       () => ["id"],
     );
     const { app } = buildApp(
-      { "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" } },
+      {
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
+      },
       { store, instancesForSubject: () => ["inst_1"] },
     );
     const res = await app.request("/streams/playlists/records", {
@@ -761,6 +808,104 @@ describe("pdpp records routes: cursor/order mismatch", () => {
     const keys = body.data.map((r: { id: string }) => r.id);
     expect(keys).toContain("pl_mine");
     expect(keys).not.toContain("pl_not_mine");
+  });
+
+  it("uses the owner token's persisted instance scope for records and stream listings", async () => {
+    const store = createMemoryRecordStore();
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "playlists",
+          key: "pl_mine",
+          data: { id: "pl_mine", name: "mine" },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+        {
+          instance: "inst_other",
+          stream: "playlists",
+          key: "pl_not_mine",
+          data: { id: "pl_not_mine", name: "not mine" },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+    );
+    const { app } = buildApp(
+      {
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
+      },
+      {
+        store,
+        instancesForSubject: () => ["inst_1", "inst_other"],
+      },
+    );
+
+    const records = await app.request("/streams/playlists/records", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+    expect(records.status).toBe(200);
+    const recordsBody = await records.json();
+    expect(recordsBody.data.map((r: { id: string }) => r.id)).toEqual([
+      "pl_mine",
+    ]);
+
+    const streams = await app.request("/streams", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+    expect(streams.status).toBe(200);
+    const streamsBody = await streams.json();
+    expect(streamsBody.data).toEqual([
+      expect.objectContaining({ name: "playlists", record_count: 1 }),
+    ]);
+
+    const record = await app.request("/streams/playlists/records/pl_not_mine", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+    expect(record.status).toBe(404);
+  });
+
+  it("denies a scoped owner token after current ownership no longer includes its instance", async () => {
+    const store = createMemoryRecordStore();
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "playlists",
+          key: "pl_mine",
+          data: { id: "pl_mine", name: "mine" },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+    );
+    const { app } = buildApp(
+      {
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
+      },
+      {
+        store,
+        instancesForSubject: () => ["inst_other"],
+      },
+    );
+
+    const records = await app.request("/streams/playlists/records", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+    expect(records.status).toBe(403);
+    expect((await records.json()).error.code).toBe("grant_stream_not_allowed");
   });
 });
 
@@ -786,7 +931,14 @@ describe("pdpp records routes: unsupported view/expand shapes", () => {
   it("owner read succeeds without view/expand, then the same shapes are rejected on both record endpoints", async () => {
     const store = ownerStoreWithRecord();
     const { app } = buildApp(
-      { "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" } },
+      {
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
+      },
       { store },
     );
 
@@ -834,7 +986,14 @@ describe("pdpp records routes: unsupported view/expand shapes", () => {
   it("rejects owner expand/view on metadata and list-streams endpoints as invalid_request", async () => {
     const store = ownerStoreWithRecord();
     const { app } = buildApp(
-      { "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" } },
+      {
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
+      },
       { store },
     );
 
@@ -898,7 +1057,14 @@ describe("pdpp records routes: unsupported view/expand shapes", () => {
   it("rejects bare/malformed forms: bare 'expand', bare 'expand_limit', bare 'view'", async () => {
     const store = ownerStoreWithRecord();
     const { app } = buildApp(
-      { "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" } },
+      {
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
+      },
       { store },
     );
 
@@ -916,7 +1082,14 @@ describe("pdpp records routes: unsupported view/expand shapes", () => {
   it("rejects bracketed forms of otherwise-supported base names instead of silently accepting them", async () => {
     const store = ownerStoreWithRecord();
     const { app } = buildApp(
-      { "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" } },
+      {
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
+      },
       { store },
     );
 
@@ -945,7 +1118,14 @@ describe("pdpp records routes: unsupported view/expand shapes", () => {
   it("supported limit, order and fields still work for owner reads", async () => {
     const store = ownerStoreWithRecord();
     const { app } = buildApp(
-      { "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" } },
+      {
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
+      },
       { store },
     );
 
@@ -967,7 +1147,14 @@ describe("pdpp records routes: unsupported view/expand shapes", () => {
   it("owner stream metadata declares no optional query capabilities", async () => {
     const store = ownerStoreWithRecord();
     const { app } = buildApp(
-      { "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" } },
+      {
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
+      },
       { store },
     );
     const res = await app.request("/streams/playlists", {
@@ -991,7 +1178,12 @@ describe("pdpp records routes: record ingest ownership", () => {
 
   it("accepts an envelope for the token subject's owned instance", async () => {
     const { app, store } = buildApp({
-      "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+      "owner-tok": {
+        active: true,
+        tokenKind: "owner",
+        subjectId: "sub_1",
+        instanceIds: ["inst_1"],
+      },
     });
     const res = await app.request("/streams/playlists/records/ingest", {
       method: "POST",
@@ -1036,7 +1228,12 @@ describe("pdpp records routes: record ingest ownership", () => {
 
   it("rejects a mixed batch without writing the owned envelope", async () => {
     const { app, store } = buildApp({
-      "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+      "owner-tok": {
+        active: true,
+        tokenKind: "owner",
+        subjectId: "sub_1",
+        instanceIds: ["inst_1"],
+      },
     });
     const res = await app.request("/streams/playlists/records/ingest", {
       method: "POST",
@@ -1056,7 +1253,12 @@ describe("pdpp records routes: record ingest ownership", () => {
 describe("pdpp records routes: blob ingest", () => {
   it("rejects a chunked body above the byte cap without storing it", async () => {
     const { app, store } = buildApp({
-      "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+      "owner-tok": {
+        active: true,
+        tokenKind: "owner",
+        subjectId: "sub_1",
+        instanceIds: ["inst_1"],
+      },
     });
     const storeBlobBytes = vi.spyOn(store, "storeBlobBytes");
     const chunk = new Uint8Array(1024 * 1024);
@@ -1092,7 +1294,12 @@ describe("pdpp records routes: blob ingest", () => {
 
   it("rejects a malformed media type before persisting bytes", async () => {
     const { app, store } = buildApp({
-      "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+      "owner-tok": {
+        active: true,
+        tokenKind: "owner",
+        subjectId: "sub_1",
+        instanceIds: ["inst_1"],
+      },
     });
     const storeBlobBytes = vi.spyOn(store, "storeBlobBytes");
     const res = await app.request("/blobs/ingest", {
@@ -1137,7 +1344,12 @@ describe("pdpp records routes: blob ingest", () => {
 
   it("stores owner-uploaded blob bytes and returns the blob_id a record can reference", async () => {
     const { app, store } = buildApp({
-      "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+      "owner-tok": {
+        active: true,
+        tokenKind: "owner",
+        subjectId: "sub_1",
+        instanceIds: ["inst_1"],
+      },
     });
 
     const bytes = new Uint8Array([1, 2, 3, 4, 5]);
@@ -1195,7 +1407,12 @@ describe("pdpp records routes: snapshot replace", () => {
     const store = createSqliteRecordStore(db);
     const { app } = buildApp(
       {
-        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
         "client-tok": {
           active: true,
           tokenKind: "client",

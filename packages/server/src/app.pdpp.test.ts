@@ -97,7 +97,12 @@ describe("createApp: PDPP routes are reachable through the real app", () => {
       },
     ]);
     const auth = createFixtureAuthorizationService({
-      "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+      "owner-tok": {
+        active: true,
+        tokenKind: "owner",
+        subjectId: "sub_1",
+        instanceIds: ["inst_1"],
+      },
     });
 
     const logger = pino({ level: "silent" });

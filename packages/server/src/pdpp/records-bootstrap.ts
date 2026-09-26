@@ -198,6 +198,7 @@ function coLocatedAuthorizationService(
         active: true as const,
         tokenKind: context.tokenKind ?? "client",
         subjectId: context.subjectId ?? "",
+        instanceIds: context.instanceIds,
         grant: context.grant as PdppPortGrant | undefined,
         clientId: context.clientId,
         expiresAt: context.expiresAt,

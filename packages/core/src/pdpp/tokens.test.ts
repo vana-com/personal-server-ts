@@ -364,13 +364,20 @@ describe("§8 — introspection carries the full enforcement context", () => {
 
   it("carries no grant for an owner token", () => {
     // §8: "an owner token carries none" — the RS must not synthesize one.
-    const owner = tokens.issueOwnerToken({ subjectId: "user_abc123" });
+    const owner = tokens.issueOwnerToken({
+      subjectId: "user_abc123",
+      instanceIds: ["spotify-account-a"],
+    });
     const response = tokens.introspect(owner.access_token);
     expect(response.active).toBe(true);
     expect(response.pdpp_token_kind).toBe("owner");
     expect(response.subject_id).toBe("user_abc123");
+    expect(response.instance_ids).toEqual(["spotify-account-a"]);
     expect(response.grant_id).toBeUndefined();
     expect(response.authorization_details).toBeUndefined();
+
+    const context = tokens.resolveToken(owner.access_token);
+    expect(context.instanceIds).toEqual(["spotify-account-a"]);
   });
 });
 

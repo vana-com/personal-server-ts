@@ -211,6 +211,7 @@ function bridgeAsToRs(tokens: PdppTokenService): PdppAuthorizationService {
         active: true as const,
         tokenKind: context.tokenKind ?? "client",
         subjectId: context.subjectId ?? "",
+        instanceIds: context.instanceIds,
         // MISMATCH 3: the AS's `ClientDisplay` has a closed shape
         // (`name: string` + known optional URIs); the RS mirror declares an
         // open `[key: string]: unknown` index signature. A closed type is not
@@ -303,6 +304,7 @@ describe("PDPP integrated journey (real AS + real RS in one app)", () => {
     const sessions = new AuthorizationSessionStore();
     const ownerToken = tokens.issueOwnerToken({
       subjectId: SUBJECT,
+      instanceIds: [INSTANCE],
     }).access_token;
 
     const logger = pino({ level: "silent" });

@@ -67,11 +67,23 @@ export function pdppInstanceBindingRoutes(
         ),
       };
     }
-    return { subjectId: context.subjectId };
+    return { subjectId: context.subjectId, instanceIds: context.instanceIds };
   }
 
-  function ownInstance(instance: string, subjectId: string): boolean {
-    return deps.instancesForSubject(subjectId).includes(instance);
+  function scopedOwnedInstances(owner: {
+    subjectId: string;
+    instanceIds?: string[];
+  }): string[] {
+    const current = deps.instancesForSubject(owner.subjectId);
+    if (!owner.instanceIds) return [];
+    return owner.instanceIds.filter((instance) => current.includes(instance));
+  }
+
+  function canAccessInstance(
+    instance: string,
+    owner: { subjectId: string; instanceIds?: string[] },
+  ): boolean {
+    return scopedOwnedInstances(owner).includes(instance);
   }
 
   function configuredActiveMethod(instance: string): string | null {
@@ -83,7 +95,7 @@ export function pdppInstanceBindingRoutes(
     const owner = await ownerContext(c.req.raw);
     if ("error" in owner) return owner.error;
     const instance = c.req.param("instance");
-    if (!ownInstance(instance, owner.subjectId)) {
+    if (!canAccessInstance(instance, owner)) {
       return errorResponse(
         "authentication_error",
         "Instance is not owned",
@@ -103,7 +115,7 @@ export function pdppInstanceBindingRoutes(
     const owner = await ownerContext(c.req.raw);
     if ("error" in owner) return owner.error;
     const instance = c.req.param("instance");
-    if (!ownInstance(instance, owner.subjectId)) {
+    if (!canAccessInstance(instance, owner)) {
       return errorResponse(
         "authentication_error",
         "Instance is not owned",

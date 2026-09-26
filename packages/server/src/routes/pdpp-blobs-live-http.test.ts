@@ -58,7 +58,12 @@ async function bootAndListen(): Promise<void> {
     pdppBlobsRoutes({
       store,
       auth: createFixtureAuthorizationService({
-        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
       }),
       declarations,
       instancesForSubject: () => ["inst_1"],
@@ -194,6 +199,7 @@ describe("PDPP blob GET over a real listening HTTP server and real on-disk SQLit
               active: true,
               tokenKind: "owner",
               subjectId: "sub_1",
+              instanceIds: ["inst_1"],
             },
           }),
           declarations,
@@ -239,6 +245,7 @@ describe("PDPP blob GET over a real listening HTTP server and real on-disk SQLit
               active: true,
               tokenKind: "owner",
               subjectId: "sub_1",
+              instanceIds: ["inst_1"],
             },
           }),
           declarations,

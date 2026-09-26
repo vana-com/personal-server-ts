@@ -7,6 +7,17 @@ import type {
 
 export interface IndexManager {
   insert(entry: NewIndexEntry): IndexEntry;
+  /** Check a legacy write and allocate its CAS revision in one SQLite transaction. */
+  insertIfCurrent(
+    entry: NewIndexEntry,
+    precondition?: { kind: "none" } | { kind: "match"; version: number },
+  ):
+    | { ok: true; entry: IndexEntry }
+    | {
+        ok: false;
+        currentVersion: number | null;
+        currentProducer: string | null;
+      };
   findByPath(path: string): IndexEntry | undefined;
   findByScope(options: IndexListOptions): IndexEntry[];
   findLatestByScope(scope: string): IndexEntry | undefined;
@@ -39,8 +50,8 @@ export interface IndexManager {
    */
   updateFileId(path: string, fileId: string): boolean;
   /**
-   * Returns the highest stored `version` for a scope, or 0 if none. Used by
-   * `insert` to derive the next expectedVersion for DPv2 AddData.
+   * Returns the highest DPv2 sync version for a scope, or 0 if none.
+   * This is independent from legacy CAS revision.
    */
   findLatestVersionByScope(scope: string): number;
   /**

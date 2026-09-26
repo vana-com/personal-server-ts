@@ -65,7 +65,11 @@ import { generateDevToken } from "./dev-token.js";
 import { migrateLocalState } from "./migrations/local-state.js";
 import { createTokenStore, type TokenStore } from "./token-store.js";
 import { TunnelManager, ensureFrpcBinary } from "./tunnel/index.js";
-import { createNodeDataStorage } from "./storage/node-data-storage.js";
+import {
+  createNodeDataStorage,
+  recoverStagedDataFiles,
+  reindexLegacyDataFiles,
+} from "./storage/node-data-storage.js";
 import { createSqliteQuestionStore } from "./storage/question-store.js";
 import {
   computeQuestion,
@@ -198,8 +202,17 @@ export async function createServer(
     db,
     logger,
   });
-  const indexManager = createIndexManager(db);
+  const indexManager = createIndexManager(db, {
+    revisionJournalDir: join(storageRoot, "cas-revisions"),
+  });
   const hierarchyOptions: HierarchyManagerOptions = { dataDir };
+  await recoverStagedDataFiles({ indexManager, hierarchyOptions });
+  const indexedCount = db
+    .prepare("SELECT COUNT(*) AS count FROM data_files")
+    .get() as { count: number };
+  if (indexedCount.count === 0) {
+    await reindexLegacyDataFiles({ indexManager, hierarchyOptions });
+  }
   const dataStorage = createNodeDataStorage({ indexManager, hierarchyOptions });
 
   const gatewayClient =

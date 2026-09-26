@@ -357,7 +357,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
    * `ownerSubjectId` resolves the verified signer to the PDPP subject; a
    * deployment that maps wallets to subjects differently supplies its own.
    */
-  app.post("/owner/token", (c) => {
+  app.post("/owner/token", async (c) => {
     // With `ownerAuth` wired, the middleware above has already verified a
     // wallet signature and confirmed the signer is the server owner, so
     // `c.get("auth").signer` is a proven identity rather than a claim.
@@ -380,8 +380,56 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       );
     }
 
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "owner token exchange requires JSON body {source_id, instance_id}",
+      );
+    }
+    if (body === null || typeof body !== "object" || Array.isArray(body)) {
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "owner token exchange requires JSON body {source_id, instance_id}",
+      );
+    }
+    const tokenRequest = body as Record<string, unknown>;
+    const sourceId = tokenRequest.source_id;
+    const instanceId = tokenRequest.instance_id;
+    if (typeof sourceId !== "string" || typeof instanceId !== "string") {
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "owner token exchange requires exactly one source_id and one instance_id",
+      );
+    }
+    const declaration = deps.resolveDeclaration(sourceId);
+    if (!declaration) {
+      return errorResponse(c, 404, "not_found", "source declaration not found");
+    }
+    const inventory = deps.inventoryFor(subjectId, sourceId);
+    const ownsInstance = declaration.streams.some((stream) =>
+      inventory.eligibleFor(stream.name).includes(instanceId),
+    );
+    if (!ownsInstance) {
+      return errorResponse(
+        c,
+        403,
+        "access_denied",
+        "instance_id is not owned by the authenticated subject for this source",
+      );
+    }
+
     const issued = deps.tokens.issueOwnerToken({
       subjectId,
+      instanceIds: [instanceId],
       ttlSeconds: OWNER_TOKEN_TTL_SECONDS,
     });
     deps.logger.info(

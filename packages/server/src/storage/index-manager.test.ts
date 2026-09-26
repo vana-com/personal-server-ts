@@ -96,7 +96,7 @@ describe("IndexManager", () => {
     expect(found).toBeUndefined();
   });
 
-  it("findByScope returns entries ordered by collectedAt DESC", () => {
+  it("findByScope keeps chronological order when an older row arrives late", () => {
     manager.insert({
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
@@ -121,9 +121,7 @@ describe("IndexManager", () => {
 
     const entries = manager.findByScope({ scope: "instagram.profile" });
     expect(entries).toHaveLength(3);
-    expect(entries[0]!.collectedAt).toBe("2026-01-03T00:00:00Z");
-    expect(entries[1]!.collectedAt).toBe("2026-01-02T00:00:00Z");
-    expect(entries[2]!.collectedAt).toBe("2026-01-01T00:00:00Z");
+    expect(entries.map((entry) => entry.casRevision)).toEqual([2, 3, 1]);
   });
 
   it("findByScope respects limit and offset", () => {
@@ -143,30 +141,31 @@ describe("IndexManager", () => {
       offset: 1,
     });
     expect(page).toHaveLength(2);
-    // DESC order: 05, 04, 03, 02, 01 → offset 1 → 04, 03
-    expect(page[0]!.collectedAt).toBe("2026-01-04T00:00:00Z");
-    expect(page[1]!.collectedAt).toBe("2026-01-03T00:00:00Z");
+    // CAS revision DESC order: 5, 4, 3, 2, 1 → offset 1 → 4, 3
+    expect(page.map((entry) => entry.casRevision)).toEqual([4, 3]);
   });
 
-  it("findLatestByScope returns most recent entry", () => {
+  it("findLatestByScope returns the newest collectedAt after a backfill", () => {
     manager.insert({
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
-      collectedAt: "2026-01-01T00:00:00Z",
+      collectedAt: "2026-01-03T00:00:00Z",
       sizeBytes: 100,
+      version: 10,
     });
     manager.insert({
       fileId: null,
       path: "ig/profile/2026-01-03T00-00-00Z.json",
       scope: "instagram.profile",
-      collectedAt: "2026-01-03T00:00:00Z",
+      collectedAt: "2026-01-01T00:00:00Z",
       sizeBytes: 200,
+      version: 1,
     });
 
     const latest = manager.findLatestByScope("instagram.profile");
     expect(latest).toBeDefined();
-    expect(latest!.collectedAt).toBe("2026-01-03T00:00:00Z");
+    expect(latest!.casRevision).toBe(1);
   });
 
   it("countByScope returns correct count", () => {
@@ -611,6 +610,7 @@ describe("IndexManager", () => {
     });
 
     expect(entry.version).toBe(1);
+    expect(entry.casRevision).toBe(1);
     expect(entry.dataPointId).toBeNull();
   });
 
@@ -638,8 +638,34 @@ describe("IndexManager", () => {
     });
 
     expect(first.version).toBe(1);
+    expect(first.casRevision).toBe(1);
     expect(second.version).toBe(2);
+    expect(second.casRevision).toBe(2);
     expect(otherScope.version).toBe(1);
+    expect(otherScope.casRevision).toBe(1);
+  });
+
+  it("insert without version does not reuse a deleted scope CAS revision", () => {
+    manager.insert({
+      fileId: null,
+      path: "ig/profile/2026-01-01T00-00-00Z.json",
+      scope: "instagram.profile",
+      collectedAt: "2026-01-01T00:00:00Z",
+      sizeBytes: 100,
+    });
+    manager.deleteByScope("instagram.profile");
+
+    const recreated = manager.insert({
+      fileId: null,
+      path: "ig/profile/2026-01-02T00-00-00Z.json",
+      scope: "instagram.profile",
+      collectedAt: "2026-01-02T00:00:00Z",
+      sizeBytes: 100,
+    });
+
+    expect(recreated.version).toBe(2);
+    expect(recreated.casRevision).toBe(2);
+    expect(manager.findLatestVersionByScope("instagram.profile")).toBe(2);
   });
 
   it("insert respects an explicit version", () => {
@@ -653,6 +679,7 @@ describe("IndexManager", () => {
     });
 
     expect(entry.version).toBe(7);
+    expect(entry.casRevision).toBe(1);
   });
 
   it("findLatestVersionByScope returns 0 for unknown scope", () => {
@@ -675,6 +702,30 @@ describe("IndexManager", () => {
       sizeBytes: 100,
     });
 
+    expect(manager.findLatestVersionByScope("instagram.profile")).toBe(2);
+  });
+
+  it("updateVersion can lower or raise sync version without changing CAS revision", () => {
+    const entry = manager.insert({
+      fileId: null,
+      path: "ig/profile/2026-01-01T00-00-00Z.json",
+      scope: "instagram.profile",
+      collectedAt: "2026-01-01T00:00:00Z",
+      sizeBytes: 100,
+    });
+
+    expect(manager.updateVersion(entry.path, 9)).toBe(true);
+    expect(manager.findByPath(entry.path)).toMatchObject({
+      version: 9,
+      casRevision: 1,
+    });
+    expect(manager.findLatestVersionByScope("instagram.profile")).toBe(9);
+
+    expect(manager.updateVersion(entry.path, 2)).toBe(true);
+    expect(manager.findByPath(entry.path)).toMatchObject({
+      version: 2,
+      casRevision: 1,
+    });
     expect(manager.findLatestVersionByScope("instagram.profile")).toBe(2);
   });
 

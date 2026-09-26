@@ -38,8 +38,10 @@ import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { computeS256Challenge } from "@opendatalabs/personal-server-ts-core/pdpp";
+import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { createServer, type ServerContext } from "./bootstrap.js";
 import { initializeDatabase } from "./storage/index-schema.js";
+import { singleInstanceInventory } from "./pdpp/deployment.js";
 
 /** Derives a stable owner address; same signature the bootstrap suites use. */
 const KNOWN_SIG =
@@ -130,9 +132,18 @@ async function boot() {
 
 /** Mint a real owner token through the mounted route, behind the owner proof. */
 async function ownerToken(context: ServerContext): Promise<string> {
+  const serverOwner = await recoverServerOwner(KNOWN_SIG);
+  const instanceId = singleInstanceInventory(
+    serverOwner.toLowerCase(),
+    SOURCE_ID,
+  ).eligibleFor("")[0];
   const response = await context.app.request("/pdpp/v1/owner/token", {
     method: "POST",
-    headers: { authorization: `Bearer ${context.devToken}` },
+    headers: {
+      authorization: `Bearer ${context.devToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ source_id: SOURCE_ID, instance_id: instanceId }),
   });
   expect(response.status).toBe(200);
   const body = (await response.json()) as { access_token: string };
@@ -241,6 +252,65 @@ afterEach(async () => {
 });
 
 describe("PDPP boot journey: real createServer", () => {
+  it("rejects missing, unretained, and unowned owner-token requests with distinct reasons", async () => {
+    ctx = await boot();
+    const request = (body?: unknown) =>
+      ctx!.app.request("/pdpp/v1/owner/token", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${ctx!.devToken}`,
+          "content-type": "application/json",
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      });
+
+    const missing = await request();
+    expect(missing.status).toBe(400);
+    expect((await missing.json()).error).toBe("invalid_request");
+
+    const unknownSource = await request({
+      source_id: "https://registry.pdpp.dev/connectors/unretained",
+      instance_id: "unretained:owner",
+    });
+    expect(unknownSource.status).toBe(404);
+    expect((await unknownSource.json()).error).toBe("not_found");
+
+    const otherInstance = await request({
+      source_id: SOURCE_ID,
+      instance_id: "spotify:another-owner",
+    });
+    expect(otherInstance.status).toBe(403);
+    expect((await otherInstance.json()).error).toBe("access_denied");
+  });
+
+  it("mints a real owner token scoped to exactly one requested instance", async () => {
+    ctx = await boot();
+    const token = await ownerToken(ctx);
+    const introspected = await ctx.app.request("/pdpp/v1/introspect", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ token }).toString(),
+    });
+    expect(introspected.status).toBe(200);
+    const body = (await introspected.json()) as {
+      active: boolean;
+      pdpp_token_kind?: string;
+      instance_ids?: string[];
+    };
+    expect(body.active).toBe(true);
+    expect(body.pdpp_token_kind).toBe("owner");
+    expect(body.instance_ids).toHaveLength(1);
+    expect(body.instance_ids?.[0]).toBe(
+      singleInstanceInventory(
+        (await recoverServerOwner(KNOWN_SIG)).toLowerCase(),
+        SOURCE_ID,
+      ).eligibleFor("")[0],
+    );
+  });
+
   it("issues a real grant-bound token on a real bootstrapped server", async () => {
     ctx = await boot();
     const { grantId, accessToken } = await obtainGrantBoundToken(ctx);

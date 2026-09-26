@@ -72,7 +72,12 @@ function auth(kind: "client" | "owner"): PdppAuthorizationService {
             grant: GRANT as never,
             clientId: "app_public_id",
           }
-        : { active: true, tokenKind: "owner" as const, subjectId: "sub" };
+        : {
+            active: true,
+            tokenKind: "owner" as const,
+            subjectId: "sub",
+            instanceIds: [INSTANCE],
+          };
     },
   };
 }

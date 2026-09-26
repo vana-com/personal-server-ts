@@ -69,6 +69,52 @@ export async function writeDataFile(
   };
 }
 
+/** Stage and fsync an envelope before an index transaction makes it visible. */
+export async function stageDataFile(
+  options: HierarchyManagerOptions,
+  envelope: DataFileEnvelope,
+): Promise<{
+  finalPath: string;
+  stagePath: string;
+  relativePath: string;
+  sizeBytes: number;
+}> {
+  const finalPath = buildDataFilePath(
+    options.dataDir,
+    envelope.scope,
+    envelope.collectedAt,
+  );
+  await mkdir(dirname(finalPath), { recursive: true });
+  const stagePath = `${finalPath}.pending.${randomUUID()}`;
+  const bytes = Buffer.from(JSON.stringify(envelope, null, 2), "utf-8");
+  const handle = await open(stagePath, "wx");
+  try {
+    await handle.writeFile(bytes);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  return {
+    finalPath,
+    stagePath,
+    relativePath: relative(options.dataDir, finalPath),
+    sizeBytes: bytes.length,
+  };
+}
+
+export async function publishStagedDataFile(
+  stagePath: string,
+  finalPath: string,
+): Promise<void> {
+  await rename(stagePath, finalPath);
+  const directory = await open(dirname(finalPath), "r");
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
+}
+
 /** Read and parse a data file */
 export async function readDataFile(
   options: HierarchyManagerOptions,
@@ -77,7 +123,7 @@ export async function readDataFile(
 ): Promise<DataFileEnvelope> {
   const filePath = buildDataFilePath(options.dataDir, scope, collectedAt);
   const content = await readFile(filePath, "utf-8");
-  return DataFileEnvelopeSchema.parse(JSON.parse(content));
+  return DataFileEnvelopeSchema.passthrough().parse(JSON.parse(content));
 }
 
 /** Read a data file without decoding or parsing its potentially large body. */

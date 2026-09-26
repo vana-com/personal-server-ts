@@ -20,8 +20,10 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { computeS256Challenge } from "@opendatalabs/personal-server-ts-core/pdpp";
+import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { createServer, type ServerContext } from "../bootstrap.js";
 import { initializeDatabase } from "../storage/index-schema.js";
+import { singleInstanceInventory } from "./deployment.js";
 import * as clientDocumentFetch from "./client-document-fetch.js";
 
 const KNOWN_SIG =
@@ -111,9 +113,20 @@ afterEach(async () => {
 });
 
 async function ownerToken(context: ServerContext): Promise<string> {
+  const owner = await recoverServerOwner(KNOWN_SIG);
   const response = await context.app.request("/pdpp/v1/owner/token", {
     method: "POST",
-    headers: { authorization: `Bearer ${context.devToken}` },
+    headers: {
+      authorization: `Bearer ${context.devToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      source_id: SOURCE_ID,
+      instance_id: singleInstanceInventory(
+        owner.toLowerCase(),
+        SOURCE_ID,
+      ).eligibleFor("")[0],
+    }),
   });
   expect(response.status).toBe(200);
   const body = (await response.json()) as { access_token: string };

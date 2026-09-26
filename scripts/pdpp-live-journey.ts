@@ -27,9 +27,11 @@ import { tmpdir } from "node:os";
 import type { AddressInfo } from "node:net";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { computeS256Challenge } from "@opendatalabs/personal-server-ts-core/pdpp";
+import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { createServer } from "../packages/server/src/bootstrap.js";
 import { listenHttpServer } from "../packages/server/src/listen.js";
 import { initializeDatabase } from "../packages/server/src/storage/index-schema.js";
+import { singleInstanceInventory } from "../packages/server/src/pdpp/deployment.js";
 
 /** Derives a stable owner address; the same signature the test suites use. */
 const KNOWN_SIG =
@@ -143,9 +145,17 @@ async function main(): Promise<void> {
   say("RFC 9728 discovery", await meta.json());
 
   // --- 2. Owner token, behind the server's own owner proof ----------------
+  const subject = (await recoverServerOwner(KNOWN_SIG)).toLowerCase();
+  const instanceId = singleInstanceInventory(subject, SOURCE_ID).eligibleFor(
+    "",
+  )[0];
   const ownerRes = await fetch(`${base}/pdpp/v1/owner/token`, {
     method: "POST",
-    headers: { authorization: `Bearer ${ctx.devToken}` },
+    headers: {
+      authorization: `Bearer ${ctx.devToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ source_id: SOURCE_ID, instance_id: instanceId }),
   });
   must(ownerRes.status === 200, `owner token returned ${ownerRes.status}`);
   const owner = ((await ownerRes.json()) as { access_token: string })

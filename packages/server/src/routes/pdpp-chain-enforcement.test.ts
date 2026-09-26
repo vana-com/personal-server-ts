@@ -227,7 +227,12 @@ describe("a bound, live chain permission authorizes the read", () => {
     // An owner token is the owner reading their own server. Requiring a
     // grantee permission for it would lock owners out of their own data.
     const app = harness({
-      token: { active: true, subjectId: "sub_1", tokenKind: "owner" },
+      token: {
+        active: true,
+        subjectId: "sub_1",
+        tokenKind: "owner",
+        instanceIds: ["inst_1"],
+      },
     });
     const response = await read(app);
     expect(response.status).toBe(200);

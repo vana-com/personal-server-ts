@@ -3,6 +3,7 @@ import {
   DataFileEnvelopeSchema,
   decryptWithPassword,
   deriveScopeKey,
+  type DataFileEnvelope,
   type DataPointRecord,
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
@@ -362,10 +363,13 @@ export async function downloadOne(
   }
 
   // 6. Parse as DataFileEnvelope (validate)
-  let envelope: ReturnType<typeof DataFileEnvelopeSchema.parse>;
+  let envelope: DataFileEnvelope & {
+    producer?: unknown;
+    producer_provenance?: unknown;
+  };
   try {
     const raw = JSON.parse(new TextDecoder().decode(plaintext));
-    envelope = DataFileEnvelopeSchema.parse(raw);
+    envelope = DataFileEnvelopeSchema.passthrough().parse(raw);
   } catch (err) {
     const detail = (err as Error).message;
     diagnostics?.onDecryptError(record.id, record.scope, detail);
@@ -451,6 +455,14 @@ export async function downloadOne(
       sizeBytes,
       version: Number(record.expectedVersion),
       dataPointId: record.id,
+      ...(envelope.producer === "pdpp-projector" ||
+      envelope.producer === "pdpp-import-projection"
+        ? { producer: envelope.producer }
+        : {}),
+      ...(envelope.producer_provenance &&
+      typeof envelope.producer_provenance === "object"
+        ? { producerProvenance: JSON.stringify(envelope.producer_provenance) }
+        : {}),
     });
   } catch (err) {
     const detail = (err as Error).message;
