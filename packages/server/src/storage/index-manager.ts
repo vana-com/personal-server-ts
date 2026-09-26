@@ -29,6 +29,8 @@ export interface IndexManager {
         currentVersion: number | null;
         currentProducer: string | null;
       };
+  closeScopeForWrites(scope: string): void;
+  insertRecovered(entry: NewIndexEntry): IndexEntry;
   findByPath(path: string): IndexEntry | undefined;
   findByScope(options: IndexListOptions): IndexEntry[];
   findLatestByScope(scope: string): IndexEntry | undefined;
@@ -46,6 +48,7 @@ export interface IndexManager {
     limit?: number;
     offset?: number;
   }): { scopes: ScopeSummary[]; total: number };
+  listIndexedScopes(): string[];
   findClosestByScope(scope: string, at: string): IndexEntry | undefined;
   findByFileId(fileId: string): IndexEntry | undefined;
   /** Find an index entry by its DPv2 data-point id (download dedup). */
@@ -127,6 +130,8 @@ export function createIndexManager(
       revisionJournalDir!,
       `${createHash("sha256").update(scope).digest("hex")}.revision`,
     );
+  const closedMarkerPath = (scope: string): string =>
+    `${journalPath(scope)}.closed`;
   const readJournal = (scope: string): number => {
     if (!revisionJournalDir) return 0;
     let value: string;
@@ -149,6 +154,31 @@ export function createIndexManager(
     const file = openSync(staged, "wx");
     try {
       writeFileSync(file, String(revision));
+      fsyncSync(file);
+    } finally {
+      closeSync(file);
+    }
+    renameSync(staged, path);
+    const dir = openSync(revisionJournalDir, "r");
+    try {
+      fsyncSync(dir);
+    } finally {
+      closeSync(dir);
+    }
+  };
+  const reserveClosedMarker = (scope: string): void => {
+    if (!revisionJournalDir) return;
+    const path = closedMarkerPath(scope);
+    try {
+      readFileSync(path);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const staged = `${path}.pending.${randomUUID()}`;
+    const file = openSync(staged, "wx");
+    try {
+      writeFileSync(file, "closed\n");
       fsyncSync(file);
     } finally {
       closeSync(file);
@@ -200,7 +230,19 @@ export function createIndexManager(
     "SELECT * FROM data_files WHERE scope = @scope ORDER BY julianday(collected_at) DESC, id DESC LIMIT 1",
   );
   const currentForWriteStmt = db.prepare<{ scope: string }>(
-    "SELECT cas_revision, producer FROM data_files WHERE scope = @scope ORDER BY julianday(collected_at) DESC, id DESC LIMIT 1",
+    `SELECT
+       latest.cas_revision,
+       latest.producer,
+       revisions.closed_for_writes
+     FROM scope_revisions revisions
+     LEFT JOIN (
+       SELECT cas_revision, producer
+       FROM data_files
+       WHERE scope = @scope
+       ORDER BY julianday(collected_at) DESC, id DESC
+       LIMIT 1
+     ) latest ON 1 = 1
+     WHERE revisions.scope = @scope`,
   );
 
   const countByScopeStmt = db.prepare<{ scope: string }>(
@@ -216,6 +258,9 @@ export function createIndexManager(
 
   const findClosestByScopeStmt = db.prepare<{ scope: string; at: string }>(
     "SELECT * FROM data_files WHERE scope = @scope AND collected_at <= @at ORDER BY collected_at DESC LIMIT 1",
+  );
+  const listIndexedScopesStmt = db.prepare(
+    "SELECT DISTINCT scope FROM data_files ORDER BY scope ASC",
   );
 
   const findByFileIdStmt = db.prepare<{ file_id: string }>(
@@ -248,7 +293,7 @@ export function createIndexManager(
   );
 
   const ensureScopeRevisionStmt = db.prepare<{ scope: string }>(
-    "INSERT OR IGNORE INTO scope_revisions (scope, cas_revision) VALUES (@scope, 0)",
+    "INSERT OR IGNORE INTO scope_revisions (scope, cas_revision, closed_for_writes) VALUES (@scope, 0, 0)",
   );
 
   const readScopeRevisionStmt = db.prepare<{ scope: string }>(
@@ -260,6 +305,9 @@ export function createIndexManager(
     cas_revision: number;
   }>(
     "UPDATE scope_revisions SET cas_revision = @cas_revision WHERE scope = @scope AND cas_revision < @cas_revision",
+  );
+  const closeScopeForWritesStmt = db.prepare<{ scope: string }>(
+    "UPDATE scope_revisions SET closed_for_writes = 1 WHERE scope = @scope",
   );
 
   const deleteByScopeStmt = db.prepare<{ scope: string }>(
@@ -310,15 +358,25 @@ export function createIndexManager(
       precondition?: { kind: "none" } | { kind: "match"; version: number },
     ) => {
       const current = currentForWriteStmt.get({ scope: entry.scope }) as
-        { cas_revision: number; producer: string | null } | undefined;
+        | {
+            cas_revision: number | null;
+            producer: string | null;
+            closed_for_writes: number;
+          }
+        | undefined;
+      const currentVersion =
+        current === undefined ? null : (current.cas_revision ?? null);
+      const scopeClosedForWrites = current?.closed_for_writes === 1;
       if (
-        (precondition?.kind === "none" && current !== undefined) ||
+        scopeClosedForWrites ||
+        (precondition?.kind === "none" &&
+          (current?.cas_revision ?? null) !== null) ||
         (precondition?.kind === "match" &&
-          current?.cas_revision !== precondition.version)
+          currentVersion !== precondition.version)
       ) {
         return {
           ok: false as const,
-          currentVersion: current?.cas_revision ?? null,
+          currentVersion,
           currentProducer: current?.producer ?? null,
         };
       }
@@ -333,6 +391,16 @@ export function createIndexManager(
       return result.entry;
     },
     insertIfCurrent,
+    closeScopeForWrites(scope) {
+      ensureScopeRevisionStmt.run({ scope });
+      // Durable fail-closed marker. There is no HTTP reset path; clearing this
+      // requires an explicit owner-confirmed offline repair/rebuild.
+      reserveClosedMarker(scope);
+      closeScopeForWritesStmt.run({ scope });
+    },
+    insertRecovered(entry) {
+      return insertRow(entry);
+    },
 
     findByPath(path) {
       const row = findByPathStmt.get({ path }) as RawRow | undefined;
@@ -435,6 +503,11 @@ export function createIndexManager(
         })),
         total,
       };
+    },
+
+    listIndexedScopes() {
+      const rows = listIndexedScopesStmt.all() as Array<{ scope: string }>;
+      return rows.map((row) => row.scope);
     },
 
     findClosestByScope(scope, at) {

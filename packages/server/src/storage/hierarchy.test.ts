@@ -1,9 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { open as realOpen } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   writeDataFile,
+  stageDataFile,
   readDataFile,
   readScopeBlockManifest,
   readScopeBlocks,
@@ -88,6 +90,27 @@ describe("HierarchyManager", () => {
       const parsed = JSON.parse(content);
       expect(parsed.version).toBe("1.0");
       expect(parsed.data).toEqual(largeData);
+    });
+  });
+
+  describe("stageDataFile", () => {
+    it("fsyncs the staged file and parent directory before returning", async () => {
+      const syncs: string[] = [];
+      const openFile: typeof realOpen = async (...args) => {
+        const handle = await realOpen(...args);
+        const originalSync = handle.sync.bind(handle);
+        vi.spyOn(handle, "sync").mockImplementation(async () => {
+          syncs.push(String(args[0]));
+          await originalSync();
+        });
+        return handle;
+      };
+
+      const staged = await stageDataFile(options, makeEnvelope(), { openFile });
+
+      expect(syncs).toHaveLength(2);
+      expect(syncs[0]).toBe(staged.stagePath);
+      expect(syncs[1]).toBe(join(dataDir, "instagram", "profile"));
     });
   });
 

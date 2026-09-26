@@ -74,10 +74,15 @@ export async function recoverStagedDataFiles(
 
 /** Rebuild a lost legacy index from finalized envelopes, never from stages. */
 export async function reindexLegacyDataFiles(
-  deps: NodeDataStorageDeps,
+  deps: NodeDataStorageDeps & {
+    closeRecoveredScopeForWrites?: (
+      scope: string,
+    ) => boolean | Promise<boolean>;
+  },
 ): Promise<number> {
   const dataDir = deps.hierarchyOptions.dataDir;
   let recovered = 0;
+  const recoveredScopes = new Set<string>();
   const visit = async (dir: string): Promise<void> => {
     for (const item of (await readdir(dir, { withFileTypes: true })).sort(
       (a, b) => a.name.localeCompare(b.name),
@@ -107,7 +112,10 @@ export async function reindexLegacyDataFiles(
         continue;
       }
       const bytes = (await stat(path)).size;
-      deps.indexManager.insert({
+      const closeAfterInsert = await deps.closeRecoveredScopeForWrites?.(
+        envelope.scope,
+      );
+      deps.indexManager.insertRecovered({
         fileId: null,
         schemaId: envelope.schemaId ?? null,
         path: relativePath,
@@ -125,6 +133,10 @@ export async function reindexLegacyDataFiles(
             ? JSON.stringify(envelope.producer_provenance)
             : null,
       });
+      if (closeAfterInsert && !recoveredScopes.has(envelope.scope)) {
+        deps.indexManager.closeScopeForWrites(envelope.scope);
+        recoveredScopes.add(envelope.scope);
+      }
       recovered++;
     }
   };

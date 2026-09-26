@@ -1,6 +1,6 @@
-import { mkdir } from "node:fs/promises";
+import { access, mkdir, open, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { privateKeyToAccount } from "viem/accounts";
 
@@ -192,6 +192,66 @@ export async function createServer(
   await mkdir(storageRoot, { recursive: true });
   await mkdir(dataDir, { recursive: true });
 
+  const revisionJournalDir = join(storageRoot, "cas-revisions");
+  const reindexInProgressPath = join(storageRoot, "reindex-in-progress");
+  const fsyncDirectory = async (path: string): Promise<void> => {
+    const handle = await open(path, "r");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  };
+  const hasReindexInProgress = async (): Promise<boolean> => {
+    try {
+      await access(reindexInProgressPath);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+  };
+  const markReindexInProgress = async (): Promise<void> => {
+    await writeFile(reindexInProgressPath, `${new Date().toISOString()}\n`);
+    const marker = await open(reindexInProgressPath, "r");
+    try {
+      await marker.sync();
+    } finally {
+      await marker.close();
+    }
+    await fsyncDirectory(storageRoot);
+  };
+  const clearReindexInProgress = async (): Promise<void> => {
+    await rm(reindexInProgressPath, { force: true });
+    await fsyncDirectory(storageRoot);
+  };
+  const hasScopeRevisionJournal = async (scope: string): Promise<boolean> => {
+    const journalPath = join(
+      revisionJournalDir,
+      `${createHash("sha256").update(scope).digest("hex")}.revision`,
+    );
+    try {
+      await access(journalPath);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+  };
+  const hasScopeClosedMarker = async (scope: string): Promise<boolean> => {
+    const journalPath = join(
+      revisionJournalDir,
+      `${createHash("sha256").update(scope).digest("hex")}.revision.closed`,
+    );
+    try {
+      await access(journalPath);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+  };
+
   const db = initializeDatabase(indexPath);
   await migrateLocalState({
     storageRoot,
@@ -203,15 +263,35 @@ export async function createServer(
     logger,
   });
   const indexManager = createIndexManager(db, {
-    revisionJournalDir: join(storageRoot, "cas-revisions"),
+    revisionJournalDir,
   });
   const hierarchyOptions: HierarchyManagerOptions = { dataDir };
   await recoverStagedDataFiles({ indexManager, hierarchyOptions });
+  const resumeReindex = await hasReindexInProgress();
+  let needsRecoveryScan = false;
+  for (const scope of indexManager.listIndexedScopes()) {
+    if (resumeReindex || (await hasScopeClosedMarker(scope))) {
+      indexManager.closeScopeForWrites(scope);
+    }
+    if (!(await hasScopeRevisionJournal(scope))) {
+      needsRecoveryScan = true;
+      indexManager.closeScopeForWrites(scope);
+    }
+  }
   const indexedCount = db
     .prepare("SELECT COUNT(*) AS count FROM data_files")
     .get() as { count: number };
-  if (indexedCount.count === 0) {
-    await reindexLegacyDataFiles({ indexManager, hierarchyOptions });
+  if (indexedCount.count === 0 || resumeReindex || needsRecoveryScan) {
+    await markReindexInProgress();
+    await reindexLegacyDataFiles({
+      indexManager,
+      hierarchyOptions,
+      closeRecoveredScopeForWrites: async (scope) =>
+        resumeReindex ||
+        (await hasScopeClosedMarker(scope)) ||
+        !(await hasScopeRevisionJournal(scope)),
+    });
+    await clearReindexInProgress();
   }
   const dataStorage = createNodeDataStorage({ indexManager, hierarchyOptions });
 

@@ -193,7 +193,10 @@ async function authorize(): Promise<{ accessToken: string; grant: Grant }> {
 
   const created = await as.request("/pdpp/v1/authorize", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${ownerToken}`,
+    },
     body: JSON.stringify({
       client_id: "budget_example",
       redirect_uri: REDIRECT,

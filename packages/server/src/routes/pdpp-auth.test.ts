@@ -90,9 +90,13 @@ function post(
   body: unknown,
   headers: Record<string, string> = {},
 ) {
+  const requestHeaders =
+    path === "/pdpp/v1/authorize" && !headers.authorization
+      ? { ...ownerAuth(scopedOwnerToken()), ...headers }
+      : headers;
   return app.request(path, {
     method: "POST",
-    headers: { "content-type": "application/json", ...headers },
+    headers: { "content-type": "application/json", ...requestHeaders },
     body: JSON.stringify(body),
   });
 }
@@ -103,6 +107,16 @@ function ownerTokenBody(overrides: Record<string, unknown> = {}) {
     instance_id: OWNER_INSTANCE,
     ...overrides,
   };
+}
+
+function scopedOwnerToken(
+  subjectId = OWNER,
+  instanceId = OWNER_INSTANCE,
+): string {
+  return tokens.issueOwnerToken({
+    subjectId,
+    instanceIds: [instanceId],
+  }).access_token;
 }
 
 function postForm(
@@ -161,7 +175,7 @@ afterEach(() => {
 
 /** Walk authorize → review, returning the session and the owner's digest. */
 async function openSessionAndReview(body = selectionBody()) {
-  const ownerToken = tokens.issueOwnerToken({ subjectId: OWNER }).access_token;
+  const ownerToken = scopedOwnerToken();
   const created = await post("/pdpp/v1/authorize", body);
   expect(created.status).toBe(201);
   const { session_id } = (await created.json()) as { session_id: string };
@@ -295,9 +309,7 @@ describe("owner authentication on the decision endpoints", () => {
 
   it("rejects an approval carrying another owner's token (404)", async () => {
     const { sessionId, digest } = await openSessionAndReview();
-    const intruder = tokens.issueOwnerToken({
-      subjectId: OTHER_OWNER,
-    }).access_token;
+    const intruder = scopedOwnerToken(OTHER_OWNER);
 
     const response = await post(
       `/pdpp/v1/authorize/${sessionId}/approve`,
@@ -311,9 +323,7 @@ describe("owner authentication on the decision endpoints", () => {
 
   it("refuses to disclose a review to another owner (404)", async () => {
     const { sessionId } = await openSessionAndReview();
-    const intruder = tokens.issueOwnerToken({
-      subjectId: OTHER_OWNER,
-    }).access_token;
+    const intruder = scopedOwnerToken(OTHER_OWNER);
     const response = await app.request(
       `/pdpp/v1/authorize/${sessionId}/review`,
       { headers: ownerAuth(intruder) },
@@ -343,9 +353,7 @@ describe("owner authentication on the decision endpoints", () => {
     );
     const { grant_id } = (await approved.json()) as { grant_id: string };
 
-    const intruder = tokens.issueOwnerToken({
-      subjectId: OTHER_OWNER,
-    }).access_token;
+    const intruder = scopedOwnerToken(OTHER_OWNER);
     const response = await postForm(
       "/pdpp/v1/revoke",
       { grant_id },
@@ -357,25 +365,20 @@ describe("owner authentication on the decision endpoints", () => {
 
 describe("staleness (§7 / §9 AS item 15)", () => {
   it("answers 409 stale_review when eligibility changed after review", async () => {
-    const { sessionId, ownerToken, digest } = await openSessionAndReview();
+    const { sessionId, digest } = await openSessionAndReview();
     // A different account is now the only eligible one.
     eligible = ["spotify-account-b"];
 
     const response = await post(
       `/pdpp/v1/authorize/${sessionId}/approve`,
       { review_digest: digest },
-      ownerAuth(ownerToken),
+      ownerAuth(scopedOwnerToken(OWNER, "spotify-account-b")),
     );
     expect(response.status).toBe(409);
     expect((await response.json()).error).toBe("stale_review");
   });
 
-  it("answers 409 when a SECOND instance connects after review", async () => {
-    // The canonical §6 drift case, and the one a consent UI must be able to
-    // recover from: the owner reviewed a single auto-resolved account, then
-    // connected another before approving. Re-resolution can no longer pick a
-    // handle, and that must surface as staleness (re-fetch and re-prompt) —
-    // not as invalid_request, which routes the UI to a dead end.
+  it("keeps approval bound to the owner token's scoped instance when a second instance connects", async () => {
     const { sessionId, ownerToken, digest } = await openSessionAndReview();
     eligible = ["spotify-account-a", "spotify-account-b"];
 
@@ -384,22 +387,7 @@ describe("staleness (§7 / §9 AS item 15)", () => {
       { review_digest: digest },
       ownerAuth(ownerToken),
     );
-    expect(response.status).toBe(409);
-    expect((await response.json()).error).toBe("stale_review");
-
-    // And the recovery path works: re-fetching now offers the choice.
-    const refetched = await app.request(
-      `/pdpp/v1/authorize/${sessionId}/review`,
-      { headers: ownerAuth(ownerToken) },
-    );
-    expect(refetched.status).toBe(200);
-    const body = (await refetched.json()) as {
-      instance_choice_required?: Array<{ candidates: string[] }>;
-    };
-    expect(body.instance_choice_required?.[0].candidates).toEqual([
-      "spotify-account-a",
-      "spotify-account-b",
-    ]);
+    expect(response.status).toBe(200);
   });
 
   it("answers 409 for a digest the owner never saw", async () => {
@@ -697,9 +685,7 @@ describe("approval persistence failure (session/grant/code atomicity)", () => {
 
 describe("the consent review model the UI renders", () => {
   it("emits the four semantic categories separately", async () => {
-    const ownerToken = tokens.issueOwnerToken({
-      subjectId: OWNER,
-    }).access_token;
+    const ownerToken = scopedOwnerToken();
     const created = await post(
       "/pdpp/v1/authorize",
       selectionBody({
@@ -733,9 +719,7 @@ describe("the consent review model the UI renders", () => {
   });
 
   it("shows fully resolved streams, never request-only conveniences", async () => {
-    const ownerToken = tokens.issueOwnerToken({
-      subjectId: OWNER,
-    }).access_token;
+    const ownerToken = scopedOwnerToken();
     const created = await post(
       "/pdpp/v1/authorize",
       selectionBody({ streams: [{ name: "*" }] }),
@@ -836,9 +820,7 @@ describe("existing_grants — the review lists this client's active grants", () 
 
     // A fresh session for music_recommendations: its review should list
     // exactly the one active grant for that same client.
-    const ownerToken = tokens.issueOwnerToken({
-      subjectId: OWNER,
-    }).access_token;
+    const ownerToken = scopedOwnerToken();
     const created = await post("/pdpp/v1/authorize", selectionBody());
     const { session_id } = (await created.json()) as { session_id: string };
     const reviewed = await app.request(
@@ -1032,9 +1014,7 @@ describe("RFC 7636 — PKCE binds the code to the requesting client", () => {
     });
 
     // Nothing was minted: the grant has no live client token to introspect.
-    const ownerToken = tokens.issueOwnerToken({
-      subjectId: OWNER,
-    }).access_token;
+    const ownerToken = scopedOwnerToken();
     const grants = store.listGrantsForSubject(OWNER);
     expect(grants.length).toBeGreaterThan(0);
     const anyLive = await postForm(
@@ -1199,73 +1179,48 @@ describe("owner-token exchange", () => {
 });
 
 describe("§6 — instance choice over the wire", () => {
-  it("returns candidates instead of a review, then resolves on the pick", async () => {
+  it("renders the review for the instance already selected by the owner token", async () => {
     eligible = ["spotify-account-a", "spotify-account-b"];
-    const ownerToken = tokens.issueOwnerToken({
-      subjectId: OWNER,
-    }).access_token;
+    const ownerToken = scopedOwnerToken(OWNER, "spotify-account-b");
     const created = await post("/pdpp/v1/authorize", selectionBody());
     const { session_id } = (await created.json()) as { session_id: string };
 
-    const pending = await app.request(
+    const reviewed = await app.request(
       `/pdpp/v1/authorize/${session_id}/review`,
       { headers: ownerAuth(ownerToken) },
     );
-    expect(pending.status).toBe(200);
-    const pendingBody = (await pending.json()) as {
+    expect(reviewed.status).toBe(200);
+    const body = (await reviewed.json()) as {
       review?: unknown;
       instance_choice_required?: Array<{
         stream: string;
         candidates: string[];
       }>;
     };
-    expect(pendingBody.review).toBeUndefined();
-    expect(pendingBody.instance_choice_required).toEqual([
-      {
-        stream: "top_artists",
-        candidates: ["spotify-account-a", "spotify-account-b"],
-      },
-    ]);
-
-    // The owner picks; the choice rides along as a query parameter.
-    const picked = await app.request(
-      `/pdpp/v1/authorize/${session_id}/review?${new URLSearchParams({
-        "instance[top_artists]": "spotify-account-b",
-      })}`,
-      { headers: ownerAuth(ownerToken) },
-    );
-    const pickedBody = (await picked.json()) as {
-      review: { data: { streams: Array<{ instance_ids: string[] }> } };
-    };
-    expect(pickedBody.review.data.streams[0].instance_ids).toEqual([
-      "spotify-account-b",
-    ]);
+    expect(body.instance_choice_required).toBeUndefined();
+    expect(
+      (body.review as { data: { streams: Array<{ instance_ids: string[] }> } })
+        .data.streams[0].instance_ids,
+    ).toEqual(["spotify-account-b"]);
   });
 
-  it("issues over exactly the chosen instance", async () => {
+  it("issues over exactly the owner token's scoped instance", async () => {
     eligible = ["spotify-account-a", "spotify-account-b"];
-    const ownerToken = tokens.issueOwnerToken({
-      subjectId: OWNER,
-    }).access_token;
+    const ownerToken = scopedOwnerToken(OWNER, "spotify-account-b");
     const created = await post("/pdpp/v1/authorize", selectionBody());
     const { session_id } = (await created.json()) as { session_id: string };
 
-    const picked = await app.request(
-      `/pdpp/v1/authorize/${session_id}/review?${new URLSearchParams({
-        "instance[top_artists]": "spotify-account-b",
-      })}`,
+    const reviewed = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review`,
       { headers: ownerAuth(ownerToken) },
     );
-    const { review } = (await picked.json()) as {
+    const { review } = (await reviewed.json()) as {
       review: { review_digest: string };
     };
 
     const approved = await post(
       `/pdpp/v1/authorize/${session_id}/approve`,
-      {
-        review_digest: review.review_digest,
-        instance_choices: { top_artists: ["spotify-account-b"] },
-      },
+      { review_digest: review.review_digest },
       ownerAuth(ownerToken),
     );
     expect(approved.status).toBe(200);
@@ -1275,21 +1230,17 @@ describe("§6 — instance choice over the wire", () => {
     ]);
   });
 
-  it("answers 409 when the approved pick differs from the reviewed one", async () => {
+  it("answers 409 when approval choices differ from the scoped review", async () => {
     eligible = ["spotify-account-a", "spotify-account-b"];
-    const ownerToken = tokens.issueOwnerToken({
-      subjectId: OWNER,
-    }).access_token;
+    const ownerToken = scopedOwnerToken(OWNER, "spotify-account-b");
     const created = await post("/pdpp/v1/authorize", selectionBody());
     const { session_id } = (await created.json()) as { session_id: string };
 
-    const picked = await app.request(
-      `/pdpp/v1/authorize/${session_id}/review?${new URLSearchParams({
-        "instance[top_artists]": "spotify-account-b",
-      })}`,
+    const reviewed = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review`,
       { headers: ownerAuth(ownerToken) },
     );
-    const { review } = (await picked.json()) as {
+    const { review } = (await reviewed.json()) as {
       review: { review_digest: string };
     };
 
@@ -1325,9 +1276,7 @@ describe("redirect_uri validation (RFC 6749 §3.1.2, §10.6)", () => {
    * verifier too — they redeem the stolen code and receive a grant-bound token.
    */
   async function approveWith(redirectUri: string) {
-    const ownerToken = tokens.issueOwnerToken({
-      subjectId: OWNER,
-    }).access_token;
+    const ownerToken = scopedOwnerToken();
     const created = await post("/pdpp/v1/authorize", {
       ...selectionBody(),
       redirect_uri: redirectUri,
@@ -1468,9 +1417,7 @@ describe("GET /grants — the owner's own grants, with status", () => {
       revoked: true,
     });
 
-    const ownerToken = tokens.issueOwnerToken({
-      subjectId: OWNER,
-    }).access_token;
+    const ownerToken = scopedOwnerToken();
     const response = await listGrants(ownerToken);
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
@@ -1546,9 +1493,7 @@ describe("GET /grants — the owner's own grants, with status", () => {
     seedGrant({ grantId: "grant_music", clientId: "music_recommendations" });
     seedGrant({ grantId: "grant_other", clientId: "other_client" });
 
-    const ownerToken = tokens.issueOwnerToken({
-      subjectId: OWNER,
-    }).access_token;
+    const ownerToken = scopedOwnerToken();
     const response = await listGrants(
       ownerToken,
       "?client_id=music_recommendations",
@@ -1597,18 +1542,14 @@ describe("GET /grants — the owner's own grants, with status", () => {
       subjectId: OTHER_OWNER,
     });
 
-    const ownerToken = tokens.issueOwnerToken({
-      subjectId: OWNER,
-    }).access_token;
+    const ownerToken = scopedOwnerToken();
     const response = await listGrants(ownerToken);
     const body = await response.text();
     expect(body).toContain("grant_mine");
     expect(body).not.toContain("grant_theirs");
 
     // And the other subject sees only their own.
-    const theirToken = tokens.issueOwnerToken({
-      subjectId: OTHER_OWNER,
-    }).access_token;
+    const theirToken = scopedOwnerToken(OTHER_OWNER);
     const theirs = await (await listGrants(theirToken)).text();
     expect(theirs).toContain("grant_theirs");
     expect(theirs).not.toContain("grant_mine");
@@ -1616,9 +1557,7 @@ describe("GET /grants — the owner's own grants, with status", () => {
 
   it("carries no tokens, consent evidence, review digests or codes", async () => {
     seedGrant({ grantId: "grant_music", clientId: "music_recommendations" });
-    const ownerToken = tokens.issueOwnerToken({
-      subjectId: OWNER,
-    }).access_token;
+    const ownerToken = scopedOwnerToken();
     const response = await listGrants(ownerToken);
     const raw = await response.text();
 

@@ -431,6 +431,14 @@ export function createApp(deps: AppDeps): Hono {
       lineageGateway: deps.lineageGateway,
       writeSessionStore,
       writeProofReplayStore,
+      pdppOwnerBearer: deps.pdpp
+        ? {
+            auth: deps.pdpp.auth,
+            configuredMethods: deps.pdpp.configuredMethods,
+            ownerSubjectId: deps.serverOwner,
+            instancesForSubject: deps.pdpp.instancesForSubject,
+          }
+        : undefined,
       // A new local version of a scope marks every question that reads it
       // stale; the recompute waits for a reader.
       onDataWritten: deps.derivativeCompute

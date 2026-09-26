@@ -73,12 +73,14 @@ export async function writeDataFile(
 export async function stageDataFile(
   options: HierarchyManagerOptions,
   envelope: DataFileEnvelope,
+  deps: { openFile?: typeof open } = {},
 ): Promise<{
   finalPath: string;
   stagePath: string;
   relativePath: string;
   sizeBytes: number;
 }> {
+  const openFile = deps.openFile ?? open;
   const finalPath = buildDataFilePath(
     options.dataDir,
     envelope.scope,
@@ -87,12 +89,18 @@ export async function stageDataFile(
   await mkdir(dirname(finalPath), { recursive: true });
   const stagePath = `${finalPath}.pending.${randomUUID()}`;
   const bytes = Buffer.from(JSON.stringify(envelope, null, 2), "utf-8");
-  const handle = await open(stagePath, "wx");
+  const handle = await openFile(stagePath, "wx");
   try {
     await handle.writeFile(bytes);
     await handle.sync();
   } finally {
     await handle.close();
+  }
+  const directory = await openFile(dirname(stagePath), "r");
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
   }
   return {
     finalPath,

@@ -25,10 +25,13 @@ import {
 import { WRITE_SIGNATURE_HEADER } from "@opendatalabs/personal-server-ts-core/write";
 import { createServer, type ServerContext } from "./bootstrap.js";
 import { createNodeDataStorage } from "./storage/node-data-storage.js";
+import { initializeDatabase } from "./storage/index-schema.js";
+import { createIndexManager } from "./storage/index-manager.js";
 
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
 const SCOPE = "example.profile";
+const OTHER_SCOPE = "example.settings";
 let root: string;
 let server: ServerContext | undefined;
 
@@ -46,8 +49,9 @@ function provenance(data: Record<string, unknown>) {
 async function post(
   data: Record<string, unknown>,
   headers: Record<string, string> = {},
+  scope = SCOPE,
 ) {
-  const response = await server!.app.request(`/v1/data/${SCOPE}`, {
+  const response = await server!.app.request(`/v1/data/${scope}`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${server!.devToken}`,
@@ -59,6 +63,14 @@ async function post(
   return { status: response.status, body: await response.json() };
 }
 
+function revisionJournalPath(scope: string) {
+  return join(
+    root,
+    "cas-revisions",
+    `${createHash("sha256").update(scope).digest("hex")}.revision`,
+  );
+}
+
 async function deleteScope() {
   const response = await server!.app.request(`/v1/data/${SCOPE}`, {
     method: "DELETE",
@@ -67,14 +79,14 @@ async function deleteScope() {
   return { status: response.status, body: await response.json() };
 }
 
-function rows() {
+function rows(scope = SCOPE) {
   const db = new Database(join(root, "index.db"), { readonly: true });
   try {
     return db
       .prepare(
         "SELECT path, version, cas_revision, producer, producer_provenance FROM data_files WHERE scope = ? ORDER BY cas_revision",
       )
-      .all(SCOPE) as Array<{
+      .all(scope) as Array<{
       path: string;
       version: number;
       cas_revision: number;
@@ -512,5 +524,241 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
       headers: { authorization: `Bearer ${server!.devToken}` },
     });
     expect((await response.json()).data).toEqual({ id: "manual" });
+  });
+
+  it("refuses a stale attributed write after paired index and CAS journal loss", async () => {
+    expect((await post({ id: "projected" })).status).toBe(201);
+    expect((await deleteScope()).status).toBe(200);
+    expect((await post({ id: "manual" })).status).toBe(201);
+    await server!.cleanup();
+    await unlink(join(root, "index.db"));
+    await rm(join(root, "cas-revisions"), { recursive: true, force: true });
+    server = await createServer(
+      ServerConfigSchema.parse({ tunnel: { enabled: false } }),
+      { serverDir: root, dataDir: join(root, "data") },
+    );
+    expect(rows()).toHaveLength(1);
+    const recovered = await server!.app.request(`/v1/data/${SCOPE}`, {
+      headers: { authorization: `Bearer ${server!.devToken}` },
+    });
+    expect((await recovered.json()).data).toEqual({ id: "manual" });
+
+    const stale = await post(
+      { id: "stale" },
+      {
+        "if-match": '"1"',
+        "vana-producer": "pdpp-projector",
+        "vana-producer-provenance": Buffer.from(
+          JSON.stringify(provenance({ id: "stale" })),
+        ).toString("base64url"),
+      },
+    );
+    expect(stale.status).toBe(412);
+    expect(stale.body).toMatchObject({
+      error: "PRECONDITION_FAILED",
+      current_producer: null,
+    });
+    const afterRefusal = await server!.app.request(`/v1/data/${SCOPE}`, {
+      headers: { authorization: `Bearer ${server!.devToken}` },
+    });
+    expect((await afterRefusal.json()).data).toEqual({ id: "manual" });
+
+    await server!.cleanup();
+    server = await createServer(
+      ServerConfigSchema.parse({ tunnel: { enabled: false } }),
+      { serverDir: root, dataDir: join(root, "data") },
+    );
+    const staleAfterRestart = await post(
+      { id: "still-stale" },
+      {
+        "if-match": '"1"',
+        "vana-producer": "pdpp-projector",
+        "vana-producer-provenance": Buffer.from(
+          JSON.stringify(provenance({ id: "still-stale" })),
+        ).toString("base64url"),
+      },
+    );
+    expect(staleAfterRestart.status).toBe(412);
+  });
+
+  it("closes only recovered scopes whose CAS journal entry was lost", async () => {
+    expect((await post({ id: "projected" })).status).toBe(201);
+    expect((await deleteScope()).status).toBe(200);
+    expect((await post({ id: "manual" })).status).toBe(201);
+    expect((await post({ id: "other" }, {}, OTHER_SCOPE)).status).toBe(201);
+    await server!.cleanup();
+    await unlink(join(root, "index.db"));
+    await unlink(revisionJournalPath(SCOPE));
+    server = await createServer(
+      ServerConfigSchema.parse({ tunnel: { enabled: false } }),
+      { serverDir: root, dataDir: join(root, "data") },
+    );
+
+    const stale = await post({ id: "stale" }, { "if-match": '"1"' });
+    expect(stale.status).toBe(412);
+
+    const otherCurrent = rows(OTHER_SCOPE)[0]!.cas_revision;
+    const otherWrite = await post(
+      { id: "other-next" },
+      { "if-match": `"${otherCurrent}"` },
+      OTHER_SCOPE,
+    );
+    expect(otherWrite.status).toBe(201);
+  });
+
+  it("refuses stale attributed writes after restart from an interrupted paired-loss reindex", async () => {
+    expect((await post({ id: "projected" })).status).toBe(201);
+    expect((await deleteScope()).status).toBe(200);
+    expect((await post({ id: "manual" })).status).toBe(201);
+    expect((await post({ id: "other-manual" }, {}, OTHER_SCOPE)).status).toBe(
+      201,
+    );
+    const manualRow = rows()[0]!;
+    const manualPath = join(root, "data", manualRow.path);
+    const manualBytes = await readFile(manualPath);
+    const manualEnvelope = JSON.parse(manualBytes.toString("utf8")) as {
+      collectedAt: string;
+    };
+    const otherRow = rows(OTHER_SCOPE)[0]!;
+
+    await server!.cleanup();
+    await unlink(join(root, "index.db"));
+    await rm(join(root, "cas-revisions"), { recursive: true, force: true });
+    await writeFile(join(root, "reindex-in-progress"), "interrupted\n");
+    const interruptedDb = initializeDatabase(join(root, "index.db"));
+    const interruptedIndex = createIndexManager(interruptedDb, {
+      revisionJournalDir: join(root, "cas-revisions"),
+    });
+    interruptedIndex.insert({
+      fileId: null,
+      path: manualRow.path,
+      scope: SCOPE,
+      collectedAt: manualEnvelope.collectedAt,
+      sizeBytes: manualBytes.byteLength,
+    });
+    interruptedIndex.close();
+
+    server = await createServer(
+      ServerConfigSchema.parse({ tunnel: { enabled: false } }),
+      { serverDir: root, dataDir: join(root, "data") },
+    );
+    const stale = await post(
+      { id: "stale-after-interrupt" },
+      {
+        "if-match": '"1"',
+        "vana-producer": "pdpp-projector",
+        "vana-producer-provenance": Buffer.from(
+          JSON.stringify(provenance({ id: "stale-after-interrupt" })),
+        ).toString("base64url"),
+      },
+    );
+    expect(stale.status).toBe(412);
+    const otherRead = await server!.app.request(`/v1/data/${OTHER_SCOPE}`, {
+      headers: { authorization: `Bearer ${server!.devToken}` },
+    });
+    expect((await otherRead.json()).data).toEqual({ id: "other-manual" });
+    expect(rows(OTHER_SCOPE).map((row) => row.path)).toEqual([otherRow.path]);
+    const staleOther = await post(
+      { id: "other-stale-after-interrupt" },
+      {
+        "if-match": '"1"',
+        "vana-producer": "pdpp-projector",
+        "vana-producer-provenance": Buffer.from(
+          JSON.stringify(provenance({ id: "other-stale-after-interrupt" })),
+        ).toString("base64url"),
+      },
+      OTHER_SCOPE,
+    );
+    expect(staleOther.status).toBe(412);
+  });
+
+  it("recovers two surviving versions in one unsafe scope after interrupted paired-loss reindex", async () => {
+    expect((await post({ id: "projected" })).status).toBe(201);
+    expect((await deleteScope()).status).toBe(200);
+    expect((await post({ id: "manual-one" })).status).toBe(201);
+    expect((await post({ id: "manual-two" })).status).toBe(201);
+    const [firstRow, secondRow] = rows();
+    const firstPath = join(root, "data", firstRow!.path);
+    const firstBytes = await readFile(firstPath);
+    const firstEnvelope = JSON.parse(firstBytes.toString("utf8")) as {
+      collectedAt: string;
+    };
+
+    await server!.cleanup();
+    await unlink(join(root, "index.db"));
+    await rm(join(root, "cas-revisions"), { recursive: true, force: true });
+    await writeFile(join(root, "reindex-in-progress"), "interrupted\n");
+    const interruptedDb = initializeDatabase(join(root, "index.db"));
+    const interruptedIndex = createIndexManager(interruptedDb, {
+      revisionJournalDir: join(root, "cas-revisions"),
+    });
+    interruptedIndex.insert({
+      fileId: null,
+      path: firstRow!.path,
+      scope: SCOPE,
+      collectedAt: firstEnvelope.collectedAt,
+      sizeBytes: firstBytes.byteLength,
+    });
+    interruptedIndex.close();
+
+    server = await createServer(
+      ServerConfigSchema.parse({ tunnel: { enabled: false } }),
+      { serverDir: root, dataDir: join(root, "data") },
+    );
+
+    expect(rows().map((row) => row.path)).toEqual([
+      firstRow!.path,
+      secondRow!.path,
+    ]);
+    const latest = await server!.app.request(`/v1/data/${SCOPE}`, {
+      headers: { authorization: `Bearer ${server!.devToken}` },
+    });
+    expect((await latest.json()).data).toEqual({ id: "manual-two" });
+    const stale = await post(
+      { id: "stale-same-scope" },
+      {
+        "if-match": '"1"',
+        "vana-producer": "pdpp-projector",
+        "vana-producer-provenance": Buffer.from(
+          JSON.stringify(provenance({ id: "stale-same-scope" })),
+        ).toString("base64url"),
+      },
+    );
+    expect(stale.status).toBe(412);
+  });
+
+  it("keeps a recovered unsafe scope closed after a later index-only loss", async () => {
+    expect((await post({ id: "projected" })).status).toBe(201);
+    expect((await deleteScope()).status).toBe(200);
+    expect((await post({ id: "manual" })).status).toBe(201);
+    await server!.cleanup();
+    await unlink(join(root, "index.db"));
+    await rm(join(root, "cas-revisions"), { recursive: true, force: true });
+    server = await createServer(
+      ServerConfigSchema.parse({ tunnel: { enabled: false } }),
+      { serverDir: root, dataDir: join(root, "data") },
+    );
+
+    const firstStale = await post({ id: "first-stale" }, { "if-match": '"1"' });
+    expect(firstStale.status).toBe(412);
+
+    await server!.cleanup();
+    await unlink(join(root, "index.db"));
+    server = await createServer(
+      ServerConfigSchema.parse({ tunnel: { enabled: false } }),
+      { serverDir: root, dataDir: join(root, "data") },
+    );
+    const liveAfterIndexLoss = rows()[0]!.cas_revision;
+    const staleAfterIndexLoss = await post(
+      { id: "stale-after-index-loss" },
+      {
+        "if-match": `"${liveAfterIndexLoss}"`,
+        "vana-producer": "pdpp-projector",
+        "vana-producer-provenance": Buffer.from(
+          JSON.stringify(provenance({ id: "stale-after-index-loss" })),
+        ).toString("base64url"),
+      },
+    );
+    expect(staleAfterIndexLoss.status).toBe(412);
   });
 });

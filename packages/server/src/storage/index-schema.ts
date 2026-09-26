@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS data_files (
 const CREATE_SCOPE_REVISIONS_SQL = `
 CREATE TABLE IF NOT EXISTS scope_revisions (
   scope TEXT PRIMARY KEY,
-  cas_revision INTEGER NOT NULL
+  cas_revision INTEGER NOT NULL,
+  closed_for_writes INTEGER NOT NULL DEFAULT 0
 )`;
 
 const CREATE_INDEXES_SQL = [
@@ -33,7 +34,7 @@ const CREATE_INDEXES_SQL = [
   "CREATE INDEX IF NOT EXISTS idx_data_files_scope_cas_revision ON data_files (scope, cas_revision)",
 ];
 
-export const INDEX_SCHEMA_VERSION = 6;
+export const INDEX_SCHEMA_VERSION = 7;
 
 function hasColumn(
   db: Database.Database,
@@ -91,6 +92,14 @@ function migrateSchema(db: Database.Database, currentVersion: number): void {
       INSERT OR IGNORE INTO scope_revisions (scope, cas_revision)
       SELECT scope, MAX(cas_revision) FROM data_files GROUP BY scope
     `);
+  }
+  if (
+    currentVersion < 7 &&
+    !hasColumn(db, "scope_revisions", "closed_for_writes")
+  ) {
+    db.exec(
+      "ALTER TABLE scope_revisions ADD COLUMN closed_for_writes INTEGER NOT NULL DEFAULT 0",
+    );
   }
 }
 

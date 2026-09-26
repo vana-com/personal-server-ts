@@ -18,6 +18,16 @@ export interface IndexManager {
         currentVersion: number | null;
         currentProducer: string | null;
       };
+  /**
+   * Close a recovered scope for CAS writes when deleted history cannot be
+   * proven. Reads remain available; writes fail through the precondition path.
+   */
+  closeScopeForWrites(scope: string): void;
+  /**
+   * Internal recovery path for already persisted envelopes. Bypasses the
+   * closed-for-writes guard while preserving CAS allocation and journals.
+   */
+  insertRecovered(entry: NewIndexEntry): IndexEntry;
   findByPath(path: string): IndexEntry | undefined;
   findByScope(options: IndexListOptions): IndexEntry[];
   findLatestByScope(scope: string): IndexEntry | undefined;
@@ -34,6 +44,7 @@ export interface IndexManager {
     limit?: number;
     offset?: number;
   }): { scopes: ScopeSummary[]; total: number };
+  listIndexedScopes(): string[];
   findClosestByScope(scope: string, at: string): IndexEntry | undefined;
   findByFileId(fileId: string): IndexEntry | undefined;
   /** Find an index entry by its DPv2 data-point id (download dedup). */

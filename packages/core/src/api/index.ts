@@ -121,6 +121,12 @@ export interface PersonalServerWriteAuthInput {
   scope: string;
 }
 
+export interface PersonalServerScopeAuthInput {
+  request: Request;
+  /** Raw scope path param; auth ports that need scope binding validate it. */
+  scope: string;
+}
+
 /**
  * Result of authorizing a DELEGATED (write-session) write. A void return
  * means the request was authorized as the owner instead — the ingest then
@@ -206,6 +212,11 @@ export interface PersonalServerReadFulfillmentReporter {
 export interface PersonalServerApiAuthPort {
   authorizeOwner(request: Request): Promise<void>;
   authorizeBuilderList(request: Request): Promise<void>;
+  /**
+   * Authorize listing versions for one legacy scope. Optional so auth ports
+   * without scoped owner-token support keep the existing builder-list gate.
+   */
+  authorizeScopeVersions?(input: PersonalServerScopeAuthInput): Promise<void>;
   authorizeBuilderRead(
     input: PersonalServerReadAuthInput,
   ): Promise<PersonalServerReadAuthResult | void>;
@@ -1420,7 +1431,14 @@ export async function handlePersonalServerDataRequest(
     const parts = pathname.split("/").filter(Boolean);
     if (parts.length === 2 && parts[1] === "versions") {
       if (request.method !== "GET") return methodNotAllowed();
-      await deps.auth.authorizeBuilderList(request);
+      if (deps.auth.authorizeScopeVersions) {
+        await deps.auth.authorizeScopeVersions({
+          request,
+          scope: decodePathPart(parts[0]),
+        });
+      } else {
+        await deps.auth.authorizeBuilderList(request);
+      }
       const result = await listDataVersionsContract({
         storage: deps.storage,
         scopeParam: decodePathPart(parts[0]),

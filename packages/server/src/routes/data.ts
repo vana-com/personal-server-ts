@@ -28,6 +28,7 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/write";
 import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
 import type { Logger } from "pino";
+import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
   createBodyLimit,
   DATA_INGEST_MAX_SIZE,
@@ -78,6 +79,12 @@ export interface DataRouteDeps {
   writeSessionStore?: WriteSessionStore;
   /** Replay guard for per-write proofs; defaults to in-memory (api-auth). */
   writeProofReplayStore?: WriteProofReplayStore;
+  pdppOwnerBearer?: {
+    auth: PdppAuthorizationService;
+    configuredMethods: Map<string, string[]>;
+    ownerSubjectId?: string;
+    instancesForSubject?: (subjectId: string) => string[];
+  };
   /**
    * Powers the RECORD_DATA_ACCESS attestation embedded in 402 challenges.
    * When supplied alongside serverOwner + paymentEnabled, every challenge
@@ -134,6 +141,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     runtimeAvailability: deps.runtimeAvailability,
     writeSessionStore: deps.writeSessionStore,
     writeProofReplayStore: deps.writeProofReplayStore,
+    pdppOwnerBearer: deps.pdppOwnerBearer,
   });
 
   app.use("/:scope", createBodyLimit(DATA_INGEST_MAX_SIZE));

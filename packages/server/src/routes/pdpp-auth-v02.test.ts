@@ -39,6 +39,7 @@ const OWNER = "user_abc123";
 const REDIRECT = "https://app.example.com/callback";
 const VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const CHALLENGE = computeS256Challenge(VERIFIER);
+const INSTANCE = "account_example";
 
 const YEAR = { since: "2025-01-01T00:00:00Z", until: "2026-01-01T00:00:00Z" };
 const Q4 = { since: "2025-10-01T00:00:00Z", until: "2026-01-01T00:00:00Z" };
@@ -75,7 +76,7 @@ let app: Hono;
 let standingTerms: RecipientTerms | null;
 
 const inventory: InstanceInventory = {
-  eligibleFor: () => ["account_example"],
+  eligibleFor: () => [INSTANCE],
 };
 
 function v02Body(streamOverrides: Record<string, unknown> = {}) {
@@ -118,9 +119,13 @@ function post(
   body: unknown,
   headers: Record<string, string> = {},
 ) {
+  const requestHeaders =
+    path === "/pdpp/v1/authorize" && !headers.authorization
+      ? { ...ownerAuth(scopedOwnerToken()), ...headers }
+      : headers;
   return app.request(path, {
     method: "POST",
-    headers: { "content-type": "application/json", ...headers },
+    headers: { "content-type": "application/json", ...requestHeaders },
     body: JSON.stringify(body),
   });
 }
@@ -135,6 +140,13 @@ function postForm(path: string, fields: Record<string, string>) {
 
 function ownerAuth(token: string) {
   return { authorization: `Bearer ${token}` };
+}
+
+function scopedOwnerToken(): string {
+  return tokens.issueOwnerToken({
+    subjectId: OWNER,
+    instanceIds: [INSTANCE],
+  }).access_token;
 }
 
 beforeEach(() => {
@@ -175,7 +187,7 @@ afterEach(() => {
  * in the query string — the same way the consent UI re-fetches after a choice.
  */
 async function review(narrowing = "", body = v02Body()) {
-  const ownerToken = tokens.issueOwnerToken({ subjectId: OWNER }).access_token;
+  const ownerToken = scopedOwnerToken();
   const created = await post("/pdpp/v1/authorize", body);
   expect(created.status).toBe(201);
   const { session_id } = (await created.json()) as { session_id: string };
