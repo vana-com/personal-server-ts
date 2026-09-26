@@ -7,7 +7,6 @@ import {
   readdir,
   unlink,
   rename,
-  stat,
   rm,
 } from "node:fs/promises";
 import { createReadStream } from "node:fs";
@@ -40,32 +39,17 @@ const TEXT_PAGE_MEDIA_TYPE = "text/plain; charset=utf-8";
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
-/** Atomic write: mkdir -p, write temp file, rename */
+/** Publish a durable envelope before callers make it visible in the index. */
 export async function writeDataFile(
   options: HierarchyManagerOptions,
   envelope: DataFileEnvelope,
 ): Promise<WriteResult> {
-  const filePath = buildDataFilePath(
-    options.dataDir,
-    envelope.scope,
-    envelope.collectedAt,
-  );
-  const dir = dirname(filePath);
-
-  await mkdir(dir, { recursive: true });
-
-  const content = JSON.stringify(envelope, null, 2);
-  const tempPath = filePath + ".tmp." + randomUUID();
-
-  await writeFile(tempPath, content, "utf-8");
-  await rename(tempPath, filePath);
-
-  const stats = await stat(filePath);
-
+  const staged = await stageDataFile(options, envelope);
+  await publishStagedDataFile(staged.stagePath, staged.finalPath);
   return {
-    path: filePath,
-    relativePath: relative(options.dataDir, filePath),
-    sizeBytes: stats.size,
+    path: staged.finalPath,
+    relativePath: staged.relativePath,
+    sizeBytes: staged.sizeBytes,
   };
 }
 
