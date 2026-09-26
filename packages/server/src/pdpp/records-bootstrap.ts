@@ -146,9 +146,6 @@ export function createPdppRecordsDeps(
   );
 
   const store = createSqliteRecordStore(options.db);
-  for (const instance of configuredMethods.keys()) {
-    store.getInstanceBinding(instance);
-  }
 
   return {
     store,

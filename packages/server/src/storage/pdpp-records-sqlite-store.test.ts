@@ -48,6 +48,42 @@ describe("sqlite record store", () => {
     expect(record?.data).toEqual({ id: "msg_1", content: "hi" });
   });
 
+  it("test fixture forwards validateData with and without an explicit binding", () => {
+    const rejectBad = (
+      _stream: string,
+      _instance: string,
+      data: Record<string, unknown>,
+    ) => (data.content === "bad" ? "content is bad" : null);
+    const envelope = (instance: string, key: string, content: string) => ({
+      instance,
+      stream: "messages",
+      key,
+      data: { id: key, content },
+      emitted_at: "2026-04-01T00:00:00.000Z",
+    });
+    const unbound = store.ingestBatch(
+      [envelope("inst_1", "ok", "hi"), envelope("inst_1", "no", "bad")],
+      messagesSemantics,
+      messagesPk,
+      undefined,
+      rejectBad,
+    );
+    expect(unbound.results.map((r) => r.outcome)).toEqual([
+      "accepted",
+      "rejected",
+    ]);
+    const bound = store.ingestBatch(
+      [envelope("inst_2", "no", "bad")],
+      messagesSemantics,
+      messagesPk,
+      { method: "m", generation: 1 },
+      rejectBad,
+    );
+    expect(bound.results.map((r) => r.outcome)).toEqual(["rejected"]);
+    expect(store.getRecord("inst_1", "messages", "no")).toBeUndefined();
+    expect(store.getRecord("inst_2", "messages", "no")).toBeUndefined();
+  });
+
   describe("method-less ingest (the sync importer path)", () => {
     const base: PdppRecordEnvelopeInput = {
       instance: "inst_1",

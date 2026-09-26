@@ -173,7 +173,7 @@ async function reset(
   context: ServerContext,
   token: string,
   instance: string,
-  expectedMethod: string,
+  expectedMethod: string | null,
   expectedGeneration: number,
   nextMethod: string | null,
 ) {
@@ -1208,7 +1208,7 @@ describe("P10c and method authority over HTTP", () => {
     expect(bPage2.body.data.map((r: any) => r.id)).toEqual(["b2"]);
   });
 
-  it("refuses a changes_since horizon that is not a non-negative integer", async () => {
+  it("refuses a list or changes_since horizon that is not a non-negative safe integer", async () => {
     const { token } = await bootSwitchable();
     const instance = `oura:${owner}`;
     await seedEvents(token, instance, ["a1", "a2"]);
@@ -1218,6 +1218,13 @@ describe("P10c and method authority over HTTP", () => {
       "/v1/streams/events/records?changes_since=&limit=1",
     );
     const cursor = page.body.next_cursor as string;
+    const listPage = await read(
+      ctx!,
+      token,
+      "/v1/streams/events/records?order=asc&limit=1",
+    );
+    const listCursor = listPage.body.next_cursor as string;
+    expect(listCursor).toBeTruthy();
     const full = await read(
       ctx!,
       token,
@@ -1238,7 +1245,19 @@ describe("P10c and method authority over HTTP", () => {
     expect((await reset(ctx!, token, instance, "oura", 1, null)).status).toBe(
       200,
     );
-    for (const horizon of ["abc", "-1", "1.5", null]) {
+    // 2^53 + 1 rounds to 2^53 as a number, so it must fail the
+    // safe-integer check rather than pass the fence as a huge horizon.
+    const badHorizons = ["abc", "-1", "1.5", null, "9007199254740993"];
+    for (const horizon of badHorizons) {
+      const forged = await read(
+        ctx!,
+        token,
+        `/v1/streams/events/records?order=asc&limit=1&cursor=${encodeURIComponent(forge(listCursor, { horizon }))}`,
+      );
+      expect(forged.status).toBe(400);
+      expect(forged.body.error.code).toBe("invalid_cursor");
+    }
+    for (const horizon of badHorizons) {
       const forged = await read(
         ctx!,
         token,
@@ -1260,6 +1279,37 @@ describe("P10c and method authority over HTTP", () => {
     );
     expect(forgedSince.status).toBe(400);
     expect(forgedSince.body.error.code).toBe("invalid_cursor");
+  });
+
+  it("refuses a reset to an empty method, and changes nothing", async () => {
+    const { token } = await bootSwitchable();
+    const instance = `oura:${owner}`;
+    await seedEvents(token, instance, ["a1"]);
+    for (const nextMethod of ["", "  "]) {
+      const refused = await reset(ctx!, token, instance, "oura", 1, nextMethod);
+      expect(refused.status).toBe(400);
+      expect((await refused.json()).error.code).toBe("invalid_request");
+    }
+    const unchanged = await read(
+      ctx!,
+      token,
+      `/pdpp/instances/${encodeURIComponent(instance)}/binding`,
+    );
+    expect(unchanged.body).toMatchObject({ method: "oura", generation: 1 });
+    const listed = await read(ctx!, token, "/v1/streams/events/records");
+    expect(listed.body.data.map((r: any) => r.id)).toEqual(["a1"]);
+
+    // null (remove) and a method not configured yet (switch, §4.5) are
+    // still accepted.
+    const toNull = await reset(ctx!, token, instance, "oura", 1, null);
+    expect(toNull.status).toBe(200);
+    expect(await toNull.json()).toMatchObject({ method: null, generation: 2 });
+    const toNext = await reset(ctx!, token, instance, null, 2, "oura-browser");
+    expect(toNext.status).toBe(200);
+    expect(await toNext.json()).toMatchObject({
+      method: "oura-browser",
+      generation: 3,
+    });
   });
 
   it("reads a binding over HTTP without creating a binding row", async () => {

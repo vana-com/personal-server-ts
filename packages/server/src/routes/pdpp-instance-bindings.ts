@@ -136,6 +136,17 @@ export function pdppInstanceBindingRoutes(
     ) {
       return errorResponse("invalid_request", "Reset fields are invalid", 400);
     }
+    // A reset may name a method that is not configured yet: the switch
+    // flow resets to B before it writes B to the config (design §4.5,
+    // step 2 before step 4). It may not name an empty method: a binding of
+    // "" refuses every write (method_required) until the next reset.
+    if (typeof input.next_method === "string" && !input.next_method.trim()) {
+      return errorResponse(
+        "invalid_request",
+        "next_method must be null or a non-empty method id",
+        400,
+      );
+    }
     try {
       const result = deps.store.resetInstanceBinding({
         instance,

@@ -418,6 +418,17 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
     return storage;
   }
 
+  /** `syncOne` through an importer that records the import outcome. */
+  async function syncObserved(envelope: DataFileEnvelope) {
+    let outcome: PdppImportOutcome | undefined;
+    const observed: PdppImporter = {
+      importEnvelope: (e) => (outcome = importer.importEnvelope(e)),
+      needsRetry: (scope, at) => importer.needsRetry(scope, at),
+    };
+    const legacy = await syncOne(envelope, observed);
+    return { legacy, outcome };
+  }
+
   it("decrypts, keeps legacy indexing, and refuses the record at the method fence", async () => {
     let outcome: PdppImportOutcome | undefined;
     const observed: PdppImporter = {
@@ -725,13 +736,18 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
 
   describe("malformed and hostile metadata", () => {
     it("keeps legacy indexing when $pdpp is malformed, and imports nothing", async () => {
-      const legacy = await syncOne(
+      const { legacy, outcome } = await syncObserved(
         makeEnvelope({
           id: "235680975",
           username: "callumflack",
           $pdpp: { version: 1, sourceId: SOURCE_ID, declaration: "broken" },
         }),
       );
+      // The importer refused the metadata itself, before any store call.
+      expect(outcome).toMatchObject({
+        status: "rejected",
+        rejection: { code: "malformed_metadata" },
+      });
 
       // The blob arrived intact, so the legacy path must still have run.
       expect(legacy.written).toHaveLength(1);
@@ -752,7 +768,7 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
         .digest("hex");
       expect(canonicalDigest).not.toBe(DOCUMENT_DIGEST);
 
-      await syncOne(
+      const { outcome } = await syncObserved(
         makeEnvelope({
           id: "235680975",
           username: "callumflack",
@@ -767,6 +783,10 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
         }),
       );
 
+      expect(outcome).toMatchObject({
+        status: "rejected",
+        rejection: { code: "digest_mismatch" },
+      });
       expect(store.listStreams([INSTANCE])).toEqual([]);
     });
 
@@ -800,7 +820,7 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
     });
 
     it("does not import a record whose key disagrees with its payload", async () => {
-      await syncOne(
+      const { outcome } = await syncObserved(
         makeEnvelope({
           id: "235680975",
           username: "callumflack",
@@ -810,6 +830,10 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
         }),
       );
 
+      expect(outcome).toMatchObject({
+        status: "rejected",
+        rejection: { code: "record_key_mismatch" },
+      });
       expect(store.getRecord(INSTANCE, "profile", "999999999")).toBeUndefined();
       expect(store.getRecord(INSTANCE, "profile", "235680975")).toBeUndefined();
     });

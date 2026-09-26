@@ -15,7 +15,8 @@ export const TEST_BINDING = { method: "test_method", generation: 1 } as const;
  * current-generation claim (P8c). When a call passes no binding, this view
  * supplies `TEST_BINDING`, claims each referenced blob for the envelope's
  * instance first, and ingests each instance's envelopes as its own batch.
- * An explicit binding passes through unchanged.
+ * An explicit binding passes through unchanged. Both paths forward
+ * `validateData`.
  */
 export function createTestBoundRecordStore(
   db: Database.Database,
@@ -26,9 +27,15 @@ export function createTestBoundRecordStore(
   );
   return {
     ...store,
-    ingestBatch: (envelopes, semantics, primaryKey, binding) => {
+    ingestBatch: (envelopes, semantics, primaryKey, binding, validateData) => {
       if (binding) {
-        return store.ingestBatch(envelopes, semantics, primaryKey, binding);
+        return store.ingestBatch(
+          envelopes,
+          semantics,
+          primaryKey,
+          binding,
+          validateData,
+        );
       }
       const results: IngestOutcome[] = [];
       const instances = new Set(envelopes.map((e) => e.instance));
@@ -45,7 +52,7 @@ export function createTestBoundRecordStore(
           }
         }
         store
-          .ingestBatch(batch, semantics, primaryKey, TEST_BINDING)
+          .ingestBatch(batch, semantics, primaryKey, TEST_BINDING, validateData)
           .results.forEach((result, j) => {
             results[positions[j]] = { ...result, index: positions[j] };
           });
