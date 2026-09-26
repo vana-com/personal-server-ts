@@ -1,7 +1,15 @@
-import { access, mkdir, open, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { createRequire } from "node:module";
 import { createHash, randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { privateKeyToAccount } from "viem/accounts";
 
 const require = createRequire(import.meta.url);
@@ -188,12 +196,27 @@ export async function createServer(
     "pending-blob-deletions.json",
   );
   const tokensPath = join(storageRoot, "tokens.json");
-
-  await mkdir(storageRoot, { recursive: true });
-  await mkdir(dataDir, { recursive: true });
-
   const revisionJournalDir = join(storageRoot, "cas-revisions");
-  const reindexInProgressPath = join(storageRoot, "reindex-in-progress");
+  const metadataSentinelPath = join(storageRoot, "cas-metadata-initialized");
+  const historyUnknownPath = join(storageRoot, "cas-history-unknown");
+  const pathExists = async (path: string): Promise<boolean> => {
+    try {
+      await access(path);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+  };
+  const hadIndex = await pathExists(indexPath);
+  const hadMetadataSentinel = await pathExists(metadataSentinelPath);
+  let hadLocalData = false;
+  try {
+    hadLocalData = (await readdir(dataDir)).length > 0;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+
   const fsyncDirectory = async (path: string): Promise<void> => {
     const handle = await open(path, "r");
     try {
@@ -202,15 +225,56 @@ export async function createServer(
       await handle.close();
     }
   };
-  const hasReindexInProgress = async (): Promise<boolean> => {
-    try {
-      await access(reindexInProgressPath);
-      return true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-      throw error;
+  const newDirectoryParents = new Set<string>();
+  for (const requested of [storageRoot, dataDir]) {
+    let current = requested;
+    while (!(await pathExists(current))) {
+      const parent = dirname(current);
+      if (parent === current) break;
+      newDirectoryParents.add(parent);
+      current = parent;
     }
+  }
+  await mkdir(storageRoot, { recursive: true });
+  await mkdir(dataDir, { recursive: true });
+  for (const parent of [...newDirectoryParents].sort(
+    (a, b) => a.length - b.length,
+  )) {
+    await fsyncDirectory(parent);
+  }
+
+  const reindexInProgressPath = join(storageRoot, "reindex-in-progress");
+  const hasReindexInProgress = async (): Promise<boolean> => {
+    return pathExists(reindexInProgressPath);
   };
+  const writeDurableRootFile = async (
+    path: string,
+    content: string,
+  ): Promise<void> => {
+    await writeFile(path, content);
+    const handle = await open(path, "r");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await fsyncDirectory(storageRoot);
+  };
+  const markHistoryUnknown = async (): Promise<void> => {
+    await writeDurableRootFile(historyUnknownPath, "unknown\n");
+    await writeDurableRootFile(metadataSentinelPath, "unknown\n");
+  };
+  if ((hadMetadataSentinel || hadLocalData) && !hadIndex) {
+    await markHistoryUnknown();
+  } else if (
+    (hadMetadataSentinel &&
+      (await readFile(metadataSentinelPath, "utf8")) !== "initialized\n") ||
+    (await pathExists(historyUnknownPath))
+  ) {
+    await markHistoryUnknown();
+  } else if (!hadMetadataSentinel) {
+    await writeDurableRootFile(metadataSentinelPath, "initialized\n");
+  }
   const markReindexInProgress = async (): Promise<void> => {
     await writeFile(reindexInProgressPath, `${new Date().toISOString()}\n`);
     const marker = await open(reindexInProgressPath, "r");
@@ -224,19 +288,6 @@ export async function createServer(
   const clearReindexInProgress = async (): Promise<void> => {
     await rm(reindexInProgressPath, { force: true });
     await fsyncDirectory(storageRoot);
-  };
-  const hasScopeRevisionJournal = async (scope: string): Promise<boolean> => {
-    const journalPath = join(
-      revisionJournalDir,
-      `${createHash("sha256").update(scope).digest("hex")}.revision`,
-    );
-    try {
-      await access(journalPath);
-      return true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-      throw error;
-    }
   };
   const hasScopeClosedMarker = async (scope: string): Promise<boolean> => {
     const journalPath = join(
@@ -262,18 +313,35 @@ export async function createServer(
     db,
     logger,
   });
+  // This database-held bit distinguishes an old index that needs open-marker
+  // migration from a migrated index whose root sentinel was later lost.
+  const openMarkerProtocolInitialized =
+    db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cas_open_marker_protocol'",
+      )
+      .get() !== undefined;
   const indexManager = createIndexManager(db, {
     revisionJournalDir,
+    historyUnknownPath,
+    // Existing databases predate open proofs. Later boots treat a missing
+    // proof as an interrupted close or metadata loss, never as open.
+    allowOpenMarkerMigration:
+      hadIndex && !hadMetadataSentinel && !openMarkerProtocolInitialized,
   });
+  db.exec(
+    "CREATE TABLE IF NOT EXISTS cas_open_marker_protocol (id INTEGER PRIMARY KEY)",
+  );
   const hierarchyOptions: HierarchyManagerOptions = { dataDir };
   await recoverStagedDataFiles({ indexManager, hierarchyOptions });
   const resumeReindex = await hasReindexInProgress();
   let needsRecoveryScan = false;
   for (const scope of indexManager.listIndexedScopes()) {
-    if (resumeReindex || (await hasScopeClosedMarker(scope))) {
+    const closed = await hasScopeClosedMarker(scope);
+    if (resumeReindex || closed) {
       indexManager.closeScopeForWrites(scope);
     }
-    if (!(await hasScopeRevisionJournal(scope))) {
+    if (!closed && !indexManager.hasTrustedRevisionJournal(scope)) {
       needsRecoveryScan = true;
       indexManager.closeScopeForWrites(scope);
     }
@@ -289,7 +357,7 @@ export async function createServer(
       closeRecoveredScopeForWrites: async (scope) =>
         resumeReindex ||
         (await hasScopeClosedMarker(scope)) ||
-        !(await hasScopeRevisionJournal(scope)),
+        !indexManager.hasTrustedRevisionJournal(scope),
     });
     await clearReindexInProgress();
   }

@@ -611,15 +611,12 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       const results: IngestOutcome[] = [];
       const writes: {
         recordKey: string;
-        data: Record<string, unknown>;
+        data: Record<string, unknown> | null;
         emittedAt: string;
       }[] = [];
       input.envelopes.forEach((envelope, index) => {
         const reject = (reason: string) =>
           results.push({ index, outcome: "rejected", reason });
-        if (envelope.op === "delete") {
-          return reject("replace records must be upserts");
-        }
         let recordKey: string;
         try {
           recordKey = encodeRecordKey(envelope.key);
@@ -658,7 +655,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         results.push(plan.outcome);
         writes.push({
           recordKey,
-          data: plan.write.data!,
+          data: plan.write.data,
           emittedAt: envelope.emitted_at,
         });
       });

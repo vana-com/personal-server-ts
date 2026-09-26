@@ -7,9 +7,10 @@ import {
   openSync,
   readFileSync,
   renameSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type {
   IndexEntry,
   IndexListOptions,
@@ -30,6 +31,7 @@ export interface IndexManager {
         currentProducer: string | null;
       };
   closeScopeForWrites(scope: string): void;
+  hasTrustedRevisionJournal(scope: string): boolean;
   insertRecovered(entry: NewIndexEntry): IndexEntry;
   findByPath(path: string): IndexEntry | undefined;
   findByScope(options: IndexListOptions): IndexEntry[];
@@ -120,10 +122,23 @@ function rowToEntry(row: RawRow): IndexEntry {
 
 export function createIndexManager(
   db: Database.Database,
-  options?: { revisionJournalDir?: string },
+  options?: {
+    revisionJournalDir?: string;
+    historyUnknownPath?: string;
+    allowOpenMarkerMigration?: boolean;
+  },
 ): IndexManager {
   const revisionJournalDir = options?.revisionJournalDir;
-  if (revisionJournalDir) mkdirSync(revisionJournalDir, { recursive: true });
+  const historyUnknownPath = options?.historyUnknownPath;
+  if (revisionJournalDir) {
+    mkdirSync(revisionJournalDir, { recursive: true });
+    const parent = openSync(dirname(revisionJournalDir), "r");
+    try {
+      fsyncSync(parent);
+    } finally {
+      closeSync(parent);
+    }
+  }
 
   const journalPath = (scope: string): string =>
     join(
@@ -132,6 +147,19 @@ export function createIndexManager(
     );
   const closedMarkerPath = (scope: string): string =>
     `${journalPath(scope)}.closed`;
+  const openMarkerPath = (scope: string): string =>
+    `${journalPath(scope)}.open`;
+  const markerExists = (path: string): boolean => {
+    try {
+      readFileSync(path);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+  };
+  const historyUnknown =
+    historyUnknownPath !== undefined && markerExists(historyUnknownPath);
   const readJournal = (scope: string): number => {
     if (!revisionJournalDir) return 0;
     let value: string;
@@ -166,19 +194,13 @@ export function createIndexManager(
       closeSync(dir);
     }
   };
-  const reserveClosedMarker = (scope: string): void => {
+  const reserveMarker = (path: string, content: string): void => {
     if (!revisionJournalDir) return;
-    const path = closedMarkerPath(scope);
-    try {
-      readFileSync(path);
-      return;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
+    if (markerExists(path)) return;
     const staged = `${path}.pending.${randomUUID()}`;
     const file = openSync(staged, "wx");
     try {
-      writeFileSync(file, "closed\n");
+      writeFileSync(file, content);
       fsyncSync(file);
     } finally {
       closeSync(file);
@@ -191,14 +213,57 @@ export function createIndexManager(
       closeSync(dir);
     }
   };
+  const reserveClosedMarker = (scope: string): void => {
+    if (revisionJournalDir) reserveMarker(closedMarkerPath(scope), "closed\n");
+  };
+  const reserveOpenMarker = (scope: string): void => {
+    if (revisionJournalDir) reserveMarker(openMarkerPath(scope), "open\n");
+  };
+  const removeOpenMarker = (scope: string): void => {
+    if (!revisionJournalDir || !markerExists(openMarkerPath(scope))) return;
+    unlinkSync(openMarkerPath(scope));
+    const dir = openSync(revisionJournalDir, "r");
+    try {
+      fsyncSync(dir);
+    } finally {
+      closeSync(dir);
+    }
+  };
+  const hasTrustedRevisionJournal = (scope: string): boolean =>
+    !!revisionJournalDir &&
+    readJournal(scope) > 0 &&
+    markerExists(openMarkerPath(scope)) &&
+    !markerExists(closedMarkerPath(scope));
 
   // The index can be reconstructed from envelopes. Keep a separate durable
   // high-water mark so reconstruction cannot reuse a deleted CAS version.
   if (revisionJournalDir) {
     const existing = db
-      .prepare("SELECT scope, cas_revision FROM scope_revisions")
-      .all() as Array<{ scope: string; cas_revision: number }>;
-    for (const row of existing) reserveJournal(row.scope, row.cas_revision);
+      .prepare(
+        "SELECT scope, cas_revision, closed_for_writes FROM scope_revisions",
+      )
+      .all() as Array<{
+      scope: string;
+      cas_revision: number;
+      closed_for_writes: number;
+    }>;
+    for (const row of existing) {
+      reserveJournal(row.scope, row.cas_revision);
+      if (
+        row.closed_for_writes === 1 ||
+        markerExists(closedMarkerPath(row.scope)) ||
+        (!markerExists(openMarkerPath(row.scope)) &&
+          !options?.allowOpenMarkerMigration)
+      ) {
+        removeOpenMarker(row.scope);
+        reserveClosedMarker(row.scope);
+        db.prepare(
+          "UPDATE scope_revisions SET closed_for_writes = 1 WHERE scope = ?",
+        ).run(row.scope);
+      } else {
+        reserveOpenMarker(row.scope);
+      }
+    }
   }
   const insertStmt = db.prepare<{
     file_id: string | null;
@@ -366,7 +431,16 @@ export function createIndexManager(
         | undefined;
       const currentVersion =
         current === undefined ? null : (current.cas_revision ?? null);
-      const scopeClosedForWrites = current?.closed_for_writes === 1;
+      const scopeClosedForWrites =
+        ((historyUnknown ||
+          (historyUnknownPath !== undefined &&
+            markerExists(historyUnknownPath))) &&
+          !hasTrustedRevisionJournal(entry.scope)) ||
+        current?.closed_for_writes === 1 ||
+        (revisionJournalDir !== undefined &&
+          (markerExists(closedMarkerPath(entry.scope)) ||
+            ((current !== undefined || readJournal(entry.scope) > 0) &&
+              !hasTrustedRevisionJournal(entry.scope))));
       if (
         scopeClosedForWrites ||
         (precondition?.kind === "none" &&
@@ -374,12 +448,19 @@ export function createIndexManager(
         (precondition?.kind === "match" &&
           currentVersion !== precondition.version)
       ) {
+        if (scopeClosedForWrites) {
+          ensureScopeRevisionStmt.run({ scope: entry.scope });
+          removeOpenMarker(entry.scope);
+          reserveClosedMarker(entry.scope);
+          closeScopeForWritesStmt.run({ scope: entry.scope });
+        }
         return {
           ok: false as const,
           currentVersion,
           currentProducer: current?.producer ?? null,
         };
       }
+      reserveOpenMarker(entry.scope);
       return { ok: true as const, entry: insertRow(entry) };
     },
   );
@@ -395,9 +476,13 @@ export function createIndexManager(
       ensureScopeRevisionStmt.run({ scope });
       // Durable fail-closed marker. There is no HTTP reset path; clearing this
       // requires an explicit owner-confirmed offline repair/rebuild.
+      // Remove open proof first. A crash before the closed marker is written
+      // leaves an ambiguous scope, which startup closes from the database row.
+      removeOpenMarker(scope);
       reserveClosedMarker(scope);
       closeScopeForWritesStmt.run({ scope });
     },
+    hasTrustedRevisionJournal,
     insertRecovered(entry) {
       return insertRow(entry);
     },

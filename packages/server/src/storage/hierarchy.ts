@@ -86,7 +86,9 @@ export async function stageDataFile(
     envelope.scope,
     envelope.collectedAt,
   );
-  await mkdir(dirname(finalPath), { recursive: true });
+  const finalDir = dirname(finalPath);
+  const directorySyncPaths = collectDirectorySyncPaths(finalDir);
+  await mkdir(finalDir, { recursive: true });
   const stagePath = `${finalPath}.pending.${randomUUID()}`;
   const bytes = Buffer.from(JSON.stringify(envelope, null, 2), "utf-8");
   const handle = await openFile(stagePath, "wx");
@@ -96,11 +98,13 @@ export async function stageDataFile(
   } finally {
     await handle.close();
   }
-  const directory = await openFile(dirname(stagePath), "r");
-  try {
-    await directory.sync();
-  } finally {
-    await directory.close();
+  for (const directoryPath of directorySyncPaths) {
+    const directory = await openFile(directoryPath, "r");
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
   }
   return {
     finalPath,
@@ -108,6 +112,17 @@ export async function stageDataFile(
     relativePath: relative(options.dataDir, finalPath),
     sizeBytes: bytes.length,
   };
+}
+
+function collectDirectorySyncPaths(finalDir: string): string[] {
+  const paths: string[] = [];
+  let current = finalDir;
+  while (true) {
+    paths.unshift(current);
+    const parent = dirname(current);
+    if (parent === current) return paths;
+    current = parent;
+  }
 }
 
 export async function publishStagedDataFile(

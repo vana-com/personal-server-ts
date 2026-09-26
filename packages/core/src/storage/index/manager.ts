@@ -23,6 +23,8 @@ export interface IndexManager {
    * proven. Reads remain available; writes fail through the precondition path.
    */
   closeScopeForWrites(scope: string): void;
+  /** A durable revision and open-state proof exist for this scope. */
+  hasTrustedRevisionJournal(scope: string): boolean;
   /**
    * Internal recovery path for already persisted envelopes. Bypasses the
    * closed-for-writes guard while preserving CAS allocation and journals.

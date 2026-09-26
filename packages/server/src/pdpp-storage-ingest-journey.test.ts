@@ -1826,14 +1826,13 @@ describe("P7: stream snapshot replace", () => {
         records: [
           record("k1", "changed", "2026-09-02T00:00:00Z"),
           {
-            key: "k2",
+            key: "k9",
             data: null,
             emitted_at: "2026-09-02T00:00:00Z",
-            op: "delete",
           },
         ],
         index: 1,
-        reason: /must be upserts/,
+        reason: /data must be a JSON object/,
       },
       {
         records: [
@@ -1955,6 +1954,72 @@ describe("P7: stream snapshot replace", () => {
     } finally {
       db.close();
     }
+  });
+
+  it("accepts explicit key-only and full-data deletes in a replace snapshot", async () => {
+    ctx = await bootBoth();
+    const token = await ownerToken(ctx);
+    const instance = await seed(ctx, token);
+    const before = storeCounters();
+
+    const result = await replace(ctx, token, "profile", {
+      instance,
+      emitted_at: "2026-09-02T12:00:00Z",
+      records: [
+        {
+          key: "k1",
+          op: "delete",
+          emitted_at: "2026-09-02T00:00:00Z",
+        },
+        {
+          key: "k2",
+          data: { user_id: "k2", email: "ignored@example.com" },
+          op: "delete",
+          emitted_at: "2026-09-02T00:00:00Z",
+        },
+        record("k3", "k3@a", "2026-09-02T00:00:00Z"),
+      ],
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      accepted: 2,
+      unchanged: 1,
+      deleted: 0,
+      rejected: [],
+    });
+    expect(result.body.results.map((r: any) => r.outcome)).toEqual([
+      "accepted",
+      "accepted",
+      "unchanged",
+    ]);
+    expect(storeCounters()).toEqual({
+      clock: before.clock + 2,
+      changes: before.changes + 2,
+    });
+
+    const rows = currentRows();
+    expect(
+      rows
+        .filter((row: any) => row.stream === "profile")
+        .map((row: any) => ({
+          key: row.record_key,
+          deleted: row.deleted,
+          deletedAt: row.deleted_at,
+        })),
+    ).toEqual([
+      {
+        key: "k1",
+        deleted: 1,
+        deletedAt: "2026-09-02T00:00:00Z",
+      },
+      {
+        key: "k2",
+        deleted: 1,
+        deletedAt: "2026-09-02T00:00:00Z",
+      },
+      { key: "k3", deleted: 0, deletedAt: null },
+    ]);
   });
 
   it("rolls back every upsert and tombstone when a write faults mid-transaction", async () => {
@@ -2223,7 +2288,10 @@ describe("P5: record data is validated against the declared stream schema", () =
   it("ingest: a non-conforming upsert over a stored record leaves it unchanged, and a delete is not schema-checked", async () => {
     ctx = await bootWhoop();
     const token = await ownerToken(ctx);
-    await ingest(ctx, token, "sleep", [envelope({ id: "s1", score: 80 })]);
+    await ingest(ctx, token, "sleep", [
+      envelope({ id: "s1", score: 80 }),
+      envelope({ id: "s2", score: 2 }),
+    ]);
     const rows = sleepRows();
     const counters = storeCounters();
 
@@ -2252,8 +2320,15 @@ describe("P5: record data is validated against the declared stream schema", () =
         op: "delete",
         emitted_at: "2026-09-03T00:00:00Z",
       },
+      {
+        instance: instance(),
+        key: "s2",
+        data: { id: "s2", score: 2 },
+        op: "delete",
+        emitted_at: "2026-09-03T00:00:00Z",
+      },
     ]);
-    expect(outcomes(deleted.body)).toEqual(["accepted"]);
+    expect(outcomes(deleted.body)).toEqual(["accepted", "accepted"]);
   });
 
   it("replace: applies a conforming snapshot, and one non-conforming record rejects it with nothing written", async () => {

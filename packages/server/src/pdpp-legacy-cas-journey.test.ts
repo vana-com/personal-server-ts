@@ -761,4 +761,181 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     );
     expect(staleAfterIndexLoss.status).toBe(412);
   });
+
+  it("keeps a manual head closed through paired loss, journal loss, then index loss", async () => {
+    expect((await post({ id: "projected-one" })).status).toBe(201);
+    const projected = { id: "projected-two" };
+    expect(
+      (
+        await post(projected, {
+          "vana-producer": "pdpp-projector",
+          "vana-producer-provenance": Buffer.from(
+            JSON.stringify(provenance(projected)),
+          ).toString("base64url"),
+        })
+      ).status,
+    ).toBe(201);
+    expect(rows()[1]!.cas_revision).toBe(2);
+    expect((await deleteScope()).status).toBe(200);
+    expect((await post({ id: "manual" })).status).toBe(201);
+
+    const restart = async () => {
+      server = await createServer(
+        ServerConfigSchema.parse({ tunnel: { enabled: false } }),
+        { serverDir: root, dataDir: join(root, "data") },
+      );
+    };
+    await server!.cleanup();
+    await unlink(join(root, "index.db"));
+    await rm(join(root, "cas-revisions"), { recursive: true, force: true });
+    await restart();
+    expect(
+      (await post({ id: "blocked-first" }, { "if-match": '"1"' })).status,
+    ).toBe(412);
+
+    await server!.cleanup();
+    await rm(join(root, "cas-revisions"), { recursive: true, force: true });
+    await restart();
+    expect(
+      (await post({ id: "blocked-second" }, { "if-match": '"1"' })).status,
+    ).toBe(412);
+    expect(await readdir(join(root, "cas-revisions"))).toContain(
+      `${createHash("sha256").update(SCOPE).digest("hex")}.revision.closed`,
+    );
+
+    await server!.cleanup();
+    await unlink(join(root, "index.db"));
+    await restart();
+    const stale = { id: "stale-projector-over-manual" };
+    const write = await post(stale, {
+      "if-match": `"${rows()[0]!.cas_revision}"`,
+      "vana-producer": "pdpp-projector",
+      "vana-producer-provenance": Buffer.from(
+        JSON.stringify(provenance(stale)),
+      ).toString("base64url"),
+    });
+    expect(write.status).toBe(412);
+    const current = await server!.app.request(`/v1/data/${SCOPE}`, {
+      headers: { authorization: `Bearer ${server!.devToken}` },
+    });
+    expect((await current.json()).data).toEqual({ id: "manual" });
+  });
+
+  it("keeps a closed scope without live files closed after journal and index loss", async () => {
+    expect((await post({ id: "temporary" })).status).toBe(201);
+    expect((await deleteScope()).status).toBe(200);
+    server!.indexManager.closeScopeForWrites(SCOPE);
+    expect(rows()).toHaveLength(0);
+
+    await server!.cleanup();
+    await rm(join(root, "cas-revisions"), { recursive: true, force: true });
+    server = await createServer(
+      ServerConfigSchema.parse({ tunnel: { enabled: false } }),
+      { serverDir: root, dataDir: join(root, "data") },
+    );
+    expect(await readdir(join(root, "cas-revisions"))).toContain(
+      `${createHash("sha256").update(SCOPE).digest("hex")}.revision.closed`,
+    );
+
+    await server!.cleanup();
+    await unlink(join(root, "index.db"));
+    server = await createServer(
+      ServerConfigSchema.parse({ tunnel: { enabled: false } }),
+      { serverDir: root, dataDir: join(root, "data") },
+    );
+    expect(
+      (await post({ id: "should-stay-closed" }, { "if-none-match": "*" }))
+        .status,
+    ).toBe(412);
+  });
+
+  it("does not trust a revision journal after its closed marker and index are lost", async () => {
+    expect((await post({ id: "manual" })).status).toBe(201);
+    server!.indexManager.closeScopeForWrites(SCOPE);
+    await server!.cleanup();
+    await unlink(`${revisionJournalPath(SCOPE)}.closed`);
+    await unlink(join(root, "index.db"));
+    server = await createServer(
+      ServerConfigSchema.parse({ tunnel: { enabled: false } }),
+      { serverDir: root, dataDir: join(root, "data") },
+    );
+    const current = rows()[0]!.cas_revision;
+    expect(
+      (await post({ id: "stale" }, { "if-match": `"${current}"` })).status,
+    ).toBe(412);
+  });
+
+  it("fails closed when an open-state marker disappears before the database records closure", async () => {
+    expect((await post({ id: "manual" })).status).toBe(201);
+    await server!.cleanup();
+    await unlink(`${revisionJournalPath(SCOPE)}.open`);
+    server = await createServer(
+      ServerConfigSchema.parse({ tunnel: { enabled: false } }),
+      { serverDir: root, dataDir: join(root, "data") },
+    );
+    expect(
+      (await post({ id: "must-stay-manual" }, { "if-match": '"1"' })).status,
+    ).toBe(412);
+    expect(await readdir(join(root, "cas-revisions"))).toContain(
+      `${createHash("sha256").update(SCOPE).digest("hex")}.revision.closed`,
+    );
+  });
+
+  it("does not remigrate a missing open marker after the root sentinel is lost", async () => {
+    expect((await post({ id: "manual" })).status).toBe(201);
+    await server!.cleanup();
+    await unlink(`${revisionJournalPath(SCOPE)}.open`);
+    await unlink(join(root, "cas-metadata-initialized"));
+    server = await createServer(
+      ServerConfigSchema.parse({ tunnel: { enabled: false } }),
+      { serverDir: root, dataDir: join(root, "data") },
+    );
+    expect(
+      (await post({ id: "must-stay-manual" }, { "if-match": '"1"' })).status,
+    ).toBe(412);
+  });
+
+  it("refuses a write to an empty prior scope when both metadata stores are lost", async () => {
+    expect((await post({ id: "temporary" })).status).toBe(201);
+    expect((await deleteScope()).status).toBe(200);
+    server!.indexManager.closeScopeForWrites(SCOPE);
+    await server!.cleanup();
+    await unlink(join(root, "index.db"));
+    await rm(join(root, "cas-revisions"), { recursive: true, force: true });
+    server = await createServer(
+      ServerConfigSchema.parse({ tunnel: { enabled: false } }),
+      { serverDir: root, dataDir: join(root, "data") },
+    );
+    expect((await post({ id: "new" }, { "if-none-match": "*" })).status).toBe(
+      412,
+    );
+  });
+
+  it("treats an unknown scope as closed after index loss even if other journals survive", async () => {
+    expect((await post({ id: "temporary" })).status).toBe(201);
+    expect((await deleteScope()).status).toBe(200);
+    server!.indexManager.closeScopeForWrites(SCOPE);
+    expect((await post({ id: "other" }, {}, OTHER_SCOPE)).status).toBe(201);
+    await server!.cleanup();
+    await unlink(join(root, "index.db"));
+    await unlink(revisionJournalPath(SCOPE));
+    await unlink(`${revisionJournalPath(SCOPE)}.closed`);
+    server = await createServer(
+      ServerConfigSchema.parse({ tunnel: { enabled: false } }),
+      { serverDir: root, dataDir: join(root, "data") },
+    );
+    expect(
+      (await post({ id: "unsafe-recreate" }, { "if-none-match": "*" })).status,
+    ).toBe(412);
+    const currentOther = rows(OTHER_SCOPE)[0]!.cas_revision;
+    expect(
+      (
+        await post(
+          { id: "safe-next" },
+          { "if-match": `"${currentOther}"` },
+          OTHER_SCOPE,
+        )
+      ).status,
+    ).toBe(201);
+  });
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, readFile } from "node:fs/promises";
 import { open as realOpen } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -94,7 +94,7 @@ describe("HierarchyManager", () => {
   });
 
   describe("stageDataFile", () => {
-    it("fsyncs the staged file and parent directory before returning", async () => {
+    it("fsyncs the staged file and each directory with a newly created entry before returning", async () => {
       const syncs: string[] = [];
       const openFile: typeof realOpen = async (...args) => {
         const handle = await realOpen(...args);
@@ -108,9 +108,101 @@ describe("HierarchyManager", () => {
 
       const staged = await stageDataFile(options, makeEnvelope(), { openFile });
 
-      expect(syncs).toHaveLength(2);
       expect(syncs[0]).toBe(staged.stagePath);
-      expect(syncs[1]).toBe(join(dataDir, "instagram", "profile"));
+      expect(syncs).toEqual(
+        expect.arrayContaining([
+          dataDir,
+          join(dataDir, "instagram"),
+          join(dataDir, "instagram", "profile"),
+        ]),
+      );
+      expect(syncs.at(-1)).toBe(join(dataDir, "instagram", "profile"));
+    });
+
+    it("fsyncs the storage root when creating dataDir before returning", async () => {
+      const storageRoot = await mkdtemp(join(tmpdir(), "hierarchy-root-"));
+      const freshDataDir = join(storageRoot, "data");
+      const syncs: string[] = [];
+      const openFile: typeof realOpen = async (...args) => {
+        const handle = await realOpen(...args);
+        const originalSync = handle.sync.bind(handle);
+        vi.spyOn(handle, "sync").mockImplementation(async () => {
+          syncs.push(String(args[0]));
+          await originalSync();
+        });
+        return handle;
+      };
+
+      try {
+        const staged = await stageDataFile(
+          { dataDir: freshDataDir },
+          makeEnvelope(),
+          { openFile },
+        );
+
+        expect(syncs[0]).toBe(staged.stagePath);
+        expect(syncs).toEqual(
+          expect.arrayContaining([
+            storageRoot,
+            freshDataDir,
+            join(freshDataDir, "instagram"),
+            join(freshDataDir, "instagram", "profile"),
+          ]),
+        );
+        expect(syncs.at(-1)).toBe(join(freshDataDir, "instagram", "profile"));
+      } finally {
+        await rm(storageRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("fsyncs every ancestor even when dataDir has several missing parents", async () => {
+      const existingRoot = await mkdtemp(
+        join(tmpdir(), "hierarchy-ancestors-"),
+      );
+      const nestedRoot = join(existingRoot, "new", "deeper");
+      const nestedDataDir = join(nestedRoot, "data");
+      const syncs: string[] = [];
+      const openFile: typeof realOpen = async (...args) => {
+        const handle = await realOpen(...args);
+        const originalSync = handle.sync.bind(handle);
+        vi.spyOn(handle, "sync").mockImplementation(async () => {
+          syncs.push(String(args[0]));
+          await originalSync();
+        });
+        return handle;
+      };
+
+      try {
+        await stageDataFile({ dataDir: nestedDataDir }, makeEnvelope(), {
+          openFile,
+        });
+        expect(syncs).toContain(existingRoot);
+        expect(syncs).toContain(join(existingRoot, "new"));
+        expect(syncs).toContain(nestedRoot);
+        expect(syncs).toContain(nestedDataDir);
+      } finally {
+        await rm(existingRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("fsyncs a scope parent that another write may have created", async () => {
+      await mkdir(join(dataDir, "instagram"), { recursive: true });
+      const syncs: string[] = [];
+      const openFile: typeof realOpen = async (...args) => {
+        const handle = await realOpen(...args);
+        const originalSync = handle.sync.bind(handle);
+        vi.spyOn(handle, "sync").mockImplementation(async () => {
+          syncs.push(String(args[0]));
+          await originalSync();
+        });
+        return handle;
+      };
+
+      const staged = await stageDataFile(options, makeEnvelope(), { openFile });
+      expect(syncs[0]).toBe(staged.stagePath);
+      expect(syncs).toContain(dataDir);
+      expect(syncs).toContain(join(dataDir, "instagram"));
+      expect(syncs.at(-1)).toBe(join(dataDir, "instagram", "profile"));
     });
   });
 
