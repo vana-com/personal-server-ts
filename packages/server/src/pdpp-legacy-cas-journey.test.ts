@@ -10,8 +10,19 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
+import type {
+  Builder,
+  GatewayClient,
+  GatewayGrantResponse,
+} from "@opendatalabs/vana-sdk/node";
+import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
+import {
+  buildWeb3SignedHeader,
+  createTestWallet,
+} from "@opendatalabs/personal-server-ts-core/test-utils";
+import { WRITE_SIGNATURE_HEADER } from "@opendatalabs/personal-server-ts-core/write";
 import { createServer, type ServerContext } from "./bootstrap.js";
 import { createNodeDataStorage } from "./storage/node-data-storage.js";
 
@@ -273,6 +284,90 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     );
     expect(result.status).toBe(400);
     expect(result.body.error.errorCode).toBe("PAYLOAD_HASH_MISMATCH");
+    expect(rows()).toHaveLength(0);
+  });
+
+  it("rejects a producer asserted by a real delegated write session", async () => {
+    const builder = createTestWallet(0);
+    const owner = await recoverServerOwner(KNOWN_SIG);
+    const grantId = "grant-write-p9";
+    const builderId = "builder-write-p9";
+    const grant: GatewayGrantResponse = {
+      id: grantId,
+      grantorAddress: owner,
+      granteeId: builderId,
+      scopes: [`write:${SCOPE}`],
+      status: "confirmed",
+      addedAt: "2026-01-21T10:00:00.000Z",
+      expiresAt: null,
+      expired: false,
+      revokedAt: null,
+      revocationSignature: null,
+      paymentStatus: "paid",
+      paidAt: null,
+      paidBy: null,
+      grantVersion: "1",
+      settleTxHash: null,
+      settleSubmittedAt: null,
+      revocationTxHash: null,
+      fee: {
+        asset: "0x0000000000000000000000000000000000000000",
+        registrationFee: "0",
+        dataAccessFee: "0",
+        totalDue: "0",
+      },
+    };
+    const gateway = {
+      getBuilder: vi.fn().mockResolvedValue({
+        id: builderId,
+        ownerAddress: owner,
+        granteeAddress: builder.address,
+        publicKey: "0x04key",
+        appUrl: "https://app.example.com",
+        addedAt: "2026-01-21T10:00:00.000Z",
+      } satisfies Builder),
+      getGrant: vi.fn().mockResolvedValue(grant),
+    } as unknown as GatewayClient;
+    await server!.cleanup();
+    server = await createServer(
+      ServerConfigSchema.parse({ tunnel: { enabled: false } }),
+      { serverDir: root, dataDir: join(root, "data"), gatewayClient: gateway },
+    );
+    const origin = server.config.server.origin;
+    const session = await server.app.request("/v1/write/session", {
+      method: "POST",
+      headers: {
+        authorization: await buildWeb3SignedHeader({
+          wallet: builder,
+          aud: origin,
+          method: "POST",
+          uri: "/v1/write/session",
+          grantId,
+        }),
+      },
+    });
+    expect(session.status).toBe(200);
+    const { access_token } = await session.json();
+    const body = JSON.stringify({ id: "builder" });
+    const response = await server.app.request(`/v1/data/${SCOPE}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${access_token}`,
+        "content-type": "application/json",
+        "vana-producer": "pdpp-projector",
+        [WRITE_SIGNATURE_HEADER]: await buildWeb3SignedHeader({
+          wallet: builder,
+          aud: origin,
+          method: "POST",
+          uri: `/v1/data/${SCOPE}`,
+          body: new TextEncoder().encode(body),
+          grantId,
+        }),
+      },
+      body,
+    });
+    expect(response.status).toBe(403);
+    expect((await response.json()).error.errorCode).toBe("NOT_OWNER");
     expect(rows()).toHaveLength(0);
   });
 
