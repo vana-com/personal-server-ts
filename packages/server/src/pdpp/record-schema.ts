@@ -25,46 +25,56 @@ import type {
  *
  * A stream whose declaration carries no schema is not checked: a
  * private-shape declaration states no shape to check against. A schema this
- * build cannot compile rejects every upsert of that stream, because an
- * unchecked write would store data the declaration may not permit.
+ * build cannot compile prevents the resource server from mounting, because
+ * an unchecked write would store data the declaration may not permit.
  */
 export function createRecordDataValidator(
   declarations: StreamDeclarationRegistry,
 ): RecordDataValidator {
-  const ajv = new Ajv2020({
-    allErrors: false,
-    strict: false,
-    validateFormats: false,
-    // Two sources may reuse one `$id`; each schema is compiled on its own.
-    addUsedSchema: false,
-  });
-  const compiled = new WeakMap<object, ValidateFunction | string>();
+  const compiled = new WeakMap<object, ValidateFunction>();
 
-  function validatorFor(
-    schema: Record<string, unknown>,
-  ): ValidateFunction | string {
-    let entry = compiled.get(schema);
-    if (entry === undefined) {
-      try {
-        entry = ajv.compile(schema);
-      } catch (err) {
-        entry = `schema_unavailable: ${err instanceof Error ? err.message : String(err)}`;
-      }
-      compiled.set(schema, entry);
+  function validatorFor(schema: Record<string, unknown>): ValidateFunction {
+    let validate = compiled.get(schema);
+    if (!validate) {
+      // A fresh Ajv instance allows separate sources to reuse the same `$id`
+      // and lets root references (`$ref: "#"`) resolve normally.
+      const ajv = new Ajv2020({
+        allErrors: false,
+        strict: false,
+        validateFormats: false,
+      });
+      validate = ajv.compile(schema);
+      compiled.set(schema, validate);
     }
-    return entry;
+    return validate;
+  }
+
+  // Compilation is a boot-time declaration gate. A declaration is not
+  // retained for serving if its advertised schema cannot be enforced.
+  for (const declaration of declarations.list()) {
+    if (declaration.schema) {
+      try {
+        validatorFor(declaration.schema);
+      } catch (err) {
+        throw new Error(
+          `PDPP stream '${declaration.name}' schema cannot compile: ${err instanceof Error ? err.message : String(err)}`,
+          { cause: err },
+        );
+      }
+    }
   }
 
   return (stream, instance, data) => {
     const schema = declarations.forInstance(instance, stream)?.schema;
     if (!schema) return null;
     const validate = validatorFor(schema);
-    if (typeof validate === "string") return validate;
     if (validate(data)) return null;
     // `allErrors: false` stops at the first failing keyword, so the reason
     // is the same for the same data and schema on every call.
     const [error] = validate.errors ?? [];
-    const path = error ? redactedPath(schema, error.instancePath) : "(root)";
+    const path = error
+      ? redactedPath(schema, error.instancePath, data)
+      : "(root)";
     return `schema_violation: ${path} ${error?.message ?? "does not match the declared schema"}`;
   };
 }
@@ -80,31 +90,38 @@ export function createRecordDataValidator(
  * follow the schema (a combinator, a non-local `$ref`), every later segment
  * is redacted. The instance root is shown as `(root)`.
  */
-function redactedPath(schema: Record<string, unknown>, instancePath: string) {
+function redactedPath(
+  schema: Record<string, unknown>,
+  instancePath: string,
+  data: unknown,
+) {
   if (instancePath === "") return "(root)";
   const segments = instancePath
     .slice(1)
     .split("/")
     .map((s) => s.replace(/~1/g, "/").replace(/~0/g, "~"));
   let node: unknown = schema;
+  let value = data;
   const shown: string[] = [];
   for (const segment of segments) {
     const current = resolveLocalRef(schema, node);
     const properties = current?.properties as
       Record<string, unknown> | undefined;
-    const isArray =
-      current !== undefined &&
-      (current.type === "array" ||
-        "items" in current ||
-        "prefixItems" in current);
-    if (properties && Object.hasOwn(properties, segment)) {
+    const arrayValue = Array.isArray(value) ? value : undefined;
+    const numericIndex = /^(0|[1-9][0-9]*)$/.test(segment);
+    if (arrayValue && numericIndex) {
+      shown.push(segment.replace(/~/g, "~0").replace(/\//g, "~1"));
+      const prefix = current?.prefixItems as unknown[] | undefined;
+      const index = Number(segment);
+      node = prefix && index < prefix.length ? prefix[index] : current?.items;
+      value = arrayValue[index];
+    } else if (properties && Object.hasOwn(properties, segment)) {
       shown.push(segment.replace(/~/g, "~0").replace(/\//g, "~1"));
       node = properties[segment];
-    } else if (isArray && /^(0|[1-9][0-9]*)$/.test(segment)) {
-      shown.push(segment);
-      const prefix = current.prefixItems as unknown[] | undefined;
-      const index = Number(segment);
-      node = prefix && index < prefix.length ? prefix[index] : current.items;
+      value =
+        value && typeof value === "object"
+          ? (value as Record<string, unknown>)[segment]
+          : undefined;
     } else {
       shown.push("*");
       // A data key under `additionalProperties` still has a known schema,
@@ -112,6 +129,10 @@ function redactedPath(schema: Record<string, unknown>, instancePath: string) {
       node =
         current && !("patternProperties" in current)
           ? current.additionalProperties
+          : undefined;
+      value =
+        value && typeof value === "object"
+          ? (value as Record<string, unknown>)[segment]
           : undefined;
     }
   }

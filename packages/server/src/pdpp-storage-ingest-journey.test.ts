@@ -1285,7 +1285,7 @@ describe("P10c and method authority over HTTP", () => {
     const { token } = await bootSwitchable();
     const instance = `oura:${owner}`;
     await seedEvents(token, instance, ["a1"]);
-    for (const nextMethod of ["", "  "]) {
+    for (const nextMethod of ["", "  ", " oura "]) {
       const refused = await reset(ctx!, token, instance, "oura", 1, nextMethod);
       expect(refused.status).toBe(400);
       expect((await refused.json()).error.code).toBe("invalid_request");
@@ -2222,7 +2222,7 @@ describe("P5: record data is validated against the declared stream schema", () =
     });
   }
 
-  it("rejects every upsert of a stream whose schema does not compile, with nothing written", async () => {
+  it("refuses to boot a declaration whose stream schema does not compile", async () => {
     const path = await writeDeclaration(
       "whoop",
       declarationWith("whoop", "sleep", {
@@ -2233,23 +2233,35 @@ describe("P5: record data is validated against the declared stream schema", () =
         },
       }),
     );
+    let failure: unknown;
+    try {
+      await boot([path]);
+    } catch (err) {
+      failure = err;
+    }
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain(
+      "PDPP stream 'sleep' schema cannot compile",
+    );
+  });
+
+  it("compiles recursive root references during boot", async () => {
+    const path = await writeDeclaration(
+      "whoop",
+      declarationWith("whoop", "sleep", {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          child: { $ref: "#" },
+        },
+      }),
+    );
     ctx = await boot([path]);
     const token = await ownerToken(ctx);
-    const before = storeCounters();
-
     const result = await ingest(ctx, token, "sleep", [
-      envelope({ id: "s1", score: 1 }),
-      envelope({ id: "s2" }),
+      envelope({ id: "root", child: { id: "child" } }),
     ]);
-    expect(result.status).toBe(200);
-    const unavailable =
-      "schema_unavailable: can't resolve reference #/$defs/missing from id #";
-    expect(result.body.results).toEqual([
-      { index: 0, outcome: "rejected", reason: unavailable },
-      { index: 1, outcome: "rejected", reason: unavailable },
-    ]);
-    expect(sleepRows()).toEqual([]);
-    expect(storeCounters()).toEqual(before);
+    expect(result.body.results).toEqual([{ index: 0, outcome: "accepted" }]);
   });
 
   it("validates each source's stream against its own schema when two sources declare the same stream name", async () => {
@@ -2312,6 +2324,24 @@ describe("P5: record data is validated against the declared stream schema", () =
           },
           tags: { type: "array", items: { type: "string" } },
           byId: { type: "object", additionalProperties: { type: "string" } },
+          mixed: {
+            type: ["object", "array"],
+            items: { type: "string" },
+            additionalProperties: { type: "string" },
+          },
+          patterned: {
+            type: "object",
+            patternProperties: {
+              "^contact_": {
+                type: "object",
+                additionalProperties: { type: "string" },
+              },
+            },
+          },
+          numericProperty: {
+            type: "object",
+            properties: { "123": { type: "string" } },
+          },
         },
       }),
     );
@@ -2323,6 +2353,9 @@ describe("P5: record data is validated against the declared stream schema", () =
       envelope({ id: "s2", tags: ["a", 1] }),
       envelope({ id: "s3", byId: { "5551234": 1 } }),
       envelope({ id: "s4", contacts: { "bob@example.com": "x" } }),
+      envelope({ id: "s5", mixed: { "5551234": 1 } }),
+      envelope({ id: "s6", patterned: { contact_home: { "5551234": 1 } } }),
+      envelope({ id: "s7", numericProperty: { "123": 1 } }),
     ]);
     expect(result.body.results).toEqual([
       {
@@ -2345,7 +2378,78 @@ describe("P5: record data is validated against the declared stream schema", () =
         outcome: "rejected",
         reason: "schema_violation: /contacts/* must be object",
       },
+      {
+        index: 4,
+        outcome: "rejected",
+        reason: "schema_violation: /mixed/* must be string",
+      },
+      {
+        index: 5,
+        outcome: "rejected",
+        reason: "schema_violation: /patterned/*/* must be string",
+      },
+      {
+        index: 6,
+        outcome: "rejected",
+        reason: "schema_violation: /numericProperty/123 must be string",
+      },
     ]);
     expect(JSON.stringify(result.body)).not.toMatch(/alice|bob|5551234/);
+  });
+
+  it("rejects invalid changes_since cursor offsets before pagination", async () => {
+    ctx = await bootBoth();
+    const token = await ownerToken(ctx);
+    const instance = `oura:${owner}`;
+    const seeded = await ingest(
+      ctx,
+      token,
+      "events",
+      ["offset-a", "offset-b", "offset-c"].map((id) => ({
+        instance,
+        key: id,
+        data: { id, kind: "test" },
+        emitted_at: "2026-09-01T00:00:00Z",
+      })),
+    );
+    expect(seeded.body.results).toHaveLength(3);
+    const first = await read(
+      ctx,
+      token,
+      "/v1/streams/events/records?changes_since=&limit=1",
+    );
+    const cursor = first.body.next_cursor as string;
+    const forgeOffset = (offset: unknown) =>
+      Buffer.from(
+        JSON.stringify({
+          ...JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")),
+          offset,
+        }),
+      ).toString("base64url");
+
+    for (const offset of [
+      "1",
+      "abc",
+      -1,
+      1.5,
+      null,
+      "9007199254740993",
+      9007199254740992,
+    ]) {
+      const result = await read(
+        ctx,
+        token,
+        `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(forgeOffset(offset))}`,
+      );
+      expect(result.status).toBe(400);
+      expect(result.body.error.code).toBe("invalid_cursor");
+    }
+    const valid = await read(
+      ctx,
+      token,
+      `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(forgeOffset(1))}`,
+    );
+    expect(valid.status).toBe(200);
+    expect(valid.body.data).toHaveLength(1);
   });
 });

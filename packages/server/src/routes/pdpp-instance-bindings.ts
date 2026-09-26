@@ -138,12 +138,16 @@ export function pdppInstanceBindingRoutes(
     }
     // A reset may name a method that is not configured yet: the switch
     // flow resets to B before it writes B to the config (design §4.5,
-    // step 2 before step 4). It may not name an empty method: a binding of
-    // "" refuses every write (method_required) until the next reset.
-    if (typeof input.next_method === "string" && !input.next_method.trim()) {
+    // step 2 before step 4). It may not name an empty or padded id, which
+    // would be stored under a name that does not match its configured method.
+    if (
+      typeof input.next_method === "string" &&
+      (!input.next_method.trim() ||
+        input.next_method !== input.next_method.trim())
+    ) {
       return errorResponse(
         "invalid_request",
-        "next_method must be null or a non-empty method id",
+        "next_method must be null or an unpadded, non-empty method id",
         400,
       );
     }

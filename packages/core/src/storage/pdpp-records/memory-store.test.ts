@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { createMemoryRecordStore } from "./memory-store.js";
-import type { PdppRecordEnvelopeInput } from "./types.js";
+import { decodeCursor, encodeCursor, type CursorPayload } from "./cursor.js";
+import { InvalidCursorError, type PdppRecordEnvelopeInput } from "./types.js";
 
 function messagesSemantics() {
   return "append_only" as const;
@@ -295,6 +296,53 @@ describe("memory record store: list records", () => {
 });
 
 describe("memory record store: changes_since", () => {
+  it("rejects invalid changes_since page offsets", () => {
+    const store = createMemoryRecordStore();
+    store.ingestBatch(
+      ["a", "b", "c"].map((key) => ({
+        instance: "inst_1",
+        stream: "playlists",
+        key,
+        data: { id: key },
+        emitted_at: "2026-04-01T00:00:00.000Z",
+      })),
+      playlistsSemantics,
+      playlistsPk,
+    );
+    const page = store.changesSince("playlists", {
+      instanceIds: ["inst_1"],
+      limit: 1,
+    });
+    const payload = decodeCursor(page.nextCursor!);
+    const forgeOffset = (offset: unknown) =>
+      encodeCursor({ ...payload, offset } as CursorPayload);
+
+    for (const offset of [
+      "1",
+      "abc",
+      -1,
+      1.5,
+      null,
+      "9007199254740993",
+      9007199254740992,
+    ]) {
+      expect(() =>
+        store.changesSince("playlists", {
+          instanceIds: ["inst_1"],
+          limit: 1,
+          cursor: forgeOffset(offset),
+        }),
+      ).toThrow(InvalidCursorError);
+    }
+    expect(
+      store.changesSince("playlists", {
+        instanceIds: ["inst_1"],
+        limit: 1,
+        cursor: forgeOffset(1),
+      }).data,
+    ).toHaveLength(1);
+  });
+
   it("returns all current records on a first-ever sync", () => {
     const store = createMemoryRecordStore();
     store.ingestBatch(
