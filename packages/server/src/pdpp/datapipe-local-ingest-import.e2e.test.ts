@@ -28,7 +28,8 @@
  *     the real `buildDeclarationRegistry` including its connector trust gate;
  *   - the importer is the real `createPdppImporter`, wired exactly as
  *     `createPdppSyncImporter` wires it at boot;
- *   - the record store is the real better-sqlite3 backend on a real file;
+ *   - the record store is the core memory store: the PS SQLite store refuses
+ *     every method-less import (P8a), see `datapipe-sync-import.e2e.test.ts`;
  *   - the read is the real `listRecords` surface the resource server serves,
  *     restricted to the instance handles a grant would carry.
  *
@@ -44,13 +45,15 @@ import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import Database from "better-sqlite3";
 import { pino } from "pino";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
-import type { PdppRecordStore } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+import {
+  createMemoryRecordStore,
+  type PdppRecordStore,
+} from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import {
   createPdppImporter,
   type PdppImporter,
@@ -61,7 +64,6 @@ import {
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
-import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
 import { dataRoutes } from "../routes/data.js";
 import {
   buildDeclarationRegistry,
@@ -192,8 +194,6 @@ describe("the declaration under test is the producer's own document", () => {
 
 describe("local POST /v1/data/:scope -> PDPP import -> scoped read", () => {
   let dataDir: string;
-  let recordsDir: string;
-  let db: Database.Database;
   let store: PdppRecordStore;
   let importer: PdppImporter;
   let app: ReturnType<typeof dataRoutes>;
@@ -201,9 +201,10 @@ describe("local POST /v1/data/:scope -> PDPP import -> scoped read", () => {
 
   beforeEach(async () => {
     dataDir = await mkdtemp(join(tmpdir(), "pdpp-local-ingest-data-"));
-    recordsDir = await mkdtemp(join(tmpdir(), "pdpp-local-ingest-records-"));
-    db = new Database(join(recordsDir, "records.db"));
-    store = createSqliteRecordStore(db);
+    // The PS SQLite store refuses every method-less import (P8a; see
+    // datapipe-sync-import.e2e.test.ts). The core memory store accepts it,
+    // so the importer's own mapping is exercised here.
+    store = createMemoryRecordStore();
     importer = buildImporter(store);
 
     const indexDb = initializeDatabase(":memory:");
@@ -230,7 +231,6 @@ describe("local POST /v1/data/:scope -> PDPP import -> scoped read", () => {
     cleanup();
     store.close();
     await rm(dataDir, { recursive: true, force: true });
-    await rm(recordsDir, { recursive: true, force: true });
   });
 
   /** POST a body to the ingest route as the owner, signing the real bytes. */

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import Database from "better-sqlite3";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import { createTestBoundRecordStore } from "../__fixtures__/bound-record-store.js";
 import {
   CursorExpiredError,
   encodeCursor,
@@ -26,7 +27,7 @@ describe("sqlite record store", () => {
 
   beforeEach(() => {
     db = new Database(":memory:");
-    store = createSqliteRecordStore(db);
+    store = createTestBoundRecordStore(db);
   });
 
   afterEach(() => {
@@ -47,33 +48,152 @@ describe("sqlite record store", () => {
     expect(record?.data).toEqual({ id: "msg_1", content: "hi" });
   });
 
-  it("requires a method context after an instance enters method authority", () => {
-    const base: PdppRecordEnvelopeInput = {
-      instance: "inst_1",
+  it("test fixture forwards validateData with and without an explicit binding", () => {
+    const rejectBad = (
+      _stream: string,
+      _instance: string,
+      data: Record<string, unknown>,
+    ) => (data.content === "bad" ? "content is bad" : null);
+    const envelope = (instance: string, key: string, content: string) => ({
+      instance,
       stream: "messages",
-      key: "msg_1",
-      data: { id: "msg_1", content: "from method A" },
+      key,
+      data: { id: key, content },
       emitted_at: "2026-04-01T00:00:00.000Z",
-    };
-    store.getInstanceBinding("inst_1");
-    const accepted = store.ingestBatch([base], messagesSemantics, messagesPk, {
-      method: "method_a",
-      generation: 1,
     });
-    expect(accepted.accepted).toBe(1);
-
-    const rejected = store.ingestBatch(
-      [{ ...base, data: { id: "msg_1", content: "method-blind overwrite" } }],
+    const unbound = store.ingestBatch(
+      [envelope("inst_1", "ok", "hi"), envelope("inst_1", "no", "bad")],
       messagesSemantics,
       messagesPk,
+      undefined,
+      rejectBad,
     );
-    expect(rejected.results).toEqual([
-      { index: 0, outcome: "rejected", reason: "method_required" },
+    expect(unbound.results.map((r) => r.outcome)).toEqual([
+      "accepted",
+      "rejected",
     ]);
-    expect(store.getRecord("inst_1", "messages", "msg_1")?.data).toEqual({
-      id: "msg_1",
-      content: "from method A",
+    const bound = store.ingestBatch(
+      [envelope("inst_2", "no", "bad")],
+      messagesSemantics,
+      messagesPk,
+      { method: "m", generation: 1 },
+      rejectBad,
+    );
+    expect(bound.results.map((r) => r.outcome)).toEqual(["rejected"]);
+    expect(store.getRecord("inst_1", "messages", "no")).toBeUndefined();
+    expect(store.getRecord("inst_2", "messages", "no")).toBeUndefined();
+  });
+
+  describe("method-less ingest (the sync importer path)", () => {
+    const base: PdppRecordEnvelopeInput = {
+      instance: "inst_1",
+      stream: "media",
+      key: "media_1",
+      data: { id: "media_1", blob_ref: { blob_id: "blob_missing" } },
+      emitted_at: "2026-04-01T00:00:00.000Z",
+    };
+    const counts = () =>
+      db
+        .prepare(
+          `SELECT (SELECT COUNT(*) FROM pdpp_records) AS records,
+                  (SELECT COUNT(*) FROM pdpp_record_changes) AS changes,
+                  (SELECT COUNT(*) FROM pdpp_instance_binding) AS bindings,
+                  (SELECT value FROM pdpp_write_clock) AS clock`,
+        )
+        .get();
+
+    it("is refused on an instance with no binding row, even with a nonexistent blob_ref", () => {
+      const raw = createSqliteRecordStore(db);
+      const before = counts();
+      const result = raw.ingestBatch(
+        [base],
+        () => "append_only",
+        () => ["id"],
+      );
+      expect(result.results).toEqual([
+        { index: 0, outcome: "rejected", reason: "method_required" },
+      ]);
+      expect(counts()).toEqual(before);
+      expect(raw.getRecord("inst_1", "media", "media_1")).toBeUndefined();
     });
+
+    it("is refused on a bound instance and leaves its rows intact", () => {
+      const raw = createSqliteRecordStore(db);
+      const own = { ...base, stream: "messages", key: "msg_1" };
+      own.data = { id: "msg_1", content: "from method A" };
+      expect(
+        raw.ingestBatch([own], messagesSemantics, messagesPk, {
+          method: "method_a",
+          generation: 1,
+        }).accepted,
+      ).toBe(1);
+
+      const rejected = raw.ingestBatch(
+        [{ ...own, data: { id: "msg_1", content: "method-blind overwrite" } }],
+        messagesSemantics,
+        messagesPk,
+      );
+      expect(rejected.results).toEqual([
+        { index: 0, outcome: "rejected", reason: "method_required" },
+      ]);
+      expect(raw.getRecord("inst_1", "messages", "msg_1")?.data).toEqual({
+        id: "msg_1",
+        content: "from method A",
+      });
+    });
+  });
+
+  it("refuses a replace without a method and writes nothing", () => {
+    const raw = createSqliteRecordStore(db);
+    const count = () =>
+      db
+        .prepare(
+          `SELECT (SELECT COUNT(*) FROM pdpp_records) AS records,
+                  (SELECT COUNT(*) FROM pdpp_instance_binding) AS bindings,
+                  (SELECT value FROM pdpp_write_clock) AS clock`,
+        )
+        .get();
+    const before = count();
+    for (const method of ["", null as unknown as string]) {
+      expect(() =>
+        raw.replaceStream({
+          instance: "inst_1",
+          stream: "playlists",
+          method,
+          generation: 1,
+          emittedAt: "2026-04-01T00:00:00.000Z",
+          primaryKey: playlistsPk(),
+          envelopes: [
+            {
+              instance: "inst_1",
+              stream: "playlists",
+              key: "p1",
+              data: { id: "p1" },
+              emitted_at: "2026-04-01T00:00:00.000Z",
+            },
+          ],
+        }),
+      ).toThrow("method_required");
+    }
+    expect(count()).toEqual(before);
+    expect(raw.getInstanceBinding("inst_1").method).toBeNull();
+  });
+
+  it("reads a binding without creating a row", () => {
+    const before = db
+      .prepare("SELECT COUNT(*) AS n FROM pdpp_instance_binding")
+      .get();
+    expect(store.getInstanceBinding("inst_unseen")).toEqual({
+      instance: "inst_unseen",
+      method: null,
+      generation: 1,
+      resetClock: 0,
+      empty: true,
+    });
+    expect(
+      db.prepare("SELECT COUNT(*) AS n FROM pdpp_instance_binding").get(),
+    ).toEqual(before);
+    expect(before).toEqual({ n: 0 });
   });
 
   it("allocates monotonic versions for mutable_state upserts", () => {
@@ -495,6 +615,12 @@ describe("sqlite record store", () => {
 
   describe("findBlobReferences", () => {
     it("finds the record that references a blob_id via data.blob_ref.blob_id", () => {
+      store.putBlobMeta({
+        blobId: "blob_x",
+        mimeType: "image/png",
+        sizeBytes: 1,
+        sha256: "00",
+      });
       store.ingestBatch(
         [
           {
@@ -522,6 +648,12 @@ describe("sqlite record store", () => {
     });
 
     it("does not find a reference from a deleted record", () => {
+      store.putBlobMeta({
+        blobId: "blob_x",
+        mimeType: "image/png",
+        sizeBytes: 1,
+        sha256: "00",
+      });
       store.ingestBatch(
         [
           {
@@ -546,6 +678,12 @@ describe("sqlite record store", () => {
     });
 
     it("finds every non-deleted record that references the same blob_id", () => {
+      store.putBlobMeta({
+        blobId: "blob_shared",
+        mimeType: "image/png",
+        sizeBytes: 1,
+        sha256: "00",
+      });
       store.ingestBatch(
         [
           {
@@ -579,6 +717,12 @@ describe("sqlite record store", () => {
 
   describe("schema migration", () => {
     it("tracks a schema version and does not re-run migrations on reopen", () => {
+      store.putBlobMeta({
+        blobId: "blob_y",
+        mimeType: "image/png",
+        sizeBytes: 1,
+        sha256: "00",
+      });
       store.ingestBatch(
         [
           {

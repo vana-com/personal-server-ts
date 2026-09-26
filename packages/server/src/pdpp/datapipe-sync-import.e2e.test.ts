@@ -1,5 +1,6 @@
 /**
- * End-to-end: a real encrypted DataPipe envelope reaches a scoped PDPP read.
+ * End-to-end: a real encrypted DataPipe envelope reaches the PDPP importer,
+ * and the PS store refuses it because it carries no acquisition method.
  *
  * This exercises the actual production path rather than a reconstruction of
  * it. Specifically, nothing here is mocked that the claim depends on:
@@ -10,8 +11,9 @@
  *   - the declaration is a real spec-core §5 document, parsed by the real
  *     `parseDeclaration` and retained through the real
  *     `buildDeclarationRegistry`, including its connector trust gate;
- *   - the record store is the real better-sqlite3 backend, on a real file, so
- *     the persistence claim is about durable state and not a Map;
+ *   - the record store is the real better-sqlite3 backend, on a real file.
+ *     It refuses every method-less write (P8a), so the retry and cache
+ *     mechanics run against the core memory store instead;
  *   - the read is the real `listRecords`/`getRecord` surface the resource
  *     server serves, restricted to the same instance handles a grant would
  *     carry.
@@ -54,9 +56,13 @@ import {
   createPdppImporter,
   downloadOne,
   type PdppImporter,
+  type PdppImportOutcome,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import { parseDeclaration } from "@opendatalabs/personal-server-ts-core/pdpp";
-import type { PdppRecordStore } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+import {
+  createMemoryRecordStore,
+  type PdppRecordStore,
+} from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type { StorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
@@ -412,141 +418,86 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
     return storage;
   }
 
-  it("decrypts, imports, and serves the record under a scoped read", async () => {
+  /** `syncOne` through an importer that records the import outcome. */
+  async function syncObserved(envelope: DataFileEnvelope) {
+    let outcome: PdppImportOutcome | undefined;
+    const observed: PdppImporter = {
+      importEnvelope: (e) => (outcome = importer.importEnvelope(e)),
+      needsRetry: (scope, at) => importer.needsRetry(scope, at),
+    };
+    const legacy = await syncOne(envelope, observed);
+    return { legacy, outcome };
+  }
+
+  it("decrypts, keeps legacy indexing, and refuses the record at the method fence", async () => {
+    let outcome: PdppImportOutcome | undefined;
+    const observed: PdppImporter = {
+      importEnvelope: (e) => (outcome = importer.importEnvelope(e)),
+      needsRetry: (scope, at) => importer.needsRetry(scope, at),
+    };
     const legacy = await syncOne(
       makeEnvelope({
         id: "235680975",
         username: "callumflack",
         full_name: "Callum Flack",
-        follower_count: 4210,
         $pdpp: pdppMetadata(),
       }),
+      observed,
     );
 
-    // Legacy indexing still happened — the importer is additive.
+    // Legacy indexing still happened: the importer is additive.
     expect(legacy.written).toHaveLength(1);
     expect(legacy.entries).toHaveLength(1);
-    // And the legacy envelope keeps the payload it always had.
-    expect(legacy.written[0].scope).toBe(SCOPE);
 
-    // The scoped read the resource server serves, restricted to the instance
-    // handles a grant for this source would carry.
-    const page = store.listRecords("profile", {
-      instanceIds: [INSTANCE],
-      limit: 10,
-      order: "asc",
+    // The envelope carries no acquisition method or binding generation, so
+    // the PS store cannot apply P8a/P8c to it and writes nothing (L1).
+    expect(outcome).toEqual({
+      status: "rejected",
+      rejection: { code: "method_authority", message: "method_required" },
     });
+    expect(store.listStreams([INSTANCE])).toEqual([]);
+    expect(
+      db.prepare("SELECT COUNT(*) AS n FROM pdpp_instance_binding").get() as {
+        n: number;
+      },
+    ).toEqual({ n: 0 });
+  });
 
-    expect(page.data).toHaveLength(1);
-    expect(page.data[0].recordKey).toBe("235680975");
-    expect(page.data[0].emittedAt).toBe(COLLECTED_AT);
-    // $pdpp is import metadata and must not be served back as record data.
-    expect(page.data[0].data).toEqual({
+  it("does not retry a method-fence refusal on later syncs", async () => {
+    let calls = 0;
+    const counting: PdppImporter = {
+      importEnvelope: (e) => {
+        calls += 1;
+        return importer.importEnvelope(e);
+      },
+      needsRetry: (scope, at) => importer.needsRetry(scope, at),
+    };
+    const envelope = makeEnvelope({
       id: "235680975",
       username: "callumflack",
-      full_name: "Callum Flack",
-      follower_count: 4210,
+      $pdpp: pdppMetadata(),
     });
-    expect(page.data[0].data).not.toHaveProperty("$pdpp");
-  });
-
-  it("does not leak the record to a read scoped to another instance", async () => {
-    await syncOne(
-      makeEnvelope({
-        id: "235680975",
-        username: "callumflack",
-        full_name: "Callum Flack",
-        $pdpp: pdppMetadata(),
-      }),
+    const storage = createPersistentLegacyStorage();
+    const adapter = createStorageAdapter(
+      await encryptEnvelope(envelope, masterKey),
     );
+    const deps = {
+      storage,
+      storageAdapter: adapter,
+      gateway: {} as never,
+      cursor: {} as never,
+      masterKey,
+      serverOwner: OWNER,
+      logger,
+      pdppImporter: counting,
+    } as never;
 
-    const page = store.listRecords("profile", {
-      instanceIds: [`instagram:0x${"9".repeat(40)}`],
-      limit: 10,
-      order: "asc",
-    });
-    expect(page.data).toEqual([]);
-  });
+    await downloadOne(deps, makeDataPointRecord());
+    await downloadOne(deps, makeDataPointRecord());
+    await downloadOne(deps, makeDataPointRecord());
 
-  it("survives a restart: the record is still readable from a reopened store", async () => {
-    await syncOne(
-      makeEnvelope({
-        id: "235680975",
-        username: "callumflack",
-        full_name: "Callum Flack",
-        $pdpp: pdppMetadata(),
-      }),
-    );
-
-    // Close everything and reopen the same file, as a process restart would.
-    store.close();
-    const reopened = createSqliteRecordStore(new Database(dbPath));
-    try {
-      const record = reopened.getRecord(INSTANCE, "profile", "235680975");
-      expect(record).toBeDefined();
-      expect(record?.data.username).toBe("callumflack");
-      expect(record?.version).toBe(1);
-
-      // And a re-sync after restart is still idempotent — the version must
-      // not climb just because the process bounced.
-      await syncOne(
-        makeEnvelope({
-          id: "235680975",
-          username: "callumflack",
-          full_name: "Callum Flack",
-          $pdpp: pdppMetadata(),
-        }),
-        buildImporter(reopened),
-      );
-      expect(
-        reopened.getRecord(INSTANCE, "profile", "235680975")?.version,
-      ).toBe(1);
-    } finally {
-      reopened.close();
-    }
-    // Reassign so afterEach's close() is harmless.
-    store = reopened;
-  });
-
-  it("imports an update as a new version and reports it once", async () => {
-    await syncOne(
-      makeEnvelope({
-        id: "235680975",
-        username: "callumflack",
-        full_name: "Callum Flack",
-        follower_count: 4210,
-        $pdpp: pdppMetadata(),
-      }),
-    );
-
-    const anchor = store.changesSince("profile", {
-      instanceIds: [INSTANCE],
-      limit: 50,
-    }).nextChangesSince;
-
-    await syncOne(
-      makeEnvelope(
-        {
-          id: "235680975",
-          username: "callumflack",
-          full_name: "Callum Flack",
-          follower_count: 4300,
-          $pdpp: pdppMetadata(),
-        },
-        "2026-09-18T10:00:00.000Z",
-      ),
-    );
-
-    const record = store.getRecord(INSTANCE, "profile", "235680975");
-    expect(record?.version).toBe(2);
-    expect(record?.data.follower_count).toBe(4300);
-
-    const changes = store.changesSince("profile", {
-      instanceIds: [INSTANCE],
-      changesSince: anchor,
-      limit: 50,
-    });
-    expect(changes.data).toHaveLength(1);
+    expect(calls).toBe(1);
+    expect(store.listStreams([INSTANCE])).toEqual([]);
   });
 
   /**
@@ -561,6 +512,16 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
    * no amount of re-syncing recovers it.
    */
   describe("retry after the import did not happen", () => {
+    // The download worker's retry and cache mechanics are store-agnostic.
+    // The PS SQLite store refuses every method-less import (see above), so
+    // these run against the core memory store, which accepts them.
+    let store: PdppRecordStore;
+    let importer: PdppImporter;
+    beforeEach(() => {
+      store = createMemoryRecordStore();
+      importer = buildImporter(store);
+    });
+
     /** Drive one sync run against a persistent index. */
     async function syncWith(
       storage: DataStoragePort,
@@ -646,31 +607,6 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
       const record = store.getRecord(INSTANCE, "profile", "235680975");
       expect(record).toBeDefined();
       expect(record?.version).toBe(1);
-    });
-
-    it("survives a restart: an entry indexed before PDPP existed still imports", async () => {
-      const storage = createPersistentLegacyStorage();
-      const envelope = makeEnvelope({
-        id: "235680975",
-        username: "callumflack",
-        full_name: "Callum Flack",
-        $pdpp: pdppMetadata(),
-      });
-      const adapter = createStorageAdapter(
-        await encryptEnvelope(envelope, masterKey),
-      );
-
-      await syncWith(storage, envelope, undefined, adapter);
-
-      // Restart: same DB file, fresh store and importer, same legacy index.
-      store.close();
-      const reopened = createSqliteRecordStore(new Database(dbPath));
-      store = reopened;
-      await syncWith(storage, envelope, buildImporter(reopened), adapter);
-
-      expect(
-        reopened.getRecord(INSTANCE, "profile", "235680975")?.version,
-      ).toBe(1);
     });
 
     it("reuses the cached local envelope instead of re-downloading", async () => {
@@ -800,13 +736,18 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
 
   describe("malformed and hostile metadata", () => {
     it("keeps legacy indexing when $pdpp is malformed, and imports nothing", async () => {
-      const legacy = await syncOne(
+      const { legacy, outcome } = await syncObserved(
         makeEnvelope({
           id: "235680975",
           username: "callumflack",
           $pdpp: { version: 1, sourceId: SOURCE_ID, declaration: "broken" },
         }),
       );
+      // The importer refused the metadata itself, before any store call.
+      expect(outcome).toMatchObject({
+        status: "rejected",
+        rejection: { code: "malformed_metadata" },
+      });
 
       // The blob arrived intact, so the legacy path must still have run.
       expect(legacy.written).toHaveLength(1);
@@ -827,7 +768,7 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
         .digest("hex");
       expect(canonicalDigest).not.toBe(DOCUMENT_DIGEST);
 
-      await syncOne(
+      const { outcome } = await syncObserved(
         makeEnvelope({
           id: "235680975",
           username: "callumflack",
@@ -842,6 +783,10 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
         }),
       );
 
+      expect(outcome).toMatchObject({
+        status: "rejected",
+        rejection: { code: "digest_mismatch" },
+      });
       expect(store.listStreams([INSTANCE])).toEqual([]);
     });
 
@@ -875,7 +820,7 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
     });
 
     it("does not import a record whose key disagrees with its payload", async () => {
-      await syncOne(
+      const { outcome } = await syncObserved(
         makeEnvelope({
           id: "235680975",
           username: "callumflack",
@@ -885,6 +830,10 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
         }),
       );
 
+      expect(outcome).toMatchObject({
+        status: "rejected",
+        rejection: { code: "record_key_mismatch" },
+      });
       expect(store.getRecord(INSTANCE, "profile", "999999999")).toBeUndefined();
       expect(store.getRecord(INSTANCE, "profile", "235680975")).toBeUndefined();
     });

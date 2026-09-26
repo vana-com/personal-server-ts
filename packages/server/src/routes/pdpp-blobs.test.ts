@@ -5,7 +5,7 @@ import {
   createStreamDeclarationRegistry,
   type PdppRecordStore,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
-import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
+import { createTestBoundRecordStore } from "../__fixtures__/bound-record-store.js";
 import { createFixtureAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth.test-utils";
 import type { Grant } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { pdppBlobsRoutes } from "./pdpp-blobs.js";
@@ -49,7 +49,7 @@ const backends: Array<{
   { name: "memory", createStore: () => createMemoryRecordStore() },
   {
     name: "sqlite",
-    createStore: () => createSqliteRecordStore(new Database(":memory:")),
+    createStore: () => createTestBoundRecordStore(new Database(":memory:")),
   },
 ];
 

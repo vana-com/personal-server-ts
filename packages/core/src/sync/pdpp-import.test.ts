@@ -185,6 +185,7 @@ describe("retry classification", () => {
       "primary_key_mismatch",
       "semantics_mismatch",
       "record_key_mismatch",
+      "method_authority",
     ] as const) {
       expect(isPermanentRejection({ code, message: "" })).toBe(true);
     }
@@ -251,6 +252,47 @@ describe("retry classification", () => {
     });
 
     expect(importer.importEnvelope(envelope()).status).toBe("rejected");
+    expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(true);
+  });
+
+  it("settles a store method-authority refusal and leaves other store refusals open", () => {
+    const refusingWith = (reason: string) => {
+      const store = createMemoryRecordStore();
+      const importer = createPdppImporter({
+        store: {
+          ...store,
+          ingestBatch: (envelopes) => ({
+            accepted: 0,
+            unchanged: 0,
+            rejected: [{ index: 0, reason }],
+            results: envelopes.map((_, index) => ({
+              index,
+              outcome: "rejected" as const,
+              reason,
+            })),
+          }),
+        },
+        declarations: [RETAINED],
+        instanceFor: () => INSTANCE,
+        logger: silentLogger(),
+      });
+      return { importer, outcome: importer.importEnvelope(envelope()) };
+    };
+
+    for (const reason of [
+      "method_required",
+      "binding_required",
+      "blob_unclaimed",
+    ]) {
+      const { importer, outcome } = refusingWith(reason);
+      expect(outcome).toEqual({
+        status: "rejected",
+        rejection: { code: "method_authority", message: reason },
+      });
+      expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(false);
+    }
+    const { importer, outcome } = refusingWith("database is locked");
+    expect(outcome).toMatchObject({ rejection: { code: "store_rejected" } });
     expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(true);
   });
 

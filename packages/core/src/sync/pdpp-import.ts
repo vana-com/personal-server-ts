@@ -121,6 +121,7 @@ export type PdppImportRejectionCode =
   | "semantics_mismatch"
   | "record_key_mismatch"
   | "no_instance"
+  | "method_authority"
   | "store_rejected";
 
 export interface PdppImportRejection {
@@ -141,6 +142,8 @@ export interface PdppImportRejection {
  * Treating them as permanent is exactly how an envelope gets stranded.
  * `store_rejected` is likewise excluded: the store is infrastructure, and a
  * write it refuses today may be accepted once it is healthy.
+ * `method_authority` IS here: the importer carries no acquisition method, so
+ * the store's method and binding checks (P8a, P8c) refuse it on every cycle.
  */
 const PERMANENT_REJECTION_CODES: ReadonlySet<PdppImportRejectionCode> = new Set(
   [
@@ -153,8 +156,23 @@ const PERMANENT_REJECTION_CODES: ReadonlySet<PdppImportRejectionCode> = new Set(
     "primary_key_mismatch",
     "semantics_mismatch",
     "record_key_mismatch",
+    "method_authority",
   ],
 );
+
+/**
+ * Store reasons from the method and binding checks. The importer writes
+ * without a method, so none of these can clear on a later cycle.
+ */
+const METHOD_AUTHORITY_REASONS: ReadonlySet<string> = new Set([
+  "method_required",
+  "method_inactive",
+  "config_multiple_active_methods",
+  "binding_generation_mismatch",
+  "instance_bound_to_other_method",
+  "binding_required",
+  "blob_unclaimed",
+]);
 
 /**
  * Whether a rejection is a settled verdict about the envelope itself.
@@ -618,7 +636,13 @@ export function createPdppImporter(deps: PdppImporterDeps): PdppImporter {
       () => declaredStream.primaryKey,
     );
     if (result.rejected.length > 0) {
-      return reject("store_rejected", result.rejected[0].reason);
+      const reason = result.rejected[0].reason;
+      return reject(
+        METHOD_AUTHORITY_REASONS.has(reason)
+          ? "method_authority"
+          : "store_rejected",
+        reason,
+      );
     }
     if (result.accepted === 0) {
       // append_only duplicate: the store treats it as a no-op, and so do we.

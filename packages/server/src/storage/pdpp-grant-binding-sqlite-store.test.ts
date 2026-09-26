@@ -6,7 +6,7 @@ import Database from "better-sqlite3";
 
 import type { PdppGrantBinding } from "@opendatalabs/personal-server-ts-core/grants";
 import { createSqlitePdppGrantBindingStore } from "./pdpp-grant-binding-sqlite-store.js";
-import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import { createTestBoundRecordStore } from "../__fixtures__/bound-record-store.js";
 
 const PERMISSION = {
   chainId: 14800,
@@ -291,7 +291,7 @@ describe("createSqlitePdppGrantBindingStore", () => {
   it("coexists with the pdpp records store on the same database handle", () => {
     const db = new Database(":memory:");
     const bindingStore = createSqlitePdppGrantBindingStore(db);
-    const recordStore = createSqliteRecordStore(db);
+    const recordStore = createTestBoundRecordStore(db);
 
     bindingStore.putBinding(makeBinding());
     recordStore.ingestBatch(

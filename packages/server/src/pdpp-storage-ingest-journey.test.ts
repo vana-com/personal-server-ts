@@ -173,7 +173,7 @@ async function reset(
   context: ServerContext,
   token: string,
   instance: string,
-  expectedMethod: string,
+  expectedMethod: string | null,
   expectedGeneration: number,
   nextMethod: string | null,
 ) {
@@ -1019,6 +1019,87 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
   });
 });
 
+describe("$pdpp import over POST /v1/data", () => {
+  it("writes no canonical row and settles the envelope when no method is configured", async () => {
+    const WHOOP = "https://registry.pdpp.dev/connectors/whoop";
+    const document = JSON.stringify({
+      source_id: WHOOP,
+      source_kind: "connector",
+      version: "1",
+      streams: [
+        {
+          name: "sleep",
+          fields: ["id", "score"],
+          required_fields: ["id"],
+          primary_key: ["id"],
+          schema: {
+            type: "object",
+            properties: { id: { type: "string" }, score: { type: "integer" } },
+            required: ["id"],
+            additionalProperties: false,
+          },
+        },
+      ],
+    });
+    const path = await writeDeclaration("whoop", document);
+    ctx = await boot([path], []);
+    const logs: unknown[] = [];
+    const warn = ctx.logger.warn.bind(ctx.logger);
+    ctx.logger.warn = ((...args: unknown[]) => {
+      logs.push(args[0]);
+      return (warn as (...a: unknown[]) => void)(...args);
+    }) as typeof ctx.logger.warn;
+
+    const response = await ctx.app.request("/v1/data/whoop.sleep", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${ctx.devToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        id: "s1",
+        score: "not-an-integer",
+        extra: true,
+        $pdpp: {
+          version: 1,
+          sourceId: WHOOP,
+          declaration: {
+            source: "whoop",
+            version: "1",
+            upstreamCommit: null,
+            digest: `sha256:${sha256(document)}`,
+          },
+          stream: {
+            name: "sleep",
+            scope: "whoop.sleep",
+            semantics: "mutable_state",
+            primaryKey: ["id"],
+          },
+          record: { key: { id: "s1" }, op: "upsert" },
+        },
+      }),
+    });
+    expect(response.status).toBe(201);
+
+    const db = new Database(join(tempDir, "index.db"), { readonly: true });
+    try {
+      expect(
+        db.prepare("SELECT COUNT(*) AS n FROM pdpp_records").get(),
+      ).toEqual({ n: 0 });
+    } finally {
+      db.close();
+    }
+    expect(storeCounters()).toEqual({ clock: 0, changes: 0 });
+    expect(logs).toContainEqual(
+      expect.objectContaining({
+        code: "method_authority",
+        message: "method_required",
+        permanent: true,
+      }),
+    );
+  });
+});
+
 describe("P10c and method authority over HTTP", () => {
   async function bootSwitchable() {
     const ouraPath = await writeDeclaration("oura", OURA_DECLARATION);
@@ -1125,6 +1206,142 @@ describe("P10c and method authority over HTTP", () => {
     );
     expect(bPage2.status).toBe(200);
     expect(bPage2.body.data.map((r: any) => r.id)).toEqual(["b2"]);
+  });
+
+  it("refuses a list or changes_since horizon that is not a non-negative safe integer", async () => {
+    const { token } = await bootSwitchable();
+    const instance = `oura:${owner}`;
+    await seedEvents(token, instance, ["a1", "a2"]);
+    const page = await read(
+      ctx!,
+      token,
+      "/v1/streams/events/records?changes_since=&limit=1",
+    );
+    const cursor = page.body.next_cursor as string;
+    const listPage = await read(
+      ctx!,
+      token,
+      "/v1/streams/events/records?order=asc&limit=1",
+    );
+    const listCursor = listPage.body.next_cursor as string;
+    expect(listCursor).toBeTruthy();
+    const full = await read(
+      ctx!,
+      token,
+      "/v1/streams/events/records?changes_since=&limit=10",
+    );
+    const token1 = full.body.next_changes_since as string;
+    expect(token1).toBeTruthy();
+    const forge = (encoded: string, patch: Record<string, unknown>) =>
+      Buffer.from(
+        JSON.stringify({
+          ...JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")),
+          ...patch,
+        }),
+      ).toString("base64url");
+
+    // A reset after the session starts: a NaN horizon would compare false
+    // against reset_clock and pass the fence.
+    expect((await reset(ctx!, token, instance, "oura", 1, null)).status).toBe(
+      200,
+    );
+    // 2^53 + 1 rounds to 2^53 as a number, so it must fail the
+    // safe-integer check rather than pass the fence as a huge horizon.
+    const badHorizons = ["abc", "-1", "1.5", null, "9007199254740993"];
+    for (const horizon of badHorizons) {
+      const forged = await read(
+        ctx!,
+        token,
+        `/v1/streams/events/records?order=asc&limit=1&cursor=${encodeURIComponent(forge(listCursor, { horizon }))}`,
+      );
+      expect(forged.status).toBe(400);
+      expect(forged.body.error.code).toBe("invalid_cursor");
+    }
+    for (const horizon of badHorizons) {
+      const forged = await read(
+        ctx!,
+        token,
+        `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(forge(cursor, { horizon }))}`,
+      );
+      expect(forged.status).toBe(400);
+      expect(forged.body.error.code).toBe("invalid_cursor");
+    }
+    const since = await read(
+      ctx!,
+      token,
+      `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(forge(cursor, { sinceHorizon: "abc" }))}`,
+    );
+    expect(since.status).toBe(400);
+    const forgedSince = await read(
+      ctx!,
+      token,
+      `/v1/streams/events/records?changes_since=${encodeURIComponent(forge(token1, { horizon: "abc" }))}&limit=1`,
+    );
+    expect(forgedSince.status).toBe(400);
+    expect(forgedSince.body.error.code).toBe("invalid_cursor");
+  });
+
+  it("refuses a reset to an empty method, and changes nothing", async () => {
+    const { token } = await bootSwitchable();
+    const instance = `oura:${owner}`;
+    await seedEvents(token, instance, ["a1"]);
+    for (const nextMethod of ["", "  "]) {
+      const refused = await reset(ctx!, token, instance, "oura", 1, nextMethod);
+      expect(refused.status).toBe(400);
+      expect((await refused.json()).error.code).toBe("invalid_request");
+    }
+    const unchanged = await read(
+      ctx!,
+      token,
+      `/pdpp/instances/${encodeURIComponent(instance)}/binding`,
+    );
+    expect(unchanged.body).toMatchObject({ method: "oura", generation: 1 });
+    const listed = await read(ctx!, token, "/v1/streams/events/records");
+    expect(listed.body.data.map((r: any) => r.id)).toEqual(["a1"]);
+
+    // null (remove) and a method not configured yet (switch, §4.5) are
+    // still accepted.
+    const toNull = await reset(ctx!, token, instance, "oura", 1, null);
+    expect(toNull.status).toBe(200);
+    expect(await toNull.json()).toMatchObject({ method: null, generation: 2 });
+    const toNext = await reset(ctx!, token, instance, null, 2, "oura-browser");
+    expect(toNext.status).toBe(200);
+    expect(await toNext.json()).toMatchObject({
+      method: "oura-browser",
+      generation: 3,
+    });
+  });
+
+  it("reads a binding over HTTP without creating a binding row", async () => {
+    const { token } = await bootSwitchable();
+    const instance = `oura:${owner}`;
+    const bindingRows = () => {
+      const db = new Database(join(tempDir, "index.db"), { readonly: true });
+      try {
+        return (
+          db
+            .prepare("SELECT COUNT(*) AS n FROM pdpp_instance_binding")
+            .get() as { n: number }
+        ).n;
+      } finally {
+        db.close();
+      }
+    };
+    const binding = await read(
+      ctx!,
+      token,
+      `/pdpp/instances/${encodeURIComponent(instance)}/binding`,
+    );
+    expect(binding.status).toBe(200);
+    expect(binding.body).toMatchObject({
+      method: null,
+      generation: 1,
+      empty: true,
+      configured_active_method: "oura",
+    });
+    expect(bindingRows()).toBe(0);
+    await seedEvents(token, instance, ["a1"]);
+    expect(bindingRows()).toBe(1);
   });
 
   it("keeps a keyset cursor valid across later writes without a reset", async () => {

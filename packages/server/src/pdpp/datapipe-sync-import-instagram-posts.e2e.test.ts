@@ -13,7 +13,6 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import Database from "better-sqlite3";
 import { pino } from "pino";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
@@ -28,10 +27,12 @@ import {
   type PdppImporter,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import { parseDeclaration } from "@opendatalabs/personal-server-ts-core/pdpp";
-import type { PdppRecordStore } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+import {
+  createMemoryRecordStore,
+  type PdppRecordStore,
+} from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type { StorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
-import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
 import {
   buildDeclarationRegistry,
   singleInstanceInventory,
@@ -183,17 +184,16 @@ describe("the instagram.posts declaration under test is the producer's own docum
 
 describe("DataPipe encrypted sync -> PDPP import -> scoped read (instagram.posts)", () => {
   let dir: string;
-  let dbPath: string;
-  let db: Database.Database;
   let store: PdppRecordStore;
   let importer: PdppImporter;
   const masterKey = new Uint8Array(32).fill(11);
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "pdpp-sync-posts-e2e-"));
-    dbPath = join(dir, "records.db");
-    db = new Database(dbPath);
-    store = createSqliteRecordStore(db);
+    // The PS SQLite store refuses every method-less import (P8a; see
+    // datapipe-sync-import.e2e.test.ts). The core memory store accepts it,
+    // so the importer's own mapping is exercised here.
+    store = createMemoryRecordStore();
     importer = buildImporter(store);
   });
 

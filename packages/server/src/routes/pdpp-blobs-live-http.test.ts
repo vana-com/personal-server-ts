@@ -25,7 +25,7 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createStreamDeclarationRegistry } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { createFixtureAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth.test-utils";
-import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
+import { createTestBoundRecordStore } from "../__fixtures__/bound-record-store.js";
 import { pdppBlobsRoutes } from "./pdpp-blobs.js";
 import { listenHttpServer, type NodeServer } from "../listen.js";
 
@@ -51,7 +51,7 @@ let baseUrl: string;
  */
 async function bootAndListen(): Promise<void> {
   const db = new Database(dbPath);
-  const store = createSqliteRecordStore(db);
+  const store = createTestBoundRecordStore(db);
   const app = new Hono();
   app.route(
     "/v1/blobs",
@@ -100,7 +100,7 @@ describe("PDPP blob GET over a real listening HTTP server and real on-disk SQLit
     // Direct write to the on-disk database, independent of the route's own
     // connection, then the actual read happens over a real HTTP GET.
     const seedDb = new Database(dbPath);
-    const seedStore = createSqliteRecordStore(seedDb);
+    const seedStore = createTestBoundRecordStore(seedDb);
     const payload = new Uint8Array([1, 2, 3, 4, 5, 250, 251]);
     const meta = seedStore.storeBlobBytes(payload, "application/octet-stream");
     seedStore.ingestBatch(
@@ -133,7 +133,7 @@ describe("PDPP blob GET over a real listening HTTP server and real on-disk SQLit
 
   it("denies an unauthenticated real HTTP GET for a genuinely stored blob", async () => {
     const seedDb = new Database(dbPath);
-    const seedStore = createSqliteRecordStore(seedDb);
+    const seedStore = createTestBoundRecordStore(seedDb);
     const meta = seedStore.storeBlobBytes(
       new Uint8Array([1, 2, 3]),
       "image/jpeg",
@@ -167,7 +167,7 @@ describe("PDPP blob GET over a real listening HTTP server and real on-disk SQLit
     // route's server AND its underlying SQLite connection).
     {
       const db = new Database(dbPath);
-      const store = createSqliteRecordStore(db);
+      const store = createTestBoundRecordStore(db);
       const meta = store.storeBlobBytes(payload, "application/pdf");
       blobId = meta.blobId;
       store.ingestBatch(
@@ -228,7 +228,7 @@ describe("PDPP blob GET over a real listening HTTP server and real on-disk SQLit
     // disk rather than living only in the first process's in-memory cache.
     {
       const db = new Database(dbPath);
-      const store = createSqliteRecordStore(db);
+      const store = createTestBoundRecordStore(db);
       const app = new Hono();
       app.route(
         "/v1/blobs",
