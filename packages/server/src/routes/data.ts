@@ -12,6 +12,7 @@ import type {
 } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type {
+  PdppImporter,
   ScopeDeletionTracker,
   SyncManager,
 } from "@opendatalabs/personal-server-ts-core/sync";
@@ -104,6 +105,12 @@ export interface DataRouteDeps {
   }) => void;
   /** Post-auth read hook (runs a stale derivative question on demand). */
   onDataRead?: (event: { scope: string }) => void;
+  /**
+   * The deployment's PDPP importer, so an owner-authenticated local ingest
+   * reaches the record store the resource server reads — the same importer
+   * and the same delegate the sync download worker is given at boot.
+   */
+  pdppImporter?: PdppImporter;
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
 }
 
@@ -151,6 +158,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         lineageGateway: deps.lineageGateway,
         onDataWritten: deps.onDataWritten,
         onDataRead: deps.onDataRead,
+        pdppImporter: deps.pdppImporter,
         // Network identifier for the 402 challenge body. We use the chain
         // id as the convention since the gateway is chain-scoped; clients
         // dispatch on the (scheme, chainId) pair, not the human name.

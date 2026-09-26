@@ -71,6 +71,45 @@ export const DEFAULTS = {
     // Quiet period after a source scope changes before a recompute starts.
     recomputeDebounceMs: 5_000,
   },
+  pdpp: {
+    // The PDPP Authorization Server is opt-in. Off by default so an existing
+    // deployment gains no new authorization surface on upgrade.
+    enabled: false,
+    // Absolute file paths of retained SourceDeclaration documents. There is
+    // deliberately no trust-all option and no default: an AS that accepts any
+    // declaration it can reach will issue grants over data it was never meant
+    // to speak for. Empty means this server retains none and issues nothing.
+    // An entry may pin the file's sha256 (hex, over the exact bytes); a file
+    // whose bytes no longer match is refused. The installer that verified
+    // the signed artifact writes that digest.
+    declarationPaths: [] as Array<string | { path: string; sha256: string }>,
+    // At most one acquisition method may write each retained source. The
+    // declaration path ties an artifact method id to the source it produces.
+    methods: [] as Array<{ method_id: string; declaration_path: string }>,
+    // Require PKCE (RFC 7636, S256) on the authorization-code flow. PDPP
+    // clients are public clients; without a verifier an intercepted code is
+    // redeemable by whoever intercepted it.
+    requirePkce: true,
+    // Registered clients. `redirect_uri` is validated by EXACT match against
+    // this list (RFC 6749 §3.1.2.2), because the authorization code is
+    // delivered through that redirect: an unvalidated target is code
+    // exfiltration, and PKCE does not help when the attacker chose the
+    // challenge. Empty means no client may start an authorization flow.
+    clients: [] as Array<{
+      clientId: string;
+      redirectUris: string[];
+      // Optional operator policy: cap how long a grant issued to this client
+      // stays active, in seconds. Unset means no AS-imposed expiry, exactly
+      // today's behavior. This is deployment policy, not something a client
+      // can request — there is deliberately no client-supplied expiry field.
+      grantLifetimeSeconds?: number;
+    }>,
+    // Hosts this deployment allows to resolve URL-hosted (§6) client
+    // identities. Empty means no client_id is ever fetched: registration in
+    // `clients` above stays the only way a client is admitted, and this
+    // server performs no outbound request for an unregistered one.
+    urlHostedClientHosts: [] as string[],
+  },
 };
 
 export const StorageBackend = z.enum([
@@ -204,6 +243,62 @@ export const ServerConfigSchema = z.object({
         .default(DEFAULTS.inference.recomputeDebounceMs),
     })
     .default(DEFAULTS.inference),
+  pdpp: z
+    .object({
+      enabled: z.boolean().default(DEFAULTS.pdpp.enabled),
+      // No trust-all switch by design. A declaration is trusted because an
+      // operator retained this exact document, not because it was reachable.
+      declarationPaths: z
+        .array(
+          z.union([
+            z.string().min(1),
+            z.object({
+              path: z.string().min(1),
+              sha256: z
+                .string()
+                .regex(/^[0-9a-f]{64}$/, "lowercase hex sha256"),
+            }),
+          ]),
+        )
+        .default(DEFAULTS.pdpp.declarationPaths),
+      methods: z
+        .array(
+          z.object({
+            method_id: z.string().min(1),
+            declaration_path: z.string().min(1),
+          }),
+        )
+        .default(DEFAULTS.pdpp.methods),
+      requirePkce: z.boolean().default(DEFAULTS.pdpp.requirePkce),
+      clients: z
+        .array(
+          z.object({
+            clientId: z.string().min(1),
+            // Absolute URIs only; the AS additionally enforces https (or
+            // loopback http) and exact matching at request time.
+            redirectUris: z.array(z.string().min(1)).min(1),
+            // Bounded well under the Date range limit (~±8.64e15ms, itself
+            // below Number.MAX_SAFE_INTEGER) so
+            // `Date.now() + grantLifetimeSeconds * 1000` can never overflow
+            // into an invalid or wrapped instant. 100 years is generous for
+            // an operator policy and nowhere near that limit.
+            grantLifetimeSeconds: z
+              .number()
+              .int()
+              .positive()
+              .max(100 * 365 * 24 * 60 * 60)
+              .optional(),
+          }),
+        )
+        .default(DEFAULTS.pdpp.clients),
+      // Opt-in allowlist: no host here means no client_id URL is ever
+      // fetched. A static registration in `clients` remains first choice and
+      // is always checked before this path runs.
+      urlHostedClientHosts: z
+        .array(z.string().min(1))
+        .default(DEFAULTS.pdpp.urlHostedClientHosts),
+    })
+    .default(DEFAULTS.pdpp),
 });
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;

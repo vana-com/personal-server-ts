@@ -45,6 +45,7 @@ import {
   createGatewayDeleteDataPort,
   createScopeDeletionTracker,
   createSyncManager,
+  type PdppImporter,
   type SyncManager,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type { DataPointFeedPort } from "@opendatalabs/personal-server-ts-core/ports";
@@ -55,6 +56,11 @@ import {
 import { createFilePendingBlobDeletionStore } from "./pending-blob-deletions.js";
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
+import { createPdppAuthDeps } from "./pdpp/bootstrap.js";
+import {
+  createPdppRecordsDeps,
+  createPdppSyncImporter,
+} from "./pdpp/records-bootstrap.js";
 import { generateDevToken } from "./dev-token.js";
 import { migrateLocalState } from "./migrations/local-state.js";
 import { createTokenStore, type TokenStore } from "./token-store.js";
@@ -330,6 +336,28 @@ export async function createServer(
 
   // --- Sync engine setup ---
   let syncManager: SyncManager | null = null;
+  /**
+   * Late-bound PDPP importer.
+   *
+   * The sync engine is wired here, but the PDPP servers mount much further
+   * down: they need the index (to derive the connector inventory), the
+   * declarations and the auth store, none of which exist yet. Rather than
+   * reorder boot around the newer subsystem, the download worker holds this
+   * stable delegate and it starts importing the moment PDPP mounts. While
+   * PDPP is disabled or fails to mount, `importer` stays null and the
+   * delegate reports every envelope as skipped — sync behaves exactly as it
+   * did before this existed.
+   */
+  let pdppImporterImpl: PdppImporter | null = null;
+  const pdppImporter: PdppImporter = {
+    importEnvelope: (envelope) =>
+      pdppImporterImpl?.importEnvelope(envelope) ?? { status: "skipped" },
+    // Before PDPP mounts, nothing is settled: an entry indexed during that
+    // window must still be retried once the real importer attaches, which is
+    // the "enable PDPP after an earlier sync" case.
+    needsRetry: (scope, collectedAt) =>
+      pdppImporterImpl?.needsRetry(scope, collectedAt) ?? true,
+  };
   // Deletion-aware registry view. Independent of sync: the data route uses
   // it to answer 410 for scopes the owner deleted even when sync is off.
   const dataPointFeed =
@@ -466,6 +494,7 @@ export async function createServer(
         derivativeScheduler.markSourceChanged(event.scope, {
           lineageSources: event.lineageSources,
         }),
+      pdppImporter,
     };
 
     // Durable deletion: gateway tombstone signed with the same server
@@ -590,7 +619,71 @@ export async function createServer(
           })
       : undefined;
 
+  // PDPP Authorization Server. Opt-in, and returns undefined unless the
+  // deployment has an owner, retained declarations, and readable auth state —
+  // so `/pdpp/v1` is mounted only when it can actually issue grants.
+  const pdppAuth = await createPdppAuthDeps({
+    config,
+    storageRoot,
+    logger,
+    indexManager,
+    serverOrigin: () => effectiveOrigin,
+    serverOwner,
+    devToken,
+    accessToken,
+    tokenStore,
+  });
+
+  // PDPP Resource Server. Mounts only alongside a mounted AS, so a real boot
+  // yields both halves over ONE token authority — the AS's own
+  // PdppTokenService, resolved in-process (Core §8 co-located). Without this
+  // a real server can issue a valid grant-bound token that has nothing to
+  // read, and cannot publish the RFC 9728 metadata a client needs to discover
+  // where to authorize.
+  const pdppRecords = createPdppRecordsDeps({
+    pdppAuth,
+    declarations: pdppAuth?.retainedDeclarations ?? [],
+    db,
+    serverOwner,
+    resource: effectiveOrigin,
+    logger,
+    configuredMethods: pdppAuth?.configuredMethods,
+  });
+
+  // Close the sync→PDPP loop. Until this runs the download worker holds an
+  // inert delegate; from here a synced envelope carrying verified `$pdpp`
+  // metadata reaches the store the RS serves reads from, which refuses it
+  // until the metadata carries a method and binding generation (P8a).
+  pdppImporterImpl =
+    createPdppSyncImporter({
+      records: pdppRecords,
+      declarations: pdppAuth?.retainedDeclarations ?? [],
+      documents: pdppAuth?.retainedDocuments ?? new Map(),
+      serverOwner,
+      logger,
+    }) ?? null;
+
   const app = createApp({
+    pdppAuth,
+    // Declaration submission, gated on the control-plane credential the
+    // deployment already uses for operator surfaces (`PS_ACCESS_TOKEN`).
+    // Deliberately NOT a new config field: `loadConfig()` rewrites
+    // `config.json` with defaults on every boot, so a secret living there is
+    // a secret at rest in a file the server edits. Without the credential the
+    // route is not mounted and the declaration set stays exactly what config
+    // made it.
+    pdppDeclarations: pdppAuth
+      ? {
+          registry: pdppAuth.declarationRegistry,
+          supportedConnectors: pdppAuth.supportedConnectors,
+          operatorToken: accessToken,
+        }
+      : undefined,
+    pdpp: pdppRecords,
+    // The SAME stable delegate the download worker was given above, not a
+    // second importer: both arrival routes must resolve to one importer over
+    // one store, and this one is already late-bound to `pdppImporterImpl`.
+    pdppImporter,
     mcpHydrateScopes:
       isEnclave && jobSyncManager
         ? (scopes) => jobSyncManager.hydrateScopes(scopes)

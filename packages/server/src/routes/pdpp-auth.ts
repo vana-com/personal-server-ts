@@ -1,0 +1,1161 @@
+/**
+ * PDPP Core v0.1.0 Authorization Server HTTP surface.
+ *
+ * The endpoints under `/pdpp/v1`:
+ *
+ *   POST /authorize                      — accept an RFC 9396 selection request
+ *   GET  /authorize/:session_id/review   — the owner's consent review model
+ *   POST /authorize/:session_id/approve  — authenticated owner approval
+ *   POST /authorize/:session_id/deny     — authenticated owner denial
+ *   POST /token                          — code redemption + refresh rotation
+ *   POST /introspect                     — RFC 7662 introspection
+ *   GET  /grants                         — the owner's grants, with status
+ *   POST /revoke                         — owner-initiated grant revocation
+ *
+ * This is deliberately a NEW surface rather than an extension of
+ * `oauth-token.ts`. That endpoint serves the control-plane and CLI device
+ * flows against the legacy `TokenStore`; PDPP tokens are grant-bound and live
+ * in their own store with their own lifecycle. Mixing them would mean one
+ * endpoint with two token authorities, which §8 explicitly warns against
+ * ("do not query or create a second grant authority"). Existing clients of
+ * `/oauth/token` are untouched.
+ *
+ * Every response carries `Cache-Control: no-store` and `Pragma: no-cache`
+ * (RFC 6749 §5.1 for token responses; delivery scope §1 requires it on every
+ * token response specifically).
+ *
+ * Two things that cost integrators a debug cycle, so stated plainly:
+ *
+ *   - **Content types differ by endpoint.** `/authorize`, `/approve` and
+ *     `/deny` take JSON. `/token`, `/introspect` and `/revoke` take
+ *     `application/x-www-form-urlencoded`, because they follow the RFC 6749 /
+ *     7662 / 7009 wire conventions a standard OAuth client library already
+ *     speaks. Sending JSON to the form endpoints parses to an empty body and
+ *     reads as a missing parameter.
+ *   - **The review digest is nested.** `GET /authorize/:id/review` returns
+ *     `{ session_id, review, expires_at }`, so the digest is at
+ *     `review.review_digest`, not at the top level. The envelope also carries
+ *     `instance_choice_required` instead of `review` when the owner still has
+ *     an instance to pick.
+ */
+
+import { Hono, type Context } from "hono";
+import type { Logger } from "pino";
+import type {
+  ClientIdentityResult,
+  ClientIdMetadataDocument,
+} from "@opendatalabs/personal-server-ts-core/pdpp";
+import type {
+  AuthorizationSessionStore,
+  PdppTokenService,
+} from "@opendatalabs/personal-server-ts-core/pdpp";
+import {
+  approveAuthorization,
+  denyAuthorization,
+  fetchReview,
+  PDPP_API_VERSION,
+  PDPP_DATA_ACCESS_TYPE,
+  PDPP_DATA_ACCESS_TYPE_V02,
+  resolveRequesterIdentity,
+  validateCodeChallenge,
+  validateRedirectUri,
+  validateSelectionRequest,
+  type DeclarationSnapshot,
+  type GrantStatus,
+  type InstanceInventory,
+  type OwnerChoices,
+  type OwnerConditions,
+  type PdppAuthStore,
+  type RecipientTerms,
+  type RegisteredRedirectPolicy,
+  type SelectionRequest,
+  type StoredGrant,
+} from "@opendatalabs/personal-server-ts-core/pdpp";
+import { createWeb3AuthMiddleware } from "../middleware/web3-auth.js";
+import { createOwnerCheckMiddleware } from "../middleware/owner-check.js";
+import type { TokenStore } from "../token-store.js";
+
+/** No-store on everything: tokens, codes, and review models are all sensitive. */
+const NO_STORE = {
+  "Cache-Control": "no-store",
+  Pragma: "no-cache",
+} as const;
+
+/** Owner tokens are short-lived: they authorize consent decisions. */
+export const OWNER_TOKEN_TTL_SECONDS = 15 * 60;
+
+export interface PdppAuthRouteDeps {
+  logger: Logger;
+  store: PdppAuthStore;
+  tokens: PdppTokenService;
+  sessions: AuthorizationSessionStore;
+  /**
+   * Resolve the retained declaration snapshot for a source. The AS resolves
+   * only against this snapshot — never a live re-fetch at approval time.
+   */
+  resolveDeclaration(sourceId: string): DeclarationSnapshot | null;
+  /** The owner's connected instances, read fresh at review and approval. */
+  inventoryFor(subjectId: string, sourceId: string): InstanceInventory;
+  /**
+   * The authenticated owner for an incoming authorization request. Returns
+   * null when no owner session is present.
+   */
+  currentSubjectId(c: Context): string | null;
+  /**
+   * Resolve the PDPP subject for a request that already passed the PS owner
+   * proof (`web3-auth` + `owner-check`). Used only by
+   * `POST /owner/token`. Defaults to `currentSubjectId` when a deployment
+   * uses one notion of owner identity for both.
+   */
+  ownerSubjectId?(c: Context): string | null;
+  /**
+   * Owner-proof wiring. When supplied, `POST /owner/token` is guarded by the
+   * PS's existing `web3-auth` + `owner-check` middleware — the same wallet
+   * signature chain every other owner route uses — and the verified signer
+   * becomes the PDPP subject. Absent, the route falls back to
+   * `ownerSubjectId`/`currentSubjectId`, which is how the unit tests drive it.
+   */
+  ownerAuth?: {
+    serverOrigin: string | (() => string);
+    serverOwner?: `0x${string}`;
+    devToken?: string;
+    accessToken?: string;
+    tokenStore?: TokenStore;
+  };
+  /**
+   * Registered metadata for a client, used to validate `redirect_uri` by
+   * exact match (RFC 6749 §3.1.2.2). Returning null means the client is
+   * unregistered, and an unregistered client cannot receive an authorization
+   * code — the AS fails closed rather than trusting the requested target.
+   */
+  registeredClient?(clientId: string): RegisteredRedirectPolicy | null;
+  /**
+   * Resolve a URL-hosted client identity (§6) when a client is not locally
+   * registered. Optional: leaving it unset preserves registration-only
+   * behavior exactly, and performs no outbound fetch.
+   */
+  resolveClientIdentity?(clientId: string): Promise<ClientIdentityResult>;
+  /**
+   * AS-policy grant expiry, when the deployment sets one.
+   *
+   * `clientId` is the second argument (not folded into `request`) because it
+   * is authorization-request context, not part of the RFC 9396 selection
+   * request itself — Core's `SelectionRequest` stays binding-neutral and
+   * carries no client identity. `request` remains first for compatibility
+   * with any existing caller that only closed over it.
+   */
+  grantExpiryFor?(
+    request: SelectionRequest,
+    clientId: string,
+  ): string | undefined;
+  /**
+   * Require PKCE on the authorization code flow. Defaults to true and should
+   * stay true: PDPP clients are public clients, so without a verifier an
+   * intercepted code is redeemable by whoever intercepted it.
+   */
+  requirePkce?: boolean;
+  /**
+   * Standing terms this client has authorized, when the deployment tracks
+   * them.
+   *
+   * Absent means the AS knows of no standing terms, which is the safe default
+   * rather than a gap: with no terms, only conditions the client's own request
+   * already covers can become commitments, and anything else refuses. v0.2 is
+   * explicit that a capability advertisement is not acceptance, so an AS that
+   * cannot evidence acceptance must not assume it.
+   */
+  standingTermsFor?(clientId: string): RecipientTerms | null;
+  /**
+   * This authorization server's issuer identifier, used to build the absolute
+   * endpoint URLs in its metadata document. Absent omits the document
+   * entirely rather than publishing relative or guessed URLs — a client that
+   * cannot resolve the endpoints is worse off than one that finds no document
+   * and falls back to configuration.
+   */
+  issuer?: string | (() => string);
+}
+
+function errorResponse(
+  c: Context,
+  status: 400 | 401 | 403 | 404 | 409 | 500,
+  error: string,
+  description: string,
+) {
+  return c.json({ error, error_description: description }, status, NO_STORE);
+}
+
+/** Bearer token from the Authorization header, if present. */
+function bearer(c: Context): string | undefined {
+  const header = c.req.header("authorization");
+  if (!header?.toLowerCase().startsWith("bearer ")) return undefined;
+  const token = header.slice(7).trim();
+  return token.length > 0 ? token : undefined;
+}
+
+/**
+ * Negotiate `PDPP-Version` (§7 version layering, §9 AS item 17).
+ *
+ * An absent header selects the current stable version. An unsupported one is
+ * a 400 `unsupported_version` — not a silent downgrade, because a client that
+ * asked for a version it needs must not be handed a different contract.
+ */
+function negotiateVersion(
+  c: Context,
+): { ok: true } | { ok: false; requested: string } {
+  const requested = c.req.header("pdpp-version");
+  if (!requested) return { ok: true };
+  if (requested !== PDPP_API_VERSION) return { ok: false, requested };
+  return { ok: true };
+}
+
+/**
+ * The PDPP AS metadata document, as a handler both of its locations share.
+ *
+ * Exported because the two URLs it is served at live in different routers: the
+ * path-first one inside `/pdpp/v1`, and the RFC 8414 §3 one
+ * (`/.well-known/oauth-authorization-server/pdpp/v1`) at the app root, outside
+ * this prefix. One handler rather than two so the documents can never drift --
+ * a client discovering through either must find the same authority.
+ *
+ * `issuer` is accepted as a thunk for deployments that resolve their own origin
+ * late (a bound port unknown at construction). It is resolved per request so
+ * the document never advertises a stale origin.
+ */
+export function pdppAsMetadataHandler(
+  issuerSource: PdppAuthRouteDeps["issuer"],
+): (c: Context) => Response {
+  return (c: Context) => {
+    const issuer =
+      typeof issuerSource === "function" ? issuerSource() : issuerSource;
+    if (!issuer) {
+      return errorResponse(
+        c,
+        404,
+        "not_found",
+        "this deployment does not publish PDPP authorization-server metadata",
+      );
+    }
+    const base = `${issuer.replace(/\/$/, "")}/pdpp/v1`;
+    return c.json(
+      {
+        issuer,
+        authorization_endpoint: `${base}/authorize`,
+        token_endpoint: `${base}/token`,
+        introspection_endpoint: `${base}/introspect`,
+        revocation_endpoint: `${base}/revoke`,
+        authorization_details_types_supported: [
+          PDPP_DATA_ACCESS_TYPE,
+          PDPP_DATA_ACCESS_TYPE_V02,
+        ],
+        grant_types_supported: ["authorization_code", "refresh_token"],
+        response_types_supported: ["code"],
+        // PKCE is required on this flow, not merely supported: PDPP clients
+        // are public clients, so an intercepted code without a verifier is
+        // redeemable by whoever intercepted it.
+        code_challenge_methods_supported: ["S256"],
+        pdpp_api_version: PDPP_API_VERSION,
+      },
+      200,
+      NO_STORE,
+    );
+  };
+}
+
+export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
+  const app = new Hono();
+
+  // The selected version echoes back on every response (§9 AS item 17).
+  app.use("*", async (c, next) => {
+    const version = negotiateVersion(c);
+    if (!version.ok) {
+      return errorResponse(
+        c,
+        400,
+        "unsupported_version",
+        `PDPP-Version '${version.requested}' is not supported; this server implements ${PDPP_API_VERSION}`,
+      );
+    }
+    await next();
+    c.header("PDPP-Version", PDPP_API_VERSION);
+  });
+
+  // The owner-proof chain, when a deployment wires one. `web3-auth` verifies
+  // the Web3Signed wallet signature and populates `c.get("auth")`;
+  // `owner-check` compares the recovered signer against the configured server
+  // owner. Scoped to the token-exchange path only — the rest of the surface
+  // authenticates with the PDPP owner token that exchange produces.
+  if (deps.ownerAuth) {
+    app.use(
+      "/owner/token",
+      createWeb3AuthMiddleware({
+        serverOrigin: deps.ownerAuth.serverOrigin,
+        devToken: deps.ownerAuth.devToken,
+        accessToken: deps.ownerAuth.accessToken,
+        tokenStore: deps.ownerAuth.tokenStore,
+        serverOwner: deps.ownerAuth.serverOwner,
+      }),
+    );
+    app.use(
+      "/owner/token",
+      createOwnerCheckMiddleware(deps.ownerAuth.serverOwner),
+    );
+  }
+
+  /**
+   * OAuth authorization-server metadata for the PDPP AS.
+   *
+   * v0.2 §8 requires an AS supporting the revision to advertise
+   * `https://pdpp.dev/data-access/0.2` in
+   * `authorization_details_types_supported`, and requires a client to
+   * establish support before requesting the type. Without this document a
+   * conformant client must not request v0.2 at all, so the implementation
+   * would be unreachable to exactly the clients that follow the spec.
+   *
+   * Both types are advertised: both are implemented, each resolves under its
+   * own revision, and dropping v0.1 would strand existing clients.
+   *
+   * This sits under `/pdpp/v1/` rather than at the origin root because the
+   * root document already describes the MCP OAuth authorization server — a
+   * different authority over different tokens. §8 warns against a second grant
+   * authority; merging the documents would present the two as one.
+   *
+   * The SAME document is also served at the RFC 8414 §3 location
+   * (`/.well-known/oauth-authorization-server/pdpp/v1` — well-known first, the
+   * issuer's path appended), mounted by the app because it lies outside this
+   * router's prefix. Publishing only the path-first form above left the
+   * document undiscoverable to any client that follows RFC 8414, which is the
+   * only discovery rule the spec gives. The RFC location keeps the `/pdpp/v1`
+   * suffix, so it does not collide with the bare URL the MCP AS owns and the
+   * separation this comment describes is preserved.
+   */
+  app.get(
+    "/.well-known/oauth-authorization-server",
+    pdppAsMetadataHandler(deps.issuer),
+  );
+
+  /**
+   * Exchange an already-verified owner proof for a PDPP owner token.
+   *
+   * This endpoint mints no authority of its own. The caller must already have
+   * satisfied the PS's existing owner proof — the `web3-auth` middleware
+   * verifies a Web3Signed wallet signature and `owner-check` compares the
+   * recovered signer against the configured server owner. This route only
+   * converts that proof into the short-lived, grant-system credential the
+   * consent decision endpoints require.
+   *
+   * The indirection is deliberate and is the whole point of the design in
+   * `approval.ts`: a consent broker (Account/Web) never mints an owner token
+   * and never asserts owner identity. It holds a credential the PS issued to
+   * a verified wallet signer, so compromising the broker yields a token that
+   * expires, not the authority to approve anything for any subject.
+   *
+   * Mount this behind the same middleware chain as other owner routes:
+   *
+   *   app.use("/pdpp/v1/owner/token", createWeb3AuthMiddleware(...));
+   *   app.use("/pdpp/v1/owner/token", createOwnerCheckMiddleware(serverOwner));
+   *
+   * `ownerSubjectId` resolves the verified signer to the PDPP subject; a
+   * deployment that maps wallets to subjects differently supplies its own.
+   */
+  app.post("/owner/token", (c) => {
+    // With `ownerAuth` wired, the middleware above has already verified a
+    // wallet signature and confirmed the signer is the server owner, so
+    // `c.get("auth").signer` is a proven identity rather than a claim.
+    const verifiedSigner = (c.get("auth") as { signer?: string } | undefined)
+      ?.signer;
+    const subjectId =
+      deps.ownerSubjectId?.(c) ??
+      (deps.ownerAuth && verifiedSigner ? verifiedSigner : null) ??
+      deps.currentSubjectId(c);
+    if (!subjectId) {
+      // Reaching here means the owner middleware did not run or did not
+      // populate a verified signer. Fail closed rather than inventing a
+      // subject — an owner token for an unidentified subject is exactly the
+      // credential this design exists to prevent.
+      return errorResponse(
+        c,
+        401,
+        "unauthorized",
+        "a verified owner proof is required to obtain a PDPP owner token",
+      );
+    }
+
+    const issued = deps.tokens.issueOwnerToken({
+      subjectId,
+      ttlSeconds: OWNER_TOKEN_TTL_SECONDS,
+    });
+    deps.logger.info(
+      { subject_id: subjectId },
+      "PDPP owner token issued to a verified owner",
+    );
+    return c.json(issued, 200, NO_STORE);
+  });
+
+  /**
+   * Accept an RFC 9396 selection request and open an authorization session.
+   *
+   * Requires an authenticated owner: the session is bound to that subject at
+   * creation, which is what makes the later approval check meaningful. A
+   * session created for an unauthenticated caller would have no subject to
+   * bind an approval against.
+   */
+  app.post("/authorize", async (c) => {
+    const subjectId = deps.currentSubjectId(c);
+    if (!subjectId) {
+      return errorResponse(
+        c,
+        401,
+        "unauthorized",
+        "an authenticated owner session is required to start an authorization",
+      );
+    }
+
+    let body: {
+      authorization_details?: SelectionRequest[];
+      client_id?: string;
+      redirect_uri?: string;
+      state?: string;
+      code_challenge?: string;
+      code_challenge_method?: string;
+      client_display?: { name: string };
+    };
+    try {
+      body = await c.req.json();
+    } catch {
+      return errorResponse(c, 400, "invalid_request", "body must be JSON");
+    }
+
+    const details = body.authorization_details;
+    if (!Array.isArray(details) || details.length !== 1) {
+      // v0.1 issues one grant per authorization. A package of several details
+      // would need package-level access-mode rules (§9 AS item 20) that Core
+      // does not yet pin down, so we reject rather than guess.
+      return errorResponse(
+        c,
+        400,
+        "invalid_authorization_details",
+        "exactly one authorization_details entry is supported",
+      );
+    }
+    if (!body.client_id || !body.redirect_uri) {
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "client_id and redirect_uri are required",
+      );
+    }
+
+    // The authorization code travels in this redirect, so an unvalidated
+    // target is code exfiltration, not just an open redirect. PKCE does not
+    // help: an attacker who chose the redirect also chose the challenge and
+    // holds the verifier. RFC 6749 §4.1.2.1 forbids reporting this failure BY
+    // redirecting, so it is returned directly to the caller.
+    // Local registration has highest precedence and costs no network call.
+    // Only when a client is NOT registered does §6 require us to try its
+    // URL-hosted identity: rejecting solely for absence of preregistration is
+    // the one reason the spec names as insufficient.
+    let redirectPolicy = deps.registeredClient?.(body.client_id) ?? null;
+    // The document that earned redirect admission, carried forward so the
+    // consent surface shows the identity the verified domain asserted rather
+    // than whatever the client put in `client_display`. §6 ranks validated
+    // binding metadata above inline metadata; admitting on the document and
+    // then displaying the inline name would break that.
+    let validatedClientDocument: ClientIdMetadataDocument | undefined;
+    if (!redirectPolicy && deps.resolveClientIdentity) {
+      const resolved = await deps.resolveClientIdentity(body.client_id);
+      if (resolved.ok) {
+        redirectPolicy = resolved.policy;
+        validatedClientDocument = resolved.document;
+      } else {
+        // The refusal names the actual reason -- untrusted URL, unreachable,
+        // mismatched document -- rather than "not registered", so an operator
+        // can tell a policy denial from a broken client.
+        deps.logger.warn(
+          { client_id: body.client_id, reason: resolved.failure.code },
+          "PDPP authorization refused: URL-hosted client identity rejected",
+        );
+      }
+    }
+
+    const redirectFailure = validateRedirectUri(
+      body.redirect_uri,
+      redirectPolicy,
+    );
+    if (redirectFailure) {
+      deps.logger.warn(
+        {
+          client_id: body.client_id,
+          redirect_uri: body.redirect_uri,
+          reason: redirectFailure.code,
+        },
+        "PDPP authorization refused: redirect_uri failed validation",
+      );
+      return errorResponse(c, 400, "invalid_request", redirectFailure.message);
+    }
+
+    // PKCE is validated before consent, not at redemption: a client whose flow
+    // is unusable should learn that before a human is asked to decide anything.
+    const pkceFailure = validateCodeChallenge(
+      body.code_challenge,
+      body.code_challenge_method,
+      { required: deps.requirePkce ?? true },
+    );
+    if (pkceFailure) {
+      return errorResponse(c, 400, "invalid_request", pkceFailure.message);
+    }
+
+    const request = details[0];
+    const snapshot = deps.resolveDeclaration(request.source?.id ?? "");
+    if (!snapshot) {
+      return errorResponse(
+        c,
+        400,
+        "invalid_authorization_details",
+        "no retained declaration snapshot for the requested source",
+      );
+    }
+
+    const validation = validateSelectionRequest(request, snapshot);
+    if (!validation.ok) {
+      // §9 AS item 5: the binding maps a Source validation failure to RFC 9396
+      // `invalid_authorization_details`. Other shape failures map to
+      // `invalid_request`.
+      //
+      // v0.2 names the same code for a malformed minimum ("Malformed or
+      // unsupported authorization details instead produce
+      // `invalid_authorization_details`"), and `invalid_minimum` reaches it
+      // through this default. That is deliberately the *shape* half of the
+      // v0.2 error split: an unsatisfiable-but-well-formed minimum is an
+      // owner-decision outcome and surfaces at approval as `access_denied`,
+      // not here.
+      const oauthError =
+        validation.failure.code === "invalid_request"
+          ? "invalid_request"
+          : "invalid_authorization_details";
+      return errorResponse(c, 400, oauthError, validation.failure.message);
+    }
+
+    const session = deps.sessions.create({
+      subjectId,
+      request,
+      snapshot,
+      requester: resolveRequesterIdentity({
+        client_id: body.client_id,
+        document: validatedClientDocument,
+        inline: body.client_display,
+      }),
+      redirectUri: body.redirect_uri,
+      stateParam: body.state,
+      codeChallenge: body.code_challenge,
+      codeChallengeMethod: body.code_challenge_method,
+      grantExpiresAt: deps.grantExpiryFor?.(request, body.client_id),
+    });
+
+    deps.logger.info(
+      { session_id: session.session_id, client_id: body.client_id },
+      "PDPP authorization session opened",
+    );
+
+    return c.json(
+      { session_id: session.session_id, expires_at: session.expires_at },
+      201,
+      NO_STORE,
+    );
+  });
+
+  /**
+   * The consent review model, for the authenticated owner only.
+   *
+   * When a stream has several eligible instances and the request named none,
+   * the response carries `instance_choice_required` instead of a review: the
+   * owner picks, then re-fetches with `?instance[<stream>]=<handle>` repeated
+   * per handle. §6 forbids inferring fan-in from omission, so this is a
+   * consent step rather than a failure.
+   */
+  app.get("/authorize/:session_id/review", (c) => {
+    const sessionId = c.req.param("session_id");
+    const session = deps.sessions.get(sessionId);
+
+    const result = fetchReview({
+      sessions: deps.sessions,
+      tokens: deps.tokens,
+      sessionId,
+      ownerToken: bearer(c),
+      inventory: deps.inventoryFor(
+        session?.subject_id ?? "",
+        session?.snapshot.source_id ?? "",
+      ),
+      instanceChoices: parseInstanceChoices(c),
+      ownerChoices: parseOwnerChoices(c),
+      ownerConditions: parseOwnerConditions(c),
+      standingTerms:
+        deps.standingTermsFor?.(session?.requester.client_id ?? "") ??
+        undefined,
+      store: deps.store,
+    });
+
+    if (!result.ok) {
+      return errorResponse(
+        c,
+        approvalStatus(result.failure.code),
+        approvalOAuthError(result.failure.code),
+        result.failure.message,
+      );
+    }
+    return c.json(result.result, 200, NO_STORE);
+  });
+
+  /**
+   * Approve. Requires an authenticated owner token AND the review digest the
+   * owner was shown — see `approval.ts` for why affiliation is not enough.
+   */
+  app.post("/authorize/:session_id/approve", async (c) => {
+    const sessionId = c.req.param("session_id");
+    const session = deps.sessions.get(sessionId);
+
+    let body: {
+      review_digest?: string;
+      explicit_ai_training_consent?: boolean;
+      instance_choices?: Record<string, string[]>;
+      /** v0.2 narrowing, in the same shape the review was fetched with. */
+      owner_choices?: OwnerChoices;
+      /** v0.2 conditions on purpose/retention, as reviewed. */
+      owner_conditions?: OwnerConditions;
+    };
+    try {
+      body = await c.req.json();
+    } catch {
+      return errorResponse(c, 400, "invalid_request", "body must be JSON");
+    }
+
+    const result = approveAuthorization({
+      sessions: deps.sessions,
+      tokens: deps.tokens,
+      sessionId,
+      ownerToken: bearer(c),
+      reviewDigest: body.review_digest ?? "",
+      inventory: deps.inventoryFor(
+        session?.subject_id ?? "",
+        session?.snapshot.source_id ?? "",
+      ),
+      instanceChoices: body.instance_choices,
+      ownerChoices: body.owner_choices,
+      ownerConditions: body.owner_conditions,
+      standingTerms:
+        deps.standingTermsFor?.(session?.requester.client_id ?? "") ??
+        undefined,
+      explicitAiTrainingConsent: body.explicit_ai_training_consent,
+    });
+
+    if (!result.ok) {
+      return errorResponse(
+        c,
+        approvalStatus(result.failure.code),
+        approvalOAuthError(result.failure.code),
+        result.failure.message,
+      );
+    }
+
+    // Persist the grant and its authorization code as one durable unit
+    // before marking this session complete. Only
+    // once this succeeds does the session move to "approved" — if the write
+    // fails, the session stays "pending" so the same reviewed approval can
+    // be retried rather than being stranded as already-decided with nothing
+    // durable behind it.
+    const code = `pdpp_code_${crypto.randomUUID().replace(/-/g, "")}`;
+    deps.store.insertGrantWithAuthCode({
+      grant: result.grant,
+      subjectId: result.grant.subject.id,
+      reviewDigest: result.consentEvidence.review_digest,
+      consentEvidence: result.consentEvidence,
+      code,
+      authCode: {
+        grantId: result.grant.grant_id,
+        clientId: result.grant.client.client_id,
+        redirectUri: session!.redirect_uri,
+        // Carried from the authorization request, so redemption can prove the
+        // redeemer is the client that asked (RFC 7636 §4.4).
+        codeChallenge: session!.code_challenge ?? null,
+        codeChallengeMethod: session!.code_challenge_method ?? null,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      },
+    });
+
+    deps.sessions.setStatus(session!.session_id, "approved");
+
+    const redirect = new URL(session!.redirect_uri);
+    redirect.searchParams.set("code", code);
+    if (session!.state_param) {
+      redirect.searchParams.set("state", session!.state_param);
+    }
+
+    deps.logger.info(
+      { grant_id: result.grant.grant_id },
+      "PDPP grant issued after authenticated owner approval",
+    );
+
+    return c.json(
+      { redirect_uri: redirect.toString(), grant_id: result.grant.grant_id },
+      200,
+      NO_STORE,
+    );
+  });
+
+  /** Deny. Terminal; no grant and no consent evidence beyond the denial. */
+  app.post("/authorize/:session_id/deny", async (c) => {
+    const sessionId = c.req.param("session_id");
+    const session = deps.sessions.get(sessionId);
+
+    // The owner's optional note. Read defensively: a denial must succeed even
+    // when the body is absent or malformed, because refusing is the safe
+    // outcome and must never be blocked by the shape of an optional field.
+    let reason: string | undefined;
+    try {
+      const body = (await c.req.json()) as { reason?: unknown } | null;
+      if (typeof body?.reason === "string") reason = body.reason;
+    } catch {
+      reason = undefined;
+    }
+
+    const result = denyAuthorization({
+      sessions: deps.sessions,
+      tokens: deps.tokens,
+      sessionId,
+      ownerToken: bearer(c),
+      ...(reason !== undefined && { reason }),
+    });
+
+    if (!result.ok) {
+      return errorResponse(
+        c,
+        approvalStatus(result.failure.code),
+        approvalOAuthError(result.failure.code),
+        result.failure.message,
+      );
+    }
+
+    const redirect = new URL(session!.redirect_uri);
+    redirect.searchParams.set("error", "access_denied");
+    if (session!.state_param) {
+      redirect.searchParams.set("state", session!.state_param);
+    }
+    return c.json({ redirect_uri: redirect.toString() }, 200, NO_STORE);
+  });
+
+  /**
+   * Token endpoint: authorization-code redemption and refresh rotation.
+   *
+   * Form-encoded per RFC 6749 §4.1.3 / §6, so a standard OAuth client library
+   * works against it unmodified.
+   */
+  app.post("/token", async (c) => {
+    const contentType = c.req.header("content-type") ?? "";
+    if (!contentType.includes("application/x-www-form-urlencoded")) {
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "Content-Type must be application/x-www-form-urlencoded",
+      );
+    }
+
+    const body = await c.req.parseBody();
+    const grantType = asString(body.grant_type);
+
+    if (grantType === "authorization_code") {
+      const code = asString(body.code);
+      const clientId = asString(body.client_id);
+      const redirectUri = asString(body.redirect_uri);
+      if (!code || !clientId || !redirectUri) {
+        return errorResponse(
+          c,
+          400,
+          "invalid_request",
+          "code, client_id, and redirect_uri are required",
+        );
+      }
+      const result = deps.tokens.redeemAuthorizationCode({
+        code,
+        clientId,
+        redirectUri,
+        codeVerifier: asString(body.code_verifier) ?? undefined,
+      });
+      if (!result.ok) {
+        return errorResponse(
+          c,
+          400,
+          result.failure.code,
+          result.failure.message,
+        );
+      }
+      return c.json(result.issued, 200, NO_STORE);
+    }
+
+    if (grantType === "refresh_token") {
+      const refreshToken = asString(body.refresh_token);
+      if (!refreshToken) {
+        return errorResponse(
+          c,
+          400,
+          "invalid_request",
+          "refresh_token is required",
+        );
+      }
+      const result = deps.tokens.refresh({ refreshToken });
+      if (!result.ok) {
+        return errorResponse(
+          c,
+          400,
+          result.failure.code,
+          result.failure.message,
+        );
+      }
+      return c.json(result.issued, 200, NO_STORE);
+    }
+
+    return errorResponse(
+      c,
+      400,
+      "unsupported_grant_type",
+      `grant_type '${grantType ?? ""}' is not supported by the PDPP token endpoint`,
+    );
+  });
+
+  /**
+   * RFC 7662 introspection.
+   *
+   * **The co-located deployment is the supported baseline**, and there the RS
+   * calls `resolveToken` directly — this endpoint is not on that path.
+   *
+   * **Known gap for the separated deployment (§9 AS item 18).** The only
+   * credential accepted here is a PDPP *owner* token: 15-minute TTL, mintable
+   * only from a wallet owner-proof. A standalone Resource Server cannot hold
+   * one, so the deployment topology this endpoint exists to serve cannot
+   * actually authenticate to it. Closing that needs a distinct RS client
+   * identity (client credentials, mTLS, or a registered RS principal) that is
+   * not owner scope, which is a deployment-model decision this build does not
+   * make.
+   *
+   * Stated plainly rather than papered over: this AS does **not** claim
+   * conformance for separated AS/RS introspection. It is conformant for the
+   * co-located equivalent §8 explicitly permits ("A co-located AS and RS MAY
+   * resolve the same context through a local equivalent").
+   */
+  app.post("/introspect", async (c) => {
+    const callerToken = bearer(c);
+    if (!callerToken) {
+      return errorResponse(
+        c,
+        401,
+        "invalid_client",
+        "the resource server must authenticate to introspect",
+      );
+    }
+    const caller = deps.tokens.resolveToken(callerToken);
+    if (!caller.active || caller.tokenKind !== "owner") {
+      return errorResponse(
+        c,
+        401,
+        "invalid_client",
+        "introspection requires an authenticated resource server",
+      );
+    }
+
+    const body = await c.req.parseBody();
+    const token = asString(body.token);
+    if (!token) {
+      // RFC 7662: a missing token is a request error, not an inactive answer.
+      return errorResponse(c, 400, "invalid_request", "token is required");
+    }
+
+    return c.json(deps.tokens.introspect(token), 200, NO_STORE);
+  });
+
+  /**
+   * List the owner's PDPP grants, newest first, with each one's status.
+   *
+   * Sits at `/grants` rather than under `/owner` because `/owner/*` is the
+   * wallet-proof-guarded path that mints owner tokens, while this route
+   * authenticates the same way `/revoke` does — with the owner token that
+   * exchange produced. It is the read half of the same owner grant-lifecycle
+   * pair, so it belongs beside its writer, not beside the credential mint.
+   *
+   * The projection is exactly the review's `existing_grants` shape plus
+   * `status` and `client_id`, so a surface that renders one can render the
+   * other. What it deliberately omits is everything that is authority or
+   * evidence rather than description: tokens, authorization codes, consent
+   * evidence and review digests. A grant list is for showing an owner what
+   * they have agreed to; none of those fields serve that, and each would turn
+   * a read-only listing into a credential leak.
+   *
+   * `status` widens `grantStatus` by one value the store models as a separate
+   * column: a `single_use` grant that has been redeemed reads `consumed`, not
+   * `active`, because it can never issue another token.
+   */
+  app.get("/grants", (c) => {
+    const caller = resolveOwner(c);
+    if (!caller.ok) return caller.response;
+
+    const clientFilter = c.req.query("client_id");
+    const now = new Date();
+    const grants = deps.store
+      .listGrantsForSubject(caller.subjectId)
+      .filter((stored) => !clientFilter || stored.clientId === clientFilter)
+      .map((stored) => ({
+        grant_id: stored.grant.grant_id,
+        client_id: stored.clientId,
+        status: listedGrantStatus(deps.store, stored, now),
+        issued_at: stored.grant.issued_at,
+        ...(stored.grant.expires_at && { expires_at: stored.grant.expires_at }),
+        access_mode: stored.grant.access_mode,
+        purpose_code: stored.grant.purpose_code,
+        streams: stored.grant.streams.map((s) => ({
+          name: s.name,
+          fields: s.fields,
+        })),
+      }));
+
+    return c.json({ grants }, 200, NO_STORE);
+  });
+
+  /**
+   * Revoke a grant. Owner-authenticated, and scoped to the owner's own grants
+   * — a valid owner token is not authority over another subject's grant.
+   */
+  app.post("/revoke", async (c) => {
+    const caller = resolveOwner(c);
+    if (!caller.ok) return caller.response;
+
+    const body = await c.req.parseBody();
+    const grantId = asString(body.grant_id);
+    if (!grantId) {
+      return errorResponse(c, 400, "invalid_request", "grant_id is required");
+    }
+
+    const stored = deps.store.getGrant(grantId);
+    // Not-found for another owner's grant as well, so a caller cannot probe
+    // which grant ids exist outside their own subject.
+    if (!stored || stored.subjectId !== caller.subjectId) {
+      return errorResponse(c, 404, "not_found", "grant not found");
+    }
+
+    const revoked = deps.tokens.revokeGrant(grantId);
+    deps.logger.info({ grant_id: grantId, revoked }, "PDPP grant revocation");
+
+    // Idempotent: a second revoke is still "it is revoked".
+    return c.json({ grant_id: grantId, status: "revoked" }, 200, NO_STORE);
+  });
+
+  /**
+   * The single owner-token check the owner grant routes share.
+   *
+   * A client token is refused with the same 401 as no token at all: from the
+   * caller's side, holding the wrong kind of credential and holding none are
+   * the same answer, and distinguishing them would tell a client token holder
+   * that owner scope exists to be reached for.
+   */
+  function resolveOwner(
+    c: Context,
+  ):
+    | { ok: true; subjectId: string }
+    | { ok: false; response: ReturnType<typeof errorResponse> } {
+    const ownerToken = bearer(c);
+    if (!ownerToken) {
+      return {
+        ok: false,
+        response: errorResponse(
+          c,
+          401,
+          "unauthorized",
+          "an owner token is required",
+        ),
+      };
+    }
+    const caller = deps.tokens.resolveToken(ownerToken);
+    if (!caller.active || caller.tokenKind !== "owner" || !caller.subjectId) {
+      return {
+        ok: false,
+        response: errorResponse(
+          c,
+          401,
+          "unauthorized",
+          "an active owner token is required",
+        ),
+      };
+    }
+    return { ok: true, subjectId: caller.subjectId };
+  }
+
+  return app;
+}
+
+/**
+ * The lifecycle value an owner should see for one grant.
+ *
+ * `grantStatus` answers active/expired/revoked. A redeemed `single_use` grant
+ * is none of those in the store's terms — it has not expired and nobody
+ * revoked it — yet it can never issue another token, so reporting it as
+ * "active" would tell the owner they still have live access they do not have.
+ */
+function listedGrantStatus(
+  store: PdppAuthStore,
+  stored: StoredGrant,
+  now: Date,
+): GrantStatus | "consumed" {
+  const status = store.grantStatus(stored, now);
+  if (
+    status === "active" &&
+    stored.grant.access_mode === "single_use" &&
+    stored.consumedAt
+  ) {
+    return "consumed";
+  }
+  return status;
+}
+
+/**
+ * The wire error for one Core approval-failure code.
+ *
+ * Core keeps `selection_refused` distinct so the two refusal shapes can carry
+ * different statuses and different UI handling, but PR #1 names
+ * `access_denied` as the OAuth error a client sees for a refused selection.
+ * This is the one place those two vocabularies meet, so a client reads
+ * standard OAuth while Core keeps its precision.
+ */
+function approvalOAuthError(code: string): string {
+  if (code === "selection_refused") return "access_denied";
+  // v0.2: an unsupported recipient term is reported as a structured
+  // authorization failure. `invalid_authorization_details` is the RFC 9396
+  // code for authorization details the AS will not honour, which is what an
+  // uncovered term makes them.
+  if (code === "recipient_terms_unsupported") {
+    return "invalid_authorization_details";
+  }
+  return code;
+}
+
+function approvalStatus(code: string): 400 | 401 | 403 | 404 | 409 {
+  switch (code) {
+    case "unauthorized":
+      return 401;
+    case "session_not_found":
+      return 404;
+    case "stale_review":
+      return 409;
+    case "recipient_terms_unsupported":
+      // 409: the request and the owner's terms conflict, and neither side can
+      // fix it alone -- the recipient has to accept the term. Not 403, which
+      // would read as "the owner said no".
+      return 409;
+    case "selection_refused":
+      // A refusal, not a malformed request: the client asked for something
+      // well-formed and the owner's decision cannot satisfy it. 403 rather
+      // than 400 so a consent UI can tell "fix your request" from "this
+      // combination cannot be approved". `access_denied` keeps its existing
+      // 400 for an already-decided session.
+      return 403;
+    default:
+      return 400;
+  }
+}
+
+function asString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * Read owner instance picks from repeated `instance[<stream>]=<handle>` query
+ * parameters, so a choice survives a plain GET re-fetch without the UI having
+ * to hold server state.
+ */
+function parseInstanceChoices(
+  c: Context,
+): Record<string, string[]> | undefined {
+  const choices: Record<string, string[]> = {};
+  const url = new URL(c.req.url);
+  for (const [key, value] of url.searchParams.entries()) {
+    const match = /^instance\[(.+)\]$/.exec(key);
+    if (!match || value.length === 0) continue;
+    (choices[match[1]] ??= []).push(value);
+  }
+  return Object.keys(choices).length > 0 ? choices : undefined;
+}
+
+/**
+ * Read the owner's v0.2 narrowing from the review URL, so a re-fetch shows the
+ * current proposal without the UI having to hold server state — the same
+ * property `instance[...]` already has.
+ *
+ *   decline[<stream>]            — remove an optional stream (value ignored)
+ *   field[<stream>]=<name>       — repeated; the narrowed field list
+ *   since[<stream>]=<instant>    — narrowed window lower bound
+ *   until[<stream>]=<instant>    — narrowed window upper bound
+ *
+ * A repeated `field[...]` with no values cannot be expressed in a query
+ * string, which is why "share nothing from this stream" is `decline[...]`
+ * rather than an empty field list. The two are different decisions and the
+ * wire keeps them different: declining an optional stream succeeds, while
+ * emptying a stream's fields is a refusal.
+ */
+/**
+ * Read the owner's v0.2 conditions from the review URL.
+ *
+ *   retention_max_duration / retention_on_expiry — proposed retention term
+ *   condition_purpose_code                       — proposed purpose code
+ *
+ * Both retention members are required together: a duration with no expiry
+ * action, or the reverse, is half a term, and half a term cannot be matched
+ * against what the recipient accepted.
+ */
+function parseOwnerConditions(c: Context): OwnerConditions | undefined {
+  const url = new URL(c.req.url);
+  const maxDuration = url.searchParams.get("retention_max_duration");
+  const onExpiry = url.searchParams.get("retention_on_expiry");
+  const purposeCode = url.searchParams.get("condition_purpose_code");
+
+  const conditions: OwnerConditions = {
+    ...(maxDuration &&
+      (onExpiry === "delete" || onExpiry === "anonymize") && {
+        retention: { max_duration: maxDuration, on_expiry: onExpiry },
+      }),
+    ...(purposeCode && { purpose_code: purposeCode }),
+  };
+  return Object.keys(conditions).length > 0 ? conditions : undefined;
+}
+
+function parseOwnerChoices(c: Context): OwnerChoices | undefined {
+  const declined: string[] = [];
+  const fields: Record<string, string[]> = {};
+  const windows: Record<string, { since?: string; until?: string }> = {};
+
+  const url = new URL(c.req.url);
+  for (const [key, value] of url.searchParams.entries()) {
+    const decline = /^decline\[(.+)\]$/.exec(key);
+    if (decline) {
+      declined.push(decline[1]);
+      continue;
+    }
+    const field = /^field\[(.+)\]$/.exec(key);
+    if (field && value.length > 0) {
+      (fields[field[1]] ??= []).push(value);
+      continue;
+    }
+    const since = /^since\[(.+)\]$/.exec(key);
+    if (since && value.length > 0) {
+      (windows[since[1]] ??= {}).since = value;
+      continue;
+    }
+    const until = /^until\[(.+)\]$/.exec(key);
+    if (until && value.length > 0) {
+      (windows[until[1]] ??= {}).until = value;
+    }
+  }
+
+  const choices: OwnerChoices = {
+    ...(declined.length > 0 && { declined_streams: declined }),
+    ...(Object.keys(fields).length > 0 && { fields }),
+    ...(Object.keys(windows).length > 0 && { time_ranges: windows }),
+  };
+  return Object.keys(choices).length > 0 ? choices : undefined;
+}

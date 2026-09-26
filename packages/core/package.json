@@ -48,6 +48,22 @@
       "types": "./dist/errors/catalog.d.ts",
       "import": "./dist/errors/catalog.js"
     },
+    "./errors/pdpp": {
+      "types": "./dist/errors/pdpp-catalog.d.ts",
+      "import": "./dist/errors/pdpp-catalog.js"
+    },
+    "./pdpp-version": {
+      "types": "./dist/pdpp-version.d.ts",
+      "import": "./dist/pdpp-version.js"
+    },
+    "./ports/pdpp-auth": {
+      "types": "./dist/ports/pdpp-auth.d.ts",
+      "import": "./dist/ports/pdpp-auth.js"
+    },
+    "./ports/pdpp-auth.test-utils": {
+      "types": "./dist/ports/pdpp-auth.test-utils.d.ts",
+      "import": "./dist/ports/pdpp-auth.test-utils.js"
+    },
     "./schemas": {
       "types": "./dist/schemas/server-config.d.ts",
       "import": "./dist/schemas/server-config.js"
@@ -59,6 +75,10 @@
     "./storage/index": {
       "types": "./dist/storage/index/index.d.ts",
       "import": "./dist/storage/index/index.js"
+    },
+    "./storage/pdpp-records": {
+      "types": "./dist/storage/pdpp-records/index.d.ts",
+      "import": "./dist/storage/pdpp-records/index.js"
     },
     "./storage/blocks": {
       "types": "./dist/storage/blocks/index.d.ts",
@@ -75,6 +95,10 @@
     "./grants": {
       "types": "./dist/grants/index.d.ts",
       "import": "./dist/grants/index.js"
+    },
+    "./pdpp": {
+      "types": "./dist/pdpp/index.d.ts",
+      "import": "./dist/pdpp/index.js"
     },
     "./policy": {
       "types": "./dist/policy/index.d.ts",

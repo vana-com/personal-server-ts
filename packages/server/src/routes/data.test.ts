@@ -1097,6 +1097,124 @@ describe("GET /v1/data/:scope", () => {
     expect(readFulfillmentReporter.report).not.toHaveBeenCalled();
   });
 
+  // A dangling index row — the row survived, the file behind it did not.
+  // Batch 17 spent most of a diagnosis on this because it answered a bare
+  // INTERNAL_ERROR 500 and logged nothing anywhere.
+  async function orphanTheBackingFile(scope: string) {
+    const entry = indexManager.findLatestByScope(scope);
+    expect(entry).toBeDefined();
+    await rm(buildDataFilePath(dataDir, scope, entry!.collectedAt), {
+      force: true,
+    });
+    return entry!;
+  }
+
+  it("returns 404 DATA_FILE_MISSING when the indexed file is gone", async () => {
+    const app = createApp();
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+    await orphanTheBackingFile("instagram.profile");
+
+    const res = await getWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(404);
+    const json = await res.json();
+    expect(json.error).toBe("DATA_FILE_MISSING");
+  });
+
+  it("logs the missing-file read with route and request id", async () => {
+    const records: Record<string, unknown>[] = [];
+    const app = createApp({
+      logger: {
+        ...logger,
+        error: ((obj: Record<string, unknown>) => {
+          records.push(obj);
+        }) as never,
+      } as never,
+    });
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+    await orphanTheBackingFile("instagram.profile");
+
+    let finishBodyRead!: () => void;
+    let bodyReadStarted!: () => void;
+    const bodyReadGate = new Promise<void>((resolve) => {
+      finishBodyRead = resolve;
+    });
+    const bodyReadStartedPromise = new Promise<void>((resolve) => {
+      bodyReadStarted = resolve;
+    });
+    const clone = Response.prototype.clone;
+    const cloneSpy = vi
+      .spyOn(Response.prototype, "clone")
+      .mockImplementation(function (this: Response) {
+        const cloned = clone.call(this);
+        if (this.status !== 404) return cloned;
+        return {
+          json: async () => {
+            bodyReadStarted();
+            await bodyReadGate;
+            return cloned.json();
+          },
+        } as Response;
+      });
+
+    try {
+      let requestSettled = false;
+      const responsePromise = getWithAuth(app, "instagram.profile").then(
+        (response) => {
+          requestSettled = true;
+          return response;
+        },
+      );
+      await bodyReadStartedPromise;
+      expect(requestSettled).toBe(false);
+
+      finishBodyRead();
+      await responsePromise;
+
+      const logged = records.find((r) => r.errorCode === "DATA_FILE_MISSING");
+      expect(logged).toMatchObject({
+        route: "GET /v1/data/:scope",
+        scope: "instagram.profile",
+        errorCode: "DATA_FILE_MISSING",
+        requestId: expect.any(String),
+      });
+    } finally {
+      finishBodyRead();
+      cloneSpy.mockRestore();
+    }
+  });
+
+  it("logs unexpected 500s on the data route with route and request id", async () => {
+    const records: Record<string, unknown>[] = [];
+    const app = createApp({
+      logger: {
+        ...logger,
+        error: ((obj: Record<string, unknown>) => {
+          records.push(obj);
+        }) as never,
+      } as never,
+      // A storage fault that is not a missing file: the read must still
+      // answer 500, but it must no longer do so silently.
+      dataStorage: {
+        findEntry: () => {
+          throw new Error("index exploded");
+        },
+      } as never,
+    });
+
+    const res = await getWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(500);
+    const logged = records.find((r) => r.errorCode === "INTERNAL_ERROR");
+    expect(logged).toMatchObject({
+      route: "GET /v1/data/:scope",
+      errorCode: "INTERNAL_ERROR",
+      requestId: expect.any(String),
+    });
+    // Structured, and the message must survive for diagnosis.
+    expect(JSON.stringify(logged)).toContain("index exploded");
+  });
+
   it("returns 401 MISSING_AUTH without authorization header", async () => {
     const app = createApp();
 
