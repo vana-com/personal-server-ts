@@ -355,6 +355,7 @@ function existingActiveGrantsForClient(
   subjectId: string,
   clientId: string,
   now: Date,
+  instanceIds?: string[],
 ): ExistingGrant[] {
   return store
     .listGrantsForSubject(subjectId)
@@ -363,6 +364,15 @@ function existingActiveGrantsForClient(
       (stored) =>
         store.grantStatus(stored, now) === "active" &&
         !(stored.grant.access_mode === "single_use" && stored.consumedAt),
+    )
+    .filter((stored) =>
+      instanceIds
+        ? stored.grant.streams.every((stream) =>
+            stream.instance_ids.every((instanceId) =>
+              instanceIds.includes(instanceId),
+            ),
+          )
+        : true,
     )
     .map((stored) => ({
       grant_id: stored.grant.grant_id,
@@ -410,6 +420,11 @@ export function fetchReview(input: {
    * shared. Approval itself is unaffected either way.
    */
   store?: PdppAuthStore;
+  /**
+   * Optional owner-token instance scope for `existing_grants`. When present,
+   * only grants wholly contained by this scope are included in the review.
+   */
+  existingGrantInstanceIds?: string[];
   now?: Date;
 }):
   | { ok: true; result: ReviewFetchResult }
@@ -513,6 +528,7 @@ export function fetchReview(input: {
           session.subject_id,
           session.requester.client_id,
           now,
+          input.existingGrantInstanceIds,
         )
       : undefined,
   });

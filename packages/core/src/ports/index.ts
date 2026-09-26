@@ -134,6 +134,19 @@ export interface DataStoragePort extends RuntimeStoragePort {
     collectedAt: string,
   ): boolean | Promise<boolean>;
   writeEnvelope(envelope: DataFileEnvelope): Promise<WriteResult>;
+  /** Atomic local legacy write, including a version compare when requested. */
+  commitEnvelope?(
+    envelope: DataFileEnvelope,
+    entry: Omit<NewIndexEntry, "path" | "sizeBytes"> & { sizeBytes?: number },
+    precondition?: { kind: "none" } | { kind: "match"; version: number },
+  ): Promise<
+    | { ok: true; writeResult: WriteResult }
+    | {
+        ok: false;
+        currentVersion: number | null;
+        currentProducer: string | null;
+      }
+  >;
   writeBlockManifest?(
     scope: string,
     collectedAt: string,

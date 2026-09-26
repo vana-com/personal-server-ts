@@ -46,9 +46,11 @@ import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { computeS256Challenge } from "@opendatalabs/personal-server-ts-core/pdpp";
+import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { createServer, type ServerContext } from "./bootstrap.js";
 import { listenHttpServer, type NodeServer } from "./listen.js";
 import { initializeDatabase } from "./storage/index-schema.js";
+import { singleInstanceInventory } from "./pdpp/deployment.js";
 import {
   bearerTokenAuthorizationStrategy,
   PdppContextClient,
@@ -149,9 +151,17 @@ afterEach(async () => {
 });
 
 async function ownerToken(): Promise<string> {
+  const subject = (await recoverServerOwner(KNOWN_SIG)).toLowerCase();
+  const instanceId = singleInstanceInventory(subject, SOURCE_ID).eligibleFor(
+    "",
+  )[0];
   const res = await fetch(`${baseUrl}/pdpp/v1/owner/token`, {
     method: "POST",
-    headers: { authorization: `Bearer ${ctx!.devToken}` },
+    headers: {
+      authorization: `Bearer ${ctx!.devToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ source_id: SOURCE_ID, instance_id: instanceId }),
   });
   expect(res.status).toBe(200);
   return ((await res.json()) as { access_token: string }).access_token;

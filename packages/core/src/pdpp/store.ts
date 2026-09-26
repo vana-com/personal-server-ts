@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS pdpp_access_tokens (
   subject_id TEXT NOT NULL,
   client_id TEXT,
   token_kind TEXT NOT NULL CHECK (token_kind IN ('owner','client')),
+  owner_instance_ids_json TEXT,
   family_id TEXT,
   issued_at TEXT NOT NULL,
   expires_at TEXT,
@@ -167,6 +168,7 @@ export interface AccessTokenRecord {
   subjectId: string;
   clientId: string | null;
   tokenKind: PdppTokenKind;
+  ownerInstanceIds: string[] | null;
   familyId: string | null;
   issuedAt: string;
   expiresAt: string | null;
@@ -222,6 +224,19 @@ export function openPdppAuthStore(dbPath: string): PdppAuthStore {
     .all() as { name: string }[];
   if (!declarationColumns.some((column) => column.name === "document")) {
     db.exec("ALTER TABLE pdpp_declarations ADD COLUMN document TEXT");
+  }
+
+  const accessTokenColumns = db
+    .prepare("PRAGMA table_info(pdpp_access_tokens)")
+    .all() as { name: string }[];
+  if (
+    !accessTokenColumns.some(
+      (column) => column.name === "owner_instance_ids_json",
+    )
+  ) {
+    db.exec(
+      "ALTER TABLE pdpp_access_tokens ADD COLUMN owner_instance_ids_json TEXT",
+    );
   }
 
   const meta = db
@@ -548,6 +563,7 @@ export class PdppAuthStore {
     subjectId: string;
     clientId: string | null;
     tokenKind: PdppTokenKind;
+    ownerInstanceIds?: string[] | null;
     familyId?: string | null;
     expiresAt: string | null;
     /** Enforce single-use consumption as part of this issuance. */
@@ -574,8 +590,8 @@ export class PdppAuthStore {
         .prepare(
           `INSERT INTO pdpp_access_tokens
              (token_hash, grant_id, subject_id, client_id, token_kind,
-              family_id, issued_at, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+              owner_instance_ids_json, family_id, issued_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           hashToken(input.token),
@@ -583,6 +599,9 @@ export class PdppAuthStore {
           input.subjectId,
           input.clientId,
           input.tokenKind,
+          input.ownerInstanceIds
+            ? JSON.stringify(input.ownerInstanceIds)
+            : null,
           input.familyId ?? null,
           at,
           input.expiresAt,
@@ -602,6 +621,7 @@ export class PdppAuthStore {
           subject_id: string;
           client_id: string | null;
           token_kind: PdppTokenKind;
+          owner_instance_ids_json: string | null;
           family_id: string | null;
           issued_at: string;
           expires_at: string | null;
@@ -615,6 +635,9 @@ export class PdppAuthStore {
       subjectId: row.subject_id,
       clientId: row.client_id,
       tokenKind: row.token_kind,
+      ownerInstanceIds: row.owner_instance_ids_json
+        ? (JSON.parse(row.owner_instance_ids_json) as string[])
+        : null,
       familyId: row.family_id,
       issuedAt: row.issued_at,
       expiresAt: row.expires_at,

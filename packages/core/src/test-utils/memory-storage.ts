@@ -1,6 +1,6 @@
 /**
  * In-memory DataStoragePort for unit tests: envelopes in a Map, index rows
- * in an array, versions assigned max+1 per scope like the real index.
+ * in an array, CAS revisions assigned max+1 per scope like the real index.
  */
 
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
@@ -25,7 +25,8 @@ export function createMemoryDataStorage(): MemoryDataStorage {
       .filter((entry) => entry.scope === scope)
       .sort(
         (a, b) =>
-          b.collectedAt.localeCompare(a.collectedAt) || b.version - a.version,
+          (b.casRevision ?? b.version) - (a.casRevision ?? a.version) ||
+          b.collectedAt.localeCompare(a.collectedAt),
       );
   const remove = (predicate: (entry: IndexEntry) => boolean) => {
     let removed = 0;
@@ -54,7 +55,11 @@ export function createMemoryDataStorage(): MemoryDataStorage {
           scope: entry.scope,
           latestCollectedAt:
             existing &&
-            existing.latestCollectedAt.localeCompare(entry.collectedAt) > 0
+            (entries.find(
+              (row) =>
+                row.scope === entry.scope &&
+                row.collectedAt === existing.latestCollectedAt,
+            )?.casRevision ?? 0) > (entry.casRevision ?? entry.version)
               ? existing.latestCollectedAt
               : entry.collectedAt,
           versionCount: (existing?.versionCount ?? 0) + 1,
@@ -106,18 +111,22 @@ export function createMemoryDataStorage(): MemoryDataStorage {
       };
     },
     insertEntry(entry) {
-      const version =
-        entry.version ??
-        forScope(entry.scope).reduce(
-          (max, row) => Math.max(max, row.version),
-          0,
-        ) + 1;
+      const casRevision =
+        entry.casRevision ??
+        entries
+          .filter((row) => row.scope === entry.scope)
+          .reduce(
+            (max, row) => Math.max(max, row.casRevision ?? row.version),
+            0,
+          ) + 1;
+      const version = entry.version ?? casRevision;
       const indexed: IndexEntry = {
         ...entry,
         id: nextId,
         schemaId: entry.schemaId ?? null,
         createdAt: new Date(0).toISOString(),
         version,
+        casRevision,
         dataPointId: entry.dataPointId ?? null,
       };
       nextId += 1;

@@ -17,6 +17,7 @@ import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-c
 import type { GatewayClient, Builder } from "@opendatalabs/vana-sdk/node";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
+import { IngestPersistedError } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
   createTestWallet,
   buildWeb3SignedHeader,
@@ -393,9 +394,9 @@ describe("POST /v1/data/:scope with a write session", () => {
       writeSessionStore,
       dataStorage: {
         ...realStorage,
-        async writeEnvelope(envelope) {
+        async commitEnvelope(envelope, entry, precondition) {
           if (failures-- > 0) throw new Error("disk full");
-          return realStorage.writeEnvelope(envelope);
+          return realStorage.commitEnvelope!(envelope, entry, precondition);
         },
       },
     });
@@ -436,10 +437,10 @@ describe("POST /v1/data/:scope with a write session", () => {
     flakyIndex.close();
   });
 
-  it("keeps the proof consumed when the envelope persisted but indexing failed", async () => {
-    // Partial storage failure: the envelope reaches disk, the index insert
-    // throws. The record is persisted (a re-index surfaces it), so the same
-    // proof must NOT be accepted again.
+  it("keeps the proof consumed when storage reports a post-commit failure", async () => {
+    // Partial storage failure after the durable boundary: the real storage
+    // path has indexed/published the record, then reports an incomplete
+    // post-commit step. Retrying with the same proof would duplicate it.
     const partialIndex = createIndexManager(initializeDatabase(":memory:"));
     const realStorage = createNodeDataStorage({
       indexManager: partialIndex,
@@ -457,9 +458,19 @@ describe("POST /v1/data/:scope with a write session", () => {
       writeSessionStore,
       dataStorage: {
         ...realStorage,
-        async insertEntry(entry) {
-          if (indexFailures-- > 0) throw new Error("index locked");
-          return realStorage.insertEntry(entry);
+        async commitEnvelope(envelope, entry, precondition) {
+          const result = await realStorage.commitEnvelope!(
+            envelope,
+            entry,
+            precondition,
+          );
+          if (indexFailures-- > 0 && result.ok) {
+            throw new IngestPersistedError(
+              result.writeResult.relativePath,
+              new Error("post-commit failure"),
+            );
+          }
+          return result;
         },
       },
     });
@@ -490,8 +501,10 @@ describe("POST /v1/data/:scope with a write session", () => {
     expect((await retry.json()).error.errorCode).toBe(
       "WRITE_ATTRIBUTION_REPLAY",
     );
-    // Only the orphaned (unindexed) envelope exists: nothing was indexed.
-    expect(partialIndex.findLatestByScope(SCOPE)).toBeUndefined();
+    expect(partialIndex.findLatestByScope(SCOPE)).toMatchObject({
+      scope: SCOPE,
+      casRevision: 1,
+    });
     partialIndex.close();
   });
 

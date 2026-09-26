@@ -186,11 +186,17 @@ afterEach(() => {
  * digest must match the review it was rendered from.
  */
 async function authorize(): Promise<{ accessToken: string; grant: Grant }> {
-  const ownerToken = tokens.issueOwnerToken({ subjectId: OWNER }).access_token;
+  const ownerToken = tokens.issueOwnerToken({
+    subjectId: OWNER,
+    instanceIds: [INSTANCE],
+  }).access_token;
 
   const created = await as.request("/pdpp/v1/authorize", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${ownerToken}`,
+    },
     body: JSON.stringify({
       client_id: "budget_example",
       redirect_uri: REDIRECT,
@@ -307,6 +313,7 @@ function rs(): Hono {
         active: true as const,
         tokenKind: context.tokenKind ?? "client",
         subjectId: context.subjectId ?? "",
+        instanceIds: context.instanceIds,
         grant: context.grant as Grant | undefined,
         clientId: context.clientId,
         expiresAt: context.expiresAt,

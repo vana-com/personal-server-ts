@@ -27,6 +27,7 @@ import { computeS256Challenge } from "@opendatalabs/personal-server-ts-core/pdpp
 import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { createServer, type ServerContext } from "../bootstrap.js";
 import { initializeDatabase } from "../storage/index-schema.js";
+import { singleInstanceInventory } from "./deployment.js";
 
 /**
  * The signature the existing bootstrap suite uses; `recoverServerOwner`
@@ -54,6 +55,16 @@ const DECLARATION = JSON.stringify({
     },
   ],
 });
+
+async function ownerTokenRequestBody(sourceId = SOURCE_ID) {
+  return {
+    source_id: sourceId,
+    instance_id: singleInstanceInventory(
+      (await recoverServerOwner(KNOWN_SIG)).toLowerCase(),
+      sourceId,
+    ).eligibleFor("")[0],
+  };
+}
 
 let tempDir: string;
 let ctx: ServerContext | undefined;
@@ -156,6 +167,11 @@ describe("mounting is conditional on the deployment being able to serve PDPP", (
     ctx = await boot(pdppConfig([await writeDeclaration()]));
     const response = await ctx.app.request("/pdpp/v1/owner/token", {
       method: "POST",
+      headers: {
+        authorization: `Bearer ${ctx.devToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(await ownerTokenRequestBody()),
     });
     expect(response.status).not.toBe(404);
   });
@@ -213,7 +229,11 @@ describe("the real OAuth grant flow on a bootstrapped server", () => {
   async function ownerToken(context: ServerContext): Promise<string> {
     const response = await context.app.request("/pdpp/v1/owner/token", {
       method: "POST",
-      headers: { authorization: `Bearer ${context.devToken}` },
+      headers: {
+        authorization: `Bearer ${context.devToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(await ownerTokenRequestBody()),
     });
     expect(response.status).toBe(200);
     const body = (await response.json()) as { access_token: string };
@@ -604,7 +624,11 @@ describe("redirect_uri is validated on the bootstrapped server", () => {
     const minted = (await (
       await ctx!.app.request("/pdpp/v1/owner/token", {
         method: "POST",
-        headers: { authorization: `Bearer ${ctx!.devToken}` },
+        headers: {
+          authorization: `Bearer ${ctx!.devToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(await ownerTokenRequestBody()),
       })
     ).json()) as { access_token: string };
     return ctx!.app.request("/pdpp/v1/authorize", {
@@ -704,7 +728,11 @@ describe("review C5 — /authorize binds an authenticated owner", () => {
     const minted = (await (
       await ctx!.app.request("/pdpp/v1/owner/token", {
         method: "POST",
-        headers: { authorization: `Bearer ${ctx!.devToken}` },
+        headers: {
+          authorization: `Bearer ${ctx!.devToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(await ownerTokenRequestBody()),
       })
     ).json()) as { access_token: string };
 
@@ -743,8 +771,10 @@ describe("review C1 — PDPP-Version is the spec's HTTP contract version", () =>
       method: "POST",
       headers: {
         authorization: `Bearer ${ctx!.devToken}`,
+        "content-type": "application/json",
         "pdpp-version": "2026-04-06",
       },
+      body: JSON.stringify(await ownerTokenRequestBody()),
     });
     expect(response.status).toBe(200);
     expect(response.headers.get("pdpp-version")).toBe("2026-04-06");
@@ -755,8 +785,10 @@ describe("review C1 — PDPP-Version is the spec's HTTP contract version", () =>
       method: "POST",
       headers: {
         authorization: `Bearer ${ctx!.devToken}`,
+        "content-type": "application/json",
         "pdpp-version": "0.1.0",
       },
+      body: JSON.stringify(await ownerTokenRequestBody()),
     });
     expect(response.status).toBe(400);
     expect((await response.json()).error).toBe("unsupported_version");
@@ -810,7 +842,15 @@ describe("the real boot path mounts the AS for a normative declaration", () => {
 
     const response = await ctx.app.request("/pdpp/v1/owner/token", {
       method: "POST",
-      headers: { authorization: `Bearer ${ctx.devToken}` },
+      headers: {
+        authorization: `Bearer ${ctx.devToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(
+        await ownerTokenRequestBody(
+          "https://registry.pdpp.dev/connectors/instagram",
+        ),
+      ),
     });
 
     // Previously 404: nothing was retained, so the AS never mounted.
@@ -823,7 +863,15 @@ describe("the real boot path mounts the AS for a normative declaration", () => {
 
     const minted = await ctx.app.request("/pdpp/v1/owner/token", {
       method: "POST",
-      headers: { authorization: `Bearer ${ctx.devToken}` },
+      headers: {
+        authorization: `Bearer ${ctx.devToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(
+        await ownerTokenRequestBody(
+          "https://registry.pdpp.dev/connectors/instagram",
+        ),
+      ),
     });
     expect(minted.status).toBe(200);
     const { access_token } = (await minted.json()) as { access_token: string };
@@ -915,7 +963,11 @@ describe("operator per-client grant lifetime policy", () => {
   async function ownerToken(context: ServerContext): Promise<string> {
     const response = await context.app.request("/pdpp/v1/owner/token", {
       method: "POST",
-      headers: { authorization: `Bearer ${context.devToken}` },
+      headers: {
+        authorization: `Bearer ${context.devToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(await ownerTokenRequestBody()),
     });
     expect(response.status).toBe(200);
     const body = (await response.json()) as { access_token: string };

@@ -13,6 +13,7 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
   CursorExpiredError,
+  decodeCursor,
   encodeCursor,
   InvalidCursorError,
   InvalidCursorSyntaxError,
@@ -33,6 +34,21 @@ import { createRecordDataValidator } from "../pdpp/record-schema.js";
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
 export const MAX_BLOB_UPLOAD_BYTES = 32 * 1024 * 1024;
+
+function rebindListCursor(
+  template: string,
+  order: "asc" | "desc",
+  last: PdppRecordRow,
+): string {
+  const bound = decodeCursor(template);
+  if (bound.kind !== "list") throw new InvalidCursorError();
+  return encodeCursor({
+    ...bound,
+    order,
+    sortValue: last.emittedAt,
+    recordKey: last.recordKey,
+  });
+}
 /**
  * Desktop caps one connector run's captured records at 32 MiB, and it sends
  * one record per ingest request. JSON escaping can grow a record's encoded
@@ -141,14 +157,7 @@ export interface PdppRecordsRouteDeps {
   declarations: StreamDeclarationRegistry;
   /** The exact owner of this Personal Server; required for ingest. */
   ownerSubjectId?: string;
-  /**
-   * Resolves every instance_id owned by a subject, for owner-token
-   * current-capability reads (which carry no grant, so the effective
-   * instance scope is "everything this subject owns"). A minimal seam —
-   * the real ownership registry is out of this lane's scope (it likely
-   * lives with source-declaration/connection bookkeeping) so this defaults
-   * to "the store already only contains one owner's data" when omitted.
-   */
+  /** Current ownership used to narrow the instance stored in an owner token. */
   instancesForSubject?: (subjectId: string) => string[];
   /**
    * Owner access feed. PDPP reads must appear in the SAME feed as legacy
@@ -702,10 +711,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
    * The declaration a read of `stream` is measured against.
    *
    * A client reads under its grant, which names one source. An owner reads
-   * every owned instance whose source declares the stream; `ownerInstanceIds`
-   * is that set, so an owner read of a shared name never reaches an instance
-   * of a source that does not declare it. For an owner read the declaration
-   * only answers "does this stream exist"; records carry their own shape.
+   * only the token's currently owned instance whose source declares the
+   * stream. The declaration only answers whether that stream exists;
+   * records carry their own shape.
    */
   function readDeclaration(
     context: PdppTokenContext,
@@ -720,7 +728,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         ownerInstanceIds: [],
       };
     }
-    const owned = deps.instancesForSubject?.(requireSubjectId(context)) ?? [];
+    const owned = ownerInstances(context);
     const ownerInstanceIds = owned.filter((instance) =>
       deps.declarations.forInstance(instance, stream),
     );
@@ -729,6 +737,14 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         ? deps.declarations.forInstance(ownerInstanceIds[0], stream)
         : deps.declarations.get(stream);
     return { declaration, ownerInstanceIds };
+  }
+
+  function ownerInstances(context: PdppTokenContext): string[] {
+    if (context.tokenKind !== "owner") return [];
+    const current = deps.instancesForSubject?.(requireSubjectId(context));
+    if (!current) return [];
+    if (!context.instanceIds) return [];
+    return context.instanceIds.filter((instance) => current.includes(instance));
   }
 
   app.get("/streams", async (c) => {
@@ -756,8 +772,24 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
 
     const instanceIds =
       context.tokenKind === "owner"
-        ? (deps.instancesForSubject?.(requireSubjectId(context)) ?? [])
+        ? ownerInstances(context)
         : (context.grant?.streams.flatMap((s) => s.instance_ids) ?? []);
+
+    if (context.tokenKind === "owner" && instanceIds.length === 0) {
+      return sendError(
+        c,
+        mapAndLog(
+          deps,
+          "GET /v1/streams",
+          reqId,
+          new PdppError(
+            "grant_stream_not_allowed",
+            "Owner token is not scoped to a currently owned instance",
+          ),
+        ),
+        reqId,
+      );
+    }
 
     const streams = deps.store.listStreams(instanceIds);
 
@@ -836,24 +868,18 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     try {
       rejectUnknownParams(c, "streamMetadata");
       const stream = c.req.param("stream");
-      const declaration =
-        context!.tokenKind === "client"
-          ? deps.declarations.get(stream, context!.grant?.source.id)
-          : deps.declarations.get(stream);
-      if (
-        !declaration &&
-        context!.tokenKind === "owner" &&
-        deps.declarations.declares(stream)
-      ) {
-        // An owner token spans every owned instance, and more than one
-        // source declares this name with its own key and schema. There is
-        // no single honest answer until owner reads can name an instance.
+      const { declaration, ownerInstanceIds } = readDeclaration(
+        context!,
+        stream,
+      );
+      const scope = resolveReadScope(context!, stream, declaration);
+
+      if (context!.tokenKind === "owner" && ownerInstanceIds.length === 0) {
         throw new PdppError(
-          "invalid_request",
-          `Stream '${stream}' is declared by more than one source`,
+          "grant_stream_not_allowed",
+          "Owner token is not scoped to a currently owned instance",
         );
       }
-      const scope = resolveReadScope(context!, stream, declaration);
 
       if (context!.tokenKind === "owner") {
         return c.json(
@@ -924,6 +950,12 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const scope = resolveReadScope(context!, stream, declaration);
       const effectiveInstanceIds =
         context!.tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds;
+      if (context!.tokenKind === "owner" && effectiveInstanceIds.length === 0) {
+        throw new PdppError(
+          "grant_stream_not_allowed",
+          "Owner token is not scoped to a currently owned instance",
+        );
+      }
 
       const { limit, clamped } = parseLimit(c.req.query("limit"));
       const order = parseOrder(c.req.query("order"));
@@ -1018,15 +1050,18 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const visible: PdppRecordRow[] = [];
       let pageCursor = cursor;
       let storeHasMore = false;
-      let horizon: string | undefined;
+      let cursorTemplate: string | undefined;
       do {
+        const requestCursor = pageCursor;
         const page = deps.store.listRecords(stream, {
           instanceIds: effectiveInstanceIds,
-          // One extra, so a page that is entirely filtered out still makes
-          // progress rather than stalling on the same cursor.
-          limit: limit + 1,
+          // Fetch at most one client page from the store at a time. The route
+          // may need several store pages to collect enough grant-visible rows,
+          // but keeping this page size at the client limit means the store
+          // usually gives us a bound cursor exactly at the visible boundary.
+          limit,
           order,
-          cursor: pageCursor,
+          cursor: requestCursor,
         });
         for (const row of page.data) {
           if (
@@ -1037,8 +1072,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           }
           if (visible.length > limit) break;
         }
-        horizon ??= page.horizon;
         pageCursor = page.nextCursor ?? undefined;
+        cursorTemplate = pageCursor ?? requestCursor;
         storeHasMore = page.hasMore;
       } while (visible.length <= limit && storeHasMore && pageCursor);
 
@@ -1047,6 +1082,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const moreVisible = visible.length > limit;
       const data = moreVisible ? visible.slice(0, limit) : visible;
       const last = data[data.length - 1];
+      if (moreVisible && last && !cursorTemplate) {
+        throw new Error(
+          "Filtered list has more rows but no bound store cursor",
+        );
+      }
       const meta = clamped
         ? {
             warnings: [
@@ -1059,18 +1099,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           object: "list",
           has_more: moreVisible,
           ...(moreVisible &&
-            last && {
-              next_cursor: encodeCursor({
-                kind: "list",
-                order,
-                // Must match the store's own sort key exactly or the cursor
-                // resumes at the wrong position. Both backends sort by
-                // (emitted_at, record_key).
-                sortValue: last.emittedAt,
-                recordKey: last.recordKey,
-                // Carry the store's reset fence (P10c) to the next page.
-                ...(horizon !== undefined && { horizon }),
-              }),
+            last &&
+            cursorTemplate && {
+              next_cursor: rebindListCursor(cursorTemplate, order, last),
             }),
           data: data.map((row) => toRecordJson(stream, row, fields)),
           ...(meta && { meta }),
@@ -1213,8 +1244,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         throw new PdppError("not_found", "Stream not found");
       }
 
-      const effectiveInstanceIds =
-        deps.instancesForSubject?.(requireSubjectId(context!)) ?? [];
+      const effectiveInstanceIds = ownerInstances(context!);
       let deletedAny = false;
       for (const instance of effectiveInstanceIds) {
         const declaration = deps.declarations.forInstance(instance, stream);
@@ -1295,8 +1325,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const results: IngestOutcome[] = new Array(entries.length);
       const admitted: { index: number; envelope: PdppRecordEnvelopeInput }[] =
         [];
-      const ownedInstances =
-        deps.instancesForSubject?.(context!.subjectId) ?? [];
+      const ownedInstances = ownerInstances(context!);
       entries.forEach((entry, index) => {
         if (
           entry === null ||
@@ -1450,8 +1479,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             "Replace body must be {instance, emitted_at, records[]}",
           );
         }
-        const ownedInstances =
-          deps.instancesForSubject?.(context!.subjectId) ?? [];
+        const ownedInstances = ownerInstances(context!);
         if (!ownedInstances.includes(instance)) {
           throw new PdppError(
             "authentication_error",
@@ -1576,7 +1604,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         !deps.ownerSubjectId ||
         context!.subjectId.toLowerCase() !==
           deps.ownerSubjectId.toLowerCase() ||
-        !deps.instancesForSubject?.(context!.subjectId).length
+        ownerInstances(context!).length === 0
       ) {
         throw new PdppError(
           "authentication_error",
@@ -1591,8 +1619,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         rawGeneration === undefined ? NaN : Number(rawGeneration);
       if (
         deps.bindingStore &&
-        (!instance ||
-          !deps.instancesForSubject?.(context!.subjectId).includes(instance))
+        (!instance || !ownerInstances(context!).includes(instance))
       ) {
         throw new PdppError(
           "authentication_error",

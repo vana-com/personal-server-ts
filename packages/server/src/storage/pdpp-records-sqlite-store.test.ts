@@ -752,6 +752,19 @@ describe("sqlite record store", () => {
       expect(version.version).toBeGreaterThan(0);
     });
 
+    it("persists the store epoch across reopen", () => {
+      const first = db
+        .prepare("SELECT epoch FROM pdpp_store_metadata WHERE id = 1")
+        .get() as { epoch: string };
+      expect(first.epoch).toBeTruthy();
+
+      createSqliteRecordStore(db);
+      const second = db
+        .prepare("SELECT epoch FROM pdpp_store_metadata WHERE id = 1")
+        .get() as { epoch: string };
+      expect(second.epoch).toBe(first.epoch);
+    });
+
     it("refuses to open a database with a newer schema version than this build supports", () => {
       db.prepare(
         "UPDATE pdpp_schema_version SET version = 9999 WHERE id = 1",
@@ -925,6 +938,39 @@ describe("sqlite record store", () => {
       expect(page2.data.map((r) => r.recordKey)).toEqual(["c2", "c3"]);
     });
 
+    it("rejects a minted list cursor reused against a different stream", () => {
+      seedA();
+      store.ingestBatch(
+        [
+          {
+            instance: "inst_a",
+            stream: "playlists",
+            key: "pl_1",
+            data: { id: "pl_1" },
+            emitted_at: "2026-04-03T00:00:00.000Z",
+          },
+        ],
+        playlistsSemantics,
+        playlistsPk,
+        A,
+      );
+      const page1 = store.listRecords("messages", {
+        instanceIds: ["inst_a"],
+        limit: 1,
+        order: "asc",
+      });
+      expect(page1.nextCursor).toBeDefined();
+
+      expect(() =>
+        store.listRecords("playlists", {
+          instanceIds: ["inst_a"],
+          limit: 1,
+          order: "asc",
+          cursor: page1.nextCursor,
+        }),
+      ).toThrow(CursorExpiredError);
+    });
+
     it("expires a pre-reset changes_since page cursor", () => {
       seedA();
       const page1 = store.changesSince("messages", {
@@ -942,7 +988,75 @@ describe("sqlite record store", () => {
       ).toThrow(CursorExpiredError);
     });
 
-    it("expires a legacy list cursor without a horizon only if a read instance was reset", () => {
+    it("expires a changes_since token from an earlier reset epoch", () => {
+      seedA();
+      const session1 = store.changesSince("messages", {
+        instanceIds: ["inst_a"],
+        limit: 10,
+      });
+      expect(session1.nextChangesSince).toBeDefined();
+      resetToB();
+
+      expect(() =>
+        store.changesSince("messages", {
+          instanceIds: ["inst_a"],
+          limit: 10,
+          changesSince: session1.nextChangesSince,
+        }),
+      ).toThrow(CursorExpiredError);
+    });
+
+    it("rejects a changes_since token reused against a different stream", () => {
+      seedA();
+      const session1 = store.changesSince("messages", {
+        instanceIds: ["inst_a"],
+        limit: 10,
+      });
+      expect(session1.nextChangesSince).toBeDefined();
+
+      expect(() =>
+        store.changesSince("playlists", {
+          instanceIds: ["inst_a"],
+          limit: 10,
+          changesSince: session1.nextChangesSince,
+        }),
+      ).toThrow(CursorExpiredError);
+    });
+
+    it("expires legacy list and changes_since tokens without store binding", () => {
+      seedA();
+      const legacyList = encodeCursor({
+        kind: "list",
+        order: "asc",
+        sortValue: "2026-04-01T00:00:00.000Z",
+        recordKey: "a1",
+        horizon: "0",
+      });
+      expect(() =>
+        store.listRecords("messages", {
+          instanceIds: ["inst_a"],
+          limit: 5,
+          order: "asc",
+          cursor: legacyList,
+        }),
+      ).toThrow(CursorExpiredError);
+
+      const legacyChanges = encodeCursor({
+        kind: "changes_since",
+        horizon: "0",
+        sinceHorizon: null,
+        offset: 0,
+      });
+      expect(() =>
+        store.changesSince("messages", {
+          instanceIds: ["inst_a"],
+          limit: 10,
+          changesSince: legacyChanges,
+        }),
+      ).toThrow(CursorExpiredError);
+    });
+
+    it("expires a legacy list cursor without a horizon", () => {
       seedA();
       const legacy = encodeCursor({
         kind: "list",
@@ -950,14 +1064,6 @@ describe("sqlite record store", () => {
         sortValue: "2026-04-01T00:00:00.000Z",
         recordKey: "a1",
       });
-      const before = store.listRecords("messages", {
-        instanceIds: ["inst_a"],
-        limit: 5,
-        order: "asc",
-        cursor: legacy,
-      });
-      expect(before.data.map((r) => r.recordKey)).toEqual(["a2"]);
-      resetToB();
       expect(() =>
         store.listRecords("messages", {
           instanceIds: ["inst_a"],

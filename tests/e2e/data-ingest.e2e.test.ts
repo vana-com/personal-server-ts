@@ -56,7 +56,9 @@ describe("Data ingest endpoint (e2e)", () => {
 
     expect(body).toHaveProperty("collectedAt");
     expect(typeof body.collectedAt).toBe("string");
-    expect(body.collectedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+    expect(body.collectedAt).toMatch(
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/,
+    );
     const date = new Date(body.collectedAt);
     expect(date.getTime()).toBeGreaterThan(0);
   });

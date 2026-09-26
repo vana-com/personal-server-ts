@@ -43,7 +43,12 @@ const declarations = createStreamDeclarationRegistry([
 
 const ownerAuth: PdppAuthorizationService = {
   async resolveToken() {
-    return { active: true, tokenKind: "owner" as const, subjectId: "sub" };
+    return {
+      active: true,
+      tokenKind: "owner" as const,
+      subjectId: "sub",
+      instanceIds: ["i1"],
+    };
   },
 };
 

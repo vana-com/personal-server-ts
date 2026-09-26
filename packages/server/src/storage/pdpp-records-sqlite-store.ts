@@ -1,5 +1,6 @@
 import type { Database } from "better-sqlite3";
 import { createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
   encodeRecordKey,
   planIngest,
@@ -163,6 +164,15 @@ JOIN pdpp_instance_binding b ON b.instance = r.instance
 JOIN pdpp_blobs m ON m.blob_id = r.blob_id
 WHERE r.blob_id IS NOT NULL AND r.deleted = 0;
 `,
+  // v5: database epoch for opaque cursor binding. Tokens from a different
+  // records DB, a rebuilt records DB, or a pre-epoch implementation expire
+  // instead of being interpreted against this store.
+  `
+CREATE TABLE IF NOT EXISTS pdpp_store_metadata (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  epoch TEXT NOT NULL
+);
+`,
 ];
 
 function migrate(db: Database): void {
@@ -180,6 +190,11 @@ function migrate(db: Database): void {
   const applyFrom = db.transaction((fromVersion: number) => {
     for (let v = fromVersion; v < MIGRATIONS.length; v++) {
       db.exec(MIGRATIONS[v]);
+      if (v === 4) {
+        db.prepare(
+          "INSERT OR IGNORE INTO pdpp_store_metadata (id, epoch) VALUES (1, ?)",
+        ).run(randomUUID());
+      }
     }
     db.prepare("UPDATE pdpp_schema_version SET version = ? WHERE id = 1").run(
       MIGRATIONS.length,
@@ -596,15 +611,12 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       const results: IngestOutcome[] = [];
       const writes: {
         recordKey: string;
-        data: Record<string, unknown>;
+        data: Record<string, unknown> | null;
         emittedAt: string;
       }[] = [];
       input.envelopes.forEach((envelope, index) => {
         const reject = (reason: string) =>
           results.push({ index, outcome: "rejected", reason });
-        if (envelope.op === "delete") {
-          return reject("replace records must be upserts");
-        }
         let recordKey: string;
         try {
           recordKey = encodeRecordKey(envelope.key);
@@ -643,7 +655,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         results.push(plan.outcome);
         writes.push({
           recordKey,
-          data: plan.write.data!,
+          data: plan.write.data,
           emittedAt: envelope.emitted_at,
         });
       });
@@ -817,6 +829,26 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     }
   }
 
+  function cursorEpoch(): string {
+    const row = db
+      .prepare("SELECT epoch FROM pdpp_store_metadata WHERE id = 1")
+      .get() as { epoch: string } | undefined;
+    if (!row) throw new CursorExpiredError();
+    return row.epoch;
+  }
+
+  function assertCursorScope(
+    payload: { stream?: string; epoch?: string },
+    stream: string,
+  ): void {
+    if (payload.stream !== stream) {
+      throw new CursorExpiredError();
+    }
+    if (payload.epoch !== cursorEpoch()) {
+      throw new CursorExpiredError();
+    }
+  }
+
   function listRecords(
     stream: string,
     options: ListRecordsOptions,
@@ -826,6 +858,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     if (options.cursor) {
       const payload = decodeCursor(options.cursor);
       if (payload.kind !== "list") throw new InvalidCursorError();
+      assertCursorScope(payload, stream);
       if (payload.order !== options.order) throw new InvalidCursorError();
       const cursorHorizon =
         payload.horizon === undefined ? null : parseHorizon(payload.horizon);
@@ -869,6 +902,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         hasMore && last
           ? encodeCursor({
               kind: "list",
+              stream,
+              epoch: cursorEpoch(),
               order: options.order,
               sortValue: last.emitted_at,
               recordKey: last.record_key,
@@ -934,6 +969,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     if (options.cursor) {
       const payload = decodeCursor(options.cursor);
       if (payload.kind !== "changes_since") throw new InvalidCursorError();
+      assertCursorScope(payload, stream);
       horizon = parseHorizon(payload.horizon);
       sinceHorizon =
         payload.sinceHorizon !== null
@@ -950,6 +986,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         throw err;
       }
       if (payload.kind !== "changes_since") throw new InvalidCursorError();
+      assertCursorScope(payload, stream);
       sinceHorizon = parseHorizon(payload.horizon);
       horizon = (nextWriteSeq.get() as { value: number }).value;
     } else {
@@ -1071,6 +1108,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       nextCursor: hasMore
         ? encodeCursor({
             kind: "changes_since",
+            stream,
+            epoch: cursorEpoch(),
             horizon: String(horizon),
             sinceHorizon: sinceHorizon !== null ? String(sinceHorizon) : null,
             offset: offset + options.limit,
@@ -1080,6 +1119,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         ? undefined
         : encodeCursor({
             kind: "changes_since",
+            stream,
+            epoch: cursorEpoch(),
             horizon: String(horizon),
             sinceHorizon: null,
             offset: 0,

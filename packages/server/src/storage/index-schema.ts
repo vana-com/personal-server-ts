@@ -11,8 +11,18 @@ CREATE TABLE IF NOT EXISTS data_files (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
   size_bytes INTEGER NOT NULL DEFAULT 0,
   version INTEGER NOT NULL DEFAULT 1,
+  cas_revision INTEGER NOT NULL DEFAULT 1,
   data_point_id TEXT,
-  after_tombstone_version INTEGER
+  after_tombstone_version INTEGER,
+  producer TEXT,
+  producer_provenance TEXT
+)`;
+
+const CREATE_SCOPE_REVISIONS_SQL = `
+CREATE TABLE IF NOT EXISTS scope_revisions (
+  scope TEXT PRIMARY KEY,
+  cas_revision INTEGER NOT NULL,
+  closed_for_writes INTEGER NOT NULL DEFAULT 0
 )`;
 
 const CREATE_INDEXES_SQL = [
@@ -21,9 +31,10 @@ const CREATE_INDEXES_SQL = [
   "CREATE INDEX IF NOT EXISTS idx_data_files_file_id ON data_files (file_id)",
   "CREATE INDEX IF NOT EXISTS idx_data_files_schema_id ON data_files (schema_id)",
   "CREATE INDEX IF NOT EXISTS idx_data_files_data_point_id ON data_files (data_point_id)",
+  "CREATE INDEX IF NOT EXISTS idx_data_files_scope_cas_revision ON data_files (scope, cas_revision)",
 ];
 
-export const INDEX_SCHEMA_VERSION = 4;
+export const INDEX_SCHEMA_VERSION = 7;
 
 function hasColumn(
   db: Database.Database,
@@ -61,6 +72,35 @@ function migrateSchema(db: Database.Database, currentVersion: number): void {
       "ALTER TABLE data_files ADD COLUMN after_tombstone_version INTEGER",
     );
   }
+  if (currentVersion < 5) {
+    if (!hasColumn(db, "data_files", "producer")) {
+      db.exec("ALTER TABLE data_files ADD COLUMN producer TEXT");
+    }
+    if (!hasColumn(db, "data_files", "producer_provenance")) {
+      db.exec("ALTER TABLE data_files ADD COLUMN producer_provenance TEXT");
+    }
+  }
+  if (currentVersion < 6) {
+    if (!hasColumn(db, "data_files", "cas_revision")) {
+      db.exec(
+        "ALTER TABLE data_files ADD COLUMN cas_revision INTEGER NOT NULL DEFAULT 1",
+      );
+      db.exec("UPDATE data_files SET cas_revision = version");
+    }
+    db.exec(CREATE_SCOPE_REVISIONS_SQL);
+    db.exec(`
+      INSERT OR IGNORE INTO scope_revisions (scope, cas_revision)
+      SELECT scope, MAX(cas_revision) FROM data_files GROUP BY scope
+    `);
+  }
+  if (
+    currentVersion < 7 &&
+    !hasColumn(db, "scope_revisions", "closed_for_writes")
+  ) {
+    db.exec(
+      "ALTER TABLE scope_revisions ADD COLUMN closed_for_writes INTEGER NOT NULL DEFAULT 0",
+    );
+  }
 }
 
 function ensureSchemaVersion(db: Database.Database): void {
@@ -81,6 +121,7 @@ export function initializeDatabase(dbPath: string): Database.Database {
   db.pragma("journal_mode = WAL");
 
   db.exec(CREATE_TABLE_SQL);
+  db.exec(CREATE_SCOPE_REVISIONS_SQL);
   ensureSchemaVersion(db);
   for (const sql of CREATE_INDEXES_SQL) {
     db.exec(sql);

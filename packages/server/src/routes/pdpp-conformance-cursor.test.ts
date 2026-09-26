@@ -25,7 +25,6 @@ import { Hono } from "hono";
 import {
   createMemoryRecordStore,
   createStreamDeclarationRegistry,
-  encodeCursor,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { pdppRecordsRoutes } from "./pdpp-records.js";
@@ -69,7 +68,7 @@ const clientAuth: PdppAuthorizationService = {
   },
 };
 
-function app() {
+function fixture() {
   const store = createMemoryRecordStore();
   store.ingestBatch(
     [
@@ -79,6 +78,13 @@ function app() {
         key: "r1",
         data: { id: "r1", name: "n1" },
         emitted_at: "2026-05-01T00:00:00.000Z",
+      },
+      {
+        instance: INSTANCE,
+        stream: "s",
+        key: "r2",
+        data: { id: "r2", name: "n2" },
+        emitted_at: "2026-05-02T00:00:00.000Z",
       },
     ],
     () => "mutable_state",
@@ -95,7 +101,18 @@ function app() {
       instancesForSubject: () => [INSTANCE],
     }),
   );
-  return a;
+  return { app: a, store };
+}
+
+function mintedListCursor(order: "asc" | "desc") {
+  const context = fixture();
+  const page = context.store.listRecords("s", {
+    instanceIds: [INSTANCE],
+    limit: 1,
+    order,
+  });
+  expect(page.nextCursor).toBeDefined();
+  return { ...context, cursor: page.nextCursor! };
 }
 
 async function expectInvalidCursor(res: Response) {
@@ -108,14 +125,17 @@ async function expectInvalidCursor(res: Response) {
 
 describe("a malformed cursor is 400 invalid_cursor, never 500", () => {
   it("rejects a cursor that is not base64url at all", async () => {
-    const res = await app().request("/v1/streams/s/records?cursor=!!!nope!!!", {
-      headers: AUTH,
-    });
+    const res = await fixture().app.request(
+      "/v1/streams/s/records?cursor=!!!nope!!!",
+      {
+        headers: AUTH,
+      },
+    );
     await expectInvalidCursor(res);
   });
 
   it("rejects base64url that does not decode to JSON", async () => {
-    const res = await app().request(
+    const res = await fixture().app.request(
       "/v1/streams/s/records?cursor=bm90LWpzb24",
       {
         headers: AUTH,
@@ -130,14 +150,17 @@ describe("a malformed cursor is 400 invalid_cursor, never 500", () => {
       .replace(/\+/g, "-")
       .replace(/\//g, "_")
       .replace(/=+$/, "");
-    const res = await app().request(`/v1/streams/s/records?cursor=${cursor}`, {
-      headers: AUTH,
-    });
+    const res = await fixture().app.request(
+      `/v1/streams/s/records?cursor=${cursor}`,
+      {
+        headers: AUTH,
+      },
+    );
     await expectInvalidCursor(res);
   });
 
   it("rejects an empty cursor value", async () => {
-    const res = await app().request("/v1/streams/s/records?cursor=", {
+    const res = await fixture().app.request("/v1/streams/s/records?cursor=", {
       headers: AUTH,
     });
     // An empty cursor is absent, not malformed — it must not 500 either way.
@@ -145,15 +168,11 @@ describe("a malformed cursor is 400 invalid_cursor, never 500", () => {
   });
 
   it("still rejects a valid cursor reused against a different order", async () => {
-    // The already-mapped class, kept as a control so this fix cannot
-    // regress the case that already worked.
-    const cursor = encodeCursor({
-      kind: "list",
-      order: "asc",
-      sortValue: "2026-05-01T00:00:00.000Z",
-      recordKey: "r1",
-    });
-    const res = await app().request(
+    // The already-mapped class, kept as a control so this fix cannot regress
+    // wrong-order handling. The cursor must be minted by the store so it has
+    // the current stream + epoch binding.
+    const { app, cursor } = mintedListCursor("asc");
+    const res = await app.request(
       `/v1/streams/s/records?order=desc&cursor=${encodeURIComponent(cursor)}`,
       { headers: AUTH },
     );
@@ -161,15 +180,11 @@ describe("a malformed cursor is 400 invalid_cursor, never 500", () => {
   });
 
   it("still serves a valid cursor", async () => {
-    // Positive control: the narrowing above must not reject good cursors.
-    const cursor = encodeCursor({
-      kind: "list",
-      order: "desc",
-      sortValue: "2026-06-01T00:00:00.000Z",
-      recordKey: "r0",
-    });
-    const res = await app().request(
-      `/v1/streams/s/records?cursor=${encodeURIComponent(cursor)}`,
+    // Positive control: the narrowing above must not reject store-minted
+    // stream + epoch bound cursors.
+    const { app, cursor } = mintedListCursor("desc");
+    const res = await app.request(
+      `/v1/streams/s/records?order=desc&cursor=${encodeURIComponent(cursor)}`,
       { headers: AUTH },
     );
     expect(res.status).toBe(200);

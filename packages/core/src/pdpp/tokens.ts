@@ -381,6 +381,9 @@ export class PdppTokenService {
         active: true,
         tokenKind: "owner",
         subjectId: record.subjectId,
+        ...(record.ownerInstanceIds && {
+          instanceIds: record.ownerInstanceIds,
+        }),
         ...(record.expiresAt && { expiresAt: record.expiresAt }),
       };
     }
@@ -432,6 +435,7 @@ export class PdppTokenService {
       active: true,
       pdpp_token_kind: context.tokenKind,
       subject_id: context.subjectId,
+      ...(context.instanceIds && { instance_ids: context.instanceIds }),
       ...(context.expiresAt && {
         exp: Math.floor(Date.parse(context.expiresAt) / 1000),
       }),
@@ -469,6 +473,7 @@ export class PdppTokenService {
    */
   issueOwnerToken(input: {
     subjectId: string;
+    instanceIds?: string[];
     ttlSeconds?: number;
     now?: Date;
   }): { access_token: string; token_type: "Bearer"; expires_in: number } {
@@ -483,6 +488,7 @@ export class PdppTokenService {
       subjectId: input.subjectId,
       clientId: null,
       tokenKind: "owner",
+      ownerInstanceIds: input.instanceIds,
       expiresAt: expiresAt.toISOString(),
       consumeSingleUse: false,
       now,

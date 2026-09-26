@@ -16,7 +16,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { basename } from "node:path";
 import { tmpdir } from "node:os";
@@ -26,6 +26,7 @@ import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { createServer, type ServerContext } from "./bootstrap.js";
 import { MAX_INGEST_BODY_BYTES } from "./routes/pdpp-records.js";
+import { singleInstanceInventory } from "./pdpp/deployment.js";
 
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
@@ -72,6 +73,7 @@ const OURA_DECLARATION = JSON.stringify({
 let tempDir: string;
 let ctx: ServerContext | undefined;
 let owner: string;
+let bootedSourceIds: string[] = [];
 
 async function writeDeclaration(name: string, document: string) {
   const dir = join(tempDir, "declarations");
@@ -89,6 +91,18 @@ async function boot(
   declarationPaths: (string | { path: string; sha256: string })[],
   methods?: { method_id: string; declaration_path: string }[],
 ) {
+  bootedSourceIds = (
+    await Promise.all(
+      declarationPaths.map(async (entry) => {
+        const path = typeof entry === "string" ? entry : entry.path;
+        const declaration = JSON.parse(await readFile(path, "utf-8")) as {
+          source_id?: string;
+          source?: { id?: string };
+        };
+        return declaration.source_id ?? declaration.source?.id;
+      }),
+    )
+  ).filter((sourceId): sourceId is string => typeof sourceId === "string");
   return createServer(
     ServerConfigSchema.parse({
       tunnel: { enabled: false },
@@ -117,10 +131,28 @@ async function bootBoth() {
   ]);
 }
 
-async function ownerToken(context: ServerContext): Promise<string> {
+async function ownerToken(
+  context: ServerContext,
+  sourceId?: string,
+): Promise<string> {
+  const subject = owner || (await recoverServerOwner(KNOWN_SIG)).toLowerCase();
+  const source =
+    sourceId ??
+    (bootedSourceIds.length === 1
+      ? bootedSourceIds[0]
+      : bootedSourceIds.includes(OURA)
+        ? OURA
+        : (bootedSourceIds[0] ?? CLAUDE));
   const response = await context.app.request("/pdpp/v1/owner/token", {
     method: "POST",
-    headers: { authorization: `Bearer ${context.devToken}` },
+    headers: {
+      authorization: `Bearer ${context.devToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      source_id: source,
+      instance_id: singleInstanceInventory(subject, source).eligibleFor("")[0],
+    }),
   });
   expect(response.status).toBe(200);
   return ((await response.json()) as { access_token: string }).access_token;
@@ -377,15 +409,16 @@ describe("P1: configured declaration admission", () => {
 describe("P2: streams are keyed by source and stream name", () => {
   it("validates each source's profile against its own primary key", async () => {
     ctx = await bootBoth();
-    const token = await ownerToken(ctx);
+    const claudeToken = await ownerToken(ctx, CLAUDE);
+    const ouraToken = await ownerToken(ctx, OURA);
 
-    const claude = await ingest(ctx, token, "profile", {
+    const claude = await ingest(ctx, claudeToken, "profile", {
       instance: `claude:${owner}`,
       key: "c1",
       data: { id: "c1", name: "Claude user" },
       emitted_at: "2026-09-01T00:00:00Z",
     });
-    const oura = await ingest(ctx, token, "profile", {
+    const oura = await ingest(ctx, ouraToken, "profile", {
       instance: `oura:${owner}`,
       key: "o1",
       data: { user_id: "o1", email: "o@example.com" },
@@ -395,7 +428,7 @@ describe("P2: streams are keyed by source and stream name", () => {
     expect(outcomes(oura.body)).toEqual(["accepted"]);
 
     // A record shaped for the other source's key is rejected.
-    const crossed = await ingest(ctx, token, "profile", {
+    const crossed = await ingest(ctx, claudeToken, "profile", {
       instance: `claude:${owner}`,
       key: "o2",
       data: { user_id: "o2" },
@@ -403,16 +436,16 @@ describe("P2: streams are keyed by source and stream name", () => {
     });
     expect(outcomes(crossed.body)).toEqual(["rejected"]);
 
-    const c1 = await read(ctx, token, "/v1/streams/profile/records/c1");
+    const c1 = await read(ctx, claudeToken, "/v1/streams/profile/records/c1");
     expect(c1.status).toBe(200);
     expect(c1.body.data).toEqual({ id: "c1", name: "Claude user" });
-    const o1 = await read(ctx, token, "/v1/streams/profile/records/o1");
+    const o1 = await read(ctx, ouraToken, "/v1/streams/profile/records/o1");
     expect(o1.body.data).toEqual({ user_id: "o1", email: "o@example.com" });
   });
 
   it("rejects a stream that the instance's source does not declare", async () => {
     ctx = await bootBoth();
-    const token = await ownerToken(ctx);
+    const token = await ownerToken(ctx, CLAUDE);
     const result = await ingest(ctx, token, "events", {
       instance: `claude:${owner}`,
       key: "e1",
@@ -428,17 +461,54 @@ describe("P2: streams are keyed by source and stream name", () => {
       }),
     ]);
     const listed = await read(ctx, token, "/v1/streams/events/records");
-    expect(listed.body.data).toEqual([]);
+    expect(listed.status).toBe(403);
+    expect(listed.body.error.code).toBe("grant_stream_not_allowed");
   });
 
-  it("refuses owner metadata for a stream name that two sources declare", async () => {
+  it("scopes owner metadata to the token instance when two sources declare a stream name", async () => {
     ctx = await bootBoth();
-    const token = await ownerToken(ctx);
-    const ambiguous = await read(ctx, token, "/v1/streams/profile");
-    expect(ambiguous.status).toBe(400);
-    const unique = await read(ctx, token, "/v1/streams/events");
+    const claudeToken = await ownerToken(ctx, CLAUDE);
+    const ouraToken = await ownerToken(ctx, OURA);
+
+    const claudeProfile = await read(ctx, claudeToken, "/v1/streams/profile");
+    expect(claudeProfile.status).toBe(200);
+    expect(claudeProfile.body.primary_key).toEqual(["id"]);
+
+    const ouraProfile = await read(ctx, ouraToken, "/v1/streams/profile");
+    expect(ouraProfile.status).toBe(200);
+    expect(ouraProfile.body.primary_key).toEqual(["user_id"]);
+
+    const unique = await read(ctx, ouraToken, "/v1/streams/events");
     expect(unique.status).toBe(200);
     expect(unique.body.primary_key).toEqual(["id"]);
+  });
+});
+
+describe("P6: scoped owner tokens on a real server", () => {
+  it("cannot read or reset another owned instance's binding", async () => {
+    ctx = await bootBoth();
+    const claudeToken = await ownerToken(ctx, CLAUDE);
+    const ouraToken = await ownerToken(ctx, OURA);
+    const ouraInstance = `oura:${owner}`;
+    const bindingPath = `/pdpp/instances/${encodeURIComponent(ouraInstance)}/binding`;
+
+    const crossRead = await read(ctx, claudeToken, bindingPath);
+    expect(crossRead.status).toBe(401);
+    expect(crossRead.body.error.code).toBe("authentication_error");
+    const crossReset = await reset(
+      ctx,
+      claudeToken,
+      ouraInstance,
+      null,
+      1,
+      "oura",
+    );
+    expect(crossReset.status).toBe(401);
+    expect((await crossReset.json()).error.code).toBe("authentication_error");
+
+    const ownedRead = await read(ctx, ouraToken, bindingPath);
+    expect(ownedRead.status).toBe(200);
+    expect(ownedRead.body).toMatchObject({ method: null, generation: 1 });
   });
 });
 
@@ -1281,6 +1351,139 @@ describe("P10c and method authority over HTTP", () => {
     expect(forgedSince.body.error.code).toBe("invalid_cursor");
   });
 
+  it("expires cursor and changes_since tokens minted for another stream", async () => {
+    const { token } = await bootSwitchable();
+    const instance = `oura:${owner}`;
+    await seedEvents(token, instance, ["a1", "a2"]);
+    const profileResult = await ingest(
+      ctx!,
+      token,
+      "profile",
+      [
+        {
+          instance,
+          key: "p1",
+          data: { user_id: "p1", email: "p1@example.com" },
+          emitted_at: "2026-09-01T00:00:00Z",
+        },
+      ],
+      "oura",
+    );
+    expect(outcomes(profileResult.body)).toEqual(["accepted"]);
+
+    const eventsList = await read(
+      ctx!,
+      token,
+      "/v1/streams/events/records?order=asc&limit=1",
+    );
+    const listCursor = eventsList.body.next_cursor as string;
+    expect(listCursor).toBeTruthy();
+    const crossList = await read(
+      ctx!,
+      token,
+      `/v1/streams/profile/records?order=asc&limit=1&cursor=${encodeURIComponent(listCursor)}`,
+    );
+    expect(crossList.status).toBe(410);
+    expect(crossList.body.error.code).toBe("cursor_expired");
+
+    const eventsChanges = await read(
+      ctx!,
+      token,
+      "/v1/streams/events/records?changes_since=&limit=10",
+    );
+    const changesToken = eventsChanges.body.next_changes_since as string;
+    expect(changesToken).toBeTruthy();
+    const crossChanges = await read(
+      ctx!,
+      token,
+      `/v1/streams/profile/records?changes_since=${encodeURIComponent(changesToken)}&limit=1`,
+    );
+    expect(crossChanges.status).toBe(410);
+    expect(crossChanges.body.error.code).toBe("cursor_expired");
+  });
+
+  it("expires list and changes_since tokens minted by a different records DB", async () => {
+    const { token } = await bootSwitchable();
+    const instance = `oura:${owner}`;
+    await seedEvents(token, instance, ["a1", "a2"]);
+
+    const listPage = await read(
+      ctx!,
+      token,
+      "/v1/streams/events/records?order=asc&limit=1",
+    );
+    const listCursor = listPage.body.next_cursor as string;
+    expect(listCursor).toBeTruthy();
+    const changesPage = await read(
+      ctx!,
+      token,
+      "/v1/streams/events/records?changes_since=&limit=1",
+    );
+    const changesCursor = changesPage.body.next_cursor as string;
+    expect(changesCursor).toBeTruthy();
+
+    const dbA = tempDir;
+    const dbB = await mkdtemp(join(tmpdir(), "pdpp-storage-ingest-"));
+    await ctx!.cleanup();
+    ctx = undefined;
+    tempDir = dbB;
+    await rm(dbA, { recursive: true, force: true });
+    const ouraPath = await writeDeclaration("oura", OURA_DECLARATION);
+    const claudePath = await writeDeclaration("claude", CLAUDE_DECLARATION);
+    ctx = await boot([claudePath, ouraPath]);
+    const tokenB = await ownerToken(ctx);
+
+    const staleList = await read(
+      ctx,
+      tokenB,
+      `/v1/streams/events/records?order=asc&limit=1&cursor=${encodeURIComponent(listCursor)}`,
+    );
+    expect(staleList.status).toBe(410);
+    expect(staleList.body.error.code).toBe("cursor_expired");
+    const staleChanges = await read(
+      ctx,
+      tokenB,
+      `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(changesCursor)}`,
+    );
+    expect(staleChanges.status).toBe(410);
+    expect(staleChanges.body.error.code).toBe("cursor_expired");
+  });
+
+  it("anchors changes_since pages and surfaces mid-session writes in the next session", async () => {
+    const { token } = await bootSwitchable();
+    const instance = `oura:${owner}`;
+    await seedEvents(token, instance, ["a1", "a2"]);
+
+    const page1 = await read(
+      ctx!,
+      token,
+      "/v1/streams/events/records?changes_since=&limit=1",
+    );
+    expect(page1.status).toBe(200);
+    expect(page1.body.data.map((r: any) => r.id)).toEqual(["a1"]);
+    expect(page1.body.next_cursor).toBeTruthy();
+
+    await seedEvents(token, instance, ["a3"], 3);
+
+    const page2 = await read(
+      ctx!,
+      token,
+      `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(page1.body.next_cursor)}`,
+    );
+    expect(page2.status).toBe(200);
+    expect(page2.body.data.map((r: any) => r.id)).toEqual(["a2"]);
+    expect(page2.body.has_more).toBe(false);
+    expect(page2.body.next_changes_since).toBeTruthy();
+
+    const nextSession = await read(
+      ctx!,
+      token,
+      `/v1/streams/events/records?changes_since=${encodeURIComponent(page2.body.next_changes_since)}&limit=10`,
+    );
+    expect(nextSession.status).toBe(200);
+    expect(nextSession.body.data.map((r: any) => r.id)).toEqual(["a3"]);
+  });
+
   it("refuses a reset to an empty method, and changes nothing", async () => {
     const { token } = await bootSwitchable();
     const instance = `oura:${owner}`;
@@ -1623,14 +1826,13 @@ describe("P7: stream snapshot replace", () => {
         records: [
           record("k1", "changed", "2026-09-02T00:00:00Z"),
           {
-            key: "k2",
+            key: "k9",
             data: null,
             emitted_at: "2026-09-02T00:00:00Z",
-            op: "delete",
           },
         ],
         index: 1,
-        reason: /must be upserts/,
+        reason: /data must be a JSON object/,
       },
       {
         records: [
@@ -1666,10 +1868,11 @@ describe("P7: stream snapshot replace", () => {
 
   it("tombstones only inside the replaced (instance, stream)", async () => {
     ctx = await bootBoth();
-    const token = await ownerToken(ctx);
+    const claudeToken = await ownerToken(ctx, CLAUDE);
+    const token = await ownerToken(ctx, OURA);
     const instance = `oura:${owner}`;
     // Same stream name on another instance, and another stream on this one.
-    const claude = await ingest(ctx, token, "profile", {
+    const claude = await ingest(ctx, claudeToken, "profile", {
       instance: `claude:${owner}`,
       key: "c1",
       data: { id: "c1", name: "c" },
@@ -1751,6 +1954,72 @@ describe("P7: stream snapshot replace", () => {
     } finally {
       db.close();
     }
+  });
+
+  it("accepts explicit key-only and full-data deletes in a replace snapshot", async () => {
+    ctx = await bootBoth();
+    const token = await ownerToken(ctx);
+    const instance = await seed(ctx, token);
+    const before = storeCounters();
+
+    const result = await replace(ctx, token, "profile", {
+      instance,
+      emitted_at: "2026-09-02T12:00:00Z",
+      records: [
+        {
+          key: "k1",
+          op: "delete",
+          emitted_at: "2026-09-02T00:00:00Z",
+        },
+        {
+          key: "k2",
+          data: { user_id: "k2", email: "ignored@example.com" },
+          op: "delete",
+          emitted_at: "2026-09-02T00:00:00Z",
+        },
+        record("k3", "k3@a", "2026-09-02T00:00:00Z"),
+      ],
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      accepted: 2,
+      unchanged: 1,
+      deleted: 0,
+      rejected: [],
+    });
+    expect(result.body.results.map((r: any) => r.outcome)).toEqual([
+      "accepted",
+      "accepted",
+      "unchanged",
+    ]);
+    expect(storeCounters()).toEqual({
+      clock: before.clock + 2,
+      changes: before.changes + 2,
+    });
+
+    const rows = currentRows();
+    expect(
+      rows
+        .filter((row: any) => row.stream === "profile")
+        .map((row: any) => ({
+          key: row.record_key,
+          deleted: row.deleted,
+          deletedAt: row.deleted_at,
+        })),
+    ).toEqual([
+      {
+        key: "k1",
+        deleted: 1,
+        deletedAt: "2026-09-02T00:00:00Z",
+      },
+      {
+        key: "k2",
+        deleted: 1,
+        deletedAt: "2026-09-02T00:00:00Z",
+      },
+      { key: "k3", deleted: 0, deletedAt: null },
+    ]);
   });
 
   it("rolls back every upsert and tombstone when a write faults mid-transaction", async () => {
@@ -2019,7 +2288,10 @@ describe("P5: record data is validated against the declared stream schema", () =
   it("ingest: a non-conforming upsert over a stored record leaves it unchanged, and a delete is not schema-checked", async () => {
     ctx = await bootWhoop();
     const token = await ownerToken(ctx);
-    await ingest(ctx, token, "sleep", [envelope({ id: "s1", score: 80 })]);
+    await ingest(ctx, token, "sleep", [
+      envelope({ id: "s1", score: 80 }),
+      envelope({ id: "s2", score: 2 }),
+    ]);
     const rows = sleepRows();
     const counters = storeCounters();
 
@@ -2048,8 +2320,15 @@ describe("P5: record data is validated against the declared stream schema", () =
         op: "delete",
         emitted_at: "2026-09-03T00:00:00Z",
       },
+      {
+        instance: instance(),
+        key: "s2",
+        data: { id: "s2", score: 2 },
+        op: "delete",
+        emitted_at: "2026-09-03T00:00:00Z",
+      },
     ]);
-    expect(outcomes(deleted.body)).toEqual(["accepted"]);
+    expect(outcomes(deleted.body)).toEqual(["accepted", "accepted"]);
   });
 
   it("replace: applies a conforming snapshot, and one non-conforming record rejects it with nothing written", async () => {
@@ -2267,7 +2546,14 @@ describe("P5: record data is validated against the declared stream schema", () =
         declarationWith("beta", "profile", schemaWith("number")),
       ),
     ]);
-    const token = await ownerToken(ctx);
+    const alphaToken = await ownerToken(
+      ctx,
+      "https://registry.pdpp.dev/connectors/alpha",
+    );
+    const betaToken = await ownerToken(
+      ctx,
+      "https://registry.pdpp.dev/connectors/beta",
+    );
     const at = (source: string, id: string, v: unknown) => ({
       instance: `${source}:${owner}`,
       key: id,
@@ -2275,11 +2561,11 @@ describe("P5: record data is validated against the declared stream schema", () =
       emitted_at: "2026-09-01T00:00:00Z",
     });
 
-    const alpha = await ingest(ctx, token, "profile", [
+    const alpha = await ingest(ctx, alphaToken, "profile", [
       at("alpha", "p1", "text"),
     ]);
     expect(alpha.body.results).toEqual([{ index: 0, outcome: "accepted" }]);
-    const beta = await ingest(ctx, token, "profile", [
+    const beta = await ingest(ctx, betaToken, "profile", [
       at("beta", "p1", "text"),
       at("beta", "p2", 7),
     ]);

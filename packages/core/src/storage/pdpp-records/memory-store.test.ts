@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { createMemoryRecordStore } from "./memory-store.js";
-import type { PdppRecordEnvelopeInput } from "./types.js";
+import { encodeCursor } from "./cursor.js";
+import { CursorExpiredError, type PdppRecordEnvelopeInput } from "./types.js";
 
 function messagesSemantics() {
   return "append_only" as const;
@@ -269,6 +270,69 @@ describe("memory record store: list records", () => {
     ).toThrow();
   });
 
+  it("rejects a minted list cursor reused against a different stream", () => {
+    const store = createMemoryRecordStore();
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "messages",
+          key: "msg_1",
+          data: { id: "msg_1" },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+        {
+          instance: "inst_1",
+          stream: "messages",
+          key: "msg_2",
+          data: { id: "msg_2" },
+          emitted_at: "2026-04-02T00:00:00.000Z",
+        },
+        {
+          instance: "inst_1",
+          stream: "playlists",
+          key: "pl_1",
+          data: { id: "pl_1" },
+          emitted_at: "2026-04-03T00:00:00.000Z",
+        },
+      ],
+      (stream) => (stream === "messages" ? "append_only" : "mutable_state"),
+      () => ["id"],
+    );
+    const page1 = store.listRecords("messages", {
+      instanceIds: ["inst_1"],
+      limit: 1,
+      order: "asc",
+    });
+    expect(page1.nextCursor).toBeDefined();
+
+    expect(() =>
+      store.listRecords("playlists", {
+        instanceIds: ["inst_1"],
+        limit: 1,
+        order: "asc",
+        cursor: page1.nextCursor,
+      }),
+    ).toThrow(CursorExpiredError);
+  });
+
+  it("expires a legacy list cursor without stream and epoch binding", () => {
+    const store = createMemoryRecordStore();
+    expect(() =>
+      store.listRecords("messages", {
+        instanceIds: ["inst_1"],
+        limit: 1,
+        order: "asc",
+        cursor: encodeCursor({
+          kind: "list",
+          order: "asc",
+          sortValue: "2026-04-01T00:00:00.000Z",
+          recordKey: "msg_1",
+        }),
+      }),
+    ).toThrow(CursorExpiredError);
+  });
+
   it("never exposes an unprojected field through fields projection", () => {
     const store = createMemoryRecordStore();
     store.ingestBatch(
@@ -415,6 +479,54 @@ describe("memory record store: changes_since", () => {
     });
     expect(session2.data).toHaveLength(1);
     expect(session2.data[0].recordKey).toBe("pl_1");
+  });
+
+  it("rejects a changes_since token reused against a different stream", () => {
+    const store = createMemoryRecordStore();
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "playlists",
+          key: "pl_1",
+          data: { id: "pl_1", name: "v1" },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      playlistsSemantics,
+      playlistsPk,
+    );
+    const session1 = store.changesSince("playlists", {
+      instanceIds: ["inst_1"],
+      limit: 10,
+    });
+    expect(session1.nextChangesSince).toBeDefined();
+
+    expect(() =>
+      store.changesSince("messages", {
+        instanceIds: ["inst_1"],
+        limit: 10,
+        changesSince: session1.nextChangesSince,
+      }),
+    ).toThrow(CursorExpiredError);
+  });
+
+  it("rejects a changes_since token from another epoch", () => {
+    const store = createMemoryRecordStore();
+    expect(() =>
+      store.changesSince("playlists", {
+        instanceIds: ["inst_1"],
+        limit: 10,
+        changesSince: encodeCursor({
+          kind: "changes_since",
+          stream: "playlists",
+          epoch: "1",
+          horizon: new Date(1).toISOString(),
+          sinceHorizon: null,
+          offset: 0,
+        }),
+      }),
+    ).toThrow(CursorExpiredError);
   });
 
   it("does not surface a record whose only change is outside the field projection", () => {

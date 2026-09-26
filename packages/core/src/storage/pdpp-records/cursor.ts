@@ -6,6 +6,10 @@
 
 export interface ListCursorPayload {
   kind: "list";
+  /** Stream this token was minted for. Absent only on legacy cursors. */
+  stream?: string;
+  /** Store reset epoch this token was minted in. Absent only on legacy cursors. */
+  epoch?: string;
   order: "asc" | "desc";
   sortValue: string | null; // cursor_field value of the last row on the page
   recordKey: string; // primary key tiebreaker
@@ -19,6 +23,10 @@ export interface ListCursorPayload {
 
 export interface ChangesSinceCursorPayload {
   kind: "changes_since";
+  /** Stream this token was minted for. Absent only on legacy cursors. */
+  stream?: string;
+  /** Store reset epoch this token was minted in. Absent only on legacy cursors. */
+  epoch?: string;
   /** The session horizon every page of this session is anchored to. */
   horizon: string;
   /** The previous session's horizon, or null for a first-ever sync. */

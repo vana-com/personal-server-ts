@@ -71,7 +71,12 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
     const app = pdppBlobsRoutes({
       store,
       auth: createFixtureAuthorizationService({
-        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
       }),
       declarations,
     });
@@ -109,7 +114,12 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
     const app = pdppBlobsRoutes({
       store,
       auth: createFixtureAuthorizationService({
-        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
       }),
       declarations,
       instancesForSubject: () => ["inst_1"],
@@ -148,7 +158,12 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
     const app = pdppBlobsRoutes({
       store,
       auth: createFixtureAuthorizationService({
-        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
       }),
       declarations,
       instancesForSubject: () => ["inst_1"],
@@ -185,7 +200,12 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
     const app = pdppBlobsRoutes({
       store,
       auth: createFixtureAuthorizationService({
-        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
       }),
       declarations,
       instancesForSubject: () => ["inst_1"], // does not include inst_other
@@ -227,7 +247,12 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       readBlobBytes,
       store,
       auth: createFixtureAuthorizationService({
-        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
       }),
       declarations,
       // instancesForSubject intentionally omitted.
@@ -267,7 +292,12 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       readBlobBytes,
       store,
       auth: createFixtureAuthorizationService({
-        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
       }),
       declarations,
       instancesForSubject: () => [],
@@ -488,7 +518,12 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
     const app = pdppBlobsRoutes({
       store,
       auth: createFixtureAuthorizationService({
-        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
       }),
       declarations,
       instancesForSubject: () => ["inst_1"],
@@ -527,7 +562,12 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
     const app = pdppBlobsRoutes({
       store,
       auth: createFixtureAuthorizationService({
-        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
       }),
       declarations,
       instancesForSubject: () => ["inst_1"],
@@ -566,7 +606,12 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
     const app = pdppBlobsRoutes({
       store,
       auth: createFixtureAuthorizationService({
-        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
       }),
       declarations,
       instancesForSubject: () => ["inst_1"],
@@ -611,7 +656,12 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
     const app = pdppBlobsRoutes({
       store,
       auth: createFixtureAuthorizationService({
-        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
       }),
       declarations,
       instancesForSubject: () => ["inst_1"],
@@ -650,7 +700,12 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
     const app = pdppBlobsRoutes({
       store,
       auth: createFixtureAuthorizationService({
-        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
       }),
       declarations,
       instancesForSubject: () => ["inst_1"],
@@ -751,7 +806,12 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
     const app = pdppBlobsRoutes({
       store,
       auth: createFixtureAuthorizationService({
-        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
       }),
       declarations,
       instancesForSubject: () => ["inst_1"], // does not include inst_other
@@ -762,6 +822,94 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
     });
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Length")).toBe("3");
+  });
+
+  it("uses the owner token's persisted instance scope for blob reads", async () => {
+    const store = newStore();
+    store.putBlobMeta({
+      blobId: "blob_other",
+      mimeType: "image/jpeg",
+      sizeBytes: 3,
+      sha256: "abc",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_other",
+          stream: "media",
+          key: "media_other",
+          data: { id: "media_other", blob_ref: { blob_id: "blob_other" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
+    const app = pdppBlobsRoutes({
+      store,
+      auth: createFixtureAuthorizationService({
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
+      }),
+      declarations,
+      instancesForSubject: () => ["inst_1", "inst_other"],
+      readBlobBytes: async () => new Uint8Array(3),
+    });
+
+    const res = await app.request("/blob_other", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+
+    expect(res.status).toBe(404);
+    expect((await res.json()).error.code).toBe("blob_not_found");
+  });
+
+  it("denies a scoped owner token after current ownership no longer includes its instance", async () => {
+    const store = newStore();
+    store.putBlobMeta({
+      blobId: "blob_mine",
+      mimeType: "image/jpeg",
+      sizeBytes: 3,
+      sha256: "abc",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: "blob_mine" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
+    const app = pdppBlobsRoutes({
+      store,
+      auth: createFixtureAuthorizationService({
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
+      }),
+      declarations,
+      instancesForSubject: () => ["inst_other"],
+      readBlobBytes: async () => new Uint8Array(3),
+    });
+
+    const res = await app.request("/blob_mine", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+
+    expect(res.status).toBe(404);
+    expect((await res.json()).error.code).toBe("blob_not_found");
   });
 
   it("denies a blob when NO visible reference passes authorization, even with multiple references (companion to the any-visible-reference regression)", async () => {
@@ -903,7 +1051,12 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
     const app = pdppBlobsRoutes({
       store,
       auth: createFixtureAuthorizationService({
-        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
       }),
       declarations,
       instancesForSubject: () => ["inst_1"],
@@ -949,7 +1102,12 @@ describe.each(backends)(
       return pdppBlobsRoutes({
         store,
         auth: createFixtureAuthorizationService({
-          "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1" },
+          "owner-tok": {
+            active: true,
+            tokenKind: "owner",
+            subjectId: "sub_1",
+            instanceIds: ["inst_1"],
+          },
         }),
         declarations,
         instancesForSubject:

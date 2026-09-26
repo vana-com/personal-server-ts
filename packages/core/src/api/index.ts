@@ -61,7 +61,12 @@ import {
   parseMetadataHeader,
   stringifyMetadataHeader,
   IngestPersistedError,
+  sha256Hex,
+  type LegacyPrecondition,
+  type LegacyProducer,
+  type LegacyProducerProvenance,
 } from "../contracts/index.js";
+import { canonicalJsonBytes } from "../derivatives/e2ee/jcs.js";
 import type {
   DataFileEnvelope,
   DataPortabilityGatewayConfig,
@@ -113,6 +118,12 @@ export interface PersonalServerWriteAuthInput {
   request: Request;
   /** Raw scope path param (validated by parseDataScopeContract after auth,
    * same precedence as the owner write path). */
+  scope: string;
+}
+
+export interface PersonalServerScopeAuthInput {
+  request: Request;
+  /** Raw scope path param; auth ports that need scope binding validate it. */
   scope: string;
 }
 
@@ -201,6 +212,11 @@ export interface PersonalServerReadFulfillmentReporter {
 export interface PersonalServerApiAuthPort {
   authorizeOwner(request: Request): Promise<void>;
   authorizeBuilderList(request: Request): Promise<void>;
+  /**
+   * Authorize listing versions for one legacy scope. Optional so auth ports
+   * without scoped owner-token support keep the existing builder-list gate.
+   */
+  authorizeScopeVersions?(input: PersonalServerScopeAuthInput): Promise<void>;
   authorizeBuilderRead(
     input: PersonalServerReadAuthInput,
   ): Promise<PersonalServerReadAuthResult | void>;
@@ -850,10 +866,141 @@ export async function handleX402Cycle(
   return { kind: "gateway-error", status: gatewayRes.status, body: errorBody };
 }
 
-function collectedAt(now: () => Date): string {
-  return now()
-    .toISOString()
-    .replace(/\.\d{3}Z$/, "Z");
+const lastCollectedAtByStorage = new WeakMap<DataStoragePort, number>();
+function collectedAt(
+  now: () => Date,
+  storage: DataStoragePort,
+  scope: string,
+): string {
+  // Further writes in the same second need distinct paths so no version is
+  // overwritten. Use one timestamp format so lexical ordering remains valid.
+  const second = Math.floor(now().getTime() / 1000) * 1000;
+  // The process-local clock resets on restart. Consult the durable head so a
+  // same-second restart cannot reuse a committed envelope path.
+  const latest = Date.parse(storage.findEntry({ scope })?.collectedAt ?? "");
+  const current = Math.max(
+    second,
+    (lastCollectedAtByStorage.get(storage) ?? 0) + 1,
+    Number.isFinite(latest) ? latest + 1 : 0,
+  );
+  lastCollectedAtByStorage.set(storage, current);
+  return new Date(current).toISOString();
+}
+
+function parseLegacyPrecondition(
+  request: Request,
+): LegacyPrecondition | Response | undefined {
+  const none = request.headers.get("if-none-match");
+  const match = request.headers.get("if-match");
+  if (none !== null && match !== null) {
+    return errorResponse(
+      400,
+      "INVALID_PRECONDITION",
+      "Supply only one precondition",
+    );
+  }
+  if (none !== null) {
+    return none === "*"
+      ? { kind: "none" }
+      : errorResponse(400, "INVALID_PRECONDITION", "If-None-Match must be *");
+  }
+  if (match !== null) {
+    const parsed = /^"([1-9]\d*)"$/.exec(match);
+    const version = parsed ? Number(parsed[1]) : NaN;
+    return Number.isSafeInteger(version)
+      ? { kind: "match", version }
+      : errorResponse(
+          400,
+          "INVALID_PRECONDITION",
+          "If-Match must be a quoted positive version",
+        );
+  }
+  return undefined;
+}
+
+function parseProducerHeader(
+  request: Request,
+): { producer?: LegacyProducer; encodedProvenance?: string } | Response {
+  const producer = request.headers.get("vana-producer");
+  const encodedProvenance =
+    request.headers.get("vana-producer-provenance") ?? undefined;
+  if (producer === null && !encodedProvenance) return {};
+  if (producer !== "pdpp-projector" && producer !== "pdpp-import-projection") {
+    return errorResponse(
+      400,
+      "INVALID_PRODUCER",
+      "Vana-Producer is unrecognized or missing",
+    );
+  }
+  if (
+    encodedProvenance &&
+    (encodedProvenance.length > 8192 ||
+      !/^[A-Za-z0-9_-]+$/.test(encodedProvenance))
+  ) {
+    return errorResponse(
+      400,
+      "INVALID_PROVENANCE",
+      "Vana-Producer-Provenance is malformed",
+    );
+  }
+  return { producer, encodedProvenance };
+}
+
+async function parseProducerProvenance(
+  encoded: string | undefined,
+  body: Record<string, unknown>,
+): Promise<LegacyProducerProvenance | Response | undefined> {
+  if (!encoded) return undefined;
+  try {
+    const value = JSON.parse(
+      new TextDecoder().decode(
+        Uint8Array.from(
+          atob(encoded.replace(/-/g, "+").replace(/_/g, "/")),
+          (char) => char.charCodeAt(0),
+        ),
+      ),
+    ) as LegacyProducerProvenance;
+    if (
+      !value ||
+      typeof value !== "object" ||
+      typeof value.projector_version !== "string" ||
+      !value.projector_version ||
+      typeof value.declaration_digest !== "string" ||
+      !value.declaration_digest ||
+      !Array.isArray(value.inputs) ||
+      !value.inputs.every(
+        (input) =>
+          input &&
+          typeof input.stream === "string" &&
+          input.stream &&
+          typeof input.changes_since_token === "string" &&
+          input.changes_since_token,
+      ) ||
+      typeof value.payload_sha256 !== "string" ||
+      !/^(?:0x)?[0-9a-fA-F]{64}$/.test(value.payload_sha256)
+    ) {
+      return errorResponse(
+        400,
+        "INVALID_PROVENANCE",
+        "Producer provenance has invalid fields",
+      );
+    }
+    const actual = (await sha256Hex(canonicalJsonBytes(body))).slice(2);
+    if (actual !== value.payload_sha256.replace(/^0x/, "").toLowerCase()) {
+      return errorResponse(
+        400,
+        "PAYLOAD_HASH_MISMATCH",
+        "Provenance payload_sha256 does not match the JSON body",
+      );
+    }
+    return value;
+  } catch {
+    return errorResponse(
+      400,
+      "INVALID_PROVENANCE",
+      "Vana-Producer-Provenance is not base64url JSON",
+    );
+  }
 }
 
 /**
@@ -950,22 +1097,15 @@ async function ingestTombstoneMarker(
 
 // The delete worker wants a full Logger; the API logger is all-optional.
 function apiLoggerAsLogger(logger: PersonalServerApiLogger | undefined) {
-  const noop = () => undefined;
   return {
     debug: (payload: unknown, message?: string) =>
-      (logger?.debug ?? noop)(
-        payload as Record<string, unknown>,
-        message ?? "",
-      ),
+      logger?.debug?.(payload as Record<string, unknown>, message ?? ""),
     info: (payload: unknown, message?: string) =>
-      (logger?.info ?? noop)(payload as Record<string, unknown>, message ?? ""),
+      logger?.info?.(payload as Record<string, unknown>, message ?? ""),
     warn: (payload: unknown, message?: string) =>
-      (logger?.warn ?? noop)(payload as Record<string, unknown>, message ?? ""),
+      logger?.warn?.(payload as Record<string, unknown>, message ?? ""),
     error: (payload: unknown, message?: string) =>
-      (logger?.error ?? noop)(
-        payload as Record<string, unknown>,
-        message ?? "",
-      ),
+      logger?.error?.(payload as Record<string, unknown>, message ?? ""),
   };
 }
 
@@ -1291,7 +1431,14 @@ export async function handlePersonalServerDataRequest(
     const parts = pathname.split("/").filter(Boolean);
     if (parts.length === 2 && parts[1] === "versions") {
       if (request.method !== "GET") return methodNotAllowed();
-      await deps.auth.authorizeBuilderList(request);
+      if (deps.auth.authorizeScopeVersions) {
+        await deps.auth.authorizeScopeVersions({
+          request,
+          scope: decodePathPart(parts[0]),
+        });
+      } else {
+        await deps.auth.authorizeBuilderList(request);
+      }
       const result = await listDataVersionsContract({
         storage: deps.storage,
         scopeParam: decodePathPart(parts[0]),
@@ -1678,7 +1825,26 @@ export async function handlePersonalServerDataRequest(
         const scopeResult = parseDataScopeContract(scopeParam);
         if (!scopeResult.ok)
           return failWrite(contractErrorResponse(scopeResult));
-        const collectedAtValue = collectedAt(deps.now ?? (() => new Date()));
+        const parsedPrecondition = parseLegacyPrecondition(request);
+        if (parsedPrecondition instanceof Response)
+          return failWrite(parsedPrecondition);
+        const producerHeader = parseProducerHeader(request);
+        if (producerHeader instanceof Response)
+          return failWrite(producerHeader);
+        if (writeAuth && producerHeader.producer) {
+          return failWrite(
+            errorResponse(
+              403,
+              "NOT_OWNER",
+              "Only the owner may assert a producer",
+            ),
+          );
+        }
+        const collectedAtValue = collectedAt(
+          deps.now ?? (() => new Date()),
+          deps.storage,
+          scopeResult.scope,
+        );
         const status = deps.syncManager ? "syncing" : "stored";
         const afterTombstoneVersion = await ingestTombstoneMarker(
           deps,
@@ -1725,6 +1891,15 @@ export async function handlePersonalServerDataRequest(
         // data needs no schema at all — we ingest it schemaless. (Structured JSON
         // below still resolves a schema for validation/metadata.)
         if (!isJsonContentType(request)) {
+          if (producerHeader.producer) {
+            return failWrite(
+              errorResponse(
+                400,
+                "INVALID_PRODUCER",
+                "Producer attribution requires a JSON body",
+              ),
+            );
+          }
           const bytes = new Uint8Array(await request.arrayBuffer());
           const metadata = parseMetadataHeader(
             request.headers.get("x-vana-metadata"),
@@ -1748,6 +1923,7 @@ export async function handlePersonalServerDataRequest(
             attribution: writeAuth?.attribution,
             lineage,
             afterTombstoneVersion,
+            precondition: parsedPrecondition,
           });
           if (!result.ok) return failWrite(contractErrorResponse(result));
           committed = true;
@@ -1777,6 +1953,11 @@ export async function handlePersonalServerDataRequest(
           "Request body must be valid JSON",
         );
         if (!parsed.ok) return failWrite(contractResponse(parsed.result));
+        const provenance = await parseProducerProvenance(
+          producerHeader.encodedProvenance,
+          parsed.body,
+        );
+        if (provenance instanceof Response) return failWrite(provenance);
         // Derivative writes: validate the caller's `lineage` before anything
         // is stored (a failure here throws, releasing the builder's proof).
         const lineage = await prepareWriteLineage(
@@ -1795,6 +1976,9 @@ export async function handlePersonalServerDataRequest(
           attribution: writeAuth?.attribution,
           lineage,
           afterTombstoneVersion,
+          precondition: parsedPrecondition,
+          producer: producerHeader.producer,
+          producerProvenance: provenance,
         });
         if (!result.ok) return failWrite(contractErrorResponse(result));
         committed = true;
@@ -1837,7 +2021,7 @@ export async function handlePersonalServerDataRequest(
                   ? err.cause.message
                   : String(err.cause),
             },
-            "Envelope written but indexing failed; record persisted unindexed",
+            "Envelope write incomplete after durable commit; boot recovery may finish it",
           );
         } else if (!committed) {
           await writeAuth?.releaseProof?.();

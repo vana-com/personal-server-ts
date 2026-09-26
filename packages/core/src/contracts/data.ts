@@ -1,5 +1,9 @@
 import { type DataStoragePort } from "../ports/index.js";
-import type { IndexEntry, ScopeSummary } from "../storage/index/types.js";
+import type {
+  IndexEntry,
+  NewIndexEntry,
+  ScopeSummary,
+} from "../storage/index/types.js";
 import {
   createDataFileEnvelope,
   ScopeSchema,
@@ -29,16 +33,29 @@ export type DataContractErrorCode =
    * need different operator responses — one is "no data yet", the other is
    * an index/storage divergence that wants repairing.
    */
-  | "DATA_FILE_MISSING";
+  | "DATA_FILE_MISSING"
+  | "PRECONDITION_FAILED";
+
+export type LegacyProducer = "pdpp-projector" | "pdpp-import-projection";
+export interface LegacyProducerProvenance {
+  projector_version: string;
+  declaration_digest: string;
+  inputs: Array<{ stream: string; changes_since_token: string }>;
+  payload_sha256: string;
+}
+export type LegacyPrecondition =
+  { kind: "none" } | { kind: "match"; version: number };
 
 export interface DataContractErrorBody {
   error: DataContractErrorCode;
   message: string;
+  current_version?: number | null;
+  current_producer?: string | null;
 }
 
 export interface DataContractError {
   ok: false;
-  status: 400 | 404;
+  status: 400 | 404 | 412;
   body: DataContractErrorBody;
 }
 
@@ -89,6 +106,9 @@ export interface ListDataVersionsContractResult {
       fileId: string | null;
       schemaId: string | null;
       collectedAt: string;
+      version: number;
+      producer: LegacyProducer | null;
+      producer_provenance: LegacyProducerProvenance | null;
     }>;
     total: number;
     limit: number;
@@ -110,9 +130,9 @@ export interface ReadDataContractResult {
 }
 
 /**
- * Thrown by the ingest contracts when the envelope was already written to
- * storage but a later step (indexing) failed. The record is on disk and a
- * re-index can surface it, so callers must treat the write as persisted:
+ * Thrown when an ingest has crossed the durable-write boundary but a later
+ * step failed. Boot recovery or re-index can finish it, so callers must
+ * treat the write as persisted:
  * never retry it under the same proof, never release a replay reservation.
  */
 export class IngestPersistedError extends Error {
@@ -121,7 +141,7 @@ export class IngestPersistedError extends Error {
     public readonly cause: unknown,
   ) {
     super(
-      `Envelope written to ${relativePath} but indexing failed: ${
+      `Envelope persisted at ${relativePath} but write did not complete: ${
         cause instanceof Error ? cause.message : String(cause)
       }`,
     );
@@ -138,6 +158,40 @@ async function indexWrittenEnvelope(
   } catch (err) {
     throw new IngestPersistedError(entry.path, err);
   }
+}
+
+async function commitWrittenEnvelope(
+  storage: DataStoragePort,
+  envelope: DataFileEnvelope,
+  entry: Omit<NewIndexEntry, "path" | "sizeBytes"> & { sizeBytes?: number },
+  precondition?: LegacyPrecondition,
+): Promise<{ ok: true; writeResult: WriteResult } | DataContractError> {
+  if (storage.commitEnvelope) {
+    const result = await storage.commitEnvelope(envelope, entry, precondition);
+    if (!result.ok) {
+      return {
+        ok: false,
+        status: 412,
+        body: {
+          error: "PRECONDITION_FAILED",
+          message: "Scope version precondition failed",
+          current_version: result.currentVersion,
+          current_producer: result.currentProducer,
+        },
+      };
+    }
+    return result;
+  }
+  if (precondition) {
+    throw new Error("Conditional legacy writes require atomic storage support");
+  }
+  const writeResult = await storage.writeEnvelope(envelope);
+  await indexWrittenEnvelope(storage, {
+    ...entry,
+    path: writeResult.relativePath,
+    sizeBytes: entry.sizeBytes ?? writeResult.sizeBytes,
+  });
+  return { ok: true, writeResult };
 }
 
 export interface IngestDataContractInput {
@@ -162,6 +216,9 @@ export interface IngestDataContractInput {
   lineage?: StoredLineage;
   /** See `IndexEntry.afterTombstoneVersion`. */
   afterTombstoneVersion?: number | null;
+  precondition?: LegacyPrecondition;
+  producer?: LegacyProducer;
+  producerProvenance?: LegacyProducerProvenance;
 }
 
 export interface IngestDataContractResult {
@@ -194,6 +251,7 @@ export interface IngestBinaryDataContractInput {
   lineage?: StoredLineage;
   /** See `IndexEntry.afterTombstoneVersion`. */
   afterTombstoneVersion?: number | null;
+  precondition?: LegacyPrecondition;
 }
 
 export interface DeleteDataScopeContractInput {
@@ -355,6 +413,11 @@ export async function listDataVersionsContract(
         fileId: entry.fileId,
         schemaId: entry.schemaId,
         collectedAt: entry.collectedAt,
+        version: entry.casRevision ?? entry.version,
+        producer: entry.producer ?? null,
+        producer_provenance: entry.producerProvenance
+          ? (JSON.parse(entry.producerProvenance) as LegacyProducerProvenance)
+          : null,
       })),
       total,
       limit,
@@ -474,26 +537,40 @@ export async function ingestDataContract(
     };
   }
 
-  const envelope = createDataFileEnvelope(
-    scopeResult.scope,
-    input.collectedAt,
-    stampServerKeys(input.body, input),
+  const envelope = {
+    ...createDataFileEnvelope(
+      scopeResult.scope,
+      input.collectedAt,
+      stampServerKeys(input.body, input),
+    ),
+    ...(input.producer ? { producer: input.producer } : {}),
+    ...(input.producerProvenance
+      ? { producer_provenance: input.producerProvenance }
+      : {}),
+  };
+  const committed = await commitWrittenEnvelope(
+    input.storage,
+    envelope,
+    {
+      fileId: null,
+      schemaId: null,
+      scope: scopeResult.scope,
+      collectedAt: input.collectedAt,
+      afterTombstoneVersion: input.afterTombstoneVersion ?? null,
+      producer: input.producer ?? null,
+      producerProvenance: input.producerProvenance
+        ? JSON.stringify(input.producerProvenance)
+        : null,
+    },
+    input.precondition,
   );
-  const writeResult = await input.storage.writeEnvelope(envelope);
+  if (!committed.ok) return committed;
+  const { writeResult } = committed;
   try {
     await writeBlockSidecars(input.storage, envelope);
   } catch {
     // Best-effort bounded sidecars: raw envelope storage remains the source of truth.
   }
-  await indexWrittenEnvelope(input.storage, {
-    fileId: null,
-    schemaId: null,
-    path: writeResult.relativePath,
-    scope: scopeResult.scope,
-    collectedAt: input.collectedAt,
-    sizeBytes: writeResult.sizeBytes,
-    afterTombstoneVersion: input.afterTombstoneVersion ?? null,
-  });
 
   return {
     ok: true,
@@ -591,21 +668,26 @@ export async function ingestBinaryDataContract(
     input.collectedAt,
     stampServerKeys(data, input),
   );
-  const writeResult = await input.storage.writeEnvelope(envelope);
+  const committed = await commitWrittenEnvelope(
+    input.storage,
+    envelope,
+    {
+      fileId: null,
+      schemaId: null,
+      scope: scopeResult.scope,
+      collectedAt: input.collectedAt,
+      sizeBytes: input.bytes.length,
+      afterTombstoneVersion: input.afterTombstoneVersion ?? null,
+    },
+    input.precondition,
+  );
+  if (!committed.ok) return committed;
+  const { writeResult } = committed;
   try {
     await writeBlockSidecars(input.storage, envelope);
   } catch {
     // Best-effort bounded sidecars: raw envelope storage remains the source of truth.
   }
-  await indexWrittenEnvelope(input.storage, {
-    fileId: null,
-    schemaId: null,
-    path: writeResult.relativePath,
-    scope: scopeResult.scope,
-    collectedAt: input.collectedAt,
-    sizeBytes: input.bytes.length,
-    afterTombstoneVersion: input.afterTombstoneVersion ?? null,
-  });
 
   return {
     ok: true,

@@ -10,7 +10,14 @@ import {
   readScopeBlocks,
   writeBlockManifest,
   writeDataFile,
+  stageDataFile,
+  publishStagedDataFile,
 } from "./hierarchy.js";
+import { readFile, readdir, stat, unlink } from "node:fs/promises";
+import { join, relative } from "node:path";
+import { DataFileEnvelopeSchema } from "@opendatalabs/vana-sdk/browser";
+import { IngestPersistedError } from "@opendatalabs/personal-server-ts-core/contracts";
+import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type {
@@ -24,6 +31,117 @@ import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/node";
 export interface NodeDataStorageDeps {
   indexManager: IndexManager;
   hierarchyOptions: HierarchyManagerOptions;
+}
+
+/** Finish committed stages and discard stages that lost their index race. */
+export async function recoverStagedDataFiles(
+  deps: NodeDataStorageDeps,
+): Promise<void> {
+  const visit = async (dir: string): Promise<void> => {
+    for (const item of await readdir(dir, { withFileTypes: true })) {
+      const path = join(dir, item.name);
+      if (item.isDirectory()) {
+        await visit(path);
+      } else if (item.isFile()) {
+        const marker = item.name.indexOf(".json.pending.");
+        if (marker < 0) continue;
+        const finalPath = join(
+          dir,
+          item.name.slice(0, marker + ".json".length),
+        );
+        const indexed = deps.indexManager.findByPath(
+          relative(deps.hierarchyOptions.dataDir, finalPath),
+        );
+        if (!indexed) {
+          await unlink(path);
+          continue;
+        }
+        // A leftover stage can share the final path of a prior committed
+        // write after a restart. The existing final file wins: this stage
+        // cannot be identified as the one that created the older index row.
+        try {
+          await stat(finalPath);
+          await unlink(path);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          await publishStagedDataFile(path, finalPath);
+        }
+      }
+    }
+  };
+  await visit(deps.hierarchyOptions.dataDir);
+}
+
+/** Rebuild a lost legacy index from finalized envelopes, never from stages. */
+export async function reindexLegacyDataFiles(
+  deps: NodeDataStorageDeps & {
+    closeRecoveredScopeForWrites?: (
+      scope: string,
+    ) => boolean | Promise<boolean>;
+  },
+): Promise<number> {
+  const dataDir = deps.hierarchyOptions.dataDir;
+  let recovered = 0;
+  const recoveredScopes = new Set<string>();
+  const visit = async (dir: string): Promise<void> => {
+    for (const item of (await readdir(dir, { withFileTypes: true })).sort(
+      (a, b) => a.name.localeCompare(b.name),
+    )) {
+      if (dir === dataDir && item.name === "blocks") continue;
+      const path = join(dir, item.name);
+      if (item.isDirectory()) {
+        await visit(path);
+        continue;
+      }
+      if (!item.isFile() || !item.name.endsWith(".json")) continue;
+      const relativePath = relative(dataDir, path);
+      if (deps.indexManager.findByPath(relativePath)) continue;
+      let raw: unknown;
+      try {
+        raw = JSON.parse(await readFile(path, "utf8"));
+      } catch {
+        continue;
+      }
+      const parsed = DataFileEnvelopeSchema.passthrough().safeParse(raw);
+      if (!parsed.success) continue;
+      const envelope = parsed.data;
+      if (
+        buildDataFilePath(dataDir, envelope.scope, envelope.collectedAt) !==
+        path
+      ) {
+        continue;
+      }
+      const bytes = (await stat(path)).size;
+      const closeAfterInsert = await deps.closeRecoveredScopeForWrites?.(
+        envelope.scope,
+      );
+      deps.indexManager.insertRecovered({
+        fileId: null,
+        schemaId: envelope.schemaId ?? null,
+        path: relativePath,
+        scope: envelope.scope,
+        collectedAt: envelope.collectedAt,
+        sizeBytes: bytes,
+        producer:
+          envelope.producer === "pdpp-projector" ||
+          envelope.producer === "pdpp-import-projection"
+            ? envelope.producer
+            : null,
+        producerProvenance:
+          envelope.producer_provenance &&
+          typeof envelope.producer_provenance === "object"
+            ? JSON.stringify(envelope.producer_provenance)
+            : null,
+      });
+      if (closeAfterInsert && !recoveredScopes.has(envelope.scope)) {
+        deps.indexManager.closeScopeForWrites(envelope.scope);
+        recoveredScopes.add(envelope.scope);
+      }
+      recovered++;
+    }
+  };
+  await visit(dataDir);
+  return recovered;
 }
 
 export function createNodeDataStorage(
@@ -91,6 +209,39 @@ export function createNodeDataStorage(
     },
     writeEnvelope(envelope: DataFileEnvelope) {
       return writeDataFile(deps.hierarchyOptions, envelope);
+    },
+    async commitEnvelope(envelope, entry, precondition) {
+      const staged = await stageDataFile(deps.hierarchyOptions, envelope);
+      let indexed = false;
+      try {
+        const result = deps.indexManager.insertIfCurrent(
+          {
+            ...entry,
+            path: staged.relativePath,
+            sizeBytes: entry.sizeBytes ?? staged.sizeBytes,
+          },
+          precondition,
+        );
+        if (!result.ok) {
+          return result;
+        }
+        indexed = true;
+        await publishStagedDataFile(staged.stagePath, staged.finalPath);
+        return {
+          ok: true as const,
+          writeResult: {
+            path: staged.finalPath,
+            relativePath: staged.relativePath,
+            sizeBytes: staged.sizeBytes,
+          },
+        };
+      } catch (err) {
+        if (indexed) throw new IngestPersistedError(staged.relativePath, err);
+        throw err;
+      } finally {
+        // An indexed stage must survive a failed rename for boot recovery.
+        if (!indexed) await unlink(staged.stagePath);
+      }
     },
     writeBlockManifest(scope, collectedAt, manifest, blocks) {
       return writeBlockManifest(

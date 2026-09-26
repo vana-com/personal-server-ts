@@ -7,7 +7,6 @@ import {
   readdir,
   unlink,
   rename,
-  stat,
   rm,
 } from "node:fs/promises";
 import { createReadStream } from "node:fs";
@@ -40,33 +39,87 @@ const TEXT_PAGE_MEDIA_TYPE = "text/plain; charset=utf-8";
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
-/** Atomic write: mkdir -p, write temp file, rename */
+/** Publish a durable envelope before callers make it visible in the index. */
 export async function writeDataFile(
   options: HierarchyManagerOptions,
   envelope: DataFileEnvelope,
 ): Promise<WriteResult> {
-  const filePath = buildDataFilePath(
+  const staged = await stageDataFile(options, envelope);
+  await publishStagedDataFile(staged.stagePath, staged.finalPath);
+  return {
+    path: staged.finalPath,
+    relativePath: staged.relativePath,
+    sizeBytes: staged.sizeBytes,
+  };
+}
+
+/** Stage and fsync an envelope before an index transaction makes it visible. */
+export async function stageDataFile(
+  options: HierarchyManagerOptions,
+  envelope: DataFileEnvelope,
+  deps: { openFile?: typeof open } = {},
+): Promise<{
+  finalPath: string;
+  stagePath: string;
+  relativePath: string;
+  sizeBytes: number;
+}> {
+  const openFile = deps.openFile ?? open;
+  const finalPath = buildDataFilePath(
     options.dataDir,
     envelope.scope,
     envelope.collectedAt,
   );
-  const dir = dirname(filePath);
-
-  await mkdir(dir, { recursive: true });
-
-  const content = JSON.stringify(envelope, null, 2);
-  const tempPath = filePath + ".tmp." + randomUUID();
-
-  await writeFile(tempPath, content, "utf-8");
-  await rename(tempPath, filePath);
-
-  const stats = await stat(filePath);
-
+  const finalDir = dirname(finalPath);
+  const directorySyncPaths = collectDirectorySyncPaths(finalDir);
+  await mkdir(finalDir, { recursive: true });
+  const stagePath = `${finalPath}.pending.${randomUUID()}`;
+  const bytes = Buffer.from(JSON.stringify(envelope, null, 2), "utf-8");
+  const handle = await openFile(stagePath, "wx");
+  try {
+    await handle.writeFile(bytes);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  for (const directoryPath of directorySyncPaths) {
+    const directory = await openFile(directoryPath, "r");
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
+  }
   return {
-    path: filePath,
-    relativePath: relative(options.dataDir, filePath),
-    sizeBytes: stats.size,
+    finalPath,
+    stagePath,
+    relativePath: relative(options.dataDir, finalPath),
+    sizeBytes: bytes.length,
   };
+}
+
+function collectDirectorySyncPaths(finalDir: string): string[] {
+  const paths: string[] = [];
+  let current = finalDir;
+  while (true) {
+    paths.unshift(current);
+    const parent = dirname(current);
+    if (parent === current) return paths;
+    current = parent;
+  }
+}
+
+export async function publishStagedDataFile(
+  stagePath: string,
+  finalPath: string,
+): Promise<void> {
+  await rename(stagePath, finalPath);
+  const directory = await open(dirname(finalPath), "r");
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
 }
 
 /** Read and parse a data file */
@@ -77,7 +130,7 @@ export async function readDataFile(
 ): Promise<DataFileEnvelope> {
   const filePath = buildDataFilePath(options.dataDir, scope, collectedAt);
   const content = await readFile(filePath, "utf-8");
-  return DataFileEnvelopeSchema.parse(JSON.parse(content));
+  return DataFileEnvelopeSchema.passthrough().parse(JSON.parse(content));
 }
 
 /** Read a data file without decoding or parsing its potentially large body. */

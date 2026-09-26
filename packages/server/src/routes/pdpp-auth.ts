@@ -60,6 +60,7 @@ import {
   validateCodeChallenge,
   validateRedirectUri,
   validateSelectionRequest,
+  type ApprovalFailure,
   type DeclarationSnapshot,
   type GrantStatus,
   type InstanceInventory,
@@ -190,6 +191,110 @@ function bearer(c: Context): string | undefined {
   if (!header?.toLowerCase().startsWith("bearer ")) return undefined;
   const token = header.slice(7).trim();
   return token.length > 0 ? token : undefined;
+}
+
+function resolveScopedOwnerToken(
+  deps: PdppAuthRouteDeps,
+  ownerToken: string | undefined,
+  subjectId?: string,
+):
+  | { ok: true; subjectId: string; instanceId: string }
+  | { ok: false; failure: ApprovalFailure } {
+  if (!ownerToken) {
+    return {
+      ok: false,
+      failure: {
+        code: "unauthorized",
+        message: "a scoped owner token is required",
+      },
+    };
+  }
+
+  const context = deps.tokens.resolveToken(ownerToken);
+  if (!context.active || context.tokenKind !== "owner" || !context.subjectId) {
+    return {
+      ok: false,
+      failure: {
+        code: "unauthorized",
+        message: "an active scoped owner token is required",
+      },
+    };
+  }
+  if (subjectId && context.subjectId !== subjectId) {
+    return {
+      ok: false,
+      failure: {
+        code: "session_not_found",
+        message: "authorization session not found",
+      },
+    };
+  }
+  if (!context.instanceIds || context.instanceIds.length !== 1) {
+    return {
+      ok: false,
+      failure: {
+        code: "access_denied",
+        message: "owner token is not scoped to an instance",
+      },
+    };
+  }
+  return {
+    ok: true,
+    subjectId: context.subjectId,
+    instanceId: context.instanceIds[0],
+  };
+}
+
+function inventoryWithinOwnerScope(
+  inventory: InstanceInventory,
+  instanceId: string,
+): InstanceInventory {
+  return {
+    eligibleFor(streamName: string) {
+      return inventory
+        .eligibleFor(streamName)
+        .filter((eligibleInstanceId) => eligibleInstanceId === instanceId);
+    },
+  };
+}
+
+function scopedOwnerCoversSnapshot(
+  deps: PdppAuthRouteDeps,
+  subjectId: string,
+  instanceId: string,
+  snapshot: DeclarationSnapshot,
+): boolean {
+  const inventory = deps.inventoryFor(subjectId, snapshot.source_id);
+  return snapshot.streams.some((stream) =>
+    inventory.eligibleFor(stream.name).includes(instanceId),
+  );
+}
+
+function grantContainedByOwnerScope(
+  deps: PdppAuthRouteDeps,
+  subjectId: string,
+  stored: StoredGrant,
+  instanceId: string,
+): boolean {
+  const snapshot = deps.resolveDeclaration(stored.grant.source.id);
+  if (!snapshot) return false;
+  if (!scopedOwnerCoversSnapshot(deps, subjectId, instanceId, snapshot)) {
+    return false;
+  }
+  return stored.grant.streams.every((stream) =>
+    stream.instance_ids.every(
+      (grantedInstanceId) => grantedInstanceId === instanceId,
+    ),
+  );
+}
+
+function scopedOwnerFailureResponse(c: Context, failure: ApprovalFailure) {
+  return errorResponse(
+    c,
+    failure.code === "access_denied" ? 403 : approvalStatus(failure.code),
+    approvalOAuthError(failure.code),
+    failure.message,
+  );
 }
 
 /**
@@ -357,7 +462,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
    * `ownerSubjectId` resolves the verified signer to the PDPP subject; a
    * deployment that maps wallets to subjects differently supplies its own.
    */
-  app.post("/owner/token", (c) => {
+  app.post("/owner/token", async (c) => {
     // With `ownerAuth` wired, the middleware above has already verified a
     // wallet signature and confirmed the signer is the server owner, so
     // `c.get("auth").signer` is a proven identity rather than a claim.
@@ -380,8 +485,56 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       );
     }
 
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "owner token exchange requires JSON body {source_id, instance_id}",
+      );
+    }
+    if (body === null || typeof body !== "object" || Array.isArray(body)) {
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "owner token exchange requires JSON body {source_id, instance_id}",
+      );
+    }
+    const tokenRequest = body as Record<string, unknown>;
+    const sourceId = tokenRequest.source_id;
+    const instanceId = tokenRequest.instance_id;
+    if (typeof sourceId !== "string" || typeof instanceId !== "string") {
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "owner token exchange requires exactly one source_id and one instance_id",
+      );
+    }
+    const declaration = deps.resolveDeclaration(sourceId);
+    if (!declaration) {
+      return errorResponse(c, 404, "not_found", "source declaration not found");
+    }
+    const inventory = deps.inventoryFor(subjectId, sourceId);
+    const ownsInstance = declaration.streams.some((stream) =>
+      inventory.eligibleFor(stream.name).includes(instanceId),
+    );
+    if (!ownsInstance) {
+      return errorResponse(
+        c,
+        403,
+        "access_denied",
+        "instance_id is not owned by the authenticated subject for this source",
+      );
+    }
+
     const issued = deps.tokens.issueOwnerToken({
       subjectId,
+      instanceIds: [instanceId],
       ttlSeconds: OWNER_TOKEN_TTL_SECONDS,
     });
     deps.logger.info(
@@ -515,6 +668,20 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         "no retained declaration snapshot for the requested source",
       );
     }
+    const owner = resolveScopedOwnerToken(deps, bearer(c), subjectId);
+    if (!owner.ok) {
+      return scopedOwnerFailureResponse(c, owner.failure);
+    }
+    if (
+      !scopedOwnerCoversSnapshot(deps, subjectId, owner.instanceId, snapshot)
+    ) {
+      return errorResponse(
+        c,
+        403,
+        "access_denied",
+        "owner token is not scoped to an instance for the requested source",
+      );
+    }
 
     const validation = validateSelectionRequest(request, snapshot);
     if (!validation.ok) {
@@ -576,15 +743,38 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   app.get("/authorize/:session_id/review", (c) => {
     const sessionId = c.req.param("session_id");
     const session = deps.sessions.get(sessionId);
+    const owner = resolveScopedOwnerToken(deps, bearer(c), session?.subject_id);
+    if (!owner.ok) {
+      return scopedOwnerFailureResponse(c, owner.failure);
+    }
+    if (
+      session &&
+      !scopedOwnerCoversSnapshot(
+        deps,
+        session.subject_id,
+        owner.instanceId,
+        session.snapshot,
+      )
+    ) {
+      return errorResponse(
+        c,
+        403,
+        "access_denied",
+        "owner token is not scoped to an instance for the requested source",
+      );
+    }
 
     const result = fetchReview({
       sessions: deps.sessions,
       tokens: deps.tokens,
       sessionId,
       ownerToken: bearer(c),
-      inventory: deps.inventoryFor(
-        session?.subject_id ?? "",
-        session?.snapshot.source_id ?? "",
+      inventory: inventoryWithinOwnerScope(
+        deps.inventoryFor(
+          session?.subject_id ?? "",
+          session?.snapshot.source_id ?? "",
+        ),
+        owner.instanceId,
       ),
       instanceChoices: parseInstanceChoices(c),
       ownerChoices: parseOwnerChoices(c),
@@ -593,6 +783,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         deps.standingTermsFor?.(session?.requester.client_id ?? "") ??
         undefined,
       store: deps.store,
+      existingGrantInstanceIds: [owner.instanceId],
     });
 
     if (!result.ok) {
@@ -613,6 +804,26 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   app.post("/authorize/:session_id/approve", async (c) => {
     const sessionId = c.req.param("session_id");
     const session = deps.sessions.get(sessionId);
+    const owner = resolveScopedOwnerToken(deps, bearer(c), session?.subject_id);
+    if (!owner.ok) {
+      return scopedOwnerFailureResponse(c, owner.failure);
+    }
+    if (
+      session &&
+      !scopedOwnerCoversSnapshot(
+        deps,
+        session.subject_id,
+        owner.instanceId,
+        session.snapshot,
+      )
+    ) {
+      return errorResponse(
+        c,
+        403,
+        "access_denied",
+        "owner token is not scoped to an instance for the requested source",
+      );
+    }
 
     let body: {
       review_digest?: string;
@@ -635,9 +846,12 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       sessionId,
       ownerToken: bearer(c),
       reviewDigest: body.review_digest ?? "",
-      inventory: deps.inventoryFor(
-        session?.subject_id ?? "",
-        session?.snapshot.source_id ?? "",
+      inventory: inventoryWithinOwnerScope(
+        deps.inventoryFor(
+          session?.subject_id ?? "",
+          session?.snapshot.source_id ?? "",
+        ),
+        owner.instanceId,
       ),
       instanceChoices: body.instance_choices,
       ownerChoices: body.owner_choices,
@@ -706,6 +920,26 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   app.post("/authorize/:session_id/deny", async (c) => {
     const sessionId = c.req.param("session_id");
     const session = deps.sessions.get(sessionId);
+    const owner = resolveScopedOwnerToken(deps, bearer(c), session?.subject_id);
+    if (!owner.ok) {
+      return scopedOwnerFailureResponse(c, owner.failure);
+    }
+    if (
+      session &&
+      !scopedOwnerCoversSnapshot(
+        deps,
+        session.subject_id,
+        owner.instanceId,
+        session.snapshot,
+      )
+    ) {
+      return errorResponse(
+        c,
+        403,
+        "access_denied",
+        "owner token is not scoped to an instance for the requested source",
+      );
+    }
 
     // The owner's optional note. Read defensively: a denial must succeed even
     // when the body is absent or malformed, because refusing is the safe
@@ -861,12 +1095,51 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         "introspection requires an authenticated resource server",
       );
     }
+    if (
+      !caller.subjectId ||
+      !caller.instanceIds ||
+      caller.instanceIds.length !== 1
+    ) {
+      return errorResponse(
+        c,
+        403,
+        "access_denied",
+        "introspection requires a scoped owner token",
+      );
+    }
 
     const body = await c.req.parseBody();
     const token = asString(body.token);
     if (!token) {
       // RFC 7662: a missing token is a request error, not an inactive answer.
       return errorResponse(c, 400, "invalid_request", "token is required");
+    }
+
+    const target = deps.tokens.resolveToken(token);
+    if (target.active) {
+      if (target.grant) {
+        const stored = deps.store.getGrant(target.grant.grant_id);
+        if (
+          !stored ||
+          stored.subjectId !== caller.subjectId ||
+          !grantContainedByOwnerScope(
+            deps,
+            caller.subjectId,
+            stored,
+            caller.instanceIds[0],
+          )
+        ) {
+          return c.json({ active: false }, 200, NO_STORE);
+        }
+      } else if (
+        target.tokenKind !== "owner" ||
+        target.subjectId !== caller.subjectId ||
+        !target.instanceIds ||
+        target.instanceIds.length !== 1 ||
+        target.instanceIds[0] !== caller.instanceIds[0]
+      ) {
+        return c.json({ active: false }, 200, NO_STORE);
+      }
     }
 
     return c.json(deps.tokens.introspect(token), 200, NO_STORE);
@@ -902,6 +1175,14 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     const grants = deps.store
       .listGrantsForSubject(caller.subjectId)
       .filter((stored) => !clientFilter || stored.clientId === clientFilter)
+      .filter((stored) =>
+        grantContainedByOwnerScope(
+          deps,
+          caller.subjectId,
+          stored,
+          caller.instanceId,
+        ),
+      )
       .map((stored) => ({
         grant_id: stored.grant.grant_id,
         client_id: stored.clientId,
@@ -936,7 +1217,16 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     const stored = deps.store.getGrant(grantId);
     // Not-found for another owner's grant as well, so a caller cannot probe
     // which grant ids exist outside their own subject.
-    if (!stored || stored.subjectId !== caller.subjectId) {
+    if (
+      !stored ||
+      stored.subjectId !== caller.subjectId ||
+      !grantContainedByOwnerScope(
+        deps,
+        caller.subjectId,
+        stored,
+        caller.instanceId,
+      )
+    ) {
       return errorResponse(c, 404, "not_found", "grant not found");
     }
 
@@ -958,7 +1248,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   function resolveOwner(
     c: Context,
   ):
-    | { ok: true; subjectId: string }
+    | { ok: true; subjectId: string; instanceId: string }
     | { ok: false; response: ReturnType<typeof errorResponse> } {
     const ownerToken = bearer(c);
     if (!ownerToken) {
@@ -984,7 +1274,22 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         ),
       };
     }
-    return { ok: true, subjectId: caller.subjectId };
+    if (!caller.instanceIds || caller.instanceIds.length !== 1) {
+      return {
+        ok: false,
+        response: errorResponse(
+          c,
+          403,
+          "access_denied",
+          "a scoped owner token is required",
+        ),
+      };
+    }
+    return {
+      ok: true,
+      subjectId: caller.subjectId,
+      instanceId: caller.instanceIds[0],
+    };
   }
 
   return app;

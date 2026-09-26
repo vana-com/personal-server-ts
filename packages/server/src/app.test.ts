@@ -185,6 +185,22 @@ describe("createApp", () => {
     expect(body.status).toBe("healthy");
   });
 
+  it("does not wire PDPP owner tokens into legacy POST /v1/data/:scope", async () => {
+    const app = makeApp();
+
+    const res = await app.request("/v1/data/test.scope", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        authorization: "Bearer pdpp_owner_token",
+      },
+      body: JSON.stringify({ value: 1 }),
+    });
+
+    expect(res.status).toBe(401);
+    expect(indexManager.countByScope("test.scope")).toBe(0);
+  });
+
   it("mounts enclave jobs only for the enclave profile", async () => {
     const common = {
       logger: pino({ level: "silent" }),

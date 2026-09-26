@@ -40,7 +40,10 @@ describe("initializeDatabase", () => {
     expect(columnNames).toContain("created_at");
     expect(columnNames).toContain("size_bytes");
     expect(columnNames).toContain("version");
+    expect(columnNames).toContain("cas_revision");
     expect(columnNames).toContain("data_point_id");
+    expect(columnNames).toContain("producer");
+    expect(columnNames).toContain("producer_provenance");
     db.close();
   });
 
@@ -97,7 +100,7 @@ describe("initializeDatabase", () => {
       .get("instagram/profile.json") as
       { path: string; scope: string; size_bytes: number } | undefined;
 
-    expect(version).toBe(4);
+    expect(version).toBe(7);
     expect(row).toEqual({
       path: "instagram/profile.json",
       scope: "instagram.profile",
@@ -141,18 +144,19 @@ describe("initializeDatabase", () => {
     const version = db.pragma("user_version", { simple: true });
     const row = db
       .prepare(
-        "SELECT path, schema_id, version, data_point_id FROM data_files WHERE path = ?",
+        "SELECT path, schema_id, version, cas_revision, data_point_id FROM data_files WHERE path = ?",
       )
       .get("instagram/profile.json") as
       | {
           path: string;
           schema_id: string | null;
           version: number;
+          cas_revision: number;
           data_point_id: string | null;
         }
       | undefined;
 
-    expect(version).toBe(4);
+    expect(version).toBe(7);
     expect(row).toEqual({
       path: "instagram/profile.json",
       schema_id: null,
@@ -161,6 +165,7 @@ describe("initializeDatabase", () => {
       // data_point_id null so the sync worker will register the data point
       // on the next pass.
       version: 1,
+      cas_revision: 1,
       data_point_id: null,
     });
     db.close();
@@ -200,16 +205,17 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(4);
+    expect(db.pragma("user_version", { simple: true })).toBe(7);
     const row = db
       .prepare(
-        "SELECT path, schema_id, version, data_point_id FROM data_files WHERE path = ?",
+        "SELECT path, schema_id, version, cas_revision, data_point_id FROM data_files WHERE path = ?",
       )
       .get("instagram/profile.json") as
       | {
           path: string;
           schema_id: string | null;
           version: number;
+          cas_revision: number;
           data_point_id: string | null;
         }
       | undefined;
@@ -217,6 +223,7 @@ describe("initializeDatabase", () => {
       path: "instagram/profile.json",
       schema_id: "0xschema",
       version: 1,
+      cas_revision: 1,
       data_point_id: null,
     });
     db.close();
@@ -258,15 +265,16 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(4);
+    expect(db.pragma("user_version", { simple: true })).toBe(7);
     const row = db
       .prepare(
-        "SELECT path, version, data_point_id, after_tombstone_version FROM data_files WHERE path = ?",
+        "SELECT path, version, cas_revision, data_point_id, after_tombstone_version FROM data_files WHERE path = ?",
       )
       .get("instagram/profile.json") as
       | {
           path: string;
           version: number;
+          cas_revision: number;
           data_point_id: string | null;
           after_tombstone_version: number | null;
         }
@@ -276,9 +284,38 @@ describe("initializeDatabase", () => {
     expect(row).toEqual({
       path: "instagram/profile.json",
       version: 7,
+      cas_revision: 7,
       data_point_id: "0xdp",
       after_tombstone_version: null,
     });
+    db.close();
+    await rm(tempDir, { recursive: true });
+  });
+
+  it("migrates a v6 scope revision without closing it for writes", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "schema-migrate-v6-"));
+    const dbPath = join(tempDir, "index.db");
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE scope_revisions (
+        scope TEXT PRIMARY KEY,
+        cas_revision INTEGER NOT NULL
+      );
+      INSERT INTO scope_revisions (scope, cas_revision)
+      VALUES ('instagram.profile', 4);
+      PRAGMA user_version = 6;
+    `);
+    legacy.close();
+
+    const db = initializeDatabase(dbPath);
+    expect(db.pragma("user_version", { simple: true })).toBe(7);
+    expect(
+      db
+        .prepare(
+          "SELECT cas_revision, closed_for_writes FROM scope_revisions WHERE scope = ?",
+        )
+        .get("instagram.profile"),
+    ).toEqual({ cas_revision: 4, closed_for_writes: 0 });
     db.close();
     await rm(tempDir, { recursive: true });
   });

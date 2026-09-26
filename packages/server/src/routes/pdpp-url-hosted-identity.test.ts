@@ -49,6 +49,7 @@ const CHALLENGE = computeS256Challenge(VERIFIER);
 /** The client is identified BY the URL its document lives at. */
 const CLIENT_ID = "https://client.example.com/pdpp-client.json";
 const REDIRECT = "https://client.example.com/callback";
+const OWNER_INSTANCE = "spotify-account-a";
 
 const DOCUMENT_NAME = "Document Name";
 const INLINE_NAME = "Inline Name";
@@ -78,7 +79,7 @@ let servedDocument: string;
 let servedStatus: number;
 
 const inventory: InstanceInventory = {
-  eligibleFor: () => ["spotify-account-a"],
+  eligibleFor: () => [OWNER_INSTANCE],
 };
 
 function authorizeBody(overrides: Record<string, unknown> = {}) {
@@ -150,13 +151,19 @@ afterEach(() => {
 
 /** A genuinely minted owner token, as the consent surface would hold. */
 function ownerToken() {
-  return tokens.issueOwnerToken({ subjectId: OWNER }).access_token;
+  return tokens.issueOwnerToken({
+    subjectId: OWNER,
+    instanceIds: [OWNER_INSTANCE],
+  }).access_token;
 }
 
 async function openSession(body: unknown = authorizeBody()) {
   return app.request("/pdpp/v1/authorize", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${ownerToken()}`,
+    },
     body: JSON.stringify(body),
   });
 }
