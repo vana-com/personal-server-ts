@@ -276,6 +276,13 @@ function parseHorizon(value: unknown): number {
   return horizon;
 }
 
+function parseOffset(value: unknown): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new InvalidCursorError();
+  }
+  return value;
+}
+
 function instanceHasRecords(db: Database, instance: string): boolean {
   const row = db
     .prepare(
@@ -975,7 +982,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         payload.sinceHorizon !== null
           ? parseHorizon(payload.sinceHorizon)
           : null;
-      offset = payload.offset;
+      offset = parseOffset(payload.offset);
     } else if (options.changesSince) {
       let payload;
       try {

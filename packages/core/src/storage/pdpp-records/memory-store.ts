@@ -37,6 +37,13 @@ function rowKey(instance: string, stream: string, recordKey: string): RowKey {
   return `${instance}\0${stream}\0${recordKey}`;
 }
 
+function parseOffset(value: unknown): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new InvalidCursorError();
+  }
+  return value;
+}
+
 /** A history entry: every version ever written for a row, in write order. */
 interface HistoryEntry {
   instance: string;
@@ -307,7 +314,7 @@ export function createMemoryRecordStore(): PdppRecordStore {
       assertCursorScope(payload, stream);
       horizon = payload.horizon;
       sinceHorizon = payload.sinceHorizon;
-      offset = payload.offset;
+      offset = parseOffset(payload.offset);
     } else if (options.changesSince) {
       let payload;
       try {
