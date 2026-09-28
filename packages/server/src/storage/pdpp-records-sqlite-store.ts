@@ -815,6 +815,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         throw new PdppBindingError("binding_generation_mismatch");
       }
 
+      // A registered connection has one method for its lifetime. Reset may
+      // erase its data and advance the generation, but it cannot rebind the
+      // connection to another method.
+      if (current.source_id !== null && current.method !== input.nextMethod) {
+        throw new PdppBindingError("connection_conflict");
+      }
+
       eraseInstanceData(input.instance);
       const resetClock = (nextWriteSeq.get() as { value: number }).value;
       db.prepare(
@@ -859,21 +866,6 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       const current = ensureBinding(db, input.instance);
       if (current.deleted_at !== null) {
         throw new PdppBindingError("connection_deleted");
-      }
-      const hasRows = instanceHasRecords(db, input.instance);
-      const legacyId = !uuidConnectionId;
-      if (
-        legacyId &&
-        current.method !== null &&
-        current.method !== input.method
-      ) {
-        throw new PdppBindingError("connection_method_unknown");
-      }
-      if (legacyId && current.method === null && hasRows) {
-        throw new PdppBindingError("connection_method_unknown");
-      }
-      if (!legacyId && current.method === null && hasRows) {
-        throw new PdppBindingError("connection_method_unknown");
       }
       if (
         current.source_id !== null &&
