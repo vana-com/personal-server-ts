@@ -432,8 +432,10 @@ export interface PdppIntrospectionResponse {
   active: boolean;
   pdpp_token_kind?: PdppTokenKind;
   subject_id?: string;
-  /** Owner tokens only. Exactly one instance for tokens minted by /owner/token. */
+  /** Owner tokens only. Source-wide tokens may omit an instance list. */
   instance_ids?: string[];
+  /** Owner tokens only. Limits the token to one source's connections. */
+  source_id?: string;
   grant_id?: string;
   client_id?: string;
   /** Unix epoch seconds. Omitted when the token never expires. */
@@ -462,6 +464,8 @@ export interface PdppTokenContext {
   subjectId?: string;
   /** Owner tokens only. The RS enforces this persisted scope directly. */
   instanceIds?: string[];
+  /** Owner tokens only. The AS and RS enforce this source scope directly. */
+  sourceId?: string;
   /** Client tokens only. An owner token carries no grant. */
   grant?: Grant;
   clientId?: string;
