@@ -508,7 +508,7 @@ describe("P6: scoped owner tokens on a real server", () => {
 
     const ownedRead = await read(ctx, ouraToken, bindingPath);
     expect(ownedRead.status).toBe(200);
-    expect(ownedRead.body).toMatchObject({ method: null, generation: 1 });
+    expect(ownedRead.body).toMatchObject({ method: "oura", generation: 1 });
   });
 });
 
@@ -753,7 +753,7 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
       token,
       `/pdpp/instances/${encodeURIComponent(instance)}/binding`,
     );
-    expect(binding.body).toMatchObject({ method: null, empty: true });
+    expect(binding.body).toMatchObject({ method: "oura", empty: true });
     expect(storeCounters()).toEqual({ clock: 0, changes: 0 });
   });
 
@@ -769,7 +769,7 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
       `/pdpp/instances/${encodeURIComponent(instance)}/binding`,
     );
     expect(binding.body).toMatchObject({
-      method: null,
+      method: "oura",
       generation: 1,
       empty: true,
       configured_active_method: "oura",
@@ -1515,7 +1515,7 @@ describe("P10c and method authority over HTTP", () => {
     });
   });
 
-  it("reads a binding over HTTP without creating a binding row", async () => {
+  it("reads the account-one binding registered during boot", async () => {
     const { token } = await bootSwitchable();
     const instance = `oura:${owner}`;
     const bindingRows = () => {
@@ -1537,14 +1537,15 @@ describe("P10c and method authority over HTTP", () => {
     );
     expect(binding.status).toBe(200);
     expect(binding.body).toMatchObject({
-      method: null,
+      method: "oura",
       generation: 1,
       empty: true,
       configured_active_method: "oura",
     });
-    expect(bindingRows()).toBe(0);
+    // The registry migration creates account-1's binding row on boot.
+    expect(bindingRows()).toBe(2);
     await seedEvents(token, instance, ["a1"]);
-    expect(bindingRows()).toBe(1);
+    expect(bindingRows()).toBe(2);
   });
 
   it("keeps a keyset cursor valid across later writes without a reset", async () => {
@@ -1606,6 +1607,9 @@ describe("P10c and method authority over HTTP", () => {
     // A pre-binding instance: rows exist, the binding has no method.
     const db = new Database(join(tempDir, "index.db"));
     try {
+      db.prepare(
+        "UPDATE pdpp_instance_binding SET method = NULL, source_id = NULL, label = '', deleted_at = NULL WHERE instance = ?",
+      ).run(instance);
       db.prepare(
         `INSERT INTO pdpp_records (instance, stream, record_key, data, version, emitted_at, deleted, deleted_at, blob_id)
          VALUES (?, 'events', 'legacy', ?, 1, '2026-08-01T00:00:00Z', 0, NULL, NULL)`,
@@ -2126,7 +2130,7 @@ describe("P7: stream snapshot replace", () => {
         token,
         `/pdpp/instances/${encodeURIComponent(instance)}/binding`,
       );
-    expect((await binding()).body.method).toBeNull();
+    expect((await binding()).body.method).toBe("oura");
 
     const first = await replace(ctx, token, "profile", {
       instance,

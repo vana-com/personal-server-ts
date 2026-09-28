@@ -44,6 +44,9 @@ describe("createPdppRecordsDeps: instancesForSubject", () => {
       serverOwner: SERVER_OWNER,
       resource: "https://ps.example.com",
       logger: pino({ level: "silent" }),
+      configuredMethods: [
+        { sourceId: DECLARATION.source_id, methodId: "spotify" },
+      ],
     });
     expect(deps).toBeDefined();
     const instances = deps!.instancesForSubject!(SERVER_OWNER);
@@ -58,6 +61,9 @@ describe("createPdppRecordsDeps: instancesForSubject", () => {
       serverOwner: SERVER_OWNER,
       resource: "https://ps.example.com",
       logger: pino({ level: "silent" }),
+      configuredMethods: [
+        { sourceId: DECLARATION.source_id, methodId: "spotify" },
+      ],
     });
     const instances = deps!.instancesForSubject!(SERVER_OWNER.toUpperCase());
     expect(instances).toEqual([`spotify:${SERVER_OWNER.toLowerCase()}`]);
@@ -75,10 +81,43 @@ describe("createPdppRecordsDeps: instancesForSubject", () => {
       serverOwner: SERVER_OWNER,
       resource: "https://ps.example.com",
       logger: pino({ level: "silent" }),
+      configuredMethods: [
+        { sourceId: DECLARATION.source_id, methodId: "spotify" },
+      ],
     });
     expect(deps).toBeDefined();
     const instances = deps!.instancesForSubject!(OTHER_SUBJECT);
     expect(instances).toEqual([]);
+  });
+
+  it("restores a registered connection's configured method after restart", () => {
+    const options = {
+      pdppAuth: fakePdppAuth(),
+      declarations: [DECLARATION],
+      db,
+      serverOwner: SERVER_OWNER,
+      resource: "https://ps.example.com",
+      logger: pino({ level: "silent" }),
+      configuredMethods: [
+        { sourceId: DECLARATION.source_id, methodId: "spotify" },
+      ],
+    };
+    const firstBoot = createPdppRecordsDeps(options)!;
+    const connectionId = "conn_123e4567-e89b-42d3-a456-426614174000";
+    firstBoot.bindingStore.registerConnection({
+      instance: connectionId,
+      sourceId: DECLARATION.source_id,
+      method: "spotify",
+      label: "Work",
+    });
+
+    const nextBoot = createPdppRecordsDeps(options)!;
+    expect(nextBoot.configuredMethods.get(connectionId)).toEqual(["spotify"]);
+    expect(
+      nextBoot.bindingStore
+        .listConnections(DECLARATION.source_id)
+        .map((item) => item.instance),
+    ).toContain(connectionId);
   });
 });
 

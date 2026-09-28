@@ -49,7 +49,10 @@ import {
   type RetainedDeclaration,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type { PdppAuthRouteDeps } from "../routes/pdpp-auth.js";
-import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
+import {
+  createSqliteRecordStore,
+  PdppBindingError,
+} from "../storage/pdpp-records-sqlite-store.js";
 import { singleInstanceInventory } from "./deployment.js";
 
 export interface PdppRecordsDeps {
@@ -59,6 +62,7 @@ export interface PdppRecordsDeps {
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
   instancesForSubject?: (subjectId: string) => string[];
+  sourceIds: Set<string>;
   readBlobBytes?: (
     blobId: string,
   ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
@@ -128,7 +132,6 @@ export function createPdppRecordsDeps(
     );
     return undefined;
   }
-  const instances = sources.map((source) => source.instance);
   const configuredMethods = new Map<string, string[]>();
   for (const configured of options.configuredMethods ?? []) {
     const source = sources.find(
@@ -140,25 +143,98 @@ export function createPdppRecordsDeps(
     configuredMethods.set(source.instance, methodIds);
   }
 
+  const store = createSqliteRecordStore(options.db);
+
+  // Adopt account 1 on first boot/access without rewriting rows. The old
+  // handle remains the instance id, so existing grants, keys and records stay
+  // valid. A legacy instance with rows but no matching method is deliberately
+  // left out of inventory; Desktop must reconnect it.
+  for (const source of sources) {
+    const methods = configuredMethods.get(source.instance) ?? [];
+    if (methods.length !== 1) continue;
+    try {
+      store.registerConnection({
+        instance: source.instance,
+        sourceId: source.sourceId,
+        method: methods[0],
+        label: "",
+      });
+    } catch (error) {
+      if (!(error instanceof PdppBindingError)) throw error;
+      if (error.reason !== "connection_method_unknown") throw error;
+      logger.warn(
+        { sourceId: source.sourceId, instance: source.instance },
+        "PDPP legacy connection method is unknown — owner must reconnect",
+      );
+    }
+  }
+  // Rebuild each registered connection's active-method view from the
+  // durable binding and this boot's source configuration. New connection
+  // ids survive a PS restart; keeping this map legacy-only would leave them
+  // registered but unable to write.
+  for (const source of sources) {
+    const methods = configuredMethods.get(source.instance) ?? [];
+    if (methods.length !== 1) continue;
+    for (const connection of store.listConnections(source.sourceId)) {
+      if (connection.method === methods[0]) {
+        configuredMethods.set(connection.instance, [methods[0]]);
+      }
+    }
+  }
+
+  const sourceRegistry = createSourceStreamDeclarationRegistry(sources);
+  const sourceForLegacyInstance = new Map(
+    sources.map((source) => [source.instance, source.sourceId]),
+  );
+  const declarations: StreamDeclarationRegistry = {
+    get: (stream, sourceId) => sourceRegistry.get(stream, sourceId),
+    forInstance(instance, stream) {
+      const sourceId =
+        store.getInstanceBinding(instance).sourceId ??
+        sourceForLegacyInstance.get(instance);
+      return sourceId ? sourceRegistry.get(stream, sourceId) : undefined;
+    },
+    declares: (stream) => sourceRegistry.declares(stream),
+    list: () => sourceRegistry.list(),
+  };
+
+  pdppAuth.connectionState = (instance) => {
+    const binding = store.getInstanceBinding(instance);
+    return {
+      sourceId: binding.sourceId,
+      deleted: binding.deletedAt !== null,
+    };
+  };
+
   logger.info(
     { streams: streams.map((s) => s.name), resource: options.resource },
     "PDPP Resource Server mounted at /v1",
   );
-
-  const store = createSqliteRecordStore(options.db);
 
   return {
     store,
     bindingStore: store,
     configuredMethods,
     auth: coLocatedAuthorizationService(pdppAuth),
-    declarations: createSourceStreamDeclarationRegistry(sources),
+    declarations,
     // This deployment has exactly one owner. A subject other than that
     // owner (however it got an "owner"-kind token) owns none of these
     // instances — comparison normalized the same way subjectId is derived
     // above (lowercased address), so casing never causes a false mismatch.
     instancesForSubject: (subject) =>
-      subject.toLowerCase() === subjectId ? instances : [],
+      subject.toLowerCase() === subjectId
+        ? Array.from(
+            new Set(
+              sources.flatMap((source) => [
+                source.instance,
+                ...store
+                  .listConnections(source.sourceId)
+                  .map((connection) => connection.instance),
+              ]),
+            ),
+          )
+        : [],
+    sourceIds: new Set(sources.map((source) => source.sourceId)),
     // Real boot wiring for GET /v1/blobs/:blobId: reads the same store the
     // blob was ingested into, so this deployment can only ever serve bytes
     // it verifiably stored -- store.getBlobBytes re-verifies size/sha256
@@ -280,8 +356,14 @@ export function createPdppSyncImporter(options: {
   return createPdppImporter({
     store: records.store,
     declarations: retained,
-    instanceFor: (sourceId) =>
-      singleInstanceInventory(subjectId, sourceId).eligibleFor("")[0],
+    instanceFor: (sourceId) => {
+      const connections = records.bindingStore.listConnections(sourceId);
+      if (connections.length === 1) return connections[0].instance;
+      if (connections.length > 1) return undefined;
+      return records.sourceIds.has(sourceId)
+        ? singleInstanceInventory(subjectId, sourceId).eligibleFor("")[0]
+        : undefined;
+    },
     logger,
   });
 }

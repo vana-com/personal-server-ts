@@ -97,6 +97,11 @@ export interface PdppAuthRouteDeps {
   resolveDeclaration(sourceId: string): DeclarationSnapshot | null;
   /** The owner's connected instances, read fresh at review and approval. */
   inventoryFor(subjectId: string, sourceId: string): InstanceInventory;
+  /** Durable connection state used to refuse owner tokens for tombstones. */
+  connectionState?(instanceId: string): {
+    sourceId: string | null;
+    deleted: boolean;
+  };
   /**
    * The authenticated owner for an incoming authorization request. Returns
    * null when no owner session is present.
@@ -529,6 +534,15 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         403,
         "access_denied",
         "instance_id is not owned by the authenticated subject for this source",
+      );
+    }
+    const connection = deps.connectionState?.(instanceId);
+    if (connection?.deleted && connection.sourceId === sourceId) {
+      return errorResponse(
+        c,
+        409,
+        "connection_deleted",
+        "connection is deleted and cannot receive an owner token",
       );
     }
 
