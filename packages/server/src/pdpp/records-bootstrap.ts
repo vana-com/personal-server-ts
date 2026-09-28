@@ -49,11 +49,7 @@ import {
   type RetainedDeclaration,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type { PdppAuthRouteDeps } from "../routes/pdpp-auth.js";
-import {
-  createSqliteRecordStore,
-  PdppBindingError,
-} from "../storage/pdpp-records-sqlite-store.js";
-import { singleInstanceInventory } from "./deployment.js";
+import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
 
 export interface PdppRecordsDeps {
   store: PdppRecordStore;
@@ -100,10 +96,7 @@ export function createPdppRecordsDeps(
   // declaration and no other.
   const sources: SourceStreamDeclarations[] = [];
   for (const snapshot of options.declarations) {
-    const instance = singleInstanceInventory(
-      subjectId,
-      snapshot.source_id,
-    ).eligibleFor("")[0];
+    const instance = legacyInstanceId(subjectId, snapshot.source_id);
     const claimant = sources.find((s) => s.instance === instance);
     if (claimant) {
       // Two source ids that derive one instance would write one set of
@@ -200,21 +193,27 @@ export function createPdppRecordsDeps(
   }
 
   const sourceRegistry = createSourceStreamDeclarationRegistry(sources);
-  const sourceForLegacyInstance = new Map(
-    sources.map((source) => [source.instance, source.sourceId]),
-  );
   const declarations: StreamDeclarationRegistry = {
     get: (stream, sourceId) => sourceRegistry.get(stream, sourceId),
     forInstance(instance, stream) {
-      const sourceId =
-        store.getInstanceBinding(instance).sourceId ??
-        sourceForLegacyInstance.get(instance);
+      // Resolve authority from the live connection registry on every read.
+      // A deleted or unregistered handle has no source declaration.
+      const sourceId = store.getInstanceBinding(instance).sourceId;
       return sourceId ? sourceRegistry.get(stream, sourceId) : undefined;
     },
     declares: (stream) => sourceRegistry.declares(stream),
     list: () => sourceRegistry.list(),
   };
 
+  const connectionInventory = (sourceId: string) => ({
+    eligibleFor: () =>
+      store.listConnections(sourceId).map((connection) => connection.instance),
+  });
+  pdppAuth.inventoryFor = (subject, sourceId) =>
+    subject.toLowerCase() === subjectId &&
+    sources.some((source) => source.sourceId === sourceId)
+      ? connectionInventory(sourceId)
+      : { eligibleFor: () => [] };
   pdppAuth.connectionState = (instance) => {
     const binding = store.getInstanceBinding(instance);
     return {
@@ -242,12 +241,11 @@ export function createPdppRecordsDeps(
       subject.toLowerCase() === subjectId
         ? Array.from(
             new Set(
-              sources.flatMap((source) => [
-                source.instance,
-                ...store
+              sources.flatMap((source) =>
+                store
                   .listConnections(source.sourceId)
                   .map((connection) => connection.instance),
-              ]),
+              ),
             ),
           )
         : [],
@@ -330,7 +328,6 @@ export function createPdppSyncImporter(options: {
   const { records, serverOwner, logger } = options;
   if (!records || !serverOwner) return undefined;
 
-  const subjectId = serverOwner.toLowerCase();
   const retained: RetainedDeclaration[] = [];
   for (const snapshot of options.declarations) {
     const document = options.documents.get(snapshot.source_id);
@@ -377,12 +374,15 @@ export function createPdppSyncImporter(options: {
       const connections = records.bindingStore.listConnections(sourceId);
       if (connections.length === 1) return connections[0].instance;
       if (connections.length > 1) return undefined;
-      return records.sourceIds.has(sourceId)
-        ? singleInstanceInventory(subjectId, sourceId).eligibleFor("")[0]
-        : undefined;
+      return undefined;
     },
     logger,
   });
+}
+
+function legacyInstanceId(subjectId: string, sourceId: string): string {
+  const connector = sourceId.split("/").filter(Boolean).pop() ?? sourceId;
+  return `${connector}:${subjectId}`;
 }
 
 /**

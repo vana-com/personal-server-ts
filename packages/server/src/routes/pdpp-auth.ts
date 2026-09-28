@@ -97,7 +97,6 @@ export interface PdppAuthRouteDeps {
   resolveDeclaration(sourceId: string): DeclarationSnapshot | null;
   /** The owner's connected instances, read fresh at review and approval. */
   inventoryFor(subjectId: string, sourceId: string): InstanceInventory;
-  /** Durable connection state used to refuse owner tokens for tombstones. */
   connectionState?(instanceId: string): {
     sourceId: string | null;
     deleted: boolean;
@@ -203,7 +202,7 @@ function resolveScopedOwnerToken(
   ownerToken: string | undefined,
   subjectId?: string,
 ):
-  | { ok: true; subjectId: string; instanceId: string }
+  | { ok: true; subjectId: string; instanceId?: string }
   | { ok: false; failure: ApprovalFailure } {
   if (!ownerToken) {
     return {
@@ -234,44 +233,36 @@ function resolveScopedOwnerToken(
       },
     };
   }
-  if (!context.instanceIds || context.instanceIds.length !== 1) {
-    return {
-      ok: false,
-      failure: {
-        code: "access_denied",
-        message: "owner token is not scoped to an instance",
-      },
-    };
-  }
   return {
     ok: true,
     subjectId: context.subjectId,
-    instanceId: context.instanceIds[0],
-  };
-}
-
-function inventoryWithinOwnerScope(
-  inventory: InstanceInventory,
-  instanceId: string,
-): InstanceInventory {
-  return {
-    eligibleFor(streamName: string) {
-      return inventory
-        .eligibleFor(streamName)
-        .filter((eligibleInstanceId) => eligibleInstanceId === instanceId);
-    },
+    ...(context.instanceIds?.length === 1 && {
+      instanceId: context.instanceIds[0],
+    }),
   };
 }
 
 function scopedOwnerCoversSnapshot(
   deps: PdppAuthRouteDeps,
   subjectId: string,
-  instanceId: string,
+  ownerInstanceId: string | undefined,
   snapshot: DeclarationSnapshot,
 ): boolean {
   const inventory = deps.inventoryFor(subjectId, snapshot.source_id);
-  return snapshot.streams.some((stream) =>
-    inventory.eligibleFor(stream.name).includes(instanceId),
+  const eligible = new Set(
+    snapshot.streams.flatMap((stream) => inventory.eligibleFor(stream.name)),
+  );
+  if (ownerInstanceId) {
+    const sourceId = deps.connectionState?.(ownerInstanceId)?.sourceId;
+    if (
+      (sourceId && sourceId !== snapshot.source_id) ||
+      (!sourceId && !eligible.has(ownerInstanceId))
+    ) {
+      return false;
+    }
+  }
+  return snapshot.streams.some(
+    (stream) => inventory.eligibleFor(stream.name).length > 0,
   );
 }
 
@@ -279,17 +270,47 @@ function grantContainedByOwnerScope(
   deps: PdppAuthRouteDeps,
   subjectId: string,
   stored: StoredGrant,
-  instanceId: string,
+  ownerInstanceScope?: string | string[],
 ): boolean {
   const snapshot = deps.resolveDeclaration(stored.grant.source.id);
   if (!snapshot) return false;
-  if (!scopedOwnerCoversSnapshot(deps, subjectId, instanceId, snapshot)) {
+  const inventory = deps.inventoryFor(subjectId, snapshot.source_id);
+  const allowed = new Set(
+    snapshot.streams.flatMap((stream) => inventory.eligibleFor(stream.name)),
+  );
+  // Retain addressability for old grants after account deletion. The handle
+  // itself remains scoped to this source, while live inventory still decides
+  // whether it may be selected for a new grant.
+  const connector =
+    snapshot.source_id.split("/").filter(Boolean).pop() ?? snapshot.source_id;
+  const legacyId = `${connector}:${subjectId.toLowerCase()}`;
+  allowed.add(legacyId);
+  for (const grantedInstance of stored.grant.streams.flatMap(
+    (stream) => stream.instance_ids,
+  )) {
+    const state = deps.connectionState?.(grantedInstance);
+    if (state?.sourceId === snapshot.source_id) allowed.add(grantedInstance);
+  }
+  const ownerInstanceIds = Array.isArray(ownerInstanceScope)
+    ? ownerInstanceScope
+    : ownerInstanceScope
+      ? [ownerInstanceScope]
+      : undefined;
+  if (
+    ownerInstanceIds?.length &&
+    !ownerInstanceIds.some(
+      (instance) =>
+        instance === legacyId ||
+        deps.connectionState?.(instance)?.sourceId === snapshot.source_id ||
+        snapshot.streams.some((stream) =>
+          inventory.eligibleFor(stream.name).includes(instance),
+        ),
+    )
+  ) {
     return false;
   }
   return stored.grant.streams.every((stream) =>
-    stream.instance_ids.every(
-      (grantedInstanceId) => grantedInstanceId === instanceId,
-    ),
+    stream.instance_ids.every((instance) => allowed.has(instance)),
   );
 }
 
@@ -498,7 +519,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         c,
         400,
         "invalid_request",
-        "owner token exchange requires JSON body {source_id, instance_id}",
+        "owner token exchange requires JSON body {source_id, instance_id?}",
       );
     }
     if (body === null || typeof body !== "object" || Array.isArray(body)) {
@@ -506,18 +527,21 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         c,
         400,
         "invalid_request",
-        "owner token exchange requires JSON body {source_id, instance_id}",
+        "owner token exchange requires JSON body {source_id, instance_id?}",
       );
     }
     const tokenRequest = body as Record<string, unknown>;
     const sourceId = tokenRequest.source_id;
     const instanceId = tokenRequest.instance_id;
-    if (typeof sourceId !== "string" || typeof instanceId !== "string") {
+    if (
+      typeof sourceId !== "string" ||
+      (instanceId !== undefined && typeof instanceId !== "string")
+    ) {
       return errorResponse(
         c,
         400,
         "invalid_request",
-        "owner token exchange requires exactly one source_id and one instance_id",
+        "owner token exchange requires source_id and an optional instance_id",
       );
     }
     const declaration = deps.resolveDeclaration(sourceId);
@@ -525,30 +549,35 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       return errorResponse(c, 404, "not_found", "source declaration not found");
     }
     const inventory = deps.inventoryFor(subjectId, sourceId);
-    const ownsInstance = declaration.streams.some((stream) =>
-      inventory.eligibleFor(stream.name).includes(instanceId),
-    );
-    if (!ownsInstance) {
-      return errorResponse(
-        c,
-        403,
-        "access_denied",
-        "instance_id is not owned by the authenticated subject for this source",
+    if (typeof instanceId === "string") {
+      const ownsInstance = declaration.streams.some((stream) =>
+        inventory.eligibleFor(stream.name).includes(instanceId),
       );
-    }
-    const connection = deps.connectionState?.(instanceId);
-    if (connection?.deleted && connection.sourceId === sourceId) {
-      return errorResponse(
-        c,
-        409,
-        "connection_deleted",
-        "connection is deleted and cannot receive an owner token",
-      );
+      const legacyAccountOne =
+        instanceId ===
+        `${sourceId.split("/").filter(Boolean).pop() ?? sourceId}:${subjectId.toLowerCase()}`;
+      const state = deps.connectionState?.(instanceId);
+      if (state?.deleted && state.sourceId === sourceId) {
+        return errorResponse(
+          c,
+          409,
+          "connection_deleted",
+          "connection is deleted and cannot receive an owner token",
+        );
+      }
+      if (!ownsInstance && !legacyAccountOne) {
+        return errorResponse(
+          c,
+          403,
+          "access_denied",
+          "instance_id is not owned by the authenticated subject for this source",
+        );
+      }
     }
 
     const issued = deps.tokens.issueOwnerToken({
       subjectId,
-      instanceIds: [instanceId],
+      ...(typeof instanceId === "string" && { instanceIds: [instanceId] }),
       ttlSeconds: OWNER_TOKEN_TTL_SECONDS,
     });
     deps.logger.info(
@@ -783,12 +812,9 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       tokens: deps.tokens,
       sessionId,
       ownerToken: bearer(c),
-      inventory: inventoryWithinOwnerScope(
-        deps.inventoryFor(
-          session?.subject_id ?? "",
-          session?.snapshot.source_id ?? "",
-        ),
-        owner.instanceId,
+      inventory: deps.inventoryFor(
+        session?.subject_id ?? "",
+        session?.snapshot.source_id ?? "",
       ),
       instanceChoices: parseInstanceChoices(c),
       ownerChoices: parseOwnerChoices(c),
@@ -797,7 +823,17 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         deps.standingTermsFor?.(session?.requester.client_id ?? "") ??
         undefined,
       store: deps.store,
-      existingGrantInstanceIds: [owner.instanceId],
+      existingGrantInstanceIds: session
+        ? Array.from(
+            new Set(
+              session.snapshot.streams.flatMap((stream) =>
+                deps
+                  .inventoryFor(session.subject_id, session.snapshot.source_id)
+                  .eligibleFor(stream.name),
+              ),
+            ),
+          )
+        : [],
     });
 
     if (!result.ok) {
@@ -860,12 +896,9 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       sessionId,
       ownerToken: bearer(c),
       reviewDigest: body.review_digest ?? "",
-      inventory: inventoryWithinOwnerScope(
-        deps.inventoryFor(
-          session?.subject_id ?? "",
-          session?.snapshot.source_id ?? "",
-        ),
-        owner.instanceId,
+      inventory: deps.inventoryFor(
+        session?.subject_id ?? "",
+        session?.snapshot.source_id ?? "",
       ),
       instanceChoices: body.instance_choices,
       ownerChoices: body.owner_choices,
@@ -1194,7 +1227,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
           deps,
           caller.subjectId,
           stored,
-          caller.instanceId,
+          caller.instanceIds,
         ),
       )
       .map((stored) => ({
@@ -1238,7 +1271,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         deps,
         caller.subjectId,
         stored,
-        caller.instanceId,
+        caller.instanceIds,
       )
     ) {
       return errorResponse(c, 404, "not_found", "grant not found");
@@ -1262,7 +1295,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   function resolveOwner(
     c: Context,
   ):
-    | { ok: true; subjectId: string; instanceId: string }
+    | { ok: true; subjectId: string; instanceIds?: string[] }
     | { ok: false; response: ReturnType<typeof errorResponse> } {
     const ownerToken = bearer(c);
     if (!ownerToken) {
@@ -1288,21 +1321,10 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         ),
       };
     }
-    if (!caller.instanceIds || caller.instanceIds.length !== 1) {
-      return {
-        ok: false,
-        response: errorResponse(
-          c,
-          403,
-          "access_denied",
-          "a scoped owner token is required",
-        ),
-      };
-    }
     return {
       ok: true,
       subjectId: caller.subjectId,
-      instanceId: caller.instanceIds[0],
+      instanceIds: caller.instanceIds,
     };
   }
 

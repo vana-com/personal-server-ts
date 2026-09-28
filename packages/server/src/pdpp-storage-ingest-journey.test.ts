@@ -1156,9 +1156,9 @@ describe("$pdpp import over POST /v1/data", () => {
     expect(storeCounters()).toEqual({ clock: 0, changes: 0 });
     expect(logs).toContainEqual(
       expect.objectContaining({
-        code: "method_authority",
-        message: "method_required",
-        permanent: true,
+        code: "no_instance",
+        message: `no instance handle could be derived for source '${WHOOP}'`,
+        permanent: false,
       }),
     );
   });

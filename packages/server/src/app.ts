@@ -353,6 +353,10 @@ export function createApp(deps: AppDeps): Hono {
         auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
         instancesForSubject: deps.pdpp.instancesForSubject,
+        isConnectionAvailable: (instance) => {
+          const binding = deps.pdpp!.bindingStore.getInstanceBinding(instance);
+          return binding.sourceId !== null && binding.deletedAt === null;
+        },
         readBlobBytes: deps.pdpp.readBlobBytes,
       }),
     );

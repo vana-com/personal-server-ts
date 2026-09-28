@@ -19,7 +19,7 @@ import {
   PdppTokenService,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { createServer, type ServerContext } from "./bootstrap.js";
-import { singleInstanceInventory } from "./pdpp/deployment.js";
+import { registerTestConnection } from "./pdpp/test-connections.js";
 
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
@@ -92,23 +92,12 @@ async function bootBoth() {
 }
 
 function instance(sourceId: string) {
-  return singleInstanceInventory(owner, sourceId).eligibleFor("")[0];
+  const connector = sourceId.split("/").filter(Boolean).at(-1) ?? sourceId;
+  return `${connector}:${owner}`;
 }
 
 async function ownerToken(sourceId: string): Promise<string> {
-  const response = await ctx!.app.request("/pdpp/v1/owner/token", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${ctx!.devToken}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      source_id: sourceId,
-      instance_id: instance(sourceId),
-    }),
-  });
-  expect(response.status).toBe(200);
-  return ((await response.json()) as { access_token: string }).access_token;
+  return registerTestConnection(ctx!.app, ctx!.devToken, owner, sourceId);
 }
 
 function unscopedOwnerToken(): string {
@@ -478,7 +467,7 @@ describe("scoped owner tokens in the AS consent path", () => {
     expect(JSON.stringify(existing)).not.toContain("sleep");
   });
 
-  it("refuses old unscoped owner tokens for AS grant and consent", async () => {
+  it("uses source-wide owner tokens for consent and grant management", async () => {
     const ouraToken = await ownerToken(OURA);
     await ingestOuraSleep(ouraToken);
 
@@ -506,11 +495,7 @@ describe("scoped owner tokens in the AS consent path", () => {
         ],
       }),
     });
-    expect(authorized.status).toBe(403);
-    expect(await json(authorized)).toMatchObject({
-      error: "access_denied",
-      error_description: "owner token is not scoped to an instance",
-    });
+    expect(authorized.status).toBe(201);
 
     const multiAuthorized = await ctx!.app.request("/pdpp/v1/authorize", {
       method: "POST",
@@ -534,22 +519,14 @@ describe("scoped owner tokens in the AS consent path", () => {
         ],
       }),
     });
-    expect(multiAuthorized.status).toBe(403);
-    expect(await json(multiAuthorized)).toMatchObject({
-      error: "access_denied",
-      error_description: "owner token is not scoped to an instance",
-    });
+    expect(multiAuthorized.status).toBe(201);
 
     const ouraSession = await authorizeOura(ouraToken);
     const reviewed = await ctx!.app.request(
       `/pdpp/v1/authorize/${ouraSession}/review`,
       { headers: { authorization: `Bearer ${legacyToken}` } },
     );
-    expect(reviewed.status).toBe(403);
-    expect(await json(reviewed)).toMatchObject({
-      error: "access_denied",
-      error_description: "owner token is not scoped to an instance",
-    });
+    expect(reviewed.status).toBe(200);
 
     const ouraReview = await ctx!.app.request(
       `/pdpp/v1/authorize/${ouraSession}/review`,
@@ -571,20 +548,12 @@ describe("scoped owner tokens in the AS consent path", () => {
         body: JSON.stringify({ review_digest: review.review_digest }),
       },
     );
-    expect(approved.status).toBe(403);
-    expect(await json(approved)).toMatchObject({
-      error: "access_denied",
-      error_description: "owner token is not scoped to an instance",
-    });
+    expect(approved.status).toBe(200);
 
     const grants = await ctx!.app.request("/pdpp/v1/grants", {
       headers: { authorization: `Bearer ${legacyToken}` },
     });
-    expect(grants.status).toBe(403);
-    expect(await json(grants)).toMatchObject({
-      error: "access_denied",
-      error_description: "a scoped owner token is required",
-    });
+    expect(grants.status).toBe(200);
 
     const introspected = await ctx!.app.request("/pdpp/v1/introspect", {
       method: "POST",
@@ -608,10 +577,10 @@ describe("scoped owner tokens in the AS consent path", () => {
       },
       body: new URLSearchParams({ grant_id: "grant-never-reached" }).toString(),
     });
-    expect(revoked.status).toBe(403);
+    expect(revoked.status).toBe(404);
     expect(await json(revoked)).toMatchObject({
-      error: "access_denied",
-      error_description: "a scoped owner token is required",
+      error: "not_found",
+      error_description: "grant not found",
     });
   });
 });

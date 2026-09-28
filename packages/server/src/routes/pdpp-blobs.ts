@@ -17,6 +17,7 @@ export interface PdppBlobsRouteDeps {
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
   instancesForSubject?: (subjectId: string) => string[];
+  isConnectionAvailable?: (instance: string) => boolean;
   /**
    * Loads raw blob bytes for a blob_id, or undefined if not locally stored.
    * Optional: when absent or throwing, GET fails closed with `api_error` (500) instead of a fabricated 200.
@@ -134,6 +135,21 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
     // Client token: the blob must be referenced by a record this exact
     // grant can see — instance scope, resources allowlist, time_constraint,
     // and blob_ref must be in the granted fields for that record's stream.
+    const grantInstances = (context.grant?.streams ?? []).flatMap(
+      (stream) => stream.instance_ids,
+    );
+    if (
+      grantInstances.some(
+        (instance) => deps.isConnectionAvailable?.(instance) === false,
+      )
+    ) {
+      const err = new PdppError(
+        "instance_unavailable",
+        "The connection for this grant is unavailable",
+      );
+      return { error: jsonError(c, err, reqId) };
+    }
+
     for (const reference of references) {
       const declaration = deps.declarations.forInstance(
         reference.instance,

@@ -27,7 +27,6 @@ import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { createServer } from "../packages/server/src/bootstrap.js";
 import { listenHttpServer } from "../packages/server/src/listen.js";
 import { initializeDatabase } from "../packages/server/src/storage/index-schema.js";
-import { singleInstanceInventory } from "../packages/server/src/pdpp/deployment.js";
 
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
@@ -87,6 +86,7 @@ async function main(): Promise<void> {
       pdpp: {
         enabled: true,
         declarationPaths: [declPath],
+        methods: [{ method_id: "spotify", declaration_path: declPath }],
         clients: [{ clientId: CLIENT_ID, redirectUris: [REDIRECT] }],
       },
     }),
@@ -107,9 +107,7 @@ async function main(): Promise<void> {
   // own owner proof. The external test cannot mint one itself, which is the
   // point: only the owner's authenticated session can.
   const subject = (await recoverServerOwner(KNOWN_SIG)).toLowerCase();
-  const instanceId = singleInstanceInventory(subject, SOURCE_ID).eligibleFor(
-    "",
-  )[0];
+  const instanceId = `spotify:${subject}`;
   const ownerRes = await ctx.app.request("/pdpp/v1/owner/token", {
     method: "POST",
     headers: {
@@ -124,6 +122,24 @@ async function main(): Promise<void> {
   const { access_token: ownerToken } = (await ownerRes.json()) as {
     access_token: string;
   };
+  const registration = await ctx.app.request(
+    `/pdpp/connections/${encodeURIComponent(instanceId)}`,
+    {
+      method: "PUT",
+      headers: {
+        authorization: `Bearer ${ownerToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        source_id: SOURCE_ID,
+        method_id: "spotify",
+        label: "Personal",
+      }),
+    },
+  );
+  if (!registration.ok) {
+    throw new Error(`connection registration failed: ${registration.status}`);
+  }
 
   // Single ready line, parsed positionally by the consuming test.
   console.log(`PS_READY ${bound!.port} ${ownerToken} ${SOURCE_ID} ${STREAM}`);
