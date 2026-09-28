@@ -681,6 +681,25 @@ describe("scoped owner tokens in the AS consent path", () => {
       candidates: [instance(OURA), accountB].sort(),
     });
 
+    const fanInSessionId = await authorizeOura(owner);
+    const fanIn = await ctx!.app.request(
+      `/pdpp/v1/authorize/${fanInSessionId}/approve`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${owner}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          instance_choices: { sleep: [instance(OURA), accountB] },
+        }),
+      },
+    );
+    expect(fanIn.status).toBe(400);
+    expect(await json(fanIn)).toMatchObject({
+      error: "unsupported_instance_fan_in",
+    });
+
     const { accessToken } = await issueOuraGrant(owner, { sleep: [accountB] });
     const read = await readSleep(accessToken);
     expect(read.status).toBe(200);
