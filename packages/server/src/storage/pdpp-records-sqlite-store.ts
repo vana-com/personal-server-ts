@@ -481,13 +481,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     // Reads inside the transaction see earlier writes of the same batch, so
     // two envelopes for one key are decided in order.
     const runBatch = db.transaction(() => {
-      let shouldBind = false;
       if (binding && envelopes.length > 0) {
-        shouldBind = checkBinding(
-          binding.method,
-          binding.generation,
-          envelopes,
-        );
+        checkBinding(binding.method, binding.generation, envelopes);
       } else if (envelopes.length > 0) {
         // P8a: every canonical write names its method and generation. A write
         // without them (the sync importer, which has no method identity)
@@ -502,7 +497,6 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         );
         return;
       }
-      let wroteAny = false;
       envelopes.forEach((envelope, index) => {
         const plan = planIngest(
           index,
@@ -541,7 +535,6 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           };
           return;
         }
-        wroteAny = true;
         writeVersion(
           envelope.instance,
           envelope.stream,
@@ -550,9 +543,6 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           envelope.emitted_at,
         );
       });
-      if (shouldBind && binding && wroteAny) {
-        bindMethod(envelopes[0].instance, binding);
-      }
     });
 
     runBatch();
@@ -607,15 +597,6 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     });
   }
 
-  function bindMethod(
-    instance: string,
-    binding: { method: string; generation: number },
-  ): void {
-    db.prepare(
-      "UPDATE pdpp_instance_binding SET method = ? WHERE instance = ? AND generation = ? AND method IS NULL",
-    ).run(binding.method, instance, binding.generation);
-  }
-
   // P7: the records are the complete live set of (instance, stream) from a
   // covered full refresh by the bound method. Under Q1 every live row of the
   // instance was written by that method in this generation, so a live key the
@@ -632,11 +613,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     validateData?: RecordDataValidator;
   }): ReplaceStreamResult {
     return db.transaction((): ReplaceStreamResult => {
-      const shouldBind = checkInstanceBinding(
-        input.instance,
-        input.method,
-        input.generation,
-      );
+      checkInstanceBinding(input.instance, input.method, input.generation);
 
       const seen = new Set<string>();
       const results: IngestOutcome[] = [];
@@ -721,9 +698,6 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           input.emittedAt,
         );
       }
-      if (shouldBind && (writes.length > 0 || missing.length > 0)) {
-        bindMethod(input.instance, input);
-      }
       return { ...summary, applied: true, deleted: missing.length };
     })();
   }
@@ -732,19 +706,19 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     method: string,
     generation: number,
     envelopes: PdppRecordEnvelopeInput[],
-  ): boolean {
+  ): void {
     const instances = new Set(envelopes.map((envelope) => envelope.instance));
     if (instances.size !== 1) throw new PdppBindingError("invalid_request");
-    return checkInstanceBinding([...instances][0], method, generation);
+    checkInstanceBinding([...instances][0], method, generation);
   }
 
-  /** P8a checks (2) and (3); true when this write binds an empty instance. */
+  /** Check every write against the connection's registered method/generation. */
   function checkInstanceBinding(
     instance: string,
     method: string,
     generation: number,
-  ): boolean {
-    // Only a named method may bind or write; an empty one would bind "".
+  ): void {
+    // Only a named method may write.
     if (typeof method !== "string" || method.length === 0) {
       throw new PdppBindingError("method_required");
     }
@@ -752,20 +726,15 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     if (current.deleted_at !== null) {
       throw new PdppBindingError("connection_deleted");
     }
-    if (instance.startsWith("conn_") && current.source_id === null) {
+    if (current.source_id === null) {
       throw new PdppBindingError("connection_required");
     }
     if (current.generation !== generation) {
       throw new PdppBindingError("binding_generation_mismatch");
     }
-    if (current.method === method) return false;
-    if (current.method !== null) {
+    if (current.method !== method) {
       throw new PdppBindingError("instance_bound_to_other_method");
     }
-    if (instanceHasRecords(db, instance)) {
-      throw new PdppBindingError("binding_required");
-    }
-    return true;
   }
 
   // Read-only: an instance with no row reports the row `ensureBinding` would
@@ -855,14 +824,6 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     label: string;
   }): PdppInstanceBinding {
     return db.transaction(() => {
-      const uuidConnectionId =
-        /^conn_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
-          input.instance,
-        );
-      const legacyConnectionId = /^[a-z0-9._-]+:[^:\s]+$/i.test(input.instance);
-      if (!uuidConnectionId && !legacyConnectionId) {
-        throw new PdppBindingError("connection_id_invalid");
-      }
       const current = ensureBinding(db, input.instance);
       if (current.deleted_at !== null) {
         throw new PdppBindingError("connection_deleted");
@@ -1365,19 +1326,14 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       if (binding.deleted_at !== null) {
         throw new PdppBindingError("connection_deleted");
       }
-      if (input.instance.startsWith("conn_") && binding.source_id === null) {
+      if (binding.source_id === null) {
         throw new PdppBindingError("connection_required");
       }
       if (binding.generation !== input.generation) {
         throw new PdppBindingError("binding_generation_mismatch");
       }
       if (binding.method !== input.method) {
-        if (binding.method !== null) {
-          throw new PdppBindingError("instance_bound_to_other_method");
-        }
-        if (instanceHasRecords(db, input.instance)) {
-          throw new PdppBindingError("binding_required");
-        }
+        throw new PdppBindingError("instance_bound_to_other_method");
       }
       const meta = storeBlobBytes(input.bytes, input.mimeType);
       db.prepare(

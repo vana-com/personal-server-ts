@@ -119,6 +119,12 @@ describe("sqlite record store", () => {
 
     it("is refused on a bound instance and leaves its rows intact", () => {
       const raw = createSqliteRecordStore(db);
+      raw.registerConnection({
+        instance: "inst_1",
+        sourceId: "https://test.invalid/method-a",
+        method: "method_a",
+        label: "Method A",
+      });
       const own = { ...base, stream: "messages", key: "msg_1" };
       own.data = { id: "msg_1", content: "from method A" };
       expect(
@@ -807,7 +813,12 @@ describe("sqlite record store", () => {
         .all(),
     });
     const seedA = () => {
-      store.getInstanceBinding("inst_a");
+      store.registerConnection({
+        instance: "inst_a",
+        sourceId: "https://test.invalid/method-a",
+        method: A.method,
+        label: "Method A",
+      });
       const blob = store.storeBlobBytesForInstance({
         instance: "inst_a",
         ...A,
@@ -833,7 +844,7 @@ describe("sqlite record store", () => {
         instance,
         expectedMethod: "method_a",
         expectedGeneration: 1,
-        nextMethod: "method_b",
+        nextMethod: "method_a",
       });
 
     it("rolls back every reset step when the transaction faults at its last write", () => {
@@ -847,7 +858,7 @@ describe("sqlite record store", () => {
       expect(snapshot()).toEqual(before);
       db.exec("DROP TRIGGER fault_reset");
       expect(resetToB().binding).toMatchObject({
-        method: "method_b",
+        method: "method_a",
         generation: 2,
       });
       expect(snapshot()).toMatchObject({
@@ -860,7 +871,12 @@ describe("sqlite record store", () => {
     });
 
     it("rolls back blob bytes and metadata when the upload claim write faults", () => {
-      store.getInstanceBinding("inst_a");
+      store.registerConnection({
+        instance: "inst_a",
+        sourceId: "https://test.invalid/method-a",
+        method: A.method,
+        label: "Method A",
+      });
       const before = snapshot();
       db.exec(`CREATE TRIGGER fault_claim BEFORE INSERT ON pdpp_blob_claims
         BEGIN SELECT RAISE(ABORT, 'injected claim fault'); END`);
@@ -889,7 +905,7 @@ describe("sqlite record store", () => {
         [envelope("inst_a", "b1", "2026-04-03T00:00:00.000Z")],
         messagesSemantics,
         messagesPk,
-        { method: "method_b", generation: 2 },
+        { method: "method_a", generation: 2 },
       );
       expect(() =>
         store.listRecords("messages", {
@@ -910,7 +926,12 @@ describe("sqlite record store", () => {
 
     it("keeps list cursors valid across writes and resets of instances they do not read", () => {
       seedA();
-      store.getInstanceBinding("inst_c");
+      store.registerConnection({
+        instance: "inst_c",
+        sourceId: "https://test.invalid/method-a",
+        method: A.method,
+        label: "Method A",
+      });
       store.ingestBatch(
         [
           envelope("inst_c", "c1", "2026-04-01T00:00:00.000Z"),
@@ -1079,7 +1100,12 @@ describe("sqlite record store", () => {
 
     it("keeps a blob shared with another instance through one reset", () => {
       const blob = seedA();
-      store.getInstanceBinding("inst_c");
+      store.registerConnection({
+        instance: "inst_c",
+        sourceId: "https://test.invalid/method-a",
+        method: A.method,
+        label: "Method A",
+      });
       const shared = store.storeBlobBytesForInstance({
         instance: "inst_c",
         ...A,
