@@ -207,6 +207,21 @@ export function createServerApiAuth(
       );
     }
 
+    if (context.sourceId) {
+      const namespace = legacyNamespace(scope);
+      const configured = bridge.configuredMethods.get(context.sourceId) ?? [];
+      const sourceNamespace =
+        context.sourceId.split("/").filter(Boolean).at(-1) ?? context.sourceId;
+      if (namespace !== sourceNamespace || configured.length !== 1) {
+        throw pdppBridgeError(
+          "PDPP_OWNER_BEARER_SCOPE_MISMATCH",
+          "PDPP owner bearer token is not scoped to the requested legacy source namespace",
+          { scope, sourceId: context.sourceId },
+        );
+      }
+      return;
+    }
+
     if (!context.instanceIds || context.instanceIds.length !== 1) {
       throw pdppBridgeError(
         "PDPP_OWNER_BEARER_UNSCOPED_INSTANCE",

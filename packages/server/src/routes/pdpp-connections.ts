@@ -21,7 +21,7 @@ export interface PdppConnectionRouteDeps {
   store: PdppConnectionStore;
   auth: PdppAuthorizationService;
   ownerSubjectId: string;
-  /** Known method ids keyed by the source's legacy account-1 handle. */
+  /** Known method ids keyed by source id. */
   configuredMethods: Map<string, string[]>;
   /** Retained source ids this server can serve. */
   sourceIds: Set<string>;
@@ -34,15 +34,12 @@ function jsonError(code: string, message: string, status: number): Response {
 const CONNECTION_ID =
   /^conn_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-function legacyIdFor(owner: string, sourceId: string): string {
-  const connector = sourceId.split("/").filter(Boolean).pop() ?? sourceId;
-  return `${connector}:${owner.toLowerCase()}`;
-}
-
 function isConnectionId(id: string, owner: string, sourceId?: string): boolean {
   return (
     CONNECTION_ID.test(id) ||
-    (sourceId !== undefined && id === legacyIdFor(owner, sourceId))
+    (sourceId !== undefined &&
+      id ===
+        `${sourceId.split("/").filter(Boolean).pop() ?? sourceId}:${owner.toLowerCase()}`)
   );
 }
 
@@ -58,7 +55,9 @@ function connectionJson(binding: PdppInstanceBinding) {
 export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
   const app = new Hono();
 
-  async function owner(request: Request): Promise<string | Response> {
+  async function owner(
+    request: Request,
+  ): Promise<{ subjectId: string; sourceId: string } | Response> {
     const token = request.headers
       .get("authorization")
       ?.match(/^Bearer\s+(.+)$/i)?.[1];
@@ -69,11 +68,12 @@ export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
       !context.active ||
       context.tokenKind !== "owner" ||
       !context.subjectId ||
+      !context.sourceId ||
       context.subjectId.toLowerCase() !== deps.ownerSubjectId.toLowerCase()
     ) {
       return jsonError("authentication_error", "Owner token required", 401);
     }
-    return context.subjectId;
+    return { subjectId: context.subjectId, sourceId: context.sourceId };
   }
 
   app.get("/pdpp/capabilities", (c) =>
@@ -81,11 +81,18 @@ export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
   );
 
   app.get("/pdpp/connections", async (c) => {
-    const subject = await owner(c.req.raw);
-    if (subject instanceof Response) return subject;
     const sourceId = c.req.query("source_id");
     if (!sourceId || !deps.sourceIds.has(sourceId)) {
       return jsonError("not_found", "Source declaration not found", 404);
+    }
+    const ownerScope = await owner(c.req.raw);
+    if (ownerScope instanceof Response) return ownerScope;
+    if (ownerScope.sourceId !== sourceId) {
+      return jsonError(
+        "access_denied",
+        "Owner token has a different source scope",
+        403,
+      );
     }
     return c.json({
       connections: deps.store.listConnections(sourceId).map(connectionJson),
@@ -93,8 +100,6 @@ export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
   });
 
   app.put("/pdpp/connections/:connectionId", async (c) => {
-    const subject = await owner(c.req.raw);
-    if (subject instanceof Response) return subject;
     const connectionId = c.req.param("connectionId");
     let body: unknown;
     try {
@@ -118,15 +123,23 @@ export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
         400,
       );
     }
-    if (!isConnectionId(connectionId, subject, input.source_id)) {
+    const ownerScope = await owner(c.req.raw);
+    if (ownerScope instanceof Response) return ownerScope;
+    if (ownerScope.sourceId !== input.source_id) {
+      return jsonError(
+        "access_denied",
+        "Owner token has a different source scope",
+        403,
+      );
+    }
+    if (!isConnectionId(connectionId, ownerScope.subjectId, input.source_id)) {
       return jsonError(
         "connection_id_invalid",
         "Connection id is invalid",
         400,
       );
     }
-    const configured =
-      deps.configuredMethods.get(legacyIdFor(subject, input.source_id)) ?? [];
+    const configured = deps.configuredMethods.get(input.source_id) ?? [];
     if (configured.length !== 1 || configured[0] !== input.method_id) {
       return jsonError(
         "method_inactive",
@@ -153,16 +166,23 @@ export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
   });
 
   app.delete("/pdpp/connections/:connectionId", async (c) => {
-    const subject = await owner(c.req.raw);
-    if (subject instanceof Response) return subject;
     const connectionId = c.req.param("connectionId");
+    const ownerScope = await owner(c.req.raw);
+    if (ownerScope instanceof Response) return ownerScope;
     const current = deps.store.getInstanceBinding(connectionId);
     if (
       !current.sourceId ||
       !deps.sourceIds.has(current.sourceId) ||
-      !isConnectionId(connectionId, subject, current.sourceId)
+      !isConnectionId(connectionId, ownerScope.subjectId, current.sourceId)
     ) {
       return jsonError("not_found", "Connection not found", 404);
+    }
+    if (ownerScope.sourceId !== current.sourceId) {
+      return jsonError(
+        "access_denied",
+        "Owner token has a different source scope",
+        403,
+      );
     }
     if (current.deletedAt !== null) return c.json(connectionJson(current), 200);
     try {

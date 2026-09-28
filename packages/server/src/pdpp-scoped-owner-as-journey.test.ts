@@ -105,6 +105,7 @@ function unscopedOwnerToken(): string {
   try {
     return new PdppTokenService(store).issueOwnerToken({
       subjectId: owner,
+      sourceId: OURA,
     }).access_token;
   } finally {
     store.close();
@@ -116,14 +117,18 @@ function multiInstanceOwnerToken(): string {
   try {
     return new PdppTokenService(store).issueOwnerToken({
       subjectId: owner,
-      instanceIds: [instance(CLAUDE), instance(OURA)],
+      sourceId: OURA,
     }).access_token;
   } finally {
     store.close();
   }
 }
 
-async function ingestOuraSleep(token: string) {
+async function ingestOuraSleep(
+  token: string,
+  instanceId = instance(OURA),
+  score = 91,
+) {
   const response = await ctx!.app.request(
     "/v1/streams/sleep/records/ingest?method=oura&binding_generation=1",
     {
@@ -133,9 +138,9 @@ async function ingestOuraSleep(token: string) {
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        instance: instance(OURA),
+        instance: instanceId,
         key: "sleep-1",
-        data: { id: "sleep-1", score: 91 },
+        data: { id: "sleep-1", score },
         emitted_at: "2026-09-01T00:00:00Z",
       }),
     },
@@ -197,13 +202,24 @@ async function authorizeClaude(token: string): Promise<string> {
   return ((await response.json()) as { session_id: string }).session_id;
 }
 
-async function issueOuraGrant(token: string): Promise<{
+async function issueOuraGrant(
+  token: string,
+  instanceChoices?: Record<string, string[]>,
+): Promise<{
   accessToken: string;
   grantId: string;
 }> {
   const sessionId = await authorizeOura(token);
+  const choiceQuery = instanceChoices
+    ? `?${new URLSearchParams(
+        Object.entries(instanceChoices).map(([stream, [instanceId]]) => [
+          `instance[${stream}]`,
+          instanceId,
+        ]),
+      )}`
+    : "";
   const reviewed = await ctx!.app.request(
-    `/pdpp/v1/authorize/${sessionId}/review`,
+    `/pdpp/v1/authorize/${sessionId}/review${choiceQuery}`,
     { headers: { authorization: `Bearer ${token}` } },
   );
   expect(reviewed.status).toBe(200);
@@ -219,7 +235,10 @@ async function issueOuraGrant(token: string): Promise<{
         authorization: `Bearer ${token}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({ review_digest: review.review_digest }),
+      body: JSON.stringify({
+        review_digest: review.review_digest,
+        ...(instanceChoices && { instance_choices: instanceChoices }),
+      }),
     },
   );
   expect(approved.status).toBe(200);
@@ -311,8 +330,7 @@ describe("scoped owner tokens in the AS consent path", () => {
     expect(authorized.status).toBe(403);
     expect(await json(authorized)).toMatchObject({
       error: "access_denied",
-      error_description:
-        "owner token is not scoped to an instance for the requested source",
+      error_description: "owner token is not scoped to the requested source",
     });
 
     const ouraSession = await authorizeOura(ouraToken);
@@ -323,8 +341,7 @@ describe("scoped owner tokens in the AS consent path", () => {
     expect(claudeReview.status).toBe(403);
     expect(await json(claudeReview)).toMatchObject({
       error: "access_denied",
-      error_description:
-        "owner token is not scoped to an instance for the requested source",
+      error_description: "owner token is not scoped to the requested source",
     });
 
     const ouraReview = await ctx!.app.request(
@@ -351,8 +368,7 @@ describe("scoped owner tokens in the AS consent path", () => {
     const claudeApprovalBody = await json(claudeApprove);
     expect(claudeApprovalBody).toMatchObject({
       error: "access_denied",
-      error_description:
-        "owner token is not scoped to an instance for the requested source",
+      error_description: "owner token is not scoped to the requested source",
     });
     expect(claudeApprovalBody.redirect_uri).toBeUndefined();
 
@@ -563,10 +579,10 @@ describe("scoped owner tokens in the AS consent path", () => {
       },
       body: new URLSearchParams({ token: ouraToken }).toString(),
     });
-    expect(introspected.status).toBe(403);
+    expect(introspected.status).toBe(200);
     expect(await json(introspected)).toMatchObject({
-      error: "access_denied",
-      error_description: "introspection requires a scoped owner token",
+      active: true,
+      source_id: OURA,
     });
 
     const revoked = await ctx!.app.request("/pdpp/v1/revoke", {
@@ -582,5 +598,92 @@ describe("scoped owner tokens in the AS consent path", () => {
       error: "not_found",
       error_description: "grant not found",
     });
+  });
+
+  it("keeps deleted-connection grants listed and revocable while each read returns 404", async () => {
+    const owner = await ownerToken(OURA);
+    await ingestOuraSleep(owner);
+    const { accessToken, grantId } = await issueOuraGrant(owner);
+
+    const deleted = await ctx!.app.request(
+      `/pdpp/connections/${encodeURIComponent(instance(OURA))}`,
+      { method: "DELETE", headers: { authorization: `Bearer ${owner}` } },
+    );
+    expect(deleted.status).toBe(200);
+
+    for (const path of [
+      "/v1/streams/sleep/records",
+      "/v1/streams/sleep/records?changes_since=0",
+      "/v1/streams/sleep/records/sleep-1",
+      "/v1/blobs/sha256:missing",
+    ]) {
+      const response = await ctx!.app.request(path, {
+        headers: { authorization: `Bearer ${accessToken}` },
+      });
+      expect(response.status, path).toBe(404);
+      expect(await json(response), path).toMatchObject({
+        error: { code: "instance_unavailable" },
+      });
+    }
+
+    const grants = await ctx!.app.request("/pdpp/v1/grants", {
+      headers: { authorization: `Bearer ${owner}` },
+    });
+    expect(await json(grants)).toMatchObject({
+      grants: [expect.objectContaining({ grant_id: grantId })],
+    });
+
+    const revoked = await ctx!.app.request("/pdpp/v1/revoke", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${owner}`,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ grant_id: grantId }).toString(),
+    });
+    expect(revoked.status).toBe(200);
+  });
+
+  it("asks for an account when two connections exist and grants only the chosen account", async () => {
+    const owner = await ownerToken(OURA);
+    const accountB = "conn_123e4567-e89b-42d3-a456-426614174000";
+    const registration = await ctx!.app.request(
+      `/pdpp/connections/${encodeURIComponent(accountB)}`,
+      {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${owner}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          source_id: OURA,
+          method_id: "oura",
+          label: "Work",
+        }),
+      },
+    );
+    expect(registration.status).toBe(200);
+    await ingestOuraSleep(owner, instance(OURA), 91);
+    await ingestOuraSleep(owner, accountB, 44);
+
+    const sessionId = await authorizeOura(owner);
+    const unchosen = await ctx!.app.request(
+      `/pdpp/v1/authorize/${sessionId}/review`,
+      { headers: { authorization: `Bearer ${owner}` } },
+    );
+    const choice = (await json(unchosen)).instance_choice_required as {
+      stream: string;
+      candidates: string[];
+    }[];
+    expect(choice).toHaveLength(1);
+    expect(choice[0]).toMatchObject({
+      stream: "sleep",
+      candidates: [instance(OURA), accountB].sort(),
+    });
+
+    const { accessToken } = await issueOuraGrant(owner, { sleep: [accountB] });
+    const read = await readSleep(accessToken);
+    expect(read.status).toBe(200);
+    expect(read.body.data).toEqual({ id: "sleep-1", score: 44 });
   });
 });

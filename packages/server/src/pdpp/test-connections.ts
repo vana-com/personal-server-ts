@@ -23,7 +23,7 @@ export async function registerTestConnection(
       authorization: `Bearer ${devToken}`,
       "content-type": "application/json",
     },
-    body: JSON.stringify({ source_id: sourceId, instance_id: connectionId }),
+    body: JSON.stringify({ source_id: sourceId }),
   });
   if (!ownerResponse.ok) {
     throw new Error(`owner token request failed: ${ownerResponse.status}`);

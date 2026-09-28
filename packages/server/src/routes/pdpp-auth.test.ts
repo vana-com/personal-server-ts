@@ -104,7 +104,6 @@ function post(
 function ownerTokenBody(overrides: Record<string, unknown> = {}) {
   return {
     source_id: SOURCE_ID,
-    instance_id: OWNER_INSTANCE,
     ...overrides,
   };
 }
@@ -115,8 +114,14 @@ function scopedOwnerToken(
 ): string {
   return tokens.issueOwnerToken({
     subjectId,
+    sourceId: SOURCE_ID,
     instanceIds: [instanceId],
   }).access_token;
+}
+
+function sourceOwnerToken(subjectId = OWNER): string {
+  return tokens.issueOwnerToken({ subjectId, sourceId: SOURCE_ID })
+    .access_token;
 }
 
 function postForm(
@@ -1083,7 +1088,8 @@ describe("owner-token exchange", () => {
     expect(context.active).toBe(true);
     expect(context.tokenKind).toBe("owner");
     expect(context.subjectId).toBe(OWNER);
-    expect(context.instanceIds).toEqual([OWNER_INSTANCE]);
+    expect(context.sourceId).toBe(SOURCE_ID);
+    expect(context.instanceIds).toBeUndefined();
     expect(context.grant).toBeUndefined();
   });
 
@@ -1108,12 +1114,12 @@ describe("owner-token exchange", () => {
     expect(array.status).toBe(400);
   });
 
-  it("refuses to mint for an instance the owner does not own", async () => {
+  it("refuses instance-scoped owner-token requests", async () => {
     const response = await post(
       "/pdpp/v1/owner/token",
       ownerTokenBody({ instance_id: "spotify-account-b" }),
     );
-    expect(response.status).toBe(403);
+    expect(response.status).toBe(400);
   });
 
   it("mints a token usable end-to-end for approval", async () => {
@@ -1181,7 +1187,7 @@ describe("owner-token exchange", () => {
 describe("§6 — instance choice over the wire", () => {
   it("requires a choice when two source connections are active", async () => {
     eligible = ["spotify-account-a", "spotify-account-b"];
-    const ownerToken = scopedOwnerToken(OWNER, "spotify-account-b");
+    const ownerToken = sourceOwnerToken();
     const created = await post("/pdpp/v1/authorize", selectionBody());
     const { session_id } = (await created.json()) as { session_id: string };
 
@@ -1205,7 +1211,7 @@ describe("§6 — instance choice over the wire", () => {
 
   it("issues over exactly the owner token's scoped instance", async () => {
     eligible = ["spotify-account-a", "spotify-account-b"];
-    const ownerToken = scopedOwnerToken(OWNER, "spotify-account-b");
+    const ownerToken = sourceOwnerToken();
     const created = await post("/pdpp/v1/authorize", selectionBody());
     const { session_id } = (await created.json()) as { session_id: string };
 
@@ -1234,7 +1240,7 @@ describe("§6 — instance choice over the wire", () => {
 
   it("answers 409 when approval choices differ from the scoped review", async () => {
     eligible = ["spotify-account-a", "spotify-account-b"];
-    const ownerToken = scopedOwnerToken(OWNER, "spotify-account-b");
+    const ownerToken = sourceOwnerToken();
     const created = await post("/pdpp/v1/authorize", selectionBody());
     const { session_id } = (await created.json()) as { session_id: string };
 

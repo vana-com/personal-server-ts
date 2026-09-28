@@ -706,7 +706,7 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
         authorization: `Bearer ${ctx.devToken}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({ source_id: OURA, instance_id: instance }),
+      body: JSON.stringify({ source_id: OURA }),
     });
     const { access_token: token } = (await minted.json()) as {
       access_token: string;

@@ -58,6 +58,7 @@ export interface PdppRecordsDeps {
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
   instancesForSubject?: (subjectId: string) => string[];
+  instancesForSource?: (subjectId: string, sourceId: string) => string[];
   sourceIds: Set<string>;
   readBlobBytes?: (
     blobId: string,
@@ -89,31 +90,12 @@ export function createPdppRecordsDeps(
 
   const subjectId = options.serverOwner.toLowerCase();
 
-  // Every instance handle this deployment can produce, derived the same way
-  // the AS derives them at issuance, so an owner read and a grant-bound read
-  // agree about which instances exist. Each instance holds exactly one
-  // source's records, so its streams are validated against that source's
-  // declaration and no other.
+  // Declarations define stream shapes. The active connection registry defines
+  // which instances exist for each source.
   const sources: SourceStreamDeclarations[] = [];
   for (const snapshot of options.declarations) {
-    const instance = legacyInstanceId(subjectId, snapshot.source_id);
-    const claimant = sources.find((s) => s.instance === instance);
-    if (claimant) {
-      // Two source ids that derive one instance would write one set of
-      // rows under two authorities. Keep the first and refuse the rest.
-      logger.warn(
-        {
-          sourceId: snapshot.source_id,
-          instance,
-          claimedBy: claimant.sourceId,
-        },
-        "PDPP declaration shares an instance with another source — its streams are not mounted",
-      );
-      continue;
-    }
     sources.push({
       sourceId: snapshot.source_id,
-      instance,
       streams: toStreamDeclarations(snapshot),
     });
   }
@@ -131,9 +113,9 @@ export function createPdppRecordsDeps(
       (candidate) => candidate.sourceId === configured.sourceId,
     );
     if (!source) continue;
-    const methodIds = configuredMethods.get(source.instance) ?? [];
+    const methodIds = configuredMethods.get(source.sourceId) ?? [];
     methodIds.push(configured.methodId);
-    configuredMethods.set(source.instance, methodIds);
+    configuredMethods.set(source.sourceId, methodIds);
   }
 
   const store = createSqliteRecordStore(options.db);
@@ -183,11 +165,10 @@ export function createPdppRecordsDeps(
   // ids survive a PS restart; keeping this map legacy-only would leave them
   // registered but unable to write.
   for (const source of sources) {
-    const methods = configuredMethods.get(source.instance) ?? [];
-    if (methods.length !== 1) continue;
+    const methods = configuredMethods.get(source.sourceId) ?? [];
     for (const connection of store.listConnections(source.sourceId)) {
-      if (connection.method === methods[0]) {
-        configuredMethods.set(connection.instance, [methods[0]]);
+      if (connection.method && methods.includes(connection.method)) {
+        configuredMethods.set(connection.instance, [connection.method]);
       }
     }
   }
@@ -249,6 +230,12 @@ export function createPdppRecordsDeps(
             ),
           )
         : [],
+    instancesForSource: (subject, sourceId) =>
+      subject.toLowerCase() === subjectId
+        ? store
+            .listConnections(sourceId)
+            .map((connection) => connection.instance)
+        : [],
     sourceIds: new Set(sources.map((source) => source.sourceId)),
     // Real boot wiring for GET /v1/blobs/:blobId: reads the same store the
     // blob was ingested into, so this deployment can only ever serve bytes
@@ -289,6 +276,7 @@ function coLocatedAuthorizationService(
         active: true as const,
         tokenKind: context.tokenKind ?? "client",
         subjectId: context.subjectId ?? "",
+        sourceId: context.sourceId,
         instanceIds: context.instanceIds,
         grant: context.grant as PdppPortGrant | undefined,
         clientId: context.clientId,
@@ -378,11 +366,6 @@ export function createPdppSyncImporter(options: {
     },
     logger,
   });
-}
-
-function legacyInstanceId(subjectId: string, sourceId: string): string {
-  const connector = sourceId.split("/").filter(Boolean).pop() ?? sourceId;
-  return `${connector}:${subjectId}`;
 }
 
 /**

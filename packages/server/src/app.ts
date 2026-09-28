@@ -223,6 +223,7 @@ export interface AppDeps {
     auth: PdppAuthorizationService;
     declarations: StreamDeclarationRegistry;
     instancesForSubject?: (subjectId: string) => string[];
+    instancesForSource?: (subjectId: string, sourceId: string) => string[];
     sourceIds: Set<string>;
     readBlobBytes?: (
       blobId: string,
@@ -301,6 +302,7 @@ export function createApp(deps: AppDeps): Hono {
         auth: deps.pdpp.auth,
         ownerSubjectId: deps.serverOwner!,
         instancesForSubject: deps.pdpp.instancesForSubject!,
+        instancesForSource: deps.pdpp.instancesForSource,
         configuredMethods: deps.pdpp.configuredMethods,
       }),
     );
@@ -312,6 +314,7 @@ export function createApp(deps: AppDeps): Hono {
         declarations: deps.pdpp.declarations,
         ownerSubjectId: deps.serverOwner,
         instancesForSubject: deps.pdpp.instancesForSubject,
+        instancesForSource: deps.pdpp.instancesForSource,
         bindingStore: deps.pdpp.bindingStore,
         configuredMethods: deps.pdpp.configuredMethods,
         // An `api_error` on the resource surface is a server fault and must
@@ -353,6 +356,7 @@ export function createApp(deps: AppDeps): Hono {
         auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
         instancesForSubject: deps.pdpp.instancesForSubject,
+        instancesForSource: deps.pdpp.instancesForSource,
         isConnectionAvailable: (instance) => {
           const binding = deps.pdpp!.bindingStore.getInstanceBinding(instance);
           return binding.sourceId !== null && binding.deletedAt === null;

@@ -163,6 +163,8 @@ export interface PdppRecordsRouteDeps {
   ownerSubjectId?: string;
   /** Current ownership used to narrow the instance stored in an owner token. */
   instancesForSubject?: (subjectId: string) => string[];
+  /** Active connections covered by a source-scoped owner token. */
+  instancesForSource?: (subjectId: string, sourceId: string) => string[];
   /**
    * Owner access feed. PDPP reads must appear in the SAME feed as legacy
    * `/v1/data/{scope}` reads, or adopting PDPP would silently make an owner's
@@ -745,6 +747,14 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
 
   function ownerInstances(context: PdppTokenContext): string[] {
     if (context.tokenKind !== "owner") return [];
+    if (context.sourceId) {
+      return (
+        deps.instancesForSource?.(
+          requireSubjectId(context),
+          context.sourceId,
+        ) ?? []
+      );
+    }
     const current = deps.instancesForSubject?.(requireSubjectId(context));
     if (!current) return [];
     if (!context.instanceIds) return [];

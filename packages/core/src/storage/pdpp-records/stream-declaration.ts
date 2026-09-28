@@ -91,8 +91,8 @@ export function createStreamDeclarationRegistry(
 
 export interface SourceStreamDeclarations {
   sourceId: string;
-  /** The instance handle this deployment holds the source's records under. */
-  instance: string;
+  /** Optional legacy handle for callers that still use source-derived IDs. */
+  instance?: string;
   streams: StreamDeclaration[];
 }
 
@@ -108,7 +108,9 @@ export function createSourceStreamDeclarationRegistry(
       source.sourceId,
       new Map(source.streams.map((d) => [d.name, d])),
     );
-    sourceByInstance.set(source.instance, source.sourceId);
+    if (source.instance !== undefined) {
+      sourceByInstance.set(source.instance, source.sourceId);
+    }
     for (const stream of source.streams) {
       const list = declaringSources.get(stream.name) ?? [];
       list.push(stream);
