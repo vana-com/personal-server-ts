@@ -185,6 +185,9 @@ describe("sqlite record store", () => {
       .get();
     expect(store.getInstanceBinding("inst_unseen")).toEqual({
       instance: "inst_unseen",
+      sourceId: null,
+      label: "",
+      deletedAt: null,
       method: null,
       generation: 1,
       resetClock: 0,
