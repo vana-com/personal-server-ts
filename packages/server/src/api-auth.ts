@@ -133,7 +133,9 @@ function pdppBridgeError(
 
 export function createServerApiAuth(
   deps: ServerApiAuthDeps,
-): PersonalServerApiAuthPort {
+): PersonalServerApiAuthPort & {
+  authorizeOwnerScope(input: PersonalServerScopeAuthInput): Promise<void>;
+} {
   const writeProofReplayStore =
     deps.writeProofReplayStore ?? createInMemoryWriteProofReplayStore();
   // The write-session half of this port is protocol, not runtime: the browser
@@ -313,6 +315,10 @@ export function createServerApiAuth(
     authorizeOwner,
     authorizeWrite,
     authorizeWriteSession,
+    async authorizeOwnerScope(input: PersonalServerScopeAuthInput) {
+      if (await authorizePdppOwnerBearerForScope(input)) return;
+      await authorizeOwner(input.request);
+    },
 
     async authorizeScopeVersions(input) {
       if (await authorizePdppOwnerBearerForScope(input)) return;

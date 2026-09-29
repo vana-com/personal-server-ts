@@ -1,4 +1,4 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import {
   handlePersonalServerDataRequest,
   type PersonalServerApiDispatchOptions,
@@ -35,6 +35,14 @@ import {
 } from "../middleware/body-limit.js";
 import { createNodeDataStorage } from "../storage/node-data-storage.js";
 import { createServerApiAuth } from "../api-auth.js";
+import { parseDataScopeContract } from "@opendatalabs/personal-server-ts-core/contracts";
+import {
+  beginScopeImport,
+  finalizeScopeImport,
+  putScopeImportChunk,
+  ScopeImportError,
+  type ScopeImportDeps,
+} from "./chunked-scope-import.js";
 
 export interface DataRouteDeps {
   indexManager: IndexManager;
@@ -145,7 +153,120 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     pdppOwnerBearer: deps.pdppOwnerBearer,
   });
 
-  app.use("/:scope", createBodyLimit(DATA_INGEST_MAX_SIZE));
+  const importDeps: ScopeImportDeps = {
+    hierarchyOptions: deps.hierarchyOptions,
+    indexManager: deps.indexManager,
+    serverOwner: deps.serverOwner,
+    authorizeOwner: (request, scope) =>
+      auth.authorizeOwnerScope({ request, scope }),
+    syncManager: deps.syncManager,
+    onDataWritten: deps.onDataWritten,
+    afterTombstoneVersion: async (scope) => {
+      if (!deps.scopeDeletions) return null;
+      const verdict = await deps.scopeDeletions.resolve(scope);
+      if (!verdict.deleted || verdict.version === null) return null;
+      const version = Number(verdict.version);
+      return Number.isSafeInteger(version) ? version : null;
+    },
+  };
+
+  const importRoute = async (
+    c: Context,
+    action: () => Promise<unknown>,
+    status = 200,
+  ) => {
+    try {
+      return c.body(JSON.stringify(await action()), status as 200, {
+        "content-type": "application/json",
+      });
+    } catch (error) {
+      if (error instanceof ScopeImportError) {
+        return c.body(
+          JSON.stringify({ error: error.code, message: error.message }),
+          error.status as 400,
+          { "content-type": "application/json" },
+        );
+      }
+      const caught = error as {
+        status?: number;
+        code?: string;
+        message?: string;
+      };
+      if (caught.status && caught.code) {
+        return c.body(
+          JSON.stringify({ error: caught.code, message: caught.message }),
+          caught.status as 500,
+          { "content-type": "application/json" },
+        );
+      }
+      return c.body(
+        JSON.stringify({
+          error: "IMPORT_FAILED",
+          message: "Scope import failed",
+        }),
+        500,
+        { "content-type": "application/json" },
+      );
+    }
+  };
+
+  app.post("/:scope/imports", createBodyLimit(4096), (c) =>
+    importRoute(
+      c,
+      async () => {
+        const parsedScope = parseDataScopeContract(c.req.param("scope"));
+        if (!parsedScope.ok) {
+          throw new ScopeImportError(
+            400,
+            "INVALID_SCOPE",
+            parsedScope.body.message,
+          );
+        }
+        let body: unknown;
+        try {
+          body = await c.req.json();
+        } catch {
+          throw new ScopeImportError(
+            400,
+            "INVALID_BODY",
+            "Request body must be valid JSON",
+          );
+        }
+        return beginScopeImport(importDeps, c.req.raw, parsedScope.scope, body);
+      },
+      201,
+    ),
+  );
+  app.put("/:scope/imports/:id/chunks/:index", (c) =>
+    importRoute(c, () =>
+      putScopeImportChunk(
+        importDeps,
+        c.req.raw,
+        c.req.param("scope"),
+        c.req.param("id"),
+        Number(c.req.param("index")),
+      ),
+    ),
+  );
+  app.post("/:scope/imports/:id/finalize", (c) =>
+    importRoute(
+      c,
+      () =>
+        finalizeScopeImport(
+          importDeps,
+          c.req.raw,
+          c.req.param("scope"),
+          c.req.param("id"),
+        ),
+      201,
+    ),
+  );
+
+  const legacyWriteBodyLimit = createBodyLimit(DATA_INGEST_MAX_SIZE);
+  app.use("/:scope", (c, next) => {
+    if (c.req.path.split("/").includes("imports")) return next();
+    return legacyWriteBodyLimit(c, next);
+  });
   app.all("*", (c) =>
     handlePersonalServerDataRequest(
       c.req.raw,

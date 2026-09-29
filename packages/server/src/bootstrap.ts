@@ -64,6 +64,7 @@ import {
 import { createFilePendingBlobDeletionStore } from "./pending-blob-deletions.js";
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
+import { cleanupExpiredScopeImports } from "./routes/chunked-scope-import.js";
 import { createPdppAuthDeps } from "./pdpp/bootstrap.js";
 import {
   createPdppRecordsDeps,
@@ -336,6 +337,11 @@ export async function createServer(
     "CREATE TABLE IF NOT EXISTS cas_open_marker_protocol (id INTEGER PRIMARY KEY)",
   );
   const hierarchyOptions: HierarchyManagerOptions = { dataDir };
+  await cleanupExpiredScopeImports(
+    { hierarchyOptions, indexManager },
+    Date.now(),
+    true,
+  );
   await recoverStagedDataFiles({ indexManager, hierarchyOptions });
   const resumeReindex = await hasReindexInProgress();
   let needsRecoveryScan = false;
