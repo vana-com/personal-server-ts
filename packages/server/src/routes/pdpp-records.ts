@@ -748,11 +748,14 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   function ownerInstances(context: PdppTokenContext): string[] {
     if (context.tokenKind !== "owner") return [];
     if (context.sourceId) {
-      return (
+      const current =
         deps.instancesForSource?.(
           requireSubjectId(context),
           context.sourceId,
-        ) ?? []
+        ) ?? [];
+      if (!context.instanceIds) return current;
+      return context.instanceIds.filter((instance) =>
+        current.includes(instance),
       );
     }
     const current = deps.instancesForSubject?.(requireSubjectId(context));
