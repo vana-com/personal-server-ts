@@ -84,6 +84,7 @@ export interface DataRouteDeps {
     configuredMethods: Map<string, string[]>;
     ownerSubjectId?: string;
     instancesForSubject?: (subjectId: string) => string[];
+    instancesForSource?: (subjectId: string, sourceId: string) => string[];
   };
   /**
    * Powers the RECORD_DATA_ACCESS attestation embedded in 402 challenges.

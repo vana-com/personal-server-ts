@@ -65,6 +65,7 @@ export interface ServerApiAuthDeps {
     configuredMethods: Map<string, string[]>;
     ownerSubjectId?: string;
     instancesForSubject?: (subjectId: string) => string[];
+    instancesForSource?: (subjectId: string, sourceId: string) => string[];
   };
 }
 
@@ -218,6 +219,22 @@ export function createServerApiAuth(
           "PDPP owner bearer token is not scoped to the requested legacy source namespace",
           { scope, sourceId: context.sourceId },
         );
+      }
+      if (context.instanceIds) {
+        const liveInstances = new Set(
+          bridge.instancesForSource?.(context.subjectId, context.sourceId) ??
+            [],
+        );
+        if (
+          context.instanceIds.length === 0 ||
+          context.instanceIds.some((instance) => !liveInstances.has(instance))
+        ) {
+          throw pdppBridgeError(
+            "PDPP_OWNER_BEARER_FOREIGN",
+            "PDPP owner bearer token is not scoped to currently available source instances",
+            { sourceId: context.sourceId, instanceIds: context.instanceIds },
+          );
+        }
       }
       return;
     }

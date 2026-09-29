@@ -421,6 +421,7 @@ export function createApp(deps: AppDeps): Hono {
             configuredMethods: deps.pdpp.configuredMethods,
             ownerSubjectId: deps.serverOwner,
             instancesForSubject: deps.pdpp.instancesForSubject,
+            instancesForSource: deps.pdpp.instancesForSource,
           }
         : undefined,
       // A new local version of a scope marks every question that reads it
