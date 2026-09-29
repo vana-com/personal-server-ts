@@ -26,7 +26,7 @@ import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { createServer, type ServerContext } from "./bootstrap.js";
 import { MAX_INGEST_BODY_BYTES } from "./routes/pdpp-records.js";
-import { singleInstanceInventory } from "./pdpp/deployment.js";
+import { registerTestConnection } from "./pdpp/test-connections.js";
 
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
@@ -143,19 +143,7 @@ async function ownerToken(
       : bootedSourceIds.includes(OURA)
         ? OURA
         : (bootedSourceIds[0] ?? CLAUDE));
-  const response = await context.app.request("/pdpp/v1/owner/token", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${context.devToken}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      source_id: source,
-      instance_id: singleInstanceInventory(subject, source).eligibleFor("")[0],
-    }),
-  });
-  expect(response.status).toBe(200);
-  return ((await response.json()) as { access_token: string }).access_token;
+  return registerTestConnection(context.app, context.devToken, subject, source);
 }
 
 interface IngestBody {
@@ -711,17 +699,35 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
         { method_id: "oura-browser", declaration_path: ouraPath },
       ],
     );
-    const token = await ownerToken(ctx);
-    const response = await ingest(ctx, token, "events", {
-      instance: `oura:${owner}`,
-      key: "event-locked",
-      data: { id: "event-locked", kind: "locked" },
-      emitted_at: "2026-09-01T00:00:00Z",
+    const instance = `oura:${owner}`;
+    const minted = await ctx.app.request("/pdpp/v1/owner/token", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${ctx.devToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ source_id: OURA, instance_id: instance }),
     });
-    expect(response.status).toBe(409);
-    expect((response.body as any).error.code).toBe(
-      "config_multiple_active_methods",
+    const { access_token: token } = (await minted.json()) as {
+      access_token: string;
+    };
+    const registration = await ctx.app.request(
+      `/pdpp/connections/${encodeURIComponent(instance)}`,
+      {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          source_id: OURA,
+          method_id: "oura",
+          label: "Personal",
+        }),
+      },
     );
+    expect(registration.status).toBe(409);
+    expect((await registration.json()).error.code).toBe("method_inactive");
   });
 
   it("rejects an unclaimed blob reference without binding an empty instance", async () => {
@@ -757,7 +763,7 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
     expect(storeCounters()).toEqual({ clock: 0, changes: 0 });
   });
 
-  it("rejects stale A writes after reset to B and expires pre-reset change tokens", async () => {
+  it("rejects stale-generation writes after reset and expires old change tokens", async () => {
     const ouraPath = await writeDeclaration("oura", OURA_DECLARATION);
     const claudePath = await writeDeclaration("claude", CLAUDE_DECLARATION);
     ctx = await boot([claudePath, ouraPath]);
@@ -810,17 +816,10 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
       "/v1/streams/events/records?changes_since=",
     );
     const oldToken = baseline.body.next_changes_since as string;
-    const switched = await reset(
-      ctx,
-      token,
-      instance,
-      "oura",
-      1,
-      "oura-browser",
-    );
+    const switched = await reset(ctx, token, instance, "oura", 1, "oura");
     expect(switched.status).toBe(200);
     expect(await switched.json()).toMatchObject({
-      method: "oura-browser",
+      method: "oura",
       generation: 2,
     });
     expect(storeCounters()).toEqual({ clock: 4, changes: 0 });
@@ -857,14 +856,7 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
     );
     expect(blobStoreCounters()).toEqual(blobCountersAfterSwitch);
 
-    const resetAgain = await reset(
-      ctx,
-      token,
-      instance,
-      "oura",
-      1,
-      "oura-browser",
-    );
+    const resetAgain = await reset(ctx, token, instance, "oura", 1, "oura");
     expect(resetAgain.status).toBe(200);
     expect(await resetAgain.json()).toMatchObject({ status: "already_reset" });
     const afterReset = await read(
@@ -879,7 +871,7 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
       [claudePath, ouraPath],
       [
         { method_id: "claude", declaration_path: claudePath },
-        { method_id: "oura-browser", declaration_path: ouraPath },
+        { method_id: "oura", declaration_path: ouraPath },
       ],
     );
     const newToken = await ownerToken(ctx);
@@ -900,7 +892,7 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
     expect(staleRecord.status).toBe(409);
     expect(
       (staleRecord.body as unknown as { error: { code: string } }).error.code,
-    ).toBe("method_inactive");
+    ).toBe("binding_generation_mismatch");
     const staleBlob = await uploadBlob(
       ctx,
       newToken,
@@ -910,13 +902,15 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
       new TextEncoder().encode("late A bytes"),
     );
     expect(staleBlob.status).toBe(409);
-    expect((await staleBlob.json()).error.code).toBe("method_inactive");
+    expect((await staleBlob.json()).error.code).toBe(
+      "binding_generation_mismatch",
+    );
     const beforeStaleBlob = blobStoreCounters();
     const staleGenerationBlob = await uploadBlob(
       ctx,
       newToken,
       instance,
-      "oura-browser",
+      "oura",
       1,
       new TextEncoder().encode("old generation browser bytes"),
     );
@@ -930,7 +924,7 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
       ctx,
       newToken,
       instance,
-      "oura-browser",
+      "oura",
       2,
       new TextEncoder().encode("pending B bytes"),
     );
@@ -941,7 +935,7 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
       instance,
       "oura",
       1,
-      "oura-browser",
+      "oura",
     );
     expect(repeatedReset.status).toBe(200);
     expect(await repeatedReset.json()).toMatchObject({
@@ -959,7 +953,7 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
         data: { id: "event-b-stale-generation", kind: "browser" },
         emitted_at: "2026-09-02T00:00:00Z",
       },
-      "oura-browser",
+      "oura",
       1,
     );
     expect(staleGeneration.status).toBe(409);
@@ -979,7 +973,7 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
         data: { id: "event-b", kind: "browser" },
         emitted_at: "2026-09-02T00:00:00Z",
       },
-      "oura-browser",
+      "oura",
       2,
     );
     expect(bRecord.status).toBe(200);
@@ -1219,15 +1213,15 @@ describe("P10c and method authority over HTTP", () => {
     const changesCursor = changesPage.body.next_cursor as string;
     expect(changesCursor).toBeTruthy();
 
-    expect(
-      (await reset(ctx!, token, instance, "oura", 1, "oura-browser")).status,
-    ).toBe(200);
+    expect((await reset(ctx!, token, instance, "oura", 1, "oura")).status).toBe(
+      200,
+    );
     await ctx!.cleanup();
     ctx = await boot(
       [claudePath, ouraPath],
       [
         { method_id: "claude", declaration_path: claudePath },
-        { method_id: "oura-browser", declaration_path: ouraPath },
+        { method_id: "oura", declaration_path: ouraPath },
       ],
     );
     const newToken = await ownerToken(ctx);
@@ -1241,7 +1235,7 @@ describe("P10c and method authority over HTTP", () => {
         data: { id: key, kind: "b" },
         emitted_at: `2026-09-0${i + 8}T00:00:00Z`,
       })),
-      "oura-browser",
+      "oura",
       2,
     );
     expect(outcomes(bRecord.body)).toEqual(["accepted", "accepted"]);
@@ -1312,7 +1306,7 @@ describe("P10c and method authority over HTTP", () => {
 
     // A reset after the session starts: a NaN horizon would compare false
     // against reset_clock and pass the fence.
-    expect((await reset(ctx!, token, instance, "oura", 1, null)).status).toBe(
+    expect((await reset(ctx!, token, instance, "oura", 1, "oura")).status).toBe(
       200,
     );
     // 2^53 + 1 rounds to 2^53 as a number, so it must fail the
@@ -1502,20 +1496,28 @@ describe("P10c and method authority over HTTP", () => {
     const listed = await read(ctx!, token, "/v1/streams/events/records");
     expect(listed.body.data.map((r: any) => r.id)).toEqual(["a1"]);
 
-    // null (remove) and a method not configured yet (switch, §4.5) are
-    // still accepted.
-    const toNull = await reset(ctx!, token, instance, "oura", 1, null);
-    expect(toNull.status).toBe(200);
-    expect(await toNull.json()).toMatchObject({ method: null, generation: 2 });
-    const toNext = await reset(ctx!, token, instance, null, 2, "oura-browser");
-    expect(toNext.status).toBe(200);
-    expect(await toNext.json()).toMatchObject({
-      method: "oura-browser",
-      generation: 3,
+    const switched = await reset(ctx!, token, instance, "oura", 1, null);
+    expect(switched.status).toBe(409);
+    expect((await switched.json()).error.code).toBe("connection_conflict");
+    const sameMethod = await reset(ctx!, token, instance, "oura", 1, "oura");
+    expect(sameMethod.status).toBe(200);
+    expect(await sameMethod.json()).toMatchObject({
+      method: "oura",
+      generation: 2,
+    });
+    const empty = await read(
+      ctx!,
+      token,
+      `/pdpp/instances/${encodeURIComponent(instance)}/binding`,
+    );
+    expect(empty.body).toMatchObject({
+      method: "oura",
+      generation: 2,
+      empty: true,
     });
   });
 
-  it("reads the account-one binding registered during boot", async () => {
+  it("reads account one after Desktop explicitly registers it", async () => {
     const { token } = await bootSwitchable();
     const instance = `oura:${owner}`;
     const bindingRows = () => {
@@ -1542,7 +1544,7 @@ describe("P10c and method authority over HTTP", () => {
       empty: true,
       configured_active_method: "oura",
     });
-    // The registry migration creates account-1's binding row on boot.
+    // Boot registers account one from the persisted server configuration.
     expect(bindingRows()).toBe(2);
     await seedEvents(token, instance, ["a1"]);
     expect(bindingRows()).toBe(2);
@@ -1598,89 +1600,6 @@ describe("P10c and method authority over HTTP", () => {
     }
     expect(storeCounters()).toEqual({ clock: 0, changes: 0 });
     expect(blobStoreCounters()).toEqual({ metadata: 0, bytes: 0, claims: 0 });
-  });
-
-  it("requires an owner reset before a configured method writes to a migrated instance", async () => {
-    const { ouraPath, claudePath } = await bootSwitchable();
-    const instance = `oura:${owner}`;
-    await ctx!.cleanup();
-    // A pre-binding instance: rows exist, the binding has no method.
-    const db = new Database(join(tempDir, "index.db"));
-    try {
-      db.prepare(
-        "UPDATE pdpp_instance_binding SET method = NULL, source_id = NULL, label = '', deleted_at = NULL WHERE instance = ?",
-      ).run(instance);
-      db.prepare(
-        `INSERT INTO pdpp_records (instance, stream, record_key, data, version, emitted_at, deleted, deleted_at, blob_id)
-         VALUES (?, 'events', 'legacy', ?, 1, '2026-08-01T00:00:00Z', 0, NULL, NULL)`,
-      ).run(instance, JSON.stringify({ id: "legacy", kind: "old" }));
-    } finally {
-      db.close();
-    }
-    ctx = await boot([claudePath, ouraPath]);
-    const token = await ownerToken(ctx);
-
-    const binding = await read(
-      ctx,
-      token,
-      `/pdpp/instances/${encodeURIComponent(instance)}/binding`,
-    );
-    expect(binding.body).toMatchObject({
-      method: null,
-      generation: 1,
-      empty: false,
-    });
-    const write = await ingest(ctx, token, "events", {
-      instance,
-      key: "new",
-      data: { id: "new", kind: "a" },
-      emitted_at: "2026-09-01T00:00:00Z",
-    });
-    expect(write.status).toBe(409);
-    expect((write.body as any).error.code).toBe("binding_required");
-    const blob = await uploadBlob(
-      ctx,
-      token,
-      instance,
-      "oura",
-      1,
-      new TextEncoder().encode("migrated bytes"),
-    );
-    expect(blob.status).toBe(409);
-    expect((await blob.json()).error.code).toBe("binding_required");
-
-    const adopted = await ctx.app.request(
-      `/pdpp/instances/${encodeURIComponent(instance)}/reset`,
-      {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${token}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          expected_method: null,
-          expected_generation: 1,
-          next_method: "oura",
-        }),
-      },
-    );
-    expect(adopted.status).toBe(200);
-    const after = await ingest(
-      ctx,
-      token,
-      "events",
-      {
-        instance,
-        key: "new",
-        data: { id: "new", kind: "a" },
-        emitted_at: "2026-09-01T00:00:00Z",
-      },
-      "oura",
-      2,
-    );
-    expect(outcomes(after.body)).toEqual(["accepted"]);
-    const listed = await read(ctx, token, "/v1/streams/events/records");
-    expect(listed.body.data.map((r: any) => r.id)).toEqual(["new"]);
   });
 });
 

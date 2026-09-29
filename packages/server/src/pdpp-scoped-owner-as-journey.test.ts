@@ -371,6 +371,42 @@ describe("scoped owner tokens in the AS consent path", () => {
     expect(secondOuraRead.status).toBe(404);
   });
 
+  it("restarts after the owner deletes the legacy account-one connection", async () => {
+    const token = await ownerToken(OURA);
+    await ingestOuraSleep(token);
+
+    const connectionId = instance(OURA);
+    const deleted = await ctx!.app.request(
+      `/pdpp/connections/${encodeURIComponent(connectionId)}`,
+      { method: "DELETE", headers: { authorization: `Bearer ${token}` } },
+    );
+    expect(deleted.status).toBe(200);
+
+    await ctx!.cleanup();
+    ctx = undefined;
+    ctx = await bootBoth();
+
+    const reRegistered = await ctx.app.request(
+      `/pdpp/connections/${encodeURIComponent(connectionId)}`,
+      {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          source_id: OURA,
+          method_id: "oura",
+          label: "Personal",
+        }),
+      },
+    );
+    expect(reRegistered.status).toBe(409);
+    expect(await json(reRegistered)).toMatchObject({
+      error: { code: "connection_deleted" },
+    });
+  });
+
   it("allows a scoped owner token for the same instance to authorize, review, approve, redeem, and read", async () => {
     const ouraToken = await ownerToken(OURA);
     await ingestOuraSleep(ouraToken);
