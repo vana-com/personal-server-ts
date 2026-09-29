@@ -1,9 +1,12 @@
+import { connect } from "node:net";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { startTestServer, type TestServer } from "./helpers/server.js";
 import { startMockGateway, type MockGateway } from "./helpers/mock-gateway.js";
 
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
+const LEGACY_BODY_LIMIT_BYTES = 512 * 1024 * 1024;
+const LEGACY_200_MIB_BYTES = 200 * 1024 * 1024;
 
 describe("Data ingest endpoint (e2e)", () => {
   let server: TestServer;
@@ -109,4 +112,80 @@ describe("Data ingest endpoint (e2e)", () => {
 
     expect(body1.collectedAt).not.toBe(body2.collectedAt);
   });
+
+  it("POST /v1/data/{scope} accepts and reads back a legacy 200 MiB body", async () => {
+    const payload = "x".repeat(LEGACY_200_MIB_BYTES);
+    const post = await fetch(`${server.url}/v1/data/legacy.large`, {
+      method: "POST",
+      headers: ownerHeaders(),
+      body: JSON.stringify({ payload }),
+    });
+    expect(post.status).toBe(201);
+
+    const read = await fetch(`${server.url}/v1/data/legacy.large`, {
+      headers: {
+        Authorization: `Bearer ${server.devToken}`,
+      },
+    });
+    expect(read.status).toBe(200);
+    await expect(read.json()).resolves.toMatchObject({
+      data: { payload },
+    });
+  }, 120000);
+
+  it("POST /v1/data/{scope} rejects a body over the legacy ingest cap", async () => {
+    if (!server.devToken) {
+      throw new Error("Test server did not expose a dev token");
+    }
+    const response = await sendOversizedLegacyIngestHeaders({
+      url: server.url,
+      token: server.devToken,
+      contentLength: LEGACY_BODY_LIMIT_BYTES + 1,
+    });
+    expect(response).toContain(" 413 ");
+    expect(response).toContain("CONTENT_TOO_LARGE");
+  });
 });
+
+async function sendOversizedLegacyIngestHeaders(input: {
+  url: string;
+  token: string;
+  contentLength: number;
+}): Promise<string> {
+  const url = new URL(input.url);
+  const socket = connect({
+    host: url.hostname,
+    port: Number(url.port),
+  });
+  socket.setEncoding("utf8");
+  const response = new Promise<string>((resolve, reject) => {
+    let data = "";
+    socket.on("data", (chunk) => {
+      data += chunk;
+      if (data.includes("\r\n\r\n")) resolve(data);
+    });
+    socket.on("error", reject);
+    socket.setTimeout(5000, () => reject(new Error("response timed out")));
+  });
+  await new Promise<void>((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("error", reject);
+  });
+  socket.write(
+    [
+      "POST /v1/data/legacy.too-large HTTP/1.1",
+      `Host: ${url.host}`,
+      `Authorization: Bearer ${input.token}`,
+      "Content-Type: application/json",
+      `Content-Length: ${input.contentLength}`,
+      "Connection: close",
+      "",
+      "",
+    ].join("\r\n"),
+  );
+  try {
+    return await response;
+  } finally {
+    socket.destroy();
+  }
+}

@@ -33,7 +33,7 @@ import { createRecordDataValidator } from "../pdpp/record-schema.js";
 
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
-export const MAX_BLOB_UPLOAD_BYTES = 32 * 1024 * 1024;
+export const MAX_BLOB_UPLOAD_BYTES = 512 * 1024 * 1024;
 
 function rebindListCursor(
   template: string,
@@ -49,12 +49,8 @@ function rebindListCursor(
     recordKey: last.recordKey,
   });
 }
-/**
- * Desktop caps one connector run's captured records at 32 MiB, and it sends
- * one record per ingest request. JSON escaping can grow a record's encoded
- * size, so the limit leaves room above the capture cap rather than matching it.
- */
-export const MAX_INGEST_BODY_BYTES = 64 * 1024 * 1024;
+/** 512 MiB — max body size for PDPP record ingest and replace routes. */
+export const MAX_INGEST_BODY_BYTES = 512 * 1024 * 1024;
 
 const BLOB_MEDIA_TYPE =
   /^(application|audio|example|font|haptics|image|message|model|multipart|text|video)\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/i;
