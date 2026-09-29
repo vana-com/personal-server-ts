@@ -58,13 +58,10 @@ export interface PdppRecordsDeps {
   store: PdppRecordStore;
   bindingStore: ReturnType<typeof createSqliteRecordStore>;
   configuredMethods: Map<string, string[]>;
-  connectionMethods: Map<string, string[]>;
-  canonicalSourceIds: Set<string>;
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
   instancesForSubject?: (subjectId: string) => string[];
   instancesForSource?: (subjectId: string, sourceId: string) => string[];
-  sourceIds: Set<string>;
   readBlobBytes?: (
     blobId: string,
   ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
@@ -83,7 +80,6 @@ export interface CreatePdppRecordsDepsOptions {
   resource: string;
   logger: Logger;
   configuredMethods?: { sourceId: string; methodId: string }[];
-  connectionMethods?: Map<string, string[]>;
 }
 
 export function createPdppRecordsDeps(
@@ -127,13 +123,6 @@ export function createPdppRecordsDeps(
     methodIds.push(configured.methodId);
     configuredMethods.set(source.sourceId, methodIds);
   }
-  const connectionMethods = new Map(options.connectionMethods ?? []);
-  for (const [sourceId, methodIds] of configuredMethods) {
-    if (!connectionMethods.has(sourceId)) {
-      connectionMethods.set(sourceId, [...methodIds]);
-    }
-  }
-
   const store = createSqliteRecordStore(options.db);
 
   // Register account 1 only for an empty source registry. Never add a legacy
@@ -236,12 +225,6 @@ export function createPdppRecordsDeps(
     store,
     bindingStore: store,
     configuredMethods,
-    connectionMethods,
-    // Retained declaration bytes may outlive the active canonical writer
-    // configuration. A connection method alone must never enable writers.
-    canonicalSourceIds: new Set(
-      (options.configuredMethods ?? []).map((method) => method.sourceId),
-    ),
     auth: coLocatedAuthorizationService(pdppAuth),
     declarations,
     // This deployment has exactly one owner. A subject other than that
@@ -266,10 +249,6 @@ export function createPdppRecordsDeps(
             .listConnections(sourceId)
             .map((connection) => connection.instance)
         : [],
-    sourceIds: new Set([
-      ...sources.map((source) => source.sourceId),
-      ...connectionMethods.keys(),
-    ]),
     // Real boot wiring for GET /v1/blobs/:blobId: reads the same store the
     // blob was ingested into, so this deployment can only ever serve bytes
     // it verifiably stored -- store.getBlobBytes re-verifies size/sha256

@@ -811,7 +811,6 @@ export async function createServer(
     resource: effectiveOrigin,
     logger,
     configuredMethods: pdppAuth?.configuredMethods,
-    connectionMethods: pdppAuth?.connectionMethods,
   });
 
   const pdppConnections = pdppAuth

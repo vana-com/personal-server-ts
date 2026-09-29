@@ -225,13 +225,10 @@ export interface AppDeps {
     store: PdppRecordStore;
     bindingStore: ReturnType<typeof createSqliteRecordStore>;
     configuredMethods: Map<string, string[]>;
-    connectionMethods: Map<string, string[]>;
-    canonicalSourceIds: Set<string>;
     auth: PdppAuthorizationService;
     declarations: StreamDeclarationRegistry;
     instancesForSubject?: (subjectId: string) => string[];
     instancesForSource?: (subjectId: string, sourceId: string) => string[];
-    sourceIds: Set<string>;
     readBlobBytes?: (
       blobId: string,
     ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
