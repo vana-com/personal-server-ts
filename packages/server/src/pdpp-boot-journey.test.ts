@@ -41,7 +41,7 @@ import { computeS256Challenge } from "@opendatalabs/personal-server-ts-core/pdpp
 import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { createServer, type ServerContext } from "./bootstrap.js";
 import { initializeDatabase } from "./storage/index-schema.js";
-import { singleInstanceInventory } from "./pdpp/deployment.js";
+import { registerTestConnection } from "./pdpp/test-connections.js";
 
 /** Derives a stable owner address; same signature the bootstrap suites use. */
 const KNOWN_SIG =
@@ -118,6 +118,10 @@ function pdppConfig(declarationPaths: string[]) {
     pdpp: {
       enabled: true,
       declarationPaths,
+      methods: declarationPaths.map((declaration_path) => ({
+        method_id: "spotify",
+        declaration_path,
+      })),
       clients: [{ clientId: CLIENT_ID, redirectUris: [REDIRECT] }],
     },
   });
@@ -133,21 +137,12 @@ async function boot() {
 /** Mint a real owner token through the mounted route, behind the owner proof. */
 async function ownerToken(context: ServerContext): Promise<string> {
   const serverOwner = await recoverServerOwner(KNOWN_SIG);
-  const instanceId = singleInstanceInventory(
-    serverOwner.toLowerCase(),
+  return registerTestConnection(
+    context.app,
+    context.devToken,
+    serverOwner,
     SOURCE_ID,
-  ).eligibleFor("")[0];
-  const response = await context.app.request("/pdpp/v1/owner/token", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${context.devToken}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ source_id: SOURCE_ID, instance_id: instanceId }),
-  });
-  expect(response.status).toBe(200);
-  const body = (await response.json()) as { access_token: string };
-  return body.access_token;
+  );
 }
 
 /**
@@ -279,13 +274,26 @@ describe("PDPP boot journey: real createServer", () => {
       source_id: SOURCE_ID,
       instance_id: "spotify:another-owner",
     });
-    expect(otherInstance.status).toBe(403);
-    expect((await otherInstance.json()).error).toBe("access_denied");
+    expect(otherInstance.status).toBe(200);
+    expect((await otherInstance.json()).access_token).toEqual(
+      expect.any(String),
+    );
   });
 
-  it("mints a real owner token scoped to exactly one requested instance", async () => {
+  it("mints a source-wide owner token without instance-scoped introspection", async () => {
     ctx = await boot();
-    const token = await ownerToken(ctx);
+    const response = await ctx.app.request("/pdpp/v1/owner/token", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${ctx.devToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ source_id: SOURCE_ID }),
+    });
+    expect(response.status).toBe(200);
+    const { access_token: token } = (await response.json()) as {
+      access_token: string;
+    };
     const introspected = await ctx.app.request("/pdpp/v1/introspect", {
       method: "POST",
       headers: {
@@ -295,20 +303,7 @@ describe("PDPP boot journey: real createServer", () => {
       body: new URLSearchParams({ token }).toString(),
     });
     expect(introspected.status).toBe(200);
-    const body = (await introspected.json()) as {
-      active: boolean;
-      pdpp_token_kind?: string;
-      instance_ids?: string[];
-    };
-    expect(body.active).toBe(true);
-    expect(body.pdpp_token_kind).toBe("owner");
-    expect(body.instance_ids).toHaveLength(1);
-    expect(body.instance_ids?.[0]).toBe(
-      singleInstanceInventory(
-        (await recoverServerOwner(KNOWN_SIG)).toLowerCase(),
-        SOURCE_ID,
-      ).eligibleFor("")[0],
-    );
+    expect((await introspected.json()).active).toBe(true);
   });
 
   it("issues a real grant-bound token on a real bootstrapped server", async () => {

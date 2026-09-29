@@ -102,6 +102,7 @@ export type ApprovalFailureCode =
    * recipient can accept a term.
    */
   | "recipient_terms_unsupported"
+  | "unsupported_instance_fan_in"
   | "invalid_request";
 
 export interface ApprovalFailure {
@@ -450,6 +451,16 @@ export function fetchReview(input: {
     };
   }
 
+  if (requestsFanIn(session.request, session.snapshot, input.instanceChoices)) {
+    return {
+      ok: false,
+      failure: {
+        code: "unsupported_instance_fan_in",
+        message: "Select one connection per stream",
+      },
+    };
+  }
+
   const inventory = withInstanceChoices(input.inventory, input.instanceChoices);
 
   // Surface outstanding choices before attempting resolution: an unresolvable
@@ -613,6 +624,16 @@ export function approveAuthorization(input: {
     };
   }
 
+  if (requestsFanIn(session.request, session.snapshot, input.instanceChoices)) {
+    return {
+      ok: false,
+      failure: {
+        code: "unsupported_instance_fan_in",
+        message: "Select one connection per stream",
+      },
+    };
+  }
+
   if (!input.reviewDigest) {
     return {
       ok: false,
@@ -675,6 +696,17 @@ export function approveAuthorization(input: {
     grant: issuance.grant,
     consentEvidence: issuance.consentEvidence,
   };
+}
+
+function requestsFanIn(
+  request: SelectionRequest,
+  snapshot: DeclarationSnapshot,
+  choices: Record<string, string[]> | undefined,
+): boolean {
+  return expandSelections(request, snapshot).some((stream) => {
+    const ids = choices?.[stream.name] ?? stream.instance_ids ?? [];
+    return new Set(ids).size > 1;
+  });
 }
 
 /**

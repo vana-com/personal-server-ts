@@ -11,6 +11,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import Database from "better-sqlite3";
 import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import {
@@ -19,7 +20,7 @@ import {
   PdppTokenService,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { createServer, type ServerContext } from "./bootstrap.js";
-import { singleInstanceInventory } from "./pdpp/deployment.js";
+import { registerTestConnection } from "./pdpp/test-connections.js";
 
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
@@ -92,23 +93,12 @@ async function bootBoth() {
 }
 
 function instance(sourceId: string) {
-  return singleInstanceInventory(owner, sourceId).eligibleFor("")[0];
+  const connector = sourceId.split("/").filter(Boolean).at(-1) ?? sourceId;
+  return `${connector}:${owner}`;
 }
 
 async function ownerToken(sourceId: string): Promise<string> {
-  const response = await ctx!.app.request("/pdpp/v1/owner/token", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${ctx!.devToken}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      source_id: sourceId,
-      instance_id: instance(sourceId),
-    }),
-  });
-  expect(response.status).toBe(200);
-  return ((await response.json()) as { access_token: string }).access_token;
+  return registerTestConnection(ctx!.app, ctx!.devToken, owner, sourceId);
 }
 
 function unscopedOwnerToken(): string {
@@ -116,6 +106,7 @@ function unscopedOwnerToken(): string {
   try {
     return new PdppTokenService(store).issueOwnerToken({
       subjectId: owner,
+      sourceId: OURA,
     }).access_token;
   } finally {
     store.close();
@@ -127,14 +118,18 @@ function multiInstanceOwnerToken(): string {
   try {
     return new PdppTokenService(store).issueOwnerToken({
       subjectId: owner,
-      instanceIds: [instance(CLAUDE), instance(OURA)],
+      sourceId: OURA,
     }).access_token;
   } finally {
     store.close();
   }
 }
 
-async function ingestOuraSleep(token: string) {
+async function ingestOuraSleep(
+  token: string,
+  instanceId = instance(OURA),
+  score = 91,
+) {
   const response = await ctx!.app.request(
     "/v1/streams/sleep/records/ingest?method=oura&binding_generation=1",
     {
@@ -144,9 +139,9 @@ async function ingestOuraSleep(token: string) {
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        instance: instance(OURA),
+        instance: instanceId,
         key: "sleep-1",
-        data: { id: "sleep-1", score: 91 },
+        data: { id: "sleep-1", score },
         emitted_at: "2026-09-01T00:00:00Z",
       }),
     },
@@ -208,13 +203,24 @@ async function authorizeClaude(token: string): Promise<string> {
   return ((await response.json()) as { session_id: string }).session_id;
 }
 
-async function issueOuraGrant(token: string): Promise<{
+async function issueOuraGrant(
+  token: string,
+  instanceChoices?: Record<string, string[]>,
+): Promise<{
   accessToken: string;
   grantId: string;
 }> {
   const sessionId = await authorizeOura(token);
+  const choiceQuery = instanceChoices
+    ? `?${new URLSearchParams(
+        Object.entries(instanceChoices).map(([stream, [instanceId]]) => [
+          `instance[${stream}]`,
+          instanceId,
+        ]),
+      )}`
+    : "";
   const reviewed = await ctx!.app.request(
-    `/pdpp/v1/authorize/${sessionId}/review`,
+    `/pdpp/v1/authorize/${sessionId}/review${choiceQuery}`,
     { headers: { authorization: `Bearer ${token}` } },
   );
   expect(reviewed.status).toBe(200);
@@ -230,7 +236,10 @@ async function issueOuraGrant(token: string): Promise<{
         authorization: `Bearer ${token}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({ review_digest: review.review_digest }),
+      body: JSON.stringify({
+        review_digest: review.review_digest,
+        ...(instanceChoices && { instance_choices: instanceChoices }),
+      }),
     },
   );
   expect(approved.status).toBe(200);
@@ -322,8 +331,7 @@ describe("scoped owner tokens in the AS consent path", () => {
     expect(authorized.status).toBe(403);
     expect(await json(authorized)).toMatchObject({
       error: "access_denied",
-      error_description:
-        "owner token is not scoped to an instance for the requested source",
+      error_description: "owner token is not scoped to the requested source",
     });
 
     const ouraSession = await authorizeOura(ouraToken);
@@ -334,8 +342,7 @@ describe("scoped owner tokens in the AS consent path", () => {
     expect(claudeReview.status).toBe(403);
     expect(await json(claudeReview)).toMatchObject({
       error: "access_denied",
-      error_description:
-        "owner token is not scoped to an instance for the requested source",
+      error_description: "owner token is not scoped to the requested source",
     });
 
     const ouraReview = await ctx!.app.request(
@@ -362,8 +369,7 @@ describe("scoped owner tokens in the AS consent path", () => {
     const claudeApprovalBody = await json(claudeApprove);
     expect(claudeApprovalBody).toMatchObject({
       error: "access_denied",
-      error_description:
-        "owner token is not scoped to an instance for the requested source",
+      error_description: "owner token is not scoped to the requested source",
     });
     expect(claudeApprovalBody.redirect_uri).toBeUndefined();
 
@@ -405,6 +411,72 @@ describe("scoped owner tokens in the AS consent path", () => {
     expect(await json(reRegistered)).toMatchObject({
       error: { code: "connection_deleted" },
     });
+  });
+
+  it("restores known legacy account-one bindings on boot without a Desktop PUT", async () => {
+    const token = await ownerToken(OURA);
+    await ingestOuraSleep(token);
+    const { accessToken } = await issueOuraGrant(token);
+
+    await ctx!.cleanup();
+    ctx = undefined;
+    const db = new Database(join(tempDir, "index.db"));
+    try {
+      // Restore the base PS v5 schema. Its known method and legacy id remain;
+      // v6 must add the connection metadata before boot can adopt the row.
+      db.exec(`
+        ALTER TABLE pdpp_instance_binding DROP COLUMN deleted_at;
+        ALTER TABLE pdpp_instance_binding DROP COLUMN label;
+        ALTER TABLE pdpp_instance_binding DROP COLUMN source_id;
+        UPDATE pdpp_schema_version SET version = 5 WHERE id = 1;
+      `);
+    } finally {
+      db.close();
+    }
+
+    ctx = await bootBoth();
+
+    const existingRead = await readSleep(accessToken);
+    expect(existingRead.status).toBe(200);
+    expect(existingRead.body.data).toEqual({ id: "sleep-1", score: 91 });
+    const existingList = await ctx.app.request("/v1/streams/sleep/records", {
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    expect(existingList.status).toBe(200);
+
+    const desktopMint = await ctx.app.request("/pdpp/v1/owner/token", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${ctx.devToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        source_id: OURA,
+        instance_id: instance(OURA),
+      }),
+    });
+    expect(desktopMint.status).toBe(200);
+    const { access_token: ownerAccess } = (await desktopMint.json()) as {
+      access_token: string;
+    };
+    const write = await ctx.app.request(
+      "/v1/streams/sleep/records/ingest?method=oura&binding_generation=1",
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${ownerAccess}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          instance: instance(OURA),
+          key: "sleep-2",
+          data: { id: "sleep-2", score: 50 },
+          emitted_at: "2026-09-02T00:00:00Z",
+        }),
+      },
+    );
+    expect(write.status).toBe(200);
+    expect((await authorizeOura(ownerAccess)).length).toBeGreaterThan(0);
   });
 
   it("allows a scoped owner token for the same instance to authorize, review, approve, redeem, and read", async () => {
@@ -478,7 +550,7 @@ describe("scoped owner tokens in the AS consent path", () => {
     expect(JSON.stringify(existing)).not.toContain("sleep");
   });
 
-  it("refuses old unscoped owner tokens for AS grant and consent", async () => {
+  it("uses source-wide owner tokens for consent and grant management", async () => {
     const ouraToken = await ownerToken(OURA);
     await ingestOuraSleep(ouraToken);
 
@@ -506,11 +578,7 @@ describe("scoped owner tokens in the AS consent path", () => {
         ],
       }),
     });
-    expect(authorized.status).toBe(403);
-    expect(await json(authorized)).toMatchObject({
-      error: "access_denied",
-      error_description: "owner token is not scoped to an instance",
-    });
+    expect(authorized.status).toBe(201);
 
     const multiAuthorized = await ctx!.app.request("/pdpp/v1/authorize", {
       method: "POST",
@@ -534,22 +602,14 @@ describe("scoped owner tokens in the AS consent path", () => {
         ],
       }),
     });
-    expect(multiAuthorized.status).toBe(403);
-    expect(await json(multiAuthorized)).toMatchObject({
-      error: "access_denied",
-      error_description: "owner token is not scoped to an instance",
-    });
+    expect(multiAuthorized.status).toBe(201);
 
     const ouraSession = await authorizeOura(ouraToken);
     const reviewed = await ctx!.app.request(
       `/pdpp/v1/authorize/${ouraSession}/review`,
       { headers: { authorization: `Bearer ${legacyToken}` } },
     );
-    expect(reviewed.status).toBe(403);
-    expect(await json(reviewed)).toMatchObject({
-      error: "access_denied",
-      error_description: "owner token is not scoped to an instance",
-    });
+    expect(reviewed.status).toBe(200);
 
     const ouraReview = await ctx!.app.request(
       `/pdpp/v1/authorize/${ouraSession}/review`,
@@ -571,20 +631,12 @@ describe("scoped owner tokens in the AS consent path", () => {
         body: JSON.stringify({ review_digest: review.review_digest }),
       },
     );
-    expect(approved.status).toBe(403);
-    expect(await json(approved)).toMatchObject({
-      error: "access_denied",
-      error_description: "owner token is not scoped to an instance",
-    });
+    expect(approved.status).toBe(200);
 
     const grants = await ctx!.app.request("/pdpp/v1/grants", {
       headers: { authorization: `Bearer ${legacyToken}` },
     });
-    expect(grants.status).toBe(403);
-    expect(await json(grants)).toMatchObject({
-      error: "access_denied",
-      error_description: "a scoped owner token is required",
-    });
+    expect(grants.status).toBe(200);
 
     const introspected = await ctx!.app.request("/pdpp/v1/introspect", {
       method: "POST",
@@ -594,10 +646,10 @@ describe("scoped owner tokens in the AS consent path", () => {
       },
       body: new URLSearchParams({ token: ouraToken }).toString(),
     });
-    expect(introspected.status).toBe(403);
+    expect(introspected.status).toBe(200);
     expect(await json(introspected)).toMatchObject({
-      error: "access_denied",
-      error_description: "introspection requires a scoped owner token",
+      active: true,
+      source_id: OURA,
     });
 
     const revoked = await ctx!.app.request("/pdpp/v1/revoke", {
@@ -608,10 +660,196 @@ describe("scoped owner tokens in the AS consent path", () => {
       },
       body: new URLSearchParams({ grant_id: "grant-never-reached" }).toString(),
     });
-    expect(revoked.status).toBe(403);
+    expect(revoked.status).toBe(404);
     expect(await json(revoked)).toMatchObject({
-      error: "access_denied",
-      error_description: "a scoped owner token is required",
+      error: "not_found",
+      error_description: "grant not found",
     });
+  });
+
+  it("keeps deleted-connection grants listed and revocable while each read returns 404", async () => {
+    const owner = await ownerToken(OURA);
+    await ingestOuraSleep(owner);
+    const { accessToken, grantId } = await issueOuraGrant(owner);
+
+    const deleted = await ctx!.app.request(
+      `/pdpp/connections/${encodeURIComponent(instance(OURA))}`,
+      { method: "DELETE", headers: { authorization: `Bearer ${owner}` } },
+    );
+    expect(deleted.status).toBe(200);
+
+    for (const path of [
+      "/v1/streams/sleep/records",
+      "/v1/streams/sleep/records?changes_since=0",
+      "/v1/streams/sleep/records/sleep-1",
+      "/v1/blobs/sha256:missing",
+    ]) {
+      const response = await ctx!.app.request(path, {
+        headers: { authorization: `Bearer ${accessToken}` },
+      });
+      expect(response.status, path).toBe(404);
+      expect(await json(response), path).toMatchObject({
+        error: { code: "instance_unavailable" },
+      });
+    }
+
+    const grants = await ctx!.app.request("/pdpp/v1/grants", {
+      headers: { authorization: `Bearer ${owner}` },
+    });
+    expect(await json(grants)).toMatchObject({
+      grants: [expect.objectContaining({ grant_id: grantId })],
+    });
+
+    const revoked = await ctx!.app.request("/pdpp/v1/revoke", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${owner}`,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ grant_id: grantId }).toString(),
+    });
+    expect(revoked.status).toBe(200);
+  });
+
+  it("asks for an account when two connections exist and grants only the chosen account", async () => {
+    const owner = await ownerToken(OURA);
+    const accountB = "conn_123e4567-e89b-42d3-a456-426614174000";
+    const registration = await ctx!.app.request(
+      `/pdpp/connections/${encodeURIComponent(accountB)}`,
+      {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${owner}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          source_id: OURA,
+          method_id: "oura",
+          label: "Work",
+        }),
+      },
+    );
+    expect(registration.status).toBe(200);
+    await ingestOuraSleep(owner, instance(OURA), 91);
+    await ingestOuraSleep(owner, accountB, 44);
+
+    const sessionId = await authorizeOura(owner);
+    const unchosen = await ctx!.app.request(
+      `/pdpp/v1/authorize/${sessionId}/review`,
+      { headers: { authorization: `Bearer ${owner}` } },
+    );
+    const choice = (await json(unchosen)).instance_choice_required as {
+      stream: string;
+      candidates: string[];
+    }[];
+    expect(choice).toHaveLength(1);
+    expect(choice[0]).toMatchObject({
+      stream: "sleep",
+      candidates: [instance(OURA), accountB].sort(),
+    });
+
+    const fanInSessionId = await authorizeOura(owner);
+    const fanIn = await ctx!.app.request(
+      `/pdpp/v1/authorize/${fanInSessionId}/approve`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${owner}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          instance_choices: { sleep: [instance(OURA), accountB] },
+        }),
+      },
+    );
+    expect(fanIn.status).toBe(400);
+    expect(await json(fanIn)).toMatchObject({
+      error: "unsupported_instance_fan_in",
+    });
+
+    const { accessToken } = await issueOuraGrant(owner, { sleep: [accountB] });
+    const read = await readSleep(accessToken);
+    expect(read.status).toBe(200);
+    expect(read.body.data).toEqual({ id: "sleep-1", score: 44 });
+  });
+
+  it("keeps the other connection's data and change feed after deleting one account", async () => {
+    const owner = await ownerToken(OURA);
+    const accountA = instance(OURA);
+    const accountB = "conn_123e4567-e89b-42d3-a456-426614174000";
+    const registration = await ctx!.app.request(
+      `/pdpp/connections/${encodeURIComponent(accountB)}`,
+      {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${owner}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          source_id: OURA,
+          method_id: "oura",
+          label: "Work",
+        }),
+      },
+    );
+    expect(registration.status).toBe(200);
+
+    await ingestOuraSleep(owner, accountA, 91);
+    await ingestOuraSleep(owner, accountB, 44);
+    const grantA = await issueOuraGrant(owner, {
+      sleep: [accountA],
+    });
+    const grantB = await issueOuraGrant(owner, {
+      sleep: [accountB],
+    });
+
+    const beforeDelete = await readSleep(grantB.accessToken);
+    expect(beforeDelete.status).toBe(200);
+    expect(beforeDelete.body.data).toEqual({ id: "sleep-1", score: 44 });
+
+    const baselineA = await ctx!.app.request(
+      "/v1/streams/sleep/records?changes_since=",
+      { headers: { authorization: `Bearer ${grantA.accessToken}` } },
+    );
+    const baselineB = await ctx!.app.request(
+      "/v1/streams/sleep/records?changes_since=",
+      { headers: { authorization: `Bearer ${grantB.accessToken}` } },
+    );
+    expect(baselineA.status).toBe(200);
+    expect(baselineB.status).toBe(200);
+    const baselineABody = (await json(baselineA)) as {
+      data: Array<{ data: unknown }>;
+      next_changes_since: string;
+    };
+    const baselineBBody = (await json(baselineB)) as {
+      data: Array<{ data: unknown }>;
+      next_changes_since: string;
+    };
+    expect(baselineABody.data).toEqual([
+      expect.objectContaining({ data: { id: "sleep-1", score: 91 } }),
+    ]);
+    expect(baselineBBody.data).toEqual([
+      expect.objectContaining({ data: { id: "sleep-1", score: 44 } }),
+    ]);
+    expect(baselineABody.next_changes_since).not.toBe(
+      baselineBBody.next_changes_since,
+    );
+
+    const deleted = await ctx!.app.request(
+      `/pdpp/connections/${encodeURIComponent(accountA)}`,
+      { method: "DELETE", headers: { authorization: `Bearer ${owner}` } },
+    );
+    expect(deleted.status).toBe(200);
+
+    const afterDelete = await readSleep(grantB.accessToken);
+    expect(afterDelete.status).toBe(200);
+    expect(afterDelete.body.data).toEqual({ id: "sleep-1", score: 44 });
+
+    const changes = await ctx!.app.request(
+      `/v1/streams/sleep/records?changes_since=${encodeURIComponent(baselineBBody.next_changes_since)}`,
+      { headers: { authorization: `Bearer ${grantB.accessToken}` } },
+    );
+    expect(changes.status).toBe(200);
+    expect(await json(changes)).toMatchObject({ data: [] });
   });
 });

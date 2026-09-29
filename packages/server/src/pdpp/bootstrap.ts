@@ -34,7 +34,6 @@ import type { TokenStore } from "../token-store.js";
 import { boundedClientDocumentFetcher } from "./client-document-fetch.js";
 import {
   deriveSupportedConnectors,
-  singleInstanceInventory,
   type ConfiguredDeclaration,
 } from "./deployment.js";
 import {
@@ -220,8 +219,10 @@ export async function createPdppAuthDeps(
     // same thunk-or-string `serverOrigin` already is, so a deployment that
     // resolves its origin late still advertises the live one.
     issuer: options.serverOrigin,
-    inventoryFor: (subject, sourceId) =>
-      singleInstanceInventory(subject || subjectId, sourceId),
+    // The records bootstrap replaces this with a live registry lookup once
+    // the shared SQLite store is available. Until then, no connection is
+    // eligible for consent.
+    inventoryFor: () => ({ eligibleFor: () => [] }),
     /**
      * Bind the session's subject to an *authenticated* owner.
      *

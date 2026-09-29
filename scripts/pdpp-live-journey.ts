@@ -31,7 +31,6 @@ import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { createServer } from "../packages/server/src/bootstrap.js";
 import { listenHttpServer } from "../packages/server/src/listen.js";
 import { initializeDatabase } from "../packages/server/src/storage/index-schema.js";
-import { singleInstanceInventory } from "../packages/server/src/pdpp/deployment.js";
 
 /** Derives a stable owner address; the same signature the test suites use. */
 const KNOWN_SIG =
@@ -117,6 +116,7 @@ async function main(): Promise<void> {
     pdpp: {
       enabled: true,
       declarationPaths: [declPath],
+      methods: [{ method_id: "spotify", declaration_path: declPath }],
       // redirect_uri is validated by EXACT match against a registered client.
       clients: [{ clientId: CLIENT_ID, redirectUris: [REDIRECT] }],
     },
@@ -146,9 +146,7 @@ async function main(): Promise<void> {
 
   // --- 2. Owner token, behind the server's own owner proof ----------------
   const subject = (await recoverServerOwner(KNOWN_SIG)).toLowerCase();
-  const instanceId = singleInstanceInventory(subject, SOURCE_ID).eligibleFor(
-    "",
-  )[0];
+  const instanceId = `spotify:${subject}`;
   const ownerRes = await fetch(`${base}/pdpp/v1/owner/token`, {
     method: "POST",
     headers: {
@@ -160,6 +158,25 @@ async function main(): Promise<void> {
   must(ownerRes.status === 200, `owner token returned ${ownerRes.status}`);
   const owner = ((await ownerRes.json()) as { access_token: string })
     .access_token;
+  const registration = await fetch(
+    `${base}/pdpp/connections/${encodeURIComponent(instanceId)}`,
+    {
+      method: "PUT",
+      headers: {
+        authorization: `Bearer ${owner}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        source_id: SOURCE_ID,
+        method_id: "spotify",
+        label: "Personal",
+      }),
+    },
+  );
+  must(
+    registration.status === 200,
+    `connection registration returned ${registration.status}`,
+  );
   say("owner token minted");
 
   const ownerAuth = { authorization: `Bearer ${owner}` };

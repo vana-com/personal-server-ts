@@ -65,10 +65,8 @@ import {
 import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
 import { dataRoutes } from "../routes/data.js";
-import {
-  buildDeclarationRegistry,
-  singleInstanceInventory,
-} from "./deployment.js";
+import { buildDeclarationRegistry } from "./deployment.js";
+import { legacyTestConnectionId } from "./test-connections.js";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const SCOPE = "github.profile";
@@ -180,8 +178,7 @@ function buildImporter(store: PdppRecordStore): PdppImporter {
         })),
       },
     ],
-    instanceFor: (sourceId) =>
-      singleInstanceInventory(SUBJECT, sourceId).eligibleFor("")[0],
+    instanceFor: (sourceId) => legacyTestConnectionId(SUBJECT, sourceId),
     logger,
   });
 }

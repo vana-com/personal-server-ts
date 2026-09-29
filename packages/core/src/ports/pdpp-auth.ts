@@ -101,6 +101,8 @@ export interface PdppTokenContext {
   subjectId?: string;
   /** Owner tokens only. The RS enforces this persisted scope directly. */
   instanceIds?: string[];
+  /** Owner tokens only. Limits the token to one source's connections. */
+  sourceId?: string;
   /** Client tokens only. */
   grant?: Grant;
   clientId?: string;

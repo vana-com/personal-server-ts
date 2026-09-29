@@ -706,7 +706,7 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
         authorization: `Bearer ${ctx.devToken}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({ source_id: OURA, instance_id: instance }),
+      body: JSON.stringify({ source_id: OURA }),
     });
     const { access_token: token } = (await minted.json()) as {
       access_token: string;
@@ -1156,9 +1156,9 @@ describe("$pdpp import over POST /v1/data", () => {
     expect(storeCounters()).toEqual({ clock: 0, changes: 0 });
     expect(logs).toContainEqual(
       expect.objectContaining({
-        code: "method_authority",
-        message: "method_required",
-        permanent: true,
+        code: "no_instance",
+        message: `no instance handle could be derived for source '${WHOOP}'`,
+        permanent: false,
       }),
     );
   });
@@ -1544,10 +1544,10 @@ describe("P10c and method authority over HTTP", () => {
       empty: true,
       configured_active_method: "oura",
     });
-    // Boot registers account one from the persisted server configuration.
-    expect(bindingRows()).toBe(2);
+    // A read-only binding probe creates the legacy row but does not register it.
+    expect(bindingRows()).toBe(1);
     await seedEvents(token, instance, ["a1"]);
-    expect(bindingRows()).toBe(2);
+    expect(bindingRows()).toBe(1);
   });
 
   it("keeps a keyset cursor valid across later writes without a reset", async () => {

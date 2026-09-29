@@ -21,12 +21,13 @@ describe("PDPP connection routes", () => {
           active: true as const,
           tokenKind: "owner" as const,
           subjectId: OWNER,
+          sourceId: SOURCE,
           instanceIds: [A],
         };
       },
     } satisfies PdppAuthorizationService,
     ownerSubjectId: OWNER,
-    configuredMethods: new Map([[A, ["spotify"]]]),
+    configuredMethods: new Map([[SOURCE, ["spotify"]]]),
     sourceIds: new Set([SOURCE]),
   });
 

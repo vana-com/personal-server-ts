@@ -17,6 +17,8 @@ export interface PdppBlobsRouteDeps {
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
   instancesForSubject?: (subjectId: string) => string[];
+  instancesForSource?: (subjectId: string, sourceId: string) => string[];
+  isConnectionAvailable?: (instance: string) => boolean;
   /**
    * Loads raw blob bytes for a blob_id, or undefined if not locally stored.
    * Optional: when absent or throwing, GET fails closed with `api_error` (500) instead of a fabricated 200.
@@ -86,6 +88,25 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       return { error: jsonError(c, err, reqId) };
     }
 
+    // DELETE removes the grant's record references and claim rows. Check its
+    // connection before blob metadata so callers still get the K7 refusal.
+    if (context.tokenKind !== "owner") {
+      const grantInstances = (context.grant?.streams ?? []).flatMap(
+        (stream) => stream.instance_ids,
+      );
+      if (
+        grantInstances.some(
+          (instance) => deps.isConnectionAvailable?.(instance) === false,
+        )
+      ) {
+        const err = new PdppError(
+          "instance_unavailable",
+          "The connection for this grant is unavailable",
+        );
+        return { error: jsonError(c, err, reqId) };
+      }
+    }
+
     const meta = deps.store.getBlobMeta(blobId);
     if (!meta) {
       const err = new PdppError(
@@ -118,8 +139,9 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       // everyone" — mirrors the record routes' `?? []` default.
       if (!context.subjectId) return { error: notFound() };
       const currentInstances = deps.instancesForSubject?.(context.subjectId);
-      const ownedInstances =
-        context.instanceIds && currentInstances
+      const ownedInstances = context.sourceId
+        ? (deps.instancesForSource?.(context.subjectId, context.sourceId) ?? [])
+        : context.instanceIds && currentInstances
           ? context.instanceIds.filter((instance) =>
               currentInstances.includes(instance),
             )

@@ -21,6 +21,7 @@ export interface PdppInstanceBindingRouteDeps {
   auth: PdppAuthorizationService;
   ownerSubjectId: string;
   instancesForSubject(subjectId: string): string[];
+  instancesForSource?(subjectId: string, sourceId: string): string[];
   configuredMethods: Map<string, string[]>;
 }
 
@@ -67,13 +68,21 @@ export function pdppInstanceBindingRoutes(
         ),
       };
     }
-    return { subjectId: context.subjectId, instanceIds: context.instanceIds };
+    return {
+      subjectId: context.subjectId,
+      instanceIds: context.instanceIds,
+      sourceId: context.sourceId,
+    };
   }
 
   function scopedOwnedInstances(owner: {
     subjectId: string;
     instanceIds?: string[];
+    sourceId?: string;
   }): string[] {
+    if (owner.sourceId) {
+      return deps.instancesForSource?.(owner.subjectId, owner.sourceId) ?? [];
+    }
     const current = deps.instancesForSubject(owner.subjectId);
     if (!owner.instanceIds) return [];
     return owner.instanceIds.filter((instance) => current.includes(instance));
@@ -81,7 +90,7 @@ export function pdppInstanceBindingRoutes(
 
   function canAccessInstance(
     instance: string,
-    owner: { subjectId: string; instanceIds?: string[] },
+    owner: { subjectId: string; instanceIds?: string[]; sourceId?: string },
   ): boolean {
     return scopedOwnedInstances(owner).includes(instance);
   }
