@@ -145,26 +145,43 @@ export function createPdppRecordsDeps(
 
   const store = createSqliteRecordStore(options.db);
 
-  // Adopt account 1 on first boot/access without rewriting rows. The old
-  // handle remains the instance id, so existing grants, keys and records stay
-  // valid. A legacy instance with rows but no matching method is deliberately
-  // left out of inventory; Desktop must reconnect it.
+  // Register account 1 without changing its legacy id. Existing rows can only
+  // be attached when their stored method agrees with this boot's configuration.
   for (const source of sources) {
     const methods = configuredMethods.get(source.instance) ?? [];
     if (methods.length !== 1) continue;
+    const method = methods[0];
+    const binding = store.getInstanceBinding(source.instance);
+    if (
+      binding.deletedAt !== null ||
+      (binding.method !== null && binding.method !== method) ||
+      (!binding.empty && binding.method !== method) ||
+      (binding.sourceId !== null && binding.sourceId !== source.sourceId)
+    ) {
+      logger.warn(
+        { sourceId: source.sourceId },
+        "PDPP account-one binding does not match this boot and was left unchanged",
+      );
+      continue;
+    }
     try {
       store.registerConnection({
         instance: source.instance,
         sourceId: source.sourceId,
-        method: methods[0],
+        method,
         label: "",
       });
     } catch (error) {
       if (!(error instanceof PdppBindingError)) throw error;
-      if (error.reason !== "connection_method_unknown") throw error;
+      if (
+        error.reason !== "connection_deleted" &&
+        error.reason !== "connection_conflict"
+      ) {
+        throw error;
+      }
       logger.warn(
-        { sourceId: source.sourceId, instance: source.instance },
-        "PDPP legacy connection method is unknown — owner must reconnect",
+        { sourceId: source.sourceId },
+        "PDPP account-one binding changed during startup and was left unchanged",
       );
     }
   }
