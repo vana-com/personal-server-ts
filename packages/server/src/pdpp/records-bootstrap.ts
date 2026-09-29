@@ -49,7 +49,10 @@ import {
   type RetainedDeclaration,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type { PdppAuthRouteDeps } from "../routes/pdpp-auth.js";
-import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
+import {
+  createSqliteRecordStore,
+  PdppBindingError,
+} from "../storage/pdpp-records-sqlite-store.js";
 
 export interface PdppRecordsDeps {
   store: PdppRecordStore;
@@ -94,8 +97,12 @@ export function createPdppRecordsDeps(
   // which instances exist for each source.
   const sources: SourceStreamDeclarations[] = [];
   for (const snapshot of options.declarations) {
+    const connector =
+      snapshot.source_id.split("/").filter(Boolean).pop() ?? snapshot.source_id;
+    const instance = `${connector}:${subjectId}`;
     sources.push({
       sourceId: snapshot.source_id,
+      instance,
       streams: toStreamDeclarations(snapshot),
     });
   }
@@ -123,14 +130,16 @@ export function createPdppRecordsDeps(
   // Register account 1 without changing its legacy id. Existing rows can only
   // be attached when their stored method agrees with this boot's configuration.
   for (const source of sources) {
-    const methods = configuredMethods.get(source.instance) ?? [];
+    const instance = source.instance;
+    if (!instance) continue;
+    const methods = configuredMethods.get(source.sourceId) ?? [];
     if (methods.length !== 1) continue;
     const method = methods[0];
-    const binding = store.getInstanceBinding(source.instance);
+    if (!method) continue;
+    const binding = store.getInstanceBinding(instance);
     if (
       binding.deletedAt !== null ||
-      (binding.method !== null && binding.method !== method) ||
-      (!binding.empty && binding.method !== method) ||
+      binding.method !== method ||
       (binding.sourceId !== null && binding.sourceId !== source.sourceId)
     ) {
       logger.warn(
@@ -141,7 +150,7 @@ export function createPdppRecordsDeps(
     }
     try {
       store.registerConnection({
-        instance: source.instance,
+        instance,
         sourceId: source.sourceId,
         method,
         label: "",

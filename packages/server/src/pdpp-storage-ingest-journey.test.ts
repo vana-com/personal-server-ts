@@ -1544,10 +1544,10 @@ describe("P10c and method authority over HTTP", () => {
       empty: true,
       configured_active_method: "oura",
     });
-    // Boot registers account one from the persisted server configuration.
-    expect(bindingRows()).toBe(2);
+    // A read-only binding probe creates the legacy row but does not register it.
+    expect(bindingRows()).toBe(1);
     await seedEvents(token, instance, ["a1"]);
-    expect(bindingRows()).toBe(2);
+    expect(bindingRows()).toBe(1);
   });
 
   it("keeps a keyset cursor valid across later writes without a reset", async () => {

@@ -11,6 +11,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import Database from "better-sqlite3";
 import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import {
@@ -410,6 +411,72 @@ describe("scoped owner tokens in the AS consent path", () => {
     expect(await json(reRegistered)).toMatchObject({
       error: { code: "connection_deleted" },
     });
+  });
+
+  it("restores known legacy account-one bindings on boot without a Desktop PUT", async () => {
+    const token = await ownerToken(OURA);
+    await ingestOuraSleep(token);
+    const { accessToken } = await issueOuraGrant(token);
+
+    await ctx!.cleanup();
+    ctx = undefined;
+    const db = new Database(join(tempDir, "index.db"));
+    try {
+      // Restore the base PS v5 schema. Its known method and legacy id remain;
+      // v6 must add the connection metadata before boot can adopt the row.
+      db.exec(`
+        ALTER TABLE pdpp_instance_binding DROP COLUMN deleted_at;
+        ALTER TABLE pdpp_instance_binding DROP COLUMN label;
+        ALTER TABLE pdpp_instance_binding DROP COLUMN source_id;
+        UPDATE pdpp_schema_version SET version = 5 WHERE id = 1;
+      `);
+    } finally {
+      db.close();
+    }
+
+    ctx = await bootBoth();
+
+    const existingRead = await readSleep(accessToken);
+    expect(existingRead.status).toBe(200);
+    expect(existingRead.body.data).toEqual({ id: "sleep-1", score: 91 });
+    const existingList = await ctx.app.request("/v1/streams/sleep/records", {
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    expect(existingList.status).toBe(200);
+
+    const desktopMint = await ctx.app.request("/pdpp/v1/owner/token", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${ctx.devToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        source_id: OURA,
+        instance_id: instance(OURA),
+      }),
+    });
+    expect(desktopMint.status).toBe(200);
+    const { access_token: ownerAccess } = (await desktopMint.json()) as {
+      access_token: string;
+    };
+    const write = await ctx.app.request(
+      "/v1/streams/sleep/records/ingest?method=oura&binding_generation=1",
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${ownerAccess}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          instance: instance(OURA),
+          key: "sleep-2",
+          data: { id: "sleep-2", score: 50 },
+          emitted_at: "2026-09-02T00:00:00Z",
+        }),
+      },
+    );
+    expect(write.status).toBe(200);
+    expect((await authorizeOura(ownerAccess)).length).toBeGreaterThan(0);
   });
 
   it("allows a scoped owner token for the same instance to authorize, review, approve, redeem, and read", async () => {
