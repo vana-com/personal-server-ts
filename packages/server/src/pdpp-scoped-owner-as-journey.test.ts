@@ -705,4 +705,84 @@ describe("scoped owner tokens in the AS consent path", () => {
     expect(read.status).toBe(200);
     expect(read.body.data).toEqual({ id: "sleep-1", score: 44 });
   });
+
+  it("keeps the other connection's data and change feed after deleting one account", async () => {
+    const owner = await ownerToken(OURA);
+    const accountA = instance(OURA);
+    const accountB = "conn_123e4567-e89b-42d3-a456-426614174000";
+    const registration = await ctx!.app.request(
+      `/pdpp/connections/${encodeURIComponent(accountB)}`,
+      {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${owner}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          source_id: OURA,
+          method_id: "oura",
+          label: "Work",
+        }),
+      },
+    );
+    expect(registration.status).toBe(200);
+
+    await ingestOuraSleep(owner, accountA, 91);
+    await ingestOuraSleep(owner, accountB, 44);
+    const grantA = await issueOuraGrant(owner, {
+      sleep: [accountA],
+    });
+    const grantB = await issueOuraGrant(owner, {
+      sleep: [accountB],
+    });
+
+    const beforeDelete = await readSleep(grantB.accessToken);
+    expect(beforeDelete.status).toBe(200);
+    expect(beforeDelete.body.data).toEqual({ id: "sleep-1", score: 44 });
+
+    const baselineA = await ctx!.app.request(
+      "/v1/streams/sleep/records?changes_since=",
+      { headers: { authorization: `Bearer ${grantA.accessToken}` } },
+    );
+    const baselineB = await ctx!.app.request(
+      "/v1/streams/sleep/records?changes_since=",
+      { headers: { authorization: `Bearer ${grantB.accessToken}` } },
+    );
+    expect(baselineA.status).toBe(200);
+    expect(baselineB.status).toBe(200);
+    const baselineABody = (await json(baselineA)) as {
+      data: Array<{ data: unknown }>;
+      next_changes_since: string;
+    };
+    const baselineBBody = (await json(baselineB)) as {
+      data: Array<{ data: unknown }>;
+      next_changes_since: string;
+    };
+    expect(baselineABody.data).toEqual([
+      expect.objectContaining({ data: { id: "sleep-1", score: 91 } }),
+    ]);
+    expect(baselineBBody.data).toEqual([
+      expect.objectContaining({ data: { id: "sleep-1", score: 44 } }),
+    ]);
+    expect(baselineABody.next_changes_since).not.toBe(
+      baselineBBody.next_changes_since,
+    );
+
+    const deleted = await ctx!.app.request(
+      `/pdpp/connections/${encodeURIComponent(accountA)}`,
+      { method: "DELETE", headers: { authorization: `Bearer ${owner}` } },
+    );
+    expect(deleted.status).toBe(200);
+
+    const afterDelete = await readSleep(grantB.accessToken);
+    expect(afterDelete.status).toBe(200);
+    expect(afterDelete.body.data).toEqual({ id: "sleep-1", score: 44 });
+
+    const changes = await ctx!.app.request(
+      `/v1/streams/sleep/records?changes_since=${encodeURIComponent(baselineBBody.next_changes_since)}`,
+      { headers: { authorization: `Bearer ${grantB.accessToken}` } },
+    );
+    expect(changes.status).toBe(200);
+    expect(await json(changes)).toMatchObject({ data: [] });
+  });
 });
