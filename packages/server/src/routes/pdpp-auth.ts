@@ -499,13 +499,18 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     const sourceId = tokenRequest.source_id;
     if (
       typeof sourceId !== "string" ||
-      Object.keys(tokenRequest).some((key) => key !== "source_id")
+      Object.keys(tokenRequest).some(
+        (key) => key !== "source_id" && key !== "instance_id",
+      ) ||
+      (tokenRequest.instance_id !== undefined &&
+        (typeof tokenRequest.instance_id !== "string" ||
+          tokenRequest.instance_id.length === 0))
     ) {
       return errorResponse(
         c,
         400,
         "invalid_request",
-        "owner token exchange accepts source_id only",
+        "owner token exchange accepts source_id and an optional instance_id",
       );
     }
     const declaration = deps.resolveDeclaration(sourceId);

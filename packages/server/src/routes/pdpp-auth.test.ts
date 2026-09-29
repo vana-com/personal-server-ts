@@ -1071,7 +1071,10 @@ describe("owner-token exchange", () => {
   it("mints an owner token for a request that passed the owner proof", async () => {
     // The stubbed `currentSubjectId` stands in for the verified signer the
     // web3-auth + owner-check middleware chain populates in production.
-    const response = await post("/pdpp/v1/owner/token", ownerTokenBody());
+    const response = await post(
+      "/pdpp/v1/owner/token",
+      ownerTokenBody({ instance_id: OWNER_INSTANCE }),
+    );
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
     const issued = (await response.json()) as {
@@ -1101,7 +1104,7 @@ describe("owner-token exchange", () => {
     expect(response.status).toBe(401);
   });
 
-  it("allows a source-wide owner token and rejects malformed instance selectors", async () => {
+  it("accepts Desktop instance selectors but rejects malformed values", async () => {
     const missing = await post("/pdpp/v1/owner/token", {
       source_id: SOURCE_ID,
     });
@@ -1114,12 +1117,16 @@ describe("owner-token exchange", () => {
     expect(array.status).toBe(400);
   });
 
-  it("refuses instance-scoped owner-token requests", async () => {
-    const response = await post(
-      "/pdpp/v1/owner/token",
-      ownerTokenBody({ instance_id: "spotify-account-b" }),
-    );
-    expect(response.status).toBe(400);
+  it("keeps the accepted Desktop selector source-scoped", async () => {
+    const response = await post("/pdpp/v1/owner/token", {
+      source_id: SOURCE_ID,
+      instance_id: OWNER_INSTANCE,
+    });
+    expect(response.status).toBe(200);
+    const issued = (await response.json()) as { access_token: string };
+    const context = tokens.resolveToken(issued.access_token);
+    expect(context.sourceId).toBe(SOURCE_ID);
+    expect(context.instanceIds).toBeUndefined();
   });
 
   it("mints a token usable end-to-end for approval", async () => {

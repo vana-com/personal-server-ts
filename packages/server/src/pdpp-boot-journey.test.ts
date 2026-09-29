@@ -267,15 +267,17 @@ describe("PDPP boot journey: real createServer", () => {
       source_id: "https://registry.pdpp.dev/connectors/unretained",
       instance_id: "unretained:owner",
     });
-    expect(unknownSource.status).toBe(400);
-    expect((await unknownSource.json()).error).toBe("invalid_request");
+    expect(unknownSource.status).toBe(404);
+    expect((await unknownSource.json()).error).toBe("not_found");
 
     const otherInstance = await request({
       source_id: SOURCE_ID,
       instance_id: "spotify:another-owner",
     });
-    expect(otherInstance.status).toBe(400);
-    expect((await otherInstance.json()).error).toBe("invalid_request");
+    expect(otherInstance.status).toBe(200);
+    expect((await otherInstance.json()).access_token).toEqual(
+      expect.any(String),
+    );
   });
 
   it("mints a source-wide owner token without instance-scoped introspection", async () => {
