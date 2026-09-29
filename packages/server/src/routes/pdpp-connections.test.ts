@@ -27,7 +27,9 @@ describe("PDPP connection routes", () => {
       },
     } satisfies PdppAuthorizationService,
     ownerSubjectId: OWNER,
-    configuredMethods: new Map([[SOURCE, ["spotify"]]]),
+    connectionMethods: new Map([[SOURCE, ["spotify"]]]),
+    configuredMethods: new Map(),
+    canonicalSourceIds: new Set([SOURCE]),
     sourceIds: new Set([SOURCE]),
   });
 

@@ -67,8 +67,11 @@ import { createApp, type IdentityInfo } from "./app.js";
 import { createPdppAuthDeps } from "./pdpp/bootstrap.js";
 import {
   createPdppRecordsDeps,
+  coLocatedAuthorizationService,
   createPdppSyncImporter,
+  registerLegacyDataConnections,
 } from "./pdpp/records-bootstrap.js";
+import { createSqliteRecordStore } from "./storage/pdpp-records-sqlite-store.js";
 import { generateDevToken } from "./dev-token.js";
 import { migrateLocalState } from "./migrations/local-state.js";
 import { createTokenStore, type TokenStore } from "./token-store.js";
@@ -795,6 +798,18 @@ export async function createServer(
     tokenStore,
   });
 
+  if (pdppAuth) {
+    registerLegacyDataConnections({
+      db,
+      serverOwner,
+      connectionMethods: pdppAuth.connectionMethods,
+      legacyScopes: indexManager
+        .listDistinctScopes()
+        .scopes.map(({ scope }) => scope),
+      logger,
+    });
+  }
+
   // PDPP Resource Server. Mounts only alongside a mounted AS, so a real boot
   // yields both halves over ONE token authority — the AS's own
   // PdppTokenService, resolved in-process (Core §8 co-located). Without this
@@ -810,6 +825,26 @@ export async function createServer(
     logger,
     configuredMethods: pdppAuth?.configuredMethods,
   });
+
+  const pdppConnections = pdppAuth
+    ? {
+        store: createSqliteRecordStore(db),
+        auth: pdppRecords?.auth ?? coLocatedAuthorizationService(pdppAuth),
+        ownerSubjectId: serverOwner!,
+        connectionMethods: new Map(pdppAuth.connectionMethods),
+        configuredMethods:
+          pdppRecords?.configuredMethods ?? new Map<string, string[]>(),
+        canonicalSourceIds: new Set(
+          pdppAuth.configuredMethods.map((method) => method.sourceId),
+        ),
+        sourceIds: new Set([
+          ...pdppAuth.connectionMethods.keys(),
+          ...pdppAuth.retainedDeclarations.map(
+            (declaration) => declaration.source_id,
+          ),
+        ]),
+      }
+    : undefined;
 
   // Close the sync→PDPP loop. Until this runs the download worker holds an
   // inert delegate; from here a synced envelope carrying verified `$pdpp`
@@ -841,6 +876,7 @@ export async function createServer(
         }
       : undefined,
     pdpp: pdppRecords,
+    pdppConnections,
     // The SAME stable delegate the download worker was given above, not a
     // second importer: both arrival routes must resolve to one importer over
     // one store, and this one is already late-bound to `pdppImporterImpl`.

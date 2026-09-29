@@ -79,7 +79,10 @@ import type { JobRequestEnvelope } from "@opendatalabs/vana-sdk/protocol/jobs";
 import type { JobExecuteResponse } from "./jobs/types.js";
 import { pdppRecordsRoutes } from "./routes/pdpp-records.js";
 import { pdppInstanceBindingRoutes } from "./routes/pdpp-instance-bindings.js";
-import { pdppConnectionRoutes } from "./routes/pdpp-connections.js";
+import {
+  pdppConnectionRoutes,
+  type PdppConnectionRouteDeps,
+} from "./routes/pdpp-connections.js";
 import { pdppBlobsRoutes } from "./routes/pdpp-blobs.js";
 import { pdppWellKnownRoutes } from "./routes/pdpp-well-known.js";
 import type { createSqliteRecordStore } from "./storage/pdpp-records-sqlite-store.js";
@@ -184,6 +187,8 @@ export interface AppDeps {
    * one enforcement path).
    */
   pdppAuth?: PdppAuthRouteDeps;
+  /** Connection registry routes can run with canonical record routes off. */
+  pdppConnections?: PdppConnectionRouteDeps;
   /**
    * Operator-authenticated declaration submission. Absent (or with no
    * operator token) leaves the route unmounted and the declaration set
@@ -224,7 +229,6 @@ export interface AppDeps {
     declarations: StreamDeclarationRegistry;
     instancesForSubject?: (subjectId: string) => string[];
     instancesForSource?: (subjectId: string, sourceId: string) => string[];
-    sourceIds: Set<string>;
     readBlobBytes?: (
       blobId: string,
     ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
@@ -284,17 +288,11 @@ export function createApp(deps: AppDeps): Hono {
   // PDPP §4 record model + §8 Resource Server query surface. Independent of
   // the legacy DPP fileId/scope routes above; mounted only when a pdpp deps
   // bundle is supplied.
+  if (deps.pdppConnections) {
+    app.route("/", pdppConnectionRoutes(deps.pdppConnections));
+  }
+
   if (deps.pdpp) {
-    app.route(
-      "/",
-      pdppConnectionRoutes({
-        store: deps.pdpp.bindingStore,
-        auth: deps.pdpp.auth,
-        ownerSubjectId: deps.serverOwner!,
-        configuredMethods: deps.pdpp.configuredMethods,
-        sourceIds: deps.pdpp.sourceIds,
-      }),
-    );
     app.route(
       "/",
       pdppInstanceBindingRoutes({
@@ -423,6 +421,7 @@ export function createApp(deps: AppDeps): Hono {
             configuredMethods: deps.pdpp.configuredMethods,
             ownerSubjectId: deps.serverOwner,
             instancesForSubject: deps.pdpp.instancesForSubject,
+            instancesForSource: deps.pdpp.instancesForSource,
           }
         : undefined,
       // A new local version of a scope marks every question that reads it

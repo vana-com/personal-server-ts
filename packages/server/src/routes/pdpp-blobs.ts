@@ -132,19 +132,22 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
 
     if (context.tokenKind === "owner") {
       // Owner tokens carry no grant: current-capability read, scoped to the
-      // owner's own subject's instances only — a blob referenced by a
-      // record on an instance the owner doesn't own must not be served.
+      // owner's selected live instances when the token has an instance list.
+      // A source scope must not widen that explicit selection.
       // Fail closed: a missing resolver, a missing subjectId, or an empty
       // owned list must all deny rather than fall back to "visible to
       // everyone" — mirrors the record routes' `?? []` default.
       if (!context.subjectId) return { error: notFound() };
       const currentInstances = deps.instancesForSubject?.(context.subjectId);
-      const ownedInstances = context.sourceId
+      const sourceInstances = context.sourceId
         ? (deps.instancesForSource?.(context.subjectId, context.sourceId) ?? [])
-        : context.instanceIds && currentInstances
-          ? context.instanceIds.filter((instance) =>
-              currentInstances.includes(instance),
-            )
+        : (currentInstances ?? []);
+      const ownedInstances = context.instanceIds
+        ? context.instanceIds.filter((instance) =>
+            sourceInstances.includes(instance),
+          )
+        : context.sourceId
+          ? sourceInstances
           : [];
       const visible = references.some((reference) =>
         ownedInstances.includes(reference.instance),

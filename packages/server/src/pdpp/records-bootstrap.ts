@@ -62,7 +62,6 @@ export interface PdppRecordsDeps {
   declarations: StreamDeclarationRegistry;
   instancesForSubject?: (subjectId: string) => string[];
   instancesForSource?: (subjectId: string, sourceId: string) => string[];
-  sourceIds: Set<string>;
   readBlobBytes?: (
     blobId: string,
   ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
@@ -81,6 +80,67 @@ export interface CreatePdppRecordsDepsOptions {
   resource: string;
   logger: Logger;
   configuredMethods?: { sourceId: string; methodId: string }[];
+}
+
+/** Restore account-one registry rows for legacy scopes before Desktop reads the registry. */
+export function registerLegacyDataConnections(options: {
+  db: Database;
+  serverOwner: string | undefined;
+  connectionMethods: Map<string, string[]>;
+  legacyScopes: string[];
+  logger: Logger;
+}): void {
+  if (!options.serverOwner) return;
+
+  const store = createSqliteRecordStore(options.db);
+  const scopesWithData = new Set(
+    options.legacyScopes.map((scope) => scope.split(".", 1)[0]?.toLowerCase()),
+  );
+  const subjectId = options.serverOwner.toLowerCase();
+
+  for (const [sourceId, methods] of options.connectionMethods) {
+    const connector = sourceId.split("/").filter(Boolean).at(-1) ?? sourceId;
+    if (!scopesWithData.has(connector.toLowerCase()) || methods.length !== 1) {
+      continue;
+    }
+    const [method] = methods;
+    if (!method || store.listConnections(sourceId).length > 0) continue;
+
+    const instance = `${connector}:${subjectId}`;
+    const binding = store.getInstanceBinding(instance);
+    if (
+      binding.deletedAt !== null ||
+      (binding.method !== method &&
+        !(
+          binding.method === null &&
+          binding.empty &&
+          binding.sourceId === null
+        )) ||
+      (binding.sourceId !== null && binding.sourceId !== sourceId)
+    ) {
+      options.logger.warn(
+        { sourceId },
+        "PDPP legacy-data binding does not match this boot and was left unchanged",
+      );
+      continue;
+    }
+
+    try {
+      store.registerConnection({ instance, sourceId, method, label: "" });
+    } catch (error) {
+      if (!(error instanceof PdppBindingError)) throw error;
+      if (
+        error.reason !== "connection_deleted" &&
+        error.reason !== "connection_conflict"
+      ) {
+        throw error;
+      }
+      options.logger.warn(
+        { sourceId },
+        "PDPP legacy-data binding changed during startup and was left unchanged",
+      );
+    }
+  }
 }
 
 export function createPdppRecordsDeps(
@@ -124,7 +184,6 @@ export function createPdppRecordsDeps(
     methodIds.push(configured.methodId);
     configuredMethods.set(source.sourceId, methodIds);
   }
-
   const store = createSqliteRecordStore(options.db);
 
   // Register account 1 only for an empty source registry. Never add a legacy
@@ -251,7 +310,6 @@ export function createPdppRecordsDeps(
             .listConnections(sourceId)
             .map((connection) => connection.instance)
         : [],
-    sourceIds: new Set(sources.map((source) => source.sourceId)),
     // Real boot wiring for GET /v1/blobs/:blobId: reads the same store the
     // blob was ingested into, so this deployment can only ever serve bytes
     // it verifiably stored -- store.getBlobBytes re-verifies size/sha256
@@ -273,7 +331,7 @@ export function createPdppRecordsDeps(
  * casting: an inactive result must never yield an undefined subject that
  * flows onward into an authorization decision.
  */
-function coLocatedAuthorizationService(
+export function coLocatedAuthorizationService(
   pdppAuth: PdppAuthRouteDeps,
 ): PdppAuthorizationService {
   return {

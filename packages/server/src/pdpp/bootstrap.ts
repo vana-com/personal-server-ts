@@ -8,10 +8,9 @@
  * decisions authenticate against the same wallet signature every other owner
  * route uses.
  *
- * Returns undefined when PDPP is disabled or has nothing to serve, which
- * leaves `/pdpp/v1` unmounted. An authorization server with no retained
- * declarations can issue nothing useful, so mounting it would add surface
- * without adding capability.
+ * Returns undefined when PDPP is disabled and no connection registry is
+ * configured. It also returns undefined when no declarations or connection
+ * methods remain, so `/pdpp/v1` is mounted only when it can issue tokens.
  */
 
 import { createHash } from "node:crypto";
@@ -32,6 +31,7 @@ import {
 import type { PdppAuthRouteDeps } from "../routes/pdpp-auth.js";
 import type { TokenStore } from "../token-store.js";
 import { boundedClientDocumentFetcher } from "./client-document-fetch.js";
+import { resolveRetainedSourceId } from "./source-id-compat.js";
 import {
   deriveSupportedConnectors,
   type ConfiguredDeclaration,
@@ -76,6 +76,8 @@ export type PdppAuthBootResult = PdppAuthRouteDeps & {
   retainedDocuments: Map<string, string>;
   /** Configured artifact methods resolved through their retained declaration paths. */
   configuredMethods: { sourceId: string; methodId: string }[];
+  /** Connection methods remain available when canonical record declarations are off. */
+  connectionMethods: Map<string, string[]>;
   /**
    * The live registry behind `resolveDeclaration`. Handed out so the
    * submission route can write to the same object the AS reads from — a
@@ -91,7 +93,9 @@ export async function createPdppAuthDeps(
   options: CreatePdppAuthDepsOptions,
 ): Promise<PdppAuthBootResult | undefined> {
   const { config, logger } = options;
-  if (!config.pdpp.enabled) return undefined;
+  const hasConnectionRegistry =
+    (config.pdpp.connectionMethods?.length ?? 0) > 0;
+  if (!config.pdpp.enabled && !hasConnectionRegistry) return undefined;
 
   // The AS binds grants to a subject and authenticates decisions against the
   // server owner. Without a known owner there is no subject to bind to and no
@@ -113,7 +117,7 @@ export async function createPdppAuthDeps(
   );
 
   const declarations = await readDeclarations(
-    config.pdpp.declarationPaths,
+    config.pdpp.enabled ? config.pdpp.declarationPaths : [],
     logger,
   );
   const declarationSourceByPath = new Map(
@@ -121,7 +125,9 @@ export async function createPdppAuthDeps(
       .filter((declaration) => declaration.path)
       .map((declaration) => [resolve(declaration.path!), declaration.sourceId]),
   );
-  const configuredMethods = config.pdpp.methods.flatMap((method) => {
+  const configuredMethods = (
+    config.pdpp.enabled ? config.pdpp.methods : []
+  ).flatMap((method) => {
     const sourceId = declarationSourceByPath.get(
       resolve(method.declaration_path),
     );
@@ -137,6 +143,13 @@ export async function createPdppAuthDeps(
     }
     return [{ sourceId, methodId: method.method_id }];
   });
+  const connectionMethods = new Map<string, string[]>();
+  for (const method of config.pdpp.connectionMethods ?? []) {
+    const methods = connectionMethods.get(method.source_id) ?? [];
+    methods.push(method.method_id);
+    connectionMethods.set(method.source_id, methods);
+  }
+  const connectionSourceIds = new Set(connectionMethods.keys());
 
   // The durable registry the submission route writes to, seeded from the
   // configured paths. Seeds and submissions share one validator; only
@@ -154,7 +167,7 @@ export async function createPdppAuthDeps(
 
   const registry = {
     resolve: declarationRegistry.resolve,
-    retained: declarationRegistry.list(),
+    retained: config.pdpp.enabled ? declarationRegistry.list() : [],
     retainedDocuments: new Map(
       declarationRegistry
         .list()
@@ -165,7 +178,22 @@ export async function createPdppAuthDeps(
     ),
   };
 
-  if (registry.retained.length === 0) {
+  const retainedSourceIds = new Set(
+    registry.retained.map((declaration) => declaration.source_id),
+  );
+  const activeConfiguredMethods = configuredMethods.filter((method) =>
+    retainedSourceIds.has(method.sourceId),
+  );
+  for (const method of activeConfiguredMethods) {
+    const methods = connectionMethods.get(method.sourceId) ?? [];
+    if (!methods.includes(method.methodId)) methods.push(method.methodId);
+    connectionMethods.set(method.sourceId, methods);
+  }
+  for (const sourceId of connectionMethods.keys()) {
+    connectionSourceIds.add(sourceId);
+  }
+
+  if (registry.retained.length === 0 && connectionSourceIds.size === 0) {
     logger.warn(
       { supportedConnectors, configured: config.pdpp.declarationPaths.length },
       "PDPP enabled but no declarations were retained — authorization server not mounted",
@@ -211,8 +239,11 @@ export async function createPdppAuthDeps(
     sessions,
     retainedDeclarations: registry.retained,
     retainedDocuments: registry.retainedDocuments,
-    configuredMethods,
-    resolveDeclaration: registry.resolve,
+    configuredMethods: activeConfiguredMethods,
+    connectionMethods,
+    resolveConnectionSourceId: (requested) =>
+      resolveRetainedSourceId(requested, connectionSourceIds),
+    resolveDeclaration: config.pdpp.enabled ? registry.resolve : () => null,
     declarationRegistry,
     supportedConnectors,
     // The AS's own issuer identity, for its metadata document. Carried as the

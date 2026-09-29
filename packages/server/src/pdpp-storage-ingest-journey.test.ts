@@ -146,6 +146,23 @@ async function ownerToken(
   return registerTestConnection(context.app, context.devToken, subject, source);
 }
 
+async function ownerTokenForInstance(
+  context: ServerContext,
+  sourceId: string,
+  instanceId: string,
+): Promise<string> {
+  const response = await context.app.request("/pdpp/v1/owner/token", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${context.devToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ source_id: sourceId, instance_id: instanceId }),
+  });
+  expect(response.status).toBe(200);
+  return ((await response.json()) as { access_token: string }).access_token;
+}
+
 interface IngestBody {
   accepted: number;
   unchanged: number;
@@ -395,6 +412,137 @@ describe("P1: configured declaration admission", () => {
 });
 
 describe("P2: streams are keyed by source and stream name", () => {
+  it("keeps canonical reads scoped to the selected connection", async () => {
+    const ouraPath = await writeDeclaration("oura", OURA_DECLARATION);
+    ctx = await boot([ouraPath]);
+    const sourceOwnerToken = await ownerToken(ctx, OURA);
+    const accountA = `oura:${owner}`;
+    const accountB = "conn_123e4567-e89b-42d3-a456-426614174000";
+
+    const registration = await ctx.app.request(
+      `/pdpp/connections/${encodeURIComponent(accountB)}`,
+      {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${sourceOwnerToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          source_id: OURA,
+          method_id: "oura",
+          label: "Account B",
+        }),
+      },
+    );
+    expect(registration.status).toBe(200);
+
+    for (const [instance, key] of [
+      [accountA, "repo-a"],
+      [accountB, "repo-b"],
+    ]) {
+      const written = await ingest(
+        ctx,
+        sourceOwnerToken,
+        "profile",
+        {
+          instance,
+          key,
+          data: { user_id: key },
+          emitted_at: "2026-09-01T00:00:00Z",
+        },
+        "oura",
+      );
+      expect(written.status).toBe(200);
+      expect(outcomes(written.body)).toEqual(["accepted"]);
+    }
+
+    const selectedB = await ownerTokenForInstance(ctx, OURA, accountB);
+    const selectedA = await ownerTokenForInstance(ctx, OURA, accountA);
+    const accountBRead = await read(
+      ctx,
+      selectedB,
+      "/v1/streams/profile/records",
+    );
+    const accountARead = await read(
+      ctx,
+      selectedA,
+      "/v1/streams/profile/records",
+    );
+    expect(accountBRead.body.data.map((record: any) => record.id)).toEqual([
+      "repo-b",
+    ]);
+    expect(accountARead.body.data.map((record: any) => record.id)).toEqual([
+      "repo-a",
+    ]);
+  });
+
+  it("does not let a selected connection read another connection's blob", async () => {
+    const ouraPath = await writeDeclaration("oura", OURA_DECLARATION);
+    ctx = await boot([ouraPath]);
+    const sourceOwnerToken = await ownerToken(ctx, OURA);
+    const accountA = `oura:${owner}`;
+    const accountB = "conn_123e4567-e89b-42d3-a456-426614174000";
+
+    const registration = await ctx.app.request(
+      `/pdpp/connections/${encodeURIComponent(accountB)}`,
+      {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${sourceOwnerToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          source_id: OURA,
+          method_id: "oura",
+          label: "Account B",
+        }),
+      },
+    );
+    expect(registration.status).toBe(200);
+
+    const uploaded = await uploadBlob(
+      ctx,
+      sourceOwnerToken,
+      accountA,
+      "oura",
+      1,
+      new TextEncoder().encode("account A only blob"),
+    );
+    expect(uploaded.status).toBe(200);
+    const { blob_id: blobId } = (await uploaded.json()) as { blob_id: string };
+    const referenced = await ingest(ctx, sourceOwnerToken, "events", {
+      instance: accountA,
+      key: "event-a-with-blob",
+      data: {
+        id: "event-a-with-blob",
+        kind: "image",
+        blob_ref: { blob_id: blobId },
+      },
+      emitted_at: "2026-09-01T00:00:00Z",
+    });
+    expect(referenced.status).toBe(200);
+    expect(outcomes(referenced.body)).toEqual(["accepted"]);
+
+    const selectedB = await ownerTokenForInstance(ctx, OURA, accountB);
+    const bRecords = await read(ctx, selectedB, "/v1/streams/profile/records");
+    expect(bRecords.body.data).toEqual([]);
+    const bBlob = await ctx.app.request(
+      `/v1/blobs/${encodeURIComponent(blobId)}`,
+      { headers: { authorization: `Bearer ${selectedB}` } },
+    );
+    expect(bBlob.status).toBe(404);
+
+    const selectedA = await ownerTokenForInstance(ctx, OURA, accountA);
+    const aBlob = await ctx.app.request(
+      `/v1/blobs/${encodeURIComponent(blobId)}`,
+      { headers: { authorization: `Bearer ${selectedA}` } },
+    );
+    expect(aBlob.status).toBe(200);
+    expect(new TextDecoder().decode(await aBlob.arrayBuffer())).toBe(
+      "account A only blob",
+    );
+  });
+
   it("validates each source's profile against its own primary key", async () => {
     ctx = await bootBoth();
     const claudeToken = await ownerToken(ctx, CLAUDE);

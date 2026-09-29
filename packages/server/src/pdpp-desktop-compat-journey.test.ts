@@ -50,7 +50,10 @@ function seedScope() {
   db.close();
 }
 
-async function boot() {
+async function boot(
+  connectionMethods: { source_id: string; method_id: string }[] = [],
+  canonicalEnabled = true,
+) {
   const declarationPath = join(tempDir, "declarations", "claude.json");
   await mkdir(join(tempDir, "declarations"), { recursive: true });
   await writeFile(declarationPath, DECLARATION, "utf-8");
@@ -58,9 +61,12 @@ async function boot() {
     ServerConfigSchema.parse({
       tunnel: { enabled: false },
       pdpp: {
-        enabled: true,
-        declarationPaths: [declarationPath],
-        methods: [{ method_id: "claude", declaration_path: declarationPath }],
+        enabled: canonicalEnabled,
+        declarationPaths: canonicalEnabled ? [declarationPath] : [],
+        methods: canonicalEnabled
+          ? [{ method_id: "claude", declaration_path: declarationPath }]
+          : [],
+        connectionMethods,
       },
     }),
     { serverDir: tempDir, dataDir: join(tempDir, "data") },
@@ -81,14 +87,17 @@ function seedRegisteredConnection() {
   }
 }
 
-async function mintOwnerToken(sourceId: string): Promise<Response> {
+async function mintOwnerToken(
+  sourceId: string,
+  instanceId: string | undefined = legacyId,
+): Promise<Response> {
   return ctx!.app.request("/pdpp/v1/owner/token", {
     method: "POST",
     headers: {
       authorization: `Bearer ${ctx!.devToken}`,
       "content-type": "application/json",
     },
-    body: JSON.stringify({ source_id: sourceId, instance_id: legacyId }),
+    body: JSON.stringify({ source_id: sourceId, instance_id: instanceId }),
   });
 }
 
@@ -188,6 +197,141 @@ describe("Desktop multi-account compatibility on a real Personal Server", () => 
     expect(response.status).toBe(404);
   });
 
+  it("serves connection management for an undeclared canonical-off source", async () => {
+    const ouraSource = "https://registry.pdpp.dev/sources/oura";
+    ctx = await boot([{ source_id: ouraSource, method_id: "oura" }], false);
+    expect(ctx.config.pdpp.connectionMethods).toEqual([
+      { source_id: ouraSource, method_id: "oura" },
+    ]);
+    expect((await ctx.app.request("/pdpp/capabilities")).status).toBe(200);
+
+    const tokenResponse = await mintOwnerToken(
+      "https://registry.pdpp.dev/connectors/oura",
+    );
+    expect(tokenResponse.status, await tokenResponse.clone().text()).toBe(200);
+    const { access_token: token } = (await tokenResponse.json()) as {
+      access_token: string;
+    };
+
+    const empty = await ctx.app.request("/pdpp/connections?source_id=oura", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(empty.status).toBe(200);
+    expect((await empty.json()).connections).toEqual([]);
+
+    const connectionId = "conn_123e4567-e89b-42d3-a456-426614174000";
+    const registered = await ctx.app.request(
+      `/pdpp/connections/${connectionId}`,
+      {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          source_id: "https://registry.pdpp.dev/connectors/oura",
+          method_id: "oura",
+          label: "Account B",
+        }),
+      },
+    );
+    expect(registered.status).toBe(200);
+    expect((await registered.json()).source_id).toBe(ouraSource);
+
+    const listed = await ctx.app.request("/pdpp/connections?source_id=oura", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect((await listed.json()).connections).toMatchObject([
+      {
+        connection_id: connectionId,
+        source_id: "oura",
+        method_id: "oura",
+        label: "Account B",
+      },
+    ]);
+
+    const accountTokenResponse = await mintOwnerToken(ouraSource, connectionId);
+    expect(accountTokenResponse.status).toBe(200);
+    const { access_token: accountToken } =
+      (await accountTokenResponse.json()) as { access_token: string };
+    const canonicalWrite = await ctx.app.request(
+      "/v1/streams/profile/records/ingest?method=oura&binding_generation=1",
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${accountToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          instance: connectionId,
+          key: "record-1",
+          data: { id: "record-1" },
+          emitted_at: "2026-09-01T00:00:00Z",
+        }),
+      },
+    );
+    expect(canonicalWrite.status).not.toBe(200);
+
+    const deleted = await ctx.app.request(`/pdpp/connections/${connectionId}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(deleted.status).toBe(200);
+    const afterDelete = await ctx.app.request(
+      "/pdpp/connections?source_id=oura",
+      { headers: { authorization: `Bearer ${token}` } },
+    );
+    expect((await afterDelete.json()).connections).toEqual([]);
+
+    const canonicalRead = await ctx.app.request("/v1/streams/profile/records", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(canonicalRead.status).not.toBe(200);
+  });
+
+  it("does not reactivate retained canonical writers when a source is registry-only", async () => {
+    ctx = await boot();
+    await ctx.cleanup();
+    ctx = await createServer(
+      ServerConfigSchema.parse({
+        tunnel: { enabled: false },
+        pdpp: {
+          enabled: true,
+          declarationPaths: [],
+          methods: [],
+          connectionMethods: [{ source_id: SOURCE_ID, method_id: "claude" }],
+        },
+      }),
+      { serverDir: tempDir, dataDir: join(tempDir, "data") },
+    );
+
+    const tokenResponse = await mintOwnerToken(SOURCE_ID);
+    expect(tokenResponse.status).toBe(200);
+    const { access_token: token } = (await tokenResponse.json()) as {
+      access_token: string;
+    };
+    const write = await ctx.app.request(
+      "/v1/streams/profile/records/ingest?method=claude&binding_generation=1",
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          instance: legacyId,
+          key: "record-1",
+          data: { id: "record-1" },
+          emitted_at: "2026-09-01T00:00:00Z",
+        }),
+      },
+    );
+    expect(write.status).toBe(409);
+    expect(await write.json()).toMatchObject({
+      error: { code: "method_inactive" },
+    });
+  });
+
   it("does not add account one when a connection is already registered", async () => {
     seedRegisteredConnection();
     ctx = await boot();
@@ -226,5 +370,112 @@ describe("Desktop multi-account compatibility on a real Personal Server", () => 
       { headers: { authorization: `Bearer ${token}` } },
     );
     expect(phantomBinding.status).toBe(401);
+  });
+
+  it("registers every legacy-data source after upgrading an empty connection registry", async () => {
+    const sources = [
+      {
+        source_id: "https://registry.pdpp.dev/connectors/github",
+        method_id: "github",
+      },
+      {
+        source_id: "https://registry.pdpp.dev/connectors/oura",
+        method_id: "oura",
+      },
+    ];
+    const legacyScopes = ["github.profile", "oura.sleep"];
+    const db = new Database(join(tempDir, "index.db"));
+    try {
+      db.exec("DELETE FROM data_files");
+    } finally {
+      db.close();
+    }
+    ctx = await boot(sources, false);
+
+    for (const source of sources) {
+      const tokenResponse = await mintOwnerToken(source.source_id);
+      expect(tokenResponse.status).toBe(200);
+      const { access_token: token } = (await tokenResponse.json()) as {
+        access_token: string;
+      };
+      const listed = await ctx.app.request(
+        `/pdpp/connections?source_id=${encodeURIComponent(source.source_id)}`,
+        { headers: { authorization: `Bearer ${token}` } },
+      );
+      expect((await listed.json()).connections).toEqual([]);
+    }
+
+    for (const scope of legacyScopes) {
+      const written = await ctx.app.request(`/v1/data/${scope}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${ctx.devToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ id: `${scope}-legacy-row` }),
+      });
+      expect(written.status, await written.clone().text()).toBe(201);
+    }
+
+    await ctx.cleanup();
+    ctx = await boot(sources, false);
+    for (const source of sources) {
+      const tokenResponse = await mintOwnerToken(source.source_id);
+      expect(tokenResponse.status).toBe(200);
+      const { access_token: token } = (await tokenResponse.json()) as {
+        access_token: string;
+      };
+      const listed = await ctx.app.request(
+        `/pdpp/connections?source_id=${encodeURIComponent(source.source_id)}`,
+        { headers: { authorization: `Bearer ${token}` } },
+      );
+      expect(listed.status).toBe(200);
+      const body = (await listed.json()) as {
+        connections: Array<{
+          connection_id: string;
+          label: string;
+          method_id: string;
+          source_id: string;
+        }>;
+      };
+      expect(body.connections).toEqual([
+        {
+          connection_id: `${source.source_id.split("/").at(-1)}:${owner}`,
+          label: "",
+          method_id: source.method_id,
+          source_id: source.source_id,
+        },
+      ]);
+    }
+
+    await ctx.cleanup();
+    ctx = await boot(sources, false);
+    for (const source of sources) {
+      const tokenResponse = await mintOwnerToken(source.source_id);
+      const { access_token: token } = (await tokenResponse.json()) as {
+        access_token: string;
+      };
+      const listed = await ctx.app.request(
+        `/pdpp/connections?source_id=${encodeURIComponent(source.source_id)}`,
+        { headers: { authorization: `Bearer ${token}` } },
+      );
+      expect(listed.status).toBe(200);
+      const body = (await listed.json()) as {
+        connections: Array<{
+          connection_id: string;
+          label: string;
+          method_id: string;
+          source_id: string;
+        }>;
+      };
+      expect(body.connections).toEqual([
+        {
+          connection_id: `${source.source_id.split("/").at(-1)}:${owner}`,
+          label: "",
+          method_id: source.method_id,
+          source_id: source.source_id,
+        },
+      ]);
+    }
   });
 });

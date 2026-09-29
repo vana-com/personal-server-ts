@@ -96,6 +96,8 @@ export interface PdppAuthRouteDeps {
    * only against this snapshot — never a live re-fetch at approval time.
    */
   resolveDeclaration(sourceId: string): DeclarationSnapshot | null;
+  /** Resolve an owner-token source from the independent connection registry. */
+  resolveConnectionSourceId?(sourceId: string): string | undefined;
   /** The owner's connected instances, read fresh at review and approval. */
   inventoryFor(subjectId: string, sourceId: string): InstanceInventory;
   connectionState?(instanceId: string): {
@@ -518,12 +520,26 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     const declaration =
       deps.resolveDeclaration(sourceId) ??
       (canonicalCandidate ? deps.resolveDeclaration(canonicalCandidate) : null);
-    if (!declaration) {
-      return errorResponse(c, 404, "not_found", "source declaration not found");
+    const connectionSourceId =
+      deps.resolveConnectionSourceId?.(sourceId) ??
+      (canonicalCandidate
+        ? deps.resolveConnectionSourceId?.(canonicalCandidate)
+        : undefined);
+    const resolvedSourceId = declaration?.source_id ?? connectionSourceId;
+    if (!resolvedSourceId) {
+      return errorResponse(
+        c,
+        404,
+        "not_found",
+        "source is not enabled on this server",
+      );
     }
     const issued = deps.tokens.issueOwnerToken({
       subjectId,
-      sourceId: declaration.source_id,
+      sourceId: resolvedSourceId,
+      ...(typeof tokenRequest.instance_id === "string" && {
+        instanceIds: [tokenRequest.instance_id],
+      }),
       ttlSeconds: OWNER_TOKEN_TTL_SECONDS,
     });
     deps.logger.info(

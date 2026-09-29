@@ -1092,7 +1092,7 @@ describe("owner-token exchange", () => {
     expect(context.tokenKind).toBe("owner");
     expect(context.subjectId).toBe(OWNER);
     expect(context.sourceId).toBe(SOURCE_ID);
-    expect(context.instanceIds).toBeUndefined();
+    expect(context.instanceIds).toEqual([OWNER_INSTANCE]);
     expect(context.grant).toBeUndefined();
   });
 
@@ -1126,7 +1126,7 @@ describe("owner-token exchange", () => {
     const issued = (await response.json()) as { access_token: string };
     const context = tokens.resolveToken(issued.access_token);
     expect(context.sourceId).toBe(SOURCE_ID);
-    expect(context.instanceIds).toBeUndefined();
+    expect(context.instanceIds).toEqual([OWNER_INSTANCE]);
   });
 
   it("mints a token usable end-to-end for approval", async () => {

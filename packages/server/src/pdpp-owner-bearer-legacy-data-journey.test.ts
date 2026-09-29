@@ -137,6 +137,20 @@ function issueStaleInstanceOwnerToken(): string {
   }
 }
 
+function issueStaleSourceOwnerToken(): string {
+  const foreignInstance = `oura:${owner}:stale`;
+  const store = openPdppAuthStore(join(tempDir, "pdpp-auth.db"));
+  try {
+    return new PdppTokenService(store).issueOwnerToken({
+      subjectId: owner,
+      sourceId: OURA,
+      instanceIds: [foreignInstance],
+    }).access_token;
+  } finally {
+    store.close();
+  }
+}
+
 async function issueClientToken(): Promise<string> {
   const token = await ownerToken(OURA);
   const authorized = await ctx!.app.request("/pdpp/v1/authorize", {
@@ -295,6 +309,25 @@ describe("PDPP owner bearer bridge for POST /v1/data/:scope", () => {
 
     expect(response.status).toBe(403);
     expect(await responseCode(response)).toBe("PDPP_OWNER_BEARER_FOREIGN");
+  });
+
+  it("rejects source-scoped owner tokens for unavailable instances on both legacy routes", async () => {
+    const token = issueStaleSourceOwnerToken();
+    const headers = { authorization: `Bearer ${token}` };
+
+    const written = await ctx!.app.request("/v1/data/oura.sleep", {
+      method: "POST",
+      headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify({ id: "row-stale", score: 12 }),
+    });
+    const versions = await ctx!.app.request("/v1/data/oura.sleep/versions", {
+      headers,
+    });
+
+    expect(written.status).toBe(403);
+    expect(versions.status).toBe(403);
+    expect(await responseCode(written)).toBe("PDPP_OWNER_BEARER_FOREIGN");
+    expect(await responseCode(versions)).toBe("PDPP_OWNER_BEARER_FOREIGN");
   });
 
   it("does not let an owner token for one source post a different source namespace", async () => {

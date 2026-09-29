@@ -81,7 +81,10 @@ export function pdppInstanceBindingRoutes(
     sourceId?: string;
   }): string[] {
     if (owner.sourceId) {
-      return deps.instancesForSource?.(owner.subjectId, owner.sourceId) ?? [];
+      const current =
+        deps.instancesForSource?.(owner.subjectId, owner.sourceId) ?? [];
+      if (!owner.instanceIds) return current;
+      return owner.instanceIds.filter((instance) => current.includes(instance));
     }
     const current = deps.instancesForSubject(owner.subjectId);
     if (!owner.instanceIds) return [];
