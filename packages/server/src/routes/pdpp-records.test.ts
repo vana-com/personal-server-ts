@@ -12,6 +12,7 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
   MAX_BLOB_UPLOAD_BYTES,
+  MAX_INGEST_BODY_BYTES,
   pdppRecordsRoutes,
   type PdppRecordsRouteDeps,
 } from "./pdpp-records.js";
@@ -33,6 +34,13 @@ const declarations = createStreamDeclarationRegistry([
     requiredFields: ["id"],
   },
 ]);
+
+describe("pdpp records route body caps", () => {
+  it("sets record and blob ingest request caps to 512 MiB", () => {
+    expect(MAX_INGEST_BODY_BYTES).toBe(536870912);
+    expect(MAX_BLOB_UPLOAD_BYTES).toBe(536870912);
+  });
+});
 
 function clientGrant(overrides: Partial<Grant["streams"][number]> = {}): Grant {
   return {

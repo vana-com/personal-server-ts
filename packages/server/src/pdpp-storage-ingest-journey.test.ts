@@ -687,15 +687,27 @@ describe("P4: ingest body limit", () => {
   it("refuses a body over the limit", async () => {
     ctx = await bootBoth();
     const token = await ownerToken(ctx);
-    const oversized = JSON.stringify({
-      instance: `oura:${owner}`,
-      key: "huge",
-      data: { user_id: "huge", email: "x".repeat(MAX_INGEST_BODY_BYTES) },
-      emitted_at: "2026-09-01T00:00:00Z",
-    });
-    const result = await ingest(ctx, token, "profile", oversized);
+    const response = await ctx.app.request(
+      "/v1/streams/profile/records/ingest?method=oura&binding_generation=1",
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+          "content-length": String(MAX_INGEST_BODY_BYTES + 1),
+        },
+        body: "{}",
+      },
+    );
+    const result = {
+      status: response.status,
+      body: (await response.json()) as any,
+    };
     expect(result.status).toBe(400);
-    expect((result.body as any).error.code).toBe("invalid_request");
+    expect(result.body.error.code).toBe("invalid_request");
+    expect(result.body.error.message).toBe(
+      "Ingest body exceeds the 512 MiB limit",
+    );
     const listed = await read(ctx, token, "/v1/streams/profile/records");
     expect(listed.body.data).toEqual([]);
   });

@@ -1,8 +1,8 @@
 import { bodyLimit } from "hono/body-limit";
 import type { MiddlewareHandler } from "hono";
 
-/** 50 MB — max body size for data ingest routes */
-export const DATA_INGEST_MAX_SIZE = 50 * 1024 * 1024;
+/** 512 MiB — max body size for legacy data ingest routes */
+export const DATA_INGEST_MAX_SIZE = 512 * 1024 * 1024;
 
 /** 1 MB — default max body size for general routes */
 export const DEFAULT_MAX_SIZE = 1 * 1024 * 1024;
