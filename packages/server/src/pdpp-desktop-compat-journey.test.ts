@@ -371,4 +371,111 @@ describe("Desktop multi-account compatibility on a real Personal Server", () => 
     );
     expect(phantomBinding.status).toBe(401);
   });
+
+  it("registers every legacy-data source after upgrading an empty connection registry", async () => {
+    const sources = [
+      {
+        source_id: "https://registry.pdpp.dev/connectors/github",
+        method_id: "github",
+      },
+      {
+        source_id: "https://registry.pdpp.dev/connectors/oura",
+        method_id: "oura",
+      },
+    ];
+    const legacyScopes = ["github.profile", "oura.sleep"];
+    const db = new Database(join(tempDir, "index.db"));
+    try {
+      db.exec("DELETE FROM data_files");
+    } finally {
+      db.close();
+    }
+    ctx = await boot(sources, false);
+
+    for (const source of sources) {
+      const tokenResponse = await mintOwnerToken(source.source_id);
+      expect(tokenResponse.status).toBe(200);
+      const { access_token: token } = (await tokenResponse.json()) as {
+        access_token: string;
+      };
+      const listed = await ctx.app.request(
+        `/pdpp/connections?source_id=${encodeURIComponent(source.source_id)}`,
+        { headers: { authorization: `Bearer ${token}` } },
+      );
+      expect((await listed.json()).connections).toEqual([]);
+    }
+
+    for (const scope of legacyScopes) {
+      const written = await ctx.app.request(`/v1/data/${scope}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${ctx.devToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ id: `${scope}-legacy-row` }),
+      });
+      expect(written.status, await written.clone().text()).toBe(201);
+    }
+
+    await ctx.cleanup();
+    ctx = await boot(sources, false);
+    for (const source of sources) {
+      const tokenResponse = await mintOwnerToken(source.source_id);
+      expect(tokenResponse.status).toBe(200);
+      const { access_token: token } = (await tokenResponse.json()) as {
+        access_token: string;
+      };
+      const listed = await ctx.app.request(
+        `/pdpp/connections?source_id=${encodeURIComponent(source.source_id)}`,
+        { headers: { authorization: `Bearer ${token}` } },
+      );
+      expect(listed.status).toBe(200);
+      const body = (await listed.json()) as {
+        connections: Array<{
+          connection_id: string;
+          label: string;
+          method_id: string;
+          source_id: string;
+        }>;
+      };
+      expect(body.connections).toEqual([
+        {
+          connection_id: `${source.source_id.split("/").at(-1)}:${owner}`,
+          label: "",
+          method_id: source.method_id,
+          source_id: source.source_id,
+        },
+      ]);
+    }
+
+    await ctx.cleanup();
+    ctx = await boot(sources, false);
+    for (const source of sources) {
+      const tokenResponse = await mintOwnerToken(source.source_id);
+      const { access_token: token } = (await tokenResponse.json()) as {
+        access_token: string;
+      };
+      const listed = await ctx.app.request(
+        `/pdpp/connections?source_id=${encodeURIComponent(source.source_id)}`,
+        { headers: { authorization: `Bearer ${token}` } },
+      );
+      expect(listed.status).toBe(200);
+      const body = (await listed.json()) as {
+        connections: Array<{
+          connection_id: string;
+          label: string;
+          method_id: string;
+          source_id: string;
+        }>;
+      };
+      expect(body.connections).toEqual([
+        {
+          connection_id: `${source.source_id.split("/").at(-1)}:${owner}`,
+          label: "",
+          method_id: source.method_id,
+          source_id: source.source_id,
+        },
+      ]);
+    }
+  });
 });

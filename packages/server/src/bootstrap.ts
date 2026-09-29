@@ -69,6 +69,7 @@ import {
   createPdppRecordsDeps,
   coLocatedAuthorizationService,
   createPdppSyncImporter,
+  registerLegacyDataConnections,
 } from "./pdpp/records-bootstrap.js";
 import { createSqliteRecordStore } from "./storage/pdpp-records-sqlite-store.js";
 import { generateDevToken } from "./dev-token.js";
@@ -796,6 +797,18 @@ export async function createServer(
     accessToken,
     tokenStore,
   });
+
+  if (pdppAuth) {
+    registerLegacyDataConnections({
+      db,
+      serverOwner,
+      connectionMethods: pdppAuth.connectionMethods,
+      legacyScopes: indexManager
+        .listDistinctScopes()
+        .scopes.map(({ scope }) => scope),
+      logger,
+    });
+  }
 
   // PDPP Resource Server. Mounts only alongside a mounted AS, so a real boot
   // yields both halves over ONE token authority — the AS's own

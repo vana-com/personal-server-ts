@@ -82,6 +82,67 @@ export interface CreatePdppRecordsDepsOptions {
   configuredMethods?: { sourceId: string; methodId: string }[];
 }
 
+/** Restore account-one registry rows for legacy scopes before Desktop reads the registry. */
+export function registerLegacyDataConnections(options: {
+  db: Database;
+  serverOwner: string | undefined;
+  connectionMethods: Map<string, string[]>;
+  legacyScopes: string[];
+  logger: Logger;
+}): void {
+  if (!options.serverOwner) return;
+
+  const store = createSqliteRecordStore(options.db);
+  const scopesWithData = new Set(
+    options.legacyScopes.map((scope) => scope.split(".", 1)[0]?.toLowerCase()),
+  );
+  const subjectId = options.serverOwner.toLowerCase();
+
+  for (const [sourceId, methods] of options.connectionMethods) {
+    const connector = sourceId.split("/").filter(Boolean).at(-1) ?? sourceId;
+    if (!scopesWithData.has(connector.toLowerCase()) || methods.length !== 1) {
+      continue;
+    }
+    const [method] = methods;
+    if (!method || store.listConnections(sourceId).length > 0) continue;
+
+    const instance = `${connector}:${subjectId}`;
+    const binding = store.getInstanceBinding(instance);
+    if (
+      binding.deletedAt !== null ||
+      (binding.method !== method &&
+        !(
+          binding.method === null &&
+          binding.empty &&
+          binding.sourceId === null
+        )) ||
+      (binding.sourceId !== null && binding.sourceId !== sourceId)
+    ) {
+      options.logger.warn(
+        { sourceId },
+        "PDPP legacy-data binding does not match this boot and was left unchanged",
+      );
+      continue;
+    }
+
+    try {
+      store.registerConnection({ instance, sourceId, method, label: "" });
+    } catch (error) {
+      if (!(error instanceof PdppBindingError)) throw error;
+      if (
+        error.reason !== "connection_deleted" &&
+        error.reason !== "connection_conflict"
+      ) {
+        throw error;
+      }
+      options.logger.warn(
+        { sourceId },
+        "PDPP legacy-data binding changed during startup and was left unchanged",
+      );
+    }
+  }
+}
+
 export function createPdppRecordsDeps(
   options: CreatePdppRecordsDepsOptions,
 ): PdppRecordsDeps | undefined {
