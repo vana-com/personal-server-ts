@@ -36,7 +36,7 @@ describe("createPdppRecordsDeps: instancesForSubject", () => {
     db = new Database(":memory:");
   });
   afterEach(() => db.close());
-  it("returns only explicitly registered connections for the owner", () => {
+  it("returns account one and explicitly registered connections for the owner", () => {
     const deps = createPdppRecordsDeps({
       pdppAuth: fakePdppAuth(),
       declarations: [DECLARATION],
@@ -56,7 +56,10 @@ describe("createPdppRecordsDeps: instancesForSubject", () => {
       method: "spotify",
       label: "Personal",
     });
-    expect(deps!.instancesForSubject!(SERVER_OWNER)).toEqual([connectionId]);
+    expect(deps!.instancesForSubject!(SERVER_OWNER)).toEqual(
+      expect.arrayContaining([`spotify:${SERVER_OWNER}`, connectionId]),
+    );
+    expect(deps!.instancesForSubject!(SERVER_OWNER)).toHaveLength(2);
   });
 
   it("normalizes the server owner's address casing the same way subjectId is derived", () => {
@@ -78,9 +81,12 @@ describe("createPdppRecordsDeps: instancesForSubject", () => {
       method: "spotify",
       label: "Personal",
     });
-    expect(deps!.instancesForSubject!(SERVER_OWNER.toUpperCase())).toEqual([
-      connectionId,
-    ]);
+    expect(deps!.instancesForSubject!(SERVER_OWNER.toUpperCase())).toEqual(
+      expect.arrayContaining([`spotify:${SERVER_OWNER}`, connectionId]),
+    );
+    expect(deps!.instancesForSubject!(SERVER_OWNER.toUpperCase())).toHaveLength(
+      2,
+    );
   });
 
   it("returns no instances for a different subject than the configured server owner", () => {

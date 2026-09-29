@@ -4,6 +4,7 @@ import {
   PdppBindingError,
   type PdppInstanceBinding,
 } from "../storage/pdpp-records-sqlite-store.js";
+import { resolveRetainedSourceId } from "../pdpp/source-id-compat.js";
 
 interface PdppConnectionStore {
   listConnections(sourceId: string): PdppInstanceBinding[];
@@ -43,10 +44,13 @@ function isConnectionId(id: string, owner: string, sourceId?: string): boolean {
   );
 }
 
-function connectionJson(binding: PdppInstanceBinding) {
+function connectionJson(
+  binding: PdppInstanceBinding,
+  sourceId = binding.sourceId,
+) {
   return {
     connection_id: binding.instance,
-    source_id: binding.sourceId,
+    source_id: sourceId,
     method_id: binding.method,
     label: binding.label,
   };
@@ -81,8 +85,11 @@ export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
   );
 
   app.get("/pdpp/connections", async (c) => {
-    const sourceId = c.req.query("source_id");
-    if (!sourceId || !deps.sourceIds.has(sourceId)) {
+    const requestedSourceId = c.req.query("source_id");
+    const sourceId = requestedSourceId
+      ? resolveRetainedSourceId(requestedSourceId, deps.sourceIds)
+      : undefined;
+    if (!requestedSourceId || !sourceId) {
       return jsonError("not_found", "Source declaration not found", 404);
     }
     const ownerScope = await owner(c.req.raw);
@@ -95,7 +102,9 @@ export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
       );
     }
     return c.json({
-      connections: deps.store.listConnections(sourceId).map(connectionJson),
+      connections: deps.store
+        .listConnections(sourceId)
+        .map((connection) => connectionJson(connection, requestedSourceId)),
     });
   });
 
@@ -111,11 +120,15 @@ export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
       return jsonError("invalid_request", "Body must be an object", 400);
     }
     const input = body as Record<string, unknown>;
+    const requestedSourceId = input.source_id;
+    const sourceId =
+      typeof requestedSourceId === "string"
+        ? resolveRetainedSourceId(requestedSourceId, deps.sourceIds)
+        : undefined;
     if (
-      typeof input.source_id !== "string" ||
+      !sourceId ||
       typeof input.method_id !== "string" ||
-      typeof input.label !== "string" ||
-      !deps.sourceIds.has(input.source_id)
+      typeof input.label !== "string"
     ) {
       return jsonError(
         "invalid_request",
@@ -125,21 +138,21 @@ export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
     }
     const ownerScope = await owner(c.req.raw);
     if (ownerScope instanceof Response) return ownerScope;
-    if (ownerScope.sourceId !== input.source_id) {
+    if (ownerScope.sourceId !== sourceId) {
       return jsonError(
         "access_denied",
         "Owner token has a different source scope",
         403,
       );
     }
-    if (!isConnectionId(connectionId, ownerScope.subjectId, input.source_id)) {
+    if (!isConnectionId(connectionId, ownerScope.subjectId, sourceId)) {
       return jsonError(
         "connection_id_invalid",
         "Connection id is invalid",
         400,
       );
     }
-    const configured = deps.configuredMethods.get(input.source_id) ?? [];
+    const configured = deps.configuredMethods.get(sourceId) ?? [];
     if (configured.length !== 1 || configured[0] !== input.method_id) {
       return jsonError(
         "method_inactive",
@@ -150,7 +163,7 @@ export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
     try {
       const binding = deps.store.registerConnection({
         instance: connectionId,
-        sourceId: input.source_id,
+        sourceId,
         method: input.method_id,
         label: input.label,
       });

@@ -139,7 +139,12 @@ export function createPdppRecordsDeps(
     const binding = store.getInstanceBinding(instance);
     if (
       binding.deletedAt !== null ||
-      binding.method !== method ||
+      (binding.method !== method &&
+        !(
+          binding.method === null &&
+          binding.empty &&
+          binding.sourceId === null
+        )) ||
       (binding.sourceId !== null && binding.sourceId !== source.sourceId)
     ) {
       logger.warn(

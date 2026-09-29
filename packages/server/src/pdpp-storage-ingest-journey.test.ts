@@ -1517,7 +1517,7 @@ describe("P10c and method authority over HTTP", () => {
     });
   });
 
-  it("reads account one after Desktop explicitly registers it", async () => {
+  it("reads account one after the PS bootstraps its empty legacy binding", async () => {
     const { token } = await bootSwitchable();
     const instance = `oura:${owner}`;
     const bindingRows = () => {
@@ -1544,10 +1544,10 @@ describe("P10c and method authority over HTTP", () => {
       empty: true,
       configured_active_method: "oura",
     });
-    // A read-only binding probe creates the legacy row but does not register it.
-    expect(bindingRows()).toBe(1);
+    // Boot registers a new owner's empty account-one binding before the probe.
+    expect(bindingRows()).toBe(2);
     await seedEvents(token, instance, ["a1"]);
-    expect(bindingRows()).toBe(1);
+    expect(bindingRows()).toBe(2);
   });
 
   it("keeps a keyset cursor valid across later writes without a reset", async () => {
