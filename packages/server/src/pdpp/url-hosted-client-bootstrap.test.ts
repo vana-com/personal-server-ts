@@ -23,7 +23,7 @@ import { computeS256Challenge } from "@opendatalabs/personal-server-ts-core/pdpp
 import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { createServer, type ServerContext } from "../bootstrap.js";
 import { initializeDatabase } from "../storage/index-schema.js";
-import { singleInstanceInventory } from "./deployment.js";
+import { registerTestConnection } from "./test-connections.js";
 import * as clientDocumentFetch from "./client-document-fetch.js";
 
 const KNOWN_SIG =
@@ -86,6 +86,10 @@ function pdppConfig(overrides: {
     pdpp: {
       enabled: true,
       declarationPaths: overrides.declarationPaths,
+      methods: overrides.declarationPaths.map((declaration_path, index) => ({
+        method_id: `method-${index + 1}`,
+        declaration_path,
+      })),
       clients: overrides.clients ?? [],
       urlHostedClientHosts: overrides.urlHostedClientHosts ?? [],
     },
@@ -114,23 +118,13 @@ afterEach(async () => {
 
 async function ownerToken(context: ServerContext): Promise<string> {
   const owner = await recoverServerOwner(KNOWN_SIG);
-  const response = await context.app.request("/pdpp/v1/owner/token", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${context.devToken}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      source_id: SOURCE_ID,
-      instance_id: singleInstanceInventory(
-        owner.toLowerCase(),
-        SOURCE_ID,
-      ).eligibleFor("")[0],
-    }),
-  });
-  expect(response.status).toBe(200);
-  const body = (await response.json()) as { access_token: string };
-  return body.access_token;
+  return registerTestConnection(
+    context.app,
+    context.devToken,
+    owner,
+    SOURCE_ID,
+    "method-1",
+  );
 }
 
 function authorizeBody(overrides: Record<string, unknown> = {}) {

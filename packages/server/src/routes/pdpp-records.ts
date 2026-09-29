@@ -143,6 +143,10 @@ function parseIngestBody(bytes: Uint8Array): unknown {
 export interface PdppRecordsRouteDeps {
   store: PdppRecordStore;
   bindingStore?: {
+    getInstanceBinding(instance: string): {
+      sourceId: string | null;
+      deletedAt: string | null;
+    };
     storeBlobBytesForInstance(input: {
       instance: string;
       method: string;
@@ -159,6 +163,8 @@ export interface PdppRecordsRouteDeps {
   ownerSubjectId?: string;
   /** Current ownership used to narrow the instance stored in an owner token. */
   instancesForSubject?: (subjectId: string) => string[];
+  /** Active connections covered by a source-scoped owner token. */
+  instancesForSource?: (subjectId: string, sourceId: string) => string[];
   /**
    * Owner access feed. PDPP reads must appear in the SAME feed as legacy
    * `/v1/data/{scope}` reads, or adopting PDPP would silently make an owner's
@@ -741,10 +747,33 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
 
   function ownerInstances(context: PdppTokenContext): string[] {
     if (context.tokenKind !== "owner") return [];
+    if (context.sourceId) {
+      return (
+        deps.instancesForSource?.(
+          requireSubjectId(context),
+          context.sourceId,
+        ) ?? []
+      );
+    }
     const current = deps.instancesForSubject?.(requireSubjectId(context));
     if (!current) return [];
     if (!context.instanceIds) return [];
     return context.instanceIds.filter((instance) => current.includes(instance));
+  }
+
+  function requireRegisteredConnections(instanceIds: string[]): void {
+    if (!deps.bindingStore) return;
+    if (
+      instanceIds.some((instance) => {
+        const binding = deps.bindingStore!.getInstanceBinding(instance);
+        return binding.sourceId === null || binding.deletedAt !== null;
+      })
+    ) {
+      throw new PdppError(
+        "instance_unavailable",
+        "The connection for this grant is unavailable",
+      );
+    }
   }
 
   app.get("/streams", async (c) => {
@@ -950,6 +979,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const scope = resolveReadScope(context!, stream, declaration);
       const effectiveInstanceIds =
         context!.tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds;
+      if (context!.tokenKind === "client") {
+        requireRegisteredConnections(effectiveInstanceIds);
+      }
       if (context!.tokenKind === "owner" && effectiveInstanceIds.length === 0) {
         throw new PdppError(
           "grant_stream_not_allowed",
@@ -1153,6 +1185,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
 
       const effectiveInstanceIds =
         context!.tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds;
+      if (context!.tokenKind === "client") {
+        requireRegisteredConnections(effectiveInstanceIds);
+      }
 
       if (!recordKeyWithinGrantResources(recordKey, scope.streamGrant)) {
         throw new PdppError("not_found", "Record not found");

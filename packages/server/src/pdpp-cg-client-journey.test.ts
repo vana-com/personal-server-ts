@@ -50,7 +50,7 @@ import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { createServer, type ServerContext } from "./bootstrap.js";
 import { listenHttpServer, type NodeServer } from "./listen.js";
 import { initializeDatabase } from "./storage/index-schema.js";
-import { singleInstanceInventory } from "./pdpp/deployment.js";
+import { registerTestConnection } from "./pdpp/test-connections.js";
 import {
   bearerTokenAuthorizationStrategy,
   PdppContextClient,
@@ -114,6 +114,7 @@ async function bootAndListen(): Promise<void> {
       pdpp: {
         enabled: true,
         declarationPaths: [declPath],
+        methods: [{ method_id: "spotify", declaration_path: declPath }],
         clients: [{ clientId: CLIENT_ID, redirectUris: [REDIRECT] }],
       },
     }),
@@ -152,19 +153,7 @@ afterEach(async () => {
 
 async function ownerToken(): Promise<string> {
   const subject = (await recoverServerOwner(KNOWN_SIG)).toLowerCase();
-  const instanceId = singleInstanceInventory(subject, SOURCE_ID).eligibleFor(
-    "",
-  )[0];
-  const res = await fetch(`${baseUrl}/pdpp/v1/owner/token`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${ctx!.devToken}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ source_id: SOURCE_ID, instance_id: instanceId }),
-  });
-  expect(res.status).toBe(200);
-  return ((await res.json()) as { access_token: string }).access_token;
+  return registerTestConnection(ctx!.app, ctx!.devToken, subject, SOURCE_ID);
 }
 
 /** Real AS flow over the wire → a real grant-bound client access token. */

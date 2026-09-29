@@ -36,7 +36,7 @@ describe("createPdppRecordsDeps: instancesForSubject", () => {
     db = new Database(":memory:");
   });
   afterEach(() => db.close());
-  it("returns this deployment's instances for the configured server owner", () => {
+  it("returns only explicitly registered connections for the owner", () => {
     const deps = createPdppRecordsDeps({
       pdppAuth: fakePdppAuth(),
       declarations: [DECLARATION],
@@ -44,10 +44,19 @@ describe("createPdppRecordsDeps: instancesForSubject", () => {
       serverOwner: SERVER_OWNER,
       resource: "https://ps.example.com",
       logger: pino({ level: "silent" }),
+      configuredMethods: [
+        { sourceId: DECLARATION.source_id, methodId: "spotify" },
+      ],
     });
     expect(deps).toBeDefined();
-    const instances = deps!.instancesForSubject!(SERVER_OWNER);
-    expect(instances).toEqual([`spotify:${SERVER_OWNER.toLowerCase()}`]);
+    const connectionId = "conn_123e4567-e89b-42d3-a456-426614174000";
+    deps!.bindingStore.registerConnection({
+      instance: connectionId,
+      sourceId: DECLARATION.source_id,
+      method: "spotify",
+      label: "Personal",
+    });
+    expect(deps!.instancesForSubject!(SERVER_OWNER)).toEqual([connectionId]);
   });
 
   it("normalizes the server owner's address casing the same way subjectId is derived", () => {
@@ -58,9 +67,20 @@ describe("createPdppRecordsDeps: instancesForSubject", () => {
       serverOwner: SERVER_OWNER,
       resource: "https://ps.example.com",
       logger: pino({ level: "silent" }),
+      configuredMethods: [
+        { sourceId: DECLARATION.source_id, methodId: "spotify" },
+      ],
     });
-    const instances = deps!.instancesForSubject!(SERVER_OWNER.toUpperCase());
-    expect(instances).toEqual([`spotify:${SERVER_OWNER.toLowerCase()}`]);
+    const connectionId = "conn_123e4567-e89b-42d3-a456-426614174000";
+    deps!.bindingStore.registerConnection({
+      instance: connectionId,
+      sourceId: DECLARATION.source_id,
+      method: "spotify",
+      label: "Personal",
+    });
+    expect(deps!.instancesForSubject!(SERVER_OWNER.toUpperCase())).toEqual([
+      connectionId,
+    ]);
   });
 
   it("returns no instances for a different subject than the configured server owner", () => {
@@ -75,10 +95,43 @@ describe("createPdppRecordsDeps: instancesForSubject", () => {
       serverOwner: SERVER_OWNER,
       resource: "https://ps.example.com",
       logger: pino({ level: "silent" }),
+      configuredMethods: [
+        { sourceId: DECLARATION.source_id, methodId: "spotify" },
+      ],
     });
     expect(deps).toBeDefined();
     const instances = deps!.instancesForSubject!(OTHER_SUBJECT);
     expect(instances).toEqual([]);
+  });
+
+  it("restores a registered connection's configured method after restart", () => {
+    const options = {
+      pdppAuth: fakePdppAuth(),
+      declarations: [DECLARATION],
+      db,
+      serverOwner: SERVER_OWNER,
+      resource: "https://ps.example.com",
+      logger: pino({ level: "silent" }),
+      configuredMethods: [
+        { sourceId: DECLARATION.source_id, methodId: "spotify" },
+      ],
+    };
+    const firstBoot = createPdppRecordsDeps(options)!;
+    const connectionId = "conn_123e4567-e89b-42d3-a456-426614174000";
+    firstBoot.bindingStore.registerConnection({
+      instance: connectionId,
+      sourceId: DECLARATION.source_id,
+      method: "spotify",
+      label: "Work",
+    });
+
+    const nextBoot = createPdppRecordsDeps(options)!;
+    expect(nextBoot.configuredMethods.get(connectionId)).toEqual(["spotify"]);
+    expect(
+      nextBoot.bindingStore
+        .listConnections(DECLARATION.source_id)
+        .map((item) => item.instance),
+    ).toContain(connectionId);
   });
 });
 

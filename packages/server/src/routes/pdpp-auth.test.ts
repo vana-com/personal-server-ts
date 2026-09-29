@@ -104,7 +104,6 @@ function post(
 function ownerTokenBody(overrides: Record<string, unknown> = {}) {
   return {
     source_id: SOURCE_ID,
-    instance_id: OWNER_INSTANCE,
     ...overrides,
   };
 }
@@ -115,8 +114,14 @@ function scopedOwnerToken(
 ): string {
   return tokens.issueOwnerToken({
     subjectId,
+    sourceId: SOURCE_ID,
     instanceIds: [instanceId],
   }).access_token;
+}
+
+function sourceOwnerToken(subjectId = OWNER): string {
+  return tokens.issueOwnerToken({ subjectId, sourceId: SOURCE_ID })
+    .access_token;
 }
 
 function postForm(
@@ -378,7 +383,7 @@ describe("staleness (§7 / §9 AS item 15)", () => {
     expect((await response.json()).error).toBe("stale_review");
   });
 
-  it("keeps approval bound to the owner token's scoped instance when a second instance connects", async () => {
+  it("requires a new review when a second instance connects", async () => {
     const { sessionId, ownerToken, digest } = await openSessionAndReview();
     eligible = ["spotify-account-a", "spotify-account-b"];
 
@@ -387,7 +392,7 @@ describe("staleness (§7 / §9 AS item 15)", () => {
       { review_digest: digest },
       ownerAuth(ownerToken),
     );
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(409);
   });
 
   it("answers 409 for a digest the owner never saw", async () => {
@@ -1066,7 +1071,10 @@ describe("owner-token exchange", () => {
   it("mints an owner token for a request that passed the owner proof", async () => {
     // The stubbed `currentSubjectId` stands in for the verified signer the
     // web3-auth + owner-check middleware chain populates in production.
-    const response = await post("/pdpp/v1/owner/token", ownerTokenBody());
+    const response = await post(
+      "/pdpp/v1/owner/token",
+      ownerTokenBody({ instance_id: OWNER_INSTANCE }),
+    );
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
     const issued = (await response.json()) as {
@@ -1083,7 +1091,8 @@ describe("owner-token exchange", () => {
     expect(context.active).toBe(true);
     expect(context.tokenKind).toBe("owner");
     expect(context.subjectId).toBe(OWNER);
-    expect(context.instanceIds).toEqual([OWNER_INSTANCE]);
+    expect(context.sourceId).toBe(SOURCE_ID);
+    expect(context.instanceIds).toBeUndefined();
     expect(context.grant).toBeUndefined();
   });
 
@@ -1095,11 +1104,11 @@ describe("owner-token exchange", () => {
     expect(response.status).toBe(401);
   });
 
-  it("refuses to mint without exactly one requested instance", async () => {
+  it("accepts Desktop instance selectors but rejects malformed values", async () => {
     const missing = await post("/pdpp/v1/owner/token", {
       source_id: SOURCE_ID,
     });
-    expect(missing.status).toBe(400);
+    expect(missing.status).toBe(200);
 
     const array = await post("/pdpp/v1/owner/token", {
       source_id: SOURCE_ID,
@@ -1108,12 +1117,16 @@ describe("owner-token exchange", () => {
     expect(array.status).toBe(400);
   });
 
-  it("refuses to mint for an instance the owner does not own", async () => {
-    const response = await post(
-      "/pdpp/v1/owner/token",
-      ownerTokenBody({ instance_id: "spotify-account-b" }),
-    );
-    expect(response.status).toBe(403);
+  it("keeps the accepted Desktop selector source-scoped", async () => {
+    const response = await post("/pdpp/v1/owner/token", {
+      source_id: SOURCE_ID,
+      instance_id: OWNER_INSTANCE,
+    });
+    expect(response.status).toBe(200);
+    const issued = (await response.json()) as { access_token: string };
+    const context = tokens.resolveToken(issued.access_token);
+    expect(context.sourceId).toBe(SOURCE_ID);
+    expect(context.instanceIds).toBeUndefined();
   });
 
   it("mints a token usable end-to-end for approval", async () => {
@@ -1179,9 +1192,9 @@ describe("owner-token exchange", () => {
 });
 
 describe("§6 — instance choice over the wire", () => {
-  it("renders the review for the instance already selected by the owner token", async () => {
+  it("requires a choice when two source connections are active", async () => {
     eligible = ["spotify-account-a", "spotify-account-b"];
-    const ownerToken = scopedOwnerToken(OWNER, "spotify-account-b");
+    const ownerToken = sourceOwnerToken();
     const created = await post("/pdpp/v1/authorize", selectionBody());
     const { session_id } = (await created.json()) as { session_id: string };
 
@@ -1197,21 +1210,20 @@ describe("§6 — instance choice over the wire", () => {
         candidates: string[];
       }>;
     };
-    expect(body.instance_choice_required).toBeUndefined();
-    expect(
-      (body.review as { data: { streams: Array<{ instance_ids: string[] }> } })
-        .data.streams[0].instance_ids,
-    ).toEqual(["spotify-account-b"]);
+    expect(body.instance_choice_required?.[0]).toMatchObject({
+      stream: "top_artists",
+      candidates: ["spotify-account-a", "spotify-account-b"],
+    });
   });
 
   it("issues over exactly the owner token's scoped instance", async () => {
     eligible = ["spotify-account-a", "spotify-account-b"];
-    const ownerToken = scopedOwnerToken(OWNER, "spotify-account-b");
+    const ownerToken = sourceOwnerToken();
     const created = await post("/pdpp/v1/authorize", selectionBody());
     const { session_id } = (await created.json()) as { session_id: string };
 
     const reviewed = await app.request(
-      `/pdpp/v1/authorize/${session_id}/review`,
+      `/pdpp/v1/authorize/${session_id}/review?instance%5Btop_artists%5D=spotify-account-b`,
       { headers: ownerAuth(ownerToken) },
     );
     const { review } = (await reviewed.json()) as {
@@ -1220,7 +1232,10 @@ describe("§6 — instance choice over the wire", () => {
 
     const approved = await post(
       `/pdpp/v1/authorize/${session_id}/approve`,
-      { review_digest: review.review_digest },
+      {
+        review_digest: review.review_digest,
+        instance_choices: { top_artists: ["spotify-account-b"] },
+      },
       ownerAuth(ownerToken),
     );
     expect(approved.status).toBe(200);
@@ -1232,12 +1247,12 @@ describe("§6 — instance choice over the wire", () => {
 
   it("answers 409 when approval choices differ from the scoped review", async () => {
     eligible = ["spotify-account-a", "spotify-account-b"];
-    const ownerToken = scopedOwnerToken(OWNER, "spotify-account-b");
+    const ownerToken = sourceOwnerToken();
     const created = await post("/pdpp/v1/authorize", selectionBody());
     const { session_id } = (await created.json()) as { session_id: string };
 
     const reviewed = await app.request(
-      `/pdpp/v1/authorize/${session_id}/review`,
+      `/pdpp/v1/authorize/${session_id}/review?instance%5Btop_artists%5D=spotify-account-b`,
       { headers: ownerAuth(ownerToken) },
     );
     const { review } = (await reviewed.json()) as {

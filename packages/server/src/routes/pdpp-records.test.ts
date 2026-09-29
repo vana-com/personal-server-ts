@@ -1405,6 +1405,12 @@ describe("pdpp records routes: snapshot replace", () => {
   it("refuses a client token for the owner subject with 401 and changes no rows", async () => {
     const db = new Database(":memory:");
     const store = createSqliteRecordStore(db);
+    store.registerConnection({
+      instance: "inst_1",
+      sourceId: "https://test.invalid/connector",
+      method: "m1",
+      label: "Test account",
+    });
     const { app } = buildApp(
       {
         "owner-tok": {

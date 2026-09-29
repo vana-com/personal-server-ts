@@ -19,7 +19,7 @@ import {
   PdppTokenService,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { createServer, type ServerContext } from "./bootstrap.js";
-import { singleInstanceInventory } from "./pdpp/deployment.js";
+import { registerTestConnection } from "./pdpp/test-connections.js";
 
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
@@ -93,23 +93,12 @@ async function bootBoth() {
 }
 
 function instance(sourceId: string, subject = owner) {
-  return singleInstanceInventory(subject, sourceId).eligibleFor("")[0];
+  const connector = sourceId.split("/").filter(Boolean).at(-1) ?? sourceId;
+  return `${connector}:${subject}`;
 }
 
 async function ownerToken(sourceId: string): Promise<string> {
-  const response = await ctx!.app.request("/pdpp/v1/owner/token", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${ctx!.devToken}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      source_id: sourceId,
-      instance_id: instance(sourceId),
-    }),
-  });
-  expect(response.status).toBe(200);
-  return ((await response.json()) as { access_token: string }).access_token;
+  return registerTestConnection(ctx!.app, ctx!.devToken, owner, sourceId);
 }
 
 function issueForeignOwnerToken(): string {

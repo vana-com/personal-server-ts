@@ -77,13 +77,12 @@ import type { Logger } from "pino";
 import { enclaveJobRoutes } from "./routes/enclave-jobs.js";
 import type { JobRequestEnvelope } from "@opendatalabs/vana-sdk/protocol/jobs";
 import type { JobExecuteResponse } from "./jobs/types.js";
-import {
-  pdppRecordsRoutes,
-  type PdppRecordsRouteDeps,
-} from "./routes/pdpp-records.js";
+import { pdppRecordsRoutes } from "./routes/pdpp-records.js";
 import { pdppInstanceBindingRoutes } from "./routes/pdpp-instance-bindings.js";
+import { pdppConnectionRoutes } from "./routes/pdpp-connections.js";
 import { pdppBlobsRoutes } from "./routes/pdpp-blobs.js";
 import { pdppWellKnownRoutes } from "./routes/pdpp-well-known.js";
+import type { createSqliteRecordStore } from "./storage/pdpp-records-sqlite-store.js";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import type {
   PdppRecordStore,
@@ -219,43 +218,13 @@ export interface AppDeps {
    */
   pdpp?: {
     store: PdppRecordStore;
-    bindingStore: PdppRecordStore & {
-      getInstanceBinding(instance: string): {
-        instance: string;
-        method: string | null;
-        generation: number;
-        resetClock: number;
-        empty?: boolean;
-      };
-      resetInstanceBinding(input: {
-        instance: string;
-        expectedMethod: string | null;
-        expectedGeneration: number;
-        nextMethod: string | null;
-      }): {
-        binding: {
-          instance: string;
-          method: string | null;
-          generation: number;
-          resetClock: number;
-        };
-        alreadyReset: boolean;
-      };
-      storeBlobBytesForInstance(input: {
-        instance: string;
-        method: string;
-        generation: number;
-        bytes: Uint8Array;
-        mimeType: string;
-      }): ReturnType<PdppRecordStore["storeBlobBytes"]>;
-      replaceStream: NonNullable<
-        PdppRecordsRouteDeps["bindingStore"]
-      >["replaceStream"];
-    };
+    bindingStore: ReturnType<typeof createSqliteRecordStore>;
     configuredMethods: Map<string, string[]>;
     auth: PdppAuthorizationService;
     declarations: StreamDeclarationRegistry;
     instancesForSubject?: (subjectId: string) => string[];
+    instancesForSource?: (subjectId: string, sourceId: string) => string[];
+    sourceIds: Set<string>;
     readBlobBytes?: (
       blobId: string,
     ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
@@ -318,11 +287,22 @@ export function createApp(deps: AppDeps): Hono {
   if (deps.pdpp) {
     app.route(
       "/",
+      pdppConnectionRoutes({
+        store: deps.pdpp.bindingStore,
+        auth: deps.pdpp.auth,
+        ownerSubjectId: deps.serverOwner!,
+        configuredMethods: deps.pdpp.configuredMethods,
+        sourceIds: deps.pdpp.sourceIds,
+      }),
+    );
+    app.route(
+      "/",
       pdppInstanceBindingRoutes({
         store: deps.pdpp.bindingStore,
         auth: deps.pdpp.auth,
         ownerSubjectId: deps.serverOwner!,
         instancesForSubject: deps.pdpp.instancesForSubject!,
+        instancesForSource: deps.pdpp.instancesForSource,
         configuredMethods: deps.pdpp.configuredMethods,
       }),
     );
@@ -334,6 +314,7 @@ export function createApp(deps: AppDeps): Hono {
         declarations: deps.pdpp.declarations,
         ownerSubjectId: deps.serverOwner,
         instancesForSubject: deps.pdpp.instancesForSubject,
+        instancesForSource: deps.pdpp.instancesForSource,
         bindingStore: deps.pdpp.bindingStore,
         configuredMethods: deps.pdpp.configuredMethods,
         // An `api_error` on the resource surface is a server fault and must
@@ -375,6 +356,11 @@ export function createApp(deps: AppDeps): Hono {
         auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
         instancesForSubject: deps.pdpp.instancesForSubject,
+        instancesForSource: deps.pdpp.instancesForSource,
+        isConnectionAvailable: (instance) => {
+          const binding = deps.pdpp!.bindingStore.getInstanceBinding(instance);
+          return binding.sourceId !== null && binding.deletedAt === null;
+        },
         readBlobBytes: deps.pdpp.readBlobBytes,
       }),
     );

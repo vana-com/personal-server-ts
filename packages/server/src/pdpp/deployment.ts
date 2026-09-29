@@ -147,25 +147,3 @@ function connectorNameFor(snapshot: DeclarationSnapshot): string {
     return snapshot.source_id;
   }
 }
-
-/**
- * The owner's connected instances for a source.
- *
- * This PS is single-instance per source today: one owner, one connected
- * account per connector, and the scope index carries no per-account handle.
- * Reporting exactly one handle is therefore the truth here, not a placeholder
- * — and it is why the auto-resolve path (§6: exactly one eligible handle)
- * applies rather than the owner-choice path.
- *
- * When multi-account connections land, this is the one function that changes:
- * returning several handles makes the AS require an explicit owner choice
- * automatically, because that rule lives in resolution, not here.
- */
-export function singleInstanceInventory(
-  subjectId: string,
-  sourceId: string,
-): { eligibleFor(streamName: string): string[] } {
-  const connector = sourceId.split("/").filter(Boolean).pop() ?? sourceId;
-  const handle = `${connector}:${subjectId}`;
-  return { eligibleFor: () => [handle] };
-}

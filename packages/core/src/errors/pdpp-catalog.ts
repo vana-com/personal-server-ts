@@ -33,6 +33,7 @@ export type PdppErrorCode =
   | "grant_invalid"
   | "disclosure_unavailable"
   | "blob_not_found"
+  | "instance_unavailable"
   | "not_found"
   | "cursor_expired"
   | "rate_limit_exceeded"
@@ -55,6 +56,7 @@ const STATUS_BY_CODE: Record<PdppErrorCode, number> = {
   grant_invalid: 403,
   disclosure_unavailable: 403,
   blob_not_found: 404,
+  instance_unavailable: 404,
   not_found: 404,
   cursor_expired: 410,
   rate_limit_exceeded: 429,
@@ -78,6 +80,7 @@ const TYPE_BY_CODE: Record<PdppErrorCode, PdppErrorType> = {
   grant_invalid: "permission_error",
   disclosure_unavailable: "permission_error",
   blob_not_found: "not_found_error",
+  instance_unavailable: "not_found_error",
   not_found: "not_found_error",
   cursor_expired: "gone_error",
   rate_limit_exceeded: "rate_limit_error",

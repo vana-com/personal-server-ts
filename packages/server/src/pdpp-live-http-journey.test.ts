@@ -32,7 +32,7 @@ import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { createServer, type ServerContext } from "./bootstrap.js";
 import { listenHttpServer, type NodeServer } from "./listen.js";
 import { initializeDatabase } from "./storage/index-schema.js";
-import { singleInstanceInventory } from "./pdpp/deployment.js";
+import { registerTestConnection } from "./pdpp/test-connections.js";
 
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
@@ -92,11 +92,13 @@ async function writeDeclaration(): Promise<string> {
  * port, so parallel test files never collide on a fixed port.
  */
 async function bootAndListen(): Promise<void> {
+  const declarationPath = await writeDeclaration();
   const config = ServerConfigSchema.parse({
     tunnel: { enabled: false },
     pdpp: {
       enabled: true,
-      declarationPaths: [await writeDeclaration()],
+      declarationPaths: [declarationPath],
+      methods: [{ method_id: "spotify", declaration_path: declarationPath }],
       clients: [{ clientId: CLIENT_ID, redirectUris: [REDIRECT] }],
     },
   });
@@ -139,19 +141,7 @@ afterEach(async () => {
 /** Real owner token, minted over the wire behind the server's owner proof. */
 async function ownerToken(): Promise<string> {
   const subject = (await recoverServerOwner(KNOWN_SIG)).toLowerCase();
-  const instanceId = singleInstanceInventory(subject, SOURCE_ID).eligibleFor(
-    "",
-  )[0];
-  const res = await fetch(`${baseUrl}/pdpp/v1/owner/token`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${ctx!.devToken}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ source_id: SOURCE_ID, instance_id: instanceId }),
-  });
-  expect(res.status).toBe(200);
-  return ((await res.json()) as { access_token: string }).access_token;
+  return registerTestConnection(ctx!.app, ctx!.devToken, subject, SOURCE_ID);
 }
 
 /** Drive the full authorization flow over TCP to a grant-bound client token. */

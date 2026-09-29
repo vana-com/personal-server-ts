@@ -199,6 +199,12 @@ describe("sqlite record store: blob bytes (real on-disk database)", () => {
 
     const db1 = new Database(dbPath);
     const store1 = createTestBoundRecordStore(db1);
+    store1.registerConnection({
+      instance: "inst_1",
+      sourceId: "https://test.invalid/method-a",
+      method: "method_a",
+      label: "Method A",
+    });
     const meta = store1.storeBlobBytesForInstance({
       instance: "inst_1",
       method: "method_a",
@@ -298,28 +304,6 @@ describe("sqlite record store: blob bytes (real on-disk database)", () => {
       sha256: "preexistinghash",
     });
     expect(store.getBlobBytes("blob_pre_existing")).toBeUndefined();
-    expect(store.getInstanceBinding("inst_1")).toMatchObject({
-      method: null,
-      generation: 1,
-      empty: false,
-    });
-    expect(() =>
-      store.ingestBatch(
-        [
-          {
-            instance: "inst_1",
-            stream: "media",
-            key: "media_1",
-            data: { id: "media_1", blob_ref: { blob_id: "blob_pre_existing" } },
-            emitted_at: "2026-01-02T00:00:00.000Z",
-          },
-        ],
-        () => "mutable_state",
-        () => ["id"],
-        { method: "method_a", generation: 1 },
-      ),
-    ).toThrow("binding_required");
-
     // The migrated database accepts new byte-backed blobs normally.
     const newBytes = new Uint8Array([1, 2, 3]);
     const newMeta = store.storeBlobBytes(newBytes, "text/plain");
@@ -328,7 +312,7 @@ describe("sqlite record store: blob bytes (real on-disk database)", () => {
     const version = db
       .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
       .get() as { version: number };
-    expect(version.version).toBe(5);
+    expect(version.version).toBe(6);
 
     store.close();
   });

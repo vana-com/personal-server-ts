@@ -28,6 +28,20 @@ export function createTestBoundRecordStore(
   return {
     ...store,
     ingestBatch: (envelopes, semantics, primaryKey, binding, validateData) => {
+      const selectedBinding = binding ?? TEST_BINDING;
+      for (const instance of new Set(envelopes.map((e) => e.instance))) {
+        if (store.getInstanceBinding(instance).sourceId === null) {
+          store.registerConnection({
+            instance,
+            sourceId: "https://test.invalid/connector",
+            method: selectedBinding.method,
+            label: "Test",
+          });
+        }
+        if (store.getInstanceBinding(instance).sourceId === null) {
+          throw new Error(`test connection registration failed: ${instance}`);
+        }
+      }
       if (binding) {
         return store.ingestBatch(
           envelopes,

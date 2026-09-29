@@ -21,6 +21,7 @@ export interface PdppInstanceBindingRouteDeps {
   auth: PdppAuthorizationService;
   ownerSubjectId: string;
   instancesForSubject(subjectId: string): string[];
+  instancesForSource?(subjectId: string, sourceId: string): string[];
   configuredMethods: Map<string, string[]>;
 }
 
@@ -67,13 +68,21 @@ export function pdppInstanceBindingRoutes(
         ),
       };
     }
-    return { subjectId: context.subjectId, instanceIds: context.instanceIds };
+    return {
+      subjectId: context.subjectId,
+      instanceIds: context.instanceIds,
+      sourceId: context.sourceId,
+    };
   }
 
   function scopedOwnedInstances(owner: {
     subjectId: string;
     instanceIds?: string[];
+    sourceId?: string;
   }): string[] {
+    if (owner.sourceId) {
+      return deps.instancesForSource?.(owner.subjectId, owner.sourceId) ?? [];
+    }
     const current = deps.instancesForSubject(owner.subjectId);
     if (!owner.instanceIds) return [];
     return owner.instanceIds.filter((instance) => current.includes(instance));
@@ -81,7 +90,7 @@ export function pdppInstanceBindingRoutes(
 
   function canAccessInstance(
     instance: string,
-    owner: { subjectId: string; instanceIds?: string[] },
+    owner: { subjectId: string; instanceIds?: string[]; sourceId?: string },
   ): boolean {
     return scopedOwnedInstances(owner).includes(instance);
   }
@@ -148,10 +157,8 @@ export function pdppInstanceBindingRoutes(
     ) {
       return errorResponse("invalid_request", "Reset fields are invalid", 400);
     }
-    // A reset may name a method that is not configured yet: the switch
-    // flow resets to B before it writes B to the config (design §4.5,
-    // step 2 before step 4). It may not name an empty or padded id, which
-    // would be stored under a name that does not match its configured method.
+    // Reject malformed method ids here. Registered connections also enforce
+    // their fixed method in the store; the reset route cannot switch them.
     if (
       typeof input.next_method === "string" &&
       (!input.next_method.trim() ||

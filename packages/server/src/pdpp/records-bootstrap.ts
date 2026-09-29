@@ -49,8 +49,10 @@ import {
   type RetainedDeclaration,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type { PdppAuthRouteDeps } from "../routes/pdpp-auth.js";
-import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
-import { singleInstanceInventory } from "./deployment.js";
+import {
+  createSqliteRecordStore,
+  PdppBindingError,
+} from "../storage/pdpp-records-sqlite-store.js";
 
 export interface PdppRecordsDeps {
   store: PdppRecordStore;
@@ -59,6 +61,8 @@ export interface PdppRecordsDeps {
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
   instancesForSubject?: (subjectId: string) => string[];
+  instancesForSource?: (subjectId: string, sourceId: string) => string[];
+  sourceIds: Set<string>;
   readBlobBytes?: (
     blobId: string,
   ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
@@ -89,31 +93,13 @@ export function createPdppRecordsDeps(
 
   const subjectId = options.serverOwner.toLowerCase();
 
-  // Every instance handle this deployment can produce, derived the same way
-  // the AS derives them at issuance, so an owner read and a grant-bound read
-  // agree about which instances exist. Each instance holds exactly one
-  // source's records, so its streams are validated against that source's
-  // declaration and no other.
+  // Declarations define stream shapes. The active connection registry defines
+  // which instances exist for each source.
   const sources: SourceStreamDeclarations[] = [];
   for (const snapshot of options.declarations) {
-    const instance = singleInstanceInventory(
-      subjectId,
-      snapshot.source_id,
-    ).eligibleFor("")[0];
-    const claimant = sources.find((s) => s.instance === instance);
-    if (claimant) {
-      // Two source ids that derive one instance would write one set of
-      // rows under two authorities. Keep the first and refuse the rest.
-      logger.warn(
-        {
-          sourceId: snapshot.source_id,
-          instance,
-          claimedBy: claimant.sourceId,
-        },
-        "PDPP declaration shares an instance with another source — its streams are not mounted",
-      );
-      continue;
-    }
+    const connector =
+      snapshot.source_id.split("/").filter(Boolean).pop() ?? snapshot.source_id;
+    const instance = `${connector}:${subjectId}`;
     sources.push({
       sourceId: snapshot.source_id,
       instance,
@@ -128,37 +114,138 @@ export function createPdppRecordsDeps(
     );
     return undefined;
   }
-  const instances = sources.map((source) => source.instance);
   const configuredMethods = new Map<string, string[]>();
   for (const configured of options.configuredMethods ?? []) {
     const source = sources.find(
       (candidate) => candidate.sourceId === configured.sourceId,
     );
     if (!source) continue;
-    const methodIds = configuredMethods.get(source.instance) ?? [];
+    const methodIds = configuredMethods.get(source.sourceId) ?? [];
     methodIds.push(configured.methodId);
-    configuredMethods.set(source.instance, methodIds);
+    configuredMethods.set(source.sourceId, methodIds);
   }
+
+  const store = createSqliteRecordStore(options.db);
+
+  // Register account 1 without changing its legacy id. Existing rows can only
+  // be attached when their stored method agrees with this boot's configuration.
+  for (const source of sources) {
+    const instance = source.instance;
+    if (!instance) continue;
+    const methods = configuredMethods.get(source.sourceId) ?? [];
+    if (methods.length !== 1) continue;
+    const method = methods[0];
+    if (!method) continue;
+    const binding = store.getInstanceBinding(instance);
+    if (
+      binding.deletedAt !== null ||
+      binding.method !== method ||
+      (binding.sourceId !== null && binding.sourceId !== source.sourceId)
+    ) {
+      logger.warn(
+        { sourceId: source.sourceId },
+        "PDPP account-one binding does not match this boot and was left unchanged",
+      );
+      continue;
+    }
+    try {
+      store.registerConnection({
+        instance,
+        sourceId: source.sourceId,
+        method,
+        label: "",
+      });
+    } catch (error) {
+      if (!(error instanceof PdppBindingError)) throw error;
+      if (
+        error.reason !== "connection_deleted" &&
+        error.reason !== "connection_conflict"
+      ) {
+        throw error;
+      }
+      logger.warn(
+        { sourceId: source.sourceId },
+        "PDPP account-one binding changed during startup and was left unchanged",
+      );
+    }
+  }
+  // Rebuild each registered connection's active-method view from the
+  // durable binding and this boot's source configuration. New connection
+  // ids survive a PS restart; keeping this map legacy-only would leave them
+  // registered but unable to write.
+  for (const source of sources) {
+    const methods = configuredMethods.get(source.sourceId) ?? [];
+    for (const connection of store.listConnections(source.sourceId)) {
+      if (connection.method && methods.includes(connection.method)) {
+        configuredMethods.set(connection.instance, [connection.method]);
+      }
+    }
+  }
+
+  const sourceRegistry = createSourceStreamDeclarationRegistry(sources);
+  const declarations: StreamDeclarationRegistry = {
+    get: (stream, sourceId) => sourceRegistry.get(stream, sourceId),
+    forInstance(instance, stream) {
+      // Resolve authority from the live connection registry on every read.
+      // A deleted or unregistered handle has no source declaration.
+      const sourceId = store.getInstanceBinding(instance).sourceId;
+      return sourceId ? sourceRegistry.get(stream, sourceId) : undefined;
+    },
+    declares: (stream) => sourceRegistry.declares(stream),
+    list: () => sourceRegistry.list(),
+  };
+
+  const connectionInventory = (sourceId: string) => ({
+    eligibleFor: () =>
+      store.listConnections(sourceId).map((connection) => connection.instance),
+  });
+  pdppAuth.inventoryFor = (subject, sourceId) =>
+    subject.toLowerCase() === subjectId &&
+    sources.some((source) => source.sourceId === sourceId)
+      ? connectionInventory(sourceId)
+      : { eligibleFor: () => [] };
+  pdppAuth.connectionState = (instance) => {
+    const binding = store.getInstanceBinding(instance);
+    return {
+      sourceId: binding.sourceId,
+      deleted: binding.deletedAt !== null,
+    };
+  };
 
   logger.info(
     { streams: streams.map((s) => s.name), resource: options.resource },
     "PDPP Resource Server mounted at /v1",
   );
 
-  const store = createSqliteRecordStore(options.db);
-
   return {
     store,
     bindingStore: store,
     configuredMethods,
     auth: coLocatedAuthorizationService(pdppAuth),
-    declarations: createSourceStreamDeclarationRegistry(sources),
+    declarations,
     // This deployment has exactly one owner. A subject other than that
     // owner (however it got an "owner"-kind token) owns none of these
     // instances — comparison normalized the same way subjectId is derived
     // above (lowercased address), so casing never causes a false mismatch.
     instancesForSubject: (subject) =>
-      subject.toLowerCase() === subjectId ? instances : [],
+      subject.toLowerCase() === subjectId
+        ? Array.from(
+            new Set(
+              sources.flatMap((source) =>
+                store
+                  .listConnections(source.sourceId)
+                  .map((connection) => connection.instance),
+              ),
+            ),
+          )
+        : [],
+    instancesForSource: (subject, sourceId) =>
+      subject.toLowerCase() === subjectId
+        ? store
+            .listConnections(sourceId)
+            .map((connection) => connection.instance)
+        : [],
+    sourceIds: new Set(sources.map((source) => source.sourceId)),
     // Real boot wiring for GET /v1/blobs/:blobId: reads the same store the
     // blob was ingested into, so this deployment can only ever serve bytes
     // it verifiably stored -- store.getBlobBytes re-verifies size/sha256
@@ -198,6 +285,7 @@ function coLocatedAuthorizationService(
         active: true as const,
         tokenKind: context.tokenKind ?? "client",
         subjectId: context.subjectId ?? "",
+        sourceId: context.sourceId,
         instanceIds: context.instanceIds,
         grant: context.grant as PdppPortGrant | undefined,
         clientId: context.clientId,
@@ -237,7 +325,6 @@ export function createPdppSyncImporter(options: {
   const { records, serverOwner, logger } = options;
   if (!records || !serverOwner) return undefined;
 
-  const subjectId = serverOwner.toLowerCase();
   const retained: RetainedDeclaration[] = [];
   for (const snapshot of options.declarations) {
     const document = options.documents.get(snapshot.source_id);
@@ -280,8 +367,12 @@ export function createPdppSyncImporter(options: {
   return createPdppImporter({
     store: records.store,
     declarations: retained,
-    instanceFor: (sourceId) =>
-      singleInstanceInventory(subjectId, sourceId).eligibleFor("")[0],
+    instanceFor: (sourceId) => {
+      const connections = records.bindingStore.listConnections(sourceId);
+      if (connections.length === 1) return connections[0].instance;
+      if (connections.length > 1) return undefined;
+      return undefined;
+    },
     logger,
   });
 }

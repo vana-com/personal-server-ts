@@ -27,7 +27,7 @@ import { computeS256Challenge } from "@opendatalabs/personal-server-ts-core/pdpp
 import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { createServer, type ServerContext } from "../bootstrap.js";
 import { initializeDatabase } from "../storage/index-schema.js";
-import { singleInstanceInventory } from "./deployment.js";
+import { registerTestConnection } from "./test-connections.js";
 
 /**
  * The signature the existing bootstrap suite uses; `recoverServerOwner`
@@ -57,13 +57,7 @@ const DECLARATION = JSON.stringify({
 });
 
 async function ownerTokenRequestBody(sourceId = SOURCE_ID) {
-  return {
-    source_id: sourceId,
-    instance_id: singleInstanceInventory(
-      (await recoverServerOwner(KNOWN_SIG)).toLowerCase(),
-      sourceId,
-    ).eligibleFor("")[0],
-  };
+  return { source_id: sourceId };
 }
 
 let tempDir: string;
@@ -227,17 +221,12 @@ describe("the real OAuth grant flow on a bootstrapped server", () => {
    * in the test below.
    */
   async function ownerToken(context: ServerContext): Promise<string> {
-    const response = await context.app.request("/pdpp/v1/owner/token", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${context.devToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(await ownerTokenRequestBody()),
-    });
-    expect(response.status).toBe(200);
-    const body = (await response.json()) as { access_token: string };
-    return body.access_token;
+    return registerTestConnection(
+      context.app,
+      context.devToken,
+      await recoverServerOwner(KNOWN_SIG),
+      SOURCE_ID,
+    );
   }
 
   beforeEach(async () => {
@@ -621,21 +610,17 @@ describe("redirect_uri is validated on the bootstrapped server", () => {
     redirectUri: string,
     clientId = "music_recommendations",
   ) {
-    const minted = (await (
-      await ctx!.app.request("/pdpp/v1/owner/token", {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${ctx!.devToken}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(await ownerTokenRequestBody()),
-      })
-    ).json()) as { access_token: string };
+    const token = await registerTestConnection(
+      ctx!.app,
+      ctx!.devToken,
+      await recoverServerOwner(KNOWN_SIG),
+      SOURCE_ID,
+    );
     return ctx!.app.request("/pdpp/v1/authorize", {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        authorization: `Bearer ${minted.access_token}`,
+        authorization: `Bearer ${token}`,
       },
       body: JSON.stringify({
         client_id: clientId,
@@ -725,22 +710,18 @@ describe("review C5 — /authorize binds an authenticated owner", () => {
   });
 
   it("opens a session for the authenticated owner and binds their subject", async () => {
-    const minted = (await (
-      await ctx!.app.request("/pdpp/v1/owner/token", {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${ctx!.devToken}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(await ownerTokenRequestBody()),
-      })
-    ).json()) as { access_token: string };
+    const token = await registerTestConnection(
+      ctx!.app,
+      ctx!.devToken,
+      await recoverServerOwner(KNOWN_SIG),
+      SOURCE_ID,
+    );
 
     const response = await ctx!.app.request("/pdpp/v1/authorize", {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        authorization: `Bearer ${minted.access_token}`,
+        authorization: `Bearer ${token}`,
       },
       body: JSON.stringify(authorizeBody()),
     });
@@ -750,7 +731,7 @@ describe("review C5 — /authorize binds an authenticated owner", () => {
     const { session_id } = (await response.json()) as { session_id: string };
     const reviewed = await ctx!.app.request(
       `/pdpp/v1/authorize/${session_id}/review`,
-      { headers: { authorization: `Bearer ${minted.access_token}` } },
+      { headers: { authorization: `Bearer ${token}` } },
     );
     expect(reviewed.status).toBe(200);
   });
@@ -861,20 +842,13 @@ describe("the real boot path mounts the AS for a normative declaration", () => {
     await seedScope("instagram.profile");
     ctx = await boot(pdppConfig([await writeNormativeDeclaration()]));
 
-    const minted = await ctx.app.request("/pdpp/v1/owner/token", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${ctx.devToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(
-        await ownerTokenRequestBody(
-          "https://registry.pdpp.dev/connectors/instagram",
-        ),
-      ),
-    });
-    expect(minted.status).toBe(200);
-    const { access_token } = (await minted.json()) as { access_token: string };
+    const access_token = await registerTestConnection(
+      ctx.app,
+      ctx.devToken,
+      await recoverServerOwner(KNOWN_SIG),
+      "https://registry.pdpp.dev/connectors/instagram",
+      "spotify",
+    );
 
     const authorized = await ctx.app.request("/pdpp/v1/authorize", {
       method: "POST",
@@ -961,17 +935,12 @@ describe("operator per-client grant lifetime policy", () => {
   });
 
   async function ownerToken(context: ServerContext): Promise<string> {
-    const response = await context.app.request("/pdpp/v1/owner/token", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${context.devToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(await ownerTokenRequestBody()),
-    });
-    expect(response.status).toBe(200);
-    const body = (await response.json()) as { access_token: string };
-    return body.access_token;
+    return registerTestConnection(
+      context.app,
+      context.devToken,
+      await recoverServerOwner(KNOWN_SIG),
+      SOURCE_ID,
+    );
   }
 
   /**
