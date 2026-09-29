@@ -120,6 +120,30 @@ describe("pdpp.clients[].grantLifetimeSeconds", () => {
   });
 });
 
+describe("pdpp.connectionMethods", () => {
+  it("parses source and method entries without record declarations", () => {
+    const config = ServerConfigSchema.parse({
+      pdpp: {
+        connectionMethods: [
+          {
+            source_id: "https://registry.pdpp.dev/sources/oura",
+            method_id: "oura",
+          },
+        ],
+      },
+    });
+
+    expect(config.pdpp.declarationPaths).toEqual([]);
+    expect(config.pdpp.methods).toEqual([]);
+    expect(config.pdpp.connectionMethods).toEqual([
+      {
+        source_id: "https://registry.pdpp.dev/sources/oura",
+        method_id: "oura",
+      },
+    ]);
+  });
+});
+
 describe("withCurrentInferenceModel", () => {
   it("moves a superseded default forward", () => {
     const stored = ServerConfigSchema.parse({

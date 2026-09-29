@@ -86,6 +86,10 @@ export const DEFAULTS = {
     // At most one acquisition method may write each retained source. The
     // declaration path ties an artifact method id to the source it produces.
     methods: [] as Array<{ method_id: string; declaration_path: string }>,
+    // Per-source connection methods are independent of canonical record
+    // declarations. They let Desktop manage account handles while canonical
+    // writers remain disabled for sources absent from declarationPaths.
+    connectionMethods: [] as Array<{ source_id: string; method_id: string }>,
     // Require PKCE (RFC 7636, S256) on the authorization-code flow. PDPP
     // clients are public clients; without a verifier an intercepted code is
     // redeemable by whoever intercepted it.
@@ -269,6 +273,14 @@ export const ServerConfigSchema = z.object({
           }),
         )
         .default(DEFAULTS.pdpp.methods),
+      connectionMethods: z
+        .array(
+          z.object({
+            source_id: z.string().url(),
+            method_id: z.string().min(1),
+          }),
+        )
+        .default(DEFAULTS.pdpp.connectionMethods),
       requirePkce: z.boolean().default(DEFAULTS.pdpp.requirePkce),
       clients: z
         .array(

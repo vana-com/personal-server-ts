@@ -6,7 +6,7 @@ import {
 } from "../storage/pdpp-records-sqlite-store.js";
 import { resolveRetainedSourceId } from "../pdpp/source-id-compat.js";
 
-interface PdppConnectionStore {
+export interface PdppConnectionStore {
   listConnections(sourceId: string): PdppInstanceBinding[];
   getInstanceBinding(instance: string): PdppInstanceBinding;
   registerConnection(input: {
@@ -23,8 +23,11 @@ export interface PdppConnectionRouteDeps {
   auth: PdppAuthorizationService;
   ownerSubjectId: string;
   /** Known method ids keyed by source id. */
+  connectionMethods: Map<string, string[]>;
+  /** Active per-instance writer methods for canonical-enabled sources. */
   configuredMethods: Map<string, string[]>;
-  /** Retained source ids this server can serve. */
+  canonicalSourceIds: Set<string>;
+  /** Source ids in the connection registry. */
   sourceIds: Set<string>;
 }
 
@@ -152,7 +155,7 @@ export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
         400,
       );
     }
-    const configured = deps.configuredMethods.get(sourceId) ?? [];
+    const configured = deps.connectionMethods.get(sourceId) ?? [];
     if (configured.length !== 1 || configured[0] !== input.method_id) {
       return jsonError(
         "method_inactive",
@@ -167,7 +170,9 @@ export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
         method: input.method_id,
         label: input.label,
       });
-      deps.configuredMethods.set(connectionId, [input.method_id]);
+      if (deps.canonicalSourceIds.has(sourceId)) {
+        deps.configuredMethods.set(connectionId, [input.method_id]);
+      }
       return c.json(connectionJson(binding), 200);
     } catch (error) {
       if (error instanceof PdppBindingError) {

@@ -58,6 +58,8 @@ export interface PdppRecordsDeps {
   store: PdppRecordStore;
   bindingStore: ReturnType<typeof createSqliteRecordStore>;
   configuredMethods: Map<string, string[]>;
+  connectionMethods: Map<string, string[]>;
+  canonicalSourceIds: Set<string>;
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
   instancesForSubject?: (subjectId: string) => string[];
@@ -81,6 +83,7 @@ export interface CreatePdppRecordsDepsOptions {
   resource: string;
   logger: Logger;
   configuredMethods?: { sourceId: string; methodId: string }[];
+  connectionMethods?: Map<string, string[]>;
 }
 
 export function createPdppRecordsDeps(
@@ -123,6 +126,12 @@ export function createPdppRecordsDeps(
     const methodIds = configuredMethods.get(source.sourceId) ?? [];
     methodIds.push(configured.methodId);
     configuredMethods.set(source.sourceId, methodIds);
+  }
+  const connectionMethods = new Map(options.connectionMethods ?? []);
+  for (const [sourceId, methodIds] of configuredMethods) {
+    if (!connectionMethods.has(sourceId)) {
+      connectionMethods.set(sourceId, [...methodIds]);
+    }
   }
 
   const store = createSqliteRecordStore(options.db);
@@ -227,6 +236,12 @@ export function createPdppRecordsDeps(
     store,
     bindingStore: store,
     configuredMethods,
+    connectionMethods,
+    // Retained declaration bytes may outlive the active canonical writer
+    // configuration. A connection method alone must never enable writers.
+    canonicalSourceIds: new Set(
+      (options.configuredMethods ?? []).map((method) => method.sourceId),
+    ),
     auth: coLocatedAuthorizationService(pdppAuth),
     declarations,
     // This deployment has exactly one owner. A subject other than that
@@ -251,7 +266,10 @@ export function createPdppRecordsDeps(
             .listConnections(sourceId)
             .map((connection) => connection.instance)
         : [],
-    sourceIds: new Set(sources.map((source) => source.sourceId)),
+    sourceIds: new Set([
+      ...sources.map((source) => source.sourceId),
+      ...connectionMethods.keys(),
+    ]),
     // Real boot wiring for GET /v1/blobs/:blobId: reads the same store the
     // blob was ingested into, so this deployment can only ever serve bytes
     // it verifiably stored -- store.getBlobBytes re-verifies size/sha256
@@ -273,7 +291,7 @@ export function createPdppRecordsDeps(
  * casting: an inactive result must never yield an undefined subject that
  * flows onward into an authorization decision.
  */
-function coLocatedAuthorizationService(
+export function coLocatedAuthorizationService(
   pdppAuth: PdppAuthRouteDeps,
 ): PdppAuthorizationService {
   return {

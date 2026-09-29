@@ -527,7 +527,12 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         : undefined);
     const resolvedSourceId = declaration?.source_id ?? connectionSourceId;
     if (!resolvedSourceId) {
-      return errorResponse(c, 404, "not_found", "source declaration not found");
+      return errorResponse(
+        c,
+        404,
+        "not_found",
+        "source is not enabled on this server",
+      );
     }
     const issued = deps.tokens.issueOwnerToken({
       subjectId,
