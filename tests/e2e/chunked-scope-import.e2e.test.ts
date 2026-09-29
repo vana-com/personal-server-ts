@@ -5,11 +5,14 @@ import { mkdir, open, rm, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildDataFilePath } from "../../packages/core/src/storage/hierarchy/index.js";
+import { startChildTestServer } from "./helpers/child-server.js";
 import { startTestServer, type TestServer } from "./helpers/server.js";
 
 const CHUNK_BYTES = 8 * 1024 * 1024;
 const DATA_BYTES = 170 * 1024 * 1024;
 const SERVER_DIR = resolve(process.cwd(), ".scratch", "chunked-scope-import");
+const OWNER_SIGNATURE =
+  "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
 
 async function digestFile(path: string): Promise<string> {
   const hash = createHash("sha256");
@@ -57,7 +60,7 @@ async function writeChatGptScope(path: string): Promise<string> {
 }
 
 async function beginImport(
-  server: TestServer,
+  server: Pick<TestServer, "url" | "devToken">,
   scope: string,
   body: { totalBytes: number; totalChunks: number; sha256: string },
 ) {
@@ -73,7 +76,7 @@ async function beginImport(
 }
 
 async function putChunk(
-  server: TestServer,
+  server: Pick<TestServer, "url" | "devToken">,
   scope: string,
   id: string,
   index: number,
@@ -99,8 +102,7 @@ async function putChunk(
 
 async function openServer(): Promise<TestServer> {
   return startTestServer({
-    masterKeySignature:
-      "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b",
+    masterKeySignature: OWNER_SIGNATURE,
     serverDir: SERVER_DIR,
   });
 }
@@ -108,43 +110,50 @@ async function openServer(): Promise<TestServer> {
 describe("legacy chunked scope import (real server)", () => {
   it("keeps the committed scope readable across restart during an incomplete import", async () => {
     await rm(SERVER_DIR, { recursive: true, force: true });
-    let server = await openServer();
-    const oldBody = JSON.stringify({
-      conversations: [{ id: "old", title: "committed" }],
+    const server = await startChildTestServer({
+      rootPath: SERVER_DIR,
+      ownerSignature: OWNER_SIGNATURE,
     });
-    const oldWrite = await fetch(`${server.url}/v1/data/chatgpt.scope`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${server.devToken}`,
-        "Content-Type": "application/json",
-      },
-      body: oldBody,
-    });
-    expect(oldWrite.status).toBe(201);
-
-    const pendingBytes = Buffer.from('{"conversations":[{"id":"new"}]}');
-    const pending = await beginImport(server, "chatgpt.scope", {
-      totalBytes: pendingBytes.length + 1,
-      totalChunks: 1,
-      sha256: createHash("sha256")
-        .update(Buffer.concat([pendingBytes, Buffer.from(" ")]))
-        .digest("hex"),
-    });
-    const id = pending.body.importId as string;
-    const chunk = await putChunk(
-      server,
-      "chatgpt.scope",
-      id,
-      0,
-      Buffer.concat([pendingBytes, Buffer.from(" ")]),
-    );
-    expect(chunk.status).toBe(200);
-    await server.cleanup();
-
-    server = await openServer();
+    let restarted: Awaited<ReturnType<typeof startChildTestServer>> | undefined;
     try {
-      const read = await fetch(`${server.url}/v1/data/chatgpt.scope`, {
-        headers: { Authorization: `Bearer ${server.devToken}` },
+      const oldBody = JSON.stringify({
+        conversations: [{ id: "old", title: "committed" }],
+      });
+      const oldWrite = await fetch(`${server.url}/v1/data/chatgpt.scope`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${server.devToken}`,
+          "Content-Type": "application/json",
+        },
+        body: oldBody,
+      });
+      expect(oldWrite.status).toBe(201);
+
+      const pendingBytes = Buffer.from('{"conversations":[{"id":"new"}]}');
+      const pending = await beginImport(server, "chatgpt.scope", {
+        totalBytes: pendingBytes.length + 1,
+        totalChunks: 1,
+        sha256: createHash("sha256")
+          .update(Buffer.concat([pendingBytes, Buffer.from(" ")]))
+          .digest("hex"),
+      });
+      const id = pending.body.importId as string;
+      const chunk = await putChunk(
+        server,
+        "chatgpt.scope",
+        id,
+        0,
+        Buffer.concat([pendingBytes, Buffer.from(" ")]),
+      );
+      expect(chunk.status).toBe(200);
+      await server.kill();
+
+      restarted = await startChildTestServer({
+        rootPath: SERVER_DIR,
+        ownerSignature: OWNER_SIGNATURE,
+      });
+      const read = await fetch(`${restarted.url}/v1/data/chatgpt.scope`, {
+        headers: { Authorization: `Bearer ${restarted.devToken}` },
       });
       expect(read.status).toBe(200);
       const envelope = await read.json();
@@ -152,7 +161,8 @@ describe("legacy chunked scope import (real server)", () => {
         conversations: [{ id: "old", title: "committed" }],
       });
     } finally {
-      await server.cleanup();
+      await server.stop();
+      await restarted?.stop();
       await rm(SERVER_DIR, { recursive: true, force: true });
     }
   }, 60_000);
