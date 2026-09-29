@@ -75,6 +75,7 @@ import {
 import { createWeb3AuthMiddleware } from "../middleware/web3-auth.js";
 import { createOwnerCheckMiddleware } from "../middleware/owner-check.js";
 import type { TokenStore } from "../token-store.js";
+import { canonicalSourceIdCandidate } from "../pdpp/source-id-compat.js";
 
 /** No-store on everything: tokens, codes, and review models are all sensitive. */
 const NO_STORE = {
@@ -513,13 +514,16 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         "owner token exchange accepts source_id and an optional instance_id",
       );
     }
-    const declaration = deps.resolveDeclaration(sourceId);
+    const canonicalCandidate = canonicalSourceIdCandidate(sourceId);
+    const declaration =
+      deps.resolveDeclaration(sourceId) ??
+      (canonicalCandidate ? deps.resolveDeclaration(canonicalCandidate) : null);
     if (!declaration) {
       return errorResponse(c, 404, "not_found", "source declaration not found");
     }
     const issued = deps.tokens.issueOwnerToken({
       subjectId,
-      sourceId,
+      sourceId: declaration.source_id,
       ttlSeconds: OWNER_TOKEN_TTL_SECONDS,
     });
     deps.logger.info(
