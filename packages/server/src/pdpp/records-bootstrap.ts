@@ -127,8 +127,8 @@ export function createPdppRecordsDeps(
 
   const store = createSqliteRecordStore(options.db);
 
-  // Register account 1 without changing its legacy id. Existing rows can only
-  // be attached when their stored method agrees with this boot's configuration.
+  // Register account 1 only for an empty source registry. Never add a legacy
+  // fallback beside a connection that the owner already registered.
   for (const source of sources) {
     const instance = source.instance;
     if (!instance) continue;
@@ -136,6 +136,7 @@ export function createPdppRecordsDeps(
     if (methods.length !== 1) continue;
     const method = methods[0];
     if (!method) continue;
+    if (store.listConnections(source.sourceId).length > 0) continue;
     const binding = store.getInstanceBinding(instance);
     if (
       binding.deletedAt !== null ||

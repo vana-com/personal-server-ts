@@ -11,8 +11,10 @@ import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
+import Database from "better-sqlite3";
 import { createServer, type ServerContext } from "./bootstrap.js";
 import { initializeDatabase } from "./storage/index-schema.js";
+import { createSqliteRecordStore } from "./storage/pdpp-records-sqlite-store.js";
 
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
@@ -65,6 +67,20 @@ async function boot() {
   );
 }
 
+function seedRegisteredConnection() {
+  const db = new Database(join(tempDir, "index.db"));
+  try {
+    createSqliteRecordStore(db).registerConnection({
+      instance: "conn_123e4567-e89b-42d3-a456-426614174000",
+      sourceId: SOURCE_ID,
+      method: "claude",
+      label: "Existing account",
+    });
+  } finally {
+    db.close();
+  }
+}
+
 async function mintOwnerToken(sourceId: string): Promise<Response> {
   return ctx!.app.request("/pdpp/v1/owner/token", {
     method: "POST",
@@ -82,7 +98,6 @@ beforeEach(async () => {
   owner = (await recoverServerOwner(KNOWN_SIG)).toLowerCase();
   legacyId = `claude:${owner}`;
   seedScope();
-  ctx = await boot();
 });
 
 afterEach(async () => {
@@ -94,6 +109,7 @@ afterEach(async () => {
 
 describe("Desktop multi-account compatibility on a real Personal Server", () => {
   it("lets a new Claude owner read account one's binding without fixture registration", async () => {
+    ctx = await boot();
     const tokenResponse = await mintOwnerToken(SOURCE_ID);
     expect(tokenResponse.status).toBe(200);
     const { access_token: token } = (await tokenResponse.json()) as {
@@ -113,6 +129,7 @@ describe("Desktop multi-account compatibility on a real Personal Server", () => 
   });
 
   it("accepts Desktop's source URI and public id while returning a refresh-matchable row", async () => {
+    ctx = await boot();
     const tokenResponse = await mintOwnerToken(DESKTOP_SOURCE_URI);
     expect(tokenResponse.status).toBe(200);
     const { access_token: token } = (await tokenResponse.json()) as {
@@ -164,9 +181,50 @@ describe("Desktop multi-account compatibility on a real Personal Server", () => 
   });
 
   it("does not mint source authority for aliases without a retained declaration", async () => {
+    ctx = await boot();
     const response = await mintOwnerToken(
       "https://registry.pdpp.dev/connectors/oura",
     );
     expect(response.status).toBe(404);
+  });
+
+  it("does not add account one when a connection is already registered", async () => {
+    seedRegisteredConnection();
+    ctx = await boot();
+
+    const tokenResponse = await mintOwnerToken(SOURCE_ID);
+    expect(tokenResponse.status).toBe(200);
+    const { access_token: token } = (await tokenResponse.json()) as {
+      access_token: string;
+    };
+    const listed = await ctx!.app.request(
+      `/pdpp/connections?source_id=${PUBLIC_SOURCE_ID}`,
+      { headers: { authorization: `Bearer ${token}` } },
+    );
+    expect(listed.status).toBe(200);
+    const body = (await listed.json()) as {
+      connections: Array<{ connection_id: string }>;
+    };
+    expect(
+      body.connections.map((connection) => connection.connection_id),
+    ).toEqual(["conn_123e4567-e89b-42d3-a456-426614174000"]);
+
+    const db = new Database(join(tempDir, "index.db"), { readonly: true });
+    try {
+      const row = db
+        .prepare(
+          "SELECT COUNT(*) AS n FROM pdpp_instance_binding WHERE instance = ?",
+        )
+        .get(legacyId) as { n: number };
+      expect(row.n).toBe(0);
+    } finally {
+      db.close();
+    }
+
+    const phantomBinding = await ctx!.app.request(
+      `/pdpp/instances/${encodeURIComponent(legacyId)}/binding`,
+      { headers: { authorization: `Bearer ${token}` } },
+    );
+    expect(phantomBinding.status).toBe(401);
   });
 });
