@@ -28,6 +28,7 @@ const openingScopes = new Set<string>();
 let beginReservationActive = false;
 const activeChunkIndexes = new Set<string>();
 const finalizingImports = new Set<string>();
+const abortingImports = new Set<string>();
 let activeChunkWrites = 0;
 
 type Frame = { kind: "object" | "array"; state: string };
@@ -353,6 +354,7 @@ function receiptPath(
 async function loadMetadata(
   deps: ScopeImportDeps,
   id: string,
+  allowExpired = false,
 ): Promise<ImportMetadata> {
   if (!/^[0-9a-f-]{36}$/i.test(id)) {
     throw new ScopeImportError(404, "IMPORT_NOT_FOUND", "Import not found");
@@ -361,7 +363,10 @@ async function loadMetadata(
     const metadata = JSON.parse(
       await readFile(join(importPath(deps, id), "metadata.json"), "utf8"),
     ) as ImportMetadata;
-    if (Date.now() - metadata.createdAt > SCOPE_IMPORT_TTL_MS) {
+    if (
+      !allowExpired &&
+      Date.now() - metadata.createdAt > SCOPE_IMPORT_TTL_MS
+    ) {
       throw new ScopeImportError(410, "IMPORT_EXPIRED", "Import has expired");
     }
     return metadata;
@@ -416,6 +421,22 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
+async function removeImportArtifacts(
+  deps: Pick<ScopeImportDeps, "hierarchyOptions" | "indexManager">,
+  metadata: ImportMetadata,
+): Promise<void> {
+  const finalPath = buildDataFilePath(
+    deps.hierarchyOptions.dataDir,
+    metadata.scope,
+    metadata.collectedAt,
+  );
+  await unlink(`${finalPath}.pending.${metadata.id}`).catch(() => undefined);
+  const relativePath = relative(deps.hierarchyOptions.dataDir, finalPath);
+  if (!deps.indexManager.findByPath(relativePath)) {
+    await unlink(finalPath).catch(() => undefined);
+  }
+}
+
 export async function cleanupExpiredScopeImports(
   deps: Pick<ScopeImportDeps, "hierarchyOptions" | "indexManager">,
   now = Date.now(),
@@ -431,15 +452,7 @@ export async function cleanupExpiredScopeImports(
         await readFile(join(directory, "metadata.json"), "utf8"),
       ) as ImportMetadata;
       if (now - metadata.createdAt > SCOPE_IMPORT_TTL_MS) {
-        const dataPath = buildDataFilePath(
-          deps.hierarchyOptions.dataDir,
-          metadata.scope,
-          metadata.collectedAt,
-        );
-        const relativePath = relative(deps.hierarchyOptions.dataDir, dataPath);
-        if (!deps.indexManager.findByPath(relativePath)) {
-          await unlink(dataPath).catch(() => undefined);
-        }
+        await removeImportArtifacts(deps, metadata);
         await rm(directory, { recursive: true, force: true });
         continue;
       }
@@ -531,16 +544,8 @@ export async function beginScopeImport(
         "Import size, chunk count, or SHA-256 is invalid",
       );
     }
-    if (
-      (await readdir(join(importsDir(deps), "receipts"))).length >=
-      MAX_DURABLE_RECEIPTS
-    ) {
-      throw new ScopeImportError(
-        429,
-        "RECEIPT_CAPACITY",
-        "Import receipt storage is full",
-      );
-    }
+    const receiptCount = (await readdir(join(importsDir(deps), "receipts")))
+      .length;
     const active = (
       await readdir(importsDir(deps), { withFileTypes: true })
     ).filter((item) => item.isDirectory() && item.name !== "receipts");
@@ -559,6 +564,13 @@ export async function beginScopeImport(
       } catch {
         // Invalid entries are removed by cleanup on the next request.
       }
+    }
+    if (receiptCount + active.length >= MAX_DURABLE_RECEIPTS) {
+      throw new ScopeImportError(
+        429,
+        "RECEIPT_CAPACITY",
+        "Import receipt storage is full",
+      );
     }
     if (
       activeForScope ||
@@ -646,6 +658,13 @@ export async function putScopeImportChunk(
   index: number,
 ): Promise<{ accepted: true; index: number; bytes: number; sha256: string }> {
   await deps.authorizeOwner(request, scope);
+  if (abortingImports.has(id)) {
+    throw new ScopeImportError(
+      409,
+      "IMPORT_ABORTING",
+      "Import is being aborted",
+    );
+  }
   const metadata = await loadMetadata(deps, id);
   if (
     metadata.owner !== deps.serverOwner?.toLowerCase() ||
@@ -672,6 +691,13 @@ export async function putScopeImportChunk(
       415,
       "INVALID_CHUNK_TYPE",
       "Chunk must use application/octet-stream",
+    );
+  }
+  if (abortingImports.has(id)) {
+    throw new ScopeImportError(
+      409,
+      "IMPORT_ABORTING",
+      "Import is being aborted",
     );
   }
   const chunkKey = `${id}:${index}`;
@@ -764,6 +790,13 @@ export async function finalizeScopeImport(
   id: string,
 ): Promise<Record<string, unknown>> {
   await deps.authorizeOwner(request, scope);
+  if (abortingImports.has(id)) {
+    throw new ScopeImportError(
+      409,
+      "IMPORT_ABORTING",
+      "Import is being aborted",
+    );
+  }
   if (finalizingImports.has(id)) {
     throw new ScopeImportError(
       409,
@@ -779,6 +812,103 @@ export async function finalizeScopeImport(
   }
 }
 
+export async function abortScopeImport(
+  deps: ScopeImportDeps,
+  request: Request,
+  scope: string,
+  id: string,
+): Promise<Record<string, unknown>> {
+  await deps.authorizeOwner(request, scope);
+  if (finalizingImports.has(id)) {
+    throw new ScopeImportError(
+      409,
+      "IMPORT_FINALIZING",
+      "Import is already being finalized",
+    );
+  }
+  if (abortingImports.has(id)) {
+    throw new ScopeImportError(
+      409,
+      "IMPORT_ABORTING",
+      "Import is already being aborted",
+    );
+  }
+  abortingImports.add(id);
+  try {
+    if ([...activeChunkIndexes].some((key) => key.startsWith(`${id}:`))) {
+      throw new ScopeImportError(
+        409,
+        "CHUNK_IN_PROGRESS",
+        "A chunk for this import is still being uploaded",
+      );
+    }
+    const receiptFile = receiptPath(deps, id);
+    let prior: Record<string, unknown> | undefined;
+    try {
+      prior = JSON.parse(await readFile(receiptFile, "utf8")) as Record<
+        string,
+        unknown
+      >;
+    } catch {
+      // No terminal receipt exists yet.
+    }
+    if (prior) {
+      if (
+        prior.owner !== deps.serverOwner?.toLowerCase() ||
+        prior.scope !== scope
+      ) {
+        throw new ScopeImportError(404, "IMPORT_NOT_FOUND", "Import not found");
+      }
+      if (prior.status !== "aborted") {
+        throw new ScopeImportError(
+          409,
+          "IMPORT_FINALIZED",
+          "A finalized import cannot be aborted",
+        );
+      }
+      try {
+        const metadata = await loadMetadata(deps, id, true);
+        if (metadata.owner === prior.owner && metadata.scope === prior.scope) {
+          await removeImportArtifacts(deps, metadata);
+          await rm(importPath(deps, id), { recursive: true, force: true });
+        }
+      } catch (error) {
+        if (!(error instanceof ScopeImportError) || error.status !== 404) {
+          throw error;
+        }
+      }
+      return prior;
+    }
+
+    const metadata = await loadMetadata(deps, id, true);
+    if (
+      metadata.owner !== deps.serverOwner?.toLowerCase() ||
+      metadata.scope !== scope
+    ) {
+      throw new ScopeImportError(404, "IMPORT_NOT_FOUND", "Import not found");
+    }
+    const abortedAt = new Date().toISOString();
+    const receipt = {
+      importId: id,
+      owner: metadata.owner,
+      scope,
+      status: "aborted",
+      abortedAt,
+      completedAt: abortedAt,
+    };
+    await writeAtomic(
+      `${receiptFile}.${randomUUID()}.tmp`,
+      receiptFile,
+      Buffer.from(JSON.stringify(receipt)),
+    );
+    await removeImportArtifacts(deps, metadata);
+    await rm(importPath(deps, id), { recursive: true, force: true });
+    return receipt;
+  } finally {
+    abortingImports.delete(id);
+  }
+}
+
 async function finalizeScopeImportAuthorized(
   deps: ScopeImportDeps,
   scope: string,
@@ -791,9 +921,14 @@ async function finalizeScopeImportAuthorized(
     if (
       prior.scope === scope &&
       prior.owner === deps.serverOwner?.toLowerCase()
-    )
+    ) {
+      if (prior.status === "aborted") {
+        throw new ScopeImportError(410, "IMPORT_ABORTED", "Import was aborted");
+      }
       return prior;
-  } catch {
+    }
+  } catch (error) {
+    if (error instanceof ScopeImportError) throw error;
     // No prior receipt.
   }
   const metadata = await loadMetadata(deps, id);
@@ -950,90 +1085,95 @@ async function finalizeScopeImportAuthorized(
     await file.close();
   }
 
-  const sizeBytes = (await stat(stagePath)).size;
-  const afterTombstoneVersion =
-    (await deps.afterTombstoneVersion?.(scope)) ?? null;
-  const latestAtCommit = deps.indexManager.findLatestByScope(scope);
-  if (
-    latestAtCommit &&
-    Date.parse(latestAtCommit.collectedAt) >= Date.parse(metadata.collectedAt)
-  ) {
-    await unlink(stagePath).catch(() => undefined);
-    metadata.collectedAt = new Date(
-      Date.parse(latestAtCommit.collectedAt) + 1,
-    ).toISOString();
-    await saveMetadata(deps, metadata);
-    throw new ScopeImportError(
-      409,
-      "SCOPE_CHANGED",
-      "Scope changed while the import was in progress; retry finalize",
-    );
-  }
-  // Publish the complete, fsynced envelope before swapping the SQLite index.
-  // Readers continue to resolve the old entry until the new file is ready.
-  await publishStagedDataFile(stagePath, finalPath);
-  let indexed: ReturnType<typeof deps.indexManager.insertIfCurrent>;
   try {
-    indexed = deps.indexManager.insertIfCurrent(
-      {
-        fileId: null,
-        schemaId: null,
-        path: relativePath,
-        scope,
-        collectedAt: metadata.collectedAt,
-        sizeBytes,
-        dataPointId: null,
-        afterTombstoneVersion,
-        producer: null,
-        producerProvenance: null,
-      },
-      latestAtCommit
-        ? {
-            kind: "match",
-            version: latestAtCommit.casRevision ?? latestAtCommit.version,
-          }
-        : { kind: "none" },
-    );
-  } catch (error) {
-    // The synchronous index API can throw. Keep the data file only if the
-    // transaction committed before the error became observable.
-    if (!deps.indexManager.findByPath(relativePath)) {
-      await unlink(finalPath).catch(() => undefined);
-    }
-    throw error;
-  }
-  if (!indexed.ok) {
-    await unlink(finalPath).catch(() => undefined);
-    const latest = deps.indexManager.findLatestByScope(scope);
-    if (latest) {
+    const sizeBytes = (await stat(stagePath)).size;
+    const afterTombstoneVersion =
+      (await deps.afterTombstoneVersion?.(scope)) ?? null;
+    const latestAtCommit = deps.indexManager.findLatestByScope(scope);
+    if (
+      latestAtCommit &&
+      Date.parse(latestAtCommit.collectedAt) >= Date.parse(metadata.collectedAt)
+    ) {
+      await unlink(stagePath).catch(() => undefined);
       metadata.collectedAt = new Date(
-        Date.parse(latest.collectedAt) + 1,
+        Date.parse(latestAtCommit.collectedAt) + 1,
       ).toISOString();
       await saveMetadata(deps, metadata);
+      throw new ScopeImportError(
+        409,
+        "SCOPE_CHANGED",
+        "Scope changed while the import was in progress; retry finalize",
+      );
     }
-    throw new ScopeImportError(
-      409,
-      "SCOPE_CHANGED",
-      "Scope changed while the import was in progress",
+    // Publish the complete, fsynced envelope before swapping the SQLite index.
+    // Readers continue to resolve the old entry until the new file is ready.
+    await publishStagedDataFile(stagePath, finalPath);
+    let indexed: ReturnType<typeof deps.indexManager.insertIfCurrent>;
+    try {
+      indexed = deps.indexManager.insertIfCurrent(
+        {
+          fileId: null,
+          schemaId: null,
+          path: relativePath,
+          scope,
+          collectedAt: metadata.collectedAt,
+          sizeBytes,
+          dataPointId: null,
+          afterTombstoneVersion,
+          producer: null,
+          producerProvenance: null,
+        },
+        latestAtCommit
+          ? {
+              kind: "match",
+              version: latestAtCommit.casRevision ?? latestAtCommit.version,
+            }
+          : { kind: "none" },
+      );
+    } catch (error) {
+      // The synchronous index API can throw. Keep the data file only if the
+      // transaction committed before the error became observable.
+      if (!deps.indexManager.findByPath(relativePath)) {
+        await unlink(finalPath).catch(() => undefined);
+      }
+      throw error;
+    }
+    if (!indexed.ok) {
+      await unlink(finalPath).catch(() => undefined);
+      const latest = deps.indexManager.findLatestByScope(scope);
+      if (latest) {
+        metadata.collectedAt = new Date(
+          Date.parse(latest.collectedAt) + 1,
+        ).toISOString();
+        await saveMetadata(deps, metadata);
+      }
+      throw new ScopeImportError(
+        409,
+        "SCOPE_CHANGED",
+        "Scope changed while the import was in progress",
+      );
+    }
+    const receipt = {
+      importId: id,
+      owner: metadata.owner,
+      scope,
+      sha256: metadata.sha256,
+      totalBytes: metadata.totalBytes,
+      collectedAt: metadata.collectedAt,
+      completedAt: new Date().toISOString(),
+    };
+    const receiptFile = receiptPath(deps, id);
+    const receiptTemp = `${receiptFile}.${randomUUID()}.tmp`;
+    await writeAtomic(
+      receiptTemp,
+      receiptFile,
+      Buffer.from(JSON.stringify(receipt)),
     );
+    await rm(importPath(deps, id), { recursive: true, force: true });
+    notifyCommittedScope(deps, scope, metadata.collectedAt);
+    return receipt;
+  } catch (error) {
+    await removeImportArtifacts(deps, metadata);
+    throw error;
   }
-  const receipt = {
-    importId: id,
-    owner: metadata.owner,
-    scope,
-    sha256: metadata.sha256,
-    totalBytes: metadata.totalBytes,
-    collectedAt: metadata.collectedAt,
-    completedAt: new Date().toISOString(),
-  };
-  const receiptFile = receiptPath(deps, id);
-  const receiptTemp = `${receiptFile}.${randomUUID()}.tmp`;
-  await writeAtomic(
-    receiptTemp,
-    receiptFile,
-    Buffer.from(JSON.stringify(receipt)),
-  );
-  await rm(importPath(deps, id), { recursive: true, force: true });
-  notifyCommittedScope(deps, scope, metadata.collectedAt);
-  return receipt;
 }

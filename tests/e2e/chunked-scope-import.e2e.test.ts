@@ -1,10 +1,19 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { Readable } from "node:stream";
-import { mkdir, open, rm, stat } from "node:fs/promises";
+import { mkdir, open, readFile, rm, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildDataFilePath } from "../../packages/core/src/storage/hierarchy/index.js";
+import type { IndexManager } from "../../packages/core/src/storage/index/index.js";
+import {
+  SCOPE_IMPORT_TTL_MS,
+  beginScopeImport,
+  cleanupExpiredScopeImports,
+  finalizeScopeImport,
+  putScopeImportChunk,
+  type ScopeImportDeps,
+} from "../../packages/server/src/routes/chunked-scope-import.js";
 import { startChildTestServer } from "./helpers/child-server.js";
 import { startTestServer, type TestServer } from "./helpers/server.js";
 
@@ -163,6 +172,155 @@ describe("legacy chunked scope import (real server)", () => {
     } finally {
       await server.stop();
       await restarted?.stop();
+      await rm(SERVER_DIR, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("aborts an import idempotently only for its authenticated owner and scope", async () => {
+    await rm(SERVER_DIR, { recursive: true, force: true });
+    const server = await openServer();
+    try {
+      const data = Buffer.from('{"unfinished":true}');
+      const started = await beginImport(server, "chatgpt.abort", {
+        totalBytes: data.length,
+        totalChunks: 1,
+        sha256: createHash("sha256").update(data).digest("hex"),
+      });
+      const id = started.body.importId as string;
+      expect(
+        (await putChunk(server, "chatgpt.abort", id, 0, data)).status,
+      ).toBe(200);
+
+      const abortUrl = `${server.url}/v1/data/chatgpt.abort/imports/${id}`;
+      const unauthorized = await fetch(abortUrl, {
+        method: "DELETE",
+        headers: { Authorization: "Bearer invalid" },
+      });
+      expect(unauthorized.status).not.toBe(200);
+
+      const wrongScope = await fetch(
+        `${server.url}/v1/data/chatgpt.other/imports/${id}`,
+        {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${server.devToken}` },
+        },
+      );
+      expect(wrongScope.status).toBe(404);
+      const importDirectory = join(SERVER_DIR, "data", ".scope-imports", id);
+      expect((await stat(join(importDirectory, "chunk-0.bin"))).isFile()).toBe(
+        true,
+      );
+
+      const aborted = await fetch(abortUrl, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${server.devToken}` },
+      });
+      expect(aborted.status).toBe(200);
+      expect(await aborted.json()).toMatchObject({
+        importId: id,
+        status: "aborted",
+      });
+      const repeated = await fetch(abortUrl, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${server.devToken}` },
+      });
+      expect(repeated.status).toBe(200);
+      expect(await repeated.json()).toMatchObject({
+        importId: id,
+        status: "aborted",
+      });
+      expect(await stat(importDirectory).catch(() => null)).toBeNull();
+
+      const finalize = await fetch(`${abortUrl}/finalize`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${server.devToken}` },
+      });
+      expect(finalize.status).toBe(410);
+      expect(
+        (
+          await beginImport(server, "chatgpt.abort", {
+            totalBytes: data.length,
+            totalChunks: 1,
+            sha256: createHash("sha256").update(data).digest("hex"),
+          })
+        ).response.status,
+      ).toBe(201);
+    } finally {
+      await server.cleanup();
+      await rm(SERVER_DIR, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("cleans pending envelopes when a failed import expires", async () => {
+    const dataDir = join(SERVER_DIR, "direct-cleanup-data");
+    await rm(SERVER_DIR, { recursive: true, force: true });
+    await mkdir(dataDir, { recursive: true });
+    const deps: ScopeImportDeps = {
+      hierarchyOptions: { dataDir },
+      indexManager: {
+        findByPath: () => undefined,
+        findLatestByScope: () => undefined,
+      } as unknown as IndexManager,
+      serverOwner: "0x1111111111111111111111111111111111111111",
+      authorizeOwner: async () => undefined,
+      afterTombstoneVersion: async () => {
+        throw new Error("injected finalize failure");
+      },
+    };
+    try {
+      const data = Buffer.from('{"unfinished":true}');
+      const request = new Request("http://localhost", { method: "POST" });
+      const started = await beginScopeImport(deps, request, "chatgpt.failure", {
+        totalBytes: data.length,
+        totalChunks: 1,
+        sha256: createHash("sha256").update(data).digest("hex"),
+      });
+      const chunkRequest = new Request("http://localhost/chunk", {
+        method: "PUT",
+        headers: {
+          "content-type": "application/octet-stream",
+          "x-chunk-sha256": createHash("sha256").update(data).digest("hex"),
+        },
+        body: data,
+      });
+      await putScopeImportChunk(
+        deps,
+        chunkRequest,
+        "chatgpt.failure",
+        started.importId,
+        0,
+      );
+      await expect(
+        finalizeScopeImport(deps, request, "chatgpt.failure", started.importId),
+      ).rejects.toThrow("injected finalize failure");
+
+      const metadata = JSON.parse(
+        await readFile(
+          join(dataDir, ".scope-imports", started.importId, "metadata.json"),
+          "utf8",
+        ),
+      ) as { scope: string; collectedAt: string };
+      const finalPath = buildDataFilePath(
+        dataDir,
+        metadata.scope,
+        metadata.collectedAt,
+      );
+      const pendingPath = `${finalPath}.pending.${started.importId}`;
+      expect(await stat(pendingPath).catch(() => null)).toBeNull();
+
+      // Recreate the exact orphan a process crash before cleanup could leave.
+      await (await open(pendingPath, "w")).close();
+      await cleanupExpiredScopeImports(
+        deps,
+        Date.now() + SCOPE_IMPORT_TTL_MS + 1,
+      );
+      expect(await stat(pendingPath).catch(() => null)).toBeNull();
+      expect(
+        await stat(join(dataDir, ".scope-imports", started.importId)).catch(
+          () => null,
+        ),
+      ).toBeNull();
+    } finally {
       await rm(SERVER_DIR, { recursive: true, force: true });
     }
   }, 60_000);

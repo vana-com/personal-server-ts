@@ -37,6 +37,7 @@ import { createNodeDataStorage } from "../storage/node-data-storage.js";
 import { createServerApiAuth } from "../api-auth.js";
 import { parseDataScopeContract } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
+  abortScopeImport,
   beginScopeImport,
   finalizeScopeImport,
   putScopeImportChunk,
@@ -259,6 +260,16 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
           c.req.param("id"),
         ),
       201,
+    ),
+  );
+  app.delete("/:scope/imports/:id", (c) =>
+    importRoute(c, () =>
+      abortScopeImport(
+        importDeps,
+        c.req.raw,
+        c.req.param("scope"),
+        c.req.param("id"),
+      ),
     ),
   );
 
