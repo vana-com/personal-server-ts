@@ -30,6 +30,11 @@ import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/l
 import type { Logger } from "pino";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
+  ContentTooLargeError,
+  ProtocolError,
+} from "@opendatalabs/personal-server-ts-core/errors";
+import { cacheRequestBodyBytes } from "@opendatalabs/personal-server-ts-core/auth";
+import {
   createBodyLimit,
   DATA_INGEST_MAX_SIZE,
 } from "../middleware/body-limit.js";
@@ -43,6 +48,7 @@ import {
   putScopeImportChunk,
   ScopeImportError,
   type ScopeImportDeps,
+  SCOPE_IMPORT_CHUNK_BYTES,
 } from "./chunked-scope-import.js";
 
 export interface DataRouteDeps {
@@ -188,6 +194,13 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
           { "content-type": "application/json" },
         );
       }
+      if (error instanceof ProtocolError) {
+        return c.body(
+          JSON.stringify({ error: error.errorCode, message: error.message }),
+          error.code as 400,
+          { "content-type": "application/json" },
+        );
+      }
       const caught = error as {
         status?: number;
         code?: string;
@@ -238,16 +251,35 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       201,
     ),
   );
-  app.put("/:scope/imports/:id/chunks/:index", (c) =>
-    importRoute(c, () =>
-      putScopeImportChunk(
-        importDeps,
-        c.req.raw,
-        c.req.param("scope"),
-        c.req.param("id"),
-        Number(c.req.param("index")),
+  app.put(
+    "/:scope/imports/:id/chunks/:index",
+    async (c, next) => {
+      try {
+        await cacheRequestBodyBytes(c.req.raw, SCOPE_IMPORT_CHUNK_BYTES, true);
+      } catch (error) {
+        if (error instanceof ContentTooLargeError) {
+          return c.json(
+            {
+              error: "CONTENT_TOO_LARGE",
+              message: `Request body exceeds maximum size of ${SCOPE_IMPORT_CHUNK_BYTES} bytes`,
+            },
+            413,
+          );
+        }
+        throw error;
+      }
+      await next();
+    },
+    (c) =>
+      importRoute(c, () =>
+        putScopeImportChunk(
+          importDeps,
+          c.req.raw,
+          c.req.param("scope"),
+          c.req.param("id"),
+          Number(c.req.param("index")),
+        ),
       ),
-    ),
   );
   app.post("/:scope/imports/:id/finalize", (c) =>
     importRoute(

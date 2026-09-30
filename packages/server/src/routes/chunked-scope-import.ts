@@ -14,6 +14,7 @@ import { dirname, join, relative } from "node:path";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
+import { cacheRequestBodyBytes } from "@opendatalabs/personal-server-ts-core/auth";
 import { publishStagedDataFile } from "../storage/hierarchy.js";
 
 export const SCOPE_IMPORT_CHUNK_BYTES = 8 * 1024 * 1024;
@@ -618,28 +619,20 @@ export async function beginScopeImport(
   }
 }
 
-async function streamRequestToFile(
-  request: Request,
+async function writeChunkToFile(
+  bytes: Uint8Array,
   path: string,
 ): Promise<{ bytes: number; sha256: string }> {
-  if (!request.body)
+  if (bytes.byteLength === 0)
     throw new ScopeImportError(400, "EMPTY_CHUNK", "Chunk body is required");
   const handle = await open(path, "wx");
   const hash = createHash("sha256");
-  let bytes = 0;
   try {
-    for await (const chunk of request.body as unknown as AsyncIterable<Uint8Array>) {
-      bytes += chunk.byteLength;
-      if (bytes > SCOPE_IMPORT_CHUNK_BYTES) {
-        throw new ScopeImportError(
-          413,
-          "CHUNK_TOO_LARGE",
-          "Chunk exceeds 8 MiB",
-        );
-      }
-      hash.update(chunk);
-      await handle.writeFile(chunk);
+    if (bytes.byteLength > SCOPE_IMPORT_CHUNK_BYTES) {
+      throw new ScopeImportError(413, "CHUNK_TOO_LARGE", "Chunk exceeds 8 MiB");
     }
+    hash.update(bytes);
+    await handle.writeFile(bytes);
     await handle.sync();
   } catch (error) {
     await unlink(path).catch(() => undefined);
@@ -647,7 +640,7 @@ async function streamRequestToFile(
   } finally {
     await handle.close();
   }
-  return { bytes, sha256: hash.digest("hex") };
+  return { bytes: bytes.byteLength, sha256: hash.digest("hex") };
 }
 
 export async function putScopeImportChunk(
@@ -658,6 +651,13 @@ export async function putScopeImportChunk(
   index: number,
 ): Promise<{ accepted: true; index: number; bytes: number; sha256: string }> {
   await deps.authorizeOwner(request, scope);
+  const bodyBytes = await cacheRequestBodyBytes(
+    request,
+    SCOPE_IMPORT_CHUNK_BYTES,
+  );
+  if (!bodyBytes) {
+    throw new ScopeImportError(400, "EMPTY_CHUNK", "Chunk body is required");
+  }
   if (abortingImports.has(id)) {
     throw new ScopeImportError(
       409,
@@ -743,7 +743,7 @@ export async function putScopeImportChunk(
   activeChunkWrites++;
   activeChunkIndexes.add(chunkKey);
   try {
-    const received = await streamRequestToFile(request, temp);
+    const received = await writeChunkToFile(bodyBytes, temp);
     if (received.bytes !== expectedBytes || received.sha256 !== expectedHash) {
       await unlink(temp).catch(() => undefined);
       throw new ScopeImportError(

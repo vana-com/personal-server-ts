@@ -71,6 +71,7 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/api";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { createServerApiAuth } from "../api-auth.js";
+import { createBodyLimit, DEFAULT_MAX_SIZE } from "../middleware/body-limit.js";
 import { authenticateRequest } from "@opendatalabs/personal-server-ts-core/auth";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
@@ -322,6 +323,7 @@ export function executeMcpConnectionRequest(
  */
 export function mcpConnectionsRoutes(deps: McpRouteDeps): Hono {
   const app = new Hono();
+  app.use("*", createBodyLimit(DEFAULT_MAX_SIZE));
   const store = deps.connectionStore ?? createInMemoryMcpConnectionStore();
 
   const ownerAuth: PersonalServerApiAuthPort = createServerApiAuth({
@@ -446,6 +448,7 @@ export type McpOAuthRouteDeps = Pick<
 
 export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
   const app = new Hono();
+  app.use("*", createBodyLimit(DEFAULT_MAX_SIZE));
   const connectionStore =
     deps.connectionStore ?? createInMemoryMcpConnectionStore();
   const authorizationStore =

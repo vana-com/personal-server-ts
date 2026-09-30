@@ -74,6 +74,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { createWeb3AuthMiddleware } from "../middleware/web3-auth.js";
 import { createOwnerCheckMiddleware } from "../middleware/owner-check.js";
+import { createBodyLimit, DEFAULT_MAX_SIZE } from "../middleware/body-limit.js";
 import type { TokenStore } from "../token-store.js";
 import { canonicalSourceIdCandidate } from "../pdpp/source-id-compat.js";
 
@@ -384,6 +385,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   // owner. Scoped to the token-exchange path only — the rest of the surface
   // authenticates with the PDPP owner token that exchange produces.
   if (deps.ownerAuth) {
+    app.use("/owner/token", createBodyLimit(DEFAULT_MAX_SIZE));
     app.use(
       "/owner/token",
       createWeb3AuthMiddleware({
