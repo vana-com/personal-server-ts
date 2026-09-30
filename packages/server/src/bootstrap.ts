@@ -55,6 +55,7 @@ import {
 import { createFilePendingBlobDeletionStore } from "./pending-blob-deletions.js";
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
+import { cleanupExpiredScopeImports } from "./routes/chunked-scope-import.js";
 import { generateDevToken } from "./dev-token.js";
 import { migrateLocalState } from "./migrations/local-state.js";
 import { createTokenStore, type TokenStore } from "./token-store.js";
@@ -195,6 +196,11 @@ export async function createServer(
   });
   const indexManager = createIndexManager(db);
   const hierarchyOptions: HierarchyManagerOptions = { dataDir };
+  await cleanupExpiredScopeImports(
+    { hierarchyOptions, indexManager },
+    Date.now(),
+    true,
+  );
   const dataStorage = createNodeDataStorage({ indexManager, hierarchyOptions });
 
   const gatewayClient =

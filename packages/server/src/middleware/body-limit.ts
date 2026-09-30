@@ -1,5 +1,6 @@
 import { bodyLimit } from "hono/body-limit";
 import type { MiddlewareHandler } from "hono";
+import { cacheRequestBodyBytes } from "@opendatalabs/personal-server-ts-core/auth";
 
 /** 50 MB — max body size for data ingest routes */
 export const DATA_INGEST_MAX_SIZE = 50 * 1024 * 1024;
@@ -11,7 +12,7 @@ export const DEFAULT_MAX_SIZE = 1 * 1024 * 1024;
  * Creates a Hono body-limit middleware that returns 413 JSON on overflow.
  */
 export function createBodyLimit(maxSize: number): MiddlewareHandler {
-  return bodyLimit({
+  const enforceLimit = bodyLimit({
     maxSize,
     onError: (c) => {
       return c.json(
@@ -23,4 +24,10 @@ export function createBodyLimit(maxSize: number): MiddlewareHandler {
       );
     },
   });
+
+  return (c, next) =>
+    enforceLimit(c, async () => {
+      await cacheRequestBodyBytes(c.req.raw, maxSize);
+      await next();
+    });
 }

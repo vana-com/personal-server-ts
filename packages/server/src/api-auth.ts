@@ -96,7 +96,9 @@ async function assertRegisteredBuilder(
 
 export function createServerApiAuth(
   deps: ServerApiAuthDeps,
-): PersonalServerApiAuthPort {
+): PersonalServerApiAuthPort & {
+  authorizeOwnerScope(request: Request, scope: string): Promise<void>;
+} {
   const writeProofReplayStore =
     deps.writeProofReplayStore ?? createInMemoryWriteProofReplayStore();
   // The write-session half of this port is protocol, not runtime: the browser
@@ -157,6 +159,9 @@ export function createServerApiAuth(
 
   return {
     authorizeOwner,
+    async authorizeOwnerScope(request: Request, _scope: string) {
+      await authorizeOwner(request);
+    },
     authorizeWrite,
     authorizeWriteSession,
 

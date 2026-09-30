@@ -6,6 +6,7 @@ import {
   type Web3SignedPayload,
 } from "@opendatalabs/vana-sdk/browser";
 import {
+  ContentTooLargeError,
   ExpiredTokenError,
   InvalidSignatureError,
   MissingAuthError,
@@ -40,6 +41,8 @@ export interface AuthenticatedRequest {
   isPolicyBypass: boolean;
   devBypass: boolean;
 }
+
+const cachedRequestBodies = new WeakMap<Request, Uint8Array>();
 
 function resolveOrigin(origin: string | (() => string)): string {
   return typeof origin === "function" ? origin() : origin;
@@ -76,11 +79,94 @@ function getBearerToken(headerValue: string | null): string | null {
   return headerValue.slice(7);
 }
 
-async function requestBodyBytes(
+/**
+ * Capture a request body before a handler parses it. The cached bytes are the
+ * exact bytes owner authentication hashes, even when a later JSON parser has
+ * consumed the adapter's Request body.
+ */
+export async function cacheRequestBodyBytes(
   request: Request,
+  maxBytes?: number,
+  consumeBody = false,
 ): Promise<Uint8Array | undefined> {
   if (request.method === "GET" || request.method === "HEAD") return undefined;
-  return new Uint8Array(await request.clone().arrayBuffer());
+  const cached = cachedRequestBodies.get(request);
+  if (cached) return cached;
+
+  // Preserve the existing unbounded auth behavior for callers that do not
+  // have a route-specific body limit. Server routes with known limits pass
+  // maxBytes and use the bounded streaming path below.
+  if (maxBytes === undefined) {
+    const bytes = new Uint8Array(await request.clone().arrayBuffer());
+    cachedRequestBodies.set(request, bytes);
+    return bytes;
+  }
+
+  const contentLength = request.headers.get("content-length");
+  if (contentLength !== null) {
+    const parsedLength = Number(contentLength);
+    if (!Number.isSafeInteger(parsedLength) || parsedLength < 0) {
+      void request.body?.cancel().catch(() => undefined);
+      throw new ContentTooLargeError({ max: maxBytes });
+    }
+    if (parsedLength > maxBytes) {
+      void request.body?.cancel().catch(() => undefined);
+      throw new ContentTooLargeError({ max: maxBytes });
+    }
+  }
+
+  const source = consumeBody ? request : request.clone();
+  const body = source.body;
+  if (!body) {
+    // Some browser engines do not expose Request.body. Their request streams
+    // cannot be bounded incrementally, so retain the compatibility path and
+    // reject immediately after the engine materializes the clone.
+    const bytes = new Uint8Array(await source.arrayBuffer());
+    if (bytes.byteLength > maxBytes) {
+      throw new ContentTooLargeError({ max: maxBytes });
+    }
+    cachedRequestBodies.set(request, bytes);
+    return bytes;
+  }
+
+  // Grow only as bytes arrive, with the route's limit as the hard ceiling.
+  // Small writes therefore do not reserve the full capacity of a large route.
+  let buffer = new Uint8Array(
+    contentLength === null
+      ? Math.min(maxBytes, 64 * 1024)
+      : Number(contentLength),
+  );
+  const reader = body.getReader();
+  let length = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (length + value.byteLength > maxBytes) {
+        const cancellations = consumeBody
+          ? [reader.cancel()]
+          : [reader.cancel(), request.body?.cancel()];
+        void Promise.allSettled(cancellations);
+        throw new ContentTooLargeError({ max: maxBytes });
+      }
+      if (length + value.byteLength > buffer.byteLength) {
+        const capacity = Math.min(
+          maxBytes,
+          Math.max(length + value.byteLength, buffer.byteLength * 2, 1),
+        );
+        const grown = new Uint8Array(capacity);
+        grown.set(buffer.subarray(0, length));
+        buffer = grown;
+      }
+      buffer.set(value, length);
+      length += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = buffer.subarray(0, length);
+  cachedRequestBodies.set(request, bytes);
+  return bytes;
 }
 
 function getErrorDetails(err: unknown): Record<string, unknown> | undefined {
@@ -153,7 +239,7 @@ export async function authenticateRequest(
       expectedOrigin: resolveOrigin(input.serverOrigin),
       expectedMethod: input.request.method,
       expectedPath: url.pathname,
-      bodyBytes: await requestBodyBytes(input.request),
+      bodyBytes: await cacheRequestBodyBytes(input.request),
       now: input.now?.(),
     });
 
