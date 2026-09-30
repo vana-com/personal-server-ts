@@ -41,6 +41,8 @@ export interface AuthenticatedRequest {
   devBypass: boolean;
 }
 
+const cachedRequestBodies = new WeakMap<Request, Uint8Array>();
+
 function resolveOrigin(origin: string | (() => string)): string {
   return typeof origin === "function" ? origin() : origin;
 }
@@ -76,11 +78,20 @@ function getBearerToken(headerValue: string | null): string | null {
   return headerValue.slice(7);
 }
 
-async function requestBodyBytes(
+/**
+ * Capture a request body before a handler parses it. The cached bytes are the
+ * exact bytes owner authentication hashes, even when a later JSON parser has
+ * consumed the adapter's Request body.
+ */
+export async function cacheRequestBodyBytes(
   request: Request,
 ): Promise<Uint8Array | undefined> {
   if (request.method === "GET" || request.method === "HEAD") return undefined;
-  return new Uint8Array(await request.clone().arrayBuffer());
+  const cached = cachedRequestBodies.get(request);
+  if (cached) return cached;
+  const bytes = new Uint8Array(await request.clone().arrayBuffer());
+  cachedRequestBodies.set(request, bytes);
+  return bytes;
 }
 
 function getErrorDetails(err: unknown): Record<string, unknown> | undefined {
@@ -153,7 +164,7 @@ export async function authenticateRequest(
       expectedOrigin: resolveOrigin(input.serverOrigin),
       expectedMethod: input.request.method,
       expectedPath: url.pathname,
-      bodyBytes: await requestBodyBytes(input.request),
+      bodyBytes: await cacheRequestBodyBytes(input.request),
       now: input.now?.(),
     });
 
