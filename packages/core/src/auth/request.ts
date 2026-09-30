@@ -6,6 +6,7 @@ import {
   type Web3SignedPayload,
 } from "@opendatalabs/vana-sdk/browser";
 import {
+  ContentTooLargeError,
   ExpiredTokenError,
   InvalidSignatureError,
   MissingAuthError,
@@ -42,6 +43,7 @@ export interface AuthenticatedRequest {
 }
 
 const cachedRequestBodies = new WeakMap<Request, Uint8Array>();
+const DEFAULT_SIGNED_BODY_MAX_BYTES = 1 * 1024 * 1024;
 
 function resolveOrigin(origin: string | (() => string)): string {
   return typeof origin === "function" ? origin() : origin;
@@ -85,11 +87,64 @@ function getBearerToken(headerValue: string | null): string | null {
  */
 export async function cacheRequestBodyBytes(
   request: Request,
+  maxBytes = DEFAULT_SIGNED_BODY_MAX_BYTES,
+  consumeBody = false,
 ): Promise<Uint8Array | undefined> {
   if (request.method === "GET" || request.method === "HEAD") return undefined;
   const cached = cachedRequestBodies.get(request);
   if (cached) return cached;
-  const bytes = new Uint8Array(await request.clone().arrayBuffer());
+
+  const contentLength = request.headers.get("content-length");
+  if (contentLength !== null) {
+    const parsedLength = Number(contentLength);
+    if (!Number.isSafeInteger(parsedLength) || parsedLength < 0) {
+      void request.body?.cancel().catch(() => undefined);
+      throw new ContentTooLargeError({ max: maxBytes });
+    }
+    if (parsedLength > maxBytes) {
+      void request.body?.cancel().catch(() => undefined);
+      throw new ContentTooLargeError({ max: maxBytes });
+    }
+  }
+
+  const source = consumeBody ? request : request.clone();
+  const body = source.body;
+  if (!body) {
+    // Some browser engines do not expose Request.body. Their request streams
+    // cannot be bounded incrementally, so retain the compatibility path and
+    // reject immediately after the engine materializes the clone.
+    const bytes = new Uint8Array(await source.arrayBuffer());
+    if (bytes.byteLength > maxBytes) {
+      throw new ContentTooLargeError({ max: maxBytes });
+    }
+    cachedRequestBodies.set(request, bytes);
+    return bytes;
+  }
+
+  // Allocate no more than the route's limit. Read one stream chunk at a time
+  // and reject before copying any chunk that would cross that limit.
+  const capacity = contentLength === null ? maxBytes : Number(contentLength);
+  const buffer = new Uint8Array(capacity);
+  const reader = body.getReader();
+  let length = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (length + value.byteLength > maxBytes) {
+        const cancellations = consumeBody
+          ? [reader.cancel()]
+          : [reader.cancel(), request.body?.cancel()];
+        void Promise.allSettled(cancellations);
+        throw new ContentTooLargeError({ max: maxBytes });
+      }
+      buffer.set(value, length);
+      length += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = buffer.subarray(0, length);
   cachedRequestBodies.set(request, bytes);
   return bytes;
 }

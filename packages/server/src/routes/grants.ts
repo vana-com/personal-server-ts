@@ -16,6 +16,7 @@ import {
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { TokenStore } from "../token-store.js";
 import { createServerApiAuth } from "../api-auth.js";
+import { createBodyLimit, DEFAULT_MAX_SIZE } from "../middleware/body-limit.js";
 
 export interface GrantsRouteDeps {
   logger: Logger;
@@ -32,6 +33,7 @@ export interface GrantsRouteDeps {
 
 export function grantsRoutes(deps: GrantsRouteDeps): Hono {
   const app = new Hono();
+  app.use("*", createBodyLimit(DEFAULT_MAX_SIZE));
 
   const auth = createServerApiAuth({
     serverOrigin: deps.serverOrigin,

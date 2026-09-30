@@ -38,6 +38,7 @@ import {
   mapSdkAuthError,
 } from "../middleware/web3-auth.js";
 import { createOwnerCheckMiddleware } from "../middleware/owner-check.js";
+import { createBodyLimit, DEFAULT_MAX_SIZE } from "../middleware/body-limit.js";
 
 export interface LoginV2Deps {
   logger: Logger;
@@ -243,6 +244,8 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
     serverOwner: deps.serverOwner,
   });
   const ownerCheck = createOwnerCheckMiddleware(deps.serverOwner);
+  app.use("/approve", createBodyLimit(DEFAULT_MAX_SIZE));
+  app.use("/token", createBodyLimit(DEFAULT_MAX_SIZE));
 
   if (allowInteractiveLogin) {
     // POST /  — Initiate login flow (no auth required)

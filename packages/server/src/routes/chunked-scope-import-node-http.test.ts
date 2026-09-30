@@ -14,11 +14,13 @@ import {
   authenticateRequest,
   cacheRequestBodyBytes,
 } from "@opendatalabs/personal-server-ts-core/auth";
+import { ContentTooLargeError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
 import { listenHttpServer } from "../listen.js";
 import { dataRoutes } from "./data.js";
+import { SCOPE_IMPORT_CHUNK_BYTES } from "./chunked-scope-import.js";
 
 const owner = createTestWallet(9);
 const logger = pino({ level: "silent" });
@@ -76,6 +78,63 @@ async function signedHeaders(input: {
 }
 
 describe("chunked scope imports over the @hono/node-server HTTP adapter", () => {
+  it("stops caching at the chunk limit and cancels an oversized stream", async () => {
+    let cancelled = false;
+    let pulls = 0;
+    let bytesOffered = 0;
+    const request = new Request("http://127.0.0.1/upload", {
+      method: "PUT",
+      body: new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            pulls++;
+            const size = [4, 4, 1, 100][pulls - 1];
+            if (size === undefined) return controller.close();
+            bytesOffered += size;
+            controller.enqueue(new Uint8Array(size));
+          },
+          cancel() {
+            cancelled = true;
+          },
+        },
+        { highWaterMark: 0 },
+      ),
+      // @ts-expect-error Node's Request requires duplex for streaming bodies.
+      duplex: "half",
+    });
+
+    await expect(
+      cacheRequestBodyBytes(request, 8, true),
+    ).rejects.toBeInstanceOf(ContentTooLargeError);
+    expect(cancelled).toBe(true);
+    expect(bytesOffered).toBe(9);
+    expect(pulls).toBe(3);
+  });
+
+  it("rejects an oversized Content-Length before reading the body", async () => {
+    let pulls = 0;
+    const request = new Request("http://127.0.0.1/upload", {
+      method: "PUT",
+      headers: { "content-length": "9" },
+      body: new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            pulls++;
+            controller.enqueue(new Uint8Array(1));
+          },
+        },
+        { highWaterMark: 0 },
+      ),
+      // @ts-expect-error Node's Request requires duplex for streaming bodies.
+      duplex: "half",
+    });
+
+    await expect(
+      cacheRequestBodyBytes(request, 8, true),
+    ).rejects.toBeInstanceOf(ContentTooLargeError);
+    expect(pulls).toBe(0);
+  });
+
   it("begins with Content-Length, accepts a signed chunk, and finalizes", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "scope-import-node-http-"));
     const db = initializeDatabase(":memory:");
@@ -105,11 +164,13 @@ describe("chunked scope imports over the @hono/node-server HTTP adapter", () => 
       throw new Error("Expected a TCP address");
     const port = address.port;
     const path = `/v1/data/${scope}/imports`;
+    const chunk = new Uint8Array(SCOPE_IMPORT_CHUNK_BYTES).fill(0x20);
+    chunk.set(new TextEncoder().encode('{"data":[]}'));
     const beginBytes = new TextEncoder().encode(
       JSON.stringify({
-        totalBytes: new TextEncoder().encode('{"data":[]}').byteLength,
+        totalBytes: chunk.byteLength,
         totalChunks: 1,
-        sha256: createHash("sha256").update('{"data":[]}').digest("hex"),
+        sha256: createHash("sha256").update(chunk).digest("hex"),
       }),
     );
     try {
@@ -128,7 +189,6 @@ describe("chunked scope imports over the @hono/node-server HTTP adapter", () => 
       expect(importId).toEqual(expect.any(String));
 
       const chunkPath = `${path}/${importId}/chunks/0`;
-      const chunk = new TextEncoder().encode('{"data":[]}');
       const chunkHash = createHash("sha256").update(chunk).digest("hex");
       const upload = await sendHttp(port, {
         method: "PUT",
@@ -218,7 +278,10 @@ describe("chunked scope imports over the @hono/node-server HTTP adapter", () => 
           ...(await signedHeaders({ method: "POST", path, body })),
         },
       });
-      expect(tampered.status, tampered.body).not.toBe(201);
+      expect(tampered.status, tampered.body).toBe(401);
+      expect(JSON.parse(tampered.body)).toMatchObject({
+        error: "INVALID_SIGNATURE",
+      });
 
       const begin = await sendHttp(address.port, {
         method: "POST",
@@ -239,6 +302,69 @@ describe("chunked scope imports over the @hono/node-server HTTP adapter", () => 
       await rm(dataDir, { recursive: true, force: true });
     }
   });
+
+  it.each([true, false])(
+    "returns 413 for an oversized chunk with Content-Length: %s",
+    async (withContentLength) => {
+      const dataDir = await mkdtemp(join(tmpdir(), "scope-import-node-http-"));
+      const indexManager = createIndexManager(initializeDatabase(":memory:"));
+      const app = new Hono();
+      app.route(
+        "/v1/data",
+        dataRoutes({
+          indexManager,
+          hierarchyOptions: { dataDir },
+          logger,
+          serverOrigin: "http://127.0.0.1",
+          serverOwner: owner.address,
+          gateway: { isRegisteredBuilder: async () => true } as never,
+          accessLogWriter: { write: async () => undefined },
+          mountPath: "/v1/data",
+        }),
+      );
+      const server = await listenHttpServer({
+        fetch: app.fetch,
+        port: 0,
+        hostname: "127.0.0.1",
+      });
+      const address = server.address();
+      if (!address || typeof address === "string")
+        throw new Error("Expected a TCP address");
+      const path = `/v1/data/${scope}/imports/not-created/chunks/0`;
+      const body = new Uint8Array(SCOPE_IMPORT_CHUNK_BYTES + 1);
+      try {
+        const unsigned = await sendHttp(address.port, {
+          method: "PUT",
+          path,
+          body: new Uint8Array([1]),
+          headers: { "content-type": "application/octet-stream" },
+        });
+        expect(unsigned.status, unsigned.body).toBe(401);
+
+        const response = await sendHttp(address.port, {
+          method: "PUT",
+          path,
+          body,
+          headers: {
+            "content-type": "application/octet-stream",
+            ...(withContentLength
+              ? { "content-length": String(body.byteLength) }
+              : {}),
+          },
+        });
+        expect(response.status, response.body).toBe(413);
+        expect(JSON.parse(response.body)).toMatchObject({
+          error: "CONTENT_TOO_LARGE",
+        });
+      } finally {
+        await new Promise<void>((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve())),
+        );
+        indexManager.close();
+        await rm(dataDir, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("rejects cached bytes that differ from the signed body after JSON parsing", async () => {
     const path = `/v1/data/${scope}/imports`;

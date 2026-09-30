@@ -27,7 +27,7 @@ export function createBodyLimit(maxSize: number): MiddlewareHandler {
 
   return (c, next) =>
     enforceLimit(c, async () => {
-      await cacheRequestBodyBytes(c.req.raw);
+      await cacheRequestBodyBytes(c.req.raw, maxSize);
       await next();
     });
 }
