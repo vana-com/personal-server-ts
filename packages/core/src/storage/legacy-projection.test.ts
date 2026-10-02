@@ -1,12 +1,16 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { diffBodies } from "../legacy-projection/__fixtures__/parity/diff.js";
-import { ingestDataContract } from "../contracts/data.js";
+import {
+  ingestBinaryDataContract,
+  ingestDataContract,
+} from "../contracts/data.js";
 import type { DataStoragePort } from "../ports/index.js";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
 import {
   classifyStoredBody,
   legacyScopesProjectedFrom,
+  supersedeLegacyVersions,
   withLegacyProjection,
   type LegacyProjectionIssue,
 } from "./legacy-projection.js";
@@ -563,4 +567,142 @@ describe("withLegacyProjection parity goldens", () => {
       ).toEqual(golden.reviewedDifferences.map(({ path }) => path));
     },
   );
+});
+
+describe("supersedeLegacyVersions", () => {
+  it("deletes only older legacy-form versions of the scope", async () => {
+    const raw = createMemoryDataStorage();
+    const legacy = { conversations: [], total: 0 };
+    await store(
+      raw,
+      "chatgpt.conversations",
+      "2026-09-01T00:00:00.000Z",
+      legacy,
+    );
+    await store(raw, "chatgpt.conversations", "2026-09-02T00:00:00.000Z", {
+      records: [],
+    });
+    await store(
+      raw,
+      "chatgpt.conversations",
+      "2026-09-03T00:00:00.000Z",
+      legacy,
+    );
+    await store(raw, "chatgpt.conversations", "2026-10-01T00:00:00.000Z", {
+      records: [conversation],
+    });
+    // Written later (another device): not superseded by an older write.
+    await store(
+      raw,
+      "chatgpt.conversations",
+      "2026-10-02T00:00:00.000Z",
+      legacy,
+    );
+    await store(raw, "chatgpt.memories", "2026-09-01T00:00:00.000Z", {
+      memories: [],
+      total: 0,
+    });
+
+    const deleted = await supersedeLegacyVersions(
+      withLegacyProjection(raw),
+      "chatgpt.conversations",
+      "2026-10-01T00:00:00.000Z",
+    );
+
+    expect(deleted.sort()).toEqual([
+      "2026-09-01T00:00:00.000Z",
+      "2026-09-03T00:00:00.000Z",
+    ]);
+    expect(
+      raw.entries.map((entry) => `${entry.scope} ${entry.collectedAt}`).sort(),
+    ).toEqual([
+      "chatgpt.conversations 2026-09-02T00:00:00.000Z",
+      "chatgpt.conversations 2026-10-01T00:00:00.000Z",
+      "chatgpt.conversations 2026-10-02T00:00:00.000Z",
+      "chatgpt.memories 2026-09-01T00:00:00.000Z",
+    ]);
+  });
+
+  it.each([
+    ["an unprojected records stream", "chatgpt.messages", { records: [] }],
+    ["a legacy body", "chatgpt.conversations", { conversations: [], total: 0 }],
+  ])("deletes nothing after %s", async (_label, scope, body) => {
+    const raw = createMemoryDataStorage();
+    await store(raw, scope, "2026-09-01T00:00:00.000Z", {
+      conversations: [],
+      total: 0,
+    });
+    await store(raw, scope, "2026-10-01T00:00:00.000Z", body);
+
+    expect(
+      await supersedeLegacyVersions(raw, scope, "2026-10-01T00:00:00.000Z"),
+    ).toEqual([]);
+    expect(raw.entries).toHaveLength(2);
+  });
+
+  it("deletes nothing when the new version cannot be projected", async () => {
+    const raw = createMemoryDataStorage();
+    await store(raw, "claude.projects", "2026-09-01T00:00:00.000Z", {
+      projects: [],
+      total: 0,
+    });
+    // No claude.account_profile stream is stored, so projection fails.
+    await store(raw, "claude.projects", "2026-10-01T00:00:00.000Z", {
+      records: [{ id: "p1", name: "Research" }],
+    });
+
+    expect(
+      await supersedeLegacyVersions(
+        withLegacyProjection(raw),
+        "claude.projects",
+        "2026-10-01T00:00:00.000Z",
+      ),
+    ).toEqual([]);
+    expect(raw.entries).toHaveLength(2);
+  });
+
+  it("compares versions by instant, keeping a later version that sorts earlier as a string", async () => {
+    const raw = createMemoryDataStorage();
+    await store(raw, "chatgpt.conversations", "2026-10-01T12:00:00.500Z", {
+      conversations: [],
+      total: 0,
+    });
+    await store(raw, "chatgpt.conversations", "2026-10-01T12:00:00Z", {
+      records: [],
+    });
+
+    expect(
+      await supersedeLegacyVersions(
+        withLegacyProjection(raw),
+        "chatgpt.conversations",
+        "2026-10-01T12:00:00Z",
+      ),
+    ).toEqual([]);
+    expect(raw.entries).toHaveLength(2);
+  });
+
+  it("keeps an older binary upload under the scope", async () => {
+    const raw = createMemoryDataStorage();
+    const binary = await ingestBinaryDataContract({
+      storage: raw,
+      scopeParam: "chatgpt.conversations",
+      bytes: new TextEncoder().encode("%PDF-1.4"),
+      mimeType: "application/pdf",
+      collectedAt: "2026-09-01T00:00:00.000Z",
+      status: "stored",
+    });
+    expect(binary.ok).toBe(true);
+    await store(raw, "chatgpt.conversations", "2026-10-01T00:00:00.000Z", {
+      records: [],
+    });
+
+    expect(
+      await supersedeLegacyVersions(
+        withLegacyProjection(raw),
+        "chatgpt.conversations",
+        "2026-10-01T00:00:00.000Z",
+      ),
+    ).toEqual([]);
+    expect(raw.entries).toHaveLength(2);
+  });
 });

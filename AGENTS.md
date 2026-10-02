@@ -33,7 +33,7 @@
 - Composition root is `packages/server/src/bootstrap.ts`; route mounting and global JSON error/404 shape live in `packages/server/src/app.ts`.
 - Prefer adding route deps to `AppDeps`/route factory deps instead of importing singletons; tests instantiate routes with mocked deps.
 - Auth is not only `Web3Signed`: owner routes can also authenticate via dev token, `PS_ACCESS_TOKEN`, or persisted CLI session tokens in `tokens.json`.
-- Two storage ports: readers (data route, MCP, derivatives, job worker) get `withLegacyProjection(raw)`, which serves legacy scope bodies projected from stored PDPP `{records}`; sync upload/download must get the raw port so stored bytes and hashes never change. `?view=stored` gives the owner the stored body.
+- Two storage ports: readers (data route, MCP, derivatives, job worker) get `withLegacyProjection(raw)`, which serves legacy scope bodies projected from stored PDPP `{records}`; sync upload/download must get the raw port so stored bytes and hashes never change. `?view=stored` gives the owner the stored body; owner `POST ?supersede=legacy` deletes older legacy-form versions locally only (not on the gateway).
 - Body limits are endpoint-specific: default helper is 1 MB, but data ingest uses 50 MB and structured 413 JSON.
 
 ## Testing/style conventions

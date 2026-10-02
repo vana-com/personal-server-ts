@@ -23,6 +23,7 @@ import {
   type ProjectionError,
 } from "../legacy-projection/index.js";
 import type { DataStoragePort } from "../ports/index.js";
+import { isBinaryEnvelope } from "../contracts/binary.js";
 import type { IndexEntry } from "./index/types.js";
 import { buildDataBlocksAsync } from "./blocks/build.js";
 import { readBuiltScopeBlocks } from "./blocks/page.js";
@@ -481,4 +482,57 @@ function isRecordsBody(
     keys[0] === "records" &&
     Array.isArray((data as { records: unknown }).records)
   );
+}
+
+/**
+ * After a `{records}` version of a projected scope is committed, delete the
+ * scope's older versions whose stored body is a legacy body: the new
+ * version serves the same legacy view, so they are a second copy.
+ * PDPP versions, unrelated forms and newer versions are kept. Returns the
+ * `collectedAt` of every deleted version.
+ *
+ * Local only: the deletes are not sent to the gateway. Copies that sync
+ * already uploaded, and copies other replicas already downloaded, remain.
+ */
+export async function supersedeLegacyVersions(
+  storage: DataStoragePort,
+  scope: string,
+  committedAt: string,
+): Promise<string[]> {
+  const readStored = (storage.readStoredEnvelope ?? storage.readEnvelope).bind(
+    storage,
+  );
+  const committed = await readStored(scope, committedAt);
+  if (classifyStoredBody(scope, committed.data) !== "pdpp-projected") return [];
+  // Only delete once the new version really serves the legacy view: a
+  // failed projection (a missing join stream, say) is served as stored.
+  if (isRecordsBody((await storage.readEnvelope(scope, committedAt)).data)) {
+    return [];
+  }
+
+  const committedMs = Date.parse(committedAt);
+  const older: string[] = [];
+  const pageSize = 100;
+  for (let offset = 0; ; offset += pageSize) {
+    const page = storage.listVersions(scope, { limit: pageSize, offset });
+    for (const entry of page) {
+      // Compare instants, not strings: "…00.500Z" sorts before "…00Z".
+      if (Date.parse(entry.collectedAt) < committedMs) {
+        older.push(entry.collectedAt);
+      }
+    }
+    if (page.length < pageSize) break;
+  }
+
+  const deleted: string[] = [];
+  for (const collectedAt of older) {
+    const envelope = await readStored(scope, collectedAt);
+    // A binary upload under the scope is not a legacy body.
+    if (isBinaryEnvelope(envelope)) continue;
+    if (classifyStoredBody(scope, envelope.data) !== "legacy") continue;
+    if (await storage.deleteVersion(scope, collectedAt)) {
+      deleted.push(collectedAt);
+    }
+  }
+  return deleted;
 }
