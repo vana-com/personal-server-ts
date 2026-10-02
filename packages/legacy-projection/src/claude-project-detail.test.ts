@@ -75,3 +75,32 @@ describe("Claude 0.1.3 project detail", () => {
     });
   });
 });
+
+describe("claude.projects archived", () => {
+  it.each([
+    { is_archived: undefined, archived_at: undefined, archived: false },
+    { is_archived: null, archived_at: null, archived: false },
+    { is_archived: false, archived_at: null, archived: false },
+    { is_archived: true, archived_at: null, archived: true },
+    { is_archived: null, archived_at: "2026-01-01T00:00:00Z", archived: true },
+  ])(
+    "is a boolean like legacy's Boolean(archived_at): is_archived=$is_archived archived_at=$archived_at",
+    ({ is_archived, archived_at, archived }) => {
+      const result = projectPdppRecordsToLegacyPayload(
+        "claude.projects",
+        [
+          profile,
+          {
+            stream: "projects",
+            data: { id: "p2", name: "Plain", is_archived, archived_at },
+          },
+        ],
+        options,
+      );
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      const [projected] = result.payload.projects as { archived: unknown }[];
+      expect(projected.archived).toBe(archived);
+    },
+  );
+});

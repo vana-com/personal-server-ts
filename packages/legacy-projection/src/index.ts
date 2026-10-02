@@ -8,6 +8,7 @@ import type {
   LegacyScopeBinding,
   LegacyScopeLookupResult,
   PdppRecord,
+  ProjectionDiagnostic,
   ProjectPdppRecordsOptions,
   ProjectionResult,
 } from "./types.js";
@@ -25,6 +26,7 @@ export type {
   LegacyScopeLookupResult,
   PdppRecord,
   PdppSelection,
+  ProjectionDiagnostic,
   ProjectionError,
   ProjectionResult,
   ProjectPdppRecordsOptions,
@@ -140,8 +142,17 @@ export function projectPdppRecordsToLegacyPayload(
     }
     return { ok: false, error: { kind: "unknown_scope", scope } };
   }
-  const result = binding.project(records, options);
+  const result = binding.project(
+    options.orderByPrimaryKey
+      ? inPrimaryKeyOrder(records, binding.primaryKey)
+      : records,
+    options,
+  );
   if (!result.ok) return result;
+
+  // These bindings drop and count malformed rows themselves (see their
+  // records_dropped diagnostics) instead of failing the whole scope.
+  if (DROP_AND_COUNT_SCOPES.has(scope)) return result;
 
   for (const record of records) {
     if (!binding.pdppStreams.includes(record.stream)) continue;
@@ -181,7 +192,7 @@ export function projectPdppRecordsToLegacyPayload(
   // A schema-valid subset is still incomplete. A fetched stream with zero
   // source rows remains a valid empty success.
   const skipped = result.diagnostics?.filter(
-    (diagnostic) =>
+    (diagnostic): diagnostic is RecordsSkipped =>
       diagnostic.kind === "records_skipped" && diagnostic.count > 0,
   );
   if (skipped?.length) {
@@ -200,6 +211,43 @@ export function projectPdppRecordsToLegacyPayload(
     };
   }
   return result;
+}
+
+const DROP_AND_COUNT_SCOPES: ReadonlySet<string> = new Set([
+  "chatgpt.conversations",
+]);
+
+type RecordsSkipped = Extract<
+  ProjectionDiagnostic,
+  { kind: "records_skipped" }
+>;
+
+/**
+ * Stable sort by (stream, primary-key values). Rows with equal keys, or of a
+ * stream without a declared key, keep their input order.
+ */
+function inPrimaryKeyOrder(
+  records: PdppRecord[],
+  primaryKey: Record<string, string[]>,
+): PdppRecord[] {
+  const keyOf = (record: PdppRecord): string => {
+    const data = record.data as Record<string, unknown> | null | undefined;
+    const fields = primaryKey[record.stream] ?? [];
+    return JSON.stringify(
+      fields.map((field) =>
+        data && typeof data === "object" ? (data[field] ?? null) : null,
+      ),
+    );
+  };
+  return records
+    .map((record, index) => ({ record, index, key: keyOf(record) }))
+    .sort((a, b) => {
+      if (a.record.stream !== b.record.stream)
+        return a.record.stream < b.record.stream ? -1 : 1;
+      if (a.key !== b.key) return a.key < b.key ? -1 : 1;
+      return a.index - b.index;
+    })
+    .map(({ record }) => record);
 }
 
 function bindingFor(scope: string, profileKey?: string) {

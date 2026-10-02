@@ -518,12 +518,20 @@ describe("legacy scope binding self-check", () => {
         fetchedStreams: [...binding.pdppStreams],
       });
       if (scope === "chatgpt.conversations") {
+        // A conversation without branch evidence is dropped and counted,
+        // never projected with an invented thread.
         expect(result).toMatchObject({
-          ok: false,
-          error: {
-            kind: "invalid_value",
-            scope,
-          },
+          ok: true,
+          payload: { conversations: [], total: 0 },
+          diagnostics: [
+            {
+              kind: "records_dropped",
+              scope,
+              stream: "conversations",
+              count: 1,
+              reasons: ["Conversation lacks a current-branch message count"],
+            },
+          ],
         });
         return;
       }

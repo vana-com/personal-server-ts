@@ -2,6 +2,7 @@ import type {
   LegacyScopeBinding,
   PdppRecord,
   ProjectPdppRecordsOptions,
+  ProjectionDiagnostic,
   ProjectionErr,
   ProjectionResult,
 } from "./types.js";
@@ -38,6 +39,10 @@ function byStream(
   return records.filter((r) => r.stream === stream).map((r) => r.data);
 }
 
+function isObjectRow(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 function ifDefined(
   record: Record<string, unknown>,
   sourceField: string,
@@ -67,6 +72,16 @@ function missingStream(
  * stream in `fetchedStreams` with zero matching `records` is a real, empty
  * result (N-B1), not an error.
  */
+/**
+ * The timestamp a binding stamps on generated fields (`fetched_at`,
+ * `fetchedAt`, a null memory `created_at`). A caller that needs the same
+ * stored records to project to the same bytes passes `options.now`; without
+ * it the wall clock is used, as the legacy connectors did per run.
+ */
+function projectionTime(options: ProjectPdppRecordsOptions): string {
+  return options.now ?? new Date().toISOString();
+}
+
 function requireStreams(
   scope: string,
   options: ProjectPdppRecordsOptions,
@@ -1230,7 +1245,7 @@ const githubHistory: LegacyScopeBinding = {
     }
     return {
       ok: true,
-      payload: { pullRequests, issues, fetchedAt: new Date().toISOString() },
+      payload: { pullRequests, issues, fetchedAt: projectionTime(options) },
     };
   },
 };
@@ -1420,7 +1435,7 @@ const githubEvents: LegacyScopeBinding = {
     });
     return {
       ok: true,
-      payload: { events, fetchedAt: new Date().toISOString() },
+      payload: { events, fetchedAt: projectionTime(options) },
     };
   },
 };
@@ -1459,7 +1474,7 @@ const githubContributions: LegacyScopeBinding = {
         return [];
       return [{ date: r.date, count: r.contribution_count }];
     });
-    return { ok: true, payload: { days, fetchedAt: new Date().toISOString() } };
+    return { ok: true, payload: { days, fetchedAt: projectionTime(options) } };
   },
 };
 
@@ -1478,7 +1493,7 @@ const chatgptMemories: LegacyScopeBinding = {
   primaryKey: { memories: ["id"] },
   lossy: [
     "type: legacy always emits it, defaulting to the literal string 'memory' when the upstream field is absent (chatgpt-playwright.js:645, `memory.type || 'memory'`); the memories stream has no `type` field at all, so this binding reproduces that same fallback rather than omitting the field the schema allows.",
-    "created_at: a null value falls back to the wall clock at projection time (new Date().toISOString()), matching legacy's own `memory.created_at || new Date().toISOString()` fallback — this makes project() depend on the clock for that one field (N-M3).",
+    "created_at: a null value falls back to the projection time (options.now, else the wall clock), matching legacy's own `memory.created_at || new Date().toISOString()` fallback (N-M3).",
   ],
   provenance: [
     {
@@ -1509,7 +1524,7 @@ const chatgptMemories: LegacyScopeBinding = {
           created_at:
             typeof m.created_at === "string"
               ? m.created_at
-              : new Date().toISOString(),
+              : projectionTime(options),
           type: "memory",
           ...(typeof m.updated_at === "string"
             ? { updated_at: m.updated_at }
@@ -1552,8 +1567,8 @@ const chatgptConversations: LegacyScopeBinding = {
   primaryKey: { conversations: ["id"], messages: ["id"] },
   lossy: [
     "Conversation create/update times pass through as null when the source lacks them, matching legacy's listed?.create_time ?? fetched.create_time ?? null fallback.",
-    "fetched_at is generated at projection time, matching legacy's per-run toConversationRecord timestamp.",
-    "Conversations without complete current-branch message evidence reject the projection; nested full threads are not invented.",
+    "fetched_at is the projection time (options.now, else the wall clock), matching legacy's per-run toConversationRecord timestamp.",
+    "A conversation without complete current-branch message evidence, a valid id, or valid timestamps is dropped and counted in a records_dropped diagnostic; nested full threads are not invented. Messages whose conversation is absent are dropped and counted the same way.",
     "Only user/assistant text or multimodal_text messages with nonempty string content are retained, matching the legacy connector's walkMessages filter; message_count is the retained count.",
     "A missing title becomes 'Untitled', matching the legacy connector's toConversationRecord fallback; model_slug is renamed to model.",
   ],
@@ -1567,32 +1582,46 @@ const chatgptConversations: LegacyScopeBinding = {
     },
   ],
   project(records, options): ProjectionResult {
-    const guard = requireStreams("chatgpt.conversations", options, [
-      "conversations",
-      "messages",
-    ]);
+    const scope = "chatgpt.conversations";
+    const guard = requireStreams(scope, options, ["conversations"]);
     if (guard) return guard;
+    // Without a messages stream at all, a read-time caller still serves the
+    // conversation list (titles and times) with empty threads, and says so.
+    const messagesMissing = !options.fetchedStreams.includes("messages");
+    if (messagesMissing && !options.allowMissingJoinStreams)
+      return missingStream(scope, "messages");
+    const fetchedAt = projectionTime(options);
+
+    // One malformed conversation must not make the whole scope unreadable:
+    // it is left out and counted, by reason.
+    const dropped = new Map<string, number>();
+    const drop = (reason: string) =>
+      dropped.set(reason, (dropped.get(reason) ?? 0) + 1);
+    let malformedMessages = 0;
 
     const messagesByConversation = new Map<string, Record<string, unknown>[]>();
     for (const message of byStream(records, "messages")) {
+      if (!isObjectRow(message)) {
+        malformedMessages += 1;
+        continue;
+      }
       if (typeof message.conversation_id !== "string") continue;
       const group = messagesByConversation.get(message.conversation_id) ?? [];
       group.push(message);
       messagesByConversation.set(message.conversation_id, group);
     }
 
-    const sourceConversations = byStream(records, "conversations");
-    const sourceIds = new Set(sourceConversations.map((c) => c.id));
-    if ([...messagesByConversation.keys()].some((id) => !sourceIds.has(id))) {
-      return {
-        ok: false,
-        error: {
-          kind: "invalid_value",
-          scope: "chatgpt.conversations",
-          reason: "Messages have no matching conversation",
-        },
-      };
+    const sourceConversations: Record<string, unknown>[] = [];
+    for (const row of byStream(records, "conversations")) {
+      if (isObjectRow(row)) sourceConversations.push(row);
+      else drop("Conversation record is not an object");
     }
+    const sourceIds = new Set(sourceConversations.map((c) => c.id));
+    let orphanMessages = 0;
+    for (const [id, group] of messagesByConversation) {
+      if (!sourceIds.has(id)) orphanMessages += group.length;
+    }
+
     const conversations: Record<string, unknown>[] = [];
     for (const conversation of sourceConversations) {
       const {
@@ -1603,43 +1632,44 @@ const chatgptConversations: LegacyScopeBinding = {
         message_count_on_current_branch,
       } = conversation;
       if (!isOptionalString(create_time) || !isOptionalString(update_time)) {
-        return {
-          ok: false,
-          error: {
-            kind: "invalid_value",
-            scope: "chatgpt.conversations",
-            reason: "Conversation timestamps must be strings, null, or absent",
-          },
-        };
+        drop("Conversation timestamps must be strings, null, or absent");
+        continue;
+      }
+      if (!isNonEmptyString(id)) {
+        drop("Conversation lacks an id");
+        continue;
+      }
+      const title =
+        typeof conversation.title === "string" && conversation.title.length > 0
+          ? conversation.title
+          : "Untitled";
+      if (messagesMissing) {
+        conversations.push({
+          id,
+          title,
+          create_time: create_time ?? null,
+          update_time: update_time ?? null,
+          message_count: 0,
+          messages: [],
+          fetched_at: fetchedAt,
+        });
+        continue;
       }
       if (
-        !isNonEmptyString(id) ||
         typeof message_count_on_current_branch !== "number" ||
         !Number.isInteger(message_count_on_current_branch) ||
         message_count_on_current_branch < 0
       ) {
-        return {
-          ok: false,
-          error: {
-            kind: "invalid_value",
-            scope: "chatgpt.conversations",
-            reason: "Conversation lacks required branch identity or count",
-          },
-        };
+        drop("Conversation lacks a current-branch message count");
+        continue;
       }
 
       const branch = (messagesByConversation.get(id) ?? []).filter(
         (m) => m.on_current_branch === true,
       );
       if (branch.length !== message_count_on_current_branch) {
-        return {
-          ok: false,
-          error: {
-            kind: "invalid_value",
-            scope: "chatgpt.conversations",
-            reason: "Current branch message count does not match conversation",
-          },
-        };
+        drop("Current branch message count does not match conversation");
+        continue;
       }
       const byId = new Map(
         branch.filter((m) => typeof m.id === "string").map((m) => [m.id, m]),
@@ -1654,14 +1684,8 @@ const chatgptConversations: LegacyScopeBinding = {
         node = typeof message.parent_id === "string" ? message.parent_id : null;
       }
       if (ordered.length !== branch.length) {
-        return {
-          ok: false,
-          error: {
-            kind: "invalid_value",
-            scope: "chatgpt.conversations",
-            reason: "Current branch message chain is incomplete",
-          },
-        };
+        drop("Current branch message chain is incomplete");
+        continue;
       }
       ordered.reverse();
       const messages = ordered
@@ -1683,21 +1707,46 @@ const chatgptConversations: LegacyScopeBinding = {
         }));
       conversations.push({
         id,
-        title:
-          typeof conversation.title === "string" &&
-          conversation.title.length > 0
-            ? conversation.title
-            : "Untitled",
+        title,
         create_time: create_time ?? null,
         update_time: update_time ?? null,
         message_count: messages.length,
         messages,
-        fetched_at: new Date().toISOString(),
+        fetched_at: fetchedAt,
       });
+    }
+
+    const diagnostics: ProjectionDiagnostic[] = [];
+    if (dropped.size > 0) {
+      diagnostics.push({
+        kind: "records_dropped",
+        scope,
+        stream: "conversations",
+        count: [...dropped.values()].reduce((sum, n) => sum + n, 0),
+        reasons: [...dropped.keys()],
+      });
+    }
+    if (orphanMessages + malformedMessages > 0) {
+      diagnostics.push({
+        kind: "records_dropped",
+        scope,
+        stream: "messages",
+        count: orphanMessages + malformedMessages,
+        reasons: [
+          ...(orphanMessages > 0
+            ? ["Messages have no matching conversation"]
+            : []),
+          ...(malformedMessages > 0 ? ["Message record is not an object"] : []),
+        ],
+      });
+    }
+    if (messagesMissing) {
+      diagnostics.push({ kind: "stream_missing", scope, stream: "messages" });
     }
     return {
       ok: true,
       payload: { conversations, total: conversations.length },
+      ...(diagnostics.length > 0 ? { diagnostics } : {}),
     };
   },
 };
@@ -2195,7 +2244,9 @@ const claudeProjects: LegacyScopeBinding = {
         label: `Project, ${project.name}`,
         createdAt: project.create_time ?? null,
         updatedAt: project.update_time ?? null,
-        archived: project.is_archived ?? null,
+        // Legacy emits `Boolean(p?.archived_at)` (claude-export-playwright.js
+        // normalizeProject), so the value is always a boolean, never null.
+        archived: project.is_archived === true || Boolean(project.archived_at),
         detail,
       });
     }

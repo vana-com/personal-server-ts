@@ -2439,7 +2439,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
     it.each([
       { field: "create_time", value: 123, scenario: "numeric create_time" },
       { field: "update_time", value: {}, scenario: "object update_time" },
-    ])("rejects $scenario", ({ field, value }) => {
+    ])("drops and counts a conversation with $scenario", ({ field, value }) => {
       const result = projectPdppRecordsToLegacyPayload(
         "chatgpt.conversations",
         [
@@ -2459,12 +2459,20 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         { fetchedStreams: ["conversations", "messages"] },
       );
 
-      expect(result).toMatchObject({
-        ok: false,
-        error: {
-          kind: "invalid_value",
-          scope: "chatgpt.conversations",
-        },
+      expect(result).toEqual({
+        ok: true,
+        payload: { conversations: [], total: 0 },
+        diagnostics: [
+          {
+            kind: "records_dropped",
+            scope: "chatgpt.conversations",
+            stream: "conversations",
+            count: 1,
+            reasons: [
+              "Conversation timestamps must be strings, null, or absent",
+            ],
+          },
+        ],
       });
     });
 
@@ -2587,7 +2595,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       });
     });
 
-    it("fails closed when a conversation is missing required branch count", () => {
+    it("drops and counts the conversation when a conversation is missing required branch count", () => {
       const result = projectPdppRecordsToLegacyPayload(
         "chatgpt.conversations",
         [
@@ -2607,15 +2615,20 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       );
 
       expect(result).toMatchObject({
-        ok: false,
-        error: {
-          kind: "invalid_value",
-          scope: "chatgpt.conversations",
-        },
+        ok: true,
+        payload: { conversations: [], total: 0 },
+        diagnostics: [
+          {
+            kind: "records_dropped",
+            stream: "conversations",
+            count: 1,
+            reasons: ["Conversation lacks a current-branch message count"],
+          },
+        ],
       });
     });
 
-    it("fails closed when the current-branch message set is incomplete", () => {
+    it("drops and counts the conversation when the current-branch message set is incomplete", () => {
       const result = projectPdppRecordsToLegacyPayload(
         "chatgpt.conversations",
         [
@@ -2635,15 +2648,22 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       );
 
       expect(result).toMatchObject({
-        ok: false,
-        error: {
-          kind: "invalid_value",
-          scope: "chatgpt.conversations",
-        },
+        ok: true,
+        payload: { conversations: [], total: 0 },
+        diagnostics: [
+          {
+            kind: "records_dropped",
+            stream: "conversations",
+            count: 1,
+            reasons: [
+              "Current branch message count does not match conversation",
+            ],
+          },
+        ],
       });
     });
 
-    it("fails closed when a current-branch message is orphaned from the current_node chain", () => {
+    it("drops and counts the conversation when a current-branch message is orphaned from the current_node chain", () => {
       const result = projectPdppRecordsToLegacyPayload(
         "chatgpt.conversations",
         [
@@ -2687,12 +2707,197 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       );
 
       expect(result).toMatchObject({
-        ok: false,
-        error: {
-          kind: "invalid_value",
-          scope: "chatgpt.conversations",
-        },
+        ok: true,
+        payload: { conversations: [], total: 0 },
+        diagnostics: [
+          {
+            kind: "records_dropped",
+            stream: "conversations",
+            count: 1,
+            reasons: ["Current branch message chain is incomplete"],
+          },
+        ],
       });
+    });
+
+    it("serves the other conversations when one is malformed", () => {
+      const result = projectPdppRecordsToLegacyPayload(
+        "chatgpt.conversations",
+        [
+          ...conversationRecords,
+          {
+            stream: "conversations",
+            data: {
+              id: "conv_broken",
+              title: "Broken",
+              current_node: "gone",
+              message_count_on_current_branch: 2,
+            },
+          },
+          {
+            stream: "messages",
+            data: {
+              id: "msg_stray",
+              conversation_id: "conv_not_stored",
+              parent_id: null,
+              role: "user",
+              content: "No conversation row",
+              content_type: "text",
+              on_current_branch: true,
+            },
+          },
+        ],
+        { fetchedStreams: ["conversations", "messages"] },
+      );
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      const conversations = result.payload.conversations as {
+        id: string;
+        messages: unknown[];
+      }[];
+      expect(conversations.map((c) => c.id)).toEqual(["conv_1"]);
+      expect(conversations[0].messages).toHaveLength(3);
+      expect(result.payload.total).toBe(1);
+      expect(result.diagnostics).toEqual([
+        {
+          kind: "records_dropped",
+          scope: "chatgpt.conversations",
+          stream: "conversations",
+          count: 1,
+          reasons: ["Current branch message count does not match conversation"],
+        },
+        {
+          kind: "records_dropped",
+          scope: "chatgpt.conversations",
+          stream: "messages",
+          count: 1,
+          reasons: ["Messages have no matching conversation"],
+        },
+      ]);
+      validateAgainst(
+        { schema: chatgptConversationsSchema.schema },
+        result.payload,
+      );
+    });
+
+    it("drops a conversation without an id and non-object rows instead of failing the scope", () => {
+      const result = projectPdppRecordsToLegacyPayload(
+        "chatgpt.conversations",
+        [
+          ...conversationRecords,
+          {
+            stream: "conversations",
+            data: { title: "No id", message_count_on_current_branch: 0 },
+          },
+          {
+            stream: "conversations",
+            data: null as unknown as Record<string, unknown>,
+          },
+          {
+            stream: "messages",
+            data: null as unknown as Record<string, unknown>,
+          },
+        ],
+        { fetchedStreams: ["conversations", "messages"] },
+      );
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(
+        (result.payload.conversations as { id: string }[]).map((c) => c.id),
+      ).toEqual(["conv_1"]);
+      expect(result.diagnostics).toEqual([
+        {
+          kind: "records_dropped",
+          scope: "chatgpt.conversations",
+          stream: "conversations",
+          count: 2,
+          reasons: [
+            "Conversation record is not an object",
+            "Conversation lacks an id",
+          ],
+        },
+        {
+          kind: "records_dropped",
+          scope: "chatgpt.conversations",
+          stream: "messages",
+          count: 1,
+          reasons: ["Message record is not an object"],
+        },
+      ]);
+    });
+
+    it("projects empty threads and reports stream_missing when allowed to run without messages", () => {
+      const result = projectPdppRecordsToLegacyPayload(
+        "chatgpt.conversations",
+        conversationRecords.filter(
+          (record) => record.stream === "conversations",
+        ),
+        {
+          fetchedStreams: ["conversations"],
+          allowMissingJoinStreams: true,
+          now: "2026-10-01T00:00:00.000Z",
+        },
+      );
+
+      expect(result).toEqual({
+        ok: true,
+        payload: {
+          conversations: [
+            {
+              id: "conv_1",
+              title: "Adapter notes",
+              create_time: "2026-09-22T10:00:00Z",
+              update_time: "2026-09-22T10:05:00Z",
+              message_count: 0,
+              messages: [],
+              fetched_at: "2026-10-01T00:00:00.000Z",
+            },
+          ],
+          total: 1,
+        },
+        diagnostics: [
+          {
+            kind: "stream_missing",
+            scope: "chatgpt.conversations",
+            stream: "messages",
+          },
+        ],
+      });
+    });
+
+    it("projects the same records to the same output given now and key order", () => {
+      const options = {
+        fetchedStreams: ["conversations", "messages"],
+        now: "2026-10-01T00:00:00.000Z",
+        orderByPrimaryKey: true,
+      };
+      const second: PdppRecord = {
+        stream: "conversations",
+        data: {
+          id: "conv_0",
+          title: "Earlier",
+          current_node: null,
+          message_count_on_current_branch: 0,
+        },
+      };
+      const forward = projectPdppRecordsToLegacyPayload(
+        "chatgpt.conversations",
+        [...conversationRecords, second],
+        options,
+      );
+      const reversed = projectPdppRecordsToLegacyPayload(
+        "chatgpt.conversations",
+        [second, ...conversationRecords].reverse(),
+        options,
+      );
+
+      expect(JSON.stringify(forward)).toBe(JSON.stringify(reversed));
+      expect(forward.ok && forward.payload.conversations).toMatchObject([
+        { id: "conv_0", fetched_at: "2026-10-01T00:00:00.000Z" },
+        { id: "conv_1", fetched_at: "2026-10-01T00:00:00.000Z" },
+      ]);
     });
 
     it("preserves a fetched empty conversations result", () => {

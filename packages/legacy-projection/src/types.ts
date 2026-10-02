@@ -48,12 +48,26 @@ export interface ProjectionOk {
   ok: true;
   payload: Record<string, unknown>;
 }
-export interface ProjectionDiagnostic {
-  count: number;
-  kind: "records_skipped";
-  missingFields: string[];
-  scope: string;
-}
+/**
+ * `records_skipped` makes the whole projection `incomplete_scope`.
+ * `records_dropped` and `stream_missing` do not: the payload is served
+ * without the named rows, and the diagnostic says how many were left out.
+ */
+export type ProjectionDiagnostic =
+  | {
+      count: number;
+      kind: "records_skipped";
+      missingFields: string[];
+      scope: string;
+    }
+  | {
+      count: number;
+      kind: "records_dropped";
+      reasons: string[];
+      scope: string;
+      stream: string;
+    }
+  | { kind: "stream_missing"; scope: string; stream: string };
 export interface ProjectionErr {
   error: ProjectionError;
   ok: false;
@@ -71,6 +85,27 @@ export interface ProjectPdppRecordsOptions {
   fetchedStreams: string[];
   /** Selected signed connector key. Omitted for the original PAT binding. */
   profileKey?: string;
+  /**
+   * ISO timestamp for generated fields (`fetched_at`, `fetchedAt`, a null
+   * memory `created_at`). Pass it to make the same records project to the
+   * same bytes. Defaults to the wall clock.
+   */
+  now?: string;
+  /**
+   * A stream absent from `fetchedStreams` normally fails with
+   * `missing_stream`. When this is true, a binding that can still produce a
+   * useful payload without a join stream does so and reports
+   * `stream_missing` instead. Today only `chatgpt.conversations` can (it
+   * projects conversations with `messages: []`). For read-time callers whose
+   * join stream has no stored version yet.
+   */
+  allowMissingJoinStreams?: boolean;
+  /**
+   * Feed rows to the binding sorted by (stream, primary key) instead of in
+   * input order, so the output does not depend on the order rows were
+   * stored in. Top-level arrays then follow key order, not source order.
+   */
+  orderByPrimaryKey?: boolean;
 }
 
 /**
