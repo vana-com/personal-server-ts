@@ -420,19 +420,30 @@ describe("withLegacyProjection", () => {
 
     for (let round = 0; round < 3; round += 1) {
       for (const scope of ["chatgpt.conversations", "chatgpt.memories"]) {
-        await served.readEnvelope(scope, "2026-10-01T00:00:01.000Z");
         await served.readEnvelopeBytes!(scope, "2026-10-01T00:00:01.000Z");
       }
     }
 
-    expect(
-      readEnvelope.mock.calls.filter(
-        ([scope]) => scope === "chatgpt.conversations",
-      ),
-    ).toHaveLength(3);
-    expect(
-      readEnvelope.mock.calls.filter(([scope]) => scope === "chatgpt.memories"),
-    ).toHaveLength(3);
+    expect(readEnvelope.mock.calls.map(([scope]) => scope).sort()).toEqual([
+      "chatgpt.conversations",
+      "chatgpt.memories",
+    ]);
+  });
+
+  it("reads a legacy envelope once when it serves it", async () => {
+    const raw = createMemoryDataStorage();
+    await store(raw, "chatgpt.conversations", "2026-10-01T00:00:01.000Z", {
+      conversations: [],
+      total: 0,
+    });
+    const readEnvelope = vi.spyOn(raw, "readEnvelope");
+
+    await withLegacyProjection(raw).readEnvelope(
+      "chatgpt.conversations",
+      "2026-10-01T00:00:01.000Z",
+    );
+
+    expect(readEnvelope).toHaveBeenCalledOnce();
   });
 
   it("serves a body of tagged {stream, data} rows as stored", async () => {
@@ -453,37 +464,40 @@ describe("withLegacyProjection", () => {
     expect(data).toEqual(body);
   });
 
-  it("joins a historical version with the sibling streams of its own time", async () => {
-    const raw = createMemoryDataStorage();
-    // Run 1 writes messages after conversations; run 2 rewrites both.
-    await store(raw, "chatgpt.conversations", "2026-10-01T00:00:01.000Z", {
-      records: [conversation],
-    });
-    await store(raw, "chatgpt.messages", "2026-10-01T00:00:02.000Z", {
-      records: messages,
-    });
-    await store(raw, "chatgpt.conversations", "2026-10-02T00:00:01.000Z", {
-      records: [
-        {
-          ...conversation,
-          current_node: "m1",
-          message_count_on_current_branch: 1,
-        },
-      ],
-    });
-    await store(raw, "chatgpt.messages", "2026-10-02T00:00:02.000Z", {
-      records: [messages[1]],
-    });
-    const served = withLegacyProjection(raw);
-    const thread = async (collectedAt: string) =>
-      (
-        (await served.readEnvelope("chatgpt.conversations", collectedAt))
-          .data as { conversations: { messages: { id: string }[] }[] }
-      ).conversations[0].messages.map((m) => m.id);
+  it.each([
+    ["after", "2026-10-01T00:00:02.000Z", "2026-10-02T00:00:02.000Z"],
+    ["before", "2026-10-01T00:00:00.000Z", "2026-10-02T00:00:00.000Z"],
+  ])(
+    "joins a historical version with the messages its run wrote %s it",
+    async (_order, run1Messages, run2Messages) => {
+      const raw = createMemoryDataStorage();
+      await store(raw, "chatgpt.messages", run1Messages, { records: messages });
+      await store(raw, "chatgpt.conversations", "2026-10-01T00:00:01.000Z", {
+        records: [conversation],
+      });
+      await store(raw, "chatgpt.messages", run2Messages, {
+        records: [messages[1]],
+      });
+      await store(raw, "chatgpt.conversations", "2026-10-02T00:00:01.000Z", {
+        records: [
+          {
+            ...conversation,
+            current_node: "m1",
+            message_count_on_current_branch: 1,
+          },
+        ],
+      });
+      const served = withLegacyProjection(raw);
+      const thread = async (collectedAt: string) =>
+        (
+          (await served.readEnvelope("chatgpt.conversations", collectedAt))
+            .data as { conversations: { messages: { id: string }[] }[] }
+        ).conversations[0].messages.map((m) => m.id);
 
-    expect(await thread("2026-10-01T00:00:01.000Z")).toEqual(["m1", "m2"]);
-    expect(await thread("2026-10-02T00:00:01.000Z")).toEqual(["m1"]);
-  });
+      expect(await thread("2026-10-01T00:00:01.000Z")).toEqual(["m1", "m2"]);
+      expect(await thread("2026-10-02T00:00:01.000Z")).toEqual(["m1"]);
+    },
+  );
 
   it("is idempotent", () => {
     const served = withLegacyProjection(createMemoryDataStorage());

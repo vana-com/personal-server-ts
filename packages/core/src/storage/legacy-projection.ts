@@ -136,10 +136,10 @@ export function withLegacyProjection(
     if (!isProjectedScope(scope)) return { view: null };
     const binding = LEGACY_SCOPE_BINDINGS.get(scope)!;
     const source = scope.slice(0, scope.indexOf("."));
-    // A historical version joins the sibling streams as they stood until
-    // the next version of `scope` was written, not the newest siblings. The
-    // latest version joins the latest siblings, whatever order one run wrote
-    // its streams in.
+    // The latest version joins the latest siblings, whatever order one run
+    // wrote its streams in. A historical version joins, of the sibling
+    // versions written before the next version of `scope`, the one nearest
+    // in time: the one its own run wrote, before or after it.
     const supersededAt = nextVersionTime(raw, scope, collectedAt);
     const inputs = binding.pdppStreams.map((stream) => {
       const storedScope = `${source}.${stream}`;
@@ -148,7 +148,7 @@ export function withLegacyProjection(
           ? raw.findEntry({ scope, at: collectedAt })
           : supersededAt === undefined
             ? raw.findEntry({ scope: storedScope })
-            : newestBefore(raw, storedScope, supersededAt);
+            : nearestBefore(raw, storedScope, collectedAt, supersededAt);
       return {
         stream,
         storedScope,
@@ -426,16 +426,33 @@ function nextVersionTime(
   return next;
 }
 
-/** The newest version of `scope` collected before `bound` (epoch ms). */
-function newestBefore(
+/**
+ * The version of `scope` collected nearest to `collectedAt`, among those
+ * collected before `bound` (epoch ms).
+ */
+function nearestBefore(
   raw: DataStoragePort,
   scope: string,
+  collectedAt: string,
   bound: number,
 ): IndexEntry | undefined {
-  const before = (entry: IndexEntry) => Date.parse(entry.collectedAt) < bound;
-  const latest = raw.findEntry({ scope });
-  if (!latest || before(latest)) return latest;
-  return walkVersions(raw, scope, before);
+  const at = Date.parse(collectedAt);
+  // Newest first: remember the last version after `at`, stop at the first
+  // one at or before it, and take whichever of the two is nearer.
+  let after: IndexEntry | undefined;
+  const notAfter = walkVersions(raw, scope, (entry) => {
+    const time = Date.parse(entry.collectedAt);
+    if (time > at) {
+      if (time < bound) after = entry;
+      return false;
+    }
+    return true;
+  });
+  if (!after || !notAfter) return after ?? notAfter;
+  return Date.parse(after.collectedAt) - at <
+    at - Date.parse(notAfter.collectedAt)
+    ? after
+    : notAfter;
 }
 
 /** A `{stream, data}` row: a record tagged with its stream, not a stream row. */
