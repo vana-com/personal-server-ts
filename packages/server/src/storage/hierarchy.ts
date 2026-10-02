@@ -69,6 +69,20 @@ export async function writeDataFile(
   };
 }
 
+/** Publish a fully written scope envelope with one atomic rename. */
+export async function publishStagedDataFile(
+  stagePath: string,
+  finalPath: string,
+): Promise<void> {
+  await rename(stagePath, finalPath);
+  const directory = await open(dirname(finalPath), "r");
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
+}
+
 /** Read and parse a data file */
 export async function readDataFile(
   options: HierarchyManagerOptions,

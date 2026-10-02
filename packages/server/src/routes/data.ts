@@ -1,4 +1,4 @@
-import { Hono } from "hono";
+import { Hono, type Context, type MiddlewareHandler } from "hono";
 import {
   handlePersonalServerDataRequest,
   type PersonalServerApiDispatchOptions,
@@ -33,6 +33,21 @@ import {
 } from "../middleware/body-limit.js";
 import { createNodeDataStorage } from "../storage/node-data-storage.js";
 import { createServerApiAuth } from "../api-auth.js";
+import { parseDataScopeContract } from "@opendatalabs/personal-server-ts-core/contracts";
+import {
+  ContentTooLargeError,
+  ProtocolError,
+} from "@opendatalabs/personal-server-ts-core/errors";
+import { cacheRequestBodyBytes } from "@opendatalabs/personal-server-ts-core/auth";
+import {
+  abortScopeImport,
+  beginScopeImport,
+  finalizeScopeImport,
+  putScopeImportChunk,
+  ScopeImportError,
+  SCOPE_IMPORT_CHUNK_BYTES,
+  type ScopeImportDeps,
+} from "./chunked-scope-import.js";
 
 export interface DataRouteDeps {
   indexManager: IndexManager;
@@ -107,6 +122,31 @@ export interface DataRouteDeps {
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
 }
 
+export function isChunkedScopeImportEndpoint(
+  method: string,
+  path: string,
+): boolean {
+  const segments = path.split("/").filter(Boolean);
+  const importsIndex = segments.lastIndexOf("imports");
+  if (importsIndex < 1) return false;
+  const suffix = segments.slice(importsIndex);
+
+  if (method === "POST") {
+    return (
+      (suffix.length === 1 && suffix[0] === "imports") ||
+      (suffix.length === 3 &&
+        suffix[0] === "imports" &&
+        suffix[2] === "finalize")
+    );
+  }
+  if (method === "PUT") {
+    return (
+      suffix.length === 4 && suffix[0] === "imports" && suffix[2] === "chunks"
+    );
+  }
+  return method === "DELETE" && suffix.length === 2 && suffix[0] === "imports";
+}
+
 export function dataRoutes(deps: DataRouteDeps): Hono {
   const app = new Hono();
 
@@ -129,7 +169,160 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     writeProofReplayStore: deps.writeProofReplayStore,
   });
 
-  app.use("/:scope", createBodyLimit(DATA_INGEST_MAX_SIZE));
+  const importDeps: ScopeImportDeps = {
+    hierarchyOptions: deps.hierarchyOptions,
+    indexManager: deps.indexManager,
+    serverOwner: deps.serverOwner,
+    authorizeOwner: (request, scope) =>
+      auth.authorizeOwnerScope(request, scope),
+    syncManager: deps.syncManager,
+    onDataWritten: (event) => deps.onDataWritten?.(event),
+    afterTombstoneVersion: async (scope) => {
+      if (!deps.scopeDeletions) return null;
+      const verdict = await deps.scopeDeletions.resolve(scope);
+      if (!verdict.deleted || verdict.version === null) return null;
+      const version = Number(verdict.version);
+      return Number.isSafeInteger(version) ? version : null;
+    },
+  };
+
+  const importRoute = async (
+    c: Context,
+    action: () => Promise<unknown>,
+    status = 200,
+  ) => {
+    try {
+      return c.body(JSON.stringify(await action()), status as 200, {
+        "content-type": "application/json",
+      });
+    } catch (error) {
+      if (error instanceof ScopeImportError) {
+        return c.body(
+          JSON.stringify({ error: error.code, message: error.message }),
+          error.status as 400,
+          { "content-type": "application/json" },
+        );
+      }
+      if (error instanceof ProtocolError) {
+        return c.body(
+          JSON.stringify({ error: error.errorCode, message: error.message }),
+          error.code as 400,
+          { "content-type": "application/json" },
+        );
+      }
+      const caught = error as {
+        status?: number;
+        code?: string;
+        message?: string;
+      };
+      if (caught.status && caught.code) {
+        return c.body(
+          JSON.stringify({ error: caught.code, message: caught.message }),
+          caught.status as 500,
+          { "content-type": "application/json" },
+        );
+      }
+      return c.body(
+        JSON.stringify({
+          error: "IMPORT_FAILED",
+          message: "Scope import failed",
+        }),
+        500,
+        { "content-type": "application/json" },
+      );
+    }
+  };
+
+  const cacheImportRequestBody =
+    (maxBytes: number): MiddlewareHandler =>
+    async (c, next) => {
+      try {
+        await cacheRequestBodyBytes(c.req.raw, maxBytes, true);
+      } catch (error) {
+        if (error instanceof ContentTooLargeError) {
+          return c.json(
+            {
+              error: "CONTENT_TOO_LARGE",
+              message: `Request body exceeds maximum size of ${maxBytes} bytes`,
+            },
+            413,
+          );
+        }
+        throw error;
+      }
+      await next();
+    };
+
+  app.post("/:scope/imports", createBodyLimit(4096), (c) =>
+    importRoute(
+      c,
+      async () => {
+        const parsedScope = parseDataScopeContract(c.req.param("scope"));
+        if (!parsedScope.ok) {
+          throw new ScopeImportError(
+            400,
+            "INVALID_SCOPE",
+            parsedScope.body.message,
+          );
+        }
+        let body: unknown;
+        try {
+          body = await c.req.json();
+        } catch {
+          throw new ScopeImportError(
+            400,
+            "INVALID_BODY",
+            "Request body must be valid JSON",
+          );
+        }
+        return beginScopeImport(importDeps, c.req.raw, parsedScope.scope, body);
+      },
+      201,
+    ),
+  );
+  app.put(
+    "/:scope/imports/:id/chunks/:index",
+    cacheImportRequestBody(SCOPE_IMPORT_CHUNK_BYTES),
+    (c) =>
+      importRoute(c, () =>
+        putScopeImportChunk(
+          importDeps,
+          c.req.raw,
+          c.req.param("scope"),
+          c.req.param("id"),
+          Number(c.req.param("index")),
+        ),
+      ),
+  );
+  app.post("/:scope/imports/:id/finalize", cacheImportRequestBody(0), (c) =>
+    importRoute(
+      c,
+      () =>
+        finalizeScopeImport(
+          importDeps,
+          c.req.raw,
+          c.req.param("scope"),
+          c.req.param("id"),
+        ),
+      201,
+    ),
+  );
+  app.delete("/:scope/imports/:id", cacheImportRequestBody(0), (c) =>
+    importRoute(c, () =>
+      abortScopeImport(
+        importDeps,
+        c.req.raw,
+        c.req.param("scope"),
+        c.req.param("id"),
+      ),
+    ),
+  );
+
+  const legacyWriteBodyLimit = createBodyLimit(DATA_INGEST_MAX_SIZE);
+  app.use("/:scope", (c, next) => {
+    if (isChunkedScopeImportEndpoint(c.req.method, c.req.path)) return next();
+    return legacyWriteBodyLimit(c, next);
+  });
   app.all("*", (c) =>
     handlePersonalServerDataRequest(
       c.req.raw,
