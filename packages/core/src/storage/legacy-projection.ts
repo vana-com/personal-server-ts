@@ -23,6 +23,7 @@ import {
   type ProjectionError,
 } from "../legacy-projection/index.js";
 import type { DataStoragePort } from "../ports/index.js";
+import type { IndexEntry } from "./index/types.js";
 import { buildDataBlocksAsync } from "./blocks/build.js";
 import { readBuiltScopeBlocks } from "./blocks/page.js";
 import type { DataBlockManifest, DataScopeBlock } from "./blocks/types.js";
@@ -43,10 +44,12 @@ const SERVER_STAMP_KEYS: ReadonlySet<string> = new Set([
 
 /**
  * - `legacy`: anything that is not exactly `{records: [...]}`. Served as stored.
- * - `pdpp-projected`: `{records}` under a scope with a legacy binding of a
- *   projected source. Served as the projected legacy body.
+ * - `pdpp-projected`: `{records}` of plain rows under a scope with a legacy
+ *   binding of a projected source. Served as the projected legacy body.
  * - `pdpp-unprojected`: `{records}` under any other scope (for example
- *   `chatgpt.messages`, which has no legacy form). Served as stored.
+ *   `chatgpt.messages`, which has no legacy form), or `{records}` holding a
+ *   tagged `{stream, data}` row, which is not one stream's rows. Served as
+ *   stored.
  */
 export type StoredBodyForm = "legacy" | "pdpp-projected" | "pdpp-unprojected";
 
@@ -55,7 +58,9 @@ export function classifyStoredBody(
   data: unknown,
 ): StoredBodyForm {
   if (!isRecordsBody(data)) return "legacy";
-  return isProjectedScope(scope) ? "pdpp-projected" : "pdpp-unprojected";
+  return isProjectedScope(scope) && !data.records.some(isTaggedRecord)
+    ? "pdpp-projected"
+    : "pdpp-unprojected";
 }
 
 export type LegacyProjectionIssue =
@@ -93,6 +98,9 @@ interface Projected {
 
 const textEncoder = new TextEncoder();
 
+/** How many stored versions' body forms one served port remembers. */
+const FORM_CACHE_SIZE = 64;
+
 /**
  * Wrap a raw storage port so reads of projected scopes return legacy bodies.
  * Wrapping an already wrapped port returns it unchanged.
@@ -106,20 +114,41 @@ export function withLegacyProjection(
   // One entry, keyed by the versions of every input. It saves re-projecting
   // on repeated reads of the same data; it is not a persistent cache.
   let memo: { key: string; value: Projected | null } | null = null;
+  // The body form of each stored version read so far, so a version that is
+  // not projected (most often a legacy body) is parsed to classify it once,
+  // not on every read. Bounded; the oldest entry goes first.
+  const forms = new Map<string, StoredBodyForm>();
+  const rememberForm = (version: string, form: StoredBodyForm) => {
+    forms.set(version, form);
+    if (forms.size > FORM_CACHE_SIZE) {
+      forms.delete(forms.keys().next().value!);
+    }
+  };
 
-  async function projected(
+  /**
+   * The projected view of a stored version, or null when it is served as
+   * stored. `own` is the stored envelope when it had to be read to decide.
+   */
+  async function resolve(
     scope: string,
     collectedAt: string,
-  ): Promise<Projected | null> {
-    if (!isProjectedScope(scope)) return null;
+  ): Promise<{ view: Projected | null; own?: DataFileEnvelope }> {
+    if (!isProjectedScope(scope)) return { view: null };
     const binding = LEGACY_SCOPE_BINDINGS.get(scope)!;
     const source = scope.slice(0, scope.indexOf("."));
+    // A historical version joins the sibling streams as they stood until
+    // the next version of `scope` was written, not the newest siblings. The
+    // latest version joins the latest siblings, whatever order one run wrote
+    // its streams in.
+    const supersededAt = nextVersionTime(raw, scope, collectedAt);
     const inputs = binding.pdppStreams.map((stream) => {
       const storedScope = `${source}.${stream}`;
       const entry =
         storedScope === scope
           ? raw.findEntry({ scope, at: collectedAt })
-          : raw.findEntry({ scope: storedScope });
+          : supersededAt === undefined
+            ? raw.findEntry({ scope: storedScope })
+            : newestBefore(raw, storedScope, supersededAt);
       return {
         stream,
         storedScope,
@@ -129,17 +158,35 @@ export function withLegacyProjection(
         version: entry ? `${entry.id}@${entry.collectedAt}` : null,
       };
     });
+    const ownVersion = inputs.find(
+      (input) => input.storedScope === scope,
+    )?.version;
+    if (ownVersion) {
+      const form = forms.get(ownVersion);
+      if (form !== undefined && form !== "pdpp-projected") {
+        return { view: null };
+      }
+    }
     const key = JSON.stringify([scope, inputs.map((input) => input.version)]);
-    if (memo?.key === key) return memo.value;
+    if (memo?.key === key) return { view: memo.value };
 
     const own = await raw.readEnvelope(scope, collectedAt);
+    const form = classifyStoredBody(scope, own.data);
+    if (ownVersion) rememberForm(ownVersion, form);
     let value: Projected | null = null;
-    if (classifyStoredBody(scope, own.data) === "pdpp-projected") {
+    if (form === "pdpp-projected") {
       value = await project(scope, collectedAt, own, inputs);
       if (value) value.view = key;
     }
     memo = { key, value };
-    return value;
+    return { view: value, own };
+  }
+
+  async function projected(
+    scope: string,
+    collectedAt: string,
+  ): Promise<Projected | null> {
+    return (await resolve(scope, collectedAt)).view;
   }
 
   async function project(
@@ -159,8 +206,12 @@ export function withLegacyProjection(
         input.storedScope === scope
           ? own
           : await raw.readEnvelope(input.storedScope, input.collectedAt);
-      const rows = isRecordsBody(envelope.data) ? envelope.data.records : null;
-      if (!rows) continue;
+      if (classifyStoredBody(input.storedScope, envelope.data) === "legacy") {
+        continue;
+      }
+      const rows = (envelope.data as { records: Record<string, unknown>[] })
+        .records;
+      if (rows.some(isTaggedRecord)) continue;
       fetchedStreams.push(input.stream);
       if (input.collectedAt > now) now = input.collectedAt;
       for (const row of rows) {
@@ -218,10 +269,8 @@ export function withLegacyProjection(
   const overrides: Partial<DataStoragePort> & { [SERVED]: true } = {
     [SERVED]: true,
     async readEnvelope(scope, collectedAt) {
-      return (
-        (await projected(scope, collectedAt))?.envelope ??
-        raw.readEnvelope(scope, collectedAt)
-      );
+      const { view, own } = await resolve(scope, collectedAt);
+      return view?.envelope ?? own ?? raw.readEnvelope(scope, collectedAt);
     },
     readStoredEnvelope(scope, collectedAt) {
       return raw.readEnvelope(scope, collectedAt);
@@ -338,6 +387,68 @@ function isProjectedScope(scope: string): boolean {
     dot > 0 &&
     PROJECTED_SOURCES.has(scope.slice(0, dot)) &&
     LEGACY_SCOPE_BINDINGS.has(scope)
+  );
+}
+
+const VERSION_PAGE_SIZE = 100;
+
+/** Versions of `scope`, newest first, until `stop` returns true. */
+function walkVersions(
+  raw: DataStoragePort,
+  scope: string,
+  stop: (entry: IndexEntry) => boolean,
+): IndexEntry | undefined {
+  for (let offset = 0; ; offset += VERSION_PAGE_SIZE) {
+    const page = raw.listVersions(scope, { limit: VERSION_PAGE_SIZE, offset });
+    const found = page.find(stop);
+    if (found || page.length < VERSION_PAGE_SIZE) return found;
+  }
+}
+
+/**
+ * When the version of `scope` after the one at `collectedAt` was collected,
+ * or undefined when that version is the latest (or not indexed).
+ */
+function nextVersionTime(
+  raw: DataStoragePort,
+  scope: string,
+  collectedAt: string,
+): number | undefined {
+  const at = Date.parse(collectedAt);
+  const latest = raw.findEntry({ scope });
+  if (!latest || !(Date.parse(latest.collectedAt) > at)) return undefined;
+  let next = Date.parse(latest.collectedAt);
+  walkVersions(raw, scope, (entry) => {
+    const time = Date.parse(entry.collectedAt);
+    if (time > at) next = time;
+    return !(time > at);
+  });
+  return next;
+}
+
+/** The newest version of `scope` collected before `bound` (epoch ms). */
+function newestBefore(
+  raw: DataStoragePort,
+  scope: string,
+  bound: number,
+): IndexEntry | undefined {
+  const before = (entry: IndexEntry) => Date.parse(entry.collectedAt) < bound;
+  const latest = raw.findEntry({ scope });
+  if (!latest || before(latest)) return latest;
+  return walkVersions(raw, scope, before);
+}
+
+/** A `{stream, data}` row: a record tagged with its stream, not a stream row. */
+function isTaggedRecord(row: unknown): boolean {
+  if (row === null || typeof row !== "object" || Array.isArray(row)) {
+    return false;
+  }
+  const { stream, data } = row as { stream?: unknown; data?: unknown };
+  return (
+    typeof stream === "string" &&
+    data !== null &&
+    typeof data === "object" &&
+    !Array.isArray(data)
   );
 }
 

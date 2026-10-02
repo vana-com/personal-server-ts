@@ -81,6 +81,11 @@ describe("classifyStoredBody", () => {
       { records: [], $writtenBy: { builder: "0x1" } },
       "pdpp-projected",
     ],
+    [
+      "chatgpt.conversations",
+      { records: [{ stream: "conversations", data: { id: "c" } }] },
+      "pdpp-unprojected",
+    ],
   ])("%s %j is %s", (scope, data, form) => {
     expect(classifyStoredBody(scope, data)).toBe(form);
   });
@@ -363,6 +368,121 @@ describe("withLegacyProjection", () => {
     const { data } = await served.readEnvelope("chatgpt.conversations", at);
 
     expect(data).toMatchObject({ conversations: [{ title: "Replaced" }] });
+  });
+
+  it("serves chatgpt.conversations newest update first, not in id order", async () => {
+    const raw = createMemoryDataStorage();
+    const older = {
+      ...conversation,
+      id: "conv-a",
+      update_time: "2026-09-01T10:05:00Z",
+      current_node: null,
+      message_count_on_current_branch: 0,
+    };
+    const newer = {
+      ...older,
+      id: "conv-b",
+      update_time: "2026-09-02T10:05:00Z",
+    };
+    await store(raw, "chatgpt.messages", "2026-10-01T00:00:00.000Z", {
+      records: [],
+    });
+    await store(raw, "chatgpt.conversations", "2026-10-01T00:00:01.000Z", {
+      records: [older, newer],
+    });
+
+    const { data } = await withLegacyProjection(raw).readEnvelope(
+      "chatgpt.conversations",
+      "2026-10-01T00:00:01.000Z",
+    );
+
+    expect(
+      (data as { conversations: { id: string }[] }).conversations.map(
+        (c) => c.id,
+      ),
+    ).toEqual(["conv-b", "conv-a"]);
+  });
+
+  it("parses each legacy version once to classify it, even when reads alternate between scopes", async () => {
+    const raw = createMemoryDataStorage();
+    await store(raw, "chatgpt.conversations", "2026-10-01T00:00:01.000Z", {
+      conversations: [],
+      total: 0,
+    });
+    await store(raw, "chatgpt.memories", "2026-10-01T00:00:01.000Z", {
+      memories: [],
+      total: 0,
+    });
+    // Raw bytes, as a file-backed port returns them without parsing.
+    raw.readEnvelopeBytes = async () => new Uint8Array();
+    const readEnvelope = vi.spyOn(raw, "readEnvelope");
+    const served = withLegacyProjection(raw);
+
+    for (let round = 0; round < 3; round += 1) {
+      for (const scope of ["chatgpt.conversations", "chatgpt.memories"]) {
+        await served.readEnvelope(scope, "2026-10-01T00:00:01.000Z");
+        await served.readEnvelopeBytes!(scope, "2026-10-01T00:00:01.000Z");
+      }
+    }
+
+    expect(
+      readEnvelope.mock.calls.filter(
+        ([scope]) => scope === "chatgpt.conversations",
+      ),
+    ).toHaveLength(3);
+    expect(
+      readEnvelope.mock.calls.filter(([scope]) => scope === "chatgpt.memories"),
+    ).toHaveLength(3);
+  });
+
+  it("serves a body of tagged {stream, data} rows as stored", async () => {
+    const raw = createMemoryDataStorage();
+    await store(raw, "chatgpt.messages", "2026-10-01T00:00:00.000Z", {
+      records: messages,
+    });
+    const body = {
+      records: [{ stream: "conversations", data: conversation }],
+    };
+    await store(raw, "chatgpt.conversations", "2026-10-01T00:00:01.000Z", body);
+
+    const { data } = await withLegacyProjection(raw).readEnvelope(
+      "chatgpt.conversations",
+      "2026-10-01T00:00:01.000Z",
+    );
+
+    expect(data).toEqual(body);
+  });
+
+  it("joins a historical version with the sibling streams of its own time", async () => {
+    const raw = createMemoryDataStorage();
+    // Run 1 writes messages after conversations; run 2 rewrites both.
+    await store(raw, "chatgpt.conversations", "2026-10-01T00:00:01.000Z", {
+      records: [conversation],
+    });
+    await store(raw, "chatgpt.messages", "2026-10-01T00:00:02.000Z", {
+      records: messages,
+    });
+    await store(raw, "chatgpt.conversations", "2026-10-02T00:00:01.000Z", {
+      records: [
+        {
+          ...conversation,
+          current_node: "m1",
+          message_count_on_current_branch: 1,
+        },
+      ],
+    });
+    await store(raw, "chatgpt.messages", "2026-10-02T00:00:02.000Z", {
+      records: [messages[1]],
+    });
+    const served = withLegacyProjection(raw);
+    const thread = async (collectedAt: string) =>
+      (
+        (await served.readEnvelope("chatgpt.conversations", collectedAt))
+          .data as { conversations: { messages: { id: string }[] }[] }
+      ).conversations[0].messages.map((m) => m.id);
+
+    expect(await thread("2026-10-01T00:00:01.000Z")).toEqual(["m1", "m2"]);
+    expect(await thread("2026-10-02T00:00:01.000Z")).toEqual(["m1"]);
   });
 
   it("is idempotent", () => {
