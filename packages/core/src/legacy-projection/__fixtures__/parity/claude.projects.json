@@ -1,0 +1,333 @@
+{
+  "scope": "claude.projects",
+  "provenance": {
+    "legacyConnector": "claude-export-playwright.js claude-export-playwright 2.0.1 sha256:12a068a5186aececdd13e999b84f14a281d8e3d256c1eec70b812afd17142152",
+    "pdppBundle": "claude-0.2.23.js sha256:570e3fe205f1f80b2ee35e3bcecc8d267cdb94f8ae06159cff072313a9b9721d",
+    "inputs": "inputs/claude/{export-entries,organizations,site}.json (synthetic; real export key names from data-connectors connectors/anthropic/__fixtures__/split-export + fixtures/scrubbed/pilot-real-shape, packed as one old-format ZIP); served by lib/claude-upstream.mjs to both scripts",
+    "generatedBy": "generate.mjs",
+    "clock": "frozen at 2026-10-01T00:00:00.000Z in both script runs (legacy now()-derived fields carry this value)",
+    "legacyRequestedScopes": [
+      "claude.conversations",
+      "claude.projects"
+    ],
+    "pdppRequestedScopes": [
+      "claude.account_profile",
+      "claude.conversations",
+      "claude.messages",
+      "claude.projects",
+      "claude.project_documents"
+    ],
+    "pdppStreamDedupe": {
+      "account_profile": {
+        "emitted": 1,
+        "stored": 1,
+        "unkeyed": 0
+      },
+      "projects": {
+        "emitted": 3,
+        "stored": 3,
+        "unkeyed": 0
+      },
+      "project_documents": {
+        "emitted": 2,
+        "stored": 2,
+        "unkeyed": 0
+      }
+    }
+  },
+  "fetchedStreams": [
+    "account_profile",
+    "projects",
+    "project_documents"
+  ],
+  "streams": {
+    "account_profile": [
+      {
+        "id": "0a9e1f00-0000-4000-8000-0000000000a1",
+        "organization_id": "0a9e1f00-0000-4000-8000-0000000000a1",
+        "full_name": "Synthetic Claude User",
+        "plan": "Pro plan",
+        "name_source": "browser_menu",
+        "metadata_status": "valid"
+      }
+    ],
+    "projects": [
+      {
+        "id": "0a9e1f00-0000-4000-8000-0000000000d1",
+        "name": "Design System",
+        "description": "Tokens and components.",
+        "create_time": "2026-09-01T00:00:00.000000Z",
+        "update_time": "2026-09-09T00:00:00.000000Z",
+        "is_archived": false,
+        "prompt_template": "Answer as a design-system reviewer.",
+        "creator": {
+          "uuid": "0a9e1f00-0000-4000-8000-0000000000b1",
+          "full_name": "Synthetic Claude User"
+        },
+        "is_private": true,
+        "is_starter_project": false,
+        "archived_at": null,
+        "raw_docs": [
+          {
+            "uuid": "0a9e1f00-0000-4000-8000-00000000d011",
+            "filename": "tokens.md",
+            "content": "# Tokens\nspacing-1: 4px",
+            "created_at": "2026-09-02T00:00:00.000000Z"
+          },
+          {
+            "filename": "id-less.md",
+            "content": "A document without a uuid.",
+            "created_at": "2026-09-03T00:00:00.000000Z"
+          }
+        ]
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-0000000000d2",
+        "name": "Old Research",
+        "description": null,
+        "create_time": "2026-03-01T00:00:00.000000Z",
+        "update_time": "2026-05-01T00:00:00.000000Z",
+        "is_archived": true,
+        "prompt_template": null,
+        "creator": {
+          "uuid": "0a9e1f00-0000-4000-8000-0000000000b1",
+          "full_name": "Synthetic Claude User"
+        },
+        "is_private": true,
+        "is_starter_project": false,
+        "archived_at": "2026-05-01T00:00:00.000000Z",
+        "raw_docs": []
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-0000000000d3",
+        "name": "How to use Claude",
+        "description": "An example project.",
+        "create_time": "2026-09-05T00:00:00.000000Z",
+        "update_time": "2026-09-05T00:00:00.000000Z",
+        "is_archived": false,
+        "prompt_template": null,
+        "creator": null,
+        "is_private": false,
+        "is_starter_project": true,
+        "archived_at": null,
+        "raw_docs": [
+          {
+            "uuid": "0a9e1f00-0000-4000-8000-00000000d031",
+            "filename": "intro.md",
+            "content": "Example content.",
+            "created_at": "2026-09-05T00:00:00.000000Z"
+          }
+        ]
+      }
+    ],
+    "project_documents": [
+      {
+        "id": "0a9e1f00-0000-4000-8000-00000000d011",
+        "project_id": "0a9e1f00-0000-4000-8000-0000000000d1",
+        "filename": "tokens.md",
+        "content": "# Tokens\nspacing-1: 4px",
+        "create_time": "2026-09-02T00:00:00.000000Z",
+        "update_time": null
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-00000000d031",
+        "project_id": "0a9e1f00-0000-4000-8000-0000000000d3",
+        "filename": "intro.md",
+        "content": "Example content.",
+        "create_time": "2026-09-05T00:00:00.000000Z",
+        "update_time": null
+      }
+    ]
+  },
+  "legacyBody": {
+    "profile": {
+      "name": "Synthetic Claude User",
+      "plan": "Pro plan"
+    },
+    "organizationId": "0a9e1f00-0000-4000-8000-0000000000a1",
+    "projects": [
+      {
+        "id": "0a9e1f00-0000-4000-8000-0000000000d1",
+        "title": "Design System",
+        "href": "/project/0a9e1f00-0000-4000-8000-0000000000d1",
+        "label": "Project, Design System",
+        "createdAt": "2026-09-01T00:00:00.000000Z",
+        "updatedAt": "2026-09-09T00:00:00.000000Z",
+        "archived": false,
+        "detail": {
+          "uuid": "0a9e1f00-0000-4000-8000-0000000000d1",
+          "name": "Design System",
+          "description": "Tokens and components.",
+          "is_private": true,
+          "is_starter_project": false,
+          "prompt_template": "Answer as a design-system reviewer.",
+          "created_at": "2026-09-01T00:00:00.000000Z",
+          "updated_at": "2026-09-09T00:00:00.000000Z",
+          "creator": {
+            "uuid": "0a9e1f00-0000-4000-8000-0000000000b1",
+            "full_name": "Synthetic Claude User"
+          },
+          "docs": [
+            {
+              "uuid": "0a9e1f00-0000-4000-8000-00000000d011",
+              "filename": "tokens.md",
+              "content": "# Tokens\nspacing-1: 4px",
+              "created_at": "2026-09-02T00:00:00.000000Z"
+            },
+            {
+              "filename": "id-less.md",
+              "content": "A document without a uuid.",
+              "created_at": "2026-09-03T00:00:00.000000Z"
+            }
+          ]
+        }
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-0000000000d2",
+        "title": "Old Research",
+        "href": "/project/0a9e1f00-0000-4000-8000-0000000000d2",
+        "label": "Project, Old Research",
+        "createdAt": "2026-03-01T00:00:00.000000Z",
+        "updatedAt": "2026-05-01T00:00:00.000000Z",
+        "archived": true,
+        "detail": {
+          "uuid": "0a9e1f00-0000-4000-8000-0000000000d2",
+          "name": "Old Research",
+          "description": "",
+          "is_private": true,
+          "is_starter_project": false,
+          "prompt_template": "",
+          "created_at": "2026-03-01T00:00:00.000000Z",
+          "updated_at": "2026-05-01T00:00:00.000000Z",
+          "archived_at": "2026-05-01T00:00:00.000000Z",
+          "creator": {
+            "uuid": "0a9e1f00-0000-4000-8000-0000000000b1",
+            "full_name": "Synthetic Claude User"
+          },
+          "docs": []
+        }
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-0000000000d3",
+        "title": "How to use Claude",
+        "href": "/project/0a9e1f00-0000-4000-8000-0000000000d3",
+        "label": "Project, How to use Claude",
+        "createdAt": "2026-09-05T00:00:00.000000Z",
+        "updatedAt": "2026-09-05T00:00:00.000000Z",
+        "archived": false,
+        "detail": {
+          "uuid": "0a9e1f00-0000-4000-8000-0000000000d3",
+          "name": "How to use Claude",
+          "description": "An example project.",
+          "is_private": false,
+          "is_starter_project": true,
+          "prompt_template": "",
+          "created_at": "2026-09-05T00:00:00.000000Z",
+          "updated_at": "2026-09-05T00:00:00.000000Z",
+          "creator": null,
+          "docs": [
+            {
+              "uuid": "0a9e1f00-0000-4000-8000-00000000d031",
+              "filename": "intro.md",
+              "content": "Example content.",
+              "created_at": "2026-09-05T00:00:00.000000Z"
+            }
+          ]
+        }
+      }
+    ],
+    "total": 3,
+    "source": "official-export"
+  },
+  "reviewedDifferences": [
+    {
+      "path": "projects[id=0a9e1f00-0000-4000-8000-0000000000d1].detail.archived_at",
+      "legacy": "<absent>",
+      "projected": null,
+      "reason": "projection-only key: the PDPP projects stream always carries archived_at (null when not archived)"
+    },
+    {
+      "path": "projects[id=0a9e1f00-0000-4000-8000-0000000000d1].detail.docs[0].updated_at",
+      "legacy": "<absent>",
+      "projected": null,
+      "reason": "projection-only key: the adapter always writes docs[].updated_at; raw export docs have none"
+    },
+    {
+      "path": "projects[id=0a9e1f00-0000-4000-8000-0000000000d1].detail.docs[1]",
+      "legacy": {
+        "filename": "id-less.md",
+        "content": "A document without a uuid.",
+        "created_at": "2026-09-03T00:00:00.000000Z"
+      },
+      "projected": "<absent>",
+      "reason": "a raw doc without a uuid is not a project_documents record; it survives only in detail.raw_docs"
+    },
+    {
+      "path": "projects[id=0a9e1f00-0000-4000-8000-0000000000d1].detail.raw_docs",
+      "legacy": "<absent>",
+      "projected": [
+        {
+          "uuid": "0a9e1f00-0000-4000-8000-00000000d011",
+          "filename": "tokens.md",
+          "content": "# Tokens\nspacing-1: 4px",
+          "created_at": "2026-09-02T00:00:00.000000Z"
+        },
+        {
+          "filename": "id-less.md",
+          "content": "A document without a uuid.",
+          "created_at": "2026-09-03T00:00:00.000000Z"
+        }
+      ],
+      "reason": "projection-only key: the adapter adds raw_docs from the PDPP projects stream"
+    },
+    {
+      "path": "projects[id=0a9e1f00-0000-4000-8000-0000000000d2].detail.description",
+      "legacy": "",
+      "projected": null,
+      "reason": "the PDPP connector maps an empty description/prompt_template to null; legacy keeps the raw \"\""
+    },
+    {
+      "path": "projects[id=0a9e1f00-0000-4000-8000-0000000000d2].detail.prompt_template",
+      "legacy": "",
+      "projected": null,
+      "reason": "the PDPP connector maps an empty description/prompt_template to null; legacy keeps the raw \"\""
+    },
+    {
+      "path": "projects[id=0a9e1f00-0000-4000-8000-0000000000d2].detail.raw_docs",
+      "legacy": "<absent>",
+      "projected": [],
+      "reason": "projection-only key: the adapter adds raw_docs from the PDPP projects stream"
+    },
+    {
+      "path": "projects[id=0a9e1f00-0000-4000-8000-0000000000d3].detail.archived_at",
+      "legacy": "<absent>",
+      "projected": null,
+      "reason": "projection-only key: the PDPP projects stream always carries archived_at (null when not archived)"
+    },
+    {
+      "path": "projects[id=0a9e1f00-0000-4000-8000-0000000000d3].detail.docs[uuid=0a9e1f00-0000-4000-8000-00000000d031].updated_at",
+      "legacy": "<absent>",
+      "projected": null,
+      "reason": "projection-only key: the adapter always writes docs[].updated_at; raw export docs have none"
+    },
+    {
+      "path": "projects[id=0a9e1f00-0000-4000-8000-0000000000d3].detail.prompt_template",
+      "legacy": "",
+      "projected": null,
+      "reason": "the PDPP connector maps an empty description/prompt_template to null; legacy keeps the raw \"\""
+    },
+    {
+      "path": "projects[id=0a9e1f00-0000-4000-8000-0000000000d3].detail.raw_docs",
+      "legacy": "<absent>",
+      "projected": [
+        {
+          "uuid": "0a9e1f00-0000-4000-8000-00000000d031",
+          "filename": "intro.md",
+          "content": "Example content.",
+          "created_at": "2026-09-05T00:00:00.000000Z"
+        }
+      ],
+      "reason": "projection-only key: the adapter adds raw_docs from the PDPP projects stream"
+    }
+  ]
+}

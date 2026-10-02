@@ -1,0 +1,41 @@
+{
+  "_comment": "Synthetic fixture shaped only from fields in the pinned H-E-B 0.2.0 collection profile.",
+  "records": [
+    {
+      "stream": "orders",
+      "data": {
+        "id": "HEB12345",
+        "order_date": "2026-09-15",
+        "total_cents": 2575,
+        "item_count": 2,
+        "status": "Ready for pickup"
+      }
+    },
+    {
+      "stream": "order_items",
+      "data": {
+        "id": "HEB12345|12345678",
+        "order_id": "HEB12345",
+        "name": "Apples",
+        "product_id": "12345678",
+        "product_url": "https://www.heb.com/product-detail/apples",
+        "image_url": "https://images.heb.com/apples.jpg",
+        "quantity": 2,
+        "line_total_cents": 250
+      }
+    },
+    {
+      "stream": "order_items",
+      "data": {
+        "id": "HEB12345|unknown-product",
+        "order_id": "HEB12345",
+        "name": "Unidentified item",
+        "product_id": null,
+        "product_url": null,
+        "image_url": null,
+        "quantity": null,
+        "line_total_cents": null
+      }
+    }
+  ]
+}

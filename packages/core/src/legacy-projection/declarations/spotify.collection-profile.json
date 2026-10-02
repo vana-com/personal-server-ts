@@ -1,0 +1,318 @@
+{
+	"protocol_version": "0.1.0",
+	"connector_id": "https://registry.pdpp.dev/connectors/spotify",
+	"connector_key": "spotify",
+	"manifest_uri": "https://registry.pdpp.dev/connectors/spotify",
+	"version": "0.1.4",
+	"display_name": "Spotify",
+	"brand": {
+		"icon": "icon.svg",
+		"background_color": "#1ED760"
+	},
+	"runtime_requirements": {
+		"bindings": {
+			"network": {
+				"required": true
+			},
+			"browser": {
+				"required": true
+			}
+		}
+	},
+	"capabilities": {
+		"human_interaction": ["manual_action"],
+		"public_listing": {
+			"tier": "development",
+			"rationale": "Browser-session replacement for the legacy Spotify connector. Keeps profile, playlists, playlist items, and saved tracks without requiring owners to paste a one-hour public Web API access token."
+		},
+		"refresh_policy": {
+			"recommended_mode": "manual",
+			"recommended_interval_seconds": 21600,
+			"minimum_interval_seconds": 3600,
+			"maximum_staleness_seconds": 86400,
+			"interaction_posture": "manual_action_likely",
+			"rate_limit_sensitivity": "medium",
+			"bot_detection_sensitivity": "medium",
+			"background_safe": false,
+			"rationale": "Collection reuses the owner's open.spotify.com browser session. Existing sessions can refresh unattended while valid, but first collection and expired sessions require the owner to sign in through the browser handoff."
+		}
+	},
+	"streams": [
+		{
+			"name": "playlists",
+			"description": "User's playlists.",
+			"display": {
+				"label": "Your playlists",
+				"detail": "Playlist names, ownership, public/collaborative flags, track counts, snapshot IDs."
+			},
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string"
+					},
+					"name": {
+						"type": "string",
+						"x_pdpp_role": "primary-title"
+					},
+					"owner_id": {
+						"type": ["string", "null"]
+					},
+					"owner_name": {
+						"type": ["string", "null"],
+						"x_pdpp_role": "actor"
+					},
+					"public": {
+						"type": ["boolean", "null"]
+					},
+					"collaborative": {
+						"type": ["boolean", "null"]
+					},
+					"track_count": {
+						"type": ["integer", "null"]
+					},
+					"snapshot_id": {
+						"type": ["string", "null"]
+					},
+					"description": {
+						"type": ["string", "null"],
+						"x_pdpp_role": "secondary"
+					},
+					"uri": {
+						"type": ["string", "null"]
+					},
+					"followers": {
+						"type": ["integer", "null"]
+					},
+					"images": {
+						"type": "array"
+					}
+				},
+				"required": ["id", "name"]
+			},
+			"primary_key": ["id"],
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"required": true,
+			"incremental": false,
+			"query": {
+				"search": {
+					"lexical_fields": ["name", "owner_name", "description"],
+					"semantic_fields": ["description"]
+				}
+			},
+			"coverage_strategy": "full_inventory",
+			"freshness_strategy": "manual_as_of"
+		},
+		{
+			"name": "playlist_items",
+			"description": "Tracks within the user's playlists (D3 child stream of playlists).",
+			"display": {
+				"label": "Your playlist tracks",
+				"detail": "One record per track in a playlist: playlist, track identity, position, when and by whom it was added."
+			},
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string"
+					},
+					"playlist_id": {
+						"type": "string"
+					},
+					"track_id": {
+						"type": ["string", "null"]
+					},
+					"uri": {
+						"type": ["string", "null"]
+					},
+					"position": {
+						"type": "integer"
+					},
+					"added_at": {
+						"type": ["string", "null"],
+						"format": "date-time",
+						"x_pdpp_role": "event-time"
+					},
+					"added_by": {
+						"type": ["string", "null"],
+						"x_pdpp_role": "actor"
+					},
+					"name": {
+						"type": "string",
+						"x_pdpp_role": "primary-title"
+					},
+					"artist_names": {
+						"type": "array"
+					},
+					"album_name": {
+						"type": ["string", "null"]
+					},
+					"duration_ms": {
+						"type": ["integer", "null"]
+					}
+				},
+				"required": ["id", "playlist_id", "position"]
+			},
+			"primary_key": ["id"],
+			"consent_time_field": "added_at",
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"required": false,
+			"incremental": false,
+			"relationships": [
+				{
+					"name": "playlist",
+					"stream": "playlists",
+					"foreign_key": "playlist_id",
+					"cardinality": "has_one"
+				}
+			],
+			"query": {
+				"search": {
+					"lexical_fields": ["name", "album_name"]
+				},
+				"range_filters": {
+					"added_at": ["gte", "gt", "lte", "lt"]
+				},
+				"aggregations": {
+					"count": true,
+					"group_by_time": ["added_at"]
+				}
+			},
+			"coverage_strategy": "full_inventory",
+			"freshness_strategy": "manual_as_of"
+		},
+		{
+			"name": "saved_tracks",
+			"description": "User's saved/liked tracks.",
+			"display": {
+				"label": "Your saved tracks",
+				"detail": "Liked tracks, when they were added, artist/album context."
+			},
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string"
+					},
+					"name": {
+						"type": "string",
+						"x_pdpp_role": "primary-title"
+					},
+					"artist_names": {
+						"type": "array"
+					},
+					"album_name": {
+						"type": ["string", "null"]
+					},
+					"duration_ms": {
+						"type": ["integer", "null"]
+					},
+					"popularity": {
+						"type": ["integer", "null"]
+					},
+					"added_at": {
+						"type": ["string", "null"],
+						"format": "date-time",
+						"x_pdpp_role": "event-time"
+					},
+					"isrc": {
+						"type": ["string", "null"]
+					},
+					"uri": {
+						"type": ["string", "null"]
+					},
+					"explicit": {
+						"type": ["boolean", "null"]
+					},
+					"album_artist_names": {
+						"type": "array"
+					}
+				},
+				"required": ["id", "name"]
+			},
+			"primary_key": ["id"],
+			"cursor_field": "added_at",
+			"consent_time_field": "added_at",
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"required": true,
+			"incremental": true,
+			"query": {
+				"search": {
+					"lexical_fields": ["name", "album_name"]
+				},
+				"aggregations": {
+					"count": true,
+					"group_by_time": ["added_at"]
+				},
+				"range_filters": {
+					"added_at": ["gte", "gt", "lte", "lt"]
+				}
+			},
+			"coverage_strategy": "checkpoint_window",
+			"freshness_strategy": "manual_as_of"
+		},
+		{
+			"name": "profile",
+			"description": "The authenticated Spotify account's own profile, from GET /me.",
+			"display": {
+				"label": "Your Spotify profile",
+				"detail": "Account id, display name, follower count."
+			},
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string"
+					},
+					"display_name": {
+						"type": ["string", "null"],
+						"x_pdpp_role": "primary-title"
+					},
+					"followers": {
+						"type": ["integer", "null"]
+					},
+					"uri": {
+						"type": ["string", "null"]
+					},
+					"images": {
+						"type": "array"
+					},
+					"following": {
+						"type": ["integer", "null"]
+					}
+				},
+				"required": ["id"]
+			},
+			"primary_key": ["id"],
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"required": false,
+			"incremental": false,
+			"query": {
+				"search": {
+					"lexical_fields": ["display_name"]
+				}
+			},
+			"coverage_strategy": "singleton_presence",
+			"freshness_strategy": "manual_as_of"
+		}
+	],
+	"reason_display_messages": {
+		"spotify_browser_stage1_deferred": "Spotify has deferred this stream in the current browser connector version. Other supported Spotify streams can still sync."
+	}
+}

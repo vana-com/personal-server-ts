@@ -1,0 +1,121 @@
+{
+  "generated_file_notice": "GENERATED FILE — DO NOT HAND-EDIT. Rebuild with scripts/build-connector-oci-artifact.mjs.",
+  "connector_key": "whoop",
+  "connector_id": "https://registry.pdpp.dev/connectors/whoop",
+  "version": "0.1.0",
+  "protocol_version": "0.1.0",
+  "source": {
+    "repository": "https://github.com/PDP-Connect/data-connectors",
+    "revision": "3754d80d98e2f93c89a38be104231eb1b84a6ad5",
+    "package": "packages/polyfill-connectors"
+  },
+  "source_inventory": [
+    {
+      "path": "connectors/whoop/index.ts",
+      "sha256": "sha256:edd2b0793d6370801bfa91cba6ad308f48aa96ef468e9c54a1b005b6e7c161a6"
+    },
+    {
+      "path": "connectors/whoop/parsers.ts",
+      "sha256": "sha256:eb2d4d059322fc91c33032c2f69d6dab4c5fe3594fd80fcc4547e0f260f7cc9e"
+    },
+    {
+      "path": "connectors/whoop/schemas.ts",
+      "sha256": "sha256:1d618f117bcaa6cd46d1bda794dc9b076a0fdb5a7b113b2e71356143f8803390"
+    },
+    {
+      "path": "src/browser-handoff.ts",
+      "sha256": "sha256:dd316a8f9bce9a7f1a623d59612575d426d35b212ad3e8d075590ce9d2d1b6d7"
+    },
+    {
+      "path": "src/browser-launch.ts",
+      "sha256": "sha256:914bc80f3a4c53a6f52324ece77e42fa0e0e762ab9d48604364fe346a9ed6607"
+    },
+    {
+      "path": "src/capture-redaction.ts",
+      "sha256": "sha256:de9f0ef459574d5ef3a03b060e241dab705e8f981958c6d7d2eca8f7a97b4e4a"
+    },
+    {
+      "path": "src/connector-exit.ts",
+      "sha256": "sha256:395555db65b8760bd5f7812fe81c7b5922d84a25bfc8a1e82a925c9bd2ed0b56"
+    },
+    {
+      "path": "src/connector-runtime.ts",
+      "sha256": "sha256:73c8746a5a5900ddb5e57263669b5bb5feee55cdc9977ce51e19819d4c4e56ca"
+    },
+    {
+      "path": "src/fixture-capture.ts",
+      "sha256": "sha256:29b8863a659f25c7946640c358bca543f33f4d942d8fd042b28884f4e5d1d653"
+    },
+    {
+      "path": "src/profile-lock.ts",
+      "sha256": "sha256:e4398bd9a175edcc62cfed0df33bd5c2cd570450f846e5e9e73a8b99e523ad36"
+    },
+    {
+      "path": "src/runtime-environment.ts",
+      "sha256": "sha256:93ad3686202601fe638f97d5278c80b521092b31d849d53d77fe93fb3154d57d"
+    },
+    {
+      "path": "src/schema-registry.ts",
+      "sha256": "sha256:0babcc2e73431002b31e58bfd8754b85d10294cfa51058d4471db7f95a164b73"
+    },
+    {
+      "path": "src/session-establish.ts",
+      "sha256": "sha256:c204b0f5106def83cc517f0ddce3c1ac4910c49ecdd048542cc130dcbe046d2a"
+    },
+    {
+      "path": "src/shutdown-hook.ts",
+      "sha256": "sha256:20f2918a9c85e645776f3a5c2e46b9ec930d429e50443436978a5cccdabc604f"
+    },
+    {
+      "path": "src/streaming-target-registration.ts",
+      "sha256": "sha256:12eaeeecd9fcbff8b2cd0846721163917df2f6f9e0692050fb581269ef6a76ca"
+    },
+    {
+      "path": "src/terminal-error.ts",
+      "sha256": "sha256:4bc3efc944ca22615905239ee7f875cfc27aabd8ca5dafe28ee5cc8e6d8c426a"
+    }
+  ],
+  "build": {
+    "esbuild_version": "0.28.2",
+    "options": {
+      "bundle": true,
+      "format": "esm",
+      "minifyWhitespace": true,
+      "platform": "node",
+      "target": "node24"
+    }
+  },
+  "runtime_requirements": {
+    "bindings": {
+      "network": {
+        "required": true
+      },
+      "browser": {
+        "required": true
+      }
+    }
+  },
+  "host_runtime_contract": {
+    "version": "1.1",
+    "node": ">=24.15.0 <25",
+    "packages": [
+      {
+        "specifier": "patchright",
+        "package": "patchright",
+        "declared_version": "1.63.0",
+        "reason": "Browser automation driver. Needs a downloaded Chromium build and a matching host OS, which an artifact cannot carry; bundling the JS alone would not make it runnable.",
+        "loaded": "dynamic-import"
+      }
+    ]
+  },
+  "bundled_dependencies": [
+    "@pdpp/connector-protocol",
+    "zod"
+  ],
+  "outputs": {
+    "collection-profile.json": "sha256:56526b134cb2ff5299170f78811b59ae58397cf8f3ec026887c9540baee91abf",
+    "code.tar.gz": "sha256:8d8a7b37df7e3d478d9ded4d51f7219af8b6f82872abe14e86a6b19f13f95691",
+    "assets.tar.gz": "sha256:7a7e69cfb08cefc78d9992b22646f8e6c8449f89f13980cc884aaf86b646a808",
+    "licenses.tar.gz": "sha256:8c753d01585a84cd993125b54c6f062d3ffea8e50069979e48ebb8a23682c623"
+  }
+}

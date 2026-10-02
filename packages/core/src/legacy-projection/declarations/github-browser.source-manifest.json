@@ -1,0 +1,620 @@
+{
+	"protocol_version": "0.1.0",
+	"connector_id": "https://registry.pdpp.dev/connectors/github-browser",
+	"connector_key": "github-browser",
+	"manifest_uri": "https://registry.pdpp.dev/connectors/github-browser",
+	"version": "0.1.0",
+	"display_name": "GitHub (browser session)",
+	"brand": {
+		"icon": "icon.svg",
+		"background_color": "#181717"
+	},
+	"runtime_requirements": {
+		"bindings": {
+			"network": {
+				"required": true
+			},
+			"browser": {
+				"required": true
+			}
+		}
+	},
+	"capabilities": {
+		"human_interaction": ["manual_action"],
+		"public_listing": {
+			"tier": "development",
+			"rationale": "Separate browser-session profile for existing Vana GitHub users. The PAT connector remains the recommended profile for new connections."
+		},
+		"refresh_policy": {
+			"recommended_mode": "manual",
+			"recommended_interval_seconds": 21600,
+			"minimum_interval_seconds": 3600,
+			"maximum_staleness_seconds": 86400,
+			"interaction_posture": "manual_action_likely",
+			"rate_limit_sensitivity": "high",
+			"bot_detection_sensitivity": "medium",
+			"background_safe": false,
+			"rationale": "Uses an owner signed-in GitHub browser session and public GitHub web/API surfaces. Expired sessions need owner sign-in."
+		}
+	},
+	"streams": [
+		{
+			"name": "profile",
+			"description": "Legacy GitHub profile, pinned repositories, organization links, achievements, and displayed contribution count, collected from the signed-in profile page.",
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": { "type": "string" },
+					"username": {
+						"type": "string"
+					},
+					"fullName": {
+						"type": "string"
+					},
+					"bio": {
+						"type": "string"
+					},
+					"company": {
+						"type": "string"
+					},
+					"location": {
+						"type": "string"
+					},
+					"website": {
+						"type": "string"
+					},
+					"avatarUrl": {
+						"type": "string"
+					},
+					"followers": {
+						"type": "number"
+					},
+					"following": {
+						"type": "number"
+					},
+					"repositoryCount": {
+						"type": "number"
+					},
+					"profileUrl": {
+						"type": "string"
+					},
+					"pinnedRepositories": {
+						"type": "array",
+						"items": {
+							"type": "object",
+							"properties": {
+								"fullName": {
+									"type": "string"
+								},
+								"url": {
+									"type": ["string", "null"]
+								},
+								"description": {
+									"type": "string"
+								},
+								"language": {
+									"type": ["string", "null"]
+								},
+								"stars": {
+									"type": "number"
+								}
+							},
+							"required": ["fullName"],
+							"additionalProperties": false
+						}
+					},
+					"organizations": {
+						"type": "array",
+						"items": {
+							"type": "object",
+							"properties": {
+								"login": {
+									"type": "string"
+								},
+								"label": {
+									"type": "string"
+								},
+								"url": {
+									"type": "string"
+								},
+								"avatarUrl": {
+									"type": ["string", "null"]
+								}
+							},
+							"required": ["login"],
+							"additionalProperties": false
+						}
+					},
+					"achievements": {
+						"type": "array",
+						"items": {
+							"type": "object",
+							"properties": {
+								"name": {
+									"type": "string"
+								},
+								"iconUrl": {
+									"type": ["string", "null"]
+								}
+							},
+							"required": ["name"],
+							"additionalProperties": false
+						}
+					},
+					"contributionsLastYear": {
+						"type": ["number", "null"]
+					}
+				},
+				"required": ["id", "username", "profileUrl"],
+				"additionalProperties": false
+			},
+			"primary_key": ["id"],
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"incremental": false,
+			"coverage_strategy": "singleton_presence",
+			"freshness_strategy": "scheduled_window"
+		},
+		{
+			"name": "repositories",
+			"description": "Repositories displayed in the signed-in user's repositories tab.",
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": { "type": "string" },
+					"repositories": {
+						"type": "array",
+						"items": {
+							"type": "object",
+							"properties": {
+								"name": {
+									"type": "string"
+								},
+								"url": {
+									"type": "string"
+								},
+								"description": {
+									"type": "string"
+								},
+								"language": {
+									"type": "string"
+								},
+								"stars": {
+									"type": "number"
+								},
+								"forks": {
+									"type": "number"
+								},
+								"visibility": {
+									"type": "string"
+								},
+								"topics": {
+									"type": "array",
+									"items": {
+										"type": "string"
+									}
+								},
+								"updatedAt": {
+									"type": ["string", "null"]
+								}
+							},
+							"required": ["name", "url"],
+							"additionalProperties": false
+						}
+					}
+				},
+				"required": ["id", "repositories"],
+				"additionalProperties": false
+			},
+			"primary_key": ["id"],
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"incremental": false,
+			"coverage_strategy": "full_inventory",
+			"freshness_strategy": "scheduled_window"
+		},
+		{
+			"name": "starred",
+			"description": "Repositories displayed in the signed-in user's starred list.",
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": { "type": "string" },
+					"starred": {
+						"type": "array",
+						"items": {
+							"type": "object",
+							"properties": {
+								"fullName": {
+									"type": "string"
+								},
+								"url": {
+									"type": "string"
+								},
+								"description": {
+									"type": "string"
+								},
+								"language": {
+									"type": "string"
+								},
+								"stars": {
+									"type": "number"
+								},
+								"updatedAt": {
+									"type": ["string", "null"]
+								}
+							},
+							"required": ["fullName", "url"],
+							"additionalProperties": false
+						}
+					}
+				},
+				"required": ["id", "starred"],
+				"additionalProperties": false
+			},
+			"primary_key": ["id"],
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"incremental": false,
+			"coverage_strategy": "full_inventory",
+			"freshness_strategy": "scheduled_window"
+		},
+		{
+			"name": "events",
+			"description": "Recent public activity events (up to 300 events and GitHub's retention window).",
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": { "type": "string" },
+					"events": {
+						"type": "array",
+						"items": {
+							"type": "object",
+							"properties": {
+								"id": {
+									"type": "string"
+								},
+								"type": {
+									"type": "string"
+								},
+								"createdAt": {
+									"type": "string"
+								},
+								"repo": {
+									"type": "string"
+								},
+								"repoUrl": {
+									"type": "string"
+								},
+								"action": {
+									"type": ["string", "null"]
+								},
+								"title": {
+									"type": ["string", "null"]
+								},
+								"body": {
+									"type": ["string", "null"]
+								},
+								"url": {
+									"type": ["string", "null"]
+								},
+								"branch": {
+									"type": ["string", "null"]
+								},
+								"commits": {
+									"type": ["number", "null"]
+								},
+								"isPublic": {
+									"type": "boolean"
+								}
+							},
+							"required": ["id", "type", "createdAt", "repo", "isPublic"],
+							"additionalProperties": false
+						}
+					},
+					"fetchedAt": {
+						"type": "string"
+					},
+					"windowDescription": {
+						"type": "string"
+					}
+				},
+				"required": ["id", "events", "fetchedAt"],
+				"additionalProperties": false
+			},
+			"primary_key": ["id"],
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"incremental": false,
+			"coverage_strategy": "scheduled_window",
+			"freshness_strategy": "scheduled_window"
+		},
+		{
+			"name": "contributions",
+			"description": "Contribution graph days and summaries for four year views. Summary is emitted only when all four views contain data.",
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": { "type": "string" },
+					"totalContributionsLastYear": {
+						"type": ["number", "null"]
+					},
+					"yearTotals": {
+						"type": "array",
+						"items": {
+							"type": "object",
+							"properties": {
+								"year": {
+									"type": "number"
+								},
+								"total": {
+									"type": "number"
+								}
+							},
+							"required": ["year", "total"],
+							"additionalProperties": false
+						}
+					},
+					"days": {
+						"type": "array",
+						"items": {
+							"type": "object",
+							"properties": {
+								"date": {
+									"type": "string"
+								},
+								"count": {
+									"type": "number"
+								},
+								"level": {
+									"type": ["number", "null"]
+								}
+							},
+							"required": ["date", "count"],
+							"additionalProperties": false
+						}
+					},
+					"monthlyTotals": {
+						"type": "array",
+						"items": {
+							"type": "object",
+							"properties": {
+								"month": {
+									"type": "string"
+								},
+								"count": {
+									"type": "number"
+								}
+							},
+							"required": ["month", "count"],
+							"additionalProperties": false
+						}
+					},
+					"topDay": {
+						"type": ["object", "null"],
+						"properties": {
+							"date": {
+								"type": "string"
+							},
+							"count": {
+								"type": "number"
+							}
+						},
+						"required": ["date", "count"],
+						"additionalProperties": false
+					},
+					"fetchedAt": {
+						"type": "string"
+					}
+				},
+				"required": ["id", "days", "fetchedAt"],
+				"additionalProperties": false
+			},
+			"primary_key": ["id"],
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"incremental": false,
+			"coverage_strategy": "scheduled_window",
+			"freshness_strategy": "scheduled_window"
+		},
+		{
+			"name": "history",
+			"description": "Authored issues and pull requests from GitHub Search, capped at 1,000 results per type.",
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": { "type": "string" },
+					"pullRequests": {
+						"type": "array",
+						"items": {
+							"type": "object",
+							"properties": {
+								"id": {
+									"type": "string"
+								},
+								"type": {
+									"type": "string"
+								},
+								"number": {
+									"type": ["number", "null"]
+								},
+								"title": {
+									"type": ["string", "null"]
+								},
+								"body": {
+									"type": ["string", "null"]
+								},
+								"state": {
+									"type": ["string", "null"]
+								},
+								"createdAt": {
+									"type": ["string", "null"]
+								},
+								"updatedAt": {
+									"type": ["string", "null"]
+								},
+								"closedAt": {
+									"type": ["string", "null"]
+								},
+								"mergedAt": {
+									"type": ["string", "null"]
+								},
+								"url": {
+									"type": ["string", "null"]
+								},
+								"repo": {
+									"type": "string"
+								},
+								"repoUrl": {
+									"type": ["string", "null"]
+								},
+								"labels": {
+									"type": "array",
+									"items": {
+										"type": "string"
+									}
+								},
+								"comments": {
+									"type": "number"
+								},
+								"reactionsTotal": {
+									"type": "number"
+								},
+								"isDraft": {
+									"type": "boolean"
+								}
+							},
+							"required": ["id", "type", "repo"],
+							"additionalProperties": false
+						}
+					},
+					"issues": {
+						"type": "array",
+						"items": {
+							"type": "object",
+							"properties": {
+								"id": {
+									"type": "string"
+								},
+								"type": {
+									"type": "string"
+								},
+								"number": {
+									"type": ["number", "null"]
+								},
+								"title": {
+									"type": ["string", "null"]
+								},
+								"body": {
+									"type": ["string", "null"]
+								},
+								"state": {
+									"type": ["string", "null"]
+								},
+								"createdAt": {
+									"type": ["string", "null"]
+								},
+								"updatedAt": {
+									"type": ["string", "null"]
+								},
+								"closedAt": {
+									"type": ["string", "null"]
+								},
+								"mergedAt": {
+									"type": ["string", "null"]
+								},
+								"url": {
+									"type": ["string", "null"]
+								},
+								"repo": {
+									"type": "string"
+								},
+								"repoUrl": {
+									"type": ["string", "null"]
+								},
+								"labels": {
+									"type": "array",
+									"items": {
+										"type": "string"
+									}
+								},
+								"comments": {
+									"type": "number"
+								},
+								"reactionsTotal": {
+									"type": "number"
+								},
+								"isDraft": {
+									"type": "boolean"
+								}
+							},
+							"required": ["id", "type", "repo"],
+							"additionalProperties": false
+						}
+					},
+					"fetchedAt": {
+						"type": "string"
+					},
+					"windowDescription": {
+						"type": "string"
+					}
+				},
+				"required": ["id", "pullRequests", "issues", "fetchedAt"],
+				"additionalProperties": false
+			},
+			"primary_key": ["id"],
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"incremental": false,
+			"coverage_strategy": "scheduled_window",
+			"freshness_strategy": "scheduled_window"
+		}
+	],
+	"profiles": [
+		{
+			"id": "legacy",
+			"label": "Legacy GitHub browser collection",
+			"streams": [
+				{
+					"name": "profile"
+				},
+				{
+					"name": "repositories"
+				},
+				{
+					"name": "starred"
+				},
+				{
+					"name": "events"
+				},
+				{
+					"name": "contributions"
+				},
+				{
+					"name": "history"
+				}
+			]
+		}
+	],
+	"reason_display_messages": {
+		"github_browser_incomplete": "GitHub did not return a complete result for this stream."
+	}
+}

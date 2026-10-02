@@ -1,0 +1,362 @@
+{
+	"protocol_version": "0.1.0",
+	"connector_id": "https://registry.pdpp.dev/connectors/linkedin",
+	"connector_key": "linkedin",
+	"manifest_uri": "https://registry.pdpp.dev/connectors/linkedin",
+	"version": "0.3.1",
+	"display_name": "LinkedIn",
+	"brand": {
+		"icon": "icon.svg",
+		"background_color": "#0A66C2"
+	},
+	"runtime_requirements": {
+		"bindings": {
+			"network": {
+				"required": true
+			},
+			"browser": {
+				"required": true
+			}
+		}
+	},
+	"capabilities": {
+		"human_interaction": ["manual_action"],
+		"refresh_policy": {
+			"recommended_mode": "manual",
+			"minimum_interval_seconds": 3600,
+			"interaction_posture": "manual_action_likely",
+			"rate_limit_sensitivity": "medium",
+			"bot_detection_sensitivity": "high",
+			"background_safe": false,
+			"rationale": "LinkedIn aggressively blocks automated access; profile refresh is manual-only."
+		},
+		"public_listing": {
+			"tier": "development"
+		}
+	},
+	"streams": [
+		{
+			"name": "profile",
+			"required": true,
+			"description": "The user's LinkedIn profile.",
+			"display": {
+				"label": "Your LinkedIn profile",
+				"detail": "Name, headline, summary, location, industry, current position, URL."
+			},
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string"
+					},
+					"full_name": {
+						"type": ["string", "null"],
+						"x_pdpp_role": "primary-title"
+					},
+					"headline": {
+						"type": ["string", "null"],
+						"x_pdpp_role": "secondary"
+					},
+					"summary": {
+						"type": ["string", "null"],
+						"x_pdpp_role": "secondary"
+					},
+					"location": {
+						"type": ["string", "null"]
+					},
+					"industry": {
+						"type": ["string", "null"]
+					},
+					"public_url": {
+						"type": ["string", "null"]
+					},
+					"current_position_title": {
+						"type": ["string", "null"]
+					},
+					"current_company": {
+						"type": ["string", "null"]
+					},
+					"connection_count": {
+						"type": ["integer", "null"],
+						"description": "From the connections listing's reported total, not the profile payload itself. Null when the connections listing wasn't fetched or reported no total."
+					},
+					"profile_picture_url": {
+						"type": ["string", "null"],
+						"description": "Dash profile's own display image, falling back to /me's miniProfile picture. Null when neither is present."
+					}
+				},
+				"required": ["id"]
+			},
+			"primary_key": ["id"],
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"incremental": false,
+			"query": {
+				"search": {
+					"lexical_fields": ["full_name", "headline", "summary", "location"],
+					"semantic_fields": ["headline", "summary"]
+				}
+			},
+			"coverage_strategy": "singleton_presence",
+			"freshness_strategy": "manual_as_of"
+		},
+		{
+			"name": "experience",
+			"required": true,
+			"description": "Work experience entries.",
+			"display": {
+				"label": "Your work experience",
+				"detail": "Title, company, start/end dates, location, description per role."
+			},
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string"
+					},
+					"title": {
+						"type": ["string", "null"],
+						"x_pdpp_role": "primary-title"
+					},
+					"company": {
+						"type": ["string", "null"],
+						"x_pdpp_role": "actor"
+					},
+					"employment_type": {
+						"type": ["string", "null"]
+					},
+					"start_date": {
+						"type": ["string", "null"],
+						"description": "Partial date at source precision: YYYY or YYYY-MM (LinkedIn never reports day precision for experience).",
+						"x_pdpp_role": "event-time"
+					},
+					"end_date": {
+						"type": ["string", "null"],
+						"description": "Partial date at source precision: YYYY or YYYY-MM. Null means the role is current."
+					},
+					"location": {
+						"type": ["string", "null"]
+					},
+					"description": {
+						"type": ["string", "null"],
+						"x_pdpp_role": "secondary"
+					}
+				},
+				"required": ["id"]
+			},
+			"primary_key": ["id"],
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"incremental": false,
+			"query": {
+				"search": {
+					"lexical_fields": ["title", "company", "location", "description"],
+					"semantic_fields": ["title", "description"]
+				}
+			},
+			"coverage_strategy": "full_inventory",
+			"freshness_strategy": "manual_as_of"
+		},
+		{
+			"name": "education",
+			"required": true,
+			"description": "Education entries.",
+			"display": {
+				"label": "Your education",
+				"detail": "School, degree, field of study, start/end dates."
+			},
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string"
+					},
+					"school": {
+						"type": ["string", "null"]
+					},
+					"degree": {
+						"type": ["string", "null"]
+					},
+					"field_of_study": {
+						"type": ["string", "null"]
+					},
+					"start_date": {
+						"type": ["string", "null"],
+						"description": "Partial date at source precision: YYYY or YYYY-MM.",
+						"x_pdpp_role": "event-time"
+					},
+					"end_date": {
+						"type": ["string", "null"],
+						"description": "Partial date at source precision: YYYY or YYYY-MM. Null means ongoing."
+					},
+					"grade": {
+						"type": ["string", "null"]
+					},
+					"logo_url": {
+						"type": ["string", "null"],
+						"description": "School logo image. Null when the source shape (any of school.logo.vectorImage, the typed com.linkedin.common.VectorImage key, or the older schoolLogo.vectorImage) is absent."
+					}
+				},
+				"required": ["id"]
+			},
+			"primary_key": ["id"],
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"incremental": false,
+			"query": {
+				"search": {
+					"lexical_fields": ["school", "degree"]
+				}
+			},
+			"coverage_strategy": "full_inventory",
+			"freshness_strategy": "manual_as_of"
+		},
+		{
+			"name": "skills",
+			"description": "Skills listed on the profile.",
+			"display": {
+				"label": "Your skills",
+				"detail": "Skill names plus endorsement counts if visible."
+			},
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string"
+					},
+					"name": {
+						"type": "string",
+						"x_pdpp_role": "primary-title"
+					},
+					"endorsement_count": {
+						"type": ["integer", "null"]
+					}
+				},
+				"required": ["id", "name"]
+			},
+			"primary_key": ["id"],
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"incremental": false,
+			"query": {
+				"search": {
+					"lexical_fields": ["name"]
+				}
+			},
+			"coverage_strategy": "full_inventory",
+			"freshness_strategy": "manual_as_of"
+		},
+		{
+			"name": "languages",
+			"required": true,
+			"description": "Languages listed on the profile.",
+			"display": {
+				"label": "Your languages",
+				"detail": "Language name plus proficiency level, if visible."
+			},
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string"
+					},
+					"name": {
+						"type": "string",
+						"x_pdpp_role": "primary-title"
+					},
+					"proficiency": {
+						"type": ["string", "null"]
+					}
+				},
+				"required": ["id", "name"]
+			},
+			"primary_key": ["id"],
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"incremental": false,
+			"query": {
+				"search": {
+					"lexical_fields": ["name", "proficiency"]
+				}
+			},
+			"coverage_strategy": "full_inventory",
+			"freshness_strategy": "manual_as_of"
+		},
+		{
+			"name": "connections",
+			"required": true,
+			"description": "The owner's first-degree LinkedIn connections.",
+			"display": {
+				"label": "Your connections",
+				"detail": "Name, headline, profile URL, and date connected."
+			},
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string",
+						"description": "The connected member's LinkedIn URN."
+					},
+					"full_name": {
+						"type": ["string", "null"],
+						"x_pdpp_role": "primary-title"
+					},
+					"headline": {
+						"type": ["string", "null"],
+						"x_pdpp_role": "secondary"
+					},
+					"profile_url": {
+						"type": ["string", "null"]
+					},
+					"connected_at": {
+						"type": ["string", "null"],
+						"format": "date-time",
+						"x_pdpp_role": "event-time"
+					}
+				},
+				"required": ["id"]
+			},
+			"primary_key": ["id"],
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"incremental": false,
+			"query": {
+				"search": {
+					"lexical_fields": ["full_name", "headline"],
+					"semantic_fields": ["headline"]
+				},
+				"range_filters": {
+					"connected_at": ["gte", "gt", "lte", "lt"]
+				},
+				"aggregations": {
+					"count": true,
+					"group_by_time": ["connected_at"]
+				}
+			},
+			"coverage_strategy": "full_inventory",
+			"freshness_strategy": "manual_as_of"
+		}
+	],
+	"reason_display_messages": {
+		"linkedin_dash_profile_unavailable": "LinkedIn didn't return a full profile for this account",
+		"older_connections_deferred_page_budget": "LinkedIn has more connections than this run collected; they'll be picked up on a future run"
+	}
+}
