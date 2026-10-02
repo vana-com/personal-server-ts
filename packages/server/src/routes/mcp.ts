@@ -85,6 +85,7 @@ import type {
   RuntimeAvailabilityPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
 import type { TokenStore } from "../token-store.js";
+import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import { createNodeDataStorage } from "../storage/node-data-storage.js";
 
 export interface McpRouteDeps {
@@ -261,10 +262,12 @@ function buildDataApiDeps(deps: McpRouteDeps): PersonalServerDataApiDeps {
   const dataStorage =
     deps.dataStorage ??
     (deps.indexManager && deps.hierarchyOptions
-      ? createNodeDataStorage({
-          indexManager: deps.indexManager,
-          hierarchyOptions: deps.hierarchyOptions,
-        })
+      ? withLegacyProjection(
+          createNodeDataStorage({
+            indexManager: deps.indexManager,
+            hierarchyOptions: deps.hierarchyOptions,
+          }),
+        )
       : undefined);
   if (!dataStorage) {
     throw new Error(

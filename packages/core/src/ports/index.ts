@@ -91,6 +91,15 @@ export interface DataStoragePort extends RuntimeStoragePort {
   findByDataPointId(dataPointId: string): IndexEntry | undefined;
   findUnsynced(options?: { limit?: number }): IndexEntry[];
   readEnvelope(scope: string, collectedAt: string): Promise<DataFileEnvelope>;
+  /**
+   * The envelope exactly as stored, bypassing any read-time view. Only a
+   * served port (see `withLegacyProjection`) has it; on a raw port
+   * `readEnvelope` already returns the stored form.
+   */
+  readStoredEnvelope?(
+    scope: string,
+    collectedAt: string,
+  ): Promise<DataFileEnvelope>;
   /** Read the stored JSON envelope without parsing its potentially large data. */
   readEnvelopeBytes?(scope: string, collectedAt: string): Promise<Uint8Array>;
   /** Open a fresh byte stream for the stored JSON envelope. May be called twice. */

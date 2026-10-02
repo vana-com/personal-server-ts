@@ -12,6 +12,7 @@
  * often anyone reads the answer.
  */
 
+import { legacyScopesProjectedFrom } from "../storage/legacy-projection.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
 import type { ComputeOutcome } from "./compute.js";
 import type { QuestionStore } from "./types.js";
@@ -366,7 +367,22 @@ export function createRecomputeScheduler(
       );
       void track(
         (async () => {
-          const affected = await options.store.list({ sourceScope: scope });
+          // A projected legacy scope (chatgpt.conversations) also reads its
+          // sibling streams (chatgpt.messages), so their changes count too.
+          const seen = new Set<string>();
+          const affected = [];
+          for (const sourceScope of [
+            scope,
+            ...legacyScopesProjectedFrom(scope),
+          ]) {
+            for (const registration of await options.store.list({
+              sourceScope,
+            })) {
+              if (seen.has(registration.questionId)) continue;
+              seen.add(registration.questionId);
+              affected.push(registration);
+            }
+          }
           for (const registration of affected) {
             if (registration.recompute === "snapshot") {
               // A snapshot question computes at registration and on an

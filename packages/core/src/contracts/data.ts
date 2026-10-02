@@ -92,6 +92,11 @@ export interface ReadDataContractInput {
   scopeParam: string;
   fileId?: string;
   at?: string;
+  /**
+   * `stored` returns the body exactly as stored, without the read-time
+   * legacy projection. Callers must restrict it to the owner.
+   */
+  view?: "stored";
 }
 
 export interface ReadDataContractResult {
@@ -380,10 +385,16 @@ export async function readDataContract(
   return {
     ok: true,
     scope: scopeResult.scope,
-    envelope: await input.storage.readEnvelope(
-      scopeResult.scope,
-      entry.collectedAt,
-    ),
+    envelope:
+      input.view === "stored" && input.storage.readStoredEnvelope
+        ? await input.storage.readStoredEnvelope(
+            scopeResult.scope,
+            entry.collectedAt,
+          )
+        : await input.storage.readEnvelope(
+            scopeResult.scope,
+            entry.collectedAt,
+          ),
   };
 }
 

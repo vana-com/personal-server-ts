@@ -588,13 +588,40 @@ describe("executeJob", () => {
 
   it("reads and seals a result at the byte budget", async () => {
     const fixture = await createFixture();
-    fixture.deps.resultMaxBytes = 100;
+    const servedBytes = (
+      await fixture.storage.readEnvelopeBytes!("instagram.profile", "x")
+    ).byteLength;
+    vi.mocked(fixture.storage.readEnvelopeBytes!).mockClear();
+    fixture.deps.resultMaxBytes = Math.max(100, servedBytes);
 
     await expect(executeJob(fixture.envelope, fixture.deps)).resolves.toEqual(
       expect.objectContaining({ resultSize: expect.any(Number) }),
     );
 
     expect(fixture.storage.readEnvelopeBytes).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a served body over budget when the stored entry is within it", async () => {
+    const fixture = await createFixture();
+    fixture.deps.resultMaxBytes = 100;
+    vi.mocked(fixture.storage.readEnvelopeBytes!).mockResolvedValue(
+      new TextEncoder().encode(
+        JSON.stringify({
+          version: "1.0",
+          scope: SCOPE,
+          collectedAt: "2026-01-01T00:00:00.000Z",
+          data: { note: "x".repeat(200) },
+        }),
+      ),
+    );
+
+    await expect(
+      executeJob(fixture.envelope, fixture.deps),
+    ).rejects.toMatchObject({
+      code: "RESULT_TOO_LARGE",
+      retryable: false,
+    });
+    expect(fixture.resultUploadFetch).not.toHaveBeenCalled();
   });
 
   it("normalizes an uppercase job id before building result paths", async () => {

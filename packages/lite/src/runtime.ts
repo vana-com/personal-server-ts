@@ -1,4 +1,8 @@
 import {
+  withLegacyProjection,
+  type LegacyProjectionIssue,
+} from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
+import {
   GrantRequiredError,
   InvalidSignatureError,
   MissingAuthError,
@@ -205,6 +209,12 @@ export interface PsLiteRuntimeOptions {
    * returns a structured snapshot useful for debugging stuck approval pages.
    */
   diagnostics?: DiagnosticsRecorder;
+  /**
+   * Called when a legacy scope cannot be projected from stored PDPP records
+   * (the stored body is then served) or is projected with rows left out.
+   * Defaults to a console warning.
+   */
+  onLegacyProjectionIssue?: (issue: LegacyProjectionIssue) => void;
 }
 
 export interface PsLiteRuntimeStateCapabilities {
@@ -712,13 +722,26 @@ function resolveX402Settings(
   };
 }
 
+function warnLegacyProjectionIssue(issue: LegacyProjectionIssue): void {
+  console.warn(
+    issue.kind === "projection_failed"
+      ? "[legacy-projection] projection failed; serving stored body"
+      : "[legacy-projection] projection left rows out",
+    issue,
+  );
+}
+
 export function createPsLiteRuntime(
   options: PsLiteRuntimeOptions,
 ): PsLiteRuntime {
   let active = options.active ?? false;
   const now = options.now ?? (() => new Date());
   const auth = options.auth ?? createMissingAuthAdapter();
-  const dataStorage = toDataStoragePort(options.storage);
+  // Readers get legacy bodies projected from stored PDPP records; writes and
+  // listings pass through. Sync is built outside with the raw port.
+  const dataStorage = withLegacyProjection(toDataStoragePort(options.storage), {
+    onIssue: options.onLegacyProjectionIssue ?? warnLegacyProjectionIssue,
+  });
   // Wire diagnostics by default so GET /v1/diagnostics is always available.
   const diagnostics = options.diagnostics ?? new DiagnosticsRecorder();
   options = { ...options, diagnostics };

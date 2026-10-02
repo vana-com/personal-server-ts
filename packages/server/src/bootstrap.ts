@@ -16,6 +16,7 @@ import {
   type IndexManager,
 } from "./storage/index-manager.js";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
+import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import {
   createGatewayClient,
   NodeECIESProvider,
@@ -195,7 +196,22 @@ export async function createServer(
   });
   const indexManager = createIndexManager(db);
   const hierarchyOptions: HierarchyManagerOptions = { dataDir };
-  const dataStorage = createNodeDataStorage({ indexManager, hierarchyOptions });
+  // Sync moves stored bytes and must see them unchanged (the upload hashes
+  // them). Every reader gets the served port, which projects legacy scope
+  // bodies from stored PDPP records.
+  const rawDataStorage = createNodeDataStorage({
+    indexManager,
+    hierarchyOptions,
+  });
+  const dataStorage = withLegacyProjection(rawDataStorage, {
+    onIssue: (issue) =>
+      issue.kind === "projection_failed"
+        ? logger.warn(
+            issue,
+            "Legacy scope projection failed; serving stored body",
+          )
+        : logger.info(issue, "Legacy scope projection left rows out"),
+  });
 
   const gatewayClient =
     options?.gatewayClient ?? createGatewayClient(config.gateway.url);
@@ -438,7 +454,7 @@ export async function createServer(
     });
 
     const uploadDeps = {
-      storage: dataStorage,
+      storage: rawDataStorage,
       storageAdapter,
       gateway: gatewayClient,
       signer: serverSigner,
@@ -451,7 +467,7 @@ export async function createServer(
     };
 
     const downloadDeps = {
-      storage: dataStorage,
+      storage: rawDataStorage,
       storageAdapter,
       gateway: gatewayClient,
       cursor,
