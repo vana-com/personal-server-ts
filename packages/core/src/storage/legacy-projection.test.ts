@@ -672,6 +672,91 @@ describe("supersedeLegacyVersions", () => {
     expect(raw.entries).toHaveLength(2);
   });
 
+  it.each([
+    ["claude.conversations", "messages", "conversation_id"],
+    ["claude.projects", "project_documents", "project_id"],
+  ])(
+    "keeps the legacy %s when the projection holds fewer nested items",
+    async (scope, nestedStream, _parentKey) => {
+      const golden = JSON.parse(
+        readFileSync(
+          new URL(
+            `../legacy-projection/__fixtures__/parity/${scope}.json`,
+            import.meta.url,
+          ),
+          "utf8",
+        ),
+      ) as {
+        streams: Record<string, Record<string, unknown>[]>;
+        legacyBody: Record<string, unknown>;
+      };
+      const raw = createMemoryDataStorage();
+      await store(raw, scope, "2026-09-01T00:00:00.000Z", golden.legacyBody);
+      for (const [stream, rows] of Object.entries(golden.streams)) {
+        const kept =
+          stream === nestedStream
+            ? rows.slice(0, rows.length - 1)
+            : rows.map((row) => {
+                // No source count to check the nested rows against.
+                const { message_count: _count, ...rest } = row;
+                return rest;
+              });
+        await store(raw, `claude.${stream}`, "2026-10-01T00:00:00.000Z", {
+          records: kept,
+        });
+      }
+
+      const result = await supersedeLegacyVersions(
+        withLegacyProjection(raw),
+        scope,
+        "2026-10-01T00:00:00.000Z",
+      );
+
+      expect(result.superseded).toEqual([]);
+      expect(result.refused).toMatch(/nested/);
+      expect(raw.entries.filter((entry) => entry.scope === scope)).toHaveLength(
+        2,
+      );
+    },
+  );
+
+  it("supersedes a complete Claude projection", async () => {
+    const golden = JSON.parse(
+      readFileSync(
+        new URL(
+          "../legacy-projection/__fixtures__/parity/claude.projects.json",
+          import.meta.url,
+        ),
+        "utf8",
+      ),
+    ) as {
+      streams: Record<string, Record<string, unknown>[]>;
+      legacyBody: Record<string, unknown>;
+    };
+    const raw = createMemoryDataStorage();
+    await store(
+      raw,
+      "claude.projects",
+      "2026-09-01T00:00:00.000Z",
+      golden.legacyBody,
+    );
+    for (const [stream, rows] of Object.entries(golden.streams)) {
+      await store(raw, `claude.${stream}`, "2026-10-01T00:00:00.000Z", {
+        records: rows,
+      });
+    }
+
+    expect(
+      (
+        await supersedeLegacyVersions(
+          withLegacyProjection(raw),
+          "claude.projects",
+          "2026-10-01T00:00:00.000Z",
+        )
+      ).superseded,
+    ).toEqual(["2026-09-01T00:00:00.000Z"]);
+  });
+
   it("compares versions by instant, keeping a later version that sorts earlier as a string", async () => {
     const raw = createMemoryDataStorage();
     await store(raw, "chatgpt.messages", "2026-10-01T00:00:00.000Z", {

@@ -514,7 +514,8 @@ export interface SupersedeResult {
  * no join stream missing and no row left out. It also deletes nothing when
  * the projection holds fewer items than the newest legacy version, or lacks
  * any item id that version holds, so an empty or time-windowed run cannot
- * replace a full history. A legacy version must carry the scope's legacy
+ * replace a full history. For Claude scopes it also deletes nothing when an
+ * item holds fewer nested messages or documents than the legacy item. A legacy version must carry the scope's legacy
  * collection key (`conversations` for `chatgpt.conversations`); PDPP
  * versions, other bodies, binary uploads, versions a builder wrote
  * (`$writtenBy`) and newer versions are kept.
@@ -569,7 +570,12 @@ export async function supersedeLegacyVersions(
     if (page.length < pageSize) break;
   }
 
-  const legacy: { collectedAt: string; count: number; ids: string[] }[] = [];
+  const legacy: {
+    collectedAt: string;
+    count: number;
+    ids: string[];
+    items: unknown[];
+  }[] = [];
   for (const collectedAt of older) {
     const envelope = await readStored(scope, collectedAt);
     // A binary upload under the scope is not a legacy body.
@@ -580,6 +586,7 @@ export async function supersedeLegacyVersions(
       collectedAt,
       count: items.length,
       ids: items.map(itemId).filter((id) => id !== undefined),
+      items,
     });
   }
   const newest = legacy.reduce<(typeof legacy)[number] | undefined>(
@@ -604,6 +611,8 @@ export async function supersedeLegacyVersions(
         `the projection lacks ${missing.length} of the ${collection} in the newest legacy version`,
       );
     }
+    const shortfall = nestedShortfall(scope, newest.items, projectedItems);
+    if (shortfall) return refuse(shortfall);
   }
 
   const superseded: string[] = [];
@@ -613,6 +622,71 @@ export async function supersedeLegacyVersions(
     }
   }
   return { superseded };
+}
+
+/**
+ * Nested rows a Claude item holds, per scope. The PDPP rows carry no source
+ * count the binding can check them against (a conversation's `message_count`
+ * is optional; a project has none), so the projection cannot vouch for them.
+ * Compare them with the legacy item instead. ChatGPT is not listed: its
+ * binding checks the source count itself, and a shorter current branch there
+ * is a reviewed difference.
+ *
+ * A project also keeps its source `raw_docs`. A raw doc with a uuid must be
+ * a projected doc; one without a uuid survives only in `raw_docs`, so it
+ * counts as a projected doc too.
+ */
+const NESTED_ITEMS: Record<
+  string,
+  (item: unknown) => { held: number; selfShort: boolean }
+> = {
+  "claude.conversations": (item) => ({
+    held: arrayLength(field(item, "messages")),
+    selfShort: false,
+  }),
+  "claude.projects": (item) => {
+    const detail = field(item, "detail");
+    const rawDocs = field(detail, "raw_docs");
+    const raw = Array.isArray(rawDocs) ? rawDocs : [];
+    const withId = raw.filter((doc) => typeof field(doc, "uuid") === "string");
+    const docs = arrayLength(field(detail, "docs"));
+    return {
+      held: docs + raw.length - withId.length,
+      selfShort: docs < withId.length,
+    };
+  },
+};
+
+function field(value: unknown, key: string): unknown {
+  return value !== null && typeof value === "object"
+    ? (value as Record<string, unknown>)[key]
+    : undefined;
+}
+
+function arrayLength(value: unknown): number {
+  return Array.isArray(value) ? value.length : 0;
+}
+
+/** Why the projection holds fewer nested rows than it should, if so. */
+function nestedShortfall(
+  scope: string,
+  legacyItems: unknown[],
+  projectedItems: unknown[],
+): string | undefined {
+  const nested = NESTED_ITEMS[scope];
+  if (!nested) return undefined;
+  const projectedById = new Map(
+    projectedItems.map((item) => [itemId(item), nested(item).held]),
+  );
+  const short = legacyItems.filter(
+    (item) => (projectedById.get(itemId(item)) ?? 0) < nested(item).held,
+  );
+  // A project whose own source lists docs the projection lacks.
+  const incomplete = projectedItems.filter((item) => nested(item).selfShort);
+  const count = short.length + incomplete.length;
+  return count > 0
+    ? `the projection holds fewer nested rows than the source or the newest legacy version for ${count} of the ${legacyCollectionKey(scope)}`
+    : undefined;
 }
 
 /** `chatgpt.conversations` → `conversations`: the array a legacy body holds. */
