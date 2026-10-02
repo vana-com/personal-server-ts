@@ -1,7 +1,7 @@
 # Parity oracle
 
-This directory produced the goldens in `../src/__fixtures__/parity/`. It is
-not built, tested or published. CI only runs `../src/parity-goldens.test.ts`
+This directory produced the goldens in `../src/legacy-projection/__fixtures__/parity/`. It is
+not built, tested or published. CI only runs `../src/legacy-projection/parity-goldens.test.ts`
 against the committed goldens.
 
 The oracle runs the frozen legacy connector and the PDPP bundle for one
@@ -28,12 +28,12 @@ capture was available.
 ## Regenerate
 
 ```sh
-cd packages/legacy-projection/parity-oracle
+cd packages/core/parity-oracle
 npm ci
 REF_DIR=/path/to/unity-surfaces node generate.mjs   # writes out/
 npx tsx review.ts out/goldens                       # adds reviewedDifferences
 ```
 
-`review.ts` overwrites `../src/__fixtures__/parity/*.json` and fails on any
+`review.ts` overwrites `../src/legacy-projection/__fixtures__/parity/*.json` and fails on any
 difference that matches no reviewed rule. Add a rule only after reading the
 difference in `out/diffs/DIFFS.md`.

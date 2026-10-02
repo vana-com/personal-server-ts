@@ -2,8 +2,8 @@
 
 ## Repo shape
 
-- npm workspaces monorepo; use npm, not pnpm/yarn. Root build is `tsc --build` over `packages/legacy-projection`, `packages/core`, `packages/server`, `packages/cli`, `packages/enclave`, and `scripts` via TS project references.
-- Package boundaries matter: `core` owns protocol/auth/grants/storage/keys/gateway/sync; `server` owns the Hono HTTP app and runtime bootstrap; `cli` is only a facade re-exporting core config and server bootstrap; `enclave` owns the dstack port, deterministic identity, sealing and the node agent HTTP, and imports nothing from `core`/`server`. `legacy-projection` is the pure, zero-dependency PDPP→legacy scope projection; it must stay browser-safe (no `node:` imports; its tsconfig sets `types: []`).
+- npm workspaces monorepo; use npm, not pnpm/yarn. Root build is `tsc --build` over `packages/core`, `packages/server`, `packages/cli`, `packages/enclave`, and `scripts` via TS project references.
+- Package boundaries matter: `core` owns protocol/auth/grants/storage/keys/gateway/sync; `server` owns the Hono HTTP app and runtime bootstrap; `cli` is only a facade re-exporting core config and server bootstrap; `enclave` owns the dstack port, deterministic identity, sealing and the node agent HTTP, and imports nothing from `core`/`server`. `packages/core/src/legacy-projection` is the internal, pure PDPP→legacy scope projection (not a published package); it must stay browser-safe, so ESLint rejects `node:` imports there.
 - Public API is controlled by package `exports`; update `packages/*/package.json` when moving exported files or subpaths.
 
 ## Commands that are easy to guess wrong
@@ -46,7 +46,7 @@
 
 ## Release/deploy/git notes
 
-- Stable release: `release.yml` runs semantic-release on push to `main` and publishes `packages/legacy-projection` → `core` → `lite` → `server` → `cli` (see `.releaserc.yaml`). Workspace `*` deps are pinned to the release version before publish via `scripts/semantic-release-pin-workspace-deps.cjs` (same idea as canary).
-- Canary prereleases: `prerelease.yml` on `dev`/`develop`/`feat/*` rewrites package versions/pins then `npm publish --tag canary` for legacy-projection/core/lite/server/cli.
+- Stable release: `release.yml` runs semantic-release on push to `main` and publishes `packages/core` → `lite` → `server` → `cli` (see `.releaserc.yaml`). Workspace `*` deps are pinned to the release version before publish via `scripts/semantic-release-pin-workspace-deps.cjs` (same idea as canary).
+- Canary prereleases: `prerelease.yml` on `dev`/`develop`/`feat/*` rewrites package versions/pins then `npm publish --tag canary` for core/lite/server/cli.
 - Docker build intentionally replaces root `tsconfig.json` with references to only `core` and `server`; container defaults set `CLOUD_MODE=true`, `PERSONAL_SERVER_ROOT_PATH=/data`, `TUNNEL_ENABLED=false`, and `DEV_UI_ENABLED=false`.
 - Use conventional commits for commit messages

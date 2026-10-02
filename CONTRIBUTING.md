@@ -23,12 +23,11 @@ npm run build
 
 This is an npm workspaces monorepo:
 
-| Package                      | Purpose                                            |
-| ---------------------------- | -------------------------------------------------- |
-| `packages/core`              | Protocol logic — auth, grants, scopes, storage     |
-| `packages/legacy-projection` | Pure PDPP→legacy scope projection                  |
-| `packages/server`            | Hono HTTP server — routes, middleware, composition |
-| `packages/cli`               | CLI entry point                                    |
+| Package           | Purpose                                            |
+| ----------------- | -------------------------------------------------- |
+| `packages/core`   | Protocol logic — auth, grants, scopes, storage     |
+| `packages/server` | Hono HTTP server — routes, middleware, composition |
+| `packages/cli`    | CLI entry point                                    |
 
 ## Development Workflow
 

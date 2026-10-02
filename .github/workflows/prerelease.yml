@@ -41,7 +41,6 @@ jobs:
 
           const canaryVersion = process.env.CANARY_VERSION;
           const packageFiles = [
-            "packages/legacy-projection/package.json",
             "packages/core/package.json",
             "packages/lite/package.json",
             "packages/server/package.json",
@@ -76,10 +75,6 @@ jobs:
             fs.writeFileSync(path, `${JSON.stringify(pkg, null, 2)}\n`);
           }
           EOF
-      - name: Publish legacy-projection canary
-        run: cd packages/legacy-projection && npm publish --tag canary --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish core canary
         run: cd packages/core && npm publish --tag canary --access public
         env:

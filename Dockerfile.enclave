@@ -14,7 +14,6 @@ WORKDIR /app
 
 # Copy dependency manifests first for layer caching
 COPY package.json package-lock.json ./
-COPY packages/legacy-projection/package.json packages/legacy-projection/
 COPY packages/core/package.json packages/core/
 COPY packages/lite/package.json packages/lite/
 COPY packages/server/package.json packages/server/

@@ -11,9 +11,6 @@ plugins:
   # npm from resolving not-yet-published sibling versions from the registry.
   - "./scripts/semantic-release-pin-workspace-deps.cjs"
   - - "@semantic-release/npm"
-    - pkgRoot: packages/legacy-projection
-      npmPublish: true
-  - - "@semantic-release/npm"
     - pkgRoot: packages/core
       npmPublish: true
   - - "@semantic-release/npm"

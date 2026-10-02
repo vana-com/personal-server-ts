@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
-import { projectPdppRecordsToLegacyPayload } from "../src/index.js";
-import { diffBodies } from "../src/__fixtures__/parity/diff.js";
-const dir = new URL("../src/__fixtures__/parity/", import.meta.url).pathname;
+import { projectPdppRecordsToLegacyPayload } from "../src/legacy-projection/index.js";
+import { diffBodies } from "../src/legacy-projection/__fixtures__/parity/diff.js";
+const dir = new URL("../src/legacy-projection/__fixtures__/parity/", import.meta.url).pathname;
 const rules: [RegExp, (d: any, all: any[]) => boolean, string][] = [
   [/\.create_time$/, (d) => typeof d.legacy === "number", "time format: legacy emits the detail body's epoch seconds, the PDPP stream stores ISO 8601; same instant"],
   [/\.update_time$/, (d) => typeof d.legacy === "string", "time format: legacy copies the provider string verbatim (microseconds, +00:00), the PDPP stream stores toISOString(); same instant"],

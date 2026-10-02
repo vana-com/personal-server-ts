@@ -10,7 +10,7 @@
 //   LEGACY_CLAUDE_JS   $REF_DIR/apps/desktop/connectors/anthropic/claude-export-playwright.js
 //   PDPP_CHATGPT_JS    $REF_DIR/apps/mobile/public/connectors/chatgpt-0.2.20.js
 //   PDPP_CLAUDE_JS     $REF_DIR/apps/mobile/public/connectors/claude-0.2.23.js
-//   ADAPTER_DIR        ../src (this package's adapter source)
+//   ADAPTER_DIR        ../src/legacy-projection (the adapter source)
 //   INPUTS_DIR         ./inputs
 // outputs: goldens/<scope>.json, captures/*.json (raw script I/O),
 //          diffs/<scope>.json, diffs/DIFFS.md
@@ -31,7 +31,7 @@ const paths = {
   PDPP_CLAUDE_JS: process.env.PDPP_CLAUDE_JS ?? join(REF, "apps/mobile/public/connectors/claude-0.2.23.js"),
   INPUTS_DIR: resolve(process.env.INPUTS_DIR ?? join(here, "inputs")),
 };
-const ADAPTER_DIR = resolve(process.env.ADAPTER_DIR ?? join(here, "../src"));
+const ADAPTER_DIR = resolve(process.env.ADAPTER_DIR ?? join(here, "../src/legacy-projection"));
 const MENU_NAME = "Syn";
 const WINDOW_SINCE = "2026-09-01T00:00:00Z"; // frozen now (2026-10-01) minus 30 days
 const sha = (p) => createHash("sha256").update(readFileSync(p)).digest("hex");
