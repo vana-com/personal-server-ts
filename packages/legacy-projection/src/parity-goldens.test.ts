@@ -123,6 +123,34 @@ describe.each(SCOPES)("%s parity with the legacy connector", (scope) => {
   });
 });
 
+describe("the parity diff", () => {
+  const conversations = [{ id: "a" }, { id: "b" }, { id: "c" }];
+
+  it("reports a different element order", () => {
+    expect(
+      diffBodies(
+        { conversations },
+        { conversations: [...conversations].reverse() },
+      ),
+    ).toEqual([
+      {
+        path: "conversations[order]",
+        legacy: ["a", "b", "c"],
+        projected: ["c", "b", "a"],
+      },
+    ]);
+  });
+
+  it("reports a duplicated element", () => {
+    expect(
+      diffBodies(
+        { conversations },
+        { conversations: [...conversations, conversations[0]] },
+      ),
+    ).toEqual([{ path: "conversations[id=a]#count", legacy: 1, projected: 2 }]);
+  });
+});
+
 describe("chatgpt.conversations in a stable order", () => {
   it("follows legacy's newest-update-first order whatever order rows were stored in", () => {
     const golden = load("chatgpt.conversations");
