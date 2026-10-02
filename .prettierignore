@@ -9,3 +9,4 @@ packages/legacy-projection/src/__fixtures__
 packages/legacy-projection/src/legacy-schemas
 packages/legacy-projection/src/declarations
 packages/legacy-projection/src/github-browser-0.2.0-oracle.mjs
+packages/legacy-projection/parity-oracle

@@ -3,7 +3,13 @@ import eslintConfigPrettier from "eslint-config-prettier";
 
 export default tseslint.config(
   {
-    ignores: ["**/dist/**", "**/node_modules/**", "**/*.d.ts"],
+    ignores: [
+      "**/dist/**",
+      "**/node_modules/**",
+      "**/*.d.ts",
+      // Offline parity generator; never built or published.
+      "packages/legacy-projection/parity-oracle/**",
+    ],
   },
   ...tseslint.configs.recommended,
   eslintConfigPrettier,

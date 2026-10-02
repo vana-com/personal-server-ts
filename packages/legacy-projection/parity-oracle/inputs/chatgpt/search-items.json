@@ -1,0 +1,62 @@
+[
+  {
+    "conversation_id": "6700a1b2-0000-4000-8000-00000000c004",
+    "current_node_id": "c004-a3",
+    "title": "Prime proof",
+    "is_archived": false,
+    "update_time": "2026-09-12T11:03:20.000000+00:00",
+    "payload": {
+      "kind": "message",
+      "message_id": "c004-a3",
+      "snippet": null
+    }
+  },
+  {
+    "conversation_id": "6700a1b2-0000-4000-8000-00000000c003",
+    "current_node_id": "c003-a1",
+    "title": null,
+    "is_archived": false,
+    "update_time": "2026-09-12T10:01:40.000000+00:00",
+    "payload": {
+      "kind": "message",
+      "message_id": "c003-a1",
+      "snippet": null
+    }
+  },
+  {
+    "conversation_id": "6700a1b2-0000-4000-8000-00000000c002",
+    "current_node_id": "c002-a2",
+    "title": "CSV analysis",
+    "is_archived": false,
+    "update_time": "2026-09-12T09:06:40.000000+00:00",
+    "payload": {
+      "kind": "message",
+      "message_id": "c002-a2",
+      "snippet": null
+    }
+  },
+  {
+    "conversation_id": "6700a1b2-0000-4000-8000-00000000c001",
+    "current_node_id": "c001-a2",
+    "title": "Weekend trip planning",
+    "is_archived": false,
+    "update_time": "2026-09-12T08:15:00.000000+00:00",
+    "payload": {
+      "kind": "message",
+      "message_id": "c001-a2",
+      "snippet": null
+    }
+  },
+  {
+    "conversation_id": "6700a1b2-0000-4000-8000-00000000c005",
+    "current_node_id": "c005-a1",
+    "title": "Old packing list",
+    "is_archived": false,
+    "update_time": "2026-06-09T10:15:20.000000+00:00",
+    "payload": {
+      "kind": "message",
+      "message_id": "c005-a1",
+      "snippet": null
+    }
+  }
+]

@@ -1,0 +1,15 @@
+{
+  "user": {
+    "id": "user-synthetic0001",
+    "name": "Synthetic User",
+    "email": "synthetic.user@example.invalid",
+    "image": null,
+    "picture": null,
+    "idp": "auth0",
+    "iat": 1789000000,
+    "mfa": false
+  },
+  "expires": "2026-12-30T00:00:00.000Z",
+  "accessToken": "synthetic-access-token",
+  "authProvider": "auth0"
+}

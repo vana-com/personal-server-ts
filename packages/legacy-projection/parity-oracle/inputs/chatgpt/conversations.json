@@ -1,0 +1,877 @@
+[
+  {
+    "title": "Weekend trip planning",
+    "create_time": 1789200000,
+    "update_time": 1789200900,
+    "mapping": {
+      "client-created-root": {
+        "id": "client-created-root",
+        "message": null,
+        "parent": null,
+        "children": [
+          "c001-sys"
+        ]
+      },
+      "c001-sys": {
+        "id": "c001-sys",
+        "message": {
+          "id": "c001-sys",
+          "author": {
+            "role": "system",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": null,
+          "update_time": null,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              ""
+            ]
+          },
+          "status": "finished_successfully",
+          "end_turn": null,
+          "weight": 0,
+          "metadata": {
+            "is_visually_hidden_from_conversation": true
+          },
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "client-created-root",
+        "children": [
+          "c001-u1"
+        ]
+      },
+      "c001-u1": {
+        "id": "c001-u1",
+        "message": {
+          "id": "c001-u1",
+          "author": {
+            "role": "user",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": 1789200010.5,
+          "update_time": null,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "Plan a weekend in Lisbon for two."
+            ]
+          },
+          "status": "finished_successfully",
+          "end_turn": null,
+          "weight": 1,
+          "metadata": {},
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "c001-sys",
+        "children": [
+          "c001-a1-old",
+          "c001-a1-new"
+        ]
+      },
+      "c001-a1-old": {
+        "id": "c001-a1-old",
+        "message": {
+          "id": "c001-a1-old",
+          "author": {
+            "role": "assistant",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": 1789200020.25,
+          "update_time": null,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "Draft itinerary: day one Alfama, day two Sintra."
+            ]
+          },
+          "status": "finished_successfully",
+          "end_turn": true,
+          "weight": 1,
+          "metadata": {
+            "model_slug": "gpt-4o",
+            "finish_details": {
+              "type": "stop"
+            }
+          },
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "c001-u1",
+        "children": [
+          "c001-u2-old"
+        ]
+      },
+      "c001-u2-old": {
+        "id": "c001-u2-old",
+        "message": {
+          "id": "c001-u2-old",
+          "author": {
+            "role": "user",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": 1789200030,
+          "update_time": null,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "Make it cheaper."
+            ]
+          },
+          "status": "finished_successfully",
+          "end_turn": null,
+          "weight": 1,
+          "metadata": {},
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "c001-a1-old",
+        "children": []
+      },
+      "c001-a1-new": {
+        "id": "c001-a1-new",
+        "message": {
+          "id": "c001-a1-new",
+          "author": {
+            "role": "assistant",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": 1789200040.75,
+          "update_time": null,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "Here is a two-day plan: Alfama walk, tram 28, then Belem."
+            ]
+          },
+          "status": "finished_successfully",
+          "end_turn": true,
+          "weight": 1,
+          "metadata": {
+            "model_slug": "gpt-4o",
+            "finish_details": {
+              "type": "stop"
+            }
+          },
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "c001-u1",
+        "children": [
+          "c001-u2"
+        ]
+      },
+      "c001-u2": {
+        "id": "c001-u2",
+        "message": {
+          "id": "c001-u2",
+          "author": {
+            "role": "user",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": 1789200600,
+          "update_time": null,
+          "content": {
+            "content_type": "multimodal_text",
+            "parts": [
+              {
+                "content_type": "image_asset_pointer",
+                "asset_pointer": "file-service://file-SynthImage0001",
+                "size_bytes": 123456,
+                "width": 1024,
+                "height": 768,
+                "fovea": null,
+                "metadata": {
+                  "dalle": null,
+                  "sanitized": true
+                }
+              },
+              "What is this building?"
+            ]
+          },
+          "status": "finished_successfully",
+          "end_turn": null,
+          "weight": 1,
+          "metadata": {
+            "attachments": [
+              {
+                "id": "file-SynthImage0001",
+                "name": "photo.jpg",
+                "mime_type": "image/jpeg",
+                "size": 123456
+              }
+            ]
+          },
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "c001-a1-new",
+        "children": [
+          "c001-a2"
+        ]
+      },
+      "c001-a2": {
+        "id": "c001-a2",
+        "message": {
+          "id": "c001-a2",
+          "author": {
+            "role": "assistant",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": 1789200610,
+          "update_time": null,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "That looks like the Belem Tower."
+            ]
+          },
+          "status": "finished_successfully",
+          "end_turn": true,
+          "weight": 1,
+          "metadata": {
+            "model_slug": "gpt-4o",
+            "finish_details": {
+              "type": "stop"
+            }
+          },
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "c001-u2",
+        "children": []
+      }
+    },
+    "moderation_results": [],
+    "current_node": "c001-a2",
+    "plugin_ids": null,
+    "conversation_id": "6700a1b2-0000-4000-8000-00000000c001",
+    "id": "6700a1b2-0000-4000-8000-00000000c001",
+    "conversation_template_id": null,
+    "gizmo_id": null,
+    "gizmo_type": null,
+    "is_archived": false,
+    "is_starred": null,
+    "safe_urls": [],
+    "blocked_urls": [],
+    "default_model_slug": "auto",
+    "conversation_origin": null,
+    "voice": null,
+    "async_status": null,
+    "disabled_tool_ids": [],
+    "is_do_not_remember": false,
+    "memory_scope": "global_enabled"
+  },
+  {
+    "title": "CSV analysis",
+    "create_time": 1789203600,
+    "update_time": 1789204000,
+    "mapping": {
+      "client-created-root": {
+        "id": "client-created-root",
+        "message": null,
+        "parent": null,
+        "children": [
+          "c002-u1"
+        ]
+      },
+      "c002-u1": {
+        "id": "c002-u1",
+        "message": {
+          "id": "c002-u1",
+          "author": {
+            "role": "user",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": 1789203601,
+          "update_time": null,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "Which region sold the most?"
+            ]
+          },
+          "status": "finished_successfully",
+          "end_turn": null,
+          "weight": 1,
+          "metadata": {
+            "attachments": [
+              {
+                "id": "file-SynthCsv0002",
+                "name": "sales.csv",
+                "mime_type": "text/csv",
+                "size": 2048
+              }
+            ]
+          },
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "client-created-root",
+        "children": [
+          "c002-a1"
+        ]
+      },
+      "c002-a1": {
+        "id": "c002-a1",
+        "message": {
+          "id": "c002-a1",
+          "author": {
+            "role": "assistant",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": 1789203602,
+          "update_time": null,
+          "content": {
+            "content_type": "code",
+            "language": "unknown",
+            "response_format_name": null,
+            "text": "import pandas as pd\ndf = pd.read_csv('/mnt/data/sales.csv')\ndf.groupby('region').total.sum()"
+          },
+          "status": "finished_successfully",
+          "end_turn": false,
+          "weight": 1,
+          "metadata": {
+            "model_slug": "gpt-4o"
+          },
+          "recipient": "python",
+          "channel": null
+        },
+        "parent": "c002-u1",
+        "children": [
+          "c002-t1"
+        ]
+      },
+      "c002-t1": {
+        "id": "c002-t1",
+        "message": {
+          "id": "c002-t1",
+          "author": {
+            "role": "tool",
+            "name": "python",
+            "metadata": {}
+          },
+          "create_time": 1789203603,
+          "update_time": null,
+          "content": {
+            "content_type": "execution_output",
+            "text": "region\nnorth    10\nsouth     7"
+          },
+          "status": "finished_successfully",
+          "end_turn": null,
+          "weight": 1,
+          "metadata": {
+            "aggregate_result": {
+              "status": "success"
+            }
+          },
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "c002-a1",
+        "children": [
+          "c002-a2"
+        ]
+      },
+      "c002-a2": {
+        "id": "c002-a2",
+        "message": {
+          "id": "c002-a2",
+          "author": {
+            "role": "assistant",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": 1789203604,
+          "update_time": null,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "North sold the most, with a total of 10."
+            ]
+          },
+          "status": "finished_successfully",
+          "end_turn": true,
+          "weight": 1,
+          "metadata": {},
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "c002-t1",
+        "children": []
+      }
+    },
+    "moderation_results": [],
+    "current_node": "c002-a2",
+    "plugin_ids": null,
+    "conversation_id": "6700a1b2-0000-4000-8000-00000000c002",
+    "id": "6700a1b2-0000-4000-8000-00000000c002",
+    "conversation_template_id": null,
+    "gizmo_id": null,
+    "gizmo_type": null,
+    "is_archived": false,
+    "is_starred": null,
+    "safe_urls": [],
+    "blocked_urls": [],
+    "default_model_slug": "auto",
+    "conversation_origin": null,
+    "voice": null,
+    "async_status": null,
+    "disabled_tool_ids": [],
+    "is_do_not_remember": false,
+    "memory_scope": "global_enabled"
+  },
+  {
+    "title": null,
+    "create_time": 1789207200,
+    "update_time": 1789207300,
+    "mapping": {
+      "client-created-root": {
+        "id": "client-created-root",
+        "message": null,
+        "parent": null,
+        "children": [
+          "c003-u1"
+        ]
+      },
+      "c003-u1": {
+        "id": "c003-u1",
+        "message": {
+          "id": "c003-u1",
+          "author": {
+            "role": "user",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": 1789207201,
+          "update_time": null,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "hello?"
+            ]
+          },
+          "status": "finished_successfully",
+          "end_turn": null,
+          "weight": 1,
+          "metadata": {},
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "client-created-root",
+        "children": [
+          "c003-a1"
+        ]
+      },
+      "c003-a1": {
+        "id": "c003-a1",
+        "message": {
+          "id": "c003-a1",
+          "author": {
+            "role": "assistant",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": 1789207202,
+          "update_time": null,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "Hi! How can I help?"
+            ]
+          },
+          "status": "finished_successfully",
+          "end_turn": true,
+          "weight": 1,
+          "metadata": {},
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "c003-u1",
+        "children": [
+          "c003-u2"
+        ]
+      },
+      "c003-u2": {
+        "id": "c003-u2",
+        "message": {
+          "id": "c003-u2",
+          "author": {
+            "role": "user",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": 1789207203,
+          "update_time": null,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "never mind"
+            ]
+          },
+          "status": "finished_successfully",
+          "end_turn": null,
+          "weight": 1,
+          "metadata": {},
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "c003-a1",
+        "children": []
+      }
+    },
+    "moderation_results": [],
+    "current_node": "c003-a1",
+    "plugin_ids": null,
+    "conversation_id": "6700a1b2-0000-4000-8000-00000000c003",
+    "id": "6700a1b2-0000-4000-8000-00000000c003",
+    "conversation_template_id": null,
+    "gizmo_id": null,
+    "gizmo_type": null,
+    "is_archived": false,
+    "is_starred": null,
+    "safe_urls": [],
+    "blocked_urls": [],
+    "default_model_slug": "auto",
+    "conversation_origin": null,
+    "voice": null,
+    "async_status": null,
+    "disabled_tool_ids": [],
+    "is_do_not_remember": false,
+    "memory_scope": "global_enabled"
+  },
+  {
+    "title": "Prime proof",
+    "create_time": 1789210800,
+    "update_time": 1789211000,
+    "mapping": {
+      "client-created-root": {
+        "id": "client-created-root",
+        "message": null,
+        "parent": null,
+        "children": [
+          "c004-ctx"
+        ]
+      },
+      "c004-ctx": {
+        "id": "c004-ctx",
+        "message": {
+          "id": "c004-ctx",
+          "author": {
+            "role": "user",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": null,
+          "update_time": null,
+          "content": {
+            "content_type": "user_editable_context",
+            "user_profile": "Synthetic profile text.",
+            "user_instructions": "Be brief."
+          },
+          "status": "finished_successfully",
+          "end_turn": null,
+          "weight": 1,
+          "metadata": {
+            "is_visually_hidden_from_conversation": true,
+            "user_context_message_data": {
+              "about_user_message": "Synthetic profile text."
+            }
+          },
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "client-created-root",
+        "children": [
+          "c004-u1"
+        ]
+      },
+      "c004-u1": {
+        "id": "c004-u1",
+        "message": {
+          "id": "c004-u1",
+          "author": {
+            "role": "user",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": 1789210801,
+          "update_time": null,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "Prove there are infinitely many primes."
+            ]
+          },
+          "status": "finished_successfully",
+          "end_turn": null,
+          "weight": 1,
+          "metadata": {},
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "c004-ctx",
+        "children": [
+          "c004-th"
+        ]
+      },
+      "c004-th": {
+        "id": "c004-th",
+        "message": {
+          "id": "c004-th",
+          "author": {
+            "role": "assistant",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": 1789210802,
+          "update_time": null,
+          "content": {
+            "content_type": "thoughts",
+            "thoughts": [
+              {
+                "summary": "Euclid",
+                "content": "Assume finitely many and multiply them.",
+                "chunks": [],
+                "finished": true
+              }
+            ],
+            "source_analysis_msg_id": "synthetic"
+          },
+          "status": "finished_successfully",
+          "end_turn": false,
+          "weight": 1,
+          "metadata": {
+            "model_slug": "o3",
+            "reasoning_status": "is_reasoning"
+          },
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "c004-u1",
+        "children": [
+          "c004-rr"
+        ]
+      },
+      "c004-rr": {
+        "id": "c004-rr",
+        "message": {
+          "id": "c004-rr",
+          "author": {
+            "role": "assistant",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": 1789210803,
+          "update_time": null,
+          "content": {
+            "content_type": "reasoning_recap",
+            "content": "Thought for 4 seconds"
+          },
+          "status": "finished_successfully",
+          "end_turn": false,
+          "weight": 1,
+          "metadata": {
+            "model_slug": "o3",
+            "reasoning_status": "reasoning_ended"
+          },
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "c004-th",
+        "children": [
+          "c004-a-empty"
+        ]
+      },
+      "c004-a-empty": {
+        "id": "c004-a-empty",
+        "message": {
+          "id": "c004-a-empty",
+          "author": {
+            "role": "assistant",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": 1789210804,
+          "update_time": null,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              ""
+            ]
+          },
+          "status": "finished_successfully",
+          "end_turn": false,
+          "weight": 1,
+          "metadata": {
+            "model_slug": "o3"
+          },
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "c004-rr",
+        "children": [
+          "c004-a3"
+        ]
+      },
+      "c004-a3": {
+        "id": "c004-a3",
+        "message": {
+          "id": "c004-a3",
+          "author": {
+            "role": "assistant",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": 1789210805,
+          "update_time": null,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "Suppose the primes are finite.",
+              "Their product plus one has a new prime factor."
+            ]
+          },
+          "status": "finished_successfully",
+          "end_turn": true,
+          "weight": 1,
+          "metadata": {
+            "model_slug": "o3",
+            "finish_details": {
+              "type": "stop"
+            }
+          },
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "c004-a-empty",
+        "children": []
+      }
+    },
+    "moderation_results": [],
+    "current_node": "c004-a3",
+    "plugin_ids": null,
+    "conversation_id": "6700a1b2-0000-4000-8000-00000000c004",
+    "id": "6700a1b2-0000-4000-8000-00000000c004",
+    "conversation_template_id": null,
+    "gizmo_id": null,
+    "gizmo_type": null,
+    "is_archived": false,
+    "is_starred": null,
+    "safe_urls": [],
+    "blocked_urls": [],
+    "default_model_slug": "auto",
+    "conversation_origin": null,
+    "voice": null,
+    "async_status": null,
+    "disabled_tool_ids": [],
+    "is_do_not_remember": false,
+    "memory_scope": "global_enabled"
+  },
+  {
+    "title": "Old packing list",
+    "create_time": 1781000000,
+    "update_time": 1781000120,
+    "mapping": {
+      "client-created-root": {
+        "id": "client-created-root",
+        "message": null,
+        "parent": null,
+        "children": [
+          "c005-u1"
+        ]
+      },
+      "c005-u1": {
+        "id": "c005-u1",
+        "message": {
+          "id": "c005-u1",
+          "author": {
+            "role": "user",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": 1781000001,
+          "update_time": null,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "Packing list for camping?"
+            ]
+          },
+          "status": "finished_successfully",
+          "end_turn": null,
+          "weight": 1,
+          "metadata": {},
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "client-created-root",
+        "children": [
+          "c005-a1"
+        ]
+      },
+      "c005-a1": {
+        "id": "c005-a1",
+        "message": {
+          "id": "c005-a1",
+          "author": {
+            "role": "assistant",
+            "name": null,
+            "metadata": {}
+          },
+          "create_time": 1781000002,
+          "update_time": null,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "Tent, sleeping bag, stove, water filter."
+            ]
+          },
+          "status": "finished_successfully",
+          "end_turn": true,
+          "weight": 1,
+          "metadata": {
+            "model_slug": "gpt-4o-mini",
+            "finish_details": {
+              "type": "stop"
+            }
+          },
+          "recipient": "all",
+          "channel": null
+        },
+        "parent": "c005-u1",
+        "children": []
+      }
+    },
+    "moderation_results": [],
+    "current_node": "c005-a1",
+    "plugin_ids": null,
+    "conversation_id": "6700a1b2-0000-4000-8000-00000000c005",
+    "id": "6700a1b2-0000-4000-8000-00000000c005",
+    "conversation_template_id": null,
+    "gizmo_id": null,
+    "gizmo_type": null,
+    "is_archived": false,
+    "is_starred": null,
+    "safe_urls": [],
+    "blocked_urls": [],
+    "default_model_slug": "auto",
+    "conversation_origin": null,
+    "voice": null,
+    "async_status": null,
+    "disabled_tool_ids": [],
+    "is_do_not_remember": false,
+    "memory_scope": "global_enabled"
+  }
+]
