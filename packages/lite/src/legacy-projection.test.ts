@@ -57,10 +57,12 @@ function createRuntime(
     tokenStore: createMemoryPsLiteTokenStore(),
     saveConfig: async () => {},
     stateCapabilities: { config: "memory" },
-    auth: createBearerTokenPsLiteAuth({
-      ownerToken: "owner-token",
-      builderToken: "builder-token",
-    }),
+    auth:
+      options.auth ??
+      createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
     active: true,
   });
   return { runtime, storage };
@@ -71,8 +73,18 @@ async function post(
   scope: string,
   body: unknown,
 ) {
-  const res = await runtime.fetch(
-    new Request(`https://ps.local/v1/data/${scope}`, {
+  const res = await postRaw(runtime, `/v1/data/${scope}`, body);
+  expect(res.status).toBe(201);
+  return res;
+}
+
+function postRaw(
+  runtime: ReturnType<typeof createRuntime>["runtime"],
+  path: string,
+  body: unknown,
+) {
+  return runtime.fetch(
+    new Request(`https://ps.local${path}`, {
       method: "POST",
       headers: {
         Authorization: "Bearer owner-token",
@@ -81,7 +93,6 @@ async function post(
       body: JSON.stringify(body),
     }),
   );
-  expect(res.status).toBe(201);
 }
 
 function get(
@@ -311,5 +322,201 @@ describe("PS-Lite legacy projection", () => {
         cursor: first.nextCursor,
       }),
     ).rejects.toMatchObject({ code: "cursor_invalid" });
+  });
+});
+
+describe("POST ?supersede=legacy", () => {
+  const legacyBody = { conversations: [], total: 0 };
+
+  function versionBodies(
+    storage: ReturnType<typeof createRuntime>["storage"],
+    scope: string,
+  ) {
+    return Promise.all(
+      storage
+        .listVersions(scope, { limit: 50 })
+        .map(
+          async (entry) =>
+            (await storage.readEnvelope(scope, entry.collectedAt)).data,
+        ),
+    );
+  }
+
+  const legacyThread = {
+    conversations: [
+      {
+        id: "conv-1",
+        title: "Trip plan",
+        message_count: 1,
+        messages: [
+          { id: "m1", role: "user", content: "How do I get to Lyon?" },
+        ],
+      },
+    ],
+    total: 1,
+  };
+
+  it("deletes older legacy versions after the PDPP write commits", async () => {
+    const { runtime, storage } = createRuntime();
+    await post(runtime, "chatgpt.messages", messages);
+    await post(runtime, "chatgpt.conversations", legacyBody);
+    await post(runtime, "chatgpt.conversations", legacyBody);
+    const legacyVersions = storage
+      .listVersions("chatgpt.conversations", { limit: 50 })
+      .map((entry) => entry.collectedAt);
+
+    const res = await postRaw(
+      runtime,
+      "/v1/data/chatgpt.conversations?supersede=legacy",
+      conversations,
+    );
+
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { superseded: string[] };
+    expect([...body.superseded].sort()).toEqual([...legacyVersions].sort());
+    expect(await versionBodies(storage, "chatgpt.conversations")).toEqual([
+      conversations,
+    ]);
+    const read = await get(runtime, "/v1/data/chatgpt.conversations");
+    expect(((await read.json()) as { data: unknown }).data).toMatchObject({
+      conversations: [{ id: "conv-1" }],
+      total: 1,
+    });
+  });
+
+  it("keeps older PDPP versions", async () => {
+    const { runtime, storage } = createRuntime();
+    await post(runtime, "chatgpt.messages", messages);
+    await post(runtime, "chatgpt.conversations", legacyBody);
+    await post(runtime, "chatgpt.conversations", { records: [] });
+
+    const res = await postRaw(
+      runtime,
+      "/v1/data/chatgpt.conversations?supersede=legacy",
+      conversations,
+    );
+
+    expect(res.status).toBe(201);
+    expect(await versionBodies(storage, "chatgpt.conversations")).toEqual([
+      conversations,
+      { records: [] },
+    ]);
+  });
+
+  it("deletes nothing when the new body cannot serve the legacy view", async () => {
+    const { runtime, storage } = createRuntime();
+    await post(runtime, "chatgpt.conversations", legacyBody);
+
+    const res = await postRaw(
+      runtime,
+      "/v1/data/chatgpt.conversations?supersede=legacy",
+      legacyBody,
+    );
+
+    expect(res.status).toBe(201);
+    expect(((await res.json()) as { superseded: string[] }).superseded).toEqual(
+      [],
+    );
+    expect(storage.countVersions("chatgpt.conversations")).toBe(2);
+  });
+
+  it("keeps the legacy threads when the messages stream is not stored yet", async () => {
+    const { runtime, storage } = createRuntime();
+    await post(runtime, "chatgpt.conversations", legacyThread);
+
+    const res = await postRaw(
+      runtime,
+      "/v1/data/chatgpt.conversations?supersede=legacy",
+      conversations,
+    );
+
+    expect(res.status).toBe(201);
+    expect(await res.json()).toMatchObject({
+      superseded: [],
+      supersedeRefused: "the projection is partial (stream_missing)",
+    });
+    expect(await versionBodies(storage, "chatgpt.conversations")).toEqual([
+      conversations,
+      legacyThread,
+    ]);
+  });
+
+  it("keeps the legacy history when the PDPP write holds fewer conversations", async () => {
+    const { runtime, storage } = createRuntime();
+    await post(runtime, "chatgpt.messages", { records: [] });
+    await post(runtime, "chatgpt.conversations", legacyThread);
+
+    const res = await postRaw(
+      runtime,
+      "/v1/data/chatgpt.conversations?supersede=legacy",
+      { records: [] },
+    );
+
+    expect(res.status).toBe(201);
+    expect(await res.json()).toMatchObject({
+      superseded: [],
+      supersedeRefused:
+        "the projection has 0 conversations; the newest legacy version has 1",
+    });
+    expect(storage.countVersions("chatgpt.conversations")).toBe(2);
+  });
+
+  it("deletes nothing when the write fails", async () => {
+    const { runtime, storage } = createRuntime();
+    await post(runtime, "chatgpt.conversations", legacyBody);
+
+    const res = await postRaw(
+      runtime,
+      "/v1/data/chatgpt.conversations?supersede=legacy",
+      ["not", "an", "object"],
+    );
+
+    expect(res.status).toBe(400);
+    expect(storage.countVersions("chatgpt.conversations")).toBe(1);
+  });
+
+  it("rejects an unknown supersede value before writing", async () => {
+    const { runtime, storage } = createRuntime();
+
+    const res = await postRaw(
+      runtime,
+      "/v1/data/chatgpt.conversations?supersede=all",
+      conversations,
+    );
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      error: { errorCode: "INVALID_SUPERSEDE" },
+    });
+    expect(storage.countVersions("chatgpt.conversations")).toBe(0);
+  });
+
+  it("refuses supersede on a delegated builder write and hands the proof back", async () => {
+    const releaseProof = vi.fn(async () => {});
+    const bearer = createBearerTokenPsLiteAuth({
+      ownerToken: "owner-token",
+      builderToken: "builder-token",
+    });
+    const { runtime, storage } = createRuntime({
+      auth: {
+        ...bearer,
+        authorizeWrite: async () => ({
+          builder: "0x00000000000000000000000000000000000000b1",
+          grantId: "grant-w",
+          attribution: {} as never,
+          releaseProof,
+        }),
+      },
+    });
+
+    const res = await postRaw(
+      runtime,
+      "/v1/data/chatgpt.conversations?supersede=legacy",
+      conversations,
+    );
+
+    expect(res.status).toBe(403);
+    expect(releaseProof).toHaveBeenCalledOnce();
+    expect(storage.countVersions("chatgpt.conversations")).toBe(0);
   });
 });

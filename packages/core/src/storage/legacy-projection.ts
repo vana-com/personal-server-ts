@@ -23,6 +23,7 @@ import {
   type ProjectionError,
 } from "../legacy-projection/index.js";
 import type { DataStoragePort } from "../ports/index.js";
+import { isBinaryEnvelope } from "../contracts/binary.js";
 import type { IndexEntry } from "./index/types.js";
 import { buildDataBlocksAsync } from "./blocks/build.js";
 import { readBuiltScopeBlocks } from "./blocks/page.js";
@@ -86,6 +87,10 @@ export interface LegacyProjectionOptions {
 }
 
 const SERVED = Symbol.for("personal-server-ts.legacy-projection.served");
+/** A served port's own projected view of one stored version, for supersede. */
+const PROJECTED_VIEW = Symbol.for(
+  "personal-server-ts.legacy-projection.projected-view",
+);
 
 interface Projected {
   /** Identifies the inputs; block cursors carry it so a page from one
@@ -94,6 +99,8 @@ interface Projected {
   envelope: DataFileEnvelope;
   bytes: Uint8Array;
   built?: { manifest: DataBlockManifest; blocks: DataScopeBlock[] };
+  /** Rows left out or join streams missing; absent for a complete view. */
+  diagnostics?: ProjectionDiagnostic[];
 }
 
 const textEncoder = new TextEncoder();
@@ -248,6 +255,9 @@ export function withLegacyProjection(
     return {
       envelope,
       bytes: textEncoder.encode(JSON.stringify(envelope)),
+      ...(result.diagnostics?.length
+        ? { diagnostics: result.diagnostics }
+        : {}),
     };
   }
 
@@ -266,8 +276,12 @@ export function withLegacyProjection(
     return view.built;
   }
 
-  const overrides: Partial<DataStoragePort> & { [SERVED]: true } = {
+  const overrides: Partial<DataStoragePort> & {
+    [SERVED]: true;
+    [PROJECTED_VIEW]: typeof projected;
+  } = {
     [SERVED]: true,
+    [PROJECTED_VIEW]: projected,
     async readEnvelope(scope, collectedAt) {
       const { view, own } = await resolve(scope, collectedAt);
       return view?.envelope ?? own ?? raw.readEnvelope(scope, collectedAt);
@@ -481,4 +495,226 @@ function isRecordsBody(
     keys[0] === "records" &&
     Array.isArray((data as { records: unknown }).records)
   );
+}
+
+export interface SupersedeResult {
+  /** `collectedAt` of every deleted version. */
+  superseded: string[];
+  /** Why nothing was deleted, when superseding was refused. */
+  refused?: string;
+}
+
+/**
+ * After a `{records}` version of a projected scope is committed, delete the
+ * scope's older owner-written legacy versions: the new version serves the
+ * same legacy view, so they are a second copy.
+ *
+ * It deletes nothing unless `storage` is a served port (see
+ * `withLegacyProjection`) whose projection of the new version is complete:
+ * no join stream missing and no row left out. It also deletes nothing when
+ * the projection holds fewer items than the newest legacy version, or lacks
+ * any item id that version holds, so an empty or time-windowed run cannot
+ * replace a full history. For Claude scopes it also deletes nothing when an
+ * item holds fewer nested messages or documents than the legacy item. A legacy version must carry the scope's legacy
+ * collection key (`conversations` for `chatgpt.conversations`); PDPP
+ * versions, other bodies, binary uploads, versions a builder wrote
+ * (`$writtenBy`) and newer versions are kept.
+ *
+ * Local only: the deletes are not sent to the gateway. Copies that sync
+ * already uploaded, and copies other replicas already downloaded, remain.
+ */
+export async function supersedeLegacyVersions(
+  storage: DataStoragePort,
+  scope: string,
+  committedAt: string,
+): Promise<SupersedeResult> {
+  const refuse = (refused: string): SupersedeResult => ({
+    superseded: [],
+    refused,
+  });
+  const readStored = (storage.readStoredEnvelope ?? storage.readEnvelope).bind(
+    storage,
+  );
+  const committed = await readStored(scope, committedAt);
+  if (classifyStoredBody(scope, committed.data) !== "pdpp-projected") {
+    return refuse("the new version is not PDPP records of a projected scope");
+  }
+  const projectedView = (
+    storage as {
+      [PROJECTED_VIEW]?: (s: string, c: string) => Promise<Projected | null>;
+    }
+  )[PROJECTED_VIEW];
+  const view = projectedView ? await projectedView(scope, committedAt) : null;
+  if (!view) return refuse("the new version cannot be projected");
+  if (view.diagnostics?.length) {
+    const kinds = [...new Set(view.diagnostics.map((d) => d.kind))];
+    return refuse(`the projection is partial (${kinds.join(", ")})`);
+  }
+  const collection = legacyCollectionKey(scope);
+  const projectedItems = (view.envelope.data as Record<string, unknown>)[
+    collection
+  ] as unknown[];
+  const projectedCount = projectedItems.length;
+
+  const committedMs = Date.parse(committedAt);
+  const older: string[] = [];
+  const pageSize = 100;
+  for (let offset = 0; ; offset += pageSize) {
+    const page = storage.listVersions(scope, { limit: pageSize, offset });
+    for (const entry of page) {
+      // Compare instants, not strings: "…00.500Z" sorts before "…00Z".
+      if (Date.parse(entry.collectedAt) < committedMs) {
+        older.push(entry.collectedAt);
+      }
+    }
+    if (page.length < pageSize) break;
+  }
+
+  const legacy: {
+    collectedAt: string;
+    count: number;
+    ids: string[];
+    items: unknown[];
+  }[] = [];
+  for (const collectedAt of older) {
+    const envelope = await readStored(scope, collectedAt);
+    // A binary upload under the scope is not a legacy body.
+    if (isBinaryEnvelope(envelope)) continue;
+    const items = legacyCollection(scope, envelope.data);
+    if (items === null) continue;
+    legacy.push({
+      collectedAt,
+      count: items.length,
+      ids: items.map(itemId).filter((id) => id !== undefined),
+      items,
+    });
+  }
+  const newest = legacy.reduce<(typeof legacy)[number] | undefined>(
+    (best, version) =>
+      !best || Date.parse(version.collectedAt) > Date.parse(best.collectedAt)
+        ? version
+        : best,
+    undefined,
+  );
+  if (newest && projectedCount < newest.count) {
+    return refuse(
+      `the projection has ${projectedCount} ${collection}; the newest legacy version has ${newest.count}`,
+    );
+  }
+  if (newest) {
+    const projectedIds = new Set(
+      projectedItems.map(itemId).filter((id) => id !== undefined),
+    );
+    const missing = newest.ids.filter((id) => !projectedIds.has(id));
+    if (missing.length > 0) {
+      return refuse(
+        `the projection lacks ${missing.length} of the ${collection} in the newest legacy version`,
+      );
+    }
+    const shortfall = nestedShortfall(scope, newest.items, projectedItems);
+    if (shortfall) return refuse(shortfall);
+  }
+
+  const superseded: string[] = [];
+  for (const { collectedAt } of legacy) {
+    if (await storage.deleteVersion(scope, collectedAt)) {
+      superseded.push(collectedAt);
+    }
+  }
+  return { superseded };
+}
+
+/**
+ * Nested rows a Claude item holds, per scope. The PDPP rows carry no source
+ * count the binding can check them against (a conversation's `message_count`
+ * is optional; a project has none), so the projection cannot vouch for them.
+ * Compare them with the legacy item instead. ChatGPT is not listed: its
+ * binding checks the source count itself, and a shorter current branch there
+ * is a reviewed difference.
+ *
+ * A project also keeps its source `raw_docs`. A raw doc with a uuid must be
+ * a projected doc; one without a uuid survives only in `raw_docs`, so it
+ * counts as a projected doc too.
+ */
+const NESTED_ITEMS: Record<
+  string,
+  (item: unknown) => { held: number; selfShort: boolean }
+> = {
+  "claude.conversations": (item) => ({
+    held: arrayLength(field(item, "messages")),
+    selfShort: false,
+  }),
+  "claude.projects": (item) => {
+    const detail = field(item, "detail");
+    const rawDocs = field(detail, "raw_docs");
+    const raw = Array.isArray(rawDocs) ? rawDocs : [];
+    const withId = raw.filter((doc) => typeof field(doc, "uuid") === "string");
+    const docs = arrayLength(field(detail, "docs"));
+    return {
+      held: docs + raw.length - withId.length,
+      selfShort: docs < withId.length,
+    };
+  },
+};
+
+function field(value: unknown, key: string): unknown {
+  return value !== null && typeof value === "object"
+    ? (value as Record<string, unknown>)[key]
+    : undefined;
+}
+
+function arrayLength(value: unknown): number {
+  return Array.isArray(value) ? value.length : 0;
+}
+
+/** Why the projection holds fewer nested rows than it should, if so. */
+function nestedShortfall(
+  scope: string,
+  legacyItems: unknown[],
+  projectedItems: unknown[],
+): string | undefined {
+  const nested = NESTED_ITEMS[scope];
+  if (!nested) return undefined;
+  const projectedById = new Map(
+    projectedItems.map((item) => [itemId(item), nested(item).held]),
+  );
+  const short = legacyItems.filter(
+    (item) => (projectedById.get(itemId(item)) ?? 0) < nested(item).held,
+  );
+  // A project whose own source lists docs the projection lacks.
+  const incomplete = projectedItems.filter((item) => nested(item).selfShort);
+  const count = short.length + incomplete.length;
+  return count > 0
+    ? `the projection holds fewer nested rows than the source or the newest legacy version for ${count} of the ${legacyCollectionKey(scope)}`
+    : undefined;
+}
+
+/** `chatgpt.conversations` → `conversations`: the array a legacy body holds. */
+function legacyCollectionKey(scope: string): string {
+  return scope.slice(scope.indexOf(".") + 1);
+}
+
+/**
+ * The items of an owner-written legacy body of `scope`, or null when the
+ * body is not one: it must hold the scope's collection array, must not be
+ * PDPP records, and must not carry a builder's `$writtenBy` stamp.
+ */
+function legacyCollection(scope: string, data: unknown): unknown[] | null {
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    return null;
+  }
+  if (isRecordsBody(data) || "$writtenBy" in data) return null;
+  const items = (data as Record<string, unknown>)[legacyCollectionKey(scope)];
+  return Array.isArray(items) ? items : null;
+}
+
+/** A legacy item's `id` (or `uuid`), when it has a string one. */
+function itemId(item: unknown): string | undefined {
+  if (item === null || typeof item !== "object") return undefined;
+  const { id, uuid } = item as { id?: unknown; uuid?: unknown };
+  return typeof id === "string"
+    ? id
+    : typeof uuid === "string"
+      ? uuid
+      : undefined;
 }

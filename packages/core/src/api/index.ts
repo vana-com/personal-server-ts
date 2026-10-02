@@ -24,6 +24,10 @@ import {
 } from "../sync/scope-deletions.js";
 import type { IndexEntry } from "../storage/index/types.js";
 import {
+  supersedeLegacyVersions,
+  type SupersedeResult,
+} from "../storage/legacy-projection.js";
+import {
   deleteScope as deleteScopeLocally,
   type DeleteScopeResult,
 } from "../sync/workers/delete.js";
@@ -430,6 +434,47 @@ function encodePaymentResponseHeader(body: unknown): string | undefined {
 
 function contractResponse(result: ContractResult): Response {
   return jsonResponse(result.body, { status: result.status });
+}
+
+/**
+ * Runs after the write committed, so a failure here must not fail the
+ * write: it is logged and the response lists no superseded versions.
+ */
+async function supersedeAfterCommit(
+  deps: PersonalServerDataApiDeps,
+  scope: string,
+  committedAt: string,
+): Promise<SupersedeResult> {
+  try {
+    const result = await supersedeLegacyVersions(
+      deps.storage,
+      scope,
+      committedAt,
+    );
+    if (result.superseded.length > 0) {
+      deps.logger?.info?.(
+        { scope, committedAt, superseded: result.superseded },
+        "Deleted legacy-form versions superseded by a PDPP write",
+      );
+    }
+    if (result.refused) {
+      deps.logger?.info?.(
+        { scope, committedAt, refused: result.refused },
+        "Kept legacy-form versions; superseding was refused",
+      );
+    }
+    return result;
+  } catch (err) {
+    deps.logger?.warn?.(
+      {
+        scope,
+        committedAt,
+        error: err instanceof Error ? err.message : String(err),
+      },
+      "Superseding legacy-form versions failed; the write is stored",
+    );
+    return { superseded: [], refused: "superseding failed" };
+  }
 }
 
 function contractErrorResponse(err: DataContractError): Response {
@@ -1526,6 +1571,26 @@ export async function handlePersonalServerDataRequest(
       } else {
         await deps.auth.authorizeOwner(request);
       }
+      // `?supersede=legacy`: once this write commits, delete the scope's
+      // older legacy-form versions (see supersedeLegacyVersions). It deletes
+      // data, so only the owner may ask for it.
+      const supersede = url.searchParams.get("supersede");
+      if (supersede !== null && supersede !== "legacy") {
+        await writeAuth?.releaseProof?.();
+        return errorResponse(
+          400,
+          "INVALID_SUPERSEDE",
+          'supersede must be "legacy" or absent',
+        );
+      }
+      if (supersede !== null && writeAuth) {
+        await writeAuth.releaseProof?.();
+        return errorResponse(
+          403,
+          "FORBIDDEN",
+          "Only the owner can supersede stored versions",
+        );
+      }
       // A write that fails before commit hands the proof back (replay guard)
       // so the builder's retry with the same still-valid proof is accepted;
       // after commit the proof stays consumed (a retry would be a duplicate).
@@ -1592,6 +1657,15 @@ export async function handlePersonalServerDataRequest(
         // data needs no schema at all — we ingest it schemaless. (Structured JSON
         // below still resolves a schema for validation/metadata.)
         if (!isJsonContentType(request)) {
+          if (supersede !== null) {
+            return failWrite(
+              errorResponse(
+                400,
+                "INVALID_SUPERSEDE",
+                "supersede applies to JSON writes only",
+              ),
+            );
+          }
           const bytes = new Uint8Array(await request.arrayBuffer());
           const metadata = parseMetadataHeader(
             request.headers.get("x-vana-metadata"),
@@ -1675,13 +1749,32 @@ export async function handlePersonalServerDataRequest(
           "Data file ingested",
         );
         await logBuilderWrite();
+        const supersedeResult =
+          supersede === "legacy"
+            ? await supersedeAfterCommit(
+                deps,
+                scopeResult.scope,
+                collectedAtValue,
+              )
+            : undefined;
         notifyNewData(deps.syncManager);
         notifyDataWritten(deps, {
           scope: scopeResult.scope,
           collectedAt: collectedAtValue,
           lineageSources: lineage?.sources,
         });
-        return jsonResponse(result.response, { status: 201 });
+        return jsonResponse(
+          supersedeResult
+            ? {
+                ...result.response,
+                superseded: supersedeResult.superseded,
+                ...(supersedeResult.refused
+                  ? { supersedeRefused: supersedeResult.refused }
+                  : {}),
+              }
+            : result.response,
+          { status: 201 },
+        );
       } catch (err) {
         // An envelope that reached storage before indexing failed is
         // persisted (a re-index surfaces it): keep the proof consumed so a
