@@ -2894,9 +2894,10 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       );
 
       expect(JSON.stringify(forward)).toBe(JSON.stringify(reversed));
+      // Legacy order: newest update_time first; conv_0 has none, so it is last.
       expect(forward.ok && forward.payload.conversations).toMatchObject([
-        { id: "conv_0", fetched_at: "2026-10-01T00:00:00.000Z" },
         { id: "conv_1", fetched_at: "2026-10-01T00:00:00.000Z" },
+        { id: "conv_0", fetched_at: "2026-10-01T00:00:00.000Z" },
       ]);
     });
 

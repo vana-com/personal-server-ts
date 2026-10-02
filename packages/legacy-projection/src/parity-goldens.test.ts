@@ -122,3 +122,58 @@ describe.each(SCOPES)("%s parity with the legacy connector", (scope) => {
     }
   });
 });
+
+describe("chatgpt.conversations in a stable order", () => {
+  it("follows legacy's newest-update-first order whatever order rows were stored in", () => {
+    const golden = load("chatgpt.conversations");
+    const shuffled = records(golden).reverse();
+    const result = projectPdppRecordsToLegacyPayload(
+      "chatgpt.conversations",
+      shuffled,
+      {
+        fetchedStreams: golden.fetchedStreams,
+        now: ORACLE_CLOCK,
+        orderByPrimaryKey: true,
+      },
+    );
+    const ids = (body: unknown) =>
+      (body as { conversations: { id: string }[] }).conversations.map(
+        (conversation) => conversation.id,
+      );
+    expect(result.ok && ids(result.payload)).toEqual(ids(golden.legacyBody));
+  });
+
+  it("breaks an update_time tie by id and puts a missing time last", () => {
+    const conversation = (id: string, update_time: string | null) => ({
+      stream: "conversations",
+      data: {
+        id,
+        title: id,
+        create_time: null,
+        update_time,
+        current_node: null,
+        message_count_on_current_branch: 0,
+      },
+    });
+    const result = projectPdppRecordsToLegacyPayload(
+      "chatgpt.conversations",
+      [
+        conversation("z", null),
+        conversation("c", "2026-09-01T00:00:00.000Z"),
+        conversation("b", "2026-09-02T00:00:00.000Z"),
+        conversation("a", "2026-09-01T00:00:00.000Z"),
+      ],
+      {
+        fetchedStreams: ["conversations", "messages"],
+        now: ORACLE_CLOCK,
+        orderByPrimaryKey: true,
+      },
+    );
+    expect(
+      result.ok &&
+        (
+          result.payload as { conversations: { id: string }[] }
+        ).conversations.map((c) => c.id),
+    ).toEqual(["b", "a", "c", "z"]);
+  });
+});

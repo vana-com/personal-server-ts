@@ -103,7 +103,9 @@ export interface ProjectPdppRecordsOptions {
   /**
    * Feed rows to the binding sorted by (stream, primary key) instead of in
    * input order, so the output does not depend on the order rows were
-   * stored in. Top-level arrays then follow key order, not source order.
+   * stored in. Top-level arrays then follow key order, not source order,
+   * except `chatgpt.conversations`, which follows legacy's order: newest
+   * `update_time` first, then id.
    */
   orderByPrimaryKey?: boolean;
 }

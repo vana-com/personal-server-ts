@@ -1743,6 +1743,9 @@ const chatgptConversations: LegacyScopeBinding = {
     if (messagesMissing) {
       diagnostics.push({ kind: "stream_missing", scope, stream: "messages" });
     }
+    // Legacy delivered the conversation list in ChatGPT's own order: most
+    // recently updated first. A stable order keeps that order, not id order.
+    if (options.orderByPrimaryKey) conversations.sort(newestUpdateFirst);
     return {
       ok: true,
       payload: { conversations, total: conversations.length },
@@ -1750,6 +1753,24 @@ const chatgptConversations: LegacyScopeBinding = {
     };
   },
 };
+
+/**
+ * Newest `update_time` first; a missing or unparseable time sorts last.
+ * Ties fall back to the id, so the order never depends on input order.
+ */
+function newestUpdateFirst(
+  a: Record<string, unknown>,
+  b: Record<string, unknown>,
+): number {
+  const time = (row: Record<string, unknown>) => {
+    const parsed =
+      typeof row.update_time === "string" ? Date.parse(row.update_time) : NaN;
+    return Number.isNaN(parsed) ? -Infinity : parsed;
+  };
+  const byTime = time(b) - time(a);
+  if (byTime !== 0 && !Number.isNaN(byTime)) return byTime;
+  return String(a.id) < String(b.id) ? -1 : String(a.id) > String(b.id) ? 1 : 0;
+}
 
 // This is the merged 0.1.3 source declaration. Admission remains a separate
 // decision; this local manifest hash is not the signed OCI artifact digest.
