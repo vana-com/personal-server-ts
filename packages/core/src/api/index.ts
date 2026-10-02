@@ -1260,6 +1260,16 @@ export async function handlePersonalServerDataRequest(
     if (request.method === "GET") {
       const scopeResult = parseDataScopeContract(scopeParam);
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
+      // `?view=stored` returns the body as stored, without the read-time
+      // legacy projection. Owner only; checked after auth below.
+      const view = url.searchParams.get("view");
+      if (view !== null && view !== "stored") {
+        return errorResponse(
+          400,
+          "INVALID_VIEW",
+          'view must be "stored" or absent',
+        );
+      }
       const selectedEntry = deps.storage.findEntry({
         scope: scopeResult.scope,
         fileId: url.searchParams.get("fileId") ?? undefined,
@@ -1282,6 +1292,14 @@ export async function handlePersonalServerDataRequest(
       // and before payment (so nobody is charged for deleted data). Covers
       // both a stale local copy of a tombstoned scope and a local miss.
       await assertScopeNotDeleted(deps, scopeResult.scope, selectedEntry);
+
+      if (view === "stored" && !isOwnerView(authResult)) {
+        return errorResponse(
+          403,
+          "FORBIDDEN",
+          "Only the owner can read the stored view",
+        );
+      }
 
       // Demand: this authorized read is what pays for a recompute of a
       // derivative whose sources have moved on. It runs after the gates
@@ -1398,6 +1416,7 @@ export async function handlePersonalServerDataRequest(
         scopeParam: scopeResult.scope,
         fileId: url.searchParams.get("fileId") ?? undefined,
         at: url.searchParams.get("at") ?? undefined,
+        ...(view === "stored" ? { view } : {}),
       });
       if (!result.ok) {
         if (result.status === 404) {

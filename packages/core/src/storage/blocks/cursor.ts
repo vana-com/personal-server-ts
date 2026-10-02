@@ -6,6 +6,8 @@ export interface DataBlockCursor {
   collectedAt: string;
   blockIndex: number;
   intraBlockOffset?: number;
+  /** Identifies a read-time view of the version (see readBuiltScopeBlocks). */
+  view?: string;
 }
 
 export interface EncodeDataBlockCursorInput {
@@ -13,13 +15,15 @@ export interface EncodeDataBlockCursorInput {
   collectedAt: string;
   blockIndex: number;
   intraBlockOffset?: number;
+  view?: string;
 }
 
 export type DataBlockCursorErrorCode =
   | "cursor_malformed"
   | "cursor_unsupported_version"
   | "cursor_scope_mismatch"
-  | "cursor_collected_at_mismatch";
+  | "cursor_collected_at_mismatch"
+  | "cursor_view_mismatch";
 
 export interface DataBlockCursorError {
   code: DataBlockCursorErrorCode;
@@ -53,6 +57,7 @@ export function encodeDataBlockCursor(
       ...(input.intraBlockOffset === undefined
         ? {}
         : { intraBlockOffset: input.intraBlockOffset }),
+      ...(input.view === undefined ? {} : { view: input.view }),
     }),
   );
 }
@@ -101,7 +106,8 @@ export function decodeDataBlockCursor(
     candidate.collectedAt.length === 0 ||
     !isNonNegativeInteger(candidate.blockIndex) ||
     (candidate.intraBlockOffset !== undefined &&
-      !isNonNegativeInteger(candidate.intraBlockOffset))
+      !isNonNegativeInteger(candidate.intraBlockOffset)) ||
+    (candidate.view !== undefined && typeof candidate.view !== "string")
   ) {
     return malformedCursor("Cursor payload has invalid fields");
   }
@@ -116,13 +122,14 @@ export function decodeDataBlockCursor(
       ...(candidate.intraBlockOffset === undefined
         ? {}
         : { intraBlockOffset: candidate.intraBlockOffset }),
+      ...(typeof candidate.view === "string" ? { view: candidate.view } : {}),
     },
   };
 }
 
 export function validateDataBlockCursor(
   cursor: string,
-  expected: { scope: string; collectedAt: string },
+  expected: { scope: string; collectedAt: string; view?: string },
 ): ValidateDataBlockCursorResult {
   const decoded = decodeDataBlockCursor(cursor);
   if (!decoded.ok) return decoded;
@@ -143,6 +150,17 @@ export function validateDataBlockCursor(
       error: {
         code: "cursor_collected_at_mismatch",
         message: "Cursor collectedAt does not match requested collectedAt",
+      },
+    };
+  }
+
+  if (decoded.cursor.view !== expected.view) {
+    return {
+      ok: false,
+      error: {
+        code: "cursor_view_mismatch",
+        message:
+          "The data behind this cursor changed; restart without a cursor",
       },
     };
   }

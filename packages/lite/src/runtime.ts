@@ -1,3 +1,4 @@
+import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import {
   GrantRequiredError,
   InvalidSignatureError,
@@ -718,7 +719,9 @@ export function createPsLiteRuntime(
   let active = options.active ?? false;
   const now = options.now ?? (() => new Date());
   const auth = options.auth ?? createMissingAuthAdapter();
-  const dataStorage = toDataStoragePort(options.storage);
+  // Readers get legacy bodies projected from stored PDPP records; writes and
+  // listings pass through. Sync is built outside with the raw port.
+  const dataStorage = withLegacyProjection(toDataStoragePort(options.storage));
   // Wire diagnostics by default so GET /v1/diagnostics is always available.
   const diagnostics = options.diagnostics ?? new DiagnosticsRecorder();
   options = { ...options, diagnostics };

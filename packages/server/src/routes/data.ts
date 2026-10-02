@@ -31,6 +31,7 @@ import {
   createBodyLimit,
   DATA_INGEST_MAX_SIZE,
 } from "../middleware/body-limit.js";
+import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import { createNodeDataStorage } from "../storage/node-data-storage.js";
 import { createServerApiAuth } from "../api-auth.js";
 
@@ -112,10 +113,12 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
 
   const dataStorage =
     deps.dataStorage ??
-    createNodeDataStorage({
-      indexManager: deps.indexManager,
-      hierarchyOptions: deps.hierarchyOptions,
-    });
+    withLegacyProjection(
+      createNodeDataStorage({
+        indexManager: deps.indexManager,
+        hierarchyOptions: deps.hierarchyOptions,
+      }),
+    );
   const auth = createServerApiAuth({
     serverOrigin: deps.serverOrigin,
     serverOwner: deps.serverOwner,

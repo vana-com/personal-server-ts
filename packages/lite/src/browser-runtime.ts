@@ -1,3 +1,4 @@
+import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 import type { InferenceProvider } from "@opendatalabs/personal-server-ts-core/derivatives";
@@ -194,7 +195,8 @@ export async function createIndexedDbPsLiteRuntime(
   ) {
     derivatives = createPsLiteDerivativeCompute({
       config,
-      storage,
+      // Derivatives read sources the way apps do: projected legacy bodies.
+      storage: withLegacyProjection(storage),
       store: await createPsLiteQuestionStore(stateStore),
       serverOwner,
       syncManager: () => syncManager,
