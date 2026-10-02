@@ -1,0 +1,292 @@
+{
+  "protocol_version": "0.1.0",
+  "connector_id": "https://registry.pdpp.dev/connectors/oura-browser",
+  "connector_key": "oura-browser",
+  "manifest_uri": "https://registry.pdpp.dev/connectors/oura-browser",
+  "version": "0.1.2",
+  "display_name": "Oura (Browser Sign-In)",
+  "runtime_requirements": {
+    "bindings": {
+      "network": {
+        "required": true
+      },
+      "browser": {
+        "required": true
+      }
+    }
+  },
+  "capabilities": {
+    "human_interaction": ["manual_action"],
+    "refresh_policy": {
+      "recommended_mode": "manual",
+      "recommended_interval_seconds": 21600,
+      "minimum_interval_seconds": 3600,
+      "maximum_staleness_seconds": 86400,
+      "interaction_posture": "manual_action_likely",
+      "rate_limit_sensitivity": "medium",
+      "bot_detection_sensitivity": "medium",
+      "background_safe": false,
+      "rationale": "Collection reuses the owner’s cloud.ouraring.com browser session. Existing sessions can refresh without a prompt while valid; first collection and expired sessions require the owner to sign in through the browser handoff."
+    },
+    "public_listing": {
+      "tier": "development"
+    }
+  },
+  "streams": [
+    {
+      "name": "sleep",
+      "description": "Daily sleep sessions and one record per daily sleep score, including score-only days and multiple score documents for one date. Initial collection covers the most recent 90 days; earlier days require a requested time range.",
+      "display": {
+        "label": "Your sleep sessions",
+        "detail": "Per-night: total sleep duration, awake time, stages (REM, deep, light), heart rate range, HRV, temperature deviation, efficiency, latency, timing, and daily score contributors."
+      },
+      "semantics": "mutable_state",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "record_type": {
+            "type": "string",
+            "enum": ["sleep_session", "daily_score"]
+          },
+          "id": {
+            "type": "string"
+          },
+          "day": {
+            "type": "string",
+            "format": "date",
+            "x_pdpp_role": "event-time"
+          },
+          "bedtime_start": {
+            "type": ["string", "null"]
+          },
+          "bedtime_end": {
+            "type": ["string", "null"]
+          },
+          "total_sleep_duration": {
+            "type": ["integer", "null"]
+          },
+          "rem_sleep_duration": {
+            "type": ["integer", "null"]
+          },
+          "deep_sleep_duration": {
+            "type": ["integer", "null"]
+          },
+          "light_sleep_duration": {
+            "type": ["integer", "null"]
+          },
+          "efficiency": {
+            "type": ["integer", "null"]
+          },
+          "latency": {
+            "type": ["integer", "null"]
+          },
+          "average_heart_rate": {
+            "type": ["number", "null"]
+          },
+          "lowest_heart_rate": {
+            "type": ["integer", "null"]
+          },
+          "average_hrv": {
+            "type": ["number", "null"]
+          },
+          "temperature_delta": {
+            "type": ["number", "null"]
+          },
+          "sleep_score": {
+            "type": ["integer", "null"],
+            "x_pdpp_role": "amount"
+          },
+          "daily_sleep_id": {
+            "type": ["string", "null"]
+          },
+          "daily_sleep_timestamp": {
+            "type": ["string", "null"],
+            "format": "date-time"
+          },
+          "awake_time": {
+            "type": ["integer", "null"]
+          },
+          "average_breath": {
+            "type": ["number", "null"]
+          },
+          "restless_periods": {
+            "type": ["integer", "null"]
+          },
+          "time_in_bed": {
+            "type": ["integer", "null"]
+          },
+          "type": {
+            "type": ["string", "null"]
+          },
+          "contributors": {
+            "type": "object"
+          }
+        },
+        "required": ["id", "day"]
+      },
+      "primary_key": ["id"],
+      "cursor_field": "day",
+      "consent_time_field": "day",
+      "selection": {
+        "fields": true,
+        "resources": true
+      },
+      "required": true,
+      "incremental": true,
+      "query": {
+        "range_filters": {
+          "day": ["gte", "gt", "lte", "lt"],
+          "daily_sleep_timestamp": ["gte", "gt", "lte", "lt"]
+        },
+        "aggregations": {
+          "count": true,
+          "group_by_time": ["day"]
+        }
+      },
+      "coverage_strategy": "checkpoint_window",
+      "freshness_strategy": "scheduled_window"
+    },
+    {
+      "name": "readiness",
+      "description": "Daily readiness scores. Initial collection covers the most recent 90 days; earlier days require a requested time range.",
+      "display": {
+        "label": "Your readiness",
+        "detail": "Daily readiness score with contributing factors (activity balance, recovery index, HRV balance, etc.)."
+      },
+      "semantics": "mutable_state",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "day": {
+            "type": "string",
+            "format": "date",
+            "x_pdpp_role": "event-time"
+          },
+          "score": {
+            "type": ["integer", "null"],
+            "x_pdpp_role": "amount"
+          },
+          "temperature_deviation": {
+            "type": ["number", "null"]
+          },
+          "temperature_trend_deviation": {
+            "type": ["number", "null"]
+          },
+          "contributors": {
+            "type": "object"
+          }
+        },
+        "required": ["id", "day"]
+      },
+      "primary_key": ["id"],
+      "cursor_field": "day",
+      "consent_time_field": "day",
+      "selection": {
+        "fields": true,
+        "resources": true
+      },
+      "required": true,
+      "incremental": true,
+      "query": {
+        "range_filters": {
+          "day": ["gte", "gt", "lte", "lt"]
+        },
+        "aggregations": {
+          "count": true,
+          "group_by_time": ["day"]
+        }
+      },
+      "coverage_strategy": "checkpoint_window",
+      "freshness_strategy": "scheduled_window"
+    },
+    {
+      "name": "activity",
+      "description": "Daily activity and movement. Initial collection covers the most recent 90 days; earlier days require a requested time range.",
+      "display": {
+        "label": "Your activity",
+        "detail": "Daily steps, active calories, total calories, inactive/low/medium/high activity time, target progress."
+      },
+      "semantics": "mutable_state",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "day": {
+            "type": "string",
+            "format": "date",
+            "x_pdpp_role": "event-time"
+          },
+          "score": {
+            "type": ["integer", "null"],
+            "x_pdpp_role": "amount"
+          },
+          "active_calories": {
+            "type": ["integer", "null"]
+          },
+          "total_calories": {
+            "type": ["integer", "null"]
+          },
+          "steps": {
+            "type": ["integer", "null"]
+          },
+          "target_calories": {
+            "type": ["integer", "null"]
+          },
+          "equivalent_walking_distance": {
+            "type": ["integer", "null"]
+          },
+          "high_activity_time": {
+            "type": ["integer", "null"]
+          },
+          "medium_activity_time": {
+            "type": ["integer", "null"]
+          },
+          "low_activity_time": {
+            "type": ["integer", "null"]
+          },
+          "sedentary_time": {
+            "type": ["integer", "null"]
+          },
+          "resting_time": {
+            "type": ["integer", "null"]
+          },
+          "inactivity_alerts": {
+            "type": ["integer", "null"]
+          },
+          "contributors": {
+            "type": "object"
+          }
+        },
+        "required": ["id", "day"]
+      },
+      "primary_key": ["id"],
+      "cursor_field": "day",
+      "consent_time_field": "day",
+      "selection": {
+        "fields": true,
+        "resources": true
+      },
+      "required": true,
+      "incremental": true,
+      "query": {
+        "range_filters": {
+          "day": ["gte", "gt", "lte", "lt"]
+        },
+        "aggregations": {
+          "count": true,
+          "group_by_time": ["day"]
+        }
+      },
+      "coverage_strategy": "checkpoint_window",
+      "freshness_strategy": "scheduled_window"
+    }
+  ],
+  "reason_display_messages": {
+    "oura_browser_window_deferred": "This run read at most 90 days of Oura history. Later days will be retried from the saved checkpoint."
+  }
+}

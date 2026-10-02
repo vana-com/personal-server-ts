@@ -11,6 +11,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const PACKAGE_FILES = [
+  "packages/legacy-projection/package.json",
   "packages/core/package.json",
   "packages/lite/package.json",
   "packages/server/package.json",

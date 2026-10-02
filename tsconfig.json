@@ -1,5 +1,6 @@
 {
   "references": [
+    { "path": "packages/legacy-projection" },
     { "path": "packages/core" },
     { "path": "packages/lite" },
     { "path": "packages/server" },

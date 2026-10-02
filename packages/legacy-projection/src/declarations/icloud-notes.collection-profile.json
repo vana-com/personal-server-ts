@@ -1,0 +1,160 @@
+{
+	"protocol_version": "0.1.0",
+	"connector_id": "https://registry.pdpp.dev/connectors/icloud-notes",
+	"connector_key": "icloud-notes",
+	"manifest_uri": "https://registry.pdpp.dev/connectors/icloud-notes",
+	"version": "0.1.0",
+	"display_name": "iCloud Notes",
+	"brand": {
+		"icon": "icon.svg",
+		"background_color": "#FFD426"
+	},
+	"runtime_requirements": {
+		"bindings": {
+			"network": {
+				"required": true
+			},
+			"browser": {
+				"required": true
+			}
+		}
+	},
+	"capabilities": {
+		"human_interaction": ["manual_action"],
+		"refresh_policy": {
+			"recommended_mode": "automatic",
+			"recommended_interval_seconds": 43200,
+			"minimum_interval_seconds": 14400,
+			"maximum_staleness_seconds": 172800,
+			"interaction_posture": "manual_action_likely",
+			"rate_limit_sensitivity": "medium",
+			"bot_detection_sensitivity": "medium",
+			"background_safe": true,
+			"assisted_after_owner_auth": true,
+			"rationale": "Apple does not publish a rate limit for the CloudKit web service or the icloud.com sign-in surface. This connector is session-reuse-only: it never automates Apple ID sign-in or any two-factor challenge, so a scheduled run either reuses the seeded profile's live session or hands off to the owner via manual_action. First login from a new browser profile commonly serves a two-factor prompt and sometimes a 'Trust this browser?' step, but the session persists in the profile afterward, so most scheduled refreshes reuse it without any prompt. A conservative 12-hour cadence avoids repeatedly exercising Apple's undocumented sign-in friction; assisted_after_owner_auth:true lets a background run ask the owner for bounded help when the session has gone stale."
+		},
+		"public_listing": {
+			"tier": "development"
+		}
+	},
+	"streams": [
+		{
+			"name": "notes",
+			"description": "Notes in iCloud Notes, queried from the CloudKit private database's 'recents' search index.",
+			"display": {
+				"label": "Your iCloud notes",
+				"detail": "Note title, snippet, best-effort extracted body text, pin state, folder assignment, attachment flag, and created/modified timestamps."
+			},
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string"
+					},
+					"title": {
+						"type": ["string", "null"],
+						"x_pdpp_role": "primary-title"
+					},
+					"snippet": {
+						"type": ["string", "null"]
+					},
+					"folder_id": {
+						"type": ["string", "null"]
+					},
+					"is_pinned": {
+						"type": "boolean"
+					},
+					"created_at": {
+						"type": ["string", "null"],
+						"format": "date-time"
+					},
+					"modified_at": {
+						"type": ["string", "null"],
+						"format": "date-time",
+						"x_pdpp_role": "event-time"
+					},
+					"has_attachments": {
+						"type": "boolean"
+					},
+					"text_content": {
+						"type": ["string", "null"],
+						"x_pdpp_role": "secondary"
+					}
+				},
+				"required": ["id", "is_pinned", "has_attachments"]
+			},
+			"primary_key": ["id"],
+			"relationships": [
+				{
+					"name": "folder",
+					"stream": "folders",
+					"foreign_key": "folder_id",
+					"cardinality": "has_one"
+				}
+			],
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"incremental": false,
+			"query": {
+				"search": {
+					"lexical_fields": ["title", "snippet", "text_content"],
+					"semantic_fields": ["title", "snippet", "text_content"]
+				},
+				"range_filters": {
+					"created_at": ["gte", "gt", "lte", "lt"],
+					"modified_at": ["gte", "gt", "lte", "lt"]
+				},
+				"aggregations": {
+					"count": true,
+					"group_by_time": ["created_at", "modified_at"],
+					"group_by": ["folder_id"]
+				}
+			},
+			"coverage_strategy": "full_inventory",
+			"freshness_strategy": "scheduled_window",
+			"required": true
+		},
+		{
+			"name": "folders",
+			"description": "Folders used to organize iCloud Notes, queried from the CloudKit private database's 'parentless' search index.",
+			"display": {
+				"label": "Your iCloud notes folders",
+				"detail": "Folder name and CloudKit record identity."
+			},
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string"
+					},
+					"name": {
+						"type": "string",
+						"x_pdpp_role": "primary-title"
+					}
+				},
+				"required": ["id", "name"]
+			},
+			"primary_key": ["id"],
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"incremental": false,
+			"query": {
+				"search": {
+					"lexical_fields": ["name"]
+				}
+			},
+			"coverage_strategy": "full_inventory",
+			"freshness_strategy": "scheduled_window",
+			"required": true
+		}
+	],
+	"reason_display_messages": {
+		"older_pages_deferred_page_budget": "We stopped after reading a set number of pages of your iCloud notes, so older notes haven't been collected yet. Nothing was lost — the next run picks up where this one stopped"
+	}
+}

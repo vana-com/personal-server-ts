@@ -4,3 +4,8 @@ coverage
 *.d.ts
 *.tsbuildinfo
 package-lock.json
+# Vendored, byte-identical reference artifacts (see __fixtures__/PROVENANCE.md)
+packages/legacy-projection/src/__fixtures__
+packages/legacy-projection/src/legacy-schemas
+packages/legacy-projection/src/declarations
+packages/legacy-projection/src/github-browser-0.2.0-oracle.mjs

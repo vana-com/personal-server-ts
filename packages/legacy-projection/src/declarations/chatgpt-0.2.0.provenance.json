@@ -1,0 +1,168 @@
+{
+  "generated_file_notice": "GENERATED FILE — DO NOT HAND-EDIT. Rebuild with scripts/build-connector-oci-artifact.mjs.",
+  "connector_key": "chatgpt",
+  "connector_id": "https://registry.pdpp.dev/connectors/chatgpt",
+  "version": "0.2.0",
+  "protocol_version": "0.1.0",
+  "source": {
+    "repository": "https://github.com/PDP-Connect/data-connectors",
+    "revision": "1640b63dd7c10817d590008d6fec0b25c3ffcd6c",
+    "package": "connectors/chatgpt"
+  },
+  "source_inventory": [
+    {
+      "path": "connectors/chatgpt/index.ts",
+      "sha256": "sha256:ebeee245cc11ca0f6e56c3a77d2d47db4deb1792597fd09e2d2db1495cffd1d4"
+    },
+    {
+      "path": "connectors/chatgpt/parsers.ts",
+      "sha256": "sha256:f0140ed5aded384611e50c982ec2d9462d4d9e5c3cf1fa18f675d00fdce3f9db"
+    },
+    {
+      "path": "connectors/chatgpt/schemas.ts",
+      "sha256": "sha256:98605b6a2763d7d94680a4a5baf346105db19db44189aa0e4ac5187df96e44d9"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/adaptive-lane.ts",
+      "sha256": "sha256:c697eac8725c694efd972d4c2a77b91e60c4e9cfd2c24b0852f8a57c8f322c5c"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/auto-login/chatgpt.ts",
+      "sha256": "sha256:c1ee8f22c3627ca126dc7d4b3845bd676c0a2eb01f8def58677635c985034f4c"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/auto-login/login-credentials.ts",
+      "sha256": "sha256:f7c5763fee3b38be70103350de9245c41874060d98d3c550ed5e67e59293b689"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/browser-handoff.ts",
+      "sha256": "sha256:dd316a8f9bce9a7f1a623d59612575d426d35b212ad3e8d075590ce9d2d1b6d7"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/browser-launch.ts",
+      "sha256": "sha256:914bc80f3a4c53a6f52324ece77e42fa0e0e762ab9d48604364fe346a9ed6607"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/browser-surface-policy.ts",
+      "sha256": "sha256:e9827e585854b5ac3cdc60432dbb112cfdee4b2ff6fb1798fee402f68334032d"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/capture-redaction.ts",
+      "sha256": "sha256:de9f0ef459574d5ef3a03b060e241dab705e8f981958c6d7d2eca8f7a97b4e4a"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/connector-exit.ts",
+      "sha256": "sha256:395555db65b8760bd5f7812fe81c7b5922d84a25bfc8a1e82a925c9bd2ed0b56"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/connector-paths.ts",
+      "sha256": "sha256:a8913acf76159270342d7a0bd709d2a85da0d5bfc683fbbd0a0d0f202e884038"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/connector-runtime.ts",
+      "sha256": "sha256:5cdeccd50034aff4f84b6e1105cb77201700ca2618c9f061fdcd63737daf8ca1"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/fingerprint-cursor.ts",
+      "sha256": "sha256:9e06e7d7796f99b352d85a3b5f30505e3393d555e82829fb331882fc4e695b9a"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/fixture-capture.ts",
+      "sha256": "sha256:4005e66d066f45a28e1bd05599a4f959c96b383f043bf064f51c7c0366cd984b"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/platform-probes.ts",
+      "sha256": "sha256:623402190b3b9ff14ac7d6f561a77bf58dba51f3a872f877a6e1bf5b9adcfa2f"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/profile-lock.ts",
+      "sha256": "sha256:e4398bd9a175edcc62cfed0df33bd5c2cd570450f846e5e9e73a8b99e523ad36"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/provider-budget.ts",
+      "sha256": "sha256:1dc04ec1a33497a99470d038f22df017aec99b05a7ae63f2c07a4608e072b0a7"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/provider-pacing.ts",
+      "sha256": "sha256:6a79661d584efb5198e8c2dd9c5545806238e2ae62f6fac2b0be7fe7ea422e8a"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/repair-budget.ts",
+      "sha256": "sha256:b3c076b9c3aa2f28df796d18fc400eb2a2df1394a780fb89cb2537f1de14dfda"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/run-budget.ts",
+      "sha256": "sha256:f517dd6ac5b13a75bcea6035f9385753587e1487051ee1561583f6fb5b9d20f9"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/runtime-environment.ts",
+      "sha256": "sha256:93ad3686202601fe638f97d5278c80b521092b31d849d53d77fe93fb3154d57d"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/schema-registry.ts",
+      "sha256": "sha256:0babcc2e73431002b31e58bfd8754b85d10294cfa51058d4471db7f95a164b73"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/session-establish.ts",
+      "sha256": "sha256:8ceb1a0451ef5a03f5f83259a91cbe44401ad44ba82c8c5b0f4ee80579f30a42"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/shutdown-hook.ts",
+      "sha256": "sha256:20f2918a9c85e645776f3a5c2e46b9ec930d429e50443436978a5cccdabc604f"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/streaming-target-registration.ts",
+      "sha256": "sha256:12eaeeecd9fcbff8b2cd0846721163917df2f6f9e0692050fb581269ef6a76ca"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/terminal-error.ts",
+      "sha256": "sha256:4bc3efc944ca22615905239ee7f875cfc27aabd8ca5dafe28ee5cc8e6d8c426a"
+    }
+  ],
+  "build": {
+    "esbuild_version": "0.28.2",
+    "options": {
+      "bundle": true,
+      "format": "esm",
+      "minifyWhitespace": true,
+      "platform": "node",
+      "target": "node24"
+    }
+  },
+  "runtime_requirements": {
+    "bindings": {
+      "network": {
+        "required": true
+      },
+      "browser": {
+        "required": true
+      }
+    }
+  },
+  "host_runtime_contract": {
+    "version": "1.1",
+    "node": ">=24.15.0 <25",
+    "packages": [
+      {
+        "specifier": "patchright",
+        "package": "patchright",
+        "declared_version": "1.63.0",
+        "reason": "Browser automation driver. Needs a downloaded Chromium build and a matching host OS, which an artifact cannot carry; bundling the JS alone would not make it runnable.",
+        "loaded": "dynamic-import"
+      }
+    ]
+  },
+  "bundled_dependencies": [
+    "@pdpp/connector-protocol",
+    "eventemitter3",
+    "p-queue",
+    "p-timeout",
+    "zod"
+  ],
+  "outputs": {
+    "collection-profile.json": "sha256:7dcb6e215cd02b1dc93b7a5895db0ebe89feb35a5c117bad1ad04c30e3fdd3e0",
+    "code.tar.gz": "sha256:79803e3ab1002837a4fab82e42b327062f92ec95735134ef9bf438eb3bd34bcf",
+    "assets.tar.gz": "sha256:bb6dab25992c959f3a5f0f9a0c24460c08fe1d661233506f815d75e056290ebc",
+    "licenses.tar.gz": "sha256:8d502bb8a83e63101397c7a57af52da4a456d5bfe382c4731920594d485c3398"
+  }
+}
