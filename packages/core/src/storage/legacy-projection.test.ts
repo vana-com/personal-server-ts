@@ -6,6 +6,7 @@ import {
   ingestDataContract,
 } from "../contracts/data.js";
 import type { DataStoragePort } from "../ports/index.js";
+import type { WriterAttribution } from "../write/attribution.js";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
 import {
   classifyStoredBody,
@@ -53,6 +54,7 @@ async function store(
   scope: string,
   collectedAt: string,
   body: Record<string, unknown>,
+  attribution?: WriterAttribution,
 ) {
   const result = await ingestDataContract({
     storage,
@@ -60,6 +62,7 @@ async function store(
     body,
     collectedAt,
     status: "stored",
+    attribution,
   });
   if (!result.ok) throw new Error(JSON.stringify(result.body));
 }
@@ -573,6 +576,9 @@ describe("supersedeLegacyVersions", () => {
   it("deletes only older legacy-form versions of the scope", async () => {
     const raw = createMemoryDataStorage();
     const legacy = { conversations: [], total: 0 };
+    await store(raw, "chatgpt.messages", "2026-09-30T00:00:00.000Z", {
+      records: messages,
+    });
     await store(
       raw,
       "chatgpt.conversations",
@@ -603,13 +609,13 @@ describe("supersedeLegacyVersions", () => {
       total: 0,
     });
 
-    const deleted = await supersedeLegacyVersions(
+    const { superseded } = await supersedeLegacyVersions(
       withLegacyProjection(raw),
       "chatgpt.conversations",
       "2026-10-01T00:00:00.000Z",
     );
 
-    expect(deleted.sort()).toEqual([
+    expect(superseded.sort()).toEqual([
       "2026-09-01T00:00:00.000Z",
       "2026-09-03T00:00:00.000Z",
     ]);
@@ -620,6 +626,7 @@ describe("supersedeLegacyVersions", () => {
       "chatgpt.conversations 2026-10-01T00:00:00.000Z",
       "chatgpt.conversations 2026-10-02T00:00:00.000Z",
       "chatgpt.memories 2026-09-01T00:00:00.000Z",
+      "chatgpt.messages 2026-09-30T00:00:00.000Z",
     ]);
   });
 
@@ -635,7 +642,8 @@ describe("supersedeLegacyVersions", () => {
     await store(raw, scope, "2026-10-01T00:00:00.000Z", body);
 
     expect(
-      await supersedeLegacyVersions(raw, scope, "2026-10-01T00:00:00.000Z"),
+      (await supersedeLegacyVersions(raw, scope, "2026-10-01T00:00:00.000Z"))
+        .superseded,
     ).toEqual([]);
     expect(raw.entries).toHaveLength(2);
   });
@@ -657,12 +665,18 @@ describe("supersedeLegacyVersions", () => {
         "claude.projects",
         "2026-10-01T00:00:00.000Z",
       ),
-    ).toEqual([]);
+    ).toEqual({
+      superseded: [],
+      refused: "the new version cannot be projected",
+    });
     expect(raw.entries).toHaveLength(2);
   });
 
   it("compares versions by instant, keeping a later version that sorts earlier as a string", async () => {
     const raw = createMemoryDataStorage();
+    await store(raw, "chatgpt.messages", "2026-10-01T00:00:00.000Z", {
+      records: [],
+    });
     await store(raw, "chatgpt.conversations", "2026-10-01T12:00:00.500Z", {
       conversations: [],
       total: 0,
@@ -677,12 +691,15 @@ describe("supersedeLegacyVersions", () => {
         "chatgpt.conversations",
         "2026-10-01T12:00:00Z",
       ),
-    ).toEqual([]);
-    expect(raw.entries).toHaveLength(2);
+    ).toEqual({ superseded: [] });
+    expect(raw.entries).toHaveLength(3);
   });
 
   it("keeps an older binary upload under the scope", async () => {
     const raw = createMemoryDataStorage();
+    await store(raw, "chatgpt.messages", "2026-09-30T00:00:00.000Z", {
+      records: [],
+    });
     const binary = await ingestBinaryDataContract({
       storage: raw,
       scopeParam: "chatgpt.conversations",
@@ -702,7 +719,189 @@ describe("supersedeLegacyVersions", () => {
         "chatgpt.conversations",
         "2026-10-01T00:00:00.000Z",
       ),
-    ).toEqual([]);
+    ).toEqual({ superseded: [] });
+    expect(raw.entries).toHaveLength(3);
+  });
+
+  async function legacyWithThread(raw: DataStoragePort) {
+    await store(raw, "chatgpt.conversations", "2026-09-01T00:00:00.000Z", {
+      conversations: [
+        {
+          id: "conv-1",
+          title: "Trip plan",
+          message_count: 2,
+          messages: [{ id: "m1" }, { id: "m2" }],
+        },
+      ],
+      total: 1,
+    });
+  }
+
+  it("deletes nothing when the messages stream is missing", async () => {
+    const raw = createMemoryDataStorage();
+    await legacyWithThread(raw);
+    await store(raw, "chatgpt.conversations", "2026-10-01T00:00:00.000Z", {
+      records: [conversation],
+    });
+
+    expect(
+      await supersedeLegacyVersions(
+        withLegacyProjection(raw),
+        "chatgpt.conversations",
+        "2026-10-01T00:00:00.000Z",
+      ),
+    ).toEqual({
+      superseded: [],
+      refused: "the projection is partial (stream_missing)",
+    });
     expect(raw.entries).toHaveLength(2);
+  });
+
+  it("deletes nothing when the projection drops a row", async () => {
+    const raw = createMemoryDataStorage();
+    await legacyWithThread(raw);
+    await store(raw, "chatgpt.messages", "2026-09-30T00:00:00.000Z", {
+      records: messages,
+    });
+    const { message_count_on_current_branch: _count, ...countless } =
+      conversation;
+    await store(raw, "chatgpt.conversations", "2026-10-01T00:00:00.000Z", {
+      records: [countless],
+    });
+
+    expect(
+      await supersedeLegacyVersions(
+        withLegacyProjection(raw),
+        "chatgpt.conversations",
+        "2026-10-01T00:00:00.000Z",
+      ),
+    ).toEqual({
+      superseded: [],
+      refused: "the projection is partial (records_dropped)",
+    });
+    expect(raw.entries).toHaveLength(3);
+  });
+
+  it("deletes nothing when the projection holds fewer items than the newest legacy version", async () => {
+    const raw = createMemoryDataStorage();
+    await legacyWithThread(raw);
+    await store(raw, "chatgpt.messages", "2026-09-30T00:00:00.000Z", {
+      records: [],
+    });
+    await store(raw, "chatgpt.conversations", "2026-10-01T00:00:00.000Z", {
+      records: [],
+    });
+
+    expect(
+      await supersedeLegacyVersions(
+        withLegacyProjection(raw),
+        "chatgpt.conversations",
+        "2026-10-01T00:00:00.000Z",
+      ),
+    ).toEqual({
+      superseded: [],
+      refused:
+        "the projection has 0 conversations; the newest legacy version has 1",
+    });
+    expect(raw.entries).toHaveLength(3);
+  });
+
+  it("deletes nothing when the projection lacks a conversation the newest legacy version holds", async () => {
+    const raw = createMemoryDataStorage();
+    await legacyWithThread(raw);
+    await store(raw, "chatgpt.messages", "2026-09-30T00:00:00.000Z", {
+      records: [],
+    });
+    // A windowed run: as many conversations as legacy, but other ones.
+    await store(raw, "chatgpt.conversations", "2026-10-01T00:00:00.000Z", {
+      records: [
+        {
+          ...conversation,
+          id: "conv-2",
+          current_node: null,
+          message_count_on_current_branch: 0,
+        },
+      ],
+    });
+
+    expect(
+      await supersedeLegacyVersions(
+        withLegacyProjection(raw),
+        "chatgpt.conversations",
+        "2026-10-01T00:00:00.000Z",
+      ),
+    ).toEqual({
+      superseded: [],
+      refused:
+        "the projection lacks 1 of the conversations in the newest legacy version",
+    });
+    expect(raw.entries).toHaveLength(3);
+  });
+
+  const builderWrite: WriterAttribution = {
+    builder: "0x00000000000000000000000000000000000000b1",
+    grantId: "grant-1",
+    signature: "payload.sig",
+    bodyHash: "hash",
+    writtenAt: "2026-09-01T00:00:00.000Z",
+  };
+
+  it.each([
+    [
+      "a legacy body a builder wrote",
+      { conversations: [], total: 0 },
+      builderWrite,
+    ],
+    ["a body without the legacy collection", { records: [], extra: 1 }],
+    ["a body whose collection is not an array", { conversations: {} }],
+  ])("keeps %s", async (_label, body, attribution?: WriterAttribution) => {
+    const raw = createMemoryDataStorage();
+    await store(raw, "chatgpt.messages", "2026-09-30T00:00:00.000Z", {
+      records: [],
+    });
+    await store(
+      raw,
+      "chatgpt.conversations",
+      "2026-09-01T00:00:00.000Z",
+      body,
+      attribution,
+    );
+    await store(raw, "chatgpt.conversations", "2026-10-01T00:00:00.000Z", {
+      records: [],
+    });
+
+    expect(
+      await supersedeLegacyVersions(
+        withLegacyProjection(raw),
+        "chatgpt.conversations",
+        "2026-10-01T00:00:00.000Z",
+      ),
+    ).toEqual({ superseded: [] });
+    expect(raw.entries).toHaveLength(3);
+  });
+
+  it("deletes nothing on a raw port, which cannot show the projection", async () => {
+    const raw = createMemoryDataStorage();
+    await store(raw, "chatgpt.messages", "2026-09-30T00:00:00.000Z", {
+      records: [],
+    });
+    await store(raw, "chatgpt.conversations", "2026-09-01T00:00:00.000Z", {
+      conversations: [],
+      total: 0,
+    });
+    await store(raw, "chatgpt.conversations", "2026-10-01T00:00:00.000Z", {
+      records: [],
+    });
+
+    expect(
+      (
+        await supersedeLegacyVersions(
+          raw,
+          "chatgpt.conversations",
+          "2026-10-01T00:00:00.000Z",
+        )
+      ).superseded,
+    ).toEqual([]);
+    expect(raw.entries).toHaveLength(3);
   });
 });

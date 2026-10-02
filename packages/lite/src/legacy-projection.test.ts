@@ -342,8 +342,23 @@ describe("POST ?supersede=legacy", () => {
     );
   }
 
+  const legacyThread = {
+    conversations: [
+      {
+        id: "conv-1",
+        title: "Trip plan",
+        message_count: 1,
+        messages: [
+          { id: "m1", role: "user", content: "How do I get to Lyon?" },
+        ],
+      },
+    ],
+    total: 1,
+  };
+
   it("deletes older legacy versions after the PDPP write commits", async () => {
     const { runtime, storage } = createRuntime();
+    await post(runtime, "chatgpt.messages", messages);
     await post(runtime, "chatgpt.conversations", legacyBody);
     await post(runtime, "chatgpt.conversations", legacyBody);
     const legacyVersions = storage
@@ -371,6 +386,7 @@ describe("POST ?supersede=legacy", () => {
 
   it("keeps older PDPP versions", async () => {
     const { runtime, storage } = createRuntime();
+    await post(runtime, "chatgpt.messages", messages);
     await post(runtime, "chatgpt.conversations", legacyBody);
     await post(runtime, "chatgpt.conversations", { records: [] });
 
@@ -401,6 +417,47 @@ describe("POST ?supersede=legacy", () => {
     expect(((await res.json()) as { superseded: string[] }).superseded).toEqual(
       [],
     );
+    expect(storage.countVersions("chatgpt.conversations")).toBe(2);
+  });
+
+  it("keeps the legacy threads when the messages stream is not stored yet", async () => {
+    const { runtime, storage } = createRuntime();
+    await post(runtime, "chatgpt.conversations", legacyThread);
+
+    const res = await postRaw(
+      runtime,
+      "/v1/data/chatgpt.conversations?supersede=legacy",
+      conversations,
+    );
+
+    expect(res.status).toBe(201);
+    expect(await res.json()).toMatchObject({
+      superseded: [],
+      supersedeRefused: "the projection is partial (stream_missing)",
+    });
+    expect(await versionBodies(storage, "chatgpt.conversations")).toEqual([
+      conversations,
+      legacyThread,
+    ]);
+  });
+
+  it("keeps the legacy history when the PDPP write holds fewer conversations", async () => {
+    const { runtime, storage } = createRuntime();
+    await post(runtime, "chatgpt.messages", { records: [] });
+    await post(runtime, "chatgpt.conversations", legacyThread);
+
+    const res = await postRaw(
+      runtime,
+      "/v1/data/chatgpt.conversations?supersede=legacy",
+      { records: [] },
+    );
+
+    expect(res.status).toBe(201);
+    expect(await res.json()).toMatchObject({
+      superseded: [],
+      supersedeRefused:
+        "the projection has 0 conversations; the newest legacy version has 1",
+    });
     expect(storage.countVersions("chatgpt.conversations")).toBe(2);
   });
 

@@ -87,6 +87,10 @@ export interface LegacyProjectionOptions {
 }
 
 const SERVED = Symbol.for("personal-server-ts.legacy-projection.served");
+/** A served port's own projected view of one stored version, for supersede. */
+const PROJECTED_VIEW = Symbol.for(
+  "personal-server-ts.legacy-projection.projected-view",
+);
 
 interface Projected {
   /** Identifies the inputs; block cursors carry it so a page from one
@@ -95,6 +99,8 @@ interface Projected {
   envelope: DataFileEnvelope;
   bytes: Uint8Array;
   built?: { manifest: DataBlockManifest; blocks: DataScopeBlock[] };
+  /** Rows left out or join streams missing; absent for a complete view. */
+  diagnostics?: ProjectionDiagnostic[];
 }
 
 const textEncoder = new TextEncoder();
@@ -249,6 +255,9 @@ export function withLegacyProjection(
     return {
       envelope,
       bytes: textEncoder.encode(JSON.stringify(envelope)),
+      ...(result.diagnostics?.length
+        ? { diagnostics: result.diagnostics }
+        : {}),
     };
   }
 
@@ -267,8 +276,12 @@ export function withLegacyProjection(
     return view.built;
   }
 
-  const overrides: Partial<DataStoragePort> & { [SERVED]: true } = {
+  const overrides: Partial<DataStoragePort> & {
+    [SERVED]: true;
+    [PROJECTED_VIEW]: typeof projected;
+  } = {
     [SERVED]: true,
+    [PROJECTED_VIEW]: projected,
     async readEnvelope(scope, collectedAt) {
       const { view, own } = await resolve(scope, collectedAt);
       return view?.envelope ?? own ?? raw.readEnvelope(scope, collectedAt);
@@ -484,12 +497,27 @@ function isRecordsBody(
   );
 }
 
+export interface SupersedeResult {
+  /** `collectedAt` of every deleted version. */
+  superseded: string[];
+  /** Why nothing was deleted, when superseding was refused. */
+  refused?: string;
+}
+
 /**
  * After a `{records}` version of a projected scope is committed, delete the
- * scope's older versions whose stored body is a legacy body: the new
- * version serves the same legacy view, so they are a second copy.
- * PDPP versions, unrelated forms and newer versions are kept. Returns the
- * `collectedAt` of every deleted version.
+ * scope's older owner-written legacy versions: the new version serves the
+ * same legacy view, so they are a second copy.
+ *
+ * It deletes nothing unless `storage` is a served port (see
+ * `withLegacyProjection`) whose projection of the new version is complete:
+ * no join stream missing and no row left out. It also deletes nothing when
+ * the projection holds fewer items than the newest legacy version, or lacks
+ * any item id that version holds, so an empty or time-windowed run cannot
+ * replace a full history. A legacy version must carry the scope's legacy
+ * collection key (`conversations` for `chatgpt.conversations`); PDPP
+ * versions, other bodies, binary uploads, versions a builder wrote
+ * (`$writtenBy`) and newer versions are kept.
  *
  * Local only: the deletes are not sent to the gateway. Copies that sync
  * already uploaded, and copies other replicas already downloaded, remain.
@@ -498,17 +526,34 @@ export async function supersedeLegacyVersions(
   storage: DataStoragePort,
   scope: string,
   committedAt: string,
-): Promise<string[]> {
+): Promise<SupersedeResult> {
+  const refuse = (refused: string): SupersedeResult => ({
+    superseded: [],
+    refused,
+  });
   const readStored = (storage.readStoredEnvelope ?? storage.readEnvelope).bind(
     storage,
   );
   const committed = await readStored(scope, committedAt);
-  if (classifyStoredBody(scope, committed.data) !== "pdpp-projected") return [];
-  // Only delete once the new version really serves the legacy view: a
-  // failed projection (a missing join stream, say) is served as stored.
-  if (isRecordsBody((await storage.readEnvelope(scope, committedAt)).data)) {
-    return [];
+  if (classifyStoredBody(scope, committed.data) !== "pdpp-projected") {
+    return refuse("the new version is not PDPP records of a projected scope");
   }
+  const projectedView = (
+    storage as {
+      [PROJECTED_VIEW]?: (s: string, c: string) => Promise<Projected | null>;
+    }
+  )[PROJECTED_VIEW];
+  const view = projectedView ? await projectedView(scope, committedAt) : null;
+  if (!view) return refuse("the new version cannot be projected");
+  if (view.diagnostics?.length) {
+    const kinds = [...new Set(view.diagnostics.map((d) => d.kind))];
+    return refuse(`the projection is partial (${kinds.join(", ")})`);
+  }
+  const collection = legacyCollectionKey(scope);
+  const projectedItems = (view.envelope.data as Record<string, unknown>)[
+    collection
+  ] as unknown[];
+  const projectedCount = projectedItems.length;
 
   const committedMs = Date.parse(committedAt);
   const older: string[] = [];
@@ -524,15 +569,78 @@ export async function supersedeLegacyVersions(
     if (page.length < pageSize) break;
   }
 
-  const deleted: string[] = [];
+  const legacy: { collectedAt: string; count: number; ids: string[] }[] = [];
   for (const collectedAt of older) {
     const envelope = await readStored(scope, collectedAt);
     // A binary upload under the scope is not a legacy body.
     if (isBinaryEnvelope(envelope)) continue;
-    if (classifyStoredBody(scope, envelope.data) !== "legacy") continue;
-    if (await storage.deleteVersion(scope, collectedAt)) {
-      deleted.push(collectedAt);
+    const items = legacyCollection(scope, envelope.data);
+    if (items === null) continue;
+    legacy.push({
+      collectedAt,
+      count: items.length,
+      ids: items.map(itemId).filter((id) => id !== undefined),
+    });
+  }
+  const newest = legacy.reduce<(typeof legacy)[number] | undefined>(
+    (best, version) =>
+      !best || Date.parse(version.collectedAt) > Date.parse(best.collectedAt)
+        ? version
+        : best,
+    undefined,
+  );
+  if (newest && projectedCount < newest.count) {
+    return refuse(
+      `the projection has ${projectedCount} ${collection}; the newest legacy version has ${newest.count}`,
+    );
+  }
+  if (newest) {
+    const projectedIds = new Set(
+      projectedItems.map(itemId).filter((id) => id !== undefined),
+    );
+    const missing = newest.ids.filter((id) => !projectedIds.has(id));
+    if (missing.length > 0) {
+      return refuse(
+        `the projection lacks ${missing.length} of the ${collection} in the newest legacy version`,
+      );
     }
   }
-  return deleted;
+
+  const superseded: string[] = [];
+  for (const { collectedAt } of legacy) {
+    if (await storage.deleteVersion(scope, collectedAt)) {
+      superseded.push(collectedAt);
+    }
+  }
+  return { superseded };
+}
+
+/** `chatgpt.conversations` → `conversations`: the array a legacy body holds. */
+function legacyCollectionKey(scope: string): string {
+  return scope.slice(scope.indexOf(".") + 1);
+}
+
+/**
+ * The items of an owner-written legacy body of `scope`, or null when the
+ * body is not one: it must hold the scope's collection array, must not be
+ * PDPP records, and must not carry a builder's `$writtenBy` stamp.
+ */
+function legacyCollection(scope: string, data: unknown): unknown[] | null {
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    return null;
+  }
+  if (isRecordsBody(data) || "$writtenBy" in data) return null;
+  const items = (data as Record<string, unknown>)[legacyCollectionKey(scope)];
+  return Array.isArray(items) ? items : null;
+}
+
+/** A legacy item's `id` (or `uuid`), when it has a string one. */
+function itemId(item: unknown): string | undefined {
+  if (item === null || typeof item !== "object") return undefined;
+  const { id, uuid } = item as { id?: unknown; uuid?: unknown };
+  return typeof id === "string"
+    ? id
+    : typeof uuid === "string"
+      ? uuid
+      : undefined;
 }

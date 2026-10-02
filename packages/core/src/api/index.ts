@@ -23,7 +23,10 @@ import {
   type ScopeDeletionTracker,
 } from "../sync/scope-deletions.js";
 import type { IndexEntry } from "../storage/index/types.js";
-import { supersedeLegacyVersions } from "../storage/legacy-projection.js";
+import {
+  supersedeLegacyVersions,
+  type SupersedeResult,
+} from "../storage/legacy-projection.js";
 import {
   deleteScope as deleteScopeLocally,
   type DeleteScopeResult,
@@ -441,20 +444,26 @@ async function supersedeAfterCommit(
   deps: PersonalServerDataApiDeps,
   scope: string,
   committedAt: string,
-): Promise<string[]> {
+): Promise<SupersedeResult> {
   try {
-    const superseded = await supersedeLegacyVersions(
+    const result = await supersedeLegacyVersions(
       deps.storage,
       scope,
       committedAt,
     );
-    if (superseded.length > 0) {
+    if (result.superseded.length > 0) {
       deps.logger?.info?.(
-        { scope, committedAt, superseded },
+        { scope, committedAt, superseded: result.superseded },
         "Deleted legacy-form versions superseded by a PDPP write",
       );
     }
-    return superseded;
+    if (result.refused) {
+      deps.logger?.info?.(
+        { scope, committedAt, refused: result.refused },
+        "Kept legacy-form versions; superseding was refused",
+      );
+    }
+    return result;
   } catch (err) {
     deps.logger?.warn?.(
       {
@@ -464,7 +473,7 @@ async function supersedeAfterCommit(
       },
       "Superseding legacy-form versions failed; the write is stored",
     );
-    return [];
+    return { superseded: [], refused: "superseding failed" };
   }
 }
 
@@ -1740,7 +1749,7 @@ export async function handlePersonalServerDataRequest(
           "Data file ingested",
         );
         await logBuilderWrite();
-        const superseded =
+        const supersedeResult =
           supersede === "legacy"
             ? await supersedeAfterCommit(
                 deps,
@@ -1755,7 +1764,15 @@ export async function handlePersonalServerDataRequest(
           lineageSources: lineage?.sources,
         });
         return jsonResponse(
-          superseded ? { ...result.response, superseded } : result.response,
+          supersedeResult
+            ? {
+                ...result.response,
+                superseded: supersedeResult.superseded,
+                ...(supersedeResult.refused
+                  ? { supersedeRefused: supersedeResult.refused }
+                  : {}),
+              }
+            : result.response,
           { status: 201 },
         );
       } catch (err) {
