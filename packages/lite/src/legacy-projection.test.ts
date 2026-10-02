@@ -4,7 +4,7 @@
  * owner-only stored view, and the bounded block reads MCP tools use.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildDataBlocksAsync } from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import { createBearerTokenPsLiteAuth, createPsLiteRuntime } from "./runtime.js";
@@ -43,10 +43,13 @@ const messages = {
   ],
 };
 
-function createRuntime() {
+function createRuntime(
+  options: Partial<Parameters<typeof createPsLiteRuntime>[0]> = {},
+) {
   const storage = createMemoryPsLiteStorage();
   const accessLogStore = createMemoryPsLiteAccessLogStore();
   const runtime = createPsLiteRuntime({
+    ...options,
     storage,
     gateway: createMockPsLiteGateway(),
     accessLogReader: accessLogStore,
@@ -94,6 +97,28 @@ function get(
 }
 
 describe("PS-Lite legacy projection", () => {
+  it("reports a projection that left rows out", async () => {
+    const onLegacyProjectionIssue = vi.fn();
+    const { runtime } = createRuntime({ onLegacyProjectionIssue });
+    await post(runtime, "chatgpt.conversations", conversations);
+
+    const res = await get(runtime, "/v1/data/chatgpt.conversations");
+
+    expect(res.status).toBe(200);
+    expect(onLegacyProjectionIssue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "projection_diagnostics",
+        scope: "chatgpt.conversations",
+        diagnostics: [
+          expect.objectContaining({
+            kind: "stream_missing",
+            stream: "messages",
+          }),
+        ],
+      }),
+    );
+  });
+
   it("serves the projected legacy body to the owner and keeps the stored records", async () => {
     const { runtime, storage } = createRuntime();
     await post(runtime, "chatgpt.messages", messages);
