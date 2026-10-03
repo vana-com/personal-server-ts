@@ -7,7 +7,9 @@ import * as viaSource from "./index.js";
 // exists and serves the same projection as the source module.
 describe("@opendatalabs/personal-server-ts-core/legacy-projection", () => {
   it("exports every runtime name the source module exports", () => {
-    expect(Object.keys(viaExport).sort()).toEqual(Object.keys(viaSource).sort());
+    expect(Object.keys(viaExport).sort()).toEqual(
+      Object.keys(viaSource).sort(),
+    );
   });
 
   it("projects ChatGPT records into the legacy body", () => {
@@ -40,11 +42,17 @@ describe("@opendatalabs/personal-server-ts-core/legacy-projection", () => {
           },
         },
       ],
-      { fetchedStreams: ["conversations", "messages"], now: "2026-01-02T00:00:00.000Z" },
+      {
+        fetchedStreams: ["conversations", "messages"],
+        now: "2026-01-02T00:00:00.000Z",
+      },
     );
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    const payload = result.payload as { total: number; conversations: { messages: unknown[] }[] };
+    const payload = result.payload as {
+      total: number;
+      conversations: { messages: unknown[] }[];
+    };
     expect(payload.total).toBe(1);
     expect(payload.conversations[0]?.messages).toHaveLength(1);
   });
