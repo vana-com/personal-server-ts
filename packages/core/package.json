@@ -68,6 +68,10 @@
       "types": "./dist/storage/preview.d.ts",
       "import": "./dist/storage/preview.js"
     },
+    "./legacy-projection": {
+      "types": "./dist/legacy-projection/index.d.ts",
+      "import": "./dist/legacy-projection/index.js"
+    },
     "./storage/legacy-projection": {
       "types": "./dist/storage/legacy-projection.d.ts",
       "import": "./dist/storage/legacy-projection.js"
