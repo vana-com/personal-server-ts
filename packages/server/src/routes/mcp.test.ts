@@ -636,6 +636,30 @@ describe("MCP owner scope-request answers", () => {
       (await store.getById(connectionId))?.scopeAccessRequest,
     ).toBeDefined();
   });
+
+  it("never lets the asking MCP client answer its own request with its connection token", async () => {
+    const { connectionId, connectionToken } = await connectionWithRequest();
+    const base = `/v1/mcp/connections/${connectionId}`;
+    const asClient = { Authorization: `Bearer ${connectionToken}` };
+
+    const approve = await app.request(`${base}/scope-request/approve`, {
+      method: "POST",
+      headers: { ...asClient, "Content-Type": "application/json" },
+      body: JSON.stringify({ scopes: ["chatgpt.conversations"] }),
+    });
+    expect([401, 403]).toContain(approve.status);
+    const view = await app.request(base, { headers: asClient });
+    expect([401, 403]).toContain(view.status);
+
+    const record = await store.getById(connectionId);
+    expect(record?.scopeAccessRequest?.scopes).toEqual([
+      "chatgpt.conversations",
+      "spotify.profile",
+    ]);
+    expect(record?.grants).toEqual([
+      { grantId: "grant-1", scopes: ["instagram.profile"] },
+    ]);
+  });
 });
 
 describe("MCP /mcp/:token route", () => {
