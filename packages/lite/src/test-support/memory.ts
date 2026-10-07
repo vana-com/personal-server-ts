@@ -148,9 +148,12 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
     },
 
     findByDataPointId(dataPointId) {
-      return Array.from(entries.values()).find(
-        (entry) => entry.dataPointId === dataPointId,
-      );
+      let newest: IndexEntry | undefined;
+      for (const entry of entries.values()) {
+        if (entry.dataPointId !== dataPointId) continue;
+        if (!newest || entry.version >= newest.version) newest = entry;
+      }
+      return newest;
     },
 
     findUnsynced(options) {

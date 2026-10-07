@@ -84,7 +84,12 @@ export function createMemoryDataStorage(): MemoryDataStorage {
       return entries.find((entry) => entry.fileId === fileId);
     },
     findByDataPointId(dataPointId) {
-      return entries.find((entry) => entry.dataPointId === dataPointId);
+      let newest: IndexEntry | undefined;
+      for (const entry of entries) {
+        if (entry.dataPointId !== dataPointId) continue;
+        if (!newest || entry.version >= newest.version) newest = entry;
+      }
+      return newest;
     },
     findUnsynced(options) {
       const unsynced = entries.filter((entry) => entry.dataPointId === null);

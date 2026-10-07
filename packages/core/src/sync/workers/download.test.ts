@@ -14,6 +14,10 @@ import type { SyncCursor } from "../cursor.js";
 import type { Logger } from "../../logger/index.js";
 import type { DataStoragePort } from "../../ports/index.js";
 import { TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH } from "../tombstone.js";
+import { createMemoryDataStorage } from "../../test-utils/memory-storage.js";
+import { computeQuestion } from "../../derivatives/compute.js";
+import { createFakeInferenceProvider } from "../../derivatives/inference.js";
+import { createInMemoryQuestionStore } from "../../derivatives/store.js";
 
 vi.mock("@opendatalabs/vana-sdk/browser", async (importOriginal) => ({
   ...(await importOriginal()),
@@ -157,6 +161,100 @@ describe("download worker", () => {
 
       expect(result).toBeNull();
       expect(deps.storageAdapter.download).not.toHaveBeenCalled();
+    });
+
+    it("downloads a newer version of a data point indexed at an older one", async () => {
+      // DPv2 ids are per (owner, scope): every version of a scope shares
+      // one id, so the id alone must not dedup a new version away.
+      const deps = makeMockDeps();
+      (
+        deps.storage.findByDataPointId as ReturnType<typeof vi.fn>
+      ).mockReturnValue({
+        id: 1,
+        fileId: null,
+        schemaId: null,
+        path: `${SCOPE}/2026-01-20T10:00:00Z.json`,
+        scope: SCOPE,
+        collectedAt: "2026-01-20T10:00:00Z",
+        createdAt: "2026-01-20T10:00:00Z",
+        sizeBytes: 128,
+        version: 1,
+        dataPointId: DATA_POINT_ID,
+      } satisfies IndexEntry);
+
+      const result = await downloadOne(
+        deps,
+        makeDataPointRecord({ expectedVersion: "3" }),
+      );
+
+      expect(deps.storageAdapter.urlForKey).toHaveBeenCalledWith(`${SCOPE}/3`);
+      expect(deps.storage.insertEntry).toHaveBeenCalledWith(
+        expect.objectContaining({
+          collectedAt: COLLECTED_AT,
+          version: 3,
+          dataPointId: DATA_POINT_ID,
+        }),
+      );
+      expect(result).not.toBeNull();
+    });
+
+    it("still skips when the indexed version is newer than the listed one", async () => {
+      const deps = makeMockDeps();
+      (
+        deps.storage.findByDataPointId as ReturnType<typeof vi.fn>
+      ).mockReturnValue({
+        id: 1,
+        fileId: null,
+        schemaId: null,
+        path: RELATIVE_PATH,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        createdAt: "2026-01-21T10:00:00Z",
+        sizeBytes: 128,
+        version: 4,
+        dataPointId: DATA_POINT_ID,
+      } satisfies IndexEntry);
+
+      const result = await downloadOne(
+        deps,
+        makeDataPointRecord({ expectedVersion: "3" }),
+      );
+
+      expect(result).toBeNull();
+      expect(deps.storageAdapter.download).not.toHaveBeenCalled();
+    });
+
+    it("adopts the listed version on a local copy found by collectedAt", async () => {
+      // Without this the copy keeps its old version and the next cycle
+      // downloads the same blob again.
+      const deps = makeMockDeps();
+      (deps.storage as { updateEntryVersion?: unknown }).updateEntryVersion = vi
+        .fn()
+        .mockResolvedValue(true);
+      (deps.storage.findEntry as ReturnType<typeof vi.fn>).mockReturnValue({
+        id: 2,
+        fileId: null,
+        schemaId: null,
+        path: RELATIVE_PATH,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        createdAt: "2026-01-21T10:00:00Z",
+        sizeBytes: 128,
+        version: 1,
+        dataPointId: DATA_POINT_ID,
+      } satisfies IndexEntry);
+
+      const result = await downloadOne(
+        deps,
+        makeDataPointRecord({ expectedVersion: "2" }),
+      );
+
+      expect(result).toBeNull();
+      expect(deps.storage.updateEntryVersion).toHaveBeenCalledWith(
+        RELATIVE_PATH,
+        2,
+      );
+      expect(deps.storage.insertEntry).not.toHaveBeenCalled();
     });
 
     it("downloads, decrypts, writes, and indexes data point", async () => {
@@ -949,6 +1047,95 @@ describe("download worker", () => {
         expect.objectContaining({ scope: SCOPE, error: "disk error" }),
         "Failed to reconcile deleted data point locally",
       );
+    });
+  });
+
+  describe("replica catch-up feeds derivatives the latest version", () => {
+    // Regression: a replica that first downloaded version 1 of a scope
+    // skipped every later version (same per-scope data point id), so a
+    // question it computed answered from the oldest version.
+    const REPOS = "github.repositories";
+    const VERSIONS = [
+      { version: "1", collectedAt: "2026-10-06T18:02:27Z" },
+      { version: "2", collectedAt: "2026-10-06T18:04:01Z" },
+      { version: "3", collectedAt: "2026-10-06T18:09:43Z" },
+    ];
+
+    it("downloads versions 2 and 3 after version 1 and computes from version 3", async () => {
+      const storage = createMemoryDataStorage();
+      const deps = makeMockDeps();
+      deps.storage = storage;
+      const listed: DataPointRecord[] = [];
+      (
+        deps.gateway.listDataPointsByOwner as ReturnType<typeof vi.fn>
+      ).mockImplementation(async () => ({ dataPoints: listed, cursor: null }));
+
+      for (const { version, collectedAt } of VERSIONS) {
+        const envelope: DataFileEnvelope = {
+          version: "1.0",
+          scope: REPOS,
+          collectedAt,
+          data: { repositories: [{ name: `repo-v${version}` }] },
+        };
+        (decryptWithPassword as ReturnType<typeof vi.fn>).mockResolvedValue(
+          new TextEncoder().encode(JSON.stringify(envelope)),
+        );
+        // The feed lists the data point once, at its latest version.
+        listed.splice(
+          0,
+          listed.length,
+          makeDataPointRecord({ scope: REPOS, expectedVersion: version }),
+        );
+        await downloadAll(deps);
+      }
+
+      expect(
+        storage.entries
+          .filter((entry) => entry.scope === REPOS)
+          .map((entry) => [entry.version, entry.collectedAt]),
+      ).toEqual(VERSIONS.map((v) => [Number(v.version), v.collectedAt]));
+
+      const provider = createFakeInferenceProvider();
+      const outcome = await computeQuestion("q-langs", {
+        storage,
+        store: createInMemoryQuestionStore({
+          initial: [
+            {
+              questionId: "q-langs",
+              derivedScope: "hermesqa.languages",
+              sourceScopes: [REPOS],
+              question: "Which languages appear most across my repos?",
+              model: null,
+              answerShape: null,
+              recompute: "on-change",
+              registeredBy: { kind: "owner" },
+              status: "pending",
+              error: null,
+              errorCode: null,
+              createdAt: "2026-10-06T22:00:00.000Z",
+              updatedAt: "2026-10-06T22:00:00.000Z",
+              lastComputedAt: null,
+              derivedVersion: null,
+              derivedCollectedAt: null,
+            },
+          ],
+        }),
+        provider,
+        serverOwner: OWNER,
+        now: () => new Date("2026-10-07T00:22:47.000Z"),
+        retryDelaysMs: [0, 0],
+      });
+      expect(outcome.status).toBe("ready");
+
+      const derived = storage.findEntry({ scope: "hermesqa.languages" });
+      const answer = await storage.readEnvelope(
+        "hermesqa.languages",
+        derived!.collectedAt,
+      );
+      expect((answer.data as { sources: unknown }).sources).toEqual([
+        { scope: REPOS, version: 3, collectedAt: "2026-10-06T18:09:43Z" },
+      ]);
+      expect(JSON.stringify(provider.calls[0]!.messages)).toContain("repo-v3");
     });
   });
 });
