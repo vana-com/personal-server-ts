@@ -31,6 +31,7 @@ import {
   createMcpDataReadClient,
   hashConnectionToken,
   loadMcpGranteeAccount,
+  McpActivityRecorder,
   MCP_TOOLS,
   type McpConnectionStore,
   type McpToolContext,
@@ -345,6 +346,319 @@ describe("MCP owner connection routes", () => {
     );
     expect(res.status).toBe(400);
     expect((await res.json()).error.errorCode).toBe("GRANTS_REQUIRED");
+  });
+});
+
+describe("MCP owner scope-request answers", () => {
+  const APPROVAL_PAGE = "http://127.0.0.1:8081/mcp/scope-request";
+  const hookContexts: unknown[] = [];
+  let app: Hono;
+  let store: McpConnectionStore;
+  let gateway: GatewayClient;
+  let activityRecorder: McpActivityRecorder;
+
+  beforeEach(() => {
+    store = createInMemoryMcpConnectionStore();
+    activityRecorder = new McpActivityRecorder();
+    gateway = makeGatewayForGrantee({
+      granteeAddress: "0x0000000000000000000000000000000000000003",
+      grantId: "grant-1",
+      scopes: ["instagram.profile"],
+    }).gateway;
+    const deps = {
+      logger,
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway,
+      gatewayConfig,
+      serverSigner: {
+        signGrantRegistration: vi
+          .fn()
+          .mockResolvedValue("0xgrantsig" as `0x${string}`),
+        signRecordDataAccess: vi.fn(),
+      },
+      accessLogWriter: createMockAccessLogWriter(),
+      connectionStore: store,
+      activityRecorder,
+      indexManager: createIndexManager(initializeDatabase(":memory:")),
+      hierarchyOptions: { dataDir: "/tmp" },
+      scopeRequestApprovalUrl: (id, context) => {
+        hookContexts.push(context);
+        return `${APPROVAL_PAGE}?connection=${encodeURIComponent(id)}`;
+      },
+    };
+    const root = new Hono();
+    root.route("/mcp", mcpStreamableHttpRoutes(deps));
+    root.route("/v1/mcp/connections", mcpConnectionsRoutes(deps));
+    app = root;
+  });
+
+  async function ownerRequest(
+    method: "GET" | "POST",
+    path: string,
+    body?: unknown,
+  ) {
+    const rawBody = body === undefined ? undefined : JSON.stringify(body);
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method,
+      uri: path,
+      ...(rawBody ? { body: new TextEncoder().encode(rawBody) } : {}),
+    });
+    return app.request(path, {
+      method,
+      headers: {
+        Authorization: auth,
+        ...(rawBody ? { "Content-Type": "application/json" } : {}),
+      },
+      ...(rawBody ? { body: rawBody } : {}),
+    });
+  }
+
+  async function callTool(token: string, name: string, args: unknown) {
+    const res = await app.request(`/mcp/${encodeURIComponent(token)}`, {
+      method: "POST",
+      headers: {
+        Accept: "application/json, text/event-stream",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: name,
+        method: "tools/call",
+        params: { name, arguments: args },
+      }),
+    });
+    expect(res.status).toBe(200);
+    return JSON.parse((await res.json()).result.content[0].text);
+  }
+
+  async function connectionWithRequest() {
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store, publicOrigin: SERVER_ORIGIN },
+    );
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "grant-1", scopes: ["instagram.profile"] }],
+      },
+      { store },
+    );
+    const requested = await callTool(
+      created.connectionToken,
+      "request_scope_access",
+      {
+        scopes: ["chatgpt.conversations", "spotify.profile"],
+        reason: "Answer from chats and music.",
+      },
+    );
+    return { ...created, requested };
+  }
+
+  it("gives the agent the host approval link, then grants the union on approve", async () => {
+    const { connectionId, connectionToken, requested } =
+      await connectionWithRequest();
+    expect(requested.approvalUrl).toBe(
+      `${APPROVAL_PAGE}?connection=${connectionId}`,
+    );
+    // The hook learns the public origin so the link can name this server.
+    expect(hookContexts.at(-1)).toEqual({ serverOrigin: SERVER_ORIGIN });
+
+    const list = await ownerRequest("GET", "/v1/mcp/connections");
+    const [view] = (await list.json()).connections;
+    expect(view.grantedScopes).toEqual(["instagram.profile"]);
+    expect(view.scopeAccessRequest.scopes).toEqual([
+      "chatgpt.conversations",
+      "spotify.profile",
+    ]);
+
+    const res = await ownerRequest(
+      "POST",
+      `/v1/mcp/connections/${connectionId}/scope-request/approve`,
+      { scopes: ["spotify.profile"] },
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toMatchObject({
+      grantId: "grant-1",
+      grantedScopes: ["instagram.profile", "spotify.profile"],
+      approvedScopes: ["spotify.profile"],
+      deniedScopes: ["chatgpt.conversations"],
+      connection: {
+        grantedScopes: ["instagram.profile", "spotify.profile"],
+        scopeAccessDecision: { decision: "approved" },
+      },
+    });
+    expect(body.connection.scopeAccessRequest).toBeUndefined();
+    expect(gateway.createGrant).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scopes: ["instagram.profile", "spotify.profile"],
+        grantVersion: "2",
+      }),
+    );
+    expect(activityRecorder.snapshot().events[0]).toMatchObject({
+      tool: "owner.scope_request.approve",
+      status: "succeeded",
+      scopes: ["spotify.profile"],
+    });
+
+    const listed = await callTool(connectionToken, "list_granted_scopes", {});
+    expect(
+      listed.scopes.map((entry: { scope: string }) => entry.scope),
+    ).toEqual(["instagram.profile", "spotify.profile"]);
+    expect(listed.lastScopeDecision).toMatchObject({ decision: "approved" });
+  });
+
+  it("GET /:id returns one connection with its pending request", async () => {
+    const { connectionId } = await connectionWithRequest();
+    const res = await ownerRequest(
+      "GET",
+      `/v1/mcp/connections/${connectionId}`,
+    );
+    expect(res.status).toBe(200);
+    const view = await res.json();
+    expect(view).toMatchObject({
+      id: connectionId,
+      status: "approved",
+      grantedScopes: ["instagram.profile"],
+      scopeAccessRequest: {
+        scopes: ["chatgpt.conversations", "spotify.profile"],
+        reason: "Answer from chats and music.",
+      },
+    });
+    expect(view).not.toHaveProperty("encryptedGranteePrivateKey");
+    expect(view).not.toHaveProperty("tokenHash");
+
+    const missing = await ownerRequest("GET", "/v1/mcp/connections/nope");
+    expect(missing.status).toBe(404);
+    expect((await missing.json()).error.errorCode).toBe(
+      "MCP_CONNECTION_NOT_FOUND",
+    );
+
+    const anonymous = await app.request(`/v1/mcp/connections/${connectionId}`);
+    expect(anonymous.status).toBe(401);
+  });
+
+  it("deny clears the request and the agent can see the denial", async () => {
+    const { connectionId, connectionToken } = await connectionWithRequest();
+
+    const res = await ownerRequest(
+      "POST",
+      `/v1/mcp/connections/${connectionId}/scope-request/deny`,
+    );
+    expect(res.status).toBe(200);
+    const { connection } = await res.json();
+    expect(connection.scopeAccessRequest).toBeUndefined();
+    expect(connection.grantedScopes).toEqual(["instagram.profile"]);
+    expect(connection.scopeAccessDecision).toMatchObject({
+      decision: "denied",
+      deniedScopes: ["chatgpt.conversations", "spotify.profile"],
+    });
+    expect(gateway.createGrant).not.toHaveBeenCalled();
+    expect(activityRecorder.snapshot().events[0]).toMatchObject({
+      tool: "owner.scope_request.deny",
+      status: "succeeded",
+    });
+
+    const listed = await callTool(connectionToken, "list_granted_scopes", {});
+    expect(listed.lastScopeDecision).toMatchObject({ decision: "denied" });
+    expect(listed.pendingScopeRequest).toBeUndefined();
+  });
+
+  it("returns 409 NO_PENDING_REQUEST once answered", async () => {
+    const { connectionId } = await connectionWithRequest();
+    await ownerRequest(
+      "POST",
+      `/v1/mcp/connections/${connectionId}/scope-request/deny`,
+    );
+
+    for (const [path, body] of [
+      ["deny", undefined],
+      ["approve", { scopes: ["spotify.profile"] }],
+    ] as const) {
+      const res = await ownerRequest(
+        "POST",
+        `/v1/mcp/connections/${connectionId}/scope-request/${path}`,
+        body,
+      );
+      expect(res.status).toBe(409);
+      expect((await res.json()).error.errorCode).toBe("NO_PENDING_REQUEST");
+    }
+  });
+
+  it("returns 400 for scopes outside the request", async () => {
+    const { connectionId } = await connectionWithRequest();
+    const res = await ownerRequest(
+      "POST",
+      `/v1/mcp/connections/${connectionId}/scope-request/approve`,
+      { scopes: ["github.profile"] },
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error.errorCode).toBe("SCOPE_NOT_REQUESTED");
+    expect(gateway.createGrant).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 for an unknown connection and 401 without owner auth", async () => {
+    const missing = await ownerRequest(
+      "POST",
+      "/v1/mcp/connections/not-a-connection/scope-request/approve",
+      { scopes: ["spotify.profile"] },
+    );
+    expect(missing.status).toBe(404);
+    expect((await missing.json()).error.errorCode).toBe(
+      "MCP_CONNECTION_NOT_FOUND",
+    );
+
+    const { connectionId } = await connectionWithRequest();
+    const anonymous = await app.request(
+      `/v1/mcp/connections/${connectionId}/scope-request/deny`,
+      { method: "POST" },
+    );
+    expect(anonymous.status).toBe(401);
+
+    // Another wallet is not this server's owner, so it cannot answer.
+    const path = `/v1/mcp/connections/${connectionId}/scope-request/deny`;
+    const foreign = await app.request(path, {
+      method: "POST",
+      headers: {
+        Authorization: await buildWeb3SignedHeader({
+          wallet: createTestWallet(10),
+          aud: SERVER_ORIGIN,
+          method: "POST",
+          uri: path,
+        }),
+      },
+    });
+    expect([401, 403]).toContain(foreign.status);
+    expect(
+      (await store.getById(connectionId))?.scopeAccessRequest,
+    ).toBeDefined();
+  });
+
+  it("never lets the asking MCP client answer its own request with its connection token", async () => {
+    const { connectionId, connectionToken } = await connectionWithRequest();
+    const base = `/v1/mcp/connections/${connectionId}`;
+    const asClient = { Authorization: `Bearer ${connectionToken}` };
+
+    const approve = await app.request(`${base}/scope-request/approve`, {
+      method: "POST",
+      headers: { ...asClient, "Content-Type": "application/json" },
+      body: JSON.stringify({ scopes: ["chatgpt.conversations"] }),
+    });
+    expect([401, 403]).toContain(approve.status);
+    const view = await app.request(base, { headers: asClient });
+    expect([401, 403]).toContain(view.status);
+
+    const record = await store.getById(connectionId);
+    expect(record?.scopeAccessRequest?.scopes).toEqual([
+      "chatgpt.conversations",
+      "spotify.profile",
+    ]);
+    expect(record?.grants).toEqual([
+      { grantId: "grant-1", scopes: ["instagram.profile"] },
+    ]);
   });
 });
 

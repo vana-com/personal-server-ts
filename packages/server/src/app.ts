@@ -40,6 +40,7 @@ import {
   createInMemoryMcpOAuthAuthorizationStore,
   type McpConnectionStore,
   type McpOAuthAuthorizationStore,
+  type McpScopeRequestApprovalUrlHook,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import { uiConfigRoutes } from "./routes/ui-config.js";
 import { uiRegistrationRoutes } from "./routes/ui-registration.js";
@@ -148,6 +149,8 @@ export interface AppDeps {
   mcpConnectionStore?: McpConnectionStore;
   mcpOAuthAuthorizationStore?: McpOAuthAuthorizationStore;
   mcpOAuthApprovalUrl?: string | (() => string);
+  /** See `CreateServerOptions.mcpScopeRequestApprovalUrl`. */
+  mcpScopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
   mcpActivityRecorder?: McpActivityRecorder;
   mcpHydrateScopes?: (scopes: string[]) => Promise<void>;
   /**
@@ -387,6 +390,7 @@ export function createApp(deps: AppDeps): Hono {
     connectionStore: mcpConnectionStore,
     oauthAuthorizationStore: mcpOAuthAuthorizationStore,
     oauthApprovalUrl: deps.mcpOAuthApprovalUrl,
+    scopeRequestApprovalUrl: deps.mcpScopeRequestApprovalUrl,
     activityRecorder: mcpActivityRecorder,
   };
 

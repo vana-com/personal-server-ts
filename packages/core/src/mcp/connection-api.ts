@@ -7,6 +7,11 @@
  *   POST   /v1/mcp/connections/:id/approve
  *   DELETE /v1/mcp/connections/:id
  *
+ * plus the server-signed answer to an MCP client's `request_scope_access`:
+ *
+ *   POST   /v1/mcp/connections/:id/scope-request/approve
+ *   POST   /v1/mcp/connections/:id/scope-request/deny
+ *
  * These endpoints DO NOT read user data. They only manage connection records
  * — create the per-connection grantee/token, store grant ids after the user
  * approves them, and mark connections revoked.
@@ -14,9 +19,10 @@
 
 import { generateMcpGrantee } from "./grantee.js";
 import { createGrantContract } from "../contracts/index.js";
-import type {
-  DataPortabilityGatewayConfig,
-  GatewayClient,
+import {
+  ScopeSchema,
+  type DataPortabilityGatewayConfig,
+  type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../signing/index.js";
 import {
@@ -28,6 +34,7 @@ import type {
   McpConnectionRecord,
   McpConnectionStore,
   McpConnectionGrant,
+  McpScopeAccessDecision,
   McpScopeAccessRequest,
   McpOAuthAuthorizationRecord,
   McpOAuthAuthorizationStore,
@@ -185,6 +192,14 @@ export interface ApproveMcpConnectionOptions {
   now?: () => Date;
 }
 
+/**
+ * errorCode for an unknown connection id on the single-connection and
+ * scope-request routes. Distinct from the generic `NOT_FOUND` a server
+ * answers for a route it does not have, so a caller (Vana Web) can tell
+ * "this request is gone" from "this server predates the route".
+ */
+export const MCP_CONNECTION_NOT_FOUND = "MCP_CONNECTION_NOT_FOUND";
+
 export class McpConnectionNotFoundError extends Error {
   constructor(public connectionId: string) {
     super(`mcp connection ${connectionId} not found`);
@@ -303,6 +318,298 @@ export async function requestMcpScopeAccess(
   };
 }
 
+/** A scope-request answer the owner cannot give in the connection's state. */
+export class McpScopeRequestError extends Error {
+  constructor(
+    public code: string,
+    message: string,
+    public status: 400 | 409 | 500 | 502 = 400,
+    public body?: unknown,
+  ) {
+    super(message);
+    this.name = "McpScopeRequestError";
+  }
+}
+
+export interface ApproveMcpScopeAccessRequestInput {
+  connectionId: string;
+  /** Scopes the owner approves; must be a subset of the pending request. */
+  scopes: unknown;
+}
+
+export interface ApproveMcpScopeAccessRequestOptions {
+  store: McpConnectionStore;
+  gateway: Pick<GatewayClient, "getBuilder" | "getGrant" | "createGrant">;
+  serverOwner?: `0x${string}`;
+  serverSigner?: Pick<ServerSigner, "signGrantRegistration">;
+  now?: () => Date;
+}
+
+export interface ApproveMcpScopeAccessRequestOutput {
+  connection: McpConnectionRecord;
+  grantId: string;
+  /** Every scope the connection's grant now covers. */
+  grantedScopes: string[];
+  approvedScopes: string[];
+  deniedScopes: string[];
+}
+
+/**
+ * Owner approves (part of) a pending `request_scope_access` without an
+ * external signer: the server signs the grant itself, as the OAuth approve
+ * path does.
+ *
+ * The gateway keeps ONE grant per (owner, grantee) and a new registration
+ * replaces its scopes, so the grant is re-signed over the union of every
+ * scope the connection already holds plus the approved ones. Signing only
+ * the new scopes would silently revoke the old ones.
+ */
+export async function approveMcpScopeAccessRequest(
+  input: ApproveMcpScopeAccessRequestInput,
+  options: ApproveMcpScopeAccessRequestOptions,
+): Promise<ApproveMcpScopeAccessRequestOutput> {
+  const connection = await options.store.getById(input.connectionId);
+  if (!connection) throw new McpConnectionNotFoundError(input.connectionId);
+  const pending = requirePendingScopeRequest(connection);
+  const approvedScopes = parseApprovedScopes(input.scopes, pending);
+
+  const live = await readLiveGrantState(connection, options.gateway);
+  const grantedScopes = sortedUnique([...live.scopes, ...approvedScopes]);
+
+  let grantResult: Awaited<ReturnType<typeof createGrantContract>>;
+  try {
+    grantResult = await createGrantContract({
+      gateway: options.gateway,
+      serverOwner: options.serverOwner,
+      serverSigner: options.serverSigner,
+      body: {
+        granteeAddress: connection.granteeAddress,
+        scopes: grantedScopes,
+        grantVersion: live.nextGrantVersion,
+        ...(live.expiresAt !== undefined ? { expiresAt: live.expiresAt } : {}),
+      },
+    });
+  } catch (err) {
+    throw new McpScopeRequestError(
+      "GRANT_CREATION_FAILED",
+      err instanceof Error ? err.message : String(err),
+      502,
+    );
+  }
+  if (!grantResult.ok) {
+    throw new McpScopeRequestError(
+      "GRANT_CREATION_FAILED",
+      extractGrantErrorMessage(grantResult.body),
+      grantResult.status >= 500 ? 502 : grantResult.status === 409 ? 409 : 400,
+      grantResult.body,
+    );
+  }
+  const grantId = (grantResult.body as { grantId?: string }).grantId;
+  if (!grantId) {
+    throw new McpScopeRequestError(
+      "GRANT_CREATION_FAILED",
+      "Gateway did not return a grant id.",
+      502,
+      grantResult.body,
+    );
+  }
+
+  const decidedAt = nowIso(options.now);
+  const deniedScopes = pending.scopes.filter(
+    (scope) => !approvedScopes.includes(scope),
+  );
+  const updated = await options.store.mutate(input.connectionId, (latest) => {
+    // The grant above was signed from the state read before the gateway
+    // round trip; refuse to store it over a change made in between.
+    requirePendingScopeRequest(latest);
+    if (JSON.stringify(latest.grants) !== JSON.stringify(connection.grants)) {
+      throw new McpScopeRequestError(
+        "CONCURRENT_UPDATE",
+        "The connection's grants changed during approval; retry.",
+        409,
+      );
+    }
+    const decision: McpScopeAccessDecision = {
+      decision: "approved",
+      approvedScopes,
+      deniedScopes,
+      requestedAt: pending.requestedAt,
+      decidedAt,
+    };
+    return {
+      ...latest,
+      grants: [{ grantId, scopes: grantedScopes }],
+      scopeAccessRequest: undefined,
+      scopeAccessDecision: decision,
+    };
+  });
+  if (!updated) throw new McpConnectionNotFoundError(input.connectionId);
+  return {
+    connection: updated,
+    grantId,
+    grantedScopes,
+    approvedScopes,
+    deniedScopes,
+  };
+}
+
+/** Owner declines the pending request; the decision stays for the client. */
+export async function denyMcpScopeAccessRequest(
+  input: { connectionId: string },
+  options: { store: McpConnectionStore; now?: () => Date },
+): Promise<McpConnectionRecord> {
+  const decidedAt = nowIso(options.now);
+  const updated = await options.store.mutate(input.connectionId, (latest) => {
+    const pending = requirePendingScopeRequest(latest);
+    const decision: McpScopeAccessDecision = {
+      decision: "denied",
+      approvedScopes: [],
+      deniedScopes: pending.scopes,
+      requestedAt: pending.requestedAt,
+      decidedAt,
+    };
+    return {
+      ...latest,
+      scopeAccessRequest: undefined,
+      scopeAccessDecision: decision,
+    };
+  });
+  if (!updated) throw new McpConnectionNotFoundError(input.connectionId);
+  return updated;
+}
+
+function requirePendingScopeRequest(
+  connection: McpConnectionRecord,
+): McpScopeAccessRequest {
+  if (connection.status !== "approved") {
+    throw new McpConnectionStateError(
+      connection.id,
+      connection.status,
+      "approved",
+    );
+  }
+  const pending = connection.scopeAccessRequest;
+  if (!pending || pending.scopes.length === 0) {
+    throw new McpScopeRequestError(
+      "NO_PENDING_REQUEST",
+      `mcp connection ${connection.id} has no pending scope request`,
+      409,
+    );
+  }
+  return pending;
+}
+
+function parseApprovedScopes(
+  value: unknown,
+  pending: McpScopeAccessRequest,
+): string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new McpScopeRequestError(
+      "SCOPES_REQUIRED",
+      "Approve requires a non-empty scopes array; use deny to decline all.",
+    );
+  }
+  const scopes: string[] = [];
+  for (const raw of value) {
+    const scope = typeof raw === "string" ? raw.trim() : "";
+    if (!ScopeSchema.safeParse(scope).success) {
+      throw new McpScopeRequestError(
+        "INVALID_SCOPE",
+        `Invalid scope: ${JSON.stringify(raw)}`,
+      );
+    }
+    if (!pending.scopes.includes(scope)) {
+      throw new McpScopeRequestError(
+        "SCOPE_NOT_REQUESTED",
+        `Scope ${scope} is not part of the pending request`,
+      );
+    }
+    if (!scopes.includes(scope)) scopes.push(scope);
+  }
+  return scopes.sort();
+}
+
+interface LiveGrantState {
+  /** Scopes the connection holds now: its record plus the live gateway grant. */
+  scopes: string[];
+  nextGrantVersion: string;
+  /** Unix seconds of the live grant's expiry, carried over so approval never extends it. */
+  expiresAt?: number;
+}
+
+/**
+ * Read what the gateway holds for this connection's grantee: the scopes the
+ * replacement grant must keep, the version counter it must advance past, and
+ * the expiry it must not outlive. A revoked grant contributes its version but
+ * no scopes, so approval never resurrects access the owner already pulled.
+ */
+async function readLiveGrantState(
+  connection: McpConnectionRecord,
+  gateway: Pick<GatewayClient, "getGrant">,
+): Promise<LiveGrantState> {
+  const grantIds = sortedUnique(
+    connection.grants.map((grant) => grant.grantId),
+  );
+  const revoked = new Set<string>();
+  const scopes = new Set<string>();
+  let maxVersion = 0n;
+  let expiresAt: number | undefined;
+  for (const grantId of grantIds) {
+    let live: Awaited<ReturnType<typeof gateway.getGrant>>;
+    try {
+      live = await gateway.getGrant(grantId);
+    } catch (err) {
+      throw new McpScopeRequestError(
+        "GATEWAY_UNAVAILABLE",
+        `Could not read grant ${grantId}: ${err instanceof Error ? err.message : String(err)}`,
+        502,
+      );
+    }
+    if (!live) continue;
+    const version = parseUint(live.grantVersion);
+    if (version !== null && version > maxVersion) maxVersion = version;
+    if (live.revokedAt) {
+      revoked.add(grantId);
+      continue;
+    }
+    for (const scope of live.scopes) scopes.add(scope);
+    const liveExpiry = parseExpirySeconds(live.expiresAt);
+    if (liveExpiry !== undefined) {
+      expiresAt =
+        expiresAt === undefined ? liveExpiry : Math.max(expiresAt, liveExpiry);
+    }
+  }
+  for (const grant of connection.grants) {
+    if (revoked.has(grant.grantId)) continue;
+    for (const scope of grant.scopes) scopes.add(scope);
+  }
+  return {
+    scopes: sortedUnique(scopes),
+    nextGrantVersion: (maxVersion + 1n).toString(),
+    ...(expiresAt !== undefined ? { expiresAt } : {}),
+  };
+}
+
+function parseUint(value: unknown): bigint | null {
+  if (typeof value !== "string" || !/^\d+$/u.test(value)) return null;
+  return BigInt(value);
+}
+
+/** Gateway expiry may be unix seconds or an ISO date; 0/null means perpetual. */
+function parseExpirySeconds(value: string | null): number | undefined {
+  if (!value) return undefined;
+  if (/^\d+$/u.test(value)) {
+    const seconds = Number(value);
+    return seconds > 0 ? seconds : undefined;
+  }
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : undefined;
+}
+
+function sortedUnique(values: Iterable<string>): string[] {
+  return Array.from(new Set(values)).sort();
+}
+
 export interface RevokeMcpConnectionOptions {
   store: McpConnectionStore;
   now?: () => Date;
@@ -337,7 +644,12 @@ export interface McpConnectionView {
   granteeAddress: `0x${string}`;
   status: "pending" | "approved" | "revoked";
   grants: McpConnectionGrant[];
+  /** Every scope the connection's grants cover, deduplicated and sorted. */
+  grantedScopes: string[];
+  /** Scopes the MCP client is still asking for, if any. */
   scopeAccessRequest?: McpScopeAccessRequest;
+  /** Owner's answer to the most recent scope request. */
+  scopeAccessDecision?: McpScopeAccessDecision;
   createdAt: string;
   approvedAt?: string;
   revokedAt?: string;
@@ -353,12 +665,24 @@ export function toMcpConnectionView(
     granteeAddress: record.granteeAddress,
     status: record.status,
     grants: record.grants,
+    grantedScopes: sortedUnique(record.grants.flatMap((grant) => grant.scopes)),
     scopeAccessRequest: record.scopeAccessRequest,
+    scopeAccessDecision: record.scopeAccessDecision,
     createdAt: record.createdAt,
     approvedAt: record.approvedAt,
     revokedAt: record.revokedAt,
     lastUsedAt: record.lastUsedAt,
   };
+}
+
+/** One connection as the owner sees it; throws when the id is unknown. */
+export async function getMcpConnectionView(
+  connectionId: string,
+  store: McpConnectionStore,
+): Promise<McpConnectionView> {
+  const record = await store.getById(connectionId);
+  if (!record) throw new McpConnectionNotFoundError(connectionId);
+  return toMcpConnectionView(record);
 }
 
 export async function listMcpConnectionViews(

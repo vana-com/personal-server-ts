@@ -37,6 +37,20 @@ export interface McpScopeAccessRequest {
 }
 
 /**
+ * The owner's answer to the last `scopeAccessRequest`, kept so the MCP client
+ * can be told what happened after the pending request is cleared.
+ */
+export interface McpScopeAccessDecision {
+  decision: "approved" | "denied";
+  /** Requested scopes the owner approved. Empty on a denial. */
+  approvedScopes: string[];
+  /** Requested scopes the owner left out or declined. */
+  deniedScopes: string[];
+  requestedAt: string;
+  decidedAt: string;
+}
+
+/**
  * Encrypted-at-rest grantee private key.
  *
  * For Web PS Lite this is wrapped with the same owner-derived master key
@@ -87,6 +101,8 @@ export interface McpConnectionRecord {
   grants: McpConnectionGrant[];
   /** Missing scopes the MCP client asked the owner to approve. */
   scopeAccessRequest?: McpScopeAccessRequest;
+  /** Owner's answer to the most recent scope access request. */
+  scopeAccessDecision?: McpScopeAccessDecision;
   createdAt: string;
   approvedAt?: string;
   revokedAt?: string;
@@ -136,6 +152,7 @@ export interface McpConnectionStore {
         | "previousRefreshTokenHash"
         | "refreshExpiresAt"
         | "scopeAccessRequest"
+        | "scopeAccessDecision"
       >
     >,
   ): Promise<McpConnectionRecord | null>;

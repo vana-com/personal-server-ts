@@ -73,19 +73,24 @@ import {
   approveMcpOAuthAuthorization,
   approveMcpOAuthAuthorizationWithScopes,
   approveMcpConnection,
+  approveMcpScopeAccessRequest,
   buildMcpProtectedResourceMetadataUrl,
   buildStableMcpUrl,
   createInMemoryMcpOAuthAuthorizationStore,
   createMcpConnection,
   createMcpOAuthAuthorization,
   createMcpDataReadClient,
+  denyMcpScopeAccessRequest,
   handleMcpStreamableHttpRequest,
   hashConnectionToken,
   listMcpConnectionViews,
   loadMcpGranteeAccount,
+  MCP_CONNECTION_NOT_FOUND,
+  getMcpConnectionView,
   McpConnectionNotFoundError,
   McpConnectionStateError,
   McpOAuthAuthorizationError,
+  McpScopeRequestError,
   redeemMcpOAuthAuthorizationCode,
   refreshMcpOAuthToken,
   requestMcpScopeAccess,
@@ -96,6 +101,7 @@ import {
   type McpConnectionGrant,
   type McpConnectionStore,
   type McpOAuthAuthorizationStore,
+  type McpScopeRequestApprovalUrlHook,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import type { PsLiteStorageCapabilities } from "./storage.js";
 import {
@@ -205,6 +211,13 @@ export interface PsLiteRuntimeOptions {
   mcpOAuthAuthorizationStore?: McpOAuthAuthorizationStore;
   mcpOAuthApprovalUrl?: string | (() => string);
   /**
+   * Page where the owner answers an MCP client's `request_scope_access`.
+   * Called with the connection id and this runtime's public origin; a
+   * returned URL is handed to the agent to show the user. Omit to keep
+   * pointing the owner at Vana.
+   */
+  mcpScopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  /**
    * Optional diagnostics recorder. When provided, GET /v1/diagnostics (owner-only)
    * returns a structured snapshot useful for debugging stuck approval pages.
    */
@@ -301,7 +314,7 @@ export interface Web3SignedPsLiteAuthOptions {
 }
 
 type JsonStatus =
-  200 | 201 | 400 | 401 | 403 | 404 | 405 | 409 | 500 | 501 | 503;
+  200 | 201 | 400 | 401 | 403 | 404 | 405 | 409 | 500 | 501 | 502 | 503;
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -1288,6 +1301,7 @@ export function createPsLiteRuntime(
             store: options.mcpConnectionStore,
             authorizationStore: mcpOAuthAuthorizationStore,
             approvalUrl: options.mcpOAuthApprovalUrl,
+            scopeRequestApprovalUrl: options.mcpScopeRequestApprovalUrl,
             auth,
             dataStorage,
             accessLogWriter,
@@ -1328,6 +1342,7 @@ async function handleMcpRoute(input: {
   store: McpConnectionStore;
   authorizationStore: McpOAuthAuthorizationStore;
   approvalUrl?: string | (() => string);
+  scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
   auth: PsLiteAuthAdapter;
   dataStorage: DataStoragePort;
   accessLogWriter: AccessLogWriter;
@@ -1670,11 +1685,24 @@ async function handleMcpRoute(input: {
       }
       return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
     }
-    // /v1/mcp/connections/:id[/approve]
+    // /v1/mcp/connections/:id[/approve | /scope-request/(approve|deny)]
+    // GET /:id reads one connection; DELETE /:id revokes it.
     const tail = pathname.slice(ownerPrefix.length + 1);
-    const [id, action] = tail.split("/");
+    const [id, action, subAction, ...rest] = tail.split("/");
     if (!id) {
       return errorResponse(404, "NOT_FOUND", "Not found");
+    }
+    if (action === "scope-request") {
+      if (
+        rest.length > 0 ||
+        (subAction !== "approve" && subAction !== "deny")
+      ) {
+        return errorResponse(404, "NOT_FOUND", "Not found");
+      }
+      if (input.request.method !== "POST") {
+        return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+      }
+      return handleScopeRequestAnswer(id, subAction);
     }
     if (action === "approve") {
       if (input.request.method !== "POST") {
@@ -1712,6 +1740,16 @@ async function handleMcpRoute(input: {
       }
     }
     if (!action) {
+      if (input.request.method === "GET") {
+        try {
+          return jsonResponse(await getMcpConnectionView(id, input.store));
+        } catch (err) {
+          if (err instanceof McpConnectionNotFoundError) {
+            return errorResponse(404, MCP_CONNECTION_NOT_FOUND, err.message);
+          }
+          throw err;
+        }
+      }
       if (input.request.method === "DELETE") {
         try {
           const updated = await revokeMcpConnection(id, {
@@ -1729,6 +1767,89 @@ async function handleMcpRoute(input: {
       return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
     }
     return errorResponse(404, "NOT_FOUND", "Not found");
+  }
+
+  async function handleScopeRequestAnswer(
+    id: string,
+    answer: "approve" | "deny",
+  ): Promise<Response> {
+    let scopes: unknown;
+    if (answer === "approve") {
+      try {
+        scopes = ((await input.request.json()) as { scopes?: unknown }).scopes;
+      } catch {
+        return errorResponse(400, "INVALID_BODY", "Body must be JSON");
+      }
+    }
+    const gateway = input.gateway;
+    if (answer === "approve" && !gateway) {
+      return errorResponse(
+        500,
+        "SERVER_NOT_CONFIGURED",
+        "Gateway is not configured",
+      );
+    }
+    const activityId = input.activityRecorder?.start({
+      tool: `owner.scope_request.${answer}`,
+      ...(Array.isArray(scopes)
+        ? {
+            scopes: scopes.filter(
+              (scope): scope is string => typeof scope === "string",
+            ),
+          }
+        : {}),
+    });
+    const finish = (status: "succeeded" | "failed", errorCode?: string) => {
+      if (activityId) {
+        input.activityRecorder?.finish(activityId, {
+          status,
+          ...(errorCode ? { errorCode } : {}),
+        });
+      }
+    };
+    try {
+      if (answer === "deny" || !gateway) {
+        const denied = await denyMcpScopeAccessRequest(
+          { connectionId: id },
+          { store: input.store, now: input.now },
+        );
+        finish("succeeded");
+        return jsonResponse({ connection: toMcpConnectionView(denied) });
+      }
+      const approved = await approveMcpScopeAccessRequest(
+        { connectionId: id, scopes },
+        {
+          store: input.store,
+          gateway,
+          serverOwner: input.serverOwner,
+          serverSigner: input.serverSigner,
+          now: input.now,
+        },
+      );
+      finish("succeeded");
+      return jsonResponse({
+        connection: toMcpConnectionView(approved.connection),
+        grantId: approved.grantId,
+        grantedScopes: approved.grantedScopes,
+        approvedScopes: approved.approvedScopes,
+        deniedScopes: approved.deniedScopes,
+      });
+    } catch (err) {
+      if (err instanceof McpConnectionNotFoundError) {
+        finish("failed", MCP_CONNECTION_NOT_FOUND);
+        return errorResponse(404, MCP_CONNECTION_NOT_FOUND, err.message);
+      }
+      if (err instanceof McpConnectionStateError) {
+        finish("failed", "INVALID_STATE");
+        return errorResponse(409, "INVALID_STATE", err.message);
+      }
+      if (err instanceof McpScopeRequestError) {
+        finish("failed", err.code);
+        return errorResponse(err.status, err.code, err.message);
+      }
+      finish("failed", "INTERNAL");
+      throw err;
+    }
   }
 
   async function handleMcpToken(
@@ -1788,6 +1909,8 @@ async function handleMcpRoute(input: {
           { store: input.store, now: input.now },
         );
       },
+      scopeRequestApprovalUrl: input.scopeRequestApprovalUrl,
+      serverOrigin: input.serverOrigin,
     });
     void input.store
       .update(record.id, {

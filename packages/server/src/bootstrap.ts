@@ -16,6 +16,7 @@ import {
   type IndexManager,
 } from "./storage/index-manager.js";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
+import type { McpScopeRequestApprovalUrlHook } from "@opendatalabs/personal-server-ts-core/mcp";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import {
   createGatewayClient,
@@ -129,6 +130,16 @@ export interface CreateServerOptions {
    * approval surface (e.g. the desktop app) pass it here.
    */
   mcpOAuthApprovalUrl?: string | (() => string);
+  /**
+   * Page where the owner answers an MCP client's `request_scope_access`
+   * (approve/deny via `POST /v1/mcp/connections/:id/scope-request/{approve,deny}`).
+   * Called with the connection id and the server's current public origin; a
+   * returned URL is handed to the agent to show the user. Omit (or return
+   * undefined) to keep telling the agent the request waits for approval in
+   * Vana. `vanaWebMcpScopeRequestApprovalUrl()` from the core mcp entry
+   * builds the Vana Web link (`/mcp/requests/<id>?ps_origin=<origin>`).
+   */
+  mcpScopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
   profile?: "standard" | "enclave";
   serverAccount?: ServerAccount;
 }
@@ -657,6 +668,7 @@ export async function createServer(
     serverSigner,
     getTunnelStatus: () => tunnelManager?.getStatus() ?? null,
     mcpOAuthApprovalUrl: options?.mcpOAuthApprovalUrl,
+    mcpScopeRequestApprovalUrl: options?.mcpScopeRequestApprovalUrl,
     mcpConnectionStore: mcpState?.connections,
     mcpOAuthAuthorizationStore: mcpState?.authorizations,
     onServerRegistered: (serverId) => notifyServerRegistered(serverId),

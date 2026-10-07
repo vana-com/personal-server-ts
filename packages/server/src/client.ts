@@ -57,6 +57,7 @@ export interface StartPersonalServerNodeOptions
       | "ownerSignature"
       | "readFulfillmentReporter"
       | "mcpOAuthApprovalUrl"
+      | "mcpScopeRequestApprovalUrl"
     >,
     LoadConfigOptions {
   config?: ServerConfig;
@@ -95,6 +96,7 @@ export async function startPersonalServer(
     gatewayClient: options.gatewayClient,
     readFulfillmentReporter: options.readFulfillmentReporter,
     mcpOAuthApprovalUrl: options.mcpOAuthApprovalUrl,
+    mcpScopeRequestApprovalUrl: options.mcpScopeRequestApprovalUrl,
   });
   const mainServer = await listenHttpServer({
     fetch: context.app.fetch,
