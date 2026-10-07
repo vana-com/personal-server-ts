@@ -136,7 +136,7 @@ export function createIndexManager(db: Database.Database): IndexManager {
   );
 
   const findByDataPointIdStmt = db.prepare<{ data_point_id: string }>(
-    "SELECT * FROM data_files WHERE data_point_id = @data_point_id",
+    "SELECT * FROM data_files WHERE data_point_id = @data_point_id ORDER BY version DESC, id DESC LIMIT 1",
   );
 
   const findUnsyncedStmt = db.prepare(

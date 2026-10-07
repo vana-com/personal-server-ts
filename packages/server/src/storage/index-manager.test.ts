@@ -552,6 +552,30 @@ describe("IndexManager", () => {
     expect(manager.findUnsynced()).toHaveLength(0);
   });
 
+  it("findByDataPointId answers the newest version of the data point", () => {
+    // DPv2 data point ids are per (owner, scope), so every version of a
+    // scope shares one id. The download dedup reads this row's version.
+    for (const [version, at] of [
+      [1, "2026-10-06T18:02:27Z"],
+      [2, "2026-10-06T18:04:01Z"],
+      [3, "2026-10-06T18:09:43Z"],
+    ] as const) {
+      manager.insert({
+        fileId: null,
+        path: `github/repositories/${at}.json`,
+        scope: "github.repositories",
+        collectedAt: at,
+        sizeBytes: 100,
+        version,
+        dataPointId: "0xdatapoint",
+      });
+    }
+
+    const found = manager.findByDataPointId("0xdatapoint");
+    expect(found?.version).toBe(3);
+    expect(found?.collectedAt).toBe("2026-10-06T18:09:43Z");
+  });
+
   it("deleteByPath returns true when exists, false otherwise", () => {
     manager.insert({
       fileId: null,

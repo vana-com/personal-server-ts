@@ -494,7 +494,12 @@ export async function createPersistentPsLiteStorage(
     },
 
     findByDataPointId(dataPointId) {
-      return state.entries.find((entry) => entry.dataPointId === dataPointId);
+      let newest: IndexEntry | undefined;
+      for (const entry of state.entries) {
+        if (entry.dataPointId !== dataPointId) continue;
+        if (!newest || entry.version >= newest.version) newest = entry;
+      }
+      return newest;
     },
 
     findUnsynced(options) {

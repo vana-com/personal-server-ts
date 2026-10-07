@@ -87,7 +87,11 @@ export interface DataStoragePort extends RuntimeStoragePort {
   countVersions(scope: string): number;
   findEntry(lookup: DataStorageEntryLookup): IndexEntry | undefined;
   findByFileId(fileId: string): IndexEntry | undefined;
-  /** Dedup lookup for the download worker: find an entry by its DPv2 data-point id. */
+  /**
+   * Dedup lookup for the download worker: the NEWEST local version (highest
+   * `version`) of a DPv2 data point. Data point ids are per (owner, scope),
+   * so every version of a scope shares one id.
+   */
   findByDataPointId(dataPointId: string): IndexEntry | undefined;
   findUnsynced(options?: { limit?: number }): IndexEntry[];
   readEnvelope(scope: string, collectedAt: string): Promise<DataFileEnvelope>;
