@@ -42,6 +42,7 @@ export interface HandleMcpRequestOptions {
   activityRecorder?: McpActivityRecorder;
   requestScopeAccess?: McpToolContext["requestScopeAccess"];
   scopeRequestApprovalUrl?: McpToolContext["scopeRequestApprovalUrl"];
+  serverOrigin?: McpToolContext["serverOrigin"];
   /** Emits one access record per denied data tool call; see reportToolDenial. */
   reporterDeps?: PersonalServerReadReporterDeps;
   serverName?: string;
@@ -421,6 +422,7 @@ export function createMcpServerForConnection(
     activityRecorder: options.activityRecorder,
     requestScopeAccess: options.requestScopeAccess,
     scopeRequestApprovalUrl: options.scopeRequestApprovalUrl,
+    serverOrigin: options.serverOrigin,
   };
 
   for (const tool of MCP_TOOLS) {

@@ -18,6 +18,10 @@ import {
 import type { McpDataReadClient } from "./read-client.js";
 import { McpDataReadError } from "./read-client.js";
 import type { McpActivityRecorder } from "./activity.js";
+import type {
+  McpScopeRequestApprovalUrlContext,
+  McpScopeRequestApprovalUrlHook,
+} from "./approval-url.js";
 import { MiniSearchIndex, type SearchDocument } from "./search/index.js";
 import { MAX_SELECTED_BLOCK_IDS } from "../storage/blocks/index.js";
 import {
@@ -39,7 +43,12 @@ export interface McpToolContext {
    * request. When it returns a URL, `request_scope_access` hands it to the
    * agent to show the user; when absent, the owner is pointed at Vana.
    */
-  scopeRequestApprovalUrl?(connectionId: string): string | undefined;
+  scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  /**
+   * This server's current public origin, handed to the approval-URL hook so
+   * the link can name the server that holds the request.
+   */
+  serverOrigin?: string;
 }
 
 export type McpToolResultContent =
@@ -748,7 +757,7 @@ const requestScopeAccess: McpToolDefinition = {
   inputSchema: scopeAccessRequestInputShape,
   async handler(
     args,
-    { connection, requestScopeAccess, scopeRequestApprovalUrl },
+    { connection, requestScopeAccess, scopeRequestApprovalUrl, serverOrigin },
   ) {
     const requestedScopes = normalizeScopeListInput(args.scopes);
     // Read before recording: a new request must not hide the owner's last
@@ -786,7 +795,9 @@ const requestScopeAccess: McpToolDefinition = {
     const finalApprovalRequired = missingScopes.length > 0;
     const recorded = finalApprovalRequired && requestRecorded;
     const approvalUrl = recorded
-      ? resolveScopeRequestApprovalUrl(scopeRequestApprovalUrl, connection.id)
+      ? resolveScopeRequestApprovalUrl(scopeRequestApprovalUrl, connection.id, {
+          serverOrigin,
+        })
       : undefined;
     const declinedScopes =
       previousDecision?.deniedScopes.filter((scope) =>
@@ -821,10 +832,11 @@ const requestScopeAccess: McpToolDefinition = {
 function resolveScopeRequestApprovalUrl(
   hook: McpToolContext["scopeRequestApprovalUrl"],
   connectionId: string,
+  context: McpScopeRequestApprovalUrlContext,
 ): string | undefined {
   if (!hook) return undefined;
   try {
-    const url = hook(connectionId);
+    const url = hook(connectionId, context);
     return typeof url === "string" && url.trim() ? url.trim() : undefined;
   } catch {
     // A broken host hook must not fail the request itself; fall back to Vana.

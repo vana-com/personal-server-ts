@@ -85,6 +85,8 @@ import {
   hashConnectionToken,
   listMcpConnectionViews,
   loadMcpGranteeAccount,
+  MCP_CONNECTION_NOT_FOUND,
+  getMcpConnectionView,
   McpConnectionNotFoundError,
   McpConnectionStateError,
   McpOAuthAuthorizationError,
@@ -99,6 +101,7 @@ import {
   type McpConnectionGrant,
   type McpConnectionStore,
   type McpOAuthAuthorizationStore,
+  type McpScopeRequestApprovalUrlHook,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import type { PsLiteStorageCapabilities } from "./storage.js";
 import {
@@ -209,10 +212,11 @@ export interface PsLiteRuntimeOptions {
   mcpOAuthApprovalUrl?: string | (() => string);
   /**
    * Page where the owner answers an MCP client's `request_scope_access`.
-   * Called with the connection id; a returned URL is handed to the agent to
-   * show the user. Omit to keep pointing the owner at Vana.
+   * Called with the connection id and this runtime's public origin; a
+   * returned URL is handed to the agent to show the user. Omit to keep
+   * pointing the owner at Vana.
    */
-  mcpScopeRequestApprovalUrl?: (connectionId: string) => string | undefined;
+  mcpScopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
   /**
    * Optional diagnostics recorder. When provided, GET /v1/diagnostics (owner-only)
    * returns a structured snapshot useful for debugging stuck approval pages.
@@ -1338,7 +1342,7 @@ async function handleMcpRoute(input: {
   store: McpConnectionStore;
   authorizationStore: McpOAuthAuthorizationStore;
   approvalUrl?: string | (() => string);
-  scopeRequestApprovalUrl?: (connectionId: string) => string | undefined;
+  scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
   auth: PsLiteAuthAdapter;
   dataStorage: DataStoragePort;
   accessLogWriter: AccessLogWriter;
@@ -1682,6 +1686,7 @@ async function handleMcpRoute(input: {
       return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
     }
     // /v1/mcp/connections/:id[/approve | /scope-request/(approve|deny)]
+    // GET /:id reads one connection; DELETE /:id revokes it.
     const tail = pathname.slice(ownerPrefix.length + 1);
     const [id, action, subAction, ...rest] = tail.split("/");
     if (!id) {
@@ -1735,6 +1740,16 @@ async function handleMcpRoute(input: {
       }
     }
     if (!action) {
+      if (input.request.method === "GET") {
+        try {
+          return jsonResponse(await getMcpConnectionView(id, input.store));
+        } catch (err) {
+          if (err instanceof McpConnectionNotFoundError) {
+            return errorResponse(404, MCP_CONNECTION_NOT_FOUND, err.message);
+          }
+          throw err;
+        }
+      }
       if (input.request.method === "DELETE") {
         try {
           const updated = await revokeMcpConnection(id, {
@@ -1821,8 +1836,8 @@ async function handleMcpRoute(input: {
       });
     } catch (err) {
       if (err instanceof McpConnectionNotFoundError) {
-        finish("failed", "NOT_FOUND");
-        return errorResponse(404, "NOT_FOUND", err.message);
+        finish("failed", MCP_CONNECTION_NOT_FOUND);
+        return errorResponse(404, MCP_CONNECTION_NOT_FOUND, err.message);
       }
       if (err instanceof McpConnectionStateError) {
         finish("failed", "INVALID_STATE");
@@ -1895,6 +1910,7 @@ async function handleMcpRoute(input: {
         );
       },
       scopeRequestApprovalUrl: input.scopeRequestApprovalUrl,
+      serverOrigin: input.serverOrigin,
     });
     void input.store
       .update(record.id, {

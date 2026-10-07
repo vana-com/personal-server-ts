@@ -192,6 +192,14 @@ export interface ApproveMcpConnectionOptions {
   now?: () => Date;
 }
 
+/**
+ * errorCode for an unknown connection id on the single-connection and
+ * scope-request routes. Distinct from the generic `NOT_FOUND` a server
+ * answers for a route it does not have, so a caller (Vana Web) can tell
+ * "this request is gone" from "this server predates the route".
+ */
+export const MCP_CONNECTION_NOT_FOUND = "MCP_CONNECTION_NOT_FOUND";
+
 export class McpConnectionNotFoundError extends Error {
   constructor(public connectionId: string) {
     super(`mcp connection ${connectionId} not found`);
@@ -665,6 +673,16 @@ export function toMcpConnectionView(
     revokedAt: record.revokedAt,
     lastUsedAt: record.lastUsedAt,
   };
+}
+
+/** One connection as the owner sees it; throws when the id is unknown. */
+export async function getMcpConnectionView(
+  connectionId: string,
+  store: McpConnectionStore,
+): Promise<McpConnectionView> {
+  const record = await store.getById(connectionId);
+  if (!record) throw new McpConnectionNotFoundError(connectionId);
+  return toMcpConnectionView(record);
 }
 
 export async function listMcpConnectionViews(

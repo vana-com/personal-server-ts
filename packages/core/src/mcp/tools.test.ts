@@ -383,11 +383,14 @@ describe("mcp/tools", () => {
           readClient: createMinimalReadClient(),
           requestScopeAccess: recordedRequest(connection),
           scopeRequestApprovalUrl,
+          serverOrigin: "https://ps.example.com",
         },
       );
 
       const url = "http://127.0.0.1:8081/mcp/scope-request?connection=conn-1";
-      expect(scopeRequestApprovalUrl).toHaveBeenCalledWith("conn-1");
+      expect(scopeRequestApprovalUrl).toHaveBeenCalledWith("conn-1", {
+        serverOrigin: "https://ps.example.com",
+      });
       const body = JSON.parse(result.content[0].text);
       expect(body).toMatchObject({
         approvalRequired: true,

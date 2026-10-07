@@ -29,6 +29,7 @@ import {
   createMemoryPsLiteTokenStore,
 } from "./test-support/memory.js";
 import {
+  type McpScopeRequestApprovalUrlHook,
   createInMemoryMcpConnectionStore,
   createMcpConnection,
   createMcpDataReadClient,
@@ -170,7 +171,7 @@ function buildRuntime(
     grantId?: string;
     scopes?: string[];
     approvalUrl?: string;
-    scopeRequestApprovalUrl?: (connectionId: string) => string | undefined;
+    scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
   } = {},
 ): RuntimeBundle {
   const gateway = makeMockGateway({
@@ -523,6 +524,25 @@ describe("createPsLiteRuntime + scope-request answers", () => {
       await ownerSigned("POST", "/v1/mcp/connections/nope/scope-request/deny"),
     );
     expect(missing.status).toBe(404);
+    expect((await missing.json()).error.errorCode).toBe(
+      "MCP_CONNECTION_NOT_FOUND",
+    );
+
+    const one = await bundle.runtime.fetch(
+      await ownerSigned("GET", `/v1/mcp/connections/${id}`),
+    );
+    expect(one.status).toBe(200);
+    expect(await one.json()).toMatchObject({
+      id,
+      scopeAccessDecision: { decision: "denied" },
+    });
+    const unknown = await bundle.runtime.fetch(
+      await ownerSigned("GET", "/v1/mcp/connections/nope"),
+    );
+    expect(unknown.status).toBe(404);
+    expect((await unknown.json()).error.errorCode).toBe(
+      "MCP_CONNECTION_NOT_FOUND",
+    );
   });
 });
 

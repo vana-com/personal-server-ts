@@ -910,6 +910,77 @@ describe("createApp", () => {
       ).toContain("x-vana-metadata");
     });
   });
+
+  describe("CORS for Vana Web MCP scope requests", () => {
+    // Vana Web (app.vana.org) loads a pending MCP scope request and posts the
+    // owner's decision straight to this server through its public URL, with
+    // a Web3Signed owner header. No cookies, so `*` is enough; the preflight
+    // must pass before any auth runs, and errors must stay readable.
+    const WEB_ORIGIN = "https://app.vana.org";
+    const DECISION_PATHS = [
+      "/v1/mcp/connections/conn-1/scope-request/approve",
+      "/v1/mcp/connections/conn-1/scope-request/deny",
+    ];
+
+    function lowerList(value: string | null): string[] {
+      return (value ?? "").split(",").map((h) => h.trim().toLowerCase());
+    }
+
+    it.each(DECISION_PATHS)("OPTIONS %s answers 204", async (path) => {
+      const app = makeApp();
+      const res = await app.request(path, {
+        method: "OPTIONS",
+        headers: {
+          Origin: WEB_ORIGIN,
+          "Access-Control-Request-Method": "POST",
+          "Access-Control-Request-Headers": "authorization, content-type",
+        },
+      });
+      expect(res.status).toBe(204);
+      expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+      expect(res.headers.get("Access-Control-Allow-Methods")).toContain("POST");
+      const allowed = lowerList(
+        res.headers.get("Access-Control-Allow-Headers"),
+      );
+      expect(allowed).toContain("authorization");
+      expect(allowed).toContain("content-type");
+    });
+
+    it("serves the owner's signed list and a readable 404 cross-origin", async () => {
+      const app = makeApp();
+      const listPath = "/v1/mcp/connections";
+      const list = await app.request(listPath, {
+        headers: {
+          Origin: WEB_ORIGIN,
+          Authorization: await buildWeb3SignedHeader({
+            wallet: ownerWallet,
+            aud: SERVER_ORIGIN,
+            method: "GET",
+            uri: listPath,
+          }),
+        },
+      });
+      expect(list.status).toBe(200);
+      expect(list.headers.get("Access-Control-Allow-Origin")).toBe("*");
+      expect(await list.json()).toEqual({ connections: [] });
+
+      const deny = await app.request(DECISION_PATHS[1], {
+        method: "POST",
+        headers: {
+          Origin: WEB_ORIGIN,
+          Authorization: await buildWeb3SignedHeader({
+            wallet: ownerWallet,
+            aud: SERVER_ORIGIN,
+            method: "POST",
+            uri: DECISION_PATHS[1],
+          }),
+        },
+      });
+      expect(deny.status).toBe(404);
+      expect(deny.headers.get("Access-Control-Allow-Origin")).toBe("*");
+      expect((await deny.json()).error.code).toBe(404);
+    });
+  });
 });
 
 // Regression for the dev UI leak: /ui (and the dev-token-gated bootstrap that

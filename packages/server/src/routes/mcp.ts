@@ -46,10 +46,12 @@ import {
   type McpProofReplayStore,
   createMcpDataReadClient,
   denyMcpScopeAccessRequest,
+  getMcpConnectionView,
   handleMcpStreamableHttpRequest,
   hashConnectionToken,
   listMcpConnectionViews,
   loadMcpGranteeAccount,
+  MCP_CONNECTION_NOT_FOUND,
   McpConnectionNotFoundError,
   McpConnectionStateError,
   McpOAuthAuthorizationError,
@@ -66,6 +68,7 @@ import {
   type McpSessionStore,
   type McpOAuthAuthorizationStore,
   type McpActivityRecorder,
+  type McpScopeRequestApprovalUrlHook,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import type {
   PersonalServerDataApiDeps,
@@ -153,7 +156,7 @@ export interface McpRouteDeps {
    * returns a URL, `request_scope_access` gives it to the agent to show the
    * user. Absent: the agent is told to wait for approval in Vana.
    */
-  scopeRequestApprovalUrl?: (connectionId: string) => string | undefined;
+  scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
 }
 
 function resolveOrigin(origin: string | (() => string)): string {
@@ -338,14 +341,15 @@ const SCOPE_REQUEST_DENY_ACTIVITY = "owner.scope_request.deny";
 
 function scopeRequestErrorCode(err: unknown): string {
   if (err instanceof McpScopeRequestError) return err.code;
-  if (err instanceof McpConnectionNotFoundError) return "NOT_FOUND";
+  if (err instanceof McpConnectionNotFoundError)
+    return MCP_CONNECTION_NOT_FOUND;
   if (err instanceof McpConnectionStateError) return "INVALID_STATE";
   return "INTERNAL";
 }
 
 function scopeRequestErrorResponse(c: Context, err: unknown): Response | null {
   if (err instanceof McpConnectionNotFoundError) {
-    return c.json(jsonError(404, "NOT_FOUND", err.message), 404);
+    return c.json(jsonError(404, MCP_CONNECTION_NOT_FOUND, err.message), 404);
   }
   if (err instanceof McpConnectionStateError) {
     return c.json(jsonError(409, "INVALID_STATE", err.message), 409);
@@ -406,6 +410,21 @@ export function mcpConnectionsRoutes(deps: McpRouteDeps): Hono {
     if (err) return err;
     const records = await listMcpConnectionViews(store);
     return c.json({ connections: records });
+  });
+
+  // One connection, e.g. the pending scope request Vana Web renders. An
+  // unknown id answers MCP_CONNECTION_NOT_FOUND, never the generic NOT_FOUND
+  // a server without this route returns.
+  app.get("/:id", async (c) => {
+    const err = await requireOwner(c);
+    if (err) return err;
+    try {
+      return c.json(await getMcpConnectionView(c.req.param("id"), store));
+    } catch (caught) {
+      const response = scopeRequestErrorResponse(c, caught);
+      if (response) return response;
+      throw caught;
+    }
   });
 
   app.post("/:id/approve", async (c) => {
@@ -953,6 +972,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
         );
       },
       scopeRequestApprovalUrl: deps.scopeRequestApprovalUrl,
+      serverOrigin: resolveOrigin(deps.serverOrigin),
     });
     void store
       .update(record.id, { lastUsedAt: new Date().toISOString() })
