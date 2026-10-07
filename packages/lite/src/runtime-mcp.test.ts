@@ -170,6 +170,7 @@ function buildRuntime(
     grantId?: string;
     scopes?: string[];
     approvalUrl?: string;
+    scopeRequestApprovalUrl?: (connectionId: string) => string | undefined;
   } = {},
 ): RuntimeBundle {
   const gateway = makeMockGateway({
@@ -199,6 +200,7 @@ function buildRuntime(
     serverOwner: owner.address,
     mcpConnectionStore: store,
     mcpOAuthApprovalUrl: opts.approvalUrl,
+    mcpScopeRequestApprovalUrl: opts.scopeRequestApprovalUrl,
     auth: createWeb3SignedPsLiteAuth({
       origin: SERVER_ORIGIN,
       ownerAddress: owner.address,
@@ -433,6 +435,94 @@ describe("createPsLiteRuntime + /mcp/:token route", () => {
       ),
     );
     expect(res.status).toBe(401);
+  });
+});
+
+describe("createPsLiteRuntime + scope-request answers", () => {
+  async function requested(bundle: RuntimeBundle) {
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store: bundle.store, publicOrigin: SERVER_ORIGIN },
+    );
+    await bundle.runtime.fetch(
+      await ownerSigned(
+        "POST",
+        `/v1/mcp/connections/${created.connectionId}/approve`,
+        { grants: [{ grantId: "grant-mcp-1", scopes: ["instagram.profile"] }] },
+      ),
+    );
+    const res = await bundle.runtime.fetch(
+      new Request(
+        `${SERVER_ORIGIN}/mcp/${encodeURIComponent(created.connectionToken)}`,
+        {
+          method: "POST",
+          headers: {
+            Accept: "application/json, text/event-stream",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: {
+              name: "request_scope_access",
+              arguments: { scopes: ["chatgpt.history", "spotify.profile"] },
+            },
+          }),
+        },
+      ),
+    );
+    const tool = JSON.parse((await res.json()).result.content[0].text);
+    return { id: created.connectionId, tool };
+  }
+
+  it("hands out the host link and approves the union server-side", async () => {
+    const bundle = buildRuntime({
+      grantId: "grant-mcp-1",
+      scopeRequestApprovalUrl: (id) => `http://127.0.0.1:9/approve/${id}`,
+    });
+    const { id, tool } = await requested(bundle);
+    expect(tool.approvalUrl).toBe(`http://127.0.0.1:9/approve/${id}`);
+
+    const res = await bundle.runtime.fetch(
+      await ownerSigned(
+        "POST",
+        `/v1/mcp/connections/${id}/scope-request/approve`,
+        { scopes: ["chatgpt.history"] },
+      ),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      grantedScopes: ["chatgpt.history", "instagram.profile"],
+      deniedScopes: ["spotify.profile"],
+    });
+    expect(bundle.gateway.createGrant).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scopes: ["chatgpt.history", "instagram.profile"],
+        grantVersion: "2",
+      }),
+    );
+  });
+
+  it("denies, then refuses a second answer, and 404s unknown ids", async () => {
+    const bundle = buildRuntime();
+    const { id, tool } = await requested(bundle);
+    expect(tool).not.toHaveProperty("approvalUrl");
+
+    const deny = () =>
+      ownerSigned("POST", `/v1/mcp/connections/${id}/scope-request/deny`);
+    const denied = await bundle.runtime.fetch(await deny());
+    expect(denied.status).toBe(200);
+    expect((await denied.json()).connection.scopeAccessDecision).toMatchObject({
+      decision: "denied",
+    });
+    const again = await bundle.runtime.fetch(await deny());
+    expect(again.status).toBe(409);
+
+    const missing = await bundle.runtime.fetch(
+      await ownerSigned("POST", "/v1/mcp/connections/nope/scope-request/deny"),
+    );
+    expect(missing.status).toBe(404);
   });
 });
 

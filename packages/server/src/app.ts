@@ -148,6 +148,8 @@ export interface AppDeps {
   mcpConnectionStore?: McpConnectionStore;
   mcpOAuthAuthorizationStore?: McpOAuthAuthorizationStore;
   mcpOAuthApprovalUrl?: string | (() => string);
+  /** See `CreateServerOptions.mcpScopeRequestApprovalUrl`. */
+  mcpScopeRequestApprovalUrl?: (connectionId: string) => string | undefined;
   mcpActivityRecorder?: McpActivityRecorder;
   mcpHydrateScopes?: (scopes: string[]) => Promise<void>;
   /**
@@ -387,6 +389,7 @@ export function createApp(deps: AppDeps): Hono {
     connectionStore: mcpConnectionStore,
     oauthAuthorizationStore: mcpOAuthAuthorizationStore,
     oauthApprovalUrl: deps.mcpOAuthApprovalUrl,
+    scopeRequestApprovalUrl: deps.mcpScopeRequestApprovalUrl,
     activityRecorder: mcpActivityRecorder,
   };
 

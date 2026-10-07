@@ -12,14 +12,17 @@ import {
 import {
   approveMcpConnection,
   approveMcpOAuthAuthorization,
+  approveMcpScopeAccessRequest,
   buildStableMcpUrl,
   buildMcpUrl,
   createMcpConnection,
   createMcpOAuthAuthorization,
+  denyMcpScopeAccessRequest,
   hashConnectionToken,
   listMcpConnectionViews,
   McpConnectionNotFoundError,
   McpConnectionStateError,
+  McpScopeRequestError,
   redeemMcpOAuthAuthorizationCode,
   refreshMcpOAuthToken,
   requestMcpScopeAccess,
@@ -620,4 +623,295 @@ describe("mcp/connection-api refresh grant", () => {
     );
     return { connectionStore, connectionId: created.connectionId, token };
   }
+});
+
+describe("mcp/connection-api scope request answers", () => {
+  const OWNER = "0x00000000000000000000000000000000000000aa" as const;
+  const REQUESTED_AT = "2026-10-07T10:00:00.000Z";
+  const DECIDED_AT = "2026-10-07T10:05:00.000Z";
+
+  function liveGrant(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "0xgrant1",
+      scopes: ["instagram.profile"],
+      grantVersion: "3",
+      expiresAt: null,
+      revokedAt: null,
+      ...overrides,
+    };
+  }
+
+  function gatewayMock(live: Record<string, unknown> | null = liveGrant()) {
+    return {
+      getBuilder: vi.fn(async () => ({ id: "0xbuilder" })),
+      getGrant: vi.fn(async () => live),
+      createGrant: vi.fn(async () => ({ grantId: "0xgrant2" })),
+    };
+  }
+
+  const serverSigner = {
+    signGrantRegistration: vi.fn(async () => "0xsig" as `0x${string}`),
+  };
+
+  async function connectionWithRequest(
+    grants = [{ grantId: "0xgrant1", scopes: ["instagram.profile"] }],
+    requested = ["chatgpt.conversations", "spotify.profile"],
+  ) {
+    const store = createInMemoryMcpConnectionStore();
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store, publicOrigin: PUBLIC_ORIGIN },
+    );
+    await approveMcpConnection(
+      { connectionId: created.connectionId, grants },
+      { store },
+    );
+    await requestMcpScopeAccess(
+      {
+        connectionId: created.connectionId,
+        scopes: requested,
+        reason: "Answer from chats and music.",
+      },
+      { store, now: () => new Date(REQUESTED_AT) },
+    );
+    return { store, id: created.connectionId, grantee: created.granteeAddress };
+  }
+
+  function approveOptions(
+    store: ReturnType<typeof createInMemoryMcpConnectionStore>,
+    gateway: ReturnType<typeof gatewayMock>,
+  ) {
+    return {
+      store,
+      gateway: gateway as never,
+      serverOwner: OWNER,
+      serverSigner,
+      now: () => new Date(DECIDED_AT),
+    };
+  }
+
+  it("re-signs the union of existing and approved scopes, never dropping one", async () => {
+    const { store, id, grantee } = await connectionWithRequest();
+    // The gateway grant holds a scope this record never saw; it must survive.
+    const gateway = gatewayMock(
+      liveGrant({ scopes: ["instagram.profile", "github.profile"] }),
+    );
+
+    const result = await approveMcpScopeAccessRequest(
+      { connectionId: id, scopes: ["spotify.profile"] },
+      approveOptions(store, gateway),
+    );
+
+    expect(gateway.getGrant).toHaveBeenCalledWith("0xgrant1");
+    expect(gateway.createGrant).toHaveBeenCalledWith(
+      expect.objectContaining({
+        grantorAddress: OWNER,
+        granteeId: "0xbuilder",
+        scopes: ["github.profile", "instagram.profile", "spotify.profile"],
+        grantVersion: "4",
+        expiresAt: "0",
+      }),
+    );
+    expect(gateway.getBuilder).toHaveBeenCalledWith(grantee);
+    expect(result.grantedScopes).toEqual([
+      "github.profile",
+      "instagram.profile",
+      "spotify.profile",
+    ]);
+    expect(result.approvedScopes).toEqual(["spotify.profile"]);
+    expect(result.deniedScopes).toEqual(["chatgpt.conversations"]);
+
+    const [view] = await listMcpConnectionViews(store);
+    expect(view?.grants).toEqual([
+      {
+        grantId: "0xgrant2",
+        scopes: ["github.profile", "instagram.profile", "spotify.profile"],
+      },
+    ]);
+    expect(view?.grantedScopes).toEqual(result.grantedScopes);
+    expect(view?.scopeAccessRequest).toBeUndefined();
+    expect(view?.scopeAccessDecision).toEqual({
+      decision: "approved",
+      approvedScopes: ["spotify.profile"],
+      deniedScopes: ["chatgpt.conversations"],
+      requestedAt: REQUESTED_AT,
+      decidedAt: DECIDED_AT,
+    });
+  });
+
+  it("keeps every grant's scopes when the connection holds several", async () => {
+    const { store, id } = await connectionWithRequest([
+      { grantId: "0xgrant1", scopes: ["instagram.profile"] },
+      { grantId: "0xgrant1b", scopes: ["chatgpt.*"] },
+    ]);
+    const gateway = gatewayMock();
+    gateway.getGrant.mockImplementation(async (grantId: string) =>
+      grantId === "0xgrant1b"
+        ? liveGrant({ id: grantId, scopes: ["chatgpt.*"], grantVersion: "7" })
+        : liveGrant(),
+    );
+
+    const result = await approveMcpScopeAccessRequest(
+      { connectionId: id, scopes: ["spotify.profile"] },
+      approveOptions(store, gateway),
+    );
+
+    expect(result.grantedScopes).toEqual([
+      "chatgpt.*",
+      "instagram.profile",
+      "spotify.profile",
+    ]);
+    expect(gateway.createGrant).toHaveBeenCalledWith(
+      expect.objectContaining({ grantVersion: "8" }),
+    );
+  });
+
+  it("does not resurrect scopes of a grant the owner already revoked", async () => {
+    const { store, id } = await connectionWithRequest();
+    const gateway = gatewayMock(
+      liveGrant({ revokedAt: "2026-10-01T00:00:00.000Z", grantVersion: "5" }),
+    );
+
+    const result = await approveMcpScopeAccessRequest(
+      { connectionId: id, scopes: ["spotify.profile"] },
+      approveOptions(store, gateway),
+    );
+
+    expect(result.grantedScopes).toEqual(["spotify.profile"]);
+    expect(gateway.createGrant).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scopes: ["spotify.profile"],
+        grantVersion: "6",
+      }),
+    );
+  });
+
+  it("keeps the live grant's expiry instead of making it perpetual", async () => {
+    const { store, id } = await connectionWithRequest();
+    const gateway = gatewayMock(liveGrant({ expiresAt: "1900000000" }));
+
+    await approveMcpScopeAccessRequest(
+      { connectionId: id, scopes: ["spotify.profile"] },
+      approveOptions(store, gateway),
+    );
+
+    expect(gateway.createGrant).toHaveBeenCalledWith(
+      expect.objectContaining({ expiresAt: "1900000000" }),
+    );
+  });
+
+  it("rejects scopes outside the pending request or malformed, without signing", async () => {
+    const { store, id } = await connectionWithRequest();
+    const gateway = gatewayMock();
+
+    for (const [scopes, code] of [
+      [["github.profile"], "SCOPE_NOT_REQUESTED"],
+      [["not a scope"], "INVALID_SCOPE"],
+      [[], "SCOPES_REQUIRED"],
+      [undefined, "SCOPES_REQUIRED"],
+    ] as const) {
+      await expect(
+        approveMcpScopeAccessRequest(
+          { connectionId: id, scopes },
+          approveOptions(store, gateway),
+        ),
+      ).rejects.toMatchObject({ code, status: 400 });
+    }
+    expect(gateway.createGrant).not.toHaveBeenCalled();
+    expect((await store.getById(id))?.scopeAccessRequest?.scopes).toEqual([
+      "chatgpt.conversations",
+      "spotify.profile",
+    ]);
+  });
+
+  it("leaves the request pending when the gateway refuses the grant", async () => {
+    const { store, id } = await connectionWithRequest();
+    const gateway = gatewayMock();
+    gateway.createGrant.mockRejectedValue(new Error("gateway down"));
+
+    await expect(
+      approveMcpScopeAccessRequest(
+        { connectionId: id, scopes: ["spotify.profile"] },
+        approveOptions(store, gateway),
+      ),
+    ).rejects.toMatchObject({ code: "GRANT_CREATION_FAILED", status: 502 });
+    const stored = await store.getById(id);
+    expect(stored?.scopeAccessRequest).toBeDefined();
+    expect(stored?.grants).toEqual([
+      { grantId: "0xgrant1", scopes: ["instagram.profile"] },
+    ]);
+  });
+
+  it("refuses to store a grant signed over grants that changed meanwhile", async () => {
+    const { store, id } = await connectionWithRequest();
+    const gateway = gatewayMock();
+    gateway.createGrant.mockImplementation(async () => {
+      // Another approval widened the connection during the gateway call.
+      await store.update(id, {
+        grants: [{ grantId: "0xgrant1", scopes: ["github.profile"] }],
+      });
+      return { grantId: "0xgrant2" };
+    });
+
+    await expect(
+      approveMcpScopeAccessRequest(
+        { connectionId: id, scopes: ["spotify.profile"] },
+        approveOptions(store, gateway),
+      ),
+    ).rejects.toMatchObject({ code: "CONCURRENT_UPDATE", status: 409 });
+    expect((await store.getById(id))?.grants).toEqual([
+      { grantId: "0xgrant1", scopes: ["github.profile"] },
+    ]);
+  });
+
+  it("deny clears the request and records the denial", async () => {
+    const { store, id } = await connectionWithRequest();
+
+    const denied = await denyMcpScopeAccessRequest(
+      { connectionId: id },
+      { store, now: () => new Date(DECIDED_AT) },
+    );
+
+    expect(denied.scopeAccessRequest).toBeUndefined();
+    expect(denied.grants).toEqual([
+      { grantId: "0xgrant1", scopes: ["instagram.profile"] },
+    ]);
+    expect(denied.scopeAccessDecision).toEqual({
+      decision: "denied",
+      approvedScopes: [],
+      deniedScopes: ["chatgpt.conversations", "spotify.profile"],
+      requestedAt: REQUESTED_AT,
+      decidedAt: DECIDED_AT,
+    });
+  });
+
+  it("refuses to answer when nothing is pending", async () => {
+    const { store, id } = await connectionWithRequest();
+    await denyMcpScopeAccessRequest({ connectionId: id }, { store });
+    const gateway = gatewayMock();
+
+    await expect(
+      denyMcpScopeAccessRequest({ connectionId: id }, { store }),
+    ).rejects.toMatchObject({ code: "NO_PENDING_REQUEST", status: 409 });
+    const approve = approveMcpScopeAccessRequest(
+      { connectionId: id, scopes: ["spotify.profile"] },
+      approveOptions(store, gateway),
+    );
+    await expect(approve).rejects.toBeInstanceOf(McpScopeRequestError);
+    await expect(approve).rejects.toMatchObject({ code: "NO_PENDING_REQUEST" });
+    expect(gateway.createGrant).not.toHaveBeenCalled();
+  });
+
+  it("throws not-found for an unknown connection", async () => {
+    const store = createInMemoryMcpConnectionStore();
+    await expect(
+      approveMcpScopeAccessRequest(
+        { connectionId: "nope", scopes: ["spotify.profile"] },
+        approveOptions(store, gatewayMock()),
+      ),
+    ).rejects.toBeInstanceOf(McpConnectionNotFoundError);
+    await expect(
+      denyMcpScopeAccessRequest({ connectionId: "nope" }, { store }),
+    ).rejects.toBeInstanceOf(McpConnectionNotFoundError);
+  });
 });

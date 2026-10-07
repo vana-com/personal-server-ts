@@ -41,6 +41,7 @@ export interface HandleMcpRequestOptions {
   readClient: McpDataReadClient;
   activityRecorder?: McpActivityRecorder;
   requestScopeAccess?: McpToolContext["requestScopeAccess"];
+  scopeRequestApprovalUrl?: McpToolContext["scopeRequestApprovalUrl"];
   /** Emits one access record per denied data tool call; see reportToolDenial. */
   reporterDeps?: PersonalServerReadReporterDeps;
   serverName?: string;
@@ -419,6 +420,7 @@ export function createMcpServerForConnection(
     readClient: options.readClient,
     activityRecorder: options.activityRecorder,
     requestScopeAccess: options.requestScopeAccess,
+    scopeRequestApprovalUrl: options.scopeRequestApprovalUrl,
   };
 
   for (const tool of MCP_TOOLS) {

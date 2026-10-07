@@ -356,6 +356,125 @@ describe("mcp/tools", () => {
     expect(requestScopeAccess).not.toHaveBeenCalled();
   });
 
+  describe("request_scope_access approval link", () => {
+    function recordedRequest(connection: McpConnectionRecord) {
+      return vi.fn().mockResolvedValue({
+        connection: {
+          ...connection,
+          scopeAccessRequest: {
+            scopes: ["chatgpt.conversations"],
+            requestedAt: "2026-10-07T10:00:00.000Z",
+          },
+        },
+        requestRecorded: true,
+      });
+    }
+
+    it("returns the host's approvalUrl and tells the agent to show it", async () => {
+      const connection = createConnection();
+      const scopeRequestApprovalUrl = vi.fn(
+        (id: string) =>
+          `http://127.0.0.1:8081/mcp/scope-request?connection=${id}`,
+      );
+      const result = await getTool("request_scope_access").handler(
+        { scopes: ["chatgpt.conversations"] },
+        {
+          connection,
+          readClient: createMinimalReadClient(),
+          requestScopeAccess: recordedRequest(connection),
+          scopeRequestApprovalUrl,
+        },
+      );
+
+      const url = "http://127.0.0.1:8081/mcp/scope-request?connection=conn-1";
+      expect(scopeRequestApprovalUrl).toHaveBeenCalledWith("conn-1");
+      const body = JSON.parse(result.content[0].text);
+      expect(body).toMatchObject({
+        approvalRequired: true,
+        requestRecorded: true,
+        approvalUrl: url,
+      });
+      expect(body.nextAction).toContain(url);
+      expect(body.nextAction).toContain("tell you when they are done");
+    });
+
+    it("keeps the Vana wording and no approvalUrl without a hook", async () => {
+      const connection = createConnection();
+      const result = await getTool("request_scope_access").handler(
+        { scopes: ["chatgpt.conversations"] },
+        {
+          connection,
+          readClient: createMinimalReadClient(),
+          requestScopeAccess: recordedRequest(connection),
+        },
+      );
+
+      const body = JSON.parse(result.content[0].text);
+      expect(body).not.toHaveProperty("approvalUrl");
+      expect(body.nextAction).toBe(
+        "The request is waiting for owner approval in Vana. Access remains unchanged until the owner approves it.",
+      );
+    });
+
+    it("omits approvalUrl when the hook has none or nothing is missing", async () => {
+      const connection = createConnection();
+      const noUrl = await getTool("request_scope_access").handler(
+        { scopes: ["chatgpt.conversations"] },
+        {
+          connection,
+          readClient: createMinimalReadClient(),
+          requestScopeAccess: recordedRequest(connection),
+          scopeRequestApprovalUrl: () => undefined,
+        },
+      );
+      expect(JSON.parse(noUrl.content[0].text)).not.toHaveProperty(
+        "approvalUrl",
+      );
+
+      const hook = vi.fn(() => "http://127.0.0.1/approve");
+      const granted = await getTool("request_scope_access").handler(
+        { scopes: ["instagram.profile"] },
+        {
+          connection,
+          readClient: createMinimalReadClient(),
+          requestScopeAccess: vi.fn(),
+          scopeRequestApprovalUrl: hook,
+        },
+      );
+      expect(JSON.parse(granted.content[0].text)).not.toHaveProperty(
+        "approvalUrl",
+      );
+      expect(hook).not.toHaveBeenCalled();
+    });
+
+    it("tells the agent the owner already declined these scopes", async () => {
+      const connection: McpConnectionRecord = {
+        ...createConnection(),
+        scopeAccessDecision: {
+          decision: "denied",
+          approvedScopes: [],
+          deniedScopes: ["chatgpt.conversations"],
+          requestedAt: "2026-10-07T10:00:00.000Z",
+          decidedAt: "2026-10-07T10:05:00.000Z",
+        },
+      };
+      const result = await getTool("request_scope_access").handler(
+        { scopes: ["chatgpt.conversations"] },
+        {
+          connection,
+          readClient: createMinimalReadClient(),
+          requestScopeAccess: recordedRequest(connection),
+        },
+      );
+
+      const body = JSON.parse(result.content[0].text);
+      expect(body.previousDecision).toMatchObject({ decision: "denied" });
+      expect(body.nextAction).toContain(
+        "owner previously declined chatgpt.conversations",
+      );
+    });
+  });
+
   it("request_scope_access reports when a bounded request could not be recorded", async () => {
     const connection = createConnection();
     const result = await getTool("request_scope_access").handler(

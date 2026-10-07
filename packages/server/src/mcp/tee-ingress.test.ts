@@ -716,6 +716,7 @@ describe("TEE MCP ingress", () => {
           granteeAddress: OWNER,
           status: "approved",
           grants: [{ grantId: "0xabc", scopes: ["spotify.profile"] }],
+          grantedScopes: ["spotify.profile"],
           createdAt: expect.any(String),
         },
       ]);
