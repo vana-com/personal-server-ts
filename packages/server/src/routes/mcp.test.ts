@@ -1128,7 +1128,24 @@ describe("MCP OAuth routes", () => {
       vi.useRealTimers();
     });
 
-    it("signs the grant with a 365-day expiry by default", async () => {
+    it("signs a perpetual grant by default, as before the option existed", async () => {
+      const authorizationId = await pendingAuthorizationId();
+      const res = await ownerRequest(
+        "POST",
+        `/v1/mcp/oauth/authorizations/${authorizationId}/approve`,
+        { scopes: ["chatgpt.history"] },
+      );
+      expect(res.status).toBe(200);
+      expect(gateway.createGrant).toHaveBeenCalledWith(
+        expect.objectContaining({
+          scopes: ["chatgpt.history"],
+          expiresAt: "0",
+        }),
+      );
+    });
+
+    it("signs a 365-day expiry when mcpGrantTtlSeconds is a year", async () => {
+      buildOAuthApp({ mcpGrantTtlSeconds: 365 * 24 * 60 * 60 });
       const authorizationId = await pendingAuthorizationId();
       const res = await ownerRequest(
         "POST",

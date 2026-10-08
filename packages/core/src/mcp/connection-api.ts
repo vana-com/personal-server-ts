@@ -60,10 +60,11 @@ const OAUTH_AUTHORIZATION_TTL_MS = 10 * 60 * 1000;
 /**
  * Default lifetime of a grant the server signs itself for an MCP connection
  * (OAuth approve, or a scope-request approve with no live grant to inherit
- * an expiry from): 365 days from signing. Hosts override it with
- * `mcpGrantTtlSeconds`; 0 signs perpetual grants.
+ * an expiry from): 0, a perpetual grant, as before this option existed.
+ * Hosts opt into a dated grant with `mcpGrantTtlSeconds`, for example
+ * 365 * 24 * 60 * 60 for one year from signing.
  */
-export const DEFAULT_MCP_GRANT_TTL_SECONDS = 365 * 24 * 60 * 60;
+export const DEFAULT_MCP_GRANT_TTL_SECONDS = 0;
 
 /**
  * Unix-seconds expiry for a freshly signed MCP grant, or undefined for a
@@ -477,8 +478,8 @@ export interface ApproveMcpScopeAccessRequestOptions {
   now?: () => Date;
   /**
    * Lifetime of the re-signed grant when the connection has no live grant
-   * to inherit an expiry from. Defaults to DEFAULT_MCP_GRANT_TTL_SECONDS;
-   * 0 means perpetual. A live grant's expiry (or perpetuity) always wins.
+   * to inherit an expiry from. Defaults to DEFAULT_MCP_GRANT_TTL_SECONDS
+   * (0, perpetual). A live grant's expiry (or perpetuity) always wins.
    */
   grantTtlSeconds?: number;
 }
@@ -1086,8 +1087,8 @@ export interface ApproveMcpOAuthAuthorizationScopesOptions extends ApproveMcpOAu
   fetch?: typeof fetch;
   /**
    * Lifetime of the signed grant when the approve body names no
-   * `expiresAt`. Defaults to DEFAULT_MCP_GRANT_TTL_SECONDS; 0 means
-   * perpetual.
+   * `expiresAt`. Defaults to DEFAULT_MCP_GRANT_TTL_SECONDS (0,
+   * perpetual).
    */
   grantTtlSeconds?: number;
 }

@@ -223,7 +223,7 @@ export interface PsLiteRuntimeOptions {
   /**
    * Lifetime in seconds of grants this runtime signs itself for MCP
    * connections (OAuth approve, scope-request approve with no live grant to
-   * inherit an expiry from). Defaults to 365 days; 0 signs perpetual grants.
+   * inherit an expiry from). Unset or 0 signs perpetual grants (the default).
    */
   mcpGrantTtlSeconds?: number;
   /**

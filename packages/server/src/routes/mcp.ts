@@ -122,8 +122,8 @@ export interface McpRouteDeps {
   paymentEnabled?: boolean;
   /**
    * Lifetime in seconds of grants this server signs itself for MCP
-   * connections when there is no live grant expiry to keep. Defaults to
-   * 365 days; 0 signs perpetual grants.
+   * connections when there is no live grant expiry to keep. Unset or 0
+   * signs perpetual grants (the default).
    */
   mcpGrantTtlSeconds?: number;
   devToken?: string;

@@ -145,7 +145,7 @@ export interface CreateServerOptions {
    * Lifetime in seconds of grants the server signs itself for MCP
    * connections: the OAuth approve path and a scope-request approve with no
    * live grant to inherit an expiry from (a live grant's expiry is always
-   * kept). Defaults to 365 days; 0 signs perpetual grants.
+   * kept). Unset or 0 signs perpetual grants (the default).
    */
   mcpGrantTtlSeconds?: number;
   profile?: "standard" | "enclave";

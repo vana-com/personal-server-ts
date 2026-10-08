@@ -125,7 +125,7 @@ export interface AppDeps {
   /**
    * Lifetime in seconds of grants the server signs itself for MCP
    * connections (OAuth approve, scope-request approve with no live grant).
-   * Defaults to 365 days; 0 signs perpetual grants.
+   * Unset or 0 signs perpetual grants (the default).
    */
   mcpGrantTtlSeconds?: number;
   /** Derivative data: gateway lineage access for the data routes. */

@@ -805,13 +805,13 @@ describe("mcp/connection-api scope request answers", () => {
     );
   });
 
-  it("keeps a perpetual live grant perpetual instead of adding the default expiry", async () => {
+  it("keeps a perpetual live grant perpetual instead of adding a configured expiry", async () => {
     const { store, id } = await connectionWithRequest();
     const gateway = gatewayMock(liveGrant({ expiresAt: "0" }));
 
     await approveMcpScopeAccessRequest(
       { connectionId: id, scopes: ["spotify.profile"] },
-      approveOptions(store, gateway),
+      { ...approveOptions(store, gateway), grantTtlSeconds: 365 * 24 * 3600 },
     );
 
     expect(gateway.createGrant).toHaveBeenCalledWith(
@@ -841,7 +841,7 @@ describe("mcp/connection-api scope request answers", () => {
     );
   });
 
-  it("signs the default 365-day expiry when there is no live grant to inherit from", async () => {
+  it("signs a perpetual grant by default when there is no live grant to inherit from", async () => {
     const { store, id } = await connectionWithRequest();
     const gateway = gatewayMock(null);
 
@@ -850,15 +850,29 @@ describe("mcp/connection-api scope request answers", () => {
       approveOptions(store, gateway),
     );
 
+    expect(DEFAULT_MCP_GRANT_TTL_SECONDS).toBe(0);
+    expect(gateway.createGrant).toHaveBeenCalledWith(
+      expect.objectContaining({ expiresAt: "0" }),
+    );
+  });
+
+  it("signs a configured 365-day expiry when there is no live grant to inherit from", async () => {
+    const { store, id } = await connectionWithRequest();
+    const gateway = gatewayMock(null);
+
+    await approveMcpScopeAccessRequest(
+      { connectionId: id, scopes: ["spotify.profile"] },
+      { ...approveOptions(store, gateway), grantTtlSeconds: 365 * 24 * 3600 },
+    );
+
     const expected =
-      Math.floor(Date.parse(DECIDED_AT) / 1000) + DEFAULT_MCP_GRANT_TTL_SECONDS;
-    expect(DEFAULT_MCP_GRANT_TTL_SECONDS).toBe(365 * 24 * 60 * 60);
+      Math.floor(Date.parse(DECIDED_AT) / 1000) + 365 * 24 * 3600;
     expect(gateway.createGrant).toHaveBeenCalledWith(
       expect.objectContaining({ expiresAt: String(expected) }),
     );
   });
 
-  it("signs the default expiry when the only live grant was revoked", async () => {
+  it("signs the configured expiry when the only live grant was revoked", async () => {
     const { store, id } = await connectionWithRequest();
     const gateway = gatewayMock(
       liveGrant({
@@ -1170,8 +1184,12 @@ describe("mcpGrantDefaultExpiry", () => {
   const now = () => new Date("2026-10-08T00:00:00.000Z");
   const nowSeconds = Math.floor(now().getTime() / 1000);
 
-  it("defaults to 365 days from now", () => {
-    expect(mcpGrantDefaultExpiry(undefined, now)).toBe(
+  it("defaults to perpetual (no expiry), as before the option existed", () => {
+    expect(mcpGrantDefaultExpiry(undefined, now)).toBeUndefined();
+  });
+
+  it("gives 365 days from now when configured for a year", () => {
+    expect(mcpGrantDefaultExpiry(365 * 24 * 60 * 60, now)).toBe(
       nowSeconds + 365 * 24 * 60 * 60,
     );
   });
