@@ -221,6 +221,12 @@ export interface PsLiteRuntimeOptions {
    */
   mcpScopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
   /**
+   * Lifetime in seconds of grants this runtime signs itself for MCP
+   * connections (OAuth approve, scope-request approve with no live grant to
+   * inherit an expiry from). Unset or 0 signs perpetual grants (the default).
+   */
+  mcpGrantTtlSeconds?: number;
+  /**
    * Optional diagnostics recorder. When provided, GET /v1/diagnostics (owner-only)
    * returns a structured snapshot useful for debugging stuck approval pages.
    */
@@ -1319,6 +1325,7 @@ export function createPsLiteRuntime(
               (DataPortabilityGatewayConfig & { url?: string }) | undefined,
             serverOwner: options.serverOwner ?? options.identity?.address,
             serverSigner: options.serverSigner,
+            grantTtlSeconds: options.mcpGrantTtlSeconds,
             activityRecorder,
           });
           if (mcpResponse) return mcpResponse;
@@ -1357,6 +1364,7 @@ async function handleMcpRoute(input: {
   gatewayConfig?: (DataPortabilityGatewayConfig & { url?: string }) | null;
   serverOwner?: `0x${string}`;
   serverSigner?: Pick<ServerSigner, "signGrantRegistration">;
+  grantTtlSeconds?: number;
   activityRecorder?: McpActivityRecorder;
 }): Promise<Response | null> {
   const pathname = input.url.pathname;
@@ -1616,6 +1624,7 @@ async function handleMcpRoute(input: {
               serverOwner: input.serverOwner,
               serverSigner: input.serverSigner,
               now: input.now,
+              grantTtlSeconds: input.grantTtlSeconds,
             },
           );
           return jsonResponse({ redirectTo: approved.redirectTo });
@@ -1859,6 +1868,7 @@ async function handleMcpRoute(input: {
           serverOwner: input.serverOwner,
           serverSigner: input.serverSigner,
           now: input.now,
+          grantTtlSeconds: input.grantTtlSeconds,
         },
       );
       finish("succeeded");

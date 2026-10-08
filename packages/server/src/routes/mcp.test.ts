@@ -1058,16 +1058,18 @@ describe("MCP /mcp/:token route", () => {
 describe("MCP OAuth routes", () => {
   let app: Hono;
   let store: McpConnectionStore;
+  let gateway: GatewayClient;
 
-  beforeEach(() => {
+  function buildOAuthApp(extra: { mcpGrantTtlSeconds?: number } = {}) {
     store = createInMemoryMcpConnectionStore();
     const authorizationStore = createInMemoryMcpOAuthAuthorizationStore();
     const grantee = "0x0000000000000000000000000000000000000003" as const;
-    const gateway = makeGatewayForGrantee({ granteeAddress: grantee }).gateway;
+    gateway = makeGatewayForGrantee({ granteeAddress: grantee }).gateway;
     const root = new Hono();
     root.route(
       "/",
       mcpOAuthRoutes({
+        ...extra,
         logger,
         serverOrigin: SERVER_ORIGIN,
         serverOwner: ownerWallet.address,
@@ -1085,6 +1087,117 @@ describe("MCP OAuth routes", () => {
       }),
     );
     app = root;
+  }
+
+  beforeEach(() => buildOAuthApp());
+
+  async function pendingAuthorizationId(): Promise<string> {
+    const register = await app.request("/mcp/oauth/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_name: "Claude",
+        redirect_uris: [CLAUDE_REDIRECT_URI],
+      }),
+    });
+    const registered = await register.json();
+    const authorize = await app.request(
+      `/mcp/oauth/authorize?${new URLSearchParams({
+        response_type: "code",
+        client_id: registered.client_id,
+        redirect_uri: CLAUDE_REDIRECT_URI,
+        code_challenge: await pkceChallenge("grant-expiry-verifier"),
+        code_challenge_method: "S256",
+        scope: "vana:read",
+      })}`,
+    );
+    return new URL(authorize.headers.get("location")!).searchParams.get(
+      "mcp_authorization",
+    )!;
+  }
+
+  describe("grant expiry on approve", () => {
+    const NOW = new Date("2026-10-08T12:00:00.000Z");
+    const nowSeconds = Math.floor(NOW.getTime() / 1000);
+
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(NOW);
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("signs a perpetual grant by default, as before the option existed", async () => {
+      const authorizationId = await pendingAuthorizationId();
+      const res = await ownerRequest(
+        "POST",
+        `/v1/mcp/oauth/authorizations/${authorizationId}/approve`,
+        { scopes: ["chatgpt.history"] },
+      );
+      expect(res.status).toBe(200);
+      expect(gateway.createGrant).toHaveBeenCalledWith(
+        expect.objectContaining({
+          scopes: ["chatgpt.history"],
+          expiresAt: "0",
+        }),
+      );
+    });
+
+    it("signs a 365-day expiry when mcpGrantTtlSeconds is a year", async () => {
+      buildOAuthApp({ mcpGrantTtlSeconds: 365 * 24 * 60 * 60 });
+      const authorizationId = await pendingAuthorizationId();
+      const res = await ownerRequest(
+        "POST",
+        `/v1/mcp/oauth/authorizations/${authorizationId}/approve`,
+        { scopes: ["chatgpt.history"] },
+      );
+      expect(res.status).toBe(200);
+      expect(gateway.createGrant).toHaveBeenCalledWith(
+        expect.objectContaining({
+          scopes: ["chatgpt.history"],
+          expiresAt: String(nowSeconds + 365 * 24 * 60 * 60),
+        }),
+      );
+    });
+
+    it("uses mcpGrantTtlSeconds when configured, 0 meaning perpetual", async () => {
+      buildOAuthApp({ mcpGrantTtlSeconds: 7 * 24 * 60 * 60 });
+      let authorizationId = await pendingAuthorizationId();
+      await ownerRequest(
+        "POST",
+        `/v1/mcp/oauth/authorizations/${authorizationId}/approve`,
+        { scopes: ["chatgpt.history"] },
+      );
+      expect(gateway.createGrant).toHaveBeenCalledWith(
+        expect.objectContaining({
+          expiresAt: String(nowSeconds + 7 * 24 * 60 * 60),
+        }),
+      );
+
+      buildOAuthApp({ mcpGrantTtlSeconds: 0 });
+      authorizationId = await pendingAuthorizationId();
+      await ownerRequest(
+        "POST",
+        `/v1/mcp/oauth/authorizations/${authorizationId}/approve`,
+        { scopes: ["chatgpt.history"] },
+      );
+      expect(gateway.createGrant).toHaveBeenCalledWith(
+        expect.objectContaining({ expiresAt: "0" }),
+      );
+    });
+
+    it("keeps an explicit expiresAt from the approve body", async () => {
+      const authorizationId = await pendingAuthorizationId();
+      await ownerRequest(
+        "POST",
+        `/v1/mcp/oauth/authorizations/${authorizationId}/approve`,
+        { scopes: ["chatgpt.history"], expiresAt: 1900000000 },
+      );
+      expect(gateway.createGrant).toHaveBeenCalledWith(
+        expect.objectContaining({ expiresAt: "1900000000" }),
+      );
+    });
   });
 
   async function ownerRequest(

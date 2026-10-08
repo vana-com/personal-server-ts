@@ -122,6 +122,12 @@ export interface AppDeps {
    * Off-by-default to keep dev / test setups frictionless.
    */
   paymentEnabled?: boolean;
+  /**
+   * Lifetime in seconds of grants the server signs itself for MCP
+   * connections (OAuth approve, scope-request approve with no live grant).
+   * Unset or 0 signs perpetual grants (the default).
+   */
+  mcpGrantTtlSeconds?: number;
   /** Derivative data: gateway lineage access for the data routes. */
   lineageGateway?: LineageGatewayPort;
   /**
@@ -378,6 +384,7 @@ export function createApp(deps: AppDeps): Hono {
     gateway: deps.gateway,
     gatewayConfig: deps.gatewayConfig,
     paymentEnabled: deps.paymentEnabled,
+    mcpGrantTtlSeconds: deps.mcpGrantTtlSeconds,
     devToken: deps.devToken,
     accessToken: deps.accessToken,
     tokenStore: deps.tokenStore,
