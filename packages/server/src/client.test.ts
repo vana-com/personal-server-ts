@@ -102,6 +102,30 @@ describe("startPersonalServer node handle", () => {
     );
   });
 
+  it("passes mcpGrantTtlSeconds to the server and rejects a bad one at startup", async () => {
+    const rootPath = await mkdtemp(join(tmpdir(), "ps-client-"));
+    cleanupFns.push(() => rm(rootPath, { recursive: true, force: true }));
+    const port = await getFreePort();
+    const config = ServerConfigSchema.parse({
+      server: { port, origin: `http://localhost:${port}` },
+      logging: { level: "fatal", pretty: false },
+      devUi: { enabled: false },
+      sync: { enabled: false, lastProcessedTimestamp: null },
+      tunnel: { enabled: false },
+    });
+    await expect(
+      startPersonalServer({
+        config,
+        rootPath,
+        ownerSignature: await createOwnerSignature(),
+        gatewayClient: createGateway(),
+        localApproval: false,
+        startBackgroundServices: false,
+        mcpGrantTtlSeconds: -1,
+      }),
+    ).rejects.toThrow(/mcpGrantTtlSeconds/);
+  });
+
   it("starts, reports identity, and prepares registration", async () => {
     const { ps, port } = await startTestServer();
 
