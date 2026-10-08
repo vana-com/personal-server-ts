@@ -56,6 +56,9 @@ import {
   McpConnectionStateError,
   McpOAuthAuthorizationError,
   McpScopeRequestError,
+  MCP_SCOPE_REQUEST_NOT_FOUND,
+  MCP_SCOPE_REQUEST_TOKEN_HEADER,
+  readMcpScopeRequestWithToken,
   redeemMcpOAuthAuthorizationCode,
   refreshMcpOAuthToken,
   requestMcpScopeAccess,
@@ -425,6 +428,27 @@ export function mcpConnectionsRoutes(deps: McpRouteDeps): Hono {
       if (response) return response;
       throw caught;
     }
+  });
+
+  // The pending request, read with the token from its approval link instead
+  // of an owner signature, so the owner signs only to answer. Every failure
+  // is the same 404, so the route does not reveal which requests exist.
+  app.get("/:id/scope-request", async (c) => {
+    const view = await readMcpScopeRequestWithToken(
+      {
+        connectionId: c.req.param("id"),
+        token: c.req.header(MCP_SCOPE_REQUEST_TOKEN_HEADER),
+      },
+      { store },
+    );
+    c.header("Cache-Control", "no-store");
+    if (!view) {
+      return c.json(
+        jsonError(404, MCP_SCOPE_REQUEST_NOT_FOUND, "Scope request not found"),
+        404,
+      );
+    }
+    return c.json(view);
   });
 
   app.post("/:id/approve", async (c) => {

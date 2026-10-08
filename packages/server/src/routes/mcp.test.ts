@@ -33,6 +33,7 @@ import {
   loadMcpGranteeAccount,
   McpActivityRecorder,
   MCP_TOOLS,
+  MCP_SCOPE_REQUEST_TOKEN_HEADER,
   type McpConnectionStore,
   type McpToolContext,
 } from "@opendatalabs/personal-server-ts-core/mcp";
@@ -464,7 +465,12 @@ describe("MCP owner scope-request answers", () => {
       `${APPROVAL_PAGE}?connection=${connectionId}`,
     );
     // The hook learns the public origin so the link can name this server.
-    expect(hookContexts.at(-1)).toEqual({ serverOrigin: SERVER_ORIGIN });
+    // The hook learns the public origin so the link can name this server,
+    // and the read token the link carries in its fragment.
+    expect(hookContexts.at(-1)).toEqual({
+      serverOrigin: SERVER_ORIGIN,
+      readToken: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
+    });
 
     const list = await ownerRequest("GET", "/v1/mcp/connections");
     const [view] = (await list.json()).connections;
@@ -659,6 +665,108 @@ describe("MCP owner scope-request answers", () => {
     expect(record?.grants).toEqual([
       { grantId: "grant-1", scopes: ["instagram.profile"] },
     ]);
+  });
+
+  function lastReadToken(): string {
+    const context = hookContexts.at(-1) as { readToken?: string } | undefined;
+    if (!context?.readToken) throw new Error("hook got no read token");
+    return context.readToken;
+  }
+
+  function tokenRead(connectionId: string, token?: string) {
+    return app.request(`/v1/mcp/connections/${connectionId}/scope-request`, {
+      headers: token ? { [MCP_SCOPE_REQUEST_TOKEN_HEADER]: token } : {},
+    });
+  }
+
+  it("GET /:id/scope-request loads the pending request with the link token and no signature", async () => {
+    const { connectionId } = await connectionWithRequest();
+    const res = await tokenRead(connectionId, lastReadToken());
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+    const view = await res.json();
+    expect(view).toEqual({
+      id: connectionId,
+      displayName: "Claude",
+      scopeAccessRequest: {
+        scopes: ["chatgpt.conversations", "spotify.profile"],
+        reason: "Answer from chats and music.",
+        requestedAt: expect.any(String),
+      },
+      grantedScopes: ["instagram.profile"],
+    });
+
+    // The hash never leaves the server, on any view.
+    expect(
+      (await store.getById(connectionId))?.scopeAccessRequest?.readTokenHash,
+    ).toMatch(/^[0-9a-f]{64}$/);
+    const owner = await (
+      await ownerRequest("GET", `/v1/mcp/connections/${connectionId}`)
+    ).json();
+    expect(Object.keys(owner.scopeAccessRequest).sort()).toEqual([
+      "reason",
+      "requestedAt",
+      "scopes",
+    ]);
+  });
+
+  it("GET /:id/scope-request answers one 404 for a wrong, missing or misplaced token", async () => {
+    const first = await connectionWithRequest();
+    const firstToken = lastReadToken();
+    const second = await connectionWithRequest();
+    const answers = [
+      await tokenRead(first.connectionId, `${firstToken.slice(0, -1)}x`),
+      await tokenRead(first.connectionId),
+      await tokenRead(first.connectionId, "a".repeat(500)),
+      // A real token only opens its own connection's request.
+      await tokenRead(second.connectionId, firstToken),
+      await tokenRead("not-a-connection", firstToken),
+    ];
+    for (const res of answers) {
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({
+        error: {
+          code: 404,
+          errorCode: "MCP_SCOPE_REQUEST_NOT_FOUND",
+          message: "Scope request not found",
+        },
+      });
+    }
+  });
+
+  it("GET /:id/scope-request stops working once the request is answered or replaced", async () => {
+    const { connectionId, connectionToken } = await connectionWithRequest();
+    const firstToken = lastReadToken();
+
+    // Asking again writes a new request with a new token; the old link dies.
+    await callTool(connectionToken, "request_scope_access", {
+      scopes: ["github.profile"],
+    });
+    const secondToken = lastReadToken();
+    expect(secondToken).not.toBe(firstToken);
+    expect((await tokenRead(connectionId, firstToken)).status).toBe(404);
+    expect((await tokenRead(connectionId, secondToken)).status).toBe(200);
+
+    await ownerRequest(
+      "POST",
+      `/v1/mcp/connections/${connectionId}/scope-request/deny`,
+    );
+    expect((await tokenRead(connectionId, secondToken)).status).toBe(404);
+  });
+
+  it("the read token cannot answer the request", async () => {
+    const { connectionId } = await connectionWithRequest();
+    const res = await app.request(
+      `/v1/mcp/connections/${connectionId}/scope-request/deny`,
+      {
+        method: "POST",
+        headers: { [MCP_SCOPE_REQUEST_TOKEN_HEADER]: lastReadToken() },
+      },
+    );
+    expect(res.status).toBe(401);
+    expect(
+      (await store.getById(connectionId))?.scopeAccessRequest,
+    ).toBeDefined();
   });
 });
 

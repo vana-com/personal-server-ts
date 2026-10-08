@@ -31,6 +31,27 @@ describe("buildMcpScopeRequestApprovalUrl", () => {
     );
   });
 
+  it("carries the read token in the fragment, never the query", () => {
+    const link =
+      buildMcpScopeRequestApprovalUrl({
+        connectionId: "conn-1",
+        serverOrigin: "https://abc123.server.vana.org",
+        readToken: "tok_abc-123",
+      }) ?? "";
+    expect(link).toBe(
+      "https://app.vana.org/mcp/requests/conn-1?ps_origin=https%3A%2F%2Fabc123.server.vana.org#t=tok_abc-123",
+    );
+    const url = new URL(link);
+    expect(new URLSearchParams(url.hash.slice(1)).get("t")).toBe("tok_abc-123");
+    expect(url.search).not.toContain("tok_abc-123");
+    expect(
+      vanaWebMcpScopeRequestApprovalUrl()("conn-1", {
+        serverOrigin: "https://abc123.server.vana.org",
+        readToken: "tok_abc-123",
+      }),
+    ).toBe(link);
+  });
+
   it("gives no link for a server the page cannot reach", () => {
     for (const serverOrigin of [
       undefined,

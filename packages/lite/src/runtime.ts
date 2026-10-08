@@ -86,6 +86,9 @@ import {
   listMcpConnectionViews,
   loadMcpGranteeAccount,
   MCP_CONNECTION_NOT_FOUND,
+  MCP_SCOPE_REQUEST_NOT_FOUND,
+  MCP_SCOPE_REQUEST_TOKEN_HEADER,
+  readMcpScopeRequestWithToken,
   getMcpConnectionView,
   McpConnectionNotFoundError,
   McpConnectionStateError,
@@ -1648,6 +1651,38 @@ async function handleMcpRoute(input: {
       }
     }
     return errorResponse(404, "NOT_FOUND", "Not found");
+  }
+
+  // GET /v1/mcp/connections/:id/scope-request: the pending request, read
+  // with the token from its approval link instead of an owner signature, so
+  // the owner signs only to answer. Every failure is the same 404, so the
+  // route does not reveal which requests exist.
+  const scopeRequestRead =
+    /^\/v1\/mcp\/connections\/([^/]+)\/scope-request$/u.exec(pathname);
+  if (scopeRequestRead && input.request.method === "GET") {
+    let connectionId = "";
+    try {
+      connectionId = decodeURIComponent(scopeRequestRead[1] ?? "");
+    } catch {
+      connectionId = "";
+    }
+    const view = await readMcpScopeRequestWithToken(
+      {
+        connectionId,
+        token: input.request.headers.get(MCP_SCOPE_REQUEST_TOKEN_HEADER),
+      },
+      { store: input.store, now: input.now },
+    );
+    if (!view) {
+      const notFound = errorResponse(
+        404,
+        MCP_SCOPE_REQUEST_NOT_FOUND,
+        "Scope request not found",
+      );
+      notFound.headers.set("Cache-Control", "no-store");
+      return notFound;
+    }
+    return jsonResponse(view, { headers: { "Cache-Control": "no-store" } });
   }
 
   // Owner management endpoints
