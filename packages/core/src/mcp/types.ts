@@ -34,7 +34,23 @@ export interface McpScopeAccessRequest {
   scopes: string[];
   reason?: string;
   requestedAt: string;
+  /**
+   * SHA-256 hex of the read token carried in this request's approval link.
+   * The raw token is handed to the agent once (inside the link's fragment)
+   * and lets the owner's page load this request without a signature. Stored
+   * on the request so answering or replacing the request drops it. Never
+   * returned by any view.
+   */
+  readTokenHash?: string;
+  /** ISO expiry of the read token. Absent or past means the token is dead. */
+  readTokenExpiresAt?: string;
 }
+
+/** What a scope request looks like outside the server: no read token. */
+export type McpScopeAccessRequestView = Pick<
+  McpScopeAccessRequest,
+  "scopes" | "reason" | "requestedAt"
+>;
 
 /**
  * The owner's answer to the last `scopeAccessRequest`, kept so the MCP client

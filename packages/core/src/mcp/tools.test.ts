@@ -5,6 +5,7 @@ import { handleMcpStreamableHttpRequest } from "./server.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { McpDataReadClient } from "./read-client.js";
 import { McpDataReadError } from "./read-client.js";
+import { vanaWebMcpScopeRequestApprovalUrl } from "./approval-url.js";
 
 function getTool(name: string) {
   const tool = MCP_TOOLS.find((candidate) => candidate.name === name);
@@ -399,6 +400,47 @@ describe("mcp/tools", () => {
       });
       expect(body.nextAction).toContain(url);
       expect(body.nextAction).toContain("tell you when they are done");
+    });
+
+    it("puts the request's read token in the Vana Web link fragment", async () => {
+      const connection = createConnection();
+      const requestScopeAccess = vi.fn().mockResolvedValue({
+        connection: {
+          ...connection,
+          scopeAccessRequest: {
+            scopes: ["chatgpt.conversations"],
+            requestedAt: "2026-10-07T10:00:00.000Z",
+            readTokenHash: "a".repeat(64),
+            readTokenExpiresAt: "2026-10-08T10:00:00.000Z",
+          },
+        },
+        requestRecorded: true,
+        readToken: "tok_abc-123",
+      });
+      const hook = vi.fn(vanaWebMcpScopeRequestApprovalUrl());
+      const result = await getTool("request_scope_access").handler(
+        { scopes: ["chatgpt.conversations"] },
+        {
+          connection,
+          readClient: createMinimalReadClient(),
+          requestScopeAccess,
+          scopeRequestApprovalUrl: hook,
+          serverOrigin: "https://ps.example.com",
+        },
+      );
+
+      expect(hook).toHaveBeenCalledWith("conn-1", {
+        serverOrigin: "https://ps.example.com",
+        readToken: "tok_abc-123",
+      });
+      const text = result.content[0].text;
+      const body = JSON.parse(text);
+      expect(body.approvalUrl).toBe(
+        "https://app.vana.org/mcp/requests/conn-1?ps_origin=https%3A%2F%2Fps.example.com#t=tok_abc-123",
+      );
+      const url = new URL(body.approvalUrl);
+      expect(url.search).not.toContain("tok_abc-123");
+      expect(text).not.toContain("readTokenHash");
     });
 
     it("keeps the Vana wording and no approvalUrl without a hook", async () => {
@@ -1823,6 +1865,31 @@ describe("mcp/tools", () => {
     expect(byScope["chatgpt.history"].recommendedAccess).toBe("search");
     expect(byScope["chatgpt.history"].sizeClass).toBe("huge");
     expect(byScope["chatgpt.history"].reason).toBeDefined();
+  });
+
+  it("list_granted_scopes shows the pending request without its read token", async () => {
+    const result = await getTool("list_granted_scopes").handler(
+      {},
+      {
+        connection: {
+          ...createConnection(),
+          scopeAccessRequest: {
+            scopes: ["chatgpt.conversations"],
+            reason: "Use chats.",
+            requestedAt: "2026-10-07T10:00:00.000Z",
+            readTokenHash: "a".repeat(64),
+            readTokenExpiresAt: "2026-10-08T10:00:00.000Z",
+          },
+        },
+        readClient: createMinimalReadClient(),
+      },
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.pendingScopeRequest).toEqual({
+      scopes: ["chatgpt.conversations"],
+      reason: "Use chats.",
+      requestedAt: "2026-10-07T10:00:00.000Z",
+    });
   });
 
   it("list_granted_scopes marks scope as needs_refresh when no local data", async () => {

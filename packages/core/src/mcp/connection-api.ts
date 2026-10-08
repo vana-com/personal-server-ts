@@ -12,6 +12,12 @@
  *   POST   /v1/mcp/connections/:id/scope-request/approve
  *   POST   /v1/mcp/connections/:id/scope-request/deny
  *
+ * and one read that is NOT owner-signed, because the owner's page needs it
+ * before it asks for any signature:
+ *
+ *   GET    /v1/mcp/connections/:id/scope-request
+ *          (header `X-Vana-Scope-Request-Token`, from the approval link)
+ *
  * These endpoints DO NOT read user data. They only manage connection records
  * — create the per-connection grantee/token, store grant ids after the user
  * approves them, and mark connections revoked.
@@ -36,6 +42,7 @@ import type {
   McpConnectionGrant,
   McpScopeAccessDecision,
   McpScopeAccessRequest,
+  McpScopeAccessRequestView,
   McpOAuthAuthorizationRecord,
   McpOAuthAuthorizationStore,
 } from "./types.js";
@@ -49,6 +56,26 @@ import {
 
 const TOKEN_BYTES = 32;
 const OAUTH_AUTHORIZATION_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Request header carrying the scope-request read token. The token travels in
+ * the approval link's URL fragment, so the page reads it client-side and
+ * sends it here; it never reaches a web server log or a Referer.
+ */
+export const MCP_SCOPE_REQUEST_TOKEN_HEADER = "X-Vana-Scope-Request-Token";
+
+/**
+ * errorCode for every failed token read: unknown connection, nothing
+ * pending, wrong, missing or expired token. One answer for all of them, so
+ * the route does not reveal which connections or requests exist.
+ */
+export const MCP_SCOPE_REQUEST_NOT_FOUND = "MCP_SCOPE_REQUEST_NOT_FOUND";
+
+/** How long an approval link can load its request without a signature. */
+export const MCP_SCOPE_REQUEST_READ_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** 32 random bytes encode to 43 base64url chars; anything far longer is junk. */
+const MAX_READ_TOKEN_CHARS = 128;
 
 /** Store patch that drops every refresh token a connection still answers to. */
 const CLEARED_REFRESH_FAMILY = {
@@ -238,6 +265,8 @@ export async function approveMcpConnection(
     const remainingRequestScopes = pendingRequest?.scopes.filter(
       (scope) => !input.grants.some((grant) => grantCoversScope(grant, scope)),
     );
+    // A narrowed request is a different request: its old link stops loading
+    // it (the read token is dropped) and the page falls back to a signed read.
     return {
       ...existing,
       status: "approved",
@@ -247,7 +276,10 @@ export async function approveMcpConnection(
         pendingRequest &&
         remainingRequestScopes &&
         remainingRequestScopes.length > 0
-          ? { ...pendingRequest, scopes: remainingRequestScopes }
+          ? {
+              ...toMcpScopeAccessRequestView(pendingRequest),
+              scopes: remainingRequestScopes,
+            }
           : undefined,
     };
   });
@@ -264,14 +296,28 @@ function grantCoversScope(grant: McpConnectionGrant, scope: string): boolean {
   );
 }
 
+export interface RequestMcpScopeAccessOutput {
+  connection: McpConnectionRecord;
+  requestRecorded: boolean;
+  /**
+   * Raw read token for the request just written, returned ONCE so it can go
+   * into the approval link; the record keeps only its hash. Absent when the
+   * request was not (re)written. Every write mints a new token and kills the
+   * previous one.
+   */
+  readToken?: string;
+}
+
 export async function requestMcpScopeAccess(
   input: { connectionId: string; scopes: string[]; reason?: string },
   options: { store: McpConnectionStore; now?: () => Date },
-): Promise<{
-  connection: McpConnectionRecord;
-  requestRecorded: boolean;
-}> {
+): Promise<RequestMcpScopeAccessOutput> {
   const requestedAt = nowIso(options.now);
+  const readToken = randomToken();
+  const readTokenHash = await hashConnectionToken(readToken);
+  const readTokenExpiresAt = new Date(
+    nowMs(options.now) + MCP_SCOPE_REQUEST_READ_TOKEN_TTL_MS,
+  ).toISOString();
   const inputScopes = Array.from(
     new Set(input.scopes.map((scope) => scope.trim()).filter(Boolean)),
   ).sort();
@@ -301,6 +347,8 @@ export async function requestMcpScopeAccess(
       scopes,
       ...(reason ? { reason } : {}),
       requestedAt,
+      readTokenHash,
+      readTokenExpiresAt,
     };
     return { ...existing, scopeAccessRequest: request };
   });
@@ -315,6 +363,64 @@ export async function requestMcpScopeAccess(
       missingInputScopes.every((scope) =>
         updated.scopeAccessRequest?.scopes.includes(scope),
       ),
+    ...(updated.scopeAccessRequest?.readTokenHash === readTokenHash
+      ? { readToken }
+      : {}),
+  };
+}
+
+/**
+ * What a holder of the approval link may see without signing: who is asking,
+ * for what, and what it already has. Nothing that identifies the grantee or
+ * the connection's tokens.
+ */
+export interface McpScopeRequestReadView {
+  id: string;
+  displayName: string;
+  scopeAccessRequest: McpScopeAccessRequestView;
+  grantedScopes: string[];
+}
+
+/** Constant-time equality for two hex digests of the same algorithm. */
+function digestsEqual(a: string, b: string): boolean {
+  let diff = a.length ^ b.length;
+  const length = Math.max(a.length, b.length);
+  for (let i = 0; i < length; i += 1) {
+    diff |= (a.charCodeAt(i) | 0) ^ (b.charCodeAt(i) | 0);
+  }
+  return diff === 0;
+}
+
+/**
+ * Load one pending scope request with the read token from its approval link.
+ * Returns null for an unknown or non-approved connection, no pending request,
+ * a request without a token, a wrong or missing token, or an expired one, so
+ * a caller can answer all of them the same way.
+ */
+export async function readMcpScopeRequestWithToken(
+  input: { connectionId: string; token: string | null | undefined },
+  options: { store: McpConnectionStore; now?: () => Date },
+): Promise<McpScopeRequestReadView | null> {
+  const token = input.token?.trim() ?? "";
+  if (!token || token.length > MAX_READ_TOKEN_CHARS || !input.connectionId) {
+    return null;
+  }
+  const presentedHash = await hashConnectionToken(token);
+  const record = await options.store.getById(input.connectionId);
+  const request = record?.scopeAccessRequest;
+  if (!record || record.status !== "approved" || !request) return null;
+  if (!request.readTokenHash || !request.readTokenExpiresAt) return null;
+  if (!digestsEqual(presentedHash, request.readTokenHash)) return null;
+  const expiresAt = Date.parse(request.readTokenExpiresAt);
+  if (!Number.isFinite(expiresAt) || expiresAt <= nowMs(options.now)) {
+    return null;
+  }
+  if (request.scopes.length === 0) return null;
+  return {
+    id: record.id,
+    displayName: record.displayName,
+    scopeAccessRequest: toMcpScopeAccessRequestView(request),
+    grantedScopes: sortedUnique(record.grants.flatMap((grant) => grant.scopes)),
   };
 }
 
@@ -647,13 +753,24 @@ export interface McpConnectionView {
   /** Every scope the connection's grants cover, deduplicated and sorted. */
   grantedScopes: string[];
   /** Scopes the MCP client is still asking for, if any. */
-  scopeAccessRequest?: McpScopeAccessRequest;
+  scopeAccessRequest?: McpScopeAccessRequestView;
   /** Owner's answer to the most recent scope request. */
   scopeAccessDecision?: McpScopeAccessDecision;
   createdAt: string;
   approvedAt?: string;
   revokedAt?: string;
   lastUsedAt?: string;
+}
+
+/** A scope request without its read token, for anything that leaves the server. */
+export function toMcpScopeAccessRequestView(
+  request: McpScopeAccessRequest,
+): McpScopeAccessRequestView {
+  return {
+    scopes: request.scopes,
+    ...(request.reason !== undefined ? { reason: request.reason } : {}),
+    requestedAt: request.requestedAt,
+  };
 }
 
 export function toMcpConnectionView(
@@ -666,7 +783,9 @@ export function toMcpConnectionView(
     status: record.status,
     grants: record.grants,
     grantedScopes: sortedUnique(record.grants.flatMap((grant) => grant.scopes)),
-    scopeAccessRequest: record.scopeAccessRequest,
+    scopeAccessRequest: record.scopeAccessRequest
+      ? toMcpScopeAccessRequestView(record.scopeAccessRequest)
+      : undefined,
     scopeAccessDecision: record.scopeAccessDecision,
     createdAt: record.createdAt,
     approvedAt: record.approvedAt,

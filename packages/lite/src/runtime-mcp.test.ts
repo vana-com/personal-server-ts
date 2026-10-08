@@ -36,6 +36,8 @@ import {
   hashConnectionToken,
   loadMcpGranteeAccount,
   MCP_TOOLS,
+  MCP_SCOPE_REQUEST_TOKEN_HEADER,
+  vanaWebMcpScopeRequestApprovalUrl,
   type McpConnectionStore,
   type McpToolContext,
 } from "@opendatalabs/personal-server-ts-core/mcp";
@@ -543,6 +545,55 @@ describe("createPsLiteRuntime + scope-request answers", () => {
     expect((await unknown.json()).error.errorCode).toBe(
       "MCP_CONNECTION_NOT_FOUND",
     );
+  });
+  it("loads the request with the link token and no signature, until answered", async () => {
+    const bundle = buildRuntime({
+      grantId: "grant-mcp-1",
+      scopeRequestApprovalUrl: vanaWebMcpScopeRequestApprovalUrl(),
+    });
+    const { id, tool } = await requested(bundle);
+    const link = new URL(tool.approvalUrl);
+    expect(link.search).not.toContain("t=");
+    const token = new URLSearchParams(link.hash.slice(1)).get("t") ?? "";
+    expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+
+    const read = (value?: string, connectionId = id) =>
+      bundle.runtime.fetch(
+        new Request(
+          `${SERVER_ORIGIN}/v1/mcp/connections/${connectionId}/scope-request`,
+          {
+            headers: value ? { [MCP_SCOPE_REQUEST_TOKEN_HEADER]: value } : {},
+          },
+        ),
+      );
+    const ok = await read(token);
+    expect(ok.status).toBe(200);
+    expect(ok.headers.get("Cache-Control")).toBe("no-store");
+    expect(await ok.json()).toEqual({
+      id,
+      displayName: "Claude",
+      scopeAccessRequest: {
+        scopes: ["chatgpt.history", "spotify.profile"],
+        requestedAt: expect.any(String),
+      },
+      grantedScopes: ["instagram.profile"],
+    });
+
+    for (const res of [
+      await read(),
+      await read(`${token.slice(0, -1)}x`),
+      await read(token, "nope"),
+    ]) {
+      expect(res.status).toBe(404);
+      expect((await res.json()).error.errorCode).toBe(
+        "MCP_SCOPE_REQUEST_NOT_FOUND",
+      );
+    }
+
+    await bundle.runtime.fetch(
+      await ownerSigned("POST", `/v1/mcp/connections/${id}/scope-request/deny`),
+    );
+    expect((await read(token)).status).toBe(404);
   });
 });
 

@@ -20,13 +20,16 @@ import {
   denyMcpScopeAccessRequest,
   hashConnectionToken,
   listMcpConnectionViews,
+  MCP_SCOPE_REQUEST_READ_TOKEN_TTL_MS,
   McpConnectionNotFoundError,
   McpConnectionStateError,
   McpScopeRequestError,
   redeemMcpOAuthAuthorizationCode,
   refreshMcpOAuthToken,
+  readMcpScopeRequestWithToken,
   requestMcpScopeAccess,
   revokeMcpConnection,
+  toMcpConnectionView,
 } from "./connection-api.js";
 import { MCP_REFRESH_TTL_MS, MCP_TOKEN_TTL_MS } from "./token-expiry.js";
 import { ensureMcpGranteeRegistered } from "./builder-registration.js";
@@ -913,5 +916,147 @@ describe("mcp/connection-api scope request answers", () => {
     await expect(
       denyMcpScopeAccessRequest({ connectionId: "nope" }, { store }),
     ).rejects.toBeInstanceOf(McpConnectionNotFoundError);
+  });
+});
+
+describe("mcp/connection-api scope request read token", () => {
+  const T0 = new Date("2026-10-07T10:00:00.000Z");
+
+  async function connectionWithRequest() {
+    const store = createInMemoryMcpConnectionStore();
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store, publicOrigin: PUBLIC_ORIGIN },
+    );
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "g1", scopes: ["instagram.profile"] }],
+      },
+      { store },
+    );
+    const requested = await requestMcpScopeAccess(
+      {
+        connectionId: created.connectionId,
+        scopes: ["chatgpt.history", "spotify.profile"],
+        reason: "Answer from prior chats and music.",
+      },
+      { store, now: () => T0 },
+    );
+    return { store, connectionId: created.connectionId, requested };
+  }
+
+  it("mints a 256-bit token, returns it once and stores only its hash", async () => {
+    const { store, connectionId, requested } = await connectionWithRequest();
+    expect(requested.readToken).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    const record = await store.getById(connectionId);
+    expect(record?.scopeAccessRequest?.readTokenHash).toBe(
+      await hashConnectionToken(requested.readToken ?? ""),
+    );
+    expect(record?.scopeAccessRequest?.readTokenExpiresAt).toBe(
+      new Date(
+        T0.getTime() + MCP_SCOPE_REQUEST_READ_TOKEN_TTL_MS,
+      ).toISOString(),
+    );
+    expect(JSON.stringify(record)).not.toContain(requested.readToken);
+    // Owner views never carry the hash or expiry.
+    expect(toMcpConnectionView(record!).scopeAccessRequest).not.toHaveProperty(
+      "readTokenHash",
+    );
+  });
+
+  it("reads a minimal view with the token until it expires", async () => {
+    const { store, connectionId, requested } = await connectionWithRequest();
+    const read = (at: number, token = requested.readToken) =>
+      readMcpScopeRequestWithToken(
+        { connectionId, token },
+        { store, now: () => new Date(at) },
+      );
+    const view = await read(T0.getTime());
+    expect(view).toEqual({
+      id: connectionId,
+      displayName: "Claude",
+      scopeAccessRequest: {
+        scopes: ["chatgpt.history", "spotify.profile"],
+        reason: "Answer from prior chats and music.",
+        requestedAt: T0.toISOString(),
+      },
+      grantedScopes: ["instagram.profile"],
+    });
+    const expiry = T0.getTime() + MCP_SCOPE_REQUEST_READ_TOKEN_TTL_MS;
+    expect(await read(expiry - 1)).not.toBeNull();
+    expect(await read(expiry)).toBeNull();
+    expect(await read(T0.getTime(), "")).toBeNull();
+    expect(await read(T0.getTime(), null as unknown as string)).toBeNull();
+    expect(await read(T0.getTime(), "wrong")).toBeNull();
+  });
+
+  it("dies when the request is denied, narrowed, replaced, or the connection is revoked", async () => {
+    const denied = await connectionWithRequest();
+    await denyMcpScopeAccessRequest(
+      { connectionId: denied.connectionId },
+      { store: denied.store },
+    );
+    expect(
+      await readMcpScopeRequestWithToken(
+        {
+          connectionId: denied.connectionId,
+          token: denied.requested.readToken,
+        },
+        { store: denied.store, now: () => T0 },
+      ),
+    ).toBeNull();
+
+    const narrowed = await connectionWithRequest();
+    await approveMcpConnection(
+      {
+        connectionId: narrowed.connectionId,
+        grants: [
+          { grantId: "g1", scopes: ["instagram.profile"] },
+          { grantId: "g2", scopes: ["chatgpt.*"] },
+        ],
+      },
+      { store: narrowed.store },
+    );
+    const narrowedRecord = await narrowed.store.getById(narrowed.connectionId);
+    expect(narrowedRecord?.scopeAccessRequest?.scopes).toEqual([
+      "spotify.profile",
+    ]);
+    expect(narrowedRecord?.scopeAccessRequest?.readTokenHash).toBeUndefined();
+
+    const replaced = await connectionWithRequest();
+    const again = await requestMcpScopeAccess(
+      { connectionId: replaced.connectionId, scopes: ["github.profile"] },
+      { store: replaced.store, now: () => T0 },
+    );
+    expect(again.readToken).toBeDefined();
+    expect(again.readToken).not.toBe(replaced.requested.readToken);
+    const readReplaced = (token?: string) =>
+      readMcpScopeRequestWithToken(
+        { connectionId: replaced.connectionId, token },
+        { store: replaced.store, now: () => T0 },
+      );
+    expect(await readReplaced(replaced.requested.readToken)).toBeNull();
+    expect(await readReplaced(again.readToken)).not.toBeNull();
+
+    await revokeMcpConnection(replaced.connectionId, { store: replaced.store });
+    expect(await readReplaced(again.readToken)).toBeNull();
+  });
+
+  it("returns no token when the request is not rewritten, and the old one keeps working", async () => {
+    const { store, connectionId, requested } = await connectionWithRequest();
+    const tooMany = Array.from({ length: 30 }, (_, i) => `github.repo${i}`);
+    const outcome = await requestMcpScopeAccess(
+      { connectionId, scopes: tooMany },
+      { store, now: () => T0 },
+    );
+    expect(outcome.requestRecorded).toBe(false);
+    expect(outcome.readToken).toBeUndefined();
+    expect(
+      await readMcpScopeRequestWithToken(
+        { connectionId, token: requested.readToken },
+        { store, now: () => T0 },
+      ),
+    ).not.toBeNull();
   });
 });

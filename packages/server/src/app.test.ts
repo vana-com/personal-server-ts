@@ -980,6 +980,35 @@ describe("createApp", () => {
       expect(deny.headers.get("Access-Control-Allow-Origin")).toBe("*");
       expect((await deny.json()).error.code).toBe(404);
     });
+    it("lets the page send the scope-request read token cross-origin", async () => {
+      const app = makeApp();
+      const path = "/v1/mcp/connections/conn-1/scope-request";
+      const preflight = await app.request(path, {
+        method: "OPTIONS",
+        headers: {
+          Origin: WEB_ORIGIN,
+          "Access-Control-Request-Method": "GET",
+          "Access-Control-Request-Headers": "x-vana-scope-request-token",
+        },
+      });
+      expect(preflight.status).toBe(204);
+      expect(
+        lowerList(preflight.headers.get("Access-Control-Allow-Headers")),
+      ).toContain("x-vana-scope-request-token");
+
+      // No signature on this read; a wrong token is a readable 404.
+      const read = await app.request(path, {
+        headers: {
+          Origin: WEB_ORIGIN,
+          "X-Vana-Scope-Request-Token": "not-the-token",
+        },
+      });
+      expect(read.status).toBe(404);
+      expect(read.headers.get("Access-Control-Allow-Origin")).toBe("*");
+      expect((await read.json()).error.errorCode).toBe(
+        "MCP_SCOPE_REQUEST_NOT_FOUND",
+      );
+    });
   });
 });
 

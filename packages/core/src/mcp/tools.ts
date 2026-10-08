@@ -17,6 +17,7 @@ import {
 } from "./types.js";
 import type { McpDataReadClient } from "./read-client.js";
 import { McpDataReadError } from "./read-client.js";
+import { toMcpScopeAccessRequestView } from "./connection-api.js";
 import type { McpActivityRecorder } from "./activity.js";
 import type {
   McpScopeRequestApprovalUrlContext,
@@ -37,6 +38,8 @@ export interface McpToolContext {
   requestScopeAccess?(input: { scopes: string[]; reason?: string }): Promise<{
     connection: McpConnectionRecord;
     requestRecorded: boolean;
+    /** Raw read token for the request just written; goes into the link. */
+    readToken?: string;
   }>;
   /**
    * Host-provided page where the owner answers this connection's scope
@@ -740,7 +743,11 @@ const listGrantedScopes: McpToolDefinition = {
     return textResult({
       scopes: scopeEntries,
       ...(connection.scopeAccessRequest
-        ? { pendingScopeRequest: connection.scopeAccessRequest }
+        ? {
+            pendingScopeRequest: toMcpScopeAccessRequestView(
+              connection.scopeAccessRequest,
+            ),
+          }
         : {}),
       ...(connection.scopeAccessDecision
         ? { lastScopeDecision: connection.scopeAccessDecision }
@@ -778,6 +785,7 @@ const requestScopeAccess: McpToolDefinition = {
         connection.scopeAccessRequest?.scopes.includes(scope),
       );
     let requestRecorded = alreadyRecorded;
+    let readToken: string | undefined;
     if (approvalRequired && requestScopeAccess) {
       const outcome = await requestScopeAccess({
         scopes: missingScopes,
@@ -785,6 +793,7 @@ const requestScopeAccess: McpToolDefinition = {
       });
       effectiveConnection = outcome.connection;
       requestRecorded = outcome.requestRecorded;
+      readToken = outcome.readToken;
       grantedRequestedScopes = requestedScopes.filter((scope) =>
         Boolean(resolveGrantForScope(effectiveConnection, scope)),
       );
@@ -797,6 +806,7 @@ const requestScopeAccess: McpToolDefinition = {
     const approvalUrl = recorded
       ? resolveScopeRequestApprovalUrl(scopeRequestApprovalUrl, connection.id, {
           serverOrigin,
+          ...(readToken ? { readToken } : {}),
         })
       : undefined;
     const declinedScopes =
