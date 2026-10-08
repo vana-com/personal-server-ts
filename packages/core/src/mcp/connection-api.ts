@@ -58,6 +58,32 @@ const TOKEN_BYTES = 32;
 const OAUTH_AUTHORIZATION_TTL_MS = 10 * 60 * 1000;
 
 /**
+ * Default lifetime of a grant the server signs itself for an MCP connection
+ * (OAuth approve, or a scope-request approve with no live grant to inherit
+ * an expiry from): 365 days from signing. Hosts override it with
+ * `mcpGrantTtlSeconds`; 0 signs perpetual grants.
+ */
+export const DEFAULT_MCP_GRANT_TTL_SECONDS = 365 * 24 * 60 * 60;
+
+/**
+ * Unix-seconds expiry for a freshly signed MCP grant, or undefined for a
+ * perpetual one (ttl 0).
+ */
+export function mcpGrantDefaultExpiry(
+  ttlSeconds: number | undefined,
+  now?: () => Date,
+): number | undefined {
+  const ttl = ttlSeconds ?? DEFAULT_MCP_GRANT_TTL_SECONDS;
+  if (!Number.isFinite(ttl) || ttl < 0) {
+    throw new RangeError(
+      `mcpGrantTtlSeconds must be a non-negative number, got ${ttlSeconds}`,
+    );
+  }
+  if (ttl === 0) return undefined;
+  return Math.floor(nowMs(now) / 1000) + Math.floor(ttl);
+}
+
+/**
  * Request header carrying the scope-request read token. The token travels in
  * the approval link's URL fragment, so the page reads it client-side and
  * sends it here; it never reaches a web server log or a Referer.
@@ -449,6 +475,12 @@ export interface ApproveMcpScopeAccessRequestOptions {
   serverOwner?: `0x${string}`;
   serverSigner?: Pick<ServerSigner, "signGrantRegistration">;
   now?: () => Date;
+  /**
+   * Lifetime of the re-signed grant when the connection has no live grant
+   * to inherit an expiry from. Defaults to DEFAULT_MCP_GRANT_TTL_SECONDS;
+   * 0 means perpetual. A live grant's expiry (or perpetuity) always wins.
+   */
+  grantTtlSeconds?: number;
 }
 
 export interface ApproveMcpScopeAccessRequestOutput {
@@ -481,6 +513,13 @@ export async function approveMcpScopeAccessRequest(
 
   const live = await readLiveGrantState(connection, options.gateway);
   const grantedScopes = sortedUnique([...live.scopes, ...approvedScopes]);
+  // Keep the live grant's expiry so approval never extends it (a perpetual
+  // live grant stays perpetual). Only a connection with no live grant gets
+  // the default lifetime from now.
+  const expiresAt =
+    live.expiry.kind === "inherit"
+      ? live.expiry.expiresAt
+      : mcpGrantDefaultExpiry(options.grantTtlSeconds, options.now);
 
   let grantResult: Awaited<ReturnType<typeof createGrantContract>>;
   try {
@@ -492,7 +531,7 @@ export async function approveMcpScopeAccessRequest(
         granteeAddress: connection.granteeAddress,
         scopes: grantedScopes,
         grantVersion: live.nextGrantVersion,
-        ...(live.expiresAt !== undefined ? { expiresAt: live.expiresAt } : {}),
+        ...(expiresAt !== undefined ? { expiresAt } : {}),
       },
     });
   } catch (err) {
@@ -639,8 +678,13 @@ interface LiveGrantState {
   /** Scopes the connection holds now: its record plus the live gateway grant. */
   scopes: string[];
   nextGrantVersion: string;
-  /** Unix seconds of the live grant's expiry, carried over so approval never extends it. */
-  expiresAt?: number;
+  /**
+   * The expiry approval must carry over so it never extends access:
+   * `inherit` when a live (unrevoked) grant exists, with its unix-seconds
+   * expiry or undefined when it is perpetual; `none` when there is no live
+   * grant to inherit from.
+   */
+  expiry: { kind: "inherit"; expiresAt?: number } | { kind: "none" };
 }
 
 /**
@@ -659,6 +703,8 @@ async function readLiveGrantState(
   const revoked = new Set<string>();
   const scopes = new Set<string>();
   let maxVersion = 0n;
+  let anyLive = false;
+  let anyPerpetual = false;
   let expiresAt: number | undefined;
   for (const grantId of grantIds) {
     let live: Awaited<ReturnType<typeof gateway.getGrant>>;
@@ -679,8 +725,11 @@ async function readLiveGrantState(
       continue;
     }
     for (const scope of live.scopes) scopes.add(scope);
+    anyLive = true;
     const liveExpiry = parseExpirySeconds(live.expiresAt);
-    if (liveExpiry !== undefined) {
+    if (liveExpiry === undefined) {
+      anyPerpetual = true;
+    } else {
       expiresAt =
         expiresAt === undefined ? liveExpiry : Math.max(expiresAt, liveExpiry);
     }
@@ -692,7 +741,11 @@ async function readLiveGrantState(
   return {
     scopes: sortedUnique(scopes),
     nextGrantVersion: (maxVersion + 1n).toString(),
-    ...(expiresAt !== undefined ? { expiresAt } : {}),
+    expiry: !anyLive
+      ? { kind: "none" }
+      : anyPerpetual
+        ? { kind: "inherit" }
+        : { kind: "inherit", expiresAt },
   };
 }
 
@@ -1031,6 +1084,12 @@ export interface ApproveMcpOAuthAuthorizationScopesOptions extends ApproveMcpOAu
   serverOwner?: `0x${string}`;
   serverSigner?: Pick<ServerSigner, "signGrantRegistration">;
   fetch?: typeof fetch;
+  /**
+   * Lifetime of the signed grant when the approve body names no
+   * `expiresAt`. Defaults to DEFAULT_MCP_GRANT_TTL_SECONDS; 0 means
+   * perpetual.
+   */
+  grantTtlSeconds?: number;
 }
 
 export async function approveMcpOAuthAuthorizationWithScopes(
@@ -1084,6 +1143,9 @@ export async function approveMcpOAuthAuthorizationWithScopes(
     throw err;
   }
 
+  const expiresAt =
+    input.expiresAt ??
+    mcpGrantDefaultExpiry(options.grantTtlSeconds, options.now);
   const grantResult = await createGrantContract({
     gateway: options.gateway,
     serverOwner: options.serverOwner,
@@ -1091,7 +1153,7 @@ export async function approveMcpOAuthAuthorizationWithScopes(
     body: {
       granteeAddress: connection.granteeAddress,
       scopes: input.scopes,
-      ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
+      ...(expiresAt !== undefined ? { expiresAt } : {}),
       ...(input.nonce !== undefined ? { nonce: input.nonce } : {}),
     },
   });

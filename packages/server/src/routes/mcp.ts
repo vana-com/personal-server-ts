@@ -120,6 +120,12 @@ export interface McpRouteDeps {
    * The owner/OAuth connection path is always free regardless of this flag.
    */
   paymentEnabled?: boolean;
+  /**
+   * Lifetime in seconds of grants this server signs itself for MCP
+   * connections when there is no live grant expiry to keep. Defaults to
+   * 365 days; 0 signs perpetual grants.
+   */
+  mcpGrantTtlSeconds?: number;
   devToken?: string;
   accessToken?: string;
   tokenStore?: TokenStore;
@@ -524,6 +530,7 @@ export function mcpConnectionsRoutes(deps: McpRouteDeps): Hono {
           gateway: deps.gateway,
           serverOwner: deps.serverOwner,
           serverSigner: deps.serverSigner,
+          grantTtlSeconds: deps.mcpGrantTtlSeconds,
         },
       );
       if (activityId) {
@@ -615,6 +622,7 @@ export type McpOAuthRouteDeps = Pick<
   | "tokenStore"
   | "gatewayConfig"
   | "serverSigner"
+  | "mcpGrantTtlSeconds"
 >;
 
 export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
@@ -894,6 +902,7 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
             gatewayUrl: deps.gatewayConfig.url,
             serverOwner: deps.serverOwner,
             serverSigner: deps.serverSigner,
+            grantTtlSeconds: deps.mcpGrantTtlSeconds,
           },
         );
         return c.json({ redirectTo: approved.redirectTo });
