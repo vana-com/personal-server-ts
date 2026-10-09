@@ -549,6 +549,35 @@ describe("POST /v1/data/:scope", () => {
       $firstAdded: expect.objectContaining({ version: 1 }),
     });
   });
+
+  it("carries the first-added ledger forward across stored versions", async () => {
+    const scope = "instagram.posts";
+    const res1 = await post(scope, { posts: [{ id: "a" }, { id: "b" }] });
+    expect(res1.status).toBe(201);
+    const { collectedAt: first } = await res1.json();
+
+    // Ensure timestamps differ
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+
+    const res2 = await post(scope, {
+      posts: [{ id: "a" }, { id: "b" }, { id: "c" }],
+    });
+    expect(res2.status).toBe(201);
+    const { collectedAt: second } = await res2.json();
+
+    const stored = JSON.parse(
+      await readFile(buildDataFilePath(dataDir, scope, second), "utf-8"),
+    );
+    expect(stored.data.$firstAdded).toEqual({
+      version: 1,
+      trackedSince: first,
+      records: {
+        "posts:i:a": first,
+        "posts:i:b": first,
+        "posts:i:c": second,
+      },
+    });
+  });
 });
 
 describe("GET /v1/data (list scopes)", () => {
