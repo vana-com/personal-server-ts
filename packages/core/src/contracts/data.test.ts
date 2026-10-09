@@ -710,4 +710,31 @@ describe("first-added ledger on ingest", () => {
     expect(data.$lineage).toEqual(lineage);
     expect(ledgerOf(data).records).toMatchObject({ "items:i:a": T1 });
   });
+
+  it("does not re-date a note whose text was edited between ingests", async () => {
+    const storage = createMemoryStorage();
+    const scope = "icloud_notes.notes";
+    const body = (textContent: string) => ({
+      notes: [{ recordName: "n1", title: "Title", textContent }],
+    });
+    await ingestDataContract({
+      storage,
+      scopeParam: scope,
+      body: body("first"),
+      collectedAt: T1,
+      status: "stored",
+    });
+    await ingestDataContract({
+      storage,
+      scopeParam: scope,
+      body: body("edited"),
+      collectedAt: T2,
+      status: "stored",
+    });
+
+    const read = await readDataContract({ storage, scopeParam: scope });
+    if (!read.ok) throw new Error("expected read to succeed");
+    const ledger = readFirstAddedLedger(read.envelope.data);
+    expect(ledger?.records).toEqual({ "notes:i:n1": T1 });
+  });
 });

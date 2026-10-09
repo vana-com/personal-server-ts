@@ -529,6 +529,7 @@ async function buildIngestFirstAddedLedger(
     }
     if (previous === null) {
       return buildFirstAddedLedger({
+        scope,
         previousData: null,
         newData: body,
         collectedAt,
@@ -539,6 +540,7 @@ async function buildIngestFirstAddedLedger(
       ? await storage.readStoredEnvelope(scope, previous.collectedAt)
       : await storage.readEnvelope(scope, previous.collectedAt);
     return buildFirstAddedLedger({
+      scope,
       previousData: isRecord(envelope.data) ? envelope.data : null,
       newData: body,
       collectedAt,

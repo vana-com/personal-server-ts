@@ -14,6 +14,7 @@
  */
 
 import { canonicalizeJson } from "../derivatives/e2ee/jcs.js";
+import { memoryRecordRulesFor, type MemoryRecordRule } from "./record-rules.js";
 
 /** Reserved key inside the envelope `data` record for the first-added ledger. */
 export const FIRST_ADDED_KEY = "$firstAdded" as const;
@@ -115,13 +116,28 @@ async function hashPart(value: unknown): Promise<string> {
 }
 
 /**
- * `"i:" + String(id)` for the first qualifying `id`, `uuid`, `key`, `uri` or
- * `url` (a non-empty string or a finite number); otherwise the content hash.
+ * The value at a dotted path of plain objects, or undefined when any segment
+ * is missing or not a plain object.
  */
-async function idPart(obj: Record<string, unknown>): Promise<string> {
-  for (const property of ID_PROPERTIES) {
-    if (!hasOwn(obj, property)) continue;
-    const value = obj[property];
+function valueAtPath(obj: Record<string, unknown>, path: string): unknown {
+  let current: unknown = obj;
+  for (const segment of path.split(".")) {
+    if (!isRecord(current) || !hasOwn(current, segment)) return undefined;
+    current = current[segment];
+  }
+  return current;
+}
+
+/**
+ * `"i:" + String(id)` for the first `fields` entry whose value (a non-empty
+ * string or a finite number) qualifies; otherwise the content hash of `obj`.
+ */
+async function idPart(
+  obj: Record<string, unknown>,
+  fields: readonly string[],
+): Promise<string> {
+  for (const field of fields) {
+    const value = valueAtPath(obj, field);
     if (typeof value === "string" && value.length > 0) {
       return `i:${value}`;
     }
@@ -153,23 +169,16 @@ function dedupe(keys: string[]): string[] {
   return Array.from(new Set(keys));
 }
 
-/**
- * Stable keys for the records in an envelope `data` object, de-duplicated,
- * in first-seen order. Returns null when the data is not trackable.
- */
-export async function extractRecordKeys(
+/** The generic rule, used only for scopes with no entry in the rules table. */
+async function extractGenericRecordKeys(
   data: Record<string, unknown>,
-): Promise<string[] | null> {
-  if (!isRecord(data)) return null;
-  // A binary payload has no addressable records and is never tracked.
-  if (hasOwn(data, "$binary")) return null;
-
+): Promise<string[]> {
   // PDPP form: one `records` array of `{ stream, data }` envelopes.
   const pdppRecords = asPdppRecords(data.records);
   if (pdppRecords) {
     const keys: string[] = [];
     for (const record of pdppRecords) {
-      keys.push(`${record.stream}:${await idPart(record.data)}`);
+      keys.push(`${record.stream}:${await idPart(record.data, ID_PROPERTIES)}`);
     }
     return dedupe(keys);
   }
@@ -184,7 +193,7 @@ export async function extractRecordKeys(
     sawArray = true;
     for (const element of value) {
       if (isRecord(element)) {
-        keys.push(`${key}:${await idPart(element)}`);
+        keys.push(`${key}:${await idPart(element, ID_PROPERTIES)}`);
       } else {
         keys.push(`${key}:${await hashPart(element)}`);
       }
@@ -195,7 +204,73 @@ export async function extractRecordKeys(
   return dedupe(keys);
 }
 
+/**
+ * The items of a rule from a PDPP `records` array, in stream order. A
+ * `streamFilter` (PDPP only) keeps a split stream's rows to one collection.
+ */
+function pdppItems(
+  records: PdppRecord[],
+  rule: MemoryRecordRule,
+): Record<string, unknown>[] {
+  const names = new Set<string>([rule.collection, ...(rule.aliases ?? [])]);
+  return records
+    .filter((record) => names.has(record.stream))
+    .filter(
+      (record) =>
+        !rule.streamFilter ||
+        record.data[rule.streamFilter.field] === rule.streamFilter.equals,
+    )
+    .map((r) => r.data);
+}
+
+/** The items of a rule from a legacy body; the first matching array wins. */
+function legacyItems(
+  data: Record<string, unknown>,
+  rule: MemoryRecordRule,
+): Record<string, unknown>[] {
+  for (const name of [rule.collection, ...(rule.aliases ?? [])]) {
+    if (!hasOwn(data, name)) continue;
+    const value = data[name];
+    if (!Array.isArray(value)) continue;
+    return value.filter(isRecord);
+  }
+  return [];
+}
+
+/**
+ * Stable keys for the records in an envelope `data` object, de-duplicated,
+ * in first-seen order. Returns null when the data is not trackable.
+ *
+ * A ruled scope only produces keys for its named collections; the generic
+ * rule remains the default for scopes with no rules entry.
+ */
+export async function extractRecordKeys(
+  scope: string,
+  data: Record<string, unknown>,
+): Promise<string[] | null> {
+  if (!isRecord(data)) return null;
+  // A binary payload has no addressable records and is never tracked.
+  if (hasOwn(data, "$binary")) return null;
+
+  const rules = memoryRecordRulesFor(scope);
+  if (rules === null) return extractGenericRecordKeys(data);
+
+  const pdppRecords = asPdppRecords(data.records);
+  const keys: string[] = [];
+  for (const rule of rules) {
+    const items = pdppRecords
+      ? pdppItems(pdppRecords, rule)
+      : legacyItems(data, rule);
+    for (const item of items) {
+      keys.push(`${rule.collection}:${await idPart(item, rule.idFields)}`);
+    }
+  }
+  return dedupe(keys);
+}
+
 export interface BuildFirstAddedLedgerInput {
+  /** Scope whose record rules select the tracked collections. */
+  scope: string;
   /** `data` of the scope's previous snapshot, or null when this is the scope's first snapshot. */
   previousData: Record<string, unknown> | null;
   /** `data` about to be stored (without a ledger). */
@@ -208,7 +283,7 @@ export interface BuildFirstAddedLedgerInput {
 export async function buildFirstAddedLedger(
   input: BuildFirstAddedLedgerInput,
 ): Promise<FirstAddedLedger | null> {
-  const newKeys = await extractRecordKeys(input.newData);
+  const newKeys = await extractRecordKeys(input.scope, input.newData);
   if (newKeys === null) return null;
 
   // A Map keeps arbitrary keys (including "__proto__") out of the prototype
@@ -238,7 +313,8 @@ export async function buildFirstAddedLedger(
   if (input.previousData !== null) {
     // Case B: the previous snapshot predates tracking. Everything it held
     // existed before tracking began (null); genuinely new keys are dated now.
-    const previousKeys = (await extractRecordKeys(input.previousData)) ?? [];
+    const previousKeys =
+      (await extractRecordKeys(input.scope, input.previousData)) ?? [];
     for (const key of previousKeys) {
       if (!records.has(key)) records.set(key, null);
     }
