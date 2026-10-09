@@ -16,6 +16,7 @@ import { dirname, join, relative } from "node:path";
 import { randomUUID } from "node:crypto";
 import {
   DataFileEnvelopeSchema,
+  scopeToPathSegments,
   type DataFileEnvelope,
 } from "@opendatalabs/vana-sdk/browser";
 import {
@@ -122,6 +123,63 @@ export async function readDataFilePreview(
   } finally {
     await handle.close();
   }
+}
+
+/**
+ * Per-scope first-seen ledger: ONE flat file `<dataDir>/first-seen/<scope>.json`.
+ *
+ * It sits outside the per-version data files (`<dataDir>/<source>/<category>/…`)
+ * and outside the block sidecars (`<dataDir>/blocks/…`). A scope's source
+ * matches `[a-z0-9][a-z0-9_]*`, so no scope can have `first-seen` (it holds a
+ * hyphen) as its directory, and the ledger is never in the SQLite index, so it
+ * is not a version and nothing that lists, uploads or serves data reaches it.
+ */
+function buildFirstSeenLedgerPath(dataDir: string, scope: string): string {
+  // Throws for anything that is not a well-formed scope, so the scope can
+  // never carry a path separator or `..` into the file name.
+  scopeToPathSegments(scope);
+  return join(dataDir, "first-seen", `${scope}.json`);
+}
+
+/** Returns null when the scope has no ledger file. */
+export async function readFirstSeenLedger(
+  options: HierarchyManagerOptions,
+  scope: string,
+): Promise<unknown | null> {
+  try {
+    return JSON.parse(
+      await readFile(buildFirstSeenLedgerPath(options.dataDir, scope), "utf-8"),
+    ) as unknown;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+/** Atomic write: mkdir -p, write temp file, rename. */
+export async function writeFirstSeenLedger(
+  options: HierarchyManagerOptions,
+  scope: string,
+  ledger: unknown,
+): Promise<void> {
+  const filePath = buildFirstSeenLedgerPath(options.dataDir, scope);
+  await mkdir(dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.tmp.${randomUUID()}`;
+  try {
+    await writeFile(tempPath, JSON.stringify(ledger), "utf-8");
+    await rename(tempPath, filePath);
+  } catch (err) {
+    await rm(tempPath, { force: true });
+    throw err;
+  }
+}
+
+/** Idempotent: a missing file is a no-op. */
+export async function deleteFirstSeenLedger(
+  options: HierarchyManagerOptions,
+  scope: string,
+): Promise<void> {
+  await rm(buildFirstSeenLedgerPath(options.dataDir, scope), { force: true });
 }
 
 export async function writeBlockManifest(

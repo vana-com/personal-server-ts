@@ -19,17 +19,16 @@ import {
   type StoredLineage,
 } from "../lineage/lineage.js";
 import {
-  buildFirstAddedLedger,
-  hasReservedFirstAddedKey,
-  stampFirstAdded,
-  type FirstAddedLedger,
-} from "../additions/first-added.js";
+  ensureScopeLedger,
+  recordStoredVersion,
+} from "../additions/ledger-store.js";
 import {
   InvalidTimezoneError,
   summarizeAdditions,
+  validateTimezone,
   type AdditionsSummary,
-  type ScopeAdditionsInput,
 } from "../additions/summary.js";
+import type { ScopeFirstSeenLedger } from "../additions/first-added.js";
 
 export type DataContractErrorCode =
   "INVALID_SCOPE" | "INVALID_BODY" | "INVALID_QUERY" | "NOT_FOUND";
@@ -158,16 +157,14 @@ export interface IngestDataContractInput {
    * Builder attribution for delegated (write-session) writes. When present,
    * it is stamped into the envelope `data` under the reserved `$writtenBy`
    * key so it travels through the unchanged encrypt/upload/register path.
-   * Owner writes pass nothing, but every JSON write still gains the
-   * server-stamped `$firstAdded` ledger, so no write is byte-identical to
-   * the caller's body.
+   * Owner writes pass nothing and the envelope is byte-identical to today.
    */
   attribution?: WriterAttribution;
   /**
    * Validated lineage for a derivative write (see lineage/lineage.ts). When
    * present it is stamped into the envelope `data` under the reserved
-   * `$lineage` key, next to `$writtenBy`; absent = root record (the record
-   * still carries `$firstAdded`).
+   * `$lineage` key, next to `$writtenBy`; absent = root record, envelope
+   * unchanged.
    */
   lineage?: StoredLineage;
   /** See `IndexEntry.afterTombstoneVersion`. */
@@ -405,9 +402,6 @@ export interface SummarizeDataAdditionsContractInput {
   now: Date;
 }
 
-/** Newest versions scanned for a scope's latest snapshot and its recent siblings. */
-const ADDITIONS_VERSION_LIMIT = 20;
-
 function invalidQuery(message: string): DataContractError {
   return {
     ok: false,
@@ -416,20 +410,12 @@ function invalidQuery(message: string): DataContractError {
   };
 }
 
-/** The stored bytes, not the read-time projection: the ledger is server-owned. */
-function readStoredEnvelope(
-  storage: DataStoragePort,
-  scope: string,
-  collectedAt: string,
-): Promise<DataFileEnvelope> {
-  return storage.readStoredEnvelope
-    ? storage.readStoredEnvelope(scope, collectedAt)
-    : storage.readEnvelope(scope, collectedAt);
-}
-
 /**
- * The owner's additions summary over every visible scope. Scopes whose latest
- * snapshot cannot be read are skipped; unreadable recent snapshots are ignored.
+ * The owner's additions summary over every visible scope, computed from the
+ * per-scope first-seen sidecars only. Both query parameters are validated
+ * before storage is touched. A scope with no sidecar is rebuilt once from its
+ * retained versions and persisted; a scope with no readable version is left
+ * out.
  */
 export async function summarizeDataAdditionsContract(
   input: SummarizeDataAdditionsContractInput,
@@ -437,83 +423,28 @@ export async function summarizeDataAdditionsContract(
   if (!Number.isInteger(input.days) || input.days < 1 || input.days > 31) {
     return invalidQuery("days must be an integer between 1 and 31");
   }
-
-  const scopeSummaries = await collectScopes(
-    input.storage,
-    undefined,
-    input.isVisible,
-  );
-  const nowMs = input.now.getTime();
-  const recentWindowMs = (input.days + 1) * 24 * 60 * 60 * 1000;
-  const scopes: ScopeAdditionsInput[] = [];
-
-  for (const summary of scopeSummaries) {
-    const versions = input.storage.listVersions(summary.scope, {
-      limit: ADDITIONS_VERSION_LIMIT,
-    });
-    // Both implementations order newest-first, but take the max explicitly so
-    // the wrong snapshot never becomes "latest".
-    let latest: IndexEntry | null = null;
-    for (const version of versions) {
-      if (
-        latest === null ||
-        version.collectedAt.localeCompare(latest.collectedAt) > 0
-      ) {
-        latest = version;
-      }
-    }
-    if (latest === null) continue;
-
-    let latestData: Record<string, unknown>;
-    try {
-      const envelope = await readStoredEnvelope(
-        input.storage,
-        summary.scope,
-        latest.collectedAt,
-      );
-      if (!isRecord(envelope.data)) continue;
-      latestData = envelope.data;
-    } catch {
-      // An unreadable latest snapshot hides its scope from the summary.
-      continue;
-    }
-
-    // Recent siblings reconcile ledgers imported on other devices before sync.
-    const recentData: Record<string, unknown>[] = [];
-    for (const version of versions) {
-      if (version.collectedAt === latest.collectedAt) continue;
-      const at = Date.parse(version.collectedAt);
-      if (Number.isNaN(at) || at > nowMs || at < nowMs - recentWindowMs) {
-        continue;
-      }
-      try {
-        const envelope = await readStoredEnvelope(
-          input.storage,
-          summary.scope,
-          version.collectedAt,
-        );
-        if (isRecord(envelope.data)) recentData.push(envelope.data);
-      } catch {
-        // An unreadable recent snapshot is ignored; the latest still counts.
-      }
-    }
-
-    scopes.push({ scope: summary.scope, latestData, recentData });
-  }
-
   try {
-    return await summarizeAdditions({
-      scopes,
-      timezone: input.timezone,
-      days: input.days,
-      now: input.now,
-    });
+    validateTimezone(input.timezone);
   } catch (err) {
     if (err instanceof InvalidTimezoneError) {
       return invalidQuery("Unknown timezone");
     }
     throw err;
   }
+
+  const scopes = await collectScopes(input.storage, undefined, input.isVisible);
+  const ledgers: ScopeFirstSeenLedger[] = [];
+  for (const summary of scopes) {
+    const ledger = await ensureScopeLedger(input.storage, summary.scope);
+    if (ledger) ledgers.push(ledger);
+  }
+
+  return summarizeAdditions({
+    ledgers,
+    timezone: input.timezone,
+    days: input.days,
+    now: input.now,
+  });
 }
 
 export async function readDataContract(
@@ -598,29 +529,11 @@ export async function ingestDataContract(
       },
     };
   }
-  // The first-added ledger is derived from successive snapshots, so a caller
-  // must not supply one: a planted ledger would date records wrongly.
-  if (hasReservedFirstAddedKey(input.body)) {
-    return {
-      ok: false,
-      status: 400,
-      body: {
-        error: "INVALID_BODY",
-        message: "Request body must not contain the reserved $firstAdded key",
-      },
-    };
-  }
 
-  const firstAdded = await buildIngestFirstAddedLedger(
-    input.storage,
-    scopeResult.scope,
-    input.body,
-    input.collectedAt,
-  );
   const envelope = createDataFileEnvelope(
     scopeResult.scope,
     input.collectedAt,
-    stampServerKeys(input.body, input, firstAdded),
+    stampServerKeys(input.body, input),
   );
   const writeResult = await input.storage.writeEnvelope(envelope);
   try {
@@ -637,6 +550,11 @@ export async function ingestDataContract(
     sizeBytes: writeResult.sizeBytes,
     afterTombstoneVersion: input.afterTombstoneVersion ?? null,
   });
+  await recordStoredVersion(input.storage, {
+    scope: scopeResult.scope,
+    collectedAt: input.collectedAt,
+    data: envelope.data,
+  });
 
   return {
     ok: true,
@@ -647,78 +565,20 @@ export async function ingestDataContract(
   };
 }
 
-/** Newest versions scanned when looking for the scope's previous snapshot. */
-const FIRST_ADDED_VERSION_LOOKBACK = 200;
-
 /**
- * The first-added ledger for a JSON write, or null when it cannot be built
- * safely. Best-effort: a ledger must never fail or over-count a write.
- */
-async function buildIngestFirstAddedLedger(
-  storage: DataStoragePort,
-  scope: string,
-  body: Record<string, unknown>,
-  collectedAt: string,
-): Promise<FirstAddedLedger | null> {
-  try {
-    // Both implementations order versions newest-first, but take the max by
-    // collectedAt explicitly so the wrong snapshot never becomes "previous".
-    const versions = storage.listVersions(scope, {
-      limit: FIRST_ADDED_VERSION_LOOKBACK,
-    });
-    let previous: IndexEntry | null = null;
-    for (const version of versions) {
-      if (version.collectedAt === collectedAt) continue;
-      if (
-        previous === null ||
-        version.collectedAt.localeCompare(previous.collectedAt) > 0
-      ) {
-        previous = version;
-      }
-    }
-    if (previous === null) {
-      return buildFirstAddedLedger({
-        scope,
-        previousData: null,
-        newData: body,
-        collectedAt,
-      });
-    }
-    // Read as a method on `storage` (never detached) to keep `this` bound.
-    const envelope = storage.readStoredEnvelope
-      ? await storage.readStoredEnvelope(scope, previous.collectedAt)
-      : await storage.readEnvelope(scope, previous.collectedAt);
-    return buildFirstAddedLedger({
-      scope,
-      previousData: isRecord(envelope.data) ? envelope.data : null,
-      newData: body,
-      collectedAt,
-    });
-  } catch {
-    // An unreadable previous snapshot must not read as "no previous
-    // snapshot": that would date every existing record as new.
-    return null;
-  }
-}
-
-/**
- * Stamp the server-owned reserved keys (`$writtenBy`, `$lineage` and
- * `$firstAdded`) into the record about to be stored. Every JSON write gains
- * `$firstAdded` (the first-seen ledger); `$writtenBy` and `$lineage` stay
- * absent unless the write carried them, so a root owner write is no longer
- * byte-identical to the caller's body.
+ * Stamp the server-owned reserved keys (`$writtenBy`, `$lineage`) into the
+ * record about to be stored. Both are absent from owner root writes, so such
+ * an envelope stays byte-identical to today's.
  */
 function stampServerKeys(
   data: Record<string, unknown>,
   input: Pick<IngestDataContractInput, "attribution" | "lineage">,
-  firstAdded: FirstAddedLedger | null = null,
 ): Record<string, unknown> {
   let stamped = data;
   if (input.lineage) stamped = stampLineage(stamped, input.lineage);
   if (input.attribution) {
     stamped = stampWriterAttribution(stamped, input.attribution);
   }
-  if (firstAdded) stamped = stampFirstAdded(stamped, firstAdded);
   return stamped;
 }
 
@@ -807,6 +667,11 @@ export async function ingestBinaryDataContract(
     sizeBytes: input.bytes.length,
     afterTombstoneVersion: input.afterTombstoneVersion ?? null,
   });
+  await recordStoredVersion(input.storage, {
+    scope: scopeResult.scope,
+    collectedAt: input.collectedAt,
+    data: envelope.data,
+  });
 
   return {
     ok: true,
@@ -823,10 +688,11 @@ export async function deleteDataScopeContract(
   const scopeResult = parseDataScopeContract(input.scopeParam);
   if (!scopeResult.ok) return scopeResult;
 
-  return {
-    ok: true,
-    deletedCount: await input.storage.deleteScope(scopeResult.scope),
-  };
+  const deletedCount = await input.storage.deleteScope(scopeResult.scope);
+  // `deleteScope` removes the first-seen sidecar too; this covers a storage
+  // port whose `deleteScope` predates the sidecar.
+  await input.storage.deleteFirstSeenLedger?.(scopeResult.scope);
+  return { ok: true, deletedCount };
 }
 
 async function writeBlockSidecars(

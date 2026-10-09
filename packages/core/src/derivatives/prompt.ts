@@ -31,12 +31,7 @@ const TIMESTAMP_KEYS = [
 ];
 
 /** Server-stamped envelope keys that are not user data. */
-const RESERVED_KEYS = new Set([
-  "$lineage",
-  "$writtenBy",
-  "$firstAdded",
-  "$binary",
-]);
+const RESERVED_KEYS = new Set(["$lineage", "$writtenBy", "$binary"]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);

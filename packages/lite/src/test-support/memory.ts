@@ -116,6 +116,7 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
   const envelopes = new Map<string, DataFileEnvelope>();
   const blockManifests = new Map<string, DataBlockManifest>();
   const blockPayloads = new Map<string, DataScopeBlock>();
+  const firstSeenLedgers = new Map<string, unknown>();
   let nextId = 1;
 
   function envelopeKey(scope: string, collectedAt: string): string {
@@ -365,7 +366,20 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
       return true;
     },
 
+    async readFirstSeenLedger(scope) {
+      return structuredClone(firstSeenLedgers.get(scope) ?? null);
+    },
+
+    async writeFirstSeenLedger(scope, ledger) {
+      firstSeenLedgers.set(scope, structuredClone(ledger));
+    },
+
+    async deleteFirstSeenLedger(scope) {
+      firstSeenLedgers.delete(scope);
+    },
+
     async deleteScope(scope) {
+      firstSeenLedgers.delete(scope);
       let deleted = 0;
       for (const [path, entry] of entries.entries()) {
         if (entry.scope === scope) {

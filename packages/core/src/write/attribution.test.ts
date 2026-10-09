@@ -14,7 +14,6 @@ import {
   type WriterAttribution,
 } from "./attribution.js";
 import { buildBinaryEnvelopeData, sha256Hex } from "../contracts/binary.js";
-import { FIRST_ADDED_KEY } from "../additions/first-added.js";
 import { LINEAGE_KEY, stampLineage } from "../lineage/lineage.js";
 import {
   createInMemoryWriteProofReplayStore,
@@ -645,22 +644,6 @@ describe("verifyStoredWriterAttribution", () => {
     expect(verified.payload.method).toBe("POST");
     expect(verified.payload.uri).toBe(`/v1/data/${SCOPE}`);
     expect(verified.payload.grantId).toBe(GRANT_ID);
-  });
-
-  it("verifies when the record also carries a $firstAdded ledger", async () => {
-    const data = await storedJsonRecord({ note: "hello" });
-    data[FIRST_ADDED_KEY] = {
-      version: 1,
-      trackedSince: "2026-01-01T00:00:00.000Z",
-      records: { "note:i:hello": "2026-01-01T00:00:00.000Z" },
-    };
-    const verified = await verifyStoredWriterAttribution(
-      { scope: SCOPE, data },
-      { expectedOrigin: SERVER_ORIGIN },
-    );
-    expect(verified.bodyHash).toBe(
-      (data[WRITER_ATTRIBUTION_KEY] as WriterAttribution).bodyHash,
-    );
   });
 
   async function storedBinaryRecord() {

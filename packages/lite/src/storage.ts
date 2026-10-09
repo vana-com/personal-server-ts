@@ -33,6 +33,12 @@ export interface PsLitePersistedStorageState {
     path: string;
     block: DataScopeBlock;
   }>;
+  /**
+   * Per-scope first-seen ledgers. Kept beside, not inside, `entries` and
+   * `envelopes`: a ledger is never an index row, so it is not a version, is
+   * never selected for upload and is not served by any data read.
+   */
+  firstSeenLedgers?: Array<{ scope: string; ledger: unknown }>;
 }
 
 export type PsLiteFileStorageKind = "opfs" | "indexeddb" | "custom";
@@ -132,6 +138,7 @@ function normalizeState(
     envelopes: state.envelopes,
     blockManifests: state.blockManifests ?? [],
     blockPayloads: state.blockPayloads ?? [],
+    firstSeenLedgers: state.firstSeenLedgers ?? [],
   };
 }
 
@@ -443,6 +450,9 @@ export async function createPersistentPsLiteStorage(
   const fallbackBlockPayloads = new Map(
     (state.blockPayloads ?? []).map(({ path, block }) => [path, block]),
   );
+  const firstSeenLedgers = new Map<string, unknown>(
+    (state.firstSeenLedgers ?? []).map(({ scope, ledger }) => [scope, ledger]),
+  );
   const fallbackStore = createIndexedDbFallbackDataFileStore(
     fallbackEnvelopes,
     fallbackBlockManifests,
@@ -473,6 +483,9 @@ export async function createPersistentPsLiteStorage(
       ),
       blockPayloads: Array.from(fallbackBlockPayloads.entries()).map(
         ([path, block]) => ({ path, block }),
+      ),
+      firstSeenLedgers: Array.from(firstSeenLedgers.entries()).map(
+        ([scope, ledger]) => ({ scope, ledger }),
       ),
     };
     const write = persistQueue.then(() => persistence.write(snapshot));
@@ -855,7 +868,21 @@ export async function createPersistentPsLiteStorage(
       return updated;
     },
 
+    async readFirstSeenLedger(scope) {
+      return structuredClone(firstSeenLedgers.get(scope) ?? null);
+    },
+
+    async writeFirstSeenLedger(scope, ledger) {
+      firstSeenLedgers.set(scope, structuredClone(ledger));
+      await persist();
+    },
+
+    async deleteFirstSeenLedger(scope) {
+      if (firstSeenLedgers.delete(scope)) await persist();
+    },
+
     async deleteScope(scope) {
+      firstSeenLedgers.delete(scope);
       let deleted = 0;
       const deletedPaths: string[] = [];
       const deletedBlockTrees: string[] = [];

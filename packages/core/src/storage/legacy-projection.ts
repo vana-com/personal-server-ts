@@ -41,7 +41,6 @@ const PROJECTED_SOURCES: ReadonlySet<string> = new Set(["chatgpt", "claude"]);
 const SERVER_STAMP_KEYS: ReadonlySet<string> = new Set([
   "$writtenBy",
   "$lineage",
-  "$firstAdded",
 ]);
 
 /**

@@ -367,9 +367,7 @@ function shouldKeepProperty(
     return !(plan.storedLineage && plan.binary && key === "lineage");
   }
   if (path !== "data") return true;
-  if (key === "$writtenBy" || key === "$lineage" || key === "$firstAdded") {
-    return false;
-  }
+  if (key === "$writtenBy" || key === "$lineage") return false;
   if (plan.storedLineage && !plan.binary && key === "lineage") return false;
   if (
     plan.storedLineage &&

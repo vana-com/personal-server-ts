@@ -15,6 +15,8 @@ export interface MemoryDataStorage extends DataStoragePort {
 export function createMemoryDataStorage(): MemoryDataStorage {
   const entries: IndexEntry[] = [];
   const envelopes = new Map<string, DataFileEnvelope>();
+  // Per-scope first-seen ledgers: beside the data, never an index row.
+  const ledgers = new Map<string, unknown>();
   let nextId = 1;
 
   const key = (scope: string, collectedAt: string) =>
@@ -153,7 +155,17 @@ export function createMemoryDataStorage(): MemoryDataStorage {
       entry.version = version;
       return true;
     },
+    async readFirstSeenLedger(scope) {
+      return structuredClone(ledgers.get(scope) ?? null);
+    },
+    async writeFirstSeenLedger(scope, ledger) {
+      ledgers.set(scope, structuredClone(ledger));
+    },
+    async deleteFirstSeenLedger(scope) {
+      ledgers.delete(scope);
+    },
     async deleteScope(scope) {
+      ledgers.delete(scope);
       return remove((entry) => entry.scope === scope);
     },
     async deleteByFileId(fileId) {

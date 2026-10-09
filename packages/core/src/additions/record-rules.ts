@@ -2,11 +2,16 @@
 export interface MemoryRecordRule {
   /** Canonical collection name; also the prefix of every record key. Top-level key in a legacy body. */
   collection: string;
-  /** Other names the same collection is stored under: PDPP stream names or alternate legacy keys. */
+  /**
+   * Other names the same collection is stored under: PDPP stream names or
+   * alternate legacy keys. In the stored PDPP rows form `{ records: [...] }`
+   * a scope's rows belong to the rule whose collection or alias is the
+   * scope's dataset name (the part after the first dot).
+   */
   aliases?: readonly string[];
   /** Fields tried in order for the record's stable identity. Dotted paths allowed (e.g. "track.id"). */
   idFields: readonly string[];
-  /** PDPP only: keep a stream's record only when this field equals this value (a stream that feeds several collections). */
+  /** Rows form: keep a row only when this field equals this value (a stream that feeds several collections). */
   streamFilter?: { field: string; equals: string };
 }
 
@@ -83,9 +88,14 @@ export const MEMORY_RECORD_RULES: Readonly<
   "discord.servers": [{ collection: "servers", idFields: ["id"] }],
   "discord.messages": [{ collection: "messages", idFields: ["id"] }],
   "discord.connections": [{ collection: "connections", idFields: ["id"] }],
-  "x.posts": [{ collection: "records", idFields: ["id"] }],
-  "x.likes": [{ collection: "records", idFields: ["id"] }],
-  "x.bookmarks": [{ collection: "records", idFields: ["id"] }],
+  // These stream a stored PDPP `{ records }` body, whose rows are the
+  // collection. The dataset-named alias keeps a keyed body (`{ posts: [...] }`)
+  // on the same `records:` keys.
+  "x.posts": [{ collection: "records", aliases: ["posts"], idFields: ["id"] }],
+  "x.likes": [{ collection: "records", aliases: ["likes"], idFields: ["id"] }],
+  "x.bookmarks": [
+    { collection: "records", aliases: ["bookmarks"], idFields: ["id"] },
+  ],
   "linkedin.experience": [
     {
       collection: "items",

@@ -91,7 +91,6 @@ function writeDataObject(
     const omit =
       property.key === "$writtenBy" ||
       property.key === "$lineage" ||
-      property.key === "$firstAdded" ||
       (flags.storedLineage && !flags.binary && property.key === "lineage") ||
       (redactMetadata &&
         !hasKeptProperty(bytes, property.valueStart, property.valueEnd));

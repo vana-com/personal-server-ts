@@ -94,10 +94,7 @@ describe("createServer legacy projection wiring", () => {
               entry.collectedAt,
             )
           ).data,
-        ).toEqual({
-          ...conversations,
-          $firstAdded: expect.objectContaining({ version: 1 }),
-        });
+        ).toEqual(conversations);
       }
     } finally {
       await ctx.cleanup();

@@ -80,7 +80,6 @@ import {
   prepareLineage,
   type StoredLineage,
 } from "../lineage/lineage.js";
-import { FIRST_ADDED_KEY } from "../additions/first-added.js";
 import type { LineageGatewayPort } from "../lineage/gateway.js";
 import {
   binaryFilename,
@@ -1103,10 +1102,9 @@ export function isOwnerView(
 
 /**
  * The envelope view a grantee read is entitled to. The server-stamped
- * `$writtenBy` (writing builder's address, grantId, signature), `$lineage`
- * (the owner's source data-point ids, dictionary-attackable back
- * to scopes since dataPointId = keccak(owner, scope)) and `$firstAdded` (the
- * owner's per-record keys and first-seen timestamps) never leave the server
+ * `$writtenBy` (writing builder's address, grantId, signature) and
+ * `$lineage` (the owner's source data-point ids, dictionary-attackable back
+ * to scopes since dataPointId = keccak(owner, scope)) never leave the server
  * on a grantee read: the owner reads them from storage, and grantees get the
  * graph only through the grant-redacted lineage endpoint. When `$lineage` is
  * present, the caller-supplied lineage field it mirrors (top-level `lineage`
@@ -1121,14 +1119,9 @@ export function redactEnvelopeForGrantee(
   const {
     [WRITER_ATTRIBUTION_KEY]: attribution,
     [LINEAGE_KEY]: storedLineage,
-    [FIRST_ADDED_KEY]: firstAdded,
     ...rest
   } = envelope.data;
-  if (
-    attribution === undefined &&
-    storedLineage === undefined &&
-    firstAdded === undefined
-  ) {
+  if (attribution === undefined && storedLineage === undefined) {
     return envelope;
   }
   let data: Record<string, unknown> = rest;
@@ -1196,7 +1189,13 @@ export async function handlePersonalServerDataRequest(
         storage: deps.storage,
         isVisible: discoveryVisibility(deps),
         timezone: url.searchParams.get("tz") ?? "UTC",
-        days: daysRaw === null ? 7 : Number(daysRaw),
+        // Digits only: Number() would also accept "", "1e1", "0x7" and " 7".
+        days:
+          daysRaw === null
+            ? 7
+            : /^\d{1,3}$/.test(daysRaw)
+              ? Number(daysRaw)
+              : Number.NaN,
         now: (deps.now ?? (() => new Date()))(),
       });
       if ("ok" in result) return contractErrorResponse(result);

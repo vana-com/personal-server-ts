@@ -1,6 +1,9 @@
 import {
   deleteAllForScope,
   deleteDataFile,
+  deleteFirstSeenLedger,
+  readFirstSeenLedger,
+  writeFirstSeenLedger,
   readDataFile,
   readDataFileBytes,
   readDataFileStream,
@@ -116,9 +119,19 @@ export function createNodeDataStorage(
     updateEntryVersion(path: string, version: number) {
       return deps.indexManager.updateVersion(path, version);
     },
+    readFirstSeenLedger(scope: string) {
+      return readFirstSeenLedger(deps.hierarchyOptions, scope);
+    },
+    writeFirstSeenLedger(scope: string, ledger: unknown) {
+      return writeFirstSeenLedger(deps.hierarchyOptions, scope, ledger);
+    },
+    deleteFirstSeenLedger(scope: string) {
+      return deleteFirstSeenLedger(deps.hierarchyOptions, scope);
+    },
     async deleteScope(scope: string) {
       const deletedCount = deps.indexManager.deleteByScope(scope);
       await deleteAllForScope(deps.hierarchyOptions, scope);
+      await deleteFirstSeenLedger(deps.hierarchyOptions, scope);
       return deletedCount;
     },
     async deleteByFileId(fileId: string) {

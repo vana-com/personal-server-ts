@@ -478,10 +478,7 @@ describe("derivative data routes", () => {
       expect(res.status).toBe(201);
       expect((await res.json()).lineage).toBeUndefined();
       const envelope = await (await ownerRead("notes.entries")).json();
-      expect(envelope.data).toEqual({
-        note: "root",
-        $firstAdded: expect.objectContaining({ version: 1 }),
-      });
+      expect(envelope.data).toEqual({ note: "root" });
     });
   });
 

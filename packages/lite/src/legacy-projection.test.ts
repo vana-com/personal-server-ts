@@ -43,11 +43,6 @@ const messages = {
   ],
 };
 
-/** A stored body also carries the server-stamped `$firstAdded` ledger. */
-function storedBody(data: Record<string, unknown>) {
-  return { ...data, $firstAdded: expect.objectContaining({ version: 1 }) };
-}
-
 function createRuntime(
   options: Partial<Parameters<typeof createPsLiteRuntime>[0]> = {},
 ) {
@@ -161,7 +156,7 @@ describe("PS-Lite legacy projection", () => {
       "chatgpt.conversations",
       entry.collectedAt,
     );
-    expect(stored.data).toEqual(storedBody(conversations));
+    expect(stored.data).toEqual(conversations);
   });
 
   it("returns the stored body to the owner with ?view=stored", async () => {
@@ -175,7 +170,7 @@ describe("PS-Lite legacy projection", () => {
 
     expect(res.status).toBe(200);
     expect(((await res.json()) as { data: unknown }).data).toEqual(
-      storedBody(conversations),
+      conversations,
     );
   });
 
@@ -380,7 +375,7 @@ describe("POST ?supersede=legacy", () => {
     const body = (await res.json()) as { superseded: string[] };
     expect([...body.superseded].sort()).toEqual([...legacyVersions].sort());
     expect(await versionBodies(storage, "chatgpt.conversations")).toEqual([
-      storedBody(conversations),
+      conversations,
     ]);
     const read = await get(runtime, "/v1/data/chatgpt.conversations");
     expect(((await read.json()) as { data: unknown }).data).toMatchObject({
@@ -403,8 +398,8 @@ describe("POST ?supersede=legacy", () => {
 
     expect(res.status).toBe(201);
     expect(await versionBodies(storage, "chatgpt.conversations")).toEqual([
-      storedBody(conversations),
-      storedBody({ records: [] }),
+      conversations,
+      { records: [] },
     ]);
   });
 
@@ -441,8 +436,8 @@ describe("POST ?supersede=legacy", () => {
       supersedeRefused: "the projection is partial (stream_missing)",
     });
     expect(await versionBodies(storage, "chatgpt.conversations")).toEqual([
-      storedBody(conversations),
-      storedBody(legacyThread),
+      conversations,
+      legacyThread,
     ]);
   });
 

@@ -299,10 +299,7 @@ describe("POST /v1/data/:scope", () => {
     expect(content.version).toBe("1.0");
     expect(content.scope).toBe("instagram.profile");
     expect(content.collectedAt).toBe(json.collectedAt);
-    expect(content.data).toEqual({
-      username: "test",
-      $firstAdded: expect.objectContaining({ version: 1 }),
-    });
+    expect(content.data).toEqual({ username: "test" });
   });
 
   it("SQLite index has matching row", async () => {
@@ -540,43 +537,8 @@ describe("POST /v1/data/:scope", () => {
     );
     const content1 = JSON.parse(await readFile(path1, "utf-8"));
     const content2 = JSON.parse(await readFile(path2, "utf-8"));
-    expect(content1.data).toEqual({
-      version: 1,
-      $firstAdded: expect.objectContaining({ version: 1 }),
-    });
-    expect(content2.data).toEqual({
-      version: 2,
-      $firstAdded: expect.objectContaining({ version: 1 }),
-    });
-  });
-
-  it("carries the first-added ledger forward across stored versions", async () => {
-    const scope = "instagram.posts";
-    const res1 = await post(scope, { posts: [{ id: "a" }, { id: "b" }] });
-    expect(res1.status).toBe(201);
-    const { collectedAt: first } = await res1.json();
-
-    // Ensure timestamps differ
-    await new Promise((resolve) => setTimeout(resolve, 1100));
-
-    const res2 = await post(scope, {
-      posts: [{ id: "a" }, { id: "b" }, { id: "c" }],
-    });
-    expect(res2.status).toBe(201);
-    const { collectedAt: second } = await res2.json();
-
-    const stored = JSON.parse(
-      await readFile(buildDataFilePath(dataDir, scope, second), "utf-8"),
-    );
-    expect(stored.data.$firstAdded).toEqual({
-      version: 1,
-      trackedSince: first,
-      records: {
-        "posts:i:a": first,
-        "posts:i:b": first,
-        "posts:i:c": second,
-      },
-    });
+    expect(content1.data).toEqual({ version: 1 });
+    expect(content2.data).toEqual({ version: 2 });
   });
 });
 
@@ -746,16 +708,36 @@ describe("GET /v1/data/additions", () => {
   let cleanup: () => void;
 
   function createApp(overrides: Partial<DataRouteDeps> = {}) {
+    const gateway = createMockGateway({
+      getGrant: vi.fn().mockResolvedValue(makeGrant({ scopes: ["notes.*"] })),
+    });
     return dataRoutes({
       indexManager,
       hierarchyOptions,
       logger,
       serverOrigin: SERVER_ORIGIN,
       serverOwner: ownerWallet.address,
-      gateway: createMockGateway(),
+      gateway,
       accessLogWriter: createMockAccessLogWriter(),
       ...overrides,
     });
+  }
+
+  async function getAdditions(
+    app: ReturnType<typeof dataRoutes>,
+    query = "",
+    signer: typeof ownerWallet | null = ownerWallet,
+  ) {
+    const headers: Record<string, string> = {};
+    if (signer) {
+      headers.Authorization = await buildWeb3SignedHeader({
+        wallet: signer,
+        aud: SERVER_ORIGIN,
+        method: "GET",
+        uri: "/additions",
+      });
+    }
+    return app.request(`/additions${query}`, { headers });
   }
 
   beforeEach(async () => {
@@ -775,22 +757,16 @@ describe("GET /v1/data/additions", () => {
     await rm(dataDir, { recursive: true, force: true });
   });
 
-  it("returns the additions summary for the owner after two writes", async () => {
+  it("dates only the record the second write adds, from the sidecar", async () => {
     const app = createApp();
     await postWithOwnerAuth(app, "notes.entries", { items: [{ id: "a" }] });
+    // collectedAt has one-second resolution.
+    await new Promise((resolve) => setTimeout(resolve, 1100));
     await postWithOwnerAuth(app, "notes.entries", {
       items: [{ id: "a" }, { id: "b" }],
     });
 
-    const auth = await buildWeb3SignedHeader({
-      wallet: ownerWallet,
-      aud: SERVER_ORIGIN,
-      method: "GET",
-      uri: "/additions",
-    });
-    const res = await app.request("/additions", {
-      headers: { Authorization: auth },
-    });
+    const res = await getAdditions(app);
 
     expect(res.status).toBe(200);
     const json = await res.json();
@@ -799,34 +775,93 @@ describe("GET /v1/data/additions", () => {
       total: 2,
       trackedSince: expect.any(String),
       scopes: [
-        {
-          scope: "notes.entries",
-          total: 2,
-          trackedSince: expect.any(String),
-        },
+        { scope: "notes.entries", total: 2, trackedSince: json.trackedSince },
       ],
     });
     expect(json.days).toHaveLength(7);
+    expect(
+      json.days.reduce(
+        (sum: number, day: { added: number }) => sum + day.added,
+        0,
+      ),
+    ).toBe(1);
+  });
+
+  it("honours the tz parameter", async () => {
+    const app = createApp();
+    await postWithOwnerAuth(app, "notes.entries", { items: [{ id: "a" }] });
+    const res = await getAdditions(app, "?tz=America/Toronto&days=3");
+    const json = await res.json();
+    expect(json.timezone).toBe("America/Toronto");
+    expect(json.days).toHaveLength(3);
   });
 
   it("refuses a non-owner or unauthenticated caller", async () => {
     const app = createApp();
 
-    const unauth = await app.request("/additions");
+    const unauth = await getAdditions(app, "", null);
     expect(unauth.status).toBe(401);
     expect((await unauth.json()).error.errorCode).toBe("MISSING_AUTH");
 
-    const nonOwnerAuth = await buildWeb3SignedHeader({
+    const nonOwner = await getAdditions(app, "", wallet);
+    expect(nonOwner.status).toBe(401);
+    expect((await nonOwner.json()).error.errorCode).toBe("NOT_OWNER");
+  });
+
+  it.each([
+    ["days=0"],
+    ["days=32"],
+    ["days="],
+    ["days=1e1"],
+    ["days=0x7"],
+    ["days=%207"],
+    ["days=7.5"],
+    ["days=abc"],
+    ["tz=Not/AZone"],
+  ])("rejects ?%s before any storage access", async (query) => {
+    const app = createApp();
+    await postWithOwnerAuth(app, "notes.entries", { items: [{ id: "a" }] });
+    const listScopes = vi.spyOn(indexManager, "listDistinctScopes");
+
+    const res = await getAdditions(app, `?${query}`);
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("INVALID_QUERY");
+    expect(listScopes).not.toHaveBeenCalled();
+  });
+
+  it("never serves ledger content on a grantee read of the scope", async () => {
+    const app = createApp();
+    await postWithOwnerAuth(app, "notes.entries", { items: [{ id: "a" }] });
+    const header = await buildWeb3SignedHeader({
       wallet,
       aud: SERVER_ORIGIN,
       method: "GET",
-      uri: "/additions",
+      uri: "/notes.entries",
+      grantId: "grant-123",
     });
-    const nonOwner = await app.request("/additions", {
-      headers: { Authorization: nonOwnerAuth },
+    const res = await app.request("/notes.entries", {
+      headers: { Authorization: header },
     });
-    expect(nonOwner.status).toBe(401);
-    expect((await nonOwner.json()).error.errorCode).toBe("NOT_OWNER");
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toEqual({ items: [{ id: "a" }] });
+  });
+
+  it("does not offer the sidecar as a scope", async () => {
+    const app = createApp();
+    await postWithOwnerAuth(app, "notes.entries", { items: [{ id: "a" }] });
+    const header = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: "/",
+    });
+    const res = await app.request("/", { headers: { Authorization: header } });
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.scopes.map((s: { scope: string }) => s.scope)).toEqual([
+      "notes.entries",
+    ]);
   });
 });
 

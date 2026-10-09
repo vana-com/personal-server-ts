@@ -197,7 +197,6 @@ describe("withLegacyProjection", () => {
       ).data,
     ).toEqual({
       records: [{ ...conversation, message_count_on_current_branch: 0 }],
-      $firstAdded: expect.objectContaining({ version: 1 }),
     });
   });
 
@@ -293,7 +292,6 @@ describe("withLegacyProjection", () => {
 
     expect(envelope.data).toEqual({
       records: [{ id: "p1", name: "Research" }],
-      $firstAdded: expect.objectContaining({ version: 1 }),
     });
     expect(onIssue).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -470,10 +468,7 @@ describe("withLegacyProjection", () => {
       "2026-10-01T00:00:01.000Z",
     );
 
-    expect(data).toEqual({
-      ...body,
-      $firstAdded: expect.objectContaining({ version: 1 }),
-    });
+    expect(data).toEqual(body);
   });
 
   it.each([
@@ -993,5 +988,52 @@ describe("supersedeLegacyVersions", () => {
       ).superseded,
     ).toEqual([]);
     expect(raw.entries).toHaveLength(3);
+  });
+});
+
+describe("withLegacyProjection and the first-seen sidecar", () => {
+  const SCOPE = "chatgpt.conversations";
+  const T1 = "2026-09-01T00:00:00.000Z";
+  const T2 = "2026-10-01T00:00:00.000Z";
+
+  it("passes the sidecar methods through to the raw port", async () => {
+    const raw = createMemoryDataStorage();
+    const served = withLegacyProjection(raw);
+
+    await served.writeFirstSeenLedger!(SCOPE, { marker: 1 });
+    expect(await raw.readFirstSeenLedger!(SCOPE)).toEqual({ marker: 1 });
+    expect(await served.readFirstSeenLedger!(SCOPE)).toEqual({ marker: 1 });
+    await served.deleteFirstSeenLedger!(SCOPE);
+    expect(await raw.readFirstSeenLedger!(SCOPE)).toBeNull();
+  });
+
+  it("keys a scope moving from the legacy form to the stored rows form identically", async () => {
+    const raw = createMemoryDataStorage();
+    await store(raw, SCOPE, T1, { conversations: [conversation], total: 1 });
+    await store(raw, SCOPE, T2, {
+      records: [conversation, { ...conversation, id: "conv-2" }],
+    });
+
+    const ledger = (await raw.readFirstSeenLedger!(SCOPE)) as {
+      baseline: string;
+      records: Record<string, [string, string]>;
+    };
+    expect(ledger.baseline).toBe(T1);
+    // conv-1 is the same record in both forms; only conv-2 is new.
+    expect(ledger.records["conversations:i:conv-1"]).toEqual([T1, T2]);
+    expect(ledger.records["conversations:i:conv-2"]).toEqual([T2, T2]);
+  });
+
+  it("never serves ledger content through the served port", async () => {
+    const raw = createMemoryDataStorage();
+    await store(raw, SCOPE, T1, { records: [conversation] });
+    const served = withLegacyProjection(raw);
+
+    const envelope = await served.readEnvelope(SCOPE, T1);
+    const stored = await served.readStoredEnvelope!(SCOPE, T1);
+    for (const view of [envelope, stored]) {
+      expect(JSON.stringify(view)).not.toContain("baseline");
+      expect(JSON.stringify(view)).not.toContain("conversations:i:");
+    }
   });
 });
