@@ -46,8 +46,9 @@ import { ProtocolError } from "../errors/catalog.js";
 
 /**
  * Block sidecars are built from the FULL stored envelope, so they carry the
- * server-stamped `$writtenBy` / `$lineage` keys and the consumed caller
- * lineage field that grantee reads of the record itself never see. The same
+ * server-stamped `$writtenBy` / `$lineage` / `$firstAdded` keys and the
+ * consumed caller lineage field that grantee reads of the record itself
+ * never see. The same
  * redaction applies here at serve time: dedicated blocks under those paths
  * are dropped, data-level object payloads (`$.data`, grouped-key blocks,
  * `$.data.metadata`) have the keys stripped, and group labels naming a
@@ -177,6 +178,7 @@ function redactedBlockPathPrefixes(ctx: BlockRedactionContext): string[] {
   return [
     "$.data.$writtenBy",
     "$.data.$lineage",
+    "$.data.$firstAdded",
     ...(ctx.dropTopLevelLineage ? ["$.data.lineage"] : []),
     ...(ctx.dropMetadataLineage ? ["$.data.metadata.lineage"] : []),
   ];
@@ -206,6 +208,7 @@ function isRedactedKeyName(
     return (
       key === "$writtenBy" ||
       key === "$lineage" ||
+      key === "$firstAdded" ||
       (ctx.dropTopLevelLineage && key === "lineage")
     );
   }
@@ -245,7 +248,12 @@ function stripDataLevelKeys(
   value: Record<string, unknown>,
   ctx: BlockRedactionContext,
 ): Record<string, unknown> {
-  const { $writtenBy: _writtenBy, $lineage: _lineage, ...rest } = value;
+  const {
+    $writtenBy: _writtenBy,
+    $lineage: _lineage,
+    $firstAdded: _firstAdded,
+    ...rest
+  } = value;
   let data: Record<string, unknown> = rest;
   if (ctx.dropTopLevelLineage) {
     const { lineage: _callerLineage, ...dataRest } = data;

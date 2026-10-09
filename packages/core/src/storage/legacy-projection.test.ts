@@ -197,6 +197,7 @@ describe("withLegacyProjection", () => {
       ).data,
     ).toEqual({
       records: [{ ...conversation, message_count_on_current_branch: 0 }],
+      $firstAdded: expect.objectContaining({ version: 1 }),
     });
   });
 
@@ -292,6 +293,7 @@ describe("withLegacyProjection", () => {
 
     expect(envelope.data).toEqual({
       records: [{ id: "p1", name: "Research" }],
+      $firstAdded: expect.objectContaining({ version: 1 }),
     });
     expect(onIssue).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -468,7 +470,10 @@ describe("withLegacyProjection", () => {
       "2026-10-01T00:00:01.000Z",
     );
 
-    expect(data).toEqual(body);
+    expect(data).toEqual({
+      ...body,
+      $firstAdded: expect.objectContaining({ version: 1 }),
+    });
   });
 
   it.each([

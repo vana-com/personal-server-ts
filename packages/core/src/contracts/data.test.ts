@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
+import {
+  createDataFileEnvelope,
+  type DataFileEnvelope,
+} from "@opendatalabs/vana-sdk/browser";
 import type { DataStoragePort } from "../ports/index.js";
 import type { IndexEntry } from "../storage/index/index.js";
+import { readFirstAddedLedger } from "../additions/first-added.js";
 import {
   deleteDataScopeContract,
   ingestDataContract,
@@ -449,6 +453,7 @@ describe("lineage on ingest", () => {
       summary: "x",
       lineage: [SOURCE_ID],
       $lineage: lineage,
+      $firstAdded: expect.objectContaining({ version: 1 }),
     });
   });
 
@@ -525,6 +530,184 @@ describe("lineage on ingest", () => {
       storage,
       scopeParam: "notes.entries",
     });
-    expect(read.ok && read.envelope.data).toEqual({ note: "x" });
+    expect(read.ok && read.envelope.data).toEqual({
+      note: "x",
+      $firstAdded: expect.objectContaining({ version: 1 }),
+    });
+  });
+});
+
+describe("first-added ledger on ingest", () => {
+  const SCOPE = "notes.entries";
+  const T1 = "2026-01-01T00:00:00.000Z";
+  const T2 = "2026-02-01T00:00:00.000Z";
+  const T3 = "2026-03-01T00:00:00.000Z";
+
+  type IngestExtra = Pick<
+    Parameters<typeof ingestDataContract>[0],
+    "attribution" | "lineage"
+  >;
+
+  function ingest(
+    storage: DataStoragePort,
+    body: Record<string, unknown>,
+    collectedAt: string,
+    extra: IngestExtra = {},
+  ) {
+    return ingestDataContract({
+      storage,
+      scopeParam: SCOPE,
+      body,
+      collectedAt,
+      status: "stored",
+      ...extra,
+    });
+  }
+
+  async function latestData(storage: DataStoragePort) {
+    const read = await readDataContract({ storage, scopeParam: SCOPE });
+    if (!read.ok) throw new Error("expected read to succeed");
+    return read.envelope.data;
+  }
+
+  function ledgerOf(data: Record<string, unknown>) {
+    const ledger = readFirstAddedLedger(data);
+    if (!ledger) throw new Error("expected a first-added ledger");
+    return ledger;
+  }
+
+  it("dates every record of the first ingest with that write's collectedAt", async () => {
+    const storage = createMemoryStorage();
+    await ingest(storage, { items: [{ id: "a" }, { id: "b" }] }, T1);
+
+    const ledger = ledgerOf(await latestData(storage));
+    expect(ledger.trackedSince).toBe(T1);
+    expect(ledger.records).toEqual({
+      "items:i:a": T1,
+      "items:i:b": T1,
+    });
+  });
+
+  it("carries records forward unchanged when a later ingest adds nothing", async () => {
+    const storage = createMemoryStorage();
+    const body = { items: [{ id: "a" }, { id: "b" }] };
+    await ingest(storage, body, T1);
+    await ingest(storage, body, T2);
+
+    const ledger = ledgerOf(await latestData(storage));
+    expect(ledger.trackedSince).toBe(T1);
+    expect(ledger.records).toEqual({
+      "items:i:a": T1,
+      "items:i:b": T1,
+    });
+  });
+
+  it("dates only the record a later ingest adds", async () => {
+    const storage = createMemoryStorage();
+    await ingest(storage, { items: [{ id: "a" }, { id: "b" }] }, T1);
+    await ingest(
+      storage,
+      { items: [{ id: "a" }, { id: "b" }, { id: "c" }] },
+      T2,
+    );
+
+    expect(ledgerOf(await latestData(storage)).records).toEqual({
+      "items:i:a": T1,
+      "items:i:b": T1,
+      "items:i:c": T2,
+    });
+  });
+
+  it("keeps a record's original timestamp when it returns after a gap", async () => {
+    const storage = createMemoryStorage();
+    await ingest(storage, { items: [{ id: "a" }, { id: "b" }] }, T1);
+    await ingest(storage, { items: [{ id: "a" }] }, T2);
+    await ingest(storage, { items: [{ id: "a" }, { id: "b" }] }, T3);
+
+    expect(ledgerOf(await latestData(storage)).records).toEqual({
+      "items:i:a": T1,
+      "items:i:b": T1,
+    });
+  });
+
+  it("treats a pre-tracking snapshot's records as already existing", async () => {
+    const storage = createMemoryStorage();
+    const envelope = createDataFileEnvelope(SCOPE, T1, {
+      items: [{ id: "a" }],
+    });
+    await storage.writeEnvelope(envelope);
+    await storage.insertEntry({
+      fileId: null,
+      schemaId: null,
+      path: `${SCOPE}/${T1}.json`,
+      scope: SCOPE,
+      collectedAt: T1,
+      sizeBytes: JSON.stringify(envelope).length,
+      afterTombstoneVersion: null,
+    });
+
+    await ingest(storage, { items: [{ id: "a" }, { id: "b" }] }, T2);
+    const ledger = ledgerOf(await latestData(storage));
+    expect(ledger.trackedSince).toBe(T2);
+    expect(ledger.records).toEqual({
+      "items:i:a": null,
+      "items:i:b": T2,
+    });
+  });
+
+  it("rejects a body that carries the reserved $firstAdded key", async () => {
+    const storage = createMemoryStorage();
+    const result = await ingest(
+      storage,
+      { items: [{ id: "a" }], $firstAdded: { version: 1 } },
+      T1,
+    );
+    expect(result).toEqual({
+      ok: false,
+      status: 400,
+      body: {
+        error: "INVALID_BODY",
+        message: "Request body must not contain the reserved $firstAdded key",
+      },
+    });
+    expect(storage.listVersions(SCOPE, {})).toEqual([]);
+  });
+
+  it("still ingests when the previous envelope cannot be read", async () => {
+    const storage = createMemoryStorage();
+    await ingest(storage, { items: [{ id: "a" }] }, T1);
+    vi.spyOn(storage, "readEnvelope").mockRejectedValueOnce(new Error("boom"));
+
+    const result = await ingest(storage, { items: [{ id: "a" }] }, T2);
+    expect(result.ok).toBe(true);
+
+    const data = await latestData(storage);
+    expect("$firstAdded" in data).toBe(false);
+  });
+
+  it("stamps the ledger alongside $writtenBy and $lineage", async () => {
+    const storage = createMemoryStorage();
+    const source = `0x${"ab".repeat(32)}` as const;
+    const lineage = {
+      sources: [source],
+      writtenAt: "2026-01-01T00:00:00.000Z",
+    };
+    const attribution = {
+      builder: `0x${"11".repeat(20)}` as `0x${string}`,
+      grantId: "grant-1",
+      signature: "0xdeadbeef",
+      bodyHash: "0xabc",
+      writtenAt: "2026-01-01T00:00:00.000Z",
+    };
+
+    await ingest(storage, { items: [{ id: "a" }], lineage: [source] }, T1, {
+      attribution,
+      lineage,
+    });
+
+    const data = await latestData(storage);
+    expect(data.$writtenBy).toEqual(attribution);
+    expect(data.$lineage).toEqual(lineage);
+    expect(ledgerOf(data).records).toMatchObject({ "items:i:a": T1 });
   });
 });

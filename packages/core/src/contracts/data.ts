@@ -18,6 +18,12 @@ import {
   stampLineage,
   type StoredLineage,
 } from "../lineage/lineage.js";
+import {
+  buildFirstAddedLedger,
+  hasReservedFirstAddedKey,
+  stampFirstAdded,
+  type FirstAddedLedger,
+} from "../additions/first-added.js";
 
 export type DataContractErrorCode =
   "INVALID_SCOPE" | "INVALID_BODY" | "NOT_FOUND";
@@ -146,14 +152,16 @@ export interface IngestDataContractInput {
    * Builder attribution for delegated (write-session) writes. When present,
    * it is stamped into the envelope `data` under the reserved `$writtenBy`
    * key so it travels through the unchanged encrypt/upload/register path.
-   * Owner writes pass nothing and the envelope is byte-identical to today.
+   * Owner writes pass nothing, but every JSON write still gains the
+   * server-stamped `$firstAdded` ledger, so no write is byte-identical to
+   * the caller's body.
    */
   attribution?: WriterAttribution;
   /**
    * Validated lineage for a derivative write (see lineage/lineage.ts). When
    * present it is stamped into the envelope `data` under the reserved
-   * `$lineage` key, next to `$writtenBy`; absent = root record, envelope
-   * unchanged.
+   * `$lineage` key, next to `$writtenBy`; absent = root record (the record
+   * still carries `$firstAdded`).
    */
   lineage?: StoredLineage;
   /** See `IndexEntry.afterTombstoneVersion`. */
@@ -441,11 +449,29 @@ export async function ingestDataContract(
       },
     };
   }
+  // The first-added ledger is derived from successive snapshots, so a caller
+  // must not supply one: a planted ledger would date records wrongly.
+  if (hasReservedFirstAddedKey(input.body)) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: "INVALID_BODY",
+        message: "Request body must not contain the reserved $firstAdded key",
+      },
+    };
+  }
 
+  const firstAdded = await buildIngestFirstAddedLedger(
+    input.storage,
+    scopeResult.scope,
+    input.body,
+    input.collectedAt,
+  );
   const envelope = createDataFileEnvelope(
     scopeResult.scope,
     input.collectedAt,
-    stampServerKeys(input.body, input),
+    stampServerKeys(input.body, input, firstAdded),
   );
   const writeResult = await input.storage.writeEnvelope(envelope);
   try {
@@ -472,20 +498,76 @@ export async function ingestDataContract(
   };
 }
 
+/** Newest versions scanned when looking for the scope's previous snapshot. */
+const FIRST_ADDED_VERSION_LOOKBACK = 200;
+
 /**
- * Stamp the server-owned reserved keys (`$writtenBy`, `$lineage`) into the
- * record about to be stored. Both are absent from owner root writes, so such
- * an envelope stays byte-identical to today's.
+ * The first-added ledger for a JSON write, or null when it cannot be built
+ * safely. Best-effort: a ledger must never fail or over-count a write.
+ */
+async function buildIngestFirstAddedLedger(
+  storage: DataStoragePort,
+  scope: string,
+  body: Record<string, unknown>,
+  collectedAt: string,
+): Promise<FirstAddedLedger | null> {
+  try {
+    // Both implementations order versions newest-first, but take the max by
+    // collectedAt explicitly so the wrong snapshot never becomes "previous".
+    const versions = storage.listVersions(scope, {
+      limit: FIRST_ADDED_VERSION_LOOKBACK,
+    });
+    let previous: IndexEntry | null = null;
+    for (const version of versions) {
+      if (version.collectedAt === collectedAt) continue;
+      if (
+        previous === null ||
+        version.collectedAt.localeCompare(previous.collectedAt) > 0
+      ) {
+        previous = version;
+      }
+    }
+    if (previous === null) {
+      return buildFirstAddedLedger({
+        previousData: null,
+        newData: body,
+        collectedAt,
+      });
+    }
+    // Read as a method on `storage` (never detached) to keep `this` bound.
+    const envelope = storage.readStoredEnvelope
+      ? await storage.readStoredEnvelope(scope, previous.collectedAt)
+      : await storage.readEnvelope(scope, previous.collectedAt);
+    return buildFirstAddedLedger({
+      previousData: isRecord(envelope.data) ? envelope.data : null,
+      newData: body,
+      collectedAt,
+    });
+  } catch {
+    // An unreadable previous snapshot must not read as "no previous
+    // snapshot": that would date every existing record as new.
+    return null;
+  }
+}
+
+/**
+ * Stamp the server-owned reserved keys (`$writtenBy`, `$lineage` and
+ * `$firstAdded`) into the record about to be stored. Every JSON write gains
+ * `$firstAdded` (the first-seen ledger); `$writtenBy` and `$lineage` stay
+ * absent unless the write carried them, so a root owner write is no longer
+ * byte-identical to the caller's body.
  */
 function stampServerKeys(
   data: Record<string, unknown>,
   input: Pick<IngestDataContractInput, "attribution" | "lineage">,
+  firstAdded: FirstAddedLedger | null = null,
 ): Record<string, unknown> {
   let stamped = data;
   if (input.lineage) stamped = stampLineage(stamped, input.lineage);
   if (input.attribution) {
     stamped = stampWriterAttribution(stamped, input.attribution);
   }
+  if (firstAdded) stamped = stampFirstAdded(stamped, firstAdded);
   return stamped;
 }
 

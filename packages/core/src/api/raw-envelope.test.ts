@@ -65,3 +65,50 @@ describe("redactJsonEnvelopeBytesForGrantee", () => {
     });
   });
 });
+
+describe("redactEnvelopeForGrantee", () => {
+  const FIRST_ADDED = {
+    version: 1,
+    trackedSince: "2026-09-03T11:00:00.000Z",
+    records: { "items:i:a": "2026-09-03T11:00:00.000Z" },
+  };
+
+  it("drops a lone $firstAdded ledger and keeps the other data", () => {
+    const envelope = DataFileEnvelopeSchema.parse({
+      version: "1.0",
+      scope: "instagram.profile",
+      collectedAt: "2026-09-03T11:00:00.000Z",
+      data: { name: "Ada", items: [1, 2], $firstAdded: FIRST_ADDED },
+    });
+    expect(envelope.data.$firstAdded).toEqual(FIRST_ADDED);
+
+    const redacted = redactEnvelopeForGrantee(envelope);
+    expect(redacted.data).toEqual({ name: "Ada", items: [1, 2] });
+  });
+
+  it("drops $firstAdded on the byte path too", () => {
+    expectLegacyEquivalent({
+      version: "1.0",
+      scope: "instagram.profile",
+      collectedAt: "2026-09-03T11:00:00.000Z",
+      data: { name: "Ada", $firstAdded: FIRST_ADDED },
+    });
+  });
+
+  it("drops $firstAdded together with $writtenBy and $lineage", () => {
+    const envelope = DataFileEnvelopeSchema.parse({
+      version: "1.0",
+      scope: "instagram.profile",
+      collectedAt: "2026-09-03T11:00:00.000Z",
+      data: {
+        name: "Ada",
+        $writtenBy: { builder: "0xabcd" },
+        $lineage: { sources: ["0x1234"], writtenAt: "2026-09-03" },
+        $firstAdded: FIRST_ADDED,
+      },
+    });
+
+    const redacted = redactEnvelopeForGrantee(envelope);
+    expect(redacted.data).toEqual({ name: "Ada" });
+  });
+});

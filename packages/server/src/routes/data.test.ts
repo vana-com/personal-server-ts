@@ -299,7 +299,10 @@ describe("POST /v1/data/:scope", () => {
     expect(content.version).toBe("1.0");
     expect(content.scope).toBe("instagram.profile");
     expect(content.collectedAt).toBe(json.collectedAt);
-    expect(content.data).toEqual({ username: "test" });
+    expect(content.data).toEqual({
+      username: "test",
+      $firstAdded: expect.objectContaining({ version: 1 }),
+    });
   });
 
   it("SQLite index has matching row", async () => {
@@ -537,8 +540,14 @@ describe("POST /v1/data/:scope", () => {
     );
     const content1 = JSON.parse(await readFile(path1, "utf-8"));
     const content2 = JSON.parse(await readFile(path2, "utf-8"));
-    expect(content1.data).toEqual({ version: 1 });
-    expect(content2.data).toEqual({ version: 2 });
+    expect(content1.data).toEqual({
+      version: 1,
+      $firstAdded: expect.objectContaining({ version: 1 }),
+    });
+    expect(content2.data).toEqual({
+      version: 2,
+      $firstAdded: expect.objectContaining({ version: 1 }),
+    });
   });
 });
 
