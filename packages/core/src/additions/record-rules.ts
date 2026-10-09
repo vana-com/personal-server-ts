@@ -9,124 +9,159 @@ export interface MemoryRecordRule {
    * scope's dataset name (the part after the first dot).
    */
   aliases?: readonly string[];
-  /** Fields tried in order for the record's stable identity. Dotted paths allowed (e.g. "track.id"). */
+  /**
+   * LEGACY keyed form: fields tried in order for the record's identity.
+   * Dotted paths allowed. Empty = the collection is counted but not tracked.
+   */
   idFields: readonly string[];
+  /**
+   * ROWS form (stored PDPP `{ records: [...] }`): fields tried in order for
+   * the identity. Each is chosen so the legacy projection binding copies the
+   * value unchanged into the matching `idFields` field, so one record has
+   * the same key in both forms (proved per binding in
+   * `record-rules.parity.test.ts`). Empty = counted but not tracked.
+   */
+  rowIdFields: readonly string[];
   /** Rows form: keep a row only when this field equals this value (a stream that feeds several collections). */
   streamFilter?: { field: string; equals: string };
 }
 
+/** A collection counted toward the total but never tracked for additions. */
+const untracked = (
+  collection: string,
+  aliases?: readonly string[],
+): MemoryRecordRule => ({
+  collection,
+  ...(aliases ? { aliases } : {}),
+  idFields: [],
+  rowIdFields: [],
+});
+
+/** Same id field in both forms. */
+const sameId = (
+  collection: string,
+  fields: readonly string[],
+  aliases?: readonly string[],
+): MemoryRecordRule => ({
+  collection,
+  ...(aliases ? { aliases } : {}),
+  idFields: fields,
+  rowIdFields: fields,
+});
+
 /**
  * Scope -> its record collections. An empty list means the scope holds no
- * memory records.
+ * memory records (a singleton, or a stream that only joins into another
+ * scope's legacy body).
  *
- * These rules must stay in step with the owner apps' memory list. Changing a
- * rule's `collection` or `idFields` re-keys that scope's ledger, so its
- * records would be dated as new on the next write.
+ * Both stored forms of a scope must produce the same keys, so each rule names
+ * the id field per form. Where the projection binding keeps no field that is
+ * equal in both forms (linkedin.experience, linkedin.education: the legacy
+ * body drops the row id), the collection is untracked in both forms and only
+ * counts toward the total.
+ *
+ * Changing a rule's `collection` or id fields re-keys that scope's ledger, so
+ * its records would be dated as new until its sidecar is rebuilt.
  */
 export const MEMORY_RECORD_RULES: Readonly<
   Record<string, readonly MemoryRecordRule[]>
 > = {
-  "chatgpt.conversations": [{ collection: "conversations", idFields: ["id"] }],
+  "chatgpt.conversations": [sameId("conversations", ["id"])],
   "chatgpt.memories": [],
   "chatgpt.messages": [],
+  // Line items that only join into their order's legacy body.
+  "amazon.order_items": [],
+  "heb.order_items": [],
+  "wholefoods.order_items": [],
+  "claude.messages": [],
+  "claude.account_profile": [],
+  "claude.project_documents": [],
   "github.profile": [],
+  "github.user": [],
+  "github.user_stats": [],
+  "github.pinned_repositories": [],
+  "github.organizations": [],
+  // The binding projects the row's `html_url` into the legacy `url`.
   "github.repositories": [
     {
       collection: "repositories",
-      idFields: ["url", "fullName", "full_name", "name"],
+      idFields: ["url"],
+      rowIdFields: ["html_url"],
     },
   ],
   "github.starred": [
-    {
-      collection: "starred",
-      idFields: ["url", "fullName", "full_name", "name"],
-    },
+    { collection: "starred", idFields: ["url"], rowIdFields: ["html_url"] },
   ],
-  "github.events": [{ collection: "events", idFields: ["id"] }],
+  "github.events": [sameId("events", ["id"])],
+  // The PDPP streams behind this legacy scope are stored as their own scopes
+  // (`github.issues`, `github.pull_requests`, `github.user`), never as one
+  // `github.history` rows scope, so these rules serve the legacy body only.
   "github.history": [
-    { collection: "issues", idFields: ["id", "number"] },
-    {
-      collection: "pullRequests",
-      aliases: ["pull_requests"],
-      idFields: ["id", "number"],
-    },
+    sameId("issues", ["id"]),
+    sameId("pullRequests", ["id"], ["pull_requests"]),
   ],
+  "github.issues": [sameId("issues", ["id"])],
+  "github.pull_requests": [sameId("pullRequests", ["id"], ["pull_requests"])],
   // The PDPP `contributions` stream's records become the legacy `days` array.
-  "github.contributions": [
-    { collection: "days", aliases: ["contributions"], idFields: ["date"] },
+  "github.contributions": [sameId("days", ["date"], ["contributions"])],
+  // The binding projects the row `id` into the legacy `recordName`.
+  "icloud_notes.notes": [
+    { collection: "notes", idFields: ["recordName"], rowIdFields: ["id"] },
   ],
-  "icloud_notes.notes": [{ collection: "notes", idFields: ["recordName"] }],
-  "icloud_notes.folders": [{ collection: "folders", idFields: ["recordName"] }],
+  "icloud_notes.folders": [
+    { collection: "folders", idFields: ["recordName"], rowIdFields: ["id"] },
+  ],
   "instagram.profile": [],
-  "instagram.posts": [
-    { collection: "posts", idFields: ["id", "shortcode", "taken_at"] },
-  ],
-  // The PDPP `following` stream's records become the legacy `accounts` array.
+  "instagram.post_likes": [],
+  // The legacy post has no id; `taken_at` is copied unchanged.
+  "instagram.posts": [sameId("posts", ["taken_at"])],
+  // The PDPP `following` stream's records become the legacy `accounts` array;
+  // the binding projects the row `id` into the legacy `pk`.
   "instagram.following": [
     {
       collection: "accounts",
       aliases: ["following"],
-      idFields: ["pk", "username"],
+      idFields: ["pk"],
+      rowIdFields: ["id"],
     },
   ],
   // The PDPP `ads` stream carries all kinds; `streamFilter` keeps each
   // collection to the rows the projection assigns to it.
   "instagram.ads": [
     {
-      collection: "ad_topics",
-      aliases: ["ads"],
-      idFields: ["name"],
+      ...sameId("ad_topics", ["name"], ["ads"]),
       streamFilter: { field: "kind", equals: "ad_topic" },
     },
     {
-      collection: "advertisers",
-      aliases: ["ads"],
-      idFields: ["name"],
+      ...sameId("advertisers", ["name"], ["ads"]),
       streamFilter: { field: "kind", equals: "advertiser" },
     },
   ],
-  "discord.servers": [{ collection: "servers", idFields: ["id"] }],
-  "discord.messages": [{ collection: "messages", idFields: ["id"] }],
-  "discord.connections": [{ collection: "connections", idFields: ["id"] }],
-  // These stream a stored PDPP `{ records }` body, whose rows are the
-  // collection. The dataset-named alias keeps a keyed body (`{ posts: [...] }`)
-  // on the same `records:` keys.
-  "x.posts": [{ collection: "records", aliases: ["posts"], idFields: ["id"] }],
-  "x.likes": [{ collection: "records", aliases: ["likes"], idFields: ["id"] }],
-  "x.bookmarks": [
-    { collection: "records", aliases: ["bookmarks"], idFields: ["id"] },
-  ],
-  "linkedin.experience": [
-    {
-      collection: "items",
-      aliases: ["experience", "experiences"],
-      idFields: ["id", "experienceGroupId"],
-    },
-  ],
-  "linkedin.education": [
-    { collection: "items", aliases: ["education"], idFields: ["id"] },
-  ],
+  "discord.servers": [sameId("servers", ["id"])],
+  "discord.messages": [sameId("messages", ["id"])],
+  "discord.connections": [sameId("connections", ["id"])],
+  // These store a PDPP `{ records }` body, whose rows are the collection. The
+  // dataset-named alias keeps a keyed body (`{ posts: [...] }`) on the same
+  // `records:` keys.
+  "x.posts": [sameId("records", ["id"], ["posts"])],
+  "x.likes": [sameId("records", ["id"], ["likes"])],
+  "x.bookmarks": [sameId("records", ["id"], ["bookmarks"])],
+  // The legacy body drops the row id and keeps no other field that is
+  // equal in both forms: counted, never tracked.
+  "linkedin.experience": [untracked("items", ["experience", "experiences"])],
+  "linkedin.education": [untracked("items", ["education"])],
+  // The binding projects the row `uri` unchanged.
   "spotify.playlists": [
-    {
-      collection: "playlists",
-      aliases: ["public_playlists", "items"],
-      idFields: ["id", "playlist_id", "playlistId", "uri"],
-    },
+    sameId("playlists", ["uri"], ["public_playlists", "items"]),
   ],
-  // The PDPP `saved_tracks` stream's records become the legacy `savedTracks` array.
+  "spotify.playlist_items": [],
   "spotify.savedTracks": [
-    {
-      collection: "savedTracks",
-      aliases: ["tracks", "items", "saved_tracks"],
-      idFields: [
-        "track.id",
-        "track.track_id",
-        "track.trackId",
-        "track.uri",
-        "id",
-        "uri",
-      ],
-    },
+    sameId("savedTracks", ["uri"], ["tracks", "items", "saved_tracks"]),
+  ],
+  // The PDPP stream is `saved_tracks`, so the rows are stored under this
+  // scope; its keys equal the legacy `spotify.savedTracks` keys.
+  "spotify.saved_tracks": [
+    sameId("savedTracks", ["uri"], ["saved_tracks", "tracks", "items"]),
   ],
 };
 

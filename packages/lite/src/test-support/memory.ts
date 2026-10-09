@@ -119,6 +119,13 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
   const firstSeenLedgers = new Map<string, unknown>();
   let nextId = 1;
 
+  function dropEmptyLedger(scope: string): void {
+    for (const entry of entries.values()) {
+      if (entry.scope === scope) return;
+    }
+    firstSeenLedgers.delete(scope);
+  }
+
   function envelopeKey(scope: string, collectedAt: string): string {
     return `${scope}\n${collectedAt}`;
   }
@@ -410,6 +417,7 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
               blockPayloads.delete(payloadKey);
             }
           }
+          dropEmptyLedger(entry.scope);
           return true;
         }
       }
@@ -428,6 +436,7 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
               blockPayloads.delete(payloadKey);
             }
           }
+          dropEmptyLedger(entry.scope);
           return true;
         }
       }

@@ -1159,7 +1159,9 @@ describe("download worker", () => {
         version: "1.0",
         scope: REPOS,
         collectedAt,
-        data: { repositories: names.map((name) => ({ name })) },
+        data: {
+          repositories: names.map((name) => ({ url: `https://x/${name}` })),
+        },
       };
       (decryptWithPassword as ReturnType<typeof vi.fn>).mockResolvedValue(
         new TextEncoder().encode(JSON.stringify(envelope)),
@@ -1190,11 +1192,12 @@ describe("download worker", () => {
         version: 2,
         scope: REPOS,
         baseline: V1,
+        current: V2,
         latest: { collectedAt: V2, total: 3 },
         records: {
-          "repositories:i:a": [V1, V2],
-          "repositories:i:b": [V1, V2],
-          "repositories:i:c": [V2, V2],
+          "repositories:i:https://x/a": [V1, V2],
+          "repositories:i:https://x/b": [V1, V2],
+          "repositories:i:https://x/c": [V2, V2],
         },
       });
     });

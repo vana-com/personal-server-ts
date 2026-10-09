@@ -4,7 +4,10 @@ import {
   readScopeFirstSeenLedger,
   type ScopeFirstSeenLedger,
 } from "../additions/first-added.js";
-import { recordStoredVersion } from "../additions/ledger-store.js";
+import {
+  ensureScopeLedger,
+  recordStoredVersion,
+} from "../additions/ledger-store.js";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
 import type { DataStoragePort } from "../ports/index.js";
 import {
@@ -118,10 +121,9 @@ describe("first-seen sidecar on ingest", () => {
     const storage = createMemoryDataStorage();
     await ingest(storage, items("a", "b"), T1);
     await ingestBinary(storage, T2);
-    expect((await ledgerOf(storage)).latest).toEqual({
-      collectedAt: T2,
-      total: 0,
-    });
+    const afterBinary = await ledgerOf(storage);
+    expect(afterBinary.latest).toEqual({ collectedAt: T2, total: 1 });
+    expect(afterBinary.records["items:i:a"]![0]).toBe(T1);
     await ingest(storage, items("a", "b", "c"), T3);
 
     const ledger = await ledgerOf(storage);
@@ -132,21 +134,47 @@ describe("first-seen sidecar on ingest", () => {
     expect(summary.days.at(-1)).toEqual({ date: "2026-10-09", added: 1 });
   });
 
-  it("keeps history when the sidecar read fails or the sidecar is corrupt", async () => {
+  it("does not date everything as added when a binary write came first", async () => {
+    const storage = createMemoryDataStorage();
+    await ingestBinary(storage, T1);
+    await ingest(storage, items("a", "b", "c"), T2);
+    const summary = await summarize(storage);
+    expect(summary.total).toBe(3);
+    expect(summary.days.reduce((sum, day) => sum + day.added, 0)).toBe(0);
+    expect(summary.trackedSince).toBe(T2);
+  });
+
+  it("reports trackedSince null for a scope with only a binary file", async () => {
+    const storage = createMemoryDataStorage();
+    await ingestBinary(storage, T1);
+    const summary = await summarize(storage);
+    expect(summary.total).toBe(1);
+    expect(summary.trackedSince).toBeNull();
+    expect(summary.scopes).toEqual([
+      { scope: SCOPE, total: 1, trackedSince: null },
+    ]);
+  });
+
+  it("rebuilds an unreadable or corrupt sidecar on the next additions read", async () => {
     const storage = createMemoryDataStorage();
     await ingest(storage, items("a"), T1);
     vi.spyOn(storage, "readFirstSeenLedger").mockRejectedValueOnce(
       new Error("boom"),
     );
     await ingest(storage, items("a", "b"), T2);
-    // The corrupt/unreadable sidecar was rebuilt from the retained versions.
-    const ledger = await ledgerOf(storage);
-    expect(ledger.baseline).toBe(T1);
-    expect(ledger.records["items:i:b"]).toEqual([T2, T2]);
+    // The write never rebuilds; the owner's read catches the sidecar up.
+    const caught = await ensureScopeLedger(storage, SCOPE);
+    expect(caught?.baseline).toBe(T1);
+    expect(caught?.records["items:i:b"]).toEqual([T2, T2]);
 
     await storage.writeFirstSeenLedger!(SCOPE, { version: 2, junk: true });
     await ingest(storage, items("a", "b", "c"), T3);
-    expect((await ledgerOf(storage)).records["items:i:a"]).toEqual([T1, T3]);
+    expect(await storage.readFirstSeenLedger!(SCOPE)).toEqual({
+      version: 2,
+      junk: true,
+    });
+    const rebuilt = await ensureScopeLedger(storage, SCOPE);
+    expect(rebuilt?.records["items:i:a"]).toEqual([T1, T3]);
   });
 
   it("still succeeds when writing the sidecar fails", async () => {
@@ -170,6 +198,7 @@ describe("first-seen sidecar on ingest", () => {
 
   it("folds concurrent ingests of one scope without losing either", async () => {
     const storage = createMemoryDataStorage();
+    await ingest(storage, items("a"), T1);
     const read = storage.readFirstSeenLedger!.bind(storage);
     storage.readFirstSeenLedger = async (scope) => {
       const value = await read(scope);
@@ -177,7 +206,6 @@ describe("first-seen sidecar on ingest", () => {
       return value;
     };
     await Promise.all([
-      ingest(storage, items("a"), T1),
       ingest(storage, items("a", "b"), T2),
       ingest(storage, items("a", "b", "c"), T3),
     ]);
@@ -252,13 +280,29 @@ describe("first-seen sidecar backfill", () => {
     expect(ledger.records["items:i:a"]).toEqual([T1, T2]);
   });
 
-  it("backfills on the first ingest after an upgrade and folds the new version from memory", async () => {
+  it("never rebuilds on a write: older versions and no sidecar leave it absent", async () => {
     const storage = createMemoryDataStorage();
     await storeWithoutSidecar(storage, SCOPE, T1, items("a"));
-    await ingest(storage, items("a", "b"), T2);
-    const ledger = await ledgerOf(storage);
-    expect(ledger.baseline).toBe(T1);
-    expect(ledger.records["items:i:b"]).toEqual([T2, T2]);
+    await storeWithoutSidecar(storage, SCOPE, T2, items("a", "b"));
+    const readEnvelope = vi.spyOn(storage, "readEnvelope");
+
+    await ingest(storage, items("a", "b", "c"), T3);
+
+    expect(readEnvelope).not.toHaveBeenCalled();
+    expect(await storage.readFirstSeenLedger!(SCOPE)).toBeNull();
+    // The owner's read builds it from all three versions.
+    const summary = await summarize(storage);
+    expect(summary.trackedSince).toBe(T1);
+    expect(summary.days.find((d) => d.date === "2026-10-09")?.added).toBe(1);
+    expect(summary.days.find((d) => d.date === "2026-10-08")?.added).toBe(1);
+  });
+
+  it("starts a sidecar from memory when the written version is the scope's first", async () => {
+    const storage = createMemoryDataStorage();
+    const readEnvelope = vi.spyOn(storage, "readEnvelope");
+    await ingest(storage, items("a"), T1);
+    expect(readEnvelope).not.toHaveBeenCalled();
+    expect((await ledgerOf(storage)).baseline).toBe(T1);
   });
 
   it("two devices holding the same versions compute the same ledger", async () => {
@@ -269,12 +313,13 @@ describe("first-seen sidecar backfill", () => {
       await storeWithoutSidecar(storage, SCOPE, T2, items("a", "b"));
     }
     await summarize(one);
-    // The other device receives them in the opposite order via sync.
+    // The other device receives T2 by sync with T1 already stored.
     await recordStoredVersion(two, {
       scope: SCOPE,
       collectedAt: T2,
       data: items("a", "b"),
     });
+    await summarize(two);
     expect(await ledgerOf(two)).toEqual(await ledgerOf(one));
   });
 
@@ -430,6 +475,7 @@ describe("sidecar shape", () => {
       version: 2,
       scope: SCOPE,
       baseline: T1,
+      current: T1,
       latest: { collectedAt: T1, total: 1 },
       records: { "items:i:a": [T1, T1] },
     });

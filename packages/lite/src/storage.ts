@@ -13,6 +13,7 @@ import {
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { WriteResult } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
+import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
 import type { PsLiteStorageAdapter } from "./runtime.js";
 import { createStorageReadMethods, sortEntries } from "./storage-utils.js";
 import {
@@ -881,35 +882,44 @@ export async function createPersistentPsLiteStorage(
       if (firstSeenLedgers.delete(scope)) await persist();
     },
 
-    async deleteScope(scope) {
-      firstSeenLedgers.delete(scope);
-      let deleted = 0;
-      const deletedPaths: string[] = [];
-      const deletedBlockTrees: string[] = [];
-      state = {
-        ...state,
-        entries: state.entries.filter((entry) => {
-          if (entry.scope !== scope) return true;
-          deleted += 1;
-          deletedPaths.push(envelopePath(entry.scope, entry.collectedAt));
-          deletedBlockTrees.push(blockTreePath(entry.scope, entry.collectedAt));
-          return false;
-        }),
-      };
-      await Promise.all(
-        [
-          ...deletedPaths.flatMap((path) => [
-            fileStore.deleteEnvelope(path),
-            fallbackStore.deleteEnvelope(path),
-          ]),
-          ...deletedBlockTrees.flatMap((path) => [
-            fileStore.deleteBlockTree?.(path),
-            fallbackStore.deleteBlockTree?.(path),
-          ]),
-        ].filter((promise): promise is Promise<void> => promise !== undefined),
-      );
-      await persist();
-      return deleted;
+    // Deletions run under the scope's first-seen sidecar lock (a rebuild in
+    // flight cannot write it back), and the sidecar goes with the scope's last
+    // version, so no delete path leaves a stale ledger behind.
+    deleteScope(scope) {
+      return withScopeLock(scope, async () => {
+        firstSeenLedgers.delete(scope);
+        let deleted = 0;
+        const deletedPaths: string[] = [];
+        const deletedBlockTrees: string[] = [];
+        state = {
+          ...state,
+          entries: state.entries.filter((entry) => {
+            if (entry.scope !== scope) return true;
+            deleted += 1;
+            deletedPaths.push(envelopePath(entry.scope, entry.collectedAt));
+            deletedBlockTrees.push(
+              blockTreePath(entry.scope, entry.collectedAt),
+            );
+            return false;
+          }),
+        };
+        await Promise.all(
+          [
+            ...deletedPaths.flatMap((path) => [
+              fileStore.deleteEnvelope(path),
+              fallbackStore.deleteEnvelope(path),
+            ]),
+            ...deletedBlockTrees.flatMap((path) => [
+              fileStore.deleteBlockTree?.(path),
+              fallbackStore.deleteBlockTree?.(path),
+            ]),
+          ].filter(
+            (promise): promise is Promise<void> => promise !== undefined,
+          ),
+        );
+        await persist();
+        return deleted;
+      });
     },
 
     async deleteVersion(scope, collectedAt) {
@@ -928,6 +938,10 @@ export async function createPersistentPsLiteStorage(
   };
 
   async function removeEntry(entry: IndexEntry): Promise<boolean> {
+    return withScopeLock(entry.scope, () => removeEntryLocked(entry));
+  }
+
+  async function removeEntryLocked(entry: IndexEntry): Promise<boolean> {
     const blobPath = envelopePath(entry.scope, entry.collectedAt);
     // Delete the blob FIRST (both stores tolerate a missing blob); only drop the index row once
     // the blob is gone. If blob deletion throws for a real reason, the row is preserved so the
@@ -946,6 +960,10 @@ export async function createPersistentPsLiteStorage(
       ...state,
       entries: state.entries.filter((e) => e !== entry),
     };
+    // The sidecar goes with the scope's last version.
+    if (!state.entries.some((e) => e.scope === entry.scope)) {
+      firstSeenLedgers.delete(entry.scope);
+    }
     await persist();
     return true;
   }

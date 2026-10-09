@@ -731,7 +731,7 @@ export async function reconcileDeletedDataPoint(
   // The first-seen sidecar was derived from versions that no longer exist.
   // Dropping it lets the next write or additions read rebuild it from what
   // this replica retains (a re-add above the tombstone included).
-  if (removed > 0) {
+  if (removed > 0 || kept === 0) {
     try {
       await storage.deleteFirstSeenLedger?.(record.scope);
     } catch {

@@ -232,6 +232,65 @@ describe("first-seen sidecar on the Node storage", () => {
     await expect(storage.readFirstSeenLedger!("a/../b.c")).rejects.toThrow();
   });
 
+  describe("never outlives the scope's last version", () => {
+    it("is removed when deleteVersion removes the last version", async () => {
+      await ingest(items("secret-id"), T1);
+      await stat(sidecarPath());
+      await storage.deleteVersion(SCOPE, T1);
+      await expect(stat(sidecarPath())).rejects.toThrow();
+    });
+
+    it("is removed when deleteByFileId removes the last version", async () => {
+      await ingest(items("secret-id"), T1);
+      const entry = storage.findEntry({ scope: SCOPE })!;
+      await storage.updateFileId(entry.path, "file-1");
+      await storage.deleteByFileId("file-1");
+      await expect(stat(sidecarPath())).rejects.toThrow();
+    });
+
+    it("is removed when dropUnsyncedEntry removes the last row", async () => {
+      await ingest(items("secret-id"), T1);
+      const entry = storage.findEntry({ scope: SCOPE })!;
+      expect(await storage.dropUnsyncedEntry!(entry.path)).toBe(true);
+      await expect(stat(sidecarPath())).rejects.toThrow();
+    });
+
+    it("stays while other versions remain, and a deleted newest version is rebuilt away", async () => {
+      await ingest(items("a"), T1);
+      await ingest(items("a", "secret-id"), T2);
+      await storage.deleteVersion(SCOPE, T2);
+      await stat(sidecarPath());
+      const rebuilt = await ensureScopeLedger(storage, SCOPE);
+      expect(rebuilt?.latest.collectedAt).toBe(T1);
+      expect(Object.keys(rebuilt!.records)).toEqual(["items:i:a"]);
+      expect(await readFile(sidecarPath(), "utf-8")).not.toContain("secret-id");
+    });
+
+    it("a delete racing a rebuild leaves nothing on disk", async () => {
+      await ingest(items("secret-id"), T1);
+      await rm(sidecarPath());
+      const original = storage.readEnvelope.bind(storage);
+      let deletion: Promise<number> | undefined;
+      const racing: DataStoragePort = new Proxy(storage, {
+        get(target, property) {
+          if (property === "readEnvelope") {
+            return async (scope: string, collectedAt: string) => {
+              const envelope = await original(scope, collectedAt);
+              deletion ??= storage.deleteScope(scope);
+              return envelope;
+            };
+          }
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      await ensureScopeLedger(racing, SCOPE);
+      await deletion;
+      await expect(stat(sidecarPath())).rejects.toThrow();
+      expect(storage.countVersions(SCOPE)).toBe(0);
+    });
+  });
+
   it("buildDataBlocks of a stored envelope never sees the sidecar", async () => {
     await ingest(items("a"), T1);
     const stored = await storage.readEnvelope(SCOPE, T1);

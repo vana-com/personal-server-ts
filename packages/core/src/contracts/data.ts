@@ -433,14 +433,16 @@ export async function summarizeDataAdditionsContract(
   }
 
   const scopes = await collectScopes(input.storage, undefined, input.isVisible);
-  const ledgers: ScopeFirstSeenLedger[] = [];
-  for (const summary of scopes) {
-    const ledger = await ensureScopeLedger(input.storage, summary.scope);
-    if (ledger) ledgers.push(ledger);
+  // One scope at a time: only one ledger is in memory at once.
+  async function* ledgers(): AsyncGenerator<ScopeFirstSeenLedger> {
+    for (const summary of scopes) {
+      const ledger = await ensureScopeLedger(input.storage, summary.scope);
+      if (ledger) yield ledger;
+    }
   }
 
   return summarizeAdditions({
-    ledgers,
+    ledgers: ledgers(),
     timezone: input.timezone,
     days: input.days,
     now: input.now,
@@ -688,9 +690,10 @@ export async function deleteDataScopeContract(
   const scopeResult = parseDataScopeContract(input.scopeParam);
   if (!scopeResult.ok) return scopeResult;
 
+  // `deleteScope` removes the first-seen sidecar too, under the sidecar's
+  // lock so a rebuild in flight cannot write it back; the explicit call
+  // covers a storage port whose `deleteScope` predates the sidecar.
   const deletedCount = await input.storage.deleteScope(scopeResult.scope);
-  // `deleteScope` removes the first-seen sidecar too; this covers a storage
-  // port whose `deleteScope` predates the sidecar.
   await input.storage.deleteFirstSeenLedger?.(scopeResult.scope);
   return { ok: true, deletedCount };
 }

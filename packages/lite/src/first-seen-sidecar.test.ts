@@ -137,4 +137,27 @@ describe("PS-Lite first-seen sidecar", () => {
     );
     expect(await afterDelete.readFirstSeenLedger!(SCOPE)).toBeNull();
   });
+
+  it("drops the sidecar with the scope's last version, keeps it while others remain", async () => {
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "indexeddb" },
+      createMemoryPsLitePersistence(),
+    );
+    for (const [at, ids] of [
+      ["2026-10-01T12:00:00.000Z", ["a"]],
+      ["2026-10-02T12:00:00.000Z", ["a", "b"]],
+    ] as const) {
+      await ingestDataContract({
+        storage,
+        scopeParam: SCOPE,
+        body: items(...ids),
+        collectedAt: at,
+        status: "stored",
+      });
+    }
+    await storage.deleteVersion(SCOPE, "2026-10-01T12:00:00.000Z");
+    expect(await storage.readFirstSeenLedger!(SCOPE)).not.toBeNull();
+    await storage.deleteVersion(SCOPE, "2026-10-02T12:00:00.000Z");
+    expect(await storage.readFirstSeenLedger!(SCOPE)).toBeNull();
+  });
 });

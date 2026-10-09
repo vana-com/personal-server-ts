@@ -12,8 +12,11 @@ import {
 } from "./first-added.js";
 
 export interface AdditionsSummaryInput {
-  /** One first-seen ledger per visible scope. */
-  ledgers: readonly ScopeFirstSeenLedger[];
+  /**
+   * One first-seen ledger per visible scope. Consumed one at a time, so a
+   * lazy source keeps only one ledger in memory.
+   */
+  ledgers: Iterable<ScopeFirstSeenLedger> | AsyncIterable<ScopeFirstSeenLedger>;
   /** IANA timezone, e.g. "America/Toronto". */
   timezone: string;
   /** Number of local calendar days to report, ending with the day containing `now`. 1..31. */
@@ -27,13 +30,17 @@ export interface AdditionsSummary {
   total: number;
   /** Oldest first, exactly `days` entries, the last one is the local day containing `now`. */
   days: { date: string; added: number }[]; // date is "YYYY-MM-DD" in `timezone`
-  /** Earliest scope baseline, or null when there are no scopes. */
+  /** Earliest scope baseline, or null when no scope has a trackable version yet. */
   trackedSince: string | null;
   scopes: {
     scope: string;
     total: number;
-    /** The scope's baseline: records first seen then predate tracking. */
-    trackedSince: string;
+    /**
+     * The scope's baseline: records first seen then predate tracking. Null
+     * when no version of the scope is trackable yet (binary only, over the
+     * record cap, or no record has an id): the scope is total-only.
+     */
+    trackedSince: string | null;
   }[];
 }
 
@@ -101,9 +108,9 @@ export function validateTimezone(timezone: string): void {
   createFormatter(timezone);
 }
 
-export function summarizeAdditions(
+export async function summarizeAdditions(
   input: AdditionsSummaryInput,
-): AdditionsSummary {
+): Promise<AdditionsSummary> {
   const { timezone, days, now } = input;
   const formatter = createFormatter(timezone);
   const dayRows = buildDayRows(formatter, now, days);
@@ -114,7 +121,7 @@ export function summarizeAdditions(
   let trackedSince: string | null = null;
   let trackedSinceAt = Infinity;
 
-  for (const ledger of input.ledgers) {
+  for await (const ledger of input.ledgers) {
     for (const firstSeen of listAddedTimestamps(ledger)) {
       const date = localDate(formatter, new Date(Date.parse(firstSeen)));
       const index = dayIndex.get(date);
@@ -122,15 +129,19 @@ export function summarizeAdditions(
     }
 
     total += ledger.latest.total;
-    const baselineAt = Date.parse(ledger.baseline);
-    if (baselineAt < trackedSinceAt) {
-      trackedSinceAt = baselineAt;
-      trackedSince = ledger.baseline;
+    // A skipped scope keeps no per-record keys: it is total-only.
+    const scopeTrackedSince = ledger.skipped ? null : ledger.baseline;
+    if (scopeTrackedSince !== null) {
+      const baselineAt = Date.parse(scopeTrackedSince);
+      if (baselineAt < trackedSinceAt) {
+        trackedSinceAt = baselineAt;
+        trackedSince = scopeTrackedSince;
+      }
     }
     scopes.push({
       scope: ledger.scope,
       total: ledger.latest.total,
-      trackedSince: ledger.baseline,
+      trackedSince: scopeTrackedSince,
     });
   }
 
