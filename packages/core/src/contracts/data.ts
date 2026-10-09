@@ -24,9 +24,15 @@ import {
   stampFirstAdded,
   type FirstAddedLedger,
 } from "../additions/first-added.js";
+import {
+  InvalidTimezoneError,
+  summarizeAdditions,
+  type AdditionsSummary,
+  type ScopeAdditionsInput,
+} from "../additions/summary.js";
 
 export type DataContractErrorCode =
-  "INVALID_SCOPE" | "INVALID_BODY" | "NOT_FOUND";
+  "INVALID_SCOPE" | "INVALID_BODY" | "INVALID_QUERY" | "NOT_FOUND";
 
 export interface DataContractErrorBody {
   error: DataContractErrorCode;
@@ -247,6 +253,41 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 const VISIBILITY_PAGE_SIZE = 200;
 
+/**
+ * Every scope whose latest entry passes `isVisible` (all of them when no
+ * filter is given). Walks the whole listing because the index cannot filter
+ * by tombstone; a scope with no latest entry is kept (nothing covers it).
+ */
+async function collectScopes(
+  storage: DataStoragePort,
+  scopePrefix: string | undefined,
+  isVisible: DataVisibilityFilter | undefined,
+): Promise<ScopeSummary[]> {
+  const scopes: ScopeSummary[] = [];
+  for (let scan = 0; ; scan += VISIBILITY_PAGE_SIZE) {
+    const batch = storage.listScopes({
+      scopePrefix,
+      limit: VISIBILITY_PAGE_SIZE,
+      offset: scan,
+    });
+    for (const summary of batch.scopes) {
+      if (!isVisible) {
+        scopes.push(summary);
+        continue;
+      }
+      const latest = storage.findEntry({
+        scope: summary.scope,
+        at: summary.latestCollectedAt,
+      });
+      if (!latest || (await isVisible(summary.scope, latest))) {
+        scopes.push(summary);
+      }
+    }
+    if (batch.scopes.length < VISIBILITY_PAGE_SIZE) break;
+  }
+  return scopes;
+}
+
 export async function listDataScopesContract(
   input: ListDataScopesContractInput,
 ): Promise<ListDataScopesContractResult> {
@@ -257,24 +298,11 @@ export async function listDataScopesContract(
   if (input.isVisible) {
     // Filtered listing: walk every scope so the page and the total both
     // describe the visible set (the index cannot filter by tombstone).
-    const visible: ScopeSummary[] = [];
-    for (let scan = 0; ; scan += VISIBILITY_PAGE_SIZE) {
-      const batch = input.storage.listScopes({
-        scopePrefix: input.scopePrefix,
-        limit: VISIBILITY_PAGE_SIZE,
-        offset: scan,
-      });
-      for (const summary of batch.scopes) {
-        const latest = input.storage.findEntry({
-          scope: summary.scope,
-          at: summary.latestCollectedAt,
-        });
-        if (!latest || (await input.isVisible(summary.scope, latest))) {
-          visible.push(summary);
-        }
-      }
-      if (batch.scopes.length < VISIBILITY_PAGE_SIZE) break;
-    }
+    const visible = await collectScopes(
+      input.storage,
+      input.scopePrefix,
+      input.isVisible,
+    );
     total = visible.length;
     page = visible.slice(offset, offset + limit);
   } else {
@@ -365,6 +393,127 @@ export async function listDataVersionsContract(
       offset,
     },
   };
+}
+
+export interface SummarizeDataAdditionsContractInput {
+  storage: DataStoragePort;
+  isVisible?: DataVisibilityFilter;
+  /** IANA timezone, e.g. "America/Toronto". */
+  timezone: string;
+  /** Number of local calendar days to report. Must be an integer 1..31. */
+  days: number;
+  now: Date;
+}
+
+/** Newest versions scanned for a scope's latest snapshot and its recent siblings. */
+const ADDITIONS_VERSION_LIMIT = 20;
+
+function invalidQuery(message: string): DataContractError {
+  return {
+    ok: false,
+    status: 400,
+    body: { error: "INVALID_QUERY", message },
+  };
+}
+
+/** The stored bytes, not the read-time projection: the ledger is server-owned. */
+function readStoredEnvelope(
+  storage: DataStoragePort,
+  scope: string,
+  collectedAt: string,
+): Promise<DataFileEnvelope> {
+  return storage.readStoredEnvelope
+    ? storage.readStoredEnvelope(scope, collectedAt)
+    : storage.readEnvelope(scope, collectedAt);
+}
+
+/**
+ * The owner's additions summary over every visible scope. Scopes whose latest
+ * snapshot cannot be read are skipped; unreadable recent snapshots are ignored.
+ */
+export async function summarizeDataAdditionsContract(
+  input: SummarizeDataAdditionsContractInput,
+): Promise<AdditionsSummary | DataContractError> {
+  if (!Number.isInteger(input.days) || input.days < 1 || input.days > 31) {
+    return invalidQuery("days must be an integer between 1 and 31");
+  }
+
+  const scopeSummaries = await collectScopes(
+    input.storage,
+    undefined,
+    input.isVisible,
+  );
+  const nowMs = input.now.getTime();
+  const recentWindowMs = (input.days + 1) * 24 * 60 * 60 * 1000;
+  const scopes: ScopeAdditionsInput[] = [];
+
+  for (const summary of scopeSummaries) {
+    const versions = input.storage.listVersions(summary.scope, {
+      limit: ADDITIONS_VERSION_LIMIT,
+    });
+    // Both implementations order newest-first, but take the max explicitly so
+    // the wrong snapshot never becomes "latest".
+    let latest: IndexEntry | null = null;
+    for (const version of versions) {
+      if (
+        latest === null ||
+        version.collectedAt.localeCompare(latest.collectedAt) > 0
+      ) {
+        latest = version;
+      }
+    }
+    if (latest === null) continue;
+
+    let latestData: Record<string, unknown>;
+    try {
+      const envelope = await readStoredEnvelope(
+        input.storage,
+        summary.scope,
+        latest.collectedAt,
+      );
+      if (!isRecord(envelope.data)) continue;
+      latestData = envelope.data;
+    } catch {
+      // An unreadable latest snapshot hides its scope from the summary.
+      continue;
+    }
+
+    // Recent siblings reconcile ledgers imported on other devices before sync.
+    const recentData: Record<string, unknown>[] = [];
+    for (const version of versions) {
+      if (version.collectedAt === latest.collectedAt) continue;
+      const at = Date.parse(version.collectedAt);
+      if (Number.isNaN(at) || at > nowMs || at < nowMs - recentWindowMs) {
+        continue;
+      }
+      try {
+        const envelope = await readStoredEnvelope(
+          input.storage,
+          summary.scope,
+          version.collectedAt,
+        );
+        if (isRecord(envelope.data)) recentData.push(envelope.data);
+      } catch {
+        // An unreadable recent snapshot is ignored; the latest still counts.
+      }
+    }
+
+    scopes.push({ scope: summary.scope, latestData, recentData });
+  }
+
+  try {
+    return await summarizeAdditions({
+      scopes,
+      timezone: input.timezone,
+      days: input.days,
+      now: input.now,
+    });
+  } catch (err) {
+    if (err instanceof InvalidTimezoneError) {
+      return invalidQuery("Unknown timezone");
+    }
+    throw err;
+  }
 }
 
 export async function readDataContract(

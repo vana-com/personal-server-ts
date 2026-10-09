@@ -13,6 +13,7 @@ import {
   listDataScopesContract,
   listDataVersionsContract,
   readDataContract,
+  summarizeDataAdditionsContract,
 } from "./data.js";
 import {
   decodeBinaryEnvelope,
@@ -736,5 +737,96 @@ describe("first-added ledger on ingest", () => {
     if (!read.ok) throw new Error("expected read to succeed");
     const ledger = readFirstAddedLedger(read.envelope.data);
     expect(ledger?.records).toEqual({ "notes:i:n1": T1 });
+  });
+});
+
+describe("summarize additions contract", () => {
+  const SCOPE = "notes.entries";
+  const FIRST = "2026-10-01T12:00:00.000Z";
+  const SECOND = "2026-10-08T12:00:00.000Z";
+
+  async function ingestTwoVersions(storage: DataStoragePort) {
+    await ingestDataContract({
+      storage,
+      scopeParam: SCOPE,
+      body: { items: [{ id: "a" }, { id: "b" }] },
+      collectedAt: FIRST,
+      status: "stored",
+    });
+    await ingestDataContract({
+      storage,
+      scopeParam: SCOPE,
+      body: { items: [{ id: "a" }, { id: "b" }, { id: "c" }] },
+      collectedAt: SECOND,
+      status: "stored",
+    });
+  }
+
+  it("summarizes real ingested snapshots from their stamped ledgers", async () => {
+    const storage = createMemoryStorage();
+    await ingestTwoVersions(storage);
+
+    const result = await summarizeDataAdditionsContract({
+      storage,
+      timezone: "UTC",
+      days: 7,
+      now: new Date("2026-10-08T12:00:05.000Z"),
+    });
+
+    if ("ok" in result) throw new Error("expected a summary");
+    expect(result.total).toBe(3);
+    expect(result.trackedSince).toBe(FIRST);
+    expect(result.scopes).toEqual([
+      { scope: SCOPE, total: 3, trackedSince: FIRST },
+    ]);
+    // `c` was first added by the second write, whose UTC day is 2026-10-08.
+    expect(result.days.at(-1)).toEqual({ date: "2026-10-08", added: 1 });
+    // `a` and `b` date to 2026-10-01, outside the 7-day day list.
+    expect(result.days[0]).toEqual({ date: "2026-10-02", added: 0 });
+  });
+
+  it("rejects an out-of-range days or an unknown timezone", async () => {
+    for (const days of [0, 32]) {
+      const result = await summarizeDataAdditionsContract({
+        storage: createMemoryStorage(),
+        timezone: "UTC",
+        days,
+        now: new Date(SECOND),
+      });
+      expect(result).toMatchObject({
+        ok: false,
+        status: 400,
+        body: { error: "INVALID_QUERY" },
+      });
+    }
+
+    const badTimezone = await summarizeDataAdditionsContract({
+      storage: createMemoryStorage(),
+      timezone: "Not/AZone",
+      days: 7,
+      now: new Date(SECOND),
+    });
+    expect(badTimezone).toEqual({
+      ok: false,
+      status: 400,
+      body: { error: "INVALID_QUERY", message: "Unknown timezone" },
+    });
+  });
+
+  it("excludes scopes the visibility filter hides", async () => {
+    const storage = createMemoryStorage();
+    await ingestTwoVersions(storage);
+
+    const result = await summarizeDataAdditionsContract({
+      storage,
+      isVisible: () => false,
+      timezone: "UTC",
+      days: 7,
+      now: new Date("2026-10-08T12:00:05.000Z"),
+    });
+
+    if ("ok" in result) throw new Error("expected a summary");
+    expect(result.total).toBe(0);
+    expect(result.scopes).toEqual([]);
   });
 });

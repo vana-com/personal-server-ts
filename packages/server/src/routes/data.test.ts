@@ -739,6 +739,97 @@ describe("GET /v1/data (list scopes)", () => {
   });
 });
 
+describe("GET /v1/data/additions", () => {
+  let dataDir: string;
+  let hierarchyOptions: HierarchyManagerOptions;
+  let indexManager: IndexManager;
+  let cleanup: () => void;
+
+  function createApp(overrides: Partial<DataRouteDeps> = {}) {
+    return dataRoutes({
+      indexManager,
+      hierarchyOptions,
+      logger,
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+      ...overrides,
+    });
+  }
+
+  beforeEach(async () => {
+    dataDir = await mkdtemp(join(tmpdir(), "data-route-additions-test-"));
+    hierarchyOptions = { dataDir };
+
+    const db = initializeDatabase(":memory:");
+    indexManager = createIndexManager(db);
+
+    cleanup = () => {
+      indexManager.close();
+    };
+  });
+
+  afterEach(async () => {
+    cleanup();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  it("returns the additions summary for the owner after two writes", async () => {
+    const app = createApp();
+    await postWithOwnerAuth(app, "notes.entries", { items: [{ id: "a" }] });
+    await postWithOwnerAuth(app, "notes.entries", {
+      items: [{ id: "a" }, { id: "b" }],
+    });
+
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: "/additions",
+    });
+    const res = await app.request("/additions", {
+      headers: { Authorization: auth },
+    });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toMatchObject({
+      timezone: "UTC",
+      total: 2,
+      trackedSince: expect.any(String),
+      scopes: [
+        {
+          scope: "notes.entries",
+          total: 2,
+          trackedSince: expect.any(String),
+        },
+      ],
+    });
+    expect(json.days).toHaveLength(7);
+  });
+
+  it("refuses a non-owner or unauthenticated caller", async () => {
+    const app = createApp();
+
+    const unauth = await app.request("/additions");
+    expect(unauth.status).toBe(401);
+    expect((await unauth.json()).error.errorCode).toBe("MISSING_AUTH");
+
+    const nonOwnerAuth = await buildWeb3SignedHeader({
+      wallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: "/additions",
+    });
+    const nonOwner = await app.request("/additions", {
+      headers: { Authorization: nonOwnerAuth },
+    });
+    expect(nonOwner.status).toBe(401);
+    expect((await nonOwner.json()).error.errorCode).toBe("NOT_OWNER");
+  });
+});
+
 describe("GET /v1/data/:scope/versions", () => {
   let dataDir: string;
   let hierarchyOptions: HierarchyManagerOptions;

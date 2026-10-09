@@ -62,6 +62,8 @@ import {
   stringifyMetadataHeader,
   IngestPersistedError,
 } from "../contracts/index.js";
+// Imported directly: the contracts barrel does not re-export this addition.
+import { summarizeDataAdditionsContract } from "../contracts/data.js";
 import type {
   DataFileEnvelope,
   DataPortabilityGatewayConfig,
@@ -1181,6 +1183,24 @@ export async function handlePersonalServerDataRequest(
         isVisible: discoveryVisibility(deps),
       });
       return jsonResponse(result.response);
+    }
+
+    // "additions" has no dot, so it can never be a real scope name (scopes are
+    // "source.dataset"); handle it before the single-segment scope path.
+    if (pathname === "/additions") {
+      if (request.method !== "GET") return methodNotAllowed();
+      // The counts span every scope, so only the owner may read them.
+      await deps.auth.authorizeOwner(request);
+      const daysRaw = url.searchParams.get("days");
+      const result = await summarizeDataAdditionsContract({
+        storage: deps.storage,
+        isVisible: discoveryVisibility(deps),
+        timezone: url.searchParams.get("tz") ?? "UTC",
+        days: daysRaw === null ? 7 : Number(daysRaw),
+        now: (deps.now ?? (() => new Date()))(),
+      });
+      if ("ok" in result) return contractErrorResponse(result);
+      return jsonResponse(result);
     }
 
     const parts = pathname.split("/").filter(Boolean);
