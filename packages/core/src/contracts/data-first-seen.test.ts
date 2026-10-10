@@ -134,14 +134,18 @@ describe("first-seen sidecar on ingest", () => {
     expect(summary.days.at(-1)).toEqual({ date: "2026-10-09", added: 1 });
   });
 
-  it("does not date everything as added when a binary write came first", async () => {
+  it("does not date the first JSON import as added when a binary file came before it (f, reversed)", async () => {
     const storage = createMemoryDataStorage();
     await ingestBinary(storage, T1);
     await ingest(storage, items("a", "b", "c"), T2);
     const summary = await summarize(storage);
     expect(summary.total).toBe(3);
-    expect(summary.days.reduce((sum, day) => sum + day.added, 0)).toBe(0);
+    // The baseline (T2) is not the scope's oldest version: the records may
+    // have been there since the binary file, so they do not count.
+    expect(summary.days.find((d) => d.date === "2026-10-08")?.added).toBe(0);
     expect(summary.trackedSince).toBe(T2);
+    expect(summary.scopes[0]!.partial).toBe(true);
+    expect(summary.partial).toBe(true);
   });
 
   it("reports trackedSince null for a scope with only a binary file", async () => {
@@ -151,7 +155,7 @@ describe("first-seen sidecar on ingest", () => {
     expect(summary.total).toBe(1);
     expect(summary.trackedSince).toBeNull();
     expect(summary.scopes).toEqual([
-      { scope: SCOPE, total: 1, trackedSince: null },
+      { scope: SCOPE, total: 1, trackedSince: null, partial: false },
     ]);
   });
 
@@ -167,10 +171,10 @@ describe("first-seen sidecar on ingest", () => {
     expect(caught?.baseline).toBe(T1);
     expect(caught?.records["items:i:b"]).toEqual([T2, T2]);
 
-    await storage.writeFirstSeenLedger!(SCOPE, { version: 3, junk: true });
+    await storage.writeFirstSeenLedger!(SCOPE, { version: 4, junk: true });
     await ingest(storage, items("a", "b", "c"), T3);
     expect(await storage.readFirstSeenLedger!(SCOPE)).toEqual({
-      version: 3,
+      version: 4,
       junk: true,
     });
     const rebuilt = await ensureScopeLedger(storage, SCOPE);
@@ -389,7 +393,8 @@ describe("first-seen sidecar deletion", () => {
     expect(ledger.baseline).toBe(T3);
     const summary = await summarize(storage);
     expect(summary.total).toBe(3);
-    expect(summary.days.reduce((sum, day) => sum + day.added, 0)).toBe(0);
+    // (d) a fresh baseline: the reimport's records are dated on its day.
+    expect(summary.days.find((d) => d.date === "2026-10-09")?.added).toBe(3);
   });
 
   it("removes the sidecar even when the storage's deleteScope predates it", async () => {
@@ -506,7 +511,7 @@ describe("sidecar shape", () => {
     await ingest(storage, items("a"), T1);
     const ledger: ScopeFirstSeenLedger = await ledgerOf(storage);
     expect(ledger).toEqual({
-      version: 3,
+      version: 4,
       scope: SCOPE,
       baseline: T1,
       current: T1,

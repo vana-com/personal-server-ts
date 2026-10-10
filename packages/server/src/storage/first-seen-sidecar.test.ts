@@ -15,6 +15,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
   ensureScopeLedger,
+  listAddedTimestamps,
   readScopeFirstSeenLedger,
   withScopeLock,
 } from "@opendatalabs/personal-server-ts-core/additions";
@@ -79,7 +80,7 @@ describe("first-seen sidecar on the Node storage", () => {
     await ingest(items("a", "b"), T2);
 
     const onDisk = JSON.parse(await readFile(sidecarPath(), "utf-8"));
-    expect(onDisk.version).toBe(3);
+    expect(onDisk.version).toBe(4);
     expect(onDisk.records["items:i:b"]).toEqual([T2, T2]);
     // The scope's own directory holds only the two version files.
     expect(await readdir(join(dataDir, "notes", "entries"))).toEqual([
@@ -360,6 +361,40 @@ describe("first-seen sidecar on the Node storage", () => {
     await stat(sidecarPath());
     expect(await ensureScopeLedger(storage, SCOPE)).toBeNull();
     await expect(stat(sidecarPath())).rejects.toThrow();
+  });
+
+  describe("partial from real version numbers (follow-up review)", () => {
+    async function store(
+      version: number,
+      afterTombstoneVersion: number | null,
+    ) {
+      const envelope = createDataFileEnvelope(SCOPE, T1, items("a", "b"));
+      const written = await storage.writeEnvelope(envelope);
+      await storage.insertEntry({
+        fileId: null,
+        schemaId: null,
+        path: written.relativePath,
+        scope: SCOPE,
+        collectedAt: T1,
+        sizeBytes: written.sizeBytes,
+        version,
+        afterTombstoneVersion,
+      });
+    }
+
+    it("a first version numbered above 1 is partial and its records do not count", async () => {
+      await store(5, null);
+      const ledger = (await ensureScopeLedger(storage, SCOPE))!;
+      expect(ledger.partial).toBe(true);
+      expect(listAddedTimestamps(ledger)).toEqual([]);
+    });
+
+    it("a version written after a deletion starts afresh and counts, whatever its number", async () => {
+      await store(5, 4);
+      const ledger = (await ensureScopeLedger(storage, SCOPE))!;
+      expect(ledger.partial).toBeUndefined();
+      expect(listAddedTimestamps(ledger)).toEqual([T1, T1]);
+    });
   });
 
   it("buildDataBlocks of a stored envelope never sees the sidecar", async () => {

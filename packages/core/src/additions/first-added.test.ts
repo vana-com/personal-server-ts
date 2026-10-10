@@ -420,10 +420,10 @@ const iso = (days: number) =>
   new Date(Date.parse(T1) + days * DAY).toISOString();
 
 describe("foldVersion", () => {
-  it("starts a ledger at the first version, dating nothing as new", async () => {
+  it("starts a ledger at the first version, dating its records at that version", async () => {
     const ledger = await fold([version(T1, ["a", "b"])]);
     expect(ledger).toEqual({
-      version: 3,
+      version: 4,
       scope: "notes.entries",
       baseline: T1,
       current: T1,
@@ -431,12 +431,13 @@ describe("foldVersion", () => {
       through: T1,
       records: { "items:i:a": [T1, T1], "items:i:b": [T1, T1] },
     });
-    expect(isPreTracking(ledger, "items:i:a")).toBe(true);
+    // A complete ledger knows when its baseline records arrived: that day.
+    expect(isPreTracking(ledger, "items:i:a")).toBe(false);
     expect(isPresent(ledger, "items:i:a")).toBe(true);
-    expect(listAddedTimestamps(ledger)).toEqual([]);
+    expect(listAddedTimestamps(ledger)).toEqual([T1, T1]);
   });
 
-  it("dates only the record a later version adds", async () => {
+  it("dates the first import at its version and a later record at the later one", async () => {
     const ledger = await fold([
       version(T1, ["a", "b"]),
       version(T2, ["a", "b", "c"]),
@@ -445,7 +446,7 @@ describe("foldVersion", () => {
     expect(ledger.records["items:i:a"]).toEqual([T1, T2]);
     expect(isPreTracking(ledger, "items:i:c")).toBe(false);
     expect(ledger.latest).toEqual({ collectedAt: T2, total: 3 });
-    expect(listAddedTimestamps(ledger)).toEqual([T2]);
+    expect(listAddedTimestamps(ledger)).toEqual([T1, T1, T2]);
   });
 
   it("keeps a record's first date when it is absent for a version and returns", async () => {
@@ -601,11 +602,12 @@ describe("foldVersion", () => {
     expect(listAddedTimestamps(first)).toEqual([]);
 
     const json = await fold([version(T2, ["a", "b", "c"])], first);
-    // The first trackable version is the baseline: nothing is "added".
+    // The first trackable version is the baseline: its records count on its
+    // date (case f), the binary file before it contributes none.
     expect(json.baseline).toBe(T2);
-    expect(listAddedTimestamps(json)).toEqual([]);
+    expect(listAddedTimestamps(json)).toEqual([T2, T2, T2]);
     const more = await fold([version(T3, ["a", "b", "c", "d"])], json);
-    expect(listAddedTimestamps(more)).toEqual([T3]);
+    expect(listAddedTimestamps(more)).toEqual([T2, T2, T2, T3]);
   });
 
   it("does not baseline a snapshot whose records have no usable id", async () => {
@@ -619,7 +621,7 @@ describe("foldVersion", () => {
     expect(first.latest.total).toBe(2);
     const next = await fold([version(T2, ["a", "b"])], first);
     expect(next.baseline).toBe(T2);
-    expect(listAddedTimestamps(next)).toEqual([]);
+    expect(listAddedTimestamps(next)).toEqual([T2, T2]);
   });
 
   it("baselines an empty snapshot, so later records are real additions", async () => {
@@ -677,7 +679,7 @@ describe("foldVersion", () => {
     const next = (await foldVersion(capped, version(T3, ["a", "b"])))!;
     expect(next.latest).toEqual({ collectedAt: T3, total: 2 });
     expect(next.records["items:i:b"]).toEqual([T3, T3]);
-    expect(listAddedTimestamps(next)).toEqual([T3]);
+    expect(listAddedTimestamps(next)).toEqual([T1, T3]);
   }, 30_000);
 
   it("never baselines an over-cap first snapshot", async () => {
@@ -692,7 +694,7 @@ describe("foldVersion", () => {
     expect(capped.baseline).toBeNull();
     const next = (await foldVersion(capped, version(T2, ["a", "b"])))!;
     expect(next.baseline).toBe(T2);
-    expect(listAddedTimestamps(next)).toEqual([]);
+    expect(listAddedTimestamps(next)).toEqual([T2, T2]);
   }, 30_000);
 
   describe("at the key cap", () => {
@@ -782,9 +784,12 @@ describe("foldVersion", () => {
       expect(Object.keys(flooded.records).length).toBeLessThanOrEqual(
         MAX_TRACKED_KEYS,
       );
-      // The owner imports the same records again: nothing is new to them.
+      // The owner imports the same records again: none is dated by the new
+      // import, they keep the day they first arrived.
       const again = (await foldVersion(flooded, v(3, owner)))!;
-      expect(listAddedTimestamps(again)).toEqual([]);
+      const added = listAddedTimestamps(again);
+      expect(added.filter((when) => when === at(3))).toEqual([]);
+      expect(added.filter((when) => when === at(1))).toHaveLength(5_001);
     }, 120_000);
 
     it("keeps returning baseline records dated at the baseline after a disjoint version (F1b)", async () => {
@@ -794,8 +799,10 @@ describe("foldVersion", () => {
         MAX_TRACKED_KEYS,
       );
       const back = (await foldVersion(ledger, v(3, x)))!;
-      // All of x is still known and pre-tracking: none of it is an addition.
-      expect(listAddedTimestamps(back)).toEqual([]);
+      // All of x is still known at the baseline: none of it is dated by v3.
+      const added = listAddedTimestamps(back);
+      expect(added.filter((when) => when === at(3))).toEqual([]);
+      expect(added.filter((when) => when === at(1))).toHaveLength(KEEP);
     }, 120_000);
 
     it("KNOWN LIMITATION, not a guarantee: dated (not pre-tracking) records can be evicted and re-dated near the cap", async () => {
@@ -888,7 +895,7 @@ describe("foldVersion", () => {
   });
 });
 
-describe("a partial ledger", () => {
+describe("a truncated ledger", () => {
   it("never moves its baseline back over versions it did not fold (reviewer: 107 false additions)", async () => {
     // Rebuilt from the newest versions only: day 100 is the oldest folded.
     const fold1 = new LedgerFold(null, "notes.entries");
@@ -904,16 +911,20 @@ describe("a partial ledger", () => {
         Array.from({ length: 108 }, (_, i) => `r${i}`),
       ),
     );
-    const partial = (await fold1.finish({ partial: true }))!;
-    expect(partial.partial).toBe(true);
-    expect(partial.baseline).toBe(iso(100));
+    const truncated = (await fold1.finish({ truncated: true }))!;
+    expect(truncated.truncated).toBe(true);
+    expect(truncated.baseline).toBe(iso(100));
+    // The owner's read marks it partial (derived from the index, not stored).
+    const partial = { ...truncated, partial: true as const };
     expect(listAddedTimestamps(partial)).toEqual([iso(101)]);
 
     // An older download arrives: it must not re-baseline the unfolded gap.
-    const withOlder = (await foldVersion(partial, version(iso(0), ["r0"])))!;
+    const withOlder = (await foldVersion(truncated, version(iso(0), ["r0"])))!;
     expect(withOlder.baseline).toBe(iso(100));
     expect(withOlder.records["items:i:r0"]).toEqual([iso(0), iso(101)]);
-    expect(listAddedTimestamps(withOlder)).toEqual([iso(101)]);
+    expect(
+      listAddedTimestamps({ ...withOlder, partial: true as const }),
+    ).toEqual([iso(101)]);
   });
 
   it("a complete ledger still lowers its baseline for an older version", async () => {
@@ -936,7 +947,7 @@ describe("foldVersions", () => {
 
 describe("readScopeFirstSeenLedger", () => {
   const valid: ScopeFirstSeenLedger = {
-    version: 3,
+    version: 4,
     scope: "notes.entries",
     baseline: T1,
     current: T2,
@@ -958,9 +969,9 @@ describe("readScopeFirstSeenLedger", () => {
         skipped,
       );
     }
-    expect(readScopeFirstSeenLedger({ ...valid, partial: true })?.partial).toBe(
-      true,
-    );
+    expect(
+      readScopeFirstSeenLedger({ ...valid, truncated: true })?.truncated,
+    ).toBe(true);
   });
 
   it.each<[string, unknown]>([
@@ -980,7 +991,8 @@ describe("readScopeFirstSeenLedger", () => {
       { ...valid, latest: { collectedAt: T2, total: -1 } },
     ],
     ["a bad skipped reason", { ...valid, skipped: "x" }],
-    ["a bad partial flag", { ...valid, partial: false }],
+    ["a bad truncated flag", { ...valid, truncated: false }],
+    ["a version-3 sidecar (partial meant truncated)", { ...valid, version: 3 }],
     ["records as an array", { ...valid, records: [] }],
     ["a record that is not a pair", { ...valid, records: { a: [T1] } }],
     [

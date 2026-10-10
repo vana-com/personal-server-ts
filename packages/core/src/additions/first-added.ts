@@ -55,13 +55,15 @@ export type LedgerSkipReason = "too_large" | "unreadable";
 
 /** One document per scope, stored as a sidecar beside the data. */
 export interface ScopeFirstSeenLedger {
-  version: 3;
+  version: 4;
   scope: string;
   /**
    * collectedAt of the EARLIEST TRACKABLE version folded in (one with records
-   * that have ids, or an empty one): records first seen then predate tracking.
-   * Null until a trackable version exists, so a binary, over-cap or
-   * id-less first snapshot never makes everything after it look added.
+   * that have ids, or an empty one). Its records count as added on its date
+   * only when the baseline is the scope's oldest retained version AND that
+   * version is the scope's first (see `partial`); otherwise their real date is
+   * unknown. Null until a trackable version exists, so a binary, over-cap or
+   * id-less first snapshot never becomes the baseline.
    */
   baseline: string | null;
   /** collectedAt of the NEWEST trackable version: a record is present iff last seen then. */
@@ -86,9 +88,19 @@ export interface ScopeFirstSeenLedger {
   /** Set when no per-record keys are kept (see `LedgerSkipReason`); `records` is then empty. */
   skipped?: LedgerSkipReason;
   /**
-   * The ledger was rebuilt from only the newest retained versions (count or
-   * byte budget). A version older than `baseline` then never moves the
-   * baseline back over the versions that were not folded.
+   * The rebuild or catch-up folded only the newest retained versions (the
+   * count window or the byte budget cut off older ones). A version older than
+   * `baseline` then never moves the baseline back over versions that were not
+   * folded. Persisted.
+   */
+  truncated?: true;
+  /**
+   * DERIVED, never persisted: set by `ensureScopeLedger` on the ledger it
+   * returns when the baseline is not known to be the scope's first version.
+   * The owner's read decides it from the index (the oldest retained version,
+   * its number, whether it follows a deletion) plus `truncated`, so it follows
+   * later changes of version numbers and deletions. Records first seen at the
+   * baseline then keep an unknown date and are not counted as added.
    */
   partial?: true;
   /** record key -> [firstSeen collectedAt, lastSeen collectedAt] */
@@ -428,7 +440,7 @@ export class LedgerFold {
   private through: string | null = null;
   private retry: ScopeFirstSeenLedger["retry"];
   private skipped: LedgerSkipReason | undefined;
-  private partial = false;
+  private truncated = false;
   // A Map keeps arbitrary keys (including "__proto__") out of the prototype
   // chain; Object.fromEntries defines each one as an own property again.
   private records = new Map<string, Pair>();
@@ -447,7 +459,7 @@ export class LedgerFold {
         }
       : undefined;
     this.skipped = ledger.skipped;
-    this.partial = ledger.partial === true;
+    this.truncated = ledger.truncated === true;
     // Copied, never shared: the input ledger is not mutated.
     for (const [key, pair] of Object.entries(ledger.records)) {
       this.records.set(key, [pair[0], pair[1]]);
@@ -480,8 +492,11 @@ export class LedgerFold {
 
     if (this.baseline === null) {
       this.baseline = version.collectedAt;
-    } else if (isEarlier(version.collectedAt, this.baseline) && !this.partial) {
-      // A partial ledger never moves its baseline back over versions it did
+    } else if (
+      isEarlier(version.collectedAt, this.baseline) &&
+      !this.truncated
+    ) {
+      // A truncated ledger never moves its baseline back over versions it did
       // not fold: their records would then look added.
       this.baseline = version.collectedAt;
     }
@@ -538,8 +553,8 @@ export class LedgerFold {
   /**
    * Make room for `need` records by dropping some that are absent: not in the
    * newest tracked version, not in the version being folded, and not
-   * pre-tracking (first seen at or before the baseline). Pre-tracking records
-   * are never dropped. Dated records that are absent CAN be dropped (and are
+   * baseline records (first seen at or before the baseline). Baseline records
+   * are never dropped. Other absent records CAN be dropped (and are
    * dated as new if they return): that needs a scope near the cap, and
    * whoever can write the scope can provoke it. Among the evictable ones the
    * most recently first seen go first. Returns how many were dropped.
@@ -587,12 +602,12 @@ export class LedgerFold {
 
   /**
    * Prune and return the ledger, or null when nothing was ever folded.
-   * `partial` marks a ledger rebuilt from only the newest retained versions;
+   * `truncated` marks a ledger rebuilt from only the newest retained versions;
    * `through` overrides the completeness marker (see `ScopeFirstSeenLedger`).
    */
   async finish(
     options: {
-      partial?: boolean;
+      truncated?: boolean;
       through?: string;
       /** `null` clears the retry list; undefined keeps it. */
       retry?: ScopeFirstSeenLedger["retry"] | null;
@@ -600,10 +615,10 @@ export class LedgerFold {
   ): Promise<ScopeFirstSeenLedger | null> {
     if (this.scope === null || this.latest === null) return null;
     await this.prune();
-    const partial = this.partial || options.partial === true;
+    const truncated = this.truncated || options.truncated === true;
     const retry = options.retry === undefined ? this.retry : options.retry;
     return {
-      version: 3,
+      version: 4,
       scope: this.scope,
       baseline: this.baseline,
       current: this.current,
@@ -611,7 +626,7 @@ export class LedgerFold {
       through: options.through ?? this.through ?? this.latest.collectedAt,
       ...(retry ? { retry } : {}),
       ...(this.skipped ? { skipped: this.skipped } : {}),
-      ...(partial ? { partial: true as const } : {}),
+      ...(truncated ? { truncated: true as const } : {}),
       records: Object.fromEntries(this.records),
     };
   }
@@ -649,20 +664,25 @@ export function isPresent(ledger: ScopeFirstSeenLedger, key: string): boolean {
   return Date.parse(ledger.records[key]![1]) === Date.parse(ledger.current);
 }
 
-/** True when the record was first seen at or before the baseline (or there is no baseline). */
+/**
+ * True when the record's first-seen date is unknown: there is no baseline, or
+ * the ledger is partial and the record was first seen at or before the
+ * baseline. In a complete ledger the baseline's records are dated by it.
+ */
 export function isPreTracking(
   ledger: ScopeFirstSeenLedger,
   key: string,
 ): boolean {
   if (ledger.baseline === null) return true;
-  if (!hasOwn(ledger.records, key)) return false;
+  if (ledger.partial !== true || !hasOwn(ledger.records, key)) return false;
   return Date.parse(ledger.records[key]![0]) <= Date.parse(ledger.baseline);
 }
 
 /**
  * First-seen timestamps of the records that count as additions: present in
- * the newest tracked version and first seen after the baseline. One per
- * record. A skipped ledger, one with no baseline yet, and a scope whose newest
+ * the newest tracked version. Records first seen at the baseline count too
+ * (they entered the server then) unless the ledger is `partial`, where their
+ * date is unknown. One per record. A skipped ledger, one with no baseline yet, and a scope whose newest
  * version is not its newest tracked one (a binary file or an over-cap
  * snapshot, whose `latest.total` does not describe those records) report none,
  * so `added` can never exceed `total`.
@@ -681,7 +701,7 @@ export function listAddedTimestamps(ledger: ScopeFirstSeenLedger): string[] {
   const added: string[] = [];
   for (const [first, last] of Object.values(ledger.records)) {
     if (Date.parse(last) !== currentMs) continue;
-    if (Date.parse(first) <= baselineMs) continue;
+    if (ledger.partial === true && Date.parse(first) <= baselineMs) continue;
     added.push(first);
   }
   // Two versions at one instant can both look present; never report more
@@ -715,7 +735,7 @@ export function readScopeFirstSeenLedger(
   value: unknown,
 ): ScopeFirstSeenLedger | null {
   try {
-    if (!isRecord(value) || value.version !== 3) return null;
+    if (!isRecord(value) || value.version !== 4) return null;
     const {
       scope,
       baseline,
@@ -724,7 +744,7 @@ export function readScopeFirstSeenLedger(
       through,
       records,
       skipped,
-      partial,
+      truncated,
     } = value;
     if (typeof scope !== "string" || scope.length === 0) return null;
     if (!nullableParseable(baseline) || !nullableParseable(current)) {
@@ -763,7 +783,7 @@ export function readScopeFirstSeenLedger(
       return null;
     }
     if (skipped !== undefined && !SKIP_REASONS.has(skipped)) return null;
-    if (partial !== undefined && partial !== true) return null;
+    if (truncated !== undefined && truncated !== true) return null;
     if (!isRecord(records)) return null;
 
     const entries = Object.entries(records);
@@ -775,7 +795,7 @@ export function readScopeFirstSeenLedger(
       copied.set(key, [pair[0], pair[1]]);
     }
     return {
-      version: 3,
+      version: 4,
       scope,
       baseline,
       current,
@@ -783,7 +803,7 @@ export function readScopeFirstSeenLedger(
       through,
       ...(retryValue ? { retry: retryValue } : {}),
       ...(skipped ? { skipped: skipped as LedgerSkipReason } : {}),
-      ...(partial ? { partial: true as const } : {}),
+      ...(truncated ? { truncated: true as const } : {}),
       records: Object.fromEntries(copied),
     };
   } catch {

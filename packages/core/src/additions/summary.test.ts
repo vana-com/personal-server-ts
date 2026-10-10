@@ -97,26 +97,65 @@ describe("summarizeAdditions", () => {
     ]);
   });
 
-  it("never counts pre-tracking records, absent records or other scopes' days", async () => {
+  const WINDOW_BASELINE = "2026-09-20T00:00:00.000Z";
+  const baselineRecords = (): Record<string, [string, string]> => ({
+    // First seen at the baseline.
+    "items:i:old": [WINDOW_BASELINE, NOW],
+    // Added today but no longer in the newest version.
+    "items:i:gone": ["2026-10-09T02:00:00.000Z", "2026-10-09T03:00:00.000Z"],
+    "items:i:new": ["2026-10-09T01:00:00.000Z", NOW],
+  });
+  const BASELINE_DAY = "2026-09-20";
+
+  it("counts a complete scope's baseline records on the baseline's date, never absent ones", async () => {
+    const summary = await summarize(
+      [
+        ledger("notes.entries", baselineRecords(), {
+          latest: { collectedAt: NOW, total: 2 },
+          baseline: WINDOW_BASELINE,
+        }),
+      ],
+      { days: 31 },
+    );
+    expect(summary.total).toBe(2);
+    expect(summary.partial).toBe(false);
+    expect(summary.scopes[0]!.partial).toBe(false);
+    expect(addedOn(summary, BASELINE_DAY)).toBe(1);
+    expect(addedOn(summary, "2026-10-09")).toBe(1);
+  });
+
+  it("does not count a partial scope's baseline records, and flags it", async () => {
+    const summary = await summarize(
+      [
+        ledger("notes.entries", baselineRecords(), {
+          latest: { collectedAt: NOW, total: 2 },
+          baseline: WINDOW_BASELINE,
+          partial: true,
+        }),
+      ],
+      { days: 31 },
+    );
+    expect(addedOn(summary, BASELINE_DAY)).toBe(0);
+    expect(addedOn(summary, "2026-10-09")).toBe(1);
+    expect(summary.partial).toBe(true);
+    expect(summary.scopes[0]).toMatchObject({
+      trackedSince: WINDOW_BASELINE,
+      partial: true,
+    });
+  });
+
+  it("adds two scopes' records to the same day, one of them on its baseline", async () => {
+    const day = "2026-10-09T01:00:00.000Z";
     const summary = await summarize([
       ledger(
-        "notes.entries",
-        {
-          // First seen at the baseline: predates tracking.
-          "items:i:old": [BASELINE, NOW],
-          // Added today but no longer in the newest version.
-          "items:i:gone": [
-            "2026-10-09T02:00:00.000Z",
-            "2026-10-09T03:00:00.000Z",
-          ],
-          "items:i:new": ["2026-10-09T01:00:00.000Z", NOW],
-        },
-        { latest: { collectedAt: NOW, total: 2 } },
+        "a.fresh",
+        { "items:i:1": [day, NOW], "items:i:2": [day, NOW] },
+        { baseline: day },
       ),
+      ledger("b.old", { "items:i:x": [day, NOW] }),
     ]);
-
-    expect(summary.total).toBe(2);
-    expect(summary.days.at(-1)).toEqual({ date: "2026-10-09", added: 1 });
+    expect(addedOn(summary, "2026-10-09")).toBe(3);
+    expect(summary.partial).toBe(false);
   });
 
   it("reports latest.total per scope, including records without ids", async () => {
@@ -175,9 +214,9 @@ describe("summarizeAdditions", () => {
     ]);
     expect(summary.total).toBe(300_002);
     expect(summary.scopes).toEqual([
-      { scope: "a.binary", total: 1, trackedSince: null },
-      { scope: "b.huge", total: 300_000, trackedSince: null },
-      { scope: "c.normal", total: 1, trackedSince: BASELINE },
+      { scope: "a.binary", total: 1, trackedSince: null, partial: false },
+      { scope: "b.huge", total: 300_000, trackedSince: null, partial: false },
+      { scope: "c.normal", total: 1, trackedSince: BASELINE, partial: false },
     ]);
     expect(summary.trackedSince).toBe(BASELINE);
     expect(summary.days.at(-1)).toEqual({ date: "2026-10-09", added: 1 });

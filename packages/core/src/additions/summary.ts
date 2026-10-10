@@ -2,8 +2,8 @@
  * Additions summary: how many records each scope's newest version holds and
  * how many of those records were first seen on each of the last N local
  * calendar days. Pure: it reads only the ledgers it is handed, never a store,
- * and never mutates them. A day's count is meaningful for a scope only for
- * days after that scope's `trackedSince`.
+ * and never mutates them. A scope's records first seen at its `trackedSince`
+ * count on that date unless the scope is `partial`.
  */
 
 import {
@@ -32,6 +32,8 @@ export interface AdditionsSummary {
   days: { date: string; added: number }[]; // date is "YYYY-MM-DD" in `timezone`
   /** Earliest scope baseline, or null when no scope has a trackable version yet. */
   trackedSince: string | null;
+  /** Some scope's baseline was clamped (see the scope entries' `partial`). */
+  partial: boolean;
   scopes: {
     scope: string;
     total: number;
@@ -41,6 +43,12 @@ export interface AdditionsSummary {
      * record cap, or no record has an id): the scope is total-only.
      */
     trackedSince: string | null;
+    /**
+     * The scope's baseline is not known to be its first version (older
+     * versions were not folded or no longer exist), so records first seen at
+     * `trackedSince` have an unknown date and are not counted as added.
+     */
+    partial: boolean;
   }[];
 }
 
@@ -120,6 +128,7 @@ export async function summarizeAdditions(
   let total = 0;
   let trackedSince: string | null = null;
   let trackedSinceAt = Infinity;
+  let anyPartial = false;
 
   for await (const ledger of input.ledgers) {
     for (const firstSeen of listAddedTimestamps(ledger)) {
@@ -138,14 +147,26 @@ export async function summarizeAdditions(
         trackedSince = scopeTrackedSince;
       }
     }
+    // Only a tracked scope can be partial: with no baseline there is nothing
+    // whose date could be unknown.
+    const partial = scopeTrackedSince !== null && ledger.partial === true;
+    anyPartial ||= partial;
     scopes.push({
       scope: ledger.scope,
       total: ledger.latest.total,
       trackedSince: scopeTrackedSince,
+      partial,
     });
   }
 
   scopes.sort((a, b) => a.scope.localeCompare(b.scope));
 
-  return { timezone, total, days: dayRows, trackedSince, scopes };
+  return {
+    timezone,
+    total,
+    days: dayRows,
+    trackedSince,
+    partial: anyPartial,
+    scopes,
+  };
 }
