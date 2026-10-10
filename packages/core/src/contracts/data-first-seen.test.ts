@@ -134,13 +134,14 @@ describe("first-seen sidecar on ingest", () => {
     expect(summary.days.at(-1)).toEqual({ date: "2026-10-09", added: 1 });
   });
 
-  it("does not date everything as added when a binary write came first", async () => {
+  it("dates the first JSON import on its own day when a binary write came first (f)", async () => {
     const storage = createMemoryDataStorage();
     await ingestBinary(storage, T1);
     await ingest(storage, items("a", "b", "c"), T2);
     const summary = await summarize(storage);
     expect(summary.total).toBe(3);
-    expect(summary.days.reduce((sum, day) => sum + day.added, 0)).toBe(0);
+    // T2 is 2026-10-08, inside the window: its three records are additions.
+    expect(summary.days.find((d) => d.date === "2026-10-08")?.added).toBe(3);
     expect(summary.trackedSince).toBe(T2);
   });
 
@@ -151,7 +152,7 @@ describe("first-seen sidecar on ingest", () => {
     expect(summary.total).toBe(1);
     expect(summary.trackedSince).toBeNull();
     expect(summary.scopes).toEqual([
-      { scope: SCOPE, total: 1, trackedSince: null },
+      { scope: SCOPE, total: 1, trackedSince: null, partial: false },
     ]);
   });
 
@@ -389,7 +390,8 @@ describe("first-seen sidecar deletion", () => {
     expect(ledger.baseline).toBe(T3);
     const summary = await summarize(storage);
     expect(summary.total).toBe(3);
-    expect(summary.days.reduce((sum, day) => sum + day.added, 0)).toBe(0);
+    // (d) a fresh baseline: the reimport's records are dated on its day.
+    expect(summary.days.find((d) => d.date === "2026-10-09")?.added).toBe(3);
   });
 
   it("removes the sidecar even when the storage's deleteScope predates it", async () => {

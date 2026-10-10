@@ -207,6 +207,21 @@ async function foldEntries(
   return { folded, failed };
 }
 
+/**
+ * Whether the oldest retained history looks like the scope's start.
+ * Version numbers count a scope's versions from 1, so a higher number means
+ * older versions existed and are gone (deleted, superseded, or never
+ * downloaded here): the baseline is then not when its records arrived. A
+ * version written after a deletion (`afterTombstoneVersion`) starts afresh.
+ * A deleted version in the middle of the history leaves no such trace.
+ */
+function startsAtFirst(retained: readonly IndexEntry[]): boolean {
+  // The lowest version number decides; versions at one instant are ordered by
+  // their string, which says nothing about their numbers.
+  const lowest = retained.reduce((a, b) => (b.version < a.version ? b : a));
+  return lowest.version <= 1 || (lowest.afterTombstoneVersion ?? null) !== null;
+}
+
 /** The retry record for versions that could not be read, or null when there are none. */
 function retryOf(
   failed: readonly IndexEntry[],
@@ -252,7 +267,10 @@ async function rebuild(
   }
   const total = storage.countVersions(scope);
   return fold.finish({
-    partial: folded < total,
+    // Not partial only when every version back to the oldest was folded AND
+    // the oldest looks like the scope's first (see `startsAtFirst`).
+    partial:
+      folded < total || (retained.length === total && !startsAtFirst(retained)),
     through: retained[0]!.collectedAt,
     retry: retryOf(failed, now),
   });
@@ -383,7 +401,14 @@ export async function recordStoredVersion(
       }
       const fold = new LedgerFold(existing, version.scope);
       await fold.add(version);
-      const next = await fold.finish({ through });
+      const next = await fold.finish({
+        through,
+        // A sidecar started from the only version is complete, unless that
+        // version is not the scope's first (its number is above 1).
+        ...(!existing && retained.length > 0 && !startsAtFirst(retained)
+          ? { partial: true }
+          : {}),
+      });
       if (!next) return;
       await storage.writeFirstSeenLedger!(version.scope, next);
       await dropIfScopeEmpty(storage, version.scope);

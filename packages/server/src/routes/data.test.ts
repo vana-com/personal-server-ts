@@ -757,7 +757,7 @@ describe("GET /v1/data/additions", () => {
     await rm(dataDir, { recursive: true, force: true });
   });
 
-  it("dates only the record the second write adds, from the sidecar", async () => {
+  it("counts the first import and the record the second write adds, from the sidecar", async () => {
     const app = createApp();
     await postWithOwnerAuth(app, "notes.entries", { items: [{ id: "a" }] });
     // collectedAt has one-second resolution.
@@ -774,17 +774,35 @@ describe("GET /v1/data/additions", () => {
       timezone: "UTC",
       total: 2,
       trackedSince: expect.any(String),
+      partial: false,
       scopes: [
-        { scope: "notes.entries", total: 2, trackedSince: json.trackedSince },
+        {
+          scope: "notes.entries",
+          total: 2,
+          trackedSince: json.trackedSince,
+          partial: false,
+        },
       ],
     });
     expect(json.days).toHaveLength(7);
+    // "a" arrived with the first import and "b" with the second: both today.
     expect(
       json.days.reduce(
         (sum: number, day: { added: number }) => sum + day.added,
         0,
       ),
-    ).toBe(1);
+    ).toBe(2);
+  });
+
+  it("reports a brand-new scope's records as added on the day they were imported", async () => {
+    const app = createApp();
+    await postWithOwnerAuth(app, "notes.entries", {
+      items: [{ id: "a" }, { id: "b" }, { id: "c" }],
+    });
+    const json = await (await getAdditions(app)).json();
+    expect(json.total).toBe(3);
+    expect(json.days.at(-1).added).toBe(3);
+    expect(json.partial).toBe(false);
   });
 
   it("honours the tz parameter", async () => {

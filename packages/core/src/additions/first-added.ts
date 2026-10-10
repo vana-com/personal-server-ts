@@ -59,9 +59,11 @@ export interface ScopeFirstSeenLedger {
   scope: string;
   /**
    * collectedAt of the EARLIEST TRACKABLE version folded in (one with records
-   * that have ids, or an empty one): records first seen then predate tracking.
-   * Null until a trackable version exists, so a binary, over-cap or
-   * id-less first snapshot never makes everything after it look added.
+   * that have ids, or an empty one). When the ledger is complete (not
+   * `partial`) that is when those records entered the server, so they count
+   * as added on that date; when it is `partial` their real date is unknown and
+   * they do not count. Null until a trackable version exists, so a binary,
+   * over-cap or id-less first snapshot never becomes the baseline.
    */
   baseline: string | null;
   /** collectedAt of the NEWEST trackable version: a record is present iff last seen then. */
@@ -86,9 +88,12 @@ export interface ScopeFirstSeenLedger {
   /** Set when no per-record keys are kept (see `LedgerSkipReason`); `records` is then empty. */
   skipped?: LedgerSkipReason;
   /**
-   * The ledger was rebuilt from only the newest retained versions (count or
-   * byte budget). A version older than `baseline` then never moves the
-   * baseline back over the versions that were not folded.
+   * The baseline is not known to be the scope's first version: the ledger was
+   * rebuilt from only the newest retained versions (count or byte budget), or
+   * the oldest retained version is not the scope's first (older ones were
+   * deleted). Records first seen at the baseline then keep an unknown date and
+   * are not counted as added, and a version older than `baseline` never moves
+   * the baseline back over the versions that were not folded.
    */
   partial?: true;
   /** record key -> [firstSeen collectedAt, lastSeen collectedAt] */
@@ -538,8 +543,8 @@ export class LedgerFold {
   /**
    * Make room for `need` records by dropping some that are absent: not in the
    * newest tracked version, not in the version being folded, and not
-   * pre-tracking (first seen at or before the baseline). Pre-tracking records
-   * are never dropped. Dated records that are absent CAN be dropped (and are
+   * baseline records (first seen at or before the baseline). Baseline records
+   * are never dropped. Other absent records CAN be dropped (and are
    * dated as new if they return): that needs a scope near the cap, and
    * whoever can write the scope can provoke it. Among the evictable ones the
    * most recently first seen go first. Returns how many were dropped.
@@ -649,20 +654,25 @@ export function isPresent(ledger: ScopeFirstSeenLedger, key: string): boolean {
   return Date.parse(ledger.records[key]![1]) === Date.parse(ledger.current);
 }
 
-/** True when the record was first seen at or before the baseline (or there is no baseline). */
+/**
+ * True when the record's first-seen date is unknown: there is no baseline, or
+ * the ledger is partial and the record was first seen at or before the
+ * baseline. In a complete ledger the baseline's records are dated by it.
+ */
 export function isPreTracking(
   ledger: ScopeFirstSeenLedger,
   key: string,
 ): boolean {
   if (ledger.baseline === null) return true;
-  if (!hasOwn(ledger.records, key)) return false;
+  if (ledger.partial !== true || !hasOwn(ledger.records, key)) return false;
   return Date.parse(ledger.records[key]![0]) <= Date.parse(ledger.baseline);
 }
 
 /**
  * First-seen timestamps of the records that count as additions: present in
- * the newest tracked version and first seen after the baseline. One per
- * record. A skipped ledger, one with no baseline yet, and a scope whose newest
+ * the newest tracked version. Records first seen at the baseline count too
+ * (they entered the server then) unless the ledger is `partial`, where their
+ * date is unknown. One per record. A skipped ledger, one with no baseline yet, and a scope whose newest
  * version is not its newest tracked one (a binary file or an over-cap
  * snapshot, whose `latest.total` does not describe those records) report none,
  * so `added` can never exceed `total`.
@@ -681,7 +691,7 @@ export function listAddedTimestamps(ledger: ScopeFirstSeenLedger): string[] {
   const added: string[] = [];
   for (const [first, last] of Object.values(ledger.records)) {
     if (Date.parse(last) !== currentMs) continue;
-    if (Date.parse(first) <= baselineMs) continue;
+    if (ledger.partial === true && Date.parse(first) <= baselineMs) continue;
     added.push(first);
   }
   // Two versions at one instant can both look present; never report more

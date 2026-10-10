@@ -31,6 +31,7 @@ async function put(
   collectedAt: string,
   data: Record<string, unknown>,
   sizeBytes = 100,
+  extra: { version?: number; afterTombstoneVersion?: number | null } = {},
 ) {
   const written = await storage.writeEnvelope(
     createDataFileEnvelope(scope, collectedAt, data),
@@ -42,7 +43,8 @@ async function put(
     scope,
     collectedAt,
     sizeBytes,
-    afterTombstoneVersion: null,
+    afterTombstoneVersion: extra.afterTombstoneVersion ?? null,
+    ...(extra.version !== undefined ? { version: extra.version } : {}),
   });
 }
 
@@ -208,14 +210,14 @@ describe("negative outcomes are persisted", () => {
     const ledger = await stored(storage);
     expect(ledger?.skipped).toBeUndefined();
     expect(ledger?.records["items:i:b"]).toEqual([at(2), at(2)]);
-    expect(listAddedTimestamps(ledger!)).toEqual([at(2)]);
+    expect(listAddedTimestamps(ledger!)).toEqual([at(0), at(2)]);
 
     // Rebuilding with the offending version inside the window ends the same
     // way, and repeated reads make no envelope reads.
     await storage.deleteFirstSeenLedger!(SCOPE);
     const rebuilt = await ensureScopeLedger(storage, SCOPE);
     expect(rebuilt?.skipped).toBeUndefined();
-    expect(listAddedTimestamps(rebuilt!)).toEqual([at(2)]);
+    expect(listAddedTimestamps(rebuilt!)).toEqual([at(0), at(2)]);
     const readEnvelope = vi.spyOn(storage, "readEnvelope");
     for (let i = 0; i < 3; i += 1) await ensureScopeLedger(storage, SCOPE);
     expect(readEnvelope).not.toHaveBeenCalled();
@@ -255,7 +257,11 @@ describe("negative outcomes are persisted", () => {
     expect(readEnvelope).not.toHaveBeenCalled();
     // The established records stay known: returning is not an addition.
     await ingest(batch("a"), at(2));
-    expect(listAddedTimestamps((await stored(storage))!)).toEqual([]);
+    expect(
+      listAddedTimestamps((await stored(storage))!).filter(
+        (when) => when === at(2),
+      ),
+    ).toEqual([]);
   }, 90_000);
 });
 
@@ -473,7 +479,7 @@ describe("added never exceeds total (B10)", () => {
       });
     await ingest(items("a"), at(0));
     await ingest(items("a", "b", "c"), at(1));
-    expect(listAddedTimestamps((await stored(storage))!)).toHaveLength(2);
+    expect(listAddedTimestamps((await stored(storage))!)).toHaveLength(3);
 
     await ingestBinaryDataContract({
       storage,
@@ -494,7 +500,7 @@ describe("added never exceeds total (B10)", () => {
     expect(listAddedTimestamps(after).length).toBeLessThanOrEqual(
       after.latest.total,
     );
-    expect(listAddedTimestamps(after)).toHaveLength(3);
+    expect(listAddedTimestamps(after)).toHaveLength(4);
   });
 
   it("a too_large marker reports no additions and total 0", async () => {
@@ -706,5 +712,159 @@ describe("edges (F7)", () => {
       await ensureScopeLedger(scope.storage, SCOPE, { now: clock(1.2) });
       expect(scope.reads()).toBe(0);
     });
+  });
+});
+
+describe("when the baseline's records count as added (first-import rule)", () => {
+  const ingest = (
+    storage: DataStoragePort,
+    body: Record<string, unknown>,
+    collectedAt: string,
+  ) =>
+    ingestDataContract({
+      storage,
+      scopeParam: SCOPE,
+      body,
+      collectedAt,
+      status: "stored",
+    });
+
+  it("(a) a sidecar started from the scope's only version is complete: its records count", async () => {
+    const storage = createMemoryDataStorage();
+    await ingest(storage, items("a", "b", "c"), at(0));
+    const ledger = (await stored(storage))!;
+    expect(ledger.partial).toBeUndefined();
+    expect(listAddedTimestamps(ledger)).toEqual([at(0), at(0), at(0)]);
+  });
+
+  it("(a) but not when that only version is not the scope's first (its number is above 1)", async () => {
+    const storage = createMemoryDataStorage();
+    await put(storage, SCOPE, at(0), items("a", "b"), 100, { version: 5 });
+    await recordStoredVersion(storage, {
+      scope: SCOPE,
+      collectedAt: at(0),
+      data: items("a", "b"),
+    });
+    const ledger = (await stored(storage))!;
+    expect(ledger.partial).toBe(true);
+    expect(listAddedTimestamps(ledger)).toEqual([]);
+  });
+
+  it("(b) a rebuild after the write path left the sidecar absent is complete", async () => {
+    const storage = createMemoryDataStorage();
+    await put(storage, SCOPE, at(0), items("a", "b"));
+    await put(storage, SCOPE, at(1), items("a", "b", "c"));
+    await ingest(storage, items("a", "b", "c", "d"), at(2));
+    expect(await storage.readFirstSeenLedger!(SCOPE)).toBeNull();
+    const ledger = (await ensureScopeLedger(storage, SCOPE))!;
+    expect(ledger.partial).toBeUndefined();
+    expect(listAddedTimestamps(ledger)).toEqual([at(0), at(0), at(1), at(2)]);
+  });
+
+  it("(b) a rebuild that is cut short by the window or the budget is partial", async () => {
+    const storage = createMemoryDataStorage();
+    for (let i = 0; i < 6; i += 1)
+      await put(storage, SCOPE, at(i), items(...upTo(i + 1)));
+    const ledger = (await ensureScopeLedger(storage, SCOPE, {
+      byteBudget: 350,
+    }))!;
+    expect(ledger.partial).toBe(true);
+    expect(listAddedTimestamps(ledger)).toEqual([at(4), at(5)]);
+  });
+
+  it("(c) deleted older versions leave the oldest retained version number above 1: partial", async () => {
+    const storage = createMemoryDataStorage();
+    await put(storage, SCOPE, at(0), items("a"));
+    await put(storage, SCOPE, at(1), items("a", "b"));
+    await put(storage, SCOPE, at(2), items("a", "b", "c"));
+    await storage.deleteVersion(SCOPE, at(0));
+    const ledger = (await ensureScopeLedger(storage, SCOPE))!;
+    expect(ledger.partial).toBe(true);
+    expect(ledger.baseline).toBe(at(1));
+    // The baseline's records have an unknown date; the later one counts.
+    expect(listAddedTimestamps(ledger)).toEqual([at(2)]);
+  });
+
+  it("(c) a version written after a deletion starts afresh and counts, even above number 1", async () => {
+    const storage = createMemoryDataStorage();
+    await put(storage, SCOPE, at(0), items("a", "b"), 100, {
+      version: 4,
+      afterTombstoneVersion: 3,
+    });
+    const ledger = (await ensureScopeLedger(storage, SCOPE))!;
+    expect(ledger.partial).toBeUndefined();
+    expect(listAddedTimestamps(ledger)).toEqual([at(0), at(0)]);
+  });
+
+  it("(c) LIMITATION: a middle version deleted leaves no trace, so the baseline still counts", async () => {
+    const storage = createMemoryDataStorage();
+    await put(storage, SCOPE, at(0), items("a"));
+    await put(storage, SCOPE, at(1), items("a", "b"));
+    await put(storage, SCOPE, at(2), items("a", "b", "c"));
+    await storage.deleteVersion(SCOPE, at(1));
+    const ledger = (await ensureScopeLedger(storage, SCOPE))!;
+    expect(ledger.partial).toBeUndefined();
+    // "b" arrived in the deleted version but is dated by the next one.
+    expect(ledger.records["items:i:b"]).toEqual([at(2), at(2)]);
+  });
+
+  it("(d) delete the scope and reimport: the reimport's records count on its day", async () => {
+    const storage = createMemoryDataStorage();
+    await ingest(storage, items("a"), at(0));
+    await storage.deleteScope(SCOPE);
+    await ingest(storage, items("a", "b"), at(9));
+    const ledger = (await stored(storage))!;
+    expect(ledger.baseline).toBe(at(9));
+    expect(listAddedTimestamps(ledger)).toEqual([at(9), at(9)]);
+  });
+
+  it("(e) a version older than the baseline arriving later moves the baseline back", async () => {
+    const storage = createMemoryDataStorage();
+    await ingest(storage, items("a", "b"), at(5));
+    await put(storage, SCOPE, at(2), items("a"));
+    await recordStoredVersion(storage, {
+      scope: SCOPE,
+      collectedAt: at(2),
+      data: items("a"),
+    });
+    const ledger = (await ensureScopeLedger(storage, SCOPE))!;
+    expect(ledger.baseline).toBe(at(2));
+    expect(ledger.records["items:i:a"]).toEqual([at(2), at(5)]);
+    expect(listAddedTimestamps(ledger)).toEqual([at(2), at(5)]);
+  });
+
+  it("added never exceeds total over random sequences of writes, binaries and deletes", async () => {
+    let seed = 7;
+    const random = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32;
+    for (let run = 0; run < 25; run += 1) {
+      const storage = createMemoryDataStorage();
+      let slot = 0;
+      for (let step = 0; step < 8; step += 1) {
+        const roll = random();
+        slot += 1;
+        if (roll < 0.15) {
+          await ingestBinaryDataContract({
+            storage,
+            scopeParam: SCOPE,
+            bytes: new TextEncoder().encode("%PDF"),
+            mimeType: "application/pdf",
+            collectedAt: at(slot),
+            status: "stored",
+          });
+        } else if (roll < 0.25 && storage.entries.length > 1) {
+          const entry =
+            storage.entries[Math.floor(random() * storage.entries.length)]!;
+          await storage.deleteVersion(SCOPE, entry.collectedAt);
+        } else {
+          const count = 1 + Math.floor(random() * 6);
+          await ingest(storage, items(...upTo(count)), at(slot));
+        }
+        const ledger = await ensureScopeLedger(storage, SCOPE);
+        if (!ledger) continue;
+        expect(listAddedTimestamps(ledger).length).toBeLessThanOrEqual(
+          ledger.latest.total,
+        );
+      }
+    }
   });
 });
